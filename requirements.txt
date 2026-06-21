@@ -1,1 +1,7 @@
-
+flask
+gunicorn
+requests
+pandas
+numpy
+ccxt
+upstash-redis
