@@ -1405,22 +1405,25 @@ def montar_health_tecnico():
 
 def processar_comando(texto):
     cmd = texto.strip().lower()
+
     if cmd in ["/start", "/help", "/comandos"]:
-    return (
-        "🐍 Cobra Attack Online\n\n"
-        "Comandos:\n"
-        "/health\n"
-        "/teste\n"
-        "/posicoes\n"
-        "/top\n"
-        "/resumo\n"
-        "/mes\n"
-        "/estatisticas\n"
-        "/watchlist\n"
-        "/comandos"
-    )
+        return (
+            "🐍 Cobra Attack Online\n\n"
+            "Comandos:\n"
+            "/health\n"
+            "/teste\n"
+            "/posicoes\n"
+            "/top\n"
+            "/resumo\n"
+            "/mes\n"
+            "/estatisticas\n"
+            "/watchlist\n"
+            "/comandos"
+        )
+
     if cmd == "/health":
         return montar_health_tecnico()
+
     if cmd == "/teste":
         return "✅ Cobra Attack conectado ao Telegram."
     if cmd in ["/posicoes", "/posições"]:
