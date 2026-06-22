@@ -114,10 +114,20 @@ WATCHDOG_CHECK_SECONDS = int(os.environ.get("WATCHDOG_CHECK_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-DONKEY_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-DONKEY_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TOKEN = (
+    os.environ.get("DONKEY_H4_TOKEN")
+    or os.environ.get("DONKEY_TELEGRAM_BOT_TOKEN")
+    or os.environ.get("TELEGRAM_BOT_TOKEN")
+)
+
+CHAT_ID = (
+    os.environ.get("DONKEY_H4_CHAT_ID")
+    or os.environ.get("DONKEY_TELEGRAM_CHAT_ID")
+    or os.environ.get("TELEGRAM_CHAT_ID")
+)
+
+DONKEY_TOKEN = TOKEN
+DONKEY_CHAT_ID = CHAT_ID
 
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
