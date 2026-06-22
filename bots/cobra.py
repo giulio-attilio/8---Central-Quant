@@ -254,10 +254,22 @@ def enviar_startup_cobra_uma_vez():
     except Exception as e:
         print("Erro na trava startup Cobra:", e)
 
+    try:
+        watchlist_count = len(carregar_watchlist())
+    except Exception:
+        watchlist_count = HEALTH.get("watchlist_total", 0) or HEALTH.get("last_watchlist_count", 0)
+
     send_telegram(
-        "🐍 Cobra Attack iniciado.\n\n"
-        "Bot privado online.\n"
-        f"Watchlist: {WATCHLIST_FILE}\n"
+        "🐍 Robô Cobra Attack iniciado\n\n"
+        "Filtros ativos:\n"
+        "Early Cobra ativo: ✅\n"
+        "Cobra ativo: ✅\n"
+        f"Score mínimo Early: {EARLY_COBRA_MIN_SCORE}\n"
+        f"Score mínimo Cobra: {COBRA_MIN_SCORE}\n"
+        f"Risco máximo: {MAX_RISK_H1}%\n"
+        f"Limite de posições: {MAX_OPEN_POSITIONS}\n"
+        f"Watchlist: {watchlist_count} ativos\n"
+        f"Timeframe: {TIMEFRAME_H1} com contexto {TIMEFRAME_H4}\n"
         f"Startup guard: {STARTUP_SIGNAL_GRACE_SECONDS}s"
     )
 
@@ -1405,27 +1417,19 @@ def montar_health_tecnico():
 
 def processar_comando(texto):
     cmd = texto.strip().lower()
-
-    if cmd in ["/start", "/help", "/comandos"]:
+    if cmd in ["/start", "/help"]:
         return (
             "🐍 Cobra Attack Online\n\n"
             "Comandos:\n"
             "/health\n"
-            "/teste\n"
             "/posicoes\n"
-            "/top\n"
             "/resumo\n"
             "/mes\n"
             "/estatisticas\n"
-            "/watchlist\n"
-            "/comandos"
+            "/watchlist"
         )
-
     if cmd == "/health":
         return montar_health_tecnico()
-
-    if cmd == "/teste":
-        return "✅ Cobra Attack conectado ao Telegram."
     if cmd in ["/posicoes", "/posições"]:
         return montar_posicoes()
     if cmd == "/resumo":
