@@ -442,7 +442,7 @@ ALLOW_POI_UPDATE_ENTRY = True
 # REENTRY:
 # Nova entrada depois que um trade anterior atingiu TP50 e foi encerrado.
 # Evita reentrar imediatamente no mesmo candle/correção.
-ENABLE_REENTRY_AFTER_TP50 = False
+ENABLE_REENTRY_AFTER_TP50 = True
 REENTRY_AFTER_CLOSE_SECONDS = 2 * 60 * 60  # 2 candles H1
 REENTRY_COOLDOWN_SECONDS = 60 * 60
 
