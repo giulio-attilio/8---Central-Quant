@@ -22,8 +22,18 @@ app = Flask(__name__)
 # CONFIGURACOES TELEGRAM / REDIS / EXCHANGE
 # ====================================================
 
-TOKEN = os.environ.get("COBRA_TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("COBRA_TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+TOKEN = (
+    os.environ.get("COBRA_ATTACK_TOKEN")
+    or os.environ.get("COBRA_TELEGRAM_BOT_TOKEN")
+    or os.environ.get("COBRA_TOKEN")
+    or os.environ.get("TELEGRAM_BOT_TOKEN")
+)
+CHAT_ID = (
+    os.environ.get("COBRA_ATTACK_CHAT_ID")
+    or os.environ.get("COBRA_TELEGRAM_CHAT_ID")
+    or os.environ.get("COBRA_CHAT_ID")
+    or os.environ.get("TELEGRAM_CHAT_ID")
+)
 
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
@@ -1341,6 +1351,7 @@ def montar_health_tecnico():
         "last_success": HEALTH.get("last_success"),
         "last_error": HEALTH.get("last_error"),
         "last_warning": HEALTH.get("last_warning"),
+        "last_warning": HEALTH.get("last_warning"),
         "watchlist_file": WATCHLIST_FILE,
         "daily_summary_time": f"{DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}",
         "monthly_summary_day": MONTHLY_SUMMARY_DAY,
@@ -1567,6 +1578,18 @@ def scanner():
                             historico = dict(list(historico.items())[-3000:])
                         salvar_sinais(historico)
                         print(f"STARTUP GUARD COBRA: sinal marcado e não enviado: {chave}")
+                        continue
+
+                    if startup_signal_guard_active():
+                        historico[chave] = True
+                        if len(historico) > 3000:
+                            historico = dict(list(historico.items())[-3000:])
+                        salvar_sinais(historico)
+                        print(
+                            f"STARTUP GUARD COBRA: sinal antigo ignorado "
+                            f"{s['symbol_clean']} {s['side']} {s['signal_type']} "
+                            f"({startup_guard_restante_segundos()}s restantes)"
+                        )
                         continue
 
                     if registrar_posicao(s):
