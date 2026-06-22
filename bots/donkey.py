@@ -304,32 +304,63 @@ redis = Redis(
 # ====================================================
 
 def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
+    """
+    Busca OHLCV com retry/backoff.
+
+    Importante:
+    - Falha em UM ativo/timeframe é tratada como WARNING, não como erro crítico.
+    - O scanner deve pular esse ativo e seguir para o próximo.
+    - HEALTH["last_error"] fica reservado para falha estrutural do robô/scanner.
+    """
+    ultimo_erro = None
+
     for attempt in range(max_retries):
         try:
-            return safe_fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
+            ultimo_erro = e
             print(f"AVISO API OHLCV ({attempt + 1}/{max_retries}) {symbol} {timeframe}: {e}")
             time.sleep(2 ** attempt)
         except Exception as e:
+            ultimo_erro = e
             print(f"ERRO API OHLCV {symbol} {timeframe}: {e}")
             time.sleep(2 ** attempt)
 
-    HEALTH["last_error"] = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
+    aviso = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
+    if ultimo_erro:
+        aviso += f": {ultimo_erro}"
+
+    HEALTH["last_warning"] = aviso
+    print("WARNING:", aviso)
     return []
 
 
 def safe_fetch_ticker(symbol, max_retries=3):
+    """
+    Busca ticker com retry/backoff.
+
+    Falha pontual vira WARNING e não derruba o health geral da Central.
+    """
+    ultimo_erro = None
+
     for attempt in range(max_retries):
         try:
-            return safe_fetch_ticker(symbol)
+            return exchange.fetch_ticker(symbol)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
+            ultimo_erro = e
             print(f"AVISO API TICKER ({attempt + 1}/{max_retries}) {symbol}: {e}")
             time.sleep(2 ** attempt)
         except Exception as e:
+            ultimo_erro = e
             print(f"ERRO API TICKER {symbol}: {e}")
             time.sleep(2 ** attempt)
 
-    HEALTH["last_error"] = f"Falha ticker {symbol} após {max_retries} tentativas"
+    aviso = f"Falha ticker {symbol} após {max_retries} tentativas"
+    if ultimo_erro:
+        aviso += f": {ultimo_erro}"
+
+    HEALTH["last_warning"] = aviso
+    print("WARNING:", aviso)
     return None
 
 
@@ -356,6 +387,7 @@ HEALTH = {
     "last_management_run": None,
     "last_success": None,
     "last_error": None,
+    "last_warning": None,
     "last_watchlist_count": 0,
     "last_signals_sent": 0,
     "last_donkey_signals_sent": 0,
