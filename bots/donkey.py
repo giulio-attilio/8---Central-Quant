@@ -194,8 +194,22 @@ SPIKE_BODY_ATR_MULT = 4.0
 USE_MAX_RISK_FILTER = True
 MAX_RISK_H1 = 2.5
 
+# Donkey: bloqueia qualquer entrada/POI com risco acima do limite operacional.
+# Objetivo: evitar sinais com risco 3% a 6% que distorcem o resultado.
+DONKEY_MAX_RISK_PCT = MAX_RISK_H1
+
+# Donkey: ao bater TP50, stop sobe imediatamente para breakeven com pequeno lucro.
+# Isso evita TP50 virar loss depois.
+DONKEY_MOVE_SL_TO_BE_ON_TP50 = True
+DONKEY_BE_OFFSET_PCT = 0.10
+
+# Gestão Donkey pós-TP50:
+# - Trailing50 usa o cálculo atual de trailing H4 e encerra/protege 50%.
+# - Trailing100 encerra o restante somente no fechamento do candle H4 contra a EMA20.
+DONKEY_USE_TRAILING50_EMA20_100 = True
+
 # Limite de exposição operacional.
-MAX_OPEN_POSITIONS = 100
+MAX_OPEN_POSITIONS = 25
 
 # ====================================================
 # TREND PRO ELITE - FILTROS OBRIGATÓRIOS
@@ -1055,6 +1069,10 @@ def montar_health_tecnico():
         "reentry_enabled": ENABLE_REENTRY_AFTER_TP50,
         "reentry_after_close_seconds": REENTRY_AFTER_CLOSE_SECONDS,
         "max_risk": MAX_RISK_H1,
+        "donkey_max_risk_pct": DONKEY_MAX_RISK_PCT,
+        "donkey_move_sl_to_be_on_tp50": DONKEY_MOVE_SL_TO_BE_ON_TP50,
+        "donkey_be_offset_pct": DONKEY_BE_OFFSET_PCT,
+        "donkey_use_trailing50_ema20_100": DONKEY_USE_TRAILING50_EMA20_100,
         "use_max_risk_filter": USE_MAX_RISK_FILTER,
         "trendpro_elite_filter": ENABLE_TRENDPRO_ELITE_FILTER,
         "elite_threshold": ELITE_THRESHOLD,
@@ -2325,6 +2343,13 @@ def detectar_confirmacao_donkey_h4(symbol, posicao):
 
     risk_pct = risk_abs / entry_confirmada * 100
 
+    if USE_MAX_RISK_FILTER and risk_pct > DONKEY_MAX_RISK_PCT:
+        print(
+            f"CONFIRMAÇÃO DONKEY IGNORADA POR RISCO ALTO: "
+            f"{nome_limpo(symbol)} | {risk_pct:.2f}% > {DONKEY_MAX_RISK_PCT:.2f}%"
+        )
+        return None
+
     posicoes = carregar_posicoes()
     p = posicoes.get(symbol, posicao)
     p["entry"] = entry_confirmada
@@ -2416,6 +2441,14 @@ def detectar_poi_donkey_h4(symbol, posicao):
         return None
 
     risk_pct = risk_abs / entry * 100
+
+    if USE_MAX_RISK_FILTER and risk_pct > DONKEY_MAX_RISK_PCT:
+        print(
+            f"POI DONKEY IGNORADO POR RISCO ALTO: "
+            f"{nome_limpo(symbol)} | {risk_pct:.2f}% > {DONKEY_MAX_RISK_PCT:.2f}%"
+        )
+        return None
+
     tp50 = entry + risk_abs * TP50_R if side == "LONG" else entry - risk_abs * TP50_R
 
     marcar_donkey_poi_cooldown(symbol, side)
@@ -2446,147 +2479,190 @@ def detectar_poi_donkey_h4(symbol, posicao):
     }
 
 
+def registrar_fechamento_donkey(symbol, p, exit_price, resultado_total, closed_by, result_type=None, extra=None):
+    """
+    Registra fechamento do Donkey.
+
+    resultado_total pode ser:
+    - 100% da posição antes do TP50;
+    - resultado ponderado quando houve SL50 + SL100.
+    """
+    if extra is None:
+        extra = {}
+
+    registrar_evento_trade({
+        "event": "CLOSE",
+        "date": data_hoje_sp_str(),
+        "datetime": data_hora_sp_str(),
+        "symbol": symbol,
+        "symbol_clean": p["symbol_clean"],
+        "side": p["side"],
+        "entry": float(p["entry"]),
+        "exit": float(exit_price),
+        "pnl": float(resultado_total),
+        "mfe_max_pct": float(p.get("mfe_max_pct", 0)),
+        "mfe_gave_back_pct": float(p.get("mfe_max_pct", 0)) - float(resultado_total),
+        "result_type": result_type or ("WIN" if resultado_total > 0 else "LOSS"),
+        "signal_type": "DONKEY",
+        "closed_by": closed_by,
+        **extra
+    })
+
+    p["closed_at"] = time.time()
+    p["closed_datetime"] = data_hora_sp_str()
+    p["closed_reason"] = closed_by
+    p["status"] = "ENCERRADO"
+
+
+def buscar_candle_h4_fechado(symbol):
+    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=120)
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
+    return df_h4.iloc[-2]
+
+
+def ema20_h4_invalidou(symbol, side):
+    """
+    Trailing100 / SL100:
+    usa fechamento do candle H4 contra a EMA20.
+    LONG: fecha abaixo da EMA20.
+    SHORT: fecha acima da EMA20.
+    """
+    candle_h4 = buscar_candle_h4_fechado(symbol)
+    close_h4 = float(candle_h4["close"])
+    ema20_h4 = float(candle_h4["ema20"])
+    timestamp_h4 = int(candle_h4["time"])
+
+    invalidou = (
+        (side == "LONG" and close_h4 < ema20_h4) or
+        (side == "SHORT" and close_h4 > ema20_h4)
+    )
+
+    return invalidou, close_h4, ema20_h4, timestamp_h4
+
+
 def gerenciar_donkey_position(symbol, p, preco_atual):
     """
     Gestão exclusiva do DONKEY H4.
-    Retorna True se alterou/encerrou a posição.
+
+    Antes do TP50:
+    - stop normal encerra 100%.
+
+    Após TP50:
+    - Trailing50: cálculo atual de stop/trailing fecha 50% da posição.
+    - Trailing100: fechamento H4 contra EMA20 encerra o restante.
     """
     side = p["side"]
     entry = float(p["entry"])
     sl = float(p["sl"])
 
-    # Stop em tempo real no stop atual.
+    tp50_hit = bool(p.get("tp50_hit", False))
+    sl50_hit = bool(p.get("sl50_hit", False))
+    remaining_pct = float(p.get("remaining_pct", 100.0))
+
+    # ====================================================
+    # STOP / TRAILING50 EM TEMPO REAL
+    # ====================================================
     if not stop_em_carencia(p):
-        if side == "LONG" and preco_atual <= sl:
-            resultado = pnl_pct(side, entry, sl)
-            enviar_stop(p, preco_atual, sl, resultado)
-
-            registrar_evento_trade({
-                "event": "CLOSE",
-                "date": data_hoje_sp_str(),
-                "datetime": data_hora_sp_str(),
-                "symbol": symbol,
-                "symbol_clean": p["symbol_clean"],
-                "side": side,
-                "entry": entry,
-                "exit": sl,
-                "pnl": resultado,
-                "mfe_max_pct": float(p.get("mfe_max_pct", 0)),
-                "mfe_gave_back_pct": float(p.get("mfe_max_pct", 0)) - resultado,
-                "result_type": "WIN" if resultado > 0 else "LOSS",
-                "signal_type": "DONKEY",
-                "closed_by": "DONKEY_STOP"
-            })
-
-            p["closed_at"] = time.time()
-            p["closed_datetime"] = data_hora_sp_str()
-            p["closed_reason"] = "DONKEY_STOP"
-            p["status"] = "ENCERRADO"
-            return True
-
-        if side == "SHORT" and preco_atual >= sl:
-            resultado = pnl_pct(side, entry, sl)
-            enviar_stop(p, preco_atual, sl, resultado)
-
-            registrar_evento_trade({
-                "event": "CLOSE",
-                "date": data_hoje_sp_str(),
-                "datetime": data_hora_sp_str(),
-                "symbol": symbol,
-                "symbol_clean": p["symbol_clean"],
-                "side": side,
-                "entry": entry,
-                "exit": sl,
-                "pnl": resultado,
-                "mfe_max_pct": float(p.get("mfe_max_pct", 0)),
-                "mfe_gave_back_pct": float(p.get("mfe_max_pct", 0)) - resultado,
-                "result_type": "WIN" if resultado > 0 else "LOSS",
-                "signal_type": "DONKEY",
-                "closed_by": "DONKEY_STOP"
-            })
-
-            p["closed_at"] = time.time()
-            p["closed_datetime"] = data_hora_sp_str()
-            p["closed_reason"] = "DONKEY_STOP"
-            p["status"] = "ENCERRADO"
-            return True
-
-    # Invalidação por candle H4 fechado além da EMA20.
-    try:
-        ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=120)
-        df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
-        candle_h4 = df_h4.iloc[-2]
-        close_h4 = float(candle_h4["close"])
-        ema20_h4 = float(candle_h4["ema20"])
-
-        invalidou = (
-            (side == "LONG" and close_h4 < ema20_h4) or
-            (side == "SHORT" and close_h4 > ema20_h4)
+        stop_tocado = (
+            (side == "LONG" and preco_atual <= sl) or
+            (side == "SHORT" and preco_atual >= sl)
         )
 
-        if invalidou:
-            resultado = pnl_pct(side, entry, close_h4)
-            enviar_stop(p, close_h4, close_h4, resultado)
+        if stop_tocado:
+            resultado_stop = pnl_pct(side, entry, sl)
 
-            registrar_evento_trade({
-                "event": "CLOSE",
-                "date": data_hoje_sp_str(),
-                "datetime": data_hora_sp_str(),
-                "symbol": symbol,
-                "symbol_clean": p["symbol_clean"],
-                "side": side,
-                "entry": entry,
-                "exit": close_h4,
-                "pnl": resultado,
-                "mfe_max_pct": float(p.get("mfe_max_pct", 0)),
-                "mfe_gave_back_pct": float(p.get("mfe_max_pct", 0)) - resultado,
-                "result_type": "WIN" if resultado > 0 else "LOSS",
-                "signal_type": "DONKEY",
-                "closed_by": "DONKEY_EMA20_CLOSE"
-            })
+            # Antes do TP50: stop normal encerra 100%.
+            if not tp50_hit:
+                enviar_stop(p, preco_atual, sl, resultado_stop)
 
-            p["closed_at"] = time.time()
-            p["closed_datetime"] = data_hora_sp_str()
-            p["closed_reason"] = "DONKEY_EMA20_CLOSE"
-            p["status"] = "ENCERRADO"
-            return True
+                registrar_fechamento_donkey(
+                    symbol=symbol,
+                    p=p,
+                    exit_price=sl,
+                    resultado_total=resultado_stop,
+                    closed_by="DONKEY_STOP",
+                    extra={
+                        "exit_pct": 100,
+                        "sl50_hit": False,
+                        "sl100_hit": False
+                    }
+                )
+                return True
 
-    except Exception as e:
-        print(f"ERRO INVALIDAÇÃO DONKEY {nome_limpo(symbol)}:", e)
+            # Depois do TP50: Trailing50 fecha apenas metade uma única vez.
+            if tp50_hit and not sl50_hit:
+                p["sl50_hit"] = True
+                p["sl50_price"] = sl
+                p["sl50_pnl"] = resultado_stop
+                p["sl50_datetime"] = data_hora_sp_str()
+                p["remaining_pct"] = 50.0
+                p["status"] = "DONKEY SL50 / AGUARDANDO EMA20 H4"
+                p["last_adjustment"] = "SL50"
 
-    # TP50 informativo/operacional em 1R.
-    # Importante: retorna True logo após enviar a mensagem para persistir
-    # tp50_hit/tp50_message_sent no Redis e evitar duplicação a cada ciclo.
-    try:
-        tp50 = float(p["tp50"])
-
-        if not p.get("tp50_hit") and not p.get("tp50_message_sent"):
-            if side == "LONG" and preco_atual >= tp50:
-                p["tp50_hit"] = True
-                p["tp50_message_sent"] = True
-                p["status"] = "DONKEY TRAILING"
-                p["tp50_activated_at"] = time.time()
-                enviar_tp50(p, tp50, pnl_pct(side, entry, tp50))
+                enviar_donkey_sl50(p, sl, resultado_stop)
 
                 registrar_evento_trade({
-                    "event": "TP50",
+                    "event": "SL50",
                     "date": data_hoje_sp_str(),
                     "datetime": data_hora_sp_str(),
                     "symbol": symbol,
                     "symbol_clean": p["symbol_clean"],
                     "side": side,
                     "entry": entry,
-                    "tp50": tp50,
-                    "signal_type": "DONKEY"
+                    "exit": sl,
+                    "pnl": resultado_stop,
+                    "exit_pct": 50,
+                    "remaining_pct": 50,
+                    "signal_type": "DONKEY",
+                    "closed_by": "DONKEY_SL50"
                 })
 
                 return True
 
-            if side == "SHORT" and preco_atual <= tp50:
+            # Se SL50 já foi executado, o restante só sai pela EMA20 H4.
+            if tp50_hit and sl50_hit:
+                return False
+
+    # ====================================================
+    # TP50: ATIVA GESTÃO 50/100
+    # ====================================================
+    try:
+        tp50 = float(p["tp50"])
+
+        if not p.get("tp50_hit") and not p.get("tp50_message_sent"):
+            tp50_tocado = (
+                (side == "LONG" and preco_atual >= tp50) or
+                (side == "SHORT" and preco_atual <= tp50)
+            )
+
+            if tp50_tocado:
                 p["tp50_hit"] = True
                 p["tp50_message_sent"] = True
-                p["status"] = "DONKEY TRAILING"
+                p["status"] = "DONKEY TP50 / TRAILING50+EMA20"
                 p["tp50_activated_at"] = time.time()
+                p["remaining_pct"] = 100.0
+                p["sl50_hit"] = False
+                p["sl50_price"] = None
+                p["sl50_pnl"] = None
+                p["sl100_hit"] = False
+                p["sl100_price"] = None
+                p["sl100_pnl"] = None
+                p["management_mode"] = "TRAILING50_EMA20_100"
+
+                stop_after_tp50 = float(p["sl"])
+
+                # Trailing50 começa no BE + offset para reduzir TP50 virando loss.
+                if DONKEY_MOVE_SL_TO_BE_ON_TP50:
+                    if side == "LONG":
+                        stop_after_tp50 = max(float(p["sl"]), entry * (1 + DONKEY_BE_OFFSET_PCT / 100))
+                    else:
+                        stop_after_tp50 = min(float(p["sl"]), entry * (1 - DONKEY_BE_OFFSET_PCT / 100))
+
+                    p["sl"] = stop_after_tp50
+                    p["breakeven"] = True
+                    p["breakeven_activated_at"] = time.time()
+                    p["last_adjustment"] = "TP50_TRAILING50_BE"
+
                 enviar_tp50(p, tp50, pnl_pct(side, entry, tp50))
 
                 registrar_evento_trade({
@@ -2598,6 +2674,9 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
                     "side": side,
                     "entry": entry,
                     "tp50": tp50,
+                    "trailing50_start": stop_after_tp50,
+                    "ema20_exit_enabled": True,
+                    "management_mode": "TRAILING50_EMA20_100",
                     "signal_type": "DONKEY"
                 })
 
@@ -2606,53 +2685,128 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
     except Exception as e:
         print(f"ERRO TP50 DONKEY {nome_limpo(symbol)}:", e)
 
-    # Trailing por swing H4 com margem 0,5%.
+    # ====================================================
+    # TRAILING100 / SL100: FECHAMENTO H4 CONTRA EMA20
+    # Só vale após TP50.
+    # ====================================================
     try:
-        novo_stop = calcular_donkey_trailing(symbol, side)
+        if bool(p.get("tp50_hit", False)):
+            invalidou, close_h4, ema20_h4, timestamp_h4 = ema20_h4_invalidou(symbol, side)
+            ultimo_h4_sl100 = int(p.get("last_ema20_exit_h4_ts", 0) or 0)
 
-        if side == "LONG" and novo_stop > float(p["sl"]):
-            p["sl"] = novo_stop
-            p["status"] = "DONKEY TRAILING"
-            p["trailing_activated_at"] = time.time()
-            enviar_donkey_trailing(p, novo_stop)
+            if invalidou and int(timestamp_h4) != ultimo_h4_sl100:
+                p["last_ema20_exit_h4_ts"] = int(timestamp_h4)
 
-            registrar_evento_trade({
-                "event": "TRAILING",
-                "date": data_hoje_sp_str(),
-                "datetime": data_hora_sp_str(),
-                "symbol": symbol,
-                "symbol_clean": p["symbol_clean"],
-                "side": side,
-                "new_stop": novo_stop,
-                "signal_type": "DONKEY"
-            })
+                resultado_sl100 = pnl_pct(side, entry, close_h4)
 
-            return True
+                # Se SL50 já saiu, resultado final é ponderado:
+                # 50% no SL50 + 50% no SL100.
+                if bool(p.get("sl50_hit", False)):
+                    resultado_sl50 = float(p.get("sl50_pnl", 0))
+                    resultado_total = (resultado_sl50 * 0.5) + (resultado_sl100 * 0.5)
+                    exit_pct = 50
+                    remaining_before = 50
+                else:
+                    resultado_total = resultado_sl100
+                    exit_pct = 100
+                    remaining_before = float(p.get("remaining_pct", 100.0))
 
-        if side == "SHORT" and novo_stop < float(p["sl"]):
-            if p.get("last_trailing_message_stop") == novo_stop:
-                return False
-            p["sl"] = novo_stop
-            p["status"] = "DONKEY TRAILING"
-            p["trailing_activated_at"] = time.time()
-            p["last_trailing_message_stop"] = novo_stop
-            enviar_donkey_trailing(p, novo_stop)
+                p["sl100_hit"] = True
+                p["sl100_price"] = close_h4
+                p["sl100_pnl"] = resultado_sl100
+                p["remaining_pct"] = 0.0
 
-            registrar_evento_trade({
-                "event": "TRAILING",
-                "date": data_hoje_sp_str(),
-                "datetime": data_hora_sp_str(),
-                "symbol": symbol,
-                "symbol_clean": p["symbol_clean"],
-                "side": side,
-                "new_stop": novo_stop,
-                "signal_type": "DONKEY"
-            })
+                enviar_donkey_sl100(
+                    p=p,
+                    close_h4=close_h4,
+                    ema20_h4=ema20_h4,
+                    resultado_sl100=resultado_sl100,
+                    resultado_total=resultado_total,
+                    exit_pct=exit_pct
+                )
 
-            return True
+                registrar_fechamento_donkey(
+                    symbol=symbol,
+                    p=p,
+                    exit_price=close_h4,
+                    resultado_total=resultado_total,
+                    closed_by="DONKEY_SL100_EMA20_H4",
+                    extra={
+                        "exit_pct": exit_pct,
+                        "remaining_before": remaining_before,
+                        "sl50_hit": bool(p.get("sl50_hit", False)),
+                        "sl50_price": p.get("sl50_price"),
+                        "sl50_pnl": p.get("sl50_pnl"),
+                        "sl100_price": close_h4,
+                        "sl100_pnl": resultado_sl100,
+                        "ema20_h4": ema20_h4,
+                        "h4_timestamp": int(timestamp_h4)
+                    }
+                )
+
+                return True
 
     except Exception as e:
-        print(f"ERRO TRAILING DONKEY {nome_limpo(symbol)}:", e)
+        print(f"ERRO SL100 EMA20 DONKEY {nome_limpo(symbol)}:", e)
+
+    # ====================================================
+    # TRAILING50: cálculo atual de trailing H4 com buffer.
+    # Só atualiza após TP50 e antes do SL50.
+    # ====================================================
+    try:
+        if bool(p.get("tp50_hit", False)) and not bool(p.get("sl50_hit", False)):
+            novo_stop = calcular_donkey_trailing(symbol, side)
+
+            if side == "LONG" and novo_stop > float(p["sl"]):
+                if p.get("last_trailing_message_stop") == novo_stop:
+                    return False
+
+                p["sl"] = novo_stop
+                p["status"] = "DONKEY TRAILING50"
+                p["trailing_activated_at"] = time.time()
+                p["last_trailing_message_stop"] = novo_stop
+                enviar_donkey_trailing(p, novo_stop)
+
+                registrar_evento_trade({
+                    "event": "TRAILING50",
+                    "date": data_hoje_sp_str(),
+                    "datetime": data_hora_sp_str(),
+                    "symbol": symbol,
+                    "symbol_clean": p["symbol_clean"],
+                    "side": side,
+                    "new_stop": novo_stop,
+                    "exit_pct": 50,
+                    "signal_type": "DONKEY"
+                })
+
+                return True
+
+            if side == "SHORT" and novo_stop < float(p["sl"]):
+                if p.get("last_trailing_message_stop") == novo_stop:
+                    return False
+
+                p["sl"] = novo_stop
+                p["status"] = "DONKEY TRAILING50"
+                p["trailing_activated_at"] = time.time()
+                p["last_trailing_message_stop"] = novo_stop
+                enviar_donkey_trailing(p, novo_stop)
+
+                registrar_evento_trade({
+                    "event": "TRAILING50",
+                    "date": data_hoje_sp_str(),
+                    "datetime": data_hora_sp_str(),
+                    "symbol": symbol,
+                    "symbol_clean": p["symbol_clean"],
+                    "side": side,
+                    "new_stop": novo_stop,
+                    "exit_pct": 50,
+                    "signal_type": "DONKEY"
+                })
+
+                return True
+
+    except Exception as e:
+        print(f"ERRO TRAILING50 DONKEY {nome_limpo(symbol)}:", e)
 
     return False
 
@@ -2844,9 +2998,32 @@ def enviar_donkey_trailing(p, novo_stop):
     )
 
     safe_send_telegram_donkey(
-        f"🐴 🟣 TRAILING DONKEY - {p['symbol_clean']}\n\n"
-        f"Novo Stop:\n{fmt_br(novo_stop)}\n\n"
-        f"Lucro protegido:\n{fmt_pct(lucro_protegido)}"
+        f"🐴 🟣 TRAILING50 DONKEY - {p['symbol_clean']}\n\n"
+        f"Stop da metade protegida:\n{fmt_br(novo_stop)}\n\n"
+        f"Proteção da metade:\n{fmt_pct(lucro_protegido)}\n\n"
+        f"Trailing100:\nFechamento H4 contra EMA20"
+    )
+
+
+def enviar_donkey_sl50(p, stop, resultado):
+    safe_send_telegram_donkey(
+        f"🐴 🟠 SL50 DONKEY - {p['symbol_clean']}\n\n"
+        f"50% da posição saiu no Trailing50 ✅\n\n"
+        f"Saída SL50:\n{fmt_br(stop)}\n\n"
+        f"Resultado da metade:\n{fmt_pct(resultado)}\n\n"
+        f"Restante:\n50% aguardando fechamento H4 contra EMA20"
+    )
+
+
+def enviar_donkey_sl100(p, close_h4, ema20_h4, resultado_sl100, resultado_total, exit_pct):
+    safe_send_telegram_donkey(
+        f"🐴 🔴 SL100 DONKEY - {p['symbol_clean']}\n\n"
+        f"Candle H4 fechou contra a EMA20 ✅\n\n"
+        f"Fechamento H4:\n{fmt_br(close_h4)}\n\n"
+        f"EMA20 H4:\n{fmt_br(ema20_h4)}\n\n"
+        f"Percentual encerrado agora:\n{exit_pct}%\n\n"
+        f"Resultado SL100:\n{fmt_pct(resultado_sl100)}\n\n"
+        f"Resultado final ponderado:\n{fmt_pct(resultado_total)}"
     )
 
 
@@ -2854,14 +3031,20 @@ def enviar_tp50(p, tp50, pnl_tp):
     origem = origem_msg_trade(p)
 
     if origem == "DONKEY":
-        status = "Aguardando trailing H4 ✅"
+        status = (
+            "Gestão 50/100 ativada ✅\n"
+            "Trailing50: cálculo atual protege 50%\n"
+            "Trailing100: fechamento H4 contra EMA20"
+        )
+        parcial_txt = "TP50 atingido; gestão dupla ativada ✅"
     else:
         status = "Aguardando Breakeven 1,5R ✅"
+        parcial_txt = "Parcial 50% realizada ✅"
 
     enviar_por_origem(p, 
         f"🎯 TP50 {origem} - {p['symbol_clean']}\n\n"
-        f"Parcial 50% realizada ✅\n\n"
-        f"Resultado parcial:\n"
+        f"{parcial_txt}\n\n"
+        f"Resultado no TP50:\n"
         f"{fmt_pct(pnl_tp)}\n\n"
         f"Status:\n"
         f"{status}"
@@ -2930,6 +3113,18 @@ def registrar_posicao(s):
         )
         return False
 
+    try:
+        risk_pct_sinal = float(s.get("risk_pct", 999))
+    except Exception:
+        risk_pct_sinal = 999
+
+    if USE_MAX_RISK_FILTER and risk_pct_sinal > DONKEY_MAX_RISK_PCT:
+        print(
+            f"SINAL DONKEY IGNORADO POR RISCO ALTO: "
+            f"{nome_limpo(symbol)} | {risk_pct_sinal:.2f}% > {DONKEY_MAX_RISK_PCT:.2f}%"
+        )
+        return False
+
     posicoes[symbol] = {
         "symbol": symbol,
         "symbol_clean": s["symbol_clean"],
@@ -2946,6 +3141,16 @@ def registrar_posicao(s):
         "tp50_hit": False,
         "tp50_message_sent": False,
         "be_trigger_message_sent": False,
+        "management_mode": None,
+        "remaining_pct": 100.0,
+        "sl50_hit": False,
+        "sl50_price": None,
+        "sl50_pnl": None,
+        "sl50_datetime": None,
+        "sl100_hit": False,
+        "sl100_price": None,
+        "sl100_pnl": None,
+        "last_ema20_exit_h4_ts": None,
         "timestamp": s["timestamp"],
         "created_at": time.time(),
         "active_since": time.time(),
@@ -4094,6 +4299,8 @@ def scanner():
         f"Donkey H4 ativo: {check_bool(ENABLE_DONKEY_H4)}\n"
         f"Early Donkey H4 ativo: {check_bool(ENABLE_EARLY_DONKEY_H4)}\n"
         f"Buffer stop/trailing: {DONKEY_BUFFER_PCT}%\n"
+        f"Risco máximo por sinal: {DONKEY_MAX_RISK_PCT}%\n"
+        f"Limite de posições: {MAX_OPEN_POSITIONS}\n"
         f"Timeframe: {DONKEY_TIMEFRAME}"
     )
 
