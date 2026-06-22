@@ -496,21 +496,6 @@ HEALTH = {
 }
 
 
-
-
-def run_thread_guarded(nome, target):
-    while True:
-        try:
-            target()
-            break
-        except Exception as e:
-            try:
-                HEALTH["last_error"] = f"Thread {nome} travou: {e}"
-            except Exception:
-                pass
-            print(f"ERRO FATAL THREAD MEME {nome}: {e}")
-            time.sleep(10)
-
 # ====================================================
 # UTILITÁRIOS
 # ====================================================
@@ -3734,9 +3719,32 @@ def home():
     return "Meme Hunter PRO Online"
 
 
+
+def run_thread_guarded(nome, target):
+    while True:
+        try:
+            target()
+        except Exception as e:
+            try:
+                HEALTH["last_error"] = f"Thread {nome} travou: {e}"
+            except Exception:
+                pass
+
+            print(f"ERRO FATAL THREAD MEME {nome}:", e)
+
+            try:
+                safe_send_telegram(
+                    f"🚨 MEME THREAD TRAVOU: {nome}\n\n"
+                    f"Erro:\n{str(e)}\n\n"
+                    "A thread será reiniciada automaticamente."
+                )
+            except Exception:
+                pass
+
+            time.sleep(10)
+
 threading.Thread(target=run_thread_guarded, args=("scanner", scanner), daemon=True).start()
 threading.Thread(target=run_thread_guarded, args=("telegram_commands", listen_commands), daemon=True).start()
-threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog), daemon=True).start()
 
 
 if __name__ == "__main__":
