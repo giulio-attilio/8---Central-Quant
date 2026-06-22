@@ -496,6 +496,21 @@ HEALTH = {
 }
 
 
+
+
+def run_thread_guarded(nome, target):
+    while True:
+        try:
+            target()
+            break
+        except Exception as e:
+            try:
+                HEALTH["last_error"] = f"Thread {nome} travou: {e}"
+            except Exception:
+                pass
+            print(f"ERRO FATAL THREAD MEME {nome}: {e}")
+            time.sleep(10)
+
 # ====================================================
 # UTILITÁRIOS
 # ====================================================
