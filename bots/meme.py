@@ -1,11 +1,46 @@
-# ==============================================================================
-# ROBÔ MEME HUNTER ELITE - VERSÃO FINAL QUANT & EXECUÇÃO REAL BINGX
-# ==============================================================================
-# Lógica Principal:
-# - Foco total na estratégia Hunter Breakout (Volume + Rompimento + Momentum).
-# - Otimizado para não estourar rate-limit da BingX (Usa fetch_tickers unificado).
-# - Abre e gerencia posições reais na conta de Futuros Perpétuos (Swap) da BingX.
-# - Proteção ativa contra Spikes e gerenciamento automatizado de TP50 e Trailing.
+# TREND PRO MTF H4/H1 + POI
+# Versão: 2026-06-11-TREND-PRO-ELITE-FASE1-BE-1R5
+#
+# Lógica:
+# - H4 é apenas contexto/filtro.
+# - H1 abre trade somente alinhado ao H4.
+# - POI H1 gera reentrada/atualização operacional.
+# - Novo POI só é enviado se o preço sair da zona EMA9/21 e retornar.
+# - EARLY detecta entrada antecipada em rejeição da EMA21.
+# - /health mostra status do robô.
+# - Filtro anti-spike protege contra candles/dados suspeitos.
+# - Sinal recuperado permite entrar em tendência H4/H1 já alinhada.
+# - Recuperado agora exige toque na zona EMA9/EMA21 para evitar entrada tardia.
+# - Risco ALTO é bloqueado por padrão.
+# - POI não dispara logo após entrada/recuperado.
+# - Não existe BUY/SELL H4 no Telegram.
+# - TP50 = maior entre 1R e 1 ATR H1.
+# - BE após TP50 com offset.
+# - Trailing stop após TP50 usando Chandelier 2 ATR.
+# - TP50 mínimo evita parciais muito curtas em POIs com risco pequeno.
+# - REENTRY permite nova entrada depois de trade encerrado que atingiu TP50.
+# - POI cooldown aumentado para 2 candles H1.
+# - Mensagens explicam o motivo do RECUPERADO e do REENTRY.
+# - Correção UTF-8 nas mensagens do Telegram e JSON/Redis.
+# - /reset não apaga posições abertas nem histórico; limpa apenas cooldowns/bloqueios.
+# - Relatório mensal no dia 01 sobre o mês anterior.
+# - Validação da watchlist contra mercados reais da BingX.
+# - /health melhorado substitui /status.
+# - Limite máximo de 20 posições abertas.
+# - /posicoes mostra origem do trade.
+# - Corrigido registro de ENTRY antes do return True.
+# - Histórico de sinais só é marcado após registro real da posição.
+# - Telegram só envia sinal se a posição foi registrada.
+# - Score Elite agora filtra sinais do Trend PRO Elite.
+#
+# Mensagens Telegram:
+# 🟢 BUY H1
+# 🔴 SELL H1
+# 🔵 POI H1
+# 🔁 REENTRY H1
+# 🟡 TP50 ATINGIDO
+# 🟣 TRAILING ATUALIZADO
+# 🟠 SL/TRAIL
 
 from flask import Flask
 import os
@@ -18,7 +53,6 @@ import ccxt
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
-# --- Funções Auxiliares de Fallback ---
 try:
     from strategy import calcular_atr
 except Exception:
@@ -38,61 +72,110 @@ try:
     from telegram_utils import send_telegram, fmt_br, fmt_pct
 except Exception:
     def fmt_br(v):
-        try: return f"{float(v):,.6f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        except Exception: return str(v)
+        try:
+            return f"{float(v):,.6f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return str(v)
+
     def fmt_pct(v):
-        try: return f"{float(v):+.2f}%".replace(".", ",")
-        except Exception: return str(v)
+        try:
+            return f"{float(v):+.2f}%".replace(".", ",")
+        except Exception:
+            return str(v)
+
+    def send_telegram(msg):
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        msg = normalizar_texto(msg)
+
+        if not token or not chat_id:
+            print(msg)
+            return
+
+        payload = {
+            "chat_id": chat_id,
+            "text": msg
+        }
+
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=20
+        )
+
 
 app = Flask(__name__)
 
-# --- Configurações de Ambiente ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-# --- Configurações de API da Conta Real BingX ---
-BINGX_API_KEY = os.environ.get("BINGX_API_KEY", "")
-BINGX_SECRET_KEY = os.environ.get("BINGX_SECRET_KEY", "")
-ALAVANCAGEM_PADRAO = 3  # Configura alavancagem para ativos voláteis
-VALOR_POR_TRADE_USDT = 15.0  # Margem utilizada por operação
-
 WATCHLIST_FILE = "watchlist_meme.json"
+
 POSITIONS_KEY = "memepro:positions"
 SIGNALS_KEY = "memepro:signals"
 TRADES_KEY = "memepro:trades"
 DAILY_SUMMARY_KEY = "memepro:daily_summary_sent"
 MONTHLY_SUMMARY_KEY = "memepro:monthly_summary_sent"
+REENTRY_BLOCK_KEY = "memepro:reentry_block"
 BE_MONITOR_KEY = "memepro:be_monitor"
 POI_COOLDOWN_KEY = "memepro:poi_cooldown"
 EARLY_COOLDOWN_KEY = "memepro:early_cooldown"
 
-# --- Parâmetros Técnicos & Estratégia ---
+# ====================================================
+# CONFIGURAÇÕES PRINCIPAIS
+# ====================================================
+
 TIMEFRAME_H4 = "4h"
 TIMEFRAME_H1 = "1h"
-EMA_FAST, EMA_MID, EMA50 = 9, 21, 50
-SUPERTREND_PERIOD, SUPERTREND_FACTOR = 10, 3.0
-ATR_LEN, SWING_LEN, ATR_BUFFER_STOP = 14, 5, 0.25
+
+EMA_FAST = 9
+EMA_MID = 21
+EMA50 = 50
+EMA200 = 200
+
+SUPERTREND_PERIOD = 10
+SUPERTREND_FACTOR = 3.0
+
+ATR_LEN = 14
+SWING_LEN = 5
+ATR_BUFFER_STOP = 0.25
 
 TP50_R = 1.0
-TP50_MIN_ATR = 1.0
+TP50_MIN_ATR = 1.0  # TP50 mínimo = 1 ATR H1
+
+# Gestão Elite:
+# - TP50 continua em 1R.
+# - Breakeven/trailing só ativa quando o trade andar 1,5R.
 BE_TRIGGER_R = 1.5
 BE_OFFSET_PCT = 0.10
 TRAIL_ATR_MULT = 2.0
 
+# Proteção anti-spike / dado ruim:
+# Se o range do candle for absurdo em relação ao ATR, o candle é marcado como suspeito.
 ENABLE_SPIKE_FILTER = True
 SPIKE_RANGE_ATR_MULT = 6.0
 SPIKE_BODY_ATR_MULT = 4.0
 
+# Risco máximo agora bloqueia sinais ALTO por padrão.
 USE_MAX_RISK_FILTER = True
 MAX_RISK_H1 = 2.5
-MAX_OPEN_POSITIONS = 20
-PROTECTION_SECONDS = 300
 
-# --- Configuração Específica Hunter Breakout ---
+# Limite de exposição operacional.
+MAX_OPEN_POSITIONS = 20
+
+# ====================================================
+# HUNTER BREAKOUT - ROMPIMENTO + VOLUME + MOMENTUM
+# ====================================================
 ENABLE_HUNTER_BREAKOUT = True
-HUNTER_BREAKOUT_ONLY = True  # Foco exclusivo na melhor estrutura para Memes
+
+# Quando True, o Meme Hunter só abre trades pelo setup Hunter Breakout.
+# Isso evita continuar misturando sinais RECUPERADO/POI do Trend PRO na estatística.
+HUNTER_BREAKOUT_ONLY = True
+
 HUNTER_SCORE_MIN = 60
 HUNTER_BREAKOUT_LOOKBACK = 10
 HUNTER_VOLUME_MULT_MIN = 1.8
@@ -100,475 +183,3314 @@ HUNTER_RSI_BUY_MIN = 60.0
 HUNTER_RSI_SELL_MAX = 40.0
 HUNTER_MAX_DISTANCE_EMA9_ATR = 2.5
 HUNTER_MIN_ADX_H4 = 15.0
+HUNTER_COOLDOWN_SECONDS = 60 * 60
 
-# --- Inicialização da API CCXT & Redis ---
-exchange_config = {"enableRateLimit": True, "options": {"defaultType": "swap"}}
-if BINGX_API_KEY and BINGX_SECRET_KEY:
-    exchange_config["apiKey"] = BINGX_API_KEY
-    exchange_config["secret"] = BINGX_SECRET_KEY
 
-exchange = ccxt.bingx(exchange_config)
-redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
+# ====================================================
+# TREND PRO ELITE - FILTROS OBRIGATÓRIOS
+# ====================================================
+# O Trend PRO agora vira Trend PRO Elite: menos sinais, maior qualidade.
+ENABLE_TRENDPRO_ELITE_FILTER = True
+
+# Filtro principal para sinais normais e REENTRY.
+# Fase 1: mais permissivo para avaliação prática.
+ELITE_THRESHOLD = 55
+ELITE_MIN_ADX_H4 = 15.0
+REQUIRE_HIGH_VOLUME = False
+REQUIRE_BB_EXPANDING = False
+
+# EARLY continua ativo como trade mais ousado, com score menor.
+EARLY_THRESHOLD = 45
+EARLY_MIN_ADX_H4 = 15.0
+
+# POI altera operacionalmente a posição; por isso também passa por filtro.
+POI_THRESHOLD = 50
+POI_MIN_ADX_H4 = 15.0
+POI_REQUIRE_HIGH_VOLUME = False
+
+# RECUPERADO desligado por enquanto.
+# Motivo: no histórico recente, muitos RECUPERADOS entraram tarde e deram stop.
+# Reavaliar depois de alguns dias/uma semana comparando TP50, stops e volume de sinais.
+ENABLE_RECOVERED_SIGNAL = True
+RECOVERED_REQUIRE_EMA_ZONE = True
+
+# Relatório automático de posições aos 50 minutos desligado.
+# Use /posicoes, /status ou /resumo sob demanda.
+ENABLE_AUTO_POSITION_REPORT = False
+
+# Informativos.
+ADX_LEN = 14
+ADX_MIN = 20.0
+
+# EARLY:
+# Entrada antecipada na EMA21, antes da confirmação completa do BUY/SELL H1.
+ENABLE_EARLY = True
+EARLYDX_H4_MIN = 15.0
+# Alias mantido para compatibilidade com versões anteriores.
+EARLY_ADX_H4_MIN = EARLYDX_H4_MIN
+EARLY_REQUIRE_VOLUME = False
+EARLY_COOLDOWN_SECONDS = 60 * 60
+
+# POI.
+POI_COOLDOWN_SECONDS = 2 * 60 * 60  # 2 candles H1
+POI_AFTER_ENTRY_COOLDOWN_SECONDS = 60 * 60  # evita POI logo após entrada
+ALLOW_POI_UPDATE_ENTRY = True
+
+# REENTRY:
+# Nova entrada depois que um trade anterior atingiu TP50 e foi encerrado.
+# Evita reentrar imediatamente no mesmo candle/correção.
+ENABLE_REENTRY_AFTER_TP50 = True
+REENTRY_AFTER_CLOSE_SECONDS = 2 * 60 * 60  # 2 candles H1
+REENTRY_COOLDOWN_SECONDS = 60 * 60
+
+# Proteção para não checar stop logo após BE/Trailing.
+PROTECTION_SECONDS = 300
+
+
+# Relatório mensal automático: dia 01, consolidando mês anterior.
+MONTHLY_SUMMARY_DAY = 1
+MONTHLY_SUMMARY_HOUR = 8
+MONTHLY_SUMMARY_MINUTE = 5
+
+exchange = ccxt.bingx({"enableRateLimit": True})
+exchange.options["defaultType"] = "swap"
+
+redis = Redis(
+    url=UPSTASH_REDIS_REST_URL,
+    token=UPSTASH_REDIS_REST_TOKEN
+)
 
 ultimo_candle_h1 = {}
 ultimo_relatorio_hora = None
+
 HEALTH = {
-    "started_at": None, "last_scanner_run": None, "last_management_run": None,
-    "last_success": None, "last_error": None, "last_watchlist_count": 0,
-    "last_signals_sent": 0, "last_positions_count": 0, "watchdog_status": "OK"
+    "started_at": None,
+    "last_scanner_run": None,
+    "last_management_run": None,
+    "last_success": None,
+    "last_error": None,
+    "last_watchlist_count": 0,
+    "last_signals_sent": 0,
+    "last_positions_count": 0,
+    "watchlist_total": 0,
+    "watchlist_valid": 0,
+    "watchlist_invalid": [],
+    "last_invalid_watchlist_check": None,
+    "last_watchdog_alert": None,
+    "watchdog_status": "OK"
 }
 
+# ====================================================
+# WATCHDOG
+# ====================================================
 WATCHDOG_CHECK_SECONDS = 300
 WATCHDOG_THRESHOLD_MINUTES = 20
 WATCHDOG_ALERT_COOLDOWN_SECONDS = 3600
 LAST_WATCHDOG_ALERT_TS = 0.0
 
-# ==============================================================================
-# FUNÇÕES DE INFRAESTRUTURA & UTILS
-# ==============================================================================
-def agora_sp(): return datetime.now(timezone(timedelta(hours=-3)))
-def data_hoje_sp_str(): return agora_sp().strftime("%Y-%m-%d")
-def data_hora_sp_str(): return agora_sp().strftime("%d/%m/%Y %H:%M")
-def nome_limpo(symbol): return symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
+
+# ====================================================
+# UTILITÁRIOS
+# ====================================================
+
+def agora_sp():
+    return datetime.now(timezone(timedelta(hours=-3)))
+
+
+def data_hoje_sp_str():
+    return agora_sp().strftime("%Y-%m-%d")
+
+
+def data_hora_sp_str():
+    return agora_sp().strftime("%d/%m/%Y %H:%M")
+
+
+def nome_limpo(symbol):
+    return symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
+
 
 def carregar_watchlist():
     try:
-        with open(WATCHLIST_FILE, "r") as f: return json.load(f)
-    except Exception: return []
+        with open(WATCHLIST_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print("ERRO WATCHLIST:", e)
+        return []
+
+
+def validar_watchlist_bingx(watchlist, avisar_telegram=False):
+    """
+    Valida a watchlist contra os mercados reais carregados pela BingX/CCXT.
+    Ativos inválidos são ignorados para não quebrar o scanner.
+    """
+    validos = []
+    invalidos = []
+
+    try:
+        markets = exchange.load_markets()
+    except Exception as e:
+        print("ERRO AO CARREGAR MERCADOS BINGX:", e)
+        HEALTH["watchlist_total"] = len(watchlist)
+        HEALTH["watchlist_valid"] = 0
+        HEALTH["watchlist_invalid"] = []
+        HEALTH["last_invalid_watchlist_check"] = data_hora_sp_str()
+        HEALTH["last_error"] = f"Erro load_markets BingX: {e}"
+        return watchlist
+
+    for symbol in watchlist:
+        if symbol in markets:
+            validos.append(symbol)
+        else:
+            invalidos.append(symbol)
+
+    HEALTH["watchlist_total"] = len(watchlist)
+    HEALTH["watchlist_valid"] = len(validos)
+    HEALTH["watchlist_invalid"] = invalidos
+    HEALTH["last_invalid_watchlist_check"] = data_hora_sp_str()
+
+    if invalidos:
+        msg = (
+            "⚠️ Ativos inválidos na watchlist BingX:\n\n"
+            + "\n".join(invalidos)
+            + "\n\n"
+            "Eles serão ignorados pelo scanner.\n"
+            "Confira se o contrato usa prefixo, exemplo: 1000BONK/USDT:USDT."
+        )
+
+        print(msg)
+
+        if avisar_telegram:
+            try:
+                safe_send_telegram(msg)
+            except Exception as e:
+                print("ERRO AO AVISAR WATCHLIST INVÁLIDA:", e)
+
+    return validos
+
+
+def redis_get_json(key, padrao):
+    try:
+        data = redis.get(key)
+        if data is None:
+            return padrao
+        if isinstance(data, str):
+            return json.loads(data)
+        return data
+    except Exception as e:
+        print(f"ERRO REDIS GET {key}:", e)
+        return padrao
+
+
+def redis_set_json(key, value):
+    try:
+        redis.set(key, json.dumps(value, ensure_ascii=False))
+    except Exception as e:
+        print(f"ERRO REDIS SET {key}:", e)
+
+
+def carregar_posicoes():
+    return redis_get_json(POSITIONS_KEY, {})
+
+
+def salvar_posicoes(dados):
+    redis_set_json(POSITIONS_KEY, dados)
+
+
+def carregar_sinais():
+    return redis_get_json(SIGNALS_KEY, {})
+
+
+def salvar_sinais(dados):
+    redis_set_json(SIGNALS_KEY, dados)
+
+
+def carregar_bloqueios_reentrada():
+    return redis_get_json(REENTRY_BLOCK_KEY, {})
+
+
+def salvar_bloqueios_reentrada(dados):
+    redis_set_json(REENTRY_BLOCK_KEY, dados)
+
+
+def carregar_trades():
+    return redis_get_json(TRADES_KEY, [])
+
+
+def carregar_monthly_summary_sent():
+    return redis_get_json(MONTHLY_SUMMARY_KEY, {})
+
+
+def salvar_monthly_summary_sent(dados):
+    redis_set_json(MONTHLY_SUMMARY_KEY, dados)
+
+
+
+def salvar_trades(dados):
+    redis_set_json(TRADES_KEY, dados)
+
+
+def carregar_monitor_be():
+    dados = redis_get_json(BE_MONITOR_KEY, [])
+    if isinstance(dados, list):
+        return dados
+    return []
+
+
+def salvar_monitor_be(dados):
+    if not isinstance(dados, list):
+        dados = []
+    redis_set_json(BE_MONITOR_KEY, dados)
+
+
+def carregar_poi_cooldown():
+    return redis_get_json(POI_COOLDOWN_KEY, {})
+
+
+def salvar_poi_cooldown(dados):
+    redis_set_json(POI_COOLDOWN_KEY, dados)
+
+
+def carregar_early_cooldown():
+    return redis_get_json(EARLY_COOLDOWN_KEY, {})
+
+
+def salvar_early_cooldown(dados):
+    redis_set_json(EARLY_COOLDOWN_KEY, dados)
+
+
+def early_em_cooldown(symbol, side):
+    dados = carregar_early_cooldown()
+    chave = f"{symbol}_{side}"
+    ultimo = float(dados.get(chave, 0))
+    return time.time() - ultimo < EARLY_COOLDOWN_SECONDS
+
+
+def marcar_early_cooldown(symbol, side):
+    dados = carregar_early_cooldown()
+    chave = f"{symbol}_{side}"
+    dados[chave] = time.time()
+
+    if len(dados) > 300:
+        itens = sorted(dados.items(), key=lambda x: x[1])
+        dados = dict(itens[-300:])
+
+    salvar_early_cooldown(dados)
+
+
+def registrar_evento_trade(evento):
+    trades = carregar_trades()
+    trades.append(evento)
+    if len(trades) > 1000:
+        trades = trades[-1000:]
+    salvar_trades(trades)
+
+
+def existe_posicao_ativa(symbol):
+    posicoes = carregar_posicoes()
+    return symbol in posicoes and posicoes[symbol].get("status") != "ENCERRADO"
+
+
+def pnl_pct(side, entry, price):
+    if side == "LONG":
+        return ((price - entry) / entry) * 100
+    return ((entry - price) / entry) * 100
+
+
+def check_bool(valor):
+    return "✅" if valor else "❌"
+
+
+def fmt_risco(valor):
+    try:
+        return f"{float(valor):.2f}".replace(".", ",")
+    except Exception:
+        return str(valor)
+
+
+def risco_label(risco_pct):
+    try:
+        r = float(risco_pct)
+    except Exception:
+        return "⚪ N/A"
+    if r <= 1.5:
+        return "🟢 IDEAL"
+    if r <= 2.5:
+        return "🟡 ATENÇÃO"
+    return "🔴 ALTO"
+
+
+def estado_txt(state):
+    if state == 1:
+        return "BULLISH ✅"
+    if state == -1:
+        return "BEARISH ✅"
+    return "NEUTRO ⚠️"
+
+
 
 def normalizar_texto(msg):
-    if msg is None: return ""
+    """
+    Garante string UTF-8 limpa para Telegram.
+    Corrige casos comuns de texto UTF-8 interpretado como Latin-1.
+    """
+    if msg is None:
+        return ""
+
     msg = str(msg)
+
+    # Corrige mojibake comum: RobÃ´, âœ…, ðŸ...
     try:
         if "Ã" in msg or "â" in msg or "ðŸ" in msg:
             msg = msg.encode("latin1").decode("utf-8")
-    except Exception: pass
+    except Exception:
+        pass
+
     return msg
 
-def send_telegram_safe(msg):
-    msg = normalizar_texto(msg)
-    if not TOKEN or not CHAT_ID:
-        print(msg)
-        return
-    payload = {"chat_id": CHAT_ID, "text": msg}
+def enviar_texto(chat_id, msg):
     try:
+        msg = normalizar_texto(msg)
+        payload = {
+            "chat_id": chat_id,
+            "text": msg
+        }
+
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=20
         )
-    except Exception as e: print("Erro Telegram:", e)
+    except Exception as e:
+        print("Erro ao responder Telegram:", e)
 
-# --- Métodos de Persistência via Redis JSON ---
-def redis_get_json(key, padrao):
+
+
+def safe_send_telegram(msg):
+    """
+    Wrapper para garantir UTF-8 mesmo se send_telegram vier de telegram_utils.
+    """
+    msg = normalizar_texto(msg)
+
     try:
-        data = redis.get(key)
-        if data is None: return padrao
-        return json.loads(data) if isinstance(data, str) else data
-    except Exception: return padrao
+        send_telegram(msg)
+    except UnicodeError:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            print(msg)
+            return
 
-def redis_set_json(key, value):
-    try: redis.set(key, json.dumps(value, ensure_ascii=False))
-    except Exception as e: print(f"Erro Redis Set {key}:", e)
+        payload = {
+            "chat_id": chat_id,
+            "text": msg
+        }
 
-def carregar_posicoes(): return redis_get_json(POSITIONS_KEY, {})
-def salvar_posicoes(dados): redis_set_json(POSITIONS_KEY, dados)
-def carregar_sinais(): return redis_get_json(SIGNALS_KEY, {})
-def salvar_sinais(dados): redis_set_json(SIGNALS_KEY, dados)
-def carregar_trades(): return redis_get_json(TRADES_KEY, [])
-def salvar_trades(dados): redis_set_json(TRADES_KEY, dados)
-def registrar_evento_trade(evento):
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=20
+        )
+
+
+
+
+def mes_anterior_ref():
+    hoje = agora_sp()
+    primeiro_mes_atual = hoje.replace(day=1)
+    ultimo_mes_anterior = primeiro_mes_atual - timedelta(days=1)
+    return ultimo_mes_anterior.strftime("%Y-%m"), ultimo_mes_anterior.strftime("%m/%Y")
+
+
+def montar_resumo_mensal():
+    mes_ref, mes_txt = mes_anterior_ref()
     trades = carregar_trades()
-    trades.append(evento)
-    salvar_trades(trades[-1000:])
 
-def pnl_pct(side, entry, price):
-    if side == "LONG": return ((price - entry) / entry) * 100
-    return ((entry - price) / entry) * 100
+    do_mes = [
+        t for t in trades
+        if str(t.get("date", "")).startswith(mes_ref)
+    ]
 
-def risco_label(risco_pct):
-    if risco_pct <= 1.5: return "🟢 IDEAL"
-    if risco_pct <= 2.5: return "🟡 ATENÇÃO"
-    return "🔴 ALTO"
+    entries = [t for t in do_mes if t.get("event") == "ENTRY"]
+    pois = [t for t in do_mes if t.get("event") == "POI"]
+    exits = [t for t in do_mes if t.get("event") in ["EXIT", "SL", "TRAIL", "BE", "CLOSE"]]
+    tp50s = [t for t in do_mes if t.get("event") == "TP50"]
+    trails = [t for t in do_mes if t.get("event") == "TRAILING"]
 
-# ==============================================================================
-# MÓDULO DE EXECUÇÃO REAL DE ORDENS FINANCEIRAS (BINGX)
-# ==============================================================================
-def executar_ordem_real_bingx(symbol, side, preco_referencia):
-    """
-    Executa a abertura real de ordens a mercado na conta de futuros perpétuos.
-    Lida com cálculo de tamanho de contrato, ajuste de alavancagem e margem.
-    """
-    if not BINGX_API_KEY or not BINGX_SECRET_KEY:
-        print(f"[SIMULAÇÃO] Ordem de {side} para {symbol} registrada (Sem API configurada).")
-        return True
+    longs = [t for t in entries if t.get("side") == "LONG"]
+    shorts = [t for t in entries if t.get("side") == "SHORT"]
+    earlys = [t for t in entries if t.get("signal_type") == "EARLY"]
+    recuperados = [t for t in entries if t.get("signal_type") == "RECUPERADO"]
+    reentries = [t for t in entries if t.get("signal_type") == "REENTRY"]
 
-    try:
-        # 1. Alinha Alavancagem no Ativo
+    wins = []
+    bes = []
+    losses = []
+    pnl_total = 0.0
+    melhor = None
+    pior = None
+
+    for t in exits:
         try:
-            exchange.set_leverage(ALAVANCAGEM_PADRAO, symbol)
-        except Exception as e:
-            print(f"Aviso ao definir alavancagem em {symbol}: {e}")
+            pnl = float(t.get("pnl", t.get("pnl_pct", t.get("result_pct", 0))))
+        except Exception:
+            pnl = 0.0
 
-        # 2. Calcula Tamanho da Ordem com Base no Valor Nominal Alavancado
-        valor_nominal_usdt = VALOR_POR_TRADE_USDT * ALAVANCAGEM_PADRAO
-        quantidade_contratos = valor_nominal_usdt / preco_referencia
+        pnl_total += pnl
 
-        # Arredonda de acordo com as regras de precisão da exchange
-        markets = exchange.load_markets()
-        market = markets.get(symbol)
-        if market and 'amount' in market['precision']:
-            quantidade_contratos = exchange.amount_to_precision(symbol, quantidade_contratos)
+        if pnl > 0.15:
+            wins.append(t)
+        elif pnl >= -0.15:
+            bes.append(t)
+        else:
+            losses.append(t)
 
-        # 3. Determina Direção da Execução
-        ordem_side = "buy" if side == "LONG" else "sell"
+        if melhor is None or pnl > float(melhor.get("_pnl_calc", -999999)):
+            t["_pnl_calc"] = pnl
+            melhor = t
 
-        print(f"📦 ENVIANDO ORDEM PRIVADA BINGX: {ordem_side.upper()} {quantidade_contratos} contratos em {symbol}")
-        ordem = exchange.create_market_order(symbol, ordem_side, quantidade_contratos)
-        print(f"✅ ORDEM EXECUTADA COM SUCESSO! ID: {ordem.get('id')}")
-        return True
+        if pior is None or pnl < float(pior.get("_pnl_calc", 999999)):
+            t["_pnl_calc"] = pnl
+            pior = t
 
-    except Exception as e:
-        print(f"🚨 ERRO CRÍTICO NA EXECUÇÃO FINANCEIRA EM {symbol}: {e}")
-        send_telegram_safe(f"❌ Erro ao abrir ordem real em {symbol}: {str(e)}")
-        return False
+    fechados = len(exits)
+    win_rate = (len(wins) / fechados * 100) if fechados else 0
+    win_rate_sem_be = (len(wins) / (len(wins) + len(losses)) * 100) if (len(wins) + len(losses)) else 0
 
-def fechar_ordem_real_bingx(symbol, side_posicao):
-    """Fecha a posição aberta executando a ordem reversa a mercado."""
-    if not BINGX_API_KEY or not BINGX_SECRET_KEY:
-        return True
+    melhor_txt = "N/A"
+    if melhor:
+        melhor_txt = f"{melhor.get('symbol_clean', melhor.get('symbol', 'N/A'))} {fmt_pct(melhor.get('_pnl_calc', 0))}"
+
+    pior_txt = "N/A"
+    if pior:
+        pior_txt = f"{pior.get('symbol_clean', pior.get('symbol', 'N/A'))} {fmt_pct(pior.get('_pnl_calc', 0))}"
+
+    msg = (
+        f"📊 RESUMO MENSAL MEME HUNTER\n"
+        f"Mês: {mes_txt}\n\n"
+        f"Sinais H1: {len(entries)}\n"
+        f"LONG: {len(longs)}\n"
+        f"SHORT: {len(shorts)}\n"
+        f"EARLY: {len(earlys)}\n"
+        f"RECUPERADO: {len(recuperados)}\n"
+        f"REENTRY: {len(reentries)}\n"
+        f"POIs H1: {len(pois)}\n\n"
+        f"Trades encerrados: {fechados}\n"
+        f"Wins: {len(wins)}\n"
+        f"Breakeven: {len(bes)}\n"
+        f"Loss: {len(losses)}\n"
+        f"Win rate: {win_rate:.2f}%\n"
+        f"Win rate sem BE: {win_rate_sem_be:.2f}%\n\n"
+        f"TP50 atingidos: {len(tp50s)}\n"
+        f"Trailings atualizados: {len(trails)}\n\n"
+        f"PnL realizado:\n"
+        f"{fmt_pct(pnl_total)}\n\n"
+        f"Melhor trade:\n"
+        f"{melhor_txt}\n\n"
+        f"Pior trade:\n"
+        f"{pior_txt}"
+    )
+
+    return msg
+
+
+def enviar_resumo_mensal_se_preciso():
+    agora = agora_sp()
+
+    if agora.day != MONTHLY_SUMMARY_DAY:
+        return
+
+    if agora.hour != MONTHLY_SUMMARY_HOUR or agora.minute < MONTHLY_SUMMARY_MINUTE:
+        return
+
+    enviados = carregar_monthly_summary_sent()
+    mes_ref, _ = mes_anterior_ref()
+
+    if enviados.get(mes_ref):
+        return
+
+    safe_send_telegram(montar_resumo_mensal())
+
+    enviados[mes_ref] = True
+
+    if len(enviados) > 36:
+        itens = sorted(enviados.items())
+        enviados = dict(itens[-36:])
+
+    salvar_monthly_summary_sent(enviados)
+
+
+def calcular_uptime_horas():
     try:
-        posicoes_conta = exchange.fetch_positions(symbols=[symbol])
-        quantidade = 0
-        for p in posicoes_conta:
-            if float(p.get('contracts', 0)) > 0:
-                quantidade = float(p['contracts'])
-                break
-        
-        if quantidade == 0:
-            return True
+        started_at = HEALTH.get("started_at")
+        if not started_at:
+            return None
 
-        ordem_side = "sell" if side_posicao == "LONG" else "buy"
-        exchange.create_market_order(symbol, ordem_side, quantidade)
-        print(f"🏁 POSIÇÃO REAL ENCERRADA EM {symbol}")
-        return True
-    except Exception as e:
-        print(f"Erro ao fechar posição real em {symbol}: {e}")
-        return False
+        inicio = datetime.strptime(started_at, "%d/%m/%Y %H:%M")
+        agora_local = agora_sp().replace(tzinfo=None)
+        return round((agora_local - inicio).total_seconds() / 3600, 2)
+    except Exception:
+        return None
 
-# ==============================================================================
-# INDICADORES & PROCESSAMENTO DE DADOS
-# ==============================================================================
+
+def montar_health_tecnico():
+    try:
+        posicoes = carregar_posicoes()
+        abertas = [
+            p for p in posicoes.values()
+            if p.get("status") != "ENCERRADO"
+        ]
+        HEALTH["last_positions_count"] = len(abertas)
+    except Exception:
+        abertas = []
+
+    positions_open = HEALTH.get("last_positions_count", 0)
+    usage_pct = (positions_open / MAX_OPEN_POSITIONS * 100) if MAX_OPEN_POSITIONS else 0
+
+    payload = {
+        "ok": HEALTH.get("last_error") is None,
+        "uptime_horas": calcular_uptime_horas(),
+        "started_at": HEALTH.get("started_at"),
+        "last_scanner_run": HEALTH.get("last_scanner_run"),
+        "last_management_run": HEALTH.get("last_management_run"),
+        "last_success": HEALTH.get("last_success"),
+        "last_error": HEALTH.get("last_error"),
+        "watchlist_total": HEALTH.get("watchlist_total", HEALTH.get("last_watchlist_count", 0)),
+        "watchlist_valida": HEALTH.get("watchlist_valid", HEALTH.get("last_watchlist_count", 0)),
+        "watchlist_invalida": len(HEALTH.get("watchlist_invalid", [])),
+        "watchlist_invalidos": HEALTH.get("watchlist_invalid", []),
+        "last_invalid_watchlist_check": HEALTH.get("last_invalid_watchlist_check"),
+        "positions_open": positions_open,
+        "positions_limit": MAX_OPEN_POSITIONS,
+        "positions_usage_pct": round(usage_pct, 2),
+        "can_open_new_positions": positions_open < MAX_OPEN_POSITIONS,
+        "last_signals_sent": HEALTH.get("last_signals_sent", 0),
+        "poi_cooldown_seconds": POI_COOLDOWN_SECONDS,
+        "reentry_enabled": ENABLE_REENTRY_AFTER_TP50,
+        "reentry_after_close_seconds": REENTRY_AFTER_CLOSE_SECONDS,
+        "max_risk": MAX_RISK_H1,
+        "use_max_risk_filter": USE_MAX_RISK_FILTER,
+        "trendpro_elite_filter": ENABLE_TRENDPRO_ELITE_FILTER,
+        "elite_threshold": ELITE_THRESHOLD,
+        "elite_min_adx_h4": ELITE_MIN_ADX_H4,
+        "require_high_volume": REQUIRE_HIGH_VOLUME,
+        "require_bb_expanding": REQUIRE_BB_EXPANDING,
+        "early_threshold": EARLY_THRESHOLD,
+        "early_min_adx_h4": EARLY_MIN_ADX_H4,
+        "poi_threshold": POI_THRESHOLD,
+        "poi_min_adx_h4": POI_MIN_ADX_H4,
+        "enable_recovered_signal": ENABLE_RECOVERED_SIGNAL,
+        "auto_position_report": ENABLE_AUTO_POSITION_REPORT,
+        "be_trigger_r": BE_TRIGGER_R
+    }
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def contar_posicoes_ativas():
+    try:
+        posicoes = carregar_posicoes()
+        abertas = [
+            p for p in posicoes.values()
+            if p.get("status") != "ENCERRADO"
+        ]
+        return len(abertas)
+    except Exception:
+        return 0
+
+
+def limite_posicoes_atingido():
+    return contar_posicoes_ativas() >= MAX_OPEN_POSITIONS
+
+
+def origem_trade_txt(p):
+    origem = (
+        p.get("signal_type")
+        or p.get("origin")
+        or p.get("origem")
+        or "NORMAL"
+    )
+
+    if origem == "NORMAL":
+        return "NORMAL"
+    if origem == "RECUPERADO":
+        return "RECUPERADO"
+    if origem in ["EARLY", "EARLY"]:
+        return "EARLY"
+    if origem == "REENTRY":
+        return "REENTRY"
+    if origem == "POI":
+        return "POI"
+
+    return str(origem)
+
+# ====================================================
+# INDICADORES
+# ====================================================
+
 def calcular_supertrend_df(df, period=10, multiplier=3.5):
-    high, low, close = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
     prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
     atr = tr.ewm(alpha=1 / period, adjust=False).mean()
     hl2 = (high + low) / 2
-    upperband, lowerband = hl2 + multiplier * atr, hl2 - multiplier * atr
-    final_upper, final_lower = upperband.copy(), lowerband.copy()
+
+    upperband = hl2 + multiplier * atr
+    lowerband = hl2 - multiplier * atr
+
+    final_upper = upperband.copy()
+    final_lower = lowerband.copy()
+
     direction = pd.Series(index=df.index, dtype="int64")
     supertrend = pd.Series(index=df.index, dtype="float64")
+
     direction.iloc[0] = 1
     supertrend.iloc[0] = lowerband.iloc[0]
 
     for i in range(1, len(df)):
-        final_upper.iloc[i] = upperband.iloc[i] if upperband.iloc[i] < final_upper.iloc[i - 1] or close.iloc[i - 1] > final_upper.iloc[i - 1] else final_upper.iloc[i - 1]
-        final_lower.iloc[i] = lowerband.iloc[i] if lowerband.iloc[i] > final_lower.iloc[i - 1] or close.iloc[i - 1] < final_lower.iloc[i - 1] else final_lower.iloc[i - 1]
-        if direction.iloc[i - 1] == -1: direction.iloc[i] = 1 if close.iloc[i] > final_upper.iloc[i] else -1
-        else: direction.iloc[i] = -1 if close.iloc[i] < final_lower.iloc[i] else 1
+        final_upper.iloc[i] = (
+            upperband.iloc[i]
+            if upperband.iloc[i] < final_upper.iloc[i - 1]
+            or close.iloc[i - 1] > final_upper.iloc[i - 1]
+            else final_upper.iloc[i - 1]
+        )
+
+        final_lower.iloc[i] = (
+            lowerband.iloc[i]
+            if lowerband.iloc[i] > final_lower.iloc[i - 1]
+            or close.iloc[i - 1] < final_lower.iloc[i - 1]
+            else final_lower.iloc[i - 1]
+        )
+
+        if direction.iloc[i - 1] == -1:
+            direction.iloc[i] = 1 if close.iloc[i] > final_upper.iloc[i] else -1
+        else:
+            direction.iloc[i] = -1 if close.iloc[i] < final_lower.iloc[i] else 1
+
         supertrend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+
     return supertrend, direction
 
+
+def calcular_adx(df, period=14):
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = pd.Series(
+        [u if u > d and u > 0 else 0 for u, d in zip(up_move, down_move)],
+        index=df.index
+    )
+    minus_dm = pd.Series(
+        [d if d > u and d > 0 else 0 for u, d in zip(up_move, down_move)],
+        index=df.index
+    )
+
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+
+    return adx, plus_di, minus_di
+
+
+
+
 def marcar_spikes(df):
+    """
+    Marca candles com range/pavio anormal em relação ao ATR.
+    Isso ajuda a evitar que um candle com dado ruim gere stop, ATR ou sinal falso.
+    """
     df = df.copy()
+
     if not ENABLE_SPIKE_FILTER:
         df["spike_suspeito"] = False
         return df
-    if "atr14" not in df.columns: df["atr14"] = calcular_atr(df, ATR_LEN)
+
+    if "atr14" not in df.columns:
+        df["atr14"] = calcular_atr(df, ATR_LEN)
+
     candle_range = (df["high"].astype(float) - df["low"].astype(float)).abs()
     candle_body = (df["close"].astype(float) - df["open"].astype(float)).abs()
     atr = df["atr14"].astype(float)
-    df["spike_suspeito"] = ((candle_range > atr * SPIKE_RANGE_ATR_MULT) | (candle_body > atr * SPIKE_BODY_ATR_MULT)).fillna(False)
+
+    spike_range = candle_range > (atr * SPIKE_RANGE_ATR_MULT)
+    spike_body = candle_body > (atr * SPIKE_BODY_ATR_MULT)
+
+    df["spike_suspeito"] = (spike_range | spike_body).fillna(False)
+
     return df
+
+
+
+def calcular_rsi(series, period=14):
+    series = series.astype(float)
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+
+    return rsi
+
 
 def preparar_df(df):
     df = df.copy()
+
     df["ema9"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=EMA50, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=EMA200, adjust=False).mean()
     df["atr14"] = calcular_atr(df, ATR_LEN)
     df = marcar_spikes(df)
-    _, st_dir = calcular_supertrend_df(df, SUPERTREND_PERIOD, SUPERTREND_FACTOR)
+
+    _, st_dir = calcular_supertrend_df(
+        df,
+        period=SUPERTREND_PERIOD,
+        multiplier=SUPERTREND_FACTOR
+    )
     df["supertrend_dir"] = st_dir
+
     df["vol_avg20"] = df["volume"].rolling(20).mean()
+    df["volume_ok"] = df["volume"] > df["vol_avg20"]
     df["volume_ratio"] = df["volume"] / df["vol_avg20"]
-    
-    # RSI cálculo manual limpo
-    delta = df["close"].astype(float).diff()
-    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
-    rs = gain.ewm(alpha=1/14, adjust=False).mean() / loss.ewm(alpha=1/14, adjust=False).mean().replace(0, 1e-10)
-    df["rsi14"] = 100 - (100 / (1 + rs))
+    df["rsi14"] = calcular_rsi(df["close"], 14)
 
     bb_basis = df["close"].rolling(20).mean()
     bb_dev = df["close"].rolling(20).std()
-    df["bb_ok"] = ((bb_basis + 2 * bb_dev) - (bb_basis - 2 * bb_dev)) / bb_basis > ((bb_basis + 2 * bb_dev) - (bb_basis - 2 * bb_dev)).rolling(100).mean()
+    bb_upper = bb_basis + 2 * bb_dev
+    bb_lower = bb_basis - 2 * bb_dev
+    bb_width = (bb_upper - bb_lower) / bb_basis
+    df["bb_width"] = bb_width
+    df["bb_width_avg"] = bb_width.rolling(100).mean()
+    df["bb_ok"] = bb_width > df["bb_width_avg"]
+
+    adx, plus_di, minus_di = calcular_adx(df, ADX_LEN)
+    df["adx"] = adx
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
+    df["adx_ok"] = adx >= ADX_MIN
+
     return df
+
+
+def estado_tendencia(candle):
+    super_bull = int(candle["supertrend_dir"]) == 1
+    super_bear = int(candle["supertrend_dir"]) == -1
+
+    ema_bull = float(candle["ema9"]) > float(candle["ema21"])
+    ema_bear = float(candle["ema9"]) < float(candle["ema21"])
+
+    if super_bull and ema_bull:
+        return 1
+    if super_bear and ema_bear:
+        return -1
+    return 0
+
+
+def nascimento_sinal(df):
+    candle = df.iloc[-2]
+    prev = df.iloc[-3]
+
+    state_now = estado_tendencia(candle)
+    state_prev = estado_tendencia(prev)
+
+    if state_now == 1 and state_prev != 1:
+        return "LONG"
+    if state_now == -1 and state_prev != -1:
+        return "SHORT"
+    return None
+
 
 def calcular_stop_tp(signal, entry, df):
     candle = df.iloc[-2]
     atr = float(candle["atr14"])
+
     ultimos = df.iloc[-(SWING_LEN + 1):-1]
+
     if signal == "LONG":
-        sl = float(ultimos["low"].min()) - atr * ATR_BUFFER_STOP
+        swing_low = float(ultimos["low"].min())
+        sl = swing_low - atr * ATR_BUFFER_STOP
         risk_abs = abs(entry - sl)
-        tp50 = entry + max(risk_abs * TP50_R, atr * TP50_MIN_ATR)
+
+        tp50_dist = max(
+            risk_abs * TP50_R,
+            atr * TP50_MIN_ATR
+        )
+
+        tp50 = entry + tp50_dist
+
     else:
-        sl = float(ultimos["high"].max()) + atr * ATR_BUFFER_STOP
+        swing_high = float(ultimos["high"].max())
+        sl = swing_high + atr * ATR_BUFFER_STOP
         risk_abs = abs(sl - entry)
-        tp50 = entry - max(risk_abs * TP50_R, atr * TP50_MIN_ATR)
+
+        tp50_dist = max(
+            risk_abs * TP50_R,
+            atr * TP50_MIN_ATR
+        )
+
+        tp50 = entry - tp50_dist
+
     return float(sl), float(tp50), float(risk_abs)
 
-# ==============================================================================
-# MOTOR DA ESTRATÉGIA: HUNTER BREAKOUT
-# ==============================================================================
-def detectar_hunter_breakout(symbol, df_h4_preparado=None):
-    if not ENABLE_HUNTER_BREAKOUT: return None
-    try:
-        ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=100)
-        df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
-        if df_h4_preparado is None:
-            ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=50)
-            df_h4_preparado = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
-    except Exception: return None
 
-    candle, candle_h4 = df_h1.iloc[-2], df_h4_preparado.iloc[-2]
-    if bool(candle.get("spike_suspeito", False)): return None
+
+def calcular_qualidade(side, h4_state, h1_candle):
+    pontos = 0.0
+
+    if side == "LONG" and h4_state == 1:
+        pontos += 2
+    elif side == "SHORT" and h4_state == -1:
+        pontos += 2
+
+    if bool(h1_candle.get("volume_ok", False)):
+        pontos += 1
+
+    if bool(h1_candle.get("bb_ok", False)):
+        pontos += 1
+
+    if bool(h1_candle.get("adx_ok", False)):
+        pontos += 1
+
+    if pontos >= 4:
+        return pontos, "ALTA 🟢"
+    if pontos >= 2:
+        return pontos, "MÉDIA 🟡"
+    return pontos, "BAIXA 🔴"
+
+
+def calcular_signal_score(s):
+    """
+    Score informativo do futuro Elite PRO.
+    Não altera entrada, não bloqueia sinal e não muda a gestão.
+    Serve para medir quais sinais do Trend PRO têm confluência mais forte.
+    """
+    score = 0
+
+    try:
+        h4_state = int(s.get("h4_state", 0))
+        h1_state = int(s.get("h1_state", 0))
+    except Exception:
+        h4_state = 0
+        h1_state = 0
+
+    # Alinhamento principal H4/H1.
+    if h4_state != 0 and h1_state == h4_state:
+        score += 25
+
+    # Força da tendência no H4.
+    try:
+        adx_h4 = float(s.get("adx_h4", 0))
+        if adx_h4 >= 40:
+            score += 25
+        elif adx_h4 >= 30:
+            score += 15
+        elif adx_h4 >= 20:
+            score += 8
+    except Exception:
+        pass
+
+    # Força da tendência no H1.
+    try:
+        adx_h1 = float(s.get("adx_h1", 0))
+        if adx_h1 >= 30:
+            score += 10
+        elif adx_h1 >= 20:
+            score += 5
+    except Exception:
+        pass
+
+    # Volume e expansão de volatilidade.
+    if bool(s.get("volume_ok", False)):
+        score += 15
+
+    if bool(s.get("bb_ok", False)):
+        score += 10
+
+    # Risco menor recebe mais pontos.
+    try:
+        risco = float(s.get("risk_pct", 99))
+        if risco <= 1.0:
+            score += 15
+        elif risco <= 1.5:
+            score += 10
+        elif risco <= 2.0:
+            score += 5
+    except Exception:
+        pass
+
+    # Qualidade já calculada pelo Trend PRO.
+    qualidade = str(s.get("qualidade", ""))
+    if "ALTA" in qualidade:
+        score += 10
+    elif "MÉDIA" in qualidade:
+        score += 5
+
+    return min(int(score), 100)
+
+
+def adicionar_signal_score(s):
+    score = calcular_signal_score(s)
+    s["signal_score"] = score
+    s["elite_candidate"] = score >= ELITE_THRESHOLD
+    return s
+
+
+
+def passa_filtro_trendpro_elite(
+    s,
+    threshold=None,
+    min_adx_h4=None,
+    require_high_volume=None,
+    require_bb_expanding=None,
+    label="SINAL"
+):
+    """
+    Filtro central do Trend PRO Elite.
+    Bloqueia sinais fracos antes de registrar posição, enviar Telegram ou atualizar POI.
+    """
+
+    if not ENABLE_TRENDPRO_ELITE_FILTER:
+        return True, "Filtro Elite desligado"
+
+    if threshold is None:
+        threshold = ELITE_THRESHOLD
+
+    if min_adx_h4 is None:
+        min_adx_h4 = ELITE_MIN_ADX_H4
+
+    if require_high_volume is None:
+        require_high_volume = REQUIRE_HIGH_VOLUME
+
+    if require_bb_expanding is None:
+        require_bb_expanding = REQUIRE_BB_EXPANDING
+
+    try:
+        score = int(s.get("signal_score", calcular_signal_score(s)))
+    except Exception:
+        score = 0
+
+    try:
+        adx_h4 = float(s.get("adx_h4", 0))
+    except Exception:
+        adx_h4 = 0.0
+
+    volume_ok = bool(s.get("volume_ok", False))
+    bb_ok = bool(s.get("bb_ok", False))
+
+    if score < threshold:
+        return False, f"{label}: Score abaixo do mínimo: {score}/{threshold}"
+
+    if adx_h4 < min_adx_h4:
+        return False, f"{label}: ADX H4 abaixo do mínimo: {adx_h4:.2f}/{min_adx_h4:.2f}"
+
+    if require_high_volume and not volume_ok:
+        return False, f"{label}: Volume H1 baixo"
+
+    if require_bb_expanding and not bb_ok:
+        return False, f"{label}: Bollinger H1 comprimindo"
+
+    return True, f"{label}: Aprovado no filtro Trend PRO Elite"
+
+
+# ====================================================
+# SINAL H1 ALINHADO AO H4
+# ====================================================
+
+def analisar_sinal_h1(symbol):
+    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    df_h1 = pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"])
+    df_h4 = pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"])
+
+    df_h1 = preparar_df(df_h1)
+    df_h4 = preparar_df(df_h4)
+
+    timestamp = int(df_h1.iloc[-2]["time"])
+    candle_h1 = df_h1.iloc[-2]
+    candle_h4 = df_h4.iloc[-2]
+
+    if bool(candle_h1.get("spike_suspeito", False)):
+        print(f"CANDLE H1 SUSPEITO IGNORADO: {nome_limpo(symbol)}")
+        return None, df_h1, df_h4
+
+    h4_state = estado_tendencia(candle_h4)
+    h1_state = estado_tendencia(candle_h1)
+
+    print(
+        f"{nome_limpo(symbol)} | "
+        f"H4={h4_state} | H1={h1_state} | "
+        f"ADX_H4={float(candle_h4.get('adx', 0)):.2f} | "
+        f"Volume_H1={bool(candle_h1.get('volume_ok', False))} | "
+        f"BB_H1={bool(candle_h1.get('bb_ok', False))}"
+    )
+
+    signal = nascimento_sinal(df_h1)
+    signal_type = "NORMAL"
+
+    if signal == "LONG" and h4_state != 1:
+        signal = None
+    elif signal == "SHORT" and h4_state != -1:
+        signal = None
+
+    # SINAL RECUPERADO:
+    # Se o robô iniciou depois que a tendência já nasceu, o nascimento do H1
+    # pode ter acontecido horas antes.
+    #
+    # Para evitar entrada atrasada, o RECUPERADO só é aceito quando
+    # o candle fechado toca a zona EMA9/EMA21.
+    if signal is None and ENABLE_RECOVERED_SIGNAL and h4_state != 0 and h1_state == h4_state:
+        ema9_h1 = float(candle_h1["ema9"])
+        ema21_h1 = float(candle_h1["ema21"])
+        zone_top = max(ema9_h1, ema21_h1)
+        zone_bottom = min(ema9_h1, ema21_h1)
+
+        inside_ema_zone = (
+            float(candle_h1["low"]) <= zone_top and
+            float(candle_h1["high"]) >= zone_bottom
+        )
+
+        recovered_confirmed = True
+
+        if RECOVERED_REQUIRE_EMA_ZONE:
+            recovered_confirmed = inside_ema_zone
+
+        if recovered_confirmed:
+            signal = "LONG" if h1_state == 1 else "SHORT"
+            signal_type = "RECUPERADO"
+
+    if not signal:
+        return None, df_h1, df_h4
+
+    entry = float(candle_h1["close"])
+    sl, tp50, risk_abs = calcular_stop_tp(signal, entry, df_h1)
+    risk_pct = risk_abs / entry * 100
+
+    if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1:
+        print(f"SINAL IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
+        return None, df_h1, df_h4
+
+    pontos, qualidade = calcular_qualidade(signal, h4_state, candle_h1)
+
+    return adicionar_signal_score({
+        "type": "SIGNAL",
+        "signal_type": signal_type,
+        "symbol": symbol,
+        "symbol_clean": nome_limpo(symbol),
+        "signal": signal,
+        "side": signal,
+        "timestamp": timestamp,
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "risk_abs": risk_abs,
+        "risk_pct": risk_pct,
+        "h4_state": h4_state,
+        "h1_state": h1_state,
+        "adx_h4": float(df_h4.iloc[-2]["adx"]),
+        "adx_h1": float(candle_h1["adx"]),
+        "volume_ok": bool(candle_h1.get("volume_ok", False)),
+        "bb_ok": bool(candle_h1.get("bb_ok", False)),
+        "qualidade_pontos": pontos,
+        "qualidade": qualidade
+    }), df_h1, df_h4
+
+
+
+
+
+# ====================================================
+# HUNTER BREAKOUT - ROMPIMENTO + VOLUME + MOMENTUM
+# ====================================================
+
+def calcular_hunter_score(s):
+    score = 0
+
+    try:
+        volume_ratio = float(s.get("volume_ratio", 0))
+        if volume_ratio >= 4.0:
+            score += 35
+        elif volume_ratio >= 3.0:
+            score += 30
+        elif volume_ratio >= HUNTER_VOLUME_MULT_MIN:
+            score += 25
+    except Exception:
+        pass
+
+    if bool(s.get("breakout_ok", False)):
+        score += 25
+
+    if bool(s.get("bb_ok", False)):
+        score += 15
+
+    try:
+        rsi = float(s.get("rsi", 50))
+        if s.get("signal") == "LONG":
+            if rsi >= 70:
+                score += 15
+            elif rsi >= HUNTER_RSI_BUY_MIN:
+                score += 10
+        else:
+            if rsi <= 30:
+                score += 15
+            elif rsi <= HUNTER_RSI_SELL_MAX:
+                score += 10
+    except Exception:
+        pass
+
+    try:
+        adx_h4 = float(s.get("adx_h4", 0))
+        if adx_h4 >= 25:
+            score += 10
+        elif adx_h4 >= HUNTER_MIN_ADX_H4:
+            score += 5
+    except Exception:
+        pass
+
+    try:
+        dist = float(s.get("dist_ema9_atr", 99))
+        if dist <= 1.5:
+            score += 10
+        elif dist <= HUNTER_MAX_DISTANCE_EMA9_ATR:
+            score += 5
+    except Exception:
+        pass
+
+    return min(int(score), 100)
+
+
+def detectar_hunter_breakout(symbol):
+    """
+    Hunter Breakout:
+    - Setup próprio para memecoins.
+    - Procura rompimento real com volume explosivo e momentum.
+    - Registra posição para gerar estatística completa.
+    """
+
+    if not ENABLE_HUNTER_BREAKOUT:
+        return None
+
+    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
+
+    candle = df_h1.iloc[-2]
+    candle_h4 = df_h4.iloc[-2]
+
+    if bool(candle.get("spike_suspeito", False)):
+        print(f"HUNTER IGNORADO POR CANDLE SUSPEITO: {nome_limpo(symbol)}")
+        return None
+
+    timestamp = int(candle["time"])
 
     lookback = int(HUNTER_BREAKOUT_LOOKBACK)
+    if len(df_h1) < lookback + 5:
+        return None
+
     anteriores = df_h1.iloc[-(lookback + 2):-2]
-    max_look, min_look = float(anteriores["high"].max()), float(anteriores["low"].min())
-    close, ema9, ema21, ema50, atr = float(candle["close"]), float(candle["ema9"]), float(candle["ema21"]), float(candle["ema50"]), float(candle["atr14"])
-    volume_ratio, rsi, bb_ok = float(candle.get("volume_ratio", 0)), float(candle.get("rsi14", 50)), bool(candle.get("bb_ok", False))
+    max_20 = float(anteriores["high"].max())
+    min_20 = float(anteriores["low"].min())
+
+    close = float(candle["close"])
+    ema9 = float(candle["ema9"])
+    ema21 = float(candle["ema21"])
+    ema50 = float(candle["ema50"])
+    atr = float(candle["atr14"])
+
+    volume_ratio = float(candle.get("volume_ratio", 0))
+    rsi = float(candle.get("rsi14", 50))
+    bb_ok = bool(candle.get("bb_ok", False))
+    adx_h4 = float(candle_h4.get("adx", 0))
     dist_ema9_atr = abs(close - ema9) / atr if atr > 0 else 99
 
-    if volume_ratio < HUNTER_VOLUME_MULT_MIN or dist_ema9_atr > HUNTER_MAX_DISTANCE_EMA9_ATR: return None
+    print(
+        f"HUNTER CHECK {nome_limpo(symbol)} | "
+        f"VOL={volume_ratio:.2f}x | "
+        f"RSI={rsi:.1f} | "
+        f"ADX_H4={adx_h4:.1f} | "
+        f"BB={bb_ok} | "
+        f"DIST_EMA9_ATR={dist_ema9_atr:.2f}"
+    )
+
+    if volume_ratio < HUNTER_VOLUME_MULT_MIN:
+        return None
+
+    if adx_h4 < HUNTER_MIN_ADX_H4:
+        return None
+
+    if dist_ema9_atr > HUNTER_MAX_DISTANCE_EMA9_ATR:
+        return None
 
     signal = None
-    if ema9 > ema21 >= ema50 and close > max_look and rsi >= HUNTER_RSI_BUY_MIN and bb_ok: signal = "LONG"
-    elif ema9 < ema21 <= ema50 and close < min_look and rsi <= HUNTER_RSI_SELL_MAX and bb_ok: signal = "SHORT"
+    breakout_ok = False
 
-    if not signal: return None
+    if (
+        ema9 > ema21 and
+        ema21 >= ema50 and
+        close > max_20 and
+        rsi >= HUNTER_RSI_BUY_MIN and
+        bb_ok
+    ):
+        signal = "LONG"
+        breakout_ok = True
+
+    elif (
+        ema9 < ema21 and
+        ema21 <= ema50 and
+        close < min_20 and
+        rsi <= HUNTER_RSI_SELL_MAX and
+        bb_ok
+    ):
+        signal = "SHORT"
+        breakout_ok = True
+
+    if not signal:
+        return None
 
     entry = close
     sl, tp50, risk_abs = calcular_stop_tp(signal, entry, df_h1)
     risk_pct = risk_abs / entry * 100
-    if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1: return None
 
-    # Score de Confirmação Quantitativa
-    score = 25 if volume_ratio >= 3.0 else 15
-    score += 25 if bb_ok else 0
-    score += 25 if rsi >= 65 or rsi <= 35 else 15
-    score += 25 if dist_ema9_atr <= 1.5 else 10
-    score = min(score, 100)
+    if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1:
+        print(f"HUNTER IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
+        return None
 
-    if score < HUNTER_SCORE_MIN: return None
+    h4_state = estado_tendencia(candle_h4)
+    h1_state = estado_tendencia(candle)
+    pontos, qualidade = calcular_qualidade(signal, h4_state, candle)
 
-    return {
-        "type": "HUNTER_BREAKOUT", "signal_type": "HUNTER_BREAKOUT", "symbol": symbol,
-        "symbol_clean": nome_limpo(symbol), "signal": signal, "side": signal, "timestamp": int(candle["time"]),
-        "entry": entry, "sl": sl, "tp50": tp50, "risk_abs": risk_abs, "risk_pct": risk_pct,
-        "hunter_score": score, "signal_score": score, "volume_ratio": volume_ratio, "rsi": rsi, "dist_ema9_atr": dist_ema9_atr
+    sinal = {
+        "type": "HUNTER_BREAKOUT",
+        "signal_type": "HUNTER_BREAKOUT",
+        "symbol": symbol,
+        "symbol_clean": nome_limpo(symbol),
+        "signal": signal,
+        "side": signal,
+        "timestamp": timestamp,
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "risk_abs": risk_abs,
+        "risk_pct": risk_pct,
+        "h4_state": h4_state,
+        "h1_state": h1_state,
+        "adx_h4": adx_h4,
+        "adx_h1": float(candle.get("adx", 0)),
+        "volume_ok": True,
+        "volume_ratio": volume_ratio,
+        "bb_ok": bb_ok,
+        "rsi": rsi,
+        "breakout_ok": breakout_ok,
+        "max_20": max_20,
+        "min_20": min_20,
+        "dist_ema9_atr": dist_ema9_atr,
+        "qualidade_pontos": pontos,
+        "qualidade": qualidade
     }
 
-# ==============================================================================
-# SISTEMA DE MONITORAMENTO DE POSIÇÕES (GERENCIAMENTO DE RISCO)
-# ==============================================================================
-def calcular_chandelier(symbol, side):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=40)
-        df = marcar_spikes(preparar_df(pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])))
-        ultimos = df.iloc[-20:-1]
-        ultimos = ultimos[~ultimos["spike_suspeito"]] if "spike_suspeito" in ultimos.columns else ultimos
-        atr = float(df.iloc[-2]["atr14"])
-        if side == "LONG": return float(ultimos["high"].max()) - atr * TRAIL_ATR_MULT
-        return float(ultimos["low"].min()) + atr * TRAIL_ATR_MULT
-    except Exception: return float(exchange.fetch_ticker(symbol)["last"])
+    hunter_score = calcular_hunter_score(sinal)
+    sinal["hunter_score"] = hunter_score
+    sinal["signal_score"] = hunter_score
+    sinal["elite_candidate"] = hunter_score >= HUNTER_SCORE_MIN
 
-def gerenciar_posicoes(tickers_cache):
+    if hunter_score < HUNTER_SCORE_MIN:
+        print(f"HUNTER BLOQUEADO POR SCORE: {nome_limpo(symbol)} | {hunter_score}/{HUNTER_SCORE_MIN}")
+        return None
+
+    return sinal
+
+
+def enviar_hunter_breakout(s):
+    emoji = "🐸🟢" if s["signal"] == "LONG" else "🐸🔴"
+    nome = "MEME HUNTER BUY" if s["signal"] == "LONG" else "MEME HUNTER SELL"
+
+    rompimento_txt = "máxima" if s["signal"] == "LONG" else "mínima"
+
+    msg = (
+        f"{emoji} {nome} - {s['symbol_clean']}\n\n"
+        f"Estratégia:\nHunter Breakout ✅\n\n"
+        f"Motivo:\n"
+        f"Rompimento da {rompimento_txt} de {HUNTER_BREAKOUT_LOOKBACK} candles ✅\n"
+        f"Volume explosivo ✅\n"
+        f"Momentum forte ✅\n"
+        f"Bollinger expandindo ✅\n\n"
+        f"Entrada:\n{fmt_br(s['entry'])}\n\n"
+        f"SL:\n{fmt_br(s['sl'])}\n\n"
+        f"TP50:\n{fmt_br(s['tp50'])}\n\n"
+        f"{risco_label(s['risk_pct'])} - Risco: {fmt_risco(s['risk_pct'])}%\n\n"
+        f"Score Hunter:\n{s.get('hunter_score', 0)}/100\n\n"
+        f"Informativos:\n"
+        f"Volume: {float(s.get('volume_ratio', 0)):.2f}x média\n"
+        f"RSI H1: {fmt_br(s.get('rsi', 0))}\n"
+        f"ADX H4: {fmt_br(s.get('adx_h4', 0))}\n"
+        f"Distância EMA9/ATR: {fmt_br(s.get('dist_ema9_atr', 0))}"
+    )
+
+    safe_send_telegram(msg)
+
+
+
+# ====================================================
+# EARLY - EMA21
+# ====================================================
+
+def detectar_early_a(symbol):
+    """
+    EARLY:
+    - Entrada antecipada a favor do H4 e contra o pullback do H1.
+    - EARLY BUY: H4 BULLISH e H1 BEARISH/contra-tendência.
+    - EARLY SELL: H4 BEARISH e H1 BULLISH/contra-tendência.
+    - Candle H1 fechado toca EMA21.
+    - Volume H1 alto, se habilitado.
+    - BUY: fecha acima da máxima do candle anterior.
+    - SELL: fecha abaixo da mínima do candle anterior.
+    - Não depende do H1 já estar alinhado; se H1 já alinhou, vira sinal normal.
+    """
+
+    if not ENABLE_EARLY:
+        return None
+
+    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
+
+    candle = df_h1.iloc[-2]
+    prev = df_h1.iloc[-3]
+    candle_h4 = df_h4.iloc[-2]
+
+    if bool(candle.get("spike_suspeito", False)):
+        print(f"EARLY IGNORADO POR CANDLE SUSPEITO: {nome_limpo(symbol)}")
+        return None
+
+    h4_state = estado_tendencia(candle_h4)
+    h1_state = estado_tendencia(candle)
+
+    if h4_state == 0:
+        return None
+
+    # EARLY só vale quando o H1 ainda está em pullback contra o H4:
+    # - H4 BULLISH + H1 BEARISH = possível EARLY BUY.
+    # - H4 BEARISH + H1 BULLISH = possível EARLY SELL.
+    # Se H1 já está alinhado ao H4, o sinal correto é NORMAL/ELITE, não EARLY.
+    if h4_state == 1 and h1_state != -1:
+        return None
+
+    if h4_state == -1 and h1_state != 1:
+        return None
+
+    adx_h4 = float(candle_h4.get("adx", 0))
+    if adx_h4 < EARLYDX_H4_MIN:
+        return None
+
+    volume_ok = bool(candle.get("volume_ok", False))
+    if EARLY_REQUIRE_VOLUME and not volume_ok:
+        return None
+
+    ema21 = float(candle["ema21"])
+    touched_ema21 = float(candle["low"]) <= ema21 <= float(candle["high"])
+
+    if not touched_ema21:
+        return None
+
+    close = float(candle["close"])
+    prev_high = float(prev["high"])
+    prev_low = float(prev["low"])
+
+    signal = None
+
+    if h4_state == 1 and close > prev_high:
+        signal = "LONG"
+
+    if h4_state == -1 and close < prev_low:
+        signal = "SHORT"
+
+    if not signal:
+        return None
+
+    if early_em_cooldown(symbol, signal):
+        return None
+
+    entry = close
+    sl, tp50, risk_abs = calcular_stop_tp(signal, entry, df_h1)
+    risk_pct = risk_abs / entry * 100
+
+    if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1:
+        print(f"EARLY IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
+        return None
+
+    pontos, qualidade = calcular_qualidade(signal, h4_state, candle)
+
+    marcar_early_cooldown(symbol, signal)
+
+    return adicionar_signal_score({
+        "type": "EARLY",
+        "signal_type": "EARLY",
+        "symbol": symbol,
+        "symbol_clean": nome_limpo(symbol),
+        "signal": signal,
+        "side": signal,
+        "timestamp": int(candle["time"]),
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "risk_abs": risk_abs,
+        "risk_pct": risk_pct,
+        "h4_state": h4_state,
+        "h1_state": h1_state,
+        "adx_h4": adx_h4,
+        "adx_h1": float(candle.get("adx", 0)),
+        "volume_ok": volume_ok,
+        "bb_ok": bool(candle.get("bb_ok", False)),
+        "qualidade_pontos": pontos,
+        "qualidade": qualidade
+    })
+
+
+# ====================================================
+# POI H1
+# ====================================================
+
+def poi_em_cooldown(symbol, side):
+    dados = carregar_poi_cooldown()
+    chave = f"{symbol}_{side}"
+    ultimo = float(dados.get(chave, 0))
+    return time.time() - ultimo < POI_COOLDOWN_SECONDS
+
+
+def marcar_poi_cooldown(symbol, side):
+    dados = carregar_poi_cooldown()
+    chave = f"{symbol}_{side}"
+    dados[chave] = time.time()
+
+    if len(dados) > 300:
+        itens = sorted(dados.items(), key=lambda x: x[1])
+        dados = dict(itens[-300:])
+
+    salvar_poi_cooldown(dados)
+
+
+def detectar_poi(symbol, posicao):
+    """
+    POI H1:
+    - Respeita cooldown de 1h.
+    - Não envia POI logo após entrada/RECUPERADO.
+    - Só envia novo POI se o preço tiver SAÍDO da zona EMA9/EMA21
+      depois do último POI e depois RETORNADO para a zona.
+    - Respeita risco máximo se USE_MAX_RISK_FILTER=True.
+    """
+
+    # Evita POI imediatamente após abrir/recuperar uma posição.
+    try:
+        active_since = float(posicao.get("active_since", posicao.get("created_at", 0)))
+        if time.time() - active_since < POI_AFTER_ENTRY_COOLDOWN_SECONDS:
+            return None
+    except Exception:
+        pass
+
+    if poi_em_cooldown(symbol, posicao["side"]):
+        return None
+
+    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
+
+    candle = df_h1.iloc[-2]
+
+    if bool(candle.get("spike_suspeito", False)):
+        print(f"POI IGNORADO POR CANDLE SUSPEITO: {nome_limpo(symbol)}")
+        return None
+
+    h4_state = estado_tendencia(df_h4.iloc[-2])
+    h1_state = estado_tendencia(candle)
+
+    side = posicao["side"]
+
+    if side == "LONG" and not (h4_state == 1 and h1_state == 1):
+        return None
+
+    if side == "SHORT" and not (h4_state == -1 and h1_state == -1):
+        return None
+
+    ema9 = float(candle["ema9"])
+    ema21 = float(candle["ema21"])
+    poi_top = max(ema9, ema21)
+    poi_bottom = min(ema9, ema21)
+
+    inside_zone = (
+        float(candle["low"]) <= poi_top and
+        float(candle["high"]) >= poi_bottom
+    )
+
+    posicoes = carregar_posicoes()
+    p_atual = posicoes.get(symbol, posicao)
+
+    last_poi_zone = bool(p_atual.get("last_poi_zone", False))
+
+    # Se saiu da zona, libera um novo POI futuro.
+    if not inside_zone:
+        if last_poi_zone:
+            p_atual["last_poi_zone"] = False
+            posicoes[symbol] = p_atual
+            salvar_posicoes(posicoes)
+        return None
+
+    # Se ainda está na zona desde o último POI, não repete mensagem.
+    if inside_zone and last_poi_zone:
+        return None
+
+    if side == "LONG":
+        confirmed = float(candle["close"]) > ema21
+    else:
+        confirmed = float(candle["close"]) < ema21
+
+    if not confirmed:
+        return None
+
+    entry = float(candle["close"])
+    sl = float(p_atual["sl"])
+    risk_abs = abs(entry - sl)
+    risk_pct = risk_abs / entry * 100
+
+    if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1:
+        print(f"POI IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
+        return None
+
+    atr = float(candle["atr14"])
+
+    tp50_dist = max(
+        risk_abs * TP50_R,
+        atr * TP50_MIN_ATR
+    )
+
+    if side == "LONG":
+        tp50 = entry + tp50_dist
+    else:
+        tp50 = entry - tp50_dist
+
+    marcar_poi_cooldown(symbol, side)
+
+    # Marca que já houve POI nesta permanência dentro da zona.
+    p_atual["last_poi_zone"] = True
+    posicoes[symbol] = p_atual
+    salvar_posicoes(posicoes)
+
+    pontos, qualidade = calcular_qualidade(side, h4_state, candle)
+
+    return adicionar_signal_score({
+        "type": "POI",
+        "signal_type": "POI",
+        "symbol": symbol,
+        "symbol_clean": nome_limpo(symbol),
+        "signal": side,
+        "side": side,
+        "timestamp": int(candle["time"]),
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "risk_abs": risk_abs,
+        "risk_pct": risk_pct,
+        "h4_state": h4_state,
+        "h1_state": h1_state,
+        "adx_h4": float(df_h4.iloc[-2]["adx"]),
+        "adx_h1": float(candle.get("adx", 0)),
+        "volume_ok": bool(candle.get("volume_ok", False)),
+        "bb_ok": bool(candle.get("bb_ok", False)),
+        "qualidade_pontos": pontos,
+        "qualidade": qualidade
+    })
+
+
+
+
+# ====================================================
+# REENTRY H1 APÓS TP50
+# ====================================================
+
+def detectar_reentry(symbol, posicao_fechada):
+    """
+    REENTRY:
+    - Só vale para trade encerrado que atingiu TP50.
+    - Não vale para SL antes do TP50.
+    - Aguarda pelo menos REENTRY_AFTER_CLOSE_SECONDS após fechamento.
+    - Exige H4/H1 ainda alinhados com o lado anterior.
+    - Exige que o preço tenha saído da zona EMA9/EMA21 após o fechamento
+      e depois retornado para a zona.
+    """
+
+    if not ENABLE_REENTRY_AFTER_TP50:
+        return None
+
+    if not posicao_fechada:
+        return None
+
+    if posicao_fechada.get("status") != "ENCERRADO":
+        return None
+
+    if not bool(posicao_fechada.get("tp50_hit", False)):
+        return None
+
+    try:
+        closed_at = float(posicao_fechada.get("closed_at", 0))
+        if time.time() - closed_at < REENTRY_AFTER_CLOSE_SECONDS:
+            return None
+    except Exception:
+        return None
+
+    try:
+        last_reentry_at = float(posicao_fechada.get("last_reentry_at", 0))
+        if time.time() - last_reentry_at < REENTRY_COOLDOWN_SECONDS:
+            return None
+    except Exception:
+        pass
+
+    side = posicao_fechada.get("side")
+    if side not in ["LONG", "SHORT"]:
+        return None
+
+    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
+
+    candle = df_h1.iloc[-2]
+
+    if bool(candle.get("spike_suspeito", False)):
+        print(f"REENTRY IGNORADO POR CANDLE SUSPEITO: {nome_limpo(symbol)}")
+        return None
+
+    h4_state = estado_tendencia(df_h4.iloc[-2])
+    h1_state = estado_tendencia(candle)
+
+    if side == "LONG" and not (h4_state == 1 and h1_state == 1):
+        return None
+
+    if side == "SHORT" and not (h4_state == -1 and h1_state == -1):
+        return None
+
+    ema9 = float(candle["ema9"])
+    ema21 = float(candle["ema21"])
+    zone_top = max(ema9, ema21)
+    zone_bottom = min(ema9, ema21)
+
+    inside_zone = (
+        float(candle["low"]) <= zone_top and
+        float(candle["high"]) >= zone_bottom
+    )
+
+    posicoes = carregar_posicoes()
+    p_atual = posicoes.get(symbol, posicao_fechada)
+
+    reentry_ready = bool(p_atual.get("reentry_ready", False))
+
+    # Primeiro precisa sair da zona após o fechamento.
+    if not inside_zone:
+        if not reentry_ready:
+            p_atual["reentry_ready"] = True
+            posicoes[symbol] = p_atual
+            salvar_posicoes(posicoes)
+        return None
+
+    # Se ainda não saiu da zona depois do fechamento, não reentra.
+    if inside_zone and not reentry_ready:
+        return None
+
+    if side == "LONG":
+        confirmed = float(candle["close"]) > ema21
+    else:
+        confirmed = float(candle["close"]) < ema21
+
+    if not confirmed:
+        return None
+
+    entry = float(candle["close"])
+    sl, tp50, risk_abs = calcular_stop_tp(side, entry, df_h1)
+    risk_pct = risk_abs / entry * 100
+
+    if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1:
+        print(f"REENTRY IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
+        return None
+
+    try:
+        candles_since_close = int((time.time() - float(posicao_fechada.get("closed_at", time.time()))) / (60 * 60))
+    except Exception:
+        candles_since_close = None
+
+    pontos, qualidade = calcular_qualidade(side, h4_state, candle)
+
+    p_atual["reentry_ready"] = False
+    p_atual["last_reentry_at"] = time.time()
+    posicoes[symbol] = p_atual
+    salvar_posicoes(posicoes)
+
+    return adicionar_signal_score({
+        "type": "REENTRY",
+        "signal_type": "REENTRY",
+        "symbol": symbol,
+        "symbol_clean": nome_limpo(symbol),
+        "signal": side,
+        "side": side,
+        "timestamp": int(candle["time"]),
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "risk_abs": risk_abs,
+        "risk_pct": risk_pct,
+        "h4_state": h4_state,
+        "h1_state": h1_state,
+        "adx_h4": float(df_h4.iloc[-2]["adx"]),
+        "adx_h1": float(candle["adx"]),
+        "volume_ok": bool(candle.get("volume_ok", False)),
+        "bb_ok": bool(candle.get("bb_ok", False)),
+        "candles_since_close": candles_since_close,
+        "qualidade_pontos": pontos,
+        "qualidade": qualidade
+    })
+
+# ====================================================
+# TELEGRAM
+# ====================================================
+
+def enviar_early_a(s):
+    emoji = "🚀 🟢" if s["signal"] == "LONG" else "🚀 🔴"
+    nome = "EARLY BUY" if s["signal"] == "LONG" else "EARLY SELL"
+    volume_txt = "ALTO ✅" if s.get("volume_ok") else "BAIXO ⚠️"
+    bollinger_txt = "EXPANDINDO ✅" if s.get("bb_ok") else "COMPRIMINDO ⚠️"
+
+    msg = (
+        f"{emoji} {nome} - {s['symbol_clean']}\n\n"
+        f"Entrada antecipada na EMA21\n"
+        f"A favor do H4 e contra o pullback do H1\n\n"
+        f"H4: {estado_txt(s['h4_state'])}\n"
+        f"H1 Pullback: {estado_txt(s['h1_state'])}\n\n"
+        f"Entrada:\n{fmt_br(s['entry'])}\n\n"
+        f"SL:\n{fmt_br(s['sl'])}\n\n"
+        f"TP50:\n{fmt_br(s['tp50'])}\n\n"
+        f"{risco_label(s['risk_pct'])} - Risco: {fmt_risco(s['risk_pct'])}%\n\n"
+        f"Qualidade:\n{s.get('qualidade', 'N/A')}\n\n"
+        f"Score Elite:\n{s.get('signal_score', calcular_signal_score(s))}/100\n\n"
+        f"Informativos:\n"
+        f"ADX H4: {fmt_br(s.get('adx_h4', 0))}\n"
+        f"Volume H1: {volume_txt}\n"
+        f"Bollinger H1: {bollinger_txt}"
+    )
+
+    safe_send_telegram(msg)
+
+
+def enviar_sinal_h1(s):
+    emoji = "🟢" if s["signal"] == "LONG" else "🔴"
+    nome = "BUY" if s["signal"] == "LONG" else "SELL"
+    tipo = " RECUPERADO" if s.get("signal_type") == "RECUPERADO" else ""
+
+    volume_txt = "ALTO ✅" if s.get("volume_ok") else "BAIXO ⚠️"
+    bollinger_txt = "EXPANDINDO ✅" if s.get("bb_ok") else "COMPRIMINDO ⚠️"
+
+    motivo_extra = ""
+
+    if s.get("signal_type") == "RECUPERADO":
+        motivo_extra = (
+            "Motivo do recuperado:\n"
+            "Retorno à zona EMA9/EMA21 após alinhamento H4/H1 mantido ✅\n"
+            "Tendência principal continua válida ✅\n"
+            "Entrada de continuação após pullback ✅\n\n"
+        )
+
+    msg = (
+        f"{emoji} {nome} H1{tipo} - {s['symbol_clean']}\n\n"
+        f"{motivo_extra}"
+        f"H4: {estado_txt(s['h4_state'])}\n"
+        f"H1: {estado_txt(s['h1_state'])}\n\n"
+        f"Entrada:\n{fmt_br(s['entry'])}\n\n"
+        f"SL:\n{fmt_br(s['sl'])}\n\n"
+        f"TP50:\n{fmt_br(s['tp50'])}\n\n"
+        f"{risco_label(s['risk_pct'])} - Risco: {fmt_risco(s['risk_pct'])}%\n\n"
+        f"Qualidade:\n{s.get('qualidade', 'N/A')}\n\n"
+        f"Score Elite:\n{s.get('signal_score', calcular_signal_score(s))}/100\n\n"
+        f"Informativos:\n"
+        f"ADX H4: {fmt_br(s.get('adx_h4', 0))}\n"
+        f"Volume H1: {volume_txt}\n"
+        f"Bollinger H1: {bollinger_txt}"
+    )
+
+    safe_send_telegram(msg)
+
+
+def enviar_reentry(s):
+    emoji = "🔁 🟢" if s["signal"] == "LONG" else "🔁 🔴"
+    nome = "REENTRY BUY H1" if s["signal"] == "LONG" else "REENTRY SELL H1"
+
+    volume_txt = "ALTO ✅" if s.get("volume_ok") else "BAIXO ⚠️"
+    bollinger_txt = "EXPANDINDO ✅" if s.get("bb_ok") else "COMPRIMINDO ⚠️"
+
+    candles_txt = "N/A" if s.get("candles_since_close") is None else str(s.get("candles_since_close"))
+
+    msg = (
+        f"{emoji} {nome} - {s['symbol_clean']}\n\n"
+        f"Motivo do reentry:\n"
+        f"Trade anterior atingiu TP50 ✅\n"
+        f"Preço voltou à zona EMA9/EMA21 ✅\n"
+        f"Tendência principal permanece alinhada ✅\n"
+        f"Candles desde saída: {candles_txt}\n\n"
+        f"H4: {estado_txt(s['h4_state'])}\n"
+        f"H1: {estado_txt(s['h1_state'])}\n\n"
+        f"Entrada:\n{fmt_br(s['entry'])}\n\n"
+        f"SL:\n{fmt_br(s['sl'])}\n\n"
+        f"TP50:\n{fmt_br(s['tp50'])}\n\n"
+        f"{risco_label(s['risk_pct'])} - Risco: {fmt_risco(s['risk_pct'])}%\n\n"
+        f"Qualidade:\n{s.get('qualidade', 'N/A')}\n\n"
+        f"Score Elite:\n{s.get('signal_score', calcular_signal_score(s))}/100\n\n"
+        f"Informativos:\n"
+        f"ADX H4: {fmt_br(s.get('adx_h4', 0))}\n"
+        f"Volume H1: {volume_txt}\n"
+        f"Bollinger H1: {bollinger_txt}"
+    )
+
+    safe_send_telegram(msg)
+
+
+
+
+def enviar_poi(s):
+    emoji = "🔵"
+    nome = "POI H1"
+
+    msg = (
+        f"{emoji} {nome} - {s['symbol_clean']}\n\n"
+        f"H4: {estado_txt(s['h4_state'])}\n"
+        f"H1: {estado_txt(s['h1_state'])}\n\n"
+        f"Entrada:\n{fmt_br(s['entry'])}\n\n"
+        f"SL:\n{fmt_br(s['sl'])}\n\n"
+        f"TP50:\n{fmt_br(s['tp50'])}\n\n"
+        f"{risco_label(s['risk_pct'])} - Risco: {fmt_risco(s['risk_pct'])}%"
+    )
+
+    safe_send_telegram(msg)
+
+
+def enviar_tp50(p, tp50, pnl_tp):
+    safe_send_telegram(
+        f"🎯 TP50 ATINGIDO - {p['symbol_clean']}\n\n"
+        f"Parcial 50% realizada ✅\n\n"
+        f"Resultado parcial:\n"
+        f"{fmt_pct(pnl_tp)}\n\n"
+        f"Status:\n"
+        f"Aguardando Breakeven 1,5R ✅"
+    )
+
+
+def enviar_trailing_ativado(p, novo_stop):
+    lucro_protegido = pnl_pct(
+        p["side"],
+        float(p["entry"]),
+        float(novo_stop)
+    )
+
+    safe_send_telegram(
+        f"🟣 TRAILING ATIVADO - {p['symbol_clean']}\n\n"
+        f"Novo Stop:\n"
+        f"{fmt_br(novo_stop)}\n\n"
+        f"Lucro protegido:\n"
+        f"{fmt_pct(lucro_protegido)}\n\n"
+        f"Status:\n"
+        f"Breakeven ativo ✅"
+    )
+
+
+def enviar_trailing(p, novo_stop):
+    lucro_protegido = pnl_pct(
+        p["side"],
+        float(p["entry"]),
+        float(novo_stop)
+    )
+
+    safe_send_telegram(
+        f"🟣 TRAILING ATUALIZADO - {p['symbol_clean']}\n\n"
+        f"Novo Stop:\n"
+        f"{fmt_br(novo_stop)}\n\n"
+        f"Lucro protegido:\n"
+        f"{fmt_pct(lucro_protegido)}"
+    )
+
+
+def enviar_stop(p, preco_atual, stop, resultado):
+    titulo = "🟣 TRAIL STOP" if resultado >= 0 else "🟠 STOP"
+
+    safe_send_telegram(
+        f"{titulo} - {p['symbol_clean']}\n\n"
+        f"Preço atual:\n"
+        f"{fmt_br(preco_atual)}\n\n"
+        f"Saída:\n"
+        f"{fmt_br(stop)}\n\n"
+        f"Resultado:\n"
+        f"{fmt_pct(resultado)}"
+    )
+
+
+# ====================================================
+# POSIÇÕES
+# ====================================================
+
+def registrar_posicao(s):
+    posicoes = carregar_posicoes()
+
+    # BLOQUEIO CENTRAL DE LIMITE:
+    # Garante que NORMAL, RECUPERADO, EARLY e REENTRY não abram acima do limite.
+    symbol = s["symbol"]
+
+    posicoes_ativas = [
+        p for p in posicoes.values()
+        if p.get("status") != "ENCERRADO"
+    ]
+
+    if symbol in posicoes and posicoes[symbol].get("status") != "ENCERRADO":
+        print(f"POSIÇÃO JÁ ATIVA IGNORADA: {nome_limpo(symbol)}")
+        return False
+
+    if len(posicoes_ativas) >= MAX_OPEN_POSITIONS:
+        print(
+            f"SINAL IGNORADO POR LIMITE DE POSIÇÕES: "
+            f"{nome_limpo(symbol)} | {len(posicoes_ativas)}/{MAX_OPEN_POSITIONS}"
+        )
+        return False
+
+    posicoes[symbol] = {
+        "symbol": symbol,
+        "symbol_clean": s["symbol_clean"],
+        "side": s["signal"],
+        "entry": s["entry"],
+        "sl": s["sl"],
+        "tp50": s["tp50"],
+        "risk_abs": s["risk_abs"],
+        "risk_pct": s["risk_pct"],
+        "status": "ATIVO",
+        "breakeven": False,
+        "tp50_hit": False,
+        "timestamp": s["timestamp"],
+        "created_at": time.time(),
+        "active_since": time.time(),
+        "breakeven_activated_at": None,
+        "trailing_activated_at": None,
+        "h4_state": s.get("h4_state"),
+        "h1_state": s.get("h1_state"),
+        "signal_type": s.get("signal_type", "NORMAL"),
+        "signal_score": s.get("signal_score", calcular_signal_score(s)),
+        "elite_candidate": bool(s.get("elite_candidate", s.get("signal_score", calcular_signal_score(s)) >= ELITE_THRESHOLD)),
+        "last_poi_zone": False,
+        "reentry_ready": False,
+        "last_reentry_at": None,
+        "closed_at": None,
+        "closed_reason": None
+    }
+
+    salvar_posicoes(posicoes)
+
+    registrar_evento_trade({
+        "event": "ENTRY",
+        "date": data_hoje_sp_str(),
+        "datetime": data_hora_sp_str(),
+        "symbol": symbol,
+        "symbol_clean": s["symbol_clean"],
+        "side": s["signal"],
+        "entry": s["entry"],
+        "sl": s["sl"],
+        "tp50": s["tp50"],
+        "risk_pct": s["risk_pct"],
+        "h4_state": s.get("h4_state"),
+        "h1_state": s.get("h1_state"),
+        "qualidade": s.get("qualidade"),
+        "qualidade_pontos": s.get("qualidade_pontos"),
+        "signal_type": s.get("signal_type", "NORMAL"),
+        "signal_score": s.get("signal_score", calcular_signal_score(s)),
+        "hunter_score": s.get("hunter_score"),
+        "volume_ratio": s.get("volume_ratio"),
+        "rsi": s.get("rsi"),
+        "elite_candidate": bool(s.get("elite_candidate", s.get("signal_score", calcular_signal_score(s)) >= ELITE_THRESHOLD))
+    })
+
+    return True
+
+
+def atualizar_posicao_com_poi(poi):
+    if not ALLOW_POI_UPDATE_ENTRY:
+        return
+
+    posicoes = carregar_posicoes()
+    p = posicoes.get(poi["symbol"])
+
+    if not p or p.get("status") == "ENCERRADO":
+        return
+
+    p["entry"] = poi["entry"]
+    p["tp50"] = poi["tp50"]
+    p["risk_abs"] = poi["risk_abs"]
+    p["risk_pct"] = poi["risk_pct"]
+    p["timestamp"] = poi["timestamp"]
+    p["active_since"] = time.time()
+    p["breakeven"] = False
+    p["tp50_hit"] = False
+    p["status"] = "ATIVO"
+    p["breakeven_activated_at"] = None
+    p["trailing_activated_at"] = None
+    p["last_poi_zone"] = True
+    p["last_update_type"] = "POI"
+
+    posicoes[poi["symbol"]] = p
+    salvar_posicoes(posicoes)
+
+    registrar_evento_trade({
+        "event": "POI",
+        "date": data_hoje_sp_str(),
+        "datetime": data_hora_sp_str(),
+        "symbol": poi["symbol"],
+        "symbol_clean": poi["symbol_clean"],
+        "side": poi["side"],
+        "entry": poi["entry"],
+        "sl": poi["sl"],
+        "tp50": poi["tp50"],
+        "risk_pct": poi["risk_pct"],
+        "h4_state": poi.get("h4_state"),
+        "h1_state": poi.get("h1_state"),
+        "signal_score": poi.get("signal_score"),
+        "elite_candidate": poi.get("elite_candidate"),
+        "qualidade": poi.get("qualidade"),
+        "qualidade_pontos": poi.get("qualidade_pontos")
+    })
+
+
+def calcular_chandelier(symbol, side):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
+    df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+    df["atr14"] = calcular_atr(df, ATR_LEN)
+    df = marcar_spikes(df)
+
+    candle = df.iloc[-2]
+    atr = float(candle["atr14"])
+
+    ultimos = df.iloc[-40:-1]
+    if "spike_suspeito" in ultimos.columns:
+        ultimos = ultimos[~ultimos["spike_suspeito"]]
+
+    if len(ultimos) < 10:
+        ultimos = df.iloc[-23:-1]
+
+    if side == "LONG":
+        highest_high = float(ultimos["high"].max())
+        return highest_high - atr * TRAIL_ATR_MULT
+
+    lowest_low = float(ultimos["low"].min())
+    return lowest_low + atr * TRAIL_ATR_MULT
+
+
+def stop_em_carencia(p):
+    agora = time.time()
+
+    for campo in ["breakeven_activated_at", "trailing_activated_at"]:
+        val = p.get(campo)
+        if val is None:
+            continue
+        try:
+            if agora - float(val) < PROTECTION_SECONDS:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def adicionar_monitor_be(p, entry, exit_price):
+    monitores = carregar_monitor_be()
+
+    monitores.append({
+        "symbol": p["symbol"],
+        "symbol_clean": p["symbol_clean"],
+        "side": p["side"],
+        "entry": entry,
+        "exit_price": exit_price,
+        "closed_at": time.time(),
+        "closed_date": data_hoje_sp_str(),
+        "closed_datetime": data_hora_sp_str(),
+        "monitor_until": time.time() + 86400,
+        "best_after_pct": 0.0,
+        "active": True
+    })
+
+    if len(monitores) > 500:
+        monitores = monitores[-500:]
+
+    salvar_monitor_be(monitores)
+
+
+def atualizar_monitor_be():
+    monitores = carregar_monitor_be()
+
+    if not monitores:
+        return
+
+    agora = time.time()
+    alterou = False
+
+    for m in monitores:
+        if not m.get("active"):
+            continue
+
+        try:
+            ticker = exchange.fetch_ticker(m["symbol"])
+            preco = float(ticker["last"])
+            saida = float(m["exit_price"])
+
+            if m["side"] == "LONG":
+                movimento = ((preco - saida) / saida) * 100
+            else:
+                movimento = ((saida - preco) / saida) * 100
+
+            if movimento > float(m.get("best_after_pct", 0)):
+                m["best_after_pct"] = movimento
+                alterou = True
+
+            if agora >= float(m.get("monitor_until", 0)):
+                m["active"] = False
+                alterou = True
+
+        except Exception as e:
+            print("ERRO MONITOR BE:", e)
+
+    if alterou:
+        salvar_monitor_be(monitores)
+
+
+def gerenciar_posicoes():
     posicoes = carregar_posicoes()
     alterou = False
 
     for symbol, p in list(posicoes.items()):
-        if p.get("status") == "ENCERRADO": continue
+        if p.get("status") == "ENCERRADO":
+            continue
 
         try:
-            # Puxa o preço do cache unificado para poupar a API
-            ticker = tickers_cache.get(symbol)
-            if not ticker: continue
+            ticker = exchange.fetch_ticker(symbol)
             preco_atual = float(ticker["last"])
 
-            side, entry, sl, tp50 = p["side"], float(p["entry"]), float(p["sl"]), float(p["tp50"])
+            # Proteção anti-spike para gestão:
+            # se o último candle H1 fechado for suspeito, não atualiza stop/TP nesta rodada.
+            try:
+                ohlcv_check = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
+                df_check = pd.DataFrame(ohlcv_check, columns=["time", "open", "high", "low", "close", "volume"])
+                df_check["atr14"] = calcular_atr(df_check, ATR_LEN)
+                df_check = marcar_spikes(df_check)
+                if bool(df_check.iloc[-2].get("spike_suspeito", False)):
+                    print(f"GESTÃO PAUSADA POR CANDLE SUSPEITO: {nome_limpo(symbol)}")
+                    continue
+            except Exception as e:
+                print(f"ERRO CHECAGEM SPIKE {nome_limpo(symbol)}:", e)
 
-            # 1. Execução de Stop Loss Físico
-            if (side == "LONG" and preco_atual <= sl) or (side == "SHORT" and preco_atual >= sl):
-                resultado = pnl_pct(side, entry, sl)
-                fechar_ordem_real_bingx(symbol, side)
-                p["status"] = "ENCERRADO"
-                p["closed_at"] = time.time()
-                alterou = True
-                
-                send_telegram_safe(f"🟣 TRAIL STOP/SL ATINGIDO - {p['symbol_clean']}\nResultado: {fmt_pct(resultado)}")
-                registrar_evento_trade({"event": "CLOSE", "symbol": symbol, "pnl": resultado, "result_type": "SL"})
-                continue
+            side = p["side"]
+            entry = float(p["entry"])
+            sl = float(p["sl"])
+            tp50 = float(p["tp50"])
 
-            # 2. Execução de Alvo Parcial (TP50)
-            if not p.get("tp50_hit") and ((side == "LONG" and preco_atual >= tp50) or (side == "SHORT" and preco_atual <= tp50)):
-                p["tp50_hit"] = True
-                p["status"] = "TP50 HIT"
-                alterou = True
-                send_telegram_safe(f"🎯 TP50 ATINGIDO - {p['symbol_clean']}\nParcial 50% no bolso! Aguardando gatilho BE a 1.5R.")
-                registrar_evento_trade({"event": "TP50", "symbol": symbol, "entry": entry, "tp50": tp50})
-                continue
+            # STOP por preço em tempo real.
+            if not stop_em_carencia(p):
+                if side == "LONG" and preco_atual <= sl:
+                    resultado = pnl_pct(side, entry, sl)
+                    enviar_stop(p, preco_atual, sl, resultado)
 
-            # 3. Gatilho de Breakeven e Ativação do Trailing (Apenas em 1.5R)
-            if p.get("tp50_hit") and not p.get("breakeven"):
-                risk_abs = float(p.get("risk_abs", abs(entry - sl)))
-                gatilho_be = entry + (risk_abs * BE_TRIGGER_R) if side == "LONG" else entry - (risk_abs * BE_TRIGGER_R)
+                    resultado_tipo = (
+                        "BREAKEVEN"
+                        if p.get("breakeven") and -0.05 <= resultado <= 0.30
+                        else ("WIN" if resultado > 0 else "LOSS")
+                    )
 
-                if (side == "LONG" and preco_atual >= gatilho_be) or (side == "SHORT" and preco_atual <= gatilho_be):
-                    novo_stop_be = entry * (1 + BE_OFFSET_PCT / 100) if side == "LONG" else entry * (1 - BE_OFFSET_PCT / 100)
-                    p["sl"] = max(sl, novo_stop_be) if side == "LONG" else min(sl, novo_stop_be)
-                    p["breakeven"] = True
-                    p["status"] = "TRAILING STOP"
+                    registrar_evento_trade({
+                        "event": "CLOSE",
+                        "date": data_hoje_sp_str(),
+                        "datetime": data_hora_sp_str(),
+                        "symbol": symbol,
+                        "symbol_clean": p["symbol_clean"],
+                        "side": side,
+                        "entry": entry,
+                        "exit": sl,
+                        "pnl": resultado,
+                        "result_type": resultado_tipo,
+                        "breakeven": bool(p.get("breakeven")),
+                        "tp50_hit": bool(p.get("tp50_hit")),
+                        "status": p.get("status")
+                    })
+
+                    if resultado_tipo == "BREAKEVEN":
+                        adicionar_monitor_be(p, entry, sl)
+
+                    p["closed_at"] = time.time()
+                    p["closed_datetime"] = data_hora_sp_str()
+                    p["closed_reason"] = resultado_tipo
+                    p["reentry_ready"] = False
+                    p["status"] = "ENCERRADO"
                     alterou = True
-                    send_telegram_safe(f"🟣 TRAILING ATIVADO - {p['symbol_clean']}\nStop puxado para o lucro (Breakeven) com Offset.")
                     continue
 
-            # 4. Atualização Dinâmica do Trailing (Chandelier ATR)
-            if p.get("breakeven"):
-                novo_stop_trail = calcular_chandelier(symbol, side)
-                if side == "LONG" and novo_stop_trail > sl:
-                    p["sl"] = novo_stop_trail
+                if side == "SHORT" and preco_atual >= sl:
+                    resultado = pnl_pct(side, entry, sl)
+                    enviar_stop(p, preco_atual, sl, resultado)
+
+                    resultado_tipo = (
+                        "BREAKEVEN"
+                        if p.get("breakeven") and -0.05 <= resultado <= 0.30
+                        else ("WIN" if resultado > 0 else "LOSS")
+                    )
+
+                    registrar_evento_trade({
+                        "event": "CLOSE",
+                        "date": data_hoje_sp_str(),
+                        "datetime": data_hora_sp_str(),
+                        "symbol": symbol,
+                        "symbol_clean": p["symbol_clean"],
+                        "side": side,
+                        "entry": entry,
+                        "exit": sl,
+                        "pnl": resultado,
+                        "result_type": resultado_tipo,
+                        "breakeven": bool(p.get("breakeven")),
+                        "tp50_hit": bool(p.get("tp50_hit")),
+                        "status": p.get("status")
+                    })
+
+                    if resultado_tipo == "BREAKEVEN":
+                        adicionar_monitor_be(p, entry, sl)
+
+                    p["closed_at"] = time.time()
+                    p["closed_datetime"] = data_hora_sp_str()
+                    p["closed_reason"] = resultado_tipo
+                    p["reentry_ready"] = False
+                    p["status"] = "ENCERRADO"
                     alterou = True
-                elif side == "SHORT" and novo_stop_trail < sl:
-                    p["sl"] = novo_stop_trail
+                    continue
+
+            # TP50 em 1R:
+            # Realiza a parcial, mas NÃO move o stop para BE ainda.
+            # O BE/trailing só ativa quando o preço andar 1,5R.
+            if not p.get("tp50_hit"):
+                if side == "LONG" and preco_atual >= tp50:
+                    p["tp50_hit"] = True
+                    p["status"] = "TP50 HIT"
+                    p["tp50_activated_at"] = time.time()
                     alterou = True
 
-        except Exception as e: print(f"Erro na gestão de {symbol}: {e}")
+                    enviar_tp50(p, tp50, pnl_pct(side, entry, tp50))
 
-    if alterou: salvar_posicoes(posicoes)
+                    registrar_evento_trade({
+                        "event": "TP50",
+                        "date": data_hoje_sp_str(),
+                        "datetime": data_hora_sp_str(),
+                        "symbol": symbol,
+                        "symbol_clean": p["symbol_clean"],
+                        "side": side,
+                        "entry": entry,
+                        "tp50": tp50,
+                        "be_trigger_r": BE_TRIGGER_R,
+                        "be_trigger_price": entry + float(p.get("risk_abs", abs(entry - sl))) * BE_TRIGGER_R,
+                        "stop_after_tp50": float(p["sl"])
+                    })
+
+                    continue
+
+                if side == "SHORT" and preco_atual <= tp50:
+                    p["tp50_hit"] = True
+                    p["status"] = "TP50 HIT"
+                    p["tp50_activated_at"] = time.time()
+                    alterou = True
+
+                    enviar_tp50(p, tp50, pnl_pct(side, entry, tp50))
+
+                    registrar_evento_trade({
+                        "event": "TP50",
+                        "date": data_hoje_sp_str(),
+                        "datetime": data_hora_sp_str(),
+                        "symbol": symbol,
+                        "symbol_clean": p["symbol_clean"],
+                        "side": side,
+                        "entry": entry,
+                        "tp50": tp50,
+                        "be_trigger_r": BE_TRIGGER_R,
+                        "be_trigger_price": entry - float(p.get("risk_abs", abs(sl - entry))) * BE_TRIGGER_R,
+                        "stop_after_tp50": float(p["sl"])
+                    })
+
+                    continue
+
+            # BE/trailing em 1,5R:
+            # Só depois do TP50 e somente uma vez.
+            if p.get("tp50_hit") and not p.get("breakeven"):
+                try:
+                    risk_abs_pos = float(p.get("risk_abs", abs(entry - sl)))
+                except Exception:
+                    risk_abs_pos = abs(entry - sl)
+
+                if side == "LONG":
+                    be_trigger_price = entry + risk_abs_pos * BE_TRIGGER_R
+
+                    if preco_atual >= be_trigger_price:
+                        novo_stop_be = entry * (1 + BE_OFFSET_PCT / 100)
+                        novo_stop_trail = calcular_chandelier(symbol, side)
+                        novo_stop = max(float(p["sl"]), novo_stop_be, novo_stop_trail)
+
+                        p["sl"] = novo_stop
+                        p["breakeven"] = True
+                        p["status"] = "TRAILING STOP"
+                        p["breakeven_activated_at"] = time.time()
+                        p["trailing_activated_at"] = time.time()
+                        alterou = True
+
+                        enviar_trailing_ativado(p, novo_stop)
+
+                        registrar_evento_trade({
+                            "event": "BE_TRIGGER",
+                            "date": data_hoje_sp_str(),
+                            "datetime": data_hora_sp_str(),
+                            "symbol": symbol,
+                            "symbol_clean": p["symbol_clean"],
+                            "side": side,
+                            "entry": entry,
+                            "be_trigger_r": BE_TRIGGER_R,
+                            "be_trigger_price": be_trigger_price,
+                            "new_stop": novo_stop
+                        })
+
+                        continue
+
+                if side == "SHORT":
+                    be_trigger_price = entry - risk_abs_pos * BE_TRIGGER_R
+
+                    if preco_atual <= be_trigger_price:
+                        novo_stop_be = entry * (1 - BE_OFFSET_PCT / 100)
+                        novo_stop_trail = calcular_chandelier(symbol, side)
+                        novo_stop = min(float(p["sl"]), novo_stop_be, novo_stop_trail)
+
+                        p["sl"] = novo_stop
+                        p["breakeven"] = True
+                        p["status"] = "TRAILING STOP"
+                        p["breakeven_activated_at"] = time.time()
+                        p["trailing_activated_at"] = time.time()
+                        alterou = True
+
+                        enviar_trailing_ativado(p, novo_stop)
+
+                        registrar_evento_trade({
+                            "event": "BE_TRIGGER",
+                            "date": data_hoje_sp_str(),
+                            "datetime": data_hora_sp_str(),
+                            "symbol": symbol,
+                            "symbol_clean": p["symbol_clean"],
+                            "side": side,
+                            "entry": entry,
+                            "be_trigger_r": BE_TRIGGER_R,
+                            "be_trigger_price": be_trigger_price,
+                            "new_stop": novo_stop
+                        })
+
+                        continue
+
+            # Trailing somente após ativar BE em 1,5R.
+            if p.get("tp50_hit") and p.get("breakeven"):
+                novo_stop = calcular_chandelier(symbol, side)
+
+                if side == "LONG" and novo_stop > float(p["sl"]):
+                    p["sl"] = novo_stop
+                    p["trailing_activated_at"] = time.time()
+                    alterou = True
+                    enviar_trailing(p, novo_stop)
+
+                    registrar_evento_trade({
+                        "event": "TRAILING",
+                        "date": data_hoje_sp_str(),
+                        "datetime": data_hora_sp_str(),
+                        "symbol": symbol,
+                        "symbol_clean": p["symbol_clean"],
+                        "side": side,
+                        "new_stop": novo_stop
+                    })
+
+                if side == "SHORT" and novo_stop < float(p["sl"]):
+                    p["sl"] = novo_stop
+                    p["trailing_activated_at"] = time.time()
+                    alterou = True
+                    enviar_trailing(p, novo_stop)
+
+                    registrar_evento_trade({
+                        "event": "TRAILING",
+                        "date": data_hoje_sp_str(),
+                        "datetime": data_hora_sp_str(),
+                        "symbol": symbol,
+                        "symbol_clean": p["symbol_clean"],
+                        "side": side,
+                        "new_stop": novo_stop
+                    })
+
+        except Exception as e:
+            print(f"ERRO GESTÃO {symbol}: {e}")
+
+    if alterou:
+        salvar_posicoes(posicoes)
+
 
 # ====================================================
-# LOOP CENTRAL DO SCANNER (PROCESSADOR PRINCIPAL)
+# RELATÓRIOS / COMANDOS
 # ====================================================
+
+def obter_posicoes_ativas_ordenadas():
+    posicoes = carregar_posicoes()
+    ativos = []
+
+    for p in posicoes.values():
+        if p.get("status") == "ENCERRADO":
+            continue
+
+        try:
+            ticker = exchange.fetch_ticker(p["symbol"])
+            preco = float(ticker["last"])
+            resultado = pnl_pct(p["side"], float(p["entry"]), preco)
+
+            item = dict(p)
+            item["pnl_atual"] = resultado
+            ativos.append(item)
+
+        except Exception as e:
+            print("ERRO AO ORDENAR POSIÇÃO:", e)
+
+    ativos.sort(key=lambda x: x["pnl_atual"], reverse=True)
+    return ativos
+
+
+def enviar_relatorio_posicoes():
+    ativos = obter_posicoes_ativas_ordenadas()
+    data = agora_sp().strftime("%d/%m/%Y %H:%M")
+
+    if not ativos:
+        send_telegram(
+            f"📊 RELATÓRIO DE POSIÇÕES\n"
+            f"{data}\n\n"
+            f"Nenhum trade ativo."
+        )
+        return
+
+    linhas = ["📊 RELATÓRIO DE POSIÇÕES", data]
+
+    for p in ativos:
+        linhas.append(
+            f"\n{p['symbol_clean']} - {p['side']}\n\n"
+            f"PnL:\n{fmt_pct(p['pnl_atual'])}\n\n"
+            f"Entrada:\n{fmt_br(p['entry'])}\n\n"
+            f"Stop Atual:\n{fmt_br(p['sl'])}\n\n"
+            f"TP50:\n{fmt_br(p['tp50'])}\n\n"
+            f"Status:\n"
+            f"Breakeven {check_bool(p.get('breakeven'))}\n"
+            f"TP50 {check_bool(p.get('tp50_hit'))}\n"
+            f"Trailing Stop {check_bool(p.get('status') == 'TRAILING STOP')}\n"
+            f"────────────────"
+        )
+
+    send_telegram("\n".join(linhas))
+
+
+def montar_status():
+    ativos = obter_posicoes_ativas_ordenadas()
+    linhas = ["📊 STATUS DO ROBÔ"]
+    linhas.append(f"\nTrades ativos: {len(ativos)}")
+
+    if not ativos:
+        linhas.append("\nNenhum trade ativo.")
+        return "\n".join(linhas)
+
+    linhas.append("\n────────────────\n")
+
+    for p in ativos:
+        linhas.append(
+            f"{p['symbol_clean']} - {p['side']}\n\n"
+            f"PnL:\n{fmt_pct(p['pnl_atual'])}\n\n"
+            f"Entrada:\n{fmt_br(p['entry'])}\n\n"
+            f"Stop Atual:\n{fmt_br(p['sl'])}\n\n"
+            f"TP50:\n{fmt_br(p['tp50'])}\n\n"
+            f"Breakeven {check_bool(p.get('breakeven'))}\n"
+            f"TP50 {check_bool(p.get('tp50_hit'))}\n"
+            f"Trailing Stop {check_bool(p.get('status') == 'TRAILING STOP')}\n"
+            f"────────────────\n"
+        )
+
+    return "\n".join(linhas)
+
+
+def montar_watchlist():
+    watchlist = carregar_watchlist()
+    linhas = [f"👀 WATCHLIST ({len(watchlist)})\n"]
+
+    for symbol in watchlist:
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            preco = float(ticker["last"])
+            linhas.append(f"{nome_limpo(symbol)} | {fmt_br(preco)}")
+        except Exception:
+            linhas.append(f"{nome_limpo(symbol)} | erro")
+
+    return "\n".join(linhas)
+
+
+def montar_resumo_diario():
+    hoje = data_hoje_sp_str()
+    data_br = agora_sp().strftime("%d/%m/%Y")
+
+    trades = carregar_trades()
+
+    entradas = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY"]
+    pois = [t for t in trades if t.get("date") == hoje and t.get("event") == "POI"]
+    earlys = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY" and t.get("signal_type") == "EARLY"]
+    reentries = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY" and t.get("signal_type") == "REENTRY"]
+    hunters = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY" and t.get("signal_type") == "HUNTER_BREAKOUT"]
+    fechados = [t for t in trades if t.get("date") == hoje and t.get("event") == "CLOSE"]
+    tp50s = [t for t in trades if t.get("date") == hoje and t.get("event") == "TP50"]
+    trailings = [t for t in trades if t.get("date") == hoje and t.get("event") == "TRAILING"]
+
+    wins = [t for t in fechados if t.get("result_type") == "WIN"]
+    losses = [t for t in fechados if t.get("result_type") == "LOSS"]
+    bes = [t for t in fechados if t.get("result_type") == "BREAKEVEN"]
+
+    pnl_total = sum(float(t.get("pnl", 0)) for t in fechados)
+
+    longs = [t for t in entradas if t.get("side") == "LONG"]
+    shorts = [t for t in entradas if t.get("side") == "SHORT"]
+
+    melhor = max(fechados, key=lambda x: float(x.get("pnl", 0))) if fechados else None
+    pior = min(fechados, key=lambda x: float(x.get("pnl", 0))) if fechados else None
+
+    linhas = [
+        "📈 RESUMO MEME HUNTER DO DIA",
+        data_br,
+        "",
+        f"Sinais H1 do dia: {len(entradas)}",
+        f"LONG: {len(longs)}",
+        f"SHORT: {len(shorts)}",
+        f"EARLY: {len(earlys)}",
+        f"REENTRY: {len(reentries)}",
+        f"HUNTER BREAKOUT: {len(hunters)}",
+        f"POIs H1: {len(pois)}",
+        "",
+        f"Trades encerrados: {len(fechados)}",
+        f"Wins: {len(wins)}",
+        f"Breakeven: {len(bes)}",
+        f"Loss: {len(losses)}",
+        "",
+        f"TP50 atingidos: {len(tp50s)}",
+        f"Trailings atualizados: {len(trailings)}",
+        "",
+        "PnL realizado:",
+        f"{fmt_pct(pnl_total)}"
+    ]
+
+    if melhor:
+        linhas.extend(["", "Melhor trade:", f"{melhor.get('symbol_clean')} {fmt_pct(melhor.get('pnl', 0))}"])
+
+    if pior:
+        linhas.extend(["", "Pior trade:", f"{pior.get('symbol_clean')} {fmt_pct(pior.get('pnl', 0))}"])
+
+    ativos = obter_posicoes_ativas_ordenadas()
+    linhas.extend(["", f"Trades ainda ativos: {len(ativos)}"])
+
+    for p in ativos[:10]:
+        linhas.append(f"{p['symbol_clean']} {p['side']} | PnL {fmt_pct(p['pnl_atual'])}")
+
+    return "\n".join(linhas)
+
+
+def enviar_resumo_diario():
+    send_telegram(montar_resumo_diario())
+
+
+def resumo_diario_ja_enviado():
+    enviados = redis_get_json(DAILY_SUMMARY_KEY, {})
+    hoje = data_hoje_sp_str()
+    return enviados.get(hoje) is True
+
+
+def marcar_resumo_diario_enviado():
+    enviados = redis_get_json(DAILY_SUMMARY_KEY, {})
+    hoje = data_hoje_sp_str()
+    enviados[hoje] = True
+
+    if len(enviados) > 30:
+        chaves = sorted(enviados.keys())
+        for chave in chaves[:-30]:
+            enviados.pop(chave, None)
+
+    redis_set_json(DAILY_SUMMARY_KEY, enviados)
+
+
+def montar_monitor_be():
+    monitores = carregar_monitor_be()
+    ativos = [m for m in monitores if m.get("active")]
+    recentes = monitores[-20:]
+
+    linhas = [
+        "📉 MONITOR DE BREAKEVEN",
+        "",
+        f"Ativos em monitoramento: {len(ativos)}"
+    ]
+
+    if not recentes:
+        linhas.append("\nNenhum breakeven monitorado ainda.")
+        return "\n".join(linhas)
+
+    linhas.append("\nÚltimos monitoramentos:")
+
+    for m in reversed(recentes[-10:]):
+        status = "ATIVO" if m.get("active") else "FINALIZADO"
+        linhas.append(
+            f"\n{m.get('symbol_clean')} - {m.get('side')}\n"
+            f"Fechou: {m.get('closed_datetime')}\n"
+            f"Após saída: +{fmt_br(m.get('best_after_pct', 0))}%\n"
+            f"Status: {status}\n"
+            f"────────────────"
+        )
+
+    return "\n".join(linhas)
+
+
+def resetar_robo():
+    global ultimo_candle_h1, ultimo_relatorio_hora
+
+    salvar_posicoes({})
+    salvar_sinais({})
+    salvar_trades([])
+    salvar_monitor_be([])
+    salvar_poi_cooldown({})
+    salvar_early_cooldown({})
+    redis_set_json(DAILY_SUMMARY_KEY, {})
+
+    ultimo_candle_h1 = {}
+    ultimo_relatorio_hora = None
+
+
+def listen_commands():
+    last_update_id = 0
+
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last_update_id + 1}",
+                timeout=30
+            ).json()
+
+            for update in resp.get("result", []):
+                last_update_id = update.get("update_id", last_update_id)
+
+                msg = update.get("message", {})
+                texto_raw = msg.get("text", "") or ""
+                texto = texto_raw.strip().split()[0].lower() if texto_raw.strip() else ""
+
+                # Aceita comandos enviados como /comandos@NomeDoBot
+                if "@" in texto:
+                    texto = texto.split("@")[0]
+
+                chat_id = msg.get("chat", {}).get("id")
+
+                if not chat_id:
+                    continue
+
+                if texto == "/status":
+                    enviar_texto(chat_id, montar_status())
+
+                elif texto == "/watchlist":
+                    enviar_texto(chat_id, montar_watchlist())
+
+                elif texto == "/resumo":
+                    enviar_texto(chat_id, montar_resumo_diario())
+
+                elif texto == "/be":
+                    enviar_texto(chat_id, montar_monitor_be())
+
+                elif texto == "/limparbe":
+                    salvar_monitor_be([])
+                    enviar_texto(chat_id, "✅ Monitor BE limpo com segurança.")
+
+                elif texto == "/reset":
+                    # RESET SEGURO:
+                    # Não apaga posições abertas.
+                    # Não apaga histórico de trades.
+                    # Limpa apenas cooldowns e bloqueios operacionais.
+                    salvar_sinais({})
+                    salvar_bloqueios_reentrada({})
+                    salvar_monitor_be([])
+                    salvar_poi_cooldown({})
+                    salvar_early_cooldown({})
+                    redis_set_json(DAILY_SUMMARY_KEY, {})
+
+                    reset_msg = (
+                        "✅ Reset operacional realizado.\n\n"
+                        "O que foi limpo:\n"
+                        "- Histórico de sinais/cooldowns\n"
+                        "- Bloqueios de reentrada\n"
+                        "- Monitor BE\n"
+                        "- Cooldown POI\n"
+                        "- Cooldown EARLY\n"
+                        "- Controle de resumo diário\n\n"
+                        "O que NÃO foi apagado:\n"
+                        "- Posições abertas\n"
+                        "- Histórico de trades"
+                    )
+
+                    enviar_texto(chat_id, reset_msg)
+
+                elif texto == "/mensal":
+                    enviar_texto(chat_id, montar_resumo_mensal())
+
+                elif texto == "/watchlist":
+                    wl = carregar_watchlist()
+                    wl_validada = validar_watchlist_bingx(wl, avisar_telegram=False)
+                    msg = (
+                        f"Watchlist configurada: {len(wl)} ativos\n"
+                        f"Watchlist válida BingX: {len(wl_validada)} ativos\n\n"
+                        + "\n".join([nome_limpo(x) for x in wl_validada])
+                    )
+                    enviar_texto(chat_id, msg)
+
+                elif texto == "/posicoes":
+                    posicoes = carregar_posicoes()
+                    abertas = [
+                        p for p in posicoes.values()
+                        if p.get("status") != "ENCERRADO"
+                    ]
+
+                    if not abertas:
+                        enviar_texto(chat_id, "Nenhuma posição aberta.")
+                    else:
+                        linhas = []
+
+                        for p in abertas:
+                            try:
+                                ticker = exchange.fetch_ticker(p["symbol"])
+                                preco = float(ticker["last"])
+                                pnl = pnl_pct(p["side"], float(p["entry"]), preco)
+                            except Exception:
+                                pnl = 0.0
+
+                            origem = origem_trade_txt(p)
+                            entrada_txt = fmt_br(p.get("entry", 0))
+                            update_type = p.get("last_update_type")
+
+                            linha = (
+                                f"{nome_limpo(p['symbol'])} {p['side']} | "
+                                f"Origem: {origem} | "
+                                f"Entrada: {entrada_txt} | "
+                                f"PnL {fmt_pct(pnl)}"
+                            )
+
+                            if update_type:
+                                linha += f" | Últ. ajuste: {update_type}"
+
+                            linhas.append(linha)
+
+                        msg = (
+                            f"Posições abertas: {len(abertas)}/{MAX_OPEN_POSITIONS}\n\n"
+                            + "\n".join(linhas[:50])
+                        )
+
+                        enviar_texto(chat_id, msg)
+
+
+                elif texto == "/top":
+                    posicoes = carregar_posicoes()
+                    abertas = [
+                        p for p in posicoes.values()
+                        if p.get("status") != "ENCERRADO"
+                    ]
+
+                    ranking = []
+
+                    for p in abertas:
+                        try:
+                            ticker = exchange.fetch_ticker(p["symbol"])
+                            preco = float(ticker["last"])
+                            pnl = pnl_pct(p["side"], float(p["entry"]), preco)
+                            ranking.append((pnl, p))
+                        except Exception:
+                            pass
+
+                    ranking.sort(key=lambda x: x[0], reverse=True)
+
+                    if not ranking:
+                        enviar_texto(chat_id, "Nenhuma posição aberta para ranking.")
+                    else:
+                        linhas = []
+
+                        for pnl, p in ranking[:10]:
+                            linhas.append(
+                                f"{nome_limpo(p['symbol'])} {p['side']} | "
+                                f"Origem: {origem_trade_txt(p)} | "
+                                f"{fmt_pct(pnl)}"
+                            )
+
+                        enviar_texto(chat_id, "Top posições abertas:\n\n" + "\n".join(linhas))
+
+
+                elif texto in ["/comandos", "/help", "/start"]:
+                    comandos_msg = (
+                        "📌 Comandos Meme Hunter:\n\n"
+                        "/health - painel técnico do robô\n"
+                        "/teste - testa conexão com Telegram\n"
+                        "/posicoes - lista posições abertas com origem\n"
+                        "/top - mostra melhores posições abertas\n"
+                        "/resumo - envia resumo do dia\n"
+                        "/mensal - envia resumo do mês anterior\n"
+                        "/watchlist - mostra ativos monitorados\n"
+                        "/reset - limpa cooldowns/bloqueios sem apagar posições\n"
+                        "/limparbe - limpa monitor BE caso fique inconsistente\n"
+                        "/comandos - mostra esta lista"
+                    )
+                    enviar_texto(chat_id, comandos_msg)
+
+
+                elif texto == "/status":
+                    enviar_texto(chat_id, "O /status foi substituído pelo /health. Use /health para o painel técnico.")
+
+
+                elif texto == "/health":
+                    enviar_texto(chat_id, montar_health_tecnico())
+
+
+                elif texto == "/teste":
+                    enviar_texto(chat_id, "✅ Meme Hunter operacional e conectado.")
+
+        except Exception as e:
+            print("ERRO COMANDOS:", e)
+
+        time.sleep(2)
+
+
+# ====================================================
+# SCANNER
+# ====================================================
+
 def scanner():
-    print("▶️ MEME HUNTER ELITE INICIADO")
+    global ultimo_relatorio_hora
+
+    print("SCANNER INICIADO")
     HEALTH["started_at"] = data_hora_sp_str()
-    send_telegram_safe(f"🐸 Robô Caçador de Memes Ativo!\nFoco: Estrutura Breakout H1\nScore Mínimo: {HUNTER_SCORE_MIN}")
+    safe_send_telegram(
+        "🐸 Robô Meme Hunter iniciado\n\n"
+        f"Filtros ativos:\n"
+        f"Score mínimo: {ELITE_THRESHOLD}/100\n"
+        f"ADX H4 mínimo: {ELITE_MIN_ADX_H4}\n"
+        f"Volume H1 obrigatório: {check_bool(REQUIRE_HIGH_VOLUME)}\n"
+        f"Recuperado ativo: {check_bool(ENABLE_RECOVERED_SIGNAL)}\n"
+        f"Relatório automático: {check_bool(ENABLE_AUTO_POSITION_REPORT)}\n"
+        f"Estratégia Hunter Breakout: {check_bool(ENABLE_HUNTER_BREAKOUT)}\n"
+        f"Hunter registra posição: {check_bool(True)}\n"
+        f"Meme score mínimo: {HUNTER_SCORE_MIN}/100"
+    )
 
     while True:
         try:
             HEALTH["last_scanner_run"] = data_hora_sp_str()
-            watchlist = carregar_watchlist()
-            if not watchlist:
-                time.sleep(10)
-                continue
-
-            # --- REDUÇÃO DE CORRIDA DE REDE (CACHE DE TICKERS UNIFICADO) ---
-            try:
-                tickers_cache = exchange.fetch_tickers(watchlist)
-            except Exception as e:
-                print(f"Erro ao baixar tickers: {e}")
-                time.sleep(10)
-                continue
-
-            # Executa gerenciamento dinâmico de saídas
-            gerenciar_posicoes(tickers_cache)
+            gerenciar_posicoes()
             HEALTH["last_management_run"] = data_hora_sp_str()
+            atualizar_monitor_be()
 
-            # Processamento de novos sinais de entrada
-            posicoes = carregar_posicoes()
-            posicoes_ativas = [p for p in posicoes.values() if p.get("status") != "ENCERRADO"]
-            HEALTH["last_positions_count"] = len(posicoes_ativas)
+            agora = time.localtime()
 
-            if len(posicoes_ativas) < MAX_OPEN_POSITIONS:
-                for symbol in watchlist:
+            if ENABLE_AUTO_POSITION_REPORT and agora.tm_min >= 50:
+                chave_hora = f"{agora.tm_year}-{agora.tm_yday}-{agora.tm_hour}"
+
+                if ultimo_relatorio_hora != chave_hora:
+                    print("ENVIANDO RELATÓRIO DE POSIÇÕES")
+                    enviar_relatorio_posicoes()
+                    ultimo_relatorio_hora = chave_hora
+
+            agora_brasil = agora_sp()
+
+            if agora_brasil.hour == 23 and agora_brasil.minute >= 55:
+                if not resumo_diario_ja_enviado():
+                    print("ENVIANDO RESUMO DO DIA")
+                    enviar_resumo_diario()
+                    marcar_resumo_diario_enviado()
+
+            enviar_resumo_mensal_se_preciso()
+
+            watchlist = carregar_watchlist()
+            watchlist = validar_watchlist_bingx(watchlist, avisar_telegram=True)
+            HEALTH["last_watchlist_count"] = len(watchlist)
+            sinais = []
+            sinais_enviados = 0
+
+            for symbol in watchlist:
+                try:
+                    # POI primeiro para posições ativas.
+                    posicoes = carregar_posicoes()
                     if symbol in posicoes and posicoes[symbol].get("status") != "ENCERRADO":
+                        if HUNTER_BREAKOUT_ONLY:
+                            continue
+
+                        poi = detectar_poi(symbol, posicoes[symbol])
+                        if poi:
+                            aprovado, motivo = passa_filtro_trendpro_elite(
+                                poi,
+                                threshold=POI_THRESHOLD,
+                                min_adx_h4=POI_MIN_ADX_H4,
+                                require_high_volume=POI_REQUIRE_HIGH_VOLUME,
+                                require_bb_expanding=False,
+                                label="POI"
+                            )
+
+                            if aprovado:
+                                enviar_poi(poi)
+                                atualizar_posicao_com_poi(poi)
+                            else:
+                                print(f"POI BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
                         continue
 
-                    hunter_signal = detectar_hunter_breakout(symbol)
-                    if hunter_signal:
-                        # Validação contra Slippage excessivo antes de disparar
-                        tk_atual = tickers_cache.get(symbol)
-                        if tk_atual:
-                            distancia_slippage = abs(float(tk_atual["last"]) - hunter_signal["entry"]) / hunter_signal["entry"] * 100
-                            if distancia_slippage > 0.75: # Se o preço correu mais de 0.75% do fechamento, aborta
-                                print(f"Sinal abortado devido a alta derrapagem (Slippage): {nome_limpo(symbol)}")
+                    # REENTRY para posições encerradas que já atingiram TP50.
+                    if symbol in posicoes and posicoes[symbol].get("status") == "ENCERRADO":
+                        reentry = detectar_reentry(symbol, posicoes[symbol])
+                        if reentry:
+                            aprovado, motivo = passa_filtro_trendpro_elite(
+                                reentry,
+                                threshold=ELITE_THRESHOLD,
+                                min_adx_h4=ELITE_MIN_ADX_H4,
+                                require_high_volume=REQUIRE_HIGH_VOLUME,
+                                require_bb_expanding=REQUIRE_BB_EXPANDING,
+                                label="REENTRY"
+                            )
+
+                            if not aprovado:
+                                print(f"REENTRY BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
                                 continue
 
-                        # Registro e execução financeira real
-                        if executar_ordem_real_bingx(symbol, hunter_signal["side"], hunter_signal["entry"]):
-                            posicoes[symbol] = {
-                                "symbol": symbol, "symbol_clean": hunter_signal["symbol_clean"],
-                                "side": hunter_signal["side"], "entry": hunter_signal["entry"],
-                                "sl": hunter_signal["sl"], "tp50": hunter_signal["tp50"],
-                                "risk_abs": hunter_signal["risk_abs"], "risk_pct": hunter_signal["risk_pct"],
-                                "status": "ATIVO", "breakeven": False, "tp50_hit": False, "created_at": time.time()
-                            }
-                            salvar_posicoes(posicoes)
-                            
-                            # Dispara Alerta Formatado para o Telegram
-                            msg = (
-                                f"🐸🟢 HUNTER BREAKOUT BUY - {hunter_signal['symbol_clean']}\n\n"
-                                f"Entrada Real: {fmt_br(hunter_signal['entry'])}\n"
-                                f"Stop Técnico: {fmt_br(hunter_signal['sl'])}\n"
-                                f"Alvo TP50: {fmt_br(hunter_signal['tp50'])}\n\n"
-                                f"Risco da Op: {fmt_risco(hunter_signal['risk_pct'])}% ({risco_label(hunter_signal['risk_pct'])})\n"
-                                f"Score de Força: {hunter_signal['hunter_score']}/100\n"
-                                f"Volume Multiplicador: {hunter_signal['volume_ratio']:.2f}x"
-                            ) if hunter_signal["side"] == "LONG" else (
-                                f"🐸🔴 HUNTER BREAKOUT SELL - {hunter_signal['symbol_clean']}\n\n"
-                                f"Entrada Real: {fmt_br(hunter_signal['entry'])}\n"
-                                f"Stop Técnico: {fmt_br(hunter_signal['sl'])}\n"
-                                f"Alvo TP50: {fmt_br(hunter_signal['tp50'])}\n\n"
-                                f"Risco da Op: {fmt_risco(hunter_signal['risk_pct'])}% ({risco_label(hunter_signal['risk_pct'])})\n"
-                                f"Score de Força: {hunter_signal['hunter_score']}/100\n"
-                                f"Volume Multiplicador: {hunter_signal['volume_ratio']:.2f}x"
-                            )
-                            send_telegram_safe(msg)
-                            registrar_evento_trade({"event": "ENTRY", "symbol": symbol, "side": hunter_signal["side"]})
+                            timestamp = int(reentry["timestamp"])
+                            chave_reentry = f"REENTRY_{symbol}_{timestamp}_{reentry['signal']}"
 
+                            historico_tmp = carregar_sinais()
+                            if chave_reentry not in historico_tmp:
+                                if registrar_posicao(reentry):
+                                    historico_tmp[chave_reentry] = True
+                                    salvar_sinais(historico_tmp)
+                                    enviar_reentry(reentry)
+                                    sinais_enviados += 1
+                            continue
+
+                    hunter = detectar_hunter_breakout(symbol)
+
+                    if hunter:
+                        timestamp = int(hunter["timestamp"])
+                        chave_hunter = f"HUNTER_{symbol}_{timestamp}_{hunter['signal']}"
+
+                        historico_tmp = carregar_sinais()
+                        if chave_hunter not in historico_tmp:
+                            if registrar_posicao(hunter):
+                                historico_tmp[chave_hunter] = True
+                                salvar_sinais(historico_tmp)
+                                enviar_hunter_breakout(hunter)
+                                sinais_enviados += 1
+                        continue
+
+                    if HUNTER_BREAKOUT_ONLY:
+                        continue
+
+                    early = detectar_early_a(symbol)
+
+                    if early:
+                        aprovado, motivo = passa_filtro_trendpro_elite(
+                            early,
+                            threshold=EARLY_THRESHOLD,
+                            min_adx_h4=EARLY_MIN_ADX_H4,
+                            require_high_volume=EARLY_REQUIRE_VOLUME,
+                            require_bb_expanding=False,
+                            label="EARLY"
+                        )
+
+                        if not aprovado:
+                            print(f"EARLY BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
+                            continue
+
+                        timestamp = int(early["timestamp"])
+                        chave_early = f"EARLY_{symbol}_{timestamp}_{early['signal']}"
+
+                        historico_tmp = carregar_sinais()
+                        if chave_early not in historico_tmp:
+                            if registrar_posicao(early):
+                                historico_tmp[chave_early] = True
+                                salvar_sinais(historico_tmp)
+                                enviar_early_a(early)
+                                sinais_enviados += 1
+                        continue
+
+                    resultado, df_h1, df_h4 = analisar_sinal_h1(symbol)
+
+                    if not resultado:
+                        continue
+
+                    aprovado, motivo = passa_filtro_trendpro_elite(
+                        resultado,
+                        threshold=ELITE_THRESHOLD,
+                        min_adx_h4=ELITE_MIN_ADX_H4,
+                        require_high_volume=REQUIRE_HIGH_VOLUME,
+                        require_bb_expanding=REQUIRE_BB_EXPANDING,
+                        label="SINAL"
+                    )
+
+                    if not aprovado:
+                        print(f"SINAL BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
+                        continue
+
+                    timestamp = int(resultado["timestamp"])
+
+                    if symbol in ultimo_candle_h1 and ultimo_candle_h1[symbol] == timestamp:
+                        continue
+
+                    ultimo_candle_h1[symbol] = timestamp
+                    sinais.append(resultado)
+
+                except Exception as e:
+                    print(f"ERRO EM {symbol}:", e)
+
+            sinais.sort(key=lambda x: x.get("risk_pct", 999))
+
+            historico = carregar_sinais()
+
+            for s in sinais:
+                if existe_posicao_ativa(s["symbol"]):
+                    continue
+
+                chave = f"{s['symbol']}_{s['timestamp']}_{s['signal']}"
+
+                if chave in historico:
+                    continue
+
+                if registrar_posicao(s):
+                    historico[chave] = True
+                    enviar_sinal_h1(s)
+                    sinais_enviados += 1
+
+            salvar_sinais(historico)
+
+            HEALTH["last_signals_sent"] = sinais_enviados
             HEALTH["last_success"] = data_hora_sp_str()
             HEALTH["last_error"] = None
+            print(f"Sinais enviados: {len(sinais)}")
 
         except Exception as e:
             HEALTH["last_error"] = str(e)
-            print("Erro no Scanner Loop:", e)
+            print("ERRO SCANNER:", e)
 
-        time.sleep(10) # Frequência de varredura rápida para capturar volatilidade de memes
+        time.sleep(60)
 
-# ==============================================================================
-# PROVEDORES DOS ENDPOINTS HTTP (PAINEL WEB FLASK)
-# ==============================================================================
-@app.route("/health")
-def health_endpoint():
-    return {
-        "status": "OPERACIONAL",
-        "watchdog": HEALTH["watchdog_status"],
-        "started_at": HEALTH["started_at"],
-        "last_scanner_run": HEALTH["last_scanner_run"],
-        "last_management_run": HEALTH["last_management_run"],
-        "posicoes_abertas_count": HEALTH["last_positions_count"],
-        "last_error": HEALTH["last_error"]
+
+
+# ====================================================
+# WATCHDOG - MONITORAMENTO INTERNO
+# ====================================================
+
+def minutos_desde_data_hora(valor):
+    try:
+        if not valor:
+            return None
+
+        dt = datetime.strptime(str(valor), "%d/%m/%Y %H:%M")
+        agora_local = agora_sp().replace(tzinfo=None)
+
+        return round((agora_local - dt).total_seconds() / 60, 2)
+    except Exception:
+        return None
+
+
+def montar_watchdog_status():
+    minutos_scanner = minutos_desde_data_hora(HEALTH.get("last_scanner_run"))
+    minutos_management = minutos_desde_data_hora(HEALTH.get("last_management_run"))
+
+    scanner_ok = (
+        minutos_scanner is not None and
+        minutos_scanner <= WATCHDOG_THRESHOLD_MINUTES
+    )
+
+    management_ok = (
+        minutos_management is not None and
+        minutos_management <= WATCHDOG_THRESHOLD_MINUTES
+    )
+
+    erro = HEALTH.get("last_error")
+
+    ok = bool(scanner_ok and management_ok and not erro)
+
+    status = {
+        "ok": ok,
+        "bot": "Meme Hunter",
+        "watchdog_status": "OK" if ok else "ALERTA",
+        "watchdog_check_seconds": WATCHDOG_CHECK_SECONDS,
+        "watchdog_threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
+        "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
+        "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
+        "last_scanner_run": HEALTH.get("last_scanner_run"),
+        "minutes_since_scanner": minutos_scanner,
+        "scanner_ok": scanner_ok,
+        "last_management_run": HEALTH.get("last_management_run"),
+        "minutes_since_management": minutos_management,
+        "management_ok": management_ok,
+        "last_success": HEALTH.get("last_success"),
+        "last_error": erro
     }
 
-@app.route("/")
-def home(): return "Meme Hunter Elite Quant Engine está Ativo e Rodando."
+    HEALTH["watchdog_status"] = status["watchdog_status"]
 
-# Inicialização assíncrona das threads nativas
+    return status
+
+
+def enviar_alerta_watchdog(status):
+    msg = (
+        "🚨🐸 WATCHDOG MEME HUNTER\n\n"
+        f"Status: {status.get('watchdog_status')}\n\n"
+        f"Scanner OK: {check_bool(status.get('scanner_ok'))}\n"
+        f"Último scanner: {status.get('last_scanner_run')}\n"
+        f"Minutos sem scanner: {status.get('minutes_since_scanner')}\n\n"
+        f"Management OK: {check_bool(status.get('management_ok'))}\n"
+        f"Última gestão: {status.get('last_management_run')}\n"
+        f"Minutos sem gestão: {status.get('minutes_since_management')}\n\n"
+        f"Último sucesso: {status.get('last_success')}\n"
+        f"Erro: {status.get('last_error')}"
+    )
+
+    safe_send_telegram(msg)
+
+
+def watchdog():
+    global LAST_WATCHDOG_ALERT_TS
+
+    while True:
+        try:
+            status = montar_watchdog_status()
+
+            if not status.get("ok"):
+                agora_ts = time.time()
+
+                if agora_ts - LAST_WATCHDOG_ALERT_TS >= WATCHDOG_ALERT_COOLDOWN_SECONDS:
+                    enviar_alerta_watchdog(status)
+                    LAST_WATCHDOG_ALERT_TS = agora_ts
+                    HEALTH["last_watchdog_alert"] = data_hora_sp_str()
+
+        except Exception as e:
+            print("ERRO WATCHDOG:", e)
+
+        time.sleep(WATCHDOG_CHECK_SECONDS)
+
+
+
+@app.route("/health")
+def health():
+    try:
+        posicoes = carregar_posicoes()
+        abertas = [
+            p for p in posicoes.values()
+            if p.get("status") != "ENCERRADO"
+        ]
+        HEALTH["last_positions_count"] = len(abertas)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "started_at": HEALTH.get("started_at"),
+        "last_scanner_run": HEALTH.get("last_scanner_run"),
+        "last_management_run": HEALTH.get("last_management_run"),
+        "last_success": HEALTH.get("last_success"),
+        "last_error": HEALTH.get("last_error"),
+        "last_watchlist_count": HEALTH.get("last_watchlist_count"),
+        "last_signals_sent": HEALTH.get("last_signals_sent"),
+        "last_positions_count": HEALTH.get("last_positions_count"),
+        "watchdog_status": HEALTH.get("watchdog_status"),
+        "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
+        "watchdog_check_seconds": WATCHDOG_CHECK_SECONDS,
+        "watchdog_threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
+        "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
+        "minutes_since_scanner": minutos_desde_data_hora(HEALTH.get("last_scanner_run")),
+        "minutes_since_management": minutos_desde_data_hora(HEALTH.get("last_management_run")),
+        "config": {
+            "timeframe_h4": TIMEFRAME_H4,
+            "timeframe_h1": TIMEFRAME_H1,
+            "supertrend_factor": SUPERTREND_FACTOR,
+            "early_adx_h4_min": EARLYDX_H4_MIN,
+            "spike_filter": ENABLE_SPIKE_FILTER,
+            "max_risk": MAX_RISK_H1,
+            "use_max_risk_filter": USE_MAX_RISK_FILTER,
+            "trendpro_elite_filter": ENABLE_TRENDPRO_ELITE_FILTER,
+            "elite_threshold": ELITE_THRESHOLD,
+            "elite_min_adx_h4": ELITE_MIN_ADX_H4,
+            "require_high_volume": REQUIRE_HIGH_VOLUME,
+            "require_bb_expanding": REQUIRE_BB_EXPANDING,
+            "early_threshold": EARLY_THRESHOLD,
+            "early_min_adx_h4": EARLY_MIN_ADX_H4,
+            "poi_threshold": POI_THRESHOLD,
+            "poi_min_adx_h4": POI_MIN_ADX_H4,
+            "enable_recovered_signal": ENABLE_RECOVERED_SIGNAL,
+            "auto_position_report": ENABLE_AUTO_POSITION_REPORT,
+        "be_trigger_r": BE_TRIGGER_R,
+            "poi_cooldown_seconds": POI_COOLDOWN_SECONDS,
+            "tp50_r": TP50_R,
+            "tp50_min_atr": TP50_MIN_ATR,
+            "be_trigger_r": BE_TRIGGER_R,
+            "enable_reentry": ENABLE_REENTRY_AFTER_TP50,
+            "reentry_after_close_seconds": REENTRY_AFTER_CLOSE_SECONDS,
+            "enable_hunter_breakout": ENABLE_HUNTER_BREAKOUT,
+            "hunter_breakout_only": HUNTER_BREAKOUT_ONLY,
+            "hunter_score_min": HUNTER_SCORE_MIN,
+            "hunter_volume_mult_min": HUNTER_VOLUME_MULT_MIN,
+            "hunter_breakout_lookback": HUNTER_BREAKOUT_LOOKBACK
+        }
+    }
+
+
+@app.route("/watchdog")
+def watchdog_status_route():
+    return montar_watchdog_status()
+
+@app.route("/")
+def home():
+    return "Meme Hunter Online"
+
+
 threading.Thread(target=scanner, daemon=True).start()
+threading.Thread(target=listen_commands, daemon=True).start()
+threading.Thread(target=watchdog, daemon=True).start()
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
