@@ -1,8 +1,8 @@
 # COBRA ATTACK BOT
-# Versao: 2026-06-17-COBRA-ATTACK-V1.1 (Com Camada de Resiliencia CCXT)
+# Versao: 2026-06-21-COBRA-CENTRAL-QUANT-RESILIENTE-V2
 #
-# Bot separado do Trend PRO, Donkey e Meme Hunter.
-# Envia sinais apenas para o seu chat privado no Telegram.
+# Adaptado para Central Quant PRO.
+# Melhorias: watchlist separada, warnings não críticos, startup guard, startup message cooldown.
 
 from flask import Flask
 import os
@@ -28,7 +28,7 @@ CHAT_ID = os.environ.get("COBRA_TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_C
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-WATCHLIST_FILE = "watchlist.json"
+WATCHLIST_FILE = os.environ.get("COBRA_WATCHLIST_FILE", "watchlists/cobra.json")
 
 exchange = ccxt.bingx({"enableRateLimit": True})
 exchange.options["defaultType"] = "swap"
@@ -91,6 +91,11 @@ SCAN_SLEEP_SECONDS = 60
 COMMAND_SLEEP_SECONDS = 2
 PROTECTION_SECONDS = 300
 
+# Proteção anti-lote após deploy/restart do Render.
+STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("COBRA_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
+SERVICE_STARTED_TS = time.time()
+STARTUP_ALERT_COOLDOWN_SECONDS = int(os.environ.get("COBRA_STARTUP_ALERT_COOLDOWN_SECONDS", "3600"))
+
 MONTHLY_SUMMARY_DAY = 1
 DAILY_SUMMARY_HOUR = 23
 DAILY_SUMMARY_MINUTE = 55
@@ -112,6 +117,8 @@ HEALTH = {
     "watchlist_invalid": [],
     "last_signals_sent": 0,
     "last_positions_count": 0,
+    "last_warning": None,
+    "last_invalid_watchlist_check": None,
 }
 
 # ====================================================
@@ -125,7 +132,8 @@ def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso: Erro API OHLCV ({attempt+1}/{max_retries}) para {symbol}: {e}")
             time.sleep(2 ** attempt) # Backoff exponencial: 1s, 2s, 4s...
-    HEALTH["last_error"] = f"Falha ao buscar OHLCV para {symbol} apos {max_retries} tentativas."
+    HEALTH["last_warning"] = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
+    print(HEALTH["last_warning"])
     return []
 
 def safe_fetch_ticker(symbol, max_retries=3):
@@ -135,7 +143,8 @@ def safe_fetch_ticker(symbol, max_retries=3):
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso: Erro API Ticker ({attempt+1}/{max_retries}) para {symbol}: {e}")
             time.sleep(2 ** attempt)
-    HEALTH["last_error"] = f"Falha ao buscar Ticker para {symbol} apos {max_retries} tentativas."
+    HEALTH["last_warning"] = f"Falha Ticker {symbol} após {max_retries} tentativas"
+    print(HEALTH["last_warning"])
     return None
 
 def safe_load_markets(max_retries=3):
@@ -145,7 +154,8 @@ def safe_load_markets(max_retries=3):
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso: Erro API Load Markets ({attempt+1}/{max_retries}): {e}")
             time.sleep(2 ** attempt)
-    HEALTH["last_error"] = "Falha crítica ao carregar markets da exchange."
+    HEALTH["last_warning"] = "Falha ao carregar markets da exchange após retries"
+    print(HEALTH["last_warning"])
     return None
 
 # ====================================================
@@ -212,6 +222,34 @@ def send_telegram(msg):
         )
     except Exception as e:
         print("ERRO TELEGRAM COBRA:", e)
+
+
+
+def startup_signal_guard_active():
+    try:
+        return time.time() - SERVICE_STARTED_TS < STARTUP_SIGNAL_GRACE_SECONDS
+    except Exception:
+        return False
+
+def enviar_startup_cobra_uma_vez():
+    chave = "cobra:startup_msg_last_ts"
+    agora = time.time()
+    try:
+        ultimo = redis.get(chave)
+        ultimo = float(ultimo or 0)
+        if agora - ultimo < STARTUP_ALERT_COOLDOWN_SECONDS:
+            print("Startup Cobra já avisado recentemente. Pulando Telegram.")
+            return
+        redis.set(chave, str(agora))
+    except Exception as e:
+        print("Erro na trava startup Cobra:", e)
+
+    send_telegram(
+        "🐍 Cobra Attack iniciado.\n\n"
+        "Bot privado online.\n"
+        f"Watchlist: {WATCHLIST_FILE}\n"
+        f"Startup guard: {STARTUP_SIGNAL_GRACE_SECONDS}s"
+    )
 
 def redis_get_json(key, padrao):
     try:
@@ -323,6 +361,8 @@ def carregar_watchlist():
     candidatos = [WATCHLIST_FILE]
     if WATCHLIST_FILE != "watchlist.json":
         candidatos.append("watchlist.json")
+    if WATCHLIST_FILE != "watchlists/cobra.json":
+        candidatos.append("watchlists/cobra.json")
 
     for arquivo in candidatos:
         try:
@@ -352,6 +392,7 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
     HEALTH["watchlist_total"] = len(watchlist)
     HEALTH["watchlist_valid"] = len(validos)
     HEALTH["watchlist_invalid"] = invalidos
+    HEALTH["last_invalid_watchlist_check"] = data_hora_sp_str()
 
     if invalidos and avisar_telegram:
         send_telegram(
@@ -1299,6 +1340,7 @@ def montar_health_tecnico():
         "last_management_run": HEALTH.get("last_management_run"),
         "last_success": HEALTH.get("last_success"),
         "last_error": HEALTH.get("last_error"),
+        "last_warning": HEALTH.get("last_warning"),
         "watchlist_file": WATCHLIST_FILE,
         "daily_summary_time": f"{DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}",
         "monthly_summary_day": MONTHLY_SUMMARY_DAY,
@@ -1308,6 +1350,7 @@ def montar_health_tecnico():
         "watchlist_total": HEALTH.get("watchlist_total"),
         "watchlist_valid": HEALTH.get("watchlist_valid"),
         "watchlist_invalid": HEALTH.get("watchlist_invalid"),
+        "last_invalid_watchlist_check": HEALTH.get("last_invalid_watchlist_check"),
         "positions_open": contar_posicoes_ativas(),
         "positions_limit": MAX_OPEN_POSITIONS,
         "telegram_private_configured": bool(TOKEN and CHAT_ID),
@@ -1344,6 +1387,8 @@ def montar_health_tecnico():
         "be_trigger_r": BE_TRIGGER_R,
         "trailing_atr_mult": TRAIL_ATR_MULT,
         "max_risk_h1": MAX_RISK_H1,
+        "startup_signal_guard_active": startup_signal_guard_active(),
+        "startup_signal_grace_seconds": STARTUP_SIGNAL_GRACE_SECONDS,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -1478,7 +1523,7 @@ def scanner():
     HEALTH["started_at"] = data_hora_sp_str()
     watchlist_inicial = carregar_watchlist()
     validar_watchlist_bingx(watchlist_inicial, avisar_telegram=True)
-    send_telegram("🐍 Cobra Attack iniciado.\n\nBot privado online.")
+    enviar_startup_cobra_uma_vez()
 
     while True:
         try:
@@ -1512,6 +1557,16 @@ def scanner():
                     historico = carregar_sinais()
                     chave = f"{s['signal_type']}_{s['symbol']}_{s['timestamp']}_{s['side']}"
                     if chave in historico:
+                        continue
+
+                    if startup_signal_guard_active():
+                        # Evita sinais atrasados logo após deploy/restart.
+                        # Marca no histórico para não enviar o mesmo candle depois.
+                        historico[chave] = True
+                        if len(historico) > 3000:
+                            historico = dict(list(historico.items())[-3000:])
+                        salvar_sinais(historico)
+                        print(f"STARTUP GUARD COBRA: sinal marcado e não enviado: {chave}")
                         continue
 
                     if registrar_posicao(s):
@@ -1671,6 +1726,7 @@ def watchdog_status():
         "minutes_since_scanner": minutos_desde(HEALTH.get("last_scanner_run")),
         "minutes_since_management": minutos_desde(HEALTH.get("last_management_run")),
         "last_error": HEALTH.get("last_error"),
+        "last_warning": HEALTH.get("last_warning"),
     }
 
 iniciar_threads_monitoradas()
