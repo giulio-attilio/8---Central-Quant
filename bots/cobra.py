@@ -242,7 +242,7 @@ def startup_signal_guard_active():
         return False
 
 def enviar_startup_cobra_uma_vez():
-    chave = "cobra:startup_msg_last_ts_v2"
+    chave = "cobra:startup_msg_last_ts"
     agora = time.time()
     try:
         ultimo = redis.get(chave)
@@ -1445,6 +1445,7 @@ def processar_comando(texto):
 
 def listen_commands():
     global ultimo_update_id
+    print("INTERPRETADOR DE COMANDOS COBRA INICIADO")
     while True:
         try:
             if not TOKEN or not CHAT_ID:
@@ -1464,7 +1465,14 @@ def listen_commands():
                 if str(CHAT_ID) != chat_id:
                     continue
                 texto = msg.get("text", "")
-                resposta = processar_comando(texto)
+                if not texto:
+                    continue
+
+                cmd = texto.strip().split()[0].lower()
+                if "@" in cmd:
+                    cmd = cmd.split("@")[0]
+
+                resposta = processar_comando(cmd)
                 if resposta:
                     send_telegram(resposta)
         except Exception as e:
