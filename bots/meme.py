@@ -450,6 +450,10 @@ REENTRY_COOLDOWN_SECONDS = 60 * 60
 PROTECTION_SECONDS = 300
 
 # Central Quant: evita sinais antigos após deploy/restart.
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "23"))
+DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "55"))
+DAILY_SUMMARY_KEY = "meme:daily_summary_sent"
+
 STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("MEME_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
 SERVICE_STARTED_TS = time.time()
 STARTUP_MSG_COOLDOWN_SECONDS = int(os.environ.get("MEME_STARTUP_MSG_COOLDOWN_SECONDS", "3600"))
@@ -3375,6 +3379,43 @@ def resetar_robo():
 
 
 
+
+def resumo_diario_ja_enviado():
+    enviados = redis_get_json(DAILY_SUMMARY_KEY, {})
+    hoje = data_hoje_sp_str()
+    return enviados.get(hoje) is True
+
+
+def marcar_resumo_diario_enviado():
+    enviados = redis_get_json(DAILY_SUMMARY_KEY, {})
+    hoje = data_hoje_sp_str()
+    enviados[hoje] = True
+
+    if len(enviados) > 30:
+        chaves = sorted(enviados.keys())
+        for chave in chaves[:-30]:
+            enviados.pop(chave, None)
+
+    redis_set_json(DAILY_SUMMARY_KEY, enviados)
+
+
+def enviar_resumo_diario_se_preciso():
+    agora = agora_sp()
+
+    if agora.hour != DAILY_SUMMARY_HOUR or agora.minute < DAILY_SUMMARY_MINUTE:
+        return
+
+    if resumo_diario_ja_enviado():
+        return
+
+    try:
+        safe_send_telegram(montar_resumo_diario())
+        marcar_resumo_diario_enviado()
+        print("Resumo diário Meme Hunter enviado automaticamente.")
+    except Exception as e:
+        print("ERRO RESUMO DIARIO MEME:", e)
+
+
 def montar_health_telegram_curto():
     try:
         watch_total = HEALTH.get("watchlist_total", HEALTH.get("last_watchlist_count", 0))
@@ -3545,6 +3586,8 @@ def scanner():
             HEALTH["last_scanner_run"] = data_hora_sp_str()
             gerenciar_posicoes()
             HEALTH["last_management_run"] = data_hora_sp_str()
+
+            enviar_resumo_diario_se_preciso()
             atualizar_monitor_be()
 
             agora = time.localtime()
