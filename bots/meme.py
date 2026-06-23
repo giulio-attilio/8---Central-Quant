@@ -987,7 +987,6 @@ def safe_send_telegram(msg):
             "chat_id": CHAT_ID,
             "text": parte
         }
-
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -998,8 +997,6 @@ def safe_send_telegram(msg):
             time.sleep(0.5)
         except Exception as e:
             print("ERRO TELEGRAM MEME:", e)
-
-
 
 def mes_anterior_ref():
     hoje = agora_sp()
@@ -3380,6 +3377,8 @@ def resetar_robo():
 
 def montar_health_telegram_curto():
     try:
+        watch_total = HEALTH.get("watchlist_total", HEALTH.get("last_watchlist_count", 0))
+        watch_valid = HEALTH.get("watchlist_valid", HEALTH.get("last_watchlist_count", 0))
         return (
             "🩺 HEALTH MEME HUNTER\n\n"
             f"OK: {check_bool(HEALTH.get('last_error') is None)}\n"
@@ -3389,22 +3388,21 @@ def montar_health_telegram_curto():
             f"Último sucesso: {HEALTH.get('last_success')}\n"
             f"Erro: {HEALTH.get('last_error')}\n"
             f"Warning: {HEALTH.get('last_warning')}\n\n"
-            f"Watchlist: {HEALTH.get('watchlist_valid', HEALTH.get('last_watchlist_count', 0))}/"
-            f"{HEALTH.get('watchlist_total', HEALTH.get('last_watchlist_count', 0))}\n"
+            f"Watchlist: {watch_valid}/{watch_total}\n"
             f"Posições abertas: {contar_posicoes_ativas()}/{MAX_OPEN_POSITIONS}\n\n"
             f"Breakout: {check_bool(ENABLE_MEME_BREAKOUT_STRATEGY)}\n"
             f"Early Hunter: {check_bool(ENABLE_EARLY_HUNTER)}\n"
             f"Reentry: {check_bool(ENABLE_REENTRY_AFTER_TP50)}\n"
             f"Legacy Trend: {check_bool(ENABLE_LEGACY_TREND_ENTRIES)}\n"
             f"POI Alerts: {check_bool(ENABLE_POI_ALERTS)}\n\n"
-            f"Score mínimo: {MEME_MIN_SCORE}/100\n"
+            f"Meme score mínimo: {MEME_MIN_SCORE}/100\n"
             f"Early score mínimo: {EARLY_HUNTER_SCORE_MIN}/100\n"
+            f"ADX H4 mínimo: {MEME_MIN_ADX_H4}\n"
             f"Risco máximo: {MAX_RISK_H1}%\n"
             f"Startup guard: {check_bool(startup_signal_guard_active())}"
         )
     except Exception as e:
         return f"❌ Erro ao montar /health do Meme: {e}"
-
 
 def processar_comando(texto):
     cmd = texto.strip().lower()
@@ -3430,62 +3428,65 @@ def processar_comando(texto):
             "🔥 Meme Breakout - rompimento confirmado"
         )
 
-    if cmd in ["/health", "/status"]:
-        return montar_health_tecnico()
+    if cmd == "/health":
+        return montar_health_telegram_curto()
+
     if cmd == "/teste":
         return "✅ Meme Hunter PRO conectado ao Telegram."
+
     if cmd in ["/posicoes", "/posições"]:
-        return montar_status()
+        return montar_posicoes()
+
     if cmd == "/top":
-        ativos = obter_posicoes_ativas_ordenadas()
+        try:
+            ativos = obter_posicoes_ativas_ordenadas()
+        except Exception:
+            ativos = []
         if not ativos:
             return "📊 TOP MEME HUNTER\n\nNenhuma posição ativa."
         linhas = ["📊 TOP MEME HUNTER\n"]
         for p in ativos[:10]:
-            linhas.append(f"{p['symbol_clean']} {p['side']} | {fmt_pct(p.get('pnl_atual', 0))}")
+            linhas.append(
+                f"{p.get('symbol_clean', p.get('symbol', 'N/A'))} {p.get('side', '')} | "
+                f"{fmt_pct(p.get('pnl_atual', 0))}"
+            )
         return "\n".join(linhas)
-    if cmd == "/watchlist":
-        wl = carregar_watchlist()
-        wl_validada = validar_watchlist_bingx(wl, avisar_telegram=False)
-        return (
-            f"👀 WATCHLIST MEME HUNTER\n\n"
-            f"Configurada: {len(wl)} ativos\n"
-            f"Válida BingX: {len(wl_validada)} ativos\n\n"
-            + "\n".join([nome_limpo(x) for x in wl_validada])
-        )
+
     if cmd == "/resumo":
         return montar_resumo_diario()
-    if cmd == "/mensal":
-        return montar_resumo_mensal()
-    if cmd == "/be":
-        return montar_monitor_be()
-    if cmd == "/limparbe":
-        salvar_monitor_be([])
-        return "✅ Monitor BE limpo com segurança."
-    if cmd == "/reset":
-        salvar_sinais({})
-        salvar_bloqueios_reentrada({})
-        salvar_monitor_be([])
-        salvar_poi_cooldown({})
-        salvar_early_cooldown({})
-        salvar_early_hunter_cooldown({})
-        redis_set_json(DAILY_SUMMARY_KEY, {})
-        return (
-            "✅ Reset operacional realizado.\n\n"
-            "O que foi limpo:\n"
-            "- Histórico de sinais/cooldowns\n"
-            "- Bloqueios de reentrada\n"
-            "- Monitor BE\n"
-            "- Cooldown POI\n"
-            "- Cooldown EARLY\n"
-            "- Cooldown EARLY HUNTER\n"
-            "- Controle de resumo diário\n\n"
-            "O que NÃO foi apagado:\n"
-            "- Posições abertas\n"
-            "- Histórico de trades"
-        )
-    return None
 
+    if cmd in ["/mensal", "/mes"]:
+        return montar_resumo_mensal()
+
+    if cmd == "/watchlist":
+        watchlist = carregar_watchlist()
+        return "👀 WATCHLIST MEME HUNTER\n\n" + "\n".join([nome_limpo(s) for s in watchlist])
+
+    if cmd == "/be":
+        try:
+            dados = carregar_monitor_be()
+            return "🟢 MONITOR BE MEME\n\n" + json.dumps(dados, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return f"Erro ao ler monitor BE: {e}"
+
+    if cmd == "/limparbe":
+        try:
+            salvar_monitor_be([])
+            return "✅ Monitor BE limpo."
+        except Exception as e:
+            return f"Erro ao limpar monitor BE: {e}"
+
+    if cmd == "/reset":
+        try:
+            salvar_poi_cooldown({})
+            salvar_early_cooldown({})
+            salvar_early_hunter_cooldown({})
+            salvar_bloqueios_reentrada({})
+            return "✅ Cooldowns/bloqueios limpos. Posições e histórico preservados."
+        except Exception as e:
+            return f"Erro no reset: {e}"
+
+    return None
 
 def listen_commands():
     last_update_id = 0
