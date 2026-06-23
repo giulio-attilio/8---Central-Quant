@@ -1,5 +1,5 @@
 # TREND PRO MTF H4/H1 + POI
-# Versão: 2026-06-23-DONKEY-H4-PARCIAL50-EMA20-BE-POST-STOP-COOLDOWN
+# Versão: 2026-06-23-DONKEY-H4-PARCIAL50-EMA20-SELETIVO
 #
 # Lógica:
 # - H4 é apenas contexto/filtro.
@@ -155,7 +155,7 @@ EMA20 = 20
 # DONKEY H4 - SETUP INDEPENDENTE
 # ====================================================
 ENABLE_DONKEY_H4 = True
-ENABLE_EARLY_DONKEY_H4 = True
+ENABLE_EARLY_DONKEY_H4 = False
 DONKEY_TIMEFRAME = "4h"
 DONKEY_EMA_FAST = 20
 DONKEY_EMA_SLOW = 50
@@ -164,7 +164,7 @@ DONKEY_MACD_SLOW = 26
 DONKEY_MACD_SIGNAL = 9
 DONKEY_BUFFER_PCT = 0.5  # 0,5% de margem no stop/trailing
 DONKEY_SWING_LEN = 5
-DONKEY_POI_COOLDOWN_SECONDS = 4 * 60 * 60  # 1 candle H4
+DONKEY_POI_COOLDOWN_SECONDS = 8 * 60 * 60  # 2 candles H4
 DONKEY_RISK_USDT = float(os.environ.get("DONKEY_RISK_USDT", "10"))
 
 
@@ -193,7 +193,7 @@ SPIKE_BODY_ATR_MULT = 4.0
 
 # Risco máximo agora bloqueia sinais ALTO por padrão.
 USE_MAX_RISK_FILTER = True
-MAX_RISK_H1 = 2.5
+MAX_RISK_H1 = 2.0
 
 # Donkey: bloqueia qualquer entrada/POI com risco acima do limite operacional.
 # Objetivo: evitar sinais com risco 3% a 6% que distorcem o resultado.
@@ -1227,6 +1227,8 @@ def montar_health_tecnico():
         "donkey_remaining_after_tp50_pct": DONKEY_REMAINING_AFTER_TP50_PCT,
         "donkey_exit_remainder_on_h4_ema20": DONKEY_EXIT_REMAINDER_ON_H4_EMA20,
         "donkey_post_exit_cooldown_seconds": DONKEY_POST_EXIT_COOLDOWN_SECONDS,
+        "donkey_poi_cooldown_seconds": DONKEY_POI_COOLDOWN_SECONDS,
+        "donkey_selective_mode": True,
         "use_max_risk_filter": USE_MAX_RISK_FILTER,
         "trendpro_elite_filter": ENABLE_TRENDPRO_ELITE_FILTER,
         "elite_threshold": ELITE_THRESHOLD,
@@ -4514,8 +4516,10 @@ def scanner():
         f"Filtros ativos:\n"
         f"Donkey H4 ativo: {check_bool(ENABLE_DONKEY_H4)}\n"
         f"Early Donkey H4 ativo: {check_bool(ENABLE_EARLY_DONKEY_H4)}\n"
+        f"Modo seletivo: ✅\n"
         f"Buffer stop/trailing: {DONKEY_BUFFER_PCT}%\n"
         f"Risco máximo por sinal: {DONKEY_MAX_RISK_PCT}%\n"
+        f"POI cooldown: {DONKEY_POI_COOLDOWN_SECONDS // 3600}h\n"
         f"Limite de posições: {MAX_OPEN_POSITIONS}\n"
         f"Cooldown pós-saída: {DONKEY_POST_EXIT_COOLDOWN_SECONDS // 60} min\n"
         f"Gestão: TP50 realiza 50% + restante EMA20 H4\n"
