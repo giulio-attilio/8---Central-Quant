@@ -309,6 +309,63 @@ def bot_detail(key):
     return bot_health(key, BOT_CONFIGS[key])
 
 
+@app.route("/central")
+def central():
+    status = central_watchdog_status()
+
+    resumo = {}
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+
+        resumo[key] = {
+            "name": b.get("name"),
+            "ok": (
+                bool(b.get("enabled"))
+                and bool(b.get("loaded"))
+                and not b.get("last_error")
+                and not b.get("load_error")
+            ),
+            "enabled": b.get("enabled"),
+            "loaded": b.get("loaded"),
+            "telegram": {
+                "token_configured": b.get("token_configured"),
+                "chat_configured": b.get("chat_configured"),
+            },
+            "last_error": b.get("last_error"),
+            "last_warning": h.get("last_warning"),
+            "load_error": b.get("load_error"),
+            "last_scanner_run": b.get("last_scanner_run"),
+            "last_management_run": b.get("last_management_run"),
+            "minutes_since_scanner": b.get("minutes_since_scanner"),
+            "minutes_since_management": b.get("minutes_since_management"),
+            "watchlist_total": h.get("watchlist_total"),
+            "watchlist_valid": h.get("watchlist_valid"),
+            "watchlist_invalid": h.get("watchlist_invalid", []),
+            "positions_open": h.get("last_positions_count"),
+            "signals_last_cycle": h.get("last_signals_sent"),
+            "watchdog_status": h.get("watchdog_last_status"),
+        }
+
+    enabled = [k for k, v in resumo.items() if v.get("enabled")]
+    loaded = [k for k, v in resumo.items() if v.get("loaded")]
+    alerts = [
+        k for k, v in resumo.items()
+        if v.get("enabled") and not v.get("ok")
+    ]
+
+    return {
+        "ok": status.get("ok"),
+        "status": status.get("status"),
+        "central_started_at": status.get("central_started_at"),
+        "enabled_bots": enabled,
+        "loaded_bots": loaded,
+        "alerts": alerts,
+        "reasons": status.get("reasons", []),
+        "bots": resumo,
+    }
+
+
 start_enabled_bots()
 threading.Thread(target=central_watchdog_loop, daemon=True).start()
 
