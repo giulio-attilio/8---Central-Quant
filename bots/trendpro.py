@@ -160,7 +160,7 @@ TIMEFRAME_H1 = "1h"
 # Central Quant:
 # ENABLE_TRENDPRO=true carrega o módulo na Central.
 # TREND_PRO_ENABLED=false deixa o robô em stand-by: health/watchlist/gestão/resumos funcionam, mas novos sinais não são enviados.
-TREND_PRO_ENABLED = os.environ.get("TREND_PRO_ENABLED", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
+TREND_PRO_ENABLED = os.environ.get("ENABLE_TRENDPRO", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 TREND_PRO_AUTO_TRADE = os.environ.get("TREND_PRO_AUTO_TRADE", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("TRENDPRO_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
 SERVICE_STARTED_TS = time.time()
