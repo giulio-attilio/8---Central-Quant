@@ -949,17 +949,23 @@ def normalizar_texto(msg):
 def enviar_texto(chat_id, msg):
     try:
         msg = normalizar_texto(msg)
-        payload = {
-            "chat_id": chat_id,
-            "text": msg
-        }
+        partes = [msg[i:i + 3900] for i in range(0, len(msg), 3900)]
+        if not partes:
+            partes = [""]
 
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            timeout=20
-        )
+        for parte in partes:
+            payload = {
+                "chat_id": chat_id,
+                "text": parte
+            }
+
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=20
+            )
+            time.sleep(0.5)
     except Exception as e:
         print("Erro ao responder Telegram:", e)
 
@@ -967,20 +973,31 @@ def enviar_texto(chat_id, msg):
 
 def safe_send_telegram(msg):
     msg = normalizar_texto(msg)
+
     if not TOKEN or not CHAT_ID:
         print(msg)
         return
-    payload = {"chat_id": CHAT_ID, "text": msg}
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            timeout=20
-        )
-    except Exception as e:
-        print("ERRO TELEGRAM MEME:", e)
 
+    partes = [msg[i:i + 3900] for i in range(0, len(msg), 3900)]
+    if not partes:
+        partes = [""]
+
+    for parte in partes:
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": parte
+        }
+
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=20
+            )
+            time.sleep(0.5)
+        except Exception as e:
+            print("ERRO TELEGRAM MEME:", e)
 
 
 
@@ -3461,7 +3478,10 @@ def listen_commands():
                 chat_id = msg.get("chat", {}).get("id")
                 if not chat_id or str(chat_id) != str(CHAT_ID):
                     continue
-                resposta = processar_comando(texto)
+                cmd = texto.strip().split()[0].lower()
+                if "@" in cmd:
+                    cmd = cmd.split("@")[0]
+                resposta = processar_comando(cmd)
                 if resposta:
                     enviar_texto(chat_id, resposta)
         except Exception as e:
