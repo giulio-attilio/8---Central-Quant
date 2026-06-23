@@ -1417,24 +1417,41 @@ def montar_health_tecnico():
 
 def processar_comando(texto):
     cmd = texto.strip().lower()
-    if cmd in ["/start", "/help"]:
+    if cmd in ["/start", "/help", "/comandos"]:
         return (
-            "🐍 Cobra Attack Online\n\n"
-            "Comandos:\n"
-            "/health\n"
-            "/posicoes\n"
-            "/resumo\n"
-            "/mes\n"
-            "/estatisticas\n"
-            "/watchlist"
+            "📌 Comandos disponíveis:
+
+"
+            "/health - painel técnico do Cobra
+"
+            "/teste - testa conexão com Telegram
+"
+            "/posicoes - lista posições abertas
+"
+            "/top - mostra melhores posições abertas
+"
+            "/resumo - envia resumo do dia
+"
+            "/mensal - envia resumo do mês
+"
+            "/mes - envia resumo do mês
+"
+            "/estatisticas - histórico geral
+"
+            "/watchlist - mostra ativos monitorados
+"
+            "/comandos - mostra esta lista"
         )
     if cmd == "/health":
         return montar_health_tecnico()
+
+    if cmd == "/teste":
+        return "✅ Cobra Attack conectado ao Telegram."
     if cmd in ["/posicoes", "/posições"]:
         return montar_posicoes()
     if cmd == "/resumo":
         return montar_resumo("dia")
-    if cmd == "/mes":
+    if cmd in ["/mes", "/mensal"]:
         return montar_resumo("mes")
     if cmd == "/estatisticas":
         return montar_resumo("all")
