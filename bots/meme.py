@@ -1200,7 +1200,7 @@ def montar_health_tecnico():
         "use_min_quote_volume_filter": USE_MIN_QUOTE_VOLUME_FILTER,
         "min_quote_volume_h1_usdt": MIN_QUOTE_VOLUME_H1_USDT,
         "startup_signal_grace_seconds": STARTUP_SIGNAL_GRACE_SECONDS,
-        "startup_signal_guard_active": startup_signal_guard_active(),
+        "startup_signal_guard_active": ((time.time() - SERVICE_STARTED_TS) < STARTUP_SIGNAL_GRACE_SECONDS),
         "startup_guard_restante_segundos": startup_guard_restante_segundos(),
         "watchdog_status": HEALTH.get("watchdog_last_status", "OK"),
         "watchdog_last_check": HEALTH.get("watchdog_last_check"),
@@ -2582,7 +2582,7 @@ def enviar_stop(p, preco_atual, stop, resultado):
 # ====================================================
 
 def registrar_posicao(s):
-    if startup_signal_guard_active():
+    if ((time.time() - SERVICE_STARTED_TS) < STARTUP_SIGNAL_GRACE_SECONDS):
         try:
             historico = carregar_sinais()
             symbol_guard = s.get("symbol")
@@ -3399,7 +3399,7 @@ def montar_health_telegram_curto():
             f"Early score mínimo: {EARLY_HUNTER_SCORE_MIN}/100\n"
             f"ADX H4 mínimo: {MEME_MIN_ADX_H4}\n"
             f"Risco máximo: {MAX_RISK_H1}%\n"
-            f"Startup guard: {check_bool(startup_signal_guard_active())}"
+            f"Startup guard: {check_bool((time.time() - SERVICE_STARTED_TS) < STARTUP_SIGNAL_GRACE_SECONDS)}"
         )
     except Exception as e:
         return f"❌ Erro ao montar /health do Meme: {e}"
