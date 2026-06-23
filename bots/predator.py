@@ -1,19 +1,14 @@
-Aqui está o código completo refatorado, com as correções aplicadas.
-
-### O que foi alterado/corrigido nesta versão:
-
-1. **Lock de Concorrência (`threading.Lock`):** Implementado nas funções de leitura/escrita do Redis para evitar condições de corrida entre as threads do scanner e dos comandos do Telegram.
-2. **Vetorização do ADX:** Removido o loop `for` (list comprehension) da função `calcular_adx` e substituído por `np.where` do NumPy, tornando o cálculo instantâneo e economizando CPU.
-3. **Otimização de Payload REST:** Reduzido o limite padrão de candles de `300` para `100` na função `fetch_df`. Como a maior média usada é de 50 períodos, 100 candles são mais do que suficientes, reduzindo drasticamente o tempo de resposta das chamadas à API da BingX.
-4. **Tratamento de Erro Individual na Gestão:** Envolvida a função `obter_preco_atual` dentro do loop de gerenciamento em um bloco `try/except`. Se um ativo falhar por timeout ou oscilação na exchange, ele pula para o próximo e não trava o gerenciamento dos demais.
-5. **Ajuste na Janela M15:** A janela do M15 agora vai desde o início do candle H1 que gerou o Sweep até o timestamp atual (`time.time() * 1000`), permitindo que o robô pegue CHOCHs que se desenvolvam um pouco depois do fechamento do candle do sweep.
-6. **Limpeza de Código:** Removidos indicadores não utilizados (`ema9`, `ema20`, `ema21`, `ema200`) para otimizar a performance.
-
-```python
 # SMART PREDATOR - SMC H1
-# Versão: 2026-06-20-SMART-PREDATOR-V2-M15-CHOCH-OPTIMIZED
+# Versão: 2026-06-23-SMART-PREDATOR-STANDBY-CENTRAL-QUANT
 #
-# Lógica Smart Predator Corrigida e Otimizada.
+# Stand-by para Central Quant:
+# - Estrutura padronizada como Donkey/Cobra/Meme.
+# - Robô inicia, responde Telegram, health, watchlist, resumo, mensal, funil e watchdog.
+# - Por padrão NÃO envia novos sinais: SMART_PREDATOR_ENABLED=false.
+# - Para ativar no Render: SMART_PREDATOR_ENABLED=true.
+# - Mantém lógica: Liquidity Sweep H1 + CHOCH M15 + Order Block H1 + Reteste.
+# - Gestão: TP50 -> BE + offset -> Trailing ATR.
+# - Futuro BingX real: usar SL/TP virtuais pela Central Quant.
 
 from flask import Flask
 import os
@@ -30,14 +25,15 @@ from upstash_redis import Redis
 app = Flask(__name__)
 
 # ====================================================
-# IDENTIDADE E LOCKS
+# IDENTIDADE / STAND-BY / LOCKS
 # ====================================================
 
 BOT_NAME = os.environ.get("BOT_NAME", "Smart Predator")
 SERVICE_MODE = "SMART_PREDATOR"
+BOT_VERSION = "2026-06-23-SMART-PREDATOR-STANDBY-CENTRAL-QUANT"
 
-# Lock global para evitar Race Conditions no Redis entre as Threads
 redis_lock = threading.Lock()
+ultimo_update_id = None
 
 # ====================================================
 # TELEGRAM / REDIS / EXCHANGE
@@ -49,15 +45,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-exchange = ccxt.bingx({"enableRateLimit": True})
-exchange.options["defaultType"] = "swap"
-
-redis = Redis(
-    url=UPSTASH_REDIS_REST_URL,
-    token=UPSTASH_REDIS_REST_TOKEN
-)
-
-WATCHLIST_FILE = "watchlist.json"
+WATCHLIST_FILE = os.environ.get("PREDATOR_WATCHLIST_FILE", "watchlists/predator.json")
 
 POSITIONS_KEY = "smartpredator:positions"
 SIGNALS_KEY = "smartpredator:signals"
@@ -66,8 +54,16 @@ DAILY_SUMMARY_KEY = "smartpredator:daily_summary_sent"
 MONTHLY_SUMMARY_KEY = "smartpredator:monthly_summary_sent"
 SWEEP_STATE_KEY = "smartpredator:sweep_state"
 SIGNAL_COOLDOWN_KEY = "smartpredator:signal_cooldown"
-STARTUP_MESSAGE_KEY = "smartpredator:startup_message_sent"
+STARTUP_MESSAGE_KEY = "smartpredator:startup_message_sent_v2"
 FUNNEL_STATS_KEY = "smartpredator:funnel_stats"
+
+exchange = ccxt.bingx({"enableRateLimit": True})
+exchange.options["defaultType"] = "swap"
+
+redis = Redis(
+    url=UPSTASH_REDIS_REST_URL,
+    token=UPSTASH_REDIS_REST_TOKEN
+)
 
 # ====================================================
 # CONFIGURAÇÕES PRINCIPAIS
@@ -77,46 +73,47 @@ TIMEFRAME_H1 = os.environ.get("PREDATOR_TIMEFRAME", "1h")
 TIMEFRAME_H4 = os.environ.get("PREDATOR_CONTEXT_TIMEFRAME", "4h")
 TIMEFRAME_M15 = os.environ.get("PREDATOR_CHOCH_TIMEFRAME", "15m")
 
-SMART_PREDATOR_ENABLED = os.environ.get("SMART_PREDATOR_ENABLED", "true").lower() == "true"
-SMART_PREDATOR_AUTO_TRADE = os.environ.get("SMART_PREDATOR_AUTO_TRADE", "false").lower() == "true"
+# IMPORTANTE: default false para stand-by.
+SMART_PREDATOR_ENABLED = os.environ.get("SMART_PREDATOR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
+SMART_PREDATOR_AUTO_TRADE = os.environ.get("SMART_PREDATOR_AUTO_TRADE", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 
-SCANNER_SLEEP_SECONDS = int(os.environ.get("SCANNER_SLEEP_SECONDS", "60"))
+SCANNER_SLEEP_SECONDS = int(os.environ.get("PREDATOR_SCANNER_SLEEP_SECONDS", os.environ.get("SCANNER_SLEEP_SECONDS", "60")))
+COMMAND_SLEEP_SECONDS = int(os.environ.get("COMMAND_SLEEP_SECONDS", "2"))
 
-SWING_LOOKBACK = int(os.environ.get("SWING_LOOKBACK", "10"))
-CHOCH_LOOKBACK = int(os.environ.get("CHOCH_LOOKBACK", "8"))
-OB_LOOKBACK = int(os.environ.get("OB_LOOKBACK", "12"))
+SWING_LOOKBACK = int(os.environ.get("PREDATOR_SWING_LOOKBACK", "10"))
+CHOCH_LOOKBACK = int(os.environ.get("PREDATOR_CHOCH_LOOKBACK", "8"))
+OB_LOOKBACK = int(os.environ.get("PREDATOR_OB_LOOKBACK", "12"))
 
-MIN_PREDATOR_SCORE = int(os.environ.get("MIN_PREDATOR_SCORE", "70"))
+MIN_PREDATOR_SCORE = int(os.environ.get("PREDATOR_MIN_SCORE", os.environ.get("MIN_PREDATOR_SCORE", "70")))
 
 ATR_LEN = int(os.environ.get("ATR_LEN", "14"))
 ADX_LEN = int(os.environ.get("ADX_LEN", "14"))
-
 EMA50 = 50
 
-MIN_ADX_H4 = float(os.environ.get("MIN_ADX_H4", "15"))
-VOLUME_MULTIPLIER = float(os.environ.get("VOLUME_MULTIPLIER", "1.2"))
+MIN_ADX_H4 = float(os.environ.get("PREDATOR_MIN_ADX_H4", os.environ.get("MIN_ADX_H4", "15")))
+VOLUME_MULTIPLIER = float(os.environ.get("PREDATOR_VOLUME_MULTIPLIER", os.environ.get("VOLUME_MULTIPLIER", "1.2")))
 
-MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "20"))
-USE_MAX_RISK_FILTER = os.environ.get("USE_MAX_RISK_FILTER", "true").lower() == "true"
-MAX_RISK_H1 = float(os.environ.get("MAX_RISK_H1", "2.5"))
+MAX_OPEN_POSITIONS = int(os.environ.get("PREDATOR_MAX_OPEN_POSITIONS", os.environ.get("MAX_OPEN_POSITIONS", "20")))
+USE_MAX_RISK_FILTER = os.environ.get("PREDATOR_USE_MAX_RISK_FILTER", os.environ.get("USE_MAX_RISK_FILTER", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+MAX_RISK_H1 = float(os.environ.get("PREDATOR_MAX_RISK_H1", os.environ.get("MAX_RISK_H1", "2.5")))
 
-TP50_R = float(os.environ.get("TP50_R", "2.0"))
-BE_OFFSET_PCT = float(os.environ.get("BE_OFFSET_PCT", "0.10"))
-TRAIL_ATR_MULT = float(os.environ.get("TRAIL_ATR_MULT", "2.0"))
-PROTECTION_SECONDS = int(os.environ.get("PROTECTION_SECONDS", "300"))
+TP50_R = float(os.environ.get("PREDATOR_TP50_R", os.environ.get("TP50_R", "2.0")))
+BE_OFFSET_PCT = float(os.environ.get("PREDATOR_BE_OFFSET_PCT", os.environ.get("BE_OFFSET_PCT", "0.10")))
+TRAIL_ATR_MULT = float(os.environ.get("PREDATOR_TRAIL_ATR_MULT", os.environ.get("TRAIL_ATR_MULT", "2.0")))
+PROTECTION_SECONDS = int(os.environ.get("PREDATOR_PROTECTION_SECONDS", os.environ.get("PROTECTION_SECONDS", "300")))
 
-SIGNAL_COOLDOWN_SECONDS = int(os.environ.get("SIGNAL_COOLDOWN_SECONDS", str(60 * 60)))
+SIGNAL_COOLDOWN_SECONDS = int(os.environ.get("PREDATOR_SIGNAL_COOLDOWN_SECONDS", str(60 * 60)))
 
-ENABLE_SPIKE_FILTER = os.environ.get("ENABLE_SPIKE_FILTER", "true").lower() == "true"
-SPIKE_RANGE_ATR_MULT = float(os.environ.get("SPIKE_RANGE_ATR_MULT", "6"))
-SPIKE_BODY_ATR_MULT = float(os.environ.get("SPIKE_BODY_ATR_MULT", "4"))
+ENABLE_SPIKE_FILTER = os.environ.get("PREDATOR_ENABLE_SPIKE_FILTER", os.environ.get("ENABLE_SPIKE_FILTER", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+SPIKE_RANGE_ATR_MULT = float(os.environ.get("PREDATOR_SPIKE_RANGE_ATR_MULT", os.environ.get("SPIKE_RANGE_ATR_MULT", "6")))
+SPIKE_BODY_ATR_MULT = float(os.environ.get("PREDATOR_SPIKE_BODY_ATR_MULT", os.environ.get("SPIKE_BODY_ATR_MULT", "4")))
 
-DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "23"))
-DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "55"))
+DAILY_SUMMARY_HOUR = int(os.environ.get("PREDATOR_DAILY_SUMMARY_HOUR", os.environ.get("DAILY_SUMMARY_HOUR", "23")))
+DAILY_SUMMARY_MINUTE = int(os.environ.get("PREDATOR_DAILY_SUMMARY_MINUTE", os.environ.get("DAILY_SUMMARY_MINUTE", "55")))
 
-MONTHLY_SUMMARY_DAY = int(os.environ.get("MONTHLY_SUMMARY_DAY", "1"))
-MONTHLY_SUMMARY_HOUR = int(os.environ.get("MONTHLY_SUMMARY_HOUR", "8"))
-MONTHLY_SUMMARY_MINUTE = int(os.environ.get("MONTHLY_SUMMARY_MINUTE", "5"))
+MONTHLY_SUMMARY_DAY = int(os.environ.get("PREDATOR_MONTHLY_SUMMARY_DAY", os.environ.get("MONTHLY_SUMMARY_DAY", "1")))
+MONTHLY_SUMMARY_HOUR = int(os.environ.get("PREDATOR_MONTHLY_SUMMARY_HOUR", os.environ.get("MONTHLY_SUMMARY_HOUR", "23")))
+MONTHLY_SUMMARY_MINUTE = int(os.environ.get("PREDATOR_MONTHLY_SUMMARY_MINUTE", os.environ.get("MONTHLY_SUMMARY_MINUTE", "55")))
 
 WATCHDOG_CHECK_SECONDS = int(os.environ.get("WATCHDOG_CHECK_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("WATCHDOG_THRESHOLD_MINUTES", "20"))
@@ -128,6 +125,7 @@ HEALTH = {
     "last_management_run": None,
     "last_success": None,
     "last_error": None,
+    "last_warning": None,
     "last_signals_sent": 0,
     "last_positions_count": 0,
     "watchlist_total": 0,
@@ -138,6 +136,28 @@ HEALTH = {
     "last_watchdog_alert_ts": 0,
     "watchdog_last_check": None,
     "watchdog_last_status": "OK"
+}
+
+DEFAULT_FUNNEL_STATS = {
+    "scanner_runs": 0,
+    "symbols_scanned": 0,
+    "bullish_sweeps": 0,
+    "bearish_sweeps": 0,
+    "bullish_choch": 0,
+    "bearish_choch": 0,
+    "bullish_ob": 0,
+    "bearish_ob": 0,
+    "bullish_retests": 0,
+    "bearish_retests": 0,
+    "risk_rejected": 0,
+    "score_70_plus": 0,
+    "score_80_plus": 0,
+    "score_85_plus": 0,
+    "signals_detected": 0,
+    "signals_sent": 0,
+    "long_signals": 0,
+    "short_signals": 0,
+    "last_update": None
 }
 
 # ====================================================
@@ -158,6 +178,18 @@ def data_hora_sp_str():
 
 def nome_limpo(symbol):
     return symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
+
+
+def normalizar_texto(msg):
+    if msg is None:
+        return ""
+    msg = str(msg)
+    try:
+        if "Ã" in msg or "â" in msg or "ðŸ" in msg:
+            msg = msg.encode("latin1").decode("utf-8")
+    except Exception:
+        pass
+    return msg
 
 
 def fmt_br(v, casas=8):
@@ -183,7 +215,6 @@ def risco_label(risco_pct):
         r = float(risco_pct)
     except Exception:
         return "⚪ N/A"
-
     if r <= 1.5:
         return "🟢 IDEAL"
     if r <= 2.5:
@@ -192,40 +223,52 @@ def risco_label(risco_pct):
 
 
 def safe_send_telegram(msg):
+    msg = normalizar_texto(msg)
+
     if not TOKEN or not CHAT_ID:
         print(msg)
         return
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": msg
-    }
+    partes = [msg[i:i + 3900] for i in range(0, len(msg), 3900)]
+    if not partes:
+        partes = [""]
 
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            timeout=20
-        )
-    except Exception as e:
-        print("ERRO TELEGRAM:", e)
+    for parte in partes:
+        payload = {"chat_id": CHAT_ID, "text": parte}
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=20
+            )
+            time.sleep(0.35)
+        except Exception as e:
+            print("ERRO TELEGRAM:", e)
 
 
 def enviar_texto(chat_id, msg):
+    msg = normalizar_texto(msg)
+
     if not TOKEN:
         print(msg)
         return
 
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data=json.dumps({"chat_id": chat_id, "text": msg}, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            timeout=20
-        )
-    except Exception as e:
-        print("ERRO AO RESPONDER TELEGRAM:", e)
+    partes = [msg[i:i + 3900] for i in range(0, len(msg), 3900)]
+    if not partes:
+        partes = [""]
+
+    for parte in partes:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data=json.dumps({"chat_id": chat_id, "text": parte}, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=20
+            )
+            time.sleep(0.35)
+        except Exception as e:
+            print("ERRO AO RESPONDER TELEGRAM:", e)
 
 
 def redis_get_json(key, padrao):
@@ -248,136 +291,6 @@ def redis_set_json(key, value):
             redis.set(key, json.dumps(value, ensure_ascii=False))
         except Exception as e:
             print(f"ERRO REDIS SET {key}:", e)
-
-
-DEFAULT_FUNNEL_STATS = {
-    "scanner_runs": 0,
-    "symbols_scanned": 0,
-    "bullish_sweeps": 0,
-    "bearish_sweeps": 0,
-    "bullish_choch": 0,
-    "bearish_choch": 0,
-    "bullish_ob": 0,
-    "bearish_ob": 0,
-    "bullish_retests": 0,
-    "bearish_retests": 0,
-    "risk_rejected": 0,
-    "score_70_plus": 0,
-    "score_80_plus": 0,
-    "score_85_plus": 0,
-    "signals_detected": 0,
-    "signals_sent": 0,
-    "long_signals": 0,
-    "short_signals": 0,
-    "last_update": None
-}
-
-
-def carregar_funnel_stats():
-    dados = redis_get_json(FUNNEL_STATS_KEY, {})
-    if not isinstance(dados, dict):
-        dados = {}
-
-    stats = DEFAULT_FUNNEL_STATS.copy()
-    stats.update(dados)
-    return stats
-
-
-def salvar_funnel_stats(stats):
-    if not isinstance(stats, dict):
-        stats = DEFAULT_FUNNEL_STATS.copy()
-
-    stats["last_update"] = data_hora_sp_str()
-    redis_set_json(FUNNEL_STATS_KEY, stats)
-
-
-def inc_funnel_stat(campo, valor=1):
-    stats = carregar_funnel_stats()
-    try:
-        stats[campo] = int(stats.get(campo, 0)) + int(valor)
-    except Exception:
-        stats[campo] = valor
-    salvar_funnel_stats(stats)
-
-
-def resetar_funnel_stats():
-    stats = DEFAULT_FUNNEL_STATS.copy()
-    stats["last_update"] = data_hora_sp_str()
-    redis_set_json(FUNNEL_STATS_KEY, stats)
-
-
-def montar_funnel_stats_json():
-    return json.dumps(carregar_funnel_stats(), ensure_ascii=False, indent=2)
-
-
-def montar_funnel_stats_texto():
-    s = carregar_funnel_stats()
-
-    return (
-        "🦈 FUNIL SMART PREDATOR\n\n"
-        f"Scanner runs: {s.get('scanner_runs', 0)}\n"
-        f"Ativos escaneados: {s.get('symbols_scanned', 0)}\n\n"
-        f"Liquidity Sweeps:\n"
-        f"Bullish: {s.get('bullish_sweeps', 0)}\n"
-        f"Bearish: {s.get('bearish_sweeps', 0)}\n\n"
-        f"CHOCH:\n"
-        f"Bullish: {s.get('bullish_choch', 0)}\n"
-        f"Bearish: {s.get('bearish_choch', 0)}\n\n"
-        f"Order Blocks:\n"
-        f"Bullish: {s.get('bullish_ob', 0)}\n"
-        f"Bearish: {s.get('bearish_ob', 0)}\n\n"
-        f"Retestes:\n"
-        f"Bullish: {s.get('bullish_retests', 0)}\n"
-        f"Bearish: {s.get('bearish_retests', 0)}\n\n"
-        f"Rejeitados por risco: {s.get('risk_rejected', 0)}\n\n"
-        f"Score >= 70: {s.get('score_70_plus', 0)}\n"
-        f"Score >= 80: {s.get('score_80_plus', 0)}\n"
-        f"Score >= 85: {s.get('score_85_plus', 0)}\n\n"
-        f"Sinais detectados: {s.get('signals_detected', 0)}\n"
-        f"Sinais enviados: {s.get('signals_sent', 0)}\n"
-        f"LONG: {s.get('long_signals', 0)}\n"
-        f"SHORT: {s.get('short_signals', 0)}\n\n"
-        f"Última atualização: {s.get('last_update')}"
-    )
-
-
-def startup_message_already_sent_today():
-    dados = redis_get_json(STARTUP_MESSAGE_KEY, {})
-    if not isinstance(dados, dict):
-        return False
-
-    return dados.get("date") == data_hoje_sp_str()
-
-
-def marcar_startup_message_sent():
-    redis_set_json(STARTUP_MESSAGE_KEY, {
-        "date": data_hoje_sp_str(),
-        "datetime": data_hora_sp_str()
-    })
-
-
-def montar_startup_message():
-    return (
-        "🤖 Robô " + BOT_NAME + " iniciado\n\n"
-        "Modo:\n" + ("REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO") + "\n\n"
-        "Lógica:\n"
-        "Liquidity Sweep + CHOCH + Order Block + Reteste\n\n"
-        "Timeframe principal: " + TIMEFRAME_H1 + "\n"
-        "CHOCH: " + TIMEFRAME_M15 + "\n"
-        "Contexto: " + TIMEFRAME_H4 + "\n"
-        "Score mínimo: " + str(MIN_PREDATOR_SCORE) + "/100\n"
-        "Risco máximo: " + str(MAX_RISK_H1) + "%\n"
-        "Relatório diário: " + f"{DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}"
-    )
-
-
-def enviar_startup_message_once():
-    if startup_message_already_sent_today():
-        print("Mensagem inicial já enviada hoje. Pulando envio.")
-        return
-
-    safe_send_telegram(montar_startup_message())
-    marcar_startup_message_sent()
 
 
 def carregar_watchlist():
@@ -422,7 +335,6 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
             + "\n\nEles serão ignorados pelo Smart Predator."
         )
         print(msg)
-
         if avisar_telegram:
             safe_send_telegram(msg)
 
@@ -499,13 +411,41 @@ def marcar_cooldown(symbol, side):
     salvar_signal_cooldown(dados)
 
 
+def carregar_funnel_stats():
+    dados = redis_get_json(FUNNEL_STATS_KEY, {})
+    if not isinstance(dados, dict):
+        dados = {}
+    stats = DEFAULT_FUNNEL_STATS.copy()
+    stats.update(dados)
+    return stats
+
+
+def salvar_funnel_stats(stats):
+    if not isinstance(stats, dict):
+        stats = DEFAULT_FUNNEL_STATS.copy()
+    stats["last_update"] = data_hora_sp_str()
+    redis_set_json(FUNNEL_STATS_KEY, stats)
+
+
+def inc_funnel_stat(campo, valor=1):
+    stats = carregar_funnel_stats()
+    try:
+        stats[campo] = int(stats.get(campo, 0)) + int(valor)
+    except Exception:
+        stats[campo] = valor
+    salvar_funnel_stats(stats)
+
+
+def resetar_funnel_stats():
+    stats = DEFAULT_FUNNEL_STATS.copy()
+    stats["last_update"] = data_hora_sp_str()
+    redis_set_json(FUNNEL_STATS_KEY, stats)
+
+
 def contar_posicoes_ativas():
     try:
         posicoes = carregar_posicoes()
-        return len([
-            p for p in posicoes.values()
-            if p.get("status") != "ENCERRADO"
-        ])
+        return len([p for p in posicoes.values() if p.get("status") != "ENCERRADO"])
     except Exception:
         return 0
 
@@ -530,7 +470,6 @@ def atualizar_mfe_posicao(p, preco_atual):
         side = p.get("side")
         entry = float(p.get("entry"))
         pnl_atual = pnl_pct(side, entry, float(preco_atual))
-
         mfe_atual = float(p.get("mfe_max_pct", 0))
         if pnl_atual > mfe_atual:
             p["mfe_max_pct"] = pnl_atual
@@ -538,12 +477,10 @@ def atualizar_mfe_posicao(p, preco_atual):
             return True
     except Exception:
         pass
-
     return False
 
-
 # ====================================================
-# INDICADORES (VETORIZADOS COM PERFORMANCE EXCELENTE)
+# INDICADORES
 # ====================================================
 
 def calcular_atr(df, period=14):
@@ -569,7 +506,6 @@ def calcular_adx(df, period=14):
     up_move = high.diff()
     down_move = -low.diff()
 
-    # OTIMIZAÇÃO: Vetorização via numpy.where substituindo loops 'for'
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
 
@@ -625,12 +561,8 @@ def preparar_df(df):
 
 
 def fetch_df(symbol, timeframe, limit=100):
-    # OTIMIZAÇÃO: Limite de candles reduzido de 300 para 100 para aliviar rede/API
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(
-        ohlcv,
-        columns=["time", "open", "high", "low", "close", "volume"]
-    )
+    df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     return preparar_df(df)
 
 
@@ -651,7 +583,6 @@ def contexto_h4_txt(candle_h4):
     except Exception:
         return "N/A", 0.0
 
-
 # ====================================================
 # SMART PREDATOR - SMC CORE
 # ====================================================
@@ -670,7 +601,6 @@ def detect_bullish_sweep(df, lookback=10):
 
     candle = df.iloc[-2]
     level = previous_low(df, lookback)
-
     swept = float(candle["low"]) < level and float(candle["close"]) > level
 
     if not swept:
@@ -691,7 +621,6 @@ def detect_bearish_sweep(df, lookback=10):
 
     candle = df.iloc[-2]
     level = previous_high(df, lookback)
-
     swept = float(candle["high"]) > level and float(candle["close"]) < level
 
     if not swept:
@@ -707,7 +636,6 @@ def detect_bearish_sweep(df, lookback=10):
 
 
 def _m15_window_after_h1_sweep(df_m15, sweep):
-    # CORREÇÃO: Expandida a janela para não cortar travas do CHOCH no candle atual H1
     try:
         sweep_ts = int(sweep.get("timestamp"))
     except Exception:
@@ -715,7 +643,6 @@ def _m15_window_after_h1_sweep(df_m15, sweep):
 
     start = sweep_ts
     end = time.time() * 1000
-
     janela = df_m15[(df_m15["time"].astype(int) >= start) & (df_m15["time"].astype(int) < end)]
 
     if len(janela) < 2:
@@ -738,7 +665,7 @@ def detect_bullish_choch_m15_after_sweep(df_m15, sweep):
             continue
 
         candle = df_m15.iloc[pos]
-        prev = df_m15.iloc[pos-4:pos]
+        prev = df_m15.iloc[pos - 4:pos]
         internal_high = float(prev["high"].max())
 
         close = float(candle["close"])
@@ -775,7 +702,7 @@ def detect_bearish_choch_m15_after_sweep(df_m15, sweep):
             continue
 
         candle = df_m15.iloc[pos]
-        prev = df_m15.iloc[pos-4:pos]
+        prev = df_m15.iloc[pos - 4:pos]
         internal_low = float(prev["low"].min())
 
         close = float(candle["close"])
@@ -846,25 +773,19 @@ def price_touched_zone(candle, zone_low, zone_high):
 
 def is_retesting_bullish_ob(df, ob):
     candle = df.iloc[-2]
-
     touched = price_touched_zone(candle, ob["low"], ob["high"])
     rejection = float(candle["close"]) > float(candle["open"])
-
     ob_mid = (float(ob["low"]) + float(ob["high"])) / 2
     close_above_mid = float(candle["close"]) >= ob_mid
-
     return touched and rejection and close_above_mid
 
 
 def is_retesting_bearish_ob(df, ob):
     candle = df.iloc[-2]
-
     touched = price_touched_zone(candle, ob["low"], ob["high"])
     rejection = float(candle["close"]) < float(candle["open"])
-
     ob_mid = (float(ob["low"]) + float(ob["high"])) / 2
     close_below_mid = float(candle["close"]) <= ob_mid
-
     return touched and rejection and close_below_mid
 
 
@@ -1040,13 +961,14 @@ def scan_smart_predator_symbol(symbol):
                     print(f"SMART PREDATOR LONG IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
                     return None
 
-                score, reasons = calcular_predator_score(
-                    True, True, True, True, adx_h4, volume_ok
-                )
+                score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok)
 
-                if score >= 70: inc_funnel_stat("score_70_plus")
-                if score >= 80: inc_funnel_stat("score_80_plus")
-                if score >= 85: inc_funnel_stat("score_85_plus")
+                if score >= 70:
+                    inc_funnel_stat("score_70_plus")
+                if score >= 80:
+                    inc_funnel_stat("score_80_plus")
+                if score >= 85:
+                    inc_funnel_stat("score_85_plus")
 
                 if score >= MIN_PREDATOR_SCORE:
                     inc_funnel_stat("signals_detected")
@@ -1103,13 +1025,14 @@ def scan_smart_predator_symbol(symbol):
                     print(f"SMART PREDATOR SHORT IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
                     return None
 
-                score, reasons = calcular_predator_score(
-                    True, True, True, True, adx_h4, volume_ok
-                )
+                score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok)
 
-                if score >= 70: inc_funnel_stat("score_70_plus")
-                if score >= 80: inc_funnel_stat("score_80_plus")
-                if score >= 85: inc_funnel_stat("score_85_plus")
+                if score >= 70:
+                    inc_funnel_stat("score_70_plus")
+                if score >= 80:
+                    inc_funnel_stat("score_80_plus")
+                if score >= 85:
+                    inc_funnel_stat("score_85_plus")
 
                 if score >= MIN_PREDATOR_SCORE:
                     inc_funnel_stat("signals_detected")
@@ -1143,7 +1066,6 @@ def scan_smart_predator_symbol(symbol):
 
     return None
 
-
 # ====================================================
 # MENSAGENS TELEGRAM
 # ====================================================
@@ -1152,9 +1074,7 @@ def formatar_sinal_predator(s):
     side = s["side"]
     emoji = "🟢" if side == "LONG" else "🔴"
     modo = "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
-
     reasons_text = "\n".join(s.get("reasons", []))
-
     ob = s.get("ob", {})
     ob_txt = (
         f"OB Low: {fmt_br(ob.get('low', 0))}\n"
@@ -1207,7 +1127,6 @@ def mensagem_saida(p, preco, motivo, resultado):
         f"Resultado:\n{fmt_pct(resultado)}\n\n"
         f"MFE:\n{fmt_pct(p.get('mfe_max_pct', 0))}"
     )
-
 
 # ====================================================
 # POSIÇÕES / GESTÃO
@@ -1298,7 +1217,6 @@ def calcular_trailing_stop(symbol, side):
         df = fetch_df(symbol, TIMEFRAME_H1, limit=50)
         candle = df.iloc[-2]
         atr = float(candle["atr14"])
-
         ultimos = df.iloc[-10:-1]
 
         if side == "LONG":
@@ -1314,9 +1232,7 @@ def calcular_trailing_stop(symbol, side):
 
 def encerrar_posicao(symbol, p, preco_saida, motivo):
     posicoes = carregar_posicoes()
-
     resultado = pnl_pct(p["side"], float(p["entry"]), float(preco_saida))
-
     mfe = float(p.get("mfe_max_pct", 0))
     giveback = max(0.0, mfe - resultado)
 
@@ -1367,7 +1283,6 @@ def gerenciar_posicoes():
             sl = float(p.get("sl"))
             tp50 = float(p.get("tp50"))
 
-            # CORREÇÃO: Tratamento de erro robusto individual por par para não travar o loop inteiro
             try:
                 preco = obter_preco_atual(symbol)
             except Exception as exchange_err:
@@ -1464,9 +1379,8 @@ def gerenciar_posicoes():
             except Exception:
                 pass
 
-            # Verificação de Saída Real (Stop / BE / Trail)
+            # Stop / BE / Trail
             sl_atual = float(p.get("sl"))
-
             stop_hit = (
                 (side == "LONG" and preco <= sl_atual) or
                 (side == "SHORT" and preco >= sl_atual)
@@ -1494,7 +1408,6 @@ def gerenciar_posicoes():
 
     HEALTH["last_management_run"] = data_hora_sp_str()
     HEALTH["last_positions_count"] = contar_posicoes_ativas()
-
 
 # ====================================================
 # RESUMOS / ESTATÍSTICAS
@@ -1562,13 +1475,13 @@ def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
 
     posicoes = carregar_posicoes()
     ativos = [p for p in posicoes.values() if p.get("status") != "ENCERRADO"]
-
     modo = "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
 
     return (
         f"{titulo}\n"
         f"{data_txt}\n\n"
         f"Modo:\n{modo}\n\n"
+        f"Smart Predator ativo:\n{check_bool(SMART_PREDATOR_ENABLED)}\n\n"
         f"Sinais H1 do período: {len(entradas)}\n"
         f"LONG: {len(longs)}\n"
         f"SHORT: {len(shorts)}\n\n"
@@ -1640,9 +1553,12 @@ def marcar_resumo_diario_enviado():
 def enviar_resumo_diario_se_preciso():
     agora = agora_sp()
 
-    if agora.hour != DAILY_SUMMARY_HOUR: return
-    if agora.minute < DAILY_SUMMARY_MINUTE: return
-    if resumo_diario_ja_enviado(): return
+    if agora.hour != DAILY_SUMMARY_HOUR:
+        return
+    if agora.minute < DAILY_SUMMARY_MINUTE:
+        return
+    if resumo_diario_ja_enviado():
+        return
 
     safe_send_telegram(montar_resumo_diario())
     marcar_resumo_diario_enviado()
@@ -1659,13 +1575,16 @@ def salvar_monthly_summary_sent(dados):
 def enviar_resumo_mensal_se_preciso():
     agora = agora_sp()
 
-    if agora.day != MONTHLY_SUMMARY_DAY: return
-    if agora.hour != MONTHLY_SUMMARY_HOUR or agora.minute < MONTHLY_SUMMARY_MINUTE: return
+    if agora.day != MONTHLY_SUMMARY_DAY:
+        return
+    if agora.hour != MONTHLY_SUMMARY_HOUR or agora.minute < MONTHLY_SUMMARY_MINUTE:
+        return
 
     enviados = carregar_monthly_summary_sent()
     mes_ref, _ = mes_anterior_ref()
 
-    if enviados.get(mes_ref): return
+    if enviados.get(mes_ref):
+        return
 
     safe_send_telegram(montar_resumo_mensal())
     enviados[mes_ref] = True
@@ -1702,10 +1621,14 @@ def montar_stats_gerais():
 
     for t in exits:
         score = int(t.get("score", 0) or 0)
-        if 70 <= score <= 74: por_score["70_74"].append(t)
-        elif 75 <= score <= 79: por_score["75_79"].append(t)
-        elif 80 <= score <= 84: por_score["80_84"].append(t)
-        elif score >= 85: por_score["85_plus"].append(t)
+        if 70 <= score <= 74:
+            por_score["70_74"].append(t)
+        elif 75 <= score <= 79:
+            por_score["75_79"].append(t)
+        elif 80 <= score <= 84:
+            por_score["80_84"].append(t)
+        elif score >= 85:
+            por_score["85_plus"].append(t)
 
     linhas_score = []
     for faixa, itens in por_score.items():
@@ -1725,6 +1648,8 @@ def montar_stats_gerais():
 
     return (
         f"📈 ESTATÍSTICAS SMART PREDATOR\n\n"
+        f"Smart Predator ativo: {check_bool(SMART_PREDATOR_ENABLED)}\n"
+        f"Modo: {'REAL' if SMART_PREDATOR_AUTO_TRADE else 'OBSERVAÇÃO'}\n\n"
         f"Sinais totais: {len(entradas)}\n"
         f"Trades encerrados: {fechados}\n"
         f"Wins: {len(wins)}\n"
@@ -1745,7 +1670,7 @@ def montar_posicoes_texto():
     ativos = [p for p in posicoes.values() if p.get("status") != "ENCERRADO"]
 
     if not ativos:
-        return "📭 Nenhuma posição Smart Predator activa."
+        return "📭 Nenhuma posição Smart Predator ativa."
 
     linhas = ["📊 POSIÇÕES SMART PREDATOR\n"]
 
@@ -1770,13 +1695,48 @@ def montar_posicoes_texto():
     return "\n".join(linhas)
 
 
+def montar_funnel_stats_json():
+    return json.dumps(carregar_funnel_stats(), ensure_ascii=False, indent=2)
+
+
+def montar_funnel_stats_texto():
+    s = carregar_funnel_stats()
+
+    return (
+        "🦈 FUNIL SMART PREDATOR\n\n"
+        f"Scanner runs: {s.get('scanner_runs', 0)}\n"
+        f"Ativos escaneados: {s.get('symbols_scanned', 0)}\n\n"
+        f"Liquidity Sweeps:\n"
+        f"Bullish: {s.get('bullish_sweeps', 0)}\n"
+        f"Bearish: {s.get('bearish_sweeps', 0)}\n\n"
+        f"CHOCH:\n"
+        f"Bullish: {s.get('bullish_choch', 0)}\n"
+        f"Bearish: {s.get('bearish_choch', 0)}\n\n"
+        f"Order Blocks:\n"
+        f"Bullish: {s.get('bullish_ob', 0)}\n"
+        f"Bearish: {s.get('bearish_ob', 0)}\n\n"
+        f"Retestes:\n"
+        f"Bullish: {s.get('bullish_retests', 0)}\n"
+        f"Bearish: {s.get('bearish_retests', 0)}\n\n"
+        f"Rejeitados por risco: {s.get('risk_rejected', 0)}\n\n"
+        f"Score >= 70: {s.get('score_70_plus', 0)}\n"
+        f"Score >= 80: {s.get('score_80_plus', 0)}\n"
+        f"Score >= 85: {s.get('score_85_plus', 0)}\n\n"
+        f"Sinais detectados: {s.get('signals_detected', 0)}\n"
+        f"Sinais enviados: {s.get('signals_sent', 0)}\n"
+        f"LONG: {s.get('long_signals', 0)}\n"
+        f"SHORT: {s.get('short_signals', 0)}\n\n"
+        f"Última atualização: {s.get('last_update')}"
+    )
+
 # ====================================================
 # WATCHDOG / HEALTH
 # ====================================================
 
 def parse_data_hora_sp(valor):
     try:
-        if not valor: return None
+        if not valor:
+            return None
         return datetime.strptime(str(valor), "%d/%m/%Y %H:%M")
     except Exception:
         return None
@@ -1784,8 +1744,8 @@ def parse_data_hora_sp(valor):
 
 def minutos_desde_health(campo):
     dt = parse_data_hora_sp(HEALTH.get(campo))
-    if not dt: return None
-
+    if not dt:
+        return None
     agora_local = agora_sp().replace(tzinfo=None)
     return round((agora_local - dt).total_seconds() / 60, 2)
 
@@ -1793,8 +1753,8 @@ def minutos_desde_health(campo):
 def calcular_uptime_horas():
     try:
         started_at = HEALTH.get("started_at")
-        if not started_at: return None
-
+        if not started_at:
+            return None
         inicio = datetime.strptime(started_at, "%d/%m/%Y %H:%M")
         agora_local = agora_sp().replace(tzinfo=None)
         return round((agora_local - inicio).total_seconds() / 3600, 2)
@@ -1806,15 +1766,24 @@ def montar_watchdog_status():
     minutes_since_scanner = minutos_desde_health("last_scanner_run")
     minutes_since_management = minutos_desde_health("last_management_run")
 
-    scanner_stalled = (minutes_since_scanner is not None and minutes_since_scanner > WATCHDOG_THRESHOLD_MINUTES)
-    management_stalled = (minutes_since_management is not None and minutes_since_management > WATCHDOG_THRESHOLD_MINUTES)
+    scanner_stalled = (
+        minutes_since_scanner is not None and
+        minutes_since_scanner > WATCHDOG_THRESHOLD_MINUTES
+    )
+    management_stalled = (
+        minutes_since_management is not None and
+        minutes_since_management > WATCHDOG_THRESHOLD_MINUTES
+    )
 
     ok = (HEALTH.get("last_error") is None and not scanner_stalled and not management_stalled)
 
     reasons = []
-    if HEALTH.get("last_error") is not None: reasons.append(f"last_error: {HEALTH.get('last_error')}")
-    if scanner_stalled: reasons.append(f"scanner parado há {minutes_since_scanner} min")
-    if management_stalled: reasons.append(f"gestão parada há {minutes_since_management} min")
+    if HEALTH.get("last_error") is not None:
+        reasons.append(f"last_error: {HEALTH.get('last_error')}")
+    if scanner_stalled:
+        reasons.append(f"scanner parado há {minutes_since_scanner} min")
+    if management_stalled:
+        reasons.append(f"gestão parada há {minutes_since_management} min")
 
     return {
         "ok": ok,
@@ -1844,7 +1813,8 @@ def pode_enviar_alerta_watchdog():
 
 
 def enviar_alerta_watchdog(status):
-    if not pode_enviar_alerta_watchdog(): return
+    if not pode_enviar_alerta_watchdog():
+        return
 
     motivos = status.get("reasons") or ["motivo não identificado"]
 
@@ -1860,7 +1830,6 @@ def enviar_alerta_watchdog(status):
     )
 
     safe_send_telegram(msg)
-
     HEALTH["last_watchdog_alert"] = data_hora_sp_str()
     HEALTH["last_watchdog_alert_ts"] = time.time()
 
@@ -1892,22 +1861,28 @@ def montar_health_tecnico():
     payload = {
         "ok": watchdog.get("ok", HEALTH.get("last_error") is None),
         "bot": BOT_NAME,
+        "version": BOT_VERSION,
         "service_mode": SERVICE_MODE,
+        "standby": not SMART_PREDATOR_ENABLED,
         "uptime_horas": calcular_uptime_horas(),
         "started_at": HEALTH.get("started_at"),
         "last_scanner_run": HEALTH.get("last_scanner_run"),
         "last_management_run": HEALTH.get("last_management_run"),
         "last_success": HEALTH.get("last_success"),
         "last_error": HEALTH.get("last_error"),
+        "last_warning": HEALTH.get("last_warning"),
+        "watchlist_file": WATCHLIST_FILE,
         "watchlist_total": HEALTH.get("watchlist_total"),
         "watchlist_valida": HEALTH.get("watchlist_valid"),
         "watchlist_invalida": len(HEALTH.get("watchlist_invalid", [])),
         "watchlist_invalidos": HEALTH.get("watchlist_invalid", []),
+        "last_invalid_watchlist_check": HEALTH.get("last_invalid_watchlist_check"),
         "positions_open": positions_open,
         "positions_limit": MAX_OPEN_POSITIONS,
         "positions_usage_pct": round(usage_pct, 2),
         "can_open_new_positions": positions_open < MAX_OPEN_POSITIONS,
         "last_signals_sent": HEALTH.get("last_signals_sent", 0),
+        "telegram_configured": bool(TOKEN and CHAT_ID),
         "smart_predator_enabled": SMART_PREDATOR_ENABLED,
         "smart_predator_auto_trade": SMART_PREDATOR_AUTO_TRADE,
         "timeframe_h1": TIMEFRAME_H1,
@@ -1922,8 +1897,14 @@ def montar_health_tecnico():
         "max_risk_h1": MAX_RISK_H1,
         "use_max_risk_filter": USE_MAX_RISK_FILTER,
         "tp50_r": TP50_R,
+        "be_offset_pct": BE_OFFSET_PCT,
+        "trail_atr_mult": TRAIL_ATR_MULT,
         "daily_summary_time": f"{DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}",
+        "daily_summary_sent_today": resumo_diario_ja_enviado(),
+        "monthly_summary_day": MONTHLY_SUMMARY_DAY,
+        "monthly_summary_time": f"{MONTHLY_SUMMARY_HOUR:02d}:{MONTHLY_SUMMARY_MINUTE:02d}",
         "mfe_enabled": True,
+        "funnel_enabled": True,
         "watchdog_status": watchdog.get("status"),
         "minutes_since_scanner": watchdog.get("minutes_since_scanner"),
         "minutes_since_management": watchdog.get("minutes_since_management"),
@@ -1936,6 +1917,53 @@ def montar_health_tecnico():
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
+# ====================================================
+# STARTUP
+# ====================================================
+
+def startup_message_already_sent_today():
+    dados = redis_get_json(STARTUP_MESSAGE_KEY, {})
+    if not isinstance(dados, dict):
+        return False
+    return dados.get("date") == data_hoje_sp_str()
+
+
+def marcar_startup_message_sent():
+    redis_set_json(STARTUP_MESSAGE_KEY, {
+        "date": data_hoje_sp_str(),
+        "datetime": data_hora_sp_str()
+    })
+
+
+def montar_startup_message():
+    modo = "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
+    return (
+        f"🦈 Robô {BOT_NAME} iniciado\n\n"
+        f"Status:\n"
+        f"Stand-by: {check_bool(not SMART_PREDATOR_ENABLED)}\n"
+        f"Ativo para sinais: {check_bool(SMART_PREDATOR_ENABLED)}\n"
+        f"Modo: {modo}\n\n"
+        f"Lógica:\n"
+        f"Liquidity Sweep + CHOCH M15 + Order Block + Reteste\n\n"
+        f"Filtros ativos:\n"
+        f"Timeframe principal: {TIMEFRAME_H1}\n"
+        f"CHOCH: {TIMEFRAME_M15}\n"
+        f"Contexto: {TIMEFRAME_H4}\n"
+        f"Score mínimo: {MIN_PREDATOR_SCORE}/100\n"
+        f"Risco máximo: {MAX_RISK_H1}%\n"
+        f"Volume mínimo: {VOLUME_MULTIPLIER}x\n"
+        f"Limite de posições: {MAX_OPEN_POSITIONS}\n"
+        f"Resumo diário: {DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}\n"
+        f"Watchdog: {WATCHDOG_THRESHOLD_MINUTES} min"
+    )
+
+
+def enviar_startup_message_once():
+    if startup_message_already_sent_today():
+        print("Mensagem inicial Smart Predator já enviada hoje. Pulando envio.")
+        return
+    safe_send_telegram(montar_startup_message())
+    marcar_startup_message_sent()
 
 # ====================================================
 # COMANDOS TELEGRAM
@@ -1952,57 +1980,154 @@ def resetar_estado_operacional():
     redis_set_json(MONTHLY_SUMMARY_KEY, {})
 
 
+def processar_comando(texto):
+    cmd = texto.strip().lower()
+    if "@" in cmd:
+        cmd = cmd.split("@")[0]
+
+    if cmd in ["/start", "/help", "/comandos"]:
+        return (
+            "📌 Comandos Smart Predator:\n\n"
+            "/health - painel técnico\n"
+            "/teste - testa conexão Telegram\n"
+            "/posicoes - posições abertas\n"
+            "/top - melhores posições abertas\n"
+            "/resumo - resumo diário\n"
+            "/mensal - resumo mensal\n"
+            "/stats - estatísticas gerais\n"
+            "/funil - funil do setup\n"
+            "/watchlist - ativos monitorados\n"
+            "/reset - limpa posições, sinais, histórico e funil\n"
+            "/comandos - mostra esta lista"
+        )
+
+    if cmd == "/health":
+        return montar_health_tecnico()
+
+    if cmd == "/teste":
+        return "✅ Smart Predator conectado ao Telegram."
+
+    if cmd in ["/posicoes", "/positions"]:
+        return montar_posicoes_texto()
+
+    if cmd == "/top":
+        return montar_top_posicoes()
+
+    if cmd in ["/resumo", "/daily"]:
+        return montar_resumo_diario()
+
+    if cmd == "/mensal":
+        return montar_resumo_mensal()
+
+    if cmd == "/stats":
+        return montar_stats_gerais()
+
+    if cmd in ["/funil", "/funnel"]:
+        return montar_funnel_stats_texto()
+
+    if cmd == "/watchlist":
+        wl = carregar_watchlist()
+        validos = HEALTH.get("watchlist_valid", 0)
+        return (
+            f"📋 WATCHLIST SMART PREDATOR\n\n"
+            f"Arquivo: {WATCHLIST_FILE}\n"
+            f"Total: {len(wl)}\n"
+            f"Válidos BingX: {validos}\n\n"
+            + "\n".join([nome_limpo(x) for x in wl[:120]])
+        )
+
+    if cmd == "/reset":
+        resetar_estado_operacional()
+        return "✅ Smart Predator resetado."
+
+    return None
+
+
+def montar_top_posicoes():
+    posicoes = carregar_posicoes()
+    ranking = []
+
+    for p in posicoes.values():
+        if p.get("status") == "ENCERRADO":
+            continue
+
+        try:
+            preco = obter_preco_atual(p["symbol"])
+            pnl = pnl_pct(p["side"], float(p["entry"]), preco)
+            ranking.append((pnl, p))
+        except Exception:
+            pass
+
+    ranking.sort(key=lambda x: x[0], reverse=True)
+
+    if not ranking:
+        return "📊 TOP SMART PREDATOR\n\nNenhuma posição aberta."
+
+    linhas = ["📊 TOP SMART PREDATOR\n"]
+
+    for pnl, p in ranking[:10]:
+        linhas.append(
+            f"{p.get('symbol_clean', nome_limpo(p.get('symbol', '')))} {p.get('side')} | "
+            f"{fmt_pct(pnl)} | Score {p.get('score', 0)}/100"
+        )
+
+    return "\n".join(linhas)
+
+
 def listen_commands():
+    global ultimo_update_id
+
     if not TOKEN:
         print("TELEGRAM TOKEN NÃO CONFIGURADO. COMANDOS DESATIVADOS.")
         return
 
-    last_update_id = 0
+    try:
+        requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook", timeout=10)
+    except Exception as e:
+        print("AVISO deleteWebhook Smart Predator:", e)
+
+    print("INTERPRETADOR DE COMANDOS SMART PREDATOR INICIADO")
 
     while True:
         try:
+            params = {"timeout": 20}
+            if ultimo_update_id is not None:
+                params["offset"] = ultimo_update_id + 1
+
             resp = requests.get(
-                f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last_update_id + 1}",
+                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+                params=params,
                 timeout=30
             ).json()
 
-            for update in resp.get("result", []):
-                last_update_id = update.get("update_id", last_update_id)
+            if not resp.get("ok", True):
+                print("ERRO TELEGRAM getUpdates:", resp)
+                time.sleep(5)
+                continue
 
-                msg = update.get("message", {})
+            for update in resp.get("result", []):
+                ultimo_update_id = update.get("update_id", ultimo_update_id)
+                msg = update.get("message") or update.get("edited_message") or {}
                 texto = msg.get("text", "")
                 chat_id = msg.get("chat", {}).get("id")
 
-                if not texto or not chat_id: continue
+                if not texto or not chat_id:
+                    continue
 
-                cmd = texto.strip().lower()
+                if CHAT_ID and str(chat_id) != str(CHAT_ID):
+                    continue
 
-                if cmd in ["/start", "/help"]:
-                    enviar_texto(
-                        chat_id,
-                        "🦈 SMART PREDATOR\n\nComandos:\n/health\n/posicoes\n/resumo\n/mensal\n/stats\n/funil\n/watchlist\n/reset"
-                    )
-                elif cmd == "/health": enviar_texto(chat_id, montar_health_tecnico())
-                elif cmd in ["/posicoes", "/positions"]: enviar_texto(chat_id, montar_posicoes_texto())
-                elif cmd in ["/resumo", "/daily"]: enviar_texto(chat_id, montar_resumo_diario())
-                elif cmd == "/mensal": enviar_texto(chat_id, montar_resumo_mensal())
-                elif cmd == "/stats": enviar_texto(chat_id, montar_stats_gerais())
-                elif cmd in ["/funil", "/funnel"]: enviar_texto(chat_id, montar_funnel_stats_texto())
-                elif cmd == "/watchlist":
-                    wl = carregar_watchlist()
-                    enviar_texto(
-                        chat_id,
-                        f"📋 WATCHLIST SMART PREDATOR\n\nTotal: {len(wl)}\nVálidos BingX: {HEALTH.get('watchlist_valid', 0)}\n\n"
-                        + "\n".join([nome_limpo(x) for x in wl[:80]])
-                    )
-                elif cmd == "/reset":
-                    resetar_estado_operacional()
-                    enviar_texto(chat_id, "✅ Smart Predator resetado.")
+                cmd = texto.strip().split()[0].lower()
+                resposta = processar_comando(cmd)
+
+                if resposta:
+                    enviar_texto(chat_id, resposta)
 
         except Exception as e:
             print("ERRO COMANDOS:", e)
             time.sleep(10)
 
+        time.sleep(COMMAND_SLEEP_SECONDS)
 
 # ====================================================
 # SCANNER LOOP PRINCIPAL
@@ -2011,7 +2136,6 @@ def listen_commands():
 def scanner():
     print(f"SCANNER INICIADO - {BOT_NAME}")
     HEALTH["started_at"] = data_hora_sp_str()
-
     enviar_startup_message_once()
 
     while True:
@@ -2026,27 +2150,30 @@ def scanner():
 
             sinais_enviados = 0
 
-            for symbol in watchlist:
-                try:
-                    s = scan_smart_predator_symbol(symbol)
+            # Gestão sempre roda para posições já existentes.
+            gerenciar_posicoes()
 
-                    if s:
-                        ok = registrar_posicao(s)
-                        if ok:
-                            safe_send_telegram(formatar_sinal_predator(s))
-                            inc_funnel_stat("signals_sent")
-                            sinais_enviados += 1
+            if SMART_PREDATOR_ENABLED:
+                for symbol in watchlist:
+                    try:
+                        s = scan_smart_predator_symbol(symbol)
 
-                except Exception as e:
-                    print(f"ERRO SCANNER {symbol}:", e)
-                    HEALTH["last_error"] = f"Erro scanner {nome_limpo(symbol)}: {e}"
+                        if s:
+                            ok = registrar_posicao(s)
+                            if ok:
+                                safe_send_telegram(formatar_sinal_predator(s))
+                                inc_funnel_stat("signals_sent")
+                                sinais_enviados += 1
 
-                time.sleep(0.2)
+                    except Exception as e:
+                        print(f"ERRO SCANNER {symbol}:", e)
+                        HEALTH["last_error"] = f"Erro scanner {nome_limpo(symbol)}: {e}"
+
+                    time.sleep(0.2)
+            else:
+                HEALTH["last_warning"] = "Smart Predator em stand-by; scanner não envia sinais."
 
             HEALTH["last_signals_sent"] = sinais_enviados
-
-            # Roda a gestão de ordens após mapear os pares
-            gerenciar_posicoes()
 
             enviar_resumo_diario_se_preciso()
             enviar_resumo_mensal_se_preciso()
@@ -2059,48 +2186,73 @@ def scanner():
 
         time.sleep(SCANNER_SLEEP_SECONDS)
 
-
 # ====================================================
-# ROTAS FLASK (WEB API)
+# ROTAS FLASK
 # ====================================================
 
 @app.route("/")
-def home(): return f"{BOT_NAME} Online"
+def home():
+    return f"{BOT_NAME} Online"
+
 
 @app.route("/health")
-def health(): return montar_health_tecnico()
+def health():
+    return montar_health_tecnico()
+
 
 @app.route("/watchdog")
-def watchdog(): return montar_watchdog_status()
+def watchdog():
+    return montar_watchdog_status()
+
 
 @app.route("/resumo")
-def resumo(): return montar_resumo_diario().replace("\n", "<br>")
+def resumo():
+    return montar_resumo_diario().replace("\n", "<br>")
+
 
 @app.route("/posicoes")
-def posicoes_rota(): return montar_posicoes_texto().replace("\n", "<br>")
+def posicoes_rota():
+    return montar_posicoes_texto().replace("\n", "<br>")
+
 
 @app.route("/stats")
-def stats_rota(): return montar_stats_gerais().replace("\n", "<br>")
+def stats_rota():
+    return montar_stats_gerais().replace("\n", "<br>")
+
 
 @app.route("/funil")
-def funil_rota(): return montar_funnel_stats_json()
+def funil_rota():
+    return montar_funnel_stats_json()
+
 
 @app.route("/funnel")
-def funnel_rota(): return montar_funnel_stats_json()
-
+def funnel_rota():
+    return montar_funnel_stats_json()
 
 # ====================================================
-# EXECUÇÃO DE THREADS
+# THREADS MONITORADAS
 # ====================================================
 
-threading.Thread(target=scanner, daemon=True).start()
-threading.Thread(target=listen_commands, daemon=True).start()
-threading.Thread(target=watchdog_loop, daemon=True).start()
+def run_thread_guarded(nome, target):
+    while True:
+        try:
+            target()
+        except Exception as e:
+            HEALTH["last_error"] = f"{nome}: {e}"
+            print(f"ERRO THREAD {nome}:", e)
+            time.sleep(10)
+
+
+def iniciar_threads_monitoradas():
+    threading.Thread(target=run_thread_guarded, args=("scanner", scanner), daemon=True).start()
+    threading.Thread(target=run_thread_guarded, args=("telegram_commands", listen_commands), daemon=True).start()
+    threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
+
+
+iniciar_threads_monitoradas()
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
     )
-
-```
