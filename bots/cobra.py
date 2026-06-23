@@ -242,7 +242,7 @@ def startup_signal_guard_active():
         return False
 
 def enviar_startup_cobra_uma_vez():
-    chave = "cobra:startup_msg_last_ts_v3"
+    chave = "cobra:startup_msg_last_ts_v4"
     agora = time.time()
     try:
         ultimo = redis.get(chave)
