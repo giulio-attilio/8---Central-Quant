@@ -3377,6 +3377,35 @@ def resetar_robo():
     ultimo_relatorio_hora = None
 
 
+
+def montar_health_telegram_curto():
+    try:
+        return (
+            "🩺 HEALTH MEME HUNTER\n\n"
+            f"OK: {check_bool(HEALTH.get('last_error') is None)}\n"
+            f"Iniciado: {HEALTH.get('started_at')}\n"
+            f"Scanner: {HEALTH.get('last_scanner_run')}\n"
+            f"Gestão: {HEALTH.get('last_management_run')}\n"
+            f"Último sucesso: {HEALTH.get('last_success')}\n"
+            f"Erro: {HEALTH.get('last_error')}\n"
+            f"Warning: {HEALTH.get('last_warning')}\n\n"
+            f"Watchlist: {HEALTH.get('watchlist_valid', HEALTH.get('last_watchlist_count', 0))}/"
+            f"{HEALTH.get('watchlist_total', HEALTH.get('last_watchlist_count', 0))}\n"
+            f"Posições abertas: {contar_posicoes_ativas()}/{MAX_OPEN_POSITIONS}\n\n"
+            f"Breakout: {check_bool(ENABLE_MEME_BREAKOUT_STRATEGY)}\n"
+            f"Early Hunter: {check_bool(ENABLE_EARLY_HUNTER)}\n"
+            f"Reentry: {check_bool(ENABLE_REENTRY_AFTER_TP50)}\n"
+            f"Legacy Trend: {check_bool(ENABLE_LEGACY_TREND_ENTRIES)}\n"
+            f"POI Alerts: {check_bool(ENABLE_POI_ALERTS)}\n\n"
+            f"Score mínimo: {MEME_MIN_SCORE}/100\n"
+            f"Early score mínimo: {EARLY_HUNTER_SCORE_MIN}/100\n"
+            f"Risco máximo: {MAX_RISK_H1}%\n"
+            f"Startup guard: {check_bool(startup_signal_guard_active())}"
+        )
+    except Exception as e:
+        return f"❌ Erro ao montar /health do Meme: {e}"
+
+
 def processar_comando(texto):
     cmd = texto.strip().lower()
     if "@" in cmd:
