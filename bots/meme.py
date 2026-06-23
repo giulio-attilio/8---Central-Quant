@@ -3782,6 +3782,128 @@ def scanner():
 
 
 
+# ====================================================
+# WATCHDOG PADRONIZADO CENTRAL QUANT
+# ====================================================
+
+def parse_data_hora_sp(valor):
+    try:
+        if not valor:
+            return None
+        return datetime.strptime(str(valor), "%d/%m/%Y %H:%M")
+    except Exception:
+        return None
+
+
+def minutos_desde_health(campo):
+    dt = parse_data_hora_sp(HEALTH.get(campo))
+    if not dt:
+        return None
+    agora_local = agora_sp().replace(tzinfo=None)
+    return round((agora_local - dt).total_seconds() / 60, 2)
+
+
+def montar_watchdog_status():
+    minutes_since_scanner = minutos_desde_health("last_scanner_run")
+    minutes_since_management = minutos_desde_health("last_management_run")
+
+    scanner_stalled = (
+        minutes_since_scanner is not None and
+        minutes_since_scanner > WATCHDOG_THRESHOLD_MINUTES
+    )
+
+    management_stalled = (
+        minutes_since_management is not None and
+        minutes_since_management > WATCHDOG_THRESHOLD_MINUTES
+    )
+
+    ok = (
+        HEALTH.get("last_error") is None and
+        not scanner_stalled and
+        not management_stalled
+    )
+
+    reasons = []
+
+    if HEALTH.get("last_error") is not None:
+        reasons.append(f"last_error: {HEALTH.get('last_error')}")
+
+    if scanner_stalled:
+        reasons.append(f"scanner parado há {minutes_since_scanner} min")
+
+    if management_stalled:
+        reasons.append(f"gestão parada há {minutes_since_management} min")
+
+    return {
+        "ok": ok,
+        "bot": "Meme Hunter",
+        "last_scanner_run": HEALTH.get("last_scanner_run"),
+        "last_management_run": HEALTH.get("last_management_run"),
+        "minutes_since_scanner": minutes_since_scanner,
+        "minutes_since_management": minutes_since_management,
+        "last_error": HEALTH.get("last_error"),
+        "last_warning": HEALTH.get("last_warning"),
+        "watchdog_check_seconds": WATCHDOG_CHECK_SECONDS,
+        "watchdog_threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
+        "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
+        "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
+        "watchdog_last_check": HEALTH.get("watchdog_last_check"),
+        "status": "OK" if ok else "ALERTA",
+        "reasons": reasons,
+    }
+
+
+def pode_enviar_alerta_watchdog():
+    try:
+        ultimo = float(HEALTH.get("last_watchdog_alert_ts", 0) or 0)
+        return time.time() - ultimo >= WATCHDOG_ALERT_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def enviar_alerta_watchdog(status):
+    if not pode_enviar_alerta_watchdog():
+        return
+
+    motivos = status.get("reasons") or ["motivo não identificado"]
+
+    msg = (
+        "🚨 WATCHDOG - Meme Hunter\n\n"
+        "O robô pode estar travado.\n\n"
+        "Motivo:\n"
+        + "\n".join([f"- {m}" for m in motivos])
+        + "\n\n"
+        f"Último scanner:\n{status.get('last_scanner_run')}\n\n"
+        f"Última gestão:\n{status.get('last_management_run')}\n\n"
+        f"Último erro:\n{status.get('last_error')}"
+    )
+
+    safe_send_telegram(msg)
+
+    HEALTH["last_watchdog_alert"] = data_hora_sp_str()
+    HEALTH["last_watchdog_alert_ts"] = time.time()
+
+
+def watchdog_loop():
+    print("WATCHDOG INICIADO - Meme Hunter")
+
+    while True:
+        try:
+            HEALTH["watchdog_last_check"] = data_hora_sp_str()
+
+            status = montar_watchdog_status()
+            HEALTH["watchdog_last_status"] = status.get("status", "OK")
+
+            if not status.get("ok", True):
+                print("WATCHDOG MEME ALERTA:", status)
+                enviar_alerta_watchdog(status)
+
+        except Exception as e:
+            print("ERRO WATCHDOG MEME:", e)
+
+        time.sleep(WATCHDOG_CHECK_SECONDS)
+
+
 @app.route("/health")
 def health():
     try:
@@ -3796,16 +3918,7 @@ def health():
 
 @app.route("/watchdog")
 def watchdog_status():
-    return {
-        "ok": HEALTH.get("watchdog_last_status", "OK") == "OK",
-        "bot": "Meme Hunter PRO",
-        "last_scanner_run": HEALTH.get("last_scanner_run"),
-        "last_management_run": HEALTH.get("last_management_run"),
-        "last_error": HEALTH.get("last_error"),
-        "last_warning": HEALTH.get("last_warning"),
-        "watchdog_status": HEALTH.get("watchdog_last_status", "OK"),
-        "watchdog_last_check": HEALTH.get("watchdog_last_check"),
-    }
+    return montar_watchdog_status()
 
 @app.route("/")
 def home():
@@ -3838,6 +3951,7 @@ def run_thread_guarded(nome, target):
 
 threading.Thread(target=run_thread_guarded, args=("scanner", scanner), daemon=True).start()
 threading.Thread(target=run_thread_guarded, args=("telegram_commands", listen_commands), daemon=True).start()
+threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
 
 
 if __name__ == "__main__":
