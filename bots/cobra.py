@@ -1417,47 +1417,61 @@ def montar_health_tecnico():
 
 def processar_comando(texto):
     cmd = texto.strip().lower()
+    if "@" in cmd:
+        cmd = cmd.split("@")[0]
+
     if cmd in ["/start", "/help", "/comandos"]:
         return (
-            "📌 Comandos disponíveis:
-
-"
-            "/health - painel técnico do Cobra
-"
-            "/teste - testa conexão com Telegram
-"
-            "/posicoes - lista posições abertas
-"
-            "/top - mostra melhores posições abertas
-"
-            "/resumo - envia resumo do dia
-"
-            "/mensal - envia resumo do mês
-"
-            "/mes - envia resumo do mês
-"
-            "/estatisticas - histórico geral
-"
-            "/watchlist - mostra ativos monitorados
-"
+            "📌 Comandos disponíveis:\n\n"
+            "/health - painel técnico do Cobra\n"
+            "/teste - testa conexão com Telegram\n"
+            "/posicoes - lista posições abertas\n"
+            "/top - mostra melhores posições abertas\n"
+            "/resumo - envia resumo do dia\n"
+            "/mensal - envia resumo do mês\n"
+            "/mes - envia resumo do mês\n"
+            "/estatisticas - histórico geral\n"
+            "/watchlist - mostra ativos monitorados\n"
             "/comandos - mostra esta lista"
         )
+
     if cmd == "/health":
         return montar_health_tecnico()
 
     if cmd == "/teste":
         return "✅ Cobra Attack conectado ao Telegram."
+
     if cmd in ["/posicoes", "/posições"]:
         return montar_posicoes()
+
+    if cmd == "/top":
+        try:
+            ativos = obter_posicoes_ativas_ordenadas()
+        except Exception:
+            ativos = []
+        if not ativos:
+            return "📊 TOP COBRA\n\nNenhuma posição ativa."
+        linhas = ["📊 TOP COBRA\n"]
+        for p in ativos[:10]:
+            linhas.append(
+                f"{p.get('symbol_clean', p.get('symbol', 'N/A'))} {p.get('side', '')} | "
+                f"{fmt_pct(p.get('pnl_atual', 0))}"
+            )
+        return "\n".join(linhas)
+
     if cmd == "/resumo":
         return montar_resumo("dia")
-    if cmd in ["/mes", "/mensal"]:
+
+    if cmd in ["/mensal", "/mes"]:
         return montar_resumo("mes")
+
     if cmd == "/estatisticas":
         return montar_resumo("all")
+
     if cmd == "/watchlist":
         watchlist = carregar_watchlist()
         return "👀 WATCHLIST COBRA\n\n" + "\n".join([nome_limpo(s) for s in watchlist])
+
     return None
 
 def listen_commands():
