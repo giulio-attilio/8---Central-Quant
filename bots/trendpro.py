@@ -51,6 +51,7 @@ import threading
 import requests
 import pandas as pd
 import ccxt
+from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
@@ -114,15 +115,27 @@ WATCHDOG_CHECK_SECONDS = int(os.environ.get("WATCHDOG_CHECK_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TOKEN = (
+    os.environ.get("TREND_PRO_ELITE_TOKEN")
+    or os.environ.get("TRENDPRO_TELEGRAM_BOT_TOKEN")
+    or os.environ.get("TRENDPRO_TOKEN")
+    or os.environ.get("TELEGRAM_BOT_TOKEN")
+)
+
+CHAT_ID = (
+    os.environ.get("TREND_PRO_ELITE_CHAT_ID")
+    or os.environ.get("TRENDPRO_TELEGRAM_CHAT_ID")
+    or os.environ.get("TRENDPRO_CHAT_ID")
+    or os.environ.get("TELEGRAM_CHAT_ID")
+)
+
 DONKEY_TOKEN = os.environ.get("DONKEY_TELEGRAM_BOT_TOKEN")
 DONKEY_CHAT_ID = os.environ.get("DONKEY_TELEGRAM_CHAT_ID")
 
 UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-WATCHLIST_FILE = "watchlist.json"
+WATCHLIST_FILE = os.environ.get("TRENDPRO_WATCHLIST_FILE", "watchlists/trendpro.json")
 
 POSITIONS_KEY = "trendpro:positions"
 SIGNALS_KEY = "trendpro:signals"
@@ -143,6 +156,15 @@ DONKEY_POI_COOLDOWN_KEY = "trendpro:donkey_poi_cooldown"
 
 TIMEFRAME_H4 = "4h"
 TIMEFRAME_H1 = "1h"
+
+# Central Quant:
+# ENABLE_TRENDPRO=true carrega o módulo na Central.
+# TREND_PRO_ENABLED=false deixa o robô em stand-by: health/watchlist/gestão/resumos funcionam, mas novos sinais não são enviados.
+TREND_PRO_ENABLED = os.environ.get("TREND_PRO_ENABLED", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
+TREND_PRO_AUTO_TRADE = os.environ.get("TREND_PRO_AUTO_TRADE", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
+STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("TRENDPRO_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
+SERVICE_STARTED_TS = time.time()
+
 
 EMA_FAST = 9
 EMA_MID = 21
@@ -281,6 +303,7 @@ HEALTH = {
     "last_management_run": None,
     "last_success": None,
     "last_error": None,
+    "last_warning": None,
     "last_watchlist_count": 0,
     "last_signals_sent": 0,
     "last_donkey_signals_sent": 0,
@@ -316,13 +339,76 @@ def nome_limpo(symbol):
     return symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
 
 
+
+
+# ====================================================
+# CAMADA DE RESILIÊNCIA API (CCXT SAFE FETCH)
+# ====================================================
+
+def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return safe_fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except (RateLimitExceeded, NetworkError, ExchangeError) as e:
+            print(f"Aviso TRENDPRO OHLCV ({attempt+1}/{max_retries}) {symbol} {timeframe}: {e}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"Aviso TRENDPRO OHLCV genérico ({attempt+1}/{max_retries}) {symbol} {timeframe}: {e}")
+            time.sleep(2 ** attempt)
+
+    HEALTH["last_warning"] = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
+    print(HEALTH["last_warning"])
+    return []
+
+
+def safe_fetch_ticker(symbol, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return safe_fetch_ticker(symbol)
+        except (RateLimitExceeded, NetworkError, ExchangeError) as e:
+            print(f"Aviso TRENDPRO Ticker ({attempt+1}/{max_retries}) {symbol}: {e}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"Aviso TRENDPRO Ticker genérico ({attempt+1}/{max_retries}) {symbol}: {e}")
+            time.sleep(2 ** attempt)
+
+    HEALTH["last_warning"] = f"Falha Ticker {symbol} após {max_retries} tentativas"
+    print(HEALTH["last_warning"])
+    return None
+
+
+def safe_load_markets(max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return exchange.load_markets()
+        except (RateLimitExceeded, NetworkError, ExchangeError) as e:
+            print(f"Aviso TRENDPRO load_markets ({attempt+1}/{max_retries}): {e}")
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"Aviso TRENDPRO load_markets genérico ({attempt+1}/{max_retries}): {e}")
+            time.sleep(2 ** attempt)
+
+    HEALTH["last_warning"] = "Falha ao carregar markets da exchange após tentativas"
+    print(HEALTH["last_warning"])
+    return None
+
 def carregar_watchlist():
-    try:
-        with open(WATCHLIST_FILE, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        print("ERRO WATCHLIST:", e)
-        return []
+    candidatos = [WATCHLIST_FILE]
+    for item in ["watchlists/trendpro.json", "watchlist_trendpro.json", "watchlist.json"]:
+        if item not in candidatos:
+            candidatos.append(item)
+
+    for arquivo in candidatos:
+        try:
+            with open(arquivo, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+                if isinstance(dados, list):
+                    return dados
+        except Exception:
+            pass
+
+    print("ERRO WATCHLIST: nenhum arquivo válido encontrado para Trend PRO Elite")
+    return []
 
 
 def validar_watchlist_bingx(watchlist, avisar_telegram=False):
@@ -334,14 +420,14 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
     invalidos = []
 
     try:
-        markets = exchange.load_markets()
+        markets = safe_load_markets()
     except Exception as e:
         print("ERRO AO CARREGAR MERCADOS BINGX:", e)
         HEALTH["watchlist_total"] = len(watchlist)
-        HEALTH["watchlist_valid"] = 0
+        HEALTH["watchlist_valid"] = len(watchlist)
         HEALTH["watchlist_invalid"] = []
         HEALTH["last_invalid_watchlist_check"] = data_hora_sp_str()
-        HEALTH["last_error"] = f"Erro load_markets BingX: {e}"
+        HEALTH["last_warning"] = f"Erro load_markets BingX: {e}"
         return watchlist
 
     for symbol in watchlist:
@@ -926,6 +1012,11 @@ def calcular_uptime_horas():
 
 
 
+def startup_signal_guard_active():
+    return time.time() - SERVICE_STARTED_TS < STARTUP_SIGNAL_GRACE_SECONDS
+
+
+
 
 # ====================================================
 # WATCHDOG
@@ -992,6 +1083,15 @@ def montar_watchdog_status():
         "minutes_since_scanner": minutes_since_scanner,
         "minutes_since_management": minutes_since_management,
         "last_error": HEALTH.get("last_error"),
+        "last_warning": HEALTH.get("last_warning"),
+        "watchlist_file": WATCHLIST_FILE,
+        "watchlist_total": HEALTH.get("watchlist_total"),
+        "watchlist_valida": HEALTH.get("watchlist_valid"),
+        "watchlist_invalida": len(HEALTH.get("watchlist_invalid", [])),
+        "watchlist_invalidos": HEALTH.get("watchlist_invalid", []),
+        "telegram_configured": bool(TOKEN and CHAT_ID),
+        "startup_signal_grace_seconds": STARTUP_SIGNAL_GRACE_SECONDS,
+        "startup_signal_guard_active": startup_signal_guard_active(),
         "watchdog_check_seconds": WATCHDOG_CHECK_SECONDS,
         "watchdog_threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
         "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
@@ -1570,8 +1670,8 @@ def passa_filtro_trendpro_elite(
 # ====================================================
 
 def analisar_sinal_h1(symbol):
-    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+    ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
     df_h1 = pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"])
     df_h4 = pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"])
@@ -1691,8 +1791,8 @@ def detectar_early_a(symbol):
     if not ENABLE_EARLY:
         return None
 
-    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+    ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -1833,8 +1933,8 @@ def detectar_poi(symbol, posicao):
     if poi_em_cooldown(symbol, posicao["side"]):
         return None
 
-    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+    ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -1992,8 +2092,8 @@ def detectar_reentry(symbol, posicao_fechada):
     if side not in ["LONG", "SHORT"]:
         return None
 
-    ohlcv_h1 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+    ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -2112,7 +2212,7 @@ def calcular_donkey_position_size(entry, sl):
 
 
 def calcular_donkey_trailing(symbol, side):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=120)
+    ohlcv = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=120)
     df = preparar_df(pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"]))
 
     ultimos = df.iloc[-(DONKEY_SWING_LEN + 1):-1]
@@ -2138,7 +2238,7 @@ def detectar_donkey_h4(symbol):
     if existe_posicao_ativa(symbol):
         return None
 
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df_h4.iloc[-2]
 
@@ -2224,7 +2324,7 @@ def detectar_early_donkey_h4(symbol):
     if existe_posicao_ativa(symbol):
         return None
 
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df_h4.iloc[-2]
 
@@ -2316,7 +2416,7 @@ def detectar_confirmacao_donkey_h4(symbol, posicao):
     if side not in ["LONG", "SHORT"]:
         return None
 
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df_h4.iloc[-2]
 
@@ -2383,7 +2483,7 @@ def detectar_poi_donkey_h4(symbol, posicao):
     if donkey_poi_em_cooldown(symbol, side):
         return None
 
-    ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df_h4.iloc[-2]
 
@@ -2514,7 +2614,7 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
 
     # Invalidação por candle H4 fechado além da EMA20.
     try:
-        ohlcv_h4 = exchange.fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=120)
+        ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=120)
         df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
         candle_h4 = df_h4.iloc[-2]
         close_h4 = float(candle_h4["close"])
@@ -3042,7 +3142,7 @@ def atualizar_posicao_com_poi(poi):
 
 
 def calcular_chandelier(symbol, side):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
+    ohlcv = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     df["atr14"] = calcular_atr(df, ATR_LEN)
     df = marcar_spikes(df)
@@ -3118,7 +3218,7 @@ def atualizar_monitor_be():
             continue
 
         try:
-            ticker = exchange.fetch_ticker(m["symbol"])
+            ticker = safe_fetch_ticker(m["symbol"])
             preco = float(ticker["last"])
             saida = float(m["exit_price"])
 
@@ -3151,7 +3251,7 @@ def gerenciar_posicoes():
             continue
 
         try:
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = safe_fetch_ticker(symbol)
             preco_atual = float(ticker["last"])
 
             if atualizar_mfe_posicao(p, preco_atual):
@@ -3164,7 +3264,7 @@ def gerenciar_posicoes():
             # Proteção anti-spike para gestão:
             # se o último candle H1 fechado for suspeito, não atualiza stop/TP nesta rodada.
             try:
-                ohlcv_check = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
+                ohlcv_check = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
                 df_check = pd.DataFrame(ohlcv_check, columns=["time", "open", "high", "low", "close", "volume"])
                 df_check["atr14"] = calcular_atr(df_check, ATR_LEN)
                 df_check = marcar_spikes(df_check)
@@ -3449,7 +3549,7 @@ def obter_posicoes_ativas_ordenadas():
             continue
 
         try:
-            ticker = exchange.fetch_ticker(p["symbol"])
+            ticker = safe_fetch_ticker(p["symbol"])
             preco = float(ticker["last"])
             resultado = pnl_pct(p["side"], float(p["entry"]), preco)
 
@@ -3528,7 +3628,7 @@ def montar_watchlist():
 
     for symbol in watchlist:
         try:
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = safe_fetch_ticker(symbol)
             preco = float(ticker["last"])
             linhas.append(f"{nome_limpo(symbol)} | {fmt_br(preco)}")
         except Exception:
@@ -3616,7 +3716,7 @@ def montar_resumo_diario():
         if is_donkey_signal_type(p.get("signal_type")):
             continue
         try:
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = safe_fetch_ticker(symbol)
             preco = float(ticker["last"])
             pnl = pnl_pct(p["side"], float(p["entry"]), preco)
             ativos.append(f"{p['symbol_clean']} {p['side']} | PnL {fmt_pct(pnl)}")
@@ -3709,7 +3809,7 @@ def montar_resumo_donkey():
         if not is_donkey_signal_type(p.get("signal_type")):
             continue
         try:
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = safe_fetch_ticker(symbol)
             preco = float(ticker["last"])
             pnl = pnl_pct(p["side"], float(p["entry"]), preco)
             ativos.append(f"{p['symbol_clean']} {p['side']} | Origem: {origem_trade_txt(p)} | PnL {fmt_pct(pnl)}")
@@ -3886,7 +3986,7 @@ def listen_commands():
 
                         for p in abertas:
                             try:
-                                ticker = exchange.fetch_ticker(p["symbol"])
+                                ticker = safe_fetch_ticker(p["symbol"])
                                 preco = float(ticker["last"])
                                 pnl = pnl_pct(p["side"], float(p["entry"]), preco)
                             except Exception:
@@ -3930,7 +4030,7 @@ def listen_commands():
 
                     for p in abertas:
                         try:
-                            ticker = exchange.fetch_ticker(p["symbol"])
+                            ticker = safe_fetch_ticker(p["symbol"])
                             preco = float(ticker["last"])
                             pnl = pnl_pct(p["side"], float(p["entry"]), preco)
                             ranking.append((pnl, p))
@@ -4022,7 +4122,7 @@ def montar_posicoes_donkey():
         if not is_donkey_signal_type(p.get("signal_type")):
             continue
         try:
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = safe_fetch_ticker(symbol)
             preco_atual = float(ticker["last"])
             pnl = pnl_pct(p["side"], float(p["entry"]), preco_atual)
             linhas.append(
@@ -4111,7 +4211,8 @@ def scanner():
         f"Volume H1 obrigatório: {check_bool(REQUIRE_HIGH_VOLUME)}\n"
         f"Recuperado ativo: {check_bool(ENABLE_RECOVERED_SIGNAL)}\n"
         f"Relatório automático: {check_bool(ENABLE_AUTO_POSITION_REPORT)}\n"
-        f"Modo: TREND PRO ONLY ✅\n"
+        f"Modo: {'ATIVO ✅' if TREND_PRO_ENABLED else 'STAND-BY ⚪'}\n"
+        f"Auto trade: {'SIM' if TREND_PRO_AUTO_TRADE else 'NÃO'}\n"
         f"Watchdog: ✅ {WATCHDOG_THRESHOLD_MINUTES} min"
     )
 
@@ -4148,8 +4249,21 @@ def scanner():
             sinais = []
             sinais_enviados = 0
 
+            if not TREND_PRO_ENABLED:
+                HEALTH["last_warning"] = "Trend PRO Elite em stand-by; scanner não envia sinais."
+                HEALTH["last_positions_count"] = contar_posicoes_ativas()
+                HEALTH["last_signals_sent"] = 0
+                HEALTH["last_success"] = data_hora_sp_str()
+                HEALTH["last_error"] = None
+                time.sleep(60)
+                continue
+
             for symbol in watchlist:
                 try:
+                    if startup_signal_guard_active():
+                        print(f"STARTUP GUARD TRENDPRO: ignorando novos sinais temporariamente em {nome_limpo(symbol)}")
+                        continue
+
                     # POI primeiro para posições ativas.
                     posicoes = carregar_posicoes()
                     if symbol in posicoes and posicoes[symbol].get("status") != "ENCERRADO":
@@ -4312,6 +4426,11 @@ def health():
     return {
         "ok": watchdog.get("ok", True),
         "bot": BOT_NAME,
+        "version": "2026-06-23-TREND-PRO-ELITE-CENTRAL-QUANT-PADRONIZADO",
+        "service_mode": "TREND_PRO_ELITE",
+        "standby": not TREND_PRO_ENABLED,
+        "trend_pro_enabled": TREND_PRO_ENABLED,
+        "trend_pro_auto_trade": TREND_PRO_AUTO_TRADE,
         "started_at": HEALTH.get("started_at"),
         "last_scanner_run": HEALTH.get("last_scanner_run"),
         "last_management_run": HEALTH.get("last_management_run"),
@@ -4373,9 +4492,33 @@ def home():
     return f"{BOT_NAME} Online"
 
 
-threading.Thread(target=scanner, daemon=True).start()
-threading.Thread(target=listen_commands, daemon=True).start()
-threading.Thread(target=watchdog_loop, daemon=True).start()
+def run_thread_guarded(nome, target):
+    while True:
+        try:
+            target()
+        except Exception as e:
+            try:
+                HEALTH["last_error"] = f"Thread {nome} travou: {e}"
+            except Exception:
+                pass
+
+            print(f"ERRO FATAL THREAD TRENDPRO {nome}:", e)
+
+            try:
+                safe_send_telegram(
+                    f"🚨 TRENDPRO THREAD TRAVOU: {nome}\n\n"
+                    f"Erro:\n{str(e)}\n\n"
+                    "A thread será reiniciada automaticamente."
+                )
+            except Exception:
+                pass
+
+            time.sleep(10)
+
+
+threading.Thread(target=run_thread_guarded, args=("scanner", scanner), daemon=True).start()
+threading.Thread(target=run_thread_guarded, args=("telegram_commands", listen_commands), daemon=True).start()
+threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
 
 
 if __name__ == "__main__":
