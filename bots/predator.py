@@ -54,7 +54,7 @@ DAILY_SUMMARY_KEY = "smartpredator:daily_summary_sent"
 MONTHLY_SUMMARY_KEY = "smartpredator:monthly_summary_sent"
 SWEEP_STATE_KEY = "smartpredator:sweep_state"
 SIGNAL_COOLDOWN_KEY = "smartpredator:signal_cooldown"
-STARTUP_MESSAGE_KEY = "smartpredator:startup_message_sent_v2"
+STARTUP_MESSAGE_KEY = "smartpredator:startup_message_sent_v3"
 FUNNEL_STATS_KEY = "smartpredator:funnel_stats"
 
 exchange = ccxt.bingx({"enableRateLimit": True})
