@@ -1,6 +1,6 @@
 # ==============================================================================
 # TURTLE BREAKOUT PRO 2.0 - CENTRAL QUANT
-# Versão: 2026-06-23-TURTLE-BREAKOUT-PRO-100-100-FUNIL-PAPER
+# Versão: 2026-06-24-TURTLE-BREAKOUT-PRO-FILTROS-VOLUME-ADX-LIMITE
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -93,20 +93,23 @@ OHLCV_LIMIT = int(os.environ.get("TURTLE_OHLCV_LIMIT", "220"))
 
 ATR_LEN = int(os.environ.get("TURTLE_ATR_LEN", "14"))
 ATR_STOP_MULT = float(os.environ.get("TURTLE_ATR_STOP_MULT", "2.0"))
-TP50_R = float(os.environ.get("TURTLE_TP50_R", "1.0"))
+TP50_R = float(os.environ.get("TURTLE_TP50_R", "0.8"))
 
 MIN_ATR_PCT = float(os.environ.get("TURTLE_MIN_ATR_PCT", "0.25"))
 MAX_RISK_PCT = float(os.environ.get("TURTLE_MAX_RISK_PCT", "6.0"))
 
 # Score Turtle
-SCORE_MIN_QUALITY_TO_SIGNAL = int(os.environ.get("TURTLE_SCORE_MIN_QUALITY_TO_SIGNAL", "0"))
+SCORE_MIN_QUALITY_TO_SIGNAL = int(os.environ.get("TURTLE_SCORE_MIN_QUALITY_TO_SIGNAL", "70"))
 VOLUME_REL_LOOKBACK = int(os.environ.get("TURTLE_VOLUME_REL_LOOKBACK", "20"))
+MIN_VOLUME_REL_TO_SIGNAL = float(os.environ.get("TURTLE_MIN_VOLUME_REL_TO_SIGNAL", "1.20"))
+MIN_ADX_TO_SIGNAL = float(os.environ.get("TURTLE_MIN_ADX_TO_SIGNAL", "20"))
+ADX_LEN = int(os.environ.get("TURTLE_ADX_LEN", "14"))
 IDEAL_ATR_PCT = float(os.environ.get("TURTLE_IDEAL_ATR_PCT", "1.20"))
 IDEAL_BREAKOUT_ATR = float(os.environ.get("TURTLE_IDEAL_BREAKOUT_ATR", "0.35"))
 IDEAL_CHANNEL_ATR = float(os.environ.get("TURTLE_IDEAL_CHANNEL_ATR", "3.0"))
 
-MAX_OPEN_POSITIONS = int(os.environ.get("TURTLE_MAX_OPEN_POSITIONS", "40"))
-ALLOW_SAME_SYMBOL_BOTH_SETUPS = str(os.environ.get("TURTLE_ALLOW_SAME_SYMBOL_BOTH_SETUPS", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+MAX_OPEN_POSITIONS = int(os.environ.get("TURTLE_MAX_OPEN_POSITIONS", "10"))
+ALLOW_SAME_SYMBOL_BOTH_SETUPS = str(os.environ.get("TURTLE_ALLOW_SAME_SYMBOL_BOTH_SETUPS", "false")).lower() in {"1", "true", "yes", "sim", "on"}
 
 SCAN_SLEEP_SECONDS = int(os.environ.get("TURTLE_SCAN_SLEEP_SECONDS", "60"))
 MANAGEMENT_SLEEP_SECONDS = int(os.environ.get("TURTLE_MANAGEMENT_SLEEP_SECONDS", "20"))
@@ -501,6 +504,19 @@ def add_indicators(df):
         axis=1,
     ).max(axis=1)
     df["atr"] = tr.rolling(ATR_LEN).mean()
+
+    # ADX simples para filtrar rompimentos sem força direcional.
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+    atr_adx = tr.rolling(ADX_LEN).mean()
+    plus_di = 100 * plus_dm.rolling(ADX_LEN).mean() / atr_adx
+    minus_di = 100 * minus_dm.rolling(ADX_LEN).mean() / atr_adx
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    df["adx"] = dx.rolling(ADX_LEN).mean()
     return df
 
 
@@ -670,6 +686,8 @@ def get_funnel():
             "reprovados_atr": 0,
             "reprovados_risco": 0,
             "reprovados_score": 0,
+            "reprovados_volume": 0,
+            "reprovados_adx": 0,
             "reprovados_cooldown": 0,
             "reprovados_posicao_ativa": 0,
             "sinais_enviados": 0,
@@ -700,6 +718,8 @@ def funnel_snapshot():
         "reprovados_atr": int(data.get("reprovados_atr", 0) or 0),
         "reprovados_risco": int(data.get("reprovados_risco", 0) or 0),
         "reprovados_score": int(data.get("reprovados_score", 0) or 0),
+        "reprovados_volume": int(data.get("reprovados_volume", 0) or 0),
+        "reprovados_adx": int(data.get("reprovados_adx", 0) or 0),
         "reprovados_cooldown": int(data.get("reprovados_cooldown", 0) or 0),
         "reprovados_posicao_ativa": int(data.get("reprovados_posicao_ativa", 0) or 0),
         "sinais_enviados": int(data.get("sinais_enviados", 0) or 0),
@@ -831,6 +851,16 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
         return None
 
     score_data = calc_turtle_score(row, prev, side, close, atr, entry_high, entry_low, entry_len)
+
+    if safe_float(score_data.get("volume_rel")) < MIN_VOLUME_REL_TO_SIGNAL:
+        funnel_inc("reprovados_volume")
+        return None
+
+    adx_value = safe_float(row.get("adx"), 0.0)
+    if adx_value < MIN_ADX_TO_SIGNAL:
+        funnel_inc("reprovados_adx")
+        return None
+
     if score_data["score_turtle"] < SCORE_MIN_QUALITY_TO_SIGNAL:
         funnel_inc("reprovados_score")
         return None
@@ -853,6 +883,7 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
         "score_turtle": score_data["score_turtle"],
         "quality": score_data["quality"],
         "volume_rel": score_data["volume_rel"],
+        "adx": safe_float(row.get("adx"), 0.0),
         "breakout_atr": score_data["breakout_atr"],
         "channel_atr": score_data["channel_atr"],
         "entry_len": entry_len,
@@ -1965,7 +1996,7 @@ def startup():
     threading.Thread(target=management_loop, daemon=True).start()
     threading.Thread(target=summary_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
-    # threading.Thread(target=command_loop, daemon=True).start()
+    threading.Thread(target=command_loop, daemon=True).start()
 
 
 startup()
