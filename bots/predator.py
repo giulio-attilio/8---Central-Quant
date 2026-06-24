@@ -1,5 +1,5 @@
 # SMART PREDATOR - SMC H1
-# Versão: 2026-06-23-SMART-PREDATOR-STANDBY-CENTRAL-QUANT
+# Versão: 2026-06-24-SMART-PREDATOR-BINGX-WARNING-FIX
 #
 # Stand-by para Central Quant:
 # - Estrutura padronizada como Donkey/Cobra/Meme.
@@ -2167,7 +2167,17 @@ def scanner():
 
                     except Exception as e:
                         print(f"ERRO SCANNER {symbol}:", e)
-                        HEALTH["last_error"] = f"Erro scanner {nome_limpo(symbol)}: {e}"
+
+                        erro_txt = str(e)
+                        if "109500" in erro_txt or "quote service unavailable" in erro_txt:
+                            HEALTH["last_warning"] = (
+                                f"Erro temporário BingX {nome_limpo(symbol)}: {erro_txt}"
+                            )
+                            HEALTH["last_error"] = None
+                        else:
+                            HEALTH["last_error"] = (
+                                f"Erro scanner {nome_limpo(symbol)}: {erro_txt}"
+                            )
 
                     time.sleep(0.2)
             else:
@@ -2182,7 +2192,13 @@ def scanner():
 
         except Exception as e:
             print("ERRO LOOP SCANNER:", e)
-            HEALTH["last_error"] = str(e)
+
+            erro_txt = str(e)
+            if "109500" in erro_txt or "quote service unavailable" in erro_txt:
+                HEALTH["last_warning"] = f"Erro temporário BingX no scanner: {erro_txt}"
+                HEALTH["last_error"] = None
+            else:
+                HEALTH["last_error"] = erro_txt
 
         time.sleep(SCANNER_SLEEP_SECONDS)
 
