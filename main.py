@@ -1,15 +1,18 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-21-CENTRAL-FULL-SAFE-LOADER
+# Versão: 2026-06-23-CENTRAL-FULL-SAFE-LOADER-TURTLE
 #
 # Objetivo:
-# - Rodar os 5 robôs em um único serviço Render.
+# - Rodar os robôs em um único serviço Render.
 # - Preservar as lógicas originais dos arquivos enviados.
 # - Evitar reescrever estratégias por aproximação.
 # - Permitir ativação gradual por ENABLE_*.
+# - Adicionar Turtle Breakout 2.0 como robô de pesquisa/paper.
 #
 # Importante:
 # - Pause os serviços antigos no Render antes de ativar o mesmo bot aqui.
 # - Se dois processos usarem o mesmo token Telegram com getUpdates, ocorre erro 409.
+# - O Turtle aqui é apenas carregado como módulo em bots/turtle.py.
+# - A execução real na BingX NÃO é feita pela Central.
 
 import os
 import time
@@ -107,6 +110,16 @@ BOT_CONFIGS = {
         "name": "Smart Predator",
         "token_env": "SMART_PREDATOR_TOKEN",
         "chat_env": "SMART_PREDATOR_CHAT_ID",
+    },
+    "TURTLE": {
+        "enabled_env": "ENABLE_TURTLE",
+        "module": "turtle",
+        "file": BOTS_DIR / "turtle.py",
+        "name": "Turtle Breakout 2.0",
+        "token_env": "TURTLE_TOKEN",
+        "chat_env": "TURTLE_CHAT_ID",
+        "extra_token_envs": ["TURTLE_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"],
+        "extra_chat_envs": ["TURTLE_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"],
     },
 }
 
@@ -246,7 +259,7 @@ def central_watchdog_status():
 
 
 def send_central_alert(message: str):
-    # Usa o send_telegram/safe_send_telegram de cada módulo carregado para não depender de um 6º bot.
+    # Usa o send_telegram/safe_send_telegram de cada módulo carregado para não depender de outro bot.
     for module in LOADED_BOTS.values():
         try:
             if hasattr(module, "safe_send_telegram"):
@@ -345,6 +358,17 @@ def central():
             "positions_open": h.get("last_positions_count"),
             "signals_last_cycle": h.get("last_signals_sent"),
             "watchdog_status": h.get("watchdog_last_status"),
+
+            # Métricas estatísticas avançadas.
+            # O Turtle já preenche esses campos; os outros bots podem passar a preencher depois.
+            "mfe_avg_pct": h.get("mfe_avg_pct"),
+            "mae_avg_pct": h.get("mae_avg_pct"),
+            "mfe_avg_r": h.get("mfe_avg_r"),
+            "mae_avg_r": h.get("mae_avg_r"),
+            "top_mfe_month": h.get("top_mfe_month", []),
+            "runners_3r": h.get("runners_3r"),
+            "runners_5r": h.get("runners_5r"),
+            "runners_10r": h.get("runners_10r"),
         }
 
     enabled = [k for k, v in resumo.items() if v.get("enabled")]
