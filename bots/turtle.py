@@ -1965,7 +1965,7 @@ def startup():
     threading.Thread(target=management_loop, daemon=True).start()
     threading.Thread(target=summary_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
-    threading.Thread(target=command_loop, daemon=True).start()
+    # threading.Thread(target=command_loop, daemon=True).start()
 
 
 startup()
