@@ -1,5 +1,5 @@
 # TREND PRO MTF H4/H1 + POI
-# Versão: 2026-06-17-TREND-PRO-ONLY-WATCHDOG-MFE-WINLOSS
+# Versão: 2026-06-23-TRENDPRO-CENTRAL-QUANT-RECURSION-FIX
 #
 # Lógica:
 # - H4 é apenas contexto/filtro.
@@ -160,7 +160,7 @@ TIMEFRAME_H1 = "1h"
 # Central Quant:
 # ENABLE_TRENDPRO=true carrega o módulo na Central.
 # TREND_PRO_ENABLED=false deixa o robô em stand-by: health/watchlist/gestão/resumos funcionam, mas novos sinais não são enviados.
-TREND_PRO_ENABLED = os.environ.get("ENABLE_TRENDPRO", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
+TREND_PRO_ENABLED = os.environ.get("TREND_PRO_ENABLED", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 TREND_PRO_AUTO_TRADE = os.environ.get("TREND_PRO_AUTO_TRADE", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("TRENDPRO_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
 SERVICE_STARTED_TS = time.time()
@@ -348,7 +348,7 @@ def nome_limpo(symbol):
 def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
     for attempt in range(max_retries):
         try:
-            return safe_fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso TRENDPRO OHLCV ({attempt+1}/{max_retries}) {symbol} {timeframe}: {e}")
             time.sleep(2 ** attempt)
@@ -364,7 +364,7 @@ def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
 def safe_fetch_ticker(symbol, max_retries=3):
     for attempt in range(max_retries):
         try:
-            return safe_fetch_ticker(symbol)
+            return exchange.fetch_ticker(symbol)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso TRENDPRO Ticker ({attempt+1}/{max_retries}) {symbol}: {e}")
             time.sleep(2 ** attempt)
@@ -1673,6 +1673,10 @@ def analisar_sinal_h1(symbol):
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 50 or len(ohlcv_h4) < 50:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para {nome_limpo(symbol)}"
+        return None, pd.DataFrame(), pd.DataFrame()
+
     df_h1 = pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"])
     df_h4 = pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"])
 
@@ -1793,6 +1797,10 @@ def detectar_early_a(symbol):
 
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 50 or len(ohlcv_h4) < 50:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para {nome_limpo(symbol)}"
+        return None
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
