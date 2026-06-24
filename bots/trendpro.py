@@ -1,5 +1,5 @@
 # TREND PRO MTF H4/H1 + POI
-# Versão: 2026-06-23-TRENDPRO-CENTRAL-QUANT-RECURSION-FIX
+# Versão: 2026-06-24-TRENDPRO-CENTRAL-QUANT-PADRAO-FINAL
 #
 # Lógica:
 # - H4 é apenas contexto/filtro.
@@ -149,6 +149,7 @@ EARLY_COOLDOWN_KEY = "trendpro:early_cooldown"
 DONKEY_COOLDOWN_KEY = "trendpro:donkey_cooldown"
 DONKEY_CONFIRM_KEY = "trendpro:donkey_confirmed"
 DONKEY_POI_COOLDOWN_KEY = "trendpro:donkey_poi_cooldown"
+FUNNEL_KEY = "trendpro:funnel"
 
 # ====================================================
 # CONFIGURAÇÕES PRINCIPAIS
@@ -158,10 +159,13 @@ TIMEFRAME_H4 = "4h"
 TIMEFRAME_H1 = "1h"
 
 # Central Quant:
-# ENABLE_TRENDPRO=true carrega o módulo na Central.
-# TREND_PRO_ENABLED=false deixa o robô em stand-by: health/watchlist/gestão/resumos funcionam, mas novos sinais não são enviados.
-TREND_PRO_ENABLED = os.environ.get("TREND_PRO_ENABLED", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
-TREND_PRO_AUTO_TRADE = os.environ.get("TREND_PRO_AUTO_TRADE", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
+# ENABLE_TRENDPRO=true liga o Trend PRO na Central e permite envio de sinais.
+# TREND_PRO_ENABLED foi mantido apenas como compatibilidade legada.
+def env_bool(name, default="false"):
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+TREND_PRO_ENABLED = env_bool("ENABLE_TRENDPRO", os.environ.get("TREND_PRO_ENABLED", "false"))
+TREND_PRO_AUTO_TRADE = env_bool("TREND_PRO_AUTO_TRADE", "false")
 STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("TRENDPRO_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
 SERVICE_STARTED_TS = time.time()
 
@@ -479,6 +483,158 @@ def redis_set_json(key, value):
         redis.set(key, json.dumps(value, ensure_ascii=False))
     except Exception as e:
         print(f"ERRO REDIS SET {key}:", e)
+
+
+# ====================================================
+# FUNIL TREND PRO - DIAGNÓSTICO
+# ====================================================
+
+FUNIL_PADRAO = {
+    "scanner_runs": 0,
+    "ativos_analisados": 0,
+    "startup_guard_ignorados": 0,
+    "posicao_ativa_ignorados": 0,
+
+    "normal_detectados": 0,
+    "early_detectados": 0,
+    "reentry_detectados": 0,
+    "poi_detectados": 0,
+    "recuperados_detectados": 0,
+
+    "score_55_plus": 0,
+    "score_70_plus": 0,
+    "score_80_plus": 0,
+
+    "reprovados_risco": 0,
+    "reprovados_score": 0,
+    "reprovados_adx": 0,
+    "reprovados_volume": 0,
+    "reprovados_bb": 0,
+    "reprovados_spike": 0,
+    "reprovados_cooldown": 0,
+
+    "sinais_enviados": 0,
+    "last_update": None,
+}
+
+def carregar_funil():
+    dados = redis_get_json(FUNNEL_KEY, {})
+    return dados if isinstance(dados, dict) else {}
+
+def salvar_funil(dados):
+    redis_set_json(FUNNEL_KEY, dados)
+
+def funil_hoje():
+    dados = carregar_funil()
+    hoje = data_hoje_sp_str()
+    base = dict(FUNIL_PADRAO)
+    atual = dados.get(hoje, {})
+    if isinstance(atual, dict):
+        base.update(atual)
+    return base
+
+def montar_funil_texto():
+    f = funil_hoje()
+    return (
+        "📈 FUNIL TREND PRO DO DIA\n\n"
+        f"Ativos analisados: {f.get('ativos_analisados', f.get('symbols_scanned', 0))}\n"
+        f"Normal detectados: {f.get('normal_detectados', f.get('normal_detected', 0))}\n"
+        f"Early detectados: {f.get('early_detectados', f.get('early_detected', 0))}\n"
+        f"Reentry detectados: {f.get('reentry_detectados', f.get('reentry_detected', 0))}\n"
+        f"POIs detectados: {f.get('poi_detectados', f.get('poi_detected', 0))}\n\n"
+        f"Score 55+: {f.get('score_55_plus', 0)}\n"
+        f"Score 70+: {f.get('score_70_plus', 0)}\n"
+        f"Score 80+: {f.get('score_80_plus', 0)}\n\n"
+        f"Reprovados por risco: {f.get('reprovados_risco', f.get('risk_rejected', 0))}\n"
+        f"Reprovados por score: {f.get('reprovados_score', f.get('score_rejected', 0))}\n"
+        f"Reprovados por ADX: {f.get('reprovados_adx', f.get('adx_rejected', 0))}\n"
+        f"Reprovados por spike/dado suspeito: {f.get('reprovados_spike', f.get('spike_rejected', 0))}\n"
+        f"Reprovados por cooldown: {f.get('reprovados_cooldown', f.get('cooldown_rejected', 0))}\n"
+        f"Reprovados por posição ativa: {f.get('reprovados_posicao_ativa', f.get('active_position_rejected', 0))}\n"
+        f"Ignorados por startup guard: {f.get('startup_guard_ignorados', f.get('startup_guard_ignored', 0))}\n\n"
+        f"Sinais enviados: {f.get('sinais_enviados', f.get('signals_sent', 0))}"
+    )
+
+
+def registrar_funil(campo, qtd=1):
+    try:
+        dados = carregar_funil()
+        hoje = data_hoje_sp_str()
+        atual = dados.get(hoje, {})
+        if not isinstance(atual, dict):
+            atual = {}
+
+        base = dict(FUNIL_PADRAO)
+        base.update(atual)
+        base[campo] = int(base.get(campo, 0)) + int(qtd)
+        base["last_update"] = data_hora_sp_str()
+
+        dados[hoje] = base
+
+        if len(dados) > 45:
+            chaves = sorted(dados.keys())[-45:]
+            dados = {k: dados[k] for k in chaves}
+
+        salvar_funil(dados)
+    except Exception as e:
+        print("ERRO REGISTRAR FUNIL TRENDPRO:", e)
+
+def registrar_score_funil(s):
+    try:
+        score = int(s.get("signal_score", 0))
+        if score >= 55:
+            registrar_funil("score_55_plus")
+        if score >= 70:
+            registrar_funil("score_70_plus")
+        if score >= 80:
+            registrar_funil("score_80_plus")
+    except Exception:
+        pass
+
+def registrar_reprovacao_funil(motivo):
+    motivo = str(motivo or "").lower()
+    if "score" in motivo:
+        registrar_funil("reprovados_score")
+    elif "adx" in motivo:
+        registrar_funil("reprovados_adx")
+    elif "volume" in motivo:
+        registrar_funil("reprovados_volume")
+    elif "bollinger" in motivo or "bb" in motivo:
+        registrar_funil("reprovados_bb")
+    else:
+        registrar_funil("reprovados_score")
+
+def montar_funil():
+    f = funil_hoje()
+
+    return (
+        "📈 FUNIL TREND PRO DO DIA\n\n"
+        f"Scanner runs: {f.get('scanner_runs', 0)}\n"
+        f"Ativos analisados: {f.get('ativos_analisados', 0)}\n"
+        f"Startup guard ignorados: {f.get('startup_guard_ignorados', 0)}\n"
+        f"Posição ativa ignorados: {f.get('posicao_ativa_ignorados', 0)}\n\n"
+
+        f"Normal detectados: {f.get('normal_detectados', 0)}\n"
+        f"Early detectados: {f.get('early_detectados', 0)}\n"
+        f"Reentry detectados: {f.get('reentry_detectados', 0)}\n"
+        f"POI detectados: {f.get('poi_detectados', 0)}\n"
+        f"Recuperados detectados: {f.get('recuperados_detectados', 0)}\n\n"
+
+        f"Score 55+: {f.get('score_55_plus', 0)}\n"
+        f"Score 70+: {f.get('score_70_plus', 0)}\n"
+        f"Score 80+: {f.get('score_80_plus', 0)}\n\n"
+
+        f"Reprovados por risco: {f.get('reprovados_risco', 0)}\n"
+        f"Reprovados por score: {f.get('reprovados_score', 0)}\n"
+        f"Reprovados por ADX: {f.get('reprovados_adx', 0)}\n"
+        f"Reprovados por volume: {f.get('reprovados_volume', 0)}\n"
+        f"Reprovados por Bollinger: {f.get('reprovados_bb', 0)}\n"
+        f"Reprovados por spike: {f.get('reprovados_spike', 0)}\n"
+        f"Reprovados por cooldown: {f.get('reprovados_cooldown', 0)}\n\n"
+
+        f"Sinais enviados: {f.get('sinais_enviados', 0)}\n"
+        f"Última atualização: {f.get('last_update') or 'N/A'}"
+    )
 
 
 def carregar_posicoes():
@@ -862,6 +1018,30 @@ def mes_anterior_ref():
     return ultimo_mes_anterior.strftime("%Y-%m"), ultimo_mes_anterior.strftime("%m/%Y")
 
 
+def montar_eventos_texto():
+    hoje = data_hoje_sp_str()
+    trades = carregar_trades()
+    eventos = [
+        t for t in trades
+        if t.get("date") == hoje and t.get("event") in ["TP50", "TRAILING", "SL", "TRAIL", "BE", "CLOSE", "EXIT"]
+    ]
+
+    if not eventos:
+        return "📋 EVENTOS TREND PRO DO DIA\n\nNenhum evento de gestão registrado hoje."
+
+    linhas = ["📋 EVENTOS TREND PRO DO DIA", ""]
+    for t in eventos[-40:]:
+        simbolo = t.get("symbol_clean", t.get("symbol", "N/A"))
+        evento = t.get("event", "N/A")
+        lado = t.get("side", "")
+        pnl = t.get("pnl", t.get("pnl_pct", t.get("result_pct", None)))
+        if pnl is not None:
+            linhas.append(f"{evento} - {simbolo} {lado} | {fmt_pct(pnl)}")
+        else:
+            linhas.append(f"{evento} - {simbolo} {lado}")
+    return "\n".join(linhas)
+
+
 def montar_resumo_mensal():
     mes_ref, mes_txt = mes_anterior_ref()
     trades = carregar_trades()
@@ -1203,12 +1383,6 @@ def montar_health_tecnico():
         "enable_recovered_signal": ENABLE_RECOVERED_SIGNAL,
         "auto_position_report": ENABLE_AUTO_POSITION_REPORT,
         "be_trigger_r": BE_TRIGGER_R,
-        "donkey_h4_enabled": ENABLE_DONKEY_H4,
-        "early_donkey_h4_enabled": ENABLE_EARLY_DONKEY_H4,
-        "donkey_confirm_key": DONKEY_CONFIRM_KEY,
-        "donkey_buffer_pct": DONKEY_BUFFER_PCT,
-        "donkey_risk_usdt": DONKEY_RISK_USDT,
-        "donkey_telegram_configured": bool(DONKEY_TOKEN and DONKEY_CHAT_ID),
         "resumos_separados": True,
         "mfe_enabled": True,
         "mfe_split_enabled": True,
@@ -1221,7 +1395,9 @@ def montar_health_tecnico():
         "watchdog_threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
         "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
         "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
-        "watchdog_last_check": HEALTH.get("watchdog_last_check")
+        "watchdog_last_check": HEALTH.get("watchdog_last_check"),
+        "funnel_enabled": True,
+        "funnel_today": funil_hoje()
     }
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -1605,6 +1781,12 @@ def adicionar_signal_score(s):
     score = calcular_signal_score(s)
     s["signal_score"] = score
     s["elite_candidate"] = score >= ELITE_THRESHOLD
+    if score >= 55:
+        registrar_funil("score_55_plus")
+    if score >= 70:
+        registrar_funil("score_70_plus")
+    if score >= 80:
+        registrar_funil("score_80_plus")
     return s
 
 
@@ -1651,9 +1833,11 @@ def passa_filtro_trendpro_elite(
     bb_ok = bool(s.get("bb_ok", False))
 
     if score < threshold:
+        registrar_funil("reprovados_score")
         return False, f"{label}: Score abaixo do mínimo: {score}/{threshold}"
 
     if adx_h4 < min_adx_h4:
+        registrar_funil("reprovados_adx")
         return False, f"{label}: ADX H4 abaixo do mínimo: {adx_h4:.2f}/{min_adx_h4:.2f}"
 
     if require_high_volume and not volume_ok:
@@ -1688,6 +1872,7 @@ def analisar_sinal_h1(symbol):
     candle_h4 = df_h4.iloc[-2]
 
     if bool(candle_h1.get("spike_suspeito", False)):
+        registrar_funil("reprovados_spike")
         print(f"CANDLE H1 SUSPEITO IGNORADO: {nome_limpo(symbol)}")
         return None, df_h1, df_h4
 
@@ -1744,10 +1929,13 @@ def analisar_sinal_h1(symbol):
     risk_pct = risk_abs / entry * 100
 
     if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1:
+        registrar_funil("reprovados_risco")
         print(f"SINAL IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
         return None, df_h1, df_h4
 
     pontos, qualidade = calcular_qualidade(signal, h4_state, candle_h1)
+
+    registrar_funil("normal_detectados")
 
     return adicionar_signal_score({
         "type": "SIGNAL",
@@ -1810,6 +1998,7 @@ def detectar_early_a(symbol):
     candle_h4 = df_h4.iloc[-2]
 
     if bool(candle.get("spike_suspeito", False)):
+        registrar_funil("reprovados_spike")
         print(f"EARLY IGNORADO POR CANDLE SUSPEITO: {nome_limpo(symbol)}")
         return None
 
@@ -1859,6 +2048,7 @@ def detectar_early_a(symbol):
         return None
 
     if early_em_cooldown(symbol, signal):
+        registrar_funil("reprovados_cooldown")
         return None
 
     entry = close
@@ -1866,11 +2056,13 @@ def detectar_early_a(symbol):
     risk_pct = risk_abs / entry * 100
 
     if USE_MAX_RISK_FILTER and risk_pct > MAX_RISK_H1:
+        registrar_funil("reprovados_risco")
         print(f"EARLY IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
         return None
 
     pontos, qualidade = calcular_qualidade(signal, h4_state, candle)
 
+    registrar_funil("early_detectados")
     marcar_early_cooldown(symbol, signal)
 
     return adicionar_signal_score({
@@ -3731,6 +3923,25 @@ def montar_resumo_diario():
         except Exception:
             ativos.append(f"{p.get('symbol_clean', symbol)} {p.get('side', '')} | PnL N/A")
 
+    funil = funil_hoje()
+    linhas += [
+        "",
+        "📈 FUNIL TREND PRO DO DIA",
+        f"Ativos analisados: {funil.get('ativos_analisados', 0)}",
+        f"Normal detectados: {funil.get('normal_detectados', 0)}",
+        f"Early detectados: {funil.get('early_detectados', 0)}",
+        f"Reentry detectados: {funil.get('reentry_detectados', 0)}",
+        f"POI detectados: {funil.get('poi_detectados', 0)}",
+        f"Score 55+: {funil.get('score_55_plus', 0)}",
+        f"Score 70+: {funil.get('score_70_plus', 0)}",
+        f"Score 80+: {funil.get('score_80_plus', 0)}",
+        f"Reprovados por risco: {funil.get('reprovados_risco', 0)}",
+        f"Reprovados por score: {funil.get('reprovados_score', 0)}",
+        f"Reprovados por ADX: {funil.get('reprovados_adx', 0)}",
+        f"Reprovados por spike: {funil.get('reprovados_spike', 0)}",
+        f"Sinais enviados: {funil.get('sinais_enviados', 0)}",
+    ]
+
     linhas += ["", f"Trades Trend PRO ainda ativos: {len(ativos)}"]
     if ativos:
         linhas.extend(ativos[:20])
@@ -3927,6 +4138,12 @@ def listen_commands():
 
                 elif texto == "/resumo":
                     enviar_texto(chat_id, montar_resumo_diario())
+
+                elif texto == "/funil":
+                    enviar_texto(chat_id, montar_funil_texto())
+
+                elif texto == "/eventos":
+                    enviar_texto(chat_id, montar_eventos_texto())
 
                 elif texto == "/resumo_donkey":
                     safe_send_telegram_donkey(montar_resumo_donkey())
@@ -4254,6 +4471,8 @@ def scanner():
             watchlist = carregar_watchlist()
             watchlist = validar_watchlist_bingx(watchlist, avisar_telegram=True)
             HEALTH["last_watchlist_count"] = len(watchlist)
+            registrar_funil("scanner_runs")
+            registrar_funil("ativos_analisados", len(watchlist))
             sinais = []
             sinais_enviados = 0
 
@@ -4268,13 +4487,16 @@ def scanner():
 
             for symbol in watchlist:
                 try:
+                    registrar_funil("ativos_analisados")
                     if startup_signal_guard_active():
+                        registrar_funil("startup_guard_ignorados")
                         print(f"STARTUP GUARD TRENDPRO: ignorando novos sinais temporariamente em {nome_limpo(symbol)}")
                         continue
 
                     # POI primeiro para posições ativas.
                     posicoes = carregar_posicoes()
                     if symbol in posicoes and posicoes[symbol].get("status") != "ENCERRADO":
+                        registrar_funil("posicao_ativa_ignorados")
                         # Trend PRO Only:
                         # Não gerencia, não confirma e não envia POI Donkey.
                         # Posições Donkey ficam exclusivamente no serviço Donkey.
@@ -4283,6 +4505,8 @@ def scanner():
 
                         poi = detectar_poi(symbol, posicoes[symbol])
                         if poi:
+                            registrar_funil("poi_detectados")
+                            registrar_score_funil(poi)
                             aprovado, motivo = passa_filtro_trendpro_elite(
                                 poi,
                                 threshold=POI_THRESHOLD,
@@ -4296,6 +4520,7 @@ def scanner():
                                 enviar_poi(poi)
                                 atualizar_posicao_com_poi(poi)
                             else:
+                                registrar_reprovacao_funil(motivo)
                                 print(f"POI BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
                         continue
 
@@ -4303,6 +4528,8 @@ def scanner():
                     if symbol in posicoes and posicoes[symbol].get("status") == "ENCERRADO":
                         reentry = detectar_reentry(symbol, posicoes[symbol])
                         if reentry:
+                            registrar_funil("reentry_detectados")
+                            registrar_score_funil(reentry)
                             aprovado, motivo = passa_filtro_trendpro_elite(
                                 reentry,
                                 threshold=ELITE_THRESHOLD,
@@ -4313,6 +4540,7 @@ def scanner():
                             )
 
                             if not aprovado:
+                                registrar_reprovacao_funil(motivo)
                                 print(f"REENTRY BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
                                 continue
 
@@ -4326,11 +4554,14 @@ def scanner():
                                     salvar_sinais(historico_tmp)
                                     enviar_reentry(reentry)
                                     sinais_enviados += 1
+                                    registrar_funil("sinais_enviados")
                             continue
 
                     early = detectar_early_a(symbol)
 
                     if early:
+                        registrar_funil("early_detectados")
+                        registrar_score_funil(early)
                         aprovado, motivo = passa_filtro_trendpro_elite(
                             early,
                             threshold=EARLY_THRESHOLD,
@@ -4341,6 +4572,7 @@ def scanner():
                         )
 
                         if not aprovado:
+                            registrar_reprovacao_funil(motivo)
                             print(f"EARLY BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
                             continue
 
@@ -4354,12 +4586,19 @@ def scanner():
                                 salvar_sinais(historico_tmp)
                                 enviar_early_a(early)
                                 sinais_enviados += 1
+                                registrar_funil("sinais_enviados")
                         continue
 
                     resultado, df_h1, df_h4 = analisar_sinal_h1(symbol)
 
                     if not resultado:
                         continue
+
+                    if resultado.get("signal_type") == "RECUPERADO":
+                        registrar_funil("recuperados_detectados")
+                    else:
+                        registrar_funil("normal_detectados")
+                    registrar_score_funil(resultado)
 
                     aprovado, motivo = passa_filtro_trendpro_elite(
                         resultado,
@@ -4371,6 +4610,7 @@ def scanner():
                     )
 
                     if not aprovado:
+                        registrar_reprovacao_funil(motivo)
                         print(f"SINAL BLOQUEADO PELO TREND PRO ELITE: {nome_limpo(symbol)} | {motivo}")
                         continue
 
@@ -4391,6 +4631,7 @@ def scanner():
 
             for s in sinais:
                 if existe_posicao_ativa(s["symbol"]):
+                    registrar_funil("reprovados_posicao_ativa")
                     continue
 
                 chave = f"{s['symbol']}_{s['timestamp']}_{s['signal']}"
@@ -4402,6 +4643,8 @@ def scanner():
                     historico[chave] = True
                     enviar_sinal_h1(s)
                     sinais_enviados += 1
+                    registrar_funil("sinais_enviados")
+                    registrar_funil("sinais_enviados")
 
             salvar_sinais(historico)
 
@@ -4416,6 +4659,17 @@ def scanner():
 
         time.sleep(60)
 
+
+
+@app.route("/funil")
+def funil_route():
+    return funil_hoje()
+
+
+
+@app.route("/eventos")
+def eventos_route():
+    return montar_eventos_texto(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/health")
@@ -4481,11 +4735,7 @@ def health():
             "be_trigger_r": BE_TRIGGER_R,
             "enable_reentry": ENABLE_REENTRY_AFTER_TP50,
             "reentry_after_close_seconds": REENTRY_AFTER_CLOSE_SECONDS,
-            "donkey_h4_enabled": ENABLE_DONKEY_H4,
-            "donkey_buffer_pct": DONKEY_BUFFER_PCT,
-            "donkey_risk_usdt": DONKEY_RISK_USDT,
-        "donkey_telegram_configured": bool(DONKEY_TOKEN and DONKEY_CHAT_ID),
-        "resumos_separados": True
+                    "resumos_separados": True
         }
     }
 
