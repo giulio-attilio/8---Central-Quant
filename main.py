@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-23-CENTRAL-FULL-SAFE-LOADER-TURTLE
+# Versão: 2026-06-24-CENTRAL-FULL-BINGX-WARNING-FIX
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -64,6 +64,11 @@ def minutes_since(value):
     if not dt:
         return None
     return round((agora_sp().replace(tzinfo=None) - dt).total_seconds() / 60, 2)
+
+
+def is_benign_bingx_quote_error(value):
+    txt = str(value or "").lower()
+    return "109500" in txt or "quote service unavailable" in txt
 
 
 # Cada bot recebe seus tokens próprios, mapeados para TELEGRAM_BOT_TOKEN/CHAT_ID
@@ -238,7 +243,7 @@ def central_watchdog_status():
             continue
 
         last_error = b.get("last_error")
-        if last_error:
+        if last_error and not is_benign_bingx_quote_error(last_error):
             reasons.append(f"{key}: last_error={last_error}")
 
         ms = b.get("minutes_since_scanner")
@@ -336,7 +341,10 @@ def central():
             "ok": (
                 bool(b.get("enabled"))
                 and bool(b.get("loaded"))
-                and not b.get("last_error")
+                and not (
+                    b.get("last_error")
+                    and not is_benign_bingx_quote_error(b.get("last_error"))
+                )
                 and not b.get("load_error")
             ),
             "enabled": b.get("enabled"),
