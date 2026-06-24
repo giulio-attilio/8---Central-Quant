@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-24-CENTRAL-FULL-BINGX-WARNING-FIX
+# Versão: 2026-06-24-CENTRAL-FULL-EXPOSURE-PANEL
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -228,6 +228,68 @@ def bot_health(key: str, cfg: dict):
     return payload
 
 
+def get_open_positions_from_module(module):
+    positions = []
+    try:
+        if hasattr(module, "carregar_posicoes"):
+            raw = module.carregar_posicoes()
+        elif hasattr(module, "get_positions"):
+            raw = module.get_positions()
+        else:
+            raw = {}
+
+        if isinstance(raw, dict):
+            iterable = raw.values()
+        elif isinstance(raw, list):
+            iterable = raw
+        else:
+            iterable = []
+
+        for p in iterable:
+            if not isinstance(p, dict):
+                continue
+            status = str(p.get("status", "OPEN")).upper()
+            if status in {"ENCERRADO", "CLOSED", "FECHADO"}:
+                continue
+            positions.append(p)
+    except Exception:
+        pass
+    return positions
+
+
+def central_exposure_snapshot():
+    total = 0
+    longs = 0
+    shorts = 0
+    by_bot = {}
+
+    for key, module in LOADED_BOTS.items():
+        positions = get_open_positions_from_module(module)
+        bot_longs = 0
+        bot_shorts = 0
+        for p in positions:
+            side = str(p.get("side", p.get("direction", ""))).upper()
+            if side in {"LONG", "BUY"}:
+                longs += 1
+                bot_longs += 1
+            elif side in {"SHORT", "SELL"}:
+                shorts += 1
+                bot_shorts += 1
+        total += len(positions)
+        by_bot[key] = {
+            "total": len(positions),
+            "long": bot_longs,
+            "short": bot_shorts,
+        }
+
+    return {
+        "total_positions_open": total,
+        "long_positions_open": longs,
+        "short_positions_open": shorts,
+        "by_bot": by_bot,
+    }
+
+
 def central_watchdog_status():
     reasons = []
     bots = {}
@@ -394,8 +456,14 @@ def central():
         "loaded_bots": loaded,
         "alerts": alerts,
         "reasons": status.get("reasons", []),
+        "exposure": central_exposure_snapshot(),
         "bots": resumo,
     }
+
+
+@app.route("/exposure")
+def exposure():
+    return central_exposure_snapshot()
 
 
 start_enabled_bots()
