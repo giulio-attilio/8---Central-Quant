@@ -1,6 +1,6 @@
 # ==============================================================================
 # TURTLE BREAKOUT PRO 2.0 - CENTRAL QUANT
-# Versão: 2026-06-23-TURTLE-BREAKOUT-PRO-100-100-AUDITADO-PAPER
+# Versão: 2026-06-23-TURTLE-BREAKOUT-PRO-100-100-FUNIL-PAPER
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -16,6 +16,7 @@
 # - Medir captura de tendência.
 # - Medir runner aberto atual.
 # - Gerar Score Turtle e qualidade do sinal.
+# - Registrar funil Turtle igual ao Cobra.
 # - Medir expectancy em R.
 # - Medir Profit Factor em % e em R.
 # - Separar estatísticas por setup e por direção LONG/SHORT.
@@ -165,6 +166,7 @@ COOLDOWN_KEY = "turtle_pro:cooldowns"
 DAILY_SUMMARY_KEY = "turtle_pro:daily_summary_sent"
 MONTHLY_SUMMARY_KEY = "turtle_pro:monthly_summary_sent"
 LAST_CANDLES_KEY = "turtle_pro:last_scanned_candles_by_symbol"
+FUNNEL_KEY = "turtle_pro:funnel"
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 
@@ -240,6 +242,20 @@ HEALTH = {
     "ranking_month": [],
     "enabled_setups": list(SETUPS.keys()),
     "mode": "PAPER",
+
+    "funnel_today": {
+        "ativos_analisados": 0,
+        "rompimentos_20_buy": 0,
+        "rompimentos_20_sell": 0,
+        "rompimentos_55_buy": 0,
+        "rompimentos_55_sell": 0,
+        "reprovados_atr": 0,
+        "reprovados_risco": 0,
+        "reprovados_score": 0,
+        "reprovados_cooldown": 0,
+        "reprovados_posicao_ativa": 0,
+        "sinais_enviados": 0,
+    },
 }
 
 # ==============================================================================
@@ -633,6 +649,62 @@ def record_event(event_type, pos, extra=None):
     return event
 
 
+
+# ==============================================================================
+# FUNIL TURTLE
+# ==============================================================================
+
+def get_funnel():
+    data = redis_get_json(FUNNEL_KEY, {})
+    if not isinstance(data, dict):
+        data = {}
+    today = date_key()
+    if data.get("date") != today:
+        data = {
+            "date": today,
+            "ativos_analisados": 0,
+            "rompimentos_20_buy": 0,
+            "rompimentos_20_sell": 0,
+            "rompimentos_55_buy": 0,
+            "rompimentos_55_sell": 0,
+            "reprovados_atr": 0,
+            "reprovados_risco": 0,
+            "reprovados_score": 0,
+            "reprovados_cooldown": 0,
+            "reprovados_posicao_ativa": 0,
+            "sinais_enviados": 0,
+        }
+        redis_set_json(FUNNEL_KEY, data)
+    return data
+
+
+def save_funnel(data):
+    return redis_set_json(FUNNEL_KEY, data)
+
+
+def funnel_inc(field, amount=1):
+    data = get_funnel()
+    data[field] = int(data.get(field, 0) or 0) + amount
+    save_funnel(data)
+    return data
+
+
+def funnel_snapshot():
+    data = get_funnel()
+    return {
+        "ativos_analisados": int(data.get("ativos_analisados", 0) or 0),
+        "rompimentos_20_buy": int(data.get("rompimentos_20_buy", 0) or 0),
+        "rompimentos_20_sell": int(data.get("rompimentos_20_sell", 0) or 0),
+        "rompimentos_55_buy": int(data.get("rompimentos_55_buy", 0) or 0),
+        "rompimentos_55_sell": int(data.get("rompimentos_55_sell", 0) or 0),
+        "reprovados_atr": int(data.get("reprovados_atr", 0) or 0),
+        "reprovados_risco": int(data.get("reprovados_risco", 0) or 0),
+        "reprovados_score": int(data.get("reprovados_score", 0) or 0),
+        "reprovados_cooldown": int(data.get("reprovados_cooldown", 0) or 0),
+        "reprovados_posicao_ativa": int(data.get("reprovados_posicao_ativa", 0) or 0),
+        "sinais_enviados": int(data.get("sinais_enviados", 0) or 0),
+    }
+
 # ==============================================================================
 # SCORE TURTLE
 # ==============================================================================
@@ -721,6 +793,7 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
 
     atr_pct = atr / close * 100.0
     if atr_pct < MIN_ATR_PCT:
+        funnel_inc("reprovados_atr")
         return None
 
     side = None
@@ -731,24 +804,35 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
         side = "LONG"
         stop = close - ATR_STOP_MULT * atr
         tp50 = close + TP50_R * abs(close - stop)
+        if setup_key == "TURTLE20":
+            funnel_inc("rompimentos_20_buy")
+        elif setup_key == "TURTLE55":
+            funnel_inc("rompimentos_55_buy")
     elif close < entry_low:
         side = "SHORT"
         stop = close + ATR_STOP_MULT * atr
         tp50 = close - TP50_R * abs(close - stop)
+        if setup_key == "TURTLE20":
+            funnel_inc("rompimentos_20_sell")
+        elif setup_key == "TURTLE55":
+            funnel_inc("rompimentos_55_sell")
 
     if not side:
         return None
 
     rp = risk_pct(close, stop)
     if rp <= 0 or rp > MAX_RISK_PCT:
+        funnel_inc("reprovados_risco")
         return None
 
     current_ts = int(row["ts"])
     if is_in_cooldown(symbol, setup_key, side, current_ts):
+        funnel_inc("reprovados_cooldown")
         return None
 
     score_data = calc_turtle_score(row, prev, side, close, atr, entry_high, entry_low, entry_len)
     if score_data["score_turtle"] < SCORE_MIN_QUALITY_TO_SIGNAL:
+        funnel_inc("reprovados_score")
         return None
 
     return {
@@ -847,6 +931,8 @@ def scanner_loop():
                 if int(last_candles.get(symbol, 0) or 0) == symbol_last_closed_ts:
                     continue
 
+                funnel_inc("ativos_analisados")
+
                 for setup_key, setup_cfg in SETUPS.items():
                     if len(positions) >= MAX_OPEN_POSITIONS:
                         break
@@ -856,6 +942,7 @@ def scanner_loop():
                         continue
 
                     if should_skip_due_to_open_position(positions, symbol, setup_key, sig["side"]):
+                        funnel_inc("reprovados_posicao_ativa")
                         continue
 
                     if time.time() - started < STARTUP_GUARD_SECONDS:
@@ -871,6 +958,7 @@ def scanner_loop():
                     set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
 
                     safe_send_telegram(signal_message(sig))
+                    funnel_inc("sinais_enviados")
                     signals_sent += 1
 
                 last_candles[symbol] = symbol_last_closed_ts
@@ -1264,6 +1352,7 @@ def refresh_health_stats():
     today_events = [e for e in get_events() if str(e.get("created_at", "")).startswith(date_key_br())]
 
     stats = calc_stats(month_trades)
+    HEALTH["funnel_today"] = funnel_snapshot()
 
     HEALTH["signals_today"] = len(today_signals)
     HEALTH["signals_month"] = len(month_signals)
@@ -1412,6 +1501,18 @@ def build_summary(period_name, trades, period_signals_override=None):
         f"Turtle 55: {sum(1 for s in period_signals if s.get('setup') == 'TURTLE55')}\n"
         f"LONG: {sum(1 for s in period_signals if s.get('side') == 'LONG')}\n"
         f"SHORT: {sum(1 for s in period_signals if s.get('side') == 'SHORT')}\n\n"
+        f"🐢 FUNIL TURTLE\n"
+        f"Ativos analisados: {HEALTH.get('funnel_today', {}).get('ativos_analisados', 0)}\n"
+        f"Rompimentos 20 BUY: {HEALTH.get('funnel_today', {}).get('rompimentos_20_buy', 0)}\n"
+        f"Rompimentos 20 SELL: {HEALTH.get('funnel_today', {}).get('rompimentos_20_sell', 0)}\n"
+        f"Rompimentos 55 BUY: {HEALTH.get('funnel_today', {}).get('rompimentos_55_buy', 0)}\n"
+        f"Rompimentos 55 SELL: {HEALTH.get('funnel_today', {}).get('rompimentos_55_sell', 0)}\n"
+        f"Reprovados por ATR: {HEALTH.get('funnel_today', {}).get('reprovados_atr', 0)}\n"
+        f"Reprovados por risco: {HEALTH.get('funnel_today', {}).get('reprovados_risco', 0)}\n"
+        f"Reprovados por score: {HEALTH.get('funnel_today', {}).get('reprovados_score', 0)}\n"
+        f"Reprovados por cooldown: {HEALTH.get('funnel_today', {}).get('reprovados_cooldown', 0)}\n"
+        f"Reprovados por posição ativa: {HEALTH.get('funnel_today', {}).get('reprovados_posicao_ativa', 0)}\n"
+        f"Sinais enviados: {HEALTH.get('funnel_today', {}).get('sinais_enviados', 0)}\n\n"
         f"Trades encerrados: {stats['count']}\n"
         f"Wins: {stats['wins']}\n"
         f"Breakeven: {stats['be']}\n"
@@ -1623,6 +1724,24 @@ def ranking_command_text():
     return "🏆 RANKING TURTLE DO MÊS\n\n" + ranking_text_from_rows(rows)
 
 
+
+def funnel_text():
+    f = funnel_snapshot()
+    return (
+        "🐢 FUNIL TURTLE DO DIA\n\n"
+        f"Ativos analisados: {f['ativos_analisados']}\n"
+        f"Rompimentos 20 BUY: {f['rompimentos_20_buy']}\n"
+        f"Rompimentos 20 SELL: {f['rompimentos_20_sell']}\n"
+        f"Rompimentos 55 BUY: {f['rompimentos_55_buy']}\n"
+        f"Rompimentos 55 SELL: {f['rompimentos_55_sell']}\n\n"
+        f"Reprovados por ATR: {f['reprovados_atr']}\n"
+        f"Reprovados por risco: {f['reprovados_risco']}\n"
+        f"Reprovados por score: {f['reprovados_score']}\n"
+        f"Reprovados por cooldown: {f['reprovados_cooldown']}\n"
+        f"Reprovados por posição ativa: {f['reprovados_posicao_ativa']}\n\n"
+        f"Sinais enviados: {f['sinais_enviados']}"
+    )
+
 def handle_command(text):
     text = (text or "").strip().lower()
 
@@ -1637,6 +1756,7 @@ def handle_command(text):
             "/direcoes - estatísticas LONG x SHORT\n"
             "/ranking - ranking mensal dos setups\n"
             "/score - explica o Score Turtle\n"
+            "/funil - funil de detecção do dia\n"
             "/eventos - eventos de gestão do dia\n"
             "/top - Top 5 MFE do mês\n"
             "/watchlist - tamanho da watchlist\n"
@@ -1684,6 +1804,10 @@ def handle_command(text):
 
     if text == "/ranking":
         safe_send_telegram(ranking_command_text())
+        return
+
+    if text == "/funil":
+        safe_send_telegram(funnel_text())
         return
 
     if text == "/score":
@@ -1769,6 +1893,12 @@ def events_route():
     return {"events": get_events()[-300:]}
 
 
+@app.route("/funnel")
+def funnel_route():
+    refresh_health_stats()
+    return {"funnel_today": HEALTH.get("funnel_today", funnel_snapshot())}
+
+
 @app.route("/summary")
 def summary_route():
     refresh_health_stats()
@@ -1778,6 +1908,7 @@ def summary_route():
         "setups": HEALTH.get("setups", {}),
         "directions": HEALTH.get("directions", {}),
         "ranking_month": HEALTH.get("ranking_month", []),
+        "funnel_today": HEALTH.get("funnel_today", {}),
         "events_today": {
             "tp50": HEALTH.get("tp50_today"),
             "be": HEALTH.get("be_today"),
@@ -1802,6 +1933,7 @@ def reset_paper_route():
     redis_set_json(EVENTS_KEY, [])
     redis_set_json(COOLDOWN_KEY, {})
     redis_set_json(LAST_CANDLES_KEY, {})
+    redis_set_json(FUNNEL_KEY, {})
     refresh_health_stats()
     return {"ok": True, "message": "paper resetado"}
 
@@ -1826,7 +1958,7 @@ def startup():
         f"Turtle55: entrada {ALL_SETUPS['TURTLE55']['entry_len']} / saída {ALL_SETUPS['TURTLE55']['exit_len']}\n\n"
         f"Stop: {ATR_STOP_MULT} ATR\n"
         f"TP50: {TP50_R}R\n"
-        "MFE/MAE, devolução, captura de tendência, Score Turtle, runner aberto, expectancy, PF em R, ranking e estatísticas LONG/SHORT ativados."
+        "MFE/MAE, funil Turtle, devolução, captura de tendência, Score Turtle, runner aberto, expectancy, PF em R, ranking e estatísticas LONG/SHORT ativados."
     )
 
     threading.Thread(target=scanner_loop, daemon=True).start()
