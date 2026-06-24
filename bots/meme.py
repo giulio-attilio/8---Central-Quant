@@ -3465,8 +3465,8 @@ def processar_comando(texto):
             "/reset - limpa cooldowns/bloqueios sem apagar posições\n"
             "/comandos - mostra esta lista\n\n"
             "Setups ativos:\n"
-            "🔥 Early Hunter - pré-rompimento\n"
-            "🔥 Meme Breakout - rompimento confirmado"
+            "🐸Early Hunter - pré-rompimento\n"
+            "🐸Meme Breakout - rompimento confirmado"
         )
 
     if cmd == "/health":
@@ -3570,7 +3570,7 @@ def scanner():
     print("SCANNER INICIADO")
     HEALTH["started_at"] = data_hora_sp_str()
     safe_send_telegram(
-        "🔥 Robô Meme Hunter PRO iniciado\n\n"
+        "🐸Robô Meme Hunter PRO iniciado\n\n"
         f"Filtros ativos:\n"
         f"Score mínimo: {ELITE_THRESHOLD}/100\n"
         f"ADX H4 mínimo: {ELITE_MIN_ADX_H4}\n"
