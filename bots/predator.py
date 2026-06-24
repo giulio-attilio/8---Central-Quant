@@ -30,7 +30,7 @@ app = Flask(__name__)
 
 BOT_NAME = os.environ.get("BOT_NAME", "Smart Predator")
 SERVICE_MODE = "SMART_PREDATOR"
-BOT_VERSION = "2026-06-23-SMART-PREDATOR-STANDBY-CENTRAL-QUANT"
+BOT_VERSION = "2026-06-24-SMART-PREDATOR-LIMIT8-WARNING-FIX"
 
 redis_lock = threading.Lock()
 ultimo_update_id = None
@@ -93,7 +93,7 @@ EMA50 = 50
 MIN_ADX_H4 = float(os.environ.get("PREDATOR_MIN_ADX_H4", os.environ.get("MIN_ADX_H4", "15")))
 VOLUME_MULTIPLIER = float(os.environ.get("PREDATOR_VOLUME_MULTIPLIER", os.environ.get("VOLUME_MULTIPLIER", "1.2")))
 
-MAX_OPEN_POSITIONS = int(os.environ.get("PREDATOR_MAX_OPEN_POSITIONS", os.environ.get("MAX_OPEN_POSITIONS", "20")))
+MAX_OPEN_POSITIONS = int(os.environ.get("PREDATOR_MAX_OPEN_POSITIONS", os.environ.get("MAX_OPEN_POSITIONS", "8")))
 USE_MAX_RISK_FILTER = os.environ.get("PREDATOR_USE_MAX_RISK_FILTER", os.environ.get("USE_MAX_RISK_FILTER", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
 MAX_RISK_H1 = float(os.environ.get("PREDATOR_MAX_RISK_H1", os.environ.get("MAX_RISK_H1", "2.5")))
 
