@@ -127,11 +127,15 @@ BOT_CONFIGS = {
         "extra_chat_envs": ["TURTLE_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"],
     },
     "FALCON": {
-    "name": "Falcon Strike",
     "enabled_env": "ENABLE_FALCON",
-    "health_url": "/health",
-    "emoji": "🦅",
-}
+    "module": "falcon",
+    "file": BOTS_DIR / "falcon.py",
+    "name": "Falcon Strike",
+    "token_env": "FALCON_TOKEN",
+    "chat_env": "FALCON_CHAT_ID",
+    "extra_token_envs": ["FALCON_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"],
+    "extra_chat_envs": ["FALCON_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"],
+},
 }
 
 LOADED_BOTS = {}
