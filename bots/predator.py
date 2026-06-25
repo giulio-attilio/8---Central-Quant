@@ -1,3 +1,4 @@
+# Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em PREDATOR.
 # SMART PREDATOR - SMC H1
 # Versão: 2026-06-24-SMART-PREDATOR-BINGX-WARNING-FIX
 #
@@ -31,6 +32,15 @@ app = Flask(__name__)
 BOT_NAME = os.environ.get("BOT_NAME", "Smart Predator")
 SERVICE_MODE = "SMART_PREDATOR"
 BOT_VERSION = "2026-06-24-SMART-PREDATOR-LIMIT8-WARNING-FIX"
+
+# Padrão Central Quant: este bot não usa startup guard para sinais.
+# Mantido explícito para padronização de /health e evitar bloqueios após deploy.
+STARTUP_SIGNAL_GRACE_SECONDS = int(
+    os.environ.get(
+        "PREDATOR_STARTUP_SIGNAL_GRACE_SECONDS",
+        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
+    )
+)
 
 redis_lock = threading.Lock()
 ultimo_update_id = None
@@ -1900,6 +1910,8 @@ def montar_health_tecnico():
         "be_offset_pct": BE_OFFSET_PCT,
         "trail_atr_mult": TRAIL_ATR_MULT,
         "daily_summary_time": f"{DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}",
+        "startup_signal_grace_seconds": STARTUP_SIGNAL_GRACE_SECONDS,
+        "startup_signal_guard_active": False,
         "daily_summary_sent_today": resumo_diario_ja_enviado(),
         "monthly_summary_day": MONTHLY_SUMMARY_DAY,
         "monthly_summary_time": f"{MONTHLY_SUMMARY_HOUR:02d}:{MONTHLY_SUMMARY_MINUTE:02d}",
