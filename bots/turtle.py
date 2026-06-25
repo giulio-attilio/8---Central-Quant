@@ -57,6 +57,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import requests
+import numpy as np
 import pandas as pd
 import ccxt
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
@@ -1459,6 +1460,22 @@ def get_open_runner():
     return best
 
 
+
+def startup_guard_active():
+    """Retorna se o startup guard ainda está ativo.
+
+    O padrão da Central Quant é 0 segundos; a função existe para evitar
+    erro caso o relatório/health consulte o estado do guard.
+    """
+    try:
+        started_ts = HEALTH.get("started_ts")
+        if not started_ts:
+            return False
+        return (time.time() - float(started_ts)) < float(STARTUP_GUARD_SECONDS)
+    except Exception:
+        return False
+
+
 def refresh_health_stats():
     month_trades = trades_month()
     month_signals = signals_month()
@@ -2519,6 +2536,7 @@ def build_summary(period_name, trades, period_signals_override=None):
 
 def startup():
     HEALTH["started_at"] = data_hora_sp_str()
+    HEALTH["started_ts"] = time.time()
 
     try:
         load_watchlist()
