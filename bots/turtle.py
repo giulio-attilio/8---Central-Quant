@@ -1,7 +1,7 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em TURTLE.
 # ==============================================================================
 # TURTLE BREAKOUT PRO 2.0 - CENTRAL QUANT
-# Versão: 2026-06-24-TURTLE-BREAKOUT-PRO-TP50-PARCIAL50
+# Versão: 2026-06-24-TURTLE-BREAKOUT-PRO-RELATORIOS-PRO
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -2055,6 +2055,463 @@ def reset_paper_route():
     redis_set_json(FUNNEL_KEY, {})
     refresh_health_stats()
     return {"ok": True, "message": "paper resetado"}
+
+
+
+# ==============================================================================
+# REFINOS DE RELATÓRIO - CENTRAL QUANT PRO
+# ===============================================================================
+# Este bloco sobrescreve funções de estatística/relatório mantendo a estratégia
+# Turtle intacta. Objetivo: deixar o Turtle no mesmo padrão dos demais bots.
+
+
+def pf_raw(values):
+    vals = [safe_float(v) for v in values]
+    gross_profit = sum(x for x in vals if x > 0)
+    gross_loss = abs(sum(x for x in vals if x < 0))
+    if gross_profit <= 0 or gross_loss <= 0:
+        return None
+    return gross_profit / gross_loss
+
+
+def fmt_pf(value):
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.2f}"
+    except Exception:
+        return "N/A"
+
+
+def fmt_capture(value):
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.2f}%"
+    except Exception:
+        return "N/A"
+
+
+def calc_stats(trades):
+    trades = trades or []
+    if not trades:
+        return {
+            "count": 0,
+            "wins": 0,
+            "losses": 0,
+            "be": 0,
+            "winrate": 0.0,
+            "pnl_pct": 0.0,
+            "pnl_r": 0.0,
+            "mfe_avg_pct": 0.0,
+            "mae_avg_pct": 0.0,
+            "mfe_avg_r": 0.0,
+            "mae_avg_r": 0.0,
+            "giveback_avg_pct": 0.0,
+            "giveback_avg_r": 0.0,
+            "expectancy_r": 0.0,
+            "expectancy_after_tp50_r": 0.0,
+            "profit_factor_pct": None,
+            "profit_factor_r": None,
+            "trend_capture_pct": None,
+            "top_mfe": [],
+            "runners_3r": 0,
+            "runners_5r": 0,
+            "runners_10r": 0,
+            "tp50_hits": 0,
+            "avg_management_cycles": 0.0,
+            "avg_candles_to_tp50": 0.0,
+            "best_trade": None,
+            "worst_trade": None,
+            "biggest_runner": None,
+            "biggest_loss": None,
+        }
+
+    results_pct = [safe_float(t.get("result_pct")) for t in trades]
+    results_r = [safe_float(t.get("result_r")) for t in trades]
+
+    wins_trades = [t for t in trades if safe_float(t.get("result_pct")) > 0.05]
+    loss_trades = [t for t in trades if safe_float(t.get("result_pct")) < -0.05]
+
+    top = sorted(
+        [
+            {
+                "symbol": t.get("symbol"),
+                "setup": t.get("setup"),
+                "side": t.get("side"),
+                "mfe_pct": safe_float(t.get("mfe_pct")),
+                "mfe_r": safe_float(t.get("mfe_r")),
+                "closed_at": t.get("closed_at"),
+            }
+            for t in trades
+        ],
+        key=lambda x: x["mfe_r"],
+        reverse=True,
+    )[:5]
+
+    best = max(wins_trades, key=lambda t: safe_float(t.get("result_r"))) if wins_trades else None
+    worst = min(loss_trades, key=lambda t: safe_float(t.get("result_r"))) if loss_trades else None
+    biggest_runner = max(trades, key=lambda t: safe_float(t.get("mfe_r"))) if trades else None
+    biggest_loss = min(loss_trades, key=lambda t: safe_float(t.get("result_r"))) if loss_trades else None
+
+    gross_profit_r = sum(x for x in results_r if x > 0)
+    mfe_positive_r = sum([safe_float(t.get("mfe_r")) for t in trades if safe_float(t.get("mfe_r")) > 0])
+    trend_capture = (gross_profit_r / mfe_positive_r * 100.0) if gross_profit_r > 0 and mfe_positive_r > 0 else None
+
+    tp50_trades = [t for t in trades if t.get("tp50_hit")]
+    expectancy_after_tp50 = avg([t.get("result_r") for t in tp50_trades]) if tp50_trades else 0.0
+
+    return {
+        "count": len(trades),
+        "wins": len(wins_trades),
+        "losses": len(loss_trades),
+        "be": sum(1 for x in results_pct if -0.05 <= x <= 0.05),
+        "winrate": len(wins_trades) / len(trades) * 100.0 if trades else 0.0,
+        "pnl_pct": sum(results_pct),
+        "pnl_r": sum(results_r),
+        "mfe_avg_pct": avg([t.get("mfe_pct") for t in trades]),
+        "mae_avg_pct": avg([t.get("mae_pct") for t in trades]),
+        "mfe_avg_r": avg([t.get("mfe_r") for t in trades]),
+        "mae_avg_r": avg([t.get("mae_r") for t in trades]),
+        "giveback_avg_pct": avg([t.get("giveback_pct") for t in trades]),
+        "giveback_avg_r": avg([t.get("giveback_r") for t in trades]),
+        "expectancy_r": avg(results_r),
+        "expectancy_after_tp50_r": expectancy_after_tp50,
+        "profit_factor_pct": pf_raw(results_pct),
+        "profit_factor_r": pf_raw(results_r),
+        "trend_capture_pct": trend_capture,
+        "top_mfe": top,
+        "runners_3r": sum(1 for t in trades if safe_float(t.get("mfe_r")) >= 3.0),
+        "runners_5r": sum(1 for t in trades if safe_float(t.get("mfe_r")) >= 5.0),
+        "runners_10r": sum(1 for t in trades if safe_float(t.get("mfe_r")) >= 10.0),
+        "tp50_hits": sum(1 for t in trades if t.get("tp50_hit")),
+        "avg_management_cycles": avg([t.get("management_cycles") for t in trades]),
+        "avg_candles_to_tp50": avg([t.get("candles_to_tp50") for t in trades if t.get("candles_to_tp50") is not None]),
+        "best_trade": best,
+        "worst_trade": worst,
+        "biggest_runner": biggest_runner,
+        "biggest_loss": biggest_loss,
+    }
+
+
+def build_ranking_month(month_trades):
+    rows = []
+    for setup_key, setup_trades in split_by_setup(month_trades).items():
+        s = calc_stats(setup_trades)
+        if s["count"] <= 0 or s["wins"] <= 0:
+            continue
+
+        rows.append({
+            "name": setup_key,
+            "label": SETUPS[setup_key]["label"],
+            "trades": s["count"],
+            "profit_factor_r": s["profit_factor_r"],
+            "expectancy_r": s["expectancy_r"],
+            "pnl_r": s["pnl_r"],
+            "winrate": s["winrate"],
+        })
+
+    rows.sort(key=lambda x: (
+        safe_float(x.get("expectancy_r")),
+        safe_float(x.get("profit_factor_r")),
+        safe_float(x.get("winrate")),
+    ), reverse=True)
+    return rows
+
+
+def count_open_runners():
+    positions = get_positions()
+    vals = [safe_float(p.get("mfe_r")) for p in positions.values()]
+    return {
+        "open_runners_3r": sum(1 for r in vals if r >= 3.0),
+        "open_runners_5r": sum(1 for r in vals if r >= 5.0),
+        "open_runners_10r": sum(1 for r in vals if r >= 10.0),
+    }
+
+
+def refresh_health_stats():
+    month_trades = trades_month()
+    month_signals = signals_month()
+    today_trades = trades_today()
+    today_signals = signals_today()
+    today_events = [e for e in get_events() if str(e.get("created_at", "")).startswith(date_key_br())]
+
+    stats = calc_stats(month_trades)
+    HEALTH["funnel_today"] = funnel_snapshot()
+
+    HEALTH["signals_today"] = len(today_signals)
+    HEALTH["signals_month"] = len(month_signals)
+    HEALTH["trades_closed_today"] = len(today_trades)
+    HEALTH["trades_closed_month"] = len(month_trades)
+
+    HEALTH["signals_turtle20_today"] = sum(1 for s in today_signals if s.get("setup") == "TURTLE20")
+    HEALTH["signals_turtle55_today"] = sum(1 for s in today_signals if s.get("setup") == "TURTLE55")
+    HEALTH["signals_buy_today"] = sum(1 for s in today_signals if s.get("side") == "LONG")
+    HEALTH["signals_sell_today"] = sum(1 for s in today_signals if s.get("side") == "SHORT")
+
+    HEALTH["tp50_today"] = sum(1 for e in today_events if e.get("event_type") == "TP50")
+    HEALTH["be_today"] = sum(1 for e in today_events if e.get("event_type") == "BE")
+    HEALTH["stops_today"] = sum(1 for e in today_events if e.get("event_type") == "STOP")
+    HEALTH["turtle_exits_today"] = sum(1 for e in today_events if str(e.get("event_type", "")).startswith("SAÍDA TURTLE"))
+
+    HEALTH["mfe_avg_pct"] = round(stats["mfe_avg_pct"], 4)
+    HEALTH["mae_avg_pct"] = round(stats["mae_avg_pct"], 4)
+    HEALTH["mfe_avg_r"] = round(stats["mfe_avg_r"], 4)
+    HEALTH["mae_avg_r"] = round(stats["mae_avg_r"], 4)
+    HEALTH["giveback_avg_pct"] = round(stats["giveback_avg_pct"], 4)
+    HEALTH["giveback_avg_r"] = round(stats["giveback_avg_r"], 4)
+    HEALTH["expectancy_r"] = round(stats["expectancy_r"], 4)
+    HEALTH["expectancy_after_tp50_r"] = round(stats["expectancy_after_tp50_r"], 4)
+    HEALTH["profit_factor_pct"] = stats["profit_factor_pct"]
+    HEALTH["profit_factor_r"] = stats["profit_factor_r"]
+    HEALTH["trend_capture_pct"] = stats["trend_capture_pct"]
+
+    open_runner = get_open_runner()
+    if open_runner:
+        HEALTH["open_runner_symbol"] = open_runner.get("symbol")
+        HEALTH["open_runner_setup"] = open_runner.get("setup")
+        HEALTH["open_runner_side"] = open_runner.get("side")
+        HEALTH["open_runner_r"] = round(safe_float(open_runner.get("mfe_r")), 4)
+        HEALTH["open_runner_pct"] = round(safe_float(open_runner.get("mfe_pct")), 4)
+    else:
+        HEALTH["open_runner_symbol"] = None
+        HEALTH["open_runner_setup"] = None
+        HEALTH["open_runner_side"] = None
+        HEALTH["open_runner_r"] = 0.0
+        HEALTH["open_runner_pct"] = 0.0
+
+    HEALTH.update(count_open_runners())
+    HEALTH["top_mfe_month"] = stats["top_mfe"]
+    HEALTH["runners_3r"] = stats["runners_3r"]
+    HEALTH["runners_5r"] = stats["runners_5r"]
+    HEALTH["runners_10r"] = stats["runners_10r"]
+
+    HEALTH["setups"] = {setup_key: calc_stats(setup_trades) for setup_key, setup_trades in split_by_setup(month_trades).items()}
+    HEALTH["directions"] = {direction: calc_stats(direction_trades) for direction, direction_trades in split_by_direction(month_trades).items()}
+    HEALTH["ranking_month"] = build_ranking_month(month_trades)
+    HEALTH["best_setup"] = HEALTH["ranking_month"][0]["name"] if HEALTH["ranking_month"] else None
+    HEALTH["worst_setup"] = HEALTH["ranking_month"][-1]["name"] if HEALTH["ranking_month"] else None
+    HEALTH["positions_limit"] = MAX_OPEN_POSITIONS
+    HEALTH["startup_signal_grace_seconds"] = STARTUP_SIGNAL_GRACE_SECONDS
+    HEALTH["startup_signal_guard_active"] = startup_guard_active()
+    HEALTH["telegram_configured"] = bool(TOKEN and CHAT_ID)
+    HEALTH["mode"] = "PAPER"
+    HEALTH["last_summary_run"] = data_hora_sp_str()
+
+    # Limpa warning antigo de getUpdates quando os comandos estão centralizados no roteador da Central.
+    if "getUpdates 409" in str(HEALTH.get("last_warning") or ""):
+        HEALTH["last_warning"] = None
+
+
+def setup_summary_lines(trades):
+    by_setup = split_by_setup(trades)
+    lines = []
+    for setup_key, setup_trades in by_setup.items():
+        s = calc_stats(setup_trades)
+        label = SETUPS[setup_key]["label"]
+        lines.append(
+            f"{label}:\n"
+            f"Trades: {s['count']} | WR: {s['winrate']:.2f}%\n"
+            f"PF %: {fmt_pf(s['profit_factor_pct'])} | PF R: {fmt_pf(s['profit_factor_r'])}\n"
+            f"Expectancy: {fmt_r(s['expectancy_r'])}\n"
+            f"Expectancy pós-TP50: {fmt_r(s['expectancy_after_tp50_r'])}\n"
+            f"Captura: {fmt_capture(s['trend_capture_pct'])}\n"
+            f"PnL: {fmt_pct(s['pnl_pct'])} | {fmt_r(s['pnl_r'])}\n"
+            f"MFE médio: {fmt_pct(s['mfe_avg_pct'])} | {fmt_r(s['mfe_avg_r'])}\n"
+            f"MAE médio: {fmt_pct(s['mae_avg_pct'])} | {fmt_r(s['mae_avg_r'])}\n"
+            f"Devolução média: {fmt_pct(s['giveback_avg_pct'])} | {fmt_r(s['giveback_avg_r'])}"
+        )
+    return "\n\n".join(lines) if lines else "N/A"
+
+
+def direction_summary_lines(trades):
+    lines = []
+    for direction, direction_trades in split_by_direction(trades).items():
+        s = calc_stats(direction_trades)
+        lines.append(
+            f"{direction}:\n"
+            f"Trades: {s['count']} | WR: {s['winrate']:.2f}%\n"
+            f"PF R: {fmt_pf(s['profit_factor_r'])} | Expectancy: {fmt_r(s['expectancy_r'])}\n"
+            f"Expectancy pós-TP50: {fmt_r(s['expectancy_after_tp50_r'])}\n"
+            f"PnL: {fmt_pct(s['pnl_pct'])} | {fmt_r(s['pnl_r'])}"
+        )
+    return "\n\n".join(lines) if lines else "N/A"
+
+
+def ranking_text_from_rows(rows):
+    if not rows:
+        return "N/A - nenhum setup com trade vencedor ainda."
+    lines = []
+    for i, row in enumerate(rows, 1):
+        lines.append(
+            f"{i}. {row['label']} | Trades: {row['trades']} | PF R: {fmt_pf(row['profit_factor_r'])} | Exp: {fmt_r(row['expectancy_r'])} | WR: {row['winrate']:.2f}%"
+        )
+    return "\n".join(lines)
+
+
+def trade_line(trade, metric="result"):
+    if not trade:
+        if metric == "result":
+            return "Nenhum trade vencedor."
+        if metric == "worst":
+            return "Nenhum trade perdedor."
+        return "N/A"
+    if metric == "mfe":
+        return f"{trade.get('symbol')} {trade.get('setup')} {fmt_pct(trade.get('mfe_pct'))} | {fmt_r(trade.get('mfe_r'))}"
+    return f"{trade.get('symbol')} {trade.get('setup')} {fmt_pct(trade.get('result_pct'))} | {fmt_r(trade.get('result_r'))}"
+
+
+def positions_text():
+    positions = get_positions()
+    if not positions:
+        return "🐢 Turtle: nenhuma posição paper aberta."
+
+    lines = ["🐢 POSIÇÕES TURTLE PAPER\n"]
+
+    for p in positions.values():
+        price = safe_fetch_price(p["symbol"])
+        current = ""
+        if price:
+            pnl = pnl_pct_for_side(p["side"], p["entry"], price)
+            rr = r_for_side(p["side"], p["entry"], p.get("initial_stop", p["stop"]), price)
+            current = f"Atual: {fmt_price(price)} | {fmt_pct(pnl)} | {fmt_r(rr)}\n"
+
+        if p.get("tp50_hit") and p.get("be_moved"):
+            status_txt = "TP50 + BREAKEVEN ✅"
+        elif p.get("tp50_hit"):
+            status_txt = "TP50 ✅"
+        elif p.get("be_moved"):
+            status_txt = "BREAKEVEN ✅"
+        else:
+            status_txt = "ABERTA"
+
+        partial_txt = ""
+        if p.get("tp50_hit"):
+            partial_txt = (
+                f"Parcial TP50: {safe_float(p.get('partial_pct'), TP50_PARTIAL_PCT):.0f}% | "
+                f"{fmt_pct(p.get('partial_result_pct', 0))} | {fmt_r(p.get('partial_result_r', 0))}\n"
+            )
+
+        lines.append(
+            f"{p.get('setup_label', p.get('setup'))} - {p['symbol']} {p['side']}\n"
+            f"Status: {status_txt}\n"
+            f"Entrada: {fmt_price(p['entry'])}\n"
+            f"SL: {fmt_price(p['stop'])}\n"
+            f"TP50: {fmt_price(p['tp50'])}\n"
+            f"{partial_txt}"
+            f"{current}"
+            f"MFE: {fmt_pct(p.get('mfe_pct', 0))} | {fmt_r(p.get('mfe_r', 0))}\n"
+            f"MAE: {fmt_pct(p.get('mae_pct', 0))} | {fmt_r(p.get('mae_r', 0))}\n"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900] + "\n\n..."
+    return text
+
+
+def build_summary(period_name, trades, period_signals_override=None):
+    refresh_health_stats()
+    stats = calc_stats(trades)
+    positions = get_positions()
+    open_by_setup = {k: 0 for k in SETUPS}
+    for p in positions.values():
+        setup = p.get("setup")
+        if setup in open_by_setup:
+            open_by_setup[setup] += 1
+
+    if period_signals_override is not None:
+        period_signals = period_signals_override
+    else:
+        period_signals = signals_today() if period_name == "DIA" else signals_month()
+
+    top_lines = []
+    for item in stats["top_mfe"]:
+        top_lines.append(
+            f"{item.get('symbol')} {item.get('setup')} {fmt_pct(item.get('mfe_pct'))} | {fmt_r(item.get('mfe_r'))}"
+        )
+    top_text = "\n".join(top_lines) if top_lines else "N/A"
+
+    setup_text = setup_summary_lines(trades)
+    direction_text = direction_summary_lines(trades)
+    ranking_text = ranking_text_from_rows(build_ranking_month(trades))
+    open_runners = count_open_runners()
+
+    return (
+        f"🐢 RESUMO TURTLE BREAKOUT PRO 2.0 - {period_name}\n"
+        f"{agora_sp().strftime('%d/%m/%Y')}\n\n"
+        f"Sinais Turtle: {len(period_signals)}\n"
+        f"Turtle 20: {sum(1 for s in period_signals if s.get('setup') == 'TURTLE20')}\n"
+        f"Turtle 55: {sum(1 for s in period_signals if s.get('setup') == 'TURTLE55')}\n"
+        f"LONG: {sum(1 for s in period_signals if s.get('side') == 'LONG')}\n"
+        f"SHORT: {sum(1 for s in period_signals if s.get('side') == 'SHORT')}\n\n"
+        f"🐢 FUNIL TURTLE\n"
+        f"Ativos analisados: {HEALTH.get('funnel_today', {}).get('ativos_analisados', 0)}\n"
+        f"Rompimentos 20 BUY: {HEALTH.get('funnel_today', {}).get('rompimentos_20_buy', 0)}\n"
+        f"Rompimentos 20 SELL: {HEALTH.get('funnel_today', {}).get('rompimentos_20_sell', 0)}\n"
+        f"Rompimentos 55 BUY: {HEALTH.get('funnel_today', {}).get('rompimentos_55_buy', 0)}\n"
+        f"Rompimentos 55 SELL: {HEALTH.get('funnel_today', {}).get('rompimentos_55_sell', 0)}\n"
+        f"Reprovados por ATR: {HEALTH.get('funnel_today', {}).get('reprovados_atr', 0)}\n"
+        f"Reprovados por risco: {HEALTH.get('funnel_today', {}).get('reprovados_risco', 0)}\n"
+        f"Reprovados por score: {HEALTH.get('funnel_today', {}).get('reprovados_score', 0)}\n"
+        f"Reprovados por volume: {HEALTH.get('funnel_today', {}).get('reprovados_volume', 0)}\n"
+        f"Reprovados por ADX: {HEALTH.get('funnel_today', {}).get('reprovados_adx', 0)}\n"
+        f"Reprovados por cooldown: {HEALTH.get('funnel_today', {}).get('reprovados_cooldown', 0)}\n"
+        f"Reprovados por posição ativa: {HEALTH.get('funnel_today', {}).get('reprovados_posicao_ativa', 0)}\n"
+        f"Sinais enviados: {HEALTH.get('funnel_today', {}).get('sinais_enviados', 0)}\n\n"
+        f"Trades encerrados: {stats['count']}\n"
+        f"Wins: {stats['wins']}\n"
+        f"Breakeven: {stats['be']}\n"
+        f"Loss: {stats['losses']}\n"
+        f"Win rate: {stats['winrate']:.2f}%\n"
+        f"Profit Factor %: {fmt_pf(stats['profit_factor_pct'])}\n"
+        f"Profit Factor R: {fmt_pf(stats['profit_factor_r'])}\n"
+        f"Expectancy: {fmt_r(stats['expectancy_r'])} por trade\n"
+        f"Expectancy pós-TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
+        f"Captura de tendência: {fmt_capture(stats['trend_capture_pct'])}\n\n"
+        f"TP50 atingidos: {stats['tp50_hits']}\n"
+        f"Tempo médio até TP50: {stats['avg_candles_to_tp50']:.1f} ciclos de gestão\n"
+        f"Tempo médio até fechamento: {stats['avg_management_cycles']:.1f} ciclos de gestão\n"
+        f"Tempo médio em trade: {stats['avg_management_cycles']:.1f} ciclos de gestão\n"
+        f"Stops: {HEALTH['stops_today'] if period_name == 'DIA' else 'ver eventos'}\n"
+        f"Saídas Turtle: {HEALTH['turtle_exits_today'] if period_name == 'DIA' else 'ver eventos'}\n\n"
+        f"PnL realizado:\n"
+        f"{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
+        f"MFE médio:\n"
+        f"{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n\n"
+        f"MAE médio:\n"
+        f"{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n\n"
+        f"Devolução média:\n"
+        f"{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
+        f"Maior runner aberto:\n"
+        f"{HEALTH.get('open_runner_symbol') or 'N/A'} {HEALTH.get('open_runner_setup') or ''} {fmt_pct(HEALTH.get('open_runner_pct', 0))} | {fmt_r(HEALTH.get('open_runner_r', 0))}\n\n"
+        f"Runners fechados:\n"
+        f"3R+: {stats['runners_3r']}\n"
+        f"5R+: {stats['runners_5r']}\n"
+        f"10R+: {stats['runners_10r']}\n\n"
+        f"Runners abertos:\n"
+        f"3R+: {open_runners['open_runners_3r']}\n"
+        f"5R+: {open_runners['open_runners_5r']}\n"
+        f"10R+: {open_runners['open_runners_10r']}\n\n"
+        f"Por setup:\n"
+        f"{setup_text}\n\n"
+        f"Por direção:\n"
+        f"{direction_text}\n\n"
+        f"Ranking dos setups:\n"
+        f"{ranking_text}\n\n"
+        f"Top 5 MFE do período:\n"
+        f"{top_text}\n\n"
+        f"Maior runner do dia/periodo fechado:\n"
+        f"{trade_line(stats['biggest_runner'], metric='mfe')}\n\n"
+        f"Melhor trade realizado:\n"
+        f"{trade_line(stats['best_trade'])}\n\n"
+        f"Pior trade realizado:\n"
+        f"{trade_line(stats['worst_trade'], metric='worst')}\n\n"
+        f"Trades ainda ativos: {len(positions)}\n"
+        f"Turtle20 ativos: {open_by_setup.get('TURTLE20', 0)}\n"
+        f"Turtle55 ativos: {open_by_setup.get('TURTLE55', 0)}\n\n"
+        f"Modo: PAPER / SEM BINGX"
+    )
 
 # ==============================================================================
 # STARTUP
