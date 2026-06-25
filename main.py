@@ -627,6 +627,224 @@ def runners():
     }
 
 
+
+
+
+
+@app.route("/relatorio")
+def relatorio_curto():
+    return {"text": build_central_report("curto")}
+
+
+@app.route("/relatorio/completo")
+def relatorio_completo():
+    return {"text": build_central_report("completo")}
+
+
+@app.route("/relatorio/<key>")
+def relatorio_bot(key):
+    bot_key = REPORT_BOT_ALIASES.get(str(key).lower(), str(key).upper())
+    if bot_key not in BOT_CONFIGS:
+        return {"error": "bot inválido"}, 404
+    return {"text": build_central_report("completo", bot_key=bot_key)}
+
+
+# ==========================================================
+# CENTRAL REPORT BUILDER
+# ==========================================================
+# Comandos/rotas:
+# - /relatorio           -> relatório consolidado resumido
+# - /relatorio completo  -> relatório completo com health/funil/eventos/resumo
+# - /relatorio <bot>     -> relatório completo de um bot
+# - /relatorio curto     -> igual ao resumido
+
+REPORT_COMMANDS = {"/relatorio", "/relatório", "/report"}
+REPORT_BOT_ALIASES = {
+    "trend": "TRENDPRO",
+    "trendpro": "TRENDPRO",
+    "trend_pro": "TRENDPRO",
+    "trend-pro": "TRENDPRO",
+    "donkey": "DONKEY",
+    "cobra": "COBRA",
+    "meme": "MEME",
+    "predator": "PREDATOR",
+    "smart": "PREDATOR",
+    "smartpredator": "PREDATOR",
+    "turtle": "TURTLE",
+    "falcon": "FALCON",
+}
+
+
+def _short(value, max_len=1200):
+    txt = "" if value is None else str(value)
+    if len(txt) <= max_len:
+        return txt
+    return txt[:max_len].rstrip() + "\n... [cortado]"
+
+
+def _clean_warning(value):
+    if not value:
+        return None
+    txt = str(value)
+    # getUpdates 409 é resíduo arquitetural de comando Telegram; não é falha operacional
+    # quando scanner/gestão seguem recentes. Mantemos como observação, não alerta crítico.
+    return txt
+
+
+def _bot_report_health_text(key: str):
+    cfg = BOT_CONFIGS.get(key)
+    if not cfg:
+        return f"{key}: bot inválido"
+    b = bot_health(key, cfg)
+    h = b.get("health", {}) or {}
+    warning = _clean_warning(h.get("last_warning"))
+    return (
+        f"{key} - {b.get('name')}\n"
+        f"enabled: {b.get('enabled')} | loaded: {b.get('loaded')} | ok: {not bool(b.get('load_error') or b.get('last_error'))}\n"
+        f"scanner: {b.get('last_scanner_run')} ({b.get('minutes_since_scanner')} min)\n"
+        f"gestão: {b.get('last_management_run')} ({b.get('minutes_since_management')} min)\n"
+        f"erro: {b.get('last_error')}\n"
+        f"warning: {warning}\n"
+        f"watchdog: {h.get('watchdog_last_status') or h.get('watchdog_status')}\n"
+        f"watchlist: {h.get('watchlist_valid')}/{h.get('watchlist_total')} inválidos={h.get('watchlist_invalid', [])}\n"
+        f"posições: {h.get('last_positions_count')} | sinais ciclo: {h.get('last_signals_sent')}"
+    )
+
+
+def _bot_funil_text(key: str, module):
+    if key == "TURTLE":
+        return _json_or_text(_call_first(module, ["funnel_text"]))
+    if key == "FALCON":
+        return _json_or_text(_call_first(module, ["funnel_text"]))
+    return _json_or_text(_call_first(module, [
+        "montar_funil_texto", "montar_funil", "funnel_text", "funil_texto", "build_funnel_text"
+    ]))
+
+
+def _bot_eventos_text(key: str, module):
+    if key == "TURTLE":
+        return _json_or_text(_call_first(module, ["events_text"]))
+    if key == "FALCON":
+        return _json_or_text(_call_first(module, ["events_text"]))
+    return _json_or_text(_call_first(module, [
+        "montar_eventos_texto", "events_text", "eventos_texto", "build_events_text"
+    ]))
+
+
+def _bot_resumo_text(key: str, module):
+    if key in {"TURTLE", "FALCON"}:
+        if hasattr(module, "build_summary") and hasattr(module, "trades_today"):
+            return module.build_summary("DIA", module.trades_today())
+    return _json_or_text(_call_first(module, [
+        "montar_resumo_diario", "build_daily_summary", "summary_text", "build_summary_text", "resumo_texto"
+    ]))
+
+
+def build_single_bot_report(key: str, complete: bool = True):
+    key = str(key).upper()
+    cfg = BOT_CONFIGS.get(key)
+    if not cfg:
+        return f"Bot inválido: {key}"
+    module = LOADED_BOTS.get(key)
+
+    parts = [f"🤖 RELATÓRIO {key} - {cfg.get('name')}\n", "🩺 HEALTH\n" + _bot_report_health_text(key)]
+
+    if module is None:
+        return "\n\n".join(parts + [f"Módulo não carregado: {LOAD_ERRORS.get(key)}"])
+
+    funil = _bot_funil_text(key, module)
+    eventos = _bot_eventos_text(key, module)
+    resumo = _bot_resumo_text(key, module)
+
+    if funil and funil != "None":
+        parts.append("📈 FUNIL\n" + _short(funil, 2200 if complete else 900))
+    if eventos and eventos != "None":
+        parts.append("📋 EVENTOS\n" + _short(eventos, 2200 if complete else 900))
+    if resumo and resumo != "None":
+        parts.append("📊 RESUMO\n" + _short(resumo, 3000 if complete else 1200))
+
+    return "\n\n".join(parts)
+
+
+def build_central_status_text():
+    status = central_watchdog_status()
+    exposure_snapshot = central_exposure_snapshot()
+    best = exposure_snapshot.get("best_open_runner") or {}
+    lines = [
+        f"📊 RELATÓRIO CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Status: {status.get('status')} | OK: {status.get('ok')}",
+        f"Central iniciou: {status.get('central_started_at')}",
+        f"Motivos: {status.get('reasons', [])}",
+        "",
+        "📌 EXPOSIÇÃO",
+        f"Total: {exposure_snapshot.get('total_positions_open')}",
+        f"LONG: {exposure_snapshot.get('long_positions_open')}",
+        f"SHORT: {exposure_snapshot.get('short_positions_open')}",
+        f"Runners abertos: {exposure_snapshot.get('open_runners')}",
+    ]
+    if best:
+        lines += [
+            "",
+            "🏃 Melhor runner aberto",
+            f"{best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')}",
+            f"{best.get('runner_pct')}% | {best.get('runner_r')}R",
+        ]
+
+    lines.append("")
+    lines.append("🤖 BOTS")
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+        ok = bool(b.get("enabled")) and bool(b.get("loaded")) and not b.get("load_error") and not b.get("last_error")
+        emoji = "✅" if ok else ("⚠️" if b.get("enabled") else "⏸️")
+        lines.append(
+            f"{emoji} {key}: loaded={b.get('loaded')} | scanner={b.get('minutes_since_scanner')}m | "
+            f"gestão={b.get('minutes_since_management')}m | pos={h.get('last_positions_count')} | "
+            f"erro={b.get('last_error')} | warning={h.get('last_warning')}"
+        )
+    return "\n".join(lines)
+
+
+def build_central_report(mode: str = "curto", bot_key: str = None):
+    mode = (mode or "curto").lower().strip()
+    complete = mode in {"completo", "full", "complete"}
+
+    if bot_key:
+        return build_single_bot_report(bot_key, complete=True)
+
+    if not complete:
+        return build_central_status_text()
+
+    parts = [build_central_status_text()]
+    parts.append("\n\n==============================\nCHECKLIST COMPLETO DOS BOTS\n==============================")
+    for key in BOT_CONFIGS.keys():
+        parts.append(build_single_bot_report(key, complete=True))
+    return "\n\n==============================\n".join(parts)
+
+
+def parse_report_command(text: str):
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    raw_no_mention = raw.split("@", 1)[0] if raw.startswith("/") and "@" in raw.split()[0] else raw
+    parts = raw_no_mention.lower().split()
+    if not parts or parts[0] not in REPORT_COMMANDS:
+        return None
+
+    mode = "curto"
+    bot_key = None
+    for p in parts[1:]:
+        p = p.strip().lower().replace("/", "")
+        if p in {"completo", "full", "complete"}:
+            mode = "completo"
+        elif p in {"curto", "resumido", "short"}:
+            mode = "curto"
+        elif p in REPORT_BOT_ALIASES:
+            bot_key = REPORT_BOT_ALIASES[p]
+            mode = "completo"
+    return mode, bot_key
+
 # ==========================================================
 # CENTRAL TELEGRAM COMMAND ROUTER
 # ==========================================================
@@ -714,7 +932,13 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     Converte comandos padronizados em resposta textual.
     Mantém a lógica individual em cada bot e só padroniza o acesso pela Central.
     """
-    cmd = (cmd or "").strip().lower().split("@")[0]
+    raw_cmd = (cmd or "").strip()
+    parsed_report = parse_report_command(raw_cmd)
+    if parsed_report:
+        mode, bot_key = parsed_report
+        return build_central_report(mode, bot_key=bot_key)
+
+    cmd = raw_cmd.lower().split()[0].split("@")[0] if raw_cmd else ""
 
     # TURTLE tem handle_command próprio, mas ele envia pelo próprio módulo.
     # Preferimos respostas diretas para evitar depender do CHAT_ID interno.
@@ -740,7 +964,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         if cmd in ["/start", "/comandos"]:
             return (
                 "🐢 COMANDOS TURTLE BREAKOUT PRO 2.0\n\n"
-                "/health\n/posicoes\n/resumo\n/funil\n/eventos\n/top\n/ranking"
+                "/health\n/posicoes\n/resumo\n/funil\n/eventos\n/top\n/ranking\n/relatorio\n/relatorio completo"
             )
 
     if key == "FALCON":
@@ -760,7 +984,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
                 wl = module.load_watchlist()
                 return "🦅 WATCHLIST FALCON\n\n" + "\n".join([str(x) for x in wl[:100]])
         if cmd in ["/start", "/comandos"]:
-            return "🦅 Comandos Falcon:\n/health\n/posicoes\n/resumo\n/funil\n/eventos\n/watchlist"
+            return "🦅 Comandos Falcon:\n/health\n/posicoes\n/resumo\n/funil\n/eventos\n/watchlist\n/relatorio\n/relatorio completo"
 
     # Padrão genérico para outros bots, caso você ligue o roteador central depois.
     if cmd == "/health":
@@ -814,8 +1038,7 @@ def central_command_router_loop(key: str, cfg: dict):
                     telegram_send_with_token(token, chat_id, f"{cfg.get('name', key)} não carregado na Central.")
                     continue
 
-                cmd = text.split()[0].lower().split("@")[0]
-                reply = build_command_reply_for_module(key, module, cmd)
+                reply = build_command_reply_for_module(key, module, text)
                 if reply:
                     telegram_send_with_token(token, chat_id, reply)
                     health = getattr(module, "HEALTH", None)
