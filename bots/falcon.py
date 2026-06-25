@@ -1612,7 +1612,7 @@ def start_threads():
     threading.Thread(target=run_thread_guarded, args=("scanner", scanner_loop), daemon=True).start()
     threading.Thread(target=run_thread_guarded, args=("management", management_loop), daemon=True).start()
     threading.Thread(target=run_thread_guarded, args=("summary", summary_loop), daemon=True).start()
-    threading.Thread(target=run_thread_guarded, args=("commands", commands_loop), daemon=True).start()
+    # threading.Thread(target=run_thread_guarded, args=("commands", commands_loop), daemon=True).start()
     threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
 
 
