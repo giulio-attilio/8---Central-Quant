@@ -1,7 +1,7 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em TURTLE.
 # ==============================================================================
 # TURTLE BREAKOUT PRO 2.0 - CENTRAL QUANT
-# Versão: 2026-06-24-TURTLE-BREAKOUT-PRO-FILTROS-VOLUME-ADX-LIMITE
+# Versão: 2026-06-24-TURTLE-BREAKOUT-PRO-TP50-PARCIAL50
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -95,6 +95,14 @@ OHLCV_LIMIT = int(os.environ.get("TURTLE_OHLCV_LIMIT", "220"))
 ATR_LEN = int(os.environ.get("TURTLE_ATR_LEN", "14"))
 ATR_STOP_MULT = float(os.environ.get("TURTLE_ATR_STOP_MULT", "2.0"))
 TP50_R = float(os.environ.get("TURTLE_TP50_R", "0.8"))
+
+# Gestão de parcial:
+# - Ao bater TP50, considera 50% realizado no preço do TP50/preço atual.
+# - O restante continua aberto com stop em BE.
+# - O resultado final do trade passa a ser: parcial realizada + restante encerrado.
+TP50_PARTIAL_ENABLED = str(os.environ.get("TURTLE_TP50_PARTIAL_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+TP50_PARTIAL_PCT = float(os.environ.get("TURTLE_TP50_PARTIAL_PCT", "50"))
+TP50_REMAINING_PCT = max(0.0, 100.0 - TP50_PARTIAL_PCT)
 
 MIN_ATR_PCT = float(os.environ.get("TURTLE_MIN_ATR_PCT", "0.25"))
 MAX_RISK_PCT = float(os.environ.get("TURTLE_MAX_RISK_PCT", "6.0"))
@@ -1071,8 +1079,28 @@ def close_position(pid, pos, exit_price, reason):
     initial_stop = safe_float(pos.get("initial_stop", pos["stop"]))
     side = pos["side"]
 
-    result_pct = pnl_pct_for_side(side, entry, exit_price)
-    result_r = r_for_side(side, entry, initial_stop, exit_price)
+    remainder_pct = pnl_pct_for_side(side, entry, exit_price)
+    remainder_r = r_for_side(side, entry, initial_stop, exit_price)
+
+    partial_enabled = bool(pos.get("tp50_hit")) and TP50_PARTIAL_ENABLED
+    partial_fraction = safe_float(pos.get("partial_fraction"), TP50_PARTIAL_PCT / 100.0)
+    remaining_fraction = safe_float(pos.get("remaining_fraction"), TP50_REMAINING_PCT / 100.0)
+
+    if partial_enabled:
+        partial_price = safe_float(pos.get("partial_price"), safe_float(pos.get("tp50"), exit_price))
+        partial_pct = safe_float(pos.get("partial_result_pct"), pnl_pct_for_side(side, entry, partial_price))
+        partial_r = safe_float(pos.get("partial_result_r"), r_for_side(side, entry, initial_stop, partial_price))
+
+        result_pct = (partial_pct * partial_fraction) + (remainder_pct * remaining_fraction)
+        result_r = (partial_r * partial_fraction) + (remainder_r * remaining_fraction)
+    else:
+        partial_price = None
+        partial_pct = 0.0
+        partial_r = 0.0
+        partial_fraction = 0.0
+        remaining_fraction = 1.0
+        result_pct = remainder_pct
+        result_r = remainder_r
 
     giveback_pct = safe_float(pos.get("mfe_pct")) - result_pct
     giveback_r = safe_float(pos.get("mfe_r")) - result_r
@@ -1084,6 +1112,14 @@ def close_position(pid, pos, exit_price, reason):
             "exit_price": exit_price,
             "exit_reason": reason,
             "closed_at": data_hora_sp_str(),
+            "partial_enabled": partial_enabled,
+            "partial_price": partial_price,
+            "partial_pct": partial_fraction * 100.0,
+            "remaining_pct": remaining_fraction * 100.0,
+            "partial_result_pct": partial_pct,
+            "partial_result_r": partial_r,
+            "remainder_result_pct": remainder_pct,
+            "remainder_result_r": remainder_r,
             "result_pct": result_pct,
             "result_r": result_r,
             "giveback_pct": giveback_pct,
@@ -1101,13 +1137,25 @@ def close_position(pid, pos, exit_price, reason):
     else:
         emoji = "🟡"
 
+    partial_txt = ""
+    if partial_enabled:
+        partial_txt = (
+            f"\nParcial TP50:\n"
+            f"{partial_fraction * 100:.0f}% em {fmt_price(partial_price)} | "
+            f"{fmt_pct(partial_pct)} | {fmt_r(partial_r)}\n"
+            f"Restante:\n"
+            f"{remaining_fraction * 100:.0f}% encerrado em {fmt_price(exit_price)} | "
+            f"{fmt_pct(remainder_pct)} | {fmt_r(remainder_r)}\n"
+        )
+
     safe_send_telegram(
         f"🐢 SAÍDA {pos.get('setup_label', pos.get('setup'))} - {pos['symbol']}\n\n"
         f"Direção: {side}\n"
         f"Entrada: {fmt_price(entry)}\n"
         f"Saída: {fmt_price(exit_price)}\n"
-        f"Motivo: {reason}\n\n"
-        f"Resultado: {fmt_pct(result_pct)} | {fmt_r(result_r)}\n"
+        f"Motivo: {reason}\n"
+        f"{partial_txt}\n"
+        f"Resultado consolidado:\n{fmt_pct(result_pct)} | {fmt_r(result_r)}\n"
         f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}\n"
         f"MAE: {fmt_pct(pos.get('mae_pct', 0))} | {fmt_r(pos.get('mae_r', 0))}\n"
         f"Devolução: {fmt_pct(giveback_pct)} | {fmt_r(giveback_r)}\n\n"
@@ -1115,7 +1163,6 @@ def close_position(pid, pos, exit_price, reason):
     )
 
     return trade
-
 
 def management_loop():
     while True:
@@ -1154,16 +1201,47 @@ def management_loop():
                         pos["be_moved"] = True
                         pos["stop"] = entry
                         pos["candles_to_tp50"] = int(pos.get("management_cycles", 0))
+
+                        partial_fraction = TP50_PARTIAL_PCT / 100.0 if TP50_PARTIAL_ENABLED else 0.0
+                        remaining_fraction = max(0.0, 1.0 - partial_fraction)
+                        partial_pct = pnl_pct_for_side(side, entry, price)
+                        partial_r = r_for_side(side, entry, safe_float(pos.get("initial_stop", stop)), price)
+
+                        pos["partial_enabled"] = TP50_PARTIAL_ENABLED
+                        pos["partial_price"] = price
+                        pos["partial_pct"] = TP50_PARTIAL_PCT if TP50_PARTIAL_ENABLED else 0.0
+                        pos["remaining_pct"] = TP50_REMAINING_PCT if TP50_PARTIAL_ENABLED else 100.0
+                        pos["partial_fraction"] = partial_fraction
+                        pos["remaining_fraction"] = remaining_fraction
+                        pos["partial_result_pct"] = partial_pct
+                        pos["partial_result_r"] = partial_r
+                        pos["partial_realized_pct"] = partial_pct * partial_fraction
+                        pos["partial_realized_r"] = partial_r * partial_fraction
                         changed = True
 
-                        record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"]})
+                        record_event(
+                            "TP50",
+                            pos,
+                            {
+                                "price": price,
+                                "candles_to_tp50": pos["candles_to_tp50"],
+                                "partial_pct": pos["partial_pct"],
+                                "partial_result_pct": partial_pct,
+                                "partial_result_r": partial_r,
+                                "partial_realized_pct": pos["partial_realized_pct"],
+                                "partial_realized_r": pos["partial_realized_r"],
+                            }
+                        )
                         record_event("BE", pos, {"new_stop": entry})
 
                         safe_send_telegram(
                             f"🐢 TP50 {pos.get('setup_label', pos.get('setup'))} - {symbol}\n\n"
                             f"Direção: {side}\n"
                             f"Preço atual: {fmt_price(price)}\n"
-                            f"Stop movido para BE: {fmt_price(entry)}\n"
+                            f"Parcial realizada: {TP50_PARTIAL_PCT:.0f}% ✅\n"
+                            f"Resultado da parcial: {fmt_pct(partial_pct)} | {fmt_r(partial_r)}\n"
+                            f"Lucro garantido na posição total: {fmt_pct(pos['partial_realized_pct'])} | {fmt_r(pos['partial_realized_r'])}\n"
+                            f"Stop do restante movido para BE: {fmt_price(entry)}\n"
                             f"Tempo até TP50: {pos['candles_to_tp50']} ciclos de gestão\n\n"
                             f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}"
                         )
@@ -1547,6 +1625,8 @@ def build_summary(period_name, trades, period_signals_override=None):
         f"Reprovados por ATR: {HEALTH.get('funnel_today', {}).get('reprovados_atr', 0)}\n"
         f"Reprovados por risco: {HEALTH.get('funnel_today', {}).get('reprovados_risco', 0)}\n"
         f"Reprovados por score: {HEALTH.get('funnel_today', {}).get('reprovados_score', 0)}\n"
+        f"Reprovados por volume: {HEALTH.get('funnel_today', {}).get('reprovados_volume', 0)}\n"
+        f"Reprovados por ADX: {HEALTH.get('funnel_today', {}).get('reprovados_adx', 0)}\n"
         f"Reprovados por cooldown: {HEALTH.get('funnel_today', {}).get('reprovados_cooldown', 0)}\n"
         f"Reprovados por posição ativa: {HEALTH.get('funnel_today', {}).get('reprovados_posicao_ativa', 0)}\n"
         f"Sinais enviados: {HEALTH.get('funnel_today', {}).get('sinais_enviados', 0)}\n\n"
@@ -1774,6 +1854,8 @@ def funnel_text():
         f"Reprovados por ATR: {f['reprovados_atr']}\n"
         f"Reprovados por risco: {f['reprovados_risco']}\n"
         f"Reprovados por score: {f['reprovados_score']}\n"
+        f"Reprovados por volume: {f.get('reprovados_volume', 0)}\n"
+        f"Reprovados por ADX: {f.get('reprovados_adx', 0)}\n"
         f"Reprovados por cooldown: {f['reprovados_cooldown']}\n"
         f"Reprovados por posição ativa: {f['reprovados_posicao_ativa']}\n\n"
         f"Sinais enviados: {f['sinais_enviados']}"
