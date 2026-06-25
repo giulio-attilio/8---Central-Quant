@@ -1,5 +1,5 @@
 # TREND PRO MTF H4/H1 + POI
-# Versão: 2026-06-25-TRENDPRO-FIX-TELEGRAM-SAFE-SEND
+# Versão: 2026-06-25-TRENDPRO-AUDITORIA-TELEGRAM-FLOW
 #
 # Lógica:
 # - H4 é apenas contexto/filtro.
@@ -917,15 +917,22 @@ def enviar_texto(chat_id, msg):
 
 def safe_send_telegram(msg):
     """
-    Envia mensagens do Trend PRO usando SEMPRE os tokens resolvidos em TOKEN/CHAT_ID.
-    Isso evita bug em que send_telegram() importado/fallback usa TELEGRAM_BOT_TOKEN
-    em vez de TREND_PRO_ELITE_TOKEN/TREND_PRO_ELITE_CHAT_ID.
+    Envia mensagens automáticas do Trend PRO usando SEMPRE TOKEN/CHAT_ID resolvidos.
+    Auditoria 2026-06-25:
+    - Não usa send_telegram() importado/fallback.
+    - Faz até 3 tentativas.
+    - Registra sucesso/erro no HEALTH.
+    - Retorna True/False para o scanner saber se o Telegram realmente enviou.
     """
     msg = normalizar_texto(msg)
 
     if not TOKEN or not CHAT_ID:
-        print("TELEGRAM TREND PRO NÃO CONFIGURADO:")
+        erro = "TELEGRAM TREND PRO NÃO CONFIGURADO: TOKEN ou CHAT_ID ausente"
+        print(erro)
         print(msg)
+        HEALTH["last_telegram_ok"] = False
+        HEALTH["last_telegram_error"] = erro
+        HEALTH["last_telegram_attempt"] = data_hora_sp_str()
         return False
 
     payload = {
@@ -933,24 +940,40 @@ def safe_send_telegram(msg):
         "text": msg
     }
 
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            timeout=20
-        )
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-        if resp.status_code != 200:
-            print(f"ERRO TELEGRAM TREND PRO status={resp.status_code}: {resp.text}")
-            return False
+    for tentativa in range(1, 4):
+        try:
+            HEALTH["last_telegram_attempt"] = data_hora_sp_str()
 
-        print("TELEGRAM TREND PRO ENVIADO OK")
-        return True
+            resp = requests.post(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=20
+            )
 
-    except Exception as e:
-        print("ERRO TELEGRAM TREND PRO:", e)
-        return False
+            if resp.status_code == 200:
+                print("TELEGRAM TREND PRO ENVIADO OK")
+                HEALTH["last_telegram_ok"] = True
+                HEALTH["last_telegram_error"] = None
+                HEALTH["last_telegram_success"] = data_hora_sp_str()
+                return True
+
+            erro = f"status={resp.status_code}: {resp.text}"
+            print(f"ERRO TELEGRAM TREND PRO tentativa {tentativa}/3: {erro}")
+            HEALTH["last_telegram_ok"] = False
+            HEALTH["last_telegram_error"] = erro
+            time.sleep(2 * tentativa)
+
+        except Exception as e:
+            erro = str(e)
+            print(f"ERRO TELEGRAM TREND PRO tentativa {tentativa}/3:", erro)
+            HEALTH["last_telegram_ok"] = False
+            HEALTH["last_telegram_error"] = erro
+            time.sleep(2 * tentativa)
+
+    return False
 
 
 def safe_send_telegram_donkey(msg):
@@ -1395,6 +1418,26 @@ def montar_health_tecnico():
         "mfe_split_enabled": True,
         "service_mode": "TREND_PRO_ONLY",
         "bot": BOT_NAME,
+        "telegram_configured": bool(TOKEN and CHAT_ID),
+        "telegram_token_source": (
+            "TREND_PRO_ELITE_TOKEN" if os.environ.get("TREND_PRO_ELITE_TOKEN") else
+            "TRENDPRO_TELEGRAM_BOT_TOKEN" if os.environ.get("TRENDPRO_TELEGRAM_BOT_TOKEN") else
+            "TRENDPRO_TOKEN" if os.environ.get("TRENDPRO_TOKEN") else
+            "TELEGRAM_BOT_TOKEN" if os.environ.get("TELEGRAM_BOT_TOKEN") else
+            None
+        ),
+        "telegram_chat_id_source": (
+            "TREND_PRO_ELITE_CHAT_ID" if os.environ.get("TREND_PRO_ELITE_CHAT_ID") else
+            "TRENDPRO_TELEGRAM_CHAT_ID" if os.environ.get("TRENDPRO_TELEGRAM_CHAT_ID") else
+            "TRENDPRO_CHAT_ID" if os.environ.get("TRENDPRO_CHAT_ID") else
+            "TELEGRAM_CHAT_ID" if os.environ.get("TELEGRAM_CHAT_ID") else
+            None
+        ),
+        "last_telegram_ok": HEALTH.get("last_telegram_ok"),
+        "last_telegram_success": HEALTH.get("last_telegram_success"),
+        "last_telegram_attempt": HEALTH.get("last_telegram_attempt"),
+        "last_telegram_error": HEALTH.get("last_telegram_error"),
+        "last_signal_telegram_failed": HEALTH.get("last_signal_telegram_failed"),
         "watchdog_status": watchdog.get("status"),
         "minutes_since_scanner": watchdog.get("minutes_since_scanner"),
         "minutes_since_management": watchdog.get("minutes_since_management"),
@@ -2993,7 +3036,7 @@ def enviar_early_a(s):
         f"Bollinger H1: {bollinger_txt}"
     )
 
-    safe_send_telegram(msg)
+    return safe_send_telegram(msg)
 
 
 def enviar_sinal_h1(s):
@@ -3031,7 +3074,7 @@ def enviar_sinal_h1(s):
         f"Bollinger H1: {bollinger_txt}"
     )
 
-    safe_send_telegram(msg)
+    return safe_send_telegram(msg)
 
 
 def enviar_reentry(s):
@@ -3064,7 +3107,7 @@ def enviar_reentry(s):
         f"Bollinger H1: {bollinger_txt}"
     )
 
-    safe_send_telegram(msg)
+    return safe_send_telegram(msg)
 
 
 
@@ -3083,7 +3126,7 @@ def enviar_poi(s):
         f"{risco_label(s['risk_pct'])} - Risco: {fmt_risco(s['risk_pct'])}%"
     )
 
-    safe_send_telegram(msg)
+    return safe_send_telegram(msg)
 
 
 def enviar_donkey(s):
@@ -4120,6 +4163,13 @@ def resetar_robo():
 def listen_commands():
     last_update_id = 0
 
+    try:
+        if TOKEN:
+            requests.get(f"https://api.telegram.org/bot{TOKEN}/deleteWebhook", timeout=10)
+            print("WEBHOOK TREND PRO REMOVIDO/CONFIRMADO")
+    except Exception as e:
+        print("AVISO deleteWebhook Trend PRO:", e)
+
     while True:
         try:
             resp = requests.get(
@@ -4290,6 +4340,7 @@ def listen_commands():
                     comandos_msg = (
                         "📌 Comandos disponíveis:\n\n"
                         "/health - painel técnico do robô\n"
+                        "/telegram - testa envio automático dos sinais\n"
                         "/teste - testa conexão com Telegram\n"
                         "/posicoes - lista posições abertas com origem\n"
                         "/top - mostra melhores posições abertas\n"
@@ -4316,6 +4367,17 @@ def listen_commands():
                     enviar_texto(
                         chat_id,
                         "✅ Posições Donkey zeradas."
+                    )
+
+                elif texto == "/telegram":
+                    ok = safe_send_telegram(
+                        "✅ TESTE TELEGRAM AUTOMÁTICO TREND PRO\n\n"
+                        "Este teste usa o mesmo caminho dos sinais automáticos: TOKEN/CHAT_ID globais."
+                    )
+                    enviar_texto(
+                        chat_id,
+                        "✅ Teste automático enviado com sucesso." if ok else
+                        f"❌ Falha no teste automático. Erro: {HEALTH.get('last_telegram_error')}"
                     )
 
                 elif texto == "/teste":
@@ -4430,6 +4492,31 @@ def listen_donkey_commands():
 # SCANNER
 # ====================================================
 
+def registrar_falha_telegram_sinal(s, origem):
+    """
+    Registra no log/HEALTH quando o sinal foi salvo no Redis, mas o Telegram não confirmou envio.
+    Isso evita sinais 'fantasma' sem diagnóstico.
+    """
+    try:
+        msg = (
+            f"FALHA TELEGRAM SINAL {origem}: "
+            f"{nome_limpo(s.get('symbol', 'N/A'))} {s.get('signal', '')} | "
+            f"erro={HEALTH.get('last_telegram_error')}"
+        )
+        print(msg)
+        HEALTH["last_warning"] = msg
+        HEALTH["last_signal_telegram_failed"] = {
+            "datetime": data_hora_sp_str(),
+            "origin": origem,
+            "symbol": s.get("symbol"),
+            "signal": s.get("signal"),
+            "error": HEALTH.get("last_telegram_error")
+        }
+    except Exception as e:
+        print("ERRO AO REGISTRAR FALHA TELEGRAM SINAL:", e)
+
+
+
 def scanner():
     global ultimo_relatorio_hora
 
@@ -4524,7 +4611,9 @@ def scanner():
                             )
 
                             if aprovado:
-                                enviar_poi(poi)
+                                telegram_ok = enviar_poi(poi)
+                                if not telegram_ok:
+                                    registrar_falha_telegram_sinal(poi, "POI")
                                 atualizar_posicao_com_poi(poi)
                             else:
                                 registrar_reprovacao_funil(motivo)
@@ -4559,7 +4648,9 @@ def scanner():
                                 if registrar_posicao(reentry):
                                     historico_tmp[chave_reentry] = True
                                     salvar_sinais(historico_tmp)
-                                    enviar_reentry(reentry)
+                                    telegram_ok = enviar_reentry(reentry)
+                                    if not telegram_ok:
+                                        registrar_falha_telegram_sinal(reentry, "REENTRY")
                                     sinais_enviados += 1
                                     registrar_funil("sinais_enviados")
                             continue
@@ -4591,7 +4682,9 @@ def scanner():
                             if registrar_posicao(early):
                                 historico_tmp[chave_early] = True
                                 salvar_sinais(historico_tmp)
-                                enviar_early_a(early)
+                                telegram_ok = enviar_early_a(early)
+                                if not telegram_ok:
+                                    registrar_falha_telegram_sinal(early, "EARLY")
                                 sinais_enviados += 1
                                 registrar_funil("sinais_enviados")
                         continue
@@ -4648,9 +4741,10 @@ def scanner():
 
                 if registrar_posicao(s):
                     historico[chave] = True
-                    enviar_sinal_h1(s)
+                    telegram_ok = enviar_sinal_h1(s)
+                    if not telegram_ok:
+                        registrar_falha_telegram_sinal(s, "NORMAL")
                     sinais_enviados += 1
-                    registrar_funil("sinais_enviados")
                     registrar_funil("sinais_enviados")
 
             salvar_sinais(historico)
@@ -4695,7 +4789,13 @@ def health():
     return {
         "ok": watchdog.get("ok", True),
         "bot": BOT_NAME,
-        "version": "2026-06-23-TREND-PRO-ELITE-CENTRAL-QUANT-PADRONIZADO",
+        "version": "2026-06-25-TRENDPRO-AUDITORIA-TELEGRAM-FLOW",
+        "telegram_configured": bool(TOKEN and CHAT_ID),
+        "last_telegram_ok": HEALTH.get("last_telegram_ok"),
+        "last_telegram_success": HEALTH.get("last_telegram_success"),
+        "last_telegram_attempt": HEALTH.get("last_telegram_attempt"),
+        "last_telegram_error": HEALTH.get("last_telegram_error"),
+        "last_signal_telegram_failed": HEALTH.get("last_signal_telegram_failed"),
         "service_mode": "TREND_PRO_ELITE",
         "standby": not TREND_PRO_ENABLED,
         "trend_pro_enabled": TREND_PRO_ENABLED,
