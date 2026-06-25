@@ -1,3 +1,4 @@
+# Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em COBRA.
 # COBRA ATTACK BOT
 # Versao: 2026-06-21-COBRA-CENTRAL-QUANT-RESILIENTE-V2
 #
@@ -102,7 +103,12 @@ COMMAND_SLEEP_SECONDS = 2
 PROTECTION_SECONDS = 300
 
 # Proteção anti-lote após deploy/restart do Render.
-STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("COBRA_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
+STARTUP_SIGNAL_GRACE_SECONDS = int(
+    os.environ.get(
+        "COBRA_STARTUP_SIGNAL_GRACE_SECONDS",
+        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
+    )
+)
 SERVICE_STARTED_TS = time.time()
 STARTUP_ALERT_COOLDOWN_SECONDS = int(os.environ.get("COBRA_STARTUP_ALERT_COOLDOWN_SECONDS", "3600"))
 
@@ -129,6 +135,10 @@ HEALTH = {
     "last_positions_count": 0,
     "last_warning": None,
     "last_invalid_watchlist_check": None,
+    "last_watchdog_alert": None,
+    "last_watchdog_alert_ts": 0,
+    "watchdog_last_check": None,
+    "watchdog_last_status": "OK",
 }
 
 # ====================================================
@@ -1363,7 +1373,6 @@ def montar_health_tecnico():
         "last_success": HEALTH.get("last_success"),
         "last_error": HEALTH.get("last_error"),
         "last_warning": HEALTH.get("last_warning"),
-        "last_warning": HEALTH.get("last_warning"),
         "watchlist_file": WATCHLIST_FILE,
         "daily_summary_time": f"{DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}",
         "monthly_summary_day": MONTHLY_SUMMARY_DAY,
@@ -1376,6 +1385,9 @@ def montar_health_tecnico():
         "last_invalid_watchlist_check": HEALTH.get("last_invalid_watchlist_check"),
         "positions_open": contar_posicoes_ativas(),
         "positions_limit": MAX_OPEN_POSITIONS,
+        "watchdog_status": HEALTH.get("watchdog_last_status", "OK"),
+        "watchdog_last_check": HEALTH.get("watchdog_last_check"),
+        "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
         "telegram_private_configured": bool(TOKEN and CHAT_ID),
         "funnel_today": funil,
         "today": {
@@ -1721,10 +1733,20 @@ def watchdog():
     time.sleep(60)
     while True:
         try:
+            HEALTH["watchdog_last_check"] = data_hora_sp_str()
+
             min_scanner = minutos_desde(HEALTH.get("last_scanner_run"))
             min_management = minutos_desde(HEALTH.get("last_management_run"))
 
-            if min_scanner is not None and min_scanner > WATCHDOG_THRESHOLD_MINUTES:
+            scanner_stalled = min_scanner is not None and min_scanner > WATCHDOG_THRESHOLD_MINUTES
+            management_stalled = min_management is not None and min_management > WATCHDOG_THRESHOLD_MINUTES
+
+            if HEALTH.get("last_error") is None and not scanner_stalled and not management_stalled:
+                HEALTH["watchdog_last_status"] = "OK"
+            else:
+                HEALTH["watchdog_last_status"] = "ALERTA"
+
+            if scanner_stalled:
                 if pode_alertar("scanner"):
                     enviar_alerta_travamento(
                         "COBRA ATTACK PARADO",
@@ -1732,7 +1754,7 @@ def watchdog():
                         f"Último scanner:\n{HEALTH.get('last_scanner_run')}"
                     )
 
-            if min_management is not None and min_management > WATCHDOG_THRESHOLD_MINUTES:
+            if management_stalled:
                 if pode_alertar("management"):
                     enviar_alerta_travamento(
                         "GESTÃO COBRA PARADA",
@@ -1790,8 +1812,9 @@ def health():
 @app.route("/watchdog")
 def watchdog_status():
     return {
-        "ok": True,
+        "ok": HEALTH.get("watchdog_last_status", "OK") == "OK",
         "bot": "Cobra Attack",
+        "status": HEALTH.get("watchdog_last_status", "OK"),
         "watchdog_threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
         "watchdog_check_seconds": WATCHDOG_CHECK_SECONDS,
         "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
@@ -1801,6 +1824,7 @@ def watchdog_status():
         "minutes_since_management": minutos_desde(HEALTH.get("last_management_run")),
         "last_error": HEALTH.get("last_error"),
         "last_warning": HEALTH.get("last_warning"),
+        "watchdog_last_check": HEALTH.get("watchdog_last_check"),
     }
 
 iniciar_threads_monitoradas()
