@@ -166,7 +166,7 @@ def env_bool(name, default="false"):
 
 TREND_PRO_ENABLED = env_bool("ENABLE_TRENDPRO", os.environ.get("TREND_PRO_ENABLED", "false"))
 TREND_PRO_AUTO_TRADE = env_bool("TREND_PRO_AUTO_TRADE", "false")
-STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("TRENDPRO_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
+STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("TRENDPRO_STARTUP_SIGNAL_GRACE_SECONDS", os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")))
 SERVICE_STARTED_TS = time.time()
 
 
