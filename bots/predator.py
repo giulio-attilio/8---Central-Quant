@@ -1,6 +1,6 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em PREDATOR.
 # SMART PREDATOR - SMC H1
-# Versão: 2026-06-24-SMART-PREDATOR-BINGX-WARNING-FIX
+# Versão: 2026-06-25-SMART-PREDATOR-V4-STATS-SCORE-MAE
 #
 # Stand-by para Central Quant:
 # - Estrutura padronizada como Donkey/Cobra/Meme.
@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 BOT_NAME = os.environ.get("BOT_NAME", "Smart Predator")
 SERVICE_MODE = "SMART_PREDATOR"
-BOT_VERSION = "2026-06-24-SMART-PREDATOR-LIMIT8-WARNING-FIX"
+BOT_VERSION = "2026-06-25-SMART-PREDATOR-V4-STATS-SCORE-MAE"
 
 # Padrão Central Quant: este bot não usa startup guard para sinais.
 # Mantido explícito para padronização de /health e evitar bloqueios após deploy.
@@ -163,6 +163,8 @@ DEFAULT_FUNNEL_STATS = {
     "score_70_plus": 0,
     "score_80_plus": 0,
     "score_85_plus": 0,
+    "score_90_plus": 0,
+    "score_95_plus": 0,
     "signals_detected": 0,
     "signals_sent": 0,
     "long_signals": 0,
@@ -214,6 +216,48 @@ def fmt_pct(v):
         return f"{float(v):+.2f}%".replace(".", ",")
     except Exception:
         return str(v)
+
+
+def fmt_r(v):
+    try:
+        return f"{float(v):+.2f}R".replace(".", ",")
+    except Exception:
+        return str(v)
+
+
+def fmt_pf(v):
+    try:
+        v = float(v)
+        if v == float("inf"):
+            return "∞"
+        return f"{v:.2f}".replace(".", ",")
+    except Exception:
+        return str(v)
+
+
+def safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def safe_int(v, default=0):
+    try:
+        if v is None:
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def pct_to_r(pct, risk_pct):
+    risk_pct = abs(safe_float(risk_pct, 0.0))
+    if risk_pct <= 0:
+        return 0.0
+    return safe_float(pct, 0.0) / risk_pct
 
 
 def check_bool(valor):
@@ -484,6 +528,21 @@ def atualizar_mfe_posicao(p, preco_atual):
         if pnl_atual > mfe_atual:
             p["mfe_max_pct"] = pnl_atual
             p["mfe_updated_at"] = data_hora_sp_str()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def atualizar_mae_posicao(p, preco_atual):
+    try:
+        side = p.get("side")
+        entry = float(p.get("entry"))
+        pnl_atual = pnl_pct(side, entry, float(preco_atual))
+        mae_atual = float(p.get("mae_min_pct", 0))
+        if pnl_atual < mae_atual:
+            p["mae_min_pct"] = pnl_atual
+            p["mae_updated_at"] = data_hora_sp_str()
             return True
     except Exception:
         pass
@@ -835,16 +894,32 @@ def is_retesting_bearish_ob_m15(df_m15, ob):
     return False
 
 
-def calcular_predator_score(has_sweep, has_choch, has_ob, has_rejection, adx_h4, volume_ok):
+def calcular_predator_score(
+    has_sweep,
+    has_choch,
+    has_ob,
+    has_rejection,
+    adx_h4,
+    volume_ok,
+    risk_pct=None,
+    volume_ratio=None,
+    side=None,
+    h4_context=None
+):
+    """
+    Score v4: deixa de ser quase binário.
+    A base obrigatória dá 80 pontos; os 20 pontos finais dependem de força, volume, risco e contexto.
+    Assim o /stats passa a separar sinais 70-79, 80-84, 85-89, 90-94 e 95+.
+    """
     score = 0
     reasons = []
 
     if has_sweep:
-        score += 30
-        reasons.append("Liquidity Sweep confirmado ✅")
+        score += 25
+        reasons.append("Liquidity Sweep H1 confirmado ✅")
 
     if has_choch:
-        score += 25
+        score += 20
         reasons.append("CHOCH estrutural confirmado M15 ✅")
 
     if has_ob:
@@ -855,20 +930,68 @@ def calcular_predator_score(has_sweep, has_choch, has_ob, has_rejection, adx_h4,
         score += 15
         reasons.append("Reteste com rejeição no OB ✅")
 
+    # ADX H4: até 8 pontos.
     try:
-        if float(adx_h4) >= MIN_ADX_H4:
-            score += 5
-            reasons.append(f"ADX H4 aceitável: {float(adx_h4):.2f} ✅")
+        adx = float(adx_h4)
+        if adx >= 30:
+            score += 8
+            reasons.append(f"ADX H4 forte: {adx:.2f} ✅")
+        elif adx >= 22:
+            score += 6
+            reasons.append(f"ADX H4 bom: {adx:.2f} ✅")
+        elif adx >= MIN_ADX_H4:
+            score += 4
+            reasons.append(f"ADX H4 aceitável: {adx:.2f} ✅")
         else:
-            reasons.append(f"ADX H4 baixo: {float(adx_h4):.2f} ⚠️")
+            reasons.append(f"ADX H4 baixo: {adx:.2f} ⚠️")
     except Exception:
         reasons.append("ADX H4 indisponível ⚠️")
 
+    # Volume: até 6 pontos.
+    vr = safe_float(volume_ratio, 0.0)
     if volume_ok:
-        score += 5
-        reasons.append("Volume acima da média ✅")
+        if vr >= 2.0:
+            score += 6
+            reasons.append(f"Volume muito acima da média: {vr:.2f}x ✅")
+        elif vr >= 1.5:
+            score += 5
+            reasons.append(f"Volume forte: {vr:.2f}x ✅")
+        else:
+            score += 3
+            reasons.append(f"Volume acima da média: {vr:.2f}x ✅")
     else:
-        reasons.append("Volume sem destaque ⚠️")
+        reasons.append(f"Volume sem destaque: {vr:.2f}x ⚠️")
+
+    # Risco: até 4 pontos.
+    rp = safe_float(risk_pct, 999.0)
+    if rp <= 1.0:
+        score += 4
+        reasons.append(f"Risco curto: {rp:.2f}% ✅")
+    elif rp <= 1.5:
+        score += 3
+        reasons.append(f"Risco bom: {rp:.2f}% ✅")
+    elif rp <= 2.0:
+        score += 2
+        reasons.append(f"Risco aceitável: {rp:.2f}% ✅")
+    elif rp <= MAX_RISK_H1:
+        score += 1
+        reasons.append(f"Risco no limite: {rp:.2f}% ⚠️")
+    else:
+        reasons.append(f"Risco acima do limite: {rp:.2f}% ❌")
+
+    # Contexto H4: até 2 pontos, sem bloquear reversões.
+    if h4_context and side:
+        if side == "LONG" and h4_context == "BULLISH":
+            score += 2
+            reasons.append("Contexto H4 favorece LONG ✅")
+        elif side == "SHORT" and h4_context == "BEARISH":
+            score += 2
+            reasons.append("Contexto H4 favorece SHORT ✅")
+        elif h4_context == "NEUTRO":
+            score += 1
+            reasons.append("Contexto H4 neutro ⚪")
+        else:
+            reasons.append(f"Contexto H4 contra o sinal: {h4_context} ⚠️")
 
     return min(int(score), 100), reasons
 
@@ -879,10 +1002,14 @@ def classificar_predator(score):
     except Exception:
         return "FRACA 🔴"
 
-    if score >= 85:
+    if score >= 95:
         return "EXCEPCIONAL 🔥"
-    if score >= 80:
+    if score >= 90:
+        return "MUITO FORTE 🟢"
+    if score >= 85:
         return "IDEAL 🟢"
+    if score >= 80:
+        return "BOA 🟡"
     if score >= 70:
         return "MÉDIA 🟡"
     return "FRACA 🔴"
@@ -971,7 +1098,7 @@ def scan_smart_predator_symbol(symbol):
                     print(f"SMART PREDATOR LONG IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
                     return None
 
-                score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok)
+                score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok, risk_pct, float(candle_h1.get("volume_ratio", 0)), "LONG", h4_context)
 
                 if score >= 70:
                     inc_funnel_stat("score_70_plus")
@@ -979,6 +1106,10 @@ def scan_smart_predator_symbol(symbol):
                     inc_funnel_stat("score_80_plus")
                 if score >= 85:
                     inc_funnel_stat("score_85_plus")
+                if score >= 90:
+                    inc_funnel_stat("score_90_plus")
+                if score >= 95:
+                    inc_funnel_stat("score_95_plus")
 
                 if score >= MIN_PREDATOR_SCORE:
                     inc_funnel_stat("signals_detected")
@@ -1035,7 +1166,7 @@ def scan_smart_predator_symbol(symbol):
                     print(f"SMART PREDATOR SHORT IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}%")
                     return None
 
-                score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok)
+                score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok, risk_pct, float(candle_h1.get("volume_ratio", 0)), "SHORT", h4_context)
 
                 if score >= 70:
                     inc_funnel_stat("score_70_plus")
@@ -1043,6 +1174,10 @@ def scan_smart_predator_symbol(symbol):
                     inc_funnel_stat("score_80_plus")
                 if score >= 85:
                     inc_funnel_stat("score_85_plus")
+                if score >= 90:
+                    inc_funnel_stat("score_90_plus")
+                if score >= 95:
+                    inc_funnel_stat("score_95_plus")
 
                 if score >= MIN_PREDATOR_SCORE:
                     inc_funnel_stat("signals_detected")
@@ -1163,6 +1298,7 @@ def registrar_posicao(s):
         "initial_sl": float(s["sl"]),
         "tp50": float(s["tp50"]),
         "risk_abs": float(s.get("risk_abs", abs(float(s["entry"]) - float(s["sl"])))),
+        "risk_abs": float(s.get("risk_abs", 0)),
         "risk_pct": float(s.get("risk_pct", 0)),
         "score": int(s.get("score", 0)),
         "quality": s.get("quality", ""),
@@ -1180,6 +1316,10 @@ def registrar_posicao(s):
         "last_protection_ts": 0,
         "mfe_max_pct": 0.0,
         "mfe_updated_at": None,
+        "mae_min_pct": 0.0,
+        "mae_updated_at": None,
+        "management_cycles": 0,
+        "cycles_to_tp50": None,
         "closed_at": None,
         "close_reason": None,
         "auto_trade": SMART_PREDATOR_AUTO_TRADE,
@@ -1203,6 +1343,7 @@ def registrar_posicao(s):
         "entry": float(s["entry"]),
         "sl": float(s["sl"]),
         "tp50": float(s["tp50"]),
+        "risk_abs": float(s.get("risk_abs", 0)),
         "risk_pct": float(s.get("risk_pct", 0)),
         "score": int(s.get("score", 0)),
         "quality": s.get("quality", ""),
@@ -1244,7 +1385,13 @@ def encerrar_posicao(symbol, p, preco_saida, motivo):
     posicoes = carregar_posicoes()
     resultado = pnl_pct(p["side"], float(p["entry"]), float(preco_saida))
     mfe = float(p.get("mfe_max_pct", 0))
+    mae = float(p.get("mae_min_pct", 0))
     giveback = max(0.0, mfe - resultado)
+    risk_pct = abs(float(p.get("risk_pct", 0)) or 0.0)
+    pnl_r = pct_to_r(resultado, risk_pct)
+    mfe_r = pct_to_r(mfe, risk_pct)
+    mae_r = pct_to_r(mae, risk_pct)
+    giveback_r = pct_to_r(giveback, risk_pct)
 
     p["status"] = "ENCERRADO"
     p["closed_at"] = time.time()
@@ -1252,7 +1399,12 @@ def encerrar_posicao(symbol, p, preco_saida, motivo):
     p["close_reason"] = motivo
     p["exit_price"] = float(preco_saida)
     p["pnl_pct"] = float(resultado)
+    p["mae_min_pct"] = float(mae)
     p["mfe_gave_back_pct"] = float(giveback)
+    p["pnl_r"] = float(pnl_r)
+    p["mfe_max_r"] = float(mfe_r)
+    p["mae_min_r"] = float(mae_r)
+    p["mfe_gave_back_r"] = float(giveback_r)
 
     posicoes[symbol] = p
     salvar_posicoes(posicoes)
@@ -1268,8 +1420,17 @@ def encerrar_posicao(symbol, p, preco_saida, motivo):
         "exit": float(preco_saida),
         "pnl": float(resultado),
         "pnl_pct": float(resultado),
+        "risk_abs": float(p.get("risk_abs", 0)),
+        "risk_pct": float(risk_pct),
+        "pnl_r": float(pnl_r),
         "mfe_max_pct": float(mfe),
+        "mfe_max_r": float(mfe_r),
+        "mae_min_pct": float(mae),
+        "mae_min_r": float(mae_r),
         "mfe_gave_back_pct": float(giveback),
+        "mfe_gave_back_r": float(giveback_r),
+        "management_cycles": int(p.get("management_cycles", 0) or 0),
+        "cycles_to_tp50": p.get("cycles_to_tp50"),
         "tp50_hit": bool(p.get("tp50_hit", False)),
         "score": int(p.get("score", 0)),
         "quality": p.get("quality", ""),
@@ -1299,7 +1460,13 @@ def gerenciar_posicoes():
                 print(f"Erro ao buscar preço de {symbol}: {exchange_err}")
                 continue
 
+            p["management_cycles"] = int(p.get("management_cycles", 0) or 0) + 1
+            alterou = True
+
             if atualizar_mfe_posicao(p, preco):
+                alterou = True
+
+            if atualizar_mae_posicao(p, preco):
                 alterou = True
 
             # TP50
@@ -1312,6 +1479,7 @@ def gerenciar_posicoes():
                 if hit_tp50:
                     p["tp50_hit"] = True
                     p["tp50_hit_at"] = time.time()
+                    p["cycles_to_tp50"] = int(p.get("management_cycles", 0) or 0)
                     p["be_active"] = True
                     p["trailing_active"] = True
                     p["last_protection_ts"] = time.time()
@@ -1333,6 +1501,7 @@ def gerenciar_posicoes():
                         "price": float(preco),
                         "entry": entry,
                         "tp50": tp50,
+                        "cycles_to_tp50": int(p.get("cycles_to_tp50", 0) or 0),
                         "signal_type": "SMART_PREDATOR"
                     })
 
@@ -1430,58 +1599,18 @@ def filtrar_trades_periodo(data_prefix):
 
 def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
     trades = filtrar_trades_periodo(data_prefix)
-
-    entradas = [t for t in trades if t.get("event") == "ENTRY"]
-    exits = [t for t in trades if t.get("event") in ["SL", "TRAIL", "BE", "CLOSE"]]
-    tp50s = [t for t in trades if t.get("event") == "TP50"]
-    trails = [t for t in trades if t.get("event") == "TRAILING"]
+    stats = calc_predator_stats(trades)
+    entradas = stats["entries"]
+    exits = stats["exits"]
 
     longs = [t for t in entradas if t.get("side") == "LONG"]
     shorts = [t for t in entradas if t.get("side") == "SHORT"]
 
-    excepcionais = [t for t in entradas if "EXCEPCIONAL" in str(t.get("quality", ""))]
-    ideais = [t for t in entradas if "IDEAL" in str(t.get("quality", ""))]
-    medios = [t for t in entradas if "MÉDIA" in str(t.get("quality", ""))]
-
-    wins = []
-    bes = []
-    losses = []
-    pnl_total = 0.0
-    melhor = None
-    pior = None
-
-    for t in exits:
-        try:
-            pnl = float(t.get("pnl", t.get("pnl_pct", 0)))
-        except Exception:
-            pnl = 0.0
-
-        pnl_total += pnl
-
-        if pnl > 0.15:
-            wins.append(t)
-        elif pnl >= -0.15:
-            bes.append(t)
-        else:
-            losses.append(t)
-
-        if melhor is None or pnl > float(melhor.get("_pnl_calc", -999999)):
-            t["_pnl_calc"] = pnl
-            melhor = t
-
-        if pior is None or pnl < float(pior.get("_pnl_calc", 999999)):
-            t["_pnl_calc"] = pnl
-            pior = t
-
-    fechados = len(exits)
-    win_rate = (len(wins) / fechados * 100) if fechados else 0
-    win_rate_sem_be = (len(wins) / (len(wins) + len(losses)) * 100) if (len(wins) + len(losses)) else 0
-
-    mfe_medio = (sum(float(t.get("mfe_max_pct", 0)) for t in exits) / len(exits)) if exits else 0
-    devolucao_media = (sum(float(t.get("mfe_gave_back_pct", 0)) for t in exits) / len(exits)) if exits else 0
-
-    melhor_txt = f"{melhor.get('symbol_clean', melhor.get('symbol', 'N/A'))} {fmt_pct(melhor.get('_pnl_calc', 0))}" if melhor else "N/A"
-    pior_txt = f"{pior.get('symbol_clean', pior.get('symbol', 'N/A'))} {fmt_pct(pior.get('_pnl_calc', 0))}" if pior else "N/A"
+    excepcionais = [t for t in entradas if safe_int(t.get("score", 0), 0) >= 95]
+    muito_fortes = [t for t in entradas if 90 <= safe_int(t.get("score", 0), 0) <= 94]
+    ideais = [t for t in entradas if 85 <= safe_int(t.get("score", 0), 0) <= 89]
+    bons = [t for t in entradas if 80 <= safe_int(t.get("score", 0), 0) <= 84]
+    medios = [t for t in entradas if 70 <= safe_int(t.get("score", 0), 0) <= 79]
 
     posicoes = carregar_posicoes()
     ativos = [p for p in posicoes.values() if p.get("status") != "ENCERRADO"]
@@ -1495,22 +1624,34 @@ def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
         f"Sinais H1 do período: {len(entradas)}\n"
         f"LONG: {len(longs)}\n"
         f"SHORT: {len(shorts)}\n\n"
-        f"EXCEPCIONAL: {len(excepcionais)}\n"
-        f"IDEAL: {len(ideais)}\n"
-        f"MÉDIO: {len(medios)}\n\n"
-        f"Trades encerrados: {fechados}\n"
-        f"Wins: {len(wins)}\n"
-        f"Breakeven: {len(bes)}\n"
-        f"Loss: {len(losses)}\n"
-        f"Win rate: {win_rate:.2f}%\n"
-        f"Win rate sem BE: {win_rate_sem_be:.2f}%\n\n"
-        f"TP50 atingidos: {len(tp50s)}\n"
-        f"Trailings atualizados: {len(trails)}\n\n"
-        f"PnL realizado:\n{fmt_pct(pnl_total)}\n\n"
-        f"MFE médio:\n{fmt_pct(mfe_medio)}\n\n"
-        f"Devolução média:\n{fmt_pct(devolucao_media)}\n\n"
-        f"Melhor trade:\n{melhor_txt}\n\n"
-        f"Pior trade:\n{pior_txt}\n\n"
+        f"EXCEPCIONAL 95+: {len(excepcionais)}\n"
+        f"MUITO FORTE 90-94: {len(muito_fortes)}\n"
+        f"IDEAL 85-89: {len(ideais)}\n"
+        f"BOA 80-84: {len(bons)}\n"
+        f"MÉDIA 70-79: {len(medios)}\n\n"
+        f"Trades encerrados: {stats['count']}\n"
+        f"Wins: {stats['wins']}\n"
+        f"Breakeven: {stats['be']}\n"
+        f"Loss: {stats['losses']}\n"
+        f"Win rate: {stats['winrate']:.2f}%\n"
+        f"Win rate sem BE: {stats['winrate_sem_be']:.2f}%\n"
+        f"Profit Factor %: {fmt_pf(stats['profit_factor_pct'])}\n"
+        f"Profit Factor R: {fmt_pf(stats['profit_factor_r'])}\n"
+        f"Expectancy: {fmt_r(stats['expectancy_r'])} por trade\n"
+        f"Expectancy pós-TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
+        f"Captura de tendência: {stats['trend_capture_pct']:.2f}%\n\n"
+        f"TP50 atingidos: {stats['tp50_hits']}\n"
+        f"Tempo médio até TP50: {stats['avg_cycles_to_tp50']:.1f} ciclos de gestão\n"
+        f"Tempo médio até fechamento: {stats['avg_management_cycles']:.1f} ciclos de gestão\n"
+        f"Trailings atualizados: {len(stats['trails'])}\n\n"
+        f"PnL realizado:\n{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
+        f"MFE médio:\n{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n"
+        f"MAE médio:\n{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n"
+        f"Devolução média:\n{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
+        f"Runners:\n3R+: {stats['runners_3r']}\n5R+: {stats['runners_5r']}\n10R+: {stats['runners_10r']}\n\n"
+        f"LONG x SHORT:\n{stats_by_side_text(exits)}\n\n"
+        f"Melhor trade:\n{trade_line_predator(stats['best_trade'])}\n\n"
+        f"Pior trade:\n{trade_line_predator(stats['worst_trade'])}\n\n"
         f"Trades Smart Predator ainda ativos: {len(ativos)}"
     )
 
@@ -1606,72 +1747,255 @@ def enviar_resumo_mensal_se_preciso():
     salvar_monthly_summary_sent(enviados)
 
 
-def montar_stats_gerais():
-    trades = carregar_trades()
-    entradas = [t for t in trades if t.get("event") == "ENTRY"]
+def trade_line_predator(t):
+    if not t:
+        return "N/A"
+    return (
+        f"{t.get('symbol_clean', t.get('symbol', 'N/A'))} "
+        f"{t.get('side', '')} "
+        f"{fmt_pct(t.get('pnl', t.get('pnl_pct', 0)))} | "
+        f"{fmt_r(t.get('pnl_r', 0))} | "
+        f"Score {t.get('score', 0)}"
+    )
+
+
+def calc_predator_stats(trades):
+    entries = [t for t in trades if t.get("event") == "ENTRY"]
     exits = [t for t in trades if t.get("event") in ["SL", "TRAIL", "BE", "CLOSE"]]
     tp50s = [t for t in trades if t.get("event") == "TP50"]
+    trails = [t for t in trades if t.get("event") == "TRAILING"]
 
     wins = []
     bes = []
     losses = []
-    pnl_total = 0.0
+
+    gross_win_pct = 0.0
+    gross_loss_pct = 0.0
+    gross_win_r = 0.0
+    gross_loss_r = 0.0
+
+    pnl_pct_total = 0.0
+    pnl_r_total = 0.0
+    mfe_pct_total = 0.0
+    mfe_r_total = 0.0
+    mae_pct_total = 0.0
+    mae_r_total = 0.0
+    giveback_pct_total = 0.0
+    giveback_r_total = 0.0
+
+    cycles_to_tp50 = []
+    management_cycles = []
+
+    best_trade = None
+    worst_trade = None
 
     for t in exits:
-        pnl = float(t.get("pnl", t.get("pnl_pct", 0)) or 0)
-        pnl_total += pnl
-        if pnl > 0.15:
+        pnl_pct_v = safe_float(t.get("pnl", t.get("pnl_pct", 0)), 0.0)
+        risk_pct_v = abs(safe_float(t.get("risk_pct", 0), 0.0))
+        pnl_r_v = safe_float(t.get("pnl_r"), pct_to_r(pnl_pct_v, risk_pct_v))
+        mfe_pct_v = safe_float(t.get("mfe_max_pct", 0), 0.0)
+        mae_pct_v = safe_float(t.get("mae_min_pct", 0), 0.0)
+        giveback_pct_v = safe_float(t.get("mfe_gave_back_pct", 0), 0.0)
+        mfe_r_v = safe_float(t.get("mfe_max_r"), pct_to_r(mfe_pct_v, risk_pct_v))
+        mae_r_v = safe_float(t.get("mae_min_r"), pct_to_r(mae_pct_v, risk_pct_v))
+        giveback_r_v = safe_float(t.get("mfe_gave_back_r"), pct_to_r(giveback_pct_v, risk_pct_v))
+
+        pnl_pct_total += pnl_pct_v
+        pnl_r_total += pnl_r_v
+        mfe_pct_total += mfe_pct_v
+        mfe_r_total += mfe_r_v
+        mae_pct_total += mae_pct_v
+        mae_r_total += mae_r_v
+        giveback_pct_total += giveback_pct_v
+        giveback_r_total += giveback_r_v
+
+        if pnl_pct_v > 0.15:
             wins.append(t)
-        elif pnl >= -0.15:
+            gross_win_pct += pnl_pct_v
+            gross_win_r += pnl_r_v
+        elif pnl_pct_v >= -0.15:
             bes.append(t)
         else:
             losses.append(t)
+            gross_loss_pct += abs(pnl_pct_v)
+            gross_loss_r += abs(pnl_r_v)
 
-    por_score = {"70_74": [], "75_79": [], "80_84": [], "85_plus": []}
+        if t.get("cycles_to_tp50") is not None:
+            cycles_to_tp50.append(safe_float(t.get("cycles_to_tp50"), 0.0))
+        if t.get("management_cycles") is not None:
+            management_cycles.append(safe_float(t.get("management_cycles"), 0.0))
 
+        if best_trade is None or pnl_pct_v > safe_float(best_trade.get("_pnl_calc", -999999)):
+            t["_pnl_calc"] = pnl_pct_v
+            best_trade = t
+        if worst_trade is None or pnl_pct_v < safe_float(worst_trade.get("_pnl_calc", 999999)):
+            t["_pnl_calc"] = pnl_pct_v
+            worst_trade = t
+
+    count = len(exits)
+    non_be_count = len(wins) + len(losses)
+    profit_factor_pct = gross_win_pct / gross_loss_pct if gross_loss_pct > 0 else (float("inf") if gross_win_pct > 0 else 0.0)
+    profit_factor_r = gross_win_r / gross_loss_r if gross_loss_r > 0 else (float("inf") if gross_win_r > 0 else 0.0)
+    expectancy_r = pnl_r_total / count if count else 0.0
+    expectancy_pct = pnl_pct_total / count if count else 0.0
+
+    tp50_exits = [t for t in exits if bool(t.get("tp50_hit", False))]
+    expectancy_after_tp50_r = (
+        sum(safe_float(t.get("pnl_r"), pct_to_r(t.get("pnl", t.get("pnl_pct", 0)), t.get("risk_pct", 0))) for t in tp50_exits) / len(tp50_exits)
+        if tp50_exits else 0.0
+    )
+
+    trend_capture_pct = (
+        (sum(max(0.0, safe_float(t.get("pnl", t.get("pnl_pct", 0)), 0.0)) for t in exits) /
+         sum(max(0.0, safe_float(t.get("mfe_max_pct", 0), 0.0)) for t in exits) * 100)
+        if exits and sum(max(0.0, safe_float(t.get("mfe_max_pct", 0), 0.0)) for t in exits) > 0 else 0.0
+    )
+
+    return {
+        "entries": entries,
+        "exits": exits,
+        "tp50s": tp50s,
+        "trails": trails,
+        "count": count,
+        "wins": len(wins),
+        "be": len(bes),
+        "losses": len(losses),
+        "winrate": (len(wins) / count * 100) if count else 0.0,
+        "winrate_sem_be": (len(wins) / non_be_count * 100) if non_be_count else 0.0,
+        "profit_factor_pct": profit_factor_pct,
+        "profit_factor_r": profit_factor_r,
+        "expectancy_r": expectancy_r,
+        "expectancy_pct": expectancy_pct,
+        "expectancy_after_tp50_r": expectancy_after_tp50_r,
+        "pnl_pct": pnl_pct_total,
+        "pnl_r": pnl_r_total,
+        "mfe_avg_pct": mfe_pct_total / count if count else 0.0,
+        "mfe_avg_r": mfe_r_total / count if count else 0.0,
+        "mae_avg_pct": mae_pct_total / count if count else 0.0,
+        "mae_avg_r": mae_r_total / count if count else 0.0,
+        "giveback_avg_pct": giveback_pct_total / count if count else 0.0,
+        "giveback_avg_r": giveback_r_total / count if count else 0.0,
+        "tp50_hits": len(tp50s),
+        "avg_cycles_to_tp50": sum(cycles_to_tp50) / len(cycles_to_tp50) if cycles_to_tp50 else 0.0,
+        "avg_management_cycles": sum(management_cycles) / len(management_cycles) if management_cycles else 0.0,
+        "trend_capture_pct": trend_capture_pct,
+        "runners_3r": sum(1 for t in exits if safe_float(t.get("mfe_max_r"), pct_to_r(t.get("mfe_max_pct", 0), t.get("risk_pct", 0))) >= 3),
+        "runners_5r": sum(1 for t in exits if safe_float(t.get("mfe_max_r"), pct_to_r(t.get("mfe_max_pct", 0), t.get("risk_pct", 0))) >= 5),
+        "runners_10r": sum(1 for t in exits if safe_float(t.get("mfe_max_r"), pct_to_r(t.get("mfe_max_pct", 0), t.get("risk_pct", 0))) >= 10),
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+    }
+
+
+def stats_by_side_text(exits):
+    lines = []
+    for side in ["LONG", "SHORT"]:
+        rows = [t for t in exits if t.get("side") == side]
+        st = calc_predator_stats(rows)
+        lines.append(
+            f"{side}: {st['count']} trades | WR {st['winrate']:.2f}% | "
+            f"PF {fmt_pf(st['profit_factor_pct'])} | Exp {fmt_r(st['expectancy_r'])}"
+        )
+    return "\n".join(lines)
+
+
+def stats_by_score_text(exits):
+    buckets = {
+        "70-79": [],
+        "80-84": [],
+        "85-89": [],
+        "90-94": [],
+        "95+": [],
+    }
     for t in exits:
-        score = int(t.get("score", 0) or 0)
-        if 70 <= score <= 74:
-            por_score["70_74"].append(t)
-        elif 75 <= score <= 79:
-            por_score["75_79"].append(t)
+        score = safe_int(t.get("score", 0), 0)
+        if 70 <= score <= 79:
+            buckets["70-79"].append(t)
         elif 80 <= score <= 84:
-            por_score["80_84"].append(t)
-        elif score >= 85:
-            por_score["85_plus"].append(t)
+            buckets["80-84"].append(t)
+        elif 85 <= score <= 89:
+            buckets["85-89"].append(t)
+        elif 90 <= score <= 94:
+            buckets["90-94"].append(t)
+        elif score >= 95:
+            buckets["95+"].append(t)
 
-    linhas_score = []
-    for faixa, itens in por_score.items():
-        if not itens:
-            linhas_score.append(f"{faixa}: 0 trades")
-            continue
-        w = [t for t in itens if float(t.get("pnl", t.get("pnl_pct", 0)) or 0) > 0.15]
-        wr = len(w) / len(itens) * 100
-        linhas_score.append(f"{faixa}: {len(itens)} trades | WR {wr:.2f}%")
+    lines = []
+    for name, rows in buckets.items():
+        st = calc_predator_stats(rows)
+        lines.append(
+            f"{name}: {st['count']} trades | WR {st['winrate']:.2f}% | "
+            f"PF {fmt_pf(st['profit_factor_pct'])} | Exp {fmt_r(st['expectancy_r'])}"
+        )
+    return "\n".join(lines)
 
-    fechados = len(exits)
-    win_rate = (len(wins) / fechados * 100) if fechados else 0
-    win_rate_sem_be = (len(wins) / (len(wins) + len(losses)) * 100) if (len(wins) + len(losses)) else 0
 
-    avg_mfe = sum(float(t.get("mfe_max_pct", 0)) for t in exits) / len(exits) if exits else 0
-    avg_giveback = sum(float(t.get("mfe_gave_back_pct", 0)) for t in exits) / len(exits) if exits else 0
+def asset_ranking_text(exits, limit=8):
+    grouped = {}
+    for t in exits:
+        sym = t.get("symbol_clean") or nome_limpo(t.get("symbol", ""))
+        grouped.setdefault(sym, []).append(t)
+
+    rows = []
+    for sym, items in grouped.items():
+        st = calc_predator_stats(items)
+        rows.append((st["pnl_pct"], sym, st))
+
+    if not rows:
+        return "N/A"
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+    top = rows[:limit]
+    bottom = list(reversed(rows[-limit:])) if len(rows) > limit else []
+
+    top_lines = [
+        f"{sym}: {fmt_pct(st['pnl_pct'])} | {st['count']} trades | WR {st['winrate']:.2f}% | PF {fmt_pf(st['profit_factor_pct'])}"
+        for _, sym, st in top
+    ]
+    bottom_lines = [
+        f"{sym}: {fmt_pct(st['pnl_pct'])} | {st['count']} trades | WR {st['winrate']:.2f}% | PF {fmt_pf(st['profit_factor_pct'])}"
+        for _, sym, st in bottom
+    ]
+
+    if bottom_lines:
+        return "Melhores:\n" + "\n".join(top_lines) + "\n\nPiores:\n" + "\n".join(bottom_lines)
+    return "Melhores:\n" + "\n".join(top_lines)
+
+
+def montar_stats_gerais():
+    trades = carregar_trades()
+    stats = calc_predator_stats(trades)
+    exits = stats["exits"]
 
     return (
-        f"📈 ESTATÍSTICAS SMART PREDATOR\n\n"
+        f"📈 ESTATÍSTICAS SMART PREDATOR V4\n\n"
         f"Smart Predator ativo: {check_bool(SMART_PREDATOR_ENABLED)}\n"
         f"Modo: {'REAL' if SMART_PREDATOR_AUTO_TRADE else 'OBSERVAÇÃO'}\n\n"
-        f"Sinais totais: {len(entradas)}\n"
-        f"Trades encerrados: {fechados}\n"
-        f"Wins: {len(wins)}\n"
-        f"Breakeven: {len(bes)}\n"
-        f"Loss: {len(losses)}\n"
-        f"Win rate: {win_rate:.2f}%\n"
-        f"Win rate sem BE: {win_rate_sem_be:.2f}%\n\n"
-        f"TP50 atingidos: {len(tp50s)}\n"
-        f"PnL realizado total: {fmt_pct(pnl_total)}\n"
-        f"MFE médio: {fmt_pct(avg_mfe)}\n"
-        f"Devolução média: {fmt_pct(avg_giveback)}\n\n"
-        f"Por score:\n" + "\n".join(linhas_score)
+        f"Sinais totais: {len(stats['entries'])}\n"
+        f"Trades encerrados: {stats['count']}\n"
+        f"Wins: {stats['wins']}\n"
+        f"Breakeven: {stats['be']}\n"
+        f"Loss: {stats['losses']}\n"
+        f"Win rate: {stats['winrate']:.2f}%\n"
+        f"Win rate sem BE: {stats['winrate_sem_be']:.2f}%\n"
+        f"Profit Factor %: {fmt_pf(stats['profit_factor_pct'])}\n"
+        f"Profit Factor R: {fmt_pf(stats['profit_factor_r'])}\n"
+        f"Expectancy: {fmt_r(stats['expectancy_r'])} por trade\n"
+        f"Expectancy pós-TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
+        f"Captura de tendência: {stats['trend_capture_pct']:.2f}%\n\n"
+        f"TP50 atingidos: {stats['tp50_hits']}\n"
+        f"Tempo médio até TP50: {stats['avg_cycles_to_tp50']:.1f} ciclos de gestão\n"
+        f"Tempo médio até fechamento: {stats['avg_management_cycles']:.1f} ciclos de gestão\n\n"
+        f"PnL realizado:\n{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
+        f"MFE médio:\n{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n"
+        f"MAE médio:\n{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n"
+        f"Devolução média:\n{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
+        f"Runners:\n3R+: {stats['runners_3r']}\n5R+: {stats['runners_5r']}\n10R+: {stats['runners_10r']}\n\n"
+        f"LONG x SHORT:\n{stats_by_side_text(exits)}\n\n"
+        f"Por score:\n{stats_by_score_text(exits)}\n\n"
+        f"Ranking por ativo:\n{asset_ranking_text(exits, 8)}\n\n"
+        f"Melhor trade:\n{trade_line_predator(stats['best_trade'])}\n\n"
+        f"Pior trade:\n{trade_line_predator(stats['worst_trade'])}"
     )
 
 
@@ -1697,6 +2021,9 @@ def montar_posicoes_texto():
                 f"Stop Atual: {fmt_br(p.get('sl'))}\n"
                 f"TP50: {fmt_br(p.get('tp50'))}\n"
                 f"Score: {p.get('score')}/100\n"
+                f"MFE: {fmt_pct(p.get('mfe_max_pct', 0))}\n"
+                f"MAE: {fmt_pct(p.get('mae_min_pct', 0))}\n"
+                f"Ciclos em trade: {p.get('management_cycles', 0)}\n"
                 f"Status: {'TP50 ✅' if p.get('tp50_hit') else 'Aberto'}\n"
             )
         except Exception:
@@ -1731,7 +2058,9 @@ def montar_funnel_stats_texto():
         f"Rejeitados por risco: {s.get('risk_rejected', 0)}\n\n"
         f"Score >= 70: {s.get('score_70_plus', 0)}\n"
         f"Score >= 80: {s.get('score_80_plus', 0)}\n"
-        f"Score >= 85: {s.get('score_85_plus', 0)}\n\n"
+        f"Score >= 85: {s.get('score_85_plus', 0)}\n"
+        f"Score >= 90: {s.get('score_90_plus', 0)}\n"
+        f"Score >= 95: {s.get('score_95_plus', 0)}\n\n"
         f"Sinais detectados: {s.get('signals_detected', 0)}\n"
         f"Sinais enviados: {s.get('signals_sent', 0)}\n"
         f"LONG: {s.get('long_signals', 0)}\n"
@@ -2008,6 +2337,7 @@ def processar_comando(texto):
             "/mensal - resumo mensal\n"
             "/stats - estatísticas gerais\n"
             "/funil - funil do setup\n"
+            "/ranking - ranking por ativo\n"
             "/watchlist - ativos monitorados\n"
             "/reset - limpa posições, sinais, histórico e funil\n"
             "/comandos - mostra esta lista"
@@ -2036,6 +2366,9 @@ def processar_comando(texto):
 
     if cmd in ["/funil", "/funnel"]:
         return montar_funnel_stats_texto()
+
+    if cmd in ["/ranking", "/ativos"]:
+        return "🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)
 
     if cmd == "/watchlist":
         wl = carregar_watchlist()
@@ -2256,6 +2589,11 @@ def funil_rota():
 @app.route("/funnel")
 def funnel_rota():
     return montar_funnel_stats_json()
+
+
+@app.route("/ranking")
+def ranking_rota():
+    return ("🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)).replace("\n", "<br>")
 
 # ====================================================
 # THREADS MONITORADAS
