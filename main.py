@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-25-CENTRAL-FULL-RELATORIO-DIAGNOSTICO-SELFTEST
+# Versão: 2026-06-25-CENTRAL-FULL-RELATORIO-DIAGNOSTICO-SELFTEST-MEMORY-ROUTES-FIX
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -19,6 +19,8 @@ import os
 import time
 import json
 import threading
+import gc
+from collections import deque
 import requests
 import importlib.util
 from pathlib import Path
@@ -35,6 +37,16 @@ BOTS_DIR = BASE_DIR / "bots"
 WATCHDOG_CHECK_SECONDS = int(os.environ.get("WATCHDOG_CHECK_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
+
+# Limites internos de observabilidade de memória.
+# Render free/starter costuma reiniciar perto de 512 MB; use env para ajustar.
+MEMORY_LIMIT_MB = float(os.environ.get("CENTRAL_MEMORY_LIMIT_MB", "512"))
+MEMORY_GC_THRESHOLD_MB = float(os.environ.get("CENTRAL_MEMORY_GC_THRESHOLD_MB", "430"))
+MEMORY_HISTORY_MAXLEN = int(os.environ.get("CENTRAL_MEMORY_HISTORY_MAXLEN", "120"))
+MEMORY_LOG_EVERY_SECONDS = int(os.environ.get("CENTRAL_MEMORY_LOG_EVERY_SECONDS", "300"))
+MEMORY_HISTORY = deque(maxlen=MEMORY_HISTORY_MAXLEN)
+LAST_MEMORY_LOG_TS = 0.0
+LAST_GC_TS = 0.0
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -97,6 +109,142 @@ def safe_round(value, ndigits=2, default=None):
         return round(float(value), ndigits)
     except Exception:
         return default
+
+
+def current_rss_mb():
+    """RSS atual do processo em MB, usando /proc para não depender de psutil."""
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as f:
+            pages = int(f.read().split()[1])
+        return round(pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024), 2)
+    except Exception:
+        return None
+
+
+def memory_percent(rss_mb=None):
+    try:
+        rss = current_rss_mb() if rss_mb is None else rss_mb
+        if rss is None or MEMORY_LIMIT_MB <= 0:
+            return None
+        return round((float(rss) / float(MEMORY_LIMIT_MB)) * 100, 2)
+    except Exception:
+        return None
+
+
+def memory_snapshot(label="snapshot"):
+    rss = current_rss_mb()
+    pct = memory_percent(rss)
+    snap = {
+        "ts": data_hora_sp_str(),
+        "label": str(label),
+        "rss_mb": rss,
+        "limit_mb": MEMORY_LIMIT_MB,
+        "usage_pct": pct,
+        "gc_count": list(gc.get_count()),
+        "loaded_bots": list(LOADED_BOTS.keys()),
+        "threads": threading.active_count(),
+    }
+    MEMORY_HISTORY.append(snap)
+    return snap
+
+
+def maybe_collect_garbage(label="auto"):
+    """Coleta GC se a memória estiver alta. Evita rodar GC em loop a cada request."""
+    global LAST_GC_TS
+    rss = current_rss_mb()
+    if rss is None:
+        return {"ran": False, "rss_before_mb": None, "rss_after_mb": None, "reason": "rss_unavailable"}
+
+    now = time.time()
+    if rss < MEMORY_GC_THRESHOLD_MB and now - LAST_GC_TS < 60:
+        return {"ran": False, "rss_before_mb": rss, "rss_after_mb": rss, "reason": "below_threshold"}
+
+    if rss >= MEMORY_GC_THRESHOLD_MB or now - LAST_GC_TS >= 300:
+        before = rss
+        collected = gc.collect()
+        after = current_rss_mb()
+        LAST_GC_TS = now
+        MEMORY_HISTORY.append({
+            "ts": data_hora_sp_str(),
+            "label": f"gc:{label}",
+            "rss_mb": after,
+            "limit_mb": MEMORY_LIMIT_MB,
+            "usage_pct": memory_percent(after),
+            "collected": collected,
+            "rss_before_mb": before,
+            "threads": threading.active_count(),
+        })
+        return {"ran": True, "rss_before_mb": before, "rss_after_mb": after, "collected": collected}
+
+    return {"ran": False, "rss_before_mb": rss, "rss_after_mb": rss, "reason": "cooldown"}
+
+
+def log_memory_if_needed(label="periodic"):
+    global LAST_MEMORY_LOG_TS
+    now = time.time()
+    if now - LAST_MEMORY_LOG_TS < MEMORY_LOG_EVERY_SECONDS:
+        return
+    LAST_MEMORY_LOG_TS = now
+    snap = memory_snapshot(label)
+    print(
+        "MEMORY",
+        f"label={snap.get('label')}",
+        f"rss_mb={snap.get('rss_mb')}",
+        f"usage_pct={snap.get('usage_pct')}",
+        f"threads={snap.get('threads')}",
+    )
+
+
+def build_memory_report():
+    snap_before = memory_snapshot("/memory_before_gc")
+    gc_result = maybe_collect_garbage("/memory")
+    snap_after = memory_snapshot("/memory_after_gc")
+
+    status = "OK"
+    pct = snap_after.get("usage_pct")
+    if pct is not None and pct >= 90:
+        status = "ATENÇÃO"
+    if pct is not None and pct >= 97:
+        status = "CRÍTICO"
+
+    recent = list(MEMORY_HISTORY)[-8:]
+    hist_lines = [
+        f"{x.get('ts')} | {x.get('label')} | {x.get('rss_mb')} MB | {x.get('usage_pct')}%"
+        for x in recent
+    ]
+
+    lines = [
+        "🧠 MEMÓRIA CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Status: {status}",
+        "",
+        f"RSS antes GC: {snap_before.get('rss_mb')} MB ({snap_before.get('usage_pct')}%)",
+        f"RSS atual: {snap_after.get('rss_mb')} MB ({snap_after.get('usage_pct')}%)",
+        f"Limite configurado: {MEMORY_LIMIT_MB:.0f} MB",
+        f"Threshold GC: {MEMORY_GC_THRESHOLD_MB:.0f} MB",
+        f"Threads ativas: {snap_after.get('threads')}",
+        f"GC count: {snap_after.get('gc_count')}",
+        f"GC executado: {gc_result.get('ran')} | coletados: {gc_result.get('collected')}",
+        "",
+        "Histórico recente:",
+        *(hist_lines or ["Sem histórico."]),
+        "",
+        "Observação:",
+        "Se a memória ficar acima de 90% por muito tempo, o Render pode reiniciar o serviço.",
+    ]
+    return "\n".join(lines)
+
+
+@app.after_request
+def after_request_memory_housekeeping(response):
+    try:
+        log_memory_if_needed("after_request")
+        # Coleta apenas quando estiver acima do limite configurado.
+        if (current_rss_mb() or 0) >= MEMORY_GC_THRESHOLD_MB:
+            maybe_collect_garbage("after_request")
+    except Exception:
+        pass
+    return response
 
 
 # Cada bot recebe seus tokens próprios, mapeados para TELEGRAM_BOT_TOKEN/CHAT_ID
@@ -503,6 +651,8 @@ def central_watchdog_loop():
     while True:
         try:
             CENTRAL_HEALTH["last_watchdog_check"] = data_hora_sp_str()
+            log_memory_if_needed("watchdog")
+            maybe_collect_garbage("watchdog")
             status = central_watchdog_status()
             CENTRAL_HEALTH["watchdog_status"] = status["status"]
 
@@ -686,6 +836,13 @@ def diagnostico():
 @app.route("/selftest")
 def selftest():
     return {"text": build_selftest_report()}
+
+
+@app.route("/memory")
+@app.route("/memoria")
+@app.route("/memória")
+def memory():
+    return {"text": build_memory_report(), "history": list(MEMORY_HISTORY)[-20:]}
 
 
 # ==========================================================
@@ -1020,6 +1177,7 @@ def build_diagnostic_report():
         f"Scanners/Gestão recentes: {'✅' if all_cycles_ok else '❌'}",
         f"Sem erros críticos: {'✅' if all_errors_ok else '❌'}",
         f"Watchlists válidas: {'✅' if all_watchlists_ok else '❌'}",
+        f"Memória: {current_rss_mb()} MB ({memory_percent()}%)",
         "",
         "EXPOSIÇÃO",
         f"Total: {total_pos} | LONG: {long_pos} | SHORT: {short_pos}",
@@ -1145,6 +1303,8 @@ def build_selftest_report():
     add_test("Runners calculados", isinstance(open_runners, dict), f"3R={open_runners.get('runners_3r_open', 0)}")
     add_test("Relatório central gera texto", bool(build_central_status_text()), "OK")
     add_test("Diagnóstico gera texto", bool(build_diagnostic_report()), "OK")
+    mem_pct = memory_percent()
+    add_test("Memória abaixo de 95%", mem_pct is None or mem_pct < 95, f"{current_rss_mb()} MB | {mem_pct}%")
 
     risk_notes = []
     if total_pos >= 50:
@@ -1315,6 +1475,9 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     if cmd0 in {"/selftest", "/self-test", "/teste", "/autoteste"}:
         return build_selftest_report()
 
+    if cmd0 in {"/memory", "/memoria", "/memória"}:
+        return build_memory_report()
+
     parsed_report = parse_report_command(raw_cmd)
     if parsed_report:
         mode, bot_key = parsed_report
@@ -1465,7 +1628,10 @@ def start_central_runtime_once():
 
         CENTRAL_RUNTIME_STARTED = True
 
+    memory_snapshot("before_start_bots")
     start_enabled_bots()
+    memory_snapshot("after_start_bots")
+    maybe_collect_garbage("after_start_bots")
     threading.Thread(target=central_watchdog_loop, daemon=True).start()
     start_central_command_routers()
 
@@ -1475,4 +1641,3 @@ start_central_runtime_once()
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
-
