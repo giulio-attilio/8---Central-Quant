@@ -138,6 +138,7 @@ POI_COOLDOWN_KEY = "memepro:poi_cooldown"
 EARLY_COOLDOWN_KEY = "memepro:early_cooldown"
 FUNNEL_KEY = "memepro:funnel"
 EARLY_HUNTER_COOLDOWN_KEY = "memepro:early_hunter_cooldown"
+STARTUP_MSG_KEY = "memepro:last_startup_msg_ts"
 
 # ====================================================
 # CONFIGURAÇÕES PRINCIPAIS
@@ -1133,6 +1134,28 @@ def enviar_resumo_mensal_se_preciso():
     salvar_monthly_summary_sent(enviados)
 
 
+
+def startup_guard_restante_segundos():
+    try:
+        restante = int(STARTUP_SIGNAL_GRACE_SECONDS - (time.time() - SERVICE_STARTED_TS))
+        return max(0, restante)
+    except Exception:
+        return 0
+
+def pode_enviar_startup_msg():
+    try:
+        ultimo = float(redis_get_str(STARTUP_MSG_KEY, "0") or 0)
+        return time.time() - ultimo >= STARTUP_MSG_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+def marcar_startup_msg_enviada():
+    try:
+        redis_set_str(STARTUP_MSG_KEY, str(time.time()))
+    except Exception:
+        pass
+
+
 def calcular_uptime_horas():
     try:
         started_at = HEALTH.get("started_at")
@@ -1724,6 +1747,8 @@ def detectar_breakout_meme(symbol):
 
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+    if not ohlcv_h1 or not ohlcv_h4:
+        return None
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -1880,6 +1905,8 @@ def detectar_breakout_meme(symbol):
 def analisar_sinal_h1(symbol):
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+    if not ohlcv_h1 or not ohlcv_h4:
+        return None, pd.DataFrame(), pd.DataFrame()
 
     df_h1 = pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"])
     df_h4 = pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"])
@@ -3262,6 +3289,8 @@ def montar_resumo_diario():
     pois = [t for t in trades if t.get("date") == hoje and t.get("event") == "POI"]
     earlys = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY" and t.get("signal_type") == "EARLY"]
     reentries = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY" and t.get("signal_type") == "REENTRY"]
+    breakouts = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY" and t.get("signal_type") in ["BREAKOUT", "HUNTER_BREAKOUT"]]
+    early_hunters = [t for t in trades if t.get("date") == hoje and t.get("event") == "ENTRY" and t.get("signal_type") == "EARLY_HUNTER"]
     fechados = [t for t in trades if t.get("date") == hoje and t.get("event") == "CLOSE"]
     tp50s = [t for t in trades if t.get("date") == hoje and t.get("event") == "TP50"]
     trailings = [t for t in trades if t.get("date") == hoje and t.get("event") == "TRAILING"]
@@ -3286,7 +3315,9 @@ def montar_resumo_diario():
         f"LONG: {len(longs)}",
         f"SHORT: {len(shorts)}",
         f"EARLY: {len(earlys)}",
+        f"EARLY HUNTER: {len(early_hunters)}",
         f"REENTRY: {len(reentries)}",
+        f"MEME BREAKOUT: {len(breakouts)}",
         f"POIs H1: {len(pois)}",
         "",
         f"Trades encerrados: {len(fechados)}",
@@ -3451,6 +3482,76 @@ def montar_health_telegram_curto():
     except Exception as e:
         return f"❌ Erro ao montar /health do Meme: {e}"
 
+
+def montar_watchdog_telegram_curto():
+    try:
+        status = montar_watchdog_status()
+        motivos = status.get("reasons") or []
+        motivos_txt = "Nenhum" if not motivos else "\n".join([f"- {m}" for m in motivos])
+        return (
+            "🚨 WATCHDOG MEME HUNTER\n\n"
+            f"Status: {status.get('status')}\n"
+            f"OK: {check_bool(status.get('ok'))}\n\n"
+            f"Scanner: {status.get('last_scanner_run')}\n"
+            f"Minutos sem scanner: {status.get('minutes_since_scanner')}\n\n"
+            f"Gestão: {status.get('last_management_run')}\n"
+            f"Minutos sem gestão: {status.get('minutes_since_management')}\n\n"
+            f"Último erro: {status.get('last_error')}\n"
+            f"Warning: {status.get('last_warning')}\n\n"
+            f"Motivos:\n{motivos_txt}"
+        )
+    except Exception as e:
+        return f"❌ Erro ao montar /watchdog: {e}"
+
+def montar_funil_telegram():
+    try:
+        f = funil_hoje()
+        return (
+            "🐸 FUNIL MEME HUNTER - DIA\n"
+            f"{agora_sp().strftime('%d/%m/%Y')}\n\n"
+            f"Ativos analisados: {f.get('ativos_analisados', 0)}\n"
+            f"Breakouts detectados: {f.get('breakout_detectados', 0)}\n"
+            f"Early Hunter detectados: {f.get('early_hunter_detectados', 0)}\n"
+            f"Reprovados volume: {f.get('reprovados_volume', 0)}\n"
+            f"Reprovados volume financeiro: {f.get('reprovados_volume_financeiro', 0)}\n"
+            f"Reprovados RSI/momentum: {f.get('reprovados_rsi', 0)}\n"
+            f"Reprovados BB: {f.get('reprovados_bb', 0)}\n"
+            f"Reprovados H4/ADX: {f.get('reprovados_h4', 0)}\n"
+            f"Reprovados risco: {f.get('reprovados_risco', 0)}\n"
+            f"Reprovados score: {f.get('reprovados_score', 0)}\n"
+            f"Reprovados spike: {f.get('reprovados_spike', 0)}\n"
+            f"Reprovados posição ativa: {f.get('reprovados_posicao_ativa', 0)}\n"
+            f"Startup guard ignorados: {f.get('startup_guard_ignorados', 0)}\n"
+            f"Sinais enviados: {f.get('sinais_enviados', 0)}"
+        )
+    except Exception as e:
+        return f"❌ Erro ao montar /funil: {e}"
+
+def montar_eventos_telegram(limite=20):
+    try:
+        trades = carregar_trades()
+        if not trades:
+            return "📜 EVENTOS MEME HUNTER\n\nNenhum evento registrado."
+        recentes = trades[-limite:]
+        linhas = ["📜 EVENTOS MEME HUNTER", "", f"Últimos {len(recentes)} eventos:"]
+        for t in reversed(recentes):
+            evento = t.get("event", "N/A")
+            symbol = t.get("symbol_clean", t.get("symbol", "N/A"))
+            side = t.get("side", "")
+            data = t.get("datetime", t.get("date", ""))
+            origem = t.get("signal_type", t.get("origin", ""))
+            pnl = t.get("pnl", t.get("pnl_pct", t.get("result_pct", None)))
+            extra = ""
+            if pnl is not None:
+                extra = f" | PnL {fmt_pct(pnl)}"
+            elif t.get("entry") is not None:
+                extra = f" | Entrada {fmt_br(t.get('entry'))}"
+            linhas.append(f"{data} | {evento} | {symbol} {side} {origem}{extra}")
+        return "\n".join(linhas)
+    except Exception as e:
+        return f"❌ Erro ao montar /eventos: {e}"
+
+
 def processar_comando(texto):
     cmd = texto.strip().lower()
     if "@" in cmd:
@@ -3478,8 +3579,17 @@ def processar_comando(texto):
     if cmd == "/health":
         return montar_health_telegram_curto()
 
+    if cmd == "/watchdog":
+        return montar_watchdog_telegram_curto()
+
+    if cmd == "/funil":
+        return montar_funil_telegram()
+
+    if cmd == "/eventos":
+        return montar_eventos_telegram()
+
     if cmd == "/teste":
-        return "✅ Meme Hunter PRO conectado ao Telegram."
+        return "✅ Meme Hunter conectado ao Telegram."
 
     if cmd in ["/posicoes", "/posições"]:
         return montar_posicoes()
@@ -3575,17 +3685,21 @@ def scanner():
 
     print("SCANNER INICIADO")
     HEALTH["started_at"] = data_hora_sp_str()
-    safe_send_telegram(
-        "🐸 Robô Meme Hunter PRO iniciado\n\n"
-        f"Filtros ativos:\n"
-        f"Score mínimo: {ELITE_THRESHOLD}/100\n"
-        f"ADX H4 mínimo: {ELITE_MIN_ADX_H4}\n"
-        f"Volume H1 obrigatório: {check_bool(REQUIRE_HIGH_VOLUME)}\n"
-        f"Recuperado ativo: {check_bool(ENABLE_RECOVERED_SIGNAL)}\n"
-        f"Relatório automático: {check_bool(ENABLE_AUTO_POSITION_REPORT)}\n"
-        f"Estratégia principal: Breakout + Volume + Momentum\n"
-        f"Meme score mínimo: {MEME_MIN_SCORE}/100"
-    )
+    if pode_enviar_startup_msg():
+        safe_send_telegram(
+            "🐸 Robô Meme Hunter iniciado\n\n"
+            f"Filtros ativos:\n"
+            f"Score mínimo: {ELITE_THRESHOLD}/100\n"
+            f"ADX H4 mínimo: {ELITE_MIN_ADX_H4}\n"
+            f"Volume H1 obrigatório: {check_bool(REQUIRE_HIGH_VOLUME)}\n"
+            f"Recuperado ativo: {check_bool(ENABLE_RECOVERED_SIGNAL)}\n"
+            f"Relatório automático: {check_bool(ENABLE_AUTO_POSITION_REPORT)}\n"
+            f"Estratégia principal: Breakout + Volume + Momentum\n"
+            f"Meme score mínimo: {MEME_MIN_SCORE}/100"
+        )
+        marcar_startup_msg_enviada()
+    else:
+        print("STARTUP MEME: mensagem de inicialização suprimida por cooldown")
 
     while True:
         try:
@@ -3917,7 +4031,7 @@ def health():
     except Exception as e:
         return {
             "ok": False,
-            "bot": "Meme Hunter PRO",
+            "bot": "Meme Hunter",
             "last_error": str(e),
             "health": HEALTH,
         }
@@ -3928,7 +4042,7 @@ def watchdog_status():
 
 @app.route("/")
 def home():
-    return "Meme Hunter PRO Online"
+    return "Meme Hunter Online"
 
 
 
