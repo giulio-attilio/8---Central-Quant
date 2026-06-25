@@ -107,7 +107,7 @@ ONE_TRADE_PER_SYMBOL_PER_DAY = str(os.environ.get("FALCON_ONE_TRADE_PER_SYMBOL_P
 SCAN_SLEEP_SECONDS = int(os.environ.get("FALCON_SCAN_SLEEP_SECONDS", "60"))
 MANAGEMENT_SLEEP_SECONDS = int(os.environ.get("FALCON_MANAGEMENT_SLEEP_SECONDS", "20"))
 COMMAND_SLEEP_SECONDS = int(os.environ.get("FALCON_COMMAND_SLEEP_SECONDS", "2"))
-FALCON_COMMANDS_ENABLED = str(os.environ.get("FALCON_COMMANDS_ENABLED", "false")).lower() in {"1", "true", "yes", "sim", "on"}
+FALCON_COMMANDS_ENABLED = False  # comandos centralizados na Central Quant; nunca usar getUpdates aqui
 WATCHDOG_SLEEP_SECONDS = int(os.environ.get("FALCON_WATCHDOG_SLEEP_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("FALCON_WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("FALCON_WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
@@ -1209,7 +1209,7 @@ def signals_month():
 
 def refresh_health_stats():
     # Limpa warning antigo do getUpdates quando os comandos estão centralizados na Central.
-    if (not FALCON_COMMANDS_ENABLED) and "getUpdates 409" in str(HEALTH.get("last_warning") or ""):
+    if "getUpdates 409" in str(HEALTH.get("last_warning") or ""):
         HEALTH["last_warning"] = None
     month_trades = trades_month()
     month_signals = signals_month()
@@ -1441,7 +1441,7 @@ def events_text(limit=20):
 
 def health_payload():
     refresh_health_stats()
-    if (not FALCON_COMMANDS_ENABLED) and "getUpdates 409" in str(HEALTH.get("last_warning") or ""):
+    if "getUpdates 409" in str(HEALTH.get("last_warning") or ""):
         HEALTH["last_warning"] = None
     return {
         "ok": HEALTH.get("last_error") is None,
@@ -1619,10 +1619,8 @@ def start_threads():
     threading.Thread(target=run_thread_guarded, args=("management", management_loop), daemon=True).start()
     threading.Thread(target=run_thread_guarded, args=("summary", summary_loop), daemon=True).start()
     # Comandos do Falcon ficam centralizados no roteador da Central Quant.
-    # Por padrão, NÃO inicia getUpdates aqui para evitar conflito 409.
-    # Só ligue FALCON_COMMANDS_ENABLED=true se o Falcon rodar isolado, sem Central.
-    if FALCON_COMMANDS_ENABLED:
-        threading.Thread(target=run_thread_guarded, args=("commands", commands_loop), daemon=True).start()
+    # NÃO iniciar commands_loop aqui para evitar conflito 409 getUpdates.
+    # threading.Thread(target=run_thread_guarded, args=("commands", commands_loop), daemon=True).start()
 
     threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
 
