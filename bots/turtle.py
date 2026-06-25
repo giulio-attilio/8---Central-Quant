@@ -1,7 +1,6 @@
-# Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em TURTLE.
 # ==============================================================================
 # TURTLE BREAKOUT PRO 2.0 - CENTRAL QUANT
-# Versão: 2026-06-24-TURTLE-BREAKOUT-PRO-RELATORIOS-PRO
+# Versão: 2026-06-23-TURTLE-BREAKOUT-PRO-100-100-FUNIL-PAPER
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -57,7 +56,6 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import requests
-import numpy as np
 import pandas as pd
 import ccxt
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
@@ -95,31 +93,20 @@ OHLCV_LIMIT = int(os.environ.get("TURTLE_OHLCV_LIMIT", "220"))
 
 ATR_LEN = int(os.environ.get("TURTLE_ATR_LEN", "14"))
 ATR_STOP_MULT = float(os.environ.get("TURTLE_ATR_STOP_MULT", "2.0"))
-TP50_R = float(os.environ.get("TURTLE_TP50_R", "0.8"))
-
-# Gestão de parcial:
-# - Ao bater TP50, considera 50% realizado no preço do TP50/preço atual.
-# - O restante continua aberto com stop em BE.
-# - O resultado final do trade passa a ser: parcial realizada + restante encerrado.
-TP50_PARTIAL_ENABLED = str(os.environ.get("TURTLE_TP50_PARTIAL_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
-TP50_PARTIAL_PCT = float(os.environ.get("TURTLE_TP50_PARTIAL_PCT", "50"))
-TP50_REMAINING_PCT = max(0.0, 100.0 - TP50_PARTIAL_PCT)
+TP50_R = float(os.environ.get("TURTLE_TP50_R", "1.0"))
 
 MIN_ATR_PCT = float(os.environ.get("TURTLE_MIN_ATR_PCT", "0.25"))
 MAX_RISK_PCT = float(os.environ.get("TURTLE_MAX_RISK_PCT", "6.0"))
 
 # Score Turtle
-SCORE_MIN_QUALITY_TO_SIGNAL = int(os.environ.get("TURTLE_SCORE_MIN_QUALITY_TO_SIGNAL", "70"))
+SCORE_MIN_QUALITY_TO_SIGNAL = int(os.environ.get("TURTLE_SCORE_MIN_QUALITY_TO_SIGNAL", "0"))
 VOLUME_REL_LOOKBACK = int(os.environ.get("TURTLE_VOLUME_REL_LOOKBACK", "20"))
-MIN_VOLUME_REL_TO_SIGNAL = float(os.environ.get("TURTLE_MIN_VOLUME_REL_TO_SIGNAL", "1.20"))
-MIN_ADX_TO_SIGNAL = float(os.environ.get("TURTLE_MIN_ADX_TO_SIGNAL", "20"))
-ADX_LEN = int(os.environ.get("TURTLE_ADX_LEN", "14"))
 IDEAL_ATR_PCT = float(os.environ.get("TURTLE_IDEAL_ATR_PCT", "1.20"))
 IDEAL_BREAKOUT_ATR = float(os.environ.get("TURTLE_IDEAL_BREAKOUT_ATR", "0.35"))
 IDEAL_CHANNEL_ATR = float(os.environ.get("TURTLE_IDEAL_CHANNEL_ATR", "3.0"))
 
-MAX_OPEN_POSITIONS = int(os.environ.get("TURTLE_MAX_OPEN_POSITIONS", "10"))
-ALLOW_SAME_SYMBOL_BOTH_SETUPS = str(os.environ.get("TURTLE_ALLOW_SAME_SYMBOL_BOTH_SETUPS", "false")).lower() in {"1", "true", "yes", "sim", "on"}
+MAX_OPEN_POSITIONS = int(os.environ.get("TURTLE_MAX_OPEN_POSITIONS", "40"))
+ALLOW_SAME_SYMBOL_BOTH_SETUPS = str(os.environ.get("TURTLE_ALLOW_SAME_SYMBOL_BOTH_SETUPS", "true")).lower() in {"1", "true", "yes", "sim", "on"}
 
 SCAN_SLEEP_SECONDS = int(os.environ.get("TURTLE_SCAN_SLEEP_SECONDS", "60"))
 MANAGEMENT_SLEEP_SECONDS = int(os.environ.get("TURTLE_MANAGEMENT_SLEEP_SECONDS", "20"))
@@ -129,16 +116,7 @@ WATCHDOG_SLEEP_SECONDS = int(os.environ.get("TURTLE_WATCHDOG_SLEEP_SECONDS", "30
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("TURTLE_WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("TURTLE_WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
 
-STARTUP_GUARD_SECONDS = int(
-    os.environ.get(
-        "TURTLE_STARTUP_GUARD_SECONDS",
-        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
-    )
-)
-
-STARTUP_SIGNAL_GRACE_SECONDS = STARTUP_GUARD_SECONDS
-
-)
+STARTUP_GUARD_SECONDS = int(os.environ.get("TURTLE_STARTUP_GUARD_SECONDS", "300"))
 SIGNAL_COOLDOWN_CANDLES = int(os.environ.get("TURTLE_SIGNAL_COOLDOWN_CANDLES", "3"))
 
 DAILY_SUMMARY_HOUR = int(os.environ.get("TURTLE_DAILY_SUMMARY_HOUR", "23"))
@@ -523,19 +501,6 @@ def add_indicators(df):
         axis=1,
     ).max(axis=1)
     df["atr"] = tr.rolling(ATR_LEN).mean()
-
-    # ADX simples para filtrar rompimentos sem força direcional.
-    up_move = df["high"].diff()
-    down_move = -df["low"].diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-    plus_dm = pd.Series(plus_dm, index=df.index)
-    minus_dm = pd.Series(minus_dm, index=df.index)
-    atr_adx = tr.rolling(ADX_LEN).mean()
-    plus_di = 100 * plus_dm.rolling(ADX_LEN).mean() / atr_adx
-    minus_di = 100 * minus_dm.rolling(ADX_LEN).mean() / atr_adx
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    df["adx"] = dx.rolling(ADX_LEN).mean()
     return df
 
 
@@ -705,8 +670,6 @@ def get_funnel():
             "reprovados_atr": 0,
             "reprovados_risco": 0,
             "reprovados_score": 0,
-            "reprovados_volume": 0,
-            "reprovados_adx": 0,
             "reprovados_cooldown": 0,
             "reprovados_posicao_ativa": 0,
             "sinais_enviados": 0,
@@ -737,8 +700,6 @@ def funnel_snapshot():
         "reprovados_atr": int(data.get("reprovados_atr", 0) or 0),
         "reprovados_risco": int(data.get("reprovados_risco", 0) or 0),
         "reprovados_score": int(data.get("reprovados_score", 0) or 0),
-        "reprovados_volume": int(data.get("reprovados_volume", 0) or 0),
-        "reprovados_adx": int(data.get("reprovados_adx", 0) or 0),
         "reprovados_cooldown": int(data.get("reprovados_cooldown", 0) or 0),
         "reprovados_posicao_ativa": int(data.get("reprovados_posicao_ativa", 0) or 0),
         "sinais_enviados": int(data.get("sinais_enviados", 0) or 0),
@@ -870,16 +831,6 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
         return None
 
     score_data = calc_turtle_score(row, prev, side, close, atr, entry_high, entry_low, entry_len)
-
-    if safe_float(score_data.get("volume_rel")) < MIN_VOLUME_REL_TO_SIGNAL:
-        funnel_inc("reprovados_volume")
-        return None
-
-    adx_value = safe_float(row.get("adx"), 0.0)
-    if adx_value < MIN_ADX_TO_SIGNAL:
-        funnel_inc("reprovados_adx")
-        return None
-
     if score_data["score_turtle"] < SCORE_MIN_QUALITY_TO_SIGNAL:
         funnel_inc("reprovados_score")
         return None
@@ -902,7 +853,6 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
         "score_turtle": score_data["score_turtle"],
         "quality": score_data["quality"],
         "volume_rel": score_data["volume_rel"],
-        "adx": safe_float(row.get("adx"), 0.0),
         "breakout_atr": score_data["breakout_atr"],
         "channel_atr": score_data["channel_atr"],
         "entry_len": entry_len,
@@ -1084,28 +1034,8 @@ def close_position(pid, pos, exit_price, reason):
     initial_stop = safe_float(pos.get("initial_stop", pos["stop"]))
     side = pos["side"]
 
-    remainder_pct = pnl_pct_for_side(side, entry, exit_price)
-    remainder_r = r_for_side(side, entry, initial_stop, exit_price)
-
-    partial_enabled = bool(pos.get("tp50_hit")) and TP50_PARTIAL_ENABLED
-    partial_fraction = safe_float(pos.get("partial_fraction"), TP50_PARTIAL_PCT / 100.0)
-    remaining_fraction = safe_float(pos.get("remaining_fraction"), TP50_REMAINING_PCT / 100.0)
-
-    if partial_enabled:
-        partial_price = safe_float(pos.get("partial_price"), safe_float(pos.get("tp50"), exit_price))
-        partial_pct = safe_float(pos.get("partial_result_pct"), pnl_pct_for_side(side, entry, partial_price))
-        partial_r = safe_float(pos.get("partial_result_r"), r_for_side(side, entry, initial_stop, partial_price))
-
-        result_pct = (partial_pct * partial_fraction) + (remainder_pct * remaining_fraction)
-        result_r = (partial_r * partial_fraction) + (remainder_r * remaining_fraction)
-    else:
-        partial_price = None
-        partial_pct = 0.0
-        partial_r = 0.0
-        partial_fraction = 0.0
-        remaining_fraction = 1.0
-        result_pct = remainder_pct
-        result_r = remainder_r
+    result_pct = pnl_pct_for_side(side, entry, exit_price)
+    result_r = r_for_side(side, entry, initial_stop, exit_price)
 
     giveback_pct = safe_float(pos.get("mfe_pct")) - result_pct
     giveback_r = safe_float(pos.get("mfe_r")) - result_r
@@ -1117,14 +1047,6 @@ def close_position(pid, pos, exit_price, reason):
             "exit_price": exit_price,
             "exit_reason": reason,
             "closed_at": data_hora_sp_str(),
-            "partial_enabled": partial_enabled,
-            "partial_price": partial_price,
-            "partial_pct": partial_fraction * 100.0,
-            "remaining_pct": remaining_fraction * 100.0,
-            "partial_result_pct": partial_pct,
-            "partial_result_r": partial_r,
-            "remainder_result_pct": remainder_pct,
-            "remainder_result_r": remainder_r,
             "result_pct": result_pct,
             "result_r": result_r,
             "giveback_pct": giveback_pct,
@@ -1142,25 +1064,13 @@ def close_position(pid, pos, exit_price, reason):
     else:
         emoji = "🟡"
 
-    partial_txt = ""
-    if partial_enabled:
-        partial_txt = (
-            f"\nParcial TP50:\n"
-            f"{partial_fraction * 100:.0f}% em {fmt_price(partial_price)} | "
-            f"{fmt_pct(partial_pct)} | {fmt_r(partial_r)}\n"
-            f"Restante:\n"
-            f"{remaining_fraction * 100:.0f}% encerrado em {fmt_price(exit_price)} | "
-            f"{fmt_pct(remainder_pct)} | {fmt_r(remainder_r)}\n"
-        )
-
     safe_send_telegram(
         f"🐢 SAÍDA {pos.get('setup_label', pos.get('setup'))} - {pos['symbol']}\n\n"
         f"Direção: {side}\n"
         f"Entrada: {fmt_price(entry)}\n"
         f"Saída: {fmt_price(exit_price)}\n"
-        f"Motivo: {reason}\n"
-        f"{partial_txt}\n"
-        f"Resultado consolidado:\n{fmt_pct(result_pct)} | {fmt_r(result_r)}\n"
+        f"Motivo: {reason}\n\n"
+        f"Resultado: {fmt_pct(result_pct)} | {fmt_r(result_r)}\n"
         f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}\n"
         f"MAE: {fmt_pct(pos.get('mae_pct', 0))} | {fmt_r(pos.get('mae_r', 0))}\n"
         f"Devolução: {fmt_pct(giveback_pct)} | {fmt_r(giveback_r)}\n\n"
@@ -1168,6 +1078,7 @@ def close_position(pid, pos, exit_price, reason):
     )
 
     return trade
+
 
 def management_loop():
     while True:
@@ -1206,47 +1117,16 @@ def management_loop():
                         pos["be_moved"] = True
                         pos["stop"] = entry
                         pos["candles_to_tp50"] = int(pos.get("management_cycles", 0))
-
-                        partial_fraction = TP50_PARTIAL_PCT / 100.0 if TP50_PARTIAL_ENABLED else 0.0
-                        remaining_fraction = max(0.0, 1.0 - partial_fraction)
-                        partial_pct = pnl_pct_for_side(side, entry, price)
-                        partial_r = r_for_side(side, entry, safe_float(pos.get("initial_stop", stop)), price)
-
-                        pos["partial_enabled"] = TP50_PARTIAL_ENABLED
-                        pos["partial_price"] = price
-                        pos["partial_pct"] = TP50_PARTIAL_PCT if TP50_PARTIAL_ENABLED else 0.0
-                        pos["remaining_pct"] = TP50_REMAINING_PCT if TP50_PARTIAL_ENABLED else 100.0
-                        pos["partial_fraction"] = partial_fraction
-                        pos["remaining_fraction"] = remaining_fraction
-                        pos["partial_result_pct"] = partial_pct
-                        pos["partial_result_r"] = partial_r
-                        pos["partial_realized_pct"] = partial_pct * partial_fraction
-                        pos["partial_realized_r"] = partial_r * partial_fraction
                         changed = True
 
-                        record_event(
-                            "TP50",
-                            pos,
-                            {
-                                "price": price,
-                                "candles_to_tp50": pos["candles_to_tp50"],
-                                "partial_pct": pos["partial_pct"],
-                                "partial_result_pct": partial_pct,
-                                "partial_result_r": partial_r,
-                                "partial_realized_pct": pos["partial_realized_pct"],
-                                "partial_realized_r": pos["partial_realized_r"],
-                            }
-                        )
+                        record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"]})
                         record_event("BE", pos, {"new_stop": entry})
 
                         safe_send_telegram(
                             f"🐢 TP50 {pos.get('setup_label', pos.get('setup'))} - {symbol}\n\n"
                             f"Direção: {side}\n"
                             f"Preço atual: {fmt_price(price)}\n"
-                            f"Parcial realizada: {TP50_PARTIAL_PCT:.0f}% ✅\n"
-                            f"Resultado da parcial: {fmt_pct(partial_pct)} | {fmt_r(partial_r)}\n"
-                            f"Lucro garantido na posição total: {fmt_pct(pos['partial_realized_pct'])} | {fmt_r(pos['partial_realized_r'])}\n"
-                            f"Stop do restante movido para BE: {fmt_price(entry)}\n"
+                            f"Stop movido para BE: {fmt_price(entry)}\n"
                             f"Tempo até TP50: {pos['candles_to_tp50']} ciclos de gestão\n\n"
                             f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}"
                         )
@@ -1464,22 +1344,6 @@ def get_open_runner():
     return best
 
 
-
-def startup_guard_active():
-    """Retorna se o startup guard ainda está ativo.
-
-    O padrão da Central Quant é 0 segundos; a função existe para evitar
-    erro caso o relatório/health consulte o estado do guard.
-    """
-    try:
-        started_ts = HEALTH.get("started_ts")
-        if not started_ts:
-            return False
-        return (time.time() - float(started_ts)) < float(STARTUP_GUARD_SECONDS)
-    except Exception:
-        return False
-
-
 def refresh_health_stats():
     month_trades = trades_month()
     month_signals = signals_month()
@@ -1646,8 +1510,6 @@ def build_summary(period_name, trades, period_signals_override=None):
         f"Reprovados por ATR: {HEALTH.get('funnel_today', {}).get('reprovados_atr', 0)}\n"
         f"Reprovados por risco: {HEALTH.get('funnel_today', {}).get('reprovados_risco', 0)}\n"
         f"Reprovados por score: {HEALTH.get('funnel_today', {}).get('reprovados_score', 0)}\n"
-        f"Reprovados por volume: {HEALTH.get('funnel_today', {}).get('reprovados_volume', 0)}\n"
-        f"Reprovados por ADX: {HEALTH.get('funnel_today', {}).get('reprovados_adx', 0)}\n"
         f"Reprovados por cooldown: {HEALTH.get('funnel_today', {}).get('reprovados_cooldown', 0)}\n"
         f"Reprovados por posição ativa: {HEALTH.get('funnel_today', {}).get('reprovados_posicao_ativa', 0)}\n"
         f"Sinais enviados: {HEALTH.get('funnel_today', {}).get('sinais_enviados', 0)}\n\n"
@@ -1875,8 +1737,6 @@ def funnel_text():
         f"Reprovados por ATR: {f['reprovados_atr']}\n"
         f"Reprovados por risco: {f['reprovados_risco']}\n"
         f"Reprovados por score: {f['reprovados_score']}\n"
-        f"Reprovados por volume: {f.get('reprovados_volume', 0)}\n"
-        f"Reprovados por ADX: {f.get('reprovados_adx', 0)}\n"
         f"Reprovados por cooldown: {f['reprovados_cooldown']}\n"
         f"Reprovados por posição ativa: {f['reprovados_posicao_ativa']}\n\n"
         f"Sinais enviados: {f['sinais_enviados']}"
@@ -2077,470 +1937,12 @@ def reset_paper_route():
     refresh_health_stats()
     return {"ok": True, "message": "paper resetado"}
 
-
-
-# ==============================================================================
-# REFINOS DE RELATÓRIO - CENTRAL QUANT PRO
-# ===============================================================================
-# Este bloco sobrescreve funções de estatística/relatório mantendo a estratégia
-# Turtle intacta. Objetivo: deixar o Turtle no mesmo padrão dos demais bots.
-
-
-def pf_raw(values):
-    vals = [safe_float(v) for v in values]
-    gross_profit = sum(x for x in vals if x > 0)
-    gross_loss = abs(sum(x for x in vals if x < 0))
-    if gross_profit <= 0 or gross_loss <= 0:
-        return None
-    return gross_profit / gross_loss
-
-
-def fmt_pf(value):
-    if value is None:
-        return "N/A"
-    try:
-        return f"{float(value):.2f}"
-    except Exception:
-        return "N/A"
-
-
-def fmt_capture(value):
-    if value is None:
-        return "N/A"
-    try:
-        return f"{float(value):.2f}%"
-    except Exception:
-        return "N/A"
-
-
-def calc_stats(trades):
-    trades = trades or []
-    if not trades:
-        return {
-            "count": 0,
-            "wins": 0,
-            "losses": 0,
-            "be": 0,
-            "winrate": 0.0,
-            "pnl_pct": 0.0,
-            "pnl_r": 0.0,
-            "mfe_avg_pct": 0.0,
-            "mae_avg_pct": 0.0,
-            "mfe_avg_r": 0.0,
-            "mae_avg_r": 0.0,
-            "giveback_avg_pct": 0.0,
-            "giveback_avg_r": 0.0,
-            "expectancy_r": 0.0,
-            "expectancy_after_tp50_r": 0.0,
-            "profit_factor_pct": None,
-            "profit_factor_r": None,
-            "trend_capture_pct": None,
-            "top_mfe": [],
-            "runners_3r": 0,
-            "runners_5r": 0,
-            "runners_10r": 0,
-            "tp50_hits": 0,
-            "avg_management_cycles": 0.0,
-            "avg_candles_to_tp50": 0.0,
-            "best_trade": None,
-            "worst_trade": None,
-            "biggest_runner": None,
-            "biggest_loss": None,
-        }
-
-    results_pct = [safe_float(t.get("result_pct")) for t in trades]
-    results_r = [safe_float(t.get("result_r")) for t in trades]
-
-    wins_trades = [t for t in trades if safe_float(t.get("result_pct")) > 0.05]
-    loss_trades = [t for t in trades if safe_float(t.get("result_pct")) < -0.05]
-
-    top = sorted(
-        [
-            {
-                "symbol": t.get("symbol"),
-                "setup": t.get("setup"),
-                "side": t.get("side"),
-                "mfe_pct": safe_float(t.get("mfe_pct")),
-                "mfe_r": safe_float(t.get("mfe_r")),
-                "closed_at": t.get("closed_at"),
-            }
-            for t in trades
-        ],
-        key=lambda x: x["mfe_r"],
-        reverse=True,
-    )[:5]
-
-    best = max(wins_trades, key=lambda t: safe_float(t.get("result_r"))) if wins_trades else None
-    worst = min(loss_trades, key=lambda t: safe_float(t.get("result_r"))) if loss_trades else None
-    biggest_runner = max(trades, key=lambda t: safe_float(t.get("mfe_r"))) if trades else None
-    biggest_loss = min(loss_trades, key=lambda t: safe_float(t.get("result_r"))) if loss_trades else None
-
-    gross_profit_r = sum(x for x in results_r if x > 0)
-    mfe_positive_r = sum([safe_float(t.get("mfe_r")) for t in trades if safe_float(t.get("mfe_r")) > 0])
-    trend_capture = (gross_profit_r / mfe_positive_r * 100.0) if gross_profit_r > 0 and mfe_positive_r > 0 else None
-
-    tp50_trades = [t for t in trades if t.get("tp50_hit")]
-    expectancy_after_tp50 = avg([t.get("result_r") for t in tp50_trades]) if tp50_trades else 0.0
-
-    return {
-        "count": len(trades),
-        "wins": len(wins_trades),
-        "losses": len(loss_trades),
-        "be": sum(1 for x in results_pct if -0.05 <= x <= 0.05),
-        "winrate": len(wins_trades) / len(trades) * 100.0 if trades else 0.0,
-        "pnl_pct": sum(results_pct),
-        "pnl_r": sum(results_r),
-        "mfe_avg_pct": avg([t.get("mfe_pct") for t in trades]),
-        "mae_avg_pct": avg([t.get("mae_pct") for t in trades]),
-        "mfe_avg_r": avg([t.get("mfe_r") for t in trades]),
-        "mae_avg_r": avg([t.get("mae_r") for t in trades]),
-        "giveback_avg_pct": avg([t.get("giveback_pct") for t in trades]),
-        "giveback_avg_r": avg([t.get("giveback_r") for t in trades]),
-        "expectancy_r": avg(results_r),
-        "expectancy_after_tp50_r": expectancy_after_tp50,
-        "profit_factor_pct": pf_raw(results_pct),
-        "profit_factor_r": pf_raw(results_r),
-        "trend_capture_pct": trend_capture,
-        "top_mfe": top,
-        "runners_3r": sum(1 for t in trades if safe_float(t.get("mfe_r")) >= 3.0),
-        "runners_5r": sum(1 for t in trades if safe_float(t.get("mfe_r")) >= 5.0),
-        "runners_10r": sum(1 for t in trades if safe_float(t.get("mfe_r")) >= 10.0),
-        "tp50_hits": sum(1 for t in trades if t.get("tp50_hit")),
-        "avg_management_cycles": avg([t.get("management_cycles") for t in trades]),
-        "avg_candles_to_tp50": avg([t.get("candles_to_tp50") for t in trades if t.get("candles_to_tp50") is not None]),
-        "best_trade": best,
-        "worst_trade": worst,
-        "biggest_runner": biggest_runner,
-        "biggest_loss": biggest_loss,
-    }
-
-
-def build_ranking_month(month_trades):
-    rows = []
-    for setup_key, setup_trades in split_by_setup(month_trades).items():
-        s = calc_stats(setup_trades)
-        if s["count"] <= 0 or s["wins"] <= 0:
-            continue
-
-        rows.append({
-            "name": setup_key,
-            "label": SETUPS[setup_key]["label"],
-            "trades": s["count"],
-            "profit_factor_r": s["profit_factor_r"],
-            "expectancy_r": s["expectancy_r"],
-            "pnl_r": s["pnl_r"],
-            "winrate": s["winrate"],
-        })
-
-    rows.sort(key=lambda x: (
-        safe_float(x.get("expectancy_r")),
-        safe_float(x.get("profit_factor_r")),
-        safe_float(x.get("winrate")),
-    ), reverse=True)
-    return rows
-
-
-def count_open_runners():
-    positions = get_positions()
-    vals = [safe_float(p.get("mfe_r")) for p in positions.values()]
-    return {
-        "open_runners_3r": sum(1 for r in vals if r >= 3.0),
-        "open_runners_5r": sum(1 for r in vals if r >= 5.0),
-        "open_runners_10r": sum(1 for r in vals if r >= 10.0),
-    }
-
-
-def refresh_health_stats():
-    month_trades = trades_month()
-    month_signals = signals_month()
-    today_trades = trades_today()
-    today_signals = signals_today()
-    today_events = [e for e in get_events() if str(e.get("created_at", "")).startswith(date_key_br())]
-
-    stats = calc_stats(month_trades)
-    HEALTH["funnel_today"] = funnel_snapshot()
-
-    HEALTH["signals_today"] = len(today_signals)
-    HEALTH["signals_month"] = len(month_signals)
-    HEALTH["trades_closed_today"] = len(today_trades)
-    HEALTH["trades_closed_month"] = len(month_trades)
-
-    HEALTH["signals_turtle20_today"] = sum(1 for s in today_signals if s.get("setup") == "TURTLE20")
-    HEALTH["signals_turtle55_today"] = sum(1 for s in today_signals if s.get("setup") == "TURTLE55")
-    HEALTH["signals_buy_today"] = sum(1 for s in today_signals if s.get("side") == "LONG")
-    HEALTH["signals_sell_today"] = sum(1 for s in today_signals if s.get("side") == "SHORT")
-
-    HEALTH["tp50_today"] = sum(1 for e in today_events if e.get("event_type") == "TP50")
-    HEALTH["be_today"] = sum(1 for e in today_events if e.get("event_type") == "BE")
-    HEALTH["stops_today"] = sum(1 for e in today_events if e.get("event_type") == "STOP")
-    HEALTH["turtle_exits_today"] = sum(1 for e in today_events if str(e.get("event_type", "")).startswith("SAÍDA TURTLE"))
-
-    HEALTH["mfe_avg_pct"] = round(stats["mfe_avg_pct"], 4)
-    HEALTH["mae_avg_pct"] = round(stats["mae_avg_pct"], 4)
-    HEALTH["mfe_avg_r"] = round(stats["mfe_avg_r"], 4)
-    HEALTH["mae_avg_r"] = round(stats["mae_avg_r"], 4)
-    HEALTH["giveback_avg_pct"] = round(stats["giveback_avg_pct"], 4)
-    HEALTH["giveback_avg_r"] = round(stats["giveback_avg_r"], 4)
-    HEALTH["expectancy_r"] = round(stats["expectancy_r"], 4)
-    HEALTH["expectancy_after_tp50_r"] = round(stats["expectancy_after_tp50_r"], 4)
-    HEALTH["profit_factor_pct"] = stats["profit_factor_pct"]
-    HEALTH["profit_factor_r"] = stats["profit_factor_r"]
-    HEALTH["trend_capture_pct"] = stats["trend_capture_pct"]
-
-    open_runner = get_open_runner()
-    if open_runner:
-        HEALTH["open_runner_symbol"] = open_runner.get("symbol")
-        HEALTH["open_runner_setup"] = open_runner.get("setup")
-        HEALTH["open_runner_side"] = open_runner.get("side")
-        HEALTH["open_runner_r"] = round(safe_float(open_runner.get("mfe_r")), 4)
-        HEALTH["open_runner_pct"] = round(safe_float(open_runner.get("mfe_pct")), 4)
-    else:
-        HEALTH["open_runner_symbol"] = None
-        HEALTH["open_runner_setup"] = None
-        HEALTH["open_runner_side"] = None
-        HEALTH["open_runner_r"] = 0.0
-        HEALTH["open_runner_pct"] = 0.0
-
-    HEALTH.update(count_open_runners())
-    HEALTH["top_mfe_month"] = stats["top_mfe"]
-    HEALTH["runners_3r"] = stats["runners_3r"]
-    HEALTH["runners_5r"] = stats["runners_5r"]
-    HEALTH["runners_10r"] = stats["runners_10r"]
-
-    HEALTH["setups"] = {setup_key: calc_stats(setup_trades) for setup_key, setup_trades in split_by_setup(month_trades).items()}
-    HEALTH["directions"] = {direction: calc_stats(direction_trades) for direction, direction_trades in split_by_direction(month_trades).items()}
-    HEALTH["ranking_month"] = build_ranking_month(month_trades)
-    HEALTH["best_setup"] = HEALTH["ranking_month"][0]["name"] if HEALTH["ranking_month"] else None
-    HEALTH["worst_setup"] = HEALTH["ranking_month"][-1]["name"] if HEALTH["ranking_month"] else None
-    HEALTH["positions_limit"] = MAX_OPEN_POSITIONS
-    HEALTH["startup_signal_grace_seconds"] = STARTUP_GUARD_SECONDS
-    HEALTH["startup_signal_guard_active"] = startup_guard_active()
-    HEALTH["telegram_configured"] = bool(TOKEN and CHAT_ID)
-    HEALTH["mode"] = "PAPER"
-    HEALTH["last_summary_run"] = data_hora_sp_str()
-
-    # Limpa warning antigo de getUpdates quando os comandos estão centralizados no roteador da Central.
-    if "getUpdates 409" in str(HEALTH.get("last_warning") or ""):
-        HEALTH["last_warning"] = None
-
-
-def setup_summary_lines(trades):
-    by_setup = split_by_setup(trades)
-    lines = []
-    for setup_key, setup_trades in by_setup.items():
-        s = calc_stats(setup_trades)
-        label = SETUPS[setup_key]["label"]
-        lines.append(
-            f"{label}:\n"
-            f"Trades: {s['count']} | WR: {s['winrate']:.2f}%\n"
-            f"PF %: {fmt_pf(s['profit_factor_pct'])} | PF R: {fmt_pf(s['profit_factor_r'])}\n"
-            f"Expectancy: {fmt_r(s['expectancy_r'])}\n"
-            f"Expectancy pós-TP50: {fmt_r(s['expectancy_after_tp50_r'])}\n"
-            f"Captura: {fmt_capture(s['trend_capture_pct'])}\n"
-            f"PnL: {fmt_pct(s['pnl_pct'])} | {fmt_r(s['pnl_r'])}\n"
-            f"MFE médio: {fmt_pct(s['mfe_avg_pct'])} | {fmt_r(s['mfe_avg_r'])}\n"
-            f"MAE médio: {fmt_pct(s['mae_avg_pct'])} | {fmt_r(s['mae_avg_r'])}\n"
-            f"Devolução média: {fmt_pct(s['giveback_avg_pct'])} | {fmt_r(s['giveback_avg_r'])}"
-        )
-    return "\n\n".join(lines) if lines else "N/A"
-
-
-def direction_summary_lines(trades):
-    lines = []
-    for direction, direction_trades in split_by_direction(trades).items():
-        s = calc_stats(direction_trades)
-        lines.append(
-            f"{direction}:\n"
-            f"Trades: {s['count']} | WR: {s['winrate']:.2f}%\n"
-            f"PF R: {fmt_pf(s['profit_factor_r'])} | Expectancy: {fmt_r(s['expectancy_r'])}\n"
-            f"Expectancy pós-TP50: {fmt_r(s['expectancy_after_tp50_r'])}\n"
-            f"PnL: {fmt_pct(s['pnl_pct'])} | {fmt_r(s['pnl_r'])}"
-        )
-    return "\n\n".join(lines) if lines else "N/A"
-
-
-def ranking_text_from_rows(rows):
-    if not rows:
-        return "N/A - nenhum setup com trade vencedor ainda."
-    lines = []
-    for i, row in enumerate(rows, 1):
-        lines.append(
-            f"{i}. {row['label']} | Trades: {row['trades']} | PF R: {fmt_pf(row['profit_factor_r'])} | Exp: {fmt_r(row['expectancy_r'])} | WR: {row['winrate']:.2f}%"
-        )
-    return "\n".join(lines)
-
-
-def trade_line(trade, metric="result"):
-    if not trade:
-        if metric == "result":
-            return "Nenhum trade vencedor."
-        if metric == "worst":
-            return "Nenhum trade perdedor."
-        return "N/A"
-    if metric == "mfe":
-        return f"{trade.get('symbol')} {trade.get('setup')} {fmt_pct(trade.get('mfe_pct'))} | {fmt_r(trade.get('mfe_r'))}"
-    return f"{trade.get('symbol')} {trade.get('setup')} {fmt_pct(trade.get('result_pct'))} | {fmt_r(trade.get('result_r'))}"
-
-
-def positions_text():
-    positions = get_positions()
-    if not positions:
-        return "🐢 Turtle: nenhuma posição paper aberta."
-
-    lines = ["🐢 POSIÇÕES TURTLE PAPER\n"]
-
-    for p in positions.values():
-        price = safe_fetch_price(p["symbol"])
-        current = ""
-        if price:
-            pnl = pnl_pct_for_side(p["side"], p["entry"], price)
-            rr = r_for_side(p["side"], p["entry"], p.get("initial_stop", p["stop"]), price)
-            current = f"Atual: {fmt_price(price)} | {fmt_pct(pnl)} | {fmt_r(rr)}\n"
-
-        if p.get("tp50_hit") and p.get("be_moved"):
-            status_txt = "TP50 + BREAKEVEN ✅"
-        elif p.get("tp50_hit"):
-            status_txt = "TP50 ✅"
-        elif p.get("be_moved"):
-            status_txt = "BREAKEVEN ✅"
-        else:
-            status_txt = "ABERTA"
-
-        partial_txt = ""
-        if p.get("tp50_hit"):
-            partial_txt = (
-                f"Parcial TP50: {safe_float(p.get('partial_pct'), TP50_PARTIAL_PCT):.0f}% | "
-                f"{fmt_pct(p.get('partial_result_pct', 0))} | {fmt_r(p.get('partial_result_r', 0))}\n"
-            )
-
-        lines.append(
-            f"{p.get('setup_label', p.get('setup'))} - {p['symbol']} {p['side']}\n"
-            f"Status: {status_txt}\n"
-            f"Entrada: {fmt_price(p['entry'])}\n"
-            f"SL: {fmt_price(p['stop'])}\n"
-            f"TP50: {fmt_price(p['tp50'])}\n"
-            f"{partial_txt}"
-            f"{current}"
-            f"MFE: {fmt_pct(p.get('mfe_pct', 0))} | {fmt_r(p.get('mfe_r', 0))}\n"
-            f"MAE: {fmt_pct(p.get('mae_pct', 0))} | {fmt_r(p.get('mae_r', 0))}\n"
-        )
-
-    text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3900] + "\n\n..."
-    return text
-
-
-def build_summary(period_name, trades, period_signals_override=None):
-    refresh_health_stats()
-    stats = calc_stats(trades)
-    positions = get_positions()
-    open_by_setup = {k: 0 for k in SETUPS}
-    for p in positions.values():
-        setup = p.get("setup")
-        if setup in open_by_setup:
-            open_by_setup[setup] += 1
-
-    if period_signals_override is not None:
-        period_signals = period_signals_override
-    else:
-        period_signals = signals_today() if period_name == "DIA" else signals_month()
-
-    top_lines = []
-    for item in stats["top_mfe"]:
-        top_lines.append(
-            f"{item.get('symbol')} {item.get('setup')} {fmt_pct(item.get('mfe_pct'))} | {fmt_r(item.get('mfe_r'))}"
-        )
-    top_text = "\n".join(top_lines) if top_lines else "N/A"
-
-    setup_text = setup_summary_lines(trades)
-    direction_text = direction_summary_lines(trades)
-    ranking_text = ranking_text_from_rows(build_ranking_month(trades))
-    open_runners = count_open_runners()
-
-    return (
-        f"🐢 RESUMO TURTLE BREAKOUT PRO 2.0 - {period_name}\n"
-        f"{agora_sp().strftime('%d/%m/%Y')}\n\n"
-        f"Sinais Turtle: {len(period_signals)}\n"
-        f"Turtle 20: {sum(1 for s in period_signals if s.get('setup') == 'TURTLE20')}\n"
-        f"Turtle 55: {sum(1 for s in period_signals if s.get('setup') == 'TURTLE55')}\n"
-        f"LONG: {sum(1 for s in period_signals if s.get('side') == 'LONG')}\n"
-        f"SHORT: {sum(1 for s in period_signals if s.get('side') == 'SHORT')}\n\n"
-        f"🐢 FUNIL TURTLE\n"
-        f"Ativos analisados: {HEALTH.get('funnel_today', {}).get('ativos_analisados', 0)}\n"
-        f"Rompimentos 20 BUY: {HEALTH.get('funnel_today', {}).get('rompimentos_20_buy', 0)}\n"
-        f"Rompimentos 20 SELL: {HEALTH.get('funnel_today', {}).get('rompimentos_20_sell', 0)}\n"
-        f"Rompimentos 55 BUY: {HEALTH.get('funnel_today', {}).get('rompimentos_55_buy', 0)}\n"
-        f"Rompimentos 55 SELL: {HEALTH.get('funnel_today', {}).get('rompimentos_55_sell', 0)}\n"
-        f"Reprovados por ATR: {HEALTH.get('funnel_today', {}).get('reprovados_atr', 0)}\n"
-        f"Reprovados por risco: {HEALTH.get('funnel_today', {}).get('reprovados_risco', 0)}\n"
-        f"Reprovados por score: {HEALTH.get('funnel_today', {}).get('reprovados_score', 0)}\n"
-        f"Reprovados por volume: {HEALTH.get('funnel_today', {}).get('reprovados_volume', 0)}\n"
-        f"Reprovados por ADX: {HEALTH.get('funnel_today', {}).get('reprovados_adx', 0)}\n"
-        f"Reprovados por cooldown: {HEALTH.get('funnel_today', {}).get('reprovados_cooldown', 0)}\n"
-        f"Reprovados por posição ativa: {HEALTH.get('funnel_today', {}).get('reprovados_posicao_ativa', 0)}\n"
-        f"Sinais enviados: {HEALTH.get('funnel_today', {}).get('sinais_enviados', 0)}\n\n"
-        f"Trades encerrados: {stats['count']}\n"
-        f"Wins: {stats['wins']}\n"
-        f"Breakeven: {stats['be']}\n"
-        f"Loss: {stats['losses']}\n"
-        f"Win rate: {stats['winrate']:.2f}%\n"
-        f"Profit Factor %: {fmt_pf(stats['profit_factor_pct'])}\n"
-        f"Profit Factor R: {fmt_pf(stats['profit_factor_r'])}\n"
-        f"Expectancy: {fmt_r(stats['expectancy_r'])} por trade\n"
-        f"Expectancy pós-TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
-        f"Captura de tendência: {fmt_capture(stats['trend_capture_pct'])}\n\n"
-        f"TP50 atingidos: {stats['tp50_hits']}\n"
-        f"Tempo médio até TP50: {stats['avg_candles_to_tp50']:.1f} ciclos de gestão\n"
-        f"Tempo médio até fechamento: {stats['avg_management_cycles']:.1f} ciclos de gestão\n"
-        f"Tempo médio em trade: {stats['avg_management_cycles']:.1f} ciclos de gestão\n"
-        f"Stops: {HEALTH['stops_today'] if period_name == 'DIA' else 'ver eventos'}\n"
-        f"Saídas Turtle: {HEALTH['turtle_exits_today'] if period_name == 'DIA' else 'ver eventos'}\n\n"
-        f"PnL realizado:\n"
-        f"{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
-        f"MFE médio:\n"
-        f"{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n\n"
-        f"MAE médio:\n"
-        f"{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n\n"
-        f"Devolução média:\n"
-        f"{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
-        f"Maior runner aberto:\n"
-        f"{HEALTH.get('open_runner_symbol') or 'N/A'} {HEALTH.get('open_runner_setup') or ''} {fmt_pct(HEALTH.get('open_runner_pct', 0))} | {fmt_r(HEALTH.get('open_runner_r', 0))}\n\n"
-        f"Runners fechados:\n"
-        f"3R+: {stats['runners_3r']}\n"
-        f"5R+: {stats['runners_5r']}\n"
-        f"10R+: {stats['runners_10r']}\n\n"
-        f"Runners abertos:\n"
-        f"3R+: {open_runners['open_runners_3r']}\n"
-        f"5R+: {open_runners['open_runners_5r']}\n"
-        f"10R+: {open_runners['open_runners_10r']}\n\n"
-        f"Por setup:\n"
-        f"{setup_text}\n\n"
-        f"Por direção:\n"
-        f"{direction_text}\n\n"
-        f"Ranking dos setups:\n"
-        f"{ranking_text}\n\n"
-        f"Top 5 MFE do período:\n"
-        f"{top_text}\n\n"
-        f"Maior runner do dia/periodo fechado:\n"
-        f"{trade_line(stats['biggest_runner'], metric='mfe')}\n\n"
-        f"Melhor trade realizado:\n"
-        f"{trade_line(stats['best_trade'])}\n\n"
-        f"Pior trade realizado:\n"
-        f"{trade_line(stats['worst_trade'], metric='worst')}\n\n"
-        f"Trades ainda ativos: {len(positions)}\n"
-        f"Turtle20 ativos: {open_by_setup.get('TURTLE20', 0)}\n"
-        f"Turtle55 ativos: {open_by_setup.get('TURTLE55', 0)}\n\n"
-        f"Modo: PAPER / SEM BINGX"
-    )
-
 # ==============================================================================
 # STARTUP
 # ==============================================================================
 
 def startup():
     HEALTH["started_at"] = data_hora_sp_str()
-    HEALTH["started_ts"] = time.time()
 
     try:
         load_watchlist()
@@ -2563,9 +1965,7 @@ def startup():
     threading.Thread(target=management_loop, daemon=True).start()
     threading.Thread(target=summary_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
-    # # Comandos do Turtle ficam centralizados no roteador da Central Quant.
-    # Evita conflito 409 do Telegram quando a Central também consulta o mesmo token.
-    # threading.Thread(target=command_loop, daemon=True).start()
+    threading.Thread(target=command_loop, daemon=True).start()
 
 
 startup()
