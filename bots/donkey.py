@@ -1,6 +1,6 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em DONKEY.
 # TREND PRO MTF H4/H1 + POI
-# Versão: 2026-06-23-DONKEY-H4-PARCIAL50-EMA20-SELETIVO
+# Versão: 2026-06-25-DONKEY-H4-V2-BOOTSTRAP-WATCHDOG
 #
 # Lógica:
 # - H4 é apenas contexto/filtro.
@@ -223,6 +223,11 @@ DONKEY_EXIT_REMAINDER_ON_H4_EMA20 = True
 DONKEY_POST_EXIT_COOLDOWN_SECONDS = int(os.environ.get("DONKEY_POST_EXIT_COOLDOWN_SECONDS", str(4 * 60 * 60)))
 DONKEY_POST_EXIT_COOLDOWN_KEY = "donkey:post_exit_cooldown"
 
+# Estado persistente de boot/deploy para auditoria e proteção pós-deploy.
+BOOT_STATE_KEY = "donkey:boot_state"
+BOOT_HISTORY_KEY = "donkey:boot_history"
+THREAD_HEARTBEAT_KEY = "donkey:thread_heartbeat"
+
 # Limite de exposição operacional.
 MAX_OPEN_POSITIONS = 25
 
@@ -304,7 +309,7 @@ DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "55"))
 STARTUP_SIGNAL_GRACE_SECONDS = int(
     os.environ.get(
         "DONKEY_STARTUP_SIGNAL_GRACE_SECONDS",
-        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
+        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "600")
     )
 )
 SERVICE_STARTED_TS = time.time()
@@ -536,6 +541,111 @@ def redis_set_json(key, value):
         redis.set(key, json.dumps(value, ensure_ascii=False))
     except Exception as e:
         print(f"ERRO REDIS SET {key}:", e)
+
+
+def carregar_boot_state():
+    return redis_get_json(BOOT_STATE_KEY, {})
+
+
+def salvar_boot_state(dados):
+    redis_set_json(BOOT_STATE_KEY, dados)
+
+
+def registrar_boot():
+    """Registra cada inicialização/deploy do serviço."""
+    try:
+        anterior = carregar_boot_state()
+        historico = redis_get_json(BOOT_HISTORY_KEY, [])
+        agora_txt = data_hora_sp_str()
+        agora_ts = time.time()
+
+        estado = {
+            "last_boot": agora_txt,
+            "last_boot_ts": agora_ts,
+            "previous_boot": anterior.get("last_boot"),
+            "previous_boot_ts": anterior.get("last_boot_ts"),
+            "deploy_counter": int(anterior.get("deploy_counter", 0) or 0) + 1,
+            "boot_completed": False,
+            "boot_completed_at": None,
+            "startup_grace_seconds": STARTUP_SIGNAL_GRACE_SECONDS,
+            "bot": BOT_NAME
+        }
+
+        historico.append({
+            "boot": agora_txt,
+            "boot_ts": agora_ts,
+            "previous_boot": anterior.get("last_boot"),
+            "deploy_counter": estado["deploy_counter"]
+        })
+        historico = historico[-50:]
+
+        salvar_boot_state(estado)
+        redis_set_json(BOOT_HISTORY_KEY, historico)
+        print(f"BOOT REGISTRADO - {BOT_NAME} | deploy_counter={estado['deploy_counter']} | startup_guard={STARTUP_SIGNAL_GRACE_SECONDS}s")
+        return estado
+    except Exception as e:
+        print("ERRO REGISTRAR BOOT:", e)
+        return {}
+
+
+def marcar_boot_completo():
+    try:
+        estado = carregar_boot_state()
+        if estado.get("boot_completed") is True:
+            return
+        estado["boot_completed"] = True
+        estado["boot_completed_at"] = data_hora_sp_str()
+        estado["boot_completed_ts"] = time.time()
+        salvar_boot_state(estado)
+        print("BOOTSTRAP FINALIZADO - OPERAÇÃO NORMAL INICIADA")
+    except Exception as e:
+        print("ERRO MARCAR BOOT COMPLETO:", e)
+
+
+def segundos_restantes_startup_guard():
+    try:
+        restante = STARTUP_SIGNAL_GRACE_SECONDS - (time.time() - SERVICE_STARTED_TS)
+        return max(0, int(restante))
+    except Exception:
+        return 0
+
+
+def atualizar_thread_heartbeat(nome):
+    try:
+        dados = redis_get_json(THREAD_HEARTBEAT_KEY, {})
+        dados[nome] = {
+            "datetime": data_hora_sp_str(),
+            "ts": time.time()
+        }
+        redis_set_json(THREAD_HEARTBEAT_KEY, dados)
+    except Exception:
+        pass
+
+
+def carregar_thread_heartbeat():
+    return redis_get_json(THREAD_HEARTBEAT_KEY, {})
+
+
+def calcular_estado_operacional_donkey():
+    """Métricas operacionais atuais para /health e auditoria diária."""
+    posicoes = carregar_posicoes()
+    abertas = [
+        p for p in posicoes.values()
+        if p.get("status") != "ENCERRADO" and is_donkey_signal_type(p.get("signal_type"))
+    ]
+
+    em_tp50 = [p for p in abertas if bool(p.get("tp50_hit") or p.get("partial_tp50_done"))]
+    aguardando_ema20 = [p for p in abertas if bool(p.get("partial_tp50_done")) and DONKEY_EXIT_REMAINDER_ON_H4_EMA20]
+    protegidas_be = [p for p in abertas if bool(p.get("breakeven")) or bool(p.get("partial_tp50_done"))]
+    runners = [p for p in abertas if bool(p.get("partial_tp50_done")) and float(p.get("remaining_position_pct", 0) or 0) > 0]
+
+    return {
+        "donkey_positions_open": len(abertas),
+        "donkey_positions_tp50": len(em_tp50),
+        "donkey_positions_waiting_ema20": len(aguardando_ema20),
+        "donkey_positions_protected_be": len(protegidas_be),
+        "donkey_runners_active": len(runners)
+    }
 
 
 def carregar_posicoes():
@@ -1120,7 +1230,16 @@ def montar_watchdog_status():
     scanner_stalled = minutes_since_scanner is not None and minutes_since_scanner > WATCHDOG_THRESHOLD_MINUTES
     management_stalled = minutes_since_management is not None and minutes_since_management > WATCHDOG_THRESHOLD_MINUTES
 
-    ok = HEALTH.get("last_error") is None and not scanner_stalled and not management_stalled
+    boot_state = carregar_boot_state()
+    heartbeats = carregar_thread_heartbeat()
+    startup_stalled = False
+    try:
+        # Se o processo ficou tempo demais no bootstrap, é alerta.
+        startup_stalled = startup_signal_guard_active() and (time.time() - SERVICE_STARTED_TS) > (STARTUP_SIGNAL_GRACE_SECONDS + 120)
+    except Exception:
+        startup_stalled = False
+
+    ok = HEALTH.get("last_error") is None and not scanner_stalled and not management_stalled and not startup_stalled
 
     reasons = []
     if HEALTH.get("last_error") is not None:
@@ -1129,6 +1248,8 @@ def montar_watchdog_status():
         reasons.append(f"scanner parado há {minutes_since_scanner} min")
     if management_stalled:
         reasons.append(f"gestão parada há {minutes_since_management} min")
+    if startup_stalled:
+        reasons.append("bootstrap excedeu o tempo esperado")
 
     return {
         "ok": ok,
@@ -1143,6 +1264,13 @@ def montar_watchdog_status():
         "watchdog_alert_cooldown_seconds": WATCHDOG_ALERT_COOLDOWN_SECONDS,
         "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
         "watchdog_last_check": HEALTH.get("watchdog_last_check"),
+        "startup_mode": startup_signal_guard_active(),
+        "startup_remaining_seconds": segundos_restantes_startup_guard(),
+        "boot_completed": boot_state.get("boot_completed"),
+        "last_boot": boot_state.get("last_boot"),
+        "previous_boot": boot_state.get("previous_boot"),
+        "deploy_counter": boot_state.get("deploy_counter"),
+        "thread_heartbeats": heartbeats,
         "status": "OK" if ok else "ALERTA",
         "reasons": reasons
     }
@@ -1177,6 +1305,7 @@ def watchdog_loop():
     while True:
         try:
             HEALTH["watchdog_last_check"] = data_hora_sp_str()
+            atualizar_thread_heartbeat("watchdog")
             status = montar_watchdog_status()
             HEALTH["watchdog_last_status"] = status.get("status", "OK")
             if not status.get("ok", True):
@@ -1200,6 +1329,8 @@ def montar_health_tecnico():
     positions_open = HEALTH.get("last_positions_count", 0)
     usage_pct = (positions_open / MAX_OPEN_POSITIONS * 100) if MAX_OPEN_POSITIONS else 0
     watchdog = montar_watchdog_status()
+    boot_state = carregar_boot_state()
+    operacional = calcular_estado_operacional_donkey()
 
     payload = {
         "ok": HEALTH.get("last_error") is None,
@@ -1209,6 +1340,7 @@ def montar_health_tecnico():
         "last_management_run": HEALTH.get("last_management_run"),
         "last_success": HEALTH.get("last_success"),
         "last_error": HEALTH.get("last_error"),
+        "last_warning": HEALTH.get("last_warning"),
         "watchlist_file": WATCHLIST_FILE,
         "watchlist_total": HEALTH.get("watchlist_total", HEALTH.get("last_watchlist_count", 0)),
         "watchlist_valida": HEALTH.get("watchlist_valid", HEALTH.get("last_watchlist_count", 0)),
@@ -1269,7 +1401,16 @@ def montar_health_tecnico():
         "daily_summary_time": f"{DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d}",
         "daily_summary_sent_today": resumo_diario_ja_enviado(),
         "startup_signal_grace_seconds": STARTUP_SIGNAL_GRACE_SECONDS,
-        "startup_signal_guard_active": startup_signal_guard_active()
+        "startup_signal_guard_active": startup_signal_guard_active(),
+        "startup_mode": startup_signal_guard_active(),
+        "startup_mode_txt": startup_mode_txt(),
+        "startup_remaining_seconds": segundos_restantes_startup_guard(),
+        "boot_completed": boot_state.get("boot_completed"),
+        "last_boot": boot_state.get("last_boot"),
+        "previous_boot": boot_state.get("previous_boot"),
+        "deploy_counter": boot_state.get("deploy_counter"),
+        "boot_completed_at": boot_state.get("boot_completed_at"),
+        **operacional
     }
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -4064,6 +4205,13 @@ def montar_resumo_donkey():
     trailings = [t for t in trades_donkey if t.get("date") == hoje and t.get("event") == "TRAILING"]
     parciais_tp50 = [t for t in tp50s if t.get("partial_realized")]
     saidas_ema20 = [t for t in fechados if t.get("exit_model") == "PARTIAL50_EMA20"]
+    sl50s = [t for t in fechados if t.get("exit_model") == "PARTIAL50_STOP_REMAINDER"]
+    sl100s = saidas_ema20
+    trailing50s = [t for t in trades_donkey if t.get("date") == hoje and t.get("event") in ["TRAILING50", "SL50"]]
+    trailing100s = [t for t in trades_donkey if t.get("date") == hoje and t.get("event") in ["TRAILING100", "SL100"]]
+
+    lucro_tp50 = sum(float(t.get("partial_realized_result_pct", t.get("pnl", 0)) or 0) for t in parciais_tp50)
+    lucro_final = sum(float(t.get("pnl", 0) or 0) for t in fechados)
 
     wins = [t for t in fechados if t.get("result_type") == "WIN"]
     losses = [t for t in fechados if t.get("result_type") == "LOSS"]
@@ -4095,7 +4243,17 @@ def montar_resumo_donkey():
         f"Loss: {len(losses)}",
         "",
         f"TP50 atingidos: {len(tp50s)}",
+        f"TP50 parciais realizados: {len(parciais_tp50)}",
+        f"SL50 / stop do restante: {len(sl50s)}",
+        f"SL100 EMA20 H4: {len(sl100s)}",
+        f"Trailing50: {len(trailing50s)}",
+        f"Trailing100: {len(trailing100s)}",
         f"Trailings atualizados: {len(trailings)}",
+        "",
+        "Lucro parcial TP50:",
+        fmt_pct(lucro_tp50),
+        "Lucro final realizado:",
+        fmt_pct(lucro_final),
         "",
         "PnL realizado:",
         fmt_pct(pnl_total),
@@ -4127,7 +4285,15 @@ def montar_resumo_donkey():
         except Exception:
             ativos.append(f"{p.get('symbol_clean', symbol)} {p.get('side', '')} | Origem: {origem_trade_txt(p)} | PnL N/A")
 
-    linhas += ["", f"Trades Donkey ainda ativos: {len(ativos)}"]
+    operacional = calcular_estado_operacional_donkey()
+    linhas += [
+        "",
+        f"Runners ativos: {operacional.get('donkey_runners_active', 0)}",
+        f"Aguardando EMA20 H4: {operacional.get('donkey_positions_waiting_ema20', 0)}",
+        f"Protegidas em BE/parcial: {operacional.get('donkey_positions_protected_be', 0)}",
+        "",
+        f"Trades Donkey ainda ativos: {len(ativos)}"
+    ]
     if ativos:
         linhas.extend(ativos[:20])
 
@@ -4179,6 +4345,12 @@ def startup_signal_guard_active():
         return (time.time() - SERVICE_STARTED_TS) < STARTUP_SIGNAL_GRACE_SECONDS
     except Exception:
         return False
+
+
+def startup_mode_txt():
+    if startup_signal_guard_active():
+        return f"BOOTSTRAPPING ({segundos_restantes_startup_guard()}s restantes)"
+    return "OPERACIONAL"
 
 
 def montar_monitor_be():
@@ -4535,6 +4707,7 @@ def scanner():
     while True:
         try:
             HEALTH["last_scanner_run"] = data_hora_sp_str()
+            atualizar_thread_heartbeat("scanner")
 
             # Gestão exclusiva Donkey.
             posicoes = carregar_posicoes()
@@ -4563,6 +4736,7 @@ def scanner():
                 salvar_posicoes(posicoes)
 
             HEALTH["last_management_run"] = data_hora_sp_str()
+            atualizar_thread_heartbeat("management")
 
             enviar_resumo_mensal_se_preciso()
             enviar_resumo_diario_se_preciso()
@@ -4573,6 +4747,8 @@ def scanner():
 
             sinais_enviados = 0
             startup_guard = startup_signal_guard_active()
+            if not startup_guard:
+                marcar_boot_completo()
             if startup_guard:
                 print(
                     "STARTUP GUARD ATIVO: novos sinais/POIs/confirmações serão ignorados "
@@ -4723,6 +4899,7 @@ def run_thread_guarded(nome, target):
 
 
 def iniciar_threads_monitoradas():
+    registrar_boot()
     # IMPORTANTE: apenas UM listener Telegram deve rodar.
     # O listener duplicado listen_donkey_commands fica definido no arquivo,
     # mas NÃO é iniciado para evitar erro 409 getUpdates.
