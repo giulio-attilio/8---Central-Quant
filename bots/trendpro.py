@@ -1,5 +1,5 @@
 # TREND PRO MTF H4/H1 + POI
-# Versão: 2026-06-24-TRENDPRO-CENTRAL-QUANT-PADRAO-FINAL
+# Versão: 2026-06-25-TRENDPRO-FIX-TELEGRAM-SAFE-SEND
 #
 # Lógica:
 # - H4 é apenas contexto/filtro.
@@ -917,33 +917,40 @@ def enviar_texto(chat_id, msg):
 
 def safe_send_telegram(msg):
     """
-    Wrapper para garantir UTF-8 mesmo se send_telegram vier de telegram_utils.
+    Envia mensagens do Trend PRO usando SEMPRE os tokens resolvidos em TOKEN/CHAT_ID.
+    Isso evita bug em que send_telegram() importado/fallback usa TELEGRAM_BOT_TOKEN
+    em vez de TREND_PRO_ELITE_TOKEN/TREND_PRO_ELITE_CHAT_ID.
     """
     msg = normalizar_texto(msg)
 
+    if not TOKEN or not CHAT_ID:
+        print("TELEGRAM TREND PRO NÃO CONFIGURADO:")
+        print(msg)
+        return False
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": msg
+    }
+
     try:
-        send_telegram(msg)
-    except UnicodeError:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        if not token or not chat_id:
-            print(msg)
-            return
-
-        payload = {
-            "chat_id": chat_id,
-            "text": msg
-        }
-
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=20
         )
 
+        if resp.status_code != 200:
+            print(f"ERRO TELEGRAM TREND PRO status={resp.status_code}: {resp.text}")
+            return False
 
+        print("TELEGRAM TREND PRO ENVIADO OK")
+        return True
 
+    except Exception as e:
+        print("ERRO TELEGRAM TREND PRO:", e)
+        return False
 
 
 def safe_send_telegram_donkey(msg):
