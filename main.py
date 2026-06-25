@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-24-CENTRAL-FULL-EXPOSURE-PANEL
+# Versão: 2026-06-25-CENTRAL-FULL-EXPOSURE-RUNNERS-PANEL
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -7,6 +7,7 @@
 # - Evitar reescrever estratégias por aproximação.
 # - Permitir ativação gradual por ENABLE_*.
 # - Adicionar Turtle Breakout 2.0 como robô de pesquisa/paper.
+# - Adicionar painel de runners abertos por R na Central.
 #
 # Importante:
 # - Pause os serviços antigos no Render antes de ativar o mesmo bot aqui.
@@ -268,16 +269,103 @@ def get_open_positions_from_module(module):
     return positions
 
 
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _position_runner_r(position: dict):
+    """
+    Retorna o melhor R disponível para uma posição aberta.
+
+    Prioridade:
+    1. Campos de R atual, se algum bot passar no futuro.
+    2. Campos de R aberto/resultado parcial, se existirem.
+    3. MFE em R, que já é preenchido pelo Turtle e por futuros bots compatíveis.
+
+    Observação: para bots sem métrica em R, retorna 0.0 sem quebrar o painel.
+    """
+    if not isinstance(position, dict):
+        return 0.0
+
+    candidates = [
+        "current_r",
+        "pnl_r",
+        "unrealized_r",
+        "open_r",
+        "result_r",
+        "mfe_r",
+    ]
+
+    for field in candidates:
+        if field in position and position.get(field) is not None:
+            return _safe_float(position.get(field), 0.0)
+
+    return 0.0
+
+
+def _position_runner_pct(position: dict):
+    if not isinstance(position, dict):
+        return 0.0
+
+    candidates = [
+        "current_pct",
+        "pnl_pct",
+        "unrealized_pct",
+        "open_pct",
+        "result_pct",
+        "mfe_pct",
+    ]
+
+    for field in candidates:
+        if field in position and position.get(field) is not None:
+            return _safe_float(position.get(field), 0.0)
+
+    return 0.0
+
+
+def _empty_runner_buckets():
+    return {
+        "runners_1r_open": 0,
+        "runners_2r_open": 0,
+        "runners_3r_open": 0,
+        "runners_5r_open": 0,
+        "runners_10r_open": 0,
+    }
+
+
+def _update_runner_buckets(buckets: dict, runner_r: float):
+    if runner_r >= 1.0:
+        buckets["runners_1r_open"] += 1
+    if runner_r >= 2.0:
+        buckets["runners_2r_open"] += 1
+    if runner_r >= 3.0:
+        buckets["runners_3r_open"] += 1
+    if runner_r >= 5.0:
+        buckets["runners_5r_open"] += 1
+    if runner_r >= 10.0:
+        buckets["runners_10r_open"] += 1
+
+
 def central_exposure_snapshot():
     total = 0
     longs = 0
     shorts = 0
     by_bot = {}
+    open_runner_buckets = _empty_runner_buckets()
+    best_open_runner = None
 
     for key, module in LOADED_BOTS.items():
         positions = get_open_positions_from_module(module)
         bot_longs = 0
         bot_shorts = 0
+        bot_buckets = _empty_runner_buckets()
+        bot_best_runner = None
+
         for p in positions:
             side = str(p.get("side", p.get("direction", ""))).upper()
             if side in {"LONG", "BUY"}:
@@ -286,17 +374,45 @@ def central_exposure_snapshot():
             elif side in {"SHORT", "SELL"}:
                 shorts += 1
                 bot_shorts += 1
+
+            runner_r = _position_runner_r(p)
+            runner_pct = _position_runner_pct(p)
+            _update_runner_buckets(open_runner_buckets, runner_r)
+            _update_runner_buckets(bot_buckets, runner_r)
+
+            runner_payload = {
+                "bot": key,
+                "symbol": p.get("symbol") or p.get("ativo") or p.get("pair"),
+                "setup": p.get("setup") or p.get("setup_label"),
+                "side": side,
+                "runner_r": round(runner_r, 4),
+                "runner_pct": round(runner_pct, 4),
+                "entry": p.get("entry") or p.get("entrada"),
+                "stop": p.get("stop") or p.get("sl") or p.get("stop_atual"),
+                "tp50": p.get("tp50"),
+            }
+
+            if bot_best_runner is None or runner_r > bot_best_runner.get("runner_r", 0):
+                bot_best_runner = dict(runner_payload)
+
+            if best_open_runner is None or runner_r > best_open_runner.get("runner_r", 0):
+                best_open_runner = dict(runner_payload)
+
         total += len(positions)
         by_bot[key] = {
             "total": len(positions),
             "long": bot_longs,
             "short": bot_shorts,
+            "open_runners": bot_buckets,
+            "best_open_runner": bot_best_runner,
         }
 
     return {
         "total_positions_open": total,
         "long_positions_open": longs,
         "short_positions_open": shorts,
+        "open_runners": open_runner_buckets,
+        "best_open_runner": best_open_runner,
         "by_bot": by_bot,
     }
 
@@ -403,6 +519,7 @@ def bot_detail(key):
 @app.route("/central")
 def central():
     status = central_watchdog_status()
+    exposure_snapshot = central_exposure_snapshot()
 
     resumo = {}
     for key, cfg in BOT_CONFIGS.items():
@@ -450,6 +567,14 @@ def central():
             "runners_3r": h.get("runners_3r"),
             "runners_5r": h.get("runners_5r"),
             "runners_10r": h.get("runners_10r"),
+
+            # Runners abertos informados pelo próprio bot, quando existirem.
+            # O Turtle já preenche esses campos; a Central também calcula o consolidado em /exposure.
+            "open_runner_symbol": h.get("open_runner_symbol"),
+            "open_runner_setup": h.get("open_runner_setup"),
+            "open_runner_side": h.get("open_runner_side"),
+            "open_runner_r": h.get("open_runner_r"),
+            "open_runner_pct": h.get("open_runner_pct"),
         }
 
     enabled = [k for k, v in resumo.items() if v.get("enabled")]
@@ -467,7 +592,9 @@ def central():
         "loaded_bots": loaded,
         "alerts": alerts,
         "reasons": status.get("reasons", []),
-        "exposure": central_exposure_snapshot(),
+        "exposure": exposure_snapshot,
+        "open_runners": exposure_snapshot.get("open_runners"),
+        "best_open_runner": exposure_snapshot.get("best_open_runner"),
         "bots": resumo,
     }
 
@@ -475,6 +602,23 @@ def central():
 @app.route("/exposure")
 def exposure():
     return central_exposure_snapshot()
+
+
+@app.route("/runners")
+def runners():
+    snapshot = central_exposure_snapshot()
+    return {
+        "open_runners": snapshot.get("open_runners"),
+        "best_open_runner": snapshot.get("best_open_runner"),
+        "by_bot": {
+            key: {
+                "open_runners": value.get("open_runners"),
+                "best_open_runner": value.get("best_open_runner"),
+                "positions_open": value.get("total"),
+            }
+            for key, value in snapshot.get("by_bot", {}).items()
+        },
+    }
 
 
 # ==========================================================
