@@ -18,6 +18,7 @@ import os
 import time
 import json
 import threading
+import requests
 import importlib.util
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -476,8 +477,222 @@ def exposure():
     return central_exposure_snapshot()
 
 
+# ==========================================================
+# CENTRAL TELEGRAM COMMAND ROUTER
+# ==========================================================
+# Objetivo:
+# - Permitir que a Central responda comandos dos bots que NÃO rodam command_loop próprio.
+# - Evitar conflito Telegram getUpdates 409.
+# - Hoje fica ativo por padrão para TURTLE e FALCON, pois esses bots devem ter o command_loop interno desligado.
+# - Para qualquer outro bot, só ligue CENTRAL_ROUTE_<BOT>_TELEGRAM=true depois de desligar o command_loop interno dele.
+
+COMMAND_ROUTER_DEFAULTS = {
+    "TRENDPRO": False,
+    "DONKEY": False,
+    "COBRA": False,
+    "MEME": False,
+    "PREDATOR": False,
+    "TURTLE": True,
+    "FALCON": True,
+}
+
+CENTRAL_COMMAND_OFFSETS = {}
+
+
+def get_bot_module(name: str):
+    return LOADED_BOTS.get(str(name).upper())
+
+
+def central_route_enabled_for_bot(key: str) -> bool:
+    default = COMMAND_ROUTER_DEFAULTS.get(key.upper(), False)
+    return env_bool(f"CENTRAL_ROUTE_{key.upper()}_TELEGRAM", default=default)
+
+
+def telegram_get_updates_for_token(token, offset=None):
+    if not token:
+        return [], None
+    try:
+        params = {"timeout": 20}
+        if offset:
+            params["offset"] = offset
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        r = requests.get(url, params=params, timeout=25)
+        if r.status_code != 200:
+            return [], f"getUpdates {r.status_code}: {r.text[:180]}"
+        return r.json().get("result", []), None
+    except Exception as exc:
+        return [], f"getUpdates: {exc}"
+
+
+def telegram_send_with_token(token, chat_id, text):
+    if not token or not chat_id:
+        print(text)
+        return False
+    try:
+        partes = [str(text)[i:i + 3900] for i in range(0, len(str(text)), 3900)] or [""]
+        for parte in partes:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": parte,
+                "disable_web_page_preview": True,
+            }
+            requests.post(url, json=payload, timeout=15)
+            time.sleep(0.25)
+        return True
+    except Exception as exc:
+        print("ERRO TELEGRAM CENTRAL ROUTER:", exc)
+        return False
+
+
+def _json_or_text(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return str(value)
+
+
+def _call_first(module, names, *args):
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return fn(*args)
+    return None
+
+
+def build_command_reply_for_module(key: str, module, cmd: str):
+    """
+    Converte comandos padronizados em resposta textual.
+    Mantém a lógica individual em cada bot e só padroniza o acesso pela Central.
+    """
+    cmd = (cmd or "").strip().lower().split("@")[0]
+
+    # TURTLE tem handle_command próprio, mas ele envia pelo próprio módulo.
+    # Preferimos respostas diretas para evitar depender do CHAT_ID interno.
+    if key == "TURTLE":
+        if cmd == "/health":
+            fn = getattr(module, "refresh_health_stats", None)
+            if callable(fn):
+                fn()
+            return json.dumps(getattr(module, "HEALTH", {}), ensure_ascii=False, indent=2)
+        if cmd == "/funil":
+            return _json_or_text(_call_first(module, ["funnel_text"]))
+        if cmd == "/eventos":
+            return _json_or_text(_call_first(module, ["events_text"]))
+        if cmd == "/resumo":
+            if hasattr(module, "build_summary") and hasattr(module, "trades_today"):
+                return module.build_summary("DIA", module.trades_today())
+        if cmd == "/posicoes":
+            return _json_or_text(_call_first(module, ["positions_text"]))
+        if cmd == "/top":
+            return _json_or_text(_call_first(module, ["top_mfe_text"]))
+        if cmd == "/ranking":
+            return _json_or_text(_call_first(module, ["ranking_command_text"]))
+        if cmd in ["/start", "/comandos"]:
+            return (
+                "🐢 COMANDOS TURTLE BREAKOUT PRO 2.0\n\n"
+                "/health\n/posicoes\n/resumo\n/funil\n/eventos\n/top\n/ranking"
+            )
+
+    if key == "FALCON":
+        if cmd == "/health":
+            return _json_or_text(_call_first(module, ["health_payload"]))
+        if cmd == "/funil":
+            return _json_or_text(_call_first(module, ["funnel_text"]))
+        if cmd == "/eventos":
+            return _json_or_text(_call_first(module, ["events_text"]))
+        if cmd == "/resumo":
+            if hasattr(module, "build_summary") and hasattr(module, "trades_today"):
+                return module.build_summary("DIA", module.trades_today())
+        if cmd == "/posicoes":
+            return _json_or_text(_call_first(module, ["positions_text"]))
+        if cmd == "/watchlist":
+            if hasattr(module, "load_watchlist"):
+                wl = module.load_watchlist()
+                return "🦅 WATCHLIST FALCON\n\n" + "\n".join([str(x) for x in wl[:100]])
+        if cmd in ["/start", "/comandos"]:
+            return "🦅 Comandos Falcon:\n/health\n/posicoes\n/resumo\n/funil\n/eventos\n/watchlist"
+
+    # Padrão genérico para outros bots, caso você ligue o roteador central depois.
+    if cmd == "/health":
+        h = getattr(module, "HEALTH", None)
+        return json.dumps(h or bot_health(key, BOT_CONFIGS[key]), ensure_ascii=False, indent=2)
+    if cmd == "/funil":
+        return _json_or_text(_call_first(module, ["montar_funil_texto", "montar_funil", "funnel_text", "funil_texto"]))
+    if cmd == "/eventos":
+        return _json_or_text(_call_first(module, ["montar_eventos_texto", "events_text", "eventos_texto"]))
+    if cmd == "/resumo":
+        return _json_or_text(_call_first(module, ["montar_resumo_diario", "build_daily_summary", "summary_text"]))
+
+    return None
+
+
+def central_command_router_loop(key: str, cfg: dict):
+    token = os.environ.get(cfg.get("token_env"))
+    allowed_chat = os.environ.get(cfg.get("chat_env"))
+
+    if not token:
+        print(f"ROTEADOR TELEGRAM {key} NÃO INICIADO: token ausente")
+        return
+
+    print(f"ROTEADOR TELEGRAM CENTRAL INICIADO - {key}")
+    offset = CENTRAL_COMMAND_OFFSETS.get(key)
+
+    while True:
+        try:
+            module = get_bot_module(key)
+            updates, warning = telegram_get_updates_for_token(token, offset)
+
+            if warning:
+                if module is not None and hasattr(module, "HEALTH"):
+                    module.HEALTH["last_warning"] = warning
+                time.sleep(2)
+                continue
+
+            for upd in updates:
+                offset = upd.get("update_id", 0) + 1
+                CENTRAL_COMMAND_OFFSETS[key] = offset
+
+                msg = upd.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+
+                if not text.startswith("/"):
+                    continue
+                if allowed_chat and chat_id != str(allowed_chat):
+                    continue
+                if module is None:
+                    telegram_send_with_token(token, chat_id, f"{cfg.get('name', key)} não carregado na Central.")
+                    continue
+
+                cmd = text.split()[0].lower().split("@")[0]
+                reply = build_command_reply_for_module(key, module, cmd)
+                if reply:
+                    telegram_send_with_token(token, chat_id, reply)
+                    health = getattr(module, "HEALTH", None)
+                    if isinstance(health, dict):
+                        health["last_command_run"] = data_hora_sp_str()
+
+        except Exception as exc:
+            print(f"ERRO ROTEADOR TELEGRAM {key}:", exc)
+            module = get_bot_module(key)
+            if module is not None and hasattr(module, "HEALTH"):
+                module.HEALTH["last_warning"] = f"central router: {exc}"
+
+        time.sleep(2)
+
+
+def start_central_command_routers():
+    for key, cfg in BOT_CONFIGS.items():
+        if not env_bool(cfg["enabled_env"], default=False):
+            continue
+        if not central_route_enabled_for_bot(key):
+            continue
+        threading.Thread(target=central_command_router_loop, args=(key, cfg), daemon=True).start()
+
+
 start_enabled_bots()
 threading.Thread(target=central_watchdog_loop, daemon=True).start()
+start_central_command_routers()
 
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
