@@ -1,3 +1,4 @@
+# Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em FALCON.
 # ==============================================================================
 # FALCON STRIKE - ORB PRO - CENTRAL QUANT
 # Versao: 2026-06-24-FALCON-STRIKE-ORB-V1
@@ -109,7 +110,12 @@ COMMAND_SLEEP_SECONDS = int(os.environ.get("FALCON_COMMAND_SLEEP_SECONDS", "2"))
 WATCHDOG_SLEEP_SECONDS = int(os.environ.get("FALCON_WATCHDOG_SLEEP_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("FALCON_WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("FALCON_WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
-STARTUP_GUARD_SECONDS = int(os.environ.get("FALCON_STARTUP_GUARD_SECONDS", "300"))
+STARTUP_GUARD_SECONDS = int(
+    os.environ.get(
+        "FALCON_STARTUP_GUARD_SECONDS",
+        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
+    )
+)
 
 DAILY_SUMMARY_HOUR = int(os.environ.get("FALCON_DAILY_SUMMARY_HOUR", "23"))
 DAILY_SUMMARY_MINUTE = int(os.environ.get("FALCON_DAILY_SUMMARY_MINUTE", "55"))
@@ -1614,4 +1620,3 @@ start_threads()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
