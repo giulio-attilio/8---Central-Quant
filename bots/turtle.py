@@ -2292,7 +2292,7 @@ def refresh_health_stats():
     HEALTH["best_setup"] = HEALTH["ranking_month"][0]["name"] if HEALTH["ranking_month"] else None
     HEALTH["worst_setup"] = HEALTH["ranking_month"][-1]["name"] if HEALTH["ranking_month"] else None
     HEALTH["positions_limit"] = MAX_OPEN_POSITIONS
-    HEALTH["startup_signal_grace_seconds"] = STARTUP_SIGNAL_GRACE_SECONDS
+    HEALTH["startup_signal_grace_seconds"] = STARTUP_GUARD_SECONDS
     HEALTH["startup_signal_guard_active"] = startup_guard_active()
     HEALTH["telegram_configured"] = bool(TOKEN and CHAT_ID)
     HEALTH["mode"] = "PAPER"
