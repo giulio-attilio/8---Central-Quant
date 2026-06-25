@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-25-CENTRAL-FULL-EXPOSURE-RUNNERS-PANEL-RUNTIME-GUARD
+# Versão: 2026-06-25-CENTRAL-FULL-RELATORIO-DIAGNOSTICO-SELFTEST
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -683,6 +683,11 @@ def diagnostico():
     return {"text": build_diagnostic_report()}
 
 
+@app.route("/selftest")
+def selftest():
+    return {"text": build_selftest_report()}
+
+
 # ==========================================================
 # CENTRAL REPORT BUILDER
 # ==========================================================
@@ -1045,6 +1050,153 @@ def build_diagnostic_report():
     return "\n".join(lines)
 
 
+
+
+def build_selftest_report():
+    """
+    Self test operacional da Central.
+    Não altera estado dos bots. Apenas valida carregamento, health, ciclos,
+    watchlists, exposição, runners e rotas críticas.
+    """
+    status = central_watchdog_status()
+    exposure_snapshot = central_exposure_snapshot()
+    by_bot_exposure = exposure_snapshot.get("by_bot", {}) or {}
+
+    tests = []
+    bot_lines = []
+    passed = 0
+    total = 0
+
+    def add_test(name, ok, detail=""):
+        nonlocal passed, total
+        total += 1
+        if ok:
+            passed += 1
+        tests.append(f"{'✅' if ok else '❌'} {name}{(' — ' + str(detail)) if detail else ''}")
+
+    enabled_count = 0
+    loaded_count = 0
+    scanner_ok_count = 0
+    management_ok_count = 0
+    watchlist_ok_count = 0
+    error_ok_count = 0
+
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+        if not b.get("enabled"):
+            continue
+
+        enabled_count += 1
+        loaded = bool(b.get("loaded"))
+        if loaded:
+            loaded_count += 1
+
+        scanner_min = b.get("minutes_since_scanner")
+        management_min = b.get("minutes_since_management")
+        scanner_ok = scanner_min is not None and scanner_min <= WATCHDOG_THRESHOLD_MINUTES
+        management_ok = management_min is not None and management_min <= WATCHDOG_THRESHOLD_MINUTES
+        error_ok = not b.get("last_error") and not b.get("load_error")
+
+        wl_total = h.get("watchlist_total")
+        wl_valid = h.get("watchlist_valid")
+        wl_invalid = h.get("watchlist_invalid", []) or []
+        watchlist_ok = (wl_total is None) or (wl_valid == wl_total and not wl_invalid)
+
+        if scanner_ok:
+            scanner_ok_count += 1
+        if management_ok:
+            management_ok_count += 1
+        if watchlist_ok:
+            watchlist_ok_count += 1
+        if error_ok:
+            error_ok_count += 1
+
+        warning = _clean_warning(h.get("last_warning") or b.get("last_warning"))
+        exp = by_bot_exposure.get(key, {}) or {}
+        runner_r = exp.get("best_open_runner", {}).get("runner_r") if exp.get("best_open_runner") else None
+
+        bot_lines.append(
+            f"{key:<9} "
+            f"load={'OK' if loaded else 'ERRO'} | "
+            f"scan={'OK' if scanner_ok else 'FALHA'} {scanner_min}m | "
+            f"gestão={'OK' if management_ok else 'FALHA'} {management_min}m | "
+            f"WL={'OK' if watchlist_ok else 'FALHA'} {wl_valid}/{wl_total} | "
+            f"erro={'OK' if error_ok else 'ERRO'} | "
+            f"pos={exp.get('total')} | "
+            f"runner={safe_round(runner_r, 2, 0)}R"
+            + (f" | warning={warning}" if warning else "")
+        )
+
+    add_test("Bots habilitados carregados", enabled_count > 0 and loaded_count == enabled_count, f"{loaded_count}/{enabled_count}")
+    add_test("Scanners recentes", enabled_count > 0 and scanner_ok_count == enabled_count, f"{scanner_ok_count}/{enabled_count}")
+    add_test("Gestões recentes", enabled_count > 0 and management_ok_count == enabled_count, f"{management_ok_count}/{enabled_count}")
+    add_test("Watchlists válidas", enabled_count > 0 and watchlist_ok_count == enabled_count, f"{watchlist_ok_count}/{enabled_count}")
+    add_test("Sem erros críticos", enabled_count > 0 and error_ok_count == enabled_count, f"{error_ok_count}/{enabled_count}")
+    add_test("Central watchdog OK", bool(status.get("ok")), status.get("status"))
+
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+    open_runners = exposure_snapshot.get("open_runners") or {}
+    best = exposure_snapshot.get("best_open_runner") or {}
+
+    add_test("Exposure disponível", "total_positions_open" in exposure_snapshot, f"pos={total_pos}")
+    add_test("Runners calculados", isinstance(open_runners, dict), f"3R={open_runners.get('runners_3r_open', 0)}")
+    add_test("Relatório central gera texto", bool(build_central_status_text()), "OK")
+    add_test("Diagnóstico gera texto", bool(build_diagnostic_report()), "OK")
+
+    risk_notes = []
+    if total_pos >= 50:
+        risk_notes.append(f"Muitas posições abertas: {total_pos}.")
+    if total_pos and short_pos / max(total_pos, 1) >= 0.80:
+        risk_notes.append(f"Exposição muito SHORT: {short_pos}/{total_pos}.")
+    if total_pos and long_pos / max(total_pos, 1) >= 0.80:
+        risk_notes.append(f"Exposição muito LONG: {long_pos}/{total_pos}.")
+
+    critical_ok = passed == total and bool(status.get("ok"))
+    result = "✅ SELFTEST APROVADO" if critical_ok else "⚠️ SELFTEST COM PENDÊNCIAS"
+
+    lines = [
+        "🧪 SELFTEST CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Resultado: {result}",
+        f"Testes: {passed}/{total} aprovados",
+        "",
+        "CHECKS",
+        *tests,
+        "",
+        "EXPOSIÇÃO",
+        f"Total: {total_pos} | LONG: {long_pos} | SHORT: {short_pos}",
+        (
+            "Runners: "
+            f"1R={open_runners.get('runners_1r_open', 0)} | "
+            f"2R={open_runners.get('runners_2r_open', 0)} | "
+            f"3R={open_runners.get('runners_3r_open', 0)} | "
+            f"5R={open_runners.get('runners_5r_open', 0)} | "
+            f"10R={open_runners.get('runners_10r_open', 0)}"
+        ),
+    ]
+
+    if best:
+        lines.append(
+            f"Melhor runner: {best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')} | "
+            f"{best.get('runner_pct')}% | {best.get('runner_r')}R"
+        )
+
+    if risk_notes:
+        lines += ["", "OBSERVAÇÕES DE RISCO"] + [f"- {r}" for r in risk_notes]
+
+    lines += ["", "BOTS"] + bot_lines
+
+    if critical_ok:
+        lines += ["", "CONCLUSÃO", "Sistema pronto para operar. Monitorar apenas os alertas de risco direcional."]
+    else:
+        lines += ["", "CONCLUSÃO", "Há pendências técnicas. Verifique os itens marcados com ❌ antes de confiar nos robôs."]
+
+    return "\n".join(lines)
+
+
 def parse_report_command(text: str):
     raw = (text or "").strip()
     if not raw:
@@ -1159,6 +1311,9 @@ def build_command_reply_for_module(key: str, module, cmd: str):
 
     if cmd0 in {"/diagnostico", "/diagnóstico", "/diag"}:
         return build_diagnostic_report()
+
+    if cmd0 in {"/selftest", "/self-test", "/teste", "/autoteste"}:
+        return build_selftest_report()
 
     parsed_report = parse_report_command(raw_cmd)
     if parsed_report:
