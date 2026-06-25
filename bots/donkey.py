@@ -1,3 +1,4 @@
+# Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em DONKEY.
 # TREND PRO MTF H4/H1 + POI
 # Versão: 2026-06-23-DONKEY-H4-PARCIAL50-EMA20-SELETIVO
 #
@@ -300,7 +301,12 @@ DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "55"))
 # Durante os primeiros minutos após o processo subir, o robô gerencia posições abertas,
 # mas NÃO envia novos sinais/POIs/confirmações acumulados.
 # Novos sinais detectados nesse período são marcados no histórico para não serem enviados atrasados depois.
-STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "600"))
+STARTUP_SIGNAL_GRACE_SECONDS = int(
+    os.environ.get(
+        "DONKEY_STARTUP_SIGNAL_GRACE_SECONDS",
+        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
+    )
+)
 SERVICE_STARTED_TS = time.time()
 
 exchange = ccxt.bingx({"enableRateLimit": True})
