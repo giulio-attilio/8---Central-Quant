@@ -1,3 +1,4 @@
+# Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em MEME.
 # TREND PRO MTF H4/H1 + POI
 # Versão: 2026-06-22-MEME-HUNTER-PRO-V3-CENTRAL-QUANT-RESILIENTE
 #
@@ -454,7 +455,12 @@ DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "23"))
 DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "55"))
 DAILY_SUMMARY_KEY = "meme:daily_summary_sent"
 
-STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("MEME_STARTUP_SIGNAL_GRACE_SECONDS", "600"))
+STARTUP_SIGNAL_GRACE_SECONDS = int(
+    os.environ.get(
+        "MEME_STARTUP_SIGNAL_GRACE_SECONDS",
+        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
+    )
+)
 SERVICE_STARTED_TS = time.time()
 STARTUP_MSG_COOLDOWN_SECONDS = int(os.environ.get("MEME_STARTUP_MSG_COOLDOWN_SECONDS", "3600"))
 
