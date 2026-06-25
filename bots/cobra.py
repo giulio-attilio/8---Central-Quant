@@ -57,6 +57,9 @@ STATE_KEY = "cobra:state"
 DAILY_SUMMARY_KEY = "cobra:daily_summary_sent"
 MONTHLY_SUMMARY_KEY = "cobra:monthly_summary_sent"
 FUNNEL_KEY = "cobra:funnel"
+TELEGRAM_LAST_UPDATE_KEY = "cobra:telegram:last_update_id"
+TELEGRAM_COMMAND_DEDUP_PREFIX = "cobra:telegram:cmd_dedup"
+TELEGRAM_COMMAND_DEDUP_SECONDS = int(os.environ.get("COBRA_TELEGRAM_COMMAND_DEDUP_SECONDS", "4"))
 
 # ====================================================
 # PARAMETROS PRINCIPAIS
@@ -1359,6 +1362,78 @@ def montar_resumo(periodo="dia"):
         linhas.extend([f"{p['symbol_clean']} {side_nome(p['side'])} | {setup_nome(p.get('signal_type'))} | {fmt_pct(p.get('pnl_atual', 0))}" for p in ativos[:20]])
     return "\n".join(linhas)
 
+
+def montar_funil():
+    """Mensagem compacta do funil do dia para o comando /funil."""
+    f = funil_hoje()
+    return (
+        "🐍 FUNIL COBRA\n"
+        f"{agora_sp().strftime('%d/%m/%Y %H:%M')}\n\n"
+        f"Ativos analisados: {f.get('ativos_analisados', 0)}\n"
+        f"Bollinger BUY: {f.get('bollinger_buy', 0)}\n"
+        f"Bollinger SELL: {f.get('bollinger_sell', 0)}\n"
+        f"MACD BUY: {f.get('macd_buy', 0)}\n"
+        f"MACD SELL: {f.get('macd_sell', 0)}\n"
+        f"Early detectados: {f.get('early_detectados', 0)}\n"
+        f"Cobra detectados: {f.get('cobra_detectados', 0)}\n"
+        f"Reprovados por risco: {f.get('reprovados_risco', 0)}\n"
+        f"Reprovados por score: {f.get('reprovados_score', 0)}\n"
+        f"Reprovados por spike: {f.get('reprovados_spike', 0)}\n"
+        f"Reprovados por posição ativa: {f.get('reprovados_posicao_ativa', 0)}\n"
+        f"Sinais enviados: {f.get('sinais_enviados', 0)}"
+    )
+
+
+def montar_eventos(qtd=20):
+    """Mostra os últimos eventos relevantes registrados no Redis."""
+    try:
+        trades = carregar_trades()
+    except Exception:
+        trades = []
+
+    if not trades:
+        return "🐍 EVENTOS COBRA\n\nNenhum evento registrado."
+
+    eventos = trades[-int(qtd):]
+    linhas = ["🐍 ÚLTIMOS EVENTOS COBRA", data_hora_sp_str(), ""]
+
+    for e in reversed(eventos):
+        evento = str(e.get("event", "N/A"))
+        symbol = e.get("symbol_clean") or nome_limpo(str(e.get("symbol", "N/A")))
+        side = e.get("side") or e.get("direction") or ""
+        setup = setup_nome(e.get("signal_type")) if e.get("signal_type") else ""
+        dt = e.get("datetime") or e.get("closed_at") or e.get("created_at") or e.get("date") or ""
+
+        detalhe = f"{evento} - {symbol}"
+        if side:
+            detalhe += f" {side_nome(side) if side in ['LONG', 'SHORT'] else side}"
+        if setup:
+            detalhe += f" | {setup}"
+
+        extras = []
+        if evento == "ENTRY":
+            extras.append(f"Entrada {fmt_br(e.get('entry'))}")
+            extras.append(f"SL {fmt_br(e.get('sl'))}")
+            extras.append(f"TP50 {fmt_br(e.get('tp50'))}")
+        elif evento == "TP50":
+            extras.append(f"Preço {fmt_br(e.get('price'))}")
+        elif evento == "BREAKEVEN":
+            extras.append(f"Novo SL {fmt_br(e.get('new_sl'))}")
+        elif evento == "TRAILING":
+            extras.append(f"Novo SL {fmt_br(e.get('new_sl'))}")
+        elif evento == "CLOSE":
+            extras.append(f"Saída {fmt_br(e.get('exit'))}")
+            extras.append(f"PnL {fmt_pct(e.get('pnl', 0))}")
+            if e.get("result_type"):
+                extras.append(str(e.get("result_type")))
+
+        linhas.append(f"{dt}\n{detalhe}")
+        if extras:
+            linhas.append(" | ".join(extras))
+        linhas.append("───────────────")
+
+    return "\n".join(linhas)
+
 def montar_health_tecnico():
     hoje = calcular_metricas_resumo("dia")
     mes = calcular_metricas_resumo("mes")
@@ -1480,11 +1555,58 @@ def processar_comando(texto):
     if cmd == "/estatisticas":
         return montar_resumo("all")
 
+    if cmd == "/funil":
+        return montar_funil()
+
+    if cmd in ["/eventos", "/events"]:
+        return montar_eventos()
+
     if cmd == "/watchlist":
         watchlist = carregar_watchlist()
         return "👀 WATCHLIST COBRA\n\n" + "\n".join([nome_limpo(s) for s in watchlist])
 
     return None
+
+
+def redis_get_number(key, padrao=0):
+    try:
+        valor = redis.get(key)
+        if valor is None:
+            return padrao
+        return int(float(valor))
+    except Exception:
+        return padrao
+
+
+def telegram_update_ja_processado(update_id):
+    """Evita que o mesmo update seja respondido duas vezes após restart/deploy."""
+    try:
+        update_id = int(update_id)
+        ultimo = redis_get_number(TELEGRAM_LAST_UPDATE_KEY, 0)
+        if update_id <= ultimo:
+            return True
+        redis.set(TELEGRAM_LAST_UPDATE_KEY, str(update_id))
+        return False
+    except Exception as e:
+        print("ERRO DEDUPE UPDATE COBRA:", e)
+        return False
+
+
+def comando_em_cooldown(chat_id, cmd):
+    """Proteção extra contra duas respostas seguidas para o mesmo comando."""
+    try:
+        chave = f"{TELEGRAM_COMMAND_DEDUP_PREFIX}:{chat_id}:{cmd}"
+        agora = time.time()
+        ultimo = redis.get(chave)
+        ultimo = float(ultimo or 0)
+        if agora - ultimo < TELEGRAM_COMMAND_DEDUP_SECONDS:
+            print(f"COMANDO COBRA IGNORADO POR DEDUPE: {cmd}")
+            return True
+        redis.set(chave, str(agora))
+        return False
+    except Exception as e:
+        print("ERRO DEDUPE COMANDO COBRA:", e)
+        return False
 
 def listen_commands():
     global ultimo_update_id
@@ -1494,13 +1616,32 @@ def listen_commands():
             if not TOKEN or not CHAT_ID:
                 time.sleep(COMMAND_SLEEP_SECONDS)
                 continue
+            ultimo_redis = redis_get_number(TELEGRAM_LAST_UPDATE_KEY, 0)
+            if ultimo_update_id is None:
+                ultimo_update_id = ultimo_redis if ultimo_redis > 0 else None
+
             params = {"timeout": 20}
             if ultimo_update_id is not None:
-                params["offset"] = ultimo_update_id + 1
+                params["offset"] = int(ultimo_update_id) + 1
+
             r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates", params=params, timeout=30)
             data = r.json()
+
+            if not data.get("ok", True):
+                HEALTH["last_warning"] = f"getUpdates {data}"
+                print("AVISO GETUPDATES COBRA:", data)
+                time.sleep(COMMAND_SLEEP_SECONDS)
+                continue
+
             for upd in data.get("result", []):
-                ultimo_update_id = upd.get("update_id")
+                update_id = upd.get("update_id")
+                if update_id is None:
+                    continue
+
+                ultimo_update_id = int(update_id)
+                if telegram_update_ja_processado(update_id):
+                    continue
+
                 msg = upd.get("message") or upd.get("edited_message")
                 if not msg:
                     continue
@@ -1514,6 +1655,9 @@ def listen_commands():
                 cmd = texto.strip().split()[0].lower()
                 if "@" in cmd:
                     cmd = cmd.split("@")[0]
+
+                if comando_em_cooldown(chat_id, cmd):
+                    continue
 
                 resposta = processar_comando(cmd)
                 if resposta:
@@ -1643,17 +1787,6 @@ def scanner():
                         print(f"STARTUP GUARD COBRA: sinal marcado e não enviado: {chave}")
                         continue
 
-                    if startup_signal_guard_active():
-                        historico[chave] = True
-                        if len(historico) > 3000:
-                            historico = dict(list(historico.items())[-3000:])
-                        salvar_sinais(historico)
-                        print(
-                            f"STARTUP GUARD COBRA: sinal antigo ignorado "
-                            f"{s['symbol_clean']} {s['side']} {s['signal_type']} "
-                            f"({startup_guard_restante_segundos()}s restantes)"
-                        )
-                        continue
 
                     if registrar_posicao(s):
                         historico[chave] = True
@@ -1826,6 +1959,15 @@ def watchdog_status():
         "last_warning": HEALTH.get("last_warning"),
         "watchdog_last_check": HEALTH.get("watchdog_last_check"),
     }
+
+
+@app.route("/funil")
+def funil_route():
+    return funil_hoje()
+
+@app.route("/eventos")
+def eventos_route():
+    return {"ok": True, "bot": "Cobra Attack", "events": carregar_trades()[-50:]}
 
 iniciar_threads_monitoradas()
 
