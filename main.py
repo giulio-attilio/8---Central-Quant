@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-25-CENTRAL-FULL-EXPOSURE-RUNNERS-PANEL
+# Versão: 2026-06-25-CENTRAL-FULL-EXPOSURE-RUNNERS-PANEL-RUNTIME-GUARD
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -129,15 +129,15 @@ BOT_CONFIGS = {
         "extra_chat_envs": ["TURTLE_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"],
     },
     "FALCON": {
-    "enabled_env": "ENABLE_FALCON",
-    "module": "falcon",
-    "file": BOTS_DIR / "falcon.py",
-    "name": "Falcon Strike",
-    "token_env": "FALCON_TOKEN",
-    "chat_env": "FALCON_CHAT_ID",
-    "extra_token_envs": ["FALCON_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"],
-    "extra_chat_envs": ["FALCON_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"],
-},
+        "enabled_env": "ENABLE_FALCON",
+        "module": "falcon",
+        "file": BOTS_DIR / "falcon.py",
+        "name": "Falcon Strike",
+        "token_env": "FALCON_TOKEN",
+        "chat_env": "FALCON_CHAT_ID",
+        "extra_token_envs": ["FALCON_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"],
+        "extra_chat_envs": ["FALCON_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"],
+    },
 }
 
 LOADED_BOTS = {}
@@ -149,6 +149,12 @@ CENTRAL_HEALTH = {
     "last_watchdog_alert_ts": 0,
     "watchdog_status": "OK",
 }
+
+# Evita inicialização duplicada de bots/roteadores no mesmo processo.
+# Importante para impedir respostas duplicadas no Telegram caso o módulo principal
+# seja importado mais de uma vez pelo servidor.
+CENTRAL_RUNTIME_STARTED = False
+CENTRAL_RUNTIME_LOCK = threading.Lock()
 
 
 def _set_env_temporarily(mapping):
@@ -834,9 +840,29 @@ def start_central_command_routers():
         threading.Thread(target=central_command_router_loop, args=(key, cfg), daemon=True).start()
 
 
-start_enabled_bots()
-threading.Thread(target=central_watchdog_loop, daemon=True).start()
-start_central_command_routers()
+def start_central_runtime_once():
+    """
+    Inicializa bots, watchdog e roteadores apenas uma vez por processo.
+
+    Sem esta trava, múltiplas importações do main.py podem iniciar mais de um
+    roteador Telegram para o mesmo token, causando respostas duplicadas e/ou
+    conflitos getUpdates 409.
+    """
+    global CENTRAL_RUNTIME_STARTED
+
+    with CENTRAL_RUNTIME_LOCK:
+        if CENTRAL_RUNTIME_STARTED:
+            print("CENTRAL RUNTIME JÁ INICIADO - ignorando nova chamada")
+            return
+
+        CENTRAL_RUNTIME_STARTED = True
+
+    start_enabled_bots()
+    threading.Thread(target=central_watchdog_loop, daemon=True).start()
+    start_central_command_routers()
+
+
+start_central_runtime_once()
 
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
