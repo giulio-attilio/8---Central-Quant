@@ -1,3 +1,4 @@
+# Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em TURTLE.
 # ==============================================================================
 # TURTLE BREAKOUT PRO 2.0 - CENTRAL QUANT
 # Versão: 2026-06-24-TURTLE-BREAKOUT-PRO-FILTROS-VOLUME-ADX-LIMITE
@@ -119,7 +120,12 @@ WATCHDOG_SLEEP_SECONDS = int(os.environ.get("TURTLE_WATCHDOG_SLEEP_SECONDS", "30
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("TURTLE_WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("TURTLE_WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
 
-STARTUP_GUARD_SECONDS = int(os.environ.get("TURTLE_STARTUP_GUARD_SECONDS", "300"))
+STARTUP_GUARD_SECONDS = int(
+    os.environ.get(
+        "TURTLE_STARTUP_GUARD_SECONDS",
+        os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")
+    )
+)
 SIGNAL_COOLDOWN_CANDLES = int(os.environ.get("TURTLE_SIGNAL_COOLDOWN_CANDLES", "3"))
 
 DAILY_SUMMARY_HOUR = int(os.environ.get("TURTLE_DAILY_SUMMARY_HOUR", "23"))
@@ -1996,6 +2002,8 @@ def startup():
     threading.Thread(target=management_loop, daemon=True).start()
     threading.Thread(target=summary_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
+    # # Comandos do Turtle ficam centralizados no roteador da Central Quant.
+    # Evita conflito 409 do Telegram quando a Central também consulta o mesmo token.
     # threading.Thread(target=command_loop, daemon=True).start()
 
 
