@@ -73,6 +73,32 @@ def is_benign_bingx_quote_error(value):
     return "109500" in txt or "quote service unavailable" in txt
 
 
+def is_benign_telegram_conflict(value):
+    txt = str(value or "").lower()
+    return (
+        "getupdates" in txt
+        and ("409" in txt or "conflict" in txt)
+        and "terminated by other getupdates request" in txt
+    )
+
+
+def clean_operational_warning(value):
+    if not value:
+        return None
+    if is_benign_telegram_conflict(value):
+        return None
+    return value
+
+
+def safe_round(value, ndigits=2, default=None):
+    try:
+        if value is None:
+            return default
+        return round(float(value), ndigits)
+    except Exception:
+        return default
+
+
 # Cada bot recebe seus tokens próprios, mapeados para TELEGRAM_BOT_TOKEN/CHAT_ID
 # apenas durante o import do módulo. Assim o código original continua intacto.
 BOT_CONFIGS = {
@@ -235,7 +261,10 @@ def bot_health(key: str, cfg: dict):
     }
 
     if module is not None:
-        health = getattr(module, "HEALTH", {})
+        raw_health = getattr(module, "HEALTH", {}) or {}
+        health = dict(raw_health) if isinstance(raw_health, dict) else {}
+        health["last_warning"] = clean_operational_warning(health.get("last_warning"))
+
         payload["health"] = health
         payload["last_scanner_run"] = health.get("last_scanner_run")
         payload["last_management_run"] = health.get("last_management_run")
@@ -649,6 +678,11 @@ def relatorio_bot(key):
     return {"text": build_central_report("completo", bot_key=bot_key)}
 
 
+@app.route("/diagnostico")
+def diagnostico():
+    return {"text": build_diagnostic_report()}
+
+
 # ==========================================================
 # CENTRAL REPORT BUILDER
 # ==========================================================
@@ -683,12 +717,79 @@ def _short(value, max_len=1200):
 
 
 def _clean_warning(value):
-    if not value:
-        return None
-    txt = str(value)
-    # getUpdates 409 é resíduo arquitetural de comando Telegram; não é falha operacional
-    # quando scanner/gestão seguem recentes. Mantemos como observação, não alerta crítico.
-    return txt
+    return clean_operational_warning(value)
+
+
+def _fmt_metric(value, suffix="", ndigits=2, empty="N/A"):
+    val = safe_round(value, ndigits, None)
+    if val is None:
+        return empty
+    sign = "+" if isinstance(val, (int, float)) and val > 0 and suffix in {"%", "R"} else ""
+    return f"{sign}{val:.{ndigits}f}{suffix}"
+
+
+def _bot_compact_status_line(key: str, exposure_by_bot: dict = None):
+    cfg = BOT_CONFIGS.get(key)
+    if not cfg:
+        return f"⚠️ {key}: bot inválido"
+
+    b = bot_health(key, cfg)
+    h = b.get("health", {}) or {}
+    exposure_info = (exposure_by_bot or {}).get(key, {})
+    warning = _clean_warning(h.get("last_warning"))
+    last_error = b.get("last_error")
+    loaded = bool(b.get("loaded"))
+    enabled = bool(b.get("enabled"))
+    ok = enabled and loaded and not b.get("load_error") and not last_error
+    emoji = "✅" if ok else ("⚠️" if enabled else "⏸️")
+
+    positions = h.get("last_positions_count")
+    if positions is None:
+        positions = exposure_info.get("total")
+
+    pf_r = h.get("profit_factor_r")
+    expectancy = h.get("expectancy_r")
+    open_r = h.get("open_runner_r")
+    open_symbol = h.get("open_runner_symbol")
+    if open_r is None and exposure_info.get("best_open_runner"):
+        open_r = exposure_info["best_open_runner"].get("runner_r")
+        open_symbol = exposure_info["best_open_runner"].get("symbol")
+
+    runners = exposure_info.get("open_runners") or {}
+    runner_txt = (
+        f"1R:{runners.get('runners_1r_open', 0)} "
+        f"2R:{runners.get('runners_2r_open', 0)} "
+        f"3R:{runners.get('runners_3r_open', 0)}"
+    )
+
+    pieces = [
+        f"{emoji} {key} ({b.get('name')})",
+        f"scan {b.get('minutes_since_scanner')}m",
+        f"gestão {b.get('minutes_since_management')}m",
+        f"pos {positions}",
+        f"WL {h.get('watchlist_valid')}/{h.get('watchlist_total')}",
+        f"sinais {h.get('last_signals_sent')}",
+    ]
+
+    if pf_r is not None:
+        pieces.append(f"PF {_fmt_metric(pf_r, '', 2)}")
+    if expectancy is not None:
+        pieces.append(f"Exp {_fmt_metric(expectancy, 'R', 2)}")
+    if open_r is not None:
+        runner_label = f"runner {_fmt_metric(open_r, 'R', 2)}"
+        if open_symbol:
+            runner_label += f" {open_symbol}"
+        pieces.append(runner_label)
+    pieces.append(runner_txt)
+
+    if last_error:
+        pieces.append(f"erro={last_error}")
+    if warning:
+        pieces.append(f"warning={warning}")
+    if b.get("load_error"):
+        pieces.append(f"load_error={b.get('load_error')}")
+
+    return " | ".join(pieces)
 
 
 def _bot_report_health_text(key: str):
@@ -770,8 +871,11 @@ def build_central_status_text():
     status = central_watchdog_status()
     exposure_snapshot = central_exposure_snapshot()
     best = exposure_snapshot.get("best_open_runner") or {}
+    by_bot_exposure = exposure_snapshot.get("by_bot", {}) or {}
+    open_runners = exposure_snapshot.get("open_runners") or {}
+
     lines = [
-        f"📊 RELATÓRIO CENTRAL QUANT",
+        "📊 RELATÓRIO CENTRAL QUANT",
         f"Data/hora: {data_hora_sp_str()}",
         f"Status: {status.get('status')} | OK: {status.get('ok')}",
         f"Central iniciou: {status.get('central_started_at')}",
@@ -781,8 +885,16 @@ def build_central_status_text():
         f"Total: {exposure_snapshot.get('total_positions_open')}",
         f"LONG: {exposure_snapshot.get('long_positions_open')}",
         f"SHORT: {exposure_snapshot.get('short_positions_open')}",
-        f"Runners abertos: {exposure_snapshot.get('open_runners')}",
+        (
+            "Runners abertos: "
+            f"1R={open_runners.get('runners_1r_open', 0)} | "
+            f"2R={open_runners.get('runners_2r_open', 0)} | "
+            f"3R={open_runners.get('runners_3r_open', 0)} | "
+            f"5R={open_runners.get('runners_5r_open', 0)} | "
+            f"10R={open_runners.get('runners_10r_open', 0)}"
+        ),
     ]
+
     if best:
         lines += [
             "",
@@ -791,18 +903,23 @@ def build_central_status_text():
             f"{best.get('runner_pct')}% | {best.get('runner_r')}R",
         ]
 
-    lines.append("")
-    lines.append("🤖 BOTS")
-    for key, cfg in BOT_CONFIGS.items():
-        b = bot_health(key, cfg)
-        h = b.get("health", {}) or {}
-        ok = bool(b.get("enabled")) and bool(b.get("loaded")) and not b.get("load_error") and not b.get("last_error")
-        emoji = "✅" if ok else ("⚠️" if b.get("enabled") else "⏸️")
-        lines.append(
-            f"{emoji} {key}: loaded={b.get('loaded')} | scanner={b.get('minutes_since_scanner')}m | "
-            f"gestão={b.get('minutes_since_management')}m | pos={h.get('last_positions_count')} | "
-            f"erro={b.get('last_error')} | warning={h.get('last_warning')}"
-        )
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    concentration_msgs = []
+    if total_pos >= 50:
+        concentration_msgs.append(f"Atenção: {total_pos} posições abertas.")
+    if total_pos and short_pos / max(total_pos, 1) >= 0.80:
+        concentration_msgs.append(f"Concentração SHORT alta: {short_pos}/{total_pos}.")
+    if total_pos and long_pos / max(total_pos, 1) >= 0.80:
+        concentration_msgs.append(f"Concentração LONG alta: {long_pos}/{total_pos}.")
+    if concentration_msgs:
+        lines += ["", "⚠️ OBSERVAÇÕES DE RISCO"] + [f"- {m}" for m in concentration_msgs]
+
+    lines += ["", "🤖 BOTS"]
+    for key in BOT_CONFIGS.keys():
+        lines.append(_bot_compact_status_line(key, by_bot_exposure))
+
     return "\n".join(lines)
 
 
@@ -821,6 +938,111 @@ def build_central_report(mode: str = "curto", bot_key: str = None):
     for key in BOT_CONFIGS.keys():
         parts.append(build_single_bot_report(key, complete=True))
     return "\n\n==============================\n".join(parts)
+
+
+def build_diagnostic_report():
+    status = central_watchdog_status()
+    exposure_snapshot = central_exposure_snapshot()
+    by_bot_exposure = exposure_snapshot.get("by_bot", {}) or {}
+    reasons = list(status.get("reasons", []) or [])
+    warnings = []
+    checks = []
+
+    all_enabled_loaded = True
+    all_watchlists_ok = True
+    all_cycles_ok = True
+    all_errors_ok = True
+
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+        if not b.get("enabled"):
+            continue
+
+        loaded = bool(b.get("loaded"))
+        scanner_ok = b.get("minutes_since_scanner") is not None and b.get("minutes_since_scanner") <= WATCHDOG_THRESHOLD_MINUTES
+        management_ok = b.get("minutes_since_management") is not None and b.get("minutes_since_management") <= WATCHDOG_THRESHOLD_MINUTES
+        error_ok = not b.get("last_error") and not b.get("load_error")
+        wl_total = h.get("watchlist_total")
+        wl_valid = h.get("watchlist_valid")
+        wl_invalid = h.get("watchlist_invalid", []) or []
+        watchlist_ok = (wl_total is None) or (wl_valid == wl_total and not wl_invalid)
+        warning = _clean_warning(h.get("last_warning"))
+
+        all_enabled_loaded = all_enabled_loaded and loaded
+        all_cycles_ok = all_cycles_ok and scanner_ok and management_ok
+        all_errors_ok = all_errors_ok and error_ok
+        all_watchlists_ok = all_watchlists_ok and watchlist_ok
+
+        if warning:
+            warnings.append(f"{key}: {warning}")
+
+        checks.append(
+            f"{key}: "
+            f"loaded={'✅' if loaded else '❌'} | "
+            f"scanner={'✅' if scanner_ok else '❌'} {b.get('minutes_since_scanner')}m | "
+            f"gestão={'✅' if management_ok else '❌'} {b.get('minutes_since_management')}m | "
+            f"WL={'✅' if watchlist_ok else '❌'} {wl_valid}/{wl_total} | "
+            f"erro={'✅' if error_ok else '❌'} | "
+            f"pos={(by_bot_exposure.get(key) or {}).get('total')}"
+        )
+
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    open_runners = exposure_snapshot.get("open_runners") or {}
+    best = exposure_snapshot.get("best_open_runner") or {}
+
+    risk_notes = []
+    if total_pos >= 50:
+        risk_notes.append(f"Muitas posições abertas: {total_pos}.")
+    if total_pos and short_pos / max(total_pos, 1) >= 0.80:
+        risk_notes.append(f"Exposição muito SHORT: {short_pos}/{total_pos}.")
+    if total_pos and long_pos / max(total_pos, 1) >= 0.80:
+        risk_notes.append(f"Exposição muito LONG: {long_pos}/{total_pos}.")
+
+    apto = bool(status.get("ok")) and all_enabled_loaded and all_cycles_ok and all_errors_ok and all_watchlists_ok
+    resultado = "✅ APTO PARA OPERAR" if apto else "⚠️ ATENÇÃO / VERIFICAR"
+
+    lines = [
+        "🩺 DIAGNÓSTICO CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Resultado: {resultado}",
+        "",
+        "CHECKS GERAIS",
+        f"Central status: {status.get('status')}",
+        f"Bots carregados: {'✅' if all_enabled_loaded else '❌'}",
+        f"Scanners/Gestão recentes: {'✅' if all_cycles_ok else '❌'}",
+        f"Sem erros críticos: {'✅' if all_errors_ok else '❌'}",
+        f"Watchlists válidas: {'✅' if all_watchlists_ok else '❌'}",
+        "",
+        "EXPOSIÇÃO",
+        f"Total: {total_pos} | LONG: {long_pos} | SHORT: {short_pos}",
+        (
+            "Runners: "
+            f"1R={open_runners.get('runners_1r_open', 0)} | "
+            f"2R={open_runners.get('runners_2r_open', 0)} | "
+            f"3R={open_runners.get('runners_3r_open', 0)} | "
+            f"5R={open_runners.get('runners_5r_open', 0)} | "
+            f"10R={open_runners.get('runners_10r_open', 0)}"
+        ),
+    ]
+
+    if best:
+        lines += [
+            f"Melhor runner: {best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')} | "
+            f"{best.get('runner_pct')}% | {best.get('runner_r')}R"
+        ]
+
+    if reasons:
+        lines += ["", "MOTIVOS DO WATCHDOG"] + [f"- {r}" for r in reasons]
+    if warnings:
+        lines += ["", "WARNINGS RELEVANTES"] + [f"- {w}" for w in warnings]
+    if risk_notes:
+        lines += ["", "OBSERVAÇÕES DE RISCO"] + [f"- {r}" for r in risk_notes]
+
+    lines += ["", "BOTS"] + checks
+    return "\n".join(lines)
 
 
 def parse_report_command(text: str):
@@ -933,12 +1155,17 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     Mantém a lógica individual em cada bot e só padroniza o acesso pela Central.
     """
     raw_cmd = (cmd or "").strip()
+    cmd0 = raw_cmd.lower().split()[0].split("@")[0] if raw_cmd else ""
+
+    if cmd0 in {"/diagnostico", "/diagnóstico", "/diag"}:
+        return build_diagnostic_report()
+
     parsed_report = parse_report_command(raw_cmd)
     if parsed_report:
         mode, bot_key = parsed_report
         return build_central_report(mode, bot_key=bot_key)
 
-    cmd = raw_cmd.lower().split()[0].split("@")[0] if raw_cmd else ""
+    cmd = cmd0
 
     # TURTLE tem handle_command próprio, mas ele envia pelo próprio módulo.
     # Preferimos respostas diretas para evitar depender do CHAT_ID interno.
@@ -1018,7 +1245,10 @@ def central_command_router_loop(key: str, cfg: dict):
 
             if warning:
                 if module is not None and hasattr(module, "HEALTH"):
-                    module.HEALTH["last_warning"] = warning
+                    if is_benign_telegram_conflict(warning):
+                        module.HEALTH["last_warning"] = None
+                    else:
+                        module.HEALTH["last_warning"] = warning
                 time.sleep(2)
                 continue
 
