@@ -80,7 +80,8 @@ ENABLE_FALCON = str(os.environ.get("ENABLE_FALCON", "true")).lower() in {"1", "t
 # Execução real segura.
 # PAPER: igual ao comportamento atual.
 # READY: valida BingX/API/Risk, mas NÃO envia ordens.
-# LIVE: só envia se ENABLE_REAL_TRADING=true e a Central aprovar em /can_open_trade.
+# VERIFY: monta/valida a ordem completa, mas NÃO envia.
+# LIVE: envia automaticamente se ENABLE_REAL_TRADING=true e a Central aprovar em /can_open_trade.
 FALCON_MODE = os.environ.get("FALCON_MODE", os.environ.get("EXECUTION_MODE", "PAPER")).strip().upper()
 ENABLE_REAL_TRADING = str(os.environ.get("ENABLE_REAL_TRADING", "false")).lower() in {"1", "true", "yes", "sim", "on"}
 FALCON_REAL_NOTIONAL_USDT = float(os.environ.get("FALCON_REAL_NOTIONAL_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "5")))
@@ -905,7 +906,7 @@ def signal_message(sig):
         f"ADX M15: {safe_float(sig.get('adx'), 0):.2f}\n"
         f"Breakout em ATR: {safe_float(sig.get('breakout_atr'), 0):.2f}\n"
         f"Range em ATR: {safe_float(sig.get('range_atr'), 0):.2f}\n\n"
-        f"Modo: {FALCON_MODE} / {'BINGX BLOQUEADA' if FALCON_MODE != 'LIVE' else 'BINGX SAFE'}"
+        f"Modo: {FALCON_MODE} / {'BINGX AUTO' if FALCON_MODE == 'LIVE' else ('VERIFY SEM ENVIO' if FALCON_MODE == 'VERIFY' else 'BINGX BLOQUEADA')}"
     )
 
 
@@ -964,7 +965,8 @@ def execute_signal_if_allowed(sig, positions=None):
     Decide e, se estiver LIVE, envia ordem real à BingX via broker.py.
     Em PAPER: não consulta execução real e preserva comportamento antigo.
     Em READY: consulta Central/BingX READY, mas não envia ordem.
-    Em LIVE: exige ENABLE_REAL_TRADING=true, Central ALLOW e broker carregado.
+    Em VERIFY: monta payload/quantidade em DRY_RUN, mas não envia ordem.
+    Em LIVE: envia automaticamente se ENABLE_REAL_TRADING=true, Central ALLOW e broker carregado.
     """
     positions = positions if positions is not None else get_positions()
     mode = FALCON_MODE
@@ -995,7 +997,7 @@ def execute_signal_if_allowed(sig, positions=None):
     if not decision.get("allowed"):
         return False, decision
 
-    if mode == "READY":
+    if mode in {"READY", "VERIFY"}:
         ready = None
         if central_broker is not None:
             try:
@@ -1005,8 +1007,25 @@ def execute_signal_if_allowed(sig, positions=None):
         else:
             ready = {"ok": False, "status": "BROKER_IMPORT_ERROR", "error": BROKER_IMPORT_ERROR}
         sig["bingx_ready"] = ready
-        HEALTH["last_execution_order"] = {"mode": "READY", "ready": ready}
-        # READY nunca bloqueia o paper/sinal; só registra o estado.
+
+        verify_order = None
+        if mode == "VERIFY" and central_broker is not None:
+            try:
+                # Em VERIFY o broker fica em dry-run: calcula quantidade/preço e monta payload sem enviar.
+                verify_order = central_broker.place_market_order(
+                    symbol=sig.get("symbol"),
+                    side=sig.get("side"),
+                    notional_usdt=FALCON_REAL_NOTIONAL_USDT,
+                    reduce_only=False,
+                    client_tag=f"FALCON-VERIFY-{sig.get('setup')}-{int(time.time())}",
+                )
+                sig["verify_order"] = verify_order
+            except Exception as exc:
+                verify_order = {"ok": False, "status": "VERIFY_ERROR", "sent": False, "error": str(exc)}
+                sig["verify_order"] = verify_order
+
+        HEALTH["last_execution_order"] = {"mode": mode, "ready": ready, "verify_order": verify_order, "sent": False}
+        # READY/VERIFY nunca bloqueiam o paper/sinal; só registram o estado.
         return True, decision
 
     if mode != "LIVE":
@@ -1499,7 +1518,7 @@ def build_summary(period_name, trades, period_signals_override=None):
         f"Melhor trade:\n{trade_line(stats['best_trade'])}\n\n"
         f"Pior trade:\n{trade_line(stats['worst_trade'])}\n\n"
         f"Trades ainda ativos: {len(positions)}\n"
-        f"Modo: {FALCON_MODE} / {'BINGX BLOQUEADA' if FALCON_MODE != 'LIVE' else 'BINGX SAFE'}"
+        f"Modo: {FALCON_MODE} / {'BINGX AUTO' if FALCON_MODE == 'LIVE' else ('VERIFY SEM ENVIO' if FALCON_MODE == 'VERIFY' else 'BINGX BLOQUEADA')}"
     )
 
 
@@ -1807,7 +1826,7 @@ def start_threads():
         f"ORB NY: {ORB_START_HOUR:02d}:{ORB_START_MINUTE:02d}\n"
         f"Opera até: {ORB_TRADE_END_HOUR:02d}:{ORB_TRADE_END_MINUTE:02d} NY\n"
         f"Alinhamento: {ALIGNMENT_MODE}\n"
-        f"Modo: {FALCON_MODE} / {'BINGX BLOQUEADA' if FALCON_MODE != 'LIVE' else 'BINGX SAFE'}"
+        f"Modo: {FALCON_MODE} / {'BINGX AUTO' if FALCON_MODE == 'LIVE' else ('VERIFY SEM ENVIO' if FALCON_MODE == 'VERIFY' else 'BINGX BLOQUEADA')}"
     )
     threading.Thread(target=run_thread_guarded, args=("scanner", scanner_loop), daemon=True).start()
     threading.Thread(target=run_thread_guarded, args=("management", management_loop), daemon=True).start()
