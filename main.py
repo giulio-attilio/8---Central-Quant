@@ -2744,6 +2744,19 @@ def support_route():
     return {"text": build_support_report()}
 
 
+@app.route("/menu")
+@app.route("/comandos")
+@app.route("/start")
+def menu_route():
+    return {"text": build_central_menu_text()}
+
+
+@app.route("/comandosfull")
+@app.route("/commandsfull")
+def commands_full_route():
+    return {"text": build_central_help_text()}
+
+
 @app.route("/audit")
 @app.route("/auditoria2")
 def audit_route():
@@ -2880,9 +2893,40 @@ def falcon_route():
     return {"text": build_single_bot_report("FALCON", complete=True)}
 
 
+def build_central_menu_text():
+    return (
+        "📦 MENU CENTRAL QUANT\n\n"
+        "Use quase sempre apenas estes comandos:\n\n"
+        "1) Rotina diária\n"
+        "/dashboard — visão geral para operar e monitorar\n"
+        "/daily — relatório enxuto para copiar e mandar ao ChatGPT\n\n"
+        "2) Pós-deploy / antes de LIVE\n"
+        "/selftest — valida saúde geral da Central\n"
+        "/execution — valida modo, BingX e permissões\n"
+        "/sync — compara Central LIVE x BingX\n\n"
+        "3) Execução real\n"
+        "/live — saldo, posições reais e últimas execuções\n"
+        "/executions — log das tentativas VERIFY/LIVE\n"
+        "/risk — decisão global ALLOW/DENY e concentração\n\n"
+        "4) Se algo parecer errado\n"
+        "/support — pacote técnico de troubleshooting\n"
+        "/memory — memória/risco de restart\n"
+        "/audit — auditoria completa em partes\n\n"
+        "5) Investigar operação específica\n"
+        "/journal — histórico resumido\n"
+        "/trade <ativo> — replay do último trade do ativo\n"
+        "/timeline <ativo> — linha do tempo quando disponível\n"
+        "/decisionlog — decisões quando disponível\n\n"
+        "Comandos por robô:\n"
+        "/falcon /predator /turtle /trend /donkey /cobra /meme\n\n"
+        "Lista completa avançada: /comandosfull"
+    )
+
+
 def build_central_help_text():
     return (
-        "🤖 CENTRAL QUANT — COMANDOS\n\n"
+        "🤖 CENTRAL QUANT — LISTA COMPLETA DE COMANDOS\n\n"
+        "Uso recomendado: /menu\n\n"
         "Pacotes principais:\n"
         "/dashboard — visão geral inteligente\n"
         "/daily — relatório diário enxuto para avaliação\n"
@@ -2890,15 +2934,15 @@ def build_central_help_text():
         "/audit — auditoria completa\n"
         "/full — dump completo com snapshot\n\n"
         "Operação:\n"
-        "/executive\n/selftest\n/diagnostico\n/memory\n/execution\n/bingx\n/risk\n/heat\n/ranking\n/healthscore\n/meta\n/exposure\n/runners\n\n"
+        "/executive\n/selftest\n/diagnostico\n/memory\n/execution\n/bingx\n/live\n/sync\n/executions\n/risk\n/heat\n/ranking\n/healthscore\n/meta\n/exposure\n/runners\n\n"
         "Relatórios:\n"
         "/relatorio — resumo central\n"
         "/relatoriocompleto — pacote completo sem espaço\n"
         "/auditoria — alias do relatório completo nativo\n\n"
         "Por robô:\n"
         "/trend\n/donkey\n/cobra\n/meme\n/predator\n/turtle\n/falcon\n\n"
-        "Histórico e simulação:\n"
-        "/snapshot\n/history\n/simulate TURTLE\n\n"
+        "Histórico, estatística e simulação:\n"
+        "/journal\n/trade <ativo>\n/globalstats\n/signalai <ativo>\n/capital\n/correlation\n/timeheat\n/marketscore\n/allocation\n/rankingvivo\n/learning\n/quantos\n/snapshot\n/history\n/simulate TURTLE\n/simulateoff TURTLE\n\n"
         "Sugestão de uso diário: /dashboard. Para colar no ChatGPT: /daily."
     )
 
@@ -3345,7 +3389,9 @@ def build_central_command_reply(text: str):
         return None
     cmd0 = raw.lower().split()[0].split("@")[0]
 
-    if cmd0 in {"/start", "/help", "/comandos"}:
+    if cmd0 in {"/start", "/help", "/menu", "/comandos"}:
+        return build_central_menu_text()
+    if cmd0 in {"/comandosfull", "/commandsfull", "/helpfull"}:
         return build_central_help_text()
     if cmd0 in {"/dashboard"}:
         return build_dashboard_report()
@@ -3467,6 +3513,9 @@ def build_central_command_reply(text: str):
 def _central_command_title(text: str):
     cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
     mapping = {
+        "/menu": "MENU",
+        "/comandos": "MENU",
+        "/start": "MENU",
         "/dashboard": "DASHBOARD",
         "/daily": "DAILY",
         "/diario": "DAILY",
