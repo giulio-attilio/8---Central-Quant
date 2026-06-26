@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-25-CENTRAL-FULL-RELATORIO-DIAGNOSTICO-SELFTEST-MEMORY-ROUTES-FIX
+# Versão: 2026-06-25-CENTRAL-FULL-MEMORY-POR-BOT
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -8,23 +8,28 @@
 # - Permitir ativação gradual por ENABLE_*.
 # - Adicionar Turtle Breakout 2.0 como robô de pesquisa/paper.
 # - Adicionar painel de runners abertos por R na Central.
+# - Adicionar /relatorio, /diagnostico, /selftest e /memory.
+# - Instrumentar memória por etapa/bot no nível da Central.
 #
 # Importante:
 # - Pause os serviços antigos no Render antes de ativar o mesmo bot aqui.
 # - Se dois processos usarem o mesmo token Telegram com getUpdates, ocorre erro 409.
 # - O Turtle aqui é apenas carregado como módulo em bots/turtle.py.
 # - A execução real na BingX NÃO é feita pela Central.
+# - A memória por scanner interno de cada bot só pode ser medida dentro do próprio bot.
+#   Este main mede memória antes/depois de carregar, consultar health, posições,
+#   exposure, relatório, diagnóstico, selftest e rotas centralizadas.
 
 import os
 import time
 import json
-import threading
 import gc
-from collections import deque
+import threading
 import requests
 import importlib.util
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from collections import deque
 from flask import Flask
 
 app = Flask(__name__)
@@ -38,15 +43,16 @@ WATCHDOG_CHECK_SECONDS = int(os.environ.get("WATCHDOG_CHECK_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
 
-# Limites internos de observabilidade de memória.
-# Render free/starter costuma reiniciar perto de 512 MB; use env para ajustar.
-MEMORY_LIMIT_MB = float(os.environ.get("CENTRAL_MEMORY_LIMIT_MB", "512"))
-MEMORY_GC_THRESHOLD_MB = float(os.environ.get("CENTRAL_MEMORY_GC_THRESHOLD_MB", "430"))
-MEMORY_HISTORY_MAXLEN = int(os.environ.get("CENTRAL_MEMORY_HISTORY_MAXLEN", "120"))
-MEMORY_LOG_EVERY_SECONDS = int(os.environ.get("CENTRAL_MEMORY_LOG_EVERY_SECONDS", "300"))
+# Memória Render free costuma ser 512 MB.
+MEMORY_LIMIT_MB = float(os.environ.get("MEMORY_LIMIT_MB", "512"))
+MEMORY_GC_THRESHOLD_MB = float(os.environ.get("MEMORY_GC_THRESHOLD_MB", "430"))
+MEMORY_ALERT_THRESHOLD_PCT = float(os.environ.get("MEMORY_ALERT_THRESHOLD_PCT", "90"))
+MEMORY_HISTORY_MAXLEN = int(os.environ.get("MEMORY_HISTORY_MAXLEN", "120"))
+MEMORY_LOG_INTERVAL_SECONDS = int(os.environ.get("MEMORY_LOG_INTERVAL_SECONDS", "300"))
+MEMORY_PROFILE_BOT_STEPS = os.environ.get("MEMORY_PROFILE_BOT_STEPS", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+
 MEMORY_HISTORY = deque(maxlen=MEMORY_HISTORY_MAXLEN)
-LAST_MEMORY_LOG_TS = 0.0
-LAST_GC_TS = 0.0
+MEMORY_LOCK = threading.Lock()
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -111,140 +117,156 @@ def safe_round(value, ndigits=2, default=None):
         return default
 
 
+# ==========================================================
+# MEMORY MONITOR
+# ==========================================================
+
 def current_rss_mb():
-    """RSS atual do processo em MB, usando /proc para não depender de psutil."""
+    """RSS real do processo em MB. Preferimos /proc/self/status no Linux/Render."""
     try:
-        with open("/proc/self/statm", "r", encoding="utf-8") as f:
-            pages = int(f.read().split()[1])
-        return round(pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024), 2)
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = float(line.split()[1])
+                    return round(kb / 1024.0, 2)
+    except Exception:
+        pass
+
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux retorna KB; macOS retorna bytes. Render é Linux.
+        return round(float(usage) / 1024.0, 2)
     except Exception:
         return None
 
 
-def memory_percent(rss_mb=None):
-    try:
-        rss = current_rss_mb() if rss_mb is None else rss_mb
-        if rss is None or MEMORY_LIMIT_MB <= 0:
-            return None
-        return round((float(rss) / float(MEMORY_LIMIT_MB)) * 100, 2)
-    except Exception:
+def memory_usage_pct(rss_mb=None):
+    rss = current_rss_mb() if rss_mb is None else rss_mb
+    if rss is None or not MEMORY_LIMIT_MB:
         return None
+    return round((float(rss) / float(MEMORY_LIMIT_MB)) * 100, 2)
 
 
-def memory_snapshot(label="snapshot"):
+def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
     rss = current_rss_mb()
-    pct = memory_percent(rss)
     snap = {
         "ts": data_hora_sp_str(),
         "label": str(label),
         "rss_mb": rss,
         "limit_mb": MEMORY_LIMIT_MB,
-        "usage_pct": pct,
-        "gc_count": list(gc.get_count()),
-        "loaded_bots": list(LOADED_BOTS.keys()),
+        "usage_pct": memory_usage_pct(rss),
         "threads": threading.active_count(),
+        "gc_count": list(gc.get_count()),
+        "loaded_bots": list(LOADED_BOTS.keys()) if "LOADED_BOTS" in globals() else [],
     }
-    MEMORY_HISTORY.append(snap)
+    if isinstance(extra, dict):
+        snap.update(extra)
+
+    if store:
+        with MEMORY_LOCK:
+            MEMORY_HISTORY.append(snap)
+
+    if print_log:
+        print(
+            f"MEMORY {snap.get('label')} | "
+            f"rss={snap.get('rss_mb')} MB | "
+            f"usage={snap.get('usage_pct')}% | "
+            f"threads={snap.get('threads')}"
+        )
     return snap
 
 
-def maybe_collect_garbage(label="auto"):
-    """Coleta GC se a memória estiver alta. Evita rodar GC em loop a cada request."""
-    global LAST_GC_TS
-    rss = current_rss_mb()
-    if rss is None:
-        return {"ran": False, "rss_before_mb": None, "rss_after_mb": None, "reason": "rss_unavailable"}
-
-    now = time.time()
-    if rss < MEMORY_GC_THRESHOLD_MB and now - LAST_GC_TS < 60:
-        return {"ran": False, "rss_before_mb": rss, "rss_after_mb": rss, "reason": "below_threshold"}
-
-    if rss >= MEMORY_GC_THRESHOLD_MB or now - LAST_GC_TS >= 300:
-        before = rss
+def force_gc_if_needed(label="gc", force=False):
+    before = memory_snapshot(f"{label}_before_gc", store=True)
+    before_mb = before.get("rss_mb") or 0
+    should_gc = bool(force or before_mb >= MEMORY_GC_THRESHOLD_MB)
+    collected = None
+    if should_gc:
         collected = gc.collect()
-        after = current_rss_mb()
-        LAST_GC_TS = now
-        MEMORY_HISTORY.append({
-            "ts": data_hora_sp_str(),
-            "label": f"gc:{label}",
-            "rss_mb": after,
-            "limit_mb": MEMORY_LIMIT_MB,
-            "usage_pct": memory_percent(after),
-            "collected": collected,
-            "rss_before_mb": before,
-            "threads": threading.active_count(),
-        })
-        return {"ran": True, "rss_before_mb": before, "rss_after_mb": after, "collected": collected}
-
-    return {"ran": False, "rss_before_mb": rss, "rss_after_mb": rss, "reason": "cooldown"}
-
-
-def log_memory_if_needed(label="periodic"):
-    global LAST_MEMORY_LOG_TS
-    now = time.time()
-    if now - LAST_MEMORY_LOG_TS < MEMORY_LOG_EVERY_SECONDS:
-        return
-    LAST_MEMORY_LOG_TS = now
-    snap = memory_snapshot(label)
-    print(
-        "MEMORY",
-        f"label={snap.get('label')}",
-        f"rss_mb={snap.get('rss_mb')}",
-        f"usage_pct={snap.get('usage_pct')}",
-        f"threads={snap.get('threads')}",
+        time.sleep(0.05)
+    after = memory_snapshot(
+        f"{label}_after_gc",
+        extra={"gc_executed": should_gc, "collected": collected, "rss_before_mb": before_mb},
+        store=True,
     )
+    return before, after
 
 
-def build_memory_report():
-    snap_before = memory_snapshot("/memory_before_gc")
-    gc_result = maybe_collect_garbage("/memory")
-    snap_after = memory_snapshot("/memory_after_gc")
+def memory_status_payload(run_gc=False, label="/memory"):
+    before = memory_snapshot(f"{label}_before_gc", store=True)
+    collected = None
+    gc_executed = False
+    if run_gc or ((before.get("rss_mb") or 0) >= MEMORY_GC_THRESHOLD_MB):
+        gc_executed = True
+        collected = gc.collect()
+        time.sleep(0.05)
+    after = memory_snapshot(
+        f"{label}_after_gc",
+        extra={"gc_executed": gc_executed, "collected": collected, "rss_before_mb": before.get("rss_mb")},
+        store=True,
+    )
+    with MEMORY_LOCK:
+        history = list(MEMORY_HISTORY)[-20:]
+    return {
+        "ok": (after.get("usage_pct") or 0) < MEMORY_ALERT_THRESHOLD_PCT,
+        "status": "OK" if (after.get("usage_pct") or 0) < MEMORY_ALERT_THRESHOLD_PCT else "ALERTA",
+        "before_gc": before,
+        "current": after,
+        "limit_mb": MEMORY_LIMIT_MB,
+        "gc_threshold_mb": MEMORY_GC_THRESHOLD_MB,
+        "alert_threshold_pct": MEMORY_ALERT_THRESHOLD_PCT,
+        "history": history,
+    }
 
-    status = "OK"
-    pct = snap_after.get("usage_pct")
-    if pct is not None and pct >= 90:
-        status = "ATENÇÃO"
-    if pct is not None and pct >= 97:
-        status = "CRÍTICO"
 
-    recent = list(MEMORY_HISTORY)[-8:]
-    hist_lines = [
-        f"{x.get('ts')} | {x.get('label')} | {x.get('rss_mb')} MB | {x.get('usage_pct')}%"
-        for x in recent
-    ]
+def build_memory_text(run_gc=False):
+    payload = memory_status_payload(run_gc=run_gc, label="/memory")
+    before = payload.get("before_gc") or {}
+    cur = payload.get("current") or {}
+    history = payload.get("history") or []
 
     lines = [
         "🧠 MEMÓRIA CENTRAL QUANT",
         f"Data/hora: {data_hora_sp_str()}",
-        f"Status: {status}",
+        f"Status: {payload.get('status')}",
         "",
-        f"RSS antes GC: {snap_before.get('rss_mb')} MB ({snap_before.get('usage_pct')}%)",
-        f"RSS atual: {snap_after.get('rss_mb')} MB ({snap_after.get('usage_pct')}%)",
-        f"Limite configurado: {MEMORY_LIMIT_MB:.0f} MB",
-        f"Threshold GC: {MEMORY_GC_THRESHOLD_MB:.0f} MB",
-        f"Threads ativas: {snap_after.get('threads')}",
-        f"GC count: {snap_after.get('gc_count')}",
-        f"GC executado: {gc_result.get('ran')} | coletados: {gc_result.get('collected')}",
+        f"RSS antes GC: {before.get('rss_mb')} MB ({before.get('usage_pct')}%)",
+        f"RSS atual: {cur.get('rss_mb')} MB ({cur.get('usage_pct')}%)",
+        f"Limite configurado: {payload.get('limit_mb')} MB",
+        f"Threshold GC: {payload.get('gc_threshold_mb')} MB",
+        f"Threads ativas: {cur.get('threads')}",
+        f"GC count: {cur.get('gc_count')}",
+        f"GC executado: {cur.get('gc_executed')} | coletados: {cur.get('collected')}",
         "",
         "Histórico recente:",
-        *(hist_lines or ["Sem histórico."]),
+    ]
+    for item in history[-12:]:
+        lines.append(f"{item.get('ts')} | {item.get('label')} | {item.get('rss_mb')} MB | {item.get('usage_pct')}% | threads={item.get('threads')}")
+    lines += [
         "",
         "Observação:",
         "Se a memória ficar acima de 90% por muito tempo, o Render pode reiniciar o serviço.",
     ]
-    return "\n".join(lines)
+    return "\n".join(lines), payload
 
 
-@app.after_request
-def after_request_memory_housekeeping(response):
-    try:
-        log_memory_if_needed("after_request")
-        # Coleta apenas quando estiver acima do limite configurado.
-        if (current_rss_mb() or 0) >= MEMORY_GC_THRESHOLD_MB:
-            maybe_collect_garbage("after_request")
-    except Exception:
-        pass
-    return response
+def memory_profile_step(label):
+    """Atalho para snapshots pequenos por etapa. Desligável por MEMORY_PROFILE_BOT_STEPS=false."""
+    if MEMORY_PROFILE_BOT_STEPS:
+        return memory_snapshot(label, store=True, print_log=False)
+    return None
+
+
+def memory_monitor_loop():
+    while True:
+        try:
+            snap = memory_snapshot("memory_loop", store=True, print_log=True)
+            if (snap.get("rss_mb") or 0) >= MEMORY_GC_THRESHOLD_MB:
+                force_gc_if_needed("memory_loop")
+        except Exception as exc:
+            print("ERRO MEMORY MONITOR:", exc)
+        time.sleep(MEMORY_LOG_INTERVAL_SECONDS)
 
 
 # Cada bot recebe seus tokens próprios, mapeados para TELEGRAM_BOT_TOKEN/CHAT_ID
@@ -325,8 +347,6 @@ CENTRAL_HEALTH = {
 }
 
 # Evita inicialização duplicada de bots/roteadores no mesmo processo.
-# Importante para impedir respostas duplicadas no Telegram caso o módulo principal
-# seja importado mais de uma vez pelo servidor.
 CENTRAL_RUNTIME_STARTED = False
 CENTRAL_RUNTIME_LOCK = threading.Lock()
 
@@ -363,12 +383,12 @@ def load_bot(key: str, cfg: dict):
         "BOT_NAME": cfg["name"],
     }
 
-    # Alguns códigos usam variáveis específicas além do padrão TELEGRAM_*.
     for extra in cfg.get("extra_token_envs", []):
         env_map[extra] = token
     for extra in cfg.get("extra_chat_envs", []):
         env_map[extra] = chat_id
 
+    memory_profile_step(f"before_import_{key}")
     old_env = _set_env_temporarily(env_map)
     try:
         module_name = f"central_bots.{cfg['module']}"
@@ -379,6 +399,7 @@ def load_bot(key: str, cfg: dict):
         return module
     finally:
         _restore_env(old_env)
+        memory_profile_step(f"after_import_{key}")
 
 
 def start_enabled_bots():
@@ -386,14 +407,20 @@ def start_enabled_bots():
         if not env_bool(cfg["enabled_env"], default=False):
             continue
         try:
+            memory_profile_step(f"before_load_bot_{key}")
             LOADED_BOTS[key] = load_bot(key, cfg)
             print(f"BOT CARREGADO: {key} - {cfg['name']}")
+            memory_profile_step(f"after_load_bot_{key}")
+            if (current_rss_mb() or 0) >= MEMORY_GC_THRESHOLD_MB:
+                force_gc_if_needed(f"after_load_bot_{key}")
         except Exception as exc:
             LOAD_ERRORS[key] = str(exc)
             print(f"ERRO AO CARREGAR {key}: {exc}")
+            memory_profile_step(f"load_error_{key}")
 
 
 def bot_health(key: str, cfg: dict):
+    memory_profile_step(f"before_bot_health_{key}")
     module = LOADED_BOTS.get(key)
     enabled = env_bool(cfg["enabled_env"], default=False)
     token_configured = bool(os.environ.get(cfg["token_env"]))
@@ -420,11 +447,14 @@ def bot_health(key: str, cfg: dict):
         payload["minutes_since_scanner"] = minutes_since(health.get("last_scanner_run"))
         payload["minutes_since_management"] = minutes_since(health.get("last_management_run"))
 
+    memory_profile_step(f"after_bot_health_{key}")
     return payload
 
 
-def get_open_positions_from_module(module):
+def get_open_positions_from_module(module, key=None):
     positions = []
+    label = key or getattr(module, "__name__", "unknown")
+    memory_profile_step(f"before_positions_{label}")
     try:
         if hasattr(module, "carregar_posicoes"):
             raw = module.carregar_posicoes()
@@ -449,6 +479,8 @@ def get_open_positions_from_module(module):
             positions.append(p)
     except Exception:
         pass
+    finally:
+        memory_profile_step(f"after_positions_{label}")
     return positions
 
 
@@ -462,52 +494,22 @@ def _safe_float(value, default=0.0):
 
 
 def _position_runner_r(position: dict):
-    """
-    Retorna o melhor R disponível para uma posição aberta.
-
-    Prioridade:
-    1. Campos de R atual, se algum bot passar no futuro.
-    2. Campos de R aberto/resultado parcial, se existirem.
-    3. MFE em R, que já é preenchido pelo Turtle e por futuros bots compatíveis.
-
-    Observação: para bots sem métrica em R, retorna 0.0 sem quebrar o painel.
-    """
     if not isinstance(position, dict):
         return 0.0
-
-    candidates = [
-        "current_r",
-        "pnl_r",
-        "unrealized_r",
-        "open_r",
-        "result_r",
-        "mfe_r",
-    ]
-
+    candidates = ["current_r", "pnl_r", "unrealized_r", "open_r", "result_r", "mfe_r"]
     for field in candidates:
         if field in position and position.get(field) is not None:
             return _safe_float(position.get(field), 0.0)
-
     return 0.0
 
 
 def _position_runner_pct(position: dict):
     if not isinstance(position, dict):
         return 0.0
-
-    candidates = [
-        "current_pct",
-        "pnl_pct",
-        "unrealized_pct",
-        "open_pct",
-        "result_pct",
-        "mfe_pct",
-    ]
-
+    candidates = ["current_pct", "pnl_pct", "unrealized_pct", "open_pct", "result_pct", "mfe_pct"]
     for field in candidates:
         if field in position and position.get(field) is not None:
             return _safe_float(position.get(field), 0.0)
-
     return 0.0
 
 
@@ -535,6 +537,7 @@ def _update_runner_buckets(buckets: dict, runner_r: float):
 
 
 def central_exposure_snapshot():
+    memory_profile_step("before_exposure_snapshot")
     total = 0
     longs = 0
     shorts = 0
@@ -543,7 +546,8 @@ def central_exposure_snapshot():
     best_open_runner = None
 
     for key, module in LOADED_BOTS.items():
-        positions = get_open_positions_from_module(module)
+        memory_profile_step(f"before_exposure_bot_{key}")
+        positions = get_open_positions_from_module(module, key=key)
         bot_longs = 0
         bot_shorts = 0
         bot_buckets = _empty_runner_buckets()
@@ -577,7 +581,6 @@ def central_exposure_snapshot():
 
             if bot_best_runner is None or runner_r > bot_best_runner.get("runner_r", 0):
                 bot_best_runner = dict(runner_payload)
-
             if best_open_runner is None or runner_r > best_open_runner.get("runner_r", 0):
                 best_open_runner = dict(runner_payload)
 
@@ -589,8 +592,9 @@ def central_exposure_snapshot():
             "open_runners": bot_buckets,
             "best_open_runner": bot_best_runner,
         }
+        memory_profile_step(f"after_exposure_bot_{key}")
 
-    return {
+    result = {
         "total_positions_open": total,
         "long_positions_open": longs,
         "short_positions_open": shorts,
@@ -598,9 +602,12 @@ def central_exposure_snapshot():
         "best_open_runner": best_open_runner,
         "by_bot": by_bot,
     }
+    memory_profile_step("after_exposure_snapshot")
+    return result
 
 
 def central_watchdog_status():
+    memory_profile_step("before_watchdog_status")
     reasons = []
     bots = {}
 
@@ -625,7 +632,7 @@ def central_watchdog_status():
         if mm is not None and mm > WATCHDOG_THRESHOLD_MINUTES:
             reasons.append(f"{key}: gestão parada há {mm} min")
 
-    return {
+    result = {
         "ok": len(reasons) == 0,
         "status": "OK" if len(reasons) == 0 else "ALERTA",
         "central_started_at": CENTRAL_HEALTH["started_at"],
@@ -633,10 +640,11 @@ def central_watchdog_status():
         "reasons": reasons,
         "bots": bots,
     }
+    memory_profile_step("after_watchdog_status")
+    return result
 
 
 def send_central_alert(message: str):
-    # Usa o send_telegram/safe_send_telegram de cada módulo carregado para não depender de outro bot.
     for module in LOADED_BOTS.values():
         try:
             if hasattr(module, "safe_send_telegram"):
@@ -651,8 +659,7 @@ def central_watchdog_loop():
     while True:
         try:
             CENTRAL_HEALTH["last_watchdog_check"] = data_hora_sp_str()
-            log_memory_if_needed("watchdog")
-            maybe_collect_garbage("watchdog")
+            memory_profile_step("watchdog_loop_start")
             status = central_watchdog_status()
             CENTRAL_HEALTH["watchdog_status"] = status["status"]
 
@@ -667,6 +674,9 @@ def central_watchdog_loop():
                     send_central_alert(msg)
                     CENTRAL_HEALTH["last_watchdog_alert"] = data_hora_sp_str()
                     CENTRAL_HEALTH["last_watchdog_alert_ts"] = time.time()
+            memory_profile_step("watchdog_loop_end")
+            if (current_rss_mb() or 0) >= MEMORY_GC_THRESHOLD_MB:
+                force_gc_if_needed("watchdog_loop")
         except Exception as exc:
             print("ERRO WATCHDOG CENTRAL:", exc)
 
@@ -703,6 +713,7 @@ def bot_detail(key):
 
 @app.route("/central")
 def central():
+    memory_profile_step("route_central_start")
     status = central_watchdog_status()
     exposure_snapshot = central_exposure_snapshot()
 
@@ -710,6 +721,7 @@ def central():
     for key, cfg in BOT_CONFIGS.items():
         b = bot_health(key, cfg)
         h = b.get("health", {}) or {}
+        exposure_info = (exposure_snapshot.get("by_bot") or {}).get(key, {}) or {}
 
         resumo[key] = {
             "name": b.get("name"),
@@ -738,12 +750,9 @@ def central():
             "watchlist_total": h.get("watchlist_total"),
             "watchlist_valid": h.get("watchlist_valid"),
             "watchlist_invalid": h.get("watchlist_invalid", []),
-            "positions_open": h.get("last_positions_count"),
+            "positions_open": h.get("last_positions_count") if h.get("last_positions_count") is not None else exposure_info.get("total"),
             "signals_last_cycle": h.get("last_signals_sent"),
             "watchdog_status": h.get("watchdog_last_status"),
-
-            # Métricas estatísticas avançadas.
-            # O Turtle já preenche esses campos; os outros bots podem passar a preencher depois.
             "mfe_avg_pct": h.get("mfe_avg_pct"),
             "mae_avg_pct": h.get("mae_avg_pct"),
             "mfe_avg_r": h.get("mfe_avg_r"),
@@ -752,9 +761,6 @@ def central():
             "runners_3r": h.get("runners_3r"),
             "runners_5r": h.get("runners_5r"),
             "runners_10r": h.get("runners_10r"),
-
-            # Runners abertos informados pelo próprio bot, quando existirem.
-            # O Turtle já preenche esses campos; a Central também calcula o consolidado em /exposure.
             "open_runner_symbol": h.get("open_runner_symbol"),
             "open_runner_setup": h.get("open_runner_setup"),
             "open_runner_side": h.get("open_runner_side"),
@@ -764,10 +770,8 @@ def central():
 
     enabled = [k for k, v in resumo.items() if v.get("enabled")]
     loaded = [k for k, v in resumo.items() if v.get("loaded")]
-    alerts = [
-        k for k, v in resumo.items()
-        if v.get("enabled") and not v.get("ok")
-    ]
+    alerts = [k for k, v in resumo.items() if v.get("enabled") and not v.get("ok")]
+    mem = memory_snapshot("route_central_end", store=True)
 
     return {
         "ok": status.get("ok"),
@@ -777,6 +781,7 @@ def central():
         "loaded_bots": loaded,
         "alerts": alerts,
         "reasons": status.get("reasons", []),
+        "memory": mem,
         "exposure": exposure_snapshot,
         "open_runners": exposure_snapshot.get("open_runners"),
         "best_open_runner": exposure_snapshot.get("best_open_runner"),
@@ -806,18 +811,37 @@ def runners():
     }
 
 
+@app.route("/memory")
+@app.route("/memoria")
+@app.route("/memória")
+def memory_route():
+    text, payload = build_memory_text(run_gc=False)
+    payload["text"] = text
+    return payload
 
 
+@app.route("/memory/gc")
+@app.route("/memoria/gc")
+def memory_gc_route():
+    text, payload = build_memory_text(run_gc=True)
+    payload["text"] = text
+    return payload
 
 
 @app.route("/relatorio")
 def relatorio_curto():
-    return {"text": build_central_report("curto")}
+    memory_profile_step("route_relatorio_start")
+    text = build_central_report("curto")
+    memory_profile_step("route_relatorio_end")
+    return {"text": text}
 
 
 @app.route("/relatorio/completo")
 def relatorio_completo():
-    return {"text": build_central_report("completo")}
+    memory_profile_step("route_relatorio_completo_start")
+    text = build_central_report("completo")
+    memory_profile_step("route_relatorio_completo_end")
+    return {"text": text}
 
 
 @app.route("/relatorio/<key>")
@@ -830,30 +854,23 @@ def relatorio_bot(key):
 
 @app.route("/diagnostico")
 def diagnostico():
-    return {"text": build_diagnostic_report()}
+    memory_profile_step("route_diagnostico_start")
+    text = build_diagnostic_report()
+    memory_profile_step("route_diagnostico_end")
+    return {"text": text}
 
 
 @app.route("/selftest")
 def selftest():
-    return {"text": build_selftest_report()}
-
-
-@app.route("/memory")
-@app.route("/memoria")
-@app.route("/memória")
-def memory():
-    return {"text": build_memory_report(), "history": list(MEMORY_HISTORY)[-20:]}
+    memory_profile_step("route_selftest_start")
+    text = build_selftest_report()
+    memory_profile_step("route_selftest_end")
+    return {"text": text}
 
 
 # ==========================================================
 # CENTRAL REPORT BUILDER
 # ==========================================================
-# Comandos/rotas:
-# - /relatorio           -> relatório consolidado resumido
-# - /relatorio completo  -> relatório completo com health/funil/eventos/resumo
-# - /relatorio <bot>     -> relatório completo de um bot
-# - /relatorio curto     -> igual ao resumido
-
 REPORT_COMMANDS = {"/relatorio", "/relatório", "/report"}
 REPORT_BOT_ALIASES = {
     "trend": "TRENDPRO",
@@ -902,7 +919,7 @@ def _bot_compact_status_line(key: str, exposure_by_bot: dict = None):
     last_error = b.get("last_error")
     loaded = bool(b.get("loaded"))
     enabled = bool(b.get("enabled"))
-    ok = enabled and loaded and not b.get("load_error") and not last_error
+    ok = enabled and loaded and not b.get("load_error") and not (last_error and not is_benign_bingx_quote_error(last_error))
     emoji = "✅" if ok else ("⚠️" if enabled else "⏸️")
 
     positions = h.get("last_positions_count")
@@ -944,7 +961,7 @@ def _bot_compact_status_line(key: str, exposure_by_bot: dict = None):
         pieces.append(runner_label)
     pieces.append(runner_txt)
 
-    if last_error:
+    if last_error and not is_benign_bingx_quote_error(last_error):
         pieces.append(f"erro={last_error}")
     if warning:
         pieces.append(f"warning={warning}")
@@ -972,6 +989,20 @@ def _bot_report_health_text(key: str):
         f"watchlist: {h.get('watchlist_valid')}/{h.get('watchlist_total')} inválidos={h.get('watchlist_invalid', [])}\n"
         f"posições: {h.get('last_positions_count')} | sinais ciclo: {h.get('last_signals_sent')}"
     )
+
+
+def _json_or_text(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return str(value)
+
+
+def _call_first(module, names, *args):
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return fn(*args)
+    return None
 
 
 def _bot_funil_text(key: str, module):
@@ -1010,9 +1041,11 @@ def build_single_bot_report(key: str, complete: bool = True):
         return f"Bot inválido: {key}"
     module = LOADED_BOTS.get(key)
 
+    memory_profile_step(f"build_single_bot_report_start_{key}")
     parts = [f"🤖 RELATÓRIO {key} - {cfg.get('name')}\n", "🩺 HEALTH\n" + _bot_report_health_text(key)]
 
     if module is None:
+        memory_profile_step(f"build_single_bot_report_end_{key}")
         return "\n\n".join(parts + [f"Módulo não carregado: {LOAD_ERRORS.get(key)}"])
 
     funil = _bot_funil_text(key, module)
@@ -1026,21 +1059,25 @@ def build_single_bot_report(key: str, complete: bool = True):
     if resumo and resumo != "None":
         parts.append("📊 RESUMO\n" + _short(resumo, 3000 if complete else 1200))
 
+    memory_profile_step(f"build_single_bot_report_end_{key}")
     return "\n\n".join(parts)
 
 
 def build_central_status_text():
+    memory_profile_step("build_central_status_start")
     status = central_watchdog_status()
     exposure_snapshot = central_exposure_snapshot()
     best = exposure_snapshot.get("best_open_runner") or {}
     by_bot_exposure = exposure_snapshot.get("by_bot", {}) or {}
     open_runners = exposure_snapshot.get("open_runners") or {}
+    mem = memory_snapshot("build_central_status_memory", store=True)
 
     lines = [
         "📊 RELATÓRIO CENTRAL QUANT",
         f"Data/hora: {data_hora_sp_str()}",
         f"Status: {status.get('status')} | OK: {status.get('ok')}",
         f"Central iniciou: {status.get('central_started_at')}",
+        f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
         f"Motivos: {status.get('reasons', [])}",
         "",
         "📌 EXPOSIÇÃO",
@@ -1075,6 +1112,8 @@ def build_central_status_text():
         concentration_msgs.append(f"Concentração SHORT alta: {short_pos}/{total_pos}.")
     if total_pos and long_pos / max(total_pos, 1) >= 0.80:
         concentration_msgs.append(f"Concentração LONG alta: {long_pos}/{total_pos}.")
+    if mem.get("usage_pct") and mem.get("usage_pct") >= MEMORY_ALERT_THRESHOLD_PCT:
+        concentration_msgs.append(f"Memória alta: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%).")
     if concentration_msgs:
         lines += ["", "⚠️ OBSERVAÇÕES DE RISCO"] + [f"- {m}" for m in concentration_msgs]
 
@@ -1082,6 +1121,7 @@ def build_central_status_text():
     for key in BOT_CONFIGS.keys():
         lines.append(_bot_compact_status_line(key, by_bot_exposure))
 
+    memory_profile_step("build_central_status_end")
     return "\n".join(lines)
 
 
@@ -1109,6 +1149,7 @@ def build_diagnostic_report():
     reasons = list(status.get("reasons", []) or [])
     warnings = []
     checks = []
+    mem = memory_snapshot("diagnostic_memory", store=True)
 
     all_enabled_loaded = True
     all_watchlists_ok = True
@@ -1124,7 +1165,7 @@ def build_diagnostic_report():
         loaded = bool(b.get("loaded"))
         scanner_ok = b.get("minutes_since_scanner") is not None and b.get("minutes_since_scanner") <= WATCHDOG_THRESHOLD_MINUTES
         management_ok = b.get("minutes_since_management") is not None and b.get("minutes_since_management") <= WATCHDOG_THRESHOLD_MINUTES
-        error_ok = not b.get("last_error") and not b.get("load_error")
+        error_ok = not (b.get("last_error") and not is_benign_bingx_quote_error(b.get("last_error"))) and not b.get("load_error")
         wl_total = h.get("watchlist_total")
         wl_valid = h.get("watchlist_valid")
         wl_invalid = h.get("watchlist_invalid", []) or []
@@ -1136,7 +1177,7 @@ def build_diagnostic_report():
         all_errors_ok = all_errors_ok and error_ok
         all_watchlists_ok = all_watchlists_ok and watchlist_ok
 
-        if warning:
+        if warning and not is_benign_bingx_quote_error(warning):
             warnings.append(f"{key}: {warning}")
 
         checks.append(
@@ -1162,8 +1203,11 @@ def build_diagnostic_report():
         risk_notes.append(f"Exposição muito SHORT: {short_pos}/{total_pos}.")
     if total_pos and long_pos / max(total_pos, 1) >= 0.80:
         risk_notes.append(f"Exposição muito LONG: {long_pos}/{total_pos}.")
+    if mem.get("usage_pct") and mem.get("usage_pct") >= MEMORY_ALERT_THRESHOLD_PCT:
+        risk_notes.append(f"Memória alta: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%).")
 
-    apto = bool(status.get("ok")) and all_enabled_loaded and all_cycles_ok and all_errors_ok and all_watchlists_ok
+    memory_ok = not mem.get("usage_pct") or mem.get("usage_pct") < 95
+    apto = bool(status.get("ok")) and all_enabled_loaded and all_cycles_ok and all_errors_ok and all_watchlists_ok and memory_ok
     resultado = "✅ APTO PARA OPERAR" if apto else "⚠️ ATENÇÃO / VERIFICAR"
 
     lines = [
@@ -1177,7 +1221,7 @@ def build_diagnostic_report():
         f"Scanners/Gestão recentes: {'✅' if all_cycles_ok else '❌'}",
         f"Sem erros críticos: {'✅' if all_errors_ok else '❌'}",
         f"Watchlists válidas: {'✅' if all_watchlists_ok else '❌'}",
-        f"Memória: {current_rss_mb()} MB ({memory_percent()}%)",
+        f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
         "",
         "EXPOSIÇÃO",
         f"Total: {total_pos} | LONG: {long_pos} | SHORT: {short_pos}",
@@ -1208,14 +1252,7 @@ def build_diagnostic_report():
     return "\n".join(lines)
 
 
-
-
 def build_selftest_report():
-    """
-    Self test operacional da Central.
-    Não altera estado dos bots. Apenas valida carregamento, health, ciclos,
-    watchlists, exposição, runners e rotas críticas.
-    """
     status = central_watchdog_status()
     exposure_snapshot = central_exposure_snapshot()
     by_bot_exposure = exposure_snapshot.get("by_bot", {}) or {}
@@ -1254,7 +1291,7 @@ def build_selftest_report():
         management_min = b.get("minutes_since_management")
         scanner_ok = scanner_min is not None and scanner_min <= WATCHDOG_THRESHOLD_MINUTES
         management_ok = management_min is not None and management_min <= WATCHDOG_THRESHOLD_MINUTES
-        error_ok = not b.get("last_error") and not b.get("load_error")
+        error_ok = not (b.get("last_error") and not is_benign_bingx_quote_error(b.get("last_error"))) and not b.get("load_error")
 
         wl_total = h.get("watchlist_total")
         wl_valid = h.get("watchlist_valid")
@@ -1283,7 +1320,7 @@ def build_selftest_report():
             f"erro={'OK' if error_ok else 'ERRO'} | "
             f"pos={exp.get('total')} | "
             f"runner={safe_round(runner_r, 2, 0)}R"
-            + (f" | warning={warning}" if warning else "")
+            + (f" | warning={warning}" if warning and not is_benign_bingx_quote_error(warning) else "")
         )
 
     add_test("Bots habilitados carregados", enabled_count > 0 and loaded_count == enabled_count, f"{loaded_count}/{enabled_count}")
@@ -1303,8 +1340,10 @@ def build_selftest_report():
     add_test("Runners calculados", isinstance(open_runners, dict), f"3R={open_runners.get('runners_3r_open', 0)}")
     add_test("Relatório central gera texto", bool(build_central_status_text()), "OK")
     add_test("Diagnóstico gera texto", bool(build_diagnostic_report()), "OK")
-    mem_pct = memory_percent()
-    add_test("Memória abaixo de 95%", mem_pct is None or mem_pct < 95, f"{current_rss_mb()} MB | {mem_pct}%")
+
+    mem = memory_snapshot("selftest_memory", store=True)
+    mem_ok = (mem.get("usage_pct") or 0) < 95
+    add_test("Memória abaixo de 95%", mem_ok, f"{mem.get('rss_mb')} MB | {mem.get('usage_pct')}%")
 
     risk_notes = []
     if total_pos >= 50:
@@ -1313,6 +1352,8 @@ def build_selftest_report():
         risk_notes.append(f"Exposição muito SHORT: {short_pos}/{total_pos}.")
     if total_pos and long_pos / max(total_pos, 1) >= 0.80:
         risk_notes.append(f"Exposição muito LONG: {long_pos}/{total_pos}.")
+    if not mem_ok:
+        risk_notes.append(f"Memória alta: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%).")
 
     critical_ok = passed == total and bool(status.get("ok"))
     result = "✅ SELFTEST APROVADO" if critical_ok else "⚠️ SELFTEST COM PENDÊNCIAS"
@@ -1379,15 +1420,10 @@ def parse_report_command(text: str):
             mode = "completo"
     return mode, bot_key
 
+
 # ==========================================================
 # CENTRAL TELEGRAM COMMAND ROUTER
 # ==========================================================
-# Objetivo:
-# - Permitir que a Central responda comandos dos bots que NÃO rodam command_loop próprio.
-# - Evitar conflito Telegram getUpdates 409.
-# - Hoje fica ativo por padrão para TURTLE e FALCON, pois esses bots devem ter o command_loop interno desligado.
-# - Para qualquer outro bot, só ligue CENTRAL_ROUTE_<BOT>_TELEGRAM=true depois de desligar o command_loop interno dele.
-
 COMMAND_ROUTER_DEFAULTS = {
     "TRENDPRO": False,
     "DONKEY": False,
@@ -1447,25 +1483,7 @@ def telegram_send_with_token(token, chat_id, text):
         return False
 
 
-def _json_or_text(value):
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, indent=2)
-    return str(value)
-
-
-def _call_first(module, names, *args):
-    for name in names:
-        fn = getattr(module, name, None)
-        if callable(fn):
-            return fn(*args)
-    return None
-
-
 def build_command_reply_for_module(key: str, module, cmd: str):
-    """
-    Converte comandos padronizados em resposta textual.
-    Mantém a lógica individual em cada bot e só padroniza o acesso pela Central.
-    """
     raw_cmd = (cmd or "").strip()
     cmd0 = raw_cmd.lower().split()[0].split("@")[0] if raw_cmd else ""
 
@@ -1476,7 +1494,12 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         return build_selftest_report()
 
     if cmd0 in {"/memory", "/memoria", "/memória"}:
-        return build_memory_report()
+        text, _payload = build_memory_text(run_gc=False)
+        return text
+
+    if cmd0 in {"/memorygc", "/memory_gc", "/memoriagc", "/memoria_gc"}:
+        text, _payload = build_memory_text(run_gc=True)
+        return text
 
     parsed_report = parse_report_command(raw_cmd)
     if parsed_report:
@@ -1485,8 +1508,6 @@ def build_command_reply_for_module(key: str, module, cmd: str):
 
     cmd = cmd0
 
-    # TURTLE tem handle_command próprio, mas ele envia pelo próprio módulo.
-    # Preferimos respostas diretas para evitar depender do CHAT_ID interno.
     if key == "TURTLE":
         if cmd == "/health":
             fn = getattr(module, "refresh_health_stats", None)
@@ -1509,7 +1530,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         if cmd in ["/start", "/comandos"]:
             return (
                 "🐢 COMANDOS TURTLE BREAKOUT PRO 2.0\n\n"
-                "/health\n/posicoes\n/resumo\n/funil\n/eventos\n/top\n/ranking\n/relatorio\n/relatorio completo"
+                "/health\n/posicoes\n/resumo\n/funil\n/eventos\n/top\n/ranking\n/relatorio\n/relatorio completo\n/memory\n/selftest"
             )
 
     if key == "FALCON":
@@ -1529,9 +1550,8 @@ def build_command_reply_for_module(key: str, module, cmd: str):
                 wl = module.load_watchlist()
                 return "🦅 WATCHLIST FALCON\n\n" + "\n".join([str(x) for x in wl[:100]])
         if cmd in ["/start", "/comandos"]:
-            return "🦅 Comandos Falcon:\n/health\n/posicoes\n/resumo\n/funil\n/eventos\n/watchlist\n/relatorio\n/relatorio completo"
+            return "🦅 Comandos Falcon:\n/health\n/posicoes\n/resumo\n/funil\n/eventos\n/watchlist\n/relatorio\n/relatorio completo\n/memory\n/selftest"
 
-    # Padrão genérico para outros bots, caso você ligue o roteador central depois.
     if cmd == "/health":
         h = getattr(module, "HEALTH", None)
         return json.dumps(h or bot_health(key, BOT_CONFIGS[key]), ensure_ascii=False, indent=2)
@@ -1586,7 +1606,9 @@ def central_command_router_loop(key: str, cfg: dict):
                     telegram_send_with_token(token, chat_id, f"{cfg.get('name', key)} não carregado na Central.")
                     continue
 
+                memory_profile_step(f"telegram_command_before_{key}_{text.split()[0]}")
                 reply = build_command_reply_for_module(key, module, text)
+                memory_profile_step(f"telegram_command_after_{key}_{text.split()[0]}")
                 if reply:
                     telegram_send_with_token(token, chat_id, reply)
                     health = getattr(module, "HEALTH", None)
@@ -1612,27 +1634,21 @@ def start_central_command_routers():
 
 
 def start_central_runtime_once():
-    """
-    Inicializa bots, watchdog e roteadores apenas uma vez por processo.
-
-    Sem esta trava, múltiplas importações do main.py podem iniciar mais de um
-    roteador Telegram para o mesmo token, causando respostas duplicadas e/ou
-    conflitos getUpdates 409.
-    """
     global CENTRAL_RUNTIME_STARTED
 
     with CENTRAL_RUNTIME_LOCK:
         if CENTRAL_RUNTIME_STARTED:
             print("CENTRAL RUNTIME JÁ INICIADO - ignorando nova chamada")
             return
-
         CENTRAL_RUNTIME_STARTED = True
 
-    memory_snapshot("before_start_bots")
+    memory_snapshot("before_start_bots", store=True, print_log=True)
     start_enabled_bots()
-    memory_snapshot("after_start_bots")
-    maybe_collect_garbage("after_start_bots")
+    memory_snapshot("after_start_bots", store=True, print_log=True)
+    force_gc_if_needed("after_start_bots", force=True)
+
     threading.Thread(target=central_watchdog_loop, daemon=True).start()
+    threading.Thread(target=memory_monitor_loop, daemon=True).start()
     start_central_command_routers()
 
 
@@ -1641,3 +1657,4 @@ start_central_runtime_once()
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
+
