@@ -1257,6 +1257,26 @@ def execution_mode_active():
     return PREDATOR_MODE in {"READY", "VERIFY", "LIVE"}
 
 
+def predator_mode_label():
+    """Rótulo visual padronizado do modo operacional do Smart Predator."""
+    mode = str(PREDATOR_MODE or "PAPER").strip().upper()
+    enable_real = env_bool("ENABLE_REAL_TRADING", False)
+
+    if mode == "LIVE" and enable_real:
+        return "LIVE / BINGX ATIVA"
+    if mode == "LIVE" and not enable_real:
+        return "LIVE BLOQUEADO / ENABLE_REAL_TRADING=false"
+    if mode == "VERIFY":
+        return "VERIFY / VERIFY SEM ENVIO"
+    if mode == "READY":
+        return "READY / BINGX VALIDANDO"
+    if mode == "PAPER":
+        return "PAPER / SEM BINGX"
+
+    # Compatibilidade com o texto antigo do robô.
+    return "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
+
+
 def broker_ready_payload():
     if bingx_broker is None:
         return {"ok": False, "status": "BROKER_IMPORT_ERROR", "error": BROKER_IMPORT_ERROR}
@@ -1520,7 +1540,7 @@ def montar_execution_status_texto():
 def formatar_sinal_predator(s):
     side = s["side"]
     emoji = "🟢" if side == "LONG" else "🔴"
-    modo = PREDATOR_MODE if PREDATOR_MODE in {"READY", "VERIFY", "LIVE"} else ("REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO")
+    modo = predator_mode_label()
     reasons_text = "\n".join(s.get("reasons", []))
     ob = s.get("ob", {})
     ob_txt = (
@@ -1926,7 +1946,7 @@ def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
 
     posicoes = carregar_posicoes()
     ativos = [p for p in posicoes.values() if p.get("status") != "ENCERRADO"]
-    modo = "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
+    modo = predator_mode_label()
 
     return (
         f"{titulo}\n"
@@ -2282,7 +2302,7 @@ def montar_stats_gerais():
     return (
         f"📈 ESTATÍSTICAS SMART PREDATOR V4\n\n"
         f"Smart Predator ativo: {check_bool(SMART_PREDATOR_ENABLED)}\n"
-        f"Modo: {'REAL' if SMART_PREDATOR_AUTO_TRADE else 'OBSERVAÇÃO'}\n\n"
+        f"Modo: {predator_mode_label()}\n\n"
         f"Sinais totais: {len(stats['entries'])}\n"
         f"Trades encerrados: {stats['count']}\n"
         f"Wins: {stats['wins']}\n"
@@ -2598,7 +2618,7 @@ def marcar_startup_message_sent():
 
 
 def montar_startup_message():
-    modo = "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
+    modo = predator_mode_label()
     return (
         f"🦈 Robô {BOT_NAME} iniciado\n\n"
         f"Status:\n"
