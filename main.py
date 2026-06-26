@@ -1491,6 +1491,11 @@ def build_selftest_report():
     add_test("Runners calculados", isinstance(open_runners, dict), f"3R={open_runners.get('runners_3r_open', 0)}")
     add_test("Relatório central gera texto", bool(build_central_status_text()), "OK")
     add_test("Diagnóstico gera texto", bool(build_diagnostic_report()), "OK")
+    # Testes de execução/BingX sem enviar ordens. Validam geração de /live e /sync.
+    live_txt = build_live_report() if "build_live_report" in globals() else ""
+    sync_txt = build_sync_report() if "build_sync_report" in globals() else ""
+    add_test("Live report gera texto", bool(live_txt), "OK")
+    add_test("Sync Central x BingX gera texto", bool(sync_txt), "OK")
 
     mem = memory_snapshot("selftest_memory", store=True)
     mem_ok = (mem.get("usage_pct") or 0) < 95
@@ -1861,6 +1866,21 @@ def can_open_trade_decision(payload: dict):
     long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
     short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
 
+    # Para LIVE/VERIFY, o Risk decisório usa a camada LIVE como trava principal.
+    # As posições PAPER continuam aparecendo como aviso, mas não impedem o primeiro
+    # teste real mínimo do Falcon quando a BingX ainda está sem posições reais.
+    live_rows = _central_live_positions_payload() if "_central_live_positions_payload" in globals() else []
+    if intended_live or mode in {"LIVE", "VERIFY"}:
+        risk_rows = live_rows
+        risk_total_pos = len(risk_rows)
+        risk_long_pos = sum(1 for r in risk_rows if str(r.get("side") or "").upper() in {"LONG", "BUY"})
+        risk_short_pos = sum(1 for r in risk_rows if str(r.get("side") or "").upper() in {"SHORT", "SELL"})
+    else:
+        risk_rows = rows
+        risk_total_pos = total_pos
+        risk_long_pos = long_pos
+        risk_short_pos = short_pos
+
     reasons = []
     warnings = []
 
@@ -1880,25 +1900,25 @@ def can_open_trade_decision(payload: dict):
             if not ready.get("ok"):
                 reasons.append(f"BingX não está READY: {ready.get('status') or ready.get('error')}")
 
-    if total_pos >= GLOBAL_RISK_MAX_POSITIONS:
-        reasons.append(f"limite global de posições atingido: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+    if risk_total_pos >= GLOBAL_RISK_MAX_POSITIONS:
+        reasons.append(f"limite global de posições atingido: {risk_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
 
     if symbol:
-        same_symbol = [r for r in rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
+        same_symbol = [r for r in risk_rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
         if len(same_symbol) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
             reasons.append(f"limite por ativo atingido em {symbol}: {len(same_symbol)}/{GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}")
         same_bot_symbol = [r for r in same_symbol if str(r.get("bot") or "").upper() == bot]
         if same_bot_symbol:
             reasons.append(f"{bot} já possui exposição em {symbol}")
 
-    if side in {"LONG", "BUY"} and total_pos:
-        next_long = long_pos + 1
-        side_conc = next_long / max(total_pos + 1, 1) * 100
+    if side in {"LONG", "BUY"} and risk_total_pos:
+        next_long = risk_long_pos + 1
+        side_conc = next_long / max(risk_total_pos + 1, 1) * 100
         if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
             reasons.append(f"concentração LONG ficaria {side_conc:.1f}%")
-    if side in {"SHORT", "SELL"} and total_pos:
-        next_short = short_pos + 1
-        side_conc = next_short / max(total_pos + 1, 1) * 100
+    if side in {"SHORT", "SELL"} and risk_total_pos:
+        next_short = risk_short_pos + 1
+        side_conc = next_short / max(risk_total_pos + 1, 1) * 100
         if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
             reasons.append(f"concentração SHORT ficaria {side_conc:.1f}%")
 
@@ -1909,7 +1929,9 @@ def can_open_trade_decision(payload: dict):
 
     # Avisos não bloqueantes.
     if total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
-        warnings.append(f"exposição global alta: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+        warnings.append(f"exposição PAPER/Central alta: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+    if risk_total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
+        warnings.append(f"exposição LIVE alta: {risk_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
 
     allowed = len(reasons) == 0
     return {
@@ -1923,9 +1945,11 @@ def can_open_trade_decision(payload: dict):
         "reasons": reasons,
         "warnings": warnings,
         "exposure": {
-            "total": total_pos,
-            "long": long_pos,
-            "short": short_pos,
+            "total": risk_total_pos,
+            "long": risk_long_pos,
+            "short": risk_short_pos,
+            "paper_total": total_pos,
+            "live_total": len(live_rows),
             "max_positions": GLOBAL_RISK_MAX_POSITIONS,
             "max_symbol_exposure": GLOBAL_RISK_MAX_SYMBOL_EXPOSURE,
         },
@@ -2878,6 +2902,443 @@ def build_central_help_text():
         "Sugestão de uso diário: /dashboard. Para colar no ChatGPT: /daily."
     )
 
+
+
+# ==========================================================
+# QUANT OS - JOURNAL / STATS / CAPITAL / LEARNING
+# ==========================================================
+# Esta camada é apenas analítica/consultiva. Não envia ordens.
+
+QUANT_OS_MAX_ITEMS = int(os.environ.get("QUANT_OS_MAX_ITEMS", "1500"))
+CAPITAL_ALLOCATION_BASE_NOTIONAL_USDT = float(os.environ.get("CAPITAL_ALLOCATION_BASE_NOTIONAL_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "10")))
+CAPITAL_ALLOCATION_MIN_NOTIONAL_USDT = float(os.environ.get("CAPITAL_ALLOCATION_MIN_NOTIONAL_USDT", "5"))
+CAPITAL_ALLOCATION_MAX_NOTIONAL_USDT = float(os.environ.get("CAPITAL_ALLOCATION_MAX_NOTIONAL_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "10")))
+
+
+def _module_call_optional(module, names, default=None):
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                continue
+    return default
+
+
+def _all_trades_payload(limit=None):
+    rows = []
+    for key, module in LOADED_BOTS.items():
+        raw = _module_call_optional(module, ["get_trades", "trades_today", "carregar_trades", "load_trades"], default=[])
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        if not isinstance(raw, list):
+            raw = []
+        for t in raw:
+            if not isinstance(t, dict):
+                continue
+            sym = _compact_symbol(t.get("symbol") or t.get("ativo") or t.get("pair"))
+            rows.append({
+                "bot": key,
+                "symbol": sym,
+                "sector": _symbol_sector(sym),
+                "side": str(t.get("side") or t.get("direction") or "").upper(),
+                "setup": t.get("setup") or t.get("setup_label") or t.get("origem"),
+                "created_at": t.get("created_at") or t.get("opened_at") or t.get("entry_at"),
+                "closed_at": t.get("closed_at") or t.get("exit_at") or t.get("updated_at"),
+                "entry": t.get("entry") or t.get("entrada"),
+                "exit": t.get("exit_price") or t.get("saida") or t.get("exit"),
+                "result_pct": safe_round(t.get("result_pct") or t.get("pnl_pct") or t.get("resultado_pct"), 4, 0) or 0,
+                "result_r": safe_round(t.get("result_r") or t.get("pnl_r") or t.get("resultado_r"), 4, 0) or 0,
+                "mfe_pct": safe_round(t.get("mfe_pct"), 4, 0) or 0,
+                "mfe_r": safe_round(t.get("mfe_r"), 4, 0) or 0,
+                "mae_pct": safe_round(t.get("mae_pct"), 4, 0) or 0,
+                "mae_r": safe_round(t.get("mae_r"), 4, 0) or 0,
+                "exit_reason": t.get("exit_reason") or t.get("reason") or t.get("status"),
+                "tp50_hit": bool(t.get("tp50_hit")),
+            })
+    rows = rows[-(limit or QUANT_OS_MAX_ITEMS):]
+    return rows
+
+
+def _all_events_payload(limit=None):
+    rows = []
+    for key, module in LOADED_BOTS.items():
+        raw = _module_call_optional(module, ["get_events", "events_today", "carregar_eventos", "load_events"], default=[])
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        if not isinstance(raw, list):
+            raw = []
+        for e in raw:
+            if not isinstance(e, dict):
+                continue
+            sym = _compact_symbol(e.get("symbol") or e.get("ativo") or e.get("pair"))
+            rows.append({
+                "bot": key,
+                "symbol": sym,
+                "side": str(e.get("side") or e.get("direction") or "").upper(),
+                "setup": e.get("setup") or e.get("setup_label"),
+                "event_type": e.get("event_type") or e.get("type") or e.get("evento"),
+                "created_at": e.get("created_at") or e.get("ts") or e.get("time"),
+                "mfe_pct": safe_round(e.get("mfe_pct"), 4, 0) or 0,
+                "mfe_r": safe_round(e.get("mfe_r"), 4, 0) or 0,
+                "result_pct": safe_round(e.get("result_pct"), 4, 0) or 0,
+                "result_r": safe_round(e.get("result_r"), 4, 0) or 0,
+            })
+    return rows[-(limit or QUANT_OS_MAX_ITEMS):]
+
+
+def _stats_from_rows(rows):
+    rows = rows or []
+    if not rows:
+        return {"trades": 0, "wins": 0, "losses": 0, "be": 0, "wr": 0.0, "pnl_pct": 0.0, "pnl_r": 0.0, "pf_r": 0.0, "exp_r": 0.0, "mfe_r": 0.0, "mae_r": 0.0}
+    results = [safe_round(r.get("result_r"), 6, 0) or 0 for r in rows]
+    results_pct = [safe_round(r.get("result_pct"), 6, 0) or 0 for r in rows]
+    wins = [x for x in results if x > 0.05]
+    losses = [x for x in results if x < -0.05]
+    be = len(rows) - len(wins) - len(losses)
+    gross_profit = sum(x for x in results if x > 0)
+    gross_loss = abs(sum(x for x in results if x < 0))
+    return {
+        "trades": len(rows),
+        "wins": len(wins),
+        "losses": len(losses),
+        "be": be,
+        "wr": round(len(wins) / max(len(rows), 1) * 100, 2),
+        "pnl_pct": round(sum(results_pct), 4),
+        "pnl_r": round(sum(results), 4),
+        "pf_r": round(gross_profit / gross_loss, 2) if gross_loss > 0 else (round(gross_profit, 2) if gross_profit else 0.0),
+        "exp_r": round(sum(results) / max(len(rows), 1), 4),
+        "mfe_r": round(sum((safe_round(r.get("mfe_r"), 6, 0) or 0) for r in rows) / max(len(rows), 1), 4),
+        "mae_r": round(sum((safe_round(r.get("mae_r"), 6, 0) or 0) for r in rows) / max(len(rows), 1), 4),
+    }
+
+
+def _group_stats(rows, key_fn):
+    groups = {}
+    for r in rows or []:
+        k = key_fn(r)
+        if not k:
+            continue
+        groups.setdefault(k, []).append(r)
+    out = []
+    for k, items in groups.items():
+        st = _stats_from_rows(items)
+        st["key"] = k
+        out.append(st)
+    out.sort(key=lambda x: (x.get("exp_r", 0), x.get("pf_r", 0), x.get("trades", 0)), reverse=True)
+    return out
+
+
+def build_journal_report(arg=None):
+    token = normalize_symbol_for_risk(arg) if arg else None
+    trades = _all_trades_payload()
+    events = _all_events_payload()
+    if token:
+        trades = [t for t in trades if normalize_symbol_for_risk(t.get("symbol")) == token or str(t.get("bot")).upper() == token]
+        events = [e for e in events if normalize_symbol_for_risk(e.get("symbol")) == token or str(e.get("bot")).upper() == token]
+    lines = ["📓 JOURNAL CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}"]
+    if token:
+        lines.append(f"Filtro: {token}")
+    lines += ["", f"Trades encontrados: {len(trades)} | Eventos: {len(events)}"]
+    if not trades and not events:
+        lines.append("Nenhum item encontrado ainda.")
+        return "\n".join(lines)
+    lines += ["", "Últimos eventos:"]
+    for e in events[-20:]:
+        lines.append(f"- {e.get('created_at')} | {e.get('bot')} | {e.get('event_type')} | {e.get('symbol')} {e.get('side')} {e.get('setup')} | MFE {e.get('mfe_pct')}%/{e.get('mfe_r')}R")
+    lines += ["", "Últimos trades fechados:"]
+    for t in trades[-15:]:
+        lines.append(f"- {t.get('closed_at')} | {t.get('bot')} | {t.get('symbol')} {t.get('side')} {t.get('setup')} | {t.get('result_pct')}% | {t.get('result_r')}R | {t.get('exit_reason')}")
+    return "\n".join(lines)
+
+
+def build_trade_replay_report(arg=None):
+    sym = normalize_symbol_for_risk(arg) if arg else None
+    trades = _all_trades_payload()
+    events = _all_events_payload()
+    if sym:
+        trades = [t for t in trades if normalize_symbol_for_risk(t.get("symbol")) == sym]
+        events = [e for e in events if normalize_symbol_for_risk(e.get("symbol")) == sym]
+    last = trades[-1] if trades else None
+    lines = ["🎬 REPLAY DE TRADE — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}"]
+    if sym:
+        lines.append(f"Ativo: {sym}")
+    if not last:
+        lines += ["", "Nenhum trade fechado encontrado para replay.", "Dica: use /journal para ver eventos em aberto."]
+        return "\n".join(lines)
+    lines += [
+        "",
+        f"Bot/setup: {last.get('bot')} | {last.get('setup')}",
+        f"Ativo: {last.get('symbol')} {last.get('side')}",
+        f"Entrada: {last.get('entry')} | Saída: {last.get('exit')}",
+        f"Resultado: {last.get('result_pct')}% | {last.get('result_r')}R",
+        f"MFE: {last.get('mfe_pct')}% | {last.get('mfe_r')}R",
+        f"MAE: {last.get('mae_pct')}% | {last.get('mae_r')}R",
+        f"TP50: {'sim' if last.get('tp50_hit') else 'não'}",
+        f"Motivo saída: {last.get('exit_reason')}",
+        f"Aberto: {last.get('created_at')} | Fechado: {last.get('closed_at')}",
+        "",
+        "Linha do tempo recente:",
+    ]
+    for e in events[-20:]:
+        lines.append(f"- {e.get('created_at')} | {e.get('event_type')} | {e.get('symbol')} | MFE {e.get('mfe_r')}R")
+    return "\n".join(lines)
+
+
+def build_global_stats_report():
+    trades = _all_trades_payload()
+    open_rows = _all_open_positions_payload()
+    st_all = _stats_from_rows(trades)
+    by_bot = _group_stats(trades, lambda r: r.get("bot"))[:10]
+    by_symbol = _group_stats(trades, lambda r: r.get("symbol"))[:15]
+    lines = [
+        "🌐 ESTATÍSTICAS GLOBAIS — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Trades fechados: {st_all['trades']} | WR {st_all['wr']}% | PF {st_all['pf_r']} | Exp {st_all['exp_r']}R | PnL {st_all['pnl_r']}R",
+        f"Abertos agora: {len(open_rows)}",
+        "",
+        "Por robô:",
+    ]
+    for x in by_bot:
+        lines.append(f"- {x['key']}: trades={x['trades']} | WR={x['wr']}% | PF={x['pf_r']} | Exp={x['exp_r']}R | PnL={x['pnl_r']}R")
+    lines += ["", "Top ativos:"]
+    for x in by_symbol:
+        lines.append(f"- {x['key']}: trades={x['trades']} | WR={x['wr']}% | PF={x['pf_r']} | Exp={x['exp_r']}R | PnL={x['pnl_r']}R")
+    return "\n".join(lines)
+
+
+def build_signal_ai_report(arg=None):
+    sym = normalize_symbol_for_risk(arg) if arg else None
+    trades = _all_trades_payload()
+    if sym:
+        trades = [t for t in trades if normalize_symbol_for_risk(t.get("symbol")) == sym]
+    stats = _stats_from_rows(trades)
+    confidence = "BAIXA"
+    if stats["trades"] >= 30 and stats["exp_r"] > 0 and stats["wr"] >= 55:
+        confidence = "ALTA"
+    elif stats["trades"] >= 10 and stats["exp_r"] > 0:
+        confidence = "MÉDIA"
+    lines = [
+        "🧠 IA DE QUALIDADE DO SINAL — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Filtro: {sym or 'histórico global'}",
+        "",
+        f"Amostra histórica: {stats['trades']} trades",
+        f"Win rate: {stats['wr']}%",
+        f"Profit Factor R: {stats['pf_r']}",
+        f"Expectancy: {stats['exp_r']}R",
+        f"MFE médio: {stats['mfe_r']}R | MAE médio: {stats['mae_r']}R",
+        f"Confiabilidade estatística: {confidence}",
+        "",
+        "Leitura:",
+    ]
+    if stats["trades"] < 10:
+        lines.append("- Amostra ainda pequena. Use como observação, não como filtro duro.")
+    elif stats["exp_r"] > 0:
+        lines.append("- Histórico favorece continuidade do setup dentro deste filtro.")
+    else:
+        lines.append("- Histórico pede cautela; avaliar score mínimo, horário e direção.")
+    return "\n".join(lines)
+
+
+def build_capital_report():
+    ready = bingx_ready_payload() if BINGX_READY_CHECK_ENABLED else {"ok": None, "status": "READY_CHECK_DISABLED"}
+    bal = ready.get("balance") or {}
+    exposure = central_exposure_snapshot()
+    live = _central_live_positions_payload()
+    free = safe_round(bal.get("free_usdt"), 4, None)
+    total = safe_round(bal.get("total_usdt"), 4, None)
+    max_notional = REAL_TRADING_MAX_NOTIONAL_USDT
+    capacity = int((free or 0) // max_notional) if max_notional > 0 and free is not None else 0
+    lines = [
+        "💰 CAPITAL DASHBOARD — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"BingX READY: {ready.get('ok')} | {ready.get('status')}",
+        f"Saldo USDT total/free: {total} / {free}",
+        f"Capacidade teórica no notional atual ({max_notional} USDT): {capacity} novas ordens",
+        f"Real trading: {'ATIVO' if ENABLE_REAL_TRADING else 'BLOQUEADO'} | Modo {EXECUTION_MODE}",
+        "",
+        f"Posições Central/Paper: {exposure.get('total_positions_open')} | LONG {exposure.get('long_positions_open')} | SHORT {exposure.get('short_positions_open')}",
+        f"Posições LIVE Central: {len(live)}",
+        "",
+        "Observação: equity/drawdown reais serão calculados após os primeiros eventos LIVE registrados.",
+    ]
+    return "\n".join(lines)
+
+
+def build_correlation_report():
+    rows = _all_open_positions_payload()
+    by_symbol = {}
+    for r in rows:
+        by_symbol.setdefault(r.get("symbol"), []).append(r)
+    lines = ["🔗 CORRELAÇÃO ENTRE ROBÔS", f"Data/hora: {data_hora_sp_str()}", ""]
+    conflicts = []
+    confirmations = []
+    for sym, items in by_symbol.items():
+        if len(items) < 2:
+            continue
+        longs = [x for x in items if str(x.get("side")).upper() in {"LONG", "BUY"}]
+        shorts = [x for x in items if str(x.get("side")).upper() in {"SHORT", "SELL"}]
+        bots = ",".join(sorted(set(str(x.get("bot")) for x in items)))
+        if longs and shorts:
+            conflicts.append(f"- {sym}: conflito L={len(longs)} S={len(shorts)} | bots={bots}")
+        else:
+            side = "LONG" if longs else "SHORT"
+            confirmations.append(f"- {sym}: confirmação {side} x{len(items)} | bots={bots}")
+    lines += ["Conflitos:"] + (conflicts[:20] if conflicts else ["- Nenhum conflito relevante."])
+    lines += ["", "Confirmações:"] + (confirmations[:20] if confirmations else ["- Nenhuma confirmação múltipla."])
+    return "\n".join(lines)
+
+
+def build_time_heatmap_report():
+    events = _all_events_payload()
+    buckets = {h: {"events": 0, "tp50": 0, "stop": 0} for h in range(24)}
+    for e in events:
+        txt = str(e.get("created_at") or "")
+        hour = None
+        try:
+            # Formato comum: dd/mm/YYYY HH:MM
+            hour = int(txt.split()[1].split(":")[0])
+        except Exception:
+            continue
+        if hour not in buckets:
+            continue
+        buckets[hour]["events"] += 1
+        et = str(e.get("event_type") or "").upper()
+        if "TP50" in et:
+            buckets[hour]["tp50"] += 1
+        if "STOP" in et:
+            buckets[hour]["stop"] += 1
+    lines = ["⏱️ HEATMAP TEMPORAL", f"Data/hora: {data_hora_sp_str()}", "", "Eventos por hora:"]
+    for h, v in sorted(buckets.items(), key=lambda kv: kv[1]["events"], reverse=True)[:12]:
+        if v["events"]:
+            lines.append(f"- {h:02d}:00 | eventos={v['events']} | TP50={v['tp50']} | STOP={v['stop']}")
+    if len(lines) == 4:
+        lines.append("- Ainda sem eventos suficientes.")
+    return "\n".join(lines)
+
+
+def build_market_score_report():
+    rows = _all_open_positions_payload()
+    total = len(rows)
+    longs = sum(1 for r in rows if str(r.get("side")).upper() in {"LONG", "BUY"})
+    shorts = sum(1 for r in rows if str(r.get("side")).upper() in {"SHORT", "SELL"})
+    runners = [safe_round(r.get("runner_r"), 4, 0) or 0 for r in rows]
+    avg_runner = sum(runners) / max(len(runners), 1)
+    bullish = round(longs / max(total, 1) * 100, 1)
+    bearish = round(shorts / max(total, 1) * 100, 1)
+    trend_bias = "BULLISH" if bullish > bearish + 15 else ("BEARISH" if bearish > bullish + 15 else "NEUTRO")
+    score = 50 + (bullish - bearish) / 2 + min(20, max(-20, avg_runner * 5))
+    score = max(0, min(100, round(score, 1)))
+    lines = [
+        "🌡️ MARKET SCORE — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Score interno: {score}/100",
+        f"Viés: {trend_bias}",
+        f"Bullish: {bullish}% | Bearish: {bearish}%",
+        f"Posições analisadas: {total}",
+        f"Runner médio aberto: {round(avg_runner, 2)}R",
+        "",
+        "Observação: score baseado nos robôs/posições atuais; não usa dados externos como funding, OI ou Fear & Greed ainda.",
+    ]
+    return "\n".join(lines)
+
+
+def build_capital_allocation_report():
+    trades = _all_trades_payload()
+    stats = _group_stats(trades, lambda r: r.get("bot"))
+    lines = ["💼 CAPITAL ALLOCATION — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}", ""]
+    if not stats:
+        lines.append("Sem histórico fechado suficiente. Usando notional base.")
+        for key in BOT_CONFIGS.keys():
+            lines.append(f"- {key}: {CAPITAL_ALLOCATION_BASE_NOTIONAL_USDT:.2f} USDT")
+        return "\n".join(lines)
+    for x in stats:
+        mult = 1.0
+        if x["trades"] >= 10 and x["exp_r"] > 0:
+            mult += min(1.0, x["exp_r"])
+        if x["pf_r"] < 1 and x["trades"] >= 10:
+            mult *= 0.6
+        notional = max(CAPITAL_ALLOCATION_MIN_NOTIONAL_USDT, min(CAPITAL_ALLOCATION_MAX_NOTIONAL_USDT, CAPITAL_ALLOCATION_BASE_NOTIONAL_USDT * mult))
+        lines.append(f"- {x['key']}: {notional:.2f} USDT | trades={x['trades']} | PF={x['pf_r']} | Exp={x['exp_r']}R | WR={x['wr']}%")
+    lines += ["", "Modo consultivo. A execução real continua limitada por REAL_TRADING_MAX_NOTIONAL_USDT."]
+    return "\n".join(lines)
+
+
+def build_ranking_vivo_report():
+    trades = _all_trades_payload()
+    windows = {"GLOBAL": trades, "AMOSTRA RECENTE": trades[-100:], "ÚLTIMOS 30": trades[-30:]}
+    lines = ["🏆 RANKING VIVO — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}"]
+    for label, rows in windows.items():
+        lines += ["", label]
+        grouped = _group_stats(rows, lambda r: r.get("bot"))[:7]
+        if not grouped:
+            lines.append("- Sem dados.")
+            continue
+        for i, x in enumerate(grouped, 1):
+            medal = "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"{i}."))
+            lines.append(f"{medal} {x['key']} | trades={x['trades']} | PF={x['pf_r']} | Exp={x['exp_r']}R | WR={x['wr']}% | PnL={x['pnl_r']}R")
+    return "\n".join(lines)
+
+
+def build_simulate_off_report(arg=None):
+    bot = str(arg or "").upper().strip()
+    trades = _all_trades_payload()
+    all_stats = _stats_from_rows(trades)
+    lines = ["🧪 SIMULADOR DE DESLIGAMENTO", f"Data/hora: {data_hora_sp_str()}"]
+    if not bot:
+        lines += ["", "Use: /simulateoff TURTLE"]
+        return "\n".join(lines)
+    without = [t for t in trades if str(t.get("bot")).upper() != bot]
+    st = _stats_from_rows(without)
+    lines += [
+        "",
+        f"Robô removido: {bot}",
+        f"Atual: trades={all_stats['trades']} | PnL={all_stats['pnl_r']}R | Exp={all_stats['exp_r']}R | PF={all_stats['pf_r']}",
+        f"Sem {bot}: trades={st['trades']} | PnL={st['pnl_r']}R | Exp={st['exp_r']}R | PF={st['pf_r']}",
+        f"Diferença PnL: {round(st['pnl_r'] - all_stats['pnl_r'], 4)}R",
+    ]
+    return "\n".join(lines)
+
+
+def build_learning_report():
+    trades = _all_trades_payload()
+    by_bot = _group_stats(trades, lambda r: r.get("bot"))
+    by_symbol = _group_stats(trades, lambda r: r.get("symbol"))
+    lines = ["🧬 APRENDIZADO AUTOMÁTICO — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}", "", "Sugestões:"]
+    suggestions = []
+    for x in by_bot:
+        if x["trades"] >= 10 and x["exp_r"] < 0:
+            suggestions.append(f"- {x['key']}: expectancy negativa ({x['exp_r']}R). Revisar score mínimo, janela ou filtro de direção.")
+        elif x["trades"] >= 10 and x["exp_r"] > 0.5:
+            suggestions.append(f"- {x['key']}: boa expectancy ({x['exp_r']}R). Candidato a maior alocação após validação LIVE.")
+    for x in by_symbol[:20]:
+        if x["trades"] >= 5 and x["exp_r"] < 0:
+            suggestions.append(f"- {x['key']}: desempenho fraco ({x['exp_r']}R). Considerar filtro por ativo.")
+    if not suggestions:
+        suggestions.append("- Ainda sem amostra suficiente para recomendações fortes. Continuar coletando histórico.")
+    lines += suggestions[:25]
+    return "\n".join(lines)
+
+
+def build_quantos_report():
+    parts = [
+        "🧠 QUANT OS — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        build_capital_report(),
+        "\n==============================\n" + build_global_stats_report(),
+        "\n==============================\n" + build_correlation_report(),
+        "\n==============================\n" + build_market_score_report(),
+        "\n==============================\n" + build_capital_allocation_report(),
+        "\n==============================\n" + build_learning_report(),
+    ]
+    return "\n".join(parts)
+
 def build_central_command_reply(text: str):
     raw = (text or "").strip()
     if not raw:
@@ -2964,6 +3425,36 @@ def build_central_command_reply(text: str):
     if cmd0 in {"/simulate"}:
         parts = raw.split()
         return build_simulate_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/simulateoff", "/simoff"}:
+        parts = raw.split()
+        return build_simulate_off_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/journal"}:
+        parts = raw.split()
+        return build_journal_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/trade", "/replay"}:
+        parts = raw.split()
+        return build_trade_replay_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/globalstats", "/statsglobal", "/estatisticas"}:
+        return build_global_stats_report()
+    if cmd0 in {"/signalai", "/ia", "/quality"}:
+        parts = raw.split()
+        return build_signal_ai_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/capital", "/equity"}:
+        return build_capital_report()
+    if cmd0 in {"/correlation", "/correlacao", "/correlação"}:
+        return build_correlation_report()
+    if cmd0 in {"/timeheat", "/temporal", "/heat24"}:
+        return build_time_heatmap_report()
+    if cmd0 in {"/marketscore", "/mercado"}:
+        return build_market_score_report()
+    if cmd0 in {"/allocation", "/alocacao", "/alocação"}:
+        return build_capital_allocation_report()
+    if cmd0 in {"/rankingvivo", "/rankinglive"}:
+        return build_ranking_vivo_report()
+    if cmd0 in {"/learning", "/aprendizado"}:
+        return build_learning_report()
+    if cmd0 in {"/quantos", "/quantsystem"}:
+        return build_quantos_report()
 
     parsed_report = parse_report_command(raw)
     if parsed_report:
@@ -2996,6 +3487,18 @@ def _central_command_title(text: str):
         "/live": "LIVE",
         "/sync": "SYNC",
         "/executions": "EXECUTIONS",
+        "/journal": "JOURNAL",
+        "/trade": "TRADE",
+        "/globalstats": "GLOBAL STATS",
+        "/signalai": "SIGNAL AI",
+        "/capital": "CAPITAL",
+        "/correlation": "CORRELATION",
+        "/timeheat": "TIME HEAT",
+        "/marketscore": "MARKET SCORE",
+        "/allocation": "ALLOCATION",
+        "/rankingvivo": "RANKING VIVO",
+        "/learning": "LEARNING",
+        "/quantos": "QUANT OS",
     }
     return mapping.get(cmd, "CENTRAL QUANT")
 
@@ -3006,6 +3509,8 @@ def _is_heavy_central_command(text: str):
         "/dashboard", "/daily", "/diario", "/diário", "/support",
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
+        "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital",
+        "/correlation", "/timeheat", "/marketscore", "/allocation", "/rankingvivo", "/learning",
     }
 
 
@@ -3562,6 +4067,97 @@ def start_central_command_routers():
         if not central_route_enabled_for_bot(key):
             continue
         threading.Thread(target=central_command_router_loop, args=(key, cfg), daemon=True).start()
+
+
+
+# ==========================================================
+# QUANT OS ROUTES
+# ==========================================================
+
+@app.route("/journal")
+@app.route("/journal/<arg>")
+def journal_route(arg=None):
+    return {"text": build_journal_report(arg)}
+
+
+@app.route("/trade")
+@app.route("/trade/<arg>")
+@app.route("/replay")
+@app.route("/replay/<arg>")
+def trade_replay_route(arg=None):
+    return {"text": build_trade_replay_report(arg)}
+
+
+@app.route("/globalstats")
+@app.route("/statsglobal")
+@app.route("/estatisticas")
+def globalstats_route():
+    return {"text": build_global_stats_report()}
+
+
+@app.route("/signalai")
+@app.route("/signalai/<arg>")
+@app.route("/ia")
+@app.route("/ia/<arg>")
+def signalai_route(arg=None):
+    return {"text": build_signal_ai_report(arg)}
+
+
+@app.route("/capital")
+@app.route("/equity")
+def capital_route():
+    return {"text": build_capital_report()}
+
+
+@app.route("/correlation")
+@app.route("/correlacao")
+def correlation_route():
+    return {"text": build_correlation_report()}
+
+
+@app.route("/timeheat")
+@app.route("/temporal")
+@app.route("/heat24")
+def timeheat_route():
+    return {"text": build_time_heatmap_report()}
+
+
+@app.route("/marketscore")
+@app.route("/mercado")
+def marketscore_route():
+    return {"text": build_market_score_report()}
+
+
+@app.route("/allocation")
+@app.route("/alocacao")
+def allocation_route():
+    return {"text": build_capital_allocation_report()}
+
+
+@app.route("/rankingvivo")
+@app.route("/rankinglive")
+def rankingvivo_route():
+    return {"text": build_ranking_vivo_report()}
+
+
+@app.route("/simulateoff")
+@app.route("/simulateoff/<arg>")
+@app.route("/simoff")
+@app.route("/simoff/<arg>")
+def simulateoff_route(arg=None):
+    return {"text": build_simulate_off_report(arg)}
+
+
+@app.route("/learning")
+@app.route("/aprendizado")
+def learning_route():
+    return {"text": build_learning_report()}
+
+
+@app.route("/quantos")
+@app.route("/quantsystem")
+def quantos_route():
+    return {"text": build_quantos_report()}
 
 
 def start_central_runtime_once():
