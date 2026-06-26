@@ -2512,6 +2512,59 @@ def central_telegram_command_loop():
         time.sleep(2)
 
 
+def central_daily_report_loop():
+    """
+    Envia relatório diário automático pelo Telegram exclusivo da Central.
+    Usa os mesmos mecanismos de chunking do Telegram para evitar perder mensagens grandes.
+    """
+    global CENTRAL_DAILY_REPORT_SENT_DATE
+
+    if not CENTRAL_DAILY_REPORT_ENABLED:
+        print("RELATÓRIO DIÁRIO CENTRAL DESLIGADO POR ENV")
+        return
+
+    while True:
+        try:
+            now = agora_sp()
+            current_hm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+
+            if current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
+                print(f"GERANDO RELATÓRIO DIÁRIO CENTRAL {today} {current_hm}")
+                try:
+                    save_daily_snapshot(label="auto")
+                except Exception as exc:
+                    print("ERRO SNAPSHOT RELATÓRIO DIÁRIO CENTRAL:", exc)
+
+                mode = (CENTRAL_DAILY_REPORT_MODE or "executivo").strip().lower()
+                if mode in {"completo", "full", "audit", "auditoria"}:
+                    payload = build_audit_parts()
+                    title = "RELATÓRIO DIÁRIO COMPLETO"
+                elif mode in {"daily", "diario", "diário"}:
+                    payload = build_daily_report()
+                    title = "RELATÓRIO DIÁRIO"
+                else:
+                    payload = build_dashboard_report()
+                    title = "DASHBOARD DIÁRIO"
+
+                if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
+                    telegram_send_with_token(
+                        CENTRAL_TELEGRAM_BOT_TOKEN,
+                        CENTRAL_TELEGRAM_CHAT_ID,
+                        payload,
+                        title=title,
+                    )
+                else:
+                    print("RELATÓRIO DIÁRIO CENTRAL NÃO ENVIADO: token/chat ausente")
+
+                CENTRAL_DAILY_REPORT_SENT_DATE = today
+
+        except Exception as exc:
+            print("ERRO RELATÓRIO DIÁRIO CENTRAL:", exc)
+
+        time.sleep(30)
+
+
 
 # ==========================================================
 # CENTRAL TELEGRAM COMMAND ROUTER
