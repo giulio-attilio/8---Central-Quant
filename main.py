@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-25-CENTRAL-FULL-MEMORY-POR-BOT
+# Versão: 2026-06-25-CENTRAL-FULL-RELATORIO-DIARIO-PRO
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -10,6 +10,8 @@
 # - Adicionar painel de runners abertos por R na Central.
 # - Adicionar /relatorio, /diagnostico, /selftest e /memory.
 # - Instrumentar memória por etapa/bot no nível da Central.
+# - Fazer /relatorio completo virar o pacote ideal da avaliação diária:
+#   selftest + diagnóstico + exposição + health/funil/eventos/resumo dos 7 bots.
 #
 # Importante:
 # - Pause os serviços antigos no Render antes de ativar o mesmo bot aqui.
@@ -49,7 +51,7 @@ MEMORY_GC_THRESHOLD_MB = float(os.environ.get("MEMORY_GC_THRESHOLD_MB", "430"))
 MEMORY_ALERT_THRESHOLD_PCT = float(os.environ.get("MEMORY_ALERT_THRESHOLD_PCT", "90"))
 MEMORY_HISTORY_MAXLEN = int(os.environ.get("MEMORY_HISTORY_MAXLEN", "120"))
 MEMORY_LOG_INTERVAL_SECONDS = int(os.environ.get("MEMORY_LOG_INTERVAL_SECONDS", "300"))
-MEMORY_PROFILE_BOT_STEPS = os.environ.get("MEMORY_PROFILE_BOT_STEPS", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+MEMORY_PROFILE_BOT_STEPS = os.environ.get("MEMORY_PROFILE_BOT_STEPS", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 
 MEMORY_HISTORY = deque(maxlen=MEMORY_HISTORY_MAXLEN)
 MEMORY_LOCK = threading.Lock()
@@ -837,6 +839,9 @@ def relatorio_curto():
 
 
 @app.route("/relatorio/completo")
+@app.route("/relatorio/diario")
+@app.route("/relatorio/diário")
+@app.route("/auditoria")
 def relatorio_completo():
     memory_profile_step("route_relatorio_completo_start")
     text = build_central_report("completo")
@@ -871,7 +876,7 @@ def selftest():
 # ==========================================================
 # CENTRAL REPORT BUILDER
 # ==========================================================
-REPORT_COMMANDS = {"/relatorio", "/relatório", "/report"}
+REPORT_COMMANDS = {"/relatorio", "/relatório", "/report", "/auditoria", "/diario", "/diário"}
 REPORT_BOT_ALIASES = {
     "trend": "TRENDPRO",
     "trendpro": "TRENDPRO",
@@ -1126,8 +1131,24 @@ def build_central_status_text():
 
 
 def build_central_report(mode: str = "curto", bot_key: str = None):
+    """
+    Relatórios da Central.
+
+    /relatorio:
+      Painel resumido para acompanhamento rápido.
+
+    /relatorio completo:
+      Pacote ideal para avaliação diária:
+      1) Selftest
+      2) Diagnóstico
+      3) Exposição/central
+      4) Health + funil + eventos + resumo de todos os bots
+
+    /relatorio <bot>:
+      Health + funil + eventos + resumo de um único bot.
+    """
     mode = (mode or "curto").lower().strip()
-    complete = mode in {"completo", "full", "complete"}
+    complete = mode in {"completo", "full", "complete", "diario", "diário", "auditoria"}
 
     if bot_key:
         return build_single_bot_report(bot_key, complete=True)
@@ -1135,10 +1156,25 @@ def build_central_report(mode: str = "curto", bot_key: str = None):
     if not complete:
         return build_central_status_text()
 
-    parts = [build_central_status_text()]
-    parts.append("\n\n==============================\nCHECKLIST COMPLETO DOS BOTS\n==============================")
+    parts = [
+        "📦 PACOTE DE AVALIAÇÃO DIÁRIA - CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "==============================\n1) SELFTEST\n==============================",
+        build_selftest_report(),
+        "",
+        "==============================\n2) DIAGNÓSTICO\n==============================",
+        build_diagnostic_report(),
+        "",
+        "==============================\n3) CENTRAL / EXPOSIÇÃO\n==============================",
+        build_central_status_text(),
+        "",
+        "==============================\n4) CHECKLIST COMPLETO DOS BOTS\n==============================",
+    ]
+
     for key in BOT_CONFIGS.keys():
         parts.append(build_single_bot_report(key, complete=True))
+
     return "\n\n==============================\n".join(parts)
 
 
@@ -1411,7 +1447,7 @@ def parse_report_command(text: str):
     bot_key = None
     for p in parts[1:]:
         p = p.strip().lower().replace("/", "")
-        if p in {"completo", "full", "complete"}:
+        if p in {"completo", "full", "complete", "diario", "diário", "auditoria"}:
             mode = "completo"
         elif p in {"curto", "resumido", "short"}:
             mode = "curto"
@@ -1657,4 +1693,3 @@ start_central_runtime_once()
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
-
