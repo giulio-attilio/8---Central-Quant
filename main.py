@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-25-CENTRAL-FULL-RELATORIO-DIARIO-PRO
+# Versão: 2026-06-25-CENTRAL-FULL-SUPERVISOR-EXECUTIVE-CENTRAL-BOT
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -12,6 +12,10 @@
 # - Instrumentar memória por etapa/bot no nível da Central.
 # - Fazer /relatorio completo virar o pacote ideal da avaliação diária:
 #   selftest + diagnóstico + exposição + health/funil/eventos/resumo dos 7 bots.
+# - Adicionar Telegram exclusivo da Central Quant.
+# - Adicionar /executive, /risk, /heat, /ranking, /healthscore, /history e /meta.
+# - Adicionar relatório diário automático consolidado pela Central.
+# - Adicionar Risk Manager Global em modo consultivo/advisory.
 #
 # Importante:
 # - Pause os serviços antigos no Render antes de ativar o mesmo bot aqui.
@@ -55,6 +59,27 @@ MEMORY_PROFILE_BOT_STEPS = os.environ.get("MEMORY_PROFILE_BOT_STEPS", "false").s
 
 MEMORY_HISTORY = deque(maxlen=MEMORY_HISTORY_MAXLEN)
 MEMORY_LOCK = threading.Lock()
+
+# Telegram exclusivo da Central Quant.
+# Use um token diferente dos robôs e, se quiser, o mesmo CHAT_ID que você já usa.
+CENTRAL_TELEGRAM_BOT_TOKEN = os.environ.get("CENTRAL_TELEGRAM_BOT_TOKEN")
+CENTRAL_TELEGRAM_CHAT_ID = os.environ.get("CENTRAL_TELEGRAM_CHAT_ID")
+CENTRAL_TELEGRAM_POLLING_ENABLED = env_bool("CENTRAL_TELEGRAM_POLLING_ENABLED", True)
+CENTRAL_DAILY_REPORT_ENABLED = env_bool("CENTRAL_DAILY_REPORT_ENABLED", True)
+CENTRAL_DAILY_REPORT_TIME = os.environ.get("CENTRAL_DAILY_REPORT_TIME", "23:55")
+CENTRAL_DAILY_REPORT_MODE = os.environ.get("CENTRAL_DAILY_REPORT_MODE", "executivo").strip().lower()
+
+# Risk Manager Global em modo consultivo. Ele NÃO bloqueia execução sozinho.
+# Para bloquear entradas de verdade, cada robô precisa consultar a Central antes de abrir posição.
+GLOBAL_RISK_MAX_POSITIONS = int(os.environ.get("GLOBAL_RISK_MAX_POSITIONS", "50"))
+GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT = float(os.environ.get("GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT", "80"))
+GLOBAL_RISK_MAX_SYMBOL_EXPOSURE = int(os.environ.get("GLOBAL_RISK_MAX_SYMBOL_EXPOSURE", "3"))
+
+DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
+DAILY_HISTORY_DIR.mkdir(exist_ok=True)
+CENTRAL_TELEGRAM_OFFSET = None
+CENTRAL_DAILY_REPORT_SENT_DATE = None
+
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -1457,6 +1482,727 @@ def parse_report_command(text: str):
     return mode, bot_key
 
 
+
+
+# ==========================================================
+# EXECUTIVE DASHBOARD / RISK / HISTORY / META SUPERVISOR
+# ==========================================================
+
+def _compact_symbol(symbol):
+    s = str(symbol or "").upper()
+    s = s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "")
+    return s
+
+
+def _symbol_sector(symbol):
+    s = _compact_symbol(symbol)
+    if s in {"BTCUSDT"}:
+        return "BTC"
+    if s in {"ETHUSDT"}:
+        return "ETH"
+    if s in {"SOLUSDT", "BNBUSDT", "ADAUSDT", "AVAXUSDT", "SUIUSDT", "APTUSDT", "NEARUSDT", "ATOMUSDT", "DOTUSDT", "ALGOUSDT", "HBARUSDT", "TRXUSDT", "BCHUSDT", "LTCUSDT"}:
+        return "Layer1"
+    if s in {"ARBUSDT", "OPUSDT"}:
+        return "Layer2"
+    if s in {"DOGEUSDT", "1000PEPEUSDT", "WIFUSDT", "1000BONKUSDT", "FLOKIUSDT"}:
+        return "Memecoin"
+    if s in {"INJUSDT", "RUNEUSDT", "UNIUSDT", "AAVEUSDT", "JUPUSDT"}:
+        return "DeFi"
+    if s in {"FETUSDT", "WLDUSDT", "TAOUSDT"}:
+        return "AI"
+    if s in {"ONDOUSDT", "PENDLEUSDT"}:
+        return "RWA/Yield"
+    if s in {"LINKUSDT"}:
+        return "Oracle"
+    if s in {"FILUSDT"}:
+        return "Storage"
+    if s in {"HYPEUSDT"}:
+        return "Exchange/Perp"
+    if s in {"ENAUSDT"}:
+        return "Stable/Yield"
+    if s in {"ETCUSDT"}:
+        return "Legacy"
+    return "Outros"
+
+
+def _all_open_positions_payload():
+    rows = []
+    for key, module in LOADED_BOTS.items():
+        for p in get_open_positions_from_module(module, key=key):
+            symbol = _compact_symbol(p.get("symbol") or p.get("ativo") or p.get("pair"))
+            side = str(p.get("side", p.get("direction", ""))).upper()
+            rows.append({
+                "bot": key,
+                "symbol": symbol,
+                "sector": _symbol_sector(symbol),
+                "side": side,
+                "setup": p.get("setup") or p.get("setup_label"),
+                "runner_r": round(_position_runner_r(p), 4),
+                "runner_pct": round(_position_runner_pct(p), 4),
+                "entry": p.get("entry") or p.get("entrada"),
+                "stop": p.get("stop") or p.get("sl") or p.get("stop_atual"),
+                "tp50": p.get("tp50"),
+            })
+    return rows
+
+
+def central_health_score_payload():
+    status = central_watchdog_status()
+    exposure_snapshot = central_exposure_snapshot()
+    mem = memory_snapshot("healthscore_memory", store=True)
+    score = 100
+    penalties = []
+
+    if not status.get("ok"):
+        n = min(30, 10 * len(status.get("reasons", []) or []))
+        score -= n
+        penalties.append(f"Watchdog com pendências: -{n}")
+
+    enabled = 0
+    loaded = 0
+    stale = 0
+    invalid_wl = 0
+    errors = 0
+
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+        if not b.get("enabled"):
+            continue
+        enabled += 1
+        if b.get("loaded"):
+            loaded += 1
+        if b.get("last_error") and not is_benign_bingx_quote_error(b.get("last_error")):
+            errors += 1
+        ms = b.get("minutes_since_scanner")
+        mm = b.get("minutes_since_management")
+        if ms is None or mm is None or ms > WATCHDOG_THRESHOLD_MINUTES or mm > WATCHDOG_THRESHOLD_MINUTES:
+            stale += 1
+        wl_total = h.get("watchlist_total")
+        wl_valid = h.get("watchlist_valid")
+        wl_invalid = h.get("watchlist_invalid", []) or []
+        if wl_total is not None and (wl_valid != wl_total or wl_invalid):
+            invalid_wl += 1
+
+    if enabled and loaded < enabled:
+        n = min(30, (enabled - loaded) * 10)
+        score -= n
+        penalties.append(f"Bots não carregados: -{n}")
+
+    if stale:
+        n = min(25, stale * 8)
+        score -= n
+        penalties.append(f"Ciclos atrasados: -{n}")
+
+    if errors:
+        n = min(25, errors * 10)
+        score -= n
+        penalties.append(f"Erros críticos: -{n}")
+
+    if invalid_wl:
+        n = min(15, invalid_wl * 5)
+        score -= n
+        penalties.append(f"Watchlists inválidas: -{n}")
+
+    usage = mem.get("usage_pct") or 0
+    if usage >= 95:
+        score -= 20
+        penalties.append("Memória >=95%: -20")
+    elif usage >= MEMORY_ALERT_THRESHOLD_PCT:
+        score -= 10
+        penalties.append("Memória alta: -10")
+
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+
+    if total_pos >= GLOBAL_RISK_MAX_POSITIONS:
+        score -= 10
+        penalties.append("Muitas posições abertas: -10")
+
+    if total_pos:
+        side_conc = max(long_pos, short_pos) / max(total_pos, 1) * 100
+        if side_conc >= 95:
+            score -= 10
+            penalties.append("Concentração direcional extrema: -10")
+        elif side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            score -= 5
+            penalties.append("Concentração direcional alta: -5")
+
+    score = max(0, min(100, int(round(score))))
+    if score >= 90:
+        label = "EXCELENTE"
+    elif score >= 75:
+        label = "BOM"
+    elif score >= 60:
+        label = "ATENÇÃO"
+    else:
+        label = "CRÍTICO"
+
+    return {
+        "score": score,
+        "label": label,
+        "penalties": penalties,
+        "memory": mem,
+        "enabled_bots": enabled,
+        "loaded_bots": loaded,
+        "total_positions": total_pos,
+        "long_positions": long_pos,
+        "short_positions": short_pos,
+    }
+
+
+def build_healthscore_report():
+    p = central_health_score_payload()
+    lines = [
+        "🧭 HEALTH SCORE CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Score: {p.get('score')}/100",
+        f"Classificação: {p.get('label')}",
+        "",
+        f"Bots carregados: {p.get('loaded_bots')}/{p.get('enabled_bots')}",
+        f"Memória: {p.get('memory', {}).get('rss_mb')} MB ({p.get('memory', {}).get('usage_pct')}%)",
+        f"Exposição: {p.get('total_positions')} posições | LONG {p.get('long_positions')} | SHORT {p.get('short_positions')}",
+    ]
+    penalties = p.get("penalties") or []
+    if penalties:
+        lines += ["", "Perdas de pontos:"] + [f"- {x}" for x in penalties]
+    else:
+        lines += ["", "Sem penalidades relevantes."]
+    return "\n".join(lines)
+
+
+def build_heatmap_report():
+    rows = _all_open_positions_payload()
+    by_sector = {}
+    by_symbol = {}
+    for r in rows:
+        sec = r.get("sector") or "Outros"
+        sym = r.get("symbol") or "N/A"
+        side = r.get("side") or "N/A"
+        by_sector.setdefault(sec, {"total": 0, "long": 0, "short": 0})
+        by_symbol.setdefault(sym, {"total": 0, "long": 0, "short": 0, "bots": set()})
+        by_sector[sec]["total"] += 1
+        by_symbol[sym]["total"] += 1
+        by_symbol[sym]["bots"].add(r.get("bot"))
+        if side in {"LONG", "BUY"}:
+            by_sector[sec]["long"] += 1
+            by_symbol[sym]["long"] += 1
+        elif side in {"SHORT", "SELL"}:
+            by_sector[sec]["short"] += 1
+            by_symbol[sym]["short"] += 1
+
+    lines = [
+        "🔥 HEAT MAP DA CARTEIRA",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Posições abertas: {len(rows)}",
+        "",
+        "Por setor:",
+    ]
+    for sec, v in sorted(by_sector.items(), key=lambda kv: kv[1]["total"], reverse=True):
+        lines.append(f"{sec:<15} total={v['total']} | L={v['long']} | S={v['short']}")
+
+    lines += ["", "Top ativos:"]
+    for sym, v in sorted(by_symbol.items(), key=lambda kv: kv[1]["total"], reverse=True)[:20]:
+        bots = ",".join(sorted([str(x) for x in v["bots"] if x]))
+        lines.append(f"{sym:<16} total={v['total']} | L={v['long']} | S={v['short']} | bots={bots}")
+
+    return "\n".join(lines)
+
+
+def build_risk_report():
+    exposure_snapshot = central_exposure_snapshot()
+    rows = _all_open_positions_payload()
+    by_symbol = {}
+    for r in rows:
+        by_symbol.setdefault(r.get("symbol"), []).append(r)
+
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+    notes = []
+    blocks = []
+
+    if total_pos >= GLOBAL_RISK_MAX_POSITIONS:
+        blocks.append(f"Bloquear novas entradas: posições abertas {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}.")
+    if total_pos:
+        side_conc = max(long_pos, short_pos) / max(total_pos, 1) * 100
+        if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            dominant = "SHORT" if short_pos >= long_pos else "LONG"
+            notes.append(f"Concentração {dominant}: {side_conc:.1f}% ({max(long_pos, short_pos)}/{total_pos}).")
+            blocks.append(f"Evitar novas entradas {dominant} até reduzir concentração.")
+
+    repeated = []
+    for sym, items in by_symbol.items():
+        if len(items) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
+            repeated.append((sym, len(items), sorted(set([x.get("bot") for x in items]))))
+            blocks.append(f"Evitar novas entradas em {sym}: {len(items)} exposições abertas.")
+
+    lines = [
+        "🛡️ RISK MANAGER GLOBAL — MODO CONSULTIVO",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Posições: {total_pos} | LONG {long_pos} | SHORT {short_pos}",
+        f"Limite global sugerido: {GLOBAL_RISK_MAX_POSITIONS}",
+        "",
+        "Observações:",
+    ]
+    lines += [f"- {n}" for n in notes] if notes else ["- Nenhuma concentração crítica além dos parâmetros definidos."]
+
+    if repeated:
+        lines += ["", "Ativos repetidos:"]
+        for sym, count, bots in repeated[:20]:
+            lines.append(f"- {sym}: {count} posições | bots={','.join([str(b) for b in bots])}")
+
+    lines += ["", "Recomendações consultivas:"]
+    if blocks:
+        lines += [f"- {b}" for b in blocks]
+    else:
+        lines.append("- Risco global dentro dos limites consultivos.")
+
+    lines += [
+        "",
+        "Importante:",
+        "Este Risk Manager ainda é consultivo. Para bloquear entradas reais, cada robô precisa consultar a Central antes de abrir posição.",
+    ]
+    return "\n".join(lines)
+
+
+def build_ranking_report():
+    rows = []
+    exposure_snapshot = central_exposure_snapshot()
+    by_bot_exposure = exposure_snapshot.get("by_bot", {}) or {}
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+        exp = by_bot_exposure.get(key, {}) or {}
+        best = exp.get("best_open_runner") or {}
+        expectancy = safe_round(h.get("expectancy_r"), 4, None)
+        pf = safe_round(h.get("profit_factor_r"), 4, None)
+        runner = safe_round(best.get("runner_r"), 4, 0)
+        mfe = safe_round(h.get("mfe_avg_r"), 4, None)
+        score = (expectancy or 0) * 10 + (pf or 0) + (runner or 0) + (mfe or 0)
+        rows.append({
+            "key": key,
+            "name": cfg.get("name"),
+            "score": score,
+            "pf": pf,
+            "expectancy": expectancy,
+            "runner": runner,
+            "positions": exp.get("total"),
+            "mfe_r": mfe,
+        })
+
+    rows.sort(key=lambda x: x["score"], reverse=True)
+    lines = ["🏆 RANKING DOS ROBÔS", f"Data/hora: {data_hora_sp_str()}", ""]
+    for i, r in enumerate(rows, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        lines.append(
+            f"{medal} {r['key']} — {r['name']} | "
+            f"score={safe_round(r['score'],2,0)} | PF={r['pf']} | Exp={r['expectancy']}R | "
+            f"Runner={r['runner']}R | MFE={r['mfe_r']}R | pos={r['positions']}"
+        )
+    return "\n".join(lines)
+
+
+def build_meta_supervisor_report():
+    exposure_snapshot = central_exposure_snapshot()
+    mem = memory_snapshot("meta_memory", store=True)
+    suggestions = []
+    by_bot = exposure_snapshot.get("by_bot", {}) or {}
+
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+
+    if total_pos and short_pos / max(total_pos, 1) >= 0.90:
+        suggestions.append("Exposição 90%+ SHORT: pausar novas entradas SHORT ou reduzir risco até equilibrar.")
+    if total_pos and long_pos / max(total_pos, 1) >= 0.90:
+        suggestions.append("Exposição 90%+ LONG: pausar novas entradas LONG ou reduzir risco até equilibrar.")
+    if mem.get("usage_pct") and mem.get("usage_pct") >= MEMORY_ALERT_THRESHOLD_PCT:
+        suggestions.append("Memória acima do alerta: considerar upgrade Render, separar Turtle/Donkey ou reduzir históricos.")
+
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+        exp = by_bot.get(key, {}) or {}
+        pf = safe_round(h.get("profit_factor_r"), 4, None)
+        expectancy = safe_round(h.get("expectancy_r"), 4, None)
+        pos = int(exp.get("total") or 0)
+        last_signals = h.get("last_signals_sent")
+        if pf is not None and pf < 1:
+            suggestions.append(f"{key}: PF abaixo de 1. Monitorar degradação antes de aumentar risco.")
+        if expectancy is not None and expectancy < 0:
+            suggestions.append(f"{key}: expectancy negativa. Avaliar reduzir risco/filtrar setups fracos.")
+        if pos >= 20:
+            suggestions.append(f"{key}: muitas posições abertas ({pos}). Avaliar limite/cooldown.")
+        if last_signals == 0 and key in {"TRENDPRO", "FALCON"}:
+            suggestions.append(f"{key}: sem sinais no último ciclo; verificar funil antes de concluir falha.")
+
+    if not suggestions:
+        suggestions.append("Nenhuma recomendação crítica agora. Manter monitoramento normal.")
+
+    lines = [
+        "🧠 META SUPERVISOR — INTELIGÊNCIA OPERACIONAL",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "Recomendações:",
+    ] + [f"- {s}" for s in suggestions]
+    lines += [
+        "",
+        "Observação:",
+        "As recomendações são estatísticas/operacionais. Não alteram automaticamente as estratégias.",
+    ]
+    return "\n".join(lines)
+
+
+def build_executive_report():
+    status = central_watchdog_status()
+    exposure_snapshot = central_exposure_snapshot()
+    mem = memory_snapshot("executive_memory", store=True)
+    score = central_health_score_payload()
+    best = exposure_snapshot.get("best_open_runner") or {}
+    open_runners = exposure_snapshot.get("open_runners") or {}
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+
+    ranking_rows = []
+    for key, cfg in BOT_CONFIGS.items():
+        b = bot_health(key, cfg)
+        h = b.get("health", {}) or {}
+        exp = (exposure_snapshot.get("by_bot") or {}).get(key, {}) or {}
+        runner = safe_round((exp.get("best_open_runner") or {}).get("runner_r"), 2, 0)
+        expectancy = safe_round(h.get("expectancy_r"), 2, 0)
+        ranking_rows.append((key, runner + expectancy, runner, expectancy, exp.get("total")))
+    ranking_rows.sort(key=lambda x: x[1], reverse=True)
+    bot_dia = ranking_rows[0] if ranking_rows else None
+
+    risk_status = "ATENÇÃO" if total_pos and max(long_pos, short_pos) / max(total_pos, 1) >= 0.80 else "OK"
+
+    lines = [
+        "📌 EXECUTIVE DASHBOARD — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Status operacional: {status.get('status')}",
+        f"Health Score: {score.get('score')}/100 — {score.get('label')}",
+        f"Risco direcional: {risk_status}",
+        f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
+        "",
+        "Exposição:",
+        f"Total: {total_pos} | LONG: {long_pos} | SHORT: {short_pos}",
+        f"Runners: 1R={open_runners.get('runners_1r_open', 0)} | 2R={open_runners.get('runners_2r_open', 0)} | 3R={open_runners.get('runners_3r_open', 0)} | 5R={open_runners.get('runners_5r_open', 0)}",
+    ]
+    if best:
+        lines += [
+            "",
+            "Melhor runner:",
+            f"{best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')} | {best.get('runner_pct')}% | {best.get('runner_r')}R",
+        ]
+    if bot_dia:
+        lines += [
+            "",
+            f"Bot destaque: {bot_dia[0]} | runner={bot_dia[2]}R | exp={bot_dia[3]}R | pos={bot_dia[4]}",
+        ]
+    lines += [
+        "",
+        "Ações sugeridas:",
+    ]
+    if risk_status != "OK":
+        side = "SHORT" if short_pos >= long_pos else "LONG"
+        lines.append(f"- Evitar novas entradas {side} até reduzir concentração.")
+    if mem.get("usage_pct") and mem.get("usage_pct") >= MEMORY_ALERT_THRESHOLD_PCT:
+        lines.append("- Memória alta: considerar upgrade Render ou separar robôs pesados.")
+    if not status.get("ok"):
+        lines += [f"- {r}" for r in status.get("reasons", [])]
+    if len(lines) and lines[-1] == "Ações sugeridas:":
+        lines.append("- Nenhuma ação crítica além do monitoramento normal.")
+    return "\n".join(lines)
+
+
+def daily_snapshot_payload():
+    return {
+        "ts": data_hora_sp_str(),
+        "date": agora_sp().strftime("%Y-%m-%d"),
+        "central": central_watchdog_status(),
+        "exposure": central_exposure_snapshot(),
+        "memory": memory_snapshot("daily_snapshot_memory", store=True),
+        "health_score": central_health_score_payload(),
+    }
+
+
+def save_daily_snapshot(label=None):
+    payload = daily_snapshot_payload()
+    date_key = payload.get("date")
+    suffix = f"_{label}" if label else ""
+    path = DAILY_HISTORY_DIR / f"{date_key}{suffix}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    return str(path), payload
+
+
+def build_history_report(days=7):
+    files = sorted(DAILY_HISTORY_DIR.glob("*.json"), reverse=True)[:days]
+    lines = ["📚 HISTÓRICO CENTRAL QUANT", f"Arquivos: {len(files)}", ""]
+    if not files:
+        lines.append("Nenhum histórico salvo ainda. Use /snapshot ou aguarde o relatório automático.")
+        return "\n".join(lines)
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            exp = data.get("exposure", {}) or {}
+            mem = data.get("memory", {}) or {}
+            score = data.get("health_score", {}) or {}
+            lines.append(
+                f"{data.get('date')} | score={score.get('score')}/100 | "
+                f"pos={exp.get('total_positions_open')} L={exp.get('long_positions_open')} S={exp.get('short_positions_open')} | "
+                f"mem={mem.get('rss_mb')} MB"
+            )
+        except Exception as exc:
+            lines.append(f"{path.name}: erro ao ler ({exc})")
+    return "\n".join(lines)
+
+
+def build_snapshot_report():
+    path, payload = save_daily_snapshot(label="manual")
+    exp = payload.get("exposure", {}) or {}
+    score = payload.get("health_score", {}) or {}
+    return (
+        "💾 SNAPSHOT SALVO\n"
+        f"Arquivo: {path}\n"
+        f"Score: {score.get('score')}/100\n"
+        f"Posições: {exp.get('total_positions_open')} | LONG {exp.get('long_positions_open')} | SHORT {exp.get('short_positions_open')}"
+    )
+
+
+def build_simulate_report(arg=None):
+    target = str(arg or "").upper().strip()
+    exposure_snapshot = central_exposure_snapshot()
+    by_bot = exposure_snapshot.get("by_bot", {}) or {}
+    if target in by_bot:
+        remaining_total = int(exposure_snapshot.get("total_positions_open") or 0) - int(by_bot[target].get("total") or 0)
+        return (
+            f"🧪 SIMULAÇÃO CONSULTIVA\n\n"
+            f"Remover/pausar {target} agora reduziria posições abertas de "
+            f"{exposure_snapshot.get('total_positions_open')} para {remaining_total}.\n"
+            f"Isso não altera trades; é apenas leitura de exposição atual."
+        )
+    return (
+        "🧪 SIMULAÇÃO CONSULTIVA\n\n"
+        "Uso: /simulate TURTLE, /simulate DONKEY, /simulate PREDATOR etc.\n"
+        "Nesta versão a simulação usa exposição atual. Simulações estatísticas 30/90 dias exigem histórico consolidado salvo."
+    )
+
+
+@app.route("/executive")
+@app.route("/dashboard")
+def executive_route():
+    return {"text": build_executive_report()}
+
+
+@app.route("/risk")
+@app.route("/riskmanager")
+def risk_route():
+    return {"text": build_risk_report()}
+
+
+@app.route("/heat")
+@app.route("/heatmap")
+def heat_route():
+    return {"text": build_heatmap_report()}
+
+
+@app.route("/ranking")
+def ranking_route():
+    return {"text": build_ranking_report()}
+
+
+@app.route("/healthscore")
+@app.route("/score")
+def healthscore_route():
+    return {"text": build_healthscore_report(), "payload": central_health_score_payload()}
+
+
+@app.route("/meta")
+@app.route("/metasupervisor")
+def meta_route():
+    return {"text": build_meta_supervisor_report()}
+
+
+@app.route("/history")
+def history_route():
+    return {"text": build_history_report()}
+
+
+@app.route("/snapshot")
+def snapshot_route():
+    return {"text": build_snapshot_report()}
+
+
+@app.route("/simulate")
+@app.route("/simulate/<key>")
+def simulate_route(key=None):
+    return {"text": build_simulate_report(key)}
+
+
+def build_central_help_text():
+    return (
+        "🤖 CENTRAL QUANT — COMANDOS\n\n"
+        "Operação diária:\n"
+        "/executive\n/relatorio\n/relatorio completo\n/auditoria\n/selftest\n/diagnostico\n/memory\n\n"
+        "Risco e carteira:\n"
+        "/risk\n/heat\n/ranking\n/healthscore\n/meta\n/exposure\n/runners\n\n"
+        "Histórico:\n"
+        "/snapshot\n/history\n\n"
+        "Por robô:\n"
+        "/relatorio turtle\n/relatorio donkey\n/relatorio predator\n\n"
+        "Simulação consultiva:\n"
+        "/simulate TURTLE\n\n"
+        "Observação: o Risk Manager é consultivo. Para bloquear entradas reais, os robôs precisam consultar a Central antes de operar."
+    )
+
+
+def build_central_command_reply(text: str):
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    cmd0 = raw.lower().split()[0].split("@")[0]
+
+    if cmd0 in {"/start", "/help", "/comandos"}:
+        return build_central_help_text()
+    if cmd0 in {"/health", "/central"}:
+        return json.dumps(central(), ensure_ascii=False, indent=2, default=str)
+    if cmd0 in {"/bots"}:
+        return json.dumps(bots(), ensure_ascii=False, indent=2, default=str)
+    if cmd0 in {"/watchdog"}:
+        return json.dumps(central_watchdog_status(), ensure_ascii=False, indent=2, default=str)
+    if cmd0 in {"/exposure"}:
+        return json.dumps(central_exposure_snapshot(), ensure_ascii=False, indent=2, default=str)
+    if cmd0 in {"/runners"}:
+        snapshot = central_exposure_snapshot()
+        return json.dumps({
+            "open_runners": snapshot.get("open_runners"),
+            "best_open_runner": snapshot.get("best_open_runner"),
+            "by_bot": snapshot.get("by_bot"),
+        }, ensure_ascii=False, indent=2, default=str)
+    if cmd0 in {"/selftest", "/self-test", "/teste", "/autoteste"}:
+        return build_selftest_report()
+    if cmd0 in {"/diagnostico", "/diagnóstico", "/diag"}:
+        return build_diagnostic_report()
+    if cmd0 in {"/memory", "/memoria", "/memória"}:
+        text_mem, _ = build_memory_text(run_gc=False)
+        return text_mem
+    if cmd0 in {"/memorygc", "/memory_gc", "/memoriagc", "/memoria_gc"}:
+        text_mem, _ = build_memory_text(run_gc=True)
+        return text_mem
+    if cmd0 in {"/executive", "/dashboard"}:
+        return build_executive_report()
+    if cmd0 in {"/risk", "/riskmanager"}:
+        return build_risk_report()
+    if cmd0 in {"/heat", "/heatmap"}:
+        return build_heatmap_report()
+    if cmd0 in {"/ranking"}:
+        return build_ranking_report()
+    if cmd0 in {"/healthscore", "/score"}:
+        return build_healthscore_report()
+    if cmd0 in {"/meta", "/metasupervisor"}:
+        return build_meta_supervisor_report()
+    if cmd0 in {"/history"}:
+        return build_history_report()
+    if cmd0 in {"/snapshot"}:
+        return build_snapshot_report()
+    if cmd0 in {"/simulate"}:
+        parts = raw.split()
+        return build_simulate_report(parts[1] if len(parts) > 1 else None)
+
+    parsed_report = parse_report_command(raw)
+    if parsed_report:
+        mode, bot_key = parsed_report
+        return build_central_report(mode, bot_key=bot_key)
+
+    return None
+
+
+def central_telegram_command_loop():
+    global CENTRAL_TELEGRAM_OFFSET
+
+    token = CENTRAL_TELEGRAM_BOT_TOKEN
+    allowed_chat = CENTRAL_TELEGRAM_CHAT_ID
+
+    if not CENTRAL_TELEGRAM_POLLING_ENABLED:
+        print("ROTEADOR TELEGRAM CENTRAL DESLIGADO POR ENV")
+        return
+    if not token:
+        print("ROTEADOR TELEGRAM CENTRAL NÃO INICIADO: CENTRAL_TELEGRAM_BOT_TOKEN ausente")
+        return
+
+    print("ROTEADOR TELEGRAM CENTRAL QUANT INICIADO")
+
+    while True:
+        try:
+            updates, warning = telegram_get_updates_for_token(token, CENTRAL_TELEGRAM_OFFSET)
+            if warning:
+                if not is_benign_telegram_conflict(warning):
+                    print("WARNING TELEGRAM CENTRAL:", warning)
+                time.sleep(2)
+                continue
+
+            for upd in updates:
+                CENTRAL_TELEGRAM_OFFSET = upd.get("update_id", 0) + 1
+                msg = upd.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+
+                if not text.startswith("/"):
+                    continue
+                if allowed_chat and chat_id != str(allowed_chat):
+                    continue
+
+                memory_profile_step(f"central_telegram_before_{text.split()[0]}")
+                reply = build_central_command_reply(text)
+                memory_profile_step(f"central_telegram_after_{text.split()[0]}")
+                if reply:
+                    telegram_send_with_token(token, chat_id, reply)
+        except Exception as exc:
+            print("ERRO ROTEADOR TELEGRAM CENTRAL:", exc)
+
+        time.sleep(2)
+
+
+def central_daily_report_loop():
+    global CENTRAL_DAILY_REPORT_SENT_DATE
+
+    if not CENTRAL_DAILY_REPORT_ENABLED:
+        return
+
+    while True:
+        try:
+            now = agora_sp()
+            current_hm = now.strftime("%H:%M")
+            today = now.strftime("%Y-%m-%d")
+            if current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
+                save_daily_snapshot(label="auto")
+                if CENTRAL_DAILY_REPORT_MODE in {"completo", "full"}:
+                    msg = build_central_report("completo")
+                else:
+                    msg = (
+                        build_executive_report()
+                        + "\n\n==============================\n"
+                        + build_diagnostic_report()
+                        + "\n\n==============================\n"
+                        + build_ranking_report()
+                        + "\n\n==============================\n"
+                        + build_meta_supervisor_report()
+                    )
+                if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
+                    telegram_send_with_token(CENTRAL_TELEGRAM_BOT_TOKEN, CENTRAL_TELEGRAM_CHAT_ID, msg)
+                CENTRAL_DAILY_REPORT_SENT_DATE = today
+        except Exception as exc:
+            print("ERRO RELATÓRIO DIÁRIO CENTRAL:", exc)
+        time.sleep(30)
+
+
 # ==========================================================
 # CENTRAL TELEGRAM COMMAND ROUTER
 # ==========================================================
@@ -1466,8 +2212,8 @@ COMMAND_ROUTER_DEFAULTS = {
     "COBRA": False,
     "MEME": False,
     "PREDATOR": False,
-    "TURTLE": True,
-    "FALCON": True,
+    "TURTLE": False,
+    "FALCON": False,
 }
 
 CENTRAL_COMMAND_OFFSETS = {}
@@ -1536,6 +2282,26 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     if cmd0 in {"/memorygc", "/memory_gc", "/memoriagc", "/memoria_gc"}:
         text, _payload = build_memory_text(run_gc=True)
         return text
+
+    if cmd0 in {"/executive", "/dashboard"}:
+        return build_executive_report()
+    if cmd0 in {"/risk", "/riskmanager"}:
+        return build_risk_report()
+    if cmd0 in {"/heat", "/heatmap"}:
+        return build_heatmap_report()
+    if cmd0 in {"/ranking"}:
+        return build_ranking_report()
+    if cmd0 in {"/healthscore", "/score"}:
+        return build_healthscore_report()
+    if cmd0 in {"/meta", "/metasupervisor"}:
+        return build_meta_supervisor_report()
+    if cmd0 in {"/history"}:
+        return build_history_report()
+    if cmd0 in {"/snapshot"}:
+        return build_snapshot_report()
+    if cmd0 in {"/simulate"}:
+        parts = raw_cmd.split()
+        return build_simulate_report(parts[1] if len(parts) > 1 else None)
 
     parsed_report = parse_report_command(raw_cmd)
     if parsed_report:
@@ -1685,6 +2451,8 @@ def start_central_runtime_once():
 
     threading.Thread(target=central_watchdog_loop, daemon=True).start()
     threading.Thread(target=memory_monitor_loop, daemon=True).start()
+    threading.Thread(target=central_telegram_command_loop, daemon=True).start()
+    threading.Thread(target=central_daily_report_loop, daemon=True).start()
     start_central_command_routers()
 
 
