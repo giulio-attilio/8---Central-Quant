@@ -23,7 +23,25 @@ import ccxt
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
+# ====================================================
+# BROKER / EXECUÇÃO REAL SAFE MODE
+# ====================================================
+try:
+    import broker as bingx_broker
+    BROKER_IMPORT_ERROR = None
+except Exception as _broker_exc:
+    bingx_broker = None
+    BROKER_IMPORT_ERROR = str(_broker_exc)
+
 app = Flask(__name__)
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
 
 # ====================================================
 # IDENTIDADE / STAND-BY / LOCKS
@@ -87,6 +105,18 @@ TIMEFRAME_M15 = os.environ.get("PREDATOR_CHOCH_TIMEFRAME", "15m")
 SMART_PREDATOR_ENABLED = os.environ.get("SMART_PREDATOR_ENABLED", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 SMART_PREDATOR_AUTO_TRADE = os.environ.get("SMART_PREDATOR_AUTO_TRADE", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 
+# Modos padronizados da Central Quant para execução real segura:
+# PAPER  = comportamento atual, apenas simulação/estatística do robô.
+# READY  = valida broker/central, sem montar ordem.
+# VERIFY = consulta Risk Manager, monta ordem completa, NÃO envia ordem real.
+# LIVE   = envia automaticamente se ENABLE_REAL_TRADING=true e Risk Manager permitir.
+PREDATOR_MODE = os.environ.get("PREDATOR_MODE", os.environ.get("SMART_PREDATOR_MODE", "PAPER")).strip().upper()
+PREDATOR_REAL_NOTIONAL_USDT = float(os.environ.get("PREDATOR_REAL_NOTIONAL_USDT", os.environ.get("SMART_PREDATOR_REAL_NOTIONAL_USDT", "10")))
+PREDATOR_MAX_REAL_POSITIONS = int(os.environ.get("PREDATOR_MAX_REAL_POSITIONS", "1"))
+PREDATOR_REQUIRE_CENTRAL_RISK = env_bool("PREDATOR_REQUIRE_CENTRAL_RISK", True)
+PREDATOR_EXECUTION_NOTIFY = env_bool("PREDATOR_EXECUTION_NOTIFY", True)
+CENTRAL_BASE_URL = os.environ.get("CENTRAL_BASE_URL", f"http://127.0.0.1:{os.environ.get('PORT', '10000')}").rstrip("/")
+
 SCANNER_SLEEP_SECONDS = int(os.environ.get("PREDATOR_SCANNER_SLEEP_SECONDS", os.environ.get("SCANNER_SLEEP_SECONDS", "60")))
 COMMAND_SLEEP_SECONDS = int(os.environ.get("COMMAND_SLEEP_SECONDS", "2"))
 
@@ -145,7 +175,14 @@ HEALTH = {
     "last_watchdog_alert": None,
     "last_watchdog_alert_ts": 0,
     "watchdog_last_check": None,
-    "watchdog_last_status": "OK"
+    "watchdog_last_status": "OK",
+    "execution_mode": PREDATOR_MODE,
+    "execution_enabled": PREDATOR_MODE in {"READY", "VERIFY", "LIVE"},
+    "execution_last_decision": None,
+    "execution_last_result": None,
+    "execution_last_error": None,
+    "execution_last_run": None,
+    "broker_import_error": BROKER_IMPORT_ERROR
 }
 
 DEFAULT_FUNNEL_STATS = {
@@ -1211,6 +1248,271 @@ def scan_smart_predator_symbol(symbol):
 
     return None
 
+
+# ====================================================
+# EXECUÇÃO REAL SAFE MODE / CENTRAL RISK
+# ====================================================
+
+def execution_mode_active():
+    return PREDATOR_MODE in {"READY", "VERIFY", "LIVE"}
+
+
+def broker_ready_payload():
+    if bingx_broker is None:
+        return {"ok": False, "status": "BROKER_IMPORT_ERROR", "error": BROKER_IMPORT_ERROR}
+    try:
+        return bingx_broker.ready_check(cache_seconds=10)
+    except Exception as exc:
+        return {"ok": False, "status": "BROKER_ERROR", "error": str(exc)}
+
+
+def central_can_open_trade(sig):
+    """
+    Consulta a Central Quant antes de qualquer tentativa de VERIFY/LIVE.
+    Em LIVE, falha de comunicação vira DENY por segurança.
+    Em VERIFY, também reporta a falha, mas a posição PAPER já pode continuar registrada.
+    """
+    payload = {
+        "bot": "PREDATOR",
+        "symbol": nome_limpo(sig.get("symbol", "")),
+        "raw_symbol": sig.get("symbol"),
+        "side": sig.get("side"),
+        "setup": "SMART_PREDATOR",
+        "score": sig.get("score"),
+        "risk_pct": sig.get("risk_pct"),
+        "notional_usdt": PREDATOR_REAL_NOTIONAL_USDT,
+        "mode": PREDATOR_MODE,
+        "source": "smart_predator",
+    }
+
+    if not PREDATOR_REQUIRE_CENTRAL_RISK:
+        return {"allowed": True, "decision": "ALLOW", "reasons": ["PREDATOR_REQUIRE_CENTRAL_RISK=false"], "payload": payload}
+
+    try:
+        r = requests.post(f"{CENTRAL_BASE_URL}/can_open_trade", json=payload, timeout=8)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"allowed": False, "decision": "DENY", "reasons": [r.text[:300]]}
+        data["http_status"] = r.status_code
+        data["payload"] = payload
+        return data
+    except Exception as exc:
+        return {
+            "allowed": False,
+            "decision": "DENY",
+            "reasons": [f"Falha ao consultar Central Risk Manager: {exc}"],
+            "payload": payload,
+        }
+
+
+def count_live_positions_predator():
+    posicoes = carregar_posicoes()
+    total = 0
+    for p in posicoes.values():
+        if p.get("status") == "ENCERRADO":
+            continue
+        if str(p.get("execution_mode", "")).upper() == "LIVE" or p.get("live_order_id") or p.get("bingx_order_id"):
+            total += 1
+    return total
+
+
+def predator_local_live_gate(sig):
+    reasons = []
+    if PREDATOR_MODE == "LIVE" and count_live_positions_predator() >= PREDATOR_MAX_REAL_POSITIONS:
+        reasons.append(f"Predator LIVE já no limite: {count_live_positions_predator()}/{PREDATOR_MAX_REAL_POSITIONS}")
+    return {"allowed": len(reasons) == 0, "reasons": reasons}
+
+
+def build_predator_execution_message(sig, risk, broker_result=None, ready=None, local_gate=None):
+    broker_result = broker_result or {}
+    ready = ready or {}
+    local_gate = local_gate or {}
+    symbol = nome_limpo(sig.get("symbol", ""))
+    side = sig.get("side")
+    mode = PREDATOR_MODE
+    emoji = "🧪" if mode == "VERIFY" else ("🟢" if mode == "LIVE" else "⚙️")
+    allowed = bool(risk.get("allowed")) and bool(local_gate.get("allowed", True))
+    decision = "ALLOW" if allowed else "DENY"
+    risk_reasons = risk.get("reasons") or risk.get("reason") or []
+    if isinstance(risk_reasons, str):
+        risk_reasons = [risk_reasons]
+    local_reasons = local_gate.get("reasons") or []
+
+    amount = broker_result.get("amount")
+    price_ref = broker_result.get("price_ref")
+    notional = broker_result.get("notional_usdt", PREDATOR_REAL_NOTIONAL_USDT)
+    payload = broker_result.get("request_preview") or broker_result.get("payload_preview") or broker_result.get("payload") or {}
+    precision = broker_result.get("precision") or {}
+    latency = broker_result.get("latency_ms") or broker_result.get("elapsed_ms")
+    order_id = broker_result.get("order_id") or broker_result.get("id")
+    status = broker_result.get("status")
+    sent = broker_result.get("sent")
+
+    if not allowed:
+        result_txt = "🚫 ORDEM BLOQUEADA PELO RISK MANAGER"
+    elif mode == "VERIFY":
+        result_txt = "🚫 VERIFY: ordem NÃO enviada."
+    elif mode == "LIVE" and sent:
+        result_txt = f"✅ LIVE: ordem enviada. Order ID: {order_id}"
+    elif mode == "LIVE":
+        result_txt = f"🔴 LIVE: ordem NÃO enviada. Status: {status}"
+    else:
+        result_txt = f"Modo {mode}: sem envio real."
+
+    lines = [
+        f"{emoji} SMART PREDATOR EXECUTION — {mode}",
+        "",
+        f"Ativo: {symbol}",
+        f"Side: {side}",
+        "Setup: SMART_PREDATOR H1",
+        f"Score: {sig.get('score')}/100 | Qualidade: {sig.get('quality')}",
+        f"Entrada: {fmt_br(sig.get('entry'))}",
+        f"SL: {fmt_br(sig.get('sl'))}",
+        f"TP50: {fmt_br(sig.get('tp50'))}",
+        f"Risco sinal: {fmt_br(sig.get('risk_pct'), 2)}%",
+        "",
+        "Risk Manager Central:",
+        f"{'✅' if allowed else '❌'} {decision}",
+    ]
+    for r in list(risk_reasons)[:5] + list(local_reasons)[:5]:
+        lines.append(f"- {r}")
+
+    lines += [
+        "",
+        "Broker BingX:",
+        f"Ready: {'✅' if ready.get('ok') else '❌'} {ready.get('status')}",
+    ]
+    bal = ready.get("balance") or {}
+    if bal:
+        lines.append(f"Saldo USDT: total {bal.get('total_usdt')} | free {bal.get('free_usdt')}")
+
+    lines += [
+        "",
+        "Ordem planejada:",
+        f"Notional: {notional} USDT",
+        f"Preço ref: {price_ref}",
+        f"Quantidade: {amount}",
+        f"Leverage: {getattr(bingx_broker, 'BINGX_DEFAULT_LEVERAGE', 'N/A') if bingx_broker else 'N/A'}x",
+        f"Margin: {getattr(bingx_broker, 'BINGX_MARGIN_MODE', 'N/A') if bingx_broker else 'N/A'}",
+        f"ReduceOnly: False",
+        f"Client tag: PREDATOR-{symbol}-{int(time.time())}",
+    ]
+
+    if precision:
+        lines += [
+            "",
+            "Precisão:",
+            f"Amount original: {precision.get('amount_raw')}",
+            f"Amount final: {precision.get('amount_final')}",
+            f"Market: {precision.get('market_symbol')}",
+            f"Amount precision: {precision.get('amount_precision')}",
+            f"Price precision: {precision.get('price_precision')}",
+        ]
+
+    if payload:
+        lines += [
+            "",
+            "Payload/Signature:",
+            "✅ Payload OK",
+            "✅ Signature OK" if payload.get("signature") or broker_result.get("signature_ok") else "⚪ Signature preview indisponível",
+        ]
+
+    if latency is not None:
+        lines.append(f"Tempo: {latency} ms")
+
+    if broker_result.get("error"):
+        lines += ["", f"Erro Broker: {broker_result.get('error')}"]
+
+    lines += ["", "Resultado:", result_txt]
+    return "\n".join(lines)
+
+
+def update_position_execution_fields(sig, risk, broker_result):
+    try:
+        posicoes = carregar_posicoes()
+        symbol = sig.get("symbol")
+        p = posicoes.get(symbol)
+        if not isinstance(p, dict):
+            return
+        p["execution_mode"] = PREDATOR_MODE
+        p["execution_decision"] = risk.get("decision", "ALLOW" if risk.get("allowed") else "DENY")
+        p["execution_allowed"] = bool(risk.get("allowed"))
+        p["execution_checked_at"] = data_hora_sp_str()
+        p["execution_notional_usdt"] = PREDATOR_REAL_NOTIONAL_USDT
+        p["execution_status"] = broker_result.get("status") if isinstance(broker_result, dict) else None
+        p["execution_sent"] = bool(broker_result.get("sent")) if isinstance(broker_result, dict) else False
+        p["live_order_id"] = broker_result.get("order_id") or broker_result.get("id") if isinstance(broker_result, dict) else None
+        p["bingx_order_id"] = p.get("live_order_id")
+        p["broker_result_last"] = broker_result if isinstance(broker_result, dict) else {}
+        posicoes[symbol] = p
+        salvar_posicoes(posicoes)
+    except Exception as exc:
+        print("ERRO update_position_execution_fields:", exc)
+
+
+def execute_predator_signal_safe(sig):
+    """Executa a camada VERIFY/LIVE do Smart Predator no padrão Falcon."""
+    if not execution_mode_active():
+        return None
+
+    HEALTH["execution_last_run"] = data_hora_sp_str()
+    local_gate = predator_local_live_gate(sig)
+    risk = central_can_open_trade(sig)
+    allowed = bool(risk.get("allowed")) and bool(local_gate.get("allowed", True))
+    ready = broker_ready_payload()
+    broker_result = {}
+
+    if not allowed:
+        broker_result = {"ok": False, "status": "DENIED", "sent": False, "error": "Risk Manager DENY"}
+    elif bingx_broker is None:
+        broker_result = {"ok": False, "status": "BROKER_IMPORT_ERROR", "sent": False, "error": BROKER_IMPORT_ERROR}
+    elif PREDATOR_MODE == "READY":
+        broker_result = {"ok": True, "status": "READY_ONLY", "sent": False, "notional_usdt": PREDATOR_REAL_NOTIONAL_USDT}
+    else:
+        client_tag = f"PREDATOR-{nome_limpo(sig.get('symbol'))}-{int(time.time())}"
+        try:
+            broker_result = bingx_broker.place_market_order(
+                sig.get("symbol"),
+                sig.get("side"),
+                PREDATOR_REAL_NOTIONAL_USDT,
+                reduce_only=False,
+                client_tag=client_tag,
+            )
+        except Exception as exc:
+            broker_result = {"ok": False, "status": "BROKER_EXCEPTION", "sent": False, "error": str(exc)}
+
+    HEALTH["execution_last_decision"] = risk.get("decision", "ALLOW" if risk.get("allowed") else "DENY")
+    HEALTH["execution_last_result"] = broker_result.get("status")
+    HEALTH["execution_last_error"] = broker_result.get("error")
+
+    update_position_execution_fields(sig, risk, broker_result)
+
+    msg = build_predator_execution_message(sig, risk, broker_result, ready, local_gate)
+    if PREDATOR_EXECUTION_NOTIFY:
+        safe_send_telegram(msg)
+    return {"risk": risk, "ready": ready, "broker_result": broker_result, "message": msg}
+
+
+def montar_execution_status_texto():
+    ready = broker_ready_payload()
+    bal = ready.get("balance") or {}
+    return (
+        "⚙️ EXECUÇÃO SMART PREDATOR\n\n"
+        f"Modo Predator: {PREDATOR_MODE}\n"
+        f"Central URL: {CENTRAL_BASE_URL}\n"
+        f"Notional real: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n"
+        f"Max posições LIVE Predator: {PREDATOR_MAX_REAL_POSITIONS}\n"
+        f"Central Risk obrigatório: {PREDATOR_REQUIRE_CENTRAL_RISK}\n\n"
+        f"Broker carregado: {bingx_broker is not None}\n"
+        f"Broker import error: {BROKER_IMPORT_ERROR}\n"
+        f"BingX READY: {ready.get('ok')} | {ready.get('status')}\n"
+        f"Saldo USDT total/free: {bal.get('total_usdt')} / {bal.get('free_usdt')}\n\n"
+        f"Última decisão: {HEALTH.get('execution_last_decision')}\n"
+        f"Último resultado: {HEALTH.get('execution_last_result')}\n"
+        f"Último erro: {HEALTH.get('execution_last_error')}"
+    )
+
 # ====================================================
 # MENSAGENS TELEGRAM
 # ====================================================
@@ -1218,7 +1520,7 @@ def scan_smart_predator_symbol(symbol):
 def formatar_sinal_predator(s):
     side = s["side"]
     emoji = "🟢" if side == "LONG" else "🔴"
-    modo = "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
+    modo = PREDATOR_MODE if PREDATOR_MODE in {"READY", "VERIFY", "LIVE"} else ("REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO")
     reasons_text = "\n".join(s.get("reasons", []))
     ob = s.get("ob", {})
     ob_txt = (
@@ -1298,7 +1600,6 @@ def registrar_posicao(s):
         "initial_sl": float(s["sl"]),
         "tp50": float(s["tp50"]),
         "risk_abs": float(s.get("risk_abs", abs(float(s["entry"]) - float(s["sl"])))),
-        "risk_abs": float(s.get("risk_abs", 0)),
         "risk_pct": float(s.get("risk_pct", 0)),
         "score": int(s.get("score", 0)),
         "quality": s.get("quality", ""),
@@ -1323,6 +1624,15 @@ def registrar_posicao(s):
         "closed_at": None,
         "close_reason": None,
         "auto_trade": SMART_PREDATOR_AUTO_TRADE,
+        "execution_mode": PREDATOR_MODE,
+        "execution_decision": None,
+        "execution_allowed": None,
+        "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT if execution_mode_active() else None,
+        "execution_status": None,
+        "execution_sent": False,
+        "live_order_id": None,
+        "bingx_order_id": None,
+        "broker_result_last": {},
         "ob": s.get("ob", {}),
         "sweep": s.get("sweep", {}),
         "choch": s.get("choch", {}),
@@ -1349,6 +1659,8 @@ def registrar_posicao(s):
         "quality": s.get("quality", ""),
         "signal_type": "SMART_PREDATOR",
         "auto_trade": SMART_PREDATOR_AUTO_TRADE,
+        "execution_mode": PREDATOR_MODE,
+        "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT if execution_mode_active() else None,
         "h4_context": s.get("h4_context"),
         "adx_h4": s.get("adx_h4"),
         "volume_ratio": s.get("volume_ratio")
@@ -2224,6 +2536,15 @@ def montar_health_tecnico():
         "telegram_configured": bool(TOKEN and CHAT_ID),
         "smart_predator_enabled": SMART_PREDATOR_ENABLED,
         "smart_predator_auto_trade": SMART_PREDATOR_AUTO_TRADE,
+        "predator_mode": PREDATOR_MODE,
+        "execution_enabled": execution_mode_active(),
+        "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT,
+        "execution_last_decision": HEALTH.get("execution_last_decision"),
+        "execution_last_result": HEALTH.get("execution_last_result"),
+        "execution_last_error": HEALTH.get("execution_last_error"),
+        "execution_last_run": HEALTH.get("execution_last_run"),
+        "broker_loaded": bingx_broker is not None,
+        "broker_import_error": BROKER_IMPORT_ERROR,
         "timeframe_h1": TIMEFRAME_H1,
         "timeframe_h4": TIMEFRAME_H4,
         "timeframe_m15_choch": TIMEFRAME_M15,
@@ -2283,7 +2604,9 @@ def montar_startup_message():
         f"Status:\n"
         f"Stand-by: {check_bool(not SMART_PREDATOR_ENABLED)}\n"
         f"Ativo para sinais: {check_bool(SMART_PREDATOR_ENABLED)}\n"
-        f"Modo: {modo}\n\n"
+        f"Modo: {modo}\n"
+        f"Execução segura: {PREDATOR_MODE}\n"
+        f"Notional VERIFY/LIVE: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n\n"
         f"Lógica:\n"
         f"Liquidity Sweep + CHOCH M15 + Order Block + Reteste\n\n"
         f"Filtros ativos:\n"
@@ -2338,6 +2661,7 @@ def processar_comando(texto):
             "/stats - estatísticas gerais\n"
             "/funil - funil do setup\n"
             "/ranking - ranking por ativo\n"
+            "/execution - status execução VERIFY/LIVE\n"
             "/watchlist - ativos monitorados\n"
             "/reset - limpa posições, sinais, histórico e funil\n"
             "/comandos - mostra esta lista"
@@ -2369,6 +2693,9 @@ def processar_comando(texto):
 
     if cmd in ["/ranking", "/ativos"]:
         return "🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)
+
+    if cmd in ["/execution", "/exec", "/verify", "/live"]:
+        return montar_execution_status_texto()
 
     if cmd == "/watchlist":
         wl = carregar_watchlist()
@@ -2507,6 +2834,8 @@ def scanner():
                             ok = registrar_posicao(s)
                             if ok:
                                 safe_send_telegram(formatar_sinal_predator(s))
+                                if execution_mode_active():
+                                    execute_predator_signal_safe(s)
                                 inc_funnel_stat("signals_sent")
                                 sinais_enviados += 1
 
@@ -2594,6 +2923,11 @@ def funnel_rota():
 @app.route("/ranking")
 def ranking_rota():
     return ("🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)).replace("\n", "<br>")
+
+
+@app.route("/execution")
+def execution_rota():
+    return montar_execution_status_texto().replace("\n", "<br>")
 
 # ====================================================
 # THREADS MONITORADAS
