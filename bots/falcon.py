@@ -42,6 +42,14 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask
 from upstash_redis import Redis
 
+try:
+    import broker as central_broker
+except Exception as _broker_import_exc:
+    central_broker = None
+    BROKER_IMPORT_ERROR = str(_broker_import_exc)
+else:
+    BROKER_IMPORT_ERROR = None
+
 app = Flask(__name__)
 
 # ==============================================================================
@@ -68,6 +76,20 @@ UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 WATCHLIST_FILE = os.environ.get("FALCON_WATCHLIST_FILE", "watchlists/falcon.json")
 
 ENABLE_FALCON = str(os.environ.get("ENABLE_FALCON", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+
+# Execução real segura.
+# PAPER: igual ao comportamento atual.
+# READY: valida BingX/API/Risk, mas NÃO envia ordens.
+# LIVE: só envia se ENABLE_REAL_TRADING=true e a Central aprovar em /can_open_trade.
+FALCON_MODE = os.environ.get("FALCON_MODE", os.environ.get("EXECUTION_MODE", "PAPER")).strip().upper()
+ENABLE_REAL_TRADING = str(os.environ.get("ENABLE_REAL_TRADING", "false")).lower() in {"1", "true", "yes", "sim", "on"}
+FALCON_REAL_NOTIONAL_USDT = float(os.environ.get("FALCON_REAL_NOTIONAL_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "5")))
+FALCON_REAL_MAX_POSITIONS = int(os.environ.get("FALCON_REAL_MAX_POSITIONS", "1"))
+FALCON_USE_CENTRAL_RISK = str(os.environ.get("FALCON_USE_CENTRAL_RISK", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+CENTRAL_CAN_OPEN_TRADE_URL = os.environ.get(
+    "CENTRAL_CAN_OPEN_TRADE_URL",
+    f"http://127.0.0.1:{os.environ.get('PORT', '10000')}/can_open_trade"
+)
 TIMEFRAME = os.environ.get("FALCON_TIMEFRAME", "15m")
 OHLCV_LIMIT = int(os.environ.get("FALCON_OHLCV_LIMIT", "300"))
 
@@ -206,9 +228,15 @@ HEALTH = {
     "runners_5r": 0,
     "runners_10r": 0,
     "enabled_setups": list(SETUPS.keys()),
-    "mode": "PAPER",
+    "mode": FALCON_MODE,
     "alignment_mode": ALIGNMENT_MODE,
     "funnel_today": {},
+    "execution_mode": FALCON_MODE,
+    "enable_real_trading": ENABLE_REAL_TRADING,
+    "broker_loaded": central_broker is not None,
+    "broker_import_error": BROKER_IMPORT_ERROR,
+    "last_execution_decision": None,
+    "last_execution_order": None,
 }
 
 # ==============================================================================
@@ -877,9 +905,165 @@ def signal_message(sig):
         f"ADX M15: {safe_float(sig.get('adx'), 0):.2f}\n"
         f"Breakout em ATR: {safe_float(sig.get('breakout_atr'), 0):.2f}\n"
         f"Range em ATR: {safe_float(sig.get('range_atr'), 0):.2f}\n\n"
-        f"Modo: PAPER / SEM BINGX"
+        f"Modo: {FALCON_MODE} / {'BINGX BLOQUEADA' if FALCON_MODE != 'LIVE' else 'BINGX SAFE'}"
     )
 
+
+
+# ==============================================================================
+# EXECUÇÃO REAL SEGURA / CENTRAL RISK GATE
+# ==============================================================================
+
+def normalize_symbol_for_central(symbol):
+    s = str(symbol or "").upper().strip()
+    s = s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "")
+    return s
+
+
+def falcon_live_positions_count(positions=None):
+    positions = positions if positions is not None else get_positions()
+    count = 0
+    for p in (positions or {}).values():
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("status", "OPEN")).upper() in {"ENCERRADO", "CLOSED", "FECHADO"}:
+            continue
+        if p.get("execution_mode") == "LIVE" or p.get("live_order_id") or p.get("bingx_order_id"):
+            count += 1
+    return count
+
+
+def central_can_open_trade(sig, positions=None):
+    if not FALCON_USE_CENTRAL_RISK:
+        return {"allowed": True, "decision": "ALLOW", "reasons": [], "warnings": ["FALCON_USE_CENTRAL_RISK=false"]}
+    payload = {
+        "bot": "FALCON",
+        "symbol": normalize_symbol_for_central(sig.get("symbol")),
+        "side": sig.get("side"),
+        "setup": sig.get("setup"),
+        "mode": FALCON_MODE,
+        "intended_live": FALCON_MODE == "LIVE",
+        "risk_pct": sig.get("risk_pct"),
+        "notional_usdt": FALCON_REAL_NOTIONAL_USDT,
+        "entry": sig.get("entry"),
+        "stop": sig.get("stop"),
+        "tp50": sig.get("tp50"),
+    }
+    try:
+        r = requests.post(CENTRAL_CAN_OPEN_TRADE_URL, json=payload, timeout=8)
+        if r.status_code != 200:
+            return {"allowed": False, "decision": "DENY", "reasons": [f"central HTTP {r.status_code}: {r.text[:160]}"]}
+        data = r.json()
+        return data if isinstance(data, dict) else {"allowed": False, "decision": "DENY", "reasons": ["central retornou payload inválido"]}
+    except Exception as exc:
+        return {"allowed": False, "decision": "DENY", "reasons": [f"central indisponível: {exc}"]}
+
+
+def execute_signal_if_allowed(sig, positions=None):
+    """
+    Decide e, se estiver LIVE, envia ordem real à BingX via broker.py.
+    Em PAPER: não consulta execução real e preserva comportamento antigo.
+    Em READY: consulta Central/BingX READY, mas não envia ordem.
+    Em LIVE: exige ENABLE_REAL_TRADING=true, Central ALLOW e broker carregado.
+    """
+    positions = positions if positions is not None else get_positions()
+    mode = FALCON_MODE
+    sig["execution_mode"] = mode
+    sig["real_notional_usdt"] = FALCON_REAL_NOTIONAL_USDT
+
+    if mode == "PAPER":
+        decision = {"allowed": True, "decision": "PAPER", "reasons": [], "warnings": []}
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return True, decision
+
+    if falcon_live_positions_count(positions) >= FALCON_REAL_MAX_POSITIONS:
+        decision = {
+            "allowed": False,
+            "decision": "DENY",
+            "reasons": [f"limite real Falcon atingido: {falcon_live_positions_count(positions)}/{FALCON_REAL_MAX_POSITIONS}"],
+            "warnings": [],
+        }
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
+
+    decision = central_can_open_trade(sig, positions=positions)
+    sig["execution_decision"] = decision
+    HEALTH["last_execution_decision"] = decision
+
+    if not decision.get("allowed"):
+        return False, decision
+
+    if mode == "READY":
+        ready = None
+        if central_broker is not None:
+            try:
+                ready = central_broker.ready_check()
+            except Exception as exc:
+                ready = {"ok": False, "status": "READY_ERROR", "error": str(exc)}
+        else:
+            ready = {"ok": False, "status": "BROKER_IMPORT_ERROR", "error": BROKER_IMPORT_ERROR}
+        sig["bingx_ready"] = ready
+        HEALTH["last_execution_order"] = {"mode": "READY", "ready": ready}
+        # READY nunca bloqueia o paper/sinal; só registra o estado.
+        return True, decision
+
+    if mode != "LIVE":
+        decision = {"allowed": False, "decision": "DENY", "reasons": [f"FALCON_MODE inválido: {mode}"], "warnings": []}
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
+
+    if not ENABLE_REAL_TRADING:
+        decision = {"allowed": False, "decision": "DENY", "reasons": ["ENABLE_REAL_TRADING=false"], "warnings": []}
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
+
+    if central_broker is None:
+        decision = {"allowed": False, "decision": "DENY", "reasons": [f"broker import error: {BROKER_IMPORT_ERROR}"], "warnings": []}
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
+
+    try:
+        order = central_broker.place_market_order(
+            symbol=sig.get("symbol"),
+            side=sig.get("side"),
+            notional_usdt=FALCON_REAL_NOTIONAL_USDT,
+            reduce_only=False,
+            client_tag=f"FALCON-{sig.get('setup')}-{int(time.time())}",
+        )
+        sig["live_order"] = order
+        sig["live_order_id"] = order.get("id") or order.get("order_id")
+        sig["bingx_order_id"] = sig.get("live_order_id")
+        HEALTH["last_execution_order"] = order
+        if not order.get("ok"):
+            decision = {"allowed": False, "decision": "DENY", "reasons": [f"ordem rejeitada: {order.get('error') or order.get('status')}"], "warnings": []}
+            sig["execution_decision"] = decision
+            HEALTH["last_execution_decision"] = decision
+            return False, decision
+        return True, decision
+    except Exception as exc:
+        decision = {"allowed": False, "decision": "DENY", "reasons": [f"erro broker place_order: {exc}"], "warnings": []}
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
+
+
+def execution_decision_text(decision):
+    if not isinstance(decision, dict):
+        return ""
+    d = decision.get("decision") or ("ALLOW" if decision.get("allowed") else "DENY")
+    reasons = decision.get("reasons") or []
+    warnings = decision.get("warnings") or []
+    out = [f"Execução: {d}"]
+    if reasons:
+        out.append("Motivos: " + "; ".join([str(x) for x in reasons[:3]]))
+    if warnings:
+        out.append("Avisos: " + "; ".join([str(x) for x in warnings[:3]]))
+    return "\n".join(out)
 
 def scanner_loop():
     started = time.time()
@@ -930,12 +1114,22 @@ def scanner_loop():
                     if time.time() - started < STARTUP_GUARD_SECONDS:
                         continue
 
+                    execution_allowed, execution_decision = execute_signal_if_allowed(sig, positions=positions)
+                    if not execution_allowed:
+                        funnel_inc("reprovados_risco")
+                        HEALTH["last_warning"] = "execução bloqueada: " + "; ".join([str(x) for x in execution_decision.get("reasons", [])[:3]])
+                        continue
+
                     pid = sig["id"]
                     positions[pid] = sig
                     save_positions(positions)
                     redis_list_append(SIGNALS_KEY, sig)
-                    record_event("SIGNAL", sig, {"entry": sig["entry"], "stop": sig["stop"], "tp50": sig["tp50"]})
-                    safe_send_telegram(signal_message(sig))
+                    record_event("SIGNAL", sig, {"entry": sig["entry"], "stop": sig["stop"], "tp50": sig["tp50"], "execution_decision": execution_decision})
+                    msg = signal_message(sig)
+                    extra_exec = execution_decision_text(execution_decision)
+                    if extra_exec:
+                        msg += "\n\n" + extra_exec
+                    safe_send_telegram(msg)
                     funnel_inc("sinais_enviados")
                     signals_sent += 1
 
@@ -1305,7 +1499,7 @@ def build_summary(period_name, trades, period_signals_override=None):
         f"Melhor trade:\n{trade_line(stats['best_trade'])}\n\n"
         f"Pior trade:\n{trade_line(stats['worst_trade'])}\n\n"
         f"Trades ainda ativos: {len(positions)}\n"
-        f"Modo: PAPER / SEM BINGX"
+        f"Modo: {FALCON_MODE} / {'BINGX BLOQUEADA' if FALCON_MODE != 'LIVE' else 'BINGX SAFE'}"
     )
 
 
@@ -1446,7 +1640,7 @@ def health_payload():
     return {
         "ok": HEALTH.get("last_error") is None,
         "bot": BOT_NAME,
-        "mode": "PAPER",
+        "mode": FALCON_MODE,
         "enabled": ENABLE_FALCON,
         "enabled_setups": list(SETUPS.keys()),
         "timeframe": TIMEFRAME,
@@ -1613,7 +1807,7 @@ def start_threads():
         f"ORB NY: {ORB_START_HOUR:02d}:{ORB_START_MINUTE:02d}\n"
         f"Opera até: {ORB_TRADE_END_HOUR:02d}:{ORB_TRADE_END_MINUTE:02d} NY\n"
         f"Alinhamento: {ALIGNMENT_MODE}\n"
-        f"Modo: PAPER / SEM BINGX"
+        f"Modo: {FALCON_MODE} / {'BINGX BLOQUEADA' if FALCON_MODE != 'LIVE' else 'BINGX SAFE'}"
     )
     threading.Thread(target=run_thread_guarded, args=("scanner", scanner_loop), daemon=True).start()
     threading.Thread(target=run_thread_guarded, args=("management", management_loop), daemon=True).start()
