@@ -1970,6 +1970,215 @@ def build_execution_report():
     ]
     return "\n".join(lines)
 
+
+# ==========================================================
+# LIVE / SYNC / EXECUTIONS LOG
+# ==========================================================
+
+def _broker_call(name, *args, **kwargs):
+    if central_broker is None:
+        return None, f"broker import error: {BROKER_IMPORT_ERROR}"
+    fn = getattr(central_broker, name, None)
+    if not callable(fn):
+        return None, f"broker sem função {name}"
+    try:
+        return fn(*args, **kwargs), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _broker_open_positions():
+    raw, err = _broker_call("get_positions")
+    if err:
+        return [], err
+    rows = []
+    for p in raw or []:
+        if not isinstance(p, dict):
+            continue
+        contracts = p.get("contracts") or p.get("contractSize") or p.get("amount") or p.get("positionAmt")
+        notional = p.get("notional") or p.get("initialMargin") or p.get("margin")
+        symbol = normalize_symbol_for_risk(p.get("symbol") or (p.get("info") or {}).get("symbol"))
+        side = str(p.get("side") or (p.get("info") or {}).get("side") or "").upper()
+        # CCXT costuma retornar contracts=0 para posição zerada.
+        try:
+            contracts_f = abs(float(contracts or 0))
+        except Exception:
+            contracts_f = 0.0
+        try:
+            notional_f = abs(float(notional or 0))
+        except Exception:
+            notional_f = 0.0
+        if contracts_f <= 0 and notional_f <= 0:
+            continue
+        rows.append({
+            "symbol": symbol,
+            "side": side,
+            "contracts": contracts,
+            "notional": notional,
+            "entry_price": p.get("entryPrice") or p.get("entry_price") or (p.get("info") or {}).get("avgPrice"),
+            "unrealized_pnl": p.get("unrealizedPnl") or p.get("unrealized_pnl"),
+            "leverage": p.get("leverage") or (p.get("info") or {}).get("leverage"),
+            "raw_symbol": p.get("symbol"),
+        })
+    return rows, None
+
+
+def _central_live_positions_payload():
+    rows = []
+    for key, module in LOADED_BOTS.items():
+        try:
+            positions = get_open_positions_from_module(module)
+        except Exception:
+            positions = []
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+            is_live = (
+                str(p.get("execution_mode") or "").upper() == "LIVE"
+                or bool(p.get("live_order_id"))
+                or bool(p.get("bingx_order_id"))
+            )
+            if not is_live:
+                continue
+            rows.append({
+                "bot": key,
+                "symbol": normalize_symbol_for_risk(p.get("symbol") or p.get("ativo") or p.get("pair")),
+                "side": str(p.get("side") or p.get("direction") or "").upper(),
+                "setup": p.get("setup") or p.get("setup_label"),
+                "entry": p.get("entry") or p.get("entrada"),
+                "stop": p.get("stop") or p.get("sl") or p.get("stop_atual"),
+                "tp50": p.get("tp50"),
+                "order_id": p.get("live_order_id") or p.get("bingx_order_id"),
+            })
+    return rows
+
+
+def _execution_log_items(limit=20):
+    items, err = _broker_call("get_executions_log", limit)
+    if err:
+        return [], err
+    return items or [], None
+
+
+def build_executions_log_report(limit=20):
+    items, err = _execution_log_items(limit=limit)
+    lines = [
+        "📜 EXECUTIONS LOG — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Eventos lidos: {len(items)}",
+    ]
+    if err:
+        lines.append(f"Erro: {err}")
+        return "\n".join(lines)
+    if not items:
+        lines += ["", "Nenhum evento de execução registrado ainda."]
+        return "\n".join(lines)
+    lines += ["", "Últimos eventos:"]
+    for e in items[-limit:]:
+        if not isinstance(e, dict):
+            lines.append(f"- {e}")
+            continue
+        lines.append(
+            f"- {e.get('ts')} | {e.get('event')} | {e.get('status')} | "
+            f"sent={e.get('sent')} | {e.get('symbol')} {e.get('side')} | "
+            f"notional={e.get('notional_usdt')} | amount={e.get('amount')} | id={e.get('order_id') or e.get('id')}"
+        )
+        if e.get("error"):
+            lines.append(f"  erro: {e.get('error')}")
+        if e.get("client_order_id"):
+            lines.append(f"  clientOrderId: {e.get('client_order_id')}")
+    return "\n".join(lines)
+
+
+def build_live_report():
+    ready = bingx_ready_payload() if BINGX_READY_CHECK_ENABLED else {"ok": None, "status": "READY_CHECK_DISABLED"}
+    balance = (ready.get("balance") or {}) if isinstance(ready, dict) else {}
+    broker_positions, pos_err = _broker_open_positions()
+    central_live = _central_live_positions_payload()
+    exec_items, exec_err = _execution_log_items(limit=5)
+
+    lines = [
+        "🟢 LIVE STATUS — CENTRAL QUANT / BINGX",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Execution mode: {EXECUTION_MODE}",
+        f"ENABLE_REAL_TRADING: {ENABLE_REAL_TRADING}",
+        f"Broker READY: {ready.get('ok')} | {ready.get('status')}",
+    ]
+    if ready.get("error"):
+        lines.append(f"Erro READY: {ready.get('error')}")
+    if balance:
+        lines.append(f"Saldo USDT total/free/used: {balance.get('total_usdt')} / {balance.get('free_usdt')} / {balance.get('used_usdt')}")
+    lines += [
+        "",
+        "POSIÇÕES BINGX",
+    ]
+    if pos_err:
+        lines.append(f"Erro ao ler posições: {pos_err}")
+    elif not broker_positions:
+        lines.append("Nenhuma posição aberta na BingX.")
+    else:
+        for p in broker_positions[:30]:
+            lines.append(
+                f"- {p.get('symbol')} {p.get('side')} | contracts={p.get('contracts')} | "
+                f"notional={p.get('notional')} | entry={p.get('entry_price')} | uPnL={p.get('unrealized_pnl')} | lev={p.get('leverage')}"
+            )
+
+    lines += ["", "POSIÇÕES LIVE REGISTRADAS NA CENTRAL"]
+    if not central_live:
+        lines.append("Nenhuma posição LIVE registrada na Central.")
+    else:
+        for p in central_live[:30]:
+            lines.append(f"- {p.get('bot')} {p.get('symbol')} {p.get('side')} {p.get('setup')} | order={p.get('order_id')}")
+
+    lines += ["", "ÚLTIMAS EXECUÇÕES"]
+    if exec_err:
+        lines.append(f"Erro ao ler log: {exec_err}")
+    elif not exec_items:
+        lines.append("Nenhum evento registrado ainda.")
+    else:
+        for e in exec_items[-5:]:
+            lines.append(f"- {e.get('ts')} | {e.get('status')} | sent={e.get('sent')} | {e.get('symbol')} {e.get('side')} | id={e.get('order_id') or e.get('id')}")
+    return "\n".join(lines)
+
+
+def build_sync_report():
+    broker_positions, pos_err = _broker_open_positions()
+    central_live = _central_live_positions_payload()
+
+    broker_keys = {(p.get("symbol"), str(p.get("side") or "").upper()) for p in broker_positions}
+    central_keys = {(p.get("symbol"), str(p.get("side") or "").upper()) for p in central_live}
+
+    only_bingx = sorted(list(broker_keys - central_keys))
+    only_central = sorted(list(central_keys - broker_keys))
+    matched = sorted(list(broker_keys & central_keys))
+
+    lines = [
+        "🔄 SYNC CENTRAL x BINGX",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"BingX positions: {len(broker_positions)}",
+        f"Central LIVE positions: {len(central_live)}",
+        f"Casadas: {len(matched)}",
+        f"Só na BingX: {len(only_bingx)}",
+        f"Só na Central: {len(only_central)}",
+    ]
+    if pos_err:
+        lines += ["", f"Erro ao ler BingX: {pos_err}"]
+        return "\n".join(lines)
+    if matched:
+        lines += ["", "Casadas:"] + [f"- {sym} {side}" for sym, side in matched[:20]]
+    if only_bingx:
+        lines += ["", "⚠️ Só na BingX:"] + [f"- {sym} {side}" for sym, side in only_bingx[:20]]
+    if only_central:
+        lines += ["", "⚠️ Só na Central:"] + [f"- {sym} {side}" for sym, side in only_central[:20]]
+    if not only_bingx and not only_central:
+        lines += ["", "✅ Central LIVE e BingX sincronizadas."]
+    else:
+        lines += ["", "Ação sugerida: antes de LIVE, investigar qualquer divergência acima."]
+    return "\n".join(lines)
+
+
 def build_risk_report():
     exposure_snapshot = central_exposure_snapshot()
     rows = _all_open_positions_payload()
@@ -2306,6 +2515,9 @@ def build_dashboard_report():
         "==============================\nEXECUÇÃO / BINGX\n==============================",
         build_execution_report(),
         "",
+        "==============================\nLIVE / SYNC\n==============================",
+        _short(build_live_report(), 1800) + "\n\n" + _short(build_sync_report(), 1200),
+        "",
         "==============================\nRISK DECISIONAL\n==============================",
         build_risk_report(),
         "",
@@ -2535,6 +2747,25 @@ def execution_route():
     return {"text": build_execution_report(), "payload": broker_status_payload(), "ready": bingx_ready_payload()}
 
 
+@app.route("/live")
+@app.route("/livestatus")
+def live_route():
+    return {"text": build_live_report()}
+
+
+@app.route("/sync")
+@app.route("/reconcile")
+def sync_route():
+    return {"text": build_sync_report()}
+
+
+@app.route("/executions")
+@app.route("/exec_log")
+@app.route("/executionlog")
+def executions_route():
+    return {"text": build_executions_log_report()}
+
+
 @app.route("/can_open_trade", methods=["GET", "POST"])
 @app.route("/canopen", methods=["GET", "POST"])
 def can_open_trade_route():
@@ -2710,6 +2941,12 @@ def build_central_command_reply(text: str):
         return build_executive_report()
     if cmd0 in {"/execution", "/execucao", "/execução", "/bingx"}:
         return build_execution_report()
+    if cmd0 in {"/live", "/livestatus"}:
+        return build_live_report()
+    if cmd0 in {"/sync", "/reconcile"}:
+        return build_sync_report()
+    if cmd0 in {"/executions", "/exec_log", "/executionlog"}:
+        return build_executions_log_report()
     if cmd0 in {"/risk", "/riskmanager"}:
         return build_risk_report()
     if cmd0 in {"/heat", "/heatmap"}:
@@ -2756,6 +2993,9 @@ def _central_command_title(text: str):
         "/predator": "PREDATOR",
         "/turtle": "TURTLE",
         "/falcon": "FALCON",
+        "/live": "LIVE",
+        "/sync": "SYNC",
+        "/executions": "EXECUTIONS",
     }
     return mapping.get(cmd, "CENTRAL QUANT")
 
@@ -3142,6 +3382,12 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         return build_executive_report()
     if cmd0 in {"/execution", "/execucao", "/execução", "/bingx"}:
         return build_execution_report()
+    if cmd0 in {"/live", "/livestatus"}:
+        return build_live_report()
+    if cmd0 in {"/sync", "/reconcile"}:
+        return build_sync_report()
+    if cmd0 in {"/executions", "/exec_log", "/executionlog"}:
+        return build_executions_log_report()
     if cmd0 in {"/risk", "/riskmanager"}:
         return build_risk_report()
     if cmd0 in {"/heat", "/heatmap"}:
