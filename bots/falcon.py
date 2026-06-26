@@ -911,6 +911,32 @@ def signal_message(sig):
 
 
 
+
+
+def verify_message(sig):
+    d = sig.get("execution_decision", {}) or {}
+    ready = sig.get("bingx_ready", {}) or {}
+    verify = sig.get("verify_order", {}) or {}
+    lines = [
+        "🧪 VERIFY",
+        "",
+        f"{sig.get('symbol')} {sig.get('side')}",
+        sig.get("setup",""),
+        "",
+        f"Risk Manager: {'✅ ALLOW' if d.get('allowed') else '❌ DENY'}",
+        f"Broker: {'✅ READY' if ready.get('ok') else '❌ NOT READY'}",
+    ]
+    if verify:
+        if verify.get("balance") is not None:
+            lines.append(f"Saldo: {verify.get('balance')}")
+        if verify.get("qty") is not None:
+            lines.append(f"Quantidade: {verify.get('qty')}")
+        if verify.get("payload"):
+            lines.append("Payload: ✅ OK")
+        lines.append("Resultado")
+        lines.append("🚫 VERIFY - Ordem NÃO enviada.")
+    return "\n".join(lines)
+
 # ==============================================================================
 # EXECUÇÃO REAL SEGURA / CENTRAL RISK GATE
 # ==============================================================================
@@ -1149,6 +1175,8 @@ def scanner_loop():
                     if extra_exec:
                         msg += "\n\n" + extra_exec
                     safe_send_telegram(msg)
+                    if FALCON_MODE == "VERIFY":
+                        safe_send_telegram(verify_message(sig))
                     funnel_inc("sinais_enviados")
                     signals_sent += 1
 
