@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-25-CENTRAL-FULL-SUPERVISOR-EXECUTIVE-CENTRAL-BOT
+# Versão: 2026-06-26-CENTRAL-SUPERVISOR-DASHBOARD-DAILY-AUDIT-FULL
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -903,7 +903,7 @@ def selftest():
 # ==========================================================
 # CENTRAL REPORT BUILDER
 # ==========================================================
-REPORT_COMMANDS = {"/relatorio", "/relatório", "/report", "/auditoria", "/diario", "/diário"}
+REPORT_COMMANDS = {"/relatorio", "/relatório", "/report", "/auditoria", "/diario", "/diário", "/relatoriocompleto", "/relatorio_completo"}
 REPORT_BOT_ALIASES = {
     "trend": "TRENDPRO",
     "trendpro": "TRENDPRO",
@@ -1470,7 +1470,7 @@ def parse_report_command(text: str):
     if not parts or parts[0] not in REPORT_COMMANDS:
         return None
 
-    mode = "curto"
+    mode = "completo" if parts[0] in {"/relatoriocompleto", "/relatorio_completo", "/auditoria", "/diario", "/diário"} else "curto"
     bot_key = None
     for p in parts[1:]:
         p = p.strip().lower().replace("/", "")
@@ -1997,10 +1997,195 @@ def build_simulate_report(arg=None):
     )
 
 
+
+def build_dashboard_report():
+    """
+    Painel operacional principal. Usa internamente executive, diagnóstico,
+    selftest, memória, risk, heat, exposure e runners, mas entrega em formato
+    consolidado para uso diário rápido.
+    """
+    parts = [
+        "📊 DASHBOARD CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "==============================\nEXECUTIVE\n==============================",
+        build_executive_report(),
+        "",
+        "==============================\nDIAGNÓSTICO\n==============================",
+        build_diagnostic_report(),
+        "",
+        "==============================\nSELFTEST\n==============================",
+        build_selftest_report(),
+        "",
+        "==============================\nMEMÓRIA\n==============================",
+        build_memory_text(run_gc=False)[0],
+        "",
+        "==============================\nRISK\n==============================",
+        build_risk_report(),
+        "",
+        "==============================\nHEAT\n==============================",
+        build_heatmap_report(),
+        "",
+        "==============================\nEXPOSURE\n==============================",
+        json.dumps(central_exposure_snapshot(), ensure_ascii=False, indent=2, default=str),
+        "",
+        "==============================\nRUNNERS\n==============================",
+        json.dumps(runners(), ensure_ascii=False, indent=2, default=str),
+    ]
+    return "\n\n".join(parts)
+
+
+def build_daily_report():
+    """
+    Pacote ideal para colar no ChatGPT na avaliação diária.
+    Mais enxuto que /full e menos técnico que /audit.
+    """
+    parts = [
+        "📅 RELATÓRIO DIÁRIO CONSOLIDADO — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "==============================\nEXECUTIVE\n==============================",
+        build_executive_report(),
+        "",
+        "==============================\nRISK\n==============================",
+        build_risk_report(),
+        "",
+        "==============================\nMEMÓRIA\n==============================",
+        build_memory_text(run_gc=False)[0],
+        "",
+        "==============================\nRELATÓRIO CENTRAL\n==============================",
+        build_central_status_text(),
+        "",
+        "==============================\nRANKING\n==============================",
+        build_ranking_report(),
+        "",
+        "==============================\nMETA SUPERVISOR\n==============================",
+        build_meta_supervisor_report(),
+        "",
+        "==============================\nRESUMOS DOS BOTS\n==============================",
+    ]
+    for key in BOT_CONFIGS.keys():
+        module = LOADED_BOTS.get(key)
+        cfg = BOT_CONFIGS.get(key, {})
+        if not module:
+            parts.append(f"🤖 {key} — {cfg.get('name')}\nMódulo não carregado: {LOAD_ERRORS.get(key)}")
+            continue
+        resumo = _bot_resumo_text(key, module)
+        parts.append(f"🤖 {key} — {cfg.get('name')}\n" + _short(resumo, 3500))
+    return "\n\n==============================\n".join(parts)
+
+
+def build_support_report():
+    """
+    Pacote de troubleshooting: não foca no desempenho, foca em saúde técnica.
+    """
+    parts = [
+        "🛠️ SUPORTE CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "==============================\nDIAGNÓSTICO\n==============================",
+        build_diagnostic_report(),
+        "",
+        "==============================\nSELFTEST\n==============================",
+        build_selftest_report(),
+        "",
+        "==============================\nMEMÓRIA\n==============================",
+        build_memory_text(run_gc=False)[0],
+        "",
+        "==============================\nHISTORY\n==============================",
+        build_history_report(),
+        "",
+        "==============================\nHEALTH DOS BOTS\n==============================",
+    ]
+    for key in BOT_CONFIGS.keys():
+        parts.append(_bot_report_health_text(key))
+    return "\n\n==============================\n".join(parts)
+
+
+def build_audit_report():
+    """
+    Auditoria técnica completa, mas ainda controlada para o Telegram.
+    """
+    parts = [
+        "🔍 AUDITORIA CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "==============================\nDASHBOARD\n==============================",
+        build_dashboard_report(),
+        "",
+        "==============================\nRANKING\n==============================",
+        build_ranking_report(),
+        "",
+        "==============================\nHISTORY\n==============================",
+        build_history_report(),
+        "",
+        "==============================\nRELATÓRIO COMPLETO DOS BOTS\n==============================",
+    ]
+    for key in BOT_CONFIGS.keys():
+        parts.append(build_single_bot_report(key, complete=True))
+    return "\n\n==============================\n".join(parts)
+
+
+def build_full_report():
+    """
+    Modo nuclear: salva snapshot e despeja praticamente tudo.
+    Pode virar muitas mensagens no Telegram.
+    """
+    parts = [
+        "💾 FULL DUMP CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "==============================\nSNAPSHOT\n==============================",
+        build_snapshot_report(),
+        "",
+        "==============================\nAUDIT\n==============================",
+        build_audit_report(),
+        "",
+        "==============================\nRELATÓRIO COMPLETO NATIVO\n==============================",
+        build_central_report("completo"),
+    ]
+    return "\n\n".join(parts)
+
+
 @app.route("/executive")
-@app.route("/dashboard")
 def executive_route():
     return {"text": build_executive_report()}
+
+
+@app.route("/dashboard")
+def dashboard_route():
+    return {"text": build_dashboard_report()}
+
+
+@app.route("/daily")
+@app.route("/diario")
+@app.route("/diário")
+def daily_route():
+    return {"text": build_daily_report()}
+
+
+@app.route("/support")
+def support_route():
+    return {"text": build_support_report()}
+
+
+@app.route("/audit")
+@app.route("/auditoria2")
+def audit_route():
+    return {"text": build_audit_report()}
+
+
+@app.route("/full")
+def full_route():
+    return {"text": build_full_report()}
+
+
+@app.route("/relatoriocompleto")
+@app.route("/relatorio_completo")
+def relatorio_completo_sem_espaco_route():
+    return {"text": build_central_report("completo")}
+
+
 
 
 @app.route("/risk")
@@ -2048,22 +2233,62 @@ def simulate_route(key=None):
     return {"text": build_simulate_report(key)}
 
 
+@app.route("/trend")
+def trend_route():
+    return {"text": build_single_bot_report("TRENDPRO", complete=True)}
+
+
+@app.route("/donkey")
+def donkey_route():
+    return {"text": build_single_bot_report("DONKEY", complete=True)}
+
+
+@app.route("/cobra")
+def cobra_route():
+    return {"text": build_single_bot_report("COBRA", complete=True)}
+
+
+@app.route("/meme")
+def meme_route():
+    return {"text": build_single_bot_report("MEME", complete=True)}
+
+
+@app.route("/predator")
+def predator_route():
+    return {"text": build_single_bot_report("PREDATOR", complete=True)}
+
+
+@app.route("/turtle")
+def turtle_route():
+    return {"text": build_single_bot_report("TURTLE", complete=True)}
+
+
+@app.route("/falcon")
+def falcon_route():
+    return {"text": build_single_bot_report("FALCON", complete=True)}
+
+
 def build_central_help_text():
     return (
         "🤖 CENTRAL QUANT — COMANDOS\n\n"
-        "Operação diária:\n"
-        "/executive\n/relatorio\n/relatorio completo\n/auditoria\n/selftest\n/diagnostico\n/memory\n\n"
-        "Risco e carteira:\n"
-        "/risk\n/heat\n/ranking\n/healthscore\n/meta\n/exposure\n/runners\n\n"
-        "Histórico:\n"
-        "/snapshot\n/history\n\n"
+        "Pacotes principais:\n"
+        "/dashboard — visão geral inteligente\n"
+        "/daily — relatório diário para avaliação\n"
+        "/support — troubleshooting técnico\n"
+        "/audit — auditoria completa\n"
+        "/full — dump completo com snapshot\n\n"
+        "Operação:\n"
+        "/executive\n/selftest\n/diagnostico\n/memory\n/risk\n/heat\n/ranking\n/healthscore\n/meta\n/exposure\n/runners\n\n"
+        "Relatórios:\n"
+        "/relatorio — resumo central\n"
+        "/relatoriocompleto — pacote completo sem espaço\n"
+        "/auditoria — alias do relatório completo nativo\n\n"
         "Por robô:\n"
-        "/relatorio turtle\n/relatorio donkey\n/relatorio predator\n\n"
-        "Simulação consultiva:\n"
-        "/simulate TURTLE\n\n"
-        "Observação: o Risk Manager é consultivo. Para bloquear entradas reais, os robôs precisam consultar a Central antes de operar."
+        "/trend\n/donkey\n/cobra\n/meme\n/predator\n/turtle\n/falcon\n\n"
+        "Histórico e simulação:\n"
+        "/snapshot\n/history\n/simulate TURTLE\n\n"
+        "Sugestão de uso diário: /dashboard. Para colar no ChatGPT: /daily."
     )
-
 
 def build_central_command_reply(text: str):
     raw = (text or "").strip()
@@ -2073,6 +2298,32 @@ def build_central_command_reply(text: str):
 
     if cmd0 in {"/start", "/help", "/comandos"}:
         return build_central_help_text()
+    if cmd0 in {"/dashboard"}:
+        return build_dashboard_report()
+    if cmd0 in {"/daily", "/diario", "/diário"}:
+        return build_daily_report()
+    if cmd0 in {"/support"}:
+        return build_support_report()
+    if cmd0 in {"/audit"}:
+        return build_audit_report()
+    if cmd0 in {"/full"}:
+        return build_full_report()
+    if cmd0 in {"/relatoriocompleto", "/relatorio_completo"}:
+        return build_central_report("completo")
+    if cmd0 in {"/trend", "/trendpro"}:
+        return build_single_bot_report("TRENDPRO", complete=True)
+    if cmd0 in {"/donkey"}:
+        return build_single_bot_report("DONKEY", complete=True)
+    if cmd0 in {"/cobra"}:
+        return build_single_bot_report("COBRA", complete=True)
+    if cmd0 in {"/meme"}:
+        return build_single_bot_report("MEME", complete=True)
+    if cmd0 in {"/predator", "/smart", "/smartpredator"}:
+        return build_single_bot_report("PREDATOR", complete=True)
+    if cmd0 in {"/turtle"}:
+        return build_single_bot_report("TURTLE", complete=True)
+    if cmd0 in {"/falcon"}:
+        return build_single_bot_report("FALCON", complete=True)
     if cmd0 in {"/health", "/central"}:
         return json.dumps(central(), ensure_ascii=False, indent=2, default=str)
     if cmd0 in {"/bots"}:
@@ -2185,18 +2436,12 @@ def central_daily_report_loop():
             today = now.strftime("%Y-%m-%d")
             if current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
                 save_daily_snapshot(label="auto")
-                if CENTRAL_DAILY_REPORT_MODE in {"completo", "full"}:
+                if CENTRAL_DAILY_REPORT_MODE in {"completo", "full", "audit", "auditoria"}:
                     msg = build_central_report("completo")
+                elif CENTRAL_DAILY_REPORT_MODE in {"daily", "diario", "diário"}:
+                    msg = build_daily_report()
                 else:
-                    msg = (
-                        build_executive_report()
-                        + "\n\n==============================\n"
-                        + build_diagnostic_report()
-                        + "\n\n==============================\n"
-                        + build_ranking_report()
-                        + "\n\n==============================\n"
-                        + build_meta_supervisor_report()
-                    )
+                    msg = build_dashboard_report()
                 if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
                     telegram_send_with_token(CENTRAL_TELEGRAM_BOT_TOKEN, CENTRAL_TELEGRAM_CHAT_ID, msg)
                 CENTRAL_DAILY_REPORT_SENT_DATE = today
@@ -2304,6 +2549,32 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     if cmd0 in {"/simulate"}:
         parts = raw_cmd.split()
         return build_simulate_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/dashboard"}:
+        return build_dashboard_report()
+    if cmd0 in {"/daily", "/diario", "/diário"}:
+        return build_daily_report()
+    if cmd0 in {"/support"}:
+        return build_support_report()
+    if cmd0 in {"/audit"}:
+        return build_audit_report()
+    if cmd0 in {"/full"}:
+        return build_full_report()
+    if cmd0 in {"/relatoriocompleto", "/relatorio_completo"}:
+        return build_central_report("completo")
+    if cmd0 in {"/trend", "/trendpro"}:
+        return build_single_bot_report("TRENDPRO", complete=True)
+    if cmd0 in {"/donkey"}:
+        return build_single_bot_report("DONKEY", complete=True)
+    if cmd0 in {"/cobra"}:
+        return build_single_bot_report("COBRA", complete=True)
+    if cmd0 in {"/meme"}:
+        return build_single_bot_report("MEME", complete=True)
+    if cmd0 in {"/predator", "/smart", "/smartpredator"}:
+        return build_single_bot_report("PREDATOR", complete=True)
+    if cmd0 in {"/turtle"}:
+        return build_single_bot_report("TURTLE", complete=True)
+    if cmd0 in {"/falcon"}:
+        return build_single_bot_report("FALCON", complete=True)
 
     parsed_report = parse_report_command(raw_cmd)
     if parsed_report:
