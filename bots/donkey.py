@@ -4117,6 +4117,10 @@ def montar_resumo_diario():
     fechados = [t for t in trades_trend if t.get("date") == hoje and t.get("event") == "CLOSE"]
     tp50s = [t for t in trades_trend if t.get("date") == hoje and t.get("event") == "TP50"]
     trailings = [t for t in trades_trend if t.get("date") == hoje and t.get("event") == "TRAILING"]
+    # Compatibilidade com campos de gestão parcial. Esses campos são usados em alguns
+    # resumos compartilhados, mas nem sempre existem nos eventos Trend.
+    parciais_tp50 = [t for t in tp50s if t.get("partial_realized")]
+    saidas_ema20 = [t for t in fechados if t.get("exit_model") == "PARTIAL50_EMA20"]
 
     wins = [t for t in fechados if t.get("result_type") == "WIN"]
     losses = [t for t in fechados if t.get("result_type") == "LOSS"]
