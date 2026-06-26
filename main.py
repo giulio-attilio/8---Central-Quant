@@ -81,6 +81,13 @@ CENTRAL_DAILY_REPORT_MODE = os.environ.get("CENTRAL_DAILY_REPORT_MODE", "executi
 TELEGRAM_CHUNK_SIZE = int(os.environ.get("TELEGRAM_CHUNK_SIZE", "3400"))
 TELEGRAM_LONG_COMMAND_NOTICE = env_bool("TELEGRAM_LONG_COMMAND_NOTICE", True)
 
+# Proteções contra respostas duplicadas no Telegram da Central.
+# DROP_PENDING evita reprocessar comandos antigos depois de deploy/restart.
+# DUPLICATE_WINDOW evita responder duas vezes ao mesmo comando em poucos segundos
+# quando o Telegram reentrega update ou quando o usuário toca no comando duas vezes.
+CENTRAL_TELEGRAM_DROP_PENDING_ON_START = env_bool("CENTRAL_TELEGRAM_DROP_PENDING_ON_START", True)
+CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS", "10"))
+
 # Risk Manager Global em modo consultivo. Ele NÃO bloqueia execução sozinho.
 # Para bloquear entradas de verdade, cada robô precisa consultar a Central antes de abrir posição.
 GLOBAL_RISK_MAX_POSITIONS = int(os.environ.get("GLOBAL_RISK_MAX_POSITIONS", "50"))
@@ -91,6 +98,9 @@ DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
 DAILY_HISTORY_DIR.mkdir(exist_ok=True)
 CENTRAL_TELEGRAM_OFFSET = None
 CENTRAL_TELEGRAM_PROCESSED_UPDATES = set()
+CENTRAL_TELEGRAM_RECENT_COMMANDS = {}
+CENTRAL_TELEGRAM_ROUTER_STARTED = False
+CENTRAL_TELEGRAM_ROUTER_LOCK = threading.Lock()
 CENTRAL_DAILY_REPORT_SENT_DATE = None
 
 
@@ -2545,7 +2555,7 @@ def cmd0_safe(text: str):
         return "command"
 
 def central_telegram_command_loop():
-    global CENTRAL_TELEGRAM_OFFSET
+    global CENTRAL_TELEGRAM_OFFSET, CENTRAL_TELEGRAM_ROUTER_STARTED
 
     token = CENTRAL_TELEGRAM_BOT_TOKEN
     allowed_chat = CENTRAL_TELEGRAM_CHAT_ID
@@ -2556,6 +2566,18 @@ def central_telegram_command_loop():
     if not token:
         print("ROTEADOR TELEGRAM CENTRAL NÃO INICIADO: CENTRAL_TELEGRAM_BOT_TOKEN ausente")
         return
+
+    # Trava forte dentro do processo: impede dois roteadores centrais usando o mesmo token.
+    with CENTRAL_TELEGRAM_ROUTER_LOCK:
+        if CENTRAL_TELEGRAM_ROUTER_STARTED:
+            print("ROTEADOR TELEGRAM CENTRAL JÁ INICIADO - ignorando segunda thread")
+            return
+        CENTRAL_TELEGRAM_ROUTER_STARTED = True
+
+    if CENTRAL_TELEGRAM_DROP_PENDING_ON_START and CENTRAL_TELEGRAM_OFFSET is None:
+        drained_offset = telegram_drain_pending_updates(token)
+        if drained_offset is not None:
+            CENTRAL_TELEGRAM_OFFSET = drained_offset
 
     print("ROTEADOR TELEGRAM CENTRAL QUANT INICIADO")
 
@@ -2589,6 +2611,10 @@ def central_telegram_command_loop():
                 if not text.startswith("/"):
                     continue
                 if allowed_chat and chat_id != str(allowed_chat):
+                    continue
+
+                if _is_duplicate_recent_central_command(chat_id, text):
+                    print(f"TELEGRAM CENTRAL: comando duplicado ignorado: chat={chat_id} text={text}")
                     continue
 
                 title = _central_command_title(text)
@@ -2717,6 +2743,60 @@ def telegram_get_updates_for_token(token, offset=None):
     except Exception as exc:
         return [], f"getUpdates: {exc}"
 
+
+
+def telegram_drain_pending_updates(token):
+    """
+    Ao iniciar/reiniciar a Central, limpa comandos pendentes do Telegram
+    sem responder a comandos antigos. Isso reduz duplicidade depois de deploy.
+    Não apaga webhook nem mensagens futuras; apenas avança o offset local.
+    """
+    if not token:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        r = requests.get(url, params={"timeout": 0}, timeout=10)
+        if r.status_code != 200:
+            print(f"WARNING TELEGRAM CENTRAL DRAIN: {r.status_code}: {r.text[:180]}")
+            return None
+        updates = r.json().get("result", []) or []
+        if not updates:
+            return None
+        max_update_id = max(int(u.get("update_id", 0) or 0) for u in updates)
+        next_offset = max_update_id + 1
+        print(f"TELEGRAM CENTRAL: pendentes ignorados no startup = {len(updates)} | next_offset={next_offset}")
+        return next_offset
+    except Exception as exc:
+        print("WARNING TELEGRAM CENTRAL DRAIN:", exc)
+        return None
+
+
+def _central_command_fingerprint(chat_id, text):
+    """Fingerprint curta para dedupe de comandos repetidos em poucos segundos."""
+    raw = (text or "").strip()
+    # Normaliza menção do bot e espaços, mas mantém argumentos.
+    parts = raw.split()
+    if parts:
+        parts[0] = parts[0].split("@", 1)[0]
+    normalized = " ".join(parts).lower()
+    return f"{chat_id}|{normalized}"
+
+
+def _is_duplicate_recent_central_command(chat_id, text):
+    now = time.time()
+    fp = _central_command_fingerprint(chat_id, text)
+
+    # limpeza leve para não crescer indefinidamente
+    expired = [k for k, ts in CENTRAL_TELEGRAM_RECENT_COMMANDS.items() if now - ts > max(60, CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS * 4)]
+    for k in expired[:200]:
+        CENTRAL_TELEGRAM_RECENT_COMMANDS.pop(k, None)
+
+    last = CENTRAL_TELEGRAM_RECENT_COMMANDS.get(fp)
+    if last is not None and now - last < CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS:
+        return True
+
+    CENTRAL_TELEGRAM_RECENT_COMMANDS[fp] = now
+    return False
 
 def split_telegram_text(text, limit=None):
     """Divide texto respeitando quebras de linha quando possível."""
