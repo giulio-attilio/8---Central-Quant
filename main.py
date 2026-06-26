@@ -37,9 +37,17 @@ import ctypes
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
-from flask import Flask
+from flask import Flask, request
 
 app = Flask(__name__)
+
+try:
+    import broker as central_broker
+except Exception as _broker_import_exc:
+    central_broker = None
+    BROKER_IMPORT_ERROR = str(_broker_import_exc)
+else:
+    BROKER_IMPORT_ERROR = None
 
 BOT_NAME = os.environ.get("BOT_NAME", "Central Quant PRO FULL")
 TIMEZONE_BR = timezone(timedelta(hours=-3))
@@ -93,6 +101,22 @@ CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_COMMAND_D
 GLOBAL_RISK_MAX_POSITIONS = int(os.environ.get("GLOBAL_RISK_MAX_POSITIONS", "50"))
 GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT = float(os.environ.get("GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT", "80"))
 GLOBAL_RISK_MAX_SYMBOL_EXPOSURE = int(os.environ.get("GLOBAL_RISK_MAX_SYMBOL_EXPOSURE", "3"))
+
+# Execução real / BingX.
+# ENABLE_REAL_TRADING=false é a trava global: mesmo se um robô estiver LIVE,
+# a Central bloqueia ordens reais enquanto esta variável não estiver true.
+ENABLE_REAL_TRADING = env_bool("ENABLE_REAL_TRADING", False)
+EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
+BINGX_READY_CHECK_ENABLED = env_bool("BINGX_READY_CHECK_ENABLED", True)
+REAL_TRADING_ALLOWED_BOTS = {
+    x.strip().upper() for x in os.environ.get("REAL_TRADING_ALLOWED_BOTS", "FALCON").split(",") if x.strip()
+}
+REAL_TRADING_ALLOWED_SYMBOLS = {
+    x.strip().upper() for x in os.environ.get("REAL_TRADING_ALLOWED_SYMBOLS", "").split(",") if x.strip()
+}
+REAL_TRADING_MAX_RISK_PCT = float(os.environ.get("REAL_TRADING_MAX_RISK_PCT", "3.0"))
+REAL_TRADING_MAX_NOTIONAL_USDT = float(os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "10"))
+REAL_TRADING_REQUIRE_READY = env_bool("REAL_TRADING_REQUIRE_READY", True)
 
 DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
 DAILY_HISTORY_DIR.mkdir(exist_ok=True)
@@ -1346,6 +1370,7 @@ def build_diagnostic_report():
         f"Sem erros críticos: {'✅' if all_errors_ok else '❌'}",
         f"Watchlists válidas: {'✅' if all_watchlists_ok else '❌'}",
         f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
+        f"Execução real: {'ATIVA' if ENABLE_REAL_TRADING else 'BLOQUEADA'} | Modo: {EXECUTION_MODE}",
         "",
         "EXPOSIÇÃO",
         f"Total: {total_pos} | LONG: {long_pos} | SHORT: {short_pos}",
@@ -1774,6 +1799,173 @@ def build_heatmap_report():
     return "\n".join(lines)
 
 
+
+# ==========================================================
+# EXECUTION / DECISIONAL RISK MANAGER
+# ==========================================================
+
+def normalize_symbol_for_risk(symbol):
+    s = str(symbol or "").upper().strip()
+    s = s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "")
+    return s
+
+
+def broker_status_payload():
+    """Status seguro do broker. Nunca expõe API key/secret."""
+    payload = {
+        "execution_mode": EXECUTION_MODE,
+        "enable_real_trading": ENABLE_REAL_TRADING,
+        "allowed_bots": sorted(list(REAL_TRADING_ALLOWED_BOTS)),
+        "allowed_symbols": sorted(list(REAL_TRADING_ALLOWED_SYMBOLS)),
+        "max_risk_pct": REAL_TRADING_MAX_RISK_PCT,
+        "max_notional_usdt": REAL_TRADING_MAX_NOTIONAL_USDT,
+        "broker_import_error": BROKER_IMPORT_ERROR,
+        "broker_loaded": central_broker is not None,
+    }
+    if central_broker is not None:
+        try:
+            payload["broker"] = central_broker.status_payload(check_ready=False)
+        except Exception as exc:
+            payload["broker"] = {"ok": False, "error": str(exc)}
+    return payload
+
+
+def bingx_ready_payload():
+    if central_broker is None:
+        return {"ok": False, "status": "BROKER_IMPORT_ERROR", "error": BROKER_IMPORT_ERROR}
+    try:
+        return central_broker.ready_check()
+    except Exception as exc:
+        return {"ok": False, "status": "READY_ERROR", "error": str(exc)}
+
+
+def can_open_trade_decision(payload: dict):
+    """
+    Risk Manager decisório da Central.
+    Retorna allow/deny para qualquer robô antes de abrir posição real.
+    """
+    payload = payload or {}
+    bot = str(payload.get("bot") or payload.get("robot") or "").upper().strip()
+    symbol = normalize_symbol_for_risk(payload.get("symbol"))
+    side = str(payload.get("side") or "").upper().strip()
+    mode = str(payload.get("mode") or payload.get("execution_mode") or EXECUTION_MODE).upper().strip()
+    intended_live = bool(payload.get("intended_live", mode == "LIVE"))
+    risk_pct = safe_round(payload.get("risk_pct"), 4, 0) or 0
+    notional = safe_round(payload.get("notional_usdt"), 4, 0) or 0
+
+    exposure_snapshot = central_exposure_snapshot()
+    rows = _all_open_positions_payload()
+    total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
+    long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
+    short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+
+    reasons = []
+    warnings = []
+
+    if not bot:
+        reasons.append("bot ausente")
+    if bot and bot not in BOT_CONFIGS:
+        reasons.append(f"bot inválido: {bot}")
+    if symbol and REAL_TRADING_ALLOWED_SYMBOLS and symbol not in REAL_TRADING_ALLOWED_SYMBOLS:
+        reasons.append(f"símbolo não liberado para real: {symbol}")
+    if intended_live:
+        if not ENABLE_REAL_TRADING:
+            reasons.append("ENABLE_REAL_TRADING=false")
+        if bot and bot not in REAL_TRADING_ALLOWED_BOTS:
+            reasons.append(f"bot não liberado para real: {bot}")
+        if REAL_TRADING_REQUIRE_READY:
+            ready = bingx_ready_payload()
+            if not ready.get("ok"):
+                reasons.append(f"BingX não está READY: {ready.get('status') or ready.get('error')}")
+
+    if total_pos >= GLOBAL_RISK_MAX_POSITIONS:
+        reasons.append(f"limite global de posições atingido: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+
+    if symbol:
+        same_symbol = [r for r in rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
+        if len(same_symbol) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
+            reasons.append(f"limite por ativo atingido em {symbol}: {len(same_symbol)}/{GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}")
+        same_bot_symbol = [r for r in same_symbol if str(r.get("bot") or "").upper() == bot]
+        if same_bot_symbol:
+            reasons.append(f"{bot} já possui exposição em {symbol}")
+
+    if side in {"LONG", "BUY"} and total_pos:
+        next_long = long_pos + 1
+        side_conc = next_long / max(total_pos + 1, 1) * 100
+        if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            reasons.append(f"concentração LONG ficaria {side_conc:.1f}%")
+    if side in {"SHORT", "SELL"} and total_pos:
+        next_short = short_pos + 1
+        side_conc = next_short / max(total_pos + 1, 1) * 100
+        if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            reasons.append(f"concentração SHORT ficaria {side_conc:.1f}%")
+
+    if risk_pct and risk_pct > REAL_TRADING_MAX_RISK_PCT:
+        reasons.append(f"risco acima do máximo real: {risk_pct}% > {REAL_TRADING_MAX_RISK_PCT}%")
+    if intended_live and notional and notional > REAL_TRADING_MAX_NOTIONAL_USDT:
+        reasons.append(f"notional acima do máximo real: {notional} > {REAL_TRADING_MAX_NOTIONAL_USDT} USDT")
+
+    # Avisos não bloqueantes.
+    if total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
+        warnings.append(f"exposição global alta: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+
+    allowed = len(reasons) == 0
+    return {
+        "allowed": allowed,
+        "decision": "ALLOW" if allowed else "DENY",
+        "bot": bot,
+        "symbol": symbol,
+        "side": side,
+        "mode": mode,
+        "intended_live": intended_live,
+        "reasons": reasons,
+        "warnings": warnings,
+        "exposure": {
+            "total": total_pos,
+            "long": long_pos,
+            "short": short_pos,
+            "max_positions": GLOBAL_RISK_MAX_POSITIONS,
+            "max_symbol_exposure": GLOBAL_RISK_MAX_SYMBOL_EXPOSURE,
+        },
+        "execution": broker_status_payload(),
+    }
+
+
+def build_execution_report():
+    status = broker_status_payload()
+    ready = bingx_ready_payload() if BINGX_READY_CHECK_ENABLED else {"ok": None, "status": "READY_CHECK_DISABLED"}
+    lines = [
+        "⚙️ EXECUÇÃO / BINGX — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Execution mode Central: {EXECUTION_MODE}",
+        f"ENABLE_REAL_TRADING: {ENABLE_REAL_TRADING}",
+        f"Bots liberados para real: {', '.join(status.get('allowed_bots') or [])}",
+        f"Símbolos liberados: {', '.join(status.get('allowed_symbols') or []) if status.get('allowed_symbols') else 'TODOS (respeitando risco)'}",
+        f"Max notional real: {REAL_TRADING_MAX_NOTIONAL_USDT} USDT",
+        f"Max risco real: {REAL_TRADING_MAX_RISK_PCT}%",
+        "",
+        f"Broker carregado: {status.get('broker_loaded')}",
+        f"Broker import error: {status.get('broker_import_error')}",
+        "",
+        "BingX READY:",
+        f"OK: {ready.get('ok')}",
+        f"Status: {ready.get('status')}",
+    ]
+    if ready.get("error"):
+        lines.append(f"Erro: {ready.get('error')}")
+    if ready.get("balance"):
+        bal = ready.get("balance") or {}
+        lines.append(f"Saldo USDT total/free: {bal.get('total_usdt')} / {bal.get('free_usdt')}")
+    lines += [
+        "",
+        "Estados seguros:",
+        "PAPER = não consulta execução real.",
+        "READY = valida API/saldo/permissões, mas não envia ordem.",
+        "LIVE = só envia ordem se ENABLE_REAL_TRADING=true e Risk Manager permitir.",
+    ]
+    return "\n".join(lines)
+
 def build_risk_report():
     exposure_snapshot = central_exposure_snapshot()
     rows = _all_open_positions_payload()
@@ -1803,7 +1995,7 @@ def build_risk_report():
             blocks.append(f"Evitar novas entradas em {sym}: {len(items)} exposições abertas.")
 
     lines = [
-        "🛡️ RISK MANAGER GLOBAL — MODO CONSULTIVO",
+        "🛡️ RISK MANAGER GLOBAL — DECISIONAL",
         f"Data/hora: {data_hora_sp_str()}",
         "",
         f"Posições: {total_pos} | LONG {long_pos} | SHORT {short_pos}",
@@ -1827,7 +2019,7 @@ def build_risk_report():
     lines += [
         "",
         "Importante:",
-        "Este Risk Manager ainda é consultivo. Para bloquear entradas reais, cada robô precisa consultar a Central antes de abrir posição.",
+        "Este Risk Manager já responde ALLOW/DENY em /can_open_trade. Para bloquear entradas reais, o robô precisa consultar esta rota antes de executar.",
     ]
     return "\n".join(lines)
 
@@ -1952,6 +2144,7 @@ def build_executive_report():
         f"Health Score: {score.get('score')}/100 — {score.get('label')}",
         f"Risco direcional: {risk_status}",
         f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
+        f"Execução real: {'ATIVA' if ENABLE_REAL_TRADING else 'BLOQUEADA'} | Modo: {EXECUTION_MODE}",
         "",
         "Exposição:",
         f"Total: {total_pos} | LONG: {long_pos} | SHORT: {short_pos}",
@@ -2114,6 +2307,9 @@ def build_dashboard_report():
         "",
         "==============================\nMEMÓRIA\n==============================",
         _brief_memory_text(),
+        "",
+        "==============================\nEXECUÇÃO / BINGX\n==============================",
+        build_execution_report(),
         "",
         "==============================\nRISK\n==============================",
         build_risk_report(),
@@ -2325,6 +2521,24 @@ def relatorio_completo_sem_espaco_route():
 
 
 
+@app.route("/execution")
+@app.route("/execucao")
+@app.route("/execução")
+@app.route("/bingx")
+def execution_route():
+    return {"text": build_execution_report(), "payload": broker_status_payload(), "ready": bingx_ready_payload()}
+
+
+@app.route("/can_open_trade", methods=["GET", "POST"])
+@app.route("/canopen", methods=["GET", "POST"])
+def can_open_trade_route():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = dict(request.args)
+    return can_open_trade_decision(payload)
+
+
 @app.route("/risk")
 @app.route("/riskmanager")
 def risk_route():
@@ -2415,7 +2629,7 @@ def build_central_help_text():
         "/audit — auditoria completa\n"
         "/full — dump completo com snapshot\n\n"
         "Operação:\n"
-        "/executive\n/selftest\n/diagnostico\n/memory\n/risk\n/heat\n/ranking\n/healthscore\n/meta\n/exposure\n/runners\n\n"
+        "/executive\n/selftest\n/diagnostico\n/memory\n/execution\n/bingx\n/risk\n/heat\n/ranking\n/healthscore\n/meta\n/exposure\n/runners\n\n"
         "Relatórios:\n"
         "/relatorio — resumo central\n"
         "/relatoriocompleto — pacote completo sem espaço\n"
@@ -2488,6 +2702,8 @@ def build_central_command_reply(text: str):
         return text_mem
     if cmd0 in {"/executive", "/dashboard"}:
         return build_executive_report()
+    if cmd0 in {"/execution", "/execucao", "/execução", "/bingx"}:
+        return build_execution_report()
     if cmd0 in {"/risk", "/riskmanager"}:
         return build_risk_report()
     if cmd0 in {"/heat", "/heatmap"}:
@@ -2896,6 +3112,8 @@ def build_command_reply_for_module(key: str, module, cmd: str):
 
     if cmd0 in {"/executive", "/dashboard"}:
         return build_executive_report()
+    if cmd0 in {"/execution", "/execucao", "/execução", "/bingx"}:
+        return build_execution_report()
     if cmd0 in {"/risk", "/riskmanager"}:
         return build_risk_report()
     if cmd0 in {"/heat", "/heatmap"}:
