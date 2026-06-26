@@ -60,6 +60,13 @@ MEMORY_PROFILE_BOT_STEPS = os.environ.get("MEMORY_PROFILE_BOT_STEPS", "false").s
 MEMORY_HISTORY = deque(maxlen=MEMORY_HISTORY_MAXLEN)
 MEMORY_LOCK = threading.Lock()
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
 # Telegram exclusivo da Central Quant.
 # Use um token diferente dos robôs e, se quiser, o mesmo CHAT_ID que você já usa.
 CENTRAL_TELEGRAM_BOT_TOKEN = os.environ.get("CENTRAL_TELEGRAM_BOT_TOKEN")
@@ -82,11 +89,6 @@ CENTRAL_DAILY_REPORT_SENT_DATE = None
 
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
 
 
 def agora_sp():
