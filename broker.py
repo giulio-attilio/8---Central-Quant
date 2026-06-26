@@ -25,8 +25,10 @@
 
 import hashlib
 import hmac
+import json
 import os
 import time
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
@@ -59,6 +61,12 @@ BROKER_DRY_RUN = env_bool("BROKER_DRY_RUN", EXECUTION_MODE != "LIVE" or not ENAB
 # Endpoint usado apenas para prévia/assinatura no VERIFY.
 # O envio real continua usando ccxt.create_order(), pois é mais seguro e padronizado.
 BINGX_SWAP_ORDER_ENDPOINT = "/openApi/swap/v2/trade/order"
+
+# Log local/ephemeral de execução. A Central lê este arquivo em /live, /sync e /executions.
+# Em Render, o filesystem é efêmero entre deploys/restarts; para auditoria permanente,
+# depois podemos migrar este log para Redis/Upstash.
+EXECUTIONS_LOG_FILE = os.environ.get("EXECUTIONS_LOG_FILE", "daily_history/executions_log.jsonl")
+EXECUTIONS_LOG_MAX_READ = int(os.environ.get("EXECUTIONS_LOG_MAX_READ", "50"))
 
 _exchange = None
 _last_ready = None
@@ -146,6 +154,53 @@ def sign_query(params: dict) -> tuple[str, str]:
         hashlib.sha256,
     ).hexdigest()
     return query, signature
+
+
+# ==============================================================================
+# EXECUTIONS LOG
+# ==============================================================================
+
+def _json_default(value):
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def log_execution_event(event: dict):
+    """Registra prévias VERIFY/DRY_RUN, ordens LIVE e erros do broker."""
+    try:
+        payload = dict(event or {})
+        payload.setdefault("ts", agora_sp_str())
+        payload.setdefault("execution_mode", EXECUTION_MODE)
+        payload.setdefault("enable_real_trading", ENABLE_REAL_TRADING)
+        path = Path(EXECUTIONS_LOG_FILE)
+        if path.parent:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def get_executions_log(limit: int = None):
+    """Retorna os últimos eventos de execução registrados pelo broker."""
+    try:
+        limit = int(limit or EXECUTIONS_LOG_MAX_READ)
+        path = Path(EXECUTIONS_LOG_FILE)
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                out.append({"raw": line})
+        return out
+    except Exception as exc:
+        return [{"ok": False, "error": str(exc)}]
 
 
 # ==============================================================================
@@ -491,9 +546,24 @@ def place_market_order(symbol, side, notional_usdt, reduce_only=False, client_ta
                 "sent": False,
                 "reason": "EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
             })
+            log_execution_event({
+                "event": "place_market_order",
+                "mode": EXECUTION_MODE,
+                "status": preview.get("status"),
+                "sent": False,
+                "symbol": preview.get("symbol"),
+                "side": preview.get("side"),
+                "notional_usdt": preview.get("notional_usdt"),
+                "amount": preview.get("amount"),
+                "price_ref": preview.get("price_ref"),
+                "client_order_id": preview.get("client_order_id"),
+                "latency_ms": preview.get("latency_ms"),
+                "payload": preview.get("payload"),
+                "signature_ok": preview.get("signature_ok"),
+            })
             return preview
         except Exception as exc:
-            return {
+            result = {
                 "ok": False,
                 "status": "DRY_RUN_ERROR",
                 "sent": False,
@@ -504,17 +574,21 @@ def place_market_order(symbol, side, notional_usdt, reduce_only=False, client_ta
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                 "reason": "falha ao montar prévia dry-run",
             }
+            log_execution_event({"event": "place_market_order", **result})
+            return result
 
     ready = ready_check(cache_seconds=0)
     if not ready.get("ok"):
-        return {"ok": False, "status": "NOT_READY", "sent": False, "symbol": sym, "error": ready.get("error"), "ready": ready}
+        result = {"ok": False, "status": "NOT_READY", "sent": False, "symbol": sym, "error": ready.get("error"), "ready": ready}
+        log_execution_event({"event": "place_market_order", **result})
+        return result
 
     try:
         preview = build_order_preview(sym, side, notional, reduce_only=reduce_only, client_tag=client_tag)
         amount = preview["amount"]
         price = preview["price_ref"]
     except Exception as exc:
-        return {
+        result = {
             "ok": False,
             "status": "PREVIEW_ERROR",
             "sent": False,
@@ -524,6 +598,8 @@ def place_market_order(symbol, side, notional_usdt, reduce_only=False, client_ta
             "error": str(exc),
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         }
+        log_execution_event({"event": "place_market_order", **result})
+        return result
 
     params = {}
     if reduce_only:
@@ -548,7 +624,7 @@ def place_market_order(symbol, side, notional_usdt, reduce_only=False, client_ta
 
         order = ex.create_order(sym, "market", order_side, amount, None, params)
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
-        return {
+        result = {
             "ok": True,
             "status": "SENT",
             "sent": True,
@@ -573,8 +649,10 @@ def place_market_order(symbol, side, notional_usdt, reduce_only=False, client_ta
             "leverage_set": leverage_set,
             "raw": order,
         }
+        log_execution_event({"event": "place_market_order", **{k: v for k, v in result.items() if k != "raw"}})
+        return result
     except Exception as exc:
-        return {
+        result = {
             "ok": False,
             "status": "ERROR",
             "sent": False,
@@ -588,6 +666,8 @@ def place_market_order(symbol, side, notional_usdt, reduce_only=False, client_ta
             "error": str(exc),
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         }
+        log_execution_event({"event": "place_market_order", **result})
+        return result
 
 
 def close_position_market(symbol, side, amount=None, notional_usdt=None):
@@ -600,7 +680,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
         amount, _price = amount_from_notional(sym, float(notional_usdt))
 
     if EXECUTION_MODE != "LIVE" or not ENABLE_REAL_TRADING or BROKER_DRY_RUN:
-        return {
+        result = {
             "ok": True,
             "status": "DRY_RUN",
             "sent": False,
@@ -611,12 +691,14 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "reduce_only": True,
             "reason": "EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
         }
+        log_execution_event({"event": "close_position_market", **result})
+        return result
 
     ex = exchange()
     started = time.perf_counter()
     try:
         order = ex.create_order(sym, "market", close_side, float(amount), None, {"reduceOnly": True})
-        return {
+        result = {
             "ok": True,
             "status": "SENT",
             "sent": True,
@@ -630,6 +712,8 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "raw": order,
         }
+        log_execution_event({"event": "close_position_market", **{k: v for k, v in result.items() if k != "raw"}})
+        return result
     except Exception as exc:
         return {
             "ok": False,
