@@ -1258,9 +1258,9 @@ def execution_mode_active():
 
 
 def predator_mode_label():
-    """Rótulo visual padronizado do modo operacional do Smart Predator."""
-    mode = str(PREDATOR_MODE or "PAPER").strip().upper()
+    """Rótulo operacional padronizado, igual ao padrão Falcon/Central Quant."""
     enable_real = env_bool("ENABLE_REAL_TRADING", False)
+    mode = str(PREDATOR_MODE or "PAPER").strip().upper()
 
     if mode == "LIVE" and enable_real:
         return "LIVE / BINGX ATIVA"
@@ -1270,11 +1270,7 @@ def predator_mode_label():
         return "VERIFY / VERIFY SEM ENVIO"
     if mode == "READY":
         return "READY / BINGX VALIDANDO"
-    if mode == "PAPER":
-        return "PAPER / SEM BINGX"
-
-    # Compatibilidade com o texto antigo do robô.
-    return "REAL" if SMART_PREDATOR_AUTO_TRADE else "OBSERVAÇÃO"
+    return "PAPER / SEM BINGX"
 
 
 def broker_ready_payload():
@@ -2400,6 +2396,80 @@ def montar_funnel_stats_texto():
         f"Última atualização: {s.get('last_update')}"
     )
 
+
+
+# Aliases usados pela Central Quant para puxar FUNIL do robô.
+# Mantém compatibilidade com o padrão Falcon/Turtle e evita aparecer N/A no /predator da Central.
+def funnel_text():
+    return montar_funnel_stats_texto()
+
+
+def funil_texto():
+    return montar_funnel_stats_texto()
+
+
+def build_funnel_text():
+    return montar_funnel_stats_texto()
+
+
+def montar_funil_texto():
+    return montar_funnel_stats_texto()
+
+
+def montar_funil():
+    return montar_funnel_stats_texto()
+
+
+def montar_eventos_texto(limit=20):
+    trades = carregar_trades()
+    if not isinstance(trades, list) or not trades:
+        return "📋 EVENTOS SMART PREDATOR\n\nNenhum evento registrado ainda."
+
+    recentes = trades[-int(limit):]
+    linhas = ["📋 EVENTOS SMART PREDATOR", ""]
+
+    for t in reversed(recentes):
+        try:
+            event = t.get("event", "N/A")
+            dt = t.get("datetime") or t.get("created_at_txt") or t.get("date", "")
+            symbol = t.get("symbol_clean") or nome_limpo(t.get("symbol", ""))
+            side = t.get("side", "")
+            setup = t.get("signal_type", "SMART_PREDATOR")
+
+            detalhe = ""
+            if event == "ENTRY":
+                detalhe = (
+                    f"Entrada {fmt_br(t.get('entry'))} | SL {fmt_br(t.get('sl'))} | "
+                    f"TP50 {fmt_br(t.get('tp50'))} | Score {t.get('score', 0)}"
+                )
+            elif event == "TP50":
+                detalhe = f"Preço {fmt_br(t.get('price'))} | TP50 {fmt_br(t.get('tp50'))}"
+            elif event == "TRAILING":
+                detalhe = f"SL {fmt_br(t.get('old_sl'))} → {fmt_br(t.get('new_sl'))}"
+            elif event in {"SL", "BE", "TRAIL", "CLOSE"}:
+                detalhe = f"Resultado {fmt_pct(t.get('pnl_pct', t.get('pnl', 0)))} | {fmt_r(t.get('pnl_r', 0))}"
+            else:
+                detalhe = f"MFE {fmt_pct(t.get('mfe_max_pct', 0))} | {fmt_r(t.get('mfe_max_r', 0))}"
+
+            linhas.append(f"{dt} | {event} | {symbol} {side} {setup}\n{detalhe}")
+            linhas.append("")
+        except Exception as exc:
+            linhas.append(f"Evento inválido: {exc}")
+
+    return "\n".join(linhas).strip()
+
+
+def events_text():
+    return montar_eventos_texto()
+
+
+def eventos_texto():
+    return montar_eventos_texto()
+
+
+def build_events_text():
+    return montar_eventos_texto()
+
 # ====================================================
 # WATCHDOG / HEALTH
 # ====================================================
@@ -2680,6 +2750,7 @@ def processar_comando(texto):
             "/mensal - resumo mensal\n"
             "/stats - estatísticas gerais\n"
             "/funil - funil do setup\n"
+            "/eventos - últimos eventos\n"
             "/ranking - ranking por ativo\n"
             "/execution - status execução VERIFY/LIVE\n"
             "/watchlist - ativos monitorados\n"
@@ -2710,6 +2781,9 @@ def processar_comando(texto):
 
     if cmd in ["/funil", "/funnel"]:
         return montar_funnel_stats_texto()
+
+    if cmd in ["/eventos", "/events"]:
+        return montar_eventos_texto()
 
     if cmd in ["/ranking", "/ativos"]:
         return "🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)
@@ -2943,6 +3017,16 @@ def funnel_rota():
 @app.route("/ranking")
 def ranking_rota():
     return ("🏆 RANKING SMART PREDATOR POR ATIVO\n\n" + asset_ranking_text(calc_predator_stats(carregar_trades())["exits"], 12)).replace("\n", "<br>")
+
+
+@app.route("/eventos")
+def eventos_rota():
+    return montar_eventos_texto().replace("\n", "<br>")
+
+
+@app.route("/events")
+def events_rota():
+    return montar_eventos_texto().replace("\n", "<br>")
 
 
 @app.route("/execution")
