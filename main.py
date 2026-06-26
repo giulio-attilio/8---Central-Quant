@@ -96,8 +96,8 @@ TELEGRAM_LONG_COMMAND_NOTICE = env_bool("TELEGRAM_LONG_COMMAND_NOTICE", True)
 CENTRAL_TELEGRAM_DROP_PENDING_ON_START = env_bool("CENTRAL_TELEGRAM_DROP_PENDING_ON_START", True)
 CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS", "10"))
 
-# Risk Manager Global em modo consultivo. Ele NÃO bloqueia execução sozinho.
-# Para bloquear entradas de verdade, cada robô precisa consultar a Central antes de abrir posição.
+# Risk Manager Global decisório. Ele responde ALLOW/DENY em /can_open_trade.
+# Em LIVE, o robô executa automaticamente se a Central aprovar e o kill switch estiver ligado.
 GLOBAL_RISK_MAX_POSITIONS = int(os.environ.get("GLOBAL_RISK_MAX_POSITIONS", "50"))
 GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT = float(os.environ.get("GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT", "80"))
 GLOBAL_RISK_MAX_SYMBOL_EXPOSURE = int(os.environ.get("GLOBAL_RISK_MAX_SYMBOL_EXPOSURE", "3"))
@@ -123,6 +123,8 @@ DAILY_HISTORY_DIR.mkdir(exist_ok=True)
 CENTRAL_TELEGRAM_OFFSET = None
 CENTRAL_TELEGRAM_PROCESSED_UPDATES = set()
 CENTRAL_TELEGRAM_RECENT_COMMANDS = {}
+CENTRAL_TELEGRAM_RECENT_SENDS = {}
+CENTRAL_SEND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_SEND_DUPLICATE_WINDOW_SECONDS", "8"))
 CENTRAL_TELEGRAM_ROUTER_STARTED = False
 CENTRAL_TELEGRAM_ROUTER_LOCK = threading.Lock()
 CENTRAL_DAILY_REPORT_SENT_DATE = None
@@ -1940,6 +1942,7 @@ def build_execution_report():
         "",
         f"Execution mode Central: {EXECUTION_MODE}",
         f"ENABLE_REAL_TRADING: {ENABLE_REAL_TRADING}",
+        f"Validação final: automática pelo robô + Risk Manager da Central",
         f"Bots liberados para real: {', '.join(status.get('allowed_bots') or [])}",
         f"Símbolos liberados: {', '.join(status.get('allowed_symbols') or []) if status.get('allowed_symbols') else 'TODOS (respeitando risco)'}",
         f"Max notional real: {REAL_TRADING_MAX_NOTIONAL_USDT} USDT",
@@ -1962,7 +1965,8 @@ def build_execution_report():
         "Estados seguros:",
         "PAPER = não consulta execução real.",
         "READY = valida API/saldo/permissões, mas não envia ordem.",
-        "LIVE = só envia ordem se ENABLE_REAL_TRADING=true e Risk Manager permitir.",
+        "VERIFY = monta/valida a ordem completa, mas não envia.",
+        "LIVE = envia automaticamente se ENABLE_REAL_TRADING=true e Risk Manager permitir.",
     ]
     return "\n".join(lines)
 
@@ -2288,17 +2292,24 @@ def _brief_memory_text():
 
 def build_dashboard_report():
     """
-    Painel operacional principal. Usa executive, diagnóstico, selftest,
-    memória, risk, heat, exposure e runners, mas evita JSON bruto para não
-    estourar o Telegram.
+    Painel operacional principal. Organização em blocos: OPERAÇÃO, SAÚDE e CARTEIRA.
+    Evita JSON bruto para não estourar o Telegram.
     """
     parts = [
         "📊 DASHBOARD CENTRAL QUANT",
         f"Data/hora: {data_hora_sp_str()}",
         "",
+        "==============================\nOPERAÇÃO\n==============================",
         "==============================\nEXECUTIVE\n==============================",
         build_executive_report(),
         "",
+        "==============================\nEXECUÇÃO / BINGX\n==============================",
+        build_execution_report(),
+        "",
+        "==============================\nRISK DECISIONAL\n==============================",
+        build_risk_report(),
+        "",
+        "==============================\nSAÚDE\n==============================",
         "==============================\nDIAGNÓSTICO\n==============================",
         build_diagnostic_report(),
         "",
@@ -2308,12 +2319,7 @@ def build_dashboard_report():
         "==============================\nMEMÓRIA\n==============================",
         _brief_memory_text(),
         "",
-        "==============================\nEXECUÇÃO / BINGX\n==============================",
-        build_execution_report(),
-        "",
-        "==============================\nRISK\n==============================",
-        build_risk_report(),
-        "",
+        "==============================\nCARTEIRA\n==============================",
         "==============================\nHEAT\n==============================",
         _short(build_heatmap_report(), 2600),
         "",
@@ -3036,6 +3042,24 @@ def split_telegram_text(text, limit=None):
     return chunks
 
 
+def _is_duplicate_recent_central_send(chat_id, full_text):
+    """Evita enviar exatamente a mesma mensagem duas vezes em poucos segundos."""
+    try:
+        now = time.time()
+        txt = str(full_text or "")
+        fp = f"{chat_id}|{hash(txt)}"
+        expired = [k for k, ts in CENTRAL_TELEGRAM_RECENT_SENDS.items() if now - ts > max(60, CENTRAL_SEND_DUPLICATE_WINDOW_SECONDS * 4)]
+        for k in expired[:200]:
+            CENTRAL_TELEGRAM_RECENT_SENDS.pop(k, None)
+        last = CENTRAL_TELEGRAM_RECENT_SENDS.get(fp)
+        if last is not None and now - last < CENTRAL_SEND_DUPLICATE_WINDOW_SECONDS:
+            return True
+        CENTRAL_TELEGRAM_RECENT_SENDS[fp] = now
+        return False
+    except Exception:
+        return False
+
+
 def telegram_send_with_token(token, chat_id, text, title=None):
     """
     Envia mensagens longas em partes. Aceita string ou lista de tuplas
@@ -3076,9 +3100,13 @@ def telegram_send_with_token(token, chat_id, text, title=None):
                 label = title or "CENTRAL QUANT"
                 prefix = f"📦 {label} — PARTE {i}/{total}\n\n" if total > 1 else f"📦 {label}\n\n"
             url = f"https://api.telegram.org/bot{token}/sendMessage"
+            full_message = prefix + chunk
+            if _is_duplicate_recent_central_send(chat_id, full_message):
+                print(f"TELEGRAM CENTRAL: envio duplicado ignorado chat={chat_id} title={title}")
+                continue
             payload = {
                 "chat_id": chat_id,
-                "text": prefix + chunk,
+                "text": full_message,
                 "disable_web_page_preview": True,
             }
             r = requests.post(url, json=payload, timeout=20)
