@@ -33,6 +33,7 @@ import gc
 import threading
 import requests
 import importlib.util
+import ctypes
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -155,6 +156,20 @@ def safe_round(value, ndigits=2, default=None):
 # MEMORY MONITOR
 # ==========================================================
 
+def malloc_trim_safe():
+    """
+    Tenta devolver memória livre do Python/glibc para o sistema operacional.
+    Em Render/Linux isso ajuda quando relatórios grandes aumentam o RSS.
+    Se não estiver disponível, falha silenciosamente.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+        return True
+    except Exception:
+        return False
+
+
 def current_rss_mb():
     """RSS real do processo em MB. Preferimos /proc/self/status no Linux/Render."""
     try:
@@ -218,6 +233,7 @@ def force_gc_if_needed(label="gc", force=False):
     collected = None
     if should_gc:
         collected = gc.collect()
+        malloc_trim_safe()
         time.sleep(0.05)
     after = memory_snapshot(
         f"{label}_after_gc",
@@ -234,6 +250,7 @@ def memory_status_payload(run_gc=False, label="/memory"):
     if run_gc or ((before.get("rss_mb") or 0) >= MEMORY_GC_THRESHOLD_MB):
         gc_executed = True
         collected = gc.collect()
+        malloc_trim_safe()
         time.sleep(0.05)
     after = memory_snapshot(
         f"{label}_after_gc",
@@ -1085,9 +1102,15 @@ def _bot_eventos_text(key: str, module):
 
 def _bot_resumo_text(key: str, module):
     def _run():
+        # Donkey tem resumo próprio. Usar montar_resumo_diario nele chama o bloco Trend
+        # e pode quebrar métricas específicas do Donkey.
+        if key == "DONKEY" and hasattr(module, "montar_resumo_donkey"):
+            return module.montar_resumo_donkey()
+
         if key in {"TURTLE", "FALCON"}:
             if hasattr(module, "build_summary") and hasattr(module, "trades_today"):
                 return module.build_summary("DIA", module.trades_today())
+
         return _call_first(module, [
             "montar_resumo_diario", "build_daily_summary", "summary_text", "build_summary_text", "resumo_texto"
         ])
@@ -2095,42 +2118,62 @@ def build_dashboard_report():
 
 def build_daily_report():
     """
-    Pacote ideal para colar no ChatGPT na avaliação diária.
-    Enxuto, sem JSON bruto, sem eventos completos e sem funis longos.
+    Pacote diário enxuto para colar no ChatGPT.
+    Mantém o essencial: estado operacional, risco, memória, exposição e resumos dos bots.
+    Evita selftest/diagnóstico completos e blocos repetidos para poupar memória/Telegram.
     """
-    parts = [
+    mem = memory_snapshot("daily_light_memory", store=True)
+    status = central_watchdog_status()
+    exposure_snapshot = central_exposure_snapshot()
+    open_runners = exposure_snapshot.get("open_runners") or {}
+    best = exposure_snapshot.get("best_open_runner") or {}
+
+    header = [
         "📅 RELATÓRIO DIÁRIO CONSOLIDADO — CENTRAL QUANT",
         f"Data/hora: {data_hora_sp_str()}",
         "",
-        "==============================\nEXECUTIVE\n==============================",
-        build_executive_report(),
+        "STATUS TÉCNICO",
+        f"Central: {status.get('status')} | OK: {status.get('ok')}",
+        f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%) | Threads: {mem.get('threads')}",
+        f"Motivos watchdog: {status.get('reasons', [])}",
         "",
-        "==============================\nDIAGNÓSTICO\n==============================",
-        build_diagnostic_report(),
-        "",
-        "==============================\nSELFTEST\n==============================",
-        build_selftest_report(),
-        "",
-        "==============================\nRISK\n==============================",
-        build_risk_report(),
-        "",
-        "==============================\nMEMÓRIA\n==============================",
-        _brief_memory_text(),
-        "",
-        "==============================\nEXPOSIÇÃO / RUNNERS\n==============================",
-        _brief_exposure_text(),
-        "",
-        "==============================\nRELATÓRIO CENTRAL\n==============================",
-        build_central_status_text(),
-        "",
-        "==============================\nRANKING\n==============================",
-        build_ranking_report(),
-        "",
-        "==============================\nMETA SUPERVISOR\n==============================",
-        build_meta_supervisor_report(),
-        "",
+        "EXPOSIÇÃO",
+        f"Total: {exposure_snapshot.get('total_positions_open')} | LONG: {exposure_snapshot.get('long_positions_open')} | SHORT: {exposure_snapshot.get('short_positions_open')}",
+        (
+            "Runners: "
+            f"1R={open_runners.get('runners_1r_open', 0)} | "
+            f"2R={open_runners.get('runners_2r_open', 0)} | "
+            f"3R={open_runners.get('runners_3r_open', 0)} | "
+            f"5R={open_runners.get('runners_5r_open', 0)} | "
+            f"10R={open_runners.get('runners_10r_open', 0)}"
+        ),
+    ]
+
+    if best:
+        header += [
+            "",
+            "Melhor runner:",
+            f"{best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')} | {best.get('runner_pct')}% | {best.get('runner_r')}R",
+        ]
+
+    # Risco enxuto, sem heatmap grande.
+    try:
+        risk_txt = _short(build_risk_report(), 1800)
+    except Exception as exc:
+        risk_txt = f"Erro ao gerar risk: {exc}"
+
+    try:
+        ranking_txt = _short(build_ranking_report(), 1200)
+    except Exception as exc:
+        ranking_txt = f"Erro ao gerar ranking: {exc}"
+
+    parts = [
+        "\n".join(header),
+        "==============================\nRISK\n==============================\n" + risk_txt,
+        "==============================\nRANKING\n==============================\n" + ranking_txt,
         "==============================\nRESUMOS DOS BOTS\n==============================",
     ]
+
     for key in BOT_CONFIGS.keys():
         module = LOADED_BOTS.get(key)
         cfg = BOT_CONFIGS.get(key, {})
@@ -2141,8 +2184,14 @@ def build_daily_report():
             resumo = _bot_resumo_text(key, module)
         except Exception as exc:
             resumo = f"Erro ao gerar resumo: {exc}"
-        parts.append(f"🤖 {key} — {cfg.get('name')}\n" + _short(resumo, 2200))
-    return "\n\n==============================\n".join(parts)
+
+        # Limite menor por bot para evitar /daily de 5+ partes.
+        parts.append(f"🤖 {key} — {cfg.get('name')}\n" + _short(resumo, 1400))
+
+    text = "\n\n==============================\n".join(parts)
+    force_gc_if_needed("daily_report_end", force=True)
+    return text
+
 
 def build_support_report():
     """
@@ -2488,6 +2537,13 @@ def _is_heavy_central_command(text: str):
     }
 
 
+
+def cmd0_safe(text: str):
+    try:
+        return (text or "").strip().lower().split()[0].split("@")[0].replace("/", "") or "command"
+    except Exception:
+        return "command"
+
 def central_telegram_command_loop():
     global CENTRAL_TELEGRAM_OFFSET
 
@@ -2545,6 +2601,12 @@ def central_telegram_command_loop():
                     memory_profile_step(f"central_telegram_after_{text.split()[0]}")
                     if reply:
                         telegram_send_with_token(token, chat_id, reply, title=title)
+                        try:
+                            del reply
+                        except Exception:
+                            pass
+                        if _is_heavy_central_command(text):
+                            force_gc_if_needed(f"central_telegram_after_{cmd0_safe(text)}", force=True)
                     else:
                         telegram_send_with_token(token, chat_id, "Comando não reconhecido. Use /help para ver os comandos.")
                 except Exception as exc:
@@ -2601,6 +2663,11 @@ def central_daily_report_loop():
                 else:
                     print("RELATÓRIO DIÁRIO CENTRAL NÃO ENVIADO: token/chat ausente")
 
+                try:
+                    del payload
+                except Exception:
+                    pass
+                force_gc_if_needed("central_daily_report_after_send", force=True)
                 CENTRAL_DAILY_REPORT_SENT_DATE = today
 
         except Exception as exc:
@@ -2694,7 +2761,14 @@ def telegram_send_with_token(token, chat_id, text, title=None):
                 header = f"📦 {title or 'RELATÓRIO CENTRAL'} — SEÇÃO {idx}/{total_sections}\n{section_title}\n\n"
                 ok = telegram_send_with_token(token, chat_id, header + str(section_text), title=None)
                 ok_all = ok_all and ok
+                try:
+                    del section_text
+                except Exception:
+                    pass
+                if idx % 3 == 0:
+                    force_gc_if_needed("telegram_sections", force=True)
                 time.sleep(0.35)
+            force_gc_if_needed("telegram_sections_done", force=True)
             return ok_all
 
         chunks = split_telegram_text(text, TELEGRAM_CHUNK_SIZE)
