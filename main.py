@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-26-CENTRAL-SUPERVISOR-DASHBOARD-DAILY-AUDIT-FULL
+# Versão: 2026-06-26-CENTRAL-SUPERVISOR-DASHBOARD-DAILY-AUDIT-FULL-CHUNKFIX
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -75,6 +75,10 @@ CENTRAL_TELEGRAM_POLLING_ENABLED = env_bool("CENTRAL_TELEGRAM_POLLING_ENABLED", 
 CENTRAL_DAILY_REPORT_ENABLED = env_bool("CENTRAL_DAILY_REPORT_ENABLED", True)
 CENTRAL_DAILY_REPORT_TIME = os.environ.get("CENTRAL_DAILY_REPORT_TIME", "23:55")
 CENTRAL_DAILY_REPORT_MODE = os.environ.get("CENTRAL_DAILY_REPORT_MODE", "executivo").strip().lower()
+
+# Telegram limita mensagens em ~4096 caracteres. Mantemos margem para cabeçalhos.
+TELEGRAM_CHUNK_SIZE = int(os.environ.get("TELEGRAM_CHUNK_SIZE", "3400"))
+TELEGRAM_LONG_COMMAND_NOTICE = env_bool("TELEGRAM_LONG_COMMAND_NOTICE", True)
 
 # Risk Manager Global em modo consultivo. Ele NÃO bloqueia execução sozinho.
 # Para bloquear entradas de verdade, cada robô precisa consultar a Central antes de abrir posição.
@@ -1998,11 +2002,45 @@ def build_simulate_report(arg=None):
 
 
 
+def _brief_exposure_text():
+    snap = central_exposure_snapshot()
+    runners = snap.get("open_runners") or {}
+    best = snap.get("best_open_runner") or {}
+    lines = [
+        "📌 EXPOSIÇÃO RESUMIDA",
+        f"Total: {snap.get('total_positions_open')} | LONG: {snap.get('long_positions_open')} | SHORT: {snap.get('short_positions_open')}",
+        (
+            "Runners: "
+            f"1R={runners.get('runners_1r_open', 0)} | "
+            f"2R={runners.get('runners_2r_open', 0)} | "
+            f"3R={runners.get('runners_3r_open', 0)} | "
+            f"5R={runners.get('runners_5r_open', 0)} | "
+            f"10R={runners.get('runners_10r_open', 0)}"
+        ),
+    ]
+    if best:
+        lines += [
+            "",
+            "Melhor runner:",
+            f"{best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')} | {best.get('runner_pct')}% | {best.get('runner_r')}R",
+        ]
+    return "\n".join(lines)
+
+
+def _brief_memory_text():
+    snap = memory_snapshot("brief_memory", store=True)
+    return (
+        "🧠 MEMÓRIA\n"
+        f"RSS: {snap.get('rss_mb')} MB ({snap.get('usage_pct')}%) | "
+        f"Threads: {snap.get('threads')} | Limite: {MEMORY_LIMIT_MB} MB"
+    )
+
+
 def build_dashboard_report():
     """
-    Painel operacional principal. Usa internamente executive, diagnóstico,
-    selftest, memória, risk, heat, exposure e runners, mas entrega em formato
-    consolidado para uso diário rápido.
+    Painel operacional principal. Usa executive, diagnóstico, selftest,
+    memória, risk, heat, exposure e runners, mas evita JSON bruto para não
+    estourar o Telegram.
     """
     parts = [
         "📊 DASHBOARD CENTRAL QUANT",
@@ -2018,27 +2056,23 @@ def build_dashboard_report():
         build_selftest_report(),
         "",
         "==============================\nMEMÓRIA\n==============================",
-        build_memory_text(run_gc=False)[0],
+        _brief_memory_text(),
         "",
         "==============================\nRISK\n==============================",
         build_risk_report(),
         "",
         "==============================\nHEAT\n==============================",
-        build_heatmap_report(),
+        _short(build_heatmap_report(), 2600),
         "",
-        "==============================\nEXPOSURE\n==============================",
-        json.dumps(central_exposure_snapshot(), ensure_ascii=False, indent=2, default=str),
-        "",
-        "==============================\nRUNNERS\n==============================",
-        json.dumps(runners(), ensure_ascii=False, indent=2, default=str),
+        "==============================\nEXPOSIÇÃO / RUNNERS\n==============================",
+        _brief_exposure_text(),
     ]
     return "\n\n".join(parts)
-
 
 def build_daily_report():
     """
     Pacote ideal para colar no ChatGPT na avaliação diária.
-    Mais enxuto que /full e menos técnico que /audit.
+    Enxuto, sem JSON bruto, sem eventos completos e sem funis longos.
     """
     parts = [
         "📅 RELATÓRIO DIÁRIO CONSOLIDADO — CENTRAL QUANT",
@@ -2047,11 +2081,20 @@ def build_daily_report():
         "==============================\nEXECUTIVE\n==============================",
         build_executive_report(),
         "",
+        "==============================\nDIAGNÓSTICO\n==============================",
+        build_diagnostic_report(),
+        "",
+        "==============================\nSELFTEST\n==============================",
+        build_selftest_report(),
+        "",
         "==============================\nRISK\n==============================",
         build_risk_report(),
         "",
         "==============================\nMEMÓRIA\n==============================",
-        build_memory_text(run_gc=False)[0],
+        _brief_memory_text(),
+        "",
+        "==============================\nEXPOSIÇÃO / RUNNERS\n==============================",
+        _brief_exposure_text(),
         "",
         "==============================\nRELATÓRIO CENTRAL\n==============================",
         build_central_status_text(),
@@ -2070,10 +2113,12 @@ def build_daily_report():
         if not module:
             parts.append(f"🤖 {key} — {cfg.get('name')}\nMódulo não carregado: {LOAD_ERRORS.get(key)}")
             continue
-        resumo = _bot_resumo_text(key, module)
-        parts.append(f"🤖 {key} — {cfg.get('name')}\n" + _short(resumo, 3500))
+        try:
+            resumo = _bot_resumo_text(key, module)
+        except Exception as exc:
+            resumo = f"Erro ao gerar resumo: {exc}"
+        parts.append(f"🤖 {key} — {cfg.get('name')}\n" + _short(resumo, 2200))
     return "\n\n==============================\n".join(parts)
-
 
 def build_support_report():
     """
@@ -2102,49 +2147,50 @@ def build_support_report():
     return "\n\n==============================\n".join(parts)
 
 
-def build_audit_report():
-    """
-    Auditoria técnica completa, mas ainda controlada para o Telegram.
-    """
+def build_audit_parts():
+    """Retorna seções independentes para envio em partes pelo Telegram."""
     parts = [
-        "🔍 AUDITORIA CENTRAL QUANT",
-        f"Data/hora: {data_hora_sp_str()}",
-        "",
-        "==============================\nDASHBOARD\n==============================",
-        build_dashboard_report(),
-        "",
-        "==============================\nRANKING\n==============================",
-        build_ranking_report(),
-        "",
-        "==============================\nHISTORY\n==============================",
-        build_history_report(),
-        "",
-        "==============================\nRELATÓRIO COMPLETO DOS BOTS\n==============================",
+        ("AUDITORIA — CENTRAL", "🔍 AUDITORIA CENTRAL QUANT\n" + f"Data/hora: {data_hora_sp_str()}"),
+        ("DASHBOARD", build_dashboard_report()),
+        ("RANKING", build_ranking_report()),
+        ("HISTORY", build_history_report()),
+        ("RISK", build_risk_report()),
+        ("HEAT", build_heatmap_report()),
+        ("EXPOSIÇÃO", _brief_exposure_text()),
     ]
     for key in BOT_CONFIGS.keys():
-        parts.append(build_single_bot_report(key, complete=True))
-    return "\n\n==============================\n".join(parts)
+        parts.append((f"BOT {key}", build_single_bot_report(key, complete=True)))
+    return parts
+
+
+def build_audit_report():
+    """
+    Auditoria técnica completa. Para HTTP devolve texto único; no Telegram
+    o roteador usa build_audit_parts() para enviar em partes.
+    """
+    return "\n\n==============================\n".join(
+        [f"==============================\n{title}\n==============================\n{text}" for title, text in build_audit_parts()]
+    )
+
+
+def build_full_parts():
+    """Modo nuclear em partes: snapshot + auditoria + relatório nativo."""
+    parts = [
+        ("FULL — SNAPSHOT", build_snapshot_report()),
+    ]
+    parts.extend(build_audit_parts())
+    parts.append(("RELATÓRIO COMPLETO NATIVO", build_central_report("completo")))
+    return parts
 
 
 def build_full_report():
     """
     Modo nuclear: salva snapshot e despeja praticamente tudo.
-    Pode virar muitas mensagens no Telegram.
+    Para Telegram, é enviado em partes por build_full_parts().
     """
-    parts = [
-        "💾 FULL DUMP CENTRAL QUANT",
-        f"Data/hora: {data_hora_sp_str()}",
-        "",
-        "==============================\nSNAPSHOT\n==============================",
-        build_snapshot_report(),
-        "",
-        "==============================\nAUDIT\n==============================",
-        build_audit_report(),
-        "",
-        "==============================\nRELATÓRIO COMPLETO NATIVO\n==============================",
-        build_central_report("completo"),
-    ]
-    return "\n\n".join(parts)
+    return "\n\n==============================\n".join(
+        [f"==============================\n{title}\n==============================\n{text}" for title, text in build_full_parts()]
+    )
 
 
 @app.route("/executive")
@@ -2183,7 +2229,7 @@ def full_route():
 @app.route("/relatoriocompleto")
 @app.route("/relatorio_completo")
 def relatorio_completo_sem_espaco_route():
-    return {"text": build_central_report("completo")}
+    return {"text": build_audit_report()}
 
 
 
@@ -2273,7 +2319,7 @@ def build_central_help_text():
         "🤖 CENTRAL QUANT — COMANDOS\n\n"
         "Pacotes principais:\n"
         "/dashboard — visão geral inteligente\n"
-        "/daily — relatório diário para avaliação\n"
+        "/daily — relatório diário enxuto para avaliação\n"
         "/support — troubleshooting técnico\n"
         "/audit — auditoria completa\n"
         "/full — dump completo com snapshot\n\n"
@@ -2304,12 +2350,12 @@ def build_central_command_reply(text: str):
         return build_daily_report()
     if cmd0 in {"/support"}:
         return build_support_report()
-    if cmd0 in {"/audit"}:
-        return build_audit_report()
+    if cmd0 in {"/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo"}:
+        return build_audit_parts()
     if cmd0 in {"/full"}:
-        return build_full_report()
+        return build_full_parts()
     if cmd0 in {"/relatoriocompleto", "/relatorio_completo"}:
-        return build_central_report("completo")
+        return build_audit_parts()
     if cmd0 in {"/trend", "/trendpro"}:
         return build_single_bot_report("TRENDPRO", complete=True)
     if cmd0 in {"/donkey"}:
@@ -2377,6 +2423,39 @@ def build_central_command_reply(text: str):
     return None
 
 
+def _central_command_title(text: str):
+    cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
+    mapping = {
+        "/dashboard": "DASHBOARD",
+        "/daily": "DAILY",
+        "/diario": "DAILY",
+        "/diário": "DAILY",
+        "/support": "SUPORTE",
+        "/audit": "AUDITORIA",
+        "/auditoria": "AUDITORIA",
+        "/relatoriocompleto": "AUDITORIA",
+        "/relatorio_completo": "AUDITORIA",
+        "/full": "FULL",
+        "/trend": "TRENDPRO",
+        "/donkey": "DONKEY",
+        "/cobra": "COBRA",
+        "/meme": "MEME",
+        "/predator": "PREDATOR",
+        "/turtle": "TURTLE",
+        "/falcon": "FALCON",
+    }
+    return mapping.get(cmd, "CENTRAL QUANT")
+
+
+def _is_heavy_central_command(text: str):
+    cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
+    return cmd in {
+        "/dashboard", "/daily", "/diario", "/diário", "/support",
+        "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
+        "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
+    }
+
+
 def central_telegram_command_loop():
     global CENTRAL_TELEGRAM_OFFSET
 
@@ -2412,42 +2491,26 @@ def central_telegram_command_loop():
                 if allowed_chat and chat_id != str(allowed_chat):
                     continue
 
-                memory_profile_step(f"central_telegram_before_{text.split()[0]}")
-                reply = build_central_command_reply(text)
-                memory_profile_step(f"central_telegram_after_{text.split()[0]}")
-                if reply:
-                    telegram_send_with_token(token, chat_id, reply)
+                title = _central_command_title(text)
+                try:
+                    if TELEGRAM_LONG_COMMAND_NOTICE and _is_heavy_central_command(text):
+                        telegram_send_with_token(token, chat_id, f"⏳ Gerando {title.lower()}...\nVou enviar em partes se ficar grande.")
+
+                    memory_profile_step(f"central_telegram_before_{text.split()[0]}")
+                    reply = build_central_command_reply(text)
+                    memory_profile_step(f"central_telegram_after_{text.split()[0]}")
+                    if reply:
+                        telegram_send_with_token(token, chat_id, reply, title=title)
+                    else:
+                        telegram_send_with_token(token, chat_id, "Comando não reconhecido. Use /help para ver os comandos.")
+                except Exception as exc:
+                    print("ERRO COMANDO CENTRAL:", text, exc)
+                    telegram_send_with_token(token, chat_id, f"⚠️ Erro ao executar {text}: {exc}")
         except Exception as exc:
             print("ERRO ROTEADOR TELEGRAM CENTRAL:", exc)
 
         time.sleep(2)
 
-
-def central_daily_report_loop():
-    global CENTRAL_DAILY_REPORT_SENT_DATE
-
-    if not CENTRAL_DAILY_REPORT_ENABLED:
-        return
-
-    while True:
-        try:
-            now = agora_sp()
-            current_hm = now.strftime("%H:%M")
-            today = now.strftime("%Y-%m-%d")
-            if current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
-                save_daily_snapshot(label="auto")
-                if CENTRAL_DAILY_REPORT_MODE in {"completo", "full", "audit", "auditoria"}:
-                    msg = build_central_report("completo")
-                elif CENTRAL_DAILY_REPORT_MODE in {"daily", "diario", "diário"}:
-                    msg = build_daily_report()
-                else:
-                    msg = build_dashboard_report()
-                if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
-                    telegram_send_with_token(CENTRAL_TELEGRAM_BOT_TOKEN, CENTRAL_TELEGRAM_CHAT_ID, msg)
-                CENTRAL_DAILY_REPORT_SENT_DATE = today
-        except Exception as exc:
-            print("ERRO RELATÓRIO DIÁRIO CENTRAL:", exc)
-        time.sleep(30)
 
 
 # ==========================================================
@@ -2491,22 +2554,72 @@ def telegram_get_updates_for_token(token, offset=None):
         return [], f"getUpdates: {exc}"
 
 
-def telegram_send_with_token(token, chat_id, text):
+def split_telegram_text(text, limit=None):
+    """Divide texto respeitando quebras de linha quando possível."""
+    limit = int(limit or TELEGRAM_CHUNK_SIZE or 3400)
+    txt = "" if text is None else str(text)
+    if len(txt) <= limit:
+        return [txt]
+
+    chunks = []
+    remaining = txt
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n", 0, limit)
+        if cut < int(limit * 0.55):
+            cut = remaining.rfind(" ", 0, limit)
+        if cut < int(limit * 0.55):
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def telegram_send_with_token(token, chat_id, text, title=None):
+    """
+    Envia mensagens longas em partes. Aceita string ou lista de tuplas
+    (titulo, texto). Loga falhas do Telegram em vez de silenciar.
+    """
     if not token or not chat_id:
         print(text)
         return False
     try:
-        partes = [str(text)[i:i + 3900] for i in range(0, len(str(text)), 3900)] or [""]
-        for parte in partes:
+        # Lista de seções: [(titulo, texto), ...]
+        if isinstance(text, list):
+            ok_all = True
+            total_sections = len(text)
+            for idx, item in enumerate(text, 1):
+                if isinstance(item, tuple) and len(item) == 2:
+                    section_title, section_text = item
+                else:
+                    section_title, section_text = f"PARTE {idx}", item
+                header = f"📦 {title or 'RELATÓRIO CENTRAL'} — SEÇÃO {idx}/{total_sections}\n{section_title}\n\n"
+                ok = telegram_send_with_token(token, chat_id, header + str(section_text), title=None)
+                ok_all = ok_all and ok
+                time.sleep(0.35)
+            return ok_all
+
+        chunks = split_telegram_text(text, TELEGRAM_CHUNK_SIZE)
+        total = len(chunks)
+        ok_all = True
+        for i, chunk in enumerate(chunks, 1):
+            prefix = ""
+            if title or total > 1:
+                label = title or "CENTRAL QUANT"
+                prefix = f"📦 {label} — PARTE {i}/{total}\n\n" if total > 1 else f"📦 {label}\n\n"
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             payload = {
                 "chat_id": chat_id,
-                "text": parte,
+                "text": prefix + chunk,
                 "disable_web_page_preview": True,
             }
-            requests.post(url, json=payload, timeout=15)
-            time.sleep(0.25)
-        return True
+            r = requests.post(url, json=payload, timeout=20)
+            if r.status_code != 200:
+                ok_all = False
+                print(f"ERRO TELEGRAM SEND {r.status_code}: {r.text[:300]}")
+            time.sleep(0.35)
+        return ok_all
     except Exception as exc:
         print("ERRO TELEGRAM CENTRAL ROUTER:", exc)
         return False
@@ -2555,12 +2668,12 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         return build_daily_report()
     if cmd0 in {"/support"}:
         return build_support_report()
-    if cmd0 in {"/audit"}:
-        return build_audit_report()
+    if cmd0 in {"/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo"}:
+        return build_audit_parts()
     if cmd0 in {"/full"}:
-        return build_full_report()
+        return build_full_parts()
     if cmd0 in {"/relatoriocompleto", "/relatorio_completo"}:
-        return build_central_report("completo")
+        return build_audit_parts()
     if cmd0 in {"/trend", "/trendpro"}:
         return build_single_bot_report("TRENDPRO", complete=True)
     if cmd0 in {"/donkey"}:
