@@ -4,7 +4,7 @@
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
-# - Suportar modos PAPER / READY / LIVE.
+# - Suportar modos PAPER / READY / VERIFY / LIVE.
 # - Nunca enviar ordem real se ENABLE_REAL_TRADING=false.
 # - Fornecer ready_check(), status_payload(), get_balance(), get_positions(),
 #   place_market_order() para a Central e para o Falcon.
@@ -13,7 +13,7 @@
 # - BINGX_API_KEY
 # - BINGX_API_SECRET
 # - ENABLE_REAL_TRADING=false
-# - EXECUTION_MODE=PAPER ou READY ou LIVE
+# - EXECUTION_MODE=PAPER ou READY ou VERIFY ou LIVE
 # - BINGX_DEFAULT_TYPE=swap
 # - BINGX_MARGIN_MODE=isolated ou cross
 # - BINGX_DEFAULT_LEVERAGE=1
