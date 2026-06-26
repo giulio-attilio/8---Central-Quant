@@ -89,6 +89,7 @@ GLOBAL_RISK_MAX_SYMBOL_EXPOSURE = int(os.environ.get("GLOBAL_RISK_MAX_SYMBOL_EXP
 DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
 DAILY_HISTORY_DIR.mkdir(exist_ok=True)
 CENTRAL_TELEGRAM_OFFSET = None
+CENTRAL_TELEGRAM_PROCESSED_UPDATES = set()
 CENTRAL_DAILY_REPORT_SENT_DATE = None
 
 
@@ -1041,33 +1042,56 @@ def _call_first(module, names, *args):
     return None
 
 
+def _call_bot_text_safely(key: str, label: str, func):
+    """
+    Executa chamadas de texto dos bots sem derrubar /audit, /daily ou /relatoriocompleto.
+
+    Alguns robôs podem ter bugs internos em comandos específicos (ex.: variável
+    ausente em resumo/funil/eventos). A Central deve registrar o erro naquela
+    seção e continuar gerando o relatório dos demais bots.
+    """
+    try:
+        value = func()
+        if value is None:
+            return "N/A"
+        return _json_or_text(value)
+    except Exception as exc:
+        return f"⚠️ Erro ao gerar {label} de {key}: {exc}"
+
+
 def _bot_funil_text(key: str, module):
-    if key == "TURTLE":
-        return _json_or_text(_call_first(module, ["funnel_text"]))
-    if key == "FALCON":
-        return _json_or_text(_call_first(module, ["funnel_text"]))
-    return _json_or_text(_call_first(module, [
-        "montar_funil_texto", "montar_funil", "funnel_text", "funil_texto", "build_funnel_text"
-    ]))
+    def _run():
+        if key == "TURTLE":
+            return _call_first(module, ["funnel_text"])
+        if key == "FALCON":
+            return _call_first(module, ["funnel_text"])
+        return _call_first(module, [
+            "montar_funil_texto", "montar_funil", "funnel_text", "funil_texto", "build_funnel_text"
+        ])
+    return _call_bot_text_safely(key, "funil", _run)
 
 
 def _bot_eventos_text(key: str, module):
-    if key == "TURTLE":
-        return _json_or_text(_call_first(module, ["events_text"]))
-    if key == "FALCON":
-        return _json_or_text(_call_first(module, ["events_text"]))
-    return _json_or_text(_call_first(module, [
-        "montar_eventos_texto", "events_text", "eventos_texto", "build_events_text"
-    ]))
+    def _run():
+        if key == "TURTLE":
+            return _call_first(module, ["events_text"])
+        if key == "FALCON":
+            return _call_first(module, ["events_text"])
+        return _call_first(module, [
+            "montar_eventos_texto", "events_text", "eventos_texto", "build_events_text"
+        ])
+    return _call_bot_text_safely(key, "eventos", _run)
 
 
 def _bot_resumo_text(key: str, module):
-    if key in {"TURTLE", "FALCON"}:
-        if hasattr(module, "build_summary") and hasattr(module, "trades_today"):
-            return module.build_summary("DIA", module.trades_today())
-    return _json_or_text(_call_first(module, [
-        "montar_resumo_diario", "build_daily_summary", "summary_text", "build_summary_text", "resumo_texto"
-    ]))
+    def _run():
+        if key in {"TURTLE", "FALCON"}:
+            if hasattr(module, "build_summary") and hasattr(module, "trades_today"):
+                return module.build_summary("DIA", module.trades_today())
+        return _call_first(module, [
+            "montar_resumo_diario", "build_daily_summary", "summary_text", "build_summary_text", "resumo_texto"
+        ])
+    return _call_bot_text_safely(key, "resumo", _run)
 
 
 def build_single_bot_report(key: str, complete: bool = True):
@@ -2159,7 +2183,11 @@ def build_audit_parts():
         ("EXPOSIÇÃO", _brief_exposure_text()),
     ]
     for key in BOT_CONFIGS.keys():
-        parts.append((f"BOT {key}", build_single_bot_report(key, complete=True)))
+        try:
+            bot_text = build_single_bot_report(key, complete=True)
+        except Exception as exc:
+            bot_text = f"⚠️ Erro ao gerar relatório completo de {key}: {exc}"
+        parts.append((f"BOT {key}", bot_text))
     return parts
 
 
@@ -2179,7 +2207,11 @@ def build_full_parts():
         ("FULL — SNAPSHOT", build_snapshot_report()),
     ]
     parts.extend(build_audit_parts())
-    parts.append(("RELATÓRIO COMPLETO NATIVO", build_central_report("completo")))
+    try:
+        native_report = build_central_report("completo")
+    except Exception as exc:
+        native_report = f"⚠️ Erro ao gerar relatório completo nativo: {exc}"
+    parts.append(("RELATÓRIO COMPLETO NATIVO", native_report))
     return parts
 
 
@@ -2481,7 +2513,19 @@ def central_telegram_command_loop():
                 continue
 
             for upd in updates:
-                CENTRAL_TELEGRAM_OFFSET = upd.get("update_id", 0) + 1
+                update_id = upd.get("update_id", 0)
+                CENTRAL_TELEGRAM_OFFSET = update_id + 1
+
+                # Dedupe dentro do mesmo processo. Ajuda a evitar resposta duplicada
+                # em reinícios rápidos ou quando o Telegram reentrega update.
+                if update_id in CENTRAL_TELEGRAM_PROCESSED_UPDATES:
+                    continue
+                CENTRAL_TELEGRAM_PROCESSED_UPDATES.add(update_id)
+                if len(CENTRAL_TELEGRAM_PROCESSED_UPDATES) > 500:
+                    # mantém o set pequeno para não crescer indefinidamente
+                    CENTRAL_TELEGRAM_PROCESSED_UPDATES.clear()
+                    CENTRAL_TELEGRAM_PROCESSED_UPDATES.add(update_id)
+
                 msg = upd.get("message") or {}
                 text = (msg.get("text") or "").strip()
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
