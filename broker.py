@@ -990,4 +990,3 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
         }
         log_execution_event({"event": "close_position_market", **result})
         return result
-
