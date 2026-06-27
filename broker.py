@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-06-26-BROKER-BINGX-SAFE-V1-PRECISION-FIX
+# Versão: 2026-06-27-BROKER-BINGX-SAFE-V1-MARGIN-LEVERAGE-FIX
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -56,8 +56,15 @@ BINGX_API_SECRET = os.environ.get("BINGX_API_SECRET") or os.environ.get("BINGX_S
 BINGX_DEFAULT_TYPE = os.environ.get("BINGX_DEFAULT_TYPE", "swap")
 BINGX_MARGIN_MODE = os.environ.get("BINGX_MARGIN_MODE", "isolated")
 BINGX_DEFAULT_LEVERAGE = int(os.environ.get("BINGX_DEFAULT_LEVERAGE", os.environ.get("DEFAULT_REAL_LEVERAGE", "3")))
-DEFAULT_REAL_MARGIN_USDT = float(os.environ.get("DEFAULT_REAL_MARGIN_USDT", os.environ.get("REAL_TRADING_MARGIN_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "20"))))
-DEFAULT_REAL_LEVERAGE = int(os.environ.get("DEFAULT_REAL_LEVERAGE", os.environ.get("REAL_TRADING_LEVERAGE", str(BINGX_DEFAULT_LEVERAGE))))
+DEFAULT_REAL_MARGIN_USDT = float(
+    os.environ.get(
+        "DEFAULT_REAL_MARGIN_USDT",
+        os.environ.get("REAL_TRADING_MARGIN_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "20")),
+    )
+)
+DEFAULT_REAL_LEVERAGE = int(
+    os.environ.get("DEFAULT_REAL_LEVERAGE", os.environ.get("REAL_TRADING_LEVERAGE", str(BINGX_DEFAULT_LEVERAGE)))
+)
 BINGX_TIMEOUT_MS = int(os.environ.get("BINGX_TIMEOUT_MS", "15000"))
 ENABLE_REAL_TRADING = env_bool("ENABLE_REAL_TRADING", False)
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
@@ -68,8 +75,6 @@ BROKER_DRY_RUN = env_bool("BROKER_DRY_RUN", EXECUTION_MODE != "LIVE" or not ENAB
 BINGX_SWAP_ORDER_ENDPOINT = "/openApi/swap/v2/trade/order"
 
 # Log local/ephemeral de execução. A Central lê este arquivo em /live, /sync e /executions.
-# Em Render, o filesystem é efêmero entre deploys/restarts; para auditoria permanente,
-# depois podemos migrar este log para Redis/Upstash.
 EXECUTIONS_LOG_FILE = os.environ.get("EXECUTIONS_LOG_FILE", "daily_history/executions_log.jsonl")
 EXECUTIONS_LOG_MAX_READ = int(os.environ.get("EXECUTIONS_LOG_MAX_READ", "50"))
 
@@ -316,7 +321,6 @@ def market_info(symbol):
     }
 
 
-
 def _bot_env_prefix(bot):
     bot = str(bot or "").upper().strip()
     aliases = {"TRENDPRO": "TREND", "SMARTPREDATOR": "PREDATOR", "SMART_PREDATOR": "PREDATOR"}
@@ -334,18 +338,22 @@ def execution_config_for_bot(bot=None, margin_usdt=None, leverage=None):
     prefix = _bot_env_prefix(bot)
     margin_env = os.environ.get(f"{prefix}_REAL_MARGIN_USDT") if prefix else None
     lev_env = os.environ.get(f"{prefix}_REAL_LEVERAGE") if prefix else None
+
     try:
         margin = float(margin_usdt if margin_usdt is not None else (margin_env if margin_env is not None else DEFAULT_REAL_MARGIN_USDT))
     except Exception:
         margin = DEFAULT_REAL_MARGIN_USDT
+
     try:
         lev = int(leverage if leverage is not None else (lev_env if lev_env is not None else DEFAULT_REAL_LEVERAGE))
     except Exception:
         lev = DEFAULT_REAL_LEVERAGE
+
     if margin <= 0:
         margin = DEFAULT_REAL_MARGIN_USDT
     if lev <= 0:
         lev = DEFAULT_REAL_LEVERAGE
+
     return {
         "bot": prefix or None,
         "margin_usdt": float(margin),
@@ -354,28 +362,43 @@ def execution_config_for_bot(bot=None, margin_usdt=None, leverage=None):
         "margin_mode": BINGX_MARGIN_MODE,
     }
 
+
 def amount_from_notional(symbol, notional_usdt):
     """
-    Calcula quantidade a partir do notional e retorna detalhes de arredondamento.
-    Mantém compatibilidade: pode ser usado como amount, price = amount_from_notional(...)
-    porque retorna um dict apenas por função nova amount_details(); esta aqui segue tupla.
+    Calcula quantidade a partir do notional e retorna tupla:
+    (amount, price_ref)
     """
     details = amount_details(symbol, notional_usdt)
     return details["amount"], details["price_ref"]
 
 
-def amount_details(symbol, notional_usdt):
+def amount_details(symbol, notional_usdt, margin_usdt=None, leverage=None):
+    """
+    Calcula amount/quantidade com base no notional efetivo.
+
+    Correção importante:
+    - Esta função NÃO usa mais variáveis soltas `margin` ou `lev`.
+    - margin_usdt/leverage são opcionais e entram apenas como metadados.
+    - O cálculo da quantidade usa sempre notional_usdt recebido.
+    """
     sym = normalize_symbol(symbol)
     price = fetch_last_price(sym)
     if price <= 0:
         raise RuntimeError(f"preço inválido para {symbol}: {price}")
+
     notional = float(notional_usdt)
     raw_amount = notional / price
+
     ex = exchange()
     market = None
     amount = raw_amount
     precision_error = None
+
     try:
+        try:
+            ex.load_markets()
+        except Exception:
+            pass
         market = ex.market(sym)
         amount = float(ex.amount_to_precision(market["symbol"], raw_amount))
     except Exception as exc:
@@ -389,9 +412,9 @@ def amount_details(symbol, notional_usdt):
         "ok": True,
         "symbol": sym,
         "bingx_symbol": bingx_api_symbol(sym),
-        "margin_usdt": margin,
-        "leverage": lev,
-        "notional_usdt": effective_notional,
+        "margin_usdt": margin_usdt,
+        "leverage": leverage,
+        "notional_usdt": notional,
         "price_ref": price,
         "amount_raw": raw_amount,
         "amount": amount,
@@ -455,12 +478,13 @@ def build_order_preview(symbol, side, margin_usdt=None, reduce_only=False, clien
     sym = normalize_symbol(symbol)
     order_side = normalize_side(side)
     api_side = bingx_api_side(side)
+
     cfg = execution_config_for_bot(bot=bot, margin_usdt=margin_usdt, leverage=leverage)
     margin = cfg["margin_usdt"]
     lev = cfg["leverage"]
     effective_notional = float(notional_usdt) if notional_usdt is not None else cfg["effective_notional_usdt"]
 
-    details = amount_details(sym, effective_notional)
+    details = amount_details(sym, effective_notional, margin_usdt=margin, leverage=lev)
     amount = details["amount"]
     price = details["price_ref"]
     market = details.get("market") or {}
@@ -523,10 +547,6 @@ def build_order_preview(symbol, side, margin_usdt=None, reduce_only=False, clien
         "amount": amount,
         "effective_notional_usdt": details.get("effective_notional_usdt"),
         "margin_mode": BINGX_MARGIN_MODE,
-        "leverage": lev,
-        # Compatibilidade com os robôs/Falcon/Predator:
-        # alguns relatórios leem broker_result["precision"] esperando detalhes
-        # do cálculo da quantidade, e não apenas a precisão crua do market.
         "precision": {
             "amount_raw": details.get("amount_raw"),
             "amount_final": amount,
@@ -576,7 +596,7 @@ def format_order_preview_text(preview: dict, title: str = "🧪 VERIFY BINGX") -
         f"Side: {preview.get('api_side')} | Type: MARKET | ReduceOnly: {preview.get('reduce_only')}\n"
         f"Margin: {preview.get('margin_mode')} | Leverage: {preview.get('leverage')}x\n"
         f"Margem usada: {preview.get('margin_usdt')} USDT\n"
-        f"Exposição efetiva: {preview.get('effective_notional_usdt')} USDT\n\n"
+        f"Exposição efetiva: {preview.get('notional_usdt')} USDT\n\n"
         f"Preço ref.: {preview.get('price_ref')}\n"
         f"Quantidade raw: {preview.get('amount_raw')}\n"
         f"Quantidade enviada: {preview.get('amount')}\n"
@@ -604,17 +624,37 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
     started = time.perf_counter()
     sym = normalize_symbol(symbol)
     order_side = normalize_side(side)
+
     cfg = execution_config_for_bot(bot=bot, margin_usdt=margin_usdt, leverage=leverage)
     margin = cfg["margin_usdt"]
     lev = cfg["leverage"]
     effective_notional = float(notional_usdt) if notional_usdt is not None else cfg["effective_notional_usdt"]
+
     if margin <= 0 or effective_notional <= 0:
-        return {"ok": False, "status": "REJECTED", "sent": False, "error": "margin/effective_notional inválido", "symbol": sym}
+        return {
+            "ok": False,
+            "status": "REJECTED",
+            "sent": False,
+            "error": "margin/effective_notional inválido",
+            "symbol": sym,
+            "margin_usdt": margin,
+            "leverage": lev,
+            "notional_usdt": effective_notional,
+        }
 
     # PAPER/READY/VERIFY nunca enviam ordem real.
     if EXECUTION_MODE != "LIVE" or not ENABLE_REAL_TRADING or BROKER_DRY_RUN:
         try:
-            preview = build_order_preview(sym, side, margin, reduce_only=reduce_only, client_tag=client_tag, leverage=lev, bot=bot, notional_usdt=effective_notional)
+            preview = build_order_preview(
+                sym,
+                side,
+                margin_usdt=margin,
+                reduce_only=reduce_only,
+                client_tag=client_tag,
+                leverage=lev,
+                bot=bot,
+                notional_usdt=effective_notional,
+            )
             preview.update({
                 "status": "DRY_RUN" if EXECUTION_MODE != "VERIFY" else "VERIFY",
                 "sent": False,
@@ -650,8 +690,8 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
                 "symbol": sym,
                 "side": order_side,
                 "margin_usdt": margin,
-        "leverage": lev,
-        "notional_usdt": effective_notional,
+                "leverage": lev,
+                "notional_usdt": effective_notional,
                 "error": str(exc),
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                 "reason": "falha ao montar prévia dry-run",
@@ -666,7 +706,16 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
         return result
 
     try:
-        preview = build_order_preview(sym, side, margin, reduce_only=reduce_only, client_tag=client_tag, leverage=lev, bot=bot, notional_usdt=effective_notional)
+        preview = build_order_preview(
+            sym,
+            side,
+            margin_usdt=margin,
+            reduce_only=reduce_only,
+            client_tag=client_tag,
+            leverage=lev,
+            bot=bot,
+            notional_usdt=effective_notional,
+        )
         amount = preview["amount"]
         price = preview["price_ref"]
     except Exception as exc:
@@ -677,8 +726,8 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
             "symbol": sym,
             "side": order_side,
             "margin_usdt": margin,
-        "leverage": lev,
-        "notional_usdt": effective_notional,
+            "leverage": lev,
+            "notional_usdt": effective_notional,
             "error": str(exc),
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         }
@@ -721,12 +770,11 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
             "side": order_side,
             "api_side": bingx_api_side(side),
             "margin_usdt": margin,
-        "leverage": lev,
-        "notional_usdt": effective_notional,
+            "leverage": lev,
+            "notional_usdt": effective_notional,
             "amount": amount,
             "price_ref": price,
             "margin_mode": BINGX_MARGIN_MODE,
-            "leverage": lev,
             "reduce_only": bool(reduce_only),
             "client_tag": client_tag,
             "client_order_id": preview.get("client_order_id"),
@@ -746,8 +794,8 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
             "bingx_symbol": bingx_api_symbol(sym),
             "side": order_side,
             "margin_usdt": margin,
-        "leverage": lev,
-        "notional_usdt": effective_notional,
+            "leverage": lev,
+            "notional_usdt": effective_notional,
             "amount": preview.get("amount") if isinstance(preview, dict) else None,
             "price_ref": preview.get("price_ref") if isinstance(preview, dict) else None,
             "preview": preview if isinstance(preview, dict) else None,
@@ -814,3 +862,4 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "error": str(exc),
         }
+
