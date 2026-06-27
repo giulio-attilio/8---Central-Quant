@@ -111,7 +111,9 @@ SMART_PREDATOR_AUTO_TRADE = os.environ.get("SMART_PREDATOR_AUTO_TRADE", "false")
 # VERIFY = consulta Risk Manager, monta ordem completa, NÃO envia ordem real.
 # LIVE   = envia automaticamente se ENABLE_REAL_TRADING=true e Risk Manager permitir.
 PREDATOR_MODE = os.environ.get("PREDATOR_MODE", os.environ.get("SMART_PREDATOR_MODE", "PAPER")).strip().upper()
-PREDATOR_REAL_NOTIONAL_USDT = float(os.environ.get("PREDATOR_REAL_NOTIONAL_USDT", os.environ.get("SMART_PREDATOR_REAL_NOTIONAL_USDT", "10")))
+PREDATOR_REAL_MARGIN_USDT = float(os.environ.get("PREDATOR_REAL_MARGIN_USDT", os.environ.get("SMART_PREDATOR_REAL_MARGIN_USDT", os.environ.get("DEFAULT_REAL_MARGIN_USDT", os.environ.get("REAL_TRADING_MARGIN_USDT", os.environ.get("PREDATOR_REAL_NOTIONAL_USDT", "20"))))))
+PREDATOR_REAL_LEVERAGE = int(os.environ.get("PREDATOR_REAL_LEVERAGE", os.environ.get("SMART_PREDATOR_REAL_LEVERAGE", os.environ.get("DEFAULT_REAL_LEVERAGE", os.environ.get("REAL_TRADING_LEVERAGE", "3")))))
+PREDATOR_REAL_NOTIONAL_USDT = PREDATOR_REAL_MARGIN_USDT * PREDATOR_REAL_LEVERAGE
 PREDATOR_MAX_REAL_POSITIONS = int(os.environ.get("PREDATOR_MAX_REAL_POSITIONS", "1"))
 PREDATOR_REQUIRE_CENTRAL_RISK = env_bool("PREDATOR_REQUIRE_CENTRAL_RISK", True)
 PREDATOR_EXECUTION_NOTIFY = env_bool("PREDATOR_EXECUTION_NOTIFY", True)
@@ -1296,6 +1298,8 @@ def central_can_open_trade(sig):
         "setup": "SMART_PREDATOR",
         "score": sig.get("score"),
         "risk_pct": sig.get("risk_pct"),
+        "margin_usdt": PREDATOR_REAL_MARGIN_USDT,
+        "leverage": PREDATOR_REAL_LEVERAGE,
         "notional_usdt": PREDATOR_REAL_NOTIONAL_USDT,
         "mode": PREDATOR_MODE,
         "source": "smart_predator",
@@ -1357,7 +1361,9 @@ def build_predator_execution_message(sig, risk, broker_result=None, ready=None, 
 
     amount = broker_result.get("amount")
     price_ref = broker_result.get("price_ref")
-    notional = broker_result.get("notional_usdt", PREDATOR_REAL_NOTIONAL_USDT)
+    margin = broker_result.get("margin_usdt", PREDATOR_REAL_MARGIN_USDT)
+    leverage = broker_result.get("leverage", PREDATOR_REAL_LEVERAGE)
+    notional = broker_result.get("effective_notional_usdt", broker_result.get("notional_usdt", PREDATOR_REAL_NOTIONAL_USDT))
     payload = broker_result.get("request_preview") or broker_result.get("payload_preview") or broker_result.get("payload") or {}
     precision = broker_result.get("precision") or {}
     latency = broker_result.get("latency_ms") or broker_result.get("elapsed_ms")
@@ -1406,10 +1412,11 @@ def build_predator_execution_message(sig, risk, broker_result=None, ready=None, 
     lines += [
         "",
         "Ordem planejada:",
-        f"Notional: {notional} USDT",
+        f"Margem usada: {margin} USDT",
+        f"Alavancagem: {leverage}x",
+        f"Exposição efetiva: {notional} USDT",
         f"Preço ref: {price_ref}",
         f"Quantidade: {amount}",
-        f"Leverage: {getattr(bingx_broker, 'BINGX_DEFAULT_LEVERAGE', 'N/A') if bingx_broker else 'N/A'}x",
         f"Margin: {getattr(bingx_broker, 'BINGX_MARGIN_MODE', 'N/A') if bingx_broker else 'N/A'}",
         f"ReduceOnly: False",
         f"Client tag: PREDATOR-{symbol}-{int(time.time())}",
@@ -1455,6 +1462,8 @@ def update_position_execution_fields(sig, risk, broker_result):
         p["execution_decision"] = risk.get("decision", "ALLOW" if risk.get("allowed") else "DENY")
         p["execution_allowed"] = bool(risk.get("allowed"))
         p["execution_checked_at"] = data_hora_sp_str()
+        p["execution_margin_usdt"] = PREDATOR_REAL_MARGIN_USDT
+        p["execution_leverage"] = PREDATOR_REAL_LEVERAGE
         p["execution_notional_usdt"] = PREDATOR_REAL_NOTIONAL_USDT
         p["execution_status"] = broker_result.get("status") if isinstance(broker_result, dict) else None
         p["execution_sent"] = bool(broker_result.get("sent")) if isinstance(broker_result, dict) else False
@@ -1484,16 +1493,18 @@ def execute_predator_signal_safe(sig):
     elif bingx_broker is None:
         broker_result = {"ok": False, "status": "BROKER_IMPORT_ERROR", "sent": False, "error": BROKER_IMPORT_ERROR}
     elif PREDATOR_MODE == "READY":
-        broker_result = {"ok": True, "status": "READY_ONLY", "sent": False, "notional_usdt": PREDATOR_REAL_NOTIONAL_USDT}
+        broker_result = {"ok": True, "status": "READY_ONLY", "sent": False, "margin_usdt": PREDATOR_REAL_MARGIN_USDT, "leverage": PREDATOR_REAL_LEVERAGE, "notional_usdt": PREDATOR_REAL_NOTIONAL_USDT, "effective_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT}
     else:
         client_tag = f"PREDATOR-{nome_limpo(sig.get('symbol'))}-{int(time.time())}"
         try:
             broker_result = bingx_broker.place_market_order(
                 sig.get("symbol"),
                 sig.get("side"),
-                PREDATOR_REAL_NOTIONAL_USDT,
+                PREDATOR_REAL_MARGIN_USDT,
                 reduce_only=False,
                 client_tag=client_tag,
+                leverage=PREDATOR_REAL_LEVERAGE,
+                bot="PREDATOR",
             )
         except Exception as exc:
             broker_result = {"ok": False, "status": "BROKER_EXCEPTION", "sent": False, "error": str(exc)}
@@ -1517,7 +1528,9 @@ def montar_execution_status_texto():
         "⚙️ EXECUÇÃO SMART PREDATOR\n\n"
         f"Modo Predator: {PREDATOR_MODE}\n"
         f"Central URL: {CENTRAL_BASE_URL}\n"
-        f"Notional real: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n"
+        f"Margem real: {PREDATOR_REAL_MARGIN_USDT} USDT\n"
+        f"Alavancagem real: {PREDATOR_REAL_LEVERAGE}x\n"
+        f"Exposição efetiva: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n"
         f"Max posições LIVE Predator: {PREDATOR_MAX_REAL_POSITIONS}\n"
         f"Central Risk obrigatório: {PREDATOR_REQUIRE_CENTRAL_RISK}\n\n"
         f"Broker carregado: {bingx_broker is not None}\n"
@@ -1643,6 +1656,8 @@ def registrar_posicao(s):
         "execution_mode": PREDATOR_MODE,
         "execution_decision": None,
         "execution_allowed": None,
+        "execution_margin_usdt": PREDATOR_REAL_MARGIN_USDT if execution_mode_active() else None,
+        "execution_leverage": PREDATOR_REAL_LEVERAGE if execution_mode_active() else None,
         "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT if execution_mode_active() else None,
         "execution_status": None,
         "execution_sent": False,
@@ -1676,6 +1691,8 @@ def registrar_posicao(s):
         "signal_type": "SMART_PREDATOR",
         "auto_trade": SMART_PREDATOR_AUTO_TRADE,
         "execution_mode": PREDATOR_MODE,
+        "execution_margin_usdt": PREDATOR_REAL_MARGIN_USDT if execution_mode_active() else None,
+        "execution_leverage": PREDATOR_REAL_LEVERAGE if execution_mode_active() else None,
         "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT if execution_mode_active() else None,
         "h4_context": s.get("h4_context"),
         "adx_h4": s.get("adx_h4"),
@@ -2628,6 +2645,8 @@ def montar_health_tecnico():
         "smart_predator_auto_trade": SMART_PREDATOR_AUTO_TRADE,
         "predator_mode": PREDATOR_MODE,
         "execution_enabled": execution_mode_active(),
+        "execution_margin_usdt": PREDATOR_REAL_MARGIN_USDT,
+        "execution_leverage": PREDATOR_REAL_LEVERAGE,
         "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT,
         "execution_last_decision": HEALTH.get("execution_last_decision"),
         "execution_last_result": HEALTH.get("execution_last_result"),
@@ -2696,7 +2715,9 @@ def montar_startup_message():
         f"Ativo para sinais: {check_bool(SMART_PREDATOR_ENABLED)}\n"
         f"Modo: {modo}\n"
         f"Execução segura: {PREDATOR_MODE}\n"
-        f"Notional VERIFY/LIVE: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n\n"
+        f"Margem VERIFY/LIVE: {PREDATOR_REAL_MARGIN_USDT} USDT\n"
+        f"Alavancagem: {PREDATOR_REAL_LEVERAGE}x\n"
+        f"Exposição efetiva: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n\n"
         f"Lógica:\n"
         f"Liquidity Sweep + CHOCH M15 + Order Block + Reteste\n\n"
         f"Filtros ativos:\n"
