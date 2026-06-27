@@ -1580,7 +1580,7 @@ def build_single_bot_report(key: str, complete: bool = True):
         resumo_v2 = transform_bot_summary_v2(key, resumo)
         executivo_v2 = build_strategy_executive_metrics_v2(key, resumo)
         if executivo_v2:
-            parts.append("📈 LEITURA EXECUTIVA V2.0\n" + _short(executivo_v2, 2200 if complete else 900))
+            parts.append(_short(executivo_v2, 2200 if complete else 900))
         parts.append("📊 RESUMO\n" + _short(resumo_v2, 3000 if complete else 1200))
 
     memory_profile_step(f"build_single_bot_report_end_{key}")
@@ -3414,11 +3414,48 @@ def build_dashboard_report():
     ]
     return "\n\n".join(parts)
 
+def _extract_daily_summary_core_v2(bot_key, resumo_text, max_len=900):
+    """
+    Resumo enxuto para /daily.
+    Prioriza números operacionais e evita blocos longos que causam corte no Telegram.
+    """
+    txt = transform_bot_summary_v2(bot_key, resumo_text or "")
+    if not txt:
+        return "N/A"
+
+    keep_prefixes = (
+        "Modo:", "Smart Predator ativo:", "Sinais", "LONG:", "SHORT:",
+        "Trades encerrados:", "Wins:", "Breakeven:", "Loss:",
+        "Win rate:", "Win rate sem BE:", "Profit Factor:",
+        "Eficiência do gerenciamento", "Lucro esperado", "Lucro médio após TP50",
+        "Captura do movimento:", "TP50", "BE hoje:", "Trailing", "Stops",
+        "Resultado financeiro:", "Maior lucro", "Maior perda",
+        "Lucro devolvido", "Grandes vencedores:", "3R+:", "5R+:", "10R+:",
+        "Melhor trade:", "Pior trade:", "Trades ainda ativos:", "Trades Smart Predator ainda ativos:"
+    )
+
+    linhas = []
+    for raw in str(txt).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith(("📊", "🦅", "🐢", "🐴", "📈", "🦈")):
+            continue
+        if any(line.startswith(pref) for pref in keep_prefixes):
+            linhas.append(line)
+
+    if not linhas:
+        linhas = [line.strip() for line in str(txt).splitlines() if line.strip()][:20]
+
+    out = "\n".join(linhas)
+    return _short(out, max_len)
+
+
 def build_daily_report():
     """
     Pacote diário enxuto para colar no ChatGPT.
-    Mantém o essencial: estado operacional, risco, memória, exposição e resumos dos bots.
-    Evita selftest/diagnóstico completos e blocos repetidos para poupar memória/Telegram.
+    V2.0: não tenta enviar o relatório completo dos robôs.
+    Envia leitura executiva + resumo compacto para evitar corte em parte 3/3.
     """
     mem = memory_snapshot("daily_light_memory", store=True)
     status = central_watchdog_status()
@@ -3454,14 +3491,13 @@ def build_daily_report():
             f"{best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')} | {best.get('runner_pct')}% | {best.get('runner_r')}R",
         ]
 
-    # Risco enxuto, sem heatmap grande.
     try:
-        risk_txt = _short(build_risk_report(), 1800)
+        risk_txt = _short(build_risk_report(), 1200)
     except Exception as exc:
         risk_txt = f"Erro ao gerar risk: {exc}"
 
     try:
-        ranking_txt = _short(build_ranking_report(), 1200)
+        ranking_txt = _short(build_ranking_report(), 900)
     except Exception as exc:
         ranking_txt = f"Erro ao gerar ranking: {exc}"
 
@@ -3469,7 +3505,7 @@ def build_daily_report():
         "\n".join(header),
         "==============================\nRISK\n==============================\n" + risk_txt,
         "==============================\nRANKING\n==============================\n" + ranking_txt,
-        "==============================\nRESUMOS DOS BOTS\n==============================",
+        "==============================\nROBÔS — LEITURA EXECUTIVA\n==============================",
     ]
 
     for key in BOT_CONFIGS.keys():
@@ -3478,24 +3514,25 @@ def build_daily_report():
         if not module:
             parts.append(f"🤖 {key} — {cfg.get('name')}\nMódulo não carregado: {LOAD_ERRORS.get(key)}")
             continue
+
         try:
             resumo = _bot_resumo_text(key, module)
         except Exception as exc:
             resumo = f"Erro ao gerar resumo: {exc}"
 
-        # Limite menor por bot para evitar /daily de 5+ partes.
-        resumo_v2 = transform_bot_summary_v2(key, resumo)
         executivo_v2 = build_strategy_executive_metrics_v2(key, resumo)
-        bloco_bot = f"🤖 {key} — {cfg.get('name')}\n"
+        bloco_bot = [f"🤖 {key} — {cfg.get('name')}"]
+
         if executivo_v2:
-            bloco_bot += "\n📈 LEITURA EXECUTIVA V2.0\n" + _short(executivo_v2, 1200) + "\n"
-        bloco_bot += "\n📊 RESUMO\n" + _short(resumo_v2, 1000)
-        parts.append(bloco_bot)
+            bloco_bot.append(_short(executivo_v2, 1200))
+        else:
+            bloco_bot.append(_extract_daily_summary_core_v2(key, resumo, max_len=900))
+
+        parts.append("\n".join(bloco_bot))
 
     text = "\n\n==============================\n".join(parts)
     force_gc_if_needed("daily_report_end", force=True)
     return text
-
 
 def build_support_report():
     """
