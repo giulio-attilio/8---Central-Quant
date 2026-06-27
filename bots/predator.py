@@ -1363,7 +1363,63 @@ def build_predator_execution_message(sig, risk, broker_result=None, ready=None, 
     price_ref = broker_result.get("price_ref")
     margin = broker_result.get("margin_usdt", PREDATOR_REAL_MARGIN_USDT)
     leverage = broker_result.get("leverage", PREDATOR_REAL_LEVERAGE)
-    notional = broker_result.get("effective_notional_usdt", broker_result.get("notional_usdt", PREDATOR_REAL_NOTIONAL_USDT))
+
+    planned_exposure = broker_result.get("planned_exposure_usdt", PREDATOR_REAL_NOTIONAL_USDT)
+    actual_exposure = broker_result.get(
+        "actual_exposure_usdt",
+        broker_result.get("effective_notional_usdt", broker_result.get("notional_usdt", planned_exposure))
+    )
+
+    def _num(value, default=None):
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    def _money(value, ndigits=2):
+        val = _num(value)
+        if val is None:
+            return "N/A"
+        return f"{val:.{ndigits}f}"
+
+    def _fmt_any(value, ndigits=8):
+        val = _num(value)
+        if val is None:
+            return "N/A"
+        txt = f"{val:.{ndigits}f}".rstrip("0").rstrip(".")
+        return txt if txt else "0"
+
+    margin_display = broker_result.get("margin_usdt_display") or _money(margin, 2)
+    planned_exposure_display = broker_result.get("planned_exposure_usdt_display") or _money(planned_exposure, 2)
+    actual_exposure_display = (
+        broker_result.get("actual_exposure_usdt_display")
+        or broker_result.get("effective_notional_usdt_display")
+        or _money(actual_exposure, 2)
+    )
+
+    free_balance = None
+    balance_after = None
+    try:
+        bal = (ready.get("balance") or {}) if isinstance(ready, dict) else {}
+        free_balance = broker_result.get("free_balance_usdt")
+        if free_balance is None:
+            free_balance = bal.get("free_usdt")
+        balance_after = broker_result.get("estimated_margin_after_open_usdt")
+        if balance_after is None and free_balance is not None:
+            balance_after = float(free_balance) - float(margin)
+    except Exception:
+        pass
+
+    risk_pct_val = _num(sig.get("risk_pct"))
+    max_loss_usdt = broker_result.get("estimated_max_loss_usdt")
+    if max_loss_usdt is None and risk_pct_val is not None and actual_exposure is not None:
+        try:
+            max_loss_usdt = float(actual_exposure) * (risk_pct_val / 100.0)
+        except Exception:
+            max_loss_usdt = None
+
     payload = broker_result.get("request_preview") or broker_result.get("payload_preview") or broker_result.get("payload") or {}
     precision = broker_result.get("precision") or {}
     latency = broker_result.get("latency_ms") or broker_result.get("elapsed_ms")
@@ -1412,11 +1468,15 @@ def build_predator_execution_message(sig, risk, broker_result=None, ready=None, 
     lines += [
         "",
         "Ordem planejada:",
-        f"Margem usada: {margin} USDT",
+        f"Margem usada: {margin_display} USDT",
         f"Alavancagem: {leverage}x",
-        f"Exposição efetiva: {notional} USDT",
-        f"Preço ref: {price_ref}",
-        f"Quantidade: {amount}",
+        f"Exposição planejada: {planned_exposure_display} USDT",
+        f"Exposição efetiva: {actual_exposure_display} USDT",
+        f"Preço ref: {_fmt_any(price_ref, 8)}",
+        f"Quantidade: {_fmt_any(amount, 8)}",
+        f"Valor da posição: {actual_exposure_display} USDT",
+        f"Perda máxima estimada: {_money(max_loss_usdt, 4)} USDT",
+        f"Saldo livre após abertura estimado: {_money(balance_after, 2)} USDT",
         f"Margin: {getattr(bingx_broker, 'BINGX_MARGIN_MODE', 'N/A') if bingx_broker else 'N/A'}",
         f"ReduceOnly: False",
         f"Client tag: PREDATOR-{symbol}-{int(time.time())}",
