@@ -1,13 +1,13 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-06-26-BROKER-BINGX-SAFE-V1-VERIFY-PAYLOAD
+# Versão: 2026-06-26-BROKER-BINGX-SAFE-V1-PRECISION-FIX
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
 # - Suportar modos PAPER / READY / VERIFY / LIVE.
 # - Nunca enviar ordem real se ENABLE_REAL_TRADING=false.
 # - Em VERIFY, montar uma prévia completa da ordem: preço, quantidade,
-#   precisão, margin mode, leverage, reduceOnly, clientOrderId, payload e
+#   precisão detalhada, margin mode, leverage, reduceOnly, clientOrderId, payload e
 #   assinatura HMAC, sem enviar a ordem.
 # - Em LIVE, enviar automaticamente apenas se EXECUTION_MODE=LIVE,
 #   ENABLE_REAL_TRADING=true e BROKER_DRY_RUN=false.
@@ -472,7 +472,25 @@ def build_order_preview(symbol, side, notional_usdt, reduce_only=False, client_t
         "effective_notional_usdt": details.get("effective_notional_usdt"),
         "margin_mode": BINGX_MARGIN_MODE,
         "leverage": BINGX_DEFAULT_LEVERAGE,
-        "precision": market.get("precision"),
+        # Compatibilidade com os robôs/Falcon/Predator:
+        # alguns relatórios leem broker_result["precision"] esperando detalhes
+        # do cálculo da quantidade, e não apenas a precisão crua do market.
+        "precision": {
+            "amount_raw": details.get("amount_raw"),
+            "amount_final": amount,
+            "amount": amount,
+            "price_ref": price,
+            "effective_notional_usdt": details.get("effective_notional_usdt"),
+            "market_symbol": market.get("symbol", sym),
+            "market_id": market.get("id"),
+            "amount_precision": market.get("amount_precision"),
+            "price_precision": market.get("price_precision"),
+            "min_amount": market.get("min_amount"),
+            "min_cost": market.get("min_cost"),
+            "precision_raw": market.get("precision"),
+            "limits_raw": market.get("limits"),
+            "precision_error": details.get("precision_error"),
+        },
         "limits": market.get("limits"),
         "amount_precision": market.get("amount_precision"),
         "price_precision": market.get("price_precision"),
@@ -559,6 +577,10 @@ def place_market_order(symbol, side, notional_usdt, reduce_only=False, client_ta
                 "client_order_id": preview.get("client_order_id"),
                 "latency_ms": preview.get("latency_ms"),
                 "payload": preview.get("payload"),
+                "precision": preview.get("precision"),
+                "market_id": preview.get("market_id"),
+                "market_symbol": preview.get("market_symbol"),
+                "effective_notional_usdt": preview.get("effective_notional_usdt"),
                 "signature_ok": preview.get("signature_ok"),
             })
             return preview
@@ -726,3 +748,4 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "error": str(exc),
         }
+
