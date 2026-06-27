@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-27-CENTRAL-V3-0-FINAL-STABLE
+# Versão: 2026-06-27-CENTRAL-V3-0-FINAL-STABLE-EVOLUTION
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -1279,23 +1279,29 @@ def _v3_classificar_captura(valor):
     if valor is None:
         return "⚪ N/A"
     if valor < 30:
-        return "🔴 Baixa"
+        return "🔴 Baixo"
     if valor < 45:
         return "🟡 Regular"
     if valor < 60:
-        return "🟢 Muito boa"
+        return "🟢 Muito bom"
     return "⭐ Excelente"
 
 
 def _v3_classificar_devolucao(valor):
+    """
+    Classificação V3.0 para lucro devolvido antes do fechamento.
+    Quanto menor a devolução, melhor.
+    """
     valor = abs(_v3_text_to_float(valor, 0.0))
-    if valor < 1:
+    if valor < 0.8:
         return "⭐ Excelente"
-    if valor < 2:
+    if valor < 1.5:
         return "🟢 Muito bom"
-    if valor < 3:
+    if valor < 2.5:
         return "🟡 Bom"
-    return "🔴 Alta"
+    if valor < 4.0:
+        return "🟠 Alto"
+    return "🔴 Muito alto"
 
 
 def _v3_ciclos_para_dias_horas(ciclos, bot_key=None, default_minutes=5):
@@ -1377,6 +1383,67 @@ def _v3_bot_metrics_from_summary(bot_key, summary_text):
     }
 
 
+
+def _v3_strategy_score_0_10(metrics):
+    pf = metrics.get("profit_factor")
+    lucro = metrics.get("lucro_esperado_pct")
+    eg = metrics.get("eficiencia")
+    cap = metrics.get("captura")
+    dev = metrics.get("devolucao")
+    score = 0.0
+    peso = 0.0
+
+    if pf is not None:
+        pf = _v3_text_to_float(pf, 0.0)
+        s = 0.0 if pf < 1.0 else (4.5 if pf < 1.3 else (7.5 if pf < 1.8 else 10.0))
+        score += s * 0.30
+        peso += 0.30
+
+    if lucro is not None:
+        lucro = _v3_text_to_float(lucro, 0.0)
+        s = 0.0 if lucro < 0 else (4.5 if lucro < 0.25 else (7.5 if lucro < 0.75 else 10.0))
+        score += s * 0.25
+        peso += 0.25
+
+    if eg is not None:
+        eg = _v3_text_to_float(eg, 0.0)
+        s = 2.0 if eg < 1.0 else (5.5 if eg < 1.5 else (7.5 if eg < 2.0 else 10.0))
+        score += s * 0.20
+        peso += 0.20
+
+    if cap is not None:
+        cap = _v3_text_to_float(cap, 0.0)
+        s = 3.0 if cap < 30 else (6.0 if cap < 45 else (8.0 if cap < 60 else 10.0))
+        score += s * 0.15
+        peso += 0.15
+
+    if dev is not None:
+        dev = abs(_v3_text_to_float(dev, 0.0))
+        s = 10.0 if dev < 0.8 else (8.0 if dev < 1.5 else (6.0 if dev < 2.5 else (3.0 if dev < 4.0 else 1.0)))
+        score += s * 0.10
+        peso += 0.10
+
+    if peso <= 0:
+        return None
+    return round(score / peso, 1)
+
+
+def _v3_note_label(score):
+    if score is None:
+        return "⚪ N/A"
+    try:
+        score = float(score)
+    except Exception:
+        return "⚪ N/A"
+    if score >= 8.5:
+        return "⭐⭐⭐⭐⭐ Excelente"
+    if score >= 7.0:
+        return "⭐⭐⭐⭐ Boa"
+    if score >= 5.0:
+        return "⭐⭐⭐ Regular"
+    return "⭐⭐ Atenção"
+
+
 def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
     """
     Camada única da Central V3.0.
@@ -1401,73 +1468,38 @@ def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
     lines = ["📈 QUALIDADE EXECUTIVA V3.0", ""]
 
     if m.get("profit_factor") is not None:
-        lines += [
-            "Profit Factor:",
-            f"{_v3_fmt_num(m.get('profit_factor'))} {_v3_classificar_profit_factor(m.get('profit_factor'))}",
-        ]
-        if not compact:
-            lines += [
-                "",
-                "Referência:",
-                "< 1,00 → perde dinheiro",
-                "1,00–1,30 → lucro baixo",
-                "1,30–1,80 → boa estratégia",
-                "> 1,80 → excelente estratégia",
-            ]
-        lines.append("")
+        lines += ["Profit Factor:", f"{_v3_fmt_num(m.get('profit_factor'))} {_v3_classificar_profit_factor(m.get('profit_factor'))}", ""]
 
     if m.get("eficiencia") is not None:
-        lines += [
-            "Eficiência do gerenciamento:",
-            f"{_v3_fmt_num(m.get('eficiencia'))} {_v3_classificar_gerenciamento(m.get('eficiencia'))}",
-        ]
+        lines += ["Eficiência do gerenciamento:", f"{_v3_fmt_num(m.get('eficiencia'))} {_v3_classificar_gerenciamento(m.get('eficiencia'))}"]
         if not compact:
-            lines += [
-                "Cada trade vencedor capturou, em média,",
-                f"{_v3_fmt_num(m.get('eficiencia'))} vezes o risco inicial.",
-            ]
+            lines += ["Cada trade vencedor capturou, em média,", f"{_v3_fmt_num(m.get('eficiencia'))} vezes o risco inicial."]
         lines.append("")
 
     if m.get("lucro_esperado_pct") is not None:
-        lines += [
-            "Lucro esperado por trade:",
-            f"{_v3_fmt_pct(m.get('lucro_esperado_pct'))} {_v3_classificar_lucro_pct(m.get('lucro_esperado_pct'))}",
-            "",
-        ]
+        lines += ["Lucro esperado por trade:", f"{_v3_fmt_pct(m.get('lucro_esperado_pct'))} {_v3_classificar_lucro_pct(m.get('lucro_esperado_pct'))}", ""]
 
     if not compact and m.get("expectancy_r") is not None:
-        lines += [
-            "Auditoria em R:",
-            f"Expectativa técnica: {_v3_fmt_num(m.get('expectancy_r'))}R",
-            "",
-        ]
+        lines += ["Auditoria em R:", f"Expectativa técnica: {_v3_fmt_num(m.get('expectancy_r'))}R", ""]
 
     if not compact and m.get("pos_tp50_r") is not None:
-        lines += [
-            "Lucro médio após TP50:",
-            f"{_v3_fmt_num(m.get('pos_tp50_r'))}x o risco inicial (auditoria)",
-            "",
-        ]
+        lines += ["Lucro médio após TP50:", f"{_v3_fmt_num(m.get('pos_tp50_r'))}x o risco inicial (auditoria)", ""]
 
     if m.get("captura") is not None:
-        lines += [
-            "Captura do movimento:",
-            f"{_v3_fmt_num(m.get('captura'))}% {_v3_classificar_captura(m.get('captura'))}",
-        ]
-        if not compact:
-            lines.append("Quanto do movimento disponível o robô transformou em lucro.")
-        lines.append("")
+        lines += ["Aproveitamento da tendência:", f"{_v3_fmt_num(m.get('captura'))}%", _v3_classificar_captura(m.get("captura")), ""]
 
     if m.get("mfe") is not None:
         lines += ["Maior lucro durante o trade:", _v3_fmt_pct(m.get("mfe")), ""]
     if m.get("mae") is not None:
         lines += ["Maior perda durante o trade:", _v3_fmt_pct(m.get("mae")), ""]
     if m.get("devolucao") is not None:
-        lines += [
-            "Lucro devolvido antes do fechamento:",
-            f"{_v3_fmt_pct(m.get('devolucao'), sinal=False)} {_v3_classificar_devolucao(m.get('devolucao'))}",
-            "",
-        ]
+        lines += ["Lucro devolvido antes do fechamento:", f"{_v3_fmt_pct(m.get('devolucao'), sinal=False)} {_v3_classificar_devolucao(m.get('devolucao'))}", ""]
+
+    if m.get("pnl_pct") is not None:
+        lines += ["Resultado financeiro:", f"Financeiro: {_v3_fmt_pct(m.get('pnl_pct'))}"]
+        if not compact and m.get("expectancy_r") is not None:
+            lines.append(f"Resultado técnico: {_v3_fmt_num(m.get('expectancy_r'))}R")
+        lines.append("")
 
     if not compact and (m.get("tempo_tp50") is not None or m.get("tempo_fechamento") is not None):
         lines += ["⏱ TEMPO MÉDIO DOS TRADES"]
@@ -1483,34 +1515,10 @@ def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
         lines.append("")
 
     if any([m.get("r3"), m.get("r5"), m.get("r10")]):
-        lines += [
-            "Grandes vencedores:",
-            f"Acima de 3R: {m.get('r3')}",
-            f"Acima de 5R: {m.get('r5')}",
-            f"Acima de 10R: {m.get('r10')}",
-            "",
-        ]
+        lines += ["Grandes vencedores:", f"Acima de 3R: {m.get('r3')}", f"Acima de 5R: {m.get('r5')}", f"Acima de 10R: {m.get('r10')}", ""]
 
-    pf = m.get("profit_factor")
-    lucro = m.get("lucro_esperado_pct")
-    eg = m.get("eficiencia")
-    score = 0
-    if pf is not None:
-        score += 0 if pf < 1 else (1 if pf < 1.3 else (2 if pf < 1.8 else 3))
-    if lucro is not None:
-        score += 0 if lucro < 0 else (1 if lucro < 0.25 else (2 if lucro < 0.75 else 3))
-    if eg is not None:
-        score += 0 if eg < 1 else (1 if eg < 1.5 else (2 if eg < 2 else 3))
-    if score >= 7:
-        nota = "⭐⭐⭐⭐⭐ Excelente"
-    elif score >= 5:
-        nota = "⭐⭐⭐⭐ Boa"
-    elif score >= 3:
-        nota = "⭐⭐⭐ Regular"
-    else:
-        nota = "⭐⭐ Atenção"
-    lines += ["🏆 Nota da estratégia:", nota]
-
+    score10 = _v3_strategy_score_0_10(m)
+    lines += ["🏆 Nota da estratégia:", f"{_v3_fmt_num(score10, 1)}/10" if score10 is not None else "N/A", _v3_note_label(score10)]
     return "\n".join([line for line in lines if line is not None]).strip()
 
 
@@ -3591,9 +3599,13 @@ def build_daily_risk_summary_v3():
         )[:5]
 
         status = "🔴 BLOQUEAR NOVAS ENTRADAS" if total >= GLOBAL_RISK_MAX_POSITIONS else "🟢 Dentro do limite"
+        usage_pct = round((total / max(GLOBAL_RISK_MAX_POSITIONS, 1)) * 100, 1)
         lines = [
             "🛡️ RISCO GLOBAL",
-            f"Posições: {total}/{GLOBAL_RISK_MAX_POSITIONS} | LONG {longs} | SHORT {shorts}",
+            "Uso da capacidade:",
+            f"{total} / {GLOBAL_RISK_MAX_POSITIONS}",
+            f"{usage_pct}%",
+            f"LONG {longs} | SHORT {shorts}",
             f"Status: {status}",
         ]
         if repeated:
@@ -3606,19 +3618,46 @@ def build_daily_risk_summary_v3():
 
 
 def build_daily_ranking_summary_v3():
-    """Ranking enxuto para /daily."""
+    """
+    Ranking executivo para /daily.
+    Esconde score interno e mostra nota estimada quando possível.
+    """
     try:
-        txt = build_ranking_report()
-        lines = [line.strip() for line in str(txt).splitlines() if line.strip()]
-        keep = []
-        for line in lines:
-            if line.startswith(("🥇", "🥈", "🥉")):
-                keep.append(line)
-            elif re.match(r"^[4-7]\.", line):
-                # mantém só até 5º para economizar espaço
-                if line.startswith(("4.", "5.")):
-                    keep.append(line)
-        return "🏆 RANKING\n" + "\n".join(keep[:5])
+        exp = central_exposure_snapshot()
+        ranked = []
+        for key in BOT_CONFIGS.keys():
+            module = LOADED_BOTS.get(key)
+            cfg = BOT_CONFIGS.get(key, {})
+            if not module:
+                continue
+            nota = None
+            try:
+                resumo = _bot_resumo_text(key, module)
+                nota = _v3_strategy_score_0_10(_v3_bot_metrics_from_summary(key, resumo))
+            except Exception:
+                pass
+            runner = 0.0
+            try:
+                bot_exp = (exp.get("by_bot") or {}).get(key, {}) or {}
+                best = bot_exp.get("best_open_runner") or {}
+                runner = float(best.get("runner_r") or 0.0)
+            except Exception:
+                runner = 0.0
+            sort_score = (nota if nota is not None else 0.0) + min(max(runner, 0.0), 5.0) * 0.2
+            ranked.append((sort_score, key, cfg.get("name"), nota, runner))
+
+        ranked.sort(reverse=True, key=lambda x: x[0])
+        medals = ["🥇", "🥈", "🥉", "4.", "5."]
+        lines = ["🏆 RANKING EXECUTIVO"]
+        for idx, item in enumerate(ranked[:5]):
+            _score, key, name, nota, runner = item
+            prefix = medals[idx] if idx < len(medals) else f"{idx+1}."
+            nota_txt = f"Nota {_v3_fmt_num(nota, 1)}/10" if nota is not None else "Nota N/A"
+            stars = _v3_note_label(nota)
+            runner_txt = f" | runner {runner:.2f}R" if runner and runner > 0 else ""
+            lines.append(f"{prefix} {key} — {name}")
+            lines.append(f"{nota_txt} | {stars}{runner_txt}")
+        return "\n".join(lines)
     except Exception as exc:
         return f"Erro ao gerar ranking compacto: {exc}"
 
@@ -3737,6 +3776,76 @@ def build_daily_report():
     force_gc_if_needed("daily_report_end", force=True)
     return text
 
+
+def _read_jsonl_tail_v3(path, limit=200):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return []
+        lines = p.read_text(encoding="utf-8").splitlines()[-int(limit):]
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+
+def build_evolution_dashboard_v3():
+    """
+    Dashboard de evolução V3.0 baseado nos logs locais disponíveis.
+    Para histórico 7/30 dias permanente, o ideal é persistir em Redis/Upstash.
+    """
+    decision_log = _read_jsonl_tail_v3(CENTRAL_DECISION_LOG_FILE, 300)
+    timeline_log = _read_jsonl_tail_v3(CENTRAL_TIMELINE_LOG_FILE, 500)
+
+    decisions_total = len(decision_log)
+    allow = sum(1 for x in decision_log if str(x.get("decision", x.get("status", ""))).upper() == "ALLOW")
+    deny = sum(1 for x in decision_log if str(x.get("decision", x.get("status", ""))).upper() == "DENY")
+    verify = sum(1 for x in decision_log if str(x.get("execution_mode", x.get("mode", ""))).upper() == "VERIFY")
+    live = sum(1 for x in decision_log if str(x.get("execution_mode", x.get("mode", ""))).upper() == "LIVE")
+
+    by_bot = {}
+    for item in decision_log:
+        bot = str(item.get("bot") or item.get("robot") or "").upper() or "N/A"
+        by_bot.setdefault(bot, {"total": 0, "allow": 0, "deny": 0})
+        by_bot[bot]["total"] += 1
+        dec = str(item.get("decision", item.get("status", ""))).upper()
+        if dec == "ALLOW":
+            by_bot[bot]["allow"] += 1
+        elif dec == "DENY":
+            by_bot[bot]["deny"] += 1
+
+    lines = [
+        "📈 DASHBOARD DE EVOLUÇÃO — CENTRAL QUANT V3.0",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "Decisões registradas:",
+        str(decisions_total),
+        f"ALLOW: {allow} | DENY: {deny}",
+        f"VERIFY: {verify} | LIVE: {live}",
+        "",
+        "Eventos de timeline:",
+        str(len(timeline_log)),
+    ]
+
+    if by_bot:
+        lines += ["", "Por robô:"]
+        for bot, stats in sorted(by_bot.items(), key=lambda x: x[1]["total"], reverse=True):
+            lines.append(f"- {bot}: total={stats['total']} | allow={stats['allow']} | deny={stats['deny']}")
+
+    lines += [
+        "",
+        "Observação:",
+        "Para evolução histórica real de 7/30 dias, sem perder dados em deploy/restart,",
+        "o próximo passo é persistir métricas em Redis/Upstash ou banco externo.",
+    ]
+    return "\n".join(lines)
+
+
 def build_support_report():
     """
     Pacote de troubleshooting: não foca no desempenho, foca em saúde técnica.
@@ -3833,6 +3942,13 @@ def dashboard_route():
 @app.route("/diário")
 def daily_route():
     return {"text": build_daily_report()}
+
+
+@app.route("/evolution")
+@app.route("/evolucao")
+@app.route("/evolução")
+def evolution_route():
+    return {"text": build_evolution_dashboard_v3()}
 
 
 @app.route("/support")
