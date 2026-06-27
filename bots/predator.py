@@ -2002,6 +2002,199 @@ def filtrar_trades_periodo(data_prefix):
     return [t for t in trades if str(t.get("date", "")).startswith(data_prefix)]
 
 
+
+
+# ==============================================================================
+# MÉTRICAS EXECUTIVAS V2.0 — linguagem simples para relatório principal
+# ==============================================================================
+
+def _safe_float_metric(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _fmt_pct_metric(value, casas=2):
+    try:
+        return f"{float(value):+.{casas}f}%".replace(".", ",")
+    except Exception:
+        return "+0,00%"
+
+
+def _fmt_num_metric(value, casas=2):
+    try:
+        return f"{float(value):.{casas}f}".replace(".", ",")
+    except Exception:
+        return "0,00"
+
+
+def classificar_profit_factor(pf):
+    pf = _safe_float_metric(pf)
+    if pf < 1.0:
+        return "🔴 Estratégia perdedora"
+    if pf < 1.3:
+        return "🟡 Lucro baixo"
+    if pf < 1.8:
+        return "🟢 Boa estratégia"
+    return "⭐ Excelente estratégia"
+
+
+def classificar_gerenciamento(valor):
+    valor = _safe_float_metric(valor)
+    if valor < 1.0:
+        return "🔴 Ruim"
+    if valor < 1.5:
+        return "🟡 Aceitável"
+    if valor < 2.0:
+        return "🟢 Bom"
+    return "⭐ Excelente"
+
+
+def classificar_lucro_pct(valor):
+    valor = _safe_float_metric(valor)
+    if valor < 0:
+        return "🔴 Negativo"
+    if valor < 0.25:
+        return "🟡 Baixo"
+    if valor < 0.75:
+        return "🟢 Muito bom"
+    return "⭐ Excelente"
+
+
+def classificar_captura_movimento(valor):
+    valor = _safe_float_metric(valor)
+    if valor < 30:
+        return "🔴 Baixa"
+    if valor < 45:
+        return "🟡 Regular"
+    if valor < 60:
+        return "🟢 Muito boa"
+    return "⭐ Excelente"
+
+
+def classificar_devolucao(valor):
+    valor = abs(_safe_float_metric(valor))
+    if valor < 1:
+        return "⭐ Excelente"
+    if valor < 2:
+        return "🟢 Muito bom"
+    if valor < 3:
+        return "🟡 Bom"
+    return "🔴 Alta"
+
+
+def ciclos_para_dias_horas(ciclos, minutos_por_ciclo=5):
+    """
+    Converte ciclos de gestão em tempo humano.
+    Ajustável no Render via PREDATOR_MANAGEMENT_CYCLE_MINUTES.
+    """
+    try:
+        import os
+        minutos_por_ciclo = float(os.environ.get("PREDATOR_MANAGEMENT_CYCLE_MINUTES", minutos_por_ciclo))
+        total_min = int(round(float(ciclos) * minutos_por_ciclo))
+    except Exception:
+        return "N/A"
+
+    dias = total_min // 1440
+    horas = (total_min % 1440) // 60
+    minutos = total_min % 60
+
+    partes = []
+    if dias:
+        partes.append(f"{dias}d")
+    if horas:
+        partes.append(f"{horas}h")
+    if minutos and not dias:
+        partes.append(f"{minutos}min")
+    return " ".join(partes) if partes else "0min"
+
+
+def metricas_executivas_predator_v2(
+    profit_factor=None,
+    eficiencia_gerenciamento=None,
+    lucro_esperado_pct=None,
+    lucro_medio_pos_tp50_pct=None,
+    captura_movimento_pct=None,
+    maior_lucro_pct=None,
+    maior_perda_pct=None,
+    lucro_devolvido_pct=None,
+    tempo_tp50_ciclos=None,
+    tempo_fechamento_ciclos=None,
+    r3=None,
+    r5=None,
+    r10=None,
+):
+    """
+    Bloco executivo V2.0:
+    - relatório principal em %, linguagem simples e classificação automática;
+    - R fica como auditoria/contagem de grandes vencedores.
+    """
+    pf = _safe_float_metric(profit_factor)
+    eg = _safe_float_metric(eficiencia_gerenciamento)
+    le = _safe_float_metric(lucro_esperado_pct)
+    ptp = _safe_float_metric(lucro_medio_pos_tp50_pct)
+    cap = _safe_float_metric(captura_movimento_pct)
+    mfe = _safe_float_metric(maior_lucro_pct)
+    mae = _safe_float_metric(maior_perda_pct)
+    dev = _safe_float_metric(lucro_devolvido_pct)
+
+    linhas = [
+        "",
+        "📈 QUALIDADE DA ESTRATÉGIA",
+        "",
+        "Profit Factor:",
+        f"{_fmt_num_metric(pf)} {classificar_profit_factor(pf)}",
+        "",
+        "Referência:",
+        "< 1,00 → perde dinheiro",
+        "1,00–1,30 → lucro baixo",
+        "1,30–1,80 → boa estratégia",
+        "> 1,80 → excelente estratégia",
+        "",
+        "Eficiência do gerenciamento:",
+        f"{_fmt_num_metric(eg)} {classificar_gerenciamento(eg)}",
+        "Cada trade vencedor capturou, em média,",
+        f"{_fmt_num_metric(eg)} vezes o risco inicial.",
+        "",
+        "Lucro esperado por trade:",
+        f"{_fmt_pct_metric(le)} {classificar_lucro_pct(le)}",
+        "",
+        "Lucro médio após TP50:",
+        f"{_fmt_pct_metric(ptp)} {classificar_lucro_pct(ptp)}",
+        "",
+        "Captura do movimento:",
+        f"{_fmt_num_metric(cap)}% {classificar_captura_movimento(cap)}",
+        "",
+        "Maior lucro durante o trade:",
+        _fmt_pct_metric(mfe),
+        "",
+        "Maior perda durante o trade:",
+        _fmt_pct_metric(mae),
+        "",
+        "Lucro devolvido antes do fechamento:",
+        f"{_fmt_pct_metric(dev).replace('+', '')} {classificar_devolucao(dev)}",
+    ]
+
+    if tempo_tp50_ciclos is not None or tempo_fechamento_ciclos is not None:
+        linhas += ["", "⏱ TEMPO MÉDIO DOS TRADES"]
+        if tempo_tp50_ciclos is not None:
+            linhas.append(f"Até TP50: {ciclos_para_dias_horas(tempo_tp50_ciclos)}")
+        if tempo_fechamento_ciclos is not None:
+            linhas.append(f"Até fechamento: {ciclos_para_dias_horas(tempo_fechamento_ciclos)}")
+
+    linhas += [
+        "",
+        "Grandes vencedores:",
+        f"Acima de 3R: {int(_safe_float_metric(r3))}",
+        f"Acima de 5R: {int(_safe_float_metric(r5))}",
+        f"Acima de 10R: {int(_safe_float_metric(r10))}",
+    ]
+    return "\\n".join(linhas)
+
+
 def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
     trades = filtrar_trades_periodo(data_prefix)
     stats = calc_predator_stats(trades)
@@ -2040,20 +2233,20 @@ def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
         f"Loss: {stats['losses']}\n"
         f"Win rate: {stats['winrate']:.2f}%\n"
         f"Win rate sem BE: {stats['winrate_sem_be']:.2f}%\n"
-        f"Profit Factor %: {fmt_pf(stats['profit_factor_pct'])}\n"
-        f"Profit Factor R: {fmt_pf(stats['profit_factor_r'])}\n"
-        f"Expectancy: {fmt_r(stats['expectancy_r'])} por trade\n"
-        f"Expectancy pós-TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
-        f"Captura de tendência: {stats['trend_capture_pct']:.2f}%\n\n"
+        f"Profit Factor: {fmt_pf(stats['profit_factor_pct'])}\n"
+        f"Eficiência do gerenciamento: {fmt_pf(stats['profit_factor_r'])}\n"
+        f"Lucro esperado por trade: {fmt_r(stats['expectancy_r'])} por trade\n"
+        f"Lucro médio após TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
+        f"Captura do movimento: {stats['trend_capture_pct']:.2f}%\n\n"
         f"TP50 atingidos: {stats['tp50_hits']}\n"
         f"Tempo médio até TP50: {stats['avg_cycles_to_tp50']:.1f} ciclos de gestão\n"
         f"Tempo médio até fechamento: {stats['avg_management_cycles']:.1f} ciclos de gestão\n"
         f"Trailings atualizados: {len(stats['trails'])}\n\n"
-        f"PnL realizado:\n{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
-        f"MFE médio:\n{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n"
-        f"MAE médio:\n{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n"
-        f"Devolução média:\n{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
-        f"Runners:\n3R+: {stats['runners_3r']}\n5R+: {stats['runners_5r']}\n10R+: {stats['runners_10r']}\n\n"
+        f"Resultado financeiro:\n{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
+        f"Maior lucro durante o trade:\n{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n"
+        f"Maior perda durante o trade:\n{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n"
+        f"Lucro devolvido antes do fechamento:\n{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
+        f"Grandes vencedores:\n3R+: {stats['runners_3r']}\n5R+: {stats['runners_5r']}\n10R+: {stats['runners_10r']}\n\n"
         f"LONG x SHORT:\n{stats_by_side_text(exits)}\n\n"
         f"Melhor trade:\n{trade_line_predator(stats['best_trade'])}\n\n"
         f"Pior trade:\n{trade_line_predator(stats['worst_trade'])}\n\n"
@@ -2383,19 +2576,19 @@ def montar_stats_gerais():
         f"Loss: {stats['losses']}\n"
         f"Win rate: {stats['winrate']:.2f}%\n"
         f"Win rate sem BE: {stats['winrate_sem_be']:.2f}%\n"
-        f"Profit Factor %: {fmt_pf(stats['profit_factor_pct'])}\n"
-        f"Profit Factor R: {fmt_pf(stats['profit_factor_r'])}\n"
-        f"Expectancy: {fmt_r(stats['expectancy_r'])} por trade\n"
-        f"Expectancy pós-TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
-        f"Captura de tendência: {stats['trend_capture_pct']:.2f}%\n\n"
+        f"Profit Factor: {fmt_pf(stats['profit_factor_pct'])}\n"
+        f"Eficiência do gerenciamento: {fmt_pf(stats['profit_factor_r'])}\n"
+        f"Lucro esperado por trade: {fmt_r(stats['expectancy_r'])} por trade\n"
+        f"Lucro médio após TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
+        f"Captura do movimento: {stats['trend_capture_pct']:.2f}%\n\n"
         f"TP50 atingidos: {stats['tp50_hits']}\n"
         f"Tempo médio até TP50: {stats['avg_cycles_to_tp50']:.1f} ciclos de gestão\n"
         f"Tempo médio até fechamento: {stats['avg_management_cycles']:.1f} ciclos de gestão\n\n"
-        f"PnL realizado:\n{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
-        f"MFE médio:\n{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n"
-        f"MAE médio:\n{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n"
-        f"Devolução média:\n{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
-        f"Runners:\n3R+: {stats['runners_3r']}\n5R+: {stats['runners_5r']}\n10R+: {stats['runners_10r']}\n\n"
+        f"Resultado financeiro:\n{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
+        f"Maior lucro durante o trade:\n{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n"
+        f"Maior perda durante o trade:\n{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n"
+        f"Lucro devolvido antes do fechamento:\n{fmt_pct(stats['giveback_avg_pct'])} | {fmt_r(stats['giveback_avg_r'])}\n\n"
+        f"Grandes vencedores:\n3R+: {stats['runners_3r']}\n5R+: {stats['runners_5r']}\n10R+: {stats['runners_10r']}\n\n"
         f"LONG x SHORT:\n{stats_by_side_text(exits)}\n\n"
         f"Por score:\n{stats_by_score_text(exits)}\n\n"
         f"Ranking por ativo:\n{asset_ranking_text(exits, 8)}\n\n"
