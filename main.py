@@ -116,8 +116,41 @@ REAL_TRADING_ALLOWED_SYMBOLS = {
     x.strip().upper() for x in os.environ.get("REAL_TRADING_ALLOWED_SYMBOLS", "").split(",") if x.strip()
 }
 REAL_TRADING_MAX_RISK_PCT = float(os.environ.get("REAL_TRADING_MAX_RISK_PCT", "3.0"))
-REAL_TRADING_MAX_NOTIONAL_USDT = float(os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "10"))
+DEFAULT_REAL_MARGIN_USDT = float(os.environ.get("DEFAULT_REAL_MARGIN_USDT", os.environ.get("REAL_TRADING_MARGIN_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "20"))))
+DEFAULT_REAL_LEVERAGE = int(os.environ.get("DEFAULT_REAL_LEVERAGE", os.environ.get("REAL_TRADING_LEVERAGE", os.environ.get("BINGX_DEFAULT_LEVERAGE", "3"))))
+DEFAULT_REAL_EFFECTIVE_NOTIONAL_USDT = DEFAULT_REAL_MARGIN_USDT * DEFAULT_REAL_LEVERAGE
+REAL_TRADING_MAX_MARGIN_USDT = float(os.environ.get("REAL_TRADING_MAX_MARGIN_USDT", str(DEFAULT_REAL_MARGIN_USDT)))
+REAL_TRADING_MAX_NOTIONAL_USDT = float(os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", str(DEFAULT_REAL_EFFECTIVE_NOTIONAL_USDT)))
 REAL_TRADING_REQUIRE_READY = env_bool("REAL_TRADING_REQUIRE_READY", True)
+
+
+def _bot_env_prefix_for_execution(bot):
+    bot = str(bot or "").upper().strip()
+    aliases = {"TRENDPRO": "TREND", "SMARTPREDATOR": "PREDATOR", "SMART_PREDATOR": "PREDATOR"}
+    return aliases.get(bot, bot)
+
+
+def real_execution_config_for_bot(bot):
+    prefix = _bot_env_prefix_for_execution(bot)
+    try:
+        margin = float(os.environ.get(f"{prefix}_REAL_MARGIN_USDT", DEFAULT_REAL_MARGIN_USDT))
+    except Exception:
+        margin = DEFAULT_REAL_MARGIN_USDT
+    try:
+        leverage = int(os.environ.get(f"{prefix}_REAL_LEVERAGE", DEFAULT_REAL_LEVERAGE))
+    except Exception:
+        leverage = DEFAULT_REAL_LEVERAGE
+    return {
+        "bot": str(bot or "").upper(),
+        "env_prefix": prefix,
+        "margin_usdt": margin,
+        "leverage": leverage,
+        "effective_notional_usdt": margin * leverage,
+    }
+
+
+def all_real_execution_configs():
+    return {key: real_execution_config_for_bot(key) for key in BOT_CONFIGS.keys()} if "BOT_CONFIGS" in globals() else {}
 
 DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
 DAILY_HISTORY_DIR.mkdir(exist_ok=True)
@@ -2094,8 +2127,10 @@ def build_execution_stats_report():
         by_bot[bot]["total"] += 1
         by_bot[bot]["allow" if d.get("allowed") else "deny"] += 1
         m = str(d.get("mode") or "").upper()
-        if m in by_bot[bot]:
-            by_bot[bot][m.lower()] += 1
+        if m == "VERIFY":
+            by_bot[bot]["verify"] += 1
+        elif m == "LIVE":
+            by_bot[bot]["live"] += 1
     lines = [
         "📊 EXECUTION STATS — CENTRAL QUANT",
         f"Data/hora: {data_hora_sp_str()}",
@@ -2247,7 +2282,11 @@ def broker_status_payload():
         "allowed_bots": sorted(list(REAL_TRADING_ALLOWED_BOTS)),
         "allowed_symbols": sorted(list(REAL_TRADING_ALLOWED_SYMBOLS)),
         "max_risk_pct": REAL_TRADING_MAX_RISK_PCT,
+        "default_margin_usdt": DEFAULT_REAL_MARGIN_USDT,
+        "default_leverage": DEFAULT_REAL_LEVERAGE,
+        "max_margin_usdt": REAL_TRADING_MAX_MARGIN_USDT,
         "max_notional_usdt": REAL_TRADING_MAX_NOTIONAL_USDT,
+        "bot_execution_configs": all_real_execution_configs(),
         "broker_import_error": BROKER_IMPORT_ERROR,
         "broker_loaded": central_broker is not None,
     }
@@ -2280,7 +2319,20 @@ def can_open_trade_decision(payload: dict):
     mode = str(payload.get("mode") or payload.get("execution_mode") or EXECUTION_MODE).upper().strip()
     intended_live = bool(payload.get("intended_live", mode == "LIVE"))
     risk_pct = safe_round(payload.get("risk_pct"), 4, 0) or 0
-    notional = safe_round(payload.get("notional_usdt"), 4, 0) or 0
+    bot_cfg = real_execution_config_for_bot(bot)
+    margin = safe_round(payload.get("margin_usdt"), 4, None)
+    leverage = safe_round(payload.get("leverage"), 0, None)
+    if margin is None:
+        margin = bot_cfg.get("margin_usdt", DEFAULT_REAL_MARGIN_USDT)
+    if leverage is None:
+        leverage = bot_cfg.get("leverage", DEFAULT_REAL_LEVERAGE)
+    try:
+        leverage = int(leverage)
+    except Exception:
+        leverage = DEFAULT_REAL_LEVERAGE
+    notional = safe_round(payload.get("notional_usdt"), 4, None)
+    if notional is None or notional == 0:
+        notional = float(margin) * int(leverage)
 
     exposure_snapshot = central_exposure_snapshot()
     rows = _all_open_positions_payload()
@@ -2346,8 +2398,10 @@ def can_open_trade_decision(payload: dict):
 
     if risk_pct and risk_pct > REAL_TRADING_MAX_RISK_PCT:
         reasons.append(f"risco acima do máximo real: {risk_pct}% > {REAL_TRADING_MAX_RISK_PCT}%")
+    if intended_live and margin and margin > REAL_TRADING_MAX_MARGIN_USDT:
+        reasons.append(f"margem acima do máximo real: {margin} > {REAL_TRADING_MAX_MARGIN_USDT} USDT")
     if intended_live and notional and notional > REAL_TRADING_MAX_NOTIONAL_USDT:
-        reasons.append(f"notional acima do máximo real: {notional} > {REAL_TRADING_MAX_NOTIONAL_USDT} USDT")
+        reasons.append(f"exposição efetiva acima do máximo real: {notional} > {REAL_TRADING_MAX_NOTIONAL_USDT} USDT")
 
     # Avisos não bloqueantes.
     if total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
@@ -2375,6 +2429,9 @@ def can_open_trade_decision(payload: dict):
             "max_positions": GLOBAL_RISK_MAX_POSITIONS,
             "max_symbol_exposure": GLOBAL_RISK_MAX_SYMBOL_EXPOSURE,
         },
+        "requested_margin_usdt": margin,
+        "requested_leverage": leverage,
+        "requested_effective_notional_usdt": notional,
         "execution": broker_status_payload(),
     }
     try:
@@ -2396,8 +2453,15 @@ def build_execution_report():
         f"Validação final: automática pelo robô + Risk Manager da Central",
         f"Bots liberados para real: {', '.join(status.get('allowed_bots') or [])}",
         f"Símbolos liberados: {', '.join(status.get('allowed_symbols') or []) if status.get('allowed_symbols') else 'TODOS (respeitando risco)'}",
-        f"Max notional real: {REAL_TRADING_MAX_NOTIONAL_USDT} USDT",
+        f"Margem padrão: {DEFAULT_REAL_MARGIN_USDT} USDT",
+        f"Alavancagem padrão: {DEFAULT_REAL_LEVERAGE}x",
+        f"Exposição padrão: {DEFAULT_REAL_EFFECTIVE_NOTIONAL_USDT} USDT",
+        f"Margem máxima real: {REAL_TRADING_MAX_MARGIN_USDT} USDT",
+        f"Exposição máxima real: {REAL_TRADING_MAX_NOTIONAL_USDT} USDT",
         f"Max risco real: {REAL_TRADING_MAX_RISK_PCT}%",
+        "",
+        "Configuração por robô:",
+        *[f"- {k}: margem={v.get('margin_usdt')} USDT | lev={v.get('leverage')}x | exposição={v.get('effective_notional_usdt')} USDT" for k, v in (status.get('bot_execution_configs') or {}).items() if k in (status.get('allowed_bots') or [])],
         "",
         f"Broker carregado: {status.get('broker_loaded')}",
         f"Broker import error: {status.get('broker_import_error')}",
