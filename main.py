@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-27-CENTRAL-V2-0-EXECUTIVE-METRICS-FINAL
+# Versão: 2026-06-27-CENTRAL-V3-0-FINAL-STABLE
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -1162,15 +1162,26 @@ def _call_bot_text_safely(key: str, label: str, func):
 
 
 # ==========================================================
-# FORMATAÇÃO EXECUTIVA V2.0 — MÉTRICAS PADRONIZADAS DOS BOTS
+# FORMATAÇÃO EXECUTIVA V3.0 — MÉTRICAS PADRONIZADAS DOS BOTS
+# ==========================================================
+#
+# Filosofia V3.0:
+# - Relatórios executivos em português claro.
+# - Destaque operacional em % e classificações.
+# - R fica apenas como auditoria/grandes vencedores.
+# - Robôs sem amostra suficiente não exibem métricas falsas.
+# - /daily deve ser curto, limpo e acionável.
 # ==========================================================
 
-def _v2_text_to_float(value, default=None):
+def _v3_text_to_float(value, default=None):
     try:
         if value is None:
             return default
         s = str(value).strip()
+        if not s or s.upper() in {"N/A", "NONE", "NULL"}:
+            return default
         s = s.replace("%", "").replace("R", "").replace("+", "").replace("−", "-")
+        s = s.replace("∞", "999999")
         s = s.replace(" ", "")
         # pt-BR: 1.234,56 -> 1234.56 | decimal simples: 1,23 -> 1.23
         if "," in s and "." in s:
@@ -1182,22 +1193,24 @@ def _v2_text_to_float(value, default=None):
         return default
 
 
-def _v2_fmt_num(value, casas=2, default="N/A"):
-    val = _v2_text_to_float(value, None)
+def _v3_fmt_num(value, casas=2, default="N/A"):
+    val = _v3_text_to_float(value, None)
     if val is None:
         return default
+    if val >= 999999:
+        return "∞"
     return f"{val:.{casas}f}".replace(".", ",")
 
 
-def _v2_fmt_pct(value, casas=2, sinal=True, default="N/A"):
-    val = _v2_text_to_float(value, None)
+def _v3_fmt_pct(value, casas=2, sinal=True, default="N/A"):
+    val = _v3_text_to_float(value, None)
     if val is None:
         return default
     prefix = "+" if sinal and val > 0 else ""
     return f"{prefix}{val:.{casas}f}%".replace(".", ",")
 
 
-def _v2_find_number_after_labels(text, labels):
+def _v3_find_number_after_labels(text, labels):
     if not text:
         return None
     for label in labels:
@@ -1205,11 +1218,11 @@ def _v2_find_number_after_labels(text, labels):
         pattern = rf"{re.escape(label)}\s*[:\n]\s*([+\-−]?\d+(?:[\.,]\d+)?)"
         m = re.search(pattern, text, flags=re.IGNORECASE)
         if m:
-            return _v2_text_to_float(m.group(1), None)
+            return _v3_text_to_float(m.group(1), None)
     return None
 
 
-def _v2_find_count(patterns, text):
+def _v3_find_count(patterns, text):
     if not text:
         return 0
     for pattern in patterns:
@@ -1222,8 +1235,8 @@ def _v2_find_count(patterns, text):
     return 0
 
 
-def _v2_classificar_profit_factor(pf):
-    pf = _v2_text_to_float(pf, None)
+def _v3_classificar_profit_factor(pf):
+    pf = _v3_text_to_float(pf, None)
     if pf is None:
         return "⚪ N/A"
     if pf < 1.0:
@@ -1235,8 +1248,8 @@ def _v2_classificar_profit_factor(pf):
     return "⭐ Excelente estratégia"
 
 
-def _v2_classificar_gerenciamento(valor):
-    valor = _v2_text_to_float(valor, None)
+def _v3_classificar_gerenciamento(valor):
+    valor = _v3_text_to_float(valor, None)
     if valor is None:
         return "⚪ N/A"
     if valor < 1.0:
@@ -1248,8 +1261,8 @@ def _v2_classificar_gerenciamento(valor):
     return "⭐ Excelente"
 
 
-def _v2_classificar_lucro_pct(valor):
-    valor = _v2_text_to_float(valor, None)
+def _v3_classificar_lucro_pct(valor):
+    valor = _v3_text_to_float(valor, None)
     if valor is None:
         return "⚪ N/A"
     if valor < 0:
@@ -1261,8 +1274,8 @@ def _v2_classificar_lucro_pct(valor):
     return "⭐ Excelente"
 
 
-def _v2_classificar_captura(valor):
-    valor = _v2_text_to_float(valor, None)
+def _v3_classificar_captura(valor):
+    valor = _v3_text_to_float(valor, None)
     if valor is None:
         return "⚪ N/A"
     if valor < 30:
@@ -1274,8 +1287,8 @@ def _v2_classificar_captura(valor):
     return "⭐ Excelente"
 
 
-def _v2_classificar_devolucao(valor):
-    valor = abs(_v2_text_to_float(valor, 0.0))
+def _v3_classificar_devolucao(valor):
+    valor = abs(_v3_text_to_float(valor, 0.0))
     if valor < 1:
         return "⭐ Excelente"
     if valor < 2:
@@ -1285,8 +1298,8 @@ def _v2_classificar_devolucao(valor):
     return "🔴 Alta"
 
 
-def _v2_ciclos_para_dias_horas(ciclos, bot_key=None, default_minutes=5):
-    val = _v2_text_to_float(ciclos, None)
+def _v3_ciclos_para_dias_horas(ciclos, bot_key=None, default_minutes=5):
+    val = _v3_text_to_float(ciclos, None)
     if val is None:
         return "N/A"
     try:
@@ -1308,32 +1321,44 @@ def _v2_ciclos_para_dias_horas(ciclos, bot_key=None, default_minutes=5):
     return " ".join(partes) if partes else "0min"
 
 
-def _v2_bot_metrics_from_summary(bot_key, summary_text):
+def _v3_is_insufficient_sample(metrics):
+    """Amostra insuficiente quando não há trades encerrados ou quando tudo está zerado."""
+    trades = metrics.get("trades")
+    if trades is None:
+        return False
+    try:
+        return float(trades) <= 0
+    except Exception:
+        return False
+
+
+def _v3_bot_metrics_from_summary(bot_key, summary_text):
     txt = str(summary_text or "")
-    trades = _v2_find_number_after_labels(txt, ["Trades encerrados", "Trades fechados"])
-    pnl_pct = _v2_find_number_after_labels(txt, ["PnL realizado", "Resultado financeiro"])
-    profit_factor = _v2_find_number_after_labels(txt, ["Profit Factor %", "Profit Factor"])
-    eficiencia = _v2_find_number_after_labels(txt, ["Profit Factor R", "Eficiência do gerenciamento"])
-    expectancy_r = _v2_find_number_after_labels(txt, ["Expectancy", "Expectativa"])
-    pos_tp50_r = _v2_find_number_after_labels(txt, ["Expectancy pós-TP50", "Expectativa pós-TP50"])
-    captura = _v2_find_number_after_labels(txt, ["Captura de tendência", "Captura do movimento", "Aproveitamento do movimento"])
-    mfe = _v2_find_number_after_labels(txt, ["MFE médio", "Maior lucro durante o trade"])
-    mae = _v2_find_number_after_labels(txt, ["MAE médio", "Maior perda durante o trade"])
-    devolucao = _v2_find_number_after_labels(txt, ["Devolução média", "Lucro devolvido antes do fechamento"])
-    tempo_tp50 = _v2_find_number_after_labels(txt, ["Tempo médio até TP50"])
-    tempo_fechamento = _v2_find_number_after_labels(txt, ["Tempo médio até fechamento"])
+    trades = _v3_find_number_after_labels(txt, ["Trades encerrados", "Trades fechados"])
+    pnl_pct = _v3_find_number_after_labels(txt, ["PnL realizado", "Resultado financeiro"])
+    profit_factor = _v3_find_number_after_labels(txt, ["Profit Factor %", "Profit Factor"])
+    eficiencia = _v3_find_number_after_labels(txt, ["Profit Factor R", "Eficiência do gerenciamento"])
+    expectancy_r = _v3_find_number_after_labels(txt, ["Expectancy", "Expectativa"])
+    pos_tp50_r = _v3_find_number_after_labels(txt, ["Expectancy pós-TP50", "Expectativa pós-TP50", "Lucro médio após TP50"])
+    captura = _v3_find_number_after_labels(txt, ["Captura de tendência", "Captura do movimento", "Aproveitamento do movimento"])
+    mfe = _v3_find_number_after_labels(txt, ["MFE médio", "Maior lucro durante o trade"])
+    mae = _v3_find_number_after_labels(txt, ["MAE médio", "Maior perda durante o trade"])
+    devolucao = _v3_find_number_after_labels(txt, ["Devolução média", "Lucro devolvido antes do fechamento"])
+    tempo_tp50 = _v3_find_number_after_labels(txt, ["Tempo médio até TP50"])
+    tempo_fechamento = _v3_find_number_after_labels(txt, ["Tempo médio até fechamento"])
+    sinais = _v3_find_number_after_labels(txt, ["Sinais Falcon", "Sinais H1 do dia", "Sinais H1 do período", "Sinais Donkey do dia", "Sinais Turtle"])
 
     lucro_esperado_pct = None
     if pnl_pct is not None and trades and trades > 0:
         lucro_esperado_pct = pnl_pct / trades
 
-    # Quando só há métrica em R, mantemos para auditoria; o relatório executivo prioriza %.
-    r3 = _v2_find_count([r"3R\+\s*[:=]\s*(\d+)", r"Acima de 3R\s*[:=]\s*(\d+)"], txt)
-    r5 = _v2_find_count([r"5R\+\s*[:=]\s*(\d+)", r"Acima de 5R\s*[:=]\s*(\d+)"], txt)
-    r10 = _v2_find_count([r"10R\+\s*[:=]\s*(\d+)", r"Acima de 10R\s*[:=]\s*(\d+)"], txt)
+    r3 = _v3_find_count([r"3R\+\s*[:=]\s*(\d+)", r"Acima de 3R\s*[:=]\s*(\d+)"], txt)
+    r5 = _v3_find_count([r"5R\+\s*[:=]\s*(\d+)", r"Acima de 5R\s*[:=]\s*(\d+)"], txt)
+    r10 = _v3_find_count([r"10R\+\s*[:=]\s*(\d+)", r"Acima de 10R\s*[:=]\s*(\d+)"], txt)
 
     return {
         "trades": trades,
+        "sinais": sinais,
         "pnl_pct": pnl_pct,
         "profit_factor": profit_factor,
         "eficiencia": eficiencia,
@@ -1352,98 +1377,109 @@ def _v2_bot_metrics_from_summary(bot_key, summary_text):
     }
 
 
-def build_strategy_executive_metrics_v2(bot_key, summary_text):
+def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
     """
-    Camada única da Central V2.0.
+    Camada única da Central V3.0.
     Não altera a lógica dos robôs: apenas traduz métricas para linguagem executiva.
-    R fica como auditoria/grandes vencedores; o destaque operacional usa %.
     """
-    m = _v2_bot_metrics_from_summary(bot_key, summary_text)
-    if not any(v not in (None, 0, "") for v in m.values()):
-        return ""
+    m = _v3_bot_metrics_from_summary(bot_key, summary_text)
+    has_any = any(v not in (None, 0, "") for v in m.values())
+    if not has_any:
+        return "📈 QUALIDADE EXECUTIVA V3.0\nAmostra insuficiente hoje.\nAguardar trades encerrados."
 
-    lines = [
-        "📈 QUALIDADE EXECUTIVA V2.0",
-        "",
-    ]
+    if _v3_is_insufficient_sample(m):
+        sinais_txt = ""
+        if m.get("sinais") is not None:
+            sinais_txt = f"\nSinais hoje: {int(m.get('sinais') or 0)}"
+        return (
+            "📈 QUALIDADE EXECUTIVA V3.0\n"
+            "Amostra insuficiente hoje.\n"
+            f"Trades encerrados: {int(m.get('trades') or 0)}{sinais_txt}\n"
+            "Aguardar trades encerrados para calcular Profit Factor, lucro esperado e eficiência."
+        )
+
+    lines = ["📈 QUALIDADE EXECUTIVA V3.0", ""]
 
     if m.get("profit_factor") is not None:
         lines += [
             "Profit Factor:",
-            f"{_v2_fmt_num(m.get('profit_factor'))} {_v2_classificar_profit_factor(m.get('profit_factor'))}",
-            "",
-            "Referência:",
-            "< 1,00 → perde dinheiro",
-            "1,00–1,30 → lucro baixo",
-            "1,30–1,80 → boa estratégia",
-            "> 1,80 → excelente estratégia",
-            "",
+            f"{_v3_fmt_num(m.get('profit_factor'))} {_v3_classificar_profit_factor(m.get('profit_factor'))}",
         ]
+        if not compact:
+            lines += [
+                "",
+                "Referência:",
+                "< 1,00 → perde dinheiro",
+                "1,00–1,30 → lucro baixo",
+                "1,30–1,80 → boa estratégia",
+                "> 1,80 → excelente estratégia",
+            ]
+        lines.append("")
 
     if m.get("eficiencia") is not None:
         lines += [
             "Eficiência do gerenciamento:",
-            f"{_v2_fmt_num(m.get('eficiencia'))} {_v2_classificar_gerenciamento(m.get('eficiencia'))}",
-            "Cada trade vencedor capturou, em média,",
-            f"{_v2_fmt_num(m.get('eficiencia'))} vezes o risco inicial.",
-            "",
+            f"{_v3_fmt_num(m.get('eficiencia'))} {_v3_classificar_gerenciamento(m.get('eficiencia'))}",
         ]
+        if not compact:
+            lines += [
+                "Cada trade vencedor capturou, em média,",
+                f"{_v3_fmt_num(m.get('eficiencia'))} vezes o risco inicial.",
+            ]
+        lines.append("")
 
     if m.get("lucro_esperado_pct") is not None:
         lines += [
             "Lucro esperado por trade:",
-            f"{_v2_fmt_pct(m.get('lucro_esperado_pct'))} {_v2_classificar_lucro_pct(m.get('lucro_esperado_pct'))}",
+            f"{_v3_fmt_pct(m.get('lucro_esperado_pct'))} {_v3_classificar_lucro_pct(m.get('lucro_esperado_pct'))}",
             "",
         ]
 
-    # Mostra R somente como auditoria, sem confundir com resultado financeiro.
-    if m.get("expectancy_r") is not None:
+    if not compact and m.get("expectancy_r") is not None:
         lines += [
             "Auditoria em R:",
-            f"Expectativa técnica: {_v2_fmt_num(m.get('expectancy_r'))}R",
+            f"Expectativa técnica: {_v3_fmt_num(m.get('expectancy_r'))}R",
             "",
         ]
 
-    if m.get("pos_tp50_r") is not None:
+    if not compact and m.get("pos_tp50_r") is not None:
         lines += [
             "Lucro médio após TP50:",
-            f"{_v2_fmt_num(m.get('pos_tp50_r'))}x o risco inicial (auditoria)",
+            f"{_v3_fmt_num(m.get('pos_tp50_r'))}x o risco inicial (auditoria)",
             "",
         ]
 
     if m.get("captura") is not None:
         lines += [
             "Captura do movimento:",
-            f"{_v2_fmt_num(m.get('captura'))}% {_v2_classificar_captura(m.get('captura'))}",
-            "Quanto do movimento disponível o robô transformou em lucro.",
-            "",
+            f"{_v3_fmt_num(m.get('captura'))}% {_v3_classificar_captura(m.get('captura'))}",
         ]
+        if not compact:
+            lines.append("Quanto do movimento disponível o robô transformou em lucro.")
+        lines.append("")
 
     if m.get("mfe") is not None:
-        lines += ["Maior lucro durante o trade:", _v2_fmt_pct(m.get("mfe")), ""]
+        lines += ["Maior lucro durante o trade:", _v3_fmt_pct(m.get("mfe")), ""]
     if m.get("mae") is not None:
-        lines += ["Maior perda durante o trade:", _v2_fmt_pct(m.get("mae")), ""]
+        lines += ["Maior perda durante o trade:", _v3_fmt_pct(m.get("mae")), ""]
     if m.get("devolucao") is not None:
         lines += [
             "Lucro devolvido antes do fechamento:",
-            f"{_v2_fmt_pct(m.get('devolucao'), sinal=False)} {_v2_classificar_devolucao(m.get('devolucao'))}",
+            f"{_v3_fmt_pct(m.get('devolucao'), sinal=False)} {_v3_classificar_devolucao(m.get('devolucao'))}",
             "",
         ]
 
-    if m.get("tempo_tp50") is not None or m.get("tempo_fechamento") is not None:
+    if not compact and (m.get("tempo_tp50") is not None or m.get("tempo_fechamento") is not None):
         lines += ["⏱ TEMPO MÉDIO DOS TRADES"]
         if m.get("tempo_tp50") is not None:
-            lines.append(f"Até TP50: {_v2_ciclos_para_dias_horas(m.get('tempo_tp50'), bot_key)}")
+            lines.append(f"Até TP50: {_v3_ciclos_para_dias_horas(m.get('tempo_tp50'), bot_key)}")
         if m.get("tempo_fechamento") is not None:
-            lines.append(f"Até fechamento: {_v2_ciclos_para_dias_horas(m.get('tempo_fechamento'), bot_key)}")
-        lines += [
-            "",
-            "Auditoria:",
-        ]
+            lines.append(f"Até fechamento: {_v3_ciclos_para_dias_horas(m.get('tempo_fechamento'), bot_key)}")
+        lines += ["", "Auditoria:"]
         if m.get("tempo_tp50") is not None:
-            lines.append(f"TP50: {_v2_fmt_num(m.get('tempo_tp50'), 1)} ciclos")
+            lines.append(f"TP50: {_v3_fmt_num(m.get('tempo_tp50'), 1)} ciclos")
         if m.get("tempo_fechamento") is not None:
-            lines.append(f"Fechamento: {_v2_fmt_num(m.get('tempo_fechamento'), 1)} ciclos")
+            lines.append(f"Fechamento: {_v3_fmt_num(m.get('tempo_fechamento'), 1)} ciclos")
         lines.append("")
 
     if any([m.get("r3"), m.get("r5"), m.get("r10")]):
@@ -1455,7 +1491,6 @@ def build_strategy_executive_metrics_v2(bot_key, summary_text):
             "",
         ]
 
-    # Nota simples, conservadora.
     pf = m.get("profit_factor")
     lucro = m.get("lucro_esperado_pct")
     eg = m.get("eficiencia")
@@ -1476,10 +1511,15 @@ def build_strategy_executive_metrics_v2(bot_key, summary_text):
         nota = "⭐⭐ Atenção"
     lines += ["🏆 Nota da estratégia:", nota]
 
-    return "\n".join(lines).strip()
+    return "\n".join([line for line in lines if line is not None]).strip()
 
 
-def transform_bot_summary_v2(bot_key, summary_text):
+# Compatibilidade com chamadas antigas V2.
+def build_strategy_executive_metrics_v2(bot_key, summary_text):
+    return build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False)
+
+
+def transform_bot_summary_v3(bot_key, summary_text):
     """Transforma nomes técnicos do resumo sem recalcular estratégia."""
     txt = str(summary_text or "")
     if not txt or txt == "N/A":
@@ -1502,16 +1542,20 @@ def transform_bot_summary_v2(bot_key, summary_text):
 
     def repl_tp50(match):
         ciclos = match.group(1)
-        return f"Tempo médio até TP50:\n{_v2_ciclos_para_dias_horas(ciclos, bot_key)} ({_v2_fmt_num(ciclos, 1)} ciclos)"
+        return f"Tempo médio até TP50:\n{_v3_ciclos_para_dias_horas(ciclos, bot_key)} ({_v3_fmt_num(ciclos, 1)} ciclos)"
 
     def repl_close(match):
         ciclos = match.group(1)
-        return f"Tempo médio até fechamento:\n{_v2_ciclos_para_dias_horas(ciclos, bot_key)} ({_v2_fmt_num(ciclos, 1)} ciclos)"
+        return f"Tempo médio até fechamento:\n{_v3_ciclos_para_dias_horas(ciclos, bot_key)} ({_v3_fmt_num(ciclos, 1)} ciclos)"
 
     txt = re.sub(r"Tempo médio até TP50:\s*([\d\.,]+)\s*ciclos de gestão", repl_tp50, txt, flags=re.IGNORECASE)
     txt = re.sub(r"Tempo médio até fechamento:\s*([\d\.,]+)\s*ciclos de gestão", repl_close, txt, flags=re.IGNORECASE)
     return txt
 
+
+# Compatibilidade com chamadas antigas V2.
+def transform_bot_summary_v2(bot_key, summary_text):
+    return transform_bot_summary_v3(bot_key, summary_text)
 
 def _bot_funil_text(key: str, module):
     def _run():
@@ -1577,11 +1621,11 @@ def build_single_bot_report(key: str, complete: bool = True):
     if eventos and eventos != "None":
         parts.append("📋 EVENTOS\n" + _short(eventos, 2200 if complete else 900))
     if resumo and resumo != "None":
-        resumo_v2 = transform_bot_summary_v2(key, resumo)
-        executivo_v2 = build_strategy_executive_metrics_v2(key, resumo)
-        if executivo_v2:
-            parts.append(_short(executivo_v2, 1800 if complete else 800))
-        parts.append("📊 RESUMO\n" + _short(resumo_v2, 3000 if complete else 1200))
+        resumo_v3 = transform_bot_summary_v3(key, resumo)
+        executivo_v3 = build_strategy_executive_metrics_v3(key, resumo, compact=False)
+        if executivo_v3:
+            parts.append(_short(executivo_v3, 2000 if complete else 900))
+        parts.append("📊 RESUMO\n" + _short(resumo_v3, 3000 if complete else 1200))
 
     memory_profile_step(f"build_single_bot_report_end_{key}")
     return "\n\n".join(parts)
@@ -3522,13 +3566,118 @@ def _daily_bot_block_v2(key, cfg, resumo):
     return "\n".join(bloco).strip()
 
 
+def build_daily_risk_summary_v3():
+    """Risk enxuto para /daily."""
+    try:
+        snapshot = central_exposure_snapshot()
+        total = int(snapshot.get("total_positions_open") or 0)
+        longs = int(snapshot.get("long_positions_open") or 0)
+        shorts = int(snapshot.get("short_positions_open") or 0)
+        by_symbol = {}
+        for key, module in LOADED_BOTS.items():
+            try:
+                for p in get_open_positions_from_module(module, key=key):
+                    sym = str(p.get("symbol") or p.get("ativo") or p.get("pair") or "").upper()
+                    if not sym:
+                        continue
+                    by_symbol.setdefault(sym, set()).add(key)
+            except Exception:
+                pass
+
+        repeated = sorted(
+            [(sym, len(bots), sorted(bots)) for sym, bots in by_symbol.items() if len(bots) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE],
+            key=lambda x: x[1],
+            reverse=True,
+        )[:5]
+
+        status = "🔴 BLOQUEAR NOVAS ENTRADAS" if total >= GLOBAL_RISK_MAX_POSITIONS else "🟢 Dentro do limite"
+        lines = [
+            "🛡️ RISCO GLOBAL",
+            f"Posições: {total}/{GLOBAL_RISK_MAX_POSITIONS} | LONG {longs} | SHORT {shorts}",
+            f"Status: {status}",
+        ]
+        if repeated:
+            lines += ["", "Ativos com maior exposição:"]
+            for sym, count, bots in repeated:
+                lines.append(f"- {sym}: {count} bots ({','.join(bots)})")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Erro ao gerar risk compacto: {exc}"
+
+
+def build_daily_ranking_summary_v3():
+    """Ranking enxuto para /daily."""
+    try:
+        txt = build_ranking_report()
+        lines = [line.strip() for line in str(txt).splitlines() if line.strip()]
+        keep = []
+        for line in lines:
+            if line.startswith(("🥇", "🥈", "🥉")):
+                keep.append(line)
+            elif re.match(r"^[4-7]\.", line):
+                # mantém só até 5º para economizar espaço
+                if line.startswith(("4.", "5.")):
+                    keep.append(line)
+        return "🏆 RANKING\n" + "\n".join(keep[:5])
+    except Exception as exc:
+        return f"Erro ao gerar ranking compacto: {exc}"
+
+
+def _daily_core_status_from_summary_v3(bot_key, resumo_text):
+    """Resumo mínimo quando não há leitura executiva útil."""
+    txt = transform_bot_summary_v3(bot_key, resumo_text or "")
+    fields = [
+        "Modo:", "Sinais Falcon:", "Sinais H1 do dia:", "Sinais H1 do período:", "Sinais Donkey do dia:", "Sinais Turtle:",
+        "LONG:", "SHORT:", "Trades encerrados:", "Wins:", "Breakeven:", "Loss:", "Win rate:",
+        "TP50 hoje:", "TP50 atingidos:", "BE hoje:", "Trailing hoje:", "Stops hoje:",
+        "Trades ainda ativos:", "Trades Smart Predator ainda ativos:",
+    ]
+    raw = [line.strip() for line in str(txt).splitlines() if line.strip()]
+    out = []
+    for line in raw:
+        if any(line.startswith(f) for f in fields):
+            out.append(line)
+    return "\n".join(out[:16]).strip()
+
+
+def _daily_bot_block_v3(key, cfg, resumo):
+    m = _v3_bot_metrics_from_summary(key, resumo)
+    header = f"🤖 {key} — {cfg.get('name')}"
+
+    # Sem trades encerrados: não mostrar métricas zeradas.
+    if _v3_is_insufficient_sample(m):
+        sinais = m.get("sinais")
+        sinais_line = f"\nSinais hoje: {int(sinais or 0)}" if sinais is not None else ""
+        core = _daily_core_status_from_summary_v3(key, resumo)
+        return (
+            f"{header}\n"
+            "📈 QUALIDADE EXECUTIVA V3.0\n"
+            "Amostra insuficiente hoje.\n"
+            f"Trades encerrados: {int(m.get('trades') or 0)}{sinais_line}\n"
+            "Aguardar trades encerrados para calcular as métricas.\n"
+            + (("\n" + core) if core else "")
+        ).strip()
+
+    executivo = build_strategy_executive_metrics_v3(key, resumo, compact=True)
+    if executivo:
+        return f"{header}\n{_short(executivo, 900)}"
+
+    core = _daily_core_status_from_summary_v3(key, resumo)
+    if core:
+        return f"{header}\n{core}"
+
+    return f"{header}\n📈 QUALIDADE EXECUTIVA V3.0\nAmostra insuficiente hoje."
+
+
 def build_daily_report():
     """
-    Pacote diário enxuto para colar no ChatGPT.
-    V2.0 final:
-    - Não envia resumo completo duplicado.
-    - Remove labels sem valor.
-    - Evita cortar no meio de seções mantendo blocos menores.
+    Pacote diário executivo para colar no ChatGPT.
+    V3.0:
+    - Risk compacto.
+    - Ranking compacto.
+    - Sem campos vazios.
+    - Sem métricas falsas quando trades encerrados = 0.
+    - R apenas como auditoria/grandes vencedores.
     """
     mem = memory_snapshot("daily_light_memory", store=True)
     status = central_watchdog_status()
@@ -3537,13 +3686,12 @@ def build_daily_report():
     best = exposure_snapshot.get("best_open_runner") or {}
 
     header = [
-        "📅 RELATÓRIO DIÁRIO CONSOLIDADO — CENTRAL QUANT",
+        "📅 DAILY EXECUTIVO — CENTRAL QUANT V3.0",
         f"Data/hora: {data_hora_sp_str()}",
         "",
-        "STATUS TÉCNICO",
+        "STATUS",
         f"Central: {status.get('status')} | OK: {status.get('ok')}",
         f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%) | Threads: {mem.get('threads')}",
-        f"Motivos watchdog: {status.get('reasons', [])}",
         "",
         "EXPOSIÇÃO",
         f"Total: {exposure_snapshot.get('total_positions_open')} | LONG: {exposure_snapshot.get('long_positions_open')} | SHORT: {exposure_snapshot.get('short_positions_open')}",
@@ -3564,21 +3712,11 @@ def build_daily_report():
             f"{best.get('bot')} {best.get('symbol')} {best.get('side')} {best.get('setup')} | {best.get('runner_pct')}% | {best.get('runner_r')}R",
         ]
 
-    try:
-        risk_txt = _short(build_risk_report(), 1000)
-    except Exception as exc:
-        risk_txt = f"Erro ao gerar risk: {exc}"
-
-    try:
-        ranking_txt = _short(build_ranking_report(), 800)
-    except Exception as exc:
-        ranking_txt = f"Erro ao gerar ranking: {exc}"
-
     parts = [
         "\n".join(header),
-        "==============================\nRISK\n==============================\n" + risk_txt,
-        "==============================\nRANKING\n==============================\n" + ranking_txt,
-        "==============================\nROBÔS — LEITURA EXECUTIVA\n==============================",
+        build_daily_risk_summary_v3(),
+        build_daily_ranking_summary_v3(),
+        "🤖 ROBÔS — LEITURA EXECUTIVA",
     ]
 
     for key in BOT_CONFIGS.keys():
@@ -3593,7 +3731,7 @@ def build_daily_report():
         except Exception as exc:
             resumo = f"Erro ao gerar resumo: {exc}"
 
-        parts.append(_daily_bot_block_v2(key, cfg, resumo))
+        parts.append(_daily_bot_block_v3(key, cfg, resumo))
 
     text = "\n\n==============================\n".join(parts)
     force_gc_if_needed("daily_report_end", force=True)
