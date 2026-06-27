@@ -1580,7 +1580,7 @@ def build_single_bot_report(key: str, complete: bool = True):
         resumo_v2 = transform_bot_summary_v2(key, resumo)
         executivo_v2 = build_strategy_executive_metrics_v2(key, resumo)
         if executivo_v2:
-            parts.append(_short(executivo_v2, 2200 if complete else 900))
+            parts.append(_short(executivo_v2, 1800 if complete else 800))
         parts.append("📊 RESUMO\n" + _short(resumo_v2, 3000 if complete else 1200))
 
     memory_profile_step(f"build_single_bot_report_end_{key}")
@@ -3414,6 +3414,42 @@ def build_dashboard_report():
     ]
     return "\n\n".join(parts)
 
+def _line_has_value_v2(line: str) -> bool:
+    """
+    Remove linhas de /daily que são apenas rótulo vazio:
+    Ex.: 'Resultado financeiro:' sem valor logo ao lado.
+    """
+    if line is None:
+        return False
+    s = str(line).strip()
+    if not s:
+        return False
+
+    empty_labels = {
+        "Resultado financeiro:",
+        "Maior lucro durante o trade:",
+        "Maior perda durante o trade:",
+        "Lucro devolvido antes do fechamento:",
+        "Melhor trade:",
+        "Pior trade:",
+        "Grandes vencedores:",
+    }
+    if s in empty_labels:
+        return False
+    return True
+
+
+def _clean_daily_text_v2(text: str) -> str:
+    """Limpa linhas vazias/labels sem valor para deixar /daily mais executivo."""
+    linhas = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not _line_has_value_v2(line):
+            continue
+        linhas.append(line)
+    return "\n".join(linhas).strip()
+
+
 def _extract_daily_summary_core_v2(bot_key, resumo_text, max_len=900):
     """
     Resumo enxuto para /daily.
@@ -3435,27 +3471,64 @@ def _extract_daily_summary_core_v2(bot_key, resumo_text, max_len=900):
     )
 
     linhas = []
-    for raw in str(txt).splitlines():
-        line = raw.strip()
+    raw_lines = [line.strip() for line in str(txt).splitlines()]
+
+    for i, line in enumerate(raw_lines):
         if not line:
             continue
         if line.startswith(("📊", "🦅", "🐢", "🐴", "📈", "🦈")):
             continue
         if any(line.startswith(pref) for pref in keep_prefixes):
-            linhas.append(line)
+            # Se for label sozinho e a próxima linha estiver vazia/ausente, remove.
+            if line.endswith(":") and i + 1 < len(raw_lines):
+                nxt = raw_lines[i + 1].strip()
+                if nxt:
+                    linhas.append(line)
+                    # Mantém a linha seguinte quando ela é o valor do label.
+                    if not any(nxt.startswith(pref) for pref in keep_prefixes):
+                        linhas.append(nxt)
+                elif _line_has_value_v2(line):
+                    linhas.append(line)
+            elif _line_has_value_v2(line):
+                linhas.append(line)
 
     if not linhas:
         linhas = [line.strip() for line in str(txt).splitlines() if line.strip()][:20]
 
-    out = "\n".join(linhas)
+    out = _clean_daily_text_v2("\n".join(linhas))
     return _short(out, max_len)
+
+
+def _daily_bot_block_v2(key, cfg, resumo):
+    """
+    Monta bloco diário curto por robô.
+    Regra:
+    - Se há leitura executiva, usa ela.
+    - Se não há dados suficientes, mostra status operacional + amostra insuficiente.
+    - Nunca deixa labels sem valor.
+    """
+    executivo_v2 = build_strategy_executive_metrics_v2(key, resumo)
+    bloco = [f"🤖 {key} — {cfg.get('name')}"]
+
+    if executivo_v2:
+        bloco.append(_short(_clean_daily_text_v2(executivo_v2), 950))
+    else:
+        core = _extract_daily_summary_core_v2(key, resumo, max_len=750)
+        if core and core != "N/A":
+            bloco.append(core)
+        else:
+            bloco.append("📈 QUALIDADE EXECUTIVA V2.0\nAmostra insuficiente hoje.\nAguardar trades encerrados.")
+
+    return "\n".join(bloco).strip()
 
 
 def build_daily_report():
     """
     Pacote diário enxuto para colar no ChatGPT.
-    V2.0: não tenta enviar o relatório completo dos robôs.
-    Envia leitura executiva + resumo compacto para evitar corte em parte 3/3.
+    V2.0 final:
+    - Não envia resumo completo duplicado.
+    - Remove labels sem valor.
+    - Evita cortar no meio de seções mantendo blocos menores.
     """
     mem = memory_snapshot("daily_light_memory", store=True)
     status = central_watchdog_status()
@@ -3492,12 +3565,12 @@ def build_daily_report():
         ]
 
     try:
-        risk_txt = _short(build_risk_report(), 1200)
+        risk_txt = _short(build_risk_report(), 1000)
     except Exception as exc:
         risk_txt = f"Erro ao gerar risk: {exc}"
 
     try:
-        ranking_txt = _short(build_ranking_report(), 900)
+        ranking_txt = _short(build_ranking_report(), 800)
     except Exception as exc:
         ranking_txt = f"Erro ao gerar ranking: {exc}"
 
@@ -3520,15 +3593,7 @@ def build_daily_report():
         except Exception as exc:
             resumo = f"Erro ao gerar resumo: {exc}"
 
-        executivo_v2 = build_strategy_executive_metrics_v2(key, resumo)
-        bloco_bot = [f"🤖 {key} — {cfg.get('name')}"]
-
-        if executivo_v2:
-            bloco_bot.append(_short(executivo_v2, 1200))
-        else:
-            bloco_bot.append(_extract_daily_summary_core_v2(key, resumo, max_len=900))
-
-        parts.append("\n".join(bloco_bot))
+        parts.append(_daily_bot_block_v2(key, cfg, resumo))
 
     text = "\n\n==============================\n".join(parts)
     force_gc_if_needed("daily_report_end", force=True)
