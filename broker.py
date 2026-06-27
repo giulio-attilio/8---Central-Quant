@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-06-27-BROKER-BINGX-SAFE-V1-MARGIN-LEVERAGE-FIX
+# Versão: 2026-06-27-BROKER-BINGX-SAFE-V1-MARGIN-LEVERAGE-DISPLAY-FIX
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -12,6 +12,16 @@
 # - Em LIVE, enviar automaticamente apenas se EXECUTION_MODE=LIVE,
 #   ENABLE_REAL_TRADING=true e BROKER_DRY_RUN=false.
 #
+# Correções desta versão:
+# - Corrige bug "name 'margin' is not defined" em amount_details().
+# - Mantém margem/alavancagem por robô via Render.
+# - Calcula quantidade pela exposição efetiva = margem * alavancagem.
+# - Arredonda campos exibidos para evitar floats como 59.138999999999996.
+# - Adiciona campos de apresentação para VERIFY:
+#   margin_usdt_display, leverage_display, planned_exposure_usdt_display,
+#   actual_exposure_usdt_display, estimated_margin_after_open_usdt_display,
+#   estimated_max_loss_usdt_display.
+#
 # Variáveis principais no Render:
 # - BINGX_API_KEY
 # - BINGX_API_SECRET
@@ -22,7 +32,7 @@
 # - DEFAULT_REAL_MARGIN_USDT=20
 # - DEFAULT_REAL_LEVERAGE=3
 # - <BOT>_REAL_MARGIN_USDT / <BOT>_REAL_LEVERAGE para configuração por robô
-# - BINGX_DEFAULT_LEVERAGE=1 (fallback legado)
+# - BINGX_DEFAULT_LEVERAGE=3
 # - BINGX_TIMEOUT_MS=15000
 # ============================================================================
 
@@ -93,6 +103,19 @@ def agora_sp_str():
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def round_float(value, ndigits=8, default=None):
+    try:
+        if value is None:
+            return default
+        return round(float(value), ndigits)
+    except Exception:
+        return default
+
+
+def money(value, ndigits=2, default=None):
+    return round_float(value, ndigits=ndigits, default=default)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -251,6 +274,7 @@ def status_payload(check_ready: bool = False):
         "default_leverage": BINGX_DEFAULT_LEVERAGE,
         "default_real_margin_usdt": DEFAULT_REAL_MARGIN_USDT,
         "default_real_leverage": DEFAULT_REAL_LEVERAGE,
+        "default_effective_notional_usdt": DEFAULT_REAL_MARGIN_USDT * DEFAULT_REAL_LEVERAGE,
         "timeout_ms": BINGX_TIMEOUT_MS,
     }
     if check_ready:
@@ -323,7 +347,13 @@ def market_info(symbol):
 
 def _bot_env_prefix(bot):
     bot = str(bot or "").upper().strip()
-    aliases = {"TRENDPRO": "TREND", "SMARTPREDATOR": "PREDATOR", "SMART_PREDATOR": "PREDATOR"}
+    aliases = {
+        "TRENDPRO": "TREND",
+        "TREND_PRO": "TREND",
+        "SMARTPREDATOR": "PREDATOR",
+        "SMART_PREDATOR": "PREDATOR",
+        "SMART PREDATOR": "PREDATOR",
+    }
     return aliases.get(bot, bot)
 
 
@@ -354,19 +384,22 @@ def execution_config_for_bot(bot=None, margin_usdt=None, leverage=None):
     if lev <= 0:
         lev = DEFAULT_REAL_LEVERAGE
 
+    planned_exposure = float(margin) * int(lev)
+
     return {
         "bot": prefix or None,
         "margin_usdt": float(margin),
         "leverage": int(lev),
-        "effective_notional_usdt": float(margin) * int(lev),
+        "effective_notional_usdt": planned_exposure,
+        "planned_exposure_usdt": planned_exposure,
         "margin_mode": BINGX_MARGIN_MODE,
     }
 
 
 def amount_from_notional(symbol, notional_usdt):
     """
-    Calcula quantidade a partir do notional e retorna tupla:
-    (amount, price_ref)
+    Calcula quantidade a partir do notional e retorna tupla compatível:
+    amount, price_ref.
     """
     details = amount_details(symbol, notional_usdt)
     return details["amount"], details["price_ref"]
@@ -374,20 +407,16 @@ def amount_from_notional(symbol, notional_usdt):
 
 def amount_details(symbol, notional_usdt, margin_usdt=None, leverage=None):
     """
-    Calcula amount/quantidade com base no notional efetivo.
-
-    Correção importante:
-    - Esta função NÃO usa mais variáveis soltas `margin` ou `lev`.
-    - margin_usdt/leverage são opcionais e entram apenas como metadados.
-    - O cálculo da quantidade usa sempre notional_usdt recebido.
+    Calcula quantidade a partir da exposição efetiva em USDT.
+    Não usa variáveis externas margin/lev para evitar NameError.
     """
     sym = normalize_symbol(symbol)
     price = fetch_last_price(sym)
     if price <= 0:
         raise RuntimeError(f"preço inválido para {symbol}: {price}")
 
-    notional = float(notional_usdt)
-    raw_amount = notional / price
+    planned_notional = float(notional_usdt)
+    raw_amount = planned_notional / price
 
     ex = exchange()
     market = None
@@ -395,17 +424,13 @@ def amount_details(symbol, notional_usdt, margin_usdt=None, leverage=None):
     precision_error = None
 
     try:
-        try:
-            ex.load_markets()
-        except Exception:
-            pass
         market = ex.market(sym)
         amount = float(ex.amount_to_precision(market["symbol"], raw_amount))
     except Exception as exc:
         precision_error = str(exc)
         amount = round(raw_amount, 6)
 
-    effective_notional = amount * price if amount is not None and price is not None else None
+    actual_notional = amount * price if amount is not None and price is not None else None
     info = market_info(sym) if market else {"symbol": sym}
 
     return {
@@ -414,11 +439,15 @@ def amount_details(symbol, notional_usdt, margin_usdt=None, leverage=None):
         "bingx_symbol": bingx_api_symbol(sym),
         "margin_usdt": margin_usdt,
         "leverage": leverage,
-        "notional_usdt": notional,
+        "planned_notional_usdt": planned_notional,
+        "notional_usdt": money(actual_notional, 8),
+        "planned_exposure_usdt": money(planned_notional, 8),
+        "actual_exposure_usdt": money(actual_notional, 8),
         "price_ref": price,
         "amount_raw": raw_amount,
         "amount": amount,
-        "effective_notional_usdt": effective_notional,
+        "amount_final": amount,
+        "effective_notional_usdt": money(actual_notional, 8),
         "precision_error": precision_error,
         "market": info,
     }
@@ -429,6 +458,7 @@ def ready_check(cache_seconds: int = 30):
     now = time.time()
     if _last_ready is not None and now - _last_ready_ts <= cache_seconds:
         return dict(_last_ready)
+
     started = time.perf_counter()
     try:
         ex = exchange()
@@ -460,6 +490,7 @@ def ready_check(cache_seconds: int = 30):
             "api_secret_configured": bool(BINGX_API_SECRET),
             "api_key_masked": mask_secret(BINGX_API_KEY),
         }
+
     _last_ready = dict(payload)
     _last_ready_ts = now
     return payload
@@ -469,10 +500,24 @@ def ready_check(cache_seconds: int = 30):
 # ORDER PREVIEW / VERIFY
 # ============================================================================
 
-def build_order_preview(symbol, side, margin_usdt=None, reduce_only=False, client_tag=None, leverage=None, bot=None, notional_usdt=None):
+def build_order_preview(
+    symbol,
+    side,
+    margin_usdt=None,
+    reduce_only=False,
+    client_tag=None,
+    leverage=None,
+    bot=None,
+    notional_usdt=None,
+    risk_pct=None,
+    free_balance_usdt=None,
+):
     """
     Monta a prévia completa de uma ordem market.
     Não envia nada. Usada em READY/VERIFY e para debug antes do LIVE.
+
+    risk_pct é opcional e pode ser passado pelo robô para calcular perda máxima estimada.
+    free_balance_usdt é opcional. Se não vier, tentamos usar get_balance().
     """
     started = time.perf_counter()
     sym = normalize_symbol(symbol)
@@ -482,13 +527,31 @@ def build_order_preview(symbol, side, margin_usdt=None, reduce_only=False, clien
     cfg = execution_config_for_bot(bot=bot, margin_usdt=margin_usdt, leverage=leverage)
     margin = cfg["margin_usdt"]
     lev = cfg["leverage"]
-    effective_notional = float(notional_usdt) if notional_usdt is not None else cfg["effective_notional_usdt"]
+    planned_exposure = float(notional_usdt) if notional_usdt is not None else cfg["effective_notional_usdt"]
 
-    details = amount_details(sym, effective_notional, margin_usdt=margin, leverage=lev)
+    details = amount_details(sym, planned_exposure, margin_usdt=margin, leverage=lev)
     amount = details["amount"]
     price = details["price_ref"]
     market = details.get("market") or {}
+    actual_exposure = details.get("effective_notional_usdt")
+
     client_order_id = str(client_tag or f"CQ-{int(time.time())}")[:32]
+
+    free_balance = safe_float(free_balance_usdt)
+    if free_balance is None:
+        try:
+            free_balance = safe_float(get_balance().get("free_usdt"))
+        except Exception:
+            free_balance = None
+
+    estimated_margin_after_open = None
+    if free_balance is not None:
+        estimated_margin_after_open = free_balance - margin
+
+    risk_pct_val = safe_float(risk_pct)
+    estimated_max_loss_usdt = None
+    if risk_pct_val is not None and actual_exposure is not None:
+        estimated_max_loss_usdt = float(actual_exposure) * (risk_pct_val / 100.0)
 
     # Payload informativo baseado no endpoint REST da BingX.
     # O envio real usa ccxt, mas esta estrutura valida a assinatura e a ordem que seria enviada.
@@ -517,6 +580,25 @@ def build_order_preview(symbol, side, margin_usdt=None, reduce_only=False, clien
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
 
+    precision_payload = {
+        "amount_raw": details.get("amount_raw"),
+        "amount_final": amount,
+        "amount": amount,
+        "price_ref": price,
+        "planned_exposure_usdt": money(planned_exposure, 2),
+        "actual_exposure_usdt": money(actual_exposure, 2),
+        "effective_notional_usdt": money(actual_exposure, 2),
+        "market_symbol": market.get("symbol", sym),
+        "market_id": market.get("id"),
+        "amount_precision": market.get("amount_precision"),
+        "price_precision": market.get("price_precision"),
+        "min_amount": market.get("min_amount"),
+        "min_cost": market.get("min_cost"),
+        "precision_raw": market.get("precision"),
+        "limits_raw": market.get("limits"),
+        "precision_error": details.get("precision_error"),
+    }
+
     return {
         "ok": True,
         "status": "PREVIEW",
@@ -540,29 +622,28 @@ def build_order_preview(symbol, side, margin_usdt=None, reduce_only=False, clien
         "client_tag": client_tag,
         "client_order_id": client_order_id,
         "margin_usdt": margin,
+        "margin_usdt_display": money(margin, 2),
         "leverage": lev,
-        "notional_usdt": effective_notional,
+        "leverage_display": f"{lev}x",
+        "notional_usdt": money(actual_exposure, 8),
+        "planned_exposure_usdt": money(planned_exposure, 8),
+        "planned_exposure_usdt_display": money(planned_exposure, 2),
+        "actual_exposure_usdt": money(actual_exposure, 8),
+        "actual_exposure_usdt_display": money(actual_exposure, 2),
+        "effective_notional_usdt": money(actual_exposure, 8),
+        "effective_notional_usdt_display": money(actual_exposure, 2),
         "price_ref": price,
         "amount_raw": details.get("amount_raw"),
         "amount": amount,
-        "effective_notional_usdt": details.get("effective_notional_usdt"),
+        "amount_final": amount,
         "margin_mode": BINGX_MARGIN_MODE,
-        "precision": {
-            "amount_raw": details.get("amount_raw"),
-            "amount_final": amount,
-            "amount": amount,
-            "price_ref": price,
-            "effective_notional_usdt": details.get("effective_notional_usdt"),
-            "market_symbol": market.get("symbol", sym),
-            "market_id": market.get("id"),
-            "amount_precision": market.get("amount_precision"),
-            "price_precision": market.get("price_precision"),
-            "min_amount": market.get("min_amount"),
-            "min_cost": market.get("min_cost"),
-            "precision_raw": market.get("precision"),
-            "limits_raw": market.get("limits"),
-            "precision_error": details.get("precision_error"),
-        },
+        "free_balance_usdt": free_balance,
+        "estimated_margin_after_open_usdt": money(estimated_margin_after_open, 8),
+        "estimated_margin_after_open_usdt_display": money(estimated_margin_after_open, 2),
+        "risk_pct": risk_pct_val,
+        "estimated_max_loss_usdt": money(estimated_max_loss_usdt, 8),
+        "estimated_max_loss_usdt_display": money(estimated_max_loss_usdt, 4),
+        "precision": precision_payload,
         "limits": market.get("limits"),
         "amount_precision": market.get("amount_precision"),
         "price_precision": market.get("price_precision"),
@@ -581,11 +662,25 @@ def build_order_preview(symbol, side, margin_usdt=None, reduce_only=False, clien
 
 
 def format_order_preview_text(preview: dict, title: str = "🧪 VERIFY BINGX") -> str:
-    """Texto curto para Telegram/log, caso a Central/Falcon queira exibir a prévia."""
+    """Texto curto para Telegram/log, caso a Central/Falcon/Predator queira exibir a prévia."""
     if not isinstance(preview, dict):
         return f"{title}\nPrévia indisponível."
     if not preview.get("ok"):
         return f"{title}\n❌ {preview.get('status')}\nErro: {preview.get('error')}"
+
+    risk_line = ""
+    if preview.get("risk_pct") is not None:
+        risk_line = (
+            f"Risco setup: {preview.get('risk_pct')}%\n"
+            f"Perda máx. estimada: {preview.get('estimated_max_loss_usdt_display')} USDT\n"
+        )
+
+    balance_line = ""
+    if preview.get("free_balance_usdt") is not None:
+        balance_line = (
+            f"Saldo livre atual: {preview.get('free_balance_usdt')} USDT\n"
+            f"Saldo livre após abertura estimado: {preview.get('estimated_margin_after_open_usdt_display')} USDT\n"
+        )
 
     return (
         f"{title}\n\n"
@@ -594,13 +689,17 @@ def format_order_preview_text(preview: dict, title: str = "🧪 VERIFY BINGX") -
         f"Exchange: {preview.get('exchange')} | Endpoint: {preview.get('method')} {preview.get('endpoint')}\n\n"
         f"Símbolo: {preview.get('symbol')} | BingX: {preview.get('bingx_symbol')}\n"
         f"Side: {preview.get('api_side')} | Type: MARKET | ReduceOnly: {preview.get('reduce_only')}\n"
-        f"Margin: {preview.get('margin_mode')} | Leverage: {preview.get('leverage')}x\n"
-        f"Margem usada: {preview.get('margin_usdt')} USDT\n"
-        f"Exposição efetiva: {preview.get('notional_usdt')} USDT\n\n"
+        f"Margin: {preview.get('margin_mode')} | Leverage: {preview.get('leverage_display')}\n\n"
+        f"EXECUÇÃO\n"
+        f"Margem usada: {preview.get('margin_usdt_display')} USDT\n"
+        f"Alavancagem: {preview.get('leverage_display')}\n"
+        f"Exposição planejada: {preview.get('planned_exposure_usdt_display')} USDT\n"
+        f"Exposição efetiva: {preview.get('actual_exposure_usdt_display')} USDT\n"
         f"Preço ref.: {preview.get('price_ref')}\n"
         f"Quantidade raw: {preview.get('amount_raw')}\n"
         f"Quantidade enviada: {preview.get('amount')}\n"
-        f"Notional efetivo: {preview.get('effective_notional_usdt')} USDT\n\n"
+        f"{risk_line}"
+        f"{balance_line}\n"
         f"Market ID: {preview.get('market_id')}\n"
         f"Amount precision: {preview.get('amount_precision')} | Price precision: {preview.get('price_precision')}\n"
         f"Min amount: {preview.get('min_amount')} | Min cost: {preview.get('min_cost')}\n\n"
@@ -616,7 +715,18 @@ def format_order_preview_text(preview: dict, title: str = "🧪 VERIFY BINGX") -
 # ORDER EXECUTION
 # ============================================================================
 
-def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client_tag=None, leverage=None, bot=None, notional_usdt=None):
+def place_market_order(
+    symbol,
+    side,
+    margin_usdt=None,
+    reduce_only=False,
+    client_tag=None,
+    leverage=None,
+    bot=None,
+    notional_usdt=None,
+    risk_pct=None,
+    free_balance_usdt=None,
+):
     """
     Envia ordem market apenas se LIVE + ENABLE_REAL_TRADING=true + BROKER_DRY_RUN=false.
     Caso contrário, retorna DRY_RUN/PREVIEW sem enviar nada.
@@ -628,18 +738,18 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
     cfg = execution_config_for_bot(bot=bot, margin_usdt=margin_usdt, leverage=leverage)
     margin = cfg["margin_usdt"]
     lev = cfg["leverage"]
-    effective_notional = float(notional_usdt) if notional_usdt is not None else cfg["effective_notional_usdt"]
+    planned_exposure = float(notional_usdt) if notional_usdt is not None else cfg["effective_notional_usdt"]
 
-    if margin <= 0 or effective_notional <= 0:
+    if margin <= 0 or planned_exposure <= 0:
         return {
             "ok": False,
             "status": "REJECTED",
             "sent": False,
-            "error": "margin/effective_notional inválido",
+            "error": "margin/planned_exposure inválido",
             "symbol": sym,
             "margin_usdt": margin,
             "leverage": lev,
-            "notional_usdt": effective_notional,
+            "notional_usdt": planned_exposure,
         }
 
     # PAPER/READY/VERIFY nunca enviam ordem real.
@@ -653,7 +763,9 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
                 client_tag=client_tag,
                 leverage=lev,
                 bot=bot,
-                notional_usdt=effective_notional,
+                notional_usdt=planned_exposure,
+                risk_pct=risk_pct,
+                free_balance_usdt=free_balance_usdt,
             )
             preview.update({
                 "status": "DRY_RUN" if EXECUTION_MODE != "VERIFY" else "VERIFY",
@@ -670,6 +782,8 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
                 "margin_usdt": preview.get("margin_usdt"),
                 "leverage": preview.get("leverage"),
                 "notional_usdt": preview.get("notional_usdt"),
+                "planned_exposure_usdt": preview.get("planned_exposure_usdt"),
+                "actual_exposure_usdt": preview.get("actual_exposure_usdt"),
                 "amount": preview.get("amount"),
                 "price_ref": preview.get("price_ref"),
                 "client_order_id": preview.get("client_order_id"),
@@ -680,6 +794,8 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
                 "market_symbol": preview.get("market_symbol"),
                 "effective_notional_usdt": preview.get("effective_notional_usdt"),
                 "signature_ok": preview.get("signature_ok"),
+                "risk_pct": preview.get("risk_pct"),
+                "estimated_max_loss_usdt": preview.get("estimated_max_loss_usdt"),
             })
             return preview
         except Exception as exc:
@@ -691,7 +807,7 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
                 "side": order_side,
                 "margin_usdt": margin,
                 "leverage": lev,
-                "notional_usdt": effective_notional,
+                "notional_usdt": planned_exposure,
                 "error": str(exc),
                 "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                 "reason": "falha ao montar prévia dry-run",
@@ -701,7 +817,14 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
 
     ready = ready_check(cache_seconds=0)
     if not ready.get("ok"):
-        result = {"ok": False, "status": "NOT_READY", "sent": False, "symbol": sym, "error": ready.get("error"), "ready": ready}
+        result = {
+            "ok": False,
+            "status": "NOT_READY",
+            "sent": False,
+            "symbol": sym,
+            "error": ready.get("error"),
+            "ready": ready,
+        }
         log_execution_event({"event": "place_market_order", **result})
         return result
 
@@ -714,7 +837,9 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
             client_tag=client_tag,
             leverage=lev,
             bot=bot,
-            notional_usdt=effective_notional,
+            notional_usdt=planned_exposure,
+            risk_pct=risk_pct,
+            free_balance_usdt=free_balance_usdt,
         )
         amount = preview["amount"]
         price = preview["price_ref"]
@@ -727,7 +852,7 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
             "side": order_side,
             "margin_usdt": margin,
             "leverage": lev,
-            "notional_usdt": effective_notional,
+            "notional_usdt": planned_exposure,
             "error": str(exc),
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         }
@@ -738,12 +863,10 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
     if reduce_only:
         params["reduceOnly"] = True
     if client_tag:
-        # Algumas corretoras ignoram; mantemos como metadado se aceito.
         params["clientOrderId"] = str(client_tag)[:32]
 
     ex = exchange()
     try:
-        # Tentativa conservadora de leverage/margin. Se falhar, não bloqueia ordem.
         margin_set = None
         leverage_set = None
         try:
@@ -771,7 +894,9 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
             "api_side": bingx_api_side(side),
             "margin_usdt": margin,
             "leverage": lev,
-            "notional_usdt": effective_notional,
+            "notional_usdt": preview.get("notional_usdt"),
+            "planned_exposure_usdt": preview.get("planned_exposure_usdt"),
+            "actual_exposure_usdt": preview.get("actual_exposure_usdt"),
             "amount": amount,
             "price_ref": price,
             "margin_mode": BINGX_MARGIN_MODE,
@@ -795,7 +920,7 @@ def place_market_order(symbol, side, margin_usdt=None, reduce_only=False, client
             "side": order_side,
             "margin_usdt": margin,
             "leverage": lev,
-            "notional_usdt": effective_notional,
+            "notional_usdt": planned_exposure,
             "amount": preview.get("amount") if isinstance(preview, dict) else None,
             "price_ref": preview.get("price_ref") if isinstance(preview, dict) else None,
             "preview": preview if isinstance(preview, dict) else None,
@@ -810,6 +935,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
     """Fechamento simples. side deve ser lado da posição: LONG fecha vendendo; SHORT fecha comprando."""
     close_side = "sell" if str(side).upper() in {"LONG", "BUY"} else "buy"
     sym = normalize_symbol(symbol)
+
     if amount is None:
         if notional_usdt is None:
             return {"ok": False, "status": "REJECTED", "sent": False, "error": "amount ou notional_usdt obrigatório"}
@@ -851,7 +977,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
         log_execution_event({"event": "close_position_market", **{k: v for k, v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
-        return {
+        result = {
             "ok": False,
             "status": "ERROR",
             "sent": False,
@@ -862,4 +988,6 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "error": str(exc),
         }
+        log_execution_event({"event": "close_position_market", **result})
+        return result
 
