@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-27-CENTRAL-V3-0-FINAL-STABLE-EVOLUTION
+# Versão: 2026-06-27-CENTRAL-V3-1-FINAL-STABLE
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -1384,7 +1384,23 @@ def _v3_bot_metrics_from_summary(bot_key, summary_text):
 
 
 
+V3_MIN_TRADES_FOR_RATING = int(os.environ.get('V3_MIN_TRADES_FOR_RATING', '5'))
+
 def _v3_strategy_score_0_10(metrics):
+    """
+    Nota executiva 0-10.
+    Só calcula nota quando há amostra mínima.
+    Regra V3.1:
+    - Trades encerrados < V3_MIN_TRADES_FOR_RATING → Nota N/A / Amostra insuficiente.
+    """
+    trades = metrics.get("trades")
+    if trades is not None:
+        try:
+            if float(trades) < V3_MIN_TRADES_FOR_RATING:
+                return None
+        except Exception:
+            pass
+
     pf = metrics.get("profit_factor")
     lucro = metrics.get("lucro_esperado_pct")
     eg = metrics.get("eficiencia")
@@ -1430,11 +1446,11 @@ def _v3_strategy_score_0_10(metrics):
 
 def _v3_note_label(score):
     if score is None:
-        return "⚪ N/A"
+        return "Amostra insuficiente"
     try:
         score = float(score)
     except Exception:
-        return "⚪ N/A"
+        return "Amostra insuficiente"
     if score >= 8.5:
         return "⭐⭐⭐⭐⭐ Excelente"
     if score >= 7.0:
@@ -1444,28 +1460,42 @@ def _v3_note_label(score):
     return "⭐⭐ Atenção"
 
 
+def _v3_pct_from_r_and_avg_r(r_value, avg_r_value):
+    """
+    Converte uma métrica em R para uma estimativa em % usando a relação:
+    1R financeiro médio ≈ MFE% / MFE_R, quando disponível.
+    É uma aproximação para deixar o painel executivo mais didático.
+    """
+    r = _v3_text_to_float(r_value, None)
+    avg_r = _v3_text_to_float(avg_r_value, None)
+    if r is None or avg_r is None or avg_r == 0:
+        return None
+    return r * avg_r
+
+
+
 def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
     """
-    Camada única da Central V3.0.
+    Camada única da Central V3.1.
     Não altera a lógica dos robôs: apenas traduz métricas para linguagem executiva.
     """
     m = _v3_bot_metrics_from_summary(bot_key, summary_text)
     has_any = any(v not in (None, 0, "") for v in m.values())
     if not has_any:
-        return "📈 QUALIDADE EXECUTIVA V3.0\nAmostra insuficiente hoje.\nAguardar trades encerrados."
+        return "📈 QUALIDADE EXECUTIVA V3.1\nAmostra insuficiente hoje.\nAguardar trades encerrados."
 
     if _v3_is_insufficient_sample(m):
         sinais_txt = ""
         if m.get("sinais") is not None:
             sinais_txt = f"\nSinais hoje: {int(m.get('sinais') or 0)}"
         return (
-            "📈 QUALIDADE EXECUTIVA V3.0\n"
+            "📈 QUALIDADE EXECUTIVA V3.1\n"
             "Amostra insuficiente hoje.\n"
             f"Trades encerrados: {int(m.get('trades') or 0)}{sinais_txt}\n"
             "Aguardar trades encerrados para calcular Profit Factor, lucro esperado e eficiência."
         )
 
-    lines = ["📈 QUALIDADE EXECUTIVA V3.0", ""]
+    lines = ["📈 QUALIDADE EXECUTIVA V3.1", ""]
 
     if m.get("profit_factor") is not None:
         lines += ["Profit Factor:", f"{_v3_fmt_num(m.get('profit_factor'))} {_v3_classificar_profit_factor(m.get('profit_factor'))}", ""]
@@ -1483,10 +1513,16 @@ def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
         lines += ["Auditoria em R:", f"Expectativa técnica: {_v3_fmt_num(m.get('expectancy_r'))}R", ""]
 
     if not compact and m.get("pos_tp50_r") is not None:
-        lines += ["Lucro médio após TP50:", f"{_v3_fmt_num(m.get('pos_tp50_r'))}x o risco inicial (auditoria)", ""]
+        pos_tp50_pct = _v3_pct_from_r_and_avg_r(m.get("pos_tp50_r"), m.get("mfe"))
+        lines += ["Lucro médio após TP50:"]
+        if pos_tp50_pct is not None:
+            lines.append(f"+{_v3_fmt_num(m.get('pos_tp50_r'))}R ({_v3_fmt_pct(pos_tp50_pct)})")
+        else:
+            lines.append(f"+{_v3_fmt_num(m.get('pos_tp50_r'))}R")
+        lines += ["Auditoria:", f"{_v3_fmt_num(m.get('pos_tp50_r'))} vezes o risco inicial", ""]
 
     if m.get("captura") is not None:
-        lines += ["Aproveitamento da tendência:", f"{_v3_fmt_num(m.get('captura'))}%", _v3_classificar_captura(m.get("captura")), ""]
+        lines += ["Aproveitamento da tendência:", f"{_v3_fmt_num(m.get('captura'))}% {_v3_classificar_captura(m.get('captura'))}", ""]
 
     if m.get("mfe") is not None:
         lines += ["Maior lucro durante o trade:", _v3_fmt_pct(m.get("mfe")), ""]
@@ -1496,9 +1532,9 @@ def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
         lines += ["Lucro devolvido antes do fechamento:", f"{_v3_fmt_pct(m.get('devolucao'), sinal=False)} {_v3_classificar_devolucao(m.get('devolucao'))}", ""]
 
     if m.get("pnl_pct") is not None:
-        lines += ["Resultado financeiro:", f"Financeiro: {_v3_fmt_pct(m.get('pnl_pct'))}"]
+        lines += ["Resultado financeiro:", _v3_fmt_pct(m.get("pnl_pct"))]
         if not compact and m.get("expectancy_r") is not None:
-            lines.append(f"Resultado técnico: {_v3_fmt_num(m.get('expectancy_r'))}R")
+            lines += ["", "Resultado técnico:", f"{_v3_fmt_num(m.get('expectancy_r'))}R"]
         lines.append("")
 
     if not compact and (m.get("tempo_tp50") is not None or m.get("tempo_fechamento") is not None):
@@ -1518,7 +1554,15 @@ def build_strategy_executive_metrics_v3(bot_key, summary_text, compact=False):
         lines += ["Grandes vencedores:", f"Acima de 3R: {m.get('r3')}", f"Acima de 5R: {m.get('r5')}", f"Acima de 10R: {m.get('r10')}", ""]
 
     score10 = _v3_strategy_score_0_10(m)
-    lines += ["🏆 Nota da estratégia:", f"{_v3_fmt_num(score10, 1)}/10" if score10 is not None else "N/A", _v3_note_label(score10)]
+    lines += ["🏆 Nota da estratégia:"]
+    if score10 is None:
+        trades = m.get("trades")
+        if trades is not None:
+            lines.append(f"Trades encerrados < {V3_MIN_TRADES_FOR_RATING}")
+        lines += ["Nota:", "N/A", "Amostra insuficiente"]
+    else:
+        lines += [f"{_v3_fmt_num(score10, 1)}/10", _v3_note_label(score10)]
+
     return "\n".join([line for line in lines if line is not None]).strip()
 
 
@@ -3620,22 +3664,31 @@ def build_daily_risk_summary_v3():
 def build_daily_ranking_summary_v3():
     """
     Ranking executivo para /daily.
-    Esconde score interno e mostra nota estimada quando possível.
+    V3.1:
+    - Robôs com menos de V3_MIN_TRADES_FOR_RATING trades não entram no ranking competitivo.
+    - São listados como N/A / Amostra insuficiente.
     """
     try:
         exp = central_exposure_snapshot()
         ranked = []
+        insufficient = []
+
         for key in BOT_CONFIGS.keys():
             module = LOADED_BOTS.get(key)
             cfg = BOT_CONFIGS.get(key, {})
             if not module:
                 continue
+
             nota = None
+            trades = None
             try:
                 resumo = _bot_resumo_text(key, module)
-                nota = _v3_strategy_score_0_10(_v3_bot_metrics_from_summary(key, resumo))
+                m = _v3_bot_metrics_from_summary(key, resumo)
+                trades = m.get("trades")
+                nota = _v3_strategy_score_0_10(m)
             except Exception:
-                pass
+                m = {}
+
             runner = 0.0
             try:
                 bot_exp = (exp.get("by_bot") or {}).get(key, {}) or {}
@@ -3643,20 +3696,35 @@ def build_daily_ranking_summary_v3():
                 runner = float(best.get("runner_r") or 0.0)
             except Exception:
                 runner = 0.0
-            sort_score = (nota if nota is not None else 0.0) + min(max(runner, 0.0), 5.0) * 0.2
+
+            if nota is None:
+                insufficient.append((key, cfg.get("name"), trades, runner))
+                continue
+
+            sort_score = nota + min(max(runner, 0.0), 5.0) * 0.2
             ranked.append((sort_score, key, cfg.get("name"), nota, runner))
 
         ranked.sort(reverse=True, key=lambda x: x[0])
         medals = ["🥇", "🥈", "🥉", "4.", "5."]
         lines = ["🏆 RANKING EXECUTIVO"]
-        for idx, item in enumerate(ranked[:5]):
-            _score, key, name, nota, runner = item
-            prefix = medals[idx] if idx < len(medals) else f"{idx+1}."
-            nota_txt = f"Nota {_v3_fmt_num(nota, 1)}/10" if nota is not None else "Nota N/A"
-            stars = _v3_note_label(nota)
-            runner_txt = f" | runner {runner:.2f}R" if runner and runner > 0 else ""
-            lines.append(f"{prefix} {key} — {name}")
-            lines.append(f"{nota_txt} | {stars}{runner_txt}")
+
+        if ranked:
+            for idx, item in enumerate(ranked[:5]):
+                _score, key, name, nota, runner = item
+                prefix = medals[idx] if idx < len(medals) else f"{idx+1}."
+                runner_txt = f" | runner {runner:.2f}R" if runner and runner > 0 else ""
+                lines.append(f"{prefix} {key} — {name}")
+                lines.append(f"Nota {_v3_fmt_num(nota, 1)}/10 | {_v3_note_label(nota)}{runner_txt}")
+        else:
+            lines.append("Nenhum robô com amostra suficiente hoje.")
+
+        if insufficient:
+            lines += ["", "Amostra insuficiente:"]
+            for key, name, trades, runner in insufficient[:7]:
+                trades_txt = f"trades={int(trades or 0)}" if trades is not None else "trades=N/A"
+                runner_txt = f" | runner {runner:.2f}R" if runner and runner > 0 else ""
+                lines.append(f"- {key}: Nota N/A | {trades_txt}{runner_txt}")
+
         return "\n".join(lines)
     except Exception as exc:
         return f"Erro ao gerar ranking compacto: {exc}"
@@ -3690,7 +3758,7 @@ def _daily_bot_block_v3(key, cfg, resumo):
         core = _daily_core_status_from_summary_v3(key, resumo)
         return (
             f"{header}\n"
-            "📈 QUALIDADE EXECUTIVA V3.0\n"
+            "📈 QUALIDADE EXECUTIVA V3.1\n"
             "Amostra insuficiente hoje.\n"
             f"Trades encerrados: {int(m.get('trades') or 0)}{sinais_line}\n"
             "Aguardar trades encerrados para calcular as métricas.\n"
@@ -3705,7 +3773,7 @@ def _daily_bot_block_v3(key, cfg, resumo):
     if core:
         return f"{header}\n{core}"
 
-    return f"{header}\n📈 QUALIDADE EXECUTIVA V3.0\nAmostra insuficiente hoje."
+    return f"{header}\n📈 QUALIDADE EXECUTIVA V3.1\nAmostra insuficiente hoje."
 
 
 def build_daily_report():
@@ -3725,7 +3793,7 @@ def build_daily_report():
     best = exposure_snapshot.get("best_open_runner") or {}
 
     header = [
-        "📅 DAILY EXECUTIVO — CENTRAL QUANT V3.0",
+        "📅 DAILY EXECUTIVO — CENTRAL QUANT V3.1",
         f"Data/hora: {data_hora_sp_str()}",
         "",
         "STATUS",
@@ -3820,7 +3888,7 @@ def build_evolution_dashboard_v3():
             by_bot[bot]["deny"] += 1
 
     lines = [
-        "📈 DASHBOARD DE EVOLUÇÃO — CENTRAL QUANT V3.0",
+        "📈 DASHBOARD DE EVOLUÇÃO — CENTRAL QUANT V3.1",
         f"Data/hora: {data_hora_sp_str()}",
         "",
         "Decisões registradas:",
@@ -4208,7 +4276,7 @@ def build_central_help_text():
         "Por robô:\n"
         "/trend\n/donkey\n/cobra\n/meme\n/predator\n/turtle\n/falcon\n\n"
         "Histórico, estatística e simulação:\n"
-        "/journal\n/trade <ativo>\n/globalstats\n/signalai <ativo>\n/capital\n/correlation\n/timeheat\n/marketscore\n/allocation\n/rankingvivo\n/learning\n/quantos\n/snapshot\n/history\n/simulate TURTLE\n/simulateoff TURTLE\n\n"
+        "/journal\n/trade <ativo>\n/globalstats\n/signalai <ativo>\n/capital\n/correlation\n/timeheat\n/marketscore\n/allocation\n/rankingvivo\n/evolution\n/learning\n/quantos\n/snapshot\n/history\n/simulate TURTLE\n/simulateoff TURTLE\n\n"
         "Sugestão de uso diário: /dashboard. Para colar no ChatGPT: /daily."
     )
 
@@ -4763,6 +4831,8 @@ def build_central_command_reply(text: str):
         return build_capital_allocation_report()
     if cmd0 in {"/rankingvivo", "/rankinglive"}:
         return build_ranking_vivo_report()
+    if cmd0 in {"/evolution", "/evolucao", "/evolução"}:
+        return build_evolution_dashboard_v3()
     if cmd0 in {"/learning", "/aprendizado"}:
         return build_learning_report()
     if cmd0 in {"/quantos", "/quantsystem"}:
@@ -4832,6 +4902,9 @@ def _central_command_title(text: str):
         "/marketscore": "MARKET SCORE",
         "/allocation": "ALLOCATION",
         "/rankingvivo": "RANKING VIVO",
+        "/evolution": "EVOLUTION",
+        "/evolucao": "EVOLUÇÃO",
+        "/evolução": "EVOLUÇÃO",
         "/learning": "LEARNING",
         "/quantos": "QUANT OS",
         "/status": "STATUS",
@@ -4854,7 +4927,7 @@ def _is_heavy_central_command(text: str):
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
         "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital",
-        "/correlation", "/timeheat", "/marketscore", "/allocation", "/rankingvivo", "/learning",
+        "/correlation", "/timeheat", "/marketscore", "/allocation", "/rankingvivo", "/evolution", "/evolucao", "/evolução", "/learning",
         "/timeline", "/decisionlog", "/executionstats", "/consistency", "/brokerhealth", "/latency",
         "/livepositions", "/verifyqueue", "/status",
     }
