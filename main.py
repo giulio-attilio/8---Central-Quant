@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-26-CENTRAL-SUPERVISOR-DASHBOARD-DAILY-AUDIT-FULL-CHUNKFIX
+# Versão: 2026-06-26-CENTRAL-OMS-DECISION-TIMELINE-STATS
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -29,6 +29,7 @@
 import os
 import time
 import json
+import uuid
 import gc
 import threading
 import requests
@@ -120,6 +121,18 @@ REAL_TRADING_REQUIRE_READY = env_bool("REAL_TRADING_REQUIRE_READY", True)
 
 DAILY_HISTORY_DIR = BASE_DIR / "daily_history"
 DAILY_HISTORY_DIR.mkdir(exist_ok=True)
+
+# Persistência leve do OMS/Decision Engine da Central.
+# Não exige banco externo: grava JSONL/JSON local no Render.
+CENTRAL_DATA_DIR = BASE_DIR / "data"
+CENTRAL_DATA_DIR.mkdir(exist_ok=True)
+CENTRAL_DECISION_LOG_FILE = CENTRAL_DATA_DIR / "decision_log.jsonl"
+CENTRAL_TIMELINE_LOG_FILE = CENTRAL_DATA_DIR / "timeline.jsonl"
+CENTRAL_SHADOW_POSITIONS_FILE = CENTRAL_DATA_DIR / "shadow_positions.json"
+CENTRAL_EXECUTION_STATS_FILE = CENTRAL_DATA_DIR / "execution_stats.json"
+CENTRAL_STATUS_SNAPSHOTS_FILE = CENTRAL_DATA_DIR / "status_snapshots.jsonl"
+CENTRAL_DECISION_LOG_MAX_READ = int(os.environ.get("CENTRAL_DECISION_LOG_MAX_READ", "200"))
+CENTRAL_TIMELINE_MAX_READ = int(os.environ.get("CENTRAL_TIMELINE_MAX_READ", "300"))
 CENTRAL_TELEGRAM_OFFSET = None
 CENTRAL_TELEGRAM_PROCESSED_UPDATES = set()
 CENTRAL_TELEGRAM_RECENT_COMMANDS = {}
@@ -1807,6 +1820,415 @@ def build_heatmap_report():
 
 
 
+
+# ==========================================================
+# OMS / DECISION LOG / TIMELINE / SHADOW POSITIONS
+# ==========================================================
+
+TRADE_STATES = {
+    "NEW", "SIGNALLED", "VERIFY", "ORDER_SENT", "FILLED",
+    "TP50", "BE", "RUNNER", "CLOSED", "ERROR", "DENIED"
+}
+
+
+def _json_default(value):
+    try:
+        if isinstance(value, Path):
+            return str(value)
+    except Exception:
+        pass
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _append_jsonl(path, item):
+    try:
+        path.parent.mkdir(exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
+        return True
+    except Exception as exc:
+        print(f"ERRO append_jsonl {path}:", exc)
+        return False
+
+
+def _read_jsonl_tail(path, limit=50):
+    try:
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-int(limit):]
+        rows = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                rows.append({"raw": line})
+        return rows
+    except Exception as exc:
+        print(f"ERRO read_jsonl_tail {path}:", exc)
+        return []
+
+
+def _read_json_file(path, default):
+    try:
+        if not path.exists():
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json_file(path, payload):
+    try:
+        path.parent.mkdir(exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
+        return True
+    except Exception as exc:
+        print(f"ERRO write_json_file {path}:", exc)
+        return False
+
+
+def generate_trade_id(bot=None, symbol=None, side=None):
+    bot = str(bot or "CENTRAL").upper().replace(" ", "")[:12]
+    symbol = normalize_symbol_for_risk(symbol or "NA") if "normalize_symbol_for_risk" in globals() else str(symbol or "NA").upper()
+    side = str(side or "").upper()[:5]
+    stamp = agora_sp().strftime("%Y%m%d-%H%M%S")
+    suffix = uuid.uuid4().hex[:6].upper()
+    return f"{bot}-{stamp}-{symbol}-{side}-{suffix}".replace("--", "-")
+
+
+def _event_trade_id(bot=None, symbol=None, side=None, existing=None):
+    if existing:
+        return str(existing)
+    return generate_trade_id(bot, symbol, side)
+
+
+def append_timeline_event(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None):
+    item = {
+        "ts": data_hora_sp_str(),
+        "epoch": time.time(),
+        "trade_id": _event_trade_id(bot, symbol, side, trade_id),
+        "event": str(event_type or "EVENT").upper(),
+        "state": str(state or event_type or "EVENT").upper(),
+        "bot": str(bot or "").upper(),
+        "symbol": normalize_symbol_for_risk(symbol),
+        "side": str(side or "").upper(),
+        "details": details or {},
+    }
+    _append_jsonl(CENTRAL_TIMELINE_LOG_FILE, item)
+    return item
+
+
+def append_decision_log(payload, decision_result):
+    payload = payload or {}
+    result = decision_result or {}
+    bot = str(result.get("bot") or payload.get("bot") or "").upper()
+    symbol = normalize_symbol_for_risk(result.get("symbol") or payload.get("symbol"))
+    side = str(result.get("side") or payload.get("side") or "").upper()
+    trade_id = payload.get("trade_id") or payload.get("client_trade_id") or generate_trade_id(bot, symbol, side)
+    allowed = bool(result.get("allowed"))
+    state = "VERIFY" if allowed and str(result.get("mode") or "").upper() == "VERIFY" else ("DENIED" if not allowed else str(result.get("mode") or "ALLOW").upper())
+    item = {
+        "ts": data_hora_sp_str(),
+        "epoch": time.time(),
+        "trade_id": trade_id,
+        "bot": bot,
+        "symbol": symbol,
+        "side": side,
+        "mode": result.get("mode") or payload.get("mode") or EXECUTION_MODE,
+        "decision": result.get("decision") or ("ALLOW" if allowed else "DENY"),
+        "allowed": allowed,
+        "reasons": result.get("reasons") or [],
+        "warnings": result.get("warnings") or [],
+        "score": payload.get("score"),
+        "setup": payload.get("setup"),
+        "risk_pct": payload.get("risk_pct"),
+        "notional_usdt": payload.get("notional_usdt"),
+        "exposure": result.get("exposure") or {},
+    }
+    _append_jsonl(CENTRAL_DECISION_LOG_FILE, item)
+    append_timeline_event("RISK_ALLOW" if allowed else "RISK_DENY", bot, symbol, side, trade_id, state, item)
+    if allowed and str(item.get("mode")).upper() == "VERIFY":
+        upsert_shadow_position(item)
+    return item
+
+
+def shadow_positions_payload():
+    data = _read_json_file(CENTRAL_SHADOW_POSITIONS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def upsert_shadow_position(decision_item):
+    try:
+        if not isinstance(decision_item, dict):
+            return None
+        if str(decision_item.get("mode") or "").upper() not in {"VERIFY", "READY"}:
+            return None
+        if not decision_item.get("allowed"):
+            return None
+        trade_id = decision_item.get("trade_id") or generate_trade_id(decision_item.get("bot"), decision_item.get("symbol"), decision_item.get("side"))
+        data = shadow_positions_payload()
+        data[trade_id] = {
+            "trade_id": trade_id,
+            "created_at": decision_item.get("ts") or data_hora_sp_str(),
+            "updated_at": data_hora_sp_str(),
+            "state": "VERIFY",
+            "bot": decision_item.get("bot"),
+            "symbol": decision_item.get("symbol"),
+            "side": decision_item.get("side"),
+            "setup": decision_item.get("setup"),
+            "score": decision_item.get("score"),
+            "risk_pct": decision_item.get("risk_pct"),
+            "notional_usdt": decision_item.get("notional_usdt"),
+            "source": "decision_log",
+        }
+        _write_json_file(CENTRAL_SHADOW_POSITIONS_FILE, data)
+        append_timeline_event("SHADOW_POSITION", decision_item.get("bot"), decision_item.get("symbol"), decision_item.get("side"), trade_id, "VERIFY", data[trade_id])
+        return data[trade_id]
+    except Exception as exc:
+        print("ERRO upsert_shadow_position:", exc)
+        return None
+
+
+def decision_log_items(limit=50):
+    return _read_jsonl_tail(CENTRAL_DECISION_LOG_FILE, limit=limit)
+
+
+def timeline_items(limit=100):
+    return _read_jsonl_tail(CENTRAL_TIMELINE_LOG_FILE, limit=limit)
+
+
+def build_decision_log_report(arg=None, limit=30):
+    token = normalize_symbol_for_risk(arg) if arg else None
+    rows = decision_log_items(limit=max(limit, CENTRAL_DECISION_LOG_MAX_READ))
+    if token:
+        rows = [r for r in rows if normalize_symbol_for_risk(r.get("symbol")) == token or str(r.get("bot") or "").upper() == token or str(r.get("trade_id") or "").upper().startswith(token)]
+    rows = rows[-limit:]
+    lines = ["🧾 DECISION LOG — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}"]
+    if token:
+        lines.append(f"Filtro: {token}")
+    lines += ["", f"Decisões exibidas: {len(rows)}"]
+    if not rows:
+        lines.append("Nenhuma decisão registrada ainda. O log será preenchido quando Falcon/Predator consultarem /can_open_trade.")
+        return "\n".join(lines)
+    for r in rows:
+        reasons = r.get("reasons") or []
+        warnings = r.get("warnings") or []
+        lines.append(f"- {r.get('ts')} | {r.get('decision')} | {r.get('mode')} | {r.get('bot')} {r.get('symbol')} {r.get('side')} | score={r.get('score')} | risco={r.get('risk_pct')} | id={r.get('trade_id')}")
+        if reasons:
+            lines.append("  motivos: " + "; ".join(str(x) for x in reasons[:3]))
+        if warnings:
+            lines.append("  avisos: " + "; ".join(str(x) for x in warnings[:3]))
+    return "\n".join(lines)
+
+
+def build_timeline_report(arg=None, limit=40):
+    token = normalize_symbol_for_risk(arg) if arg else None
+    rows = timeline_items(limit=max(limit, CENTRAL_TIMELINE_MAX_READ))
+    if token:
+        rows = [r for r in rows if normalize_symbol_for_risk(r.get("symbol")) == token or str(r.get("bot") or "").upper() == token or token in str(r.get("trade_id") or "").upper()]
+    rows = rows[-limit:]
+    lines = ["🧭 TIMELINE — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}"]
+    if token:
+        lines.append(f"Filtro: {token}")
+    lines += ["", f"Eventos exibidos: {len(rows)}"]
+    if not rows:
+        lines.append("Nenhum evento de timeline registrado ainda.")
+        return "\n".join(lines)
+    for r in rows:
+        lines.append(f"- {r.get('ts')} | {r.get('event')} | {r.get('state')} | {r.get('bot')} {r.get('symbol')} {r.get('side')} | id={r.get('trade_id')}")
+    return "\n".join(lines)
+
+
+def build_live_positions_report():
+    live_rows = _central_live_positions_payload() if "_central_live_positions_payload" in globals() else []
+    shadows = shadow_positions_payload()
+    lines = ["📌 LIVE / SHADOW POSITIONS — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}", ""]
+    lines.append(f"LIVE Central: {len(live_rows)}")
+    if live_rows:
+        for p in live_rows[:30]:
+            lines.append(f"- LIVE {p.get('bot')} {p.get('symbol')} {p.get('side')} | order={p.get('order_id')} | entry={p.get('entry')}")
+    else:
+        lines.append("- Nenhuma posição LIVE registrada.")
+    lines += ["", f"Shadow VERIFY/READY: {len(shadows)}"]
+    for _, p in list(shadows.items())[-30:]:
+        lines.append(f"- SHADOW {p.get('bot')} {p.get('symbol')} {p.get('side')} | {p.get('state')} | notional={p.get('notional_usdt')} | id={p.get('trade_id')}")
+    return "\n".join(lines)
+
+
+def build_verify_queue_report():
+    shadows = shadow_positions_payload()
+    rows = [p for p in shadows.values() if str(p.get("state") or "").upper() in {"VERIFY", "READY", "SIGNALLED"}]
+    lines = ["🧪 VERIFY QUEUE / SHADOW BOOK", f"Data/hora: {data_hora_sp_str()}", "", f"Itens em VERIFY/READY: {len(rows)}"]
+    if not rows:
+        lines.append("Fila vazia. Aguardando novos sinais em VERIFY.")
+        return "\n".join(lines)
+    for p in rows[-30:]:
+        lines.append(f"- {p.get('created_at')} | {p.get('bot')} {p.get('symbol')} {p.get('side')} | score={p.get('score')} | notional={p.get('notional_usdt')} | id={p.get('trade_id')}")
+    return "\n".join(lines)
+
+
+def build_execution_stats_report():
+    decisions = decision_log_items(limit=1000)
+    timelines = timeline_items(limit=1000)
+    exec_items, exec_err = _execution_log_items(limit=1000) if "_execution_log_items" in globals() else ([], "execution log indisponível")
+    total_decisions = len(decisions)
+    allow = sum(1 for d in decisions if d.get("allowed"))
+    deny = total_decisions - allow
+    verify = sum(1 for d in decisions if str(d.get("mode") or "").upper() == "VERIFY")
+    live = sum(1 for d in decisions if str(d.get("mode") or "").upper() == "LIVE")
+    sent = sum(1 for e in exec_items or [] if isinstance(e, dict) and e.get("sent"))
+    rejected = sum(1 for e in exec_items or [] if isinstance(e, dict) and (e.get("error") or str(e.get("status") or "").upper() in {"DENIED", "REJECTED", "ERROR", "BROKER_EXCEPTION"}))
+    by_bot = {}
+    for d in decisions:
+        bot = str(d.get("bot") or "N/A").upper()
+        by_bot.setdefault(bot, {"total": 0, "allow": 0, "deny": 0, "verify": 0, "live": 0})
+        by_bot[bot]["total"] += 1
+        by_bot[bot]["allow" if d.get("allowed") else "deny"] += 1
+        m = str(d.get("mode") or "").upper()
+        if m in by_bot[bot]:
+            by_bot[bot][m.lower()] += 1
+    lines = [
+        "📊 EXECUTION STATS — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Decisões registradas: {total_decisions}",
+        f"ALLOW: {allow} | DENY: {deny}",
+        f"VERIFY: {verify} | LIVE: {live}",
+        f"Eventos de timeline: {len(timelines)}",
+        f"Eventos broker: {len(exec_items or [])} | sent={sent} | rejected/error={rejected}",
+    ]
+    if exec_err:
+        lines.append(f"Broker log aviso: {exec_err}")
+    lines += ["", "Por robô:"]
+    if not by_bot:
+        lines.append("- Sem decisões ainda.")
+    else:
+        for bot, st in sorted(by_bot.items()):
+            lines.append(f"- {bot}: total={st['total']} | allow={st['allow']} | deny={st['deny']} | verify={st['verify']} | live={st['live']}")
+    return "\n".join(lines)
+
+
+def build_latency_report():
+    exec_items, err = _execution_log_items(limit=500) if "_execution_log_items" in globals() else ([], "execution log indisponível")
+    latencies = []
+    for e in exec_items or []:
+        if not isinstance(e, dict):
+            continue
+        for k in ("latency_ms", "elapsed_ms", "duration_ms"):
+            if e.get(k) is not None:
+                val = safe_round(e.get(k), 2, None)
+                if val is not None:
+                    latencies.append(val)
+                break
+    lines = ["⏱️ LATÊNCIA DE EXECUÇÃO — CENTRAL QUANT", f"Data/hora: {data_hora_sp_str()}", ""]
+    if err:
+        lines.append(f"Aviso: {err}")
+    if not latencies:
+        lines.append("Ainda sem latências registradas no broker. Elas aparecerão após os primeiros VERIFY/LIVE com medição no broker.py.")
+        return "\n".join(lines)
+    avg = sum(latencies) / len(latencies)
+    lines += [
+        f"Amostra: {len(latencies)}",
+        f"Média: {round(avg, 2)} ms",
+        f"Mínima: {round(min(latencies), 2)} ms",
+        f"Máxima: {round(max(latencies), 2)} ms",
+    ]
+    return "\n".join(lines)
+
+
+def build_broker_health_report():
+    ready = bingx_ready_payload() if "bingx_ready_payload" in globals() else {"ok": False, "status": "NO_READY_FN"}
+    broker_status = broker_status_payload() if "broker_status_payload" in globals() else {}
+    exec_items, err = _execution_log_items(limit=20) if "_execution_log_items" in globals() else ([], "execution log indisponível")
+    lines = [
+        "🏦 BROKER HEALTH — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Broker carregado: {broker_status.get('broker_loaded')}",
+        f"Import error: {broker_status.get('broker_import_error')}",
+        f"READY: {ready.get('ok')} | {ready.get('status')}",
+    ]
+    if ready.get("error"):
+        lines.append(f"Erro: {ready.get('error')}")
+    bal = ready.get("balance") or {}
+    if bal:
+        lines.append(f"Saldo USDT total/free/used: {bal.get('total_usdt')} / {bal.get('free_usdt')} / {bal.get('used_usdt')}")
+    lines += ["", f"Últimos eventos broker lidos: {len(exec_items or [])}"]
+    if err:
+        lines.append(f"Aviso log: {err}")
+    return "\n".join(lines)
+
+
+def build_consistency_report():
+    decisions = decision_log_items(limit=1000)
+    timelines = timeline_items(limit=1000)
+    shadows = shadow_positions_payload()
+    live_rows = _central_live_positions_payload() if "_central_live_positions_payload" in globals() else []
+    broker_positions, pos_err = _broker_open_positions() if "_broker_open_positions" in globals() else ([], "broker positions indisponível")
+    issues = []
+    trade_ids = [str(d.get("trade_id")) for d in decisions if d.get("trade_id")]
+    dupes = sorted({x for x in trade_ids if trade_ids.count(x) > 1})
+    if dupes:
+        issues.append(f"Trade IDs duplicados no decision log: {len(dupes)}")
+    if pos_err:
+        issues.append(f"Erro ao ler posições BingX: {pos_err}")
+    broker_keys = {(p.get("symbol"), str(p.get("side") or "").upper()) for p in broker_positions}
+    live_keys = {(p.get("symbol"), str(p.get("side") or "").upper()) for p in live_rows}
+    only_broker = broker_keys - live_keys
+    only_live = live_keys - broker_keys
+    if only_broker:
+        issues.append(f"Posições só na BingX: {len(only_broker)}")
+    if only_live:
+        issues.append(f"Posições LIVE só na Central: {len(only_live)}")
+    denied_shadows = [p for p in shadows.values() if str(p.get("state") or "").upper() == "DENIED"]
+    if denied_shadows:
+        issues.append(f"Shadow positions em estado DENIED: {len(denied_shadows)}")
+    lines = [
+        "🧩 CONSISTÊNCIA — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Decision logs: {len(decisions)}",
+        f"Timeline events: {len(timelines)}",
+        f"Shadow positions: {len(shadows)}",
+        f"LIVE Central: {len(live_rows)} | BingX: {len(broker_positions)}",
+        "",
+        "Resultado:",
+    ]
+    if not issues:
+        lines.append("✅ Nenhuma inconsistência relevante encontrada.")
+    else:
+        lines += [f"⚠️ {x}" for x in issues]
+    return "\n".join(lines)
+
+
+def build_status_report():
+    score_payload = central_health_score_payload() if "central_health_score_payload" in globals() else {"score": None, "status": "N/A"}
+    ready = bingx_ready_payload() if "bingx_ready_payload" in globals() else {"ok": None, "status": "N/A"}
+    sync_txt = build_sync_report() if "build_sync_report" in globals() else "Sync indisponível"
+    mem = memory_snapshot("status_memory", store=True)
+    lines = [
+        "✅ STATUS CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Health Score: {score_payload.get('score')}/100 — {score_payload.get('status')}",
+        f"Watchdog: {CENTRAL_HEALTH.get('watchdog_status')}",
+        f"Execução: {'ATIVA' if ENABLE_REAL_TRADING else 'BLOQUEADA'} | Modo {EXECUTION_MODE}",
+        f"BingX: {ready.get('ok')} | {ready.get('status')}",
+        f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
+        "",
+        _short(sync_txt, 900),
+    ]
+    return "\n".join(lines)
+
 # ==========================================================
 # EXECUTION / DECISIONAL RISK MANAGER
 # ==========================================================
@@ -1934,7 +2356,7 @@ def can_open_trade_decision(payload: dict):
         warnings.append(f"exposição LIVE alta: {risk_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
 
     allowed = len(reasons) == 0
-    return {
+    decision_result = {
         "allowed": allowed,
         "decision": "ALLOW" if allowed else "DENY",
         "bot": bot,
@@ -1955,6 +2377,11 @@ def can_open_trade_decision(payload: dict):
         },
         "execution": broker_status_payload(),
     }
+    try:
+        append_decision_log(payload, decision_result)
+    except Exception as exc:
+        print("ERRO decision log:", exc)
+    return decision_result
 
 
 def build_execution_report():
@@ -2803,6 +3230,60 @@ def executions_route():
     return {"text": build_executions_log_report()}
 
 
+
+@app.route("/decisionlog")
+@app.route("/decisions")
+def decisionlog_route():
+    arg = request.args.get("q") or request.args.get("symbol") or request.args.get("bot")
+    return {"text": build_decision_log_report(arg)}
+
+
+@app.route("/timeline")
+@app.route("/timeline/<arg>")
+def timeline_route(arg=None):
+    arg = arg or request.args.get("q") or request.args.get("symbol") or request.args.get("bot")
+    return {"text": build_timeline_report(arg)}
+
+
+@app.route("/executionstats")
+@app.route("/execstats")
+def executionstats_route():
+    return {"text": build_execution_stats_report()}
+
+
+@app.route("/consistency")
+@app.route("/consistencia")
+def consistency_route():
+    return {"text": build_consistency_report()}
+
+
+@app.route("/brokerhealth")
+@app.route("/brokerstats")
+def brokerhealth_route():
+    return {"text": build_broker_health_report()}
+
+
+@app.route("/latency")
+@app.route("/latencia")
+def latency_route():
+    return {"text": build_latency_report()}
+
+
+@app.route("/livepositions")
+def livepositions_route():
+    return {"text": build_live_positions_report()}
+
+
+@app.route("/verifyqueue")
+def verifyqueue_route():
+    return {"text": build_verify_queue_report()}
+
+
+@app.route("/status")
+def status_route():
+    return {"text": build_status_report()}
+
+
 @app.route("/can_open_trade", methods=["GET", "POST"])
 @app.route("/canopen", methods=["GET", "POST"])
 def can_open_trade_route():
@@ -3501,6 +3982,26 @@ def build_central_command_reply(text: str):
         return build_learning_report()
     if cmd0 in {"/quantos", "/quantsystem"}:
         return build_quantos_report()
+    if cmd0 in {"/status"}:
+        return build_status_report()
+    if cmd0 in {"/timeline"}:
+        parts = raw.split()
+        return build_timeline_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/decisionlog", "/decisions"}:
+        parts = raw.split()
+        return build_decision_log_report(parts[1] if len(parts) > 1 else None)
+    if cmd0 in {"/executionstats", "/execstats"}:
+        return build_execution_stats_report()
+    if cmd0 in {"/consistency", "/consistencia"}:
+        return build_consistency_report()
+    if cmd0 in {"/brokerhealth", "/brokerstats"}:
+        return build_broker_health_report()
+    if cmd0 in {"/latency", "/latencia"}:
+        return build_latency_report()
+    if cmd0 in {"/livepositions"}:
+        return build_live_positions_report()
+    if cmd0 in {"/verifyqueue"}:
+        return build_verify_queue_report()
 
     parsed_report = parse_report_command(raw)
     if parsed_report:
@@ -3548,6 +4049,15 @@ def _central_command_title(text: str):
         "/rankingvivo": "RANKING VIVO",
         "/learning": "LEARNING",
         "/quantos": "QUANT OS",
+        "/status": "STATUS",
+        "/timeline": "TIMELINE",
+        "/decisionlog": "DECISION LOG",
+        "/executionstats": "EXECUTION STATS",
+        "/consistency": "CONSISTÊNCIA",
+        "/brokerhealth": "BROKER HEALTH",
+        "/latency": "LATÊNCIA",
+        "/livepositions": "LIVE POSITIONS",
+        "/verifyqueue": "VERIFY QUEUE",
     }
     return mapping.get(cmd, "CENTRAL QUANT")
 
@@ -3560,6 +4070,8 @@ def _is_heavy_central_command(text: str):
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
         "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital",
         "/correlation", "/timeheat", "/marketscore", "/allocation", "/rankingvivo", "/learning",
+        "/timeline", "/decisionlog", "/executionstats", "/consistency", "/brokerhealth", "/latency",
+        "/livepositions", "/verifyqueue", "/status",
     }
 
 
