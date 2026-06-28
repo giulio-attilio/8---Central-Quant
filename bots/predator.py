@@ -1,6 +1,6 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em PREDATOR.
 # SMART PREDATOR - SMC H1
-# Versão: 2026-06-27-SMART-PREDATOR-V5-SCORE-H4-VOLUME-CAPS
+# Versão: 2026-06-27-SMART-PREDATOR-V6-H4-CONTEXT-BLOCK
 #
 # Stand-by para Central Quant:
 # - Estrutura padronizada como Donkey/Cobra/Meme.
@@ -49,7 +49,7 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 BOT_NAME = os.environ.get("BOT_NAME", "Smart Predator")
 SERVICE_MODE = "SMART_PREDATOR"
-BOT_VERSION = "2026-06-27-SMART-PREDATOR-V5-SCORE-H4-VOLUME-CAPS"
+BOT_VERSION = "2026-06-27-SMART-PREDATOR-V6-H4-CONTEXT-BLOCK"
 
 # Padrão Central Quant: este bot não usa startup guard para sinais.
 # Mantido explícito para padronização de /health e evitar bloqueios após deploy.
@@ -127,6 +127,18 @@ CHOCH_LOOKBACK = int(os.environ.get("PREDATOR_CHOCH_LOOKBACK", "8"))
 OB_LOOKBACK = int(os.environ.get("PREDATOR_OB_LOOKBACK", "12"))
 
 MIN_PREDATOR_SCORE = int(os.environ.get("PREDATOR_MIN_SCORE", os.environ.get("MIN_PREDATOR_SCORE", "70")))
+
+# Filtro V6: bloqueia entradas contra H4 forte por padrão.
+# Evita casos como LONG contra H4 BEARISH com ADX forte.
+PREDATOR_BLOCK_STRONG_H4_CONTRA = env_bool("PREDATOR_BLOCK_STRONG_H4_CONTRA", True)
+PREDATOR_STRONG_H4_ADX = float(os.environ.get("PREDATOR_STRONG_H4_ADX", "30"))
+
+# Exceção opcional e bem restritiva para reversões realmente excepcionais.
+# Por padrão fica desligada. Para ativar: PREDATOR_ALLOW_EXCEPTIONAL_COUNTER_H4=true.
+PREDATOR_ALLOW_EXCEPTIONAL_COUNTER_H4 = env_bool("PREDATOR_ALLOW_EXCEPTIONAL_COUNTER_H4", False)
+PREDATOR_COUNTER_H4_EXCEPTION_MIN_SCORE = int(os.environ.get("PREDATOR_COUNTER_H4_EXCEPTION_MIN_SCORE", "95"))
+PREDATOR_COUNTER_H4_EXCEPTION_MIN_VOLUME = float(os.environ.get("PREDATOR_COUNTER_H4_EXCEPTION_MIN_VOLUME", "2.5"))
+PREDATOR_COUNTER_H4_EXCEPTION_MAX_RISK = float(os.environ.get("PREDATOR_COUNTER_H4_EXCEPTION_MAX_RISK", "0.70"))
 
 ATR_LEN = int(os.environ.get("ATR_LEN", "14"))
 ADX_LEN = int(os.environ.get("ADX_LEN", "14"))
@@ -933,6 +945,68 @@ def is_retesting_bearish_ob_m15(df_m15, ob):
     return False
 
 
+
+def is_h4_contra_signal(side, h4_context):
+    side = str(side or "").upper().strip()
+    h4_context = str(h4_context or "").upper().strip()
+
+    if side == "LONG" and h4_context == "BEARISH":
+        return True
+    if side == "SHORT" and h4_context == "BULLISH":
+        return True
+    return False
+
+
+def should_block_predator_by_h4_context(side, h4_context, adx_h4, score=None, volume_ratio=None, risk_pct=None):
+    """
+    Filtro V6 de decisão, não apenas pontuação.
+
+    Regra principal:
+    - LONG contra H4 BEARISH com ADX forte -> BLOQUEIA.
+    - SHORT contra H4 BULLISH com ADX forte -> BLOQUEIA.
+
+    Exceção opcional, desligada por padrão:
+    - score >= 95
+    - volume >= 2.5x
+    - risco <= 0.70%
+    """
+    if not PREDATOR_BLOCK_STRONG_H4_CONTRA:
+        return False, None
+
+    try:
+        adx = float(adx_h4)
+    except Exception:
+        adx = 0.0
+
+    if not is_h4_contra_signal(side, h4_context):
+        return False, None
+
+    if adx < PREDATOR_STRONG_H4_ADX:
+        return False, None
+
+    reason = (
+        f"Bloqueado: {side} contra H4 {h4_context} "
+        f"com ADX forte {adx:.2f} >= {PREDATOR_STRONG_H4_ADX:.2f}"
+    )
+
+    if PREDATOR_ALLOW_EXCEPTIONAL_COUNTER_H4:
+        sc = safe_float(score, 0.0)
+        vr = safe_float(volume_ratio, 0.0)
+        rp = safe_float(risk_pct, 999.0)
+
+        if (
+            sc >= PREDATOR_COUNTER_H4_EXCEPTION_MIN_SCORE
+            and vr >= PREDATOR_COUNTER_H4_EXCEPTION_MIN_VOLUME
+            and rp <= PREDATOR_COUNTER_H4_EXCEPTION_MAX_RISK
+        ):
+            return False, (
+                "Exceção liberada: H4 contra forte, porém score/volume/risco "
+                f"excepcionais | score={sc:.0f}, volume={vr:.2f}x, risco={rp:.2f}%"
+            )
+
+    return True, reason
+
+
 def calcular_predator_score(
     has_sweep,
     has_choch,
@@ -946,7 +1020,7 @@ def calcular_predator_score(
     h4_context=None
 ):
     """
-    Score v5:
+    Score v6:
     - Mantém SMC como base forte.
     - Penaliza H4 contra tendência.
     - Penaliza volume muito fraco.
@@ -1165,6 +1239,22 @@ def scan_smart_predator_symbol(symbol):
 
                 score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok, risk_pct, float(candle_h1.get("volume_ratio", 0)), "LONG", h4_context)
 
+                blocked_h4, h4_block_reason = should_block_predator_by_h4_context(
+                    "LONG",
+                    h4_context,
+                    adx_h4,
+                    score=score,
+                    volume_ratio=float(candle_h1.get("volume_ratio", 0)),
+                    risk_pct=risk_pct,
+                )
+                if h4_block_reason:
+                    reasons.append(("❌ " if blocked_h4 else "⚠️ ") + h4_block_reason)
+
+                if blocked_h4:
+                    inc_funnel_stat("risk_rejected")
+                    print(f"SMART PREDATOR LONG BLOQUEADO POR H4 FORTE CONTRA: {nome_limpo(symbol)} | score={score} | ADX_H4={adx_h4:.2f} | H4={h4_context}")
+                    return None
+
                 if score >= 70:
                     inc_funnel_stat("score_70_plus")
                 if score >= 80:
@@ -1232,6 +1322,22 @@ def scan_smart_predator_symbol(symbol):
                     return None
 
                 score, reasons = calcular_predator_score(True, True, True, True, adx_h4, volume_ok, risk_pct, float(candle_h1.get("volume_ratio", 0)), "SHORT", h4_context)
+
+                blocked_h4, h4_block_reason = should_block_predator_by_h4_context(
+                    "SHORT",
+                    h4_context,
+                    adx_h4,
+                    score=score,
+                    volume_ratio=float(candle_h1.get("volume_ratio", 0)),
+                    risk_pct=risk_pct,
+                )
+                if h4_block_reason:
+                    reasons.append(("❌ " if blocked_h4 else "⚠️ ") + h4_block_reason)
+
+                if blocked_h4:
+                    inc_funnel_stat("risk_rejected")
+                    print(f"SMART PREDATOR SHORT BLOQUEADO POR H4 FORTE CONTRA: {nome_limpo(symbol)} | score={score} | ADX_H4={adx_h4:.2f} | H4={h4_context}")
+                    return None
 
                 if score >= 70:
                     inc_funnel_stat("score_70_plus")
@@ -1618,7 +1724,10 @@ def montar_execution_status_texto():
         f"Alavancagem real: {PREDATOR_REAL_LEVERAGE}x\n"
         f"Exposição efetiva: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n"
         f"Max posições LIVE Predator: {PREDATOR_MAX_REAL_POSITIONS}\n"
-        f"Central Risk obrigatório: {PREDATOR_REQUIRE_CENTRAL_RISK}\n\n"
+        f"Central Risk obrigatório: {PREDATOR_REQUIRE_CENTRAL_RISK}\n"
+        f"Bloquear H4 forte contra: {PREDATOR_BLOCK_STRONG_H4_CONTRA}\n"
+        f"ADX H4 forte contra: {PREDATOR_STRONG_H4_ADX}\n"
+        f"Exceção H4 contra ativa: {PREDATOR_ALLOW_EXCEPTIONAL_COUNTER_H4}\n\n"
         f"Broker carregado: {bingx_broker is not None}\n"
         f"Broker import error: {BROKER_IMPORT_ERROR}\n"
         f"BingX READY: {ready.get('ok')} | {ready.get('status')}\n"
