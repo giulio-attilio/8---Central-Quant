@@ -1,6 +1,6 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em PREDATOR.
 # SMART PREDATOR - SMC H1
-# Versão: 2026-06-25-SMART-PREDATOR-V4-STATS-SCORE-MAE
+# Versão: 2026-06-27-SMART-PREDATOR-V5-SCORE-H4-VOLUME-CAPS
 #
 # Stand-by para Central Quant:
 # - Estrutura padronizada como Donkey/Cobra/Meme.
@@ -49,7 +49,7 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 BOT_NAME = os.environ.get("BOT_NAME", "Smart Predator")
 SERVICE_MODE = "SMART_PREDATOR"
-BOT_VERSION = "2026-06-25-SMART-PREDATOR-V4-STATS-SCORE-MAE"
+BOT_VERSION = "2026-06-27-SMART-PREDATOR-V5-SCORE-H4-VOLUME-CAPS"
 
 # Padrão Central Quant: este bot não usa startup guard para sinais.
 # Mantido explícito para padronização de /health e evitar bloqueios após deploy.
@@ -946,10 +946,13 @@ def calcular_predator_score(
     h4_context=None
 ):
     """
-    Score v4: deixa de ser quase binário.
-    A base obrigatória dá 80 pontos; os 20 pontos finais dependem de força, volume, risco e contexto.
-    Assim o /stats passa a separar sinais 70-79, 80-84, 85-89, 90-94 e 95+.
+    Score v5:
+    - Mantém SMC como base forte.
+    - Penaliza H4 contra tendência.
+    - Penaliza volume muito fraco.
+    - Impede sinal contra H4 forte de receber 90+ facilmente.
     """
+
     score = 0
     reasons = []
 
@@ -969,7 +972,6 @@ def calcular_predator_score(
         score += 15
         reasons.append("Reteste com rejeição no OB ✅")
 
-    # ADX H4: até 8 pontos.
     try:
         adx = float(adx_h4)
         if adx >= 30:
@@ -984,10 +986,11 @@ def calcular_predator_score(
         else:
             reasons.append(f"ADX H4 baixo: {adx:.2f} ⚠️")
     except Exception:
+        adx = 0.0
         reasons.append("ADX H4 indisponível ⚠️")
 
-    # Volume: até 6 pontos.
     vr = safe_float(volume_ratio, 0.0)
+
     if volume_ok:
         if vr >= 2.0:
             score += 6
@@ -999,10 +1002,17 @@ def calcular_predator_score(
             score += 3
             reasons.append(f"Volume acima da média: {vr:.2f}x ✅")
     else:
-        reasons.append(f"Volume sem destaque: {vr:.2f}x ⚠️")
+        if vr < 0.50:
+            score -= 8
+            reasons.append(f"Volume muito fraco: {vr:.2f}x ⚠️ Penalidade -8")
+        elif vr < 0.80:
+            score -= 4
+            reasons.append(f"Volume fraco: {vr:.2f}x ⚠️ Penalidade -4")
+        else:
+            reasons.append(f"Volume sem destaque: {vr:.2f}x ⚠️")
 
-    # Risco: até 4 pontos.
     rp = safe_float(risk_pct, 999.0)
+
     if rp <= 1.0:
         score += 4
         reasons.append(f"Risco curto: {rp:.2f}% ✅")
@@ -1018,22 +1028,38 @@ def calcular_predator_score(
     else:
         reasons.append(f"Risco acima do limite: {rp:.2f}% ❌")
 
-    # Contexto H4: até 2 pontos, sem bloquear reversões.
+    h4_contra = False
+
     if h4_context and side:
         if side == "LONG" and h4_context == "BULLISH":
-            score += 2
+            score += 4
             reasons.append("Contexto H4 favorece LONG ✅")
         elif side == "SHORT" and h4_context == "BEARISH":
-            score += 2
+            score += 4
             reasons.append("Contexto H4 favorece SHORT ✅")
         elif h4_context == "NEUTRO":
             score += 1
             reasons.append("Contexto H4 neutro ⚪")
         else:
-            reasons.append(f"Contexto H4 contra o sinal: {h4_context} ⚠️")
+            h4_contra = True
+            penalty = 15 if adx >= 30 else 10
+            score -= penalty
+            reasons.append(f"Contexto H4 contra o sinal: {h4_context} ⚠️ Penalidade -{penalty}")
 
-    return min(int(score), 100), reasons
+    score = max(0, min(int(score), 100))
 
+    # Teto de segurança:
+    # contra H4 forte não pode ser 90+.
+    if h4_contra and adx >= 30:
+        score = min(score, 84)
+        reasons.append("Teto aplicado: H4 contra com ADX forte limita score a 84 ⚠️")
+
+    # Volume extremamente fraco não pode ser EXCEPCIONAL/MUITO FORTE.
+    if vr > 0 and vr < 0.50:
+        score = min(score, 84)
+        reasons.append("Teto aplicado: volume abaixo de 0.50x limita score a 84 ⚠️")
+
+    return score, reasons
 
 def classificar_predator(score):
     try:
