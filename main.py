@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-27-CENTRAL-V3-1-FINAL-STABLE
+# Versão: 2026-06-28-CENTRAL-V3-1-FINAL-STABLE-RISK-HARD-BLOCKS-RISK-HARD-BLOCKS
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -101,8 +101,16 @@ CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_COMMAND_D
 # Risk Manager Global decisório. Ele responde ALLOW/DENY em /can_open_trade.
 # Em LIVE, o robô executa automaticamente se a Central aprovar e o kill switch estiver ligado.
 GLOBAL_RISK_MAX_POSITIONS = int(os.environ.get("GLOBAL_RISK_MAX_POSITIONS", "50"))
-GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT = float(os.environ.get("GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT", "80"))
+# V3.1 hard blocks:
+# - acima do limite global de posições, negar novas entradas
+# - concentração direcional acima de 70%, negar novas entradas no lado dominante
+# - memória acima de 95%, negar novas entradas
+# - 3+ exposições no mesmo ativo, negar nova entrada no ativo
+GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT = float(os.environ.get("GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT", "70"))
 GLOBAL_RISK_MAX_SYMBOL_EXPOSURE = int(os.environ.get("GLOBAL_RISK_MAX_SYMBOL_EXPOSURE", "3"))
+GLOBAL_RISK_MEMORY_BLOCK_PCT = float(os.environ.get("GLOBAL_RISK_MEMORY_BLOCK_PCT", "95"))
+GLOBAL_RISK_BLOCK_ON_PAPER_EXPOSURE = env_bool("GLOBAL_RISK_BLOCK_ON_PAPER_EXPOSURE", True)
+GLOBAL_RISK_ALLOW_REDUCE_ONLY = env_bool("GLOBAL_RISK_ALLOW_REDUCE_ONLY", True)
 
 # Execução real / BingX.
 # ENABLE_REAL_TRADING=false é a trava global: mesmo se um robô estiver LIVE,
@@ -2762,10 +2770,62 @@ def bingx_ready_payload():
         return {"ok": False, "status": "READY_ERROR", "error": str(exc)}
 
 
+
+def _risk_memory_block_payload():
+    """
+    Snapshot de memória para o Risk Manager.
+    Se a memória estiver alta, tenta GC/malloc_trim antes de decidir.
+    """
+    try:
+        snap = memory_snapshot("risk_memory_before", store=True)
+        usage = snap.get("usage_pct")
+        if usage is not None and float(usage) >= GLOBAL_RISK_MEMORY_BLOCK_PCT:
+            _before, after = force_gc_if_needed("risk_memory_block_check", force=True)
+            snap = after or snap
+            usage = snap.get("usage_pct")
+        return {
+            "rss_mb": snap.get("rss_mb"),
+            "usage_pct": usage,
+            "limit_mb": snap.get("limit_mb"),
+            "threshold_pct": GLOBAL_RISK_MEMORY_BLOCK_PCT,
+            "blocked": bool(usage is not None and float(usage) >= GLOBAL_RISK_MEMORY_BLOCK_PCT),
+        }
+    except Exception as exc:
+        return {
+            "rss_mb": None,
+            "usage_pct": None,
+            "limit_mb": MEMORY_LIMIT_MB,
+            "threshold_pct": GLOBAL_RISK_MEMORY_BLOCK_PCT,
+            "blocked": False,
+            "error": str(exc),
+        }
+
+
+def _risk_is_reduce_only(payload):
+    payload = payload or {}
+    value = payload.get("reduce_only")
+    if value is None:
+        value = payload.get("reduceOnly")
+    if value is None:
+        value = payload.get("close_only")
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
 def can_open_trade_decision(payload: dict):
     """
     Risk Manager decisório da Central.
-    Retorna allow/deny para qualquer robô antes de abrir posição real.
+    Retorna ALLOW/DENY para qualquer robô antes de abrir posição.
+
+    V3.1 hard blocks:
+    - Memória >= GLOBAL_RISK_MEMORY_BLOCK_PCT: DENY novas entradas.
+    - Posições Central/PAPER >= GLOBAL_RISK_MAX_POSITIONS: DENY novas entradas.
+    - Posições LIVE >= GLOBAL_RISK_MAX_POSITIONS: DENY novas entradas.
+    - Concentração direcional >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+      DENY novas entradas no lado dominante.
+    - Ativo com GLOBAL_RISK_MAX_SYMBOL_EXPOSURE ou mais exposições: DENY.
+    - reduceOnly/fechamento continua permitido quando GLOBAL_RISK_ALLOW_REDUCE_ONLY=true.
     """
     payload = payload or {}
     bot = str(payload.get("bot") or payload.get("robot") or "").upper().strip()
@@ -2773,6 +2833,8 @@ def can_open_trade_decision(payload: dict):
     side = str(payload.get("side") or "").upper().strip()
     mode = str(payload.get("mode") or payload.get("execution_mode") or EXECUTION_MODE).upper().strip()
     intended_live = bool(payload.get("intended_live", mode == "LIVE"))
+    reduce_only = _risk_is_reduce_only(payload)
+
     risk_pct = safe_round(payload.get("risk_pct"), 4, 0) or 0
     bot_cfg = real_execution_config_for_bot(bot)
     margin = safe_round(payload.get("margin_usdt"), 4, None)
@@ -2795,23 +2857,67 @@ def can_open_trade_decision(payload: dict):
     long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
     short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
 
-    # Para LIVE/VERIFY, o Risk decisório usa a camada LIVE como trava principal.
-    # As posições PAPER continuam aparecendo como aviso, mas não impedem o primeiro
-    # teste real mínimo do Falcon quando a BingX ainda está sem posições reais.
     live_rows = _central_live_positions_payload() if "_central_live_positions_payload" in globals() else []
+    live_total_pos = len(live_rows)
+    live_long_pos = sum(1 for r in live_rows if str(r.get("side") or "").upper() in {"LONG", "BUY"})
+    live_short_pos = sum(1 for r in live_rows if str(r.get("side") or "").upper() in {"SHORT", "SELL"})
+
+    # A Central/PAPER representa a verdade estatística e de exposição agregada.
+    # Em VERIFY/LIVE, ela também deve bloquear novas entradas quando a carteira
+    # paper/central já estiver saturada.
     if intended_live or mode in {"LIVE", "VERIFY"}:
         risk_rows = live_rows
-        risk_total_pos = len(risk_rows)
-        risk_long_pos = sum(1 for r in risk_rows if str(r.get("side") or "").upper() in {"LONG", "BUY"})
-        risk_short_pos = sum(1 for r in risk_rows if str(r.get("side") or "").upper() in {"SHORT", "SELL"})
+        risk_total_pos = live_total_pos
+        risk_long_pos = live_long_pos
+        risk_short_pos = live_short_pos
     else:
         risk_rows = rows
         risk_total_pos = total_pos
         risk_long_pos = long_pos
         risk_short_pos = short_pos
 
+    memory_risk = _risk_memory_block_payload()
+
     reasons = []
     warnings = []
+
+    if reduce_only and GLOBAL_RISK_ALLOW_REDUCE_ONLY:
+        decision_result = {
+            "allowed": True,
+            "decision": "ALLOW",
+            "bot": bot,
+            "symbol": symbol,
+            "side": side,
+            "mode": mode,
+            "intended_live": intended_live,
+            "reduce_only": True,
+            "reasons": [],
+            "warnings": ["reduceOnly/fechamento permitido mesmo com travas de risco"],
+            "memory": memory_risk,
+            "exposure": {
+                "total": risk_total_pos,
+                "long": risk_long_pos,
+                "short": risk_short_pos,
+                "paper_total": total_pos,
+                "paper_long": long_pos,
+                "paper_short": short_pos,
+                "live_total": live_total_pos,
+                "live_long": live_long_pos,
+                "live_short": live_short_pos,
+                "max_positions": GLOBAL_RISK_MAX_POSITIONS,
+                "max_symbol_exposure": GLOBAL_RISK_MAX_SYMBOL_EXPOSURE,
+                "max_side_concentration_pct": GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT,
+            },
+            "requested_margin_usdt": margin,
+            "requested_leverage": leverage,
+            "requested_effective_notional_usdt": notional,
+            "execution": broker_status_payload(),
+        }
+        try:
+            append_decision_log(payload, decision_result)
+        except Exception as exc:
+            print("ERRO decision log:", exc)
+        return decision_result
 
     if not bot:
         reasons.append("bot ausente")
@@ -2819,6 +2925,19 @@ def can_open_trade_decision(payload: dict):
         reasons.append(f"bot inválido: {bot}")
     if symbol and REAL_TRADING_ALLOWED_SYMBOLS and symbol not in REAL_TRADING_ALLOWED_SYMBOLS:
         reasons.append(f"símbolo não liberado para real: {symbol}")
+
+    # Hard blocks globais da Central, valem para PAPER/VERIFY/LIVE.
+    if memory_risk.get("blocked"):
+        reasons.append(
+            f"memória acima do limite operacional: {memory_risk.get('usage_pct')}% >= {GLOBAL_RISK_MEMORY_BLOCK_PCT}%"
+        )
+
+    if GLOBAL_RISK_BLOCK_ON_PAPER_EXPOSURE and total_pos >= GLOBAL_RISK_MAX_POSITIONS:
+        reasons.append(f"limite global Central/PAPER atingido: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+
+    if live_total_pos >= GLOBAL_RISK_MAX_POSITIONS:
+        reasons.append(f"limite global LIVE atingido: {live_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+
     if intended_live:
         if not ENABLE_REAL_TRADING:
             reasons.append("ENABLE_REAL_TRADING=false")
@@ -2829,27 +2948,40 @@ def can_open_trade_decision(payload: dict):
             if not ready.get("ok"):
                 reasons.append(f"BingX não está READY: {ready.get('status') or ready.get('error')}")
 
-    if risk_total_pos >= GLOBAL_RISK_MAX_POSITIONS:
-        reasons.append(f"limite global de posições atingido: {risk_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
-
+    # Exposição por ativo: usa a Central/PAPER como verdade estatística,
+    # e também confere LIVE quando houver posição real.
     if symbol:
-        same_symbol = [r for r in risk_rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
-        if len(same_symbol) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
-            reasons.append(f"limite por ativo atingido em {symbol}: {len(same_symbol)}/{GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}")
-        same_bot_symbol = [r for r in same_symbol if str(r.get("bot") or "").upper() == bot]
+        same_symbol_paper = [r for r in rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
+        same_symbol_live = [r for r in live_rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
+
+        if len(same_symbol_paper) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
+            reasons.append(f"limite por ativo Central/PAPER atingido em {symbol}: {len(same_symbol_paper)}/{GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}")
+        if len(same_symbol_live) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
+            reasons.append(f"limite por ativo LIVE atingido em {symbol}: {len(same_symbol_live)}/{GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}")
+
+        same_bot_symbol = [r for r in same_symbol_paper if str(r.get("bot") or "").upper() == bot]
         if same_bot_symbol:
             reasons.append(f"{bot} já possui exposição em {symbol}")
 
-    if side in {"LONG", "BUY"} and risk_total_pos:
-        next_long = risk_long_pos + 1
-        side_conc = next_long / max(risk_total_pos + 1, 1) * 100
-        if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
-            reasons.append(f"concentração LONG ficaria {side_conc:.1f}%")
-    if side in {"SHORT", "SELL"} and risk_total_pos:
-        next_short = risk_short_pos + 1
-        side_conc = next_short / max(risk_total_pos + 1, 1) * 100
-        if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
-            reasons.append(f"concentração SHORT ficaria {side_conc:.1f}%")
+    # Concentração direcional: bloqueia apenas novas entradas no lado dominante.
+    paper_total_after = total_pos + 1
+    live_total_after = live_total_pos + 1
+
+    if side in {"LONG", "BUY"}:
+        paper_side_conc = (long_pos + 1) / max(paper_total_after, 1) * 100
+        live_side_conc = (live_long_pos + 1) / max(live_total_after, 1) * 100 if live_total_pos else 0
+        if paper_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            reasons.append(f"concentração LONG Central/PAPER ficaria {paper_side_conc:.1f}%")
+        if live_total_pos and live_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            reasons.append(f"concentração LONG LIVE ficaria {live_side_conc:.1f}%")
+
+    if side in {"SHORT", "SELL"}:
+        paper_side_conc = (short_pos + 1) / max(paper_total_after, 1) * 100
+        live_side_conc = (live_short_pos + 1) / max(live_total_after, 1) * 100 if live_total_pos else 0
+        if paper_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            reasons.append(f"concentração SHORT Central/PAPER ficaria {paper_side_conc:.1f}%")
+        if live_total_pos and live_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+            reasons.append(f"concentração SHORT LIVE ficaria {live_side_conc:.1f}%")
 
     if risk_pct and risk_pct > REAL_TRADING_MAX_RISK_PCT:
         reasons.append(f"risco acima do máximo real: {risk_pct}% > {REAL_TRADING_MAX_RISK_PCT}%")
@@ -2860,9 +2992,11 @@ def can_open_trade_decision(payload: dict):
 
     # Avisos não bloqueantes.
     if total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
-        warnings.append(f"exposição PAPER/Central alta: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
-    if risk_total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
-        warnings.append(f"exposição LIVE alta: {risk_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+        warnings.append(f"exposição Central/PAPER alta: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+    if live_total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
+        warnings.append(f"exposição LIVE alta: {live_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+    if memory_risk.get("usage_pct") is not None and float(memory_risk.get("usage_pct")) >= MEMORY_ALERT_THRESHOLD_PCT:
+        warnings.append(f"memória elevada: {memory_risk.get('usage_pct')}%")
 
     allowed = len(reasons) == 0
     decision_result = {
@@ -2873,16 +3007,23 @@ def can_open_trade_decision(payload: dict):
         "side": side,
         "mode": mode,
         "intended_live": intended_live,
+        "reduce_only": reduce_only,
         "reasons": reasons,
         "warnings": warnings,
+        "memory": memory_risk,
         "exposure": {
             "total": risk_total_pos,
             "long": risk_long_pos,
             "short": risk_short_pos,
             "paper_total": total_pos,
-            "live_total": len(live_rows),
+            "paper_long": long_pos,
+            "paper_short": short_pos,
+            "live_total": live_total_pos,
+            "live_long": live_long_pos,
+            "live_short": live_short_pos,
             "max_positions": GLOBAL_RISK_MAX_POSITIONS,
             "max_symbol_exposure": GLOBAL_RISK_MAX_SYMBOL_EXPOSURE,
+            "max_side_concentration_pct": GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT,
         },
         "requested_margin_usdt": margin,
         "requested_leverage": leverage,
@@ -3159,30 +3300,41 @@ def build_risk_report():
     total_pos = int(exposure_snapshot.get("total_positions_open") or 0)
     long_pos = int(exposure_snapshot.get("long_positions_open") or 0)
     short_pos = int(exposure_snapshot.get("short_positions_open") or 0)
+    mem = _risk_memory_block_payload()
+
     notes = []
     blocks = []
 
     if total_pos >= GLOBAL_RISK_MAX_POSITIONS:
-        blocks.append(f"Bloquear novas entradas: posições abertas {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}.")
+        blocks.append(f"DENY novas entradas: posições abertas {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}.")
+    if mem.get("blocked"):
+        blocks.append(f"DENY novas entradas: memória {mem.get('usage_pct')}% >= {GLOBAL_RISK_MEMORY_BLOCK_PCT}%.")
+
     if total_pos:
-        side_conc = max(long_pos, short_pos) / max(total_pos, 1) * 100
+        long_conc = long_pos / max(total_pos, 1) * 100
+        short_conc = short_pos / max(total_pos, 1) * 100
+        side_conc = max(long_conc, short_conc)
+        dominant = "SHORT" if short_pos >= long_pos else "LONG"
         if side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
-            dominant = "SHORT" if short_pos >= long_pos else "LONG"
             notes.append(f"Concentração {dominant}: {side_conc:.1f}% ({max(long_pos, short_pos)}/{total_pos}).")
-            blocks.append(f"Evitar novas entradas {dominant} até reduzir concentração.")
+            blocks.append(f"DENY novos {dominant}s até concentração ficar abaixo de {GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT}%.")
 
     repeated = []
     for sym, items in by_symbol.items():
         if len(items) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
             repeated.append((sym, len(items), sorted(set([x.get("bot") for x in items]))))
-            blocks.append(f"Evitar novas entradas em {sym}: {len(items)} exposições abertas.")
+            blocks.append(f"DENY nova entrada em {sym}: {len(items)} exposições abertas.")
 
     lines = [
         "🛡️ RISK MANAGER GLOBAL — DECISIONAL",
         f"Data/hora: {data_hora_sp_str()}",
         "",
         f"Posições: {total_pos} | LONG {long_pos} | SHORT {short_pos}",
-        f"Limite global sugerido: {GLOBAL_RISK_MAX_POSITIONS}",
+        f"Limite global: {GLOBAL_RISK_MAX_POSITIONS}",
+        f"Limite concentração direcional: {GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT}%",
+        f"Limite por ativo: {GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}",
+        f"Bloqueio por memória: {GLOBAL_RISK_MEMORY_BLOCK_PCT}%",
+        f"Memória atual: {mem.get('rss_mb')} MB | {mem.get('usage_pct')}%",
         "",
         "Observações:",
     ]
@@ -3193,16 +3345,23 @@ def build_risk_report():
         for sym, count, bots in repeated[:20]:
             lines.append(f"- {sym}: {count} posições | bots={','.join([str(b) for b in bots])}")
 
-    lines += ["", "Recomendações consultivas:"]
+    lines += ["", "Bloqueios decisórios ativos:"]
     if blocks:
         lines += [f"- {b}" for b in blocks]
     else:
-        lines.append("- Risco global dentro dos limites consultivos.")
+        lines.append("- Nenhum bloqueio decisório ativo.")
 
     lines += [
         "",
+        "Regras V3.1:",
+        f"- Posições >= {GLOBAL_RISK_MAX_POSITIONS}: DENY novas entradas.",
+        f"- Memória >= {GLOBAL_RISK_MEMORY_BLOCK_PCT}%: DENY novas entradas.",
+        f"- Concentração LONG/SHORT >= {GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT}%: DENY novas entradas no lado dominante.",
+        f"- Ativo com {GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}+ exposições: DENY nova entrada no ativo.",
+        "- Fechamento/reduceOnly continua permitido.",
+        "",
         "Importante:",
-        "Este Risk Manager já responde ALLOW/DENY em /can_open_trade. Para bloquear entradas reais, o robô precisa consultar esta rota antes de executar.",
+        "Este Risk Manager responde ALLOW/DENY em /can_open_trade. Para bloquear entradas reais/VERIFY, o robô precisa consultar esta rota antes de executar.",
     ]
     return "\n".join(lines)
 
@@ -3642,7 +3801,16 @@ def build_daily_risk_summary_v3():
             reverse=True,
         )[:5]
 
-        status = "🔴 BLOQUEAR NOVAS ENTRADAS" if total >= GLOBAL_RISK_MAX_POSITIONS else "🟢 Dentro do limite"
+        mem = _risk_memory_block_payload()
+        status = "🟢 Dentro do limite"
+        if total >= GLOBAL_RISK_MAX_POSITIONS or mem.get("blocked"):
+            status = "🔴 BLOQUEAR NOVAS ENTRADAS"
+        elif total:
+            long_conc = longs / max(total, 1) * 100
+            short_conc = shorts / max(total, 1) * 100
+            if max(long_conc, short_conc) >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+                dominant = "SHORT" if short_conc >= long_conc else "LONG"
+                status = f"🟠 BLOQUEAR NOVOS {dominant}s"
         usage_pct = round((total / max(GLOBAL_RISK_MAX_POSITIONS, 1)) * 100, 1)
         lines = [
             "🛡️ RISCO GLOBAL",
@@ -3650,6 +3818,7 @@ def build_daily_risk_summary_v3():
             f"{total} / {GLOBAL_RISK_MAX_POSITIONS}",
             f"{usage_pct}%",
             f"LONG {longs} | SHORT {shorts}",
+            f"Memória: {mem.get('usage_pct')}%",
             f"Status: {status}",
         ]
         if repeated:
