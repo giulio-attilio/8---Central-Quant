@@ -113,6 +113,8 @@ CENTRAL_COMMAND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_COMMAND_D
 # Risk Manager Global decisório. Ele responde ALLOW/DENY em /can_open_trade.
 # Em LIVE, o robô executa automaticamente se a Central aprovar e o kill switch estiver ligado.
 GLOBAL_RISK_MAX_POSITIONS = int(os.environ.get("GLOBAL_RISK_MAX_POSITIONS", "50"))
+GLOBAL_RISK_MAX_PAPER_POSITIONS = int(os.environ.get("GLOBAL_RISK_MAX_PAPER_POSITIONS", "100"))
+GLOBAL_RISK_BLOCK_ON_PAPER_LIMIT = env_bool("GLOBAL_RISK_BLOCK_ON_PAPER_LIMIT", False)
 # V3.1 hard blocks:
 # - acima do limite global de posições, negar novas entradas
 # - concentração direcional acima de 70%, negar novas entradas no lado dominante
@@ -3129,6 +3131,10 @@ def can_open_trade_decision(payload: dict):
                 "live_long": live_long_pos,
                 "live_short": live_short_pos,
                 "max_positions": GLOBAL_RISK_MAX_POSITIONS,
+                "max_paper_positions": GLOBAL_RISK_MAX_PAPER_POSITIONS,
+                "block_on_paper_limit": GLOBAL_RISK_BLOCK_ON_PAPER_LIMIT,
+                "max_paper_positions": GLOBAL_RISK_MAX_PAPER_POSITIONS,
+                "block_on_paper_limit": GLOBAL_RISK_BLOCK_ON_PAPER_LIMIT,
                 "max_symbol_exposure": GLOBAL_RISK_MAX_SYMBOL_EXPOSURE,
                 "max_side_concentration_pct": GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT,
             },
@@ -3156,11 +3162,20 @@ def can_open_trade_decision(payload: dict):
             f"memória acima do limite operacional: {memory_risk.get('usage_pct')}% >= {GLOBAL_RISK_MEMORY_BLOCK_PCT}%"
         )
 
-    if GLOBAL_RISK_BLOCK_ON_PAPER_EXPOSURE and total_pos >= GLOBAL_RISK_MAX_POSITIONS:
-        reasons.append(f"limite global Central/PAPER atingido: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+    if intended_live or mode in {"LIVE", "VERIFY"}:
+        paper_limit = GLOBAL_RISK_MAX_PAPER_POSITIONS
+        paper_limit_enabled = False
+    else:
+        paper_limit = GLOBAL_RISK_MAX_PAPER_POSITIONS
+        paper_limit_enabled = GLOBAL_RISK_BLOCK_ON_PAPER_LIMIT
+
+    if paper_limit_enabled and total_pos >= paper_limit:
+        reasons.append(f"bloqueio PAPER ativo: {total_pos}/{paper_limit}")
+    elif total_pos >= max(1, int(paper_limit * 0.9)):
+        warnings.append(f"exposição PAPER alta: {total_pos}/{paper_limit}")
 
     if live_total_pos >= GLOBAL_RISK_MAX_POSITIONS:
-        reasons.append(f"limite global LIVE atingido: {live_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+        reasons.append(f"limite LIVE atingido: {live_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
 
     if intended_live:
         if not ENABLE_REAL_TRADING:
@@ -3215,8 +3230,8 @@ def can_open_trade_decision(payload: dict):
         reasons.append(f"exposição efetiva acima do máximo real: {notional} > {REAL_TRADING_MAX_NOTIONAL_USDT} USDT")
 
     # Avisos não bloqueantes.
-    if total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
-        warnings.append(f"exposição Central/PAPER alta: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
+    if total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)) and not any("exposição PAPER alta" in w for w in warnings):
+        warnings.append(f"exposição PAPER alta: {total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
     if live_total_pos >= max(1, int(GLOBAL_RISK_MAX_POSITIONS * 0.9)):
         warnings.append(f"exposição LIVE alta: {live_total_pos}/{GLOBAL_RISK_MAX_POSITIONS}")
     if memory_risk.get("usage_pct") is not None and float(memory_risk.get("usage_pct")) >= MEMORY_ALERT_THRESHOLD_PCT:

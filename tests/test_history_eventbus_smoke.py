@@ -132,6 +132,27 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             self.assertIn("events", query_payload)
             self.assertGreaterEqual(len(query_payload["events"]), 1)
 
+    def test_can_open_trade_does_not_block_paper_by_default(self):
+        with mock.patch.object(central_main, "GLOBAL_RISK_MAX_POSITIONS", 50), \
+             mock.patch.object(central_main, "GLOBAL_RISK_MAX_PAPER_POSITIONS", 100), \
+             mock.patch.object(central_main, "GLOBAL_RISK_BLOCK_ON_PAPER_LIMIT", False), \
+             mock.patch.object(central_main, "GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT", 100), \
+             mock.patch.object(central_main, "GLOBAL_RISK_MAX_SYMBOL_EXPOSURE", 3), \
+             mock.patch.object(central_main, "GLOBAL_RISK_ALLOW_REDUCE_ONLY", False), \
+             mock.patch.object(central_main, "ENABLE_REAL_TRADING", True), \
+             mock.patch.object(central_main, "REAL_TRADING_ALLOWED_BOTS", {"FALCON"}), \
+             mock.patch.object(central_main, "_all_open_positions_payload", return_value=[{"bot": "FALCON", "symbol": "BTCUSDT", "side": "LONG"}] * 101), \
+             mock.patch.object(central_main, "_central_live_positions_payload", return_value=[]), \
+             mock.patch.object(central_main, "central_exposure_snapshot", return_value={"total_positions_open": 101, "long_positions_open": 101, "short_positions_open": 0}), \
+             mock.patch.object(central_main, "_risk_memory_block_payload", return_value={"blocked": False, "usage_pct": 0}), \
+             mock.patch.object(central_main, "append_decision_log", return_value=None), \
+             mock.patch.object(central_main, "broker_status_payload", return_value={"ok": True}):
+            result = central_main.can_open_trade_decision({"bot": "FALCON", "symbol": "ETHUSDT", "side": "SHORT", "mode": "PAPER"})
+
+        self.assertTrue(result["allowed"])
+        self.assertIn("exposição PAPER alta", " ".join(result["warnings"]))
+        self.assertNotIn("bloqueio PAPER ativo", " ".join(result["reasons"]))
+
     def test_blocked_and_nested_payloads_are_normalized(self):
         history_manager.log_event(
             "TRADE_BLOCKED",
