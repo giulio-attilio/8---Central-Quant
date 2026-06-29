@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-6-SINGLE-TELEGRAM-LEADER
+# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-7-FORCE-HISTORY-V2
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -4298,7 +4298,7 @@ def build_support_report():
         build_memory_text(run_gc=False)[0],
         "",
         "==============================\nHISTORY\n==============================",
-        build_history_report(),
+        __import__("history_manager").build_history_report(),
         "",
         "==============================\nHEALTH DOS BOTS\n==============================",
     ]
@@ -4313,7 +4313,7 @@ def build_audit_parts():
         ("AUDITORIA — CENTRAL", "🔍 AUDITORIA CENTRAL QUANT\n" + f"Data/hora: {data_hora_sp_str()}"),
         ("DASHBOARD", build_dashboard_report()),
         ("RANKING", build_ranking_report()),
-        ("HISTORY", build_history_report()),
+        ("HISTORY", __import__("history_manager").build_history_report()),
         ("RISK", build_risk_report()),
         ("HEAT", build_heatmap_report()),
         ("EXPOSIÇÃO", _brief_exposure_text()),
@@ -4544,7 +4544,7 @@ def meta_route():
 
 @app.route("/history")
 def history_route():
-    return {"text": build_history_report()}
+    return {"text": __import__("history_manager").build_history_report()}
 
 
 @app.route("/snapshot")
@@ -5169,7 +5169,7 @@ def build_central_command_reply(text: str):
     if cmd0 in {"/meta", "/metasupervisor"}:
         return build_meta_supervisor_report()
     if cmd0 in {"/history"}:
-        return build_history_report()
+        return __import__("history_manager").build_history_report()
     if cmd0 in {"/riskstats", "/riscoestatisticas", "/estatisticashistory"}:
         try:
             import history_manager as super_history_manager
@@ -5716,7 +5716,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     if cmd0 in {"/meta", "/metasupervisor"}:
         return build_meta_supervisor_report()
     if cmd0 in {"/history"}:
-        return build_history_report()
+        return __import__("history_manager").build_history_report()
     if cmd0 in {"/riskstats", "/riscoestatisticas", "/estatisticashistory"}:
         try:
             import history_manager as super_history_manager
