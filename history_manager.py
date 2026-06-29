@@ -187,69 +187,125 @@ def _safe_dict(value):
     return {}
 
 
+def is_bad_string_value(value):
+    if value is None:
+        return False
+    if isinstance(value, (dict, list)):
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    if text.lower() in {"none", "null", "nan", "n/a", "na"}:
+        return False
+    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+        return True
+    if "{" in text and "}" in text:
+        return True
+    if "[" in text and "]" in text:
+        return True
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        pass
+    return len(text) > 160
+
+
+def sanitize_bot(value, payload=None):
+    candidate = value
+    if isinstance(candidate, str):
+        candidate = candidate.strip()
+    else:
+        candidate = ""
+
+    if not candidate or is_bad_string_value(candidate):
+        if isinstance(payload, dict):
+            candidate = _extract_field(payload, ["bot", "bot_name", "strategy", "source"], default="")
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+            else:
+                candidate = ""
+
+    if not candidate or is_bad_string_value(candidate):
+        return ""
+    lowered = candidate.lower()
+    if lowered in {"none", "null", "nan", "n/a", "na"}:
+        return ""
+    if "falcon strike" in lowered or "falconstrike" in lowered:
+        return "FALCON"
+    return candidate.upper()
+
+
 def _extract_field(payload, field_names, default=None):
     if not isinstance(payload, dict):
         return default
-    for name in field_names:
-        value = payload.get(name)
-        if value is not None and value != "":
-            if isinstance(value, str) and value.strip().startswith("{") and value.strip().endswith("}"):
-                parsed = _safe_dict(value)
-                if parsed:
-                    return parsed
-            return value
 
-    raw = payload.get("raw")
-    if isinstance(raw, dict):
+    def _search(node):
+        if not isinstance(node, dict):
+            return default
         for name in field_names:
-            value = raw.get(name)
+            value = node.get(name)
             if value is not None and value != "":
+                if isinstance(value, str):
+                    if is_bad_string_value(value):
+                        continue
+                    return value
                 return value
+        for child_name in ("raw", "falcon_event", "execution_decision"):
+            child = node.get(child_name)
+            if isinstance(child, dict):
+                nested = _search(child)
+                if nested is not None and nested != "":
+                    return nested
+        for child in node.values():
+            if isinstance(child, dict):
+                nested = _search(child)
+                if nested is not None and nested != "":
+                    return nested
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, dict):
+                        nested = _search(item)
+                        if nested is not None and nested != "":
+                            return nested
+        return default
 
-    falcon_event = payload.get("falcon_event") or payload.get("raw", {}).get("falcon_event") if isinstance(payload.get("raw"), dict) else None
-    if isinstance(falcon_event, dict):
-        for name in field_names:
-            value = falcon_event.get(name)
-            if value is not None and value != "":
-                return value
-
-    execution_decision = payload.get("execution_decision") or payload.get("raw", {}).get("execution_decision") if isinstance(payload.get("raw"), dict) else None
-    if isinstance(execution_decision, dict):
-        for name in field_names:
-            value = execution_decision.get(name)
-            if value is not None and value != "":
-                return value
-    return default
+    return _search(payload)
 
 
 def _extract_bot(payload):
     value = _extract_field(payload, ["bot", "bot_name", "strategy", "source"], default="")
-    if isinstance(value, str):
-        value = value.strip()
-        if not value or value.startswith("{"):
-            return ""
-        if value.lower() in {"none", "null", "nan"}:
-            return ""
-        return value
-    return ""
+    return sanitize_bot(value, payload)
 
 
 def _extract_symbol(payload):
     value = _extract_field(payload, ["symbol", "ativo", "pair", "ticker"], default="")
     if isinstance(value, str):
+        value = value.strip()
+        if not value or is_bad_string_value(value):
+            return ""
         return normalize_symbol(value)
-    return normalize_symbol(value)
+    return ""
 
 
 def _extract_setup(payload):
     value = _extract_field(payload, ["setup", "signal_type", "setup_label", "strategy"], default="")
     if isinstance(value, str):
-        return value.strip()
-    return value
+        value = value.strip()
+        if not value or is_bad_string_value(value):
+            return ""
+        return value.upper()
+    return ""
 
 
 def _extract_side(payload):
     value = _extract_field(payload, ["side", "direction", "signal"], default="")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or is_bad_string_value(value):
+            return ""
     return normalize_side(value)
 
 
@@ -346,7 +402,9 @@ def classify_event(event_type, payload=None):
 def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     raw = payload if isinstance(payload, dict) else {"value": payload}
     event = classify_event(event_type, raw)
-    bot = _extract_bot(raw) or str(_first(raw, ["bot", "bot_name", "strategy", "source"], source or "CENTRAL") or "CENTRAL").upper()
+    bot_value = _extract_bot(raw)
+    fallback_bot = sanitize_bot(_first(raw, ["bot", "bot_name", "strategy", "source"], source or "CENTRAL"), raw)
+    bot = str(bot_value or fallback_bot or source or "CENTRAL").upper()
     symbol = _extract_symbol(raw)
     side = _extract_side(raw)
     setup = _extract_setup(raw)
@@ -575,15 +633,15 @@ def calculate_stats(events=None, filters=None, rows=None):
 
     for event in rows:
         event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
-        reason = str(event.get("reason") or event.get("result") or event.get("resultado") or "").upper()
-        raw_reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("event") or event.get("event_type") or event.get("type") or "").lower()
+        reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("decision") or event.get("status") or "").upper()
+        raw_reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("decision") or event.get("status") or event.get("event") or event.get("event_type") or event.get("type") or "").lower()
         if event_name == "SIGNAL_CREATED":
             totals["signals"] += 1
         if event_name == "TRADE_OPENED":
             totals["entries"] += 1
         if event_name == "TRADE_CLOSED":
             totals["closed"] += 1
-        if event_name == "TRADE_BLOCKED":
+        if event_name in {"TRADE_BLOCKED", "RISK_DECISION"}:
             totals["blocked"] += 1
             if reason in {"DENY", "DENIED", "BLOCKED"} or "deny" in raw_reason or "blocked" in raw_reason:
                 totals["denied"] += 1
@@ -629,11 +687,16 @@ def group_stats(group_by="bot", events=None, filters=None):
     for event in rows:
         key = None
         if group_by == "bot":
-            key = str(event.get("bot") or "N/A").upper()
+            key = sanitize_bot(event.get("bot"), event) or str(event.get("bot") or "N/A").upper()
+            key = key or "N/A"
         elif group_by == "symbol":
-            key = str(event.get("symbol") or "N/A").upper()
+            symbol = _extract_symbol(event)
+            key = symbol or str(event.get("symbol") or "N/A").upper()
+            key = key or "N/A"
         else:
-            key = str(event.get("setup") or "N/A").upper()
+            setup = _extract_setup(event)
+            key = setup or str(event.get("setup") or "N/A").upper()
+            key = key or "N/A"
         buckets[key].append(event)
 
     return {key: calculate_stats(rows=items) for key, items in sorted(buckets.items())}
@@ -653,12 +716,15 @@ def build_history_payload(limit=None):
     for e in events:
         event = e.get("event") or "EVENT"
         by_event[event] += 1
-        if e.get("bot"):
-            by_bot[e.get("bot")] += 1
-        if e.get("symbol"):
-            by_symbol[e.get("symbol")] += 1
-        if e.get("setup"):
-            by_setup[str(e.get("setup"))] += 1
+        bot_key = sanitize_bot(e.get("bot"), e) or str(e.get("bot") or "N/A").upper()
+        symbol_key = _extract_symbol(e) or str(e.get("symbol") or "N/A").upper()
+        setup_key = _extract_setup(e) or str(e.get("setup") or "N/A").upper()
+        if bot_key:
+            by_bot[bot_key] += 1
+        if symbol_key:
+            by_symbol[symbol_key] += 1
+        if setup_key:
+            by_setup[setup_key] += 1
         if e.get("side"):
             by_side[e.get("side")] += 1
         if event == "TRADE_CLOSED":

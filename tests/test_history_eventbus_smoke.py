@@ -145,11 +145,27 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             source="central",
             trade_id="T-RISK",
         )
+        history_manager.log_event(
+            "TEST_EVENT",
+            {"bot": "{'name': 'falcon'}", "raw": {"bot": "Falcon Strike"}},
+            source="falcon",
+            trade_id="T-BOT",
+        )
+
         blocked_events = history_manager.load_events(filters={"event_type": "TRADE_BLOCKED"})
         self.assertGreaterEqual(len(blocked_events), 1)
+
+        bot_normalized = history_manager.normalize_payload("TEST_EVENT", {"bot": "{'name': 'falcon'}", "raw": {"bot": "Falcon Strike"}}, source="falcon")
+        self.assertEqual(bot_normalized["bot"], "FALCON")
+
         stats = history_manager.calculate_stats()
-        self.assertGreaterEqual(stats["blocked"], 1)
-        self.assertGreaterEqual(stats["denied"], 1)
+        self.assertGreaterEqual(stats["blocked"], 2)
+        self.assertGreaterEqual(stats["denied"], 2)
+
+        grouped = history_manager.group_stats(group_by="bot")
+        self.assertIn("FALCON", grouped)
+        self.assertGreaterEqual(grouped["FALCON"]["blocked"], 1)
+        self.assertGreaterEqual(grouped["FALCON"]["denied"], 1)
 
 
 if __name__ == "__main__":
