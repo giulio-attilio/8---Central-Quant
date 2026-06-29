@@ -156,6 +156,11 @@ EMA20 = 20
 # DONKEY H4 - SETUP INDEPENDENTE
 # ====================================================
 ENABLE_DONKEY_H4 = True
+# Donkey H4 Original: checklist original inspirado no vídeo.
+# Não exige pullback na EMA20.
+# LONG: EMA20 H4 > EMA50 H4, preço H4 > EMA20/EMA50, MACD H4 > 0 e preço diário > EMA20 diária.
+# SHORT: EMA20 H4 < EMA50 H4, preço H4 < EMA20/EMA50, MACD H4 < 0 e preço diário < EMA20 diária.
+ENABLE_DONKEY_H4_ORIGINAL = True
 ENABLE_EARLY_DONKEY_H4 = False
 DONKEY_TIMEFRAME = "4h"
 DONKEY_EMA_FAST = 20
@@ -200,9 +205,9 @@ MAX_RISK_H1 = 2.0
 # Objetivo: evitar sinais com risco 3% a 6% que distorcem o resultado.
 DONKEY_MAX_RISK_PCT = MAX_RISK_H1
 
-# Donkey: ao bater TP50, realiza 50% e deixa os 50% restantes correrem.
-# O restante NÃO usa stop/trailing por preço; sai somente por fechamento H4 contra EMA20.
-DONKEY_MOVE_SL_TO_BE_ON_TP50 = False
+# Donkey: ao bater TP50, stop sobe imediatamente para breakeven com pequeno lucro.
+# Isso evita TP50 virar loss depois.
+DONKEY_MOVE_SL_TO_BE_ON_TP50 = True
 DONKEY_BE_OFFSET_PCT = 0.10
 
 # Gestão Donkey pós-TP50:
@@ -636,16 +641,15 @@ def calcular_estado_operacional_donkey():
 
     em_tp50 = [p for p in abertas if bool(p.get("tp50_hit") or p.get("partial_tp50_done"))]
     aguardando_ema20 = [p for p in abertas if bool(p.get("partial_tp50_done")) and DONKEY_EXIT_REMAINDER_ON_H4_EMA20]
+    protegidas_be = [p for p in abertas if bool(p.get("breakeven")) or bool(p.get("partial_tp50_done"))]
     runners = [p for p in abertas if bool(p.get("partial_tp50_done")) and float(p.get("remaining_position_pct", 0) or 0) > 0]
-    sem_stop_pos_tp50 = [p for p in runners if bool(p.get("runner_ema20_only") or p.get("no_price_stop_after_tp50"))]
 
     return {
         "donkey_positions_open": len(abertas),
         "donkey_positions_tp50": len(em_tp50),
         "donkey_positions_waiting_ema20": len(aguardando_ema20),
-        "donkey_positions_protected_be": 0,
-        "donkey_runners_active": len(runners),
-        "donkey_runners_ema20_only": len(sem_stop_pos_tp50)
+        "donkey_positions_protected_be": len(protegidas_be),
+        "donkey_runners_active": len(runners)
     }
 
 
@@ -1042,7 +1046,7 @@ def enviar_por_origem(p, msg):
 
 
 def is_donkey_signal_type(signal_type):
-    return signal_type in ["DONKEY", "EARLY_DONKEY", "POI_DONKEY", "DONKEY_CONFIRMADO"]
+    return signal_type in ["DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY", "POI_DONKEY", "DONKEY_CONFIRMADO"]
 
 
 def is_donkey_trade_event(t):
@@ -1089,6 +1093,7 @@ def montar_resumo_mensal():
     recuperados = [t for t in entries if t.get("signal_type") == "RECUPERADO"]
     reentries = [t for t in entries if t.get("signal_type") == "REENTRY"]
     donkeys = [t for t in entries if t.get("signal_type") == "DONKEY"]
+    donkeys_original = [t for t in entries if t.get("signal_type") == "DONKEY_ORIGINAL"]
     early_donkeys = [t for t in entries if t.get("signal_type") == "EARLY_DONKEY"]
 
     wins = []
@@ -1143,6 +1148,7 @@ def montar_resumo_mensal():
         f"RECUPERADO: {len(recuperados)}\n"
         f"REENTRY: {len(reentries)}\n"
         f"DONKEY H4: {len(donkeys)}\n"
+        f"DONKEY H4 ORIGINAL: {len(donkeys_original)}\n"
         f"EARLY DONKEY H4: {len(early_donkeys)}\n"
         f"DONKEY CONFIRMADOS: {len(donkey_confirmados)}\n"
         f"POIs H1: {len(pois)}\n"
@@ -1359,7 +1365,6 @@ def montar_health_tecnico():
         "max_risk": MAX_RISK_H1,
         "donkey_max_risk_pct": DONKEY_MAX_RISK_PCT,
         "donkey_move_sl_to_be_on_tp50": DONKEY_MOVE_SL_TO_BE_ON_TP50,
-        "donkey_remainder_exit_model": "EMA20_H4_CLOSE_ONLY",
         "donkey_be_offset_pct": DONKEY_BE_OFFSET_PCT,
         "donkey_use_trailing50_ema20_100": DONKEY_USE_TRAILING50_EMA20_100,
         "donkey_partial_tp50_enabled": DONKEY_PARTIAL_TP50_ENABLED,
@@ -1383,6 +1388,8 @@ def montar_health_tecnico():
         "auto_position_report": ENABLE_AUTO_POSITION_REPORT,
         "be_trigger_r": BE_TRIGGER_R,
         "donkey_h4_enabled": ENABLE_DONKEY_H4,
+        "donkey_h4_original_enabled": ENABLE_DONKEY_H4_ORIGINAL,
+        "donkey_h4_original_checklist": "H4 EMA20/EMA50 + H4 price above/below EMA20/EMA50 + H4 MACD zero line + Daily EMA20",
         "early_donkey_h4_enabled": ENABLE_EARLY_DONKEY_H4,
         "donkey_confirm_key": DONKEY_CONFIRM_KEY,
         "donkey_buffer_pct": DONKEY_BUFFER_PCT,
@@ -1454,6 +1461,8 @@ def origem_trade_txt(p):
         return "POI"
     if origem == "DONKEY":
         return "DONKEY H4"
+    if origem == "DONKEY_ORIGINAL":
+        return "DONKEY H4 ORIGINAL"
     if origem == "EARLY_DONKEY":
         return "EARLY DONKEY"
     if origem == "POI_DONKEY":
@@ -1470,6 +1479,8 @@ def origem_msg_trade(p):
 
     if origem == "DONKEY H4":
         return "DONKEY"
+    if origem == "DONKEY H4 ORIGINAL":
+        return "DONKEY ORIGINAL"
 
     return origem
 
@@ -2505,6 +2516,139 @@ def detectar_donkey_h4(symbol):
     }
 
 
+def detectar_donkey_h4_original(symbol):
+    """
+    DONKEY H4 ORIGINAL:
+    Checklist original, sem regra de pullback.
+
+    BUY:
+    - EMA20 H4 acima da EMA50 H4
+    - Preço H4 acima da EMA20 H4
+    - Preço H4 acima da EMA50 H4
+    - MACD H4 acima de zero
+    - Preço diário acima da EMA20 diária
+
+    SELL:
+    - EMA20 H4 abaixo da EMA50 H4
+    - Preço H4 abaixo da EMA20 H4
+    - Preço H4 abaixo da EMA50 H4
+    - MACD H4 abaixo de zero
+    - Preço diário abaixo da EMA20 diária
+    """
+    if not ENABLE_DONKEY_H4_ORIGINAL:
+        return None
+
+    if existe_posicao_ativa(symbol):
+        return None
+
+    if donkey_em_cooldown_pos_saida(symbol):
+        return None
+
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    ohlcv_d1 = safe_fetch_ohlcv(symbol, timeframe="1d", limit=120)
+
+    if not ohlcv_h4 or not ohlcv_d1:
+        return None
+
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
+    df_d1 = preparar_df(pd.DataFrame(ohlcv_d1, columns=["time", "open", "high", "low", "close", "volume"]))
+
+    candle = df_h4.iloc[-2]
+    candle_d1 = df_d1.iloc[-2]
+
+    if bool(candle.get("spike_suspeito", False)):
+        print(f"DONKEY ORIGINAL IGNORADO POR CANDLE H4 SUSPEITO: {nome_limpo(symbol)}")
+        return None
+
+    timestamp = int(candle["time"])
+    close = float(candle["close"])
+    high = float(candle["high"])
+    low = float(candle["low"])
+    ema20 = float(candle["ema20"])
+    ema50 = float(candle["ema50"])
+    macd = float(candle["macd"])
+
+    close_d1 = float(candle_d1["close"])
+    ema20_d1 = float(candle_d1["ema20"])
+
+    original_long = (
+        ema20 > ema50 and
+        close > ema20 and
+        close > ema50 and
+        macd > 0 and
+        close_d1 > ema20_d1
+    )
+
+    original_short = (
+        ema20 < ema50 and
+        close < ema20 and
+        close < ema50 and
+        macd < 0 and
+        close_d1 < ema20_d1
+    )
+
+    signal = "LONG" if original_long else ("SHORT" if original_short else None)
+    if not signal:
+        return None
+
+    if donkey_em_cooldown(symbol, f"ORIGINAL_{signal}", timestamp):
+        return None
+
+    entry = close
+    if signal == "LONG":
+        sl = low * (1 - DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(entry - sl)
+        tp50 = entry + risk_abs * TP50_R
+    else:
+        sl = high * (1 + DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(sl - entry)
+        tp50 = entry - risk_abs * TP50_R
+
+    if risk_abs <= 0:
+        return None
+
+    risk_pct = risk_abs / entry * 100
+    if USE_MAX_RISK_FILTER and risk_pct > DONKEY_MAX_RISK_PCT:
+        print(
+            f"DONKEY ORIGINAL IGNORADO POR RISCO ALTO: "
+            f"{nome_limpo(symbol)} | {risk_pct:.2f}% > {DONKEY_MAX_RISK_PCT:.2f}%"
+        )
+        return None
+
+    marcar_donkey_cooldown(symbol, f"ORIGINAL_{signal}", timestamp)
+
+    return {
+        "type": "DONKEY_ORIGINAL",
+        "signal_type": "DONKEY_ORIGINAL",
+        "symbol": symbol,
+        "symbol_clean": nome_limpo(symbol),
+        "signal": signal,
+        "side": signal,
+        "timestamp": timestamp,
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "risk_abs": risk_abs,
+        "risk_pct": risk_pct,
+        "h4_state": 1 if signal == "LONG" else -1,
+        "h1_state": 0,
+        "adx_h4": float(candle.get("adx", 0)),
+        "adx_h1": 0.0,
+        "volume_ok": bool(candle.get("volume_ok", False)),
+        "bb_ok": bool(candle.get("bb_ok", False)),
+        "qualidade_pontos": 0,
+        "qualidade": "DONKEY H4 ORIGINAL 🐴",
+        "signal_score": 0,
+        "elite_candidate": False,
+        "donkey_risk_usdt": float(DONKEY_RISK_USDT),
+        "donkey_ema20": ema20,
+        "donkey_ema50": ema50,
+        "donkey_macd": macd,
+        "donkey_d1_close": close_d1,
+        "donkey_d1_ema20": ema20_d1
+    }
+
+
 def detectar_early_donkey_h4(symbol):
     """
     EARLY DONKEY H4:
@@ -2708,7 +2852,7 @@ def detectar_poi_donkey_h4(symbol, posicao):
     if not ENABLE_DONKEY_H4:
         return None
 
-    if posicao.get("signal_type") not in ["DONKEY", "EARLY_DONKEY"]:
+    if posicao.get("signal_type") not in ["DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"]:
         return None
 
     side = posicao.get("side")
@@ -2885,10 +3029,10 @@ def enviar_tp50_parcial_donkey(p, tp50, resultado):
         f"{fmt_pct(resultado)}\n\n"
         f"Lucro garantido na posição total:\n"
         f"{fmt_pct(resultado * (DONKEY_PARTIAL_TP50_PCT / 100.0))}\n\n"
+        f"Stop do restante:\n"
+        f"BE + {DONKEY_BE_OFFSET_PCT}% ✅\n\n"
         f"Restante:\n"
-        f"{DONKEY_REMAINING_AFTER_TP50_PCT:.0f}% aberto como runner ✅\n\n"
-        f"Saída do restante:\n"
-        f"Somente fechamento H4 contra EMA20"
+        f"{DONKEY_REMAINING_AFTER_TP50_PCT:.0f}% aguardando fechamento H4 contra EMA20"
     )
     safe_send_telegram_donkey(msg)
 
@@ -2925,11 +3069,12 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
     Fluxo:
     1) Antes do TP50: stop normal em tempo real.
     2) Ao atingir TP50:
-       - realiza 50% da posição no TP50;
-       - mantém 50% restante aberto como runner;
-       - NÃO usa stop/trailing por preço no restante.
+       - marca 50% realizado no TP50;
+       - move stop do restante para BE + offset;
+       - não usa mais Trailing50/Chandelier para o Donkey.
     3) Após TP50:
-       - os 50% restantes saem somente por fechamento H4 contra EMA20.
+       - 50% restante só sai por fechamento H4 contra EMA20
+         ou pelo stop BE+offset se o preço voltar.
     """
     alterou = False
 
@@ -2943,10 +3088,9 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
         return False
 
     # ====================================================
-    # 1) STOP somente ANTES do TP50
-    # Após TP50, os 50% restantes saem exclusivamente pela EMA20 H4.
+    # 1) STOP antes/depois do TP50
     # ====================================================
-    if (not p.get("partial_tp50_done")) and not stop_em_carencia(p):
+    if not stop_em_carencia(p):
         stop_hit = (
             (side == "LONG" and preco_atual <= sl) or
             (side == "SHORT" and preco_atual >= sl)
@@ -3047,6 +3191,11 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
         if tp50_hit:
             resultado_tp50 = pnl_pct(side, entry, tp50)
 
+            if side == "LONG":
+                novo_stop = entry * (1 + DONKEY_BE_OFFSET_PCT / 100)
+            else:
+                novo_stop = entry * (1 - DONKEY_BE_OFFSET_PCT / 100)
+
             p["tp50_hit"] = True
             p["tp50_message_sent"] = True
             p["partial_tp50_done"] = True
@@ -3055,11 +3204,11 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
             p["partial_realized_result_pct"] = resultado_tp50
             p["partial_realized_position_pct"] = DONKEY_PARTIAL_TP50_PCT
             p["remaining_position_pct"] = DONKEY_REMAINING_AFTER_TP50_PCT
-            p["runner_ema20_only"] = True
-            p["no_price_stop_after_tp50"] = True
-            p["breakeven"] = False
+            p["sl"] = novo_stop
+            p["breakeven"] = True
+            p["breakeven_activated_at"] = time.time()
             p["tp50_activated_at"] = time.time()
-            p["status"] = "PARCIAL 50% + RUNNER EMA20"
+            p["status"] = "PARCIAL 50% + EMA20"
             alterou = True
 
             enviar_tp50_parcial_donkey(p, tp50, resultado_tp50)
@@ -3079,9 +3228,8 @@ def gerenciar_donkey_position(symbol, p, preco_atual):
                 "partial_realized_result_pct": resultado_tp50,
                 "partial_realized_position_pct": DONKEY_PARTIAL_TP50_PCT,
                 "remaining_position_pct": DONKEY_REMAINING_AFTER_TP50_PCT,
-                "runner_ema20_only": True,
-                "no_price_stop_after_tp50": True,
-                "management_model": "PARTIAL50_RUNNER_EMA20_ONLY"
+                "stop_after_tp50": float(p["sl"]),
+                "management_model": "PARTIAL50_EMA20"
             })
 
             return True
@@ -3283,7 +3431,20 @@ def enviar_poi(s):
 
 def enviar_donkey(s):
     emoji = "🐴 🟢" if s["signal"] == "LONG" else "🐴 🔴"
-    nome = "DONKEY BUY" if s["signal"] == "LONG" else "DONKEY SELL"
+
+    if s.get("signal_type") == "DONKEY_ORIGINAL":
+        nome = "DONKEY H4 ORIGINAL BUY" if s["signal"] == "LONG" else "DONKEY H4 ORIGINAL SELL"
+        checklist = (
+            "\n\nChecklist Original:\n"
+            "EMA20/EMA50 H4 ✅\n"
+            "Preço do lado correto da EMA20 H4 ✅\n"
+            "Preço do lado correto da EMA50 H4 ✅\n"
+            "MACD H4 do lado correto do zero ✅\n"
+            "Preço do lado correto da EMA20 diária ✅"
+        )
+    else:
+        nome = "DONKEY BUY" if s["signal"] == "LONG" else "DONKEY SELL"
+        checklist = ""
 
     msg = (
         f"{emoji} {nome} - {s['symbol_clean']}\n\n"
@@ -3291,10 +3452,10 @@ def enviar_donkey(s):
         f"SL:\n{fmt_br(s['sl'])}\n\n"
         f"TP50:\n{fmt_br(s['tp50'])}\n\n"
         f"{risco_label(s['risk_pct'])} - Risco: {fmt_risco(s['risk_pct'])}%"
+        f"{checklist}"
     )
 
     safe_send_telegram_donkey(msg)
-
 
 def enviar_early_donkey(s):
     emoji = "🐴 🚀 🟢" if s["signal"] == "LONG" else "🐴 🚀 🔴"
@@ -3718,7 +3879,7 @@ def gerenciar_posicoes():
             if atualizar_mfe_posicao(p, preco_atual):
                 alterou = True
 
-            if p.get("signal_type") in ["DONKEY", "EARLY_DONKEY"]:
+            if p.get("signal_type") in ["DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"]:
                 if gerenciar_donkey_position(symbol, p, preco_atual):
                     alterou = True
                 continue
@@ -4199,6 +4360,7 @@ def montar_resumo_donkey():
 
     entradas = [t for t in trades_donkey if t.get("date") == hoje and t.get("event") == "ENTRY"]
     donkeys = [t for t in entradas if t.get("signal_type") == "DONKEY"]
+    donkeys_original = [t for t in entradas if t.get("signal_type") == "DONKEY_ORIGINAL"]
     early_donkeys = [t for t in entradas if t.get("signal_type") == "EARLY_DONKEY"]
     pois_donkey = [t for t in trades_donkey if t.get("date") == hoje and t.get("event") == "POI_DONKEY"]
     confirmados = [t for t in trades_donkey if t.get("date") == hoje and t.get("event") == "DONKEY_CONFIRMADO"]
@@ -4213,11 +4375,6 @@ def montar_resumo_donkey():
     trailing100s = [t for t in trades_donkey if t.get("date") == hoje and t.get("event") in ["TRAILING100", "SL100"]]
 
     lucro_tp50 = sum(float(t.get("partial_realized_result_pct", t.get("pnl", 0)) or 0) for t in parciais_tp50)
-    lucro_tp50_ponderado = sum(
-        float(t.get("partial_realized_result_pct", t.get("pnl", 0)) or 0) *
-        (float(t.get("partial_realized_position_pct", DONKEY_PARTIAL_TP50_PCT) or DONKEY_PARTIAL_TP50_PCT) / 100.0)
-        for t in parciais_tp50
-    )
     lucro_final = sum(float(t.get("pnl", 0) or 0) for t in fechados)
 
     wins = [t for t in fechados if t.get("result_type") == "WIN"]
@@ -4240,6 +4397,7 @@ def montar_resumo_donkey():
         f"LONG: {len(longs)}",
         f"SHORT: {len(shorts)}",
         f"DONKEY H4: {len(donkeys)}",
+        f"DONKEY H4 ORIGINAL: {len(donkeys_original)}",
         f"EARLY DONKEY H4: {len(early_donkeys)}",
         f"DONKEY CONFIRMADOS: {len(confirmados)}",
         f"POIs DONKEY: {len(pois_donkey)}",
@@ -4251,17 +4409,14 @@ def montar_resumo_donkey():
         "",
         f"TP50 atingidos: {len(tp50s)}",
         f"TP50 parciais realizados: {len(parciais_tp50)}",
-        f"Stop antes do TP50: {len([t for t in fechados if t.get('exit_model') == 'FULL_STOP'])}",
-        f"Stop do restante por preço: {len(sl50s)} (desligado no modelo atual)",
-        f"Saídas EMA20 H4: {len(sl100s)}",
-        f"Trailing50: {len(trailing50s)} (desligado)",
-        f"Trailing100: {len(trailing100s)} (desligado)",
+        f"SL50 / stop do restante: {len(sl50s)}",
+        f"SL100 EMA20 H4: {len(sl100s)}",
+        f"Trailing50: {len(trailing50s)}",
+        f"Trailing100: {len(trailing100s)}",
         f"Trailings atualizados: {len(trailings)}",
         "",
-        "Lucro parcial TP50 bruto:",
+        "Lucro parcial TP50:",
         fmt_pct(lucro_tp50),
-        "Lucro parcial TP50 ponderado:",
-        fmt_pct(lucro_tp50_ponderado),
         "Lucro final realizado:",
         fmt_pct(lucro_final),
         "",
@@ -4300,7 +4455,7 @@ def montar_resumo_donkey():
         "",
         f"Runners ativos: {operacional.get('donkey_runners_active', 0)}",
         f"Aguardando EMA20 H4: {operacional.get('donkey_positions_waiting_ema20', 0)}",
-        f"Runners EMA20 sem stop por preço: {operacional.get('donkey_runners_ema20_only', 0)}",
+        f"Protegidas em BE/parcial: {operacional.get('donkey_positions_protected_be', 0)}",
         "",
         f"Trades Donkey ainda ativos: {len(ativos)}"
     ]
@@ -4703,6 +4858,7 @@ def scanner():
         "🐴 Robô Donkey H4 iniciado\n\n"
         f"Filtros ativos:\n"
         f"Donkey H4 ativo: {check_bool(ENABLE_DONKEY_H4)}\n"
+        f"Donkey H4 Original ativo: {check_bool(ENABLE_DONKEY_H4_ORIGINAL)}\n"
         f"Early Donkey H4 ativo: {check_bool(ENABLE_EARLY_DONKEY_H4)}\n"
         f"Modo seletivo: ✅\n"
         f"Buffer stop/trailing: {DONKEY_BUFFER_PCT}%\n"
@@ -4710,7 +4866,8 @@ def scanner():
         f"POI cooldown: {DONKEY_POI_COOLDOWN_SECONDS // 3600}h\n"
         f"Limite de posições: {MAX_OPEN_POSITIONS}\n"
         f"Cooldown pós-saída: {DONKEY_POST_EXIT_COOLDOWN_SECONDS // 60} min\n"
-        f"Gestão: TP50 realiza 50% + restante sai somente na EMA20 H4\n"
+        f"Gestão: TP50 realiza 50% + restante EMA20 H4\n"
+        f"Original: EMA20/EMA50 H4 + preço EMA20/EMA50 + MACD zero + EMA20 diária\n"
         f"Timeframe: {DONKEY_TIMEFRAME}"
     )
 
@@ -4726,7 +4883,7 @@ def scanner():
             for symbol, p in list(posicoes.items()):
                 if p.get("status") == "ENCERRADO":
                     continue
-                if p.get("signal_type") not in ["DONKEY", "EARLY_DONKEY"]:
+                if p.get("signal_type") not in ["DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"]:
                     continue
 
                 try:
@@ -4833,6 +4990,23 @@ def scanner():
                                 historico[chave] = True
                                 salvar_sinais(historico)
                                 enviar_early_donkey(early_donkey)
+                                sinais_enviados += 1
+                        continue
+
+                    donkey_original_signal = detectar_donkey_h4_original(symbol)
+                    if donkey_original_signal:
+                        timestamp = int(donkey_original_signal["timestamp"])
+                        chave = f"DONKEY_ORIGINAL_{symbol}_{timestamp}_{donkey_original_signal['signal']}"
+                        historico = carregar_sinais()
+                        if chave not in historico:
+                            if startup_guard:
+                                historico[chave] = True
+                                salvar_sinais(historico)
+                                print(f"DONKEY ORIGINAL IGNORADO NO STARTUP GUARD: {nome_limpo(symbol)} {donkey_original_signal['signal']}")
+                            elif registrar_posicao(donkey_original_signal):
+                                historico[chave] = True
+                                salvar_sinais(historico)
+                                enviar_donkey(donkey_original_signal)
                                 sinais_enviados += 1
                         continue
 
