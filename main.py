@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-28-CENTRAL-V3-1-FINAL-STABLE-RISK-HARD-BLOCKS-RISK-HARD-BLOCKS
+# Versão: 2026-06-28-SUPER-CENTRAL-QUANT-V4-1-QUANT-EVENTS
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -4411,6 +4411,10 @@ def build_central_menu_text():
         "/live — saldo, posições reais e últimas execuções\n"
         "/executions — log das tentativas VERIFY/LIVE\n"
         "/risk — decisão global ALLOW/DENY e concentração\n\n"
+        "3.1) Super History\n"
+        "/history — diário da Central\n"
+        "/riskstats — estatísticas do History\n"
+        "/exporthistory — exportação JSON para análise\n\n"
         "4) Se algo parecer errado\n"
         "/support — pacote técnico de troubleshooting\n"
         "/memory — memória/risco de restart\n"
@@ -4445,7 +4449,7 @@ def build_central_help_text():
         "Por robô:\n"
         "/trend\n/donkey\n/cobra\n/meme\n/predator\n/turtle\n/falcon\n\n"
         "Histórico, estatística e simulação:\n"
-        "/journal\n/trade <ativo>\n/globalstats\n/signalai <ativo>\n/capital\n/correlation\n/timeheat\n/marketscore\n/allocation\n/rankingvivo\n/evolution\n/learning\n/quantos\n/snapshot\n/history\n/simulate TURTLE\n/simulateoff TURTLE\n\n"
+        "/history\n/riskstats\n/exporthistory\n/journal\n/trade <ativo>\n/globalstats\n/signalai <ativo>\n/capital\n/correlation\n/timeheat\n/marketscore\n/allocation\n/rankingvivo\n/evolution\n/learning\n/quantos\n/snapshot\n/history\n/simulate TURTLE\n/simulateoff TURTLE\n\n"
         "Sugestão de uso diário: /dashboard. Para colar no ChatGPT: /daily."
     )
 
@@ -4969,6 +4973,18 @@ def build_central_command_reply(text: str):
         return build_meta_supervisor_report()
     if cmd0 in {"/history"}:
         return build_history_report()
+    if cmd0 in {"/riskstats", "/riscoestatisticas", "/estatisticashistory"}:
+        try:
+            import history_manager as super_history_manager
+            return super_history_manager.build_riskstats_report()
+        except Exception as exc:
+            return f"⚠️ Erro ao gerar /riskstats: {exc}"
+    if cmd0 in {"/exporthistory", "/exportarhistory"}:
+        try:
+            import history_manager as super_history_manager
+            return super_history_manager.build_export_report()
+        except Exception as exc:
+            return f"⚠️ Erro ao gerar /exporthistory: {exc}"
     if cmd0 in {"/snapshot"}:
         return build_snapshot_report()
     if cmd0 in {"/simulate"}:
@@ -5174,6 +5190,17 @@ def central_telegram_command_loop():
 
                 title = _central_command_title(text)
                 try:
+                    try:
+                        import history_manager as super_history_manager
+                        super_history_manager.log_event("CENTRAL_COMMAND", {
+                            "command": text.split()[0] if text else "",
+                            "full_text": text,
+                            "chat_id": chat_id,
+                            "router": "central",
+                        }, source="telegram_central")
+                    except Exception as _history_exc:
+                        print("ERRO HISTORY command central:", _history_exc)
+
                     if TELEGRAM_LONG_COMMAND_NOTICE and _is_heavy_central_command(text):
                         telegram_send_with_token(token, chat_id, f"⏳ Gerando {title.lower()}...\nVou enviar em partes se ficar grande.")
 
@@ -5493,6 +5520,18 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         return build_meta_supervisor_report()
     if cmd0 in {"/history"}:
         return build_history_report()
+    if cmd0 in {"/riskstats", "/riscoestatisticas", "/estatisticashistory"}:
+        try:
+            import history_manager as super_history_manager
+            return super_history_manager.build_riskstats_report()
+        except Exception as exc:
+            return f"⚠️ Erro ao gerar /riskstats: {exc}"
+    if cmd0 in {"/exporthistory", "/exportarhistory"}:
+        try:
+            import history_manager as super_history_manager
+            return super_history_manager.build_export_report()
+        except Exception as exc:
+            return f"⚠️ Erro ao gerar /exporthistory: {exc}"
     if cmd0 in {"/snapshot"}:
         return build_snapshot_report()
     if cmd0 in {"/simulate"}:
@@ -5629,6 +5668,18 @@ def central_command_router_loop(key: str, cfg: dict):
                 if module is None:
                     telegram_send_with_token(token, chat_id, f"{cfg.get('name', key)} não carregado na Central.")
                     continue
+
+                try:
+                    import history_manager as super_history_manager
+                    super_history_manager.log_event("BOT_COMMAND", {
+                        "bot": key,
+                        "command": text.split()[0] if text else "",
+                        "full_text": text,
+                        "chat_id": chat_id,
+                        "router": "bot_token_router",
+                    }, source="telegram_bot")
+                except Exception as _history_exc:
+                    print(f"ERRO HISTORY command {key}:", _history_exc)
 
                 memory_profile_step(f"telegram_command_before_{key}_{text.split()[0]}")
                 reply = build_command_reply_for_module(key, module, text)
