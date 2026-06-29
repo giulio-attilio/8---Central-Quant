@@ -132,14 +132,25 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             self.assertIn("events", query_payload)
             self.assertGreaterEqual(len(query_payload["events"]), 1)
 
-            simulate_full = client.get("/simulate/full")
-            self.assertEqual(simulate_full.status_code, 200)
-            simulate_payload = simulate_full.get_json()
-            self.assertTrue(simulate_payload["ok"])
-            self.assertEqual(simulate_payload["generated"], 8)
-            self.assertIn("stats_after", simulate_payload)
-            self.assertIn("query_predator", simulate_payload)
-            self.assertIn("riskstats_hint", simulate_payload)
+    def test_simulate_full_is_blocked_by_default(self):
+        with central_main.app.test_client() as client:
+            response = client.get("/simulate/full")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error"], "simulation endpoint disabled")
+
+    def test_simulate_full_runs_when_enabled(self):
+        with mock.patch.dict(central_main.os.environ, {"ENABLE_SIMULATION_ENDPOINT": "true"}, clear=False):
+            with central_main.app.test_client() as client:
+                response = client.get("/simulate/full")
+                self.assertEqual(response.status_code, 200)
+                payload = response.get_json()
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["generated"], 8)
+                self.assertIn("stats_after", payload)
+                self.assertIn("query_predator", payload)
+                self.assertIn("riskstats_hint", payload)
 
     def test_can_open_trade_does_not_block_paper_by_default(self):
         with mock.patch.object(central_main, "GLOBAL_RISK_MAX_POSITIONS", 50), \

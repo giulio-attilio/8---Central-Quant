@@ -4728,6 +4728,9 @@ def simulate_route(key=None):
 
 @app.route("/simulate/full")
 def simulate_full_route():
+    if not env_bool("ENABLE_SIMULATION_ENDPOINT", False):
+        return {"ok": False, "error": "simulation endpoint disabled"}
+
     try:
         import history_manager as super_history_manager
     except Exception as exc:
