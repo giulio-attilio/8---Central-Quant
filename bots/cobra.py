@@ -1,9 +1,9 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em COBRA.
 # COBRA ATTACK BOT
-# Versao: 2026-06-21-COBRA-CENTRAL-QUANT-RESILIENTE-V2
+# Versao: 2026-06-25-COBRA-STRUCTURE-FALCON-PREDATOR-V3
 #
 # Adaptado para Central Quant PRO.
-# Melhorias: watchlist separada, warnings não críticos, startup guard, startup message cooldown.
+# Melhorias: telemetria estilo Falcon/Predator, ranking, estatísticas avançadas, filtro Early contra H4.
 
 from flask import Flask
 import os
@@ -85,6 +85,7 @@ SUPERTREND_FACTOR = 3.0
 EARLY_COBRA_MAX_CANDLES = 3
 COBRA_MAX_CANDLES = 5
 EARLY_COBRA_MIN_SCORE = 70
+EARLY_COBRA_CONTRA_H4_MIN_SCORE = int(os.environ.get("COBRA_EARLY_CONTRA_H4_MIN_SCORE", "75"))
 COBRA_MIN_SCORE = 75
 
 ATR_BUFFER_STOP = 0.20
@@ -347,8 +348,15 @@ FUNIL_PADRAO = {
     "bollinger_sell": 0,
     "early_detectados": 0,
     "cobra_detectados": 0,
+    "early_favoravel": 0,
+    "early_neutro": 0,
+    "early_contra": 0,
+    "cobra_favoravel": 0,
+    "cobra_neutro": 0,
+    "cobra_contra": 0,
     "reprovados_risco": 0,
     "reprovados_score": 0,
+    "reprovados_score_h4_contra": 0,
     "reprovados_spike": 0,
     "reprovados_posicao_ativa": 0,
     "sinais_enviados": 0,
@@ -604,6 +612,30 @@ def h4_contexto_categoria(h4_state, side):
         return "FAVORAVEL"
     return "CONTRA"
 
+
+def contexto_cobra_label(h4_state, side):
+    ctx = h4_contexto_categoria(h4_state, side)
+    if ctx == "FAVORAVEL":
+        return "FAVORÁVEL ✅"
+    if ctx == "NEUTRO":
+        return "NEUTRO ⚪"
+    return "CONTRA H4 ⚠️"
+
+
+def score_minimo_cobra_por_contexto(setup, h4_state, side):
+    ctx = h4_contexto_categoria(h4_state, side)
+    if setup == "EARLY_COBRA" and ctx == "CONTRA":
+        return EARLY_COBRA_CONTRA_H4_MIN_SCORE
+    if setup == "EARLY_COBRA":
+        return EARLY_COBRA_MIN_SCORE
+    return COBRA_MIN_SCORE
+
+
+def registrar_funil_contexto(setup, h4_state, side):
+    ctx = h4_contexto_categoria(h4_state, side).lower()
+    prefixo = "early" if setup == "EARLY_COBRA" else "cobra"
+    registrar_funil(f"{prefixo}_{ctx}")
+
 def macd_cross_up(df, idx):
     return float(df.iloc[idx]["macd"]) > float(df.iloc[idx]["macd_signal"]) and float(df.iloc[idx - 1]["macd"]) <= float(df.iloc[idx - 1]["macd_signal"])
 
@@ -726,14 +758,16 @@ def montar_sinal_cobra(symbol, side, df_h1, df_h4, return_idx, confirm_idx, cand
 
     if candles_after_return <= EARLY_COBRA_MAX_CANDLES:
         setup = "EARLY_COBRA"
-        min_score = EARLY_COBRA_MIN_SCORE
         registrar_funil("early_detectados")
     elif candles_after_return <= COBRA_MAX_CANDLES:
         setup = "COBRA"
-        min_score = COBRA_MIN_SCORE
         registrar_funil("cobra_detectados")
     else:
         return None
+
+    h4_context = h4_contexto_categoria(h4_state, side)
+    registrar_funil_contexto(setup, h4_state, side)
+    min_score = score_minimo_cobra_por_contexto(setup, h4_state, side)
 
     entry = float(candle["close"])
     sl, tp50, risk_abs = calcular_stop_tp_cobra(side, entry, df_h1, return_idx, confirm_idx)
@@ -748,6 +782,8 @@ def montar_sinal_cobra(symbol, side, df_h1, df_h4, return_idx, confirm_idx, cand
     score = calcular_score_cobra(side, h4_state, candle)
     if score < min_score:
         registrar_funil("reprovados_score")
+        if h4_context == "CONTRA":
+            registrar_funil("reprovados_score_h4_contra")
         return None
 
     return {
@@ -766,6 +802,9 @@ def montar_sinal_cobra(symbol, side, df_h1, df_h4, return_idx, confirm_idx, cand
         "risk_pct": risk_pct,
         "h4_state": h4_state,
         "h4_text": h4_txt_para_side(h4_state, side),
+        "h4_context": h4_context,
+        "contexto_cobra": contexto_cobra_label(h4_state, side),
+        "min_score_required": int(min_score),
         "score": score,
         "qualidade": qualidade_cobra(score),
         "candles_after_return": int(candles_after_return),
@@ -807,11 +846,13 @@ def enviar_sinal_cobra(s):
     msg = (
         f"🐍 {setup} {side_txt} - {s['symbol_clean']}\n\n"
         f"H4:\n{s['h4_text']}\n\n"
+        f"Contexto:\n{s.get('contexto_cobra', 'N/A')}\n\n"
         f"Entrada:\n{fmt_br(s['entry'])}\n\n"
         f"SL:\n{fmt_br(s['sl'])}\n\n"
         f"TP50:\n{fmt_br(s['tp50'])}\n\n"
         f"Risco:\n{fmt_pct(s['risk_pct'])}\n\n"
         f"Score Cobra:\n{s['score']}/100\n\n"
+        f"Score mínimo exigido:\n{s.get('min_score_required', 'N/A')}/100\n\n"
         f"Qualidade:\n{s['qualidade']}\n\n"
         f"Informativos:\n\n"
         f"Bollinger:\nSAIU DA {banda_txt} E RETORNOU ✅\n\n"
@@ -886,6 +927,9 @@ def registrar_posicao(s):
         "qualidade": s["qualidade"],
         "h4_state": int(s["h4_state"]),
         "h4_text": s["h4_text"],
+        "h4_context": s.get("h4_context", h4_contexto_categoria(int(s["h4_state"]), s["side"])),
+        "contexto_cobra": s.get("contexto_cobra"),
+        "min_score_required": int(s.get("min_score_required", 0)),
         "candles_after_return": int(s["candles_after_return"]),
         "status": "ACTIVE",
         "tp50_hit": False,
@@ -916,8 +960,10 @@ def registrar_posicao(s):
         "tp50": float(s["tp50"]),
         "risk_pct": float(s["risk_pct"]),
         "score": int(s["score"]),
+        "min_score_required": int(s.get("min_score_required", 0)),
         "h4_state": int(s["h4_state"]),
-        "h4_context": h4_contexto_categoria(int(s["h4_state"]), s["side"]),
+        "h4_context": s.get("h4_context", h4_contexto_categoria(int(s["h4_state"]), s["side"])),
+        "contexto_cobra": s.get("contexto_cobra"),
     })
     return True
 
@@ -1310,8 +1356,11 @@ def montar_resumo(periodo="dia"):
             f"MACD SELL: {funil.get('macd_sell', 0)}",
             f"Early detectados: {funil.get('early_detectados', 0)}",
             f"Cobra detectados: {funil.get('cobra_detectados', 0)}",
+            f"Early favorável/neutro/contra: {funil.get('early_favoravel', 0)}/{funil.get('early_neutro', 0)}/{funil.get('early_contra', 0)}",
+            f"Cobra favorável/neutro/contra: {funil.get('cobra_favoravel', 0)}/{funil.get('cobra_neutro', 0)}/{funil.get('cobra_contra', 0)}",
             f"Reprovados por risco: {funil.get('reprovados_risco', 0)}",
             f"Reprovados por score: {funil.get('reprovados_score', 0)}",
+            f"Reprovados score H4 contra: {funil.get('reprovados_score_h4_contra', 0)}",
             f"Reprovados por spike: {funil.get('reprovados_spike', 0)}",
             f"Reprovados por posição ativa: {funil.get('reprovados_posicao_ativa', 0)}",
             f"Sinais enviados: {funil.get('sinais_enviados', 0)}",
@@ -1376,8 +1425,11 @@ def montar_funil():
         f"MACD SELL: {f.get('macd_sell', 0)}\n"
         f"Early detectados: {f.get('early_detectados', 0)}\n"
         f"Cobra detectados: {f.get('cobra_detectados', 0)}\n"
+        f"Early fav/neu/contra: {f.get('early_favoravel', 0)}/{f.get('early_neutro', 0)}/{f.get('early_contra', 0)}\n"
+        f"Cobra fav/neu/contra: {f.get('cobra_favoravel', 0)}/{f.get('cobra_neutro', 0)}/{f.get('cobra_contra', 0)}\n"
         f"Reprovados por risco: {f.get('reprovados_risco', 0)}\n"
         f"Reprovados por score: {f.get('reprovados_score', 0)}\n"
+        f"Reprovados score H4 contra: {f.get('reprovados_score_h4_contra', 0)}\n"
         f"Reprovados por spike: {f.get('reprovados_spike', 0)}\n"
         f"Reprovados por posição ativa: {f.get('reprovados_posicao_ativa', 0)}\n"
         f"Sinais enviados: {f.get('sinais_enviados', 0)}"
@@ -1431,6 +1483,167 @@ def montar_eventos(qtd=20):
         if extras:
             linhas.append(" | ".join(extras))
         linhas.append("───────────────")
+
+    return "\n".join(linhas)
+
+
+def profit_factor(valores):
+    ganhos = sum(v for v in valores if v > 0)
+    perdas = abs(sum(v for v in valores if v < 0))
+    if perdas <= 0:
+        return ganhos if ganhos > 0 else 0.0
+    return ganhos / perdas
+
+
+def expectancy_r(fechados):
+    if not fechados:
+        return 0.0
+    valores = [float(t.get("pnl_r", t.get("mfe_max_r", 0) if t.get("result_type") == "WIN" else 0)) for t in fechados]
+    # Se os fechamentos antigos não tiverem pnl_r, estima pelo resultado percentual / risco quando possível.
+    estimados = []
+    for t in fechados:
+        if "pnl_r" in t:
+            estimados.append(float(t.get("pnl_r", 0)))
+        else:
+            pnl = float(t.get("pnl", 0))
+            risk = float(t.get("risk_pct", 0) or 0)
+            estimados.append(pnl / risk if risk > 0 else 0.0)
+    return sum(estimados) / len(estimados) if estimados else 0.0
+
+
+def agrupar_trades_por(chave, entradas, fechados):
+    grupos = {}
+    for t in entradas:
+        k = str(t.get(chave, "N/A"))
+        grupos.setdefault(k, {"entradas": 0, "fechados": 0, "wins": 0, "losses": 0, "be": 0, "pnl": 0.0})
+        grupos[k]["entradas"] += 1
+    for t in fechados:
+        k = str(t.get(chave, "N/A"))
+        grupos.setdefault(k, {"entradas": 0, "fechados": 0, "wins": 0, "losses": 0, "be": 0, "pnl": 0.0})
+        grupos[k]["fechados"] += 1
+        grupos[k]["pnl"] += float(t.get("pnl", 0))
+        if t.get("result_type") == "WIN":
+            grupos[k]["wins"] += 1
+        elif t.get("result_type") == "LOSS":
+            grupos[k]["losses"] += 1
+        elif t.get("result_type") == "BREAKEVEN":
+            grupos[k]["be"] += 1
+    return grupos
+
+
+def score_band(score):
+    try:
+        score = int(score)
+    except Exception:
+        score = 0
+    if score >= 85:
+        return "85-100"
+    if score >= 75:
+        return "75-84"
+    if score >= 70:
+        return "70-74"
+    return "<70"
+
+
+def montar_estatisticas_avancadas(periodo="mes"):
+    trades = filtrar_trades_periodo(periodo)
+    entradas = [t for t in trades if t.get("event") == "ENTRY"]
+    fechados = [t for t in trades if t.get("event") == "CLOSE"]
+    tp50s = [t for t in trades if t.get("event") == "TP50"]
+    trailings = [t for t in trades if t.get("event") == "TRAILING"]
+
+    wins = [t for t in fechados if t.get("result_type") == "WIN"]
+    losses = [t for t in fechados if t.get("result_type") == "LOSS"]
+    bes = [t for t in fechados if t.get("result_type") == "BREAKEVEN"]
+    pnl_vals = [float(t.get("pnl", 0)) for t in fechados]
+    mfe_vals = [float(t.get("mfe_max_pct", 0)) for t in fechados]
+    mae_vals = [float(t.get("mae_max_pct", 0)) for t in fechados]
+    giveback_vals = [float(t.get("mfe_gave_back_pct", 0)) for t in fechados]
+    win_rate = len(wins) / len(fechados) * 100 if fechados else 0
+
+    periodo_txt = "MÊS" if periodo == "mes" else "DIA" if periodo == "dia" else "HISTÓRICO"
+    linhas = [
+        f"📊 ESTATÍSTICAS COBRA - {periodo_txt}",
+        agora_sp().strftime("%d/%m/%Y %H:%M"),
+        "",
+        f"Sinais: {len(entradas)}",
+        f"Fechados: {len(fechados)}",
+        f"Wins: {len(wins)} | Loss: {len(losses)} | BE: {len(bes)}",
+        f"Win rate: {win_rate:.2f}%".replace(".", ","),
+        f"Profit Factor %: {profit_factor(pnl_vals):.2f}".replace(".", ","),
+        f"Expectancy estimada R: {expectancy_r(fechados):.2f}R".replace(".", ","),
+        f"PnL: {fmt_pct(sum(pnl_vals))}",
+        "",
+        f"TP50: {len(tp50s)}",
+        f"Trailing: {len(trailings)}",
+        f"MFE médio: {fmt_pct(sum(mfe_vals)/len(mfe_vals) if mfe_vals else 0)}",
+        f"MAE médio: {fmt_pct(sum(mae_vals)/len(mae_vals) if mae_vals else 0)}",
+        f"Devolução média: {fmt_pct(sum(giveback_vals)/len(giveback_vals) if giveback_vals else 0)}",
+        "",
+        "Por setup:",
+    ]
+
+    for setup in ["EARLY_COBRA", "COBRA"]:
+        ent = [t for t in entradas if t.get("signal_type") == setup]
+        fec = [t for t in fechados if t.get("signal_type") == setup]
+        w = len([t for t in fec if t.get("result_type") == "WIN"])
+        wr = w / len(fec) * 100 if fec else 0
+        pnl = sum(float(t.get("pnl", 0)) for t in fec)
+        linhas.append(f"{setup_nome(setup)}: sinais {len(ent)} | fechados {len(fec)} | WR {wr:.2f}% | PnL {fmt_pct(pnl)}".replace(".", ","))
+
+    linhas.extend(["", "Por direção:"])
+    for side in ["LONG", "SHORT"]:
+        ent = [t for t in entradas if t.get("side") == side]
+        fec = [t for t in fechados if t.get("side") == side]
+        w = len([t for t in fec if t.get("result_type") == "WIN"])
+        wr = w / len(fec) * 100 if fec else 0
+        pnl = sum(float(t.get("pnl", 0)) for t in fec)
+        linhas.append(f"{side_nome(side)}: sinais {len(ent)} | fechados {len(fec)} | WR {wr:.2f}% | PnL {fmt_pct(pnl)}".replace(".", ","))
+
+    linhas.extend(["", "Por H4:"])
+    for ctx in ["FAVORAVEL", "NEUTRO", "CONTRA"]:
+        ent = [t for t in entradas if t.get("h4_context") == ctx]
+        fec = [t for t in fechados if t.get("h4_context") == ctx]
+        w = len([t for t in fec if t.get("result_type") == "WIN"])
+        wr = w / len(fec) * 100 if fec else 0
+        pnl = sum(float(t.get("pnl", 0)) for t in fec)
+        linhas.append(f"{ctx}: sinais {len(ent)} | fechados {len(fec)} | WR {wr:.2f}% | PnL {fmt_pct(pnl)}".replace(".", ","))
+
+    linhas.extend(["", "Por faixa de score:"])
+    for band in ["70-74", "75-84", "85-100", "<70"]:
+        ent = [t for t in entradas if score_band(t.get("score")) == band]
+        fec = [t for t in fechados if score_band(t.get("score")) == band]
+        w = len([t for t in fec if t.get("result_type") == "WIN"])
+        wr = w / len(fec) * 100 if fec else 0
+        pnl = sum(float(t.get("pnl", 0)) for t in fec)
+        if ent or fec:
+            linhas.append(f"Score {band}: sinais {len(ent)} | fechados {len(fec)} | WR {wr:.2f}% | PnL {fmt_pct(pnl)}".replace(".", ","))
+
+    return "\n".join(linhas)
+
+
+def montar_ranking_cobra(periodo="mes"):
+    trades = filtrar_trades_periodo(periodo)
+    fechados = [t for t in trades if t.get("event") == "CLOSE"]
+    if not fechados:
+        return "🏆 RANKING COBRA\n\nNenhum trade fechado no período."
+
+    melhores = sorted(fechados, key=lambda x: float(x.get("pnl", 0)), reverse=True)[:5]
+    piores = sorted(fechados, key=lambda x: float(x.get("pnl", 0)))[:5]
+    mfes = sorted(fechados, key=lambda x: float(x.get("mfe_max_pct", 0)), reverse=True)[:5]
+
+    linhas = ["🏆 RANKING COBRA", agora_sp().strftime("%d/%m/%Y %H:%M"), ""]
+    linhas.append("Melhores trades:")
+    for t in melhores:
+        linhas.append(f"{t.get('symbol_clean', nome_limpo(str(t.get('symbol', ''))))} | {setup_nome(t.get('signal_type'))} | {fmt_pct(t.get('pnl', 0))}")
+
+    linhas.extend(["", "Piores trades:"])
+    for t in piores:
+        linhas.append(f"{t.get('symbol_clean', nome_limpo(str(t.get('symbol', ''))))} | {setup_nome(t.get('signal_type'))} | {fmt_pct(t.get('pnl', 0))}")
+
+    linhas.extend(["", "Maiores MFE:"])
+    for t in mfes:
+        linhas.append(f"{t.get('symbol_clean', nome_limpo(str(t.get('symbol', ''))))} | {setup_nome(t.get('signal_type'))} | MFE {fmt_pct(t.get('mfe_max_pct', 0))} | PnL {fmt_pct(t.get('pnl', 0))}")
 
     return "\n".join(linhas)
 
@@ -1492,6 +1705,7 @@ def montar_health_tecnico():
         "early_cobra_window": EARLY_COBRA_MAX_CANDLES,
         "cobra_window": COBRA_MAX_CANDLES,
         "early_min_score": EARLY_COBRA_MIN_SCORE,
+        "early_contra_h4_min_score": EARLY_COBRA_CONTRA_H4_MIN_SCORE,
         "cobra_min_score": COBRA_MIN_SCORE,
         "tp50_r": TP50_R,
         "be_trigger_r": BE_TRIGGER_R,
@@ -1517,7 +1731,10 @@ def processar_comando(texto):
             "/resumo - envia resumo do dia\n"
             "/mensal - envia resumo do mês\n"
             "/mes - envia resumo do mês\n"
-            "/estatisticas - histórico geral\n"
+            "/estatisticas - painel avançado estilo Falcon/Predator\n"
+            "/ranking - ranking de melhores/piores trades\n"
+            "/funil - funil do dia\n"
+            "/eventos - últimos eventos\n"
             "/watchlist - mostra ativos monitorados\n"
             "/comandos - mostra esta lista"
         )
@@ -1553,7 +1770,10 @@ def processar_comando(texto):
         return montar_resumo("mes")
 
     if cmd == "/estatisticas":
-        return montar_resumo("all")
+        return montar_estatisticas_avancadas("mes")
+
+    if cmd == "/ranking":
+        return montar_ranking_cobra("mes")
 
     if cmd == "/funil":
         return montar_funil()
