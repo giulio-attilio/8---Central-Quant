@@ -5769,6 +5769,36 @@ def start_central_runtime_once():
     start_central_command_routers()
 
 
+# ==========================================================
+# PATCH FINAL - SUPER HISTORY CENTRAL QUANT
+# Cole este bloco no FINAL do main.py, imediatamente ANTES desta linha:
+# start_central_runtime_once()
+# ==========================================================
+
+try:
+    import history_manager as super_history_manager
+
+    super_history_manager.wrap_central_functions(globals())
+
+    @app.route("/riskstats")
+    @app.route("/riscoestatisticas")
+    def super_riskstats_route():
+        return {"text": super_history_manager.build_riskstats_report(), "payload": super_history_manager.build_riskstats_payload()}
+
+    @app.route("/exporthistory")
+    @app.route("/exportarhistory")
+    def super_exporthistory_route():
+        return super_history_manager.build_export_payload()
+
+    @app.route("/history/raw")
+    def super_history_raw_route():
+        return super_history_manager.build_history_payload()
+
+    print("SUPER HISTORY MANAGER carregado com sucesso")
+
+except Exception as exc:
+    print("ERRO AO CARREGAR SUPER HISTORY MANAGER:", exc)
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
