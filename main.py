@@ -51,6 +51,14 @@ except Exception as _broker_import_exc:
 else:
     BROKER_IMPORT_ERROR = None
 
+try:
+    import event_bus as central_event_bus
+except Exception as _event_bus_import_exc:
+    central_event_bus = None
+    EVENT_BUS_IMPORT_ERROR = str(_event_bus_import_exc)
+else:
+    EVENT_BUS_IMPORT_ERROR = None
+
 BOT_NAME = os.environ.get("BOT_NAME", "Central Quant PRO FULL")
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 BASE_DIR = Path(__file__).resolve().parent
@@ -828,6 +836,39 @@ def central_watchdog_loop():
 @app.route("/")
 def home():
     return f"{BOT_NAME} Online"
+
+
+@app.route("/eventbus/status")
+def eventbus_status():
+    """Status simples do Event Bus da Super Central Quant."""
+    payload = {
+        "ok": central_event_bus is not None,
+        "module": "event_bus",
+        "loaded": central_event_bus is not None,
+        "import_error": EVENT_BUS_IMPORT_ERROR,
+        "history_manager_loaded": False,
+        "history_manager_error": None,
+    }
+    if central_event_bus is not None:
+        payload.update({
+            "history_manager_loaded": getattr(central_event_bus, "history_manager", None) is not None,
+            "history_manager_error": getattr(central_event_bus, "HISTORY_MANAGER_ERROR", None),
+            "event_bus_log_file": str(getattr(central_event_bus, "EVENT_BUS_LOG_FILE", "")),
+            "event_bus_seen_file": str(getattr(central_event_bus, "EVENT_BUS_SEEN_FILE", "")),
+            "version": "2026-06-28-EVENT-BUS-V1",
+        })
+    return payload
+
+
+@app.route("/eventbus/emit", methods=["POST"])
+def eventbus_emit_route():
+    """Entrada HTTP interna para emitir eventos padronizados no Super History."""
+    if central_event_bus is None:
+        return {"ok": False, "error": EVENT_BUS_IMPORT_ERROR or "event_bus import failed"}, 500
+    payload = request.get_json(silent=True) or {}
+    result = central_event_bus.emit_from_http(payload)
+    status = 200 if result.get("ok") else 500
+    return result, status
 
 
 @app.route("/health")
