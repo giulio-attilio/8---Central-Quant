@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 
 import event_bus
 import history_manager
+import main as central_main
 
 
 class HistoryEventBusSmokeTest(unittest.TestCase):
@@ -80,6 +81,14 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         grouped = history_manager.group_stats(group_by="bot")
         self.assertIn("FALCON", grouped)
         self.assertIn("MEME", grouped)
+
+    def test_main_history_stats_payload(self):
+        payload = central_main.build_history_stats_payload()
+        self.assertTrue(payload["ok"])
+        self.assertIn("general", payload)
+        self.assertIn("by_bot", payload)
+        self.assertIn("by_symbol", payload)
+        self.assertIn("by_setup", payload)
 
 
 if __name__ == "__main__":

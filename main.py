@@ -4547,9 +4547,42 @@ def meta_route():
     return {"text": build_meta_supervisor_report()}
 
 
+def build_history_stats_payload():
+    """Retorna estatísticas agregadas do history manager sem quebrar a rota antiga /history."""
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    try:
+        return {
+            "ok": True,
+            "generated_at": super_history_manager.data_hora_sp_str(),
+            "general": super_history_manager.calculate_stats(),
+            "by_bot": super_history_manager.group_stats(group_by="bot"),
+            "by_symbol": super_history_manager.group_stats(group_by="symbol"),
+            "by_setup": super_history_manager.group_stats(group_by="setup"),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @app.route("/history")
 def history_route():
-    return {"text": __import__("history_manager").build_history_report()}
+    super_history_manager = __import__("history_manager")
+    result = {"text": super_history_manager.build_history_report()}
+    stats_payload = build_history_stats_payload()
+    if stats_payload.get("ok"):
+        result["payload"] = stats_payload
+        result["stats"] = stats_payload
+    else:
+        result["stats_error"] = stats_payload.get("error")
+    return result
+
+
+@app.route("/history/stats")
+def history_stats_route():
+    return build_history_stats_payload()
 
 
 @app.route("/snapshot")
