@@ -1,7 +1,7 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em FALCON.
 # ==============================================================================
 # FALCON STRIKE - ORB PRO - CENTRAL QUANT
-# Versao: 2026-06-24-FALCON-STRIKE-ORB-V1
+# Versao: 2026-06-28-FALCON-STRIKE-ORB-V1-SUPER-HISTORY
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -49,6 +49,14 @@ except Exception as _broker_import_exc:
     BROKER_IMPORT_ERROR = str(_broker_import_exc)
 else:
     BROKER_IMPORT_ERROR = None
+
+try:
+    import history_manager as super_history
+except Exception as _history_import_exc:
+    super_history = None
+    HISTORY_IMPORT_ERROR = str(_history_import_exc)
+else:
+    HISTORY_IMPORT_ERROR = None
 
 app = Flask(__name__)
 
@@ -555,6 +563,84 @@ def save_last_candles_by_symbol(data):
     return redis_set_json(LAST_CANDLES_KEY, data)
 
 
+def falcon_history_result_from_pct(value):
+    try:
+        v = float(value)
+    except Exception:
+        return ""
+    if v > 0.05:
+        return "WIN"
+    if v < -0.05:
+        return "LOSS"
+    return "BE"
+
+
+def falcon_history_payload(pos, event=None, extra=None):
+    pos = pos if isinstance(pos, dict) else {}
+    event = event if isinstance(event, dict) else {}
+    extra = extra if isinstance(extra, dict) else {}
+
+    execution_decision = pos.get("execution_decision") or extra.get("execution_decision") or {}
+    reasons = execution_decision.get("reasons") if isinstance(execution_decision, dict) else None
+    warnings = execution_decision.get("warnings") if isinstance(execution_decision, dict) else None
+
+    payload = {
+        "bot": "FALCON",
+        "bot_name": BOT_NAME,
+        "symbol": pos.get("symbol") or event.get("symbol"),
+        "setup": pos.get("setup") or event.get("setup"),
+        "setup_label": pos.get("setup_label"),
+        "side": pos.get("side") or event.get("side"),
+        "direction": pos.get("direction"),
+        "trade_id": pos.get("id") or pos.get("trade_id"),
+        "entry": pos.get("entry"),
+        "stop": pos.get("stop"),
+        "initial_stop": pos.get("initial_stop"),
+        "tp50": pos.get("tp50"),
+        "risk_pct": pos.get("risk_pct"),
+        "score": pos.get("score_falcon"),
+        "quality": pos.get("quality"),
+        "timeframe": pos.get("timeframe") or TIMEFRAME,
+        "mode": FALCON_MODE,
+        "event_created_at": event.get("created_at") or data_hora_sp_str(),
+        "mfe_pct": pos.get("mfe_pct") or event.get("mfe_pct"),
+        "mae_pct": pos.get("mae_pct") or event.get("mae_pct"),
+        "mfe_r": pos.get("mfe_r") or event.get("mfe_r"),
+        "mae_r": pos.get("mae_r") or event.get("mae_r"),
+        "execution_decision": execution_decision,
+        "reasons": reasons or extra.get("reasons") or [],
+        "warnings": warnings or extra.get("warnings") or [],
+        "falcon_event": event,
+    }
+
+    for k, v in extra.items():
+        if k not in payload:
+            payload[k] = v
+
+    if extra.get("result_pct") is not None:
+        payload["result_pct"] = extra.get("result_pct")
+        payload["pnl_pct"] = extra.get("result_pct")
+    if extra.get("result_r") is not None:
+        payload["result_r"] = extra.get("result_r")
+        payload["pnl_r"] = extra.get("result_r")
+    if extra.get("exit_price") is not None:
+        payload["exit_price"] = extra.get("exit_price")
+
+    return payload
+
+
+def falcon_log_super_history(global_event_type, pos, event=None, extra=None):
+    if super_history is None:
+        return None
+    try:
+        payload = falcon_history_payload(pos, event=event, extra=extra)
+        trade_id = payload.get("trade_id")
+        return super_history.log_event(global_event_type, payload, source="falcon", trade_id=trade_id)
+    except Exception as exc:
+        HEALTH["last_warning"] = f"super history falcon: {exc}"
+        return None
+
+
 def record_event(event_type, pos, extra=None):
     event = {
         "event_type": event_type,
@@ -570,6 +656,29 @@ def record_event(event_type, pos, extra=None):
     if extra:
         event.update(extra)
     redis_list_append(EVENTS_KEY, event)
+
+    et = str(event_type or "").upper()
+    if et == "SIGNAL":
+        falcon_log_super_history("SIGNAL_CREATED", pos, event=event, extra=extra)
+        falcon_log_super_history("TRADE_OPENED", pos, event=event, extra=extra)
+    elif et == "TRADE_BLOCKED":
+        payload_extra = dict(extra or {})
+        payload_extra.setdefault("result", "DENY")
+        falcon_log_super_history("TRADE_BLOCKED", pos, event=event, extra=payload_extra)
+    elif et == "TP50":
+        falcon_log_super_history("TP50_HIT", pos, event=event, extra=extra)
+    elif et == "BE":
+        falcon_log_super_history("BREAKEVEN", pos, event=event, extra=extra)
+    elif et == "TRAILING":
+        falcon_log_super_history("TRAILING_UPDATED", pos, event=event, extra=extra)
+    elif et in {"STOP", "CLOSE", "CLOSED", "TRADE_CLOSED"}:
+        payload_extra = dict(extra or {})
+        payload_extra.setdefault("result", falcon_history_result_from_pct(payload_extra.get("result_pct")))
+        payload_extra.setdefault("exit_reason", event_type)
+        falcon_log_super_history("TRADE_CLOSED", pos, event=event, extra=payload_extra)
+    else:
+        falcon_log_super_history(f"FALCON_{et or 'EVENT'}", pos, event=event, extra=extra)
+
     return event
 
 # ==============================================================================
@@ -1163,6 +1272,16 @@ def scanner_loop():
                     if not execution_allowed:
                         funnel_inc("reprovados_risco")
                         HEALTH["last_warning"] = "execução bloqueada: " + "; ".join([str(x) for x in execution_decision.get("reasons", [])[:3]])
+                        record_event(
+                            "TRADE_BLOCKED",
+                            sig,
+                            {
+                                "execution_decision": execution_decision,
+                                "reasons": execution_decision.get("reasons", []),
+                                "warnings": execution_decision.get("warnings", []),
+                                "result": "DENY",
+                            },
+                        )
                         continue
 
                     pid = sig["id"]
