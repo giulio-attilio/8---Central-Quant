@@ -626,6 +626,8 @@ def load_events(limit=None, filters=None):
     bot = str(filters.get("bot") or "").strip().upper()
     symbol = str(filters.get("symbol") or "").strip().upper()
     setup = str(filters.get("setup") or "").strip().upper()
+    side = str(filters.get("side") or "").strip().upper()
+    result = str(filters.get("result") or "").strip().upper()
     event_type = str(filters.get("event_type") or "").strip().upper()
     date_from = filters.get("date_from")
     date_to = filters.get("date_to")
@@ -658,6 +660,10 @@ def load_events(limit=None, filters=None):
         if symbol and str(event.get("symbol") or "").upper() != symbol:
             continue
         if setup and str(event.get("setup") or "").upper() != setup:
+            continue
+        if side and str(event.get("side") or "").upper() != side:
+            continue
+        if result and str(event.get("result") or "").upper() != result:
             continue
         if event_type and str(event.get("event") or "").upper() != event_type:
             continue
@@ -730,6 +736,44 @@ def calculate_stats(events=None, filters=None, rows=None):
         totals["pnl_avg_pct"] = 0.0
     totals["pnl_total_pct"] = round(totals["pnl_total_pct"], 4)
     return totals
+
+
+def query_history(bot=None, symbol=None, setup=None, side=None, result=None, days=None, limit=None):
+    filters = {}
+    if bot:
+        filters["bot"] = bot
+    if symbol:
+        filters["symbol"] = symbol
+    if setup:
+        filters["setup"] = setup
+    if side:
+        filters["side"] = side
+    if result:
+        filters["result"] = result
+
+    if days:
+        try:
+            days_value = int(days)
+        except Exception:
+            days_value = None
+        if days_value is not None and days_value > 0:
+            cutoff = (agora_sp() - timedelta(days=days_value)).strftime("%d/%m/%Y %H:%M")
+            filters["date_from"] = cutoff
+
+    events = load_events(limit=limit or HISTORY_MAX_READ, filters=filters)
+    return {
+        "filters": {
+            "bot": bot or None,
+            "symbol": symbol or None,
+            "setup": setup or None,
+            "side": side or None,
+            "result": result or None,
+            "days": int(days) if str(days or "").strip().isdigit() else None,
+            "limit": int(limit) if str(limit or "").strip().isdigit() else None,
+        },
+        "stats": calculate_stats(rows=events),
+        "events": events,
+    }
 
 
 def group_stats(group_by="bot", events=None, filters=None):

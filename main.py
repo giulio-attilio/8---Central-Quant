@@ -4671,6 +4671,35 @@ def history_events_latest_route():
     return {"ok": True, "count": len(events), "event": events[-1] if events else None}
 
 
+@app.route("/history/query")
+def history_query_route():
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    bot = request.args.get("bot", default="", type=str)
+    symbol = request.args.get("symbol", default="", type=str)
+    setup = request.args.get("setup", default="", type=str)
+    side = request.args.get("side", default="", type=str)
+    result = request.args.get("result", default="", type=str)
+    days = request.args.get("days", default="", type=str)
+    limit = request.args.get("limit", default="50", type=str)
+
+    return {
+        "ok": True,
+        **super_history_manager.query_history(
+            bot=bot or None,
+            symbol=symbol or None,
+            setup=setup or None,
+            side=side or None,
+            result=result or None,
+            days=days or None,
+            limit=limit or None,
+        ),
+    }
+
+
 @app.route("/snapshot")
 def snapshot_route():
     return {"text": build_snapshot_report()}

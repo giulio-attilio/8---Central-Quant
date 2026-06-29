@@ -123,6 +123,15 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             latest_payload = latest.get_json()
             self.assertTrue(latest_payload["ok"])
 
+            query = client.get("/history/query?bot=falcon&symbol=BTCUSDT&limit=5")
+            self.assertEqual(query.status_code, 200)
+            query_payload = query.get_json()
+            self.assertTrue(query_payload["ok"])
+            self.assertIn("filters", query_payload)
+            self.assertIn("stats", query_payload)
+            self.assertIn("events", query_payload)
+            self.assertGreaterEqual(len(query_payload["events"]), 1)
+
     def test_blocked_and_nested_payloads_are_normalized(self):
         history_manager.log_event(
             "TRADE_BLOCKED",
