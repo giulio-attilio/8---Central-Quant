@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-5-RISK-SNAPSHOT
+# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-6-SINGLE-TELEGRAM-LEADER
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -36,6 +36,10 @@ import threading
 import requests
 import importlib.util
 import ctypes
+try:
+    import fcntl
+except Exception:
+    fcntl = None
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -500,6 +504,55 @@ CENTRAL_HEALTH = {
 CENTRAL_RUNTIME_STARTED = False
 CENTRAL_RUNTIME_LOCK = threading.Lock()
 
+# Locks de processo para evitar duplicidade quando o Render/Gunicorn inicia
+# mais de um worker/processo. A trava em memória evita duplicidade só dentro
+# do mesmo processo; esta trava em arquivo vale para o container inteiro.
+CENTRAL_PROCESS_LOCK_HANDLES = {}
+
+
+def acquire_runtime_file_lock(lock_name: str):
+    """
+    Retorna True se este processo virou o líder daquele trabalho.
+    Retorna False se outro processo já estiver executando o mesmo polling/loop.
+
+    Importante: mantemos o file handle aberto em CENTRAL_PROCESS_LOCK_HANDLES.
+    Se fechar, o lock é liberado pelo sistema operacional.
+    """
+    try:
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(lock_name or "runtime"))
+        lock_path = CENTRAL_DATA_DIR / f"{safe_name}.lock"
+        lock_path.parent.mkdir(exist_ok=True)
+        fh = open(lock_path, "w", encoding="utf-8")
+
+        if fcntl is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"LOCK ATIVO - {safe_name}: outro processo já é líder")
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                return False
+
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps({
+            "lock": safe_name,
+            "pid": os.getpid(),
+            "ts": data_hora_sp_str(),
+            "base_dir": str(BASE_DIR),
+            "data_dir": str(CENTRAL_DATA_DIR),
+        }, ensure_ascii=False))
+        fh.flush()
+        CENTRAL_PROCESS_LOCK_HANDLES[safe_name] = fh
+        print(f"LOCK OK - {safe_name}: pid={os.getpid()}")
+        return True
+    except Exception as exc:
+        # Fallback conservador: se não conseguir travar, deixa rodar para não derrubar a Central.
+        print(f"ERRO LOCK {lock_name}: {exc}")
+        return True
+
 
 def _set_env_temporarily(mapping):
     old = {}
@@ -897,6 +950,52 @@ def history_hooks_status_route():
         "build_history_report_source": str(globals().get("build_history_report")),
     }
 
+
+
+@app.route("/data/status")
+def data_status_route():
+    """Diagnóstico dos caminhos usados por Main, Event Bus e History."""
+    payload = {
+        "ok": True,
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "base_dir": str(BASE_DIR),
+        "central_data_dir": str(CENTRAL_DATA_DIR),
+        "main_files": {
+            "decision_log": str(CENTRAL_DECISION_LOG_FILE),
+            "timeline": str(CENTRAL_TIMELINE_LOG_FILE),
+            "shadow_positions": str(CENTRAL_SHADOW_POSITIONS_FILE),
+            "execution_stats": str(CENTRAL_EXECUTION_STATS_FILE),
+        },
+        "locks": {
+            "held_by_this_process": list(CENTRAL_PROCESS_LOCK_HANDLES.keys()),
+            "lock_files": [str(p) for p in CENTRAL_DATA_DIR.glob("*.lock")],
+        },
+        "event_bus": None,
+        "history_manager": None,
+    }
+    try:
+        if central_event_bus is not None:
+            payload["event_bus"] = {
+                "data_dir": str(getattr(central_event_bus, "DATA_DIR", "")),
+                "event_bus_log_file": str(getattr(central_event_bus, "EVENT_BUS_LOG_FILE", "")),
+                "event_bus_seen_file": str(getattr(central_event_bus, "EVENT_BUS_SEEN_FILE", "")),
+                "history_manager_loaded": getattr(central_event_bus, "history_manager", None) is not None,
+            }
+    except Exception as exc:
+        payload["event_bus"] = {"error": str(exc)}
+    try:
+        import history_manager as super_history_manager
+        payload["history_manager"] = {
+            "data_dir": str(getattr(super_history_manager, "DATA_DIR", "")),
+            "history_events": str(getattr(super_history_manager, "HISTORY_EVENTS_FILE", "")),
+            "decision_log": str(getattr(super_history_manager, "DECISION_LOG_FILE", "")),
+            "timeline": str(getattr(super_history_manager, "TIMELINE_LOG_FILE", "")),
+            "export": str(getattr(super_history_manager, "HISTORY_EXPORT_FILE", "")),
+        }
+    except Exception as exc:
+        payload["history_manager"] = {"error": str(exc)}
+    return payload
 
 
 @app.route("/health")
@@ -5803,6 +5902,9 @@ def start_central_command_routers():
             continue
         if not central_route_enabled_for_bot(key):
             continue
+        if not acquire_runtime_file_lock(f"bot_telegram_{key.lower()}"):
+            print(f"ROTEADOR TELEGRAM {key} NÃO INICIADO: outro processo já é líder")
+            continue
         threading.Thread(target=central_command_router_loop, args=(key, cfg), daemon=True).start()
 
 
@@ -5913,8 +6015,17 @@ def start_central_runtime_once():
 
     threading.Thread(target=central_watchdog_loop, daemon=True).start()
     threading.Thread(target=memory_monitor_loop, daemon=True).start()
-    threading.Thread(target=central_telegram_command_loop, daemon=True).start()
-    threading.Thread(target=central_daily_report_loop, daemon=True).start()
+
+    if acquire_runtime_file_lock("central_telegram_polling"):
+        threading.Thread(target=central_telegram_command_loop, daemon=True).start()
+    else:
+        print("ROTEADOR TELEGRAM CENTRAL NÃO INICIADO: outro processo já é líder")
+
+    if acquire_runtime_file_lock("central_daily_report"):
+        threading.Thread(target=central_daily_report_loop, daemon=True).start()
+    else:
+        print("RELATÓRIO DIÁRIO CENTRAL NÃO INICIADO: outro processo já é líder")
+
     start_central_command_routers()
 
 
