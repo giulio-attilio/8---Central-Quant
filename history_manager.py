@@ -244,7 +244,18 @@ def sanitize_bot(value, payload=None):
     lowered = candidate.lower()
     if lowered in {"none", "null", "nan", "n/a", "na"}:
         return ""
-    if "falcon strike" in lowered or "falconstrike" in lowered:
+    normalized = lowered.replace("_", " ").replace("-", " ").replace(".", " ")
+    if "smart predator" in normalized or "smartpredator" in normalized or "predator" in normalized and "smart" in normalized:
+        return "PREDATOR"
+    if "turtle breakout pro" in normalized or "turtle" in normalized and "breakout" in normalized:
+        return "TURTLE"
+    if "falcon strike" in normalized or "falcon" in normalized and "strike" in normalized:
+        return "FALCON"
+    if normalized.startswith("predator"):
+        return "PREDATOR"
+    if normalized.startswith("turtle"):
+        return "TURTLE"
+    if normalized.startswith("falcon"):
         return "FALCON"
     return candidate.upper()
 
@@ -292,6 +303,10 @@ def _extract_field(payload, field_names, default=None):
                 mapped = _lookup_from_mapping(parsed)
                 if mapped is not default:
                     return mapped
+            if isinstance(candidate, dict):
+                nested = _search(candidate)
+                if nested is not default and nested != "":
+                    return nested
 
         for child_name in ("raw", "falcon_event", "execution_decision"):
             child = node.get(child_name)
@@ -727,7 +742,8 @@ def group_stats(group_by="bot", events=None, filters=None):
     for event in rows:
         key = None
         if group_by == "bot":
-            key = sanitize_bot(event.get("bot"), event) or str(event.get("bot") or "N/A").upper()
+            key = sanitize_bot(_extract_field(event, ["bot", "bot_name", "strategy", "source"], default=""), event)
+            key = key or sanitize_bot(event.get("bot"), event)
             key = key or "N/A"
         elif group_by == "symbol":
             symbol = _extract_symbol(event)
@@ -756,9 +772,9 @@ def build_history_payload(limit=None):
     for e in events:
         event = e.get("event") or "EVENT"
         by_event[event] += 1
-        bot_key = sanitize_bot(e.get("bot"), e) or str(e.get("bot") or "N/A").upper()
-        symbol_key = _extract_symbol(e) or str(e.get("symbol") or "N/A").upper()
-        setup_key = _extract_setup(e) or str(e.get("setup") or "N/A").upper()
+        bot_key = sanitize_bot(_extract_field(e, ["bot", "bot_name", "strategy", "source"], default=""), e) or sanitize_bot(e.get("bot"), e) or "N/A"
+        symbol_key = _extract_symbol(e) or str(e.get("symbol") or "N/A").upper() or "N/A"
+        setup_key = _extract_setup(e) or str(e.get("setup") or "N/A").upper() or "N/A"
         if bot_key:
             by_bot[bot_key] += 1
         if symbol_key:

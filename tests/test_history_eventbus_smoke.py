@@ -160,6 +160,15 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             source="predator",
             trade_id="T-PREDATOR",
         )
+        history_manager.log_event(
+            "RISK_DECISION",
+            {
+                "result": "DENY",
+                "raw": {"state": "{'BOT': 'Turtle Breakout PRO 2.0', 'SYMBOL': 'SOLUSDT', 'SIDE': 'SHORT', 'SETUP': 'BREAKOUT'}"},
+            },
+            source="turtle",
+            trade_id="T-TURTLE",
+        )
 
         blocked_events = history_manager.load_events(filters={"event_type": "TRADE_BLOCKED"})
         self.assertGreaterEqual(len(blocked_events), 1)
@@ -178,14 +187,29 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.assertEqual(predator_payload["side"], "LONG")
         self.assertEqual(predator_payload["setup"], "SMART_PREDATOR")
 
+        turtle_payload = history_manager.normalize_payload(
+            "RISK_DECISION",
+            {"result": "DENY", "raw": {"state": "{'BOT': 'Turtle Breakout PRO 2.0', 'SYMBOL': 'SOLUSDT', 'SIDE': 'SHORT', 'SETUP': 'BREAKOUT'}"}},
+            source="turtle",
+            trade_id="T-TURTLE",
+        )
+        self.assertEqual(turtle_payload["bot"], "TURTLE")
+        self.assertEqual(turtle_payload["symbol"], "SOLUSDT")
+        self.assertEqual(turtle_payload["side"], "SHORT")
+        self.assertEqual(turtle_payload["setup"], "BREAKOUT")
+
         stats = history_manager.calculate_stats()
-        self.assertGreaterEqual(stats["blocked"], 2)
-        self.assertGreaterEqual(stats["denied"], 2)
+        self.assertGreaterEqual(stats["blocked"], 4)
+        self.assertGreaterEqual(stats["denied"], 4)
 
         grouped = history_manager.group_stats(group_by="bot")
         self.assertIn("FALCON", grouped)
+        self.assertIn("PREDATOR", grouped)
+        self.assertIn("TURTLE", grouped)
         self.assertGreaterEqual(grouped["FALCON"]["blocked"], 1)
         self.assertGreaterEqual(grouped["FALCON"]["denied"], 1)
+        self.assertGreaterEqual(grouped["PREDATOR"]["blocked"], 1)
+        self.assertGreaterEqual(grouped["TURTLE"]["blocked"], 1)
 
 
 if __name__ == "__main__":
