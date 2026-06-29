@@ -77,6 +77,8 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.assertGreaterEqual(stats["signals"], 1)
         self.assertGreaterEqual(stats["entries"], 1)
         self.assertGreaterEqual(stats["closed"], 2)
+        self.assertGreaterEqual(stats["blocked"], 0)
+        self.assertGreaterEqual(stats["denied"], 0)
         self.assertGreaterEqual(stats["wins"], 1)
         self.assertGreaterEqual(stats["losses"], 1)
         self.assertGreaterEqual(stats["stops"], 1)
@@ -120,6 +122,34 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             self.assertEqual(latest.status_code, 200)
             latest_payload = latest.get_json()
             self.assertTrue(latest_payload["ok"])
+
+    def test_blocked_and_nested_payloads_are_normalized(self):
+        history_manager.log_event(
+            "TRADE_BLOCKED",
+            {
+                "symbol": "ETHUSDT",
+                "setup": "trend",
+                "side": "sell",
+                "result": "DENY",
+                "raw": {"falcon_event": {"symbol": "ETHUSDT", "setup": "trend", "side": "sell"}},
+            },
+            source="falcon",
+            trade_id="T-BLOCKED",
+        )
+        history_manager.log_event(
+            "RISK_DECISION",
+            {
+                "decision": "DENY",
+                "raw": {"execution_decision": {"symbol": "BTCUSDT", "setup": "breakout", "side": "buy"}},
+            },
+            source="central",
+            trade_id="T-RISK",
+        )
+        blocked_events = history_manager.load_events(filters={"event_type": "TRADE_BLOCKED"})
+        self.assertGreaterEqual(len(blocked_events), 1)
+        stats = history_manager.calculate_stats()
+        self.assertGreaterEqual(stats["blocked"], 1)
+        self.assertGreaterEqual(stats["denied"], 1)
 
 
 if __name__ == "__main__":

@@ -171,6 +171,88 @@ def _first(payload, keys, default=None):
     return default
 
 
+def _safe_dict(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return {}
+        if value.startswith("{") and value.endswith("}"):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _extract_field(payload, field_names, default=None):
+    if not isinstance(payload, dict):
+        return default
+    for name in field_names:
+        value = payload.get(name)
+        if value is not None and value != "":
+            if isinstance(value, str) and value.strip().startswith("{") and value.strip().endswith("}"):
+                parsed = _safe_dict(value)
+                if parsed:
+                    return parsed
+            return value
+
+    raw = payload.get("raw")
+    if isinstance(raw, dict):
+        for name in field_names:
+            value = raw.get(name)
+            if value is not None and value != "":
+                return value
+
+    falcon_event = payload.get("falcon_event") or payload.get("raw", {}).get("falcon_event") if isinstance(payload.get("raw"), dict) else None
+    if isinstance(falcon_event, dict):
+        for name in field_names:
+            value = falcon_event.get(name)
+            if value is not None and value != "":
+                return value
+
+    execution_decision = payload.get("execution_decision") or payload.get("raw", {}).get("execution_decision") if isinstance(payload.get("raw"), dict) else None
+    if isinstance(execution_decision, dict):
+        for name in field_names:
+            value = execution_decision.get(name)
+            if value is not None and value != "":
+                return value
+    return default
+
+
+def _extract_bot(payload):
+    value = _extract_field(payload, ["bot", "bot_name", "strategy", "source"], default="")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or value.startswith("{"):
+            return ""
+        if value.lower() in {"none", "null", "nan"}:
+            return ""
+        return value
+    return ""
+
+
+def _extract_symbol(payload):
+    value = _extract_field(payload, ["symbol", "ativo", "pair", "ticker"], default="")
+    if isinstance(value, str):
+        return normalize_symbol(value)
+    return normalize_symbol(value)
+
+
+def _extract_setup(payload):
+    value = _extract_field(payload, ["setup", "signal_type", "setup_label", "strategy"], default="")
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _extract_side(payload):
+    value = _extract_field(payload, ["side", "direction", "signal"], default="")
+    return normalize_side(value)
+
+
 def _event_uid(event_type, payload, source=None, trade_id=None):
     payload = payload if isinstance(payload, dict) else {}
     raw = _first(payload, ["event_id", "uid", "id"])
@@ -207,6 +289,9 @@ def normalize_event_type(event_type, payload=None):
     et = str(event_type or "EVENT").upper().strip()
     p = payload if isinstance(payload, dict) else {}
     status = str(_first(p, ["status", "state", "result", "decision", "resultado"], "")).upper()
+    event_name = str(_extract_field(p, ["event", "event_type", "type"], "") or "").upper().strip()
+    if not et and event_name:
+        et = event_name
 
     aliases = {
         "SIGNAL": "SIGNAL_CREATED",
@@ -247,6 +332,8 @@ def normalize_event_type(event_type, payload=None):
 
     if et in aliases:
         return aliases[et]
+    if event_name in aliases:
+        return aliases[event_name]
     if status in {"DENY", "DENIED", "BLOCKED", "ENCERRADO", "CLOSED", "FECHADO"}:
         return "TRADE_BLOCKED" if status in {"DENY", "DENIED", "BLOCKED"} else "TRADE_CLOSED"
     return et
@@ -259,9 +346,10 @@ def classify_event(event_type, payload=None):
 def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     raw = payload if isinstance(payload, dict) else {"value": payload}
     event = classify_event(event_type, raw)
-    bot = str(_first(raw, ["bot", "bot_name", "strategy", "source"], source or "CENTRAL") or "CENTRAL").upper()
-    symbol = normalize_symbol(_first(raw, ["symbol", "ativo", "pair"]))
-    side = normalize_side(_first(raw, ["side", "direction", "signal"]))
+    bot = _extract_bot(raw) or str(_first(raw, ["bot", "bot_name", "strategy", "source"], source or "CENTRAL") or "CENTRAL").upper()
+    symbol = _extract_symbol(raw)
+    side = _extract_side(raw)
+    setup = _extract_setup(raw)
     tid = trade_id or _first(raw, ["trade_id", "position_id", "client_trade_id"])
     if not tid:
         stamp = agora_sp().strftime("%Y%m%d-%H%M%S")
@@ -283,7 +371,7 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
         "bot": bot,
         "symbol": symbol,
         "side": side,
-        "setup": _first(raw, ["setup", "signal_type", "setup_label", "strategy"]),
+        "setup": setup,
         "score": score,
         "quality": _first(raw, ["quality", "qualidade", "classification"]),
         "entry": _safe_float(_first(raw, ["entry", "entrada", "entry_price"]), None),
@@ -474,6 +562,8 @@ def calculate_stats(events=None, filters=None, rows=None):
         "signals": 0,
         "entries": 0,
         "closed": 0,
+        "blocked": 0,
+        "denied": 0,
         "wins": 0,
         "losses": 0,
         "breakeven": 0,
@@ -485,19 +575,22 @@ def calculate_stats(events=None, filters=None, rows=None):
 
     for event in rows:
         event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
+        reason = str(event.get("reason") or event.get("result") or event.get("resultado") or "").upper()
+        raw_reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("event") or event.get("event_type") or event.get("type") or "").lower()
         if event_name == "SIGNAL_CREATED":
             totals["signals"] += 1
         if event_name == "TRADE_OPENED":
             totals["entries"] += 1
         if event_name == "TRADE_CLOSED":
             totals["closed"] += 1
+        if event_name == "TRADE_BLOCKED":
+            totals["blocked"] += 1
+            if reason in {"DENY", "DENIED", "BLOCKED"} or "deny" in raw_reason or "blocked" in raw_reason:
+                totals["denied"] += 1
         if event_name == "TP50_HIT":
             totals["tp50"] += 1
         if event_name == "BREAKEVEN":
             totals["breakeven"] += 1
-
-        reason = str(event.get("reason") or event.get("result") or event.get("resultado") or "").upper()
-        raw_reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("event") or event.get("event_type") or event.get("type") or "").lower()
         if event_name == "TRADE_CLOSED" and (
             reason in {"STOP", "STOPLOSS", "SL", "STOP_LOSS", "LOSS"}
             or "stop" in raw_reason
