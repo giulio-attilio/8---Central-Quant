@@ -151,12 +151,32 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             source="falcon",
             trade_id="T-BOT",
         )
+        history_manager.log_event(
+            "RISK_DECISION",
+            {
+                "result": "DENY",
+                "raw": {"event": "{'BOT': 'PREDATOR', 'SYMBOL': 'AVAXUSDT', 'SIDE': 'LONG', 'SETUP': 'SMART_PREDATOR'}"},
+            },
+            source="predator",
+            trade_id="T-PREDATOR",
+        )
 
         blocked_events = history_manager.load_events(filters={"event_type": "TRADE_BLOCKED"})
         self.assertGreaterEqual(len(blocked_events), 1)
 
         bot_normalized = history_manager.normalize_payload("TEST_EVENT", {"bot": "{'name': 'falcon'}", "raw": {"bot": "Falcon Strike"}}, source="falcon")
         self.assertEqual(bot_normalized["bot"], "FALCON")
+
+        predator_payload = history_manager.normalize_payload(
+            "RISK_DECISION",
+            {"result": "DENY", "raw": {"event": "{'BOT': 'PREDATOR', 'SYMBOL': 'AVAXUSDT', 'SIDE': 'LONG', 'SETUP': 'SMART_PREDATOR'}"}},
+            source="predator",
+            trade_id="T-PREDATOR",
+        )
+        self.assertEqual(predator_payload["bot"], "PREDATOR")
+        self.assertEqual(predator_payload["symbol"], "AVAXUSDT")
+        self.assertEqual(predator_payload["side"], "LONG")
+        self.assertEqual(predator_payload["setup"], "SMART_PREDATOR")
 
         stats = history_manager.calculate_stats()
         self.assertGreaterEqual(stats["blocked"], 2)

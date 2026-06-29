@@ -15,6 +15,7 @@
 #   nesta versão V1. A migração pode ser feita em uma V2, lendo TRADES_KEY de cada robô.
 # ============================================================================
 
+import ast
 import json
 import os
 import time
@@ -171,6 +172,21 @@ def _first(payload, keys, default=None):
     return default
 
 
+def safe_parse_dict_string(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    text = value.strip()
+    if not text:
+        return {}
+    try:
+        parsed = ast.literal_eval(text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _safe_dict(value):
     if isinstance(value, dict):
         return value
@@ -178,12 +194,7 @@ def _safe_dict(value):
         value = value.strip()
         if not value:
             return {}
-        if value.startswith("{") and value.endswith("}"):
-            try:
-                parsed = json.loads(value)
-                return parsed if isinstance(parsed, dict) else {}
-            except Exception:
-                return {}
+        return safe_parse_dict_string(value)
     return {}
 
 
@@ -242,17 +253,46 @@ def _extract_field(payload, field_names, default=None):
     if not isinstance(payload, dict):
         return default
 
+    def _lookup_from_mapping(mapping):
+        if not isinstance(mapping, dict):
+            return default
+        for name in field_names:
+            key = str(name)
+            if key in mapping:
+                return mapping[key]
+            if key.upper() in {str(k).upper() for k in mapping.keys()}:
+                for candidate_key, candidate_value in mapping.items():
+                    if isinstance(candidate_key, str) and candidate_key.upper() == key.upper():
+                        return candidate_value
+        return default
+
     def _search(node):
         if not isinstance(node, dict):
             return default
         for name in field_names:
             value = node.get(name)
             if value is not None and value != "":
+                parsed = safe_parse_dict_string(value)
+                if parsed:
+                    mapped = _lookup_from_mapping(parsed)
+                    if mapped is not default:
+                        return mapped
                 if isinstance(value, str):
                     if is_bad_string_value(value):
                         continue
                     return value
                 return value
+
+        for candidate_key in ("event", "state", "details", "payload", "context", "raw_event"):
+            candidate = node.get(candidate_key)
+            if candidate is None or candidate == "":
+                continue
+            parsed = safe_parse_dict_string(candidate)
+            if parsed:
+                mapped = _lookup_from_mapping(parsed)
+                if mapped is not default:
+                    return mapped
+
         for child_name in ("raw", "falcon_event", "execution_decision"):
             child = node.get(child_name)
             if isinstance(child, dict):
