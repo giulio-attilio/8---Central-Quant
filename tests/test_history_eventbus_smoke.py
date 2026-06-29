@@ -21,6 +21,8 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self.event_dir = self.root / "eventbus"
         self.event_dir.mkdir(parents=True, exist_ok=True)
+        self.central_timeline_log = self.root / "central_timeline.jsonl"
+        self.central_decision_log = self.root / "central_decision.jsonl"
 
         self.patches = [
             mock.patch.object(history_manager, "DATA_DIR", self.history_dir),
@@ -33,6 +35,8 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
             mock.patch.object(event_bus, "EVENT_BUS_LOG_FILE", self.event_dir / "event_bus.jsonl"),
             mock.patch.object(event_bus, "EVENT_BUS_SEEN_FILE", self.event_dir / "event_bus_seen.json"),
             mock.patch.object(event_bus, "history_manager", history_manager),
+            mock.patch.object(central_main, "CENTRAL_TIMELINE_LOG_FILE", self.central_timeline_log),
+            mock.patch.object(central_main, "CENTRAL_DECISION_LOG_FILE", self.central_decision_log),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -89,6 +93,19 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.assertIn("by_bot", payload)
         self.assertIn("by_symbol", payload)
         self.assertIn("by_setup", payload)
+
+    def test_append_timeline_event_updates_history(self):
+        central_main.append_timeline_event(
+            "TP50",
+            bot="falcon",
+            symbol="BTCUSDT",
+            side="buy",
+            trade_id="T-TP50",
+            state="OPEN",
+            details={"setup": "trend", "pnl_pct": 1.25},
+        )
+        events = history_manager.load_events(filters={"event_type": "TP50_HIT", "bot": "falcon"})
+        self.assertGreaterEqual(len(events), 1)
 
 
 if __name__ == "__main__":

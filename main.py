@@ -2580,6 +2580,56 @@ def _event_trade_id(bot=None, symbol=None, side=None, existing=None):
     return generate_trade_id(bot, symbol, side)
 
 
+def _history_payload_from_event(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None):
+    source_payload = dict(details or {}) if isinstance(details, dict) else {}
+    source_payload.update({
+        "event_type": str(event_type or "EVENT").upper(),
+        "bot": str(bot or source_payload.get("bot") or "").upper(),
+        "symbol": normalize_symbol_for_risk(symbol or source_payload.get("symbol")),
+        "side": str(side or source_payload.get("side") or "").upper(),
+        "trade_id": str(trade_id or source_payload.get("trade_id") or ""),
+        "state": str(state or source_payload.get("state") or "").upper(),
+        "timestamp": source_payload.get("timestamp") or source_payload.get("ts") or data_hora_sp_str(),
+        "ts": source_payload.get("timestamp") or source_payload.get("ts") or data_hora_sp_str(),
+        "setup": source_payload.get("setup"),
+        "result": source_payload.get("result") or source_payload.get("decision") or source_payload.get("status"),
+        "pnl_pct": source_payload.get("pnl_pct") or source_payload.get("result_pct") or source_payload.get("pnl"),
+    })
+    return source_payload
+
+
+def _emit_history_event(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None):
+    try:
+        import history_manager as super_history_manager
+    except Exception:
+        return None
+
+    try:
+        payload = _history_payload_from_event(event_type, bot=bot, symbol=symbol, side=side, trade_id=trade_id, state=state, details=details)
+        normalized_event = str(event_type or "EVENT").upper()
+        mapping = {
+            "SIGNAL": "SIGNAL_CREATED",
+            "ENTRY": "TRADE_OPENED",
+            "TP50": "TP50_HIT",
+            "BE": "BREAKEVEN",
+            "TRAILING": "TRAILING_UPDATED",
+            "STOP": "TRADE_CLOSED",
+            "CLOSE": "TRADE_CLOSED",
+            "DENY": "TRADE_BLOCKED",
+            "ALLOW": "RISK_ALLOW",
+        }
+        history_event_type = mapping.get(normalized_event, normalized_event)
+        return super_history_manager.log_event(
+            history_event_type,
+            payload,
+            source=str(payload.get("bot") or "central").lower(),
+            trade_id=payload.get("trade_id") or None,
+        )
+    except Exception as exc:
+        print(f"ERRO history hook {event_type}: {exc}")
+        return None
+
+
 def append_timeline_event(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None):
     item = {
         "ts": data_hora_sp_str(),
@@ -2593,6 +2643,7 @@ def append_timeline_event(event_type, bot=None, symbol=None, side=None, trade_id
         "details": details or {},
     }
     _append_jsonl(CENTRAL_TIMELINE_LOG_FILE, item)
+    _emit_history_event(event_type, bot=bot, symbol=symbol, side=side, trade_id=item.get("trade_id"), state=item.get("state"), details=item)
     return item
 
 
