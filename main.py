@@ -4728,7 +4728,7 @@ def simulate_route(key=None):
 
 @app.route("/simulate/full")
 def simulate_full_route():
-    if not env_bool("ENABLE_SIMULATION_ENDPOINT", False):
+    if str(os.environ.get("ENABLE_SIMULATION_ENDPOINT", "false")).strip().lower() != "true":
         return {"ok": False, "error": "simulation endpoint disabled"}
 
     try:
