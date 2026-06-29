@@ -1,22 +1,24 @@
-# ==========================================================
-# SUPER CENTRAL QUANT - HISTORY MANAGER
-# Versao: 2026-06-29-HISTORY-V2-EVENT-LEDGER
+# ==============================================================================
+# CENTRAL QUANT - SUPER HISTORY MANAGER
+# Versão: 2026-06-29-SUPER-HISTORY-V1
 #
 # Objetivo:
-# - Transformar history_events.jsonl no ledger oficial da Super Central Quant.
-# - Evitar duplicidade entre history_events, decision_log e timeline.
-# - Expor relatorios: /history, /riskstats e /exporthistory.
+# - Criar um histórico persistente único da Central Quant.
+# - Registrar decisões do Risk Manager, eventos de timeline e eventos dos robôs.
+# - Expor /history, /riskstats, /exporthistory e /history/raw sem depender de banco externo.
+# - Funcionar em Render Free usando JSONL local/ephemeral.
+# - Ser tolerante a payloads diferentes de cada robô.
 #
-# Regra V2:
-# - /history e /riskstats leem APENAS history_events.jsonl.
-# - decision_log.jsonl e timeline.jsonl ficam apenas como compatibilidade/depuracao.
-# - Hooks da Central registram no ledger, mas as importacoes antigas nao sao mais somadas.
-# ==========================================================
+# Observação importante:
+# - Este módulo registra eventos daqui para frente.
+# - Históricos antigos que estão apenas no Redis de cada robô não são migrados automaticamente
+#   nesta versão V1. A migração pode ser feita em uma V2, lendo TRADES_KEY de cada robô.
+# ============================================================================
 
-import os
 import json
+import os
 import time
-import hashlib
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
@@ -27,22 +29,15 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 HISTORY_EVENTS_FILE = DATA_DIR / "history_events.jsonl"
-HISTORY_EXPORT_FILE = DATA_DIR / "history_export.json"
 DECISION_LOG_FILE = DATA_DIR / "decision_log.jsonl"
 TIMELINE_LOG_FILE = DATA_DIR / "timeline.jsonl"
-EXECUTION_STATS_FILE = DATA_DIR / "execution_stats.json"
-SHADOW_POSITIONS_FILE = DATA_DIR / "shadow_positions.json"
-STATUS_SNAPSHOTS_FILE = DATA_DIR / "status_snapshots.jsonl"
+HISTORY_EXPORT_FILE = DATA_DIR / "history_export.json"
 HISTORY_SEEN_FILE = DATA_DIR / "history_seen.json"
 
-DEFAULT_LIMIT = int(os.environ.get("HISTORY_DEFAULT_LIMIT", "5000"))
-MAX_EXPORT_LIMIT = int(os.environ.get("HISTORY_MAX_EXPORT_LIMIT", "20000"))
-HISTORY_DEDUPE_ENABLED = str(os.environ.get("HISTORY_DEDUPE_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
-HISTORY_MAX_SEEN_KEYS = int(os.environ.get("HISTORY_MAX_SEEN_KEYS", "30000"))
-
-# Se algum dia você quiser voltar a somar decision_log/timeline no /history,
-# mude para true. O padrão V2 é false.
-HISTORY_INCLUDE_LEGACY_IMPORTS = str(os.environ.get("HISTORY_INCLUDE_LEGACY_IMPORTS", "false")).lower() in {"1", "true", "yes", "sim", "on"}
+HISTORY_MAX_READ = int(os.environ.get("HISTORY_MAX_READ", "2000"))
+HISTORY_REPORT_DAYS = int(os.environ.get("HISTORY_REPORT_DAYS", "7"))
+HISTORY_DEDUP_ENABLED = str(os.environ.get("HISTORY_DEDUP_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+HISTORY_DEDUP_MAX_KEYS = int(os.environ.get("HISTORY_DEDUP_MAX_KEYS", "5000"))
 
 
 def agora_sp():
@@ -53,19 +48,11 @@ def data_hora_sp_str():
     return agora_sp().strftime("%d/%m/%Y %H:%M")
 
 
-def iso_sp_str():
-    return agora_sp().isoformat()
-
-
-def _json_default(obj):
+def _json_default(value):
     try:
-        if isinstance(obj, Path):
-            return str(obj)
-        if isinstance(obj, datetime):
-            return obj.isoformat()
+        return str(value)
     except Exception:
-        pass
-    return str(obj)
+        return None
 
 
 def _safe_float(value, default=None):
@@ -73,27 +60,25 @@ def _safe_float(value, default=None):
         if value is None:
             return default
         if isinstance(value, str):
-            value = value.replace("%", "").replace("R", "").replace("+", "").replace(",", ".").strip()
-            if value == "":
-                return default
+            value = value.replace("%", "").replace(",", ".").strip()
         return float(value)
     except Exception:
         return default
 
 
-def _safe_upper(value):
-    return str(value or "").strip().upper()
-
-
-def _normalize_symbol(value):
-    txt = _safe_upper(value)
-    return txt.replace("/", "").replace(":USDT", "").replace("-", "")
-
-
-def _append_jsonl(path, item):
+def _safe_int(value, default=0):
     try:
-        path.parent.mkdir(exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _append_jsonl(path: Path, item: dict):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
         return True
     except Exception as exc:
@@ -101,499 +86,505 @@ def _append_jsonl(path, item):
         return False
 
 
-def _read_jsonl(path, limit=DEFAULT_LIMIT):
-    if not Path(path).exists():
-        return []
-    rows = []
+def _read_jsonl_tail(path: Path, limit=None):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    continue
-        if limit and len(rows) > int(limit):
-            rows = rows[-int(limit):]
+        limit = int(limit or HISTORY_MAX_READ)
+        if not path.exists():
+            return []
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+        rows = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                rows.append({"raw": line})
         return rows
     except Exception as exc:
         print(f"ERRO HISTORY read_jsonl {path}: {exc}")
         return []
 
 
-def _read_json(path, default=None):
+def _read_json(path: Path, default):
     try:
-        p = Path(path)
-        if not p.exists():
+        if not path.exists():
             return default
-        return json.loads(p.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return default
 
 
-def _write_json(path, payload):
+def _write_json(path: Path, payload):
     try:
-        path = Path(path)
-        path.parent.mkdir(exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_default)
         return True
     except Exception as exc:
         print(f"ERRO HISTORY write_json {path}: {exc}")
         return False
 
 
-def _event_fingerprint(event_type, data, source, trade_id):
-    data = data if isinstance(data, dict) else {"value": data}
-    explicit = data.get("dedupe_key") or data.get("event_id") or data.get("idempotency_key")
-    if explicit:
-        return str(explicit)
-
-    # Deduplicação operacional: para decisões, usa trade_id + tipo + bot/symbol/side.
-    # Isso evita que decision_log, timeline_hook e decision_hook contem 3-4 vezes a mesma ocorrência.
-    basis = {
-        "event_type": _safe_upper(event_type or "EVENT"),
-        "source": str(source or "central"),
-        "trade_id": str(trade_id or data.get("trade_id") or data.get("id") or ""),
-        "bot": _safe_upper(data.get("bot") or data.get("robot") or data.get("strategy")),
-        "symbol": _normalize_symbol(data.get("symbol") or data.get("ativo") or data.get("pair")),
-        "side": _safe_upper(data.get("side") or data.get("direction") or data.get("lado")),
-        "setup": str(data.get("setup") or data.get("setup_label") or ""),
-        "result": _safe_upper(data.get("result") or data.get("resultado") or data.get("status") or data.get("decision")),
-        "minute": data_hora_sp_str(),
-    }
-    txt = json.dumps(basis, ensure_ascii=False, sort_keys=True, default=_json_default)
-    return hashlib.sha256(txt.encode("utf-8")).hexdigest()[:32]
+def normalize_symbol(symbol):
+    s = str(symbol or "").upper().strip()
+    if not s:
+        return ""
+    return s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace("-", "")
 
 
-def _seen_contains_or_add(key):
-    if not HISTORY_DEDUPE_ENABLED:
+def normalize_side(side):
+    s = str(side or "").upper().strip()
+    if s in {"BUY", "LONG"}:
+        return "LONG"
+    if s in {"SELL", "SHORT"}:
+        return "SHORT"
+    return s
+
+
+def _first(payload, keys, default=None):
+    if not isinstance(payload, dict):
+        return default
+    for key in keys:
+        if payload.get(key) is not None:
+            return payload.get(key)
+    return default
+
+
+def _event_uid(event_type, payload, source=None, trade_id=None):
+    payload = payload if isinstance(payload, dict) else {}
+    raw = _first(payload, ["event_id", "uid", "id"])
+    if raw:
+        return str(raw)
+    tid = trade_id or _first(payload, ["trade_id", "position_id", "client_trade_id"])
+    event_ts = _first(payload, ["event_ts", "timestamp", "created_at", "closed_at", "ts"])
+    symbol = normalize_symbol(_first(payload, ["symbol", "ativo", "pair"]))
+    side = normalize_side(_first(payload, ["side", "direction", "signal"]))
+    setup = str(_first(payload, ["setup", "signal_type", "strategy"], "")).upper()
+    return f"{source or ''}|{event_type}|{tid or ''}|{symbol}|{side}|{setup}|{event_ts or ''}"
+
+
+def _dedup_seen(uid):
+    if not HISTORY_DEDUP_ENABLED:
         return False
-    data = _read_json(HISTORY_SEEN_FILE, {"keys": []})
-    keys = data.get("keys") if isinstance(data, dict) else []
-    if not isinstance(keys, list):
-        keys = []
-    if key in set(keys):
-        return True
-    keys.append(key)
-    if len(keys) > HISTORY_MAX_SEEN_KEYS:
-        keys = keys[-HISTORY_MAX_SEEN_KEYS:]
-    _write_json(HISTORY_SEEN_FILE, {"updated_at": data_hora_sp_str(), "keys": keys})
-    return False
+    try:
+        seen = _read_json(HISTORY_SEEN_FILE, {})
+        if not isinstance(seen, dict):
+            seen = {}
+        if uid in seen:
+            return True
+        seen[uid] = time.time()
+        if len(seen) > HISTORY_DEDUP_MAX_KEYS:
+            items = sorted(seen.items(), key=lambda x: x[1])[-HISTORY_DEDUP_MAX_KEYS:]
+            seen = dict(items)
+        _write_json(HISTORY_SEEN_FILE, seen)
+        return False
+    except Exception:
+        return False
 
 
-def log_event(event_type, data=None, source="central", trade_id=None):
-    """
-    Registro universal do History Ledger.
+def classify_event(event_type, payload=None):
+    et = str(event_type or "EVENT").upper().strip()
+    p = payload if isinstance(payload, dict) else {}
+    status = str(_first(p, ["status", "state", "result", "decision"], "")).upper()
+    if et in {"SIGNAL", "SIGNAL_CREATED", "TRADE_OPENED", "ENTRY", "OPEN"}:
+        return "TRADE_OPENED" if et in {"TRADE_OPENED", "ENTRY", "OPEN"} else "SIGNAL_CREATED"
+    if et in {"TRADE_BLOCKED", "BLOCKED", "RISK_DENY"} or status in {"DENY", "DENIED", "BLOCKED"}:
+        return "TRADE_BLOCKED"
+    if et in {"TP50", "TP50_HIT"}:
+        return "TP50_HIT"
+    if et in {"BE", "BREAKEVEN", "SL50"}:
+        return "BREAKEVEN"
+    if et in {"TRAIL", "TRAILING", "TRAILING_UPDATED"}:
+        return "TRAILING_UPDATED"
+    if et in {"STOP", "SL", "SL100"}:
+        return "TRADE_CLOSED"
+    if et in {"CLOSE", "CLOSED", "TRADE_CLOSED", "EXIT"} or status in {"ENCERRADO", "CLOSED", "FECHADO"}:
+        return "TRADE_CLOSED"
+    if et in {"RISK_ALLOW", "RISK_DECISION"}:
+        return et
+    return et
 
-    A partir da V2, este é o caminho oficial de eventos da Super Central Quant.
-    /history e /riskstats leem somente history_events.jsonl por padrão.
-    """
-    data = data if isinstance(data, dict) else {"value": data}
-    bot = data.get("bot") or data.get("robot") or data.get("strategy")
-    symbol = data.get("symbol") or data.get("ativo") or data.get("pair")
-    side = data.get("side") or data.get("direction") or data.get("lado")
-    setup = data.get("setup") or data.get("setup_label")
-    result = data.get("result") or data.get("resultado") or data.get("status") or data.get("decision")
 
-    key = _event_fingerprint(event_type, data, source, trade_id)
-    if _seen_contains_or_add(key):
-        return {
-            "ok": True,
-            "duplicate": True,
-            "dedupe_key": key,
-            "event_type": _safe_upper(event_type or "EVENT"),
-            "source": str(source or "central"),
-        }
+def normalize_payload(event_type, payload=None, source=None, trade_id=None):
+    raw = payload if isinstance(payload, dict) else {"value": payload}
+    event = classify_event(event_type, raw)
+    bot = str(_first(raw, ["bot", "bot_name", "strategy", "source"], source or "CENTRAL") or "CENTRAL").upper()
+    symbol = normalize_symbol(_first(raw, ["symbol", "ativo", "pair"]))
+    side = normalize_side(_first(raw, ["side", "direction", "signal"]))
+    tid = trade_id or _first(raw, ["trade_id", "position_id", "client_trade_id"])
+    if not tid:
+        stamp = agora_sp().strftime("%Y%m%d-%H%M%S")
+        tid = f"{bot[:12]}-{stamp}-{symbol or 'NA'}-{uuid.uuid4().hex[:6].upper()}"
+
+    result_pct = _safe_float(_first(raw, ["result_pct", "pnl_pct", "current_pct", "open_pct"]), None)
+    result_r = _safe_float(_first(raw, ["result_r", "pnl_r", "current_r", "open_r"]), None)
+    risk_pct = _safe_float(_first(raw, ["risk_pct", "risco_pct", "risk"]), None)
+    score = _safe_float(_first(raw, ["score", "signal_score", "meme_score", "qualidade_pontos"]), None)
 
     item = {
-        "schema": 2,
-        "event_id": data.get("event_id") or f"evt_{int(time.time() * 1000)}_{key[:8]}",
-        "dedupe_key": key,
+        "uid": _event_uid(event, raw, source=source, trade_id=tid),
         "ts": data_hora_sp_str(),
-        "ts_iso": iso_sp_str(),
         "epoch": time.time(),
-        "event_type": _safe_upper(event_type or "EVENT"),
-        "source": str(source or "central"),
-        "trade_id": str(trade_id or data.get("trade_id") or data.get("id") or ""),
-        "bot": _safe_upper(bot),
-        "symbol": _normalize_symbol(symbol),
-        "side": _safe_upper(side),
-        "setup": str(setup or ""),
-        "result": _safe_upper(result),
-        "pnl_pct": _safe_float(data.get("pnl_pct") or data.get("pnl") or data.get("result_pct"), None),
-        "pnl_r": _safe_float(data.get("pnl_r") or data.get("result_r"), None),
-        "risk_pct": _safe_float(data.get("risk_pct") or data.get("risk") or data.get("risco"), None),
-        "score": _safe_float(data.get("score") or data.get("score_falcon") or data.get("score_predator"), None),
-        "raw": data,
+        "event": event,
+        "event_raw": str(event_type or "EVENT").upper(),
+        "source": str(source or raw.get("source") or bot or "central").lower(),
+        "trade_id": str(tid),
+        "bot": bot,
+        "symbol": symbol,
+        "side": side,
+        "setup": _first(raw, ["setup", "signal_type", "setup_label", "strategy"]),
+        "score": score,
+        "quality": _first(raw, ["quality", "qualidade", "classification"]),
+        "entry": _safe_float(_first(raw, ["entry", "entrada", "entry_price"]), None),
+        "stop": _safe_float(_first(raw, ["stop", "sl", "initial_sl", "stop_atual"]), None),
+        "tp50": _safe_float(_first(raw, ["tp50", "tp_50"]), None),
+        "exit_price": _safe_float(_first(raw, ["exit_price", "close_price", "price"]), None),
+        "risk_pct": risk_pct,
+        "result_pct": result_pct,
+        "result_r": result_r,
+        "result": _first(raw, ["result", "decision", "status"]),
+        "reason": _first(raw, ["reason", "motivo", "exit_reason"]),
+        "raw": raw,
     }
-    _append_jsonl(HISTORY_EVENTS_FILE, item)
     return item
 
 
-# Mantidas para compatibilidade/depuração, mas NÃO são usadas por padrão no /history V2.
-def import_decision_log(limit=MAX_EXPORT_LIMIT):
-    rows = _read_jsonl(DECISION_LOG_FILE, limit=limit)
-    converted = []
-    for r in rows:
-        converted.append({
-            "ts": r.get("ts"),
-            "epoch": r.get("epoch"),
-            "event_type": "TRADE_ALLOWED" if r.get("allowed") else "TRADE_BLOCKED",
-            "source": "decision_log",
-            "trade_id": r.get("trade_id"),
-            "bot": _safe_upper(r.get("bot")),
-            "symbol": _normalize_symbol(r.get("symbol")),
-            "side": _safe_upper(r.get("side")),
-            "setup": r.get("setup") or "",
-            "result": "ALLOW" if r.get("allowed") else "DENY",
-            "pnl_pct": None,
-            "pnl_r": None,
-            "risk_pct": _safe_float(r.get("risk_pct"), None),
-            "score": _safe_float(r.get("score"), None),
-            "raw": r,
-        })
-    return converted
+def log_event(event_type, payload=None, source=None, trade_id=None):
+    item = normalize_payload(event_type, payload, source=source, trade_id=trade_id)
+    uid = item.get("uid")
+    if uid and _dedup_seen(uid):
+        return {"ok": True, "dedup": True, "uid": uid}
+    ok = _append_jsonl(HISTORY_EVENTS_FILE, item)
+    if item.get("event") in {"RISK_DECISION", "RISK_ALLOW", "RISK_DENY", "TRADE_BLOCKED"}:
+        _append_jsonl(DECISION_LOG_FILE, item)
+    if item.get("event") not in {"CENTRAL_COMMAND", "BOT_COMMAND"}:
+        _append_jsonl(TIMELINE_LOG_FILE, item)
+    return {"ok": ok, "dedup": False, "event": item}
 
 
-def import_timeline(limit=MAX_EXPORT_LIMIT):
-    rows = _read_jsonl(TIMELINE_LOG_FILE, limit=limit)
-    converted = []
-    for r in rows:
-        converted.append({
-            "ts": r.get("ts"),
-            "epoch": r.get("epoch"),
-            "event_type": _safe_upper(r.get("event") or r.get("state") or "TIMELINE"),
-            "source": "timeline",
-            "trade_id": r.get("trade_id"),
-            "bot": _safe_upper(r.get("bot")),
-            "symbol": _normalize_symbol(r.get("symbol")),
-            "side": _safe_upper(r.get("side")),
-            "setup": (r.get("details") or {}).get("setup", "") if isinstance(r.get("details"), dict) else "",
-            "result": _safe_upper(r.get("state")),
-            "pnl_pct": None,
-            "pnl_r": None,
-            "risk_pct": None,
-            "score": None,
-            "raw": r,
-        })
-    return converted
+def _log_from_trade_event(evento, source=None):
+    if not isinstance(evento, dict):
+        return None
+    event_type = _first(evento, ["event_type", "event", "type"], "EVENT")
+    return log_event(event_type, evento, source=source, trade_id=_first(evento, ["trade_id", "position_id"]))
 
 
-def all_history_events(limit=DEFAULT_LIMIT, include_imports=None):
-    if include_imports is None:
-        include_imports = HISTORY_INCLUDE_LEGACY_IMPORTS
-    events = _read_jsonl(HISTORY_EVENTS_FILE, limit=limit)
-    if include_imports:
-        events = events + import_decision_log(limit=limit) + import_timeline(limit=limit)
-    events = [e for e in events if isinstance(e, dict) and not e.get("duplicate")]
-    events.sort(key=lambda x: float(x.get("epoch") or 0))
-    if limit and len(events) > int(limit):
-        events = events[-int(limit):]
-    return events
+def wrap_bot_module(module, bot_key=None):
+    """Instala hooks leves nos robôs carregados pela Central."""
+    if module is None:
+        return False
+    source = str(bot_key or getattr(module, "BOT_NAME", getattr(module, "__name__", "bot"))).lower()
+    wrapped = False
+
+    fn = getattr(module, "registrar_evento_trade", None)
+    if callable(fn) and not getattr(fn, "_history_wrapped", False):
+        original = fn
+        def registrar_evento_trade_wrapper(evento, *args, **kwargs):
+            result = original(evento, *args, **kwargs)
+            try:
+                _log_from_trade_event(evento, source=source)
+            except Exception as exc:
+                print(f"ERRO HISTORY registrar_evento_trade {source}: {exc}")
+            return result
+        registrar_evento_trade_wrapper._history_wrapped = True
+        setattr(module, "registrar_evento_trade", registrar_evento_trade_wrapper)
+        wrapped = True
+
+    fn = getattr(module, "record_event", None)
+    if callable(fn) and not getattr(fn, "_history_wrapped", False):
+        original = fn
+        def record_event_wrapper(event_type, pos, extra=None, *args, **kwargs):
+            result = original(event_type, pos, extra=extra, *args, **kwargs)
+            try:
+                payload = dict(pos or {})
+                if isinstance(extra, dict):
+                    payload.update(extra)
+                payload["event_type"] = event_type
+                log_event(event_type, payload, source=source, trade_id=payload.get("trade_id"))
+            except Exception as exc:
+                print(f"ERRO HISTORY record_event {source}: {exc}")
+            return result
+        record_event_wrapper._history_wrapped = True
+        setattr(module, "record_event", record_event_wrapper)
+        wrapped = True
+
+    return wrapped
 
 
-def _filter_events(events, bot=None, symbol=None, event_type=None):
-    bot = _safe_upper(bot) if bot else None
-    symbol = _normalize_symbol(symbol) if symbol else None
-    event_type = _safe_upper(event_type) if event_type else None
-    out = []
+def wrap_central_functions(globals_dict):
+    """Envolve funções centrais sem quebrar o comportamento original."""
+    if not isinstance(globals_dict, dict):
+        return False
+
+    append_decision = globals_dict.get("append_decision_log")
+    if callable(append_decision) and not getattr(append_decision, "_history_wrapped", False):
+        original = append_decision
+        def append_decision_log_wrapper(payload, decision_result, *args, **kwargs):
+            result = original(payload, decision_result, *args, **kwargs)
+            try:
+                merged = {}
+                if isinstance(payload, dict):
+                    merged.update(payload)
+                if isinstance(decision_result, dict):
+                    merged.update(decision_result)
+                if isinstance(result, dict):
+                    merged.update(result)
+                log_event("RISK_DECISION", merged, source="central", trade_id=merged.get("trade_id"))
+            except Exception as exc:
+                print("ERRO HISTORY append_decision_log:", exc)
+            return result
+        append_decision_log_wrapper._history_wrapped = True
+        globals_dict["append_decision_log"] = append_decision_log_wrapper
+
+    append_timeline = globals_dict.get("append_timeline_event")
+    if callable(append_timeline) and not getattr(append_timeline, "_history_wrapped", False):
+        original = append_timeline
+        def append_timeline_event_wrapper(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None, *args, **kwargs):
+            result = original(event_type, bot=bot, symbol=symbol, side=side, trade_id=trade_id, state=state, details=details, *args, **kwargs)
+            try:
+                payload = dict(details or {}) if isinstance(details, dict) else {"details": details}
+                payload.update({"bot": bot, "symbol": symbol, "side": side, "state": state})
+                log_event(event_type, payload, source="central", trade_id=trade_id)
+            except Exception as exc:
+                print("ERRO HISTORY append_timeline_event:", exc)
+            return result
+        append_timeline_event_wrapper._history_wrapped = True
+        globals_dict["append_timeline_event"] = append_timeline_event_wrapper
+
+    loaded = globals_dict.get("LOADED_BOTS")
+    if isinstance(loaded, dict):
+        for key, module in list(loaded.items()):
+            try:
+                wrap_bot_module(module, key)
+            except Exception as exc:
+                print(f"ERRO HISTORY wrap bot {key}: {exc}")
+
+    return True
+
+
+def load_events(limit=None):
+    return _read_jsonl_tail(HISTORY_EVENTS_FILE, limit=limit or HISTORY_MAX_READ)
+
+
+def build_history_payload(limit=None):
+    events = load_events(limit=limit or HISTORY_MAX_READ)
+    by_event = Counter()
+    by_bot = Counter()
+    by_symbol = Counter()
+    by_setup = Counter()
+    by_side = Counter()
+    closed = []
+    blocked = []
+    tp50 = []
+
     for e in events:
-        if bot and _safe_upper(e.get("bot")) != bot:
-            continue
-        if symbol and _normalize_symbol(e.get("symbol")) != symbol:
-            continue
-        if event_type and _safe_upper(e.get("event_type")) != event_type:
-            continue
-        out.append(e)
-    return out
+        event = e.get("event") or "EVENT"
+        by_event[event] += 1
+        if e.get("bot"):
+            by_bot[e.get("bot")] += 1
+        if e.get("symbol"):
+            by_symbol[e.get("symbol")] += 1
+        if e.get("setup"):
+            by_setup[str(e.get("setup"))] += 1
+        if e.get("side"):
+            by_side[e.get("side")] += 1
+        if event == "TRADE_CLOSED":
+            closed.append(e)
+        if event == "TRADE_BLOCKED" or str(e.get("result") or "").upper() in {"DENY", "DENIED", "BLOCKED"}:
+            blocked.append(e)
+        if event == "TP50_HIT":
+            tp50.append(e)
 
+    pnl_values = [_safe_float(x.get("result_pct"), None) for x in closed]
+    pnl_values = [x for x in pnl_values if x is not None]
+    r_values = [_safe_float(x.get("result_r"), None) for x in closed]
+    r_values = [x for x in r_values if x is not None]
+    wins = len([x for x in pnl_values if x > 0])
+    losses = len([x for x in pnl_values if x < 0])
+    be = len([x for x in pnl_values if x == 0])
+    gross_win = sum([x for x in pnl_values if x > 0])
+    gross_loss = abs(sum([x for x in pnl_values if x < 0]))
 
-def build_history_payload(limit=1000, bot=None, symbol=None, event_type=None):
-    events = all_history_events(limit=limit, include_imports=False)
-    events = _filter_events(events, bot=bot, symbol=symbol, event_type=event_type)
     return {
         "ok": True,
-        "version": "HISTORY_V2_EVENT_LEDGER",
         "generated_at": data_hora_sp_str(),
-        "total_events": len(events),
-        "filters": {"bot": bot, "symbol": symbol, "event_type": event_type},
-        "events": events,
         "files": {
             "history_events": str(HISTORY_EVENTS_FILE),
-            "decision_log_legacy": str(DECISION_LOG_FILE),
-            "timeline_legacy": str(TIMELINE_LOG_FILE),
-            "seen": str(HISTORY_SEEN_FILE),
+            "decision_log": str(DECISION_LOG_FILE),
+            "timeline": str(TIMELINE_LOG_FILE),
+            "export": str(HISTORY_EXPORT_FILE),
         },
+        "totals": {
+            "events": len(events),
+            "signals": by_event.get("SIGNAL_CREATED", 0),
+            "opened": by_event.get("TRADE_OPENED", 0),
+            "closed": len(closed),
+            "blocked": len(blocked),
+            "tp50": len(tp50),
+            "breakeven": by_event.get("BREAKEVEN", 0),
+            "trailing": by_event.get("TRAILING_UPDATED", 0),
+        },
+        "performance": {
+            "wins": wins,
+            "losses": losses,
+            "breakeven": be,
+            "win_rate_pct": round((wins / max(wins + losses, 1)) * 100, 2),
+            "pnl_total_pct": round(sum(pnl_values), 4),
+            "pnl_avg_pct": round(sum(pnl_values) / max(len(pnl_values), 1), 4) if pnl_values else 0.0,
+            "r_total": round(sum(r_values), 4),
+            "r_avg": round(sum(r_values) / max(len(r_values), 1), 4) if r_values else 0.0,
+            "profit_factor_pct": round(gross_win / gross_loss, 4) if gross_loss > 0 else (999 if gross_win > 0 else 0),
+        },
+        "by_event": dict(by_event.most_common()),
+        "by_bot": dict(by_bot.most_common()),
+        "by_symbol": dict(by_symbol.most_common(30)),
+        "by_setup": dict(by_setup.most_common(30)),
+        "by_side": dict(by_side.most_common()),
+        "recent_events": events[-50:],
     }
 
 
-def build_riskstats_payload(limit=MAX_EXPORT_LIMIT):
-    events = all_history_events(limit=limit, include_imports=False)
-    by_bot = defaultdict(lambda: {"events": 0, "allow": 0, "deny": 0, "closed": 0, "wins": 0, "loss": 0, "be": 0, "pnl_pct": 0.0, "pnl_r": 0.0})
-    by_symbol = defaultdict(lambda: {"events": 0, "allow": 0, "deny": 0, "closed": 0, "wins": 0, "loss": 0, "be": 0, "pnl_pct": 0.0, "pnl_r": 0.0})
-    by_setup = defaultdict(lambda: {"events": 0, "allow": 0, "deny": 0, "closed": 0, "wins": 0, "loss": 0, "be": 0, "pnl_pct": 0.0, "pnl_r": 0.0})
-    event_counts = Counter()
-    block_reasons = Counter()
+def build_history_report(days=None):
+    payload = build_history_payload()
+    totals = payload.get("totals", {})
+    perf = payload.get("performance", {})
+    by_bot = payload.get("by_bot", {})
+    by_symbol = payload.get("by_symbol", {})
 
-    total_pnl_pct = 0.0
-    total_pnl_r = 0.0
-    closed = wins = loss = be = allow = deny = 0
+    lines = [
+        "📚 SUPER HISTORY — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        "",
+        "Eventos registrados:",
+        f"Sinais: {totals.get('signals', 0)}",
+        f"Entradas: {totals.get('opened', 0)}",
+        f"Encerrados: {totals.get('closed', 0)}",
+        f"Bloqueados: {totals.get('blocked', 0)}",
+        f"TP50: {totals.get('tp50', 0)}",
+        f"BE: {totals.get('breakeven', 0)}",
+        f"Trailing: {totals.get('trailing', 0)}",
+        "",
+        "Performance registrada:",
+        f"Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('breakeven', 0)}",
+        f"Win rate: {perf.get('win_rate_pct', 0)}%",
+        f"PnL total: {perf.get('pnl_total_pct', 0)}%",
+        f"R total: {perf.get('r_total', 0)}R",
+        f"Profit Factor %: {perf.get('profit_factor_pct', 0)}",
+        "",
+        "Eventos por bot:",
+    ]
+    if by_bot:
+        for bot, count in list(by_bot.items())[:12]:
+            lines.append(f"- {bot}: {count}")
+    else:
+        lines.append("- Ainda sem eventos de robôs no Super History.")
 
-    def touch(bucket, key, e):
-        if not key:
-            key = "N/A"
-        st = bucket[key]
-        st["events"] += 1
-        et = _safe_upper(e.get("event_type"))
-        res = _safe_upper(e.get("result"))
-        if et in {"TRADE_ALLOWED", "RISK_ALLOW"} or res == "ALLOW":
-            st["allow"] += 1
-        if et in {"TRADE_BLOCKED", "RISK_DENY"} or res == "DENY":
-            st["deny"] += 1
-        if et in {"TRADE_CLOSED", "CLOSED", "STOP_HIT", "TP_HIT", "STOP", "TRAIL"} or res in {"WIN", "LOSS", "BE", "BREAKEVEN"}:
-            st["closed"] += 1
-            if res == "WIN":
-                st["wins"] += 1
-            elif res == "LOSS":
-                st["loss"] += 1
-            elif res in {"BE", "BREAKEVEN"}:
-                st["be"] += 1
-        if e.get("pnl_pct") is not None:
-            st["pnl_pct"] += _safe_float(e.get("pnl_pct"), 0.0) or 0.0
-        if e.get("pnl_r") is not None:
-            st["pnl_r"] += _safe_float(e.get("pnl_r"), 0.0) or 0.0
+    lines += ["", "Top ativos:"]
+    if by_symbol:
+        for symbol, count in list(by_symbol.items())[:12]:
+            lines.append(f"- {symbol}: {count}")
+    else:
+        lines.append("- Ainda sem ativos registrados.")
+
+    lines += [
+        "",
+        "Observação:",
+        "O Super History registra eventos novos a partir desta versão. Histórico antigo do Redis pode ser migrado depois em uma V2.",
+    ]
+    return "\n".join(lines)
+
+
+def build_riskstats_payload():
+    payload = build_history_payload()
+    events = load_events()
+    closed_by_bot = defaultdict(list)
+    closed_by_symbol = defaultdict(list)
+    blocked_by_reason = Counter()
 
     for e in events:
-        et = _safe_upper(e.get("event_type"))
-        res = _safe_upper(e.get("result"))
-        event_counts[et or "EVENT"] += 1
-        if et in {"TRADE_ALLOWED", "RISK_ALLOW"} or res == "ALLOW":
-            allow += 1
-        if et in {"TRADE_BLOCKED", "RISK_DENY"} or res == "DENY":
-            deny += 1
-            raw = e.get("raw") or {}
-            reasons = raw.get("reasons") or raw.get("reason") or raw.get("motivo") or []
-            if isinstance(reasons, str):
-                reasons = [reasons]
-            if isinstance(reasons, list):
-                for reason in reasons[:5]:
-                    block_reasons[str(reason)[:120]] += 1
-        if et in {"TRADE_CLOSED", "CLOSED", "STOP_HIT", "TP_HIT", "STOP", "TRAIL"} or res in {"WIN", "LOSS", "BE", "BREAKEVEN"}:
-            closed += 1
-            if res == "WIN":
-                wins += 1
-            elif res == "LOSS":
-                loss += 1
-            elif res in {"BE", "BREAKEVEN"}:
-                be += 1
-        if e.get("pnl_pct") is not None:
-            total_pnl_pct += _safe_float(e.get("pnl_pct"), 0.0) or 0.0
-        if e.get("pnl_r") is not None:
-            total_pnl_r += _safe_float(e.get("pnl_r"), 0.0) or 0.0
+        if e.get("event") == "TRADE_CLOSED":
+            closed_by_bot[e.get("bot") or "N/A"].append(e)
+            closed_by_symbol[e.get("symbol") or "N/A"].append(e)
+        if e.get("event") == "TRADE_BLOCKED":
+            reason = e.get("reason") or e.get("result") or "N/A"
+            blocked_by_reason[str(reason)] += 1
 
-        touch(by_bot, e.get("bot") or "N/A", e)
-        touch(by_symbol, e.get("symbol") or "N/A", e)
-        touch(by_setup, e.get("setup") or "N/A", e)
-
-    win_rate = round((wins / max(1, wins + loss)) * 100, 2) if (wins + loss) else None
-    win_rate_com_be = round((wins / max(1, closed)) * 100, 2) if closed else None
+    def stats(rows):
+        pnls = [_safe_float(x.get("result_pct"), None) for x in rows]
+        pnls = [x for x in pnls if x is not None]
+        wins = len([x for x in pnls if x > 0])
+        losses = len([x for x in pnls if x < 0])
+        gross_win = sum([x for x in pnls if x > 0])
+        gross_loss = abs(sum([x for x in pnls if x < 0]))
+        return {
+            "trades": len(rows),
+            "wins": wins,
+            "losses": losses,
+            "win_rate_pct": round(wins / max(wins + losses, 1) * 100, 2),
+            "pnl_total_pct": round(sum(pnls), 4),
+            "pnl_avg_pct": round(sum(pnls) / max(len(pnls), 1), 4) if pnls else 0.0,
+            "profit_factor_pct": round(gross_win / gross_loss, 4) if gross_loss > 0 else (999 if gross_win > 0 else 0),
+        }
 
     return {
         "ok": True,
-        "version": "HISTORY_V2_EVENT_LEDGER",
         "generated_at": data_hora_sp_str(),
-        "total_events": len(events),
-        "allow": allow,
-        "deny": deny,
-        "closed": closed,
-        "wins": wins,
-        "loss": loss,
-        "breakeven": be,
-        "win_rate_sem_be": win_rate,
-        "win_rate_com_be": win_rate_com_be,
-        "pnl_pct_total": round(total_pnl_pct, 4),
-        "pnl_r_total": round(total_pnl_r, 4),
-        "event_counts": dict(event_counts.most_common()),
-        "block_reasons": dict(block_reasons.most_common(20)),
-        "by_bot": dict(by_bot),
-        "by_symbol": dict(by_symbol),
-        "by_setup": dict(by_setup),
+        "summary": payload.get("performance", {}),
+        "totals": payload.get("totals", {}),
+        "by_bot_closed": {bot: stats(rows) for bot, rows in closed_by_bot.items()},
+        "by_symbol_closed": {symbol: stats(rows) for symbol, rows in list(closed_by_symbol.items())[:50]},
+        "blocked_by_reason": dict(blocked_by_reason.most_common(30)),
     }
 
 
-def _fmt_pct(value):
-    if value is None:
-        return "N/A"
-    try:
-        sign = "+" if float(value) > 0 else ""
-        return f"{sign}{float(value):.2f}%".replace(".", ",")
-    except Exception:
-        return "N/A"
-
-
-def build_history_report(limit=80, bot=None, symbol=None, event_type=None):
-    payload = build_history_payload(limit=limit, bot=bot, symbol=symbol, event_type=event_type)
-    events = payload.get("events", [])
-    stats = build_riskstats_payload(limit=MAX_EXPORT_LIMIT)
+def build_riskstats_report():
+    payload = build_riskstats_payload()
+    summary = payload.get("summary", {})
     lines = [
-        "📚 SUPER HISTORY — CENTRAL QUANT",
-        "Versão: HISTORY V2 — EVENT LEDGER",
-        f"Data/hora: {data_hora_sp_str()}",
+        "📊 RISKSTATS — SUPER HISTORY",
+        f"Data/hora: {payload.get('generated_at')}",
         "",
-        f"Eventos exibidos: {len(events)}",
-        f"Eventos totais analisados: {stats.get('total_events')}",
-        f"ALLOW: {stats.get('allow')} | DENY: {stats.get('deny')}",
-        f"Trades encerrados: {stats.get('closed')}",
-        f"Wins: {stats.get('wins')} | Loss: {stats.get('loss')} | BE: {stats.get('breakeven')}",
-        f"Win rate sem BE: {_fmt_pct(stats.get('win_rate_sem_be'))}",
-        f"PnL % total registrado: {_fmt_pct(stats.get('pnl_pct_total'))}",
+        f"Trades encerrados: {payload.get('totals', {}).get('closed', 0)}",
+        f"Win rate: {summary.get('win_rate_pct', 0)}%",
+        f"PnL total: {summary.get('pnl_total_pct', 0)}%",
+        f"R total: {summary.get('r_total', 0)}R",
+        f"Profit Factor %: {summary.get('profit_factor_pct', 0)}",
         "",
         "Por robô:",
     ]
-    by_bot = stats.get("by_bot") or {}
-    if not by_bot:
-        lines.append("- Ainda sem eventos por robô.")
+    by_bot = payload.get("by_bot_closed", {})
+    if by_bot:
+        for bot, s in by_bot.items():
+            lines.append(f"- {bot}: {s.get('trades')} trades | WR {s.get('win_rate_pct')}% | PnL {s.get('pnl_total_pct')}% | PF {s.get('profit_factor_pct')}")
     else:
-        for bot_key, st in sorted(by_bot.items()):
-            lines.append(
-                f"- {bot_key}: eventos={st.get('events')} | allow={st.get('allow')} | deny={st.get('deny')} | "
-                f"fechados={st.get('closed')} | W/L/BE={st.get('wins')}/{st.get('loss')}/{st.get('be')} | "
-                f"PnL={_fmt_pct(st.get('pnl_pct'))}"
-            )
-    lines += ["", "Últimos eventos:"]
-    if not events:
-        lines.append("- Nenhum evento ainda.")
+        lines.append("- Ainda sem trades encerrados no Super History.")
+
+    blocked = payload.get("blocked_by_reason", {})
+    lines += ["", "Bloqueios por motivo:"]
+    if blocked:
+        for reason, count in blocked.items():
+            lines.append(f"- {reason}: {count}")
     else:
-        for e in events[-30:]:
-            lines.append(
-                f"- {e.get('ts')} | {e.get('source')} | {e.get('event_type')} | "
-                f"{e.get('bot') or 'N/A'} {e.get('symbol') or ''} {e.get('side') or ''} | "
-                f"result={e.get('result') or 'N/A'} | pnl={_fmt_pct(e.get('pnl_pct'))}"
-            )
-    lines += [
-        "",
-        "Fonte oficial:",
-        str(HISTORY_EVENTS_FILE),
-        "",
-        "Rotas disponíveis:",
-        "/history — resumo do histórico",
-        "/riskstats — estatísticas de risco/performance",
-        "/exporthistory — exportação em JSON para colar no ChatGPT",
-    ]
+        lines.append("- Ainda sem bloqueios registrados.")
     return "\n".join(lines)
 
 
-def build_riskstats_report(limit=MAX_EXPORT_LIMIT):
-    stats = build_riskstats_payload(limit=limit)
-    lines = [
-        "📊 RISKSTATS — SUPER CENTRAL QUANT",
-        "Versão: HISTORY V2 — EVENT LEDGER",
-        f"Data/hora: {data_hora_sp_str()}",
-        "",
-        f"Eventos analisados: {stats.get('total_events')}",
-        f"ALLOW: {stats.get('allow')} | DENY: {stats.get('deny')}",
-        f"Trades encerrados: {stats.get('closed')}",
-        f"Wins: {stats.get('wins')} | Loss: {stats.get('loss')} | Breakeven: {stats.get('breakeven')}",
-        f"Win rate sem BE: {_fmt_pct(stats.get('win_rate_sem_be'))}",
-        f"Win rate com BE: {_fmt_pct(stats.get('win_rate_com_be'))}",
-        f"PnL % total: {_fmt_pct(stats.get('pnl_pct_total'))}",
-        f"PnL R total: {stats.get('pnl_r_total')}",
-        "",
-        "Eventos por tipo:",
-    ]
-    for k, v in (stats.get("event_counts") or {}).items():
-        lines.append(f"- {k}: {v}")
-    lines += ["", "Bloqueios mais comuns:"]
-    reasons = stats.get("block_reasons") or {}
-    if not reasons:
-        lines.append("- Ainda sem motivos de bloqueio registrados.")
-    else:
-        for k, v in reasons.items():
-            lines.append(f"- {v}x | {k}")
-    lines += ["", "Por robô:"]
-    for bot_key, st in sorted((stats.get("by_bot") or {}).items()):
-        lines.append(f"- {bot_key}: eventos={st.get('events')} | allow={st.get('allow')} | deny={st.get('deny')} | fechados={st.get('closed')} | W/L/BE={st.get('wins')}/{st.get('loss')}/{st.get('be')} | PnL={_fmt_pct(st.get('pnl_pct'))}")
-    return "\n".join(lines)
-
-
-def build_export_payload(limit=MAX_EXPORT_LIMIT):
-    payload = {
-        "ok": True,
-        "version": "HISTORY_V2_EVENT_LEDGER",
-        "generated_at": data_hora_sp_str(),
-        "history": build_history_payload(limit=limit),
-        "riskstats": build_riskstats_payload(limit=limit),
-        "shadow_positions": _read_json(SHADOW_POSITIONS_FILE, {}),
-        "execution_stats": _read_json(EXECUTION_STATS_FILE, {}),
-        "files": {
-            "official_ledger": str(HISTORY_EVENTS_FILE),
-            "legacy_decision_log": str(DECISION_LOG_FILE),
-            "legacy_timeline": str(TIMELINE_LOG_FILE),
-            "history_seen": str(HISTORY_SEEN_FILE),
-        },
-    }
+def build_export_payload():
+    payload = build_history_payload(limit=HISTORY_MAX_READ)
+    payload["riskstats"] = build_riskstats_payload()
     _write_json(HISTORY_EXPORT_FILE, payload)
     return payload
 
 
-def build_export_report(limit=MAX_EXPORT_LIMIT):
-    return json.dumps(build_export_payload(limit=limit), ensure_ascii=False, indent=2, default=_json_default)
-
-
-def wrap_central_functions(globals_dict):
-    """
-    Conecta o History nas funcoes ja existentes da Central, sem quebrar o main.py.
-
-    V2:
-    - append_decision_log continua gravando o arquivo legado, mas também registra UM evento no ledger.
-    - append_timeline_event continua gravando o arquivo legado, mas só registra no ledger quando NÃO for evento de decisão já coberto por append_decision_log.
-    - /history e /riskstats leem apenas history_events.jsonl.
-    """
-    try:
-        original_timeline = globals_dict.get("append_timeline_event")
-        if callable(original_timeline) and not getattr(original_timeline, "_history_wrapped", False):
-            def append_timeline_event_wrapped(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None):
-                result = original_timeline(event_type, bot=bot, symbol=symbol, side=side, trade_id=trade_id, state=state, details=details)
-                try:
-                    et = _safe_upper(event_type)
-                    # Eventos decisórios já são cobertos pelo decision_hook.
-                    # Isso evita TRADE_BLOCKED + RISK_DENY duplicados para a mesma tentativa.
-                    if et not in {"RISK_DENY", "RISK_ALLOW", "TRADE_BLOCKED", "TRADE_ALLOWED"}:
-                        log_event(event_type, {
-                            "bot": bot,
-                            "symbol": symbol,
-                            "side": side,
-                            "trade_id": trade_id,
-                            "status": state,
-                            "details": details,
-                        }, source="timeline_hook", trade_id=trade_id)
-                except Exception as exc:
-                    print("ERRO HISTORY timeline hook:", exc)
-                return result
-            append_timeline_event_wrapped._history_wrapped = True
-            globals_dict["append_timeline_event"] = append_timeline_event_wrapped
-
-        original_decision = globals_dict.get("append_decision_log")
-        if callable(original_decision) and not getattr(original_decision, "_history_wrapped", False):
-            def append_decision_log_wrapped(payload, decision_result):
-                result = original_decision(payload, decision_result)
-                try:
-                    data = dict(result or {})
-                    allowed = bool(data.get("allowed"))
-                    data.setdefault("result", "ALLOW" if allowed else "DENY")
-                    log_event("TRADE_ALLOWED" if allowed else "TRADE_BLOCKED", data, source="decision_hook", trade_id=data.get("trade_id"))
-                except Exception as exc:
-                    print("ERRO HISTORY decision hook:", exc)
-                return result
-            append_decision_log_wrapped._history_wrapped = True
-            globals_dict["append_decision_log"] = append_decision_log_wrapped
-
-        globals_dict["build_history_report"] = build_history_report
-        globals_dict["build_riskstats_report"] = build_riskstats_report
-        globals_dict["build_export_report"] = build_export_report
-        return True
-    except Exception as exc:
-        print("ERRO HISTORY wrap_central_functions:", exc)
-        return False
+def build_export_report():
+    payload = build_export_payload()
+    return (
+        "📦 EXPORT HISTORY — CENTRAL QUANT\n\n"
+        f"Arquivo gerado: {HISTORY_EXPORT_FILE}\n"
+        f"Eventos exportados: {payload.get('totals', {}).get('events', 0)}\n"
+        f"Gerado em: {payload.get('generated_at')}"
+    )
