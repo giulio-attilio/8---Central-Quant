@@ -871,6 +871,57 @@ def eventbus_emit_route():
     return result, status
 
 
+@app.route("/history/hooks/status")
+def history_hooks_status_route():
+    """Diagnóstico simples para confirmar se os hooks do History foram instalados."""
+    try:
+        import history_manager as super_history_manager
+        history_loaded = True
+        history_error = None
+    except Exception as exc:
+        super_history_manager = None
+        history_loaded = False
+        history_error = str(exc)
+
+    append_decision = globals().get("append_decision_log")
+    append_timeline = globals().get("append_timeline_event")
+
+    return {
+        "ok": bool(history_loaded),
+        "history_manager_loaded": history_loaded,
+        "history_manager_error": history_error,
+        "append_decision_log_exists": callable(append_decision),
+        "append_decision_log_wrapped": bool(getattr(append_decision, "_history_wrapped", False)),
+        "append_timeline_event_exists": callable(append_timeline),
+        "append_timeline_event_wrapped": bool(getattr(append_timeline, "_history_wrapped", False)),
+        "build_history_report_source": str(globals().get("build_history_report")),
+    }
+
+
+@app.route("/eventbus/test/falcon")
+def eventbus_test_falcon_route():
+    """Emite um evento de teste FALCON no Event Bus para validar gravação no Super History."""
+    if central_event_bus is None:
+        return {"ok": False, "error": EVENT_BUS_IMPORT_ERROR or "event_bus import failed"}, 500
+
+    payload = {
+        "event_type": "SYSTEM_TEST",
+        "source": "manual_eventbus_test",
+        "bot": "FALCON",
+        "symbol": "TESTUSDT",
+        "side": "LONG",
+        "setup": "FALCON_TEST",
+        "trade_id": f"FALCON-TEST-{int(time.time())}",
+        "result": "TEST",
+        "risk_pct": 0.0,
+        "score": 100,
+        "dedupe": False,
+    }
+    result = central_event_bus.emit_from_http(payload)
+    status = 200 if result.get("ok") else 500
+    return result, status
+
+
 @app.route("/health")
 def health():
     return central_watchdog_status()
