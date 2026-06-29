@@ -612,6 +612,11 @@ def start_enabled_bots():
         try:
             memory_profile_step(f"before_load_bot_{key}")
             LOADED_BOTS[key] = load_bot(key, cfg)
+            try:
+                import history_manager as super_history_manager
+                super_history_manager.wrap_bot_module(LOADED_BOTS[key], key)
+            except Exception as _history_wrap_exc:
+                print(f"AVISO HISTORY WRAP BOT {key}: {_history_wrap_exc}")
             print(f"BOT CARREGADO: {key} - {cfg['name']}")
             memory_profile_step(f"after_load_bot_{key}")
             if (current_rss_mb() or 0) >= MEMORY_GC_THRESHOLD_MB:
