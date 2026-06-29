@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-4-HISTORY-HOOKS-PROD
+# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-5-RISK-SNAPSHOT
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -3432,6 +3432,35 @@ def build_risk_report():
         "Importante:",
         "Este Risk Manager responde ALLOW/DENY em /can_open_trade. Para bloquear entradas reais/VERIFY, o robô precisa consultar esta rota antes de executar.",
     ]
+    try:
+        import history_manager as _risk_history_manager
+        _risk_history_manager.log_event(
+            "RISK_SNAPSHOT",
+            {
+                "bot": "CENTRAL",
+                "source": "risk_report",
+                "total_positions_open": total_pos,
+                "long_positions_open": long_pos,
+                "short_positions_open": short_pos,
+                "global_limit": GLOBAL_RISK_MAX_POSITIONS,
+                "side_concentration_limit_pct": GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT,
+                "symbol_exposure_limit": GLOBAL_RISK_MAX_SYMBOL_EXPOSURE,
+                "memory_block_pct": GLOBAL_RISK_MEMORY_BLOCK_PCT,
+                "memory": mem,
+                "notes": notes,
+                "blocks": blocks,
+                "repeated_symbols": [
+                    {"symbol": sym, "count": count, "bots": bots}
+                    for sym, count, bots in repeated
+                ],
+                "result": "SNAPSHOT",
+            },
+            source="risk_report",
+            trade_id=f"RISK-SNAPSHOT-{int(time.time())}",
+        )
+    except Exception as exc:
+        print("ERRO HISTORY risk snapshot:", exc)
+
     return "\n".join(lines)
 
 
