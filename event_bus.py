@@ -107,19 +107,36 @@ def emit_from_http(payload):
 
     uid = _uid(payload)
     if _seen(uid):
-        return {"ok": True, "dedup": True, "uid": uid}
+        return {"ok": True, "dedup": True, "uid": uid, "event_bus_logged": True, "history_logged": False}
 
     item = dict(payload)
     item.setdefault("received_at", data_hora_sp_str())
     item.setdefault("epoch", time.time())
     item["uid"] = uid
-    _append_jsonl(EVENT_BUS_LOG_FILE, item)
+    event_bus_logged = _append_jsonl(EVENT_BUS_LOG_FILE, item)
+    if not event_bus_logged:
+        return {"ok": False, "uid": uid, "error": "falha ao gravar event_bus.jsonl", "event_bus_logged": False}
 
     if history_manager is None:
-        return {"ok": False, "uid": uid, "error": HISTORY_MANAGER_ERROR or "history_manager indisponível"}
+        return {
+            "ok": True,
+            "uid": uid,
+            "event_bus_logged": True,
+            "history_logged": False,
+            "error": HISTORY_MANAGER_ERROR or "history_manager indisponível",
+        }
 
     event_type = item.get("event") or item.get("event_type") or item.get("type") or "EVENT"
     source = item.get("source") or item.get("bot") or "event_bus"
     trade_id = item.get("trade_id") or item.get("position_id")
-    result = history_manager.log_event(event_type, item, source=source, trade_id=trade_id)
-    return {"ok": bool(result.get("ok", True)), "uid": uid, "history": result}
+    try:
+        result = history_manager.log_event(event_type, item, source=source, trade_id=trade_id)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+    return {
+        "ok": bool(result.get("ok", True)),
+        "uid": uid,
+        "event_bus_logged": True,
+        "history_logged": bool(result.get("ok", False)),
+        "history": result,
+    }

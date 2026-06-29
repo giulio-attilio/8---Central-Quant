@@ -145,6 +145,23 @@ def normalize_side(side):
     return s
 
 
+def get_status():
+    """Retorna um resumo simples do estado local do history manager."""
+    return {
+        "ok": True,
+        "data_dir": str(DATA_DIR),
+        "events_file": str(HISTORY_EVENTS_FILE),
+        "decision_log_file": str(DECISION_LOG_FILE),
+        "timeline_file": str(TIMELINE_LOG_FILE),
+        "export_file": str(HISTORY_EXPORT_FILE),
+        "seen_file": str(HISTORY_SEEN_FILE),
+        "max_read": HISTORY_MAX_READ,
+        "report_days": HISTORY_REPORT_DAYS,
+        "dedup_enabled": HISTORY_DEDUP_ENABLED,
+        "dedup_max_keys": HISTORY_DEDUP_MAX_KEYS,
+    }
+
+
 def _first(payload, keys, default=None):
     if not isinstance(payload, dict):
         return default
@@ -254,16 +271,19 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
 
 
 def log_event(event_type, payload=None, source=None, trade_id=None):
-    item = normalize_payload(event_type, payload, source=source, trade_id=trade_id)
-    uid = item.get("uid")
-    if uid and _dedup_seen(uid):
-        return {"ok": True, "dedup": True, "uid": uid}
-    ok = _append_jsonl(HISTORY_EVENTS_FILE, item)
-    if item.get("event") in {"RISK_DECISION", "RISK_ALLOW", "RISK_DENY", "TRADE_BLOCKED"}:
-        _append_jsonl(DECISION_LOG_FILE, item)
-    if item.get("event") not in {"CENTRAL_COMMAND", "BOT_COMMAND"}:
-        _append_jsonl(TIMELINE_LOG_FILE, item)
-    return {"ok": ok, "dedup": False, "event": item}
+    try:
+        item = normalize_payload(event_type, payload, source=source, trade_id=trade_id)
+        uid = item.get("uid")
+        if uid and _dedup_seen(uid):
+            return {"ok": True, "dedup": True, "uid": uid}
+        ok = _append_jsonl(HISTORY_EVENTS_FILE, item)
+        if ok and item.get("event") in {"RISK_DECISION", "RISK_ALLOW", "RISK_DENY", "TRADE_BLOCKED"}:
+            _append_jsonl(DECISION_LOG_FILE, item)
+        if ok and item.get("event") not in {"CENTRAL_COMMAND", "BOT_COMMAND"}:
+            _append_jsonl(TIMELINE_LOG_FILE, item)
+        return {"ok": ok, "dedup": False, "event": item}
+    except Exception as exc:
+        return {"ok": False, "dedup": False, "error": str(exc), "event": {"event_type": event_type, "payload": payload}}
 
 
 def _log_from_trade_event(evento, source=None):
