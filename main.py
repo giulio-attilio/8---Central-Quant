@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-28-SUPER-CENTRAL-QUANT-V4-1-QUANT-EVENTS
+# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-4-HISTORY-HOOKS-PROD
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -897,29 +897,6 @@ def history_hooks_status_route():
         "build_history_report_source": str(globals().get("build_history_report")),
     }
 
-
-@app.route("/eventbus/test/falcon")
-def eventbus_test_falcon_route():
-    """Emite um evento de teste FALCON no Event Bus para validar gravação no Super History."""
-    if central_event_bus is None:
-        return {"ok": False, "error": EVENT_BUS_IMPORT_ERROR or "event_bus import failed"}, 500
-
-    payload = {
-        "event_type": "SYSTEM_TEST",
-        "source": "manual_eventbus_test",
-        "bot": "FALCON",
-        "symbol": "TESTUSDT",
-        "side": "LONG",
-        "setup": "FALCON_TEST",
-        "trade_id": f"FALCON-TEST-{int(time.time())}",
-        "result": "TEST",
-        "risk_pct": 0.0,
-        "score": 100,
-        "dedupe": False,
-    }
-    result = central_event_bus.emit_from_http(payload)
-    status = 200 if result.get("ok") else 500
-    return result, status
 
 
 @app.route("/health")
