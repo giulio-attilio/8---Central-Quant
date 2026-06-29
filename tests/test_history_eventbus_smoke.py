@@ -58,6 +58,29 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.assertTrue(result["event_bus_logged"])
         self.assertIn("uid", result)
 
+    def test_load_events_filters_and_aggregation(self):
+        history_manager.log_event("SIGNAL_CREATED", {"symbol": "BTCUSDT", "side": "buy", "setup": "breakout", "trade_id": "A1"}, source="falcon", trade_id="A1")
+        history_manager.log_event("TRADE_OPENED", {"symbol": "BTCUSDT", "side": "buy", "setup": "breakout", "trade_id": "A2"}, source="falcon", trade_id="A2")
+        history_manager.log_event("TRADE_CLOSED", {"symbol": "ETHUSDT", "side": "sell", "setup": "trend", "trade_id": "A3", "result_pct": 1.5, "reason": "take_profit"}, source="meme", trade_id="A3")
+        history_manager.log_event("TRADE_CLOSED", {"symbol": "ETHUSDT", "side": "sell", "setup": "trend", "trade_id": "A4", "result_pct": -0.5, "reason": "stop"}, source="meme", trade_id="A4")
+
+        filtered = history_manager.load_events(filters={"bot": "falcon"})
+        self.assertEqual(len(filtered), 2)
+
+        stats = history_manager.calculate_stats()
+        self.assertGreaterEqual(stats["total_events"], 4)
+        self.assertGreaterEqual(stats["signals"], 1)
+        self.assertGreaterEqual(stats["entries"], 1)
+        self.assertGreaterEqual(stats["closed"], 2)
+        self.assertGreaterEqual(stats["wins"], 1)
+        self.assertGreaterEqual(stats["losses"], 1)
+        self.assertGreaterEqual(stats["stops"], 1)
+        self.assertGreaterEqual(stats["pnl_total_pct"], 1.0)
+
+        grouped = history_manager.group_stats(group_by="bot")
+        self.assertIn("FALCON", grouped)
+        self.assertIn("MEME", grouped)
+
 
 if __name__ == "__main__":
     unittest.main()

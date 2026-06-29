@@ -386,8 +386,122 @@ def wrap_central_functions(globals_dict):
     return True
 
 
-def load_events(limit=None):
-    return _read_jsonl_tail(HISTORY_EVENTS_FILE, limit=limit or HISTORY_MAX_READ)
+def load_events(limit=None, filters=None):
+    events = _read_jsonl_tail(HISTORY_EVENTS_FILE, limit=limit or HISTORY_MAX_READ)
+    if not filters:
+        return events
+
+    filters = filters or {}
+    bot = str(filters.get("bot") or "").strip().upper()
+    symbol = str(filters.get("symbol") or "").strip().upper()
+    setup = str(filters.get("setup") or "").strip().upper()
+    event_type = str(filters.get("event_type") or "").strip().upper()
+    date_from = filters.get("date_from")
+    date_to = filters.get("date_to")
+
+    def _match_date(ts_value):
+        if not ts_value:
+            return True
+        try:
+            dt = datetime.strptime(str(ts_value), "%d/%m/%Y %H:%M")
+        except Exception:
+            return True
+        if date_from:
+            try:
+                if dt < datetime.strptime(str(date_from), "%d/%m/%Y %H:%M"):
+                    return False
+            except Exception:
+                pass
+        if date_to:
+            try:
+                if dt > datetime.strptime(str(date_to), "%d/%m/%Y %H:%M"):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    filtered = []
+    for event in events:
+        if bot and str(event.get("bot") or "").upper() != bot:
+            continue
+        if symbol and str(event.get("symbol") or "").upper() != symbol:
+            continue
+        if setup and str(event.get("setup") or "").upper() != setup:
+            continue
+        if event_type and str(event.get("event") or "").upper() != event_type:
+            continue
+        if not _match_date(event.get("ts")):
+            continue
+        filtered.append(event)
+    return filtered
+
+
+def calculate_stats(events=None, filters=None, rows=None):
+    rows = rows if rows is not None else (events if events is not None else load_events(filters=filters))
+    rows = list(rows or [])
+    totals = {
+        "total_events": len(rows),
+        "signals": 0,
+        "entries": 0,
+        "closed": 0,
+        "wins": 0,
+        "losses": 0,
+        "breakeven": 0,
+        "tp50": 0,
+        "stops": 0,
+        "pnl_total_pct": 0.0,
+        "pnl_avg_pct": 0.0,
+    }
+
+    for event in rows:
+        event_name = str(event.get("event") or "").upper()
+        if event_name in {"SIGNAL_CREATED", "SIGNAL"}:
+            totals["signals"] += 1
+        if event_name in {"TRADE_OPENED", "ENTRY", "OPEN", "TRADE_OPENED"}:
+            totals["entries"] += 1
+        if event_name in {"TRADE_CLOSED", "CLOSED", "CLOSE", "EXIT"}:
+            totals["closed"] += 1
+        if event_name == "TP50_HIT":
+            totals["tp50"] += 1
+        if event_name in {"STOP", "SL", "SL100", "TRADE_CLOSED"} and str(event.get("reason") or "").upper() in {"STOP", "STOP_LOSS", "SL", "STOPLOSS"}:
+            totals["stops"] += 1
+        if event_name in {"TRADE_CLOSED", "CLOSED", "CLOSE", "EXIT"}:
+            pnl = _safe_float(event.get("result_pct"), None)
+            if pnl is not None:
+                totals["pnl_total_pct"] += pnl
+                if pnl > 0:
+                    totals["wins"] += 1
+                elif pnl < 0:
+                    totals["losses"] += 1
+                else:
+                    totals["breakeven"] += 1
+
+    if totals["closed"]:
+        totals["pnl_avg_pct"] = round(totals["pnl_total_pct"] / totals["closed"], 4)
+    else:
+        totals["pnl_avg_pct"] = 0.0
+    totals["pnl_total_pct"] = round(totals["pnl_total_pct"], 4)
+    return totals
+
+
+def group_stats(group_by="bot", events=None, filters=None):
+    rows = events if events is not None else load_events(filters=filters)
+    rows = list(rows or [])
+    if group_by not in {"bot", "symbol", "setup"}:
+        raise ValueError("group_by deve ser 'bot', 'symbol' ou 'setup'")
+
+    buckets = defaultdict(list)
+    for event in rows:
+        key = None
+        if group_by == "bot":
+            key = str(event.get("bot") or "N/A").upper()
+        elif group_by == "symbol":
+            key = str(event.get("symbol") or "N/A").upper()
+        else:
+            key = str(event.get("setup") or "N/A").upper()
+        buckets[key].append(event)
+
+    return {key: calculate_stats(rows=items) for key, items in sorted(buckets.items())}
 
 
 def build_history_payload(limit=None):
