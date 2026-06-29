@@ -1,24 +1,22 @@
 # ==========================================================
 # SUPER CENTRAL QUANT - HISTORY MANAGER
-# Versao: 2026-06-28-HISTORY-V1
+# Versao: 2026-06-29-HISTORY-V2-EVENT-LEDGER
 #
 # Objetivo:
-# - Criar um historico persistente simples e profissional para a Central Quant.
-# - Salvar eventos em JSONL dentro da pasta data/.
-# - Consolidar decision_log, timeline e snapshots ja existentes.
+# - Transformar history_events.jsonl no ledger oficial da Super Central Quant.
+# - Evitar duplicidade entre history_events, decision_log e timeline.
 # - Expor relatorios: /history, /riskstats e /exporthistory.
 #
-# Importante:
-# - Nao executa trades.
-# - Nao altera estrategia dos robos.
-# - Funciona mesmo se nenhum bot estiver carregado.
-# - Usa arquivos locais do Render. Em plano free, dados podem ser perdidos em redeploy/rebuild.
-#   Futuramente, o ideal e migrar para Postgres/Supabase/Neon.
+# Regra V2:
+# - /history e /riskstats leem APENAS history_events.jsonl.
+# - decision_log.jsonl e timeline.jsonl ficam apenas como compatibilidade/depuracao.
+# - Hooks da Central registram no ledger, mas as importacoes antigas nao sao mais somadas.
 # ==========================================================
 
 import os
 import json
 import time
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
@@ -35,9 +33,16 @@ TIMELINE_LOG_FILE = DATA_DIR / "timeline.jsonl"
 EXECUTION_STATS_FILE = DATA_DIR / "execution_stats.json"
 SHADOW_POSITIONS_FILE = DATA_DIR / "shadow_positions.json"
 STATUS_SNAPSHOTS_FILE = DATA_DIR / "status_snapshots.jsonl"
+HISTORY_SEEN_FILE = DATA_DIR / "history_seen.json"
 
 DEFAULT_LIMIT = int(os.environ.get("HISTORY_DEFAULT_LIMIT", "5000"))
 MAX_EXPORT_LIMIT = int(os.environ.get("HISTORY_MAX_EXPORT_LIMIT", "20000"))
+HISTORY_DEDUPE_ENABLED = str(os.environ.get("HISTORY_DEDUPE_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+HISTORY_MAX_SEEN_KEYS = int(os.environ.get("HISTORY_MAX_SEEN_KEYS", "30000"))
+
+# Se algum dia você quiser voltar a somar decision_log/timeline no /history,
+# mude para true. O padrão V2 é false.
+HISTORY_INCLUDE_LEGACY_IMPORTS = str(os.environ.get("HISTORY_INCLUDE_LEGACY_IMPORTS", "false")).lower() in {"1", "true", "yes", "sim", "on"}
 
 
 def agora_sp():
@@ -139,23 +144,73 @@ def _write_json(path, payload):
         return False
 
 
+def _event_fingerprint(event_type, data, source, trade_id):
+    data = data if isinstance(data, dict) else {"value": data}
+    explicit = data.get("dedupe_key") or data.get("event_id") or data.get("idempotency_key")
+    if explicit:
+        return str(explicit)
+
+    # Deduplicação operacional: para decisões, usa trade_id + tipo + bot/symbol/side.
+    # Isso evita que decision_log, timeline_hook e decision_hook contem 3-4 vezes a mesma ocorrência.
+    basis = {
+        "event_type": _safe_upper(event_type or "EVENT"),
+        "source": str(source or "central"),
+        "trade_id": str(trade_id or data.get("trade_id") or data.get("id") or ""),
+        "bot": _safe_upper(data.get("bot") or data.get("robot") or data.get("strategy")),
+        "symbol": _normalize_symbol(data.get("symbol") or data.get("ativo") or data.get("pair")),
+        "side": _safe_upper(data.get("side") or data.get("direction") or data.get("lado")),
+        "setup": str(data.get("setup") or data.get("setup_label") or ""),
+        "result": _safe_upper(data.get("result") or data.get("resultado") or data.get("status") or data.get("decision")),
+        "minute": data_hora_sp_str(),
+    }
+    txt = json.dumps(basis, ensure_ascii=False, sort_keys=True, default=_json_default)
+    return hashlib.sha256(txt.encode("utf-8")).hexdigest()[:32]
+
+
+def _seen_contains_or_add(key):
+    if not HISTORY_DEDUPE_ENABLED:
+        return False
+    data = _read_json(HISTORY_SEEN_FILE, {"keys": []})
+    keys = data.get("keys") if isinstance(data, dict) else []
+    if not isinstance(keys, list):
+        keys = []
+    if key in set(keys):
+        return True
+    keys.append(key)
+    if len(keys) > HISTORY_MAX_SEEN_KEYS:
+        keys = keys[-HISTORY_MAX_SEEN_KEYS:]
+    _write_json(HISTORY_SEEN_FILE, {"updated_at": data_hora_sp_str(), "keys": keys})
+    return False
+
+
 def log_event(event_type, data=None, source="central", trade_id=None):
     """
-    Registro universal do History.
+    Registro universal do History Ledger.
 
-    Exemplos:
-    log_event("trade_opened", {"bot":"TURTLE", "symbol":"ETHUSDT"})
-    log_event("trade_closed", {"bot":"FALCON", "symbol":"BTCUSDT", "pnl_pct": 1.2, "result":"WIN"})
-    log_event("trade_blocked", {"bot":"PREDATOR", "reason":"risco alto"})
+    A partir da V2, este é o caminho oficial de eventos da Super Central Quant.
+    /history e /riskstats leem somente history_events.jsonl por padrão.
     """
     data = data if isinstance(data, dict) else {"value": data}
     bot = data.get("bot") or data.get("robot") or data.get("strategy")
     symbol = data.get("symbol") or data.get("ativo") or data.get("pair")
     side = data.get("side") or data.get("direction") or data.get("lado")
     setup = data.get("setup") or data.get("setup_label")
-    result = data.get("result") or data.get("resultado") or data.get("status")
+    result = data.get("result") or data.get("resultado") or data.get("status") or data.get("decision")
+
+    key = _event_fingerprint(event_type, data, source, trade_id)
+    if _seen_contains_or_add(key):
+        return {
+            "ok": True,
+            "duplicate": True,
+            "dedupe_key": key,
+            "event_type": _safe_upper(event_type or "EVENT"),
+            "source": str(source or "central"),
+        }
 
     item = {
+        "schema": 2,
+        "event_id": data.get("event_id") or f"evt_{int(time.time() * 1000)}_{key[:8]}",
+        "dedupe_key": key,
         "ts": data_hora_sp_str(),
         "ts_iso": iso_sp_str(),
         "epoch": time.time(),
@@ -170,13 +225,14 @@ def log_event(event_type, data=None, source="central", trade_id=None):
         "pnl_pct": _safe_float(data.get("pnl_pct") or data.get("pnl") or data.get("result_pct"), None),
         "pnl_r": _safe_float(data.get("pnl_r") or data.get("result_r"), None),
         "risk_pct": _safe_float(data.get("risk_pct") or data.get("risk") or data.get("risco"), None),
-        "score": _safe_float(data.get("score"), None),
+        "score": _safe_float(data.get("score") or data.get("score_falcon") or data.get("score_predator"), None),
         "raw": data,
     }
     _append_jsonl(HISTORY_EVENTS_FILE, item)
     return item
 
 
+# Mantidas para compatibilidade/depuração, mas NÃO são usadas por padrão no /history V2.
 def import_decision_log(limit=MAX_EXPORT_LIMIT):
     rows = _read_jsonl(DECISION_LOG_FILE, limit=limit)
     converted = []
@@ -225,11 +281,13 @@ def import_timeline(limit=MAX_EXPORT_LIMIT):
     return converted
 
 
-def all_history_events(limit=DEFAULT_LIMIT, include_imports=True):
+def all_history_events(limit=DEFAULT_LIMIT, include_imports=None):
+    if include_imports is None:
+        include_imports = HISTORY_INCLUDE_LEGACY_IMPORTS
     events = _read_jsonl(HISTORY_EVENTS_FILE, limit=limit)
     if include_imports:
         events = events + import_decision_log(limit=limit) + import_timeline(limit=limit)
-    events = [e for e in events if isinstance(e, dict)]
+    events = [e for e in events if isinstance(e, dict) and not e.get("duplicate")]
     events.sort(key=lambda x: float(x.get("epoch") or 0))
     if limit and len(events) > int(limit):
         events = events[-int(limit):]
@@ -253,24 +311,26 @@ def _filter_events(events, bot=None, symbol=None, event_type=None):
 
 
 def build_history_payload(limit=1000, bot=None, symbol=None, event_type=None):
-    events = all_history_events(limit=limit, include_imports=True)
+    events = all_history_events(limit=limit, include_imports=False)
     events = _filter_events(events, bot=bot, symbol=symbol, event_type=event_type)
     return {
         "ok": True,
+        "version": "HISTORY_V2_EVENT_LEDGER",
         "generated_at": data_hora_sp_str(),
         "total_events": len(events),
         "filters": {"bot": bot, "symbol": symbol, "event_type": event_type},
         "events": events,
         "files": {
             "history_events": str(HISTORY_EVENTS_FILE),
-            "decision_log": str(DECISION_LOG_FILE),
-            "timeline": str(TIMELINE_LOG_FILE),
+            "decision_log_legacy": str(DECISION_LOG_FILE),
+            "timeline_legacy": str(TIMELINE_LOG_FILE),
+            "seen": str(HISTORY_SEEN_FILE),
         },
     }
 
 
 def build_riskstats_payload(limit=MAX_EXPORT_LIMIT):
-    events = all_history_events(limit=limit, include_imports=True)
+    events = all_history_events(limit=limit, include_imports=False)
     by_bot = defaultdict(lambda: {"events": 0, "allow": 0, "deny": 0, "closed": 0, "wins": 0, "loss": 0, "be": 0, "pnl_pct": 0.0, "pnl_r": 0.0})
     by_symbol = defaultdict(lambda: {"events": 0, "allow": 0, "deny": 0, "closed": 0, "wins": 0, "loss": 0, "be": 0, "pnl_pct": 0.0, "pnl_r": 0.0})
     by_setup = defaultdict(lambda: {"events": 0, "allow": 0, "deny": 0, "closed": 0, "wins": 0, "loss": 0, "be": 0, "pnl_pct": 0.0, "pnl_r": 0.0})
@@ -292,7 +352,7 @@ def build_riskstats_payload(limit=MAX_EXPORT_LIMIT):
             st["allow"] += 1
         if et in {"TRADE_BLOCKED", "RISK_DENY"} or res == "DENY":
             st["deny"] += 1
-        if et in {"TRADE_CLOSED", "CLOSED", "STOP_HIT", "TP_HIT"} or res in {"WIN", "LOSS", "BE", "BREAKEVEN"}:
+        if et in {"TRADE_CLOSED", "CLOSED", "STOP_HIT", "TP_HIT", "STOP", "TRAIL"} or res in {"WIN", "LOSS", "BE", "BREAKEVEN"}:
             st["closed"] += 1
             if res == "WIN":
                 st["wins"] += 1
@@ -320,7 +380,7 @@ def build_riskstats_payload(limit=MAX_EXPORT_LIMIT):
             if isinstance(reasons, list):
                 for reason in reasons[:5]:
                     block_reasons[str(reason)[:120]] += 1
-        if et in {"TRADE_CLOSED", "CLOSED", "STOP_HIT", "TP_HIT"} or res in {"WIN", "LOSS", "BE", "BREAKEVEN"}:
+        if et in {"TRADE_CLOSED", "CLOSED", "STOP_HIT", "TP_HIT", "STOP", "TRAIL"} or res in {"WIN", "LOSS", "BE", "BREAKEVEN"}:
             closed += 1
             if res == "WIN":
                 wins += 1
@@ -342,6 +402,7 @@ def build_riskstats_payload(limit=MAX_EXPORT_LIMIT):
 
     return {
         "ok": True,
+        "version": "HISTORY_V2_EVENT_LEDGER",
         "generated_at": data_hora_sp_str(),
         "total_events": len(events),
         "allow": allow,
@@ -378,6 +439,7 @@ def build_history_report(limit=80, bot=None, symbol=None, event_type=None):
     stats = build_riskstats_payload(limit=MAX_EXPORT_LIMIT)
     lines = [
         "📚 SUPER HISTORY — CENTRAL QUANT",
+        "Versão: HISTORY V2 — EVENT LEDGER",
         f"Data/hora: {data_hora_sp_str()}",
         "",
         f"Eventos exibidos: {len(events)}",
@@ -412,6 +474,9 @@ def build_history_report(limit=80, bot=None, symbol=None, event_type=None):
             )
     lines += [
         "",
+        "Fonte oficial:",
+        str(HISTORY_EVENTS_FILE),
+        "",
         "Rotas disponíveis:",
         "/history — resumo do histórico",
         "/riskstats — estatísticas de risco/performance",
@@ -424,6 +489,7 @@ def build_riskstats_report(limit=MAX_EXPORT_LIMIT):
     stats = build_riskstats_payload(limit=limit)
     lines = [
         "📊 RISKSTATS — SUPER CENTRAL QUANT",
+        "Versão: HISTORY V2 — EVENT LEDGER",
         f"Data/hora: {data_hora_sp_str()}",
         "",
         f"Eventos analisados: {stats.get('total_events')}",
@@ -455,11 +521,18 @@ def build_riskstats_report(limit=MAX_EXPORT_LIMIT):
 def build_export_payload(limit=MAX_EXPORT_LIMIT):
     payload = {
         "ok": True,
+        "version": "HISTORY_V2_EVENT_LEDGER",
         "generated_at": data_hora_sp_str(),
         "history": build_history_payload(limit=limit),
         "riskstats": build_riskstats_payload(limit=limit),
         "shadow_positions": _read_json(SHADOW_POSITIONS_FILE, {}),
         "execution_stats": _read_json(EXECUTION_STATS_FILE, {}),
+        "files": {
+            "official_ledger": str(HISTORY_EVENTS_FILE),
+            "legacy_decision_log": str(DECISION_LOG_FILE),
+            "legacy_timeline": str(TIMELINE_LOG_FILE),
+            "history_seen": str(HISTORY_SEEN_FILE),
+        },
     }
     _write_json(HISTORY_EXPORT_FILE, payload)
     return payload
@@ -472,8 +545,11 @@ def build_export_report(limit=MAX_EXPORT_LIMIT):
 def wrap_central_functions(globals_dict):
     """
     Conecta o History nas funcoes ja existentes da Central, sem quebrar o main.py.
-    Deve ser chamado no final do main.py, depois que append_timeline_event e
-    append_decision_log ja existem.
+
+    V2:
+    - append_decision_log continua gravando o arquivo legado, mas também registra UM evento no ledger.
+    - append_timeline_event continua gravando o arquivo legado, mas só registra no ledger quando NÃO for evento de decisão já coberto por append_decision_log.
+    - /history e /riskstats leem apenas history_events.jsonl.
     """
     try:
         original_timeline = globals_dict.get("append_timeline_event")
@@ -481,14 +557,18 @@ def wrap_central_functions(globals_dict):
             def append_timeline_event_wrapped(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None):
                 result = original_timeline(event_type, bot=bot, symbol=symbol, side=side, trade_id=trade_id, state=state, details=details)
                 try:
-                    log_event(event_type, {
-                        "bot": bot,
-                        "symbol": symbol,
-                        "side": side,
-                        "trade_id": trade_id,
-                        "status": state,
-                        "details": details,
-                    }, source="timeline_hook", trade_id=trade_id)
+                    et = _safe_upper(event_type)
+                    # Eventos decisórios já são cobertos pelo decision_hook.
+                    # Isso evita TRADE_BLOCKED + RISK_DENY duplicados para a mesma tentativa.
+                    if et not in {"RISK_DENY", "RISK_ALLOW", "TRADE_BLOCKED", "TRADE_ALLOWED"}:
+                        log_event(event_type, {
+                            "bot": bot,
+                            "symbol": symbol,
+                            "side": side,
+                            "trade_id": trade_id,
+                            "status": state,
+                            "details": details,
+                        }, source="timeline_hook", trade_id=trade_id)
                 except Exception as exc:
                     print("ERRO HISTORY timeline hook:", exc)
                 return result
@@ -501,15 +581,18 @@ def wrap_central_functions(globals_dict):
                 result = original_decision(payload, decision_result)
                 try:
                     data = dict(result or {})
-                    log_event("TRADE_ALLOWED" if data.get("allowed") else "TRADE_BLOCKED", data, source="decision_hook", trade_id=data.get("trade_id"))
+                    allowed = bool(data.get("allowed"))
+                    data.setdefault("result", "ALLOW" if allowed else "DENY")
+                    log_event("TRADE_ALLOWED" if allowed else "TRADE_BLOCKED", data, source="decision_hook", trade_id=data.get("trade_id"))
                 except Exception as exc:
                     print("ERRO HISTORY decision hook:", exc)
                 return result
             append_decision_log_wrapped._history_wrapped = True
             globals_dict["append_decision_log"] = append_decision_log_wrapped
 
-        # Sobrescreve o relatorio antigo da Central. A rota /history existente chama esse nome em tempo de execucao.
         globals_dict["build_history_report"] = build_history_report
+        globals_dict["build_riskstats_report"] = build_riskstats_report
+        globals_dict["build_export_report"] = build_export_report
         return True
     except Exception as exc:
         print("ERRO HISTORY wrap_central_functions:", exc)
