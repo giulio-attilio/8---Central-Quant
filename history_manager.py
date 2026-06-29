@@ -203,27 +203,57 @@ def _dedup_seen(uid):
         return False
 
 
-def classify_event(event_type, payload=None):
+def normalize_event_type(event_type, payload=None):
     et = str(event_type or "EVENT").upper().strip()
     p = payload if isinstance(payload, dict) else {}
-    status = str(_first(p, ["status", "state", "result", "decision"], "")).upper()
-    if et in {"SIGNAL", "SIGNAL_CREATED", "TRADE_OPENED", "ENTRY", "OPEN"}:
-        return "TRADE_OPENED" if et in {"TRADE_OPENED", "ENTRY", "OPEN"} else "SIGNAL_CREATED"
-    if et in {"TRADE_BLOCKED", "BLOCKED", "RISK_DENY"} or status in {"DENY", "DENIED", "BLOCKED"}:
-        return "TRADE_BLOCKED"
-    if et in {"TP50", "TP50_HIT"}:
-        return "TP50_HIT"
-    if et in {"BE", "BREAKEVEN", "SL50"}:
-        return "BREAKEVEN"
-    if et in {"TRAIL", "TRAILING", "TRAILING_UPDATED"}:
-        return "TRAILING_UPDATED"
-    if et in {"STOP", "SL", "SL100"}:
-        return "TRADE_CLOSED"
-    if et in {"CLOSE", "CLOSED", "TRADE_CLOSED", "EXIT"} or status in {"ENCERRADO", "CLOSED", "FECHADO"}:
-        return "TRADE_CLOSED"
-    if et in {"RISK_ALLOW", "RISK_DECISION"}:
-        return et
+    status = str(_first(p, ["status", "state", "result", "decision", "resultado"], "")).upper()
+
+    aliases = {
+        "SIGNAL": "SIGNAL_CREATED",
+        "SINAL": "SIGNAL_CREATED",
+        "SIGNAL_CREATED": "SIGNAL_CREATED",
+        "ENTRY": "TRADE_OPENED",
+        "ENTRADA": "TRADE_OPENED",
+        "OPEN": "TRADE_OPENED",
+        "TRADE_OPENED": "TRADE_OPENED",
+        "TP50": "TP50_HIT",
+        "TP50_HIT": "TP50_HIT",
+        "BE": "BREAKEVEN",
+        "BREAKEVEN": "BREAKEVEN",
+        "TRAIL": "TRAILING_UPDATED",
+        "TRAILING": "TRAILING_UPDATED",
+        "TRAILING_UPDATED": "TRAILING_UPDATED",
+        "STOP": "TRADE_CLOSED",
+        "SL": "TRADE_CLOSED",
+        "SL100": "TRADE_CLOSED",
+        "CLOSE": "TRADE_CLOSED",
+        "CLOSED": "TRADE_CLOSED",
+        "CLOSES": "TRADE_CLOSED",
+        "EXIT": "TRADE_CLOSED",
+        "ENCERRADO": "TRADE_CLOSED",
+        "FECHADO": "TRADE_CLOSED",
+        "TRADE_CLOSED": "TRADE_CLOSED",
+        "DENY": "TRADE_BLOCKED",
+        "DENIED": "TRADE_BLOCKED",
+        "BLOCKED": "TRADE_BLOCKED",
+        "TRADING_BLOCKED": "TRADE_BLOCKED",
+        "RISK_DENY": "TRADE_BLOCKED",
+        "ALLOW": "RISK_ALLOW",
+        "RISK_ALLOW": "RISK_ALLOW",
+        "RISK_DECISION": "RISK_DECISION",
+        "WIN": "TRADE_CLOSED",
+        "LOSS": "TRADE_CLOSED",
+    }
+
+    if et in aliases:
+        return aliases[et]
+    if status in {"DENY", "DENIED", "BLOCKED", "ENCERRADO", "CLOSED", "FECHADO"}:
+        return "TRADE_BLOCKED" if status in {"DENY", "DENIED", "BLOCKED"} else "TRADE_CLOSED"
     return et
+
+
+def classify_event(event_type, payload=None):
+    return normalize_event_type(event_type, payload)
 
 
 def normalize_payload(event_type, payload=None, source=None, trade_id=None):
@@ -454,19 +484,31 @@ def calculate_stats(events=None, filters=None, rows=None):
     }
 
     for event in rows:
-        event_name = str(event.get("event") or "").upper()
-        if event_name in {"SIGNAL_CREATED", "SIGNAL"}:
+        event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
+        if event_name == "SIGNAL_CREATED":
             totals["signals"] += 1
-        if event_name in {"TRADE_OPENED", "ENTRY", "OPEN", "TRADE_OPENED"}:
+        if event_name == "TRADE_OPENED":
             totals["entries"] += 1
-        if event_name in {"TRADE_CLOSED", "CLOSED", "CLOSE", "EXIT"}:
+        if event_name == "TRADE_CLOSED":
             totals["closed"] += 1
         if event_name == "TP50_HIT":
             totals["tp50"] += 1
-        if event_name in {"STOP", "SL", "SL100", "TRADE_CLOSED"} and str(event.get("reason") or "").upper() in {"STOP", "STOP_LOSS", "SL", "STOPLOSS"}:
+        if event_name == "BREAKEVEN":
+            totals["breakeven"] += 1
+
+        reason = str(event.get("reason") or event.get("result") or event.get("resultado") or "").upper()
+        raw_reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("event") or event.get("event_type") or event.get("type") or "").lower()
+        if event_name == "TRADE_CLOSED" and (
+            reason in {"STOP", "STOPLOSS", "SL", "STOP_LOSS", "LOSS"}
+            or "stop" in raw_reason
+            or "sl" in raw_reason
+        ):
             totals["stops"] += 1
-        if event_name in {"TRADE_CLOSED", "CLOSED", "CLOSE", "EXIT"}:
-            pnl = _safe_float(event.get("result_pct"), None)
+
+        if event_name == "TRADE_CLOSED":
+            pnl = _safe_float(event.get("pnl_pct") or event.get("result_pct") or event.get("pnl") or event.get("resultado_pct"), None)
+            if pnl is None:
+                pnl = _safe_float(event.get("result"), None)
             if pnl is not None:
                 totals["pnl_total_pct"] += pnl
                 if pnl > 0:

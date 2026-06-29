@@ -64,10 +64,10 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.assertIn("uid", result)
 
     def test_load_events_filters_and_aggregation(self):
-        history_manager.log_event("SIGNAL_CREATED", {"symbol": "BTCUSDT", "side": "buy", "setup": "breakout", "trade_id": "A1"}, source="falcon", trade_id="A1")
-        history_manager.log_event("TRADE_OPENED", {"symbol": "BTCUSDT", "side": "buy", "setup": "breakout", "trade_id": "A2"}, source="falcon", trade_id="A2")
-        history_manager.log_event("TRADE_CLOSED", {"symbol": "ETHUSDT", "side": "sell", "setup": "trend", "trade_id": "A3", "result_pct": 1.5, "reason": "take_profit"}, source="meme", trade_id="A3")
-        history_manager.log_event("TRADE_CLOSED", {"symbol": "ETHUSDT", "side": "sell", "setup": "trend", "trade_id": "A4", "result_pct": -0.5, "reason": "stop"}, source="meme", trade_id="A4")
+        history_manager.log_event("SIGNAL", {"symbol": "BTCUSDT", "side": "buy", "setup": "breakout", "trade_id": "A1"}, source="falcon", trade_id="A1")
+        history_manager.log_event("ENTRY", {"symbol": "BTCUSDT", "side": "buy", "setup": "breakout", "trade_id": "A2"}, source="falcon", trade_id="A2")
+        history_manager.log_event("CLOSE", {"symbol": "ETHUSDT", "side": "sell", "setup": "trend", "trade_id": "A3", "pnl_pct": 1.5, "result": "WIN"}, source="meme", trade_id="A3")
+        history_manager.log_event("STOP", {"symbol": "ETHUSDT", "side": "sell", "setup": "trend", "trade_id": "A4", "pnl_pct": -0.5, "result": "LOSS"}, source="meme", trade_id="A4")
 
         filtered = history_manager.load_events(filters={"bot": "falcon"})
         self.assertEqual(len(filtered), 2)
