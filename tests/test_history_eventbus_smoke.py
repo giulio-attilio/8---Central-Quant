@@ -107,6 +107,20 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         events = history_manager.load_events(filters={"event_type": "TP50_HIT", "bot": "falcon"})
         self.assertGreaterEqual(len(events), 1)
 
+    def test_history_events_routes_read_events(self):
+        history_manager.log_event("TEST_EVENT", {"symbol": "BTCUSDT", "bot": "falcon"}, source="falcon", trade_id="T-ROUTE")
+        with central_main.app.test_client() as client:
+            response = client.get("/history/events?limit=5")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["ok"])
+            self.assertGreaterEqual(payload["count"], 1)
+
+            latest = client.get("/history/events/latest")
+            self.assertEqual(latest.status_code, 200)
+            latest_payload = latest.get_json()
+            self.assertTrue(latest_payload["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

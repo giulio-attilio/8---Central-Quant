@@ -4636,6 +4636,41 @@ def history_stats_route():
     return build_history_stats_payload()
 
 
+@app.route("/history/events")
+def history_events_route():
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    limit = request.args.get("limit", default="50", type=int)
+    bot = request.args.get("bot", default="", type=str)
+    symbol = request.args.get("symbol", default="", type=str)
+    event_type = request.args.get("event_type", default="", type=str)
+
+    filters = {}
+    if bot:
+        filters["bot"] = bot
+    if symbol:
+        filters["symbol"] = symbol
+    if event_type:
+        filters["event_type"] = event_type
+
+    events = super_history_manager.load_events(limit=limit, filters=filters)
+    return {"ok": True, "count": len(events), "events": events}
+
+
+@app.route("/history/events/latest")
+def history_events_latest_route():
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    events = super_history_manager.load_events(limit=1)
+    return {"ok": True, "count": len(events), "event": events[-1] if events else None}
+
+
 @app.route("/snapshot")
 def snapshot_route():
     return {"text": build_snapshot_report()}
