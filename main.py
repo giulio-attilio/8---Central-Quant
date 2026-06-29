@@ -4726,6 +4726,45 @@ def simulate_route(key=None):
     return {"text": build_simulate_report(key)}
 
 
+@app.route("/simulate/full")
+def simulate_full_route():
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    generated_events = []
+    sequence = [
+        ("SIGNAL_CREATED", {"bot": "PREDATOR", "symbol": "BTCUSDT", "setup": "SMART_PREDATOR", "side": "LONG", "sim_test": True}, "SIM_TEST-1"),
+        ("TRADE_OPENED", {"bot": "PREDATOR", "symbol": "BTCUSDT", "setup": "SMART_PREDATOR", "side": "LONG", "sim_test": True}, "SIM_TEST-2"),
+        ("TP50_HIT", {"bot": "PREDATOR", "symbol": "BTCUSDT", "setup": "SMART_PREDATOR", "side": "LONG", "sim_test": True}, "SIM_TEST-3"),
+        ("BREAKEVEN_MOVED", {"event_type": "BREAKEVEN", "bot": "PREDATOR", "symbol": "BTCUSDT", "setup": "SMART_PREDATOR", "side": "LONG", "sim_test": True}, "SIM_TEST-4"),
+        ("TRADE_CLOSED", {"bot": "PREDATOR", "symbol": "BTCUSDT", "setup": "SMART_PREDATOR", "side": "LONG", "result": "WIN", "pnl_pct": 2.5, "sim_test": True}, "SIM_TEST-5"),
+        ("TRADE_CLOSED", {"bot": "TURTLE", "symbol": "ETHUSDT", "setup": "TURTLE20", "side": "SHORT", "result": "LOSS", "pnl_pct": -1.0, "sim_test": True}, "SIM_TEST-6"),
+        ("TRADE_BLOCKED", {"bot": "TRENDPRO", "symbol": "SOLUSDT", "setup": "NORMAL", "side": "LONG", "result": "DENY", "sim_test": True}, "SIM_TEST-7"),
+        ("RISK_DECISION", {"bot": "FALCON", "symbol": "XRPUSDT", "setup": "FALCON30", "side": "LONG", "decision": "DENY", "result": "DENY", "sim_test": True}, "SIM_TEST-8"),
+    ]
+
+    for event_type, payload, trade_id in sequence:
+        try:
+            result = super_history_manager.log_event(event_type, payload, source="sim_test", trade_id=trade_id)
+            if result.get("ok"):
+                generated_events.append(result.get("event") or {"event": event_type, "trade_id": trade_id})
+        except Exception:
+            continue
+
+    stats_after = super_history_manager.calculate_stats()
+    query_predator = super_history_manager.query_history(bot="PREDATOR", limit=10)
+    return {
+        "ok": True,
+        "generated": len(generated_events),
+        "events": generated_events,
+        "stats_after": stats_after,
+        "query_predator": query_predator,
+        "riskstats_hint": "use /history/stats for the aggregated risk history payload",
+    }
+
+
 @app.route("/trend")
 def trend_route():
     return {"text": build_single_bot_report("TRENDPRO", complete=True)}
