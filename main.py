@@ -4671,6 +4671,44 @@ def analytics_bots_route():
         return {"ok": False, "error": str(exc)}
 
 
+@app.route("/analytics/symbols")
+def analytics_symbols_route():
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    try:
+        grouped = super_history_manager.group_stats(group_by="symbol")
+        symbols = []
+        for symbol_name, stats in grouped.items():
+            symbols.append({
+                "symbol": symbol_name,
+                "total_events": stats.get("total_events", 0),
+                "signals": stats.get("signals", 0),
+                "entries": stats.get("entries", 0),
+                "closed": stats.get("closed", 0),
+                "wins": stats.get("wins", 0),
+                "losses": stats.get("losses", 0),
+                "breakeven": stats.get("breakeven", 0),
+                "blocked": stats.get("blocked", 0),
+                "denied": stats.get("denied", 0),
+                "tp50": stats.get("tp50", 0),
+                "pnl_total_pct": stats.get("pnl_total_pct", 0.0),
+                "pnl_avg_pct": stats.get("pnl_avg_pct", 0.0),
+                "win_rate_pct": round((stats.get("wins", 0) / stats.get("closed", 1)) * 100, 2) if stats.get("closed", 0) else 0.0,
+            })
+
+        symbols.sort(key=lambda item: (-item["pnl_total_pct"], -item["wins"], -item["total_events"], item["symbol"]))
+        return {
+            "ok": True,
+            "generated_at": super_history_manager.data_hora_sp_str(),
+            "symbols": symbols,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @app.route("/analytics/setups")
 def analytics_setups_route():
     try:
