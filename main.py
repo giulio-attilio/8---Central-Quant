@@ -4633,19 +4633,25 @@ def build_history_stats_payload():
         return {"ok": False, "error": str(exc)}
 
 
-@app.route("/analytics/bots")
-def analytics_bots_route():
+def _analytics_group_response(group_by, label_key, list_key):
     try:
         import history_manager as super_history_manager
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
     try:
-        grouped = super_history_manager.group_stats(group_by="bot")
-        bots = []
-        for bot_name, stats in grouped.items():
-            bots.append({
-                "bot": bot_name,
+        days = request.args.get("days", default="", type=str)
+        if days:
+            query_result = super_history_manager.query_history(days=days, limit=None)
+            events = query_result.get("events", [])
+            grouped = super_history_manager.group_stats(group_by=group_by, events=events)
+        else:
+            grouped = super_history_manager.group_stats(group_by=group_by)
+
+        items = []
+        for name, stats in grouped.items():
+            items.append({
+                label_key: name,
                 "total_events": stats.get("total_events", 0),
                 "signals": stats.get("signals", 0),
                 "entries": stats.get("entries", 0),
@@ -4661,87 +4667,86 @@ def analytics_bots_route():
                 "win_rate_pct": round((stats.get("wins", 0) / stats.get("closed", 1)) * 100, 2) if stats.get("closed", 0) else 0.0,
             })
 
-        bots.sort(key=lambda item: (-item["pnl_total_pct"], -item["wins"], -item["total_events"], item["bot"]))
+        items.sort(key=lambda item: (-item["pnl_total_pct"], -item["wins"], -item["total_events"], item[label_key]))
+
         return {
             "ok": True,
             "generated_at": super_history_manager.data_hora_sp_str(),
-            "bots": bots,
+            "filters": {
+                "days": days or None,
+            },
+            list_key: items,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+@app.route("/analytics/bots")
+def analytics_bots_route():
+    return _analytics_group_response("bot", "bot", "bots")
 
 
 @app.route("/analytics/symbols")
 def analytics_symbols_route():
-    try:
-        import history_manager as super_history_manager
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-    try:
-        grouped = super_history_manager.group_stats(group_by="symbol")
-        symbols = []
-        for symbol_name, stats in grouped.items():
-            symbols.append({
-                "symbol": symbol_name,
-                "total_events": stats.get("total_events", 0),
-                "signals": stats.get("signals", 0),
-                "entries": stats.get("entries", 0),
-                "closed": stats.get("closed", 0),
-                "wins": stats.get("wins", 0),
-                "losses": stats.get("losses", 0),
-                "breakeven": stats.get("breakeven", 0),
-                "blocked": stats.get("blocked", 0),
-                "denied": stats.get("denied", 0),
-                "tp50": stats.get("tp50", 0),
-                "pnl_total_pct": stats.get("pnl_total_pct", 0.0),
-                "pnl_avg_pct": stats.get("pnl_avg_pct", 0.0),
-                "win_rate_pct": round((stats.get("wins", 0) / stats.get("closed", 1)) * 100, 2) if stats.get("closed", 0) else 0.0,
-            })
-
-        symbols.sort(key=lambda item: (-item["pnl_total_pct"], -item["wins"], -item["total_events"], item["symbol"]))
-        return {
-            "ok": True,
-            "generated_at": super_history_manager.data_hora_sp_str(),
-            "symbols": symbols,
-        }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+    return _analytics_group_response("symbol", "symbol", "symbols")
 
 
 @app.route("/analytics/setups")
 def analytics_setups_route():
+    return _analytics_group_response("setup", "setup", "setups")
+
+
+@app.route("/analytics/performance")
+def analytics_performance_route():
     try:
         import history_manager as super_history_manager
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
     try:
-        grouped = super_history_manager.group_stats(group_by="setup")
-        setups = []
-        for setup_name, stats in grouped.items():
-            setups.append({
-                "setup": setup_name,
+        days = request.args.get("days", default="", type=str)
+
+        if days:
+            query_result = super_history_manager.query_history(days=days, limit=None)
+            events = query_result.get("events", [])
+        else:
+            events = super_history_manager.load_events()
+
+        grouped = {}
+        for event in events:
+            bot = str(event.get("bot") or "N/A").upper()
+            grouped.setdefault(bot, []).append(event)
+
+        bots = []
+        for bot, rows in grouped.items():
+            metrics = super_history_manager.calculate_performance_metrics(rows)
+            stats = super_history_manager.calculate_stats(rows=rows)
+
+            bots.append({
+                "bot": bot,
                 "total_events": stats.get("total_events", 0),
                 "signals": stats.get("signals", 0),
                 "entries": stats.get("entries", 0),
                 "closed": stats.get("closed", 0),
-                "wins": stats.get("wins", 0),
-                "losses": stats.get("losses", 0),
-                "breakeven": stats.get("breakeven", 0),
                 "blocked": stats.get("blocked", 0),
                 "denied": stats.get("denied", 0),
-                "tp50": stats.get("tp50", 0),
-                "pnl_total_pct": stats.get("pnl_total_pct", 0.0),
-                "pnl_avg_pct": stats.get("pnl_avg_pct", 0.0),
-                "win_rate_pct": round((stats.get("wins", 0) / stats.get("closed", 1)) * 100, 2) if stats.get("closed", 0) else 0.0,
+                **metrics,
             })
 
-        setups.sort(key=lambda item: (-item["pnl_total_pct"], -item["wins"], -item["total_events"], item["setup"]))
+        bots.sort(key=lambda item: (
+            -item.get("pnl_total_pct", 0.0),
+            -item.get("wins", 0),
+            -item.get("trades", 0),
+            item.get("bot", ""),
+        ))
+
         return {
             "ok": True,
             "generated_at": super_history_manager.data_hora_sp_str(),
-            "setups": setups,
+            "filters": {
+                "days": days or None,
+            },
+            "bots": bots,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
