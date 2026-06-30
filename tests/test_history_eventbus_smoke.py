@@ -152,6 +152,29 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
                 self.assertIn("query_predator", payload)
                 self.assertIn("riskstats_hint", payload)
 
+    def test_calculate_performance_metrics_from_closed_trades(self):
+        history_manager.log_event("TRADE_CLOSED", {"symbol": "BTCUSDT", "pnl_pct": 2.5}, source="unit-test", trade_id="P-1")
+        history_manager.log_event("TRADE_CLOSED", {"symbol": "ETHUSDT", "pnl_pct": 1.0}, source="unit-test", trade_id="P-2")
+        history_manager.log_event("TRADE_CLOSED", {"symbol": "SOLUSDT", "pnl_pct": -1.5}, source="unit-test", trade_id="P-3")
+        history_manager.log_event("TRADE_CLOSED", {"symbol": "XRPUSDT", "pnl_pct": 0.0}, source="unit-test", trade_id="P-4")
+
+        metrics = history_manager.calculate_performance_metrics(history_manager.load_events(filters={"event_type": "TRADE_CLOSED"}))
+
+        self.assertEqual(metrics["trades"], 4)
+        self.assertEqual(metrics["wins"], 2)
+        self.assertEqual(metrics["losses"], 1)
+        self.assertEqual(metrics["breakeven"], 1)
+        self.assertEqual(metrics["win_rate_pct"], 50.0)
+        self.assertEqual(metrics["pnl_total_pct"], 2.0)
+        self.assertEqual(metrics["pnl_avg_pct"], 0.5)
+        self.assertEqual(metrics["avg_win_pct"], 1.75)
+        self.assertEqual(metrics["avg_loss_pct"], 1.5)
+        self.assertEqual(metrics["payoff_ratio"], 1.1667)
+        self.assertEqual(metrics["profit_factor_pct"], 2.3333)
+        self.assertEqual(metrics["expectancy_pct"], 0.875)
+        self.assertEqual(metrics["max_win_streak"], 2)
+        self.assertEqual(metrics["max_loss_streak"], 1)
+
     def test_can_open_trade_does_not_block_paper_by_default(self):
         with mock.patch.object(central_main, "GLOBAL_RISK_MAX_POSITIONS", 50), \
              mock.patch.object(central_main, "GLOBAL_RISK_MAX_PAPER_POSITIONS", 100), \

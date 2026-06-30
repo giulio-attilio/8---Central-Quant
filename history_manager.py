@@ -776,6 +776,71 @@ def query_history(bot=None, symbol=None, setup=None, side=None, result=None, day
     }
 
 
+def calculate_performance_metrics(events=None):
+    rows = list(events or [])
+    closed_trades = []
+    for event in rows:
+        event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
+        if event_name != "TRADE_CLOSED":
+            continue
+        pnl = _safe_float(event.get("pnl_pct") or event.get("result_pct") or event.get("pnl") or event.get("resultado_pct"), None)
+        if pnl is None:
+            pnl = _safe_float(event.get("result"), None)
+        if pnl is None:
+            continue
+        closed_trades.append(pnl)
+
+    trades = len(closed_trades)
+    wins = sum(1 for pnl in closed_trades if pnl > 0)
+    losses = sum(1 for pnl in closed_trades if pnl < 0)
+    breakeven = sum(1 for pnl in closed_trades if pnl == 0)
+    win_rate_pct = round((wins / trades) * 100, 2) if trades else 0.0
+    pnl_total_pct = round(sum(closed_trades), 4)
+    pnl_avg_pct = round(pnl_total_pct / trades, 4) if trades else 0.0
+
+    win_values = [pnl for pnl in closed_trades if pnl > 0]
+    loss_values = [abs(pnl) for pnl in closed_trades if pnl < 0]
+    avg_win_pct = round(sum(win_values) / len(win_values), 4) if win_values else 0.0
+    avg_loss_pct = round(sum(loss_values) / len(loss_values), 4) if loss_values else 0.0
+    payoff_ratio = round(avg_win_pct / avg_loss_pct, 4) if avg_loss_pct else 0.0
+    profit_factor_pct = round(sum(win_values) / sum(loss_values), 4) if loss_values and sum(win_values) else 0.0
+    expectancy_pct = round((win_rate_pct / 100) * avg_win_pct - ((100 - win_rate_pct) / 100) * avg_loss_pct, 4) if trades else 0.0
+
+    max_win_streak = 0
+    max_loss_streak = 0
+    current_win_streak = 0
+    current_loss_streak = 0
+    for pnl in closed_trades:
+        if pnl > 0:
+            current_win_streak += 1
+            current_loss_streak = 0
+            max_win_streak = max(max_win_streak, current_win_streak)
+        elif pnl < 0:
+            current_loss_streak += 1
+            current_win_streak = 0
+            max_loss_streak = max(max_loss_streak, current_loss_streak)
+        else:
+            current_win_streak = 0
+            current_loss_streak = 0
+
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate_pct": win_rate_pct,
+        "pnl_total_pct": pnl_total_pct,
+        "pnl_avg_pct": pnl_avg_pct,
+        "avg_win_pct": avg_win_pct,
+        "avg_loss_pct": avg_loss_pct,
+        "payoff_ratio": payoff_ratio,
+        "profit_factor_pct": profit_factor_pct,
+        "expectancy_pct": expectancy_pct,
+        "max_win_streak": max_win_streak,
+        "max_loss_streak": max_loss_streak,
+    }
+
+
 def group_stats(group_by="bot", events=None, filters=None):
     rows = events if events is not None else load_events(filters=filters)
     rows = list(rows or [])
