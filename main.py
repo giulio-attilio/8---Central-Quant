@@ -1145,6 +1145,60 @@ def memory_gc_route():
     return payload
 
 
+@app.route("/memory/top")
+def memory_top_route():
+    import gc
+    import sys
+    from collections import defaultdict
+
+    try:
+        gc.collect()
+        objects = gc.get_objects()
+
+        by_type = defaultdict(lambda: {"count": 0, "bytes": 0})
+        largest = []
+
+        for obj in objects:
+            try:
+                size = sys.getsizeof(obj)
+                type_name = type(obj).__name__
+
+                by_type[type_name]["count"] += 1
+                by_type[type_name]["bytes"] += size
+
+                if size >= 1024 * 50:
+                    largest.append({
+                        "type": type_name,
+                        "size_kb": round(size / 1024, 2),
+                        "repr": repr(obj)[:200],
+                    })
+            except Exception:
+                continue
+
+        types = []
+        for type_name, data in by_type.items():
+            types.append({
+                "type": type_name,
+                "count": data["count"],
+                "size_mb": round(data["bytes"] / 1024 / 1024, 4),
+            })
+
+        types.sort(key=lambda x: x["size_mb"], reverse=True)
+        largest.sort(key=lambda x: x["size_kb"], reverse=True)
+
+        return {
+            "ok": True,
+            "generated_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+            "object_count": len(objects),
+            "top_types": types[:30],
+            "largest_objects": largest[:30],
+            "note": "Tamanho aproximado via sys.getsizeof; não inclui sempre objetos referenciados internamente.",
+        }
+
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    
+
 @app.route("/relatorio")
 def relatorio_curto():
     memory_profile_step("route_relatorio_start")
