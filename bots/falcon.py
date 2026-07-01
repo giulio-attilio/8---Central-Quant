@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
 import numpy as np
-import ccxt
+from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask
 from upstash_redis import Redis
@@ -188,8 +188,7 @@ FUNNEL_KEY = "falcon:funnel"
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 redis_lock = threading.Lock()
 
-exchange = ccxt.bingx({"enableRateLimit": True})
-exchange.options["defaultType"] = "swap"
+exchange = get_exchange()
 
 HEALTH = {
     "started_at": None,

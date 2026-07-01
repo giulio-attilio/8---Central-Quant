@@ -50,7 +50,7 @@ import time
 import threading
 import requests
 import pandas as pd
-import ccxt
+from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
@@ -290,8 +290,7 @@ MONTHLY_SUMMARY_DAY = 1
 MONTHLY_SUMMARY_HOUR = 8
 MONTHLY_SUMMARY_MINUTE = 5
 
-exchange = ccxt.bingx({"enableRateLimit": True})
-exchange.options["defaultType"] = "swap"
+exchange = get_exchange()
 
 redis = Redis(
     url=UPSTASH_REDIS_REST_URL,
@@ -384,7 +383,7 @@ def safe_fetch_ticker(symbol, max_retries=3):
 def safe_load_markets(max_retries=3):
     for attempt in range(max_retries):
         try:
-            return exchange.load_markets()
+            return load_markets_once()
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso TRENDPRO load_markets ({attempt+1}/{max_retries}): {e}")
             time.sleep(2 ** attempt)
