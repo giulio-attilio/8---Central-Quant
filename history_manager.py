@@ -466,6 +466,16 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     side = _extract_side(raw)
     setup = _extract_setup(raw)
 
+    raw_setup = _first(raw, ["setup", "signal_type", "setup_label", "strategy"], "")
+    if raw_setup is not None and str(raw_setup).strip():
+        setup = str(raw_setup).strip().upper()
+
+    if bot == "TURTLE":
+        if setup in {"20", "T20", "TURTLE_20", "TURTLE 20"}:
+            setup = "TURTLE20"
+        elif setup in {"55", "T55", "TURTLE_55", "TURTLE 55"}:
+            setup = "TURTLE55"
+
     if not setup:
         signal_type = str(_first(raw, ["signal_type"], "") or "").upper().strip()
         raw_event = str(_first(raw, ["event", "event_type", "type"], "") or "").upper().strip()
@@ -475,17 +485,20 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
             setup = signal_type
         elif event == "POI" or raw_event == "POI":
             setup = "POI"
-        elif event == "TP50_HIT" or raw_event == "TP50":
+        elif source_name == "trendpro":
             setup = "TRENDPRO"
-        elif event == "TRAILING_UPDATED" or raw_event == "TRAILING":
-            if source_name == "meme":
-                setup = "MEME"
-            elif source_name == "trendpro":
-                setup = "TRENDPRO"
-            else:
-                setup = "TRAILING"
-        elif event == "TRADE_CLOSED" or raw_event in {"CLOSE", "STOP", "SL"}:
-            setup = "TRENDPRO"
+        elif source_name == "meme":
+            setup = "MEME"
+        elif source_name == "donkey":
+            setup = "DONKEY"
+        elif source_name == "cobra":
+            setup = "COBRA"
+        elif source_name == "predator":
+            setup = "SMART_PREDATOR"
+        elif source_name == "falcon":
+            setup = "FALCON"
+        elif source_name == "turtle":
+            setup = "TURTLE"
 
     tid = trade_id or _first(raw, ["trade_id", "position_id", "client_trade_id"])
     if not tid:
