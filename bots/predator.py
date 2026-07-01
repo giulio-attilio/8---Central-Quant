@@ -19,7 +19,7 @@ import threading
 import requests
 import numpy as np
 import pandas as pd
-import ccxt
+from exchange_manager import get_exchange
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
@@ -85,8 +85,7 @@ SIGNAL_COOLDOWN_KEY = "smartpredator:signal_cooldown"
 STARTUP_MESSAGE_KEY = "smartpredator:startup_message_sent_v3"
 FUNNEL_STATS_KEY = "smartpredator:funnel_stats"
 
-exchange = ccxt.bingx({"enableRateLimit": True})
-exchange.options["defaultType"] = "swap"
+exchange = get_exchange()
 
 redis = Redis(
     url=UPSTASH_REDIS_REST_URL,
