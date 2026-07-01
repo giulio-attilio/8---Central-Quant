@@ -19,7 +19,7 @@ import threading
 import requests
 import numpy as np
 import pandas as pd
-from exchange_manager import get_exchange
+from exchange_manager import get_exchange, load_markets_once
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
@@ -411,7 +411,7 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
     invalidos = []
 
     try:
-        markets = exchange.load_markets()
+        markets = load_markets_once()
     except Exception as e:
         print("ERRO AO CARREGAR MERCADOS BINGX:", e)
         HEALTH["watchlist_total"] = len(watchlist)
