@@ -1277,6 +1277,32 @@ def calc_stats(trades):
     }
 
 
+def slim_trade(trade, metric="result"):
+    if not trade:
+        return None
+    return {
+        "symbol": trade.get("symbol"),
+        "setup": trade.get("setup"),
+        "side": trade.get("side"),
+        "closed_at": trade.get("closed_at"),
+        "result_pct": safe_float(trade.get("result_pct")),
+        "result_r": safe_float(trade.get("result_r")),
+        "mfe_pct": safe_float(trade.get("mfe_pct")),
+        "mfe_r": safe_float(trade.get("mfe_r")),
+        "exit_reason": trade.get("exit_reason"),
+    }
+
+
+def slim_stats(stats):
+    stats = dict(stats or {})
+    stats["top_mfe"] = (stats.get("top_mfe") or [])[:5]
+    stats["best_trade"] = slim_trade(stats.get("best_trade"))
+    stats["worst_trade"] = slim_trade(stats.get("worst_trade"))
+    stats["biggest_runner"] = slim_trade(stats.get("biggest_runner"), metric="mfe")
+    stats["biggest_loss"] = slim_trade(stats.get("biggest_loss"))
+    return stats
+    
+
 def trades_today():
     br_date = date_key_br()
     return [t for t in get_trades() if trade_date_matches(t, br_date)]
@@ -1351,7 +1377,7 @@ def refresh_health_stats():
     today_signals = signals_today()
     today_events = [e for e in get_events() if str(e.get("created_at", "")).startswith(date_key_br())]
 
-    stats = calc_stats(month_trades)
+    stats = slim_stats(calc_stats(month_trades))
     HEALTH["funnel_today"] = funnel_snapshot()
 
     HEALTH["signals_today"] = len(today_signals)
@@ -1401,12 +1427,12 @@ def refresh_health_stats():
 
     setup_stats = {}
     for setup_key, setup_trades in split_by_setup(month_trades).items():
-        setup_stats[setup_key] = calc_stats(setup_trades)
+        setup_stats[setup_key] = slim_stats(calc_stats(setup_trades))
     HEALTH["setups"] = setup_stats
 
     direction_stats = {}
     for direction, direction_trades in split_by_direction(month_trades).items():
-        direction_stats[direction] = calc_stats(direction_trades)
+        direction_stats[direction] = slim_stats(calc_stats(direction_trades))
     HEALTH["directions"] = direction_stats
 
     HEALTH["ranking_month"] = build_ranking_month(month_trades)
