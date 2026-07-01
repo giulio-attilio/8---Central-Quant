@@ -4916,9 +4916,11 @@ def history_simulate_route():
 
     generated = []
     for event_name, payload in events:
-        saved = super_history_manager.publish_event(
-            event=event_name,
-            bot=bot,
+        payload["event"] = event_name
+        payload["bot"] = bot
+
+        saved = super_history_manager.log_event(
+            event_type=event_name,
             payload=payload,
             source="history_simulate",
             trade_id=trade_id,
