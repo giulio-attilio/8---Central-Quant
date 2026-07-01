@@ -457,21 +457,47 @@ def classify_event(event_type, payload=None):
 def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     raw = payload if isinstance(payload, dict) else {"value": payload}
     event = classify_event(event_type, raw)
+
     bot_value = _extract_bot(raw)
     fallback_bot = sanitize_bot(_first(raw, ["bot", "bot_name", "strategy", "source"], source or "CENTRAL"), raw)
     bot = str(bot_value or fallback_bot or source or "CENTRAL").upper()
+
     symbol = _extract_symbol(raw)
     side = _extract_side(raw)
     setup = _extract_setup(raw)
+
+    if not setup:
+        signal_type = str(_first(raw, ["signal_type"], "") or "").upper().strip()
+        raw_event = str(_first(raw, ["event", "event_type", "type"], "") or "").upper().strip()
+        source_name = str(source or raw.get("source") or "").lower().strip()
+
+        if signal_type:
+            setup = signal_type
+        elif event == "POI" or raw_event == "POI":
+            setup = "POI"
+        elif event == "TP50_HIT" or raw_event == "TP50":
+            setup = "TRENDPRO"
+        elif event == "TRAILING_UPDATED" or raw_event == "TRAILING":
+            if source_name == "meme":
+                setup = "MEME"
+            elif source_name == "trendpro":
+                setup = "TRENDPRO"
+            else:
+                setup = "TRAILING"
+        elif event == "TRADE_CLOSED" or raw_event in {"CLOSE", "STOP", "SL"}:
+            setup = "TRENDPRO"
+
     tid = trade_id or _first(raw, ["trade_id", "position_id", "client_trade_id"])
     if not tid:
         stamp = agora_sp().strftime("%Y%m%d-%H%M%S")
         tid = f"{bot[:12]}-{stamp}-{symbol or 'NA'}-{uuid.uuid4().hex[:6].upper()}"
 
-    result_pct = _safe_float(_first(raw, ["result_pct", "pnl_pct", "current_pct", "open_pct"]), None)
+    result_pct = _safe_float(_first(raw, ["result_pct", "pnl_pct", "current_pct", "open_pct", "pnl"]), None)
     result_r = _safe_float(_first(raw, ["result_r", "pnl_r", "current_r", "open_r"]), None)
     risk_pct = _safe_float(_first(raw, ["risk_pct", "risco_pct", "risk"]), None)
     score = _safe_float(_first(raw, ["score", "signal_score", "meme_score", "qualidade_pontos"]), None)
+
+    result_value = _first(raw, ["result", "decision", "status", "result_type"])
 
     item = {
         "uid": _event_uid(event, raw, source=source, trade_id=tid),
@@ -490,11 +516,11 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
         "entry": _safe_float(_first(raw, ["entry", "entrada", "entry_price"]), None),
         "stop": _safe_float(_first(raw, ["stop", "sl", "initial_sl", "stop_atual"]), None),
         "tp50": _safe_float(_first(raw, ["tp50", "tp_50"]), None),
-        "exit_price": _safe_float(_first(raw, ["exit_price", "close_price", "price"]), None),
+        "exit_price": _safe_float(_first(raw, ["exit_price", "close_price", "price", "exit"]), None),
         "risk_pct": risk_pct,
         "result_pct": result_pct,
         "result_r": result_r,
-        "result": _first(raw, ["result", "decision", "status"]),
+        "result": result_value,
         "reason": _first(raw, ["reason", "motivo", "exit_reason"]),
         "raw": raw,
     }
@@ -676,6 +702,7 @@ def load_events(limit=None, filters=None):
 def calculate_stats(events=None, filters=None, rows=None):
     rows = rows if rows is not None else (events if events is not None else load_events(filters=filters))
     rows = list(rows or [])
+
     totals = {
         "total_events": len(rows),
         "signals": 0,
@@ -693,23 +720,58 @@ def calculate_stats(events=None, filters=None, rows=None):
     }
 
     for event in rows:
-        event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
-        reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("decision") or event.get("status") or "").upper()
-        raw_reason = str(event.get("reason") or event.get("result") or event.get("resultado") or event.get("decision") or event.get("status") or event.get("event") or event.get("event_type") or event.get("type") or "").lower()
+        raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+
+        event_name = normalize_event_type(
+            event.get("event") or event.get("event_type") or event.get("type"),
+            event,
+        )
+
+        reason = str(
+            event.get("reason")
+            or event.get("result")
+            or event.get("resultado")
+            or event.get("decision")
+            or event.get("status")
+            or raw.get("result_type")
+            or ""
+        ).upper()
+
+        raw_reason = str(
+            event.get("reason")
+            or event.get("result")
+            or event.get("resultado")
+            or event.get("decision")
+            or event.get("status")
+            or event.get("event")
+            or event.get("event_type")
+            or event.get("type")
+            or raw.get("event")
+            or raw.get("event_type")
+            or raw.get("result_type")
+            or ""
+        ).lower()
+
         if event_name == "SIGNAL_CREATED":
             totals["signals"] += 1
+
         if event_name == "TRADE_OPENED":
             totals["entries"] += 1
+
         if event_name == "TRADE_CLOSED":
             totals["closed"] += 1
+
         if event_name in {"TRADE_BLOCKED", "RISK_DECISION"}:
             totals["blocked"] += 1
             if reason in {"DENY", "DENIED", "BLOCKED"} or "deny" in raw_reason or "blocked" in raw_reason:
                 totals["denied"] += 1
+
         if event_name == "TP50_HIT":
             totals["tp50"] += 1
+
         if event_name == "BREAKEVEN":
             totals["breakeven"] += 1
+
         if event_name == "TRADE_CLOSED" and (
             reason in {"STOP", "STOPLOSS", "SL", "STOP_LOSS", "LOSS"}
             or "stop" in raw_reason
@@ -718,22 +780,48 @@ def calculate_stats(events=None, filters=None, rows=None):
             totals["stops"] += 1
 
         if event_name == "TRADE_CLOSED":
-            pnl = _safe_float(event.get("pnl_pct") or event.get("result_pct") or event.get("pnl") or event.get("resultado_pct"), None)
+            pnl = (
+                _safe_float(event.get("pnl_pct"), None)
+                or _safe_float(event.get("result_pct"), None)
+                or _safe_float(event.get("pnl"), None)
+                or _safe_float(raw.get("pnl"), None)
+                or _safe_float(raw.get("pnl_pct"), None)
+                or _safe_float(raw.get("result_pct"), None)
+                or _safe_float(event.get("resultado_pct"), None)
+            )
+
             if pnl is None:
                 pnl = _safe_float(event.get("result"), None)
+
+            result_type = str(
+                event.get("result")
+                or raw.get("result_type")
+                or raw.get("result")
+                or ""
+            ).upper()
+
             if pnl is not None:
                 totals["pnl_total_pct"] += pnl
-                if pnl > 0:
+
+                if pnl > 0 or result_type == "WIN":
                     totals["wins"] += 1
-                elif pnl < 0:
+                elif pnl < 0 or result_type == "LOSS":
                     totals["losses"] += 1
                 else:
+                    totals["breakeven"] += 1
+            else:
+                if result_type == "WIN":
+                    totals["wins"] += 1
+                elif result_type == "LOSS":
+                    totals["losses"] += 1
+                elif result_type in {"BE", "BREAKEVEN"}:
                     totals["breakeven"] += 1
 
     if totals["closed"]:
         totals["pnl_avg_pct"] = round(totals["pnl_total_pct"] / totals["closed"], 4)
     else:
         totals["pnl_avg_pct"] = 0.0
+
     totals["pnl_total_pct"] = round(totals["pnl_total_pct"], 4)
     return totals
 
@@ -1088,3 +1176,68 @@ def build_export_report():
         f"Eventos exportados: {payload.get('totals', {}).get('events', 0)}\n"
         f"Gerado em: {payload.get('generated_at')}"
     )
+
+
+def audit_events(events=None):
+    rows = list(events if events is not None else load_events())
+
+    required_by_event = {
+        "TRADE_OPENED": ["bot", "symbol", "side", "setup", "entry", "stop", "tp50"],
+        "TP50_HIT": ["bot", "symbol", "side", "setup", "tp50"],
+        "BREAKEVEN": ["bot", "symbol", "side", "setup"],
+        "TRAILING_UPDATED": ["bot", "symbol", "side", "setup"],
+        "TRADE_CLOSED": ["bot", "symbol", "side", "setup", "entry", "exit_price", "result_pct"],
+        "TRADE_BLOCKED": ["bot", "symbol", "side", "setup", "result"],
+        "RISK_DECISION": ["bot", "symbol", "side", "setup", "result"],
+        "SIGNAL_CREATED": ["bot", "symbol", "side", "setup"],
+    }
+
+    audit = {}
+    for event in rows:
+        bot = str(event.get("bot") or "N/A").upper()
+        event_name = normalize_event_type(
+            event.get("event") or event.get("event_type") or event.get("type"),
+            event,
+        )
+
+        if bot not in audit:
+            audit[bot] = {
+                "events": 0,
+                "by_event": {},
+                "missing": {},
+                "examples": {},
+            }
+
+        audit[bot]["events"] += 1
+        audit[bot]["by_event"][event_name] = audit[bot]["by_event"].get(event_name, 0) + 1
+
+        required = required_by_event.get(event_name, ["bot", "symbol", "side", "setup"])
+        for field in required:
+            value = event.get(field)
+            if value is None or value == "":
+                key = f"missing_{field}"
+                audit[bot]["missing"][key] = audit[bot]["missing"].get(key, 0) + 1
+
+                if key not in audit[bot]["examples"]:
+                    audit[bot]["examples"][key] = {
+                        "event": event_name,
+                        "symbol": event.get("symbol"),
+                        "setup": event.get("setup"),
+                        "trade_id": event.get("trade_id"),
+                        "raw_event": event.get("event_raw"),
+                    }
+
+    total_events = sum(item["events"] for item in audit.values())
+    total_missing = sum(sum(item["missing"].values()) for item in audit.values())
+
+    return {
+        "ok": True,
+        "generated_at": data_hora_sp_str(),
+        "summary": {
+            "events": total_events,
+            "bots": len(audit),
+            "missing_fields": total_missing,
+            "quality_score": round(100 - min(100, (total_missing / max(total_events, 1)) * 10), 2),
+        },
+        "bots": audit,
+    }

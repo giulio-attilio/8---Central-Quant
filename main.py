@@ -4810,6 +4810,26 @@ def history_query_route():
     }
 
 
+@app.route("/history/audit")
+def history_audit_route():
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    days = request.args.get("days", default="", type=str)
+
+    try:
+        if days:
+            query_result = super_history_manager.query_history(days=days, limit=None)
+            events = query_result.get("events", [])
+            return super_history_manager.audit_events(events=events)
+
+        return super_history_manager.audit_events()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    
+    
 @app.route("/snapshot")
 def snapshot_route():
     return {"text": build_snapshot_report()}
