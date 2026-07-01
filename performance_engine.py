@@ -1,0 +1,184 @@
+from collections import defaultdict
+import history_manager
+
+
+def _safe_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.replace("%", "").replace(",", ".").strip()
+        return float(value)
+    except Exception:
+        return default
+
+
+def _event_pnl(event):
+    raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+    return (
+        _safe_float(event.get("result_pct"), None)
+        or _safe_float(event.get("pnl_pct"), None)
+        or _safe_float(event.get("pnl"), None)
+        or _safe_float(raw.get("result_pct"), None)
+        or _safe_float(raw.get("pnl_pct"), None)
+        or _safe_float(raw.get("pnl"), None)
+    )
+
+
+def _metric_from_event(event, names):
+    raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+    for name in names:
+        value = _safe_float(event.get(name), None)
+        if value is not None:
+            return value
+        value = _safe_float(raw.get(name), None)
+        if value is not None:
+            return value
+    return None
+
+
+def calculate_metrics(events):
+    closed = []
+
+    for event in events or []:
+        event_name = history_manager.normalize_event_type(
+            event.get("event") or event.get("event_type") or event.get("type"),
+            event,
+        )
+        if event_name != "TRADE_CLOSED":
+            continue
+
+        pnl = _event_pnl(event)
+        if pnl is None:
+            continue
+
+        closed.append({
+            "pnl": pnl,
+            "r": _metric_from_event(event, ["result_r", "pnl_r"]),
+            "mfe": _metric_from_event(event, ["mfe_pct", "mfe_max_pct"]),
+            "mae": _metric_from_event(event, ["mae_pct", "mae_min_pct"]),
+            "giveback": _metric_from_event(event, ["giveback_pct", "mfe_gave_back_pct"]),
+        })
+
+    trades = len(closed)
+    wins = sum(1 for x in closed if x["pnl"] > 0)
+    losses = sum(1 for x in closed if x["pnl"] < 0)
+    breakeven = sum(1 for x in closed if x["pnl"] == 0)
+
+    pnl_values = [x["pnl"] for x in closed]
+    win_values = [x["pnl"] for x in closed if x["pnl"] > 0]
+    loss_values = [abs(x["pnl"]) for x in closed if x["pnl"] < 0]
+
+    gross_win = sum(win_values)
+    gross_loss = sum(loss_values)
+
+    avg_win = round(gross_win / len(win_values), 4) if win_values else 0.0
+    avg_loss = round(gross_loss / len(loss_values), 4) if loss_values else 0.0
+
+    win_rate = round((wins / trades) * 100, 2) if trades else 0.0
+    payoff = round(avg_win / avg_loss, 4) if avg_loss else 0.0
+    profit_factor = round(gross_win / gross_loss, 4) if gross_loss else (999 if gross_win > 0 else 0.0)
+    expectancy = round((win_rate / 100) * avg_win - ((100 - win_rate) / 100) * avg_loss, 4) if trades else 0.0
+
+    max_win_streak = 0
+    max_loss_streak = 0
+    cur_win = 0
+    cur_loss = 0
+
+    for item in closed:
+        pnl = item["pnl"]
+        if pnl > 0:
+            cur_win += 1
+            cur_loss = 0
+        elif pnl < 0:
+            cur_loss += 1
+            cur_win = 0
+        else:
+            cur_win = 0
+            cur_loss = 0
+
+        max_win_streak = max(max_win_streak, cur_win)
+        max_loss_streak = max(max_loss_streak, cur_loss)
+
+    def avg_field(name):
+        values = [x[name] for x in closed if x.get(name) is not None]
+        return round(sum(values) / len(values), 4) if values else 0.0
+
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate_pct": win_rate,
+        "pnl_total_pct": round(sum(pnl_values), 4),
+        "pnl_avg_pct": round(sum(pnl_values) / trades, 4) if trades else 0.0,
+        "avg_win_pct": avg_win,
+        "avg_loss_pct": avg_loss,
+        "payoff_ratio": payoff,
+        "profit_factor_pct": profit_factor,
+        "expectancy_pct": expectancy,
+        "max_win_streak": max_win_streak,
+        "max_loss_streak": max_loss_streak,
+        "avg_r": avg_field("r"),
+        "avg_mfe_pct": avg_field("mfe"),
+        "avg_mae_pct": avg_field("mae"),
+        "avg_giveback_pct": avg_field("giveback"),
+    }
+
+
+def _group_key(event, group_by):
+    if group_by == "setup":
+        return str(event.get("setup") or "N/A").upper()
+    if group_by == "symbol":
+        return str(event.get("symbol") or "N/A").upper()
+    return str(event.get("bot") or "N/A").upper()
+
+
+def build_performance_payload(days=None, group_by="bot"):
+    if group_by not in {"bot", "setup", "symbol"}:
+        group_by = "bot"
+
+    if days:
+        result = history_manager.query_history(days=days, limit=None)
+        events = result.get("events", [])
+    else:
+        events = history_manager.load_events()
+
+    buckets = defaultdict(list)
+    for event in events:
+        buckets[_group_key(event, group_by)].append(event)
+
+    items = []
+    for key, rows in buckets.items():
+        stats = history_manager.calculate_stats(rows=rows)
+        metrics = calculate_metrics(rows)
+
+        item = {
+            group_by: key,
+            "total_events": stats.get("total_events", 0),
+            "signals": stats.get("signals", 0),
+            "entries": stats.get("entries", 0),
+            "closed": stats.get("closed", 0),
+            "blocked": stats.get("blocked", 0),
+            "denied": stats.get("denied", 0),
+            "tp50": stats.get("tp50", 0),
+            **metrics,
+        }
+        items.append(item)
+
+    items.sort(key=lambda x: (
+        -x.get("expectancy_pct", 0),
+        -x.get("profit_factor_pct", 0),
+        -x.get("pnl_total_pct", 0),
+        -x.get("trades", 0),
+    ))
+
+    return {
+        "ok": True,
+        "generated_at": history_manager.data_hora_sp_str(),
+        "filters": {
+            "days": int(days) if str(days or "").isdigit() else None,
+            "group_by": group_by,
+        },
+        "items": items,
+    }

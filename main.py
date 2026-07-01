@@ -4699,58 +4699,17 @@ def analytics_setups_route():
 @app.route("/analytics/performance")
 def analytics_performance_route():
     try:
-        import history_manager as super_history_manager
+        import performance_engine
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
-    try:
-        days = request.args.get("days", default="", type=str)
+    days = request.args.get("days", default="", type=str)
+    group_by = request.args.get("group_by", default="bot", type=str)
 
-        if days:
-            query_result = super_history_manager.query_history(days=days, limit=None)
-            events = query_result.get("events", [])
-        else:
-            events = super_history_manager.load_events()
-
-        grouped = {}
-        for event in events:
-            bot = str(event.get("bot") or "N/A").upper()
-            grouped.setdefault(bot, []).append(event)
-
-        bots = []
-        for bot, rows in grouped.items():
-            metrics = super_history_manager.calculate_performance_metrics(rows)
-            stats = super_history_manager.calculate_stats(rows=rows)
-
-            bots.append({
-                "bot": bot,
-                "total_events": stats.get("total_events", 0),
-                "signals": stats.get("signals", 0),
-                "entries": stats.get("entries", 0),
-                "closed": stats.get("closed", 0),
-                "blocked": stats.get("blocked", 0),
-                "denied": stats.get("denied", 0),
-                **metrics,
-            })
-
-        bots.sort(key=lambda item: (
-            -item.get("pnl_total_pct", 0.0),
-            -item.get("wins", 0),
-            -item.get("trades", 0),
-            item.get("bot", ""),
-        ))
-
-        return {
-            "ok": True,
-            "generated_at": super_history_manager.data_hora_sp_str(),
-            "filters": {
-                "days": days or None,
-            },
-            "bots": bots,
-        }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
+    return performance_engine.build_performance_payload(
+        days=days or None,
+        group_by=group_by or "bot",
+    )
 
 @app.route("/history")
 def history_route():
