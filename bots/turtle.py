@@ -57,7 +57,7 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
-import ccxt
+from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask, request
 from upstash_redis import Redis
@@ -170,8 +170,7 @@ FUNNEL_KEY = "turtle_pro:funnel"
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 
-exchange = ccxt.bingx({"enableRateLimit": True})
-exchange.options["defaultType"] = "swap"
+exchange = get_exchange()
 
 redis_lock = threading.Lock()
 
