@@ -969,7 +969,7 @@ def scanner_loop():
             HEALTH["last_scanner_run"] = data_hora_sp_str()
             HEALTH["last_success"] = data_hora_sp_str()
             HEALTH["last_error"] = None
-            refresh_health_stats()
+            # refresh_health_stats()  # Memory Guard V2: estatísticas pesadas só no summary_loop
 
         except Exception as exc:
             HEALTH["last_error"] = f"scanner: {exc}"
@@ -1152,7 +1152,7 @@ def management_loop():
             HEALTH["last_management_run"] = data_hora_sp_str()
             HEALTH["last_success"] = data_hora_sp_str()
             HEALTH["last_error"] = None
-            refresh_health_stats()
+            # refresh_health_stats()  # Memory Guard V2: estatísticas pesadas só no summary_loop
 
         except Exception as exc:
             HEALTH["last_error"] = f"management: {exc}"
