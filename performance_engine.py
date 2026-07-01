@@ -182,3 +182,84 @@ def build_performance_payload(days=None, group_by="bot"):
         },
         "items": items,
     }
+
+
+def _recommendation_for_item(name, metrics):
+    trades = int(metrics.get("trades") or 0)
+    expectancy = _safe_float(metrics.get("expectancy_pct"), 0.0) or 0.0
+    profit_factor = _safe_float(metrics.get("profit_factor_pct"), 0.0) or 0.0
+    win_rate = _safe_float(metrics.get("win_rate_pct"), 0.0) or 0.0
+    pnl_total = _safe_float(metrics.get("pnl_total_pct"), 0.0) or 0.0
+    avg_giveback = _safe_float(metrics.get("avg_giveback_pct"), 0.0) or 0.0
+
+    if trades < 5:
+        action = "AGUARDAR_AMOSTRA"
+        severity = "INFO"
+        reason = "Amostra insuficiente para decisão estatística."
+    elif expectancy < 0 and profit_factor < 1:
+        action = "PAUSAR_OU_OBSERVAR"
+        severity = "ALTA"
+        reason = "Expectancy negativa e Profit Factor abaixo de 1."
+    elif pnl_total < 0 and win_rate < 35:
+        action = "REDUZIR_EXPOSICAO"
+        severity = "MEDIA"
+        reason = "PnL negativo com baixo win rate."
+    elif avg_giveback >= 2.5:
+        action = "REVISAR_TRAILING"
+        severity = "MEDIA"
+        reason = "Devolução média elevada após MFE."
+    elif expectancy > 0 and profit_factor > 1.5:
+        action = "MANTER_OU_AUMENTAR_GRADUAL"
+        severity = "POSITIVA"
+        reason = "Expectancy positiva e Profit Factor saudável."
+    else:
+        action = "MANTER_OBSERVACAO"
+        severity = "BAIXA"
+        reason = "Sem sinal estatístico forte para ajuste."
+
+    return {
+        "name": name,
+        "action": action,
+        "severity": severity,
+        "reason": reason,
+        "trades": trades,
+        "expectancy_pct": expectancy,
+        "profit_factor_pct": profit_factor,
+        "win_rate_pct": win_rate,
+        "pnl_total_pct": pnl_total,
+        "avg_giveback_pct": avg_giveback,
+    }
+
+
+def build_recommendations_payload(days=None, group_by="setup"):
+    payload = build_performance_payload(days=days, group_by=group_by)
+    items = payload.get("items", [])
+
+    recommendations = []
+    for item in items:
+        name = item.get(group_by) or item.get("bot") or item.get("setup") or item.get("symbol") or "N/A"
+        recommendations.append(_recommendation_for_item(name, item))
+
+    priority = {
+        "ALTA": 0,
+        "MEDIA": 1,
+        "POSITIVA": 2,
+        "BAIXA": 3,
+        "INFO": 4,
+    }
+
+    recommendations.sort(key=lambda item: (
+        priority.get(item.get("severity"), 9),
+        item.get("expectancy_pct", 0),
+        item.get("profit_factor_pct", 0),
+    ))
+
+    return {
+        "ok": True,
+        "generated_at": history_manager.data_hora_sp_str(),
+        "filters": {
+            "days": int(days) if str(days or "").isdigit() else None,
+            "group_by": group_by,
+        },
+        "recommendations": recommendations,
+    }

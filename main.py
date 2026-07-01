@@ -4711,6 +4711,23 @@ def analytics_performance_route():
         group_by=group_by or "bot",
     )
 
+
+@app.route("/analytics/recommendations")
+def analytics_recommendations_route():
+    try:
+        import performance_engine
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    days = request.args.get("days", default="", type=str)
+    group_by = request.args.get("group_by", default="setup", type=str)
+
+    return performance_engine.build_recommendations_payload(
+        days=days or None,
+        group_by=group_by or "setup",
+    )    
+
+
 @app.route("/history")
 def history_route():
     super_history_manager = __import__("history_manager")
