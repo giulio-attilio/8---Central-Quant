@@ -4829,7 +4829,114 @@ def history_audit_route():
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     
-    
+
+@app.route("/history/simulate")
+def history_simulate_route():
+    if os.environ.get("ENABLE_HISTORY_SIMULATION", "false").lower() != "true":
+        return {"ok": False, "error": "history simulation disabled"}
+
+    try:
+        import history_manager as super_history_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    bot = request.args.get("bot", default="TRENDPRO", type=str).upper()
+    symbol = request.args.get("symbol", default="BTCUSDT", type=str).upper()
+    setup = request.args.get("setup", default="NORMAL", type=str).upper()
+    side = request.args.get("side", default="LONG", type=str).upper()
+
+    trade_id = f"SIM-{bot}-{symbol}-{setup}-{side}"
+
+    events = [
+        ("TRADE_OPENED", {
+            "trade_id": trade_id,
+            "bot": bot,
+            "symbol": symbol,
+            "side": side,
+            "setup": setup,
+            "entry": 60000,
+            "sl": 59400,
+            "tp50": 60600,
+            "risk_pct": 1.0,
+            "score": 82,
+            "quality": "ALTA 🟢",
+        }),
+        ("TP50_HIT", {
+            "trade_id": trade_id,
+            "bot": bot,
+            "symbol": symbol,
+            "side": side,
+            "setup": setup,
+            "entry": 60000,
+            "price": 60600,
+            "tp50": 60600,
+            "pnl_pct": 1.0,
+        }),
+        ("BREAKEVEN_MOVED", {
+            "trade_id": trade_id,
+            "bot": bot,
+            "symbol": symbol,
+            "side": side,
+            "setup": setup,
+            "entry": 60000,
+            "new_stop": 60000,
+            "result_r": 1.5,
+        }),
+        ("TRAILING", {
+            "trade_id": trade_id,
+            "bot": bot,
+            "symbol": symbol,
+            "side": side,
+            "setup": setup,
+            "entry": 60000,
+            "new_stop": 60650,
+            "pnl_pct": 1.8,
+            "result_r": 1.8,
+            "mfe_max_pct": 2.4,
+            "mae_min_pct": 0.2,
+            "mfe_gave_back_pct": 0.6,
+        }),
+        ("TRADE_CLOSED", {
+            "trade_id": trade_id,
+            "bot": bot,
+            "symbol": symbol,
+            "side": side,
+            "setup": setup,
+            "entry": 60000,
+            "exit": 61200,
+            "pnl_pct": 2.0,
+            "result": "WIN",
+            "result_r": 2.0,
+            "mfe_max_pct": 2.8,
+            "mae_min_pct": 0.2,
+            "mfe_gave_back_pct": 0.8,
+            "reason": "SIMULATION",
+        }),
+    ]
+
+    generated = []
+    for event_name, payload in events:
+        saved = super_history_manager.publish_event(
+            event=event_name,
+            bot=bot,
+            payload=payload,
+            source="history_simulate",
+            trade_id=trade_id,
+        )
+        generated.append(saved)
+
+    return {
+        "ok": True,
+        "generated": len(generated),
+        "bot": bot,
+        "symbol": symbol,
+        "setup": setup,
+        "side": side,
+        "events": generated,
+        "audit": super_history_manager.audit_events(events=generated),
+    }
+
+
 @app.route("/snapshot")
 def snapshot_route():
     return {"text": build_snapshot_report()}
