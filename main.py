@@ -6899,6 +6899,68 @@ def learning_readiness_route():
     except Exception as exc:
         return {"ok": False, "error": str(exc)}, 500
 
+
+# ==========================================================
+# LEARNING AUTO REFRESH — V1.3
+# Mantém learning_state.json atualizado sem depender de comando manual.
+# Não altera Policy, scores, risco, bots nem corretora.
+# ==========================================================
+LEARNING_AUTO_REFRESH_ENABLED = env_bool("LEARNING_AUTO_REFRESH_ENABLED", True)
+LEARNING_AUTO_REFRESH_SECONDS = int(os.environ.get("LEARNING_AUTO_REFRESH_SECONDS", "900"))
+LEARNING_AUTO_REFRESH_MIN_SECONDS = 300
+LEARNING_AUTO_REFRESH_LAST = {"ts": None, "ok": None, "error": None, "summary": None, "readiness": None}
+
+
+def learning_auto_refresh_loop():
+    interval = max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS)
+    while True:
+        try:
+            import learning_engine
+            result = learning_engine.refresh_state(reason="auto_loop")
+            LEARNING_AUTO_REFRESH_LAST.update({
+                "ts": data_hora_sp_str(),
+                "ok": bool(result.get("ok")),
+                "error": None,
+                "summary": result.get("summary"),
+                "readiness": result.get("readiness"),
+            })
+        except Exception as exc:
+            LEARNING_AUTO_REFRESH_LAST.update({
+                "ts": data_hora_sp_str(),
+                "ok": False,
+                "error": str(exc),
+            })
+            print("ERRO LEARNING AUTO REFRESH:", exc)
+        time.sleep(interval)
+
+
+@app.route("/learning/auto/status")
+def learning_auto_status_route():
+    return {
+        "ok": True,
+        "enabled": LEARNING_AUTO_REFRESH_ENABLED,
+        "interval_seconds": max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS),
+        "last": LEARNING_AUTO_REFRESH_LAST,
+        "note": "Auto refresh apenas recalcula o estado do Learning. Não altera operação.",
+    }
+
+
+@app.route("/learning/refresh")
+def learning_refresh_route():
+    try:
+        import learning_engine
+        result = learning_engine.refresh_state(reason="manual_route")
+        LEARNING_AUTO_REFRESH_LAST.update({
+            "ts": data_hora_sp_str(),
+            "ok": bool(result.get("ok")),
+            "error": None,
+            "summary": result.get("summary"),
+            "readiness": result.get("readiness"),
+        })
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED
 
@@ -6915,6 +6977,12 @@ def start_central_runtime_once():
 
     threading.Thread(target=central_watchdog_loop, daemon=True).start()
     threading.Thread(target=memory_monitor_loop, daemon=True).start()
+
+    if LEARNING_AUTO_REFRESH_ENABLED:
+        if acquire_runtime_file_lock("learning_auto_refresh"):
+            threading.Thread(target=learning_auto_refresh_loop, daemon=True).start()
+        else:
+            print("LEARNING AUTO REFRESH NÃO INICIADO: outro processo já é líder")
 
     if acquire_runtime_file_lock("central_telegram_polling"):
         threading.Thread(target=central_telegram_command_loop, daemon=True).start()

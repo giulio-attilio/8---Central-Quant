@@ -30,7 +30,7 @@ LEARNING_AUDIT_FILE = DATA_DIR / "learning_audit.jsonl"
 LEARNING_EXPORT_FILE = DATA_DIR / "learning_export.json"
 LEARNING_MAX_READ = int(os.environ.get("LEARNING_MAX_READ", "10000"))
 
-VERSION = "2026-07-02-LEARNING-ENGINE-V1-2-OBSERVATIONS"
+VERSION = "2026-07-02-LEARNING-ENGINE-V1-3-AUTO-REFRESH"
 MODE = os.environ.get("LEARNING_ENGINE_MODE", "OBSERVE").strip().upper()
 
 MIN_CYCLES_OBSERVATION = int(os.environ.get("LEARNING_MIN_CYCLES_OBSERVATION", "20"))
@@ -652,6 +652,36 @@ def build_learning_report(limit=None):
     else:
         lines.append("A base começa a permitir recomendações com controle de confiança.")
     return "\n".join(lines), payload
+
+
+
+def refresh_state(reason="auto_refresh", limit=None):
+    """Recalcula o estado do Learning Engine e grava state/export/audit.
+
+    Esta funcao nao altera Policy, scores, risco, bots ou corretora.
+    Ela apenas mantém learning_state.json atualizado para a Central consultar
+    sem depender de comando manual no Telegram.
+    """
+    payload = build_learning_payload(limit=limit or LEARNING_MAX_READ)
+    _append_jsonl(LEARNING_AUDIT_FILE, {
+        "ts": data_hora_sp_str(),
+        "event": "LEARNING_STATE_REFRESH",
+        "reason": str(reason or "auto_refresh"),
+        "summary": payload.get("summary"),
+        "readiness": payload.get("readiness"),
+        "policy_suggestions": payload.get("policy_suggestions") or [],
+    })
+    return {
+        "ok": True,
+        "module": "learning_engine",
+        "version": VERSION,
+        "mode": MODE,
+        "reason": str(reason or "auto_refresh"),
+        "generated_at": payload.get("generated_at"),
+        "summary": payload.get("summary"),
+        "readiness": payload.get("readiness"),
+        "policy_suggestions": payload.get("policy_suggestions") or [],
+    }
 
 
 def get_status():
