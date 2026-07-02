@@ -170,7 +170,7 @@ FUNNEL_KEY = "turtle_pro:funnel"
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 
-exchange = get_exchange()
+exchange = get_exchange()   
 
 redis_lock = threading.Lock()
 

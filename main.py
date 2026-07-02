@@ -97,7 +97,13 @@ CENTRAL_TELEGRAM_CHAT_ID = os.environ.get("CENTRAL_TELEGRAM_CHAT_ID")
 CENTRAL_TELEGRAM_POLLING_ENABLED = env_bool("CENTRAL_TELEGRAM_POLLING_ENABLED", True)
 CENTRAL_DAILY_REPORT_ENABLED = env_bool("CENTRAL_DAILY_REPORT_ENABLED", True)
 CENTRAL_DAILY_REPORT_TIME = os.environ.get("CENTRAL_DAILY_REPORT_TIME", "23:55")
+# A partir desta versão, "executivo" envia o Executive Report Diário compacto.
+# Use CENTRAL_DAILY_REPORT_MODE=dashboard, daily ou audit se quiser voltar aos modos antigos.
 CENTRAL_DAILY_REPORT_MODE = os.environ.get("CENTRAL_DAILY_REPORT_MODE", "executivo").strip().lower()
+CENTRAL_MONTHLY_REPORT_ENABLED = env_bool("CENTRAL_MONTHLY_REPORT_ENABLED", True)
+# Envia no dia 1 às 00:05 consolidando o mês anterior.
+CENTRAL_MONTHLY_REPORT_DAY = int(os.environ.get("CENTRAL_MONTHLY_REPORT_DAY", "1"))
+CENTRAL_MONTHLY_REPORT_TIME = os.environ.get("CENTRAL_MONTHLY_REPORT_TIME", "00:05")
 
 # Telegram limita mensagens em ~4096 caracteres. Mantemos margem para cabeçalhos.
 TELEGRAM_CHUNK_SIZE = int(os.environ.get("TELEGRAM_CHUNK_SIZE", "3400"))
@@ -197,6 +203,7 @@ CENTRAL_SEND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_SEND_DUPLICA
 CENTRAL_TELEGRAM_ROUTER_STARTED = False
 CENTRAL_TELEGRAM_ROUTER_LOCK = threading.Lock()
 CENTRAL_DAILY_REPORT_SENT_DATE = None
+CENTRAL_MONTHLY_REPORT_SENT_KEY = None
 
 
 
@@ -4336,6 +4343,377 @@ def build_daily_report():
     return text
 
 
+
+# ==========================================================
+# EXECUTIVE REPORT DIÁRIO/MENSAL — COMPACTO PARA ANÁLISE
+# ==========================================================
+
+def _counter_top_lines(title, data, limit=10, empty="Sem dados."):
+    lines = [title]
+    if isinstance(data, dict) and data:
+        for key, value in list(data.items())[:limit]:
+            lines.append(f"- {key}: {value}")
+    else:
+        lines.append(f"- {empty}")
+    return lines
+
+
+def _safe_history_payload(limit=3000):
+    try:
+        import history_manager as super_history_manager
+        if hasattr(super_history_manager, "build_history_payload"):
+            return super_history_manager.build_history_payload(limit=limit)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": "history_manager indisponível"}
+
+
+def _safe_riskstats_payload():
+    try:
+        import history_manager as super_history_manager
+        if hasattr(super_history_manager, "build_riskstats_payload"):
+            return super_history_manager.build_riskstats_payload()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": "riskstats indisponível"}
+
+
+def _compact_history_block(limit=3000):
+    payload = _safe_history_payload(limit=limit)
+    if not payload.get("ok"):
+        return "📚 HISTORY\n- Indisponível: " + str(payload.get("error"))
+
+    totals = payload.get("totals", {}) or {}
+    perf = payload.get("performance", {}) or {}
+    lines = [
+        "📚 HISTORY — RESUMO COMPACTO",
+        f"Eventos: {totals.get('events', 0)} | Sinais: {totals.get('signals', 0)} | Entradas: {totals.get('opened', 0)} | Encerrados: {totals.get('closed', 0)}",
+        f"Bloqueados: {totals.get('blocked', 0)} | TP50: {totals.get('tp50', 0)} | BE: {totals.get('breakeven', 0)} | Trailing: {totals.get('trailing', 0)}",
+        f"PnL total: {perf.get('pnl_total_pct', 0)}% | WR: {perf.get('win_rate_pct', 0)}% | PF: {perf.get('profit_factor_pct', 0)} | R total: {perf.get('r_total', 0)}R",
+        "",
+    ]
+    lines += _counter_top_lines("Eventos por robô:", payload.get("by_bot", {}), limit=8, empty="sem eventos de robôs")
+    lines += [""] + _counter_top_lines("Top ativos:", payload.get("by_symbol", {}), limit=8, empty="sem ativos")
+    lines += [""] + _counter_top_lines("Top setups:", payload.get("by_setup", {}), limit=8, empty="sem setups")
+    return "\n".join(lines)
+
+
+def _compact_riskstats_block():
+    payload = _safe_riskstats_payload()
+    if not payload.get("ok"):
+        return "📊 RISKSTATS\n- Indisponível: " + str(payload.get("error"))
+
+    summary = payload.get("summary", {}) or {}
+    by_bot = payload.get("by_bot_closed", {}) or {}
+    by_symbol = payload.get("by_symbol_closed", {}) or {}
+    blocked = payload.get("blocked_by_reason", {}) or {}
+
+    lines = [
+        "📊 PERFORMANCE / RISKSTATS",
+        f"Trades encerrados: {payload.get('totals', {}).get('closed', 0)}",
+        f"WR: {summary.get('win_rate_pct', 0)}% | PnL: {summary.get('pnl_total_pct', 0)}% | PF: {summary.get('profit_factor_pct', 0)} | R: {summary.get('r_total', 0)}R",
+        "",
+        "Por robô:",
+    ]
+    if by_bot:
+        ranked = sorted(by_bot.items(), key=lambda x: float((x[1] or {}).get("pnl_total_pct") or 0), reverse=True)
+        for bot, s in ranked[:8]:
+            lines.append(f"- {bot}: {s.get('trades', 0)} trades | WR {s.get('win_rate_pct', 0)}% | PnL {s.get('pnl_total_pct', 0)}% | PF {s.get('profit_factor_pct', 0)}")
+    else:
+        lines.append("- Ainda sem trades encerrados.")
+
+    if by_symbol:
+        lines += ["", "Melhores ativos por PnL:"]
+        ranked_symbols = sorted(by_symbol.items(), key=lambda x: float((x[1] or {}).get("pnl_total_pct") or 0), reverse=True)
+        for sym, s in ranked_symbols[:8]:
+            lines.append(f"- {sym}: {s.get('trades', 0)} trades | PnL {s.get('pnl_total_pct', 0)}% | WR {s.get('win_rate_pct', 0)}%")
+
+    lines += ["", "Bloqueios relevantes:"]
+    if blocked:
+        for reason, count in list(blocked.items())[:8]:
+            lines.append(f"- {reason}: {count}")
+    else:
+        lines.append("- Nenhum bloqueio registrado.")
+    return "\n".join(lines)
+
+
+def _compact_decisionlog_block(limit=120):
+    rows = _read_jsonl_tail_v3(CENTRAL_DECISION_LOG_FILE, limit)
+    if not rows:
+        return "🧾 DECISION LOG\n- Sem decisões recentes registradas."
+
+    total = len(rows)
+    allow = 0
+    deny = 0
+    by_reason = {}
+    by_bot = {}
+    for item in rows:
+        decision = str(item.get("decision", item.get("status", item.get("result", "")))).upper()
+        if decision == "ALLOW":
+            allow += 1
+        if decision in {"DENY", "DENIED", "BLOCKED"}:
+            deny += 1
+        bot = str(item.get("bot") or item.get("robot") or item.get("source") or "N/A").upper()
+        by_bot[bot] = by_bot.get(bot, 0) + 1
+        reason = str(item.get("reason") or item.get("motivo") or item.get("result") or "N/A")
+        if decision in {"DENY", "DENIED", "BLOCKED"} or reason not in {"N/A", "ALLOW"}:
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+
+    lines = [
+        "🧾 DECISION LOG — RECENTE",
+        f"Decisões lidas: {total} | ALLOW: {allow} | DENY/BLOCK: {deny}",
+        "",
+    ]
+    lines += _counter_top_lines("Por robô:", dict(sorted(by_bot.items(), key=lambda x: x[1], reverse=True)), limit=8)
+    lines += [""] + _counter_top_lines("Motivos relevantes:", dict(sorted(by_reason.items(), key=lambda x: x[1], reverse=True)), limit=8, empty="sem motivos críticos")
+    return "\n".join(lines)
+
+
+def _compact_alerts_block():
+    status = central_watchdog_status()
+    mem = memory_snapshot("executive_alerts_memory", store=True)
+    alerts = []
+    if not status.get("ok"):
+        alerts.extend(status.get("reasons", []) or [])
+    if mem.get("usage_pct") and mem.get("usage_pct") >= MEMORY_ALERT_THRESHOLD_PCT:
+        alerts.append(f"Memória alta: {mem.get('usage_pct')}%")
+    for key, err in LOAD_ERRORS.items():
+        if err:
+            alerts.append(f"{key}: erro de carregamento: {err}")
+
+    lines = ["🚨 ALERTAS"]
+    if alerts:
+        for item in alerts[:12]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- Nenhum alerta crítico no momento.")
+    return "\n".join(lines)
+
+
+def build_executive_report_daily():
+    """
+    Relatório diário unificado para análise no ChatGPT.
+    Ele substitui a necessidade de rodar vários comandos diariamente, mas mantém
+    /history, /risk, /analytics, /decisionlog etc. para investigação sob demanda.
+    """
+    parts = [
+        "📦 EXECUTIVE REPORT DIÁRIO — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "Objetivo: resumo compacto para análise diária sem colar centenas de linhas.",
+        "",
+        "==============================\nEXECUTIVE\n==============================",
+        build_executive_report(),
+        "",
+        "==============================\nRISCO GLOBAL\n==============================",
+        build_daily_risk_summary_v3(),
+        "",
+        "==============================\nRANKING / ROBÔS\n==============================",
+        build_daily_ranking_summary_v3(),
+        "",
+        "==============================\nHISTORY\n==============================",
+        _compact_history_block(limit=3000),
+        "",
+        "==============================\nRISKSTATS\n==============================",
+        _compact_riskstats_block(),
+        "",
+        "==============================\nDECISION LOG\n==============================",
+        _compact_decisionlog_block(limit=120),
+        "",
+        "==============================\nALERTAS\n==============================",
+        _compact_alerts_block(),
+        "",
+        "==============================\nROBÔS — LEITURA EXECUTIVA\n==============================",
+    ]
+
+    for key in BOT_CONFIGS.keys():
+        module = LOADED_BOTS.get(key)
+        cfg = BOT_CONFIGS.get(key, {})
+        if not module:
+            parts.append(f"🤖 {key} — {cfg.get('name')}\nMódulo não carregado: {LOAD_ERRORS.get(key)}")
+            continue
+        try:
+            resumo = _bot_resumo_text(key, module)
+            parts.append(_daily_bot_block_v3(key, cfg, resumo))
+        except Exception as exc:
+            parts.append(f"🤖 {key} — {cfg.get('name')}\nErro ao gerar leitura executiva: {exc}")
+
+    parts += [
+        "",
+        "==============================\nCOMANDOS SOB DEMANDA\n==============================",
+        "Se precisar investigar detalhes: /history, /riskstats, /decisionlog, /executionstats, /risk, /heat, /bots, /health, /analytics.",
+    ]
+    text = "\n\n".join([str(x).strip() for x in parts if str(x).strip()])
+    force_gc_if_needed("executive_report_daily_end", force=True)
+    return text
+
+
+def _month_bounds_previous(now=None):
+    now = now or agora_sp()
+    first_current = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_prev = first_current - timedelta(seconds=1)
+    first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    key = first_prev.strftime("%Y-%m")
+    label = first_prev.strftime("%m/%Y")
+    return first_prev, first_current, key, label
+
+
+def _event_epoch_value(event):
+    try:
+        if event.get("epoch") is not None:
+            return float(event.get("epoch"))
+    except Exception:
+        pass
+    return None
+
+
+def _history_events_for_period(start_dt, end_dt, limit=20000):
+    try:
+        import history_manager as super_history_manager
+        if hasattr(super_history_manager, "load_events"):
+            events = super_history_manager.load_events(limit=limit)
+        else:
+            events = (_safe_history_payload(limit=limit).get("recent_events") or [])
+    except Exception:
+        events = []
+
+    start_epoch = start_dt.timestamp()
+    end_epoch = end_dt.timestamp()
+    filtered = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        epoch = _event_epoch_value(event)
+        if epoch is None:
+            # Sem epoch confiável, mantém apenas quando for o mês pelo texto de data.
+            ts = str(event.get("ts") or "")
+            if start_dt.strftime("/%m/%Y") in ts:
+                filtered.append(event)
+            continue
+        if start_epoch <= epoch < end_epoch:
+            filtered.append(event)
+    return filtered
+
+
+def _stats_from_closed_events(rows):
+    pnls = []
+    r_values = []
+    for item in rows:
+        pnl = _safe_float(item.get("result_pct"), None)
+        if pnl is not None:
+            pnls.append(pnl)
+        rr = _safe_float(item.get("result_r"), None)
+        if rr is not None:
+            r_values.append(rr)
+    wins = len([x for x in pnls if x > 0])
+    losses = len([x for x in pnls if x < 0])
+    be = len([x for x in pnls if x == 0])
+    gross_win = sum(x for x in pnls if x > 0)
+    gross_loss = abs(sum(x for x in pnls if x < 0))
+    return {
+        "trades": len(rows),
+        "wins": wins,
+        "losses": losses,
+        "be": be,
+        "win_rate_pct": round((wins / max(wins + losses, 1)) * 100, 2),
+        "pnl_total_pct": round(sum(pnls), 4),
+        "pnl_avg_pct": round(sum(pnls) / max(len(pnls), 1), 4) if pnls else 0.0,
+        "r_total": round(sum(r_values), 4),
+        "r_avg": round(sum(r_values) / max(len(r_values), 1), 4) if r_values else 0.0,
+        "profit_factor_pct": round(gross_win / gross_loss, 4) if gross_loss > 0 else (999 if gross_win > 0 else 0),
+    }
+
+
+def _monthly_group_stats(events, field):
+    groups = {}
+    for event in events:
+        key = str(event.get(field) or "N/A").upper()
+        groups.setdefault(key, []).append(event)
+    stats = {key: _stats_from_closed_events(rows) for key, rows in groups.items()}
+    return dict(sorted(stats.items(), key=lambda x: float(x[1].get("pnl_total_pct") or 0), reverse=True))
+
+
+def build_executive_report_monthly():
+    """Relatório mensal consolidando o mês anterior."""
+    start_dt, end_dt, month_key, month_label = _month_bounds_previous()
+    events = _history_events_for_period(start_dt, end_dt, limit=30000)
+
+    by_event = {}
+    blocked_by_reason = {}
+    closed = []
+    for event in events:
+        et = str(event.get("event") or "EVENT").upper()
+        by_event[et] = by_event.get(et, 0) + 1
+        if et == "TRADE_CLOSED":
+            closed.append(event)
+        if et == "TRADE_BLOCKED" or str(event.get("result") or "").upper() in {"DENY", "DENIED", "BLOCKED"}:
+            reason = str(event.get("reason") or event.get("result") or "N/A")
+            blocked_by_reason[reason] = blocked_by_reason.get(reason, 0) + 1
+
+    perf = _stats_from_closed_events(closed)
+    by_bot = _monthly_group_stats(closed, "bot")
+    by_symbol = _monthly_group_stats(closed, "symbol")
+    by_setup = _monthly_group_stats(closed, "setup")
+
+    lines = [
+        "📆 EXECUTIVE REPORT MENSAL — CENTRAL QUANT",
+        f"Mês consolidado: {month_label}",
+        f"Período: {start_dt.strftime('%d/%m/%Y %H:%M')} até {(end_dt - timedelta(seconds=1)).strftime('%d/%m/%Y %H:%M')}",
+        f"Gerado em: {data_hora_sp_str()}",
+        "",
+        "==============================\nPERFORMANCE DO MÊS\n==============================",
+        f"Trades encerrados: {perf.get('trades', 0)} | Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('be', 0)}",
+        f"Win rate: {perf.get('win_rate_pct', 0)}% | PnL total: {perf.get('pnl_total_pct', 0)}% | PnL médio: {perf.get('pnl_avg_pct', 0)}%",
+        f"Profit Factor: {perf.get('profit_factor_pct', 0)} | R total: {perf.get('r_total', 0)}R | R médio: {perf.get('r_avg', 0)}R",
+        "",
+        "==============================\nEVENTOS DO MÊS\n==============================",
+    ]
+    lines += _counter_top_lines("Eventos:", dict(sorted(by_event.items(), key=lambda x: x[1], reverse=True)), limit=12, empty="sem eventos no mês")
+
+    lines += ["", "==============================\nROBÔS\n==============================", "Ranking por PnL:"]
+    if by_bot:
+        for bot, s in list(by_bot.items())[:10]:
+            lines.append(f"- {bot}: {s.get('trades')} trades | WR {s.get('win_rate_pct')}% | PnL {s.get('pnl_total_pct')}% | PF {s.get('profit_factor_pct')}")
+    else:
+        lines.append("- Sem trades encerrados no mês.")
+
+    lines += ["", "==============================\nATIVOS\n==============================", "Top ativos por PnL:"]
+    if by_symbol:
+        for sym, s in list(by_symbol.items())[:10]:
+            lines.append(f"- {sym}: {s.get('trades')} trades | WR {s.get('win_rate_pct')}% | PnL {s.get('pnl_total_pct')}%")
+    else:
+        lines.append("- Sem ativos com trades encerrados no mês.")
+
+    lines += ["", "==============================\nSETUPS\n==============================", "Top setups por PnL:"]
+    if by_setup:
+        for setup, s in list(by_setup.items())[:10]:
+            lines.append(f"- {setup}: {s.get('trades')} trades | WR {s.get('win_rate_pct')}% | PnL {s.get('pnl_total_pct')}%")
+    else:
+        lines.append("- Sem setups com trades encerrados no mês.")
+
+    lines += ["", "==============================\nBLOQUEIOS\n=============================="]
+    lines += _counter_top_lines("Motivos:", dict(sorted(blocked_by_reason.items(), key=lambda x: x[1], reverse=True)), limit=10, empty="sem bloqueios no mês")
+
+    lines += [
+        "",
+        "==============================\nSTATUS ATUAL PÓS-FECHAMENTO\n==============================",
+        build_executive_report(),
+        "",
+        "==============================\nRECOMENDAÇÃO\n==============================",
+    ]
+    if perf.get("trades", 0) <= 0:
+        lines.append("- Ainda não há trades encerrados suficientes no Super History para avaliação mensal estatística.")
+    else:
+        if perf.get("profit_factor_pct", 0) < 1:
+            lines.append("- Mês com Profit Factor abaixo de 1: revisar robôs/setups negativos antes de aumentar risco.")
+        elif perf.get("profit_factor_pct", 0) >= 1.5 and perf.get("pnl_total_pct", 0) > 0:
+            lines.append("- Mês positivo: considerar aumento gradual apenas nos robôs com amostra e expectativa positiva.")
+        else:
+            lines.append("- Manter risco controlado e aprofundar análise por robô antes de mudanças estruturais.")
+
+    text = "\n".join(lines)
+    force_gc_if_needed("executive_report_monthly_end", force=True)
+    return text
+
 def _read_jsonl_tail_v3(path, limit=200):
     try:
         p = Path(path)
@@ -4501,6 +4879,22 @@ def dashboard_route():
 @app.route("/diário")
 def daily_route():
     return {"text": build_daily_report()}
+
+
+@app.route("/executivereport")
+@app.route("/executive_report")
+@app.route("/dailyexecutive")
+@app.route("/daily_executive")
+def executive_report_daily_route():
+    return {"text": build_executive_report_daily()}
+
+
+@app.route("/monthly")
+@app.route("/mensal")
+@app.route("/monthlyreport")
+@app.route("/monthly_report")
+def executive_report_monthly_route():
+    return {"text": build_executive_report_monthly()}
 
 
 @app.route("/evolution")
@@ -5880,6 +6274,10 @@ def build_central_command_reply(text: str):
         return build_dashboard_report()
     if cmd0 in {"/daily", "/diario", "/diário"}:
         return build_daily_report()
+    if cmd0 in {"/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive"}:
+        return build_executive_report_daily()
+    if cmd0 in {"/monthly", "/mensal", "/monthlyreport", "/monthly_report"}:
+        return build_executive_report_monthly()
     if cmd0 in {"/support"}:
         return build_support_report()
     if cmd0 in {"/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo"}:
@@ -6037,6 +6435,14 @@ def _central_command_title(text: str):
         "/daily": "DAILY",
         "/diario": "DAILY",
         "/diário": "DAILY",
+        "/executivereport": "EXECUTIVE REPORT",
+        "/executive_report": "EXECUTIVE REPORT",
+        "/dailyexecutive": "EXECUTIVE REPORT",
+        "/daily_executive": "EXECUTIVE REPORT",
+        "/monthly": "MENSAL",
+        "/mensal": "MENSAL",
+        "/monthlyreport": "MENSAL",
+        "/monthly_report": "MENSAL",
         "/support": "SUPORTE",
         "/audit": "AUDITORIA",
         "/auditoria": "AUDITORIA",
@@ -6084,7 +6490,7 @@ def _central_command_title(text: str):
 def _is_heavy_central_command(text: str):
     cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
     return cmd in {
-        "/dashboard", "/daily", "/diario", "/diário", "/support",
+        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
         "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital",
@@ -6204,13 +6610,14 @@ def central_telegram_command_loop():
 
 def central_daily_report_loop():
     """
-    Envia relatório diário automático pelo Telegram exclusivo da Central.
-    Usa os mesmos mecanismos de chunking do Telegram para evitar perder mensagens grandes.
+    Envia relatórios automáticos pelo Telegram exclusivo da Central.
+    - Diário: Executive Report compacto no horário configurado.
+    - Mensal: dia 1 às 00:05 por padrão, consolidando o mês anterior.
     """
-    global CENTRAL_DAILY_REPORT_SENT_DATE
+    global CENTRAL_DAILY_REPORT_SENT_DATE, CENTRAL_MONTHLY_REPORT_SENT_KEY
 
-    if not CENTRAL_DAILY_REPORT_ENABLED:
-        print("RELATÓRIO DIÁRIO CENTRAL DESLIGADO POR ENV")
+    if not CENTRAL_DAILY_REPORT_ENABLED and not CENTRAL_MONTHLY_REPORT_ENABLED:
+        print("RELATÓRIOS AUTOMÁTICOS CENTRAL DESLIGADOS POR ENV")
         return
 
     while True:
@@ -6219,8 +6626,9 @@ def central_daily_report_loop():
             current_hm = now.strftime("%H:%M")
             today = now.strftime("%Y-%m-%d")
 
-            if current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
-                print(f"GERANDO RELATÓRIO DIÁRIO CENTRAL {today} {current_hm}")
+            # Relatório diário.
+            if CENTRAL_DAILY_REPORT_ENABLED and current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
+                print(f"GERANDO EXECUTIVE REPORT DIÁRIO CENTRAL {today} {current_hm}")
                 try:
                     save_daily_snapshot(label="auto")
                 except Exception as exc:
@@ -6230,12 +6638,15 @@ def central_daily_report_loop():
                 if mode in {"completo", "full", "audit", "auditoria"}:
                     payload = build_audit_parts()
                     title = "RELATÓRIO DIÁRIO COMPLETO"
-                elif mode in {"daily", "diario", "diário"}:
+                elif mode in {"daily", "diario", "diário", "legacy"}:
                     payload = build_daily_report()
                     title = "RELATÓRIO DIÁRIO"
-                else:
+                elif mode in {"dashboard", "painel"}:
                     payload = build_dashboard_report()
                     title = "DASHBOARD DIÁRIO"
+                else:
+                    payload = build_executive_report_daily()
+                    title = "EXECUTIVE REPORT DIÁRIO"
 
                 if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
                     telegram_send_with_token(
@@ -6254,8 +6665,30 @@ def central_daily_report_loop():
                 force_gc_if_needed("central_daily_report_after_send", force=True)
                 CENTRAL_DAILY_REPORT_SENT_DATE = today
 
+            # Relatório mensal: por padrão, dia 1 às 00:05, consolidando o mês anterior.
+            if CENTRAL_MONTHLY_REPORT_ENABLED and now.day == CENTRAL_MONTHLY_REPORT_DAY and current_hm == CENTRAL_MONTHLY_REPORT_TIME:
+                _start_dt, _end_dt, month_key, _month_label = _month_bounds_previous(now)
+                if CENTRAL_MONTHLY_REPORT_SENT_KEY != month_key:
+                    print(f"GERANDO EXECUTIVE REPORT MENSAL CENTRAL {month_key} {current_hm}")
+                    payload = build_executive_report_monthly()
+                    if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
+                        telegram_send_with_token(
+                            CENTRAL_TELEGRAM_BOT_TOKEN,
+                            CENTRAL_TELEGRAM_CHAT_ID,
+                            payload,
+                            title="EXECUTIVE REPORT MENSAL",
+                        )
+                    else:
+                        print("RELATÓRIO MENSAL CENTRAL NÃO ENVIADO: token/chat ausente")
+                    try:
+                        del payload
+                    except Exception:
+                        pass
+                    force_gc_if_needed("central_monthly_report_after_send", force=True)
+                    CENTRAL_MONTHLY_REPORT_SENT_KEY = month_key
+
         except Exception as exc:
-            print("ERRO RELATÓRIO DIÁRIO CENTRAL:", exc)
+            print("ERRO RELATÓRIOS AUTOMÁTICOS CENTRAL:", exc)
 
         time.sleep(30)
 
