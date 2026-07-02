@@ -1,7 +1,7 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em FALCON.
 # ==============================================================================
 # FALCON STRIKE - ORB PRO - CENTRAL QUANT
-# Versao: 2026-06-28-FALCON-STRIKE-ORB-V1-SUPER-HISTORY
+# Versao: 2026-07-02-FALCON-STRIKE-ORB-V1-CQ-FRAMEWORK
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -57,6 +57,14 @@ except Exception as _history_import_exc:
     HISTORY_IMPORT_ERROR = str(_history_import_exc)
 else:
     HISTORY_IMPORT_ERROR = None
+
+try:
+    import cq_bot_framework as cq_framework
+except Exception as _cq_framework_import_exc:
+    cq_framework = None
+    CQ_FRAMEWORK_IMPORT_ERROR = str(_cq_framework_import_exc)
+else:
+    CQ_FRAMEWORK_IMPORT_ERROR = None
 
 app = Flask(__name__)
 
@@ -243,6 +251,8 @@ HEALTH = {
     "enable_real_trading": ENABLE_REAL_TRADING,
     "broker_loaded": central_broker is not None,
     "broker_import_error": BROKER_IMPORT_ERROR,
+    "cq_framework_loaded": cq_framework is not None,
+    "cq_framework_import_error": CQ_FRAMEWORK_IMPORT_ERROR,
     "last_execution_decision": None,
     "last_execution_order": None,
 }
@@ -575,6 +585,12 @@ def falcon_history_result_from_pct(value):
 
 
 def falcon_history_payload(pos, event=None, extra=None):
+    """Payload padrão Falcon → History/Journal/Lifecycle/Context/Learning.
+
+    Esta função preserva compatibilidade com o payload antigo, mas passa a enriquecer
+    os eventos usando o CQ Bot Framework. Ela é tolerante a falhas: se o framework
+    não carregar, o Falcon continua operando com o payload legado.
+    """
     pos = pos if isinstance(pos, dict) else {}
     event = event if isinstance(event, dict) else {}
     extra = extra if isinstance(extra, dict) else {}
@@ -583,6 +599,7 @@ def falcon_history_payload(pos, event=None, extra=None):
     reasons = execution_decision.get("reasons") if isinstance(execution_decision, dict) else None
     warnings = execution_decision.get("warnings") if isinstance(execution_decision, dict) else None
 
+    # Payload legado mantido por compatibilidade com History/Analytics atuais.
     payload = {
         "bot": "FALCON",
         "bot_name": BOT_NAME,
@@ -597,15 +614,25 @@ def falcon_history_payload(pos, event=None, extra=None):
         "initial_stop": pos.get("initial_stop"),
         "tp50": pos.get("tp50"),
         "risk_pct": pos.get("risk_pct"),
-        "score": pos.get("score_falcon"),
+        "score": pos.get("score_falcon") or pos.get("score"),
         "quality": pos.get("quality"),
         "timeframe": pos.get("timeframe") or TIMEFRAME,
         "mode": FALCON_MODE,
+        "execution_mode": pos.get("execution_mode") or FALCON_MODE,
         "event_created_at": event.get("created_at") or data_hora_sp_str(),
+        "created_at": event.get("created_at") or data_hora_sp_str(),
         "mfe_pct": pos.get("mfe_pct") or event.get("mfe_pct"),
         "mae_pct": pos.get("mae_pct") or event.get("mae_pct"),
         "mfe_r": pos.get("mfe_r") or event.get("mfe_r"),
         "mae_r": pos.get("mae_r") or event.get("mae_r"),
+        "atr": pos.get("atr") or event.get("atr"),
+        "atr_pct": pos.get("atr_pct") or event.get("atr_pct"),
+        "adx": pos.get("adx") or event.get("adx"),
+        "volume_rel": pos.get("volume_rel") or event.get("volume_rel"),
+        "volume_status": pos.get("volume_status") or event.get("volume_status"),
+        "market_regime": pos.get("market_regime") or event.get("market_regime"),
+        "btc_alignment": pos.get("btc_alignment") or event.get("btc_alignment"),
+        "volatility": pos.get("volatility") or event.get("volatility"),
         "execution_decision": execution_decision,
         "reasons": reasons or extra.get("reasons") or [],
         "warnings": warnings or extra.get("warnings") or [],
@@ -624,6 +651,33 @@ def falcon_history_payload(pos, event=None, extra=None):
         payload["pnl_r"] = extra.get("result_r")
     if extra.get("exit_price") is not None:
         payload["exit_price"] = extra.get("exit_price")
+
+    # Enriquecimento padronizado para Context/Learning/Decision futuros.
+    if cq_framework is not None:
+        try:
+            standard = cq_framework.build_standard_payload(
+                bot="FALCON",
+                bot_name=BOT_NAME,
+                mode=FALCON_MODE,
+                position=pos,
+                event=event,
+                extra=extra,
+                event_type=event.get("event_type") or extra.get("event") or payload.get("event"),
+                now_str=payload.get("event_created_at") or data_hora_sp_str(),
+            )
+            for key, value in standard.items():
+                # Campos de contexto/framework devem prevalecer quando existem.
+                if key in {
+                    "standard_payload_version", "context", "score_bucket", "risk_bucket",
+                    "hour", "minute", "weekday", "session_br", "volume_status",
+                    "market_regime", "volatility", "risk_decision", "risk_allowed",
+                    "paper_positions", "memory_usage_pct", "raw_event"
+                }:
+                    payload[key] = value
+                elif payload.get(key) in (None, "", [], {}):
+                    payload[key] = value
+        except Exception as exc:
+            HEALTH["last_warning"] = f"cq framework payload falcon: {exc}"
 
     return payload
 
@@ -647,6 +701,18 @@ def record_event(event_type, pos, extra=None):
         "setup": pos.get("setup"),
         "side": pos.get("side"),
         "created_at": data_hora_sp_str(),
+        "trade_id": pos.get("id") or pos.get("trade_id"),
+        "entry": pos.get("entry"),
+        "stop": pos.get("stop"),
+        "tp50": pos.get("tp50"),
+        "score": pos.get("score_falcon") or pos.get("score"),
+        "quality": pos.get("quality"),
+        "risk_pct": pos.get("risk_pct"),
+        "adx": pos.get("adx"),
+        "atr": pos.get("atr"),
+        "atr_pct": pos.get("atr_pct"),
+        "volume_rel": pos.get("volume_rel"),
+        "execution_mode": pos.get("execution_mode") or FALCON_MODE,
         "mfe_pct": safe_float(pos.get("mfe_pct")),
         "mae_pct": safe_float(pos.get("mae_pct")),
         "mfe_r": safe_float(pos.get("mfe_r")),
@@ -654,6 +720,29 @@ def record_event(event_type, pos, extra=None):
     }
     if extra:
         event.update(extra)
+
+    if cq_framework is not None:
+        try:
+            standard_event = cq_framework.build_standard_payload(
+                bot="FALCON",
+                bot_name=BOT_NAME,
+                mode=FALCON_MODE,
+                position=pos,
+                event=event,
+                extra=extra or {},
+                event_type=event_type,
+                now_str=event.get("created_at") or data_hora_sp_str(),
+            )
+            for key in [
+                "standard_payload_version", "context", "score_bucket", "risk_bucket",
+                "hour", "minute", "weekday", "session_br", "volume_status",
+                "market_regime", "volatility", "paper_positions", "memory_usage_pct",
+            ]:
+                if standard_event.get(key) is not None:
+                    event[key] = standard_event.get(key)
+        except Exception as exc:
+            HEALTH["last_warning"] = f"cq framework event falcon: {exc}"
+
     redis_list_append(EVENTS_KEY, event)
 
     et = str(event_type or "").upper()
