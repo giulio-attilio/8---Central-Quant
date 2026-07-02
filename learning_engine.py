@@ -30,7 +30,7 @@ LEARNING_AUDIT_FILE = DATA_DIR / "learning_audit.jsonl"
 LEARNING_EXPORT_FILE = DATA_DIR / "learning_export.json"
 LEARNING_MAX_READ = int(os.environ.get("LEARNING_MAX_READ", "10000"))
 
-VERSION = "2026-07-02-LEARNING-ENGINE-V1-3-AUTO-REFRESH"
+VERSION = "2026-07-02-LEARNING-ENGINE-V1-4-BRIEF"
 MODE = os.environ.get("LEARNING_ENGINE_MODE", "OBSERVE").strip().upper()
 
 MIN_CYCLES_OBSERVATION = int(os.environ.get("LEARNING_MIN_CYCLES_OBSERVATION", "20"))
@@ -653,6 +653,140 @@ def build_learning_report(limit=None):
         lines.append("A base começa a permitir recomendações com controle de confiança.")
     return "\n".join(lines), payload
 
+
+
+
+def _fmt_signed(value, ndigits=4):
+    try:
+        v = float(value)
+        sign = "+" if v > 0 else ""
+        return f"{sign}{v:.{ndigits}f}"
+    except Exception:
+        return "0"
+
+
+def _top_items(items, max_items=3, min_cycles=1):
+    rows = []
+    for item in items or []:
+        try:
+            cycles = int(item.get("cycles") or 0)
+        except Exception:
+            cycles = 0
+        if cycles >= min_cycles:
+            rows.append(item)
+    return rows[:max_items]
+
+
+def build_learning_brief(limit=None):
+    """Resumo executivo curto para uso diário/consultoria.
+
+    Mantém o Learning em modo OBSERVE: não altera Policy, scores, risco,
+    bots nem corretora. O objetivo é reduzir JSON grande para um briefing.
+    """
+    payload = build_learning_payload(limit=limit or LEARNING_MAX_READ)
+    s = payload.get("summary") or {}
+    r = payload.get("readiness") or {}
+    groups = payload.get("groups") or {}
+    observations = payload.get("observations") or []
+    policy_suggestions = payload.get("policy_suggestions") or []
+    cov = payload.get("coverage") or {}
+    ctx = cov.get("context") or {}
+    core = cov.get("core") or {}
+
+    lines = [
+        "🧠 LEARNING BRIEF — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Modo: {payload.get('mode')} | Nível: {r.get('level')} | Confiança: {r.get('confidence')}/100",
+        "",
+        "Base:",
+        f"Ciclos: {s.get('cycles', 0)} | Eventos: {s.get('events', 0)} | Fechados: {s.get('closed', 0)} | Abertos: {s.get('open', 0)} | Bloqueados: {s.get('blocked', 0)}",
+        "",
+        "Leitura rápida:",
+    ]
+
+    if r.get("level") == "AMOSTRA_INSUFICIENTE":
+        lines.append("- Base ainda insuficiente para recomendação operacional.")
+    elif r.get("level") == "OBSERVACAO":
+        lines.append("- Base já permite estatística descritiva, sem recomendação operacional.")
+    elif r.get("level") == "INDICIOS":
+        lines.append("- Já existem indícios preliminares, mas Policy continua bloqueado.")
+    else:
+        lines.append("- Base evoluindo para recomendações, ainda com guardrails ativos.")
+
+    if policy_suggestions:
+        applied = [x for x in policy_suggestions if x.get("apply")]
+        if applied:
+            lines.append("- ALERTA: há sugestão marcada para aplicação. Revisar Policy antes de qualquer uso.")
+        else:
+            lines.append("- Nenhuma alteração operacional autorizada pelo Learning.")
+    else:
+        lines.append("- Nenhuma sugestão de Policy ativa.")
+
+    lines += ["", "Indícios por bot:"]
+    shown = 0
+    for item in _top_items(groups.get("by_bot"), max_items=5):
+        lines.append(
+            f"- {item.get('name')}: ciclos {item.get('cycles')} | fechados {item.get('closed')} | "
+            f"WR {_fmt_pct(item.get('win_rate_pct'))} | Exp {_fmt_signed(item.get('expectancy'))} | "
+            f"status {item.get('sample_status') or 'N/A'}"
+        )
+        shown += 1
+    if not shown:
+        lines.append("- Sem dados suficientes por bot.")
+
+    lines += ["", "Indícios por setup:"]
+    shown = 0
+    for item in _top_items(groups.get("by_setup"), max_items=5):
+        lines.append(
+            f"- {item.get('name')}: ciclos {item.get('cycles')} | fechados {item.get('closed')} | "
+            f"WR {_fmt_pct(item.get('win_rate_pct'))} | Exp {_fmt_signed(item.get('expectancy'))} | "
+            f"status {item.get('sample_status') or 'N/A'}"
+        )
+        shown += 1
+    if not shown:
+        lines.append("- Sem dados suficientes por setup.")
+
+    # Alertas de qualidade de dados: só mostra o essencial.
+    weak = []
+    for field in ["score", "mfe_pct", "mae_pct"]:
+        item = core.get(field) or {}
+        pct = _safe_float(item.get("pct"), 0.0)
+        if pct < 70:
+            weak.append(f"{field} {pct}%")
+    for field in ["score_bucket", "risk_bucket", "execution_mode", "paper_positions", "memory_usage_pct", "adx", "atr", "rsi", "btc_alignment", "volatility"]:
+        item = ctx.get(field) or {}
+        pct = _safe_float(item.get("pct"), 0.0)
+        if pct < 70:
+            weak.append(f"{field} {pct}%")
+
+    lines += ["", "Qualidade dos dados:"]
+    if weak:
+        lines.append("- Campos com baixa cobertura: " + "; ".join(weak[:8]) + ("..." if len(weak) > 8 else ""))
+        lines.append("- Recomendação: manter Learning em OBSERVE e bloquear alterações automáticas.")
+    else:
+        lines.append("- Cobertura mínima aceitável para leitura preliminar.")
+
+    # Observações automáticas resumidas.
+    important_obs = []
+    for obs in observations:
+        if obs.get("type") in {"data_quality", "readiness"}:
+            important_obs.append(obs.get("message"))
+        elif obs.get("type") == "group" and obs.get("sample_status") not in {"AMOSTRA_INSUFICIENTE", None}:
+            important_obs.append(obs.get("message"))
+    lines += ["", "Observações:"]
+    if important_obs:
+        for msg in important_obs[:5]:
+            lines.append(f"- {msg}")
+    else:
+        lines.append("- Nenhuma observação relevante além de amostra insuficiente.")
+
+    lines += [
+        "",
+        "Decisão operacional:",
+        "- NÃO alterar bots, scores, risco, Policy ou corretora com esta amostra.",
+        "- Usar este brief apenas para acompanhamento consultivo.",
+    ]
+    return "\n".join(lines), payload
 
 
 def refresh_state(reason="auto_refresh", limit=None):

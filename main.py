@@ -6881,6 +6881,17 @@ def learning_route():
         return {"ok": False, "error": str(exc)}, 500
 
 
+@app.route("/learning/brief")
+@app.route("/learning/resumo")
+def learning_brief_route():
+    try:
+        import learning_engine
+        text, payload = learning_engine.build_learning_brief()
+        return {"text": text, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
 @app.route("/learning/state")
 def learning_state_route():
     try:
