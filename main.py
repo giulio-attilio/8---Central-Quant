@@ -4785,6 +4785,7 @@ def analytics_recommendations_route():
 @app.route("/stats")
 def stats_route():
     try:
+        import history_manager
         import history_statistics
 
         days = request.args.get("days", default="", type=str)
