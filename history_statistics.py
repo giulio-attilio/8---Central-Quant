@@ -128,3 +128,23 @@ def build_statistics():
         "by_setup": _group_stats(closed, "setup"),
         "by_side": _group_stats(closed, "side"),
     }
+
+
+def build_statistics_from_events(events, days=None):
+    events = list(events or [])
+    closed = get_closed_trades(events)
+
+    payload = {
+        "ok": True,
+        "generated_at": history_manager.data_hora_sp_str(),
+        "filters": {"days": days},
+        "events_total": len(events),
+        "closed_trades": len(closed),
+        "overall": calculate_stats(closed),
+        "by_bot": _group_stats(closed, "bot"),
+        "by_symbol": _group_stats(closed, "symbol"),
+        "by_setup": _group_stats(closed, "setup"),
+        "by_side": _group_stats(closed, "side"),
+    }
+
+    return payload

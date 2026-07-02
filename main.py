@@ -4786,7 +4786,16 @@ def analytics_recommendations_route():
 def stats_route():
     try:
         import history_statistics
+
+        days = request.args.get("days", default="", type=str)
+
+        if days and str(days).isdigit():
+            result = history_manager.query_history(days=int(days), limit=None)
+            events = result.get("events", [])
+            return history_statistics.build_statistics_from_events(events, days=int(days))
+
         return history_statistics.build_statistics()
+
     except Exception as exc:
         return {
             "ok": False,
