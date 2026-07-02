@@ -4782,6 +4782,18 @@ def analytics_recommendations_route():
     )    
 
 
+@app.route("/stats")
+def stats_route():
+    try:
+        import history_statistics
+        return history_statistics.build_statistics()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+        }
+    
+
 @app.route("/history")
 def history_route():
     super_history_manager = __import__("history_manager")
