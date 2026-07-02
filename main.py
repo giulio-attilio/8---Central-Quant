@@ -6761,10 +6761,7 @@ def simulateoff_route(arg=None):
     return {"text": build_simulate_off_report(arg)}
 
 
-@app.route("/learning")
-@app.route("/aprendizado")
-def learning_route():
-    return {"text": build_learning_report()}
+# Legacy /learning route removed: handled by Learning Engine V1 routes below.
 
 
 @app.route("/quantos")
@@ -6874,6 +6871,7 @@ def learning_status_route():
 
 @app.route("/learning")
 @app.route("/learning/report")
+@app.route("/aprendizado")
 def learning_route():
     try:
         import learning_engine
