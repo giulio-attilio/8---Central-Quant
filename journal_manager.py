@@ -618,7 +618,7 @@ def append_lifecycle_event(event):
     if not item:
         return {"ok": False, "skipped": True, "error": "evento não é lifecycle válido"}
     uid = item.get("uid")
-    if uid and _seen(uid):
+    if uid and _dedup_seen(uid):
         return {"ok": True, "dedup": True, "uid": uid}
     ok = _append_jsonl(LIFECYCLE_FILE, item)
     return {"ok": ok, "dedup": False, "event": item}
@@ -657,7 +657,7 @@ def load_lifecycle_events(limit=None):
     return rows[-int(limit or LIFECYCLE_MAX_READ):]
 
 
-def query_lifecycle(days=None, limit=None, event=None, bot=None, symbol=None, setup=None, status=None):
+def query_lifecycle(days=None, limit=None, event=None, bot=None, symbol=None, setup=None, status=None, side=None, quality=None, market_regime=None, hour=None, **kwargs):
     rows = load_lifecycle_events(limit=limit or LIFECYCLE_MAX_READ)
     cutoff = None
     if days:
@@ -677,6 +677,23 @@ def query_lifecycle(days=None, limit=None, event=None, bot=None, symbol=None, se
             continue
         if setup and str(row.get("setup") or "").upper() != str(setup).upper():
             continue
+        if side and str(row.get("side") or "").upper() != str(side).upper():
+            continue
+        if quality and str(row.get("quality") or "").upper() != str(quality).upper():
+            continue
+        if market_regime and str(row.get("market_regime") or row.get("regime") or "").upper() != str(market_regime).upper():
+            continue
+        if hour not in (None, ""):
+            try:
+                target_hour = int(hour)
+                row_hour = row.get("hour")
+                if row_hour is None:
+                    dt = _parse_ts(row.get("ts"))
+                    row_hour = dt.hour if dt else None
+                if row_hour is None or int(row_hour) != target_hour:
+                    continue
+            except Exception:
+                pass
         result.append(row)
     lifecycles = build_trade_lifecycles(result)
     if status:
@@ -685,7 +702,7 @@ def query_lifecycle(days=None, limit=None, event=None, bot=None, symbol=None, se
     return {
         "ok": True,
         "generated_at": data_hora_sp_str(),
-        "filters": {"days": days, "limit": limit, "event": event, "bot": bot, "symbol": symbol, "setup": setup, "status": status},
+        "filters": {"days": days, "limit": limit, "event": event, "bot": bot, "symbol": symbol, "setup": setup, "status": status, "side": side, "quality": quality, "market_regime": market_regime, "hour": hour},
         "events": result[-int(limit or LIFECYCLE_MAX_READ):],
         "lifecycles": lifecycles,
         "summary": summarize_lifecycles(lifecycles),
@@ -767,8 +784,8 @@ def summarize_lifecycles(lifecycles):
     }
 
 
-def build_lifecycle_report(days=None, limit=None, status=None):
-    payload = query_lifecycle(days=days, limit=limit, status=status)
+def build_lifecycle_report(days=None, limit=None, status=None, event=None, bot=None, symbol=None, setup=None, side=None, quality=None, market_regime=None, hour=None, **kwargs):
+    payload = query_lifecycle(days=days, limit=limit, status=status, event=event, bot=bot, symbol=symbol, setup=setup, side=side, quality=quality, market_regime=market_regime, hour=hour)
     summary = payload.get("summary", {})
     lifecycles = payload.get("lifecycles", [])
     lines = [

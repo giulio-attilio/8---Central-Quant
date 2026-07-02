@@ -4982,7 +4982,11 @@ def journal_open_route():
         import journal_manager
         rows = journal_manager.load_lifecycle_events(limit=journal_manager.LIFECYCLE_MAX_READ)
         lifecycles = journal_manager.build_trade_lifecycles(rows)
-        open_items = [item for item in lifecycles.values() if item.get("status") == "OPEN"]
+        if isinstance(lifecycles, dict):
+            lifecycle_items = list(lifecycles.values())
+        else:
+            lifecycle_items = list(lifecycles or [])
+        open_items = [item for item in lifecycle_items if item.get("status") == "OPEN"]
         return {
             "ok": True,
             "generated_at": data_hora_sp_str(),
