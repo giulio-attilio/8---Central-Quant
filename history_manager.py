@@ -1198,11 +1198,22 @@ def audit_events(events=None):
         "TRADE_OPENED": ["bot", "symbol", "side", "setup", "entry", "stop", "tp50"],
         "TP50_HIT": ["bot", "symbol", "side", "setup", "tp50"],
         "BREAKEVEN": ["bot", "symbol", "side", "setup"],
+        "BREAKEVEN_MOVED": ["bot", "symbol", "side", "setup"],
         "TRAILING_UPDATED": ["bot", "symbol", "side", "setup"],
         "TRADE_CLOSED": ["bot", "symbol", "side", "setup", "entry", "exit_price", "result_pct"],
         "TRADE_BLOCKED": ["bot", "symbol", "side", "setup", "result"],
         "RISK_DECISION": ["bot", "symbol", "side", "setup", "result"],
         "SIGNAL_CREATED": ["bot", "symbol", "side", "setup"],
+    }
+
+    admin_events = {
+        "CENTRAL_COMMAND",
+        "MEMORY",
+        "HEALTH",
+        "BOT_STATUS",
+        "CENTRAL_STATUS",
+        "WATCHDOG",
+        "STARTUP",
     }
 
     audit = {}
@@ -1223,6 +1234,9 @@ def audit_events(events=None):
 
         audit[bot]["events"] += 1
         audit[bot]["by_event"][event_name] = audit[bot]["by_event"].get(event_name, 0) + 1
+
+        if event_name in admin_events:
+            continue
 
         required = required_by_event.get(event_name, ["bot", "symbol", "side", "setup"])
         for field in required:
