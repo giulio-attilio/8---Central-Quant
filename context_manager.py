@@ -22,7 +22,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 CONTEXT_EXPORT_FILE = DATA_DIR / "context_export.json"
 CONTEXT_SEEN_FILE = DATA_DIR / "context_seen.json"
-CONTEXT_VERSION = "2026-07-02-CONTEXT-MANAGER-V1"
+CONTEXT_VERSION = "2026-07-02-CONTEXT-MANAGER-V1-1-COVERAGE"
 
 
 def agora_sp():
@@ -74,38 +74,52 @@ def _first(payload, keys, default=None):
     return default
 
 
-def _deep_get(payload, keys, default=None):
-    """Busca recursiva leve em payloads dos bots, sem custo alto."""
-    if not isinstance(payload, dict):
+def _deep_get(payload, keys, default=None, max_depth=5):
+    """
+    Busca recursiva em payloads heterogêneos dos bots.
+
+    V1.1 aumenta a cobertura para eventos que chegam como:
+    event.raw.raw.execution_decision, event.raw.falcon_event, context aninhado, etc.
+    Mantém limite de profundidade para não pesar no Render.
+    """
+    if not isinstance(payload, dict) or max_depth <= 0:
         return default
 
     direct = _first(payload, keys, None)
     if direct is not None and direct != "":
         return direct
 
-    # Campos comuns onde os bots guardam contexto interno.
-    for container_key in (
+    preferred = (
+        "context",
         "raw",
         "falcon_event",
         "execution_decision",
         "risk_decision",
-        "context",
         "market_context",
         "details",
         "payload",
-    ):
+        "state",
+        "event",
+    )
+
+    for container_key in preferred:
         child = payload.get(container_key)
         if isinstance(child, dict):
-            value = _deep_get(child, keys, None)
+            value = _deep_get(child, keys, None, max_depth=max_depth - 1)
             if value is not None and value != "":
                 return value
 
-    # Último recurso: varre apenas um nível de dicts para não pesar.
     for child in payload.values():
         if isinstance(child, dict):
-            value = _first(child, keys, None)
+            value = _deep_get(child, keys, None, max_depth=max_depth - 1)
             if value is not None and value != "":
                 return value
+        elif isinstance(child, list) and max_depth > 1:
+            for entry in child[:5]:
+                if isinstance(entry, dict):
+                    value = _deep_get(entry, keys, None, max_depth=max_depth - 1)
+                    if value is not None and value != "":
+                        return value
     return default
 
 
@@ -242,15 +256,46 @@ def enrich_event(event):
     context.update(time_ctx)
     context.update(risk_ctx)
     context.update(market_ctx)
+    # Completa métricas importantes que nem todos os bots mandam no topo do evento.
+    # Isso melhora a cobertura do Learning sem alterar decisão operacional.
+    score_value = _safe_float(item.get("score"), None)
+    if score_value is None:
+        score_value = _safe_float(_deep_get(raw, ["score", "signal_score", "meme_score", "qualidade_pontos"], None), None)
+
+    risk_value = _safe_float(item.get("risk_pct"), None)
+    if risk_value is None:
+        risk_value = _safe_float(_deep_get(raw, ["risk_pct", "risco_pct", "risk"], None), None)
+
+    mfe_value = _safe_float(item.get("mfe_pct"), None)
+    if mfe_value is None:
+        mfe_value = _safe_float(_deep_get(raw, ["mfe_pct", "mfe", "max_favorable_excursion_pct"], None), None)
+
+    mae_value = _safe_float(item.get("mae_pct"), None)
+    if mae_value is None:
+        mae_value = _safe_float(_deep_get(raw, ["mae_pct", "mae", "max_adverse_excursion_pct"], None), None)
+
+    quality_value = item.get("quality") or _deep_get(raw, ["quality", "qualidade", "classification"], None)
+
     context.update({
-        "quality_normalized": _normalize_quality(item.get("quality") or _deep_get(raw, ["quality", "qualidade", "classification"], None)),
-        "score_bucket": score_bucket(item.get("score")),
-        "risk_bucket": risk_bucket(item.get("risk_pct")),
-        "mfe_bucket": pct_bucket(_deep_get(raw, ["mfe_pct", "mfe"], item.get("mfe_pct"))),
-        "mae_bucket": pct_bucket(_deep_get(raw, ["mae_pct", "mae"], item.get("mae_pct"))),
+        "quality_normalized": _normalize_quality(quality_value),
+        "score_bucket": score_bucket(score_value),
+        "risk_bucket": risk_bucket(risk_value),
+        "mfe_bucket": pct_bucket(mfe_value),
+        "mae_bucket": pct_bucket(mae_value),
     })
 
-    # Campos úteis também ficam no topo para facilitar filtros simples.
+    # Campos úteis também ficam no topo para facilitar filtros simples e Learning.
+    if item.get("score") is None and score_value is not None:
+        item["score"] = score_value
+    if item.get("risk_pct") is None and risk_value is not None:
+        item["risk_pct"] = risk_value
+    if item.get("mfe_pct") is None and mfe_value is not None:
+        item["mfe_pct"] = mfe_value
+    if item.get("mae_pct") is None and mae_value is not None:
+        item["mae_pct"] = mae_value
+    if item.get("quality") is None and quality_value is not None:
+        item["quality"] = quality_value
+
     for key, value in context.items():
         if item.get(key) is None and value is not None:
             item[key] = value
