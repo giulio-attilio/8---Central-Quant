@@ -6798,6 +6798,65 @@ def context_route():
         return {"ok": False, "error": str(exc)}, 500
 
 
+
+# ==========================================================
+# POLICY ENGINE ROUTES
+# ==========================================================
+@app.route("/policy/status")
+@app.route("/politica/status")
+def policy_status_route():
+    try:
+        import policy_engine
+        return policy_engine.get_status()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/policy")
+@app.route("/policy/report")
+@app.route("/politica")
+def policy_route():
+    try:
+        import policy_engine
+        bot = request.args.get("bot") if "request" in globals() else None
+        return {"text": policy_engine.build_policy_report(bot=bot)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/policy/state")
+@app.route("/policy/json")
+def policy_state_route():
+    try:
+        import policy_engine
+        return policy_engine.build_policy_payload()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/policy/audit")
+def policy_audit_route():
+    try:
+        import policy_engine
+        limit = request.args.get("limit", 100)
+        return policy_engine.build_policy_audit_payload(limit=limit)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/policy/simulate")
+@app.route("/policy/simulate/<bot>")
+def policy_simulate_route(bot=None):
+    try:
+        import policy_engine
+        payload = request.get_json(silent=True) or {} if request.method != "GET" else {}
+        bot_value = bot or request.args.get("bot") or payload.get("bot")
+        score = request.args.get("score") or payload.get("score")
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        return policy_engine.calculate_policy_decision(bot=bot_value, score=score, context=context, dry_run=True)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED
 
