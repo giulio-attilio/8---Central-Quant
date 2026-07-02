@@ -24,16 +24,45 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
 
+
 TIMEZONE_BR = timezone(timedelta(hours=-3))
+
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+
+DATA_DIR = Path(
+    os.getenv("DATA_DIR", str(BASE_DIR / "data"))
+).resolve()
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_EVENTS_FILE = DATA_DIR / "history_events.jsonl"
 DECISION_LOG_FILE = DATA_DIR / "decision_log.jsonl"
 TIMELINE_LOG_FILE = DATA_DIR / "timeline.jsonl"
 HISTORY_EXPORT_FILE = DATA_DIR / "history_export.json"
 HISTORY_SEEN_FILE = DATA_DIR / "history_seen.json"
+
+
+def ensure_history_files():
+    """Garante que os arquivos básicos do Super History existam."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    for file_path in [
+        HISTORY_EVENTS_FILE,
+        DECISION_LOG_FILE,
+        TIMELINE_LOG_FILE,
+    ]:
+        if not file_path.exists():
+            file_path.touch()
+
+    if not HISTORY_EXPORT_FILE.exists():
+        HISTORY_EXPORT_FILE.write_text("{}", encoding="utf-8")
+
+    if not HISTORY_SEEN_FILE.exists():
+        HISTORY_SEEN_FILE.write_text("{}", encoding="utf-8")
+
+
+ensure_history_files()
+
 
 HISTORY_MAX_READ = int(os.environ.get("HISTORY_MAX_READ", "2000"))
 HISTORY_REPORT_DAYS = int(os.environ.get("HISTORY_REPORT_DAYS", "7"))
