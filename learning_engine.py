@@ -30,7 +30,7 @@ LEARNING_AUDIT_FILE = DATA_DIR / "learning_audit.jsonl"
 LEARNING_EXPORT_FILE = DATA_DIR / "learning_export.json"
 LEARNING_MAX_READ = int(os.environ.get("LEARNING_MAX_READ", "10000"))
 
-VERSION = "2026-07-02-LEARNING-ENGINE-V1-1-CONTEXT-READ"
+VERSION = "2026-07-02-LEARNING-ENGINE-V1-2-OBSERVATIONS"
 MODE = os.environ.get("LEARNING_ENGINE_MODE", "OBSERVE").strip().upper()
 
 MIN_CYCLES_OBSERVATION = int(os.environ.get("LEARNING_MIN_CYCLES_OBSERVATION", "20"))
@@ -379,6 +379,106 @@ def _group_summary(rows, key, limit=8):
     return items[:limit]
 
 
+def _sample_label(cycles, closed):
+    if closed >= MIN_CLOSED_HIGH:
+        return "ALTA_CONFIANCA"
+    if closed >= MIN_CLOSED_MODERATE:
+        return "CONFIANCA_MODERADA"
+    if cycles >= MIN_CYCLES_HINTS:
+        return "INDICIOS"
+    if cycles >= MIN_CYCLES_OBSERVATION:
+        return "OBSERVACAO"
+    return "AMOSTRA_INSUFICIENTE"
+
+
+def _build_observations(payload):
+    """Gera observações conservadoras sem alterar Policy Engine."""
+    groups = payload.get("groups") or {}
+    summary = payload.get("summary") or {}
+    observations = []
+
+    observations.append({
+        "type": "readiness",
+        "level": payload.get("readiness", {}).get("level"),
+        "confidence": payload.get("readiness", {}).get("confidence", 0),
+        "message": "Learning em modo OBSERVE. Nenhuma política operacional foi alterada.",
+    })
+
+    for group_name, items in groups.items():
+        for item in (items or [])[:8]:
+            cycles = _safe_int(item.get("cycles"), 0)
+            closed = _safe_int(item.get("closed"), 0)
+            expectancy = _safe_float(item.get("expectancy"), 0.0)
+            wr = _safe_float(item.get("win_rate_pct"), 0.0)
+            sample = _sample_label(cycles, closed)
+            if cycles <= 0:
+                continue
+            observations.append({
+                "type": "group",
+                "group": group_name,
+                "name": item.get("name"),
+                "cycles": cycles,
+                "closed": closed,
+                "sample_status": sample,
+                "expectancy": expectancy,
+                "win_rate_pct": wr,
+                "message": (
+                    f"{group_name.replace('by_', '').upper()} {item.get('name')}: "
+                    f"{cycles} ciclos, {closed} fechados, expectancy {expectancy}. "
+                    f"Status: {sample}."
+                ),
+            })
+
+    # Diagnóstico de qualidade de dados para orientar próxima instrumentação.
+    coverage = payload.get("coverage") or {}
+    ctx = coverage.get("context") or {}
+    weak_fields = []
+    for field in ["score_bucket", "risk_bucket", "execution_mode", "paper_positions", "memory_usage_pct", "adx", "atr", "rsi", "btc_alignment", "volatility"]:
+        pct = _safe_float((ctx.get(field) or {}).get("pct"), 0.0)
+        if pct < 70:
+            weak_fields.append({"field": field, "pct": pct})
+    if weak_fields:
+        observations.append({
+            "type": "data_quality",
+            "level": "ATENCAO",
+            "fields": weak_fields,
+            "message": "Alguns campos de contexto ainda têm baixa cobertura; recomendações devem permanecer bloqueadas.",
+        })
+
+    return observations[:40]
+
+
+def _build_policy_suggestions(payload, observations):
+    """Nesta V1.2, apenas prepara sugestões bloqueadas por amostra/confiança."""
+    readiness = payload.get("readiness") or {}
+    confidence = _safe_int(readiness.get("confidence"), 0)
+    suggestions = []
+
+    if confidence < 25:
+        suggestions.append({
+            "bot": "GLOBAL",
+            "action": "NO_CHANGE",
+            "status": "BLOCKED_SAMPLE",
+            "confidence": confidence,
+            "reason": "Amostra insuficiente para alterar Policy Engine.",
+            "apply": False,
+        })
+        return suggestions
+
+    # Guardrail: mesmo em INDICIOS, não aplica nada automaticamente.
+    for obs in observations:
+        if obs.get("type") == "group" and obs.get("closed", 0) >= 20:
+            suggestions.append({
+                "bot": obs.get("name"),
+                "action": "OBSERVE_ONLY",
+                "status": "CANDIDATE",
+                "confidence": min(confidence, 40),
+                "reason": obs.get("message"),
+                "apply": False,
+            })
+    return suggestions[:10]
+
+
 def build_learning_payload(limit=None):
     data = _load_journal_data(limit=limit)
     lifecycles = _flatten_rows(data.get("lifecycles") or [])
@@ -402,6 +502,9 @@ def build_learning_payload(limit=None):
     by_setup = _group_summary(lifecycles, "setup")
     by_symbol = _group_summary(lifecycles, "symbol")
     by_hour = _group_summary(events, "hour")
+    by_session = _group_summary(events, "session_br")
+    by_score_bucket = _group_summary(events, "score_bucket")
+    by_risk_bucket = _group_summary(events, "risk_bucket")
 
     payload = {
         "ok": True,
@@ -432,6 +535,9 @@ def build_learning_payload(limit=None):
             "by_setup": by_setup,
             "by_symbol": by_symbol,
             "by_hour": by_hour,
+            "by_session": by_session,
+            "by_score_bucket": by_score_bucket,
+            "by_risk_bucket": by_risk_bucket,
         },
         "errors": data.get("errors") or [],
         "notes": [
@@ -439,6 +545,11 @@ def build_learning_payload(limit=None):
             "Com poucos ciclos, usar apenas como telemetria e diagnóstico de maturidade.",
         ],
     }
+    observations = _build_observations(payload)
+    policy_suggestions = _build_policy_suggestions(payload, observations)
+    payload["observations"] = observations
+    payload["policy_suggestions"] = policy_suggestions
+
     _write_json(LEARNING_EXPORT_FILE, payload)
     _write_json(LEARNING_STATE_FILE, {
         "version": VERSION,
@@ -446,8 +557,8 @@ def build_learning_payload(limit=None):
         "updated_at": data_hora_sp_str(),
         "readiness": readiness,
         "summary": payload["summary"],
-        "recommendations": [],
-        "policy_suggestions": [],
+        "recommendations": observations,
+        "policy_suggestions": policy_suggestions,
         "can_influence_policy": False,
     })
     _append_jsonl(LEARNING_AUDIT_FILE, {
@@ -514,6 +625,18 @@ def build_learning_report(limit=None):
         )
     if not (groups.get("by_setup") or []):
         lines.append("Sem dados por setup ainda.")
+
+    observations = payload.get("observations") or []
+    lines += ["", "Observações automáticas:"]
+    shown = 0
+    for obs in observations:
+        if obs.get("type") in {"group", "data_quality"}:
+            lines.append(f"- {obs.get('message')}")
+            shown += 1
+        if shown >= 6:
+            break
+    if shown == 0:
+        lines.append("Nenhuma observação relevante ainda.")
 
     lines += [
         "",
