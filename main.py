@@ -6580,6 +6580,12 @@ def start_central_command_routers():
 # QUANT OS ROUTES
 # ==========================================================
 
+@app.route("/journal")
+@app.route("/journal/<arg>")
+def journal_route(arg=None):
+    return {"text": build_journal_report(arg)}
+
+
 @app.route("/trade")
 @app.route("/trade/<arg>")
 @app.route("/replay")
