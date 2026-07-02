@@ -283,6 +283,11 @@ def _recommendation_for_item(name, metrics):
         "win_rate_pct": win_rate,
         "pnl_total_pct": pnl_total,
         "avg_giveback_pct": avg_giveback,
+        "score_0_100": metrics.get("score_0_100"),
+        "rating": metrics.get("rating"),
+        "confidence": metrics.get("confidence"),
+        "sample_status": metrics.get("sample_status"),
+        "risk_bias": metrics.get("risk_bias"),
         **rating,
     }
 
