@@ -330,9 +330,16 @@ def build_recommendations_payload(days=None, group_by="setup"):
     }
 
 
-def build_analytics_report(days=None, group_by="setup"):
+def build_analytics_report(days=None, group_by="setup", show_all=False):
     payload = build_recommendations_payload(days=days, group_by=group_by)
     recommendations = payload.get("recommendations", [])
+
+    if not show_all:
+        recommendations = [
+            item
+            for item in recommendations
+            if int(item.get("trades") or 0) > 0
+        ]
 
     lines = [
         "🧠 ANALYTICS — CENTRAL QUANT",
