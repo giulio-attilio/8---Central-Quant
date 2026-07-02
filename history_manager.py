@@ -1214,6 +1214,7 @@ def audit_events(events=None):
         "CENTRAL_STATUS",
         "WATCHDOG",
         "STARTUP",
+        "RISK_SNAPSHOT",
     }
 
     audit = {}
