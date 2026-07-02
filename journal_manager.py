@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - TRADE JOURNAL MANAGER
-# Versão: 2026-07-02-TRADE-JOURNAL-V1
+# Versão: 2026-07-02-TRADE-JOURNAL-V2-LIFECYCLE
 #
 # Objetivo:
 # - Criar um diário persistente de trades encerrados da Central Quant.
@@ -26,6 +26,9 @@ JOURNAL_FILE = DATA_DIR / "trade_journal.jsonl"
 JOURNAL_SEEN_FILE = DATA_DIR / "trade_journal_seen.json"
 JOURNAL_EXPORT_FILE = DATA_DIR / "trade_journal_export.json"
 JOURNAL_MAX_READ = int(os.environ.get("JOURNAL_MAX_READ", "5000"))
+LIFECYCLE_FILE = DATA_DIR / "trade_lifecycle.jsonl"
+LIFECYCLE_EXPORT_FILE = DATA_DIR / "trade_lifecycle_export.json"
+LIFECYCLE_MAX_READ = int(os.environ.get("LIFECYCLE_MAX_READ", "10000"))
 JOURNAL_SEEN_MAX = int(os.environ.get("JOURNAL_SEEN_MAX", "10000"))
 
 
@@ -37,6 +40,10 @@ def ensure_journal_files():
         JOURNAL_SEEN_FILE.write_text("{}", encoding="utf-8")
     if not JOURNAL_EXPORT_FILE.exists():
         JOURNAL_EXPORT_FILE.write_text("{}", encoding="utf-8")
+    if not LIFECYCLE_FILE.exists():
+        LIFECYCLE_FILE.touch()
+    if not LIFECYCLE_EXPORT_FILE.exists():
+        LIFECYCLE_EXPORT_FILE.write_text("{}", encoding="utf-8")
 
 
 ensure_journal_files()
@@ -529,15 +536,298 @@ def export_journal(limit=None):
     return payload
 
 
+
+# ==============================================================================
+# TRADE LIFECYCLE JOURNAL V2
+# ============================================================================
+LIFECYCLE_EVENTS = {
+    "SIGNAL_CREATED",
+    "TRADE_OPENED",
+    "TP50_HIT",
+    "BREAKEVEN",
+    "TRAILING_UPDATED",
+    "TRADE_CLOSED",
+    "TRADE_BLOCKED",
+}
+
+
+def _event_lifecycle_uid(event):
+    if not isinstance(event, dict):
+        return f"raw-{time.time()}"
+    raw_uid = _first(event, ["uid", "event_id", "id"], None)
+    event_name = str(_first(event, ["event", "event_type", "type"], "EVENT") or "EVENT").upper()
+    trade_id = _first(event, ["trade_id", "position_id", "client_trade_id"], "")
+    symbol = normalize_symbol(_nested_first(event, ["symbol", "ativo", "pair", "ticker"], ""))
+    side = normalize_side(_nested_first(event, ["side", "direction", "signal"], ""))
+    ts = _first(event, ["ts", "timestamp", "created_at", "closed_at", "event_ts", "epoch"], "")
+    if raw_uid:
+        return f"lifecycle|{event_name}|{raw_uid}"
+    return f"lifecycle|{event_name}|{trade_id}|{symbol}|{side}|{ts}"
+
+
+def normalize_lifecycle_event(event):
+    """Converte qualquer evento operacional do History em uma linha de ciclo do trade."""
+    if not isinstance(event, dict):
+        return None
+    event_name = str(_first(event, ["event", "event_type", "type"], "EVENT") or "EVENT").upper().strip()
+    if event_name not in LIFECYCLE_EVENTS:
+        return None
+
+    raw = event.get("raw") if isinstance(event.get("raw"), dict) else event
+    trade_id = _first(event, ["trade_id", "position_id", "client_trade_id"], None) or _nested_first(raw, ["trade_id", "position_id", "client_trade_id"], None)
+    bot = str(_nested_first(event, ["bot", "bot_name", "strategy", "source"], "") or "").upper().strip()
+    source = str(_first(event, ["source"], bot or "central") or "central").lower()
+    symbol = normalize_symbol(_nested_first(event, ["symbol", "ativo", "pair", "ticker"], ""))
+    side = normalize_side(_nested_first(event, ["side", "direction", "signal"], ""))
+    setup = str(_nested_first(event, ["setup", "signal_type", "setup_label", "strategy"], "") or "").upper().strip()
+    ts = _first(event, ["ts", "created_at", "timestamp", "closed_at"], None) or data_hora_sp_str()
+    epoch = _safe_float(_first(event, ["epoch"], None), time.time())
+
+    if not trade_id:
+        # fallback estável o bastante para sinais/entradas sem id explícito
+        trade_id = f"{bot or source}|{symbol}|{side}|{setup}|{ts}"
+
+    return {
+        "uid": _event_lifecycle_uid(event),
+        "ts": ts,
+        "epoch": epoch,
+        "event": event_name,
+        "source": source,
+        "trade_id": str(trade_id),
+        "bot": bot or source.upper(),
+        "setup": setup,
+        "symbol": symbol,
+        "side": side,
+        "score": _safe_float(_nested_first(event, ["score", "signal_score", "meme_score", "qualidade_pontos"], None), None),
+        "quality": _nested_first(event, ["quality", "qualidade", "classification"], None),
+        "entry": _safe_float(_nested_first(event, ["entry", "entrada", "entry_price"], None), None),
+        "stop": _safe_float(_nested_first(event, ["stop", "sl", "initial_sl", "stop_atual"], None), None),
+        "tp50": _safe_float(_nested_first(event, ["tp50", "tp_50"], None), None),
+        "exit_price": _safe_float(_nested_first(event, ["exit_price", "close_price", "price", "exit"], None), None),
+        "result_pct": _safe_float(_nested_first(event, ["result_pct", "pnl_pct", "current_pct", "open_pct", "pnl"], None), None),
+        "result_r": _safe_float(_nested_first(event, ["result_r", "pnl_r", "current_r", "open_r"], None), None),
+        "mfe_pct": _safe_float(_nested_first(event, ["mfe_pct", "max_favorable_excursion_pct", "max_profit_pct"], None), None),
+        "mae_pct": _safe_float(_nested_first(event, ["mae_pct", "max_adverse_excursion_pct", "max_drawdown_pct"], None), None),
+        "reason": _nested_first(event, ["reason", "motivo", "exit_reason", "block_reason"], None),
+        "raw": event,
+    }
+
+
+def append_lifecycle_event(event):
+    item = normalize_lifecycle_event(event)
+    if not item:
+        return {"ok": False, "skipped": True, "error": "evento não é lifecycle válido"}
+    uid = item.get("uid")
+    if uid and _seen(uid):
+        return {"ok": True, "dedup": True, "uid": uid}
+    ok = _append_jsonl(LIFECYCLE_FILE, item)
+    return {"ok": ok, "dedup": False, "event": item}
+
+
+def load_lifecycle_events(limit=None):
+    rows = _read_jsonl_tail(LIFECYCLE_FILE, limit=limit or LIFECYCLE_MAX_READ)
+    # Compatibilidade: trades fechados da V1 também aparecem como ciclo fechado.
+    if not rows:
+        for trade in load_journal_trades(limit=JOURNAL_MAX_READ):
+            rows.append({
+                "uid": f"compat|closed|{trade.get('trade_id') or trade.get('uid')}",
+                "ts": trade.get("closed_at") or trade.get("ts") or data_hora_sp_str(),
+                "epoch": trade.get("epoch") or time.time(),
+                "event": "TRADE_CLOSED",
+                "source": trade.get("source") or str(trade.get("bot") or "central").lower(),
+                "trade_id": str(trade.get("trade_id") or trade.get("uid") or ""),
+                "bot": trade.get("bot"),
+                "setup": trade.get("setup"),
+                "symbol": trade.get("symbol"),
+                "side": trade.get("side"),
+                "entry": trade.get("entry"),
+                "stop": trade.get("stop"),
+                "tp50": trade.get("tp50"),
+                "exit_price": trade.get("exit_price"),
+                "result_pct": trade.get("result_pct"),
+                "result_r": trade.get("result_r"),
+                "mfe_pct": trade.get("mfe_pct"),
+                "mae_pct": trade.get("mae_pct"),
+                "quality": trade.get("quality"),
+                "score": trade.get("score"),
+                "reason": trade.get("exit_reason") or trade.get("reason"),
+                "raw": trade,
+            })
+    rows.sort(key=lambda x: _safe_float(x.get("epoch"), 0) or 0)
+    return rows[-int(limit or LIFECYCLE_MAX_READ):]
+
+
+def query_lifecycle(days=None, limit=None, event=None, bot=None, symbol=None, setup=None, status=None):
+    rows = load_lifecycle_events(limit=limit or LIFECYCLE_MAX_READ)
+    cutoff = None
+    if days:
+        try:
+            cutoff = time.time() - (float(days) * 86400)
+        except Exception:
+            cutoff = None
+    result = []
+    for row in rows:
+        if cutoff and (_safe_float(row.get("epoch"), 0) or 0) < cutoff:
+            continue
+        if event and str(row.get("event") or "").upper() != str(event).upper():
+            continue
+        if bot and str(row.get("bot") or "").upper() != str(bot).upper():
+            continue
+        if symbol and normalize_symbol(row.get("symbol")) != normalize_symbol(symbol):
+            continue
+        if setup and str(row.get("setup") or "").upper() != str(setup).upper():
+            continue
+        result.append(row)
+    lifecycles = build_trade_lifecycles(result)
+    if status:
+        status = str(status).lower()
+        lifecycles = [x for x in lifecycles if str(x.get("status") or "").lower() == status]
+    return {
+        "ok": True,
+        "generated_at": data_hora_sp_str(),
+        "filters": {"days": days, "limit": limit, "event": event, "bot": bot, "symbol": symbol, "setup": setup, "status": status},
+        "events": result[-int(limit or LIFECYCLE_MAX_READ):],
+        "lifecycles": lifecycles,
+        "summary": summarize_lifecycles(lifecycles),
+    }
+
+
+def build_trade_lifecycles(rows=None):
+    rows = list(rows if rows is not None else load_lifecycle_events())
+    buckets = defaultdict(list)
+    for row in rows:
+        tid = row.get("trade_id") or row.get("uid") or "SEM_ID"
+        buckets[str(tid)].append(row)
+
+    lifecycles = []
+    closed_events = {"TRADE_CLOSED"}
+    blocked_events = {"TRADE_BLOCKED"}
+    for trade_id, events in buckets.items():
+        events.sort(key=lambda x: _safe_float(x.get("epoch"), 0) or 0)
+        first = events[0] if events else {}
+        last = events[-1] if events else {}
+        names = [str(e.get("event") or "") for e in events]
+        status = "OPEN"
+        if any(x in closed_events for x in names):
+            status = "CLOSED"
+        elif any(x in blocked_events for x in names):
+            status = "BLOCKED"
+        elif "SIGNAL_CREATED" in names and "TRADE_OPENED" not in names:
+            status = "SIGNAL_ONLY"
+        started_at = first.get("ts")
+        updated_at = last.get("ts")
+        duration = _minutes_between(started_at, updated_at)
+        lifecycles.append({
+            "trade_id": trade_id,
+            "status": status,
+            "bot": last.get("bot") or first.get("bot"),
+            "setup": last.get("setup") or first.get("setup"),
+            "symbol": last.get("symbol") or first.get("symbol"),
+            "side": last.get("side") or first.get("side"),
+            "started_at": started_at,
+            "updated_at": updated_at,
+            "duration_minutes": duration,
+            "event_count": len(events),
+            "events": names,
+            "last_event": last.get("event"),
+            "entry": last.get("entry") or first.get("entry"),
+            "stop": last.get("stop") or first.get("stop"),
+            "tp50": last.get("tp50") or first.get("tp50"),
+            "exit_price": last.get("exit_price"),
+            "result_pct": last.get("result_pct"),
+            "result_r": last.get("result_r"),
+            "mfe_pct": last.get("mfe_pct"),
+            "mae_pct": last.get("mae_pct"),
+            "quality": last.get("quality") or first.get("quality"),
+            "score": last.get("score") or first.get("score"),
+            "reason": last.get("reason"),
+            "timeline": events,
+        })
+    lifecycles.sort(key=lambda x: _parse_ts(x.get("updated_at")) or datetime.min, reverse=True)
+    return lifecycles
+
+
+def summarize_lifecycles(lifecycles):
+    total = len(lifecycles or [])
+    by_status = Counter([x.get("status") or "N/A" for x in lifecycles or []])
+    by_bot = Counter([x.get("bot") or "N/A" for x in lifecycles or []])
+    by_event = Counter()
+    for item in lifecycles or []:
+        for event in item.get("events") or []:
+            by_event[event] += 1
+    return {
+        "trades": total,
+        "open": by_status.get("OPEN", 0),
+        "closed": by_status.get("CLOSED", 0),
+        "blocked": by_status.get("BLOCKED", 0),
+        "signal_only": by_status.get("SIGNAL_ONLY", 0),
+        "by_status": dict(by_status),
+        "by_bot": dict(by_bot),
+        "by_event": dict(by_event),
+    }
+
+
+def build_lifecycle_report(days=None, limit=None, status=None):
+    payload = query_lifecycle(days=days, limit=limit, status=status)
+    summary = payload.get("summary", {})
+    lifecycles = payload.get("lifecycles", [])
+    lines = [
+        "📓 TRADE LIFECYCLE JOURNAL — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "Resumo:",
+        f"Ciclos: {summary.get('trades', 0)}",
+        f"Abertos: {summary.get('open', 0)} | Fechados: {summary.get('closed', 0)} | Bloqueados: {summary.get('blocked', 0)} | Só sinal: {summary.get('signal_only', 0)}",
+        "",
+        "Eventos:",
+    ]
+    by_event = summary.get("by_event", {}) or {}
+    if by_event:
+        for name, count in sorted(by_event.items(), key=lambda x: (-x[1], x[0])):
+            lines.append(f"{name}: {count}")
+    else:
+        lines.append("Nenhum evento de lifecycle registrado ainda.")
+
+    lines += ["", "Últimos ciclos:"]
+    if not lifecycles:
+        lines.append("Nenhum ciclo registrado ainda.")
+    for item in lifecycles[:20]:
+        result = item.get("result_pct")
+        result_txt = f" | PnL: {result}%" if result is not None else ""
+        lines.append(
+            f"{item.get('status')} | {item.get('bot')} {item.get('symbol')} {item.get('side')} {item.get('setup')} | "
+            f"Eventos: {item.get('event_count')} | Último: {item.get('last_event')}{result_txt}"
+        )
+    return "\n".join(lines)
+
+
+def export_lifecycle(limit=None):
+    rows = load_lifecycle_events(limit=limit or LIFECYCLE_MAX_READ)
+    lifecycles = build_trade_lifecycles(rows)
+    payload = {
+        "ok": True,
+        "generated_at": data_hora_sp_str(),
+        "files": {"lifecycle": str(LIFECYCLE_FILE), "export": str(LIFECYCLE_EXPORT_FILE)},
+        "summary": summarize_lifecycles(lifecycles),
+        "events": rows,
+        "lifecycles": lifecycles,
+    }
+    _write_json(LIFECYCLE_EXPORT_FILE, payload)
+    return payload
+
 def get_status():
     return {
         "ok": True,
         "module": "journal_manager",
-        "version": "2026-07-02-TRADE-JOURNAL-V1",
+        "version": "2026-07-02-TRADE-JOURNAL-V2-LIFECYCLE",
         "data_dir": str(DATA_DIR),
         "journal_file": str(JOURNAL_FILE),
+        "lifecycle_file": str(LIFECYCLE_FILE),
         "seen_file": str(JOURNAL_SEEN_FILE),
         "export_file": str(JOURNAL_EXPORT_FILE),
+        "lifecycle_export_file": str(LIFECYCLE_EXPORT_FILE),
         "max_read": JOURNAL_MAX_READ,
+        "lifecycle_max_read": LIFECYCLE_MAX_READ,
         "trades_loaded": len(load_journal_trades(limit=JOURNAL_MAX_READ)),
+        "lifecycle_events_loaded": len(load_lifecycle_events(limit=LIFECYCLE_MAX_READ)),
     }

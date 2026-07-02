@@ -606,14 +606,28 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
             _append_jsonl(TIMELINE_LOG_FILE, item)
 
         journal_result = None
-        if ok and item.get("event") == "TRADE_CLOSED":
+        lifecycle_result = None
+        if ok:
             try:
                 import journal_manager
-                journal_result = journal_manager.append_journal_trade(item)
+                if item.get("event") in {
+                    "SIGNAL_CREATED",
+                    "TRADE_OPENED",
+                    "TP50_HIT",
+                    "BREAKEVEN",
+                    "TRAILING_UPDATED",
+                    "TRADE_CLOSED",
+                    "TRADE_BLOCKED",
+                } and hasattr(journal_manager, "append_lifecycle_event"):
+                    lifecycle_result = journal_manager.append_lifecycle_event(item)
+                if item.get("event") == "TRADE_CLOSED":
+                    journal_result = journal_manager.append_journal_trade(item)
             except Exception as journal_exc:
-                journal_result = {"ok": False, "error": str(journal_exc)}
+                if item.get("event") == "TRADE_CLOSED":
+                    journal_result = {"ok": False, "error": str(journal_exc)}
+                lifecycle_result = lifecycle_result or {"ok": False, "error": str(journal_exc)}
 
-        return {"ok": ok, "dedup": False, "event": item, "journal": journal_result}
+        return {"ok": ok, "dedup": False, "event": item, "journal": journal_result, "lifecycle": lifecycle_result}
     except Exception as exc:
         return {"ok": False, "dedup": False, "error": str(exc), "event": {"event_type": event_type, "payload": payload}}
 
