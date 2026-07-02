@@ -604,7 +604,16 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
             _append_jsonl(DECISION_LOG_FILE, item)
         if ok and item.get("event") not in {"CENTRAL_COMMAND", "BOT_COMMAND"}:
             _append_jsonl(TIMELINE_LOG_FILE, item)
-        return {"ok": ok, "dedup": False, "event": item}
+
+        journal_result = None
+        if ok and item.get("event") == "TRADE_CLOSED":
+            try:
+                import journal_manager
+                journal_result = journal_manager.append_journal_trade(item)
+            except Exception as journal_exc:
+                journal_result = {"ok": False, "error": str(journal_exc)}
+
+        return {"ok": ok, "dedup": False, "event": item, "journal": journal_result}
     except Exception as exc:
         return {"ok": False, "dedup": False, "error": str(exc), "event": {"event_type": event_type, "payload": payload}}
 

@@ -4810,6 +4810,135 @@ def analytics_recommendations_route():
     )    
 
 
+
+
+@app.route("/journal/status")
+def journal_status_route():
+    try:
+        import journal_manager
+        return journal_manager.get_status()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal")
+def journal_route():
+    try:
+        import journal_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+    group_by = request.args.get("group_by", default="bot", type=str)
+    days = request.args.get("days", default="", type=str)
+    limit = request.args.get("limit", default="", type=str)
+
+    try:
+        return {
+            "text": journal_manager.build_journal_report(
+                group_by=group_by or "bot",
+                days=days or None,
+                limit=int(limit) if str(limit or "").isdigit() else None,
+            )
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/raw")
+def journal_raw_route():
+    try:
+        import journal_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+    return journal_manager.query_journal(
+        bot=request.args.get("bot", default="", type=str) or None,
+        setup=request.args.get("setup", default="", type=str) or None,
+        symbol=request.args.get("symbol", default="", type=str) or None,
+        side=request.args.get("side", default="", type=str) or None,
+        result=request.args.get("result", default="", type=str) or None,
+        quality=request.args.get("quality", default="", type=str) or None,
+        market_regime=request.args.get("market_regime", default="", type=str) or None,
+        hour=request.args.get("hour", default="", type=str) or None,
+        days=request.args.get("days", default="", type=str) or None,
+        limit=request.args.get("limit", default=None, type=int),
+    )
+
+
+@app.route("/journal/export")
+def journal_export_route():
+    try:
+        import journal_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+    limit = request.args.get("limit", default=None, type=int)
+    return journal_manager.export_journal(limit=limit)
+
+
+@app.route("/journal/bot")
+def journal_bot_route():
+    try:
+        import journal_manager
+        return {"text": journal_manager.build_journal_report(group_by="bot", days=request.args.get("days", default="", type=str) or None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/setup")
+def journal_setup_route():
+    try:
+        import journal_manager
+        return {"text": journal_manager.build_journal_report(group_by="setup", days=request.args.get("days", default="", type=str) or None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/symbol")
+def journal_symbol_route():
+    try:
+        import journal_manager
+        return {"text": journal_manager.build_journal_report(group_by="symbol", days=request.args.get("days", default="", type=str) or None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/hour")
+def journal_hour_route():
+    try:
+        import journal_manager
+        return {"text": journal_manager.build_journal_report(group_by="hour", days=request.args.get("days", default="", type=str) or None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/weekday")
+def journal_weekday_route():
+    try:
+        import journal_manager
+        return {"text": journal_manager.build_journal_report(group_by="weekday", days=request.args.get("days", default="", type=str) or None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/regime")
+def journal_regime_route():
+    try:
+        import journal_manager
+        return {"text": journal_manager.build_journal_report(group_by="market_regime", days=request.args.get("days", default="", type=str) or None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/quality")
+def journal_quality_route():
+    try:
+        import journal_manager
+        return {"text": journal_manager.build_journal_report(group_by="quality", days=request.args.get("days", default="", type=str) or None)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
 @app.route("/stats")
 def stats_route():
     try:
