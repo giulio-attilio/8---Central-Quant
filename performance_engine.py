@@ -2,6 +2,21 @@ from collections import defaultdict
 import history_manager
 
 
+# Eventos administrativos que podem aparecer no Super History,
+# mas não devem entrar em performance, rankings ou recomendações.
+ADMIN_EVENTS = {
+    "CENTRAL_COMMAND",
+    "BOT_COMMAND",
+    "MEMORY",
+    "HEALTH",
+    "BOT_STATUS",
+    "CENTRAL_STATUS",
+    "WATCHDOG",
+    "STARTUP",
+    "RISK_SNAPSHOT",
+}
+
+
 def _safe_float(value, default=None):
     try:
         if value is None:
@@ -11,6 +26,17 @@ def _safe_float(value, default=None):
         return float(value)
     except Exception:
         return default
+
+
+def _event_name(event):
+    return history_manager.normalize_event_type(
+        event.get("event") or event.get("event_type") or event.get("type"),
+        event,
+    )
+
+
+def _is_admin_event(event):
+    return _event_name(event) in ADMIN_EVENTS
 
 
 def _event_pnl(event):
@@ -41,10 +67,10 @@ def calculate_metrics(events):
     closed = []
 
     for event in events or []:
-        event_name = history_manager.normalize_event_type(
-            event.get("event") or event.get("event_type") or event.get("type"),
-            event,
-        )
+        if _is_admin_event(event):
+            continue
+
+        event_name = _event_name(event)
         if event_name != "TRADE_CLOSED":
             continue
 
@@ -128,10 +154,23 @@ def calculate_metrics(events):
 
 def _group_key(event, group_by):
     if group_by == "setup":
-        return str(event.get("setup") or "N/A").upper()
+        return str(event.get("setup") or "").upper().strip()
     if group_by == "symbol":
-        return str(event.get("symbol") or "N/A").upper()
-    return str(event.get("bot") or "N/A").upper()
+        return str(event.get("symbol") or "").upper().strip()
+    return str(event.get("bot") or "").upper().strip()
+
+
+def _has_operational_value(stats, metrics):
+    """Evita grupos vazios, N/A e itens apenas administrativos."""
+    return any([
+        int(stats.get("total_events") or 0) > 0,
+        int(stats.get("signals") or 0) > 0,
+        int(stats.get("entries") or 0) > 0,
+        int(stats.get("closed") or 0) > 0,
+        int(stats.get("tp50") or 0) > 0,
+        int(stats.get("blocked") or 0) > 0,
+        int(metrics.get("trades") or 0) > 0,
+    ])
 
 
 def build_performance_payload(days=None, group_by="bot"):
@@ -146,12 +185,22 @@ def build_performance_payload(days=None, group_by="bot"):
 
     buckets = defaultdict(list)
     for event in events:
-        buckets[_group_key(event, group_by)].append(event)
+        if _is_admin_event(event):
+            continue
+
+        key = _group_key(event, group_by)
+        if not key or key in {"N/A", "NA", "NONE", "NULL"}:
+            continue
+
+        buckets[key].append(event)
 
     items = []
     for key, rows in buckets.items():
         stats = history_manager.calculate_stats(rows=rows)
         metrics = calculate_metrics(rows)
+
+        if not _has_operational_value(stats, metrics):
+            continue
 
         item = {
             group_by: key,
@@ -166,11 +215,13 @@ def build_performance_payload(days=None, group_by="bot"):
         }
         items.append(item)
 
+    # Prioriza grupos com trades reais. Depois, expectativa/PF/PnL.
     items.sort(key=lambda x: (
-        -x.get("expectancy_pct", 0),
-        -x.get("profit_factor_pct", 0),
-        -x.get("pnl_total_pct", 0),
-        -x.get("trades", 0),
+        -int(x.get("trades", 0) or 0),
+        -float(x.get("expectancy_pct", 0) or 0),
+        -float(x.get("profit_factor_pct", 0) or 0),
+        -float(x.get("pnl_total_pct", 0) or 0),
+        -int(x.get("total_events", 0) or 0),
     ))
 
     return {
@@ -237,7 +288,10 @@ def build_recommendations_payload(days=None, group_by="setup"):
 
     recommendations = []
     for item in items:
-        name = item.get(group_by) or item.get("bot") or item.get("setup") or item.get("symbol") or "N/A"
+        name = item.get(group_by) or item.get("bot") or item.get("setup") or item.get("symbol") or ""
+        name = str(name or "").upper().strip()
+        if not name or name in {"N/A", "NA", "NONE", "NULL"}:
+            continue
         recommendations.append(_recommendation_for_item(name, item))
 
     priority = {
@@ -250,6 +304,7 @@ def build_recommendations_payload(days=None, group_by="setup"):
 
     recommendations.sort(key=lambda item: (
         priority.get(item.get("severity"), 9),
+        -int(item.get("trades", 0) or 0),
         item.get("expectancy_pct", 0),
         item.get("profit_factor_pct", 0),
     ))
