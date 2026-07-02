@@ -1,5 +1,6 @@
 from collections import defaultdict
 import history_manager
+import rating_engine
 
 
 # Eventos administrativos que podem aparecer no Super History,
@@ -213,6 +214,7 @@ def build_performance_payload(days=None, group_by="bot"):
             "tp50": stats.get("tp50", 0),
             **metrics,
         }
+        item.update(rating_engine.rate_item(item))
         items.append(item)
 
     # Prioriza grupos com trades reais. Depois, expectativa/PF/PnL.
@@ -268,6 +270,8 @@ def _recommendation_for_item(name, metrics):
         severity = "BAIXA"
         reason = "Sem sinal estatístico forte para ajuste."
 
+    rating = rating_engine.rate_item(metrics)
+
     return {
         "name": name,
         "action": action,
@@ -279,6 +283,7 @@ def _recommendation_for_item(name, metrics):
         "win_rate_pct": win_rate,
         "pnl_total_pct": pnl_total,
         "avg_giveback_pct": avg_giveback,
+        **rating,
     }
 
 
