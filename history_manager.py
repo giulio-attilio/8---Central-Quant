@@ -483,6 +483,30 @@ def classify_event(event_type, payload=None):
     return normalize_event_type(event_type, payload)
 
 
+ADMIN_EVENTS = {
+    "CENTRAL_COMMAND",
+    "BOT_COMMAND",
+    "MEMORY",
+    "HEALTH",
+    "BOT_STATUS",
+    "CENTRAL_STATUS",
+    "WATCHDOG",
+    "STARTUP",
+    "RISK_SNAPSHOT",
+}
+
+
+def is_admin_event(event):
+    """Retorna True para eventos administrativos que não devem entrar em performance/stats."""
+    if not isinstance(event, dict):
+        return False
+    event_name = normalize_event_type(
+        event.get("event") or event.get("event_type") or event.get("type"),
+        event,
+    )
+    return event_name in ADMIN_EVENTS
+
+
 def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     raw = payload if isinstance(payload, dict) else {"value": payload}
     event = classify_event(event_type, raw)
@@ -743,7 +767,7 @@ def load_events(limit=None, filters=None):
 
 def calculate_stats(events=None, filters=None, rows=None):
     rows = rows if rows is not None else (events if events is not None else load_events(filters=filters))
-    rows = list(rows or [])
+    rows = [event for event in list(rows or []) if not is_admin_event(event)]
 
     totals = {
         "total_events": len(rows),
@@ -907,7 +931,7 @@ def query_history(bot=None, symbol=None, setup=None, side=None, result=None, day
 
 
 def calculate_performance_metrics(events=None):
-    rows = list(events or [])
+    rows = [event for event in list(events or []) if not is_admin_event(event)]
     closed_trades = []
     for event in rows:
         event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
@@ -973,7 +997,7 @@ def calculate_performance_metrics(events=None):
 
 def group_stats(group_by="bot", events=None, filters=None):
     rows = events if events is not None else load_events(filters=filters)
-    rows = list(rows or [])
+    rows = [event for event in list(rows or []) if not is_admin_event(event)]
     if group_by not in {"bot", "symbol", "setup"}:
         raise ValueError("group_by deve ser 'bot', 'symbol' ou 'setup'")
 
@@ -999,6 +1023,7 @@ def group_stats(group_by="bot", events=None, filters=None):
 
 def build_history_payload(limit=None):
     events = load_events(limit=limit or HISTORY_MAX_READ)
+    events = [event for event in events if not is_admin_event(event)]
     by_event = Counter()
     by_bot = Counter()
     by_symbol = Counter()
@@ -1130,7 +1155,7 @@ def build_history_report(days=None):
 
 def build_riskstats_payload():
     payload = build_history_payload()
-    events = load_events()
+    events = [event for event in load_events() if not is_admin_event(event)]
     closed_by_bot = defaultdict(list)
     closed_by_symbol = defaultdict(list)
     blocked_by_reason = Counter()
@@ -1235,16 +1260,7 @@ def audit_events(events=None):
         "SIGNAL_CREATED": ["bot", "symbol", "side", "setup"],
     }
 
-    admin_events = {
-        "CENTRAL_COMMAND",
-        "MEMORY",
-        "HEALTH",
-        "BOT_STATUS",
-        "CENTRAL_STATUS",
-        "WATCHDOG",
-        "STARTUP",
-        "RISK_SNAPSHOT",
-    }
+    admin_events = ADMIN_EVENTS
 
     audit = {}
     for event in rows:
