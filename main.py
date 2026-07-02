@@ -4766,6 +4766,24 @@ def analytics_performance_route():
     )
 
 
+@app.route("/analytics/report")
+def analytics_report_route():
+    try:
+        import performance_engine
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    days = request.args.get("days", default="", type=str)
+    group_by = request.args.get("group_by", default="setup", type=str)
+
+    return {
+        "text": performance_engine.build_analytics_report(
+            days=days or None,
+            group_by=group_by or "setup",
+        )
+    }
+
+
 @app.route("/analytics/recommendations")
 def analytics_recommendations_route():
     try:

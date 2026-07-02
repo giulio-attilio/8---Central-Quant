@@ -328,3 +328,39 @@ def build_recommendations_payload(days=None, group_by="setup"):
         },
         "recommendations": recommendations,
     }
+
+
+def build_analytics_report(days=None, group_by="setup"):
+    payload = build_recommendations_payload(days=days, group_by=group_by)
+    recommendations = payload.get("recommendations", [])
+
+    lines = [
+        "🧠 ANALYTICS — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        "",
+        f"Grupo: {group_by.upper()}",
+        "",
+    ]
+
+    if not recommendations:
+        lines.append("Ainda não há recomendações estatísticas.")
+        return "\n".join(lines)
+
+    for i, item in enumerate(recommendations[:12], start=1):
+        lines += [
+            f"{i}. {item.get('name')}",
+            f"Score: {item.get('score_0_100')}/100",
+            f"Rating: {item.get('rating')}",
+            f"Confiança: {item.get('confidence')}/100",
+            f"Trades: {item.get('trades')}",
+            f"Win rate: {item.get('win_rate_pct')}%",
+            f"PnL: {item.get('pnl_total_pct')}%",
+            f"Expectancy: {item.get('expectancy_pct')}%",
+            f"Profit Factor: {item.get('profit_factor_pct')}",
+            f"Ação: {item.get('action')}",
+            f"Viés: {item.get('risk_bias')}",
+            f"Motivo: {item.get('reason')}",
+            "",
+        ]
+
+    return "\n".join(lines)
