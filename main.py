@@ -4776,12 +4776,22 @@ def analytics_report_route():
     days = request.args.get("days", default="", type=str)
     group_by = request.args.get("group_by", default="setup", type=str)
 
-    return {
-        "text": performance_engine.build_analytics_report(
-            days=days or None,
-            group_by=group_by or "setup",
-        )
+    show_all = str(
+        request.args.get("all")
+        or request.args.get("show_all")
+        or request.args.get("full")
+        or ""
+    ).lower() in {
+        "1", "true", "yes", "sim", "on"
     }
+
+    return {
+    "text": performance_engine.build_analytics_report(
+        days=days or None,
+        group_by=group_by or "setup",
+        show_all=show_all,
+    )
+}
 
 
 @app.route("/analytics/recommendations")
