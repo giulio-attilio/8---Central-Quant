@@ -6857,6 +6857,50 @@ def policy_simulate_route(bot=None):
     except Exception as exc:
         return {"ok": False, "error": str(exc)}, 500
 
+
+
+# ==========================================================
+# LEARNING ENGINE V1 - OBSERVE ROUTES
+# ==========================================================
+
+@app.route("/learning/status")
+def learning_status_route():
+    try:
+        import learning_engine
+        return learning_engine.get_status()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/learning")
+@app.route("/learning/report")
+def learning_route():
+    try:
+        import learning_engine
+        text, payload = learning_engine.build_learning_report()
+        return {"text": text, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/learning/state")
+def learning_state_route():
+    try:
+        import learning_engine
+        return learning_engine.get_state()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/learning/readiness")
+def learning_readiness_route():
+    try:
+        import learning_engine
+        text, payload = learning_engine.build_readiness_report()
+        return {"text": text, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED
 
