@@ -596,6 +596,14 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
 def log_event(event_type, payload=None, source=None, trade_id=None):
     try:
         item = normalize_payload(event_type, payload, source=source, trade_id=trade_id)
+        context_result = None
+        try:
+            import context_manager
+            if hasattr(context_manager, "enrich_event"):
+                item = context_manager.enrich_event(item)
+                context_result = {"ok": True, "version": getattr(context_manager, "CONTEXT_VERSION", None)}
+        except Exception as context_exc:
+            context_result = {"ok": False, "error": str(context_exc)}
         uid = item.get("uid")
         if uid and _dedup_seen(uid):
             return {"ok": True, "dedup": True, "uid": uid}
@@ -627,7 +635,7 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
                     journal_result = {"ok": False, "error": str(journal_exc)}
                 lifecycle_result = lifecycle_result or {"ok": False, "error": str(journal_exc)}
 
-        return {"ok": ok, "dedup": False, "event": item, "journal": journal_result, "lifecycle": lifecycle_result}
+        return {"ok": ok, "dedup": False, "event": item, "context": context_result, "journal": journal_result, "lifecycle": lifecycle_result}
     except Exception as exc:
         return {"ok": False, "dedup": False, "error": str(exc), "event": {"event_type": event_type, "payload": payload}}
 

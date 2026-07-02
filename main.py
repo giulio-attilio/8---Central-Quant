@@ -6773,6 +6773,31 @@ def quantos_route():
     return {"text": build_quantos_report()}
 
 
+# ==========================================================
+# CONTEXT MANAGER ROUTES
+# ==========================================================
+@app.route("/context/status")
+@app.route("/contexto/status")
+def context_status_route():
+    try:
+        import context_manager
+        if hasattr(context_manager, "get_status"):
+            return context_manager.get_status()
+        return {"ok": False, "error": "context_manager sem get_status"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/context")
+@app.route("/contexto")
+def context_route():
+    try:
+        import context_manager
+        return {"text": context_manager.build_context_report()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED
 
