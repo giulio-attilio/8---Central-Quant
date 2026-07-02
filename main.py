@@ -4939,6 +4939,69 @@ def journal_quality_route():
         return {"ok": False, "error": str(exc)}, 500
 
 
+@app.route("/journal/lifecycle")
+def journal_lifecycle_route():
+    try:
+        import journal_manager
+        return {
+            "text": journal_manager.build_lifecycle_report(
+                days=request.args.get("days", default="", type=str) or None,
+                limit=request.args.get("limit", default=None, type=int),
+                symbol=request.args.get("symbol", default="", type=str) or None,
+                bot=request.args.get("bot", default="", type=str) or None,
+            )
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/events")
+def journal_events_route():
+    try:
+        import journal_manager
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+    return journal_manager.query_lifecycle(
+        event=request.args.get("event", default="", type=str) or None,
+        bot=request.args.get("bot", default="", type=str) or None,
+        setup=request.args.get("setup", default="", type=str) or None,
+        symbol=request.args.get("symbol", default="", type=str) or None,
+        side=request.args.get("side", default="", type=str) or None,
+        quality=request.args.get("quality", default="", type=str) or None,
+        market_regime=request.args.get("market_regime", default="", type=str) or None,
+        hour=request.args.get("hour", default="", type=str) or None,
+        days=request.args.get("days", default="", type=str) or None,
+        limit=request.args.get("limit", default=None, type=int),
+    )
+
+
+@app.route("/journal/open")
+def journal_open_route():
+    try:
+        import journal_manager
+        rows = journal_manager.load_lifecycle_events(limit=journal_manager.LIFECYCLE_MAX_READ)
+        lifecycles = journal_manager.build_trade_lifecycles(rows)
+        open_items = [item for item in lifecycles.values() if item.get("status") == "OPEN"]
+        return {
+            "ok": True,
+            "generated_at": data_hora_sp_str(),
+            "open_count": len(open_items),
+            "items": open_items[-100:],
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/lifecycle/export")
+def journal_lifecycle_export_route():
+    try:
+        import journal_manager
+        return journal_manager.export_lifecycle(limit=request.args.get("limit", default=None, type=int))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
 @app.route("/stats")
 def stats_route():
     try:
@@ -6579,11 +6642,6 @@ def start_central_command_routers():
 # ==========================================================
 # QUANT OS ROUTES
 # ==========================================================
-
-@app.route("/journal")
-@app.route("/journal/<arg>")
-def journal_route(arg=None):
-    return {"text": build_journal_report(arg)}
 
 
 @app.route("/trade")
