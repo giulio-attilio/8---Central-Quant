@@ -237,6 +237,167 @@ THREAD_HEARTBEAT_KEY = "donkey:thread_heartbeat"
 MAX_OPEN_POSITIONS = 25
 
 # ====================================================
+# CENTRAL QUANT RISK MANAGER - TRAVA OBRIGATÓRIA
+# ====================================================
+# A Central Quant é a autoridade operacional.
+# O Donkey não deve registrar nenhuma nova posição sem ALLOW explícito
+# do endpoint /can_open_trade da Central.
+DONKEY_CENTRAL_RISK_ENABLED = str(os.environ.get("DONKEY_CENTRAL_RISK_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+DONKEY_CENTRAL_RISK_FAIL_CLOSED = str(os.environ.get("DONKEY_CENTRAL_RISK_FAIL_CLOSED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+DONKEY_CENTRAL_RISK_TIMEOUT = float(os.environ.get("DONKEY_CENTRAL_RISK_TIMEOUT", "15"))
+EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
+
+def _central_base_url():
+    base = (
+        os.environ.get("CENTRAL_BASE_URL")
+        or os.environ.get("CENTRAL_QUANT_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("RENDER_SERVICE_URL")
+        or ""
+    ).strip()
+    return base.rstrip("/")
+
+def central_can_open_trade_url():
+    explicit = os.environ.get("CENTRAL_CAN_OPEN_TRADE_URL")
+    if explicit:
+        return explicit.strip()
+    base = _central_base_url()
+    if not base:
+        return ""
+    return f"{base}/can_open_trade"
+
+def _risk_text_list(items):
+    if not items:
+        return "N/A"
+    if isinstance(items, list):
+        return "; ".join(str(x) for x in items if x is not None) or "N/A"
+    return str(items)
+
+def consultar_central_risk_manager(sinal, motivo="ENTRY"):
+    """
+    Consulta obrigatória ao Risk Manager Global da Central.
+
+    Retorna um payload padronizado com allowed=True/False.
+    Em falha ou ausência de URL, o padrão é fail-closed para impedir
+    novas entradas fora da arquitetura da Central Quant.
+    """
+    if not DONKEY_CENTRAL_RISK_ENABLED:
+        return {
+            "allowed": True,
+            "decision": "ALLOW",
+            "warnings": ["DONKEY_CENTRAL_RISK_ENABLED=false"],
+            "reasons": [],
+            "source": "local_disabled",
+        }
+
+    url = central_can_open_trade_url()
+    if not url:
+        return {
+            "allowed": not DONKEY_CENTRAL_RISK_FAIL_CLOSED,
+            "decision": "ALLOW" if not DONKEY_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "reasons": ["CENTRAL_CAN_OPEN_TRADE_URL/CENTRAL_BASE_URL/RENDER_EXTERNAL_URL não configurado"],
+            "warnings": [],
+            "source": "missing_url",
+        }
+
+    payload = {
+        "bot": "DONKEY",
+        "symbol": sinal.get("symbol_clean") or nome_limpo(sinal.get("symbol", "")),
+        "raw_symbol": sinal.get("symbol"),
+        "side": sinal.get("signal") or sinal.get("side"),
+        "setup": sinal.get("signal_type", "DONKEY"),
+        "score": sinal.get("signal_score") or sinal.get("qualidade_pontos"),
+        "risk_pct": sinal.get("risk_pct"),
+        "mode": EXECUTION_MODE,
+        "intended_live": EXECUTION_MODE == "LIVE",
+        "reduce_only": False,
+        "reason": motivo,
+        "source": "donkey",
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=DONKEY_CENTRAL_RISK_TIMEOUT)
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw_response": response.text[:500]}
+
+        if response.status_code >= 400:
+            return {
+                "allowed": not DONKEY_CENTRAL_RISK_FAIL_CLOSED,
+                "decision": "ALLOW" if not DONKEY_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+                "reasons": [f"HTTP {response.status_code} ao consultar Central"],
+                "warnings": [str(data)[:300]],
+                "source": "http_error",
+                "payload": payload,
+            }
+
+        if isinstance(data, dict):
+            data.setdefault("allowed", bool(data.get("decision") == "ALLOW"))
+            data.setdefault("decision", "ALLOW" if data.get("allowed") else "DENY")
+            data.setdefault("source", "central")
+            return data
+
+        return {
+            "allowed": not DONKEY_CENTRAL_RISK_FAIL_CLOSED,
+            "decision": "ALLOW" if not DONKEY_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "reasons": ["Resposta inválida da Central"],
+            "warnings": [str(data)[:300]],
+            "source": "invalid_response",
+            "payload": payload,
+        }
+    except Exception as exc:
+        return {
+            "allowed": not DONKEY_CENTRAL_RISK_FAIL_CLOSED,
+            "decision": "ALLOW" if not DONKEY_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "reasons": [f"Erro ao consultar Central: {exc}"],
+            "warnings": [],
+            "source": "exception",
+            "payload": payload,
+        }
+
+def registrar_bloqueio_central(sinal, decision, motivo="ENTRY"):
+    try:
+        registrar_evento_trade({
+            "event": "RISK_DENY",
+            "date": data_hoje_sp_str(),
+            "datetime": data_hora_sp_str(),
+            "symbol": sinal.get("symbol"),
+            "symbol_clean": sinal.get("symbol_clean") or nome_limpo(sinal.get("symbol", "")),
+            "side": sinal.get("signal") or sinal.get("side"),
+            "entry": sinal.get("entry"),
+            "sl": sinal.get("sl"),
+            "tp50": sinal.get("tp50"),
+            "risk_pct": sinal.get("risk_pct"),
+            "signal_type": sinal.get("signal_type", "DONKEY"),
+            "signal_score": sinal.get("signal_score"),
+            "motivo": motivo,
+            "central_decision": decision.get("decision"),
+            "central_allowed": decision.get("allowed"),
+            "central_reasons": decision.get("reasons"),
+            "central_warnings": decision.get("warnings"),
+        })
+    except Exception as exc:
+        print("ERRO AO REGISTRAR BLOQUEIO CENTRAL DONKEY:", exc)
+
+def central_risk_allows_entry(sinal, motivo="ENTRY"):
+    decision = consultar_central_risk_manager(sinal, motivo=motivo)
+    if bool(decision.get("allowed")):
+        warnings = decision.get("warnings") or []
+        if warnings:
+            print(f"CENTRAL RISK ALLOW DONKEY COM AVISO: {nome_limpo(sinal.get('symbol', ''))} | {_risk_text_list(warnings)}")
+        return True
+
+    reasons = decision.get("reasons") or ["DENY sem motivo informado"]
+    print(
+        f"ENTRADA DONKEY BLOQUEADA PELA CENTRAL: "
+        f"{nome_limpo(sinal.get('symbol', ''))} {sinal.get('signal') or sinal.get('side')} | "
+        f"{_risk_text_list(reasons)}"
+    )
+    registrar_bloqueio_central(sinal, decision, motivo=motivo)
+    return False
+
+# ====================================================
 # TREND PRO ELITE - FILTROS OBRIGATÓRIOS
 # ====================================================
 # O Trend PRO agora vira Trend PRO Elite: menos sinais, maior qualidade.
@@ -3640,6 +3801,10 @@ def registrar_posicao(s):
             f"SINAL DONKEY IGNORADO POR RISCO ALTO: "
             f"{nome_limpo(symbol)} | {risk_pct_sinal:.2f}% > {DONKEY_MAX_RISK_PCT:.2f}%"
         )
+        return False
+
+    # Trava obrigatória: a posição só pode ser registrada se a Central autorizar.
+    if not central_risk_allows_entry(s, motivo=s.get("signal_type", "ENTRY")):
         return False
 
     posicoes[symbol] = {
