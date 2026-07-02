@@ -4957,23 +4957,68 @@ def journal_lifecycle_route():
 
 @app.route("/journal/events")
 def journal_events_route():
+    """Relatório leve dos eventos de lifecycle, seguro para Telegram."""
     try:
         import journal_manager
+        return {
+            "text": journal_manager.build_events_report(
+                event=request.args.get("event", default="", type=str) or None,
+                bot=request.args.get("bot", default="", type=str) or None,
+                setup=request.args.get("setup", default="", type=str) or None,
+                symbol=request.args.get("symbol", default="", type=str) or None,
+                side=request.args.get("side", default="", type=str) or None,
+                quality=request.args.get("quality", default="", type=str) or None,
+                market_regime=request.args.get("market_regime", default="", type=str) or None,
+                hour=request.args.get("hour", default="", type=str) or None,
+                days=request.args.get("days", default="", type=str) or None,
+                limit=request.args.get("limit", default=20, type=int),
+            )
+        }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}, 500
 
-    return journal_manager.query_lifecycle(
-        event=request.args.get("event", default="", type=str) or None,
-        bot=request.args.get("bot", default="", type=str) or None,
-        setup=request.args.get("setup", default="", type=str) or None,
-        symbol=request.args.get("symbol", default="", type=str) or None,
-        side=request.args.get("side", default="", type=str) or None,
-        quality=request.args.get("quality", default="", type=str) or None,
-        market_regime=request.args.get("market_regime", default="", type=str) or None,
-        hour=request.args.get("hour", default="", type=str) or None,
-        days=request.args.get("days", default="", type=str) or None,
-        limit=request.args.get("limit", default=None, type=int),
-    )
+
+@app.route("/journal/events/raw")
+def journal_events_raw_route():
+    """Payload bruto completo, para auditoria/debug. Pode ser pesado."""
+    try:
+        import journal_manager
+        return journal_manager.query_lifecycle(
+            event=request.args.get("event", default="", type=str) or None,
+            bot=request.args.get("bot", default="", type=str) or None,
+            setup=request.args.get("setup", default="", type=str) or None,
+            symbol=request.args.get("symbol", default="", type=str) or None,
+            side=request.args.get("side", default="", type=str) or None,
+            quality=request.args.get("quality", default="", type=str) or None,
+            market_regime=request.args.get("market_regime", default="", type=str) or None,
+            hour=request.args.get("hour", default="", type=str) or None,
+            days=request.args.get("days", default="", type=str) or None,
+            limit=request.args.get("limit", default=None, type=int),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+
+@app.route("/journal/events/json")
+def journal_events_json_route():
+    """Payload compacto em JSON, sem raw pesado."""
+    try:
+        import journal_manager
+        return journal_manager.query_lifecycle_clean(
+            event=request.args.get("event", default="", type=str) or None,
+            bot=request.args.get("bot", default="", type=str) or None,
+            setup=request.args.get("setup", default="", type=str) or None,
+            symbol=request.args.get("symbol", default="", type=str) or None,
+            side=request.args.get("side", default="", type=str) or None,
+            quality=request.args.get("quality", default="", type=str) or None,
+            market_regime=request.args.get("market_regime", default="", type=str) or None,
+            hour=request.args.get("hour", default="", type=str) or None,
+            days=request.args.get("days", default="", type=str) or None,
+            limit=request.args.get("limit", default=100, type=int),
+            include_timeline=request.args.get("timeline", default="", type=str).lower() in {"1", "true", "yes", "sim", "on"},
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
 
 
 @app.route("/journal/open")

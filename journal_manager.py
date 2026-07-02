@@ -818,6 +818,119 @@ def build_lifecycle_report(days=None, limit=None, status=None, event=None, bot=N
     return "\n".join(lines)
 
 
+
+# ==========================================================
+# LIFECYCLE CLEAN / TELEGRAM-FRIENDLY VIEWS
+# ==========================================================
+
+def _compact_event(event):
+    """Remove o raw pesado e mantém apenas campos úteis para uso no Telegram/API."""
+    if not isinstance(event, dict):
+        return {}
+    fields = [
+        "ts", "epoch", "event", "source", "trade_id", "bot", "setup", "symbol", "side",
+        "score", "quality", "entry", "stop", "tp50", "exit_price", "result_pct",
+        "result_r", "mfe_pct", "mae_pct", "reason",
+    ]
+    return {k: event.get(k) for k in fields if event.get(k) is not None}
+
+
+def _compact_lifecycle(item, include_timeline=False):
+    """Remove timeline raw e deixa o ciclo leve para relatório/Telegram."""
+    if not isinstance(item, dict):
+        return {}
+    fields = [
+        "trade_id", "status", "bot", "setup", "symbol", "side", "started_at", "updated_at",
+        "duration_minutes", "event_count", "events", "last_event", "entry", "stop", "tp50",
+        "exit_price", "result_pct", "result_r", "mfe_pct", "mae_pct", "quality", "score", "reason",
+    ]
+    out = {k: item.get(k) for k in fields if item.get(k) is not None}
+    if include_timeline:
+        out["timeline"] = [_compact_event(e) for e in item.get("timeline") or []]
+    return out
+
+
+def query_lifecycle_clean(days=None, limit=None, event=None, bot=None, symbol=None, setup=None, status=None, side=None, quality=None, market_regime=None, hour=None, include_timeline=False, **kwargs):
+    """Versão leve do query_lifecycle, sem raw pesado."""
+    payload = query_lifecycle(
+        days=days,
+        limit=limit,
+        event=event,
+        bot=bot,
+        symbol=symbol,
+        setup=setup,
+        status=status,
+        side=side,
+        quality=quality,
+        market_regime=market_regime,
+        hour=hour,
+    )
+    events = [_compact_event(e) for e in payload.get("events") or []]
+    lifecycles = [_compact_lifecycle(x, include_timeline=include_timeline) for x in payload.get("lifecycles") or []]
+    return {
+        "ok": True,
+        "generated_at": payload.get("generated_at") or data_hora_sp_str(),
+        "filters": payload.get("filters") or {},
+        "summary": payload.get("summary") or {},
+        "events": events[-int(limit or 100):],
+        "lifecycles": lifecycles[-int(limit or 100):],
+    }
+
+
+def build_events_report(days=None, limit=20, event=None, bot=None, symbol=None, setup=None, status=None, side=None, quality=None, market_regime=None, hour=None, **kwargs):
+    """Relatório textual e leve dos eventos de lifecycle."""
+    payload = query_lifecycle_clean(
+        days=days,
+        limit=limit or 20,
+        event=event,
+        bot=bot,
+        symbol=symbol,
+        setup=setup,
+        status=status,
+        side=side,
+        quality=quality,
+        market_regime=market_regime,
+        hour=hour,
+        include_timeline=False,
+    )
+    summary = payload.get("summary") or {}
+    events = payload.get("events") or []
+    lines = [
+        "📓 JOURNAL EVENTS — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "Resumo:",
+        f"Ciclos: {summary.get('trades', 0)} | Abertos: {summary.get('open', 0)} | Fechados: {summary.get('closed', 0)} | Bloqueados: {summary.get('blocked', 0)}",
+        "",
+        "Eventos por tipo:",
+    ]
+    by_event = summary.get("by_event") or {}
+    if by_event:
+        for name, count in sorted(by_event.items(), key=lambda x: (-x[1], x[0])):
+            lines.append(f"{name}: {count}")
+    else:
+        lines.append("Nenhum evento registrado ainda.")
+
+    lines += ["", "Últimos eventos:"]
+    if not events:
+        lines.append("Nenhum evento encontrado para os filtros.")
+    for e in events[-int(limit or 20):]:
+        mfe = e.get("mfe_pct")
+        mae = e.get("mae_pct")
+        pnl = e.get("result_pct")
+        extras = []
+        if mfe is not None:
+            extras.append(f"MFE {round(float(mfe), 2)}%")
+        if mae is not None:
+            extras.append(f"MAE {round(float(mae), 2)}%")
+        if pnl is not None:
+            extras.append(f"PnL {round(float(pnl), 4)}%")
+        extra_txt = " | " + " | ".join(extras) if extras else ""
+        lines.append(
+            f"{e.get('ts')} | {e.get('event')} | {e.get('bot')} {e.get('symbol')} {e.get('side')} {e.get('setup')}{extra_txt}"
+        )
+    return "\n".join(lines)
+
 def export_lifecycle(limit=None):
     rows = load_lifecycle_events(limit=limit or LIFECYCLE_MAX_READ)
     lifecycles = build_trade_lifecycles(rows)
