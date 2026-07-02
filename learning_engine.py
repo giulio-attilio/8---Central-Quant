@@ -30,7 +30,7 @@ LEARNING_AUDIT_FILE = DATA_DIR / "learning_audit.jsonl"
 LEARNING_EXPORT_FILE = DATA_DIR / "learning_export.json"
 LEARNING_MAX_READ = int(os.environ.get("LEARNING_MAX_READ", "10000"))
 
-VERSION = "2026-07-02-LEARNING-ENGINE-V1-OBSERVE"
+VERSION = "2026-07-02-LEARNING-ENGINE-V1-1-CONTEXT-READ"
 MODE = os.environ.get("LEARNING_ENGINE_MODE", "OBSERVE").strip().upper()
 
 MIN_CYCLES_OBSERVATION = int(os.environ.get("LEARNING_MIN_CYCLES_OBSERVATION", "20"))
@@ -172,6 +172,132 @@ def _coverage(rows, fields):
     return result
 
 
+
+
+def _deep_get(mapping, path, default=None):
+    """Busca segura em dicts aninhados."""
+    cur = mapping
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return cur if cur is not None else default
+
+
+def _merge_dicts(*items):
+    merged = {}
+    for item in items:
+        if isinstance(item, dict):
+            for k, v in item.items():
+                if _non_empty(v):
+                    merged[k] = v
+    return merged
+
+
+def _extract_context_from_row(row):
+    """
+    Extrai contexto de eventos/ciclos mesmo quando ele veio aninhado.
+
+    Possíveis origens observadas:
+    - row["context"]
+    - row["raw"]["context"]
+    - row["raw"]["raw"]["context"]
+    - row["timeline"][-1]["context"]
+    - row["timeline"][-1]["raw"]["context"]
+    - row["timeline"][-1]["raw"]["raw"]["context"]
+    """
+    if not isinstance(row, dict):
+        return {}
+
+    contexts = []
+    contexts.append(row.get("context"))
+    contexts.append(_deep_get(row, ["raw", "context"]))
+    contexts.append(_deep_get(row, ["raw", "raw", "context"]))
+
+    timeline = row.get("timeline")
+    if isinstance(timeline, list) and timeline:
+        for ev in timeline:
+            if not isinstance(ev, dict):
+                continue
+            contexts.append(ev.get("context"))
+            contexts.append(_deep_get(ev, ["raw", "context"]))
+            contexts.append(_deep_get(ev, ["raw", "raw", "context"]))
+
+    ctx = _merge_dicts(*contexts)
+
+    # Fallback: alguns campos de contexto podem estar no próprio evento ou dentro de execution_decision.
+    for field in CONTEXT_FIELDS:
+        if not _non_empty(ctx.get(field)) and _non_empty(row.get(field)):
+            ctx[field] = row.get(field)
+
+    execution_mode = (
+        _deep_get(row, ["raw", "execution_decision", "mode"])
+        or _deep_get(row, ["raw", "raw", "execution_decision", "mode"])
+        or _deep_get(row, ["execution_decision", "mode"])
+    )
+    if _non_empty(execution_mode) and not _non_empty(ctx.get("execution_mode")):
+        ctx["execution_mode"] = execution_mode
+
+    paper_positions = (
+        _deep_get(row, ["raw", "execution_decision", "exposure", "paper_total"])
+        or _deep_get(row, ["raw", "raw", "execution_decision", "exposure", "paper_total"])
+        or _deep_get(row, ["execution_decision", "exposure", "paper_total"])
+    )
+    if _non_empty(paper_positions) and not _non_empty(ctx.get("paper_positions")):
+        ctx["paper_positions"] = paper_positions
+
+    memory_usage_pct = (
+        _deep_get(row, ["raw", "execution_decision", "memory", "usage_pct"])
+        or _deep_get(row, ["raw", "raw", "execution_decision", "memory", "usage_pct"])
+        or _deep_get(row, ["execution_decision", "memory", "usage_pct"])
+    )
+    if _non_empty(memory_usage_pct) and not _non_empty(ctx.get("memory_usage_pct")):
+        ctx["memory_usage_pct"] = memory_usage_pct
+
+    return ctx
+
+
+def _flatten_context(row):
+    """Copia campos de contexto para o topo para cobertura, agrupamentos e relatórios."""
+    if not isinstance(row, dict):
+        return row
+    item = dict(row)
+    ctx = _extract_context_from_row(item)
+    if ctx:
+        existing = item.get("context") if isinstance(item.get("context"), dict) else {}
+        item["context"] = _merge_dicts(existing, ctx)
+        for field in CONTEXT_FIELDS:
+            if not _non_empty(item.get(field)) and _non_empty(ctx.get(field)):
+                item[field] = ctx.get(field)
+
+    # Fallback temporal a partir de ts/started_at, para não deixar hour/weekday zerado.
+    dt_text = item.get("ts") or item.get("started_at") or item.get("updated_at")
+    try:
+        dt = datetime.strptime(str(dt_text), "%d/%m/%Y %H:%M") if dt_text else None
+    except Exception:
+        dt = None
+    if dt is not None:
+        if not _non_empty(item.get("hour")):
+            item["hour"] = dt.hour
+        if not _non_empty(item.get("weekday")):
+            item["weekday"] = dt.strftime("%A")
+        if not _non_empty(item.get("session_br")):
+            h = dt.hour
+            if 0 <= h < 6:
+                item["session_br"] = "MADRUGADA"
+            elif 6 <= h < 12:
+                item["session_br"] = "MANHA"
+            elif 12 <= h < 18:
+                item["session_br"] = "TARDE"
+            else:
+                item["session_br"] = "NOITE"
+    return item
+
+
+def _flatten_rows(rows):
+    return [_flatten_context(x) for x in (rows or []) if isinstance(x, dict)]
+
+
 def _avg(values):
     nums = [_safe_float(v, None) for v in values]
     nums = [v for v in nums if v is not None]
@@ -255,9 +381,9 @@ def _group_summary(rows, key, limit=8):
 
 def build_learning_payload(limit=None):
     data = _load_journal_data(limit=limit)
-    lifecycles = data.get("lifecycles") or []
-    events = data.get("events") or []
-    trades = data.get("trades") or []
+    lifecycles = _flatten_rows(data.get("lifecycles") or [])
+    events = _flatten_rows(data.get("events") or [])
+    trades = _flatten_rows(data.get("trades") or [])
 
     closed_lifecycles = [x for x in lifecycles if _is_closed(x)]
     open_lifecycles = [x for x in lifecycles if _status(x) == "OPEN"]
