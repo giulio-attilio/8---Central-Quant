@@ -4009,6 +4009,52 @@ def build_bingx_divergence_status_line():
         return f"Central x BingX: erro ao verificar divergência ({exc})"
 
 
+def bingx_divergence_payload():
+    try:
+        txt = build_sync_report()
+
+        only_bingx = []
+        only_central = []
+
+        current_section = None
+
+        for line in txt.splitlines():
+            clean = line.strip()
+
+            if clean.startswith("⚠️ Só na BingX"):
+                current_section = "only_bingx"
+                continue
+
+            if clean.startswith("⚠️ Só na Central"):
+                current_section = "only_central"
+                continue
+
+            if clean.startswith("- "):
+                item = clean.replace("- ", "", 1).strip()
+
+                if current_section == "only_bingx":
+                    only_bingx.append(item)
+                elif current_section == "only_central":
+                    only_central.append(item)
+
+        return {
+            "ok": len(only_bingx) == 0 and len(only_central) == 0,
+            "status": "OK" if len(only_bingx) == 0 and len(only_central) == 0 else "ALERTA",
+            "only_bingx_count": len(only_bingx),
+            "only_central_count": len(only_central),
+            "only_bingx": only_bingx,
+            "only_central": only_central,
+            "text": txt,
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "ERRO",
+            "error": str(exc),
+        }
+
+
 def build_status_report():
     score_payload = central_health_score_payload() if "central_health_score_payload" in globals() else {"score": None, "status": "N/A"}
     ready = bingx_ready_payload() if "bingx_ready_payload" in globals() else {"ok": None, "status": "N/A"}
@@ -6336,6 +6382,13 @@ def live_route():
 @app.route("/reconcile")
 def sync_route():
     return {"text": build_sync_report()}
+
+
+@app.route("/bingx/divergence")
+@app.route("/bingxdivergence")
+@app.route("/divergence")
+def bingx_divergence_route():
+    return bingx_divergence_payload()
 
 
 @app.route("/executions")
