@@ -1715,8 +1715,23 @@ def trade_registry_reset_route():
         return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry import failed"}, 500
 
     payload = request.get_json(silent=True) or {}
-    confirm = bool(payload.get("confirm") is True or str(payload.get("confirm", "")).upper() == "RESET")
-    result = central_trade_registry.reset_trade_registry(confirm=confirm)
+    confirm_raw = str(payload.get("confirm", "")).strip().upper()
+
+    required_phrase = "RESET_TRADE_REGISTRY_CONFIRMADO"
+
+    if confirm_raw != required_phrase:
+        return {
+            "ok": False,
+            "error": "CONFIRM_REQUIRED",
+            "message": "Reset bloqueado por segurança.",
+            "required_confirm": required_phrase,
+            "example_payload": {
+                "confirm": required_phrase
+            },
+            "warning": "Esta ação apaga todas as posições abertas e fechadas do Trade Registry.",
+        }, 400
+
+    result = central_trade_registry.reset_trade_registry(confirm=True)
     status = 200 if result.get("ok") else 400
     return result, status
 
