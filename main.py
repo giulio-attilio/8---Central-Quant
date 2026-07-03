@@ -3856,6 +3856,13 @@ def normalize_decision_log_row(r):
         or ""
     )
 
+    def unique_list(values):
+        out = []
+        for x in values or []:
+            if x and x not in out:
+                out.append(x)
+        return out
+
     return {
         "ts": r.get("ts") or r.get("created_at") or r.get("datetime"),
         "decision": decision,
@@ -3866,8 +3873,8 @@ def normalize_decision_log_row(r):
         "score": r.get("score") or raw.get("score"),
         "risk_pct": r.get("risk_pct") or raw.get("risk_pct"),
         "trade_id": str(trade_id),
-        "reasons": reasons if isinstance(reasons, list) else [reasons],
-        "warnings": warnings if isinstance(warnings, list) else [warnings],
+        "reasons": unique_list(reasons if isinstance(reasons, list) else [reasons]),
+        "warnings": unique_list(warnings if isinstance(warnings, list) else [warnings]),
         "bingx_divergence": bingx_divergence if isinstance(bingx_divergence, dict) else {},
     }    
 
