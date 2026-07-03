@@ -1457,6 +1457,101 @@ def central_can_open_trade(sig):
         }
 
 
+def _decision_value(decision_payload):
+    """Normaliza decisão ALLOW/DENY vinda da Central."""
+    try:
+        return str(
+            decision_payload.get("decision")
+            or decision_payload.get("result")
+            or ("ALLOW" if decision_payload.get("allowed") else "DENY")
+        ).upper()
+    except Exception:
+        return "DENY"
+
+
+def _risk_reasons_text(risk_payload, local_gate=None):
+    reasons = []
+    try:
+        raw = risk_payload.get("reasons") or risk_payload.get("reason") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        reasons.extend([str(x) for x in raw])
+    except Exception:
+        pass
+
+    try:
+        local_reasons = (local_gate or {}).get("reasons") or []
+        if isinstance(local_reasons, str):
+            local_reasons = [local_reasons]
+        reasons.extend([str(x) for x in local_reasons])
+    except Exception:
+        pass
+
+    return reasons or ["Sem motivo informado"]
+
+
+def predator_risk_precheck(sig):
+    """
+    Trava obrigatória da arquitetura Central Quant.
+
+    Toda entrada do Smart Predator, mesmo PAPER/VERIFY, precisa consultar
+    /can_open_trade ANTES de registrar posição, enviar Telegram ou executar.
+    """
+    HEALTH["execution_last_run"] = data_hora_sp_str()
+
+    local_gate = predator_local_live_gate(sig)
+    risk = central_can_open_trade(sig)
+    allowed = bool(risk.get("allowed")) and bool(local_gate.get("allowed", True))
+
+    decision = _decision_value(risk)
+    if not allowed:
+        decision = "DENY"
+
+    HEALTH["execution_last_decision"] = decision
+    HEALTH["execution_last_result"] = "PRECHECK_ALLOW" if allowed else "PRECHECK_DENY"
+    HEALTH["execution_last_error"] = None if allowed else "; ".join(_risk_reasons_text(risk, local_gate)[:3])
+
+    sig["risk_precheck_decision"] = decision
+    sig["risk_precheck_allowed"] = bool(allowed)
+    sig["risk_precheck_at"] = data_hora_sp_str()
+    sig["risk_precheck_payload"] = risk
+    sig["risk_precheck_local_gate"] = local_gate
+
+    return allowed, risk, local_gate
+
+
+def registrar_bloqueio_risk_predator(sig, risk, local_gate=None):
+    """Registra bloqueio local para auditoria do robô sem abrir posição."""
+    try:
+        reasons = _risk_reasons_text(risk, local_gate)
+        evento = {
+            "event": "RISK_DENY",
+            "date": data_hoje_sp_str(),
+            "datetime": data_hora_sp_str(),
+            "symbol": sig.get("symbol"),
+            "symbol_clean": sig.get("symbol_clean", nome_limpo(sig.get("symbol", ""))),
+            "side": sig.get("side"),
+            "setup": "SMART_PREDATOR",
+            "signal_type": "SMART_PREDATOR",
+            "score": int(sig.get("score", 0) or 0),
+            "risk_pct": float(sig.get("risk_pct", 0) or 0),
+            "decision": "DENY",
+            "allowed": False,
+            "reasons": reasons,
+            "central_decision": risk,
+            "local_gate": local_gate or {},
+        }
+        registrar_evento_trade(evento)
+        inc_funnel_stat("risk_rejected")
+        print(
+            "SMART PREDATOR BLOQUEADO PELA CENTRAL: "
+            f"{evento['symbol_clean']} {evento.get('side')} | "
+            + " | ".join(reasons[:3])
+        )
+    except Exception as exc:
+        print("ERRO registrar_bloqueio_risk_predator:", exc)
+
+
 def count_live_positions_predator():
     posicoes = carregar_posicoes()
     total = 0
@@ -1667,14 +1762,18 @@ def update_position_execution_fields(sig, risk, broker_result):
         print("ERRO update_position_execution_fields:", exc)
 
 
-def execute_predator_signal_safe(sig):
-    """Executa a camada VERIFY/LIVE do Smart Predator no padrão Falcon."""
+def execute_predator_signal_safe(sig, risk_prechecked=None, local_gate_prechecked=None):
+    """Executa a camada VERIFY/LIVE do Smart Predator no padrão Falcon.
+
+    Quando o scanner já consultou o Risk Manager antes do registro, reutiliza
+    essa decisão para evitar dupla consulta e manter auditoria consistente.
+    """
     if not execution_mode_active():
         return None
 
     HEALTH["execution_last_run"] = data_hora_sp_str()
-    local_gate = predator_local_live_gate(sig)
-    risk = central_can_open_trade(sig)
+    local_gate = local_gate_prechecked if isinstance(local_gate_prechecked, dict) else predator_local_live_gate(sig)
+    risk = risk_prechecked if isinstance(risk_prechecked, dict) else central_can_open_trade(sig)
     allowed = bool(risk.get("allowed")) and bool(local_gate.get("allowed", True))
     ready = broker_ready_payload()
     broker_result = {}
@@ -1848,8 +1947,9 @@ def registrar_posicao(s):
         "close_reason": None,
         "auto_trade": SMART_PREDATOR_AUTO_TRADE,
         "execution_mode": PREDATOR_MODE,
-        "execution_decision": None,
-        "execution_allowed": None,
+        "execution_decision": sig.get("risk_precheck_decision"),
+        "execution_allowed": sig.get("risk_precheck_allowed"),
+        "execution_checked_at": sig.get("risk_precheck_at"),
         "execution_margin_usdt": PREDATOR_REAL_MARGIN_USDT if execution_mode_active() else None,
         "execution_leverage": PREDATOR_REAL_LEVERAGE if execution_mode_active() else None,
         "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT if execution_mode_active() else None,
@@ -1888,6 +1988,10 @@ def registrar_posicao(s):
         "execution_margin_usdt": PREDATOR_REAL_MARGIN_USDT if execution_mode_active() else None,
         "execution_leverage": PREDATOR_REAL_LEVERAGE if execution_mode_active() else None,
         "execution_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT if execution_mode_active() else None,
+        "execution_decision": s.get("risk_precheck_decision"),
+        "execution_allowed": s.get("risk_precheck_allowed"),
+        "execution_checked_at": s.get("risk_precheck_at"),
+        "central_risk_precheck": s.get("risk_precheck_payload"),
         "h4_context": s.get("h4_context"),
         "adx_h4": s.get("adx_h4"),
         "volume_ratio": s.get("volume_ratio")
@@ -3333,11 +3437,21 @@ def scanner():
                         s = scan_smart_predator_symbol(symbol)
 
                         if s:
+                            risk_allowed, risk_payload, local_gate = predator_risk_precheck(s)
+
+                            if not risk_allowed:
+                                registrar_bloqueio_risk_predator(s, risk_payload, local_gate)
+                                continue
+
                             ok = registrar_posicao(s)
                             if ok:
                                 safe_send_telegram(formatar_sinal_predator(s))
                                 if execution_mode_active():
-                                    execute_predator_signal_safe(s)
+                                    execute_predator_signal_safe(
+                                        s,
+                                        risk_prechecked=risk_payload,
+                                        local_gate_prechecked=local_gate,
+                                    )
                                 inc_funnel_stat("signals_sent")
                                 sinais_enviados += 1
 
