@@ -1800,6 +1800,8 @@ def autosync_trade_registry(reason="manual"):
                 "imported_count": result.get("imported_count"),
                 "skipped_count": result.get("skipped_count"),
                 "errors_count": result.get("errors_count"),
+                "removed_count": result.get("removed_count"),
+                "removed": result.get("removed", [])[:50],
                 "after": result.get("after"),
             },
         }
