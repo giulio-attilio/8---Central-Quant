@@ -777,8 +777,10 @@ def central_exposure_snapshot():
         if not isinstance(p, dict):
             continue
 
-        bot = str(p.get("bot") or "UNKNOWN").upper()
-        symbol = p.get("symbol_clean") or p.get("symbol") or p.get("ativo") or p.get("pair")
+        bot = normalize_registry_bot(p.get("bot") or "UNKNOWN")
+        symbol = normalize_registry_symbol(
+            p.get("symbol_clean") or p.get("symbol") or p.get("ativo") or p.get("pair")
+        )
         setup = p.get("setup") or p.get("signal_type") or p.get("setup_label")
         side = str(p.get("side") or p.get("direction") or "").upper()
 
@@ -1345,6 +1347,30 @@ def _trade_registry_sync_symbol(symbol):
     return s
 
 
+def normalize_registry_symbol(symbol):
+    s = str(symbol or "").upper().strip()
+    s = s.replace("/USDT:USDT", "USDT")
+    s = s.replace("/USDT", "USDT")
+    s = s.replace(":USDT", "")
+    s = s.replace("-", "")
+    return s
+
+
+def normalize_registry_bot(bot):
+    b = str(bot or "").upper().strip()
+    aliases = {
+        "FALCON STRIKE": "FALCON",
+        "SMART PREDATOR": "PREDATOR",
+        "SMART_PREDATOR": "PREDATOR",
+        "TREND PRO": "TRENDPRO",
+        "TREND PRO ELITE": "TRENDPRO",
+        "MEME HUNTER": "MEME",
+        "COBRA ATTACK": "COBRA",
+        "DONKEY H4": "DONKEY",
+    }
+    return aliases.get(b, b)
+
+
 def _trade_registry_sync_side(position):
     side = str(
         position.get("side")
@@ -1644,9 +1670,11 @@ def central_positions_route():
     by_symbol = {}
 
     for p in positions:
-        bot = str(p.get("bot") or "UNKNOWN").upper()
+        bot = normalize_registry_bot(p.get("bot") or "UNKNOWN")
         side = str(p.get("side") or p.get("direction") or "UNKNOWN").upper()
-        symbol = str(p.get("symbol") or p.get("ativo") or p.get("pair") or "UNKNOWN").upper()
+        symbol = normalize_registry_symbol(
+            p.get("symbol_clean") or p.get("symbol") or p.get("ativo") or p.get("pair") or "UNKNOWN"
+        )
 
         by_bot[bot] = by_bot.get(bot, 0) + 1
         by_side[side] = by_side.get(side, 0) + 1
