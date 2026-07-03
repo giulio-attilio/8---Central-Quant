@@ -3967,6 +3967,8 @@ def build_consistency_report():
 
 def build_trade_registry_status_line():
     try:
+        autosync_trade_registry(reason="status")
+
         registry = central_trade_registry_snapshot(include_trades=False)
         autosync = TRADE_REGISTRY_AUTOSYNC_STATUS or {}
 
