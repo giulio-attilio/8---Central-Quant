@@ -244,3 +244,45 @@ def bot_ranking():
         "generated_at": analytics.get("generated_at"),
         "bots": ranking,
     }
+
+
+def setup_ranking():
+    analytics = history_manager.build_trade_record_analytics()
+
+    ranking = []
+
+    for setup, stats in analytics.get("by_setup", {}).items():
+
+        score = analytics_score(stats)
+        diagnosis = diagnose_stats(stats)
+
+        item = {
+            "setup": setup,
+            "score": score,
+            "confidence": confidence_label(
+                int(stats.get("trades", 0) or 0)
+            ),
+            "recommendation": recommendation(score, stats),
+            "strengths": diagnosis.get("strengths", []),
+            "weaknesses": diagnosis.get("weaknesses", []),
+            "notes": diagnosis.get("notes", []),
+            **stats,
+        }
+
+        ranking.append(item)
+
+    ranking.sort(
+        key=lambda x: (
+            x.get("score", 0),
+            x.get("pnl_total_pct", 0),
+            x.get("trades", 0),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "ok": True,
+        "version": "2026-07-03-ANALYTICS-V3",
+        "generated_at": analytics.get("generated_at"),
+        "setups": ranking,
+    }

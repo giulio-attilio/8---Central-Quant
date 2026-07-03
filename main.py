@@ -6966,6 +6966,68 @@ def analytics_ranking_route():
         }
 
 
+@app.route("/analytics/setups/ranking")
+def analytics_setups_ranking_route():
+
+    try:
+        import analytics_engine
+
+        payload = analytics_engine.setup_ranking()
+
+        lines = [
+            "🧠 ANALYTICS SETUPS — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            "",
+            "Ranking inteligente por setup:",
+        ]
+
+        for i, setup in enumerate(payload.get("setups", []), start=1):
+
+            lines += [
+                "",
+                f"{i}. {setup.get('setup')}",
+                f"Score: {setup.get('score')}/100",
+                f"Confiança: {setup.get('confidence')}",
+                f"Recomendação: {setup.get('recommendation')}",
+                f"Trades: {setup.get('trades')}",
+                f"Win rate: {setup.get('win_rate_pct')}%",
+                f"PnL total: {setup.get('pnl_total_pct')}%",
+                f"PnL médio: {setup.get('pnl_avg_pct')}%",
+                f"TP50 hit rate: {setup.get('tp50_hit_rate_pct')}%",
+            ]
+
+            strengths = setup.get("strengths") or []
+            weaknesses = setup.get("weaknesses") or []
+            notes = setup.get("notes") or []
+
+            if strengths:
+                lines.append("Pontos fortes:")
+                for s in strengths:
+                    lines.append(f"✅ {s}")
+
+            if weaknesses:
+                lines.append("Pontos fracos:")
+                for w in weaknesses:
+                    lines.append(f"⚠️ {w}")
+
+            if notes:
+                lines.append("Notas:")
+                for n in notes:
+                    lines.append(f"- {n}")
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+        
 @app.route("/analytics/symbols")
 def analytics_symbols_route():
     return _analytics_group_response("symbol", "symbol", "symbols")
