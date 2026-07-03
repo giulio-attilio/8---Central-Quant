@@ -6175,6 +6175,10 @@ def risk_route():
 @app.route("/risk/registry")
 @app.route("/riskregistry")
 def risk_registry_route():
+    try:
+        sync_trade_registry_from_open_positions(commit=True)
+    except Exception as exc:
+        print("AVISO SYNC REGISTRY ANTES DO RISK_REGISTRY:", exc)
     exposure = central_exposure_snapshot()
     registry = {
     "loaded": central_trade_registry is not None,
@@ -6206,6 +6210,10 @@ def risk_registry_route():
 @app.route("/risk/registry/check")
 @app.route("/riskregistry/check")
 def risk_registry_check_route():
+    try:
+        sync_trade_registry_from_open_positions(commit=True)
+    except Exception as exc:
+        print("AVISO SYNC REGISTRY ANTES DO RISK_REGISTRY_CHECK:", exc)
     exposure = central_exposure_snapshot()
     registry = central_trade_registry_snapshot(include_trades=False)
 
