@@ -873,6 +873,32 @@ def load_closed_trades(limit=None, filters=None):
 
 
 def build_closed_trades_payload(limit=None, filters=None):
+    trades = load_closed_trades(limit=limit, filters=filters)
+
+    metrics = calculate_performance_metrics([
+        {
+            "event": "TRADE_CLOSED",
+            "result_pct": t.get("pnl_pct"),
+            "result_r": t.get("r_multiple"),
+            "result": t.get("result"),
+            "bot": t.get("bot"),
+            "symbol": t.get("symbol"),
+            "setup": t.get("setup"),
+        }
+        for t in trades
+    ])
+
+    return {
+        "ok": True,
+        "generated_at": data_hora_sp_str(),
+        "file": str(CLOSED_TRADES_FILE),
+        "count": len(trades),
+        "metrics": metrics,
+        "trades": trades,
+    }
+
+
+def build_closed_trades_payload(limit=None, filters=None):
     trades = load_closed_trades(limit=limit or HISTORY_MAX_READ, filters=filters)
     metrics = calculate_performance_metrics([
         {

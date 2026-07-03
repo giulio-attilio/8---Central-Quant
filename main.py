@@ -9240,6 +9240,30 @@ try:
     def super_exporthistory_route():
         return super_history_manager.build_export_payload()
 
+    @app.route("/history/trades")
+    def history_trades():
+        try:
+            import history_manager
+            payload = history_manager.build_closed_trades_payload()
+
+            return {
+                "ok": True,
+                "text": (
+                    "🧾 HISTORY TRADES — CENTRAL QUANT\n"
+                    f"Data/hora: {payload.get('generated_at')}\n\n"
+                    f"Trades consolidados: {payload.get('count', 0)}\n\n"
+                    f"Wins: {payload['metrics']['wins']}\n"
+                    f"Losses: {payload['metrics']['losses']}\n"
+                    f"Win Rate: {payload['metrics']['win_rate_pct']}%\n"
+                    f"PnL Total: {payload['metrics']['pnl_total_pct']}%\n"
+                    f"Profit Factor: {payload['metrics']['profit_factor_pct']}"
+                ),
+                "payload": payload,
+            }
+
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    
     @app.route("/history/raw")
     def super_history_raw_route():
         return super_history_manager.build_history_payload()
