@@ -1652,6 +1652,55 @@ def _trade_registry_signature_map(items):
     return out
 
 
+def mark_registry_missing_trades(removed):
+    if central_trade_registry is None:
+        return {"ok": False, "error": "trade_registry unavailable"}
+
+    if not removed:
+        return {"ok": True, "marked_count": 0, "marked": []}
+
+    try:
+        registry = central_trade_registry.load_registry()
+        open_trades = registry.get("open_trades", {})
+
+        if not isinstance(open_trades, dict):
+            return {"ok": False, "error": "open_trades is not dict"}
+
+        marked = []
+
+        for item in removed:
+            trade_id = item.get("trade_id")
+            if not trade_id or trade_id not in open_trades:
+                continue
+
+            trade = open_trades[trade_id]
+            trade["status"] = "MISSING_FROM_BOTS"
+            trade["missing_from_bots"] = True
+            trade["missing_detected_at"] = data_hora_sp_str()
+            trade["last_update"] = data_hora_sp_str()
+
+            open_trades[trade_id] = trade
+            marked.append({
+                "trade_id": trade_id,
+                "bot": trade.get("bot"),
+                "symbol": trade.get("symbol"),
+                "side": trade.get("side"),
+                "status": trade.get("status"),
+            })
+
+        registry["open_trades"] = open_trades
+        central_trade_registry.save_registry(registry)
+
+        return {
+            "ok": True,
+            "marked_count": len(marked),
+            "marked": marked,
+        }
+
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def sync_trade_registry_from_open_positions(commit=False):
     if central_trade_registry is None:
         return {
@@ -1693,6 +1742,7 @@ def sync_trade_registry_from_open_positions(commit=False):
 
             candidate_signature = _trade_registry_signature_from_items([candidate])
             candidate_key = next(iter(candidate_signature), None)
+            
             candidates.append(candidate)
             trade_id = str(candidate.get("trade_id"))
             if trade_id in existing_ids or candidate_key in existing_signature:
@@ -1766,6 +1816,10 @@ def sync_trade_registry_from_open_positions(commit=False):
             "note": "Presente no Registry, ausente nas posições atuais dos robôs.",
         })
 
+    missing_mark_result = None
+    if commit and removed:
+        missing_mark_result = mark_registry_missing_trades(removed)
+
     return {
         "ok": len(errors) == 0,
         "commit": bool(commit),
@@ -1780,6 +1834,7 @@ def sync_trade_registry_from_open_positions(commit=False):
         "errors": errors,
         "removed_count": len(removed),
         "removed": removed[:200],
+        "missing_mark_result": missing_mark_result,
         "after": central_trade_registry_snapshot(include_trades=False) if commit else None,
         "note": "GET faz prévia/dry-run. Para importar, use POST com confirm=true ou confirm=SYNC.",
     }
