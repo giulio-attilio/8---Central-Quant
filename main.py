@@ -3687,6 +3687,16 @@ def append_decision_log(payload, decision_result):
     symbol = normalize_symbol_for_risk(result.get("symbol") or payload.get("symbol"))
     side = str(result.get("side") or payload.get("side") or "").upper()
     trade_id = payload.get("trade_id") or payload.get("client_trade_id") or generate_trade_id(bot, symbol, side)
+    if isinstance(trade_id, dict):
+        trade_id = (
+            trade_id.get("trade_id")
+            or trade_id.get("ALLOWED")
+            or trade_id.get("DENIED")
+            or trade_id.get("id")
+            or str(trade_id)
+        )
+
+    trade_id = str(trade_id)
     allowed = bool(result.get("allowed"))
     state = "VERIFY" if allowed and str(result.get("mode") or "").upper() == "VERIFY" else ("DENIED" if not allowed else str(result.get("mode") or "ALLOW").upper())
     item = {
@@ -3921,7 +3931,7 @@ def build_decision_log_report(arg=None, limit=30):
                 f"só_bingx={','.join(only_bingx) if only_bingx else '0'} | "
                 f"só_central={','.join(only_central) if only_central else '0'}"
             )
-            
+
     return "\n".join(lines)
 
 
