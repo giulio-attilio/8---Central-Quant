@@ -4457,8 +4457,11 @@ def can_open_trade_decision(payload: dict):
     }
     try:
         append_decision_log(payload, decision_result)
+        decision_result["decision_log_saved"] = True
     except Exception as exc:
-        print("ERRO decision log:", exc)
+        print("ERRO decision log:", repr(exc))
+        decision_result["decision_log_saved"] = False
+        decision_result["decision_log_error"] = str(exc)
     return decision_result
 
 
