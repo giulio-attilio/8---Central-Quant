@@ -56,6 +56,15 @@ from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
 try:
+    import trade_registry as central_trade_registry
+except Exception as _trade_registry_import_exc:
+    central_trade_registry = None
+    TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_import_exc)
+else:
+    TRADE_REGISTRY_IMPORT_ERROR = None
+
+
+try:
     from strategy import calcular_atr
 except Exception:
     def calcular_atr(df, period=14):
@@ -329,7 +338,11 @@ HEALTH = {
     "last_watchdog_alert": None,
     "last_watchdog_alert_ts": 0,
     "watchdog_last_check": None,
-    "watchdog_last_status": "OK"
+    "watchdog_last_status": "OK",
+    "trade_registry_loaded": central_trade_registry is not None,
+    "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
+    "last_trade_registry_action": None,
+    "last_trade_registry_error": None
 }
 
 
@@ -351,6 +364,127 @@ def data_hora_sp_str():
 
 def nome_limpo(symbol):
     return symbol.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
+
+
+# ====================================================
+# TRADE REGISTRY — CENTRAL QUANT
+# ====================================================
+
+def trendpro_setup_from_signal(payload):
+    signal_type = str((payload or {}).get("signal_type", "NORMAL") or "NORMAL").upper()
+    if signal_type in {"DONKEY", "EARLY_DONKEY", "POI_DONKEY", "DONKEY_CONFIRMADO"}:
+        return signal_type
+    if signal_type in {"EARLY", "REENTRY", "RECUPERADO", "POI"}:
+        return f"TRENDPRO_{signal_type}"
+    return "TRENDPRO_ELITE"
+
+
+def trendpro_registry_trade_id(payload):
+    if central_trade_registry is None:
+        return None
+    try:
+        return central_trade_registry.make_trade_id(
+            bot="TRENDPRO",
+            symbol=nome_limpo((payload or {}).get("symbol")),
+            side=(payload or {}).get("side") or (payload or {}).get("signal"),
+            setup=trendpro_setup_from_signal(payload),
+        )
+    except Exception as exc:
+        HEALTH["last_trade_registry_error"] = f"make_trade_id: {exc}"
+        return None
+
+
+def register_trade_registry_open(payload):
+    """
+    Registra a entrada aprovada do Trend PRO no Trade Registry.
+    Não bloqueia o robô se o Registry falhar; apenas registra warning no HEALTH.
+    """
+    if central_trade_registry is None:
+        HEALTH["last_trade_registry_error"] = TRADE_REGISTRY_IMPORT_ERROR or "trade_registry indisponível"
+        return None
+
+    try:
+        setup = trendpro_setup_from_signal(payload)
+        result = central_trade_registry.register_open_trade(
+            bot="TRENDPRO",
+            symbol=nome_limpo(payload.get("symbol")),
+            side=payload.get("side") or payload.get("signal"),
+            entry=payload.get("entry"),
+            sl=payload.get("sl") or payload.get("stop"),
+            tp50=payload.get("tp50"),
+            setup=setup,
+            qty=payload.get("qty") or payload.get("position_size") or payload.get("donkey_position_size"),
+            source="trendpro",
+            metadata={
+                "symbol_raw": payload.get("symbol"),
+                "symbol_clean": payload.get("symbol_clean") or nome_limpo(payload.get("symbol")),
+                "signal_type": payload.get("signal_type", "NORMAL"),
+                "signal_score": payload.get("signal_score"),
+                "elite_candidate": payload.get("elite_candidate"),
+                "risk_pct": payload.get("risk_pct"),
+                "risk_abs": payload.get("risk_abs"),
+                "h4_state": payload.get("h4_state"),
+                "h1_state": payload.get("h1_state"),
+                "qualidade": payload.get("qualidade"),
+                "qualidade_pontos": payload.get("qualidade_pontos"),
+                "execution_mode": EXECUTION_MODE,
+                "execution_decision": payload.get("risk_precheck_decision"),
+                "execution_allowed": payload.get("risk_precheck_allowed"),
+                "risk_precheck_reasons": payload.get("risk_precheck_reasons"),
+                "risk_precheck_warnings": payload.get("risk_precheck_warnings"),
+            },
+        )
+        HEALTH["last_trade_registry_action"] = result
+        HEALTH["last_trade_registry_error"] = None
+        return result
+    except Exception as exc:
+        HEALTH["last_trade_registry_error"] = f"register_open_trade: {exc}"
+        return None
+
+
+def update_trade_registry_trade(payload, **updates):
+    if central_trade_registry is None:
+        return None
+    trade_id = (payload or {}).get("registry_trade_id") or trendpro_registry_trade_id(payload)
+    if not trade_id:
+        return None
+    try:
+        result = central_trade_registry.update_trade(trade_id, **updates)
+        HEALTH["last_trade_registry_action"] = result
+        if result.get("ok"):
+            HEALTH["last_trade_registry_error"] = None
+        else:
+            HEALTH["last_trade_registry_error"] = str(result)
+        return result
+    except Exception as exc:
+        HEALTH["last_trade_registry_error"] = f"update_trade: {exc}"
+        return None
+
+
+def close_trade_registry_trade(payload, exit_price=None, pnl_pct_value=None, pnl_r=None, reason=None, metadata=None):
+    if central_trade_registry is None:
+        return None
+    trade_id = (payload or {}).get("registry_trade_id") or trendpro_registry_trade_id(payload)
+    if not trade_id:
+        return None
+    try:
+        result = central_trade_registry.close_trade(
+            trade_id=trade_id,
+            exit_price=exit_price,
+            pnl_pct=pnl_pct_value,
+            pnl_r=pnl_r,
+            reason=reason,
+            metadata=metadata or {},
+        )
+        HEALTH["last_trade_registry_action"] = result
+        if result.get("ok"):
+            HEALTH["last_trade_registry_error"] = None
+        else:
+            HEALTH["last_trade_registry_error"] = str(result)
+        return result
+    except Exception as exc:
+        HEALTH["last_trade_registry_error"] = f"close_trade: {exc}"
+        return None
 
 
 
@@ -1457,7 +1591,11 @@ def montar_health_tecnico():
         "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
         "watchdog_last_check": HEALTH.get("watchdog_last_check"),
         "funnel_enabled": True,
-        "funnel_today": funil_hoje()
+        "funnel_today": funil_hoje(),
+        "trade_registry_loaded": central_trade_registry is not None,
+        "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
+        "last_trade_registry_action": HEALTH.get("last_trade_registry_action"),
+        "last_trade_registry_error": HEALTH.get("last_trade_registry_error")
     }
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -3491,7 +3629,7 @@ def registrar_posicao(s):
     if not central_risk_allows_entry(s, motivo=motivo_risk):
         return False
 
-    posicoes[symbol] = {
+    position_payload = {
         "symbol": symbol,
         "symbol_clean": s["symbol_clean"],
         "side": s["signal"],
@@ -3533,6 +3671,16 @@ def registrar_posicao(s):
         "risk_precheck_warnings": s.get("risk_precheck_warnings")
     }
 
+    registry_result = register_trade_registry_open(position_payload)
+    if isinstance(registry_result, dict) and registry_result.get("trade_id"):
+        position_payload["registry_trade_id"] = registry_result.get("trade_id")
+        position_payload["registry_registered"] = bool(registry_result.get("ok"))
+        position_payload["registry_registered_at"] = data_hora_sp_str()
+    elif registry_result is not None:
+        position_payload["registry_registered"] = False
+        position_payload["registry_error"] = str(registry_result)
+
+    posicoes[symbol] = position_payload
     salvar_posicoes(posicoes)
 
     registrar_evento_trade({
@@ -3589,6 +3737,16 @@ def atualizar_posicao_com_poi(poi):
     p["trailing_activated_at"] = None
     p["last_poi_zone"] = True
     p["last_update_type"] = "POI"
+
+    update_trade_registry_trade(
+        p,
+        entry=p.get("entry"),
+        tp50=p.get("tp50"),
+        risk_abs=p.get("risk_abs"),
+        risk_pct=p.get("risk_pct"),
+        status=p.get("status"),
+        last_update_type="POI",
+    )
 
     posicoes[poi["symbol"]] = p
     salvar_posicoes(posicoes)
@@ -3781,6 +3939,21 @@ def gerenciar_posicoes():
                         "status": p.get("status")
                     })
 
+                    close_trade_registry_trade(
+                        p,
+                        exit_price=sl,
+                        pnl_pct_value=resultado,
+                        reason=resultado_tipo,
+                        metadata={
+                            "event": "CLOSE",
+                            "exit_reason": resultado_tipo,
+                            "mfe_max_pct": float(p.get("mfe_max_pct", 0)),
+                            "mfe_gave_back_pct": float(p.get("mfe_max_pct", 0)) - resultado,
+                            "breakeven": bool(p.get("breakeven")),
+                            "tp50_hit": bool(p.get("tp50_hit")),
+                        },
+                    )
+
                     if resultado_tipo == "BREAKEVEN":
                         adicionar_monitor_be(p, entry, sl)
 
@@ -3820,6 +3993,21 @@ def gerenciar_posicoes():
                         "status": p.get("status")
                     })
 
+                    close_trade_registry_trade(
+                        p,
+                        exit_price=sl,
+                        pnl_pct_value=resultado,
+                        reason=resultado_tipo,
+                        metadata={
+                            "event": "CLOSE",
+                            "exit_reason": resultado_tipo,
+                            "mfe_max_pct": float(p.get("mfe_max_pct", 0)),
+                            "mfe_gave_back_pct": float(p.get("mfe_max_pct", 0)) - resultado,
+                            "breakeven": bool(p.get("breakeven")),
+                            "tp50_hit": bool(p.get("tp50_hit")),
+                        },
+                    )
+
                     if resultado_tipo == "BREAKEVEN":
                         adicionar_monitor_be(p, entry, sl)
 
@@ -3843,6 +4031,20 @@ def gerenciar_posicoes():
                     alterou = True
 
                     enviar_tp50(p, tp50, pnl_pct(side, entry, tp50))
+
+                    update_trade_registry_trade(
+                        p,
+                        status=p.get("status"),
+                        tp50_hit=True,
+                        tp50_activated_at=p.get("tp50_activated_at"),
+                    )
+
+                    update_trade_registry_trade(
+                        p,
+                        status=p.get("status"),
+                        tp50_hit=True,
+                        tp50_activated_at=p.get("tp50_activated_at"),
+                    )
 
                     registrar_evento_trade({
                         "event": "TP50",
@@ -3911,6 +4113,26 @@ def gerenciar_posicoes():
 
                         enviar_trailing_ativado(p, novo_stop)
 
+                        update_trade_registry_trade(
+                            p,
+                            sl=p.get("sl"),
+                            stop=p.get("sl"),
+                            status=p.get("status"),
+                            breakeven=True,
+                            breakeven_activated_at=p.get("breakeven_activated_at"),
+                            trailing_activated_at=p.get("trailing_activated_at"),
+                        )
+
+                        update_trade_registry_trade(
+                            p,
+                            sl=p.get("sl"),
+                            stop=p.get("sl"),
+                            status=p.get("status"),
+                            breakeven=True,
+                            breakeven_activated_at=p.get("breakeven_activated_at"),
+                            trailing_activated_at=p.get("trailing_activated_at"),
+                        )
+
                         registrar_evento_trade({
                             "event": "BE_TRIGGER",
                             "date": data_hoje_sp_str(),
@@ -3971,6 +4193,22 @@ def gerenciar_posicoes():
                     p["last_trailing_message_stop"] = novo_stop
                     alterou = True
                     enviar_trailing(p, novo_stop)
+
+                    update_trade_registry_trade(
+                        p,
+                        sl=p.get("sl"),
+                        stop=p.get("sl"),
+                        status=p.get("status"),
+                        trailing_activated_at=p.get("trailing_activated_at"),
+                    )
+
+                    update_trade_registry_trade(
+                        p,
+                        sl=p.get("sl"),
+                        stop=p.get("sl"),
+                        status=p.get("status"),
+                        trailing_activated_at=p.get("trailing_activated_at"),
+                    )
 
                     registrar_evento_trade({
                         "event": "TRAILING",
