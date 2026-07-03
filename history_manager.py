@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - SUPER HISTORY MANAGER
-# Versão: 2026-06-29-SUPER-HISTORY-V1
+# Versão: 2026-07-03-SUPER-HISTORY-V2-CLOSED-TRADES
 #
 # Objetivo:
 # - Criar um histórico persistente único da Central Quant.
@@ -40,6 +40,7 @@ DECISION_LOG_FILE = DATA_DIR / "decision_log.jsonl"
 TIMELINE_LOG_FILE = DATA_DIR / "timeline.jsonl"
 HISTORY_EXPORT_FILE = DATA_DIR / "history_export.json"
 HISTORY_SEEN_FILE = DATA_DIR / "history_seen.json"
+CLOSED_TRADES_FILE = DATA_DIR / "closed_trades.jsonl"
 
 
 def ensure_history_files():
@@ -50,6 +51,7 @@ def ensure_history_files():
         HISTORY_EVENTS_FILE,
         DECISION_LOG_FILE,
         TIMELINE_LOG_FILE,
+        CLOSED_TRADES_FILE,
     ]:
         if not file_path.exists():
             file_path.touch()
@@ -138,6 +140,16 @@ def _read_jsonl_tail(path: Path, limit=None):
         return []
 
 
+def _count_jsonl(path: Path):
+    try:
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return 0
+
+
 def _read_json(path: Path, default):
     try:
         if not path.exists():
@@ -185,6 +197,8 @@ def get_status():
         "timeline_file": str(TIMELINE_LOG_FILE),
         "export_file": str(HISTORY_EXPORT_FILE),
         "seen_file": str(HISTORY_SEEN_FILE),
+        "closed_trades_file": str(CLOSED_TRADES_FILE),
+        "closed_trades_count": _count_jsonl(CLOSED_TRADES_FILE),
         "max_read": HISTORY_MAX_READ,
         "report_days": HISTORY_REPORT_DAYS,
         "dedup_enabled": HISTORY_DEDUP_ENABLED,
@@ -593,6 +607,173 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     return item
 
 
+def _closed_trade_record_from_event(item):
+    """
+    Converte um evento TRADE_CLOSED normalizado em um registro permanente de trade.
+    Este registro é append-only: depois de gravado, não deve ser alterado.
+    """
+    item = item if isinstance(item, dict) else {}
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+
+    entry_price = _safe_float(
+        item.get("entry")
+        or item.get("entry_price")
+        or raw.get("entry")
+        or raw.get("entrada")
+        or raw.get("entry_price"),
+        None,
+    )
+    exit_price = _safe_float(
+        item.get("exit_price")
+        or raw.get("exit_price")
+        or raw.get("close_price")
+        or raw.get("price")
+        or raw.get("exit"),
+        None,
+    )
+    result_pct = _safe_float(
+        item.get("result_pct")
+        or item.get("pnl_pct")
+        or item.get("pnl")
+        or raw.get("result_pct")
+        or raw.get("pnl_pct")
+        or raw.get("pnl")
+        or raw.get("resultado_pct"),
+        None,
+    )
+    result_r = _safe_float(
+        item.get("result_r")
+        or item.get("r_multiple")
+        or raw.get("result_r")
+        or raw.get("pnl_r")
+        or raw.get("r_multiple")
+        or raw.get("r"),
+        None,
+    )
+
+    entry_epoch = _safe_float(raw.get("entry_epoch") or raw.get("opened_epoch"), None)
+    exit_epoch = _safe_float(raw.get("exit_epoch") or item.get("epoch") or time.time(), None)
+    duration_minutes = _safe_float(raw.get("duration_minutes") or raw.get("tempo_aberto_min"), None)
+    if duration_minutes is None and entry_epoch is not None and exit_epoch is not None and exit_epoch >= entry_epoch:
+        duration_minutes = round((exit_epoch - entry_epoch) / 60, 2)
+
+    result_label = str(item.get("result") or raw.get("result") or raw.get("result_type") or "").upper().strip()
+    if not result_label and result_pct is not None:
+        if result_pct > 0:
+            result_label = "WIN"
+        elif result_pct < 0:
+            result_label = "LOSS"
+        else:
+            result_label = "BREAKEVEN"
+
+    record = {
+        "uid": item.get("uid"),
+        "event": "TRADE_CLOSED",
+        "created_at": data_hora_sp_str(),
+        "epoch": time.time(),
+        "trade_id": str(item.get("trade_id") or raw.get("trade_id") or raw.get("position_id") or ""),
+        "bot": sanitize_bot(item.get("bot") or raw.get("bot") or raw.get("strategy"), raw),
+        "setup": str(item.get("setup") or raw.get("setup") or raw.get("signal_type") or "").upper(),
+        "symbol": normalize_symbol(item.get("symbol") or raw.get("symbol") or raw.get("ativo")),
+        "side": normalize_side(item.get("side") or raw.get("side") or raw.get("direction")),
+        "entry_time": raw.get("entry_time") or raw.get("opened_at") or raw.get("created_at"),
+        "exit_time": raw.get("exit_time") or raw.get("closed_at") or item.get("ts") or data_hora_sp_str(),
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "stop": _safe_float(item.get("stop") or raw.get("stop") or raw.get("sl") or raw.get("initial_sl"), None),
+        "tp50": _safe_float(item.get("tp50") or raw.get("tp50") or raw.get("tp_50"), None),
+        "risk_pct": _safe_float(item.get("risk_pct") or raw.get("risk_pct") or raw.get("risco_pct") or raw.get("risk"), None),
+        "score": _safe_float(item.get("score") or raw.get("score") or raw.get("signal_score"), None),
+        "quality": item.get("quality") or raw.get("quality") or raw.get("qualidade") or raw.get("classification"),
+        "adx": _safe_float(raw.get("adx") or raw.get("adx_h4") or raw.get("adx_h1"), None),
+        "atr": _safe_float(raw.get("atr") or raw.get("atr_pct"), None),
+        "volume": raw.get("volume") or raw.get("volume_status") or raw.get("volume_h1"),
+        "trend": raw.get("trend") or raw.get("trend_h4") or raw.get("h4_trend") or raw.get("context_trend"),
+        "mfe": _safe_float(raw.get("mfe") or raw.get("max_favorable_excursion"), None),
+        "mae": _safe_float(raw.get("mae") or raw.get("max_adverse_excursion"), None),
+        "r_multiple": result_r,
+        "pnl_pct": result_pct,
+        "result": result_label,
+        "exit_reason": item.get("reason") or raw.get("exit_reason") or raw.get("reason") or raw.get("motivo"),
+        "duration_minutes": duration_minutes,
+        "source_event": item,
+        "raw": raw,
+    }
+    return record
+
+
+def append_closed_trade(item):
+    """
+    Grava uma linha em closed_trades.jsonl quando um TRADE_CLOSED é confirmado.
+    Mantém compatibilidade com o Super History: recebe o evento já normalizado pelo log_event.
+    """
+    try:
+        ensure_history_files()
+        record = _closed_trade_record_from_event(item)
+        if not record.get("trade_id") and not record.get("uid"):
+            record["trade_id"] = f"CLOSED-{agora_sp().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+        ok = _append_jsonl(CLOSED_TRADES_FILE, record)
+        return {
+            "ok": ok,
+            "file": str(CLOSED_TRADES_FILE),
+            "trade_id": record.get("trade_id"),
+            "bot": record.get("bot"),
+            "symbol": record.get("symbol"),
+            "pnl_pct": record.get("pnl_pct"),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "file": str(CLOSED_TRADES_FILE)}
+
+
+def load_closed_trades(limit=None, filters=None):
+    rows = _read_jsonl_tail(CLOSED_TRADES_FILE, limit=limit or HISTORY_MAX_READ)
+    filters = filters or {}
+    bot = str(filters.get("bot") or "").strip().upper()
+    symbol = normalize_symbol(filters.get("symbol") or "")
+    setup = str(filters.get("setup") or "").strip().upper()
+    side = normalize_side(filters.get("side") or "")
+    result = str(filters.get("result") or "").strip().upper()
+
+    out = []
+    for row in rows:
+        if bot and str(row.get("bot") or "").upper() != bot:
+            continue
+        if symbol and normalize_symbol(row.get("symbol") or "") != symbol:
+            continue
+        if setup and str(row.get("setup") or "").upper() != setup:
+            continue
+        if side and normalize_side(row.get("side") or "") != side:
+            continue
+        if result and str(row.get("result") or "").upper() != result:
+            continue
+        out.append(row)
+    return out
+
+
+def build_closed_trades_payload(limit=None, filters=None):
+    trades = load_closed_trades(limit=limit or HISTORY_MAX_READ, filters=filters)
+    metrics = calculate_performance_metrics([
+        {
+            "event": "TRADE_CLOSED",
+            "result_pct": t.get("pnl_pct"),
+            "result_r": t.get("r_multiple"),
+            "result": t.get("result"),
+            "bot": t.get("bot"),
+            "symbol": t.get("symbol"),
+            "setup": t.get("setup"),
+        }
+        for t in trades
+    ])
+    return {
+        "ok": True,
+        "generated_at": data_hora_sp_str(),
+        "file": str(CLOSED_TRADES_FILE),
+        "count": len(trades),
+        "metrics": metrics,
+        "trades": trades,
+    }
+
+
 def log_event(event_type, payload=None, source=None, trade_id=None):
     try:
         item = normalize_payload(event_type, payload, source=source, trade_id=trade_id)
@@ -612,6 +793,10 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
             _append_jsonl(DECISION_LOG_FILE, item)
         if ok and item.get("event") not in {"CENTRAL_COMMAND", "BOT_COMMAND"}:
             _append_jsonl(TIMELINE_LOG_FILE, item)
+
+        closed_trade_result = None
+        if ok and item.get("event") == "TRADE_CLOSED":
+            closed_trade_result = append_closed_trade(item)
 
         journal_result = None
         lifecycle_result = None
@@ -635,7 +820,7 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
                     journal_result = {"ok": False, "error": str(journal_exc)}
                 lifecycle_result = lifecycle_result or {"ok": False, "error": str(journal_exc)}
 
-        return {"ok": ok, "dedup": False, "event": item, "context": context_result, "journal": journal_result, "lifecycle": lifecycle_result}
+        return {"ok": ok, "dedup": False, "event": item, "context": context_result, "closed_trade": closed_trade_result, "journal": journal_result, "lifecycle": lifecycle_result}
     except Exception as exc:
         return {"ok": False, "dedup": False, "error": str(exc), "event": {"event_type": event_type, "payload": payload}}
 
@@ -1103,6 +1288,7 @@ def build_history_payload(limit=None):
             "decision_log": str(DECISION_LOG_FILE),
             "timeline": str(TIMELINE_LOG_FILE),
             "export": str(HISTORY_EXPORT_FILE),
+            "closed_trades": str(CLOSED_TRADES_FILE),
         },
         "totals": {
             "events": len(events),
@@ -1113,6 +1299,7 @@ def build_history_payload(limit=None):
             "tp50": len(tp50),
             "breakeven": by_event.get("BREAKEVEN", 0),
             "trailing": by_event.get("TRAILING_UPDATED", 0),
+            "closed_trade_records": _count_jsonl(CLOSED_TRADES_FILE),
         },
         "performance": {
             "wins": wins,
