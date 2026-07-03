@@ -1,0 +1,145 @@
+# ==============================================================================
+# CENTRAL QUANT - PROJECT CHECKER
+# Versao: 2026-07-02-CHECK-PROJECT-V1
+#
+# Objetivo:
+# - Validar a sintaxe dos arquivos principais antes do deploy.
+# - Detectar rapidamente SyntaxError/IndentationError/imports quebrados simples.
+# - Evitar deploy com bot quebrado por erro de edicao.
+#
+# Como usar na raiz do projeto:
+#   python check_project.py
+#   python3 check_project.py
+#   py check_project.py
+# ============================================================================
+
+import os
+import sys
+import py_compile
+from pathlib import Path
+from datetime import datetime
+
+ROOT = Path(__file__).resolve().parent
+
+DEFAULT_FILES = [
+    "main.py",
+    "history_manager.py",
+    "event_bus.py",
+    "broker.py",
+    "context_manager.py",
+    "exchange_manager.py",
+    "telegram_utils.py",
+    "bots/trendpro.py",
+    "bots/donkey.py",
+    "bots/cobra.py",
+    "bots/meme.py",
+    "bots/predator.py",
+    "bots/turtle.py",
+    "bots/falcon.py",
+]
+
+
+def file_label(path: str) -> str:
+    return path.replace("\\", "/")
+
+
+def check_syntax(relative_path: str) -> dict:
+    path = ROOT / relative_path
+    result = {
+        "file": file_label(relative_path),
+        "exists": path.exists(),
+        "ok": False,
+        "error": None,
+    }
+
+    if not path.exists():
+        result["error"] = "arquivo não encontrado"
+        return result
+
+    try:
+        py_compile.compile(str(path), doraise=True)
+        result["ok"] = True
+        return result
+    except py_compile.PyCompileError as exc:
+        result["error"] = str(exc)
+        return result
+    except Exception as exc:
+        result["error"] = repr(exc)
+        return result
+
+
+def discover_python_files() -> list[str]:
+    """Modo opcional: CHECK_ALL_PY=true valida todos os .py do projeto."""
+    ignored_dirs = {
+        ".git",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "env",
+        ".mypy_cache",
+        ".pytest_cache",
+    }
+    files = []
+    for path in ROOT.rglob("*.py"):
+        parts = set(path.relative_to(ROOT).parts)
+        if parts & ignored_dirs:
+            continue
+        files.append(str(path.relative_to(ROOT)).replace("\\", "/"))
+    return sorted(files)
+
+
+def main() -> int:
+    check_all_py = str(os.environ.get("CHECK_ALL_PY", "false")).lower() in {"1", "true", "yes", "sim", "on"}
+    files = discover_python_files() if check_all_py else DEFAULT_FILES
+
+    print("=" * 70)
+    print("CENTRAL QUANT - PROJECT CHECKER")
+    print(f"Data/hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    print(f"Raiz: {ROOT}")
+    print(f"Modo: {'todos os .py' if check_all_py else 'arquivos principais'}")
+    print("=" * 70)
+    print("")
+
+    results = [check_syntax(f) for f in files]
+
+    ok_count = 0
+    missing_count = 0
+    failed = []
+
+    for item in results:
+        if item["ok"]:
+            ok_count += 1
+            print(f"✅ {item['file']} — OK")
+        elif not item["exists"]:
+            missing_count += 1
+            print(f"⚪ {item['file']} — não encontrado (ignorado)")
+        else:
+            failed.append(item)
+            print(f"❌ {item['file']} — ERRO")
+
+    print("")
+    print("=" * 70)
+    print("RESUMO")
+    print("=" * 70)
+    print(f"OK: {ok_count}")
+    print(f"Não encontrados/ignorados: {missing_count}")
+    print(f"Com erro: {len(failed)}")
+
+    if failed:
+        print("")
+        print("ERROS ENCONTRADOS")
+        print("=" * 70)
+        for item in failed:
+            print(f"\n❌ {item['file']}")
+            print(item["error"])
+        print("")
+        print("STATUS: 🔴 PROJETO NÃO APTO PARA DEPLOY")
+        return 1
+
+    print("")
+    print("STATUS: 🟢 PROJETO APTO PARA DEPLOY")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

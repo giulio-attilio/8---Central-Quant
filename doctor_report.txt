@@ -1,0 +1,130 @@
+🩺 CENTRAL DOCTOR V2 — CENTRAL QUANT
+Gerado em: 02/07/2026 22:33:41
+Raiz: C:\Users\giuli\OneDrive\Documentos\GitHub\8---Central-Quant
+Ambiente detectado: LOCAL
+
+==============================
+1. ARQUIVOS PRINCIPAIS
+==============================
+✅ main.py
+✅ history_manager.py
+✅ event_bus.py
+
+==============================
+2. BOTS
+==============================
+✅ bots/trendpro.py
+✅ bots/donkey.py
+✅ bots/cobra.py
+✅ bots/meme.py
+✅ bots/predator.py
+✅ bots/turtle.py
+✅ bots/falcon.py
+
+==============================
+3. SINTAXE PYTHON
+==============================
+✅ main.py: OK
+✅ history_manager.py: OK
+✅ event_bus.py: OK
+✅ bots/trendpro.py: OK
+✅ bots/donkey.py: OK
+✅ bots/cobra.py: OK
+✅ bots/meme.py: OK
+✅ bots/predator.py: OK
+✅ bots/turtle.py: OK
+✅ bots/falcon.py: OK
+✅ broker.py: OK
+✅ context_manager.py: OK
+✅ exchange_manager.py: OK
+
+==============================
+4. MAIN / CENTRAL
+==============================
+✅ main.py contém BOT_CONFIGS
+✅ main.py contém central_exposure_snapshot
+✅ main.py contém GLOBAL_RISK_MAX_POSITIONS
+✅ main.py contém can_open_trade
+✅ main.py contém build_executive_report_daily
+✅ main.py contém build_executive_report_monthly
+✅ main.py contém central_daily_report_loop
+✅ main.py contém auditrisk
+✅ main.py contém central_watchdog_status
+✅ rota /risk
+✅ rota /bots
+✅ rota /health
+✅ rota /central
+✅ rota de auditoria: /audit, /auditoria, /auditoria2, /auditrisk, /history/audit, /policy/audit, /riskaudit
+
+==============================
+5. HISTORY / EVENT BUS
+==============================
+✅ history_manager.py contém HISTORY_EVENTS_FILE
+✅ history_manager.py contém DECISION_LOG_FILE
+✅ history_manager.py contém build_history_report
+✅ history_manager.py contém build_export_payload
+✅ history_manager.py contém log_event
+✅ event_bus.py contém emit_from_http
+✅ event_bus.py contém history_manager
+
+==============================
+6. RISK MANAGER NOS BOTS
+==============================
+✅ bots/donkey.py: Risk obrigatório confirmado (100/100)
+ℹ️ detalhe bots/donkey.py: rota=True http=True allow/deny=True block=True symbol/side=True
+✅ bots/turtle.py: Risk obrigatório confirmado (80/100)
+ℹ️ detalhe bots/turtle.py: rota=False http=True allow/deny=True block=True symbol/side=True
+✅ bots/predator.py: Risk obrigatório confirmado (100/100)
+ℹ️ detalhe bots/predator.py: rota=True http=True allow/deny=True block=True symbol/side=True
+✅ bots/falcon.py: Risk obrigatório confirmado (100/100)
+ℹ️ detalhe bots/falcon.py: rota=True http=True allow/deny=True block=True symbol/side=True
+
+==============================
+7. RUNTIME DOS BOTS
+==============================
+✅ bots/trendpro.py: runtime/threads/scanner confirmados
+ℹ️ bots/trendpro.py scanners: scanner
+ℹ️ bots/trendpro.py gestão: montar_monitor_be, adicionar_monitor_be, atualizar_monitor_be, salvar_monitor_be, carregar_monitor_be
+✅ bots/donkey.py: runtime/threads/scanner confirmados
+ℹ️ bots/donkey.py scanners: scanner
+ℹ️ bots/donkey.py gestão: montar_monitor_be, adicionar_monitor_be, atualizar_monitor_be, salvar_monitor_be, consultar_central_risk_manager, carregar_monitor_be, iniciar_threads_monitoradas
+✅ bots/cobra.py: runtime/threads/scanner confirmados
+ℹ️ bots/cobra.py scanners: scanner
+ℹ️ bots/cobra.py gestão: iniciar_threads_monitoradas
+✅ bots/meme.py: runtime/threads/scanner confirmados
+ℹ️ bots/meme.py scanners: scanner
+ℹ️ bots/meme.py gestão: montar_monitor_be, adicionar_monitor_be, atualizar_monitor_be, salvar_monitor_be, carregar_monitor_be
+✅ bots/predator.py: runtime/threads/scanner confirmados
+ℹ️ bots/predator.py scanners: scanner, scan_smart_predator_symbol
+ℹ️ bots/predator.py gestão: iniciar_threads_monitoradas
+✅ bots/turtle.py: runtime/threads/scanner confirmados
+ℹ️ bots/turtle.py scanners: scanner_loop
+ℹ️ bots/turtle.py gestão: management_loop
+✅ bots/falcon.py: runtime/threads/scanner confirmados
+ℹ️ bots/falcon.py scanners: scanner_loop
+ℹ️ bots/falcon.py gestão: management_loop
+
+==============================
+8. AMBIENTE
+==============================
+✅ Ambiente local detectado
+ℹ️ Variáveis Render: ignoradas localmente; serão validadas no Render
+ℹ️ UPSTASH_REDIS_REST_URL: não configurada localmente
+ℹ️ UPSTASH_REDIS_REST_TOKEN: não configurada localmente
+ℹ️ CENTRAL_TELEGRAM_BOT_TOKEN: não configurada localmente
+ℹ️ CENTRAL_TELEGRAM_CHAT_ID: não configurada localmente
+ℹ️ ENABLE_REAL_TRADING: não configurada localmente
+ℹ️ EXECUTION_MODE: não configurada localmente
+
+==============================
+9. DIAGNÓSTICO FINAL
+==============================
+Sintaxe OK: 13/13 arquivos
+Erros críticos: 0
+Warnings: 0
+Score: 100/100
+
+🟢 STATUS: PROJETO APTO PARA DEPLOY
+
+RECOMENDAÇÃO OPERACIONAL:
+- Deploy permitido se o objetivo não envolver reativar módulos pendentes.

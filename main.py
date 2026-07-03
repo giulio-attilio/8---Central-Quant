@@ -3590,6 +3590,333 @@ def build_sync_report():
     return "\n".join(lines)
 
 
+
+
+# ==========================================================
+# RISK AUDIT — /auditrisk
+# ==========================================================
+
+def _auditrisk_hours_from_arg(arg=None, default=2):
+    try:
+        if arg is None or str(arg).strip() == "":
+            return int(default)
+        raw = str(arg).strip().lower().replace("h", "")
+        value = int(float(raw))
+        return max(1, min(value, 168))
+    except Exception:
+        return int(default)
+
+
+def _auditrisk_event_epoch(row):
+    try:
+        value = row.get("epoch")
+        if value is not None:
+            return float(value)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _auditrisk_raw_dict(row):
+    raw = row.get("raw") if isinstance(row, dict) else None
+    return raw if isinstance(raw, dict) else {}
+
+
+def _auditrisk_field(row, key, default=None):
+    if not isinstance(row, dict):
+        return default
+    value = row.get(key)
+    if value is not None and value != "":
+        return value
+    raw = _auditrisk_raw_dict(row)
+    value = raw.get(key)
+    if value is not None and value != "":
+        return value
+    return default
+
+
+def _auditrisk_norm_bot(value):
+    txt = str(value or "").upper().strip()
+    if not txt or txt in {"NONE", "NULL", "N/A"}:
+        return "N/A"
+    if "PREDATOR" in txt:
+        return "PREDATOR"
+    if "DONKEY" in txt:
+        return "DONKEY"
+    if "TURTLE" in txt:
+        return "TURTLE"
+    if "FALCON" in txt:
+        return "FALCON"
+    if "COBRA" in txt:
+        return "COBRA"
+    if "MEME" in txt:
+        return "MEME"
+    if "TREND" in txt:
+        return "TRENDPRO"
+    return txt
+
+
+def _auditrisk_history_events(limit=3000):
+    try:
+        import history_manager as super_history_manager
+        path = Path(getattr(super_history_manager, "HISTORY_EVENTS_FILE", CENTRAL_DATA_DIR / "history_events.jsonl"))
+        return _read_jsonl_tail(path, limit=limit)
+    except Exception as exc:
+        print("ERRO auditrisk history events:", exc)
+        return []
+
+
+def _auditrisk_decision_events(limit=3000):
+    rows = []
+    try:
+        rows.extend(decision_log_items(limit=limit))
+    except Exception:
+        pass
+    for ev in _auditrisk_history_events(limit=limit):
+        event_name = str(ev.get("event") or ev.get("event_type") or ev.get("type") or "").upper()
+        raw = _auditrisk_raw_dict(ev)
+        raw_decision = str(raw.get("decision") or raw.get("allowed") or raw.get("status") or "").upper()
+        if event_name in {"RISK_DECISION", "RISK_ALLOW", "RISK_DENY", "TRADE_BLOCKED"} or raw_decision in {"ALLOW", "DENY", "TRUE", "FALSE"}:
+            rows.append(ev)
+
+    dedup = {}
+    for r in rows:
+        key = str(r.get("uid") or r.get("trade_id") or "") + "|" + str(r.get("epoch") or r.get("ts") or "")
+        if not key.strip("|"):
+            key = json.dumps(r, ensure_ascii=False, default=str)[:300]
+        dedup[key] = r
+    return list(dedup.values())
+
+
+def _auditrisk_open_events(limit=3000):
+    rows = []
+    for ev in _auditrisk_history_events(limit=limit):
+        event_name = str(ev.get("event") or ev.get("event_type") or ev.get("type") or "").upper()
+        event_raw = str(ev.get("event_raw") or "").upper()
+        if event_name in {"TRADE_OPENED"} or event_raw in {"ENTRY", "OPEN", "ENTRADA"}:
+            rows.append(ev)
+    return rows
+
+
+def _auditrisk_poi_events(limit=3000):
+    rows = []
+    for ev in _auditrisk_history_events(limit=limit):
+        event_name = str(ev.get("event") or ev.get("event_type") or ev.get("type") or "").upper()
+        event_raw = str(ev.get("event_raw") or "").upper()
+        setup = str(ev.get("setup") or "").upper()
+        if event_name == "POI" or event_raw == "POI" or setup == "POI":
+            rows.append(ev)
+    return rows
+
+
+def _auditrisk_decision_payload(row):
+    raw = _auditrisk_raw_dict(row)
+    decision = str(row.get("decision") or row.get("result") or row.get("risk_decision") or raw.get("decision") or raw.get("result") or "").upper()
+    allowed_value = row.get("allowed")
+    if allowed_value is None:
+        allowed_value = raw.get("allowed")
+    if allowed_value is None and decision in {"ALLOW", "ALLOWED", "RISK_ALLOW"}:
+        allowed = True
+    elif allowed_value is None and decision in {"DENY", "DENIED", "BLOCKED", "RISK_DENY"}:
+        allowed = False
+    else:
+        allowed = str(allowed_value).strip().lower() in {"1", "true", "yes", "sim", "allow", "allowed"}
+    bot = _auditrisk_norm_bot(_auditrisk_field(row, "bot", ""))
+    symbol = normalize_symbol_for_risk(_auditrisk_field(row, "symbol", ""))
+    side = str(_auditrisk_field(row, "side", "") or "").upper()
+    return {
+        "epoch": _auditrisk_event_epoch(row),
+        "ts": row.get("ts"),
+        "bot": bot,
+        "symbol": symbol,
+        "side": side,
+        "decision": "ALLOW" if allowed else "DENY",
+        "allowed": allowed,
+        "trade_id": row.get("trade_id") or raw.get("trade_id"),
+        "reasons": row.get("reasons") or raw.get("reasons") or [],
+    }
+
+
+def _auditrisk_entry_payload(row):
+    raw = _auditrisk_raw_dict(row)
+    return {
+        "epoch": _auditrisk_event_epoch(row),
+        "ts": row.get("ts"),
+        "bot": _auditrisk_norm_bot(_auditrisk_field(row, "bot", "")),
+        "symbol": normalize_symbol_for_risk(_auditrisk_field(row, "symbol", "")),
+        "side": str(_auditrisk_field(row, "side", "") or "").upper(),
+        "setup": str(_auditrisk_field(row, "setup", "") or "").upper(),
+        "trade_id": row.get("trade_id") or raw.get("trade_id"),
+    }
+
+
+def _auditrisk_has_risk_in_code(bot_key):
+    try:
+        cfg = BOT_CONFIGS.get(bot_key) or {}
+        file_path = cfg.get("file")
+        if not file_path or not Path(file_path).exists():
+            return False
+        txt = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+        return ("can_open_trade" in txt or "/can_open_trade" in txt) and ("ALLOW" in txt or "DENY" in txt or "allowed" in txt.lower())
+    except Exception:
+        return False
+
+
+def _auditrisk_match_decision(entry, decisions, window_seconds=1800):
+    best = None
+    e_epoch = float(entry.get("epoch") or 0)
+    for dec in decisions:
+        if not dec.get("allowed"):
+            continue
+        if dec.get("bot") != entry.get("bot"):
+            continue
+        if dec.get("symbol") and entry.get("symbol") and dec.get("symbol") != entry.get("symbol"):
+            continue
+        if dec.get("side") and entry.get("side") and dec.get("side") != entry.get("side"):
+            continue
+        d_epoch = float(dec.get("epoch") or 0)
+        if e_epoch and d_epoch and abs(e_epoch - d_epoch) > window_seconds:
+            continue
+        if best is None or abs((d_epoch or 0) - (e_epoch or 0)) < abs((best.get("epoch") or 0) - (e_epoch or 0)):
+            best = dec
+    return best
+
+
+def build_audit_risk_report(hours=2, limit=3000):
+    hours = _auditrisk_hours_from_arg(hours, default=2)
+    since_epoch = time.time() - (hours * 3600)
+
+    entries_all = [_auditrisk_entry_payload(x) for x in _auditrisk_open_events(limit=limit)]
+    pois_all = [_auditrisk_entry_payload(x) for x in _auditrisk_poi_events(limit=limit)]
+    decisions_all = [_auditrisk_decision_payload(x) for x in _auditrisk_decision_events(limit=limit)]
+
+    entries = [e for e in entries_all if not e.get("epoch") or e.get("epoch") >= since_epoch]
+    pois = [e for e in pois_all if not e.get("epoch") or e.get("epoch") >= since_epoch]
+    decisions = [d for d in decisions_all if not d.get("epoch") or d.get("epoch") >= since_epoch]
+
+    exposure_rows = _all_open_positions_payload()
+    exposure_by_bot = {}
+    for r in exposure_rows:
+        bot = _auditrisk_norm_bot(r.get("bot"))
+        exposure_by_bot[bot] = exposure_by_bot.get(bot, 0) + 1
+
+    stats = {}
+    for key in BOT_CONFIGS.keys():
+        b = bot_health(key, BOT_CONFIGS[key])
+        stats[key] = {
+            "enabled": bool(b.get("enabled")),
+            "loaded": bool(b.get("loaded")),
+            "risk_code": _auditrisk_has_risk_in_code(key),
+            "exposure": exposure_by_bot.get(key, 0),
+            "entries": 0,
+            "entries_with_allow": 0,
+            "entries_without_allow": 0,
+            "allows": 0,
+            "denies": 0,
+            "pois": 0,
+            "unmatched_examples": [],
+        }
+
+    for dec in decisions:
+        bot = dec.get("bot") or "N/A"
+        if bot not in stats:
+            stats[bot] = {"enabled": False, "loaded": False, "risk_code": False, "exposure": exposure_by_bot.get(bot, 0), "entries": 0, "entries_with_allow": 0, "entries_without_allow": 0, "allows": 0, "denies": 0, "pois": 0, "unmatched_examples": []}
+        if dec.get("allowed"):
+            stats[bot]["allows"] += 1
+        else:
+            stats[bot]["denies"] += 1
+
+    for poi in pois:
+        bot = poi.get("bot") or "N/A"
+        if bot in stats:
+            stats[bot]["pois"] += 1
+
+    for entry in entries:
+        bot = entry.get("bot") or "N/A"
+        if bot not in stats:
+            stats[bot] = {"enabled": False, "loaded": False, "risk_code": False, "exposure": exposure_by_bot.get(bot, 0), "entries": 0, "entries_with_allow": 0, "entries_without_allow": 0, "allows": 0, "denies": 0, "pois": 0, "unmatched_examples": []}
+        stats[bot]["entries"] += 1
+        match = _auditrisk_match_decision(entry, decisions)
+        if match:
+            stats[bot]["entries_with_allow"] += 1
+        else:
+            stats[bot]["entries_without_allow"] += 1
+            if len(stats[bot]["unmatched_examples"]) < 3:
+                stats[bot]["unmatched_examples"].append(entry)
+
+    total_entries = sum(v.get("entries", 0) for v in stats.values())
+    total_unmatched = sum(v.get("entries_without_allow", 0) for v in stats.values())
+    total_allows = sum(v.get("allows", 0) for v in stats.values())
+    total_denies = sum(v.get("denies", 0) for v in stats.values())
+
+    lines = [
+        "🧪 AUDITORIA DE RISCO — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Janela auditada: últimas {hours}h",
+        "",
+        "Resumo:",
+        f"- Entradas detectadas no History: {total_entries}",
+        f"- Entradas com ALLOW correspondente: {total_entries - total_unmatched}",
+        f"- Entradas sem ALLOW correspondente: {total_unmatched}",
+        f"- Decisões ALLOW lidas: {total_allows}",
+        f"- Decisões DENY/BLOCK lidas: {total_denies}",
+        f"- Exposição atual: {len(exposure_rows)} posições",
+        "",
+        "Leitura por robô:",
+    ]
+
+    for key in BOT_CONFIGS.keys():
+        s = stats.get(key) or {}
+        if not s.get("enabled"):
+            status = "⚪ PAUSADO"
+        elif not s.get("loaded"):
+            status = "🔴 NÃO CARREGADO"
+        elif s.get("entries_without_allow", 0) > 0:
+            status = "🔴 ALERTA"
+        elif not s.get("risk_code"):
+            status = "🟠 RISK NÃO CONFIRMADO"
+        elif s.get("entries", 0) == 0 and s.get("allows", 0) == 0 and s.get("denies", 0) == 0:
+            status = "🟡 OBSERVAR"
+        else:
+            status = "✅ OK"
+
+        lines += [
+            "",
+            f"{key} — {status}",
+            f"- Carregado: {s.get('loaded')} | Habilitado: {s.get('enabled')}",
+            f"- Risk no código: {'sim' if s.get('risk_code') else 'não confirmado'}",
+            f"- Posições atuais: {s.get('exposure', 0)}",
+            f"- Entradas: {s.get('entries', 0)} | com ALLOW: {s.get('entries_with_allow', 0)} | sem ALLOW: {s.get('entries_without_allow', 0)}",
+            f"- ALLOW: {s.get('allows', 0)} | DENY/BLOCK: {s.get('denies', 0)} | POI: {s.get('pois', 0)}",
+        ]
+        examples = s.get("unmatched_examples") or []
+        if examples:
+            lines.append("- Exemplos sem ALLOW:")
+            for e in examples:
+                lines.append(f"  • {e.get('ts')} | {e.get('symbol')} {e.get('side')} {e.get('setup')} | id={e.get('trade_id')}")
+
+    lines += [
+        "",
+        "Interpretação:",
+        "- OK: entradas recentes têm autorização da Central ou o robô não abriu novas entradas na janela.",
+        "- OBSERVAR: robô está carregado, mas não teve decisão/entrada recente na janela.",
+        "- ALERTA: houve entrada recente sem ALLOW correspondente no History/Decision Log.",
+        "",
+        "Comandos úteis:",
+        "/auditrisk 1 — audita última 1h",
+        "/auditrisk 24 — audita últimas 24h",
+        "/decisionlog — vê decisões recentes",
+        "/history — vê eventos consolidados",
+    ]
+
+    if total_unmatched > 0:
+        lines += ["", "Ação sugerida: manter pausado ou revisar qualquer robô com ALERTA antes de aumentar risco."]
+    else:
+        lines += ["", "Conclusão: nenhum vazamento recente de entrada foi detectado na janela auditada."]
+
+    return "\n".join(lines)
+
+
 def build_risk_report():
     exposure_snapshot = central_exposure_snapshot()
     rows = _all_open_positions_payload()
@@ -5032,6 +5359,15 @@ def can_open_trade_route():
     return can_open_trade_decision(payload)
 
 
+
+
+@app.route("/auditrisk")
+@app.route("/riskaudit")
+def auditrisk_route():
+    hours = request.args.get("hours") or request.args.get("h") or request.args.get("janela") or 2
+    return {"text": build_audit_risk_report(hours)}
+
+
 @app.route("/risk")
 @app.route("/riskmanager")
 def risk_route():
@@ -6335,6 +6671,9 @@ def build_central_command_reply(text: str):
         return build_sync_report()
     if cmd0 in {"/executions", "/exec_log", "/executionlog"}:
         return build_executions_log_report()
+    if cmd0 in {"/auditrisk", "/riskaudit"}:
+        parts = raw.split()
+        return build_audit_risk_report(parts[1] if len(parts) > 1 else 2)
     if cmd0 in {"/risk", "/riskmanager"}:
         return build_risk_report()
     if cmd0 in {"/heat", "/heatmap"}:
@@ -6917,6 +7256,9 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         return build_sync_report()
     if cmd0 in {"/executions", "/exec_log", "/executionlog"}:
         return build_executions_log_report()
+    if cmd0 in {"/auditrisk", "/riskaudit"}:
+        parts = raw.split()
+        return build_audit_risk_report(parts[1] if len(parts) > 1 else 2)
     if cmd0 in {"/risk", "/riskmanager"}:
         return build_risk_report()
     if cmd0 in {"/heat", "/heatmap"}:
