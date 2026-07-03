@@ -3782,6 +3782,96 @@ def timeline_items(limit=100):
     return _read_jsonl_tail(CENTRAL_TIMELINE_LOG_FILE, limit=limit)
 
 
+def normalize_decision_log_row(r):
+    r = r or {}
+
+    raw = r.get("raw") if isinstance(r.get("raw"), dict) else {}
+    execution_decision = (
+        r.get("execution_decision")
+        or raw.get("execution_decision")
+        or raw.get("execution_decision".upper())
+        or {}
+    )
+
+    if not isinstance(execution_decision, dict):
+        execution_decision = {}
+
+    decision = (
+        r.get("decision")
+        or r.get("result")
+        or r.get("risk_decision")
+        or execution_decision.get("decision")
+        or execution_decision.get("result")
+    )
+
+    mode = (
+        r.get("mode")
+        or r.get("execution_mode")
+        or execution_decision.get("mode")
+    )
+
+    bot = (
+        r.get("bot")
+        or execution_decision.get("bot")
+        or raw.get("bot")
+    )
+
+    symbol = (
+        r.get("symbol")
+        or execution_decision.get("symbol")
+        or raw.get("symbol_clean")
+        or raw.get("symbol")
+    )
+
+    side = (
+        r.get("side")
+        or execution_decision.get("side")
+        or raw.get("side")
+        or raw.get("direction")
+    )
+
+    warnings = (
+        r.get("warnings")
+        or r.get("risk_warnings")
+        or execution_decision.get("warnings")
+        or []
+    )
+
+    reasons = (
+        r.get("reasons")
+        or execution_decision.get("reasons")
+        or []
+    )
+
+    bingx_divergence = (
+        r.get("bingx_divergence")
+        or execution_decision.get("bingx_divergence")
+        or {}
+    )
+
+    trade_id = (
+        r.get("trade_id")
+        or execution_decision.get("trade_id")
+        or raw.get("trade_id")
+        or ""
+    )
+
+    return {
+        "ts": r.get("ts") or r.get("created_at") or r.get("datetime"),
+        "decision": decision,
+        "mode": mode,
+        "bot": normalize_registry_bot(bot or "UNKNOWN"),
+        "symbol": normalize_registry_symbol(symbol or "UNKNOWN"),
+        "side": str(side or "UNKNOWN").upper(),
+        "score": r.get("score") or raw.get("score"),
+        "risk_pct": r.get("risk_pct") or raw.get("risk_pct"),
+        "trade_id": str(trade_id),
+        "reasons": reasons if isinstance(reasons, list) else [reasons],
+        "warnings": warnings if isinstance(warnings, list) else [warnings],
+        "bingx_divergence": bingx_divergence if isinstance(bingx_divergence, dict) else {},
+    }    
+
+
 def build_decision_log_report(arg=None, limit=30):
     token = normalize_symbol_for_risk(arg) if arg else None
     rows = decision_log_items(limit=max(limit, CENTRAL_DECISION_LOG_MAX_READ))
@@ -3795,10 +3885,35 @@ def build_decision_log_report(arg=None, limit=30):
     if not rows:
         lines.append("Nenhuma decisão registrada ainda. O log será preenchido quando Falcon/Predator consultarem /can_open_trade.")
         return "\n".join(lines)
-    for r in rows:
+    for raw_row in rows:
+        r = normalize_decision_log_row(raw_row)
+
         reasons = r.get("reasons") or []
         warnings = r.get("warnings") or []
-        lines.append(f"- {r.get('ts')} | {r.get('decision')} | {r.get('mode')} | {r.get('bot')} {r.get('symbol')} {r.get('side')} | score={r.get('score')} | risco={r.get('risk_pct')} | id={r.get('trade_id')}")
+
+        lines.append(
+            f"- {r.get('ts')} | {r.get('decision')} | {r.get('mode')} | "
+            f"{r.get('bot')} {r.get('symbol')} {r.get('side')} | "
+            f"score={r.get('score')} | risco={r.get('risk_pct')} | id={r.get('trade_id')}"
+        )
+
+        if reasons:
+            lines.append("  motivos: " + "; ".join(str(x) for x in reasons[:3]))
+
+        if warnings:
+            lines.append("  avisos: " + "; ".join(str(x) for x in warnings[:3]))
+
+        divergence = r.get("bingx_divergence") or {}
+        if divergence.get("active"):
+            only_bingx = divergence.get("only_bingx") or []
+            only_central = divergence.get("only_central") or []
+            lines.append(
+                "  bingx_divergence: "
+                f"{divergence.get('status')} | "
+                f"policy={divergence.get('policy')} | "
+                f"só_bingx={','.join(only_bingx) if only_bingx else '0'} | "
+                f"só_central={','.join(only_central) if only_central else '0'}"
+            )
         if reasons:
             lines.append("  motivos: " + "; ".join(str(x) for x in reasons[:3]))
         if warnings:
@@ -6462,17 +6577,6 @@ def executions_route():
 def decisionlog_route():
     arg = request.args.get("q") or request.args.get("symbol") or request.args.get("bot")
     return {"text": build_decision_log_report(arg)}
-
-
-@app.route("/decisionlog/raw")
-def decisionlog_raw_route():
-    rows = decision_log_items(limit=20)
-    return {
-        "ok": True,
-        "file": str(CENTRAL_DECISION_LOG_FILE),
-        "count": len(rows),
-        "rows": rows,
-    }
 
 
 @app.route("/timeline")
