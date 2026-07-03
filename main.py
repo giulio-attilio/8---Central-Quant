@@ -4706,6 +4706,10 @@ def build_audit_risk_report(hours=2, limit=3000):
 
 
 def build_risk_report():
+    try:
+        sync_trade_registry_from_open_positions(commit=True)
+    except Exception as exc:
+        print("AVISO SYNC REGISTRY ANTES DO RISK:", exc)
     exposure_snapshot = central_exposure_snapshot()
     rows = _all_open_positions_payload()
     by_symbol = {}
