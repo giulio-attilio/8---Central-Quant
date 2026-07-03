@@ -1,6 +1,6 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em COBRA.
 # COBRA ATTACK BOT
-# Versao: 2026-06-25-COBRA-STRUCTURE-FALCON-PREDATOR-V3
+# Versao: 2026-07-02-COBRA-RISK-MANAGER-CENTRAL-V1
 #
 # Adaptado para Central Quant PRO.
 # Melhorias: telemetria estilo Falcon/Predator, ranking, estatísticas avançadas, filtro Early contra H4.
@@ -143,6 +143,202 @@ HEALTH = {
     "watchdog_last_check": None,
     "watchdog_last_status": "OK",
 }
+
+
+# ====================================================
+# CENTRAL QUANT RISK MANAGER - TRAVA OBRIGATORIA
+# ====================================================
+# A Central Quant é a autoridade operacional.
+# O Cobra não deve registrar nenhuma nova posição sem ALLOW explícito
+# do endpoint /can_open_trade da Central.
+COBRA_CENTRAL_RISK_ENABLED = str(os.environ.get("COBRA_CENTRAL_RISK_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+COBRA_CENTRAL_RISK_FAIL_CLOSED = str(os.environ.get("COBRA_CENTRAL_RISK_FAIL_CLOSED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+COBRA_CENTRAL_RISK_TIMEOUT = float(os.environ.get("COBRA_CENTRAL_RISK_TIMEOUT", "15"))
+EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
+
+def _central_base_url():
+    base = (
+        os.environ.get("CENTRAL_BASE_URL")
+        or os.environ.get("CENTRAL_QUANT_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("RENDER_SERVICE_URL")
+        or ""
+    ).strip()
+    return base.rstrip("/")
+
+def central_can_open_trade_url():
+    explicit = os.environ.get("CENTRAL_CAN_OPEN_TRADE_URL")
+    if explicit:
+        return explicit.strip()
+    base = _central_base_url()
+    if not base:
+        return ""
+    return f"{base}/can_open_trade"
+
+def _risk_text_list(items):
+    if not items:
+        return "N/A"
+    if isinstance(items, list):
+        return "; ".join(str(x) for x in items if x is not None) or "N/A"
+    return str(items)
+
+def consultar_central_risk_manager(sinal, motivo="ENTRY"):
+    """
+    Consulta obrigatória ao Risk Manager Global da Central.
+
+    Retorna um payload padronizado com allowed=True/False.
+    Em falha ou ausência de URL, o padrão é fail-closed para impedir
+    novas entradas fora da arquitetura da Central Quant.
+    """
+    if not COBRA_CENTRAL_RISK_ENABLED:
+        return {
+            "allowed": True,
+            "decision": "ALLOW",
+            "warnings": ["COBRA_CENTRAL_RISK_ENABLED=false"],
+            "reasons": [],
+            "source": "local_disabled",
+            "checked_at": data_hora_sp_str(),
+        }
+
+    url = central_can_open_trade_url()
+    if not url:
+        return {
+            "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
+            "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "reasons": ["CENTRAL_CAN_OPEN_TRADE_URL/CENTRAL_BASE_URL/RENDER_EXTERNAL_URL não configurado"],
+            "warnings": [],
+            "source": "missing_url",
+            "checked_at": data_hora_sp_str(),
+        }
+
+    payload = {
+        "bot": "COBRA",
+        "symbol": sinal.get("symbol_clean") or nome_limpo(sinal.get("symbol", "")),
+        "raw_symbol": sinal.get("symbol"),
+        "side": sinal.get("signal") or sinal.get("side"),
+        "setup": sinal.get("signal_type", "COBRA"),
+        "score": sinal.get("score"),
+        "risk_pct": sinal.get("risk_pct"),
+        "mode": EXECUTION_MODE,
+        "intended_live": EXECUTION_MODE == "LIVE",
+        "reduce_only": False,
+        "reason": motivo,
+        "source": "cobra",
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=COBRA_CENTRAL_RISK_TIMEOUT)
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw_response": response.text[:500]}
+
+        if response.status_code >= 400:
+            return {
+                "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
+                "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+                "reasons": [f"HTTP {response.status_code} ao consultar Central"],
+                "warnings": [str(data)[:300]],
+                "source": "http_error",
+                "payload": payload,
+                "checked_at": data_hora_sp_str(),
+            }
+
+        if isinstance(data, dict):
+            data.setdefault("allowed", bool(data.get("decision") == "ALLOW"))
+            data.setdefault("decision", "ALLOW" if data.get("allowed") else "DENY")
+            data.setdefault("source", "central")
+            data.setdefault("payload", payload)
+            data.setdefault("checked_at", data_hora_sp_str())
+            return data
+
+        return {
+            "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
+            "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "reasons": ["Resposta inválida da Central"],
+            "warnings": [str(data)[:300]],
+            "source": "invalid_response",
+            "payload": payload,
+            "checked_at": data_hora_sp_str(),
+        }
+
+    except Exception as exc:
+        return {
+            "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
+            "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "reasons": [f"Erro ao consultar Central: {exc}"],
+            "warnings": [],
+            "source": "exception",
+            "payload": payload,
+            "checked_at": data_hora_sp_str(),
+        }
+
+def registrar_bloqueio_central(sinal, decision, motivo="ENTRY"):
+    try:
+        registrar_evento_trade({
+            "event": "RISK_DENY",
+            "date": data_hoje_sp_str(),
+            "datetime": data_hora_sp_str(),
+            "symbol": sinal.get("symbol"),
+            "symbol_clean": sinal.get("symbol_clean") or nome_limpo(sinal.get("symbol", "")),
+            "side": sinal.get("signal") or sinal.get("side"),
+            "entry": sinal.get("entry"),
+            "sl": sinal.get("sl"),
+            "tp50": sinal.get("tp50"),
+            "risk_pct": sinal.get("risk_pct"),
+            "signal_type": sinal.get("signal_type", "COBRA"),
+            "score": sinal.get("score"),
+            "motivo": motivo,
+            "central_decision": decision.get("decision"),
+            "central_allowed": decision.get("allowed"),
+            "central_reasons": decision.get("reasons"),
+            "central_warnings": decision.get("warnings"),
+            "central_source": decision.get("source"),
+        })
+    except Exception as exc:
+        print("ERRO AO REGISTRAR BLOQUEIO CENTRAL COBRA:", exc)
+
+def central_risk_allows_entry(sinal, motivo="ENTRY"):
+    decision = consultar_central_risk_manager(sinal, motivo=motivo)
+
+    sinal["risk_precheck_allowed"] = bool(decision.get("allowed"))
+    sinal["risk_precheck_decision"] = decision.get("decision")
+    sinal["risk_precheck_reasons"] = decision.get("reasons") or []
+    sinal["risk_precheck_warnings"] = decision.get("warnings") or []
+    sinal["risk_precheck_source"] = decision.get("source")
+    sinal["risk_precheck_at"] = decision.get("checked_at") or data_hora_sp_str()
+
+    if bool(decision.get("allowed")):
+        warnings = decision.get("warnings") or []
+        if warnings:
+            print(f"CENTRAL RISK ALLOW COBRA COM AVISO: {nome_limpo(sinal.get('symbol', ''))} | {_risk_text_list(warnings)}")
+        try:
+            registrar_evento_trade({
+                "event": "RISK_ALLOW",
+                "date": data_hoje_sp_str(),
+                "datetime": data_hora_sp_str(),
+                "symbol": sinal.get("symbol"),
+                "symbol_clean": sinal.get("symbol_clean") or nome_limpo(sinal.get("symbol", "")),
+                "side": sinal.get("signal") or sinal.get("side"),
+                "signal_type": sinal.get("signal_type", "COBRA"),
+                "central_decision": decision.get("decision"),
+                "central_allowed": decision.get("allowed"),
+                "central_warnings": decision.get("warnings"),
+                "central_source": decision.get("source"),
+            })
+        except Exception as exc:
+            print("ERRO AO REGISTRAR ALLOW CENTRAL COBRA:", exc)
+        return True
+
+    reasons = decision.get("reasons") or ["DENY sem motivo informado"]
+    print(
+        f"ENTRADA COBRA BLOQUEADA PELA CENTRAL: "
+        f"{nome_limpo(sinal.get('symbol', ''))} {sinal.get('signal') or sinal.get('side')} | "
+        f"{_risk_text_list(reasons)}"
+    )
+    registrar_bloqueio_central(sinal, decision, motivo=motivo)
+    return False
+
 
 # ====================================================
 # CAMADA DE RESILIENCIA API (CCXT SAFE FETCH)
@@ -942,6 +1138,12 @@ def registrar_posicao(s):
         "created_at": time.time(),
         "active_since": time.time(),
         "date": data_hoje_sp_str(),
+        "execution_decision": s.get("risk_precheck_decision"),
+        "execution_allowed": s.get("risk_precheck_allowed"),
+        "execution_checked_at": s.get("risk_precheck_at"),
+        "execution_reasons": s.get("risk_precheck_reasons"),
+        "execution_warnings": s.get("risk_precheck_warnings"),
+        "execution_source": s.get("risk_precheck_source"),
     }
     posicoes[s["symbol"]] = p
     salvar_posicoes(posicoes)
@@ -963,6 +1165,12 @@ def registrar_posicao(s):
         "h4_state": int(s["h4_state"]),
         "h4_context": s.get("h4_context", h4_contexto_categoria(int(s["h4_state"]), s["side"])),
         "contexto_cobra": s.get("contexto_cobra"),
+        "execution_allowed": s.get("risk_precheck_allowed"),
+        "execution_decision": s.get("risk_precheck_decision"),
+        "execution_checked_at": s.get("risk_precheck_at"),
+        "execution_reasons": s.get("risk_precheck_reasons"),
+        "execution_warnings": s.get("risk_precheck_warnings"),
+        "execution_source": s.get("risk_precheck_source"),
     })
     return True
 
@@ -2006,6 +2214,13 @@ def scanner():
                         print(f"STARTUP GUARD COBRA: sinal marcado e não enviado: {chave}")
                         continue
 
+
+                    if not central_risk_allows_entry(s, motivo="ENTRY"):
+                        historico[chave] = True
+                        if len(historico) > 3000:
+                            historico = dict(list(historico.items())[-3000:])
+                        salvar_sinais(historico)
+                        continue
 
                     if registrar_posicao(s):
                         historico[chave] = True
