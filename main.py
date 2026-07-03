@@ -1742,7 +1742,7 @@ def sync_trade_registry_from_open_positions(commit=False):
 
             candidate_signature = _trade_registry_signature_from_items([candidate])
             candidate_key = next(iter(candidate_signature), None)
-            
+
             candidates.append(candidate)
             trade_id = str(candidate.get("trade_id"))
             if trade_id in existing_ids or candidate_key in existing_signature:
@@ -1851,14 +1851,15 @@ def autosync_trade_registry(reason="manual"):
             "last_error": None,
             "reason": reason,
             "last_result": {
-                "candidates_count": result.get("candidates_count"),
-                "imported_count": result.get("imported_count"),
-                "skipped_count": result.get("skipped_count"),
-                "errors_count": result.get("errors_count"),
-                "removed_count": result.get("removed_count"),
-                "removed": result.get("removed", [])[:50],
-                "after": result.get("after"),
-            },
+            "candidates_count": result.get("candidates_count"),
+            "imported_count": result.get("imported_count"),
+            "skipped_count": result.get("skipped_count"),
+            "errors_count": result.get("errors_count"),
+            "removed_count": result.get("removed_count"),
+            "removed": result.get("removed", [])[:50],
+            "missing_mark_result": result.get("missing_mark_result"),
+            "after": result.get("after"),
+        },
         }
         return result
 
