@@ -517,6 +517,14 @@ CENTRAL_HEALTH = {
     "watchdog_status": "OK",
 }
 
+
+TRADE_REGISTRY_AUTOSYNC_STATUS = {
+    "last_run": None,
+    "last_ok": None,
+    "last_error": None,
+    "last_result": None,
+}
+
 # Evita inicialização duplicada de bots/roteadores no mesmo processo.
 CENTRAL_RUNTIME_STARTED = False
 CENTRAL_RUNTIME_LOCK = threading.Lock()
@@ -1675,6 +1683,47 @@ def sync_trade_registry_from_open_positions(commit=False):
         "errors": errors,
         "after": central_trade_registry_snapshot(include_trades=False) if commit else None,
         "note": "GET faz prévia/dry-run. Para importar, use POST com confirm=true ou confirm=SYNC.",
+    }
+
+
+def autosync_trade_registry(reason="manual"):
+    global TRADE_REGISTRY_AUTOSYNC_STATUS
+
+    try:
+        result = sync_trade_registry_from_open_positions(commit=True)
+        TRADE_REGISTRY_AUTOSYNC_STATUS = {
+            "last_run": data_hora_sp_str(),
+            "last_ok": bool(result.get("ok")),
+            "last_error": None,
+            "reason": reason,
+            "last_result": {
+                "candidates_count": result.get("candidates_count"),
+                "imported_count": result.get("imported_count"),
+                "skipped_count": result.get("skipped_count"),
+                "errors_count": result.get("errors_count"),
+                "after": result.get("after"),
+            },
+        }
+        return result
+
+    except Exception as exc:
+        TRADE_REGISTRY_AUTOSYNC_STATUS = {
+            "last_run": data_hora_sp_str(),
+            "last_ok": False,
+            "last_error": str(exc),
+            "reason": reason,
+            "last_result": None,
+        }
+        raise
+
+
+@app.route("/traderegistry/autosync/status")
+@app.route("/trade_registry/autosync/status")
+@app.route("/trades/autosync/status")
+def trade_registry_autosync_status_route():
+    return {
+        "ok": True,
+        "autosync": TRADE_REGISTRY_AUTOSYNC_STATUS,
     }
 
 
@@ -3882,7 +3931,7 @@ def can_open_trade_decision(payload: dict):
 
     # Mantém o Trade Registry sincronizado antes da decisão de risco
     try:
-        sync_trade_registry_from_open_positions(commit=True)
+        autosync_trade_registry(reason="can_open_trade")
     except Exception as exc:
         print("AVISO SYNC REGISTRY ANTES DO CAN_OPEN_TRADE:", exc)
 
@@ -4713,7 +4762,7 @@ def build_audit_risk_report(hours=2, limit=3000):
 
 def build_risk_report():
     try:
-        sync_trade_registry_from_open_positions(commit=True)
+        autosync_trade_registry(reason="risk")
     except Exception as exc:
         print("AVISO SYNC REGISTRY ANTES DO RISK:", exc)
     exposure_snapshot = central_exposure_snapshot()
@@ -6176,7 +6225,7 @@ def risk_route():
 @app.route("/riskregistry")
 def risk_registry_route():
     try:
-        sync_trade_registry_from_open_positions(commit=True)
+        autosync_trade_registry(reason="risk_registry")
     except Exception as exc:
         print("AVISO SYNC REGISTRY ANTES DO RISK_REGISTRY:", exc)
     exposure = central_exposure_snapshot()
@@ -6211,7 +6260,7 @@ def risk_registry_route():
 @app.route("/riskregistry/check")
 def risk_registry_check_route():
     try:
-        sync_trade_registry_from_open_positions(commit=True)
+        autosync_trade_registry(reason="risk_registry_check")
     except Exception as exc:
         print("AVISO SYNC REGISTRY ANTES DO RISK_REGISTRY_CHECK:", exc)
     exposure = central_exposure_snapshot()
