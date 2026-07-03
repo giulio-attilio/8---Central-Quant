@@ -854,6 +854,68 @@ def append_closed_trade(item):
         return {"ok": False, "error": str(exc), "file": str(CLOSED_TRADES_FILE)}
 
 
+def rebuild_closed_trades_v4_from_events(limit=None):
+    """
+    Reconstrói closed_trades.jsonl a partir dos eventos TRADE_CLOSED,
+    usando trade_record.py para gerar o schema TRADE_RECORD_V1.
+    """
+    try:
+        ensure_history_files()
+
+        events = load_events(limit=limit or HISTORY_MAX_READ)
+        closed_events = [
+            e for e in events
+            if normalize_event_type(e.get("event"), e) == "TRADE_CLOSED"
+        ]
+
+        backup_file = CLOSED_TRADES_FILE.with_suffix(".jsonl.bak")
+        try:
+            if CLOSED_TRADES_FILE.exists():
+                backup_file.write_text(
+                    CLOSED_TRADES_FILE.read_text(encoding="utf-8"),
+                    encoding="utf-8"
+                )
+        except Exception:
+            pass
+
+        CLOSED_TRADES_FILE.write_text("", encoding="utf-8")
+
+        created = 0
+        errors = 0
+        seen = set()
+
+        for event in closed_events:
+            try:
+                record = _closed_trade_record_from_event(event)
+                key = _closed_trade_key(record)
+                if key and key in seen:
+                    continue
+                seen.add(key)
+                if _append_jsonl(CLOSED_TRADES_FILE, record):
+                    created += 1
+                else:
+                    errors += 1
+            except Exception:
+                errors += 1
+
+        return {
+            "ok": errors == 0,
+            "file": str(CLOSED_TRADES_FILE),
+            "backup": str(backup_file),
+            "scanned": len(events),
+            "closed_events": len(closed_events),
+            "created": created,
+            "errors": errors,
+            "records": _count_jsonl(CLOSED_TRADES_FILE),
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "file": str(CLOSED_TRADES_FILE),
+        }
+    
 def load_closed_trades(limit=None, filters=None):
     rows = _read_jsonl_tail(CLOSED_TRADES_FILE, limit=limit or HISTORY_MAX_READ)
     filters = filters or {}

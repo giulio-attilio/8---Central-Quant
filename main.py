@@ -9264,6 +9264,27 @@ try:
         except Exception as e:
             return {"ok": False, "error": str(e)}
     
+    @app.route("/history/trades/rebuild")
+    def history_trades_rebuild():
+        try:
+            import history_manager
+            payload = history_manager.rebuild_closed_trades_v4_from_events()
+
+            return {
+                "ok": payload.get("ok"),
+                "text": (
+                    "♻️ HISTORY TRADES REBUILD — CENTRAL QUANT\n"
+                    f"Eventos fechados encontrados: {payload.get('closed_events', 0)}\n"
+                    f"Registros criados: {payload.get('created', 0)}\n"
+                    f"Erros: {payload.get('errors', 0)}\n"
+                    f"Total no arquivo: {payload.get('records', 0)}"
+                ),
+                "payload": payload,
+            }
+
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    
     @app.route("/history/raw")
     def super_history_raw_route():
         return super_history_manager.build_history_payload()
