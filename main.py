@@ -1630,6 +1630,28 @@ def _trade_registry_signature_from_items(items):
     return signature
 
 
+def _trade_registry_signature_map(items):
+    out = {}
+
+    if isinstance(items, dict):
+        iterable = items.values()
+    elif isinstance(items, list):
+        iterable = items
+    else:
+        iterable = []
+
+    for item in iterable:
+        if not isinstance(item, dict):
+            continue
+
+        sig = _trade_registry_signature_from_items([item])
+        key = next(iter(sig), None)
+        if key:
+            out[key] = item
+
+    return out
+
+
 def sync_trade_registry_from_open_positions(commit=False):
     if central_trade_registry is None:
         return {
@@ -1645,11 +1667,15 @@ def sync_trade_registry_from_open_positions(commit=False):
     candidates = []
 
     existing_signature = set()
+    existing_map = {}
     try:
         registry = central_trade_registry.load_registry()
-        existing_signature = _trade_registry_signature_from_items(registry.get("open_trades", {}))
+        existing_open = registry.get("open_trades", {})
+        existing_signature = _trade_registry_signature_from_items(existing_open)
+        existing_map = _trade_registry_signature_map(existing_open)
     except Exception:
         existing_signature = set()
+        existing_map = {}
 
     for bot_key, module in LOADED_BOTS.items():
         positions = get_open_positions_from_module(module, key=bot_key)
@@ -1721,6 +1747,24 @@ def sync_trade_registry_from_open_positions(commit=False):
                     "error": str(exc),
                 })
 
+    candidate_signature_all = _trade_registry_signature_from_items(candidates)
+    removed_keys = sorted(list(existing_signature - candidate_signature_all))
+
+    removed = []
+    for key in removed_keys:
+        item = existing_map.get(key, {})
+        removed.append({
+            "signature": key,
+            "trade_id": item.get("trade_id"),
+            "bot": normalize_registry_bot(item.get("bot") or "UNKNOWN"),
+            "symbol": normalize_registry_symbol(item.get("symbol_clean") or item.get("symbol") or "UNKNOWN"),
+            "side": str(item.get("side") or item.get("direction") or "UNKNOWN").upper(),
+            "setup": item.get("setup") or item.get("signal_type") or item.get("setup_label"),
+            "last_update": item.get("last_update"),
+            "status": item.get("status"),
+            "note": "Presente no Registry, ausente nas posições atuais dos robôs.",
+        })
+
     return {
         "ok": len(errors) == 0,
         "commit": bool(commit),
@@ -1733,6 +1777,8 @@ def sync_trade_registry_from_open_positions(commit=False):
         "imported": imported,
         "skipped": skipped[:200],
         "errors": errors,
+        "removed_count": len(removed),
+        "removed": removed[:200],
         "after": central_trade_registry_snapshot(include_trades=False) if commit else None,
         "note": "GET faz prévia/dry-run. Para importar, use POST com confirm=true ou confirm=SYNC.",
     }
