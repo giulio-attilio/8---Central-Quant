@@ -6117,6 +6117,52 @@ def risk_registry_route():
     }
 
 
+@app.route("/risk/registry/check")
+@app.route("/riskregistry/check")
+def risk_registry_check_route():
+    exposure = central_exposure_snapshot()
+    registry = central_trade_registry_snapshot(include_trades=False)
+
+    risk_total = int(exposure.get("total_positions_open") or 0)
+    risk_long = int(exposure.get("long_positions_open") or 0)
+    risk_short = int(exposure.get("short_positions_open") or 0)
+
+    registry_total = int(registry.get("open_count") or 0)
+
+    issues = []
+
+    if exposure.get("source") != "trade_registry":
+        issues.append(f"Risk source não é trade_registry: {exposure.get('source')}")
+
+    if not registry.get("loaded"):
+        issues.append("Trade Registry não carregado.")
+
+    if not registry.get("ok"):
+        issues.append("Trade Registry retornou ok=False.")
+
+    if registry_total != risk_total:
+        issues.append(f"Divergência open_count: registry={registry_total} risk={risk_total}")
+
+    return {
+        "ok": len(issues) == 0,
+        "status": "OK" if len(issues) == 0 else "ALERTA",
+        "issues": issues,
+        "risk": {
+            "source": exposure.get("source"),
+            "total": risk_total,
+            "long": risk_long,
+            "short": risk_short,
+        },
+        "registry": {
+            "loaded": registry.get("loaded"),
+            "ok": registry.get("ok"),
+            "open_count": registry_total,
+            "updated_at": registry.get("updated_at"),
+            "file": registry.get("trade_registry_file"),
+        },
+    }
+
+
 @app.route("/heat")
 @app.route("/heatmap")
 def heat_route():
