@@ -723,6 +723,13 @@ def _closed_trade_record_from_event(item):
     Este registro é append-only: depois de gravado, não deve ser alterado.
     """
     item = item if isinstance(item, dict) else {}
+
+    try:
+        import trade_record
+        return trade_record.build_trade_record(item)
+    except Exception:
+        pass
+
     raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
 
     entry_price = _safe_float(
