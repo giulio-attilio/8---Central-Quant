@@ -169,6 +169,17 @@ TREND_PRO_AUTO_TRADE = env_bool("TREND_PRO_AUTO_TRADE", "false")
 STARTUP_SIGNAL_GRACE_SECONDS = int(os.environ.get("TRENDPRO_STARTUP_SIGNAL_GRACE_SECONDS", os.environ.get("STARTUP_SIGNAL_GRACE_SECONDS", "0")))
 SERVICE_STARTED_TS = time.time()
 
+# ====================================================
+# CENTRAL QUANT RISK MANAGER - TRAVA OBRIGATÓRIA
+# ====================================================
+# A Central Quant é a autoridade operacional.
+# O Trend PRO não deve registrar nenhuma nova posição sem ALLOW explícito
+# do endpoint /can_open_trade da Central.
+TRENDPRO_CENTRAL_RISK_ENABLED = str(os.environ.get("TRENDPRO_CENTRAL_RISK_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+TRENDPRO_CENTRAL_RISK_FAIL_CLOSED = str(os.environ.get("TRENDPRO_CENTRAL_RISK_FAIL_CLOSED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+TRENDPRO_CENTRAL_RISK_TIMEOUT = float(os.environ.get("TRENDPRO_CENTRAL_RISK_TIMEOUT", "15"))
+EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
+
 
 EMA_FAST = 9
 EMA_MID = 21
@@ -3254,6 +3265,200 @@ def enviar_stop(p, preco_atual, stop, resultado):
 
 
 # ====================================================
+# CENTRAL QUANT RISK MANAGER - FUNÇÕES
+# ====================================================
+
+def _central_base_url():
+    base = (
+        os.environ.get("CENTRAL_BASE_URL")
+        or os.environ.get("CENTRAL_QUANT_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("RENDER_SERVICE_URL")
+        or ""
+    ).strip()
+    return base.rstrip("/")
+
+
+def central_can_open_trade_url():
+    explicit = os.environ.get("CENTRAL_CAN_OPEN_TRADE_URL")
+    if explicit:
+        return explicit.strip()
+    base = _central_base_url()
+    if not base:
+        return ""
+    return f"{base}/can_open_trade"
+
+
+def _risk_text_list(items):
+    if not items:
+        return "N/A"
+    if isinstance(items, list):
+        return "; ".join(str(x) for x in items if x is not None) or "N/A"
+    return str(items)
+
+
+def consultar_central_risk_manager(sinal, motivo="ENTRY"):
+    """
+    Consulta obrigatória ao Risk Manager Global da Central.
+
+    Retorna um payload padronizado com allowed=True/False.
+    Em falha ou ausência de URL, o padrão é fail-closed para impedir
+    novas entradas fora da arquitetura da Central Quant.
+    """
+    if not TRENDPRO_CENTRAL_RISK_ENABLED:
+        sinal["risk_precheck_allowed"] = True
+        sinal["risk_precheck_decision"] = "ALLOW"
+        sinal["risk_precheck_at"] = data_hora_sp_str()
+        return {
+            "allowed": True,
+            "decision": "ALLOW",
+            "warnings": ["TRENDPRO_CENTRAL_RISK_ENABLED=false"],
+            "reasons": [],
+            "source": "local_disabled",
+        }
+
+    url = central_can_open_trade_url()
+    if not url:
+        decision = "ALLOW" if not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED else "DENY"
+        allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+        sinal["risk_precheck_allowed"] = allowed
+        sinal["risk_precheck_decision"] = decision
+        sinal["risk_precheck_at"] = data_hora_sp_str()
+        return {
+            "allowed": allowed,
+            "decision": decision,
+            "reasons": ["CENTRAL_CAN_OPEN_TRADE_URL/CENTRAL_BASE_URL/RENDER_EXTERNAL_URL não configurado"],
+            "warnings": [],
+            "source": "missing_url",
+        }
+
+    payload = {
+        "bot": "TRENDPRO",
+        "symbol": sinal.get("symbol_clean") or nome_limpo(sinal.get("symbol", "")),
+        "raw_symbol": sinal.get("symbol"),
+        "side": sinal.get("signal") or sinal.get("side"),
+        "setup": sinal.get("signal_type", "TRENDPRO"),
+        "score": sinal.get("signal_score") or sinal.get("qualidade_pontos"),
+        "risk_pct": sinal.get("risk_pct"),
+        "mode": EXECUTION_MODE,
+        "intended_live": EXECUTION_MODE == "LIVE",
+        "reduce_only": False,
+        "reason": motivo,
+        "source": "trendpro",
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=TRENDPRO_CENTRAL_RISK_TIMEOUT)
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw_response": response.text[:500]}
+
+        if response.status_code >= 400:
+            allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+            decision = "ALLOW" if allowed else "DENY"
+            sinal["risk_precheck_allowed"] = allowed
+            sinal["risk_precheck_decision"] = decision
+            sinal["risk_precheck_at"] = data_hora_sp_str()
+            sinal["risk_precheck_payload"] = payload
+            return {
+                "allowed": allowed,
+                "decision": decision,
+                "reasons": [f"HTTP {response.status_code} ao consultar Central"],
+                "warnings": [str(data)[:300]],
+                "source": "http_error",
+                "payload": payload,
+            }
+
+        if isinstance(data, dict):
+            data.setdefault("allowed", bool(data.get("decision") == "ALLOW"))
+            data.setdefault("decision", "ALLOW" if data.get("allowed") else "DENY")
+            data.setdefault("source", "central")
+            data.setdefault("payload", payload)
+            sinal["risk_precheck_allowed"] = bool(data.get("allowed"))
+            sinal["risk_precheck_decision"] = data.get("decision")
+            sinal["risk_precheck_at"] = data_hora_sp_str()
+            sinal["risk_precheck_payload"] = payload
+            sinal["risk_precheck_reasons"] = data.get("reasons") or data.get("reason") or []
+            sinal["risk_precheck_warnings"] = data.get("warnings") or []
+            return data
+
+        allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+        decision = "ALLOW" if allowed else "DENY"
+        sinal["risk_precheck_allowed"] = allowed
+        sinal["risk_precheck_decision"] = decision
+        sinal["risk_precheck_at"] = data_hora_sp_str()
+        sinal["risk_precheck_payload"] = payload
+        return {
+            "allowed": allowed,
+            "decision": decision,
+            "reasons": ["Resposta inválida da Central"],
+            "warnings": [str(data)[:300]],
+            "source": "invalid_response",
+            "payload": payload,
+        }
+
+    except Exception as exc:
+        allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+        decision = "ALLOW" if allowed else "DENY"
+        sinal["risk_precheck_allowed"] = allowed
+        sinal["risk_precheck_decision"] = decision
+        sinal["risk_precheck_at"] = data_hora_sp_str()
+        sinal["risk_precheck_payload"] = payload
+        return {
+            "allowed": allowed,
+            "decision": decision,
+            "reasons": [f"Falha ao consultar Central Risk Manager: {exc}"],
+            "warnings": [],
+            "source": "exception",
+            "payload": payload,
+        }
+
+
+def registrar_bloqueio_central(sinal, decision, motivo="ENTRY"):
+    try:
+        registrar_evento_trade({
+            "event": "RISK_DENY",
+            "date": data_hoje_sp_str(),
+            "datetime": data_hora_sp_str(),
+            "symbol": sinal.get("symbol"),
+            "symbol_clean": sinal.get("symbol_clean") or nome_limpo(sinal.get("symbol", "")),
+            "side": sinal.get("signal") or sinal.get("side"),
+            "entry": sinal.get("entry"),
+            "sl": sinal.get("sl"),
+            "tp50": sinal.get("tp50"),
+            "risk_pct": sinal.get("risk_pct"),
+            "signal_type": sinal.get("signal_type", "TRENDPRO"),
+            "signal_score": sinal.get("signal_score"),
+            "motivo": motivo,
+            "central_decision": decision.get("decision"),
+            "central_allowed": decision.get("allowed"),
+            "central_reasons": decision.get("reasons"),
+            "central_warnings": decision.get("warnings"),
+        })
+    except Exception as exc:
+        print("ERRO AO REGISTRAR BLOQUEIO CENTRAL TRENDPRO:", exc)
+
+
+def central_risk_allows_entry(sinal, motivo="ENTRY"):
+    decision = consultar_central_risk_manager(sinal, motivo=motivo)
+    if bool(decision.get("allowed")):
+        warnings = decision.get("warnings") or []
+        if warnings:
+            print(f"CENTRAL RISK ALLOW TRENDPRO COM AVISO: {nome_limpo(sinal.get('symbol', ''))} | {_risk_text_list(warnings)}")
+        return True
+
+    reasons = decision.get("reasons") or ["DENY sem motivo informado"]
+    print(
+        f"ENTRADA TRENDPRO BLOQUEADA PELA CENTRAL: "
+        f"{nome_limpo(sinal.get('symbol', ''))} {sinal.get('signal') or sinal.get('side')} | "
+        f"{_risk_text_list(reasons)}"
+    )
+    registrar_bloqueio_central(sinal, decision, motivo=motivo)
+    return False
+
+
+# ====================================================
 # POSIÇÕES
 # ====================================================
 
@@ -3278,6 +3483,12 @@ def registrar_posicao(s):
             f"SINAL IGNORADO POR LIMITE DE POSIÇÕES: "
             f"{nome_limpo(symbol)} | {len(posicoes_ativas)}/{MAX_OPEN_POSITIONS}"
         )
+        return False
+
+    # Trava obrigatória da Central Quant.
+    # Nenhuma posição nova é registrada sem ALLOW explícito do Risk Manager.
+    motivo_risk = s.get("signal_type", "ENTRY")
+    if not central_risk_allows_entry(s, motivo=motivo_risk):
         return False
 
     posicoes[symbol] = {
@@ -3313,7 +3524,13 @@ def registrar_posicao(s):
         "closed_at": None,
         "closed_reason": None,
         "donkey_position_size": s.get("donkey_position_size"),
-        "donkey_risk_usdt": s.get("donkey_risk_usdt")
+        "donkey_risk_usdt": s.get("donkey_risk_usdt"),
+        "execution_mode": EXECUTION_MODE,
+        "execution_decision": s.get("risk_precheck_decision"),
+        "execution_allowed": s.get("risk_precheck_allowed"),
+        "execution_checked_at": s.get("risk_precheck_at"),
+        "risk_precheck_reasons": s.get("risk_precheck_reasons"),
+        "risk_precheck_warnings": s.get("risk_precheck_warnings")
     }
 
     salvar_posicoes(posicoes)
@@ -3337,7 +3554,13 @@ def registrar_posicao(s):
         "signal_score": s.get("signal_score", calcular_signal_score(s)),
         "elite_candidate": bool(s.get("elite_candidate", s.get("signal_score", calcular_signal_score(s)) >= ELITE_THRESHOLD)),
         "donkey_position_size": s.get("donkey_position_size"),
-        "donkey_risk_usdt": s.get("donkey_risk_usdt")
+        "donkey_risk_usdt": s.get("donkey_risk_usdt"),
+        "execution_mode": EXECUTION_MODE,
+        "execution_decision": s.get("risk_precheck_decision"),
+        "execution_allowed": s.get("risk_precheck_allowed"),
+        "execution_checked_at": s.get("risk_precheck_at"),
+        "risk_precheck_reasons": s.get("risk_precheck_reasons"),
+        "risk_precheck_warnings": s.get("risk_precheck_warnings")
     })
 
     return True
