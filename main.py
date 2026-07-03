@@ -9264,6 +9264,32 @@ try:
         except Exception as e:
             return {"ok": False, "error": str(e)}
     
+    @app.route("/history/trades/analytics")
+    def history_trades_analytics():
+        try:
+            import history_manager
+            payload = history_manager.build_trade_record_analytics()
+
+            s = payload.get("summary", {})
+
+            return {
+                "ok": True,
+                "text": (
+                    "📊 TRADE RECORD ANALYTICS — CENTRAL QUANT\n"
+                    f"Data/hora: {payload.get('generated_at')}\n\n"
+                    f"Trades analisados: {payload.get('count', 0)}\n\n"
+                    "Resumo:\n"
+                    f"- MFE médio: {s.get('mfe_avg_pct', 0)}%\n"
+                    f"- MAE médio: {s.get('mae_avg_pct', 0)}%\n"
+                    f"- Giveback médio: {s.get('giveback_avg_pct', 0)}%\n"
+                    f"- TP50 hit rate: {s.get('tp50_hit_rate_pct', 0)}%"
+                ),
+                "payload": payload,
+            }
+
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    
     @app.route("/history/trades/rebuild")
     def history_trades_rebuild():
         try:

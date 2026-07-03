@@ -967,6 +967,64 @@ def build_closed_trades_payload(limit=None, filters=None):
     }
 
 
+def build_trade_record_analytics(limit=None, filters=None):
+    trades = load_closed_trades(limit=limit or HISTORY_MAX_READ, filters=filters)
+
+    def avg(values):
+        vals = [_safe_float(v, None) for v in values]
+        vals = [v for v in vals if v is not None]
+        return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+    def group_by(field):
+        buckets = defaultdict(list)
+        for t in trades:
+            key = t.get(field) or "N/A"
+            buckets[str(key)].append(t)
+
+        out = {}
+        for key, rows in buckets.items():
+            pnls = [_safe_float(r.get("pnl_pct"), None) for r in rows]
+            pnls = [p for p in pnls if p is not None]
+            wins = len([p for p in pnls if p > 0])
+            losses = len([p for p in pnls if p < 0])
+            tp50_hits = len([r for r in rows if r.get("tp50_hit") is True])
+
+            out[key] = {
+                "trades": len(rows),
+                "wins": wins,
+                "losses": losses,
+                "win_rate_pct": round(wins / max(wins + losses, 1) * 100, 2),
+                "pnl_total_pct": round(sum(pnls), 4),
+                "pnl_avg_pct": round(sum(pnls) / max(len(pnls), 1), 4) if pnls else 0.0,
+                "mfe_avg_pct": avg([r.get("mfe_pct") for r in rows]),
+                "mae_avg_pct": avg([r.get("mae_pct") for r in rows]),
+                "giveback_avg_pct": avg([r.get("giveback_pct") for r in rows]),
+                "tp50_hit_rate_pct": round(tp50_hits / max(len(rows), 1) * 100, 2),
+            }
+
+        return dict(sorted(out.items(), key=lambda x: x[1]["pnl_total_pct"], reverse=True))
+
+    tp50_hits_total = len([t for t in trades if t.get("tp50_hit") is True])
+
+    return {
+        "ok": True,
+        "generated_at": data_hora_sp_str(),
+        "count": len(trades),
+        "summary": {
+            "mfe_avg_pct": avg([t.get("mfe_pct") for t in trades]),
+            "mae_avg_pct": avg([t.get("mae_pct") for t in trades]),
+            "giveback_avg_pct": avg([t.get("giveback_pct") for t in trades]),
+            "tp50_hit_rate_pct": round(tp50_hits_total / max(len(trades), 1) * 100, 2),
+        },
+        "by_bot": group_by("bot"),
+        "by_setup": group_by("setup"),
+        "by_symbol": group_by("symbol"),
+        "by_session": group_by("session"),
+        "by_weekday": group_by("weekday"),
+        "by_result_type": group_by("result_type"),
+    }
+
+
 def build_closed_trades_payload(limit=None, filters=None):
     trades = load_closed_trades(limit=limit or HISTORY_MAX_READ, filters=filters)
     metrics = calculate_performance_metrics([
