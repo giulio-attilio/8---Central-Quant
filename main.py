@@ -952,6 +952,35 @@ def central_trade_registry_snapshot(include_trades=True):
         }
 
 
+def get_open_positions_central():
+    """
+    Fonte oficial de posições abertas da Central Quant.
+    Prioridade: Trade Registry.
+    Fallback: posições lidas diretamente dos robôs.
+    """
+    snap = central_trade_registry_snapshot(include_trades=True)
+
+    if snap.get("ok") and snap.get("loaded"):
+        trades = snap.get("open_trades", [])
+        if isinstance(trades, dict):
+            trades = list(trades.values())
+        elif not isinstance(trades, list):
+            trades = []
+
+        return [t for t in trades if isinstance(t, dict)]
+
+    # Fallback seguro caso o registry falhe
+    positions = []
+    for key, module in LOADED_BOTS.items():
+        for p in get_open_positions_from_module(module, key=key):
+            if isinstance(p, dict):
+                p = dict(p)
+                p.setdefault("bot", key)
+                positions.append(p)
+
+    return positions        
+
+
 @app.route("/")
 def home():
     return f"{BOT_NAME} Online"
@@ -1570,6 +1599,35 @@ def trade_registry_reset_route():
     result = central_trade_registry.reset_trade_registry(confirm=confirm)
     status = 200 if result.get("ok") else 400
     return result, status
+
+
+@app.route("/positions/central")
+@app.route("/central/positions")
+def central_positions_route():
+    positions = get_open_positions_central()
+
+    by_bot = {}
+    by_side = {}
+    by_symbol = {}
+
+    for p in positions:
+        bot = str(p.get("bot") or "UNKNOWN").upper()
+        side = str(p.get("side") or p.get("direction") or "UNKNOWN").upper()
+        symbol = str(p.get("symbol") or p.get("ativo") or p.get("pair") or "UNKNOWN").upper()
+
+        by_bot[bot] = by_bot.get(bot, 0) + 1
+        by_side[side] = by_side.get(side, 0) + 1
+        by_symbol[symbol] = by_symbol.get(symbol, 0) + 1
+
+    return {
+    "ok": True,
+    "source": "trade_registry" if positions else "fallback_modules",
+        "count": len(positions),
+        "by_bot": by_bot,
+        "by_side": by_side,
+        "by_symbol": by_symbol,
+        "positions": positions,
+    }
 
 
 @app.route("/traderegistry/health")
