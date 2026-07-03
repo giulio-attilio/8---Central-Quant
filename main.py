@@ -3781,6 +3781,18 @@ def build_decision_log_report(arg=None, limit=30):
             lines.append("  motivos: " + "; ".join(str(x) for x in reasons[:3]))
         if warnings:
             lines.append("  avisos: " + "; ".join(str(x) for x in warnings[:3]))
+
+        divergence = r.get("bingx_divergence") or {}
+        if divergence.get("active"):
+            only_bingx = divergence.get("only_bingx") or []
+            only_central = divergence.get("only_central") or []
+            lines.append(
+                "  bingx_divergence: "
+                f"{divergence.get('status')} | "
+                f"policy={divergence.get('policy')} | "
+                f"só_bingx={','.join(only_bingx) if only_bingx else '0'} | "
+                f"só_central={','.join(only_central) if only_central else '0'}"
+            )
     return "\n".join(lines)
 
 
