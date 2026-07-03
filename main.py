@@ -9290,6 +9290,44 @@ try:
         except Exception as e:
             return {"ok": False, "error": str(e)}
     
+    @app.route("/analytics/bots")
+    def analytics_bots():
+        try:
+            import analytics_engine
+
+            payload = analytics_engine.bot_ranking()
+
+            lines = [
+                "🧠 ANALYTICS BOTS — CENTRAL QUANT",
+                f"Data/hora: {payload.get('generated_at')}",
+                "",
+                "Ranking por robô:",
+            ]
+
+            for i, bot in enumerate(payload.get("bots", []), start=1):
+                lines += [
+                    "",
+                    f"{i}. {bot.get('bot')}",
+                    f"Score: {bot.get('score')}/100",
+                    f"Recomendação: {bot.get('recommendation')}",
+                    f"Trades: {bot.get('trades')}",
+                    f"Win rate: {bot.get('win_rate_pct')}%",
+                    f"PnL total: {bot.get('pnl_total_pct')}%",
+                    f"TP50 hit rate: {bot.get('tp50_hit_rate_pct')}%",
+                ]
+
+            return {
+                "ok": True,
+                "text": "\n".join(lines),
+                "payload": payload,
+            }
+
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e),
+            }
+    
     @app.route("/history/trades/rebuild")
     def history_trades_rebuild():
         try:
