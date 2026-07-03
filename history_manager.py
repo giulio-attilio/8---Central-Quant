@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - SUPER HISTORY MANAGER
-# Versão: 2026-07-03-SUPER-HISTORY-V2-CLOSED-TRADES
+# Versão: 2026-07-03-SUPER-HISTORY-V3-ROBUST-CLOSED-TRADES
 #
 # Objetivo:
 # - Criar um histórico persistente único da Central Quant.
@@ -70,6 +70,7 @@ HISTORY_MAX_READ = int(os.environ.get("HISTORY_MAX_READ", "2000"))
 HISTORY_REPORT_DAYS = int(os.environ.get("HISTORY_REPORT_DAYS", "7"))
 HISTORY_DEDUP_ENABLED = str(os.environ.get("HISTORY_DEDUP_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
 HISTORY_DEDUP_MAX_KEYS = int(os.environ.get("HISTORY_DEDUP_MAX_KEYS", "5000"))
+HISTORY_AUTO_BACKFILL_CLOSED = str(os.environ.get("HISTORY_AUTO_BACKFILL_CLOSED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
 
 
 def agora_sp():
@@ -203,6 +204,7 @@ def get_status():
         "report_days": HISTORY_REPORT_DAYS,
         "dedup_enabled": HISTORY_DEDUP_ENABLED,
         "dedup_max_keys": HISTORY_DEDUP_MAX_KEYS,
+        "auto_backfill_closed": HISTORY_AUTO_BACKFILL_CLOSED,
     }
 
 
@@ -439,13 +441,107 @@ def _dedup_seen(uid):
         return False
 
 
-def normalize_event_type(event_type, payload=None):
-    et = str(event_type or "EVENT").upper().strip()
+
+def _looks_like_dict_string(value):
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(text.startswith("{") and text.endswith("}"))
+
+
+def _coerce_event_args(event_type=None, payload=None):
+    """
+    Proteção V3: alguns pontos da Central/robôs podem chamar log_event(payload)
+    em vez de log_event("EVENT", payload). Esta função corrige isso antes da
+    normalização, impedindo que um dict inteiro vire nome de evento.
+    """
+    parsed_event_type = safe_parse_dict_string(event_type) if isinstance(event_type, str) and _looks_like_dict_string(event_type) else {}
+
+    if isinstance(event_type, dict):
+        if payload is None:
+            payload = event_type
+        elif isinstance(payload, dict):
+            merged = dict(event_type)
+            merged.update(payload)
+            payload = merged
+        event_type = _first(payload, ["event_type", "event", "type", "reason", "status", "result", "decision"], "EVENT")
+
+    elif parsed_event_type:
+        if payload is None:
+            payload = parsed_event_type
+        elif isinstance(payload, dict):
+            merged = dict(parsed_event_type)
+            merged.update(payload)
+            payload = merged
+        event_type = _first(payload, ["event_type", "event", "type", "reason", "status", "result", "decision"], "EVENT")
+
+    if isinstance(payload, str) and _looks_like_dict_string(payload):
+        parsed_payload = safe_parse_dict_string(payload)
+        if parsed_payload:
+            payload = parsed_payload
+
+    if not isinstance(payload, dict):
+        payload = {"value": payload} if payload is not None else {}
+
+    # Se o evento ainda parece um payload serializado, não deixa contaminar by_event.
+    if is_bad_string_value(event_type):
+        event_type = _first(payload, ["event_type", "event", "type", "reason", "status", "result", "decision"], "EVENT")
+
+    return event_type or "EVENT", payload
+
+
+def _derive_event_name_from_payload(payload):
     p = payload if isinstance(payload, dict) else {}
-    status = str(_first(p, ["status", "state", "result", "decision", "resultado"], "")).upper()
+    candidates = [
+        _first(p, ["event_type", "event", "type"]),
+        _first(p, ["reason", "motivo", "exit_reason"]),
+        _first(p, ["status", "state", "result", "decision", "resultado", "result_type"]),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, str) and not is_bad_string_value(candidate) and candidate.strip():
+            return candidate.strip()
+    return "EVENT"
+
+
+def _closed_trade_key(record):
+    if not isinstance(record, dict):
+        return ""
+    uid = str(record.get("uid") or "").strip()
+    if uid:
+        return f"uid:{uid}"
+    trade_id = str(record.get("trade_id") or "").strip()
+    bot = str(record.get("bot") or "").strip().upper()
+    symbol = normalize_symbol(record.get("symbol") or "")
+    side = normalize_side(record.get("side") or "")
+    exit_time = str(record.get("exit_time") or record.get("created_at") or "").strip()
+    pnl = str(record.get("pnl_pct") if record.get("pnl_pct") is not None else "").strip()
+    if trade_id:
+        return f"trade:{trade_id}|{exit_time}|{pnl}"
+    return f"fallback:{bot}|{symbol}|{side}|{exit_time}|{pnl}"
+
+
+def _load_closed_trade_keys(limit=None):
+    keys = set()
+    for row in _read_jsonl_tail(CLOSED_TRADES_FILE, limit=limit or HISTORY_MAX_READ * 5):
+        key = _closed_trade_key(row)
+        if key:
+            keys.add(key)
+    return keys
+
+def normalize_event_type(event_type, payload=None):
+    event_type, payload = _coerce_event_args(event_type, payload)
+    p = payload if isinstance(payload, dict) else {}
+
+    derived = _derive_event_name_from_payload(p)
+    et = str(event_type or derived or "EVENT").upper().strip()
+    if not et or is_bad_string_value(et):
+        et = str(derived or "EVENT").upper().strip()
+
+    status = str(_first(p, ["status", "state", "result", "decision", "resultado", "result_type"], "") or "").upper().strip()
     event_name = str(_extract_field(p, ["event", "event_type", "type"], "") or "").upper().strip()
-    if not et and event_name:
-        et = event_name
+    reason = str(_first(p, ["reason", "motivo", "exit_reason"], "") or "").upper().strip()
 
     aliases = {
         "SIGNAL": "SIGNAL_CREATED",
@@ -454,15 +550,20 @@ def normalize_event_type(event_type, payload=None):
         "ENTRY": "TRADE_OPENED",
         "ENTRADA": "TRADE_OPENED",
         "OPEN": "TRADE_OPENED",
+        "OPENED": "TRADE_OPENED",
         "TRADE_OPENED": "TRADE_OPENED",
         "TP50": "TP50_HIT",
         "TP50_HIT": "TP50_HIT",
         "BE": "BREAKEVEN",
+        "BE_TRIGGER": "BREAKEVEN",
         "BREAKEVEN": "BREAKEVEN",
+        "BREAKEVEN_MOVED": "BREAKEVEN",
         "TRAIL": "TRAILING_UPDATED",
         "TRAILING": "TRAILING_UPDATED",
         "TRAILING_UPDATED": "TRAILING_UPDATED",
         "STOP": "TRADE_CLOSED",
+        "STOPLOSS": "TRADE_CLOSED",
+        "STOP_LOSS": "TRADE_CLOSED",
         "SL": "TRADE_CLOSED",
         "SL100": "TRADE_CLOSED",
         "CLOSE": "TRADE_CLOSED",
@@ -477,21 +578,29 @@ def normalize_event_type(event_type, payload=None):
         "BLOCKED": "TRADE_BLOCKED",
         "TRADING_BLOCKED": "TRADE_BLOCKED",
         "RISK_DENY": "TRADE_BLOCKED",
+        "TRADE_BLOCKED": "TRADE_BLOCKED",
         "ALLOW": "RISK_ALLOW",
+        "ALLOWED": "RISK_ALLOW",
         "RISK_ALLOW": "RISK_ALLOW",
         "RISK_DECISION": "RISK_DECISION",
         "WIN": "TRADE_CLOSED",
         "LOSS": "TRADE_CLOSED",
+        "POI": "POI",
     }
 
-    if et in aliases:
-        return aliases[et]
-    if event_name in aliases:
-        return aliases[event_name]
-    if status in {"DENY", "DENIED", "BLOCKED", "ENCERRADO", "CLOSED", "FECHADO"}:
-        return "TRADE_BLOCKED" if status in {"DENY", "DENIED", "BLOCKED"} else "TRADE_CLOSED"
-    return et
+    for candidate in (et, event_name, reason, status):
+        candidate = str(candidate or "").upper().strip()
+        if candidate in aliases:
+            return aliases[candidate]
 
+    # Heurísticas finais para payloads de fechamento que não informam event_type.
+    if any(p.get(k) is not None for k in ["exit_price", "close_price", "closed_at", "exit_time"]):
+        return "TRADE_CLOSED"
+    if any(p.get(k) is not None for k in ["entry", "entrada", "entry_price"]):
+        if reason in {"ENTRY", "OPEN", "ENTRADA"}:
+            return "TRADE_OPENED"
+
+    return et or "EVENT"
 
 def classify_event(event_type, payload=None):
     return normalize_event_type(event_type, payload)
@@ -522,6 +631,7 @@ def is_admin_event(event):
 
 
 def normalize_payload(event_type, payload=None, source=None, trade_id=None):
+    event_type, payload = _coerce_event_args(event_type, payload)
     raw = payload if isinstance(payload, dict) else {"value": payload}
     event = classify_event(event_type, raw)
 
@@ -584,7 +694,7 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
         "ts": data_hora_sp_str(),
         "epoch": time.time(),
         "event": event,
-        "event_raw": str(event_type or "EVENT").upper(),
+        "event_raw": str(event_type or "EVENT").upper() if not is_bad_string_value(event_type) else event,
         "source": str(source or raw.get("source") or bot or "central").lower(),
         "trade_id": str(tid),
         "bot": bot,
@@ -712,9 +822,21 @@ def append_closed_trade(item):
         record = _closed_trade_record_from_event(item)
         if not record.get("trade_id") and not record.get("uid"):
             record["trade_id"] = f"CLOSED-{agora_sp().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+        key = _closed_trade_key(record)
+        if key and key in _load_closed_trade_keys():
+            return {
+                "ok": True,
+                "dedup": True,
+                "file": str(CLOSED_TRADES_FILE),
+                "trade_id": record.get("trade_id"),
+                "bot": record.get("bot"),
+                "symbol": record.get("symbol"),
+                "pnl_pct": record.get("pnl_pct"),
+            }
         ok = _append_jsonl(CLOSED_TRADES_FILE, record)
         return {
             "ok": ok,
+            "dedup": False,
             "file": str(CLOSED_TRADES_FILE),
             "trade_id": record.get("trade_id"),
             "bot": record.get("bot"),
@@ -773,6 +895,67 @@ def build_closed_trades_payload(limit=None, filters=None):
         "trades": trades,
     }
 
+
+
+def backfill_closed_trades_from_events(limit=None, force=False):
+    """
+    Recria closed_trades.jsonl a partir dos eventos TRADE_CLOSED já existentes.
+    Por padrão é incremental e deduplicado. Use force=True apenas se quiser
+    regravar o arquivo do zero.
+    """
+    try:
+        ensure_history_files()
+        if force:
+            CLOSED_TRADES_FILE.write_text("", encoding="utf-8")
+
+        existing = _load_closed_trade_keys(limit=HISTORY_MAX_READ * 10)
+        events = load_events(limit=limit or HISTORY_MAX_READ)
+        scanned = 0
+        candidates = 0
+        created = 0
+        skipped = 0
+        errors = 0
+
+        for event in events:
+            scanned += 1
+            event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
+            if event_name != "TRADE_CLOSED":
+                continue
+            candidates += 1
+            try:
+                normalized = normalize_payload("TRADE_CLOSED", event, source=event.get("source"), trade_id=event.get("trade_id"))
+                record = _closed_trade_record_from_event(normalized)
+                key = _closed_trade_key(record)
+                if key and key in existing:
+                    skipped += 1
+                    continue
+                ok = _append_jsonl(CLOSED_TRADES_FILE, record)
+                if ok:
+                    created += 1
+                    if key:
+                        existing.add(key)
+                else:
+                    errors += 1
+            except Exception:
+                errors += 1
+
+        return {
+            "ok": errors == 0,
+            "file": str(CLOSED_TRADES_FILE),
+            "scanned": scanned,
+            "candidates": candidates,
+            "created": created,
+            "skipped": skipped,
+            "errors": errors,
+            "closed_trade_records": _count_jsonl(CLOSED_TRADES_FILE),
+            "closed_trade_backfill": {
+                "created": created,
+                "skipped": skipped,
+                "errors": errors,
+            }
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "file": str(CLOSED_TRADES_FILE)}
 
 def log_event(event_type, payload=None, source=None, trade_id=None):
     try:
@@ -1250,7 +1433,7 @@ def build_history_payload(limit=None):
     tp50 = []
 
     for e in events:
-        event = e.get("event") or "EVENT"
+        event = normalize_event_type(e.get("event") or e.get("event_type") or e.get("type"), e)
         by_event[event] += 1
         bot_key = sanitize_bot(_extract_field(e, ["bot", "bot_name", "strategy", "source"], default=""), e) or sanitize_bot(e.get("bot"), e) or "N/A"
         symbol_key = _extract_symbol(e) or str(e.get("symbol") or "N/A").upper() or "N/A"
@@ -1280,6 +1463,12 @@ def build_history_payload(limit=None):
     gross_win = sum([x for x in pnl_values if x > 0])
     gross_loss = abs(sum([x for x in pnl_values if x < 0]))
 
+    closed_trade_records = _count_jsonl(CLOSED_TRADES_FILE)
+    backfill_result = None
+    if HISTORY_AUTO_BACKFILL_CLOSED and len(closed) > 0 and closed_trade_records < len(closed):
+        backfill_result = backfill_closed_trades_from_events(limit=limit or HISTORY_MAX_READ, force=False)
+        closed_trade_records = _count_jsonl(CLOSED_TRADES_FILE)
+
     return {
         "ok": True,
         "generated_at": data_hora_sp_str(),
@@ -1299,7 +1488,8 @@ def build_history_payload(limit=None):
             "tp50": len(tp50),
             "breakeven": by_event.get("BREAKEVEN", 0),
             "trailing": by_event.get("TRAILING_UPDATED", 0),
-            "closed_trade_records": _count_jsonl(CLOSED_TRADES_FILE),
+            "closed_trade_records": closed_trade_records,
+            "closed_trade_backfill": backfill_result,
         },
         "performance": {
             "wins": wins,
@@ -1379,10 +1569,11 @@ def build_riskstats_payload():
     blocked_by_reason = Counter()
 
     for e in events:
-        if e.get("event") == "TRADE_CLOSED":
+        event_name = normalize_event_type(e.get("event") or e.get("event_type") or e.get("type"), e)
+        if event_name == "TRADE_CLOSED":
             closed_by_bot[e.get("bot") or "N/A"].append(e)
             closed_by_symbol[e.get("symbol") or "N/A"].append(e)
-        if e.get("event") == "TRADE_BLOCKED":
+        if event_name == "TRADE_BLOCKED":
             reason = e.get("reason") or e.get("result") or "N/A"
             blocked_by_reason[str(reason)] += 1
 
