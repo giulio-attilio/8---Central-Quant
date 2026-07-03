@@ -6090,7 +6090,17 @@ def risk_route():
 @app.route("/riskregistry")
 def risk_registry_route():
     exposure = central_exposure_snapshot()
-    registry = central_trade_registry_snapshot(include_trades=False)
+    registry = {
+    "loaded": central_trade_registry is not None,
+    "ok": True,
+    "open_count": exposure.get("total_positions_open"),
+    "by_bot": {k: v.get("total") for k, v in (exposure.get("by_bot") or {}).items()},
+    "by_side": {
+        "LONG": exposure.get("long_positions_open"),
+        "SHORT": exposure.get("short_positions_open"),
+    },
+    "source": exposure.get("source"),
+}
 
     return {
         "ok": True,
@@ -6106,7 +6116,7 @@ def risk_registry_route():
         "registry": registry,
     }
 
-    
+
 @app.route("/heat")
 @app.route("/heatmap")
 def heat_route():
