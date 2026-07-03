@@ -55,6 +55,26 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
+# ====================================================
+# CENTRAL QUANT — TRADE REGISTRY
+# ====================================================
+try:
+    from trade_registry import (
+        make_trade_id,
+        register_open_trade,
+        update_trade,
+        close_trade,
+    )
+    TRADE_REGISTRY_AVAILABLE = True
+    TRADE_REGISTRY_IMPORT_ERROR = None
+except Exception as exc:
+    make_trade_id = None
+    register_open_trade = None
+    update_trade = None
+    close_trade = None
+    TRADE_REGISTRY_AVAILABLE = False
+    TRADE_REGISTRY_IMPORT_ERROR = str(exc)
+
 try:
     from strategy import calcular_atr
 except Exception:
@@ -933,6 +953,144 @@ def registrar_evento_trade(evento):
     if len(trades) > 1000:
         trades = trades[-1000:]
     salvar_trades(trades)
+
+
+def _meme_registry_symbol(value):
+    try:
+        return nome_limpo(value)
+    except Exception:
+        return str(value or "").replace("/USDT:USDT", "USDT").replace("/USDT", "USDT")
+
+
+def _meme_trade_registry_id_from_data(data):
+    try:
+        symbol = data.get("symbol_clean") or _meme_registry_symbol(data.get("symbol"))
+        side = data.get("side") or data.get("signal")
+        setup = data.get("signal_type") or data.get("setup") or "MEME"
+        if make_trade_id:
+            return make_trade_id("MEME", symbol, side, setup)
+        return f"MEME:{str(setup).upper()}:{str(symbol).upper()}:{str(side).upper()}"
+    except Exception:
+        return None
+
+
+def registrar_trade_registry_open(s, p=None):
+    if not TRADE_REGISTRY_AVAILABLE or register_open_trade is None:
+        return None
+
+    try:
+        symbol = s.get("symbol_clean") or _meme_registry_symbol(s.get("symbol"))
+        side = s.get("side") or s.get("signal")
+        setup = s.get("signal_type", "MEME")
+        result = register_open_trade(
+            bot="MEME",
+            symbol=symbol,
+            side=side,
+            entry=float(s.get("entry")),
+            sl=s.get("sl"),
+            tp50=s.get("tp50"),
+            setup=setup,
+            qty=s.get("qty"),
+            source="meme.py",
+            metadata={
+                "raw_symbol": s.get("symbol"),
+                "risk_pct": s.get("risk_pct"),
+                "risk_abs": s.get("risk_abs"),
+                "signal_score": s.get("signal_score"),
+                "meme_score": s.get("meme_score"),
+                "elite_candidate": s.get("elite_candidate"),
+                "h4_state": s.get("h4_state"),
+                "h1_state": s.get("h1_state"),
+                "qualidade": s.get("qualidade"),
+                "execution_decision": s.get("risk_precheck_decision"),
+                "execution_allowed": s.get("risk_precheck_allowed"),
+                "execution_checked_at": s.get("risk_precheck_at"),
+                "execution_risk_reason": s.get("risk_precheck_reason"),
+            },
+        )
+        trade_id = result.get("trade_id") if isinstance(result, dict) else None
+        if p is not None and trade_id:
+            p["trade_registry_id"] = trade_id
+            p["trade_registry_opened"] = True
+        return trade_id
+    except Exception as exc:
+        print("ERRO TRADE REGISTRY OPEN MEME:", exc)
+        return None
+
+
+def registrar_trade_registry_update(p, event, **updates):
+    if not TRADE_REGISTRY_AVAILABLE or update_trade is None:
+        return False
+
+    try:
+        trade_id = p.get("trade_registry_id") or _meme_trade_registry_id_from_data(p)
+        if not trade_id:
+            return False
+
+        metadata = dict(updates.pop("metadata", {}) or {})
+        metadata.update({
+            "event": event,
+            "updated_by": "meme.py",
+            "updated_at_local": data_hora_sp_str(),
+        })
+
+        payload = {
+            "status": p.get("status"),
+            "sl": p.get("sl"),
+            "tp50": p.get("tp50"),
+            "tp50_hit": p.get("tp50_hit"),
+            "breakeven": p.get("breakeven"),
+            "mfe_max_pct": p.get("mfe_max_pct"),
+            "mae_max_pct": p.get("mae_max_pct"),
+            "mfe_max_r": p.get("mfe_max_r"),
+            "mae_max_r": p.get("mae_max_r"),
+            "mfe_gave_back_pct": p.get("mfe_gave_back_pct"),
+            "mfe_gave_back_r": p.get("mfe_gave_back_r"),
+            "metadata": metadata,
+        }
+        payload.update(updates)
+        update_trade(trade_id, **payload)
+        return True
+    except Exception as exc:
+        print("ERRO TRADE REGISTRY UPDATE MEME:", exc)
+        return False
+
+
+def registrar_trade_registry_close(p, exit_price, pnl_value, reason):
+    if not TRADE_REGISTRY_AVAILABLE or close_trade is None:
+        return False
+
+    try:
+        trade_id = p.get("trade_registry_id") or _meme_trade_registry_id_from_data(p)
+        if not trade_id:
+            return False
+
+        close_trade(
+            trade_id,
+            exit_price=float(exit_price),
+            pnl_pct=float(pnl_value),
+            pnl_r=p.get("mfe_max_r"),
+            reason=reason,
+            metadata={
+                "closed_by": "meme.py",
+                "symbol": p.get("symbol"),
+                "symbol_clean": p.get("symbol_clean"),
+                "side": p.get("side"),
+                "signal_type": p.get("signal_type"),
+                "result_type": reason,
+                "breakeven": bool(p.get("breakeven")),
+                "tp50_hit": bool(p.get("tp50_hit")),
+                "mfe_max_pct": p.get("mfe_max_pct"),
+                "mae_max_pct": p.get("mae_max_pct"),
+                "mfe_gave_back_pct": p.get("mfe_gave_back_pct"),
+                "closed_at_local": data_hora_sp_str(),
+            },
+        )
+        p["trade_registry_closed"] = True
+        return True
+    except Exception as exc:
+        print("ERRO TRADE REGISTRY CLOSE MEME:", exc)
+        return False
 
 
 # ====================================================
@@ -2830,7 +2988,7 @@ def registrar_posicao(s):
     if not central_risk_allows_entry(s):
         return False
 
-    posicoes[symbol] = {
+    p = {
         "symbol": symbol,
         "symbol_clean": s["symbol_clean"],
         "side": s["signal"],
@@ -2876,6 +3034,8 @@ def registrar_posicao(s):
         "risk_precheck_reason": s.get("risk_precheck_reason")
     }
 
+    registrar_trade_registry_open(s, p)
+    posicoes[symbol] = p
     salvar_posicoes(posicoes)
 
     registrar_evento_trade({
@@ -2937,6 +3097,8 @@ def atualizar_posicao_com_poi(poi):
 
     posicoes[poi["symbol"]] = p
     salvar_posicoes(posicoes)
+
+    registrar_trade_registry_update(p, "POI", entry=poi.get("entry"), tp50=poi.get("tp50"), risk_pct=poi.get("risk_pct"), metadata={"poi": poi})
 
     registrar_evento_trade({
         "event": "POI",
@@ -3153,6 +3315,7 @@ def gerenciar_posicoes():
                     p["closed_at"] = time.time()
                     p["closed_datetime"] = data_hora_sp_str()
                     p["closed_reason"] = resultado_tipo
+                    registrar_trade_registry_close(p, sl, resultado, resultado_tipo)
                     p["reentry_ready"] = False
                     p["status"] = "ENCERRADO"
                     alterou = True
@@ -3190,6 +3353,7 @@ def gerenciar_posicoes():
                     p["closed_at"] = time.time()
                     p["closed_datetime"] = data_hora_sp_str()
                     p["closed_reason"] = resultado_tipo
+                    registrar_trade_registry_close(p, sl, resultado, resultado_tipo)
                     p["reentry_ready"] = False
                     p["status"] = "ENCERRADO"
                     alterou = True
@@ -3221,6 +3385,8 @@ def gerenciar_posicoes():
                         "stop_after_tp50": float(p["sl"])
                     })
 
+                    registrar_trade_registry_update(p, "TP50", tp50=tp50, metadata={"price": preco_atual, "pnl_pct": pnl_pct(side, entry, tp50)})
+
                     continue
 
                 if side == "SHORT" and preco_atual <= tp50:
@@ -3244,6 +3410,8 @@ def gerenciar_posicoes():
                         "be_trigger_price": entry - float(p.get("risk_abs", abs(sl - entry))) * BE_TRIGGER_R,
                         "stop_after_tp50": float(p["sl"])
                     })
+
+                    registrar_trade_registry_update(p, "TP50", tp50=tp50, metadata={"price": preco_atual, "pnl_pct": pnl_pct(side, entry, tp50)})
 
                     continue
 
@@ -3285,6 +3453,8 @@ def gerenciar_posicoes():
                             "new_stop": novo_stop
                         })
 
+                        registrar_trade_registry_update(p, "BE_TRIGGER", sl=novo_stop, metadata={"be_trigger_price": be_trigger_price, "be_trigger_r": BE_TRIGGER_R})
+
                         continue
 
                 if side == "SHORT":
@@ -3317,6 +3487,8 @@ def gerenciar_posicoes():
                             "new_stop": novo_stop
                         })
 
+                        registrar_trade_registry_update(p, "BE_TRIGGER", sl=novo_stop, metadata={"be_trigger_price": be_trigger_price, "be_trigger_r": BE_TRIGGER_R})
+
                         continue
 
             # Trailing somente após ativar BE em 1,5R.
@@ -3339,6 +3511,8 @@ def gerenciar_posicoes():
                         "new_stop": novo_stop
                     })
 
+                    registrar_trade_registry_update(p, "TRAILING", sl=novo_stop, metadata={"price": preco_atual})
+
                 if side == "SHORT" and novo_stop < float(p["sl"]):
                     p["sl"] = novo_stop
                     p["trailing_activated_at"] = time.time()
@@ -3354,6 +3528,8 @@ def gerenciar_posicoes():
                         "side": side,
                         "new_stop": novo_stop
                     })
+
+                    registrar_trade_registry_update(p, "TRAILING", sl=novo_stop, metadata={"price": preco_atual})
 
         except Exception as e:
             print(f"ERRO GESTÃO {symbol}: {e}")

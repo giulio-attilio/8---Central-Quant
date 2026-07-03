@@ -33,6 +33,26 @@ except Exception as _broker_exc:
     bingx_broker = None
     BROKER_IMPORT_ERROR = str(_broker_exc)
 
+# ====================================================
+# TRADE REGISTRY — CENTRAL QUANT
+# ====================================================
+try:
+    from trade_registry import (
+        make_trade_id,
+        register_open_trade,
+        update_trade,
+        close_trade,
+    )
+    TRADE_REGISTRY_LOADED = True
+    TRADE_REGISTRY_IMPORT_ERROR = None
+except Exception as _trade_registry_exc:
+    make_trade_id = None
+    register_open_trade = None
+    update_trade = None
+    close_trade = None
+    TRADE_REGISTRY_LOADED = False
+    TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_exc)
+
 app = Flask(__name__)
 
 
@@ -195,7 +215,9 @@ HEALTH = {
     "execution_last_result": None,
     "execution_last_error": None,
     "execution_last_run": None,
-    "broker_import_error": BROKER_IMPORT_ERROR
+    "broker_import_error": BROKER_IMPORT_ERROR,
+    "trade_registry_loaded": TRADE_REGISTRY_LOADED,
+    "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR
 }
 
 DEFAULT_FUNNEL_STATS = {
@@ -478,6 +500,123 @@ def registrar_evento_trade(evento):
     if len(trades) > 3000:
         trades = trades[-3000:]
     salvar_trades(trades)
+
+
+# ====================================================
+# TRADE REGISTRY HELPERS
+# ====================================================
+
+def _predator_registry_trade_id(symbol, side, setup="SMART_PREDATOR"):
+    try:
+        if make_trade_id:
+            return make_trade_id("PREDATOR", nome_limpo(symbol), side, setup)
+    except Exception:
+        pass
+    return f"PREDATOR:{setup}:{nome_limpo(symbol)}:{side}"
+
+
+def registrar_trade_registry_open_predator(s, p=None):
+    """Registra abertura no Trade Registry sem interferir na lógica do robô."""
+    if not TRADE_REGISTRY_LOADED or register_open_trade is None:
+        return None
+    try:
+        setup = s.get("signal_type") or "SMART_PREDATOR"
+        side = s.get("side") or s.get("signal")
+        symbol = s.get("symbol")
+        trade_id = _predator_registry_trade_id(symbol, side, setup)
+        result = register_open_trade(
+            bot="PREDATOR",
+            symbol=nome_limpo(symbol),
+            side=side,
+            entry=float(s.get("entry")),
+            sl=float(s.get("sl")),
+            tp50=float(s.get("tp50")),
+            setup=setup,
+            qty=None,
+            source="smart_predator",
+            metadata={
+                "raw_symbol": symbol,
+                "score": s.get("score"),
+                "quality": s.get("quality"),
+                "risk_pct": s.get("risk_pct"),
+                "risk_abs": s.get("risk_abs"),
+                "h4_context": s.get("h4_context"),
+                "adx_h4": s.get("adx_h4"),
+                "adx_h1": s.get("adx_h1"),
+                "volume_ratio": s.get("volume_ratio"),
+                "execution_mode": PREDATOR_MODE,
+                "execution_allowed": s.get("risk_precheck_allowed"),
+                "execution_decision": s.get("risk_precheck_decision"),
+                "auto_trade": SMART_PREDATOR_AUTO_TRADE,
+            },
+        )
+        if p is not None and isinstance(p, dict):
+            p["trade_registry_id"] = trade_id
+            p["trade_registry_open_result"] = result
+        return result
+    except Exception as exc:
+        print("ERRO TRADE_REGISTRY OPEN PREDATOR:", exc)
+        return None
+
+
+def registrar_trade_registry_update_predator(p, event, **extra):
+    if not TRADE_REGISTRY_LOADED or update_trade is None:
+        return None
+    try:
+        trade_id = p.get("trade_registry_id") or _predator_registry_trade_id(
+            p.get("symbol"), p.get("side"), p.get("signal_type", "SMART_PREDATOR")
+        )
+        metadata = dict(p.get("trade_registry_metadata", {}) or {})
+        metadata.update({
+            "last_event": event,
+            "updated_by": "smart_predator",
+            "event_at": data_hora_sp_str(),
+        })
+        metadata.update(extra)
+        payload = {
+            "status": p.get("status"),
+            "sl": p.get("sl"),
+            "tp50": p.get("tp50"),
+            "last_event": event,
+            "metadata": metadata,
+        }
+        payload.update(extra)
+        return update_trade(trade_id, **payload)
+    except Exception as exc:
+        print("ERRO TRADE_REGISTRY UPDATE PREDATOR:", exc)
+        return None
+
+
+def registrar_trade_registry_close_predator(p, exit_price, pnl_pct_value, pnl_r_value=None, reason=None):
+    if not TRADE_REGISTRY_LOADED or close_trade is None:
+        return None
+    try:
+        trade_id = p.get("trade_registry_id") or _predator_registry_trade_id(
+            p.get("symbol"), p.get("side"), p.get("signal_type", "SMART_PREDATOR")
+        )
+        return close_trade(
+            trade_id,
+            exit_price=float(exit_price) if exit_price is not None else None,
+            pnl_pct=float(pnl_pct_value) if pnl_pct_value is not None else None,
+            pnl_r=float(pnl_r_value) if pnl_r_value is not None else None,
+            reason=reason,
+            metadata={
+                "symbol": p.get("symbol"),
+                "symbol_clean": p.get("symbol_clean"),
+                "side": p.get("side"),
+                "score": p.get("score"),
+                "quality": p.get("quality"),
+                "tp50_hit": p.get("tp50_hit"),
+                "mfe_max_pct": p.get("mfe_max_pct"),
+                "mae_min_pct": p.get("mae_min_pct"),
+                "mfe_gave_back_pct": p.get("mfe_gave_back_pct"),
+                "management_cycles": p.get("management_cycles"),
+                "closed_by": "smart_predator",
+            },
+        )
+    except Exception as exc:
+        print("ERRO TRADE_REGISTRY CLOSE PREDATOR:", exc)
+        return None
 
 
 def carregar_sweep_state():
@@ -1758,6 +1897,14 @@ def update_position_execution_fields(sig, risk, broker_result):
         p["broker_result_last"] = broker_result if isinstance(broker_result, dict) else {}
         posicoes[symbol] = p
         salvar_posicoes(posicoes)
+        registrar_trade_registry_update_predator(
+            p,
+            "EXECUTION_UPDATE",
+            execution_mode=PREDATOR_MODE,
+            execution_status=p.get("execution_status"),
+            execution_sent=p.get("execution_sent"),
+            live_order_id=p.get("live_order_id"),
+        )
     except Exception as exc:
         print("ERRO update_position_execution_fields:", exc)
 
@@ -1913,7 +2060,7 @@ def registrar_posicao(s):
         print("LIMITE DE POSIÇÕES ATINGIDO")
         return False
 
-    posicoes[symbol] = {
+    p = {
         "symbol": symbol,
         "symbol_clean": s.get("symbol_clean", nome_limpo(symbol)),
         "side": s["side"],
@@ -1966,6 +2113,8 @@ def registrar_posicao(s):
         "volume_ratio": s.get("volume_ratio")
     }
 
+    registrar_trade_registry_open_predator(s, p)
+    posicoes[symbol] = p
     salvar_posicoes(posicoes)
 
     registrar_evento_trade({
@@ -2080,6 +2229,8 @@ def encerrar_posicao(symbol, p, preco_saida, motivo):
         "signal_type": "SMART_PREDATOR"
     })
 
+    registrar_trade_registry_close_predator(p, preco_saida, resultado, pnl_r, motivo)
+
     safe_send_telegram(mensagem_saida(p, preco_saida, motivo, resultado))
 
 
@@ -2148,6 +2299,16 @@ def gerenciar_posicoes():
                         "signal_type": "SMART_PREDATOR"
                     })
 
+                    registrar_trade_registry_update_predator(
+                        p,
+                        "TP50",
+                        price=float(preco),
+                        tp50_hit=True,
+                        be_active=True,
+                        trailing_active=True,
+                        cycles_to_tp50=int(p.get("cycles_to_tp50", 0) or 0),
+                    )
+
                     safe_send_telegram(mensagem_tp50(p, preco))
                     alterou = True
 
@@ -2172,6 +2333,13 @@ def gerenciar_posicoes():
                             "new_sl": float(novo_trail),
                             "signal_type": "SMART_PREDATOR"
                         })
+                        registrar_trade_registry_update_predator(
+                            p,
+                            "TRAILING",
+                            old_sl=sl_atual,
+                            new_sl=float(novo_trail),
+                            trailing_active=True,
+                        )
                         safe_send_telegram(mensagem_trailing(p, sl_atual, novo_trail))
                         alterou = True
 
@@ -2189,6 +2357,13 @@ def gerenciar_posicoes():
                             "new_sl": float(novo_trail),
                             "signal_type": "SMART_PREDATOR"
                         })
+                        registrar_trade_registry_update_predator(
+                            p,
+                            "TRAILING",
+                            old_sl=sl_atual,
+                            new_sl=float(novo_trail),
+                            trailing_active=True,
+                        )
                         safe_send_telegram(mensagem_trailing(p, sl_atual, novo_trail))
                         alterou = True
 
