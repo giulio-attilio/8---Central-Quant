@@ -7257,7 +7257,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     if cmd0 in {"/executions", "/exec_log", "/executionlog"}:
         return build_executions_log_report()
     if cmd0 in {"/auditrisk", "/riskaudit"}:
-        parts = raw.split()
+        parts = cmd.split()
         return build_audit_risk_report(parts[1] if len(parts) > 1 else 2)
     if cmd0 in {"/risk", "/riskmanager"}:
         return build_risk_report()
