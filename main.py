@@ -6463,18 +6463,7 @@ def decisionlog_route():
     arg = request.args.get("q") or request.args.get("symbol") or request.args.get("bot")
     return {"text": build_decision_log_report(arg)}
 
-
-@app.route("/decisionlog/raw")
-def decisionlog_raw_route():
-    rows = decision_log_items(limit=20)
-    return {
-        "ok": True,
-        "file": str(CENTRAL_DECISION_LOG_FILE),
-        "count": len(rows),
-        "rows": rows,
-    }
-
-    
+ 
 @app.route("/timeline")
 @app.route("/timeline/<arg>")
 def timeline_route(arg=None):
@@ -6521,6 +6510,59 @@ def status_route():
     return {"text": build_status_report()}
 
 
+@app.route("/systemdebug")
+@app.route("/debug")
+def system_debug_route():
+    decision_main_file = str(CENTRAL_DECISION_LOG_FILE)
+
+    history_decision_file = None
+    history_loaded = False
+    try:
+        import history_manager as super_history_manager
+        history_loaded = True
+        history_decision_file = str(getattr(super_history_manager, "DECISION_LOG_FILE", None))
+    except Exception:
+        pass
+
+    def count_jsonl(path):
+        try:
+            if not path or not os.path.exists(path):
+                return 0
+            with open(path, "r", encoding="utf-8") as f:
+                return sum(1 for line in f if line.strip())
+        except Exception:
+            return None
+
+    registry = central_trade_registry_snapshot(include_trades=False)
+
+    return {
+        "ok": True,
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "base_dir": BASE_DIR,
+        "central_data_dir": CENTRAL_DATA_DIR,
+        "decision_log": {
+            "main_file": decision_main_file,
+            "main_count": count_jsonl(decision_main_file),
+            "history_file": history_decision_file,
+            "history_count": count_jsonl(history_decision_file),
+        },
+        "history_manager": {
+            "loaded": history_loaded,
+        },
+        "trade_registry": {
+            "ok": registry.get("ok"),
+            "loaded": registry.get("loaded"),
+            "open_count": registry.get("open_count"),
+            "closed_count": registry.get("closed_count"),
+            "file": registry.get("trade_registry_file"),
+            "data_dir": registry.get("data_dir"),
+        },
+        "autosync": TRADE_REGISTRY_AUTOSYNC_STATUS,
+        "memory": memory_snapshot("systemdebug", store=False),
+    }
+
+
 @app.route("/can_open_trade", methods=["GET", "POST"])
 @app.route("/canopen", methods=["GET", "POST"])
 def can_open_trade_route():
@@ -6529,8 +6571,6 @@ def can_open_trade_route():
     else:
         payload = dict(request.args)
     return can_open_trade_decision(payload)
-
-
 
 
 @app.route("/auditrisk")
