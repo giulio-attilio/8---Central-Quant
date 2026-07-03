@@ -918,11 +918,12 @@ def central_watchdog_loop():
 
 
 def central_trade_registry_snapshot(include_trades=True):
-    """Snapshot seguro do Trade Registry central."""
+    """Snapshot seguro do Trade Registry central usando leitura direta do arquivo."""
     if central_trade_registry is None:
         return {
             "ok": False,
             "loaded": False,
+            "module": "trade_registry",
             "import_error": TRADE_REGISTRY_IMPORT_ERROR,
             "open_count": 0,
             "closed_count": 0,
@@ -932,20 +933,78 @@ def central_trade_registry_snapshot(include_trades=True):
         }
 
     try:
-        payload = central_trade_registry.get_trade_registry_snapshot()
-        if not isinstance(payload, dict):
-            payload = {"ok": False, "error": "INVALID_TRADE_REGISTRY_PAYLOAD", "raw": str(payload)}
+        registry = central_trade_registry.load_registry()
 
-        payload["loaded"] = True
-        payload["import_error"] = None
-        payload["module"] = "trade_registry"
-        payload["trade_registry_file"] = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", ""))
-        payload["data_dir"] = str(getattr(central_trade_registry, "DATA_DIR", ""))
+        open_raw = registry.get("open_trades", {})
+        closed_raw = registry.get("closed_trades", [])
 
-        if not include_trades:
-            payload.pop("open_trades", None)
+        if isinstance(open_raw, dict):
+            open_trades = list(open_raw.values())
+        elif isinstance(open_raw, list):
+            open_trades = open_raw
+        else:
+            open_trades = []
+
+        if isinstance(closed_raw, dict):
+            closed_trades = list(closed_raw.values())
+        elif isinstance(closed_raw, list):
+            closed_trades = closed_raw
+        else:
+            closed_trades = []
+
+        open_trades = [t for t in open_trades if isinstance(t, dict)]
+        closed_trades = [t for t in closed_trades if isinstance(t, dict)]
+
+        by_bot = {}
+        by_symbol = {}
+        by_side = {}
+
+        for trade in open_trades:
+            bot = normalize_registry_bot(trade.get("bot") or "UNKNOWN")
+            symbol = normalize_registry_symbol(
+                trade.get("symbol_clean")
+                or trade.get("symbol")
+                or trade.get("ativo")
+                or trade.get("pair")
+                or "UNKNOWN"
+            )
+            side = str(
+                trade.get("side")
+                or trade.get("direction")
+                or "UNKNOWN"
+            ).upper().strip()
+
+            if side == "BUY":
+                side = "LONG"
+            elif side == "SELL":
+                side = "SHORT"
+
+            by_bot[bot] = by_bot.get(bot, 0) + 1
+            by_symbol[symbol] = by_symbol.get(symbol, 0) + 1
+            by_side[side] = by_side.get(side, 0) + 1
+
+        payload = {
+            "ok": True,
+            "loaded": True,
+            "module": "trade_registry",
+            "import_error": None,
+            "version": registry.get("version"),
+            "updated_at": registry.get("updated_at"),
+            "open_count": len(open_trades),
+            "closed_count": len(closed_trades),
+            "by_bot": by_bot,
+            "by_symbol": by_symbol,
+            "by_side": by_side,
+            "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
+            "data_dir": str(getattr(central_trade_registry, "DATA_DIR", "")),
+        }
+
+        if include_trades:
+            payload["open_trades"] = open_trades
+            payload["closed_trades"] = closed_trades
 
         return payload
+
     except Exception as exc:
         return {
             "ok": False,
@@ -958,6 +1017,8 @@ def central_trade_registry_snapshot(include_trades=True):
             "by_bot": {},
             "by_symbol": {},
             "by_side": {},
+            "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
+            "data_dir": str(getattr(central_trade_registry, "DATA_DIR", "")),
         }
 
 
