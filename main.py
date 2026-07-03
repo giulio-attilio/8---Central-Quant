@@ -3792,6 +3792,28 @@ def timeline_items(limit=100):
     return _read_jsonl_tail(CENTRAL_TIMELINE_LOG_FILE, limit=limit)
 
 
+def clean_decision_trade_id(value):
+    if isinstance(value, dict):
+        value = (
+            value.get("trade_id")
+            or value.get("ALLOWED")
+            or value.get("DENIED")
+            or value.get("id")
+            or str(value)
+        )
+
+    text = str(value or "")
+
+    if text.startswith("{'ALLOWED':") or text.startswith('{"ALLOWED":'):
+        text = text.replace("{'ALLOWED':", "").replace('{"ALLOWED":', "")
+    if text.startswith("{'DENIED':") or text.startswith('{"DENIED":'):
+        text = text.replace("{'DENIED':", "").replace('{"DENIED":', "")
+
+    text = text.strip().strip("{}").strip("'").strip('"')
+
+    return text
+
+
 def normalize_decision_log_row(r):
     r = r or {}
 
@@ -3882,7 +3904,7 @@ def normalize_decision_log_row(r):
         "side": str(side or "UNKNOWN").upper(),
         "score": r.get("score") or raw.get("score"),
         "risk_pct": r.get("risk_pct") or raw.get("risk_pct"),
-        "trade_id": str(trade_id),
+        "trade_id": clean_decision_trade_id(trade_id),
         "reasons": unique_list(reasons if isinstance(reasons, list) else [reasons]),
         "warnings": unique_list(warnings if isinstance(warnings, list) else [warnings]),
         "bingx_divergence": bingx_divergence if isinstance(bingx_divergence, dict) else {},
