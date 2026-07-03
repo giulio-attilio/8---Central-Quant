@@ -1072,6 +1072,269 @@ def trade_registry_route():
     return central_trade_registry_snapshot(include_trades=full)
 
 
+def _trade_registry_sync_symbol(symbol):
+    s = str(symbol or "").upper().strip()
+    s = s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "")
+    return s
+
+
+def _trade_registry_sync_side(position):
+    side = str(
+        position.get("side")
+        or position.get("signal")
+        or position.get("direction")
+        or ""
+    ).upper().strip()
+    if side == "BUY":
+        return "LONG"
+    if side == "SELL":
+        return "SHORT"
+    return side
+
+
+def _trade_registry_sync_setup(bot_key, position):
+    setup = (
+        position.get("setup")
+        or position.get("signal_type")
+        or position.get("setup_label")
+        or position.get("origin")
+        or position.get("origem")
+        or bot_key
+    )
+    return str(setup or bot_key).upper().strip()
+
+
+def _trade_registry_sync_entry(position):
+    return (
+        position.get("entry")
+        or position.get("entrada")
+        or position.get("entry_price")
+        or position.get("price")
+    )
+
+
+def _trade_registry_sync_sl(position):
+    return (
+        position.get("sl")
+        or position.get("stop")
+        or position.get("initial_stop")
+        or position.get("stop_atual")
+        or position.get("current_stop")
+    )
+
+
+def _trade_registry_sync_qty(position):
+    return (
+        position.get("qty")
+        or position.get("amount")
+        or position.get("quantity")
+        or position.get("position_size")
+    )
+
+
+def _trade_registry_existing_trade_ids():
+    ids = set()
+    if central_trade_registry is None:
+        return ids
+
+    try:
+        registry = central_trade_registry.load_registry()
+    except Exception:
+        registry = None
+
+    try:
+        if isinstance(registry, dict):
+            for section in ["open_trades", "closed_trades"]:
+                values = registry.get(section, {})
+                if isinstance(values, dict):
+                    iterable = values.values()
+                elif isinstance(values, list):
+                    iterable = values
+                else:
+                    iterable = []
+                for item in iterable:
+                    if isinstance(item, dict) and item.get("trade_id"):
+                        ids.add(str(item.get("trade_id")))
+                    elif isinstance(item, str):
+                        ids.add(item)
+    except Exception:
+        pass
+
+    try:
+        snapshot = central_trade_registry.get_trade_registry_snapshot()
+        if isinstance(snapshot, dict):
+            for section in ["open_trades", "closed_trades"]:
+                values = snapshot.get(section, [])
+                if isinstance(values, dict):
+                    iterable = values.values()
+                elif isinstance(values, list):
+                    iterable = values
+                else:
+                    iterable = []
+                for item in iterable:
+                    if isinstance(item, dict) and item.get("trade_id"):
+                        ids.add(str(item.get("trade_id")))
+    except Exception:
+        pass
+
+    return ids
+
+
+def _trade_registry_sync_candidate(bot_key, position):
+    symbol = _trade_registry_sync_symbol(
+        position.get("symbol") or position.get("ativo") or position.get("pair")
+    )
+    side = _trade_registry_sync_side(position)
+    setup = _trade_registry_sync_setup(bot_key, position)
+    entry = _trade_registry_sync_entry(position)
+
+    if not symbol or side not in {"LONG", "SHORT"} or entry is None:
+        return None
+
+    try:
+        trade_id = central_trade_registry.make_trade_id(bot_key, symbol, side, setup)
+    except Exception:
+        trade_id = f"{bot_key}:{symbol}:{side}:{setup}"
+
+    return {
+        "trade_id": trade_id,
+        "bot": bot_key,
+        "symbol": symbol,
+        "side": side,
+        "setup": setup,
+        "entry": entry,
+        "sl": _trade_registry_sync_sl(position),
+        "tp50": position.get("tp50"),
+        "qty": _trade_registry_sync_qty(position),
+        "source": "main_traderegistry_sync",
+        "metadata": {
+            "synced_from": "central_open_positions",
+            "synced_at": data_hora_sp_str(),
+            "original_symbol": position.get("symbol") or position.get("ativo") or position.get("pair"),
+            "position_id": position.get("id") or position.get("position_id"),
+            "status": position.get("status", "OPEN"),
+            "created_at": position.get("created_at") or position.get("opened_at") or position.get("datetime"),
+            "risk_pct": position.get("risk_pct"),
+            "score": position.get("score") or position.get("score_turtle") or position.get("score_falcon") or position.get("signal_score") or position.get("meme_score"),
+            "quality": position.get("quality") or position.get("qualidade"),
+            "runner_r": _position_runner_r(position),
+            "runner_pct": _position_runner_pct(position),
+            "mfe_pct": position.get("mfe_pct"),
+            "mae_pct": position.get("mae_pct"),
+            "mfe_r": position.get("mfe_r"),
+            "mae_r": position.get("mae_r"),
+        },
+    }
+
+
+def sync_trade_registry_from_open_positions(commit=False):
+    if central_trade_registry is None:
+        return {
+            "ok": False,
+            "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry import failed",
+            "commit": bool(commit),
+        }
+
+    existing_ids = _trade_registry_existing_trade_ids()
+    imported = []
+    skipped = []
+    errors = []
+    candidates = []
+
+    for bot_key, module in LOADED_BOTS.items():
+        positions = get_open_positions_from_module(module, key=bot_key)
+        for position in positions:
+            candidate = _trade_registry_sync_candidate(bot_key, position)
+            if not candidate:
+                skipped.append({
+                    "bot": bot_key,
+                    "reason": "INVALID_POSITION_FIELDS",
+                    "symbol": position.get("symbol") or position.get("ativo") or position.get("pair"),
+                    "side": position.get("side") or position.get("direction") or position.get("signal"),
+                })
+                continue
+
+            candidates.append(candidate)
+            trade_id = str(candidate.get("trade_id"))
+            if trade_id in existing_ids:
+                skipped.append({
+                    "bot": bot_key,
+                    "trade_id": trade_id,
+                    "symbol": candidate.get("symbol"),
+                    "side": candidate.get("side"),
+                    "setup": candidate.get("setup"),
+                    "reason": "ALREADY_EXISTS",
+                })
+                continue
+
+            if not commit:
+                continue
+
+            try:
+                result = central_trade_registry.register_open_trade(
+                    bot=candidate.get("bot"),
+                    symbol=candidate.get("symbol"),
+                    side=candidate.get("side"),
+                    entry=candidate.get("entry"),
+                    sl=candidate.get("sl"),
+                    tp50=candidate.get("tp50"),
+                    setup=candidate.get("setup"),
+                    qty=candidate.get("qty"),
+                    source=candidate.get("source"),
+                    metadata=candidate.get("metadata"),
+                )
+                if isinstance(result, dict) and result.get("ok"):
+                    imported.append({
+                        "trade_id": result.get("trade_id") or trade_id,
+                        "bot": candidate.get("bot"),
+                        "symbol": candidate.get("symbol"),
+                        "side": candidate.get("side"),
+                        "setup": candidate.get("setup"),
+                    })
+                    existing_ids.add(str(result.get("trade_id") or trade_id))
+                else:
+                    errors.append({
+                        "trade_id": trade_id,
+                        "bot": candidate.get("bot"),
+                        "symbol": candidate.get("symbol"),
+                        "error": result if isinstance(result, dict) else str(result),
+                    })
+            except Exception as exc:
+                errors.append({
+                    "trade_id": trade_id,
+                    "bot": candidate.get("bot"),
+                    "symbol": candidate.get("symbol"),
+                    "error": str(exc),
+                })
+
+    return {
+        "ok": len(errors) == 0,
+        "commit": bool(commit),
+        "updated_at": data_hora_sp_str(),
+        "loaded_bots": list(LOADED_BOTS.keys()),
+        "candidates_count": len(candidates),
+        "imported_count": len(imported),
+        "skipped_count": len(skipped),
+        "errors_count": len(errors),
+        "imported": imported,
+        "skipped": skipped[:200],
+        "errors": errors,
+        "after": central_trade_registry_snapshot(include_trades=False) if commit else None,
+        "note": "GET faz prévia/dry-run. Para importar, use POST com confirm=true ou confirm=SYNC.",
+    }
+
+
+@app.route("/traderegistry/sync", methods=["GET", "POST"])
+@app.route("/trade_registry/sync", methods=["GET", "POST"])
+@app.route("/trades/sync", methods=["GET", "POST"])
+def trade_registry_sync_route():
+    payload = request.get_json(silent=True) or {}
+    confirm_raw = payload.get("confirm", request.args.get("confirm", ""))
+    confirm = bool(confirm_raw is True or str(confirm_raw).strip().upper() in {"1", "TRUE", "YES", "SIM", "ON", "SYNC"})
+    commit = request.method == "POST" and confirm
+    return sync_trade_registry_from_open_positions(commit=commit)
+
+
 @app.route("/traderegistry/reset", methods=["POST"])
 def trade_registry_reset_route():
     if central_trade_registry is None:
