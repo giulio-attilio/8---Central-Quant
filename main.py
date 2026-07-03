@@ -1681,8 +1681,7 @@ def sync_trade_registry_from_open_positions(commit=False):
         positions = get_open_positions_from_module(module, key=bot_key)
         for position in positions:
             candidate = _trade_registry_sync_candidate(bot_key, position)
-            candidate_signature = _trade_registry_signature_from_items([candidate])
-            candidate_key = next(iter(candidate_signature), None)
+            
             if not candidate:
                 skipped.append({
                     "bot": bot_key,
@@ -1692,6 +1691,8 @@ def sync_trade_registry_from_open_positions(commit=False):
                 })
                 continue
 
+            candidate_signature = _trade_registry_signature_from_items([candidate])
+            candidate_key = next(iter(candidate_signature), None)
             candidates.append(candidate)
             trade_id = str(candidate.get("trade_id"))
             if trade_id in existing_ids or candidate_key in existing_signature:
