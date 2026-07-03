@@ -1572,6 +1572,12 @@ def trade_registry_reset_route():
     return result, status
 
 
+@app.route("/traderegistry/health")
+@app.route("/trade_registry/health")
+@app.route("/trades/health")
+def trade_registry_health_route():
+    return central_trade_registry_snapshot(include_trades=False)
+
 @app.route("/health")
 def health():
     payload = central_watchdog_status()
