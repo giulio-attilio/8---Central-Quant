@@ -17,6 +17,14 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
+try:
+    import trade_registry as central_trade_registry
+except Exception as _trade_registry_import_exc:
+    central_trade_registry = None
+    TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_import_exc)
+else:
+    TRADE_REGISTRY_IMPORT_ERROR = None
+
 app = Flask(__name__)
 
 # ====================================================
@@ -1096,6 +1104,141 @@ def enviar_fechamento(p, price, reason, pnl):
         f"Devolução:\n{fmt_pct(p.get('mfe_gave_back_pct', 0))}"
     )
 
+
+# ====================================================
+# TRADE REGISTRY — CENTRAL QUANT
+# ====================================================
+
+def cobra_registry_loaded():
+    return central_trade_registry is not None
+
+
+def cobra_trade_registry_id(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    existing = payload.get("trade_registry_id") or payload.get("trade_id")
+    if existing:
+        return existing
+    symbol = payload.get("symbol_clean") or nome_limpo(payload.get("symbol", ""))
+    side = payload.get("side") or payload.get("signal")
+    setup = payload.get("signal_type") or payload.get("setup") or "COBRA"
+    try:
+        return central_trade_registry.make_trade_id("COBRA", symbol, side, setup)
+    except Exception:
+        return f"COBRA:{setup}:{symbol}:{side}"
+
+
+def cobra_register_open_trade(signal, position):
+    """Registra entrada Cobra no Trade Registry sem quebrar o robô em caso de falha."""
+    if central_trade_registry is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry indisponível"}
+
+    signal = signal if isinstance(signal, dict) else {}
+    position = position if isinstance(position, dict) else {}
+
+    try:
+        result = central_trade_registry.register_open_trade(
+            bot="COBRA",
+            symbol=position.get("symbol_clean") or signal.get("symbol_clean") or nome_limpo(position.get("symbol") or signal.get("symbol") or ""),
+            side=position.get("side") or signal.get("side") or signal.get("signal"),
+            entry=position.get("entry") or signal.get("entry"),
+            sl=position.get("sl") or signal.get("sl"),
+            tp50=position.get("tp50") or signal.get("tp50"),
+            setup=position.get("signal_type") or signal.get("signal_type") or "COBRA",
+            qty=position.get("qty") or signal.get("qty"),
+            source="cobra",
+            metadata={
+                "risk_pct": position.get("risk_pct") or signal.get("risk_pct"),
+                "score": position.get("score") or signal.get("score"),
+                "quality": position.get("qualidade") or signal.get("qualidade"),
+                "h4_state": position.get("h4_state") or signal.get("h4_state"),
+                "h4_context": position.get("h4_context") or signal.get("h4_context"),
+                "min_score_required": position.get("min_score_required") or signal.get("min_score_required"),
+                "execution_decision": position.get("execution_decision") or signal.get("risk_precheck_decision"),
+                "execution_allowed": position.get("execution_allowed") if position.get("execution_allowed") is not None else signal.get("risk_precheck_allowed"),
+                "execution_source": position.get("execution_source") or signal.get("risk_precheck_source"),
+                "created_at_epoch": position.get("created_at") or signal.get("created_at"),
+                "timeframe": TIMEFRAME_H1,
+            },
+        )
+        return result if isinstance(result, dict) else {"ok": False, "error": "registry retornou payload inválido"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def cobra_update_trade_registry(position, event, extra=None):
+    """Atualiza eventos de gestão no Trade Registry sem quebrar o management loop."""
+    if central_trade_registry is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry indisponível"}
+
+    position = position if isinstance(position, dict) else {}
+    extra = extra if isinstance(extra, dict) else {}
+    trade_id = cobra_trade_registry_id(position)
+
+    updates = {
+        "last_event": event,
+        "status": position.get("status"),
+        "sl": position.get("sl"),
+        "tp50": position.get("tp50"),
+        "tp50_hit": position.get("tp50_hit"),
+        "breakeven": position.get("breakeven"),
+        "trailing_active": position.get("trailing_active"),
+        "mfe_max_pct": position.get("mfe_max_pct"),
+        "mae_max_pct": position.get("mae_max_pct"),
+        "mfe_max_r": position.get("mfe_max_r"),
+        "mae_max_r": position.get("mae_max_r"),
+        "mfe_gave_back_pct": position.get("mfe_gave_back_pct"),
+        "mfe_gave_back_r": position.get("mfe_gave_back_r"),
+    }
+    updates.update(extra)
+
+    try:
+        return central_trade_registry.update_trade(trade_id, **updates)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "trade_id": trade_id}
+
+
+def cobra_close_trade_registry(position, exit_price, reason, pnl_value=None):
+    """Fecha trade Cobra no Trade Registry quando close_position() for acionado."""
+    if central_trade_registry is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry indisponível"}
+
+    position = position if isinstance(position, dict) else {}
+    trade_id = cobra_trade_registry_id(position)
+
+    try:
+        result_r = None
+        try:
+            result_r = pnl_r(
+                position.get("side"),
+                float(position.get("entry")),
+                float(position.get("initial_sl", position.get("sl"))),
+                float(exit_price),
+            )
+        except Exception:
+            result_r = None
+
+        return central_trade_registry.close_trade(
+            trade_id,
+            exit_price=exit_price,
+            pnl_pct=pnl_value,
+            pnl_r=result_r,
+            reason=reason,
+            metadata={
+                "result_type": position.get("result_type"),
+                "tp50_hit": position.get("tp50_hit"),
+                "mfe_max_pct": position.get("mfe_max_pct"),
+                "mae_max_pct": position.get("mae_max_pct"),
+                "mfe_gave_back_pct": position.get("mfe_gave_back_pct"),
+                "mfe_max_r": position.get("mfe_max_r"),
+                "mae_max_r": position.get("mae_max_r"),
+                "mfe_gave_back_r": position.get("mfe_gave_back_r"),
+                "score": position.get("score"),
+                "closed_at_epoch": position.get("closed_at"),
+            },
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "trade_id": trade_id}
+
 # ====================================================
 # REGISTRO E GESTAO
 # ====================================================
@@ -1145,6 +1288,14 @@ def registrar_posicao(s):
         "execution_warnings": s.get("risk_precheck_warnings"),
         "execution_source": s.get("risk_precheck_source"),
     }
+    registry_result = cobra_register_open_trade(s, p)
+    if isinstance(registry_result, dict) and registry_result.get("ok"):
+        p["trade_registry_id"] = registry_result.get("trade_id")
+        p["trade_registry_registered"] = True
+    else:
+        p["trade_registry_registered"] = False
+        p["trade_registry_error"] = (registry_result or {}).get("error") if isinstance(registry_result, dict) else str(registry_result)
+
     posicoes[s["symbol"]] = p
     salvar_posicoes(posicoes)
 
@@ -1171,6 +1322,9 @@ def registrar_posicao(s):
         "execution_reasons": s.get("risk_precheck_reasons"),
         "execution_warnings": s.get("risk_precheck_warnings"),
         "execution_source": s.get("risk_precheck_source"),
+        "trade_registry_id": p.get("trade_registry_id"),
+        "trade_registry_registered": p.get("trade_registry_registered"),
+        "trade_registry_error": p.get("trade_registry_error"),
     })
     return True
 
@@ -1256,6 +1410,10 @@ def fechar_posicao(symbol, p, price, reason):
         "score": int(p.get("score", 0)),
     })
 
+    registry_close_result = cobra_close_trade_registry(p, price, reason, pnl)
+    if isinstance(registry_close_result, dict) and not registry_close_result.get("ok"):
+        print("AVISO TRADE REGISTRY CLOSE COBRA:", registry_close_result)
+
     enviar_fechamento(p, price, reason, pnl)
 
 def gerenciar_posicoes():
@@ -1302,6 +1460,7 @@ def gerenciar_posicoes():
                         "signal_type": p.get("signal_type"),
                         "price": price,
                     })
+                    cobra_update_trade_registry(p, "TP50", {"price": price})
                     enviar_tp50(p, price)
                     alterou = True
 
@@ -1326,6 +1485,7 @@ def gerenciar_posicoes():
                     "signal_type": p.get("signal_type"),
                     "new_sl": p["sl"],
                 })
+                cobra_update_trade_registry(p, "BREAKEVEN", {"new_sl": p["sl"], "r_atual": r_atual})
                 enviar_be(p, p["sl"])
                 alterou = True
 
@@ -1346,6 +1506,7 @@ def gerenciar_posicoes():
                             "signal_type": p.get("signal_type"),
                             "new_sl": p["sl"],
                         })
+                        cobra_update_trade_registry(p, "TRAILING", {"new_sl": p["sl"], "r_atual": r_atual})
                         enviar_trailing(p, p["sl"])
                         alterou = True
                     if side == "SHORT" and new_trail < float(p["sl"]):
@@ -1362,6 +1523,7 @@ def gerenciar_posicoes():
                             "signal_type": p.get("signal_type"),
                             "new_sl": p["sl"],
                         })
+                        cobra_update_trade_registry(p, "TRAILING", {"new_sl": p["sl"], "r_atual": r_atual})
                         enviar_trailing(p, p["sl"])
                         alterou = True
 
