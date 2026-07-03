@@ -507,6 +507,166 @@ HEALTH = {
 
 
 # ====================================================
+# CENTRAL QUANT — RISK MANAGER OBRIGATÓRIO
+# ====================================================
+# Regra de arquitetura:
+# Nenhuma entrada nova do Meme Hunter deve ser registrada antes de consultar
+# a Central em /can_open_trade. Em caso de erro na consulta, o padrão é
+# fail-closed: bloqueia a entrada e registra o bloqueio localmente.
+CENTRAL_BASE_URL = (
+    os.environ.get("CENTRAL_BASE_URL")
+    or os.environ.get("CENTRAL_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or "https://central-robos-bingx.onrender.com"
+).rstrip("/")
+
+CENTRAL_RISK_TIMEOUT_SECONDS = float(os.environ.get("MEME_CENTRAL_RISK_TIMEOUT_SECONDS", "10"))
+
+
+def normalizar_decisao_risco(data):
+    if not isinstance(data, dict):
+        data = {}
+
+    raw_allowed = data.get("allowed", data.get("allow", data.get("ok", False)))
+    if isinstance(raw_allowed, str):
+        allowed = raw_allowed.strip().upper() in {"1", "TRUE", "YES", "SIM", "ALLOW", "ALLOWED"}
+    else:
+        allowed = bool(raw_allowed)
+
+    decision = str(
+        data.get("decision")
+        or data.get("status")
+        or ("ALLOW" if allowed else "DENY")
+    ).upper()
+
+    if decision in {"OK", "TRUE", "ALLOWED"}:
+        decision = "ALLOW"
+    if decision in {"BLOCK", "BLOCKED", "FALSE", "NOT_ALLOWED"}:
+        decision = "DENY"
+
+    if decision != "ALLOW":
+        allowed = False
+
+    return {
+        "allowed": allowed,
+        "decision": decision,
+        "reason": data.get("reason") or data.get("motivo") or data.get("message") or "",
+        "raw": data,
+        "checked_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+        "checked_ts": time.time(),
+    }
+
+
+def consultar_central_risk_manager(s):
+    symbol = s.get("symbol")
+    side = s.get("side") or s.get("signal")
+    setup = s.get("signal_type", "MEME")
+
+    payload = {
+        "bot": "MEME",
+        "robot": "MEME",
+        "strategy": "MEME",
+        "setup": setup,
+        "symbol": symbol,
+        "symbol_clean": s.get("symbol_clean", nome_limpo(symbol) if symbol else None),
+        "side": side,
+        "entry": s.get("entry"),
+        "sl": s.get("sl"),
+        "tp50": s.get("tp50"),
+        "risk_pct": s.get("risk_pct"),
+        "score": s.get("meme_score", s.get("signal_score")),
+        "source": "meme.py",
+    }
+
+    try:
+        resp = requests.post(
+            f"{CENTRAL_BASE_URL}/can_open_trade",
+            json=payload,
+            timeout=CENTRAL_RISK_TIMEOUT_SECONDS,
+        )
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = {
+                "allowed": False,
+                "decision": "DENY",
+                "reason": f"Resposta não JSON do Risk Manager: HTTP {resp.status_code}",
+                "body": resp.text[:300],
+            }
+
+        risk = normalizar_decisao_risco(data)
+        risk["http_status"] = resp.status_code
+        return risk
+
+    except Exception as exc:
+        return {
+            "allowed": False,
+            "decision": "ERROR",
+            "reason": f"Erro ao consultar Risk Manager: {exc}",
+            "raw": {},
+            "http_status": None,
+            "checked_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+            "checked_ts": time.time(),
+        }
+
+
+def anexar_precheck_risco(s, risk):
+    s["risk_precheck_allowed"] = bool(risk.get("allowed"))
+    s["risk_precheck_decision"] = risk.get("decision")
+    s["risk_precheck_reason"] = risk.get("reason")
+    s["risk_precheck_at"] = risk.get("checked_at")
+    s["risk_precheck_ts"] = risk.get("checked_ts")
+    s["risk_precheck_http_status"] = risk.get("http_status")
+    return s
+
+
+def registrar_bloqueio_central_risk(s, risk):
+    try:
+        registrar_evento_trade({
+            "event": "BLOCK",
+            "date": data_hoje_sp_str(),
+            "datetime": data_hora_sp_str(),
+            "bot": "MEME",
+            "symbol": s.get("symbol"),
+            "symbol_clean": s.get("symbol_clean", nome_limpo(s.get("symbol", ""))),
+            "side": s.get("side") or s.get("signal"),
+            "signal_type": s.get("signal_type", "MEME"),
+            "entry": s.get("entry"),
+            "sl": s.get("sl"),
+            "tp50": s.get("tp50"),
+            "risk_pct": s.get("risk_pct"),
+            "decision": risk.get("decision", "DENY"),
+            "allowed": bool(risk.get("allowed", False)),
+            "reason": risk.get("reason", ""),
+            "risk_precheck_allowed": bool(risk.get("allowed", False)),
+            "risk_precheck_decision": risk.get("decision", "DENY"),
+            "risk_precheck_reason": risk.get("reason", ""),
+            "risk_precheck_at": risk.get("checked_at"),
+            "risk_precheck_ts": risk.get("checked_ts"),
+        })
+    except Exception as exc:
+        print("ERRO AO REGISTRAR BLOQUEIO CENTRAL RISK MEME:", exc)
+
+
+def central_risk_allows_entry(s):
+    risk = consultar_central_risk_manager(s)
+    anexar_precheck_risco(s, risk)
+
+    if bool(risk.get("allowed")) and str(risk.get("decision", "")).upper() == "ALLOW":
+        return True
+
+    registrar_bloqueio_central_risk(s, risk)
+    print(
+        "MEME BLOQUEADO PELO RISK MANAGER CENTRAL: "
+        f"{s.get('symbol_clean', s.get('symbol'))} "
+        f"{s.get('side', s.get('signal'))} | "
+        f"{risk.get('decision')} | {risk.get('reason')}"
+    )
+    return False
+
+
+# ====================================================
 # UTILITÁRIOS
 # ====================================================
 
@@ -2665,6 +2825,11 @@ def registrar_posicao(s):
         )
         return False
 
+    # Risk Manager Central obrigatório antes de registrar qualquer entrada.
+    # Fail-closed: se a Central negar ou a consulta falhar, não abre posição.
+    if not central_risk_allows_entry(s):
+        return False
+
     posicoes[symbol] = {
         "symbol": symbol,
         "symbol_clean": s["symbol_clean"],
@@ -2698,7 +2863,17 @@ def registrar_posicao(s):
         "mfe_max_r": 0.0,
         "mae_max_r": 0.0,
         "mfe_gave_back_pct": 0.0,
-        "mfe_gave_back_r": 0.0
+        "mfe_gave_back_r": 0.0,
+        "execution_decision": s.get("risk_precheck_decision"),
+        "execution_allowed": s.get("risk_precheck_allowed"),
+        "execution_checked_at": s.get("risk_precheck_at"),
+        "execution_checked_ts": s.get("risk_precheck_ts"),
+        "execution_risk_reason": s.get("risk_precheck_reason"),
+        "risk_precheck_decision": s.get("risk_precheck_decision"),
+        "risk_precheck_allowed": s.get("risk_precheck_allowed"),
+        "risk_precheck_at": s.get("risk_precheck_at"),
+        "risk_precheck_ts": s.get("risk_precheck_ts"),
+        "risk_precheck_reason": s.get("risk_precheck_reason")
     }
 
     salvar_posicoes(posicoes)
@@ -2720,7 +2895,17 @@ def registrar_posicao(s):
         "qualidade_pontos": s.get("qualidade_pontos"),
         "signal_type": s.get("signal_type", "NORMAL"),
         "signal_score": s.get("signal_score", calcular_signal_score(s)),
-        "elite_candidate": bool(s.get("elite_candidate", s.get("signal_score", calcular_signal_score(s)) >= ELITE_THRESHOLD))
+        "elite_candidate": bool(s.get("elite_candidate", s.get("signal_score", calcular_signal_score(s)) >= ELITE_THRESHOLD)),
+        "execution_allowed": s.get("risk_precheck_allowed"),
+        "execution_decision": s.get("risk_precheck_decision"),
+        "execution_checked_at": s.get("risk_precheck_at"),
+        "execution_checked_ts": s.get("risk_precheck_ts"),
+        "execution_risk_reason": s.get("risk_precheck_reason"),
+        "risk_precheck_allowed": s.get("risk_precheck_allowed"),
+        "risk_precheck_decision": s.get("risk_precheck_decision"),
+        "risk_precheck_at": s.get("risk_precheck_at"),
+        "risk_precheck_ts": s.get("risk_precheck_ts"),
+        "risk_precheck_reason": s.get("risk_precheck_reason")
     })
 
     return True
