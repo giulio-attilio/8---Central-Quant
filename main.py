@@ -7027,7 +7027,81 @@ def analytics_setups_ranking_route():
             "error": str(e),
         }
 
-        
+
+@app.route("/analytics/portfolio")
+def analytics_portfolio_route():
+    try:
+        import analytics_engine
+
+        payload = analytics_engine.portfolio_advisor()
+        p = payload.get("portfolio", {})
+
+        lines = [
+            "🧭 PORTFOLIO ADVISOR — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            "",
+            "Núcleo principal:",
+        ]
+
+        core = p.get("core_bots", [])
+        if core:
+            for item in core:
+                lines.append(
+                    f"- {item.get('name')} | Score {item.get('score')} | "
+                    f"Confiança {item.get('confidence')} | PnL {item.get('pnl_total_pct')}%"
+                )
+        else:
+            lines.append("- Nenhum robô ainda atingiu critérios de núcleo principal.")
+
+        lines += ["", "Amostra insuficiente:"]
+        for item in p.get("insufficient_sample_bots", []):
+            lines.append(
+                f"- {item.get('name')} | Score {item.get('score')} | "
+                f"Trades {item.get('trades')} | Recomendação {item.get('recommendation')}"
+            )
+
+        lines += ["", "Reduzir / atenção:"]
+        reduce_items = p.get("reduce_bots", [])
+        if reduce_items:
+            for item in reduce_items:
+                lines.append(
+                    f"- {item.get('name')} | Score {item.get('score')} | "
+                    f"PnL {item.get('pnl_total_pct')}%"
+                )
+        else:
+            lines.append("- Nenhum robô em redução prioritária.")
+
+        lines += ["", "Setups principais:"]
+        for item in p.get("core_setups", []):
+            lines.append(
+                f"- {item.get('name')} | Score {item.get('score')} | "
+                f"PnL {item.get('pnl_total_pct')}%"
+            )
+
+        lines += ["", "Alertas:"]
+        alerts = p.get("alerts", [])
+        if alerts:
+            for alert in alerts:
+                lines.append(
+                    f"- {alert.get('name')}: {alert.get('type')} "
+                    f"({alert.get('giveback_avg_pct')}%)"
+                )
+        else:
+            lines.append("- Nenhum alerta relevante.")
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }        
+
+
 @app.route("/analytics/symbols")
 def analytics_symbols_route():
     return _analytics_group_response("symbol", "symbol", "symbols")
