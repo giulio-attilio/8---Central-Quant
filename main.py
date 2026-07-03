@@ -6906,6 +6906,46 @@ def analytics_bots_route():
     return _analytics_group_response("bot", "bot", "bots")
 
 
+@app.route("/analytics/ranking")
+def analytics_ranking_route():
+    try:
+        import analytics_engine
+
+        payload = analytics_engine.bot_ranking()
+
+        lines = [
+            "🧠 ANALYTICS RANKING — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            "",
+            "Ranking inteligente por robô:",
+        ]
+
+        for i, bot in enumerate(payload.get("bots", []), start=1):
+            lines += [
+                "",
+                f"{i}. {bot.get('bot')}",
+                f"Score: {bot.get('score')}/100",
+                f"Recomendação: {bot.get('recommendation')}",
+                f"Trades: {bot.get('trades')}",
+                f"Win rate: {bot.get('win_rate_pct')}%",
+                f"PnL total: {bot.get('pnl_total_pct')}%",
+                f"PnL médio: {bot.get('pnl_avg_pct')}%",
+                f"TP50 hit rate: {bot.get('tp50_hit_rate_pct')}%",
+            ]
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+        
 @app.route("/analytics/symbols")
 def analytics_symbols_route():
     return _analytics_group_response("symbol", "symbol", "symbols")
