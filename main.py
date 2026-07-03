@@ -958,18 +958,44 @@ def get_open_positions_central():
     Prioridade: Trade Registry.
     Fallback: posições lidas diretamente dos robôs.
     """
-    snap = central_trade_registry_snapshot(include_trades=True)
+    # 1) Fonte oficial: Trade Registry direto
+    try:
+        if central_trade_registry is not None:
+            registry = central_trade_registry.load_registry()
+            open_trades = registry.get("open_trades", {})
 
-    if snap.get("ok") and snap.get("loaded"):
+            if isinstance(open_trades, dict):
+                trades = list(open_trades.values())
+            elif isinstance(open_trades, list):
+                trades = open_trades
+            else:
+                trades = []
+
+            trades = [t for t in trades if isinstance(t, dict)]
+
+            if trades:
+                return trades
+    except Exception:
+        pass
+
+    # 2) Fallback: snapshot central
+    try:
+        snap = central_trade_registry_snapshot(include_trades=True)
         trades = snap.get("open_trades", [])
+
         if isinstance(trades, dict):
             trades = list(trades.values())
         elif not isinstance(trades, list):
             trades = []
 
-        return [t for t in trades if isinstance(t, dict)]
+        trades = [t for t in trades if isinstance(t, dict)]
 
-    # Fallback seguro caso o registry falhe
+        if trades:
+            return trades
+    except Exception:
+        pass
+
+    # 3) Fallback final: posições lidas dos robôs
     positions = []
     for key, module in LOADED_BOTS.items():
         for p in get_open_positions_from_module(module, key=key):
