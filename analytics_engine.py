@@ -3,7 +3,7 @@
 # ANALYTICS ENGINE
 #
 # Versão:
-# 2026-07-03-ANALYTICS-V2
+# 2026-07-03-ANALYTICS-V3
 # ==========================================================
 
 import history_manager
@@ -141,18 +141,89 @@ def recommendation(score, stats):
     return "OBSERVAR"
 
 
+def diagnose_stats(stats):
+    trades = int(stats.get("trades", 0) or 0)
+    wr = float(stats.get("win_rate_pct", 0) or 0)
+    pnl_total = float(stats.get("pnl_total_pct", 0) or 0)
+    pnl_avg = float(stats.get("pnl_avg_pct", 0) or 0)
+    tp50 = float(stats.get("tp50_hit_rate_pct", 0) or 0)
+    mfe = float(stats.get("mfe_avg_pct", 0) or 0)
+    mae = float(stats.get("mae_avg_pct", 0) or 0)
+    giveback = float(stats.get("giveback_avg_pct", 0) or 0)
+
+    strengths = []
+    weaknesses = []
+    notes = []
+
+    if trades >= 20:
+        strengths.append("Amostra operacional relevante")
+    elif trades < 10:
+        weaknesses.append("Amostra ainda insuficiente")
+
+    if wr >= 55:
+        strengths.append("Win rate elevado")
+    elif trades >= 10 and wr < 35:
+        weaknesses.append("Win rate baixo")
+
+    if pnl_total >= 8:
+        strengths.append("PnL acumulado forte")
+    elif pnl_total > 0:
+        strengths.append("PnL acumulado positivo")
+    elif pnl_total < -3:
+        weaknesses.append("PnL acumulado negativo")
+
+    if pnl_avg > 0:
+        strengths.append("Expectancy positiva por trade")
+    elif trades >= 10 and pnl_avg < 0:
+        weaknesses.append("Expectancy negativa por trade")
+
+    if tp50 >= 55:
+        strengths.append("Boa taxa de TP50")
+    elif trades >= 10 and tp50 < 25:
+        weaknesses.append("Baixa taxa de TP50")
+
+    if mfe >= 3:
+        strengths.append("Boa capacidade de gerar runners")
+    elif trades >= 10 and mfe < 1:
+        weaknesses.append("Baixo MFE médio")
+
+    if giveback >= 3:
+        weaknesses.append("Giveback elevado")
+    elif giveback > 0 and giveback <= 1.5:
+        strengths.append("Boa retenção de lucro")
+
+    if mae < -1.5:
+        weaknesses.append("MAE elevado contra a posição")
+
+    if not strengths:
+        notes.append("Sem pontos fortes estatísticos claros ainda")
+
+    if not weaknesses:
+        notes.append("Sem fragilidade crítica detectada na amostra atual")
+
+    return {
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "notes": notes,
+    }
+
+
 def bot_ranking():
     analytics = history_manager.build_trade_record_analytics()
     ranking = []
 
     for bot, stats in analytics.get("by_bot", {}).items():
         score = analytics_score(stats)
+        diagnosis = diagnose_stats(stats)
 
         item = {
             "bot": bot,
             "score": score,
             "confidence": confidence_label(int(stats.get("trades", 0) or 0)),
             "recommendation": recommendation(score, stats),
+            "strengths": diagnosis.get("strengths", []),
+            "weaknesses": diagnosis.get("weaknesses", []),
+            "notes": diagnosis.get("notes", []),
             **stats,
         }
 
@@ -169,7 +240,7 @@ def bot_ranking():
 
     return {
         "ok": True,
-        "version": "2026-07-03-ANALYTICS-V2",
+        "version": "2026-07-03-ANALYTICS-V3",
         "generated_at": analytics.get("generated_at"),
         "bots": ranking,
     }

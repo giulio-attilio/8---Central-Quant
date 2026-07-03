@@ -6925,13 +6925,33 @@ def analytics_ranking_route():
                 "",
                 f"{i}. {bot.get('bot')}",
                 f"Score: {bot.get('score')}/100",
+                f"Confiança: {bot.get('confidence')}",
                 f"Recomendação: {bot.get('recommendation')}",
                 f"Trades: {bot.get('trades')}",
                 f"Win rate: {bot.get('win_rate_pct')}%",
                 f"PnL total: {bot.get('pnl_total_pct')}%",
-                f"PnL médio: {bot.get('pnl_avg_pct')}%",
+                f"PnL médio: {bot.get('pnl_avg_pct')}%",    
                 f"TP50 hit rate: {bot.get('tp50_hit_rate_pct')}%",
             ]
+
+            strengths = bot.get("strengths") or []
+            weaknesses = bot.get("weaknesses") or []
+            notes = bot.get("notes") or []
+
+            if strengths:
+                lines.append("Pontos fortes:")
+                for s in strengths:
+                    lines.append(f"✅ {s}")
+
+            if weaknesses:
+                lines.append("Pontos fracos:")
+                for w in weaknesses:
+                    lines.append(f"⚠️ {w}")
+
+            if notes:
+                lines.append("Notas:")
+                for n in notes:
+                    lines.append(f"- {n}")
 
         return {
             "ok": True,
@@ -6945,7 +6965,7 @@ def analytics_ranking_route():
             "error": str(e),
         }
 
-        
+
 @app.route("/analytics/symbols")
 def analytics_symbols_route():
     return _analytics_group_response("symbol", "symbol", "symbols")
