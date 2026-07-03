@@ -6086,6 +6086,27 @@ def risk_route():
     return {"text": build_risk_report()}
 
 
+@app.route("/risk/registry")
+@app.route("/riskregistry")
+def risk_registry_route():
+    exposure = central_exposure_snapshot()
+    registry = central_trade_registry_snapshot(include_trades=False)
+
+    return {
+        "ok": True,
+        "risk_source": exposure.get("source"),
+        "registry_loaded": registry.get("loaded"),
+        "registry_ok": registry.get("ok"),
+        "positions": {
+            "total": exposure.get("total_positions_open"),
+            "long": exposure.get("long_positions_open"),
+            "short": exposure.get("short_positions_open"),
+        },
+        "by_bot": exposure.get("by_bot"),
+        "registry": registry,
+    }
+
+    
 @app.route("/heat")
 @app.route("/heatmap")
 def heat_route():
