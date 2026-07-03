@@ -763,6 +763,9 @@ def _update_runner_buckets(buckets: dict, runner_r: float):
 
 def central_exposure_snapshot():
     memory_profile_step("before_exposure_snapshot")
+
+    positions = get_open_positions_central()
+
     total = 0
     longs = 0
     shorts = 0
@@ -770,56 +773,59 @@ def central_exposure_snapshot():
     open_runner_buckets = _empty_runner_buckets()
     best_open_runner = None
 
-    for key, module in LOADED_BOTS.items():
-        memory_profile_step(f"before_exposure_bot_{key}")
-        positions = get_open_positions_from_module(module, key=key)
-        bot_longs = 0
-        bot_shorts = 0
-        bot_buckets = _empty_runner_buckets()
-        bot_best_runner = None
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
 
-        for p in positions:
-            side = str(p.get("side", p.get("direction", ""))).upper()
-            if side in {"LONG", "BUY"}:
-                longs += 1
-                bot_longs += 1
-            elif side in {"SHORT", "SELL"}:
-                shorts += 1
-                bot_shorts += 1
+        bot = str(p.get("bot") or "UNKNOWN").upper()
+        symbol = p.get("symbol_clean") or p.get("symbol") or p.get("ativo") or p.get("pair")
+        setup = p.get("setup") or p.get("signal_type") or p.get("setup_label")
+        side = str(p.get("side") or p.get("direction") or "").upper()
 
-            runner_r = _position_runner_r(p)
-            runner_pct = _position_runner_pct(p)
-            _update_runner_buckets(open_runner_buckets, runner_r)
-            _update_runner_buckets(bot_buckets, runner_r)
+        by_bot.setdefault(bot, {
+            "total": 0,
+            "long": 0,
+            "short": 0,
+            "open_runners": _empty_runner_buckets(),
+            "best_open_runner": None,
+        })
 
-            runner_payload = {
-                "bot": key,
-                "symbol": p.get("symbol") or p.get("ativo") or p.get("pair"),
-                "setup": p.get("setup") or p.get("setup_label"),
-                "side": side,
-                "runner_r": round(runner_r, 4),
-                "runner_pct": round(runner_pct, 4),
-                "entry": p.get("entry") or p.get("entrada"),
-                "stop": p.get("stop") or p.get("sl") or p.get("stop_atual"),
-                "tp50": p.get("tp50"),
-            }
+        if side in {"LONG", "BUY"}:
+            longs += 1
+            by_bot[bot]["long"] += 1
+        elif side in {"SHORT", "SELL"}:
+            shorts += 1
+            by_bot[bot]["short"] += 1
 
-            if bot_best_runner is None or runner_r > bot_best_runner.get("runner_r", 0):
-                bot_best_runner = dict(runner_payload)
-            if best_open_runner is None or runner_r > best_open_runner.get("runner_r", 0):
-                best_open_runner = dict(runner_payload)
+        runner_r = _position_runner_r(p)
+        runner_pct = _position_runner_pct(p)
 
-        total += len(positions)
-        by_bot[key] = {
-            "total": len(positions),
-            "long": bot_longs,
-            "short": bot_shorts,
-            "open_runners": bot_buckets,
-            "best_open_runner": bot_best_runner,
+        _update_runner_buckets(open_runner_buckets, runner_r)
+        _update_runner_buckets(by_bot[bot]["open_runners"], runner_r)
+
+        runner_payload = {
+            "bot": bot,
+            "symbol": symbol,
+            "setup": setup,
+            "side": side,
+            "runner_r": round(runner_r, 4),
+            "runner_pct": round(runner_pct, 4),
+            "entry": p.get("entry") or p.get("entrada"),
+            "stop": p.get("stop") or p.get("sl") or p.get("stop_atual"),
+            "tp50": p.get("tp50"),
         }
-        memory_profile_step(f"after_exposure_bot_{key}")
+
+        if by_bot[bot]["best_open_runner"] is None or runner_r > by_bot[bot]["best_open_runner"].get("runner_r", 0):
+            by_bot[bot]["best_open_runner"] = dict(runner_payload)
+
+        if best_open_runner is None or runner_r > best_open_runner.get("runner_r", 0):
+            best_open_runner = dict(runner_payload)
+
+        by_bot[bot]["total"] += 1
+        total += 1
 
     result = {
+        "source": "trade_registry",
         "total_positions_open": total,
         "long_positions_open": longs,
         "short_positions_open": shorts,
@@ -827,6 +833,7 @@ def central_exposure_snapshot():
         "best_open_runner": best_open_runner,
         "by_bot": by_bot,
     }
+
     memory_profile_step("after_exposure_snapshot")
     return result
 
