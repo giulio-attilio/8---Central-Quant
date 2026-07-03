@@ -4055,6 +4055,21 @@ def bingx_divergence_payload():
         }
 
 
+def bingx_divergence_warning_payload():
+    payload = bingx_divergence_payload()
+
+    return {
+        "active": not bool(payload.get("ok")),
+        "status": payload.get("status"),
+        "only_bingx_count": payload.get("only_bingx_count", 0),
+        "only_central_count": payload.get("only_central_count", 0),
+        "only_bingx": payload.get("only_bingx", []),
+        "only_central": payload.get("only_central", []),
+        "policy": "LEVEL_2_WARNING_ONLY",
+        "message": "Divergência Central x BingX detectada. Operação permitida, mas requer atenção operacional.",
+    }
+
+
 def build_status_report():
     score_payload = central_health_score_payload() if "central_health_score_payload" in globals() else {"score": None, "status": "N/A"}
     ready = bingx_ready_payload() if "bingx_ready_payload" in globals() else {"ok": None, "status": "N/A"}
@@ -4390,6 +4405,10 @@ def can_open_trade_decision(payload: dict):
     if memory_risk.get("usage_pct") is not None and float(memory_risk.get("usage_pct")) >= MEMORY_ALERT_THRESHOLD_PCT:
         warnings.append(f"memória elevada: {memory_risk.get('usage_pct')}%")
 
+    divergence_warning = bingx_divergence_warning_payload()
+    if divergence_warning.get("active"):
+        warnings.append(divergence_warning.get("message"))
+
     allowed = len(reasons) == 0
     decision_result = {
         "allowed": allowed,
@@ -4402,6 +4421,7 @@ def can_open_trade_decision(payload: dict):
         "reduce_only": reduce_only,
         "reasons": reasons,
         "warnings": warnings,
+        "bingx_divergence": divergence_warning,
         "memory": memory_risk,
         "exposure": {
             "total": risk_total_pos,
