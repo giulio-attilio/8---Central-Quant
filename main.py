@@ -3983,6 +3983,32 @@ def build_trade_registry_status_line():
         return f"Trade Registry: erro ao gerar status ({exc})"
 
         
+def build_bingx_divergence_status_line():
+    try:
+        txt = build_sync_report()
+
+        if "Só na BingX: 0" in txt and "Só na Central: 0" in txt:
+            return "Central x BingX: OK | sem divergência LIVE"
+
+        only_bingx = None
+        only_central = None
+
+        for line in txt.splitlines():
+            if line.startswith("Só na BingX:"):
+                only_bingx = line.replace("Só na BingX:", "").strip()
+            elif line.startswith("Só na Central:"):
+                only_central = line.replace("Só na Central:", "").strip()
+
+        return (
+            f"Central x BingX: ALERTA | "
+            f"só BingX={only_bingx or 'N/A'} | "
+            f"só Central={only_central or 'N/A'}"
+        )
+
+    except Exception as exc:
+        return f"Central x BingX: erro ao verificar divergência ({exc})"
+
+
 def build_status_report():
     score_payload = central_health_score_payload() if "central_health_score_payload" in globals() else {"score": None, "status": "N/A"}
     ready = bingx_ready_payload() if "bingx_ready_payload" in globals() else {"ok": None, "status": "N/A"}
@@ -3997,6 +4023,7 @@ def build_status_report():
         f"Execução: {'ATIVA' if ENABLE_REAL_TRADING else 'BLOQUEADA'} | Modo {EXECUTION_MODE}",
         f"BingX: {ready.get('ok')} | {ready.get('status')}",
         build_trade_registry_status_line(),
+        build_bingx_divergence_status_line(),
         f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
         "",
         _short(sync_txt, 900),
