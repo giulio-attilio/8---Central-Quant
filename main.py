@@ -3880,6 +3880,12 @@ def can_open_trade_decision(payload: dict):
     """
     payload = payload or {}
 
+    # Mantém o Trade Registry sincronizado antes da decisão de risco
+    try:
+        sync_trade_registry_from_open_positions(commit=True)
+    except Exception as exc:
+        print("AVISO SYNC REGISTRY ANTES DO CAN_OPEN_TRADE:", exc)
+
     bot = normalize_registry_bot(
         payload.get("bot")
         or payload.get("robot")
