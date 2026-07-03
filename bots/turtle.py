@@ -62,6 +62,26 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask, request
 from upstash_redis import Redis
 
+# ==============================================================================
+# TRADE REGISTRY — CENTRAL QUANT
+# ==============================================================================
+try:
+    from trade_registry import (
+        make_trade_id,
+        register_open_trade,
+        update_trade,
+        close_trade,
+    )
+    TRADE_REGISTRY_LOADED = True
+    TRADE_REGISTRY_IMPORT_ERROR = None
+except Exception as _trade_registry_exc:
+    make_trade_id = None
+    register_open_trade = None
+    update_trade = None
+    close_trade = None
+    TRADE_REGISTRY_LOADED = False
+    TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_exc)
+
 app = Flask(__name__)
 
 # ==============================================================================
@@ -241,6 +261,8 @@ HEALTH = {
     "ranking_month": [],
     "enabled_setups": list(SETUPS.keys()),
     "mode": "PAPER",
+    "trade_registry_loaded": TRADE_REGISTRY_LOADED,
+    "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
 
     "funnel_today": {
         "ativos_analisados": 0,
@@ -648,6 +670,124 @@ def record_event(event_type, pos, extra=None):
     return event
 
 
+# ==============================================================================
+# TRADE REGISTRY HELPERS
+# ==============================================================================
+def turtle_registry_id(pos):
+    if not TRADE_REGISTRY_LOADED or make_trade_id is None:
+        return None
+    try:
+        return pos.get("trade_registry_id") or make_trade_id(
+            "TURTLE",
+            pos.get("symbol"),
+            pos.get("side"),
+            pos.get("setup", "TURTLE"),
+        )
+    except Exception:
+        return None
+
+
+def turtle_registry_open(sig):
+    if not TRADE_REGISTRY_LOADED or register_open_trade is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "TRADE_REGISTRY_NOT_LOADED"}
+    try:
+        result = register_open_trade(
+            bot="TURTLE",
+            symbol=sig.get("symbol"),
+            side=sig.get("side"),
+            entry=safe_float(sig.get("entry")),
+            sl=safe_float(sig.get("stop", sig.get("initial_stop"))),
+            tp50=safe_float(sig.get("tp50")),
+            setup=sig.get("setup", "TURTLE"),
+            qty=None,
+            source="turtle.py",
+            metadata={
+                "bot_name": BOT_NAME,
+                "setup_label": sig.get("setup_label"),
+                "timeframe": sig.get("timeframe"),
+                "score_turtle": sig.get("score_turtle"),
+                "quality": sig.get("quality"),
+                "risk_pct": sig.get("risk_pct"),
+                "atr_pct": sig.get("atr_pct"),
+                "volume_rel": sig.get("volume_rel"),
+                "breakout_atr": sig.get("breakout_atr"),
+                "channel_atr": sig.get("channel_atr"),
+                "signal_ts": sig.get("signal_ts"),
+                "mode": "PAPER",
+            },
+        )
+        if result.get("ok") and result.get("trade_id"):
+            sig["trade_registry_id"] = result.get("trade_id")
+            sig["trade_registry_opened"] = True
+            sig["trade_registry_opened_at"] = data_hora_sp_str()
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def turtle_registry_update(pos, event, **updates):
+    if not TRADE_REGISTRY_LOADED or update_trade is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "TRADE_REGISTRY_NOT_LOADED"}
+    try:
+        trade_id = turtle_registry_id(pos)
+        if not trade_id:
+            return {"ok": False, "error": "TRADE_ID_NOT_AVAILABLE"}
+
+        payload = {
+            "last_event": event,
+            "last_event_at": data_hora_sp_str(),
+            "status": pos.get("status", "OPEN"),
+            "sl": safe_float(pos.get("stop")),
+            "tp50": safe_float(pos.get("tp50")),
+            "tp50_hit": bool(pos.get("tp50_hit")),
+            "breakeven": bool(pos.get("be_moved")),
+            "mfe_pct": safe_float(pos.get("mfe_pct")),
+            "mae_pct": safe_float(pos.get("mae_pct")),
+            "mfe_r": safe_float(pos.get("mfe_r")),
+            "mae_r": safe_float(pos.get("mae_r")),
+            "best_price": safe_float(pos.get("best_price")),
+            "worst_price": safe_float(pos.get("worst_price")),
+            "management_cycles": int(pos.get("management_cycles", 0) or 0),
+        }
+        payload.update(updates)
+        return update_trade(trade_id, **payload)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def turtle_registry_close(pos, exit_price, reason, result_pct=None, result_r=None):
+    if not TRADE_REGISTRY_LOADED or close_trade is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "TRADE_REGISTRY_NOT_LOADED"}
+    try:
+        trade_id = turtle_registry_id(pos)
+        if not trade_id:
+            return {"ok": False, "error": "TRADE_ID_NOT_AVAILABLE"}
+        return close_trade(
+            trade_id,
+            exit_price=safe_float(exit_price),
+            pnl_pct=safe_float(result_pct),
+            pnl_r=safe_float(result_r),
+            reason=reason,
+            metadata={
+                "bot": "TURTLE",
+                "setup": pos.get("setup"),
+                "setup_label": pos.get("setup_label"),
+                "symbol": pos.get("symbol"),
+                "side": pos.get("side"),
+                "mfe_pct": safe_float(pos.get("mfe_pct")),
+                "mae_pct": safe_float(pos.get("mae_pct")),
+                "mfe_r": safe_float(pos.get("mfe_r")),
+                "mae_r": safe_float(pos.get("mae_r")),
+                "giveback_pct": safe_float(pos.get("giveback_pct")),
+                "giveback_r": safe_float(pos.get("giveback_r")),
+                "tp50_hit": bool(pos.get("tp50_hit")),
+                "be_moved": bool(pos.get("be_moved")),
+                "mode": "PAPER",
+            },
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
 
 # ==============================================================================
 # FUNIL TURTLE
@@ -949,6 +1089,8 @@ def scanner_loop():
                         continue
 
                     pid = sig["id"]
+                    registry_result = turtle_registry_open(sig)
+                    sig["trade_registry_result"] = registry_result
                     positions[pid] = sig
                     save_positions(positions)
 
@@ -1053,6 +1195,9 @@ def close_position(pid, pos, exit_price, reason):
         }
     )
 
+    registry_close_result = turtle_registry_close(trade, exit_price, reason, result_pct=result_pct, result_r=result_r)
+    trade["trade_registry_close_result"] = registry_close_result
+
     redis_list_append(TRADES_KEY, trade)
     record_event(reason, trade, {"exit_price": exit_price, "result_pct": result_pct, "result_r": result_r})
 
@@ -1120,6 +1265,8 @@ def management_loop():
 
                         record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"]})
                         record_event("BE", pos, {"new_stop": entry})
+                        turtle_registry_update(pos, "TP50", price=safe_float(price), candles_to_tp50=pos["candles_to_tp50"])
+                        turtle_registry_update(pos, "BE", new_sl=safe_float(entry))
 
                         safe_send_telegram(
                             f"🐢 TP50 {pos.get('setup_label', pos.get('setup'))} - {symbol}\n\n"
