@@ -1589,6 +1589,47 @@ def _trade_registry_sync_candidate(bot_key, position):
     }
 
 
+def _trade_registry_signature_from_items(items):
+    signature = set()
+
+    if isinstance(items, dict):
+        iterable = items.values()
+    elif isinstance(items, list):
+        iterable = items
+    else:
+        iterable = []
+
+    for item in iterable:
+        if not isinstance(item, dict):
+            continue
+
+        bot = normalize_registry_bot(item.get("bot") or "UNKNOWN")
+        symbol = normalize_registry_symbol(
+            item.get("symbol_clean")
+            or item.get("symbol")
+            or item.get("ativo")
+            or item.get("pair")
+            or "UNKNOWN"
+        )
+        side = str(item.get("side") or item.get("direction") or "UNKNOWN").upper().strip()
+        if side == "BUY":
+            side = "LONG"
+        elif side == "SELL":
+            side = "SHORT"
+
+        setup = str(
+            item.get("setup")
+            or item.get("signal_type")
+            or item.get("setup_label")
+            or item.get("origin")
+            or "DEFAULT"
+        ).upper().strip()
+
+        signature.add(f"{bot}:{setup}:{symbol}:{side}")
+
+    return signature
+
+
 def sync_trade_registry_from_open_positions(commit=False):
     if central_trade_registry is None:
         return {
@@ -1603,10 +1644,19 @@ def sync_trade_registry_from_open_positions(commit=False):
     errors = []
     candidates = []
 
+    existing_signature = set()
+    try:
+        registry = central_trade_registry.load_registry()
+        existing_signature = _trade_registry_signature_from_items(registry.get("open_trades", {}))
+    except Exception:
+        existing_signature = set()
+
     for bot_key, module in LOADED_BOTS.items():
         positions = get_open_positions_from_module(module, key=bot_key)
         for position in positions:
             candidate = _trade_registry_sync_candidate(bot_key, position)
+            candidate_signature = _trade_registry_signature_from_items([candidate])
+            candidate_key = next(iter(candidate_signature), None)
             if not candidate:
                 skipped.append({
                     "bot": bot_key,
@@ -1618,7 +1668,7 @@ def sync_trade_registry_from_open_positions(commit=False):
 
             candidates.append(candidate)
             trade_id = str(candidate.get("trade_id"))
-            if trade_id in existing_ids:
+            if trade_id in existing_ids or candidate_key in existing_signature:
                 skipped.append({
                     "bot": bot_key,
                     "trade_id": trade_id,
@@ -1654,6 +1704,8 @@ def sync_trade_registry_from_open_positions(commit=False):
                         "setup": candidate.get("setup"),
                     })
                     existing_ids.add(str(result.get("trade_id") or trade_id))
+                    if candidate_key:
+                        existing_signature.add(candidate_key)
                 else:
                     errors.append({
                         "trade_id": trade_id,
