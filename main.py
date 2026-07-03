@@ -6550,8 +6550,8 @@ def system_debug_route():
         "ok": True,
         "pid": os.getpid(),
         "cwd": os.getcwd(),
-        "base_dir": BASE_DIR,
-        "central_data_dir": CENTRAL_DATA_DIR,
+        "base_dir": str(globals().get("BASE_DIR", os.getcwd())),
+        "central_data_dir": str(globals().get("CENTRAL_DATA_DIR", os.path.join(os.getcwd(), "data"))),
         "decision_log": {
             "main_file": decision_main_file,
             "main_count": count_jsonl(decision_main_file),
