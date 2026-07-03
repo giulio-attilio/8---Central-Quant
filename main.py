@@ -6463,7 +6463,18 @@ def decisionlog_route():
     arg = request.args.get("q") or request.args.get("symbol") or request.args.get("bot")
     return {"text": build_decision_log_report(arg)}
 
- 
+
+@app.route("/decisionlog/raw")
+def decisionlog_raw_route():
+    rows = decision_log_items(limit=20)
+    return {
+        "ok": True,
+        "file": str(CENTRAL_DECISION_LOG_FILE),
+        "count": len(rows),
+        "rows": rows,
+    }
+
+
 @app.route("/timeline")
 @app.route("/timeline/<arg>")
 def timeline_route(arg=None):
