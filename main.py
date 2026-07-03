@@ -3701,6 +3701,7 @@ def append_decision_log(payload, decision_result):
         "allowed": allowed,
         "reasons": result.get("reasons") or [],
         "warnings": result.get("warnings") or [],
+        "bingx_divergence": result.get("bingx_divergence") or {},
         "score": payload.get("score"),
         "setup": payload.get("setup"),
         "risk_pct": payload.get("risk_pct"),
