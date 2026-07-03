@@ -1072,6 +1072,211 @@ def trade_registry_route():
     return central_trade_registry_snapshot(include_trades=full)
 
 
+def _trade_registry_report_iter_trades(values):
+    """Normaliza open_trades/closed_trades vindos como lista ou dict."""
+    if isinstance(values, dict):
+        iterable = values.values()
+    elif isinstance(values, list):
+        iterable = values
+    else:
+        iterable = []
+    return [item for item in iterable if isinstance(item, dict)]
+
+
+def _trade_registry_report_count(items, key):
+    out = {}
+    for item in items:
+        value = item.get(key)
+        if value is None and key == "symbol":
+            value = item.get("symbol_clean")
+        if value is None:
+            value = "N/A"
+        value = str(value).upper().strip() or "N/A"
+        out[value] = out.get(value, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _trade_registry_report_duplicates(items):
+    seen = {}
+    duplicates = []
+    for item in items:
+        trade_id = str(item.get("trade_id") or "").strip()
+        if not trade_id:
+            continue
+        if trade_id in seen:
+            duplicates.append(trade_id)
+        seen[trade_id] = True
+    return sorted(set(duplicates))
+
+
+def _trade_registry_report_integrity(open_trades, closed_trades):
+    required = ["trade_id", "bot", "symbol", "side", "setup", "entry"]
+    problems = []
+    for status_name, trades in [("OPEN", open_trades), ("CLOSED", closed_trades)]:
+        for item in trades:
+            missing = [field for field in required if item.get(field) in [None, ""]]
+            if missing:
+                problems.append({
+                    "status": status_name,
+                    "trade_id": item.get("trade_id"),
+                    "bot": item.get("bot"),
+                    "symbol": item.get("symbol"),
+                    "missing": missing,
+                })
+    total = len(open_trades) + len(closed_trades)
+    ok_count = max(0, total - len(problems))
+    score = round((ok_count / total) * 100, 2) if total else 100.0
+    return {"score": score, "problems": problems[:100], "problems_count": len(problems)}
+
+
+def _trade_registry_report_conflicts(open_trades):
+    by_symbol = {}
+    for item in open_trades:
+        symbol = str(item.get("symbol") or item.get("symbol_clean") or "N/A").upper().strip()
+        by_symbol.setdefault(symbol, []).append(item)
+
+    opposite_side = []
+    multi_bot = []
+    concentration = []
+
+    try:
+        max_symbol_exposure = int(GLOBAL_RISK_MAX_SYMBOL_EXPOSURE)
+    except Exception:
+        max_symbol_exposure = 3
+
+    for symbol, trades in sorted(by_symbol.items()):
+        sides = sorted({str(t.get("side") or "").upper() for t in trades if t.get("side")})
+        bots = sorted({str(t.get("bot") or "").upper() for t in trades if t.get("bot")})
+        if "LONG" in sides and "SHORT" in sides:
+            opposite_side.append({"symbol": symbol, "count": len(trades), "sides": sides, "bots": bots})
+        if len(bots) > 1:
+            multi_bot.append({"symbol": symbol, "count": len(trades), "bots": bots, "sides": sides})
+        if len(trades) >= max_symbol_exposure:
+            concentration.append({"symbol": symbol, "count": len(trades), "limit": max_symbol_exposure, "bots": bots, "sides": sides})
+
+    return {
+        "opposite_side": opposite_side,
+        "multi_bot": multi_bot,
+        "concentration": concentration,
+    }
+
+
+def build_trade_registry_report():
+    """Relatório humano do Trade Registry central."""
+    snap = central_trade_registry_snapshot(include_trades=True)
+    open_trades = _trade_registry_report_iter_trades(snap.get("open_trades", []))
+    closed_trades = _trade_registry_report_iter_trades(snap.get("closed_trades", []))
+
+    by_bot = snap.get("by_bot") or _trade_registry_report_count(open_trades, "bot")
+    by_symbol = snap.get("by_symbol") or _trade_registry_report_count(open_trades, "symbol")
+    by_side = snap.get("by_side") or _trade_registry_report_count(open_trades, "side")
+    by_setup = _trade_registry_report_count(open_trades, "setup")
+    duplicates = _trade_registry_report_duplicates(open_trades + closed_trades)
+    integrity = _trade_registry_report_integrity(open_trades, closed_trades)
+    conflicts = _trade_registry_report_conflicts(open_trades)
+
+    open_count = int(snap.get("open_count", len(open_trades)) or 0)
+    closed_count = int(snap.get("closed_count", len(closed_trades)) or 0)
+    total = open_count + closed_count
+
+    def _top_lines(title, data, limit=10):
+        lines = [title]
+        if not data:
+            lines.append("N/A")
+            return lines
+        for key, value in list(data.items())[:limit]:
+            lines.append(f"- {key}: {value}")
+        return lines
+
+    long_count = int(by_side.get("LONG", 0) or 0)
+    short_count = int(by_side.get("SHORT", 0) or 0)
+    dominant_side = "LONG" if long_count >= short_count else "SHORT"
+    dominant_qty = max(long_count, short_count)
+    dominant_pct = round((dominant_qty / open_count) * 100, 2) if open_count else 0.0
+
+    lines = [
+        "📒 TRADE REGISTRY — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        "Resumo:",
+        f"- OK: {snap.get('ok')}",
+        f"- Carregado: {snap.get('loaded')}",
+        f"- Trades abertos: {open_count}",
+        f"- Trades fechados: {closed_count}",
+        f"- Total registrado: {total}",
+        f"- Integridade: {integrity.get('score')}%",
+        "",
+        "Direção:",
+        f"- LONG: {long_count}",
+        f"- SHORT: {short_count}",
+        f"- Lado dominante: {dominant_side} ({dominant_pct}%)",
+        "",
+    ]
+    lines += _top_lines("Por robô:", by_bot, limit=12)
+    lines += [""]
+    lines += _top_lines("Por setup:", by_setup, limit=12)
+    lines += [""]
+    lines += _top_lines("Maior exposição por ativo:", by_symbol, limit=15)
+    lines += [""]
+
+    lines += ["Conflitos e alertas:"]
+    if not duplicates and not conflicts["opposite_side"] and not conflicts["concentration"] and not integrity["problems_count"]:
+        lines.append("- Nenhum alerta crítico encontrado ✅")
+    else:
+        if duplicates:
+            lines.append(f"- Trade IDs duplicados: {len(duplicates)}")
+        if conflicts["opposite_side"]:
+            lines.append(f"- Ativos com LONG e SHORT simultâneos: {len(conflicts['opposite_side'])}")
+            for item in conflicts["opposite_side"][:8]:
+                lines.append(f"  • {item['symbol']}: {item['count']} posições | {','.join(item['sides'])} | bots={','.join(item['bots'])}")
+        if conflicts["multi_bot"]:
+            lines.append(f"- Ativos operados por mais de um robô: {len(conflicts['multi_bot'])}")
+            for item in conflicts["multi_bot"][:8]:
+                lines.append(f"  • {item['symbol']}: {item['count']} posições | bots={','.join(item['bots'])}")
+        if conflicts["concentration"]:
+            lines.append(f"- Ativos no limite/acima do limite por ativo: {len(conflicts['concentration'])}")
+            for item in conflicts["concentration"][:8]:
+                lines.append(f"  • {item['symbol']}: {item['count']}/{item['limit']} posições")
+        if integrity["problems_count"]:
+            lines.append(f"- Trades com campos ausentes: {integrity['problems_count']}")
+
+    lines += [
+        "",
+        "Arquivos:",
+        f"- Registry: {snap.get('trade_registry_file')}",
+        f"- Data dir: {snap.get('data_dir')}",
+    ]
+
+    payload = {
+        "ok": bool(snap.get("ok", True)) and integrity.get("score", 0) >= 90 and not duplicates,
+        "updated_at": data_hora_sp_str(),
+        "open_count": open_count,
+        "closed_count": closed_count,
+        "by_bot": by_bot,
+        "by_side": by_side,
+        "by_symbol": by_symbol,
+        "by_setup": by_setup,
+        "dominant_side": dominant_side,
+        "dominant_side_pct": dominant_pct,
+        "duplicates": duplicates,
+        "integrity": integrity,
+        "conflicts": conflicts,
+        "text": "\n".join(lines),
+    }
+    return payload
+
+
+@app.route("/traderegistry/report")
+@app.route("/trade_registry/report")
+@app.route("/trades/report")
+def trade_registry_report_route():
+    report = build_trade_registry_report()
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    if as_text:
+        return report.get("text", "")
+    return report
+
+
 def _trade_registry_sync_symbol(symbol):
     s = str(symbol or "").upper().strip()
     s = s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "")
@@ -1327,12 +1532,32 @@ def sync_trade_registry_from_open_positions(commit=False):
 @app.route("/traderegistry/sync", methods=["GET", "POST"])
 @app.route("/trade_registry/sync", methods=["GET", "POST"])
 @app.route("/trades/sync", methods=["GET", "POST"])
+@app.route("/traderegistry/sync/confirm", methods=["GET", "POST"])
+@app.route("/trade_registry/sync/confirm", methods=["GET", "POST"])
+@app.route("/trades/sync/confirm", methods=["GET", "POST"])
 def trade_registry_sync_route():
     payload = request.get_json(silent=True) or {}
     confirm_raw = payload.get("confirm", request.args.get("confirm", ""))
-    confirm = bool(confirm_raw is True or str(confirm_raw).strip().upper() in {"1", "TRUE", "YES", "SIM", "ON", "SYNC"})
-    commit = request.method == "POST" and confirm
-    return sync_trade_registry_from_open_positions(commit=commit)
+
+    # Permite confirmação simples pelo navegador:
+    # /traderegistry/sync?confirm=1
+    # /traderegistry/sync/confirm
+    path_confirm = str(request.path or "").rstrip("/").endswith("/confirm")
+    confirm = bool(
+        path_confirm
+        or confirm_raw is True
+        or str(confirm_raw).strip().upper() in {"1", "TRUE", "YES", "SIM", "ON", "SYNC", "CONFIRM"}
+    )
+
+    # Antes exigia POST para gravar. Agora GET com confirm=1 ou /confirm também grava,
+    # para administração direta pelo navegador, mantendo GET sem confirmação como dry-run.
+    commit = bool(confirm)
+    result = sync_trade_registry_from_open_positions(commit=commit)
+    if commit:
+        result["note"] = "Importação confirmada. GET sem confirm continua fazendo apenas prévia/dry-run."
+    else:
+        result["note"] = "GET faz prévia/dry-run. Para importar pelo navegador, use /traderegistry/sync?confirm=1 ou /traderegistry/sync/confirm."
+    return result
 
 
 @app.route("/traderegistry/reset", methods=["POST"])
