@@ -1,5 +1,5 @@
 🩺 CENTRAL DOCTOR V2 — CENTRAL QUANT
-Gerado em: 03/07/2026 06:35:07
+Gerado em: 03/07/2026 06:48:19
 Raiz: C:\Users\giuli\OneDrive\Documentos\GitHub\8---Central-Quant
 Ambiente detectado: LOCAL
 
@@ -105,16 +105,16 @@ Ambiente detectado: LOCAL
 ==============================
 ✅ bots/trendpro.py: runtime/threads/scanner confirmados
 ℹ️ bots/trendpro.py scanners: scanner
-ℹ️ bots/trendpro.py gestão: atualizar_monitor_be, carregar_monitor_be, adicionar_monitor_be, montar_monitor_be, consultar_central_risk_manager, salvar_monitor_be
+ℹ️ bots/trendpro.py gestão: consultar_central_risk_manager, carregar_monitor_be, adicionar_monitor_be, atualizar_monitor_be, montar_monitor_be, salvar_monitor_be
 ✅ bots/donkey.py: runtime/threads/scanner confirmados
 ℹ️ bots/donkey.py scanners: scanner
-ℹ️ bots/donkey.py gestão: atualizar_monitor_be, carregar_monitor_be, adicionar_monitor_be, montar_monitor_be, consultar_central_risk_manager, salvar_monitor_be, iniciar_threads_monitoradas
+ℹ️ bots/donkey.py gestão: consultar_central_risk_manager, iniciar_threads_monitoradas, carregar_monitor_be, adicionar_monitor_be, atualizar_monitor_be, montar_monitor_be, salvar_monitor_be
 ✅ bots/cobra.py: runtime/threads/scanner confirmados
 ℹ️ bots/cobra.py scanners: scanner
 ℹ️ bots/cobra.py gestão: consultar_central_risk_manager, iniciar_threads_monitoradas
 ✅ bots/meme.py: runtime/threads/scanner confirmados
 ℹ️ bots/meme.py scanners: scanner
-ℹ️ bots/meme.py gestão: atualizar_monitor_be, carregar_monitor_be, adicionar_monitor_be, montar_monitor_be, consultar_central_risk_manager, salvar_monitor_be
+ℹ️ bots/meme.py gestão: consultar_central_risk_manager, carregar_monitor_be, adicionar_monitor_be, atualizar_monitor_be, montar_monitor_be, salvar_monitor_be
 ✅ bots/predator.py: runtime/threads/scanner confirmados
 ℹ️ bots/predator.py scanners: scan_smart_predator_symbol, scanner
 ℹ️ bots/predator.py gestão: iniciar_threads_monitoradas

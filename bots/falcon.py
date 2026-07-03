@@ -1,7 +1,7 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em FALCON.
 # ==============================================================================
 # FALCON STRIKE - ORB PRO - CENTRAL QUANT
-# Versao: 2026-07-02-FALCON-STRIKE-ORB-V1-CQ-FRAMEWORK
+# Versao: 2026-07-03-FALCON-STRIKE-ORB-V1-CQ-FRAMEWORK-TRADE-REGISTRY
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -57,6 +57,14 @@ except Exception as _history_import_exc:
     HISTORY_IMPORT_ERROR = str(_history_import_exc)
 else:
     HISTORY_IMPORT_ERROR = None
+
+try:
+    import trade_registry as central_trade_registry
+except Exception as _trade_registry_import_exc:
+    central_trade_registry = None
+    TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_import_exc)
+else:
+    TRADE_REGISTRY_IMPORT_ERROR = None
 
 try:
     import cq_bot_framework as cq_framework
@@ -251,6 +259,9 @@ HEALTH = {
     "enable_real_trading": ENABLE_REAL_TRADING,
     "broker_loaded": central_broker is not None,
     "broker_import_error": BROKER_IMPORT_ERROR,
+    "trade_registry_loaded": central_trade_registry is not None,
+    "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
+    "last_trade_registry_event": None,
     "cq_framework_loaded": cq_framework is not None,
     "cq_framework_import_error": CQ_FRAMEWORK_IMPORT_ERROR,
     "last_execution_decision": None,
@@ -546,6 +557,136 @@ def get_positions():
 def save_positions(positions):
     HEALTH["last_positions_count"] = len(positions)
     return redis_set_json(POSITIONS_KEY, positions)
+
+
+def register_falcon_trade_registry_open(pos):
+    """Registra abertura do Falcon no Trade Registry central.
+
+    Falha de registry nunca pode travar o robô. O Redis local do Falcon continua
+    sendo salvo, e a Central registra o erro no HEALTH para diagnóstico.
+    """
+    if central_trade_registry is None:
+        HEALTH["last_trade_registry_event"] = {
+            "ok": False,
+            "action": "OPEN_SKIPPED",
+            "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry import failed",
+            "ts": data_hora_sp_str(),
+        }
+        return None
+
+    try:
+        result = central_trade_registry.register_open_trade(
+            bot="FALCON",
+            symbol=normalize_symbol_for_central(pos.get("symbol")),
+            side=pos.get("side"),
+            entry=pos.get("entry"),
+            sl=pos.get("stop") or pos.get("initial_stop"),
+            tp50=pos.get("tp50"),
+            setup=pos.get("setup"),
+            qty=pos.get("qty") or pos.get("amount"),
+            source="falcon",
+            metadata={
+                "falcon_position_id": pos.get("id"),
+                "setup_label": pos.get("setup_label"),
+                "risk_pct": pos.get("risk_pct"),
+                "score": pos.get("score_falcon") or pos.get("score"),
+                "quality": pos.get("quality"),
+                "timeframe": pos.get("timeframe") or TIMEFRAME,
+                "execution_mode": pos.get("execution_mode") or FALCON_MODE,
+                "ny_date": pos.get("ny_date"),
+                "created_at": pos.get("created_at"),
+                "execution_decision": pos.get("execution_decision"),
+            },
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            pos["trade_registry_id"] = result.get("trade_id")
+        HEALTH["last_trade_registry_event"] = {
+            "ok": bool(isinstance(result, dict) and result.get("ok")),
+            "action": "OPEN_REGISTERED",
+            "trade_id": pos.get("trade_registry_id"),
+            "symbol": pos.get("symbol"),
+            "setup": pos.get("setup"),
+            "side": pos.get("side"),
+            "ts": data_hora_sp_str(),
+        }
+        return result
+    except Exception as exc:
+        HEALTH["last_warning"] = f"trade_registry open falcon: {exc}"
+        HEALTH["last_trade_registry_event"] = {
+            "ok": False,
+            "action": "OPEN_ERROR",
+            "error": str(exc),
+            "symbol": pos.get("symbol"),
+            "setup": pos.get("setup"),
+            "side": pos.get("side"),
+            "ts": data_hora_sp_str(),
+        }
+        return None
+
+
+def close_falcon_trade_registry(pos, exit_price=None, result_pct=None, result_r=None, reason=None):
+    """Fecha no Trade Registry central a posição previamente registrada."""
+    if central_trade_registry is None:
+        HEALTH["last_trade_registry_event"] = {
+            "ok": False,
+            "action": "CLOSE_SKIPPED",
+            "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry import failed",
+            "ts": data_hora_sp_str(),
+        }
+        return None
+
+    try:
+        trade_id = pos.get("trade_registry_id")
+        if not trade_id:
+            trade_id = central_trade_registry.make_trade_id(
+                "FALCON",
+                normalize_symbol_for_central(pos.get("symbol")),
+                pos.get("side"),
+                pos.get("setup"),
+            )
+
+        result = central_trade_registry.close_trade(
+            trade_id=trade_id,
+            exit_price=exit_price,
+            pnl_pct=result_pct,
+            pnl_r=result_r,
+            reason=reason,
+            metadata={
+                "falcon_position_id": pos.get("id"),
+                "exit_reason": reason,
+                "closed_at_falcon": data_hora_sp_str(),
+                "mfe_pct": pos.get("mfe_pct"),
+                "mae_pct": pos.get("mae_pct"),
+                "mfe_r": pos.get("mfe_r"),
+                "mae_r": pos.get("mae_r"),
+                "giveback_pct": pos.get("giveback_pct"),
+                "giveback_r": pos.get("giveback_r"),
+            },
+        )
+        HEALTH["last_trade_registry_event"] = {
+            "ok": bool(isinstance(result, dict) and result.get("ok")),
+            "action": "TRADE_CLOSED",
+            "trade_id": trade_id,
+            "symbol": pos.get("symbol"),
+            "setup": pos.get("setup"),
+            "side": pos.get("side"),
+            "reason": reason,
+            "ts": data_hora_sp_str(),
+            "error": None if not isinstance(result, dict) else result.get("error"),
+        }
+        return result
+    except Exception as exc:
+        HEALTH["last_warning"] = f"trade_registry close falcon: {exc}"
+        HEALTH["last_trade_registry_event"] = {
+            "ok": False,
+            "action": "CLOSE_ERROR",
+            "error": str(exc),
+            "symbol": pos.get("symbol"),
+            "setup": pos.get("setup"),
+            "side": pos.get("side"),
+            "ts": data_hora_sp_str(),
+        }
+        return None
 
 
 def get_trades():
@@ -1373,6 +1514,7 @@ def scanner_loop():
                         continue
 
                     pid = sig["id"]
+                    register_falcon_trade_registry_open(sig)
                     positions[pid] = sig
                     save_positions(positions)
                     redis_list_append(SIGNALS_KEY, sig)
@@ -1463,6 +1605,14 @@ def close_position(pid, pos, exit_price, reason):
         "giveback_pct": giveback_pct,
         "giveback_r": giveback_r,
     })
+
+    close_falcon_trade_registry(
+        trade,
+        exit_price=exit_price,
+        result_pct=result_pct,
+        result_r=result_r,
+        reason=reason,
+    )
 
     redis_list_append(TRADES_KEY, trade)
     record_event(reason, trade, {"exit_price": exit_price, "result_pct": result_pct, "result_r": result_r})
