@@ -3965,6 +3965,22 @@ def build_consistency_report():
     return "\n".join(lines)
 
 
+def build_trade_registry_status_line():
+    try:
+        registry = central_trade_registry_snapshot(include_trades=False)
+        autosync = TRADE_REGISTRY_AUTOSYNC_STATUS or {}
+
+        return (
+            f"Trade Registry: "
+            f"{registry.get('open_count')} abertas | "
+            f"ok={registry.get('ok')} | "
+            f"autosync={autosync.get('last_ok')} | "
+            f"último={autosync.get('last_run')}"
+        )
+    except Exception as exc:
+        return f"Trade Registry: erro ao gerar status ({exc})"
+
+        
 def build_status_report():
     score_payload = central_health_score_payload() if "central_health_score_payload" in globals() else {"score": None, "status": "N/A"}
     ready = bingx_ready_payload() if "bingx_ready_payload" in globals() else {"ok": None, "status": "N/A"}
@@ -3978,6 +3994,7 @@ def build_status_report():
         f"Watchdog: {CENTRAL_HEALTH.get('watchdog_status')}",
         f"Execução: {'ATIVA' if ENABLE_REAL_TRADING else 'BLOQUEADA'} | Modo {EXECUTION_MODE}",
         f"BingX: {ready.get('ok')} | {ready.get('status')}",
+        build_trade_registry_status_line(),
         f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
         "",
         _short(sync_txt, 900),
