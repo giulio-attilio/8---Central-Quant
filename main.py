@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-06-29-SUPER-CENTRAL-QUANT-V4-7-FORCE-HISTORY-V2
+# Versão: 2026-07-03-SUPER-CENTRAL-QUANT-V5-TRADE-REGISTRY
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -62,6 +62,14 @@ except Exception as _event_bus_import_exc:
     EVENT_BUS_IMPORT_ERROR = str(_event_bus_import_exc)
 else:
     EVENT_BUS_IMPORT_ERROR = None
+
+try:
+    import trade_registry as central_trade_registry
+except Exception as _trade_registry_import_exc:
+    central_trade_registry = None
+    TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_import_exc)
+else:
+    TRADE_REGISTRY_IMPORT_ERROR = None
 
 BOT_NAME = os.environ.get("BOT_NAME", "Central Quant PRO FULL")
 TIMEZONE_BR = timezone(timedelta(hours=-3))
@@ -900,6 +908,50 @@ def central_watchdog_loop():
         time.sleep(WATCHDOG_CHECK_SECONDS)
 
 
+def central_trade_registry_snapshot(include_trades=True):
+    """Snapshot seguro do Trade Registry central."""
+    if central_trade_registry is None:
+        return {
+            "ok": False,
+            "loaded": False,
+            "import_error": TRADE_REGISTRY_IMPORT_ERROR,
+            "open_count": 0,
+            "closed_count": 0,
+            "by_bot": {},
+            "by_symbol": {},
+            "by_side": {},
+        }
+
+    try:
+        payload = central_trade_registry.get_trade_registry_snapshot()
+        if not isinstance(payload, dict):
+            payload = {"ok": False, "error": "INVALID_TRADE_REGISTRY_PAYLOAD", "raw": str(payload)}
+
+        payload["loaded"] = True
+        payload["import_error"] = None
+        payload["module"] = "trade_registry"
+        payload["trade_registry_file"] = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", ""))
+        payload["data_dir"] = str(getattr(central_trade_registry, "DATA_DIR", ""))
+
+        if not include_trades:
+            payload.pop("open_trades", None)
+
+        return payload
+    except Exception as exc:
+        return {
+            "ok": False,
+            "loaded": True,
+            "module": "trade_registry",
+            "import_error": None,
+            "error": str(exc),
+            "open_count": 0,
+            "closed_count": 0,
+            "by_bot": {},
+            "by_symbol": {},
+            "by_side": {},
+        }
+
+
 @app.route("/")
 def home():
     return f"{BOT_NAME} Online"
@@ -1012,9 +1064,31 @@ def data_status_route():
     return payload
 
 
+@app.route("/traderegistry")
+@app.route("/trade_registry")
+@app.route("/trades")
+def trade_registry_route():
+    full = str(request.args.get("full", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    return central_trade_registry_snapshot(include_trades=full)
+
+
+@app.route("/traderegistry/reset", methods=["POST"])
+def trade_registry_reset_route():
+    if central_trade_registry is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry import failed"}, 500
+
+    payload = request.get_json(silent=True) or {}
+    confirm = bool(payload.get("confirm") is True or str(payload.get("confirm", "")).upper() == "RESET")
+    result = central_trade_registry.reset_trade_registry(confirm=confirm)
+    status = 200 if result.get("ok") else 400
+    return result, status
+
+
 @app.route("/health")
 def health():
-    return central_watchdog_status()
+    payload = central_watchdog_status()
+    payload["trade_registry"] = central_trade_registry_snapshot(include_trades=False)
+    return payload
 
 
 @app.route("/watchdog")
@@ -1107,6 +1181,7 @@ def central():
         "reasons": status.get("reasons", []),
         "memory": mem,
         "exposure": exposure_snapshot,
+        "trade_registry": central_trade_registry_snapshot(include_trades=False),
         "open_runners": exposure_snapshot.get("open_runners"),
         "best_open_runner": exposure_snapshot.get("best_open_runner"),
         "bots": resumo,

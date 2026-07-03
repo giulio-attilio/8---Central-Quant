@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ==============================================================================
 # CENTRAL QUANT DOCTOR V2
-# Versão: 2026-07-02-CENTRAL-DOCTOR-V2
+# Versão: 2026-07-03-CENTRAL-DOCTOR-V2-TRADE-REGISTRY
 #
 # Uso:
 #   python doctor.py
@@ -28,6 +28,7 @@ CORE_FILES = [
     "main.py",
     "history_manager.py",
     "event_bus.py",
+    "trade_registry.py",
 ]
 
 BOT_FILES = [
@@ -349,6 +350,57 @@ def main():
             lines.append(ok_line(f"event_bus.py contém {term}") if ok else warn_line(f"event_bus.py contém {term}"))
             if not ok:
                 warnings.append(f"Event Bus sem item esperado: {term}")
+
+    lines.append("")
+    lines.append("==============================")
+    lines.append("5B. TRADE REGISTRY")
+    lines.append("==============================")
+
+    trade_registry_expected = [
+        "TRADE_REGISTRY_FILE",
+        "load_registry",
+        "save_registry",
+        "make_trade_id",
+        "register_open_trade",
+        "update_trade",
+        "close_trade",
+        "get_open_trades",
+        "get_trade_registry_snapshot",
+        "reset_trade_registry",
+    ]
+
+    if exists("trade_registry.py"):
+        funcs = ast_function_names("trade_registry.py")
+
+        for term in trade_registry_expected:
+            if term == "TRADE_REGISTRY_FILE":
+                ok = contains_any("trade_registry.py", [term])
+            else:
+                ok = term in funcs
+
+            lines.append(ok_line(f"trade_registry.py contém {term}") if ok else fail_line(f"trade_registry.py contém {term}"))
+
+            if not ok:
+                errors.append(f"trade_registry.py não contém item obrigatório: {term}")
+
+        registry_text = read_text(ROOT / "trade_registry.py")
+        registry_safety_checks = [
+            ("data/trade_registry.json", ["trade_registry.json"]),
+            ("lock/thread-safe", ["threading.Lock", "_lock"]),
+            ("gravação atômica", ["os.replace", ".tmp"]),
+            ("open_trades", ["open_trades"]),
+            ("closed_trades", ["closed_trades"]),
+        ]
+
+        for label, terms in registry_safety_checks:
+            ok = any(term in registry_text for term in terms)
+            lines.append(ok_line(f"trade_registry.py segurança {label}") if ok else warn_line(f"trade_registry.py segurança {label} não confirmada"))
+            if not ok:
+                warnings.append(f"Trade Registry: segurança não confirmada: {label}")
+
+    else:
+        lines.append(fail_line("trade_registry.py", "ausente"))
+        errors.append("Arquivo principal ausente: trade_registry.py")
 
     lines.append("")
     lines.append("==============================")
