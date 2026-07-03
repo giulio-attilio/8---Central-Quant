@@ -3753,7 +3753,29 @@ def upsert_shadow_position(decision_item):
 
 
 def decision_log_items(limit=50):
-    return _read_jsonl_tail(CENTRAL_DECISION_LOG_FILE, limit=limit)
+    rows = []
+
+    try:
+        rows.extend(_read_jsonl_tail(CENTRAL_DECISION_LOG_FILE, limit=limit))
+    except Exception:
+        pass
+
+    try:
+        import history_manager as super_history_manager
+        history_file = getattr(super_history_manager, "DECISION_LOG_FILE", None)
+        if history_file:
+            rows.extend(_read_jsonl_tail(history_file, limit=limit))
+    except Exception:
+        pass
+
+    def _epoch(row):
+        try:
+            return float(row.get("epoch") or 0)
+        except Exception:
+            return 0
+
+    rows = sorted(rows, key=_epoch)
+    return rows[-limit:]
 
 
 def timeline_items(limit=100):
