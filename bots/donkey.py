@@ -57,6 +57,14 @@ from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 
 try:
+    import trade_registry as central_trade_registry
+except Exception as _trade_registry_import_exc:
+    central_trade_registry = None
+    TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_import_exc)
+else:
+    TRADE_REGISTRY_IMPORT_ERROR = None
+
+try:
     from strategy import calcular_atr
 except Exception:
     def calcular_atr(df, period=14):
@@ -1016,7 +1024,171 @@ def marcar_early_cooldown(symbol, side):
     salvar_early_cooldown(dados)
 
 
+def _donkey_registry_loaded():
+    return central_trade_registry is not None
+
+
+def _donkey_registry_symbol(value):
+    try:
+        return nome_limpo(value)
+    except Exception:
+        return str(value or "").upper().strip()
+
+
+def _donkey_registry_side(value):
+    side = str(value or "").upper().strip()
+    if side == "BUY":
+        return "LONG"
+    if side == "SELL":
+        return "SHORT"
+    return side or "UNKNOWN"
+
+
+def _donkey_registry_setup_from_event(evento):
+    setup = evento.get("signal_type") or evento.get("setup")
+    if setup:
+        return str(setup).upper()
+
+    symbol = evento.get("symbol")
+    try:
+        posicoes = carregar_posicoes()
+        p = posicoes.get(symbol) or posicoes.get(_donkey_registry_symbol(symbol))
+        if isinstance(p, dict):
+            setup = p.get("signal_type") or p.get("setup")
+            if setup:
+                return str(setup).upper()
+    except Exception:
+        pass
+
+    return "DONKEY"
+
+
+def _donkey_registry_trade_ids(evento):
+    if not _donkey_registry_loaded():
+        return []
+
+    symbol = _donkey_registry_symbol(evento.get("symbol_clean") or evento.get("symbol"))
+    side = _donkey_registry_side(evento.get("side") or evento.get("signal"))
+    primary_setup = _donkey_registry_setup_from_event(evento)
+    setups = []
+    for item in [primary_setup, "DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY", "POI_DONKEY", "DEFAULT"]:
+        if item and item not in setups:
+            setups.append(item)
+
+    ids = []
+    for setup in setups:
+        try:
+            ids.append(central_trade_registry.make_trade_id("DONKEY", symbol, side, setup))
+        except Exception:
+            pass
+    return ids
+
+
+def _donkey_registry_register_open(evento):
+    if not _donkey_registry_loaded():
+        return None
+    try:
+        symbol = _donkey_registry_symbol(evento.get("symbol_clean") or evento.get("symbol"))
+        side = _donkey_registry_side(evento.get("side") or evento.get("signal"))
+        setup = _donkey_registry_setup_from_event(evento)
+        result = central_trade_registry.register_open_trade(
+            bot="DONKEY",
+            symbol=symbol,
+            side=side,
+            entry=evento.get("entry"),
+            sl=evento.get("sl") or evento.get("stop"),
+            tp50=evento.get("tp50"),
+            setup=setup,
+            qty=evento.get("qty") or evento.get("donkey_position_size"),
+            source="donkey",
+            metadata={
+                "event": "ENTRY",
+                "raw_symbol": evento.get("symbol"),
+                "symbol_clean": evento.get("symbol_clean"),
+                "risk_pct": evento.get("risk_pct"),
+                "signal_score": evento.get("signal_score"),
+                "elite_candidate": evento.get("elite_candidate"),
+                "donkey_risk_usdt": evento.get("donkey_risk_usdt"),
+                "datetime": evento.get("datetime"),
+            },
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            HEALTH["trade_registry_loaded"] = True
+            HEALTH["last_trade_registry_action"] = "OPEN_REGISTERED"
+            HEALTH["last_trade_registry_trade_id"] = result.get("trade_id")
+        return result
+    except Exception as exc:
+        HEALTH["trade_registry_loaded"] = False
+        HEALTH["trade_registry_error"] = str(exc)
+        print("ERRO TRADE REGISTRY DONKEY OPEN:", exc)
+        return None
+
+
+def _donkey_registry_update(evento):
+    if not _donkey_registry_loaded():
+        return None
+    updates = {
+        "last_event": evento.get("event"),
+        "last_event_at": evento.get("datetime") or data_hora_sp_str(),
+        "status": evento.get("event"),
+        "sl": evento.get("new_stop") or evento.get("stop_after_tp50") or evento.get("sl"),
+        "tp50": evento.get("tp50"),
+        "metadata": {k: v for k, v in evento.items() if k not in {"symbol", "symbol_clean"}},
+    }
+    for trade_id in _donkey_registry_trade_ids(evento):
+        try:
+            result = central_trade_registry.update_trade(trade_id, **updates)
+            if isinstance(result, dict) and result.get("ok"):
+                HEALTH["last_trade_registry_action"] = "TRADE_UPDATED"
+                HEALTH["last_trade_registry_trade_id"] = trade_id
+                return result
+        except Exception as exc:
+            HEALTH["trade_registry_error"] = str(exc)
+    return None
+
+
+def _donkey_registry_close(evento):
+    if not _donkey_registry_loaded():
+        return None
+    for trade_id in _donkey_registry_trade_ids(evento):
+        try:
+            result = central_trade_registry.close_trade(
+                trade_id,
+                exit_price=evento.get("exit") or evento.get("exit_price"),
+                pnl_pct=evento.get("pnl") or evento.get("pnl_pct") or evento.get("result_pct") or evento.get("pnl_total_weighted"),
+                pnl_r=evento.get("pnl_r") or evento.get("result_r"),
+                reason=evento.get("closed_by") or evento.get("result_type") or evento.get("event") or "CLOSE",
+                metadata={k: v for k, v in evento.items() if k not in {"symbol", "symbol_clean"}},
+            )
+            if isinstance(result, dict) and result.get("ok"):
+                HEALTH["last_trade_registry_action"] = "TRADE_CLOSED"
+                HEALTH["last_trade_registry_trade_id"] = trade_id
+                return result
+        except Exception as exc:
+            HEALTH["trade_registry_error"] = str(exc)
+    return None
+
+
+def _donkey_registry_handle_event(evento):
+    try:
+        if not isinstance(evento, dict):
+            return None
+        event_type = str(evento.get("event") or "").upper()
+        if event_type == "ENTRY":
+            return _donkey_registry_register_open(evento)
+        if event_type in {"POI", "POI_DONKEY", "TP50", "BE", "BE_TRIGGER", "TRAILING", "TRAILING50", "TRAILING100", "SL50"}:
+            return _donkey_registry_update(evento)
+        if event_type in {"CLOSE", "EXIT", "SL", "SL100", "TRAIL", "STOP"}:
+            return _donkey_registry_close(evento)
+        return None
+    except Exception as exc:
+        HEALTH["trade_registry_error"] = str(exc)
+        print("ERRO TRADE REGISTRY DONKEY EVENT:", exc)
+        return None
+
+
 def registrar_evento_trade(evento):
+    _donkey_registry_handle_event(evento)
     trades = carregar_trades()
     trades.append(evento)
     if len(trades) > 1000:
@@ -1559,6 +1731,11 @@ def montar_health_tecnico():
         "mfe_enabled": True,
         "service_mode": "DONKEY_ONLY",
         "bot": BOT_NAME,
+        "trade_registry_loaded": central_trade_registry is not None,
+        "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
+        "last_trade_registry_action": HEALTH.get("last_trade_registry_action"),
+        "last_trade_registry_trade_id": HEALTH.get("last_trade_registry_trade_id"),
+        "trade_registry_error": HEALTH.get("trade_registry_error"),
         "watchdog_status": watchdog.get("status"),
         "minutes_since_scanner": watchdog.get("minutes_since_scanner"),
         "minutes_since_management": watchdog.get("minutes_since_management"),
