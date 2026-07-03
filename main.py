@@ -3803,9 +3803,33 @@ def can_open_trade_decision(payload: dict):
     - reduceOnly/fechamento continua permitido quando GLOBAL_RISK_ALLOW_REDUCE_ONLY=true.
     """
     payload = payload or {}
-    bot = str(payload.get("bot") or payload.get("robot") or "").upper().strip()
-    symbol = normalize_symbol_for_risk(payload.get("symbol"))
-    side = str(payload.get("side") or "").upper().strip()
+
+    bot = normalize_registry_bot(
+        payload.get("bot")
+        or payload.get("robot")
+        or payload.get("strategy")
+        or ""
+    )
+
+    symbol = normalize_registry_symbol(
+        payload.get("symbol")
+        or payload.get("symbol_clean")
+        or payload.get("pair")
+        or payload.get("ativo")
+        or ""
+    )
+
+    side = str(
+        payload.get("side")
+        or payload.get("direction")
+        or payload.get("signal")
+        or ""
+    ).upper().strip()
+
+    if side == "BUY":
+        side = "LONG"
+    elif side == "SELL":
+        side = "SHORT"
     mode = str(payload.get("mode") or payload.get("execution_mode") or EXECUTION_MODE).upper().strip()
     intended_live = bool(payload.get("intended_live", mode == "LIVE"))
     reduce_only = _risk_is_reduce_only(payload)
