@@ -286,3 +286,89 @@ def setup_ranking():
         "generated_at": analytics.get("generated_at"),
         "setups": ranking,
     }
+
+
+    def portfolio_advisor():
+        bots = bot_ranking().get("bots", [])
+        setups = setup_ranking().get("setups", [])
+
+        core = []
+        observe = []
+        insufficient = []
+        reduce = []
+        alerts = []
+
+        for item in bots:
+            name = item.get("bot")
+            rec = item.get("recommendation")
+            conf = item.get("confidence")
+            score = item.get("score", 0)
+            pnl = item.get("pnl_total_pct", 0)
+            giveback = item.get("giveback_avg_pct", 0)
+
+            row = {
+                "name": name,
+                "score": score,
+                "confidence": conf,
+                "recommendation": rec,
+                "pnl_total_pct": pnl,
+                "trades": item.get("trades"),
+            }
+
+            if conf in {"MÉDIA", "ALTA"} and pnl > 0 and score >= 65:
+                core.append(row)
+            elif conf == "AMOSTRA INSUFICIENTE":
+                insufficient.append(row)
+            elif pnl < 0 or score < 35:
+                reduce.append(row)
+            else:
+                observe.append(row)
+
+            if giveback and giveback >= 3:
+                alerts.append({
+                    "type": "GIVEBACK_ELEVADO",
+                    "name": name,
+                    "giveback_avg_pct": giveback,
+                })
+
+        setup_core = []
+        setup_watch = []
+        setup_reduce = []
+
+        for item in setups:
+            name = item.get("setup")
+            conf = item.get("confidence")
+            score = item.get("score", 0)
+            pnl = item.get("pnl_total_pct", 0)
+
+            row = {
+                "name": name,
+                "score": score,
+                "confidence": conf,
+                "recommendation": item.get("recommendation"),
+                "pnl_total_pct": pnl,
+                "trades": item.get("trades"),
+            }
+
+            if conf in {"MÉDIA", "ALTA"} and pnl > 0 and score >= 65:
+                setup_core.append(row)
+            elif pnl < 0 and score < 40:
+                setup_reduce.append(row)
+            else:
+                setup_watch.append(row)
+
+        return {
+            "ok": True,
+            "version": "2026-07-03-PORTFOLIO-ADVISOR-V1",
+            "generated_at": bot_ranking().get("generated_at"),
+            "portfolio": {
+                "core_bots": core,
+                "observe_bots": observe,
+                "insufficient_sample_bots": insufficient,
+                "reduce_bots": reduce,
+                "core_setups": setup_core,
+                "watch_setups": setup_watch,
+                "reduce_setups": setup_reduce,
+                "alerts": alerts,
+            },
+        }
