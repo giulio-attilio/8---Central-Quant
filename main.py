@@ -50,6 +50,7 @@ from execution_orchestrator import (
     read_execution_log,
 )
 
+
 app = Flask(__name__)
 
 try:
@@ -11681,15 +11682,30 @@ def execution_policy_v1_summary_route():
     return {"ok": True, "version": payload.get("version"), "generated_at": payload.get("generated_at"), "mode": payload.get("mode"), "inputs": payload.get("inputs"), "decision": payload.get("decision"), "execution_action": payload.get("execution_action"), "confidence_score": payload.get("confidence_score"), "recommended_order": payload.get("recommended_order"), "votes": payload.get("votes"), "reasons": payload.get("reasons"), "alerts": payload.get("alerts"), "cache": {"last_generated_at": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_capital")}}
 
 
-@app.get("/execution/health")
+@app.route("/execution/health")
 def api_execution_health():
     return execution_health()
 
 
-@app.post("/execution/plan")
-def api_execution_plan(payload: dict = None):
-    if payload is None:
-        payload = {}
+@app.route("/execution/plan", methods=["GET", "POST"])
+def api_execution_plan():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {
+            "decision": request.args.get("decision", "ALLOW"),
+            "bot": request.args.get("bot", "DONKEY"),
+            "setup": request.args.get("setup", "DONKEY"),
+            "symbol": request.args.get("symbol", "ETHUSDT"),
+            "side": request.args.get("side", "LONG"),
+            "entry": request.args.get("entry", 3500),
+            "sl": request.args.get("sl", 3430),
+            "tp50": request.args.get("tp50", 3570),
+            "risk_pct": request.args.get("risk_pct", 2.0),
+            "mode": request.args.get("mode"),
+            "requested_qty": request.args.get("requested_qty", 0.1),
+            "capital_allocated": request.args.get("capital_allocated", 4500),
+        }
 
     return orchestrate_execution(
         payload=payload,
@@ -11700,9 +11716,14 @@ def api_execution_plan(payload: dict = None):
     )
 
 
-@app.get("/execution/log")
-def api_execution_log(limit: int = 20):
+@app.route("/execution/log")
+def api_execution_log():
+    try:
+        limit = int(request.args.get("limit", 20))
+    except Exception:
+        limit = 20
     return read_execution_log(limit=limit)
+
 
 
 # ==========================================================
