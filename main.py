@@ -11362,6 +11362,54 @@ def _epe_votes_from_advisor_budget(item):
     return [_epe_vote("Portfolio Advisor / Risk Budget", "INFO", 0.5, "Sem política forte do Advisor/Risk Budget.", {"advisor_action": advisor, "risk_state": risk_state})]
 
 
+
+
+def _epe_vote_from_correlation_engine(result):
+    if not isinstance(result, dict) or not result.get("ok"):
+        return _epe_vote("Correlation Engine V1", "INFO", 0.7, "Correlation Engine indisponível ou sem resposta válida.", result if isinstance(result, dict) else {})
+    sig = result.get("signal_policy") or {}
+    if not sig:
+        return _epe_vote("Correlation Engine V1", "INFO", 0.7, "Sem símbolo/sinal específico; correlação usada apenas como contexto de portfólio.", {
+            "dominant_cluster": (result.get("automation_policy") or {}).get("dominant_cluster"),
+            "high_risk_clusters": (result.get("automation_policy") or {}).get("high_risk_clusters"),
+        })
+    action = str(sig.get("correlation_action") or "").upper()
+    gate = str(sig.get("signal_gate") or "").upper()
+    severity = str(sig.get("severity") or "").upper()
+    risk_multiplier = _epe_safe_float(sig.get("risk_multiplier"), 1.0)
+    reasons = sig.get("reasons") or []
+    reason = "; ".join([str(x) for x in reasons[:3]]) or f"Correlation Engine retornou {action}."
+    if "BLOCK" in action or "BLOCK" in gate or risk_multiplier <= 0:
+        vote = "DENY"
+    elif "COMPRESS" in action or risk_multiplier < 0.5 or severity == "HIGH":
+        vote = "REDUCE"
+    elif "WATCH" in action or risk_multiplier < 1.0 or severity == "MEDIUM":
+        vote = "WAIT"
+    else:
+        vote = "ALLOW"
+    return _epe_vote("Correlation Engine V1", vote, 1.25, reason, {
+        "correlation_action": action,
+        "signal_gate": gate,
+        "severity": severity,
+        "risk_multiplier": risk_multiplier,
+        "primary_cluster": sig.get("primary_cluster"),
+        "binding_cluster": sig.get("binding_cluster"),
+        "same_symbol_count": sig.get("same_symbol_count"),
+        "clusters": sig.get("clusters"),
+        "cluster_pressures": sig.get("cluster_pressures"),
+        "reasons": reasons[:10],
+    })
+
+
+def _epe_apply_correlation_multiplier(value, multiplier):
+    try:
+        if value is None:
+            return None
+        return round(float(value) * float(multiplier), 8)
+    except Exception:
+        return value
+
+
 def _epe_request_payload_from_args(default_payload=None):
     p = dict(default_payload or {})
     for key in ["bot", "symbol", "side", "entry", "stop", "setup", "leverage", "capital", "mode", "intended_live"]:
@@ -11412,6 +11460,27 @@ def build_execution_policy_v1(capital=10000.0, bot=None, symbol=None, side=None,
     effective_risk_usdt = _epe_safe_float((sizing_item or {}).get("paper_effective_risk_usdt"), 0.0)
     effective_risk_pct = _epe_safe_float((sizing_item or {}).get("paper_effective_risk_pct"), 0.0)
 
+    try:
+        correlation_payload = build_correlation_engine_v1(capital=capital, bot=bot_norm or None, symbol=symbol_norm or None, side=side_norm or None, setup=setup)
+    except Exception as exc:
+        correlation_payload = {"ok": False, "error": str(exc), "signal_policy": None}
+    correlation_vote = _epe_vote_from_correlation_engine(correlation_payload)
+    votes.append(correlation_vote)
+
+    correlation_policy = correlation_payload.get("signal_policy") if isinstance(correlation_payload, dict) else None
+    correlation_multiplier = 1.0
+    correlation_adjusted = False
+    if isinstance(correlation_policy, dict):
+        correlation_multiplier = _epe_safe_float(correlation_policy.get("risk_multiplier"), 1.0)
+        correlation_multiplier = max(0.0, min(1.0, correlation_multiplier))
+        if correlation_multiplier < 1.0:
+            correlation_adjusted = True
+            suggested_notional = _epe_apply_correlation_multiplier(suggested_notional, correlation_multiplier) or 0.0
+            suggested_margin = _epe_apply_correlation_multiplier(suggested_margin, correlation_multiplier) or 0.0
+            suggested_qty = _epe_apply_correlation_multiplier(suggested_qty, correlation_multiplier)
+            effective_risk_usdt = _epe_apply_correlation_multiplier(effective_risk_usdt, correlation_multiplier) or 0.0
+            effective_risk_pct = _epe_apply_correlation_multiplier(effective_risk_pct, correlation_multiplier) or 0.0
+
     capital_result = _epe_capital_allocator_check(capital, bot_norm, suggested_notional, effective_risk_usdt)
     votes.append(_epe_vote_from_capital_allocator(capital_result))
 
@@ -11451,14 +11520,16 @@ def build_execution_policy_v1(capital=10000.0, bot=None, symbol=None, side=None,
         "decision": final_decision,
         "execution_action": execution_action,
         "confidence_score": confidence,
-        "recommended_order": {"bot": bot_norm, "symbol": symbol_norm, "side": side_norm, "entry": entry_f, "stop": stop_f, "setup": setup, "leverage": leverage_i, "paper_notional_usdt": round(suggested_notional, 4), "paper_margin_usdt": round(suggested_margin, 4), "paper_qty": suggested_qty, "paper_effective_risk_usdt": round(effective_risk_usdt, 4), "paper_effective_risk_pct": round(effective_risk_pct, 4), "live_allowed": (sizing_item or {}).get("live_allowed"), "live_notional_usdt": (sizing_item or {}).get("live_suggested_notional_usdt"), "live_block_reason": (sizing_item or {}).get("live_block_reason")},
+        "recommended_order": {"bot": bot_norm, "symbol": symbol_norm, "side": side_norm, "entry": entry_f, "stop": stop_f, "setup": setup, "leverage": leverage_i, "paper_notional_usdt": round(suggested_notional, 4), "paper_margin_usdt": round(suggested_margin, 4), "paper_qty": suggested_qty, "paper_effective_risk_usdt": round(effective_risk_usdt, 4), "paper_effective_risk_pct": round(effective_risk_pct, 4), "live_allowed": (sizing_item or {}).get("live_allowed"), "live_notional_usdt": (sizing_item or {}).get("live_suggested_notional_usdt"), "live_block_reason": (sizing_item or {}).get("live_block_reason"), "correlation_adjusted": correlation_adjusted, "correlation_multiplier": round(correlation_multiplier, 4)},
         "sizing": sizing_item,
+        "correlation": correlation_payload,
+        "correlation_policy": correlation_policy or {},
         "capital_allocator": capital_result,
         "risk_manager": risk_result[0] if isinstance(risk_result, tuple) else risk_result,
         "votes": votes,
         "reasons": reasons[:8],
-        "alerts": list(dict.fromkeys((sizing_payload.get("alerts") or []) + (["Decisão final contém DENY consultivo."] if final_decision == "DENY" else []) + (["Decisão final exige REDUCE/WAIT antes de qualquer execução."] if final_decision in {"REDUCE", "WAIT"} else []))),
-        "notes": ["Execution Policy Engine V1 está em modo consultivo/observação.", "Não executa ordens, não altera lote real, não altera risco real e não envia ordem para a corretora.", "Consolida Risk Manager, Capital Allocator, Dynamic Risk Budget e Dynamic Position Sizing em uma decisão única.", "A decisão final é auditável por votos de cada módulo.", "Preparado para alimentar OMS e Executor no futuro."],
+        "alerts": list(dict.fromkeys((sizing_payload.get("alerts") or []) + (correlation_payload.get("alerts") or [] if isinstance(correlation_payload, dict) else []) + (["Correlation Gate aplicou compressão ao tamanho sugerido."] if correlation_adjusted else []) + (["Decisão final contém DENY consultivo."] if final_decision == "DENY" else []) + (["Decisão final exige REDUCE/WAIT antes de qualquer execução."] if final_decision in {"REDUCE", "WAIT"} else []))),
+        "notes": ["Execution Policy Engine V1 está em modo consultivo/observação.", "Não executa ordens, não altera lote real, não altera risco real e não envia ordem para a corretora.", "Consolida Market Regime, Meta Strategy, Correlation Gate, Risk Manager, Capital Allocator, Dynamic Risk Budget e Dynamic Position Sizing em uma decisão única.", "A decisão final é auditável por votos de cada módulo.", "Preparado para alimentar OMS e Executor no futuro."],
     }
     EXECUTION_POLICY_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
     return payload
@@ -11553,6 +11624,7 @@ DECISION_SCORE_ENGINE_V1_WEIGHTS = {
     "Dynamic Position Sizing V1.1": 18.0,
     "Portfolio Advisor / Risk Budget": 17.0,
     "Capital Allocator": 15.0,
+    "Correlation Engine V1": 20.0,
     "Risk Manager Global": 30.0,
     "Live Execution Context": 5.0,
 }
@@ -11624,6 +11696,24 @@ def _dse_adjust_vote_points(vote, execution_payload=None):
         if details.get("warnings"):
             points -= 2
             adjustments.append("warnings operacionais")
+
+    if module == "Correlation Engine V1":
+        details = vote.get("details") or {}
+        mult = _dse_safe_float(details.get("risk_multiplier"), 1.0)
+        same_symbol = _dse_safe_float(details.get("same_symbol_count"), 0.0)
+        severity = str(details.get("severity") or "").upper()
+        if mult < 0.25:
+            points -= 8
+            adjustments.append("correlação comprime fortemente o risco")
+        elif mult < 0.5:
+            points -= 4
+            adjustments.append("correlação comprime risco")
+        if same_symbol > 0:
+            points -= 5
+            adjustments.append("ativo já possui exposição aberta")
+        if severity == "HIGH" and raw_vote in {"REDUCE", "DENY"}:
+            points -= 3
+            adjustments.append("cluster correlacionado em severidade alta")
 
     if module == "Live Execution Context":
         # Em OBSERVATION_ONLY, contexto LIVE é informativo, mas se LIVE estivesse pretendido e bloqueado, pesa contra.
@@ -11785,6 +11875,8 @@ def build_decision_score_engine_v1(capital=10000.0, bot=None, symbol=None, side=
         "execution_policy_confidence": execution_payload.get("confidence_score"),
         "recommended_order": execution_payload.get("recommended_order") or {},
         "sizing": sizing,
+        "correlation": execution_payload.get("correlation") or {},
+        "correlation_policy": execution_payload.get("correlation_policy") or {},
         "risk_manager": risk_manager,
         "capital_allocator": execution_payload.get("capital_allocator") or {},
         "module_scores": module_scores,
