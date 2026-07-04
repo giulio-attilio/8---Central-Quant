@@ -18447,6 +18447,541 @@ def strategy_evolution_engine_v1_summary_route():
 
 
 
+
+# ==========================================================
+# TRADE LIFECYCLE MANAGER V1 - CENTRAL QUANT
+# ==========================================================
+
+TRADE_LIFECYCLE_MANAGER_V1_VERSION = "2026-07-04-TRADE-LIFECYCLE-MANAGER-V1"
+TRADE_LIFECYCLE_MANAGER_V1_MODE = "OBSERVATION_ONLY"
+TRADE_LIFECYCLE_MANAGER_V1_FILE = CENTRAL_DATA_DIR / "trade_lifecycle_manager_v1.jsonl"
+TRADE_LIFECYCLE_MANAGER_V1_CACHE = {"last_generated_at": None, "last_trade_id": None}
+
+
+def _tlm_safe_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _tlm_safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _tlm_round(value, ndigits=4):
+    try:
+        return round(float(value), ndigits)
+    except Exception:
+        return value
+
+
+def _tlm_norm_symbol(value):
+    try:
+        return normalize_registry_symbol(value)
+    except Exception:
+        return str(value or "").upper().replace("/USDT:USDT", "USDT").replace("/", "").strip()
+
+
+def _tlm_norm_side(value):
+    s = str(value or "").upper().strip()
+    if s == "BUY":
+        return "LONG"
+    if s == "SELL":
+        return "SHORT"
+    return s
+
+
+def _tlm_norm_bot(value):
+    try:
+        return normalize_registry_bot(value)
+    except Exception:
+        return str(value or "").upper().strip()
+
+
+def _tlm_trade_id(trade):
+    if not isinstance(trade, dict):
+        return None
+    return (
+        trade.get("trade_id")
+        or trade.get("id")
+        or trade.get("uid")
+        or trade.get("decision_id")
+        or f"{_tlm_norm_bot(trade.get('bot'))}:{_tlm_norm_symbol(trade.get('symbol') or trade.get('symbol_clean'))}:{_tlm_norm_side(trade.get('side'))}:{trade.get('setup') or ''}:{trade.get('entry') or trade.get('entry_price') or ''}"
+    )
+
+
+def _tlm_trade_symbol(trade):
+    return _tlm_norm_symbol((trade or {}).get("symbol_clean") or (trade or {}).get("symbol") or (trade or {}).get("ativo") or (trade or {}).get("pair"))
+
+
+def _tlm_trade_side(trade):
+    return _tlm_norm_side((trade or {}).get("side") or (trade or {}).get("direction"))
+
+
+def _tlm_trade_entry(trade):
+    return _tlm_safe_float((trade or {}).get("entry") or (trade or {}).get("entry_price") or (trade or {}).get("preco_entrada"), None)
+
+
+def _tlm_trade_stop(trade):
+    return _tlm_safe_float((trade or {}).get("stop") or (trade or {}).get("sl") or (trade or {}).get("stop_loss"), None)
+
+
+def _tlm_trade_tp50(trade):
+    return _tlm_safe_float((trade or {}).get("tp50") or (trade or {}).get("take_profit_50") or (trade or {}).get("tp_50"), None)
+
+
+def _tlm_append_jsonl(item):
+    try:
+        TRADE_LIFECYCLE_MANAGER_V1_FILE.parent.mkdir(exist_ok=True)
+        with open(TRADE_LIFECYCLE_MANAGER_V1_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _tlm_read_records(limit=1000):
+    records = []
+    try:
+        if not TRADE_LIFECYCLE_MANAGER_V1_FILE.exists():
+            return []
+        with open(TRADE_LIFECYCLE_MANAGER_V1_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-int(limit or 1000):]
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+    except Exception:
+        return records
+    return records
+
+
+def _tlm_registry_snapshot_light():
+    snap = central_trade_registry_snapshot(include_trades=True)
+    open_trades = snap.get("open_trades") or []
+    closed_trades = snap.get("closed_trades") or []
+    if not isinstance(open_trades, list):
+        open_trades = []
+    if not isinstance(closed_trades, list):
+        closed_trades = []
+    return snap, [x for x in open_trades if isinstance(x, dict)], [x for x in closed_trades if isinstance(x, dict)]
+
+
+def _tlm_find_trade(trades, trade_id=None, bot=None, symbol=None, side=None):
+    trade_id = str(trade_id or "").strip()
+    bot_n = _tlm_norm_bot(bot)
+    symbol_n = _tlm_norm_symbol(symbol)
+    side_n = _tlm_norm_side(side)
+    for t in trades or []:
+        if trade_id and str(_tlm_trade_id(t) or "") == trade_id:
+            return t
+    for t in trades or []:
+        if bot_n and _tlm_norm_bot(t.get("bot")) != bot_n:
+            continue
+        if symbol_n and _tlm_trade_symbol(t) != symbol_n:
+            continue
+        if side_n and _tlm_trade_side(t) != side_n:
+            continue
+        return t
+    return None
+
+
+def _tlm_pnl_from_closed_trade(trade):
+    if not isinstance(trade, dict):
+        return {"pnl_pct": None, "result_r": None, "outcome": "UNKNOWN"}
+    pnl_pct = _tlm_safe_float(trade.get("pnl_pct") or trade.get("pnl_percent") or trade.get("resultado_pct"), None)
+    result_r = _tlm_safe_float(trade.get("r") or trade.get("result_r") or trade.get("r_multiple") or trade.get("pnl_r"), None)
+    outcome = str(trade.get("outcome") or trade.get("result") or trade.get("status_result") or "").upper().strip()
+    if outcome not in {"WIN", "LOSS", "BE"}:
+        try:
+            outcome = _le_normalize_outcome(outcome=None, result_r=result_r, pnl_pct=pnl_pct)
+        except Exception:
+            if result_r is not None:
+                outcome = "WIN" if result_r > 0.05 else ("LOSS" if result_r < -0.05 else "BE")
+            elif pnl_pct is not None:
+                outcome = "WIN" if pnl_pct > 0.02 else ("LOSS" if pnl_pct < -0.02 else "BE")
+            else:
+                outcome = "UNKNOWN"
+    return {"pnl_pct": pnl_pct, "result_r": result_r, "outcome": outcome}
+
+
+def _tlm_open_trade_lifecycle_state(trade):
+    symbol = _tlm_trade_symbol(trade)
+    side = _tlm_trade_side(trade)
+    entry = _tlm_trade_entry(trade)
+    stop = _tlm_trade_stop(trade)
+    tp50 = _tlm_trade_tp50(trade)
+    runner_pct = _tlm_safe_float(trade.get("runner_pct") or trade.get("open_pnl_pct") or trade.get("pnl_pct"), 0.0) or 0.0
+    runner_r = _tlm_safe_float(trade.get("runner_r") or trade.get("open_pnl_r") or trade.get("r"), 0.0) or 0.0
+    flags = []
+    if _tlm_safe_float(trade.get("tp50_hit"), None) or str(trade.get("status") or "").upper().find("TP50") >= 0:
+        flags.append("TP50_REACHED")
+    if _tlm_safe_float(trade.get("breakeven"), None) or str(trade.get("status") or "").upper().find("BE") >= 0:
+        flags.append("BREAKEVEN_ACTIVE")
+    if _tlm_safe_float(trade.get("trailing"), None) or str(trade.get("status") or "").upper().find("TRAIL") >= 0:
+        flags.append("TRAILING_ACTIVE")
+    if runner_r >= 1:
+        flags.append("RUNNER_1R_PLUS")
+    if runner_r >= 2:
+        flags.append("RUNNER_2R_PLUS")
+    state = "OPEN_TRACKING"
+    if "TRAILING_ACTIVE" in flags:
+        state = "OPEN_TRAILING"
+    elif "BREAKEVEN_ACTIVE" in flags:
+        state = "OPEN_BREAKEVEN"
+    elif "TP50_REACHED" in flags:
+        state = "OPEN_AFTER_TP50"
+    return {
+        "trade_id": _tlm_trade_id(trade),
+        "bot": _tlm_norm_bot(trade.get("bot")),
+        "setup": trade.get("setup"),
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "stop": stop,
+        "tp50": tp50,
+        "state": state,
+        "runner_pct": _tlm_round(runner_pct, 4),
+        "runner_r": _tlm_round(runner_r, 4),
+        "flags": flags,
+        "needs_outcome": False,
+    }
+
+
+def _tlm_closed_trade_lifecycle_state(trade, learning_records=None, outcome_records=None):
+    pnl = _tlm_pnl_from_closed_trade(trade)
+    tid = _tlm_trade_id(trade)
+    matching_learning = None
+    matching_outcome = None
+    for r in reversed(learning_records or []):
+        if str(r.get("trade_id") or "") == str(tid):
+            matching_learning = r
+            break
+    for r in reversed(outcome_records or []):
+        if str(r.get("trade_id") or "") == str(tid):
+            matching_outcome = r
+            break
+    return {
+        "trade_id": tid,
+        "bot": _tlm_norm_bot(trade.get("bot")),
+        "setup": trade.get("setup"),
+        "symbol": _tlm_trade_symbol(trade),
+        "side": _tlm_trade_side(trade),
+        "entry": _tlm_trade_entry(trade),
+        "stop": _tlm_trade_stop(trade),
+        "exit": _tlm_safe_float(trade.get("exit") or trade.get("exit_price") or trade.get("close_price"), None),
+        "state": "CLOSED_PENDING_OUTCOME" if not matching_outcome else "CLOSED_EVALUATED",
+        "outcome": pnl.get("outcome"),
+        "result_r": pnl.get("result_r"),
+        "pnl_pct": pnl.get("pnl_pct"),
+        "learning_id": matching_learning.get("learning_id") if matching_learning else None,
+        "outcome_evaluation_id": matching_outcome.get("evaluation_id") if matching_outcome else None,
+        "needs_outcome": not bool(matching_outcome),
+    }
+
+
+def build_trade_lifecycle_manager_v1(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, trade_id=None, record_decision=False, evaluate_closed=False, persist=False):
+    """
+    Machine-first lifecycle layer.
+    It does not execute. It connects: signal/decision -> registry -> close -> outcome -> learning.
+    """
+    global TRADE_LIFECYCLE_MANAGER_V1_CACHE
+    generated_at = data_hora_sp_str()
+    alerts = []
+    errors = []
+    actions = []
+
+    snap, open_trades, closed_trades = _tlm_registry_snapshot_light()
+    learning_records = _le_read_records(limit=max(LEARNING_ENGINE_V1_DEFAULT_READ_LIMIT, 5000)) if '_le_read_records' in globals() else []
+    outcome_records = _oe_read_records(limit=5000) if '_oe_read_records' in globals() else []
+
+    open_states = [_tlm_open_trade_lifecycle_state(t) for t in open_trades]
+    closed_states = [_tlm_closed_trade_lifecycle_state(t, learning_records, outcome_records) for t in closed_trades[-50:]]
+    pending_outcomes = [x for x in closed_states if x.get("needs_outcome")]
+
+    # Optional signal decision registration.
+    decision_payload = None
+    decision_saved = False
+    if bot or symbol or side or entry or stop:
+        try:
+            decision_payload = build_learning_engine_v1(
+                capital=capital,
+                bot=bot,
+                symbol=symbol,
+                side=side,
+                entry=entry,
+                stop=stop,
+                setup=setup,
+                leverage=leverage,
+                record=bool(record_decision),
+            )
+            decision_saved = bool(decision_payload.get("record_saved"))
+            if record_decision and decision_saved:
+                actions.append("DECISION_RECORDED_FOR_LIFECYCLE")
+            elif record_decision and not decision_saved:
+                alerts.append("Learning decision foi solicitado, mas não foi salvo.")
+        except Exception as exc:
+            errors.append(f"decision_learning_error: {exc}")
+            decision_payload = {"ok": False, "error": str(exc)}
+
+    selected_open = _tlm_find_trade(open_trades, trade_id=trade_id, bot=bot, symbol=symbol, side=side)
+    selected_closed = _tlm_find_trade(closed_trades, trade_id=trade_id, bot=bot, symbol=symbol, side=side)
+    selected_trade_state = None
+    if selected_open:
+        selected_trade_state = _tlm_open_trade_lifecycle_state(selected_open)
+    elif selected_closed:
+        selected_trade_state = _tlm_closed_trade_lifecycle_state(selected_closed, learning_records, outcome_records)
+
+    outcome_evaluation = None
+    if evaluate_closed and selected_trade_state and selected_trade_state.get("state") == "CLOSED_PENDING_OUTCOME" and selected_trade_state.get("learning_id"):
+        try:
+            outcome_evaluation = build_outcome_evaluator_v1(
+                learning_id=selected_trade_state.get("learning_id"),
+                trade_id=selected_trade_state.get("trade_id"),
+                outcome=selected_trade_state.get("outcome"),
+                result_r=selected_trade_state.get("result_r"),
+                pnl_pct=selected_trade_state.get("pnl_pct"),
+                note="auto_from_trade_lifecycle_v1",
+                save=True,
+                force=True,
+            )
+            if outcome_evaluation.get("ok"):
+                actions.append("OUTCOME_EVALUATED_FROM_CLOSED_TRADE")
+            else:
+                alerts.append(f"Outcome automático não aplicado: {outcome_evaluation.get('error') or outcome_evaluation.get('message')}")
+        except Exception as exc:
+            errors.append(f"outcome_auto_evaluation_error: {exc}")
+
+    stats = {
+        "open_trades": len(open_trades),
+        "closed_trades": len(closed_trades),
+        "open_tracking": len(open_states),
+        "closed_evaluated": len([x for x in closed_states if x.get("state") == "CLOSED_EVALUATED"]),
+        "closed_pending_outcome": len(pending_outcomes),
+        "learning_records": len(learning_records or []),
+        "outcome_evaluations": len([x for x in outcome_records if x.get("record_type") == "OUTCOME_EVALUATION"]),
+    }
+
+    if stats["closed_pending_outcome"]:
+        alerts.append(f"{stats['closed_pending_outcome']} trade(s) fechado(s) ainda precisam de outcome avaliado.")
+    if not open_trades and not closed_trades:
+        alerts.append("Trade Registry sem trades; lifecycle fica em espera.")
+    if decision_payload and decision_payload.get("adaptive_decision") in {"ALLOW", "REDUCE"} and not record_decision:
+        alerts.append("Há decisão avaliável para sinal, mas ela não foi registrada. Use record_decision=true para lifecycle completo.")
+
+    lifecycle_ready = bool(snap.get("ok"))
+    learning_loop_ready = stats["outcome_evaluations"] > 0
+    automation_policy = {
+        "trade_lifecycle_ready": lifecycle_ready,
+        "human_report_required": False,
+        "route": "DECISION_SCORE_TO_LEARNING_TO_REGISTRY_TO_OUTCOME_TO_ADAPTIVE_WEIGHTS",
+        "record_decisions_before_execution": True,
+        "auto_outcome_evaluation_ready": True,
+        "learning_loop_ready": learning_loop_ready,
+        "blocked_actions": [
+            "EXECUTE_WITHOUT_LIFECYCLE_RECORD",
+            "CLOSE_WITHOUT_OUTCOME_EVALUATION",
+            "BYPASS_LEARNING_FEEDBACK",
+        ],
+        "allowed_actions_now": [
+            "TRACK_OPEN_TRADES",
+            "LINK_DECISIONS_TO_TRADES",
+            "EVALUATE_CLOSED_TRADES_WITH_KNOWN_OUTCOME",
+            "FEED_OUTCOME_EVALUATOR",
+        ],
+    }
+
+    payload = {
+        "ok": True,
+        "version": TRADE_LIFECYCLE_MANAGER_V1_VERSION,
+        "generated_at": generated_at,
+        "mode": TRADE_LIFECYCLE_MANAGER_V1_MODE,
+        "capital": capital,
+        "machine_first": True,
+        "human_report_required": False,
+        "registry": {
+            "ok": snap.get("ok"),
+            "open_count": snap.get("open_count"),
+            "closed_count": snap.get("closed_count"),
+            "by_bot": snap.get("by_bot"),
+            "by_symbol": snap.get("by_symbol"),
+            "by_side": snap.get("by_side"),
+            "trade_registry_file": snap.get("trade_registry_file"),
+        },
+        "stats": stats,
+        "selected_trade": selected_trade_state,
+        "decision_context": decision_payload,
+        "decision_saved": decision_saved,
+        "outcome_evaluation": outcome_evaluation,
+        "open_lifecycle_sample": open_states[:25],
+        "closed_lifecycle_sample": closed_states[-25:],
+        "pending_outcome_sample": pending_outcomes[:20],
+        "automation_policy": automation_policy,
+        "actions": actions,
+        "alerts": alerts,
+        "errors": errors,
+        "notes": [
+            "Trade Lifecycle Manager V1 é machine-first e não depende de relatório humano.",
+            "V1 não executa ordens; ele conecta decisão, registro, acompanhamento, fechamento, outcome e aprendizado.",
+            "Cada decisão executável deve gerar um learning_id antes da execução para permitir avaliação posterior.",
+            "Trades fechados com resultado conhecido podem alimentar automaticamente Outcome Evaluator e Adaptive Weight Engine.",
+        ],
+    }
+
+    if persist:
+        saved, err = _tlm_append_jsonl({"record_type": "TRADE_LIFECYCLE_SNAPSHOT", **payload})
+        payload["state_saved"] = saved
+        payload["state_save_error"] = err
+    else:
+        payload["state_saved"] = False
+
+    TRADE_LIFECYCLE_MANAGER_V1_CACHE = {"last_generated_at": generated_at, "last_trade_id": (selected_trade_state or {}).get("trade_id")}
+    return payload
+
+
+def build_trade_lifecycle_manager_v1_text(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, trade_id=None, record_decision=False, evaluate_closed=False, persist=False):
+    payload = build_trade_lifecycle_manager_v1(
+        capital=capital,
+        bot=bot,
+        symbol=symbol,
+        side=side,
+        entry=entry,
+        stop=stop,
+        setup=setup,
+        leverage=leverage,
+        trade_id=trade_id,
+        record_decision=record_decision,
+        evaluate_closed=evaluate_closed,
+        persist=persist,
+    )
+    st = payload.get("stats") or {}
+    reg = payload.get("registry") or {}
+    auto = payload.get("automation_policy") or {}
+    sel = payload.get("selected_trade") or {}
+    dec = payload.get("decision_context") or {}
+    lines = [
+        "🔁 TRADE LIFECYCLE MANAGER V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Estado autônomo:",
+        f"Lifecycle ready: {auto.get('trade_lifecycle_ready')} | Learning loop ready: {auto.get('learning_loop_ready')} | Human report required: {payload.get('human_report_required')}",
+        f"Rota: {auto.get('route')}",
+        "",
+        "Registry:",
+        f"Open: {reg.get('open_count')} | Closed: {reg.get('closed_count')} | arquivo: {reg.get('trade_registry_file')}",
+        f"By bot: {reg.get('by_bot')}",
+        "",
+        "Lifecycle stats:",
+        f"Open tracking: {st.get('open_tracking')} | Closed evaluated: {st.get('closed_evaluated')} | Pending outcome: {st.get('closed_pending_outcome')}",
+        f"Learning records: {st.get('learning_records')} | Outcome evaluations: {st.get('outcome_evaluations')}",
+        "",
+    ]
+    if sel:
+        lines += [
+            "Trade selecionado:",
+            f"Trade ID: {sel.get('trade_id')}",
+            f"Bot: {sel.get('bot')} | Setup: {sel.get('setup')} | Ativo: {sel.get('symbol')} | Side: {sel.get('side')}",
+            f"Estado: {sel.get('state')} | Outcome: {sel.get('outcome')} | R: {sel.get('result_r')} | PnL%: {sel.get('pnl_pct')}",
+            f"Learning ID: {sel.get('learning_id')} | Evaluation ID: {sel.get('outcome_evaluation_id')}",
+            "",
+        ]
+    if dec:
+        lines += [
+            "Decisão/sinal avaliado:",
+            f"Learning ID: {dec.get('learning_id')} | salvo: {dec.get('record_saved')} | modo: {dec.get('record_mode')}",
+            f"Decision: {dec.get('adaptive_decision')} | Score: {dec.get('adaptive_decision_score')} | Hard deny: {dec.get('hard_deny')}",
+            "",
+        ]
+    lines += ["Amostra de abertos:"]
+    for t in payload.get("open_lifecycle_sample") or []:
+        lines.append(f"- {t.get('bot')} {t.get('symbol')} {t.get('side')} | {t.get('state')} | R={t.get('runner_r')} | flags={','.join(t.get('flags') or []) or '-'}")
+    lines += ["", "Pendentes de outcome:"]
+    for t in payload.get("pending_outcome_sample") or []:
+        lines.append(f"- {t.get('bot')} {t.get('symbol')} {t.get('side')} | trade_id={t.get('trade_id')} | outcome={t.get('outcome')} | learning={t.get('learning_id')}")
+    lines += ["", "Ações:"]
+    for a in payload.get("actions") or []:
+        lines.append(f"- {a}")
+    lines += ["", "Alertas:"]
+    for a in payload.get("alerts") or []:
+        lines.append(f"- {a}")
+    if payload.get("errors"):
+        lines += ["", "Erros:"]
+        for e in payload.get("errors") or []:
+            lines.append(f"- {e}")
+    lines += ["", "Notas:"]
+    for n in payload.get("notes") or []:
+        lines.append(f"- {n}")
+    return "\n".join(lines), payload
+
+
+@app.route("/trade/lifecycle/v1", methods=["GET", "POST"])
+@app.route("/lifecycle/trade/v1", methods=["GET", "POST"])
+@app.route("/trade-lifecycle/v1", methods=["GET", "POST"])
+def trade_lifecycle_manager_v1_route():
+    body = request.get_json(silent=True) or {}
+    def arg(name, default=None):
+        return body.get(name, request.args.get(name, default))
+    capital = _tlm_safe_float(arg("capital"), 10000.0)
+    bot = arg("bot")
+    symbol = arg("symbol")
+    side = arg("side")
+    entry = _tlm_safe_float(arg("entry"), None)
+    stop = _tlm_safe_float(arg("stop"), None)
+    setup = arg("setup")
+    leverage = _tlm_safe_float(arg("leverage"), None)
+    trade_id = arg("trade_id")
+    record_decision = str(arg("record_decision", arg("record", ""))).lower() in {"1", "true", "yes", "sim", "on", "save"}
+    evaluate_closed = str(arg("evaluate_closed", arg("evaluate", ""))).lower() in {"1", "true", "yes", "sim", "on"}
+    persist = str(arg("persist", "")).lower() in {"1", "true", "yes", "sim", "on", "save"}
+    text, payload = build_trade_lifecycle_manager_v1_text(
+        capital=capital,
+        bot=bot,
+        symbol=symbol,
+        side=side,
+        entry=entry,
+        stop=stop,
+        setup=setup,
+        leverage=leverage,
+        trade_id=trade_id,
+        record_decision=record_decision,
+        evaluate_closed=evaluate_closed,
+        persist=persist,
+    )
+    return {"ok": True, "payload": payload, "text": text}
+
+
+@app.route("/trade/lifecycle/summary/v1", methods=["GET", "POST"])
+@app.route("/trade-lifecycle/summary/v1", methods=["GET", "POST"])
+def trade_lifecycle_manager_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    capital = _tlm_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    payload = build_trade_lifecycle_manager_v1(capital=capital)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "registry": payload.get("registry"),
+        "stats": payload.get("stats"),
+        "automation_policy": payload.get("automation_policy"),
+        "alerts": payload.get("alerts"),
+    }
+
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
