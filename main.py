@@ -11539,6 +11539,354 @@ def execution_policy_v1_summary_route():
     return {"ok": True, "version": payload.get("version"), "generated_at": payload.get("generated_at"), "mode": payload.get("mode"), "inputs": payload.get("inputs"), "decision": payload.get("decision"), "execution_action": payload.get("execution_action"), "confidence_score": payload.get("confidence_score"), "recommended_order": payload.get("recommended_order"), "votes": payload.get("votes"), "reasons": payload.get("reasons"), "alerts": payload.get("alerts"), "cache": {"last_generated_at": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_capital")}}
 
 
+
+# ==========================================================
+# DECISION SCORE ENGINE V1 - CENTRAL QUANT
+# ==========================================================
+
+DECISION_SCORE_ENGINE_V1_VERSION = "2026-07-04-DECISION-SCORE-ENGINE-V1"
+DECISION_SCORE_ENGINE_V1_MODE = "OBSERVATION_ONLY"
+DECISION_SCORE_ENGINE_V1_CACHE = {"last_payload": None, "last_generated_at": None, "last_capital": None}
+
+DECISION_SCORE_ENGINE_V1_WEIGHTS = {
+    "Input Validation": 8.0,
+    "Dynamic Position Sizing V1.1": 18.0,
+    "Portfolio Advisor / Risk Budget": 17.0,
+    "Capital Allocator": 15.0,
+    "Risk Manager Global": 30.0,
+    "Live Execution Context": 5.0,
+}
+
+DECISION_SCORE_ENGINE_V1_POINTS = {
+    "ALLOW": 100.0,
+    "REDUCE": 67.0,
+    "WAIT": 45.0,
+    "DENY": 0.0,
+    "INFO": 55.0,
+}
+
+
+def _dse_safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _dse_clip(value, low, high):
+    return max(float(low), min(float(high), float(value)))
+
+
+def _dse_vote_weight(vote):
+    module = str((vote or {}).get("module") or "").strip()
+    return float(DECISION_SCORE_ENGINE_V1_WEIGHTS.get(module, _dse_safe_float((vote or {}).get("weight"), 1.0) * 10.0))
+
+
+def _dse_vote_points(vote):
+    raw_vote = str((vote or {}).get("vote") or "INFO").upper().strip()
+    return float(DECISION_SCORE_ENGINE_V1_POINTS.get(raw_vote, 45.0))
+
+
+def _dse_adjust_vote_points(vote, execution_payload=None):
+    """Ajustes pequenos para tornar o score mais explicativo sem substituir o voto original."""
+    vote = vote or {}
+    module = str(vote.get("module") or "")
+    raw_vote = str(vote.get("vote") or "INFO").upper().strip()
+    points = _dse_vote_points(vote)
+    adjustments = []
+
+    if module == "Dynamic Position Sizing V1.1":
+        details = vote.get("details") or {}
+        util = _dse_safe_float(details.get("risk_budget_utilization_pct"), None)
+        if util is not None:
+            if util < 2:
+                points -= 7
+                adjustments.append("uso do risk budget muito baixo")
+            elif util < 10:
+                points -= 3
+                adjustments.append("uso do risk budget baixo")
+            elif util > 75 and raw_vote in {"ALLOW", "REDUCE"}:
+                points += 3
+                adjustments.append("uso do risk budget saudável")
+        executable = str(details.get("executable_size_state") or "").upper()
+        if "CAP_LIMITED" in executable:
+            points -= 4
+            adjustments.append("tamanho limitado por cap")
+
+    if module == "Risk Manager Global":
+        details = vote.get("details") or {}
+        reasons = " ".join([str(x) for x in details.get("reasons") or []]).lower()
+        if raw_vote == "DENY" and ("concentração" in reasons or "exposição" in reasons):
+            points -= 5
+            adjustments.append("deny por concentração/exposição")
+        if details.get("warnings"):
+            points -= 2
+            adjustments.append("warnings operacionais")
+
+    if module == "Live Execution Context":
+        # Em OBSERVATION_ONLY, contexto LIVE é informativo, mas se LIVE estivesse pretendido e bloqueado, pesa contra.
+        try:
+            intended_live = bool(((execution_payload or {}).get("inputs") or {}).get("intended_live"))
+            live_ctx = (execution_payload or {}).get("sizing", {}).get("live_caps", {}) or {}
+            real_enabled = bool(live_ctx.get("real_trading_enabled"))
+            if intended_live and not real_enabled:
+                points = min(points, 20.0)
+                adjustments.append("LIVE pretendido mas real trading bloqueado")
+        except Exception:
+            pass
+
+    return round(_dse_clip(points, 0.0, 100.0), 4), adjustments
+
+
+def _dse_decision_from_score(score, hard_deny=False, hard_wait=False, sizing_action=""):
+    sizing_action = str(sizing_action or "").upper()
+    if hard_deny:
+        return "DENY"
+    if "DO_NOT_OPEN" in sizing_action:
+        return "DENY"
+    if hard_wait and score < 72:
+        return "WAIT"
+    if score >= 72:
+        return "ALLOW"
+    if score >= 56:
+        return "REDUCE"
+    if score >= 42:
+        return "WAIT"
+    return "DENY"
+
+
+def _dse_confidence(score, votes, hard_deny=False):
+    votes = votes or []
+    if not votes:
+        return 50.0
+    deny_weight = sum(_dse_vote_weight(v) for v in votes if str(v.get("vote") or "").upper() == "DENY")
+    allow_weight = sum(_dse_vote_weight(v) for v in votes if str(v.get("vote") or "").upper() == "ALLOW")
+    total = sum(_dse_vote_weight(v) for v in votes) or 1.0
+    separation = abs(allow_weight - deny_weight) / total
+    distance = abs(float(score) - 50.0) / 50.0
+    confidence = 45.0 + (distance * 35.0) + (separation * 20.0)
+    if hard_deny:
+        confidence += 8.0
+    return round(_dse_clip(confidence, 0.0, 100.0), 2)
+
+
+def _dse_request_payload_from_args(default_payload=None):
+    p = dict(default_payload or {})
+    for key in ["bot", "symbol", "side", "entry", "stop", "setup", "leverage", "capital", "mode", "intended_live"]:
+        val = request.args.get(key)
+        if val not in [None, ""]:
+            p[key] = val
+    return p
+
+
+def build_decision_score_engine_v1(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None):
+    global DECISION_SCORE_ENGINE_V1_CACHE
+
+    capital = _dse_safe_float(capital, 10000.0)
+    execution_payload = build_execution_policy_v1(
+        capital=capital,
+        bot=bot,
+        symbol=symbol,
+        side=side,
+        entry=entry,
+        stop=stop,
+        setup=setup,
+        leverage=leverage,
+        mode=mode,
+        intended_live=intended_live,
+    )
+
+    votes = execution_payload.get("votes") or []
+    module_scores = []
+    total_weight = 0.0
+    weighted_points = 0.0
+
+    for vote in votes:
+        weight = _dse_vote_weight(vote)
+        base_points = _dse_vote_points(vote)
+        adjusted_points, adjustments = _dse_adjust_vote_points(vote, execution_payload=execution_payload)
+        contribution = weight * adjusted_points
+        total_weight += weight
+        weighted_points += contribution
+        module_scores.append({
+            "module": vote.get("module"),
+            "vote": vote.get("vote"),
+            "weight": round(weight, 4),
+            "base_points": round(base_points, 4),
+            "adjusted_points": round(adjusted_points, 4),
+            "contribution": round(contribution, 4),
+            "reason": vote.get("reason"),
+            "adjustments": adjustments,
+            "details": vote.get("details") or {},
+        })
+
+    raw_score = (weighted_points / total_weight) if total_weight else 50.0
+
+    sizing = execution_payload.get("sizing") or {}
+    risk_manager = execution_payload.get("risk_manager") or {}
+    hard_deny = any(str(v.get("vote") or "").upper() == "DENY" and str(v.get("module") or "") == "Risk Manager Global" for v in votes)
+    hard_wait = False
+    try:
+        hard_wait = bool(((execution_payload.get("inputs") or {}).get("intended_live")) and not (((sizing.get("live_caps") or {}).get("real_trading_enabled"))))
+    except Exception:
+        hard_wait = False
+
+    decision = _dse_decision_from_score(raw_score, hard_deny=hard_deny, hard_wait=hard_wait, sizing_action=sizing.get("sizing_action"))
+    confidence = _dse_confidence(raw_score, votes, hard_deny=hard_deny)
+
+    deny_votes = [m for m in module_scores if str(m.get("vote") or "").upper() == "DENY"]
+    reduce_votes = [m for m in module_scores if str(m.get("vote") or "").upper() == "REDUCE"]
+    allow_votes = [m for m in module_scores if str(m.get("vote") or "").upper() == "ALLOW"]
+    wait_votes = [m for m in module_scores if str(m.get("vote") or "").upper() == "WAIT"]
+
+    score_band = "EXCELLENT" if raw_score >= 82 else "GOOD" if raw_score >= 72 else "REDUCE_ZONE" if raw_score >= 56 else "WAIT_ZONE" if raw_score >= 42 else "DENY_ZONE"
+    execution_action = {
+        "ALLOW": "ALLOW_SCORE_OBSERVATION",
+        "REDUCE": "ALLOW_REDUCED_BY_SCORE_OBSERVATION",
+        "WAIT": "WAIT_BY_SCORE_OBSERVATION",
+        "DENY": "DENY_BY_SCORE_OBSERVATION",
+    }.get(decision, "WAIT_BY_SCORE_OBSERVATION")
+
+    reasons = []
+    if hard_deny:
+        reasons.append("Risk Manager Global gerou hard deny consultivo; decisão final permanece DENY mesmo com módulos favoráveis.")
+    if deny_votes:
+        reasons.append("Há voto DENY relevante no comitê decisório.")
+    if reduce_votes:
+        reasons.append("Sizing ou política operacional recomenda redução de tamanho.")
+    if allow_votes and not deny_votes:
+        reasons.append("Módulos principais favorecem execução consultiva.")
+    if sizing.get("binding_limit"):
+        binding = sizing.get("binding_limit") or {}
+        reasons.append(f"Limitador dominante do sizing: {binding.get('name')} ({binding.get('value_usdt')} USDT).")
+    util = _dse_safe_float(sizing.get("risk_budget_utilization_pct"), None)
+    if util is not None and util < 10:
+        reasons.append(f"Uso efetivo do risk per trade baixo: {round(util, 4)}%.")
+    if not reasons:
+        reasons.append("Decision Score calculado por ponderação dos votos dos módulos.")
+
+    payload = {
+        "ok": True,
+        "version": DECISION_SCORE_ENGINE_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": DECISION_SCORE_ENGINE_V1_MODE,
+        "capital": capital,
+        "inputs": execution_payload.get("inputs") or {},
+        "decision_score": round(raw_score, 2),
+        "score_band": score_band,
+        "decision": decision,
+        "execution_action": execution_action,
+        "confidence_score": confidence,
+        "hard_deny": bool(hard_deny),
+        "hard_wait": bool(hard_wait),
+        "execution_policy_decision": execution_payload.get("decision"),
+        "execution_policy_confidence": execution_payload.get("confidence_score"),
+        "recommended_order": execution_payload.get("recommended_order") or {},
+        "sizing": sizing,
+        "risk_manager": risk_manager,
+        "capital_allocator": execution_payload.get("capital_allocator") or {},
+        "module_scores": module_scores,
+        "vote_summary": {
+            "allow": len(allow_votes),
+            "reduce": len(reduce_votes),
+            "wait": len(wait_votes),
+            "deny": len(deny_votes),
+            "total_weight": round(total_weight, 4),
+            "weighted_points": round(weighted_points, 4),
+        },
+        "reasons": reasons[:10],
+        "alerts": list(dict.fromkeys((execution_payload.get("alerts") or []) + (["Decision Score aplicado com hard deny do Risk Manager."] if hard_deny else []) + (["Decision Score indica redução/espera antes de execução."] if decision in {"REDUCE", "WAIT"} else []))),
+        "notes": [
+            "Decision Score Engine V1 está em modo consultivo/observação.",
+            "Não executa ordens, não altera lote real, não altera risco real e não envia ordem para a corretora.",
+            "Converte votos do Execution Policy Engine V1 em pontuação ponderada.",
+            "Risk Manager pode atuar como hard deny consultivo quando a regra de risco for crítica.",
+            "Preparado para calibração futura dos pesos por histórico de acertos/erros.",
+        ],
+    }
+    DECISION_SCORE_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    return payload
+
+
+def build_decision_score_engine_v1_text(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None):
+    payload = build_decision_score_engine_v1(capital=capital, bot=bot, symbol=symbol, side=side, entry=entry, stop=stop, setup=setup, leverage=leverage, mode=mode, intended_live=intended_live)
+    inp = payload.get("inputs") or {}
+    order = payload.get("recommended_order") or {}
+    sizing = payload.get("sizing") or {}
+    binding = sizing.get("binding_limit") or {}
+    lines = [
+        "🧮 DECISION SCORE ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Trade avaliado:",
+        f"Bot: {inp.get('bot')} | Setup: {inp.get('setup')}",
+        f"Ativo: {inp.get('symbol')} | Side: {inp.get('side')}",
+        f"Entrada: {inp.get('entry')} | Stop: {inp.get('stop')} | Leverage: {inp.get('leverage')}x",
+        "",
+        "Resultado decisório:",
+        f"Decision Score: {payload.get('decision_score')}/100 | Faixa: {payload.get('score_band')}",
+        f"Decision: {payload.get('decision')} | Action: {payload.get('execution_action')}",
+        f"Confidence: {payload.get('confidence_score')}/100",
+        f"Hard deny: {payload.get('hard_deny')} | Execution Policy V1: {payload.get('execution_policy_decision')} ({payload.get('execution_policy_confidence')}/100)",
+        "",
+        "Ordem sugerida:",
+        f"Paper notional: {order.get('paper_notional_usdt')} USDT",
+        f"Paper margem: {order.get('paper_margin_usdt')} USDT",
+        f"Paper qty: {order.get('paper_qty')}",
+        f"Risco efetivo paper: {order.get('paper_effective_risk_usdt')} USDT ({order.get('paper_effective_risk_pct')}%)",
+        f"LIVE permitido: {order.get('live_allowed')} | LIVE notional: {order.get('live_notional_usdt')} | motivo: {order.get('live_block_reason')}",
+        "",
+        "Sizing e limitadores:",
+        f"Prioridade estratégica: {sizing.get('strategic_priority')} | Tamanho executável: {sizing.get('executable_size_state')}",
+        f"Risk per trade: {sizing.get('risk_per_trade_pct')}% ({sizing.get('risk_per_trade_usdt')} USDT)",
+        f"Stop distance: {sizing.get('stop_distance_pct')}% ({sizing.get('stop_distance_source')})",
+        f"Raw notional necessário: {sizing.get('raw_notional_usdt')} USDT",
+        f"Limitador dominante: {binding.get('name')} ({binding.get('value_usdt')} USDT)",
+        f"Uso do risk per trade: {sizing.get('risk_budget_utilization_pct')}% | Risco não usado: {sizing.get('unused_risk_per_trade_usdt')} USDT",
+        "",
+        "Pontuação por módulo:",
+    ]
+    for item in payload.get("module_scores") or []:
+        adj = f" | ajustes: {', '.join(item.get('adjustments') or [])}" if item.get("adjustments") else ""
+        lines.append(f"- {item.get('module')}: voto={item.get('vote')} | peso={item.get('weight')} | pontos={item.get('adjusted_points')} | contribuição={item.get('contribution')}{adj}")
+        if item.get("reason"):
+            lines.append(f"  motivo: {item.get('reason')}")
+    if payload.get("alerts"):
+        lines += ["", "Alertas:"] + [f"- {x}" for x in payload.get("alerts", [])[:10]]
+    lines += ["", "Motivos principais:"] + [f"- {x}" for x in payload.get("reasons", [])]
+    lines += ["", "Notas:"] + [f"- {x}" for x in payload.get("notes", [])]
+    return "\n".join(lines), payload
+
+
+@app.route("/decision/score/v1", methods=["GET", "POST"])
+@app.route("/decisionscore/v1", methods=["GET", "POST"])
+@app.route("/score/decision/v1", methods=["GET", "POST"])
+@app.route("/decision-score/v1", methods=["GET", "POST"])
+def decision_score_engine_v1_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _dse_request_payload_from_args(body)
+    capital = _dse_safe_float(args_payload.get("capital"), 10000.0)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_decision_score_engine_v1_text(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"))
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/decision/score/summary/v1", methods=["GET", "POST"])
+@app.route("/decisionscore/summary/v1", methods=["GET", "POST"])
+@app.route("/score/decision/summary/v1", methods=["GET", "POST"])
+def decision_score_engine_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _dse_request_payload_from_args(body)
+    capital = _dse_safe_float(args_payload.get("capital"), 10000.0)
+    payload = build_decision_score_engine_v1(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"))
+    return {"ok": True, "version": payload.get("version"), "generated_at": payload.get("generated_at"), "mode": payload.get("mode"), "inputs": payload.get("inputs"), "decision_score": payload.get("decision_score"), "score_band": payload.get("score_band"), "decision": payload.get("decision"), "execution_action": payload.get("execution_action"), "confidence_score": payload.get("confidence_score"), "hard_deny": payload.get("hard_deny"), "recommended_order": payload.get("recommended_order"), "module_scores": payload.get("module_scores"), "vote_summary": payload.get("vote_summary"), "reasons": payload.get("reasons"), "alerts": payload.get("alerts"), "cache": {"last_generated_at": DECISION_SCORE_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": DECISION_SCORE_ENGINE_V1_CACHE.get("last_capital")}}
+
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
 def analytics_bot_exposure_v2_route():
@@ -12878,6 +13226,22 @@ def build_central_command_reply(text: str):
             capital_arg = 10000.0
         text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
         return text_v2
+    if cmd0 in {"/decisionscore", "/decisionscorev1", "/decisionscoreengine", "/dse", "/scoredecision", "/scoredecisao", "/scoredecisão"}:
+        parts = raw.split()
+        bot_arg = parts[1].upper() if len(parts) > 1 else None
+        symbol_arg = parts[2].upper() if len(parts) > 2 else None
+        side_arg = parts[3].upper() if len(parts) > 3 else None
+        try:
+            entry_arg = float(parts[4]) if len(parts) > 4 else None
+        except Exception:
+            entry_arg = None
+        try:
+            stop_arg = float(parts[5]) if len(parts) > 5 else None
+        except Exception:
+            stop_arg = None
+        setup_arg = parts[6].upper() if len(parts) > 6 else None
+        text_score, _ = build_decision_score_engine_v1_text(capital=10000.0, bot=bot_arg, symbol=symbol_arg, side=side_arg, entry=entry_arg, stop=stop_arg, setup=setup_arg)
+        return text_score
     if cmd0 in {"/executionpolicy", "/executionpolicyv1", "/policy", "/policyv1", "/canexecute", "/execpolicy", "/epe", "/politicaexecucao", "/políticaexecução"}:
         parts = raw.split()
         bot_arg = parts[1].upper() if len(parts) > 1 else None
