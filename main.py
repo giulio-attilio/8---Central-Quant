@@ -16998,6 +16998,362 @@ def meta_strategy_engine_v11_short_route():
     return {"ok": True, "payload": payload, "text": text}
 
 
+# ============================================================
+# MARKET REGIME DETECTOR V1 — CENTRAL QUANT
+# Machine-first regime layer. It does not execute; it classifies
+# the current internal/portfolio context and provides policy hints
+# for Meta Strategy and Decision engines.
+# ============================================================
+
+MARKET_REGIME_DETECTOR_V1_VERSION = "2026-07-04-MARKET-REGIME-DETECTOR-V1"
+
+
+def _mrd_safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _mrd_safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _mrd_round(value, ndigits=4):
+    try:
+        return round(float(value), ndigits)
+    except Exception:
+        return value
+
+
+def _mrd_get_exposure_summary(capital=10000.0):
+    try:
+        if "build_bot_exposure_manager_v2" in globals():
+            payload = build_bot_exposure_manager_v2(capital=capital)
+            return payload.get("summary") or payload or {}
+    except Exception as exc:
+        return {"error": str(exc)}
+    return {}
+
+
+def _mrd_get_meta_context(capital=10000.0):
+    try:
+        if "build_meta_strategy_engine_v1_1" in globals():
+            return build_meta_strategy_engine_v1_1(capital=capital) or {}
+    except Exception as exc:
+        return {"error": str(exc), "strategies": []}
+    return {"strategies": []}
+
+
+def _mrd_classify_exposure_regime(exposure_summary):
+    positions = _mrd_safe_int(exposure_summary.get("positions"), 0)
+    long_n = _mrd_safe_int(exposure_summary.get("long"), 0)
+    short_n = _mrd_safe_int(exposure_summary.get("short"), 0)
+    risk_used = _mrd_safe_float(exposure_summary.get("risk_used_usdt"), 0.0)
+    capital_used = _mrd_safe_float(exposure_summary.get("capital_used"), 0.0)
+    capital = _mrd_safe_float(exposure_summary.get("capital"), 10000.0) or 10000.0
+    capital_usage_pct = _mrd_safe_float(exposure_summary.get("capital_usage_pct"), (capital_used / capital * 100.0 if capital else 0.0))
+    long_pct = (long_n / positions * 100.0) if positions else 0.0
+    short_pct = (short_n / positions * 100.0) if positions else 0.0
+    imbalance_pct = abs(long_pct - short_pct)
+
+    if positions <= 0:
+        regime = "NO_PORTFOLIO_EXPOSURE"
+        family = "UNKNOWN_WAIT_SAMPLE"
+        confidence = 35.0
+        direction = "FLAT"
+    elif long_pct >= 75.0:
+        regime = "DIRECTIONAL_LONG_EXPOSURE"
+        family = "TREND_BIASED"
+        confidence = min(92.0, 55.0 + imbalance_pct * 0.45)
+        direction = "LONG"
+    elif short_pct >= 75.0:
+        regime = "DIRECTIONAL_SHORT_EXPOSURE"
+        family = "TREND_BIASED"
+        confidence = min(92.0, 55.0 + imbalance_pct * 0.45)
+        direction = "SHORT"
+    elif imbalance_pct <= 20.0 and positions >= 6:
+        regime = "BALANCED_OR_HEDGED_EXPOSURE"
+        family = "BALANCED"
+        confidence = 65.0
+        direction = "BALANCED"
+    elif positions >= 15 and capital_usage_pct >= 40.0:
+        regime = "CROWDED_PORTFOLIO_EXPOSURE"
+        family = "RISK_COMPRESSION"
+        confidence = 72.0
+        direction = "MIXED"
+    else:
+        regime = "MIXED_EXPOSURE"
+        family = "TRANSITIONAL"
+        confidence = 55.0
+        direction = exposure_summary.get("net_direction") or "MIXED"
+
+    return {
+        "regime": regime,
+        "regime_family": family,
+        "confidence": _mrd_round(confidence, 2),
+        "positions": positions,
+        "long": long_n,
+        "short": short_n,
+        "long_pct": _mrd_round(long_pct, 2),
+        "short_pct": _mrd_round(short_pct, 2),
+        "imbalance_pct": _mrd_round(imbalance_pct, 2),
+        "net_direction": direction,
+        "capital_usage_pct": _mrd_round(capital_usage_pct, 2),
+        "risk_used_usdt": _mrd_round(risk_used, 4),
+    }
+
+
+def _mrd_cluster_policy(exposure_regime, meta_payload):
+    strategies = meta_payload.get("strategies") or []
+    cluster_summary = meta_payload.get("cluster_summary") or {}
+    primary = meta_payload.get("primary_strategy") or {}
+    regime = exposure_regime.get("regime")
+    net_direction = exposure_regime.get("net_direction")
+
+    cluster_policy = {}
+    for cluster, data in cluster_summary.items():
+        cluster_key = str(cluster or "UNKNOWN").upper()
+        primary_count = _mrd_safe_int(data.get("primary"), 0)
+        disabled_count = _mrd_safe_int(data.get("disabled"), 0)
+        avg_score = _mrd_safe_float(data.get("avg_score"), 0.0)
+        risk_budget_pct = _mrd_safe_float(data.get("risk_budget_pct"), 0.0)
+        target_pct = _mrd_safe_float(data.get("target_pct"), 0.0)
+
+        action = "NEUTRAL_WAIT"
+        multiplier = 0.35
+        gate = "REQUIRES_DECISION_SCORE"
+        reasons = []
+
+        if primary_count > 0:
+            action = "PRIMARY_CLUSTER"
+            multiplier = 1.0
+            gate = "ALLOW_ONLY_IF_META_AND_RISK_ALLOW"
+            reasons.append("Cluster contém a estratégia primária atual.")
+        elif disabled_count >= _mrd_safe_int(data.get("bots"), 0) and _mrd_safe_int(data.get("bots"), 0) > 0:
+            action = "DISABLED_CLUSTER"
+            multiplier = 0.0
+            gate = "BLOCK_NEW_SIGNALS"
+            reasons.append("Todos os robôs do cluster estão defensivos/bloqueados para novo risco.")
+        elif avg_score >= 60.0 and risk_budget_pct > 0.15:
+            action = "SECONDARY_CLUSTER"
+            multiplier = 0.35
+            gate = "ALLOW_SMALL_FILTERED_SIGNALS"
+            reasons.append("Cluster tem score/risk budget suficientes para sinais filtrados.")
+        else:
+            action = "WAIT_CLUSTER"
+            multiplier = 0.15
+            gate = "REDUCE_OR_WAIT_SIGNALS"
+            reasons.append("Cluster sem força suficiente para prioridade autônoma.")
+
+        if regime in {"DIRECTIONAL_LONG_EXPOSURE", "DIRECTIONAL_SHORT_EXPOSURE"} and action != "PRIMARY_CLUSTER":
+            multiplier = min(multiplier, 0.2)
+            reasons.append("Portfólio já está direcional; clusters não primários ficam comprimidos.")
+
+        cluster_policy[cluster_key] = {
+            "cluster": cluster_key,
+            "action": action,
+            "signal_gate": gate,
+            "risk_multiplier": _mrd_round(multiplier, 4),
+            "target_pct": _mrd_round(target_pct, 4),
+            "risk_budget_pct": _mrd_round(risk_budget_pct, 4),
+            "avg_score": _mrd_round(avg_score, 2),
+            "primary": primary_count,
+            "disabled": disabled_count,
+            "reasons": reasons,
+        }
+
+    return cluster_policy
+
+
+def build_market_regime_detector_v1(capital=10000.0, persist=False):
+    generated_at = data_hora_sp_str() if "data_hora_sp_str" in globals() else ""
+    exposure_summary = _mrd_get_exposure_summary(capital=capital)
+    meta_payload = _mrd_get_meta_context(capital=capital)
+    exposure_regime = _mrd_classify_exposure_regime(exposure_summary)
+    cluster_policy = _mrd_cluster_policy(exposure_regime, meta_payload)
+    strategies = meta_payload.get("strategies") or []
+    primary = meta_payload.get("primary_strategy") or None
+
+    regime = exposure_regime.get("regime")
+    family = exposure_regime.get("regime_family")
+    confidence = _mrd_safe_float(exposure_regime.get("confidence"), 0.0)
+    long_pct = _mrd_safe_float(exposure_regime.get("long_pct"), 0.0)
+    short_pct = _mrd_safe_float(exposure_regime.get("short_pct"), 0.0)
+
+    direction_policy = {
+        "new_long_signals": "NORMAL",
+        "new_short_signals": "NORMAL",
+        "reason": "Sem compressão direcional extrema detectada.",
+    }
+    alerts = []
+
+    if regime == "DIRECTIONAL_LONG_EXPOSURE":
+        direction_policy = {
+            "new_long_signals": "COMPRESS_OR_ALLOW_ONLY_HIGH_QUALITY",
+            "new_short_signals": "ALLOW_IF_RISK_AND_META_APPROVE",
+            "reason": "Portfólio já está fortemente LONG; novos LONGs precisam reduzir concentração ou ter qualidade excepcional.",
+        }
+        alerts.append("Regime interno direcional LONG; comprimir novos sinais LONG sem qualidade excepcional.")
+    elif regime == "DIRECTIONAL_SHORT_EXPOSURE":
+        direction_policy = {
+            "new_long_signals": "ALLOW_IF_RISK_AND_META_APPROVE",
+            "new_short_signals": "COMPRESS_OR_ALLOW_ONLY_HIGH_QUALITY",
+            "reason": "Portfólio já está fortemente SHORT; novos SHORTs precisam reduzir concentração ou ter qualidade excepcional.",
+        }
+        alerts.append("Regime interno direcional SHORT; comprimir novos sinais SHORT sem qualidade excepcional.")
+    elif regime == "CROWDED_PORTFOLIO_EXPOSURE":
+        direction_policy = {
+            "new_long_signals": "REDUCE_OR_WAIT",
+            "new_short_signals": "REDUCE_OR_WAIT",
+            "reason": "Portfólio cheio; priorizar qualidade, redução de exposição e sinais excepcionais.",
+        }
+        alerts.append("Portfólio carregado; Market Regime recomenda compressão de novos sinais.")
+
+    eligible_clusters = [k for k, v in cluster_policy.items() if v.get("action") in {"PRIMARY_CLUSTER", "SECONDARY_CLUSTER"}]
+    blocked_clusters = [k for k, v in cluster_policy.items() if v.get("action") == "DISABLED_CLUSTER"]
+    compressed_clusters = [k for k, v in cluster_policy.items() if v.get("risk_multiplier", 0.0) <= 0.2 and v.get("action") != "DISABLED_CLUSTER"]
+
+    if not primary:
+        alerts.append("Nenhuma estratégia primária detectada pelo Meta Strategy; regime deve operar defensivo/aguardar amostra.")
+    if exposure_regime.get("positions", 0) <= 0:
+        alerts.append("Sem exposição suficiente para inferir regime robusto por proxy; aguardar Market Regime real com dados de mercado.")
+
+    automation_policy = {
+        "market_regime_ready": True,
+        "source": "EXPOSURE_AND_META_PROXY_V1",
+        "human_report_required": False,
+        "route_new_signals_to": "META_STRATEGY_GATE_THEN_DECISION_SCORE_ENGINE",
+        "meta_strategy_required": True,
+        "decision_score_required": True,
+        "direction_policy": direction_policy,
+        "eligible_clusters": eligible_clusters,
+        "blocked_clusters": blocked_clusters,
+        "compressed_clusters": compressed_clusters,
+        "primary_strategy": (primary or {}).get("bot") if isinstance(primary, dict) else None,
+        "primary_strategy_family": (primary or {}).get("strategy_family") if isinstance(primary, dict) else None,
+    }
+
+    payload = {
+        "ok": True,
+        "version": MARKET_REGIME_DETECTOR_V1_VERSION,
+        "generated_at": generated_at,
+        "mode": "OBSERVATION_ONLY",
+        "capital": _mrd_round(capital, 4),
+        "regime": regime,
+        "regime_family": family,
+        "confidence": confidence,
+        "source": "EXPOSURE_PROXY_PLUS_META_STRATEGY",
+        "market_data_used": False,
+        "exposure_regime": exposure_regime,
+        "portfolio_state": meta_payload.get("portfolio_state"),
+        "primary_strategy": primary,
+        "strategy_count": len(strategies),
+        "cluster_policy": cluster_policy,
+        "automation_policy": automation_policy,
+        "alerts": alerts,
+        "notes": [
+            "Market Regime Detector V1 é machine-first e não depende de leitura humana de relatório.",
+            "V1 ainda não usa candles/indicadores de mercado; classifica regime por exposição, Meta Strategy e clusters internos.",
+            "O regime detectado deve funcionar como gate adicional antes do Decision Score/Execution Policy.",
+            "No futuro, Market Regime Detector V2 deve incorporar ADX, ATR, volatilidade, range, breadth e correlação real de mercado.",
+        ],
+    }
+    return payload
+
+
+def build_market_regime_detector_v1_text(capital=10000.0, persist=False):
+    payload = build_market_regime_detector_v1(capital=capital, persist=persist)
+    er = payload.get("exposure_regime") or {}
+    auto = payload.get("automation_policy") or {}
+    direction = auto.get("direction_policy") or {}
+    lines = [
+        "🧭 MARKET REGIME DETECTOR V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Regime interno detectado:",
+        f"Regime: {payload.get('regime')} | Família: {payload.get('regime_family')} | Confiança: {payload.get('confidence')}/100",
+        f"Fonte: {payload.get('source')} | Market data usado: {payload.get('market_data_used')}",
+        f"Exposição: posições {er.get('positions')} | LONG {er.get('long')} ({er.get('long_pct')}%) | SHORT {er.get('short')} ({er.get('short_pct')}%) | Net {er.get('net_direction')}",
+        f"Capital usado: {er.get('capital_usage_pct')}% | Risco aberto: {er.get('risk_used_usdt')} USDT",
+        "",
+        "Política direcional:",
+        f"Novos LONG: {direction.get('new_long_signals')}",
+        f"Novos SHORT: {direction.get('new_short_signals')}",
+        f"Motivo: {direction.get('reason')}",
+        "",
+        "Política autônoma:",
+        f"Market regime ready: {auto.get('market_regime_ready')} | Human report required: {auto.get('human_report_required')}",
+        f"Rota: {auto.get('route_new_signals_to')}",
+        f"Primary strategy: {auto.get('primary_strategy')} | Família: {auto.get('primary_strategy_family')}",
+        f"Eligible clusters: {', '.join(auto.get('eligible_clusters') or []) or 'None'}",
+        f"Compressed clusters: {', '.join(auto.get('compressed_clusters') or []) or 'None'}",
+        f"Blocked clusters: {', '.join(auto.get('blocked_clusters') or []) or 'None'}",
+        "",
+        "Política por cluster:",
+    ]
+    for name, c in (payload.get("cluster_policy") or {}).items():
+        lines.append(f"- {name}: {c.get('action')} | Gate: {c.get('signal_gate')} | Risk mult: {c.get('risk_multiplier')} | Score médio: {c.get('avg_score')} | Target: {c.get('target_pct')}%")
+        for reason in c.get("reasons") or []:
+            lines.append(f"  • {reason}")
+    lines += ["", "Alertas:"]
+    for a in payload.get("alerts") or []:
+        lines.append(f"- {a}")
+    lines += ["", "Notas:"]
+    for n in payload.get("notes") or []:
+        lines.append(f"- {n}")
+    return "\n".join(lines), payload
+
+
+@app.route("/market/regime/v1", methods=["GET", "POST"])
+@app.route("/regime/market/v1", methods=["GET", "POST"])
+@app.route("/market-regime/v1", methods=["GET", "POST"])
+def market_regime_detector_v1_route():
+    body = request.get_json(silent=True) or {}
+    capital = _mrd_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    persist = str(body.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    text, payload = build_market_regime_detector_v1_text(capital=capital, persist=persist)
+    return {"ok": True, "payload": payload, "text": text}
+
+
+@app.route("/market/regime/summary/v1", methods=["GET", "POST"])
+@app.route("/market-regime/summary/v1", methods=["GET", "POST"])
+def market_regime_detector_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    capital = _mrd_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    payload = build_market_regime_detector_v1(capital=capital, persist=False)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "regime": payload.get("regime"),
+        "regime_family": payload.get("regime_family"),
+        "confidence": payload.get("confidence"),
+        "exposure_regime": payload.get("exposure_regime"),
+        "automation_policy": payload.get("automation_policy"),
+        "cluster_policy": payload.get("cluster_policy"),
+        "alerts": payload.get("alerts"),
+    }
+
+
+@app.route("/regime", methods=["GET", "POST"])
+def market_regime_detector_v1_short_route():
+    body = request.get_json(silent=True) or {}
+    capital = _mrd_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    text, payload = build_market_regime_detector_v1_text(capital=capital, persist=False)
+    return {"ok": True, "payload": payload, "text": text}
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
