@@ -6814,8 +6814,272 @@ def _monthly_group_stats(events, field):
     return dict(sorted(stats.items(), key=lambda x: float(x[1].get("pnl_total_pct") or 0), reverse=True))
 
 
+
+def _executive_alert_log_file_path():
+    """Caminho padrão do log do Executive Alert Manager."""
+    try:
+        return CENTRAL_DATA_DIR / "executive_alert_log.jsonl"
+    except Exception:
+        return Path("data") / "executive_alert_log.jsonl"
+
+
+def _read_executive_alert_log_rows(limit=50000):
+    """Lê o log JSONL do Executive Alert Manager sem depender da rota HTTP."""
+    path = _executive_alert_log_file_path()
+    rows = []
+    try:
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if limit:
+            lines = lines[-int(limit):]
+        for line in lines:
+            try:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    rows.append(item)
+            except Exception:
+                pass
+    except Exception:
+        return []
+    return rows
+
+
+def _executive_alert_rows_for_period(start_dt, end_dt, limit=50000):
+    start_epoch = start_dt.timestamp()
+    end_epoch = end_dt.timestamp()
+    rows = []
+    for item in _read_executive_alert_log_rows(limit=limit):
+        epoch = _safe_float(item.get("epoch"), None)
+        if epoch is None:
+            generated = str(item.get("generated_at") or "")
+            if start_dt.strftime("/%m/%Y") in generated:
+                rows.append(item)
+            continue
+        if start_epoch <= epoch < end_epoch:
+            rows.append(item)
+    return rows
+
+
+def _executive_alert_health_score_from_row(row):
+    hs = row.get("health_score") or {}
+    if isinstance(hs, dict):
+        return _safe_float(hs.get("score"), None)
+    return None
+
+
+def _executive_alert_day_key(row):
+    epoch = _safe_float(row.get("epoch"), None)
+    if epoch is not None:
+        try:
+            return datetime.fromtimestamp(epoch, TIMEZONE_BR).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    generated = str(row.get("generated_at") or "")
+    try:
+        return datetime.strptime(generated[:10], "%d/%m/%Y").strftime("%Y-%m-%d")
+    except Exception:
+        return "N/A"
+
+
+def _executive_alert_monthly_stats(start_dt, end_dt):
+    """
+    Consolida a saúde executiva do mês com base no log do Executive Alert Manager.
+    Não dispara novos alertas; apenas lê histórico persistido.
+    """
+    rows = _executive_alert_rows_for_period(start_dt, end_dt)
+    days_in_period = max(1, (end_dt.date() - start_dt.date()).days)
+
+    scores = []
+    alerts_total = 0
+    to_notify_total = 0
+    resolved_total = 0
+    critical_total = 0
+    warning_total = 0
+    recovery_total = 0
+    by_category = {}
+    by_level = {}
+    by_day = {}
+    timeline = []
+
+    for row in rows:
+        score = _executive_alert_health_score_from_row(row)
+        if score is not None:
+            scores.append(score)
+
+        day_key = _executive_alert_day_key(row)
+        by_day.setdefault(day_key, {"checks": 0, "critical": 0, "warning": 0, "alerts": 0, "resolved": 0, "min_score": None})
+        by_day[day_key]["checks"] += 1
+        if score is not None:
+            current = by_day[day_key].get("min_score")
+            by_day[day_key]["min_score"] = score if current is None else min(current, score)
+
+        alerts = row.get("alerts") or []
+        if not isinstance(alerts, list):
+            alerts = []
+        resolved = row.get("resolved") or []
+        if not isinstance(resolved, list):
+            resolved = []
+        to_notify = row.get("alerts_to_notify") or []
+        if not isinstance(to_notify, list):
+            to_notify = []
+
+        alerts_total += len(alerts)
+        to_notify_total += len(to_notify)
+        resolved_total += len(resolved)
+        recovery_total += len(resolved)
+        by_day[day_key]["alerts"] += len(alerts)
+        by_day[day_key]["resolved"] += len(resolved)
+
+        for alert in alerts:
+            if not isinstance(alert, dict):
+                continue
+            level = str(alert.get("level") or "UNKNOWN").upper()
+            category = str(alert.get("category") or "UNKNOWN").upper()
+            by_level[level] = by_level.get(level, 0) + 1
+            by_category[category] = by_category.get(category, 0) + 1
+            if level == "CRITICAL":
+                critical_total += 1
+                by_day[day_key]["critical"] += 1
+            elif level == "WARNING":
+                warning_total += 1
+                by_day[day_key]["warning"] += 1
+            title = alert.get("title") or alert.get("code") or "Alerta executivo"
+            generated = row.get("generated_at") or alert.get("generated_at") or day_key
+            timeline.append({"generated_at": generated, "level": level, "category": category, "title": str(title)})
+
+        for rec in resolved:
+            if not isinstance(rec, dict):
+                continue
+            generated = row.get("generated_at") or rec.get("generated_at") or day_key
+            resolved_alert = rec.get("resolved_alert") or {}
+            title = resolved_alert.get("title") or rec.get("title") or "Alerta resolvido"
+            category = resolved_alert.get("category") or rec.get("category") or "RECOVERY"
+            timeline.append({"generated_at": generated, "level": "RECOVERY", "category": str(category).upper(), "title": str(title)})
+
+    days_with_critical = len([d for d, v in by_day.items() if d != "N/A" and v.get("critical", 0) > 0])
+    days_with_warning = len([d for d, v in by_day.items() if d != "N/A" and v.get("warning", 0) > 0 and v.get("critical", 0) == 0])
+    days_with_any_alert = len([d for d, v in by_day.items() if d != "N/A" and v.get("alerts", 0) > 0])
+    healthy_days_observed = len([d for d, v in by_day.items() if d != "N/A" and v.get("alerts", 0) == 0 and (v.get("min_score") or 100) >= 90])
+
+    # Melhor sequência saudável observada nos dias com algum check no log.
+    streak = 0
+    best_streak = 0
+    try:
+        cur = start_dt.date()
+        while cur < end_dt.date():
+            key = cur.strftime("%Y-%m-%d")
+            item = by_day.get(key)
+            is_healthy = bool(item and item.get("alerts", 0) == 0 and (item.get("min_score") or 100) >= 90)
+            if is_healthy:
+                streak += 1
+                best_streak = max(best_streak, streak)
+            else:
+                streak = 0
+            cur += timedelta(days=1)
+    except Exception:
+        best_streak = healthy_days_observed
+
+    avg_score = round(sum(scores) / max(len(scores), 1), 2) if scores else None
+    min_score = round(min(scores), 2) if scores else None
+    latest_snapshot = _executive_alerts_snapshot_for_reports(check_only=True)
+
+    timeline = sorted(timeline, key=lambda x: str(x.get("generated_at") or ""))[-12:]
+    by_category = dict(sorted(by_category.items(), key=lambda x: (-x[1], x[0])))
+    by_level = dict(sorted(by_level.items(), key=lambda x: (-x[1], x[0])))
+
+    return {
+        "ok": True,
+        "rows": rows,
+        "checks": len(rows),
+        "days_in_period": days_in_period,
+        "days_observed": len([d for d in by_day.keys() if d != "N/A"]),
+        "avg_score": avg_score,
+        "min_score": min_score,
+        "alerts_total": alerts_total,
+        "alerts_to_notify_total": to_notify_total,
+        "resolved_total": resolved_total,
+        "recovery_total": recovery_total,
+        "critical_total": critical_total,
+        "warning_total": warning_total,
+        "days_with_critical": days_with_critical,
+        "days_with_warning": days_with_warning,
+        "days_with_any_alert": days_with_any_alert,
+        "healthy_days_observed": healthy_days_observed,
+        "best_healthy_streak": best_streak,
+        "by_category": by_category,
+        "by_level": by_level,
+        "timeline": timeline,
+        "latest_snapshot": latest_snapshot,
+        "log_file": str(_executive_alert_log_file_path()),
+    }
+
+
+def _executive_monthly_health_block(start_dt, end_dt):
+    stats = _executive_alert_monthly_stats(start_dt, end_dt)
+    latest = stats.get("latest_snapshot") or {}
+    latest_hs = latest.get("health_score") or {}
+
+    avg_score = stats.get("avg_score")
+    min_score = stats.get("min_score")
+    avg_txt = f"{avg_score}/100" if avg_score is not None else "sem amostra mensal"
+    min_txt = f"{min_score}/100" if min_score is not None else "sem amostra mensal"
+
+    lines = [
+        "🚨 EXECUTIVE HEALTH DO MÊS",
+        "",
+        f"Checks registrados: {stats.get('checks', 0)}",
+        f"Dias observados: {stats.get('days_observed', 0)}/{stats.get('days_in_period', 0)}",
+        f"Health Score médio: {avg_txt}",
+        f"Menor Health Score: {min_txt}",
+        f"Status atual: {latest.get('status', 'UNKNOWN')}",
+        f"Health atual: {latest_hs.get('score', 0)}/100 — {latest_hs.get('label', 'N/A')}",
+        "",
+        "Alertas:",
+        f"- CRITICAL: {stats.get('critical_total', 0)}",
+        f"- WARNING: {stats.get('warning_total', 0)}",
+        f"- Para notificar: {stats.get('alerts_to_notify_total', 0)}",
+        f"- Recoveries: {stats.get('recovery_total', 0)}",
+        "",
+        "Dias:",
+        f"- Dias sem alertas observados: {stats.get('healthy_days_observed', 0)}",
+        f"- Dias com WARNING: {stats.get('days_with_warning', 0)}",
+        f"- Dias com CRITICAL: {stats.get('days_with_critical', 0)}",
+        f"- Melhor sequência saudável observada: {stats.get('best_healthy_streak', 0)} dia(s)",
+        "",
+        "Categorias mais frequentes:",
+    ]
+
+    by_category = stats.get("by_category") or {}
+    if by_category:
+        for category, count in list(by_category.items())[:8]:
+            lines.append(f"- {category}: {count}")
+    else:
+        lines.append("- Nenhuma categoria de alerta registrada no mês.")
+
+    timeline = stats.get("timeline") or []
+    lines += ["", "Executive timeline:"]
+    if timeline:
+        for item in timeline[-10:]:
+            lines.append(f"- {item.get('generated_at')} | {item.get('level')} | {item.get('category')} | {item.get('title')}")
+    else:
+        lines.append("- Nenhum alerta/recovery registrado no período.")
+
+    lines += ["", "Leitura executiva:"]
+    if stats.get("checks", 0) == 0:
+        lines.append("- Ainda não há histórico mensal suficiente do Executive Alert Manager. A partir deste deploy, o log mensal passará a alimentar esta seção.")
+    elif stats.get("critical_total", 0) > 0:
+        lines.append("- O mês teve alerta crítico. Revisar a timeline e a categoria dominante antes de aumentar risco operacional.")
+    elif stats.get("warning_total", 0) > 0:
+        lines.append("- O mês teve warnings, mas sem incidente crítico. Manter observação e acompanhar recorrência por categoria.")
+    else:
+        lines.append("- A Central permaneceu saudável nos checks observados. Nenhuma interrupção executiva relevante foi registrada.")
+
+    return "\n".join(lines)
+
+
 def build_executive_report_monthly():
-    """Relatório mensal consolidando o mês anterior."""
+    """Relatório mensal consolidando o mês anterior com Executive Monthly Report V2."""
     start_dt, end_dt, month_key, month_label = _month_bounds_previous()
     events = _history_events_for_period(start_dt, end_dt, limit=30000)
 
@@ -6836,16 +7100,32 @@ def build_executive_report_monthly():
     by_symbol = _monthly_group_stats(closed, "symbol")
     by_setup = _monthly_group_stats(closed, "setup")
 
+    try:
+        pipeline = build_execution_pipeline_status()
+    except Exception:
+        pipeline = {}
+    adaptive = pipeline.get("adaptive") or {}
+    positions = pipeline.get("positions") or {}
+
     lines = [
-        "📆 EXECUTIVE REPORT MENSAL — CENTRAL QUANT",
+        "📆 EXECUTIVE REPORT MENSAL — CENTRAL QUANT V2",
         f"Mês consolidado: {month_label}",
         f"Período: {start_dt.strftime('%d/%m/%Y %H:%M')} até {(end_dt - timedelta(seconds=1)).strftime('%d/%m/%Y %H:%M')}",
         f"Gerado em: {data_hora_sp_str()}",
+        "",
+        "==============================\nEXECUTIVE HEALTH DO MÊS\n==============================",
+        _executive_monthly_health_block(start_dt, end_dt),
         "",
         "==============================\nPERFORMANCE DO MÊS\n==============================",
         f"Trades encerrados: {perf.get('trades', 0)} | Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('be', 0)}",
         f"Win rate: {perf.get('win_rate_pct', 0)}% | PnL total: {perf.get('pnl_total_pct', 0)}% | PnL médio: {perf.get('pnl_avg_pct', 0)}%",
         f"Profit Factor: {perf.get('profit_factor_pct', 0)} | R total: {perf.get('r_total', 0)}R | R médio: {perf.get('r_avg', 0)}R",
+        "",
+        "==============================\nPIPELINE E APRENDIZADO ATUAIS\n==============================",
+        f"Pipeline atual: {pipeline.get('status', 'UNKNOWN')}",
+        f"PAPER abertas: {positions.get('open', 0)} | PAPER fechadas: {positions.get('closed', 0)} | Outcomes pendentes: {positions.get('pending_outcome', 0)}",
+        f"Adaptive action: {adaptive.get('recommended_action', 'N/A')} | Weight: {adaptive.get('suggested_weight', 'N/A')} | Confidence: {safe_round(adaptive.get('confidence'), 1, 0)}%",
+        f"Trades no Adaptive: {adaptive.get('trades', 0)}",
         "",
         "==============================\nEVENTOS DO MÊS\n==============================",
     ]
@@ -6880,7 +7160,7 @@ def build_executive_report_monthly():
         "==============================\nSTATUS ATUAL PÓS-FECHAMENTO\n==============================",
         build_executive_report(),
         "",
-        "==============================\nRECOMENDAÇÃO\n==============================",
+        "==============================\nRECOMENDAÇÃO EXECUTIVA\n==============================",
     ]
     if perf.get("trades", 0) <= 0:
         lines.append("- Ainda não há trades encerrados suficientes no Super History para avaliação mensal estatística.")
@@ -6892,8 +7172,19 @@ def build_executive_report_monthly():
         else:
             lines.append("- Manter risco controlado e aprofundar análise por robô antes de mudanças estruturais.")
 
+    try:
+        health_stats = _executive_alert_monthly_stats(start_dt, end_dt)
+        if health_stats.get("critical_total", 0) > 0:
+            lines.append("- Como houve alerta crítico no mês, priorizar estabilidade operacional antes de aumentar automação ou lote.")
+        elif health_stats.get("warning_total", 0) > 0:
+            lines.append("- Como houve warnings no mês, acompanhar recorrência antes de subir exposição.")
+        elif health_stats.get("checks", 0) > 0:
+            lines.append("- Saúde executiva do mês foi estável nos checks observados.")
+    except Exception:
+        pass
+
     text = "\n".join(lines)
-    force_gc_if_needed("executive_report_monthly_end", force=True)
+    force_gc_if_needed("executive_report_monthly_v2_end", force=True)
     return text
 
 def _read_jsonl_tail_v3(path, limit=200):
