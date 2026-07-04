@@ -11986,7 +11986,7 @@ def _awe_extract_outcome_records(limit=600):
     Se não houver outcome rotulado, V1 permanece em bootstrap conservador.
     """
     records = []
-    paths = [CENTRAL_DECISION_LOG_FILE, CENTRAL_TIMELINE_LOG_FILE]
+    paths = [CENTRAL_DECISION_LOG_FILE, CENTRAL_TIMELINE_LOG_FILE, CENTRAL_DATA_DIR / "learning_engine_v1.jsonl"]
     for path in paths:
         try:
             if not path or not Path(path).exists():
@@ -12340,6 +12340,449 @@ def adaptive_weight_engine_v1_summary_route():
         "alerts": payload.get("alerts"),
         "cache": {"last_generated_at": ADAPTIVE_WEIGHT_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": ADAPTIVE_WEIGHT_ENGINE_V1_CACHE.get("last_capital")},
     }
+
+
+# ==========================================================
+# LEARNING ENGINE V1 - CENTRAL QUANT
+# ==========================================================
+
+LEARNING_ENGINE_V1_VERSION = "2026-07-04-LEARNING-ENGINE-V1"
+LEARNING_ENGINE_V1_MODE = "OBSERVATION_ONLY"
+LEARNING_ENGINE_V1_FILE = CENTRAL_DATA_DIR / "learning_engine_v1.jsonl"
+LEARNING_ENGINE_V1_CACHE = {"last_payload": None, "last_generated_at": None, "last_learning_id": None}
+LEARNING_ENGINE_V1_DEFAULT_READ_LIMIT = int(os.environ.get("LEARNING_ENGINE_READ_LIMIT", "1000"))
+
+
+def _le_safe_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _le_now_id(prefix="LEARN"):
+    try:
+        return f"{prefix}-{agora_sp().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8].upper()}"
+    except Exception:
+        return f"{prefix}-{uuid.uuid4().hex[:12].upper()}"
+
+
+def _le_append_jsonl(item):
+    try:
+        LEARNING_ENGINE_V1_FILE.parent.mkdir(exist_ok=True)
+        with open(LEARNING_ENGINE_V1_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _le_read_records(limit=None):
+    limit = int(limit or LEARNING_ENGINE_V1_DEFAULT_READ_LIMIT)
+    records = []
+    try:
+        if not LEARNING_ENGINE_V1_FILE.exists():
+            return []
+        with open(LEARNING_ENGINE_V1_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+    except Exception:
+        return records
+    return records
+
+
+def _le_normalize_outcome(outcome=None, result_r=None, pnl_pct=None):
+    raw = str(outcome or "").upper().strip()
+    aliases = {
+        "WIN": "WIN", "W": "WIN", "TP": "WIN", "PROFIT": "WIN", "GAIN": "WIN", "LUCRO": "WIN",
+        "LOSS": "LOSS", "L": "LOSS", "SL": "LOSS", "STOP": "LOSS", "PREJUIZO": "LOSS", "PREJUÍZO": "LOSS",
+        "BE": "BE", "BREAKEVEN": "BE", "BREAK_EVEN": "BE", "0": "BE",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    r = _le_safe_float(result_r, None)
+    if r is not None:
+        if r > 0.05:
+            return "WIN"
+        if r < -0.05:
+            return "LOSS"
+        return "BE"
+    p = _le_safe_float(pnl_pct, None)
+    if p is not None:
+        if p > 0.02:
+            return "WIN"
+        if p < -0.02:
+            return "LOSS"
+        return "BE"
+    return "UNKNOWN"
+
+
+def _le_vote_direction(vote):
+    v = str(vote or "").upper().strip()
+    if v in {"ALLOW", "REDUCE"}:
+        return "POSITIVE"
+    if v in {"DENY", "WAIT"}:
+        return "NEGATIVE"
+    return "NEUTRAL"
+
+
+def _le_module_correctness(vote, normalized_outcome):
+    direction = _le_vote_direction(vote)
+    outcome = str(normalized_outcome or "").upper().strip()
+    if outcome == "UNKNOWN" or direction == "NEUTRAL":
+        return None
+    if outcome == "WIN":
+        return direction == "POSITIVE"
+    if outcome == "LOSS":
+        return direction == "NEGATIVE"
+    if outcome == "BE":
+        return str(vote or "").upper().strip() in {"REDUCE", "WAIT", "DENY"}
+    return None
+
+
+def _le_find_latest_decision(records, learning_id=None, trade_id=None):
+    learning_id = str(learning_id or "").strip()
+    trade_id = str(trade_id or "").strip()
+    for item in reversed(records or []):
+        if item.get("record_type") != "DECISION":
+            continue
+        if learning_id and str(item.get("learning_id") or "") == learning_id:
+            return item
+        if trade_id and str(item.get("trade_id") or "") == trade_id:
+            return item
+    return None
+
+
+def _le_outcome_stats(records=None):
+    records = records if records is not None else _le_read_records()
+    decisions = [x for x in records if x.get("record_type") == "DECISION"]
+    outcomes = [x for x in records if x.get("record_type") == "OUTCOME"]
+    by_module = {}
+    by_decision = {}
+    for out in outcomes:
+        decision = str(out.get("decision") or out.get("adaptive_decision") or "UNKNOWN").upper()
+        by_decision.setdefault(decision, {"count": 0, "wins": 0, "losses": 0, "be": 0})
+        by_decision[decision]["count"] += 1
+        outcome = str(out.get("outcome") or "UNKNOWN").upper()
+        if outcome == "WIN":
+            by_decision[decision]["wins"] += 1
+        elif outcome == "LOSS":
+            by_decision[decision]["losses"] += 1
+        elif outcome == "BE":
+            by_decision[decision]["be"] += 1
+        for m in out.get("module_outcomes") or []:
+            module = m.get("module") or "UNKNOWN"
+            if module not in by_module:
+                by_module[module] = {"observations": 0, "correct": 0, "wrong": 0, "neutral": 0, "accuracy_pct": None}
+            correct = m.get("correct")
+            if correct is None:
+                by_module[module]["neutral"] += 1
+                continue
+            by_module[module]["observations"] += 1
+            if correct:
+                by_module[module]["correct"] += 1
+            else:
+                by_module[module]["wrong"] += 1
+    for module, stats in by_module.items():
+        obs = stats.get("observations") or 0
+        stats["accuracy_pct"] = round((stats.get("correct", 0) / obs) * 100.0, 2) if obs else None
+    return {
+        "records": len(records),
+        "decisions": len(decisions),
+        "outcomes": len(outcomes),
+        "by_module": by_module,
+        "by_decision": by_decision,
+    }
+
+
+def build_learning_engine_v1(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None, record=False):
+    global LEARNING_ENGINE_V1_CACHE
+    adaptive = build_adaptive_weight_engine_v1(
+        capital=capital,
+        bot=bot,
+        symbol=symbol,
+        side=side,
+        entry=entry,
+        stop=stop,
+        setup=setup,
+        leverage=leverage,
+        mode=mode,
+        intended_live=intended_live,
+        persist=False,
+    )
+    inp = adaptive.get("inputs") or {}
+    order = adaptive.get("recommended_order") or {}
+    learning_id = _le_now_id("LEARN")
+    trade_id = str(inp.get("trade_id") or order.get("trade_id") or f"{inp.get('bot')}:{inp.get('symbol')}:{inp.get('side')}:{learning_id}")
+    module_votes = []
+    for item in adaptive.get("adaptive_module_scores") or adaptive.get("module_scores") or []:
+        module_votes.append({
+            "module": item.get("module"),
+            "vote": item.get("vote"),
+            "weight": item.get("adaptive_weight", item.get("weight")),
+            "points": item.get("adjusted_points"),
+            "reason": item.get("reason"),
+            "details": item.get("details"),
+        })
+    record_item = {
+        "record_type": "DECISION",
+        "learning_id": learning_id,
+        "trade_id": trade_id,
+        "created_at": data_hora_sp_str(),
+        "version": LEARNING_ENGINE_V1_VERSION,
+        "source": "Learning Engine V1",
+        "inputs": inp,
+        "decision": adaptive.get("adaptive_decision"),
+        "adaptive_decision": adaptive.get("adaptive_decision"),
+        "adaptive_decision_score": adaptive.get("adaptive_decision_score"),
+        "adaptive_confidence_score": adaptive.get("adaptive_confidence_score"),
+        "base_decision": adaptive.get("base_decision"),
+        "base_decision_score": adaptive.get("base_decision_score"),
+        "hard_deny": adaptive.get("hard_deny"),
+        "hard_wait": adaptive.get("hard_wait"),
+        "recommended_order": order,
+        "sizing": adaptive.get("sizing"),
+        "risk_manager": adaptive.get("risk_manager"),
+        "capital_allocator": adaptive.get("capital_allocator"),
+        "module_votes": module_votes,
+        "outcome_status": "PENDING_OUTCOME",
+    }
+    saved = False
+    save_error = None
+    if record:
+        saved, save_error = _le_append_jsonl(record_item)
+    records = _le_read_records()
+    stats = _le_outcome_stats(records)
+    payload = {
+        "ok": True,
+        "version": LEARNING_ENGINE_V1_VERSION,
+        "mode": LEARNING_ENGINE_V1_MODE,
+        "generated_at": data_hora_sp_str(),
+        "learning_id": learning_id,
+        "trade_id": trade_id,
+        "record_saved": saved,
+        "record_error": save_error,
+        "record_mode": "SAVED" if saved else "PREVIEW_ONLY",
+        "decision_record": record_item,
+        "adaptive_decision": adaptive.get("adaptive_decision"),
+        "adaptive_decision_score": adaptive.get("adaptive_decision_score"),
+        "adaptive_confidence_score": adaptive.get("adaptive_confidence_score"),
+        "hard_deny": adaptive.get("hard_deny"),
+        "recommended_order": order,
+        "module_votes": module_votes,
+        "learning_stats": stats,
+        "alerts": list(adaptive.get("alerts") or []),
+        "reasons": [
+            "Learning Engine V1 registra decisão, votos, score e ordem sugerida para futura avaliação de outcome.",
+            "O outcome ainda precisa ser registrado quando o trade fechar para gerar acertos/erros por módulo.",
+        ],
+        "notes": [
+            "Learning Engine V1 está em modo consultivo/observação.",
+            "Não executa ordens e não altera decisões; apenas registra decisões e outcomes rotulados.",
+            "Os outcomes registrados alimentam o Adaptive Weight Engine V1 como base de aprendizado.",
+            "Use record=true ou POST para salvar uma decisão; use /learning/outcome/v1 para registrar o resultado posterior.",
+        ],
+    }
+    if not record:
+        payload["alerts"].append("Prévia não salva. Use record=true ou POST para registrar esta decisão no Learning Engine.")
+    LEARNING_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_learning_id": learning_id}
+    return payload
+
+
+def build_learning_outcome_v1(learning_id=None, trade_id=None, outcome=None, result_r=None, pnl_pct=None, note=None, force=False):
+    records = _le_read_records(limit=max(LEARNING_ENGINE_V1_DEFAULT_READ_LIMIT, 5000))
+    decision_record = _le_find_latest_decision(records, learning_id=learning_id, trade_id=trade_id)
+    normalized = _le_normalize_outcome(outcome=outcome, result_r=result_r, pnl_pct=pnl_pct)
+    module_outcomes = []
+    if decision_record:
+        for vote in decision_record.get("module_votes") or []:
+            correct = _le_module_correctness(vote.get("vote"), normalized)
+            module_outcomes.append({
+                "module": vote.get("module"),
+                "vote": vote.get("vote"),
+                "correct": correct,
+                "points": vote.get("points"),
+                "weight": vote.get("weight"),
+                "reason": vote.get("reason"),
+            })
+    item = {
+        "record_type": "OUTCOME",
+        "learning_id": learning_id or (decision_record or {}).get("learning_id") or _le_now_id("ORPHAN"),
+        "trade_id": trade_id or (decision_record or {}).get("trade_id"),
+        "created_at": data_hora_sp_str(),
+        "version": LEARNING_ENGINE_V1_VERSION,
+        "source": "Learning Engine V1",
+        "decision_found": decision_record is not None,
+        "decision": (decision_record or {}).get("decision"),
+        "adaptive_decision": (decision_record or {}).get("adaptive_decision"),
+        "adaptive_decision_score": (decision_record or {}).get("adaptive_decision_score"),
+        "outcome": normalized,
+        "raw_outcome": outcome,
+        "result_r": _le_safe_float(result_r, None),
+        "pnl_pct": _le_safe_float(pnl_pct, None),
+        "note": note,
+        "module_outcomes": module_outcomes,
+    }
+    if normalized == "UNKNOWN" and not force:
+        return {
+            "ok": False,
+            "error": "OUTCOME_UNKNOWN",
+            "message": "Informe outcome=WIN/LOSS/BE ou result_r/pnl_pct.",
+            "preview": item,
+        }
+    saved, err = _le_append_jsonl(item)
+    stats = _le_outcome_stats(_le_read_records())
+    return {
+        "ok": saved,
+        "version": LEARNING_ENGINE_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "outcome_saved": saved,
+        "error": err,
+        "outcome_record": item,
+        "learning_stats": stats,
+        "notes": [
+            "Outcome registrado para calibrar acertos/erros por módulo.",
+            "O Adaptive Weight Engine V1 passa a detectar este outcome na próxima leitura.",
+        ],
+    }
+
+
+def build_learning_engine_v1_text(payload):
+    rec = payload.get("decision_record") or {}
+    order = payload.get("recommended_order") or {}
+    stats = payload.get("learning_stats") or {}
+    lines = [
+        "🧬 LEARNING ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Registro de decisão:",
+        f"Learning ID: {payload.get('learning_id')}",
+        f"Trade ID: {payload.get('trade_id')}",
+        f"Status: {payload.get('record_mode')} | salvo: {payload.get('record_saved')}",
+        "",
+        "Decisão registrada:",
+        f"Decision: {payload.get('adaptive_decision')} | Score: {payload.get('adaptive_decision_score')} | Confidence: {payload.get('adaptive_confidence_score')}",
+        f"Hard deny: {payload.get('hard_deny')}",
+        "",
+        "Ordem sugerida:",
+        f"Paper notional: {order.get('paper_notional_usdt')} USDT | Margem: {order.get('paper_margin_usdt')} USDT | Qty: {order.get('paper_qty')}",
+        f"Risco efetivo: {order.get('paper_effective_risk_usdt')} USDT ({order.get('paper_effective_risk_pct')}%)",
+        "",
+        "Votos registrados:",
+    ]
+    for vote in payload.get("module_votes") or []:
+        lines.append(f"- {vote.get('module')}: {vote.get('vote')} | peso={vote.get('weight')} | pontos={vote.get('points')}")
+    lines += [
+        "",
+        "Estatísticas de aprendizado:",
+        f"Registros totais: {stats.get('records')} | Decisões: {stats.get('decisions')} | Outcomes: {stats.get('outcomes')}",
+    ]
+    by_module = stats.get("by_module") or {}
+    if by_module:
+        lines += ["", "Acurácia por módulo:"]
+        for module, item in by_module.items():
+            lines.append(f"- {module}: obs={item.get('observations')} | acertos={item.get('correct')} | erros={item.get('wrong')} | acc={item.get('accuracy_pct')}%")
+    if payload.get("alerts"):
+        lines += ["", "Alertas:"] + [f"- {x}" for x in payload.get("alerts", [])[:12]]
+    lines += ["", "Motivos:"] + [f"- {x}" for x in payload.get("reasons", [])]
+    lines += ["", "Notas:"] + [f"- {x}" for x in payload.get("notes", [])]
+    return "\n".join(lines)
+
+
+def build_learning_outcome_v1_text(payload):
+    item = payload.get("outcome_record") or payload.get("preview") or {}
+    stats = payload.get("learning_stats") or {}
+    lines = [
+        "🏁 LEARNING OUTCOME V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at', data_hora_sp_str())}",
+        f"Versão: {payload.get('version', LEARNING_ENGINE_V1_VERSION)}",
+        "",
+        f"OK: {payload.get('ok')}",
+        f"Learning ID: {item.get('learning_id')}",
+        f"Trade ID: {item.get('trade_id')}",
+        f"Decision found: {item.get('decision_found')}",
+        f"Decision: {item.get('adaptive_decision') or item.get('decision')}",
+        f"Outcome: {item.get('outcome')} | R: {item.get('result_r')} | PnL%: {item.get('pnl_pct')}",
+        "",
+        "Acerto por módulo:",
+    ]
+    for m in item.get("module_outcomes") or []:
+        lines.append(f"- {m.get('module')}: voto={m.get('vote')} | correto={m.get('correct')}")
+    lines += [
+        "",
+        "Estatísticas:",
+        f"Registros: {stats.get('records')} | Decisões: {stats.get('decisions')} | Outcomes: {stats.get('outcomes')}",
+    ]
+    if payload.get("notes"):
+        lines += ["", "Notas:"] + [f"- {x}" for x in payload.get("notes", [])]
+    return "\n".join(lines)
+
+
+@app.route("/learning/engine/v1", methods=["GET", "POST"])
+@app.route("/learning/v1", methods=["GET", "POST"])
+@app.route("/learn/v1", methods=["GET", "POST"])
+def learning_engine_v1_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _dse_request_payload_from_args(body)
+    capital = _le_safe_float(args_payload.get("capital"), 10000.0)
+    record_raw = body.get("record", request.args.get("record", ""))
+    record = request.method == "POST" or str(record_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save", "record"}
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    payload = build_learning_engine_v1(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), record=record)
+    text = build_learning_engine_v1_text(payload)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/learning/outcome/v1", methods=["GET", "POST"])
+@app.route("/learning/result/v1", methods=["GET", "POST"])
+@app.route("/learn/outcome/v1", methods=["GET", "POST"])
+def learning_outcome_v1_route():
+    body = request.get_json(silent=True) or {}
+    learning_id = body.get("learning_id", request.args.get("learning_id"))
+    trade_id = body.get("trade_id", request.args.get("trade_id"))
+    outcome = body.get("outcome", request.args.get("outcome"))
+    result_r = body.get("result_r", request.args.get("result_r"))
+    pnl_pct = body.get("pnl_pct", request.args.get("pnl_pct"))
+    note = body.get("note", request.args.get("note"))
+    force_raw = body.get("force", request.args.get("force", ""))
+    force = str(force_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    payload = build_learning_outcome_v1(learning_id=learning_id, trade_id=trade_id, outcome=outcome, result_r=result_r, pnl_pct=pnl_pct, note=note, force=force)
+    text = build_learning_outcome_v1_text(payload)
+    if as_text:
+        return text
+    return {"ok": bool(payload.get("ok")), "text": text, "payload": payload}
+
+
+@app.route("/learning/stats/v1")
+@app.route("/learn/stats/v1")
+def learning_stats_v1_route():
+    limit = request.args.get("limit", default=LEARNING_ENGINE_V1_DEFAULT_READ_LIMIT, type=int)
+    records = _le_read_records(limit=limit)
+    stats = _le_outcome_stats(records)
+    lines = [
+        "📚 LEARNING STATS V1 — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Registros: {stats.get('records')} | Decisões: {stats.get('decisions')} | Outcomes: {stats.get('outcomes')}",
+        "",
+        "Por módulo:",
+    ]
+    for module, item in (stats.get("by_module") or {}).items():
+        lines.append(f"- {module}: obs={item.get('observations')} | acertos={item.get('correct')} | erros={item.get('wrong')} | neutros={item.get('neutral')} | acc={item.get('accuracy_pct')}%")
+    return {"ok": True, "version": LEARNING_ENGINE_V1_VERSION, "text": "\n".join(lines), "payload": stats}
+
 
 
 @app.route("/analytics/exposure-v2")
