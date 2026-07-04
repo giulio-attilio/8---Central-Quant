@@ -6432,94 +6432,52 @@ def build_executive_report_daily():
 # ==========================================================
 
 def build_executive_dashboard_json():
-    """
-    Retorna um resumo executivo em formato JSON.
-
-    Não gera texto.
-    Não depende do Telegram.
-    Serve como fonte única para:
-      - CEO Daily Report
-      - Dashboard Web
-      - APIs futuras
-      - IA
-    """
-
     try:
-        dashboard = build_dashboard_report_json()
-        if isinstance(dashboard, dict):
-            return dashboard
+        memory_mb = current_rss_mb()
     except Exception:
-        pass
+        memory_mb = None
 
     try:
-        summary = build_dashboard_summary()
+        memory_pct = memory_usage_pct(memory_mb)
     except Exception:
-        summary = {}
+        memory_pct = None
 
     try:
-        health = build_health_report_json()
-    except Exception:
-        health = {}
-
-    try:
-        memory = get_memory_stats()
-    except Exception:
-        memory = {}
-
-    try:
-        exposure = get_global_exposure_summary()
+        exposure = central_exposure_snapshot()
     except Exception:
         exposure = {}
 
+    try:
+        watchdog = central_watchdog_status()
+    except Exception:
+        watchdog = {}
+
+    total = exposure.get("total_positions_open", 0)
+    longs = exposure.get("long_positions_open", 0)
+    shorts = exposure.get("short_positions_open", 0)
+
+    risk_status = "OK"
+    try:
+        if total >= GLOBAL_RISK_MAX_POSITIONS:
+            risk_status = "ATENÇÃO"
+        elif memory_pct is not None and memory_pct >= GLOBAL_RISK_MEMORY_BLOCK_PCT:
+            risk_status = "ATENÇÃO"
+    except Exception:
+        pass
+
     return {
         "generated_at": data_hora_sp_str(),
-
-        "status":
-            health.get("status")
-            or summary.get("status")
-            or "UNKNOWN",
-
-        "health_score":
-            health.get("health_score", 0),
-
-        "real_execution_enabled":
-            bool(summary.get("real_execution_enabled", False)),
-
-        "memory_mb":
-            memory.get("rss_mb", 0),
-
-        "memory_pct":
-            memory.get("memory_pct", 0),
-
-        "risk_status":
-            exposure.get("status", "UNKNOWN"),
-
-        "positions":
-            exposure.get("total_positions", 0),
-
-        "long":
-            exposure.get("long_positions", 0),
-
-        "short":
-            exposure.get("short_positions", 0),
-
-        "runner_1r":
-            exposure.get("runner_1r", 0),
-
-        "runner_2r":
-            exposure.get("runner_2r", 0),
-
-        "runner_3r":
-            exposure.get("runner_3r", 0),
-
-        "runner_5r":
-            exposure.get("runner_5r", 0),
-
-        "best_runner":
-            exposure.get("best_runner"),
-
-        "best_bot":
-            exposure.get("best_bot")
+        "status": watchdog.get("status", "OK"),
+        "health_score": 100 if watchdog.get("ok", True) else 70,
+        "real_execution_enabled": bool(ENABLE_REAL_TRADING),
+        "execution_mode": EXECUTION_MODE,
+        "memory_mb": memory_mb or 0,
+        "memory_pct": memory_pct or 0,
+        "risk_status": risk_status,
+        "positions": total,
+        "long": longs,
+        "short": shorts,
+        "best_runner": exposure.get("best_open_runner"),
     }
 
 
@@ -6923,6 +6881,11 @@ def build_full_report():
 @app.route("/executive")
 def executive_route():
     return {"text": build_executive_report()}
+
+
+@app.route("/ceodaily")
+def ceo_daily_route():
+    return {"text": build_ceo_daily_report()}
 
 
 @app.route("/dashboard")
@@ -15114,6 +15077,8 @@ def build_central_command_reply(text: str):
         return build_central_help_text()
     if cmd0 in {"/dashboard"}:
         return build_dashboard_report()
+    if cmd0 in {"/ceo", "/ceodaily", "/ceo_daily"}:
+        return build_ceo_daily_report()
     if cmd0 in {"/daily", "/diario", "/diário"}:
         return build_daily_report()
     if cmd0 in {"/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive"}:
