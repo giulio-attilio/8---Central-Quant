@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-03-SUPER-CENTRAL-QUANT-V5-TRADE-REGISTRY
+# Versão: 2026-07-03-SUPER-CENTRAL-QUANT-V5-TRADE-REGISTRY-EXPOSURE-SCORE-V2
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -8397,6 +8397,529 @@ def exposure_score_engine_v1_summary_route():
     }
 
 
+# ==========================================================
+# EXPOSURE SCORE ENGINE V2 - CENTRAL QUANT
+# ==========================================================
+
+EXPOSURE_SCORE_ENGINE_V2_VERSION = "2026-07-03-EXPOSURE-SCORE-ENGINE-V2"
+EXPOSURE_SCORE_ENGINE_V2_MODE = os.environ.get("EXPOSURE_SCORE_ENGINE_V2_MODE", "OBSERVATION_ONLY").strip().upper()
+EXPOSURE_SCORE_ENGINE_V2_CACHE = {
+    "last_snapshot": None,
+    "last_generated_at": None,
+    "last_capital": None,
+}
+EXPOSURE_SCORE_ENGINE_V2_LOCK = threading.Lock()
+
+
+def _ese_v2_clamp(value, minimum=0.0, maximum=100.0):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    return max(float(minimum), min(float(maximum), value))
+
+
+def _ese_v2_float_from_any(*values, default=0.0):
+    for value in values:
+        try:
+            if value is None:
+                continue
+            return float(value)
+        except Exception:
+            continue
+    return default
+
+
+def _ese_v2_text_from_any(*values, default="N/A"):
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return default
+
+
+def _ese_v2_confidence_score(performance):
+    """Score de confiança estatística: amostra e rótulo de confiança pesam muito."""
+    performance = performance or {}
+    trades = int(_ese_v2_float_from_any(performance.get("trades"), default=0.0))
+    confidence = str(performance.get("confidence") or "").upper()
+
+    if trades <= 0:
+        trade_score = 20.0
+    elif trades < 5:
+        trade_score = 35.0
+    elif trades < 10:
+        trade_score = 50.0
+    elif trades < 20:
+        trade_score = 65.0
+    elif trades < 40:
+        trade_score = 78.0
+    elif trades < 80:
+        trade_score = 88.0
+    else:
+        trade_score = 96.0
+
+    label_score = 55.0
+    if "ALTA" in confidence or "FORTE" in confidence:
+        label_score = 90.0
+    elif "MÉDIA" in confidence or "MEDIA" in confidence:
+        label_score = 75.0
+    elif "BAIXA" in confidence:
+        label_score = 50.0
+    elif "INSUFICIENTE" in confidence or "AMOSTRA" in confidence:
+        label_score = 40.0
+    elif "UNKNOWN" in confidence or not confidence:
+        label_score = 45.0
+
+    return round(_ese_v2_clamp((trade_score * 0.70) + (label_score * 0.30)), 2)
+
+
+def _ese_v2_expectancy_score(performance, analytics_item=None):
+    """Score de expectancy. Usa expectancy explícita se existir; senão usa PnL médio como proxy conservador."""
+    performance = performance or {}
+    analytics_item = analytics_item or {}
+
+    expectancy = _ese_v2_float_from_any(
+        analytics_item.get("expectancy_pct"),
+        analytics_item.get("expectancy"),
+        analytics_item.get("expectancy_r"),
+        analytics_item.get("pnl_avg_pct"),
+        performance.get("pnl_avg_pct"),
+        default=0.0,
+    )
+
+    # Mapeamento conservador para pct por trade/proxy.
+    if expectancy >= 1.00:
+        score = 95.0
+    elif expectancy >= 0.50:
+        score = 85.0
+    elif expectancy >= 0.20:
+        score = 75.0
+    elif expectancy >= 0.05:
+        score = 65.0
+    elif expectancy >= -0.05:
+        score = 52.0
+    elif expectancy >= -0.20:
+        score = 40.0
+    elif expectancy >= -0.50:
+        score = 25.0
+    else:
+        score = 12.0
+
+    return {
+        "score": round(_ese_v2_clamp(score), 2),
+        "expectancy_value": round(expectancy, 6),
+        "source": "ANALYTICS_EXPECTANCY_OR_PNL_AVG_PROXY",
+    }
+
+
+def _ese_v2_drawdown_score(performance, analytics_item=None):
+    """Score de drawdown. Se o Analytics ainda não trouxer DD, usa proxy neutro/conservador."""
+    performance = performance or {}
+    analytics_item = analytics_item or {}
+
+    dd = _ese_v2_float_from_any(
+        analytics_item.get("drawdown_pct"),
+        analytics_item.get("max_drawdown_pct"),
+        analytics_item.get("dd_pct"),
+        analytics_item.get("drawdown"),
+        default=None,
+    )
+
+    if dd is None:
+        # Sem drawdown explícito: usa proxy suave por PnL total negativo.
+        pnl_total = _ese_v2_float_from_any(performance.get("pnl_total_pct"), analytics_item.get("pnl_total_pct"), default=0.0)
+        if pnl_total >= 0:
+            return {"score": 65.0, "drawdown_pct": None, "source": "NEUTRAL_NO_DRAWDOWN_DATA"}
+        proxy_dd = abs(pnl_total)
+        source = "PNL_TOTAL_NEGATIVE_PROXY"
+    else:
+        proxy_dd = abs(dd)
+        source = "ANALYTICS_DRAWDOWN"
+
+    if proxy_dd <= 1:
+        score = 95.0
+    elif proxy_dd <= 3:
+        score = 85.0
+    elif proxy_dd <= 6:
+        score = 70.0
+    elif proxy_dd <= 10:
+        score = 55.0
+    elif proxy_dd <= 15:
+        score = 35.0
+    else:
+        score = 15.0
+
+    return {"score": round(_ese_v2_clamp(score), 2), "drawdown_pct": round(proxy_dd, 4), "source": source}
+
+
+def _ese_v2_consistency_score(performance, analytics_item=None):
+    """Score de consistência com base em win rate, PnL total, trades e sinais de estabilidade disponíveis."""
+    performance = performance or {}
+    analytics_item = analytics_item or {}
+
+    explicit = _ese_v2_float_from_any(
+        analytics_item.get("consistency_score"),
+        analytics_item.get("stability_score"),
+        analytics_item.get("consistencia_score"),
+        default=None,
+    )
+    if explicit is not None:
+        return {"score": round(_ese_v2_clamp(explicit), 2), "source": "ANALYTICS_CONSISTENCY"}
+
+    trades = int(_ese_v2_float_from_any(performance.get("trades"), analytics_item.get("trades"), default=0.0))
+    win_rate = _ese_v2_float_from_any(performance.get("win_rate_pct"), analytics_item.get("win_rate_pct"), default=0.0)
+    pnl_total = _ese_v2_float_from_any(performance.get("pnl_total_pct"), analytics_item.get("pnl_total_pct"), default=0.0)
+    pnl_avg = _ese_v2_float_from_any(performance.get("pnl_avg_pct"), analytics_item.get("pnl_avg_pct"), default=0.0)
+
+    score = 50.0
+    if trades >= 20:
+        score += 12.0
+    elif trades >= 10:
+        score += 7.0
+    elif trades < 5:
+        score -= 8.0
+
+    if win_rate >= 60:
+        score += 13.0
+    elif win_rate >= 50:
+        score += 7.0
+    elif win_rate >= 40:
+        score += 0.0
+    else:
+        score -= 12.0
+
+    if pnl_total > 5:
+        score += 12.0
+    elif pnl_total > 0:
+        score += 6.0
+    elif pnl_total < -5:
+        score -= 15.0
+    elif pnl_total < 0:
+        score -= 7.0
+
+    if pnl_avg > 0.2:
+        score += 7.0
+    elif pnl_avg > 0:
+        score += 3.0
+    elif pnl_avg < -0.2:
+        score -= 8.0
+
+    return {"score": round(_ese_v2_clamp(score), 2), "source": "DERIVED_FROM_WINRATE_PNL_TRADES"}
+
+
+def _ese_v2_rating(score):
+    score = float(score or 0.0)
+    if score >= 85:
+        return "EXCELLENT"
+    if score >= 74:
+        return "GOOD"
+    if score >= 60:
+        return "ATTENTION"
+    if score >= 45:
+        return "WEAK"
+    return "CRITICAL"
+
+
+def _ese_v2_decision(score, bot_state, performance, components):
+    positions = int((bot_state or {}).get("positions", 0) or 0)
+    usage_pct = _bem_v2_float((bot_state or {}).get("usage_pct"), 0.0)
+    risk_usage_pct = _bem_v2_float((bot_state or {}).get("risk_usage_pct"), 0.0)
+    confidence_score = _bem_v2_float((components or {}).get("confidence_score"), 0.0)
+    drawdown_score = _bem_v2_float((components or {}).get("drawdown_score"), 0.0)
+    expectancy_score = _bem_v2_float((components or {}).get("expectancy_score"), 0.0)
+    recommendation = str((performance or {}).get("recommendation") or "").upper()
+
+    if score >= 84 and confidence_score >= 70 and expectancy_score >= 65 and drawdown_score >= 60 and usage_pct < 85 and risk_usage_pct < 55 and positions > 0:
+        return "SCALE_UP_OBSERVATION"
+    if score >= 74 and risk_usage_pct < 75 and expectancy_score >= 50:
+        return "MAINTAIN_OR_ALLOW_OBSERVATION"
+    if score >= 60:
+        if usage_pct >= 90:
+            return "REDUCE_SIZE_OBSERVATION"
+        return "MAINTAIN_OBSERVATION"
+    if score >= 45:
+        return "REDUCE_SIZE_OBSERVATION"
+    if "PAUS" in recommendation or "AGUARD" in recommendation:
+        return "PAUSE_OR_WAIT_SAMPLE_OBSERVATION"
+    return "PAUSE_OR_REVIEW_OBSERVATION"
+
+
+def _ese_v2_reasons(bot_state, components, performance, detail):
+    reasons = _ese_v1_reasons(bot_state, components, performance) if callable(globals().get("_ese_v1_reasons")) else []
+    detail = detail or {}
+    confidence_score = _bem_v2_float((components or {}).get("confidence_score"), 0.0)
+    expectancy_score = _bem_v2_float((components or {}).get("expectancy_score"), 0.0)
+    drawdown_score = _bem_v2_float((components or {}).get("drawdown_score"), 0.0)
+    consistency_score = _bem_v2_float((components or {}).get("consistency_score"), 0.0)
+
+    if confidence_score < 55:
+        reasons.append("Confiança estatística ainda baixa; evitar aumentar exposição agressivamente.")
+    if expectancy_score >= 70:
+        reasons.append("Expectancy/proxy positivo favorece manutenção ou aumento gradual.")
+    elif expectancy_score < 45:
+        reasons.append("Expectancy/proxy fraco exige redução ou espera por melhora.")
+    if drawdown_score < 55:
+        reasons.append("Drawdown/proxy de queda exige atenção antes de liberar mais capital.")
+    if consistency_score < 55:
+        reasons.append("Consistência operacional ainda fraca ou instável.")
+
+    return reasons[:8]
+
+
+def build_exposure_score_engine_v2(capital=10000.0, bot_filter=None):
+    try:
+        capital = float(capital or 0)
+    except Exception:
+        capital = 10000.0
+
+    base = build_exposure_score_engine_v1(capital=capital, bot_filter=bot_filter)
+    analytics_ranking, analytics_error = _ese_v1_load_analytics_ranking()
+
+    scored_bots = {}
+    ranking_items = []
+
+    for base_item in base.get("ranking", []) or []:
+        if not isinstance(base_item, dict):
+            continue
+
+        bot = normalize_registry_bot(base_item.get("bot") or "UNKNOWN")
+        analytics_item = analytics_ranking.get(bot, {}) if isinstance(analytics_ranking, dict) else {}
+        performance = dict(base_item.get("performance") or {})
+        components_v1 = dict(base_item.get("components") or {})
+
+        expectancy = _ese_v2_expectancy_score(performance, analytics_item)
+        drawdown = _ese_v2_drawdown_score(performance, analytics_item)
+        consistency = _ese_v2_consistency_score(performance, analytics_item)
+        confidence_score = _ese_v2_confidence_score(performance)
+
+        components = {
+            "performance_score": round(_ese_v2_clamp(components_v1.get("performance_score", performance.get("score", 50.0))), 2),
+            "risk_score": round(_ese_v2_clamp(components_v1.get("risk_score", 60.0)), 2),
+            "capital_score": round(_ese_v2_clamp(components_v1.get("capital_score", 55.0)), 2),
+            "concentration_score": round(_ese_v2_clamp(components_v1.get("concentration_score", 60.0)), 2),
+            "activity_score": round(_ese_v2_clamp(components_v1.get("activity_score", 50.0)), 2),
+            "drawdown_score": drawdown.get("score"),
+            "expectancy_score": expectancy.get("score"),
+            "consistency_score": consistency.get("score"),
+            "confidence_score": confidence_score,
+        }
+
+        # V2 aumenta peso de qualidade estatística real e reduz risco de amostras pequenas dominarem.
+        score = (
+            components["performance_score"] * 0.24
+            + components["expectancy_score"] * 0.16
+            + components["confidence_score"] * 0.13
+            + components["consistency_score"] * 0.12
+            + components["drawdown_score"] * 0.10
+            + components["risk_score"] * 0.10
+            + components["capital_score"] * 0.07
+            + components["concentration_score"] * 0.05
+            + components["activity_score"] * 0.03
+        )
+        score = round(_ese_v2_clamp(score), 2)
+
+        detail = {
+            "expectancy": expectancy,
+            "drawdown": drawdown,
+            "consistency": consistency,
+            "confidence_score_source": "TRADES_AND_CONFIDENCE_LABEL",
+            "v1_score": base_item.get("score"),
+            "v1_rating": base_item.get("rating"),
+            "v1_decision": base_item.get("decision"),
+        }
+
+        item = dict(base_item)
+        item.update({
+            "score": score,
+            "rating": _ese_v2_rating(score),
+            "decision": _ese_v2_decision(score, base_item, performance, components),
+            "components": components,
+            "quality_detail": detail,
+            "reasons": _ese_v2_reasons(base_item, components, performance, detail),
+            "engine_upgrade": "V2_ADDS_DRAWDOWN_EXPECTANCY_CONSISTENCY_CONFIDENCE",
+        })
+
+        scored_bots[bot] = item
+        ranking_items.append(item)
+
+    ranking_items.sort(key=lambda item: (-item.get("score", 0), -int(item.get("positions", 0) or 0), item.get("bot")))
+
+    active_items = [item for item in ranking_items if int(item.get("positions", 0) or 0) > 0]
+    best_bot = ranking_items[0] if ranking_items else None
+    weakest_active = sorted(active_items, key=lambda item: (item.get("score", 0), -int(item.get("positions", 0) or 0)))[0] if active_items else None
+
+    category_summary = {}
+    for item in ranking_items:
+        cat = str(item.get("category") or "OTHER").upper()
+        bucket = category_summary.setdefault(cat, {"bots": 0, "positions": 0, "avg_score": 0.0, "capital_used": 0.0, "risk_used_usdt": 0.0})
+        bucket["bots"] += 1
+        bucket["positions"] += int(item.get("positions", 0) or 0)
+        bucket["avg_score"] += float(item.get("score", 0.0) or 0.0)
+        bucket["capital_used"] += _bem_v2_float(item.get("capital_used"), 0.0)
+        bucket["risk_used_usdt"] += _bem_v2_float(item.get("risk_used_usdt"), 0.0)
+    for cat, bucket in category_summary.items():
+        bucket["avg_score"] = round(bucket["avg_score"] / bucket["bots"], 2) if bucket.get("bots") else 0.0
+        bucket["capital_used"] = round(bucket["capital_used"], 4)
+        bucket["risk_used_usdt"] = round(bucket["risk_used_usdt"], 4)
+
+    avg_score = round(sum(item.get("score", 0) for item in ranking_items) / len(ranking_items), 2) if ranking_items else 0.0
+    active_avg_score = round(sum(item.get("score", 0) for item in active_items) / len(active_items), 2) if active_items else 0.0
+
+    summary = {
+        "bots": len(ranking_items),
+        "active_bots": len(active_items),
+        "avg_score": avg_score,
+        "active_avg_score": active_avg_score,
+        "best_bot": best_bot,
+        "weakest_active_bot": weakest_active,
+        "category_summary": category_summary,
+        "exposure_summary": (base.get("summary", {}) or {}).get("exposure_summary", {}),
+        "v1_comparison": {
+            "v1_avg_score": (base.get("summary", {}) or {}).get("avg_score"),
+            "v1_active_avg_score": (base.get("summary", {}) or {}).get("active_avg_score"),
+        },
+    }
+
+    payload = {
+        "ok": True,
+        "version": EXPOSURE_SCORE_ENGINE_V2_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": EXPOSURE_SCORE_ENGINE_V2_MODE,
+        "capital": round(capital, 4),
+        "summary": summary,
+        "bots": scored_bots,
+        "ranking": ranking_items,
+        "inputs": {
+            "exposure_version": ((base.get("summary", {}) or {}).get("exposure_summary", {}) or {}).get("version"),
+            "score_engine_v1_version": base.get("version"),
+            "analytics_loaded": analytics_error is None,
+            "analytics_error": analytics_error,
+        },
+        "notes": [
+            "Exposure Score Engine V2 está em modo consultivo/observação.",
+            "Não altera lote, execução, risco real ou permissões de entrada.",
+            "Adiciona Drawdown Score, Expectancy Score, Consistency Score e Confidence Score ao V1.",
+            "Quando drawdown ou consistência explícitos não existem, usa proxies conservadores baseados em PnL, win rate e amostra.",
+            "Preparado para alimentar Portfolio Advisor V1 com score mais robusto.",
+        ],
+    }
+
+    with EXPOSURE_SCORE_ENGINE_V2_LOCK:
+        EXPOSURE_SCORE_ENGINE_V2_CACHE["last_snapshot"] = payload
+        EXPOSURE_SCORE_ENGINE_V2_CACHE["last_generated_at"] = payload.get("generated_at")
+        EXPOSURE_SCORE_ENGINE_V2_CACHE["last_capital"] = payload.get("capital")
+
+    return payload
+
+
+def build_exposure_score_engine_v2_text(capital=10000.0, bot_filter=None):
+    payload = build_exposure_score_engine_v2(capital=capital, bot_filter=bot_filter)
+    summary = payload.get("summary", {})
+    ranking = payload.get("ranking", [])
+    exposure_summary = summary.get("exposure_summary", {}) or {}
+
+    lines = [
+        "🧠 EXPOSURE SCORE ENGINE V2 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Resumo geral:",
+        f"Capital analisado: {payload.get('capital')} USDT",
+        f"Robôs avaliados: {summary.get('bots')} | ativos: {summary.get('active_bots')}",
+        f"Score médio geral: {summary.get('avg_score')}/100",
+        f"Score médio dos ativos: {summary.get('active_avg_score')}/100",
+        f"V1 comparação: geral {summary.get('v1_comparison', {}).get('v1_avg_score')} | ativos {summary.get('v1_comparison', {}).get('v1_active_avg_score')}",
+        f"Posições: {exposure_summary.get('positions')} | LONG {exposure_summary.get('long')} | SHORT {exposure_summary.get('short')} | Net {exposure_summary.get('net_direction')}",
+        f"Capital usado: {exposure_summary.get('capital_used')} USDT ({exposure_summary.get('capital_usage_pct')}%)",
+        f"Risco aberto estimado: {exposure_summary.get('risk_used_usdt')} USDT",
+        "",
+        "Ranking por robô:",
+    ]
+
+    for i, item in enumerate(ranking, start=1):
+        components = item.get("components") or {}
+        perf = item.get("performance") or {}
+        detail = item.get("quality_detail") or {}
+        expectancy = detail.get("expectancy") or {}
+        drawdown = detail.get("drawdown") or {}
+        consistency = detail.get("consistency") or {}
+        lines += [
+            "",
+            f"{i}. {item.get('bot')} — Score {item.get('score')}/100 ({item.get('rating')})",
+            f"Decisão: {item.get('decision')} | V1: {detail.get('v1_score')}/100 ({detail.get('v1_decision')})",
+            f"Categoria: {item.get('category')} | Status: {item.get('status')}",
+            f"Posições: {item.get('positions')} | Net {item.get('net_direction')} | Maior ativo: {item.get('largest_symbol')} ({item.get('largest_symbol_count')})",
+            f"Capital: {item.get('capital_used')} / {item.get('capital_allocated')} USDT ({item.get('usage_pct')}%)",
+            f"Risco: {item.get('risk_used_usdt')} / {item.get('max_open_risk_usdt')} USDT ({item.get('risk_usage_pct')}%)",
+            "Componentes V2: "
+            f"perf {components.get('performance_score')} | exp {components.get('expectancy_score')} | conf {components.get('confidence_score')} | "
+            f"cons {components.get('consistency_score')} | DD {components.get('drawdown_score')} | risco {components.get('risk_score')} | capital {components.get('capital_score')}",
+            f"Analytics: trades {perf.get('trades')} | win {perf.get('win_rate_pct')}% | pnl {perf.get('pnl_total_pct')}% | fonte {perf.get('source')}",
+            f"Expectancy/proxy: {expectancy.get('expectancy_value')} | Drawdown/proxy: {drawdown.get('drawdown_pct')} | Consistência fonte: {consistency.get('source')}",
+        ]
+        reasons = item.get("reasons") or []
+        if reasons:
+            lines.append("Leitura:")
+            for reason in reasons[:5]:
+                lines.append(f"- {reason}")
+        alerts = item.get("exposure_alerts") or []
+        if alerts:
+            lines.append("Alertas Exposure: " + ", ".join(alerts))
+
+    lines += ["", "Notas:"]
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+
+    return "\n".join(lines), payload
+
+
+@app.route("/exposure/score/v2")
+@app.route("/exposure/scores/v2")
+@app.route("/score/exposure/v2")
+@app.route("/analytics/exposure-score/v2")
+def exposure_score_engine_v2_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_exposure_score_engine_v2_text(capital=capital)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/exposure/score/<bot>/v2")
+@app.route("/score/exposure/<bot>/v2")
+def exposure_score_engine_v2_bot_route(bot):
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_exposure_score_engine_v2_text(capital=capital, bot_filter=bot)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/exposure/score/summary/v2")
+def exposure_score_engine_v2_summary_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    payload = build_exposure_score_engine_v2(capital=capital)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "summary": payload.get("summary"),
+        "ranking": payload.get("ranking"),
+        "cache": {
+            "last_generated_at": EXPOSURE_SCORE_ENGINE_V2_CACHE.get("last_generated_at"),
+            "last_capital": EXPOSURE_SCORE_ENGINE_V2_CACHE.get("last_capital"),
+        },
+    }
+
+
+
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
 def analytics_bot_exposure_v2_route():
@@ -9736,6 +10259,14 @@ def build_central_command_reply(text: str):
             capital_arg = 10000.0
         text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
         return text_v2
+    if cmd0 in {"/exposurescorev2", "/scorev2", "/scoreexposurev2"}:
+        parts = raw.split()
+        try:
+            capital_arg = float(parts[1]) if len(parts) > 1 else 10000.0
+        except Exception:
+            capital_arg = 10000.0
+        text_score, _ = build_exposure_score_engine_v2_text(capital=capital_arg)
+        return text_score
     if cmd0 in {"/exposurescore", "/scoreexposure", "/exposurescorev1", "/scorev1"}:
         parts = raw.split()
         try:
