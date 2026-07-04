@@ -7337,6 +7337,517 @@ def analytics_exposure_route():
         }
     
 
+# ==========================================================
+# BOT EXPOSURE MANAGER V2 - CENTRAL QUANT
+# ==========================================================
+
+BOT_EXPOSURE_MANAGER_V2_VERSION = "2026-07-03-BOT-EXPOSURE-MANAGER-V2"
+BOT_EXPOSURE_MANAGER_V2_MODE = os.environ.get("BOT_EXPOSURE_MANAGER_V2_MODE", "OBSERVATION_ONLY").strip().upper()
+BOT_EXPOSURE_MANAGER_V2_CACHE = {
+    "last_snapshot": None,
+    "last_generated_at": None,
+    "last_capital": None,
+}
+BOT_EXPOSURE_MANAGER_V2_LOCK = threading.Lock()
+
+
+def _bem_v2_env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+def _bem_v2_bot_profiles(capital=10000.0):
+    """
+    Perfil inicial consultivo por robô.
+    Pode ser ajustado por ENV sem alterar código:
+    DONKEY_CAPITAL_PCT, DONKEY_MAX_OPEN_RISK_PCT etc.
+    """
+    defaults = {
+        "TRENDPRO": {"category": "CORE", "capital_pct": 15.0, "max_open_risk_pct": 1.5},
+        "DONKEY": {"category": "CORE", "capital_pct": 45.0, "max_open_risk_pct": 4.0},
+        "PREDATOR": {"category": "CORE", "capital_pct": 20.0, "max_open_risk_pct": 2.0},
+        "TURTLE": {"category": "SATELLITE", "capital_pct": 10.0, "max_open_risk_pct": 1.0},
+        "FALCON": {"category": "TACTICAL", "capital_pct": 5.0, "max_open_risk_pct": 0.75},
+        "COBRA": {"category": "TACTICAL", "capital_pct": 3.0, "max_open_risk_pct": 0.50},
+        "MEME": {"category": "EXPERIMENTAL", "capital_pct": 2.0, "max_open_risk_pct": 0.25},
+    }
+
+    profiles = {}
+    known_bots = set(defaults.keys())
+    try:
+        known_bots.update([str(k).upper() for k in BOT_CONFIGS.keys()])
+    except Exception:
+        pass
+
+    for bot in sorted(known_bots):
+        base = defaults.get(bot, {"category": "OTHER", "capital_pct": 0.0, "max_open_risk_pct": 0.0})
+        capital_pct = _bem_v2_env_float(f"{bot}_CAPITAL_PCT", base.get("capital_pct", 0.0))
+        max_risk_pct = _bem_v2_env_float(f"{bot}_MAX_OPEN_RISK_PCT", base.get("max_open_risk_pct", 0.0))
+        profiles[bot] = {
+            "bot": bot,
+            "category": os.environ.get(f"{bot}_CATEGORY", base.get("category", "OTHER")).strip().upper(),
+            "capital_pct": round(capital_pct, 4),
+            "capital_allocated": round(float(capital or 0) * capital_pct / 100.0, 4),
+            "max_open_risk_pct": round(max_risk_pct, 4),
+            "max_open_risk_usdt": round(float(capital or 0) * max_risk_pct / 100.0, 4),
+        }
+    return profiles
+
+
+def _bem_v2_first_value(item, keys, default=None):
+    if not isinstance(item, dict):
+        return default
+    for key in keys:
+        value = item.get(key)
+        if value not in [None, ""]:
+            return value
+    return default
+
+
+def _bem_v2_float(value, default=0.0):
+    try:
+        if value in [None, ""]:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _bem_v2_side(position):
+    side = str(_bem_v2_first_value(position, ["side", "direction", "signal"], "UNKNOWN")).upper().strip()
+    if side == "BUY":
+        return "LONG"
+    if side == "SELL":
+        return "SHORT"
+    return side or "UNKNOWN"
+
+
+def _bem_v2_symbol(position):
+    try:
+        return normalize_registry_symbol(
+            _bem_v2_first_value(position, ["symbol_clean", "symbol", "ativo", "pair"], "UNKNOWN")
+        )
+    except Exception:
+        return str(_bem_v2_first_value(position, ["symbol_clean", "symbol", "ativo", "pair"], "UNKNOWN")).upper().strip()
+
+
+def _bem_v2_bot(position):
+    try:
+        return normalize_registry_bot(_bem_v2_first_value(position, ["bot", "robot", "source_bot"], "UNKNOWN"))
+    except Exception:
+        return str(_bem_v2_first_value(position, ["bot", "robot", "source_bot"], "UNKNOWN")).upper().strip()
+
+
+def _bem_v2_setup(position, bot="UNKNOWN"):
+    return str(_bem_v2_first_value(
+        position,
+        ["setup", "signal_type", "setup_label", "origin", "origem", "strategy"],
+        bot,
+    )).upper().strip() or bot
+
+
+def _bem_v2_qty(position):
+    return _bem_v2_float(_bem_v2_first_value(position, ["qty", "quantity", "amount", "position_size", "size"], 0), 0.0)
+
+
+def _bem_v2_entry(position):
+    return _bem_v2_float(_bem_v2_first_value(position, ["entry", "entrada", "entry_price", "price"], 0), 0.0)
+
+
+def _bem_v2_stop(position):
+    return _bem_v2_float(_bem_v2_first_value(position, ["sl", "stop", "initial_stop", "stop_atual", "current_stop"], 0), 0.0)
+
+
+def _bem_v2_capital_used(position):
+    explicit = _bem_v2_first_value(position, [
+        "capital_used", "capital_usdt", "margin_usdt", "required_capital", "notional_usdt",
+        "effective_notional_usdt", "value_usdt", "position_value_usdt",
+    ], None)
+    if explicit not in [None, ""]:
+        return max(0.0, _bem_v2_float(explicit, 0.0))
+
+    entry = _bem_v2_entry(position)
+    qty = _bem_v2_qty(position)
+    if entry > 0 and qty > 0:
+        return max(0.0, abs(entry * qty))
+
+    return 0.0
+
+
+def _bem_v2_risk_used(position):
+    explicit = _bem_v2_first_value(position, [
+        "risk_usdt", "required_risk_usdt", "open_risk_usdt", "risk_value_usdt", "max_loss_usdt"
+    ], None)
+    if explicit not in [None, ""]:
+        return max(0.0, _bem_v2_float(explicit, 0.0))
+
+    entry = _bem_v2_entry(position)
+    stop = _bem_v2_stop(position)
+    qty = _bem_v2_qty(position)
+    if entry > 0 and stop > 0 and qty > 0:
+        return max(0.0, abs(entry - stop) * qty)
+
+    risk_pct = _bem_v2_float(_bem_v2_first_value(position, ["risk_pct", "risco_pct", "risk_percent"], 0), 0.0)
+    capital_used = _bem_v2_capital_used(position)
+    if risk_pct > 0 and capital_used > 0:
+        return max(0.0, capital_used * risk_pct / 100.0)
+
+    return 0.0
+
+
+def _bem_v2_pnl_open(position):
+    return _bem_v2_float(_bem_v2_first_value(position, [
+        "pnl_usdt", "unrealized_pnl_usdt", "open_pnl_usdt", "profit_usdt", "pnl"
+    ], 0), 0.0)
+
+
+def _bem_v2_empty_bot_state(bot, profile=None):
+    profile = profile or {}
+    capital_allocated = _bem_v2_float(profile.get("capital_allocated"), 0.0)
+    max_risk_usdt = _bem_v2_float(profile.get("max_open_risk_usdt"), 0.0)
+    return {
+        "bot": bot,
+        "category": profile.get("category", "OTHER"),
+        "capital_pct": profile.get("capital_pct", 0.0),
+        "capital_allocated": round(capital_allocated, 4),
+        "capital_used": 0.0,
+        "capital_free": round(capital_allocated, 4),
+        "usage_pct": 0.0,
+        "max_open_risk_pct": profile.get("max_open_risk_pct", 0.0),
+        "max_open_risk_usdt": round(max_risk_usdt, 4),
+        "risk_used_usdt": 0.0,
+        "risk_free_usdt": round(max_risk_usdt, 4),
+        "risk_usage_pct": 0.0,
+        "positions": 0,
+        "long": 0,
+        "short": 0,
+        "unknown_side": 0,
+        "net_direction": "FLAT",
+        "symbols": {},
+        "setups": {},
+        "largest_symbol": None,
+        "largest_symbol_count": 0,
+        "largest_position": None,
+        "largest_risk": None,
+        "open_pnl_usdt": 0.0,
+        "runner_buckets": _empty_runner_buckets(),
+        "best_open_runner": None,
+        "status": "IDLE",
+        "alerts": [],
+        "decision": "ALLOW_OBSERVATION",
+    }
+
+
+def _bem_v2_add_counter(target, key, amount=1):
+    key = str(key or "UNKNOWN").upper().strip() or "UNKNOWN"
+    target[key] = target.get(key, 0) + amount
+
+
+def _bem_v2_finalize_state(state):
+    capital_allocated = _bem_v2_float(state.get("capital_allocated"), 0.0)
+    capital_used = _bem_v2_float(state.get("capital_used"), 0.0)
+    max_risk_usdt = _bem_v2_float(state.get("max_open_risk_usdt"), 0.0)
+    risk_used = _bem_v2_float(state.get("risk_used_usdt"), 0.0)
+
+    state["capital_used"] = round(capital_used, 4)
+    state["capital_free"] = round(capital_allocated - capital_used, 4)
+    state["usage_pct"] = round((capital_used / capital_allocated) * 100.0, 2) if capital_allocated > 0 else 0.0
+    state["risk_used_usdt"] = round(risk_used, 4)
+    state["risk_free_usdt"] = round(max_risk_usdt - risk_used, 4)
+    state["risk_usage_pct"] = round((risk_used / max_risk_usdt) * 100.0, 2) if max_risk_usdt > 0 else 0.0
+
+    if state.get("long", 0) > state.get("short", 0):
+        state["net_direction"] = "LONG"
+    elif state.get("short", 0) > state.get("long", 0):
+        state["net_direction"] = "SHORT"
+    elif state.get("positions", 0) > 0:
+        state["net_direction"] = "BALANCED"
+    else:
+        state["net_direction"] = "FLAT"
+
+    symbols = state.get("symbols") or {}
+    if symbols:
+        largest_symbol, count = sorted(symbols.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        state["largest_symbol"] = largest_symbol
+        state["largest_symbol_count"] = count
+
+    alerts = []
+    if state["capital_free"] < 0:
+        alerts.append("CAPITAL_EXCEEDED")
+    if state["risk_free_usdt"] < 0:
+        alerts.append("RISK_EXCEEDED")
+    if state.get("usage_pct", 0) >= 90:
+        alerts.append("CAPITAL_NEAR_LIMIT")
+    if state.get("risk_usage_pct", 0) >= 90:
+        alerts.append("RISK_NEAR_LIMIT")
+    if state.get("positions", 0) == 0:
+        status = "IDLE"
+    elif alerts:
+        status = "OVERLOADED" if ("CAPITAL_EXCEEDED" in alerts or "RISK_EXCEEDED" in alerts) else "LOADED_ATTENTION"
+    else:
+        status = "LOADED"
+
+    state["alerts"] = alerts
+    state["status"] = status
+
+    if "RISK_EXCEEDED" in alerts or "CAPITAL_EXCEEDED" in alerts:
+        state["decision"] = "REDUCE_OR_BLOCK_OBSERVATION"
+    elif "RISK_NEAR_LIMIT" in alerts or "CAPITAL_NEAR_LIMIT" in alerts:
+        state["decision"] = "REDUCE_SIZE_OBSERVATION"
+    else:
+        state["decision"] = "ALLOW_OBSERVATION"
+
+    return state
+
+
+def build_bot_exposure_manager_v2(capital=10000.0, bot_filter=None):
+    """
+    Bot Exposure Manager V2 consultivo.
+    Fonte oficial: get_open_positions_central(), priorizando Trade Registry.
+    Não bloqueia, não executa e não altera lote. Apenas consolida estado.
+    """
+    try:
+        capital = float(capital or 0)
+    except Exception:
+        capital = 10000.0
+
+    profiles = _bem_v2_bot_profiles(capital=capital)
+    positions = get_open_positions_central()
+    bots = {bot: _bem_v2_empty_bot_state(bot, profile) for bot, profile in profiles.items()}
+
+    total_capital_used = 0.0
+    total_risk_used = 0.0
+    total_open_pnl = 0.0
+    by_symbol_total = {}
+    by_setup_total = {}
+    by_side_total = {"LONG": 0, "SHORT": 0, "UNKNOWN": 0}
+    runner_buckets_total = _empty_runner_buckets()
+    best_open_runner = None
+    position_count = 0
+
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+
+        bot = _bem_v2_bot(position)
+        if bot not in bots:
+            bots[bot] = _bem_v2_empty_bot_state(bot, {
+                "category": "OTHER",
+                "capital_pct": 0.0,
+                "capital_allocated": 0.0,
+                "max_open_risk_pct": 0.0,
+                "max_open_risk_usdt": 0.0,
+            })
+
+        state = bots[bot]
+        symbol = _bem_v2_symbol(position)
+        side = _bem_v2_side(position)
+        setup = _bem_v2_setup(position, bot=bot)
+        capital_used = _bem_v2_capital_used(position)
+        risk_used = _bem_v2_risk_used(position)
+        open_pnl = _bem_v2_pnl_open(position)
+        runner_r = _position_runner_r(position)
+        runner_pct = _position_runner_pct(position)
+
+        state["positions"] += 1
+        position_count += 1
+        if side == "LONG":
+            state["long"] += 1
+            by_side_total["LONG"] += 1
+        elif side == "SHORT":
+            state["short"] += 1
+            by_side_total["SHORT"] += 1
+        else:
+            state["unknown_side"] += 1
+            by_side_total["UNKNOWN"] += 1
+
+        _bem_v2_add_counter(state["symbols"], symbol)
+        _bem_v2_add_counter(state["setups"], setup)
+        _bem_v2_add_counter(by_symbol_total, symbol)
+        _bem_v2_add_counter(by_setup_total, setup)
+
+        state["capital_used"] += capital_used
+        state["risk_used_usdt"] += risk_used
+        state["open_pnl_usdt"] += open_pnl
+        total_capital_used += capital_used
+        total_risk_used += risk_used
+        total_open_pnl += open_pnl
+
+        position_summary = {
+            "bot": bot,
+            "symbol": symbol,
+            "setup": setup,
+            "side": side,
+            "capital_used": round(capital_used, 4),
+            "risk_used_usdt": round(risk_used, 4),
+            "open_pnl_usdt": round(open_pnl, 4),
+            "entry": _bem_v2_first_value(position, ["entry", "entrada", "entry_price", "price"], None),
+            "stop": _bem_v2_first_value(position, ["sl", "stop", "initial_stop", "stop_atual", "current_stop"], None),
+            "tp50": position.get("tp50"),
+            "runner_r": round(runner_r, 4),
+            "runner_pct": round(runner_pct, 4),
+            "trade_id": position.get("trade_id") or position.get("id") or position.get("position_id"),
+        }
+
+        if state.get("largest_position") is None or capital_used > state["largest_position"].get("capital_used", 0):
+            state["largest_position"] = dict(position_summary)
+        if state.get("largest_risk") is None or risk_used > state["largest_risk"].get("risk_used_usdt", 0):
+            state["largest_risk"] = dict(position_summary)
+
+        _update_runner_buckets(state["runner_buckets"], runner_r)
+        _update_runner_buckets(runner_buckets_total, runner_r)
+
+        if state.get("best_open_runner") is None or runner_r > state["best_open_runner"].get("runner_r", 0):
+            state["best_open_runner"] = dict(position_summary)
+        if best_open_runner is None or runner_r > best_open_runner.get("runner_r", 0):
+            best_open_runner = dict(position_summary)
+
+    for bot, state in list(bots.items()):
+        state["open_pnl_usdt"] = round(_bem_v2_float(state.get("open_pnl_usdt"), 0.0), 4)
+        bots[bot] = _bem_v2_finalize_state(state)
+
+    if bot_filter:
+        wanted = normalize_registry_bot(str(bot_filter).upper().strip())
+        bots = {wanted: bots.get(wanted, _bem_v2_finalize_state(_bem_v2_empty_bot_state(wanted, profiles.get(wanted, {}))))}
+
+    summary = {
+        "positions": position_count,
+        "capital": round(capital, 4),
+        "capital_used": round(total_capital_used, 4),
+        "capital_free": round(capital - total_capital_used, 4),
+        "capital_usage_pct": round((total_capital_used / capital) * 100.0, 2) if capital > 0 else 0.0,
+        "risk_used_usdt": round(total_risk_used, 4),
+        "open_pnl_usdt": round(total_open_pnl, 4),
+        "long": by_side_total.get("LONG", 0),
+        "short": by_side_total.get("SHORT", 0),
+        "unknown_side": by_side_total.get("UNKNOWN", 0),
+        "net_direction": "LONG" if by_side_total.get("LONG", 0) > by_side_total.get("SHORT", 0) else ("SHORT" if by_side_total.get("SHORT", 0) > by_side_total.get("LONG", 0) else "BALANCED"),
+        "symbols": dict(sorted(by_symbol_total.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "setups": dict(sorted(by_setup_total.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "runner_buckets": runner_buckets_total,
+        "best_open_runner": best_open_runner,
+    }
+
+    payload = {
+        "ok": True,
+        "version": BOT_EXPOSURE_MANAGER_V2_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": BOT_EXPOSURE_MANAGER_V2_MODE,
+        "source": "central_trade_registry_or_bot_positions",
+        "capital": round(capital, 4),
+        "summary": summary,
+        "bots": bots,
+        "notes": [
+            "Bot Exposure Manager V2 está em modo consultivo/observação.",
+            "Não altera lote, execução, risco real ou permissões de entrada.",
+            "Fonte preferencial: Trade Registry; fallback: posições abertas dos robôs carregados.",
+            "Preparado para alimentar Portfolio Advisor, Capital Allocator V2 e Dynamic Risk Budget.",
+        ],
+    }
+
+    with BOT_EXPOSURE_MANAGER_V2_LOCK:
+        BOT_EXPOSURE_MANAGER_V2_CACHE["last_snapshot"] = payload
+        BOT_EXPOSURE_MANAGER_V2_CACHE["last_generated_at"] = payload.get("generated_at")
+        BOT_EXPOSURE_MANAGER_V2_CACHE["last_capital"] = payload.get("capital")
+
+    return payload
+
+
+def build_bot_exposure_manager_v2_text(capital=10000.0, bot_filter=None):
+    payload = build_bot_exposure_manager_v2(capital=capital, bot_filter=bot_filter)
+    summary = payload.get("summary", {})
+    bots = payload.get("bots", {})
+
+    lines = [
+        "📡 BOT EXPOSURE MANAGER V2 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Resumo geral:",
+        f"Capital analisado: {summary.get('capital')} USDT",
+        f"Capital usado: {summary.get('capital_used')} USDT",
+        f"Capital livre: {summary.get('capital_free')} USDT",
+        f"Uso do capital: {summary.get('capital_usage_pct')}%",
+        f"Risco aberto estimado: {summary.get('risk_used_usdt')} USDT",
+        f"PnL aberto estimado: {summary.get('open_pnl_usdt')} USDT",
+        f"Posições: {summary.get('positions')} | LONG {summary.get('long')} | SHORT {summary.get('short')}",
+        f"Direção líquida: {summary.get('net_direction')}",
+        "",
+        "Robôs:",
+    ]
+
+    for bot, item in sorted(bots.items(), key=lambda kv: (-kv[1].get("positions", 0), kv[0])):
+        lines += [
+            "",
+            f"{bot} — {item.get('status')}",
+            f"Categoria: {item.get('category')} | Decisão: {item.get('decision')}",
+            f"Posições: {item.get('positions')} | LONG {item.get('long')} | SHORT {item.get('short')} | Net {item.get('net_direction')}",
+            f"Capital: usado {item.get('capital_used')} / alocado {item.get('capital_allocated')} USDT ({item.get('usage_pct')}%)",
+            f"Risco: usado {item.get('risk_used_usdt')} / limite {item.get('max_open_risk_usdt')} USDT ({item.get('risk_usage_pct')}%)",
+            f"Capital livre: {item.get('capital_free')} USDT | Risco livre: {item.get('risk_free_usdt')} USDT",
+            f"Maior ativo: {item.get('largest_symbol')} ({item.get('largest_symbol_count')})",
+        ]
+        if item.get("alerts"):
+            lines.append("Alertas: " + ", ".join(item.get("alerts") or []))
+
+    lines += ["", "Notas:"]
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+
+    return "\n".join(lines), payload
+
+
+@app.route("/exposure/v2")
+@app.route("/exposure/bots/v2")
+@app.route("/bot-exposure/v2")
+def bot_exposure_manager_v2_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_bot_exposure_manager_v2_text(capital=capital)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/exposure/bot/<bot>/v2")
+@app.route("/bot-exposure/<bot>/v2")
+def bot_exposure_manager_v2_bot_route(bot):
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_bot_exposure_manager_v2_text(capital=capital, bot_filter=bot)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/exposure/summary/v2")
+def bot_exposure_manager_v2_summary_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    payload = build_bot_exposure_manager_v2(capital=capital)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "summary": payload.get("summary"),
+        "cache": {
+            "last_generated_at": BOT_EXPOSURE_MANAGER_V2_CACHE.get("last_generated_at"),
+            "last_capital": BOT_EXPOSURE_MANAGER_V2_CACHE.get("last_capital"),
+        },
+    }
+
+
+@app.route("/analytics/exposure-v2")
+@app.route("/analytics/bot-exposure-v2")
+def analytics_bot_exposure_v2_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    text, payload = build_bot_exposure_manager_v2_text(capital=capital)
+    return {"ok": True, "text": text, "payload": payload}
+
+
 @app.route("/analytics/capital-check")
 def analytics_capital_check_route():
     try:
@@ -8660,6 +9171,14 @@ def build_central_command_reply(text: str):
         return build_market_score_report()
     if cmd0 in {"/allocation", "/alocacao", "/alocação"}:
         return build_capital_allocation_report()
+    if cmd0 in {"/exposurev2", "/exposicaov2", "/exposiçãov2", "/botexposurev2"}:
+        parts = raw.split()
+        try:
+            capital_arg = float(parts[1]) if len(parts) > 1 else 10000.0
+        except Exception:
+            capital_arg = 10000.0
+        text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
+        return text_v2
     if cmd0 in {"/rankingvivo", "/rankinglive"}:
         return build_ranking_vivo_report()
     if cmd0 in {"/evolution", "/evolucao", "/evolução"}:
