@@ -79,6 +79,14 @@ from outcome_evaluator import (
     read_outcome_log,
 )
 
+from adaptive_weights import (
+    adaptive_weights_health,
+    build_adaptive_weights,
+    get_adaptive_weights,
+    read_adaptive_weights_log,
+    build_adaptive_weights_text,
+)
+
 app = Flask(__name__)
 
 try:
@@ -1155,6 +1163,38 @@ def eventbus_emit_route():
     result = central_event_bus.emit_from_http(payload)
     status = 200 if result.get("ok") else 500
     return result, status
+
+
+@app.route("/adaptive/health")
+@app.route("/adaptive_weights/health")
+def adaptive_weights_health_route():
+    return adaptive_weights_health()
+
+
+@app.route("/adaptive/build")
+@app.route("/adaptive_weights/build")
+def adaptive_weights_build_route():
+    commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    return build_adaptive_weights(commit=commit)
+
+
+@app.route("/adaptive/weights")
+@app.route("/adaptive_weights")
+def adaptive_weights_route():
+    as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
+    if as_text:
+        return build_adaptive_weights_text()
+    return get_adaptive_weights()
+
+
+@app.route("/adaptive/log")
+@app.route("/adaptive_weights/log")
+def adaptive_weights_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_adaptive_weights_log(limit=limit)
 
 
 @app.route("/outcome/health")
