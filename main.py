@@ -7026,6 +7026,42 @@ def analytics_setups_ranking_route():
             "ok": False,
             "error": str(e),
         }
+    
+
+@app.route("/analytics/decision")
+def analytics_decision_engine_route():
+    try:
+        import analytics_engine
+
+        payload = analytics_engine.decision_engine_observation()
+
+        lines = [
+            "🧠 DECISION ENGINE — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            f"Modo: {payload.get('mode')}",
+            "",
+            "Decisões em observação:",
+        ]
+
+        for item in payload.get("decisions", []):
+            lines += [
+                "",
+                f"{item.get('name')}: {item.get('decision')}",
+                f"Motivo: {item.get('reason')}",
+                f"Origem: {item.get('source_action')}",
+            ]
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }    
 
 
 @app.route("/analytics/portfolio")

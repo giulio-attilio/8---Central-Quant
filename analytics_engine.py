@@ -423,3 +423,51 @@ def portfolio_advisor():
             "weekly_priorities": list(dict.fromkeys(weekly_priorities)),
         },
     }
+
+
+def decision_engine_observation():
+    payload = portfolio_advisor()
+    p = payload.get("portfolio", {})
+
+    decisions = []
+
+    core_names = {item.get("name") for item in p.get("core_bots", [])}
+    insufficient_names = {item.get("name") for item in p.get("insufficient_sample_bots", [])}
+    reduce_names = {item.get("name") for item in p.get("reduce_bots", [])}
+
+    recs = p.get("general_recommendations", [])
+
+    for rec in recs:
+        name = rec.get("name")
+        action = rec.get("action")
+
+        if name in core_names:
+            decision = "ALLOW"
+            reason = "Robô faz parte do núcleo principal."
+        elif action == "OBSERVAR POSITIVO":
+            decision = "WAIT"
+            reason = "Resultado inicial positivo, mas ainda com amostra insuficiente."
+        elif name in reduce_names or action in {"NÃO AUMENTAR", "REDUZIR / NÃO AUMENTAR"}:
+            decision = "BLOCK_OBSERVATION"
+            reason = "Robô ainda não deve receber aumento de exposição."
+        elif name in insufficient_names:
+            decision = "WAIT"
+            reason = "Amostra insuficiente para decisão operacional forte."
+        else:
+            decision = "OBSERVE"
+            reason = "Sem sinal claro para aumentar ou reduzir."
+
+        decisions.append({
+            "name": name,
+            "decision": decision,
+            "reason": reason,
+            "source_action": action,
+        })
+
+    return {
+        "ok": True,
+        "version": "2026-07-03-DECISION-ENGINE-V1-OBSERVATION",
+        "generated_at": payload.get("generated_at"),
+        "mode": "OBSERVATION_ONLY",
+        "decisions": decisions,
+    }
