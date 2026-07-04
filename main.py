@@ -6426,14 +6426,179 @@ def build_executive_report_daily():
     return text
 
 
-def build_daily_ceo_report():
+# ==========================================================
+# EXECUTIVE DASHBOARD JSON
+# Fonte única para CEO Report, Dashboard e futuras APIs
+# ==========================================================
+
+def build_executive_dashboard_json():
+    """
+    Retorna um resumo executivo em formato JSON.
+
+    Não gera texto.
+    Não depende do Telegram.
+    Serve como fonte única para:
+      - CEO Daily Report
+      - Dashboard Web
+      - APIs futuras
+      - IA
+    """
+
+    try:
+        dashboard = build_dashboard_report_json()
+        if isinstance(dashboard, dict):
+            return dashboard
+    except Exception:
+        pass
+
+    try:
+        summary = build_dashboard_summary()
+    except Exception:
+        summary = {}
+
+    try:
+        health = build_health_report_json()
+    except Exception:
+        health = {}
+
+    try:
+        memory = get_memory_stats()
+    except Exception:
+        memory = {}
+
+    try:
+        exposure = get_global_exposure_summary()
+    except Exception:
+        exposure = {}
+
+    return {
+        "generated_at": data_hora_sp_str(),
+
+        "status":
+            health.get("status")
+            or summary.get("status")
+            or "UNKNOWN",
+
+        "health_score":
+            health.get("health_score", 0),
+
+        "real_execution_enabled":
+            bool(summary.get("real_execution_enabled", False)),
+
+        "memory_mb":
+            memory.get("rss_mb", 0),
+
+        "memory_pct":
+            memory.get("memory_pct", 0),
+
+        "risk_status":
+            exposure.get("status", "UNKNOWN"),
+
+        "positions":
+            exposure.get("total_positions", 0),
+
+        "long":
+            exposure.get("long_positions", 0),
+
+        "short":
+            exposure.get("short_positions", 0),
+
+        "runner_1r":
+            exposure.get("runner_1r", 0),
+
+        "runner_2r":
+            exposure.get("runner_2r", 0),
+
+        "runner_3r":
+            exposure.get("runner_3r", 0),
+
+        "runner_5r":
+            exposure.get("runner_5r", 0),
+
+        "best_runner":
+            exposure.get("best_runner"),
+
+        "best_bot":
+            exposure.get("best_bot")
+    }
+
+
+def build_ceo_daily_report():
+    """
+    CEO DAILY REPORT
+
+    Relatório executivo compacto.
+    Projetado para ser lido em menos de 30 segundos.
+
+    Não substitui os módulos analíticos.
+    Apenas resume o estado da Central Quant.
+    """
+
+    now = data_hora_sp_str()
+
+    executive = build_executive_dashboard_json()
+    pipeline = build_execution_pipeline_status()
 
     lines = []
 
-    lines.append("📦 CEO DAILY REPORT — CENTRAL QUANT")
+    lines.append("🧠 CEO DAILY REPORT — CENTRAL QUANT")
     lines.append("")
-    lines.append(f"Data/hora: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    lines.append(f"Data/hora: {now}")
     lines.append("")
+
+    lines.append("════════════════════════════")
+    lines.append("STATUS GERAL DA CENTRAL QUANT")
+    lines.append("════════════════════════════")
+
+    lines.append(f"Status Operacional: {executive['status']}")
+    lines.append(f"Modo de Execução: {'REAL' if executive['real_execution_enabled'] else 'VERIFY'}")
+    lines.append(f"Uso de Memória (Render): {executive['memory_pct']:.1f}%")
+    lines.append(f"Exposição Global: {executive['risk_status']}")
+    lines.append(f"Confiança Estatística: {pipeline['adaptive']['confidence']:.1f}%")
+
+    lines.append("")
+    lines.append("════════════════════════════")
+    lines.append("PIPELINE")
+    lines.append("════════════════════════════")
+
+    lines.append(f"Execution Engine: {'✅' if pipeline['pipeline']['components']['execution_engine']['ok'] else '❌'}")
+    lines.append(f"Paper Executor: {'✅' if pipeline['pipeline']['components']['paper_executor']['ok'] else '❌'}")
+    lines.append(f"Lifecycle: {'✅' if pipeline['pipeline']['components']['paper_lifecycle']['ok'] else '❌'}")
+    lines.append(f"Outcome Evaluator: {'✅' if pipeline['pipeline']['components']['outcome_evaluator']['ok'] else '❌'}")
+    lines.append(f"Adaptive Weights: {'✅' if pipeline['pipeline']['components']['adaptive_weights']['ok'] else '❌'}")
+
+    lines.append("")
+    lines.append("════════════════════════════")
+    lines.append("OPERAÇÃO")
+    lines.append("════════════════════════════")
+
+    lines.append(f"Posições abertas: {pipeline['positions']['open']}")
+    lines.append(f"Posições encerradas hoje: {pipeline['positions']['closed']}")
+    lines.append(f"Outcomes pendentes: {pipeline['positions']['pending_outcome']}")
+
+    lines.append("")
+    lines.append("════════════════════════════")
+    lines.append("APRENDIZADO")
+    lines.append("════════════════════════════")
+
+    adaptive = pipeline["adaptive"]
+
+    lines.append(f"Ação sugerida: {adaptive['recommended_action']}")
+    lines.append(f"Peso sugerido: {adaptive['suggested_weight']}")
+    lines.append(f"Confidence: {adaptive['confidence']:.1f}%")
+    lines.append(f"Trades analisados: {adaptive['trades']}")
+
+    lines.append("")
+    lines.append("════════════════════════════")
+    lines.append("AÇÃO DO DIA")
+    lines.append("════════════════════════════")
+
+    if pipeline["alerts"]:
+        for alert in pipeline["alerts"]:
+            lines.append(f"• {alert}")
+    else:
+        lines.append("Nenhuma ação necessária.")
+        lines.append("A Central está operando normalmente.")
 
     return "\n".join(lines)
 
@@ -6777,7 +6942,7 @@ def daily_route():
 @app.route("/dailyexecutive")
 @app.route("/daily_executive")
 def executive_report_daily_route():
-    return {"text": build_executive_report_daily()}
+    return {"text": build_ceo_daily_report()}
 
 
 @app.route("/monthly")
@@ -14952,7 +15117,7 @@ def build_central_command_reply(text: str):
     if cmd0 in {"/daily", "/diario", "/diário"}:
         return build_daily_report()
     if cmd0 in {"/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive"}:
-        return build_executive_report_daily()
+        return build_ceo_daily_report()
     if cmd0 in {"/monthly", "/mensal", "/monthlyreport", "/monthly_report"}:
         return build_executive_report_monthly()
     if cmd0 in {"/support"}:
@@ -15437,8 +15602,8 @@ def central_daily_report_loop():
                     payload = build_dashboard_report()
                     title = "DASHBOARD DIÁRIO"
                 else:
-                    payload = build_executive_report_daily()
-                    title = "EXECUTIVE REPORT DIÁRIO"
+                    payload = build_ceo_daily_report()
+                    title = "CEO DAILY REPORT"
 
                 if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
                     telegram_send_with_token(
