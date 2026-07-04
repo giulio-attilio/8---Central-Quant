@@ -165,8 +165,6 @@ def run_execution_engine(
             engine_status = "LIVE_BLOCKED"
             plan.setdefault("errors", []).append("LIVE/REAL bloqueado: CENTRAL_REAL_EXECUTION_ENABLED=false")
 
-    result_extra_paper = None
-
     result = {
         "ok": engine_ok,
         "status": engine_status,
@@ -174,7 +172,6 @@ def run_execution_engine(
         "generated_at": _now_br(),
         "mode": mode,
         "executor_route": executor_route,
-        "exchange_executor_called": False,
         "paper_executor_called": False,
         "real_execution_enabled": REAL_EXECUTION_ENABLED,
         "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
