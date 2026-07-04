@@ -518,7 +518,6 @@ def portfolio_weights():
         cf = confidence_factor.get(conf, 0.75)
         af = action_factor.get(action, 0.50)
 
-        pnl_factor = 1.0
         if pnl > 10:
             pnl_factor = 1.25
         elif pnl > 3:
@@ -530,13 +529,14 @@ def portfolio_weights():
         else:
             pnl_factor = 0.35
 
-        sample_factor = 1.0
         if trades < 5:
             sample_factor = 0.55
         elif trades < 10:
             sample_factor = 0.70
         elif trades < 20:
             sample_factor = 0.85
+        else:
+            sample_factor = 1.0
 
         raw_strength = score * cf * af * pnl_factor * sample_factor
 
@@ -575,36 +575,60 @@ def portfolio_weights():
 
     total_strength = sum(item.get("raw_strength", 0) for item in bots)
 
-    capped = []
     for item in bots:
         if total_strength > 0:
             base_weight = item.get("raw_strength", 0) / total_strength * 100
         else:
             base_weight = 0
 
-        capped_weight = max(
-            item.get("min_weight_pct", 0),
-            min(base_weight, item.get("max_weight_pct", 100)),
-        )
-
         item["base_weight_pct"] = round(base_weight, 2)
-        item["capped_weight_pct"] = round(capped_weight, 2)
-        capped.append(item)
+        item["suggested_weight_pct"] = item.get("min_weight_pct", 0)
+        item["locked"] = False
 
-    capped_total = sum(item.get("capped_weight_pct", 0) for item in capped)
+    remaining_weight = 100.0 - sum(item.get("suggested_weight_pct", 0) for item in bots)
 
-    weighted = []
-    for item in capped:
-        if capped_total > 0:
-            final_weight = item.get("capped_weight_pct", 0) / capped_total * 100
-        else:
-            final_weight = 0
+    safety_counter = 0
+    while remaining_weight > 0.01 and safety_counter < 100:
+        safety_counter += 1
 
-        item["suggested_weight_pct"] = round(final_weight, 2)
-        weighted.append(item)
+        available = [
+            item for item in bots
+            if not item.get("locked")
+            and item.get("suggested_weight_pct", 0) < item.get("max_weight_pct", 100)
+        ]
+
+        if not available:
+            break
+
+        available_strength = sum(item.get("raw_strength", 0) for item in available)
+
+        if available_strength <= 0:
+            break
+
+        distributed = 0
+
+        for item in available:
+            share = remaining_weight * item.get("raw_strength", 0) / available_strength
+            room = item.get("max_weight_pct", 100) - item.get("suggested_weight_pct", 0)
+            add = min(share, room)
+
+            item["suggested_weight_pct"] += add
+            distributed += add
+
+            if item.get("suggested_weight_pct", 0) >= item.get("max_weight_pct", 100) - 0.0001:
+                item["locked"] = True
+
+        if distributed <= 0.0001:
+            break
+
+        remaining_weight -= distributed
+
+    for item in bots:
+        item["suggested_weight_pct"] = round(item.get("suggested_weight_pct", 0), 2)
+        item["capped_weight_pct"] = item["suggested_weight_pct"]
 
     weighted = sorted(
-        weighted,
+        bots,
         key=lambda x: x.get("suggested_weight_pct", 0),
         reverse=True,
     )
@@ -615,7 +639,7 @@ def portfolio_weights():
     defensive_bots = len([x for x in weighted if x.get("category") == "DEFENSIVE"])
 
     concentration = "BAIXA"
-    if top_weight >= 50:
+    if top_weight >= 45:
         concentration = "ALTA"
     elif top_weight >= 35:
         concentration = "MÉDIA"
@@ -636,7 +660,7 @@ def portfolio_weights():
 
     return {
         "ok": True,
-        "version": "2026-07-03-PORTFOLIO-WEIGHTS-V2",
+        "version": "2026-07-03-PORTFOLIO-WEIGHTS-V2.1",
         "generated_at": payload.get("generated_at"),
         "mode": "OBSERVATION_ONLY",
         "policy": {
@@ -661,7 +685,7 @@ def portfolio_weights():
         "notes": [
             "Pesos calculados apenas para observação.",
             "Ainda não interfere na execução real.",
-            "V2 aplica teto e piso por categoria de robô.",
+            "V2.1 aplica teto e piso sem permitir que a normalização ultrapasse os limites.",
             "Baseado em score, confiança, PnL, amostra e recomendação geral.",
         ],
     }
