@@ -11887,6 +11887,461 @@ def decision_score_engine_v1_summary_route():
     payload = build_decision_score_engine_v1(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"))
     return {"ok": True, "version": payload.get("version"), "generated_at": payload.get("generated_at"), "mode": payload.get("mode"), "inputs": payload.get("inputs"), "decision_score": payload.get("decision_score"), "score_band": payload.get("score_band"), "decision": payload.get("decision"), "execution_action": payload.get("execution_action"), "confidence_score": payload.get("confidence_score"), "hard_deny": payload.get("hard_deny"), "recommended_order": payload.get("recommended_order"), "module_scores": payload.get("module_scores"), "vote_summary": payload.get("vote_summary"), "reasons": payload.get("reasons"), "alerts": payload.get("alerts"), "cache": {"last_generated_at": DECISION_SCORE_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": DECISION_SCORE_ENGINE_V1_CACHE.get("last_capital")}}
 
+
+
+# ==========================================================
+# ADAPTIVE WEIGHT ENGINE V1 - CENTRAL QUANT
+# ==========================================================
+
+ADAPTIVE_WEIGHT_ENGINE_V1_VERSION = "2026-07-04-ADAPTIVE-WEIGHT-ENGINE-V1"
+ADAPTIVE_WEIGHT_ENGINE_V1_MODE = "OBSERVATION_ONLY"
+ADAPTIVE_WEIGHT_ENGINE_V1_FILE = CENTRAL_DATA_DIR / "adaptive_weight_engine_v1.json"
+ADAPTIVE_WEIGHT_ENGINE_V1_CACHE = {"last_payload": None, "last_generated_at": None, "last_capital": None}
+
+ADAPTIVE_WEIGHT_ENGINE_V1_MIN_OBSERVATIONS = int(os.environ.get("ADAPTIVE_WEIGHT_MIN_OBSERVATIONS", "10"))
+ADAPTIVE_WEIGHT_ENGINE_V1_MAX_ADJUSTMENT_PCT = float(os.environ.get("ADAPTIVE_WEIGHT_MAX_ADJUSTMENT_PCT", "25"))
+ADAPTIVE_WEIGHT_ENGINE_V1_TOTAL_WEIGHT = sum(DECISION_SCORE_ENGINE_V1_WEIGHTS.values())
+
+ADAPTIVE_WEIGHT_ENGINE_V1_MODULE_LIMITS = {
+    "Input Validation": {"min": 4.0, "max": 12.0},
+    "Dynamic Position Sizing V1.1": {"min": 10.0, "max": 25.0},
+    "Portfolio Advisor / Risk Budget": {"min": 10.0, "max": 25.0},
+    "Capital Allocator": {"min": 8.0, "max": 22.0},
+    "Risk Manager Global": {"min": 22.0, "max": 40.0},
+    "Live Execution Context": {"min": 2.0, "max": 10.0},
+}
+
+
+def _awe_safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _awe_clip(value, low, high):
+    return max(float(low), min(float(high), float(value)))
+
+
+def _awe_default_state():
+    return {
+        "version": ADAPTIVE_WEIGHT_ENGINE_V1_VERSION,
+        "created_at": data_hora_sp_str(),
+        "updated_at": data_hora_sp_str(),
+        "mode": ADAPTIVE_WEIGHT_ENGINE_V1_MODE,
+        "modules": {
+            module: {
+                "module": module,
+                "base_weight": float(weight),
+                "current_weight": float(weight),
+                "observations": 0,
+                "correct": 0,
+                "wrong": 0,
+                "accuracy_pct": None,
+                "adjustment_pct": 0.0,
+                "source": "BOOTSTRAP_DEFAULT",
+            }
+            for module, weight in DECISION_SCORE_ENGINE_V1_WEIGHTS.items()
+        },
+        "notes": [
+            "V1 começa em modo consultivo com pesos base do Decision Score Engine V1.",
+            "Ajustes automáticos só devem ganhar força após amostra mínima de outcomes rotulados.",
+        ],
+    }
+
+
+def _awe_load_state():
+    try:
+        if ADAPTIVE_WEIGHT_ENGINE_V1_FILE.exists():
+            with open(ADAPTIVE_WEIGHT_ENGINE_V1_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                default = _awe_default_state()
+                data.setdefault("modules", {})
+                for module, base_weight in DECISION_SCORE_ENGINE_V1_WEIGHTS.items():
+                    data["modules"].setdefault(module, default["modules"][module])
+                return data
+    except Exception:
+        pass
+    return _awe_default_state()
+
+
+def _awe_save_state(state):
+    try:
+        state = dict(state or {})
+        state["updated_at"] = data_hora_sp_str()
+        ADAPTIVE_WEIGHT_ENGINE_V1_FILE.parent.mkdir(exist_ok=True)
+        with open(ADAPTIVE_WEIGHT_ENGINE_V1_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _awe_extract_outcome_records(limit=600):
+    """
+    Tenta encontrar decisões antigas com outcome explícito.
+    Se não houver outcome rotulado, V1 permanece em bootstrap conservador.
+    """
+    records = []
+    paths = [CENTRAL_DECISION_LOG_FILE, CENTRAL_TIMELINE_LOG_FILE]
+    for path in paths:
+        try:
+            if not path or not Path(path).exists():
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-int(limit):]
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                outcome = item.get("outcome") or item.get("final_outcome") or item.get("trade_outcome") or item.get("result_label")
+                if outcome is None:
+                    # Alguns logs usam result, mas muitas vezes é apenas ALLOW/DENY. Só aceita se parecer resultado de trade.
+                    raw_result = str(item.get("trade_result") or item.get("pnl_result") or "").upper().strip()
+                    outcome = raw_result if raw_result in {"WIN", "LOSS", "BE", "BREAKEVEN", "TP", "SL", "STOP", "PROFIT", "LOSS"} else None
+                if outcome is None:
+                    continue
+                decision = str(item.get("decision") or item.get("policy_decision") or item.get("execution_decision") or "").upper().strip()
+                records.append({"decision": decision, "outcome": str(outcome).upper().strip(), "raw": item})
+        except Exception:
+            continue
+    return records[-int(limit):]
+
+
+def _awe_estimate_module_stats_from_outcomes(records):
+    """
+    V1 ainda não tem atribuição causal perfeita por módulo. Quando houver outcome rotulado,
+    aplica uma estimativa conservadora por concordância com a decisão final.
+    """
+    stats = {module: {"observations": 0, "correct": 0, "wrong": 0} for module in DECISION_SCORE_ENGINE_V1_WEIGHTS.keys()}
+    if not records:
+        return stats
+
+    positive = {"WIN", "TP", "PROFIT", "BREAKEVEN", "BE"}
+    negative = {"LOSS", "SL", "STOP"}
+    for record in records:
+        outcome = str(record.get("outcome") or "").upper().strip()
+        decision = str(record.get("decision") or "").upper().strip()
+        if outcome not in positive | negative or decision not in {"ALLOW", "REDUCE", "WAIT", "DENY"}:
+            continue
+        good_decision = (decision in {"ALLOW", "REDUCE"} and outcome in positive) or (decision in {"WAIT", "DENY"} and outcome in negative)
+        # Sem votos históricos por módulo, atribui ao conjunto com peso menor de evidência.
+        for module in stats:
+            stats[module]["observations"] += 1
+            if good_decision:
+                stats[module]["correct"] += 1
+            else:
+                stats[module]["wrong"] += 1
+    return stats
+
+
+def _awe_recommend_weights(state=None):
+    state = state or _awe_load_state()
+    records = _awe_extract_outcome_records()
+    inferred_stats = _awe_estimate_module_stats_from_outcomes(records)
+
+    table = []
+    recommended = {}
+    for module, base_weight in DECISION_SCORE_ENGINE_V1_WEIGHTS.items():
+        stored = (state.get("modules") or {}).get(module) or {}
+        observations = int(stored.get("observations") or 0)
+        correct = int(stored.get("correct") or 0)
+        wrong = int(stored.get("wrong") or 0)
+
+        # Se ainda não há stats persistidos, usa apenas outcomes rotulados detectados como sombra.
+        if observations <= 0 and inferred_stats.get(module, {}).get("observations", 0) > 0:
+            observations = int(inferred_stats[module]["observations"])
+            correct = int(inferred_stats[module]["correct"])
+            wrong = int(inferred_stats[module]["wrong"])
+            source = "INFERRED_FROM_OUTCOME_LOGS"
+        else:
+            source = stored.get("source") or "BOOTSTRAP_DEFAULT"
+
+        accuracy = (correct / observations * 100.0) if observations > 0 else None
+        if observations >= ADAPTIVE_WEIGHT_ENGINE_V1_MIN_OBSERVATIONS and accuracy is not None:
+            # Baseline neutro 55%; acima aumenta, abaixo reduz. Ajuste máximo controlado.
+            raw_adjustment = ((accuracy - 55.0) / 45.0) * ADAPTIVE_WEIGHT_ENGINE_V1_MAX_ADJUSTMENT_PCT
+            adjustment_pct = _awe_clip(raw_adjustment, -ADAPTIVE_WEIGHT_ENGINE_V1_MAX_ADJUSTMENT_PCT, ADAPTIVE_WEIGHT_ENGINE_V1_MAX_ADJUSTMENT_PCT)
+            evidence = "ACTIVE_ADAPTIVE"
+        else:
+            adjustment_pct = 0.0
+            evidence = "BOOTSTRAP_WAIT_SAMPLE"
+
+        raw_weight = float(base_weight) * (1.0 + adjustment_pct / 100.0)
+        limits = ADAPTIVE_WEIGHT_ENGINE_V1_MODULE_LIMITS.get(module, {"min": 1.0, "max": 50.0})
+        bounded_weight = _awe_clip(raw_weight, limits.get("min", 1.0), limits.get("max", 50.0))
+        recommended[module] = bounded_weight
+        table.append({
+            "module": module,
+            "base_weight": round(float(base_weight), 4),
+            "raw_recommended_weight": round(raw_weight, 4),
+            "recommended_weight_pre_normalization": round(bounded_weight, 4),
+            "observations": observations,
+            "correct": correct,
+            "wrong": wrong,
+            "accuracy_pct": round(accuracy, 2) if accuracy is not None else None,
+            "adjustment_pct": round(adjustment_pct, 4),
+            "evidence": evidence,
+            "source": source,
+            "limits": limits,
+        })
+
+    current_total = sum(recommended.values()) or ADAPTIVE_WEIGHT_ENGINE_V1_TOTAL_WEIGHT
+    normalization_factor = ADAPTIVE_WEIGHT_ENGINE_V1_TOTAL_WEIGHT / current_total
+    normalized = {module: round(weight * normalization_factor, 4) for module, weight in recommended.items()}
+
+    for item in table:
+        module = item["module"]
+        item["recommended_weight"] = normalized.get(module, item["base_weight"])
+        item["delta_weight"] = round(item["recommended_weight"] - item["base_weight"], 4)
+
+    return {
+        "weights": normalized,
+        "table": table,
+        "normalization_factor": round(normalization_factor, 6),
+        "outcome_records_detected": len(records),
+        "total_weight": round(sum(normalized.values()), 4),
+    }
+
+
+def _awe_score_with_weights(decision_payload, adaptive_weights):
+    module_scores = decision_payload.get("module_scores") or []
+    weighted_points = 0.0
+    total_weight = 0.0
+    adaptive_module_scores = []
+    for item in module_scores:
+        module = item.get("module")
+        weight = _awe_safe_float(adaptive_weights.get(module), _awe_safe_float(item.get("weight"), 1.0))
+        points = _awe_safe_float(item.get("adjusted_points"), 50.0)
+        contribution = weight * points
+        weighted_points += contribution
+        total_weight += weight
+        clone = dict(item)
+        clone["base_weight_from_decision_score"] = item.get("weight")
+        clone["adaptive_weight"] = round(weight, 4)
+        clone["adaptive_contribution"] = round(contribution, 4)
+        adaptive_module_scores.append(clone)
+    score = (weighted_points / total_weight) if total_weight else _awe_safe_float(decision_payload.get("decision_score"), 50.0)
+    return round(score, 2), round(weighted_points, 4), round(total_weight, 4), adaptive_module_scores
+
+
+def build_adaptive_weight_engine_v1(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None, persist=False):
+    global ADAPTIVE_WEIGHT_ENGINE_V1_CACHE
+    capital = _awe_safe_float(capital, 10000.0)
+    state = _awe_load_state()
+    recommendation = _awe_recommend_weights(state)
+    adaptive_weights = recommendation.get("weights") or dict(DECISION_SCORE_ENGINE_V1_WEIGHTS)
+
+    decision_payload = build_decision_score_engine_v1(
+        capital=capital,
+        bot=bot,
+        symbol=symbol,
+        side=side,
+        entry=entry,
+        stop=stop,
+        setup=setup,
+        leverage=leverage,
+        mode=mode,
+        intended_live=intended_live,
+    )
+    adaptive_score, weighted_points, total_weight, adaptive_module_scores = _awe_score_with_weights(decision_payload, adaptive_weights)
+    sizing = decision_payload.get("sizing") or {}
+    hard_deny = bool(decision_payload.get("hard_deny"))
+    hard_wait = bool(decision_payload.get("hard_wait"))
+    adaptive_decision = _dse_decision_from_score(adaptive_score, hard_deny=hard_deny, hard_wait=hard_wait, sizing_action=sizing.get("sizing_action"))
+    adaptive_action = {
+        "ALLOW": "ALLOW_ADAPTIVE_SCORE_OBSERVATION",
+        "REDUCE": "ALLOW_REDUCED_ADAPTIVE_SCORE_OBSERVATION",
+        "WAIT": "WAIT_ADAPTIVE_SCORE_OBSERVATION",
+        "DENY": "DENY_ADAPTIVE_SCORE_OBSERVATION",
+    }.get(adaptive_decision, "WAIT_ADAPTIVE_SCORE_OBSERVATION")
+    adaptive_confidence = _dse_confidence(adaptive_score, decision_payload.get("votes") or [], hard_deny=hard_deny)
+
+    active_adjustments = [x for x in recommendation.get("table") or [] if abs(_awe_safe_float(x.get("delta_weight"), 0.0)) > 0.001]
+    evidence_quality = "ACTIVE" if any((x.get("evidence") == "ACTIVE_ADAPTIVE") for x in recommendation.get("table") or []) else "BOOTSTRAP_INSUFFICIENT_OUTCOME_SAMPLE"
+
+    reasons = []
+    if evidence_quality.startswith("BOOTSTRAP"):
+        reasons.append("Ainda não há amostra suficiente de outcomes rotulados; pesos permanecem próximos do padrão do Decision Score Engine V1.")
+    else:
+        reasons.append("Pesos ajustados por histórico de outcomes rotulados acima da amostra mínima.")
+    if hard_deny:
+        reasons.append("Hard deny do Risk Manager permanece soberano mesmo com pesos adaptativos.")
+    if active_adjustments:
+        reasons.append(f"{len(active_adjustments)} módulo(s) tiveram ajuste de peso recomendado.")
+    else:
+        reasons.append("Nenhum ajuste de peso ativo aplicado nesta leitura.")
+
+    payload = {
+        "ok": True,
+        "version": ADAPTIVE_WEIGHT_ENGINE_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": ADAPTIVE_WEIGHT_ENGINE_V1_MODE,
+        "capital": capital,
+        "inputs": decision_payload.get("inputs") or {},
+        "evidence_quality": evidence_quality,
+        "outcome_records_detected": recommendation.get("outcome_records_detected"),
+        "min_observations_required": ADAPTIVE_WEIGHT_ENGINE_V1_MIN_OBSERVATIONS,
+        "base_decision_score_version": decision_payload.get("version"),
+        "base_decision_score": decision_payload.get("decision_score"),
+        "base_decision": decision_payload.get("decision"),
+        "base_confidence": decision_payload.get("confidence_score"),
+        "adaptive_decision_score": adaptive_score,
+        "adaptive_decision": adaptive_decision,
+        "adaptive_execution_action": adaptive_action,
+        "adaptive_confidence_score": adaptive_confidence,
+        "hard_deny": hard_deny,
+        "hard_wait": hard_wait,
+        "weight_total": total_weight,
+        "weighted_points": weighted_points,
+        "weights": adaptive_weights,
+        "weight_table": recommendation.get("table") or [],
+        "adaptive_module_scores": adaptive_module_scores,
+        "recommended_order": decision_payload.get("recommended_order") or {},
+        "sizing": sizing,
+        "risk_manager": decision_payload.get("risk_manager") or {},
+        "capital_allocator": decision_payload.get("capital_allocator") or {},
+        "alerts": list(dict.fromkeys((decision_payload.get("alerts") or []) + (["Adaptive Weight Engine está em bootstrap; pesos ainda não foram alterados por falta de outcomes suficientes."] if evidence_quality.startswith("BOOTSTRAP") else ["Adaptive Weight Engine aplicou pesos ajustados por histórico."])))[:12],
+        "reasons": reasons[:10],
+        "notes": [
+            "Adaptive Weight Engine V1 está em modo consultivo/observação.",
+            "Não altera execução, lote, risco real ou permissões operacionais.",
+            "Calcula pesos recomendados para o Decision Score Engine com base em histórico rotulado quando disponível.",
+            "Sem amostra suficiente, mantém pesos base e informa estado BOOTSTRAP.",
+            "Preparado para futura calibração automática de pesos por acerto/erro dos módulos.",
+        ],
+    }
+    if persist:
+        new_state = _awe_load_state()
+        for item in recommendation.get("table") or []:
+            module = item.get("module")
+            if module:
+                new_state.setdefault("modules", {}).setdefault(module, {})
+                new_state["modules"][module].update({
+                    "module": module,
+                    "base_weight": item.get("base_weight"),
+                    "current_weight": item.get("recommended_weight"),
+                    "observations": item.get("observations"),
+                    "correct": item.get("correct"),
+                    "wrong": item.get("wrong"),
+                    "accuracy_pct": item.get("accuracy_pct"),
+                    "adjustment_pct": item.get("adjustment_pct"),
+                    "source": item.get("source"),
+                })
+        new_state["last_payload_summary"] = {
+            "generated_at": payload.get("generated_at"),
+            "adaptive_decision_score": payload.get("adaptive_decision_score"),
+            "adaptive_decision": payload.get("adaptive_decision"),
+            "evidence_quality": payload.get("evidence_quality"),
+        }
+        payload["state_saved"] = _awe_save_state(new_state)
+    else:
+        payload["state_saved"] = False
+
+    ADAPTIVE_WEIGHT_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    return payload
+
+
+def build_adaptive_weight_engine_v1_text(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None, persist=False):
+    payload = build_adaptive_weight_engine_v1(capital=capital, bot=bot, symbol=symbol, side=side, entry=entry, stop=stop, setup=setup, leverage=leverage, mode=mode, intended_live=intended_live, persist=persist)
+    inp = payload.get("inputs") or {}
+    order = payload.get("recommended_order") or {}
+    sizing = payload.get("sizing") or {}
+    lines = [
+        "⚖️ ADAPTIVE WEIGHT ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Trade avaliado:",
+        f"Bot: {inp.get('bot')} | Setup: {inp.get('setup')}",
+        f"Ativo: {inp.get('symbol')} | Side: {inp.get('side')}",
+        f"Entrada: {inp.get('entry')} | Stop: {inp.get('stop')} | Leverage: {inp.get('leverage')}x",
+        "",
+        "Resultado adaptativo:",
+        f"Base Decision Score: {payload.get('base_decision_score')}/100 | Decisão base: {payload.get('base_decision')} | Confiança base: {payload.get('base_confidence')}/100",
+        f"Adaptive Decision Score: {payload.get('adaptive_decision_score')}/100 | Decisão adaptativa: {payload.get('adaptive_decision')}",
+        f"Action: {payload.get('adaptive_execution_action')} | Confiança adaptativa: {payload.get('adaptive_confidence_score')}/100",
+        f"Hard deny: {payload.get('hard_deny')} | Evidência: {payload.get('evidence_quality')}",
+        f"Outcomes detectados: {payload.get('outcome_records_detected')} | Mínimo para adaptar: {payload.get('min_observations_required')}",
+        "",
+        "Ordem sugerida:",
+        f"Paper notional: {order.get('paper_notional_usdt')} USDT | Margem: {order.get('paper_margin_usdt')} USDT | Qty: {order.get('paper_qty')}",
+        f"Risco efetivo: {order.get('paper_effective_risk_usdt')} USDT ({order.get('paper_effective_risk_pct')}%)",
+        "",
+        "Sizing:",
+        f"Prioridade estratégica: {sizing.get('strategic_priority')} | Executável: {sizing.get('executable_size_state')}",
+        f"Limitador dominante: {(sizing.get('binding_limit') or {}).get('name')} ({(sizing.get('binding_limit') or {}).get('value_usdt')} USDT)",
+        f"Uso do risk per trade: {sizing.get('risk_budget_utilization_pct')}%",
+        "",
+        "Pesos por módulo:",
+    ]
+    for item in payload.get("weight_table") or []:
+        lines.append(
+            f"- {item.get('module')}: base {item.get('base_weight')} → recomendado {item.get('recommended_weight')} "
+            f"(Δ {item.get('delta_weight')}) | obs={item.get('observations')} | acc={item.get('accuracy_pct')} | {item.get('evidence')}"
+        )
+    if payload.get("alerts"):
+        lines += ["", "Alertas:"] + [f"- {x}" for x in payload.get("alerts", [])[:12]]
+    lines += ["", "Motivos principais:"] + [f"- {x}" for x in payload.get("reasons", [])]
+    lines += ["", "Notas:"] + [f"- {x}" for x in payload.get("notes", [])]
+    return "\n".join(lines), payload
+
+
+@app.route("/adaptive/weights/v1", methods=["GET", "POST"])
+@app.route("/adaptiveweights/v1", methods=["GET", "POST"])
+@app.route("/weights/adaptive/v1", methods=["GET", "POST"])
+@app.route("/awe/v1", methods=["GET", "POST"])
+def adaptive_weight_engine_v1_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _dse_request_payload_from_args(body)
+    capital = _awe_safe_float(args_payload.get("capital"), 10000.0)
+    persist_raw = body.get("persist", request.args.get("persist", ""))
+    persist = str(persist_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_adaptive_weight_engine_v1_text(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), persist=persist)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/adaptive/weights/summary/v1", methods=["GET", "POST"])
+@app.route("/adaptiveweights/summary/v1", methods=["GET", "POST"])
+@app.route("/awe/summary/v1", methods=["GET", "POST"])
+def adaptive_weight_engine_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _dse_request_payload_from_args(body)
+    capital = _awe_safe_float(args_payload.get("capital"), 10000.0)
+    payload = build_adaptive_weight_engine_v1(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), persist=False)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "inputs": payload.get("inputs"),
+        "evidence_quality": payload.get("evidence_quality"),
+        "outcome_records_detected": payload.get("outcome_records_detected"),
+        "base_decision_score": payload.get("base_decision_score"),
+        "base_decision": payload.get("base_decision"),
+        "adaptive_decision_score": payload.get("adaptive_decision_score"),
+        "adaptive_decision": payload.get("adaptive_decision"),
+        "adaptive_confidence_score": payload.get("adaptive_confidence_score"),
+        "hard_deny": payload.get("hard_deny"),
+        "weights": payload.get("weights"),
+        "weight_table": payload.get("weight_table"),
+        "recommended_order": payload.get("recommended_order"),
+        "reasons": payload.get("reasons"),
+        "alerts": payload.get("alerts"),
+        "cache": {"last_generated_at": ADAPTIVE_WEIGHT_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": ADAPTIVE_WEIGHT_ENGINE_V1_CACHE.get("last_capital")},
+    }
+
+
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
 def analytics_bot_exposure_v2_route():
@@ -13226,6 +13681,22 @@ def build_central_command_reply(text: str):
             capital_arg = 10000.0
         text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
         return text_v2
+    if cmd0 in {"/adaptiveweights", "/adaptiveweightsv1", "/awe", "/awev1", "/pesos", "/pesosadaptativos", "/adaptive"}:
+        parts = raw.split()
+        bot_arg = parts[1].upper() if len(parts) > 1 else None
+        symbol_arg = parts[2].upper() if len(parts) > 2 else None
+        side_arg = parts[3].upper() if len(parts) > 3 else None
+        try:
+            entry_arg = float(parts[4]) if len(parts) > 4 else None
+        except Exception:
+            entry_arg = None
+        try:
+            stop_arg = float(parts[5]) if len(parts) > 5 else None
+        except Exception:
+            stop_arg = None
+        setup_arg = parts[6].upper() if len(parts) > 6 else None
+        text_awe, _ = build_adaptive_weight_engine_v1_text(capital=10000.0, bot=bot_arg, symbol=symbol_arg, side=side_arg, entry=entry_arg, stop=stop_arg, setup=setup_arg)
+        return text_awe
     if cmd0 in {"/decisionscore", "/decisionscorev1", "/decisionscoreengine", "/dse", "/scoredecision", "/scoredecisao", "/scoredecisão"}:
         parts = raw.split()
         bot_arg = parts[1].upper() if len(parts) > 1 else None
