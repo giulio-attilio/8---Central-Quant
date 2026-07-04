@@ -7341,8 +7341,10 @@ def analytics_exposure_route():
 # BOT EXPOSURE MANAGER V2 - CENTRAL QUANT
 # ==========================================================
 
-BOT_EXPOSURE_MANAGER_V2_VERSION = "2026-07-03-BOT-EXPOSURE-MANAGER-V2"
+BOT_EXPOSURE_MANAGER_V2_VERSION = "2026-07-03-BOT-EXPOSURE-MANAGER-V2.1"
 BOT_EXPOSURE_MANAGER_V2_MODE = os.environ.get("BOT_EXPOSURE_MANAGER_V2_MODE", "OBSERVATION_ONLY").strip().upper()
+BOT_EXPOSURE_MANAGER_V21_ESTIMATE_MISSING_VALUES = env_bool("BOT_EXPOSURE_MANAGER_V21_ESTIMATE_MISSING_VALUES", True)
+BOT_EXPOSURE_MANAGER_V21_CAP_ESTIMATE_TO_ALLOCATION = env_bool("BOT_EXPOSURE_MANAGER_V21_CAP_ESTIMATE_TO_ALLOCATION", True)
 BOT_EXPOSURE_MANAGER_V2_CACHE = {
     "last_snapshot": None,
     "last_generated_at": None,
@@ -7476,6 +7478,55 @@ def _bem_v2_capital_used(position):
     return 0.0
 
 
+def _bem_v21_default_position_capital(bot, profile=None):
+    """
+    Capital estimado por posição quando o Registry ainda não possui qty/capital.
+    Pode ser ajustado por ENV:
+    - BOT_EXPOSURE_MANAGER_V21_DEFAULT_POSITION_CAPITAL_USDT
+    - DONKEY_ESTIMATED_POSITION_CAPITAL_USDT, COBRA_ESTIMATED_POSITION_CAPITAL_USDT etc.
+    """
+    bot = normalize_registry_bot(str(bot or "UNKNOWN").upper().strip())
+    defaults = {
+        "DONKEY": 300.0,
+        "PREDATOR": 400.0,
+        "TRENDPRO": 300.0,
+        "TURTLE": 250.0,
+        "FALCON": 250.0,
+        "COBRA": 150.0,
+        "MEME": 100.0,
+    }
+    global_default = _bem_v2_env_float("BOT_EXPOSURE_MANAGER_V21_DEFAULT_POSITION_CAPITAL_USDT", defaults.get(bot, 100.0))
+    return _bem_v2_env_float(f"{bot}_ESTIMATED_POSITION_CAPITAL_USDT", global_default)
+
+
+def _bem_v21_capital_used(position, bot="UNKNOWN", profile=None, bot_position_count=1):
+    explicit = _bem_v2_capital_used(position)
+    if explicit > 0:
+        return explicit, "EXPLICIT"
+
+    if not BOT_EXPOSURE_MANAGER_V21_ESTIMATE_MISSING_VALUES:
+        return 0.0, "MISSING"
+
+    profile = profile or {}
+    count = max(1, int(bot_position_count or 1))
+    estimated = max(0.0, _bem_v21_default_position_capital(bot, profile=profile))
+    allocated = _bem_v2_float(profile.get("capital_allocated"), 0.0)
+
+    # Se a estimativa padrão estourar a alocação do robô, distribui a alocação entre as posições.
+    if BOT_EXPOSURE_MANAGER_V21_CAP_ESTIMATE_TO_ALLOCATION and allocated > 0 and estimated * count > allocated:
+        estimated = allocated / count
+
+    return max(0.0, estimated), "ESTIMATED"
+
+
+def _bem_v21_risk_pct_from_entry_stop(position):
+    entry = _bem_v2_entry(position)
+    stop = _bem_v2_stop(position)
+    if entry > 0 and stop > 0:
+        return abs(entry - stop) / entry * 100.0
+    return 0.0
+
+
 def _bem_v2_risk_used(position):
     explicit = _bem_v2_first_value(position, [
         "risk_usdt", "required_risk_usdt", "open_risk_usdt", "risk_value_usdt", "max_loss_usdt"
@@ -7495,6 +7546,24 @@ def _bem_v2_risk_used(position):
         return max(0.0, capital_used * risk_pct / 100.0)
 
     return 0.0
+
+
+def _bem_v21_risk_used(position, capital_used=0.0):
+    explicit = _bem_v2_risk_used(position)
+    if explicit > 0:
+        return explicit, "EXPLICIT", _bem_v2_float(_bem_v2_first_value(position, ["risk_pct", "risco_pct", "risk_percent"], 0), 0.0)
+
+    if not BOT_EXPOSURE_MANAGER_V21_ESTIMATE_MISSING_VALUES:
+        return 0.0, "MISSING", 0.0
+
+    risk_pct = _bem_v2_float(_bem_v2_first_value(position, ["risk_pct", "risco_pct", "risk_percent"], 0), 0.0)
+    if risk_pct <= 0:
+        risk_pct = _bem_v21_risk_pct_from_entry_stop(position)
+
+    if risk_pct > 0 and capital_used > 0:
+        return max(0.0, capital_used * risk_pct / 100.0), "ESTIMATED", risk_pct
+
+    return 0.0, "MISSING", 0.0
 
 
 def _bem_v2_pnl_open(position):
@@ -7537,6 +7606,14 @@ def _bem_v2_empty_bot_state(bot, profile=None):
         "status": "IDLE",
         "alerts": [],
         "decision": "ALLOW_OBSERVATION",
+        "data_quality": {
+            "explicit_capital_positions": 0,
+            "estimated_capital_positions": 0,
+            "missing_capital_positions": 0,
+            "explicit_risk_positions": 0,
+            "estimated_risk_positions": 0,
+            "missing_risk_positions": 0,
+        },
     }
 
 
@@ -7615,6 +7692,11 @@ def build_bot_exposure_manager_v2(capital=10000.0, bot_filter=None):
 
     profiles = _bem_v2_bot_profiles(capital=capital)
     positions = get_open_positions_central()
+    bot_position_counts = {}
+    for _position_count_item in positions:
+        if isinstance(_position_count_item, dict):
+            _count_bot = _bem_v2_bot(_position_count_item)
+            bot_position_counts[_count_bot] = bot_position_counts.get(_count_bot, 0) + 1
     bots = {bot: _bem_v2_empty_bot_state(bot, profile) for bot, profile in profiles.items()}
 
     total_capital_used = 0.0
@@ -7645,8 +7727,14 @@ def build_bot_exposure_manager_v2(capital=10000.0, bot_filter=None):
         symbol = _bem_v2_symbol(position)
         side = _bem_v2_side(position)
         setup = _bem_v2_setup(position, bot=bot)
-        capital_used = _bem_v2_capital_used(position)
-        risk_used = _bem_v2_risk_used(position)
+        profile = profiles.get(bot, {})
+        capital_used, capital_source = _bem_v21_capital_used(
+            position,
+            bot=bot,
+            profile=profile,
+            bot_position_count=bot_position_counts.get(bot, 1),
+        )
+        risk_used, risk_source, risk_pct_estimated = _bem_v21_risk_used(position, capital_used=capital_used)
         open_pnl = _bem_v2_pnl_open(position)
         runner_r = _position_runner_r(position)
         runner_pct = _position_runner_pct(position)
@@ -7671,6 +7759,9 @@ def build_bot_exposure_manager_v2(capital=10000.0, bot_filter=None):
         state["capital_used"] += capital_used
         state["risk_used_usdt"] += risk_used
         state["open_pnl_usdt"] += open_pnl
+        dq = state.setdefault("data_quality", {})
+        dq[f"{str(capital_source).lower()}_capital_positions"] = dq.get(f"{str(capital_source).lower()}_capital_positions", 0) + 1
+        dq[f"{str(risk_source).lower()}_risk_positions"] = dq.get(f"{str(risk_source).lower()}_risk_positions", 0) + 1
         total_capital_used += capital_used
         total_risk_used += risk_used
         total_open_pnl += open_pnl
@@ -7682,6 +7773,9 @@ def build_bot_exposure_manager_v2(capital=10000.0, bot_filter=None):
             "side": side,
             "capital_used": round(capital_used, 4),
             "risk_used_usdt": round(risk_used, 4),
+            "risk_pct_estimated": round(risk_pct_estimated, 4),
+            "capital_source": capital_source,
+            "risk_source": risk_source,
             "open_pnl_usdt": round(open_pnl, 4),
             "entry": _bem_v2_first_value(position, ["entry", "entrada", "entry_price", "price"], None),
             "stop": _bem_v2_first_value(position, ["sl", "stop", "initial_stop", "stop_atual", "current_stop"], None),
@@ -7728,6 +7822,14 @@ def build_bot_exposure_manager_v2(capital=10000.0, bot_filter=None):
         "setups": dict(sorted(by_setup_total.items(), key=lambda kv: (-kv[1], kv[0]))),
         "runner_buckets": runner_buckets_total,
         "best_open_runner": best_open_runner,
+        "data_quality": {
+            "estimate_missing_values": BOT_EXPOSURE_MANAGER_V21_ESTIMATE_MISSING_VALUES,
+            "cap_estimate_to_allocation": BOT_EXPOSURE_MANAGER_V21_CAP_ESTIMATE_TO_ALLOCATION,
+            "estimated_capital_positions": sum((b.get("data_quality") or {}).get("estimated_capital_positions", 0) for b in bots.values()),
+            "missing_capital_positions": sum((b.get("data_quality") or {}).get("missing_capital_positions", 0) for b in bots.values()),
+            "estimated_risk_positions": sum((b.get("data_quality") or {}).get("estimated_risk_positions", 0) for b in bots.values()),
+            "missing_risk_positions": sum((b.get("data_quality") or {}).get("missing_risk_positions", 0) for b in bots.values()),
+        },
     }
 
     payload = {
@@ -7740,9 +7842,10 @@ def build_bot_exposure_manager_v2(capital=10000.0, bot_filter=None):
         "summary": summary,
         "bots": bots,
         "notes": [
-            "Bot Exposure Manager V2 está em modo consultivo/observação.",
+            "Bot Exposure Manager V2.1 está em modo consultivo/observação.",
             "Não altera lote, execução, risco real ou permissões de entrada.",
             "Fonte preferencial: Trade Registry; fallback: posições abertas dos robôs carregados.",
+            "Quando qty/capital/risk não vêm no Registry, estima capital por perfil do robô e risco pela distância entrada-stop.",
             "Preparado para alimentar Portfolio Advisor, Capital Allocator V2 e Dynamic Risk Budget.",
         ],
     }
@@ -7761,7 +7864,7 @@ def build_bot_exposure_manager_v2_text(capital=10000.0, bot_filter=None):
     bots = payload.get("bots", {})
 
     lines = [
-        "📡 BOT EXPOSURE MANAGER V2 — CENTRAL QUANT",
+        "📡 BOT EXPOSURE MANAGER V2.1 — CENTRAL QUANT",
         f"Data/hora: {payload.get('generated_at')}",
         f"Versão: {payload.get('version')}",
         f"Modo: {payload.get('mode')}",
@@ -7775,6 +7878,7 @@ def build_bot_exposure_manager_v2_text(capital=10000.0, bot_filter=None):
         f"PnL aberto estimado: {summary.get('open_pnl_usdt')} USDT",
         f"Posições: {summary.get('positions')} | LONG {summary.get('long')} | SHORT {summary.get('short')}",
         f"Direção líquida: {summary.get('net_direction')}",
+        f"Estimativas: capital={((summary.get('data_quality') or {}).get('estimated_capital_positions'))} posições | risco={((summary.get('data_quality') or {}).get('estimated_risk_positions'))} posições",
         "",
         "Robôs:",
     ]
@@ -7789,6 +7893,7 @@ def build_bot_exposure_manager_v2_text(capital=10000.0, bot_filter=None):
             f"Risco: usado {item.get('risk_used_usdt')} / limite {item.get('max_open_risk_usdt')} USDT ({item.get('risk_usage_pct')}%)",
             f"Capital livre: {item.get('capital_free')} USDT | Risco livre: {item.get('risk_free_usdt')} USDT",
             f"Maior ativo: {item.get('largest_symbol')} ({item.get('largest_symbol_count')})",
+            f"Qualidade dados: capital estimado={(item.get('data_quality') or {}).get('estimated_capital_positions', 0)} | risco estimado={(item.get('data_quality') or {}).get('estimated_risk_positions', 0)}",
         ]
         if item.get("alerts"):
             lines.append("Alertas: " + ", ".join(item.get("alerts") or []))
