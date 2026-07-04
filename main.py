@@ -1153,13 +1153,27 @@ def execution_engine_health_route():
 def execution_engine_run_route():
     payload = request.get_json(silent=True) or {}
 
-    # GET sem body serve como teste simples pelo navegador.
+    url_mode = request.args.get("mode")
+
     if not payload:
-        return execution_engine_test()
+        payload = {
+            "decision": "ALLOW",
+            "bot": "DONKEY",
+            "setup": "DONKEY",
+            "symbol": "ETHUSDT",
+            "side": "LONG",
+            "entry": 3501,
+            "sl": 3431,
+            "tp50": 3571,
+            "risk_pct": 2.0,
+            "capital_allocated": 4500,
+            "requested_qty": 0.1,
+            "signal_id": f"EXECUTION-ENGINE-MANUAL-TEST-{int(time.time())}",
+        }
 
     return run_execution_engine(
         payload=payload,
-        mode=payload.get("mode"),
+        mode=url_mode or payload.get("mode"),
         dry_run=True,
     )
 
