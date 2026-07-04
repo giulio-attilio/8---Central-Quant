@@ -8919,6 +8919,430 @@ def exposure_score_engine_v2_summary_route():
     }
 
 
+# ==========================================================
+# PORTFOLIO ADVISOR V1 - CENTRAL QUANT
+# ==========================================================
+
+PORTFOLIO_ADVISOR_V1_VERSION = "2026-07-03-PORTFOLIO-ADVISOR-V1"
+PORTFOLIO_ADVISOR_V1_MODE = "OBSERVATION_ONLY"
+PORTFOLIO_ADVISOR_V1_CACHE = {
+    "last_generated_at": None,
+    "last_capital": None,
+    "last_payload": None,
+}
+
+
+def _portfolio_advisor_live_context():
+    """Contexto real da BingX, apenas consultivo."""
+    payload = {
+        "bingx_ready": None,
+        "bingx_status": "UNKNOWN",
+        "total_usdt": None,
+        "free_usdt": None,
+        "theoretical_new_orders": None,
+        "real_trading_enabled": ENABLE_REAL_TRADING,
+        "execution_mode": EXECUTION_MODE,
+        "max_notional_usdt": REAL_TRADING_MAX_NOTIONAL_USDT,
+        "live_positions": 0,
+        "notes": [],
+    }
+
+    try:
+        ready = bingx_ready_payload() if BINGX_READY_CHECK_ENABLED else {"ok": None, "status": "READY_CHECK_DISABLED"}
+        bal = ready.get("balance") or {}
+        free = safe_round(bal.get("free_usdt"), 4, None)
+        total = safe_round(bal.get("total_usdt"), 4, None)
+        capacity = int((free or 0) // REAL_TRADING_MAX_NOTIONAL_USDT) if REAL_TRADING_MAX_NOTIONAL_USDT > 0 and free is not None else 0
+        live = _central_live_positions_payload()
+        payload.update({
+            "bingx_ready": ready.get("ok"),
+            "bingx_status": ready.get("status"),
+            "total_usdt": total,
+            "free_usdt": free,
+            "theoretical_new_orders": capacity,
+            "live_positions": len(live) if isinstance(live, list) else 0,
+        })
+        if not ENABLE_REAL_TRADING:
+            payload["notes"].append("Real trading bloqueado pela trava global ENABLE_REAL_TRADING=false.")
+        if capacity <= 0:
+            payload["notes"].append("Saldo livre/capacidade real insuficiente para novas ordens no notional atual.")
+    except Exception as exc:
+        payload["error"] = str(exc)
+        payload["notes"].append("Não foi possível ler o contexto real da BingX; Advisor segue apenas consultivo/paper.")
+
+    return payload
+
+
+def _portfolio_advisor_action_for_bot(item, live_context=None):
+    """Transforma score/exposure em recomendação consultiva por robô."""
+    score = _safe_float(item.get("score"), 0.0)
+    positions = int(item.get("positions") or 0)
+    usage_pct = _safe_float(item.get("usage_pct"), 0.0)
+    risk_usage_pct = _safe_float(item.get("risk_usage_pct"), 0.0)
+    category = str(item.get("category") or "UNKNOWN").upper()
+    rating = str(item.get("rating") or "UNKNOWN").upper()
+    components = item.get("components") or {}
+    confidence_score = _safe_float(components.get("confidence_score"), 50.0)
+    expectancy_score = _safe_float(components.get("expectancy_score"), 50.0)
+    consistency_score = _safe_float(components.get("consistency_score"), 50.0)
+    perf_score = _safe_float(components.get("performance_score"), 50.0)
+    exposure_alerts = item.get("exposure_alerts") or []
+
+    action = "OBSERVE"
+    priority = "MEDIUM"
+    capital_bias = "NEUTRAL"
+    risk_bias = "NEUTRAL"
+    suggested_new_trade_policy = "ALLOW_SMALL_OR_NORMAL_PAPER"
+    reasons = []
+
+    if score >= 78 and expectancy_score >= 70 and consistency_score >= 70:
+        action = "PRIORITIZE"
+        priority = "HIGH"
+        capital_bias = "FAVOR"
+        risk_bias = "ALLOW_GRADUAL"
+        suggested_new_trade_policy = "ALLOW_OR_MAINTAIN_PAPER"
+        reasons.append("Score V2 alto com expectancy/consistência favoráveis; robô merece prioridade consultiva.")
+    elif score >= 65:
+        action = "MAINTAIN"
+        priority = "MEDIUM"
+        capital_bias = "NEUTRAL_TO_FAVOR"
+        risk_bias = "CONTROLLED"
+        suggested_new_trade_policy = "ALLOW_REDUCED_IF_CAPITAL_FULL"
+        reasons.append("Score intermediário/positivo; manter em observação com controle de tamanho.")
+    elif score >= 50:
+        action = "REDUCE_OR_WAIT"
+        priority = "LOW"
+        capital_bias = "REDUCE"
+        risk_bias = "CONSERVATIVE"
+        suggested_new_trade_policy = "REDUCE_SIZE_OR_WAIT"
+        reasons.append("Score ainda fraco/intermediário; evitar aumento de exposição até melhora estatística.")
+    else:
+        action = "PAUSE_OR_REVIEW"
+        priority = "LOW"
+        capital_bias = "DEFUND"
+        risk_bias = "DEFENSIVE"
+        suggested_new_trade_policy = "PAUSE_NEW_ENTRIES_OBSERVATION"
+        reasons.append("Score baixo; revisar estratégia ou pausar novas entradas em modo consultivo.")
+
+    if confidence_score < 50:
+        if action == "PRIORITIZE":
+            action = "MAINTAIN_SMALL_SAMPLE"
+            priority = "MEDIUM"
+            capital_bias = "NEUTRAL"
+            suggested_new_trade_policy = "ALLOW_SMALL_SIZE_ONLY"
+        reasons.append("Confiança estatística baixa; não aumentar capital de forma agressiva.")
+
+    if usage_pct >= 95:
+        if action in {"PRIORITIZE", "MAINTAIN"}:
+            suggested_new_trade_policy = "REDUCE_SIZE_NEW_ENTRIES"
+        reasons.append("Capital alocado já está praticamente cheio; novas entradas devem reduzir tamanho ou aguardar liberação.")
+
+    if risk_usage_pct >= 80:
+        action = "REDUCE_RISK"
+        priority = "HIGH"
+        risk_bias = "REDUCE"
+        suggested_new_trade_policy = "BLOCK_OR_REDUCE_RISK_OBSERVATION"
+        reasons.append("Uso de risco próximo do limite consultivo; priorizar redução de risco.")
+    elif risk_usage_pct <= 25 and score >= 75:
+        reasons.append("Risco usado ainda baixo; há margem consultiva, desde que capital/qualidade permitam.")
+
+    if positions == 0 and score < 60:
+        reasons.append("Robô sem posições abertas e score fraco; aguardar nova amostra antes de realocar capital.")
+
+    if "CAPITAL_NEAR_LIMIT" in exposure_alerts:
+        reasons.append("Exposure Manager marcou CAPITAL_NEAR_LIMIT.")
+
+    if category == "EXPERIMENTAL" and confidence_score < 60:
+        if action in {"PRIORITIZE", "MAINTAIN"}:
+            action = "MAINTAIN_EXPERIMENTAL_SMALL"
+            suggested_new_trade_policy = "ALLOW_SMALL_SIZE_ONLY"
+        reasons.append("Categoria experimental com baixa confiança; manter lote pequeno até amadurecer amostra.")
+
+    if live_context:
+        capacity = live_context.get("theoretical_new_orders")
+        real_enabled = bool(live_context.get("real_trading_enabled"))
+        free_usdt = live_context.get("free_usdt")
+        if (not real_enabled) or capacity == 0 or (free_usdt is not None and free_usdt < REAL_TRADING_MAX_NOTIONAL_USDT):
+            reasons.append("Contexto real não permite aumento LIVE agora; recomendação vale para paper/observação.")
+
+    return {
+        "action": action,
+        "priority": priority,
+        "capital_bias": capital_bias,
+        "risk_bias": risk_bias,
+        "suggested_new_trade_policy": suggested_new_trade_policy,
+        "reasons": reasons[:8],
+    }
+
+
+def _portfolio_advisor_build_reallocation(ranking):
+    """Sugestão consultiva de redistribuição entre robôs."""
+    donors = []
+    receivers = []
+
+    for item in ranking:
+        score = _safe_float(item.get("score"), 0.0)
+        usage_pct = _safe_float(item.get("usage_pct"), 0.0)
+        cap_alloc = _safe_float(item.get("capital_allocated"), 0.0)
+        positions = int(item.get("positions") or 0)
+        action = str((item.get("advisor") or {}).get("action") or "").upper()
+
+        if score < 55 and positions == 0 and cap_alloc > 0:
+            donors.append({
+                "bot": item.get("bot"),
+                "score": score,
+                "capital_allocated": cap_alloc,
+                "reason": "score baixo/sem posição; possível fonte de capital consultivo.",
+            })
+        elif score >= 75 and usage_pct >= 90:
+            receivers.append({
+                "bot": item.get("bot"),
+                "score": score,
+                "capital_allocated": cap_alloc,
+                "reason": "score alto e capital cheio; candidato a prioridade futura, não necessariamente aumento imediato.",
+            })
+        elif score >= 70 and action in {"PRIORITIZE", "MAINTAIN"}:
+            receivers.append({
+                "bot": item.get("bot"),
+                "score": score,
+                "capital_allocated": cap_alloc,
+                "reason": "score favorável; candidato a receber alocação se houver folga.",
+            })
+
+    suggestions = []
+    if donors and receivers:
+        for receiver in receivers[:3]:
+            suggestions.append({
+                "to": receiver.get("bot"),
+                "from_candidates": [d.get("bot") for d in donors[:4]],
+                "type": "CONSULTATIVE_REALLOCATION_CANDIDATE",
+                "reason": f"{receiver.get('bot')} tem score superior; doadores são robôs com score fraco/sem atividade.",
+            })
+
+    return {
+        "donor_candidates": donors,
+        "receiver_candidates": receivers,
+        "suggestions": suggestions,
+        "note": "Apenas consultivo. Não altera percentuais, lotes, risco ou execução.",
+    }
+
+
+def build_portfolio_advisor_v1(capital=10000.0, bot_filter=None):
+    global PORTFOLIO_ADVISOR_V1_CACHE
+
+    score_payload = build_exposure_score_engine_v2(capital=capital, bot_filter=bot_filter)
+    live_context = _portfolio_advisor_live_context()
+    ranking = []
+
+    for raw in score_payload.get("ranking", []) or []:
+        item = dict(raw)
+        advisor = _portfolio_advisor_action_for_bot(item, live_context=live_context)
+        item["advisor"] = advisor
+        ranking.append(item)
+
+    ranking = sorted(
+        ranking,
+        key=lambda x: (
+            {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(str((x.get("advisor") or {}).get("priority") or "LOW"), 1),
+            _safe_float(x.get("score"), 0.0),
+        ),
+        reverse=True,
+    )
+
+    active = [x for x in ranking if int(x.get("positions") or 0) > 0]
+    prioritize = [x for x in ranking if str((x.get("advisor") or {}).get("action") or "").upper() in {"PRIORITIZE", "MAINTAIN"}]
+    reduce = [x for x in ranking if str((x.get("advisor") or {}).get("action") or "").upper() in {"REDUCE_OR_WAIT", "REDUCE_RISK", "PAUSE_OR_REVIEW"}]
+    pause = [x for x in ranking if str((x.get("advisor") or {}).get("action") or "").upper() == "PAUSE_OR_REVIEW"]
+
+    reallocation = _portfolio_advisor_build_reallocation(ranking)
+    score_summary = score_payload.get("summary") or {}
+    exposure_summary = score_summary.get("exposure_summary") or {}
+
+    portfolio_state = "BALANCED_OBSERVATION"
+    state_reasons = []
+    if exposure_summary.get("net_direction") in {"LONG", "SHORT"}:
+        portfolio_state = "DIRECTIONAL_EXPOSURE"
+        state_reasons.append(f"Carteira paper está líquida {exposure_summary.get('net_direction')}.")
+    if live_context.get("theoretical_new_orders") == 0:
+        state_reasons.append("Capacidade LIVE teórica para novas ordens é zero no notional atual.")
+    if pause:
+        state_reasons.append(f"{len(pause)} robô(s) em PAUSE_OR_REVIEW consultivo.")
+    if active:
+        weakest_active = min(active, key=lambda x: _safe_float(x.get("score"), 0.0))
+    else:
+        weakest_active = None
+
+    payload = {
+        "ok": True,
+        "version": PORTFOLIO_ADVISOR_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": PORTFOLIO_ADVISOR_V1_MODE,
+        "capital": float(capital or 0.0),
+        "inputs": {
+            "score_engine_version": score_payload.get("version"),
+            "exposure_version": (score_summary.get("exposure_summary") or {}).get("version"),
+            "analytics_loaded": (score_payload.get("inputs") or {}).get("analytics_loaded"),
+        },
+        "live_context": live_context,
+        "portfolio_state": portfolio_state,
+        "state_reasons": state_reasons,
+        "summary": {
+            "bots": len(ranking),
+            "active_bots": len(active),
+            "avg_score": score_summary.get("avg_score"),
+            "active_avg_score": score_summary.get("active_avg_score"),
+            "best_bot": ranking[0] if ranking else None,
+            "weakest_active_bot": weakest_active,
+            "prioritize_count": len(prioritize),
+            "reduce_count": len(reduce),
+            "pause_count": len(pause),
+            "exposure_summary": exposure_summary,
+            "category_summary": score_summary.get("category_summary"),
+        },
+        "ranking": ranking,
+        "reallocation": reallocation,
+        "notes": [
+            "Portfolio Advisor V1 está em modo consultivo/observação.",
+            "Não altera capital, lote, risco, permissões de entrada ou execução real.",
+            "Usa Exposure Score Engine V2, Bot Exposure Manager V2.1, Analytics e contexto de capital real quando disponível.",
+            "Recomenda priorização, manutenção, redução ou revisão por robô.",
+            "Preparado para alimentar Portfolio Optimizer e Dynamic Risk Budget.",
+        ],
+    }
+
+    PORTFOLIO_ADVISOR_V1_CACHE = {
+        "last_generated_at": payload.get("generated_at"),
+        "last_capital": capital,
+        "last_payload": payload,
+    }
+    return payload
+
+
+def build_portfolio_advisor_v1_text(capital=10000.0, bot_filter=None):
+    payload = build_portfolio_advisor_v1(capital=capital, bot_filter=bot_filter)
+    summary = payload.get("summary") or {}
+    exposure = summary.get("exposure_summary") or {}
+    live = payload.get("live_context") or {}
+
+    lines = [
+        "🧭 PORTFOLIO ADVISOR V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Resumo geral:",
+        f"Capital analisado: {payload.get('capital')} USDT",
+        f"Robôs avaliados: {summary.get('bots')} | ativos: {summary.get('active_bots')}",
+        f"Score médio geral: {summary.get('avg_score')}/100 | ativos: {summary.get('active_avg_score')}/100",
+        f"Estado do portfólio: {payload.get('portfolio_state')}",
+        f"Posições paper: {exposure.get('positions')} | LONG {exposure.get('long')} | SHORT {exposure.get('short')} | Net {exposure.get('net_direction')}",
+        f"Capital paper usado: {exposure.get('capital_used')} USDT ({exposure.get('capital_usage_pct')}%)",
+        f"Risco aberto estimado: {exposure.get('risk_used_usdt')} USDT",
+        "",
+        "Contexto real/BingX:",
+        f"READY: {live.get('bingx_ready')} | {live.get('bingx_status')}",
+        f"Saldo USDT total/free: {live.get('total_usdt')} / {live.get('free_usdt')}",
+        f"Capacidade teórica novas ordens: {live.get('theoretical_new_orders')}",
+        f"Real trading: {'ATIVO' if live.get('real_trading_enabled') else 'BLOQUEADO'} | Modo {live.get('execution_mode')}",
+        "",
+    ]
+
+    state_reasons = payload.get("state_reasons") or []
+    if state_reasons:
+        lines.append("Leitura do estado:")
+        for reason in state_reasons:
+            lines.append(f"- {reason}")
+        lines.append("")
+
+    lines.append("Ranking consultivo:")
+    for i, item in enumerate(payload.get("ranking", []), start=1):
+        adv = item.get("advisor") or {}
+        perf = item.get("performance") or {}
+        components = item.get("components") or {}
+        lines += [
+            "",
+            f"{i}. {item.get('bot')} — Advisor: {adv.get('action')} | Prioridade {adv.get('priority')}",
+            f"Score V2: {item.get('score')}/100 ({item.get('rating')}) | Categoria {item.get('category')}",
+            f"Capital bias: {adv.get('capital_bias')} | Risk bias: {adv.get('risk_bias')}",
+            f"Política novo trade: {adv.get('suggested_new_trade_policy')}",
+            f"Posições: {item.get('positions')} | Net {item.get('net_direction')} | Capital {item.get('capital_used')}/{item.get('capital_allocated')} ({item.get('usage_pct')}%)",
+            f"Risco: {item.get('risk_used_usdt')}/{item.get('max_open_risk_usdt')} ({item.get('risk_usage_pct')}%)",
+            f"Componentes: perf {components.get('performance_score')} | exp {components.get('expectancy_score')} | conf {components.get('confidence_score')} | cons {components.get('consistency_score')} | DD {components.get('drawdown_score')}",
+            f"Analytics: trades {perf.get('trades')} | win {perf.get('win_rate_pct')}% | pnl {perf.get('pnl_total_pct')}% | recomendação {perf.get('recommendation')}",
+        ]
+        reasons = adv.get("reasons") or []
+        if reasons:
+            lines.append("Motivos:")
+            for reason in reasons[:6]:
+                lines.append(f"- {reason}")
+
+    realloc = payload.get("reallocation") or {}
+    lines += ["", "Redistribuição consultiva:"]
+    suggestions = realloc.get("suggestions") or []
+    if suggestions:
+        for s in suggestions[:5]:
+            lines.append(f"- Priorizar {s.get('to')} usando como candidatos: {', '.join(s.get('from_candidates') or [])}. {s.get('reason')}")
+    else:
+        lines.append("- Nenhuma redistribuição clara agora; manter observação e aguardar mais dados.")
+
+    donor_candidates = realloc.get("donor_candidates") or []
+    receiver_candidates = realloc.get("receiver_candidates") or []
+    lines.append(f"Candidatos a doar capital: {', '.join([d.get('bot') for d in donor_candidates]) if donor_candidates else 'nenhum'}")
+    lines.append(f"Candidatos a receber prioridade: {', '.join([r.get('bot') for r in receiver_candidates]) if receiver_candidates else 'nenhum'}")
+
+    lines += ["", "Notas:"]
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+
+    return "\n".join(lines), payload
+
+
+@app.route("/portfolio/advisor/v1")
+@app.route("/portfolioadvisor/v1")
+@app.route("/advisor/portfolio/v1")
+@app.route("/portfolio/v1")
+def portfolio_advisor_v1_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_portfolio_advisor_v1_text(capital=capital)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/portfolio/advisor/<bot>/v1")
+@app.route("/advisor/portfolio/<bot>/v1")
+def portfolio_advisor_v1_bot_route(bot):
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_portfolio_advisor_v1_text(capital=capital, bot_filter=bot)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/portfolio/advisor/summary/v1")
+@app.route("/portfolio/summary/v1")
+def portfolio_advisor_v1_summary_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    payload = build_portfolio_advisor_v1(capital=capital)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "portfolio_state": payload.get("portfolio_state"),
+        "summary": payload.get("summary"),
+        "live_context": payload.get("live_context"),
+        "reallocation": payload.get("reallocation"),
+        "ranking": payload.get("ranking"),
+        "cache": {
+            "last_generated_at": PORTFOLIO_ADVISOR_V1_CACHE.get("last_generated_at"),
+            "last_capital": PORTFOLIO_ADVISOR_V1_CACHE.get("last_capital"),
+        },
+    }
+
+
 
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
@@ -10259,6 +10683,14 @@ def build_central_command_reply(text: str):
             capital_arg = 10000.0
         text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
         return text_v2
+    if cmd0 in {"/portfolioadvisor", "/advisor", "/portfolio", "/portfoliov1", "/advisorv1"}:
+        parts = raw.split()
+        try:
+            capital_arg = float(parts[1]) if len(parts) > 1 else 10000.0
+        except Exception:
+            capital_arg = 10000.0
+        text_advisor, _ = build_portfolio_advisor_v1_text(capital=capital_arg)
+        return text_advisor
     if cmd0 in {"/exposurescorev2", "/scorev2", "/scoreexposurev2"}:
         parts = raw.split()
         try:
@@ -10355,6 +10787,9 @@ def _central_command_title(text: str):
         "/timeheat": "TIME HEAT",
         "/marketscore": "MARKET SCORE",
         "/allocation": "ALLOCATION",
+        "/portfolioadvisor": "PORTFOLIO ADVISOR",
+        "/advisor": "PORTFOLIO ADVISOR",
+        "/portfolio": "PORTFOLIO ADVISOR",
         "/rankingvivo": "RANKING VIVO",
         "/evolution": "EVOLUTION",
         "/evolucao": "EVOLUÇÃO",
@@ -10380,7 +10815,7 @@ def _is_heavy_central_command(text: str):
         "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
-        "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital",
+        "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital", "/portfolioadvisor", "/advisor", "/portfolio",
         "/correlation", "/timeheat", "/marketscore", "/allocation", "/rankingvivo", "/evolution", "/evolucao", "/evolução", "/learning",
         "/timeline", "/decisionlog", "/executionstats", "/consistency", "/brokerhealth", "/latency",
         "/livepositions", "/verifyqueue", "/status",
