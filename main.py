@@ -49,6 +49,13 @@ from execution_orchestrator import (
     orchestrate_execution,
     read_execution_log,
 )
+from execution_engine import (
+    execution_engine_health,
+    run_execution_engine,
+    execution_engine_test,
+    read_execution_engine_log,
+)
+
 
 
 app = Flask(__name__)
@@ -1127,6 +1134,45 @@ def eventbus_emit_route():
     result = central_event_bus.emit_from_http(payload)
     status = 200 if result.get("ok") else 500
     return result, status
+
+
+@app.route("/execution_engine/health")
+@app.route("/execution/engine/health")
+def execution_engine_health_route():
+    return execution_engine_health()
+
+
+@app.route("/execution_engine/run", methods=["GET", "POST"])
+@app.route("/execution/engine/run", methods=["GET", "POST"])
+def execution_engine_run_route():
+    payload = request.get_json(silent=True) or {}
+
+    # GET sem body serve como teste simples pelo navegador.
+    if not payload:
+        return execution_engine_test()
+
+    return run_execution_engine(
+        payload=payload,
+        mode=payload.get("mode"),
+        dry_run=True,
+    )
+
+
+@app.route("/execution_engine/test")
+@app.route("/execution/engine/test")
+def execution_engine_test_route():
+    return execution_engine_test()
+
+
+@app.route("/execution_engine/log")
+@app.route("/execution/engine/log")
+def execution_engine_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_execution_engine_log(limit=limit)
+
 
 
 @app.route("/history/hooks/status")
@@ -19028,7 +19074,7 @@ def trade_lifecycle_manager_v1_summary_route():
         "registry": payload.get("registry"),
         "stats": payload.get("stats"),
         "automation_policy": payload.get("automation_policy"),
-        "alerts": payload.get("alerts"),
+        "alerts": payload.eget("alerts"),
     }
 
 
