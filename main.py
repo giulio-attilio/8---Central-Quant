@@ -44,6 +44,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from flask import Flask, request
+from execution_pipeline_status import build_execution_pipeline_text
 from execution_orchestrator import (
     execution_health,
     orchestrate_execution,
@@ -6351,6 +6352,20 @@ def _compact_alerts_block():
     return "\n".join(lines)
 
 
+def _compact_execution_pipeline_block():
+    try:
+        return build_execution_pipeline_text()
+    except Exception as exc:
+        return (
+            "⚙️ EXECUTION PIPELINE — CENTRAL QUANT\n"
+            f"Data/hora: {data_hora_sp_str()}\n"
+            "Status: ERRO\n"
+            f"Erro ao gerar bloco do pipeline: {exc}\n"
+            "\n"
+            "Observação: este erro não impede o restante do relatório diário."
+        )
+    
+    
 def build_executive_report_daily():
     """
     Relatório diário unificado para análise no ChatGPT.
@@ -6364,6 +6379,9 @@ def build_executive_report_daily():
         "",
         "==============================\nEXECUTIVE\n==============================",
         build_executive_report(),
+        "",
+        "==============================\nEXECUTION PIPELINE\n==============================",
+        _compact_execution_pipeline_block(),
         "",
         "==============================\nRISCO GLOBAL\n==============================",
         build_daily_risk_summary_v3(),
