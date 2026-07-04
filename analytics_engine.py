@@ -471,3 +471,115 @@ def decision_engine_observation():
         "mode": "OBSERVATION_ONLY",
         "decisions": decisions,
     }
+
+
+def portfolio_weights():
+    payload = portfolio_advisor()
+    p = payload.get("portfolio", {})
+
+    bots = []
+
+    all_bots = []
+    all_bots += p.get("core_bots", [])
+    all_bots += p.get("observe_bots", [])
+    all_bots += p.get("insufficient_sample_bots", [])
+    all_bots += p.get("reduce_bots", [])
+
+    confidence_factor = {
+        "ALTA": 1.30,
+        "MÉDIA": 1.10,
+        "BAIXA": 0.90,
+        "AMOSTRA INSUFICIENTE": 0.65,
+    }
+
+    action_factor = {
+        "AUMENTAR COM CAUTELA": 1.25,
+        "OBSERVAR POSITIVO": 0.85,
+        "MANTER EM OBSERVAÇÃO": 0.70,
+        "NÃO AUMENTAR": 0.35,
+        "REDUZIR / NÃO AUMENTAR": 0.20,
+    }
+
+    rec_map = {
+        item.get("name"): item
+        for item in p.get("general_recommendations", [])
+    }
+
+    for item in all_bots:
+        name = item.get("name")
+        score = item.get("score", 0) or 0
+        pnl = item.get("pnl_total_pct", 0) or 0
+        conf = item.get("confidence")
+        trades = item.get("trades", 0) or 0
+
+        rec = rec_map.get(name, {})
+        action = rec.get("action")
+
+        cf = confidence_factor.get(conf, 0.75)
+        af = action_factor.get(action, 0.50)
+
+        pnl_factor = 1.0
+        if pnl > 10:
+            pnl_factor = 1.25
+        elif pnl > 3:
+            pnl_factor = 1.10
+        elif pnl > 0:
+            pnl_factor = 1.00
+        elif pnl > -3:
+            pnl_factor = 0.60
+        else:
+            pnl_factor = 0.35
+
+        sample_factor = 1.0
+        if trades < 5:
+            sample_factor = 0.55
+        elif trades < 10:
+            sample_factor = 0.70
+        elif trades < 20:
+            sample_factor = 0.85
+
+        raw_strength = score * cf * af * pnl_factor * sample_factor
+
+        if raw_strength < 1:
+            raw_strength = 1
+
+        bots.append({
+            "name": name,
+            "score": score,
+            "confidence": conf,
+            "pnl_total_pct": pnl,
+            "trades": trades,
+            "source_action": action,
+            "raw_strength": round(raw_strength, 4),
+        })
+
+    total_strength = sum(item.get("raw_strength", 0) for item in bots)
+
+    weighted = []
+    for item in bots:
+        if total_strength > 0:
+            weight = item.get("raw_strength", 0) / total_strength * 100
+        else:
+            weight = 0
+
+        item["suggested_weight_pct"] = round(weight, 2)
+        weighted.append(item)
+
+    weighted = sorted(
+        weighted,
+        key=lambda x: x.get("suggested_weight_pct", 0),
+        reverse=True,
+    )
+
+    return {
+        "ok": True,
+        "version": "2026-07-03-PORTFOLIO-WEIGHTS-V1",
+        "generated_at": payload.get("generated_at"),
+        "mode": "OBSERVATION_ONLY",
+        "weights": weighted,
+        "notes": [
+            "Pesos calculados apenas para observação.",
+            "Ainda não interfere na execução real.",
+            "Baseado em score, confiança, PnL, amostra e recomendação geral.",
+        ],
+    }    

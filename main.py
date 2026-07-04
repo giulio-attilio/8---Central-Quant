@@ -7064,6 +7064,49 @@ def analytics_decision_engine_route():
         }    
 
 
+@app.route("/analytics/weights")
+def analytics_weights_route():
+    try:
+        import analytics_engine
+
+        payload = analytics_engine.portfolio_weights()
+
+        lines = [
+            "⚖️ PORTFOLIO WEIGHTS — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            f"Modo: {payload.get('mode')}",
+            "",
+            "Alocação sugerida por robô:",
+        ]
+
+        for item in payload.get("weights", []):
+            lines += [
+                "",
+                f"{item.get('name')}: {item.get('suggested_weight_pct')}%",
+                f"Score: {item.get('score')}",
+                f"Confiança: {item.get('confidence')}",
+                f"PnL: {item.get('pnl_total_pct')}%",
+                f"Trades: {item.get('trades')}",
+                f"Ação base: {item.get('source_action')}",
+            ]
+
+        lines += ["", "Notas:"]
+        for note in payload.get("notes", []):
+            lines.append(f"- {note}")
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+        
 @app.route("/analytics/portfolio")
 def analytics_portfolio_route():
     try:
