@@ -7396,7 +7396,7 @@ def _executive_decision_snapshot_for_reports(monthly_stats=None, compact_source=
         adaptive = {}
 
     try:
-        return build_executive_decision(
+        executive_decision_payload = build_executive_decision(
             decision_pack=decision_pack_payload,
             strategic_advisor=strategy_payload,
             ceo_confidence=ceo_payload,
@@ -7407,6 +7407,12 @@ def _executive_decision_snapshot_for_reports(monthly_stats=None, compact_source=
             adaptive=adaptive,
             monthly_stats=monthly_stats or {},
         )
+
+        executive_decision_payload["executive_policy_manager"] = _sync_executive_policy_manager_from_decision(
+            executive_decision_payload
+        )
+
+        return executive_decision_payload
     except Exception as exc:
         return {
             "ok": False,
@@ -7435,6 +7441,59 @@ def _executive_decision_snapshot_for_reports(monthly_stats=None, compact_source=
             "errors": [str(exc)],
         }
 
+
+
+def _sync_executive_policy_manager_from_decision(executive_decision_payload):
+    """
+    Integra o Executive Decision Engine ao Executive Policy Manager.
+
+    Toda vez que o Executive Decision Engine gera diretivas executivas,
+    elas passam a ser persistidas como políticas oficiais da Central Quant.
+
+    V1 é conservador:
+    - não executa ordens;
+    - não limpa políticas manualmente criadas;
+    - apenas cria/atualiza políticas presentes em directives/policies.
+    """
+    try:
+        if not EXECUTIVE_POLICY_MANAGER_LOADED or executive_policy_manager is None:
+            return {
+                "ok": False,
+                "loaded": False,
+                "error": EXECUTIVE_POLICY_MANAGER_ERROR,
+                "ingested": 0,
+            }
+
+        if not isinstance(executive_decision_payload, dict):
+            return {
+                "ok": False,
+                "loaded": True,
+                "error": "executive_decision_payload_not_dict",
+                "ingested": 0,
+            }
+
+        result = executive_policy_manager.ingest_executive_directives(executive_decision_payload)
+
+        try:
+            active_codes = [p.get("code") for p in result.get("active_policies", []) if isinstance(p, dict)]
+        except Exception:
+            active_codes = []
+
+        return {
+            "ok": bool(result.get("ok")),
+            "loaded": True,
+            "ingested": int(result.get("ingested", 0) or 0),
+            "active_codes": active_codes,
+            "version": result.get("version"),
+            "generated_at": result.get("generated_at"),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "loaded": EXECUTIVE_POLICY_MANAGER_LOADED,
+            "error": str(exc),
+            "ingested": 0,
+        }
 
 def _executive_decision_report_block(monthly_stats=None, compact=False):
     try:
