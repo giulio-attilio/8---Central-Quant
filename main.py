@@ -16403,6 +16403,472 @@ def adaptive_weight_engine_v2_summary_route():
     }
 
 
+# ============================================================
+# META STRATEGY ENGINE V1 — CENTRAL QUANT
+# Versão: 2026-07-04-META-STRATEGY-ENGINE-V1
+# Objetivo:
+# - Orquestrar robôs/estratégias de forma autônoma e machine-first.
+# - Não é um relatório para usuário final; é uma camada de decisão para a própria Central.
+# - Usa Advisor, Optimizer, Risk Budget, Position Sizing, Decision Score e Adaptive Weights.
+# - Ainda NÃO executa ordens nem altera parâmetros reais.
+# ============================================================
+
+META_STRATEGY_ENGINE_V1_VERSION = "2026-07-04-META-STRATEGY-ENGINE-V1"
+META_STRATEGY_ENGINE_V1_MODE = "OBSERVATION_ONLY"
+META_STRATEGY_ENGINE_V1_CACHE = {"last_generated_at": None, "last_regime": None, "last_primary_strategy": None}
+
+
+def _mse_safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _mse_safe_upper(value, default="UNKNOWN"):
+    if value is None:
+        return default
+    s = str(value).strip().upper()
+    return s if s else default
+
+
+def _mse_clamp(value, lo, hi):
+    value = _mse_safe_float(value, lo)
+    return max(lo, min(hi, value))
+
+
+def _mse_strategy_family(bot, category=None):
+    b = _mse_safe_upper(bot)
+    mapping = {
+        "DONKEY": "TREND_CONTINUATION",
+        "TRENDPRO": "TREND_FOLLOWING",
+        "TURTLE": "BREAKOUT_TREND",
+        "FALCON": "OPENING_RANGE_BREAKOUT",
+        "COBRA": "REVERSAL_TACTICAL",
+        "PREDATOR": "SMART_MOMENTUM",
+        "MEME": "EXPERIMENTAL_MOMENTUM",
+    }
+    if b in mapping:
+        return mapping[b]
+    c = _mse_safe_upper(category)
+    if c == "EXPERIMENTAL":
+        return "EXPERIMENTAL"
+    if c == "TACTICAL":
+        return "TACTICAL"
+    if c == "SATELLITE":
+        return "SATELLITE"
+    return "CORE_STRATEGY"
+
+
+def _mse_strategy_cluster(family):
+    f = _mse_safe_upper(family)
+    if "TREND" in f:
+        return "TREND"
+    if "BREAKOUT" in f or "RANGE" in f:
+        return "BREAKOUT"
+    if "REVERSAL" in f:
+        return "REVERSAL"
+    if "MOMENTUM" in f:
+        return "MOMENTUM"
+    if "EXPERIMENTAL" in f:
+        return "EXPERIMENTAL"
+    return "OTHER"
+
+
+def _mse_infer_market_context(exposure_summary=None, explicit_regime=None):
+    exposure_summary = exposure_summary or {}
+    explicit = _mse_safe_upper(explicit_regime, "")
+    long_count = int(_mse_safe_float(exposure_summary.get("long"), 0))
+    short_count = int(_mse_safe_float(exposure_summary.get("short"), 0))
+    positions = int(_mse_safe_float(exposure_summary.get("positions"), 0))
+    net_direction = _mse_safe_upper(exposure_summary.get("net_direction"), "FLAT")
+    long_pct = round((long_count / positions * 100.0), 2) if positions else 0.0
+    short_pct = round((short_count / positions * 100.0), 2) if positions else 0.0
+
+    if explicit and explicit not in {"NONE", "UNKNOWN", "AUTO"}:
+        regime = explicit
+        source = "EXPLICIT_INPUT"
+    elif positions >= 10 and net_direction == "LONG" and long_pct >= 70:
+        regime = "DIRECTIONAL_LONG_EXPOSURE"
+        source = "EXPOSURE_PROXY"
+    elif positions >= 10 and net_direction == "SHORT" and short_pct >= 70:
+        regime = "DIRECTIONAL_SHORT_EXPOSURE"
+        source = "EXPOSURE_PROXY"
+    elif positions >= 15:
+        regime = "HIGH_PORTFOLIO_ACTIVITY"
+        source = "EXPOSURE_PROXY"
+    elif positions <= 3:
+        regime = "LOW_ACTIVITY_WAIT_SAMPLE"
+        source = "EXPOSURE_PROXY"
+    else:
+        regime = "BALANCED_OR_UNCLEAR"
+        source = "EXPOSURE_PROXY"
+
+    return {
+        "regime": regime,
+        "source": source,
+        "positions": positions,
+        "long": long_count,
+        "short": short_count,
+        "net_direction": net_direction,
+        "long_pct": long_pct,
+        "short_pct": short_pct,
+        "notes": [
+            "Market Regime Detector ainda não está ativo; regime é inferido por exposição e contexto interno.",
+            "Este contexto é suficiente para orquestração consultiva, mas será substituído por regime real no futuro.",
+        ],
+    }
+
+
+def _mse_policy_from_advisor(advisor_action, new_trade_policy, score, risk_state, category, regime_context):
+    advisor_action = _mse_safe_upper(advisor_action)
+    new_trade_policy = _mse_safe_upper(new_trade_policy)
+    risk_state = _mse_safe_upper(risk_state)
+    category = _mse_safe_upper(category)
+    regime = _mse_safe_upper((regime_context or {}).get("regime"))
+    score = _mse_safe_float(score, 0.0)
+
+    action = "HOLD_WAIT"
+    signal_gate = "WAIT_SIGNAL"
+    risk_multiplier = 0.50
+    sizing_multiplier = 0.50
+    priority = "LOW"
+    autonomy_gate = "CONSULTATIVE_ONLY"
+    reasons = []
+
+    if advisor_action == "PRIORITIZE" and risk_state == "PRIORITY" and score >= 75:
+        action = "PRIMARY_STRATEGY"
+        signal_gate = "ALLOW_FILTERED_SIGNALS"
+        risk_multiplier = 1.00
+        sizing_multiplier = 1.00
+        priority = "HIGH"
+        reasons.append("Advisor prioriza o robô e Risk Budget está em estado PRIORITY.")
+    elif advisor_action in {"MAINTAIN_EXPERIMENTAL_SMALL", "MAINTAIN", "MAINTAIN_OR_ALLOW"}:
+        action = "SECONDARY_STRATEGY"
+        signal_gate = "ALLOW_SMALL_FILTERED_SIGNALS"
+        risk_multiplier = 0.35 if category == "EXPERIMENTAL" else 0.55
+        sizing_multiplier = 0.35 if category == "EXPERIMENTAL" else 0.55
+        priority = "MEDIUM"
+        reasons.append("Robô deve ser mantido, mas sem expansão agressiva.")
+    elif advisor_action == "REDUCE_OR_WAIT" or "REDUCE" in new_trade_policy:
+        action = "WAIT_OR_REDUCE_STRATEGY"
+        signal_gate = "REDUCE_OR_WAIT_SIGNALS"
+        risk_multiplier = 0.25
+        sizing_multiplier = 0.25
+        priority = "LOW"
+        reasons.append("Advisor recomenda reduzir ou aguardar; novas entradas precisam de filtro forte.")
+    elif advisor_action == "PAUSE_OR_REVIEW" or "PAUSE" in new_trade_policy:
+        action = "DISABLED_FOR_NEW_RISK"
+        signal_gate = "BLOCK_NEW_SIGNALS"
+        risk_multiplier = 0.0
+        sizing_multiplier = 0.0
+        priority = "DEFENSIVE"
+        reasons.append("Robô em pausa/revisão; bloquear novo risco e manter apenas observação/defensivo.")
+    else:
+        reasons.append("Sem sinal forte de prioridade; manter em espera operacional.")
+
+    if category == "EXPERIMENTAL":
+        risk_multiplier = min(risk_multiplier, 0.35)
+        sizing_multiplier = min(sizing_multiplier, 0.35)
+        reasons.append("Categoria experimental mantém teto conservador independente do score.")
+
+    if regime in {"DIRECTIONAL_LONG_EXPOSURE", "DIRECTIONAL_SHORT_EXPOSURE"}:
+        if action == "PRIMARY_STRATEGY":
+            signal_gate = "ALLOW_ONLY_IF_REDUCES_CONCENTRATION_OR_HIGH_QUALITY"
+            sizing_multiplier = min(sizing_multiplier, 0.75)
+            reasons.append("Carteira já está direcional; mesmo estratégia primária deve reduzir concentração ou ter qualidade muito alta.")
+        elif action in {"SECONDARY_STRATEGY", "WAIT_OR_REDUCE_STRATEGY"}:
+            sizing_multiplier = min(sizing_multiplier, 0.25)
+            risk_multiplier = min(risk_multiplier, 0.25)
+            reasons.append("Regime interno mostra concentração direcional; estratégia não primária fica comprimida.")
+
+    if action == "DISABLED_FOR_NEW_RISK":
+        autonomy_gate = "DO_NOT_OPEN_NEW_TRADES"
+    elif signal_gate.startswith("ALLOW"):
+        autonomy_gate = "ELIGIBLE_FOR_DECISION_ENGINE"
+    else:
+        autonomy_gate = "REQUIRES_STRONG_CONFIRMATION"
+
+    return {
+        "orchestration_action": action,
+        "signal_gate": signal_gate,
+        "autonomy_gate": autonomy_gate,
+        "risk_multiplier": round(risk_multiplier, 4),
+        "sizing_multiplier": round(sizing_multiplier, 4),
+        "priority": priority,
+        "reasons": reasons,
+    }
+
+
+def build_meta_strategy_engine_v1(capital=10000.0, market_regime=None, persist=False):
+    capital = _mse_safe_float(capital, 10000.0)
+    generated_at = data_hora_sp_str() if "data_hora_sp_str" in globals() else None
+    alerts = []
+    notes = [
+        "Meta Strategy Engine V1 é uma camada autônoma/machine-first, não um relatório para usuário final.",
+        "Não executa ordens, não altera lotes e não muda risco real; apenas orquestra políticas para Decision/Execution Engines.",
+        "Usa Portfolio Advisor, Optimizer, Dynamic Risk Budget, Adaptive Weights e contexto de exposição.",
+        "Market Regime Detector ainda não está ativo; regime é inferido por proxies internos até o módulo dedicado existir.",
+    ]
+
+    advisor = build_portfolio_advisor_v1(capital=capital) if "build_portfolio_advisor_v1" in globals() else {"bots": {}, "summary": {}}
+    optimizer = build_portfolio_optimizer_v1_1(capital=capital) if "build_portfolio_optimizer_v1_1" in globals() else {"allocations": [], "summary": {}}
+    risk_budget = build_dynamic_risk_budget_v1(capital=capital) if "build_dynamic_risk_budget_v1" in globals() else {"budgets": [], "summary": {}}
+    adaptive = build_adaptive_weight_engine_v2(capital=capital, persist=False) if "build_adaptive_weight_engine_v2" in globals() else {}
+
+    advisor_bots = (advisor or {}).get("bots") or {}
+    optimizer_allocations = (optimizer or {}).get("allocations") or []
+    risk_budgets = (risk_budget or {}).get("budgets") or []
+    exposure_summary = ((advisor or {}).get("summary") or {}).get("exposure_summary") or ((risk_budget or {}).get("summary") or {}).get("exposure_summary") or {}
+    context = _mse_infer_market_context(exposure_summary, explicit_regime=market_regime)
+
+    allocation_by_bot = {_mse_safe_upper(x.get("bot")): x for x in optimizer_allocations if isinstance(x, dict)}
+    budget_by_bot = {_mse_safe_upper(x.get("bot")): x for x in risk_budgets if isinstance(x, dict)}
+
+    strategies = []
+    cluster_summary = {}
+    counts = {
+        "primary": 0,
+        "secondary": 0,
+        "wait_reduce": 0,
+        "disabled": 0,
+        "eligible_for_decision_engine": 0,
+    }
+
+    for bot_name, bot_data in advisor_bots.items():
+        bot_key = _mse_safe_upper(bot_name)
+        advisor_data = (bot_data or {}).get("advisor") or {}
+        alloc = allocation_by_bot.get(bot_key, {})
+        budget = budget_by_bot.get(bot_key, {})
+        category = _mse_safe_upper((bot_data or {}).get("category") or alloc.get("category") or budget.get("category"), "UNKNOWN")
+        score = _mse_safe_float((bot_data or {}).get("score"), _mse_safe_float(alloc.get("score"), 0.0))
+        advisor_action = _mse_safe_upper(advisor_data.get("action") or alloc.get("advisor_action"), "UNKNOWN")
+        new_trade_policy = _mse_safe_upper(advisor_data.get("suggested_new_trade_policy") or alloc.get("new_trade_policy") or budget.get("new_trade_policy"), "UNKNOWN")
+        risk_state = _mse_safe_upper(budget.get("risk_state"), "UNKNOWN")
+        family = _mse_strategy_family(bot_key, category)
+        cluster = _mse_strategy_cluster(family)
+        policy = _mse_policy_from_advisor(advisor_action, new_trade_policy, score, risk_state, category, context)
+
+        target_pct = _mse_safe_float(alloc.get("target_pct"), _mse_safe_float(budget.get("target_pct"), 0.0))
+        current_pct = _mse_safe_float(alloc.get("current_pct"), 0.0)
+        risk_budget_pct = _mse_safe_float(budget.get("risk_budget_pct"), 0.0)
+        risk_per_trade_pct = _mse_safe_float(budget.get("risk_per_trade_pct"), 0.0)
+        positions = int(_mse_safe_float((bot_data or {}).get("positions"), 0))
+
+        autonomous_score = 0.0
+        autonomous_score += _mse_clamp(score, 0, 100) * 0.35
+        autonomous_score += _mse_clamp(target_pct, 0, 100) * 0.25
+        autonomous_score += _mse_clamp(risk_budget_pct * 15.0, 0, 100) * 0.15
+        autonomous_score += (100.0 if policy.get("autonomy_gate") == "ELIGIBLE_FOR_DECISION_ENGINE" else 55.0 if policy.get("autonomy_gate") == "REQUIRES_STRONG_CONFIRMATION" else 0.0) * 0.20
+        autonomous_score += (70.0 if positions > 0 else 45.0) * 0.05
+        autonomous_score = round(autonomous_score, 2)
+
+        if policy["orchestration_action"] == "PRIMARY_STRATEGY":
+            counts["primary"] += 1
+        elif policy["orchestration_action"] == "SECONDARY_STRATEGY":
+            counts["secondary"] += 1
+        elif policy["orchestration_action"] == "WAIT_OR_REDUCE_STRATEGY":
+            counts["wait_reduce"] += 1
+        elif policy["orchestration_action"] == "DISABLED_FOR_NEW_RISK":
+            counts["disabled"] += 1
+        if policy.get("autonomy_gate") == "ELIGIBLE_FOR_DECISION_ENGINE":
+            counts["eligible_for_decision_engine"] += 1
+
+        item = {
+            "bot": bot_key,
+            "strategy_family": family,
+            "strategy_cluster": cluster,
+            "category": category,
+            "score": score,
+            "advisor_action": advisor_action,
+            "new_trade_policy": new_trade_policy,
+            "risk_state": risk_state,
+            "target_pct": target_pct,
+            "current_pct": current_pct,
+            "delta_pct": round(target_pct - current_pct, 4),
+            "risk_budget_pct": risk_budget_pct,
+            "risk_per_trade_pct": risk_per_trade_pct,
+            "positions": positions,
+            "autonomous_priority_score": autonomous_score,
+            "orchestration_action": policy.get("orchestration_action"),
+            "signal_gate": policy.get("signal_gate"),
+            "autonomy_gate": policy.get("autonomy_gate"),
+            "risk_multiplier": policy.get("risk_multiplier"),
+            "sizing_multiplier": policy.get("sizing_multiplier"),
+            "priority": policy.get("priority"),
+            "reasons": policy.get("reasons") or [],
+        }
+        strategies.append(item)
+        cluster_summary.setdefault(cluster, {"bots": 0, "target_pct": 0.0, "risk_budget_pct": 0.0, "avg_score_sum": 0.0, "primary": 0, "disabled": 0})
+        cluster_summary[cluster]["bots"] += 1
+        cluster_summary[cluster]["target_pct"] += target_pct
+        cluster_summary[cluster]["risk_budget_pct"] += risk_budget_pct
+        cluster_summary[cluster]["avg_score_sum"] += score
+        if item["orchestration_action"] == "PRIMARY_STRATEGY":
+            cluster_summary[cluster]["primary"] += 1
+        if item["orchestration_action"] == "DISABLED_FOR_NEW_RISK":
+            cluster_summary[cluster]["disabled"] += 1
+
+    strategies.sort(key=lambda x: (x.get("autonomous_priority_score", 0), x.get("score", 0), x.get("target_pct", 0)), reverse=True)
+
+    for cluster, data in list(cluster_summary.items()):
+        bots = max(1, int(data.get("bots") or 0))
+        data["target_pct"] = round(data.get("target_pct", 0.0), 4)
+        data["risk_budget_pct"] = round(data.get("risk_budget_pct", 0.0), 4)
+        data["avg_score"] = round(data.get("avg_score_sum", 0.0) / bots, 2)
+        data.pop("avg_score_sum", None)
+
+    primary = strategies[0] if strategies else None
+    primary_strategy = primary.get("bot") if primary else None
+    portfolio_state = ((advisor or {}).get("summary") or {}).get("portfolio_state") or ((optimizer or {}).get("summary") or {}).get("portfolio_state")
+
+    if context.get("regime") in {"DIRECTIONAL_LONG_EXPOSURE", "DIRECTIONAL_SHORT_EXPOSURE"}:
+        alerts.append("Carteira já está em exposição direcional; Meta Strategy deve comprimir novas entradas que aumentem concentração.")
+    if counts.get("disabled", 0) > 0:
+        alerts.append(f"{counts.get('disabled')} estratégia(s)/robô(s) bloqueados para novo risco.")
+    if counts.get("primary", 0) == 0:
+        alerts.append("Nenhuma estratégia primária encontrada; Central deve operar em modo defensivo/aguardar amostra.")
+    if counts.get("primary", 0) == 1:
+        alerts.append(f"Estratégia primária atual: {primary_strategy}.")
+
+    automation_policy = {
+        "autonomous_mode_ready": counts.get("eligible_for_decision_engine", 0) > 0,
+        "primary_strategy": primary_strategy,
+        "primary_strategy_family": primary.get("strategy_family") if primary else None,
+        "route_new_signals_to": "DECISION_SCORE_ENGINE_V1_WITH_ADAPTIVE_WEIGHTS_V2",
+        "default_new_signal_policy": "EVALUATE_BY_META_POLICY_THEN_DECISION_ENGINE",
+        "blocked_actions": ["DIRECT_EXECUTION_WITHOUT_DECISION_SCORE", "BYPASS_RISK_MANAGER", "BYPASS_POSITION_SIZING"],
+        "human_report_required": False,
+        "supervisor_interpretation": "ASSISTANT_INTERPRETS_RETURNS_WHEN_USER_SENDS_OUTPUT",
+    }
+
+    payload = {
+        "ok": True,
+        "version": META_STRATEGY_ENGINE_V1_VERSION,
+        "mode": META_STRATEGY_ENGINE_V1_MODE,
+        "generated_at": generated_at,
+        "capital": capital,
+        "portfolio_state": portfolio_state,
+        "market_context": context,
+        "automation_policy": automation_policy,
+        "counts": counts,
+        "strategies": strategies,
+        "cluster_summary": cluster_summary,
+        "primary_strategy": primary,
+        "adaptive_context": {
+            "version": (adaptive or {}).get("version"),
+            "evidence_quality": (adaptive or {}).get("evidence_quality"),
+            "outcome_evaluations_detected": (adaptive or {}).get("outcome_evaluations_detected"),
+            "active_weights": (adaptive or {}).get("active_weights"),
+            "shadow_weights": (adaptive or {}).get("shadow_weights"),
+        },
+        "alerts": alerts,
+        "notes": notes,
+    }
+
+    META_STRATEGY_ENGINE_V1_CACHE["last_generated_at"] = generated_at
+    META_STRATEGY_ENGINE_V1_CACHE["last_regime"] = context.get("regime")
+    META_STRATEGY_ENGINE_V1_CACHE["last_primary_strategy"] = primary_strategy
+    return payload
+
+
+def build_meta_strategy_engine_v1_text(capital=10000.0, market_regime=None, persist=False):
+    payload = build_meta_strategy_engine_v1(capital=capital, market_regime=market_regime, persist=persist)
+    ctx = payload.get("market_context") or {}
+    pol = payload.get("automation_policy") or {}
+    counts = payload.get("counts") or {}
+    lines = [
+        "🧠 META STRATEGY ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Estado autônomo:",
+        f"Regime interno: {ctx.get('regime')} | fonte: {ctx.get('source')}",
+        f"Portfólio: posições {ctx.get('positions')} | LONG {ctx.get('long')} ({ctx.get('long_pct')}%) | SHORT {ctx.get('short')} ({ctx.get('short_pct')}%) | Net {ctx.get('net_direction')}",
+        f"Primary strategy: {pol.get('primary_strategy')} | família: {pol.get('primary_strategy_family')}",
+        f"Autonomous mode ready: {pol.get('autonomous_mode_ready')} | Human report required: {pol.get('human_report_required')}",
+        "",
+        "Contagem de orquestração:",
+        f"Primary: {counts.get('primary')} | Secondary: {counts.get('secondary')} | Wait/Reduce: {counts.get('wait_reduce')} | Disabled: {counts.get('disabled')} | Eligible: {counts.get('eligible_for_decision_engine')}",
+        "",
+        "Política para novos sinais:",
+        f"Rota: {pol.get('route_new_signals_to')}",
+        f"Default: {pol.get('default_new_signal_policy')}",
+        "Bloqueios:",
+    ]
+    for item in pol.get("blocked_actions") or []:
+        lines.append(f"- {item}")
+    lines += ["", "Estratégias/robôs:"]
+    for i, s in enumerate(payload.get("strategies") or [], start=1):
+        lines += [
+            f"{i}. {s.get('bot')} — {s.get('orchestration_action')} | Gate: {s.get('signal_gate')} | Autonomy: {s.get('autonomy_gate')}",
+            f"Família: {s.get('strategy_family')} | Cluster: {s.get('strategy_cluster')} | Categoria: {s.get('category')} | Score: {s.get('score')}",
+            f"Target: {s.get('target_pct')}% | Atual: {s.get('current_pct')}% | Δ {s.get('delta_pct')}% | Risk budget: {s.get('risk_budget_pct')}% | R/trade: {s.get('risk_per_trade_pct')}%",
+            f"Priority score: {s.get('autonomous_priority_score')} | Risk mult: {s.get('risk_multiplier')} | Sizing mult: {s.get('sizing_multiplier')}",
+            "Motivos:",
+        ]
+        for r in s.get("reasons") or []:
+            lines.append(f"- {r}")
+        lines.append("")
+    lines += ["Resumo por cluster:"]
+    for cluster, data in (payload.get("cluster_summary") or {}).items():
+        lines.append(f"- {cluster}: bots={data.get('bots')} | target={data.get('target_pct')}% | risk={data.get('risk_budget_pct')}% | avg_score={data.get('avg_score')} | primary={data.get('primary')} | disabled={data.get('disabled')}")
+    lines += ["", "Alertas:"]
+    for a in payload.get("alerts") or []:
+        lines.append(f"- {a}")
+    lines += ["", "Notas:"]
+    for n in payload.get("notes") or []:
+        lines.append(f"- {n}")
+    return "\n".join(lines), payload
+
+
+@app.route("/meta/strategy/v1", methods=["GET", "POST"])
+@app.route("/meta-strategy/v1", methods=["GET", "POST"])
+@app.route("/strategy/meta/v1", methods=["GET", "POST"])
+def meta_strategy_engine_v1_route():
+    body = request.get_json(silent=True) or {}
+    capital = _mse_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    market_regime = body.get("market_regime") or body.get("regime") or request.args.get("market_regime") or request.args.get("regime")
+    persist = str(body.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    text, payload = build_meta_strategy_engine_v1_text(capital=capital, market_regime=market_regime, persist=persist)
+    return {"ok": True, "payload": payload, "text": text}
+
+
+@app.route("/meta/strategy/summary/v1", methods=["GET", "POST"])
+@app.route("/meta-strategy/summary/v1", methods=["GET", "POST"])
+def meta_strategy_engine_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    capital = _mse_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    market_regime = body.get("market_regime") or body.get("regime") or request.args.get("market_regime") or request.args.get("regime")
+    payload = build_meta_strategy_engine_v1(capital=capital, market_regime=market_regime, persist=False)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "market_context": payload.get("market_context"),
+        "automation_policy": payload.get("automation_policy"),
+        "counts": payload.get("counts"),
+        "primary_strategy": payload.get("primary_strategy"),
+        "cluster_summary": payload.get("cluster_summary"),
+        "adaptive_context": payload.get("adaptive_context"),
+        "alerts": payload.get("alerts"),
+    }
+
+
+@app.route("/metastrategy", methods=["GET", "POST"])
+@app.route("/meta", methods=["GET", "POST"])
+def meta_strategy_engine_v1_short_route():
+    body = request.get_json(silent=True) or {}
+    capital = _mse_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    market_regime = body.get("market_regime") or body.get("regime") or request.args.get("market_regime") or request.args.get("regime")
+    text, payload = build_meta_strategy_engine_v1_text(capital=capital, market_regime=market_regime, persist=False)
+    return {"ok": True, "payload": payload, "text": text}
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
