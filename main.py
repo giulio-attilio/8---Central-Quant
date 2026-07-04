@@ -57,6 +57,12 @@ from execution_engine import (
 )
 
 
+from paper_executor_integrated import (
+    paper_integrated_health,
+    get_paper_integrated_open_positions,
+    read_paper_integrated_log,
+)
+
 
 app = Flask(__name__)
 
@@ -1173,6 +1179,27 @@ def execution_engine_log_route():
         limit = 20
     return read_execution_engine_log(limit=limit)
 
+
+@app.route("/paper_integrated/health")
+@app.route("/paper/integrated/health")
+def paper_integrated_health_route():
+    return paper_integrated_health()
+
+
+@app.route("/paper_integrated/open")
+@app.route("/paper/integrated/open")
+def paper_integrated_open_route():
+    return get_paper_integrated_open_positions()
+
+
+@app.route("/paper_integrated/log")
+@app.route("/paper/integrated/log")
+def paper_integrated_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_paper_integrated_log(limit=limit)
 
 
 @app.route("/history/hooks/status")

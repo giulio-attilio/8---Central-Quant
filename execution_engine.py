@@ -29,6 +29,15 @@ except Exception as exc:
 else:
     ORCHESTRATOR_IMPORT_ERROR = None
 
+try:
+    from paper_executor_integrated import execute_paper_from_engine, paper_integrated_health
+except Exception as exc:
+    execute_paper_from_engine = None
+    paper_integrated_health = None
+    PAPER_EXECUTOR_IMPORT_ERROR = str(exc)
+else:
+    PAPER_EXECUTOR_IMPORT_ERROR = None
+
 
 VERSION = "2026-07-04-EXECUTION-ENGINE-V2"
 
@@ -82,6 +91,9 @@ def execution_engine_health() -> Dict[str, Any]:
         "orchestrator_loaded": callable(orchestrate_execution),
         "orchestrator_import_error": ORCHESTRATOR_IMPORT_ERROR,
         "orchestrator": orchestrator_payload,
+        "paper_executor_loaded": callable(execute_paper_from_engine),
+        "paper_executor_import_error": PAPER_EXECUTOR_IMPORT_ERROR,
+        "paper_executor": paper_integrated_health() if callable(paper_integrated_health) else None,
         "files": {
             "execution_engine_log": str(EXECUTION_ENGINE_LOG_FILE),
         },
@@ -129,20 +141,31 @@ def run_execution_engine(
     engine_status = "PLAN_CREATED"
     engine_ok = bool(orchestration.get("ok")) if isinstance(orchestration, dict) else False
     executor_route = "NONE"
+    result_extra_paper = None
 
     if mode == "OBSERVATION_ONLY":
         executor_route = "PLAN_ONLY"
+
     elif mode == "PAPER":
-        engine_ok = False
-        engine_status = "PAPER_EXECUTOR_NOT_CONNECTED"
-        executor_route = "PAPER_PENDING"
-        plan.setdefault("errors", []).append("Paper Executor integrado ainda não conectado ao Execution Engine V2")
+        executor_route = "PAPER"
+        if not callable(execute_paper_from_engine):
+            engine_ok = False
+            engine_status = "PAPER_EXECUTOR_NOT_LOADED"
+            plan.setdefault("errors", []).append(f"Paper Executor não carregado: {PAPER_EXECUTOR_IMPORT_ERROR}")
+        else:
+            paper_result = execute_paper_from_engine({"plan": plan})
+            engine_ok = bool(paper_result.get("ok"))
+            engine_status = paper_result.get("payload", {}).get("status", "PAPER_RESULT")
+            result_extra_paper = paper_result
+
     elif mode == "LIVE":
         executor_route = "LIVE_BLOCKED"
         if not REAL_EXECUTION_ENABLED:
             engine_ok = False
             engine_status = "LIVE_BLOCKED"
             plan.setdefault("errors", []).append("LIVE/REAL bloqueado: CENTRAL_REAL_EXECUTION_ENABLED=false")
+
+    result_extra_paper = None
 
     result = {
         "ok": engine_ok,
@@ -157,6 +180,8 @@ def run_execution_engine(
         "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
         "orchestration": orchestration,
         "plan": plan,
+        "paper_result": result_extra_paper,
+        "paper_executor_called": result_extra_paper is not None,
         "notes": [
             "Execution Engine V2 recebeu o payload e delegou validação ao Orchestrator.",
             "Nenhuma ordem real foi enviada.",
