@@ -7128,6 +7128,65 @@ def analytics_weights_route():
             "ok": False,
             "error": str(e),
         }
+    
+
+@app.route("/analytics/portfolio-manager")
+def analytics_portfolio_manager_route():
+    try:
+        from flask import request
+        import portfolio_manager
+
+        capital = request.args.get("capital", default=10000, type=float)
+
+        payload = portfolio_manager.portfolio_manager(capital=capital)
+
+        health = payload.get("portfolio_health", {})
+
+        lines = [
+            "📊 PORTFOLIO MANAGER — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            f"Modo: {payload.get('mode')}",
+            f"Capital analisado: {payload.get('capital')} USDT",
+            "",
+            "Saúde da carteira:",
+            f"Concentração: {health.get('concentration')}",
+            f"Diversificação: {health.get('diversification')}",
+            f"Risco: {health.get('risk_level')}",
+            f"Maior peso: {health.get('top_weight_pct')}%",
+            "",
+            "Alocação teórica por robô:",
+        ]
+
+        for item in payload.get("allocations", []):
+            lines += [
+                "",
+                f"{item.get('name')}:",
+                f"Peso: {item.get('weight_pct')}%",
+                f"Capital: {item.get('capital_allocated')} USDT",
+                f"Categoria: {item.get('category')}",
+                f"Decisão: {item.get('decision')}",
+                f"Score: {item.get('score')}",
+                f"Confiança: {item.get('confidence')}",
+                f"PnL: {item.get('pnl_total_pct')}%",
+                f"Trades: {item.get('trades')}",
+                f"Motivo: {item.get('reason')}",
+            ]
+
+        lines += ["", "Notas:"]
+        for note in payload.get("notes", []):
+            lines.append(f"- {note}")
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }    
 
 
 @app.route("/analytics/portfolio")
