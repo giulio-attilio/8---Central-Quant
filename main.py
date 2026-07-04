@@ -6482,77 +6482,69 @@ def build_executive_dashboard_json():
 
 
 def build_ceo_daily_report():
-    """
-    CEO DAILY REPORT
-
-    Relatório executivo compacto.
-    Projetado para ser lido em menos de 30 segundos.
-
-    Não substitui os módulos analíticos.
-    Apenas resume o estado da Central Quant.
-    """
-
     now = data_hora_sp_str()
 
     executive = build_executive_dashboard_json()
     pipeline = build_execution_pipeline_status()
 
-    lines = []
+    adaptive = pipeline.get("adaptive") or {}
+    positions = pipeline.get("positions") or {}
+    alerts = pipeline.get("alerts") or []
 
-    lines.append("🧠 CEO DAILY REPORT — CENTRAL QUANT")
-    lines.append("")
-    lines.append(f"Data/hora: {now}")
-    lines.append("")
+    risk_status = executive.get("risk_status", "OK")
+    confidence = adaptive.get("confidence", 0)
+    suggested_weight = adaptive.get("suggested_weight", 1.0)
+    action = adaptive.get("recommended_action", "WAIT_SAMPLE")
 
-    lines.append("════════════════════════════")
-    lines.append("STATUS GERAL DA CENTRAL QUANT")
-    lines.append("════════════════════════════")
+    components = ((pipeline.get("pipeline") or {}).get("components") or {})
 
-    lines.append(f"Status Operacional: {executive['status']}")
-    lines.append(f"Modo de Execução: {'REAL' if executive['real_execution_enabled'] else 'VERIFY'}")
-    lines.append(f"Uso de Memória (Render): {executive['memory_pct']:.1f}%")
-    lines.append(f"Risco Operacional: {risk_status}")
-    lines.append(f"Confiança Estatística: {confidence}%")
+    lines = [
+        "🧠 CEO DAILY REPORT — CENTRAL QUANT",
+        "",
+        f"Data/hora: {now}",
+        "",
+        "════════════════════════════",
+        "STATUS GERAL DA CENTRAL QUANT",
+        "════════════════════════════",
+        f"Status Operacional: {executive.get('status', 'OK')}",
+        f"Modo de Execução: {'REAL' if executive.get('real_execution_enabled') else 'VERIFY'}",
+        f"Uso de Memória (Render): {float(executive.get('memory_pct') or 0):.1f}%",
+        f"Risco Operacional: {risk_status}",
+        f"Confiança Estatística: {float(confidence or 0):.1f}%",
+        "",
+        "════════════════════════════",
+        "PIPELINE",
+        "════════════════════════════",
+        f"Execution Engine: {'✅' if components.get('execution_engine', {}).get('ok') else '❌'}",
+        f"Paper Executor: {'✅' if components.get('paper_executor', {}).get('ok') else '❌'}",
+        f"Lifecycle: {'✅' if components.get('paper_lifecycle', {}).get('ok') else '❌'}",
+        f"Outcome Evaluator: {'✅' if components.get('outcome_evaluator', {}).get('ok') else '❌'}",
+        f"Adaptive Weights: {'✅' if components.get('adaptive_weights', {}).get('ok') else '❌'}",
+        "",
+        "════════════════════════════",
+        "OPERAÇÃO",
+        "════════════════════════════",
+        f"Posições abertas na Central: {executive.get('positions', 0)}",
+        f"LONG: {executive.get('long', 0)} | SHORT: {executive.get('short', 0)}",
+        f"PAPER abertas: {positions.get('open', 0)}",
+        f"PAPER fechadas: {positions.get('closed', 0)}",
+        f"Outcomes pendentes: {positions.get('pending_outcome', 0)}",
+        "",
+        "════════════════════════════",
+        "APRENDIZADO",
+        "════════════════════════════",
+        f"Ação sugerida: {action}",
+        f"Peso sugerido: {suggested_weight}",
+        f"Confiança Estatística: {float(confidence or 0):.1f}%",
+        f"Trades analisados: {adaptive.get('trades', 0)}",
+        "",
+        "════════════════════════════",
+        "AÇÃO NECESSÁRIA",
+        "════════════════════════════",
+    ]
 
-    lines.append("")
-    lines.append("════════════════════════════")
-    lines.append("PIPELINE")
-    lines.append("════════════════════════════")
-
-    lines.append(f"Execution Engine: {'✅' if pipeline['pipeline']['components']['execution_engine']['ok'] else '❌'}")
-    lines.append(f"Paper Executor: {'✅' if pipeline['pipeline']['components']['paper_executor']['ok'] else '❌'}")
-    lines.append(f"Lifecycle: {'✅' if pipeline['pipeline']['components']['paper_lifecycle']['ok'] else '❌'}")
-    lines.append(f"Outcome Evaluator: {'✅' if pipeline['pipeline']['components']['outcome_evaluator']['ok'] else '❌'}")
-    lines.append(f"Adaptive Weights: {'✅' if pipeline['pipeline']['components']['adaptive_weights']['ok'] else '❌'}")
-
-    lines.append("")
-    lines.append("════════════════════════════")
-    lines.append("OPERAÇÃO")
-    lines.append("════════════════════════════")
-
-    lines.append(f"Posições abertas: {pipeline['positions']['open']}")
-    lines.append(f"Posições encerradas hoje: {pipeline['positions']['closed']}")
-    lines.append(f"Outcomes pendentes: {pipeline['positions']['pending_outcome']}")
-
-    lines.append("")
-    lines.append("════════════════════════════")
-    lines.append("APRENDIZADO")
-    lines.append("════════════════════════════")
-
-    adaptive = pipeline["adaptive"]
-
-    lines.append(f"Ação sugerida: {adaptive['recommended_action']}")
-    lines.append(f"Peso sugerido: {adaptive['suggested_weight']}")
-    lines.append(f"Confidence: {adaptive['confidence']:.1f}%")
-    lines.append(f"Trades analisados: {adaptive['trades']}")
-
-    lines.append("")
-    lines.append("════════════════════════════")
-    lines.append("AÇÃO NECESSÁRIA")
-    lines.append("════════════════════════════")
-
-    if pipeline["alerts"]:
-        for alert in pipeline["alerts"]:
+    if alerts:
+        for alert in alerts:
             lines.append(f"• {alert}")
     else:
         lines.append("Nenhuma ação necessária.")
@@ -15080,7 +15072,7 @@ def build_central_command_reply(text: str):
     if cmd0 in {"/ceo", "/ceodaily", "/ceo_daily"}:
         return build_ceo_daily_report()
     if cmd0 in {"/daily", "/diario", "/diário"}:
-        return build_daily_report()
+        return build_ceo_daily_report()
     if cmd0 in {"/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive"}:
         return build_ceo_daily_report()
     if cmd0 in {"/monthly", "/mensal", "/monthlyreport", "/monthly_report"}:
