@@ -10745,6 +10745,451 @@ def dynamic_position_sizing_v1_summary_route():
         },
     }
 
+
+# ==========================================================
+# DYNAMIC POSITION SIZING V1.1 - CENTRAL QUANT
+# ==========================================================
+
+DYNAMIC_POSITION_SIZING_V11_VERSION = "2026-07-04-DYNAMIC-POSITION-SIZING-V1.1"
+DYNAMIC_POSITION_SIZING_V11_MODE = "OBSERVATION_ONLY"
+DYNAMIC_POSITION_SIZING_V11_CACHE = {"last_payload": None, "last_generated_at": None, "last_capital": None}
+
+
+def _dps_v11_limit_item(name, value, reason, active=True):
+    try:
+        value_f = float(value)
+    except Exception:
+        value_f = 0.0
+    return {
+        "name": str(name),
+        "value_usdt": round(value_f, 4),
+        "reason": str(reason),
+        "active": bool(active and value_f > 0),
+    }
+
+
+def _dps_v11_select_binding_limit(limits):
+    active_limits = [x for x in (limits or []) if x.get("active") and _dps_safe_float(x.get("value_usdt"), 0.0) > 0]
+    if not active_limits:
+        return None
+    return min(active_limits, key=lambda x: _dps_safe_float(x.get("value_usdt"), 0.0))
+
+
+def _dynamic_position_size_for_budget_v11(budget, capital, entry=None, stop=None, side=None, leverage=None, live_context=None):
+    bot = str(budget.get("bot") or "UNKNOWN").upper().strip()
+    side_norm = _dps_normalize_side(side)
+    leverage = int(_dps_clip(_dps_safe_float(leverage, DEFAULT_REAL_LEVERAGE if "DEFAULT_REAL_LEVERAGE" in globals() else 3), 1, 50))
+    risk_usdt = _dps_safe_float(budget.get("risk_per_trade_usdt"), 0.0)
+    risk_pct = _dps_safe_float(budget.get("risk_per_trade_pct"), 0.0)
+    risk_budget_usdt = _dps_safe_float(budget.get("risk_budget_usdt"), 0.0)
+    risk_state = str(budget.get("risk_state") or "UNKNOWN").upper().strip()
+    new_trade_policy = str(budget.get("new_trade_policy") or "").upper().strip()
+    advisor_action = str(budget.get("advisor_action") or "").upper().strip()
+    optimizer_recommendation = str(budget.get("optimizer_recommendation") or "").upper().strip()
+    score = _dps_safe_float(budget.get("score"), 0.0)
+    category = str(budget.get("category") or "UNKNOWN").upper().strip()
+
+    stop_distance_pct, stop_distance_source = _dps_stop_distance_pct(entry=entry, stop=stop)
+    risk_fraction = max(stop_distance_pct / 100.0, 0.0001)
+    raw_notional = risk_usdt / risk_fraction if risk_usdt > 0 else 0.0
+    raw_margin = raw_notional / leverage if leverage > 0 else raw_notional
+
+    live_caps = _dps_live_caps(live_context)
+    max_notional_env = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_MAX_NOTIONAL_USDT"), 0.0)
+    max_margin_env = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_MAX_MARGIN_USDT"), 0.0)
+    min_notional = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_MIN_NOTIONAL_USDT"), 10.0)
+
+    # Caps por política/categoria. V1.1 mantém o cálculo baseado no risco bruto,
+    # mas explicita todos os limitadores e qual deles travou o tamanho final.
+    if risk_state == "PRIORITY":
+        policy_notional_cap = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_PRIORITY_CAP_USDT"), 300.0)
+    elif risk_state == "EXPERIMENTAL_CAPPED" or category == "EXPERIMENTAL":
+        policy_notional_cap = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_EXPERIMENTAL_CAP_USDT"), 80.0)
+    elif risk_state == "WAIT_REDUCED" or advisor_action == "REDUCE_OR_WAIT":
+        policy_notional_cap = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_REDUCED_CAP_USDT"), 120.0)
+    elif risk_state == "DEFENSIVE_MINIMUM" or advisor_action == "PAUSE_OR_REVIEW" or "PAUSE" in new_trade_policy:
+        policy_notional_cap = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_DEFENSIVE_CAP_USDT"), 30.0)
+    else:
+        policy_notional_cap = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_STANDARD_CAP_USDT"), 150.0)
+
+    # Cap derivado do capital alvo do optimizer. Não é a alocação inteira; é um teto por novo trade.
+    try:
+        target_pct = _dps_safe_float(budget.get("target_pct"), 0.0)
+        target_capital_usdt = capital * target_pct / 100.0
+    except Exception:
+        target_pct = 0.0
+        target_capital_usdt = 0.0
+    target_trade_fraction = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_TARGET_TRADE_FRACTION"), 0.10)
+    target_capital_cap = target_capital_usdt * _dps_clip(target_trade_fraction, 0.01, 1.0) if target_capital_usdt > 0 else 0.0
+
+    # Cap por orçamento total de risco do robô convertido em notional, para impedir que uma entrada consuma tudo.
+    max_budget_fraction_per_trade = _dps_safe_float(os.environ.get("DYNAMIC_POSITION_MAX_BUDGET_FRACTION_PER_TRADE"), 0.25)
+    budget_fraction_risk_usdt = risk_budget_usdt * _dps_clip(max_budget_fraction_per_trade, 0.01, 1.0)
+    budget_fraction_cap = budget_fraction_risk_usdt / risk_fraction if budget_fraction_risk_usdt > 0 else 0.0
+
+    limits = [
+        _dps_v11_limit_item("RISK_BUDGET_RAW", raw_notional, "Notional necessário para usar 100% do risk per trade pela distância até o stop."),
+        _dps_v11_limit_item("POLICY_CATEGORY_CAP", policy_notional_cap, "Teto por política/categoria do Advisor e do Risk Budget."),
+        _dps_v11_limit_item("TARGET_ALLOCATION_CAP", target_capital_cap, "Fração máxima da alocação alvo por uma nova entrada.", active=target_capital_cap > 0),
+        _dps_v11_limit_item("BUDGET_FRACTION_CAP", budget_fraction_cap, "Evita consumir parcela excessiva do orçamento total de risco do robô em uma única entrada.", active=budget_fraction_cap > 0),
+    ]
+    if max_notional_env > 0:
+        limits.append(_dps_v11_limit_item("ENV_MAX_NOTIONAL_CAP", max_notional_env, "Teto global DYNAMIC_POSITION_MAX_NOTIONAL_USDT."))
+    if max_margin_env > 0:
+        limits.append(_dps_v11_limit_item("ENV_MAX_MARGIN_CAP", max_margin_env * leverage, "Teto global DYNAMIC_POSITION_MAX_MARGIN_USDT convertido em notional."))
+
+    binding = _dps_v11_select_binding_limit(limits)
+    suggested_notional = _dps_safe_float(binding.get("value_usdt"), 0.0) if binding else 0.0
+    if raw_notional > 0:
+        suggested_notional = min(suggested_notional, raw_notional)
+    if 0 < suggested_notional < min_notional and not ("PAUSE" in new_trade_policy or risk_state == "DEFENSIVE_MINIMUM"):
+        suggested_notional = min_notional
+
+    suggested_margin = suggested_notional / leverage if leverage > 0 else suggested_notional
+
+    live_notional_cap = live_caps.get("max_notional_usdt") or 0.0
+    live_suggested_notional = min(suggested_notional, live_notional_cap) if live_notional_cap > 0 else suggested_notional
+    live_suggested_margin = live_suggested_notional / leverage if leverage > 0 else live_suggested_notional
+    if not live_caps.get("real_trading_enabled") or live_caps.get("theoretical_new_orders", 0) <= 0:
+        live_allowed = False
+        live_block_reason = "REAL_TRADING_BLOCKED_OR_NO_CAPACITY"
+        live_suggested_notional = 0.0
+        live_suggested_margin = 0.0
+    else:
+        live_allowed = True
+        live_block_reason = None
+
+    effective_risk_usdt = suggested_notional * risk_fraction
+    effective_risk_pct = (effective_risk_usdt / capital * 100.0) if capital > 0 else 0.0
+    risk_budget_utilization_pct = (effective_risk_usdt / risk_usdt * 100.0) if risk_usdt > 0 else 0.0
+
+    # Separa prioridade estratégica do tamanho executável.
+    if risk_state == "PRIORITY" or advisor_action == "PRIORITIZE":
+        strategic_priority = "PRIORITY"
+    elif advisor_action == "PAUSE_OR_REVIEW" or risk_state == "DEFENSIVE_MINIMUM":
+        strategic_priority = "DEFENSIVE"
+    elif risk_state == "EXPERIMENTAL_CAPPED":
+        strategic_priority = "EXPERIMENTAL"
+    elif advisor_action == "REDUCE_OR_WAIT" or risk_state == "WAIT_REDUCED":
+        strategic_priority = "WAIT_REDUCED"
+    else:
+        strategic_priority = "STANDARD"
+
+    binding_name = binding.get("name") if binding else None
+    if advisor_action == "PAUSE_OR_REVIEW" or "PAUSE" in new_trade_policy:
+        executable_size_state = "DO_NOT_OPEN_OR_MINIMUM_SIZE"
+    elif binding_name == "RISK_BUDGET_RAW" and risk_budget_utilization_pct >= 95:
+        executable_size_state = "FULL_RISK_SIZE"
+    elif binding_name in {"POLICY_CATEGORY_CAP", "TARGET_ALLOCATION_CAP", "BUDGET_FRACTION_CAP", "ENV_MAX_NOTIONAL_CAP", "ENV_MAX_MARGIN_CAP"}:
+        executable_size_state = "CAP_LIMITED_SIZE"
+    elif strategic_priority == "EXPERIMENTAL":
+        executable_size_state = "SMALL_EXPERIMENTAL_SIZE"
+    else:
+        executable_size_state = "REDUCED_SIZE"
+
+    if executable_size_state == "DO_NOT_OPEN_OR_MINIMUM_SIZE":
+        sizing_action = "DO_NOT_OPEN_OR_MINIMUM_SIZE_OBSERVATION"
+    elif executable_size_state == "FULL_RISK_SIZE":
+        sizing_action = "FULL_RISK_SIZE_OBSERVATION"
+    elif executable_size_state == "CAP_LIMITED_SIZE":
+        sizing_action = "CAP_LIMITED_SIZE_OBSERVATION"
+    elif executable_size_state == "SMALL_EXPERIMENTAL_SIZE":
+        sizing_action = "SMALL_EXPERIMENTAL_SIZE_OBSERVATION"
+    else:
+        sizing_action = "REDUCED_SIZE_OBSERVATION"
+
+    reasons = []
+    reasons.append(f"Risk per trade vem do Dynamic Risk Budget: {round(risk_pct, 4)}% / {round(risk_usdt, 4)} USDT.")
+    if stop_distance_source == "ENTRY_STOP":
+        reasons.append("Distância de stop calculada pela entrada e stop informados.")
+    else:
+        reasons.append("Sem entrada/stop informados; usa distância padrão conservadora para estimar tamanho.")
+    if binding:
+        reasons.append(f"Limitador dominante: {binding.get('name')} — {binding.get('reason')}")
+    if risk_budget_utilization_pct < 80 and risk_usdt > 0:
+        reasons.append(f"A sugestão usa apenas {round(risk_budget_utilization_pct, 2)}% do risk per trade por causa dos limitadores.")
+    if not live_allowed:
+        reasons.append("Execução LIVE não está permitida ou não há capacidade; sizing LIVE fica zerado e sizing paper é apenas consultivo.")
+    if advisor_action == "PAUSE_OR_REVIEW" or "PAUSE" in new_trade_policy:
+        reasons.append("Política do Advisor está em pausa; não abrir novas entradas, exceto simulação/observação defensiva.")
+
+    entry_f = _dps_safe_float(entry, None)
+    suggested_qty = None
+    if entry_f and entry_f > 0 and suggested_notional > 0:
+        suggested_qty = suggested_notional / entry_f
+
+    return {
+        "bot": bot,
+        "category": budget.get("category"),
+        "score": round(score, 2),
+        "strategic_priority": strategic_priority,
+        "executable_size_state": executable_size_state,
+        "risk_state": risk_state,
+        "advisor_action": advisor_action,
+        "optimizer_recommendation": budget.get("optimizer_recommendation"),
+        "new_trade_policy": new_trade_policy,
+        "sizing_action": sizing_action,
+        "side": side_norm,
+        "entry": entry,
+        "stop": stop,
+        "stop_distance_pct": round(stop_distance_pct, 4),
+        "stop_distance_source": stop_distance_source,
+        "leverage": leverage,
+        "risk_budget_pct": budget.get("risk_budget_pct"),
+        "risk_budget_usdt": round(risk_budget_usdt, 4),
+        "risk_per_trade_pct": round(risk_pct, 4),
+        "risk_per_trade_usdt": round(risk_usdt, 4),
+        "paper_suggested_notional_usdt": round(suggested_notional, 4),
+        "paper_suggested_margin_usdt": round(suggested_margin, 4),
+        "paper_suggested_qty": round(suggested_qty, 8) if suggested_qty is not None else None,
+        "paper_effective_risk_usdt": round(effective_risk_usdt, 4),
+        "paper_effective_risk_pct": round(effective_risk_pct, 4),
+        "risk_budget_utilization_pct": round(risk_budget_utilization_pct, 4),
+        "unused_risk_per_trade_usdt": round(max(0.0, risk_usdt - effective_risk_usdt), 4),
+        "raw_notional_usdt": round(raw_notional, 4),
+        "raw_margin_usdt": round(raw_margin, 4),
+        "binding_limit": binding,
+        "limit_chain": limits,
+        "policy_notional_cap_usdt": round(policy_notional_cap, 4) if policy_notional_cap is not None else None,
+        "target_capital_cap_usdt": round(target_capital_cap, 4),
+        "budget_fraction_cap_usdt": round(budget_fraction_cap, 4),
+        "suggested_max_open_trades": budget.get("suggested_max_open_trades"),
+        "live_allowed": live_allowed,
+        "live_block_reason": live_block_reason,
+        "live_suggested_notional_usdt": round(live_suggested_notional, 4),
+        "live_suggested_margin_usdt": round(live_suggested_margin, 4),
+        "live_caps": live_caps,
+        "reasons": reasons,
+    }
+
+
+def build_dynamic_position_sizing_v11(capital=10000.0, bot_filter=None, entry=None, stop=None, side=None, leverage=None, total_risk_budget_pct=None):
+    global DYNAMIC_POSITION_SIZING_V11_CACHE
+    capital = _dps_safe_float(capital, 10000.0)
+    try:
+        risk_budget = build_dynamic_risk_budget_v1(capital=capital, total_risk_budget_pct=total_risk_budget_pct, bot_filter=bot_filter)
+    except Exception as exc:
+        risk_budget = {"ok": False, "error": str(exc), "budgets": [], "summary": {}, "live_context": {}, "alerts": []}
+
+    budgets = risk_budget.get("budgets") or []
+    live_context = risk_budget.get("live_context") or {}
+    sizes = []
+    strategic_priority_counts = {}
+    executable_size_counts = {}
+
+    for b in budgets:
+        s = _dynamic_position_size_for_budget_v11(
+            b,
+            capital=capital,
+            entry=entry,
+            stop=stop,
+            side=side,
+            leverage=leverage,
+            live_context=live_context,
+        )
+        sizes.append(s)
+        strategic_priority_counts[s.get("strategic_priority")] = strategic_priority_counts.get(s.get("strategic_priority"), 0) + 1
+        executable_size_counts[s.get("executable_size_state")] = executable_size_counts.get(s.get("executable_size_state"), 0) + 1
+
+    sizes.sort(key=lambda x: (_dps_safe_float(x.get("paper_suggested_notional_usdt"), 0.0), _dps_safe_float(x.get("score"), 0.0)), reverse=True)
+
+    total_paper_notional = sum(_dps_safe_float(s.get("paper_suggested_notional_usdt"), 0.0) for s in sizes)
+    total_paper_margin = sum(_dps_safe_float(s.get("paper_suggested_margin_usdt"), 0.0) for s in sizes)
+    total_paper_effective_risk = sum(_dps_safe_float(s.get("paper_effective_risk_usdt"), 0.0) for s in sizes)
+    total_risk_per_trade = sum(_dps_safe_float(s.get("risk_per_trade_usdt"), 0.0) for s in sizes)
+    total_util = (total_paper_effective_risk / total_risk_per_trade * 100.0) if total_risk_per_trade > 0 else 0.0
+
+    alerts = list(risk_budget.get("alerts") or [])
+    if not (live_context or {}).get("real_trading_enabled"):
+        alerts.append("Sizing LIVE zerado enquanto real trading estiver bloqueado ou sem capacidade livre.")
+    if entry is None or stop is None:
+        alerts.append("Sem entrada/stop informados: sizing usa distância de stop padrão, apenas para referência por robô.")
+    if total_util < 50 and total_risk_per_trade > 0:
+        alerts.append("Uso efetivo do risk per trade está baixo; limitadores de política/capital estão comprimindo os tamanhos.")
+
+    payload = {
+        "ok": True,
+        "version": DYNAMIC_POSITION_SIZING_V11_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": DYNAMIC_POSITION_SIZING_V11_MODE,
+        "capital": capital,
+        "inputs": {
+            "bot_filter": bot_filter,
+            "entry": entry,
+            "stop": stop,
+            "side": _dps_normalize_side(side),
+            "leverage": int(_dps_clip(_dps_safe_float(leverage, DEFAULT_REAL_LEVERAGE if "DEFAULT_REAL_LEVERAGE" in globals() else 3), 1, 50)),
+            "risk_budget_version": risk_budget.get("version"),
+            "stop_distance_default_pct": _dps_safe_float(os.environ.get("DYNAMIC_POSITION_DEFAULT_STOP_PCT"), 2.0),
+        },
+        "sizes": sizes,
+        "summary": {
+            "bots": len(sizes),
+            "strategic_priority_counts": strategic_priority_counts,
+            "executable_size_counts": executable_size_counts,
+            "top_size_bot": sizes[0] if sizes else None,
+            "total_paper_suggested_notional_usdt": round(total_paper_notional, 4),
+            "total_paper_suggested_margin_usdt": round(total_paper_margin, 4),
+            "total_paper_effective_risk_usdt": round(total_paper_effective_risk, 4),
+            "total_paper_effective_risk_pct": round((total_paper_effective_risk / capital * 100.0) if capital > 0 else 0.0, 4),
+            "total_risk_per_trade_usdt": round(total_risk_per_trade, 4),
+            "total_risk_budget_utilization_pct": round(total_util, 4),
+            "risk_budget_summary": risk_budget.get("summary"),
+        },
+        "live_context": live_context,
+        "risk_budget_summary": risk_budget.get("summary"),
+        "alerts": alerts,
+        "notes": [
+            "Dynamic Position Sizing V1.1 está em modo consultivo/observação.",
+            "Não abre ordens, não altera lote real, não altera risco real e não executa na corretora.",
+            "Correção V1.1: mostra cadeia de limitadores e limitador dominante.",
+            "Correção V1.1: calcula utilização real do risk per trade após caps.",
+            "Correção V1.1: separa prioridade estratégica de tamanho efetivamente executável.",
+            "Preparado para alimentar Risk Manager decisório, OMS e executor no futuro.",
+        ],
+    }
+    DYNAMIC_POSITION_SIZING_V11_CACHE = {
+        "last_payload": payload,
+        "last_generated_at": payload.get("generated_at"),
+        "last_capital": capital,
+    }
+    return payload
+
+
+def build_dynamic_position_sizing_v11_text(capital=10000.0, bot_filter=None, entry=None, stop=None, side=None, leverage=None, total_risk_budget_pct=None):
+    payload = build_dynamic_position_sizing_v11(capital=capital, bot_filter=bot_filter, entry=entry, stop=stop, side=side, leverage=leverage, total_risk_budget_pct=total_risk_budget_pct)
+    summary = payload.get("summary") or {}
+    live = payload.get("live_context") or {}
+    inp = payload.get("inputs") or {}
+
+    lines = [
+        "📐 DYNAMIC POSITION SIZING V1.1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Resumo geral:",
+        f"Capital analisado: {payload.get('capital')} USDT",
+        f"Robôs avaliados: {summary.get('bots')}",
+        f"Notional paper sugerido total: {summary.get('total_paper_suggested_notional_usdt')} USDT",
+        f"Margem paper sugerida total: {summary.get('total_paper_suggested_margin_usdt')} USDT",
+        f"Risco efetivo paper estimado: {summary.get('total_paper_effective_risk_usdt')} USDT ({summary.get('total_paper_effective_risk_pct')}%)",
+        f"Uso do risk per trade disponível: {summary.get('total_risk_budget_utilization_pct')}%",
+        "",
+        "Parâmetros de sizing:",
+        f"Bot filtro: {inp.get('bot_filter')}",
+        f"Entrada: {inp.get('entry')} | Stop: {inp.get('stop')} | Side: {inp.get('side')} | Leverage: {inp.get('leverage')}x",
+        f"Stop padrão usado quando ausente: {inp.get('stop_distance_default_pct')}%",
+        "",
+        "Contexto real/BingX:",
+        f"READY: {live.get('bingx_ready')} | {live.get('bingx_status')}",
+        f"Saldo total/free: {live.get('total_usdt')} / {live.get('free_usdt')} USDT",
+        f"Capacidade teórica novas ordens: {live.get('theoretical_new_orders')}",
+        f"Real trading: {'LIBERADO' if live.get('real_trading_enabled') else 'BLOQUEADO'} | Modo {live.get('execution_mode')}",
+    ]
+
+    alerts = payload.get("alerts") or []
+    if alerts:
+        lines += ["", "Alertas de position sizing:"]
+        for alert in alerts:
+            lines.append(f"- {alert}")
+
+    lines += ["", "Sizing sugerido por robô:"]
+    for idx, s in enumerate(payload.get("sizes") or [], start=1):
+        bind = s.get("binding_limit") or {}
+        lines += [
+            "",
+            f"{idx}. {s.get('bot')} — {s.get('sizing_action')}",
+            f"Prioridade estratégica: {s.get('strategic_priority')} | Tamanho executável: {s.get('executable_size_state')}",
+            f"Estado risco: {s.get('risk_state')} | Advisor: {s.get('advisor_action')} | Score: {s.get('score')}/100",
+            f"Risk per trade: {s.get('risk_per_trade_pct')}% ({s.get('risk_per_trade_usdt')} USDT)",
+            f"Stop distance: {s.get('stop_distance_pct')}% ({s.get('stop_distance_source')}) | Leverage: {s.get('leverage')}x",
+            f"Raw notional necessário: {s.get('raw_notional_usdt')} USDT",
+            f"Paper notional sugerido: {s.get('paper_suggested_notional_usdt')} USDT",
+            f"Paper margem sugerida: {s.get('paper_suggested_margin_usdt')} USDT",
+            f"Paper qty sugerida: {s.get('paper_suggested_qty')}",
+            f"Risco efetivo paper: {s.get('paper_effective_risk_usdt')} USDT ({s.get('paper_effective_risk_pct')}%)",
+            f"Uso do risk per trade: {s.get('risk_budget_utilization_pct')}% | Risco não usado: {s.get('unused_risk_per_trade_usdt')} USDT",
+            f"Limitador dominante: {bind.get('name')} ({bind.get('value_usdt')} USDT)",
+            f"LIVE permitido: {s.get('live_allowed')} | LIVE notional: {s.get('live_suggested_notional_usdt')} USDT | motivo: {s.get('live_block_reason')}",
+            "Motivos:",
+        ]
+        for reason in s.get("reasons", [])[:6]:
+            lines.append(f"- {reason}")
+
+    lines += ["", "Notas:"]
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+
+    return "\n".join(lines), payload
+
+
+@app.route("/dynamic/position/sizing/v1.1")
+@app.route("/dynamic-position-sizing/v1.1")
+@app.route("/position/sizing/v1.1")
+@app.route("/positionsizing/v1.1")
+@app.route("/sizing/v1.1")
+def dynamic_position_sizing_v11_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    bot = request.args.get("bot", default=None, type=str)
+    entry = request.args.get("entry", default=None, type=float)
+    stop = request.args.get("stop", default=None, type=float)
+    side = request.args.get("side", default=None, type=str)
+    leverage = request.args.get("leverage", default=None, type=float)
+    total_risk = request.args.get("risk", default=None, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_dynamic_position_sizing_v11_text(capital=capital, bot_filter=bot, entry=entry, stop=stop, side=side, leverage=leverage, total_risk_budget_pct=total_risk)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/dynamic/position/sizing/<bot>/v1.1")
+@app.route("/position/sizing/<bot>/v1.1")
+@app.route("/positionsizing/<bot>/v1.1")
+def dynamic_position_sizing_v11_bot_route(bot):
+    capital = request.args.get("capital", default=10000, type=float)
+    entry = request.args.get("entry", default=None, type=float)
+    stop = request.args.get("stop", default=None, type=float)
+    side = request.args.get("side", default=None, type=str)
+    leverage = request.args.get("leverage", default=None, type=float)
+    total_risk = request.args.get("risk", default=None, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_dynamic_position_sizing_v11_text(capital=capital, bot_filter=bot, entry=entry, stop=stop, side=side, leverage=leverage, total_risk_budget_pct=total_risk)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/dynamic/position/sizing/summary/v1.1")
+@app.route("/position/sizing/summary/v1.1")
+@app.route("/positionsizing/summary/v1.1")
+def dynamic_position_sizing_v11_summary_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    bot = request.args.get("bot", default=None, type=str)
+    entry = request.args.get("entry", default=None, type=float)
+    stop = request.args.get("stop", default=None, type=float)
+    side = request.args.get("side", default=None, type=str)
+    leverage = request.args.get("leverage", default=None, type=float)
+    total_risk = request.args.get("risk", default=None, type=float)
+    payload = build_dynamic_position_sizing_v11(capital=capital, bot_filter=bot, entry=entry, stop=stop, side=side, leverage=leverage, total_risk_budget_pct=total_risk)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "capital": payload.get("capital"),
+        "inputs": payload.get("inputs"),
+        "summary": payload.get("summary"),
+        "sizes": payload.get("sizes"),
+        "alerts": payload.get("alerts"),
+        "live_context": payload.get("live_context"),
+        "cache": {
+            "last_generated_at": DYNAMIC_POSITION_SIZING_V11_CACHE.get("last_generated_at"),
+            "last_capital": DYNAMIC_POSITION_SIZING_V11_CACHE.get("last_capital"),
+        },
+    }
+
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
 def analytics_bot_exposure_v2_route():
@@ -12091,7 +12536,7 @@ def build_central_command_reply(text: str):
         except Exception:
             capital_arg = 10000.0
         bot_arg = parts[2].upper() if len(parts) > 2 else None
-        text_dps, _ = build_dynamic_position_sizing_v1_text(capital=capital_arg, bot_filter=bot_arg)
+        text_dps, _ = build_dynamic_position_sizing_v11_text(capital=capital_arg, bot_filter=bot_arg)
         return text_dps
     if cmd0 in {"/riskbudget", "/riskbudgetv1", "/dynamicrisk", "/dynamicriskv1", "/drb", "/orcamentorisco", "/orçamentorisco"}:
         parts = raw.split()
