@@ -7944,6 +7944,458 @@ def bot_exposure_manager_v2_summary_route():
         },
     }
 
+# ==========================================================
+# EXPOSURE SCORE ENGINE V1 - CENTRAL QUANT
+# ==========================================================
+
+EXPOSURE_SCORE_ENGINE_V1_VERSION = "2026-07-03-EXPOSURE-SCORE-ENGINE-V1"
+EXPOSURE_SCORE_ENGINE_V1_MODE = os.environ.get("EXPOSURE_SCORE_ENGINE_V1_MODE", "OBSERVATION_ONLY").strip().upper()
+EXPOSURE_SCORE_ENGINE_V1_CACHE = {
+    "last_snapshot": None,
+    "last_generated_at": None,
+    "last_capital": None,
+}
+EXPOSURE_SCORE_ENGINE_V1_LOCK = threading.Lock()
+
+
+def _ese_v1_clamp(value, minimum=0.0, maximum=100.0):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    return max(float(minimum), min(float(maximum), value))
+
+
+def _ese_v1_component_capital(usage_pct, positions=0):
+    """Score de saúde do uso de capital. 0 posição fica neutro; lotado perde score."""
+    usage = _ese_v1_clamp(usage_pct, 0.0, 200.0)
+    positions = int(positions or 0)
+    if positions <= 0:
+        return 55.0
+    if usage <= 50:
+        return 95.0
+    if usage <= 75:
+        return 85.0
+    if usage <= 90:
+        return 70.0
+    if usage <= 100:
+        return 55.0
+    if usage <= 120:
+        return 35.0
+    return 15.0
+
+
+def _ese_v1_component_risk(risk_usage_pct, positions=0):
+    """Score de saúde do risco aberto. Baixo uso de risco é positivo; excesso é penalizado."""
+    usage = _ese_v1_clamp(risk_usage_pct, 0.0, 250.0)
+    positions = int(positions or 0)
+    if positions <= 0:
+        return 60.0
+    if usage <= 25:
+        return 100.0
+    if usage <= 50:
+        return 90.0
+    if usage <= 75:
+        return 70.0
+    if usage <= 100:
+        return 45.0
+    if usage <= 150:
+        return 20.0
+    return 5.0
+
+
+def _ese_v1_component_concentration(bot_state):
+    positions = int((bot_state or {}).get("positions", 0) or 0)
+    if positions <= 0:
+        return 60.0
+
+    long_count = int((bot_state or {}).get("long", 0) or 0)
+    short_count = int((bot_state or {}).get("short", 0) or 0)
+    largest_symbol_count = int((bot_state or {}).get("largest_symbol_count", 0) or 0)
+
+    dominant_side_pct = (max(long_count, short_count) / positions) * 100.0 if positions else 0.0
+    symbol_pct = (largest_symbol_count / positions) * 100.0 if positions else 0.0
+
+    side_score = 100.0
+    if positions >= 4:
+        if dominant_side_pct >= 90:
+            side_score = 45.0
+        elif dominant_side_pct >= 80:
+            side_score = 60.0
+        elif dominant_side_pct >= 70:
+            side_score = 75.0
+        else:
+            side_score = 95.0
+
+    symbol_score = 100.0
+    if symbol_pct >= 50 and positions >= 3:
+        symbol_score = 45.0
+    elif symbol_pct >= 35 and positions >= 4:
+        symbol_score = 65.0
+    elif symbol_pct >= 25 and positions >= 6:
+        symbol_score = 80.0
+
+    return round((side_score * 0.65) + (symbol_score * 0.35), 2)
+
+
+def _ese_v1_component_activity(positions, category="OTHER"):
+    positions = int(positions or 0)
+    category = str(category or "OTHER").upper()
+    if positions <= 0:
+        return 50.0
+    if category == "CORE":
+        if 3 <= positions <= 15:
+            return 90.0
+        if positions <= 20:
+            return 70.0
+        return 45.0
+    if category in {"TACTICAL", "SATELLITE"}:
+        if 1 <= positions <= 5:
+            return 85.0
+        if positions <= 8:
+            return 65.0
+        return 40.0
+    if category == "EXPERIMENTAL":
+        if 1 <= positions <= 3:
+            return 80.0
+        if positions <= 5:
+            return 55.0
+        return 30.0
+    if positions <= 6:
+        return 75.0
+    return 55.0
+
+
+def _ese_v1_load_analytics_ranking():
+    """Tenta carregar score estatístico do analytics_engine. Falha de forma neutra."""
+    try:
+        import analytics_engine
+        payload = analytics_engine.bot_ranking()
+        items = payload.get("bots", []) if isinstance(payload, dict) else []
+    except Exception as exc:
+        return {}, str(exc)
+
+    ranking = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        bot_name = normalize_registry_bot(
+            item.get("bot") or item.get("name") or item.get("robot") or item.get("setup") or "UNKNOWN"
+        )
+        ranking[bot_name] = dict(item)
+    return ranking, None
+
+
+def _ese_v1_performance_component(bot, analytics_item=None):
+    if not isinstance(analytics_item, dict):
+        return {
+            "score": 50.0,
+            "source": "NEUTRAL_NO_ANALYTICS",
+            "trades": 0,
+            "win_rate_pct": 0.0,
+            "pnl_total_pct": 0.0,
+            "pnl_avg_pct": 0.0,
+            "recommendation": "WAIT_SAMPLE",
+            "confidence": "UNKNOWN",
+        }
+
+    raw_score = _ese_v1_clamp(analytics_item.get("score", 50.0), 0.0, 100.0)
+    trades = int(_bem_v2_float(analytics_item.get("trades"), 0.0))
+    if trades <= 0:
+        raw_score = min(raw_score, 55.0)
+    elif trades < 10:
+        raw_score = (raw_score * 0.70) + 15.0  # reduz excesso de confiança com amostra pequena
+
+    return {
+        "score": round(_ese_v1_clamp(raw_score), 2),
+        "source": "ANALYTICS_ENGINE",
+        "trades": trades,
+        "win_rate_pct": round(_bem_v2_float(analytics_item.get("win_rate_pct"), 0.0), 2),
+        "pnl_total_pct": round(_bem_v2_float(analytics_item.get("pnl_total_pct"), 0.0), 4),
+        "pnl_avg_pct": round(_bem_v2_float(analytics_item.get("pnl_avg_pct"), 0.0), 4),
+        "recommendation": analytics_item.get("recommendation") or analytics_item.get("action") or "N/A",
+        "confidence": analytics_item.get("confidence") or analytics_item.get("rating") or "N/A",
+    }
+
+
+def _ese_v1_decision(score, bot_state, performance):
+    positions = int((bot_state or {}).get("positions", 0) or 0)
+    usage_pct = _bem_v2_float((bot_state or {}).get("usage_pct"), 0.0)
+    risk_usage_pct = _bem_v2_float((bot_state or {}).get("risk_usage_pct"), 0.0)
+    recommendation = str((performance or {}).get("recommendation") or "").upper()
+
+    if score >= 82 and usage_pct < 85 and risk_usage_pct < 55 and positions > 0:
+        return "SCALE_UP_OBSERVATION"
+    if score >= 72 and risk_usage_pct < 75:
+        return "MAINTAIN_OR_ALLOW_OBSERVATION"
+    if score >= 58:
+        if usage_pct >= 90:
+            return "REDUCE_SIZE_OBSERVATION"
+        return "MAINTAIN_OBSERVATION"
+    if score >= 45:
+        return "REDUCE_SIZE_OBSERVATION"
+    if "PAUS" in recommendation or "AGUARD" in recommendation:
+        return "PAUSE_OR_WAIT_SAMPLE_OBSERVATION"
+    return "PAUSE_OR_REVIEW_OBSERVATION"
+
+
+def _ese_v1_rating(score):
+    score = float(score or 0.0)
+    if score >= 85:
+        return "EXCELLENT"
+    if score >= 72:
+        return "GOOD"
+    if score >= 58:
+        return "ATTENTION"
+    if score >= 45:
+        return "WEAK"
+    return "CRITICAL"
+
+
+def _ese_v1_reasons(bot_state, components, performance):
+    reasons = []
+    usage_pct = _bem_v2_float((bot_state or {}).get("usage_pct"), 0.0)
+    risk_usage_pct = _bem_v2_float((bot_state or {}).get("risk_usage_pct"), 0.0)
+    positions = int((bot_state or {}).get("positions", 0) or 0)
+
+    if positions <= 0:
+        reasons.append("Robô sem posições abertas; score fica neutro até haver atividade.")
+    if usage_pct >= 90:
+        reasons.append("Capital alocado praticamente cheio; novas entradas deveriam reduzir tamanho.")
+    if risk_usage_pct <= 25 and positions > 0:
+        reasons.append("Risco aberto ainda baixo em relação ao limite consultivo.")
+    elif risk_usage_pct >= 75:
+        reasons.append("Risco aberto alto em relação ao limite consultivo.")
+
+    perf_source = (performance or {}).get("source")
+    if perf_source == "ANALYTICS_ENGINE":
+        reasons.append(f"Score estatístico do Analytics: {(performance or {}).get('score')}/100.")
+    else:
+        reasons.append("Sem ranking estatístico suficiente; performance tratada como neutra.")
+
+    if (components or {}).get("concentration_score", 100) < 70:
+        reasons.append("Concentração direcional/por ativo exige atenção.")
+    return reasons[:6]
+
+
+def build_exposure_score_engine_v1(capital=10000.0, bot_filter=None):
+    try:
+        capital = float(capital or 0)
+    except Exception:
+        capital = 10000.0
+
+    exposure = build_bot_exposure_manager_v2(capital=capital, bot_filter=bot_filter)
+    analytics_ranking, analytics_error = _ese_v1_load_analytics_ranking()
+    bots = exposure.get("bots", {}) if isinstance(exposure, dict) else {}
+
+    scored_bots = {}
+    ranking_items = []
+
+    for bot, state in sorted(bots.items()):
+        performance = _ese_v1_performance_component(bot, analytics_ranking.get(bot))
+        components = {
+            "capital_score": round(_ese_v1_component_capital(state.get("usage_pct"), state.get("positions")), 2),
+            "risk_score": round(_ese_v1_component_risk(state.get("risk_usage_pct"), state.get("positions")), 2),
+            "performance_score": round(performance.get("score", 50.0), 2),
+            "concentration_score": round(_ese_v1_component_concentration(state), 2),
+            "activity_score": round(_ese_v1_component_activity(state.get("positions"), state.get("category")), 2),
+        }
+
+        score = (
+            components["performance_score"] * 0.35
+            + components["risk_score"] * 0.25
+            + components["capital_score"] * 0.20
+            + components["concentration_score"] * 0.10
+            + components["activity_score"] * 0.10
+        )
+        score = round(_ese_v1_clamp(score), 2)
+
+        item = {
+            "bot": bot,
+            "score": score,
+            "rating": _ese_v1_rating(score),
+            "decision": _ese_v1_decision(score, state, performance),
+            "category": state.get("category"),
+            "status": state.get("status"),
+            "positions": state.get("positions"),
+            "capital_used": state.get("capital_used"),
+            "capital_allocated": state.get("capital_allocated"),
+            "usage_pct": state.get("usage_pct"),
+            "risk_used_usdt": state.get("risk_used_usdt"),
+            "max_open_risk_usdt": state.get("max_open_risk_usdt"),
+            "risk_usage_pct": state.get("risk_usage_pct"),
+            "net_direction": state.get("net_direction"),
+            "largest_symbol": state.get("largest_symbol"),
+            "largest_symbol_count": state.get("largest_symbol_count"),
+            "components": components,
+            "performance": performance,
+            "reasons": _ese_v1_reasons(state, components, performance),
+            "exposure_alerts": state.get("alerts") or [],
+            "data_quality": state.get("data_quality") or {},
+        }
+        scored_bots[bot] = item
+        ranking_items.append(item)
+
+    ranking_items.sort(key=lambda item: (-item.get("score", 0), -int(item.get("positions", 0) or 0), item.get("bot")))
+
+    active_items = [item for item in ranking_items if int(item.get("positions", 0) or 0) > 0]
+    best_bot = ranking_items[0] if ranking_items else None
+    weakest_active = sorted(active_items, key=lambda item: (item.get("score", 0), -int(item.get("positions", 0) or 0)))[0] if active_items else None
+
+    category_summary = {}
+    for item in ranking_items:
+        cat = str(item.get("category") or "OTHER").upper()
+        bucket = category_summary.setdefault(cat, {"bots": 0, "positions": 0, "avg_score": 0.0, "capital_used": 0.0, "risk_used_usdt": 0.0})
+        bucket["bots"] += 1
+        bucket["positions"] += int(item.get("positions", 0) or 0)
+        bucket["avg_score"] += float(item.get("score", 0.0) or 0.0)
+        bucket["capital_used"] += _bem_v2_float(item.get("capital_used"), 0.0)
+        bucket["risk_used_usdt"] += _bem_v2_float(item.get("risk_used_usdt"), 0.0)
+    for cat, bucket in category_summary.items():
+        bucket["avg_score"] = round(bucket["avg_score"] / bucket["bots"], 2) if bucket.get("bots") else 0.0
+        bucket["capital_used"] = round(bucket["capital_used"], 4)
+        bucket["risk_used_usdt"] = round(bucket["risk_used_usdt"], 4)
+
+    avg_score = round(sum(item.get("score", 0) for item in ranking_items) / len(ranking_items), 2) if ranking_items else 0.0
+    active_avg_score = round(sum(item.get("score", 0) for item in active_items) / len(active_items), 2) if active_items else 0.0
+
+    summary = {
+        "bots": len(ranking_items),
+        "active_bots": len(active_items),
+        "avg_score": avg_score,
+        "active_avg_score": active_avg_score,
+        "best_bot": best_bot,
+        "weakest_active_bot": weakest_active,
+        "category_summary": category_summary,
+        "exposure_summary": exposure.get("summary", {}),
+    }
+
+    payload = {
+        "ok": True,
+        "version": EXPOSURE_SCORE_ENGINE_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": EXPOSURE_SCORE_ENGINE_V1_MODE,
+        "capital": round(capital, 4),
+        "summary": summary,
+        "bots": scored_bots,
+        "ranking": ranking_items,
+        "inputs": {
+            "exposure_version": exposure.get("version"),
+            "analytics_loaded": analytics_error is None,
+            "analytics_error": analytics_error,
+        },
+        "notes": [
+            "Exposure Score Engine V1 está em modo consultivo/observação.",
+            "Não altera lote, execução, risco real ou permissões de entrada.",
+            "Combina Exposure Manager V2.1 com score estatístico do Analytics quando disponível.",
+            "Quando não há estatística suficiente, usa score neutro de performance para evitar decisões agressivas.",
+            "Preparado para alimentar Portfolio Advisor V1.",
+        ],
+    }
+
+    with EXPOSURE_SCORE_ENGINE_V1_LOCK:
+        EXPOSURE_SCORE_ENGINE_V1_CACHE["last_snapshot"] = payload
+        EXPOSURE_SCORE_ENGINE_V1_CACHE["last_generated_at"] = payload.get("generated_at")
+        EXPOSURE_SCORE_ENGINE_V1_CACHE["last_capital"] = payload.get("capital")
+
+    return payload
+
+
+def build_exposure_score_engine_v1_text(capital=10000.0, bot_filter=None):
+    payload = build_exposure_score_engine_v1(capital=capital, bot_filter=bot_filter)
+    summary = payload.get("summary", {})
+    ranking = payload.get("ranking", [])
+    exposure_summary = summary.get("exposure_summary", {}) or {}
+
+    lines = [
+        "🧠 EXPOSURE SCORE ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Resumo geral:",
+        f"Capital analisado: {payload.get('capital')} USDT",
+        f"Robôs avaliados: {summary.get('bots')} | ativos: {summary.get('active_bots')}",
+        f"Score médio geral: {summary.get('avg_score')}/100",
+        f"Score médio dos ativos: {summary.get('active_avg_score')}/100",
+        f"Posições: {exposure_summary.get('positions')} | LONG {exposure_summary.get('long')} | SHORT {exposure_summary.get('short')} | Net {exposure_summary.get('net_direction')}",
+        f"Capital usado: {exposure_summary.get('capital_used')} USDT ({exposure_summary.get('capital_usage_pct')}%)",
+        f"Risco aberto estimado: {exposure_summary.get('risk_used_usdt')} USDT",
+        "",
+        "Ranking por robô:",
+    ]
+
+    for i, item in enumerate(ranking, start=1):
+        components = item.get("components") or {}
+        perf = item.get("performance") or {}
+        lines += [
+            "",
+            f"{i}. {item.get('bot')} — Score {item.get('score')}/100 ({item.get('rating')})",
+            f"Decisão: {item.get('decision')}",
+            f"Categoria: {item.get('category')} | Status: {item.get('status')}",
+            f"Posições: {item.get('positions')} | Net {item.get('net_direction')} | Maior ativo: {item.get('largest_symbol')} ({item.get('largest_symbol_count')})",
+            f"Capital: {item.get('capital_used')} / {item.get('capital_allocated')} USDT ({item.get('usage_pct')}%)",
+            f"Risco: {item.get('risk_used_usdt')} / {item.get('max_open_risk_usdt')} USDT ({item.get('risk_usage_pct')}%)",
+            f"Componentes: perf {components.get('performance_score')} | risco {components.get('risk_score')} | capital {components.get('capital_score')} | concentração {components.get('concentration_score')} | atividade {components.get('activity_score')}",
+            f"Analytics: trades {perf.get('trades')} | win {perf.get('win_rate_pct')}% | pnl {perf.get('pnl_total_pct')}% | fonte {perf.get('source')}",
+        ]
+        reasons = item.get("reasons") or []
+        if reasons:
+            lines.append("Leitura:")
+            for reason in reasons[:4]:
+                lines.append(f"- {reason}")
+        alerts = item.get("exposure_alerts") or []
+        if alerts:
+            lines.append("Alertas Exposure: " + ", ".join(alerts))
+
+    lines += ["", "Notas:"]
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+
+    return "\n".join(lines), payload
+
+
+@app.route("/exposure/score/v1")
+@app.route("/exposure/scores/v1")
+@app.route("/score/exposure/v1")
+@app.route("/analytics/exposure-score")
+def exposure_score_engine_v1_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_exposure_score_engine_v1_text(capital=capital)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/exposure/score/<bot>/v1")
+@app.route("/score/exposure/<bot>/v1")
+def exposure_score_engine_v1_bot_route(bot):
+    capital = request.args.get("capital", default=10000, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_exposure_score_engine_v1_text(capital=capital, bot_filter=bot)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/exposure/score/summary/v1")
+def exposure_score_engine_v1_summary_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    payload = build_exposure_score_engine_v1(capital=capital)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "summary": payload.get("summary"),
+        "ranking": payload.get("ranking"),
+        "cache": {
+            "last_generated_at": EXPOSURE_SCORE_ENGINE_V1_CACHE.get("last_generated_at"),
+            "last_capital": EXPOSURE_SCORE_ENGINE_V1_CACHE.get("last_capital"),
+        },
+    }
+
 
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
@@ -8704,7 +9156,7 @@ def build_central_help_text():
         "Por robô:\n"
         "/trend\n/donkey\n/cobra\n/meme\n/predator\n/turtle\n/falcon\n\n"
         "Histórico, estatística e simulação:\n"
-        "/history\n/riskstats\n/exporthistory\n/journal\n/trade <ativo>\n/globalstats\n/signalai <ativo>\n/capital\n/correlation\n/timeheat\n/marketscore\n/allocation\n/rankingvivo\n/evolution\n/learning\n/quantos\n/snapshot\n/history\n/simulate TURTLE\n/simulateoff TURTLE\n\n"
+        "/history\n/riskstats\n/exporthistory\n/journal\n/trade <ativo>\n/globalstats\n/signalai <ativo>\n/capital\n/correlation\n/timeheat\n/marketscore\n/allocation\n/exposurescore\n/rankingvivo\n/evolution\n/learning\n/quantos\n/snapshot\n/history\n/simulate TURTLE\n/simulateoff TURTLE\n\n"
         "Sugestão de uso diário: /dashboard. Para colar no ChatGPT: /daily."
     )
 
@@ -9284,6 +9736,14 @@ def build_central_command_reply(text: str):
             capital_arg = 10000.0
         text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
         return text_v2
+    if cmd0 in {"/exposurescore", "/scoreexposure", "/exposurescorev1", "/scorev1"}:
+        parts = raw.split()
+        try:
+            capital_arg = float(parts[1]) if len(parts) > 1 else 10000.0
+        except Exception:
+            capital_arg = 10000.0
+        text_score, _ = build_exposure_score_engine_v1_text(capital=capital_arg)
+        return text_score
     if cmd0 in {"/rankingvivo", "/rankinglive"}:
         return build_ranking_vivo_report()
     if cmd0 in {"/evolution", "/evolucao", "/evolução"}:
