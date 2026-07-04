@@ -40,6 +40,14 @@ try:
     import fcntl
 except Exception:
     fcntl = None
+try:
+    import executive_policy_manager
+    EXECUTIVE_POLICY_MANAGER_LOADED = True
+    EXECUTIVE_POLICY_MANAGER_ERROR = None
+except Exception as e:
+    executive_policy_manager = None
+    EXECUTIVE_POLICY_MANAGER_LOADED = False
+    EXECUTIVE_POLICY_MANAGER_ERROR = str(e)    
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -761,7 +769,7 @@ def get_open_positions_from_module(module, key=None):
             raw = module.get_positions()
         else:
             raw = {}
-
+def build_command_reply_for_module(key: str, module, cmd: str):
         if isinstance(raw, dict):
             iterable = raw.values()
         elif isinstance(raw, list):
@@ -16896,6 +16904,25 @@ def telegram_send_with_token(token, chat_id, text, title=None):
 def build_command_reply_for_module(key: str, module, cmd: str):
     raw_cmd = (cmd or "").strip()
     cmd0 = raw_cmd.lower().split()[0].split("@")[0] if raw_cmd else ""
+
+    if cmd0 in {"/policyhealth", "/policy_health"}:
+        if EXECUTIVE_POLICY_MANAGER_LOADED:
+            return executive_policy_manager.format_policy_health_text()
+        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+
+    if cmd0 in {"/policies", "/policylist", "/policy_list"}:
+        if EXECUTIVE_POLICY_MANAGER_LOADED:
+            return executive_policy_manager.format_policies_text(include_disabled=False)
+        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+
+    if cmd0 == "/policy":
+        if EXECUTIVE_POLICY_MANAGER_LOADED:
+            parts = raw_cmd.split(maxsplit=1)
+            code = parts[1].strip() if len(parts) > 1 else ""
+            if not code:
+                return "Use: /policy NO_NEW_LONG"
+            return executive_policy_manager.format_single_policy_text(code)
+        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
 
     if cmd0 in {"/diagnostico", "/diagnóstico", "/diag"}:
         return build_diagnostic_report()
