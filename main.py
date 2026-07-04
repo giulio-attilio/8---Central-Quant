@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-04-SUPER-CENTRAL-QUANT-V5-DYNAMIC-RISK-BUDGET-V1
+# Versão: 2026-07-04-SUPER-CENTRAL-QUANT-V5-EXECUTIVE-ALERT-HEALTH-INTEGRATED-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -5687,6 +5687,121 @@ def build_meta_supervisor_report():
     return "\n".join(lines)
 
 
+
+
+# ==========================================================
+# EXECUTIVE ALERT MANAGER — INTEGRAÇÃO COM DASHBOARD/REPORTS
+# ==========================================================
+
+def _executive_alerts_snapshot_for_reports(check_only=True):
+    """
+    Lê o Executive Alert Manager de forma segura para uso em:
+    - Executive Dashboard
+    - CEO Daily Report
+    - Executive Report Diário
+    - Executive Report Mensal
+
+    Usa check_only=True por padrão para não gerar spam, não alterar cooldown e não
+    poluir o log quando o relatório apenas precisa exibir o estado atual.
+    """
+    try:
+        payload = build_executive_alerts(check_only=check_only)
+        if not isinstance(payload, dict):
+            raise ValueError("build_executive_alerts retornou payload inválido")
+        hs = payload.get("health_score") or {}
+        if not isinstance(hs, dict):
+            hs = {}
+        return {
+            "ok": bool(payload.get("ok", True)),
+            "enabled": bool(payload.get("enabled", True)),
+            "status": payload.get("status", "UNKNOWN"),
+            "version": payload.get("version"),
+            "generated_at": payload.get("generated_at"),
+            "health_score": {
+                "score": int(hs.get("score", 100) or 100),
+                "label": hs.get("label", "EXCELENTE"),
+                "reasons": hs.get("reasons", []) or [],
+            },
+            "alerts_count": int(payload.get("alerts_count", 0) or 0),
+            "alerts_to_notify_count": int(payload.get("alerts_to_notify_count", 0) or 0),
+            "resolved_count": len(payload.get("resolved") or []),
+            "pipeline_status": payload.get("pipeline_status"),
+            "executive_summary": payload.get("executive_summary") or "Resumo executivo indisponível.",
+            "alerts": payload.get("alerts") or [],
+            "alerts_to_notify": payload.get("alerts_to_notify") or [],
+            "resolved": payload.get("resolved") or [],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "enabled": False,
+            "status": "ERROR",
+            "version": None,
+            "generated_at": data_hora_sp_str(),
+            "health_score": {
+                "score": 0,
+                "label": "ERRO",
+                "reasons": [str(exc)],
+            },
+            "alerts_count": 1,
+            "alerts_to_notify_count": 1,
+            "resolved_count": 0,
+            "pipeline_status": "UNKNOWN",
+            "executive_summary": f"Erro ao ler Executive Alert Manager: {exc}",
+            "alerts": [{
+                "level": "CRITICAL",
+                "category": "SYSTEM",
+                "title": "Executive Alert Manager indisponível",
+                "message": str(exc),
+                "action": "Verificar import, deploy e logs do executive_alert_manager.py.",
+            }],
+            "alerts_to_notify": [],
+            "resolved": [],
+        }
+
+
+def _executive_alerts_report_block(title="EXECUTIVE ALERT MANAGER"):
+    snap = _executive_alerts_snapshot_for_reports(check_only=True)
+    hs = snap.get("health_score") or {}
+    alerts = snap.get("alerts") or []
+    resolved = snap.get("resolved") or []
+
+    lines = [
+        f"🚨 {title}",
+        f"Status: {snap.get('status')}",
+        f"Health Score: {hs.get('score', 0)}/100 — {hs.get('label', 'N/A')}",
+        f"Pipeline: {snap.get('pipeline_status')}",
+        f"Alertas ativos: {snap.get('alerts_count', 0)} | Para notificar: {snap.get('alerts_to_notify_count', 0)} | Resolvidos: {snap.get('resolved_count', 0)}",
+        f"Resumo: {snap.get('executive_summary')}",
+    ]
+
+    reasons = hs.get("reasons") or []
+    if reasons:
+        lines += ["", "Motivos do Health Score:"]
+        for reason in reasons[:6]:
+            lines.append(f"- {reason}")
+
+    if alerts:
+        lines += ["", "Alertas ativos:"]
+        for alert in alerts[:8]:
+            level = alert.get("level", "INFO")
+            category = alert.get("category", "SYSTEM")
+            title = alert.get("title") or alert.get("code") or "Alerta"
+            action = alert.get("action")
+            line = f"- {level} | {category} | {title}"
+            if action:
+                line += f" — ação: {action}"
+            lines.append(line)
+    else:
+        lines += ["", "Nenhum alerta executivo ativo."]
+
+    if resolved:
+        lines += ["", "Recuperações recentes:"]
+        for item in resolved[:5]:
+            lines.append(f"- {item.get('title', 'Alerta resolvido')} | {item.get('generated_at')}")
+
+    return "\n".join(lines)
+
 def build_executive_report():
     status = central_watchdog_status()
     exposure_snapshot = central_exposure_snapshot()
@@ -5716,7 +5831,10 @@ def build_executive_report():
         f"Data/hora: {data_hora_sp_str()}",
         "",
         f"Status operacional: {status.get('status')}",
-        f"Health Score: {score.get('score')}/100 — {score.get('label')}",
+        f"Health Score Central: {score.get('score')}/100 — {score.get('label')}",
+        "",
+        _executive_alerts_report_block(),
+        "",
         f"Risco direcional: {risk_status}",
         f"Memória: {mem.get('rss_mb')} MB ({mem.get('usage_pct')}%)",
         f"Execução real: {'ATIVA' if ENABLE_REAL_TRADING else 'BLOQUEADA'} | Modo: {EXECUTION_MODE}",
@@ -6374,24 +6492,28 @@ def _compact_decisionlog_block(limit=120):
 
 
 def _compact_alerts_block():
-    status = central_watchdog_status()
-    mem = memory_snapshot("executive_alerts_memory", store=True)
-    alerts = []
-    if not status.get("ok"):
-        alerts.extend(status.get("reasons", []) or [])
-    if mem.get("usage_pct") and mem.get("usage_pct") >= MEMORY_ALERT_THRESHOLD_PCT:
-        alerts.append(f"Memória alta: {mem.get('usage_pct')}%")
-    for key, err in LOAD_ERRORS.items():
-        if err:
-            alerts.append(f"{key}: erro de carregamento: {err}")
+    """Bloco de alertas agora usa o Executive Alert Manager como fonte principal."""
+    try:
+        return _executive_alerts_report_block("ALERTAS EXECUTIVOS")
+    except Exception as exc:
+        status = central_watchdog_status()
+        mem = memory_snapshot("executive_alerts_memory", store=True)
+        alerts = []
+        if not status.get("ok"):
+            alerts.extend(status.get("reasons", []) or [])
+        if mem.get("usage_pct") and mem.get("usage_pct") >= MEMORY_ALERT_THRESHOLD_PCT:
+            alerts.append(f"Memória alta: {mem.get('usage_pct')}%")
+        for key, err in LOAD_ERRORS.items():
+            if err:
+                alerts.append(f"{key}: erro de carregamento: {err}")
 
-    lines = ["🚨 ALERTAS"]
-    if alerts:
-        for item in alerts[:12]:
-            lines.append(f"- {item}")
-    else:
-        lines.append("- Nenhum alerta crítico no momento.")
-    return "\n".join(lines)
+        lines = ["🚨 ALERTAS", f"Executive Alert Manager indisponível: {exc}"]
+        if alerts:
+            for item in alerts[:12]:
+                lines.append(f"- {item}")
+        else:
+            lines.append("- Nenhum alerta crítico no fallback.")
+        return "\n".join(lines)
 
 
 def _compact_execution_pipeline_block():
@@ -6507,10 +6629,17 @@ def build_executive_dashboard_json():
     except Exception:
         pass
 
+    executive_alerts = _executive_alerts_snapshot_for_reports(check_only=True)
+    executive_alert_health = executive_alerts.get("health_score") or {}
+
     return {
         "generated_at": data_hora_sp_str(),
-        "status": watchdog.get("status", "OK"),
-        "health_score": 100 if watchdog.get("ok", True) else 70,
+        "status": executive_alerts.get("status") or watchdog.get("status", "OK"),
+        "health_score": int(executive_alert_health.get("score", 100) or 100),
+        "health_label": executive_alert_health.get("label", "EXCELENTE"),
+        "watchdog_status": watchdog.get("status", "OK"),
+        "central_watchdog_health_score": 100 if watchdog.get("ok", True) else 70,
+        "executive_alerts": executive_alerts,
         "real_execution_enabled": bool(ENABLE_REAL_TRADING),
         "execution_mode": EXECUTION_MODE,
         "memory_mb": memory_mb or 0,
@@ -6553,6 +6682,11 @@ def build_ceo_daily_report():
         f"Uso de Memória (Render): {float(executive.get('memory_pct') or 0):.1f}%",
         f"Risco Operacional: {risk_status}",
         f"Confiança Estatística: {float(confidence or 0):.1f}%",
+        "",
+        "════════════════════════════",
+        "EXECUTIVE ALERT MANAGER",
+        "════════════════════════════",
+        _executive_alerts_report_block(),
         "",
         "════════════════════════════",
         "PIPELINE",
