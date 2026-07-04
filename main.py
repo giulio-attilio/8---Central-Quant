@@ -4651,6 +4651,94 @@ def _risk_is_reduce_only(payload):
     return str(value or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
 
 
+
+
+def _executive_policy_for_can_open_trade():
+    """
+    Consulta o Executive Decision Engine para o Risk Manager.
+
+    Esta função é deliberadamente segura:
+    - Se o Executive Decision Engine falhar, não derruba /can_open_trade.
+    - A decisão final continua sendo do Risk Manager, mas agora ele respeita
+      flags executivas como NO_NEW_LONG, NO_NEW_SHORT e HALT_NEW_ENTRIES.
+    - Não envia Telegram, não altera estado e não executa ordens.
+    """
+    try:
+        if "_executive_decision_snapshot_for_reports" not in globals():
+            return {"ok": False, "available": False, "error": "executive decision helper unavailable"}
+
+        payload = _executive_decision_snapshot_for_reports(compact_source=True)
+        if not isinstance(payload, dict):
+            return {"ok": False, "available": False, "error": "executive decision payload invalid"}
+
+        policy = payload.get("policy") or {}
+        if not isinstance(policy, dict):
+            policy = {}
+
+        primary = payload.get("primary_decision") or payload.get("primary_directive", {}).get("code")
+        return {
+            "ok": bool(payload.get("ok", True)),
+            "available": True,
+            "primary_decision": primary,
+            "primary_directive": payload.get("primary_directive") or {},
+            "policy": policy,
+            "assistant_action": payload.get("assistant_action"),
+            "generated_at": payload.get("generated_at"),
+            "version": payload.get("version"),
+            "risk": payload.get("risk") or {},
+            "ceo_confidence": payload.get("ceo_confidence") or {},
+        }
+    except Exception as exc:
+        return {"ok": False, "available": False, "error": str(exc)}
+
+
+def _apply_executive_policy_to_risk_reasons(side, reasons, warnings):
+    """
+    Aplica a política do Executive Decision Engine dentro do /can_open_trade.
+
+    Bloqueios efetivos na V1:
+    - allow_new_entries == False  -> DENY qualquer nova entrada.
+    - allow_new_long == False     -> DENY novas entradas LONG/BUY.
+    - allow_new_short == False    -> DENY novas entradas SHORT/SELL.
+
+    Avisos:
+    - allow_expansion == False    -> warning operacional, mas não bloqueia SHORT
+      quando a política principal é NO_NEW_LONG, porque SHORT pode reduzir a
+      concentração direcional dominante.
+    - allow_risk_increase == False -> warning para não aumentar risco estrutural.
+    """
+    policy_payload = _executive_policy_for_can_open_trade()
+    policy = policy_payload.get("policy") or {}
+    primary = policy_payload.get("primary_decision") or "UNKNOWN"
+    normalized_side = str(side or "").upper().strip()
+    if normalized_side == "BUY":
+        normalized_side = "LONG"
+    elif normalized_side == "SELL":
+        normalized_side = "SHORT"
+
+    if not policy_payload.get("available"):
+        warnings.append(f"Executive Decision Engine indisponível para política: {policy_payload.get('error')}")
+        return policy_payload
+
+    if policy.get("allow_new_entries") is False:
+        reasons.append(f"Executive Decision Engine {primary}: novas entradas bloqueadas")
+
+    if normalized_side == "LONG" and policy.get("allow_new_long") is False:
+        release = policy.get("release_condition") or "condição de liberação não informada"
+        reasons.append(f"Executive Decision Engine {primary}: novas entradas LONG bloqueadas ({release})")
+
+    if normalized_side == "SHORT" and policy.get("allow_new_short") is False:
+        release = policy.get("release_condition") or "condição de liberação não informada"
+        reasons.append(f"Executive Decision Engine {primary}: novas entradas SHORT bloqueadas ({release})")
+
+    if policy.get("allow_expansion") is False:
+        warnings.append(f"Executive Decision Engine {primary}: expansão estrutural bloqueada")
+
+    if policy.get("allow_risk_increase") is False:
+        warnings.append(f"Executive Decision Engine {primary}: aumento de risco estrutural bloqueado")
+
+    return policy_payload
+
 def can_open_trade_decision(payload: dict):
     """
     Risk Manager decisório da Central.
@@ -4748,6 +4836,7 @@ def can_open_trade_decision(payload: dict):
 
     reasons = []
     warnings = []
+    executive_policy_payload = None
 
     if reduce_only and GLOBAL_RISK_ALLOW_REDUCE_ONLY:
         decision_result = {
@@ -4761,6 +4850,7 @@ def can_open_trade_decision(payload: dict):
             "reduce_only": True,
             "reasons": [],
             "warnings": ["reduceOnly/fechamento permitido mesmo com travas de risco"],
+            "executive_policy": _executive_policy_for_can_open_trade(),
             "memory": memory_risk,
             "exposure": {
                 "total": risk_total_pos,
@@ -4797,6 +4887,10 @@ def can_open_trade_decision(payload: dict):
         reasons.append(f"bot inválido: {bot}")
     if symbol and REAL_TRADING_ALLOWED_SYMBOLS and symbol not in REAL_TRADING_ALLOWED_SYMBOLS:
         reasons.append(f"símbolo não liberado para real: {symbol}")
+
+    # Política executiva decidida pela camada superior da Central.
+    # Exemplo atual esperado: NO_NEW_LONG enquanto concentração LONG >= 85%.
+    executive_policy_payload = _apply_executive_policy_to_risk_reasons(side, reasons, warnings)
 
     # Hard blocks globais da Central, valem para PAPER/VERIFY/LIVE.
     if memory_risk.get("blocked"):
@@ -4895,6 +4989,7 @@ def can_open_trade_decision(payload: dict):
         "reduce_only": reduce_only,
         "reasons": reasons,
         "warnings": warnings,
+        "executive_policy": executive_policy_payload,
         "bingx_divergence": divergence_warning,
         "memory": memory_risk,
         "exposure": {
