@@ -17354,6 +17354,451 @@ def market_regime_detector_v1_short_route():
     return {"ok": True, "payload": payload, "text": text}
 
 
+
+# ============================================================
+# CORRELATION ENGINE V1 — CENTRAL QUANT
+# Version: 2026-07-04-CORRELATION-ENGINE-V1
+# Machine-first internal module. It does not execute orders.
+# It estimates hidden concentration across correlated crypto clusters
+# and acts as an additional gate before Meta/Decision/Execution flows.
+# ============================================================
+
+CORRELATION_ENGINE_V1_VERSION = "2026-07-04-CORRELATION-ENGINE-V1"
+
+
+def _ce_safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _ce_safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _ce_round(value, nd=4):
+    try:
+        return round(float(value), nd)
+    except Exception:
+        return value
+
+
+def _ce_symbol_clean(symbol):
+    s = str(symbol or "").upper().strip()
+    s = s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "")
+    s = s.replace("PERP", "").replace("-", "")
+    if s and not s.endswith("USDT") and s not in {"BTC", "ETH", "SOL"}:
+        # Keep raw symbols like BTC/ETH clean but do not force unknown suffixes.
+        pass
+    return s
+
+
+def _ce_base_asset(symbol):
+    s = _ce_symbol_clean(symbol)
+    if s.endswith("USDT"):
+        return s[:-4]
+    return s
+
+
+def _ce_primary_cluster_for_symbol(symbol):
+    base = _ce_base_asset(symbol)
+    # Static crypto correlation map V1. This is intentionally conservative;
+    # Market Regime V2 may replace it with rolling return correlations.
+    if base in {"BTC", "ETH", "BNB", "SOL", "AVAX", "LINK", "LTC", "BCH", "DOT", "NEAR", "INJ", "ATOM", "SUI", "APT", "ADA", "XRP", "TRX", "UNI"}:
+        return "MAJOR_BETA"
+    if base in {"DOGE", "WIF", "PEPE", "1000PEPE", "SHIB", "BONK", "FLOKI", "MEME", "BOME", "TURBO"}:
+        return "MEME_BETA"
+    if base in {"FET", "TAO", "RNDR", "RENDER", "WLD", "AI", "AGIX", "OCEAN", "ARKM", "GRT"}:
+        return "AI_BETA"
+    if base in {"AAVE", "UNI", "MKR", "COMP", "SNX", "CRV", "PENDLE", "LDO", "RUNE"}:
+        return "DEFI_BETA"
+    if base in {"FIL", "AR", "STX", "TIA", "SEI", "HBAR", "OP", "ARB", "JUP", "HYPE", "ENA", "RAY"}:
+        return "ALT_BETA"
+    return "OTHER_BETA"
+
+
+def _ce_symbol_clusters(symbol):
+    base = _ce_base_asset(symbol)
+    clusters = {_ce_primary_cluster_for_symbol(symbol)}
+    # Add broader overlays for hidden correlation.
+    if base in {"BTC", "ETH", "SOL", "BNB", "AVAX", "ADA", "XRP", "LINK", "SUI", "LTC", "BCH"}:
+        clusters.add("CRYPTO_CORE")
+    if base not in {"BTC", "ETH"}:
+        clusters.add("ALTCOIN_BETA")
+    if base in {"SOL", "JUP", "RAY", "WIF", "BONK"}:
+        clusters.add("SOL_ECOSYSTEM")
+    if base in {"BTC", "ETH"}:
+        clusters.add("MARKET_ANCHOR")
+    return sorted(clusters)
+
+
+def _ce_cluster_policy_from_pressure(positions, pct, same_symbol_count=0, side=None, net_direction=None):
+    side = str(side or "").upper()
+    net_direction = str(net_direction or "").upper()
+    action = "ALLOW_CLUSTER_NORMAL"
+    gate = "ALLOW_IF_DECISION_ENGINE_APPROVES"
+    multiplier = 1.0
+    severity = "LOW"
+    reasons = []
+
+    if same_symbol_count >= 1:
+        action = "REDUCE_OR_BLOCK_SAME_SYMBOL"
+        gate = "BLOCK_OR_REQUIRE_EXCEPTION_FOR_SAME_SYMBOL"
+        multiplier = min(multiplier, 0.15)
+        severity = "HIGH"
+        reasons.append("Já existe exposição no mesmo ativo; evitar duplicar risco específico.")
+
+    if positions >= 8 or pct >= 55:
+        action = "COMPRESS_CLUSTER_RISK"
+        gate = "ALLOW_ONLY_HIGH_QUALITY_OR_HEDGE"
+        multiplier = min(multiplier, 0.25)
+        severity = "HIGH"
+        reasons.append("Cluster concentrado; novo risco deve ser comprimido ou exigir qualidade excepcional.")
+    elif positions >= 5 or pct >= 35:
+        action = "REDUCE_CLUSTER_RISK"
+        gate = "REDUCE_SIZE_OR_WAIT"
+        multiplier = min(multiplier, 0.5)
+        severity = "MEDIUM"
+        reasons.append("Cluster com exposição relevante; reduzir tamanho de novos sinais.")
+    elif positions >= 3 or pct >= 20:
+        action = "WATCH_CLUSTER_RISK"
+        gate = "ALLOW_WITH_CORRELATION_AWARE_SIZING"
+        multiplier = min(multiplier, 0.75)
+        severity = "WATCH"
+        reasons.append("Cluster com exposição moderada; acompanhar correlação antes de ampliar.")
+
+    if side and net_direction and side == net_direction and net_direction in {"LONG", "SHORT"} and severity in {"MEDIUM", "HIGH", "WATCH"}:
+        multiplier = min(multiplier, 0.5)
+        if "Novo sinal aumenta a direção líquida atual do portfólio." not in reasons:
+            reasons.append("Novo sinal aumenta a direção líquida atual do portfólio.")
+        if severity == "WATCH":
+            severity = "MEDIUM"
+
+    return {
+        "action": action,
+        "signal_gate": gate,
+        "risk_multiplier": _ce_round(multiplier, 4),
+        "severity": severity,
+        "reasons": reasons or ["Cluster sem concentração crítica detectada."],
+    }
+
+
+def _ce_get_exposure_summary(capital=10000.0):
+    try:
+        if "build_bot_exposure_manager_v21" in globals():
+            data = build_bot_exposure_manager_v21(capital=capital)
+            if isinstance(data, dict):
+                return data.get("summary") or data.get("payload", {}).get("summary") or {}
+    except Exception:
+        pass
+    try:
+        if "_mrd_get_exposure_summary" in globals():
+            return _mrd_get_exposure_summary(capital=capital) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ce_get_market_regime(capital=10000.0):
+    try:
+        if "build_market_regime_detector_v1" in globals():
+            return build_market_regime_detector_v1(capital=capital) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ce_get_meta_strategy(capital=10000.0):
+    try:
+        if "build_meta_strategy_engine_v11" in globals():
+            return build_meta_strategy_engine_v11(capital=capital) or {}
+    except Exception:
+        pass
+    try:
+        if "_mrd_get_meta_context" in globals():
+            return _mrd_get_meta_context(capital=capital) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _ce_build_cluster_book(symbol_counts, capital=10000.0):
+    total_positions = sum(_ce_safe_int(v, 0) for v in (symbol_counts or {}).values()) or 0
+    cluster_book = {}
+    symbol_details = []
+    for raw_symbol, count in (symbol_counts or {}).items():
+        symbol = _ce_symbol_clean(raw_symbol)
+        count = _ce_safe_int(count, 0)
+        clusters = _ce_symbol_clusters(symbol)
+        primary_cluster = _ce_primary_cluster_for_symbol(symbol)
+        detail = {
+            "symbol": symbol,
+            "base": _ce_base_asset(symbol),
+            "count": count,
+            "primary_cluster": primary_cluster,
+            "clusters": clusters,
+        }
+        symbol_details.append(detail)
+        for cluster in clusters:
+            item = cluster_book.setdefault(cluster, {
+                "cluster": cluster,
+                "positions": 0,
+                "symbols": {},
+                "symbols_count": 0,
+                "position_pct": 0.0,
+                "estimated_cluster_capital_usdt": 0.0,
+                "severity": "LOW",
+            })
+            item["positions"] += count
+            item["symbols"][symbol] = item["symbols"].get(symbol, 0) + count
+    estimated_capital_per_position = 0.0
+    if total_positions > 0:
+        estimated_capital_per_position = _ce_safe_float(capital, 10000.0) / max(total_positions, 1)
+    for item in cluster_book.values():
+        item["symbols_count"] = len(item.get("symbols") or {})
+        item["position_pct"] = _ce_round((item.get("positions", 0) / total_positions * 100.0) if total_positions else 0.0, 2)
+        item["estimated_cluster_capital_usdt"] = _ce_round(item.get("positions", 0) * estimated_capital_per_position, 4)
+        pct = _ce_safe_float(item.get("position_pct"), 0.0)
+        pos = _ce_safe_int(item.get("positions"), 0)
+        if pos >= 8 or pct >= 55:
+            item["severity"] = "HIGH"
+        elif pos >= 5 or pct >= 35:
+            item["severity"] = "MEDIUM"
+        elif pos >= 3 or pct >= 20:
+            item["severity"] = "WATCH"
+        else:
+            item["severity"] = "LOW"
+    return cluster_book, symbol_details, total_positions
+
+
+def build_correlation_engine_v1(capital=10000.0, symbol=None, side=None, bot=None, setup=None):
+    generated_at = data_hora_sp_str() if "data_hora_sp_str" in globals() else ""
+    exposure = _ce_get_exposure_summary(capital=capital)
+    market_regime = _ce_get_market_regime(capital=capital)
+    meta_strategy = _ce_get_meta_strategy(capital=capital)
+
+    symbols = exposure.get("symbols") or {}
+    cluster_book, symbol_details, total_positions = _ce_build_cluster_book(symbols, capital=capital)
+    net_direction = str(exposure.get("net_direction") or market_regime.get("exposure_regime", {}).get("net_direction") or "FLAT").upper()
+
+    primary_cluster = None
+    signal_clusters = []
+    signal_symbol = _ce_symbol_clean(symbol) if symbol else None
+    same_symbol_count = 0
+    signal_policy = None
+    if signal_symbol:
+        primary_cluster = _ce_primary_cluster_for_symbol(signal_symbol)
+        signal_clusters = _ce_symbol_clusters(signal_symbol)
+        same_symbol_count = _ce_safe_int(symbols.get(signal_symbol) or symbols.get(signal_symbol.upper()), 0)
+        # Some stored symbols may not be normalized.
+        if same_symbol_count <= 0:
+            for k, v in symbols.items():
+                if _ce_symbol_clean(k) == signal_symbol:
+                    same_symbol_count += _ce_safe_int(v, 0)
+        cluster_pressures = []
+        for cluster in signal_clusters:
+            c = cluster_book.get(cluster) or {"positions": 0, "position_pct": 0.0, "symbols": {}}
+            policy = _ce_cluster_policy_from_pressure(
+                positions=_ce_safe_int(c.get("positions"), 0),
+                pct=_ce_safe_float(c.get("position_pct"), 0.0),
+                same_symbol_count=same_symbol_count if cluster == primary_cluster else 0,
+                side=side,
+                net_direction=net_direction,
+            )
+            cluster_pressures.append({
+                "cluster": cluster,
+                "positions": _ce_safe_int(c.get("positions"), 0),
+                "position_pct": _ce_safe_float(c.get("position_pct"), 0.0),
+                "symbols": c.get("symbols") or {},
+                **policy,
+            })
+        # Binding policy is the lowest multiplier / highest severity.
+        severity_rank = {"LOW": 0, "WATCH": 1, "MEDIUM": 2, "HIGH": 3}
+        binding = sorted(cluster_pressures, key=lambda x: (_ce_safe_float(x.get("risk_multiplier"), 1.0), -severity_rank.get(x.get("severity"), 0)))[0] if cluster_pressures else None
+        signal_policy = {
+            "bot": str(bot or "").upper() or None,
+            "setup": setup,
+            "symbol": signal_symbol,
+            "side": str(side or "").upper() or None,
+            "primary_cluster": primary_cluster,
+            "clusters": signal_clusters,
+            "same_symbol_count": same_symbol_count,
+            "cluster_pressures": cluster_pressures,
+            "binding_cluster": binding.get("cluster") if binding else None,
+            "correlation_action": binding.get("action") if binding else "ALLOW_CLUSTER_NORMAL",
+            "signal_gate": binding.get("signal_gate") if binding else "ALLOW_IF_DECISION_ENGINE_APPROVES",
+            "risk_multiplier": _ce_round(binding.get("risk_multiplier", 1.0) if binding else 1.0, 4),
+            "severity": binding.get("severity") if binding else "LOW",
+            "reasons": (binding.get("reasons") if binding else ["Sem cluster relevante detectado."]),
+        }
+
+    # Portfolio-level hidden concentration.
+    sorted_clusters = sorted(cluster_book.values(), key=lambda x: (_ce_safe_int(x.get("positions"), 0), _ce_safe_float(x.get("position_pct"), 0.0)), reverse=True)
+    top_cluster = sorted_clusters[0] if sorted_clusters else None
+    high_clusters = [c for c in sorted_clusters if c.get("severity") == "HIGH"]
+    medium_clusters = [c for c in sorted_clusters if c.get("severity") == "MEDIUM"]
+    watch_clusters = [c for c in sorted_clusters if c.get("severity") == "WATCH"]
+
+    alerts = []
+    if top_cluster and top_cluster.get("severity") in {"HIGH", "MEDIUM"}:
+        alerts.append(f"Cluster dominante {top_cluster.get('cluster')} com {top_cluster.get('positions')} posições ({top_cluster.get('position_pct')}%).")
+    if signal_policy and signal_policy.get("severity") in {"HIGH", "MEDIUM"}:
+        alerts.append(f"Novo sinal em cluster correlacionado exige compressão: {signal_policy.get('binding_cluster')}.")
+    if signal_policy and signal_policy.get("same_symbol_count", 0) > 0:
+        alerts.append(f"Ativo {signal_policy.get('symbol')} já possui exposição aberta; evitar duplicação.")
+    if net_direction in {"LONG", "SHORT"}:
+        alerts.append(f"Portfólio líquido {net_direction}; correlação deve evitar reforçar a mesma direção sem qualidade excepcional.")
+
+    automation_policy = {
+        "correlation_engine_ready": True,
+        "human_report_required": False,
+        "route_new_signals_to": "MARKET_REGIME_THEN_META_THEN_CORRELATION_THEN_DECISION_SCORE",
+        "correlation_gate_required": True,
+        "default_policy": "ALLOW_IF_CLUSTER_AND_DECISION_ENGINE_APPROVE",
+        "dominant_cluster": top_cluster.get("cluster") if top_cluster else None,
+        "dominant_cluster_severity": top_cluster.get("severity") if top_cluster else None,
+        "high_risk_clusters": [c.get("cluster") for c in high_clusters],
+        "compressed_clusters": [c.get("cluster") for c in high_clusters + medium_clusters],
+        "watch_clusters": [c.get("cluster") for c in watch_clusters],
+        "signal_policy": signal_policy,
+        "blocked_actions": [
+            "BYPASS_CORRELATION_GATE",
+            "ADD_SAME_SYMBOL_WITHOUT_EXCEPTION",
+            "ADD_HIGH_CORRELATION_CLUSTER_WITHOUT_DECISION_SCORE",
+        ],
+    }
+
+    payload = {
+        "ok": True,
+        "version": CORRELATION_ENGINE_V1_VERSION,
+        "generated_at": generated_at,
+        "mode": "OBSERVATION_ONLY",
+        "capital": _ce_round(capital, 4),
+        "market_data_used": False,
+        "source": "STATIC_CRYPTO_CLUSTER_MAP_PLUS_EXPOSURE_PROXY_V1",
+        "portfolio_state": market_regime.get("portfolio_state") or meta_strategy.get("portfolio_state"),
+        "market_regime": {
+            "regime": market_regime.get("regime"),
+            "regime_family": market_regime.get("regime_family"),
+            "confidence": market_regime.get("confidence"),
+            "source": market_regime.get("source"),
+        },
+        "exposure_summary": {
+            "positions": total_positions,
+            "net_direction": net_direction,
+            "long": exposure.get("long"),
+            "short": exposure.get("short"),
+            "capital_used": exposure.get("capital_used"),
+            "capital_usage_pct": exposure.get("capital_usage_pct"),
+            "risk_used_usdt": exposure.get("risk_used_usdt"),
+        },
+        "cluster_book": {k: v for k, v in sorted(cluster_book.items())},
+        "cluster_rank": sorted_clusters,
+        "top_cluster": top_cluster,
+        "signal_policy": signal_policy,
+        "automation_policy": automation_policy,
+        "alerts": alerts,
+        "notes": [
+            "Correlation Engine V1 é machine-first e não depende de relatório humano.",
+            "V1 usa mapa estático de clusters cripto e exposição aberta como proxy de correlação; não usa candles/retornos ainda.",
+            "O gate de correlação deve rodar antes do Decision Score/Execution Policy para evitar concentração oculta.",
+            "Correlation Engine V2 deve incorporar correlação real por retornos, beta dinâmico, regime de mercado e volatilidade.",
+        ],
+    }
+    return payload
+
+
+def build_correlation_engine_v1_text(capital=10000.0, symbol=None, side=None, bot=None, setup=None):
+    payload = build_correlation_engine_v1(capital=capital, symbol=symbol, side=side, bot=bot, setup=setup)
+    exp = payload.get("exposure_summary") or {}
+    m = payload.get("market_regime") or {}
+    sig = payload.get("signal_policy") or {}
+    auto = payload.get("automation_policy") or {}
+    lines = [
+        "🔗 CORRELATION ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Estado de correlação:",
+        f"Fonte: {payload.get('source')} | Market data usado: {payload.get('market_data_used')}",
+        f"Regime: {m.get('regime')} | Família: {m.get('regime_family')} | Confiança: {m.get('confidence')}",
+        f"Exposição: posições {exp.get('positions')} | LONG {exp.get('long')} | SHORT {exp.get('short')} | Net {exp.get('net_direction')}",
+        f"Capital usado: {exp.get('capital_usage_pct')}% | Risco aberto: {exp.get('risk_used_usdt')} USDT",
+        "",
+        "Política autônoma:",
+        f"Correlation gate required: {auto.get('correlation_gate_required')} | Human report required: {auto.get('human_report_required')}",
+        f"Rota: {auto.get('route_new_signals_to')}",
+        f"Cluster dominante: {auto.get('dominant_cluster')} | Severidade: {auto.get('dominant_cluster_severity')}",
+        f"Compressed clusters: {', '.join(auto.get('compressed_clusters') or []) or 'None'}",
+        f"Watch clusters: {', '.join(auto.get('watch_clusters') or []) or 'None'}",
+        "",
+    ]
+    if sig:
+        lines += [
+            "Política do sinal avaliado:",
+            f"Bot: {sig.get('bot')} | Ativo: {sig.get('symbol')} | Side: {sig.get('side')}",
+            f"Primary cluster: {sig.get('primary_cluster')} | Clusters: {', '.join(sig.get('clusters') or [])}",
+            f"Ação: {sig.get('correlation_action')} | Gate: {sig.get('signal_gate')} | Risk mult: {sig.get('risk_multiplier')} | Severidade: {sig.get('severity')}",
+            f"Same symbol count: {sig.get('same_symbol_count')} | Binding cluster: {sig.get('binding_cluster')}",
+            "Motivos:",
+        ]
+        for r in sig.get("reasons") or []:
+            lines.append(f"- {r}")
+        lines.append("")
+
+    lines.append("Ranking de clusters:")
+    for c in payload.get("cluster_rank") or []:
+        lines.append(f"- {c.get('cluster')}: posições={c.get('positions')} | pct={c.get('position_pct')}% | símbolos={c.get('symbols_count')} | severidade={c.get('severity')}")
+    lines += ["", "Alertas:"]
+    for a in payload.get("alerts") or []:
+        lines.append(f"- {a}")
+    lines += ["", "Notas:"]
+    for n in payload.get("notes") or []:
+        lines.append(f"- {n}")
+    return "\n".join(lines), payload
+
+
+@app.route("/correlation/engine/v1", methods=["GET", "POST"])
+@app.route("/correlation/v1", methods=["GET", "POST"])
+def correlation_engine_v1_route():
+    body = request.get_json(silent=True) or {}
+    capital = _ce_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    symbol = body.get("symbol") or request.args.get("symbol")
+    side = body.get("side") or request.args.get("side")
+    bot = body.get("bot") or request.args.get("bot")
+    setup = body.get("setup") or request.args.get("setup")
+    text, payload = build_correlation_engine_v1_text(capital=capital, symbol=symbol, side=side, bot=bot, setup=setup)
+    return {"ok": True, "payload": payload, "text": text}
+
+
+@app.route("/correlation/summary/v1", methods=["GET", "POST"])
+def correlation_engine_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    capital = _ce_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    payload = build_correlation_engine_v1(capital=capital)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "market_regime": payload.get("market_regime"),
+        "exposure_summary": payload.get("exposure_summary"),
+        "top_cluster": payload.get("top_cluster"),
+        "cluster_rank": payload.get("cluster_rank"),
+        "automation_policy": payload.get("automation_policy"),
+        "alerts": payload.get("alerts"),
+    }
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
