@@ -6365,7 +6365,7 @@ def _compact_execution_pipeline_block():
             "Observação: este erro não impede o restante do relatório diário."
         )
     
-    
+
 def build_executive_report_daily():
     """
     Relatório diário unificado para análise no ChatGPT.
@@ -6424,6 +6424,18 @@ def build_executive_report_daily():
     text = "\n\n".join([str(x).strip() for x in parts if str(x).strip()])
     force_gc_if_needed("executive_report_daily_end", force=True)
     return text
+
+
+def build_daily_ceo_report():
+
+    lines = []
+
+    lines.append("📦 CEO DAILY REPORT — CENTRAL QUANT")
+    lines.append("")
+    lines.append(f"Data/hora: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def _month_bounds_previous(now=None):
