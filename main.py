@@ -11190,6 +11190,355 @@ def dynamic_position_sizing_v11_summary_route():
         },
     }
 
+# ==========================================================
+# EXECUTION POLICY ENGINE V1 - CENTRAL QUANT
+# ==========================================================
+
+EXECUTION_POLICY_ENGINE_V1_VERSION = "2026-07-04-EXECUTION-POLICY-ENGINE-V1"
+EXECUTION_POLICY_ENGINE_V1_MODE = "OBSERVATION_ONLY"
+EXECUTION_POLICY_ENGINE_V1_CACHE = {"last_payload": None, "last_generated_at": None, "last_capital": None}
+
+
+def _epe_safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _epe_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "live"}
+
+
+def _epe_normalize_side(value):
+    side = str(value or "").upper().strip()
+    if side == "BUY":
+        return "LONG"
+    if side == "SELL":
+        return "SHORT"
+    return side
+
+
+def _epe_vote(module, vote, weight=1.0, reason="", details=None):
+    vote = str(vote or "WAIT").upper().strip()
+    if vote not in {"ALLOW", "REDUCE", "WAIT", "DENY", "INFO"}:
+        vote = "WAIT"
+    return {"module": str(module), "vote": vote, "weight": round(_epe_safe_float(weight, 1.0), 4), "reason": str(reason or ""), "details": details or {}}
+
+
+def _epe_final_decision(votes, sizing_item=None, intended_live=False, real_trading_enabled=False):
+    vals = [str(v.get("vote") or "INFO").upper() for v in (votes or [])]
+    if "DENY" in vals:
+        base = "DENY"
+    elif "WAIT" in vals:
+        base = "WAIT"
+    elif "REDUCE" in vals:
+        base = "REDUCE"
+    else:
+        base = "ALLOW"
+    if intended_live and not real_trading_enabled and base == "ALLOW":
+        base = "WAIT"
+    if sizing_item:
+        action = str(sizing_item.get("sizing_action") or "").upper()
+        if "DO_NOT_OPEN" in action:
+            base = "DENY"
+        elif ("CAP_LIMITED" in action or "REDUCED" in action) and base == "ALLOW":
+            base = "REDUCE"
+    return base
+
+
+def _epe_confidence_score(votes, final_decision, sizing_item=None):
+    votes = votes or []
+    if not votes:
+        return 50.0
+    final_decision = str(final_decision or "WAIT").upper()
+    total = sum(_epe_safe_float(v.get("weight"), 1.0) for v in votes) or 1.0
+    agree = sum(_epe_safe_float(v.get("weight"), 1.0) for v in votes if str(v.get("vote") or "").upper() == final_decision)
+    if final_decision == "REDUCE":
+        agree += 0.35 * sum(_epe_safe_float(v.get("weight"), 1.0) for v in votes if str(v.get("vote") or "").upper() in {"ALLOW", "WAIT"})
+    score = 45.0 + 55.0 * (agree / total)
+    if sizing_item:
+        util = _epe_safe_float(sizing_item.get("risk_budget_utilization_pct"), 0.0)
+        if util < 5:
+            score -= 5
+        elif util > 80:
+            score += 3
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _epe_capital_allocator_check(capital, bot, required_capital, required_risk):
+    try:
+        import capital_allocator
+        result = capital_allocator.capital_check(capital=capital, bot=bot, required=required_capital, risk=required_risk)
+        return result if isinstance(result, dict) else {"ok": False, "error": str(result)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _epe_vote_from_capital_allocator(result):
+    if not isinstance(result, dict) or not result.get("ok"):
+        return _epe_vote("Capital Allocator", "INFO", 0.6, "Capital Allocator indisponível ou sem resposta válida.", result if isinstance(result, dict) else {})
+    decision = str(result.get("decision") or result.get("base_decision") or "").upper()
+    if decision in {"BLOCK", "DENY"}:
+        vote = "DENY"
+    elif "REDUCE" in decision:
+        vote = "REDUCE"
+    elif "ALLOW" in decision:
+        vote = "ALLOW"
+    else:
+        vote = "WAIT"
+    return _epe_vote("Capital Allocator", vote, 1.15, result.get("reason") or f"Capital Allocator retornou {decision}.", {
+        "decision": decision,
+        "capital_free": result.get("capital_free"),
+        "risk_free_usdt": result.get("risk_free_usdt"),
+        "required_capital": result.get("required_capital"),
+        "required_risk_usdt": result.get("required_risk_usdt"),
+        "suggested_required_capital": result.get("suggested_required_capital"),
+    })
+
+
+def _epe_vote_from_risk_manager(result):
+    if isinstance(result, tuple):
+        result = result[0]
+    if not isinstance(result, dict):
+        return _epe_vote("Risk Manager Global", "INFO", 0.7, "Risk Manager retornou resposta não estruturada.", {})
+    decision = str(result.get("decision") or ("ALLOW" if result.get("allowed") else "DENY")).upper()
+    vote = "ALLOW" if decision == "ALLOW" or result.get("allowed") is True else "DENY"
+    reasons = result.get("reasons") or []
+    warnings = result.get("warnings") or []
+    reason = "; ".join([str(x) for x in reasons[:3]]) or "; ".join([str(x) for x in warnings[:3]]) or f"Risk Manager retornou {decision}."
+    return _epe_vote("Risk Manager Global", vote, 1.4, reason, {"decision": decision, "allowed": result.get("allowed"), "reasons": reasons[:10], "warnings": warnings[:10], "exposure": result.get("exposure")})
+
+
+def _epe_vote_from_sizing(item):
+    if not isinstance(item, dict):
+        return _epe_vote("Dynamic Position Sizing V1.1", "WAIT", 1.2, "Sizing indisponível; aguardar cálculo válido.", {})
+    action = str(item.get("sizing_action") or "").upper()
+    executable = str(item.get("executable_size_state") or "").upper()
+    binding = item.get("binding_limit") or {}
+    util = _epe_safe_float(item.get("risk_budget_utilization_pct"), 0.0)
+    if "DO_NOT_OPEN" in action:
+        vote = "DENY"
+    elif "CAP_LIMITED" in action or "REDUCED" in action:
+        vote = "REDUCE"
+    elif "FULL_RISK" in action:
+        vote = "ALLOW"
+    else:
+        vote = "WAIT"
+    return _epe_vote("Dynamic Position Sizing V1.1", vote, 1.35, f"Sizing={action}; executável={executable}; limitador={binding.get('name')}; uso risk={round(util, 4)}%.", {
+        "sizing_action": action,
+        "strategic_priority": item.get("strategic_priority"),
+        "executable_size_state": executable,
+        "binding_limit": binding,
+        "paper_suggested_notional_usdt": item.get("paper_suggested_notional_usdt"),
+        "paper_suggested_margin_usdt": item.get("paper_suggested_margin_usdt"),
+        "paper_suggested_qty": item.get("paper_suggested_qty"),
+        "paper_effective_risk_usdt": item.get("paper_effective_risk_usdt"),
+        "risk_budget_utilization_pct": item.get("risk_budget_utilization_pct"),
+        "unused_risk_per_trade_usdt": item.get("unused_risk_per_trade_usdt"),
+    })
+
+
+def _epe_votes_from_advisor_budget(item):
+    if not isinstance(item, dict):
+        return []
+    advisor = str(item.get("advisor_action") or "").upper()
+    risk_state = str(item.get("risk_state") or "").upper()
+    policy = str(item.get("new_trade_policy") or "").upper()
+    if advisor == "PRIORITIZE" or risk_state == "PRIORITY":
+        return [_epe_vote("Portfolio Advisor / Risk Budget", "ALLOW", 1.0, "Robô está priorizado estrategicamente e possui risk budget prioritário.", {"advisor_action": advisor, "risk_state": risk_state})]
+    if advisor == "PAUSE_OR_REVIEW" or "PAUSE" in policy or risk_state == "DEFENSIVE_MINIMUM":
+        return [_epe_vote("Portfolio Advisor / Risk Budget", "DENY", 1.2, "Advisor/Risk Budget indicam pausa ou mínimo defensivo; não abrir nova entrada.", {"advisor_action": advisor, "risk_state": risk_state, "new_trade_policy": policy})]
+    if advisor == "REDUCE_OR_WAIT" or risk_state == "WAIT_REDUCED":
+        return [_epe_vote("Portfolio Advisor / Risk Budget", "WAIT", 1.0, "Advisor/Risk Budget indicam reduzir ou aguardar; não expandir agressivamente.", {"advisor_action": advisor, "risk_state": risk_state, "new_trade_policy": policy})]
+    if risk_state == "EXPERIMENTAL_CAPPED":
+        return [_epe_vote("Portfolio Advisor / Risk Budget", "REDUCE", 0.9, "Robô experimental: permitir apenas tamanho pequeno/controlado.", {"advisor_action": advisor, "risk_state": risk_state})]
+    return [_epe_vote("Portfolio Advisor / Risk Budget", "INFO", 0.5, "Sem política forte do Advisor/Risk Budget.", {"advisor_action": advisor, "risk_state": risk_state})]
+
+
+def _epe_request_payload_from_args(default_payload=None):
+    p = dict(default_payload or {})
+    for key in ["bot", "symbol", "side", "entry", "stop", "setup", "leverage", "capital", "mode", "intended_live"]:
+        val = request.args.get(key)
+        if val not in [None, ""]:
+            p[key] = val
+    return p
+
+
+def build_execution_policy_v1(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None):
+    global EXECUTION_POLICY_ENGINE_V1_CACHE
+    capital = _epe_safe_float(capital, 10000.0)
+    bot_norm = normalize_registry_bot(bot or "")
+    symbol_norm = normalize_registry_symbol(symbol or "")
+    side_norm = _epe_normalize_side(side)
+    mode_norm = str(mode or EXECUTION_MODE or "VERIFY").upper().strip()
+    intended_live_bool = _epe_bool(intended_live, mode_norm == "LIVE")
+    leverage_i = int(_dps_clip(_epe_safe_float(leverage, DEFAULT_REAL_LEVERAGE if "DEFAULT_REAL_LEVERAGE" in globals() else 3), 1, 50))
+    entry_f = _epe_safe_float(entry, None)
+    stop_f = _epe_safe_float(stop, None)
+
+    votes = []
+    missing = []
+    if not bot_norm:
+        missing.append("bot")
+    if not symbol_norm:
+        missing.append("symbol")
+    if side_norm not in {"LONG", "SHORT"}:
+        missing.append("side")
+    if entry_f is None:
+        missing.append("entry")
+    if stop_f is None:
+        missing.append("stop")
+    votes.append(_epe_vote("Input Validation", "WAIT" if missing else "ALLOW", 1.3 if missing else 0.8, "Campos ausentes para decisão executável: " + ", ".join(missing) if missing else "Entrada operacional completa para avaliação.", {"missing": missing}))
+
+    try:
+        sizing_payload = build_dynamic_position_sizing_v11(capital=capital, bot_filter=bot_norm or None, entry=entry_f, stop=stop_f, side=side_norm, leverage=leverage_i)
+    except Exception as exc:
+        sizing_payload = {"ok": False, "error": str(exc), "sizes": [], "summary": {}, "live_context": {}}
+    sizes = sizing_payload.get("sizes") or []
+    sizing_item = sizes[0] if sizes else None
+    votes.append(_epe_vote_from_sizing(sizing_item))
+    votes.extend(_epe_votes_from_advisor_budget(sizing_item))
+
+    suggested_notional = _epe_safe_float((sizing_item or {}).get("paper_suggested_notional_usdt"), 0.0)
+    suggested_margin = _epe_safe_float((sizing_item or {}).get("paper_suggested_margin_usdt"), 0.0)
+    suggested_qty = (sizing_item or {}).get("paper_suggested_qty")
+    effective_risk_usdt = _epe_safe_float((sizing_item or {}).get("paper_effective_risk_usdt"), 0.0)
+    effective_risk_pct = _epe_safe_float((sizing_item or {}).get("paper_effective_risk_pct"), 0.0)
+
+    capital_result = _epe_capital_allocator_check(capital, bot_norm, suggested_notional, effective_risk_usdt)
+    votes.append(_epe_vote_from_capital_allocator(capital_result))
+
+    risk_payload = {"bot": bot_norm, "symbol": symbol_norm, "side": side_norm, "entry": entry_f, "stop": stop_f, "setup": setup, "mode": mode_norm, "intended_live": intended_live_bool, "notional_usdt": suggested_notional, "margin_usdt": suggested_margin, "leverage": leverage_i, "risk_pct": effective_risk_pct, "source": "execution_policy_engine_v1"}
+    try:
+        risk_result = can_open_trade_decision(risk_payload)
+    except Exception as exc:
+        risk_result = {"allowed": False, "decision": "DENY", "reasons": [f"Erro no Risk Manager: {exc}"], "warnings": []}
+    votes.append(_epe_vote_from_risk_manager(risk_result))
+
+    live_context = sizing_payload.get("live_context") or {}
+    live_enabled = bool(live_context.get("real_trading_enabled"))
+    if intended_live_bool and not live_enabled:
+        votes.append(_epe_vote("Live Execution Context", "WAIT", 1.0, "Trade solicitado como LIVE, mas real trading está bloqueado ou sem capacidade.", live_context))
+    else:
+        votes.append(_epe_vote("Live Execution Context", "INFO", 0.4, "Contexto LIVE usado apenas como trava informativa nesta avaliação consultiva.", live_context))
+
+    final_decision = _epe_final_decision(votes, sizing_item=sizing_item, intended_live=intended_live_bool, real_trading_enabled=live_enabled)
+    confidence = _epe_confidence_score(votes, final_decision, sizing_item=sizing_item)
+    execution_action = {"ALLOW": "ALLOW_OBSERVATION", "REDUCE": "ALLOW_REDUCED_SIZE_OBSERVATION", "WAIT": "WAIT_OR_VERIFY_OBSERVATION", "DENY": "DENY_OBSERVATION"}.get(final_decision, "WAIT_OR_VERIFY_OBSERVATION")
+
+    reasons = [v.get("reason") for v in votes if str(v.get("vote") or "").upper() == final_decision and v.get("reason")]
+    if not reasons:
+        reasons = [v.get("reason") for v in votes if str(v.get("vote") or "").upper() in {"DENY", "WAIT", "REDUCE"} and v.get("reason")]
+    if sizing_item and (sizing_item.get("binding_limit") or {}).get("name"):
+        reasons.append(f"Sizing limitado por {(sizing_item.get('binding_limit') or {}).get('name')}.")
+    if not reasons:
+        reasons = ["Decisão gerada pela consolidação dos módulos consultivos."]
+
+    payload = {
+        "ok": True,
+        "version": EXECUTION_POLICY_ENGINE_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": EXECUTION_POLICY_ENGINE_V1_MODE,
+        "capital": capital,
+        "inputs": {"bot": bot_norm, "symbol": symbol_norm, "setup": setup, "side": side_norm, "entry": entry_f, "stop": stop_f, "leverage": leverage_i, "execution_mode": mode_norm, "intended_live": intended_live_bool},
+        "decision": final_decision,
+        "execution_action": execution_action,
+        "confidence_score": confidence,
+        "recommended_order": {"bot": bot_norm, "symbol": symbol_norm, "side": side_norm, "entry": entry_f, "stop": stop_f, "setup": setup, "leverage": leverage_i, "paper_notional_usdt": round(suggested_notional, 4), "paper_margin_usdt": round(suggested_margin, 4), "paper_qty": suggested_qty, "paper_effective_risk_usdt": round(effective_risk_usdt, 4), "paper_effective_risk_pct": round(effective_risk_pct, 4), "live_allowed": (sizing_item or {}).get("live_allowed"), "live_notional_usdt": (sizing_item or {}).get("live_suggested_notional_usdt"), "live_block_reason": (sizing_item or {}).get("live_block_reason")},
+        "sizing": sizing_item,
+        "capital_allocator": capital_result,
+        "risk_manager": risk_result[0] if isinstance(risk_result, tuple) else risk_result,
+        "votes": votes,
+        "reasons": reasons[:8],
+        "alerts": list(dict.fromkeys((sizing_payload.get("alerts") or []) + (["Decisão final contém DENY consultivo."] if final_decision == "DENY" else []) + (["Decisão final exige REDUCE/WAIT antes de qualquer execução."] if final_decision in {"REDUCE", "WAIT"} else []))),
+        "notes": ["Execution Policy Engine V1 está em modo consultivo/observação.", "Não executa ordens, não altera lote real, não altera risco real e não envia ordem para a corretora.", "Consolida Risk Manager, Capital Allocator, Dynamic Risk Budget e Dynamic Position Sizing em uma decisão única.", "A decisão final é auditável por votos de cada módulo.", "Preparado para alimentar OMS e Executor no futuro."],
+    }
+    EXECUTION_POLICY_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    return payload
+
+
+def build_execution_policy_v1_text(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None):
+    payload = build_execution_policy_v1(capital=capital, bot=bot, symbol=symbol, side=side, entry=entry, stop=stop, setup=setup, leverage=leverage, mode=mode, intended_live=intended_live)
+    inp = payload.get("inputs") or {}
+    order = payload.get("recommended_order") or {}
+    sizing = payload.get("sizing") or {}
+    binding = sizing.get("binding_limit") or {}
+    lines = [
+        "🧠 EXECUTION POLICY ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Trade avaliado:",
+        f"Bot: {inp.get('bot')} | Setup: {inp.get('setup')}",
+        f"Ativo: {inp.get('symbol')} | Side: {inp.get('side')}",
+        f"Entrada: {inp.get('entry')} | Stop: {inp.get('stop')} | Leverage: {inp.get('leverage')}x",
+        f"Execution mode: {inp.get('execution_mode')} | Intended LIVE: {inp.get('intended_live')}",
+        "",
+        "Decisão final:",
+        f"Decision: {payload.get('decision')}",
+        f"Execution action: {payload.get('execution_action')}",
+        f"Confidence: {payload.get('confidence_score')}/100",
+        "",
+        "Ordem sugerida:",
+        f"Paper notional: {order.get('paper_notional_usdt')} USDT",
+        f"Paper margem: {order.get('paper_margin_usdt')} USDT",
+        f"Paper qty: {order.get('paper_qty')}",
+        f"Risco efetivo paper: {order.get('paper_effective_risk_usdt')} USDT ({order.get('paper_effective_risk_pct')}%)",
+        f"LIVE permitido: {order.get('live_allowed')} | LIVE notional: {order.get('live_notional_usdt')} | motivo: {order.get('live_block_reason')}",
+        "",
+        "Sizing e limitadores:",
+        f"Prioridade estratégica: {sizing.get('strategic_priority')} | Tamanho executável: {sizing.get('executable_size_state')}",
+        f"Risk per trade: {sizing.get('risk_per_trade_pct')}% ({sizing.get('risk_per_trade_usdt')} USDT)",
+        f"Stop distance: {sizing.get('stop_distance_pct')}% ({sizing.get('stop_distance_source')})",
+        f"Raw notional necessário: {sizing.get('raw_notional_usdt')} USDT",
+        f"Limitador dominante: {binding.get('name')} ({binding.get('value_usdt')} USDT)",
+        f"Uso do risk per trade: {sizing.get('risk_budget_utilization_pct')}% | Risco não usado: {sizing.get('unused_risk_per_trade_usdt')} USDT",
+    ]
+    if payload.get("alerts"):
+        lines += ["", "Alertas:"] + [f"- {x}" for x in payload.get("alerts", [])[:8]]
+    lines += ["", "Votos dos módulos:"]
+    for v in payload.get("votes") or []:
+        lines.append(f"- {v.get('module')}: {v.get('vote')} | {v.get('reason')}")
+    lines += ["", "Motivos principais:"] + [f"- {x}" for x in payload.get("reasons", [])]
+    lines += ["", "Notas:"] + [f"- {x}" for x in payload.get("notes", [])]
+    return "\n".join(lines), payload
+
+
+@app.route("/execution/policy/v1", methods=["GET", "POST"])
+@app.route("/executionpolicy/v1", methods=["GET", "POST"])
+@app.route("/policy/execution/v1", methods=["GET", "POST"])
+@app.route("/policy/v1", methods=["GET", "POST"])
+@app.route("/can_execute_trade", methods=["GET", "POST"])
+def execution_policy_v1_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _epe_request_payload_from_args(body)
+    capital = _epe_safe_float(args_payload.get("capital"), 10000.0)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_execution_policy_v1_text(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"))
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/execution/policy/summary/v1", methods=["GET", "POST"])
+@app.route("/executionpolicy/summary/v1", methods=["GET", "POST"])
+@app.route("/policy/summary/v1", methods=["GET", "POST"])
+def execution_policy_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _epe_request_payload_from_args(body)
+    capital = _epe_safe_float(args_payload.get("capital"), 10000.0)
+    payload = build_execution_policy_v1(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"))
+    return {"ok": True, "version": payload.get("version"), "generated_at": payload.get("generated_at"), "mode": payload.get("mode"), "inputs": payload.get("inputs"), "decision": payload.get("decision"), "execution_action": payload.get("execution_action"), "confidence_score": payload.get("confidence_score"), "recommended_order": payload.get("recommended_order"), "votes": payload.get("votes"), "reasons": payload.get("reasons"), "alerts": payload.get("alerts"), "cache": {"last_generated_at": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_capital")}}
+
+
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
 def analytics_bot_exposure_v2_route():
@@ -12529,6 +12878,22 @@ def build_central_command_reply(text: str):
             capital_arg = 10000.0
         text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
         return text_v2
+    if cmd0 in {"/executionpolicy", "/executionpolicyv1", "/policy", "/policyv1", "/canexecute", "/execpolicy", "/epe", "/politicaexecucao", "/políticaexecução"}:
+        parts = raw.split()
+        bot_arg = parts[1].upper() if len(parts) > 1 else None
+        symbol_arg = parts[2].upper() if len(parts) > 2 else None
+        side_arg = parts[3].upper() if len(parts) > 3 else None
+        try:
+            entry_arg = float(parts[4]) if len(parts) > 4 else None
+        except Exception:
+            entry_arg = None
+        try:
+            stop_arg = float(parts[5]) if len(parts) > 5 else None
+        except Exception:
+            stop_arg = None
+        setup_arg = parts[6].upper() if len(parts) > 6 else None
+        text_policy, _ = build_execution_policy_v1_text(capital=10000.0, bot=bot_arg, symbol=symbol_arg, side=side_arg, entry=entry_arg, stop=stop_arg, setup=setup_arg)
+        return text_policy
     if cmd0 in {"/positionsizing", "/positionsizingv1", "/sizing", "/sizingv1", "/dps", "/dynamicposition", "/dynamicpositionv1", "/tamanho", "/tamanhoposicao", "/tamanhoposição"}:
         parts = raw.split()
         try:
