@@ -55,14 +55,15 @@ from execution_engine import (
     execution_engine_test,
     read_execution_engine_log,
 )
-
-
+from execution_pipeline_status import (
+    build_execution_pipeline_status,
+    build_execution_pipeline_text,
+)
 from paper_executor_integrated import (
     paper_integrated_health,
     get_paper_integrated_open_positions,
     read_paper_integrated_log,
 )
-
 from paper_lifecycle import (
     paper_lifecycle_health,
     update_paper_position_price,
@@ -71,14 +72,12 @@ from paper_lifecycle import (
     paper_lifecycle_test_tp50,
     paper_lifecycle_test_close,
 )
-
 from outcome_evaluator import (
     outcome_evaluator_health,
     evaluate_closed_paper_trades,
     get_outcome_stats,
     read_outcome_log,
 )
-
 from adaptive_weights import (
     adaptive_weights_health,
     build_adaptive_weights,
@@ -1163,6 +1162,15 @@ def eventbus_emit_route():
     result = central_event_bus.emit_from_http(payload)
     status = 200 if result.get("ok") else 500
     return result, status
+
+
+@app.route("/execution/pipeline/status")
+@app.route("/execution_pipeline/status")
+def execution_pipeline_status_route():
+    as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
+    if as_text:
+        return build_execution_pipeline_text()
+    return build_execution_pipeline_status()
 
 
 @app.route("/adaptive/health")
