@@ -86,6 +86,14 @@ from adaptive_weights import (
     read_adaptive_weights_log,
     build_adaptive_weights_text,
 )
+from executive_alert_manager import (
+    executive_alert_manager_health,
+    build_executive_alerts,
+    build_executive_alerts_text,
+    build_executive_alert_text,
+    read_executive_alert_log,
+)
+
 
 app = Flask(__name__)
 
@@ -1163,6 +1171,40 @@ def eventbus_emit_route():
     result = central_event_bus.emit_from_http(payload)
     status = 200 if result.get("ok") else 500
     return result, status
+
+
+@app.route("/executive/alerts/health")
+@app.route("/executive_alerts/health")
+def executive_alerts_health_route():
+    return executive_alert_manager_health()
+
+
+@app.route("/executive/alerts/check")
+@app.route("/executive_alerts/check")
+def executive_alerts_check_route():
+    check_only = str(request.args.get("check_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    return build_executive_alerts(check_only=check_only)
+
+
+@app.route("/executive/alerts")
+@app.route("/executive_alerts")
+def executive_alerts_route():
+    notify_only = str(request.args.get("notify_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except Exception:
+        limit = 10
+    return build_executive_alerts_text(limit=limit, notify_only=notify_only)
+
+
+@app.route("/executive/alerts/log")
+@app.route("/executive_alerts/log")
+def executive_alerts_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_executive_alert_log(limit=limit)
 
 
 @app.route("/execution/pipeline/status")
@@ -15087,6 +15129,14 @@ def build_central_command_reply(text: str):
         return build_audit_parts()
     if cmd0 in {"/trend", "/trendpro"}:
         return build_single_bot_report("TRENDPRO", complete=True)
+    if cmd0 in {"/alerts", "/executivealerts", "/executive_alerts"}:
+        return build_executive_alerts_text()
+    if cmd0 in {"/alertscheck", "/alerts_check"}:
+        result = build_executive_alerts(check_only=False)
+        alerts = result.get("alerts_to_notify") or []
+        if not alerts:
+            return "✅ Executive Alert Manager\n\nNenhum alerta que precise interromper o CEO agora."
+        return "\n\n".join([build_executive_alert_text(a) for a in alerts])
     if cmd0 in {"/donkey"}:
         return build_single_bot_report("DONKEY", complete=True)
     if cmd0 in {"/cobra"}:
