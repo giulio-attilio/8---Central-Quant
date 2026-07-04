@@ -6511,8 +6511,8 @@ def build_ceo_daily_report():
     lines.append(f"Status Operacional: {executive['status']}")
     lines.append(f"Modo de Execução: {'REAL' if executive['real_execution_enabled'] else 'VERIFY'}")
     lines.append(f"Uso de Memória (Render): {executive['memory_pct']:.1f}%")
-    lines.append(f"Exposição Global: {executive['risk_status']}")
-    lines.append(f"Confiança Estatística: {pipeline['adaptive']['confidence']:.1f}%")
+    lines.append(f"Risco Operacional: {risk_status}")
+    lines.append(f"Confiança Estatística: {confidence}%")
 
     lines.append("")
     lines.append("════════════════════════════")
@@ -6548,7 +6548,7 @@ def build_ceo_daily_report():
 
     lines.append("")
     lines.append("════════════════════════════")
-    lines.append("AÇÃO DO DIA")
+    lines.append("AÇÃO NECESSÁRIA")
     lines.append("════════════════════════════")
 
     if pipeline["alerts"]:
@@ -15874,7 +15874,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
     if cmd0 in {"/dashboard"}:
         return build_dashboard_report()
     if cmd0 in {"/daily", "/diario", "/diário"}:
-        return build_daily_report()
+        return build_ceo_daily_report()
     if cmd0 in {"/support"}:
         return build_support_report()
     if cmd0 in {"/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo"}:
