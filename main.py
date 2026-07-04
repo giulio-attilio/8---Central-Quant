@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-04-SUPER-CENTRAL-QUANT-V5-EXECUTIVE-ALERT-HEALTH-INTEGRATED-V1
+# Versão: 2026-07-04-SUPER-CENTRAL-QUANT-V5-CEO-CONFIDENCE-INDEX-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -92,6 +92,10 @@ from executive_alert_manager import (
     build_executive_alerts_text,
     build_executive_alert_text,
     read_executive_alert_log,
+)
+from ceo_confidence import (
+    build_ceo_confidence_index,
+    build_ceo_confidence_text,
 )
 
 
@@ -5833,6 +5837,8 @@ def build_executive_report():
         f"Status operacional: {status.get('status')}",
         f"Health Score Central: {score.get('score')}/100 — {score.get('label')}",
         "",
+        _ceo_confidence_report_block(),
+        "",
         _executive_alerts_report_block(),
         "",
         f"Risco direcional: {risk_status}",
@@ -5878,6 +5884,7 @@ def daily_snapshot_payload():
         "exposure": central_exposure_snapshot(),
         "memory": memory_snapshot("daily_snapshot_memory", store=True),
         "health_score": central_health_score_payload(),
+        "ceo_confidence": _ceo_confidence_snapshot_for_reports(),
     }
 
 
@@ -6631,6 +6638,7 @@ def build_executive_dashboard_json():
 
     executive_alerts = _executive_alerts_snapshot_for_reports(check_only=True)
     executive_alert_health = executive_alerts.get("health_score") or {}
+    ceo_confidence = _ceo_confidence_snapshot_for_reports()
 
     return {
         "generated_at": data_hora_sp_str(),
@@ -6640,6 +6648,7 @@ def build_executive_dashboard_json():
         "watchdog_status": watchdog.get("status", "OK"),
         "central_watchdog_health_score": 100 if watchdog.get("ok", True) else 70,
         "executive_alerts": executive_alerts,
+        "ceo_confidence": ceo_confidence,
         "real_execution_enabled": bool(ENABLE_REAL_TRADING),
         "execution_mode": EXECUTION_MODE,
         "memory_mb": memory_mb or 0,
@@ -6682,6 +6691,11 @@ def build_ceo_daily_report():
         f"Uso de Memória (Render): {float(executive.get('memory_pct') or 0):.1f}%",
         f"Risco Operacional: {risk_status}",
         f"Confiança Estatística: {float(confidence or 0):.1f}%",
+        "",
+        "════════════════════════════",
+        "CEO CONFIDENCE INDEX",
+        "════════════════════════════",
+        _ceo_confidence_report_block(),
         "",
         "════════════════════════════",
         "EXECUTIVE ALERT MANAGER",
@@ -6881,6 +6895,73 @@ def _executive_alert_day_key(row):
     except Exception:
         return "N/A"
 
+
+
+def _ceo_confidence_snapshot_for_reports(monthly_stats=None):
+    """
+    Lê os módulos atuais da Central e calcula o CEO Confidence Index V1.
+    É seguro para relatórios: não altera risco, não executa trades e não envia Telegram.
+    """
+    try:
+        executive_alerts = _executive_alerts_snapshot_for_reports(check_only=True)
+    except Exception:
+        executive_alerts = {}
+
+    try:
+        pipeline = build_execution_pipeline_status()
+    except Exception:
+        pipeline = {}
+
+    try:
+        exposure = central_exposure_snapshot()
+    except Exception:
+        exposure = {}
+
+    try:
+        memory = memory_snapshot("ceo_confidence_memory", store=True)
+    except Exception:
+        memory = {}
+
+    try:
+        return build_ceo_confidence_index(
+            executive_alerts=executive_alerts,
+            pipeline=pipeline,
+            exposure=exposure,
+            memory=memory,
+            monthly_stats=monthly_stats or {},
+            extra={
+                "execution_mode": EXECUTION_MODE,
+                "real_execution_enabled": bool(ENABLE_REAL_TRADING),
+            },
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": "CEO-CONFIDENCE-ERROR",
+            "generated_at": data_hora_sp_str(),
+            "score": 0,
+            "label": "ERRO",
+            "action": "INVESTIGAR",
+            "recommendation": f"Erro ao calcular CEO Confidence Index: {exc}",
+            "components": {},
+            "strengths": [],
+            "risks": [str(exc)],
+            "reasons": [],
+            "mode": "OBSERVATION_ONLY",
+        }
+
+
+def _ceo_confidence_report_block(monthly_stats=None):
+    try:
+        payload = _ceo_confidence_snapshot_for_reports(monthly_stats=monthly_stats)
+        return build_ceo_confidence_text(payload)
+    except Exception as exc:
+        return (
+            "🧭 CEO CONFIDENCE INDEX — CENTRAL QUANT V1\n"
+            f"Data/hora: {data_hora_sp_str()}\n\n"
+            "Status: ERRO\n"
+            f"Erro ao gerar CEO Confidence Index: {exc}"
+        )
 
 def _executive_alert_monthly_stats(start_dt, end_dt):
     """
@@ -7096,6 +7177,8 @@ def build_executive_report_monthly():
             blocked_by_reason[reason] = blocked_by_reason.get(reason, 0) + 1
 
     perf = _stats_from_closed_events(closed)
+    monthly_stats_for_confidence = dict(perf) if isinstance(perf, dict) else {}
+    monthly_stats_for_confidence["events_total"] = len(events)
     by_bot = _monthly_group_stats(closed, "bot")
     by_symbol = _monthly_group_stats(closed, "symbol")
     by_setup = _monthly_group_stats(closed, "setup")
@@ -7115,6 +7198,9 @@ def build_executive_report_monthly():
         "",
         "==============================\nEXECUTIVE HEALTH DO MÊS\n==============================",
         _executive_monthly_health_block(start_dt, end_dt),
+        "",
+        "==============================\nCEO CONFIDENCE INDEX\n==============================",
+        _ceo_confidence_report_block(monthly_stats=monthly_stats_for_confidence),
         "",
         "==============================\nPERFORMANCE DO MÊS\n==============================",
         f"Trades encerrados: {perf.get('trades', 0)} | Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('be', 0)}",
@@ -7345,6 +7431,14 @@ def executive_route():
 @app.route("/ceodaily")
 def ceo_daily_route():
     return {"text": build_ceo_daily_report()}
+
+
+@app.route("/ceoconfidence")
+@app.route("/ceo_confidence")
+@app.route("/confidence")
+def ceo_confidence_route():
+    payload = _ceo_confidence_snapshot_for_reports()
+    return {"text": build_ceo_confidence_text(payload), "payload": payload}
 
 
 @app.route("/dashboard")
@@ -15542,6 +15636,8 @@ def build_central_command_reply(text: str):
         return build_ceo_daily_report()
     if cmd0 in {"/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive"}:
         return build_ceo_daily_report()
+    if cmd0 in {"/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança"}:
+        return _ceo_confidence_report_block()
     if cmd0 in {"/monthly", "/mensal", "/monthlyreport", "/monthly_report"}:
         return build_executive_report_monthly()
     if cmd0 in {"/support"}:
@@ -15821,6 +15917,11 @@ def _central_command_title(text: str):
         "/executive_report": "EXECUTIVE REPORT",
         "/dailyexecutive": "EXECUTIVE REPORT",
         "/daily_executive": "EXECUTIVE REPORT",
+        "/ceoconfidence": "CEO CONFIDENCE",
+        "/ceo_confidence": "CEO CONFIDENCE",
+        "/confidence": "CEO CONFIDENCE",
+        "/confianca": "CEO CONFIDENCE",
+        "/confiança": "CEO CONFIDENCE",
         "/monthly": "MENSAL",
         "/mensal": "MENSAL",
         "/monthlyreport": "MENSAL",
@@ -15878,7 +15979,7 @@ def _central_command_title(text: str):
 def _is_heavy_central_command(text: str):
     cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
     return cmd in {
-        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
+        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
         "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital", "/portfolioadvisor", "/advisor", "/portfolio",
