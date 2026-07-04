@@ -72,6 +72,12 @@ from paper_lifecycle import (
     paper_lifecycle_test_close,
 )
 
+from outcome_evaluator import (
+    outcome_evaluator_health,
+    evaluate_closed_paper_trades,
+    get_outcome_stats,
+    read_outcome_log,
+)
 
 app = Flask(__name__)
 
@@ -1149,6 +1155,35 @@ def eventbus_emit_route():
     result = central_event_bus.emit_from_http(payload)
     status = 200 if result.get("ok") else 500
     return result, status
+
+
+@app.route("/outcome/health")
+@app.route("/outcome_evaluator/health")
+def outcome_evaluator_health_route():
+    return outcome_evaluator_health()
+
+
+@app.route("/outcome/evaluate")
+@app.route("/outcome_evaluator/evaluate")
+def outcome_evaluator_evaluate_route():
+    force = str(request.args.get("force", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    return evaluate_closed_paper_trades(force=force)
+
+
+@app.route("/outcome/stats")
+@app.route("/outcome_evaluator/stats")
+def outcome_evaluator_stats_route():
+    return get_outcome_stats()
+
+
+@app.route("/outcome/log")
+@app.route("/outcome_evaluator/log")
+def outcome_evaluator_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_outcome_log(limit=limit)
 
 
 @app.route("/paper_lifecycle/health")
