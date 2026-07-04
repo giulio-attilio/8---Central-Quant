@@ -15903,6 +15903,506 @@ try:
 except Exception as exc:
     print("ERRO AO CARREGAR SUPER HISTORY MANAGER:", exc)
 
+
+# ==========================================================
+# ADAPTIVE WEIGHT ENGINE V2 - CENTRAL QUANT
+# ==========================================================
+
+ADAPTIVE_WEIGHT_ENGINE_V2_VERSION = "2026-07-04-ADAPTIVE-WEIGHT-ENGINE-V2"
+ADAPTIVE_WEIGHT_ENGINE_V2_MODE = "OBSERVATION_ONLY"
+ADAPTIVE_WEIGHT_ENGINE_V2_FILE = CENTRAL_DATA_DIR / "adaptive_weight_engine_v2.json"
+ADAPTIVE_WEIGHT_ENGINE_V2_CACHE = {"last_payload": None, "last_generated_at": None, "last_capital": None}
+
+ADAPTIVE_WEIGHT_ENGINE_V2_MIN_OBSERVATIONS = int(os.environ.get("ADAPTIVE_WEIGHT_V2_MIN_OBSERVATIONS", os.environ.get("ADAPTIVE_WEIGHT_MIN_OBSERVATIONS", "10")))
+ADAPTIVE_WEIGHT_ENGINE_V2_MAX_ADJUSTMENT_PCT = float(os.environ.get("ADAPTIVE_WEIGHT_V2_MAX_ADJUSTMENT_PCT", "22"))
+ADAPTIVE_WEIGHT_ENGINE_V2_SINGLE_RUN_MAX_DELTA = float(os.environ.get("ADAPTIVE_WEIGHT_V2_SINGLE_RUN_MAX_DELTA", "4"))
+ADAPTIVE_WEIGHT_ENGINE_V2_TOTAL_WEIGHT = sum(DECISION_SCORE_ENGINE_V1_WEIGHTS.values())
+
+ADAPTIVE_WEIGHT_ENGINE_V2_MODULE_LIMITS = dict(ADAPTIVE_WEIGHT_ENGINE_V1_MODULE_LIMITS)
+
+
+def _awe_v2_read_evaluations(limit=5000):
+    records = []
+    try:
+        if OUTCOME_EVALUATOR_V1_FILE.exists():
+            with open(OUTCOME_EVALUATOR_V1_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-int(limit or 5000):]
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict) and item.get("record_type") == "OUTCOME_EVALUATION":
+                    records.append(item)
+    except Exception:
+        pass
+    return records
+
+
+def _awe_v2_vote_structural_points(ev):
+    vote = str((ev or {}).get("vote") or "").upper().strip()
+    weight = _awe_safe_float((ev or {}).get("weight"), 0.0)
+    if vote in {"ALLOW", "REDUCE", "DENY", "WAIT"}:
+        return abs(weight * 100.0)
+    if vote in {"INFO", "NEUTRAL"}:
+        return abs(weight * 50.0)
+    return abs(weight * 25.0)
+
+
+def _awe_v2_module_stats_from_evaluations(records=None):
+    records = records if records is not None else _awe_v2_read_evaluations()
+    stats = {}
+    for module in DECISION_SCORE_ENGINE_V1_WEIGHTS.keys():
+        stats[module] = {
+            "module": module,
+            "observations": 0,
+            "correct": 0,
+            "wrong": 0,
+            "neutral": 0,
+            "accuracy_pct": None,
+            "avg_influence_pct": 0.0,
+            "avg_structural_influence_pct": 0.0,
+            "influence_samples": 0,
+            "structural_samples": 0,
+        }
+
+    for record in records or []:
+        rows = record.get("module_evaluations") or []
+        structural_total = 0.0
+        for ev in rows:
+            structural_total += _awe_v2_vote_structural_points(ev)
+
+        for ev in rows:
+            module = ev.get("module") or "UNKNOWN"
+            if module not in stats:
+                stats[module] = {
+                    "module": module,
+                    "observations": 0,
+                    "correct": 0,
+                    "wrong": 0,
+                    "neutral": 0,
+                    "accuracy_pct": None,
+                    "avg_influence_pct": 0.0,
+                    "avg_structural_influence_pct": 0.0,
+                    "influence_samples": 0,
+                    "structural_samples": 0,
+                }
+            correct = ev.get("correct")
+            if correct is True:
+                stats[module]["observations"] += 1
+                stats[module]["correct"] += 1
+            elif correct is False:
+                stats[module]["observations"] += 1
+                stats[module]["wrong"] += 1
+            else:
+                stats[module]["neutral"] += 1
+
+            if ev.get("influence_pct") is not None:
+                n = stats[module]["influence_samples"]
+                old = stats[module]["avg_influence_pct"]
+                val = _awe_safe_float(ev.get("influence_pct"), 0.0)
+                stats[module]["avg_influence_pct"] = round(((old * n) + val) / (n + 1), 4)
+                stats[module]["influence_samples"] = n + 1
+
+            structural_points = _awe_v2_vote_structural_points(ev)
+            structural_pct = (structural_points / structural_total * 100.0) if structural_total else 0.0
+            n2 = stats[module]["structural_samples"]
+            old2 = stats[module]["avg_structural_influence_pct"]
+            stats[module]["avg_structural_influence_pct"] = round(((old2 * n2) + structural_pct) / (n2 + 1), 4)
+            stats[module]["structural_samples"] = n2 + 1
+
+    for module, item in stats.items():
+        obs = int(item.get("observations") or 0)
+        item["accuracy_pct"] = round((item.get("correct", 0) / obs) * 100.0, 2) if obs else None
+    return stats
+
+
+def _awe_v2_default_state():
+    return {
+        "version": ADAPTIVE_WEIGHT_ENGINE_V2_VERSION,
+        "created_at": data_hora_sp_str(),
+        "updated_at": data_hora_sp_str(),
+        "mode": ADAPTIVE_WEIGHT_ENGINE_V2_MODE,
+        "weights": dict(DECISION_SCORE_ENGINE_V1_WEIGHTS),
+        "history": [],
+        "notes": [
+            "V2 usa outcomes avaliados pelo Outcome Evaluator V1.",
+            "V2 corrige influência estrutural de votos DENY/WAIT, mesmo quando pontos=0.",
+            "Ajustes ativos exigem amostra mínima por módulo para evitar overfitting.",
+        ],
+    }
+
+
+def _awe_v2_load_state():
+    try:
+        if ADAPTIVE_WEIGHT_ENGINE_V2_FILE.exists():
+            with open(ADAPTIVE_WEIGHT_ENGINE_V2_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("weights", dict(DECISION_SCORE_ENGINE_V1_WEIGHTS))
+                data.setdefault("history", [])
+                return data
+    except Exception:
+        pass
+    return _awe_v2_default_state()
+
+
+def _awe_v2_save_state(state):
+    try:
+        state = dict(state or {})
+        state["updated_at"] = data_hora_sp_str()
+        ADAPTIVE_WEIGHT_ENGINE_V2_FILE.parent.mkdir(exist_ok=True)
+        with open(ADAPTIVE_WEIGHT_ENGINE_V2_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _awe_v2_normalize_weights(weights, total=ADAPTIVE_WEIGHT_ENGINE_V2_TOTAL_WEIGHT):
+    weights = dict(weights or {})
+    cur = sum(_awe_safe_float(x, 0.0) for x in weights.values()) or float(total or 1.0)
+    factor = float(total or cur) / cur
+    return {k: round(_awe_safe_float(v, 0.0) * factor, 4) for k, v in weights.items()}, round(factor, 6)
+
+
+def _awe_v2_recommend_weights(state=None):
+    state = state or _awe_v2_load_state()
+    records = _awe_v2_read_evaluations()
+    stats = _awe_v2_module_stats_from_evaluations(records)
+    base_weights = dict(DECISION_SCORE_ENGINE_V1_WEIGHTS)
+    current_weights = dict(state.get("weights") or base_weights)
+
+    table = []
+    active_pre = {}
+    shadow_pre = {}
+    active_adjustments = 0
+    shadow_adjustments = 0
+
+    for module, base_weight in base_weights.items():
+        item = stats.get(module) or {}
+        observations = int(item.get("observations") or 0)
+        correct = int(item.get("correct") or 0)
+        wrong = int(item.get("wrong") or 0)
+        neutral = int(item.get("neutral") or 0)
+        accuracy = item.get("accuracy_pct")
+        accuracy_val = _awe_safe_float(accuracy, None)
+        avg_influence = _awe_safe_float(item.get("avg_influence_pct"), 0.0)
+        structural_influence = _awe_safe_float(item.get("avg_structural_influence_pct"), 0.0)
+        confidence_factor = _awe_clip(observations / float(max(1, ADAPTIVE_WEIGHT_ENGINE_V2_MIN_OBSERVATIONS)), 0.0, 1.0)
+
+        if accuracy_val is None:
+            raw_adjustment = 0.0
+        else:
+            raw_adjustment = ((accuracy_val - 55.0) / 45.0) * ADAPTIVE_WEIGHT_ENGINE_V2_MAX_ADJUSTMENT_PCT
+            # Módulos com alta influência estrutural e baixa acurácia sofrem penalização ligeiramente maior.
+            if accuracy_val < 50.0 and structural_influence > 20.0:
+                raw_adjustment -= min(6.0, (structural_influence - 20.0) * 0.2)
+            # Módulos defensivos com alta acurácia e alta influência estrutural ganham um pouco mais.
+            if accuracy_val >= 70.0 and structural_influence > 20.0:
+                raw_adjustment += min(5.0, (structural_influence - 20.0) * 0.15)
+
+        raw_adjustment = _awe_clip(raw_adjustment, -ADAPTIVE_WEIGHT_ENGINE_V2_MAX_ADJUSTMENT_PCT, ADAPTIVE_WEIGHT_ENGINE_V2_MAX_ADJUSTMENT_PCT)
+        shadow_adjustment_pct = raw_adjustment * max(confidence_factor, 0.15 if observations > 0 else 0.0)
+        active_adjustment_pct = raw_adjustment * confidence_factor if observations >= ADAPTIVE_WEIGHT_ENGINE_V2_MIN_OBSERVATIONS else 0.0
+
+        # Limite de variação por ciclo para evitar oscilação brusca quando persist=true.
+        active_adjustment_pct = _awe_clip(active_adjustment_pct, -ADAPTIVE_WEIGHT_ENGINE_V2_SINGLE_RUN_MAX_DELTA, ADAPTIVE_WEIGHT_ENGINE_V2_SINGLE_RUN_MAX_DELTA)
+        shadow_adjustment_pct = _awe_clip(shadow_adjustment_pct, -ADAPTIVE_WEIGHT_ENGINE_V2_MAX_ADJUSTMENT_PCT, ADAPTIVE_WEIGHT_ENGINE_V2_MAX_ADJUSTMENT_PCT)
+
+        limits = ADAPTIVE_WEIGHT_ENGINE_V2_MODULE_LIMITS.get(module, {"min": 1.0, "max": 50.0})
+        active_raw = _awe_safe_float(current_weights.get(module), base_weight) * (1.0 + active_adjustment_pct / 100.0)
+        shadow_raw = float(base_weight) * (1.0 + shadow_adjustment_pct / 100.0)
+        active_bounded = _awe_clip(active_raw, limits.get("min", 1.0), limits.get("max", 50.0))
+        shadow_bounded = _awe_clip(shadow_raw, limits.get("min", 1.0), limits.get("max", 50.0))
+
+        if abs(active_bounded - _awe_safe_float(current_weights.get(module), base_weight)) > 0.001:
+            active_adjustments += 1
+        if abs(shadow_bounded - float(base_weight)) > 0.001:
+            shadow_adjustments += 1
+
+        active_pre[module] = active_bounded
+        shadow_pre[module] = shadow_bounded
+        evidence = "ACTIVE_ADAPTIVE" if observations >= ADAPTIVE_WEIGHT_ENGINE_V2_MIN_OBSERVATIONS else ("SHADOW_LEARNING_WAIT_SAMPLE" if observations > 0 else "BOOTSTRAP_NO_OUTCOMES")
+        table.append({
+            "module": module,
+            "base_weight": round(float(base_weight), 4),
+            "current_weight": round(_awe_safe_float(current_weights.get(module), base_weight), 4),
+            "observations": observations,
+            "correct": correct,
+            "wrong": wrong,
+            "neutral": neutral,
+            "accuracy_pct": round(accuracy_val, 2) if accuracy_val is not None else None,
+            "confidence_factor": round(confidence_factor, 4),
+            "avg_influence_pct_v1": round(avg_influence, 4),
+            "avg_structural_influence_pct": round(structural_influence, 4),
+            "raw_adjustment_pct": round(raw_adjustment, 4),
+            "active_adjustment_pct": round(active_adjustment_pct, 4),
+            "shadow_adjustment_pct": round(shadow_adjustment_pct, 4),
+            "active_weight_pre_normalization": round(active_bounded, 4),
+            "shadow_weight_pre_normalization": round(shadow_bounded, 4),
+            "limits": limits,
+            "evidence": evidence,
+        })
+
+    active_weights, active_norm = _awe_v2_normalize_weights(active_pre)
+    shadow_weights, shadow_norm = _awe_v2_normalize_weights(shadow_pre)
+    for row in table:
+        module = row["module"]
+        row["active_weight"] = active_weights.get(module)
+        row["shadow_weight"] = shadow_weights.get(module)
+        row["delta_active_vs_base"] = round((active_weights.get(module) or row["base_weight"]) - row["base_weight"], 4)
+        row["delta_shadow_vs_base"] = round((shadow_weights.get(module) or row["base_weight"]) - row["base_weight"], 4)
+
+    return {
+        "records": len(records),
+        "module_stats": stats,
+        "weight_table": table,
+        "active_weights": active_weights,
+        "shadow_weights": shadow_weights,
+        "active_normalization_factor": active_norm,
+        "shadow_normalization_factor": shadow_norm,
+        "active_adjustments": active_adjustments,
+        "shadow_adjustments": shadow_adjustments,
+    }
+
+
+def build_adaptive_weight_engine_v2(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None, persist=False):
+    global ADAPTIVE_WEIGHT_ENGINE_V2_CACHE
+    capital = _awe_safe_float(capital, 10000.0)
+    state = _awe_v2_load_state()
+    recommendation = _awe_v2_recommend_weights(state)
+    active_weights = recommendation.get("active_weights") or dict(DECISION_SCORE_ENGINE_V1_WEIGHTS)
+    shadow_weights = recommendation.get("shadow_weights") or dict(DECISION_SCORE_ENGINE_V1_WEIGHTS)
+
+    decision_payload = build_decision_score_engine_v1(
+        capital=capital,
+        bot=bot,
+        symbol=symbol,
+        side=side,
+        entry=entry,
+        stop=stop,
+        setup=setup,
+        leverage=leverage,
+        mode=mode,
+        intended_live=intended_live,
+    )
+
+    active_score, active_weighted_points, active_total_weight, active_module_scores = _awe_score_with_weights(decision_payload, active_weights)
+    shadow_score, shadow_weighted_points, shadow_total_weight, shadow_module_scores = _awe_score_with_weights(decision_payload, shadow_weights)
+
+    sizing = decision_payload.get("sizing") or {}
+    hard_deny = bool(decision_payload.get("hard_deny"))
+    hard_wait = bool(decision_payload.get("hard_wait"))
+    active_decision = _dse_decision_from_score(active_score, hard_deny=hard_deny, hard_wait=hard_wait, sizing_action=sizing.get("sizing_action"))
+    shadow_decision = _dse_decision_from_score(shadow_score, hard_deny=hard_deny, hard_wait=hard_wait, sizing_action=sizing.get("sizing_action"))
+
+    action_map = {
+        "ALLOW": "ALLOW_ADAPTIVE_V2_OBSERVATION",
+        "REDUCE": "ALLOW_REDUCED_ADAPTIVE_V2_OBSERVATION",
+        "WAIT": "WAIT_ADAPTIVE_V2_OBSERVATION",
+        "DENY": "DENY_ADAPTIVE_V2_OBSERVATION",
+    }
+    active_action = action_map.get(active_decision, "WAIT_ADAPTIVE_V2_OBSERVATION")
+    active_confidence = _dse_confidence(active_score, decision_payload.get("votes") or [], hard_deny=hard_deny)
+
+    enough_modules = [x for x in recommendation.get("weight_table") or [] if int(x.get("observations") or 0) >= ADAPTIVE_WEIGHT_ENGINE_V2_MIN_OBSERVATIONS]
+    evidence_quality = "ACTIVE_ADAPTIVE" if enough_modules else ("SHADOW_LEARNING_WAIT_SAMPLE" if recommendation.get("records") else "BOOTSTRAP_NO_OUTCOMES")
+
+    save_ok = False
+    save_error = None
+    if persist:
+        state["weights"] = active_weights
+        hist = list(state.get("history") or [])
+        hist.append({
+            "ts": data_hora_sp_str(),
+            "records": recommendation.get("records"),
+            "evidence_quality": evidence_quality,
+            "active_weights": active_weights,
+            "shadow_weights": shadow_weights,
+            "active_score": active_score,
+            "shadow_score": shadow_score,
+        })
+        state["history"] = hist[-200:]
+        save_ok, save_error = _awe_v2_save_state(state)
+
+    reasons = []
+    if evidence_quality == "BOOTSTRAP_NO_OUTCOMES":
+        reasons.append("Ainda não há outcomes avaliados; V2 mantém pesos base.")
+    elif evidence_quality == "SHADOW_LEARNING_WAIT_SAMPLE":
+        reasons.append("Há outcomes avaliados, mas ainda não há amostra mínima; V2 mostra pesos sombra sem alterar pesos ativos.")
+    else:
+        reasons.append("Há amostra mínima em ao menos um módulo; V2 aplica ajustes ativos com limite de variação.")
+    if hard_deny:
+        reasons.append("Hard deny permanece soberano: pesos adaptativos não podem liberar trade vetado por regra crítica.")
+    if recommendation.get("shadow_adjustments"):
+        reasons.append(f"{recommendation.get('shadow_adjustments')} módulo(s) já possuem ajuste sombra sugerido.")
+    if recommendation.get("active_adjustments"):
+        reasons.append(f"{recommendation.get('active_adjustments')} módulo(s) possuem ajuste ativo aplicado.")
+    else:
+        reasons.append("Nenhum ajuste ativo aplicado nesta leitura.")
+
+    alerts = list(decision_payload.get("alerts") or [])
+    if evidence_quality == "SHADOW_LEARNING_WAIT_SAMPLE":
+        alerts.append("Adaptive Weight V2 está em modo sombra: já calcula tendência, mas não altera pesos ativos sem amostra mínima.")
+    if evidence_quality == "ACTIVE_ADAPTIVE":
+        alerts.append("Adaptive Weight V2 aplicou pesos ativos baseados em outcomes suficientes.")
+    if hard_deny:
+        alerts.append("Hard deny ativo; decisão final continua protegida por regra crítica.")
+
+    payload = {
+        "ok": True,
+        "version": ADAPTIVE_WEIGHT_ENGINE_V2_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": ADAPTIVE_WEIGHT_ENGINE_V2_MODE,
+        "capital": capital,
+        "inputs": decision_payload.get("inputs") or {},
+        "evidence_quality": evidence_quality,
+        "outcome_evaluations_detected": recommendation.get("records"),
+        "min_observations_required": ADAPTIVE_WEIGHT_ENGINE_V2_MIN_OBSERVATIONS,
+        "base_decision_score_version": decision_payload.get("version"),
+        "base_decision_score": decision_payload.get("decision_score"),
+        "base_decision": decision_payload.get("decision"),
+        "base_confidence": decision_payload.get("confidence_score"),
+        "active_decision_score": active_score,
+        "active_decision": active_decision,
+        "active_execution_action": active_action,
+        "active_confidence_score": active_confidence,
+        "shadow_decision_score": shadow_score,
+        "shadow_decision": shadow_decision,
+        "hard_deny": hard_deny,
+        "hard_wait": hard_wait,
+        "active_weights": active_weights,
+        "shadow_weights": shadow_weights,
+        "weight_table": recommendation.get("weight_table") or [],
+        "active_module_scores": active_module_scores,
+        "shadow_module_scores": shadow_module_scores,
+        "active_weight_total": active_total_weight,
+        "shadow_weight_total": shadow_total_weight,
+        "active_weighted_points": active_weighted_points,
+        "shadow_weighted_points": shadow_weighted_points,
+        "active_adjustments": recommendation.get("active_adjustments"),
+        "shadow_adjustments": recommendation.get("shadow_adjustments"),
+        "recommended_order": decision_payload.get("recommended_order") or {},
+        "sizing": sizing,
+        "risk_manager": decision_payload.get("risk_manager") or {},
+        "capital_allocator": decision_payload.get("capital_allocator") or {},
+        "alerts": alerts,
+        "reasons": reasons,
+        "notes": [
+            "Adaptive Weight Engine V2 está em modo consultivo/observação.",
+            "V2 usa outcomes avaliados pelo Outcome Evaluator V1 para medir acerto/erro por módulo.",
+            "V2 adiciona influência estrutural para capturar o impacto de votos DENY/WAIT mesmo quando pontos=0.",
+            "Sem amostra mínima, os pesos ativos permanecem conservadores e os ajustes aparecem como shadow weights.",
+            "Com amostra suficiente, V2 aplica ajustes ativos com limites por módulo e limite de variação por ciclo.",
+        ],
+        "state_saved": save_ok,
+        "state_save_error": save_error,
+    }
+    ADAPTIVE_WEIGHT_ENGINE_V2_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    return payload
+
+
+def build_adaptive_weight_engine_v2_text(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None, persist=False):
+    payload = build_adaptive_weight_engine_v2(capital=capital, bot=bot, symbol=symbol, side=side, entry=entry, stop=stop, setup=setup, leverage=leverage, mode=mode, intended_live=intended_live, persist=persist)
+    order = payload.get("recommended_order") or {}
+    sizing = payload.get("sizing") or {}
+    lines = [
+        "⚖️ ADAPTIVE WEIGHT ENGINE V2 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Trade avaliado:",
+        f"Bot: {(payload.get('inputs') or {}).get('bot')} | Setup: {(payload.get('inputs') or {}).get('setup')}",
+        f"Ativo: {(payload.get('inputs') or {}).get('symbol')} | Side: {(payload.get('inputs') or {}).get('side')}",
+        f"Entrada: {(payload.get('inputs') or {}).get('entry')} | Stop: {(payload.get('inputs') or {}).get('stop')} | Leverage: {(payload.get('inputs') or {}).get('leverage')}x",
+        "",
+        "Resultado adaptativo V2:",
+        f"Base Decision Score: {payload.get('base_decision_score')}/100 | Decisão base: {payload.get('base_decision')} | Confiança base: {payload.get('base_confidence')}/100",
+        f"Active Score: {payload.get('active_decision_score')}/100 | Decisão ativa: {payload.get('active_decision')} | Action: {payload.get('active_execution_action')}",
+        f"Shadow Score: {payload.get('shadow_decision_score')}/100 | Decisão sombra: {payload.get('shadow_decision')}",
+        f"Hard deny: {payload.get('hard_deny')} | Evidência: {payload.get('evidence_quality')}",
+        f"Outcomes avaliados: {payload.get('outcome_evaluations_detected')} | Mínimo por módulo: {payload.get('min_observations_required')}",
+        "",
+        "Ordem sugerida:",
+        f"Paper notional: {order.get('paper_notional_usdt')} USDT | Margem: {order.get('paper_margin_usdt')} USDT | Qty: {order.get('paper_qty')}",
+        f"Risco efetivo: {order.get('paper_effective_risk_usdt')} USDT ({order.get('paper_effective_risk_pct')}%)",
+        "",
+        "Sizing:",
+        f"Prioridade estratégica: {sizing.get('strategic_priority')} | Executável: {sizing.get('executable_size_state')}",
+        f"Limitador dominante: {(sizing.get('binding_limit') or {}).get('name')} ({(sizing.get('binding_limit') or {}).get('value_usdt')} USDT)",
+        f"Uso do risk per trade: {sizing.get('risk_budget_utilization_pct')}%",
+        "",
+        "Pesos por módulo:",
+    ]
+    for item in payload.get("weight_table") or []:
+        lines.append(
+            f"- {item.get('module')}: base {item.get('base_weight')} → ativo {item.get('active_weight')} (Δ {item.get('delta_active_vs_base')}) | sombra {item.get('shadow_weight')} (Δ {item.get('delta_shadow_vs_base')}) | obs={item.get('observations')} | acc={item.get('accuracy_pct')}% | influência estrutural={item.get('avg_structural_influence_pct')}% | {item.get('evidence')}"
+        )
+    lines += [
+        "",
+        "Alertas:",
+    ]
+    for alert in payload.get("alerts") or []:
+        lines.append(f"- {alert}")
+    lines += [
+        "",
+        "Motivos principais:",
+    ]
+    for reason in payload.get("reasons") or []:
+        lines.append(f"- {reason}")
+    lines += [
+        "",
+        "Notas:",
+    ]
+    for note in payload.get("notes") or []:
+        lines.append(f"- {note}")
+    return "\n".join(lines), payload
+
+
+@app.route("/adaptive/weights/v2", methods=["GET", "POST"])
+@app.route("/adaptive-weight/v2", methods=["GET", "POST"])
+@app.route("/weights/adaptive/v2", methods=["GET", "POST"])
+def adaptive_weight_engine_v2_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _dse_request_payload_from_args(body)
+    capital = _awe_safe_float(args_payload.get("capital"), 10000.0)
+    persist = str(args_payload.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    text, payload = build_adaptive_weight_engine_v2_text(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), persist=persist)
+    return {"ok": True, "payload": payload, "text": text}
+
+
+@app.route("/adaptive/weights/summary/v2", methods=["GET", "POST"])
+@app.route("/adaptive-weight/summary/v2", methods=["GET", "POST"])
+@app.route("/weights/adaptive/summary/v2", methods=["GET", "POST"])
+def adaptive_weight_engine_v2_summary_route():
+    body = request.get_json(silent=True) or {}
+    args_payload = _dse_request_payload_from_args(body)
+    capital = _awe_safe_float(args_payload.get("capital"), 10000.0)
+    payload = build_adaptive_weight_engine_v2(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), persist=False)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "evidence_quality": payload.get("evidence_quality"),
+        "outcome_evaluations_detected": payload.get("outcome_evaluations_detected"),
+        "min_observations_required": payload.get("min_observations_required"),
+        "base_decision_score": payload.get("base_decision_score"),
+        "active_decision_score": payload.get("active_decision_score"),
+        "active_decision": payload.get("active_decision"),
+        "shadow_decision_score": payload.get("shadow_decision_score"),
+        "shadow_decision": payload.get("shadow_decision"),
+        "hard_deny": payload.get("hard_deny"),
+        "active_weights": payload.get("active_weights"),
+        "shadow_weights": payload.get("shadow_weights"),
+        "weight_table": payload.get("weight_table"),
+        "reasons": payload.get("reasons"),
+        "alerts": payload.get("alerts"),
+    }
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
