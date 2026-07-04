@@ -7285,6 +7285,58 @@ def analytics_portfolio_route():
         }        
 
 
+@app.route("/analytics/exposure")
+def analytics_exposure_route():
+    try:
+        from flask import request
+        import bot_exposure_manager
+
+        capital = request.args.get("capital", default=10000, type=float)
+
+        payload = bot_exposure_manager.bot_exposure_manager(capital=capital)
+
+        lines = [
+            "📡 BOT EXPOSURE MANAGER — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            f"Modo: {payload.get('mode')}",
+            f"Capital analisado: {payload.get('capital')} USDT",
+            "",
+            "Exposição por robô:",
+        ]
+
+        for item in payload.get("exposures", []):
+            lines += [
+                "",
+                f"{item.get('name')}:",
+                f"Categoria: {item.get('category')}",
+                f"Decisão: {item.get('decision')}",
+                f"Capital destinado: {item.get('capital_allocated')} USDT",
+                f"Capital usado: {item.get('capital_used')} USDT",
+                f"Capital livre: {item.get('capital_free')} USDT",
+                f"Uso do capital: {item.get('usage_pct')}%",
+                f"Risco máximo aberto: {item.get('max_open_risk_usdt')} USDT",
+                f"Risco usado: {item.get('risk_used_usdt')} USDT",
+                f"Risco livre: {item.get('risk_free_usdt')} USDT",
+                f"Uso do risco: {item.get('risk_usage_pct')}%",
+            ]
+
+        lines += ["", "Notas:"]
+        for note in payload.get("notes", []):
+            lines.append(f"- {note}")
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+    
+
 @app.route("/analytics/symbols")
 def analytics_symbols_route():
     return _analytics_group_response("symbol", "symbol", "symbols")
