@@ -1203,6 +1203,35 @@ def executive_alerts_health_route():
     return executive_alert_manager_health()
 
 
+@app.route("/executive/policy/health")
+@app.route("/policy/health")
+def executive_policy_health_route():
+    if not EXECUTIVE_POLICY_MANAGER_LOADED:
+        return {"ok": False, "loaded": False, "error": EXECUTIVE_POLICY_MANAGER_ERROR}, 500
+    try:
+        as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
+        if as_text:
+            return executive_policy_manager.format_policy_health_text()
+        return executive_policy_manager.policy_manager_health()
+    except Exception as exc:
+        return {"ok": False, "loaded": True, "error": str(exc)}, 500
+
+
+@app.route("/executive/policy")
+@app.route("/policies")
+def executive_policy_route():
+    if not EXECUTIVE_POLICY_MANAGER_LOADED:
+        return {"ok": False, "loaded": False, "error": EXECUTIVE_POLICY_MANAGER_ERROR}, 500
+    try:
+        as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
+        include_disabled = str(request.args.get("include_disabled", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        if as_text:
+            return executive_policy_manager.format_policies_text(include_disabled=include_disabled)
+        return executive_policy_manager.get_active_policies()
+    except Exception as exc:
+        return {"ok": False, "loaded": True, "error": str(exc)}, 500
+
+
 @app.route("/executive/alerts/check")
 @app.route("/executive_alerts/check")
 def executive_alerts_check_route():
@@ -16163,6 +16192,25 @@ def build_central_command_reply(text: str):
         if not alerts:
             return "✅ Executive Alert Manager\n\nNenhum alerta que precise interromper o CEO agora."
         return "\n\n".join([build_executive_alert_text(a) for a in alerts])
+    if cmd0 in {"/policyhealth", "/policy_health"}:
+        if EXECUTIVE_POLICY_MANAGER_LOADED:
+            return executive_policy_manager.format_policy_health_text()
+        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+
+    if cmd0 in {"/policies", "/policylist", "/policy_list"}:
+        if EXECUTIVE_POLICY_MANAGER_LOADED:
+            return executive_policy_manager.format_policies_text(include_disabled=False)
+        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+
+    if cmd0 == "/policy":
+        if EXECUTIVE_POLICY_MANAGER_LOADED:
+            parts = raw.split(maxsplit=1)
+            code = parts[1].strip() if len(parts) > 1 else ""
+            if not code:
+                return "Use: /policy NO_NEW_LONG"
+            return executive_policy_manager.format_single_policy_text(code)
+        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+
     if cmd0 in {"/donkey"}:
         return build_single_bot_report("DONKEY", complete=True)
     if cmd0 in {"/cobra"}:
@@ -16904,25 +16952,6 @@ def telegram_send_with_token(token, chat_id, text, title=None):
 def build_command_reply_for_module(key: str, module, cmd: str):
     raw_cmd = (cmd or "").strip()
     cmd0 = raw_cmd.lower().split()[0].split("@")[0] if raw_cmd else ""
-
-    if cmd0 in {"/policyhealth", "/policy_health"}:
-        if EXECUTIVE_POLICY_MANAGER_LOADED:
-            return executive_policy_manager.format_policy_health_text()
-        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
-
-    if cmd0 in {"/policies", "/policylist", "/policy_list"}:
-        if EXECUTIVE_POLICY_MANAGER_LOADED:
-            return executive_policy_manager.format_policies_text(include_disabled=False)
-        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
-
-    if cmd0 == "/policy":
-        if EXECUTIVE_POLICY_MANAGER_LOADED:
-            parts = raw_cmd.split(maxsplit=1)
-            code = parts[1].strip() if len(parts) > 1 else ""
-            if not code:
-                return "Use: /policy NO_NEW_LONG"
-            return executive_policy_manager.format_single_policy_text(code)
-        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
 
     if cmd0 in {"/diagnostico", "/diagnóstico", "/diag"}:
         return build_diagnostic_report()
