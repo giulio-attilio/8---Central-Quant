@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-03-SUPER-CENTRAL-QUANT-V5-TRADE-REGISTRY-EXPOSURE-SCORE-V2
+# Versão: 2026-07-03-SUPER-CENTRAL-QUANT-V5-TRADE-REGISTRY-PORTFOLIO-OPTIMIZER-V1.1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -9344,10 +9344,11 @@ def portfolio_advisor_v1_summary_route():
 
 
 # ==========================================================
-# PORTFOLIO OPTIMIZER V1 - CENTRAL QUANT
+# PORTFOLIO OPTIMIZER V1.1 - CENTRAL QUANT
 # ==========================================================
 
-PORTFOLIO_OPTIMIZER_V1_VERSION = "2026-07-03-PORTFOLIO-OPTIMIZER-V1"
+PORTFOLIO_OPTIMIZER_V1_VERSION = "2026-07-03-PORTFOLIO-OPTIMIZER-V1.1"
+PORTFOLIO_OPTIMIZER_V1_1_VERSION = PORTFOLIO_OPTIMIZER_V1_VERSION
 PORTFOLIO_OPTIMIZER_V1_MODE = "OBSERVATION_ONLY"
 PORTFOLIO_OPTIMIZER_V1_CACHE = {
     "last_generated_at": None,
@@ -9361,11 +9362,63 @@ def _optimizer_category_constraints(category):
     constraints = {
         "CORE": {"min_pct": 0.0, "max_pct": 55.0, "note": "Core pode receber maior alocação quando score/confiança sustentam."},
         "TACTICAL": {"min_pct": 0.0, "max_pct": 12.0, "note": "Tático deve ser limitado até provar consistência."},
-        "SATELLITE": {"min_pct": 0.0, "max_pct": 10.0, "note": "Satélite deve ficar menor e diversificador."},
-        "EXPERIMENTAL": {"min_pct": 0.0, "max_pct": 5.0, "note": "Experimental deve ter teto baixo até amadurecer amostra."},
+        "SATELLITE": {"min_pct": 0.0, "max_pct": 8.0, "note": "Satélite deve ficar menor e diversificador."},
+        "EXPERIMENTAL": {"min_pct": 0.0, "max_pct": 5.0, "note": "Experimental deve ter teto rígido até amadurecer amostra."},
         "UNKNOWN": {"min_pct": 0.0, "max_pct": 8.0, "note": "Categoria desconhecida recebe teto conservador."},
     }
     return constraints.get(category, constraints["UNKNOWN"])
+
+
+def _optimizer_current_pct(item, capital):
+    try:
+        return (_safe_float(item.get("capital_allocated"), 0.0) / float(capital or 1.0)) * 100.0
+    except Exception:
+        return 0.0
+
+
+def _optimizer_action(item):
+    return str(((item.get("advisor") or {}).get("action")) or "OBSERVE").upper().strip()
+
+
+def _optimizer_max_target_pct(item, capital):
+    """
+    V1.1: o teto passa a obedecer primeiro a política do Advisor.
+    - REDUCE_OR_WAIT nunca aumenta alocação: teto <= alocação atual.
+    - PAUSE_OR_REVIEW fica em target mínimo defensivo.
+    - MAINTAIN_EXPERIMENTAL_SMALL respeita teto rígido experimental.
+    - PRIORITIZE pode receber excesso liberado, mas ainda com teto prudente.
+    """
+    category = str(item.get("category") or "UNKNOWN").upper().strip()
+    action = _optimizer_action(item)
+    score = _safe_float(item.get("score"), 0.0)
+    current_pct = _optimizer_current_pct(item, capital)
+    base_cap = _safe_float(_optimizer_category_constraints(category).get("max_pct"), 8.0)
+
+    cap = base_cap
+
+    if action == "PRIORITIZE":
+        # Permite absorver excesso de robôs fracos, mas sem dominar 100% do portfólio.
+        cap = 70.0 if category == "CORE" else min(base_cap * 1.5, 25.0)
+    elif action == "MAINTAIN_EXPERIMENTAL_SMALL":
+        cap = min(base_cap, 5.0)
+    elif action == "REDUCE_OR_WAIT":
+        # Regra crítica do V1.1: nunca aumentar robô em reduce/wait.
+        cap = min(base_cap, current_pct)
+    elif action in {"PAUSE_OR_REVIEW", "REDUCE_RISK"}:
+        # Target mínimo defensivo, maior só se for necessário para fechar 100% em cenário extremo.
+        if score < 40:
+            cap = 1.5
+        elif score < 50:
+            cap = 2.5
+        else:
+            cap = 3.0
+    else:
+        if score < 45:
+            cap = min(base_cap, 3.0)
+        elif score < 55:
+            cap = min(base_cap, 6.0)
+
+    return max(0.0, round(cap, 6))
 
 
 def _optimizer_health_multiplier(item):
@@ -9375,20 +9428,21 @@ def _optimizer_health_multiplier(item):
     confidence = _safe_float(components.get("confidence_score"), 50.0)
     consistency = _safe_float(components.get("consistency_score"), 50.0)
     expectancy = _safe_float(components.get("expectancy_score"), 50.0)
-    advisor = item.get("advisor") or {}
-    action = str(advisor.get("action") or "").upper()
+    action = _optimizer_action(item)
     category = str(item.get("category") or "UNKNOWN").upper()
 
     mult = 1.0
 
     if score >= 80:
-        mult *= 1.20
+        mult *= 1.25
     elif score >= 70:
-        mult *= 1.05
-    elif score < 50:
-        mult *= 0.35
+        mult *= 1.08
+    elif score < 45:
+        mult *= 0.22
+    elif score < 55:
+        mult *= 0.45
     elif score < 60:
-        mult *= 0.65
+        mult *= 0.70
 
     if confidence < 40:
         mult *= 0.55
@@ -9402,28 +9456,28 @@ def _optimizer_health_multiplier(item):
     elif consistency < 55:
         mult *= 0.80
     elif consistency >= 80:
-        mult *= 1.12
+        mult *= 1.15
 
     if expectancy < 35:
-        mult *= 0.50
+        mult *= 0.45
     elif expectancy >= 75:
-        mult *= 1.10
+        mult *= 1.12
 
     if action in {"PAUSE_OR_REVIEW", "REDUCE_RISK"}:
-        mult *= 0.35
+        mult *= 0.12
     elif action == "REDUCE_OR_WAIT":
-        mult *= 0.55
-    elif action in {"PRIORITIZE", "MAINTAIN"}:
-        mult *= 1.10
+        mult *= 0.40
+    elif action == "PRIORITIZE":
+        mult *= 1.28
     elif action == "MAINTAIN_EXPERIMENTAL_SMALL":
-        mult *= 0.80
+        mult *= 0.70
 
     if category == "EXPERIMENTAL":
-        mult *= 0.75
-    elif category == "CORE":
-        mult *= 1.05
+        mult *= 0.72
+    elif category == "CORE" and action == "PRIORITIZE":
+        mult *= 1.08
 
-    return max(0.05, min(1.60, round(mult, 4)))
+    return max(0.02, min(1.80, round(mult, 4)))
 
 
 def _optimizer_raw_weight(item):
@@ -9436,110 +9490,128 @@ def _optimizer_raw_weight(item):
     risk = _safe_float(components.get("risk_score"), 50.0)
     positions = int(item.get("positions") or 0)
 
-    # Média ponderada voltada para qualidade futura, não apenas atividade atual.
     quality = (
         score * 0.30
         + perf * 0.20
-        + expectancy * 0.18
-        + consistency * 0.14
+        + expectancy * 0.20
+        + consistency * 0.15
         + confidence * 0.10
-        + risk * 0.08
+        + risk * 0.05
     )
 
-    # Robôs sem posição não são zerados; apenas recebem menor peso até nova amostra.
-    activity_factor = 1.00 if positions > 0 else 0.72
+    activity_factor = 1.00 if positions > 0 else 0.70
     health_factor = _optimizer_health_multiplier(item)
     return max(0.0, quality * activity_factor * health_factor)
 
 
-def _optimizer_apply_caps(weight_map, item_map):
-    """Normaliza pesos e aplica tetos por categoria/bot de forma iterativa."""
-    active_keys = [k for k, v in weight_map.items() if v > 0]
-    if not active_keys:
-        return {k: 0.0 for k in weight_map.keys()}
+def _optimizer_apply_policy_caps(weight_map, item_map, capital):
+    """Normaliza pesos, aplica tetos do Advisor e fecha exatamente 100% em base não arredondada."""
+    if not weight_map:
+        return {}
 
-    total = sum(weight_map.values()) or 1.0
-    weights = {k: (weight_map[k] / total) * 100.0 for k in weight_map.keys()}
+    max_caps = {bot: _optimizer_max_target_pct(item_map.get(bot) or {}, capital) for bot in weight_map.keys()}
+    min_floors = {bot: 0.0 for bot in weight_map.keys()}
 
+    # Se todos os pesos forem zero, usa pesos iguais respeitando caps.
+    if sum(max(0.0, v) for v in weight_map.values()) <= 0:
+        weight_map = {bot: 1.0 for bot in weight_map.keys()}
+
+    # Primeiro aloca proporcionalmente, travando quem ultrapassa o teto.
+    remaining = set(weight_map.keys())
     fixed = {}
-    remaining = set(weights.keys())
+    weights = {bot: 0.0 for bot in weight_map.keys()}
 
-    for _ in range(8):
+    for _ in range(20):
+        fixed_total = sum(fixed.values())
+        rem_pct = max(0.0, 100.0 - fixed_total)
+        rem_weight_total = sum(max(0.0, weight_map.get(bot, 0.0)) for bot in remaining)
+        if not remaining or rem_pct <= 0:
+            break
+        if rem_weight_total <= 0:
+            proposal = {bot: rem_pct / max(1, len(remaining)) for bot in remaining}
+        else:
+            proposal = {bot: (max(0.0, weight_map.get(bot, 0.0)) / rem_weight_total) * rem_pct for bot in remaining}
+
         changed = False
-        for bot in list(remaining):
-            item = item_map.get(bot) or {}
-            cap = _optimizer_category_constraints(item.get("category")).get("max_pct", 8.0)
-            score = _safe_float(item.get("score"), 0.0)
-            advisor_action = str(((item.get("advisor") or {}).get("action")) or "").upper()
-
-            # Regras adicionais por qualidade.
-            if score < 40:
-                cap = min(cap, 3.0)
-            elif score < 50:
-                cap = min(cap, 5.0)
-            elif advisor_action == "PAUSE_OR_REVIEW":
-                cap = min(cap, 4.0)
-            elif advisor_action == "REDUCE_OR_WAIT":
-                cap = min(cap, 10.0)
-
-            if weights.get(bot, 0.0) > cap:
+        for bot, pct in list(proposal.items()):
+            cap = max_caps.get(bot, 100.0)
+            if pct > cap:
                 fixed[bot] = cap
                 remaining.remove(bot)
                 changed = True
-
         if not changed:
+            for bot, pct in proposal.items():
+                weights[bot] = pct
             break
 
-        fixed_total = sum(fixed.values())
-        rem_raw_total = sum(weight_map.get(bot, 0.0) for bot in remaining) or 1.0
-        rem_pct = max(0.0, 100.0 - fixed_total)
-        for bot in remaining:
-            weights[bot] = (weight_map.get(bot, 0.0) / rem_raw_total) * rem_pct
-        for bot, pct in fixed.items():
-            weights[bot] = pct
+    for bot, pct in fixed.items():
+        weights[bot] = pct
 
-    # Ajuste final para soma exata 100.
-    final_total = sum(weights.values()) or 1.0
-    weights = {k: (v / final_total) * 100.0 for k, v in weights.items()}
+    # Se os tetos somarem menos de 100, libera excesso apenas para PRIORITIZE; se ainda assim não der, para melhor score.
+    total = sum(weights.values())
+    if total < 99.999:
+        deficit = 100.0 - total
+        priority_bots = [bot for bot, item in item_map.items() if _optimizer_action(item) == "PRIORITIZE"]
+        if not priority_bots:
+            priority_bots = sorted(weight_map.keys(), key=lambda b: _safe_float((item_map.get(b) or {}).get("score"), 0.0), reverse=True)[:1]
+        for bot in priority_bots:
+            # Em exceção de fechamento de soma, PRIORITIZE pode absorver todo o déficit consultivo.
+            weights[bot] = weights.get(bot, 0.0) + deficit / max(1, len(priority_bots))
+
+    # Remove ruído e normaliza base não arredondada.
+    total = sum(weights.values()) or 1.0
+    weights = {bot: (pct / total) * 100.0 for bot, pct in weights.items()}
     return weights
 
 
 def _optimizer_recommendation_for_bot(item, target_pct, capital):
     bot = item.get("bot")
-    current_pct = _safe_float(item.get("capital_allocated"), 0.0) / float(capital or 1.0) * 100.0
+    current_pct = _optimizer_current_pct(item, capital)
     current_capital = _safe_float(item.get("capital_allocated"), 0.0)
     target_capital = float(capital or 0.0) * float(target_pct or 0.0) / 100.0
     delta_pct = target_pct - current_pct
     delta_capital = target_capital - current_capital
     advisor = item.get("advisor") or {}
-    action = str(advisor.get("action") or "OBSERVE").upper()
+    action = _optimizer_action(item)
     score = _safe_float(item.get("score"), 0.0)
     category = str(item.get("category") or "UNKNOWN").upper()
 
-    if delta_pct >= 3.0:
+    if action == "PAUSE_OR_REVIEW" or score < 45:
+        recommendation = "DEFUND_OR_PAUSE_OBSERVATION"
+    elif action == "REDUCE_OR_WAIT":
+        if delta_pct < -1.0:
+            recommendation = "DECREASE_ALLOCATION_OBSERVATION"
+        else:
+            recommendation = "HOLD_OR_WAIT_OBSERVATION"
+    elif category == "EXPERIMENTAL" or action == "MAINTAIN_EXPERIMENTAL_SMALL":
+        recommendation = "CAP_EXPERIMENTAL_OBSERVATION"
+    elif delta_pct >= 3.0:
         recommendation = "INCREASE_ALLOCATION_OBSERVATION"
     elif delta_pct <= -3.0:
         recommendation = "DECREASE_ALLOCATION_OBSERVATION"
     else:
         recommendation = "KEEP_NEAR_CURRENT_OBSERVATION"
 
-    if action == "PAUSE_OR_REVIEW" or score < 45:
-        recommendation = "DEFUND_OR_PAUSE_OBSERVATION"
-    elif category == "EXPERIMENTAL" and target_pct > 5.0:
-        recommendation = "CAP_EXPERIMENTAL_OBSERVATION"
-
     reasons = []
     if recommendation.startswith("INCREASE"):
-        reasons.append("Target otimizado acima da alocação atual por score/qualidade relativa.")
+        reasons.append("Target otimizado acima da alocação atual por score/qualidade relativa e permitido pela política do Advisor.")
     elif recommendation.startswith("DECREASE"):
-        reasons.append("Target otimizado abaixo da alocação atual por score, confiança ou consistência.")
+        reasons.append("Target otimizado abaixo da alocação atual por score, confiança, consistência ou política do Advisor.")
     elif recommendation.startswith("DEFUND"):
-        reasons.append("Score/Advisor indicam pausa ou revisão; capital deve ser protegido em modo consultivo.")
+        reasons.append("Score/Advisor indicam pausa ou revisão; target foi reduzido para mínimo defensivo consultivo.")
+    elif recommendation.startswith("HOLD"):
+        reasons.append("Advisor indica reduzir/aguardar; V1.1 impede aumento e mantém no máximo próximo da alocação atual.")
+    elif recommendation.startswith("CAP_EXPERIMENTAL"):
+        reasons.append("Categoria experimental mantém teto rígido e lote pequeno até amadurecer amostra.")
     else:
         reasons.append("Alocação atual está próxima do target consultivo.")
 
+    if action == "REDUCE_OR_WAIT":
+        reasons.append("Regra V1.1: REDUCE_OR_WAIT nunca aumenta alocação.")
+    if action == "PAUSE_OR_REVIEW":
+        reasons.append("Regra V1.1: PAUSE_OR_REVIEW recebe apenas target mínimo defensivo.")
     if category == "EXPERIMENTAL":
-        reasons.append("Categoria experimental mantém teto conservador de capital.")
+        reasons.append("Regra V1.1: experimental respeita teto rígido de capital.")
     if _safe_float(item.get("usage_pct"), 0.0) >= 95:
         reasons.append("Robô está com capital alocado praticamente cheio; novas entradas devem respeitar redução de tamanho.")
 
@@ -9557,8 +9629,27 @@ def _optimizer_recommendation_for_bot(item, target_pct, capital):
         "recommendation": recommendation,
         "priority": advisor.get("priority"),
         "new_trade_policy": advisor.get("suggested_new_trade_policy"),
-        "reasons": reasons[:6],
+        "reasons": reasons[:7],
     }
+
+
+def _optimizer_adjust_rounded_targets(items, capital):
+    """Ajusta target_pct arredondado para o total fechar em 100.00%."""
+    if not items:
+        return items
+    total = round(sum(_safe_float(x.get("target_pct"), 0.0) for x in items), 2)
+    residual = round(100.0 - total, 2)
+    if abs(residual) >= 0.01:
+        idx = 0
+        for i, item in enumerate(items):
+            if str(item.get("recommendation")) == "INCREASE_ALLOCATION_OBSERVATION":
+                idx = i
+                break
+        items[idx]["target_pct"] = round(_safe_float(items[idx].get("target_pct"), 0.0) + residual, 2)
+        items[idx]["target_capital"] = round(float(capital or 0.0) * items[idx]["target_pct"] / 100.0, 4)
+        items[idx]["delta_pct"] = round(items[idx]["target_pct"] - _safe_float(items[idx].get("current_pct"), 0.0), 2)
+        items[idx]["delta_capital"] = round(items[idx]["target_capital"] - _safe_float(items[idx].get("current_capital"), 0.0), 4)
+    return items
 
 
 def _optimizer_category_summary(items):
@@ -9591,19 +9682,21 @@ def build_portfolio_optimizer_v1(capital=10000.0, bot_filter=None):
         bot = str(item.get("bot") or "UNKNOWN").upper()
         raw_weights[bot] = _optimizer_raw_weight(item)
 
-    target_weights = _optimizer_apply_caps(raw_weights, item_map)
+    target_weights = _optimizer_apply_policy_caps(raw_weights, item_map, capital)
     optimized = []
     for bot, item in item_map.items():
         rec = _optimizer_recommendation_for_bot(item, target_weights.get(bot, 0.0), capital)
         optimized.append(rec)
 
     optimized = sorted(optimized, key=lambda x: (-_safe_float(x.get("target_pct"), 0.0), str(x.get("bot"))))
+    optimized = _optimizer_adjust_rounded_targets(optimized, capital)
 
     total_target_pct = round(sum(_safe_float(x.get("target_pct"), 0.0) for x in optimized), 2)
     total_current_pct = round(sum(_safe_float(x.get("current_pct"), 0.0) for x in optimized), 2)
     increase = [x for x in optimized if str(x.get("recommendation") or "").startswith("INCREASE")]
     decrease = [x for x in optimized if str(x.get("recommendation") or "").startswith("DECREASE")]
     defund = [x for x in optimized if str(x.get("recommendation") or "").startswith("DEFUND")]
+    hold_wait = [x for x in optimized if str(x.get("recommendation") or "").startswith("HOLD")]
 
     exposure = ((advisor_payload.get("summary") or {}).get("exposure_summary") or {})
     live_context = advisor_payload.get("live_context") or {}
@@ -9615,6 +9708,8 @@ def build_portfolio_optimizer_v1(capital=10000.0, bot_filter=None):
         portfolio_alerts.append("Capacidade LIVE teórica zero; otimização é apenas paper/consultiva agora.")
     if defund:
         portfolio_alerts.append(f"{len(defund)} robô(s) com recomendação DEFUND/PAUSE consultiva.")
+    if hold_wait:
+        portfolio_alerts.append(f"{len(hold_wait)} robô(s) em HOLD/WAIT por política do Advisor; V1.1 impede aumento automático.")
 
     payload = {
         "ok": True,
@@ -9625,7 +9720,8 @@ def build_portfolio_optimizer_v1(capital=10000.0, bot_filter=None):
         "inputs": {
             "portfolio_advisor_version": advisor_payload.get("version"),
             "score_engine_version": (advisor_payload.get("inputs") or {}).get("score_engine_version"),
-            "optimizer_basis": "score_quality_with_category_caps_and_consultative_constraints",
+            "optimizer_basis": "advisor_policy_first_score_quality_with_caps_v1_1",
+            "important_fix": "REDUCE_OR_WAIT never increases; PAUSE_OR_REVIEW defensive minimum; experimental hard cap; total closes at 100.00",
         },
         "summary": {
             "bots": len(optimized),
@@ -9634,6 +9730,7 @@ def build_portfolio_optimizer_v1(capital=10000.0, bot_filter=None):
             "increase_count": len(increase),
             "decrease_count": len(decrease),
             "defund_count": len(defund),
+            "hold_wait_count": len(hold_wait),
             "top_target_bot": optimized[0] if optimized else None,
             "category_summary": _optimizer_category_summary(optimized),
             "advisor_summary": advisor_payload.get("summary"),
@@ -9644,13 +9741,16 @@ def build_portfolio_optimizer_v1(capital=10000.0, bot_filter=None):
         "increase_candidates": increase,
         "decrease_candidates": decrease,
         "defund_candidates": defund,
+        "hold_wait_candidates": hold_wait,
         "portfolio_alerts": portfolio_alerts,
         "live_context": live_context,
         "notes": [
-            "Portfolio Optimizer V1 está em modo consultivo/observação.",
+            "Portfolio Optimizer V1.1 está em modo consultivo/observação.",
             "Não altera alocação real, lotes, risco, permissões de entrada ou execução.",
-            "Calcula alocação ideal teórica usando Portfolio Advisor V1, Exposure Score Engine V2 e restrições por categoria.",
-            "Aplica tetos conservadores para robôs experimentais, táticos, satélites e robôs em pausa/revisão.",
+            "Correção V1.1: REDUCE_OR_WAIT nunca aumenta alocação.",
+            "Correção V1.1: PAUSE_OR_REVIEW recebe target mínimo defensivo.",
+            "Correção V1.1: robôs experimentais mantêm teto rígido conservador.",
+            "Correção V1.1: o total alvo fecha em 100.00% após arredondamento.",
             "Preparado para alimentar Dynamic Risk Budget e futuras regras de rebalanceamento.",
         ],
     }
@@ -9663,6 +9763,11 @@ def build_portfolio_optimizer_v1(capital=10000.0, bot_filter=None):
     return payload
 
 
+# Alias explícito para a versão corrigida.
+def build_portfolio_optimizer_v1_1(capital=10000.0, bot_filter=None):
+    return build_portfolio_optimizer_v1(capital=capital, bot_filter=bot_filter)
+
+
 def build_portfolio_optimizer_v1_text(capital=10000.0, bot_filter=None):
     payload = build_portfolio_optimizer_v1(capital=capital, bot_filter=bot_filter)
     summary = payload.get("summary") or {}
@@ -9671,7 +9776,7 @@ def build_portfolio_optimizer_v1_text(capital=10000.0, bot_filter=None):
     live = payload.get("live_context") or {}
 
     lines = [
-        "🧮 PORTFOLIO OPTIMIZER V1 — CENTRAL QUANT",
+        "🧮 PORTFOLIO OPTIMIZER V1.1 — CENTRAL QUANT",
         f"Data/hora: {payload.get('generated_at')}",
         f"Versão: {payload.get('version')}",
         f"Modo: {payload.get('mode')}",
@@ -9680,7 +9785,7 @@ def build_portfolio_optimizer_v1_text(capital=10000.0, bot_filter=None):
         f"Capital analisado: {payload.get('capital')} USDT",
         f"Robôs otimizados: {summary.get('bots')}",
         f"Target total: {summary.get('total_target_pct')}% | Atual total: {summary.get('total_current_pct')}%",
-        f"Aumentar: {summary.get('increase_count')} | Reduzir: {summary.get('decrease_count')} | Pausar/defund: {summary.get('defund_count')}",
+        f"Aumentar: {summary.get('increase_count')} | Reduzir: {summary.get('decrease_count')} | Pausar/defund: {summary.get('defund_count')} | Hold/wait: {summary.get('hold_wait_count')}",
         f"Estado Advisor: {summary.get('portfolio_state')}",
         f"Paper: posições {exposure.get('positions')} | LONG {exposure.get('long')} | SHORT {exposure.get('short')} | Net {exposure.get('net_direction')}",
         f"Capital paper usado: {exposure.get('capital_used')} USDT ({exposure.get('capital_usage_pct')}%)",
@@ -9714,7 +9819,7 @@ def build_portfolio_optimizer_v1_text(capital=10000.0, bot_filter=None):
         reasons = item.get("reasons") or []
         if reasons:
             lines.append("Motivos:")
-            for reason in reasons[:4]:
+            for reason in reasons[:5]:
                 lines.append(f"- {reason}")
 
     cat = summary.get("category_summary") or {}
@@ -9732,10 +9837,19 @@ def build_portfolio_optimizer_v1_text(capital=10000.0, bot_filter=None):
     return "\n".join(lines), payload
 
 
+# Alias explícito para texto da versão corrigida.
+def build_portfolio_optimizer_v1_1_text(capital=10000.0, bot_filter=None):
+    return build_portfolio_optimizer_v1_text(capital=capital, bot_filter=bot_filter)
+
+
 @app.route("/portfolio/optimizer/v1")
 @app.route("/portfoliooptimizer/v1")
 @app.route("/optimizer/portfolio/v1")
 @app.route("/optimizer/v1")
+@app.route("/portfolio/optimizer/v1.1")
+@app.route("/portfoliooptimizer/v1.1")
+@app.route("/optimizer/portfolio/v1.1")
+@app.route("/optimizer/v1.1")
 def portfolio_optimizer_v1_route():
     capital = request.args.get("capital", default=10000, type=float)
     as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
@@ -9747,6 +9861,8 @@ def portfolio_optimizer_v1_route():
 
 @app.route("/portfolio/optimizer/<bot>/v1")
 @app.route("/optimizer/portfolio/<bot>/v1")
+@app.route("/portfolio/optimizer/<bot>/v1.1")
+@app.route("/optimizer/portfolio/<bot>/v1.1")
 def portfolio_optimizer_v1_bot_route(bot):
     capital = request.args.get("capital", default=10000, type=float)
     as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
@@ -9758,6 +9874,8 @@ def portfolio_optimizer_v1_bot_route(bot):
 
 @app.route("/portfolio/optimizer/summary/v1")
 @app.route("/optimizer/summary/v1")
+@app.route("/portfolio/optimizer/summary/v1.1")
+@app.route("/optimizer/summary/v1.1")
 def portfolio_optimizer_v1_summary_route():
     capital = request.args.get("capital", default=10000, type=float)
     payload = build_portfolio_optimizer_v1(capital=capital)
@@ -9771,6 +9889,7 @@ def portfolio_optimizer_v1_summary_route():
         "increase_candidates": payload.get("increase_candidates"),
         "decrease_candidates": payload.get("decrease_candidates"),
         "defund_candidates": payload.get("defund_candidates"),
+        "hold_wait_candidates": payload.get("hold_wait_candidates"),
         "portfolio_alerts": payload.get("portfolio_alerts"),
         "live_context": payload.get("live_context"),
         "cache": {
@@ -9778,6 +9897,7 @@ def portfolio_optimizer_v1_summary_route():
             "last_capital": PORTFOLIO_OPTIMIZER_V1_CACHE.get("last_capital"),
         },
     }
+
 
 
 
