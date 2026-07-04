@@ -13382,13 +13382,63 @@ def api_execution_plan():
             "capital_allocated": request.args.get("capital_allocated", 4500),
         }
 
-    return orchestrate_execution(
+    # Executive Policy Manager gate — última trava antes do Execution Orchestrator.
+    # Mesmo que /can_open_trade falhe ou não seja chamado antes, nenhuma ordem
+    # deve chegar ao orchestrate_execution sem passar pelas políticas executivas
+    # persistentes: NO_NEW_LONG, NO_NEW_SHORT, BLOCK_BOT, BLOCK_SYMBOL etc.
+    policy_reasons = []
+    policy_warnings = []
+    executive_policy_eval = _apply_executive_policy_to_risk_reasons(
+        trade_payload=payload,
+        reasons=policy_reasons,
+        warnings=policy_warnings,
+    )
+
+    if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
+        blocked_payload = dict(payload or {})
+        blocked_payload["decision"] = "DENY"
+        blocked_payload["blocked_by"] = "EXECUTIVE_POLICY_MANAGER"
+        blocked_payload["executive_policy"] = executive_policy_eval
+
+        return {
+            "ok": True,
+            "mode": payload.get("mode") or "VERIFY",
+            "dry_run": True,
+            "decision": "DENY",
+            "allowed": False,
+            "status": "BLOCKED_BY_EXECUTIVE_POLICY",
+            "blocked_by": "EXECUTIVE_POLICY_MANAGER",
+            "executive_policy": executive_policy_eval,
+            "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
+            "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
+            "payload": blocked_payload,
+            "notes": [
+                "Execution Orchestrator protegido pelo Executive Policy Manager.",
+                "Nenhuma chamada a orchestrate_execution foi feita porque a política executiva bloqueou a trade.",
+            ],
+        }
+
+    if isinstance(executive_policy_eval, dict):
+        payload["executive_policy"] = executive_policy_eval
+
+    orchestration_result = orchestrate_execution(
         payload=payload,
         mode=payload.get("mode"),
         requested_qty=payload.get("requested_qty"),
         capital_allocated=payload.get("capital_allocated"),
         dry_run=True,
     )
+
+    if isinstance(orchestration_result, dict):
+        orchestration_result.setdefault("executive_policy", executive_policy_eval)
+        orchestration_result.setdefault("policy_gate", {
+            "checked": True,
+            "allowed": True,
+            "source": "executive_policy_manager",
+            "warnings": policy_warnings,
+        })
+
+    return orchestration_result
 
 
 @app.route("/execution/log")
