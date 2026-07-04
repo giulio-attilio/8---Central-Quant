@@ -17981,6 +17981,472 @@ def correlation_engine_v1_summary_route():
     }
 
 
+# ==========================================================
+# STRATEGY EVOLUTION ENGINE V1 - CENTRAL QUANT
+# ==========================================================
+
+STRATEGY_EVOLUTION_ENGINE_V1_VERSION = "2026-07-04-STRATEGY-EVOLUTION-ENGINE-V1"
+STRATEGY_EVOLUTION_ENGINE_V1_MODE = "OBSERVATION_ONLY"
+STRATEGY_EVOLUTION_ENGINE_V1_FILE = CENTRAL_DATA_DIR / "strategy_evolution_engine_v1.jsonl"
+STRATEGY_EVOLUTION_ENGINE_V1_CACHE = {"last_generated_at": None, "last_capital": None}
+
+
+def _see_safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _see_safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _see_append_jsonl(item):
+    try:
+        STRATEGY_EVOLUTION_ENGINE_V1_FILE.parent.mkdir(exist_ok=True)
+        with open(STRATEGY_EVOLUTION_ENGINE_V1_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _see_get_outcome_stats():
+    try:
+        return _oe_evaluator_stats(_oe_read_records(limit=5000))
+    except Exception:
+        try:
+            return _le_outcome_stats(_le_read_records(limit=5000))
+        except Exception:
+            return {"by_module": {}, "by_decision": {}, "evaluations": 0, "records": 0}
+
+
+def _see_get_trade_stats_by_bot():
+    """Use Analytics when available; otherwise return empty stats.
+
+    This keeps Strategy Evolution V1 lightweight and avoids calling heavy endpoints.
+    """
+    candidates = {}
+    try:
+        # Many Central versions expose analytics through build_analytics_report.
+        if "build_analytics_report" in globals():
+            raw = build_analytics_report()
+            if isinstance(raw, dict):
+                rows = raw.get("bots") or raw.get("by_bot") or raw.get("ranking") or []
+                if isinstance(rows, dict):
+                    rows = [{"bot": k, **(v if isinstance(v, dict) else {})} for k, v in rows.items()]
+                for row in rows or []:
+                    bot = str(row.get("bot") or row.get("name") or "").upper().strip()
+                    if bot:
+                        candidates[bot] = row
+    except Exception:
+        pass
+    return candidates
+
+
+def _see_find_optimizer_item(optimizer_payload, bot):
+    bot = str(bot or "").upper().strip()
+    for item in (optimizer_payload.get("optimized_allocation") or []):
+        if str(item.get("bot") or "").upper().strip() == bot:
+            return item
+    return {}
+
+
+def _see_find_risk_budget_item(risk_budget_payload, bot):
+    bot = str(bot or "").upper().strip()
+    for item in (risk_budget_payload.get("budgets") or []):
+        if str(item.get("bot") or "").upper().strip() == bot:
+            return item
+    return {}
+
+
+def _see_find_meta_item(meta_payload, bot):
+    bot = str(bot or "").upper().strip()
+    for item in (meta_payload.get("strategies") or []):
+        if str(item.get("bot") or "").upper().strip() == bot:
+            return item
+    return {}
+
+
+def _see_bot_family_from_meta(meta_item, bot):
+    try:
+        return meta_item.get("strategy_family") or _mse_strategy_family(bot)
+    except Exception:
+        return "UNKNOWN"
+
+
+def _see_evolution_decision(bot, advisor_item, optimizer_item, risk_item, meta_item, outcome_stats):
+    advisor = advisor_item.get("advisor") or {}
+    bot_name = str(bot or advisor_item.get("bot") or "UNKNOWN").upper()
+    score = _see_safe_float(advisor_item.get("score"), 0.0)
+    trades = _see_safe_int(advisor_item.get("trades"), 0)
+    win = _see_safe_float(advisor_item.get("win_rate_pct"), None)
+    pnl = _see_safe_float(advisor_item.get("pnl_total_pct"), 0.0)
+    expectancy = _see_safe_float(advisor_item.get("expectancy_score") or advisor_item.get("expectancy") or advisor_item.get("expectancy_pct"), None)
+    advisor_action = str(advisor.get("action") or optimizer_item.get("advisor_action") or "UNKNOWN").upper()
+    optimizer_rec = str(optimizer_item.get("recommendation") or optimizer_item.get("optimizer_recommendation") or "UNKNOWN").upper()
+    risk_state = str(risk_item.get("risk_state") or "UNKNOWN").upper()
+    meta_gate = str(meta_item.get("autonomy_gate") or "UNKNOWN").upper()
+    signal_gate = str(meta_item.get("signal_gate") or "UNKNOWN").upper()
+    priority_score = _see_safe_float(meta_item.get("autonomous_priority_score"), 0.0)
+    target_pct = _see_safe_float(optimizer_item.get("target_pct") or meta_item.get("target_pct"), 0.0)
+    current_pct = _see_safe_float(optimizer_item.get("current_pct") or meta_item.get("current_pct"), 0.0)
+    delta_pct = _see_safe_float(optimizer_item.get("delta_pct") or meta_item.get("delta_pct"), 0.0)
+
+    # Outcome evidence by bot is not yet complete in V1; use global evaluator stats as confidence context.
+    evaluations = _see_safe_int(outcome_stats.get("evaluations") or outcome_stats.get("outcomes") or 0, 0)
+
+    reasons = []
+    action = "OBSERVE"
+    evolution_state = "WAIT_MORE_EVIDENCE"
+    parameter_policy = "NO_AUTO_CHANGE"
+    deployment_policy = "KEEP_CURRENT_VERSION"
+    capital_policy = "NO_CHANGE"
+    risk_policy = "NO_CHANGE"
+    next_experiment = None
+
+    if advisor_action == "PRIORITIZE" and score >= 75 and risk_state == "PRIORITY":
+        action = "PROMOTE_OR_MAINTAIN_LEADER"
+        evolution_state = "LEADER_ACTIVE"
+        parameter_policy = "PROTECT_CORE_LOGIC_NO_RANDOM_CHANGES"
+        deployment_policy = "KEEP_CURRENT_VERSION_AND_COLLECT_OUTCOMES"
+        capital_policy = "ALLOW_GRADUAL_PRIORITY_IF_RISK_APPROVES"
+        risk_policy = "ALLOW_CURRENT_DYNAMIC_BUDGET"
+        reasons.append("Robô lidera Advisor/Optimizer/Risk Budget; não alterar lógica vencedora sem evidência contrária.")
+    elif advisor_action in {"PAUSE_OR_REVIEW", "DEFUND_OR_PAUSE_OBSERVATION"} or risk_state == "DEFENSIVE_MINIMUM" or "DO_NOT_OPEN" in meta_gate:
+        action = "DEMOTE_OR_FREEZE_STRATEGY"
+        evolution_state = "DEFENSIVE_REVIEW"
+        parameter_policy = "FREEZE_NEW_RISK_AND_REVIEW_SETUP"
+        deployment_policy = "NO_PROMOTION_UNTIL_RECOVERY"
+        capital_policy = "DEFUND_OR_MINIMUM_ALLOCATION"
+        risk_policy = "MINIMUM_RISK_ONLY"
+        reasons.append("Advisor/Optimizer/Meta colocaram a estratégia em modo defensivo; bloquear evolução agressiva.")
+    elif advisor_action == "REDUCE_OR_WAIT" or risk_state == "WAIT_REDUCED" or "STRONG_CONFIRMATION" in meta_gate:
+        action = "REVIEW_AND_REQUIRE_STRONG_CONFIRMATION"
+        evolution_state = "WATCHLIST_REDUCED"
+        parameter_policy = "TEST_SMALL_VARIANTS_ONLY"
+        deployment_policy = "NO_AUTO_PROMOTION"
+        capital_policy = "HOLD_OR_REDUCE"
+        risk_policy = "REDUCED_RISK"
+        next_experiment = "A/B test conservador em paper antes de promover qualquer ajuste."
+        reasons.append("Estratégia ainda não merece expansão; permitir apenas testes pequenos e filtrados.")
+    elif "EXPERIMENTAL" in advisor_action or str(advisor_item.get("category") or "").upper() == "EXPERIMENTAL":
+        action = "KEEP_EXPERIMENT_SMALL"
+        evolution_state = "EXPERIMENTAL_CAPPED"
+        parameter_policy = "RUN_PAPER_EXPERIMENTS_ONLY"
+        deployment_policy = "PROMOTE_ONLY_AFTER_SAMPLE"
+        capital_policy = "CAP_EXPERIMENTAL_ALLOCATION"
+        risk_policy = "CAP_EXPERIMENTAL_RISK"
+        next_experiment = "Acumular amostra antes de liberar aumento de lote."
+        reasons.append("Estratégia experimental com teto rígido até haver amostra suficiente.")
+
+    if trades and trades < 10:
+        reasons.append("Amostra estatística ainda baixa; evitar conclusões definitivas.")
+        if action == "PROMOTE_OR_MAINTAIN_LEADER":
+            parameter_policy = "MAINTAIN_BUT_WAIT_MORE_SAMPLE"
+    if win is not None and win < 30 and trades >= 5:
+        reasons.append("Win rate baixo com alguma amostra; revisar setup antes de promover.")
+    if pnl < -2:
+        reasons.append("PnL acumulado negativo; reduzir agressividade até recuperação estatística.")
+    if delta_pct < -5:
+        reasons.append("Optimizer sugere retirada relevante de capital; estratégia deve perder prioridade.")
+    if evaluations < 10:
+        reasons.append("Learning/Outcome ainda em bootstrap; Strategy Evolution V1 não aplica mudanças automáticas.")
+
+    # Simple evolutionary score: quality + meta priority + capital delta, penalized by defensive states.
+    evo_score = score * 0.55 + min(max(priority_score, 0.0), 100.0) * 0.25 + max(min(delta_pct + 20, 40), 0) * 0.5
+    if action == "DEMOTE_OR_FREEZE_STRATEGY":
+        evo_score = min(evo_score, 35.0)
+    if action == "REVIEW_AND_REQUIRE_STRONG_CONFIRMATION":
+        evo_score = min(evo_score, 55.0)
+    if action == "KEEP_EXPERIMENT_SMALL":
+        evo_score = min(evo_score, 65.0)
+    evo_score = round(evo_score, 2)
+
+    return {
+        "bot": bot_name,
+        "category": advisor_item.get("category"),
+        "strategy_family": _see_bot_family_from_meta(meta_item, bot_name),
+        "strategy_cluster": meta_item.get("strategy_cluster"),
+        "score": score,
+        "trades": trades,
+        "win_rate_pct": win,
+        "pnl_total_pct": pnl,
+        "advisor_action": advisor_action,
+        "optimizer_recommendation": optimizer_rec,
+        "risk_state": risk_state,
+        "meta_gate": meta_gate,
+        "signal_gate": signal_gate,
+        "target_pct": target_pct,
+        "current_pct": current_pct,
+        "delta_pct": delta_pct,
+        "evolution_score": evo_score,
+        "evolution_state": evolution_state,
+        "evolution_action": action,
+        "parameter_policy": parameter_policy,
+        "deployment_policy": deployment_policy,
+        "capital_policy": capital_policy,
+        "risk_policy": risk_policy,
+        "next_experiment": next_experiment,
+        "auto_apply_allowed": False,
+        "human_report_required": False,
+        "reasons": reasons[:8],
+    }
+
+
+def build_strategy_evolution_engine_v1(capital=10000.0, persist=False):
+    global STRATEGY_EVOLUTION_ENGINE_V1_CACHE
+    capital = _see_safe_float(capital, 10000.0)
+    alerts = []
+    errors = []
+
+    try:
+        advisor_payload = build_portfolio_advisor_v1(capital=capital)
+    except Exception as exc:
+        advisor_payload = {"ranking": []}
+        errors.append(f"Advisor indisponível: {exc}")
+    try:
+        optimizer_payload = build_portfolio_optimizer_v1_1(capital=capital)
+    except Exception as exc:
+        optimizer_payload = {"optimized_allocation": []}
+        errors.append(f"Optimizer indisponível: {exc}")
+    try:
+        risk_payload = build_dynamic_risk_budget_v1(capital=capital)
+    except Exception as exc:
+        risk_payload = {"budgets": []}
+        errors.append(f"Risk Budget indisponível: {exc}")
+    try:
+        meta_payload = build_meta_strategy_engine_v1_1(capital=capital)
+    except Exception as exc:
+        meta_payload = {"strategies": []}
+        errors.append(f"Meta Strategy indisponível: {exc}")
+    try:
+        market_payload = build_market_regime_detector_v1(capital=capital)
+    except Exception as exc:
+        market_payload = {}
+        errors.append(f"Market Regime indisponível: {exc}")
+    try:
+        corr_payload = build_correlation_engine_v1(capital=capital)
+    except Exception as exc:
+        corr_payload = {}
+        errors.append(f"Correlation Engine indisponível: {exc}")
+
+    outcome_stats = _see_get_outcome_stats()
+    analytics_by_bot = _see_get_trade_stats_by_bot()
+
+    strategies = []
+    for item in advisor_payload.get("ranking") or []:
+        bot = str(item.get("bot") or "").upper().strip()
+        if not bot:
+            continue
+        merged = dict(item)
+        if bot in analytics_by_bot:
+            for k, v in analytics_by_bot[bot].items():
+                merged.setdefault(k, v)
+        evo = _see_evolution_decision(
+            bot,
+            merged,
+            _see_find_optimizer_item(optimizer_payload, bot),
+            _see_find_risk_budget_item(risk_payload, bot),
+            _see_find_meta_item(meta_payload, bot),
+            outcome_stats,
+        )
+        strategies.append(evo)
+
+    strategies = sorted(strategies, key=lambda x: (_see_safe_float(x.get("evolution_score"), 0), _see_safe_float(x.get("score"), 0)), reverse=True)
+
+    counts = {
+        "total": len(strategies),
+        "leaders": len([x for x in strategies if x.get("evolution_action") == "PROMOTE_OR_MAINTAIN_LEADER"]),
+        "watchlist": len([x for x in strategies if x.get("evolution_action") == "REVIEW_AND_REQUIRE_STRONG_CONFIRMATION"]),
+        "experimental": len([x for x in strategies if x.get("evolution_action") == "KEEP_EXPERIMENT_SMALL"]),
+        "defensive": len([x for x in strategies if x.get("evolution_action") == "DEMOTE_OR_FREEZE_STRATEGY"]),
+    }
+
+    top_strategy = strategies[0] if strategies else None
+    evolution_ready = False
+    auto_apply_ready = False
+    evaluations = _see_safe_int(outcome_stats.get("evaluations") or outcome_stats.get("outcomes") or 0, 0)
+    if evaluations >= 50:
+        evolution_ready = True
+    if evaluations >= 200:
+        auto_apply_ready = True
+
+    if not strategies:
+        alerts.append("Strategy Evolution não recebeu estratégias do Advisor; manter modo defensivo.")
+    if evaluations < 10:
+        alerts.append("Learning/Outcome ainda em bootstrap; não aplicar evolução automática.")
+    if counts.get("defensive"):
+        alerts.append(f"{counts.get('defensive')} estratégia(s) em revisão/defensivo; bloquear promoção automática.")
+    if top_strategy:
+        alerts.append(f"Estratégia líder atual para preservação/evolução: {top_strategy.get('bot')}.")
+
+    payload = {
+        "ok": True,
+        "version": STRATEGY_EVOLUTION_ENGINE_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": STRATEGY_EVOLUTION_ENGINE_V1_MODE,
+        "capital": capital,
+        "machine_first": True,
+        "human_report_required": False,
+        "evolution_ready": evolution_ready,
+        "auto_apply_ready": auto_apply_ready,
+        "auto_apply_allowed": False,
+        "counts": counts,
+        "top_strategy": top_strategy,
+        "strategies": strategies,
+        "market_context": {
+            "regime": market_payload.get("regime"),
+            "regime_family": market_payload.get("regime_family"),
+            "confidence": market_payload.get("confidence"),
+            "source": market_payload.get("source"),
+        },
+        "correlation_context": {
+            "dominant_cluster": ((corr_payload.get("automation_policy") or {}).get("dominant_cluster")),
+            "dominant_cluster_severity": ((corr_payload.get("automation_policy") or {}).get("dominant_cluster_severity")),
+            "compressed_clusters": ((corr_payload.get("automation_policy") or {}).get("compressed_clusters")),
+        },
+        "learning_context": {
+            "evaluations": evaluations,
+            "min_for_active_evolution": 50,
+            "min_for_auto_apply": 200,
+            "decision_accuracy_pct": outcome_stats.get("decision_accuracy_pct"),
+            "by_module": outcome_stats.get("by_module"),
+        },
+        "automation_policy": {
+            "route": "MARKET_REGIME_META_CORRELATION_DECISION_THEN_STRATEGY_EVOLUTION_FEEDBACK",
+            "strategy_evolution_ready": True,
+            "auto_parameter_changes_allowed": False,
+            "auto_deploy_allowed": False,
+            "allowed_actions_now": ["RANK_STRATEGIES", "FREEZE_DEFENSIVE", "PROPOSE_EXPERIMENTS", "PROTECT_LEADERS"],
+            "blocked_actions": ["AUTO_DEPLOY_CODE", "AUTO_CHANGE_REAL_RISK", "PROMOTE_WITHOUT_OUTCOMES", "BYPASS_DECISION_ENGINE"],
+        },
+        "alerts": alerts,
+        "errors": errors,
+        "notes": [
+            "Strategy Evolution Engine V1 é machine-first e não depende de relatório humano.",
+            "V1 não altera código, parâmetros, risco real, lote ou deploy; apenas classifica estratégias para evolução futura.",
+            "Usa Advisor, Optimizer, Risk Budget, Meta Strategy, Market Regime, Correlation e outcomes avaliados.",
+            "Mudanças automáticas ficam bloqueadas até haver amostra suficiente de outcomes e integração com OMS/Executor.",
+        ],
+    }
+
+    if persist:
+        saved, err = _see_append_jsonl({"record_type": "STRATEGY_EVOLUTION_SNAPSHOT", **payload})
+        payload["state_saved"] = saved
+        payload["state_save_error"] = err
+    else:
+        payload["state_saved"] = False
+
+    STRATEGY_EVOLUTION_ENGINE_V1_CACHE = {"last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    return payload
+
+
+def build_strategy_evolution_engine_v1_text(capital=10000.0, persist=False):
+    payload = build_strategy_evolution_engine_v1(capital=capital, persist=persist)
+    market = payload.get("market_context") or {}
+    corr = payload.get("correlation_context") or {}
+    learn = payload.get("learning_context") or {}
+    counts = payload.get("counts") or {}
+    top = payload.get("top_strategy") or {}
+    lines = [
+        "🧬 STRATEGY EVOLUTION ENGINE V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Estado autônomo:",
+        f"Evolution ready: {payload.get('evolution_ready')} | Auto apply ready: {payload.get('auto_apply_ready')} | Auto apply allowed: {payload.get('auto_apply_allowed')}",
+        f"Human report required: {payload.get('human_report_required')}",
+        f"Regime: {market.get('regime')} | Família: {market.get('regime_family')} | Confiança: {market.get('confidence')}",
+        f"Cluster dominante: {corr.get('dominant_cluster')} | Severidade: {corr.get('dominant_cluster_severity')}",
+        f"Outcomes avaliados: {learn.get('evaluations')} | mínimo evolução ativa: {learn.get('min_for_active_evolution')} | mínimo auto-apply: {learn.get('min_for_auto_apply')}",
+        "",
+        "Contagem:",
+        f"Total: {counts.get('total')} | Leaders: {counts.get('leaders')} | Watchlist: {counts.get('watchlist')} | Experimental: {counts.get('experimental')} | Defensive: {counts.get('defensive')}",
+        "",
+    ]
+    if top:
+        lines += [
+            "Estratégia líder:",
+            f"{top.get('bot')} — {top.get('evolution_action')} | estado: {top.get('evolution_state')} | score evolução: {top.get('evolution_score')}",
+            f"Política: parâmetros={top.get('parameter_policy')} | deploy={top.get('deployment_policy')} | risco={top.get('risk_policy')}",
+            "",
+        ]
+    lines.append("Estratégias:")
+    for i, item in enumerate(payload.get("strategies") or [], start=1):
+        lines += [
+            f"{i}. {item.get('bot')} — {item.get('evolution_action')} | {item.get('evolution_state')} | evo_score={item.get('evolution_score')}",
+            f"Família: {item.get('strategy_family')} | Cluster: {item.get('strategy_cluster')} | Score: {item.get('score')} | Trades: {item.get('trades')}",
+            f"Advisor: {item.get('advisor_action')} | Risk: {item.get('risk_state')} | Meta: {item.get('meta_gate')}",
+            f"Target: {item.get('target_pct')}% | Atual: {item.get('current_pct')}% | Δ {item.get('delta_pct')}%",
+            f"Políticas: capital={item.get('capital_policy')} | risco={item.get('risk_policy')} | parâmetros={item.get('parameter_policy')}",
+        ]
+        reasons = item.get("reasons") or []
+        if reasons:
+            lines.append("Motivos:")
+            for r in reasons[:5]:
+                lines.append(f"- {r}")
+        lines.append("")
+    lines.append("Alertas:")
+    for a in payload.get("alerts") or []:
+        lines.append(f"- {a}")
+    if payload.get("errors"):
+        lines.append("")
+        lines.append("Erros upstream:")
+        for e in payload.get("errors") or []:
+            lines.append(f"- {e}")
+    lines.append("")
+    lines.append("Notas:")
+    for n in payload.get("notes") or []:
+        lines.append(f"- {n}")
+    return "\n".join(lines), payload
+
+
+@app.route("/strategy/evolution/v1", methods=["GET", "POST"])
+@app.route("/evolution/strategy/v1", methods=["GET", "POST"])
+@app.route("/strategy-evolution/v1", methods=["GET", "POST"])
+def strategy_evolution_engine_v1_route():
+    body = request.get_json(silent=True) or {}
+    capital = _see_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    persist_raw = body.get("persist", request.args.get("persist", ""))
+    persist = str(persist_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    text, payload = build_strategy_evolution_engine_v1_text(capital=capital, persist=persist)
+    return {"ok": True, "payload": payload, "text": text}
+
+
+@app.route("/strategy/evolution/summary/v1", methods=["GET", "POST"])
+@app.route("/strategy-evolution/summary/v1", methods=["GET", "POST"])
+def strategy_evolution_engine_v1_summary_route():
+    body = request.get_json(silent=True) or {}
+    capital = _see_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
+    payload = build_strategy_evolution_engine_v1(capital=capital, persist=False)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "evolution_ready": payload.get("evolution_ready"),
+        "auto_apply_ready": payload.get("auto_apply_ready"),
+        "counts": payload.get("counts"),
+        "top_strategy": payload.get("top_strategy"),
+        "market_context": payload.get("market_context"),
+        "correlation_context": payload.get("correlation_context"),
+        "learning_context": payload.get("learning_context"),
+        "automation_policy": payload.get("automation_policy"),
+        "alerts": payload.get("alerts"),
+    }
+
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
