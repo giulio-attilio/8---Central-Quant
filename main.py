@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-03-SUPER-CENTRAL-QUANT-V5-TRADE-REGISTRY-PORTFOLIO-OPTIMIZER-V1.1
+# Versão: 2026-07-04-SUPER-CENTRAL-QUANT-V5-DYNAMIC-RISK-BUDGET-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -9901,6 +9901,421 @@ def portfolio_optimizer_v1_summary_route():
 
 
 
+
+
+# ==========================================================
+# DYNAMIC RISK BUDGET V1 - CENTRAL QUANT
+# ==========================================================
+
+DYNAMIC_RISK_BUDGET_V1_VERSION = "2026-07-04-DYNAMIC-RISK-BUDGET-V1"
+DYNAMIC_RISK_BUDGET_V1_MODE = "OBSERVATION_ONLY"
+DYNAMIC_RISK_BUDGET_V1_CACHE = {"last_payload": None, "last_generated_at": None, "last_capital": None}
+
+
+def _drb_safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _drb_clip(value, low, high):
+    try:
+        value = float(value)
+    except Exception:
+        value = low
+    return max(float(low), min(float(high), value))
+
+
+def _drb_round_pct(value, ndigits=2):
+    return round(_drb_safe_float(value, 0.0), ndigits)
+
+
+def _dynamic_risk_policy_for_bot(item, total_risk_budget_pct):
+    """
+    Traduz a alocação ideal do Portfolio Optimizer V1.1 em orçamento de risco.
+    Continua consultivo: não altera lote, risco, capital ou execução real.
+    """
+    bot = str(item.get("bot") or "UNKNOWN").upper().strip()
+    category = str(item.get("category") or "UNKNOWN").upper().strip()
+    advisor_action = str(item.get("advisor_action") or "").upper().strip()
+    recommendation = str(item.get("recommendation") or "").upper().strip()
+    new_trade_policy = str(item.get("new_trade_policy") or "").upper().strip()
+    score = _drb_safe_float(item.get("score"), 0.0)
+    target_pct = _drb_safe_float(item.get("target_pct"), 0.0)
+    current_pct = _drb_safe_float(item.get("current_pct"), 0.0)
+    delta_pct = _drb_safe_float(item.get("delta_pct"), 0.0)
+
+    base_budget_pct = (target_pct / 100.0) * float(total_risk_budget_pct)
+    policy_multiplier = 1.0
+    per_trade_cap_pct = 0.50
+    min_per_trade_pct = 0.05
+    max_open_trades = 3
+    risk_state = "NORMAL"
+    risk_action = "HOLD_RISK_BUDGET_OBSERVATION"
+    reasons = []
+
+    if advisor_action == "PRIORITIZE":
+        policy_multiplier = 1.08
+        per_trade_cap_pct = 0.75
+        max_open_trades = 6
+        risk_state = "PRIORITY"
+        risk_action = "INCREASE_RISK_BUDGET_OBSERVATION" if delta_pct > 1 else "MAINTAIN_PRIORITY_RISK_OBSERVATION"
+        reasons.append("Advisor prioriza o robô; orçamento de risco pode ser maior em modo consultivo.")
+    elif advisor_action == "MAINTAIN_EXPERIMENTAL_SMALL" or category == "EXPERIMENTAL":
+        policy_multiplier = 0.65
+        per_trade_cap_pct = 0.25
+        max_open_trades = 2
+        risk_state = "EXPERIMENTAL_CAPPED"
+        risk_action = "CAP_EXPERIMENTAL_RISK_OBSERVATION"
+        reasons.append("Categoria experimental: risco por trade e risco total ficam limitados até amadurecer amostra.")
+    elif advisor_action == "REDUCE_OR_WAIT":
+        policy_multiplier = 0.50
+        per_trade_cap_pct = 0.25
+        max_open_trades = 2
+        risk_state = "WAIT_REDUCED"
+        risk_action = "REDUCE_OR_HOLD_RISK_OBSERVATION"
+        reasons.append("Advisor indica reduzir/aguardar; V1 limita risco e impede expansão agressiva.")
+    elif advisor_action == "PAUSE_OR_REVIEW" or "PAUSE" in recommendation:
+        policy_multiplier = 0.20
+        per_trade_cap_pct = 0.10
+        max_open_trades = 1
+        risk_state = "DEFENSIVE_MINIMUM"
+        risk_action = "PAUSE_OR_MINIMUM_RISK_OBSERVATION"
+        reasons.append("Advisor indica pausa/revisão; risco fica em mínimo defensivo consultivo.")
+    else:
+        reasons.append("Sem política especial; orçamento segue target do Portfolio Optimizer com limites conservadores.")
+
+    if "REDUCE_SIZE" in new_trade_policy:
+        per_trade_cap_pct = min(per_trade_cap_pct, 0.35)
+        reasons.append("Política de novo trade exige redução de tamanho; limite por trade foi comprimido.")
+    if "PAUSE" in new_trade_policy:
+        per_trade_cap_pct = min(per_trade_cap_pct, 0.10)
+        max_open_trades = min(max_open_trades, 1)
+        reasons.append("Política de novo trade está em pausa; apenas orçamento defensivo de observação.")
+
+    if score >= 80:
+        reasons.append("Score alto permite orçamento acima da média, respeitando concentração e capital disponível.")
+    elif score < 50:
+        policy_multiplier *= 0.75
+        reasons.append("Score abaixo de 50 reduz orçamento de risco calculado.")
+    elif score < 60:
+        policy_multiplier *= 0.90
+        reasons.append("Score intermediário/fraco mantém orçamento conservador.")
+
+    raw_budget_pct = base_budget_pct * policy_multiplier
+
+    # Caps por categoria/política para evitar que o orçamento de risco fique agressivo demais.
+    if advisor_action == "PRIORITIZE":
+        max_budget_pct = 4.0
+    elif category == "CORE":
+        max_budget_pct = 2.0
+    elif category == "TACTICAL":
+        max_budget_pct = 0.75
+    elif category == "SATELLITE":
+        max_budget_pct = 0.60
+    elif category == "EXPERIMENTAL":
+        max_budget_pct = 0.50
+    else:
+        max_budget_pct = 0.75
+
+    if advisor_action == "PAUSE_OR_REVIEW":
+        max_budget_pct = min(max_budget_pct, 0.15)
+    if advisor_action == "REDUCE_OR_WAIT":
+        max_budget_pct = min(max_budget_pct, 0.60)
+    if category == "EXPERIMENTAL":
+        max_budget_pct = min(max_budget_pct, 0.35)
+
+    min_budget_pct = 0.0 if target_pct <= 0 else 0.05
+    budget_pct = _drb_clip(raw_budget_pct, min_budget_pct, max_budget_pct)
+
+    # Risco por trade sugerido.
+    if max_open_trades <= 0:
+        max_open_trades = 1
+    per_trade_pct = budget_pct / max_open_trades if max_open_trades else budget_pct
+    per_trade_pct = _drb_clip(per_trade_pct, min_per_trade_pct if budget_pct > 0 else 0.0, per_trade_cap_pct)
+
+    # Recalcula capacidade consultiva máxima com base no per_trade sugerido.
+    if per_trade_pct > 0:
+        suggested_max_open_trades = int(max(1, min(max_open_trades, budget_pct // per_trade_pct if budget_pct >= per_trade_pct else 1)))
+    else:
+        suggested_max_open_trades = 0
+
+    if risk_action.startswith("INCREASE") and budget_pct <= 0.25:
+        risk_action = "MAINTAIN_SMALL_RISK_OBSERVATION"
+    if advisor_action == "PAUSE_OR_REVIEW":
+        suggested_max_open_trades = min(suggested_max_open_trades, 1)
+
+    return {
+        "bot": bot,
+        "category": category,
+        "score": round(score, 2),
+        "advisor_action": advisor_action,
+        "optimizer_recommendation": recommendation,
+        "new_trade_policy": new_trade_policy,
+        "target_pct": round(target_pct, 2),
+        "current_pct": round(current_pct, 2),
+        "delta_pct": round(delta_pct, 2),
+        "risk_state": risk_state,
+        "risk_action": risk_action,
+        "risk_budget_pct": round(budget_pct, 4),
+        "risk_budget_usdt": None,
+        "risk_per_trade_pct": round(per_trade_pct, 4),
+        "risk_per_trade_usdt": None,
+        "suggested_max_open_trades": int(suggested_max_open_trades),
+        "raw_budget_pct": round(raw_budget_pct, 4),
+        "base_budget_pct": round(base_budget_pct, 4),
+        "policy_multiplier": round(policy_multiplier, 4),
+        "max_budget_pct": round(max_budget_pct, 4),
+        "per_trade_cap_pct": round(per_trade_cap_pct, 4),
+        "reasons": reasons,
+    }
+
+
+def build_dynamic_risk_budget_v1(capital=10000.0, total_risk_budget_pct=None, bot_filter=None):
+    global DYNAMIC_RISK_BUDGET_V1_CACHE
+
+    capital = _drb_safe_float(capital, 10000.0)
+    if total_risk_budget_pct is None:
+        total_risk_budget_pct = _drb_safe_float(os.environ.get("DYNAMIC_RISK_TOTAL_BUDGET_PCT"), 6.0)
+    total_risk_budget_pct = _drb_clip(total_risk_budget_pct, 0.5, 12.0)
+
+    try:
+        optimizer = build_portfolio_optimizer_v1(capital=capital)
+    except Exception as exc:
+        optimizer = {"ok": False, "error": str(exc), "optimized_allocation": [], "summary": {}, "live_context": {}}
+
+    allocation = optimizer.get("optimized_allocation") or []
+    if bot_filter:
+        wanted = str(bot_filter).upper().strip()
+        allocation = [x for x in allocation if str(x.get("bot") or "").upper().strip() == wanted]
+
+    budgets = []
+    total_budget_pct = 0.0
+    total_budget_usdt = 0.0
+    priority_count = 0
+    defensive_count = 0
+    capped_count = 0
+    pause_count = 0
+
+    for item in allocation:
+        b = _dynamic_risk_policy_for_bot(item, total_risk_budget_pct)
+        b["risk_budget_usdt"] = round((capital * b["risk_budget_pct"]) / 100.0, 4)
+        b["risk_per_trade_usdt"] = round((capital * b["risk_per_trade_pct"]) / 100.0, 4)
+        total_budget_pct += _drb_safe_float(b.get("risk_budget_pct"), 0.0)
+        total_budget_usdt += _drb_safe_float(b.get("risk_budget_usdt"), 0.0)
+        if b.get("risk_state") == "PRIORITY":
+            priority_count += 1
+        if b.get("risk_state") in {"DEFENSIVE_MINIMUM", "WAIT_REDUCED"}:
+            defensive_count += 1
+        if b.get("risk_state") == "EXPERIMENTAL_CAPPED":
+            capped_count += 1
+        if b.get("advisor_action") == "PAUSE_OR_REVIEW":
+            pause_count += 1
+        budgets.append(b)
+
+    budgets = sorted(budgets, key=lambda x: (-_drb_safe_float(x.get("risk_budget_pct"), 0), -_drb_safe_float(x.get("score"), 0), str(x.get("bot"))))
+
+    live_context = optimizer.get("live_context") or {}
+    exposure_summary = ((optimizer.get("summary") or {}).get("advisor_summary") or {}).get("exposure_summary") or {}
+
+    alerts = []
+    if (exposure_summary.get("net_direction") or "") in {"LONG", "SHORT"}:
+        alerts.append(f"Carteira paper líquida {exposure_summary.get('net_direction')}; risco dinâmico deve observar concentração direcional.")
+    if not bool(live_context.get("real_trading_enabled")):
+        alerts.append("Real trading bloqueado; orçamento de risco é consultivo/paper neste momento.")
+    if _drb_safe_float(live_context.get("theoretical_new_orders"), 0) <= 0:
+        alerts.append("Capacidade LIVE teórica zero no notional atual; não aumentar risco real agora.")
+    if pause_count:
+        alerts.append(f"{pause_count} robô(s) em PAUSE_OR_REVIEW com orçamento mínimo defensivo.")
+
+    category_summary = {}
+    for b in budgets:
+        cat = b.get("category") or "UNKNOWN"
+        category_summary.setdefault(cat, {"bots": 0, "risk_budget_pct": 0.0, "risk_budget_usdt": 0.0, "target_pct": 0.0})
+        category_summary[cat]["bots"] += 1
+        category_summary[cat]["risk_budget_pct"] += _drb_safe_float(b.get("risk_budget_pct"), 0.0)
+        category_summary[cat]["risk_budget_usdt"] += _drb_safe_float(b.get("risk_budget_usdt"), 0.0)
+        category_summary[cat]["target_pct"] += _drb_safe_float(b.get("target_pct"), 0.0)
+    for cat, data in category_summary.items():
+        data["risk_budget_pct"] = round(data["risk_budget_pct"], 4)
+        data["risk_budget_usdt"] = round(data["risk_budget_usdt"], 4)
+        data["target_pct"] = round(data["target_pct"], 2)
+
+    payload = {
+        "ok": True,
+        "version": DYNAMIC_RISK_BUDGET_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "mode": DYNAMIC_RISK_BUDGET_V1_MODE,
+        "capital": capital,
+        "total_risk_budget_pct_configured": round(total_risk_budget_pct, 4),
+        "total_risk_budget_usdt_configured": round((capital * total_risk_budget_pct) / 100.0, 4),
+        "total_risk_budget_pct_allocated": round(total_budget_pct, 4),
+        "total_risk_budget_usdt_allocated": round(total_budget_usdt, 4),
+        "budgets": budgets,
+        "summary": {
+            "bots": len(budgets),
+            "priority_count": priority_count,
+            "defensive_count": defensive_count,
+            "experimental_capped_count": capped_count,
+            "pause_count": pause_count,
+            "top_risk_bot": budgets[0] if budgets else None,
+            "category_summary": category_summary,
+            "portfolio_state": (optimizer.get("summary") or {}).get("portfolio_state") or ((optimizer.get("summary") or {}).get("advisor_summary") or {}).get("portfolio_state"),
+            "optimizer_version": optimizer.get("version"),
+            "exposure_summary": exposure_summary,
+        },
+        "live_context": live_context,
+        "optimizer_summary": optimizer.get("summary"),
+        "alerts": alerts,
+        "inputs": {
+            "optimizer_version": optimizer.get("version"),
+            "optimizer_basis": (optimizer.get("inputs") or {}).get("optimizer_basis"),
+            "total_risk_budget_pct_source": "DYNAMIC_RISK_TOTAL_BUDGET_PCT env or default 6.0",
+        },
+        "notes": [
+            "Dynamic Risk Budget V1 está em modo consultivo/observação.",
+            "Não altera risco real, lote, capital, permissões de entrada ou execução.",
+            "Converte a alocação ideal do Portfolio Optimizer V1.1 em orçamento de risco por robô.",
+            "Aplica limites por política do Advisor: PRIORITIZE, REDUCE_OR_WAIT, PAUSE_OR_REVIEW e experimental.",
+            "Preparado para alimentar Dynamic Position Sizing, Risk Manager decisório e OMS futuro.",
+        ],
+    }
+
+    DYNAMIC_RISK_BUDGET_V1_CACHE = {
+        "last_payload": payload,
+        "last_generated_at": payload.get("generated_at"),
+        "last_capital": capital,
+        "last_total_risk_budget_pct": total_risk_budget_pct,
+    }
+    return payload
+
+
+def build_dynamic_risk_budget_v1_text(capital=10000.0, total_risk_budget_pct=None, bot_filter=None):
+    payload = build_dynamic_risk_budget_v1(capital=capital, total_risk_budget_pct=total_risk_budget_pct, bot_filter=bot_filter)
+    summary = payload.get("summary") or {}
+    exposure = summary.get("exposure_summary") or {}
+    live = payload.get("live_context") or {}
+
+    lines = [
+        "🎚️ DYNAMIC RISK BUDGET V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Resumo geral:",
+        f"Capital analisado: {payload.get('capital')} USDT",
+        f"Risk budget configurado: {payload.get('total_risk_budget_pct_configured')}% ({payload.get('total_risk_budget_usdt_configured')} USDT)",
+        f"Risk budget alocado: {payload.get('total_risk_budget_pct_allocated')}% ({payload.get('total_risk_budget_usdt_allocated')} USDT)",
+        f"Robôs avaliados: {summary.get('bots')} | prioridade: {summary.get('priority_count')} | defensivos: {summary.get('defensive_count')} | experimentais capped: {summary.get('experimental_capped_count')}",
+        f"Paper: posições {exposure.get('positions')} | LONG {exposure.get('long')} | SHORT {exposure.get('short')} | Net {exposure.get('net_direction')}",
+        f"Capital paper usado: {exposure.get('capital_used')} USDT ({exposure.get('capital_usage_pct')}%)",
+        f"Risco aberto estimado: {exposure.get('risk_used_usdt')} USDT",
+        "",
+        "Contexto real/BingX:",
+        f"READY: {live.get('bingx_ready')} | {live.get('bingx_status')}",
+        f"Saldo total/free: {live.get('total_usdt')} / {live.get('free_usdt')} USDT",
+        f"Capacidade teórica novas ordens: {live.get('theoretical_new_orders')}",
+        f"Real trading: {'LIBERADO' if live.get('real_trading_enabled') else 'BLOQUEADO'} | Modo {live.get('execution_mode')}",
+    ]
+
+    alerts = payload.get("alerts") or []
+    if alerts:
+        lines += ["", "Alertas do orçamento dinâmico:"]
+        for alert in alerts:
+            lines.append(f"- {alert}")
+
+    lines += ["", "Orçamento de risco por robô:"]
+    for idx, b in enumerate(payload.get("budgets") or [], start=1):
+        lines += [
+            "",
+            f"{idx}. {b.get('bot')} — {b.get('risk_state')}",
+            f"Risk budget: {b.get('risk_budget_pct')}% ({b.get('risk_budget_usdt')} USDT)",
+            f"Risco por trade sugerido: {b.get('risk_per_trade_pct')}% ({b.get('risk_per_trade_usdt')} USDT)",
+            f"Máx. trades simultâneos sugerido: {b.get('suggested_max_open_trades')}",
+            f"Score: {b.get('score')}/100 | Categoria: {b.get('category')} | Advisor: {b.get('advisor_action')}",
+            f"Target capital: {b.get('target_pct')}% | Atual: {b.get('current_pct')}% | Δ {b.get('delta_pct')}%",
+            f"Ação de risco: {b.get('risk_action')}",
+            f"Política novo trade: {b.get('new_trade_policy')}",
+            "Motivos:",
+        ]
+        for reason in b.get("reasons", [])[:5]:
+            lines.append(f"- {reason}")
+
+    cat = summary.get("category_summary") or {}
+    if cat:
+        lines += ["", "Resumo por categoria:"]
+        for category, data in sorted(cat.items()):
+            lines.append(
+                f"- {category}: risk budget {data.get('risk_budget_pct')}% ({data.get('risk_budget_usdt')} USDT) | "
+                f"target capital {data.get('target_pct')}% | bots {data.get('bots')}"
+            )
+
+    lines += ["", "Notas:"]
+    for note in payload.get("notes", []):
+        lines.append(f"- {note}")
+
+    return "\n".join(lines), payload
+
+
+@app.route("/dynamic/risk/budget/v1")
+@app.route("/dynamic-risk-budget/v1")
+@app.route("/risk/budget/v1")
+@app.route("/riskbudget/v1")
+@app.route("/dynamicrisk/v1")
+def dynamic_risk_budget_v1_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    total_risk = request.args.get("risk", default=None, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_dynamic_risk_budget_v1_text(capital=capital, total_risk_budget_pct=total_risk)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/dynamic/risk/budget/<bot>/v1")
+@app.route("/risk/budget/<bot>/v1")
+@app.route("/riskbudget/<bot>/v1")
+def dynamic_risk_budget_v1_bot_route(bot):
+    capital = request.args.get("capital", default=10000, type=float)
+    total_risk = request.args.get("risk", default=None, type=float)
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    text, payload = build_dynamic_risk_budget_v1_text(capital=capital, total_risk_budget_pct=total_risk, bot_filter=bot)
+    if as_text:
+        return text
+    return {"ok": True, "text": text, "payload": payload}
+
+
+@app.route("/dynamic/risk/budget/summary/v1")
+@app.route("/risk/budget/summary/v1")
+@app.route("/riskbudget/summary/v1")
+def dynamic_risk_budget_v1_summary_route():
+    capital = request.args.get("capital", default=10000, type=float)
+    total_risk = request.args.get("risk", default=None, type=float)
+    payload = build_dynamic_risk_budget_v1(capital=capital, total_risk_budget_pct=total_risk)
+    return {
+        "ok": True,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "capital": payload.get("capital"),
+        "total_risk_budget_pct_configured": payload.get("total_risk_budget_pct_configured"),
+        "total_risk_budget_usdt_configured": payload.get("total_risk_budget_usdt_configured"),
+        "total_risk_budget_pct_allocated": payload.get("total_risk_budget_pct_allocated"),
+        "total_risk_budget_usdt_allocated": payload.get("total_risk_budget_usdt_allocated"),
+        "summary": payload.get("summary"),
+        "budgets": payload.get("budgets"),
+        "alerts": payload.get("alerts"),
+        "live_context": payload.get("live_context"),
+        "cache": {
+            "last_generated_at": DYNAMIC_RISK_BUDGET_V1_CACHE.get("last_generated_at"),
+            "last_capital": DYNAMIC_RISK_BUDGET_V1_CACHE.get("last_capital"),
+            "last_total_risk_budget_pct": DYNAMIC_RISK_BUDGET_V1_CACHE.get("last_total_risk_budget_pct"),
+        },
+    }
+
 @app.route("/analytics/exposure-v2")
 @app.route("/analytics/bot-exposure-v2")
 def analytics_bot_exposure_v2_route():
@@ -11240,6 +11655,14 @@ def build_central_command_reply(text: str):
             capital_arg = 10000.0
         text_v2, _ = build_bot_exposure_manager_v2_text(capital=capital_arg)
         return text_v2
+    if cmd0 in {"/riskbudget", "/riskbudgetv1", "/dynamicrisk", "/dynamicriskv1", "/drb", "/orcamentorisco", "/orçamentorisco"}:
+        parts = raw.split()
+        try:
+            capital_arg = float(parts[1]) if len(parts) > 1 else 10000.0
+        except Exception:
+            capital_arg = 10000.0
+        text_drb, _ = build_dynamic_risk_budget_v1_text(capital=capital_arg)
+        return text_drb
     if cmd0 in {"/portfoliooptimizer", "/optimizer", "/optimizador", "/otimizador", "/portfolioopt", "/optimizerv1"}:
         parts = raw.split()
         try:
