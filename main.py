@@ -1395,7 +1395,10 @@ def execution_engine_health_route():
 @app.route("/execution_engine/run", methods=["GET", "POST"])
 @app.route("/execution/engine/run", methods=["GET", "POST"])
 def execution_engine_run_route():
-    payload = request.get_json(silent=True) or {}
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
 
     url_mode = request.args.get("mode")
 
@@ -1415,11 +1418,60 @@ def execution_engine_run_route():
             "signal_id": f"EXECUTION-ENGINE-MANUAL-TEST-{int(time.time())}",
         }
 
-    return run_execution_engine(
+    # Executive Policy Manager gate — última trava antes do Execution Engine.
+    # Protege chamadas diretas ao executor, mesmo se o Risk Manager ou o
+    # Execution Orchestrator não tiverem sido chamados antes.
+    policy_reasons = []
+    policy_warnings = []
+    executive_policy_eval = _apply_executive_policy_to_risk_reasons(
+        trade_payload=payload,
+        reasons=policy_reasons,
+        warnings=policy_warnings,
+    )
+
+    if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
+        blocked_payload = dict(payload or {})
+        blocked_payload["decision"] = "DENY"
+        blocked_payload["blocked_by"] = "EXECUTIVE_POLICY_MANAGER"
+        blocked_payload["executive_policy"] = executive_policy_eval
+
+        return {
+            "ok": True,
+            "mode": url_mode or payload.get("mode") or "VERIFY",
+            "dry_run": True,
+            "decision": "DENY",
+            "allowed": False,
+            "status": "BLOCKED_BY_EXECUTIVE_POLICY",
+            "blocked_by": "EXECUTIVE_POLICY_MANAGER",
+            "executive_policy": executive_policy_eval,
+            "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
+            "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
+            "payload": blocked_payload,
+            "notes": [
+                "Execution Engine protegido pelo Executive Policy Manager.",
+                "Nenhuma chamada a run_execution_engine foi feita porque a política executiva bloqueou a trade.",
+            ],
+        }
+
+    if isinstance(executive_policy_eval, dict):
+        payload["executive_policy"] = executive_policy_eval
+
+    engine_result = run_execution_engine(
         payload=payload,
         mode=url_mode or payload.get("mode"),
         dry_run=True,
     )
+
+    if isinstance(engine_result, dict):
+        engine_result.setdefault("executive_policy", executive_policy_eval)
+        engine_result.setdefault("policy_gate", {
+            "checked": True,
+            "allowed": True,
+            "source": "executive_policy_manager",
+            "warnings": policy_warnings,
+        })
+
+    return engine_result
 
 
 @app.route("/execution_engine/test")
