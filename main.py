@@ -11396,8 +11396,8 @@ def _epe_vote_from_correlation_engine(result):
         "binding_cluster": sig.get("binding_cluster"),
         "same_symbol_count": sig.get("same_symbol_count"),
         "clusters": sig.get("clusters"),
-        "cluster_pressures": sig.get("cluster_pressures"),
-        "reasons": reasons[:10],
+        "cluster_pressures_count": len(sig.get("cluster_pressures") or []),
+        "reasons": reasons[:5],
     })
 
 
@@ -11417,6 +11417,71 @@ def _epe_request_payload_from_args(default_payload=None):
         if val not in [None, ""]:
             p[key] = val
     return p
+
+
+def _epe_compact_correlation_payload(payload):
+    if not isinstance(payload, dict):
+        return {}
+    sig = payload.get("signal_policy") or None
+    auto = payload.get("automation_policy") or {}
+    top = payload.get("top_cluster") or {}
+    compact_sig = None
+    if isinstance(sig, dict):
+        compact_pressures = []
+        for p in sig.get("cluster_pressures") or []:
+            compact_pressures.append({
+                "cluster": p.get("cluster"),
+                "positions": p.get("positions"),
+                "position_pct": p.get("position_pct"),
+                "severity": p.get("severity"),
+                "risk_multiplier": p.get("risk_multiplier"),
+                "signal_gate": p.get("signal_gate"),
+                "action": p.get("action"),
+                "reasons": (p.get("reasons") or [])[:3],
+            })
+        compact_sig = {
+            "bot": sig.get("bot"),
+            "setup": sig.get("setup"),
+            "symbol": sig.get("symbol"),
+            "side": sig.get("side"),
+            "primary_cluster": sig.get("primary_cluster"),
+            "clusters": sig.get("clusters") or [],
+            "same_symbol_count": sig.get("same_symbol_count"),
+            "binding_cluster": sig.get("binding_cluster"),
+            "correlation_action": sig.get("correlation_action"),
+            "signal_gate": sig.get("signal_gate"),
+            "risk_multiplier": sig.get("risk_multiplier"),
+            "severity": sig.get("severity"),
+            "reasons": (sig.get("reasons") or [])[:5],
+            "cluster_pressures": compact_pressures,
+        }
+    return {
+        "ok": bool(payload.get("ok")),
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "source": payload.get("source"),
+        "market_regime": payload.get("market_regime"),
+        "exposure_summary": payload.get("exposure_summary"),
+        "top_cluster": {
+            "cluster": top.get("cluster"),
+            "positions": top.get("positions"),
+            "position_pct": top.get("position_pct"),
+            "severity": top.get("severity"),
+            "symbols_count": top.get("symbols_count"),
+        } if isinstance(top, dict) else None,
+        "signal_policy": compact_sig,
+        "automation_policy": {
+            "correlation_gate_required": auto.get("correlation_gate_required"),
+            "dominant_cluster": auto.get("dominant_cluster"),
+            "dominant_cluster_severity": auto.get("dominant_cluster_severity"),
+            "compressed_clusters": auto.get("compressed_clusters") or [],
+            "high_risk_clusters": auto.get("high_risk_clusters") or [],
+            "watch_clusters": auto.get("watch_clusters") or [],
+            "route_new_signals_to": auto.get("route_new_signals_to"),
+        },
+        "alerts": (payload.get("alerts") or [])[:8],
+    }
 
 
 def build_execution_policy_v1(capital=10000.0, bot=None, symbol=None, side=None, entry=None, stop=None, setup=None, leverage=None, mode=None, intended_live=None):
@@ -11464,6 +11529,7 @@ def build_execution_policy_v1(capital=10000.0, bot=None, symbol=None, side=None,
         correlation_payload = build_correlation_engine_v1(capital=capital, bot=bot_norm or None, symbol=symbol_norm or None, side=side_norm or None, setup=setup)
     except Exception as exc:
         correlation_payload = {"ok": False, "error": str(exc), "signal_policy": None}
+    correlation_payload = _epe_compact_correlation_payload(correlation_payload)
     correlation_vote = _epe_vote_from_correlation_engine(correlation_payload)
     votes.append(correlation_vote)
 
@@ -11531,7 +11597,7 @@ def build_execution_policy_v1(capital=10000.0, bot=None, symbol=None, side=None,
         "alerts": list(dict.fromkeys((sizing_payload.get("alerts") or []) + (correlation_payload.get("alerts") or [] if isinstance(correlation_payload, dict) else []) + (["Correlation Gate aplicou compressão ao tamanho sugerido."] if correlation_adjusted else []) + (["Decisão final contém DENY consultivo."] if final_decision == "DENY" else []) + (["Decisão final exige REDUCE/WAIT antes de qualquer execução."] if final_decision in {"REDUCE", "WAIT"} else []))),
         "notes": ["Execution Policy Engine V1 está em modo consultivo/observação.", "Não executa ordens, não altera lote real, não altera risco real e não envia ordem para a corretora.", "Consolida Market Regime, Meta Strategy, Correlation Gate, Risk Manager, Capital Allocator, Dynamic Risk Budget e Dynamic Position Sizing em uma decisão única.", "A decisão final é auditável por votos de cada módulo.", "Preparado para alimentar OMS e Executor no futuro."],
     }
-    EXECUTION_POLICY_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    EXECUTION_POLICY_ENGINE_V1_CACHE = {"last_generated_at": payload.get("generated_at"), "last_capital": capital, "last_decision": payload.get("decision")}
     return payload
 
 
@@ -11898,7 +11964,7 @@ def build_decision_score_engine_v1(capital=10000.0, bot=None, symbol=None, side=
             "Preparado para calibração futura dos pesos por histórico de acertos/erros.",
         ],
     }
-    DECISION_SCORE_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    DECISION_SCORE_ENGINE_V1_CACHE = {"last_generated_at": payload.get("generated_at"), "last_capital": capital, "last_decision": payload.get("decision"), "last_score": payload.get("decision_score")}
     return payload
 
 
@@ -12357,7 +12423,7 @@ def build_adaptive_weight_engine_v1(capital=10000.0, bot=None, symbol=None, side
     else:
         payload["state_saved"] = False
 
-    ADAPTIVE_WEIGHT_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    ADAPTIVE_WEIGHT_ENGINE_V1_CACHE = {"last_generated_at": payload.get("generated_at"), "last_capital": capital, "last_decision": payload.get("adaptive_decision")}
     return payload
 
 
@@ -12706,7 +12772,7 @@ def build_learning_engine_v1(capital=10000.0, bot=None, symbol=None, side=None, 
     }
     if not record:
         payload["alerts"].append("Prévia não salva. Use record=true ou POST para registrar esta decisão no Learning Engine.")
-    LEARNING_ENGINE_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_learning_id": learning_id}
+    LEARNING_ENGINE_V1_CACHE = {"last_generated_at": payload.get("generated_at"), "last_learning_id": learning_id, "last_decision": payload.get("adaptive_decision")}
     return payload
 
 
@@ -13261,7 +13327,7 @@ def build_outcome_evaluator_v1(learning_id=None, trade_id=None, outcome=None, re
             "Para DENY/WAIT, o outcome representa o resultado observado/counterfactual do sinal ou paper tracking.",
         ],
     }
-    OUTCOME_EVALUATOR_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_learning_id": payload.get("learning_id")}
+    OUTCOME_EVALUATOR_V1_CACHE = {"last_generated_at": payload.get("generated_at"), "last_learning_id": payload.get("learning_id"), "last_decision_correct": payload.get("decision_correct")}
     return payload
 
 
@@ -16391,7 +16457,7 @@ def build_adaptive_weight_engine_v2(capital=10000.0, bot=None, symbol=None, side
         "state_saved": save_ok,
         "state_save_error": save_error,
     }
-    ADAPTIVE_WEIGHT_ENGINE_V2_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_capital": capital}
+    ADAPTIVE_WEIGHT_ENGINE_V2_CACHE = {"last_generated_at": payload.get("generated_at"), "last_capital": capital, "last_decision": payload.get("active_decision")}
     return payload
 
 
@@ -17600,26 +17666,50 @@ def _ce_get_exposure_summary(capital=10000.0):
 
 
 def _ce_get_market_regime(capital=10000.0):
-    try:
-        if "build_market_regime_detector_v1" in globals():
-            return build_market_regime_detector_v1(capital=capital) or {}
-    except Exception:
-        pass
-    return {}
+    """Lightweight proxy used by Correlation Engine.
+
+    Important: do not call build_market_regime_detector_v1 here. That function
+    can call Meta/Adaptive/Decision layers, and when Correlation is used inside
+    Execution/Decision this creates a heavy cascade. Correlation V1 only needs
+    a compact exposure-derived regime.
+    """
+    exposure = _ce_get_exposure_summary(capital=capital)
+    long_n = _ce_safe_int(exposure.get("long"), 0)
+    short_n = _ce_safe_int(exposure.get("short"), 0)
+    positions = _ce_safe_int(exposure.get("positions"), long_n + short_n)
+    net = str(exposure.get("net_direction") or "FLAT").upper()
+    if positions <= 0:
+        regime = "NO_OPEN_EXPOSURE"
+        family = "NEUTRAL"
+        confidence = 50.0
+    else:
+        long_pct = (long_n / positions * 100.0) if positions else 0.0
+        short_pct = (short_n / positions * 100.0) if positions else 0.0
+        imbalance = abs(long_pct - short_pct)
+        if net == "LONG" and long_pct >= 65:
+            regime, family = "DIRECTIONAL_LONG_EXPOSURE", "TREND_BIASED"
+        elif net == "SHORT" and short_pct >= 65:
+            regime, family = "DIRECTIONAL_SHORT_EXPOSURE", "TREND_BIASED"
+        else:
+            regime, family = "BALANCED_OR_MIXED_EXPOSURE", "MIXED"
+        confidence = _ce_round(min(95.0, 50.0 + imbalance * 0.5), 2)
+    return {
+        "regime": regime,
+        "regime_family": family,
+        "confidence": confidence,
+        "source": "LIGHTWEIGHT_EXPOSURE_PROXY_FOR_CORRELATION",
+        "portfolio_state": "DIRECTIONAL_EXPOSURE" if "DIRECTIONAL" in regime else "BALANCED_EXPOSURE",
+        "exposure_regime": {"net_direction": net, "positions": positions, "long": long_n, "short": short_n},
+    }
 
 
 def _ce_get_meta_strategy(capital=10000.0):
-    try:
-        if "build_meta_strategy_engine_v11" in globals():
-            return build_meta_strategy_engine_v11(capital=capital) or {}
-    except Exception:
-        pass
-    try:
-        if "_mrd_get_meta_context" in globals():
-            return _mrd_get_meta_context(capital=capital) or {}
-    except Exception:
-        pass
-    return {}
+    """Compact meta context for Correlation Engine.
+
+    Avoid calling the full Meta Strategy engine here to prevent recursive/heavy
+    Decision -> Correlation -> Meta -> Adaptive -> Decision chains.
+    """
+    return {"portfolio_state": None}
 
 
 def _ce_build_cluster_book(symbol_counts, capital=10000.0):
