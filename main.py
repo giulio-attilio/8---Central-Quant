@@ -7091,6 +7091,105 @@ def _strategic_advisor_report_block(monthly_stats=None, compact=False):
         )
 
 
+
+
+def _decision_pack_snapshot_for_reports(monthly_stats=None, ceo_confidence=None, strategic_advisor=None, compact_source=False):
+    """
+    Consolida o Decision Pack V1 para uso técnico do assistente.
+    Não executa ordens, não altera risco, não envia Telegram e não muda cooldowns.
+    """
+    try:
+        executive_alerts = _executive_alerts_snapshot_for_reports(check_only=True)
+    except Exception:
+        executive_alerts = {}
+
+    try:
+        pipeline = build_execution_pipeline_status()
+    except Exception:
+        pipeline = {}
+
+    try:
+        exposure = central_exposure_snapshot()
+    except Exception:
+        exposure = {}
+
+    try:
+        memory = memory_snapshot("decision_pack_memory", store=True)
+    except Exception:
+        memory = {}
+
+    try:
+        confidence_payload = ceo_confidence or _ceo_confidence_snapshot_for_reports(monthly_stats=monthly_stats)
+    except Exception:
+        confidence_payload = {}
+
+    try:
+        strategy_payload = strategic_advisor or _strategic_advisor_snapshot_for_reports(
+            monthly_stats=monthly_stats,
+            ceo_confidence=confidence_payload,
+            compact_source=compact_source,
+        )
+    except Exception:
+        strategy_payload = {}
+
+    try:
+        adaptive_payload = get_adaptive_weights()
+    except Exception:
+        adaptive_payload = {}
+
+    try:
+        outcome_payload = get_outcome_stats()
+    except Exception:
+        outcome_payload = {}
+
+    try:
+        return build_decision_pack(
+            ceo_confidence=confidence_payload,
+            strategic_advisor=strategy_payload,
+            executive_alerts=executive_alerts,
+            pipeline=pipeline,
+            exposure=exposure,
+            memory=memory,
+            adaptive=adaptive_payload,
+            outcome=outcome_payload,
+            monthly_stats=monthly_stats or {},
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": "DECISION-PACK-ERROR",
+            "generated_at": data_hora_sp_str(),
+            "directive": "INVESTIGAR_DECISION_PACK",
+            "classification": "ERRO",
+            "priority": "P0",
+            "expansion_allowed": False,
+            "human_decision_required": False,
+            "assistant_decision_required": True,
+            "next_action_for_assistant": f"Corrigir Decision Pack: {exc}",
+            "ceo_confidence": {"score": 0, "label": "ERRO"},
+            "risk": {},
+            "learning": {},
+            "pipeline": {},
+            "executive_alerts": {},
+            "technical_commands": ["/decisionpack", "/strategy", "/ceoconfidence", "/alertscheck"],
+            "errors": [str(exc)],
+        }
+
+
+def _decision_pack_report_block(monthly_stats=None, compact=False):
+    try:
+        payload = _decision_pack_snapshot_for_reports(monthly_stats=monthly_stats, compact_source=compact)
+        return build_decision_pack_text(payload, compact=compact)
+    except Exception as exc:
+        return (
+            "🧩 DECISION PACK — CENTRAL QUANT V1\n"
+            f"Data/hora: {data_hora_sp_str()}\n\n"
+            "Status: ERRO\n"
+            f"Erro ao gerar Decision Pack: {exc}\n\n"
+            "Ação prática: verificar decision_pack.py e imports do main.py."
+        )
+
+
 def _executive_alert_monthly_stats(start_dt, end_dt):
     """
     Consolida a saúde executiva do mês com base no log do Executive Alert Manager.
