@@ -63,6 +63,15 @@ from paper_executor_integrated import (
     read_paper_integrated_log,
 )
 
+from paper_lifecycle import (
+    paper_lifecycle_health,
+    update_paper_position_price,
+    get_paper_lifecycle_positions,
+    read_paper_lifecycle_log,
+    paper_lifecycle_test_tp50,
+    paper_lifecycle_test_close,
+)
+
 
 app = Flask(__name__)
 
@@ -1140,6 +1149,62 @@ def eventbus_emit_route():
     result = central_event_bus.emit_from_http(payload)
     status = 200 if result.get("ok") else 500
     return result, status
+
+
+@app.route("/paper_lifecycle/health")
+@app.route("/paper/lifecycle/health")
+def paper_lifecycle_health_route():
+    return paper_lifecycle_health()
+
+
+@app.route("/paper_lifecycle/positions")
+@app.route("/paper/lifecycle/positions")
+def paper_lifecycle_positions_route():
+    status = request.args.get("status")
+    return get_paper_lifecycle_positions(status=status)
+
+
+@app.route("/paper_lifecycle/update", methods=["GET", "POST"])
+@app.route("/paper/lifecycle/update", methods=["GET", "POST"])
+def paper_lifecycle_update_route():
+    payload = request.get_json(silent=True) or {}
+
+    trade_id = payload.get("trade_id") or request.args.get("trade_id")
+    symbol = payload.get("symbol") or request.args.get("symbol")
+    price = payload.get("price") or request.args.get("price")
+    close_raw = payload.get("close", request.args.get("close", "false"))
+    close = str(close_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    close_reason = payload.get("close_reason") or request.args.get("close_reason")
+
+    return update_paper_position_price(
+        trade_id=trade_id,
+        symbol=symbol,
+        price=price,
+        close=close,
+        close_reason=close_reason,
+    )
+
+
+@app.route("/paper_lifecycle/log")
+@app.route("/paper/lifecycle/log")
+def paper_lifecycle_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_paper_lifecycle_log(limit=limit)
+
+
+@app.route("/paper_lifecycle/test_tp50")
+@app.route("/paper/lifecycle/test_tp50")
+def paper_lifecycle_test_tp50_route():
+    return paper_lifecycle_test_tp50()
+
+
+@app.route("/paper_lifecycle/test_close")
+@app.route("/paper/lifecycle/test_close")
+def paper_lifecycle_test_close_route():
+    return paper_lifecycle_test_close()
 
 
 @app.route("/execution_engine/health")
