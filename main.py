@@ -7076,6 +7076,13 @@ def analytics_weights_route():
             f"Data/hora: {payload.get('generated_at')}",
             f"Modo: {payload.get('mode')}",
             "",
+            "Saúde da carteira:",
+            f"Concentração: {payload.get('portfolio_health', {}).get('concentration')}",
+            f"Diversificação: {payload.get('portfolio_health', {}).get('diversification')}",
+            f"Risco: {payload.get('portfolio_health', {}).get('risk_level')}",
+            f"Dependência do maior robô: {payload.get('portfolio_health', {}).get('dependency_on_top_bot')}",
+            f"Maior peso: {payload.get('portfolio_health', {}).get('top_weight_pct')}%",
+            "",
             "Alocação sugerida por robô:",
         ]
 
@@ -7088,6 +7095,9 @@ def analytics_weights_route():
                 f"PnL: {item.get('pnl_total_pct')}%",
                 f"Trades: {item.get('trades')}",
                 f"Ação base: {item.get('source_action')}",
+                f"Categoria: {item.get('category')}",
+                f"Peso bruto: {item.get('base_weight_pct')}%",
+                f"Peso limitado: {item.get('capped_weight_pct')}%",
             ]
 
         lines += ["", "Notas:"]
@@ -7106,7 +7116,7 @@ def analytics_weights_route():
             "error": str(e),
         }
 
-        
+
 @app.route("/analytics/portfolio")
 def analytics_portfolio_route():
     try:

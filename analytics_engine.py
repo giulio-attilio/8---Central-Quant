@@ -477,8 +477,6 @@ def portfolio_weights():
     payload = portfolio_advisor()
     p = payload.get("portfolio", {})
 
-    bots = []
-
     all_bots = []
     all_bots += p.get("core_bots", [])
     all_bots += p.get("observe_bots", [])
@@ -504,6 +502,8 @@ def portfolio_weights():
         item.get("name"): item
         for item in p.get("general_recommendations", [])
     }
+
+    bots = []
 
     for item in all_bots:
         name = item.get("name")
@@ -543,6 +543,23 @@ def portfolio_weights():
         if raw_strength < 1:
             raw_strength = 1
 
+        category = "OBSERVATION"
+        max_weight = 15.0
+        min_weight = 2.0
+
+        if action == "AUMENTAR COM CAUTELA":
+            category = "CORE"
+            max_weight = 45.0
+            min_weight = 10.0
+        elif action == "OBSERVAR POSITIVO":
+            category = "DEVELOPING"
+            max_weight = 15.0
+            min_weight = 3.0
+        elif action in {"NÃO AUMENTAR", "REDUZIR / NÃO AUMENTAR"}:
+            category = "DEFENSIVE"
+            max_weight = 5.0
+            min_weight = 1.0
+
         bots.append({
             "name": name,
             "score": score,
@@ -550,19 +567,40 @@ def portfolio_weights():
             "pnl_total_pct": pnl,
             "trades": trades,
             "source_action": action,
+            "category": category,
             "raw_strength": round(raw_strength, 4),
+            "min_weight_pct": min_weight,
+            "max_weight_pct": max_weight,
         })
 
     total_strength = sum(item.get("raw_strength", 0) for item in bots)
 
-    weighted = []
+    capped = []
     for item in bots:
         if total_strength > 0:
-            weight = item.get("raw_strength", 0) / total_strength * 100
+            base_weight = item.get("raw_strength", 0) / total_strength * 100
         else:
-            weight = 0
+            base_weight = 0
 
-        item["suggested_weight_pct"] = round(weight, 2)
+        capped_weight = max(
+            item.get("min_weight_pct", 0),
+            min(base_weight, item.get("max_weight_pct", 100)),
+        )
+
+        item["base_weight_pct"] = round(base_weight, 2)
+        item["capped_weight_pct"] = round(capped_weight, 2)
+        capped.append(item)
+
+    capped_total = sum(item.get("capped_weight_pct", 0) for item in capped)
+
+    weighted = []
+    for item in capped:
+        if capped_total > 0:
+            final_weight = item.get("capped_weight_pct", 0) / capped_total * 100
+        else:
+            final_weight = 0
+
+        item["suggested_weight_pct"] = round(final_weight, 2)
         weighted.append(item)
 
     weighted = sorted(
@@ -571,15 +609,59 @@ def portfolio_weights():
         reverse=True,
     )
 
+    top_weight = weighted[0].get("suggested_weight_pct", 0) if weighted else 0
+    mature_bots = len([x for x in weighted if x.get("category") == "CORE"])
+    developing_bots = len([x for x in weighted if x.get("category") == "DEVELOPING"])
+    defensive_bots = len([x for x in weighted if x.get("category") == "DEFENSIVE"])
+
+    concentration = "BAIXA"
+    if top_weight >= 50:
+        concentration = "ALTA"
+    elif top_weight >= 35:
+        concentration = "MÉDIA"
+
+    diversification = "FRACA"
+    if mature_bots >= 2 and developing_bots >= 2:
+        diversification = "BOA"
+    elif mature_bots >= 1 and developing_bots >= 2:
+        diversification = "MÉDIA"
+
+    risk_level = "MÉDIO"
+    if concentration == "ALTA" or defensive_bots >= 3:
+        risk_level = "ALTO"
+    elif concentration == "BAIXA" and diversification == "BOA":
+        risk_level = "BAIXO"
+
+    dependency = "SIM" if top_weight >= 45 else "NÃO"
+
     return {
         "ok": True,
-        "version": "2026-07-03-PORTFOLIO-WEIGHTS-V1",
+        "version": "2026-07-03-PORTFOLIO-WEIGHTS-V2",
         "generated_at": payload.get("generated_at"),
         "mode": "OBSERVATION_ONLY",
+        "policy": {
+            "core_max_weight_pct": 45.0,
+            "developing_max_weight_pct": 15.0,
+            "defensive_max_weight_pct": 5.0,
+            "core_min_weight_pct": 10.0,
+            "developing_min_weight_pct": 3.0,
+            "defensive_min_weight_pct": 1.0,
+        },
+        "portfolio_health": {
+            "concentration": concentration,
+            "diversification": diversification,
+            "risk_level": risk_level,
+            "dependency_on_top_bot": dependency,
+            "mature_bots": mature_bots,
+            "developing_bots": developing_bots,
+            "defensive_bots": defensive_bots,
+            "top_weight_pct": top_weight,
+        },
         "weights": weighted,
         "notes": [
             "Pesos calculados apenas para observação.",
             "Ainda não interfere na execução real.",
+            "V2 aplica teto e piso por categoria de robô.",
             "Baseado em score, confiança, PnL, amostra e recomendação geral.",
         ],
-    }    
+    }
