@@ -97,6 +97,10 @@ from ceo_confidence import (
     build_ceo_confidence_index,
     build_ceo_confidence_text,
 )
+from strategic_advisor import (
+    build_strategic_advisor,
+    build_strategic_advisor_text,
+)
 
 
 app = Flask(__name__)
@@ -5839,6 +5843,8 @@ def build_executive_report():
         "",
         _ceo_confidence_report_block(),
         "",
+        _strategic_advisor_report_block(compact=True),
+        "",
         _executive_alerts_report_block(),
         "",
         f"Risco direcional: {risk_status}",
@@ -5885,6 +5891,7 @@ def daily_snapshot_payload():
         "memory": memory_snapshot("daily_snapshot_memory", store=True),
         "health_score": central_health_score_payload(),
         "ceo_confidence": _ceo_confidence_snapshot_for_reports(),
+        "strategic_advisor": _strategic_advisor_snapshot_for_reports(),
     }
 
 
@@ -6639,6 +6646,7 @@ def build_executive_dashboard_json():
     executive_alerts = _executive_alerts_snapshot_for_reports(check_only=True)
     executive_alert_health = executive_alerts.get("health_score") or {}
     ceo_confidence = _ceo_confidence_snapshot_for_reports()
+    strategic_advisor = _strategic_advisor_snapshot_for_reports(ceo_confidence=ceo_confidence, compact_source=True)
 
     return {
         "generated_at": data_hora_sp_str(),
@@ -6649,6 +6657,7 @@ def build_executive_dashboard_json():
         "central_watchdog_health_score": 100 if watchdog.get("ok", True) else 70,
         "executive_alerts": executive_alerts,
         "ceo_confidence": ceo_confidence,
+        "strategic_advisor": strategic_advisor,
         "real_execution_enabled": bool(ENABLE_REAL_TRADING),
         "execution_mode": EXECUTION_MODE,
         "memory_mb": memory_mb or 0,
@@ -6696,6 +6705,11 @@ def build_ceo_daily_report():
         "CEO CONFIDENCE INDEX",
         "════════════════════════════",
         _ceo_confidence_report_block(),
+        "",
+        "════════════════════════════",
+        "STRATEGIC ADVISOR",
+        "════════════════════════════",
+        _strategic_advisor_report_block(compact=True),
         "",
         "════════════════════════════",
         "EXECUTIVE ALERT MANAGER",
@@ -6963,6 +6977,107 @@ def _ceo_confidence_report_block(monthly_stats=None):
             f"Erro ao gerar CEO Confidence Index: {exc}"
         )
 
+
+def _strategic_advisor_snapshot_for_reports(monthly_stats=None, ceo_confidence=None, compact_source=False):
+    """
+    Calcula o Strategic Advisor V1 usando snapshots técnicos atuais.
+    Não executa trades, não altera risco e não envia Telegram.
+    A saída é desenhada para uso assistido: o CEO não decide; o assistente consulta
+    comandos técnicos e devolve a ação prática.
+    """
+    try:
+        executive_alerts = _executive_alerts_snapshot_for_reports(check_only=True)
+    except Exception:
+        executive_alerts = {}
+
+    try:
+        pipeline = build_execution_pipeline_status()
+    except Exception:
+        pipeline = {}
+
+    try:
+        exposure = central_exposure_snapshot()
+    except Exception:
+        exposure = {}
+
+    try:
+        memory = memory_snapshot("strategic_advisor_memory", store=True)
+    except Exception:
+        memory = {}
+
+    try:
+        confidence_payload = ceo_confidence or _ceo_confidence_snapshot_for_reports(monthly_stats=monthly_stats)
+    except Exception:
+        confidence_payload = {}
+
+    portfolio_payload = {}
+    try:
+        fn = globals().get("build_portfolio_advisor_v1")
+        if callable(fn):
+            portfolio_payload = fn()
+    except Exception:
+        portfolio_payload = {}
+
+    try:
+        return build_strategic_advisor(
+            ceo_confidence=confidence_payload,
+            executive_alerts=executive_alerts,
+            pipeline=pipeline,
+            exposure=exposure,
+            memory=memory,
+            monthly_stats=monthly_stats or {},
+            portfolio_advisor=portfolio_payload,
+            extra={
+                "execution_mode": EXECUTION_MODE,
+                "real_execution_enabled": bool(ENABLE_REAL_TRADING),
+                "compact_source": bool(compact_source),
+            },
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": "STRATEGIC-ADVISOR-ERROR",
+            "generated_at": data_hora_sp_str(),
+            "mode": "ASSISTED_DECISION_ENGINE",
+            "human_decision_required": False,
+            "assistant_decision_required": True,
+            "primary_directive": "INVESTIGAR_STRATEGIC_ADVISOR",
+            "strategic_label": "ERRO",
+            "ceo_confidence_score": 0,
+            "ceo_confidence_label": "ERRO",
+            "expansion_blocked": True,
+            "recommendations": [{
+                "priority": "P0",
+                "category": "SYSTEM",
+                "title": "Strategic Advisor indisponível",
+                "rationale": str(exc),
+                "action": "Verificar import, deploy e logs do strategic_advisor.py.",
+                "technical_commands": ["/strategy", "/ceoconfidence", "/alertscheck"],
+                "human_decision_required": False,
+                "assistant_decision_required": True,
+                "blocks_expansion": True,
+            }],
+            "top_recommendation": None,
+            "strengths": [],
+            "risks": [str(exc)],
+            "next_technical_commands": ["/strategy", "/ceoconfidence", "/alertscheck"],
+            "operational_note": "Erro ao gerar Strategic Advisor.",
+        }
+
+
+def _strategic_advisor_report_block(monthly_stats=None, compact=False):
+    try:
+        payload = _strategic_advisor_snapshot_for_reports(monthly_stats=monthly_stats)
+        return build_strategic_advisor_text(payload, compact=compact)
+    except Exception as exc:
+        return (
+            "🧭 STRATEGIC ADVISOR — CENTRAL QUANT V1\n"
+            f"Data/hora: {data_hora_sp_str()}\n\n"
+            "Status: ERRO\n"
+            f"Erro ao gerar Strategic Advisor: {exc}"
+        )
+
+
 def _executive_alert_monthly_stats(start_dt, end_dt):
     """
     Consolida a saúde executiva do mês com base no log do Executive Alert Manager.
@@ -7202,6 +7317,9 @@ def build_executive_report_monthly():
         "==============================\nCEO CONFIDENCE INDEX\n==============================",
         _ceo_confidence_report_block(monthly_stats=monthly_stats_for_confidence),
         "",
+        "==============================\nSTRATEGIC ADVISOR\n==============================",
+        _strategic_advisor_report_block(monthly_stats=monthly_stats_for_confidence, compact=False),
+        "",
         "==============================\nPERFORMANCE DO MÊS\n==============================",
         f"Trades encerrados: {perf.get('trades', 0)} | Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('be', 0)}",
         f"Win rate: {perf.get('win_rate_pct', 0)}% | PnL total: {perf.get('pnl_total_pct', 0)}% | PnL médio: {perf.get('pnl_avg_pct', 0)}%",
@@ -7439,6 +7557,17 @@ def ceo_daily_route():
 def ceo_confidence_route():
     payload = _ceo_confidence_snapshot_for_reports()
     return {"text": build_ceo_confidence_text(payload), "payload": payload}
+
+
+@app.route("/strategicadvisor")
+@app.route("/strategic_advisor")
+@app.route("/strategy")
+@app.route("/estrategia")
+@app.route("/estratégia")
+def strategic_advisor_route():
+    compact = str(request.args.get("compact", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    payload = _strategic_advisor_snapshot_for_reports()
+    return {"text": build_strategic_advisor_text(payload, compact=compact), "payload": payload}
 
 
 @app.route("/dashboard")
@@ -15638,6 +15767,8 @@ def build_central_command_reply(text: str):
         return build_ceo_daily_report()
     if cmd0 in {"/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança"}:
         return _ceo_confidence_report_block()
+    if cmd0 in {"/strategicadvisor", "/strategic_advisor", "/strategy", "/estrategia", "/estratégia"}:
+        return _strategic_advisor_report_block(compact=False)
     if cmd0 in {"/monthly", "/mensal", "/monthlyreport", "/monthly_report"}:
         return build_executive_report_monthly()
     if cmd0 in {"/support"}:
@@ -15922,6 +16053,11 @@ def _central_command_title(text: str):
         "/confidence": "CEO CONFIDENCE",
         "/confianca": "CEO CONFIDENCE",
         "/confiança": "CEO CONFIDENCE",
+        "/strategicadvisor": "STRATEGIC ADVISOR",
+        "/strategic_advisor": "STRATEGIC ADVISOR",
+        "/strategy": "STRATEGIC ADVISOR",
+        "/estrategia": "STRATEGIC ADVISOR",
+        "/estratégia": "STRATEGIC ADVISOR",
         "/monthly": "MENSAL",
         "/mensal": "MENSAL",
         "/monthlyreport": "MENSAL",
@@ -15979,7 +16115,7 @@ def _central_command_title(text: str):
 def _is_heavy_central_command(text: str):
     cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
     return cmd in {
-        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
+        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança", "/strategicadvisor", "/strategic_advisor", "/strategy", "/estrategia", "/estratégia", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
         "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital", "/portfolioadvisor", "/advisor", "/portfolio",
