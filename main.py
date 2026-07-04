@@ -12016,8 +12016,9 @@ def _awe_extract_outcome_records(limit=600):
 
 def _awe_estimate_module_stats_from_outcomes(records):
     """
-    V1 ainda não tem atribuição causal perfeita por módulo. Quando houver outcome rotulado,
-    aplica uma estimativa conservadora por concordância com a decisão final.
+    Estima acerto por módulo a partir de outcomes rotulados.
+    Quando o Learning/Outcome Evaluator fornece module_outcomes/module_evaluations,
+    usa a atribuição por módulo. Se não houver, cai no proxy conservador pela decisão final.
     """
     stats = {module: {"observations": 0, "correct": 0, "wrong": 0} for module in DECISION_SCORE_ENGINE_V1_WEIGHTS.keys()}
     if not records:
@@ -12026,12 +12027,32 @@ def _awe_estimate_module_stats_from_outcomes(records):
     positive = {"WIN", "TP", "PROFIT", "BREAKEVEN", "BE"}
     negative = {"LOSS", "SL", "STOP"}
     for record in records:
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else record
+        module_rows = []
+        if isinstance(raw, dict):
+            module_rows = raw.get("module_outcomes") or raw.get("module_evaluations") or []
+        used_module_rows = False
+        for row in module_rows or []:
+            module = row.get("module")
+            if module not in stats:
+                continue
+            correct = row.get("correct")
+            if correct is None:
+                continue
+            used_module_rows = True
+            stats[module]["observations"] += 1
+            if correct is True:
+                stats[module]["correct"] += 1
+            else:
+                stats[module]["wrong"] += 1
+        if used_module_rows:
+            continue
+
         outcome = str(record.get("outcome") or "").upper().strip()
         decision = str(record.get("decision") or "").upper().strip()
         if outcome not in positive | negative or decision not in {"ALLOW", "REDUCE", "WAIT", "DENY"}:
             continue
         good_decision = (decision in {"ALLOW", "REDUCE"} and outcome in positive) or (decision in {"WAIT", "DENY"} and outcome in negative)
-        # Sem votos históricos por módulo, atribui ao conjunto com peso menor de evidência.
         for module in stats:
             stats[module]["observations"] += 1
             if good_decision:
@@ -12782,6 +12803,465 @@ def learning_stats_v1_route():
     for module, item in (stats.get("by_module") or {}).items():
         lines.append(f"- {module}: obs={item.get('observations')} | acertos={item.get('correct')} | erros={item.get('wrong')} | neutros={item.get('neutral')} | acc={item.get('accuracy_pct')}%")
     return {"ok": True, "version": LEARNING_ENGINE_V1_VERSION, "text": "\n".join(lines), "payload": stats}
+
+
+# ==========================================================
+# OUTCOME EVALUATOR V1 - CENTRAL QUANT
+# ==========================================================
+
+OUTCOME_EVALUATOR_V1_VERSION = "2026-07-04-OUTCOME-EVALUATOR-V1"
+OUTCOME_EVALUATOR_V1_MODE = "OBSERVATION_ONLY"
+OUTCOME_EVALUATOR_V1_FILE = CENTRAL_DATA_DIR / "outcome_evaluator_v1.jsonl"
+OUTCOME_EVALUATOR_V1_CACHE = {"last_payload": None, "last_generated_at": None, "last_learning_id": None}
+
+
+def _oe_safe_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _oe_append_jsonl(path, item):
+    try:
+        path.parent.mkdir(exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _oe_read_records(path=None, limit=1000):
+    path = path or OUTCOME_EVALUATOR_V1_FILE
+    records = []
+    try:
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-int(limit or 1000):]
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+    except Exception:
+        return records
+    return records
+
+
+def _oe_decision_direction(decision):
+    d = str(decision or "").upper().strip()
+    if d in {"ALLOW", "REDUCE", "ALLOW_BY_SCORE", "ALLOW_ADAPTIVE", "REDUCE_BY_SCORE"}:
+        return "POSITIVE"
+    if d in {"DENY", "WAIT", "DENY_BY_SCORE", "DENY_ADAPTIVE", "WAIT_BY_SCORE"}:
+        return "NEGATIVE"
+    return "NEUTRAL"
+
+
+def _oe_vote_direction(vote):
+    v = str(vote or "").upper().strip()
+    if v in {"ALLOW", "REDUCE"}:
+        return "POSITIVE"
+    if v in {"DENY", "WAIT"}:
+        return "NEGATIVE"
+    return "NEUTRAL"
+
+
+def _oe_outcome_direction(outcome):
+    o = str(outcome or "").upper().strip()
+    if o in {"WIN", "TP", "PROFIT", "GAIN", "LUCRO"}:
+        return "POSITIVE"
+    if o in {"LOSS", "SL", "STOP", "PREJUIZO", "PREJUÍZO"}:
+        return "NEGATIVE"
+    if o in {"BE", "BREAKEVEN", "BREAK_EVEN"}:
+        return "NEUTRAL"
+    return "UNKNOWN"
+
+
+def _oe_correctness_from_direction(signal_direction, outcome_direction, neutral_policy="DEFENSIVE_OK"):
+    sd = str(signal_direction or "NEUTRAL").upper()
+    od = str(outcome_direction or "UNKNOWN").upper()
+    if od == "UNKNOWN" or sd == "NEUTRAL":
+        return None
+    if od == "POSITIVE":
+        return sd == "POSITIVE"
+    if od == "NEGATIVE":
+        return sd == "NEGATIVE"
+    if od == "NEUTRAL":
+        if neutral_policy == "DEFENSIVE_OK":
+            return sd == "NEGATIVE"
+        return None
+    return None
+
+
+def _oe_score_correctness_value(correct):
+    if correct is True:
+        return 1.0
+    if correct is False:
+        return -1.0
+    return 0.0
+
+
+def _oe_module_evaluations(decision_record, normalized_outcome):
+    outcome_direction = _oe_outcome_direction(normalized_outcome)
+    evaluations = []
+    total_abs_influence = 0.0
+    correct_influence = 0.0
+    wrong_influence = 0.0
+
+    for vote in (decision_record or {}).get("module_votes") or []:
+        module = vote.get("module") or "UNKNOWN"
+        vote_value = vote.get("vote")
+        vote_direction = _oe_vote_direction(vote_value)
+        correct = _oe_correctness_from_direction(vote_direction, outcome_direction)
+        weight = _oe_safe_float(vote.get("weight"), 0.0) or 0.0
+        points = _oe_safe_float(vote.get("points"), 50.0) or 0.0
+        contribution = round(weight * points, 4)
+        influence = abs(contribution)
+        total_abs_influence += influence
+        if correct is True:
+            correct_influence += influence
+        elif correct is False:
+            wrong_influence += influence
+        evaluations.append({
+            "module": module,
+            "vote": vote_value,
+            "vote_direction": vote_direction,
+            "outcome_direction": outcome_direction,
+            "correct": correct,
+            "correctness_score": _oe_score_correctness_value(correct),
+            "weight": weight,
+            "points": points,
+            "contribution": contribution,
+            "influence_abs": round(influence, 4),
+            "reason": vote.get("reason"),
+            "details": vote.get("details"),
+        })
+
+    for item in evaluations:
+        if total_abs_influence > 0:
+            item["influence_pct"] = round((item.get("influence_abs", 0.0) / total_abs_influence) * 100.0, 2)
+        else:
+            item["influence_pct"] = 0.0
+
+    return {
+        "module_evaluations": evaluations,
+        "total_abs_influence": round(total_abs_influence, 4),
+        "correct_influence": round(correct_influence, 4),
+        "wrong_influence": round(wrong_influence, 4),
+        "correct_influence_pct": round((correct_influence / total_abs_influence) * 100.0, 2) if total_abs_influence else None,
+        "wrong_influence_pct": round((wrong_influence / total_abs_influence) * 100.0, 2) if total_abs_influence else None,
+    }
+
+
+def _oe_evaluator_stats(records=None):
+    records = records if records is not None else _oe_read_records(limit=5000)
+    by_module = {}
+    by_decision = {}
+    total = 0
+    decisions_correct = 0
+    decisions_wrong = 0
+    decisions_neutral = 0
+
+    for item in records or []:
+        if item.get("record_type") != "OUTCOME_EVALUATION":
+            continue
+        total += 1
+        decision = str(item.get("decision") or "UNKNOWN").upper()
+        by_decision.setdefault(decision, {"count": 0, "correct": 0, "wrong": 0, "neutral": 0, "accuracy_pct": None})
+        by_decision[decision]["count"] += 1
+        dc = item.get("decision_correct")
+        if dc is True:
+            decisions_correct += 1
+            by_decision[decision]["correct"] += 1
+        elif dc is False:
+            decisions_wrong += 1
+            by_decision[decision]["wrong"] += 1
+        else:
+            decisions_neutral += 1
+            by_decision[decision]["neutral"] += 1
+        for ev in item.get("module_evaluations") or []:
+            module = ev.get("module") or "UNKNOWN"
+            by_module.setdefault(module, {
+                "observations": 0,
+                "correct": 0,
+                "wrong": 0,
+                "neutral": 0,
+                "accuracy_pct": None,
+                "avg_influence_pct": 0.0,
+                "influence_samples": 0,
+            })
+            correct = ev.get("correct")
+            if correct is True:
+                by_module[module]["observations"] += 1
+                by_module[module]["correct"] += 1
+            elif correct is False:
+                by_module[module]["observations"] += 1
+                by_module[module]["wrong"] += 1
+            else:
+                by_module[module]["neutral"] += 1
+            if ev.get("influence_pct") is not None:
+                n = by_module[module]["influence_samples"]
+                old = by_module[module]["avg_influence_pct"]
+                val = _oe_safe_float(ev.get("influence_pct"), 0.0) or 0.0
+                by_module[module]["avg_influence_pct"] = round(((old * n) + val) / (n + 1), 4)
+                by_module[module]["influence_samples"] = n + 1
+
+    for module, stats in by_module.items():
+        obs = stats.get("observations") or 0
+        stats["accuracy_pct"] = round((stats.get("correct", 0) / obs) * 100.0, 2) if obs else None
+    for decision, stats in by_decision.items():
+        obs = (stats.get("correct", 0) + stats.get("wrong", 0))
+        stats["accuracy_pct"] = round((stats.get("correct", 0) / obs) * 100.0, 2) if obs else None
+
+    return {
+        "records": len(records or []),
+        "evaluations": total,
+        "decision_correct": decisions_correct,
+        "decision_wrong": decisions_wrong,
+        "decision_neutral": decisions_neutral,
+        "decision_accuracy_pct": round((decisions_correct / (decisions_correct + decisions_wrong)) * 100.0, 2) if (decisions_correct + decisions_wrong) else None,
+        "by_module": by_module,
+        "by_decision": by_decision,
+    }
+
+
+def build_outcome_evaluator_v1(learning_id=None, trade_id=None, outcome=None, result_r=None, pnl_pct=None, note=None, save=True, force=False):
+    global OUTCOME_EVALUATOR_V1_CACHE
+    records = _le_read_records(limit=max(LEARNING_ENGINE_V1_DEFAULT_READ_LIMIT, 5000))
+    decision_record = _le_find_latest_decision(records, learning_id=learning_id, trade_id=trade_id)
+    normalized = _le_normalize_outcome(outcome=outcome, result_r=result_r, pnl_pct=pnl_pct)
+    outcome_direction = _oe_outcome_direction(normalized)
+
+    if normalized == "UNKNOWN" and not force:
+        return {
+            "ok": False,
+            "version": OUTCOME_EVALUATOR_V1_VERSION,
+            "mode": OUTCOME_EVALUATOR_V1_MODE,
+            "generated_at": data_hora_sp_str(),
+            "error": "OUTCOME_UNKNOWN",
+            "message": "Informe outcome=WIN/LOSS/BE ou result_r/pnl_pct.",
+            "inputs": {"learning_id": learning_id, "trade_id": trade_id, "outcome": outcome, "result_r": result_r, "pnl_pct": pnl_pct},
+        }
+
+    if not decision_record:
+        return {
+            "ok": False,
+            "version": OUTCOME_EVALUATOR_V1_VERSION,
+            "mode": OUTCOME_EVALUATOR_V1_MODE,
+            "generated_at": data_hora_sp_str(),
+            "error": "DECISION_RECORD_NOT_FOUND",
+            "message": "Não encontrei decisão registrada para este learning_id/trade_id.",
+            "inputs": {"learning_id": learning_id, "trade_id": trade_id, "outcome": normalized, "result_r": result_r, "pnl_pct": pnl_pct},
+            "learning_stats": _le_outcome_stats(records),
+        }
+
+    decision = str(decision_record.get("adaptive_decision") or decision_record.get("decision") or "UNKNOWN").upper().strip()
+    decision_direction = _oe_decision_direction(decision)
+    decision_correct = _oe_correctness_from_direction(decision_direction, outcome_direction)
+    module_eval_payload = _oe_module_evaluations(decision_record, normalized)
+
+    eval_id = _le_now_id("EVAL")
+    evaluation_record = {
+        "record_type": "OUTCOME_EVALUATION",
+        "evaluation_id": eval_id,
+        "learning_id": decision_record.get("learning_id"),
+        "trade_id": decision_record.get("trade_id"),
+        "created_at": data_hora_sp_str(),
+        "version": OUTCOME_EVALUATOR_V1_VERSION,
+        "source": "Outcome Evaluator V1",
+        "decision": decision,
+        "decision_score": decision_record.get("adaptive_decision_score") or decision_record.get("base_decision_score"),
+        "decision_direction": decision_direction,
+        "decision_correct": decision_correct,
+        "outcome": normalized,
+        "outcome_direction": outcome_direction,
+        "raw_outcome": outcome,
+        "result_r": _oe_safe_float(result_r, None),
+        "pnl_pct": _oe_safe_float(pnl_pct, None),
+        "note": note,
+        "module_evaluations": module_eval_payload.get("module_evaluations"),
+        "influence_summary": {
+            "total_abs_influence": module_eval_payload.get("total_abs_influence"),
+            "correct_influence": module_eval_payload.get("correct_influence"),
+            "wrong_influence": module_eval_payload.get("wrong_influence"),
+            "correct_influence_pct": module_eval_payload.get("correct_influence_pct"),
+            "wrong_influence_pct": module_eval_payload.get("wrong_influence_pct"),
+        },
+        "decision_snapshot": {
+            "inputs": decision_record.get("inputs"),
+            "recommended_order": decision_record.get("recommended_order"),
+            "hard_deny": decision_record.get("hard_deny"),
+            "hard_wait": decision_record.get("hard_wait"),
+        },
+    }
+
+    saved_learning_outcome = False
+    learning_outcome_error = None
+    learning_outcome_payload = None
+    saved_eval = False
+    eval_error = None
+
+    if save:
+        learning_outcome_payload = build_learning_outcome_v1(
+            learning_id=decision_record.get("learning_id"),
+            trade_id=decision_record.get("trade_id"),
+            outcome=normalized,
+            result_r=result_r,
+            pnl_pct=pnl_pct,
+            note=note,
+            force=True,
+        )
+        saved_learning_outcome = bool(learning_outcome_payload.get("ok"))
+        learning_outcome_error = learning_outcome_payload.get("error")
+        saved_eval, eval_error = _oe_append_jsonl(OUTCOME_EVALUATOR_V1_FILE, evaluation_record)
+
+    stats = _oe_evaluator_stats(_oe_read_records(limit=5000))
+    learning_stats = _le_outcome_stats(_le_read_records(limit=5000))
+    alerts = []
+    if decision_correct is False:
+        alerts.append("A decisão final parece ter errado contra o outcome informado; revisar pesos ou regras se a amostra crescer.")
+    elif decision_correct is True:
+        alerts.append("A decisão final parece alinhada ao outcome informado.")
+    if module_eval_payload.get("wrong_influence_pct") is not None and module_eval_payload.get("wrong_influence_pct") >= 40:
+        alerts.append("Grande parte da influência ponderada veio de módulos que erraram neste outcome.")
+    if not save:
+        alerts.append("Preview não salvo. Use save=true ou POST para registrar a avaliação.")
+
+    payload = {
+        "ok": bool((saved_eval and saved_learning_outcome) if save else True),
+        "version": OUTCOME_EVALUATOR_V1_VERSION,
+        "mode": OUTCOME_EVALUATOR_V1_MODE,
+        "generated_at": data_hora_sp_str(),
+        "evaluation_id": eval_id,
+        "learning_id": decision_record.get("learning_id"),
+        "trade_id": decision_record.get("trade_id"),
+        "save_requested": bool(save),
+        "evaluation_saved": saved_eval,
+        "evaluation_error": eval_error,
+        "learning_outcome_saved": saved_learning_outcome,
+        "learning_outcome_error": learning_outcome_error,
+        "decision": decision,
+        "decision_correct": decision_correct,
+        "outcome": normalized,
+        "outcome_direction": outcome_direction,
+        "result_r": _oe_safe_float(result_r, None),
+        "pnl_pct": _oe_safe_float(pnl_pct, None),
+        "module_evaluations": module_eval_payload.get("module_evaluations"),
+        "influence_summary": evaluation_record.get("influence_summary"),
+        "evaluation_record": evaluation_record,
+        "stats": stats,
+        "learning_stats": learning_stats,
+        "alerts": alerts,
+        "reasons": [
+            "Outcome Evaluator V1 compara a decisão registrada com o resultado informado.",
+            "Cada voto de módulo recebe acerto/erro/neutro conforme sua direção e o outcome.",
+            "A avaliação salva também registra um OUTCOME no Learning Engine para alimentar o Adaptive Weight Engine.",
+        ],
+        "notes": [
+            "Outcome Evaluator V1 está em modo consultivo/observação.",
+            "Não altera pesos diretamente; ele cria a base rotulada que será usada pelo Adaptive Weight Engine.",
+            "Para DENY/WAIT, o outcome representa o resultado observado/counterfactual do sinal ou paper tracking.",
+        ],
+    }
+    OUTCOME_EVALUATOR_V1_CACHE = {"last_payload": payload, "last_generated_at": payload.get("generated_at"), "last_learning_id": payload.get("learning_id")}
+    return payload
+
+
+def build_outcome_evaluator_v1_text(payload):
+    lines = [
+        "🧾 OUTCOME EVALUATOR V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Versão: {payload.get('version')}",
+        f"Modo: {payload.get('mode')}",
+        "",
+        "Outcome avaliado:",
+        f"Evaluation ID: {payload.get('evaluation_id')}",
+        f"Learning ID: {payload.get('learning_id')}",
+        f"Trade ID: {payload.get('trade_id')}",
+        f"Outcome: {payload.get('outcome')} | R: {payload.get('result_r')} | PnL%: {payload.get('pnl_pct')}",
+        "",
+        "Decisão:",
+        f"Decision: {payload.get('decision')} | correta: {payload.get('decision_correct')}",
+        f"Avaliação salva: {payload.get('evaluation_saved')} | Learning outcome salvo: {payload.get('learning_outcome_saved')}",
+        "",
+        "Influência:",
+    ]
+    inf = payload.get("influence_summary") or {}
+    lines += [
+        f"Influência correta: {inf.get('correct_influence_pct')}%",
+        f"Influência errada: {inf.get('wrong_influence_pct')}%",
+        "",
+        "Acerto por módulo:",
+    ]
+    for m in payload.get("module_evaluations") or []:
+        lines.append(
+            f"- {m.get('module')}: voto={m.get('vote')} | correto={m.get('correct')} | "
+            f"peso={m.get('weight')} | pontos={m.get('points')} | influência={m.get('influence_pct')}%"
+        )
+    stats = payload.get("stats") or {}
+    lines += [
+        "",
+        "Estatísticas do evaluator:",
+        f"Avaliações: {stats.get('evaluations')} | decisão correta: {stats.get('decision_correct')} | decisão errada: {stats.get('decision_wrong')} | acc={stats.get('decision_accuracy_pct')}%",
+    ]
+    by_module = stats.get("by_module") or {}
+    if by_module:
+        lines += ["", "Acurácia acumulada por módulo:"]
+        for module, item in by_module.items():
+            lines.append(f"- {module}: obs={item.get('observations')} | acertos={item.get('correct')} | erros={item.get('wrong')} | acc={item.get('accuracy_pct')}% | influência média={item.get('avg_influence_pct')}%")
+    if payload.get("alerts"):
+        lines += ["", "Alertas:"] + [f"- {x}" for x in payload.get("alerts", [])]
+    lines += ["", "Motivos:"] + [f"- {x}" for x in payload.get("reasons", [])]
+    lines += ["", "Notas:"] + [f"- {x}" for x in payload.get("notes", [])]
+    return "\n".join(lines)
+
+
+@app.route("/outcome/evaluator/v1", methods=["GET", "POST"])
+@app.route("/outcome/evaluate/v1", methods=["GET", "POST"])
+@app.route("/learning/evaluate/v1", methods=["GET", "POST"])
+def outcome_evaluator_v1_route():
+    body = request.get_json(silent=True) or {}
+    learning_id = body.get("learning_id", request.args.get("learning_id"))
+    trade_id = body.get("trade_id", request.args.get("trade_id"))
+    outcome = body.get("outcome", request.args.get("outcome"))
+    result_r = body.get("result_r", request.args.get("result_r"))
+    pnl_pct = body.get("pnl_pct", request.args.get("pnl_pct"))
+    note = body.get("note", request.args.get("note"))
+    save_raw = body.get("save", request.args.get("save", "true"))
+    save = request.method == "POST" or str(save_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save", "record"}
+    force_raw = body.get("force", request.args.get("force", ""))
+    force = str(force_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
+    payload = build_outcome_evaluator_v1(learning_id=learning_id, trade_id=trade_id, outcome=outcome, result_r=result_r, pnl_pct=pnl_pct, note=note, save=save, force=force)
+    text = build_outcome_evaluator_v1_text(payload)
+    if as_text:
+        return text
+    return {"ok": bool(payload.get("ok")), "text": text, "payload": payload}
+
+
+@app.route("/outcome/evaluator/summary/v1")
+@app.route("/outcome/evaluator/stats/v1")
+@app.route("/learning/evaluator/stats/v1")
+def outcome_evaluator_stats_v1_route():
+    limit = request.args.get("limit", default=5000, type=int)
+    stats = _oe_evaluator_stats(_oe_read_records(limit=limit))
+    lines = [
+        "📊 OUTCOME EVALUATOR STATS V1 — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Avaliações: {stats.get('evaluations')}",
+        f"Decisão correta: {stats.get('decision_correct')} | decisão errada: {stats.get('decision_wrong')} | neutra: {stats.get('decision_neutral')} | acc={stats.get('decision_accuracy_pct')}%",
+        "",
+        "Por módulo:",
+    ]
+    for module, item in (stats.get("by_module") or {}).items():
+        lines.append(f"- {module}: obs={item.get('observations')} | acertos={item.get('correct')} | erros={item.get('wrong')} | neutros={item.get('neutral')} | acc={item.get('accuracy_pct')}% | influência média={item.get('avg_influence_pct')}%")
+    return {"ok": True, "version": OUTCOME_EVALUATOR_V1_VERSION, "text": "\n".join(lines), "payload": stats}
 
 
 
