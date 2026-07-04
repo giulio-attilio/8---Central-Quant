@@ -7337,6 +7337,72 @@ def analytics_exposure_route():
         }
     
 
+@app.route("/analytics/capital-check")
+def analytics_capital_check_route():
+    try:
+        from flask import request
+        import capital_allocator
+
+        capital = request.args.get("capital", default=10000, type=float)
+        bot = request.args.get("bot", default="", type=str)
+        required = request.args.get("required", default=0, type=float)
+        risk = request.args.get("risk", default=0, type=float)
+
+        payload = capital_allocator.capital_check(
+            capital=capital,
+            bot=bot,
+            required=required,
+            risk=risk,
+        )
+
+        if not payload.get("ok"):
+            return payload
+
+        lines = [
+            "💰 CAPITAL ALLOCATOR — CENTRAL QUANT",
+            f"Data/hora: {payload.get('generated_at')}",
+            f"Modo: {payload.get('mode')}",
+            "",
+            f"Bot: {payload.get('bot')}",
+            f"Categoria: {payload.get('category')}",
+            f"Decisão base: {payload.get('base_decision')}",
+            "",
+            "Capital:",
+            f"Capital total analisado: {payload.get('capital')} USDT",
+            f"Capital destinado ao robô: {payload.get('capital_allocated')} USDT",
+            f"Capital usado: {payload.get('capital_used')} USDT",
+            f"Capital livre: {payload.get('capital_free')} USDT",
+            f"Capital solicitado: {payload.get('required_capital')} USDT",
+            f"Excesso de capital: {payload.get('capital_excess')} USDT",
+            "",
+            "Risco:",
+            f"Risco livre: {payload.get('risk_free_usdt')} USDT",
+            f"Risco solicitado: {payload.get('required_risk_usdt')} USDT",
+            f"Excesso de risco: {payload.get('risk_excess_usdt')} USDT",
+            "",
+            f"Resultado: {payload.get('decision')}",
+            f"Motivo: {payload.get('reason')}",
+            f"Capital sugerido: {payload.get('suggested_required_capital')} USDT",
+            f"Redução sugerida: {payload.get('suggested_reduction_pct')}%",
+        ]
+
+        lines += ["", "Notas:"]
+        for note in payload.get("notes", []):
+            lines.append(f"- {note}")
+
+        return {
+            "ok": True,
+            "text": "\n".join(lines),
+            "payload": payload,
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }    
+    
+
 @app.route("/analytics/symbols")
 def analytics_symbols_route():
     return _analytics_group_response("symbol", "symbol", "symbols")
