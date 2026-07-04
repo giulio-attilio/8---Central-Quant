@@ -426,8 +426,16 @@ def portfolio_advisor():
 
 
 def decision_engine_observation():
-    payload = portfolio_advisor()
-    p = payload.get("portfolio", {})
+    advisor_payload = portfolio_advisor()
+    weights_payload = portfolio_weights()
+
+    p = advisor_payload.get("portfolio", {})
+    weights = weights_payload.get("weights", [])
+
+    weight_map = {
+        item.get("name"): item
+        for item in weights
+    }
 
     decisions = []
 
@@ -440,6 +448,10 @@ def decision_engine_observation():
     for rec in recs:
         name = rec.get("name")
         action = rec.get("action")
+        weight_info = weight_map.get(name, {})
+
+        suggested_weight = weight_info.get("suggested_weight_pct", 0)
+        category = weight_info.get("category")
 
         if name in core_names:
             decision = "ALLOW"
@@ -462,13 +474,16 @@ def decision_engine_observation():
             "decision": decision,
             "reason": reason,
             "source_action": action,
+            "category": category,
+            "suggested_weight_pct": suggested_weight,
         })
 
     return {
         "ok": True,
-        "version": "2026-07-03-DECISION-ENGINE-V1-OBSERVATION",
-        "generated_at": payload.get("generated_at"),
+        "version": "2026-07-03-DECISION-ENGINE-V2-WEIGHTS",
+        "generated_at": advisor_payload.get("generated_at"),
         "mode": "OBSERVATION_ONLY",
+        "portfolio_health": weights_payload.get("portfolio_health", {}),
         "decisions": decisions,
     }
 

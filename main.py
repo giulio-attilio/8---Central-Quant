@@ -7043,10 +7043,23 @@ def analytics_decision_engine_route():
             "Decisões em observação:",
         ]
 
+        health = payload.get("portfolio_health", {})
+
+        lines += [
+            "",
+            "Saúde da carteira:",
+            f"Concentração: {health.get('concentration')}",
+            f"Diversificação: {health.get('diversification')}",
+            f"Risco: {health.get('risk_level')}",
+            f"Maior peso: {health.get('top_weight_pct')}%",
+        ]
+
         for item in payload.get("decisions", []):
             lines += [
                 "",
                 f"{item.get('name')}: {item.get('decision')}",
+                f"Peso sugerido: {item.get('suggested_weight_pct')}%",
+                f"Categoria: {item.get('category')}",
                 f"Motivo: {item.get('reason')}",
                 f"Origem: {item.get('source_action')}",
             ]
