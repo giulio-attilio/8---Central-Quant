@@ -7089,6 +7089,24 @@ def analytics_portfolio_route():
         else:
             lines.append("- Nenhum alerta relevante.")
 
+        lines += ["", "Recomendação geral:"]
+        recs = p.get("general_recommendations", [])
+        if recs:
+            for rec in recs:
+                lines.append(
+                    f"- {rec.get('name')}: {rec.get('action')} — {rec.get('reason')}"
+                )
+        else:
+            lines.append("- Nenhuma recomendação geral disponível.")
+
+        lines += ["", "Prioridades da semana:"]
+        priorities = p.get("weekly_priorities", [])
+        if priorities:
+            for priority in priorities:
+                lines.append(f"- {priority}")
+        else:
+            lines.append("- Nenhuma prioridade específica.")    
+
         return {
             "ok": True,
             "text": "\n".join(lines),

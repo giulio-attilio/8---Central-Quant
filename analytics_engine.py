@@ -289,22 +289,28 @@ def setup_ranking():
 
 
 def portfolio_advisor():
-    bots = bot_ranking().get("bots", [])
-    setups = setup_ranking().get("setups", [])
+    bot_payload = bot_ranking()
+    setup_payload = setup_ranking()
+
+    bots = bot_payload.get("bots", [])
+    setups = setup_payload.get("setups", [])
 
     core = []
     observe = []
     insufficient = []
     reduce = []
     alerts = []
+    general_recommendations = []
+    weekly_priorities = []
 
     for item in bots:
         name = item.get("bot")
         rec = item.get("recommendation")
         conf = item.get("confidence")
-        score = item.get("score", 0)
-        pnl = item.get("pnl_total_pct", 0)
-        giveback = item.get("giveback_avg_pct", 0)
+        score = item.get("score", 0) or 0
+        pnl = item.get("pnl_total_pct", 0) or 0
+        giveback = item.get("giveback_avg_pct", 0) or 0
+        trades = item.get("trades", 0) or 0
 
         row = {
             "name": name,
@@ -312,17 +318,48 @@ def portfolio_advisor():
             "confidence": conf,
             "recommendation": rec,
             "pnl_total_pct": pnl,
-            "trades": item.get("trades"),
+            "trades": trades,
         }
 
         if conf in {"MÉDIA", "ALTA"} and pnl > 0 and score >= 65:
             core.append(row)
+            general_recommendations.append({
+                "name": name,
+                "action": "AUMENTAR COM CAUTELA",
+                "reason": "Robô com score forte, PnL positivo e confiança operacional relevante.",
+            })
+
         elif conf == "AMOSTRA INSUFICIENTE":
             insufficient.append(row)
+
+            if pnl > 0 and score >= 40:
+                general_recommendations.append({
+                    "name": name,
+                    "action": "OBSERVAR POSITIVO",
+                    "reason": "Resultado inicial positivo, mas ainda sem amostra suficiente.",
+                })
+            else:
+                general_recommendations.append({
+                    "name": name,
+                    "action": "NÃO AUMENTAR",
+                    "reason": "Amostra insuficiente ou desempenho ainda fraco.",
+                })
+
         elif pnl < 0 or score < 35:
             reduce.append(row)
+            general_recommendations.append({
+                "name": name,
+                "action": "REDUZIR / NÃO AUMENTAR",
+                "reason": "PnL negativo ou score abaixo do mínimo desejado.",
+            })
+
         else:
             observe.append(row)
+            general_recommendations.append({
+                "name": name,
+                "action": "MANTER EM OBSERVAÇÃO",
+                "reason": "Ainda não atende critérios claros para núcleo ou redução.",
+            })
 
         if giveback and giveback >= 3:
             alerts.append({
@@ -331,6 +368,15 @@ def portfolio_advisor():
                 "giveback_avg_pct": giveback,
             })
 
+            weekly_priorities.append(
+                f"Reduzir giveback médio do {name}."
+            )
+
+        if trades < 20:
+            weekly_priorities.append(
+                f"Aguardar mais trades do {name} antes de promover para núcleo."
+            )
+
     setup_core = []
     setup_watch = []
     setup_reduce = []
@@ -338,8 +384,8 @@ def portfolio_advisor():
     for item in setups:
         name = item.get("setup")
         conf = item.get("confidence")
-        score = item.get("score", 0)
-        pnl = item.get("pnl_total_pct", 0)
+        score = item.get("score", 0) or 0
+        pnl = item.get("pnl_total_pct", 0) or 0
 
         row = {
             "name": name,
@@ -357,10 +403,13 @@ def portfolio_advisor():
         else:
             setup_watch.append(row)
 
+    if not weekly_priorities:
+        weekly_priorities.append("Manter coleta de dados e acompanhar evolução dos rankings.")
+
     return {
         "ok": True,
-        "version": "2026-07-03-PORTFOLIO-ADVISOR-V1",
-        "generated_at": bot_ranking().get("generated_at"),
+        "version": "2026-07-03-PORTFOLIO-ADVISOR-V2",
+        "generated_at": bot_payload.get("generated_at"),
         "portfolio": {
             "core_bots": core,
             "observe_bots": observe,
@@ -370,5 +419,7 @@ def portfolio_advisor():
             "watch_setups": setup_watch,
             "reduce_setups": setup_reduce,
             "alerts": alerts,
+            "general_recommendations": general_recommendations,
+            "weekly_priorities": list(dict.fromkeys(weekly_priorities)),
         },
     }
