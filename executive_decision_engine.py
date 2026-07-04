@@ -1,5 +1,5 @@
-# EXECUTIVE DECISION ENGINE V1 — CENTRAL QUANT
-# Versão: 2026-07-04-EXECUTIVE-DECISION-ENGINE-V1
+# EXECUTIVE DECISION ENGINE V1.1 — CENTRAL QUANT
+# Versão: 2026-07-04-EXECUTIVE-DECISION-ENGINE-V1.1
 #
 # Objetivo:
 # - Transformar Decision Pack, Strategic Advisor e CEO Confidence em diretivas operacionais concretas.
@@ -10,7 +10,7 @@
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-VERSION = "2026-07-04-EXECUTIVE-DECISION-ENGINE-V1"
+VERSION = "2026-07-04-EXECUTIVE-DECISION-ENGINE-V1.1"
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 
 
@@ -152,6 +152,16 @@ def build_executive_decision(
     pending_outcome = _safe_int(pipe.get("pending_outcome") or _dict(pipe.get("positions")).get("pending_outcome"), 0)
     pipeline_status = str(pipe.get("status") or "UNKNOWN")
     components_ok = str(pipe.get("components_ok") or "")
+    if not components_ok:
+        components = _dict(_dict(pipe.get("pipeline")).get("components"))
+        if components:
+            total_components = len(components)
+            ok_components = 0
+            for comp in components.values():
+                if isinstance(comp, dict) and bool(comp.get("ok")):
+                    ok_components += 1
+            components_ok = f"{ok_components}/{total_components}"
+
 
     adaptive_confidence = _safe_float(learning.get("adaptive_confidence") or learning.get("confidence"), 0.0)
     monthly_trades = _safe_int(sample.get("monthly_trades") or sample.get("trades"), 0)
@@ -391,9 +401,9 @@ def build_executive_decision(
             "/traderegistry/report",
         ],
         "notes": [
-            "V1 não altera ordens, risco ou pesos automaticamente.",
-            "A saída policy foi desenhada para futura integração com Risk Manager.",
-            "Enquanto human_decision_required=False, a decisão prática deve ser interpretada pelo assistente técnico.",
+            "V1.1 não executa ordens, não fecha posições e não muda pesos automaticamente.",
+            "A policy já pode ser aplicada pelo Risk Manager/can_open_trade quando integrada no main.py.",
+            "Quando a condição de release for cumprida, a decisão é recalculada automaticamente.",
         ],
     }
 
@@ -407,7 +417,7 @@ def build_executive_decision_text(payload: Dict[str, Any], compact: bool = False
     directives = _list(payload.get("directives"))
 
     lines = [
-        "⚖️ EXECUTIVE DECISION ENGINE — CENTRAL QUANT V1",
+        "⚖️ EXECUTIVE DECISION ENGINE — CENTRAL QUANT V1.1",
         f"Data/hora: {payload.get('generated_at')}",
         "",
         f"Decisão primária: {payload.get('primary_decision')}",
@@ -448,7 +458,7 @@ def build_executive_decision_text(payload: Dict[str, Any], compact: bool = False
         lines += [
             "",
             "Observação:",
-            "Este motor decide a política operacional, mas V1 ainda não aplica bloqueios sozinho no Risk Manager.",
+            "Este motor decide a política operacional. Quando integrado ao Risk Manager/can_open_trade, a policy bloqueia automaticamente novas entradas incompatíveis.",
         ]
 
     return "\n".join(lines)
