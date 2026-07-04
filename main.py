@@ -44,6 +44,11 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from flask import Flask, request
+from execution_orchestrator import (
+    execution_health,
+    orchestrate_execution,
+    read_execution_log,
+)
 
 app = Flask(__name__)
 
@@ -11676,6 +11681,29 @@ def execution_policy_v1_summary_route():
     return {"ok": True, "version": payload.get("version"), "generated_at": payload.get("generated_at"), "mode": payload.get("mode"), "inputs": payload.get("inputs"), "decision": payload.get("decision"), "execution_action": payload.get("execution_action"), "confidence_score": payload.get("confidence_score"), "recommended_order": payload.get("recommended_order"), "votes": payload.get("votes"), "reasons": payload.get("reasons"), "alerts": payload.get("alerts"), "cache": {"last_generated_at": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_generated_at"), "last_capital": EXECUTION_POLICY_ENGINE_V1_CACHE.get("last_capital")}}
 
 
+@app.get("/execution/health")
+def api_execution_health():
+    return execution_health()
+
+
+@app.post("/execution/plan")
+def api_execution_plan(payload: dict = None):
+    if payload is None:
+        payload = {}
+
+    return orchestrate_execution(
+        payload=payload,
+        mode=payload.get("mode"),
+        requested_qty=payload.get("requested_qty"),
+        capital_allocated=payload.get("capital_allocated"),
+        dry_run=True,
+    )
+
+
+@app.get("/execution/log")
+def api_execution_log(limit: int = 20):
+    return read_execution_log(limit=limit)
+
 
 # ==========================================================
 # DECISION SCORE ENGINE V1 - CENTRAL QUANT
@@ -17651,8 +17679,9 @@ def _ce_cluster_policy_from_pressure(positions, pct, same_symbol_count=0, side=N
 
 def _ce_get_exposure_summary(capital=10000.0):
     try:
-        if "build_bot_exposure_manager_v21" in globals():
-            data = build_bot_exposure_manager_v21(capital=capital)
+       fn = globals().get("build_bot_exposure_manager_v21")
+       if callable(fn):
+            data = fn(capital=capital)
             if isinstance(data, dict):
                 return data.get("summary") or data.get("payload", {}).get("summary") or {}
     except Exception:
@@ -18037,8 +18066,9 @@ def _see_get_trade_stats_by_bot():
     candidates = {}
     try:
         # Many Central versions expose analytics through build_analytics_report.
-        if "build_analytics_report" in globals():
-            raw = build_analytics_report()
+        fn = globals().get("build_analytics_report")
+        if callable(fn):
+            raw = fn()
             if isinstance(raw, dict):
                 rows = raw.get("bots") or raw.get("by_bot") or raw.get("ranking") or []
                 if isinstance(rows, dict):
