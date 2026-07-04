@@ -105,6 +105,10 @@ from decision_pack import (
     build_decision_pack,
     build_decision_pack_text,
 )
+from executive_decision_engine import (
+    build_executive_decision,
+    build_executive_decision_text,
+)
 
 
 app = Flask(__name__)
@@ -5851,6 +5855,8 @@ def build_executive_report():
         "",
         _decision_pack_report_block(compact=True),
         "",
+        _executive_decision_report_block(compact=True),
+        "",
         _executive_alerts_report_block(),
         "",
         f"Risco direcional: {risk_status}",
@@ -5899,6 +5905,7 @@ def daily_snapshot_payload():
         "ceo_confidence": _ceo_confidence_snapshot_for_reports(),
         "strategic_advisor": _strategic_advisor_snapshot_for_reports(),
         "decision_pack": _decision_pack_snapshot_for_reports(),
+        "executive_decision": _executive_decision_snapshot_for_reports(),
     }
 
 
@@ -6666,6 +6673,7 @@ def build_executive_dashboard_json():
         "ceo_confidence": ceo_confidence,
         "strategic_advisor": strategic_advisor,
         "decision_pack": _decision_pack_snapshot_for_reports(compact_source=True),
+        "executive_decision": _executive_decision_snapshot_for_reports(compact_source=True),
         "real_execution_enabled": bool(ENABLE_REAL_TRADING),
         "execution_mode": EXECUTION_MODE,
         "memory_mb": memory_mb or 0,
@@ -6723,6 +6731,11 @@ def build_ceo_daily_report():
         "DECISION PACK",
         "════════════════════════════",
         _decision_pack_report_block(compact=True),
+        "",
+        "════════════════════════════",
+        "EXECUTIVE DECISION ENGINE",
+        "════════════════════════════",
+        _executive_decision_report_block(compact=True),
         "",
         "════════════════════════════",
         "EXECUTIVE ALERT MANAGER",
@@ -7190,6 +7203,120 @@ def _decision_pack_report_block(monthly_stats=None, compact=False):
         )
 
 
+
+
+# ==========================================================
+# EXECUTIVE DECISION ENGINE — INTEGRAÇÃO COM REPORTS
+# ==========================================================
+
+def _executive_decision_snapshot_for_reports(monthly_stats=None, compact_source=False):
+    """
+    Consolida o Executive Decision Engine V1.
+    V1 decide política operacional, mas não executa bloqueios sozinho.
+    """
+    try:
+        ceo_payload = _ceo_confidence_snapshot_for_reports(monthly_stats=monthly_stats)
+    except Exception:
+        ceo_payload = {}
+
+    try:
+        strategy_payload = _strategic_advisor_snapshot_for_reports(
+            monthly_stats=monthly_stats,
+            ceo_confidence=ceo_payload,
+            compact_source=compact_source,
+        )
+    except Exception:
+        strategy_payload = {}
+
+    try:
+        decision_pack_payload = _decision_pack_snapshot_for_reports(
+            monthly_stats=monthly_stats,
+            ceo_confidence=ceo_payload,
+            strategic_advisor=strategy_payload,
+            compact_source=compact_source,
+        )
+    except Exception:
+        decision_pack_payload = {}
+
+    try:
+        executive_alerts = _executive_alerts_snapshot_for_reports(check_only=True)
+    except Exception:
+        executive_alerts = {}
+
+    try:
+        pipeline = build_execution_pipeline_status()
+    except Exception:
+        pipeline = {}
+
+    try:
+        exposure = central_exposure_snapshot()
+    except Exception:
+        exposure = {}
+
+    try:
+        memory = memory_snapshot("executive_decision_memory", store=True)
+    except Exception:
+        memory = {}
+
+    try:
+        adaptive = get_adaptive_weights()
+    except Exception:
+        adaptive = {}
+
+    try:
+        return build_executive_decision(
+            decision_pack=decision_pack_payload,
+            strategic_advisor=strategy_payload,
+            ceo_confidence=ceo_payload,
+            executive_alerts=executive_alerts,
+            pipeline=pipeline,
+            exposure=exposure,
+            memory=memory,
+            adaptive=adaptive,
+            monthly_stats=monthly_stats or {},
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": "EXECUTIVE-DECISION-ERROR",
+            "generated_at": data_hora_sp_str(),
+            "mode": "EXECUTIVE_DECISION_ENGINE",
+            "human_decision_required": False,
+            "assistant_decision_required": True,
+            "primary_decision": "INVESTIGAR_EXECUTIVE_DECISION_ENGINE",
+            "primary_directive": {
+                "level": "P0",
+                "category": "SYSTEM",
+                "title": "Executive Decision Engine indisponível",
+                "action": "Verificar import, deploy e logs do executive_decision_engine.py.",
+                "rationale": str(exc),
+            },
+            "policy": {"allow_expansion": False, "allow_new_entries": False},
+            "expansion_blocked": True,
+            "assistant_action": f"Corrigir Executive Decision Engine: {exc}",
+            "ceo_confidence": {"score": 0, "label": "ERRO"},
+            "risk": {},
+            "pipeline": {},
+            "learning": {},
+            "directives": [],
+            "technical_commands": ["/executivedecision", "/decisionpack", "/strategy", "/ceoconfidence"],
+            "errors": [str(exc)],
+        }
+
+
+def _executive_decision_report_block(monthly_stats=None, compact=False):
+    try:
+        payload = _executive_decision_snapshot_for_reports(monthly_stats=monthly_stats, compact_source=compact)
+        return build_executive_decision_text(payload, compact=compact)
+    except Exception as exc:
+        return (
+            "⚖️ EXECUTIVE DECISION ENGINE — CENTRAL QUANT V1\n"
+            f"Data/hora: {data_hora_sp_str()}\n\n"
+            "Status: ERRO\n"
+            f"Erro ao gerar Executive Decision Engine: {exc}\n\n"
+            "Ação prática: verificar executive_decision_engine.py e imports do main.py."
+        )
+
 def _executive_alert_monthly_stats(start_dt, end_dt):
     """
     Consolida a saúde executiva do mês com base no log do Executive Alert Manager.
@@ -7434,6 +7561,9 @@ def build_executive_report_monthly():
         "",
         "==============================\nDECISION PACK\n==============================",
         _decision_pack_report_block(monthly_stats=monthly_stats_for_confidence, compact=True),
+        "",
+        "==============================\nEXECUTIVE DECISION ENGINE\n==============================",
+        _executive_decision_report_block(monthly_stats=monthly_stats_for_confidence, compact=True),
         "",
         "==============================\nPERFORMANCE DO MÊS\n==============================",
         f"Trades encerrados: {perf.get('trades', 0)} | Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('be', 0)}",
@@ -7694,6 +7824,19 @@ def decision_pack_route():
     compact = str(request.args.get("compact", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
     payload = _decision_pack_snapshot_for_reports()
     return {"text": build_decision_pack_text(payload, compact=compact), "payload": payload}
+
+
+@app.route("/executivedecision")
+@app.route("/executive_decision")
+@app.route("/decisionengine")
+@app.route("/decision_engine")
+@app.route("/policy")
+@app.route("/politica")
+@app.route("/política")
+def executive_decision_route():
+    compact = str(request.args.get("compact", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    payload = _executive_decision_snapshot_for_reports()
+    return {"text": build_executive_decision_text(payload, compact=compact), "payload": payload}
 
 
 @app.route("/dashboard")
@@ -16191,6 +16334,13 @@ def _central_command_title(text: str):
         "/decision": "DECISION PACK",
         "/decisao": "DECISION PACK",
         "/decisão": "DECISION PACK",
+        "/executivedecision": "EXECUTIVE DECISION",
+        "/executive_decision": "EXECUTIVE DECISION",
+        "/decisionengine": "EXECUTIVE DECISION",
+        "/decision_engine": "EXECUTIVE DECISION",
+        "/policy": "EXECUTIVE POLICY",
+        "/politica": "EXECUTIVE POLICY",
+        "/política": "EXECUTIVE POLICY",
         "/monthly": "MENSAL",
         "/mensal": "MENSAL",
         "/monthlyreport": "MENSAL",
@@ -16248,7 +16398,7 @@ def _central_command_title(text: str):
 def _is_heavy_central_command(text: str):
     cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
     return cmd in {
-        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança", "/strategicadvisor", "/strategic_advisor", "/strategy", "/estrategia", "/estratégia", "/decisionpack", "/decision_pack", "/decision", "/decisao", "/decisão", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
+        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança", "/strategicadvisor", "/strategic_advisor", "/strategy", "/estrategia", "/estratégia", "/decisionpack", "/decision_pack", "/decision", "/decisao", "/decisão", "/executivedecision", "/executive_decision", "/decisionengine", "/decision_engine", "/policy", "/politica", "/política", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
         "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital", "/portfolioadvisor", "/advisor", "/portfolio",
