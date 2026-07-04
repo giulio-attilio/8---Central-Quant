@@ -101,6 +101,10 @@ from strategic_advisor import (
     build_strategic_advisor,
     build_strategic_advisor_text,
 )
+from decision_pack import (
+    build_decision_pack,
+    build_decision_pack_text,
+)
 
 
 app = Flask(__name__)
@@ -5845,6 +5849,8 @@ def build_executive_report():
         "",
         _strategic_advisor_report_block(compact=True),
         "",
+        _decision_pack_report_block(compact=True),
+        "",
         _executive_alerts_report_block(),
         "",
         f"Risco direcional: {risk_status}",
@@ -5892,6 +5898,7 @@ def daily_snapshot_payload():
         "health_score": central_health_score_payload(),
         "ceo_confidence": _ceo_confidence_snapshot_for_reports(),
         "strategic_advisor": _strategic_advisor_snapshot_for_reports(),
+        "decision_pack": _decision_pack_snapshot_for_reports(),
     }
 
 
@@ -6658,6 +6665,7 @@ def build_executive_dashboard_json():
         "executive_alerts": executive_alerts,
         "ceo_confidence": ceo_confidence,
         "strategic_advisor": strategic_advisor,
+        "decision_pack": _decision_pack_snapshot_for_reports(compact_source=True),
         "real_execution_enabled": bool(ENABLE_REAL_TRADING),
         "execution_mode": EXECUTION_MODE,
         "memory_mb": memory_mb or 0,
@@ -6710,6 +6718,11 @@ def build_ceo_daily_report():
         "STRATEGIC ADVISOR",
         "════════════════════════════",
         _strategic_advisor_report_block(compact=True),
+        "",
+        "════════════════════════════",
+        "DECISION PACK",
+        "════════════════════════════",
+        _decision_pack_report_block(compact=True),
         "",
         "════════════════════════════",
         "EXECUTIVE ALERT MANAGER",
@@ -7320,6 +7333,9 @@ def build_executive_report_monthly():
         "==============================\nSTRATEGIC ADVISOR\n==============================",
         _strategic_advisor_report_block(monthly_stats=monthly_stats_for_confidence, compact=False),
         "",
+        "==============================\nDECISION PACK\n==============================",
+        _decision_pack_report_block(monthly_stats=monthly_stats_for_confidence, compact=True),
+        "",
         "==============================\nPERFORMANCE DO MÊS\n==============================",
         f"Trades encerrados: {perf.get('trades', 0)} | Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('be', 0)}",
         f"Win rate: {perf.get('win_rate_pct', 0)}% | PnL total: {perf.get('pnl_total_pct', 0)}% | PnL médio: {perf.get('pnl_avg_pct', 0)}%",
@@ -7568,6 +7584,17 @@ def strategic_advisor_route():
     compact = str(request.args.get("compact", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
     payload = _strategic_advisor_snapshot_for_reports()
     return {"text": build_strategic_advisor_text(payload, compact=compact), "payload": payload}
+
+
+@app.route("/decisionpack")
+@app.route("/decision_pack")
+@app.route("/decision")
+@app.route("/decisao")
+@app.route("/decisão")
+def decision_pack_route():
+    compact = str(request.args.get("compact", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    payload = _decision_pack_snapshot_for_reports()
+    return {"text": build_decision_pack_text(payload, compact=compact), "payload": payload}
 
 
 @app.route("/dashboard")
@@ -15769,6 +15796,8 @@ def build_central_command_reply(text: str):
         return _ceo_confidence_report_block()
     if cmd0 in {"/strategicadvisor", "/strategic_advisor", "/strategy", "/estrategia", "/estratégia"}:
         return _strategic_advisor_report_block(compact=False)
+    if cmd0 in {"/decisionpack", "/decision_pack", "/decision", "/decisao", "/decisão"}:
+        return _decision_pack_report_block(compact=False)
     if cmd0 in {"/monthly", "/mensal", "/monthlyreport", "/monthly_report"}:
         return build_executive_report_monthly()
     if cmd0 in {"/support"}:
@@ -16058,6 +16087,11 @@ def _central_command_title(text: str):
         "/strategy": "STRATEGIC ADVISOR",
         "/estrategia": "STRATEGIC ADVISOR",
         "/estratégia": "STRATEGIC ADVISOR",
+        "/decisionpack": "DECISION PACK",
+        "/decision_pack": "DECISION PACK",
+        "/decision": "DECISION PACK",
+        "/decisao": "DECISION PACK",
+        "/decisão": "DECISION PACK",
         "/monthly": "MENSAL",
         "/mensal": "MENSAL",
         "/monthlyreport": "MENSAL",
@@ -16115,7 +16149,7 @@ def _central_command_title(text: str):
 def _is_heavy_central_command(text: str):
     cmd = (text or "").strip().lower().split()[0].split("@")[0] if text else ""
     return cmd in {
-        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança", "/strategicadvisor", "/strategic_advisor", "/strategy", "/estrategia", "/estratégia", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
+        "/dashboard", "/daily", "/diario", "/diário", "/executivereport", "/executive_report", "/dailyexecutive", "/daily_executive", "/ceoconfidence", "/ceo_confidence", "/confidence", "/confianca", "/confiança", "/strategicadvisor", "/strategic_advisor", "/strategy", "/estrategia", "/estratégia", "/decisionpack", "/decision_pack", "/decision", "/decisao", "/decisão", "/monthly", "/mensal", "/monthlyreport", "/monthly_report", "/support",
         "/audit", "/auditoria", "/relatoriocompleto", "/relatorio_completo",
         "/full", "/trend", "/donkey", "/cobra", "/meme", "/predator", "/turtle", "/falcon",
         "/quantos", "/journal", "/trade", "/globalstats", "/signalai", "/capital", "/portfolioadvisor", "/advisor", "/portfolio",
