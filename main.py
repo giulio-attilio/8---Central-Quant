@@ -769,7 +769,7 @@ def get_open_positions_from_module(module, key=None):
             raw = module.get_positions()
         else:
             raw = {}
-def build_command_reply_for_module(key: str, module, cmd: str):
+
         if isinstance(raw, dict):
             iterable = raw.values()
         elif isinstance(raw, list):
