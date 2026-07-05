@@ -1,26 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Memory Profiler V1.1 — Central Quant
-Versão: 2026-07-05-MEMORY-PROFILER-V1.1
+Memory Profiler V1.2 — Central Quant
+Versão: 2026-07-05-MEMORY-PROFILER-V1.2
 
-Correção V1.1:
-- /memory agora é LEVE por padrão.
-- Não usa gc.get_objects() no relatório normal.
-- Não conta objetos vivos no snapshot automático.
-- /memorydeep é o diagnóstico pesado, usado apenas sob demanda.
-- Evita que o próprio diagnóstico gere salto relevante de RSS.
-- Mantém compatibilidade com o main.py já integrado na V1.
+Correção V1.2:
+- /memory Telegram: texto leve, 1 snapshot.
+- /memory HTTP/JSON: JSON leve, 1 snapshot.
+- build_memory_json() NÃO chama build_memory_report().
+- legacy_memory removido do JSON padrão.
+- /memorylegacy deve ficar separado no main.py, se quiser comparar.
+- /memorydeep continua disponível apenas sob demanda.
 
 Arquivo:
     memory_profiler_v1.py
-
-Uso no main.py:
-    import memory_profiler_v1 as memory_profiler
-    memory_profiler.start_memory_profiler(interval_seconds=300)
-
-Comandos:
-    /memory      -> leve
-    /memorydeep  -> completo/pesado
 """
 
 import os
@@ -29,10 +21,10 @@ import json
 import time
 import threading
 import traceback
-from collections import Counter
 from datetime import datetime
+from collections import Counter
 
-VERSION = "2026-07-05-MEMORY-PROFILER-V1.1"
+VERSION = "2026-07-05-MEMORY-PROFILER-V1.2"
 
 DATA_DIR = os.environ.get("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
 SNAPSHOT_FILE = os.path.join(DATA_DIR, "memory_profiler_snapshots.jsonl")
@@ -41,18 +33,10 @@ ERROR_FILE = os.path.join(DATA_DIR, "memory_profiler_error.log")
 
 DEFAULT_LIMIT_MB = float(os.environ.get("RENDER_MEMORY_LIMIT_MB", os.environ.get("MEMORY_LIMIT_MB", "512")))
 DEFAULT_INTERVAL_SECONDS = int(os.environ.get("MEMORY_PROFILER_INTERVAL_SECONDS", "300"))
-
-# Proteção: /memory não deve ser pesado.
-LIGHT_MODE_DEFAULT = os.environ.get("MEMORY_PROFILER_LIGHT_MODE", "1").strip().lower() in {"1", "true", "yes", "sim", "on"}
-
-# Só roda GC automático acima desse RSS.
 GC_THRESHOLD_MB = float(os.environ.get("MEMORY_PROFILER_GC_THRESHOLD_MB", os.environ.get("MEMORY_GC_THRESHOLD_MB", "380")))
 
-# Tracemalloc continua opcional. Usar só em /memorydeep ou se habilitado via env.
 TRACEMALLOC_ENABLED = os.environ.get("MEMORY_PROFILER_TRACEMALLOC", "0").strip().lower() in {"1", "true", "yes", "sim", "on"}
 TRACEMALLOC_TOP_N = int(os.environ.get("MEMORY_PROFILER_TRACEMALLOC_TOP_N", "8"))
-
-# Evita arquivo infinito.
 SNAPSHOT_MAX_BYTES = int(os.environ.get("MEMORY_PROFILER_SNAPSHOT_MAX_BYTES", str(2 * 1024 * 1024)))
 
 _snapshot_lock = threading.Lock()
@@ -84,10 +68,6 @@ def _safe_round(value, digits=2):
 
 
 def _maybe_trim_snapshot_file():
-    """
-    Mantém o JSONL pequeno. Se passar do limite, preserva apenas o final.
-    Isso evita crescimento de disco e leituras longas.
-    """
     try:
         if not os.path.exists(SNAPSHOT_FILE):
             return
@@ -100,7 +80,6 @@ def _maybe_trim_snapshot_file():
             f.seek(max(0, size - keep_bytes))
             data = f.read()
 
-        # Garante começar em linha inteira.
         if b"\n" in data:
             data = data.split(b"\n", 1)[1]
 
@@ -112,11 +91,8 @@ def _maybe_trim_snapshot_file():
 
 def _get_process_memory():
     """
-    Retorna memória atual do processo.
-    Preferência:
-    1) /proc/self/status no Render/Linux para RSS real.
-    2) psutil, se disponível.
-    3) resource como fallback.
+    RSS real do processo.
+    Preferência: /proc/self/status no Render/Linux.
     """
     pid = os.getpid()
 
@@ -129,6 +105,7 @@ def _get_process_memory():
                     rss_mb = float(line.split()[1]) / 1024.0
                 elif line.startswith("VmSize:"):
                     vms_mb = float(line.split()[1]) / 1024.0
+
             if rss_mb is not None:
                 return {
                     "ok": True,
@@ -152,16 +129,6 @@ def _get_process_memory():
         rss_mb = info.rss / 1024 / 1024
         vms_mb = getattr(info, "vms", 0) / 1024 / 1024
 
-        try:
-            mem_percent_system = process.memory_percent()
-        except Exception:
-            mem_percent_system = None
-
-        try:
-            num_threads = process.num_threads()
-        except Exception:
-            num_threads = threading.active_count()
-
         return {
             "ok": True,
             "source": "psutil",
@@ -170,13 +137,12 @@ def _get_process_memory():
             "vms_mb": _safe_round(vms_mb),
             "usage_pct_render_limit": _safe_round((rss_mb / DEFAULT_LIMIT_MB) * 100),
             "memory_limit_mb": DEFAULT_LIMIT_MB,
-            "memory_percent_system": _safe_round(mem_percent_system) if mem_percent_system is not None else None,
-            "threads": num_threads,
+            "memory_percent_system": None,
+            "threads": process.num_threads() if hasattr(process, "num_threads") else threading.active_count(),
         }
     except Exception as e:
         try:
             import resource
-
             usage = resource.getrusage(resource.RUSAGE_SELF)
             rss_mb = usage.ru_maxrss / 1024
             return {
@@ -205,38 +171,22 @@ def _get_process_memory():
 
 
 def _light_gc_summary():
-    """
-    Resumo leve. Não chama gc.get_objects().
-    """
-    try:
-        return {
-            "ok": True,
-            "mode": "light",
-            "gc_counts": list(gc.get_count()),
-            "total_objects": None,
-            "top_types": [],
-            "note": "Resumo leve: gc.get_objects() não foi executado.",
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "mode": "light",
-            "error": str(e),
-            "gc_counts": [],
-            "total_objects": None,
-            "top_types": [],
-        }
+    return {
+        "ok": True,
+        "mode": "light",
+        "gc_counts": list(gc.get_count()),
+        "total_objects": None,
+        "top_types": [],
+        "note": "Resumo leve: gc.get_objects() não foi executado.",
+    }
 
 
 def _deep_gc_summary():
-    """
-    Diagnóstico pesado. Usar só em /memorydeep.
-    """
     try:
         objects = gc.get_objects()
         total = len(objects)
-
         counter = Counter()
+
         for obj in objects:
             try:
                 counter[type(obj).__name__] += 1
@@ -244,8 +194,6 @@ def _deep_gc_summary():
                 counter["unknown"] += 1
 
         top_types = [{"type": k, "count": v} for k, v in counter.most_common(15)]
-
-        # Remove referência local grande o quanto antes.
         del objects
 
         return {
@@ -262,14 +210,11 @@ def _deep_gc_summary():
             "error": str(e),
             "total_objects": None,
             "top_types": [],
-            "gc_counts": list(gc.get_count()) if hasattr(gc, "get_count") else [],
+            "gc_counts": list(gc.get_count()),
         }
 
 
 def _get_tracemalloc_summary(force=False):
-    """
-    Snapshot opcional. Só roda se force=True ou MEMORY_PROFILER_TRACEMALLOC=1.
-    """
     if not (force or TRACEMALLOC_ENABLED):
         return {
             "enabled": False,
@@ -315,9 +260,6 @@ def _get_tracemalloc_summary(force=False):
 
 
 def _read_last_snapshots(limit=8):
-    """
-    Lê apenas as últimas linhas do JSONL.
-    """
     if not os.path.exists(SNAPSHOT_FILE):
         return []
 
@@ -337,13 +279,13 @@ def _read_last_snapshots(limit=8):
 
             lines = data.splitlines()[-limit:]
 
-        snapshots = []
+        out = []
         for line in lines:
             try:
-                snapshots.append(json.loads(line.decode("utf-8")))
+                out.append(json.loads(line.decode("utf-8")))
             except Exception:
                 pass
-        return snapshots
+        return out
     except Exception:
         return []
 
@@ -370,12 +312,9 @@ def _save_state(snapshot):
 
 
 def _run_gc_if_needed(mem, force=False):
-    """
-    GC controlado.
-    V1.1 não roda GC em toda consulta.
-    """
     rss = (mem or {}).get("rss_mb")
     should_gc = bool(force)
+
     try:
         if rss is not None and float(rss) >= GC_THRESHOLD_MB:
             should_gc = True
@@ -397,6 +336,7 @@ def _run_gc_if_needed(mem, force=False):
             libc.malloc_trim(0)
         except Exception:
             pass
+
         return {
             "executed": True,
             "collected": collected,
@@ -410,12 +350,10 @@ def _run_gc_if_needed(mem, force=False):
         }
 
 
-def collect_memory_snapshot(reason="manual", include_gc=False, include_tracemalloc=False, deep=False, force_gc=False):
+def collect_memory_snapshot(reason="manual", include_gc=False, include_tracemalloc=False, deep=False, force_gc=False, persist=True):
     """
-    Coleta snapshot.
-    Padrão V1.1:
-    - include_gc=False para snapshot automático.
-    - deep=False para não chamar gc.get_objects().
+    Uma chamada = um snapshot.
+    V1.2 não chama relatório dentro do JSON e não chama JSON dentro do relatório.
     """
     global _last_snapshot
 
@@ -460,42 +398,223 @@ def collect_memory_snapshot(reason="manual", include_gc=False, include_tracemall
         except Exception:
             snapshot["delta_rss_mb"] = None
 
-        try:
-            _append_snapshot(snapshot)
-            _save_state(snapshot)
-        except Exception as e:
-            snapshot["persist_error"] = str(e)
+        if persist:
+            try:
+                _append_snapshot(snapshot)
+                _save_state(snapshot)
+            except Exception as e:
+                snapshot["persist_error"] = str(e)
 
-        _last_snapshot = snapshot
+            _last_snapshot = snapshot
+
         return snapshot
 
 
-def _memory_loop(interval_seconds):
-    global _profiler_stop
+def _status_from_pct(pct):
+    status = "OK"
+    emoji = "✅"
+    severity = "NORMAL"
 
     try:
-        collect_memory_snapshot(reason="profiler_start", include_gc=False, include_tracemalloc=False, deep=False)
+        pct_f = float(pct)
+        if pct_f >= 92:
+            return "CRÍTICO", "🔴", "CRITICAL"
+        if pct_f >= 85:
+            return "ALTO", "🟠", "HIGH"
+        if pct_f >= 75:
+            return "ATENÇÃO", "🟡", "MEDIUM"
     except Exception:
         pass
 
-    while not _profiler_stop:
-        try:
-            time.sleep(max(30, int(interval_seconds)))
-            collect_memory_snapshot(reason="scheduled", include_gc=False, include_tracemalloc=False, deep=False)
-        except Exception:
-            try:
-                _ensure_data_dir()
-                with open(ERROR_FILE, "a", encoding="utf-8") as f:
-                    f.write(_now() + " | " + traceback.format_exc() + "\n")
-            except Exception:
-                pass
+    return status, emoji, severity
+
+
+def _format_memory_report_from_snapshot(snapshot, recent=None):
+    mem = snapshot.get("memory") or {}
+    gc_info = snapshot.get("gc") or {}
+    gc_action = snapshot.get("gc_action") or {}
+    trace = snapshot.get("tracemalloc") or {}
+    deep = snapshot.get("mode") == "deep"
+
+    rss = mem.get("rss_mb")
+    pct = mem.get("usage_pct_render_limit")
+    limit = mem.get("memory_limit_mb")
+    threads = mem.get("threads")
+    delta = snapshot.get("delta_rss_mb")
+
+    status, emoji, _severity = _status_from_pct(pct)
+
+    title = "🧠 MEMORY PROFILER DEEP — CENTRAL QUANT V1.2" if deep else "🧠 MEMORY PROFILER — CENTRAL QUANT V1.2"
+
+    lines = [
+        title,
+        f"Data/hora: {snapshot.get('generated_at')}",
+        "",
+        f"Status: {emoji} {status}",
+        f"RSS atual: {rss} MB",
+        f"Uso Render: {pct}% de {limit} MB",
+        f"Delta último snapshot: {delta} MB",
+        f"Threads: {threads}",
+        f"Fonte: {mem.get('source')}",
+        f"Modo: {'DEEP/PESADO' if deep else 'LIGHT/LEVE'}",
+        "",
+        "GC:",
+        f"- Counts: {gc_info.get('gc_counts')}",
+        f"- GC automático executado: {gc_action.get('executed')}",
+        f"- Objetos coletados: {gc_action.get('collected')}",
+        f"- Threshold GC: {gc_action.get('threshold_mb')} MB",
+    ]
+
+    if deep:
+        lines += [
+            "",
+            "Objetos Python:",
+            f"- Total: {gc_info.get('total_objects')}",
+        ]
+        top_types = gc_info.get("top_types") or []
+        if top_types:
+            lines.append("")
+            lines.append("Top tipos vivos:")
+            for item in top_types[:12]:
+                lines.append(f"- {item.get('type')}: {item.get('count')}")
+    else:
+        lines += [
+            "",
+            "Objetos Python:",
+            "- Não contados no /memory para evitar overhead.",
+            "- Use /memorydeep apenas quando precisar de diagnóstico pesado.",
+        ]
+
+    if recent:
+        lines.append("")
+        lines.append("Últimos snapshots:")
+        for item in recent[-6:]:
+            m = item.get("memory") or {}
+            lines.append(
+                f"- {item.get('generated_at')} | "
+                f"{m.get('rss_mb')} MB | "
+                f"{m.get('usage_pct_render_limit')}% | "
+                f"{item.get('mode', 'light')}"
+            )
+
+    if trace.get("enabled"):
+        lines += [
+            "",
+            "Tracemalloc:",
+            f"- Atual: {trace.get('current_mb')} MB",
+            f"- Pico: {trace.get('peak_mb')} MB",
+        ]
+        for item in (trace.get("top") or [])[:TRACEMALLOC_TOP_N]:
+            file_name = item.get("file", "")
+            if len(file_name) > 58:
+                file_name = "..." + file_name[-55:]
+            lines.append(f"- {item.get('size_mb')} MB | {item.get('count')} | {file_name}")
+    else:
+        lines += [
+            "",
+            "Tracemalloc: desligado no modo leve.",
+        ]
+
+    lines.append("")
+    lines.append("Leitura:")
+    try:
+        pct_f = float(pct)
+        if pct_f >= 92:
+            lines.append("Memória em zona crítica. Alto risco de restart no Render.")
+        elif pct_f >= 85:
+            lines.append("Memória alta. Monitorar crescimento e evitar novos módulos pesados.")
+        elif pct_f >= 75:
+            lines.append("Memória em atenção. Central operável, mas sem folga grande.")
+        else:
+            lines.append("Memória controlada neste momento.")
+    except Exception:
+        lines.append("Não foi possível classificar a memória.")
+
+    return "\n".join(lines)
+
+
+def build_memory_report(include_tracemalloc=False, deep=False):
+    """
+    Telegram/texto.
+    V1.2: exatamente 1 snapshot.
+    """
+    if include_tracemalloc and not deep:
+        deep = True
+
+    snapshot = collect_memory_snapshot(
+        reason="command_deep" if deep else "command",
+        include_gc=True,
+        include_tracemalloc=include_tracemalloc,
+        deep=deep,
+        force_gc=False,
+        persist=True,
+    )
+    recent = _read_last_snapshots(limit=6)
+    return _format_memory_report_from_snapshot(snapshot, recent=recent)
+
+
+def build_memory_json(deep=False, include_text=False):
+    """
+    HTTP/JSON.
+    V1.2: exatamente 1 snapshot.
+    Por padrão NÃO inclui text para evitar gerar relatório duplicado.
+    """
+    snapshot = collect_memory_snapshot(
+        reason="json_deep" if deep else "json",
+        include_gc=True,
+        include_tracemalloc=deep,
+        deep=deep,
+        force_gc=False,
+        persist=True,
+    )
+
+    if include_text:
+        recent = _read_last_snapshots(limit=6)
+        snapshot["text"] = _format_memory_report_from_snapshot(snapshot, recent=recent)
+
+    return snapshot
+
+
+def get_memory_health():
+    snapshot = collect_memory_snapshot(
+        reason="health",
+        include_gc=False,
+        include_tracemalloc=False,
+        deep=False,
+        force_gc=False,
+        persist=True,
+    )
+    mem = snapshot.get("memory") or {}
+    status, _emoji, severity = _status_from_pct(mem.get("usage_pct_render_limit"))
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "status": status,
+        "severity": severity,
+        "rss_mb": mem.get("rss_mb"),
+        "usage_pct_render_limit": mem.get("usage_pct_render_limit"),
+        "memory_limit_mb": mem.get("memory_limit_mb"),
+        "threads": mem.get("threads"),
+        "delta_rss_mb": snapshot.get("delta_rss_mb"),
+        "generated_at": snapshot.get("generated_at"),
+    }
+
+
+def memory_profiler_health_text():
+    health = get_memory_health()
+    return (
+        "🧠 MEMORY PROFILER\n"
+        f"Status: {health.get('status')}\n"
+        f"RSS: {health.get('rss_mb')} MB\n"
+        f"Uso Render: {health.get('usage_pct_render_limit')}%\n"
+        f"Delta: {health.get('delta_rss_mb')} MB\n"
+        f"Threads: {health.get('threads')}\n"
+        f"Versão: {VERSION}"
+    )
 
 
 def start_memory_profiler(interval_seconds=DEFAULT_INTERVAL_SECONDS):
-    """
-    Inicia thread daemon.
-    Seguro para chamar mais de uma vez.
-    """
     global _profiler_thread, _profiler_stop
 
     if _profiler_thread and _profiler_thread.is_alive():
@@ -531,205 +650,37 @@ def stop_memory_profiler():
     return {"ok": True, "stopping": True, "version": VERSION}
 
 
-def get_memory_health():
-    """
-    Health leve para dashboard/health.
-    """
-    snapshot = collect_memory_snapshot(reason="health", include_gc=False, include_tracemalloc=False, deep=False)
-    mem = snapshot.get("memory") or {}
-    pct = mem.get("usage_pct_render_limit")
-
-    status = "OK"
-    severity = "NORMAL"
+def _memory_loop(interval_seconds):
+    global _profiler_stop
 
     try:
-        pct_f = float(pct)
-        if pct_f >= 92:
-            status = "CRITICAL"
-            severity = "CRITICAL"
-        elif pct_f >= 85:
-            status = "WARNING"
-            severity = "HIGH"
-        elif pct_f >= 75:
-            status = "ATTENTION"
-            severity = "MEDIUM"
+        collect_memory_snapshot(
+            reason="profiler_start",
+            include_gc=False,
+            include_tracemalloc=False,
+            deep=False,
+            persist=True,
+        )
     except Exception:
         pass
 
-    return {
-        "ok": True,
-        "version": VERSION,
-        "status": status,
-        "severity": severity,
-        "rss_mb": mem.get("rss_mb"),
-        "usage_pct_render_limit": pct,
-        "memory_limit_mb": mem.get("memory_limit_mb"),
-        "threads": mem.get("threads"),
-        "delta_rss_mb": snapshot.get("delta_rss_mb"),
-        "generated_at": snapshot.get("generated_at"),
-    }
-
-
-def build_memory_report(include_tracemalloc=False, deep=False):
-    """
-    Texto pronto para Telegram.
-
-    Compatibilidade:
-    - main.py V1 chama build_memory_report(include_tracemalloc=False)
-      => em V1.1 isso fica leve automaticamente.
-    - /memorydeep deve chamar build_memory_report(include_tracemalloc=True, deep=True)
-      mas, se o main antigo só passar include_tracemalloc=True, V1.1 já considera deep=True.
-    """
-    # Compatibilidade automática: include_tracemalloc=True indica comando profundo.
-    if include_tracemalloc and not deep:
-        deep = True
-
-    snapshot = collect_memory_snapshot(
-        reason="command_deep" if deep else "command",
-        include_gc=True,
-        include_tracemalloc=include_tracemalloc,
-        deep=deep,
-        force_gc=False,
-    )
-
-    mem = snapshot.get("memory") or {}
-    gc_info = snapshot.get("gc") or {}
-    gc_action = snapshot.get("gc_action") or {}
-    trace = snapshot.get("tracemalloc") or {}
-    recent = _read_last_snapshots(limit=6)
-
-    rss = mem.get("rss_mb")
-    pct = mem.get("usage_pct_render_limit")
-    limit = mem.get("memory_limit_mb")
-    threads = mem.get("threads")
-    delta = snapshot.get("delta_rss_mb")
-
-    status = "OK"
-    emoji = "✅"
-    try:
-        pct_f = float(pct)
-        if pct_f >= 92:
-            status = "CRÍTICO"
-            emoji = "🔴"
-        elif pct_f >= 85:
-            status = "ALTO"
-            emoji = "🟠"
-        elif pct_f >= 75:
-            status = "ATENÇÃO"
-            emoji = "🟡"
-    except Exception:
-        pass
-
-    title = "🧠 MEMORY PROFILER DEEP — CENTRAL QUANT V1.1" if deep else "🧠 MEMORY PROFILER — CENTRAL QUANT V1.1"
-
-    lines = []
-    lines.append(title)
-    lines.append(f"Data/hora: {snapshot.get('generated_at')}")
-    lines.append("")
-    lines.append(f"Status: {emoji} {status}")
-    lines.append(f"RSS atual: {rss} MB")
-    lines.append(f"Uso Render: {pct}% de {limit} MB")
-    lines.append(f"Delta último snapshot: {delta} MB")
-    lines.append(f"Threads: {threads}")
-    lines.append(f"Fonte: {mem.get('source')}")
-    lines.append(f"Modo: {'DEEP/PESADO' if deep else 'LIGHT/LEVE'}")
-    lines.append("")
-    lines.append("GC:")
-    lines.append(f"- Counts: {gc_info.get('gc_counts')}")
-    lines.append(f"- GC automático executado: {gc_action.get('executed')}")
-    lines.append(f"- Objetos coletados: {gc_action.get('collected')}")
-    lines.append(f"- Threshold GC: {gc_action.get('threshold_mb')} MB")
-
-    if deep:
-        lines.append("")
-        lines.append("Objetos Python:")
-        lines.append(f"- Total: {gc_info.get('total_objects')}")
-        top_types = gc_info.get("top_types") or []
-        if top_types:
-            lines.append("")
-            lines.append("Top tipos vivos:")
-            for item in top_types[:12]:
-                lines.append(f"- {item.get('type')}: {item.get('count')}")
-    else:
-        lines.append("")
-        lines.append("Objetos Python:")
-        lines.append("- Não contados no /memory para evitar overhead.")
-        lines.append("- Use /memorydeep apenas quando precisar de diagnóstico pesado.")
-
-    if recent:
-        lines.append("")
-        lines.append("Últimos snapshots:")
-        for item in recent[-6:]:
-            m = item.get("memory") or {}
-            lines.append(
-                f"- {item.get('generated_at')} | "
-                f"{m.get('rss_mb')} MB | "
-                f"{m.get('usage_pct_render_limit')}% | "
-                f"{item.get('mode', 'light')}"
+    while not _profiler_stop:
+        try:
+            time.sleep(max(30, int(interval_seconds)))
+            collect_memory_snapshot(
+                reason="scheduled",
+                include_gc=False,
+                include_tracemalloc=False,
+                deep=False,
+                persist=True,
             )
-
-    if trace.get("enabled"):
-        lines.append("")
-        lines.append("Tracemalloc:")
-        lines.append(f"- Atual: {trace.get('current_mb')} MB")
-        lines.append(f"- Pico: {trace.get('peak_mb')} MB")
-        for item in (trace.get("top") or [])[:TRACEMALLOC_TOP_N]:
-            file_name = item.get("file", "")
-            if len(file_name) > 58:
-                file_name = "..." + file_name[-55:]
-            lines.append(f"- {item.get('size_mb')} MB | {item.get('count')} | {file_name}")
-    else:
-        lines.append("")
-        lines.append("Tracemalloc: desligado no modo leve.")
-
-    lines.append("")
-    lines.append("Leitura:")
-    try:
-        pct_f = float(pct)
-        if pct_f >= 92:
-            lines.append("Memória em zona crítica. Alto risco de restart no Render.")
-        elif pct_f >= 85:
-            lines.append("Memória alta. Monitorar crescimento e evitar novos módulos pesados.")
-        elif pct_f >= 75:
-            lines.append("Memória em atenção. Central operável, mas sem folga grande.")
-        else:
-            lines.append("Memória controlada neste momento.")
-    except Exception:
-        lines.append("Não foi possível classificar a memória.")
-
-    return "\n".join(lines)
-
-
-def build_memory_json(deep=False):
-    """
-    Endpoint HTTP.
-    V1.1: por padrão leve.
-    """
-    snapshot = collect_memory_snapshot(
-        reason="json_deep" if deep else "json",
-        include_gc=True,
-        include_tracemalloc=deep,
-        deep=deep,
-        force_gc=False,
-    )
-    try:
-        snapshot["text"] = build_memory_report(include_tracemalloc=deep, deep=deep)
-    except Exception as e:
-        snapshot["text_error"] = str(e)
-    return snapshot
-
-
-def memory_profiler_health_text():
-    health = get_memory_health()
-    return (
-        "🧠 MEMORY PROFILER\n"
-        f"Status: {health.get('status')}\n"
-        f"RSS: {health.get('rss_mb')} MB\n"
-        f"Uso Render: {health.get('usage_pct_render_limit')}%\n"
-        f"Delta: {health.get('delta_rss_mb')} MB\n"
-        f"Threads: {health.get('threads')}\n"
-        f"Versão: {VERSION}"
-    )
+        except Exception:
+            try:
+                _ensure_data_dir()
+                with open(ERROR_FILE, "a", encoding="utf-8") as f:
+                    f.write(_now() + " | " + traceback.format_exc() + "\n")
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
