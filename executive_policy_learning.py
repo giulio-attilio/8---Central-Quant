@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Executive Policy Learning V2.0.3 — Central Quant
+Executive Policy Learning V2.1.1 — Central Quant
 Versão: 2026-07-05-EXECUTIVE-POLICY-LEARNING-V1
 
 Objetivo:
@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.0.3"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.1.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR", str(BASE_DIR / "data")))
@@ -38,7 +38,7 @@ LOG_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_LOG_FILE", str(DATA_DI
 MAX_EVENTS_PER_RUN = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MAX_EVENTS_PER_RUN", "500"))
 MIN_SAMPLE_FOR_CONFIDENCE = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MIN_SAMPLE", "10"))
 
-# V2.0.3 — correlação entre Policy Timeline e Decision Log.
+# V2.1.1 — correlação entre Policy Timeline e Decision Log.
 DECISION_LOG_FILE = Path(os.environ.get("CENTRAL_DECISION_LOG_FILE", str(DATA_DIR / "decision_log.jsonl")))
 V2_STATE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_V2_STATE_FILE", str(DATA_DIR / "executive_policy_learning_v2_state.json")))
 V2_EFFECT_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_EFFECT_FILE", str(DATA_DIR / "executive_policy_learning_effect.json")))
@@ -502,7 +502,7 @@ def build_executive_policy_learning_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V2.0.3",
+        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V2.1.1",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -782,7 +782,7 @@ def build_executive_policy_learning_seed_report(result=None):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.0.3
+# EXECUTIVE POLICY LEARNING V2.1.1
 # Correlação Timeline + Decision Log
 # ==========================================================
 
@@ -910,7 +910,7 @@ def _read_new_jsonl(path, offset, max_items):
 def _read_all_policy_events_light(limit=5000):
     """
     Lê eventos da timeline de forma limitada para correlacionar com decisões.
-    Não é usado em loop pesado; V2.0.3 trabalha com limite.
+    Não é usado em loop pesado; V2.1.1 trabalha com limite.
     """
     if not TIMELINE_FILE.exists():
         return []
@@ -958,7 +958,7 @@ def _read_all_policy_events_light(limit=5000):
 
 def _active_policy_codes_for_decision(decision_dt, policy_events, window_minutes=POLICY_DECISION_WINDOW_MINUTES):
     """
-    V2.0.3: associação simples.
+    V2.1.1: associação simples.
     Uma decisão é associada a policies cujos eventos ocorreram até a decisão
     dentro da janela configurada. Events de release/expire fecham a policy.
     """
@@ -1186,7 +1186,7 @@ def _recompute_effect_summary(effect):
 
 def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=None):
     """
-    V2.0.3:
+    V2.1.1:
     Lê decisões novas do decision_log e associa às policies ativas recentes da timeline.
     Não calcula PnL ainda.
     """
@@ -1326,7 +1326,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING V2.0.3 — POLICY EFFECT",
+        "🧠 EXECUTIVE POLICY LEARNING V2.1.1 — POLICY EFFECT",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1348,7 +1348,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
             "Ainda não há correlação policy↔decision suficiente.",
             "",
             "Leitura:",
-            "A V2.0.3 precisa de eventos no Timeline e decisões no Decision Log dentro da janela configurada.",
+            "A V2.1.1 precisa de eventos no Timeline e decisões no Decision Log dentro da janela configurada.",
         ]
         return "\n".join(lines)
 
@@ -1368,7 +1368,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
 
     lines += [
         "Observação:",
-        "V2.0.3 correlaciona Timeline + Decision Log.",
+        "V2.1.1 correlaciona Timeline + Decision Log.",
         "V2.1 deve cruzar com Lifecycle/Outcome para PnL, Profit Factor e Drawdown.",
     ]
     return "\n".join(lines)
@@ -1422,7 +1422,7 @@ def build_executive_policy_effect_rebuild_report(result=None):
         result = rebuild_executive_policy_effect(commit=True)
 
     lines = [
-        "♻️ EXECUTIVE POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.3",
+        "♻️ EXECUTIVE POLICY EFFECT REBUILD — CENTRAL QUANT V2.1.1",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1469,7 +1469,7 @@ def build_policy_compare_report(limit=10):
     )
 
     lines = [
-        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.3",
+        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.1.1",
         f"Data/hora: {_now()}",
         "",
     ]
@@ -1496,7 +1496,7 @@ def build_policy_insights_report():
     values = [p for p in policies.values() if isinstance(p, dict)]
 
     lines = [
-        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.3",
+        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.1.1",
         f"Data/hora: {_now()}",
         "",
     ]
@@ -1538,7 +1538,7 @@ def build_policy_insights_report():
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.0.3 — REBUILD SAFE PATCH
+# EXECUTIVE POLICY LEARNING V2.1.1 — REBUILD SAFE PATCH
 # ==========================================================
 
 def rebuild_executive_policy_effect(commit=True, max_decisions=None):
@@ -1602,7 +1602,7 @@ def build_policy_effect_rebuild_report(result=None):
         result = rebuild_executive_policy_effect(commit=True)
 
     lines = [
-        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.3",
+        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.1.1",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1641,7 +1641,7 @@ def build_policy_effect_rebuild_report(result=None):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.0.3 — DECISION SEED
+# EXECUTIVE POLICY LEARNING V2.1.1 — DECISION SEED
 # ==========================================================
 
 def seed_policy_effect_decision(commit=True):
@@ -1721,7 +1721,7 @@ def build_policy_effect_seed_report(result=None):
         result = seed_policy_effect_decision(commit=True)
 
     lines = [
-        "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.0.3",
+        "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.1.1",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1746,6 +1746,621 @@ def build_policy_effect_seed_report(result=None):
         "/policyeffectrebuild",
     ]
 
+    return "\n".join(lines)
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.1.1 — READYNESS SAFE PATCH
+# ==========================================================
+# Esta seção sobrescreve funções da V2 sem quebrar imports/rotas existentes.
+# Objetivo:
+# - manter /policylearning, /policyeffect, /policycompare e /policyinsights;
+# - ignorar seeds técnicos em métricas reais;
+# - adicionar readiness_label / ready_to_learn por policy;
+# - continuar 100% observacional, sem execução real e sem alterar policies.
+
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.1.1"
+MIN_REAL_DECISIONS_FOR_LEARNING = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MIN_REAL_DECISIONS", "10"))
+MIN_READY_DECISIONS_FOR_POLICY = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MIN_READY_DECISIONS", "20"))
+
+
+def _is_test_seed_event(item):
+    if not isinstance(item, dict):
+        return False
+
+    candidates = [
+        item.get("test_seed"),
+        item.get("is_seed"),
+        item.get("seed"),
+    ]
+
+    payload = item.get("payload")
+    if isinstance(payload, dict):
+        candidates.extend([
+            payload.get("test_seed"),
+            payload.get("is_seed"),
+            payload.get("seed"),
+        ])
+
+    meta = item.get("meta")
+    if isinstance(meta, dict):
+        candidates.extend([
+            meta.get("test_seed"),
+            meta.get("is_seed"),
+            meta.get("seed"),
+        ])
+
+    return any(v is True or str(v).strip().lower() == "true" for v in candidates)
+
+
+def _extract_decision_outcome(decision):
+    if not isinstance(decision, dict):
+        return None
+
+    payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
+    trade = decision.get("trade") if isinstance(decision.get("trade"), dict) else {}
+
+    for source in [decision, trade, payload]:
+        if not isinstance(source, dict):
+            continue
+        for key in ["outcome", "result_outcome", "trade_outcome", "closed_result", "pnl_result", "lifecycle_outcome"]:
+            value = source.get(key)
+            if value not in (None, ""):
+                return str(value).strip().upper()
+    return None
+
+
+def _read_all_policy_events_light(limit=5000):
+    """
+    V2.1.1: lê eventos reais da timeline para correlação com Decision Log.
+    Seeds técnicos são ignorados para não contaminar readiness real.
+    """
+    if not TIMELINE_FILE.exists():
+        return []
+
+    events = []
+    skipped_test_seeds = 0
+    try:
+        with open(TIMELINE_FILE, "rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                max_bytes = 1024 * 1024
+                if size > max_bytes:
+                    f.seek(size - max_bytes)
+                    f.readline()
+                else:
+                    f.seek(0)
+            except Exception:
+                f.seek(0)
+
+            for line in f:
+                if len(events) >= limit:
+                    break
+                try:
+                    item = json.loads(line.decode("utf-8").strip())
+                    if not isinstance(item, dict):
+                        continue
+                    if _is_test_seed_event(item):
+                        skipped_test_seeds += 1
+                        continue
+                    code = _extract_code(item)
+                    dt = _event_time(item)
+                    if code and dt:
+                        events.append({
+                            "code": code,
+                            "dt": dt,
+                            "event_type": _extract_event_type(item),
+                            "test_seed": False,
+                            "reason": item.get("reason") or item.get("rationale") or "",
+                        })
+                except Exception:
+                    continue
+    except Exception:
+        return []
+
+    events.sort(key=lambda x: x.get("dt"))
+    # A lista continua sendo lista simples para compatibilidade.
+    # O contador de seeds puladas aparece no result do run_v2.
+    try:
+        _read_all_policy_events_light.last_skipped_test_seeds = skipped_test_seeds
+    except Exception:
+        pass
+    return events
+
+
+def _effect_policy_template(code):
+    return {
+        "code": code,
+        "first_seen_at": None,
+        "last_seen_at": None,
+        "decisions": 0,
+        "real_decisions": 0,
+        "test_decisions": 0,
+        "outcomes_detected": 0,
+        "allow": 0,
+        "deny": 0,
+        "block": 0,
+        "reduce_size": 0,
+        "no_expansion": 0,
+        "unknown": 0,
+        "by_bot": {},
+        "by_side": {},
+        "by_symbol": {},
+        "risk_pct_total": 0.0,
+        "score_total": 0.0,
+        "avg_risk_pct": 0.0,
+        "avg_trade_score": 0.0,
+        "effect_score": 50.0,
+        "confidence_pct": 0.0,
+        "readiness_score": 0.0,
+        "readiness_label": "WAIT_SAMPLE",
+        "ready_to_learn": False,
+        "recommendation": "OBSERVAR",
+        "notes": [],
+    }
+
+
+def _apply_decision_to_effect(policy, decision):
+    dt = _decision_time(decision)
+    dt_txt = dt.strftime("%d/%m/%Y %H:%M:%S") if dt else _now()
+    if not policy.get("first_seen_at"):
+        policy["first_seen_at"] = dt_txt
+    policy["last_seen_at"] = dt_txt
+
+    decision_name = _extract_decision(decision)
+    fields = _extract_trade_fields(decision)
+    outcome = _extract_decision_outcome(decision)
+
+    policy["decisions"] = _safe_int(policy.get("decisions")) + 1
+    policy["real_decisions"] = _safe_int(policy.get("real_decisions")) + 1
+    if outcome:
+        policy["outcomes_detected"] = _safe_int(policy.get("outcomes_detected")) + 1
+
+    d = decision_name
+    if "ALLOW" in d:
+        policy["allow"] = _safe_int(policy.get("allow")) + 1
+    elif "DENY" in d:
+        policy["deny"] = _safe_int(policy.get("deny")) + 1
+    elif "BLOCK" in d:
+        policy["block"] = _safe_int(policy.get("block")) + 1
+    elif "REDUCE" in d:
+        policy["reduce_size"] = _safe_int(policy.get("reduce_size")) + 1
+    elif "NO_EXPANSION" in d or "NO EXPANSION" in d:
+        policy["no_expansion"] = _safe_int(policy.get("no_expansion")) + 1
+    else:
+        policy["unknown"] = _safe_int(policy.get("unknown")) + 1
+
+    _update_counter_map(policy.setdefault("by_bot", {}), fields.get("bot"))
+    _update_counter_map(policy.setdefault("by_side", {}), fields.get("side"))
+    _update_counter_map(policy.setdefault("by_symbol", {}), fields.get("symbol"))
+
+    policy["risk_pct_total"] = round(_safe_float(policy.get("risk_pct_total")) + _safe_float(fields.get("risk_pct")), 6)
+    policy["score_total"] = round(_safe_float(policy.get("score_total")) + _safe_float(fields.get("score")), 6)
+
+    decisions = max(1, _safe_int(policy.get("decisions")))
+    policy["avg_risk_pct"] = round(_safe_float(policy.get("risk_pct_total")) / decisions, 4)
+    policy["avg_trade_score"] = round(_safe_float(policy.get("score_total")) / decisions, 4)
+
+    _score_effect_policy(policy)
+
+
+def _score_effect_policy(policy):
+    decisions = _safe_int(policy.get("decisions"))
+    real_decisions = _safe_int(policy.get("real_decisions"), decisions)
+    outcomes = _safe_int(policy.get("outcomes_detected"))
+    allow = _safe_int(policy.get("allow"))
+    deny = _safe_int(policy.get("deny"))
+    block = _safe_int(policy.get("block"))
+    reduce_size = _safe_int(policy.get("reduce_size"))
+    no_expansion = _safe_int(policy.get("no_expansion"))
+
+    restrictions = deny + block + reduce_size + no_expansion
+
+    sample_score = min(30.0, real_decisions * 2.0)
+    protection_score = min(30.0, restrictions * 4.0)
+    operation_score = min(20.0, allow * 2.0)
+    outcome_score = min(10.0, outcomes * 2.0)
+    balance_score = 10.0
+
+    if real_decisions >= 10 and allow >= real_decisions * 0.9 and restrictions == 0:
+        balance_score = 4.0
+
+    if real_decisions >= 10 and allow == 0 and (deny + block) >= real_decisions * 0.9:
+        balance_score = 5.0
+
+    score = max(0.0, min(100.0, sample_score + protection_score + operation_score + outcome_score + balance_score))
+    confidence = min(100.0, (real_decisions / max(1, MIN_READY_DECISIONS_FOR_POLICY)) * 100.0)
+
+    readiness_score = min(100.0, (real_decisions / max(1, MIN_REAL_DECISIONS_FOR_LEARNING)) * 70.0 + min(30.0, outcomes * 6.0))
+
+    if real_decisions < MIN_REAL_DECISIONS_FOR_LEARNING:
+        readiness_label = "WAIT_SAMPLE"
+        ready_to_learn = False
+        recommendation = "AGUARDAR_AMOSTRA"
+    elif real_decisions < MIN_READY_DECISIONS_FOR_POLICY:
+        readiness_label = "LEARN_WITH_CAUTION"
+        ready_to_learn = True
+        recommendation = "OBSERVAR"
+    else:
+        readiness_label = "READY_TO_LEARN"
+        ready_to_learn = True
+        if score >= 80:
+            recommendation = "MANTER"
+        elif score >= 60:
+            recommendation = "OBSERVAR"
+        elif score >= 45:
+            recommendation = "REVISAR"
+        else:
+            recommendation = "ENFRAQUECER_OU_APOSENTAR"
+
+    notes = []
+    if real_decisions < MIN_REAL_DECISIONS_FOR_LEARNING:
+        notes.append(f"Amostra real insuficiente: {real_decisions}/{MIN_REAL_DECISIONS_FOR_LEARNING} decisões reais.")
+    elif real_decisions < MIN_READY_DECISIONS_FOR_POLICY:
+        notes.append(f"Policy pode aprender com cautela: {real_decisions}/{MIN_READY_DECISIONS_FOR_POLICY} decisões reais.")
+    else:
+        notes.append("Policy atingiu amostra mínima para aprendizado executivo controlado.")
+    if outcomes == 0:
+        notes.append("Ainda sem outcome/lifecycle confirmado; não usar para PnL real.")
+    if restrictions > 0:
+        notes.append("Policy influenciou restrição/controle de risco em decisões reais.")
+    if allow > 0:
+        notes.append("Policy também conviveu com decisões permitidas.")
+    if real_decisions >= 10 and allow == 0:
+        notes.append("Policy altamente restritiva; revisar impacto financeiro antes de automatizar.")
+    if real_decisions >= 10 and allow >= real_decisions * 0.9:
+        notes.append("Policy pouco restritiva; revisar se agrega proteção real.")
+
+    policy["effect_score"] = round(score, 2)
+    policy["confidence_pct"] = round(confidence, 2)
+    policy["readiness_score"] = round(readiness_score, 2)
+    policy["readiness_label"] = readiness_label
+    policy["ready_to_learn"] = ready_to_learn
+    policy["recommendation"] = recommendation
+    policy["notes"] = notes[-6:]
+
+
+def _recompute_effect_summary(effect):
+    policies = effect.get("policies") or {}
+    values = [p for p in policies.values() if isinstance(p, dict)]
+
+    total_decisions = sum(_safe_int(p.get("decisions")) for p in values)
+    total_real_decisions = sum(_safe_int(p.get("real_decisions"), _safe_int(p.get("decisions"))) for p in values)
+    total_outcomes = sum(_safe_int(p.get("outcomes_detected")) for p in values)
+    avg = 0.0
+    if values:
+        avg = sum(_safe_float(p.get("effect_score")) for p in values) / len(values)
+
+    effect["summary"] = {
+        "policy_count": len(values),
+        "decisions_processed": total_decisions,
+        "real_decisions_processed": total_real_decisions,
+        "decisions_matched": total_decisions,
+        "decisions_unmatched": effect.get("summary", {}).get("decisions_unmatched", 0),
+        "outcomes_detected": total_outcomes,
+        "ready_to_learn_count": sum(1 for p in values if p.get("readiness_label") == "READY_TO_LEARN"),
+        "learn_with_caution_count": sum(1 for p in values if p.get("readiness_label") == "LEARN_WITH_CAUTION"),
+        "wait_sample_count": sum(1 for p in values if p.get("readiness_label") == "WAIT_SAMPLE"),
+        "average_effect_score": round(avg, 2),
+        "updated_at": _now(),
+    }
+
+
+def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=None):
+    """
+    V2.1.1:
+    Lê decisões novas do decision_log e associa às policies ativas reais da timeline.
+    Ignora seeds técnicos para readiness real.
+    Não calcula PnL ainda e não altera policies/execução.
+    """
+    started = time.time()
+    state = _load_v2_state()
+    effect = _load_effect()
+
+    offset = _safe_int(state.get("decision_log_offset"), 0)
+    max_decisions = int(max_decisions or MAX_DECISIONS_PER_RUN)
+
+    decisions, new_offset, reached_eof = _read_new_jsonl(DECISION_LOG_FILE, offset, max_decisions)
+    policy_events = _read_all_policy_events_light()
+    timeline_seeds_skipped = getattr(_read_all_policy_events_light, "last_skipped_test_seeds", 0)
+
+    processed = 0
+    matched = 0
+    unmatched = 0
+    test_decisions_skipped = 0
+
+    policies = effect.setdefault("policies", {})
+
+    for decision in decisions:
+        if _is_test_seed_event(decision):
+            test_decisions_skipped += 1
+            continue
+
+        dt = _decision_time(decision)
+        codes = _active_policy_codes_for_decision(dt, policy_events)
+
+        if not codes:
+            unmatched += 1
+            processed += 1
+            continue
+
+        for code in codes:
+            policy = policies.get(code)
+            if not isinstance(policy, dict):
+                policy = _effect_policy_template(code)
+                policies[code] = policy
+            _apply_decision_to_effect(policy, decision)
+            matched += 1
+
+        processed += 1
+
+    # Mantém informação de unmatched no summary sem depender de reprocessamento completo.
+    prior_summary = effect.get("summary") if isinstance(effect.get("summary"), dict) else {}
+    prior_unmatched = _safe_int(prior_summary.get("decisions_unmatched"))
+    effect.setdefault("summary", {})["decisions_unmatched"] = prior_unmatched + unmatched
+
+    state["decision_log_offset"] = new_offset
+    state["last_run_at"] = _now()
+    state["last_error"] = None
+    state["decisions_processed"] = _safe_int(state.get("decisions_processed")) + processed
+    state["last_batch"] = {
+        "decisions_read": len(decisions),
+        "decisions_processed": processed,
+        "decisions_matched": matched,
+        "decisions_unmatched": unmatched,
+        "test_decisions_skipped": test_decisions_skipped,
+        "timeline_test_seeds_skipped": timeline_seeds_skipped,
+        "policy_events_loaded": len(policy_events),
+        "old_offset": offset,
+        "new_offset": new_offset,
+        "reached_eof": reached_eof,
+    }
+
+    if commit:
+        _save_effect(effect)
+        _save_v2_state(state)
+    else:
+        _recompute_effect_summary(effect)
+
+    result = {
+        "ok": True,
+        "module": "executive_policy_learning_v2",
+        "version": VERSION,
+        "generated_at": _now(),
+        "commit": commit,
+        "decision_log_file": str(DECISION_LOG_FILE),
+        "timeline_file": str(TIMELINE_FILE),
+        "effect_file": str(V2_EFFECT_FILE),
+        "decisions_read": len(decisions),
+        "decisions_processed": processed,
+        "decisions_matched": matched,
+        "decisions_unmatched": unmatched,
+        "test_decisions_skipped": test_decisions_skipped,
+        "timeline_test_seeds_skipped": timeline_seeds_skipped,
+        "policy_events_loaded": len(policy_events),
+        "old_offset": offset,
+        "new_offset": new_offset,
+        "reached_eof": reached_eof,
+        "duration_ms": round((time.time() - started) * 1000, 2),
+        "summary": effect.get("summary") or {},
+        "notes": [
+            "V2.1.1 ignora seeds técnicos nas métricas reais.",
+            "READY_TO_LEARN é consultivo e não libera execução automática.",
+            "PnL real ainda depende de Lifecycle/Outcome em etapa futura.",
+        ],
+    }
+
+    try:
+        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+    return result
+
+
+def get_executive_policy_effect_stats():
+    effect = _load_effect()
+    effect["version"] = VERSION
+    _recompute_effect_summary(effect)
+    return effect
+
+
+def get_executive_policy_learning_v2_health():
+    state = _load_v2_state()
+    effect = _load_effect()
+    _recompute_effect_summary(effect)
+    summary = effect.get("summary") or {}
+
+    status = "OK"
+    if not DECISION_LOG_FILE.exists():
+        status = "NO_DECISION_LOG"
+    elif not TIMELINE_FILE.exists():
+        status = "NO_TIMELINE"
+    elif _safe_int(summary.get("policy_count")) == 0:
+        status = "WAITING_MATCHES"
+    elif _safe_int(summary.get("wait_sample_count")) > 0 and _safe_int(summary.get("ready_to_learn_count")) == 0:
+        status = "WAIT_SAMPLE"
+
+    return {
+        "ok": True,
+        "module": "executive_policy_learning_v2",
+        "loaded": True,
+        "version": VERSION,
+        "status": status,
+        "decision_log_file": str(DECISION_LOG_FILE),
+        "decision_log_exists": DECISION_LOG_FILE.exists(),
+        "timeline_file": str(TIMELINE_FILE),
+        "timeline_exists": TIMELINE_FILE.exists(),
+        "state_file": str(V2_STATE_FILE),
+        "effect_file": str(V2_EFFECT_FILE),
+        "decision_log_offset": state.get("decision_log_offset"),
+        "last_run_at": state.get("last_run_at"),
+        "last_error": state.get("last_error"),
+        "summary": summary,
+        "notes": [
+            "Health V2.1.1 separa amostra real de seeds técnicos.",
+            "WAIT_SAMPLE não é erro; indica que a Central ainda precisa de decisões reais.",
+        ],
+    }
+
+
+def build_executive_policy_effect_report(result=None, limit=12):
+    if result is None:
+        result = run_executive_policy_learning_v2(context={}, commit=True)
+
+    effect = get_executive_policy_effect_stats()
+    summary = effect.get("summary") or {}
+    policies = effect.get("policies") or {}
+
+    ranking = sorted(
+        [p for p in policies.values() if isinstance(p, dict)],
+        key=lambda p: (_safe_float(p.get("readiness_score")), _safe_float(p.get("effect_score")), _safe_float(p.get("confidence_pct")), _safe_int(p.get("decisions"))),
+        reverse=True,
+    )
+
+    lines = [
+        "🧠 EXECUTIVE POLICY LEARNING V2.1.1 — POLICY EFFECT",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Decisões lidas agora: {result.get('decisions_read', 0)}",
+        f"Decisões reais processadas agora: {result.get('decisions_processed', 0)}",
+        f"Matches policy↔decision: {result.get('decisions_matched', 0)}",
+        f"Sem policy associada: {result.get('decisions_unmatched', 0)}",
+        f"Seeds decision ignorados: {result.get('test_decisions_skipped', 0)}",
+        f"Seeds timeline ignorados: {result.get('timeline_test_seeds_skipped', 0)}",
+        f"Policy events reais carregados: {result.get('policy_events_loaded', 0)}",
+        "",
+        "Resumo acumulado:",
+        f"- Policies com efeito medido: {summary.get('policy_count', 0)}",
+        f"- Decisões reais correlacionadas: {summary.get('real_decisions_processed', summary.get('decisions_processed', 0))}",
+        f"- Outcomes detectados: {summary.get('outcomes_detected', 0)}",
+        f"- READY_TO_LEARN: {summary.get('ready_to_learn_count', 0)}",
+        f"- LEARN_WITH_CAUTION: {summary.get('learn_with_caution_count', 0)}",
+        f"- WAIT_SAMPLE: {summary.get('wait_sample_count', 0)}",
+        f"- Effect score médio: {summary.get('average_effect_score', 0)}",
+        "",
+    ]
+
+    if not ranking:
+        lines += [
+            "Ainda não há correlação real policy↔decision suficiente.",
+            "",
+            "Leitura:",
+            "A V2.1.1 precisa de eventos reais no Timeline e decisões reais no Decision Log dentro da janela configurada.",
+            "Seeds técnicos são ignorados para não contaminar o aprendizado real.",
+        ]
+        return "\n".join(lines)
+
+    lines.append("Ranking de readiness/efeito:")
+    for idx, p in enumerate(ranking[:limit], start=1):
+        lines += [
+            f"{idx}. {p.get('code')}",
+            f"- Readiness: {p.get('readiness_label')} | score={p.get('readiness_score')} | ready={p.get('ready_to_learn')}",
+            f"- Effect Score: {p.get('effect_score')} | Confiança: {p.get('confidence_pct')}%",
+            f"- Decisões reais: {p.get('real_decisions', p.get('decisions'))} | ALLOW: {p.get('allow')} | DENY: {p.get('deny')} | BLOCK: {p.get('block')} | REDUCE: {p.get('reduce_size')}",
+            f"- Avg risk: {p.get('avg_risk_pct')} | Avg trade score: {p.get('avg_trade_score')}",
+            f"- Recomendação: {p.get('recommendation')}",
+        ]
+        notes = p.get("notes") or []
+        if notes:
+            lines.append(f"- Nota: {notes[0]}")
+        lines.append("")
+
+    lines += [
+        "Observação:",
+        "V2.1.1 é observacional, ignora seeds técnicos e separa readiness real de validação de pipeline.",
+        "READY_TO_LEARN não altera execução real; apenas indica que a policy já tem amostra mínima para aprendizado controlado.",
+        "A próxima etapa deve cruzar com Lifecycle/Outcome para PnL, Profit Factor e Drawdown.",
+    ]
+    return "\n".join(lines)
+
+
+def build_policy_compare_report(limit=10):
+    effect = get_executive_policy_effect_stats()
+    policies = effect.get("policies") or {}
+    ranking = sorted(
+        [p for p in policies.values() if isinstance(p, dict)],
+        key=lambda p: (_safe_float(p.get("readiness_score")), _safe_float(p.get("effect_score")), _safe_int(p.get("real_decisions", p.get("decisions")))),
+        reverse=True,
+    )
+
+    lines = [
+        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.1.1",
+        f"Data/hora: {_now()}",
+        "",
+    ]
+
+    if not ranking:
+        lines += [
+            "Sem policies reais suficientes para comparar.",
+            "Rode /policyeffect após acumular decisões reais e eventos reais na Timeline.",
+        ]
+        return "\n".join(lines)
+
+    for idx, p in enumerate(ranking[:limit], start=1):
+        restrictions = _safe_int(p.get("deny")) + _safe_int(p.get("block")) + _safe_int(p.get("reduce_size")) + _safe_int(p.get("no_expansion"))
+        lines.append(
+            f"{idx}. {p.get('code')} | readiness={p.get('readiness_label')}({p.get('readiness_score')}) | "
+            f"effect={p.get('effect_score')} | conf={p.get('confidence_pct')}% | "
+            f"dec_reais={p.get('real_decisions', p.get('decisions'))} | allow={p.get('allow')} | restrições={restrictions}"
+        )
+
+    return "\n".join(lines)
+
+
+def build_policy_insights_report():
+    effect = get_executive_policy_effect_stats()
+    policies = effect.get("policies") or {}
+    values = [p for p in policies.values() if isinstance(p, dict)]
+
+    lines = [
+        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.1.1",
+        f"Data/hora: {_now()}",
+        "",
+    ]
+
+    if not values:
+        lines += [
+            "Ainda não há dados reais suficientes para insights.",
+            "Rode /policyeffect após acumular Decision Log real e Timeline real.",
+        ]
+        return "\n".join(lines)
+
+    best = max(values, key=lambda p: _safe_float(p.get("effect_score")))
+    worst = min(values, key=lambda p: _safe_float(p.get("effect_score")))
+    ready = [p for p in values if p.get("readiness_label") == "READY_TO_LEARN"]
+    caution = [p for p in values if p.get("readiness_label") == "LEARN_WITH_CAUTION"]
+    wait = [p for p in values if p.get("readiness_label") == "WAIT_SAMPLE"]
+
+    restrictive = sorted(
+        values,
+        key=lambda p: _safe_int(p.get("deny")) + _safe_int(p.get("block")) + _safe_int(p.get("reduce_size")) + _safe_int(p.get("no_expansion")),
+        reverse=True,
+    )
+
+    lines += [
+        f"READY_TO_LEARN: {len(ready)}",
+        f"LEARN_WITH_CAUTION: {len(caution)}",
+        f"WAIT_SAMPLE: {len(wait)}",
+        "",
+        f"Melhor effect score: {best.get('code')} — {best.get('effect_score')}",
+        f"Menor effect score: {worst.get('code')} — {worst.get('effect_score')}",
+        "",
+        "Mais restritivas:",
+    ]
+
+    for p in restrictive[:5]:
+        restrictions = _safe_int(p.get("deny")) + _safe_int(p.get("block")) + _safe_int(p.get("reduce_size")) + _safe_int(p.get("no_expansion"))
+        lines.append(f"- {p.get('code')}: restrições={restrictions}, decisões reais={p.get('real_decisions', p.get('decisions'))}, readiness={p.get('readiness_label')}, score={p.get('effect_score')}")
+
+    lines += [
+        "",
+        "Leitura:",
+        "Esta versão ainda não julga PnL. Ela mede influência operacional real das policies nas decisões e separa seeds técnicos.",
+    ]
     return "\n".join(lines)
 
 
