@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-LEARNING-V2.1.2
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-LEARNING-V2.1.5
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -5393,7 +5393,22 @@ def append_decision_log(payload, decision_result):
     trade_id = str(trade_id)
     allowed = bool(result.get("allowed"))
     state = "VERIFY" if allowed and str(result.get("mode") or "").upper() == "VERIFY" else ("DENIED" if not allowed else str(result.get("mode") or "ALLOW").upper())
+
+    # V2.1.5 — Main Integration / Persist Linker no Log Real
+    # O Policy Decision Linker já aparecia na resposta HTTP, mas precisava estar
+    # dentro do objeto entregue ao append_decision_log e também no arquivo usado
+    # pelo History (/data/decision_log.jsonl). Isso permite que /policyeffect
+    # reconheça policy_codes de forma explícita no rebuild.
     policy_link = extract_policy_decision_link(result, payload)
+    try:
+        result["policy_codes"] = policy_link.get("policy_codes") or []
+        result["active_policy_codes"] = policy_link.get("active_policy_codes") or []
+        result["applied_policies"] = policy_link.get("policy_codes") or []
+        result["dominant_policy_code"] = policy_link.get("dominant_policy_code")
+        result["policy_linker"] = policy_link
+    except Exception:
+        pass
+
     item = {
         "ts": data_hora_sp_str(),
         "epoch": time.time(),
@@ -5420,9 +5435,26 @@ def append_decision_log(payload, decision_result):
         "exposure": result.get("exposure") or {},
     }
     _append_jsonl(CENTRAL_DECISION_LOG_FILE, item)
+
+    # V2.1.5 — também persiste no decision_log real do History Manager
+    # quando ele usa DATA_DIR diferente do main.py. No Render, o Learning V2.1.4
+    # detectou /data/decision_log.jsonl como fonte com mais decisões; por isso
+    # gravamos o mesmo item lá também.
+    try:
+        import history_manager as _policy_history_manager
+        history_decision_file = getattr(_policy_history_manager, "DECISION_LOG_FILE", None)
+        if history_decision_file:
+            history_decision_file = Path(history_decision_file)
+            if history_decision_file.resolve() != Path(CENTRAL_DECISION_LOG_FILE).resolve():
+                _append_jsonl(history_decision_file, item)
+    except Exception as exc:
+        print("AVISO policy linker history decision log:", exc)
+
     try:
         result["policy_codes"] = item.get("policy_codes") or []
         result["active_policy_codes"] = item.get("active_policy_codes") or []
+        result["applied_policies"] = item.get("applied_policies") or []
+        result["dominant_policy_code"] = item.get("dominant_policy_code")
         result["policy_linker"] = item.get("policy_linker") or {}
     except Exception:
         pass
