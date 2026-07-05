@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-EFFECT-REBUILD-V2.0.2
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-EFFECT-SEED-V2.0.3
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -278,6 +278,8 @@ try:
         build_policy_insights_report,
         rebuild_executive_policy_effect,
         build_policy_effect_rebuild_report,
+        seed_policy_effect_decision,
+        build_policy_effect_seed_report,
     )
     EXECUTIVE_POLICY_LEARNING_LOADED = True
     EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR = None
@@ -368,7 +370,7 @@ except Exception as e:
 
     def build_executive_policy_effect_report(result=None, limit=12):
         return (
-            "🧠 EXECUTIVE POLICY LEARNING V2.0.2 — POLICY EFFECT\n"
+            "🧠 EXECUTIVE POLICY LEARNING V2.0.3 — POLICY EFFECT\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -394,7 +396,7 @@ except Exception as e:
 
     def build_policy_compare_report(limit=10):
         return (
-            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.2\n"
+            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.3\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -402,7 +404,7 @@ except Exception as e:
 
     def build_policy_insights_report():
         return (
-            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.2\n"
+            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.3\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -419,11 +421,29 @@ except Exception as e:
 
     def build_policy_effect_rebuild_report(result=None):
         return (
-            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.2.2\n"
+            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.3\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
         )
+
+    def seed_policy_effect_decision(commit=True):
+        return {
+            "ok": False,
+            "module": "executive_policy_learning_v2",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
+            "events_created": 0,
+        }
+
+    def build_policy_effect_seed_report(result=None):
+        return (
+            "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.0.3\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
+        )
+
 
 
 
@@ -2118,7 +2138,7 @@ def policy_learning_seed_route():
 @app.route("/executive/policy/learning/effect", methods=["GET"])
 def policy_effect_route():
     """
-    Executive Policy Learning V2.0.2.
+    Executive Policy Learning V2.0.3.
     Correlaciona Executive Policy Timeline + Decision Log.
     """
     try:
@@ -2132,7 +2152,7 @@ def policy_effect_route():
         return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "🧠 EXECUTIVE POLICY LEARNING V2.0.2 — POLICY EFFECT\n"
+            "🧠 EXECUTIVE POLICY LEARNING V2.0.3 — POLICY EFFECT\n"
             "Status: ❌\n"
             f"Erro na rota /policyeffect: {exc}",
             500,
@@ -2140,6 +2160,30 @@ def policy_effect_route():
         )
 
 
+
+
+
+
+@app.route("/policyeffectseed", methods=["GET"])
+@app.route("/executive/policy/learning/effect/seed", methods=["GET"])
+def policy_effect_seed_route():
+    """
+    Cria uma decisão seed para validar match Policy Timeline + Decision Log.
+    Não executa trades e não altera policies reais.
+    """
+    try:
+        check_only = str(request.args.get("check_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        result = seed_policy_effect_decision(commit=not check_only)
+        report = build_policy_effect_seed_report(result)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.0.3\n"
+            "Status: ❌\n"
+            f"Erro na rota /policyeffectseed: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
 
 
 @app.route("/policyeffectrebuild", methods=["GET"])
@@ -2160,7 +2204,7 @@ def policy_effect_rebuild_route():
         return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.2.2\n"
+            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.3\n"
             "Status: ❌\n"
             f"Erro na rota /policyeffectrebuild: {exc}",
             500,
@@ -2210,7 +2254,7 @@ def policy_compare_route():
         return build_policy_compare_report(limit=limit), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.2\n"
+            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.3\n"
             f"Erro na rota /policycompare: {exc}",
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
@@ -2224,7 +2268,7 @@ def policy_insights_route():
         return build_policy_insights_report(), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.2\n"
+            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.3\n"
             f"Erro na rota /policyinsights: {exc}",
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
@@ -7645,7 +7689,7 @@ def _daily_bot_block_v2(key, cfg, resumo):
         if core and core != "N/A":
             bloco.append(core)
         else:
-            bloco.append("📈 QUALIDADE EXECUTIVA V2.0.2\nAmostra insuficiente hoje.\nAguardar trades encerrados.")
+            bloco.append("📈 QUALIDADE EXECUTIVA V2.0.3\nAmostra insuficiente hoje.\nAguardar trades encerrados.")
 
     return "\n".join(bloco).strip()
 

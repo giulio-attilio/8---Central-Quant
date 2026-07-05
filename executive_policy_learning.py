@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Executive Policy Learning V2.0.2.2 — Central Quant
+Executive Policy Learning V2.0.3 — Central Quant
 Versão: 2026-07-05-EXECUTIVE-POLICY-LEARNING-V1
 
 Objetivo:
@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.0.2.2"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.0.3"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR", str(BASE_DIR / "data")))
@@ -38,7 +38,7 @@ LOG_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_LOG_FILE", str(DATA_DI
 MAX_EVENTS_PER_RUN = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MAX_EVENTS_PER_RUN", "500"))
 MIN_SAMPLE_FOR_CONFIDENCE = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MIN_SAMPLE", "10"))
 
-# V2.0.2.2 — correlação entre Policy Timeline e Decision Log.
+# V2.0.3 — correlação entre Policy Timeline e Decision Log.
 DECISION_LOG_FILE = Path(os.environ.get("CENTRAL_DECISION_LOG_FILE", str(DATA_DIR / "decision_log.jsonl")))
 V2_STATE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_V2_STATE_FILE", str(DATA_DIR / "executive_policy_learning_v2_state.json")))
 V2_EFFECT_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_EFFECT_FILE", str(DATA_DIR / "executive_policy_learning_effect.json")))
@@ -502,7 +502,7 @@ def build_executive_policy_learning_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V2.0.2.2",
+        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V2.0.3",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -782,7 +782,7 @@ def build_executive_policy_learning_seed_report(result=None):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.0.2.2
+# EXECUTIVE POLICY LEARNING V2.0.3
 # Correlação Timeline + Decision Log
 # ==========================================================
 
@@ -910,7 +910,7 @@ def _read_new_jsonl(path, offset, max_items):
 def _read_all_policy_events_light(limit=5000):
     """
     Lê eventos da timeline de forma limitada para correlacionar com decisões.
-    Não é usado em loop pesado; V2.0.2.2 trabalha com limite.
+    Não é usado em loop pesado; V2.0.3 trabalha com limite.
     """
     if not TIMELINE_FILE.exists():
         return []
@@ -958,7 +958,7 @@ def _read_all_policy_events_light(limit=5000):
 
 def _active_policy_codes_for_decision(decision_dt, policy_events, window_minutes=POLICY_DECISION_WINDOW_MINUTES):
     """
-    V2.0.2.2: associação simples.
+    V2.0.3: associação simples.
     Uma decisão é associada a policies cujos eventos ocorreram até a decisão
     dentro da janela configurada. Events de release/expire fecham a policy.
     """
@@ -1186,7 +1186,7 @@ def _recompute_effect_summary(effect):
 
 def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=None):
     """
-    V2.0.2.2:
+    V2.0.3:
     Lê decisões novas do decision_log e associa às policies ativas recentes da timeline.
     Não calcula PnL ainda.
     """
@@ -1326,7 +1326,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING V2.0.2.2 — POLICY EFFECT",
+        "🧠 EXECUTIVE POLICY LEARNING V2.0.3 — POLICY EFFECT",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1348,7 +1348,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
             "Ainda não há correlação policy↔decision suficiente.",
             "",
             "Leitura:",
-            "A V2.0.2.2 precisa de eventos no Timeline e decisões no Decision Log dentro da janela configurada.",
+            "A V2.0.3 precisa de eventos no Timeline e decisões no Decision Log dentro da janela configurada.",
         ]
         return "\n".join(lines)
 
@@ -1368,7 +1368,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
 
     lines += [
         "Observação:",
-        "V2.0.2.2 correlaciona Timeline + Decision Log.",
+        "V2.0.3 correlaciona Timeline + Decision Log.",
         "V2.1 deve cruzar com Lifecycle/Outcome para PnL, Profit Factor e Drawdown.",
     ]
     return "\n".join(lines)
@@ -1422,7 +1422,7 @@ def build_executive_policy_effect_rebuild_report(result=None):
         result = rebuild_executive_policy_effect(commit=True)
 
     lines = [
-        "♻️ EXECUTIVE POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.2.2",
+        "♻️ EXECUTIVE POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.3",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1469,7 +1469,7 @@ def build_policy_compare_report(limit=10):
     )
 
     lines = [
-        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.2.2",
+        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.3",
         f"Data/hora: {_now()}",
         "",
     ]
@@ -1496,7 +1496,7 @@ def build_policy_insights_report():
     values = [p for p in policies.values() if isinstance(p, dict)]
 
     lines = [
-        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.2.2",
+        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.3",
         f"Data/hora: {_now()}",
         "",
     ]
@@ -1538,7 +1538,7 @@ def build_policy_insights_report():
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.0.2.2 — REBUILD SAFE PATCH
+# EXECUTIVE POLICY LEARNING V2.0.3 — REBUILD SAFE PATCH
 # ==========================================================
 
 def rebuild_executive_policy_effect(commit=True, max_decisions=None):
@@ -1602,7 +1602,7 @@ def build_policy_effect_rebuild_report(result=None):
         result = rebuild_executive_policy_effect(commit=True)
 
     lines = [
-        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.2.2",
+        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.3",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1635,6 +1635,115 @@ def build_policy_effect_rebuild_report(result=None):
         "/policyeffect",
         "/policycompare",
         "/policyinsights",
+    ]
+
+    return "\n".join(lines)
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.0.3 — DECISION SEED
+# ==========================================================
+
+def seed_policy_effect_decision(commit=True):
+    """
+    Cria uma decisão técnica de teste no decision_log para validar:
+    Timeline seed -> Decision seed -> Policy Effect match.
+
+    Importante:
+    - Possui test_seed=True.
+    - Não executa trades.
+    - Não altera policies reais.
+    - Não cria posição.
+    """
+    DATA_DIR.mkdir(exist_ok=True)
+
+    now = _now()
+    seed_id = datetime.now().strftime("%Y%m%d%H%M%S")
+
+    decision = {
+        "generated_at": now,
+        "created_at": now,
+        "decision": "DENY",
+        "action": "POLICY_EFFECT_SEED_DECISION",
+        "bot": "FALCON",
+        "setup": "FALCON15",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "risk_pct": 1.0,
+        "score": 72,
+        "reason": "Seed técnico para validar correlação Policy Timeline + Decision Log.",
+        "source": "executive_policy_learning_effect_seed",
+        "test_seed": True,
+        "seed_id": seed_id,
+        "payload": {
+            "decision": "DENY",
+            "policy_context": ["LIMIT_NEW_LONG", "WAIT_SAMPLE"],
+            "dominant_side": "LONG",
+            "dominant_pct": 76.0,
+        },
+    }
+
+    if commit:
+        with open(DECISION_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(decision, ensure_ascii=False, sort_keys=True) + "\n")
+
+    result = {
+        "ok": True,
+        "module": "executive_policy_learning_v2",
+        "version": VERSION,
+        "generated_at": now,
+        "commit": commit,
+        "seed_id": seed_id,
+        "events_created": 1,
+        "decision_log_file": str(DECISION_LOG_FILE),
+        "decision": decision,
+        "notes": [
+            "Decisão seed é técnica e possui test_seed=True.",
+            "Ela serve apenas para validar o match Policy Timeline ↔ Decision Log.",
+            "Não executa trades e não altera policies reais.",
+        ],
+    }
+
+    try:
+        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": "POLICY_EFFECT_DECISION_SEED",
+                **result,
+            }, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+    return result
+
+
+def build_policy_effect_seed_report(result=None):
+    if result is None:
+        result = seed_policy_effect_decision(commit=True)
+
+    lines = [
+        "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.0.3",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Commit: {result.get('commit')}",
+        f"Seed ID: {result.get('seed_id')}",
+        f"Decisões criadas: {result.get('events_created', 0)}",
+        f"Decision Log: {result.get('decision_log_file')}",
+        "",
+        "Decisão seed:",
+        "- Decision: DENY",
+        "- Bot: FALCON",
+        "- Setup: FALCON15",
+        "- Symbol: BTCUSDT LONG",
+        "- Policy context: LIMIT_NEW_LONG + WAIT_SAMPLE",
+        "",
+        "Importante:",
+        "- Esta decisão é técnica e possui test_seed=True.",
+        "- Ela valida o pipeline; não representa decisão real.",
+        "- Não executa trades e não cria posição.",
+        "",
+        "Próximo comando:",
+        "/policyeffectrebuild",
     ]
 
     return "\n".join(lines)
