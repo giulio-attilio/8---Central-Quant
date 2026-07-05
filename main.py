@@ -1309,6 +1309,156 @@ def executive_policy_health_route():
         return {"ok": False, "loaded": True, "error": str(exc)}, 500
 
 
+def _normalize_executive_policy_items_for_text(raw):
+    """
+    Normaliza a saída do Executive Policy Manager para relatório humano.
+    Usa a mesma fonte que o Priority V1.1: executive_policy_manager.get_active_policies().
+    """
+    if raw is None:
+        return []
+
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        items = None
+        for key in ["active_policies", "policies", "items", "data"]:
+            value = raw.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+        if items is None and isinstance(raw.get("active_codes"), list):
+            items = [{"code": code, "enabled": True} for code in raw.get("active_codes")]
+        if items is None:
+            items = []
+            for key, value in raw.items():
+                if isinstance(value, dict):
+                    item = dict(value)
+                    item.setdefault("code", key)
+                    items.append(item)
+    else:
+        items = []
+
+    out = []
+    seen = set()
+    for item in items:
+        if isinstance(item, str):
+            item = {"code": item, "enabled": True}
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or item.get("policy_code") or item.get("name") or item.get("id") or "").upper().strip()
+        if not code or code in seen:
+            continue
+        enabled = item.get("enabled", item.get("active", True))
+        if enabled is False:
+            continue
+        normalized = dict(item)
+        normalized["code"] = code
+        seen.add(code)
+        out.append(normalized)
+    return out
+
+
+def _build_executive_policies_text_from_manager(include_disabled=False):
+    """
+    Formatter local e resiliente para /policies.
+    Evita divergência quando executive_policy_manager.format_policies_text()
+    estiver lendo uma representação antiga do estado.
+    """
+    if not EXECUTIVE_POLICY_MANAGER_LOADED or executive_policy_manager is None:
+        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+
+    manager_function = None
+    raw = None
+    error = None
+
+    try:
+        if not include_disabled and hasattr(executive_policy_manager, "get_active_policies"):
+            manager_function = "get_active_policies"
+            raw = executive_policy_manager.get_active_policies()
+        elif hasattr(executive_policy_manager, "get_all_policies"):
+            manager_function = "get_all_policies"
+            raw = executive_policy_manager.get_all_policies()
+        elif hasattr(executive_policy_manager, "load_policy_state"):
+            manager_function = "load_policy_state"
+            raw = executive_policy_manager.load_policy_state()
+        elif hasattr(executive_policy_manager, "build_policy_health"):
+            manager_function = "build_policy_health"
+            raw = executive_policy_manager.build_policy_health()
+        else:
+            manager_function = "format_policies_text_fallback"
+            return executive_policy_manager.format_policies_text(include_disabled=include_disabled)
+    except Exception as exc:
+        error = str(exc)
+        try:
+            return executive_policy_manager.format_policies_text(include_disabled=include_disabled)
+        except Exception:
+            return (
+                "📜 EXECUTIVE POLICIES — CENTRAL QUANT\n"
+                f"Data/hora: {data_hora_sp_str()}\n"
+                "Status: ❌\n"
+                f"Erro: {error}"
+            )
+
+    policies = _normalize_executive_policy_items_for_text(raw)
+
+    lines = [
+        "📜 EXECUTIVE POLICIES — CENTRAL QUANT",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Exibindo: {'todas' if include_disabled else 'ativas'}",
+        f"Fonte: executive_policy_manager.{manager_function}",
+        "",
+    ]
+
+    if not policies:
+        lines += [
+            "Nenhuma política encontrada.",
+            "",
+            "Observação:",
+            "- O formatter local consultou a mesma fonte usada pelo Priority V1.1.",
+        ]
+        return "\n".join(lines)
+
+    lines.append(f"Policies encontradas: {len(policies)}")
+    lines.append("")
+
+    def _sort_key(policy):
+        level = str(policy.get("level") or "P9").upper().strip()
+        try:
+            p = int(level[1:]) if level.startswith("P") and level[1:].isdigit() else 9
+        except Exception:
+            p = 9
+        return (p, str(policy.get("code") or ""))
+
+    for idx, policy in enumerate(sorted(policies, key=_sort_key), start=1):
+        payload = policy.get("payload") if isinstance(policy.get("payload"), dict) else {}
+        lines += [
+            f"{idx}. {policy.get('code')}",
+            f"- Título: {policy.get('title') or 'N/A'}",
+            f"- Level: {policy.get('level') or 'N/A'} | Categoria: {policy.get('category') or 'N/A'}",
+            f"- Ação: {policy.get('action') or 'N/A'}",
+            f"- Motivo: {policy.get('reason') or 'N/A'}",
+            f"- Criada em: {policy.get('created_at') or 'N/A'}",
+            f"- Atualizada em: {policy.get('updated_at') or 'N/A'}",
+        ]
+        if policy.get("release_condition"):
+            lines.append(f"- Release: {policy.get('release_condition')}")
+        if payload:
+            compact_payload = []
+            for key in ["dominant_side", "dominant_pct", "allow_expansion", "blocks_expansion", "monthly_trades", "adaptive_confidence", "ceo_confidence"]:
+                if key in payload:
+                    compact_payload.append(f"{key}={payload.get(key)}")
+            if compact_payload:
+                lines.append(f"- Payload: {', '.join(compact_payload)}")
+        lines.append("")
+
+    lines += [
+        "Notas:",
+        "- Este relatório agora usa a mesma fonte oficial do Priority V1.1.",
+        "- Se /policypriority mostrar policies ativas, /policies deve mostrar as mesmas policies.",
+    ]
+    return "\n".join(lines)
+
+
 @app.route("/executive/policy")
 @app.route("/policies")
 def executive_policy_route():
@@ -1318,7 +1468,7 @@ def executive_policy_route():
         as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
         include_disabled = str(request.args.get("include_disabled", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
         if as_text:
-            return executive_policy_manager.format_policies_text(include_disabled=include_disabled)
+            return _build_executive_policies_text_from_manager(include_disabled=include_disabled)
         return executive_policy_manager.get_active_policies()
     except Exception as exc:
         return {"ok": False, "loaded": True, "error": str(exc)}, 500
@@ -16714,9 +16864,7 @@ def build_central_command_reply(text: str):
         return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
 
     if cmd0 in {"/policies", "/policylist", "/policy_list"}:
-        if EXECUTIVE_POLICY_MANAGER_LOADED:
-            return executive_policy_manager.format_policies_text(include_disabled=False)
-        return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+        return _build_executive_policies_text_from_manager(include_disabled=False)
 
     if cmd0 in {"/policyautorelease", "/policy_auto_release", "/autorelease", "/releasepolicies"}:
         return _executive_policy_auto_release_report_block()
