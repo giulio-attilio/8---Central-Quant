@@ -5392,6 +5392,85 @@ def extract_policy_decision_link(decision_result=None, payload=None):
         "source": evaluation.get("source") or "unknown",
     }
 
+
+def enrich_decision_result_with_policy_links(decision_result=None, payload=None):
+    """
+    V2.1.7 — Top-Level Policy Link Persistence.
+
+    Garante que os vínculos de policy fiquem no nível principal do objeto
+    usado pelo append_decision_log(), pelo History wrapper e pela resposta HTTP.
+
+    A resposta do Executive Policy Manager já contém executive_policy.policy_codes,
+    mas o Policy Learning V2 precisa ler policy_codes diretamente no JSONL.
+    Esta função não altera ALLOW/DENY, risco, lote ou execução.
+    """
+    if not isinstance(decision_result, dict):
+        return decision_result
+
+    source_payload = payload if isinstance(payload, dict) else {}
+    policy_link = extract_policy_decision_link(decision_result, source_payload)
+
+    executive_policy = decision_result.get("executive_policy")
+    if not isinstance(executive_policy, dict):
+        executive_policy = source_payload.get("executive_policy") if isinstance(source_payload.get("executive_policy"), dict) else {}
+
+    # Fallback explícito: se o linker não conseguiu montar policy_codes, usa
+    # diretamente os campos já validados dentro de executive_policy.
+    if not policy_link.get("policy_codes") and isinstance(executive_policy, dict):
+        fallback_codes = []
+        for key in [
+            "policy_codes",
+            "applied_policies",
+            "applied_policy_codes",
+            "dominant_policy_code",
+            "dominant_code",
+        ]:
+            _policy_linker_add_code(fallback_codes, executive_policy.get(key))
+
+        nested_linker = executive_policy.get("policy_linker") if isinstance(executive_policy.get("policy_linker"), dict) else {}
+        for key in ["policy_codes", "applied_policies", "dominant_policy_code"]:
+            _policy_linker_add_code(fallback_codes, nested_linker.get(key))
+
+        if fallback_codes:
+            policy_link["policy_codes"] = fallback_codes
+            policy_link["linked"] = True
+            policy_link["linked_by"] = "executive_policy_top_level_fallback"
+
+    if not policy_link.get("active_policy_codes") and isinstance(executive_policy, dict):
+        active_codes = []
+        for key in ["active_policy_codes", "active_codes"]:
+            _policy_linker_add_code(active_codes, executive_policy.get(key))
+        if active_codes:
+            policy_link["active_policy_codes"] = active_codes
+
+    if not policy_link.get("dominant_policy_code") and isinstance(executive_policy, dict):
+        policy_link["dominant_policy_code"] = (
+            executive_policy.get("dominant_policy_code")
+            or executive_policy.get("dominant_code")
+        )
+
+    policy_codes = policy_link.get("policy_codes") or []
+    active_policy_codes = policy_link.get("active_policy_codes") or []
+
+    decision_result["policy_codes"] = policy_codes
+    decision_result["active_policy_codes"] = active_policy_codes
+    decision_result["applied_policies"] = policy_codes
+    decision_result["dominant_policy_code"] = policy_link.get("dominant_policy_code")
+    decision_result["policy_linker"] = policy_link
+
+    # Mantém o executive_policy também enriquecido, para compatibilidade com
+    # relatórios humanos e wrappers que mesclam payload/result.
+    if isinstance(executive_policy, dict):
+        executive_policy.setdefault("policy_codes", policy_codes)
+        executive_policy.setdefault("active_policy_codes", active_policy_codes)
+        executive_policy.setdefault("applied_policies", policy_codes)
+        executive_policy.setdefault("dominant_policy_code", policy_link.get("dominant_policy_code"))
+        executive_policy.setdefault("policy_linker", policy_link)
+        decision_result["executive_policy"] = executive_policy
+
+    return decision_result
+
+
 def append_decision_log(payload, decision_result):
     payload = payload or {}
     result = decision_result or {}
@@ -5412,20 +5491,11 @@ def append_decision_log(payload, decision_result):
     allowed = bool(result.get("allowed"))
     state = "VERIFY" if allowed and str(result.get("mode") or "").upper() == "VERIFY" else ("DENIED" if not allowed else str(result.get("mode") or "ALLOW").upper())
 
-    # V2.1.5 — Main Integration / Persist Linker no Log Real
-    # O Policy Decision Linker já aparecia na resposta HTTP, mas precisava estar
-    # dentro do objeto entregue ao append_decision_log e também no arquivo usado
-    # pelo History (/data/decision_log.jsonl). Isso permite que /policyeffect
-    # reconheça policy_codes de forma explícita no rebuild.
-    policy_link = extract_policy_decision_link(result, payload)
-    try:
-        result["policy_codes"] = policy_link.get("policy_codes") or []
-        result["active_policy_codes"] = policy_link.get("active_policy_codes") or []
-        result["applied_policies"] = policy_link.get("policy_codes") or []
-        result["dominant_policy_code"] = policy_link.get("dominant_policy_code")
-        result["policy_linker"] = policy_link
-    except Exception:
-        pass
+    # V2.1.7 — Top-Level Policy Link Persistence
+    # Enriquecimento ocorre antes de montar o item persistido, garantindo que
+    # o JSONL, o History wrapper e a resposta HTTP tenham os mesmos links.
+    enrich_decision_result_with_policy_links(result, payload)
+    policy_link = result.get("policy_linker") if isinstance(result.get("policy_linker"), dict) else extract_policy_decision_link(result, payload)
 
     item = {
         "ts": data_hora_sp_str(),
@@ -6499,7 +6569,9 @@ def can_open_trade_decision(payload: dict):
             "execution": broker_status_payload(),
         }
         try:
+            enrich_decision_result_with_policy_links(decision_result, payload)
             append_decision_log(payload, decision_result)
+            enrich_decision_result_with_policy_links(decision_result, payload)
         except Exception as exc:
             print("ERRO decision log:", exc)
         return decision_result
@@ -6648,7 +6720,9 @@ def can_open_trade_decision(payload: dict):
         "execution": broker_status_payload(),
     }
     try:
+        enrich_decision_result_with_policy_links(decision_result, payload)
         append_decision_log(payload, decision_result)
+        enrich_decision_result_with_policy_links(decision_result, payload)
         decision_result["decision_log_saved"] = True
     except Exception as exc:
         print("ERRO decision log:", repr(exc))
@@ -9789,6 +9863,27 @@ def executions_route():
 def decisionlog_route():
     arg = request.args.get("q") or request.args.get("symbol") or request.args.get("bot")
     return {"text": build_decision_log_report(arg)}
+
+
+@app.route("/decisionlograw")
+@app.route("/decisionlog/raw")
+def decisionlog_raw_route():
+    """
+    V2.1.7 — diagnóstico bruto do decision_log.
+    Mostra as últimas linhas com policy_codes/policy_linker para validar persistência.
+    """
+    try:
+        limit = int(request.args.get("limit", "5"))
+    except Exception:
+        limit = 5
+    limit = max(1, min(limit, 50))
+    items = decision_log_items(limit=limit)
+    return {
+        "ok": True,
+        "version": "2026-07-05-MAIN-POLICY-LINK-PERSISTENCE-V2.1.7",
+        "decision_log_file": str(CENTRAL_DECISION_LOG_FILE),
+        "items": items,
+    }
 
 
 @app.route("/timeline")
