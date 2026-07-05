@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-LEARNING-V2.1.5
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-REAL-PNL-R-MAPPER-V2.4
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -558,6 +558,18 @@ except Exception as _trade_registry_import_exc:
     TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_import_exc)
 else:
     TRADE_REGISTRY_IMPORT_ERROR = None
+
+# ==========================================================
+# REAL PNL/R MAPPER V2.4 — IMPORT SEGURO
+# ==========================================================
+try:
+    import real_pnl_r_mapper
+    REAL_PNL_R_MAPPER_AVAILABLE = True
+    REAL_PNL_R_MAPPER_IMPORT_ERROR = None
+except Exception as _real_pnl_r_mapper_exc:
+    real_pnl_r_mapper = None
+    REAL_PNL_R_MAPPER_AVAILABLE = False
+    REAL_PNL_R_MAPPER_IMPORT_ERROR = str(_real_pnl_r_mapper_exc)
 
 BOT_NAME = os.environ.get("BOT_NAME", "Central Quant PRO FULL")
 TIMEZONE_BR = timezone(timedelta(hours=-3))
@@ -2240,6 +2252,99 @@ def policy_effect_health_route():
             "ok": False,
             "module": "executive_policy_learning_v2",
             "route": "/policyeffecthealth",
+            "error": str(exc),
+        }, 500
+
+
+
+
+@app.route("/realpnlr/health", methods=["GET"])
+def real_pnl_r_health_route():
+    """
+    Health check do Real PnL/R Mapper V2.4.
+    Observacional: não executa ordens, não altera lotes e não muda risco real.
+    """
+    try:
+        return {
+            "ok": True,
+            "module": "real_pnl_r_mapper",
+            "available": REAL_PNL_R_MAPPER_AVAILABLE,
+            "import_error": REAL_PNL_R_MAPPER_IMPORT_ERROR,
+            "version": getattr(real_pnl_r_mapper, "VERSION", "unavailable") if REAL_PNL_R_MAPPER_AVAILABLE else "unavailable",
+            "mode": "OBSERVATION_ONLY",
+            "notes": [
+                "V2.4 mapeia PnL real e R real de trades encerrados.",
+                "Não executa ordens, não altera lotes e não muda risco real.",
+            ],
+        }, 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "real_pnl_r_mapper",
+            "route": "/realpnlr/health",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/realpnlr", methods=["GET"])
+def real_pnl_r_dashboard_route():
+    """
+    Dashboard JSON do Real PnL/R Mapper V2.4.
+    commit=true grava o snapshot/mapa em arquivo; commit=false roda apenas leitura.
+    """
+    try:
+        if not REAL_PNL_R_MAPPER_AVAILABLE:
+            return {
+                "ok": False,
+                "module": "real_pnl_r_mapper",
+                "available": False,
+                "error": REAL_PNL_R_MAPPER_IMPORT_ERROR,
+            }, 500
+
+        commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        try:
+            limit = int(request.args.get("limit", "5000"))
+        except Exception:
+            limit = 5000
+
+        return real_pnl_r_mapper.build_real_pnl_r_map(limit=limit, commit=commit), 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "real_pnl_r_mapper",
+            "route": "/realpnlr",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/realpnlr/text", methods=["GET"])
+def real_pnl_r_text_route():
+    """
+    Relatório textual do Real PnL/R Mapper V2.4.
+    Ideal para Telegram/validação rápida após deploy.
+    """
+    try:
+        if not REAL_PNL_R_MAPPER_AVAILABLE:
+            text = "❌ Real PnL/R Mapper indisponível: " + str(REAL_PNL_R_MAPPER_IMPORT_ERROR)
+            return {"ok": False, "text": text}, 500
+
+        commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        try:
+            limit = int(request.args.get("limit", "5000"))
+        except Exception:
+            limit = 5000
+
+        payload = real_pnl_r_mapper.build_real_pnl_r_map(limit=limit, commit=commit)
+        return {
+            "ok": True,
+            "text": real_pnl_r_mapper.build_real_pnl_r_text(payload),
+            "payload": payload,
+        }, 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "real_pnl_r_mapper",
+            "route": "/realpnlr/text",
             "error": str(exc),
         }, 500
 
