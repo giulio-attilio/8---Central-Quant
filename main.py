@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-LEARNING-V2.0-MEMORY-FIX
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-EFFECT-REBUILD-V2.0.1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -276,6 +276,8 @@ try:
         get_executive_policy_learning_v2_health,
         build_policy_compare_report,
         build_policy_insights_report,
+        rebuild_executive_policy_effect,
+        build_policy_effect_rebuild_report,
     )
     EXECUTIVE_POLICY_LEARNING_LOADED = True
     EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR = None
@@ -405,6 +407,24 @@ except Exception as e:
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
         )
+
+    def rebuild_executive_policy_effect(commit=True, max_decisions=None):
+        return {
+            "ok": False,
+            "module": "executive_policy_learning_v2",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
+            "rebuild": False,
+        }
+
+    def build_policy_effect_rebuild_report(result=None):
+        return (
+            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.1\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
+        )
+
 
 
 
@@ -2115,6 +2135,34 @@ def policy_effect_route():
             "🧠 EXECUTIVE POLICY LEARNING V2.0 — POLICY EFFECT\n"
             "Status: ❌\n"
             f"Erro na rota /policyeffect: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+
+
+@app.route("/policyeffectrebuild", methods=["GET"])
+@app.route("/executive/policy/learning/effect/rebuild", methods=["GET"])
+def policy_effect_rebuild_route():
+    """
+    Rebuild completo da correlação Policy Timeline + Decision Log.
+    Não executa trades e não altera policies reais.
+    """
+    try:
+        check_only = str(request.args.get("check_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        try:
+            max_decisions = int(request.args.get("max_decisions", "700"))
+        except Exception:
+            max_decisions = 700
+        result = rebuild_executive_policy_effect(commit=not check_only, max_decisions=max_decisions)
+        report = build_policy_effect_rebuild_report(result)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.1\n"
+            "Status: ❌\n"
+            f"Erro na rota /policyeffectrebuild: {exc}",
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
         )
