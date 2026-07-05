@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-PROFILER-V1.3.1.2
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-PROFILER-V1.4
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -330,33 +330,9 @@ from executive_decision_engine import (
 )
 
 
-app = Flask(__name__)
 
 # ==========================================================
-# MEMORY PROFILER — ALIASES DEFENSIVOS V1.3.1
-# ==========================================================
-try:
-    MEMORY_PROFILER_LOADED
-except NameError:
-    MEMORY_PROFILER_LOADED = False
-
-try:
-    MEMORY_PROFILER_ERROR
-except NameError:
-    try:
-        MEMORY_PROFILER_ERROR = MEMORY_PROFILER_ERROR
-    except NameError:
-        MEMORY_PROFILER_ERROR = None
-
-try:
-    memory_profiler
-except NameError:
-    memory_profiler = None
-
-
-
-# ==========================================================
-# MEMORY PROFILER V1 — IMPORT SEGURO
+# MEMORY PROFILER V1.4 — IMPORT SEGURO
 # ==========================================================
 try:
     import memory_profiler_v1 as memory_profiler
@@ -367,6 +343,7 @@ except Exception as _memory_profiler_exc:
     MEMORY_PROFILER_LOADED = False
     MEMORY_PROFILER_ERROR = str(_memory_profiler_exc)
 
+app = Flask(__name__)
 
 try:
     import broker as central_broker
@@ -1411,17 +1388,52 @@ def home():
     return f"{BOT_NAME} Online"
 
 
+@app.route("/memory")
+def memory_profiler_route():
+    """
+    Memory Profiler V1.4.
+    Endpoint leve.
+    Não inclui legacy_memory.
+    Não inclui text.
+    Não chama build_memory_report().
+    Uma chamada HTTP = um único snapshot.
+    """
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+            return memory_profiler.build_memory_json(deep=deep, include_text=False), 200
+        return {"ok": False, "loaded": False, "error": MEMORY_PROFILER_ERROR}, 500
+    except Exception as exc:
+        return {"ok": False, "route": "/memory", "error": str(exc)}, 500
+
+
+@app.route("/memorytext")
+def memory_profiler_text_route():
+    """
+    Relatório texto separado.
+    """
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+            return memory_profiler.build_memory_report(include_tracemalloc=deep, deep=deep), 200, {"Content-Type": "text/plain; charset=utf-8"}
+        return f"Memory Profiler não carregado: {MEMORY_PROFILER_ERROR}", 500, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return f"Erro no /memorytext: {exc}", 500, {"Content-Type": "text/plain; charset=utf-8"}
+
 
 @app.route("/memorylegacy")
 def memory_legacy_route():
     """
     Comparação opcional com o monitor legado.
-    Não usado pelo /memory padrão para evitar duplicidade de medição.
+    Separado do /memory para evitar duplicidade de medição.
     """
     try:
         return memory_status_payload(run_gc=False, label="/memory_legacy")
     except Exception as exc:
         return {"ok": False, "route": "/memorylegacy", "error": str(exc)}, 500
+
+
+
 
 
 @app.route("/eventbus/status")
@@ -3146,40 +3158,6 @@ def runners():
     }
 
 
-
-@app.route("/memory")
-def memory_profiler_route():
-    """
-    Memory Profiler V1.3.1.
-    Endpoint leve.
-    Não inclui legacy_memory.
-    Não inclui text.
-    Não chama build_memory_report().
-    Uma chamada HTTP = um único snapshot.
-    """
-    try:
-        if MEMORY_PROFILER_LOADED and memory_profiler:
-            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
-            return memory_profiler.build_memory_json(deep=deep, include_text=False), 200
-        return {"ok": False, "loaded": False, "error": MEMORY_PROFILER_ERROR}, 500
-    except Exception as exc:
-        return {"ok": False, "route": "/memory", "error": str(exc)}, 500
-
-
-@app.route("/memorytext")
-def memory_profiler_text_route():
-    """
-    Relatório texto separado.
-    Usar pelo navegador apenas quando quiser ler o texto.
-    Telegram também pode usar build_memory_report().
-    """
-    try:
-        if MEMORY_PROFILER_LOADED and memory_profiler:
-            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
-            return memory_profiler.build_memory_report(include_tracemalloc=deep, deep=deep), 200, {"Content-Type": "text/plain; charset=utf-8"}
-        return f"Memory Profiler não carregado: {MEMORY_PROFILER_ERROR}", 500, {"Content-Type": "text/plain; charset=utf-8"}
-    except Exception as exc:
-        return f"Erro no /memorytext: {exc}", 500, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 

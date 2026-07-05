@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Memory Profiler V1.3.1.1 — Central Quant
-Versão: 2026-07-05-MEMORY-PROFILER-V1.3.1.1
+Memory Profiler V1.4 — Central Quant
+Versão: 2026-07-05-MEMORY-PROFILER-V1.4
 
 Correção V1.3.1:
 - /memory Telegram: texto leve, 1 snapshot.
@@ -24,7 +24,7 @@ import traceback
 from datetime import datetime
 from collections import Counter
 
-VERSION = "2026-07-05-MEMORY-PROFILER-V1.3.1.1"
+VERSION = "2026-07-05-MEMORY-PROFILER-V1.4"
 
 DATA_DIR = os.environ.get("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
 SNAPSHOT_FILE = os.path.join(DATA_DIR, "memory_profiler_snapshots.jsonl")
