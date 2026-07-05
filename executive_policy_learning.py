@@ -2933,3 +2933,1260 @@ def build_policy_effect_rebuild_report(result=None):
     ]
 
     return "\n".join(lines)
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.2 — POLICY OUTCOME LINKER
+# ==========================================================
+# Objetivo:
+# - Manter a V2.1.8 funcionando como Policy Effect.
+# - Adicionar cruzamento observacional entre policy↔decision e outcomes/lifecycle.
+# - Não executa trades.
+# - Não altera policies.
+# - Não altera risco, lote, prioridade ou execução real.
+#
+# Fontes tentadas:
+# - decision_log.jsonl resolvido pela V2.1.8
+# - history_events.jsonl
+# - outcome_log.jsonl
+# - paper_lifecycle_log.jsonl
+# - paper_integrated_log.jsonl
+# - trade_registry.json
+# - history_export.json
+#
+# Observação:
+# - Quando não houver outcome fechado, mantém outcome_status=WAITING_OUTCOME.
+# - Para decisões DENY/BLOCK, não inventa PnL evitado; marca como no_executed_trade_outcome.
+# - PnL por policy só é confiável quando os eventos de ciclo/trade fechado tiverem
+#   trade_id/signal_id ou chaves suficientes para correlação.
+
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2"
+POLICY_OUTCOME_WINDOW_DAYS = int(os.environ.get("EXECUTIVE_POLICY_OUTCOME_WINDOW_DAYS", "21"))
+POLICY_OUTCOME_MAX_EVENTS = int(os.environ.get("EXECUTIVE_POLICY_OUTCOME_MAX_EVENTS", "12000"))
+
+# Referências para compatibilidade com a V2.1.8.
+_V218_effect_policy_template = _effect_policy_template
+_V218_apply_decision_to_effect = _apply_decision_to_effect
+_V218_recompute_effect_summary = _recompute_effect_summary
+
+_CURRENT_OUTCOME_INDEX = None
+_CURRENT_OUTCOME_SOURCES = []
+
+
+def _ci_get(d, key, default=None):
+    if not isinstance(d, dict):
+        return default
+    if key in d:
+        return d.get(key)
+    key_l = str(key).lower()
+    for k, v in d.items():
+        try:
+            if str(k).lower() == key_l:
+                return v
+        except Exception:
+            continue
+    return default
+
+
+def _deep_get_any(obj, keys, depth=0):
+    if depth > 6 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for key in keys:
+            value = _ci_get(obj, key)
+            if value not in (None, ""):
+                return value
+        for nested_key in ["raw", "payload", "trade", "position", "data", "details", "context", "result", "decision_result", "execution"]:
+            child = _ci_get(obj, nested_key)
+            if isinstance(child, (dict, list)):
+                found = _deep_get_any(child, keys, depth + 1)
+                if found not in (None, ""):
+                    return found
+    elif isinstance(obj, list):
+        for item in obj[:20]:
+            found = _deep_get_any(item, keys, depth + 1)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _deep_values_for_keys(obj, keys, depth=0, out=None):
+    if out is None:
+        out = []
+    if depth > 6 or obj is None:
+        return out
+    if isinstance(obj, dict):
+        for key in keys:
+            value = _ci_get(obj, key)
+            if value not in (None, ""):
+                out.append(value)
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                _deep_values_for_keys(value, keys, depth + 1, out)
+    elif isinstance(obj, list):
+        for item in obj[:30]:
+            if isinstance(item, (dict, list)):
+                _deep_values_for_keys(item, keys, depth + 1, out)
+    return out
+
+
+def _normalize_key_value(value):
+    if value is None:
+        return None
+    txt = str(value).strip()
+    if not txt or txt.lower() in {"none", "null", "nan"}:
+        return None
+    return txt.upper()
+
+
+def _decision_identity(decision):
+    """Identidade robusta para correlacionar decisão com outcome."""
+    ids = []
+    for value in _deep_values_for_keys(decision, [
+        "trade_id", "signal_id", "decision_id", "id", "uid", "position_id", "order_id", "client_order_id"
+    ]):
+        norm = _normalize_key_value(value)
+        if norm and len(norm) <= 180 and norm not in ids:
+            ids.append(norm)
+
+    fields = _extract_trade_fields(decision)
+    bot = _normalize_key_value(fields.get("bot")) or "UNKNOWN"
+    symbol = _normalize_key_value(fields.get("symbol")) or "UNKNOWN"
+    side = _normalize_key_value(fields.get("side")) or "UNKNOWN"
+    setup = _normalize_key_value(fields.get("setup")) or "UNKNOWN"
+
+    # Evita chaves claramente quebradas vindas de wrappers antigos.
+    if symbol in {"", "UNKNOWN", "NONE"}:
+        sym2 = _normalize_key_value(_deep_get_any(decision, ["symbol", "symbol_clean", "ativo", "pair"]))
+        if sym2:
+            symbol = sym2
+    if side in {"", "UNKNOWN", "NONE"}:
+        side2 = _normalize_key_value(_deep_get_any(decision, ["side", "direction"]))
+        if side2:
+            side = side2
+
+    composite = f"{bot}|{symbol}|{side}|{setup}"
+    return {
+        "ids": ids,
+        "bot": bot,
+        "symbol": symbol,
+        "side": side,
+        "setup": setup,
+        "composite": composite,
+        "dt": _decision_time(decision),
+    }
+
+
+def _outcome_identity(event):
+    ids = []
+    for value in _deep_values_for_keys(event, [
+        "trade_id", "signal_id", "decision_id", "id", "uid", "position_id", "order_id", "client_order_id"
+    ]):
+        norm = _normalize_key_value(value)
+        if norm and len(norm) <= 180 and norm not in ids:
+            ids.append(norm)
+
+    bot = _normalize_key_value(_deep_get_any(event, ["bot", "robot", "source_bot"])) or "UNKNOWN"
+    symbol = _normalize_key_value(_deep_get_any(event, ["symbol", "symbol_clean", "ativo", "pair"])) or "UNKNOWN"
+    side = _normalize_key_value(_deep_get_any(event, ["side", "direction"])) or "UNKNOWN"
+    setup = _normalize_key_value(_deep_get_any(event, ["setup", "strategy", "signal_type", "setup_label"])) or "UNKNOWN"
+    dt = _event_time(event) or _parse_dt_any(_deep_get_any(event, ["closed_at", "exit_at", "updated_at", "ts", "timestamp"]))
+    return {
+        "ids": ids,
+        "bot": bot,
+        "symbol": symbol,
+        "side": side,
+        "setup": setup,
+        "composite": f"{bot}|{symbol}|{side}|{setup}",
+        "dt": dt,
+    }
+
+
+def _extract_numeric_any(event, keys, default=None):
+    value = _deep_get_any(event, keys)
+    if value in (None, ""):
+        return default
+    try:
+        return float(str(value).replace("%", "").replace(",", "."))
+    except Exception:
+        return default
+
+
+def _extract_outcome_payload(event):
+    """Extrai resultado fechado de um evento/decisão, sem inventar dados."""
+    if not isinstance(event, dict):
+        return None
+
+    outcome_text = _deep_get_any(event, [
+        "outcome", "result_outcome", "trade_outcome", "closed_result", "pnl_result", "lifecycle_outcome", "result", "status"
+    ])
+    pnl_pct = _extract_numeric_any(event, [
+        "pnl_pct", "result_pct", "profit_pct", "pnl_percent", "return_pct", "pnl_total_pct"
+    ])
+    result_r = _extract_numeric_any(event, [
+        "result_r", "pnl_r", "r", "r_result", "r_multiple", "profit_r"
+    ])
+    pnl_usdt = _extract_numeric_any(event, [
+        "pnl_usdt", "pnl", "profit_usdt", "realized_pnl", "net_pnl", "pnl_total_usdt"
+    ])
+
+    text_blob = ""
+    try:
+        text_blob = json.dumps(event, ensure_ascii=False).upper()
+    except Exception:
+        text_blob = str(event).upper()
+
+    event_type = str(_deep_get_any(event, ["event", "event_type", "type", "action"]) or "").upper()
+
+    has_close_signal = any(token in text_blob for token in [
+        "TRADE_CLOSED", "CLOSED", "FECHADO", "ENCERRADO", "STOP", "TP50", "TAKE_PROFIT", "TAKE PROFIT", "LOSS", "WIN"
+    ]) or any(token in event_type for token in ["CLOSE", "CLOSED", "TRADE_CLOSED", "ENCERRADO"])
+
+    has_numeric = pnl_pct is not None or result_r is not None or pnl_usdt is not None
+    if not has_close_signal and not has_numeric and not outcome_text:
+        return None
+
+    label = str(outcome_text or "").upper()
+    if not label or label in {"ALLOW", "DENY", "BLOCK", "VERIFY", "OPEN", "NONE", "NULL"}:
+        if result_r is not None:
+            label = "WIN" if result_r > 0 else "LOSS" if result_r < 0 else "BREAKEVEN"
+        elif pnl_pct is not None:
+            label = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < 0 else "BREAKEVEN"
+        elif pnl_usdt is not None:
+            label = "WIN" if pnl_usdt > 0 else "LOSS" if pnl_usdt < 0 else "BREAKEVEN"
+        elif "LOSS" in text_blob or "STOP" in text_blob:
+            label = "LOSS"
+        elif "WIN" in text_blob or "TAKE" in text_blob or "TP" in text_blob:
+            label = "WIN"
+        else:
+            label = "UNKNOWN"
+
+    return {
+        "label": label,
+        "pnl_pct": pnl_pct,
+        "result_r": result_r,
+        "pnl_usdt": pnl_usdt,
+        "event_type": event_type,
+        "dt": _outcome_identity(event).get("dt"),
+        "source_event": str(_deep_get_any(event, ["source", "event", "event_type"]) or "unknown")[:80],
+    }
+
+
+def _read_jsonl_tail_items(path, max_items=POLICY_OUTCOME_MAX_EVENTS, max_bytes=6 * 1024 * 1024):
+    items = []
+    try:
+        path = Path(path)
+        if not path.exists():
+            return []
+        with open(path, "rb") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size > max_bytes:
+                    f.seek(size - max_bytes)
+                    f.readline()
+                else:
+                    f.seek(0)
+            except Exception:
+                f.seek(0)
+            for line in f:
+                if len(items) >= max_items:
+                    break
+                try:
+                    obj = json.loads(line.decode("utf-8").strip())
+                    if isinstance(obj, dict):
+                        items.append(obj)
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return items
+
+
+def _policy_outcome_candidate_paths():
+    paths = []
+
+    def add(value):
+        try:
+            if not value:
+                return
+            p = Path(str(value))
+            if p not in paths:
+                paths.append(p)
+        except Exception:
+            pass
+
+    data_dirs = [DATA_DIR, BASE_DIR / "data", Path("/data"), Path("/opt/render/project/src/data")]
+    for env_name in ["CENTRAL_DATA_DIR", "DATA_DIR"]:
+        if os.environ.get(env_name):
+            data_dirs.append(Path(os.environ.get(env_name)))
+
+    names = [
+        "history_events.jsonl",
+        "outcome_log.jsonl",
+        "paper_lifecycle_log.jsonl",
+        "paper_integrated_log.jsonl",
+        "paper_executor_integrated_log.jsonl",
+        "execution_engine_log.jsonl",
+        "trade_lifecycle_log.jsonl",
+        "decision_log.jsonl",
+    ]
+    for d in data_dirs:
+        for name in names:
+            add(Path(d) / name)
+
+    # Arquivos JSON agregados.
+    for d in data_dirs:
+        for name in ["trade_registry.json", "history_export.json", "execution_stats.json"]:
+            add(Path(d) / name)
+
+    # Tenta descobrir caminhos exportados por módulos existentes.
+    for module_name in ["history_manager", "paper_lifecycle", "outcome_evaluator", "paper_executor_integrated", "trade_registry"]:
+        try:
+            mod = __import__(module_name)
+            for attr in [
+                "HISTORY_EVENTS_FILE", "OUTCOME_LOG_FILE", "PAPER_LIFECYCLE_LOG_FILE", "PAPER_INTEGRATED_LOG_FILE",
+                "TRADE_REGISTRY_FILE", "HISTORY_EXPORT_FILE", "LOG_FILE", "EVENTS_FILE"
+            ]:
+                add(getattr(mod, attr, None))
+        except Exception:
+            continue
+
+    out = []
+    seen = set()
+    for p in paths:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _flatten_json_container(obj):
+    """Extrai eventos de JSONs agregados como trade_registry/history_export."""
+    out = []
+    if isinstance(obj, dict):
+        # Estruturas comuns.
+        for key in ["events", "history", "items", "closed_trades", "trades", "outcomes", "data"]:
+            child = obj.get(key)
+            if isinstance(child, list):
+                out.extend([x for x in child if isinstance(x, dict)])
+            elif isinstance(child, dict):
+                out.extend(_flatten_json_container(child))
+        # trade_registry: open_trades dict / closed_trades list/dict.
+        for key in ["closed_trades", "closed", "positions", "registry"]:
+            child = obj.get(key)
+            if isinstance(child, dict):
+                out.extend([v for v in child.values() if isinstance(v, dict)])
+        # Se ele próprio parece evento, inclui.
+        if _extract_outcome_payload(obj):
+            out.append(obj)
+    elif isinstance(obj, list):
+        out.extend([x for x in obj if isinstance(x, dict)])
+    return out
+
+
+def _load_policy_outcome_index():
+    """Carrega outcomes/lifecycle em índices por id e por composite."""
+    by_id = {}
+    by_composite = {}
+    sources = []
+    total_events = 0
+    total_outcomes = 0
+
+    for path in _policy_outcome_candidate_paths():
+        exists = Path(path).exists()
+        source_info = {"path": str(path), "exists": bool(exists), "events": 0, "outcomes": 0}
+        if not exists:
+            sources.append(source_info)
+            continue
+
+        events = []
+        try:
+            if str(path).endswith(".jsonl"):
+                events = _read_jsonl_tail_items(path, max_items=POLICY_OUTCOME_MAX_EVENTS)
+            elif str(path).endswith(".json"):
+                raw = _read_json(path, {})
+                events = _flatten_json_container(raw)
+        except Exception:
+            events = []
+
+        source_info["events"] = len(events)
+        total_events += len(events)
+
+        for event in events:
+            outcome = _extract_outcome_payload(event)
+            if not outcome:
+                continue
+            ident = _outcome_identity(event)
+            payload = {
+                "event": event,
+                "outcome": outcome,
+                "identity": ident,
+                "source_file": str(path),
+            }
+            for idv in ident.get("ids") or []:
+                by_id.setdefault(idv, []).append(payload)
+            comp = ident.get("composite")
+            if comp:
+                by_composite.setdefault(comp, []).append(payload)
+            total_outcomes += 1
+
+        source_info["outcomes"] = total_outcomes - sum(x.get("outcomes", 0) for x in sources if isinstance(x, dict))
+        sources.append(source_info)
+
+    # Ordena candidatos por data para match por tempo.
+    for bucket in list(by_id.values()) + list(by_composite.values()):
+        try:
+            bucket.sort(key=lambda x: x.get("identity", {}).get("dt") or datetime.max)
+        except Exception:
+            pass
+
+    index = {
+        "by_id": by_id,
+        "by_composite": by_composite,
+        "sources": sources,
+        "total_events_loaded": total_events,
+        "total_outcomes_loaded": total_outcomes,
+        "loaded_at": _now(),
+    }
+    return index
+
+
+def _choose_best_outcome(decision, candidates):
+    if not candidates:
+        return None
+    ident = _decision_identity(decision)
+    decision_dt = ident.get("dt")
+    if not decision_dt:
+        return candidates[0]
+
+    max_seconds = max(1, POLICY_OUTCOME_WINDOW_DAYS) * 86400
+    best = None
+    best_score = None
+    for item in candidates:
+        odt = (item.get("identity") or {}).get("dt") or (item.get("outcome") or {}).get("dt")
+        if odt:
+            delta = (odt - decision_dt).total_seconds()
+            # Outcome normalmente ocorre depois da decisão. Aceita pequena inversão por timezone/log.
+            if delta < -6 * 3600 or delta > max_seconds:
+                continue
+            score = abs(delta)
+        else:
+            score = max_seconds + 1
+        if best is None or score < best_score:
+            best = item
+            best_score = score
+    return best or candidates[0]
+
+
+def _find_outcome_for_decision(decision, outcome_index=None):
+    outcome_index = outcome_index or _CURRENT_OUTCOME_INDEX
+    if not outcome_index:
+        return None
+
+    # Resultado já embutido na própria decisão.
+    direct = _extract_outcome_payload(decision)
+    if direct and (direct.get("pnl_pct") is not None or direct.get("result_r") is not None or direct.get("pnl_usdt") is not None):
+        return {"outcome": direct, "identity": _decision_identity(decision), "source_file": "decision_log_embedded", "event": decision}
+
+    ident = _decision_identity(decision)
+    candidates = []
+    for idv in ident.get("ids") or []:
+        candidates.extend((outcome_index.get("by_id") or {}).get(idv, []))
+    if candidates:
+        return _choose_best_outcome(decision, candidates)
+
+    comp = ident.get("composite")
+    if comp:
+        candidates = (outcome_index.get("by_composite") or {}).get(comp, [])
+        if candidates:
+            return _choose_best_outcome(decision, candidates)
+
+    # Fallback sem setup quando setup veio quebrado/ausente.
+    comp2 = f"{ident.get('bot')}|{ident.get('symbol')}|{ident.get('side')}|UNKNOWN"
+    candidates = (outcome_index.get("by_composite") or {}).get(comp2, [])
+    if candidates:
+        return _choose_best_outcome(decision, candidates)
+
+    return None
+
+
+def _ensure_outcome_fields(policy):
+    policy.setdefault("outcomes", 0)
+    policy.setdefault("wins", 0)
+    policy.setdefault("losses", 0)
+    policy.setdefault("breakeven", 0)
+    policy.setdefault("outcome_unknown", 0)
+    policy.setdefault("waiting_outcome", 0)
+    policy.setdefault("no_executed_trade_outcome", 0)
+    policy.setdefault("pnl_total_pct", 0.0)
+    policy.setdefault("pnl_avg_pct", 0.0)
+    policy.setdefault("pnl_total_usdt", 0.0)
+    policy.setdefault("pnl_avg_usdt", 0.0)
+    policy.setdefault("result_r_total", 0.0)
+    policy.setdefault("result_r_avg", 0.0)
+    policy.setdefault("gross_profit_pct", 0.0)
+    policy.setdefault("gross_loss_pct", 0.0)
+    policy.setdefault("profit_factor_pct", None)
+    policy.setdefault("win_rate_pct", 0.0)
+    policy.setdefault("max_drawdown_pct", 0.0)
+    policy.setdefault("pnl_curve_pct", [])
+    policy.setdefault("last_outcome_at", None)
+    policy.setdefault("last_outcome_source", None)
+    policy.setdefault("outcome_status", "WAITING_OUTCOME")
+
+
+def _recompute_policy_outcome_metrics(policy):
+    _ensure_outcome_fields(policy)
+    outcomes = max(0, _safe_int(policy.get("outcomes")))
+    wins = _safe_int(policy.get("wins"))
+    losses = _safe_int(policy.get("losses"))
+
+    if outcomes > 0:
+        policy["pnl_avg_pct"] = round(_safe_float(policy.get("pnl_total_pct")) / outcomes, 4)
+        policy["pnl_avg_usdt"] = round(_safe_float(policy.get("pnl_total_usdt")) / outcomes, 4)
+        policy["result_r_avg"] = round(_safe_float(policy.get("result_r_total")) / outcomes, 4)
+        policy["win_rate_pct"] = round((wins / outcomes) * 100.0, 2)
+    else:
+        policy["pnl_avg_pct"] = 0.0
+        policy["pnl_avg_usdt"] = 0.0
+        policy["result_r_avg"] = 0.0
+        policy["win_rate_pct"] = 0.0
+
+    gp = _safe_float(policy.get("gross_profit_pct"), 0.0)
+    gl = abs(_safe_float(policy.get("gross_loss_pct"), 0.0))
+    if gl > 0:
+        policy["profit_factor_pct"] = round(gp / gl, 4)
+    elif gp > 0:
+        policy["profit_factor_pct"] = 999.0
+    else:
+        policy["profit_factor_pct"] = None
+
+    curve = policy.get("pnl_curve_pct") or []
+    peak = 0.0
+    max_dd = 0.0
+    for v in curve:
+        try:
+            x = float(v)
+        except Exception:
+            continue
+        if x > peak:
+            peak = x
+        dd = peak - x
+        if dd > max_dd:
+            max_dd = dd
+    policy["max_drawdown_pct"] = round(max_dd, 4)
+
+    if outcomes > 0:
+        policy["outcome_status"] = "OUTCOME_LINKED"
+    elif _safe_int(policy.get("no_executed_trade_outcome")) > 0:
+        policy["outcome_status"] = "NO_EXECUTED_TRADE_OUTCOME"
+    else:
+        policy["outcome_status"] = "WAITING_OUTCOME"
+
+
+def _apply_outcome_to_policy(policy, decision, outcome_match):
+    _ensure_outcome_fields(policy)
+    decision_name = _extract_decision(decision)
+
+    # Se a policy bloqueou/negou, não houve trade executado para ter PnL real.
+    if "DENY" in decision_name or "BLOCK" in decision_name:
+        policy["no_executed_trade_outcome"] = _safe_int(policy.get("no_executed_trade_outcome")) + 1
+        _recompute_policy_outcome_metrics(policy)
+        return False
+
+    if not outcome_match:
+        policy["waiting_outcome"] = _safe_int(policy.get("waiting_outcome")) + 1
+        _recompute_policy_outcome_metrics(policy)
+        return False
+
+    outcome = outcome_match.get("outcome") or {}
+    label = str(outcome.get("label") or "UNKNOWN").upper()
+    pnl_pct = outcome.get("pnl_pct")
+    result_r = outcome.get("result_r")
+    pnl_usdt = outcome.get("pnl_usdt")
+
+    policy["outcomes"] = _safe_int(policy.get("outcomes")) + 1
+
+    # Classificação por label ou números.
+    is_win = False
+    is_loss = False
+    is_be = False
+    if any(x in label for x in ["WIN", "TP", "PROFIT", "GAIN"]):
+        is_win = True
+    elif any(x in label for x in ["LOSS", "STOP", "SL"]):
+        is_loss = True
+    elif any(x in label for x in ["BE", "BREAKEVEN", "ZERO"]):
+        is_be = True
+    elif result_r is not None:
+        is_win = float(result_r) > 0
+        is_loss = float(result_r) < 0
+        is_be = float(result_r) == 0
+    elif pnl_pct is not None:
+        is_win = float(pnl_pct) > 0
+        is_loss = float(pnl_pct) < 0
+        is_be = float(pnl_pct) == 0
+    elif pnl_usdt is not None:
+        is_win = float(pnl_usdt) > 0
+        is_loss = float(pnl_usdt) < 0
+        is_be = float(pnl_usdt) == 0
+    else:
+        policy["outcome_unknown"] = _safe_int(policy.get("outcome_unknown")) + 1
+
+    if is_win:
+        policy["wins"] = _safe_int(policy.get("wins")) + 1
+    elif is_loss:
+        policy["losses"] = _safe_int(policy.get("losses")) + 1
+    elif is_be:
+        policy["breakeven"] = _safe_int(policy.get("breakeven")) + 1
+
+    if pnl_pct is not None:
+        pnl_pct = float(pnl_pct)
+        policy["pnl_total_pct"] = round(_safe_float(policy.get("pnl_total_pct")) + pnl_pct, 6)
+        if pnl_pct > 0:
+            policy["gross_profit_pct"] = round(_safe_float(policy.get("gross_profit_pct")) + pnl_pct, 6)
+        elif pnl_pct < 0:
+            policy["gross_loss_pct"] = round(_safe_float(policy.get("gross_loss_pct")) + pnl_pct, 6)
+        curve = policy.setdefault("pnl_curve_pct", [])
+        last = float(curve[-1]) if curve else 0.0
+        curve.append(round(last + pnl_pct, 6))
+        if len(curve) > 500:
+            del curve[:-500]
+
+    if result_r is not None:
+        policy["result_r_total"] = round(_safe_float(policy.get("result_r_total")) + float(result_r), 6)
+
+    if pnl_usdt is not None:
+        policy["pnl_total_usdt"] = round(_safe_float(policy.get("pnl_total_usdt")) + float(pnl_usdt), 6)
+
+    odt = outcome.get("dt")
+    if odt:
+        try:
+            policy["last_outcome_at"] = odt.strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            policy["last_outcome_at"] = str(odt)
+    policy["last_outcome_source"] = outcome_match.get("source_file")
+
+    _recompute_policy_outcome_metrics(policy)
+    return True
+
+
+def _effect_policy_template(code):
+    policy = _V218_effect_policy_template(code)
+    _ensure_outcome_fields(policy)
+    return policy
+
+
+def _apply_decision_to_effect(policy, decision):
+    # Primeiro preserva toda a lógica V2.1.8: decisões, allow/deny, readiness.
+    _V218_apply_decision_to_effect(policy, decision)
+    # Depois adiciona outcome, se existir.
+    outcome_match = _find_outcome_for_decision(decision, _CURRENT_OUTCOME_INDEX)
+    _apply_outcome_to_policy(policy, decision, outcome_match)
+    _score_effect_policy(policy)
+
+
+def _score_effect_policy(policy):
+    """V2.2: mantém score operacional e adiciona influência de outcomes quando houver."""
+    decisions = _safe_int(policy.get("real_decisions", policy.get("decisions")))
+    allow = _safe_int(policy.get("allow"))
+    deny = _safe_int(policy.get("deny"))
+    block = _safe_int(policy.get("block"))
+    reduce_size = _safe_int(policy.get("reduce_size"))
+    no_expansion = _safe_int(policy.get("no_expansion"))
+    outcomes = _safe_int(policy.get("outcomes"))
+    pnl_avg = _safe_float(policy.get("pnl_avg_pct"), 0.0)
+    pf = policy.get("profit_factor_pct")
+    dd = _safe_float(policy.get("max_drawdown_pct"), 0.0)
+
+    sample_score = min(25.0, decisions * 2.0)
+    protection_score = min(25.0, (deny + block + reduce_size + no_expansion) * 3.0)
+    operation_score = min(15.0, allow * 1.5)
+    outcome_score = 0.0
+
+    if outcomes > 0:
+        outcome_score += min(15.0, outcomes * 2.0)
+        if pnl_avg > 0:
+            outcome_score += min(10.0, pnl_avg * 2.0)
+        elif pnl_avg < 0:
+            outcome_score -= min(10.0, abs(pnl_avg) * 2.0)
+        try:
+            if pf is not None and float(pf) >= 1.2:
+                outcome_score += 5.0
+            elif pf is not None and float(pf) < 1.0:
+                outcome_score -= 5.0
+        except Exception:
+            pass
+        if dd > 5:
+            outcome_score -= min(8.0, dd / 2.0)
+
+    balance_score = 10.0
+    if decisions >= 10 and allow >= decisions * 0.9 and (deny + block + reduce_size + no_expansion) == 0:
+        balance_score = 4.0
+    if decisions >= 10 and allow == 0 and (deny + block) >= decisions * 0.9:
+        balance_score = 5.0
+
+    score = max(0.0, min(100.0, sample_score + protection_score + operation_score + balance_score + outcome_score))
+    confidence = min(100.0, (decisions / 20.0) * 100.0)
+
+    if confidence < 35:
+        recommendation = "AGUARDAR_AMOSTRA"
+    elif outcomes >= 10 and pnl_avg < 0:
+        recommendation = "REVISAR_OUTCOME"
+    elif score >= 80:
+        recommendation = "MANTER"
+    elif score >= 60:
+        recommendation = "OBSERVAR"
+    elif score >= 45:
+        recommendation = "REVISAR"
+    else:
+        recommendation = "ENFRAQUECER_OU_APOSENTAR"
+
+    notes = []
+    if decisions < 20:
+        notes.append("Amostra de decisões ainda insuficiente para conclusão robusta.")
+    if deny + block + reduce_size + no_expansion > 0:
+        notes.append("Policy influenciou restrição/controle de risco em decisões.")
+    if allow > 0:
+        notes.append("Policy também conviveu com decisões permitidas.")
+    if outcomes > 0:
+        notes.append("Policy já possui outcomes/lifecycle correlacionados.")
+    else:
+        notes.append("Ainda sem outcomes fechados correlacionados; PnL não conclusivo.")
+    if decisions >= 10 and allow == 0:
+        notes.append("Policy altamente restritiva; PnL evitado exige análise hipotética futura.")
+
+    policy["effect_score"] = round(score, 2)
+    policy["confidence_pct"] = round(confidence, 2)
+    policy["recommendation"] = recommendation
+    policy["notes"] = notes[-6:]
+    _compute_policy_readiness(policy)
+
+
+def _recompute_effect_summary(effect):
+    policies = effect.get("policies") or {}
+    values = [p for p in policies.values() if isinstance(p, dict)]
+
+    for p in values:
+        _ensure_outcome_fields(p)
+        _recompute_policy_outcome_metrics(p)
+        _score_effect_policy(p)
+
+    total_decisions = sum(_safe_int(p.get("real_decisions", p.get("decisions"))) for p in values)
+    total_outcomes = sum(_safe_int(p.get("outcomes")) for p in values)
+    total_pnl_pct = sum(_safe_float(p.get("pnl_total_pct"), 0.0) for p in values)
+    total_pnl_usdt = sum(_safe_float(p.get("pnl_total_usdt"), 0.0) for p in values)
+    wins = sum(_safe_int(p.get("wins")) for p in values)
+    losses = sum(_safe_int(p.get("losses")) for p in values)
+    avg = 0.0
+    if values:
+        avg = sum(_safe_float(p.get("effect_score")) for p in values) / len(values)
+
+    previous_unmatched = _safe_int((effect.get("summary") or {}).get("decisions_unmatched"))
+    ready = sum(1 for p in values if p.get("readiness_label") == "READY_TO_LEARN")
+    caution = sum(1 for p in values if p.get("readiness_label") == "LEARN_WITH_CAUTION")
+    wait = sum(1 for p in values if p.get("readiness_label") == "WAIT_SAMPLE")
+
+    effect["summary"] = {
+        "policy_count": len(values),
+        "decisions_processed": total_decisions,
+        "real_decisions_correlated": total_decisions,
+        "decisions_matched": total_decisions,
+        "decisions_unmatched": previous_unmatched,
+        "outcomes_detected": total_outcomes,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round((wins / total_outcomes) * 100.0, 2) if total_outcomes else 0.0,
+        "pnl_total_pct": round(total_pnl_pct, 4),
+        "pnl_total_usdt": round(total_pnl_usdt, 4),
+        "average_effect_score": round(avg, 2),
+        "ready_to_learn": ready,
+        "learn_with_caution": caution,
+        "wait_sample": wait,
+        "outcome_sources": _CURRENT_OUTCOME_SOURCES,
+        "updated_at": _now(),
+    }
+
+
+def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=None):
+    """
+    V2.2:
+    Lê decisões novas, associa policies por links explícitos/raw-aware e cruza com outcomes/lifecycle.
+    """
+    global _CURRENT_OUTCOME_INDEX, _CURRENT_OUTCOME_SOURCES
+    started = time.time()
+    state = _load_v2_state()
+    effect = _load_effect()
+
+    outcome_index = _load_policy_outcome_index()
+    _CURRENT_OUTCOME_INDEX = outcome_index
+    _CURRENT_OUTCOME_SOURCES = outcome_index.get("sources") or []
+
+    decision_log_path = _resolve_decision_log_file()
+    decision_log_candidates = getattr(_resolve_decision_log_file, "last_candidates", [])
+
+    previous_path = state.get("decision_log_file")
+    if previous_path and str(previous_path) != str(decision_log_path):
+        offset = 0
+    else:
+        offset = _safe_int(state.get("decision_log_offset"), 0)
+
+    max_decisions = int(max_decisions or MAX_DECISIONS_PER_RUN)
+
+    decisions, new_offset, reached_eof = _read_new_jsonl(decision_log_path, offset, max_decisions)
+    policy_events = _read_all_policy_events_light()
+    timeline_seeds_skipped = getattr(_read_all_policy_events_light, "last_skipped_test_seeds", 0)
+
+    processed = 0
+    matched = 0
+    unmatched = 0
+    test_decisions_skipped = 0
+    explicit_policy_links = 0
+    timeline_fallback_links = 0
+    outcomes_linked_now = 0
+
+    policies = effect.setdefault("policies", {})
+
+    for decision in decisions:
+        if _is_test_seed_event(decision):
+            test_decisions_skipped += 1
+            continue
+
+        explicit_codes = _decision_policy_codes(decision)
+        dt = _decision_time(decision)
+        codes = explicit_codes or _active_policy_codes_for_decision(dt, policy_events)
+
+        if not codes:
+            unmatched += 1
+            processed += 1
+            continue
+
+        if explicit_codes:
+            explicit_policy_links += 1
+        else:
+            timeline_fallback_links += 1
+
+        before_outcomes_total = sum(_safe_int((policies.get(c) or {}).get("outcomes")) for c in codes if isinstance(policies.get(c), dict))
+
+        for code in codes:
+            policy = policies.get(code)
+            if not isinstance(policy, dict):
+                policy = _effect_policy_template(code)
+                policies[code] = policy
+            _apply_decision_to_effect(policy, decision)
+            matched += 1
+
+        after_outcomes_total = sum(_safe_int((policies.get(c) or {}).get("outcomes")) for c in codes if isinstance(policies.get(c), dict))
+        if after_outcomes_total > before_outcomes_total:
+            outcomes_linked_now += after_outcomes_total - before_outcomes_total
+
+        processed += 1
+
+    prior_summary = effect.get("summary") if isinstance(effect.get("summary"), dict) else {}
+    prior_unmatched = _safe_int(prior_summary.get("decisions_unmatched"))
+    effect.setdefault("summary", {})["decisions_unmatched"] = prior_unmatched + unmatched
+
+    if commit:
+        _save_effect(effect)
+        _save_v2_state({
+            **state,
+            "version": VERSION,
+            "decision_log_file": str(decision_log_path),
+            "decision_log_candidates": decision_log_candidates,
+            "decision_log_offset": new_offset,
+            "last_run_at": _now(),
+            "last_error": None,
+            "decisions_processed": _safe_int(state.get("decisions_processed")) + processed,
+            "last_batch": {
+                "decisions_read": len(decisions),
+                "decisions_processed": processed,
+                "decisions_matched": matched,
+                "decisions_unmatched": unmatched,
+                "test_decisions_skipped": test_decisions_skipped,
+                "explicit_policy_links": explicit_policy_links,
+                "timeline_fallback_links": timeline_fallback_links,
+                "timeline_test_seeds_skipped": timeline_seeds_skipped,
+                "policy_events_loaded": len(policy_events),
+                "outcome_events_loaded": outcome_index.get("total_events_loaded", 0),
+                "outcomes_available": outcome_index.get("total_outcomes_loaded", 0),
+                "outcomes_linked_now": outcomes_linked_now,
+                "decision_log_file": str(decision_log_path),
+                "decision_log_candidates": decision_log_candidates,
+                "old_offset": offset,
+                "new_offset": new_offset,
+                "reached_eof": reached_eof,
+            },
+        })
+    else:
+        _recompute_effect_summary(effect)
+
+    result = {
+        "ok": True,
+        "module": "executive_policy_learning_v2",
+        "version": VERSION,
+        "generated_at": _now(),
+        "commit": commit,
+        "decision_log_file": str(decision_log_path),
+        "decision_log_candidates": decision_log_candidates,
+        "timeline_file": str(TIMELINE_FILE),
+        "effect_file": str(V2_EFFECT_FILE),
+        "decisions_read": len(decisions),
+        "decisions_processed": processed,
+        "decisions_matched": matched,
+        "decisions_unmatched": unmatched,
+        "test_decisions_skipped": test_decisions_skipped,
+        "explicit_policy_links": explicit_policy_links,
+        "timeline_fallback_links": timeline_fallback_links,
+        "timeline_test_seeds_skipped": timeline_seeds_skipped,
+        "policy_events_loaded": len(policy_events),
+        "outcome_events_loaded": outcome_index.get("total_events_loaded", 0),
+        "outcomes_available": outcome_index.get("total_outcomes_loaded", 0),
+        "outcomes_linked_now": outcomes_linked_now,
+        "outcome_sources": outcome_index.get("sources") or [],
+        "old_offset": offset,
+        "new_offset": new_offset,
+        "reached_eof": reached_eof,
+        "duration_ms": round((time.time() - started) * 1000, 2),
+        "summary": effect.get("summary") or {},
+        "notes": [
+            "V2.2 cruza Policy Effect com Lifecycle/Outcome quando houver dados fechados.",
+            "Decisões DENY/BLOCK não recebem PnL inventado; são marcadas como sem trade executado.",
+            "READY_TO_LEARN continua observacional e não altera execução real.",
+        ],
+    }
+
+    try:
+        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+    return result
+
+
+def build_executive_policy_effect_report(result=None, limit=12):
+    if result is None:
+        result = run_executive_policy_learning_v2(context={}, commit=True)
+
+    effect = get_executive_policy_effect_stats()
+    summary = effect.get("summary") or {}
+    policies = effect.get("policies") or {}
+
+    ranking = sorted(
+        [p for p in policies.values() if isinstance(p, dict)],
+        key=lambda p: (
+            p.get("readiness_label") == "READY_TO_LEARN",
+            p.get("readiness_label") == "LEARN_WITH_CAUTION",
+            _safe_float(p.get("effect_score")),
+            _safe_float(p.get("confidence_pct")),
+            _safe_int(p.get("real_decisions", p.get("decisions"))),
+        ),
+        reverse=True,
+    )
+
+    lines = [
+        "🧠 EXECUTIVE POLICY LEARNING V2.2 — POLICY OUTCOME LINKER",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Decisões lidas agora: {result.get('decisions_read', 0)}",
+        f"Decisões reais processadas agora: {result.get('decisions_processed', 0)}",
+        f"Matches policy↔decision: {result.get('decisions_matched', 0)}",
+        f"Links explícitos no decision_log: {result.get('explicit_policy_links', 0)}",
+        f"Fallback via timeline: {result.get('timeline_fallback_links', 0)}",
+        f"Sem policy associada: {result.get('decisions_unmatched', 0)}",
+        f"Seeds decision ignorados: {result.get('test_decisions_skipped', 0)}",
+        f"Policy events reais carregados: {result.get('policy_events_loaded', 0)}",
+        f"Outcome events carregados: {result.get('outcome_events_loaded', 0)}",
+        f"Outcomes disponíveis: {result.get('outcomes_available', 0)}",
+        f"Outcomes linkados agora: {result.get('outcomes_linked_now', 0)}",
+        "",
+        "Resumo acumulado:",
+        f"- Policies com efeito medido: {summary.get('policy_count', 0)}",
+        f"- Decisões reais correlacionadas: {summary.get('real_decisions_correlated', summary.get('decisions_processed', 0))}",
+        f"- Outcomes detectados: {summary.get('outcomes_detected', 0)}",
+        f"- Wins/Losses: {summary.get('wins', 0)}/{summary.get('losses', 0)}",
+        f"- Win rate: {summary.get('win_rate_pct', 0)}%",
+        f"- PnL total pct: {summary.get('pnl_total_pct', 0)}%",
+        f"- READY_TO_LEARN: {summary.get('ready_to_learn', 0)}",
+        f"- LEARN_WITH_CAUTION: {summary.get('learn_with_caution', 0)}",
+        f"- WAIT_SAMPLE: {summary.get('wait_sample', 0)}",
+        f"- Effect score médio: {summary.get('average_effect_score', 0)}",
+        "",
+    ]
+
+    if not ranking:
+        lines += [
+            "Ainda não há correlação policy↔decision suficiente.",
+            "",
+            "Leitura:",
+            "A V2.2 precisa de Decision Log com policy_codes e Lifecycle/Outcome para medir PnL real.",
+        ]
+        return "\n".join(lines)
+
+    lines.append("Ranking de readiness/efeito/outcome:")
+    for idx, p in enumerate(ranking[:limit], start=1):
+        restrictions = _safe_int(p.get("deny")) + _safe_int(p.get("block")) + _safe_int(p.get("reduce_size")) + _safe_int(p.get("no_expansion"))
+        lines += [
+            f"{idx}. {p.get('code')}",
+            f"- Readiness: {p.get('readiness_label')} | score={p.get('readiness_score')} | ready={p.get('ready_to_learn')}",
+            f"- Effect Score: {p.get('effect_score')} | Confiança: {p.get('confidence_pct')}%",
+            f"- Decisões reais: {p.get('real_decisions', p.get('decisions'))} | ALLOW: {p.get('allow')} | restrições: {restrictions}",
+            f"- Outcomes: {p.get('outcomes', 0)} | W/L/BE: {p.get('wins', 0)}/{p.get('losses', 0)}/{p.get('breakeven', 0)} | Win rate: {p.get('win_rate_pct', 0)}%",
+            f"- PnL pct: total={p.get('pnl_total_pct', 0)} | avg={p.get('pnl_avg_pct', 0)} | PF={p.get('profit_factor_pct')}",
+            f"- R total/avg: {p.get('result_r_total', 0)} / {p.get('result_r_avg', 0)} | DD max: {p.get('max_drawdown_pct', 0)}%",
+            f"- Outcome status: {p.get('outcome_status')}",
+            f"- Recomendação: {p.get('recommendation')}",
+        ]
+        notes = p.get("notes") or []
+        if notes:
+            lines.append(f"- Nota: {notes[0]}")
+        lines.append("")
+
+    lines += [
+        "Observação:",
+        "V2.2 não inventa PnL para trades bloqueados. Ela só mede outcome real quando há ciclo/fechamento correlacionável.",
+        "A próxima etapa pode criar uma análise hipotética separada para PnL evitado/perdido por bloqueios.",
+    ]
+    return "\n".join(lines)
+
+
+def build_policy_compare_report(limit=10):
+    effect = get_executive_policy_effect_stats()
+    policies = effect.get("policies") or {}
+    ranking = sorted(
+        [p for p in policies.values() if isinstance(p, dict)],
+        key=lambda p: (
+            p.get("readiness_label") == "READY_TO_LEARN",
+            _safe_float(p.get("effect_score")),
+            _safe_int(p.get("outcomes")),
+            _safe_int(p.get("real_decisions", p.get("decisions"))),
+        ),
+        reverse=True,
+    )
+
+    lines = [
+        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.2",
+        f"Data/hora: {_now()}",
+        "",
+    ]
+
+    if not ranking:
+        lines += [
+            "Sem policies suficientes para comparar.",
+            "Rode /policyeffect após acumular decisões e outcomes.",
+        ]
+        return "\n".join(lines)
+
+    for idx, p in enumerate(ranking[:limit], start=1):
+        restrictions = _safe_int(p.get("deny")) + _safe_int(p.get("block")) + _safe_int(p.get("reduce_size")) + _safe_int(p.get("no_expansion"))
+        lines.append(
+            f"{idx}. {p.get('code')} | readiness={p.get('readiness_label')}({p.get('readiness_score')}) | "
+            f"effect={p.get('effect_score')} | conf={p.get('confidence_pct')}% | "
+            f"dec_reais={p.get('real_decisions', p.get('decisions'))} | allow={p.get('allow')} | restrições={restrictions} | "
+            f"outcomes={p.get('outcomes', 0)} | W/L={p.get('wins', 0)}/{p.get('losses', 0)} | "
+            f"PnL={p.get('pnl_total_pct', 0)}% | PF={p.get('profit_factor_pct')} | DD={p.get('max_drawdown_pct', 0)}%"
+        )
+
+    return "\n".join(lines)
+
+
+def build_policy_insights_report():
+    effect = get_executive_policy_effect_stats()
+    policies = effect.get("policies") or {}
+    values = [p for p in policies.values() if isinstance(p, dict)]
+    summary = effect.get("summary") or {}
+
+    lines = [
+        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.2",
+        f"Data/hora: {_now()}",
+        "",
+        f"READY_TO_LEARN: {summary.get('ready_to_learn', 0)}",
+        f"LEARN_WITH_CAUTION: {summary.get('learn_with_caution', 0)}",
+        f"WAIT_SAMPLE: {summary.get('wait_sample', 0)}",
+        f"Outcomes detectados: {summary.get('outcomes_detected', 0)}",
+        f"PnL total correlacionado: {summary.get('pnl_total_pct', 0)}%",
+        "",
+    ]
+
+    if not values:
+        lines += [
+            "Ainda não há dados suficientes para insights.",
+            "Rode /policyeffect após acumular Decision Log e Lifecycle/Outcome.",
+        ]
+        return "\n".join(lines)
+
+    best_effect = max(values, key=lambda p: _safe_float(p.get("effect_score")))
+    worst_effect = min(values, key=lambda p: _safe_float(p.get("effect_score")))
+    with_outcomes = [p for p in values if _safe_int(p.get("outcomes")) > 0]
+
+    lines += [
+        f"Melhor effect score: {best_effect.get('code')} — {best_effect.get('effect_score')}",
+        f"Menor effect score: {worst_effect.get('code')} — {worst_effect.get('effect_score')}",
+        "",
+    ]
+
+    if with_outcomes:
+        best_pnl = max(with_outcomes, key=lambda p: _safe_float(p.get("pnl_total_pct")))
+        worst_pnl = min(with_outcomes, key=lambda p: _safe_float(p.get("pnl_total_pct")))
+        lines += [
+            f"Melhor PnL correlacionado: {best_pnl.get('code')} — {best_pnl.get('pnl_total_pct')}% em {best_pnl.get('outcomes')} outcomes",
+            f"Pior PnL correlacionado: {worst_pnl.get('code')} — {worst_pnl.get('pnl_total_pct')}% em {worst_pnl.get('outcomes')} outcomes",
+            "",
+        ]
+    else:
+        lines += [
+            "Ainda não há outcomes fechados correlacionados às policies.",
+            "Isso é esperado enquanto as decisões forem recentes ou enquanto os fechamentos não carregarem trade_id/signal_id compatível.",
+            "",
+        ]
+
+    restrictive = sorted(
+        values,
+        key=lambda p: _safe_int(p.get("deny")) + _safe_int(p.get("block")) + _safe_int(p.get("reduce_size")) + _safe_int(p.get("no_expansion")),
+        reverse=True,
+    )
+
+    lines.append("Mais restritivas:")
+    for p in restrictive[:5]:
+        restrictions = _safe_int(p.get("deny")) + _safe_int(p.get("block")) + _safe_int(p.get("reduce_size")) + _safe_int(p.get("no_expansion"))
+        lines.append(
+            f"- {p.get('code')}: restrições={restrictions}, decisões reais={p.get('real_decisions', p.get('decisions'))}, "
+            f"outcomes={p.get('outcomes', 0)}, readiness={p.get('readiness_label')}, score={p.get('effect_score')}"
+        )
+
+    lines += [
+        "",
+        "Leitura:",
+        "V2.2 mede PnL real apenas quando há outcome/lifecycle correlacionável. Para policies restritivas, PnL evitado/perdido exige uma análise hipotética separada.",
+    ]
+    return "\n".join(lines)
+
+
+def rebuild_executive_policy_effect(commit=True, max_decisions=None):
+    """
+    V2.2 rebuild completo:
+    - zera offset do decision_log da V2
+    - limpa effect/outcome stats
+    - reprocessa desde o início com Outcome Linker ativo
+    """
+    old_state = _load_v2_state()
+    old_effect = _load_effect()
+
+    decision_log_path = _resolve_decision_log_file()
+    decision_log_candidates = getattr(_resolve_decision_log_file, "last_candidates", [])
+
+    reset_state = {
+        "version": VERSION,
+        "decision_log_file": str(decision_log_path),
+        "decision_log_candidates": decision_log_candidates,
+        "decision_log_offset": 0,
+        "decisions_processed": 0,
+        "last_run_at": None,
+        "last_error": None,
+        "rebuild_requested_at": _now(),
+        "previous_state": {
+            "decision_log_file": old_state.get("decision_log_file"),
+            "decision_log_offset": old_state.get("decision_log_offset"),
+            "decisions_processed": old_state.get("decisions_processed"),
+            "last_run_at": old_state.get("last_run_at"),
+        },
+    }
+
+    reset_effect = _empty_effect()
+    reset_effect["version"] = VERSION
+    reset_effect["decision_log_file"] = str(decision_log_path)
+    reset_effect["previous_summary"] = old_effect.get("summary") or {}
+
+    if commit:
+        _write_json(V2_STATE_FILE, reset_state)
+        _write_json(V2_EFFECT_FILE, reset_effect)
+
+    result = run_executive_policy_learning_v2(
+        context={"source": "rebuild", "version": VERSION},
+        commit=commit,
+        max_decisions=max_decisions or MAX_DECISIONS_PER_RUN,
+    )
+
+    result["rebuild"] = True
+    result["previous_decision_log_file"] = old_state.get("decision_log_file")
+    result["previous_decision_log_offset"] = old_state.get("decision_log_offset")
+    result["previous_summary"] = old_effect.get("summary") or {}
+
+    try:
+        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": "POLICY_EFFECT_REBUILD_V2_2",
+                **result,
+            }, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+    return result
+
+
+def build_policy_effect_rebuild_report(result=None):
+    if result is None:
+        result = rebuild_executive_policy_effect(commit=True)
+
+    lines = [
+        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.2",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Rebuild: {result.get('rebuild')}",
+        f"Decision Log usado: {result.get('decision_log_file')}",
+        f"Offset anterior: {result.get('previous_decision_log_offset')}",
+        f"Decisões lidas: {result.get('decisions_read', 0)}",
+        f"Decisões reais processadas: {result.get('decisions_processed', 0)}",
+        f"Matches policy↔decision: {result.get('decisions_matched', 0)}",
+        f"Links explícitos no decision_log: {result.get('explicit_policy_links', 0)}",
+        f"Fallback via timeline: {result.get('timeline_fallback_links', 0)}",
+        f"Sem policy associada: {result.get('decisions_unmatched', 0)}",
+        f"Outcome events carregados: {result.get('outcome_events_loaded', 0)}",
+        f"Outcomes disponíveis: {result.get('outcomes_available', 0)}",
+        f"Outcomes linkados agora: {result.get('outcomes_linked_now', 0)}",
+        f"Novo offset: {result.get('new_offset')}",
+        "",
+    ]
+
+    candidates = result.get("decision_log_candidates") or []
+    if candidates:
+        lines.append("Decision logs candidatos:")
+        for item in candidates[:8]:
+            lines.append(f"- {item.get('path')} | exists={item.get('exists')} | linhas={item.get('line_count')}")
+        lines.append("")
+
+    sources = result.get("outcome_sources") or []
+    if sources:
+        lines.append("Outcome sources candidatos:")
+        for item in sources[:10]:
+            lines.append(f"- {item.get('path')} | exists={item.get('exists')} | eventos={item.get('events')} | outcomes={item.get('outcomes')}")
+        lines.append("")
+
+    summary = result.get("summary") or {}
+    if summary:
+        lines += [
+            "Resumo atual:",
+            f"- Policies com efeito medido: {summary.get('policy_count', 0)}",
+            f"- Decisões correlacionadas: {summary.get('decisions_processed', 0)}",
+            f"- Outcomes detectados: {summary.get('outcomes_detected', 0)}",
+            f"- PnL total pct: {summary.get('pnl_total_pct', 0)}%",
+            f"- Effect score médio: {summary.get('average_effect_score', 0)}",
+            "",
+        ]
+
+    lines += [
+        "Leitura:",
+        "A V2.2 cruza policies com outcomes/lifecycle quando houver fechamento correlacionável.",
+        "Ela não inventa PnL para bloqueios; PnL evitado será uma camada hipotética futura.",
+        "",
+        "Próximos comandos:",
+        "/policyeffect",
+        "/policycompare",
+        "/policyinsights",
+    ]
+
+    return "\n".join(lines)
