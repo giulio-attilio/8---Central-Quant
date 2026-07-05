@@ -190,6 +190,75 @@ except Exception as e:
             "items": [],
         }
 
+
+
+try:
+    from executive_policy_timeline import (
+        sync_executive_policy_timeline,
+        build_executive_policy_timeline_report,
+        get_executive_policy_timeline_health,
+        read_executive_policy_timeline,
+        get_executive_policy_timeline_stats,
+        build_executive_policy_timeline_stats_report,
+    )
+    EXECUTIVE_POLICY_TIMELINE_LOADED = True
+    EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR = None
+except Exception as e:
+    EXECUTIVE_POLICY_TIMELINE_LOADED = False
+    EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR = str(e)
+
+    def sync_executive_policy_timeline(context=None, commit=True):
+        return {
+            "ok": False,
+            "module": "executive_policy_timeline",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR,
+            "events_created": 0,
+            "events": [],
+            "notes": ["Falha ao importar Executive Policy Timeline no main.py."],
+        }
+
+    def build_executive_policy_timeline_report(result=None, limit=20):
+        return (
+            "🧭 EXECUTIVE POLICY TIMELINE — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR}"
+        )
+
+    def get_executive_policy_timeline_health():
+        return {
+            "ok": False,
+            "module": "executive_policy_timeline",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR,
+        }
+
+    def read_executive_policy_timeline(limit=30, event_type=None, code=None):
+        return {
+            "ok": False,
+            "module": "executive_policy_timeline",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR,
+            "items": [],
+        }
+
+    def get_executive_policy_timeline_stats():
+        return {
+            "ok": False,
+            "module": "executive_policy_timeline",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR,
+        }
+
+    def build_executive_policy_timeline_stats_report():
+        return (
+            "📊 EXECUTIVE POLICY TIMELINE STATS — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR}"
+        )
+
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -1686,6 +1755,80 @@ def policy_expiration_log_route():
     except Exception:
         limit = 20
     return read_executive_policy_expiration_log(limit=limit), 200
+
+
+
+@app.route("/policytimeline", methods=["GET"])
+@app.route("/executive/policy/timeline", methods=["GET"])
+def policy_timeline_route():
+    """
+    Executa uma rodada do Executive Policy Timeline V1.
+    V1 não executa trades e não altera policies; apenas registra eventos de governança.
+    """
+    try:
+        check_only = str(request.args.get("check_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        try:
+            limit = int(request.args.get("limit", "20"))
+        except Exception:
+            limit = 20
+        result = sync_executive_policy_timeline(context={}, commit=not check_only)
+        report = build_executive_policy_timeline_report(result, limit=limit)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "🧭 EXECUTIVE POLICY TIMELINE — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            f"Erro na rota /policytimeline: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+@app.route("/policytimelinehealth", methods=["GET"])
+@app.route("/executive/policy/timeline/health", methods=["GET"])
+def policy_timeline_health_route():
+    """Health check do Timeline V1."""
+    try:
+        return get_executive_policy_timeline_health(), 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_timeline",
+            "route": "/policytimelinehealth",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/lastpolicyevents", methods=["GET"])
+@app.route("/policytimeline/events", methods=["GET"])
+@app.route("/executive/policy/timeline/events", methods=["GET"])
+def last_policy_events_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    event_type = request.args.get("event_type")
+    code = request.args.get("code")
+    return read_executive_policy_timeline(limit=limit, event_type=event_type, code=code), 200
+
+
+@app.route("/policytimelinestats", methods=["GET"])
+@app.route("/executive/policy/timeline/stats", methods=["GET"])
+def policy_timeline_stats_route():
+    try:
+        as_json = str(request.args.get("format", "")).strip().lower() in {"json", "raw"}
+        if as_json:
+            return get_executive_policy_timeline_stats(), 200
+        report = build_executive_policy_timeline_stats_report()
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "📊 EXECUTIVE POLICY TIMELINE STATS — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            f"Erro na rota /policytimelinestats: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
 
 @app.route("/executive/alerts/check")
 @app.route("/executive_alerts/check")
