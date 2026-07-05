@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-04-SUPER-CENTRAL-QUANT-V5-CEO-CONFIDENCE-INDEX-V1
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-PROFILER-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -331,6 +331,19 @@ from executive_decision_engine import (
 
 
 app = Flask(__name__)
+
+# ==========================================================
+# MEMORY PROFILER V1 — IMPORT SEGURO
+# ==========================================================
+try:
+    import memory_profiler_v1 as memory_profiler
+    MEMORY_PROFILER_LOADED = True
+    MEMORY_PROFILER_IMPORT_ERROR = None
+except Exception as _memory_profiler_exc:
+    memory_profiler = None
+    MEMORY_PROFILER_LOADED = False
+    MEMORY_PROFILER_IMPORT_ERROR = str(_memory_profiler_exc)
+
 
 try:
     import broker as central_broker
@@ -3101,8 +3114,21 @@ def runners():
 @app.route("/memoria")
 @app.route("/memória")
 def memory_route():
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            payload = memory_profiler.build_memory_json()
+            payload["text"] = memory_profiler.build_memory_report(include_tracemalloc=False)
+            payload["legacy_memory"] = memory_status_payload(run_gc=False, label="/memory_legacy")
+            return payload
+    except Exception as exc:
+        text, payload = build_memory_text(run_gc=False)
+        payload["text"] = text
+        payload["memory_profiler_error"] = str(exc)
+        return payload
     text, payload = build_memory_text(run_gc=False)
     payload["text"] = text
+    payload["memory_profiler_loaded"] = MEMORY_PROFILER_LOADED
+    payload["memory_profiler_import_error"] = MEMORY_PROFILER_IMPORT_ERROR
     return payload
 
 
@@ -3110,8 +3136,26 @@ def memory_route():
 @app.route("/memoria/gc")
 def memory_gc_route():
     text, payload = build_memory_text(run_gc=True)
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            payload["memory_profiler"] = memory_profiler.build_memory_json()
+            payload["memory_profiler_text"] = memory_profiler.build_memory_report(include_tracemalloc=False)
+    except Exception as exc:
+        payload["memory_profiler_error"] = str(exc)
     payload["text"] = text
     return payload
+
+
+@app.route("/memory/deep")
+@app.route("/memoria/deep")
+def memory_deep_route():
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            text = memory_profiler.build_memory_report(include_tracemalloc=True)
+            return {"ok": True, "text": text}
+        return {"ok": False, "error": MEMORY_PROFILER_IMPORT_ERROR}, 500
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
 
 
 @app.route("/memory/top")
@@ -17910,11 +17954,29 @@ def build_command_reply_for_module(key: str, module, cmd: str):
         return build_selftest_report()
 
     if cmd0 in {"/memory", "/memoria", "/memória"}:
+        try:
+            if MEMORY_PROFILER_LOADED and memory_profiler:
+                return memory_profiler.build_memory_report(include_tracemalloc=False)
+        except Exception as exc:
+            return f"⚠️ Erro no Memory Profiler V1: {exc}\n\nFallback antigo:\n{build_memory_text(run_gc=False)[0]}"
         text, _payload = build_memory_text(run_gc=False)
         return text
 
+    if cmd0 in {"/memorydeep", "/memoriadeep", "/memory/deep", "/memoria/deep"}:
+        try:
+            if MEMORY_PROFILER_LOADED and memory_profiler:
+                return memory_profiler.build_memory_report(include_tracemalloc=True)
+        except Exception as exc:
+            return f"⚠️ Erro no /memorydeep: {exc}"
+        return "Memory Profiler V1 não carregado: " + str(MEMORY_PROFILER_IMPORT_ERROR)
+
     if cmd0 in {"/memorygc", "/memory_gc", "/memoriagc", "/memoria_gc"}:
         text, _payload = build_memory_text(run_gc=True)
+        try:
+            if MEMORY_PROFILER_LOADED and memory_profiler:
+                return memory_profiler.build_memory_report(include_tracemalloc=False) + "\n\n" + text
+        except Exception:
+            pass
         return text
 
     if cmd0 in {"/executive", "/dashboard"}:
@@ -18434,6 +18496,14 @@ def start_central_runtime_once():
 
     threading.Thread(target=central_watchdog_loop, daemon=True).start()
     threading.Thread(target=memory_monitor_loop, daemon=True).start()
+
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            print(memory_profiler.start_memory_profiler(interval_seconds=MEMORY_LOG_INTERVAL_SECONDS))
+        else:
+            print(f"MEMORY PROFILER V1 NÃO CARREGADO: {MEMORY_PROFILER_IMPORT_ERROR}")
+    except Exception as exc:
+        print(f"ERRO AO INICIAR MEMORY PROFILER V1: {exc}")
 
     if LEARNING_AUTO_REFRESH_ENABLED:
         if acquire_runtime_file_lock("learning_auto_refresh"):
