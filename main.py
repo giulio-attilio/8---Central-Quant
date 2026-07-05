@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-LEARNING-V2.1.1
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-POLICY-LEARNING-V2.1.2
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -370,7 +370,7 @@ except Exception as e:
 
     def build_executive_policy_effect_report(result=None, limit=12):
         return (
-            "🧠 EXECUTIVE POLICY LEARNING V2.1.1 — POLICY EFFECT\n"
+            "🧠 EXECUTIVE POLICY LEARNING V2.1.2 — POLICY EFFECT\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -396,7 +396,7 @@ except Exception as e:
 
     def build_policy_compare_report(limit=10):
         return (
-            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.1.1\n"
+            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.1.2\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -404,7 +404,7 @@ except Exception as e:
 
     def build_policy_insights_report():
         return (
-            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.1.1\n"
+            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.1.2\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -421,7 +421,7 @@ except Exception as e:
 
     def build_policy_effect_rebuild_report(result=None):
         return (
-            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.1.1\n"
+            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.1.2\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -438,7 +438,7 @@ except Exception as e:
 
     def build_policy_effect_seed_report(result=None):
         return (
-            "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.1.1\n"
+            "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.1.2\n"
             "Status: ❌\n"
             "Carregado: False\n"
             f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
@@ -2138,7 +2138,7 @@ def policy_learning_seed_route():
 @app.route("/executive/policy/learning/effect", methods=["GET"])
 def policy_effect_route():
     """
-    Executive Policy Learning V2.1.1.
+    Executive Policy Learning V2.1.2.
     Correlaciona Executive Policy Timeline + Decision Log.
     """
     try:
@@ -2152,7 +2152,7 @@ def policy_effect_route():
         return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "🧠 EXECUTIVE POLICY LEARNING V2.1.1 — POLICY EFFECT\n"
+            "🧠 EXECUTIVE POLICY LEARNING V2.1.2 — POLICY EFFECT\n"
             "Status: ❌\n"
             f"Erro na rota /policyeffect: {exc}",
             500,
@@ -2178,7 +2178,7 @@ def policy_effect_seed_route():
         return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.1.1\n"
+            "🌱 POLICY EFFECT DECISION SEED — CENTRAL QUANT V2.1.2\n"
             "Status: ❌\n"
             f"Erro na rota /policyeffectseed: {exc}",
             500,
@@ -2204,7 +2204,7 @@ def policy_effect_rebuild_route():
         return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.1.1\n"
+            "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.1.2\n"
             "Status: ❌\n"
             f"Erro na rota /policyeffectrebuild: {exc}",
             500,
@@ -2254,7 +2254,7 @@ def policy_compare_route():
         return build_policy_compare_report(limit=limit), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.1.1\n"
+            "⚖️ POLICY COMPARE — CENTRAL QUANT V2.1.2\n"
             f"Erro na rota /policycompare: {exc}",
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
@@ -2268,7 +2268,7 @@ def policy_insights_route():
         return build_policy_insights_report(), 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as exc:
         return (
-            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.1.1\n"
+            "💡 POLICY INSIGHTS — CENTRAL QUANT V2.1.2\n"
             f"Erro na rota /policyinsights: {exc}",
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
@@ -5251,6 +5251,129 @@ def append_timeline_event(event_type, bot=None, symbol=None, side=None, trade_id
     return item
 
 
+
+def _policy_linker_add_code(codes, value):
+    """
+    V2.1.2 — normaliza códigos de policy sem duplicar.
+    Aceita strings, listas e dicts vindos do Executive Policy Manager/Priority.
+    """
+    if value is None:
+        return
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _policy_linker_add_code(codes, item)
+        return
+
+    if isinstance(value, dict):
+        for key in [
+            "code", "policy_code", "policy_code_normalized", "dominant_code",
+            "dominant_policy_code", "id", "name",
+        ]:
+            if value.get(key):
+                _policy_linker_add_code(codes, value.get(key))
+        return
+
+    text = str(value or "").strip().upper()
+    if not text:
+        return
+
+    # Evita gravar mensagens inteiras como se fossem códigos.
+    if len(text) > 80:
+        return
+
+    # Normalização leve para valores separados por vírgula.
+    if "," in text:
+        for part in text.split(","):
+            _policy_linker_add_code(codes, part)
+        return
+
+    if text not in codes:
+        codes.append(text)
+
+
+def extract_policy_decision_link(decision_result=None, payload=None):
+    """
+    Executive Policy Decision Linker V2.1.2.
+
+    Objetivo:
+    - anexar ao decision_log quais policies influenciaram a decisão;
+    - preservar também policies ativas como contexto;
+    - não alterar decisão, risco, lote ou execução.
+    """
+    result = decision_result if isinstance(decision_result, dict) else {}
+    source_payload = payload if isinstance(payload, dict) else {}
+
+    evaluation = result.get("executive_policy") or source_payload.get("executive_policy") or {}
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+
+    priority = evaluation.get("priority") if isinstance(evaluation.get("priority"), dict) else {}
+    sync = evaluation.get("sync") if isinstance(evaluation.get("sync"), dict) else {}
+
+    policy_codes = []
+    active_policy_codes = []
+
+    # Códigos que realmente apareceram como aplicados/influentes.
+    for key in [
+        "policy_codes",
+        "applied_policy_codes",
+        "blocked_policy_codes",
+        "matched_policy_codes",
+        "applied_policies",
+        "policies_applied",
+        "dominant_policy_code",
+        "dominant_code",
+        "dominant_policy",
+    ]:
+        _policy_linker_add_code(policy_codes, evaluation.get(key))
+
+    for key in [
+        "policy_codes",
+        "applied_policy_codes",
+        "applied_policies",
+        "dominant_policy_code",
+        "dominant_code",
+        "dominant_policy",
+    ]:
+        _policy_linker_add_code(policy_codes, priority.get(key))
+
+    # Códigos ativos no momento da avaliação: contexto, não necessariamente influência.
+    for key in ["active_codes", "active_policy_codes", "policies", "active_policies"]:
+        _policy_linker_add_code(active_policy_codes, sync.get(key))
+        _policy_linker_add_code(active_policy_codes, evaluation.get(key))
+
+    # Fallback conservador: se a policy bloqueou/restringiu mas o manager não
+    # informou applied_policies, usa a dominante; se nem dominante existir, usa
+    # active_codes apenas como linked_by=active_context_fallback.
+    linked_by = "explicit_applied_policies" if policy_codes else "none"
+    if not policy_codes and (evaluation.get("allowed") is False or evaluation.get("size_multiplier") not in (None, 1, 1.0) or evaluation.get("max_risk_pct") is not None):
+        for key in ["dominant_policy_code", "dominant_code", "dominant_policy"]:
+            _policy_linker_add_code(policy_codes, evaluation.get(key))
+            _policy_linker_add_code(policy_codes, priority.get(key))
+        if policy_codes:
+            linked_by = "dominant_policy_fallback"
+
+    if not policy_codes and active_policy_codes and (evaluation.get("allowed") is False):
+        for code in active_policy_codes:
+            _policy_linker_add_code(policy_codes, code)
+        linked_by = "active_context_fallback_blocked_decision"
+
+    return {
+        "version": "2026-07-05-POLICY-DECISION-LINKER-V2.1.2",
+        "linked": bool(policy_codes),
+        "linked_by": linked_by,
+        "policy_codes": policy_codes,
+        "active_policy_codes": active_policy_codes,
+        "dominant_policy_code": (
+            evaluation.get("dominant_policy_code")
+            or evaluation.get("dominant_code")
+            or priority.get("dominant_policy_code")
+            or priority.get("dominant_code")
+        ),
+        "source": evaluation.get("source") or "unknown",
+    }
+
 def append_decision_log(payload, decision_result):
     payload = payload or {}
     result = decision_result or {}
@@ -5270,6 +5393,7 @@ def append_decision_log(payload, decision_result):
     trade_id = str(trade_id)
     allowed = bool(result.get("allowed"))
     state = "VERIFY" if allowed and str(result.get("mode") or "").upper() == "VERIFY" else ("DENIED" if not allowed else str(result.get("mode") or "ALLOW").upper())
+    policy_link = extract_policy_decision_link(result, payload)
     item = {
         "ts": data_hora_sp_str(),
         "epoch": time.time(),
@@ -5282,6 +5406,12 @@ def append_decision_log(payload, decision_result):
         "allowed": allowed,
         "reasons": result.get("reasons") or [],
         "warnings": result.get("warnings") or [],
+        "policy_codes": policy_link.get("policy_codes") or [],
+        "active_policy_codes": policy_link.get("active_policy_codes") or [],
+        "applied_policies": policy_link.get("policy_codes") or [],
+        "dominant_policy_code": policy_link.get("dominant_policy_code"),
+        "policy_linker": policy_link,
+        "executive_policy": result.get("executive_policy") or payload.get("executive_policy") or {},
         "bingx_divergence": result.get("bingx_divergence") or {},
         "score": payload.get("score"),
         "setup": payload.get("setup"),
@@ -5290,6 +5420,12 @@ def append_decision_log(payload, decision_result):
         "exposure": result.get("exposure") or {},
     }
     _append_jsonl(CENTRAL_DECISION_LOG_FILE, item)
+    try:
+        result["policy_codes"] = item.get("policy_codes") or []
+        result["active_policy_codes"] = item.get("active_policy_codes") or []
+        result["policy_linker"] = item.get("policy_linker") or {}
+    except Exception:
+        pass
     append_timeline_event("RISK_ALLOW" if allowed else "RISK_DENY", bot, symbol, side, trade_id, state, item)
     if allowed and str(item.get("mode")).upper() == "VERIFY":
         upsert_shadow_position(item)
@@ -6128,6 +6264,13 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
             evaluation["source"] = "executive_policy_manager+priority"
             evaluation["available"] = True
             evaluation["sync"] = sync_result
+            try:
+                policy_link = extract_policy_decision_link({"executive_policy": evaluation}, trade_payload)
+                evaluation["policy_codes"] = policy_link.get("policy_codes") or []
+                evaluation["active_policy_codes"] = policy_link.get("active_policy_codes") or []
+                evaluation["policy_linker"] = policy_link
+            except Exception as linker_exc:
+                evaluation["policy_linker_error"] = str(linker_exc)
             return evaluation
 
         warnings.append(f"Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}")
