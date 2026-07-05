@@ -1,54 +1,49 @@
-# executive_policy_learning.py
-# Central Quant — Executive Policy Learning V1
-# Versão: 2026-07-05-EXECUTIVE-POLICY-LEARNING-V1
-#
-# Objetivo:
-# - Avaliar estatisticamente se as políticas executivas estão ajudando ou prejudicando.
-# - Registrar impactos por policy code: bloqueios, releases, wins/losses, PnL salvo/perdido,
-#   eficiência e recomendação.
-# - Ser leve em memória: leitura incremental, arquivos pequenos e sem carregar histórico inteiro.
+# -*- coding: utf-8 -*-
+"""
+Executive Policy Learning V1 — Central Quant
+Versão: 2026-07-05-EXECUTIVE-POLICY-LEARNING-V1
 
-from __future__ import annotations
+Objetivo:
+- Aprender, de forma leve e incremental, como as policies executivas se comportam.
+- Não executa trades.
+- Não altera policies.
+- Não carrega histórico inteiro em memória.
+- Lê apenas eventos novos do Executive Policy Timeline via offset persistente.
+- Gera estatísticas por policy code.
 
-import json
+Arquivos:
+- data/executive_policy_timeline.jsonl
+- data/executive_policy_learning_state.json
+- data/executive_policy_learning_stats.json
+- data/executive_policy_learning_log.jsonl
+"""
+
 import os
+import json
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-
+from pathlib import Path
 
 VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V1"
-MODULE = "executive_policy_learning"
 
-DATA_DIR = os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR", str(BASE_DIR / "data")))
+DATA_DIR.mkdir(exist_ok=True)
 
-POLICY_LEARNING_STATE_FILE = os.path.join(DATA_DIR, "executive_policy_learning_state.json")
-POLICY_LEARNING_STATS_FILE = os.path.join(DATA_DIR, "executive_policy_learning_stats.json")
-POLICY_LEARNING_EVENTS_FILE = os.path.join(DATA_DIR, "executive_policy_learning_events.jsonl")
+TIMELINE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_TIMELINE_FILE", str(DATA_DIR / "executive_policy_timeline.jsonl")))
+STATE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_STATE_FILE", str(DATA_DIR / "executive_policy_learning_state.json")))
+STATS_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_STATS_FILE", str(DATA_DIR / "executive_policy_learning_stats.json")))
+LOG_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_LOG_FILE", str(DATA_DIR / "executive_policy_learning_log.jsonl")))
 
-# Fontes possíveis já existentes na Central.
-EXECUTIVE_POLICY_TIMELINE_FILE = os.path.join(DATA_DIR, "executive_policy_timeline.jsonl")
-DECISION_LOG_FILE = os.path.join(DATA_DIR, "decision_log.jsonl")
-HISTORY_EVENTS_FILE = os.path.join(DATA_DIR, "history_events.jsonl")
-
-MAX_EVENTS_PER_RUN = int(os.getenv("POLICY_LEARNING_MAX_EVENTS_PER_RUN", "250"))
-MAX_RECENT_EVENTS = int(os.getenv("POLICY_LEARNING_MAX_RECENT_EVENTS", "50"))
-MIN_SAMPLE_FOR_CONFIDENCE = int(os.getenv("POLICY_LEARNING_MIN_SAMPLE", "20"))
+MAX_EVENTS_PER_RUN = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MAX_EVENTS_PER_RUN", "500"))
+MIN_SAMPLE_FOR_CONFIDENCE = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MIN_SAMPLE", "10"))
 
 
-# -----------------------------------------------------------------------------
-# Utilidades leves
-# -----------------------------------------------------------------------------
-
-def _now_str() -> str:
+def _now():
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 
-def _ensure_data_dir() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(value, default=0.0):
     try:
         if value is None:
             return default
@@ -57,7 +52,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
+def _safe_int(value, default=0):
     try:
         if value is None:
             return default
@@ -66,9 +61,9 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _read_json(path: str, default: Any) -> Any:
+def _read_json(path, default):
     try:
-        if not os.path.exists(path):
+        if not Path(path).exists():
             return default
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -76,737 +71,520 @@ def _read_json(path: str, default: Any) -> Any:
         return default
 
 
-def _write_json_atomic(path: str, payload: Any) -> None:
-    _ensure_data_dir()
-    tmp = f"{path}.tmp"
+def _write_json(path, payload):
+    tmp = str(path) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
 
-def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
-    _ensure_data_dir()
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def _file_size(path: str) -> int:
+def _append_log(event):
     try:
-        return os.path.getsize(path)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     except Exception:
-        return 0
+        pass
 
 
-def _read_jsonl_incremental(path: str, offset: int, max_events: int) -> Tuple[List[Dict[str, Any]], int, bool]:
-    """
-    Lê JSONL a partir de um offset em bytes.
-    Retorna: eventos, novo_offset, truncated.
-    Não carrega arquivo inteiro na memória.
-    """
-    events: List[Dict[str, Any]] = []
-    new_offset = offset
-    truncated = False
-
-    if not os.path.exists(path):
-        return events, 0, False
-
-    size = _file_size(path)
-    if offset > size:
-        # Arquivo rotacionou ou foi reescrito.
-        offset = 0
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            f.seek(offset)
-            while len(events) < max_events:
-                line = f.readline()
-                if not line:
-                    break
-                new_offset = f.tell()
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    item = json.loads(line)
-                    if isinstance(item, dict):
-                        events.append(item)
-                except Exception:
-                    continue
-
-            # Se ainda existe conteúdo depois do limite, marca truncado.
-            pos = f.tell()
-            maybe_more = f.readline()
-            truncated = bool(maybe_more)
-            if maybe_more:
-                new_offset = pos
-    except Exception:
-        return events, offset, False
-
-    return events, new_offset, truncated
-
-
-# -----------------------------------------------------------------------------
-# Estado e stats
-# -----------------------------------------------------------------------------
-
-def _default_state() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "module": MODULE,
-        "version": VERSION,
-        "created_at": _now_str(),
-        "updated_at": None,
-        "offsets": {
-            EXECUTIVE_POLICY_TIMELINE_FILE: 0,
-            DECISION_LOG_FILE: 0,
-            HISTORY_EVENTS_FILE: 0,
-        },
-        "last_run_at": None,
-        "total_events_processed": 0,
-        "last_errors": [],
-    }
-
-
-def _load_state() -> Dict[str, Any]:
-    state = _read_json(POLICY_LEARNING_STATE_FILE, _default_state())
+def _load_state():
+    state = _read_json(STATE_FILE, {})
     if not isinstance(state, dict):
-        state = _default_state()
-    state.setdefault("offsets", {})
-    state.setdefault("total_events_processed", 0)
-    state.setdefault("last_errors", [])
+        state = {}
+    state.setdefault("version", VERSION)
+    state.setdefault("timeline_offset", 0)
+    state.setdefault("events_processed", 0)
+    state.setdefault("last_run_at", None)
+    state.setdefault("last_error", None)
     return state
 
 
-def _default_stats() -> Dict[str, Any]:
+def _save_state(state):
+    state["version"] = VERSION
+    state["updated_at"] = _now()
+    _write_json(STATE_FILE, state)
+
+
+def _empty_stats():
     return {
         "ok": True,
-        "module": MODULE,
         "version": VERSION,
-        "generated_at": _now_str(),
-        "policy_count": 0,
+        "generated_at": _now(),
         "policies": {},
-        "ranking": [],
         "summary": {
-            "policies_reliable": 0,
-            "policies_observation": 0,
-            "policies_bad": 0,
-            "avg_efficiency": 0.0,
+            "policy_count": 0,
+            "events_seen": 0,
+            "events_processed": 0,
+            "confident_policies": 0,
+            "observation_policies": 0,
+            "weak_policies": 0,
+            "average_score": 0.0,
         },
-        "recent_events": [],
     }
 
 
-def _load_stats() -> Dict[str, Any]:
-    stats = _read_json(POLICY_LEARNING_STATS_FILE, _default_stats())
+def _load_stats():
+    stats = _read_json(STATS_FILE, _empty_stats())
     if not isinstance(stats, dict):
-        stats = _default_stats()
+        stats = _empty_stats()
+    stats.setdefault("ok", True)
+    stats.setdefault("version", VERSION)
     stats.setdefault("policies", {})
-    stats.setdefault("ranking", [])
     stats.setdefault("summary", {})
-    stats.setdefault("recent_events", [])
     return stats
 
 
-def _empty_policy(code: str) -> Dict[str, Any]:
+def _save_stats(stats):
+    stats["version"] = VERSION
+    stats["generated_at"] = _now()
+    _recompute_summary(stats)
+    _write_json(STATS_FILE, stats)
+
+
+def _policy_template(code):
     return {
         "code": code,
-        "created_at": _now_str(),
-        "updated_at": _now_str(),
-        "times_triggered": 0,
-        "times_released": 0,
-        "blocked_trades": 0,
-        "allowed_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "breakevens": 0,
-        "runner_count": 0,
-        "pnl_saved_pct": 0.0,
-        "pnl_lost_pct": 0.0,
-        "drawdown_avoided_pct": 0.0,
-        "sample": 0,
-        "efficiency_score": 0.0,
-        "confidence": "AMOSTRA INSUFICIENTE",
+        "first_seen_at": None,
+        "last_seen_at": None,
+        "events": 0,
+        "created": 0,
+        "activated": 0,
+        "updated": 0,
+        "released": 0,
+        "expired": 0,
+        "kept": 0,
+        "blocked_trades_est": 0,
+        "allowed_trades_est": 0,
+        "risk_events": 0,
+        "release_events": 0,
+        "auto_release_events": 0,
+        "priority_events": 0,
+        "timeline_events": 0,
+        "score": 50.0,
+        "confidence_pct": 0.0,
         "recommendation": "OBSERVAR",
         "notes": [],
-        "last_event_at": None,
+        "last_event_type": None,
+        "last_reason": None,
     }
 
 
-def _get_policy(stats: Dict[str, Any], code: str) -> Dict[str, Any]:
-    policies = stats.setdefault("policies", {})
-    if code not in policies or not isinstance(policies.get(code), dict):
-        policies[code] = _empty_policy(code)
-    return policies[code]
+def _extract_code(event):
+    if not isinstance(event, dict):
+        return None
 
-
-# -----------------------------------------------------------------------------
-# Normalização de eventos
-# -----------------------------------------------------------------------------
-
-def _extract_policy_codes(event: Dict[str, Any]) -> List[str]:
-    codes: List[str] = []
-
-    # Formatos possíveis.
-    for key in ("code", "policy_code", "active_codes"):
+    for key in ["code", "policy_code", "policy", "policy_code_normalized"]:
         value = event.get(key)
         if isinstance(value, str) and value.strip():
-            codes.append(value.strip())
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, str) and item.strip():
-                    codes.append(item.strip())
+            return value.strip().upper()
 
-    policy = event.get("policy")
-    if isinstance(policy, dict):
-        value = policy.get("code") or policy.get("policy_code")
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        for key in ["code", "policy_code", "policy"]:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+
+    return None
+
+
+def _extract_event_type(event):
+    for key in ["event", "event_type", "type", "action"]:
+        value = event.get(key) if isinstance(event, dict) else None
         if isinstance(value, str) and value.strip():
-            codes.append(value.strip())
-
-    applied = event.get("applied_policies")
-    if isinstance(applied, list):
-        for item in applied:
-            if isinstance(item, str) and item.strip():
-                codes.append(item.strip())
-            elif isinstance(item, dict):
-                value = item.get("code") or item.get("policy_code")
-                if isinstance(value, str) and value.strip():
-                    codes.append(value.strip())
-
-    sync = event.get("sync")
-    if isinstance(sync, dict):
-        active_codes = sync.get("active_codes")
-        if isinstance(active_codes, list):
-            for item in active_codes:
-                if isinstance(item, str) and item.strip():
-                    codes.append(item.strip())
-
-    # Remove duplicados preservando ordem.
-    seen = set()
-    clean: List[str] = []
-    for code in codes:
-        if code not in seen:
-            seen.add(code)
-            clean.append(code)
-    return clean
+            return value.strip().upper()
+    return "UNKNOWN"
 
 
-def _event_type(event: Dict[str, Any]) -> str:
-    raw = (
-        event.get("event")
-        or event.get("event_type")
-        or event.get("type")
-        or event.get("action")
-        or event.get("decision")
-        or "UNKNOWN"
-    )
-    return str(raw).upper()
+def _event_text(event):
+    try:
+        return json.dumps(event, ensure_ascii=False).lower()
+    except Exception:
+        return str(event).lower()
 
 
-def _extract_pnl_pct(event: Dict[str, Any]) -> float:
-    for key in ("pnl_pct", "pnl", "realized_pnl_pct", "result_pct", "pnl_total_pct"):
-        if key in event:
-            return _safe_float(event.get(key), 0.0)
+def _apply_event_to_policy(policy, event):
+    event_type = _extract_event_type(event)
+    text = _event_text(event)
+    now = event.get("generated_at") or event.get("created_at") or event.get("ts") or _now()
 
-    payload = event.get("payload")
-    if isinstance(payload, dict):
-        for key in ("pnl_pct", "pnl", "realized_pnl_pct", "result_pct", "pnl_total_pct"):
-            if key in payload:
-                return _safe_float(payload.get(key), 0.0)
+    if not policy.get("first_seen_at"):
+        policy["first_seen_at"] = now
+    policy["last_seen_at"] = now
+    policy["last_event_type"] = event_type
 
-    return 0.0
+    reason = event.get("reason") or event.get("rationale") or event.get("message")
+    if reason:
+        policy["last_reason"] = str(reason)[:300]
 
+    policy["events"] = _safe_int(policy.get("events")) + 1
+    policy["timeline_events"] = _safe_int(policy.get("timeline_events")) + 1
 
-def _extract_r_multiple(event: Dict[str, Any]) -> float:
-    for key in ("r", "r_multiple", "r_result", "result_r"):
-        if key in event:
-            return _safe_float(event.get(key), 0.0)
-    payload = event.get("payload")
-    if isinstance(payload, dict):
-        for key in ("r", "r_multiple", "r_result", "result_r"):
-            if key in payload:
-                return _safe_float(payload.get(key), 0.0)
-    return 0.0
+    if "CREATE" in event_type or "CREATED" in event_type or "NOVA" in text or "created" in text:
+        policy["created"] = _safe_int(policy.get("created")) + 1
 
+    if "ACTIVE" in event_type or "ACTIVATE" in event_type or "INGEST" in event_type:
+        policy["activated"] = _safe_int(policy.get("activated")) + 1
 
-def _is_release_event(event: Dict[str, Any]) -> bool:
-    etype = _event_type(event)
-    text = json.dumps(event, ensure_ascii=False).upper()
-    return "RELEASE" in etype or "AUTO_RELEASE" in etype or "LIBER" in text
+    if "UPDATE" in event_type or "SYNC" in event_type:
+        policy["updated"] = _safe_int(policy.get("updated")) + 1
 
+    if "RELEASE" in event_type or "released" in text or "liber" in text:
+        policy["released"] = _safe_int(policy.get("released")) + 1
+        policy["release_events"] = _safe_int(policy.get("release_events")) + 1
+        if "AUTO" in event_type or "auto_release" in text:
+            policy["auto_release_events"] = _safe_int(policy.get("auto_release_events")) + 1
 
-def _is_block_event(event: Dict[str, Any]) -> bool:
-    etype = _event_type(event)
-    decision = str(event.get("decision", "")).upper()
-    text = json.dumps(event, ensure_ascii=False).upper()
-    return (
-        "BLOCK" in etype
-        or "DENY" in etype
-        or decision in {"BLOCK", "DENY", "REJECT"}
-        or "BLOQUE" in text
-    )
+    if "EXPIRE" in event_type or "expired" in text or "expir" in text:
+        policy["expired"] = _safe_int(policy.get("expired")) + 1
 
+    if "KEEP" in event_type or "kept" in text or "mantid" in text:
+        policy["kept"] = _safe_int(policy.get("kept")) + 1
 
-def _is_allow_event(event: Dict[str, Any]) -> bool:
-    etype = _event_type(event)
-    decision = str(event.get("decision", "")).upper()
-    return "ALLOW" in etype or decision == "ALLOW"
+    if "DENY" in text or "BLOCK" in text or "bloque" in text or "no_new" in text or "limit_new" in text:
+        policy["risk_events"] = _safe_int(policy.get("risk_events")) + 1
+        policy["blocked_trades_est"] = _safe_int(policy.get("blocked_trades_est")) + 1
 
+    if "ALLOW" in text or "normal" in text or "permit" in text:
+        policy["allowed_trades_est"] = _safe_int(policy.get("allowed_trades_est")) + 1
 
-def _is_closed_trade_event(event: Dict[str, Any]) -> bool:
-    etype = _event_type(event)
-    return any(x in etype for x in ("TRADE_CLOSED", "CLOSE", "CLOSED", "OUTCOME"))
+    if "PRIORITY" in event_type or "priority" in text:
+        policy["priority_events"] = _safe_int(policy.get("priority_events")) + 1
+
+    _score_policy(policy)
 
 
-# -----------------------------------------------------------------------------
-# Aprendizado
-# -----------------------------------------------------------------------------
+def _score_policy(policy):
+    """
+    Score V1 consultivo.
+    Não tenta provar PnL ainda; mede utilidade operacional da policy.
+    V2 poderá cruzar com outcome/decision_log para medir PnL evitado/perdido.
+    """
+    events = max(0, _safe_int(policy.get("events")))
+    risk = _safe_int(policy.get("risk_events"))
+    releases = _safe_int(policy.get("release_events"))
+    kept = _safe_int(policy.get("kept"))
+    expired = _safe_int(policy.get("expired"))
+    blocked = _safe_int(policy.get("blocked_trades_est"))
 
-def _apply_event_to_policy(policy: Dict[str, Any], event: Dict[str, Any]) -> Dict[str, Any]:
-    now = _now_str()
-    policy["updated_at"] = now
-    policy["last_event_at"] = event.get("generated_at") or event.get("timestamp") or now
+    sample_score = min(30.0, events * 3.0)
+    risk_score = min(25.0, risk * 4.0)
+    release_score = min(20.0, releases * 5.0)
+    lifecycle_score = min(15.0, (kept + expired + releases) * 2.5)
+    balance_score = 10.0
 
-    pnl_pct = _extract_pnl_pct(event)
-    r_multiple = _extract_r_multiple(event)
+    # Penaliza policies que aparecem muitas vezes e nunca têm release/expiração.
+    if events >= MIN_SAMPLE_FOR_CONFIDENCE and releases == 0 and expired == 0:
+        balance_score = 3.0
 
-    if _is_release_event(event):
-        policy["times_released"] = _safe_int(policy.get("times_released")) + 1
-        policy["sample"] = _safe_int(policy.get("sample")) + 1
-        return policy
+    score = sample_score + risk_score + release_score + lifecycle_score + balance_score
+    score = max(0.0, min(100.0, score))
 
-    if _is_block_event(event):
-        policy["times_triggered"] = _safe_int(policy.get("times_triggered")) + 1
-        policy["blocked_trades"] = _safe_int(policy.get("blocked_trades")) + 1
-        policy["sample"] = _safe_int(policy.get("sample")) + 1
+    confidence = min(100.0, (events / max(1, MIN_SAMPLE_FOR_CONFIDENCE)) * 100.0)
 
-        # Quando existe PnL associado a um trade bloqueado simulado:
-        # - PnL negativo = perda evitada => pnl_saved positivo.
-        # - PnL positivo = lucro perdido => pnl_lost positivo.
-        if pnl_pct < 0:
-            policy["pnl_saved_pct"] = round(_safe_float(policy.get("pnl_saved_pct")) + abs(pnl_pct), 6)
-            policy["losses"] = _safe_int(policy.get("losses")) + 1
-        elif pnl_pct > 0:
-            policy["pnl_lost_pct"] = round(_safe_float(policy.get("pnl_lost_pct")) + pnl_pct, 6)
-            policy["wins"] = _safe_int(policy.get("wins")) + 1
-        else:
-            policy["breakevens"] = _safe_int(policy.get("breakevens")) + 1
-
-        return policy
-
-    if _is_allow_event(event):
-        policy["times_triggered"] = _safe_int(policy.get("times_triggered")) + 1
-        policy["allowed_trades"] = _safe_int(policy.get("allowed_trades")) + 1
-        policy["sample"] = _safe_int(policy.get("sample")) + 1
-        return policy
-
-    if _is_closed_trade_event(event):
-        policy["sample"] = _safe_int(policy.get("sample")) + 1
-        if pnl_pct > 0:
-            policy["wins"] = _safe_int(policy.get("wins")) + 1
-        elif pnl_pct < 0:
-            policy["losses"] = _safe_int(policy.get("losses")) + 1
-        else:
-            policy["breakevens"] = _safe_int(policy.get("breakevens")) + 1
-
-        if r_multiple >= 1.0 or pnl_pct >= 3.0:
-            policy["runner_count"] = _safe_int(policy.get("runner_count")) + 1
-
-        return policy
-
-    # Evento genérico de policy/timeline.
-    policy["times_triggered"] = _safe_int(policy.get("times_triggered")) + 1
-    policy["sample"] = _safe_int(policy.get("sample")) + 1
-    return policy
-
-
-def _score_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
-    sample = _safe_int(policy.get("sample"))
-    blocked = max(1, _safe_int(policy.get("blocked_trades")))
-    pnl_saved = _safe_float(policy.get("pnl_saved_pct"))
-    pnl_lost = _safe_float(policy.get("pnl_lost_pct"))
-    losses = _safe_int(policy.get("losses"))
-    wins = _safe_int(policy.get("wins"))
-    breakevens = _safe_int(policy.get("breakevens"))
-    runners = _safe_int(policy.get("runner_count"))
-
-    protection_ratio = pnl_saved / max(0.0001, pnl_saved + pnl_lost)
-    avoided_loss_rate = losses / max(1, wins + losses + breakevens)
-    runner_penalty = min(0.25, runners / max(1, sample))
-    sample_factor = min(1.0, sample / max(1, MIN_SAMPLE_FOR_CONFIDENCE))
-
-    # Score conservador: prioriza proteção, mas penaliza lucro perdido.
-    raw_score = (
-        protection_ratio * 45.0
-        + avoided_loss_rate * 25.0
-        + sample_factor * 20.0
-        + min(1.0, pnl_saved / max(1.0, blocked)) * 10.0
-        - runner_penalty * 20.0
-    )
-
-    score = max(0.0, min(100.0, round(raw_score, 2)))
-    policy["efficiency_score"] = score
-
-    if sample < MIN_SAMPLE_FOR_CONFIDENCE:
-        policy["confidence"] = "AMOSTRA INSUFICIENTE"
-        policy["recommendation"] = "OBSERVAR"
-    elif score >= 80:
-        policy["confidence"] = "ALTA"
-        policy["recommendation"] = "MANTER"
-    elif score >= 60:
-        policy["confidence"] = "BOA"
-        policy["recommendation"] = "MANTER_COM_MONITORAMENTO"
+    if confidence < 40:
+        recommendation = "AGUARDAR_AMOSTRA"
+    elif score >= 75:
+        recommendation = "MANTER"
+    elif score >= 55:
+        recommendation = "OBSERVAR"
     elif score >= 40:
-        policy["confidence"] = "MÉDIA"
-        policy["recommendation"] = "REDUZIR_SEVERIDADE"
+        recommendation = "REVISAR"
     else:
-        policy["confidence"] = "BAIXA"
-        policy["recommendation"] = "REVISAR_OU_DESCONTINUAR"
+        recommendation = "ENFRAQUECER_OU_APOSENTAR"
 
-    notes: List[str] = []
-    if pnl_lost > pnl_saved and sample >= MIN_SAMPLE_FOR_CONFIDENCE:
-        notes.append("Lucro perdido maior que PnL salvo; revisar severidade da política.")
-    if pnl_saved > pnl_lost and sample >= MIN_SAMPLE_FOR_CONFIDENCE:
-        notes.append("Política historicamente protetiva: PnL salvo maior que lucro perdido.")
-    if sample < MIN_SAMPLE_FOR_CONFIDENCE:
-        notes.append("Amostra ainda insuficiente para decisão estatística forte.")
+    notes = []
+    if events < MIN_SAMPLE_FOR_CONFIDENCE:
+        notes.append("Amostra ainda insuficiente para conclusão robusta.")
+    if blocked > 0:
+        notes.append("Policy associada a bloqueios/restrições operacionais.")
+    if releases > 0:
+        notes.append("Policy possui eventos de liberação/release registrados.")
+    if events >= MIN_SAMPLE_FOR_CONFIDENCE and releases == 0 and expired == 0:
+        notes.append("Policy acumula eventos sem ciclo claro de release/expiração.")
 
-    policy["notes"] = notes[:5]
-    return policy
+    policy["score"] = round(score, 2)
+    policy["confidence_pct"] = round(confidence, 2)
+    policy["recommendation"] = recommendation
+    policy["notes"] = notes[-5:]
 
 
-def _rebuild_summary(stats: Dict[str, Any]) -> Dict[str, Any]:
-    policies = stats.get("policies", {})
-    ranking: List[Dict[str, Any]] = []
+def _recompute_summary(stats):
+    policies = stats.get("policies") or {}
+    values = [p for p in policies.values() if isinstance(p, dict)]
+    count = len(values)
 
-    reliable = 0
-    observation = 0
-    bad = 0
-    score_sum = 0.0
-    count = 0
+    avg = 0.0
+    if values:
+        avg = sum(_safe_float(p.get("score")) for p in values) / len(values)
 
-    for code, policy in policies.items():
-        if not isinstance(policy, dict):
-            continue
-        scored = _score_policy(policy)
-        score = _safe_float(scored.get("efficiency_score"))
-        rec = str(scored.get("recommendation", ""))
-        conf = str(scored.get("confidence", ""))
+    confident = sum(1 for p in values if _safe_float(p.get("confidence_pct")) >= 70)
+    weak = sum(1 for p in values if str(p.get("recommendation")) in {"REVISAR", "ENFRAQUECER_OU_APOSENTAR"})
+    observation = max(0, count - confident - weak)
 
-        if conf != "AMOSTRA INSUFICIENTE":
-            score_sum += score
-            count += 1
-
-        if rec in {"MANTER", "MANTER_COM_MONITORAMENTO"} and conf != "AMOSTRA INSUFICIENTE":
-            reliable += 1
-        elif rec in {"REVISAR_OU_DESCONTINUAR", "REDUZIR_SEVERIDADE"} and conf != "AMOSTRA INSUFICIENTE":
-            bad += 1
-        else:
-            observation += 1
-
-        ranking.append({
-            "code": code,
-            "efficiency_score": score,
-            "confidence": conf,
-            "recommendation": rec,
-            "sample": _safe_int(scored.get("sample")),
-            "pnl_saved_pct": _safe_float(scored.get("pnl_saved_pct")),
-            "pnl_lost_pct": _safe_float(scored.get("pnl_lost_pct")),
-        })
-
-    ranking.sort(key=lambda x: (x.get("efficiency_score", 0), x.get("sample", 0)), reverse=True)
-
-    stats["policy_count"] = len(policies)
-    stats["ranking"] = ranking
     stats["summary"] = {
-        "policies_reliable": reliable,
-        "policies_observation": observation,
-        "policies_bad": bad,
-        "avg_efficiency": round(score_sum / count, 2) if count else 0.0,
+        "policy_count": count,
+        "events_seen": sum(_safe_int(p.get("events")) for p in values),
+        "events_processed": sum(_safe_int(p.get("timeline_events")) for p in values),
+        "confident_policies": confident,
+        "observation_policies": observation,
+        "weak_policies": weak,
+        "average_score": round(avg, 2),
+        "updated_at": _now(),
     }
-    stats["generated_at"] = _now_str()
-    stats["ok"] = True
-    stats["module"] = MODULE
-    stats["version"] = VERSION
+
+
+def _iter_new_timeline_events(offset, max_events):
+    """
+    Lê eventos novos por offset.
+    Retorna: events, new_offset, reached_eof
+    """
+    events = []
+    if not TIMELINE_FILE.exists():
+        return events, offset, True
+
+    new_offset = offset
+    try:
+        with open(TIMELINE_FILE, "rb") as f:
+            try:
+                f.seek(max(0, int(offset)))
+            except Exception:
+                f.seek(0)
+
+            for _ in range(max_events):
+                line = f.readline()
+                if not line:
+                    new_offset = f.tell()
+                    return events, new_offset, True
+
+                new_offset = f.tell()
+                try:
+                    decoded = line.decode("utf-8").strip()
+                    if not decoded:
+                        continue
+                    event = json.loads(decoded)
+                    if isinstance(event, dict):
+                        events.append(event)
+                except Exception:
+                    continue
+
+        return events, new_offset, False
+    except Exception:
+        return events, offset, True
+
+
+def run_executive_policy_learning(context=None, commit=True, max_events=None):
+    """
+    Roda uma atualização incremental.
+    """
+    started = time.time()
+    state = _load_state()
+    stats = _load_stats()
+
+    offset = _safe_int(state.get("timeline_offset"), 0)
+    max_events = int(max_events or MAX_EVENTS_PER_RUN)
+
+    events, new_offset, reached_eof = _iter_new_timeline_events(offset, max_events)
+
+    processed = 0
+    skipped_without_code = 0
+
+    policies = stats.setdefault("policies", {})
+
+    for event in events:
+        code = _extract_code(event)
+        if not code:
+            skipped_without_code += 1
+            continue
+
+        policy = policies.get(code)
+        if not isinstance(policy, dict):
+            policy = _policy_template(code)
+            policies[code] = policy
+
+        _apply_event_to_policy(policy, event)
+        processed += 1
+
+    state["timeline_offset"] = new_offset
+    state["last_run_at"] = _now()
+    state["last_error"] = None
+    state["events_processed"] = _safe_int(state.get("events_processed")) + processed
+    state["last_batch"] = {
+        "events_read": len(events),
+        "events_processed": processed,
+        "skipped_without_code": skipped_without_code,
+        "reached_eof": reached_eof,
+        "old_offset": offset,
+        "new_offset": new_offset,
+    }
+
+    if commit:
+        _save_stats(stats)
+        _save_state(state)
+
+    result = {
+        "ok": True,
+        "module": "executive_policy_learning",
+        "version": VERSION,
+        "generated_at": _now(),
+        "commit": commit,
+        "timeline_file": str(TIMELINE_FILE),
+        "state_file": str(STATE_FILE),
+        "stats_file": str(STATS_FILE),
+        "events_read": len(events),
+        "events_processed": processed,
+        "skipped_without_code": skipped_without_code,
+        "old_offset": offset,
+        "new_offset": new_offset,
+        "reached_eof": reached_eof,
+        "duration_ms": round((time.time() - started) * 1000, 2),
+        "summary": stats.get("summary") or {},
+    }
+
+    _append_log(result)
+    return result
+
+
+def get_executive_policy_learning_stats():
+    stats = _load_stats()
+    _recompute_summary(stats)
     return stats
 
 
-def ingest_policy_event(event: Dict[str, Any], source: str = "manual") -> Dict[str, Any]:
-    """
-    API simples para outros módulos chamarem diretamente.
-    Exemplo:
-        executive_policy_learning.ingest_policy_event(payload, source="outcome_evaluator")
-    """
-    stats = _load_stats()
-    codes = _extract_policy_codes(event)
-
-    if not codes:
-        return {
-            "ok": False,
-            "module": MODULE,
-            "version": VERSION,
-            "reason": "no_policy_code_found",
-            "generated_at": _now_str(),
-        }
-
-    applied = []
-    for code in codes:
-        policy = _get_policy(stats, code)
-        _apply_event_to_policy(policy, event)
-        applied.append(code)
-
-    event_record = {
-        "generated_at": _now_str(),
-        "source": source,
-        "codes": applied,
-        "event_type": _event_type(event),
-        "pnl_pct": _extract_pnl_pct(event),
-    }
-    _append_jsonl(POLICY_LEARNING_EVENTS_FILE, event_record)
-
-    recent = stats.setdefault("recent_events", [])
-    recent.insert(0, event_record)
-    stats["recent_events"] = recent[:MAX_RECENT_EVENTS]
-
-    stats = _rebuild_summary(stats)
-    _write_json_atomic(POLICY_LEARNING_STATS_FILE, stats)
-
-    return {
-        "ok": True,
-        "module": MODULE,
-        "version": VERSION,
-        "generated_at": _now_str(),
-        "applied_codes": applied,
-        "policy_count": stats.get("policy_count", 0),
-    }
-
-
-def run_policy_learning(max_events_per_run: Optional[int] = None) -> Dict[str, Any]:
-    """
-    Varredura incremental das fontes conhecidas.
-    Projetada para rodar em /health, /policylearning ou scheduler sem estourar memória.
-    """
-    max_events = max_events_per_run or MAX_EVENTS_PER_RUN
+def get_executive_policy_learning_health():
     state = _load_state()
     stats = _load_stats()
-    errors: List[str] = []
-    processed = 0
-    truncated_sources: List[str] = []
+    summary = stats.get("summary") or {}
 
-    sources = [
-        EXECUTIVE_POLICY_TIMELINE_FILE,
-        DECISION_LOG_FILE,
-        HISTORY_EVENTS_FILE,
-    ]
-
-    for source_path in sources:
-        if processed >= max_events:
-            break
-
-        remaining = max(1, max_events - processed)
-        offset = _safe_int(state.get("offsets", {}).get(source_path, 0))
-        events, new_offset, truncated = _read_jsonl_incremental(source_path, offset, remaining)
-        state.setdefault("offsets", {})[source_path] = new_offset
-
-        if truncated:
-            truncated_sources.append(source_path)
-
-        for event in events:
-            try:
-                codes = _extract_policy_codes(event)
-                if not codes:
-                    continue
-
-                for code in codes:
-                    policy = _get_policy(stats, code)
-                    _apply_event_to_policy(policy, event)
-
-                record = {
-                    "generated_at": _now_str(),
-                    "source": source_path,
-                    "codes": codes,
-                    "event_type": _event_type(event),
-                    "pnl_pct": _extract_pnl_pct(event),
-                }
-                _append_jsonl(POLICY_LEARNING_EVENTS_FILE, record)
-
-                recent = stats.setdefault("recent_events", [])
-                recent.insert(0, record)
-                stats["recent_events"] = recent[:MAX_RECENT_EVENTS]
-
-                processed += 1
-            except Exception as exc:
-                errors.append(f"{source_path}: {exc}")
-
-    stats = _rebuild_summary(stats)
-    _write_json_atomic(POLICY_LEARNING_STATS_FILE, stats)
-
-    state["updated_at"] = _now_str()
-    state["last_run_at"] = _now_str()
-    state["total_events_processed"] = _safe_int(state.get("total_events_processed")) + processed
-    state["last_errors"] = errors[-10:]
-    _write_json_atomic(POLICY_LEARNING_STATE_FILE, state)
+    status = "OK"
+    if not TIMELINE_FILE.exists():
+        status = "NO_TIMELINE"
+    elif _safe_int(summary.get("policy_count")) == 0:
+        status = "WAITING_DATA"
 
     return {
         "ok": True,
-        "module": MODULE,
+        "module": "executive_policy_learning",
+        "loaded": True,
         "version": VERSION,
-        "generated_at": _now_str(),
-        "processed_now": processed,
-        "total_events_processed": state.get("total_events_processed", 0),
-        "policy_count": stats.get("policy_count", 0),
-        "summary": stats.get("summary", {}),
-        "truncated_sources": truncated_sources,
-        "errors": errors[-10:],
-        "files": {
-            "state": POLICY_LEARNING_STATE_FILE,
-            "stats": POLICY_LEARNING_STATS_FILE,
-            "events": POLICY_LEARNING_EVENTS_FILE,
-        },
-        "notes": [
-            "Leitura incremental por offset para reduzir consumo de memória.",
-            "V1 não executa trades e não altera políticas; apenas aprende e recomenda.",
-            "Se truncated_sources vier preenchido, rode novamente para processar o restante aos poucos.",
-        ],
+        "status": status,
+        "timeline_file": str(TIMELINE_FILE),
+        "timeline_exists": TIMELINE_FILE.exists(),
+        "state_file": str(STATE_FILE),
+        "stats_file": str(STATS_FILE),
+        "timeline_offset": state.get("timeline_offset"),
+        "last_run_at": state.get("last_run_at"),
+        "last_error": state.get("last_error"),
+        "summary": summary,
     }
 
 
-# -----------------------------------------------------------------------------
-# Relatórios / comandos
-# -----------------------------------------------------------------------------
+def build_executive_policy_learning_report(result=None, limit=12):
+    if result is None:
+        result = run_executive_policy_learning(context={}, commit=True)
 
-def get_policy_learning_stats() -> Dict[str, Any]:
-    stats = _load_stats()
-    return _rebuild_summary(stats)
+    stats = get_executive_policy_learning_stats()
+    summary = stats.get("summary") or {}
+    policies = stats.get("policies") or {}
 
-
-def get_policy_history(code: str) -> Dict[str, Any]:
-    stats = get_policy_learning_stats()
-    policy = stats.get("policies", {}).get(code)
-    if not policy:
-        return {
-            "ok": False,
-            "module": MODULE,
-            "version": VERSION,
-            "generated_at": _now_str(),
-            "reason": "policy_not_found",
-            "code": code,
-        }
-    return {
-        "ok": True,
-        "module": MODULE,
-        "version": VERSION,
-        "generated_at": _now_str(),
-        "policy": policy,
-    }
-
-
-def build_policy_learning_report(limit: int = 10) -> str:
-    result = run_policy_learning()
-    stats = get_policy_learning_stats()
-    summary = stats.get("summary", {})
-    ranking = stats.get("ranking", [])[:limit]
-
-    lines: List[str] = []
-    lines.append("🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT")
-    lines.append(f"Data/hora: {_now_str()}")
-    lines.append(f"Status: {'✅' if result.get('ok') else '⚠️'}")
-    lines.append(f"Versão: {VERSION}")
-    lines.append("")
-    lines.append("Resumo:")
-    lines.append(f"- Eventos processados agora: {result.get('processed_now', 0)}")
-    lines.append(f"- Policies avaliadas: {stats.get('policy_count', 0)}")
-    lines.append(f"- Policies confiáveis: {summary.get('policies_reliable', 0)}")
-    lines.append(f"- Policies em observação: {summary.get('policies_observation', 0)}")
-    lines.append(f"- Policies ruins/revisar: {summary.get('policies_bad', 0)}")
-    lines.append(f"- Eficiência média: {summary.get('avg_efficiency', 0.0)}%")
-    lines.append("")
-
-    if ranking:
-        lines.append("Ranking:")
-        for idx, item in enumerate(ranking, start=1):
-            lines.append(
-                f"{idx}. {item.get('code')} | score={item.get('efficiency_score')} | "
-                f"confiança={item.get('confidence')} | recomendação={item.get('recommendation')} | "
-                f"amostra={item.get('sample')} | salvo={item.get('pnl_saved_pct')}% | perdido={item.get('pnl_lost_pct')}%"
-            )
-    else:
-        lines.append("Ranking: ainda sem policies avaliadas.")
-
-    truncated = result.get("truncated_sources") or []
-    if truncated:
-        lines.append("")
-        lines.append("Observação:")
-        lines.append("- Ainda há eventos antigos para processar. Rode /policylearning novamente para continuar incrementalmente.")
-
-    errors = result.get("errors") or []
-    if errors:
-        lines.append("")
-        lines.append("Erros recentes:")
-        for err in errors[:5]:
-            lines.append(f"- {err}")
-
-    return "\n".join(lines)
-
-
-def build_policy_ranking_report(limit: int = 20) -> str:
-    stats = get_policy_learning_stats()
-    ranking = stats.get("ranking", [])[:limit]
+    ranking = sorted(
+        [p for p in policies.values() if isinstance(p, dict)],
+        key=lambda p: (_safe_float(p.get("score")), _safe_float(p.get("confidence_pct")), _safe_int(p.get("events"))),
+        reverse=True,
+    )
 
     lines = [
-        "🏆 POLICY RANKING — CENTRAL QUANT",
-        f"Data/hora: {_now_str()}",
-        f"Versão: {VERSION}",
+        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V1",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Eventos lidos agora: {result.get('events_read', 0)}",
+        f"Eventos processados agora: {result.get('events_processed', 0)}",
+        f"Timeline EOF: {result.get('reached_eof')}",
+        "",
+        "Resumo:",
+        f"- Policies avaliadas: {summary.get('policy_count', 0)}",
+        f"- Eventos acumulados: {summary.get('events_seen', 0)}",
+        f"- Policies confiáveis: {summary.get('confident_policies', 0)}",
+        f"- Em observação: {summary.get('observation_policies', 0)}",
+        f"- Fracas/revisar: {summary.get('weak_policies', 0)}",
+        f"- Score médio: {summary.get('average_score', 0)}",
         "",
     ]
 
     if not ranking:
-        lines.append("Ainda não há policies avaliadas.")
+        lines += [
+            "Ainda não há policies suficientes no Learning.",
+            "",
+            "Leitura:",
+            "O módulo está carregado, mas precisa de eventos no Executive Policy Timeline para aprender.",
+        ]
         return "\n".join(lines)
 
-    for idx, item in enumerate(ranking, start=1):
-        lines.append(
-            f"{idx}. {item.get('code')} — score={item.get('efficiency_score')} | "
-            f"{item.get('recommendation')} | confiança={item.get('confidence')} | amostra={item.get('sample')}"
-        )
+    lines.append("Ranking:")
+    for idx, p in enumerate(ranking[:limit], start=1):
+        lines += [
+            f"{idx}. {p.get('code')}",
+            f"- Score: {p.get('score')} | Confiança: {p.get('confidence_pct')}%",
+            f"- Eventos: {p.get('events')} | Risk: {p.get('risk_events')} | Releases: {p.get('release_events')}",
+            f"- Recomendação: {p.get('recommendation')}",
+        ]
+        notes = p.get("notes") or []
+        if notes:
+            lines.append(f"- Nota: {notes[0]}")
+        lines.append("")
 
+    lines += [
+        "Observação:",
+        "V1 mede utilidade operacional por eventos de policy/timeline.",
+        "V2 poderá cruzar com Decision Log e Outcome para estimar PnL salvo/perdido.",
+    ]
     return "\n".join(lines)
 
 
-def build_policy_history_report(code: str) -> str:
-    result = get_policy_history(code)
+def build_policy_history_report(code, limit=1):
+    code = str(code or "").strip().upper()
+    stats = get_executive_policy_learning_stats()
+    policy = (stats.get("policies") or {}).get(code)
+
     lines = [
-        f"📚 POLICY HISTORY — {code}",
-        f"Data/hora: {_now_str()}",
-        f"Versão: {VERSION}",
+        f"🧠 POLICY HISTORY — {code}",
+        f"Data/hora: {_now()}",
         "",
     ]
 
-    if not result.get("ok"):
-        lines.append("Policy não encontrada no learning ainda.")
+    if not policy:
+        lines += [
+            "Policy ainda não encontrada no Executive Policy Learning.",
+            "",
+            "Sugestão:",
+            "Rode /policylearning após o Executive Policy Timeline acumular eventos.",
+        ]
         return "\n".join(lines)
 
-    p = result.get("policy", {})
-    lines.extend([
-        f"Score: {p.get('efficiency_score')}%",
-        f"Confiança: {p.get('confidence')}",
-        f"Recomendação: {p.get('recommendation')}",
+    lines += [
+        f"Score: {policy.get('score')}",
+        f"Confiança: {policy.get('confidence_pct')}%",
+        f"Recomendação: {policy.get('recommendation')}",
         "",
-        f"Amostra: {p.get('sample')}",
-        f"Acionamentos: {p.get('times_triggered')}",
-        f"Releases: {p.get('times_released')}",
-        f"Trades bloqueados: {p.get('blocked_trades')}",
-        f"Trades permitidos: {p.get('allowed_trades')}",
+        f"Eventos: {policy.get('events')}",
+        f"Criada/ativada: {policy.get('created')} / {policy.get('activated')}",
+        f"Atualizações: {policy.get('updated')}",
+        f"Risk events: {policy.get('risk_events')}",
+        f"Bloqueios estimados: {policy.get('blocked_trades_est')}",
+        f"Allows estimados: {policy.get('allowed_trades_est')}",
+        f"Releases: {policy.get('released')}",
+        f"Expirações: {policy.get('expired')}",
+        f"Auto releases: {policy.get('auto_release_events')}",
         "",
-        f"Wins: {p.get('wins')}",
-        f"Losses evitados/associados: {p.get('losses')}",
-        f"Breakevens: {p.get('breakevens')}",
-        f"Runners: {p.get('runner_count')}",
-        "",
-        f"PnL salvo estimado: {p.get('pnl_saved_pct')}%",
-        f"Lucro perdido estimado: {p.get('pnl_lost_pct')}%",
-    ])
+        f"Primeira aparição: {policy.get('first_seen_at')}",
+        f"Última aparição: {policy.get('last_seen_at')}",
+        f"Último evento: {policy.get('last_event_type')}",
+    ]
 
-    notes = p.get("notes") or []
+    if policy.get("last_reason"):
+        lines.append(f"Último motivo: {policy.get('last_reason')}")
+
+    notes = policy.get("notes") or []
     if notes:
         lines.append("")
         lines.append("Notas:")
@@ -816,33 +594,33 @@ def build_policy_history_report(code: str) -> str:
     return "\n".join(lines)
 
 
-def health() -> Dict[str, Any]:
-    state = _load_state()
-    stats = get_policy_learning_stats()
-    return {
-        "ok": True,
-        "loaded": True,
-        "module": MODULE,
-        "version": VERSION,
-        "generated_at": _now_str(),
-        "policy_count": stats.get("policy_count", 0),
-        "summary": stats.get("summary", {}),
-        "last_run_at": state.get("last_run_at"),
-        "total_events_processed": state.get("total_events_processed", 0),
-        "files": {
-            "state": POLICY_LEARNING_STATE_FILE,
-            "stats": POLICY_LEARNING_STATS_FILE,
-            "events": POLICY_LEARNING_EVENTS_FILE,
-        },
-        "notes": [
-            "Executive Policy Learning V1 carregado.",
-            "Módulo somente observacional: não executa trades e não altera políticas automaticamente.",
-            "Leitura incremental para evitar pico de memória no Render.",
-        ],
-    }
+def read_executive_policy_learning_log(limit=20):
+    if not LOG_FILE.exists():
+        return {"ok": True, "items": [], "log_file": str(LOG_FILE)}
+
+    try:
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            block = 4096
+            data = b""
+            pos = end
+            while pos > 0 and data.count(b"\n") <= limit:
+                read_size = min(block, pos)
+                pos -= read_size
+                f.seek(pos)
+                data = f.read(read_size) + data
+
+        items = []
+        for line in data.splitlines()[-limit:]:
+            try:
+                items.append(json.loads(line.decode("utf-8")))
+            except Exception:
+                pass
+        return {"ok": True, "items": items, "log_file": str(LOG_FILE)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "items": [], "log_file": str(LOG_FILE)}
 
 
-# Aliases úteis para integração com main.py
-build_report = build_policy_learning_report
-build_stats_report = build_policy_learning_report
-build_ranking_report = build_policy_ranking_report
+if __name__ == "__main__":
+    print(build_executive_policy_learning_report())

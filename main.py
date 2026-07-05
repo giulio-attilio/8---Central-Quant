@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-PROFILER-V1.4
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-EXECUTIVE-POLICY-LEARNING-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -259,6 +259,77 @@ except Exception as e:
             f"Erro: {EXECUTIVE_POLICY_TIMELINE_IMPORT_ERROR}"
         )
 
+
+try:
+    from executive_policy_learning import (
+        run_executive_policy_learning,
+        build_executive_policy_learning_report,
+        get_executive_policy_learning_health,
+        get_executive_policy_learning_stats,
+        build_policy_history_report,
+        read_executive_policy_learning_log,
+    )
+    EXECUTIVE_POLICY_LEARNING_LOADED = True
+    EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR = None
+except Exception as e:
+    EXECUTIVE_POLICY_LEARNING_LOADED = False
+    EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR = str(e)
+
+    def run_executive_policy_learning(context=None, commit=True, max_events=None):
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
+            "events_read": 0,
+            "events_processed": 0,
+            "summary": {},
+        }
+
+    def build_executive_policy_learning_report(result=None, limit=12):
+        return (
+            "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
+        )
+
+    def get_executive_policy_learning_health():
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
+        }
+
+    def get_executive_policy_learning_stats():
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
+            "policies": {},
+            "summary": {},
+        }
+
+    def build_policy_history_report(code, limit=1):
+        return (
+            f"🧠 POLICY HISTORY — {code}\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
+        )
+
+    def read_executive_policy_learning_log(limit=20):
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
+            "items": [],
+        }
+
+
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -330,9 +401,33 @@ from executive_decision_engine import (
 )
 
 
+app = Flask(__name__)
 
 # ==========================================================
-# MEMORY PROFILER V1.4 — IMPORT SEGURO
+# MEMORY PROFILER — ALIASES DEFENSIVOS V1.3.1
+# ==========================================================
+try:
+    MEMORY_PROFILER_LOADED
+except NameError:
+    MEMORY_PROFILER_LOADED = False
+
+try:
+    MEMORY_PROFILER_ERROR
+except NameError:
+    try:
+        MEMORY_PROFILER_ERROR = MEMORY_PROFILER_ERROR
+    except NameError:
+        MEMORY_PROFILER_ERROR = None
+
+try:
+    memory_profiler
+except NameError:
+    memory_profiler = None
+
+
+
+# ==========================================================
+# MEMORY PROFILER V1 — IMPORT SEGURO
 # ==========================================================
 try:
     import memory_profiler_v1 as memory_profiler
@@ -343,7 +438,6 @@ except Exception as _memory_profiler_exc:
     MEMORY_PROFILER_LOADED = False
     MEMORY_PROFILER_ERROR = str(_memory_profiler_exc)
 
-app = Flask(__name__)
 
 try:
     import broker as central_broker
@@ -1388,52 +1482,17 @@ def home():
     return f"{BOT_NAME} Online"
 
 
-@app.route("/memory")
-def memory_profiler_route():
-    """
-    Memory Profiler V1.4.
-    Endpoint leve.
-    Não inclui legacy_memory.
-    Não inclui text.
-    Não chama build_memory_report().
-    Uma chamada HTTP = um único snapshot.
-    """
-    try:
-        if MEMORY_PROFILER_LOADED and memory_profiler:
-            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
-            return memory_profiler.build_memory_json(deep=deep, include_text=False), 200
-        return {"ok": False, "loaded": False, "error": MEMORY_PROFILER_ERROR}, 500
-    except Exception as exc:
-        return {"ok": False, "route": "/memory", "error": str(exc)}, 500
-
-
-@app.route("/memorytext")
-def memory_profiler_text_route():
-    """
-    Relatório texto separado.
-    """
-    try:
-        if MEMORY_PROFILER_LOADED and memory_profiler:
-            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
-            return memory_profiler.build_memory_report(include_tracemalloc=deep, deep=deep), 200, {"Content-Type": "text/plain; charset=utf-8"}
-        return f"Memory Profiler não carregado: {MEMORY_PROFILER_ERROR}", 500, {"Content-Type": "text/plain; charset=utf-8"}
-    except Exception as exc:
-        return f"Erro no /memorytext: {exc}", 500, {"Content-Type": "text/plain; charset=utf-8"}
-
 
 @app.route("/memorylegacy")
 def memory_legacy_route():
     """
     Comparação opcional com o monitor legado.
-    Separado do /memory para evitar duplicidade de medição.
+    Não usado pelo /memory padrão para evitar duplicidade de medição.
     """
     try:
         return memory_status_payload(run_gc=False, label="/memory_legacy")
     except Exception as exc:
         return {"ok": False, "route": "/memorylegacy", "error": str(exc)}, 500
-
-
-
 
 
 @app.route("/eventbus/status")
@@ -1890,6 +1949,137 @@ def policy_timeline_stats_route():
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
         )
+
+
+
+@app.route("/policylearning", methods=["GET"])
+@app.route("/executive/policy/learning", methods=["GET"])
+def policy_learning_route():
+    """
+    Executa uma rodada incremental do Executive Policy Learning V1.
+    Não executa trades e não altera policies.
+    """
+    try:
+        check_only = str(request.args.get("check_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        try:
+            limit = int(request.args.get("limit", "12"))
+        except Exception:
+            limit = 12
+        result = run_executive_policy_learning(context={}, commit=not check_only)
+        report = build_executive_policy_learning_report(result, limit=limit)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            f"Erro na rota /policylearning: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+@app.route("/policylearninghealth", methods=["GET"])
+@app.route("/executive/policy/learning/health", methods=["GET"])
+def policy_learning_health_route():
+    try:
+        return get_executive_policy_learning_health(), 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "route": "/policylearninghealth",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/policystats", methods=["GET"])
+@app.route("/executive/policy/learning/stats", methods=["GET"])
+def policy_learning_stats_route():
+    try:
+        as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
+        if as_text:
+            return build_executive_policy_learning_report(result=None), 200, {"Content-Type": "text/plain; charset=utf-8"}
+        return get_executive_policy_learning_stats(), 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "route": "/policystats",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/policyranking", methods=["GET"])
+@app.route("/executive/policy/learning/ranking", methods=["GET"])
+def policy_learning_ranking_route():
+    try:
+        try:
+            limit = int(request.args.get("limit", "15"))
+        except Exception:
+            limit = 15
+        stats = get_executive_policy_learning_stats()
+        policies = stats.get("policies") or {}
+        ranking = sorted(
+            [p for p in policies.values() if isinstance(p, dict)],
+            key=lambda p: (float(p.get("score") or 0), float(p.get("confidence_pct") or 0), int(p.get("events") or 0)),
+            reverse=True,
+        )[:limit]
+        return {
+            "ok": True,
+            "module": "executive_policy_learning",
+            "version": stats.get("version"),
+            "generated_at": data_hora_sp_str(),
+            "ranking": ranking,
+            "summary": stats.get("summary") or {},
+        }, 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "route": "/policyranking",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/policyhistory", methods=["GET"])
+@app.route("/executive/policy/learning/history", methods=["GET"])
+def policy_learning_history_route():
+    try:
+        code = request.args.get("code") or request.args.get("policy") or ""
+        if not code:
+            return (
+                "🧠 POLICY HISTORY — CENTRAL QUANT\n"
+                "Informe a policy com ?code=WAIT_SAMPLE",
+                400,
+                {"Content-Type": "text/plain; charset=utf-8"},
+            )
+        return build_policy_history_report(code), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "🧠 POLICY HISTORY — CENTRAL QUANT\n"
+            f"Erro na rota /policyhistory: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+@app.route("/policylearninglog", methods=["GET"])
+@app.route("/executive/policy/learning/log", methods=["GET"])
+def policy_learning_log_route():
+    try:
+        try:
+            limit = int(request.args.get("limit", "20"))
+        except Exception:
+            limit = 20
+        return read_executive_policy_learning_log(limit=limit), 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "route": "/policylearninglog",
+            "error": str(exc),
+        }, 500
+
 
 @app.route("/executive/alerts/check")
 @app.route("/executive_alerts/check")
@@ -3158,6 +3348,40 @@ def runners():
     }
 
 
+
+@app.route("/memory")
+def memory_profiler_route():
+    """
+    Memory Profiler V1.3.1.
+    Endpoint leve.
+    Não inclui legacy_memory.
+    Não inclui text.
+    Não chama build_memory_report().
+    Uma chamada HTTP = um único snapshot.
+    """
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+            return memory_profiler.build_memory_json(deep=deep, include_text=False), 200
+        return {"ok": False, "loaded": False, "error": MEMORY_PROFILER_ERROR}, 500
+    except Exception as exc:
+        return {"ok": False, "route": "/memory", "error": str(exc)}, 500
+
+
+@app.route("/memorytext")
+def memory_profiler_text_route():
+    """
+    Relatório texto separado.
+    Usar pelo navegador apenas quando quiser ler o texto.
+    Telegram também pode usar build_memory_report().
+    """
+    try:
+        if MEMORY_PROFILER_LOADED and memory_profiler:
+            deep = str(request.args.get("deep", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+            return memory_profiler.build_memory_report(include_tracemalloc=deep, deep=deep), 200, {"Content-Type": "text/plain; charset=utf-8"}
+        return f"Memory Profiler não carregado: {MEMORY_PROFILER_ERROR}", 500, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return f"Erro no /memorytext: {exc}", 500, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 
