@@ -47,7 +47,48 @@ try:
 except Exception as e:
     executive_policy_manager = None
     EXECUTIVE_POLICY_MANAGER_LOADED = False
-    EXECUTIVE_POLICY_MANAGER_ERROR = str(e)    
+    EXECUTIVE_POLICY_MANAGER_ERROR = str(e)
+
+try:
+    from executive_policy_auto_release import (
+        run_executive_policy_auto_release,
+        build_executive_policy_auto_release_report,
+        get_executive_policy_auto_release_health,
+    )
+    EXECUTIVE_POLICY_AUTO_RELEASE_LOADED = True
+    EXECUTIVE_POLICY_AUTO_RELEASE_IMPORT_ERROR = None
+except Exception as e:
+    EXECUTIVE_POLICY_AUTO_RELEASE_LOADED = False
+    EXECUTIVE_POLICY_AUTO_RELEASE_IMPORT_ERROR = str(e)
+
+    def run_executive_policy_auto_release(context=None):
+        return {
+            "ok": False,
+            "module": "executive_policy_auto_release",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_AUTO_RELEASE_IMPORT_ERROR,
+            "released_codes": [],
+            "kept_codes": [],
+            "notes": ["Falha ao importar Executive Policy Auto Release no main.py."],
+        }
+
+    def build_executive_policy_auto_release_report(result=None):
+        result = result or run_executive_policy_auto_release(context={})
+        return (
+            "🔓 EXECUTIVE POLICY AUTO RELEASE — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_AUTO_RELEASE_IMPORT_ERROR}"
+        )
+
+    def get_executive_policy_auto_release_health():
+        return {
+            "ok": False,
+            "module": "executive_policy_auto_release",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_AUTO_RELEASE_IMPORT_ERROR,
+        }
+
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -1230,6 +1271,47 @@ def executive_policy_route():
         return executive_policy_manager.get_active_policies()
     except Exception as exc:
         return {"ok": False, "loaded": True, "error": str(exc)}, 500
+
+
+
+@app.route("/policyautorelease", methods=["GET"])
+@app.route("/executive/policy/auto_release", methods=["GET"])
+def policy_auto_release_route():
+    """
+    Executa uma rodada segura do Executive Policy Auto Release.
+    V1 não executa trades; apenas remove policies cuja condição de risco deixou de existir.
+    """
+    try:
+        result = run_executive_policy_auto_release(context={})
+        report = build_executive_policy_auto_release_report(result)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "🔓 EXECUTIVE POLICY AUTO RELEASE — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            f"Erro na rota /policyautorelease: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+@app.route("/policyautoreleasehealth", methods=["GET"])
+@app.route("/executive/policy/auto_release/health", methods=["GET"])
+def policy_auto_release_health_route():
+    """
+    Health check do Auto Release.
+    Não remove policies; apenas informa se o módulo carregou e o estado recente.
+    """
+    try:
+        health = get_executive_policy_auto_release_health()
+        return health, 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_auto_release",
+            "route": "/policyautoreleasehealth",
+            "error": str(exc),
+        }, 500
 
 
 @app.route("/executive/alerts/check")
@@ -7703,6 +7785,40 @@ def _executive_decision_report_block(monthly_stats=None, compact=False):
             "Ação prática: verificar executive_decision_engine.py e imports do main.py."
         )
 
+
+def _executive_policy_auto_release_report_block():
+    """Executa Auto Release e devolve relatório em texto para Telegram/HTTP."""
+    try:
+        result = run_executive_policy_auto_release(context={})
+        return build_executive_policy_auto_release_report(result)
+    except Exception as exc:
+        return (
+            "🔓 EXECUTIVE POLICY AUTO RELEASE — CENTRAL QUANT\n"
+            f"Data/hora: {data_hora_sp_str()}\n\n"
+            "Status: ERRO\n"
+            f"Erro ao executar Auto Release: {exc}\n\n"
+            "Ação prática: verificar executive_policy_auto_release.py e o import no main.py."
+        )
+
+
+def _executive_policy_auto_release_health_text():
+    """Health em texto para comando Telegram. Não executa release."""
+    try:
+        health = get_executive_policy_auto_release_health()
+    except Exception as exc:
+        health = {"ok": False, "loaded": False, "error": str(exc)}
+    return (
+        "🔓 POLICY AUTO RELEASE HEALTH — CENTRAL QUANT\n"
+        f"Data/hora: {data_hora_sp_str()}\n"
+        f"OK: {health.get('ok')}\n"
+        f"Carregado: {health.get('loaded')}\n"
+        f"Policies ativas: {health.get('active_policy_count')}\n"
+        f"Códigos ativos: {health.get('active_codes')}\n"
+        f"Última rodada: {health.get('last_run_at')}\n"
+        f"Erro: {health.get('error')}"
+    )
+
+
 def _executive_alert_monthly_stats(start_dt, end_dt):
     """
     Consolida a saúde executiva do mês com base no log do Executive Alert Manager.
@@ -8223,6 +8339,12 @@ def executive_decision_route():
     compact = str(request.args.get("compact", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
     payload = _executive_decision_snapshot_for_reports()
     return {"text": build_executive_decision_text(payload, compact=compact), "payload": payload}
+
+
+@app.route("/policyautorelease/report")
+@app.route("/policy_auto_release")
+def policy_auto_release_report_route():
+    return {"text": _executive_policy_auto_release_report_block()}
 
 
 @app.route("/dashboard")
@@ -16456,6 +16578,12 @@ def build_central_command_reply(text: str):
             return executive_policy_manager.format_policies_text(include_disabled=False)
         return f"❌ Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
 
+    if cmd0 in {"/policyautorelease", "/policy_auto_release", "/autorelease", "/releasepolicies"}:
+        return _executive_policy_auto_release_report_block()
+
+    if cmd0 in {"/policyautoreleasehealth", "/policy_auto_release_health", "/autoreleasehealth"}:
+        return _executive_policy_auto_release_health_text()
+
     if cmd0 == "/policy":
         if EXECUTIVE_POLICY_MANAGER_LOADED:
             parts = raw.split(maxsplit=1)
@@ -16744,6 +16872,8 @@ def _central_command_title(text: str):
         "/decisionengine": "EXECUTIVE DECISION",
         "/decision_engine": "EXECUTIVE DECISION",
         "/policy": "EXECUTIVE POLICY",
+        "/policyautorelease": "POLICY AUTO RELEASE",
+        "/policyautoreleasehealth": "POLICY AUTO RELEASE HEALTH",
         "/politica": "EXECUTIVE POLICY",
         "/política": "EXECUTIVE POLICY",
         "/monthly": "MENSAL",
