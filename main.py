@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-PAPER-ROUTES-V2.4.4
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-EXECUTION-ROUTES-V2.5.1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -2807,12 +2807,16 @@ def paper_lifecycle_test_close_route():
     return paper_lifecycle_test_close()
 
 
+@app.route("/executionenginehealth")
+@app.route("/executionhealth")
 @app.route("/execution_engine/health")
 @app.route("/execution/engine/health")
 def execution_engine_health_route():
     return execution_engine_health()
 
 
+@app.route("/executionenginerun", methods=["GET", "POST"])
+@app.route("/executionrun", methods=["GET", "POST"])
 @app.route("/execution_engine/run", methods=["GET", "POST"])
 @app.route("/execution/engine/run", methods=["GET", "POST"])
 def execution_engine_run_route():
@@ -2900,12 +2904,16 @@ def execution_engine_run_route():
     return engine_result
 
 
+@app.route("/executionenginetest")
+@app.route("/executiontest")
 @app.route("/execution_engine/test")
 @app.route("/execution/engine/test")
 def execution_engine_test_route():
     return execution_engine_test()
 
 
+@app.route("/executionenginelog")
+@app.route("/executionlogengine")
 @app.route("/execution_engine/log")
 @app.route("/execution/engine/log")
 def execution_engine_log_route():
@@ -2914,6 +2922,48 @@ def execution_engine_log_route():
     except Exception:
         limit = 20
     return read_execution_engine_log(limit=limit)
+
+
+@app.route("/executionroutes")
+@app.route("/execution/routes")
+def execution_routes_compat_route():
+    return {
+        "ok": True,
+        "module": "execution_routes_compat",
+        "version": "2026-07-05-EXECUTION-ROUTES-COMPAT-V2.5.1",
+        "generated_at": data_hora_sp_str(),
+        "routes": {
+            "health": [
+                "/executionenginehealth",
+                "/executionhealth",
+                "/execution_engine/health",
+                "/execution/engine/health",
+            ],
+            "test": [
+                "/executionenginetest",
+                "/executiontest",
+                "/execution_engine/test",
+                "/execution/engine/test",
+            ],
+            "log": [
+                "/executionenginelog",
+                "/executionlogengine",
+                "/execution_engine/log",
+                "/execution/engine/log",
+            ],
+            "run": [
+                "/executionenginerun",
+                "/executionrun",
+                "/execution_engine/run",
+                "/execution/engine/run",
+            ],
+        },
+        "notes": [
+            "Aliases sem underline adicionados para evitar not found.",
+            "Rotas de teste/run chamam o Execution Engine; respeitam as travas do V2.5.",
+            "Não ativam operação real sozinhas.",
+        ],
+    }
 
 
 @app.route("/paper_integrated/health")
