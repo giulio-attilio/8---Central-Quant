@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-PROFILER-V1
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-PROFILER-V1.1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -17958,7 +17958,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
             if MEMORY_PROFILER_LOADED and memory_profiler:
                 return memory_profiler.build_memory_report(include_tracemalloc=False)
         except Exception as exc:
-            return f"⚠️ Erro no Memory Profiler V1: {exc}\n\nFallback antigo:\n{build_memory_text(run_gc=False)[0]}"
+            return f"⚠️ Erro no Memory Profiler V1.1: {exc}\n\nFallback antigo:\n{build_memory_text(run_gc=False)[0]}"
         text, _payload = build_memory_text(run_gc=False)
         return text
 
@@ -17968,7 +17968,7 @@ def build_command_reply_for_module(key: str, module, cmd: str):
                 return memory_profiler.build_memory_report(include_tracemalloc=True)
         except Exception as exc:
             return f"⚠️ Erro no /memorydeep: {exc}"
-        return "Memory Profiler V1 não carregado: " + str(MEMORY_PROFILER_IMPORT_ERROR)
+        return "Memory Profiler V1.1 não carregado: " + str(MEMORY_PROFILER_IMPORT_ERROR)
 
     if cmd0 in {"/memorygc", "/memory_gc", "/memoriagc", "/memoria_gc"}:
         text, _payload = build_memory_text(run_gc=True)
