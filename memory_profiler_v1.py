@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Memory Profiler V1.2 — Central Quant
-Versão: 2026-07-05-MEMORY-PROFILER-V1.2
+Memory Profiler V1.3.1.1 — Central Quant
+Versão: 2026-07-05-MEMORY-PROFILER-V1.3.1.1
 
-Correção V1.2:
+Correção V1.3.1:
 - /memory Telegram: texto leve, 1 snapshot.
 - /memory HTTP/JSON: JSON leve, 1 snapshot.
 - build_memory_json() NÃO chama build_memory_report().
@@ -24,7 +24,7 @@ import traceback
 from datetime import datetime
 from collections import Counter
 
-VERSION = "2026-07-05-MEMORY-PROFILER-V1.2"
+VERSION = "2026-07-05-MEMORY-PROFILER-V1.3.1.1"
 
 DATA_DIR = os.environ.get("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
 SNAPSHOT_FILE = os.path.join(DATA_DIR, "memory_profiler_snapshots.jsonl")
@@ -353,7 +353,7 @@ def _run_gc_if_needed(mem, force=False):
 def collect_memory_snapshot(reason="manual", include_gc=False, include_tracemalloc=False, deep=False, force_gc=False, persist=True):
     """
     Uma chamada = um snapshot.
-    V1.2 não chama relatório dentro do JSON e não chama JSON dentro do relatório.
+    V1.3.1 não chama relatório dentro do JSON e não chama JSON dentro do relatório.
     """
     global _last_snapshot
 
@@ -444,7 +444,7 @@ def _format_memory_report_from_snapshot(snapshot, recent=None):
 
     status, emoji, _severity = _status_from_pct(pct)
 
-    title = "🧠 MEMORY PROFILER DEEP — CENTRAL QUANT V1.2" if deep else "🧠 MEMORY PROFILER — CENTRAL QUANT V1.2"
+    title = "🧠 MEMORY PROFILER DEEP — CENTRAL QUANT V1.3.1" if deep else "🧠 MEMORY PROFILER — CENTRAL QUANT V1.3.1"
 
     lines = [
         title,
@@ -536,7 +536,7 @@ def _format_memory_report_from_snapshot(snapshot, recent=None):
 def build_memory_report(include_tracemalloc=False, deep=False):
     """
     Telegram/texto.
-    V1.2: exatamente 1 snapshot.
+    V1.3.1: exatamente 1 snapshot.
     """
     if include_tracemalloc and not deep:
         deep = True
@@ -556,7 +556,7 @@ def build_memory_report(include_tracemalloc=False, deep=False):
 def build_memory_json(deep=False, include_text=False):
     """
     HTTP/JSON.
-    V1.2: exatamente 1 snapshot.
+    V1.3.1: exatamente 1 snapshot.
     Por padrão NÃO inclui text para evitar gerar relatório duplicado.
     """
     snapshot = collect_memory_snapshot(
