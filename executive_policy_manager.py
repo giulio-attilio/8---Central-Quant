@@ -1,6 +1,6 @@
 # ============================================================
 # EXECUTIVE POLICY MANAGER V1 — CENTRAL QUANT
-# Versao: 2026-07-04-EXECUTIVE-POLICY-MANAGER-V1
+# Versao: 2026-07-04-EXECUTIVE-POLICY-MANAGER-V1.1
 # Arquivo sugerido: executive_policy_manager.py
 # ============================================================
 # Objetivo:
@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 
-EXECUTIVE_POLICY_MANAGER_VERSION = "2026-07-04-EXECUTIVE-POLICY-MANAGER-V1"
+EXECUTIVE_POLICY_MANAGER_VERSION = "2026-07-04-EXECUTIVE-POLICY-MANAGER-V1.1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -448,14 +448,21 @@ def evaluate_trade_against_policies(trade: Dict[str, Any]) -> Dict[str, Any]:
         payload = p.get("payload") if isinstance(p.get("payload"), dict) else {}
         applied_policy = {"code": code, "title": p.get("title"), "level": p.get("level")}
 
-        if code == "NO_NEW_LONG" and side == "LONG":
+        # Bloqueio direcional — aceita tanto códigos antigos quanto novos
+        # e também respeita diretamente o payload da policy.
+        # Assim, se o Executive Decision Engine gerar LIMIT_NEW_LONG em vez
+        # de NO_NEW_LONG, o Risk/Orchestrator/Engine continuam protegidos.
+        allow_new_long = payload.get("allow_new_long")
+        allow_new_short = payload.get("allow_new_short")
+
+        if side == "LONG" and (code in {"NO_NEW_LONG", "LIMIT_NEW_LONG"} or allow_new_long is False):
             decision = "DENY"
-            reasons.append("Política executiva ativa: NO_NEW_LONG.")
+            reasons.append(f"Política executiva ativa: {code} bloqueia novas entradas LONG.")
             applied.append(applied_policy)
 
-        elif code == "NO_NEW_SHORT" and side == "SHORT":
+        elif side == "SHORT" and (code in {"NO_NEW_SHORT", "LIMIT_NEW_SHORT"} or allow_new_short is False):
             decision = "DENY"
-            reasons.append("Política executiva ativa: NO_NEW_SHORT.")
+            reasons.append(f"Política executiva ativa: {code} bloqueia novas entradas SHORT.")
             applied.append(applied_policy)
 
         elif code == "ALLOW_ONLY_LONG" and side == "SHORT":

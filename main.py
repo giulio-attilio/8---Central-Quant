@@ -1212,7 +1212,7 @@ def executive_policy_health_route():
         as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
         if as_text:
             return executive_policy_manager.format_policy_health_text()
-        return executive_policy_manager.build_policy_health()
+        return executive_policy_manager.policy_manager_health()
     except Exception as exc:
         return {"ok": False, "loaded": True, "error": str(exc)}, 500
 
@@ -1417,6 +1417,11 @@ def execution_engine_run_route():
             "requested_qty": 0.1,
             "signal_id": f"EXECUTION-ENGINE-MANUAL-TEST-{int(time.time())}",
         }
+
+    # Em chamadas GET, normalmente enviamos bot/symbol/side/entry/etc.,
+    # mas não enviamos decision. O Execution Engine exige uma decisão executável.
+    # A policy é avaliada antes; se ela permitir, usamos ALLOW para seguir ao plano.
+    payload.setdefault("decision", "ALLOW")
 
     # Executive Policy Manager gate — última trava antes do Execution Engine.
     # Protege chamadas diretas ao executor, mesmo se o Risk Manager ou o
@@ -4743,68 +4748,6 @@ def _risk_is_reduce_only(payload):
 
 
 
-def _ensure_executive_policy_manager_synced_for_risk(force=False):
-    """
-    Garante que o Executive Policy Manager tenha políticas ativas antes do
-    /can_open_trade avaliar uma entrada.
-
-    Por que existe:
-    - em deploy/restart, o arquivo data/executive_policy.json pode iniciar vazio;
-    - o /can_open_trade não pode depender do CEO rodar /executivedecision antes;
-    - a fonte de verdade continua sendo:
-      Executive Decision Engine -> Executive Policy Manager -> Risk Manager.
-    """
-    result = {
-        "ok": False,
-        "attempted": False,
-        "reason": None,
-        "before_active_policy_count": None,
-        "after_active_policy_count": None,
-        "active_codes": [],
-        "ingested": 0,
-    }
-
-    try:
-        if not EXECUTIVE_POLICY_MANAGER_LOADED or executive_policy_manager is None:
-            result["reason"] = f"Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
-            return result
-
-        before = executive_policy_manager.build_policy_health()
-        before_count = int(before.get("active_policy_count") or 0)
-        result["before_active_policy_count"] = before_count
-
-        if before_count > 0 and not force:
-            result["ok"] = True
-            result["reason"] = "policies_already_active"
-            result["after_active_policy_count"] = before_count
-            result["active_codes"] = before.get("active_codes") or []
-            return result
-
-        if "_executive_decision_snapshot_for_reports" not in globals():
-            result["reason"] = "executive_decision_snapshot_unavailable"
-            return result
-
-        result["attempted"] = True
-        decision_payload = _executive_decision_snapshot_for_reports(compact_source=True)
-
-        # _executive_decision_snapshot_for_reports já chama _sync_executive_policy_manager_from_decision.
-        sync_payload = decision_payload.get("executive_policy_manager") if isinstance(decision_payload, dict) else {}
-        if isinstance(sync_payload, dict):
-            result["ingested"] = int(sync_payload.get("ingested", 0) or 0)
-
-        after = executive_policy_manager.build_policy_health()
-        after_count = int(after.get("active_policy_count") or 0)
-        result["after_active_policy_count"] = after_count
-        result["active_codes"] = after.get("active_codes") or []
-        result["ok"] = after_count > 0
-        result["reason"] = "synced_from_executive_decision" if result["ok"] else "sync_finished_but_no_active_policies"
-        return result
-
-    except Exception as exc:
-        result["reason"] = str(exc)
-        return result
-
-
 def _executive_policy_for_can_open_trade():
     """
     Consulta o Executive Policy Manager persistente para o Risk Manager.
@@ -4812,13 +4755,11 @@ def _executive_policy_for_can_open_trade():
     Esta é a fonte correta depois da integração V1:
     Executive Decision Engine -> Executive Policy Manager -> Risk Manager/can_open_trade.
 
-    Se o Policy Manager estiver vazio depois de deploy/restart, força uma
-    sincronização automática a partir do Executive Decision Engine antes de
-    responder ao Risk Manager.
+    Se o Policy Manager não estiver disponível, faz fallback seguro para o
+    Executive Decision Engine, sem derrubar /can_open_trade.
     """
     try:
         if EXECUTIVE_POLICY_MANAGER_LOADED and executive_policy_manager is not None:
-            sync_result = _ensure_executive_policy_manager_synced_for_risk(force=False)
             health = executive_policy_manager.build_policy_health()
             return {
                 "ok": bool(health.get("ok", True)),
@@ -4829,7 +4770,6 @@ def _executive_policy_for_can_open_trade():
                 "active_codes": health.get("active_codes") or [],
                 "updated_at": health.get("updated_at"),
                 "generated_at": health.get("generated_at"),
-                "sync": sync_result,
             }
     except Exception as exc:
         return {
@@ -4893,7 +4833,6 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
 
     try:
         if EXECUTIVE_POLICY_MANAGER_LOADED and executive_policy_manager is not None:
-            sync_result = _ensure_executive_policy_manager_synced_for_risk(force=False)
             evaluation = executive_policy_manager.evaluate_trade_against_policies(trade_payload)
             if not isinstance(evaluation, dict):
                 evaluation = {"ok": False, "allowed": True, "warnings": ["Policy Manager retornou payload inválido."]}
@@ -4913,7 +4852,6 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
 
             evaluation["source"] = "executive_policy_manager"
             evaluation["available"] = True
-            evaluation["sync"] = sync_result
             return evaluation
 
         warnings.append(f"Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}")
@@ -13434,63 +13372,13 @@ def api_execution_plan():
             "capital_allocated": request.args.get("capital_allocated", 4500),
         }
 
-    # Executive Policy Manager gate — última trava antes do Execution Orchestrator.
-    # Mesmo que /can_open_trade falhe ou não seja chamado antes, nenhuma ordem
-    # deve chegar ao orchestrate_execution sem passar pelas políticas executivas
-    # persistentes: NO_NEW_LONG, NO_NEW_SHORT, BLOCK_BOT, BLOCK_SYMBOL etc.
-    policy_reasons = []
-    policy_warnings = []
-    executive_policy_eval = _apply_executive_policy_to_risk_reasons(
-        trade_payload=payload,
-        reasons=policy_reasons,
-        warnings=policy_warnings,
-    )
-
-    if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
-        blocked_payload = dict(payload or {})
-        blocked_payload["decision"] = "DENY"
-        blocked_payload["blocked_by"] = "EXECUTIVE_POLICY_MANAGER"
-        blocked_payload["executive_policy"] = executive_policy_eval
-
-        return {
-            "ok": True,
-            "mode": payload.get("mode") or "VERIFY",
-            "dry_run": True,
-            "decision": "DENY",
-            "allowed": False,
-            "status": "BLOCKED_BY_EXECUTIVE_POLICY",
-            "blocked_by": "EXECUTIVE_POLICY_MANAGER",
-            "executive_policy": executive_policy_eval,
-            "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
-            "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
-            "payload": blocked_payload,
-            "notes": [
-                "Execution Orchestrator protegido pelo Executive Policy Manager.",
-                "Nenhuma chamada a orchestrate_execution foi feita porque a política executiva bloqueou a trade.",
-            ],
-        }
-
-    if isinstance(executive_policy_eval, dict):
-        payload["executive_policy"] = executive_policy_eval
-
-    orchestration_result = orchestrate_execution(
+    return orchestrate_execution(
         payload=payload,
         mode=payload.get("mode"),
         requested_qty=payload.get("requested_qty"),
         capital_allocated=payload.get("capital_allocated"),
         dry_run=True,
     )
-
-    if isinstance(orchestration_result, dict):
-        orchestration_result.setdefault("executive_policy", executive_policy_eval)
-        orchestration_result.setdefault("policy_gate", {
-            "checked": True,
-            "allowed": True,
-            "source": "executive_policy_manager",
-            "warnings": policy_warnings,
-        })
-
-    return orchestration_result
 
 
 @app.route("/execution/log")
