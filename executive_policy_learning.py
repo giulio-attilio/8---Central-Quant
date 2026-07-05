@@ -2984,7 +2984,7 @@ def build_policy_effect_rebuild_report(result=None):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.2.2 — POLICY OUTCOME LINKER
+# EXECUTIVE POLICY LEARNING V2.3 — REAL CLOSED OUTCOME FILTER
 # ==========================================================
 # Objetivo:
 # - Manter a V2.1.8 funcionando como Policy Effect.
@@ -3948,7 +3948,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING V2.2.4 — OUTCOME RAW INSPECTOR",
+        "🧠 EXECUTIVE POLICY LEARNING V2.3 — REAL CLOSED OUTCOME FILTER",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -4025,7 +4025,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
 
     lines += [
         "Observação:",
-        "V2.2.4 não inventa PnL para trades bloqueados. Ela diagnostica os campos reais dos outcomes linkados para calibrar o parser.",
+        "V2.3 não inventa PnL para trades bloqueados. Ela diagnostica os campos reais dos outcomes linkados para calibrar o parser.",
         "A próxima etapa usa este diagnóstico para mapear PnL/R corretamente.",
     ]
     return "\n".join(lines)
@@ -4259,7 +4259,7 @@ def build_policy_effect_rebuild_report(result=None):
 
     lines += [
         "Leitura:",
-        "A V2.2.4 cruza policies com outcomes/lifecycle em lotes menores e diagnostica campos para evitar timeout quando houver fechamento correlacionável.",
+        "A V2.3 cruza policies com outcomes/lifecycle em lotes menores e diagnostica campos para evitar timeout quando houver fechamento correlacionável.",
         "Ela não inventa PnL para bloqueios; PnL evitado será uma camada hipotética futura.",
         "",
         "Próximos comandos:",
@@ -4273,7 +4273,7 @@ def build_policy_effect_rebuild_report(result=None):
     if diag:
         lines += [
             "",
-            "Diagnóstico V2.2.4 — campos dos outcomes linkados:",
+            "Diagnóstico V2.3 — campos dos outcomes linkados:",
             "Campos numéricos mais frequentes:",
         ]
         for name, count in (diag.get("top_numeric_field_presence") or [])[:15]:
@@ -4289,7 +4289,7 @@ def build_policy_effect_rebuild_report(result=None):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.2.4 — OUTCOME RAW INSPECTOR
+# EXECUTIVE POLICY LEARNING V2.3 — REAL CLOSED OUTCOME FILTER
 # ==========================================================
 # Objetivo:
 # - manter todo o linker da V2.2;
@@ -4299,7 +4299,7 @@ def build_policy_effect_rebuild_report(result=None):
 # - não inventar PnL para bloqueios DENY/BLOCK;
 # - diagnosticar os campos reais dos outcomes linkados para calibrar o parser.
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2.4"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.3"
 
 try:
     import ast as _ast_v222
@@ -4562,7 +4562,7 @@ def _extract_outcome_payload(event):
         "event_type": event_type,
         "dt": _outcome_identity(event).get("dt"),
         "source_event": str(_v222_deep_get_any(event, ["source", "event", "event_type"]) or "unknown")[:80],
-        "parser_version": "V2.2.4",
+        "parser_version": "V2.3",
     }
 
 
@@ -4846,6 +4846,203 @@ def _recompute_effect_summary(effect):
         "learn_with_caution": caution,
         "wait_sample": wait,
         "average_effect_score": round(avg, 2),
-        "parser_version": "V2.2.4",
+        "parser_version": "V2.3",
         "updated_at": _now(),
     }
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.3 — REAL CLOSED OUTCOME FILTER
+# ==========================================================
+# Objetivo:
+# - separar eventos genéricos SIGNAL/DECISION/EVENT de fechamentos financeiros reais;
+# - aceitar como outcome financeiro apenas TRADE_CLOSED/CLOSE/CLOSED/SL/TP final
+#   ou eventos com campos financeiros reais (pnl_pct, result_pct, result_r, pnl_usdt, exit_price etc.);
+# - impedir que risk_pct/score/contexto sejam tratados como PnL;
+# - manter o diagnóstico de campos da V2.2.4 para calibragem futura.
+
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.3"
+
+_V23_GENERIC_NON_OUTCOME_LABELS = {
+    "", "UNKNOWN", "EVENT", "RISK_DECISION", "SIGNAL", "DECISION", "ALLOW", "DENY", "BLOCK",
+    "VERIFY", "OPEN", "ACTIVE", "PENDING", "NONE", "NULL", "NORMAL", "MONITOR", "ALERTA",
+}
+
+_V23_REAL_CLOSE_EVENT_TYPES = {
+    "TRADE_CLOSED", "CLOSED", "CLOSE", "POSITION_CLOSED", "PAPER_TRADE_CLOSED",
+    "TRADE_EXIT", "EXIT", "STOP_LOSS", "TAKE_PROFIT", "SL", "TP", "TP100",
+    "ENCERRADO", "FECHADO", "CLOSE_POSITION", "ORDER_CLOSED",
+}
+
+_V23_REAL_CLOSE_BLOB_TOKENS = [
+    '"EVENT":"TRADE_CLOSED"', '"EVENT_RAW":"TRADE_CLOSED"', '"EVENT_TYPE":"TRADE_CLOSED"',
+    '"EVENT":"POSITION_CLOSED"', '"EVENT_TYPE":"POSITION_CLOSED"',
+    '"EVENT":"CLOSE"', '"EVENT_TYPE":"CLOSE"',
+    '"CLOSED_AT"', '"EXIT_AT"', '"CLOSE_TIME"',
+    '"EXIT_PRICE"', '"CLOSE_PRICE"', '"CLOSED_PRICE"',
+    '"RESULT_PCT"', '"PNL_PCT"', '"PNL_USDT"', '"RESULT_R"', '"REALIZED_PNL"',
+    '"CLOSE_REASON"', '"FINAL_RESULT"',
+    'TRADE_CLOSED', 'POSITION_CLOSED', 'PAPER_TRADE_CLOSED',
+]
+
+_V23_EXCLUDED_NUMERIC_KEYS = {"risk_pct", "risk", "risco", "score", "adx", "rsi", "epoch", "hour", "minute", "weekday_num"}
+
+
+def _v23_norm_label(value):
+    return str(value or "").strip().upper().replace(" ", "_").replace("-", "_")
+
+
+def _v23_event_type(event):
+    value = _v222_deep_get_any(event, ["event_type", "event", "type", "action", "event_raw"])
+    return _v23_norm_label(value)
+
+
+def _v23_has_financial_numeric(event):
+    """Detecta somente campos financeiros, não risco/score/contexto."""
+    financial_keys = [
+        "pnl_pct", "result_pct", "profit_pct", "pnl_percent", "return_pct", "pnl_total_pct",
+        "realized_pnl_pct", "realized_pct", "net_pnl_pct", "profit_loss_pct", "performance_pct",
+        "roi_pct", "pnl_percentage", "final_pnl_pct", "trade_pnl_pct",
+        "resultado_pct", "lucro_pct", "prejuizo_pct", "prejuízo_pct",
+        "result_r", "pnl_r", "r_result", "r_multiple", "profit_r", "r_total", "rr",
+        "resultado_r", "risk_reward", "multiple_r",
+        "pnl_usdt", "profit_usdt", "realized_pnl", "net_pnl", "pnl_total_usdt",
+        "profit_loss", "realized_profit", "resultado_usdt", "lucro_usdt",
+    ]
+    for key in financial_keys:
+        value = _v222_deep_get_any(event, [key])
+        if value not in (None, "", "None", "NONE", "null", "NULL"):
+            if _v222_safe_float(value, default=None) is not None:
+                return True
+    return False
+
+
+def _v23_has_exit_price(event):
+    exit_price = _v222_extract_numeric_any(event, [
+        "exit_price", "exit", "close_price", "closed_price", "preco_saida", "saida", "price_exit", "final_price"
+    ])
+    entry = _v222_extract_numeric_any(event, [
+        "entry", "entry_price", "entrada", "open_price", "price_entry", "avg_entry", "entry_avg"
+    ])
+    return entry not in (None, 0) and exit_price is not None
+
+
+def _v23_is_real_closed_event(event, label=None):
+    """Filtro central da V2.3: só true para fechamento financeiro real."""
+    if not isinstance(event, dict):
+        return False
+
+    event_type = _v23_event_type(event)
+    norm_label = _v23_norm_label(label or _v222_pick_label(event))
+
+    # Eventos genéricos do History/Decision Log nunca são outcome financeiro por si só.
+    if event_type in {"EVENT", "RISK_DECISION", "SIGNAL", "DECISION", "RISK_ALLOW", "RISK_DENY"} and not _v23_has_financial_numeric(event) and not _v23_has_exit_price(event):
+        return False
+
+    if event_type in _V23_REAL_CLOSE_EVENT_TYPES:
+        return True
+
+    if norm_label in _V23_REAL_CLOSE_EVENT_TYPES or norm_label in {"WIN", "LOSS", "BREAKEVEN", "BE", "PROFIT", "GAIN"}:
+        # Label vencedor/perdedor só vale se há campo financeiro, preço de saída ou evento close explícito.
+        if _v23_has_financial_numeric(event) or _v23_has_exit_price(event):
+            return True
+
+    if _v23_has_financial_numeric(event):
+        return True
+
+    if _v23_has_exit_price(event):
+        return True
+
+    blob = _v222_text_blob(event)
+    # Usa tokens estruturais; evita 'STOP' genérico porque toda decisão tem stop de entrada.
+    if any(token in blob for token in _V23_REAL_CLOSE_BLOB_TOKENS):
+        return True
+
+    return False
+
+
+def _extract_outcome_payload(event):
+    """V2.3: extrai apenas outcome financeiro fechado real; ignora EVENT/SIGNAL/DECISION genéricos."""
+    if not isinstance(event, dict):
+        return None
+
+    label = _v222_pick_label(event)
+    if not _v23_is_real_closed_event(event, label=label):
+        return None
+
+    pnl_pct = _v222_extract_numeric_any(event, [
+        "pnl_pct", "result_pct", "profit_pct", "pnl_percent", "return_pct", "pnl_total_pct",
+        "realized_pnl_pct", "realized_pct", "net_pnl_pct", "profit_loss_pct", "performance_pct",
+        "roi_pct", "pnl_percentage", "final_pnl_pct", "trade_pnl_pct",
+        "resultado_pct", "lucro_pct", "prejuizo_pct", "prejuízo_pct"
+    ])
+    result_r = _v222_extract_numeric_any(event, [
+        "result_r", "pnl_r", "r_result", "r_multiple", "profit_r", "r_total", "rr",
+        "resultado_r", "risk_reward", "multiple_r"
+    ])
+    pnl_usdt = _v222_extract_numeric_any(event, [
+        "pnl_usdt", "profit_usdt", "realized_pnl", "net_pnl", "pnl_total_usdt",
+        "profit_loss", "realized_profit", "resultado_usdt", "lucro_usdt"
+    ])
+
+    if pnl_pct is None:
+        pnl_pct = _v222_compute_pct_from_prices(event, label)
+
+    if result_r is None and pnl_pct is not None:
+        risk_pct = _v222_extract_numeric_any(event, ["risk_pct", "initial_risk_pct", "risk_percent"])
+        if risk_pct not in (None, 0):
+            try:
+                result_r = round(float(pnl_pct) / abs(float(risk_pct)), 6)
+            except Exception:
+                result_r = None
+
+    # Reclassifica label se veio genérica.
+    norm_label = _v23_norm_label(label)
+    if norm_label in _V23_GENERIC_NON_OUTCOME_LABELS:
+        if result_r is not None:
+            label = "WIN" if result_r > 0 else "LOSS" if result_r < 0 else "BREAKEVEN"
+        elif pnl_pct is not None:
+            label = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < 0 else "BREAKEVEN"
+        elif pnl_usdt is not None:
+            label = "WIN" if pnl_usdt > 0 else "LOSS" if pnl_usdt < 0 else "BREAKEVEN"
+        else:
+            label = "UNKNOWN_CLOSED"
+
+    event_type = _v23_event_type(event)
+    return {
+        "label": str(label or "UNKNOWN_CLOSED").upper(),
+        "pnl_pct": pnl_pct,
+        "result_r": result_r,
+        "pnl_usdt": pnl_usdt,
+        "event_type": event_type,
+        "dt": _outcome_identity(event).get("dt"),
+        "source_event": str(_v222_deep_get_any(event, ["source", "event", "event_type", "event_raw"]) or "unknown")[:80],
+        "parser_version": "V2.3",
+        "real_closed_filter": True,
+    }
+
+
+def _v23_previous_recompute_effect_summary(effect):
+    # placeholder; replaced below only if previous function exists in globals
+    return None
+
+try:
+    _V224_recompute_effect_summary = _recompute_effect_summary
+except Exception:
+    _V224_recompute_effect_summary = None
+
+
+def _recompute_effect_summary(effect):
+    if callable(_V224_recompute_effect_summary):
+        _V224_recompute_effect_summary(effect)
+    summary = effect.setdefault("summary", {})
+    summary["parser_version"] = "V2.3"
+    summary["real_closed_outcome_filter"] = True
+    summary["notes"] = [
+        "V2.3 conta como outcome financeiro apenas fechamentos reais ou eventos com PnL/R/preço de saída.",
+        "Eventos genéricos EVENT/SIGNAL/RISK_DECISION não entram mais como outcome financeiro.",
+    ]
+    effect["version"] = VERSION
+    return effect
+
+# Ajuste de texto para relatórios que usam VERSION dinamicamente.
