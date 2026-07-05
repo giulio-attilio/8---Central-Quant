@@ -3484,6 +3484,18 @@ def _ensure_outcome_fields(policy):
     policy.setdefault("last_outcome_at", None)
     policy.setdefault("last_outcome_source", None)
     policy.setdefault("outcome_status", "WAITING_OUTCOME")
+    policy.setdefault("outcome_value_diagnostics", {
+        "linked_samples": 0,
+        "with_numeric_value": 0,
+        "without_numeric_value": 0,
+        "field_presence": {},
+        "numeric_field_presence": {},
+        "label_presence": {},
+        "event_type_presence": {},
+        "source_files": {},
+        "sample_field_paths": [],
+        "sample_events": [],
+    })
 
 
 def _recompute_policy_outcome_metrics(policy):
@@ -3936,7 +3948,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING V2.2.2 — POLICY OUTCOME LINKER",
+        "🧠 EXECUTIVE POLICY LEARNING V2.2.4 — OUTCOME RAW INSPECTOR",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -3959,6 +3971,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
         f"- Wins/Losses: {summary.get('wins', 0)}/{summary.get('losses', 0)}",
         f"- Win rate: {summary.get('win_rate_pct', 0)}%",
         f"- PnL total pct: {summary.get('pnl_total_pct', 0)}%",
+        f"- Outcomes sem valor numérico: {summary.get('outcomes_without_value', 0)}",
         f"- READY_TO_LEARN: {summary.get('ready_to_learn', 0)}",
         f"- LEARN_WITH_CAUTION: {summary.get('learn_with_caution', 0)}",
         f"- WAIT_SAMPLE: {summary.get('wait_sample', 0)}",
@@ -3987,6 +4000,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
             f"- PnL pct: total={p.get('pnl_total_pct', 0)} | avg={p.get('pnl_avg_pct', 0)} | PF={p.get('profit_factor_pct')}",
             f"- R total/avg: {p.get('result_r_total', 0)} / {p.get('result_r_avg', 0)} | DD max: {p.get('max_drawdown_pct', 0)}%",
             f"- Outcome status: {p.get('outcome_status')}",
+            f"- Diagnóstico outcome: sem_valor={p.get('outcomes_without_value', 0)} | unknown={p.get('outcome_unknown', 0)}",
             f"- Recomendação: {p.get('recommendation')}",
         ]
         notes = p.get("notes") or []
@@ -3994,10 +4008,25 @@ def build_executive_policy_effect_report(result=None, limit=12):
             lines.append(f"- Nota: {notes[0]}")
         lines.append("")
 
+    diag = summary.get("outcome_field_diagnostics") or {}
+    if diag:
+        lines += [
+            "",
+            "Diagnóstico dos campos dos outcomes linkados:",
+            "Top campos numéricos candidatos:",
+        ]
+        for name, count in (diag.get("top_numeric_field_presence") or [])[:12]:
+            lines.append(f"- {name}: {count}")
+        lines += ["Top labels/event types:"]
+        for name, count in (diag.get("top_labels") or [])[:8]:
+            lines.append(f"- label {name}: {count}")
+        for name, count in (diag.get("top_event_types") or [])[:8]:
+            lines.append(f"- event_type {name}: {count}")
+
     lines += [
         "Observação:",
-        "V2.2 não inventa PnL para trades bloqueados. Ela só mede outcome real quando há ciclo/fechamento correlacionável.",
-        "A próxima etapa pode criar uma análise hipotética separada para PnL evitado/perdido por bloqueios.",
+        "V2.2.4 não inventa PnL para trades bloqueados. Ela diagnostica os campos reais dos outcomes linkados para calibrar o parser.",
+        "A próxima etapa usa este diagnóstico para mapear PnL/R corretamente.",
     ]
     return "\n".join(lines)
 
@@ -4057,6 +4086,7 @@ def build_policy_insights_report():
         f"WAIT_SAMPLE: {summary.get('wait_sample', 0)}",
         f"Outcomes detectados: {summary.get('outcomes_detected', 0)}",
         f"PnL total correlacionado: {summary.get('pnl_total_pct', 0)}%",
+        f"Outcomes sem valor numérico: {summary.get('outcomes_without_value', 0)}",
         "",
     ]
 
@@ -4229,7 +4259,7 @@ def build_policy_effect_rebuild_report(result=None):
 
     lines += [
         "Leitura:",
-        "A V2.2.3 cruza policies com outcomes/lifecycle em lotes menores para evitar timeout quando houver fechamento correlacionável.",
+        "A V2.2.4 cruza policies com outcomes/lifecycle em lotes menores e diagnostica campos para evitar timeout quando houver fechamento correlacionável.",
         "Ela não inventa PnL para bloqueios; PnL evitado será uma camada hipotética futura.",
         "",
         "Próximos comandos:",
@@ -4238,20 +4268,38 @@ def build_policy_effect_rebuild_report(result=None):
         "/policyinsights",
     ]
 
+
+    diag = summary.get("outcome_field_diagnostics") or {}
+    if diag:
+        lines += [
+            "",
+            "Diagnóstico V2.2.4 — campos dos outcomes linkados:",
+            "Campos numéricos mais frequentes:",
+        ]
+        for name, count in (diag.get("top_numeric_field_presence") or [])[:15]:
+            lines.append(f"- {name}: {count}")
+        lines.append("Labels mais frequentes:")
+        for name, count in (diag.get("top_labels") or [])[:10]:
+            lines.append(f"- {name}: {count}")
+        lines.append("Event types mais frequentes:")
+        for name, count in (diag.get("top_event_types") or [])[:10]:
+            lines.append(f"- {name}: {count}")
+
     return "\n".join(lines)
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.2.2 — OUTCOME VALUE PARSER HOTFIX
+# EXECUTIVE POLICY LEARNING V2.2.4 — OUTCOME RAW INSPECTOR
 # ==========================================================
 # Objetivo:
 # - manter todo o linker da V2.2;
 # - melhorar a extração real de valores de outcome/PnL/R;
 # - ler campos dentro de raw/details/payload/context e strings JSON/Python-like;
 # - calcular pnl_pct a partir de entry/exit/stop/tp quando possível;
-# - não inventar PnL para bloqueios DENY/BLOCK.
+# - não inventar PnL para bloqueios DENY/BLOCK;
+# - diagnosticar os campos reais dos outcomes linkados para calibrar o parser.
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2.3"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2.4"
 
 try:
     import ast as _ast_v222
@@ -4514,9 +4562,131 @@ def _extract_outcome_payload(event):
         "event_type": event_type,
         "dt": _outcome_identity(event).get("dt"),
         "source_event": str(_v222_deep_get_any(event, ["source", "event", "event_type"]) or "unknown")[:80],
-        "parser_version": "V2.2.2",
+        "parser_version": "V2.2.4",
     }
 
+
+
+
+def _v224_inc_counter(mapping, key, inc=1):
+    if not isinstance(mapping, dict):
+        return
+    k = str(key or "UNKNOWN")[:160]
+    mapping[k] = _safe_int(mapping.get(k)) + inc
+
+
+def _v224_flatten_field_paths(obj, prefix="", depth=0, out=None, max_paths=240):
+    """Lista caminhos de campos de um outcome real para diagnóstico, sem expor valores grandes."""
+    if out is None:
+        out = []
+    if depth > 5 or obj is None or len(out) >= max_paths:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if len(out) >= max_paths:
+                break
+            key = str(k)[:80]
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(v, dict):
+                out.append({"path": path, "type": "dict", "kind": "container"})
+                _v224_flatten_field_paths(v, path, depth + 1, out, max_paths)
+            elif isinstance(v, list):
+                out.append({"path": path, "type": "list", "kind": "container", "len": len(v)})
+                for item in v[:3]:
+                    if isinstance(item, (dict, list)):
+                        _v224_flatten_field_paths(item, path + "[]", depth + 1, out, max_paths)
+            else:
+                val = v
+                val_txt = str(val)
+                is_num = False
+                try:
+                    float(val_txt.replace("%", "").replace(",", "."))
+                    is_num = True
+                except Exception:
+                    is_num = False
+                kind = "numeric_like" if is_num else "scalar"
+                # guarda preview curto apenas para diagnóstico operacional
+                preview = val_txt[:80]
+                out.append({"path": path, "type": type(v).__name__, "kind": kind, "preview": preview})
+    elif isinstance(obj, list):
+        for item in obj[:5]:
+            _v224_flatten_field_paths(item, prefix + "[]", depth + 1, out, max_paths)
+    return out
+
+
+def _v224_update_outcome_diagnostics(policy, outcome_match, outcome):
+    """Acumula diagnóstico dos campos reais encontrados nos outcomes linkados."""
+    _ensure_outcome_fields(policy)
+    diag = policy.setdefault("outcome_value_diagnostics", {})
+    diag.setdefault("linked_samples", 0)
+    diag.setdefault("with_numeric_value", 0)
+    diag.setdefault("without_numeric_value", 0)
+    diag.setdefault("field_presence", {})
+    diag.setdefault("numeric_field_presence", {})
+    diag.setdefault("label_presence", {})
+    diag.setdefault("event_type_presence", {})
+    diag.setdefault("source_files", {})
+    diag.setdefault("sample_field_paths", [])
+    diag.setdefault("sample_events", [])
+
+    diag["linked_samples"] = _safe_int(diag.get("linked_samples")) + 1
+    has_numeric = any((outcome or {}).get(k) is not None for k in ["pnl_pct", "result_r", "pnl_usdt"])
+    if has_numeric:
+        diag["with_numeric_value"] = _safe_int(diag.get("with_numeric_value")) + 1
+    else:
+        diag["without_numeric_value"] = _safe_int(diag.get("without_numeric_value")) + 1
+
+    _v224_inc_counter(diag["label_presence"], (outcome or {}).get("label") or "UNKNOWN")
+    _v224_inc_counter(diag["event_type_presence"], (outcome or {}).get("event_type") or "UNKNOWN")
+    _v224_inc_counter(diag["source_files"], (outcome_match or {}).get("source_file") or "UNKNOWN")
+
+    event = (outcome_match or {}).get("event") or {}
+    paths = _v224_flatten_field_paths(event, max_paths=220)
+    for item in paths:
+        path = item.get("path")
+        if not path:
+            continue
+        _v224_inc_counter(diag["field_presence"], path)
+        if item.get("kind") == "numeric_like":
+            _v224_inc_counter(diag["numeric_field_presence"], path)
+
+    # Mantém amostras pequenas e úteis dos primeiros outcomes linkados.
+    samples = diag.setdefault("sample_events", [])
+    if len(samples) < 5:
+        ident = (outcome_match or {}).get("identity") or {}
+        samples.append({
+            "source_file": (outcome_match or {}).get("source_file"),
+            "label": (outcome or {}).get("label"),
+            "event_type": (outcome or {}).get("event_type"),
+            "pnl_pct": (outcome or {}).get("pnl_pct"),
+            "result_r": (outcome or {}).get("result_r"),
+            "pnl_usdt": (outcome or {}).get("pnl_usdt"),
+            "identity": {
+                "ids": (ident.get("ids") or [])[:5],
+                "bot": ident.get("bot"),
+                "symbol": ident.get("symbol"),
+                "side": ident.get("side"),
+                "setup": ident.get("setup"),
+                "composite": ident.get("composite"),
+            },
+            "top_level_keys": list(event.keys())[:40] if isinstance(event, dict) else [],
+        })
+
+    sample_paths = diag.setdefault("sample_field_paths", [])
+    existing = {x.get("path") for x in sample_paths if isinstance(x, dict)}
+    for item in paths:
+        if len(sample_paths) >= 80:
+            break
+        if item.get("path") not in existing:
+            sample_paths.append(item)
+            existing.add(item.get("path"))
+
+    # Limita dicionários de contagem para não inflar estado.
+    for key in ["field_presence", "numeric_field_presence", "label_presence", "event_type_presence", "source_files"]:
+        m = diag.get(key)
+        if isinstance(m, dict) and len(m) > 120:
+            ordered = sorted(m.items(), key=lambda kv: _safe_int(kv[1]), reverse=True)[:120]
+            diag[key] = dict(ordered)
 
 def _apply_outcome_to_policy(policy, decision, outcome_match):
     """V2.2.2: aplica outcome sem transformar close sem valor em loss/pnl zero."""
@@ -4534,6 +4704,7 @@ def _apply_outcome_to_policy(policy, decision, outcome_match):
         return False
 
     outcome = outcome_match.get("outcome") or {}
+    _v224_update_outcome_diagnostics(policy, outcome_match, outcome)
     label = str(outcome.get("label") or "UNKNOWN").upper()
     pnl_pct = outcome.get("pnl_pct")
     result_r = outcome.get("result_r")
@@ -4620,6 +4791,29 @@ def _recompute_effect_summary(effect):
     be = sum(_safe_int(p.get("breakeven")) for p in values)
     unknown = sum(_safe_int(p.get("outcome_unknown")) for p in values)
     without_value = sum(_safe_int(p.get("outcomes_without_value")) for p in values)
+    # Diagnóstico agregado dos campos reais presentes nos outcomes linkados.
+    aggregated_field_presence = {}
+    aggregated_numeric_field_presence = {}
+    aggregated_label_presence = {}
+    aggregated_event_type_presence = {}
+    for p in values:
+        diag = p.get("outcome_value_diagnostics") if isinstance(p, dict) else {}
+        if not isinstance(diag, dict):
+            continue
+        for src_key, target in [
+            ("field_presence", aggregated_field_presence),
+            ("numeric_field_presence", aggregated_numeric_field_presence),
+            ("label_presence", aggregated_label_presence),
+            ("event_type_presence", aggregated_event_type_presence),
+        ]:
+            source_map = diag.get(src_key) or {}
+            if isinstance(source_map, dict):
+                for k, v in source_map.items():
+                    target[str(k)] = _safe_int(target.get(str(k))) + _safe_int(v)
+    top_outcome_fields = sorted(aggregated_field_presence.items(), key=lambda kv: _safe_int(kv[1]), reverse=True)[:30]
+    top_numeric_fields = sorted(aggregated_numeric_field_presence.items(), key=lambda kv: _safe_int(kv[1]), reverse=True)[:30]
+    top_labels = sorted(aggregated_label_presence.items(), key=lambda kv: _safe_int(kv[1]), reverse=True)[:20]
+    top_event_types = sorted(aggregated_event_type_presence.items(), key=lambda kv: _safe_int(kv[1]), reverse=True)[:20]
     pnl_total = round(sum(_safe_float(p.get("pnl_total_pct"), 0.0) for p in values), 6)
     r_total = round(sum(_safe_float(p.get("result_r_total"), 0.0) for p in values), 6)
     avg = 0.0
@@ -4639,6 +4833,12 @@ def _recompute_effect_summary(effect):
         "breakeven": be,
         "outcome_unknown": unknown,
         "outcomes_without_value": without_value,
+        "outcome_field_diagnostics": {
+            "top_field_presence": top_outcome_fields,
+            "top_numeric_field_presence": top_numeric_fields,
+            "top_labels": top_labels,
+            "top_event_types": top_event_types,
+        },
         "win_rate_pct": round((wins / total_outcomes) * 100.0, 2) if total_outcomes else 0.0,
         "pnl_total_pct": pnl_total,
         "result_r_total": r_total,
@@ -4646,6 +4846,6 @@ def _recompute_effect_summary(effect):
         "learn_with_caution": caution,
         "wait_sample": wait,
         "average_effect_score": round(avg, 2),
-        "parser_version": "V2.2.2",
+        "parser_version": "V2.2.4",
         "updated_at": _now(),
     }
