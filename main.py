@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-EXECUTIVE-POLICY-LEARNING-V1
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-EXECUTIVE-POLICY-LEARNING-SEED-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -268,6 +268,8 @@ try:
         get_executive_policy_learning_stats,
         build_policy_history_report,
         read_executive_policy_learning_log,
+        seed_executive_policy_learning_events,
+        build_executive_policy_learning_seed_report,
     )
     EXECUTIVE_POLICY_LEARNING_LOADED = True
     EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR = None
@@ -328,6 +330,24 @@ except Exception as e:
             "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
             "items": [],
         }
+
+    def seed_executive_policy_learning_events(commit=True):
+        return {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR,
+            "events_created": 0,
+        }
+
+    def build_executive_policy_learning_seed_report(result=None):
+        return (
+            "🌱 EXECUTIVE POLICY LEARNING SEED — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_LEARNING_IMPORT_ERROR}"
+        )
+
 
 
 from pathlib import Path
@@ -1973,6 +1993,30 @@ def policy_learning_route():
             "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT\n"
             "Status: ❌\n"
             f"Erro na rota /policylearning: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+
+
+@app.route("/policylearningseed", methods=["GET"])
+@app.route("/executive/policy/learning/seed", methods=["GET"])
+def policy_learning_seed_route():
+    """
+    Cria eventos seed controlados para validar Executive Policy Learning.
+    Não executa trades e não altera policies reais.
+    """
+    try:
+        check_only = str(request.args.get("check_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        result = seed_executive_policy_learning_events(commit=not check_only)
+        report = build_executive_policy_learning_seed_report(result)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "🌱 EXECUTIVE POLICY LEARNING SEED — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            f"Erro na rota /policylearningseed: {exc}",
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
         )

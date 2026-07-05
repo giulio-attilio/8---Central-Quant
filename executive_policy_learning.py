@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Executive Policy Learning V1 — Central Quant
+Executive Policy Learning V1.1 — Central Quant
 Versão: 2026-07-05-EXECUTIVE-POLICY-LEARNING-V1
 
 Objetivo:
@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V1"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V1.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR", str(BASE_DIR / "data")))
@@ -493,7 +493,7 @@ def build_executive_policy_learning_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V1",
+        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V1.1",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -620,6 +620,156 @@ def read_executive_policy_learning_log(limit=20):
         return {"ok": True, "items": items, "log_file": str(LOG_FILE)}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "items": [], "log_file": str(LOG_FILE)}
+
+
+def seed_executive_policy_learning_events(commit=True):
+    """
+    Cria eventos controlados de teste na timeline para validar o fluxo:
+    Timeline -> Policy Learning -> Stats/Ranking.
+
+    Importante:
+    - Os eventos possuem test_seed=True.
+    - Não representam decisão real.
+    - Não executam trades.
+    - Não alteram policies ativas.
+    """
+    DATA_DIR.mkdir(exist_ok=True)
+
+    now = _now()
+    seed_id = datetime.now().strftime("%Y%m%d%H%M%S")
+
+    events = [
+        {
+            "event_type": "POLICY_CREATED",
+            "code": "WAIT_SAMPLE",
+            "generated_at": now,
+            "reason": "Seed técnico para validar Executive Policy Learning.",
+            "source": "executive_policy_learning_seed",
+            "test_seed": True,
+            "seed_id": seed_id,
+        },
+        {
+            "event_type": "POLICY_KEPT",
+            "code": "WAIT_SAMPLE",
+            "generated_at": now,
+            "reason": "Seed: policy mantida por amostra insuficiente.",
+            "source": "executive_policy_learning_seed",
+            "test_seed": True,
+            "seed_id": seed_id,
+        },
+        {
+            "event_type": "POLICY_CREATED",
+            "code": "LIMIT_NEW_LONG",
+            "generated_at": now,
+            "reason": "Seed: concentração direcional elevada exige restrição.",
+            "source": "executive_policy_learning_seed",
+            "test_seed": True,
+            "seed_id": seed_id,
+            "payload": {
+                "dominant_side": "LONG",
+                "dominant_pct": 76.0,
+                "blocks_expansion": True,
+            },
+        },
+        {
+            "event_type": "POLICY_PRIORITY_DENY",
+            "code": "LIMIT_NEW_LONG",
+            "generated_at": now,
+            "reason": "Seed: bloqueio estimado de nova expansão LONG.",
+            "source": "executive_policy_learning_seed",
+            "test_seed": True,
+            "seed_id": seed_id,
+        },
+        {
+            "event_type": "POLICY_AUTO_RELEASE",
+            "code": "LIMIT_NEW_LONG",
+            "generated_at": now,
+            "reason": "Seed: liberação após queda de concentração.",
+            "source": "executive_policy_learning_seed",
+            "test_seed": True,
+            "seed_id": seed_id,
+            "payload": {
+                "release_condition": "LONG abaixo de 75%",
+            },
+        },
+        {
+            "event_type": "POLICY_CREATED",
+            "code": "NORMAL_WITH_MONITORING",
+            "generated_at": now,
+            "reason": "Seed: operação normal com monitoramento assistido.",
+            "source": "executive_policy_learning_seed",
+            "test_seed": True,
+            "seed_id": seed_id,
+        },
+        {
+            "event_type": "POLICY_ALLOW",
+            "code": "NORMAL_WITH_MONITORING",
+            "generated_at": now,
+            "reason": "Seed: operação permitida sem expansão estrutural.",
+            "source": "executive_policy_learning_seed",
+            "test_seed": True,
+            "seed_id": seed_id,
+        },
+    ]
+
+    if commit:
+        with open(TIMELINE_FILE, "a", encoding="utf-8") as f:
+            for event in events:
+                f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+    result = {
+        "ok": True,
+        "module": "executive_policy_learning",
+        "version": VERSION,
+        "generated_at": now,
+        "commit": commit,
+        "seed_id": seed_id,
+        "events_created": len(events),
+        "timeline_file": str(TIMELINE_FILE),
+        "notes": [
+            "Eventos seed são técnicos e possuem test_seed=True.",
+            "Eles servem apenas para validar o fluxo do Policy Learning.",
+            "Não representam decisão real e não executam trades.",
+        ],
+    }
+
+    _append_log({
+        "event": "POLICY_LEARNING_SEED",
+        **result,
+    })
+
+    return result
+
+
+def build_executive_policy_learning_seed_report(result=None):
+    if result is None:
+        result = seed_executive_policy_learning_events(commit=True)
+
+    lines = [
+        "🌱 EXECUTIVE POLICY LEARNING SEED — CENTRAL QUANT",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Commit: {result.get('commit')}",
+        f"Seed ID: {result.get('seed_id')}",
+        f"Eventos criados: {result.get('events_created', 0)}",
+        f"Timeline: {result.get('timeline_file')}",
+        "",
+        "Eventos seed:",
+        "- WAIT_SAMPLE criada/mantida",
+        "- LIMIT_NEW_LONG criada/bloqueio/release",
+        "- NORMAL_WITH_MONITORING criada/allow",
+        "",
+        "Importante:",
+        "- Estes eventos são técnicos e possuem test_seed=True.",
+        "- Eles validam o pipeline; não representam decisão real.",
+        "- Não executam trades e não alteram policies ativas.",
+        "",
+        "Próximo comando:",
+        "/policylearning",
+    ]
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
