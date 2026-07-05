@@ -2480,3 +2480,411 @@ def build_policy_insights_report():
 
 if __name__ == "__main__":
     print(build_executive_policy_learning_report())
+
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.1.4 — DECISION LOG SOURCE RESOLVER
+# ==========================================================
+# Correção incremental da V2.1.3:
+# - Detecta automaticamente o maior/mais completo decision_log disponível.
+# - Evita o bug onde /policyeffect lia apenas 1 decisão enquanto /decisionlog mostrava várias.
+# - Mantém compatibilidade com CENTRAL_DECISION_LOG_FILE.
+# - Continua 100% observacional.
+
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.1.4"
+
+
+def _jsonl_line_count(path):
+    try:
+        path = Path(path)
+        if not path.exists():
+            return 0
+        with open(path, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return 0
+
+
+def _decision_log_candidate_paths():
+    candidates = []
+
+    def add(value):
+        try:
+            if value is None:
+                return
+            p = Path(str(value))
+            if p not in candidates:
+                candidates.append(p)
+        except Exception:
+            pass
+
+    # Fonte padrão do módulo.
+    add(DECISION_LOG_FILE)
+
+    # Variáveis de ambiente possíveis.
+    for env_name in [
+        "CENTRAL_DECISION_LOG_FILE",
+        "HISTORY_DECISION_LOG_FILE",
+        "DECISION_LOG_FILE",
+        "CENTRAL_DATA_DIR",
+    ]:
+        value = os.environ.get(env_name)
+        if not value:
+            continue
+        if env_name.endswith("DATA_DIR"):
+            add(Path(value) / "decision_log.jsonl")
+        else:
+            add(value)
+
+    # Caminhos prováveis dentro do projeto.
+    add(DATA_DIR / "decision_log.jsonl")
+    add(BASE_DIR / "data" / "decision_log.jsonl")
+    add(Path("/opt/render/project/src/data/decision_log.jsonl"))
+
+    # History Manager pode manter um decision log próprio.
+    try:
+        import history_manager as super_history_manager
+        add(getattr(super_history_manager, "DECISION_LOG_FILE", None))
+        add(getattr(super_history_manager, "CENTRAL_DECISION_LOG_FILE", None))
+        add(getattr(super_history_manager, "HISTORY_DECISION_LOG_FILE", None))
+        history_data_dir = getattr(super_history_manager, "DATA_DIR", None)
+        if history_data_dir:
+            add(Path(history_data_dir) / "decision_log.jsonl")
+    except Exception:
+        pass
+
+    # Remove duplicados e inexistentes depois.
+    out = []
+    seen = set()
+    for p in candidates:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _resolve_decision_log_file():
+    """
+    Escolhe o decision_log mais completo.
+    Prioridade prática: maior quantidade de linhas JSONL válidas/registradas.
+    Isso evita ler um arquivo pequeno de teste enquanto /decisionlog mostra outro log maior.
+    """
+    candidates = _decision_log_candidate_paths()
+    scored = []
+    for path in candidates:
+        count = _jsonl_line_count(path)
+        exists = Path(path).exists()
+        scored.append({
+            "path": str(path),
+            "exists": bool(exists),
+            "line_count": int(count),
+        })
+
+    valid = [item for item in scored if item.get("exists") and item.get("line_count", 0) > 0]
+    if not valid:
+        chosen = str(DECISION_LOG_FILE)
+    else:
+        valid.sort(key=lambda x: (x.get("line_count", 0), x.get("path") == str(DECISION_LOG_FILE)), reverse=True)
+        chosen = valid[0]["path"]
+
+    try:
+        _resolve_decision_log_file.last_candidates = scored
+        _resolve_decision_log_file.last_chosen = chosen
+    except Exception:
+        pass
+
+    return Path(chosen)
+
+
+def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=None):
+    """
+    V2.1.4:
+    Lê decisões novas do decision_log resolvido automaticamente.
+    Associa por links explícitos quando existirem e por timeline como fallback.
+    Ignora seeds técnicos para readiness real.
+    """
+    started = time.time()
+    state = _load_v2_state()
+    effect = _load_effect()
+
+    decision_log_path = _resolve_decision_log_file()
+    decision_log_candidates = getattr(_resolve_decision_log_file, "last_candidates", [])
+
+    previous_path = state.get("decision_log_file")
+    if previous_path and str(previous_path) != str(decision_log_path):
+        # Se a fonte mudou, não reutiliza offset de outro arquivo.
+        offset = 0
+    else:
+        offset = _safe_int(state.get("decision_log_offset"), 0)
+
+    max_decisions = int(max_decisions or MAX_DECISIONS_PER_RUN)
+
+    decisions, new_offset, reached_eof = _read_new_jsonl(decision_log_path, offset, max_decisions)
+    policy_events = _read_all_policy_events_light()
+    timeline_seeds_skipped = getattr(_read_all_policy_events_light, "last_skipped_test_seeds", 0)
+
+    processed = 0
+    matched = 0
+    unmatched = 0
+    test_decisions_skipped = 0
+    explicit_policy_links = 0
+    timeline_fallback_links = 0
+
+    policies = effect.setdefault("policies", {})
+
+    for decision in decisions:
+        if _is_test_seed_event(decision):
+            test_decisions_skipped += 1
+            continue
+
+        explicit_codes = _decision_policy_codes(decision)
+        dt = _decision_time(decision)
+        codes = explicit_codes or _active_policy_codes_for_decision(dt, policy_events)
+
+        if not codes:
+            unmatched += 1
+            processed += 1
+            continue
+
+        if explicit_codes:
+            explicit_policy_links += 1
+        else:
+            timeline_fallback_links += 1
+
+        for code in codes:
+            policy = policies.get(code)
+            if not isinstance(policy, dict):
+                policy = _effect_policy_template(code)
+                policies[code] = policy
+            _apply_decision_to_effect(policy, decision)
+            matched += 1
+
+        processed += 1
+
+    prior_summary = effect.get("summary") if isinstance(effect.get("summary"), dict) else {}
+    prior_unmatched = _safe_int(prior_summary.get("decisions_unmatched"))
+    effect.setdefault("summary", {})["decisions_unmatched"] = prior_unmatched + unmatched
+
+    state["decision_log_file"] = str(decision_log_path)
+    state["decision_log_candidates"] = decision_log_candidates
+    state["decision_log_offset"] = new_offset
+    state["last_run_at"] = _now()
+    state["last_error"] = None
+    state["decisions_processed"] = _safe_int(state.get("decisions_processed")) + processed
+    state["last_batch"] = {
+        "decisions_read": len(decisions),
+        "decisions_processed": processed,
+        "decisions_matched": matched,
+        "decisions_unmatched": unmatched,
+        "test_decisions_skipped": test_decisions_skipped,
+        "explicit_policy_links": explicit_policy_links,
+        "timeline_fallback_links": timeline_fallback_links,
+        "timeline_test_seeds_skipped": timeline_seeds_skipped,
+        "policy_events_loaded": len(policy_events),
+        "decision_log_file": str(decision_log_path),
+        "decision_log_candidates": decision_log_candidates,
+        "old_offset": offset,
+        "new_offset": new_offset,
+        "reached_eof": reached_eof,
+    }
+
+    if commit:
+        _save_effect(effect)
+        _save_v2_state(state)
+    else:
+        _recompute_effect_summary(effect)
+
+    result = {
+        "ok": True,
+        "module": "executive_policy_learning_v2",
+        "version": VERSION,
+        "generated_at": _now(),
+        "commit": commit,
+        "decision_log_file": str(decision_log_path),
+        "decision_log_candidates": decision_log_candidates,
+        "timeline_file": str(TIMELINE_FILE),
+        "effect_file": str(V2_EFFECT_FILE),
+        "decisions_read": len(decisions),
+        "decisions_processed": processed,
+        "decisions_matched": matched,
+        "decisions_unmatched": unmatched,
+        "test_decisions_skipped": test_decisions_skipped,
+        "explicit_policy_links": explicit_policy_links,
+        "timeline_fallback_links": timeline_fallback_links,
+        "timeline_test_seeds_skipped": timeline_seeds_skipped,
+        "policy_events_loaded": len(policy_events),
+        "old_offset": offset,
+        "new_offset": new_offset,
+        "reached_eof": reached_eof,
+        "duration_ms": round((time.time() - started) * 1000, 2),
+        "summary": effect.get("summary") or {},
+        "notes": [
+            "V2.1.4 escolhe automaticamente o decision_log mais completo.",
+            "Se a fonte do log mudar, o offset é reiniciado com segurança.",
+            "Seeds técnicos são ignorados nas métricas reais.",
+            "PnL real ainda depende de Lifecycle/Outcome em etapa futura.",
+        ],
+    }
+
+    try:
+        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+    return result
+
+
+def get_executive_policy_learning_v2_health():
+    state = _load_v2_state()
+    effect = _load_effect()
+    _recompute_effect_summary(effect)
+    summary = effect.get("summary") or {}
+    decision_log_path = _resolve_decision_log_file()
+
+    status = "OK"
+    if not decision_log_path.exists():
+        status = "NO_DECISION_LOG"
+    elif not TIMELINE_FILE.exists():
+        status = "NO_TIMELINE"
+    elif _safe_int(summary.get("policy_count")) == 0:
+        status = "WAITING_MATCHES"
+    elif _safe_int(summary.get("wait_sample_count")) > 0 and _safe_int(summary.get("ready_to_learn_count")) == 0:
+        status = "WAIT_SAMPLE"
+
+    return {
+        "ok": True,
+        "module": "executive_policy_learning_v2",
+        "loaded": True,
+        "version": VERSION,
+        "status": status,
+        "decision_log_file": str(decision_log_path),
+        "decision_log_candidates": getattr(_resolve_decision_log_file, "last_candidates", []),
+        "decision_log_exists": decision_log_path.exists(),
+        "timeline_file": str(TIMELINE_FILE),
+        "timeline_exists": TIMELINE_FILE.exists(),
+        "state_file": str(V2_STATE_FILE),
+        "effect_file": str(V2_EFFECT_FILE),
+        "decision_log_offset": state.get("decision_log_offset"),
+        "last_run_at": state.get("last_run_at"),
+        "last_error": state.get("last_error"),
+        "summary": summary,
+    }
+
+
+def rebuild_executive_policy_effect(commit=True, max_decisions=None):
+    """
+    V2.1.4 rebuild:
+    Zera offset e effect stats, resolve o decision_log mais completo e reprocessa desde o início.
+    """
+    old_state = _load_v2_state()
+    old_effect = _load_effect()
+
+    decision_log_path = _resolve_decision_log_file()
+    decision_log_candidates = getattr(_resolve_decision_log_file, "last_candidates", [])
+
+    reset_state = {
+        "version": VERSION,
+        "decision_log_file": str(decision_log_path),
+        "decision_log_candidates": decision_log_candidates,
+        "decision_log_offset": 0,
+        "decisions_processed": 0,
+        "last_run_at": None,
+        "last_error": None,
+        "rebuild_requested_at": _now(),
+        "previous_state": {
+            "decision_log_file": old_state.get("decision_log_file"),
+            "decision_log_offset": old_state.get("decision_log_offset"),
+            "decisions_processed": old_state.get("decisions_processed"),
+            "last_run_at": old_state.get("last_run_at"),
+        },
+    }
+
+    reset_effect = _empty_effect()
+    reset_effect["version"] = VERSION
+    reset_effect["decision_log_file"] = str(decision_log_path)
+    reset_effect["previous_summary"] = old_effect.get("summary") or {}
+
+    if commit:
+        _write_json(V2_STATE_FILE, reset_state)
+        _write_json(V2_EFFECT_FILE, reset_effect)
+
+    result = run_executive_policy_learning_v2(
+        context={"source": "rebuild", "version": VERSION},
+        commit=commit,
+        max_decisions=max_decisions or MAX_DECISIONS_PER_RUN,
+    )
+
+    result["rebuild"] = True
+    result["previous_decision_log_file"] = old_state.get("decision_log_file")
+    result["previous_decision_log_offset"] = old_state.get("decision_log_offset")
+    result["previous_summary"] = old_effect.get("summary") or {}
+
+    try:
+        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": "POLICY_EFFECT_REBUILD",
+                **result,
+            }, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+    return result
+
+
+def build_policy_effect_rebuild_report(result=None):
+    if result is None:
+        result = rebuild_executive_policy_effect(commit=True)
+
+    lines = [
+        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.1.4",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Rebuild: {result.get('rebuild')}",
+        f"Decision Log usado: {result.get('decision_log_file')}",
+        f"Offset anterior: {result.get('previous_decision_log_offset')}",
+        f"Decisões lidas: {result.get('decisions_read', 0)}",
+        f"Decisões reais processadas: {result.get('decisions_processed', 0)}",
+        f"Matches policy↔decision: {result.get('decisions_matched', 0)}",
+        f"Links explícitos no decision_log: {result.get('explicit_policy_links', 0)}",
+        f"Fallback via timeline: {result.get('timeline_fallback_links', 0)}",
+        f"Sem policy associada: {result.get('decisions_unmatched', 0)}",
+        f"Seeds decision ignorados: {result.get('test_decisions_skipped', 0)}",
+        f"Seeds timeline ignorados: {result.get('timeline_test_seeds_skipped', 0)}",
+        f"Policy events reais carregados: {result.get('policy_events_loaded', 0)}",
+        f"Novo offset: {result.get('new_offset')}",
+        "",
+    ]
+
+    candidates = result.get("decision_log_candidates") or []
+    if candidates:
+        lines.append("Decision logs candidatos:")
+        for item in candidates[:8]:
+            lines.append(f"- {item.get('path')} | exists={item.get('exists')} | linhas={item.get('line_count')}")
+        lines.append("")
+
+    summary = result.get("summary") or {}
+    if summary:
+        lines += [
+            "Resumo atual:",
+            f"- Policies com efeito medido: {summary.get('policy_count', 0)}",
+            f"- Decisões correlacionadas: {summary.get('decisions_processed', 0)}",
+            f"- Effect score médio: {summary.get('average_effect_score', 0)}",
+            "",
+        ]
+
+    lines += [
+        "Leitura:",
+        "A V2.1.4 resolve automaticamente qual decision_log tem mais dados antes do rebuild.",
+        "",
+        "Próximos comandos:",
+        "/policyeffect",
+        "/policycompare",
+        "/policyinsights",
+    ]
+
+    return "\n".join(lines)
