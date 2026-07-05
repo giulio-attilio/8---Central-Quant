@@ -21,6 +21,7 @@ Arquivos:
 import os
 import json
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -2079,7 +2080,7 @@ def _apply_decision_to_effect(policy, decision):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.2.1 — READINESS HOTFIX
+# EXECUTIVE POLICY LEARNING V2.2.2.1 — READINESS HOTFIX
 # ==========================================================
 # Corrige dependência auxiliar usada pela V2.2.
 # Mantém a mesma semântica da V2.1.8: readiness é observacional
@@ -2983,7 +2984,7 @@ def build_policy_effect_rebuild_report(result=None):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.2 — POLICY OUTCOME LINKER
+# EXECUTIVE POLICY LEARNING V2.2.2 — POLICY OUTCOME LINKER
 # ==========================================================
 # Objetivo:
 # - Manter a V2.1.8 funcionando como Policy Effect.
@@ -3934,7 +3935,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING V2.2 — POLICY OUTCOME LINKER",
+        "🧠 EXECUTIVE POLICY LEARNING V2.2.2 — POLICY OUTCOME LINKER",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -4179,7 +4180,7 @@ def build_policy_effect_rebuild_report(result=None):
         result = rebuild_executive_policy_effect(commit=True)
 
     lines = [
-        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.2",
+        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.2.2",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -4227,7 +4228,7 @@ def build_policy_effect_rebuild_report(result=None):
 
     lines += [
         "Leitura:",
-        "A V2.2 cruza policies com outcomes/lifecycle quando houver fechamento correlacionável.",
+        "A V2.2.2 cruza policies com outcomes/lifecycle quando houver fechamento correlacionável.",
         "Ela não inventa PnL para bloqueios; PnL evitado será uma camada hipotética futura.",
         "",
         "Próximos comandos:",
@@ -4237,3 +4238,413 @@ def build_policy_effect_rebuild_report(result=None):
     ]
 
     return "\n".join(lines)
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.2.2 — OUTCOME VALUE PARSER HOTFIX
+# ==========================================================
+# Objetivo:
+# - manter todo o linker da V2.2;
+# - melhorar a extração real de valores de outcome/PnL/R;
+# - ler campos dentro de raw/details/payload/context e strings JSON/Python-like;
+# - calcular pnl_pct a partir de entry/exit/stop/tp quando possível;
+# - não inventar PnL para bloqueios DENY/BLOCK.
+
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2.2"
+
+try:
+    import ast as _ast_v222
+except Exception:
+    _ast_v222 = None
+
+
+def _v222_normalize_key(key):
+    return str(key or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _v222_parse_jsonish(value, depth=0):
+    """Tenta transformar strings JSON/Python-like em dict/list sem quebrar se falhar."""
+    if depth > 2 or not isinstance(value, str):
+        return None
+    txt = value.strip()
+    if len(txt) < 2 or len(txt) > 60000:
+        return None
+    if not ((txt.startswith("{") and txt.endswith("}")) or (txt.startswith("[") and txt.endswith("]"))):
+        return None
+
+    # 1) JSON normal.
+    try:
+        return json.loads(txt)
+    except Exception:
+        pass
+
+    # 2) Python repr com True/False/None.
+    if _ast_v222 is not None:
+        try:
+            return _ast_v222.literal_eval(txt)
+        except Exception:
+            pass
+
+    # 3) Python repr que veio uppercased pelo History: TRUE/FALSE/NONE.
+    try:
+        fixed = re.sub(r"\bTRUE\b", "True", txt)
+        fixed = re.sub(r"\bFALSE\b", "False", fixed)
+        fixed = re.sub(r"\bNONE\b", "None", fixed)
+        fixed = re.sub(r"\bNULL\b", "None", fixed)
+        if _ast_v222 is not None:
+            return _ast_v222.literal_eval(fixed)
+    except Exception:
+        pass
+    return None
+
+
+def _v222_iter_nodes(obj, depth=0, seen=None):
+    """Itera recursivamente por dict/list e por strings que contenham dict/list."""
+    if seen is None:
+        seen = set()
+    if depth > 7:
+        return
+    oid = id(obj)
+    if oid in seen:
+        return
+    seen.add(oid)
+
+    if isinstance(obj, dict):
+        yield obj
+        # Primeiro fontes mais úteis para outcomes.
+        preferred = ["raw", "details", "payload", "trade", "position", "context", "data", "result", "event"]
+        keys = list(obj.keys())
+        keys.sort(key=lambda k: 0 if _v222_normalize_key(k) in preferred else 1)
+        for key in keys:
+            val = obj.get(key)
+            if isinstance(val, (dict, list)):
+                yield from _v222_iter_nodes(val, depth + 1, seen)
+            elif isinstance(val, str):
+                parsed = _v222_parse_jsonish(val, depth + 1)
+                if parsed is not None:
+                    yield from _v222_iter_nodes(parsed, depth + 1, seen)
+    elif isinstance(obj, list):
+        for val in obj:
+            if isinstance(val, (dict, list)):
+                yield from _v222_iter_nodes(val, depth + 1, seen)
+            elif isinstance(val, str):
+                parsed = _v222_parse_jsonish(val, depth + 1)
+                if parsed is not None:
+                    yield from _v222_iter_nodes(parsed, depth + 1, seen)
+
+
+def _v222_deep_get_any(event, keys):
+    wanted = {_v222_normalize_key(k) for k in keys}
+    for node in _v222_iter_nodes(event):
+        if not isinstance(node, dict):
+            continue
+        # Busca exata case-insensitive/normalizada.
+        for k, v in node.items():
+            if _v222_normalize_key(k) in wanted and v not in (None, "", "None", "NONE", "null", "NULL"):
+                return v
+        # Alguns logs guardam tudo dentro de raw.raw ou detalhes textuais.
+    return None
+
+
+def _v222_safe_float(value, default=None):
+    if value in (None, "", "None", "NONE", "null", "NULL"):
+        return default
+    if isinstance(value, bool):
+        return default
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        txt = str(value).strip()
+        if not txt:
+            return default
+        # Remove símbolos comuns.
+        txt = txt.replace("%", "").replace("USDT", "").replace("R$", "").replace("$", "").strip()
+        # Trata vírgula decimal brasileira.
+        if "," in txt and "." not in txt:
+            txt = txt.replace(",", ".")
+        # Remove milhares simples.
+        txt = re.sub(r"(?<=\d),(?=\d{3}\b)", "", txt)
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", txt)
+        if not m:
+            return default
+        return float(m.group(0))
+    except Exception:
+        return default
+
+
+def _v222_extract_numeric_any(event, keys, default=None):
+    value = _v222_deep_get_any(event, keys)
+    return _v222_safe_float(value, default=default)
+
+
+def _v222_text_blob(event):
+    try:
+        return json.dumps(event, ensure_ascii=False, default=str).upper()
+    except Exception:
+        return str(event).upper()
+
+
+def _v222_pick_label(event):
+    label = _v222_deep_get_any(event, [
+        "outcome", "result_outcome", "trade_outcome", "closed_result", "pnl_result",
+        "lifecycle_outcome", "trade_result", "final_result", "result_label", "close_reason",
+        "reason", "status", "result", "event", "event_type", "type", "action"
+    ])
+    label = str(label or "").strip().upper()
+    blob = _v222_text_blob(event)
+
+    # Evita tratar decisão operacional como outcome.
+    if label in {"ALLOW", "DENY", "BLOCK", "VERIFY", "OPEN", "ACTIVE", "NONE", "NULL"}:
+        label = ""
+
+    if not label:
+        if any(x in blob for x in ["STOP_LOSS", "STOP LOSS", " SL", "LOSS", "PREJUIZO", "PREJUÍZO", "STOP"]):
+            label = "LOSS"
+        elif any(x in blob for x in ["TAKE_PROFIT", "TAKE PROFIT", "TP50", "TP100", "WIN", "PROFIT", "GAIN", "LUCRO"]):
+            label = "WIN"
+        elif any(x in blob for x in ["BREAKEVEN", "BREAK EVEN", "EMPATE", "BE"]):
+            label = "BREAKEVEN"
+        elif any(x in blob for x in ["TRADE_CLOSED", "CLOSED", "ENCERRADO", "FECHADO", "CLOSE"]):
+            label = "UNKNOWN_CLOSED"
+    return label or "UNKNOWN"
+
+
+def _v222_extract_prices_and_side(event):
+    entry = _v222_extract_numeric_any(event, [
+        "entry", "entry_price", "entrada", "open_price", "price_entry", "avg_entry", "entry_avg"
+    ])
+    exit_price = _v222_extract_numeric_any(event, [
+        "exit_price", "exit", "close_price", "closed_price", "preco_saida", "saida", "price_exit", "final_price"
+    ])
+    stop = _v222_extract_numeric_any(event, ["stop", "sl", "stop_loss", "stop_price", "stop_atual"])
+    tp50 = _v222_extract_numeric_any(event, ["tp50", "take_profit", "tp", "target", "target_price"])
+    side = _v222_deep_get_any(event, ["side", "direction", "lado"])
+    side = str(side or "").strip().upper()
+    if side == "BUY":
+        side = "LONG"
+    elif side == "SELL":
+        side = "SHORT"
+    return entry, exit_price, stop, tp50, side
+
+
+def _v222_compute_pct_from_prices(event, label):
+    entry, exit_price, stop, tp50, side = _v222_extract_prices_and_side(event)
+    if entry is None or entry == 0:
+        return None
+    # Se não veio exit_price, usa stop/tp como proxy factual do evento fechado, quando o label indica.
+    if exit_price is None:
+        if any(x in label for x in ["LOSS", "STOP", "SL"]):
+            exit_price = stop
+        elif any(x in label for x in ["WIN", "TP", "PROFIT", "GAIN"]):
+            exit_price = tp50
+    if exit_price is None:
+        return None
+    try:
+        if side == "SHORT":
+            return round(((entry - exit_price) / entry) * 100.0, 6)
+        # Default LONG se ausente, pois muitos logs não preservam side no subevento.
+        return round(((exit_price - entry) / entry) * 100.0, 6)
+    except Exception:
+        return None
+
+
+def _extract_outcome_payload(event):
+    """V2.2.2: extrai outcome + valores reais de PnL/R de logs heterogêneos."""
+    if not isinstance(event, dict):
+        return None
+
+    label = _v222_pick_label(event)
+
+    pnl_pct = _v222_extract_numeric_any(event, [
+        "pnl_pct", "result_pct", "profit_pct", "pnl_percent", "return_pct", "pnl_total_pct",
+        "realized_pnl_pct", "realized_pct", "net_pnl_pct", "profit_loss_pct", "performance_pct",
+        "change_pct", "roi_pct", "roi", "pnl_percentage", "final_pnl_pct", "trade_pnl_pct",
+        "resultado_pct", "lucro_pct", "prejuizo_pct", "prejuízo_pct"
+    ])
+    result_r = _v222_extract_numeric_any(event, [
+        "result_r", "pnl_r", "r", "r_result", "r_multiple", "profit_r", "r_total", "rr", "r_pct",
+        "resultado_r", "risk_reward", "multiple_r"
+    ])
+    pnl_usdt = _v222_extract_numeric_any(event, [
+        "pnl_usdt", "pnl", "profit_usdt", "realized_pnl", "net_pnl", "pnl_total_usdt",
+        "profit", "loss", "profit_loss", "realized_profit", "resultado_usdt", "lucro_usdt"
+    ])
+
+    if pnl_pct is None:
+        pnl_pct = _v222_compute_pct_from_prices(event, label)
+
+    # Se R não veio mas temos pnl_pct e risk_pct, deriva R factual pela relação retorno/risco do trade.
+    if result_r is None and pnl_pct is not None:
+        risk_pct = _v222_extract_numeric_any(event, ["risk_pct", "risk", "risco", "initial_risk_pct"])
+        if risk_pct not in (None, 0):
+            try:
+                result_r = round(float(pnl_pct) / abs(float(risk_pct)), 6)
+            except Exception:
+                result_r = None
+
+    blob = _v222_text_blob(event)
+    event_type = str(_v222_deep_get_any(event, ["event", "event_type", "type", "action"]) or "").upper()
+
+    has_close_signal = any(token in blob for token in [
+        "TRADE_CLOSED", "CLOSED", "FECHADO", "ENCERRADO", "STOP", "TP50", "TP100",
+        "TAKE_PROFIT", "TAKE PROFIT", "LOSS", "WIN", "BREAKEVEN", "CLOSE"
+    ]) or any(token in event_type for token in ["CLOSE", "CLOSED", "TRADE_CLOSED", "ENCERRADO"])
+    has_numeric = pnl_pct is not None or result_r is not None or pnl_usdt is not None
+
+    if not has_close_signal and not has_numeric and label in {"UNKNOWN", ""}:
+        return None
+
+    # Reclassifica pelo valor numérico quando possível. Isso corrige status genérico/enganoso.
+    if result_r is not None:
+        label = "WIN" if result_r > 0 else "LOSS" if result_r < 0 else "BREAKEVEN"
+    elif pnl_pct is not None:
+        label = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < 0 else "BREAKEVEN"
+    elif pnl_usdt is not None:
+        label = "WIN" if pnl_usdt > 0 else "LOSS" if pnl_usdt < 0 else "BREAKEVEN"
+    elif label in {"UNKNOWN", "UNKNOWN_CLOSED"}:
+        # Mantém fechado, mas sem dizer win/loss quando não há valor.
+        label = "UNKNOWN_CLOSED"
+
+    return {
+        "label": label,
+        "pnl_pct": pnl_pct,
+        "result_r": result_r,
+        "pnl_usdt": pnl_usdt,
+        "event_type": event_type,
+        "dt": _outcome_identity(event).get("dt"),
+        "source_event": str(_v222_deep_get_any(event, ["source", "event", "event_type"]) or "unknown")[:80],
+        "parser_version": "V2.2.2",
+    }
+
+
+def _apply_outcome_to_policy(policy, decision, outcome_match):
+    """V2.2.2: aplica outcome sem transformar close sem valor em loss/pnl zero."""
+    _ensure_outcome_fields(policy)
+    decision_name = _extract_decision(decision)
+
+    if "DENY" in decision_name or "BLOCK" in decision_name:
+        policy["no_executed_trade_outcome"] = _safe_int(policy.get("no_executed_trade_outcome")) + 1
+        _recompute_policy_outcome_metrics(policy)
+        return False
+
+    if not outcome_match:
+        policy["waiting_outcome"] = _safe_int(policy.get("waiting_outcome")) + 1
+        _recompute_policy_outcome_metrics(policy)
+        return False
+
+    outcome = outcome_match.get("outcome") or {}
+    label = str(outcome.get("label") or "UNKNOWN").upper()
+    pnl_pct = outcome.get("pnl_pct")
+    result_r = outcome.get("result_r")
+    pnl_usdt = outcome.get("pnl_usdt")
+
+    has_value = pnl_pct is not None or result_r is not None or pnl_usdt is not None
+    policy["outcomes"] = _safe_int(policy.get("outcomes")) + 1
+
+    is_win = False
+    is_loss = False
+    is_be = False
+    if result_r is not None:
+        is_win = float(result_r) > 0
+        is_loss = float(result_r) < 0
+        is_be = float(result_r) == 0
+    elif pnl_pct is not None:
+        is_win = float(pnl_pct) > 0
+        is_loss = float(pnl_pct) < 0
+        is_be = float(pnl_pct) == 0
+    elif pnl_usdt is not None:
+        is_win = float(pnl_usdt) > 0
+        is_loss = float(pnl_usdt) < 0
+        is_be = float(pnl_usdt) == 0
+    else:
+        # Só usa label como W/L quando o label é inequívoco; mas marca unknown para alertar falta de valor.
+        if any(x in label for x in ["WIN", "TP", "PROFIT", "GAIN"]):
+            is_win = True
+        elif any(x in label for x in ["LOSS", "STOP", "SL"]):
+            is_loss = True
+        elif any(x in label for x in ["BE", "BREAKEVEN", "ZERO"]):
+            is_be = True
+        policy["outcome_unknown"] = _safe_int(policy.get("outcome_unknown")) + 1
+
+    if is_win:
+        policy["wins"] = _safe_int(policy.get("wins")) + 1
+    elif is_loss:
+        policy["losses"] = _safe_int(policy.get("losses")) + 1
+    elif is_be:
+        policy["breakeven"] = _safe_int(policy.get("breakeven")) + 1
+
+    if pnl_pct is not None:
+        pnl_pct = float(pnl_pct)
+        policy["pnl_total_pct"] = round(_safe_float(policy.get("pnl_total_pct")) + pnl_pct, 6)
+        if pnl_pct > 0:
+            policy["gross_profit_pct"] = round(_safe_float(policy.get("gross_profit_pct")) + pnl_pct, 6)
+        elif pnl_pct < 0:
+            policy["gross_loss_pct"] = round(_safe_float(policy.get("gross_loss_pct")) + pnl_pct, 6)
+        curve = policy.setdefault("pnl_curve_pct", [])
+        last = float(curve[-1]) if curve else 0.0
+        curve.append(round(last + pnl_pct, 6))
+        if len(curve) > 500:
+            del curve[:-500]
+
+    if result_r is not None:
+        policy["result_r_total"] = round(_safe_float(policy.get("result_r_total")) + float(result_r), 6)
+
+    if pnl_usdt is not None:
+        policy["pnl_total_usdt"] = round(_safe_float(policy.get("pnl_total_usdt")) + float(pnl_usdt), 6)
+
+    # Contador auxiliar para diagnóstico de outcomes sem valor numérico.
+    if not has_value:
+        policy["outcomes_without_value"] = _safe_int(policy.get("outcomes_without_value")) + 1
+
+    odt = outcome.get("dt")
+    if odt:
+        try:
+            policy["last_outcome_at"] = odt.strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            policy["last_outcome_at"] = str(odt)
+    policy["last_outcome_source"] = outcome_match.get("source_file")
+
+    _recompute_policy_outcome_metrics(policy)
+    return True
+
+
+def _recompute_effect_summary(effect):
+    """V2.2.2 summary com diagnóstico de outcomes sem valor."""
+    policies = effect.get("policies") or {}
+    values = [p for p in policies.values() if isinstance(p, dict)]
+    total_decisions = sum(_safe_int(p.get("real_decisions", p.get("decisions"))) for p in values)
+    total_outcomes = sum(_safe_int(p.get("outcomes")) for p in values)
+    wins = sum(_safe_int(p.get("wins")) for p in values)
+    losses = sum(_safe_int(p.get("losses")) for p in values)
+    be = sum(_safe_int(p.get("breakeven")) for p in values)
+    unknown = sum(_safe_int(p.get("outcome_unknown")) for p in values)
+    without_value = sum(_safe_int(p.get("outcomes_without_value")) for p in values)
+    pnl_total = round(sum(_safe_float(p.get("pnl_total_pct"), 0.0) for p in values), 6)
+    r_total = round(sum(_safe_float(p.get("result_r_total"), 0.0) for p in values), 6)
+    avg = 0.0
+    if values:
+        avg = sum(_safe_float(p.get("effect_score")) for p in values) / len(values)
+    ready = sum(1 for p in values if p.get("readiness_label") == "READY_TO_LEARN")
+    caution = sum(1 for p in values if p.get("readiness_label") == "LEARN_WITH_CAUTION")
+    wait = sum(1 for p in values if p.get("readiness_label") == "WAIT_SAMPLE")
+
+    effect["summary"] = {
+        "policy_count": len(values),
+        "decisions_processed": total_decisions,
+        "decisions_matched": total_decisions,
+        "outcomes_detected": total_outcomes,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": be,
+        "outcome_unknown": unknown,
+        "outcomes_without_value": without_value,
+        "win_rate_pct": round((wins / total_outcomes) * 100.0, 2) if total_outcomes else 0.0,
+        "pnl_total_pct": pnl_total,
+        "result_r_total": r_total,
+        "ready_to_learn": ready,
+        "learn_with_caution": caution,
+        "wait_sample": wait,
+        "average_effect_score": round(avg, 2),
+        "parser_version": "V2.2.2",
+        "updated_at": _now(),
+    }
