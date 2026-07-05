@@ -2076,6 +2076,53 @@ def _apply_decision_to_effect(policy, decision):
     _score_effect_policy(policy)
 
 
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.2.1 — READINESS HOTFIX
+# ==========================================================
+# Corrige dependência auxiliar usada pela V2.2.
+# Mantém a mesma semântica da V2.1.8: readiness é observacional
+# e não altera execução, risco, lote ou policies ativas.
+
+def _compute_policy_readiness(policy):
+    """Calcula readiness por policy com base em decisões reais e outcomes detectados."""
+    if not isinstance(policy, dict):
+        return policy
+
+    decisions = _safe_int(policy.get("decisions"))
+    real_decisions = _safe_int(policy.get("real_decisions"), decisions)
+    outcomes = _safe_int(policy.get("outcomes_detected", policy.get("outcomes", 0)))
+
+    readiness_score = min(
+        100.0,
+        (real_decisions / max(1, MIN_REAL_DECISIONS_FOR_LEARNING)) * 70.0
+        + min(30.0, outcomes * 6.0),
+    )
+
+    if real_decisions < MIN_REAL_DECISIONS_FOR_LEARNING:
+        readiness_label = "WAIT_SAMPLE"
+        ready_to_learn = False
+        readiness_note = f"Amostra real insuficiente: {real_decisions}/{MIN_REAL_DECISIONS_FOR_LEARNING} decisões reais."
+    elif real_decisions < MIN_READY_DECISIONS_FOR_POLICY:
+        readiness_label = "LEARN_WITH_CAUTION"
+        ready_to_learn = True
+        readiness_note = f"Policy pode aprender com cautela: {real_decisions}/{MIN_READY_DECISIONS_FOR_POLICY} decisões reais."
+    else:
+        readiness_label = "READY_TO_LEARN"
+        ready_to_learn = True
+        readiness_note = "Policy atingiu amostra mínima para aprendizado executivo controlado."
+
+    policy["readiness_score"] = round(readiness_score, 2)
+    policy["readiness_label"] = readiness_label
+    policy["ready_to_learn"] = ready_to_learn
+
+    notes = policy.get("notes") if isinstance(policy.get("notes"), list) else []
+    if readiness_note not in notes:
+        notes.insert(0, readiness_note)
+    policy["notes"] = notes[-8:]
+    return policy
+
 def _score_effect_policy(policy):
     decisions = _safe_int(policy.get("decisions"))
     real_decisions = _safe_int(policy.get("real_decisions"), decisions)
@@ -2960,7 +3007,7 @@ def build_policy_effect_rebuild_report(result=None):
 # - PnL por policy só é confiável quando os eventos de ciclo/trade fechado tiverem
 #   trade_id/signal_id ou chaves suficientes para correlação.
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2.1"
 POLICY_OUTCOME_WINDOW_DAYS = int(os.environ.get("EXECUTIVE_POLICY_OUTCOME_WINDOW_DAYS", "21"))
 POLICY_OUTCOME_MAX_EVENTS = int(os.environ.get("EXECUTIVE_POLICY_OUTCOME_MAX_EVENTS", "12000"))
 
