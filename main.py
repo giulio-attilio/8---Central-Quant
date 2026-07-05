@@ -682,8 +682,26 @@ DAILY_HISTORY_DIR.mkdir(exist_ok=True)
 
 # Persistência leve do OMS/Decision Engine da Central.
 # Não exige banco externo: grava JSONL/JSON local no Render.
-CENTRAL_DATA_DIR = BASE_DIR / "data"
-CENTRAL_DATA_DIR.mkdir(exist_ok=True)
+#
+# V2.1.6 — Main Integration / Data Dir Alignment:
+# - A Central passa a respeitar CENTRAL_DATA_DIR quando existir.
+# - No Render, se /data existir, ele vira o padrão preferencial.
+# - Isso alinha append_decision_log() com o arquivo lido pelo Policy Learning
+#   e evita gravar o log rico em /opt/render/project/src/data enquanto
+#   /policyeffect lê /data/decision_log.jsonl.
+def _resolve_central_data_dir():
+    configured = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
+    if configured:
+        return Path(configured)
+    try:
+        if os.path.isdir("/data"):
+            return Path("/data")
+    except Exception:
+        pass
+    return BASE_DIR / "data"
+
+CENTRAL_DATA_DIR = _resolve_central_data_dir()
+CENTRAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 CENTRAL_DECISION_LOG_FILE = CENTRAL_DATA_DIR / "decision_log.jsonl"
 CENTRAL_TIMELINE_LOG_FILE = CENTRAL_DATA_DIR / "timeline.jsonl"
 CENTRAL_SHADOW_POSITIONS_FILE = CENTRAL_DATA_DIR / "shadow_positions.json"
