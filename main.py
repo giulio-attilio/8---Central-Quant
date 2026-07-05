@@ -89,6 +89,57 @@ except Exception as e:
             "error": EXECUTIVE_POLICY_AUTO_RELEASE_IMPORT_ERROR,
         }
 
+
+try:
+    from executive_policy_priority import (
+        resolve_executive_policy_priority,
+        build_executive_policy_priority_report,
+        get_executive_policy_priority_health,
+        read_executive_policy_priority_log,
+    )
+    EXECUTIVE_POLICY_PRIORITY_LOADED = True
+    EXECUTIVE_POLICY_PRIORITY_IMPORT_ERROR = None
+except Exception as e:
+    EXECUTIVE_POLICY_PRIORITY_LOADED = False
+    EXECUTIVE_POLICY_PRIORITY_IMPORT_ERROR = str(e)
+
+    def resolve_executive_policy_priority(trade_payload=None, policies=None, commit=True):
+        return {
+            "ok": False,
+            "module": "executive_policy_priority",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_PRIORITY_IMPORT_ERROR,
+            "decision": "ALLOW",
+            "allowed": True,
+            "reasons": [],
+            "warnings": ["Falha ao importar Executive Policy Priority no main.py."],
+        }
+
+    def build_executive_policy_priority_report(result=None):
+        return (
+            "🏛️ EXECUTIVE POLICY PRIORITY — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_PRIORITY_IMPORT_ERROR}"
+        )
+
+    def get_executive_policy_priority_health():
+        return {
+            "ok": False,
+            "module": "executive_policy_priority",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_PRIORITY_IMPORT_ERROR,
+        }
+
+    def read_executive_policy_priority_log(limit=20):
+        return {
+            "ok": False,
+            "module": "executive_policy_priority",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_PRIORITY_IMPORT_ERROR,
+            "items": [],
+        }
+
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -1312,6 +1363,53 @@ def policy_auto_release_health_route():
             "route": "/policyautoreleasehealth",
             "error": str(exc),
         }, 500
+
+
+
+@app.route("/policypriority", methods=["GET"])
+@app.route("/executive/policy/priority", methods=["GET"])
+def policy_priority_route():
+    """
+    Executa uma rodada do Executive Policy Priority V1.
+    V1 não executa trades; apenas resolve conflito entre policies ativas.
+    """
+    try:
+        result = resolve_executive_policy_priority(trade_payload=None, commit=True)
+        report = build_executive_policy_priority_report(result)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "🏛️ EXECUTIVE POLICY PRIORITY — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            f"Erro na rota /policypriority: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+@app.route("/policypriorityhealth", methods=["GET"])
+@app.route("/executive/policy/priority/health", methods=["GET"])
+def policy_priority_health_route():
+    """Health check do Priority V1."""
+    try:
+        return get_executive_policy_priority_health(), 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_priority",
+            "route": "/policypriorityhealth",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/policyprioritylog", methods=["GET"])
+@app.route("/executive/policy/priority/log", methods=["GET"])
+def policy_priority_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_executive_policy_priority_log(limit=limit), 200
 
 
 @app.route("/executive/alerts/check")
@@ -4996,7 +5094,41 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
             if evaluation.get("max_risk_pct") is not None:
                 warnings.append(f"Policy Manager limita max_risk_pct={evaluation.get('max_risk_pct')}%.")
 
-            evaluation["source"] = "executive_policy_manager"
+            # Executive Policy Priority V1 — resolve conflito entre policies ativas
+            # e anexa a policy dominante ao payload usado pelo Risk Manager.
+            try:
+                priority_eval = resolve_executive_policy_priority(trade_payload=trade_payload, commit=True)
+                evaluation["priority"] = priority_eval
+                evaluation["dominant_policy"] = priority_eval.get("dominant_policy")
+                evaluation["dominant_policy_code"] = priority_eval.get("dominant_code")
+
+                if priority_eval.get("allowed") is False:
+                    evaluation["allowed"] = False
+                    evaluation.setdefault("reasons", [])
+                    for reason in priority_eval.get("reasons") or []:
+                        if reason not in evaluation["reasons"]:
+                            evaluation["reasons"].append(str(reason))
+                        if reason not in reasons:
+                            reasons.append(str(reason))
+
+                if priority_eval.get("size_multiplier") not in (None, 1, 1.0):
+                    current_multiplier = evaluation.get("size_multiplier", 1.0)
+                    try:
+                        evaluation["size_multiplier"] = min(float(current_multiplier or 1.0), float(priority_eval.get("size_multiplier")))
+                    except Exception:
+                        evaluation["size_multiplier"] = priority_eval.get("size_multiplier")
+                    warnings.append(f"Policy Priority sugere size_multiplier={evaluation.get('size_multiplier')}.")
+
+                if priority_eval.get("max_risk_pct") is not None and evaluation.get("max_risk_pct") is None:
+                    evaluation["max_risk_pct"] = priority_eval.get("max_risk_pct")
+                    warnings.append(f"Policy Priority limita max_risk_pct={evaluation.get('max_risk_pct')}%.")
+
+                for warning in priority_eval.get("warnings") or []:
+                    warnings.append(str(warning))
+            except Exception as priority_exc:
+                warnings.append(f"Erro ao aplicar Executive Policy Priority: {priority_exc}")
+
+            evaluation["source"] = "executive_policy_manager+priority"
             evaluation["available"] = True
             evaluation["sync"] = sync_result
             return evaluation
@@ -8345,6 +8477,14 @@ def executive_decision_route():
 @app.route("/policy_auto_release")
 def policy_auto_release_report_route():
     return {"text": _executive_policy_auto_release_report_block()}
+
+
+
+@app.route("/policypriority/report")
+@app.route("/policy_priority")
+def policy_priority_report_route():
+    result = resolve_executive_policy_priority(trade_payload=None, commit=True)
+    return {"text": build_executive_policy_priority_report(result), "payload": result}
 
 
 @app.route("/dashboard")
@@ -16584,6 +16724,14 @@ def build_central_command_reply(text: str):
     if cmd0 in {"/policyautoreleasehealth", "/policy_auto_release_health", "/autoreleasehealth"}:
         return _executive_policy_auto_release_health_text()
 
+    if cmd0 in {"/policypriority", "/policy_priority", "/priority", "/policyrank"}:
+        result = resolve_executive_policy_priority(trade_payload=None, commit=True)
+        return build_executive_policy_priority_report(result)
+
+    if cmd0 in {"/policypriorityhealth", "/policy_priority_health", "/priorityhealth"}:
+        health = get_executive_policy_priority_health()
+        return json.dumps(health, ensure_ascii=False, indent=2)
+
     if cmd0 == "/policy":
         if EXECUTIVE_POLICY_MANAGER_LOADED:
             parts = raw.split(maxsplit=1)
@@ -16874,6 +17022,8 @@ def _central_command_title(text: str):
         "/policy": "EXECUTIVE POLICY",
         "/policyautorelease": "POLICY AUTO RELEASE",
         "/policyautoreleasehealth": "POLICY AUTO RELEASE HEALTH",
+        "/policypriority": "POLICY PRIORITY",
+        "/policypriorityhealth": "POLICY PRIORITY HEALTH",
         "/politica": "EXECUTIVE POLICY",
         "/política": "EXECUTIVE POLICY",
         "/monthly": "MENSAL",
