@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Executive Policy Learning V2.0.1 — Central Quant
+Executive Policy Learning V2.0.2.2 — Central Quant
 Versão: 2026-07-05-EXECUTIVE-POLICY-LEARNING-V1
 
 Objetivo:
@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.0.1.1"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.0.2.2"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR", str(BASE_DIR / "data")))
@@ -38,7 +38,7 @@ LOG_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_LOG_FILE", str(DATA_DI
 MAX_EVENTS_PER_RUN = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MAX_EVENTS_PER_RUN", "500"))
 MIN_SAMPLE_FOR_CONFIDENCE = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MIN_SAMPLE", "10"))
 
-# V2.0.1 — correlação entre Policy Timeline e Decision Log.
+# V2.0.2.2 — correlação entre Policy Timeline e Decision Log.
 DECISION_LOG_FILE = Path(os.environ.get("CENTRAL_DECISION_LOG_FILE", str(DATA_DIR / "decision_log.jsonl")))
 V2_STATE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_V2_STATE_FILE", str(DATA_DIR / "executive_policy_learning_v2_state.json")))
 V2_EFFECT_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_EFFECT_FILE", str(DATA_DIR / "executive_policy_learning_effect.json")))
@@ -502,7 +502,7 @@ def build_executive_policy_learning_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V2.0.1",
+        "🧠 EXECUTIVE POLICY LEARNING — CENTRAL QUANT V2.0.2.2",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -782,7 +782,7 @@ def build_executive_policy_learning_seed_report(result=None):
 
 
 # ==========================================================
-# EXECUTIVE POLICY LEARNING V2.0.1
+# EXECUTIVE POLICY LEARNING V2.0.2.2
 # Correlação Timeline + Decision Log
 # ==========================================================
 
@@ -910,7 +910,7 @@ def _read_new_jsonl(path, offset, max_items):
 def _read_all_policy_events_light(limit=5000):
     """
     Lê eventos da timeline de forma limitada para correlacionar com decisões.
-    Não é usado em loop pesado; V2.0.1 trabalha com limite.
+    Não é usado em loop pesado; V2.0.2.2 trabalha com limite.
     """
     if not TIMELINE_FILE.exists():
         return []
@@ -958,7 +958,7 @@ def _read_all_policy_events_light(limit=5000):
 
 def _active_policy_codes_for_decision(decision_dt, policy_events, window_minutes=POLICY_DECISION_WINDOW_MINUTES):
     """
-    V2.0.1: associação simples.
+    V2.0.2.2: associação simples.
     Uma decisão é associada a policies cujos eventos ocorreram até a decisão
     dentro da janela configurada. Events de release/expire fecham a policy.
     """
@@ -1186,7 +1186,7 @@ def _recompute_effect_summary(effect):
 
 def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=None):
     """
-    V2.0.1:
+    V2.0.2.2:
     Lê decisões novas do decision_log e associa às policies ativas recentes da timeline.
     Não calcula PnL ainda.
     """
@@ -1326,7 +1326,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
     )
 
     lines = [
-        "🧠 EXECUTIVE POLICY LEARNING V2.0.1 — POLICY EFFECT",
+        "🧠 EXECUTIVE POLICY LEARNING V2.0.2.2 — POLICY EFFECT",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1348,7 +1348,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
             "Ainda não há correlação policy↔decision suficiente.",
             "",
             "Leitura:",
-            "A V2.0.1 precisa de eventos no Timeline e decisões no Decision Log dentro da janela configurada.",
+            "A V2.0.2.2 precisa de eventos no Timeline e decisões no Decision Log dentro da janela configurada.",
         ]
         return "\n".join(lines)
 
@@ -1368,7 +1368,7 @@ def build_executive_policy_effect_report(result=None, limit=12):
 
     lines += [
         "Observação:",
-        "V2.0.1 correlaciona Timeline + Decision Log.",
+        "V2.0.2.2 correlaciona Timeline + Decision Log.",
         "V2.1 deve cruzar com Lifecycle/Outcome para PnL, Profit Factor e Drawdown.",
     ]
     return "\n".join(lines)
@@ -1422,7 +1422,7 @@ def build_executive_policy_effect_rebuild_report(result=None):
         result = rebuild_executive_policy_effect(commit=True)
 
     lines = [
-        "♻️ EXECUTIVE POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.1",
+        "♻️ EXECUTIVE POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.2.2",
         f"Data/hora: {_now()}",
         "",
         f"Status: {'✅' if result.get('ok') else '❌'}",
@@ -1469,7 +1469,7 @@ def build_policy_compare_report(limit=10):
     )
 
     lines = [
-        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.1",
+        "⚖️ POLICY COMPARE — CENTRAL QUANT V2.0.2.2",
         f"Data/hora: {_now()}",
         "",
     ]
@@ -1496,7 +1496,7 @@ def build_policy_insights_report():
     values = [p for p in policies.values() if isinstance(p, dict)]
 
     lines = [
-        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.1",
+        "💡 POLICY INSIGHTS — CENTRAL QUANT V2.0.2.2",
         f"Data/hora: {_now()}",
         "",
     ]
@@ -1535,6 +1535,109 @@ def build_policy_insights_report():
     ]
     return "\n".join(lines)
 
+
+
+# ==========================================================
+# EXECUTIVE POLICY LEARNING V2.0.2.2 — REBUILD SAFE PATCH
+# ==========================================================
+
+def rebuild_executive_policy_effect(commit=True, max_decisions=None):
+    """
+    Rebuild completo da V2:
+    - zera offset do decision_log da V2
+    - limpa effect stats
+    - reprocessa o Decision Log desde o início
+
+    Não executa trades.
+    Não altera policies.
+    """
+    old_state = _load_v2_state()
+    old_effect = _load_effect()
+
+    reset_state = {
+        "version": VERSION,
+        "decision_log_offset": 0,
+        "decisions_processed": 0,
+        "last_run_at": None,
+        "last_error": None,
+        "rebuild_requested_at": _now(),
+        "previous_state": {
+            "decision_log_offset": old_state.get("decision_log_offset"),
+            "decisions_processed": old_state.get("decisions_processed"),
+            "last_run_at": old_state.get("last_run_at"),
+        },
+    }
+
+    reset_effect = _empty_effect()
+    reset_effect["previous_summary"] = old_effect.get("summary") or {}
+
+    if commit:
+        _write_json(V2_STATE_FILE, reset_state)
+        _write_json(V2_EFFECT_FILE, reset_effect)
+
+    result = run_executive_policy_learning_v2(
+        context={"source": "rebuild"},
+        commit=commit,
+        max_decisions=max_decisions or MAX_DECISIONS_PER_RUN,
+    )
+
+    result["rebuild"] = True
+    result["previous_decision_log_offset"] = old_state.get("decision_log_offset")
+    result["previous_summary"] = old_effect.get("summary") or {}
+
+    try:
+        with open(V2_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": "POLICY_EFFECT_REBUILD",
+                **result,
+            }, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+    return result
+
+
+def build_policy_effect_rebuild_report(result=None):
+    if result is None:
+        result = rebuild_executive_policy_effect(commit=True)
+
+    lines = [
+        "♻️ POLICY EFFECT REBUILD — CENTRAL QUANT V2.0.2.2",
+        f"Data/hora: {_now()}",
+        "",
+        f"Status: {'✅' if result.get('ok') else '❌'}",
+        f"Rebuild: {result.get('rebuild')}",
+        f"Offset anterior: {result.get('previous_decision_log_offset')}",
+        f"Decisões lidas: {result.get('decisions_read', 0)}",
+        f"Decisões processadas: {result.get('decisions_processed', 0)}",
+        f"Matches policy↔decision: {result.get('decisions_matched', 0)}",
+        f"Sem policy associada: {result.get('decisions_unmatched', 0)}",
+        f"Policy events carregados: {result.get('policy_events_loaded', 0)}",
+        f"Novo offset: {result.get('new_offset')}",
+        "",
+    ]
+
+    summary = result.get("summary") or {}
+    if summary:
+        lines += [
+            "Resumo atual:",
+            f"- Policies com efeito medido: {summary.get('policy_count', 0)}",
+            f"- Decisões correlacionadas: {summary.get('decisions_processed', 0)}",
+            f"- Effect score médio: {summary.get('average_effect_score', 0)}",
+            "",
+        ]
+
+    lines += [
+        "Leitura:",
+        "O rebuild reprocessa o Decision Log desde o início para tentar associar decisões às policies da Timeline.",
+        "",
+        "Próximos comandos:",
+        "/policyeffect",
+        "/policycompare",
+        "/policyinsights",
+    ]
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
