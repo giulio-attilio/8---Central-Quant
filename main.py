@@ -140,6 +140,56 @@ except Exception as e:
             "items": [],
         }
 
+
+try:
+    from executive_policy_expiration import (
+        run_executive_policy_expiration,
+        build_executive_policy_expiration_report,
+        get_executive_policy_expiration_health,
+        read_executive_policy_expiration_log,
+    )
+    EXECUTIVE_POLICY_EXPIRATION_LOADED = True
+    EXECUTIVE_POLICY_EXPIRATION_IMPORT_ERROR = None
+except Exception as e:
+    EXECUTIVE_POLICY_EXPIRATION_LOADED = False
+    EXECUTIVE_POLICY_EXPIRATION_IMPORT_ERROR = str(e)
+
+    def run_executive_policy_expiration(context=None, commit=True):
+        return {
+            "ok": False,
+            "module": "executive_policy_expiration",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_EXPIRATION_IMPORT_ERROR,
+            "expired_codes": [],
+            "kept_codes": [],
+            "notes": ["Falha ao importar Executive Policy Expiration no main.py."],
+        }
+
+    def build_executive_policy_expiration_report(result=None):
+        return (
+            "⏳ EXECUTIVE POLICY EXPIRATION — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            "Carregado: False\n"
+            f"Erro: {EXECUTIVE_POLICY_EXPIRATION_IMPORT_ERROR}"
+        )
+
+    def get_executive_policy_expiration_health():
+        return {
+            "ok": False,
+            "module": "executive_policy_expiration",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_EXPIRATION_IMPORT_ERROR,
+        }
+
+    def read_executive_policy_expiration_log(limit=20):
+        return {
+            "ok": False,
+            "module": "executive_policy_expiration",
+            "loaded": False,
+            "error": EXECUTIVE_POLICY_EXPIRATION_IMPORT_ERROR,
+            "items": [],
+        }
+
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -1588,6 +1638,54 @@ def policy_priority_log_route():
         limit = 20
     return read_executive_policy_priority_log(limit=limit), 200
 
+
+
+
+@app.route("/policyexpiration", methods=["GET"])
+@app.route("/executive/policy/expiration", methods=["GET"])
+def policy_expiration_route():
+    """
+    Executa uma rodada segura do Executive Policy Expiration V1.
+    V1 não executa trades; apenas expira policies cujo expires_at/TTL venceu.
+    """
+    try:
+        check_only = str(request.args.get("check_only", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        result = run_executive_policy_expiration(context={}, commit=not check_only)
+        report = build_executive_policy_expiration_report(result)
+        return report, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as exc:
+        return (
+            "⏳ EXECUTIVE POLICY EXPIRATION — CENTRAL QUANT\n"
+            "Status: ❌\n"
+            f"Erro na rota /policyexpiration: {exc}",
+            500,
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+
+@app.route("/policyexpirationhealth", methods=["GET"])
+@app.route("/executive/policy/expiration/health", methods=["GET"])
+def policy_expiration_health_route():
+    """Health check do Expiration V1."""
+    try:
+        return get_executive_policy_expiration_health(), 200
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "executive_policy_expiration",
+            "route": "/policyexpirationhealth",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/policyexpirationlog", methods=["GET"])
+@app.route("/executive/policy/expiration/log", methods=["GET"])
+def policy_expiration_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    return read_executive_policy_expiration_log(limit=limit), 200
 
 @app.route("/executive/alerts/check")
 @app.route("/executive_alerts/check")
