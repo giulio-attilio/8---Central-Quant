@@ -44,7 +44,7 @@ DECISION_LOG_FILE = Path(os.environ.get("CENTRAL_DECISION_LOG_FILE", str(DATA_DI
 V2_STATE_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_V2_STATE_FILE", str(DATA_DIR / "executive_policy_learning_v2_state.json")))
 V2_EFFECT_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_EFFECT_FILE", str(DATA_DIR / "executive_policy_learning_effect.json")))
 V2_LOG_FILE = Path(os.environ.get("EXECUTIVE_POLICY_LEARNING_V2_LOG_FILE", str(DATA_DIR / "executive_policy_learning_v2_log.jsonl")))
-MAX_DECISIONS_PER_RUN = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MAX_DECISIONS_PER_RUN", "700"))
+MAX_DECISIONS_PER_RUN = int(os.environ.get("EXECUTIVE_POLICY_LEARNING_MAX_DECISIONS_PER_RUN", "150"))
 POLICY_DECISION_WINDOW_MINUTES = int(os.environ.get("EXECUTIVE_POLICY_DECISION_WINDOW_MINUTES", "1440"))
 
 
@@ -3762,6 +3762,7 @@ def run_executive_policy_learning_v2(context=None, commit=True, max_decisions=No
     """
     V2.2:
     Lê decisões novas, associa policies por links explícitos/raw-aware e cruza com outcomes/lifecycle.
+    V2.2.3 reduz o lote padrão para evitar timeout no Render/navegador.
     """
     global _CURRENT_OUTCOME_INDEX, _CURRENT_OUTCOME_SOURCES
     started = time.time()
@@ -4228,7 +4229,7 @@ def build_policy_effect_rebuild_report(result=None):
 
     lines += [
         "Leitura:",
-        "A V2.2.2 cruza policies com outcomes/lifecycle quando houver fechamento correlacionável.",
+        "A V2.2.3 cruza policies com outcomes/lifecycle em lotes menores para evitar timeout quando houver fechamento correlacionável.",
         "Ela não inventa PnL para bloqueios; PnL evitado será uma camada hipotética futura.",
         "",
         "Próximos comandos:",
@@ -4250,7 +4251,7 @@ def build_policy_effect_rebuild_report(result=None):
 # - calcular pnl_pct a partir de entry/exit/stop/tp quando possível;
 # - não inventar PnL para bloqueios DENY/BLOCK.
 
-VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2.2"
+VERSION = "2026-07-05-EXECUTIVE-POLICY-LEARNING-V2.2.3"
 
 try:
     import ast as _ast_v222
