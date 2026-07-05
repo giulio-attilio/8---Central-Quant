@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-REAL PNL/R MAPPER — CENTRAL QUANT V2.4
-Versão: 2026-07-05-REAL-PNL-R-MAPPER-V2.4
+REAL PNL/R MAPPER — CENTRAL QUANT V2.4.1
+Versão: 2026-07-05-REAL-PNL-R-MAPPER-V2.4.1
 
 Objetivo:
 - Mapear PnL real e R real a partir de trades encerrados.
-- Unificar leitura de History, Trade Registry, Decision Log e possíveis eventos de fechamento.
+- Enriquecer trades fechados incompletos usando History, Trade Registry,
+  History Export e Decision Log.
+- Separar trades sem dados suficientes em diagnóstico, em vez de zerar
+  silenciosamente PnL/R.
 - Gerar métricas por bot, setup, símbolo e lado.
 - Rodar em modo observacional, sem executar ordens e sem alterar risco/lote.
 
@@ -25,12 +28,13 @@ from __future__ import annotations
 import json
 import math
 import os
-import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-VERSION = "2026-07-05-REAL-PNL-R-MAPPER-V2.4"
+VERSION = "2026-07-05-REAL-PNL-R-MAPPER-V2.4.1"
+MODULE = "real_pnl_r_mapper"
+MODE = "OBSERVATION_ONLY"
 
 DATA_DIR = os.environ.get("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
 TRADE_REGISTRY_FILE = os.path.join(DATA_DIR, "trade_registry.jsonl")
@@ -40,6 +44,12 @@ DECISION_LOG_FILE = os.path.join(DATA_DIR, "decision_log.jsonl")
 OUTPUT_MAP_FILE = os.path.join(DATA_DIR, "real_pnl_r_map.json")
 OUTPUT_EVENTS_FILE = os.path.join(DATA_DIR, "real_pnl_r_events.jsonl")
 
+EMPTY_VALUES = {None, "", "null", "None", "NONE", "N/A", "nan", "NaN"}
+
+
+# ==========================================================
+# BÁSICO / IO
+# ==========================================================
 
 def _now_br() -> str:
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -65,6 +75,14 @@ def _safe_str(value: Any, default: str = "") -> str:
     if value is None:
         return default
     return str(value).strip()
+
+
+def _is_empty(value: Any) -> bool:
+    if value in EMPTY_VALUES:
+        return True
+    if isinstance(value, str) and value.strip() in EMPTY_VALUES:
+        return True
+    return False
 
 
 def _read_jsonl(path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -114,38 +132,60 @@ def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _flatten_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Une row + payload + trade + position + result sem sobrescrever campo bom."""
+    merged = dict(row or {})
+    for nested_key in ["payload", "trade", "position", "data", "result", "order", "decision", "context"]:
+        nested = row.get(nested_key) if isinstance(row, dict) else None
+        if isinstance(nested, dict):
+            for k, v in nested.items():
+                if _is_empty(merged.get(k)) and not _is_empty(v):
+                    merged[k] = v
+    return merged
+
+
+def _pick(d: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
+    for k in keys:
+        if k in d and not _is_empty(d.get(k)):
+            return d.get(k)
+    return default
+
+
+# ==========================================================
+# NORMALIZAÇÃO
+# ==========================================================
+
 def _normalize_side(side: Any) -> str:
     s = _safe_str(side).upper()
-    if s in {"BUY", "LONG"}:
+    if s in {"BUY", "LONG", "COMPRA"}:
         return "LONG"
-    if s in {"SELL", "SHORT"}:
+    if s in {"SELL", "SHORT", "VENDA"}:
         return "SHORT"
     return s or "UNKNOWN"
 
 
 def _normalize_symbol(symbol: Any) -> str:
     s = _safe_str(symbol).upper()
-    return s.replace("/", "").replace(":USDT", "")
+    s = s.replace("/", "").replace(":USDT", "")
+    s = s.replace("-", "").replace("_", "")
+    return s or "UNKNOWN"
 
 
-def _pick(d: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
-    for k in keys:
-        if k in d and d.get(k) is not None:
-            return d.get(k)
-    return default
+def _normalize_bot(bot: Any) -> str:
+    b = _safe_str(bot, "UNKNOWN").upper()
+    aliases = {
+        "SMARTPREDATOR": "PREDATOR",
+        "SMART_PREDATOR": "PREDATOR",
+        "TREND_PRO": "TRENDPRO",
+        "TREND PRO": "TRENDPRO",
+        "FALCON15": "FALCON",
+    }
+    return aliases.get(b, b or "UNKNOWN")
 
 
-def _candidate_trade_id(row: Dict[str, Any]) -> str:
-    explicit = _pick(row, ["trade_id", "id", "decision_id", "position_id", "signal_id"])
-    if explicit:
-        return _safe_str(explicit)
-
-    bot = _safe_str(_pick(row, ["bot", "robot", "strategy"]), "UNKNOWN")
-    setup = _safe_str(_pick(row, ["setup", "setup_name"]), "UNKNOWN")
-    symbol = _normalize_symbol(_pick(row, ["symbol", "pair", "market"]))
-    side = _normalize_side(_pick(row, ["side", "direction"])).upper()
-    entry_time = _safe_str(_pick(row, ["entry_time", "opened_at", "created_at", "timestamp", "epoch"]), "NO_TIME")
-    return f"{bot}:{setup}:{symbol}:{side}:{entry_time}"
+def _normalize_setup(setup: Any) -> str:
+    s = _safe_str(setup, "UNKNOWN").upper()
+    return s or "UNKNOWN"
 
 
 def _extract_price(row: Dict[str, Any], names: List[str]) -> Optional[float]:
@@ -154,15 +194,67 @@ def _extract_price(row: Dict[str, Any], names: List[str]) -> Optional[float]:
 
 def _infer_closed(row: Dict[str, Any]) -> bool:
     status = _safe_str(_pick(row, ["status", "state"])).upper()
-    event = _safe_str(_pick(row, ["event", "event_raw", "type"])).upper()
-    if status in {"CLOSED", "CLOSE", "DONE", "FINISHED", "EXITED"}:
+    event = _safe_str(_pick(row, ["event", "event_raw", "type", "kind"])).upper()
+    if status in {"CLOSED", "CLOSE", "DONE", "FINISHED", "EXITED", "ENCERRADO", "FECHADO"}:
         return True
-    if event in {"TRADE_CLOSED", "CLOSE", "CLOSED", "POSITION_CLOSED", "EXIT"}:
+    if event in {"TRADE_CLOSED", "CLOSE", "CLOSED", "POSITION_CLOSED", "EXIT", "TP", "STOP", "SL", "TAKE_PROFIT"}:
         return True
-    if _extract_price(row, ["exit", "exit_price", "close", "close_price", "avg_exit_price"]):
+    if _extract_price(row, ["exit", "exit_price", "close", "close_price", "avg_exit_price", "closed_price"]):
+        return True
+    if _safe_float(_pick(row, ["pnl_pct", "pnl_percent", "profit_pct", "real_pnl_pct", "pnl_usdt", "realized_pnl", "realizedPnl"])) is not None:
         return True
     return False
 
+
+def _primary_identity(row: Dict[str, Any]) -> Dict[str, Any]:
+    merged = _flatten_payload(row)
+    return {
+        "bot": _normalize_bot(_pick(merged, ["bot", "robot", "strategy", "bot_name", "source_bot"])),
+        "setup": _normalize_setup(_pick(merged, ["setup", "setup_name", "strategy_setup", "signal_type", "setup_label"])),
+        "symbol": _normalize_symbol(_pick(merged, ["symbol", "symbol_clean", "ativo", "pair", "market", "ticker"])),
+        "side": _normalize_side(_pick(merged, ["side", "direction", "position_side", "signal_side"])),
+    }
+
+
+def _candidate_trade_id(row: Dict[str, Any]) -> str:
+    merged = _flatten_payload(row)
+    explicit = _pick(merged, [
+        "trade_id", "id", "decision_id", "position_id", "signal_id", "client_order_id",
+        "order_id", "orderId", "uid", "uuid",
+    ])
+    if explicit:
+        explicit_s = _safe_str(explicit)
+        # Evita IDs ruins demais como "C" agruparem tudo indevidamente.
+        if len(explicit_s) >= 6:
+            return explicit_s
+
+    ident = _primary_identity(merged)
+    ts = _safe_str(_pick(merged, ["entry_time", "opened_at", "created_at", "timestamp", "epoch", "closed_at", "generated_at"]), "NO_TIME")
+    entry = _safe_str(_pick(merged, ["entry", "entry_price", "avg_entry_price", "open_price"]), "NO_ENTRY")
+    return f"{ident['bot']}:{ident['setup']}:{ident['symbol']}:{ident['side']}:{entry}:{ts}"
+
+
+def _match_key(row: Dict[str, Any]) -> str:
+    ident = _primary_identity(row)
+    return f"{ident['bot']}|{ident['symbol']}|{ident['side']}"
+
+
+def _loose_match_key(row: Dict[str, Any]) -> str:
+    ident = _primary_identity(row)
+    return f"{ident['symbol']}|{ident['side']}"
+
+
+def _source_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    if value:
+        return [str(value)]
+    return []
+
+
+# ==========================================================
+# CÁLCULOS
+# ==========================================================
 
 def _compute_pnl_pct(side: str, entry: Optional[float], exit_price: Optional[float]) -> Optional[float]:
     if not entry or not exit_price or entry <= 0:
@@ -172,7 +264,7 @@ def _compute_pnl_pct(side: str, entry: Optional[float], exit_price: Optional[flo
     return ((exit_price - entry) / entry) * 100.0
 
 
-def _compute_r(side: str, entry: Optional[float], stop: Optional[float], exit_price: Optional[float], pnl_pct: Optional[float]) -> Optional[float]:
+def _compute_r(side: str, entry: Optional[float], stop: Optional[float], exit_price: Optional[float]) -> Optional[float]:
     if not entry or not stop or not exit_price or entry <= 0:
         return None
     if side == "SHORT":
@@ -186,46 +278,70 @@ def _compute_r(side: str, entry: Optional[float], stop: Optional[float], exit_pr
     return reward_per_unit / risk_per_unit
 
 
+def _recompute_metrics(t: Dict[str, Any]) -> Dict[str, Any]:
+    side = _normalize_side(t.get("side"))
+    entry = _safe_float(t.get("entry"))
+    stop = _safe_float(t.get("stop"))
+    exit_price = _safe_float(t.get("exit"))
+
+    pnl_pct = _safe_float(t.get("pnl_pct"))
+    if pnl_pct is None:
+        pnl_pct = _compute_pnl_pct(side, entry, exit_price)
+
+    r_value = _safe_float(t.get("r"))
+    if r_value is None:
+        r_value = _compute_r(side, entry, stop, exit_price)
+
+    t["side"] = side or "UNKNOWN"
+    t["entry"] = entry
+    t["stop"] = stop
+    t["exit"] = exit_price
+    t["pnl_pct"] = round(pnl_pct, 6) if pnl_pct is not None else None
+    t["r"] = round(r_value, 6) if r_value is not None else None
+    return t
+
+
+# ==========================================================
+# NORMALIZAÇÃO / ENRIQUECIMENTO
+# ==========================================================
+
 def _normalize_trade(row: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
     if not isinstance(row, dict):
         return None
 
-    event_payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-    merged = dict(row)
-    merged.update({k: v for k, v in event_payload.items() if k not in merged or merged.get(k) is None})
+    merged = _flatten_payload(row)
+    ident = _primary_identity(merged)
 
-    side = _normalize_side(_pick(merged, ["side", "direction", "position_side"]))
-    symbol = _normalize_symbol(_pick(merged, ["symbol", "pair", "market"]))
-    bot = _safe_str(_pick(merged, ["bot", "robot", "strategy", "bot_name"]), "UNKNOWN")
-    setup = _safe_str(_pick(merged, ["setup", "setup_name", "strategy_setup"]), "UNKNOWN")
+    entry = _extract_price(merged, [
+        "entry", "entry_price", "avg_entry_price", "open_price", "entrada", "price_entry", "fill_entry",
+    ])
+    stop = _extract_price(merged, [
+        "sl", "stop", "stop_loss", "initial_sl", "initial_stop", "stop_price", "stop_atual",
+    ])
+    exit_price = _extract_price(merged, [
+        "exit", "exit_price", "close", "close_price", "avg_exit_price", "closed_price", "saida", "price_exit",
+    ])
 
-    entry = _extract_price(merged, ["entry", "entry_price", "avg_entry_price", "open_price"])
-    stop = _extract_price(merged, ["sl", "stop", "stop_loss", "initial_sl", "initial_stop"])
-    exit_price = _extract_price(merged, ["exit", "exit_price", "close", "close_price", "avg_exit_price"])
-
-    pnl_pct = _safe_float(_pick(merged, ["pnl_pct", "pnl_percent", "profit_pct", "real_pnl_pct"]))
-    if pnl_pct is None:
-        pnl_pct = _compute_pnl_pct(side, entry, exit_price)
-
-    r_value = _safe_float(_pick(merged, ["r", "r_result", "real_r", "r_multiple"]))
-    if r_value is None:
-        r_value = _compute_r(side, entry, stop, exit_price, pnl_pct)
-
-    pnl_usdt = _safe_float(_pick(merged, ["pnl_usdt", "realized_pnl", "realizedPnl", "profit_usdt", "net_pnl_usdt"]))
-    qty = _safe_float(_pick(merged, ["qty", "quantity", "size", "amount", "contracts"]))
+    pnl_pct = _safe_float(_pick(merged, ["pnl_pct", "pnl_percent", "profit_pct", "real_pnl_pct", "result_pct"]))
+    r_value = _safe_float(_pick(merged, ["r", "r_result", "real_r", "r_multiple", "result_r"]))
+    pnl_usdt = _safe_float(_pick(merged, ["pnl_usdt", "realized_pnl", "realizedPnl", "profit_usdt", "net_pnl_usdt", "pnl"] ))
+    qty = _safe_float(_pick(merged, ["qty", "quantity", "size", "amount", "contracts", "position_size"] ))
 
     closed = _infer_closed(merged)
-    if not closed and pnl_pct is None and r_value is None and pnl_usdt is None:
+    has_useful_data = closed or any(x is not None for x in [entry, stop, exit_price, pnl_pct, r_value, pnl_usdt, qty])
+    if not has_useful_data:
         return None
 
-    trade_id = _candidate_trade_id(merged)
-    return {
-        "trade_id": trade_id,
+    item: Dict[str, Any] = {
+        "trade_id": _candidate_trade_id(merged),
+        "match_key": _match_key(merged),
+        "loose_match_key": _loose_match_key(merged),
+        "sources": [source],
         "source": source,
-        "bot": bot,
-        "setup": setup,
-        "symbol": symbol or "UNKNOWN",
-        "side": side or "UNKNOWN",
+        "bot": ident["bot"],
+        "setup": ident["setup"],
+        "symbol": ident["symbol"],
+        "side": ident["side"],
         "entry": entry,
         "stop": stop,
         "exit": exit_price,
@@ -235,10 +351,164 @@ def _normalize_trade(row: Dict[str, Any], source: str) -> Optional[Dict[str, Any
         "r": round(r_value, 6) if r_value is not None else None,
         "status": "CLOSED" if closed else "MAPPED",
         "closed": bool(closed),
-        "raw_event": _safe_str(_pick(merged, ["event", "event_raw", "type", "status"]), ""),
-        "timestamp": _pick(merged, ["timestamp", "epoch", "created_at", "entry_time", "closed_at", "generated_at"]),
+        "raw_event": _safe_str(_pick(merged, ["event", "event_raw", "type", "status", "kind"]), ""),
+        "timestamp": _pick(merged, ["timestamp", "epoch", "created_at", "entry_time", "opened_at", "closed_at", "generated_at"]),
+    }
+    return _recompute_metrics(item)
+
+
+def _field_quality_score(t: Dict[str, Any]) -> int:
+    score = 0
+    for field in ["bot", "setup", "symbol", "side"]:
+        if t.get(field) and t.get(field) != "UNKNOWN":
+            score += 1
+    for field in ["entry", "stop", "exit", "qty", "pnl_pct", "pnl_usdt", "r"]:
+        if t.get(field) is not None:
+            score += 2
+    if t.get("closed"):
+        score += 3
+    return score
+
+
+def _merge_two(current: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge conservador: preserva campos bons e completa campos vazios."""
+    merged = dict(current)
+    sources = set(_source_list(current.get("sources")) + _source_list(incoming.get("sources")) + [incoming.get("source")])
+    merged["sources"] = sorted([s for s in sources if s])
+
+    # Se incoming é mais completo, ele pode preencher metadados UNKNOWN.
+    for k, v in incoming.items():
+        if k in {"sources"}:
+            continue
+        if _is_empty(v):
+            continue
+        if _is_empty(merged.get(k)) or merged.get(k) == "UNKNOWN":
+            merged[k] = v
+
+    # Campos numéricos: preencher se faltam.
+    for k in ["entry", "stop", "exit", "qty", "pnl_pct", "pnl_usdt", "r"]:
+        if merged.get(k) is None and incoming.get(k) is not None:
+            merged[k] = incoming.get(k)
+
+    # Se qualquer fonte diz que fechou, consideramos closed.
+    merged["closed"] = bool(current.get("closed") or incoming.get("closed"))
+    merged["status"] = "CLOSED" if merged.get("closed") else merged.get("status", "MAPPED")
+
+    # Mantém último evento bruto relevante.
+    if incoming.get("raw_event") and str(incoming.get("raw_event")).upper() in {"TRADE_CLOSED", "CLOSE", "CLOSED", "POSITION_CLOSED", "EXIT", "STOP", "TP"}:
+        merged["raw_event"] = incoming.get("raw_event")
+
+    return _recompute_metrics(merged)
+
+
+def _merge_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    1) Agrupa por trade_id quando o id parece confiável.
+    2) Enriquece fechamentos incompletos por bot/símbolo/lado.
+    3) Usa fallback por símbolo/lado para casos como trade_id='C'.
+    """
+    by_id: Dict[str, Dict[str, Any]] = {}
+
+    for t in trades:
+        tid = _safe_str(t.get("trade_id"))
+        if not tid:
+            tid = f"AUTO:{len(by_id)+1}"
+        if tid not in by_id:
+            by_id[tid] = t
+        else:
+            by_id[tid] = _merge_two(by_id[tid], t)
+
+    merged = list(by_id.values())
+
+    # Índices dos registros mais completos para enriquecer fechados incompletos.
+    by_match: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_loose: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for t in merged:
+        if t.get("match_key"):
+            by_match[t["match_key"]].append(t)
+        if t.get("loose_match_key"):
+            by_loose[t["loose_match_key"]].append(t)
+
+    for key in list(by_match.keys()):
+        by_match[key] = sorted(by_match[key], key=_field_quality_score, reverse=True)
+    for key in list(by_loose.keys()):
+        by_loose[key] = sorted(by_loose[key], key=_field_quality_score, reverse=True)
+
+    enriched: List[Dict[str, Any]] = []
+    for t in merged:
+        item = dict(t)
+        if item.get("closed"):
+            candidates = []
+            candidates.extend(by_match.get(item.get("match_key"), []))
+            candidates.extend(by_loose.get(item.get("loose_match_key"), []))
+            for c in candidates:
+                if c is item:
+                    continue
+                item = _merge_two(item, c)
+                if item.get("entry") is not None and item.get("exit") is not None and item.get("stop") is not None:
+                    break
+        enriched.append(_diagnose_trade(_recompute_metrics(item)))
+
+    # Dedup final: se dois registros ficaram com mesma identidade e ambos closed, mantém o mais completo.
+    final_by_key: Dict[str, Dict[str, Any]] = {}
+    for t in enriched:
+        dedup_key = t.get("trade_id") or f"{t.get('match_key')}|{t.get('timestamp')}"
+        # Para IDs ruins/curtos, dedup por match + timestamp aproximado textual.
+        if len(_safe_str(t.get("trade_id"))) < 6:
+            dedup_key = f"{t.get('match_key')}|{t.get('timestamp')}|{t.get('raw_event')}"
+        if dedup_key not in final_by_key:
+            final_by_key[dedup_key] = t
+        else:
+            old = final_by_key[dedup_key]
+            final_by_key[dedup_key] = _merge_two(old, t) if _field_quality_score(t) >= _field_quality_score(old) else _merge_two(t, old)
+
+    return list(final_by_key.values())
+
+
+# ==========================================================
+# DIAGNÓSTICO
+# ==========================================================
+
+def _diagnose_trade(t: Dict[str, Any]) -> Dict[str, Any]:
+    issues: List[str] = []
+    if t.get("closed"):
+        if t.get("entry") is None:
+            issues.append("MISSING_ENTRY_PRICE")
+        if t.get("exit") is None:
+            issues.append("MISSING_EXIT_PRICE")
+        if t.get("stop") is None:
+            issues.append("MISSING_STOP_PRICE")
+        if t.get("pnl_pct") is None:
+            issues.append("MISSING_PNL_PCT")
+        if t.get("r") is None:
+            issues.append("MISSING_R")
+        if t.get("symbol") in {None, "", "UNKNOWN"}:
+            issues.append("MISSING_SYMBOL")
+        if t.get("side") in {None, "", "UNKNOWN"}:
+            issues.append("MISSING_SIDE")
+    t["quality"] = "COMPLETE" if not issues and t.get("closed") else ("INCOMPLETE" if issues else "MAPPED")
+    t["issues"] = issues
+    return t
+
+
+def _diagnostics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    closed = [r for r in rows if r.get("closed") or r.get("status") == "CLOSED"]
+    incomplete = [r for r in closed if r.get("issues")]
+    by_issue: Dict[str, int] = defaultdict(int)
+    for r in incomplete:
+        for issue in r.get("issues") or []:
+            by_issue[issue] += 1
+    return {
+        "closed_complete": len([r for r in closed if not r.get("issues")]),
+        "closed_incomplete": len(incomplete),
+        "by_issue": dict(sorted(by_issue.items())),
+        "incomplete_recent": incomplete[-25:],
     }
 
+
+# ==========================================================
+# LOADERS
+# ==========================================================
 
 def _load_history_export_rows() -> List[Dict[str, Any]]:
     data = _read_json(HISTORY_EXPORT_FILE)
@@ -247,7 +517,7 @@ def _load_history_export_rows() -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
     if isinstance(data, dict):
-        for key in ["trades", "events", "closed_trades", "history", "rows"]:
+        for key in ["trades", "events", "closed_trades", "history", "rows", "items", "data"]:
             value = data.get(key)
             if isinstance(value, list):
                 return [x for x in value if isinstance(x, dict)]
@@ -255,31 +525,9 @@ def _load_history_export_rows() -> List[Dict[str, Any]]:
     return []
 
 
-def _merge_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_id: Dict[str, Dict[str, Any]] = {}
-    source_rank = {"history_events": 4, "history_export": 3, "trade_registry": 2, "decision_log": 1}
-
-    for t in trades:
-        tid = t.get("trade_id") or _candidate_trade_id(t)
-        if tid not in by_id:
-            by_id[tid] = t
-            continue
-
-        current = by_id[tid]
-        # Mantém o registro mais completo, sem perder campos já preenchidos.
-        if source_rank.get(t.get("source"), 0) >= source_rank.get(current.get("source"), 0):
-            merged = dict(current)
-            for k, v in t.items():
-                if v is not None and v != "":
-                    merged[k] = v
-            by_id[tid] = merged
-        else:
-            for k, v in t.items():
-                if current.get(k) in [None, ""] and v not in [None, ""]:
-                    current[k] = v
-
-    return list(by_id.values())
-
+# ==========================================================
+# ESTATÍSTICAS
+# ==========================================================
 
 def _stats_for(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     closed = [r for r in rows if r.get("closed") or r.get("status") == "CLOSED"]
@@ -322,6 +570,34 @@ def _group_stats(rows: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, An
     return {k: _stats_for(v) for k, v in sorted(groups.items(), key=lambda kv: kv[0])}
 
 
+# ==========================================================
+# API PÚBLICA DO MÓDULO
+# ==========================================================
+
+def get_real_pnl_r_health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "available": True,
+        "module": MODULE,
+        "version": VERSION,
+        "mode": MODE,
+        "import_error": None,
+        "files": {
+            "trade_registry_exists": os.path.exists(TRADE_REGISTRY_FILE),
+            "history_events_exists": os.path.exists(HISTORY_EVENTS_FILE),
+            "history_export_exists": os.path.exists(HISTORY_EXPORT_FILE),
+            "decision_log_exists": os.path.exists(DECISION_LOG_FILE),
+            "output_map_exists": os.path.exists(OUTPUT_MAP_FILE),
+            "output_events_exists": os.path.exists(OUTPUT_EVENTS_FILE),
+        },
+        "notes": [
+            "V2.4.1 mapeia PnL real e R real de trades encerrados.",
+            "Enriquece trades incompletos cruzando fontes por trade_id, bot/símbolo/lado e símbolo/lado.",
+            "Não executa ordens, não altera lotes e não muda risco real.",
+        ],
+    }
+
+
 def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Dict[str, Any]:
     raw_sources: List[Tuple[str, List[Dict[str, Any]]]] = [
         ("trade_registry", _read_jsonl(TRADE_REGISTRY_FILE, limit=limit)),
@@ -341,16 +617,19 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
 
     merged = _merge_trades(normalized)
     closed = [r for r in merged if r.get("closed") or r.get("status") == "CLOSED"]
+    diagnostics = _diagnostics(merged)
 
     payload: Dict[str, Any] = {
         "ok": True,
         "version": VERSION,
+        "module": MODULE,
         "generated_at": _now_br(),
-        "mode": "OBSERVATION_ONLY",
+        "mode": MODE,
         "notes": [
-            "Real PnL/R Mapper V2.4 apenas observa e calcula métricas.",
+            "Real PnL/R Mapper V2.4.1 apenas observa e calcula métricas.",
             "Não executa trades, não altera lotes e não altera policies ativas.",
             "PnL% é calculado quando há entry/exit; R é calculado quando há entry/stop/exit.",
+            "Trades incompletos agora aparecem em diagnostics.by_issue, não como perda/zero silencioso.",
         ],
         "files": {
             "trade_registry": TRADE_REGISTRY_FILE,
@@ -361,9 +640,11 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
             "output_events": OUTPUT_EVENTS_FILE,
         },
         "source_counts": source_counts,
+        "normalized_count": len(normalized),
         "mapped_count": len(merged),
         "closed_count": len(closed),
         "summary": _stats_for(merged),
+        "diagnostics": diagnostics,
         "by_bot": _group_stats(closed, "bot"),
         "by_setup": _group_stats(closed, "setup"),
         "by_symbol": _group_stats(closed, "symbol"),
@@ -380,6 +661,7 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
             "mapped_count": payload["mapped_count"],
             "closed_count": payload["closed_count"],
             "summary": payload["summary"],
+            "diagnostics": payload["diagnostics"],
         })
         payload["committed"] = True
     else:
@@ -392,12 +674,15 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:
     if payload is None:
         payload = build_real_pnl_r_map(commit=False)
 
-    summary = payload.get("summary", {})
+    summary = payload.get("summary", {}) or {}
+    diagnostics = payload.get("diagnostics", {}) or {}
+    by_issue = diagnostics.get("by_issue", {}) or {}
+
     lines = []
-    lines.append("💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.4")
+    lines.append("💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.4.1")
     lines.append(f"Data/hora: {payload.get('generated_at')}")
     lines.append(f"Status: {'✅' if payload.get('ok') else '❌'}")
-    lines.append(f"Modo: {payload.get('mode', 'OBSERVATION_ONLY')}")
+    lines.append(f"Modo: {payload.get('mode', MODE)}")
     lines.append("")
     lines.append("Resumo geral:")
     lines.append(f"- Trades fechados: {summary.get('trades', 0)}")
@@ -408,6 +693,16 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:
     lines.append(f"- R total: {summary.get('r_total', 0)}R")
     lines.append(f"- R médio: {summary.get('r_avg', 0)}R")
     lines.append(f"- Profit factor: {summary.get('profit_factor_pct', 0)}")
+    lines.append(f"- Com PnL%: {summary.get('with_pnl_pct', 0)} | Com R: {summary.get('with_r', 0)}")
+    lines.append("")
+    lines.append("Diagnóstico:")
+    lines.append(f"- Fechados completos: {diagnostics.get('closed_complete', 0)}")
+    lines.append(f"- Fechados incompletos: {diagnostics.get('closed_incomplete', 0)}")
+    if by_issue:
+        for issue, count in by_issue.items():
+            lines.append(f"- {issue}: {count}")
+    else:
+        lines.append("- Sem pendências de dados nos fechamentos mapeados.")
     lines.append("")
     lines.append("Por bot:")
     by_bot = payload.get("by_bot") or {}
@@ -417,11 +712,12 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:
         for bot, st in by_bot.items():
             lines.append(
                 f"- {bot}: trades={st.get('trades', 0)} | win={st.get('win_rate_pct', 0)}% | "
-                f"PnL={st.get('pnl_total_pct', 0)}% | R={st.get('r_total', 0)}R"
+                f"PnL={st.get('pnl_total_pct', 0)}% | R={st.get('r_total', 0)}R | "
+                f"with_pnl={st.get('with_pnl_pct', 0)} | with_r={st.get('with_r', 0)}"
             )
     lines.append("")
     lines.append("Observação:")
-    lines.append("- V2.4 ainda não muda lote, risco ou execução. Ela cria a ponte estatística entre resultado real e aprendizagem da Central.")
+    lines.append("- V2.4.1 ainda não muda lote, risco ou execução. Ela melhora a ponte estatística entre resultado real e aprendizagem da Central.")
     return "\n".join(lines)
 
 
