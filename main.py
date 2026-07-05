@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-REAL-PNL-R-MAPPER-V2.4
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-STABILIZATION-V2.4.3
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -535,6 +535,130 @@ except Exception as _memory_profiler_exc:
 
 app = Flask(__name__)
 
+# ==========================================================
+# MEMORY STABILIZER HELPERS V2.4.3
+# ==========================================================
+def _clamp_int(value, default=100, min_value=1, max_value=1000):
+    try:
+        n = int(value)
+    except Exception:
+        n = int(default)
+    if n < min_value:
+        return min_value
+    if n > max_value:
+        return max_value
+    return n
+
+
+def _request_limit(default=None, max_value=None):
+    default = MEMORY_SAFE_DEFAULT_LIMIT if default is None else default
+    max_value = MEMORY_SAFE_MAX_LIMIT if max_value is None else max_value
+    try:
+        raw = request.args.get("limit", str(default))
+    except Exception:
+        raw = default
+    return _clamp_int(raw, default=default, min_value=1, max_value=max_value)
+
+
+def _compact_real_pnl_payload(payload):
+    """Remove listas grandes do payload quando a rota textual não precisa delas."""
+    if not isinstance(payload, dict):
+        return payload
+    return {
+        "ok": payload.get("ok"),
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+        "mode": payload.get("mode"),
+        "mapped_count": payload.get("mapped_count"),
+        "closed_count": payload.get("closed_count"),
+        "normalized_count": payload.get("normalized_count"),
+        "source_counts": payload.get("source_counts"),
+        "summary": payload.get("summary"),
+        "diagnostics": payload.get("diagnostics"),
+        "by_bot": payload.get("by_bot"),
+        "by_setup": payload.get("by_setup"),
+        "by_symbol": payload.get("by_symbol"),
+        "by_side": payload.get("by_side"),
+    }
+
+
+def _memory_cleanup(reason="request", force=False):
+    if not MEMORY_STABILIZER_ENABLED:
+        return None
+    try:
+        before_mb = current_rss_mb()
+        should_gc = bool(force or (before_mb or 0) >= MEMORY_GC_THRESHOLD_MB)
+        collected = None
+        if should_gc:
+            collected = gc.collect()
+            malloc_trim_safe()
+        after_mb = current_rss_mb()
+        return {
+            "ok": True,
+            "reason": reason,
+            "gc_executed": should_gc,
+            "collected": collected,
+            "rss_before_mb": before_mb,
+            "rss_after_mb": after_mb,
+            "usage_pct": memory_usage_pct(after_mb),
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": reason, "error": str(exc)}
+
+
+@app.after_request
+def memory_stabilizer_after_request(response):
+    """
+    Limpeza leve após rotas pesadas.
+    Não altera o body da resposta, apenas reduz chance de RSS ficar preso no Render.
+    """
+    try:
+        if not MEMORY_STABILIZER_ENABLED or not MEMORY_STABILIZER_FORCE_GC_AFTER_REQUEST:
+            return response
+        path = str(getattr(request, "path", "") or "")
+        is_heavy = path in MEMORY_STABILIZER_HEAVY_PATHS or any(path.startswith(prefix + "/") for prefix in MEMORY_STABILIZER_HEAVY_PATHS)
+        current = current_rss_mb() or 0
+        if is_heavy or current >= MEMORY_GC_THRESHOLD_MB:
+            _memory_cleanup(reason=f"after_request:{path}", force=is_heavy)
+    except Exception:
+        pass
+    return response
+
+
+@app.route("/memory/stabilizer", methods=["GET"])
+@app.route("/memorystabilizer", methods=["GET"])
+def memory_stabilizer_route():
+    try:
+        force = str(request.args.get("gc", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        cleanup = _memory_cleanup(reason="/memory/stabilizer", force=force)
+        return {
+            "ok": True,
+            "module": "memory_stabilizer",
+            "version": MEMORY_STABILIZER_VERSION,
+            "enabled": MEMORY_STABILIZER_ENABLED,
+            "generated_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+            "limits": {
+                "memory_limit_mb": MEMORY_LIMIT_MB,
+                "gc_threshold_mb": MEMORY_GC_THRESHOLD_MB,
+                "alert_threshold_pct": MEMORY_ALERT_THRESHOLD_PCT,
+                "memory_history_maxlen": MEMORY_HISTORY_MAXLEN,
+                "safe_default_limit": MEMORY_SAFE_DEFAULT_LIMIT,
+                "safe_max_limit": MEMORY_SAFE_MAX_LIMIT,
+                "real_pnl_r_default_limit": REAL_PNL_R_DEFAULT_LIMIT,
+                "real_pnl_r_max_limit": REAL_PNL_R_MAX_LIMIT,
+                "telegram_chunk_size": TELEGRAM_CHUNK_SIZE if "TELEGRAM_CHUNK_SIZE" in globals() else None,
+            },
+            "cleanup": cleanup,
+            "notes": [
+                "V2.4.3 reduz picos de memória em endpoints grandes.",
+                "Rotas pesadas passam por GC após a resposta.",
+                "Limites altos de leitura são clampados por padrão.",
+            ],
+        }, 200
+    except Exception as exc:
+        return {"ok": False, "module": "memory_stabilizer", "error": str(exc)}, 500
+
+
 try:
     import broker as central_broker
 except Exception as _broker_import_exc:
@@ -582,11 +706,35 @@ WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("WATCHDOG_ALERT_COOLDOWN_SE
 
 # Memória Render free costuma ser 512 MB.
 MEMORY_LIMIT_MB = float(os.environ.get("MEMORY_LIMIT_MB", "512"))
-MEMORY_GC_THRESHOLD_MB = float(os.environ.get("MEMORY_GC_THRESHOLD_MB", "430"))
-MEMORY_ALERT_THRESHOLD_PCT = float(os.environ.get("MEMORY_ALERT_THRESHOLD_PCT", "90"))
-MEMORY_HISTORY_MAXLEN = int(os.environ.get("MEMORY_HISTORY_MAXLEN", "120"))
+MEMORY_GC_THRESHOLD_MB = float(os.environ.get("MEMORY_GC_THRESHOLD_MB", "380"))
+MEMORY_ALERT_THRESHOLD_PCT = float(os.environ.get("MEMORY_ALERT_THRESHOLD_PCT", "82"))
+MEMORY_HISTORY_MAXLEN = int(os.environ.get("MEMORY_HISTORY_MAXLEN", "40"))
 MEMORY_LOG_INTERVAL_SECONDS = int(os.environ.get("MEMORY_LOG_INTERVAL_SECONDS", "300"))
 MEMORY_PROFILE_BOT_STEPS = os.environ.get("MEMORY_PROFILE_BOT_STEPS", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+# ==========================================================
+# MEMORY STABILIZATION V2.4.3 — REPORT DIET / RENDER FREE
+# ==========================================================
+# Objetivo:
+# - Reduzir picos de memória em rotas grandes.
+# - Forçar limpeza após endpoints pesados.
+# - Limitar leituras grandes por padrão sem quebrar endpoints existentes.
+# - Evitar que /realpnlr/text devolva payload completo por padrão.
+MEMORY_STABILIZER_VERSION = "2026-07-05-MEMORY-STABILIZATION-V2.4.3"
+MEMORY_STABILIZER_ENABLED = os.environ.get("MEMORY_STABILIZER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+MEMORY_STABILIZER_FORCE_GC_AFTER_REQUEST = os.environ.get("MEMORY_STABILIZER_FORCE_GC_AFTER_REQUEST", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+MEMORY_STABILIZER_HEAVY_PATHS = {
+    "/relatorio", "/dashboard", "/executive", "/risk", "/heat", "/ranking",
+    "/history", "/history/raw", "/history/trades", "/history/trades/analytics",
+    "/exporthistory", "/exportarhistory", "/realpnlr", "/realpnlr/text",
+    "/policyeffect", "/policycompare", "/policyinsights", "/learning/state",
+    "/adaptive/weights/v2", "/meta", "/metastrategy", "/regime",
+    "/correlation/v1", "/strategy-evolution/v1", "/trade-lifecycle/v1",
+}
+MEMORY_SAFE_DEFAULT_LIMIT = int(os.environ.get("MEMORY_SAFE_DEFAULT_LIMIT", "750"))
+MEMORY_SAFE_MAX_LIMIT = int(os.environ.get("MEMORY_SAFE_MAX_LIMIT", "1500"))
+REAL_PNL_R_DEFAULT_LIMIT = int(os.environ.get("REAL_PNL_R_DEFAULT_LIMIT", "750"))
+REAL_PNL_R_MAX_LIMIT = int(os.environ.get("REAL_PNL_R_MAX_LIMIT", "1500"))
 
 MEMORY_HISTORY = deque(maxlen=MEMORY_HISTORY_MAXLEN)
 MEMORY_LOCK = threading.Lock()
@@ -614,7 +762,7 @@ CENTRAL_MONTHLY_REPORT_DAY = int(os.environ.get("CENTRAL_MONTHLY_REPORT_DAY", "1
 CENTRAL_MONTHLY_REPORT_TIME = os.environ.get("CENTRAL_MONTHLY_REPORT_TIME", "00:05")
 
 # Telegram limita mensagens em ~4096 caracteres. Mantemos margem para cabeçalhos.
-TELEGRAM_CHUNK_SIZE = int(os.environ.get("TELEGRAM_CHUNK_SIZE", "3400"))
+TELEGRAM_CHUNK_SIZE = int(os.environ.get("TELEGRAM_CHUNK_SIZE", "2600"))
 TELEGRAM_LONG_COMMAND_NOTICE = env_bool("TELEGRAM_LONG_COMMAND_NOTICE", True)
 
 # Proteções contra respostas duplicadas no Telegram da Central.
@@ -2303,9 +2451,9 @@ def real_pnl_r_dashboard_route():
 
         commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
         try:
-            limit = int(request.args.get("limit", "5000"))
+            limit = _request_limit(default=REAL_PNL_R_DEFAULT_LIMIT, max_value=REAL_PNL_R_MAX_LIMIT)
         except Exception:
-            limit = 5000
+            limit = REAL_PNL_R_DEFAULT_LIMIT
 
         return real_pnl_r_mapper.build_real_pnl_r_map(limit=limit, commit=commit), 200
     except Exception as exc:
@@ -2330,15 +2478,19 @@ def real_pnl_r_text_route():
 
         commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
         try:
-            limit = int(request.args.get("limit", "5000"))
+            limit = _request_limit(default=REAL_PNL_R_DEFAULT_LIMIT, max_value=REAL_PNL_R_MAX_LIMIT)
         except Exception:
-            limit = 5000
+            limit = REAL_PNL_R_DEFAULT_LIMIT
 
         payload = real_pnl_r_mapper.build_real_pnl_r_map(limit=limit, commit=commit)
+        include_payload = str(request.args.get("payload", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        response_payload = payload if include_payload else _compact_real_pnl_payload(payload)
         return {
             "ok": True,
             "text": real_pnl_r_mapper.build_real_pnl_r_text(payload),
-            "payload": payload,
+            "payload": response_payload,
+            "payload_mode": "full" if include_payload else "compact",
+            "limit": limit,
         }, 200
     except Exception as exc:
         return {
@@ -22509,7 +22661,7 @@ def trade_lifecycle_manager_v1_summary_route():
         "registry": payload.get("registry"),
         "stats": payload.get("stats"),
         "automation_policy": payload.get("automation_policy"),
-        "alerts": payload.eget("alerts"),
+        "alerts": payload.get("alerts"),
     }
 
 
