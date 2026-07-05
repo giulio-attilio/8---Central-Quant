@@ -4748,6 +4748,69 @@ def _risk_is_reduce_only(payload):
 
 
 
+def _ensure_executive_policy_manager_synced_for_risk(force=False):
+    """
+    Garante que o Executive Policy Manager tenha políticas ativas antes do
+    /can_open_trade avaliar uma entrada.
+
+    Por que existe:
+    - em deploy/restart, o arquivo data/executive_policy.json pode iniciar vazio;
+    - o /can_open_trade não pode depender do CEO rodar /executivedecision antes;
+    - a fonte de verdade continua sendo:
+      Executive Decision Engine -> Executive Policy Manager -> Risk Manager.
+    """
+    result = {
+        "ok": False,
+        "attempted": False,
+        "reason": None,
+        "before_active_policy_count": None,
+        "after_active_policy_count": None,
+        "active_codes": [],
+        "ingested": 0,
+    }
+
+    try:
+        if not EXECUTIVE_POLICY_MANAGER_LOADED or executive_policy_manager is None:
+            result["reason"] = f"Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}"
+            return result
+
+        before = executive_policy_manager.build_policy_health()
+        before_count = int(before.get("active_policy_count") or 0)
+        result["before_active_policy_count"] = before_count
+
+        if before_count > 0 and not force:
+            result["ok"] = True
+            result["reason"] = "policies_already_active"
+            result["after_active_policy_count"] = before_count
+            result["active_codes"] = before.get("active_codes") or []
+            return result
+
+        if "_executive_decision_snapshot_for_reports" not in globals():
+            result["reason"] = "executive_decision_snapshot_unavailable"
+            return result
+
+        result["attempted"] = True
+        decision_payload = _executive_decision_snapshot_for_reports(compact_source=True)
+
+        # _executive_decision_snapshot_for_reports já chama _sync_executive_policy_manager_from_decision.
+        sync_payload = decision_payload.get("executive_policy_manager") if isinstance(decision_payload, dict) else {}
+        if isinstance(sync_payload, dict):
+            result["ingested"] = int(sync_payload.get("ingested", 0) or 0)
+
+        after = executive_policy_manager.build_policy_health()
+        after_count = int(after.get("active_policy_count") or 0)
+        result["after_active_policy_count"] = after_count
+        result["active_codes"] = after.get("active_codes") or []
+        result["ok"] = after_count > 0
+        result["reason"] = "synced_from_executive_decision" if result["ok"] else "sync_finished_but_no_active_policies"
+        return result
+
+    except Exception as exc:
+        result["reason"] = str(exc)
+        return result
+
+
+
 def _executive_policy_for_can_open_trade():
     """
     Consulta o Executive Policy Manager persistente para o Risk Manager.
@@ -4833,6 +4896,7 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
 
     try:
         if EXECUTIVE_POLICY_MANAGER_LOADED and executive_policy_manager is not None:
+            sync_result = _ensure_executive_policy_manager_synced_for_risk(force=False)
             evaluation = executive_policy_manager.evaluate_trade_against_policies(trade_payload)
             if not isinstance(evaluation, dict):
                 evaluation = {"ok": False, "allowed": True, "warnings": ["Policy Manager retornou payload inválido."]}
@@ -4852,6 +4916,7 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
 
             evaluation["source"] = "executive_policy_manager"
             evaluation["available"] = True
+            evaluation["sync"] = sync_result
             return evaluation
 
         warnings.append(f"Executive Policy Manager não carregado: {EXECUTIVE_POLICY_MANAGER_ERROR}")
