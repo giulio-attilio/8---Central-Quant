@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-MEMORY-STABILIZATION-V2.4.3
+# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-PAPER-ROUTES-V2.4.4
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -22664,6 +22664,184 @@ def trade_lifecycle_manager_v1_summary_route():
         "alerts": payload.get("alerts"),
     }
 
+
+
+
+
+# ==========================================================
+# PAPER ROUTES COMPAT V2.4.4 — ALIASES SEM UNDERLINE
+# ==========================================================
+# Objetivo:
+# - Manter as rotas antigas com /paper_lifecycle e /paper/lifecycle.
+# - Adicionar aliases curtos usados no Telegram/browser:
+#   /paperlifecyclehealth, /paperlifecyclepositions, /paperpositions,
+#   /paperlifecyclelog, /paperlifecycletestclose, /paperlifecycletesttp50.
+# - Expor também /paperintegratedpositions como alias de /paper_integrated/open.
+# - Não altera execução real. Apenas leitura/diagnóstico paper.
+
+@app.route("/paperlifecyclehealth")
+@app.route("/paperhealth")
+def paper_lifecycle_health_alias_route():
+    try:
+        return paper_lifecycle_health()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperlifecyclehealth",
+            "module": "paper_lifecycle",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperlifecyclepositions")
+@app.route("/paperpositions")
+@app.route("/paperopen")
+def paper_lifecycle_positions_alias_route():
+    try:
+        status = request.args.get("status")
+        return get_paper_lifecycle_positions(status=status)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperpositions",
+            "module": "paper_lifecycle",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperlifecyclelog")
+@app.route("/paperlog")
+def paper_lifecycle_log_alias_route():
+    try:
+        limit = _request_limit(default=50, max_value=300) if "_request_limit" in globals() else int(request.args.get("limit", "50"))
+        return read_paper_lifecycle_log(limit=limit)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperlifecyclelog",
+            "module": "paper_lifecycle",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperlifecycleupdate", methods=["GET", "POST"])
+@app.route("/paperupdate", methods=["GET", "POST"])
+def paper_lifecycle_update_alias_route():
+    try:
+        payload = request.get_json(silent=True) or {}
+        trade_id = request.args.get("trade_id") or payload.get("trade_id")
+        symbol = request.args.get("symbol") or payload.get("symbol")
+        price = request.args.get("price") or payload.get("price")
+        close_raw = request.args.get("close", payload.get("close", False))
+        close = str(close_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        close_reason = request.args.get("close_reason") or payload.get("close_reason")
+        return update_paper_position_price(
+            trade_id=trade_id,
+            symbol=symbol,
+            price=price,
+            close=close,
+            close_reason=close_reason,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperlifecycleupdate",
+            "module": "paper_lifecycle",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperlifecycletesttp50")
+@app.route("/papertesttp50")
+def paper_lifecycle_test_tp50_alias_route():
+    try:
+        return paper_lifecycle_test_tp50()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperlifecycletesttp50",
+            "module": "paper_lifecycle",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperlifecycletestclose")
+@app.route("/papertestclose")
+def paper_lifecycle_test_close_alias_route():
+    try:
+        return paper_lifecycle_test_close()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperlifecycletestclose",
+            "module": "paper_lifecycle",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperintegratedpositions")
+@app.route("/paperintegratedopen")
+@app.route("/paper/integrated/positions")
+def paper_integrated_positions_alias_route():
+    try:
+        return get_paper_integrated_open_positions()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperintegratedpositions",
+            "module": "paper_executor_integrated",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperintegratedhealth")
+def paper_integrated_health_alias_route():
+    try:
+        return paper_integrated_health()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperintegratedhealth",
+            "module": "paper_executor_integrated",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paperintegratedlog")
+def paper_integrated_log_alias_route():
+    try:
+        limit = _request_limit(default=50, max_value=300) if "_request_limit" in globals() else int(request.args.get("limit", "50"))
+        return read_paper_integrated_log(limit=limit)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "route": "/paperintegratedlog",
+            "module": "paper_executor_integrated",
+            "error": str(exc),
+        }, 500
+
+
+@app.route("/paper/routes")
+@app.route("/paperroutes")
+def paper_routes_catalog_route():
+    return {
+        "ok": True,
+        "module": "paper_routes_compat",
+        "version": "2026-07-05-PAPER-ROUTES-COMPAT-V2.4.4",
+        "generated_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+        "routes": {
+            "health": ["/paperlifecyclehealth", "/paperhealth", "/paper_lifecycle/health", "/paper/lifecycle/health"],
+            "positions": ["/paperpositions", "/paperlifecyclepositions", "/paperopen", "/paper_lifecycle/positions", "/paper/lifecycle/positions"],
+            "log": ["/paperlifecyclelog", "/paperlog", "/paper_lifecycle/log", "/paper/lifecycle/log"],
+            "update": ["/paperlifecycleupdate?symbol=ETHUSDT&price=3580&close=true", "/paperupdate"],
+            "tests": ["/paperlifecycletesttp50", "/paperlifecycletestclose"],
+            "integrated": ["/paperintegratedpositions", "/paperintegratedhealth", "/paperintegratedlog", "/paper/integrated/positions"],
+        },
+        "notes": [
+            "Aliases adicionados para evitar erro not found ao usar comandos sem underline.",
+            "Estas rotas apenas inspecionam ou simulam lifecycle paper; não chamam corretora.",
+        ],
+    }, 200
 
 
 start_central_runtime_once()
