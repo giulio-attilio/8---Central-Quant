@@ -7676,6 +7676,325 @@ def registry_mode_segregation_v1_health_route():
     return payload
 
 
+# ============================================================================
+# EXECUTION FINAL GATE ROUTE V1
+# ----------------------------------------------------------------------------
+# Expõe em rota JSON o checklist final de execução real.
+# A lógica principal do botão vermelho continua dentro do Execution Console;
+# esta rota serve para auditoria rápida antes de novo teste real.
+# ============================================================================
+EXECUTION_FINAL_GATE_ROUTE_V1_VERSION = "2026-07-06-EXECUTION-FINAL-GATE-ROUTE-V1"
+
+
+def _efg_v1_norm_symbol(value):
+    try:
+        value = str(value or "BTCUSDT").upper().strip()
+        value = value.replace("/", "").replace("-", "").replace(":USDT", "")
+        if value.endswith("USDT"):
+            return value
+        return value + "USDT"
+    except Exception:
+        return "BTCUSDT"
+
+
+def _efg_v1_norm_side(value):
+    value = str(value or "SHORT").upper().strip()
+    if value in ("BUY", "LONG"):
+        return "LONG"
+    if value in ("SELL", "SHORT"):
+        return "SHORT"
+    return value or "SHORT"
+
+
+def _efg_v1_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return default
+
+
+def _efg_v1_bool_env(*names):
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        val = str(raw).strip().lower()
+        if val in ("1", "true", "yes", "y", "on", "sim"):
+            return True, name, raw
+        if val in ("0", "false", "no", "n", "off", "nao", "não"):
+            return False, name, raw
+    return False, None, None
+
+
+def _efg_v1_token_present():
+    token_keys = [
+        "EXECUTION_AUTH_TOKEN",
+        "CENTRAL_EXECUTION_AUTH_TOKEN",
+        "REAL_EXECUTION_AUTH_TOKEN",
+        "EXECUTION_LIVE_AUTH_TOKEN",
+        "BINGX_EXECUTION_AUTH_TOKEN",
+    ]
+    for key in token_keys:
+        if str(os.environ.get(key) or "").strip():
+            return True, key
+    try:
+        if str(request.headers.get("X-Execution-Auth-Token") or "").strip():
+            return True, "X-Execution-Auth-Token"
+    except Exception:
+        pass
+    return False, None
+
+
+def _efg_v1_arg(name, default=""):
+    try:
+        return str(request.args.get(name, default) or default).strip()
+    except Exception:
+        return str(default or "").strip()
+
+
+def _efg_v1_build_payload():
+    bot = _efg_v1_arg("bot", "FALCON").upper()
+    setup = _efg_v1_arg("setup", bot or "FALCON").upper()
+    symbol = _efg_v1_norm_symbol(_efg_v1_arg("symbol", "BTCUSDT"))
+    side = _efg_v1_norm_side(_efg_v1_arg("side", "SHORT"))
+    entry = _efg_v1_arg("entry", "108000")
+    sl = _efg_v1_arg("sl", "109000" if side == "SHORT" else "107000")
+    tp50 = _efg_v1_arg("tp50", "107000" if side == "SHORT" else "109000")
+    signal_id = _efg_v1_arg("signal_id", f"EXECUTION-FINAL-GATE-ROUTE-V1-{bot}-{symbol}-{side}")
+    client_id = _efg_v1_arg("client_order_id", f"EFG1-{bot[:5]}-{symbol[:10]}-{side[:1]}")
+    return {
+        "decision": "ALLOW",
+        "bot": bot,
+        "setup": setup,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "risk_pct": _efg_v1_float(_efg_v1_arg("risk_pct", "2"), 2.0),
+        "signal_id": signal_id,
+        "client_order_id": client_id,
+        "broker_client_order_id": client_id,
+        "clientOrderID": client_id,
+        "clientOrderId": client_id,
+        "client_tag": client_id,
+        "existing_position_ack": _efg_v1_arg("existing_position_ack", ""),
+    }
+
+
+def build_execution_final_gate_route_v1(preflight=False):
+    payload = _efg_v1_build_payload()
+    symbol = payload.get("symbol")
+    side = payload.get("side")
+    bot = payload.get("bot")
+    setup = payload.get("setup")
+
+    checks = []
+
+    def add(code, label, ok, detail=None, blocking=True, severity="P0"):
+        checks.append({
+            "code": code,
+            "label": label,
+            "ok": bool(ok),
+            "blocking": bool(blocking),
+            "severity": severity,
+            "detail": detail,
+        })
+
+    token_present, token_source = _efg_v1_token_present()
+    add(
+        "EXECUTION_AUTH_TOKEN",
+        "Token/autorização de execução real configurado",
+        token_present,
+        {"configured": token_present, "source": token_source, "token_value_exposed": False},
+        blocking=True,
+    )
+
+    # Variáveis comuns usadas em versões anteriores. Se o projeto usar nomes diferentes,
+    # o Execution Console ainda mostrará o detalhe no preview; esta rota expõe o mínimo seguro.
+    real_enabled, real_enabled_source, _ = _efg_v1_bool_env(
+        "REAL_EXECUTION_ENABLED",
+        "EXECUTION_REAL_ENABLED",
+        "ENABLE_REAL_EXECUTION",
+        "CENTRAL_REAL_EXECUTION_ENABLED",
+        "BINGX_REAL_EXECUTION_ENABLED",
+    )
+    add(
+        "REAL_EXECUTION_ENABLED_ENV",
+        "Flag de execução real habilitada no ambiente",
+        real_enabled,
+        {"configured_true": real_enabled, "source": real_enabled_source},
+        blocking=True,
+    )
+
+    pilot_enabled, pilot_source, _ = _efg_v1_bool_env(
+        "REAL_PILOT_ENABLED",
+        "EXECUTION_REAL_PILOT_ENABLED",
+        "CENTRAL_REAL_PILOT_ENABLED",
+        "BINGX_REAL_PILOT_ENABLED",
+    )
+    add(
+        "REAL_PILOT_ENABLED_ENV",
+        "Flag de piloto real habilitada no ambiente",
+        pilot_enabled,
+        {"configured_true": pilot_enabled, "source": pilot_source},
+        blocking=True,
+    )
+
+    try:
+        persistence_gate = registry_persistence_v1_gate_check(payload) if callable(globals().get("registry_persistence_v1_gate_check")) else {"ok": False, "status": "REGISTRY_PERSISTENCE_FUNCTION_MISSING"}
+    except Exception as exc:
+        persistence_gate = {"ok": False, "status": "REGISTRY_PERSISTENCE_ERROR", "error": str(exc)}
+    add(
+        "REGISTRY_PERSISTENCE_READY",
+        "Registry Persistence não aponta posição real desprotegida/sem Registry",
+        bool(persistence_gate.get("ok")),
+        persistence_gate,
+        blocking=True,
+    )
+
+    try:
+        outcome_gate = trade_close_outcome_v1_gate_check() if callable(globals().get("trade_close_outcome_v1_gate_check")) else {"ok": False, "status": "TRADE_CLOSE_OUTCOME_FUNCTION_MISSING"}
+    except Exception as exc:
+        outcome_gate = {"ok": False, "status": "TRADE_CLOSE_OUTCOME_ERROR", "error": str(exc)}
+    add(
+        "TRADE_CLOSE_OUTCOME_EVALUATED",
+        "Trades fechados REAL/UNKNOWN avaliados antes de nova execução real",
+        bool(outcome_gate.get("ok")),
+        outcome_gate,
+        blocking=True,
+    )
+
+    try:
+        registry_mode_gate = registry_mode_segregation_v1_gate_check(payload) if callable(globals().get("registry_mode_segregation_v1_gate_check")) else {"ok": False, "status": "REGISTRY_MODE_SEGREGATION_FUNCTION_MISSING"}
+    except Exception as exc:
+        registry_mode_gate = {"ok": False, "status": "REGISTRY_MODE_SEGREGATION_ERROR", "error": str(exc)}
+    add(
+        "REGISTRY_MODE_SEGREGATION_READY",
+        "Registry Mode Segregation separa REAL/PAPER/VERIFY/SYNC_ONLY/UNKNOWN",
+        bool(registry_mode_gate.get("ok")),
+        registry_mode_gate,
+        blocking=True,
+    )
+
+    try:
+        disaster_gate = disaster_stop_fallback_v1_gate_check() if callable(globals().get("disaster_stop_fallback_v1_gate_check")) else {"ok": False, "status": "DISASTER_STOP_FALLBACK_FUNCTION_MISSING"}
+    except Exception as exc:
+        disaster_gate = {"ok": False, "status": "DISASTER_STOP_FALLBACK_ERROR", "error": str(exc)}
+    add(
+        "DISASTER_STOP_FALLBACK_READY",
+        "Disaster Stop Fallback sem lock/manual attention",
+        bool(disaster_gate.get("ok")),
+        disaster_gate,
+        blocking=True,
+    )
+
+    try:
+        safety = build_post_execution_safety_check_v1(symbol=symbol, side=side, bot=bot, setup=setup) if callable(globals().get("build_post_execution_safety_check_v1")) else {"ok": False, "status": "POST_EXECUTION_SAFETY_FUNCTION_MISSING"}
+    except Exception as exc:
+        safety = {"ok": False, "status": "POST_EXECUTION_SAFETY_ERROR", "error": str(exc)}
+    no_unprotected_position = bool(safety.get("ok") and not safety.get("requires_manual_attention"))
+    add(
+        "POST_EXECUTION_SAFETY_CLEAR",
+        "Não há posição real aberta exigindo atenção manual para o ativo/side consultado",
+        no_unprotected_position,
+        {
+            "status": safety.get("status"),
+            "position_found": safety.get("position_found"),
+            "protective_orders_count": safety.get("protective_orders_count"),
+            "stop_confirmed_by_central": safety.get("stop_confirmed_by_central"),
+            "requires_manual_attention": safety.get("requires_manual_attention"),
+        },
+        blocking=True,
+    )
+
+    entry = _efg_v1_float(payload.get("entry"), None)
+    sl = _efg_v1_float(payload.get("sl"), None)
+    stop_direction_ok = bool(entry and sl and ((side == "SHORT" and sl > entry) or (side == "LONG" and sl < entry)))
+    add(
+        "DISASTER_STOP_INPUT_READY",
+        "Entrada e SL têm direção coerente",
+        stop_direction_ok,
+        {"entry": entry, "sl": sl, "side": side, "rule": "SHORT exige SL acima da entrada; LONG exige SL abaixo da entrada."},
+        blocking=True,
+    )
+
+    preflight_result = None
+    if preflight:
+        try:
+            preflight_result = run_execution_engine(payload=payload, mode="LIVE", dry_run=True)
+            live_result = ((preflight_result or {}).get("payload") or {}).get("live_result") if isinstance(preflight_result, dict) else {}
+            add(
+                "DRY_RUN_PREFLIGHT",
+                "run_execution_engine LIVE dry_run=True respondeu sem enviar ordem real",
+                isinstance(preflight_result, dict) and not bool((live_result or {}).get("sent")),
+                {
+                    "result_ok": (preflight_result or {}).get("ok") if isinstance(preflight_result, dict) else None,
+                    "status": (preflight_result or {}).get("status") if isinstance(preflight_result, dict) else None,
+                    "live_sent": bool((live_result or {}).get("sent")) if isinstance(live_result, dict) else None,
+                    "preview_isolation": (live_result or {}).get("preview_isolation") if isinstance(live_result, dict) else None,
+                },
+                blocking=True,
+            )
+        except Exception as exc:
+            preflight_result = {"ok": False, "status": "DRY_RUN_PREFLIGHT_ERROR", "error": str(exc)}
+            add("DRY_RUN_PREFLIGHT", "run_execution_engine LIVE dry_run=True", False, preflight_result, blocking=True)
+
+    failed = [c for c in checks if c.get("blocking") and not c.get("ok")]
+    ok = len(failed) == 0
+    return {
+        "ok": ok,
+        "module": "execution_final_gate_route_v1",
+        "version": EXECUTION_FINAL_GATE_ROUTE_V1_VERSION,
+        "status": "READY_FOR_REAL_EXECUTION_PRECHECK" if ok else "NOT_READY_FOR_REAL_EXECUTION_PRECHECK",
+        "generated_at": agora_sp_str() if callable(globals().get("agora_sp_str")) else None,
+        "source": "preflight" if preflight else "health",
+        "preflight_dry_run_attempted": bool(preflight),
+        "payload_checked": payload,
+        "blocking_failed_count": len(failed),
+        "failed_blocking_codes": [c.get("code") for c in failed],
+        "summary": {
+            "token_configured": token_present,
+            "real_execution_enabled_env": real_enabled,
+            "real_pilot_enabled_env": pilot_enabled,
+            "registry_persistence_ok": bool(persistence_gate.get("ok")),
+            "trade_close_outcome_ok": bool(outcome_gate.get("ok")),
+            "registry_mode_ok": bool(registry_mode_gate.get("ok")),
+            "disaster_stop_fallback_ok": bool(disaster_gate.get("ok")),
+            "post_execution_safety_clear": no_unprotected_position,
+            "disaster_stop_input_ok": stop_direction_ok,
+        },
+        "checks": checks,
+        "preflight_result": preflight_result,
+        "routes": [
+            "/executionfinalgate/health",
+            "/executionfinalgate?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=108000&sl=109000&tp50=107000",
+            "/executionconsole",
+        ],
+        "notes": [
+            "Esta rota não envia ordem real.",
+            "/executionfinalgate roda diagnóstico com preflight dry_run=True.",
+            "/executionfinalgate/health checa apenas os gates críticos sem chamar o Engine.",
+            "A execução real continua restrita ao Execution Console/botão vermelho com confirmação explícita.",
+        ],
+    }
+
+
+@app.route("/executionfinalgate/health", methods=["GET"])
+@app.route("/execution/finalgate/health", methods=["GET"])
+def execution_final_gate_route_v1_health():
+    return build_execution_final_gate_route_v1(preflight=False)
+
+
+@app.route("/executionfinalgate", methods=["GET"])
+@app.route("/execution/finalgate", methods=["GET"])
+def execution_final_gate_route_v1():
+    preflight = str(request.args.get("preflight", "true") or "true").lower() not in ("0", "false", "no", "nao", "não")
+    return build_execution_final_gate_route_v1(preflight=preflight)
+
+
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
@@ -8983,6 +9302,7 @@ def execution_console_route():
     <p><a style="color:#93c5fd" href="/realtradelifecycle/BTCUSDT/SHORT?bot=FALCON&setup=FALCON" target="_blank">/realtradelifecycle BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/registrypersistence BTC SHORT persist snapshot</a></p>
     <p><a style="color:#93c5fd" href="/registrymodesegregation?commit=true" target="_blank">/registrymodesegregation commit classifications</a></p>
+    <p><a style="color:#93c5fd" href="/executionfinalgate/health" target="_blank">/executionfinalgate/health final gate route</a></p>
     <p><a style="color:#93c5fd" href="/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/tradecloseoutcome BTC SHORT evaluate closed trade</a></p>
     <p><a style="color:#93c5fd" href="/lifecyclemonitor/BTCUSDT/SHORT?bot=FALCON&setup=FALCON&commit=true" target="_blank">/lifecyclemonitor BTC SHORT commit snapshot</a></p>
     <p><a style="color:#93c5fd" href="/positioncheck/BTCUSDT/SHORT" target="_blank">/positioncheck/BTCUSDT/SHORT</a></p>
