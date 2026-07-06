@@ -30228,6 +30228,433 @@ def paper_routes_catalog_route():
     }, 200
 
 
+# ==========================================================
+# EXECUTION DRY-RUN HARD KILL SWITCH V1
+# ==========================================================
+EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION = "2026-07-06-EXECUTION-DRY-RUN-HARD-KILL-SWITCH-V1"
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_DRY_RUN_HARD_KILL_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_DRY_RUN_HARD_KILL_V1 = None
+
+try:
+    _DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT = threading.local()
+except Exception:
+    _DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT = None
+
+
+def _dry_run_hard_kill_v1_now():
+    try:
+        return agora_sp_str()
+    except Exception:
+        try:
+            return data_hora_sp_str()
+        except Exception:
+            return None
+
+
+def _dry_run_hard_kill_v1_bool(value):
+    try:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "sim", "on", "y"}
+    except Exception:
+        return False
+
+
+def _dry_run_hard_kill_v1_active():
+    """True quando o fluxo atual é preview/dry_run e qualquer envio real deve ser fisicamente bloqueado."""
+    try:
+        ctx = getattr(_DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT, "data", None) if _DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT is not None else None
+        if isinstance(ctx, dict) and ctx.get("dry_run") is True:
+            return True
+    except Exception:
+        pass
+    try:
+        ctx = getattr(_EXECUTION_AUTH_RESOLVER_V1_CONTEXT, "data", None) if "_EXECUTION_AUTH_RESOLVER_V1_CONTEXT" in globals() and _EXECUTION_AUTH_RESOLVER_V1_CONTEXT is not None else None
+        if isinstance(ctx, dict) and ctx.get("dry_run") is True:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _dry_run_hard_kill_v1_payload_copy(payload):
+    if isinstance(payload, dict):
+        try:
+            return dict(payload)
+        except Exception:
+            return payload.copy()
+    return {}
+
+
+def _dry_run_hard_kill_v1_mask_public(obj):
+    """Sanitização simples para respostas públicas do módulo."""
+    sensitive = ("token", "secret", "signature", "apikey", "api_key", "authorization", "password")
+    try:
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                ks = str(k).lower()
+                if any(s in ks for s in sensitive):
+                    out[k] = "***MASKED***" if v not in (None, "", False) else v
+                else:
+                    out[k] = _dry_run_hard_kill_v1_mask_public(v)
+            return out
+        if isinstance(obj, list):
+            return [_dry_run_hard_kill_v1_mask_public(x) for x in obj]
+    except Exception:
+        pass
+    return obj
+
+
+def _dry_run_hard_kill_v1_build_auth(payload):
+    try:
+        if callable(globals().get("_ee_auth_resolver_v1_resolve")):
+            return _ee_auth_resolver_v1_resolve(payload=payload if isinstance(payload, dict) else {}, allow_env_fallback=True)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "EXECUTION_AUTH_RESOLVER_ERROR",
+            "error": str(exc),
+            "token_value_exposed": False,
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+    # Fallback conservador: não bloqueia preview por falta de resolver, mas nunca envia ordem real.
+    return {
+        "ok": True,
+        "status": "DRY_RUN_AUTH_NOT_REQUIRED_FOR_PREVIEW_ONLY",
+        "reason": "Hard Kill Switch interceptou antes de qualquer chamada real.",
+        "token_value_exposed": False,
+        "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+    }
+
+
+def _dry_run_hard_kill_v1_safe_preview(payload, mode="LIVE"):
+    payload = _dry_run_hard_kill_v1_payload_copy(payload)
+    auth = _dry_run_hard_kill_v1_build_auth(payload)
+    symbol = str(payload.get("symbol") or "").upper()
+    side = str(payload.get("side") or "").upper()
+    bot = str(payload.get("bot") or "")
+    setup = str(payload.get("setup") or "")
+    client_id = (
+        payload.get("client_order_id")
+        or payload.get("clientOrderId")
+        or payload.get("clientOrderID")
+        or payload.get("broker_client_order_id")
+        or payload.get("client_tag")
+    )
+    preview = {
+        "ok": True,
+        "status": "DRY_RUN_HARD_KILL_PREVIEW_ONLY",
+        "sent": False,
+        "broker_dry_run": True,
+        "preview_isolation": True,
+        "live_broker_called": False,
+        "live_send_blocked": True,
+        "dry_run": True,
+        "mode": mode,
+        "symbol": symbol,
+        "side": side,
+        "bot": bot,
+        "setup": setup,
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl"),
+        "tp50": payload.get("tp50"),
+        "risk_pct": payload.get("risk_pct"),
+        "client_order_id": client_id,
+        "payload_fields_present": sorted([str(k) for k in payload.keys() if not any(s in str(k).lower() for s in ("token", "secret", "signature", "authorization"))])[:80],
+        "note": "Nenhuma função de envio real ao broker foi chamada porque dry_run=True.",
+        "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+    }
+    live_result = {
+        "ok": True,
+        "status": "DRY_RUN_HARD_KILL_PREVIEW_ONLY",
+        "sent": False,
+        "side": side.lower() if side else None,
+        "symbol": symbol,
+        "auth": auth,
+        "preview": preview,
+        "preview_isolation": True,
+        "live_send_blocked": True,
+        "live_broker_called": False,
+        "disaster_stop": {
+            "attempted": False,
+            "status": "NOT_ATTEMPTED_DRY_RUN_HARD_KILL",
+            "reason": "dry_run=True bloqueia também criação de stop real.",
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        },
+        "requires_manual_attention": False,
+        "ts": _dry_run_hard_kill_v1_now(),
+        "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+    }
+    return {
+        "ok": True,
+        "status": "DRY_RUN_HARD_KILL_PREVIEW_ONLY",
+        "mode": mode,
+        "dry_run": True,
+        "executor_route": "DRY_RUN_HARD_KILL_SWITCH",
+        "generated_at": _dry_run_hard_kill_v1_now(),
+        "payload": {
+            "ok": True,
+            "status": "DRY_RUN_HARD_KILL_PREVIEW_ONLY",
+            "mode": mode,
+            "dry_run": True,
+            "live_broker_called": False,
+            "live_result": live_result,
+            "paper_executor_called": False,
+            "paper_result": None,
+            "real_execution_enabled": True,
+            "real_pilot_enabled": True,
+            "notes": [
+                "Execution Dry-Run Hard Kill Switch V1 interceptou o Engine antes de qualquer envio real.",
+                "dry_run=True agora nunca chama place_market_order/create_disaster_stop_order/close_position_market.",
+            ],
+        },
+        "execution_dry_run_hard_kill_switch": {
+            "applied": True,
+            "blocked_original_runner": True,
+            "live_sent": False,
+            "token_value_exposed": False,
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        },
+        "execution_engine_auth_resolver": {
+            "applied": bool("EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION" in globals()),
+            "token_value_exposed": False,
+            "version": globals().get("EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION"),
+        },
+        "notes": [
+            "Preview sintético seguro: não consulta endpoint de envio da BingX.",
+            "Para execução real, somente dry_run=False em rota explicitamente autorizada poderá chamar o runner original.",
+        ],
+        "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+    }
+
+
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    """
+    Hard Kill Switch V1:
+    - Se dry_run=True, NÃO chama o Execution Engine original.
+    - Retorna preview sintético compatível com o Final Gate.
+    - Se dry_run=False, delega ao runner anterior mantendo os guards existentes.
+    """
+    payload_dict = _dry_run_hard_kill_v1_payload_copy(payload)
+    dry = _dry_run_hard_kill_v1_bool(dry_run)
+
+    if dry:
+        return _dry_run_hard_kill_v1_safe_preview(payload_dict, mode=mode or "LIVE")
+
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_DRY_RUN_HARD_KILL_V1
+    if not callable(original_runner):
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_RUNNER_MISSING",
+            "error": "run_execution_engine original indisponível",
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+
+    previous_ctx = None
+    try:
+        if _DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT is not None:
+            previous_ctx = getattr(_DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT, "data", None)
+            _DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT.data = {
+                "dry_run": False,
+                "mode": mode,
+                "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+            }
+        result = original_runner(payload=payload, mode=mode, dry_run=False, *args, **kwargs)
+        if isinstance(result, dict):
+            result.setdefault("execution_dry_run_hard_kill_switch", {
+                "applied": True,
+                "dry_run": False,
+                "delegated_to_original_runner": True,
+                "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+            })
+        return result
+    finally:
+        try:
+            if _DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT is not None:
+                _DRY_RUN_HARD_KILL_SWITCH_V1_CONTEXT.data = previous_ctx
+        except Exception:
+            pass
+
+
+def _dry_run_hard_kill_v1_patch_broker_function(function_name):
+    if central_broker is None:
+        return {
+            "function": function_name,
+            "ok": False,
+            "patched": False,
+            "status": "BROKER_MODULE_MISSING",
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+    try:
+        original = getattr(central_broker, function_name, None)
+    except Exception as exc:
+        return {
+            "function": function_name,
+            "ok": False,
+            "patched": False,
+            "status": "BROKER_FUNCTION_LOOKUP_ERROR",
+            "error": str(exc),
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+    if not callable(original):
+        return {
+            "function": function_name,
+            "ok": True,
+            "patched": False,
+            "status": "BROKER_FUNCTION_NOT_PRESENT",
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+    marker = f"_dry_run_hard_kill_v1_original_{function_name}"
+    if getattr(central_broker, f"_dry_run_hard_kill_v1_patched_{function_name}", False):
+        return {
+            "function": function_name,
+            "ok": True,
+            "patched": True,
+            "status": "ALREADY_PATCHED",
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+
+    def _wrapped(*args, **kwargs):
+        if _dry_run_hard_kill_v1_active():
+            return {
+                "ok": False,
+                "status": "DRY_RUN_HARD_KILL_BLOCKED_LIVE_BROKER_CALL",
+                "function": function_name,
+                "sent": False,
+                "created": False,
+                "blocked": True,
+                "requires_manual_attention": False,
+                "reason": "dry_run=True: chamada real ao broker bloqueada pelo hard kill switch.",
+                "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+            }
+        return original(*args, **kwargs)
+
+    try:
+        setattr(central_broker, marker, original)
+        setattr(central_broker, function_name, _wrapped)
+        setattr(central_broker, f"_dry_run_hard_kill_v1_patched_{function_name}", True)
+        return {
+            "function": function_name,
+            "ok": True,
+            "patched": True,
+            "status": "PATCHED",
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+    except Exception as exc:
+        return {
+            "function": function_name,
+            "ok": False,
+            "patched": False,
+            "status": "PATCH_FAILED",
+            "error": str(exc),
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+
+
+EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_BROKER_PATCHES = [
+    _dry_run_hard_kill_v1_patch_broker_function("place_market_order"),
+    _dry_run_hard_kill_v1_patch_broker_function("create_disaster_stop_order"),
+    _dry_run_hard_kill_v1_patch_broker_function("close_position_market"),
+]
+
+
+def _dry_run_hard_kill_v1_patch_engine_module_broker_refs():
+    try:
+        ee_module = importlib.import_module("execution_engine")
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_MODULE_IMPORT_FAILED",
+            "error": str(exc),
+            "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        }
+    refs = []
+    try:
+        for attr in ("broker", "central_broker"):
+            module_broker = getattr(ee_module, attr, None)
+            if module_broker is not None:
+                for fn in ("place_market_order", "create_disaster_stop_order", "close_position_market"):
+                    if hasattr(central_broker, fn) and hasattr(module_broker, fn):
+                        try:
+                            setattr(module_broker, fn, getattr(central_broker, fn))
+                            refs.append(f"execution_engine.{attr}.{fn}")
+                        except Exception as exc:
+                            refs.append(f"execution_engine.{attr}.{fn}:ERROR:{exc}")
+    except Exception as exc:
+        refs.append(f"engine_module_patch_error:{exc}")
+    return {
+        "ok": True,
+        "status": "ENGINE_BROKER_REFS_PATCHED" if refs else "NO_ENGINE_BROKER_REFS_FOUND",
+        "patched_refs": refs,
+        "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+    }
+
+
+EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_ENGINE_PATCH = _dry_run_hard_kill_v1_patch_engine_module_broker_refs()
+
+
+@app.route("/executiondryrunhardkill/health")
+@app.route("/dryrunhardkill/health")
+@app.route("/execution/dryrunhardkill/health")
+def execution_dry_run_hard_kill_switch_v1_health_route():
+    configured_token = None
+    configured_source = None
+    try:
+        if callable(globals().get("_ee_auth_resolver_v1_configured_token")):
+            configured_token, configured_source = _ee_auth_resolver_v1_configured_token()
+    except Exception:
+        configured_token, configured_source = None, None
+    synthetic_probe = _dry_run_hard_kill_v1_safe_preview({
+        "decision": "ALLOW",
+        "bot": "FALCON",
+        "setup": "FALCON",
+        "symbol": "BTCUSDT",
+        "side": "SHORT",
+        "entry": "108000",
+        "sl": "109000",
+        "tp50": "107000",
+        "risk_pct": 2.0,
+    }, mode="LIVE")
+    live_result = ((synthetic_probe.get("payload") or {}).get("live_result") or {}) if isinstance(synthetic_probe, dict) else {}
+    patched_count = sum(1 for p in EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_BROKER_PATCHES if isinstance(p, dict) and p.get("patched"))
+    return {
+        "ok": True,
+        "module": "execution_dry_run_hard_kill_switch_v1",
+        "version": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_VERSION,
+        "generated_at": _dry_run_hard_kill_v1_now(),
+        "configured_token_present": bool(configured_token),
+        "configured_token_source": configured_source,
+        "token_value_exposed": False,
+        "run_execution_engine_wrapped": callable(_ORIGINAL_RUN_EXECUTION_ENGINE_FOR_DRY_RUN_HARD_KILL_V1),
+        "dry_run_behavior": {
+            "calls_original_runner": False,
+            "calls_broker_send_functions": False,
+            "synthetic_preview_only": True,
+            "live_sent": bool(live_result.get("sent")),
+            "preview_isolation": bool(live_result.get("preview_isolation")),
+            "status": live_result.get("status"),
+        },
+        "broker_patches": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_BROKER_PATCHES,
+        "broker_patched_count": patched_count,
+        "engine_patch": EXECUTION_DRY_RUN_HARD_KILL_SWITCH_V1_ENGINE_PATCH,
+        "routes": [
+            "/executiondryrunhardkill/health",
+            "/dryrunhardkill/health",
+            "/executionfinalgate",
+            "/executionfinalgate/health",
+        ],
+        "notes": [
+            "Health não envia ordem real.",
+            "Com dry_run=True, run_execution_engine retorna preview sintético e não chama o runner original.",
+            "Funções broker.place_market_order/create_disaster_stop_order/close_position_market também ficam bloqueadas em contexto dry_run.",
+        ],
+    }, 200
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
