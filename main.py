@@ -3309,7 +3309,7 @@ def trade_registry_sync_v1_health_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.7 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1.
+    EXECUTION CONSOLE V1.8 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3325,6 +3325,8 @@ def execution_console_route():
       preservando o mesmo ID apenas no GET pós-redirect PRG.
     - Broker Client Order ID V1: separa o signal_id interno da Central do
       client_order_id curto enviado ao broker/BingX.
+    - Real Execution Final Gate V1: antes do botão vermelho chamar o Engine em dry_run=False,
+      valida checklist final de autorização, piloto, limites, posição, IDs e stop.
     """
     import urllib.parse
 
@@ -3580,6 +3582,272 @@ def execution_console_route():
                 pass
             return engine_result, state
 
+
+    def _gate_float(value, default=None):
+        try:
+            if value is None or str(value).strip() == "":
+                return default
+            return float(str(value).replace(",", ".").strip())
+        except Exception:
+            return default
+
+    def _gate_env_token_present():
+        """
+        Real Execution Final Gate V1.
+        Não expõe token. Apenas informa se alguma fonte de autorização está configurada.
+        """
+        token_keys = [
+            "EXECUTION_AUTH_TOKEN",
+            "CENTRAL_EXECUTION_AUTH_TOKEN",
+            "REAL_EXECUTION_AUTH_TOKEN",
+            "EXECUTION_LIVE_AUTH_TOKEN",
+            "BINGX_EXECUTION_AUTH_TOKEN",
+        ]
+        for key in token_keys:
+            if str(os.environ.get(key) or "").strip():
+                return True, key
+        try:
+            if str(request.headers.get("X-Execution-Auth-Token") or "").strip():
+                return True, "X-Execution-Auth-Token"
+        except Exception:
+            pass
+        return False, None
+
+    def _build_real_execution_final_gate(preflight_result, current_payload, existing_position_state, confirm_value="", required_phrase="EXECUTE_REAL_TRADE", action_context="preview"):
+        """
+        Real Execution Final Gate V1.
+
+        Preview: retorna diagnóstico visível, mas não bloqueia o Preview seguro.
+        Execute: precisa retornar ok=True antes de chamar run_execution_engine(... dry_run=False).
+        """
+        current_payload = current_payload if isinstance(current_payload, dict) else {}
+        payload_result = preflight_result.get("payload") if isinstance(preflight_result, dict) else {}
+        payload_result = payload_result if isinstance(payload_result, dict) else {}
+        real_guard = payload_result.get("real_guard") if isinstance(payload_result, dict) else {}
+        real_guard = real_guard if isinstance(real_guard, dict) else {}
+        config = real_guard.get("config") if isinstance(real_guard.get("config"), dict) else {}
+        trade = real_guard.get("trade") if isinstance(real_guard.get("trade"), dict) else {}
+        broker = real_guard.get("broker") if isinstance(real_guard.get("broker"), dict) else {}
+        ready = broker.get("ready") if isinstance(broker.get("ready"), dict) else {}
+        positions = broker.get("positions") if isinstance(broker.get("positions"), dict) else {}
+        existing_position_state = existing_position_state if isinstance(existing_position_state, dict) else {}
+
+        checks = []
+
+        def add(code, label, ok, detail=None, blocking=True, severity="P0"):
+            checks.append({
+                "code": code,
+                "label": label,
+                "ok": bool(ok),
+                "blocking": bool(blocking),
+                "severity": severity,
+                "detail": detail,
+            })
+
+        is_execute = str(action_context or "").lower() == "execute"
+        required_phrase = str(required_phrase or "EXECUTE_REAL_TRADE").strip().upper()
+        confirm_ok = str(confirm_value or "").strip().upper() == required_phrase
+        add(
+            "CONFIRMATION_PHRASE",
+            "Confirmação humana para execução real",
+            confirm_ok if is_execute else True,
+            {
+                "required_for_execute": True,
+                "required_value": required_phrase,
+                "received_ok": confirm_ok,
+                "mode": action_context,
+            },
+            blocking=True,
+        )
+
+        token_present, token_source = _gate_env_token_present()
+        add(
+            "EXECUTION_AUTH_TOKEN",
+            "Token/autorização de execução real configurado",
+            token_present,
+            {"configured": token_present, "source": token_source, "token_value_exposed": False},
+            blocking=True,
+        )
+
+        real_execution_enabled = bool(payload_result.get("real_execution_enabled") or config.get("real_execution_enabled"))
+        add(
+            "REAL_EXECUTION_ENABLED",
+            "Execução real habilitada no Engine/ambiente",
+            real_execution_enabled,
+            {"real_execution_enabled": payload_result.get("real_execution_enabled"), "config_value": config.get("real_execution_enabled")},
+            blocking=True,
+        )
+
+        real_pilot_enabled = bool(payload_result.get("real_pilot_enabled") or config.get("real_pilot_enabled"))
+        add(
+            "REAL_PILOT_ENABLED",
+            "Piloto real habilitado",
+            real_pilot_enabled,
+            {"real_pilot_enabled": payload_result.get("real_pilot_enabled"), "config_value": config.get("real_pilot_enabled")},
+            blocking=True,
+        )
+
+        real_guard_allowed = bool(real_guard.get("allowed", False))
+        add(
+            "REAL_PILOT_GUARD_ALLOWED",
+            "Real Pilot Guard permitiu a intenção",
+            real_guard_allowed,
+            {"status": real_guard.get("status"), "reasons": real_guard.get("reasons"), "warnings": real_guard.get("warnings")},
+            blocking=True,
+        )
+
+        broker_available = bool(broker.get("available"))
+        broker_ready = bool(ready.get("ok") and str(ready.get("status") or "").upper() == "READY")
+        add(
+            "BROKER_READY",
+            "Broker/BingX disponível e pronto",
+            broker_available and broker_ready,
+            {
+                "broker_available": broker_available,
+                "ready_ok": ready.get("ok"),
+                "ready_status": ready.get("status"),
+                "api_key_configured": ready.get("api_key_configured"),
+                "api_secret_configured": ready.get("api_secret_configured"),
+            },
+            blocking=True,
+        )
+
+        positions_checked = bool(positions.get("ok") and positions.get("checked"))
+        add(
+            "BROKER_POSITIONS_CHECKED",
+            "Posições reais consultadas antes da execução",
+            positions_checked,
+            {"positions_ok": positions.get("ok"), "checked": positions.get("checked"), "open_positions": positions.get("open_positions")},
+            blocking=True,
+        )
+
+        bot = str(current_payload.get("bot") or "").upper().strip()
+        symbol = _normalize_console_symbol(current_payload.get("symbol"))
+        allowed_bots = [str(x).upper().strip() for x in (config.get("allowed_bots") or [])]
+        allowed_symbols = [_normalize_console_symbol(x) for x in (config.get("allowed_symbols") or [])]
+        bot_allowed = (not allowed_bots) or (bot in allowed_bots)
+        symbol_allowed = (not allowed_symbols) or (symbol in allowed_symbols)
+        add("BOT_ALLOWED", "Bot permitido para piloto real", bot_allowed, {"bot": bot, "allowed_bots": allowed_bots}, blocking=True)
+        add("SYMBOL_ALLOWED", "Ativo permitido para piloto real", symbol_allowed, {"symbol": symbol, "allowed_symbols": allowed_symbols}, blocking=True)
+
+        risk_pct = _gate_float(current_payload.get("risk_pct"), None)
+        max_risk_pct = _gate_float(config.get("max_risk_pct"), None)
+        risk_ok = bool(risk_pct is not None and (max_risk_pct is None or risk_pct <= max_risk_pct))
+        add("RISK_LIMIT", "Risco dentro do limite", risk_ok, {"risk_pct": risk_pct, "max_risk_pct": max_risk_pct}, blocking=True)
+
+        margin_usdt = _gate_float(trade.get("margin_usdt"), None)
+        max_margin_usdt = _gate_float(config.get("max_margin_usdt"), None)
+        margin_ok = bool(margin_usdt is not None and (max_margin_usdt is None or margin_usdt <= max_margin_usdt))
+        add("MARGIN_LIMIT", "Margem dentro do limite", margin_ok, {"margin_usdt": margin_usdt, "max_margin_usdt": max_margin_usdt}, blocking=True)
+
+        leverage = _gate_float(trade.get("leverage"), None)
+        max_leverage = _gate_float(config.get("max_leverage"), None)
+        leverage_ok = bool(leverage is not None and (max_leverage is None or leverage <= max_leverage))
+        add("LEVERAGE_LIMIT", "Alavancagem dentro do limite", leverage_ok, {"leverage": leverage, "max_leverage": max_leverage}, blocking=True)
+
+        notional_usdt = _gate_float(trade.get("notional_usdt"), None)
+        max_notional_usdt = _gate_float(config.get("max_notional_usdt"), None)
+        notional_ok = bool(notional_usdt is not None and (max_notional_usdt is None or notional_usdt <= max_notional_usdt))
+        add("NOTIONAL_LIMIT", "Notional dentro do limite", notional_ok, {"notional_usdt": notional_usdt, "max_notional_usdt": max_notional_usdt}, blocking=True)
+
+        requires_ack = bool(existing_position_state.get("requires_existing_position_ack_for_real_execute"))
+        ack = str(current_payload.get("existing_position_ack") or "").strip().upper()
+        ack_ok = (not requires_ack) or ack == "CENTRAL_MANAGED_EXISTING_POSITION"
+        add(
+            "EXISTING_POSITION_ACK",
+            "Posição real existente reconhecida quando necessário",
+            ack_ok,
+            {
+                "requires_ack": requires_ack,
+                "received_ack": ack,
+                "same_side_count": existing_position_state.get("same_symbol_same_side_count"),
+                "opposite_side_count": existing_position_state.get("same_symbol_opposite_side_count"),
+                "central_managed_likely": existing_position_state.get("central_managed_likely"),
+            },
+            blocking=True,
+        )
+
+        signal_id = str(current_payload.get("signal_id") or "").strip()
+        signal_meta = current_payload.get("execution_console_v1_6") if isinstance(current_payload.get("execution_console_v1_6"), dict) else {}
+        signal_source = signal_meta.get("signal_id_source")
+        signal_ok = bool(signal_id.startswith("EXECUTION-CONSOLE-V1.6-") and (not is_execute or signal_source == "POST_REFRESHED_V1_6"))
+        add("SIGNAL_ID_FRESH", "Signal ID novo para intenção operacional", signal_ok, {"signal_id": signal_id, "signal_id_source": signal_source}, blocking=True)
+
+        broker_client_order_id = str(current_payload.get("broker_client_order_id") or current_payload.get("client_order_id") or "").strip()
+        broker_id_aliases = [
+            current_payload.get("client_order_id"),
+            current_payload.get("broker_client_order_id"),
+            current_payload.get("clientOrderID"),
+            current_payload.get("clientOrderId"),
+            current_payload.get("client_tag"),
+        ]
+        aliases_match = all(str(x or "").strip() == broker_client_order_id for x in broker_id_aliases)
+        broker_id_ok = bool(broker_client_order_id and len(broker_client_order_id) <= 32 and re.fullmatch(r"[A-Z0-9_-]+", broker_client_order_id) and aliases_match)
+        add(
+            "BROKER_CLIENT_ORDER_ID",
+            "Client Order ID curto e consistente para broker",
+            broker_id_ok,
+            {"broker_client_order_id": broker_client_order_id, "length": len(broker_client_order_id), "aliases_match": aliases_match},
+            blocking=True,
+        )
+
+        entry = _gate_float(current_payload.get("entry"), None)
+        sl = _gate_float(current_payload.get("sl") or current_payload.get("stop"), None)
+        side = _normalize_console_side(current_payload.get("side"))
+        stop_direction_ok = bool(entry and sl and ((side == "SHORT" and sl > entry) or (side == "LONG" and sl < entry)))
+        add(
+            "DISASTER_STOP_INPUT_READY",
+            "Stop/disaster stop operacionalmente coerente",
+            stop_direction_ok,
+            {"entry": entry, "sl": sl, "side": side, "rule": "SHORT exige SL acima da entrada; LONG exige SL abaixo da entrada."},
+            blocking=True,
+        )
+
+        failed_blocking = [c for c in checks if c.get("blocking") and not c.get("ok")]
+        gate_ok = len(failed_blocking) == 0
+        return {
+            "ok": gate_ok,
+            "version": "2026-07-06-REAL-EXECUTION-FINAL-GATE-V1",
+            "status": "READY_FOR_REAL_EXECUTION" if gate_ok else ("BLOCKED_BY_FINAL_GATE" if is_execute else "NOT_READY_FOR_REAL_EXECUTION"),
+            "mode": action_context,
+            "blocking_failed_count": len(failed_blocking),
+            "failed_blocking_codes": [c.get("code") for c in failed_blocking],
+            "checks": checks,
+            "summary": {
+                "token_configured": token_present,
+                "real_execution_enabled": real_execution_enabled,
+                "real_pilot_enabled": real_pilot_enabled,
+                "real_guard_allowed": real_guard_allowed,
+                "broker_ready": broker_available and broker_ready,
+                "positions_checked": positions_checked,
+                "bot_allowed": bot_allowed,
+                "symbol_allowed": symbol_allowed,
+                "risk_ok": risk_ok,
+                "margin_ok": margin_ok,
+                "leverage_ok": leverage_ok,
+                "notional_ok": notional_ok,
+                "existing_position_ack_ok": ack_ok,
+                "signal_id_ok": signal_ok,
+                "broker_client_order_id_ok": broker_id_ok,
+                "disaster_stop_input_ok": stop_direction_ok,
+            },
+            "notes": [
+                "Preview usa este gate apenas como diagnóstico.",
+                "Execução real pelo botão vermelho só chama o Engine em dry_run=False se ok=true.",
+                "O valor do token nunca é exibido; apenas a presença/configuração é mostrada.",
+            ],
+        }
+
+    def _attach_real_execution_final_gate(engine_result, gate):
+        try:
+            if isinstance(engine_result, dict):
+                engine_result["real_execution_final_gate_v1"] = gate
+                if isinstance(engine_result.get("payload"), dict):
+                    engine_result["payload"]["real_execution_final_gate_v1"] = gate
+        except Exception:
+            pass
+        return engine_result
+
     def _field(name, default=""):
         if request.method == "POST":
             return str((request.form.get(name) or request.args.get(name) or default)).strip()
@@ -3669,6 +3937,11 @@ def execution_console_route():
             "max_length": 32,
             "rule": "signal_id interno continua completo; client_order_id curto é enviado ao broker/BingX.",
         },
+        "execution_console_real_execution_final_gate_v1": {
+            "enabled": True,
+            "mode": "diagnostic_on_preview_blocking_on_execute",
+            "rule": "Botão vermelho só chama run_execution_engine dry_run=False se o checklist final retornar ok=true.",
+        },
         "execution_console_v1_6": {
             "signal_id_refresh": True,
             "signal_id_source": signal_id_source,
@@ -3700,6 +3973,16 @@ def execution_console_route():
                     dry_run=True,
                 )
                 result, existing_position_state = _attach_existing_position_state(result, payload)
+                preview_required_phrase = os.environ.get("EXECUTION_LIVE_CONFIRMATION_PHRASE", "EXECUTE_REAL_TRADE").strip().upper()
+                final_gate = _build_real_execution_final_gate(
+                    preflight_result=result,
+                    current_payload=payload,
+                    existing_position_state=existing_position_state,
+                    confirm_value=confirm,
+                    required_phrase=preview_required_phrase,
+                    action_context="preview",
+                )
+                result = _attach_real_execution_final_gate(result, final_gate)
 
                 # V1.3: em preview, MISSING_EXECUTION_AUTH_TOKEN é esperado.
                 # O token só deve ser gerado em execução real dry_run=False.
@@ -3793,6 +4076,17 @@ def execution_console_route():
                     ack = str(payload.get("existing_position_ack") or "").strip().upper()
                     requires_ack = bool((existing_position_state or {}).get("requires_existing_position_ack_for_real_execute"))
 
+                    final_gate = _build_real_execution_final_gate(
+                        preflight_result=preflight_result,
+                        current_payload=payload,
+                        existing_position_state=existing_position_state,
+                        confirm_value=confirm,
+                        required_phrase=required_phrase,
+                        action_context="execute",
+                    )
+                    preflight_result = _attach_real_execution_final_gate(preflight_result, final_gate)
+                    payload["real_execution_final_gate_v1"] = final_gate
+
                     if requires_ack and ack != "CENTRAL_MANAGED_EXISTING_POSITION":
                         result = {
                             "ok": False,
@@ -3802,11 +4096,26 @@ def execution_console_route():
                             "required_existing_position_ack": "CENTRAL_MANAGED_EXISTING_POSITION",
                             "received_existing_position_ack": ack,
                             "existing_position_state": existing_position_state,
+                            "real_execution_final_gate_v1": final_gate,
                             "preflight_result": preflight_result,
                             "payload": payload,
                         }
                         status_code = 409
                         message = "Execução real bloqueada: posição real existente exige reconhecimento explícito da Central."
+                    elif not bool(final_gate.get("ok")):
+                        result = {
+                            "ok": False,
+                            "status": "BLOCKED_BY_REAL_EXECUTION_FINAL_GATE",
+                            "sent": False,
+                            "reason": "Real Execution Final Gate V1 bloqueou a execução real antes do envio ao Engine.",
+                            "failed_blocking_codes": final_gate.get("failed_blocking_codes"),
+                            "real_execution_final_gate_v1": final_gate,
+                            "existing_position_state": existing_position_state,
+                            "preflight_result": preflight_result,
+                            "payload": payload,
+                        }
+                        status_code = 409
+                        message = "Execução real bloqueada pelo Real Execution Final Gate V1. Revise o checklist antes do botão vermelho."
                     else:
                         payload["execution_console_existing_position_state"] = existing_position_state
 
@@ -3828,6 +4137,7 @@ def execution_console_route():
                                 "decision": "DENY",
                                 "executive_policy": executive_policy_eval,
                                 "existing_position_state": existing_position_state,
+                                "real_execution_final_gate_v1": final_gate,
                                 "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
                                 "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
                                 "payload": payload,
@@ -3842,6 +4152,7 @@ def execution_console_route():
                                 mode="LIVE",
                                 dry_run=False,
                             )
+                            result = _attach_real_execution_final_gate(result, final_gate)
                             result, existing_position_state_before_sync = _attach_existing_position_state(result, payload)
                             sync_result = trade_registry_sync_v1_from_execution_result(payload, result, commit=True)
 
@@ -3860,9 +4171,11 @@ def execution_console_route():
                                 result.setdefault("trade_registry_sync_v1", sync_result)
                                 result.setdefault("existing_position_state_before_sync", existing_position_state_before_sync)
                                 result.setdefault("existing_position_state", existing_position_state_after_sync)
+                                result.setdefault("real_execution_final_gate_v1", final_gate)
                                 if isinstance(result.get("payload"), dict):
                                     result["payload"].setdefault("trade_registry_sync_v1", sync_result)
-                            message = "Execução real solicitada. Trade Registry Sync V1.1 aplicado quando houve ordem real enviada."
+                                    result["payload"].setdefault("real_execution_final_gate_v1", final_gate)
+                            message = "Execução real solicitada. Real Execution Final Gate V1 aprovado; Trade Registry Sync V1.1 aplicado quando houve ordem real enviada."
 
             else:
                 result = {
@@ -3935,6 +4248,16 @@ def execution_console_route():
     existing_position_state = existing_position_state if isinstance(existing_position_state, dict) else {}
     existing_position_state_json = json.dumps(existing_position_state or {"status": "NO_STATE_YET"}, ensure_ascii=False, indent=2, default=str)
 
+    real_execution_final_gate = None
+    if isinstance(result, dict):
+        real_execution_final_gate = result.get("real_execution_final_gate_v1")
+        if real_execution_final_gate is None and isinstance(result.get("payload"), dict):
+            real_execution_final_gate = result.get("payload", {}).get("real_execution_final_gate_v1")
+        if real_execution_final_gate is None and isinstance(result.get("preflight_result"), dict):
+            real_execution_final_gate = result.get("preflight_result", {}).get("real_execution_final_gate_v1")
+    real_execution_final_gate = real_execution_final_gate if isinstance(real_execution_final_gate, dict) else {}
+    real_execution_final_gate_json = json.dumps(real_execution_final_gate or {"status": "NO_FINAL_GATE_YET"}, ensure_ascii=False, indent=2, default=str)
+
     summary = {
         "ok": result.get("ok") if isinstance(result, dict) else None,
         "status": result_payload.get("status") if isinstance(result_payload, dict) else (result.get("status") if isinstance(result, dict) else None),
@@ -3944,6 +4267,9 @@ def execution_console_route():
         "broker_client_order_id_expected": expected_broker_client_order_id,
         "broker_client_order_id_source": (payload.get("execution_console_broker_client_order_id_v1") or {}).get("client_order_id_source") if isinstance(payload.get("execution_console_broker_client_order_id_v1"), dict) else None,
         "broker_client_order_id_matches_expected": (str(broker_reported_client_order_id) == str(expected_broker_client_order_id)) if broker_reported_client_order_id and expected_broker_client_order_id else None,
+        "real_execution_final_gate_ok": real_execution_final_gate.get("ok"),
+        "real_execution_final_gate_status": real_execution_final_gate.get("status"),
+        "real_execution_final_gate_failed_codes": real_execution_final_gate.get("failed_blocking_codes"),
         "live_status": live_result.get("status"),
         "broker_error": live_result.get("error"),
         "confirmation_guard": (live_result.get("confirmation_guard") or {}).get("status") if isinstance(live_result.get("confirmation_guard"), dict) else None,
@@ -3969,7 +4295,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.7</title>
+  <title>Central Quant — Execution Console V1.8</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -4039,7 +4365,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.7</h1>
+  <h1>Central Quant — Execution Console V1.8</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -4049,6 +4375,7 @@ def execution_console_route():
     <p class="info">V1.5.1 / Trade Registry Sync V1.1: ordem real enviada pela Central é registrada imediatamente no Trade Registry; posição real detectada é sincronizada e o estado pós-sync é recalculado.</p>
     <p class="info">V1.6 / Signal ID Refresh: cada novo POST gera um signal_id novo; refresh/F5 via PRG apenas recarrega o resultado salvo.</p>
     <p class="info">Broker Client Order ID V1: a Central mantém um signal_id completo e envia ao broker/BingX um client_order_id curto e único.</p>
+    <p class="info">Real Execution Final Gate V1: antes de execução real, a Central valida token, piloto, limites, posição, IDs e stop.</p>
   </div>
 
   <form method="post" class="card" action="{esc(request.path)}">
@@ -4135,6 +4462,12 @@ def execution_console_route():
     <h2>Estado real / posição existente — V1.4</h2>
     <p class="info">Use este bloco para confirmar se a posição aberta na BingX é conhecida pela Central antes de qualquer execução real.</p>
     <pre>{esc(existing_position_state_json)}</pre>
+  </div>
+
+  <div class="card">
+    <h2>Real Execution Final Gate V1</h2>
+    <p class="warn">Checklist final antes do botão vermelho chamar execução real. No Preview, este bloco é diagnóstico; em execução real, bloqueia se houver falha.</p>
+    <pre>{esc(real_execution_final_gate_json)}</pre>
   </div>
 
   <div class="card">
