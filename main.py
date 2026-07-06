@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-05-SUPER-CENTRAL-QUANT-V5-EXECUTION-ROUTES-V2.5.1
+# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-LIVE-ROUTE-V2.5.8
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -3006,6 +3006,170 @@ def execution_engine_verify_route():
     return engine_result
 
 
+
+
+@app.route("/executionlive", methods=["GET", "POST"])
+@app.route("/execution/live", methods=["GET", "POST"])
+@app.route("/executionengine/live", methods=["GET", "POST"])
+@app.route("/execution/engine/live", methods=["GET", "POST"])
+def execution_engine_live_route():
+    """
+    EXECUTION LIVE ROUTE V2.5.8 — rota controlada para envio real.
+
+    Segurança:
+    - GET nunca envia ordem real; apenas explica como usar.
+    - POST exige confirmação explícita.
+    - Chama run_execution_engine(..., mode="LIVE", dry_run=False).
+    - O Execution Engine ainda exige:
+        * Executive Policy ALLOW
+        * Real Pilot Guard ALLOW
+        * Confirmation Guard ALLOW
+        * Execution Authorization Token
+        * Broker live_send_enabled
+    - O broker ainda exige:
+        * EXECUTION_MODE=LIVE
+        * ENABLE_REAL_TRADING=true
+        * BROKER_DRY_RUN=false
+    """
+    required_phrase = os.environ.get("EXECUTION_LIVE_CONFIRMATION_PHRASE", "EXECUTE_REAL_TRADE")
+
+    if request.method != "POST":
+        return {
+            "ok": False,
+            "route": "/executionlive",
+            "status": "POST_REQUIRED",
+            "sent": False,
+            "message": "Esta rota nunca executa ordem real via GET. Use POST com confirmação explícita.",
+            "required_confirmation_field": "confirm",
+            "required_confirmation_value": required_phrase,
+            "example_json": {
+                "confirm": required_phrase,
+                "bot": "FALCON",
+                "setup": "FALCON",
+                "symbol": "BTCUSDT",
+                "side": "SHORT",
+                "entry": 108000,
+                "sl": 109000,
+                "tp50": 107000,
+                "risk_pct": 2.0
+            },
+            "notes": [
+                "Use /executionverify para preview.",
+                "Use /executionlive somente para uma execução real deliberada.",
+            ],
+        }, 405
+
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    # Permite POST com form/query também, mas não executa sem confirm.
+    for key, value in request.form.items():
+        payload.setdefault(key, value)
+    for key, value in request.args.items():
+        payload.setdefault(key, value)
+
+    confirm = str(payload.get("confirm") or payload.get("confirmation") or payload.get("confirmation_phrase") or "").strip()
+    if confirm != required_phrase:
+        return {
+            "ok": False,
+            "route": "/executionlive",
+            "status": "CONFIRMATION_REQUIRED",
+            "sent": False,
+            "reason": "Confirmação explícita ausente ou inválida.",
+            "required_confirmation_field": "confirm",
+            "required_confirmation_value": required_phrase,
+            "received_confirmation": confirm,
+            "notes": [
+                "Nenhuma chamada a run_execution_engine foi feita.",
+                "Para preview use /executionverify.",
+            ],
+        }, 400
+
+    required_fields = ["bot", "symbol", "side", "entry", "sl"]
+    missing = [field for field in required_fields if payload.get(field) in [None, ""]]
+    if missing:
+        return {
+            "ok": False,
+            "route": "/executionlive",
+            "status": "MISSING_REQUIRED_FIELDS",
+            "sent": False,
+            "missing": missing,
+            "required_fields": required_fields,
+            "notes": ["Nenhuma ordem foi enviada."],
+        }, 400
+
+    payload.setdefault("decision", "ALLOW")
+    payload.setdefault("setup", payload.get("bot") or "FALCON")
+    payload.setdefault("risk_pct", 2.0)
+    payload.setdefault("signal_id", f"EXECUTION-LIVE-V2.5.8-{payload.get('bot','BOT')}-{payload.get('symbol','SYMBOL')}-{payload.get('side','SIDE')}-{int(time.time())}")
+
+    # Remover campo de confirmação antes de enviar ao engine/log operacional.
+    payload_for_engine = dict(payload)
+    payload_for_engine.pop("confirm", None)
+    payload_for_engine.pop("confirmation", None)
+    payload_for_engine.pop("confirmation_phrase", None)
+
+    policy_reasons = []
+    policy_warnings = []
+    executive_policy_eval = _apply_executive_policy_to_risk_reasons(
+        trade_payload=payload_for_engine,
+        reasons=policy_reasons,
+        warnings=policy_warnings,
+    )
+
+    if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
+        blocked_payload = dict(payload_for_engine or {})
+        blocked_payload["decision"] = "DENY"
+        blocked_payload["blocked_by"] = "EXECUTIVE_POLICY_MANAGER"
+        blocked_payload["executive_policy"] = executive_policy_eval
+        return {
+            "ok": True,
+            "route": "/executionlive",
+            "mode": "LIVE",
+            "dry_run": False,
+            "decision": "DENY",
+            "allowed": False,
+            "sent": False,
+            "status": "BLOCKED_BY_EXECUTIVE_POLICY",
+            "blocked_by": "EXECUTIVE_POLICY_MANAGER",
+            "executive_policy": executive_policy_eval,
+            "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
+            "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
+            "payload": blocked_payload,
+            "notes": [
+                "Execution Live protegido pelo Executive Policy Manager.",
+                "Nenhuma chamada a run_execution_engine foi feita porque a política executiva bloqueou a trade.",
+            ],
+        }, 200
+
+    if isinstance(executive_policy_eval, dict):
+        payload_for_engine["executive_policy"] = executive_policy_eval
+
+    engine_result = run_execution_engine(
+        payload=payload_for_engine,
+        mode="LIVE",
+        dry_run=False,
+    )
+
+    if isinstance(engine_result, dict):
+        engine_result.setdefault("route", "/executionlive")
+        engine_result.setdefault("mode_forced", "LIVE")
+        engine_result.setdefault("dry_run_forced", False)
+        engine_result.setdefault("executive_policy", executive_policy_eval)
+        engine_result.setdefault("policy_gate", {
+            "checked": True,
+            "allowed": True,
+            "source": "executive_policy_manager",
+            "warnings": policy_warnings,
+        })
+        engine_result.setdefault("notes", [])
+        if isinstance(engine_result.get("notes"), list):
+            engine_result["notes"].append("/executionlive chama LIVE + dry_run=False e pode enviar ordem real se todos os guards aprovarem.")
+
+    return engine_result, (200 if isinstance(engine_result, dict) and engine_result.get("ok") else 400)
+
+
 @app.route("/executionenginetest")
 @app.route("/executiontest")
 @app.route("/execution_engine/test")
@@ -3070,6 +3234,7 @@ def execution_routes_compat_route():
             "Aliases sem underline adicionados para evitar not found.",
             "Rotas de teste/run chamam o Execution Engine; respeitam as travas do V2.5.",
             "/executionverify força mode=LIVE com dry_run=True para validar o broker sem enviar ordem real.",
+            "/executionlive exige POST + confirmação explícita e chama mode=LIVE com dry_run=False.",
             "Não ativam operação real sozinhas.",
         ],
     }

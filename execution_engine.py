@@ -1,6 +1,6 @@
 # execution_engine.py
-# CENTRAL QUANT — EXECUTION ENGINE V2.5.7
-# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.7-EXECUTION-CONFIRMATION-GUARD
+# CENTRAL QUANT — EXECUTION ENGINE V2.5.8
+# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.8-EXECUTION-LIVE-ROUTE-SAFE-DUPLICATE-GUARD
 #
 # Objetivo:
 # - Ser o ponto único de decisão antes de qualquer execução.
@@ -58,7 +58,7 @@ else:
     BROKER_IMPORT_ERROR = None
 
 
-VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.7-EXECUTION-CONFIRMATION-GUARD"
+VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.8-EXECUTION-LIVE-ROUTE-SAFE-DUPLICATE-GUARD"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -537,7 +537,7 @@ def execution_engine_health() -> Dict[str, Any]:
             "execution_audit_log": str(EXECUTION_AUDIT_LOG_FILE),
         },
         "notes": [
-            "Execution Engine V2.5.7 é o ponto único antes de qualquer executor.",
+            "Execution Engine V2.5.8 é o ponto único antes de qualquer executor.",
             "Modo OBSERVATION_ONLY cria plano e loga.",
             "Modo PAPER chama Paper Executor integrado quando habilitado.",
             "Modo LIVE chama broker.py em preview seguro quando dry_run=true e em envio real apenas se Real Pilot Guard aprovar.",
@@ -598,7 +598,9 @@ def _recent_duplicate_execution(symbol: str, side: str, bot: str, window_seconds
                 if item_symbol == keys["symbol"] and item_side == keys["side"] and item_bot == keys["bot"]:
                     status = _to_upper(item.get("status") or ((item.get("result") or {}).get("status") if isinstance(item.get("result"), dict) else None))
                     sent = bool(item.get("sent") or ((item.get("result") or {}).get("live_sent") if isinstance(item.get("result"), dict) else False))
-                    if sent or status in {"SENT", "LIVE_PREVIEW_OK", "VERIFY", "DRY_RUN"}:
+                    # V2.5.8: preview recente NÃO bloqueia execução real.
+                    # Bloqueia apenas execução realmente enviada ou status de envio real.
+                    if sent or status in {"SENT", "LIVE_SENT"}:
                         matches.append({
                             "path": str(path),
                             "epoch": epoch,
@@ -976,7 +978,7 @@ def run_execution_engine(
         "paper_executor_called": result_extra_paper is not None,
         "live_broker_called": result_extra_live is not None,
         "notes": [
-            "Execution Engine V2.5.7 recebeu o payload e delegou validação ao Orchestrator.",
+            "Execution Engine V2.5.8 recebeu o payload e delegou validação ao Orchestrator.",
             "LIVE com dry_run=true faz preview seguro; LIVE real só envia se Real Pilot Guard, Confirmation Guard, Authorization Token e broker aprovarem.",
             "O broker.py mantém uma segunda camada de kill switch.",
         ],
@@ -1020,6 +1022,8 @@ def run_execution_engine(
         "live_broker_called": result_extra_live is not None,
         "live_sent": bool(result_extra_live.get("sent")) if isinstance(result_extra_live, dict) else False,
         "live_status": result_extra_live.get("status") if isinstance(result_extra_live, dict) else None,
+        "confirmation_guard_status": ((result_extra_live.get("confirmation_guard") or {}).get("status") if isinstance(result_extra_live, dict) and isinstance(result_extra_live.get("confirmation_guard"), dict) else None),
+        "execution_auth_status": ((result_extra_live.get("auth") or {}).get("status") if isinstance(result_extra_live, dict) and isinstance(result_extra_live.get("auth"), dict) else None),
         "client_order_id": result_extra_live.get("client_order_id") if isinstance(result_extra_live, dict) else None,
         "order_id": result_extra_live.get("order_id") if isinstance(result_extra_live, dict) else None,
         "amount": result_extra_live.get("amount") if isinstance(result_extra_live, dict) else None,
