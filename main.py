@@ -5021,7 +5021,7 @@ def real_trade_lifecycle_monitor_v1_health():
 # - Persistir snapshot do Trade Registry e do estado real da BingX.
 # - Reconstruir o Registry quando houver posição real protegida, mas o arquivo OPEN estiver vazio.
 # - Bloquear nova execução real quando existir posição real sem Registry confirmado.
-REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1.2"
+REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1.3"
 REGISTRY_PERSISTENCE_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_latest.json"
 REGISTRY_PERSISTENCE_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_events.jsonl"
 
@@ -5164,6 +5164,274 @@ def _rp_v1_registry_snapshot_full():
         "raw_registry": raw_registry,
     }
 
+
+# ==========================================================
+# REGISTRY PERSISTENCE V1.3 — SNAPSHOT MERGE / CLOSED HISTORY PROTECTION
+# ==========================================================
+# Objetivo:
+# - Não permitir que um snapshot novo com closed_trades vazio apague histórico já avaliado.
+# - Mesclar closed_trades do Registry atual, do último snapshot e dos eventos do Outcome Evaluator.
+# - Restaurar histórico fechado mesmo quando um deploy/restart recria trade_registry.json vazio.
+# - Preservar outcomes HIGH_REAL/avaliados, especialmente o primeiro BTC real.
+
+def _rp_v13_as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _rp_v13_as_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return list(value.values())
+    return []
+
+
+def _rp_v13_trade_key(trade, fallback=None):
+    if isinstance(trade, dict):
+        key = trade.get("trade_id") or trade.get("id") or trade.get("key")
+        if key:
+            return str(key)
+        bot = str(trade.get("bot") or "").upper().strip()
+        setup = str(trade.get("setup") or bot or "").upper().strip()
+        symbol = _rp_v1_norm_symbol(trade.get("symbol") or "")
+        side = _rp_v1_norm_side(trade.get("side") or "")
+        if bot and setup and symbol and side:
+            return f"{bot}:{setup}:{symbol}:{side}"
+    return str(fallback) if fallback is not None else None
+
+
+def _rp_v13_closed_pairs_from_obj(closed_obj, source="unknown"):
+    pairs = []
+    if isinstance(closed_obj, dict):
+        for key, trade in closed_obj.items():
+            if isinstance(trade, dict):
+                k = _rp_v13_trade_key(trade, key)
+                t = dict(trade)
+                t.setdefault("trade_id", k)
+                pairs.append((k, t, source))
+    elif isinstance(closed_obj, list):
+        for idx, trade in enumerate(closed_obj):
+            if isinstance(trade, dict):
+                k = _rp_v13_trade_key(trade, idx)
+                t = dict(trade)
+                if k:
+                    t.setdefault("trade_id", k)
+                pairs.append((k, t, source))
+    return [(k, t, s) for k, t, s in pairs if k]
+
+
+def _rp_v13_closed_pairs_from_snapshot_payload(snapshot_payload, source="latest_snapshot"):
+    pairs = []
+    if not isinstance(snapshot_payload, dict):
+        return pairs
+    registry_state = snapshot_payload.get("registry_state") if isinstance(snapshot_payload.get("registry_state"), dict) else {}
+    raw = registry_state.get("raw_registry") if isinstance(registry_state.get("raw_registry"), dict) else {}
+    pairs.extend(_rp_v13_closed_pairs_from_obj(raw.get("closed_trades"), source=f"{source}.raw_registry"))
+    snap = registry_state.get("snapshot") if isinstance(registry_state.get("snapshot"), dict) else {}
+    pairs.extend(_rp_v13_closed_pairs_from_obj(snap.get("closed_trades"), source=f"{source}.snapshot"))
+    return pairs
+
+
+def _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome"):
+    if not isinstance(outcome, dict) or not outcome.get("ok"):
+        return None
+    trade_id = outcome.get("trade_id") or outcome.get("trade_key")
+    symbol = _rp_v1_norm_symbol(outcome.get("symbol") or "")
+    side = _rp_v1_norm_side(outcome.get("side") or "")
+    bot = _rp_v1_norm_bot(outcome.get("bot") or "")
+    setup = str(outcome.get("setup") or bot or "").upper().strip()
+    if not trade_id and bot and setup and symbol and side:
+        trade_id = f"{bot}:{setup}:{symbol}:{side}"
+    if not trade_id:
+        return None
+    now = _rp_v1_now()
+    trade = {
+        "trade_id": str(trade_id),
+        "bot": bot,
+        "setup": setup,
+        "symbol": symbol,
+        "side": side,
+        "status": "CLOSED",
+        "source": source,
+        "entry": outcome.get("entry"),
+        "exit_price": outcome.get("exit_price"),
+        "exit_price_source": outcome.get("exit_price_source"),
+        "qty": outcome.get("qty"),
+        "sl": outcome.get("sl"),
+        "tp50": outcome.get("tp50"),
+        "close_reason": outcome.get("close_reason"),
+        "close_reason_evaluated": outcome.get("close_reason"),
+        "realized_pnl": outcome.get("realized_pnl"),
+        "net_pnl": outcome.get("net_pnl"),
+        "pnl_pct": outcome.get("pnl_pct"),
+        "r_multiple": outcome.get("r_multiple"),
+        "tp50_hit": ((outcome.get("tp50_result") or {}).get("hit") if isinstance(outcome.get("tp50_result"), dict) else outcome.get("tp50_hit")),
+        "outcome_evaluated": True,
+        "outcome_status": outcome.get("status") or "OUTCOME_EVALUATED",
+        "outcome_data_quality": outcome.get("data_quality"),
+        "outcome_version": outcome.get("version") or globals().get("TRADE_CLOSE_OUTCOME_V1_VERSION"),
+        "closed_at": outcome.get("generated_at") or now,
+        "last_update": outcome.get("generated_at") or now,
+        "metadata": {
+            "recovered_from_outcome_event": True,
+            "recovered_at": now,
+            "recovered_by": "registry_persistence_v1_3_snapshot_merge",
+            "outcome_evaluated": True,
+            "outcome_evaluated_at": outcome.get("generated_at") or now,
+            "outcome_version": outcome.get("version") or globals().get("TRADE_CLOSE_OUTCOME_V1_VERSION"),
+            "outcome": outcome,
+        },
+    }
+    return trade
+
+
+def _rp_v13_closed_pairs_from_outcome_files():
+    pairs = []
+    seen = set()
+    # Eventos preservam todos os outcomes salvos; latest preserva apenas o último, mas serve como fallback.
+    try:
+        path = globals().get("TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE")
+        if path and Path(path).exists():
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    outcome = json.loads(line)
+                except Exception:
+                    continue
+                trade = _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome_events")
+                key = _rp_v13_trade_key(trade) if trade else None
+                if trade and key:
+                    pairs.append((key, trade, "trade_close_outcome_events"))
+                    seen.add(key)
+    except Exception:
+        pass
+    try:
+        path = globals().get("TRADE_CLOSE_OUTCOME_V1_LATEST_FILE")
+        if path and Path(path).exists():
+            outcome = json.loads(Path(path).read_text(encoding="utf-8"))
+            trade = _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome_latest")
+            key = _rp_v13_trade_key(trade) if trade else None
+            if trade and key and key not in seen:
+                pairs.append((key, trade, "trade_close_outcome_latest"))
+    except Exception:
+        pass
+    return pairs
+
+
+def _rp_v13_trade_score(trade):
+    if not isinstance(trade, dict):
+        return -999
+    meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    outcome = meta.get("outcome") if isinstance(meta.get("outcome"), dict) else {}
+    dq = str(trade.get("outcome_data_quality") or outcome.get("data_quality") or "").upper()
+    score = 0
+    if trade.get("outcome_evaluated") or meta.get("outcome_evaluated") or outcome.get("status") == "OUTCOME_EVALUATED":
+        score += 50
+    if dq == "HIGH_REAL":
+        score += 20
+    elif dq:
+        score += 5
+    if trade.get("realized_pnl") is not None or trade.get("net_pnl") is not None:
+        score += 10
+    if trade.get("exit_price") is not None:
+        score += 5
+    if trade.get("entry") is not None:
+        score += 3
+    if meta.get("outcome"):
+        score += 5
+    # Preferir fontes de outcome quando carregam learning_payload completo.
+    if meta.get("recovered_from_outcome_event"):
+        score += 2
+    return score
+
+
+def _rp_v13_merge_trade(existing, incoming):
+    if not isinstance(existing, dict):
+        return dict(incoming or {})
+    if not isinstance(incoming, dict):
+        return dict(existing)
+    # Se incoming é claramente melhor, ele vira base; caso contrário preserva existing.
+    if _rp_v13_trade_score(incoming) > _rp_v13_trade_score(existing):
+        base, extra = dict(incoming), existing
+    else:
+        base, extra = dict(existing), incoming
+    for k, v in (extra or {}).items():
+        if base.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
+            base[k] = v
+    meta = base.get("metadata") if isinstance(base.get("metadata"), dict) else {}
+    extra_meta = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
+    for k, v in extra_meta.items():
+        if meta.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
+            meta[k] = v
+    if meta:
+        base["metadata"] = meta
+    return base
+
+
+def _rp_v13_merge_closed_history(raw_registry, latest_snapshot_payload=None):
+    raw = dict(raw_registry or {}) if isinstance(raw_registry, dict) else {"ok": True, "open_trades": {}, "closed_trades": []}
+    existing_closed_obj = raw.get("closed_trades")
+    merged = {}
+    sources = {}
+    for key, trade, source in _rp_v13_closed_pairs_from_obj(existing_closed_obj, source="current_registry"):
+        merged[key] = _rp_v13_merge_trade(merged.get(key), trade)
+        sources.setdefault(key, []).append(source)
+    for key, trade, source in _rp_v13_closed_pairs_from_snapshot_payload(latest_snapshot_payload, source="latest_snapshot"):
+        merged[key] = _rp_v13_merge_trade(merged.get(key), trade)
+        sources.setdefault(key, []).append(source)
+    for key, trade, source in _rp_v13_closed_pairs_from_outcome_files():
+        merged[key] = _rp_v13_merge_trade(merged.get(key), trade)
+        sources.setdefault(key, []).append(source)
+    # Produz lista estável; Trade Registry do projeto já usa lista para closed_trades.
+    closed_list = []
+    for key in sorted(merged.keys()):
+        trade = dict(merged[key])
+        trade.setdefault("trade_id", key)
+        trade.setdefault("status", "CLOSED")
+        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+        meta.setdefault("closed_history_sources", sorted(set(sources.get(key, []))))
+        trade["metadata"] = meta
+        closed_list.append(trade)
+    before_count = len(_rp_v13_closed_pairs_from_obj(existing_closed_obj, source="current_registry"))
+    raw["closed_trades"] = closed_list
+    raw.setdefault("open_trades", {})
+    raw["updated_at"] = _rp_v1_now()
+    raw["closed_history_merged_by"] = REGISTRY_PERSISTENCE_V1_VERSION
+    raw["closed_history_merged_at"] = _rp_v1_now()
+    return raw, {
+        "version": REGISTRY_PERSISTENCE_V1_VERSION,
+        "attempted": True,
+        "current_closed_count_before": before_count,
+        "merged_closed_count": len(closed_list),
+        "recovered_closed_count": max(0, len(closed_list) - before_count),
+        "sources_by_trade": sources,
+        "protected": True,
+    }
+
+
+def _rp_v13_update_registry_state_with_raw(registry_state, merged_raw, merge_meta=None):
+    state = dict(registry_state or {})
+    state["raw_registry"] = merged_raw
+    try:
+        state["open_count"] = len((merged_raw or {}).get("open_trades") or {})
+    except Exception:
+        pass
+    snap = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    try:
+        closed_list = _rp_v13_as_list((merged_raw or {}).get("closed_trades"))
+        open_obj = (merged_raw or {}).get("open_trades") or {}
+        snap["closed_trades"] = closed_list
+        snap["closed_count"] = len(closed_list)
+        snap["open_trades"] = list(open_obj.values()) if isinstance(open_obj, dict) else _rp_v13_as_list(open_obj)
+        snap["open_count"] = len(open_obj) if isinstance(open_obj, dict) else len(_rp_v13_as_list(open_obj))
+        snap["closed_history_merge"] = merge_meta or {}
+        state["snapshot"] = snap
+    except Exception:
+        pass
+    state["closed_history_merge"] = merge_meta or {}
+    return state
 
 def _rp_v1_select_stop_from_orders_or_args(side, entry, protective_orders=None, request_sl=None, registry_trade=None):
     side_n = _rp_v1_norm_side(side)
@@ -5320,17 +5588,20 @@ def registry_persistence_v1_rebuild_from_broker(symbol=None, side=None, bot=None
 
 def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=None, commit=False, source="manual", ack=None, sl=None, tp50=None, auto_rebuild=False, block_empty_registry_snapshot=True):
     """
-    Registry Persistence V1.2 + Trade Close Outcome Evaluator V1 + Registry Mode Segregation V1.
+    Registry Persistence V1.3 + Trade Close Outcome Evaluator V1 + Registry Mode Segregation V1.
 
-    V1 salvava snapshot mesmo quando havia posição real protegida, mas Registry vazio.
-    Isso era útil para diagnóstico, mas perigoso se o snapshot "latest" passasse a representar
-    um estado sem OPEN. V1.1 muda a regra:
-    - Se houver posição real + stop confirmado + Registry ausente, commit é bloqueado por padrão.
-    - Com rebuild/auto_rebuild + ack explícito, o Registry é reconstruído antes do snapshot.
-    - O snapshot salvo, quando há posição aberta, deve preferir o estado pós-rebuild confirmado.
+    V1.3 protege histórico fechado:
+    - Mescla closed_trades do Registry atual, último snapshot e eventos do Outcome Evaluator.
+    - Não deixa snapshot novo com closed_trades vazio apagar trades já avaliados.
+    - Pode restaurar closed_trades a partir de /data/trade_close_outcome_v1_events.jsonl.
+    - Continua bloqueando snapshot inseguro quando houver posição real protegida sem Registry.
     """
     live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
     registry_state = _rp_v1_registry_snapshot_full()
+    latest_for_merge = _rp_v1_read_latest_snapshot()
+    latest_snapshot_payload = (latest_for_merge.get("snapshot") if isinstance(latest_for_merge, dict) and latest_for_merge.get("ok") else None)
+    merged_registry_raw, closed_history_merge = _rp_v13_merge_closed_history(registry_state.get("raw_registry"), latest_snapshot_payload=latest_snapshot_payload)
+    registry_state = _rp_v13_update_registry_state_with_raw(registry_state, merged_registry_raw, merge_meta=closed_history_merge)
 
     def needs_rebuild(ls):
         return bool(
@@ -5357,6 +5628,10 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
         # Recarrega tudo após tentativa de rebuild, mesmo em erro, para refletir estado real.
         live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
         registry_state = _rp_v1_registry_snapshot_full()
+        latest_for_merge = _rp_v1_read_latest_snapshot()
+        latest_snapshot_payload = (latest_for_merge.get("snapshot") if isinstance(latest_for_merge, dict) and latest_for_merge.get("ok") else None)
+        merged_registry_raw, closed_history_merge = _rp_v13_merge_closed_history(registry_state.get("raw_registry"), latest_snapshot_payload=latest_snapshot_payload)
+        registry_state = _rp_v13_update_registry_state_with_raw(registry_state, merged_registry_raw, merge_meta=closed_history_merge)
         rebuild_required = needs_rebuild(live_state)
 
     payload = {
@@ -5380,6 +5655,8 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
             "registry_match": live_state.get("registry_match"),
             "stop_confirmed_by_central": live_state.get("stop_confirmed_by_central"),
             "open_count": registry_state.get("open_count"),
+            "closed_count": len(_rp_v13_as_list(((registry_state.get("raw_registry") or {}).get("closed_trades")) if isinstance(registry_state.get("raw_registry"), dict) else [])),
+            "closed_history_merge": closed_history_merge,
             "rebuild_required": bool(rebuild_required),
         },
     }
@@ -5396,15 +5673,21 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
             }
         else:
             try:
+                registry_save_result = {"attempted": False, "committed": False, "status": "REGISTRY_SAVE_NOT_AVAILABLE"}
+                if central_trade_registry is not None and callable(getattr(central_trade_registry, "save_registry", None)) and isinstance((registry_state or {}).get("raw_registry"), dict):
+                    central_trade_registry.save_registry((registry_state or {}).get("raw_registry"))
+                    registry_save_result = {"attempted": True, "committed": True, "status": "REGISTRY_WITH_CLOSED_HISTORY_SAVED"}
+                payload["registry_save"] = registry_save_result
                 _rp_v1_atomic_write_json(REGISTRY_PERSISTENCE_V1_LATEST_FILE, payload)
                 _rp_v1_append_event({
                     "event": "REGISTRY_PERSISTENCE_SNAPSHOT",
                     "generated_at": _rp_v1_now(),
                     "summary": payload.get("summary"),
+                    "closed_history_merge": closed_history_merge,
                     "source": source,
                     "version": REGISTRY_PERSISTENCE_V1_VERSION,
                 })
-                save_result = {"attempted": True, "committed": True, "status": "SNAPSHOT_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
+                save_result = {"attempted": True, "committed": True, "status": "SNAPSHOT_MERGED_AND_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE), "registry_save": registry_save_result}
             except Exception as exc:
                 save_result = {"attempted": True, "committed": False, "status": "SNAPSHOT_SAVE_ERROR", "error": str(exc), "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
     payload["snapshot_save"] = save_result
@@ -5420,19 +5703,23 @@ def registry_persistence_v1_restore_from_latest_snapshot(commit=False, ack=None)
     raw_registry = (((snapshot.get("registry_state") or {}).get("raw_registry")) if isinstance(snapshot, dict) else None)
     if not isinstance(raw_registry, dict):
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "SNAPSHOT_HAS_NO_RAW_REGISTRY", "committed": False}
-    open_trades = raw_registry.get("open_trades")
-    if not open_trades:
-        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "SNAPSHOT_HAS_NO_OPEN_TRADES", "committed": False}
+    merged_raw, closed_history_merge = _rp_v13_merge_closed_history(raw_registry, latest_snapshot_payload=snapshot)
+    open_trades = merged_raw.get("open_trades") if isinstance(merged_raw, dict) else {}
+    closed_trades = merged_raw.get("closed_trades") if isinstance(merged_raw, dict) else []
+    open_count = len(open_trades) if isinstance(open_trades, dict) else len(_rp_v13_as_list(open_trades))
+    closed_count = len(_rp_v13_as_list(closed_trades))
+    if open_count <= 0 and closed_count <= 0:
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "SNAPSHOT_HAS_NO_OPEN_OR_CLOSED_TRADES", "committed": False, "closed_history_merge": closed_history_merge}
     if not commit:
-        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "DRY_RUN_RESTORE_AVAILABLE", "committed": False, "open_count": len(open_trades) if isinstance(open_trades, dict) else None}
+        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "DRY_RUN_RESTORE_AVAILABLE", "committed": False, "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge}
     if central_trade_registry is None or not callable(getattr(central_trade_registry, "save_registry", None)):
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "TRADE_REGISTRY_UNAVAILABLE", "committed": False}
     try:
-        raw_registry["restored_by"] = REGISTRY_PERSISTENCE_V1_VERSION
-        raw_registry["restored_at"] = _rp_v1_now()
-        central_trade_registry.save_registry(raw_registry)
-        _rp_v1_append_event({"event": "REGISTRY_PERSISTENCE_RESTORE", "generated_at": _rp_v1_now(), "open_count": len(open_trades) if isinstance(open_trades, dict) else None})
-        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "REGISTRY_RESTORED_FROM_SNAPSHOT", "committed": True, "open_count": len(open_trades) if isinstance(open_trades, dict) else None}
+        merged_raw["restored_by"] = REGISTRY_PERSISTENCE_V1_VERSION
+        merged_raw["restored_at"] = _rp_v1_now()
+        central_trade_registry.save_registry(merged_raw)
+        _rp_v1_append_event({"event": "REGISTRY_PERSISTENCE_RESTORE", "generated_at": _rp_v1_now(), "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge, "version": REGISTRY_PERSISTENCE_V1_VERSION})
+        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "REGISTRY_RESTORED_FROM_SNAPSHOT_WITH_CLOSED_HISTORY", "committed": True, "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge}
     except Exception as exc:
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "RESTORE_SAVE_ERROR", "committed": False, "error": str(exc)}
 
@@ -5763,20 +6050,49 @@ def registry_persistence_v1_route():
     ack = request.args.get("ack") or request.args.get("registry_persistence_ack")
     sl = request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss")
     tp50 = request.args.get("tp50")
-    payload = registry_persistence_v1_snapshot(
-        symbol=symbol,
-        side=side,
-        bot=bot,
-        setup=setup,
-        commit=commit,
-        source="route",
-        ack=ack,
-        sl=sl,
-        tp50=tp50,
-        auto_rebuild=bool(rebuild or auto_rebuild),
-    )
     if restore:
-        payload["restore"] = registry_persistence_v1_restore_from_latest_snapshot(commit=commit, ack=ack)
+        # V1.3: em restore, restaurar ANTES de salvar novo snapshot.
+        # Isso evita sobrescrever o latest persistente com um Registry vazio recém-criado após deploy.
+        restore_result = registry_persistence_v1_restore_from_latest_snapshot(commit=commit, ack=ack)
+        payload = registry_persistence_v1_snapshot(
+            symbol=symbol,
+            side=side,
+            bot=bot,
+            setup=setup,
+            commit=False,
+            source="route_after_restore_inspect",
+            ack=ack,
+            sl=sl,
+            tp50=tp50,
+            auto_rebuild=bool(rebuild or auto_rebuild),
+        )
+        payload["restore"] = restore_result
+        if commit and bool((restore_result or {}).get("committed")):
+            payload["post_restore_snapshot"] = registry_persistence_v1_snapshot(
+                symbol=symbol,
+                side=side,
+                bot=bot,
+                setup=setup,
+                commit=True,
+                source="route_post_restore_snapshot",
+                ack=ack,
+                sl=sl,
+                tp50=tp50,
+                auto_rebuild=bool(rebuild or auto_rebuild),
+            )
+    else:
+        payload = registry_persistence_v1_snapshot(
+            symbol=symbol,
+            side=side,
+            bot=bot,
+            setup=setup,
+            commit=commit,
+            source="route",
+            ack=ack,
+            sl=sl,
+            tp50=tp50,
+            auto_rebuild=bool(rebuild or auto_rebuild),
+        )
     payload["routes"] = [
         "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON",
         "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
@@ -5801,6 +6117,7 @@ def registry_persistence_v1_health_route():
             "loaded": registry_state.get("trade_registry_loaded"),
             "file": registry_state.get("trade_registry_file"),
             "open_count": registry_state.get("open_count"),
+            "closed_count": len(_rp_v13_as_list(((registry_state.get("raw_registry") or {}).get("closed_trades")) if isinstance(registry_state.get("raw_registry"), dict) else [])),
             "import_error": registry_state.get("trade_registry_import_error"),
         },
         "latest_snapshot": {
@@ -5812,8 +6129,10 @@ def registry_persistence_v1_health_route():
         },
         "notes": [
             "Registry Persistence V1 salva snapshot do Registry e do estado real da BingX.",
+            "V1.3 protege closed_trades: snapshot novo não deve apagar histórico fechado/outcome já avaliado.",
+            "V1.3 mescla closed_trades do Registry atual, último snapshot e eventos do Trade Close Outcome.",
             "V1.2 adiciona recuperação manual segura de trade CLOSED quando o latest snapshot foi sobrescrito vazio.",
-            "Se houver posição real protegida e Registry vazio após deploy/restart, V1.1 bloqueia snapshot vazio e exige rebuild com ack explícito.",
+            "Se houver posição real protegida e Registry vazio após deploy/restart, o snapshot inseguro é bloqueado e exige rebuild com ack explícito.",
             "O Final Gate consulta esta camada e bloqueia nova execução real se houver posição existente sem Registry confirmado.",
             "Para persistência real entre deploys no Render, CENTRAL_DATA_DIR ou DATA_DIR deve apontar para um disco persistente.",
         ],
@@ -6814,7 +7133,7 @@ def registry_mode_segregation_v1_health_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.15 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.2 + Trade Close Outcome Evaluator V1 + Registry Mode Segregation V1.
+    EXECUTION CONSOLE V1.16 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.2 + Trade Close Outcome Evaluator V1 + Registry Mode Segregation V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
