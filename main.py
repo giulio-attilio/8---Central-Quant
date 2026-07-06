@@ -3309,7 +3309,7 @@ def trade_registry_sync_v1_health_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.5.1 — PRG + Real Position Awareness + Trade Registry Sync V1.1.
+    EXECUTION CONSOLE V1.6 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3321,6 +3321,8 @@ def execution_console_route():
     - V1.3 PRG: todo POST termina em redirect 303 para GET, impedindo reenvio por F5.
     - V1.4: detecta posição real existente na BingX e exige reconhecimento explícito
       quando a execução pode aumentar/conviver com uma posição já aberta pela Central.
+    - V1.6: gera novo signal_id para cada novo POST/intenção operacional,
+      preservando o mesmo ID apenas no GET pós-redirect PRG.
     """
     import urllib.parse
 
@@ -3406,6 +3408,27 @@ def execution_console_route():
         if side in {"BUY", "LONG"}:
             return "LONG"
         return side
+
+    def _new_console_signal_id(bot=None, setup=None, symbol=None, side=None):
+        """
+        Execution Console V1.6 — Signal ID Refresh.
+
+        Regra:
+        - Cada POST novo recebe um signal_id novo para evitar DUPLICATE_BLOCKED
+          por reaproveitamento acidental do ID via query string/PRG.
+        - O GET pós-redirect continua exibindo o mesmo signal_id salvo no resultado,
+          porque isso é apenas leitura/replay visual e não nova execução.
+        """
+        try:
+            bot_part = re.sub(r"[^A-Z0-9_]+", "", str(bot or "BOT").upper())[:18] or "BOT"
+            setup_part = re.sub(r"[^A-Z0-9_]+", "", str(setup or "SETUP").upper())[:18] or "SETUP"
+            symbol_part = _normalize_console_symbol(symbol or "SYMBOL")[:18] or "SYMBOL"
+            side_part = _normalize_console_side(side or "SIDE")[:8] or "SIDE"
+            epoch_part = int(time.time())
+            nonce = uuid.uuid4().hex[:8].upper()
+            return f"EXECUTION-CONSOLE-V1.6-{bot_part}-{setup_part}-{symbol_part}-{side_part}-{epoch_part}-{nonce}"
+        except Exception:
+            return f"EXECUTION-CONSOLE-V1.6-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}"
 
     def _extract_broker_positions_from_result(engine_result):
         try:
@@ -3542,18 +3565,51 @@ def execution_console_route():
     )
     confirm = str(confirm_raw or "").strip().upper()
 
+    bot_value = _field("bot", "FALCON").upper()
+    setup_value = _field("setup", "FALCON").upper()
+    symbol_value = _field("symbol", "BTCUSDT").upper().replace("/", "").replace(":USDT", "")
+    side_value = _field("side", "SHORT").upper()
+
+    # Execution Console V1.6 — Signal ID Refresh
+    #
+    # O bug observado veio do POST feito a partir de uma URL PRG que ainda carregava
+    # ?signal_id=... na query string. Como o form não tinha um novo signal_id,
+    # _field("signal_id") reaproveitava o ID antigo e o Orchestrator bloqueava como
+    # DUPLICATE_BLOCKED. Agora POST novo ignora signal_id da query string e gera ID novo.
+    # O ID antigo só é preservado no GET pós-redirect, quando não há execução.
+    if request.method == "POST":
+        explicit_form_signal_id = str(request.form.get("signal_id") or "").strip()
+        if explicit_form_signal_id:
+            signal_id_value = explicit_form_signal_id
+            signal_id_source = "FORM_EXPLICIT"
+            signal_id_refreshed = False
+        else:
+            signal_id_value = _new_console_signal_id(bot_value, setup_value, symbol_value, side_value)
+            signal_id_source = "POST_REFRESHED_V1_6"
+            signal_id_refreshed = True
+    else:
+        signal_id_value = _field("signal_id", _new_console_signal_id(bot_value, setup_value, symbol_value, side_value))
+        signal_id_source = "GET_OR_PRG_PRESERVED"
+        signal_id_refreshed = False
+
     payload = {
         "decision": "ALLOW",
-        "bot": _field("bot", "FALCON").upper(),
-        "setup": _field("setup", "FALCON").upper(),
-        "symbol": _field("symbol", "BTCUSDT").upper().replace("/", "").replace(":USDT", ""),
-        "side": _field("side", "SHORT").upper(),
+        "bot": bot_value,
+        "setup": setup_value,
+        "symbol": symbol_value,
+        "side": side_value,
         "entry": _field("entry", "108000"),
         "sl": _field("sl", "109000"),
         "tp50": _field("tp50", "107000"),
         "risk_pct": _safe_float_field(_field("risk_pct", "2"), 2.0),
-        "signal_id": _field("signal_id", f"EXECUTION-CONSOLE-V1-{int(time.time())}"),
+        "signal_id": signal_id_value,
         "existing_position_ack": _field("existing_position_ack", ""),
+        "execution_console_v1_6": {
+            "signal_id_refresh": True,
+            "signal_id_source": signal_id_source,
+            "signal_id_refreshed_on_post": signal_id_refreshed,
+            "rule": "POST novo gera signal_id novo; GET pós-redirect preserva o signal_id salvo.",
+        },
     }
 
     result = None
@@ -3763,7 +3819,7 @@ def execution_console_route():
             status_code = 500
             message = f"Erro na Execution Console: {exc}"
 
-        # V1.3/V1.4 PRG:
+        # V1.3/V1.4/V1.6 PRG + Signal ID Refresh:
         # Depois de qualquer POST, salva resultado e redireciona para GET.
         # Assim F5 recarrega apenas o GET e nunca reenvia preview/execução real.
         result_id = _console_save_result(payload, result, message, status_code, action)
@@ -3815,6 +3871,9 @@ def execution_console_route():
         "auth": (live_result.get("auth") or {}).get("status") if isinstance(live_result.get("auth"), dict) else None,
         "prg_result_id": result_id,
         "prg_mode": "POST_REDIRECT_GET" if result_id else "GET_ONLY",
+        "signal_id": payload.get("signal_id"),
+        "signal_id_source": (payload.get("execution_console_v1_6") or {}).get("signal_id_source") if isinstance(payload.get("execution_console_v1_6"), dict) else None,
+        "signal_id_refreshed_on_post": (payload.get("execution_console_v1_6") or {}).get("signal_id_refreshed_on_post") if isinstance(payload.get("execution_console_v1_6"), dict) else None,
         "existing_same_side_count": existing_position_state.get("same_symbol_same_side_count"),
         "existing_opposite_side_count": existing_position_state.get("same_symbol_opposite_side_count"),
         "central_managed_likely": existing_position_state.get("central_managed_likely"),
@@ -3831,7 +3890,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.5.1</title>
+  <title>Central Quant — Execution Console V1.6</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3901,7 +3960,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.5.1</h1>
+  <h1>Central Quant — Execution Console V1.6</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -3909,9 +3968,10 @@ def execution_console_route():
     <p class="info">Proteção PRG ativa: depois de Preview ou Execução, o POST vira Redirect e a tela final é carregada via GET. Apertar F5 não reenvia a ordem.</p>
     <p class="info">V1.4: a tela mostra posição real existente e exige reconhecimento explícito quando necessário.</p>
     <p class="info">V1.5.1 / Trade Registry Sync V1.1: ordem real enviada pela Central é registrada imediatamente no Trade Registry; posição real detectada é sincronizada e o estado pós-sync é recalculado.</p>
+    <p class="info">V1.6 / Signal ID Refresh: cada novo POST gera um signal_id novo; refresh/F5 via PRG apenas recarrega o resultado salvo.</p>
   </div>
 
-  <form method="post" class="card">
+  <form method="post" class="card" action="{esc(request.path)}">
     <h2>Trade</h2>
     <div class="grid">
       <div>
@@ -3948,6 +4008,11 @@ def execution_console_route():
       <div>
         <label>Risk %</label>
         <input name="risk_pct" value="{esc(payload.get('risk_pct'))}">
+      </div>
+      <div>
+        <label>Signal ID atual</label>
+        <input value="{esc(payload.get('signal_id'))}" readonly>
+        <small>V1.6: este campo é apenas visual. Novo POST gera novo signal_id automaticamente.</small>
       </div>
       <div>
         <label>Confirmação para execução real</label>
