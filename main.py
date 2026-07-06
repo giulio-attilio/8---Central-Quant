@@ -5011,11 +5011,513 @@ def real_trade_lifecycle_monitor_v1_health():
         ],
     }
 
+
+
+# ==========================================================
+# REGISTRY PERSISTENCE V1 — SNAPSHOT / REBUILD / REAL-ORDER PREFLIGHT
+# ==========================================================
+# Objetivo:
+# - Impedir que deploy/restart deixe a Central sem memória de posição real aberta.
+# - Persistir snapshot do Trade Registry e do estado real da BingX.
+# - Reconstruir o Registry quando houver posição real protegida, mas o arquivo OPEN estiver vazio.
+# - Bloquear nova execução real quando existir posição real sem Registry confirmado.
+REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1"
+REGISTRY_PERSISTENCE_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_latest.json"
+REGISTRY_PERSISTENCE_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_events.jsonl"
+
+
+def _rp_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        return None
+
+
+def _rp_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "commit", "rebuild", "recover", "snapshot"}
+
+
+def _rp_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _rp_v1_norm_symbol(value):
+    try:
+        return _rtlm_v1_norm_symbol(value)
+    except Exception:
+        try:
+            return _pesc_v1_norm_symbol(value)
+        except Exception:
+            return str(value or "").upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _rp_v1_norm_side(value):
+    try:
+        return _rtlm_v1_norm_side(value)
+    except Exception:
+        try:
+            return _pesc_v1_norm_side(value)
+        except Exception:
+            s = str(value or "").upper().strip()
+            if s in {"SELL", "SHORT"}:
+                return "SHORT"
+            if s in {"BUY", "LONG"}:
+                return "LONG"
+            return s
+
+
+def _rp_v1_norm_bot(value):
+    try:
+        return _rtlm_v1_norm_bot(value)
+    except Exception:
+        try:
+            return normalize_registry_bot(value or "FALCON")
+        except Exception:
+            return str(value or "FALCON").upper().strip()
+
+
+def _rp_v1_data_dir_status():
+    data_dir = Path(str(CENTRAL_DATA_DIR))
+    env_configured = bool(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR"))
+    warning = None
+    path_s = str(data_dir)
+    if (not env_configured) and ("/opt/render/project/src" in path_s or path_s.endswith("/data")):
+        warning = "CENTRAL_DATA_DIR/DATA_DIR não parece apontar para disco persistente externo; em Render, arquivos dentro do projeto podem sumir em deploy/restart."
+    return {
+        "central_data_dir": path_s,
+        "central_data_dir_exists": data_dir.exists(),
+        "env_configured": env_configured,
+        "env_central_data_dir_set": bool(os.environ.get("CENTRAL_DATA_DIR")),
+        "env_data_dir_set": bool(os.environ.get("DATA_DIR")),
+        "storage_warning": warning,
+        "latest_snapshot_file": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE),
+        "events_file": str(REGISTRY_PERSISTENCE_V1_EVENTS_FILE),
+    }
+
+
+def _rp_v1_atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def _rp_v1_append_event(event):
+    try:
+        REGISTRY_PERSISTENCE_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(REGISTRY_PERSISTENCE_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _rp_v1_read_latest_snapshot():
+    try:
+        if not REGISTRY_PERSISTENCE_V1_LATEST_FILE.exists():
+            return {"ok": False, "status": "NO_LATEST_SNAPSHOT", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
+        payload = json.loads(REGISTRY_PERSISTENCE_V1_LATEST_FILE.read_text(encoding="utf-8"))
+        return {"ok": True, "status": "LOADED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE), "snapshot": payload}
+    except Exception as exc:
+        return {"ok": False, "status": "READ_ERROR", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE), "error": str(exc)}
+
+
+def _rp_v1_registry_snapshot_full():
+    snap = {}
+    raw_registry = None
+    try:
+        snap = central_trade_registry_snapshot(include_trades=True) if callable(globals().get("central_trade_registry_snapshot")) else {}
+    except Exception as exc:
+        snap = {"ok": False, "snapshot_error": str(exc)}
+    try:
+        if central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)):
+            raw_registry = central_trade_registry.load_registry()
+    except Exception as exc:
+        raw_registry = {"_load_error": str(exc)}
+    open_count = None
+    try:
+        open_count = len((raw_registry or {}).get("open_trades") or {}) if isinstance(raw_registry, dict) else None
+    except Exception:
+        pass
+    file_path = None
+    try:
+        file_path = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")) if central_trade_registry is not None else None
+    except Exception:
+        file_path = None
+    return {
+        "ok": bool(central_trade_registry is not None),
+        "trade_registry_loaded": central_trade_registry is not None,
+        "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR if "TRADE_REGISTRY_IMPORT_ERROR" in globals() else None,
+        "trade_registry_file": file_path,
+        "open_count": open_count,
+        "snapshot": snap,
+        "raw_registry": raw_registry,
+    }
+
+
+def _rp_v1_select_stop_from_orders_or_args(side, entry, protective_orders=None, request_sl=None, registry_trade=None):
+    side_n = _rp_v1_norm_side(side)
+    entry_f = _rp_v1_float(entry)
+    candidates = []
+    def add(source, value):
+        v = _rp_v1_float(value)
+        if v is None:
+            return
+        directionally_valid = False
+        invalid_reason = None
+        if entry_f is None:
+            directionally_valid = True
+        elif side_n == "SHORT":
+            directionally_valid = v > entry_f
+            invalid_reason = None if directionally_valid else "SHORT_STOP_MUST_BE_ABOVE_ENTRY"
+        elif side_n == "LONG":
+            directionally_valid = v < entry_f
+            invalid_reason = None if directionally_valid else "LONG_STOP_MUST_BE_BELOW_ENTRY"
+        else:
+            directionally_valid = True
+        candidates.append({"source": source, "stop": v, "directionally_valid": directionally_valid, "invalid_reason": invalid_reason})
+    add("request_sl", request_sl)
+    if isinstance(registry_trade, dict):
+        add("registry_sl", registry_trade.get("sl") or registry_trade.get("stop"))
+    for idx, order in enumerate(protective_orders or []):
+        if not isinstance(order, dict):
+            continue
+        add(f"protective_order_{idx}:{order.get('source')}", order.get("stopPrice") or order.get("stopLossPrice") or order.get("triggerPrice") or order.get("price"))
+    selected = next((c for c in candidates if c.get("directionally_valid")), None)
+    return {"selected": selected, "candidates": candidates, "valid_count": len([c for c in candidates if c.get("directionally_valid")])}
+
+
+def _rp_v1_build_live_state(symbol=None, side=None, bot=None, setup=None):
+    symbol_n = _rp_v1_norm_symbol(symbol or "BTCUSDT")
+    side_n = _rp_v1_norm_side(side or "SHORT")
+    bot_n = _rp_v1_norm_bot(bot or "FALCON")
+    setup_n = str(setup or bot_n or "FALCON").upper().strip()
+    safety = build_post_execution_safety_check_v1(symbol=symbol_n, side=side_n, bot=bot_n, setup=setup_n)
+    direct_registry = _rtlm_v1_find_open_trades(symbol=symbol_n, side=side_n, bot=bot_n, setup=setup_n) if callable(globals().get("_rtlm_v1_find_open_trades")) else {"ok": False, "count": 0, "matches": []}
+    position = _rtlm_v1_first_position(safety) if callable(globals().get("_rtlm_v1_first_position")) else (((safety or {}).get("positions") or [None])[0] if (safety or {}).get("positions") else None)
+    protective_orders = _rtlm_v1_protective_summary(safety) if callable(globals().get("_rtlm_v1_protective_summary")) else ((safety or {}).get("protective_orders") or [])
+    registry_trade = _rtlm_v1_first_registry_trade(safety, direct_registry.get("matches")) if callable(globals().get("_rtlm_v1_first_registry_trade")) else None
+    position_found = bool((safety or {}).get("position_found"))
+    registry_match = bool((safety or {}).get("registry_match") or direct_registry.get("count", 0) > 0)
+    stop_confirmed = bool((safety or {}).get("stop_confirmed_by_central"))
+    return {
+        "ok": bool((not position_found) or (position_found and stop_confirmed and registry_match)),
+        "symbol": symbol_n,
+        "side": side_n,
+        "bot": bot_n,
+        "setup": setup_n,
+        "position_found": position_found,
+        "registry_match": registry_match,
+        "stop_confirmed_by_central": stop_confirmed,
+        "position": position or {},
+        "protective_orders_count": len(protective_orders),
+        "protective_orders": protective_orders,
+        "registry_trade": registry_trade or {},
+        "safety_status": (safety or {}).get("status"),
+        "safety_check": {
+            "ok": (safety or {}).get("ok"),
+            "status": (safety or {}).get("status"),
+            "position_count": (safety or {}).get("position_count"),
+            "open_orders_checked": (safety or {}).get("open_orders_checked"),
+            "open_orders_count": (safety or {}).get("open_orders_count"),
+            "protective_orders_count": (safety or {}).get("protective_orders_count"),
+            "trade_registry_count": (((safety or {}).get("trade_registry") or {}).get("count")),
+        },
+        "direct_registry": direct_registry,
+    }
+
+
+def _rp_v1_make_rebuild_candidate(live_state, sl=None, tp50=None, source="registry_persistence_v1"):
+    position = (live_state or {}).get("position") if isinstance(live_state, dict) else {}
+    position = position if isinstance(position, dict) else {}
+    registry_trade = (live_state or {}).get("registry_trade") if isinstance((live_state or {}), dict) else {}
+    registry_trade = registry_trade if isinstance(registry_trade, dict) else {}
+    entry = _rp_v1_float(position.get("entryPrice") or registry_trade.get("entry"))
+    stop_ref = _rp_v1_select_stop_from_orders_or_args(
+        (live_state or {}).get("side"),
+        entry,
+        protective_orders=(live_state or {}).get("protective_orders") or [],
+        request_sl=sl,
+        registry_trade=registry_trade,
+    )
+    selected_stop = (stop_ref.get("selected") or {}).get("stop")
+    # Resolve TP50 com a mesma regra do lifecycle; se não resolver, fica null.
+    tp50_payload = None
+    try:
+        tp50_payload = _rtlm_v1_tp50_status(position, registry_trade, side=(live_state or {}).get("side"), request_tp50=tp50, request_sl=selected_stop, protective_orders=(live_state or {}).get("protective_orders") or [], tp50_r_multiple=None)
+    except Exception as exc:
+        tp50_payload = {"resolved": False, "error": str(exc)}
+    resolved_tp50 = tp50_payload.get("tp50") if isinstance(tp50_payload, dict) and tp50_payload.get("resolved") else None
+    return {
+        "bot": (live_state or {}).get("bot") or "FALCON",
+        "setup": (live_state or {}).get("setup") or (live_state or {}).get("bot") or "FALCON",
+        "symbol": (live_state or {}).get("symbol") or position.get("symbol"),
+        "side": (live_state or {}).get("side") or position.get("side"),
+        "entry": entry,
+        "sl": selected_stop,
+        "tp50": resolved_tp50,
+        "qty": position.get("contracts"),
+        "source": source,
+        "metadata": {
+            "sync_version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "sync_reason": "REGISTRY_MISSING_AFTER_DEPLOY_OR_RESTART",
+            "rebuilt_at": _rp_v1_now(),
+            "broker_position_id": position.get("id"),
+            "broker_entry_price": position.get("entryPrice"),
+            "broker_contracts": position.get("contracts"),
+            "broker_notional": position.get("notional"),
+            "broker_unrealized_pnl": position.get("unrealizedPnl"),
+            "stop_reference": stop_ref,
+            "tp50_resolver": tp50_payload,
+        },
+    }
+
+
+def registry_persistence_v1_rebuild_from_broker(symbol=None, side=None, bot=None, setup=None, commit=False, ack=None, sl=None, tp50=None):
+    live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
+    if not live_state.get("position_found"):
+        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "NO_OPEN_POSITION_TO_REBUILD", "committed": False, "live_state": live_state}
+    if live_state.get("registry_match"):
+        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "REGISTRY_ALREADY_HAS_OPEN_MATCH", "committed": False, "live_state": live_state}
+    if not live_state.get("stop_confirmed_by_central"):
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "POSITION_FOUND_BUT_STOP_NOT_CONFIRMED", "committed": False, "live_state": live_state}
+    if str(ack or "").strip() != "CENTRAL_MANAGED_EXISTING_POSITION":
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "ACK_REQUIRED", "required_ack": "CENTRAL_MANAGED_EXISTING_POSITION", "committed": False, "live_state": live_state}
+    candidate = _rp_v1_make_rebuild_candidate(live_state, sl=sl, tp50=tp50, source="registry_persistence_v1_rebuild")
+    if not commit:
+        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "DRY_RUN_REBUILD_CANDIDATE", "committed": False, "candidate": candidate, "live_state": live_state}
+    try:
+        if callable(globals().get("trade_registry_sync_v1_register_candidate")):
+            res = trade_registry_sync_v1_register_candidate(candidate, commit=True)
+        else:
+            res = {"ok": False, "status": "REGISTER_FUNCTION_MISSING", "committed": False}
+    except Exception as exc:
+        res = {"ok": False, "status": "REGISTER_ERROR", "committed": False, "error": str(exc)}
+    rebuilt_live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
+    event = {"event": "REGISTRY_PERSISTENCE_REBUILD", "generated_at": _rp_v1_now(), "result": res, "candidate": candidate, "post_rebuild_registry_match": rebuilt_live_state.get("registry_match")}
+    _rp_v1_append_event(event)
+    return {
+        "ok": bool((res or {}).get("ok") and rebuilt_live_state.get("registry_match")),
+        "version": REGISTRY_PERSISTENCE_V1_VERSION,
+        "status": "REGISTRY_REBUILT_FROM_BROKER" if rebuilt_live_state.get("registry_match") else "REBUILD_ATTEMPTED_BUT_NOT_CONFIRMED",
+        "committed": bool((res or {}).get("committed")),
+        "register_result": res,
+        "candidate": candidate,
+        "live_state_before": live_state,
+        "live_state_after": rebuilt_live_state,
+    }
+
+
+def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=None, commit=False, source="manual"):
+    live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
+    registry_state = _rp_v1_registry_snapshot_full()
+    payload = {
+        "ok": True,
+        "version": REGISTRY_PERSISTENCE_V1_VERSION,
+        "generated_at": _rp_v1_now(),
+        "source": source,
+        "data_dir_status": _rp_v1_data_dir_status(),
+        "live_state": live_state,
+        "registry_state": registry_state,
+        "summary": {
+            "position_found": live_state.get("position_found"),
+            "registry_match": live_state.get("registry_match"),
+            "stop_confirmed_by_central": live_state.get("stop_confirmed_by_central"),
+            "open_count": registry_state.get("open_count"),
+        },
+    }
+    save_result = {"attempted": False, "committed": False, "status": "COMMIT_NOT_REQUESTED"}
+    if commit:
+        try:
+            _rp_v1_atomic_write_json(REGISTRY_PERSISTENCE_V1_LATEST_FILE, payload)
+            _rp_v1_append_event({"event": "REGISTRY_PERSISTENCE_SNAPSHOT", "generated_at": _rp_v1_now(), "summary": payload.get("summary"), "source": source})
+            save_result = {"attempted": True, "committed": True, "status": "SNAPSHOT_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
+        except Exception as exc:
+            save_result = {"attempted": True, "committed": False, "status": "SNAPSHOT_SAVE_ERROR", "error": str(exc), "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
+    payload["snapshot_save"] = save_result
+    return payload
+
+
+def registry_persistence_v1_restore_from_latest_snapshot(commit=False, ack=None):
+    latest = _rp_v1_read_latest_snapshot()
+    if not latest.get("ok"):
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": latest.get("status"), "latest": latest, "committed": False}
+    if str(ack or "").strip() != "RESTORE_REGISTRY_FROM_SNAPSHOT":
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "ACK_REQUIRED", "required_ack": "RESTORE_REGISTRY_FROM_SNAPSHOT", "committed": False, "latest": {"path": latest.get("path")}}
+    snapshot = latest.get("snapshot") or {}
+    raw_registry = (((snapshot.get("registry_state") or {}).get("raw_registry")) if isinstance(snapshot, dict) else None)
+    if not isinstance(raw_registry, dict):
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "SNAPSHOT_HAS_NO_RAW_REGISTRY", "committed": False}
+    open_trades = raw_registry.get("open_trades")
+    if not open_trades:
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "SNAPSHOT_HAS_NO_OPEN_TRADES", "committed": False}
+    if not commit:
+        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "DRY_RUN_RESTORE_AVAILABLE", "committed": False, "open_count": len(open_trades) if isinstance(open_trades, dict) else None}
+    if central_trade_registry is None or not callable(getattr(central_trade_registry, "save_registry", None)):
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "TRADE_REGISTRY_UNAVAILABLE", "committed": False}
+    try:
+        raw_registry["restored_by"] = REGISTRY_PERSISTENCE_V1_VERSION
+        raw_registry["restored_at"] = _rp_v1_now()
+        central_trade_registry.save_registry(raw_registry)
+        _rp_v1_append_event({"event": "REGISTRY_PERSISTENCE_RESTORE", "generated_at": _rp_v1_now(), "open_count": len(open_trades) if isinstance(open_trades, dict) else None})
+        return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "REGISTRY_RESTORED_FROM_SNAPSHOT", "committed": True, "open_count": len(open_trades) if isinstance(open_trades, dict) else None}
+    except Exception as exc:
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "RESTORE_SAVE_ERROR", "committed": False, "error": str(exc)}
+
+
+def registry_persistence_v1_gate_check(current_payload=None):
+    current_payload = current_payload if isinstance(current_payload, dict) else {}
+    symbol = current_payload.get("symbol") or "BTCUSDT"
+    side = current_payload.get("side") or "SHORT"
+    bot = current_payload.get("bot") or "FALCON"
+    setup = current_payload.get("setup") or bot
+    try:
+        live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
+        position_found = bool(live_state.get("position_found"))
+        ok = bool((not position_found) or (live_state.get("registry_match") and live_state.get("stop_confirmed_by_central")))
+        if not position_found:
+            status = "NO_EXISTING_POSITION_FOR_THIS_TRADE"
+        elif ok:
+            status = "EXISTING_POSITION_REGISTRY_PERSISTENCE_OK"
+        else:
+            status = "EXISTING_POSITION_REQUIRES_REGISTRY_PERSISTENCE_REPAIR"
+        return {
+            "ok": ok,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": status,
+            "position_found": position_found,
+            "registry_match": live_state.get("registry_match"),
+            "stop_confirmed_by_central": live_state.get("stop_confirmed_by_central"),
+            "safety_status": live_state.get("safety_status"),
+            "open_position_id": ((live_state.get("position") or {}).get("id")),
+            "data_dir_status": _rp_v1_data_dir_status(),
+        }
+    except Exception as exc:
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "REGISTRY_PERSISTENCE_GATE_ERROR", "error": str(exc)}
+
+
+# Wrapper: adiciona snapshot/persistência ao Lifecycle sem alterar a rota pública.
+_rtlm_v13_original_build_real_trade_lifecycle_monitor_v1 = build_real_trade_lifecycle_monitor_v1
+
+
+def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setup=None):
+    lifecycle = _rtlm_v13_original_build_real_trade_lifecycle_monitor_v1(symbol=symbol, side=side, bot=bot, setup=setup)
+    try:
+        commit_snapshot = False
+        rebuild_requested = False
+        restore_requested = False
+        ack = None
+        sl = None
+        tp50 = None
+        try:
+            commit_snapshot = _rp_v1_bool(request.args.get("persist_registry") or request.args.get("persist") or request.args.get("commit"), False)
+            rebuild_requested = _rp_v1_bool(request.args.get("registry_persistence_rebuild") or request.args.get("rebuild_registry") or request.args.get("repair_registry"), False)
+            restore_requested = _rp_v1_bool(request.args.get("restore_registry") or request.args.get("restore_from_snapshot"), False)
+            ack = request.args.get("registry_persistence_ack") or request.args.get("ack")
+            sl = request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss")
+            tp50 = request.args.get("tp50")
+        except Exception:
+            pass
+        persistence = registry_persistence_v1_snapshot(symbol=symbol, side=side, bot=bot, setup=setup, commit=commit_snapshot, source="lifecycle_monitor")
+        # Se o lifecycle detectou posição protegida mas Registry ausente, permite rebuild explícito no mesmo fluxo.
+        if rebuild_requested and isinstance(lifecycle, dict) and lifecycle.get("position_found") and lifecycle.get("stop_confirmed_by_central") and not lifecycle.get("registry_match"):
+            persistence["rebuild"] = registry_persistence_v1_rebuild_from_broker(symbol=symbol, side=side, bot=bot, setup=setup, commit=True, ack=ack, sl=sl, tp50=tp50)
+        if restore_requested:
+            persistence["restore"] = registry_persistence_v1_restore_from_latest_snapshot(commit=True, ack=ack)
+        lifecycle["registry_persistence_v1"] = {
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "snapshot_save": persistence.get("snapshot_save"),
+            "data_dir_status": persistence.get("data_dir_status"),
+            "summary": persistence.get("summary"),
+            "rebuild": persistence.get("rebuild"),
+            "restore": persistence.get("restore"),
+        }
+    except Exception as exc:
+        if isinstance(lifecycle, dict):
+            lifecycle["registry_persistence_v1"] = {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "WRAPPER_ERROR", "error": str(exc)}
+    return lifecycle
+
+
+@app.route("/registrypersistence", methods=["GET"])
+@app.route("/registrypersistencev1", methods=["GET"])
+@app.route("/registry/persistence", methods=["GET"])
+def registry_persistence_v1_route():
+    symbol = request.args.get("symbol") or "BTCUSDT"
+    side = request.args.get("side") or "SHORT"
+    bot = request.args.get("bot") or "FALCON"
+    setup = request.args.get("setup") or bot
+    commit = _rp_v1_bool(request.args.get("commit") or request.args.get("persist"), False)
+    rebuild = _rp_v1_bool(request.args.get("rebuild") or request.args.get("repair_registry") or request.args.get("rebuild_registry"), False)
+    restore = _rp_v1_bool(request.args.get("restore") or request.args.get("restore_registry") or request.args.get("restore_from_snapshot"), False)
+    ack = request.args.get("ack") or request.args.get("registry_persistence_ack")
+    sl = request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss")
+    tp50 = request.args.get("tp50")
+    payload = registry_persistence_v1_snapshot(symbol=symbol, side=side, bot=bot, setup=setup, commit=commit, source="route")
+    if rebuild:
+        payload["rebuild"] = registry_persistence_v1_rebuild_from_broker(symbol=symbol, side=side, bot=bot, setup=setup, commit=commit, ack=ack, sl=sl, tp50=tp50)
+    if restore:
+        payload["restore"] = registry_persistence_v1_restore_from_latest_snapshot(commit=commit, ack=ack)
+    payload["routes"] = [
+        "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON",
+        "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+        "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&rebuild=true&commit=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=66750.9",
+        "/registrypersistence?restore=true&commit=true&ack=RESTORE_REGISTRY_FROM_SNAPSHOT",
+    ]
+    return payload
+
+
+@app.route("/registrypersistence/health", methods=["GET"])
+@app.route("/registrypersistencev1/health", methods=["GET"])
+def registry_persistence_v1_health_route():
+    latest = _rp_v1_read_latest_snapshot()
+    registry_state = _rp_v1_registry_snapshot_full()
+    return {
+        "ok": True,
+        "version": REGISTRY_PERSISTENCE_V1_VERSION,
+        "module": "registry_persistence_v1",
+        "data_dir_status": _rp_v1_data_dir_status(),
+        "registry_state": {
+            "loaded": registry_state.get("trade_registry_loaded"),
+            "file": registry_state.get("trade_registry_file"),
+            "open_count": registry_state.get("open_count"),
+            "import_error": registry_state.get("trade_registry_import_error"),
+        },
+        "latest_snapshot": {
+            "ok": latest.get("ok"),
+            "status": latest.get("status"),
+            "path": latest.get("path"),
+            "generated_at": ((latest.get("snapshot") or {}).get("generated_at") if isinstance(latest.get("snapshot"), dict) else None),
+            "summary": ((latest.get("snapshot") or {}).get("summary") if isinstance(latest.get("snapshot"), dict) else None),
+        },
+        "notes": [
+            "Registry Persistence V1 salva snapshot do Registry e do estado real da BingX.",
+            "Se houver posição real protegida e Registry vazio após deploy/restart, use rebuild com ack explícito.",
+            "O Final Gate consulta esta camada e bloqueia nova execução real se houver posição existente sem Registry confirmado.",
+            "Para persistência real entre deploys no Render, CENTRAL_DATA_DIR ou DATA_DIR deve apontar para um disco persistente.",
+        ],
+        "routes": [
+            "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+            "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&rebuild=true&commit=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=66750.9",
+            "/registrypersistence?restore=true&commit=true&ack=RESTORE_REGISTRY_FROM_SNAPSHOT",
+            "/registrypersistence/health",
+        ],
+    }
+
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.12 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1.
+    EXECUTION CONSOLE V1.13 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -5034,6 +5536,7 @@ def execution_console_route():
     - Real Execution Final Gate V1: antes do botão vermelho chamar o Engine em dry_run=False,
       valida checklist final de autorização, piloto, limites, posição, IDs e stop.
     - Post-Execution Safety Check V1.1: após envio real, consulta posição, ordens de proteção/stop e Trade Registry.
+    - Registry Persistence V1: persiste snapshot/rebuild do Registry e bloqueia nova execução real se houver posição existente sem Registry confirmado.
     """
     import urllib.parse
 
@@ -5428,6 +5931,15 @@ def execution_console_route():
             blocking=True,
         )
 
+        registry_persistence_gate = registry_persistence_v1_gate_check(current_payload) if callable(globals().get("registry_persistence_v1_gate_check")) else {"ok": False, "status": "REGISTRY_PERSISTENCE_FUNCTION_MISSING"}
+        add(
+            "REGISTRY_PERSISTENCE_READY",
+            "Registry Persistence pronto para posição existente",
+            bool(registry_persistence_gate.get("ok")),
+            registry_persistence_gate,
+            blocking=True,
+        )
+
         bot = str(current_payload.get("bot") or "").upper().strip()
         symbol = _normalize_console_symbol(current_payload.get("symbol"))
         allowed_bots = [str(x).upper().strip() for x in (config.get("allowed_bots") or [])]
@@ -5527,6 +6039,7 @@ def execution_console_route():
                 "real_guard_allowed": real_guard_allowed,
                 "broker_ready": broker_available and broker_ready,
                 "positions_checked": positions_checked,
+                "registry_persistence_ok": bool(registry_persistence_gate.get("ok")),
                 "bot_allowed": bot_allowed,
                 "symbol_allowed": symbol_allowed,
                 "risk_ok": risk_ok,
@@ -5648,6 +6161,11 @@ def execution_console_route():
             "enabled": True,
             "mode": "diagnostic_on_preview_blocking_on_execute",
             "rule": "Botão vermelho só chama run_execution_engine dry_run=False se o checklist final retornar ok=true.",
+        },
+        "execution_console_registry_persistence_v1": {
+            "enabled": True,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "rule": "Nova execução real é bloqueada se houver posição real existente sem Registry confirmado/persistido.",
         },
         "execution_console_v1_6": {
             "signal_id_refresh": True,
@@ -6042,7 +6560,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.11.1.1</title>
+  <title>Central Quant — Execution Console V1.13</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -6112,7 +6630,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.11.1.1</h1>
+  <h1>Central Quant — Execution Console V1.13</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -6236,6 +6754,7 @@ def execution_console_route():
     <p><a style="color:#93c5fd" href="/traderegistrysyncv1/health" target="_blank">/traderegistrysyncv1/health</a></p>
     <p><a style="color:#93c5fd" href="/postexecutionsafety?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT" target="_blank">/postexecutionsafety BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/realtradelifecycle/BTCUSDT/SHORT?bot=FALCON&setup=FALCON" target="_blank">/realtradelifecycle BTC SHORT</a></p>
+    <p><a style="color:#93c5fd" href="/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/registrypersistence BTC SHORT persist snapshot</a></p>
     <p><a style="color:#93c5fd" href="/lifecyclemonitor/BTCUSDT/SHORT?bot=FALCON&setup=FALCON&commit=true" target="_blank">/lifecyclemonitor BTC SHORT commit snapshot</a></p>
     <p><a style="color:#93c5fd" href="/positioncheck/BTCUSDT/SHORT" target="_blank">/positioncheck/BTCUSDT/SHORT</a></p>
     <p><a style="color:#93c5fd" href="/executionverify/BTCUSDT/SHORT" target="_blank">/executionverify/BTCUSDT/SHORT</a></p>
