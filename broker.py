@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6-HEDGE-MODE-SUPPORT
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6.1-PREVIEW-ISOLATION
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -19,6 +19,7 @@
 # - Arredonda campos exibidos para evitar floats como 59.138999999999996.
 # - Adiciona Execution Audit Log V1 para registrar previews, bloqueios, erros e ordens reais.
 # - Adiciona Hedge Mode Support V2.6: envia positionSide=LONG/SHORT quando habilitado.
+# - V2.6.1 Preview Isolation: qualquer VERIFY/DRY_RUN retorna antes de create_order().
 # - Adiciona campos de apresentação para VERIFY:
 #   margin_usdt_display, leverage_display, planned_exposure_usdt_display,
 #   actual_exposure_usdt_display, estimated_margin_after_open_usdt_display,
@@ -360,6 +361,15 @@ def exchange():
     return _exchange
 
 
+
+def is_real_live_send_enabled() -> bool:
+    """
+    Única condição autorizada para chamar create_order().
+    Se qualquer uma das três travas estiver diferente, o broker deve retornar preview.
+    """
+    return EXECUTION_MODE == "LIVE" and ENABLE_REAL_TRADING is True and BROKER_DRY_RUN is False
+
+
 def status_payload(check_ready: bool = False):
     payload = {
         "ok": True,
@@ -381,6 +391,8 @@ def status_payload(check_ready: bool = False):
         "default_effective_notional_usdt": DEFAULT_REAL_MARGIN_USDT * DEFAULT_REAL_LEVERAGE,
         "timeout_ms": BINGX_TIMEOUT_MS,
         "execution_audit_log_file": EXECUTION_AUDIT_LOG_FILE,
+        "preview_isolation_version": "2026-07-06-BROKER-V2.6.1",
+        "live_send_enabled": is_real_live_send_enabled(),
     }
     if check_ready:
         payload["ready"] = ready_check()
@@ -839,8 +851,13 @@ def place_market_order(
     free_balance_usdt=None,
 ):
     """
-    Envia ordem market apenas se LIVE + ENABLE_REAL_TRADING=true + BROKER_DRY_RUN=false.
-    Caso contrário, retorna DRY_RUN/PREVIEW sem enviar nada.
+    Broker V2.6.1 — Preview Isolation.
+
+    Regra de ouro:
+    - VERIFY, PAPER, READY, BROKER_DRY_RUN=true ou ENABLE_REAL_TRADING=false:
+      monta preview, assinatura e constraints, mas retorna ANTES de create_order().
+    - create_order() só pode ser chamado quando:
+      EXECUTION_MODE=LIVE + ENABLE_REAL_TRADING=true + BROKER_DRY_RUN=false.
     """
     started = time.perf_counter()
     sym = normalize_symbol(symbol)
@@ -852,7 +869,7 @@ def place_market_order(
     planned_exposure = float(notional_usdt) if notional_usdt is not None else cfg["effective_notional_usdt"]
 
     if margin <= 0 or planned_exposure <= 0:
-        return {
+        result = {
             "ok": False,
             "status": "REJECTED",
             "sent": False,
@@ -862,108 +879,12 @@ def place_market_order(
             "leverage": lev,
             "notional_usdt": planned_exposure,
         }
-
-    # PAPER/READY/VERIFY nunca enviam ordem real.
-    if EXECUTION_MODE != "LIVE" or not ENABLE_REAL_TRADING or BROKER_DRY_RUN:
-        try:
-            preview = build_order_preview(
-                sym,
-                side,
-                margin_usdt=margin,
-                reduce_only=reduce_only,
-                client_tag=client_tag,
-                leverage=lev,
-                bot=bot,
-                notional_usdt=planned_exposure,
-                risk_pct=risk_pct,
-                free_balance_usdt=free_balance_usdt,
-            )
-            preview.update({
-                "status": "DRY_RUN" if EXECUTION_MODE != "VERIFY" else "VERIFY",
-                "sent": False,
-                "reason": "EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
-            })
-            log_execution_event({
-                "event": "place_market_order",
-                "mode": EXECUTION_MODE,
-                "status": preview.get("status"),
-                "sent": False,
-                "symbol": preview.get("symbol"),
-                "side": preview.get("side"),
-                "position_side": preview.get("position_side"),
-                "margin_usdt": preview.get("margin_usdt"),
-                "leverage": preview.get("leverage"),
-                "notional_usdt": preview.get("notional_usdt"),
-                "planned_exposure_usdt": preview.get("planned_exposure_usdt"),
-                "actual_exposure_usdt": preview.get("actual_exposure_usdt"),
-                "amount": preview.get("amount"),
-                "price_ref": preview.get("price_ref"),
-                "client_order_id": preview.get("client_order_id"),
-                "latency_ms": preview.get("latency_ms"),
-                "payload": preview.get("payload"),
-                "precision": preview.get("precision"),
-                "market_id": preview.get("market_id"),
-                "market_symbol": preview.get("market_symbol"),
-                "effective_notional_usdt": preview.get("effective_notional_usdt"),
-                "signature_ok": preview.get("signature_ok"),
-                "risk_pct": preview.get("risk_pct"),
-                "estimated_max_loss_usdt": preview.get("estimated_max_loss_usdt"),
-            })
-            log_execution_audit_event({
-                "event": "BROKER_DRY_RUN_OR_VERIFY",
-                "status": preview.get("status"),
-                "sent": False,
-                "symbol": preview.get("symbol"),
-                "side": preview.get("side"),
-                "position_side": preview.get("position_side"),
-                "margin_usdt": preview.get("margin_usdt"),
-                "leverage": preview.get("leverage"),
-                "notional_usdt": preview.get("notional_usdt"),
-                "planned_exposure_usdt": preview.get("planned_exposure_usdt"),
-                "actual_exposure_usdt": preview.get("actual_exposure_usdt"),
-                "amount": preview.get("amount"),
-                "price_ref": preview.get("price_ref"),
-                "client_order_id": preview.get("client_order_id"),
-                "constraints_ok": preview.get("constraints_ok"),
-                "constraint_reasons": preview.get("constraint_reasons"),
-                "signature_ok": preview.get("signature_ok"),
-                "risk_pct": preview.get("risk_pct"),
-                "estimated_max_loss_usdt": preview.get("estimated_max_loss_usdt"),
-                "payload": preview.get("payload"),
-            })
-            return preview
-        except Exception as exc:
-            result = {
-                "ok": False,
-                "status": "DRY_RUN_ERROR",
-                "sent": False,
-                "symbol": sym,
-                "side": order_side,
-                "margin_usdt": margin,
-                "leverage": lev,
-                "notional_usdt": planned_exposure,
-                "error": str(exc),
-                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-                "reason": "falha ao montar prévia dry-run",
-            }
-            log_execution_event({"event": "place_market_order", **result})
-            log_execution_audit_event({"event": "BROKER_DRY_RUN_ERROR", **result})
-            return result
-
-    ready = ready_check(cache_seconds=0)
-    if not ready.get("ok"):
-        result = {
-            "ok": False,
-            "status": "NOT_READY",
-            "sent": False,
-            "symbol": sym,
-            "error": ready.get("error"),
-            "ready": ready,
-        }
-        log_execution_event({"event": "place_market_order", **result})
-        log_execution_audit_event({"event": "BROKER_PREVIEW_ERROR", **result})
+        log_execution_audit_event({"event": "BROKER_REJECTED_INVALID_SIZE", **result})
         return result
 
+    live_send_enabled = is_real_live_send_enabled()
+
+    # SEMPRE monta preview antes, tanto para validação quanto para a ordem real.
     try:
         preview = build_order_preview(
             sym,
@@ -977,8 +898,6 @@ def place_market_order(
             risk_pct=risk_pct,
             free_balance_usdt=free_balance_usdt,
         )
-        amount = preview["amount"]
-        price = preview["price_ref"]
     except Exception as exc:
         result = {
             "ok": False,
@@ -986,7 +905,6 @@ def place_market_order(
             "sent": False,
             "symbol": sym,
             "side": order_side,
-            "position_side": position_side if "position_side" in locals() else bingx_position_side(side),
             "margin_usdt": margin,
             "leverage": lev,
             "notional_usdt": planned_exposure,
@@ -994,7 +912,136 @@ def place_market_order(
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         }
         log_execution_event({"event": "place_market_order", **result})
+        log_execution_audit_event({"event": "BROKER_PREVIEW_ERROR", **result})
         return result
+
+    # Se constraints existirem e falharem, nunca envia.
+    if preview.get("constraints_ok") is False:
+        result = dict(preview)
+        result.update({
+            "ok": False,
+            "status": "CONSTRAINTS_BLOCKED",
+            "sent": False,
+            "reason": "Exchange constraints bloquearam a ordem antes do envio.",
+            "preview_isolation": True,
+            "live_send_enabled": live_send_enabled,
+        })
+        log_execution_event({
+            "event": "place_market_order",
+            "mode": EXECUTION_MODE,
+            "status": result.get("status"),
+            "sent": False,
+            "symbol": result.get("symbol"),
+            "side": result.get("side"),
+            "position_side": result.get("position_side"),
+            "margin_usdt": result.get("margin_usdt"),
+            "leverage": result.get("leverage"),
+            "notional_usdt": result.get("notional_usdt"),
+            "amount": result.get("amount"),
+            "price_ref": result.get("price_ref"),
+            "client_order_id": result.get("client_order_id"),
+            "constraint_reasons": result.get("constraint_reasons"),
+        })
+        log_execution_audit_event({
+            "event": "BROKER_CONSTRAINTS_BLOCKED",
+            "sent": False,
+            "symbol": result.get("symbol"),
+            "side": result.get("side"),
+            "position_side": result.get("position_side"),
+            "margin_usdt": result.get("margin_usdt"),
+            "leverage": result.get("leverage"),
+            "notional_usdt": result.get("notional_usdt"),
+            "amount": result.get("amount"),
+            "price_ref": result.get("price_ref"),
+            "client_order_id": result.get("client_order_id"),
+            "constraint_reasons": result.get("constraint_reasons"),
+            "preview_isolation": True,
+        })
+        return result
+
+    # PREVIEW ISOLATION: se não está 100% LIVE real, retorna aqui.
+    # NUNCA chama create_order() neste bloco.
+    if not live_send_enabled:
+        result = dict(preview)
+        result.update({
+            "ok": bool(preview.get("ok")),
+            "status": "VERIFY" if EXECUTION_MODE == "VERIFY" else "DRY_RUN",
+            "sent": False,
+            "reason": "PREVIEW_ISOLATION: EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
+            "preview_isolation": True,
+            "live_send_enabled": False,
+        })
+        log_execution_event({
+            "event": "place_market_order",
+            "mode": EXECUTION_MODE,
+            "status": result.get("status"),
+            "sent": False,
+            "symbol": result.get("symbol"),
+            "side": result.get("side"),
+            "position_side": result.get("position_side"),
+            "margin_usdt": result.get("margin_usdt"),
+            "leverage": result.get("leverage"),
+            "notional_usdt": result.get("notional_usdt"),
+            "planned_exposure_usdt": result.get("planned_exposure_usdt"),
+            "actual_exposure_usdt": result.get("actual_exposure_usdt"),
+            "amount": result.get("amount"),
+            "price_ref": result.get("price_ref"),
+            "client_order_id": result.get("client_order_id"),
+            "latency_ms": result.get("latency_ms"),
+            "payload": result.get("payload"),
+            "precision": result.get("precision"),
+            "market_id": result.get("market_id"),
+            "market_symbol": result.get("market_symbol"),
+            "effective_notional_usdt": result.get("effective_notional_usdt"),
+            "signature_ok": result.get("signature_ok"),
+            "risk_pct": result.get("risk_pct"),
+            "estimated_max_loss_usdt": result.get("estimated_max_loss_usdt"),
+            "preview_isolation": True,
+        })
+        log_execution_audit_event({
+            "event": "BROKER_PREVIEW_ISOLATED",
+            "status": result.get("status"),
+            "sent": False,
+            "symbol": result.get("symbol"),
+            "side": result.get("side"),
+            "position_side": result.get("position_side"),
+            "margin_usdt": result.get("margin_usdt"),
+            "leverage": result.get("leverage"),
+            "notional_usdt": result.get("notional_usdt"),
+            "planned_exposure_usdt": result.get("planned_exposure_usdt"),
+            "actual_exposure_usdt": result.get("actual_exposure_usdt"),
+            "amount": result.get("amount"),
+            "price_ref": result.get("price_ref"),
+            "client_order_id": result.get("client_order_id"),
+            "constraints_ok": result.get("constraints_ok"),
+            "signature_ok": result.get("signature_ok"),
+            "risk_pct": result.get("risk_pct"),
+            "estimated_max_loss_usdt": result.get("estimated_max_loss_usdt"),
+            "payload": result.get("payload"),
+            "preview_isolation": True,
+            "live_send_enabled": False,
+        })
+        return result
+
+    # A partir daqui é LIVE real autorizado.
+    ready = ready_check(cache_seconds=0)
+    if not ready.get("ok"):
+        result = {
+            "ok": False,
+            "status": "NOT_READY",
+            "sent": False,
+            "symbol": sym,
+            "error": ready.get("error"),
+            "ready": ready,
+            "preview_isolation": True,
+            "live_send_enabled": live_send_enabled,
+        }
+        log_execution_event({"event": "place_market_order", **result})
+        log_execution_audit_event({"event": "BROKER_NOT_READY", **result})
+        return result
+
+    amount = preview["amount"]
+    price = preview["price_ref"]
 
     params = {}
     if reduce_only:
@@ -1014,7 +1061,11 @@ def place_market_order(
         except Exception as exc:
             margin_set = {"ok": False, "error": str(exc)}
         try:
-            leverage_set = ex.set_leverage(lev, sym)
+            # BingX Hedge Mode exige side no set_leverage.
+            if position_side:
+                leverage_set = ex.set_leverage(lev, sym, {"side": position_side})
+            else:
+                leverage_set = ex.set_leverage(lev, sym)
         except Exception as exc:
             leverage_set = {"ok": False, "error": str(exc)}
 
@@ -1032,6 +1083,9 @@ def place_market_order(
             "bingx_symbol": bingx_api_symbol(sym),
             "side": order_side,
             "api_side": bingx_api_side(side),
+            "position_side": position_side,
+            "hedge_mode_enabled": BINGX_HEDGE_MODE_ENABLED,
+            "position_mode": BINGX_POSITION_MODE,
             "margin_usdt": margin,
             "leverage": lev,
             "notional_usdt": preview.get("notional_usdt"),
@@ -1044,11 +1098,14 @@ def place_market_order(
             "client_tag": client_tag,
             "client_order_id": preview.get("client_order_id"),
             "preview": preview,
+            "preview_isolation": True,
+            "live_send_enabled": True,
             "margin_set": margin_set,
             "leverage_set": leverage_set,
             "raw": order,
         }
         log_execution_event({"event": "place_market_order", **{k: v for k, v in result.items() if k != "raw"}})
+        log_execution_audit_event({"event": "BROKER_LIVE_SENT", **{k: v for k, v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
         result = {
@@ -1058,19 +1115,21 @@ def place_market_order(
             "symbol": sym,
             "bingx_symbol": bingx_api_symbol(sym),
             "side": order_side,
-            "position_side": position_side if "position_side" in locals() else bingx_position_side(side),
+            "position_side": position_side,
             "margin_usdt": margin,
             "leverage": lev,
             "notional_usdt": planned_exposure,
             "amount": preview.get("amount") if isinstance(preview, dict) else None,
             "price_ref": preview.get("price_ref") if isinstance(preview, dict) else None,
             "preview": preview if isinstance(preview, dict) else None,
+            "preview_isolation": True,
+            "live_send_enabled": True,
             "error": str(exc),
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         }
         log_execution_event({"event": "place_market_order", **result})
+        log_execution_audit_event({"event": "BROKER_LIVE_ERROR", **result})
         return result
-
 
 def close_position_market(symbol, side, amount=None, notional_usdt=None):
     """Fechamento simples. side deve ser lado da posição: LONG fecha vendendo; SHORT fecha comprando."""
