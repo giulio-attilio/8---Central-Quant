@@ -3309,7 +3309,7 @@ def trade_registry_sync_v1_health_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.6 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh.
+    EXECUTION CONSOLE V1.7 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3323,6 +3323,8 @@ def execution_console_route():
       quando a execução pode aumentar/conviver com uma posição já aberta pela Central.
     - V1.6: gera novo signal_id para cada novo POST/intenção operacional,
       preservando o mesmo ID apenas no GET pós-redirect PRG.
+    - Broker Client Order ID V1: separa o signal_id interno da Central do
+      client_order_id curto enviado ao broker/BingX.
     """
     import urllib.parse
 
@@ -3429,6 +3431,42 @@ def execution_console_route():
             return f"EXECUTION-CONSOLE-V1.6-{bot_part}-{setup_part}-{symbol_part}-{side_part}-{epoch_part}-{nonce}"
         except Exception:
             return f"EXECUTION-CONSOLE-V1.6-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}"
+
+    def _new_broker_client_order_id(bot=None, symbol=None, side=None):
+        """
+        Broker Client Order ID V1.
+
+        O signal_id da Central pode ser longo e rico em contexto. A BingX/broker,
+        porém, pode truncar IDs longos. Este ID é curto, único e seguro para ser
+        usado como client_order_id/clientOrderID na corretora, sem substituir o
+        signal_id interno da Central.
+        """
+        try:
+            bot_raw = re.sub(r"[^A-Z0-9]+", "", str(bot or "BOT").upper())
+            symbol_raw = _normalize_console_symbol(symbol or "SYMBOL")
+            side_norm = _normalize_console_side(side or "SIDE")
+
+            bot_map = {
+                "FALCON": "FAL", "DONKEY": "DON", "TRENDPRO": "TRD",
+                "COBRA": "COB", "MEME": "MEM", "PREDATOR": "PRD",
+                "TURTLE": "TUR", "SMARTPREDATOR": "PRD", "SMART_PREDATOR": "PRD",
+            }
+            bot_part = bot_map.get(bot_raw, (bot_raw[:3] or "BOT"))
+
+            symbol_part = symbol_raw
+            for suffix in ("USDT", "USDC", "USD"):
+                if symbol_part.endswith(suffix) and len(symbol_part) > len(suffix):
+                    symbol_part = symbol_part[:-len(suffix)]
+                    break
+            symbol_part = re.sub(r"[^A-Z0-9]+", "", symbol_part.upper())[:6] or "SYM"
+
+            side_part = "S" if side_norm == "SHORT" else ("L" if side_norm == "LONG" else side_norm[:1] or "X")
+            epoch_part = str(int(time.time()))[-6:]
+            nonce = uuid.uuid4().hex[:6].upper()
+            client_id = f"CQ-{bot_part}-{symbol_part}-{side_part}-{epoch_part}-{nonce}"
+            return client_id[:32]
+        except Exception:
+            return f"CQ-BOT-SYM-X-{str(int(time.time()))[-6:]}-{uuid.uuid4().hex[:6].upper()}"[:32]
 
     def _extract_broker_positions_from_result(engine_result):
         try:
@@ -3592,6 +3630,19 @@ def execution_console_route():
         signal_id_source = "GET_OR_PRG_PRESERVED"
         signal_id_refreshed = False
 
+    # Broker Client Order ID V1
+    # POST novo: gera client_order_id curto e único para o broker/BingX.
+    # GET pós-redirect: preserva o ID salvo no resultado, apenas para exibição.
+    if request.method == "POST":
+        broker_client_order_id_value = _new_broker_client_order_id(bot_value, symbol_value, side_value)
+        broker_client_order_id_source = "POST_GENERATED_BROKER_CLIENT_ORDER_ID_V1"
+    else:
+        broker_client_order_id_value = _field(
+            "broker_client_order_id",
+            _field("client_order_id", _new_broker_client_order_id(bot_value, symbol_value, side_value)),
+        )
+        broker_client_order_id_source = "GET_OR_PRG_PRESERVED"
+
     payload = {
         "decision": "ALLOW",
         "bot": bot_value,
@@ -3603,7 +3654,21 @@ def execution_console_route():
         "tp50": _field("tp50", "107000"),
         "risk_pct": _safe_float_field(_field("risk_pct", "2"), 2.0),
         "signal_id": signal_id_value,
+        # Broker Client Order ID V1: ID curto para a corretora.
+        # Mantemos o signal_id completo como verdade interna da Central.
+        "client_order_id": broker_client_order_id_value,
+        "broker_client_order_id": broker_client_order_id_value,
+        "clientOrderID": broker_client_order_id_value,
+        "clientOrderId": broker_client_order_id_value,
+        "client_tag": broker_client_order_id_value,
         "existing_position_ack": _field("existing_position_ack", ""),
+        "execution_console_broker_client_order_id_v1": {
+            "enabled": True,
+            "broker_client_order_id": broker_client_order_id_value,
+            "client_order_id_source": broker_client_order_id_source,
+            "max_length": 32,
+            "rule": "signal_id interno continua completo; client_order_id curto é enviado ao broker/BingX.",
+        },
         "execution_console_v1_6": {
             "signal_id_refresh": True,
             "signal_id_source": signal_id_source,
@@ -3834,6 +3899,8 @@ def execution_console_route():
             "tp50": payload.get("tp50"),
             "risk_pct": payload.get("risk_pct"),
             "signal_id": payload.get("signal_id"),
+            "client_order_id": payload.get("client_order_id"),
+            "broker_client_order_id": payload.get("broker_client_order_id"),
             "existing_position_ack": payload.get("existing_position_ack"),
         }
         location = request.path + "?" + urllib.parse.urlencode(query, doseq=False)
@@ -3848,6 +3915,15 @@ def execution_console_route():
     if live_result is None and isinstance(result, dict):
         live_result = result.get("live_result")
     live_result = live_result if isinstance(live_result, dict) else {}
+    live_preview = live_result.get("preview") if isinstance(live_result.get("preview"), dict) else {}
+    broker_reported_client_order_id = (
+        live_result.get("client_order_id")
+        or live_preview.get("client_order_id")
+        or live_preview.get("client_tag")
+        or live_preview.get("clientOrderID")
+        or live_preview.get("clientOrderId")
+    )
+    expected_broker_client_order_id = payload.get("broker_client_order_id") or payload.get("client_order_id")
 
     existing_position_state = None
     if isinstance(result, dict):
@@ -3864,7 +3940,10 @@ def execution_console_route():
         "status": result_payload.get("status") if isinstance(result_payload, dict) else (result.get("status") if isinstance(result, dict) else None),
         "sent": live_result.get("sent"),
         "order_id": live_result.get("order_id") or live_result.get("id"),
-        "client_order_id": live_result.get("client_order_id"),
+        "client_order_id": broker_reported_client_order_id,
+        "broker_client_order_id_expected": expected_broker_client_order_id,
+        "broker_client_order_id_source": (payload.get("execution_console_broker_client_order_id_v1") or {}).get("client_order_id_source") if isinstance(payload.get("execution_console_broker_client_order_id_v1"), dict) else None,
+        "broker_client_order_id_matches_expected": (str(broker_reported_client_order_id) == str(expected_broker_client_order_id)) if broker_reported_client_order_id and expected_broker_client_order_id else None,
         "live_status": live_result.get("status"),
         "broker_error": live_result.get("error"),
         "confirmation_guard": (live_result.get("confirmation_guard") or {}).get("status") if isinstance(live_result.get("confirmation_guard"), dict) else None,
@@ -3890,7 +3969,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.6</title>
+  <title>Central Quant — Execution Console V1.7</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3960,7 +4039,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.6</h1>
+  <h1>Central Quant — Execution Console V1.7</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -3969,6 +4048,7 @@ def execution_console_route():
     <p class="info">V1.4: a tela mostra posição real existente e exige reconhecimento explícito quando necessário.</p>
     <p class="info">V1.5.1 / Trade Registry Sync V1.1: ordem real enviada pela Central é registrada imediatamente no Trade Registry; posição real detectada é sincronizada e o estado pós-sync é recalculado.</p>
     <p class="info">V1.6 / Signal ID Refresh: cada novo POST gera um signal_id novo; refresh/F5 via PRG apenas recarrega o resultado salvo.</p>
+    <p class="info">Broker Client Order ID V1: a Central mantém um signal_id completo e envia ao broker/BingX um client_order_id curto e único.</p>
   </div>
 
   <form method="post" class="card" action="{esc(request.path)}">
@@ -4013,6 +4093,11 @@ def execution_console_route():
         <label>Signal ID atual</label>
         <input value="{esc(payload.get('signal_id'))}" readonly>
         <small>V1.6: este campo é apenas visual. Novo POST gera novo signal_id automaticamente.</small>
+      </div>
+      <div>
+        <label>Broker Client Order ID</label>
+        <input value="{esc(payload.get('broker_client_order_id') or payload.get('client_order_id'))}" readonly>
+        <small>Broker Client Order ID V1: ID curto enviado à corretora; não substitui o signal_id interno.</small>
       </div>
       <div>
         <label>Confirmação para execução real</label>
