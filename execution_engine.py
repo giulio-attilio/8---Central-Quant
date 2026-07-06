@@ -1,6 +1,6 @@
 # execution_engine.py
-# CENTRAL QUANT — EXECUTION ENGINE V2.5
-# Versão: 2026-07-05-EXECUTION-ENGINE-V2.5-REAL-TRADING-PILOT-GUARD
+# CENTRAL QUANT — EXECUTION ENGINE V2.5.3
+# Versão: 2026-07-05-EXECUTION-ENGINE-V2.5.3-EXECUTION-PREVIEW-GUARD
 #
 # Objetivo:
 # - Ser o ponto único de decisão antes de qualquer execução.
@@ -9,7 +9,7 @@
 # - Permitir piloto LIVE/REAL apenas com travas rígidas:
 #   * CENTRAL_REAL_EXECUTION_ENABLED=true
 #   * CENTRAL_REAL_PILOT_ENABLED=true
-#   * dry_run=false
+#   * dry_run=false para envio real; dry_run=true permitido apenas para preview seguro
 #   * robô permitido
 #   * símbolo permitido
 #   * margem dentro do máximo
@@ -58,7 +58,7 @@ else:
     BROKER_IMPORT_ERROR = None
 
 
-VERSION = "2026-07-05-EXECUTION-ENGINE-V2.5-REAL-TRADING-PILOT-GUARD"
+VERSION = "2026-07-05-EXECUTION-ENGINE-V2.5.3-EXECUTION-PREVIEW-GUARD"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -300,8 +300,9 @@ def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry
         reasons.append("CENTRAL_REAL_EXECUTION_ENABLED=false")
     if not REAL_PILOT_ENABLED:
         reasons.append("CENTRAL_REAL_PILOT_ENABLED=false")
-    if dry_run:
-        reasons.append("dry_run=true; piloto real exige dry_run=false")
+    preview_mode = bool(dry_run)
+    if preview_mode:
+        warnings.append("dry_run=true; modo preview: broker pode montar VERIFY/DRY_RUN, mas não deve enviar ordem real")
 
     if decision in {"DENY", "BLOCK", "BLOCKED", "REJECT", "REJECTED"}:
         reasons.append(f"decision={decision}")
@@ -375,7 +376,7 @@ def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry
     return {
         "ok": len(reasons) == 0,
         "allowed": len(reasons) == 0,
-        "status": "REAL_PILOT_ALLOWED" if len(reasons) == 0 else "REAL_PILOT_BLOCKED",
+        "status": ("REAL_PILOT_PREVIEW_ALLOWED" if dry_run and len(reasons) == 0 else ("REAL_PILOT_ALLOWED" if len(reasons) == 0 else "REAL_PILOT_BLOCKED")),
         "version": VERSION,
         "generated_at": _now_br(),
         "reasons": reasons,
@@ -383,6 +384,7 @@ def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry
         "config": {
             "real_execution_enabled": REAL_EXECUTION_ENABLED,
             "real_pilot_enabled": REAL_PILOT_ENABLED,
+            "preview_mode": preview_mode,
             "allowed_bots": sorted(REAL_PILOT_ALLOWED_BOTS),
             "allowed_symbols": sorted(REAL_PILOT_ALLOWED_SYMBOLS),
             "max_margin_usdt": REAL_PILOT_MAX_MARGIN_USDT,
@@ -468,10 +470,10 @@ def execution_engine_health() -> Dict[str, Any]:
             "execution_engine_log": str(EXECUTION_ENGINE_LOG_FILE),
         },
         "notes": [
-            "Execution Engine V2.5 é o ponto único antes de qualquer executor.",
+            "Execution Engine V2.5.3 é o ponto único antes de qualquer executor.",
             "Modo OBSERVATION_ONLY cria plano e loga.",
             "Modo PAPER chama Paper Executor integrado quando habilitado.",
-            "Modo LIVE só chama broker.py se Real Pilot Guard aprovar.",
+            "Modo LIVE chama broker.py em preview seguro quando dry_run=true e em envio real apenas se Real Pilot Guard aprovar.",
             "Em caso de dúvida, bloqueia.",
         ],
     }
@@ -574,9 +576,23 @@ def run_execution_engine(
                 risk_pct=risk_pct,
             )
             result_extra_live = live_result
-            engine_ok = bool(live_result.get("ok") and live_result.get("sent"))
-            engine_status = "LIVE_SENT" if engine_ok else live_result.get("status", "LIVE_RESULT")
-            executor_route = "LIVE_BROKER"
+
+            if dry_run:
+                # Preview seguro: broker.py deve retornar VERIFY/DRY_RUN com sent=False.
+                # Isto valida assinatura, quantidade, margem, alavancagem e ready-check
+                # sem mandar ordem real para a BingX.
+                sent = bool(live_result.get("sent"))
+                engine_ok = bool(live_result.get("ok") and not sent)
+                engine_status = "LIVE_PREVIEW_OK" if engine_ok else live_result.get("status", "LIVE_PREVIEW_RESULT")
+                executor_route = "LIVE_BROKER_PREVIEW"
+                if sent:
+                    engine_ok = False
+                    engine_status = "SAFETY_VIOLATION_PREVIEW_SENT_ORDER"
+                    plan.setdefault("errors", []).append("dry_run=true, mas broker retornou sent=true")
+            else:
+                engine_ok = bool(live_result.get("ok") and live_result.get("sent"))
+                engine_status = "LIVE_SENT" if engine_ok else live_result.get("status", "LIVE_RESULT")
+                executor_route = "LIVE_BROKER"
 
     result = {
         "ok": engine_ok,
@@ -597,8 +613,8 @@ def run_execution_engine(
         "paper_executor_called": result_extra_paper is not None,
         "live_broker_called": result_extra_live is not None,
         "notes": [
-            "Execution Engine V2.5 recebeu o payload e delegou validação ao Orchestrator.",
-            "LIVE só é enviado se o Real Pilot Guard aprovar.",
+            "Execution Engine V2.5.3 recebeu o payload e delegou validação ao Orchestrator.",
+            "LIVE com dry_run=true faz preview seguro; LIVE real só envia se o Real Pilot Guard e o broker aprovarem.",
             "O broker.py mantém uma segunda camada de kill switch.",
         ],
     }
@@ -630,7 +646,7 @@ def execution_engine_test() -> Dict[str, Any]:
         "risk_pct": 2.0,
         "capital_allocated": 4500,
         "requested_qty": 0.1,
-        "signal_id": "EXECUTION-ENGINE-V2.5-TEST-FALCON-ETHUSDT-LONG",
+        "signal_id": "EXECUTION-ENGINE-V2.5.3-TEST-FALCON-ETHUSDT-LONG",
     }
     return run_execution_engine(payload=payload, mode="OBSERVATION_ONLY", dry_run=True)
 
@@ -654,7 +670,7 @@ def execution_engine_real_pilot_test(dry_run: bool = True) -> Dict[str, Any]:
         "risk_pct": min(2.0, REAL_PILOT_MAX_RISK_PCT),
         "margin_usdt": min(5.0, REAL_PILOT_MAX_MARGIN_USDT),
         "leverage": min(1, REAL_PILOT_MAX_LEVERAGE),
-        "signal_id": "EXECUTION-ENGINE-V2.5-REAL-PILOT-TEST-FALCON-ETHUSDT-LONG",
+        "signal_id": "EXECUTION-ENGINE-V2.5.3-REAL-PILOT-TEST-FALCON-ETHUSDT-LONG",
     }
     return run_execution_engine(payload=payload, mode="LIVE", dry_run=dry_run)
 
