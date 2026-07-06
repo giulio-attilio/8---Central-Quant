@@ -7688,7 +7688,7 @@ def registry_mode_segregation_v1_health_route():
 # A lógica principal do botão vermelho continua dentro do Execution Console;
 # esta rota serve para auditoria rápida antes de novo teste real.
 # ============================================================================
-EXECUTION_FINAL_GATE_ROUTE_V1_VERSION = "2026-07-06-EXECUTION-FINAL-GATE-ROUTE-V1"
+EXECUTION_FINAL_GATE_ROUTE_V1_VERSION = "2026-07-06-EXECUTION-FINAL-GATE-ROUTE-V1.2-AUTH-TOKEN-PASS-THROUGH"
 
 
 def _efg_v1_norm_symbol(value):
@@ -7750,6 +7750,80 @@ def _efg_v1_token_present():
     except Exception:
         pass
     return False, None
+
+
+def _efg_v1_get_auth_token_value():
+    """
+    Execution Final Gate Route V1.2.
+    Retorna o token apenas para pass-through interno ao Engine.
+    Nunca deve ser devolvido em resposta HTTP.
+    """
+    token_keys = [
+        "EXECUTION_AUTH_TOKEN",
+        "CENTRAL_EXECUTION_AUTH_TOKEN",
+        "REAL_EXECUTION_AUTH_TOKEN",
+        "EXECUTION_LIVE_AUTH_TOKEN",
+        "BINGX_EXECUTION_AUTH_TOKEN",
+    ]
+    for key in token_keys:
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value, key
+    try:
+        value = str(request.headers.get("X-Execution-Auth-Token") or "").strip()
+        if value:
+            return value, "X-Execution-Auth-Token"
+    except Exception:
+        pass
+    return "", None
+
+
+def _efg_v1_is_sensitive_key(key):
+    k = str(key or "").lower()
+    return (
+        "token" in k
+        or "secret" in k
+        or "apikey" in k
+        or "api_key" in k
+        or "x-bx-apikey" in k
+        or "signature" in k
+    )
+
+
+def _efg_v1_sanitize_public(obj):
+    """Remove/mascara segredos antes de devolver JSON público."""
+    if isinstance(obj, dict):
+        clean = {}
+        for key, value in obj.items():
+            if _efg_v1_is_sensitive_key(key):
+                clean[key] = "***MASKED***" if value not in (None, "", False) else value
+            else:
+                clean[key] = _efg_v1_sanitize_public(value)
+        return clean
+    if isinstance(obj, list):
+        return [_efg_v1_sanitize_public(item) for item in obj]
+    return obj
+
+
+def _efg_v1_payload_with_auth_token(payload):
+    """
+    Cria cópia do payload para dry-run interno com token de autorização.
+    A cópia sanitizada é a única que pode aparecer em resposta pública.
+    """
+    base = dict(payload or {})
+    token_value, token_source = _efg_v1_get_auth_token_value()
+    if token_value:
+        # Compatibilidade com nomes possíveis no Engine/broker.
+        base["execution_auth_token"] = token_value
+        base["auth_token"] = token_value
+        base["live_execution_auth_token"] = token_value
+        base["execution_token"] = token_value
+        base["broker_execution_auth_token"] = token_value
+        base["_auth_token_source"] = token_source
+        base["_auth_token_passed_to_engine"] = True
+    else:
+        base["_auth_token_passed_to_engine"] = False
+    return base
 
 
 def _efg_v1_arg(name, default=""):
@@ -7929,17 +8003,30 @@ def build_execution_final_gate_route_v1(preflight=False):
     preflight_result = None
     if preflight:
         try:
-            preflight_result = run_execution_engine(payload=payload, mode="LIVE", dry_run=True)
+            engine_payload = _efg_v1_payload_with_auth_token(payload)
+            preflight_result_raw = run_execution_engine(payload=engine_payload, mode="LIVE", dry_run=True)
+            preflight_result = _efg_v1_sanitize_public(preflight_result_raw)
             live_result = ((preflight_result or {}).get("payload") or {}).get("live_result") if isinstance(preflight_result, dict) else {}
+            live_result = live_result if isinstance(live_result, dict) else {}
+            auth_status = ((live_result.get("auth") or {}).get("status") if isinstance(live_result.get("auth"), dict) else None)
+            live_status = live_result.get("status")
+            live_sent = bool(live_result.get("sent"))
+            auth_passed = bool(engine_payload.get("_auth_token_passed_to_engine"))
+            auth_not_denied = auth_status not in ("MISSING_EXECUTION_AUTH_TOKEN", "EXECUTION_AUTH_DENIED") and live_status != "EXECUTION_AUTH_DENIED"
+            dry_run_ok = isinstance(preflight_result_raw, dict) and (not live_sent) and auth_passed and auth_not_denied
             add(
                 "DRY_RUN_PREFLIGHT",
-                "run_execution_engine LIVE dry_run=True respondeu sem enviar ordem real",
-                isinstance(preflight_result, dict) and not bool((live_result or {}).get("sent")),
+                "run_execution_engine LIVE dry_run=True recebeu token internamente e não enviou ordem real",
+                dry_run_ok,
                 {
                     "result_ok": (preflight_result or {}).get("ok") if isinstance(preflight_result, dict) else None,
                     "status": (preflight_result or {}).get("status") if isinstance(preflight_result, dict) else None,
-                    "live_sent": bool((live_result or {}).get("sent")) if isinstance(live_result, dict) else None,
-                    "preview_isolation": (live_result or {}).get("preview_isolation") if isinstance(live_result, dict) else None,
+                    "live_status": live_status,
+                    "auth_status": auth_status,
+                    "auth_token_passed_to_engine": auth_passed,
+                    "token_value_exposed": False,
+                    "live_sent": live_sent,
+                    "preview_isolation": live_result.get("preview_isolation"),
                 },
                 blocking=True,
             )
@@ -7980,7 +8067,7 @@ def build_execution_final_gate_route_v1(preflight=False):
         ],
         "notes": [
             "Esta rota não envia ordem real.",
-            "/executionfinalgate roda diagnóstico com preflight dry_run=True.",
+            "/executionfinalgate roda diagnóstico com preflight dry_run=True e pass-through seguro do token para o Engine.",
             "/executionfinalgate/health checa apenas os gates críticos sem chamar o Engine.",
             "A execução real continua restrita ao Execution Console/botão vermelho com confirmação explícita.",
         ],
