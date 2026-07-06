@@ -95,6 +95,7 @@ REAL_PILOT_ALLOW_REDUCE_ONLY = os.getenv("REAL_PILOT_ALLOW_REDUCE_ONLY", "true")
 # Default conservador: 1 posição real por vez. Se não conseguir consultar posições, bloqueia quando require_ready=true.
 REAL_PILOT_MAX_OPEN_POSITIONS = int(os.getenv("REAL_PILOT_MAX_OPEN_POSITIONS", "1"))
 REAL_PILOT_BLOCK_IF_POSITIONS_UNKNOWN = os.getenv("REAL_PILOT_BLOCK_IF_POSITIONS_UNKNOWN", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+REAL_PILOT_IGNORE_EXISTING_POSITIONS = os.getenv("REAL_PILOT_IGNORE_EXISTING_POSITIONS","false").strip().lower() in {"1","true","yes","sim","on"}
 
 
 def _now_br() -> str:
@@ -370,8 +371,10 @@ def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry
                 reasons.append(f"não foi possível consultar posições reais: {positions_payload.get('error') if isinstance(positions_payload, dict) else positions_payload}")
             else:
                 warnings.append("posições reais não consultadas; seguindo porque REAL_PILOT_BLOCK_IF_POSITIONS_UNKNOWN=false")
-        elif positions_count >= REAL_PILOT_MAX_OPEN_POSITIONS:
+        elif (not REAL_PILOT_IGNORE_EXISTING_POSITIONS) and positions_count >= REAL_PILOT_MAX_OPEN_POSITIONS:
             reasons.append(f"limite de posições reais atingido: {positions_count}/{REAL_PILOT_MAX_OPEN_POSITIONS}")
+        elif REAL_PILOT_IGNORE_EXISTING_POSITIONS and positions_count >= REAL_PILOT_MAX_OPEN_POSITIONS:
+            warnings.append("Posições reais existentes ignoradas pelo piloto (REAL_PILOT_IGNORE_EXISTING_POSITIONS=true).")
 
     return {
         "ok": len(reasons) == 0,
@@ -396,6 +399,7 @@ def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry
             "require_entry": REAL_PILOT_REQUIRE_ENTRY,
             "require_stop": REAL_PILOT_REQUIRE_STOP,
             "block_if_positions_unknown": REAL_PILOT_BLOCK_IF_POSITIONS_UNKNOWN,
+            "ignore_existing_positions": REAL_PILOT_IGNORE_EXISTING_POSITIONS,
         },
         "trade": {
             "bot": bot,
