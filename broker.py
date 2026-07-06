@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6.2a-EXECUTION-AUTH-TOKEN-SIGNATURE-FIX
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7-DISASTER-STOP-MANAGER
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -21,6 +21,7 @@
 # - Adiciona Hedge Mode Support V2.6: envia positionSide=LONG/SHORT quando habilitado.
 # - V2.6.1 Preview Isolation: qualquer VERIFY/DRY_RUN retorna antes de create_order().
 # - V2.6.2 Execution Authorization Token: envio real exige token curto gerado pelo Execution Engine.
+# - V2.7 Disaster Stop Manager: após MARKET real preenchida, cria stop de desastre na BingX.
 # - Adiciona campos de apresentação para VERIFY:
 #   margin_usdt_display, leverage_display, planned_exposure_usdt_display,
 #   actual_exposure_usdt_display, estimated_margin_after_open_usdt_display,
@@ -99,6 +100,13 @@ BINGX_HEDGE_MODE_ENABLED = env_bool("BINGX_HEDGE_MODE_ENABLED", BINGX_POSITION_M
 EXECUTION_AUTH_TOKEN_ENABLED = env_bool("EXECUTION_AUTH_TOKEN_ENABLED", True)
 EXECUTION_AUTH_TOKEN_TTL_SECONDS = int(os.environ.get("EXECUTION_AUTH_TOKEN_TTL_SECONDS", "30"))
 _EXECUTION_AUTH_TOKENS = {}
+
+# Disaster Stop Manager V2.7
+DISASTER_STOP_ENABLED = env_bool("DISASTER_STOP_ENABLED", True)
+DISASTER_STOP_REQUIRE_FOR_LIVE = env_bool("DISASTER_STOP_REQUIRE_FOR_LIVE", True)
+DISASTER_STOP_WORKING_TYPE = os.environ.get("DISASTER_STOP_WORKING_TYPE", "MARK_PRICE").strip().upper()
+DISASTER_STOP_PRICE_BUFFER_PCT = float(os.environ.get("DISASTER_STOP_PRICE_BUFFER_PCT", "0"))
+DISASTER_STOP_CLIENT_SUFFIX = os.environ.get("DISASTER_STOP_CLIENT_SUFFIX", "-DS")
 
 # Endpoint usado apenas para prévia/assinatura no VERIFY.
 # O envio real continua usando ccxt.create_order(), pois é mais seguro e padronizado.
@@ -474,6 +482,10 @@ def status_payload(check_ready: bool = False):
         "execution_auth_token_enabled": EXECUTION_AUTH_TOKEN_ENABLED,
         "execution_auth_token_ttl_seconds": EXECUTION_AUTH_TOKEN_TTL_SECONDS,
         "active_execution_auth_tokens": len(_EXECUTION_AUTH_TOKENS),
+        "disaster_stop_enabled": DISASTER_STOP_ENABLED,
+        "disaster_stop_require_for_live": DISASTER_STOP_REQUIRE_FOR_LIVE,
+        "disaster_stop_working_type": DISASTER_STOP_WORKING_TYPE,
+        "disaster_stop_price_buffer_pct": DISASTER_STOP_PRICE_BUFFER_PCT,
     }
     if check_ready:
         payload["ready"] = ready_check()
@@ -710,6 +722,7 @@ def build_order_preview(
     risk_pct=None,
     free_balance_usdt=None,
     execution_auth_token=None,
+    stop_loss_price=None,
 ):
     """
     Monta a prévia completa de uma ordem market.
@@ -919,6 +932,125 @@ def format_order_preview_text(preview: dict, title: str = "🧪 VERIFY BINGX") -
 # ==============================================================================
 # ORDER EXECUTION
 # ============================================================================
+
+
+def _safe_float_broker(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.replace(",", ".").replace("%", "").strip()
+            if not value:
+                return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def validate_disaster_stop_price(side: str, entry_price, stop_price):
+    s = str(side or "").upper().strip()
+    entry = _safe_float_broker(entry_price)
+    stop = _safe_float_broker(stop_price)
+
+    if stop is None or stop <= 0:
+        return {"ok": False, "reason": "stop_loss_price ausente ou inválido", "entry": entry, "stop": stop}
+
+    if entry is not None and entry > 0:
+        if s in {"LONG", "BUY"} and stop >= entry:
+            return {"ok": False, "reason": f"stop inválido para LONG: stop={stop} >= entry={entry}", "entry": entry, "stop": stop}
+        if s in {"SHORT", "SELL"} and stop <= entry:
+            return {"ok": False, "reason": f"stop inválido para SHORT: stop={stop} <= entry={entry}", "entry": entry, "stop": stop}
+
+    return {"ok": True, "reason": "stop válido", "entry": entry, "stop": stop}
+
+
+def _apply_disaster_stop_buffer(side: str, stop_price: float) -> float:
+    stop = float(stop_price)
+    pct = float(DISASTER_STOP_PRICE_BUFFER_PCT or 0)
+    if pct <= 0:
+        return stop
+    s = str(side or "").upper().strip()
+    if s in {"LONG", "BUY"}:
+        return stop * (1 - pct / 100.0)
+    if s in {"SHORT", "SELL"}:
+        return stop * (1 + pct / 100.0)
+    return stop
+
+
+def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag=None, entry_price=None):
+    """
+    Cria stop de desastre na BingX após abertura real.
+    A posição aberta é fechada no sentido oposto:
+    LONG -> SELL stop; SHORT -> BUY stop.
+    """
+    if not DISASTER_STOP_ENABLED:
+        return {"ok": True, "enabled": False, "created": False, "status": "DISASTER_STOP_DISABLED"}
+
+    sym = normalize_symbol(symbol)
+    normalized = normalize_side(side)
+    position_side = bingx_position_side(side)
+
+    validation = validate_disaster_stop_price(side, entry_price, stop_loss_price)
+    if not validation.get("ok"):
+        return {"ok": False, "enabled": True, "created": False, "status": "DISASTER_STOP_INVALID", "reason": validation.get("reason"), "validation": validation}
+
+    stop_price = _apply_disaster_stop_buffer(side, float(stop_loss_price))
+    close_side = "sell" if normalized == "buy" else "buy"
+    client_order_id = (str(client_tag or f"CQ-{int(time.time())}")[:24] + DISASTER_STOP_CLIENT_SUFFIX)[:32]
+
+    params = {
+        "stopPrice": float(stop_price),
+        "reduceOnly": True,
+        "workingType": DISASTER_STOP_WORKING_TYPE,
+        "clientOrderId": client_order_id,
+    }
+    if position_side:
+        params["positionSide"] = position_side
+
+    ex = exchange()
+    try:
+        order = ex.create_order(sym, "stop_market", close_side, float(amount), None, params)
+        result = {
+            "ok": True,
+            "enabled": True,
+            "created": True,
+            "status": "DISASTER_STOP_CREATED",
+            "symbol": sym,
+            "side": close_side,
+            "position_side": position_side,
+            "amount": float(amount),
+            "stop_price": float(stop_price),
+            "original_stop_price": float(stop_loss_price),
+            "type": "stop_market",
+            "working_type": DISASTER_STOP_WORKING_TYPE,
+            "reduce_only": True,
+            "client_order_id": client_order_id,
+            "order_id": order.get("id"),
+            "raw": order,
+        }
+        log_execution_audit_event({"event": "BROKER_DISASTER_STOP_CREATED", **{k: v for k, v in result.items() if k != "raw"}})
+        return result
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "enabled": True,
+            "created": False,
+            "status": "DISASTER_STOP_ERROR",
+            "symbol": sym,
+            "side": close_side,
+            "position_side": position_side,
+            "amount": float(amount),
+            "stop_price": float(stop_price),
+            "original_stop_price": float(stop_loss_price),
+            "type": "stop_market",
+            "working_type": DISASTER_STOP_WORKING_TYPE,
+            "reduce_only": True,
+            "client_order_id": client_order_id,
+            "error": str(exc),
+        }
+        log_execution_audit_event({"event": "BROKER_DISASTER_STOP_ERROR", **result})
+        return result
+
 
 def place_market_order(
     symbol,
@@ -1134,6 +1266,7 @@ def place_market_order(
             "leverage": lev,
             "notional_usdt": planned_exposure,
             "preview": preview,
+            "disaster_stop": disaster_stop_result,
             "preview_isolation": True,
             "live_send_enabled": live_send_enabled,
             "auth": auth_payload,
@@ -1143,6 +1276,30 @@ def place_market_order(
         log_execution_event({"event": "place_market_order", **result})
         log_execution_audit_event({"event": "BROKER_EXECUTION_AUTH_DENIED", **result})
         return result
+
+    if DISASTER_STOP_ENABLED and DISASTER_STOP_REQUIRE_FOR_LIVE:
+        stop_validation = validate_disaster_stop_price(side, preview.get("price_ref") if isinstance(preview, dict) else None, stop_loss_price)
+        if not stop_validation.get("ok"):
+            result = {
+                "ok": False,
+                "status": "DISASTER_STOP_REQUIRED_BLOCKED",
+                "sent": False,
+                "symbol": sym,
+                "side": order_side,
+                "position_side": bingx_position_side(side),
+                "margin_usdt": margin,
+                "leverage": lev,
+                "notional_usdt": planned_exposure,
+                "preview": preview,
+                "preview_isolation": True,
+                "live_send_enabled": live_send_enabled,
+                "stop_validation": stop_validation,
+                "error": stop_validation.get("reason"),
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            }
+            log_execution_event({"event": "place_market_order", **result})
+            log_execution_audit_event({"event": "BROKER_DISASTER_STOP_REQUIRED_BLOCKED", **result})
+            return result
 
     ready = ready_check(cache_seconds=0)
     if not ready.get("ok"):
@@ -1190,6 +1347,49 @@ def place_market_order(
             leverage_set = {"ok": False, "error": str(exc)}
 
         order = ex.create_order(sym, "market", order_side, amount, None, params)
+
+        disaster_stop_result = None
+        if DISASTER_STOP_ENABLED:
+            disaster_stop_result = create_disaster_stop_order(
+                symbol=sym,
+                side=side,
+                amount=amount,
+                stop_loss_price=stop_loss_price,
+                client_tag=client_tag,
+                entry_price=preview.get("price_ref") if isinstance(preview, dict) else None,
+            )
+            if DISASTER_STOP_REQUIRE_FOR_LIVE and not (isinstance(disaster_stop_result, dict) and disaster_stop_result.get("ok")):
+                latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                result = {
+                    "ok": False,
+                    "status": "LIVE_SENT_BUT_DISASTER_STOP_FAILED",
+                    "sent": True,
+                    "requires_manual_attention": True,
+                    "ts": agora_sp_str(),
+                    "latency_ms": latency_ms,
+                    "id": order.get("id"),
+                    "order_id": order.get("id"),
+                    "symbol": sym,
+                    "bingx_symbol": bingx_api_symbol(sym),
+                    "side": order_side,
+                    "api_side": bingx_api_side(side),
+                    "position_side": position_side,
+                    "margin_usdt": margin,
+                    "leverage": lev,
+                    "notional_usdt": preview.get("notional_usdt"),
+                    "amount": amount,
+                    "price_ref": preview.get("price_ref") if isinstance(preview, dict) else None,
+                    "client_tag": client_tag,
+                    "client_order_id": preview.get("client_order_id") if isinstance(preview, dict) else None,
+                    "preview": preview,
+                    "disaster_stop": disaster_stop_result,
+                    "raw": order,
+                    "error": "Entrada enviada, mas stop de desastre falhou. Verifique/feche manualmente ou crie stop imediatamente.",
+                }
+                log_execution_event({"event": "place_market_order", **{k: v for k, v in result.items() if k != "raw"}})
+                log_execution_audit_event({"event": "BROKER_LIVE_SENT_BUT_DISASTER_STOP_FAILED", **{k: v for k, v in result.items() if k != "raw"}})
+                return result
+
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         result = {
             "ok": True,
@@ -1320,3 +1520,4 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
         log_execution_event({"event": "close_position_market", **result})
         log_execution_audit_event({"event": "BROKER_CLOSE_ERROR", **result})
         return result
+
