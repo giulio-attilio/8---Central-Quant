@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.2-CONFIRMATION-FIX
+# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.3-PREVIEW-AUTH-CLARITY
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -3071,7 +3071,23 @@ def execution_console_route():
                     mode="LIVE",
                     dry_run=True,
                 )
-                message = "Preview executado. Nenhuma ordem real foi enviada."
+
+                # V1.3: em preview, MISSING_EXECUTION_AUTH_TOKEN é esperado.
+                # O token só deve ser gerado em execução real dry_run=False.
+                try:
+                    live_result = (result.get("payload") or {}).get("live_result") if isinstance(result, dict) else {}
+                    auth_status = ((live_result or {}).get("auth") or {}).get("status")
+                    sent = bool((live_result or {}).get("sent"))
+                    preview_isolation = bool((live_result or {}).get("preview_isolation"))
+                    if auth_status == "MISSING_EXECUTION_AUTH_TOKEN" and not sent and preview_isolation:
+                        result["ok"] = True
+                        result.setdefault("payload", {})["ok"] = True
+                        result.setdefault("payload", {})["status"] = "LIVE_PREVIEW_OK_AUTH_SKIPPED"
+                        message = "Preview seguro executado. Token ausente é esperado em dry_run=true. Nenhuma ordem real foi enviada."
+                    else:
+                        message = "Preview executado. Nenhuma ordem real foi enviada."
+                except Exception:
+                    message = "Preview executado. Nenhuma ordem real foi enviada."
 
             # Execução real deliberada
             elif action == "execute":
@@ -3173,7 +3189,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.2</title>
+  <title>Central Quant — Execution Console V1.3</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3238,11 +3254,11 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.2</h1>
+  <h1>Central Quant — Execution Console V1.3</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
-    <p>Para preview, nenhuma ordem real é enviada.</p>
+    <p>Para preview, nenhuma ordem real é enviada. Em preview, <b>MISSING_EXECUTION_AUTH_TOKEN</b> é normal porque o token só existe em execução real.</p>
   </div>
 
   <form method="post" class="card">
