@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7-DISASTER-STOP-MANAGER
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7.1-DISASTER-STOP-SIGNATURE-FIX
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -1064,6 +1064,7 @@ def place_market_order(
     risk_pct=None,
     free_balance_usdt=None,
     execution_auth_token=None,
+    stop_loss_price=None,
 ):
     """
     Broker V2.6.1 — Preview Isolation.
