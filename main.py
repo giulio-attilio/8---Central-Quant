@@ -7688,7 +7688,7 @@ def registry_mode_segregation_v1_health_route():
 # A lógica principal do botão vermelho continua dentro do Execution Console;
 # esta rota serve para auditoria rápida antes de novo teste real.
 # ============================================================================
-EXECUTION_FINAL_GATE_ROUTE_V1_VERSION = "2026-07-06-EXECUTION-FINAL-GATE-ROUTE-V1.2-AUTH-TOKEN-PASS-THROUGH"
+EXECUTION_FINAL_GATE_ROUTE_V1_VERSION = "2026-07-06-EXECUTION-FINAL-GATE-ROUTE-V1.3-ENGINE-AUTH-ALIAS-INJECTION"
 
 
 def _efg_v1_norm_symbol(value):
@@ -7787,6 +7787,9 @@ def _efg_v1_is_sensitive_key(key):
         or "api_key" in k
         or "x-bx-apikey" in k
         or "signature" in k
+        or "authorization" in k
+        or "x-execution-auth" in k
+        or "execution-auth" in k
     )
 
 
@@ -7808,22 +7811,127 @@ def _efg_v1_sanitize_public(obj):
 def _efg_v1_payload_with_auth_token(payload):
     """
     Cria cópia do payload para dry-run interno com token de autorização.
+    V1.3 injeta aliases prováveis no payload e em metadados internos.
     A cópia sanitizada é a única que pode aparecer em resposta pública.
     """
     base = dict(payload or {})
     token_value, token_source = _efg_v1_get_auth_token_value()
     if token_value:
         # Compatibilidade com nomes possíveis no Engine/broker.
-        base["execution_auth_token"] = token_value
-        base["auth_token"] = token_value
-        base["live_execution_auth_token"] = token_value
-        base["execution_token"] = token_value
-        base["broker_execution_auth_token"] = token_value
+        aliases = {
+            "execution_auth_token": token_value,
+            "auth_token": token_value,
+            "EXECUTION_AUTH_TOKEN": token_value,
+            "central_execution_auth_token": token_value,
+            "CENTRAL_EXECUTION_AUTH_TOKEN": token_value,
+            "real_execution_auth_token": token_value,
+            "REAL_EXECUTION_AUTH_TOKEN": token_value,
+            "live_execution_auth_token": token_value,
+            "EXECUTION_LIVE_AUTH_TOKEN": token_value,
+            "execution_token": token_value,
+            "broker_execution_auth_token": token_value,
+            "BINGX_EXECUTION_AUTH_TOKEN": token_value,
+            "token": token_value,
+            "authorization_token": token_value,
+            "x_execution_auth_token": token_value,
+        }
+        base.update(aliases)
+        base.setdefault("auth", {}).update({
+            "execution_auth_token": token_value,
+            "auth_token": token_value,
+            "source": token_source,
+        })
+        base.setdefault("execution_auth", {}).update({
+            "execution_auth_token": token_value,
+            "auth_token": token_value,
+            "source": token_source,
+        })
         base["_auth_token_source"] = token_source
         base["_auth_token_passed_to_engine"] = True
+        base["_auth_alias_injection_version"] = EXECUTION_FINAL_GATE_ROUTE_V1_VERSION
     else:
         base["_auth_token_passed_to_engine"] = False
+        base["_auth_alias_injection_version"] = EXECUTION_FINAL_GATE_ROUTE_V1_VERSION
     return base
+
+
+def _efg_v1_engine_auth_alias_query(token_value):
+    """Aliases de query/header para engines que validam token via Flask request.values."""
+    if not token_value:
+        return {}
+    return {
+        "execution_auth_token": token_value,
+        "auth_token": token_value,
+        "EXECUTION_AUTH_TOKEN": token_value,
+        "central_execution_auth_token": token_value,
+        "CENTRAL_EXECUTION_AUTH_TOKEN": token_value,
+        "real_execution_auth_token": token_value,
+        "REAL_EXECUTION_AUTH_TOKEN": token_value,
+        "live_execution_auth_token": token_value,
+        "EXECUTION_LIVE_AUTH_TOKEN": token_value,
+        "broker_execution_auth_token": token_value,
+        "BINGX_EXECUTION_AUTH_TOKEN": token_value,
+        "execution_token": token_value,
+        "token": token_value,
+        "authorization_token": token_value,
+        "x_execution_auth_token": token_value,
+    }
+
+
+def _efg_v1_call_engine_dry_run_with_auth(engine_payload):
+    """
+    V1.3 — Engine Auth Alias Injection.
+
+    Alguns caminhos internos do Engine/Broker validam a autorização lendo
+    request.args/request.values, e não apenas payload. Esta função executa o
+    dry-run dentro de um request_context interno com aliases seguros do token.
+    Continua usando dry_run=True; portanto não envia ordem real.
+    """
+    token_value, token_source = _efg_v1_get_auth_token_value()
+    alias_query = _efg_v1_engine_auth_alias_query(token_value)
+    injection = {
+        "auth_token_present": bool(token_value),
+        "auth_token_source": token_source,
+        "auth_token_passed_to_engine": bool(token_value),
+        "payload_aliases_injected": bool(token_value),
+        "request_aliases_injected": bool(token_value),
+        "header_aliases_injected": bool(token_value),
+        "token_value_exposed": False,
+        "version": EXECUTION_FINAL_GATE_ROUTE_V1_VERSION,
+    }
+    if token_value and "app" in globals() and hasattr(app, "test_request_context"):
+        # Mantém apenas parâmetros públicos úteis no contexto interno; aliases sensíveis serão sanitizados na resposta.
+        query_string = dict(alias_query)
+        try:
+            query_string.update({
+                "symbol": str((engine_payload or {}).get("symbol") or ""),
+                "side": str((engine_payload or {}).get("side") or ""),
+                "bot": str((engine_payload or {}).get("bot") or ""),
+                "setup": str((engine_payload or {}).get("setup") or ""),
+                "entry": str((engine_payload or {}).get("entry") or ""),
+                "sl": str((engine_payload or {}).get("sl") or ""),
+                "tp50": str((engine_payload or {}).get("tp50") or ""),
+            })
+        except Exception:
+            pass
+        headers = {
+            "X-Execution-Auth-Token": token_value,
+            "X-Execution-Auth": token_value,
+            "Authorization": f"Bearer {token_value}",
+        }
+        with app.test_request_context(
+            "/executionfinalgate/_internal_dry_run",
+            method="GET",
+            query_string=query_string,
+            headers=headers,
+        ):
+            result = run_execution_engine(payload=engine_payload, mode="LIVE", dry_run=True)
+        injection["method"] = "flask_request_context_aliases"
+        return result, injection
+
+    injection["method"] = "payload_aliases_only"
+    result = run_execution_engine(payload=engine_payload, mode="LIVE", dry_run=True)
+    return result, injection
 
 
 def _efg_v1_arg(name, default=""):
@@ -8004,7 +8112,7 @@ def build_execution_final_gate_route_v1(preflight=False):
     if preflight:
         try:
             engine_payload = _efg_v1_payload_with_auth_token(payload)
-            preflight_result_raw = run_execution_engine(payload=engine_payload, mode="LIVE", dry_run=True)
+            preflight_result_raw, auth_injection = _efg_v1_call_engine_dry_run_with_auth(engine_payload)
             preflight_result = _efg_v1_sanitize_public(preflight_result_raw)
             live_result = ((preflight_result or {}).get("payload") or {}).get("live_result") if isinstance(preflight_result, dict) else {}
             live_result = live_result if isinstance(live_result, dict) else {}
@@ -8024,6 +8132,7 @@ def build_execution_final_gate_route_v1(preflight=False):
                     "live_status": live_status,
                     "auth_status": auth_status,
                     "auth_token_passed_to_engine": auth_passed,
+                    "auth_alias_injection": _efg_v1_sanitize_public(auth_injection),
                     "token_value_exposed": False,
                     "live_sent": live_sent,
                     "preview_isolation": live_result.get("preview_isolation"),
@@ -8067,7 +8176,7 @@ def build_execution_final_gate_route_v1(preflight=False):
         ],
         "notes": [
             "Esta rota não envia ordem real.",
-            "/executionfinalgate roda diagnóstico com preflight dry_run=True e pass-through seguro do token para o Engine.",
+            "/executionfinalgate roda diagnóstico com preflight dry_run=True e injeção segura de aliases do token para o Engine.",
             "/executionfinalgate/health checa apenas os gates críticos sem chamar o Engine.",
             "A execução real continua restrita ao Execution Console/botão vermelho com confirmação explícita.",
         ],
