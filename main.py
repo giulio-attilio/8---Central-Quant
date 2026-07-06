@@ -4251,11 +4251,480 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
         ],
     }
 
+
+
+
+# ==========================================================
+# REAL TRADE LIFECYCLE MONITOR V1 — REAL POSITION / REGISTRY LIFECYCLE
+# ==========================================================
+# Objetivo:
+# - Acompanhar trade real aberto após execução pela Central.
+# - Confirmar posição, stop, PnL, TP50 e match com Trade Registry.
+# - Atualizar snapshot operacional no Registry quando commit=true.
+# - Marcar CLOSED somente com posição ausente confirmada + ack explícito.
+REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1"
+
+
+def _rtlm_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "sim", "on", "commit"}
+
+
+def _rtlm_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _rtlm_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        return None
+
+
+def _rtlm_v1_norm_symbol(value):
+    try:
+        return _pesc_v1_norm_symbol(value)
+    except Exception:
+        return str(value or "").upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _rtlm_v1_norm_side(value):
+    try:
+        return _pesc_v1_norm_side(value)
+    except Exception:
+        s = str(value or "").upper().strip()
+        if s in {"SELL", "SHORT"}:
+            return "SHORT"
+        if s in {"BUY", "LONG"}:
+            return "LONG"
+        return s
+
+
+def _rtlm_v1_norm_bot(value):
+    try:
+        return normalize_registry_bot(value or "FALCON")
+    except Exception:
+        return str(value or "FALCON").upper().strip()
+
+
+def _rtlm_v1_trade_id(bot, setup, symbol, side):
+    return f"{_rtlm_v1_norm_bot(bot)}:{str(setup or bot or 'FALCON').upper().strip()}:{_rtlm_v1_norm_symbol(symbol)}:{_rtlm_v1_norm_side(side)}"
+
+
+def _rtlm_v1_registry_available():
+    return central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)) and callable(getattr(central_trade_registry, "save_registry", None))
+
+
+def _rtlm_v1_load_registry():
+    if not _rtlm_v1_registry_available():
+        return None
+    registry = central_trade_registry.load_registry()
+    return registry if isinstance(registry, dict) else {}
+
+
+def _rtlm_v1_registry_open_items(registry):
+    open_raw = registry.get("open_trades", {}) if isinstance(registry, dict) else {}
+    if isinstance(open_raw, dict):
+        return open_raw, list(open_raw.items())
+    if isinstance(open_raw, list):
+        return open_raw, [(str(t.get("trade_id") or i), t) for i, t in enumerate(open_raw) if isinstance(t, dict)]
+    return {}, []
+
+
+def _rtlm_v1_match_trade(trade, symbol=None, side=None, bot=None, setup=None):
+    if not isinstance(trade, dict):
+        return False
+    tsymbol = _rtlm_v1_norm_symbol(trade.get("symbol_clean") or trade.get("symbol") or trade.get("ativo") or trade.get("pair"))
+    tside = _rtlm_v1_norm_side(trade.get("side") or trade.get("direction"))
+    tbot = _rtlm_v1_norm_bot(trade.get("bot") or "")
+    tsetup = str(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label") or "").upper().strip()
+    symbol_n = _rtlm_v1_norm_symbol(symbol)
+    side_n = _rtlm_v1_norm_side(side)
+    bot_n = _rtlm_v1_norm_bot(bot or "") if bot else None
+    setup_n = str(setup or "").upper().strip() if setup else None
+    if symbol_n and tsymbol != symbol_n:
+        return False
+    if side_n and tside != side_n:
+        return False
+    if bot_n and tbot and tbot != bot_n:
+        return False
+    if setup_n and tsetup and tsetup != setup_n:
+        return False
+    status = str(trade.get("status") or "").upper().strip()
+    return status in {"", "OPEN", "ACTIVE", "LIVE"}
+
+
+def _rtlm_v1_find_open_trades(symbol=None, side=None, bot=None, setup=None):
+    registry = _rtlm_v1_load_registry()
+    if registry is None:
+        return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry unavailable", "matches": [], "count": 0}
+    open_obj, items = _rtlm_v1_registry_open_items(registry)
+    matches = []
+    for key, trade in items:
+        if _rtlm_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup):
+            matches.append({"key": key, "trade": trade})
+    return {
+        "ok": True,
+        "matches": matches,
+        "count": len(matches),
+        "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
+    }
+
+
+def _rtlm_v1_update_open_trade_snapshot(symbol=None, side=None, bot=None, setup=None, lifecycle=None, commit=False):
+    """Atualiza metadata/snapshot do trade aberto. Não fecha trade."""
+    if not commit:
+        return {"attempted": False, "committed": False, "status": "COMMIT_NOT_REQUESTED"}
+    registry = _rtlm_v1_load_registry()
+    if registry is None:
+        return {"attempted": True, "committed": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR}
+    open_obj, items = _rtlm_v1_registry_open_items(registry)
+    updated = []
+    now = _rtlm_v1_now()
+    for key, trade in items:
+        if not _rtlm_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup):
+            continue
+        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+        meta["lifecycle_version"] = REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION
+        meta["lifecycle_last_check_at"] = now
+        meta["lifecycle_status"] = (lifecycle or {}).get("status")
+        meta["lifecycle_stop_confirmed"] = (lifecycle or {}).get("stop_confirmed_by_central")
+        meta["lifecycle_tp50_hit"] = ((lifecycle or {}).get("tp50") or {}).get("hit")
+        meta["lifecycle_current_pnl"] = ((lifecycle or {}).get("position") or {}).get("unrealizedPnl")
+        meta["lifecycle_mark_price"] = ((lifecycle or {}).get("position") or {}).get("markPrice")
+        meta["lifecycle_position_found"] = (lifecycle or {}).get("position_found")
+        trade["metadata"] = meta
+        trade["last_update"] = now
+        trade["lifecycle_status"] = (lifecycle or {}).get("status")
+        trade["last_mark_price"] = ((lifecycle or {}).get("position") or {}).get("markPrice")
+        trade["last_unrealized_pnl"] = ((lifecycle or {}).get("position") or {}).get("unrealizedPnl")
+        updated.append(str(key))
+    if not updated:
+        return {"attempted": True, "committed": False, "status": "NO_MATCHING_OPEN_TRADE"}
+    registry["updated_at"] = now
+    try:
+        central_trade_registry.save_registry(registry)
+    except Exception as exc:
+        return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
+    return {"attempted": True, "committed": True, "status": "OPEN_TRADE_SNAPSHOT_UPDATED", "updated_keys": updated}
+
+
+def _rtlm_v1_close_open_trade(symbol=None, side=None, bot=None, setup=None, lifecycle=None, commit=False, ack=None):
+    """Move trade OPEN para CLOSED apenas com confirmação explícita."""
+    if not commit:
+        return {"attempted": False, "committed": False, "status": "CLOSE_NOT_REQUESTED"}
+    if str(ack or "").strip().upper() not in {"POSITION_CLOSED_CONFIRMED", "CLOSE_CONFIRMED", "CLOSED_CONFIRMED"}:
+        return {
+            "attempted": True,
+            "committed": False,
+            "status": "ACK_REQUIRED",
+            "required_ack": "POSITION_CLOSED_CONFIRMED",
+        }
+    registry = _rtlm_v1_load_registry()
+    if registry is None:
+        return {"attempted": True, "committed": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR}
+    open_obj, items = _rtlm_v1_registry_open_items(registry)
+    closed_raw = registry.get("closed_trades", [])
+    if isinstance(closed_raw, dict):
+        closed_trades = list(closed_raw.values())
+    elif isinstance(closed_raw, list):
+        closed_trades = closed_raw
+    else:
+        closed_trades = []
+    closed_keys = []
+    now = _rtlm_v1_now()
+    for key, trade in list(items):
+        if not _rtlm_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup):
+            continue
+        trade = dict(trade)
+        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+        meta.update({
+            "closed_by_lifecycle_monitor": True,
+            "lifecycle_version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
+            "lifecycle_closed_at": now,
+            "close_reason": "BROKER_POSITION_NOT_FOUND",
+            "close_ack": ack,
+            "last_lifecycle_status": (lifecycle or {}).get("status"),
+            "last_position_found": (lifecycle or {}).get("position_found"),
+            "stop_confirmed_before_close": (lifecycle or {}).get("stop_confirmed_by_central"),
+        })
+        trade["metadata"] = meta
+        trade["status"] = "CLOSED"
+        trade["closed_at"] = now
+        trade["last_update"] = now
+        trade["close_reason"] = "BROKER_POSITION_NOT_FOUND"
+        closed_trades.append(trade)
+        closed_keys.append(str(key))
+        if isinstance(open_obj, dict):
+            open_obj.pop(key, None)
+        elif isinstance(open_obj, list):
+            try:
+                open_obj.remove(trade)
+            except Exception:
+                pass
+    if not closed_keys:
+        return {"attempted": True, "committed": False, "status": "NO_MATCHING_OPEN_TRADE_TO_CLOSE"}
+    registry["open_trades"] = open_obj
+    registry["closed_trades"] = closed_trades
+    registry["updated_at"] = now
+    try:
+        central_trade_registry.save_registry(registry)
+    except Exception as exc:
+        return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
+    return {"attempted": True, "committed": True, "status": "CLOSED_REGISTERED", "closed_keys": closed_keys, "closed_count": len(closed_keys)}
+
+
+def _rtlm_v1_first_position(safety):
+    positions = safety.get("positions") if isinstance(safety, dict) else []
+    if isinstance(positions, list) and positions:
+        return positions[0]
+    return None
+
+
+def _rtlm_v1_first_registry_trade(safety, direct_matches=None):
+    try:
+        matches = ((safety or {}).get("trade_registry") or {}).get("matches") or []
+        if matches:
+            return matches[0]
+    except Exception:
+        pass
+    try:
+        direct_matches = direct_matches or []
+        if direct_matches:
+            return (direct_matches[0] or {}).get("trade") or direct_matches[0]
+    except Exception:
+        pass
+    return {}
+
+
+def _rtlm_v1_tp50_status(position, registry_trade, side=None, request_tp50=None):
+    side_n = _rtlm_v1_norm_side(side)
+    tp50 = _rtlm_v1_float(request_tp50)
+    if tp50 is None and isinstance(registry_trade, dict):
+        tp50 = _rtlm_v1_float(registry_trade.get("tp50") or registry_trade.get("tp") or registry_trade.get("target"))
+    mark = _rtlm_v1_float((position or {}).get("markPrice") or (position or {}).get("lastPrice"))
+    entry = _rtlm_v1_float((position or {}).get("entryPrice") or (registry_trade or {}).get("entry"))
+    hit = False
+    if tp50 is not None and mark is not None:
+        if side_n == "SHORT":
+            hit = mark <= tp50
+        elif side_n == "LONG":
+            hit = mark >= tp50
+    distance_pct = None
+    if tp50 is not None and mark is not None and mark:
+        try:
+            distance_pct = round(((mark - tp50) / mark) * 100.0, 6)
+        except Exception:
+            distance_pct = None
+    return {
+        "tp50": tp50,
+        "markPrice": mark,
+        "entryPrice": entry,
+        "side": side_n,
+        "hit": bool(hit),
+        "distance_pct_mark_to_tp50": distance_pct,
+        "rule": "SHORT hit quando mark <= tp50; LONG hit quando mark >= tp50.",
+    }
+
+
+def _rtlm_v1_protective_summary(safety):
+    orders = (safety or {}).get("protective_orders") or []
+    stops = []
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        stops.append({
+            "id": order.get("id"),
+            "source": order.get("source"),
+            "symbol": order.get("symbol"),
+            "side": order.get("side"),
+            "positionSide": order.get("positionSide"),
+            "type": order.get("type"),
+            "status": order.get("status"),
+            "reduceOnly": order.get("reduceOnly"),
+            "stopPrice": order.get("stopPrice") or order.get("triggerPrice") or order.get("stopLossPrice"),
+            "price": order.get("price"),
+        })
+    return stops
+
+
+def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setup=None):
+    symbol_norm = _rtlm_v1_norm_symbol(symbol or "BTCUSDT")
+    side_norm = _rtlm_v1_norm_side(side or "SHORT")
+    bot = _rtlm_v1_norm_bot(bot or "FALCON")
+    setup = str(setup or bot or "FALCON").upper().strip()
+
+    try:
+        commit = _rtlm_v1_bool(request.args.get("commit") or request.args.get("update_registry"), False)
+        close_commit = _rtlm_v1_bool(request.args.get("close_registry") or request.args.get("mark_closed"), False)
+        close_ack = request.args.get("ack") or request.args.get("close_ack")
+        request_tp50 = request.args.get("tp50")
+    except Exception:
+        commit = False
+        close_commit = False
+        close_ack = None
+        request_tp50 = None
+
+    safety = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
+    direct_registry = _rtlm_v1_find_open_trades(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
+    position = _rtlm_v1_first_position(safety)
+    registry_trade = _rtlm_v1_first_registry_trade(safety, direct_registry.get("matches"))
+    position_found = bool((safety or {}).get("position_found"))
+    registry_match = bool((safety or {}).get("registry_match") or direct_registry.get("count", 0) > 0)
+    stop_confirmed = bool((safety or {}).get("stop_confirmed_by_central"))
+    tp50_status = _rtlm_v1_tp50_status(position, registry_trade, side=side_norm, request_tp50=request_tp50)
+    protective_orders = _rtlm_v1_protective_summary(safety)
+
+    if position_found and stop_confirmed and registry_match:
+        status = "OPEN_MONITORED_PROTECTED_AND_REGISTERED"
+        ok = True
+        requires_attention = False
+    elif position_found and not stop_confirmed and registry_match:
+        status = "OPEN_MONITORED_STOP_NOT_CONFIRMED"
+        ok = False
+        requires_attention = True
+    elif position_found and stop_confirmed and not registry_match:
+        status = "OPEN_MONITORED_PROTECTED_BUT_REGISTRY_MISSING"
+        ok = False
+        requires_attention = True
+    elif position_found:
+        status = "OPEN_MONITORED_REQUIRES_ATTENTION"
+        ok = False
+        requires_attention = True
+    elif (not position_found) and registry_match:
+        status = "POSITION_CLOSED_BUT_REGISTRY_OPEN"
+        ok = False
+        requires_attention = True
+    else:
+        status = "NO_OPEN_POSITION_AND_NO_OPEN_REGISTRY_MATCH"
+        ok = True
+        requires_attention = False
+
+    lifecycle = {
+        "ok": ok,
+        "version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
+        "status": status,
+        "generated_at": _rtlm_v1_now(),
+        "symbol": symbol_norm,
+        "side": side_norm,
+        "bot": bot,
+        "setup": setup,
+        "position_found": position_found,
+        "registry_match": registry_match,
+        "stop_confirmed_by_central": stop_confirmed,
+        "requires_manual_attention": requires_attention,
+        "position": position or {},
+        "protective_orders_count": len(protective_orders),
+        "protective_orders": protective_orders,
+        "tp50": tp50_status,
+        "pnl": {
+            "unrealizedPnl": (position or {}).get("unrealizedPnl"),
+            "realizedPnl": (position or {}).get("realizedPnl"),
+            "notional": (position or {}).get("notional"),
+            "entryPrice": (position or {}).get("entryPrice"),
+            "markPrice": (position or {}).get("markPrice"),
+        },
+        "registry": {
+            "direct_open_match_count": direct_registry.get("count"),
+            "safety_registry_count": (((safety or {}).get("trade_registry") or {}).get("count")),
+            "trade_id": (registry_trade or {}).get("trade_id"),
+            "trade": registry_trade or {},
+            "diagnostics": direct_registry,
+        },
+        "safety_check": {
+            "version": (safety or {}).get("version"),
+            "status": (safety or {}).get("status"),
+            "ok": (safety or {}).get("ok"),
+            "requires_manual_attention": (safety or {}).get("requires_manual_attention"),
+            "position_count": (safety or {}).get("position_count"),
+            "open_orders_checked": (safety or {}).get("open_orders_checked"),
+            "open_orders_count": (safety or {}).get("open_orders_count"),
+            "protective_orders_count": (safety or {}).get("protective_orders_count"),
+        },
+        "actions": [],
+        "notes": [
+            "V1 monitora posição real, stop, PnL, TP50 e Registry.",
+            "Por segurança, V1 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
+            "commit=true atualiza apenas snapshot/metadata do trade aberto; não cria nem fecha ordens na BingX.",
+        ],
+    }
+
+    # Atualização de snapshot do trade aberto.
+    if position_found and registry_match:
+        update_result = _rtlm_v1_update_open_trade_snapshot(
+            symbol=symbol_norm, side=side_norm, bot=bot, setup=setup,
+            lifecycle=lifecycle, commit=commit,
+        )
+        lifecycle["registry_update"] = update_result
+        if update_result.get("committed"):
+            lifecycle["actions"].append("REGISTRY_OPEN_SNAPSHOT_UPDATED")
+    else:
+        lifecycle["registry_update"] = {"attempted": False, "committed": False, "status": "NOT_APPLICABLE"}
+
+    # Fechamento controlado do Registry quando posição não existe mais.
+    if (not position_found) and registry_match:
+        close_result = _rtlm_v1_close_open_trade(
+            symbol=symbol_norm, side=side_norm, bot=bot, setup=setup,
+            lifecycle=lifecycle, commit=close_commit, ack=close_ack,
+        )
+        lifecycle["registry_close"] = close_result
+        if close_result.get("committed"):
+            lifecycle["actions"].append("REGISTRY_MARKED_CLOSED")
+            lifecycle["status"] = "POSITION_CLOSED_AND_REGISTRY_UPDATED"
+            lifecycle["ok"] = True
+            lifecycle["requires_manual_attention"] = False
+    else:
+        lifecycle["registry_close"] = {"attempted": False, "committed": False, "status": "NOT_APPLICABLE"}
+
+    return lifecycle
+
+
+@app.route("/realtradelifecycle", methods=["GET"])
+@app.route("/realtradelifecycle/<symbol>/<side>", methods=["GET"])
+@app.route("/lifecyclemonitor", methods=["GET"])
+@app.route("/lifecyclemonitor/<symbol>/<side>", methods=["GET"])
+@app.route("/trade/lifecycle", methods=["GET"])
+def real_trade_lifecycle_monitor_v1_route(symbol=None, side=None):
+    symbol = symbol or request.args.get("symbol") or "BTCUSDT"
+    side = side or request.args.get("side") or "SHORT"
+    bot = request.args.get("bot") or "FALCON"
+    setup = request.args.get("setup") or bot
+    return build_real_trade_lifecycle_monitor_v1(symbol=symbol, side=side, bot=bot, setup=setup)
+
+
+@app.route("/realtradelifecycle/health", methods=["GET"])
+@app.route("/lifecyclemonitor/health", methods=["GET"])
+def real_trade_lifecycle_monitor_v1_health():
+    return {
+        "ok": True,
+        "version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
+        "module": "real_trade_lifecycle_monitor_v1",
+        "notes": [
+            "Monitora posição real, stop, PnL, TP50 e Registry.",
+            "Leitura segura por padrão; commit=true apenas atualiza snapshot do Registry.",
+            "Fechamento do Registry exige close_registry=true e ack=POSITION_CLOSED_CONFIRMED.",
+        ],
+        "routes": [
+            "/realtradelifecycle/BTCUSDT/SHORT",
+            "/lifecyclemonitor/BTCUSDT/SHORT?commit=true",
+            "/lifecyclemonitor/BTCUSDT/SHORT?close_registry=true&ack=POSITION_CLOSED_CONFIRMED",
+            "/realtradelifecycle/health",
+        ],
+    }
+
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.9 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1.
+    EXECUTION CONSOLE V1.10 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -5282,7 +5751,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.9.1</title>
+  <title>Central Quant — Execution Console V1.10.1</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -5352,7 +5821,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.9.1</h1>
+  <h1>Central Quant — Execution Console V1.10.1</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -5475,6 +5944,8 @@ def execution_console_route():
     <p><a style="color:#93c5fd" href="/executionenginelog" target="_blank">/executionenginelog</a></p>
     <p><a style="color:#93c5fd" href="/traderegistrysyncv1/health" target="_blank">/traderegistrysyncv1/health</a></p>
     <p><a style="color:#93c5fd" href="/postexecutionsafety?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT" target="_blank">/postexecutionsafety BTC SHORT</a></p>
+    <p><a style="color:#93c5fd" href="/realtradelifecycle/BTCUSDT/SHORT?bot=FALCON&setup=FALCON" target="_blank">/realtradelifecycle BTC SHORT</a></p>
+    <p><a style="color:#93c5fd" href="/lifecyclemonitor/BTCUSDT/SHORT?bot=FALCON&setup=FALCON&commit=true" target="_blank">/lifecyclemonitor BTC SHORT commit snapshot</a></p>
     <p><a style="color:#93c5fd" href="/positioncheck/BTCUSDT/SHORT" target="_blank">/positioncheck/BTCUSDT/SHORT</a></p>
     <p><a style="color:#93c5fd" href="/executionverify/BTCUSDT/SHORT" target="_blank">/executionverify/BTCUSDT/SHORT</a></p>
     <p><a style="color:#93c5fd" href="/executionverify?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT&entry=108000&sl=109000&tp50=107000" target="_blank">/executionverify BTC SHORT</a></p>
