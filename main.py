@@ -8537,6 +8537,18 @@ def build_execution_final_gate_route_v1(preflight=False):
     )
 
     try:
+        pilot_guard = real_pilot_guard_v1_validate(payload, action="final_gate_precheck") if callable(globals().get("real_pilot_guard_v1_validate")) else {"ok": False, "allowed": False, "status": "REAL_PILOT_GUARD_FUNCTION_MISSING"}
+    except Exception as exc:
+        pilot_guard = {"ok": False, "allowed": False, "status": "REAL_PILOT_GUARD_ERROR", "error": str(exc)}
+    add(
+        "REAL_PILOT_GUARD_READY",
+        "Real Pilot Guard V1 aprovou limites do piloto real",
+        bool(pilot_guard.get("ok") and pilot_guard.get("allowed")),
+        pilot_guard,
+        blocking=True,
+    )
+
+    try:
         persistence_gate = registry_persistence_v1_gate_check(payload) if callable(globals().get("registry_persistence_v1_gate_check")) else {"ok": False, "status": "REGISTRY_PERSISTENCE_FUNCTION_MISSING"}
     except Exception as exc:
         persistence_gate = {"ok": False, "status": "REGISTRY_PERSISTENCE_ERROR", "error": str(exc)}
@@ -8666,6 +8678,7 @@ def build_execution_final_gate_route_v1(preflight=False):
             "token_configured": token_present,
             "real_execution_enabled_env": real_enabled,
             "real_pilot_enabled_env": pilot_enabled,
+            "real_pilot_guard_ok": bool(pilot_guard.get("ok") and pilot_guard.get("allowed")),
             "registry_persistence_ok": bool(persistence_gate.get("ok")),
             "trade_close_outcome_ok": bool(outcome_gate.get("ok")),
             "registry_mode_ok": bool(registry_mode_gate.get("ok")),
@@ -8679,6 +8692,7 @@ def build_execution_final_gate_route_v1(preflight=False):
             "/executionfinalgate/health",
             "/executionfinalgate?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=108000&sl=109000&tp50=107000",
             "/executionconsole",
+            "/realpilotguard/health",
         ],
         "notes": [
             "Esta rota não envia ordem real.",
@@ -30345,6 +30359,22 @@ def _dry_run_hard_kill_v1_safe_preview(payload, mode="LIVE"):
         or payload.get("broker_client_order_id")
         or payload.get("client_tag")
     )
+    try:
+        guard_fn = globals().get("real_pilot_guard_v1_validate")
+        real_pilot_guard_preview = guard_fn(payload, action="dry_run_preview") if callable(guard_fn) else {
+            "ok": True,
+            "allowed": True,
+            "status": "REAL_PILOT_GUARD_NOT_LOADED_YET",
+            "version": globals().get("REAL_PILOT_GUARD_V1_VERSION"),
+        }
+    except Exception as exc:
+        real_pilot_guard_preview = {
+            "ok": False,
+            "allowed": False,
+            "status": "REAL_PILOT_GUARD_PREVIEW_ERROR",
+            "error": str(exc),
+            "version": globals().get("REAL_PILOT_GUARD_V1_VERSION"),
+        }
     preview = {
         "ok": True,
         "status": "DRY_RUN_HARD_KILL_PREVIEW_ONLY",
@@ -30376,6 +30406,7 @@ def _dry_run_hard_kill_v1_safe_preview(payload, mode="LIVE"):
         "symbol": symbol,
         "auth": auth,
         "preview": preview,
+        "real_guard": real_pilot_guard_preview,
         "preview_isolation": True,
         "live_send_blocked": True,
         "live_broker_called": False,
@@ -30403,6 +30434,7 @@ def _dry_run_hard_kill_v1_safe_preview(payload, mode="LIVE"):
             "dry_run": True,
             "live_broker_called": False,
             "live_result": live_result,
+            "real_guard": real_pilot_guard_preview,
             "paper_executor_called": False,
             "paper_result": None,
             "real_execution_enabled": True,
@@ -31147,6 +31179,587 @@ def disaster_stop_hedge_mode_fix_v1_health_route():
         ],
         "token_value_exposed": False,
     }, 200
+
+
+# ==========================================================
+# REAL PILOT GUARD V1 — HARD LIMITS FOR LIVE PILOT
+# ==========================================================
+REAL_PILOT_GUARD_V1_VERSION = "2026-07-06-REAL-PILOT-GUARD-V1"
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_PILOT_GUARD_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_PILOT_GUARD_V1 = None
+
+
+def _rpg_v1_now():
+    try:
+        fn = globals().get("agora_sp_str") or globals().get("data_hora_sp_str")
+        return fn() if callable(fn) else None
+    except Exception:
+        return None
+
+
+def _rpg_v1_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
+def _rpg_v1_bool_env(names, default=False):
+    for name in names:
+        try:
+            if name in os.environ:
+                return _rpg_v1_bool(os.environ.get(name), default=default), name
+        except Exception:
+            pass
+    return bool(default), None
+
+
+def _rpg_v1_first_env(names, default=None):
+    for name in names:
+        try:
+            value = os.environ.get(name)
+            if value is not None and str(value).strip() != "":
+                return str(value).strip(), name
+        except Exception:
+            pass
+    return default, None
+
+
+def _rpg_v1_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _rpg_v1_int(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return int(float(str(value).replace(",", ".")))
+    except Exception:
+        return default
+
+
+def _rpg_v1_float_env(names, default=None):
+    raw, source = _rpg_v1_first_env(names, None)
+    return _rpg_v1_float(raw, default), source
+
+
+def _rpg_v1_int_env(names, default=None):
+    raw, source = _rpg_v1_first_env(names, None)
+    return _rpg_v1_int(raw, default), source
+
+
+def _rpg_v1_csv(value):
+    if value is None:
+        return []
+    items = []
+    for piece in str(value).replace(";", ",").split(","):
+        piece = piece.strip().upper()
+        if piece:
+            items.append(piece)
+    return items
+
+
+def _rpg_v1_csv_env(names, default=""):
+    raw, source = _rpg_v1_first_env(names, default)
+    return _rpg_v1_csv(raw), source
+
+
+def _rpg_v1_normalize_symbol(symbol):
+    value = str(symbol or "").upper().strip()
+    value = value.replace("/", "").replace(":USDT", "").replace("-", "")
+    return value
+
+
+def _rpg_v1_normalize_side(side):
+    value = str(side or "").upper().strip()
+    if value in {"BUY", "LONG"}:
+        return "LONG"
+    if value in {"SELL", "SHORT"}:
+        return "SHORT"
+    return value
+
+
+def _rpg_v1_payload_float(payload, keys, default=None):
+    payload = payload if isinstance(payload, dict) else {}
+    for key in keys:
+        if key in payload:
+            value = _rpg_v1_float(payload.get(key), None)
+            if value is not None:
+                return value, key
+    return default, None
+
+
+def _rpg_v1_payload_int(payload, keys, default=None):
+    payload = payload if isinstance(payload, dict) else {}
+    for key in keys:
+        if key in payload:
+            value = _rpg_v1_int(payload.get(key), None)
+            if value is not None:
+                return value, key
+    return default, None
+
+
+def _rpg_v1_action_is_reduce_only(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    for key in ("reduce_only", "reduceOnly", "close_only", "closePosition", "close_position", "is_reduce_only"):
+        if key in payload and _rpg_v1_bool(payload.get(key), default=False):
+            return True
+    action = str(payload.get("action") or payload.get("execution_action") or payload.get("management_action") or "").strip().upper()
+    return action in {"REDUCE", "PARTIAL_CLOSE", "CLOSE", "CLOSE_POSITION", "MOVE_STOP", "MOVE_SL", "BREAKEVEN", "TRAILING", "PROTECT"}
+
+
+def _rpg_v1_real_execution_enabled():
+    return _rpg_v1_bool_env([
+        "CENTRAL_REAL_EXECUTION_ENABLED",
+        "REAL_EXECUTION_ENABLED",
+        "EXECUTION_REAL_ENABLED",
+        "ENABLE_REAL_EXECUTION",
+        "BINGX_REAL_EXECUTION_ENABLED",
+        "ENABLE_REAL_TRADING",
+    ], default=False)
+
+
+def _rpg_v1_real_pilot_enabled():
+    return _rpg_v1_bool_env([
+        "CENTRAL_REAL_PILOT_ENABLED",
+        "REAL_PILOT_ENABLED",
+        "EXECUTION_REAL_PILOT_ENABLED",
+        "BINGX_REAL_PILOT_ENABLED",
+        "CENTRAL_REAL_PILOT_GUARD_ENABLED",
+    ], default=False)
+
+
+def _rpg_v1_allowed_bots():
+    bots, source = _rpg_v1_csv_env([
+        "CENTRAL_REAL_PILOT_ALLOWED_BOTS",
+        "CENTRAL_REAL_ALLOWED_BOTS",
+        "REAL_PILOT_ALLOWED_BOTS",
+        "REAL_TRADING_ALLOWED_BOTS",
+    ], default="FALCON")
+    return bots or ["FALCON"], source or "default:FALCON"
+
+
+def _rpg_v1_allowed_symbols():
+    symbols, source = _rpg_v1_csv_env([
+        "CENTRAL_REAL_PILOT_ALLOWED_SYMBOLS",
+        "CENTRAL_REAL_ALLOWED_SYMBOLS",
+        "REAL_PILOT_ALLOWED_SYMBOLS",
+        "REAL_TRADING_ALLOWED_SYMBOLS",
+    ], default="BTCUSDT,ETHUSDT")
+    symbols = [_rpg_v1_normalize_symbol(x) for x in symbols if _rpg_v1_normalize_symbol(x)]
+    return symbols or ["BTCUSDT", "ETHUSDT"], source or "default:BTCUSDT,ETHUSDT"
+
+
+def _rpg_v1_max_notional():
+    value, source = _rpg_v1_float_env([
+        "CENTRAL_REAL_PILOT_MAX_NOTIONAL_USDT",
+        "CENTRAL_REAL_MAX_NOTIONAL_USDT",
+        "REAL_PILOT_MAX_NOTIONAL_USDT",
+        "REAL_MAX_NOTIONAL_USDT",
+        "REAL_TRADING_MAX_NOTIONAL_USDT",
+    ], default=20.0)
+    return value if value is not None else 20.0, source or "default:20"
+
+
+def _rpg_v1_max_margin():
+    value, source = _rpg_v1_float_env([
+        "CENTRAL_REAL_PILOT_MAX_MARGIN_USDT",
+        "CENTRAL_REAL_MAX_MARGIN_USDT",
+        "REAL_PILOT_MAX_MARGIN_USDT",
+        "REAL_MAX_MARGIN_USDT",
+        "REAL_TRADING_MAX_MARGIN_USDT",
+    ], default=None)
+    return value, source
+
+
+def _rpg_v1_max_leverage():
+    value, source = _rpg_v1_int_env([
+        "CENTRAL_REAL_PILOT_MAX_LEVERAGE",
+        "CENTRAL_REAL_MAX_LEVERAGE",
+        "REAL_PILOT_MAX_LEVERAGE",
+        "REAL_MAX_LEVERAGE",
+        "REAL_TRADING_MAX_LEVERAGE",
+    ], default=125)
+    return value if value is not None else 125, source or "default:125"
+
+
+def _rpg_v1_max_open_positions():
+    value, source = _rpg_v1_int_env([
+        "CENTRAL_REAL_PILOT_MAX_OPEN_POSITIONS",
+        "CENTRAL_REAL_MAX_OPEN_POSITIONS",
+        "REAL_PILOT_MAX_OPEN_POSITIONS",
+        "REAL_MAX_OPEN_POSITIONS",
+        "REAL_TRADING_MAX_OPEN_POSITIONS",
+    ], default=1)
+    return value if value is not None else 1, source or "default:1"
+
+
+def _rpg_v1_trade_size(payload, bot):
+    payload = payload if isinstance(payload, dict) else {}
+    margin, margin_source = _rpg_v1_payload_float(payload, [
+        "margin_usdt", "margin", "real_margin_usdt", "requested_margin_usdt", "order_margin_usdt"
+    ], default=None)
+    leverage, leverage_source = _rpg_v1_payload_int(payload, [
+        "leverage", "real_leverage", "requested_leverage", "order_leverage"
+    ], default=None)
+    notional, notional_source = _rpg_v1_payload_float(payload, [
+        "notional_usdt", "notional", "real_notional_usdt", "requested_notional_usdt", "order_notional_usdt", "effective_notional_usdt", "total_usdt"
+    ], default=None)
+
+    cfg = {}
+    try:
+        cfg_fn = globals().get("real_execution_config_for_bot")
+        cfg = cfg_fn(bot) if callable(cfg_fn) else {}
+    except Exception:
+        cfg = {}
+
+    if margin is None:
+        margin = _rpg_v1_float((cfg or {}).get("margin_usdt"), None)
+        if margin is not None:
+            margin_source = "real_execution_config_for_bot.margin_usdt"
+    if leverage is None:
+        leverage = _rpg_v1_int((cfg or {}).get("leverage"), None)
+        if leverage is not None:
+            leverage_source = "real_execution_config_for_bot.leverage"
+    if notional is None:
+        notional = _rpg_v1_float((cfg or {}).get("effective_notional_usdt"), None)
+        if notional is not None:
+            notional_source = "real_execution_config_for_bot.effective_notional_usdt"
+    if notional is None and margin is not None:
+        notional = float(margin) * float(leverage or 1)
+        notional_source = "margin_x_leverage"
+    if margin is None and notional is not None:
+        margin = float(notional) / float(leverage or 1)
+        margin_source = "notional_div_leverage"
+    if leverage is None:
+        leverage = 1
+        leverage_source = "default:1"
+    if notional is None:
+        notional = 20.0
+        notional_source = "default:20"
+    if margin is None:
+        margin = notional
+        margin_source = "default:margin_equals_notional"
+
+    return {
+        "margin_usdt": round(float(margin), 8) if margin is not None else None,
+        "margin_source": margin_source,
+        "leverage": int(leverage) if leverage is not None else None,
+        "leverage_source": leverage_source,
+        "notional_usdt": round(float(notional), 8) if notional is not None else None,
+        "notional_source": notional_source,
+        "config_snapshot": cfg,
+    }
+
+
+def _rpg_v1_broker_snapshot():
+    available = central_broker is not None
+    ready = {"ok": False, "status": "BROKER_MODULE_NOT_AVAILABLE", "error": globals().get("BROKER_IMPORT_ERROR")}
+    if available:
+        try:
+            ready_fn = getattr(central_broker, "ready_check", None)
+            if callable(ready_fn):
+                ready = ready_fn()
+            else:
+                ready = {"ok": True, "status": "READY", "reason": "broker module present; ready_check missing"}
+        except Exception as exc:
+            ready = {"ok": False, "status": "BROKER_READY_CHECK_ERROR", "error": str(exc)}
+    return {
+        "available": available,
+        "ready": ready,
+    }
+
+
+def _rpg_v1_registry_mode_snapshot(payload):
+    try:
+        fn = globals().get("registry_mode_segregation_v1_gate_check")
+        if callable(fn):
+            result = fn(payload if isinstance(payload, dict) else {})
+            result = result if isinstance(result, dict) else {"ok": False, "status": "REGISTRY_MODE_BAD_RESULT"}
+        else:
+            result = {"ok": False, "status": "REGISTRY_MODE_SEGREGATION_FUNCTION_MISSING"}
+    except Exception as exc:
+        result = {"ok": False, "status": "REGISTRY_MODE_SEGREGATION_ERROR", "error": str(exc)}
+
+    open_by_mode = result.get("open_by_mode") if isinstance(result.get("open_by_mode"), dict) else {}
+    real_open_count = _rpg_v1_int(result.get("real_open_count"), None)
+    if real_open_count is None:
+        real_open_count = _rpg_v1_int(open_by_mode.get("REAL"), 0)
+    unknown_open_count = _rpg_v1_int(result.get("unknown_open_count"), None)
+    if unknown_open_count is None:
+        unknown_open_count = _rpg_v1_int(open_by_mode.get("UNKNOWN"), 0)
+
+    return {
+        "ok": bool(result.get("ok")),
+        "status": result.get("status"),
+        "raw": result,
+        "real_open_count": real_open_count or 0,
+        "unknown_open_count": unknown_open_count or 0,
+        "open_by_mode": open_by_mode,
+    }
+
+
+def _rpg_v1_collect_config():
+    real_execution_enabled, real_execution_source = _rpg_v1_real_execution_enabled()
+    real_pilot_enabled, real_pilot_source = _rpg_v1_real_pilot_enabled()
+    allowed_bots, allowed_bots_source = _rpg_v1_allowed_bots()
+    allowed_symbols, allowed_symbols_source = _rpg_v1_allowed_symbols()
+    max_notional, max_notional_source = _rpg_v1_max_notional()
+    max_margin, max_margin_source = _rpg_v1_max_margin()
+    max_leverage, max_leverage_source = _rpg_v1_max_leverage()
+    max_open_positions, max_open_positions_source = _rpg_v1_max_open_positions()
+    allow_reduce_only, allow_reduce_only_source = _rpg_v1_bool_env([
+        "CENTRAL_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS",
+        "CENTRAL_REAL_ALLOW_REDUCE_ONLY_ALWAYS",
+        "REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS",
+        "GLOBAL_RISK_ALLOW_REDUCE_ONLY",
+    ], default=True)
+    return {
+        "real_execution_enabled": real_execution_enabled,
+        "real_execution_enabled_source": real_execution_source,
+        "real_pilot_enabled": real_pilot_enabled,
+        "real_pilot_enabled_source": real_pilot_source,
+        "allowed_bots": allowed_bots,
+        "allowed_bots_source": allowed_bots_source,
+        "allowed_symbols": allowed_symbols,
+        "allowed_symbols_source": allowed_symbols_source,
+        "max_notional_usdt": max_notional,
+        "max_notional_usdt_source": max_notional_source,
+        "max_margin_usdt": max_margin,
+        "max_margin_usdt_source": max_margin_source,
+        "max_leverage": max_leverage,
+        "max_leverage_source": max_leverage_source,
+        "max_open_positions": max_open_positions,
+        "max_open_positions_source": max_open_positions_source,
+        "allow_reduce_only_always": allow_reduce_only,
+        "allow_reduce_only_always_source": allow_reduce_only_source,
+        "token_value_exposed": False,
+    }
+
+
+def real_pilot_guard_v1_validate(payload=None, action="execute"):
+    payload = dict(payload or {}) if isinstance(payload, dict) else {}
+    bot = str(payload.get("bot") or payload.get("robot") or "FALCON").upper().strip()
+    setup = str(payload.get("setup") or "").upper().strip()
+    symbol = _rpg_v1_normalize_symbol(payload.get("symbol") or "BTCUSDT")
+    side = _rpg_v1_normalize_side(payload.get("side") or "SHORT")
+    config = _rpg_v1_collect_config()
+    trade = _rpg_v1_trade_size(payload, bot)
+    broker = _rpg_v1_broker_snapshot()
+    registry_mode = _rpg_v1_registry_mode_snapshot(payload)
+    reduce_only = _rpg_v1_action_is_reduce_only(payload)
+
+    checks = []
+    reasons = []
+    warnings = []
+
+    def add(code, ok, label, detail=None, blocking=True):
+        item = {
+            "code": code,
+            "ok": bool(ok),
+            "label": label,
+            "blocking": bool(blocking),
+            "detail": detail or {},
+        }
+        checks.append(item)
+        if blocking and not ok:
+            reasons.append(label)
+        return item
+
+    add("REAL_EXECUTION_ENABLED", config.get("real_execution_enabled"), "Execução real habilitada no ambiente", {"source": config.get("real_execution_enabled_source")})
+    add("REAL_PILOT_ENABLED", config.get("real_pilot_enabled"), "Piloto real habilitado no ambiente", {"source": config.get("real_pilot_enabled_source")})
+
+    bot_allowed = bot in set(config.get("allowed_bots") or [])
+    add("BOT_ALLOWED", bot_allowed, "Bot permitido para piloto real", {"bot": bot, "allowed_bots": config.get("allowed_bots"), "source": config.get("allowed_bots_source")})
+
+    symbol_allowed = symbol in set(config.get("allowed_symbols") or [])
+    add("SYMBOL_ALLOWED", symbol_allowed, "Ativo permitido para piloto real", {"symbol": symbol, "allowed_symbols": config.get("allowed_symbols"), "source": config.get("allowed_symbols_source")})
+
+    margin = _rpg_v1_float(trade.get("margin_usdt"), None)
+    max_margin = _rpg_v1_float(config.get("max_margin_usdt"), None)
+    margin_ok = True if max_margin is None else (margin is not None and margin <= max_margin)
+    add("MARGIN_LIMIT", margin_ok, "Margem dentro do limite do piloto", {"margin_usdt": margin, "max_margin_usdt": max_margin, "margin_source": trade.get("margin_source"), "max_margin_source": config.get("max_margin_usdt_source")})
+
+    leverage = _rpg_v1_int(trade.get("leverage"), None)
+    max_leverage = _rpg_v1_int(config.get("max_leverage"), None)
+    leverage_ok = True if max_leverage is None else (leverage is not None and leverage <= max_leverage)
+    add("LEVERAGE_LIMIT", leverage_ok, "Alavancagem dentro do limite do piloto", {"leverage": leverage, "max_leverage": max_leverage, "leverage_source": trade.get("leverage_source"), "max_leverage_source": config.get("max_leverage_source")})
+
+    notional = _rpg_v1_float(trade.get("notional_usdt"), None)
+    max_notional = _rpg_v1_float(config.get("max_notional_usdt"), 20.0)
+    notional_ok = bool(notional is not None and notional <= max_notional)
+    add("NOTIONAL_LIMIT", notional_ok, "Notional dentro do limite rígido do piloto", {"notional_usdt": notional, "max_notional_usdt": max_notional, "notional_source": trade.get("notional_source"), "max_notional_source": config.get("max_notional_usdt_source")})
+
+    real_open_count = _rpg_v1_int(registry_mode.get("real_open_count"), 0)
+    unknown_open_count = _rpg_v1_int(registry_mode.get("unknown_open_count"), 0)
+    max_open = _rpg_v1_int(config.get("max_open_positions"), 1)
+    open_position_ok = bool((reduce_only and config.get("allow_reduce_only_always")) or (real_open_count < max_open))
+    add("MAX_REAL_OPEN_POSITIONS", open_position_ok, "Quantidade de posições reais abertas dentro do limite", {"real_open_count": real_open_count, "unknown_open_count": unknown_open_count, "max_open_positions": max_open, "reduce_only": reduce_only, "source": config.get("max_open_positions_source")})
+
+    unknown_ok = unknown_open_count == 0
+    add("NO_UNKNOWN_OPEN_POSITIONS", unknown_ok, "Nenhuma posição UNKNOWN aberta", {"unknown_open_count": unknown_open_count})
+
+    broker_ready = bool((broker.get("ready") or {}).get("ok") and str((broker.get("ready") or {}).get("status") or "").upper() == "READY")
+    add("BROKER_READY", broker_ready, "Broker/BingX pronto", {"available": broker.get("available"), "ready": broker.get("ready")})
+
+    registry_ok = bool(registry_mode.get("ok"))
+    add("REGISTRY_MODE_READY", registry_ok, "Registry Mode Segregation pronto", {"status": registry_mode.get("status"), "real_open_count": real_open_count, "open_by_mode": registry_mode.get("open_by_mode")})
+
+    failed = [c for c in checks if c.get("blocking") and not c.get("ok")]
+    allowed = len(failed) == 0
+    if notional is not None and max_notional is not None and notional > max_notional:
+        warnings.append("Tamanho calculado do trade excede o limite; ajuste ENV de margem/alavancagem ou max notional antes de operar real.")
+    if real_open_count > 0:
+        warnings.append("Já existe posição REAL aberta; piloto V1 permite nova entrada apenas se abaixo do limite de posições.")
+
+    return {
+        "ok": allowed,
+        "allowed": allowed,
+        "status": "REAL_PILOT_GUARD_ALLOWED" if allowed else "BLOCKED_BY_REAL_PILOT_GUARD",
+        "module": "real_pilot_guard_v1",
+        "version": REAL_PILOT_GUARD_V1_VERSION,
+        "generated_at": _rpg_v1_now(),
+        "action": action,
+        "bot": bot,
+        "setup": setup,
+        "symbol": symbol,
+        "side": side,
+        "reduce_only": reduce_only,
+        "config": config,
+        "trade": trade,
+        "broker": {
+            "available": broker.get("available"),
+            "ready": broker.get("ready"),
+            "positions": {
+                "ok": registry_ok,
+                "checked": True,
+                "open_positions": real_open_count,
+                "real_open_count": real_open_count,
+                "unknown_open_count": unknown_open_count,
+                "source": "registry_mode_segregation_v1_gate_check",
+            },
+        },
+        "registry_mode": registry_mode,
+        "checks": checks,
+        "blocking_failed_count": len(failed),
+        "failed_blocking_codes": [c.get("code") for c in failed],
+        "reasons": reasons,
+        "warnings": warnings,
+        "token_value_exposed": False,
+        "notes": [
+            "Real Pilot Guard V1 não envia ordens; apenas valida limites antes do envio real.",
+            "O limite padrão é conservador: 20 USDT de notional e 1 posição REAL aberta.",
+            "ENV configura intenção; este guard transforma os ENV em trava operacional rígida.",
+        ],
+    }
+
+
+@app.route("/realpilotguard/health", methods=["GET"])
+@app.route("/realpilotguard", methods=["GET"])
+@app.route("/real/pilotguard/health", methods=["GET"])
+def real_pilot_guard_v1_health_route():
+    payload = {
+        "bot": request.args.get("bot", "FALCON"),
+        "setup": request.args.get("setup", request.args.get("bot", "FALCON")),
+        "symbol": request.args.get("symbol", "BTCUSDT"),
+        "side": request.args.get("side", "SHORT"),
+        "entry": request.args.get("entry", "108000"),
+        "sl": request.args.get("sl", "109000"),
+        "tp50": request.args.get("tp50", "107000"),
+        "risk_pct": request.args.get("risk_pct", "2"),
+    }
+    for key in ("notional_usdt", "margin_usdt", "leverage", "action", "reduce_only"):
+        if key in request.args:
+            payload[key] = request.args.get(key)
+    guard = real_pilot_guard_v1_validate(payload, action="health")
+    return {
+        "ok": bool(guard.get("ok")),
+        "module": "real_pilot_guard_v1",
+        "version": REAL_PILOT_GUARD_V1_VERSION,
+        "generated_at": _rpg_v1_now(),
+        "guard": guard,
+        "routes": [
+            "/realpilotguard/health",
+            "/realpilotguard?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&notional_usdt=20",
+            "/executionfinalgate?preflight=true",
+            "/executionconsole",
+        ],
+        "token_value_exposed": False,
+    }, 200
+
+
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    """
+    Real Pilot Guard V1 wrapper:
+    - dry_run=True continua indo para o Hard Kill preview seguro.
+    - dry_run=False em LIVE só segue se Real Pilot Guard aprovar limites rígidos.
+    """
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_PILOT_GUARD_V1
+    payload_dict = dict(payload or {}) if isinstance(payload, dict) else {}
+    dry = _rpg_v1_bool(dry_run, default=True)
+    mode_norm = str(mode or payload_dict.get("mode") or "LIVE").upper().strip()
+
+    if not dry and mode_norm == "LIVE":
+        guard = real_pilot_guard_v1_validate(payload_dict, action="execute")
+        if not bool(guard.get("ok") and guard.get("allowed")):
+            return {
+                "ok": False,
+                "status": "BLOCKED_BY_REAL_PILOT_GUARD",
+                "sent": False,
+                "mode": mode_norm,
+                "dry_run": False,
+                "real_pilot_guard_v1": guard,
+                "payload": {
+                    "ok": False,
+                    "status": "BLOCKED_BY_REAL_PILOT_GUARD",
+                    "real_guard": guard,
+                    "live_result": {
+                        "ok": False,
+                        "sent": False,
+                        "status": "BLOCKED_BY_REAL_PILOT_GUARD",
+                        "real_guard": guard,
+                        "live_broker_called": False,
+                        "live_send_blocked": True,
+                        "requires_manual_attention": False,
+                    },
+                },
+                "failed_blocking_codes": guard.get("failed_blocking_codes"),
+                "reason": "Real Pilot Guard V1 bloqueou a execução real antes do envio ao broker.",
+                "version": REAL_PILOT_GUARD_V1_VERSION,
+            }
+        payload_dict["real_pilot_guard_v1"] = guard
+        payload_dict["real_guard"] = guard
+
+    if not callable(original_runner):
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_RUNNER_MISSING_AFTER_REAL_PILOT_GUARD",
+            "sent": False,
+            "version": REAL_PILOT_GUARD_V1_VERSION,
+        }
+
+    result = original_runner(payload=payload_dict, mode=mode, dry_run=dry_run, *args, **kwargs)
+    try:
+        if isinstance(result, dict):
+            guard = payload_dict.get("real_pilot_guard_v1") if isinstance(payload_dict.get("real_pilot_guard_v1"), dict) else None
+            if guard is None and dry:
+                live_payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+                guard = live_payload.get("real_guard") if isinstance(live_payload.get("real_guard"), dict) else None
+            if guard is None:
+                guard = real_pilot_guard_v1_validate(payload_dict, action="post_call_attach")
+            result.setdefault("real_pilot_guard_v1", guard)
+            if isinstance(result.get("payload"), dict):
+                result["payload"].setdefault("real_guard", guard)
+    except Exception:
+        pass
+    return result
 
 
 
