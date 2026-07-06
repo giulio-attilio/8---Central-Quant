@@ -668,6 +668,512 @@ except Exception as _broker_import_exc:
 else:
     BROKER_IMPORT_ERROR = None
 
+# ==========================================================
+# EXECUTION ENGINE AUTH RESOLVER V1 — CENTRALIZED TOKEN RESOLUTION
+# ==========================================================
+EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION = "2026-07-06-EXECUTION-ENGINE-AUTH-RESOLVER-V1"
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_AUTH_RESOLVER_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_AUTH_RESOLVER_V1 = None
+
+try:
+    _EXECUTION_AUTH_RESOLVER_V1_CONTEXT = threading.local()
+except Exception:
+    _EXECUTION_AUTH_RESOLVER_V1_CONTEXT = None
+
+
+def _ee_auth_resolver_v1_token_keys():
+    return [
+        "EXECUTION_AUTH_TOKEN",
+        "CENTRAL_EXECUTION_AUTH_TOKEN",
+        "REAL_EXECUTION_AUTH_TOKEN",
+        "EXECUTION_LIVE_AUTH_TOKEN",
+        "BINGX_EXECUTION_AUTH_TOKEN",
+        "CENTRAL_REAL_EXECUTION_AUTH_TOKEN",
+        "REAL_PILOT_AUTH_TOKEN",
+    ]
+
+
+def _ee_auth_resolver_v1_alias_keys():
+    return [
+        "execution_auth_token",
+        "auth_token",
+        "EXECUTION_AUTH_TOKEN",
+        "central_execution_auth_token",
+        "CENTRAL_EXECUTION_AUTH_TOKEN",
+        "real_execution_auth_token",
+        "REAL_EXECUTION_AUTH_TOKEN",
+        "live_execution_auth_token",
+        "EXECUTION_LIVE_AUTH_TOKEN",
+        "broker_execution_auth_token",
+        "BINGX_EXECUTION_AUTH_TOKEN",
+        "central_real_execution_auth_token",
+        "CENTRAL_REAL_EXECUTION_AUTH_TOKEN",
+        "real_pilot_auth_token",
+        "REAL_PILOT_AUTH_TOKEN",
+        "execution_token",
+        "token",
+        "authorization_token",
+        "x_execution_auth_token",
+    ]
+
+
+def _ee_auth_resolver_v1_configured_token():
+    """Retorna o token configurado no ambiente sem jamais expor seu valor."""
+    for key in _ee_auth_resolver_v1_token_keys():
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value, key
+    return "", None
+
+
+def _ee_auth_resolver_v1_get_from_mapping(mapping, key):
+    try:
+        if mapping is None:
+            return None
+        if hasattr(mapping, "get"):
+            return mapping.get(key)
+    except Exception:
+        pass
+    return None
+
+
+def _ee_auth_resolver_v1_collect_candidates(provided_token=None, payload=None, allow_env_fallback=False):
+    """
+    Coleta candidatos de token vindos do payload, request, headers e contexto interno.
+    Nunca retorna o valor em resposta pública; isto só é usado para comparação.
+    """
+    candidates = []
+
+    def add(value, source):
+        try:
+            value = str(value or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            candidates.append({"value": value, "source": source})
+
+    add(provided_token, "provided_argument")
+
+    # Contexto interno criado pelo wrapper de run_execution_engine.
+    try:
+        ctx = getattr(_EXECUTION_AUTH_RESOLVER_V1_CONTEXT, "data", None) if _EXECUTION_AUTH_RESOLVER_V1_CONTEXT is not None else None
+        if isinstance(ctx, dict):
+            add(ctx.get("provided_token"), "thread_context.provided_token")
+            ctx_payload = ctx.get("payload") if isinstance(ctx.get("payload"), dict) else None
+            if ctx_payload:
+                payload = payload if isinstance(payload, dict) else ctx_payload
+                for key in _ee_auth_resolver_v1_alias_keys():
+                    add(ctx_payload.get(key), f"thread_context.payload.{key}")
+                nested = ctx_payload.get("auth") if isinstance(ctx_payload.get("auth"), dict) else {}
+                for key in _ee_auth_resolver_v1_alias_keys():
+                    add(nested.get(key), f"thread_context.payload.auth.{key}")
+                nested = ctx_payload.get("execution_auth") if isinstance(ctx_payload.get("execution_auth"), dict) else {}
+                for key in _ee_auth_resolver_v1_alias_keys():
+                    add(nested.get(key), f"thread_context.payload.execution_auth.{key}")
+    except Exception:
+        pass
+
+    if isinstance(payload, dict):
+        for key in _ee_auth_resolver_v1_alias_keys():
+            add(payload.get(key), f"payload.{key}")
+        nested = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
+        for key in _ee_auth_resolver_v1_alias_keys():
+            add(nested.get(key), f"payload.auth.{key}")
+        nested = payload.get("execution_auth") if isinstance(payload.get("execution_auth"), dict) else {}
+        for key in _ee_auth_resolver_v1_alias_keys():
+            add(nested.get(key), f"payload.execution_auth.{key}")
+
+    # Flask request: args/form/values/json/headers.
+    try:
+        for source_name, mapping in [
+            ("request.args", getattr(request, "args", None)),
+            ("request.form", getattr(request, "form", None)),
+            ("request.values", getattr(request, "values", None)),
+        ]:
+            for key in _ee_auth_resolver_v1_alias_keys():
+                add(_ee_auth_resolver_v1_get_from_mapping(mapping, key), f"{source_name}.{key}")
+        try:
+            request_json = request.get_json(silent=True) or {}
+        except Exception:
+            request_json = {}
+        if isinstance(request_json, dict):
+            for key in _ee_auth_resolver_v1_alias_keys():
+                add(request_json.get(key), f"request.json.{key}")
+        headers = getattr(request, "headers", None)
+        for key in [
+            "X-Execution-Auth-Token",
+            "X-Execution-Auth",
+            "X-Central-Execution-Auth-Token",
+            "X-Real-Execution-Auth-Token",
+            "X-BingX-Execution-Auth-Token",
+            "Authorization",
+        ]:
+            raw = _ee_auth_resolver_v1_get_from_mapping(headers, key)
+            if raw and str(raw).lower().startswith("bearer "):
+                raw = str(raw)[7:].strip()
+            add(raw, f"request.headers.{key}")
+    except Exception:
+        pass
+
+    if allow_env_fallback:
+        configured, configured_source = _ee_auth_resolver_v1_configured_token()
+        add(configured, f"env_fallback.{configured_source or 'missing'}")
+
+    return candidates
+
+
+def _ee_auth_resolver_v1_resolve(provided_token=None, payload=None, allow_env_fallback=False):
+    configured_token, configured_source = _ee_auth_resolver_v1_configured_token()
+    if not configured_token:
+        return {
+            "ok": False,
+            "status": "MISSING_CONFIGURED_EXECUTION_AUTH_TOKEN",
+            "reason": "execution_auth_token configurado ausente",
+            "configured": False,
+            "configured_source": None,
+            "token_value_exposed": False,
+            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        }
+
+    candidates = _ee_auth_resolver_v1_collect_candidates(
+        provided_token=provided_token,
+        payload=payload,
+        allow_env_fallback=allow_env_fallback,
+    )
+    checked_sources = []
+    for item in candidates:
+        source = item.get("source")
+        value = item.get("value")
+        if source:
+            checked_sources.append(source)
+        if value and value == configured_token:
+            return {
+                "ok": True,
+                "status": "EXECUTION_AUTH_OK",
+                "reason": "execution_auth_token validado",
+                "configured": True,
+                "configured_source": configured_source,
+                "matched_source": source,
+                "candidate_count": len(candidates),
+                "checked_sources": checked_sources[:30],
+                "token_value_exposed": False,
+                "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+            }
+
+    return {
+        "ok": False,
+        "status": "MISSING_EXECUTION_AUTH_TOKEN" if not candidates else "INVALID_EXECUTION_AUTH_TOKEN",
+        "reason": "execution_auth_token ausente" if not candidates else "execution_auth_token inválido",
+        "configured": True,
+        "configured_source": configured_source,
+        "candidate_count": len(candidates),
+        "checked_sources": checked_sources[:30],
+        "token_value_exposed": False,
+        "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+    }
+
+
+def _ee_auth_resolver_v1_payload_with_aliases(payload, allow_env_fallback=False):
+    base = dict(payload or {})
+    configured_token, configured_source = _ee_auth_resolver_v1_configured_token()
+    resolved = _ee_auth_resolver_v1_resolve(payload=base, allow_env_fallback=allow_env_fallback)
+    # Se já veio token explícito correto, reaproveita; se é fallback interno/dry_run, injeta o configurado.
+    token_to_inject = ""
+    if resolved.get("ok"):
+        for item in _ee_auth_resolver_v1_collect_candidates(payload=base, allow_env_fallback=allow_env_fallback):
+            if item.get("value") == configured_token:
+                token_to_inject = item.get("value")
+                break
+    elif allow_env_fallback and configured_token:
+        token_to_inject = configured_token
+
+    if token_to_inject:
+        for key in _ee_auth_resolver_v1_alias_keys():
+            base.setdefault(key, token_to_inject)
+        base.setdefault("auth", {})
+        if isinstance(base.get("auth"), dict):
+            base["auth"].setdefault("execution_auth_token", token_to_inject)
+            base["auth"].setdefault("auth_token", token_to_inject)
+            base["auth"].setdefault("source", configured_source)
+        base.setdefault("execution_auth", {})
+        if isinstance(base.get("execution_auth"), dict):
+            base["execution_auth"].setdefault("execution_auth_token", token_to_inject)
+            base["execution_auth"].setdefault("auth_token", token_to_inject)
+            base["execution_auth"].setdefault("source", configured_source)
+        base["_execution_engine_auth_resolver_v1_passed"] = True
+        base["_execution_engine_auth_resolver_v1_version"] = EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION
+    else:
+        base["_execution_engine_auth_resolver_v1_passed"] = False
+        base["_execution_engine_auth_resolver_v1_version"] = EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION
+    return base
+
+
+def _ee_auth_resolver_v1_is_preview_context(payload=None, dry_run=None):
+    if dry_run is True:
+        return True
+    if isinstance(payload, dict):
+        for key in ("dry_run", "preview_only", "preview", "broker_dry_run"):
+            value = str(payload.get(key) or "").strip().lower()
+            if value in {"1", "true", "yes", "sim", "on"}:
+                return True
+    try:
+        for key in ("dry_run", "preview_only", "preview", "broker_dry_run"):
+            value = str(request.args.get(key) or request.values.get(key) or "").strip().lower()
+            if value in {"1", "true", "yes", "sim", "on"}:
+                return True
+    except Exception:
+        pass
+    try:
+        ctx = getattr(_EXECUTION_AUTH_RESOLVER_V1_CONTEXT, "data", None) if _EXECUTION_AUTH_RESOLVER_V1_CONTEXT is not None else None
+        if isinstance(ctx, dict) and ctx.get("dry_run") is True:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _ee_auth_resolver_v1_patch_broker_validator():
+    if central_broker is None:
+        return {
+            "ok": False,
+            "status": "BROKER_MODULE_NOT_AVAILABLE",
+            "patched": False,
+            "error": BROKER_IMPORT_ERROR,
+            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        }
+    original = getattr(central_broker, "validate_execution_auth_token", None)
+    if getattr(central_broker, "_execution_engine_auth_resolver_v1_patched", False):
+        return {
+            "ok": True,
+            "status": "BROKER_VALIDATOR_ALREADY_PATCHED",
+            "patched": True,
+            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        }
+
+    def _wrapped_validate_execution_auth_token(execution_auth_token=None, *args, **kwargs):
+        # Primeiro preserva comportamento original quando ele aprova.
+        original_result = None
+        original_error = None
+        try:
+            if callable(original):
+                original_result = original(execution_auth_token, *args, **kwargs)
+                if isinstance(original_result, dict) and original_result.get("ok"):
+                    original_result.setdefault("resolver_version", EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION)
+                    return original_result
+                if original_result is True:
+                    return {
+                        "ok": True,
+                        "status": "EXECUTION_AUTH_OK",
+                        "reason": "original_validator_true",
+                        "token_value_exposed": False,
+                        "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+                    }
+        except TypeError:
+            try:
+                if callable(original):
+                    original_result = original()
+                    if isinstance(original_result, dict) and original_result.get("ok"):
+                        original_result.setdefault("resolver_version", EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION)
+                        return original_result
+                    if original_result is True:
+                        return {
+                            "ok": True,
+                            "status": "EXECUTION_AUTH_OK",
+                            "reason": "original_validator_true_noargs",
+                            "token_value_exposed": False,
+                            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+                        }
+            except Exception as exc:
+                original_error = str(exc)
+        except Exception as exc:
+            original_error = str(exc)
+
+        # Se o original negou por ausência, usa o resolver centralizado.
+        ctx_payload = None
+        ctx_dry_run = None
+        try:
+            ctx = getattr(_EXECUTION_AUTH_RESOLVER_V1_CONTEXT, "data", None) if _EXECUTION_AUTH_RESOLVER_V1_CONTEXT is not None else None
+            if isinstance(ctx, dict):
+                ctx_payload = ctx.get("payload") if isinstance(ctx.get("payload"), dict) else None
+                ctx_dry_run = ctx.get("dry_run")
+        except Exception:
+            pass
+        allow_env_fallback = _ee_auth_resolver_v1_is_preview_context(payload=ctx_payload, dry_run=ctx_dry_run)
+        resolved = _ee_auth_resolver_v1_resolve(
+            provided_token=execution_auth_token,
+            payload=ctx_payload,
+            allow_env_fallback=allow_env_fallback,
+        )
+        if original_error:
+            resolved["original_validator_error"] = original_error
+        elif isinstance(original_result, dict):
+            resolved["original_validator_status"] = original_result.get("status")
+        resolved["resolver_applied"] = True
+        return resolved
+
+    try:
+        setattr(central_broker, "_execution_engine_auth_resolver_v1_original_validate_execution_auth_token", original)
+        setattr(central_broker, "validate_execution_auth_token", _wrapped_validate_execution_auth_token)
+        setattr(central_broker, "_execution_engine_auth_resolver_v1_patched", True)
+        return {
+            "ok": True,
+            "status": "BROKER_VALIDATOR_PATCHED",
+            "patched": True,
+            "original_present": callable(original),
+            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "BROKER_VALIDATOR_PATCH_FAILED",
+            "patched": False,
+            "error": str(exc),
+            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        }
+
+
+EXECUTION_ENGINE_AUTH_RESOLVER_V1_PATCH = _ee_auth_resolver_v1_patch_broker_validator()
+
+
+def _ee_auth_resolver_v1_patch_execution_engine_module():
+    """
+    Alguns engines importam validate_execution_auth_token por nome.
+    Além de patchar broker.validate_execution_auth_token, também patchamos
+    o símbolo dentro de execution_engine quando ele existir.
+    """
+    try:
+        ee_module = importlib.import_module("execution_engine")
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_MODULE_IMPORT_FAILED",
+            "patched": False,
+            "error": str(exc),
+            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        }
+
+    patches = []
+    wrapped = getattr(central_broker, "validate_execution_auth_token", None) if central_broker is not None else None
+    if callable(wrapped):
+        try:
+            if hasattr(ee_module, "validate_execution_auth_token"):
+                original = getattr(ee_module, "validate_execution_auth_token", None)
+                setattr(ee_module, "_execution_engine_auth_resolver_v1_original_validate_execution_auth_token", original)
+                setattr(ee_module, "validate_execution_auth_token", wrapped)
+                patches.append("execution_engine.validate_execution_auth_token")
+        except Exception as exc:
+            patches.append(f"execution_engine.validate_execution_auth_token:ERROR:{exc}")
+
+        try:
+            module_broker = getattr(ee_module, "broker", None)
+            if module_broker is not None and hasattr(module_broker, "validate_execution_auth_token"):
+                setattr(module_broker, "validate_execution_auth_token", wrapped)
+                patches.append("execution_engine.broker.validate_execution_auth_token")
+        except Exception as exc:
+            patches.append(f"execution_engine.broker.validate_execution_auth_token:ERROR:{exc}")
+
+        try:
+            module_central_broker = getattr(ee_module, "central_broker", None)
+            if module_central_broker is not None and hasattr(module_central_broker, "validate_execution_auth_token"):
+                setattr(module_central_broker, "validate_execution_auth_token", wrapped)
+                patches.append("execution_engine.central_broker.validate_execution_auth_token")
+        except Exception as exc:
+            patches.append(f"execution_engine.central_broker.validate_execution_auth_token:ERROR:{exc}")
+
+    return {
+        "ok": bool(patches),
+        "status": "EXECUTION_ENGINE_MODULE_PATCHED" if patches else "NO_ENGINE_VALIDATOR_SYMBOL_FOUND",
+        "patched": bool(patches),
+        "patches": patches,
+        "token_value_exposed": False,
+        "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+    }
+
+
+EXECUTION_ENGINE_AUTH_RESOLVER_V1_ENGINE_PATCH = _ee_auth_resolver_v1_patch_execution_engine_module()
+
+
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    """
+    Wrapper seguro em torno do Execution Engine.
+    - Injeta aliases do token no payload apenas internamente.
+    - Disponibiliza payload/dry_run em thread-local para broker.validate_execution_auth_token.
+    - Mantém a assinatura pública usada pelas rotas existentes.
+    """
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_AUTH_RESOLVER_V1
+    if not callable(original_runner):
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_RUNNER_MISSING",
+            "error": "run_execution_engine original indisponível",
+            "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        }
+    allow_env_fallback = bool(dry_run is True)
+    safe_payload = _ee_auth_resolver_v1_payload_with_aliases(payload or {}, allow_env_fallback=allow_env_fallback)
+    previous_ctx = None
+    try:
+        if _EXECUTION_AUTH_RESOLVER_V1_CONTEXT is not None:
+            previous_ctx = getattr(_EXECUTION_AUTH_RESOLVER_V1_CONTEXT, "data", None)
+            _EXECUTION_AUTH_RESOLVER_V1_CONTEXT.data = {
+                "payload": safe_payload,
+                "mode": mode,
+                "dry_run": dry_run,
+                "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+            }
+        result = original_runner(payload=safe_payload, mode=mode, dry_run=dry_run, *args, **kwargs)
+        if isinstance(result, dict):
+            result.setdefault("execution_engine_auth_resolver", {
+                "applied": True,
+                "payload_aliases_injected": bool(safe_payload.get("_execution_engine_auth_resolver_v1_passed")),
+                "broker_validator_patch": EXECUTION_ENGINE_AUTH_RESOLVER_V1_PATCH,
+                "engine_module_patch": EXECUTION_ENGINE_AUTH_RESOLVER_V1_ENGINE_PATCH,
+                "token_value_exposed": False,
+                "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+            })
+        return result
+    finally:
+        try:
+            if _EXECUTION_AUTH_RESOLVER_V1_CONTEXT is not None:
+                _EXECUTION_AUTH_RESOLVER_V1_CONTEXT.data = previous_ctx
+        except Exception:
+            pass
+
+
+@app.route("/executionauthresolver/health")
+@app.route("/execution/authresolver/health")
+def execution_engine_auth_resolver_v1_health_route():
+    configured_token, configured_source = _ee_auth_resolver_v1_configured_token()
+    resolver_probe = _ee_auth_resolver_v1_resolve(
+        provided_token=configured_token,
+        payload={"execution_auth_token": configured_token} if configured_token else {},
+        allow_env_fallback=False,
+    )
+    return {
+        "ok": bool(configured_token and EXECUTION_ENGINE_AUTH_RESOLVER_V1_PATCH.get("ok")),
+        "module": "execution_engine_auth_resolver_v1",
+        "version": EXECUTION_ENGINE_AUTH_RESOLVER_V1_VERSION,
+        "configured": bool(configured_token),
+        "configured_source": configured_source,
+        "token_value_exposed": False,
+        "broker_validator_patch": EXECUTION_ENGINE_AUTH_RESOLVER_V1_PATCH,
+        "engine_module_patch": EXECUTION_ENGINE_AUTH_RESOLVER_V1_ENGINE_PATCH,
+        "probe": {
+            "ok": bool(resolver_probe.get("ok")),
+            "status": resolver_probe.get("status"),
+            "matched_source": resolver_probe.get("matched_source"),
+            "token_value_exposed": False,
+        },
+        "notes": [
+            "Esta rota não envia ordem real.",
+            "O resolver centraliza a leitura do token para Engine/Broker sem expor o valor.",
+            "Em dry_run, permite fallback interno ao token do ambiente para validar preflight seguro.",
+        ],
+    }
+
+
 try:
     import event_bus as central_event_bus
 except Exception as _event_bus_import_exc:
