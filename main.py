@@ -4263,7 +4263,7 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
 # - Atualizar snapshot operacional no Registry quando commit=true.
 # - Reparar Registry dentro do lifecycle com repair_registry=true + ack explícito.
 # - Marcar CLOSED somente com posição ausente confirmada + ack explícito.
-REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1.1"
+REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1.2"
 
 
 def _rtlm_v1_bool(value, default=False):
@@ -4507,32 +4507,77 @@ def _rtlm_v1_first_registry_trade(safety, direct_matches=None):
 
 
 def _rtlm_v1_tp50_status(position, registry_trade, side=None, request_tp50=None):
+    """
+    V1.2: valida coerência direcional do TP50 antes de marcar hit.
+
+    Para LONG, TP50 precisa estar acima da entrada.
+    Para SHORT, TP50 precisa estar abaixo da entrada.
+
+    Sem esta validação, um TP50 antigo/incoerente pode gerar falso positivo
+    (ex.: SHORT com entry real 63k e tp50=107k).
+    """
     side_n = _rtlm_v1_norm_side(side)
+    tp50_source = None
     tp50 = _rtlm_v1_float(request_tp50)
+    if tp50 is not None:
+        tp50_source = "request"
     if tp50 is None and isinstance(registry_trade, dict):
-        tp50 = _rtlm_v1_float(registry_trade.get("tp50") or registry_trade.get("tp") or registry_trade.get("target"))
+        raw_tp50 = registry_trade.get("tp50") or registry_trade.get("tp") or registry_trade.get("target")
+        tp50 = _rtlm_v1_float(raw_tp50)
+        if tp50 is not None:
+            tp50_source = "registry"
+
     mark = _rtlm_v1_float((position or {}).get("markPrice") or (position or {}).get("lastPrice"))
     entry = _rtlm_v1_float((position or {}).get("entryPrice") or (registry_trade or {}).get("entry"))
+
+    directionally_valid = None
+    invalid_reason = None
+    if tp50 is not None and entry is not None:
+        if side_n == "SHORT":
+            directionally_valid = tp50 < entry
+            if not directionally_valid:
+                invalid_reason = "SHORT_TP50_MUST_BE_BELOW_ENTRY"
+        elif side_n == "LONG":
+            directionally_valid = tp50 > entry
+            if not directionally_valid:
+                invalid_reason = "LONG_TP50_MUST_BE_ABOVE_ENTRY"
+        else:
+            directionally_valid = False
+            invalid_reason = "UNKNOWN_SIDE"
+
     hit = False
-    if tp50 is not None and mark is not None:
+    if tp50 is not None and mark is not None and directionally_valid is True:
         if side_n == "SHORT":
             hit = mark <= tp50
         elif side_n == "LONG":
             hit = mark >= tp50
+
     distance_pct = None
     if tp50 is not None and mark is not None and mark:
         try:
-            distance_pct = round(((mark - tp50) / mark) * 100.0, 6)
+            if side_n == "SHORT":
+                # positivo = ainda falta cair até o TP50; negativo = mark já abaixo do TP50
+                distance_pct = round(((mark - tp50) / mark) * 100.0, 6)
+            elif side_n == "LONG":
+                # positivo = ainda falta subir até o TP50; negativo = mark já acima do TP50
+                distance_pct = round(((tp50 - mark) / mark) * 100.0, 6)
         except Exception:
             distance_pct = None
+
+    needs_tp50_review = bool(tp50 is None or directionally_valid is False)
     return {
         "tp50": tp50,
+        "tp50_source": tp50_source,
         "markPrice": mark,
         "entryPrice": entry,
         "side": side_n,
         "hit": bool(hit),
+        "directionally_valid": directionally_valid,
+        "needs_tp50_review": needs_tp50_review,
+        "invalid_reason": invalid_reason,
+        "distance_pct_to_tp50": distance_pct,
         "distance_pct_mark_to_tp50": distance_pct,
-        "rule": "SHORT hit quando mark <= tp50; LONG hit quando mark >= tp50.",
+        "rule": "SHORT TP50 precisa estar abaixo da entrada; LONG TP50 precisa estar acima da entrada. Hit só é calculado se o TP50 for coerente.",
     }
 
 
@@ -4637,6 +4682,12 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         ok = True
         requires_attention = False
 
+    tp50_needs_review = bool((tp50_status or {}).get("needs_tp50_review"))
+    if tp50_needs_review and position_found:
+        # Não derruba o status operacional de proteção/registro, mas evita falso positivo de TP50.
+        # O trade pode estar seguro e monitorado, enquanto o alvo precisa ser corrigido.
+        requires_attention = True
+
     lifecycle = {
         "ok": ok,
         "version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
@@ -4650,6 +4701,7 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         "registry_match": registry_match,
         "stop_confirmed_by_central": stop_confirmed,
         "requires_manual_attention": requires_attention,
+        "tp50_needs_review": tp50_needs_review,
         "position": position or {},
         "protective_orders_count": len(protective_orders),
         "protective_orders": protective_orders,
@@ -4681,10 +4733,11 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         },
         "actions": [],
         "notes": [
-            "V1.1 monitora posição real, stop, PnL, TP50 e Registry.",
-            "V1.1 pode reparar o Registry com repair_registry=true e ack=CENTRAL_MANAGED_EXISTING_POSITION quando a posição real protegida existe, mas o registro OPEN não foi encontrado.",
-            "Por segurança, V1.1 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
+            "V1.2 monitora posição real, stop, PnL, TP50 e Registry.",
+            "V1.2 pode reparar o Registry com repair_registry=true e ack=CENTRAL_MANAGED_EXISTING_POSITION quando a posição real protegida existe, mas o registro OPEN não foi encontrado.",
+            "Por segurança, V1.2 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
             "commit=true atualiza apenas snapshot/metadata do trade aberto; não cria nem fecha ordens na BingX.",
+            "V1.2 valida a coerência direcional do TP50 para evitar falso hit quando o alvo antigo não combina com a entrada real.",
         ],
     }
 
@@ -4742,6 +4795,7 @@ def real_trade_lifecycle_monitor_v1_health():
             "Monitora posição real, stop, PnL, TP50 e Registry.",
             "Leitura segura por padrão; commit=true apenas atualiza snapshot do Registry.",
             "repair_registry=true com ack=CENTRAL_MANAGED_EXISTING_POSITION repara o OPEN quando a posição real protegida existe.",
+            "V1.2 valida TP50: SHORT exige TP50 abaixo da entrada real; LONG exige TP50 acima da entrada real.",
             "Fechamento do Registry exige close_registry=true e ack=POSITION_CLOSED_CONFIRMED.",
         ],
         "routes": [
@@ -4757,7 +4811,7 @@ def real_trade_lifecycle_monitor_v1_health():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.10 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.1.1.
+    EXECUTION CONSOLE V1.11 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.2.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -5784,7 +5838,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.10.1.1</title>
+  <title>Central Quant — Execution Console V1.11.1.1</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -5854,7 +5908,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.10.1.1</h1>
+  <h1>Central Quant — Execution Console V1.11.1.1</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
