@@ -4255,14 +4255,15 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
 
 
 # ==========================================================
-# REAL TRADE LIFECYCLE MONITOR V1 — REAL POSITION / REGISTRY LIFECYCLE
+# REAL TRADE LIFECYCLE MONITOR V1.1.1 — REAL POSITION / REGISTRY LIFECYCLE
 # ==========================================================
 # Objetivo:
 # - Acompanhar trade real aberto após execução pela Central.
 # - Confirmar posição, stop, PnL, TP50 e match com Trade Registry.
 # - Atualizar snapshot operacional no Registry quando commit=true.
+# - Reparar Registry dentro do lifecycle com repair_registry=true + ack explícito.
 # - Marcar CLOSED somente com posição ausente confirmada + ack explícito.
-REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1"
+REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1.1"
 
 
 def _rtlm_v1_bool(value, default=False):
@@ -4565,12 +4566,16 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
     try:
         commit = _rtlm_v1_bool(request.args.get("commit") or request.args.get("update_registry"), False)
         close_commit = _rtlm_v1_bool(request.args.get("close_registry") or request.args.get("mark_closed"), False)
-        close_ack = request.args.get("ack") or request.args.get("close_ack")
+        repair_registry = _rtlm_v1_bool(request.args.get("repair_registry") or request.args.get("repair"), False)
+        close_ack = request.args.get("close_ack") or request.args.get("ack")
+        repair_ack = request.args.get("repair_ack") or request.args.get("ack") or request.args.get("existing_position_ack")
         request_tp50 = request.args.get("tp50")
     except Exception:
         commit = False
         close_commit = False
+        repair_registry = False
         close_ack = None
+        repair_ack = None
         request_tp50 = None
 
     safety = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
@@ -4580,8 +4585,32 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
     position_found = bool((safety or {}).get("position_found"))
     registry_match = bool((safety or {}).get("registry_match") or direct_registry.get("count", 0) > 0)
     stop_confirmed = bool((safety or {}).get("stop_confirmed_by_central"))
-    tp50_status = _rtlm_v1_tp50_status(position, registry_trade, side=side_norm, request_tp50=request_tp50)
     protective_orders = _rtlm_v1_protective_summary(safety)
+
+    # V1.1: permite reparar Registry dentro do próprio monitor quando há posição real
+    # protegida, mas o deploy atual perdeu/não carregou o registro OPEN.
+    lifecycle_registry_repair = {"attempted": False, "committed": False, "status": "NOT_REQUESTED"}
+    if position_found and stop_confirmed and (not registry_match) and repair_registry:
+        lifecycle_registry_repair = _pesc_v11_registry_repair_from_position(
+            position,
+            symbol=symbol_norm,
+            side=side_norm,
+            bot=bot,
+            setup=setup,
+            commit=True,
+            ack=repair_ack,
+        )
+        if lifecycle_registry_repair.get("ok") or lifecycle_registry_repair.get("status") in {"REGISTERED", "ALREADY_REGISTERED"}:
+            # Recarrega tudo após reparo para que o lifecycle já mostre o estado pós-reparo.
+            safety = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
+            direct_registry = _rtlm_v1_find_open_trades(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
+            position = _rtlm_v1_first_position(safety)
+            registry_trade = _rtlm_v1_first_registry_trade(safety, direct_registry.get("matches"))
+            registry_match = bool((safety or {}).get("registry_match") or direct_registry.get("count", 0) > 0)
+            stop_confirmed = bool((safety or {}).get("stop_confirmed_by_central"))
+            protective_orders = _rtlm_v1_protective_summary(safety)
+
+    tp50_status = _rtlm_v1_tp50_status(position, registry_trade, side=side_norm, request_tp50=request_tp50)
 
     if position_found and stop_confirmed and registry_match:
         status = "OPEN_MONITORED_PROTECTED_AND_REGISTERED"
@@ -4639,6 +4668,7 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
             "trade": registry_trade or {},
             "diagnostics": direct_registry,
         },
+        "registry_repair": lifecycle_registry_repair,
         "safety_check": {
             "version": (safety or {}).get("version"),
             "status": (safety or {}).get("status"),
@@ -4651,8 +4681,9 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         },
         "actions": [],
         "notes": [
-            "V1 monitora posição real, stop, PnL, TP50 e Registry.",
-            "Por segurança, V1 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
+            "V1.1 monitora posição real, stop, PnL, TP50 e Registry.",
+            "V1.1 pode reparar o Registry com repair_registry=true e ack=CENTRAL_MANAGED_EXISTING_POSITION quando a posição real protegida existe, mas o registro OPEN não foi encontrado.",
+            "Por segurança, V1.1 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
             "commit=true atualiza apenas snapshot/metadata do trade aberto; não cria nem fecha ordens na BingX.",
         ],
     }
@@ -4710,11 +4741,13 @@ def real_trade_lifecycle_monitor_v1_health():
         "notes": [
             "Monitora posição real, stop, PnL, TP50 e Registry.",
             "Leitura segura por padrão; commit=true apenas atualiza snapshot do Registry.",
+            "repair_registry=true com ack=CENTRAL_MANAGED_EXISTING_POSITION repara o OPEN quando a posição real protegida existe.",
             "Fechamento do Registry exige close_registry=true e ack=POSITION_CLOSED_CONFIRMED.",
         ],
         "routes": [
             "/realtradelifecycle/BTCUSDT/SHORT",
             "/lifecyclemonitor/BTCUSDT/SHORT?commit=true",
+            "/lifecyclemonitor/BTCUSDT/SHORT?repair_registry=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=109000&tp50=107000",
             "/lifecyclemonitor/BTCUSDT/SHORT?close_registry=true&ack=POSITION_CLOSED_CONFIRMED",
             "/realtradelifecycle/health",
         ],
@@ -4724,7 +4757,7 @@ def real_trade_lifecycle_monitor_v1_health():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.10 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.
+    EXECUTION CONSOLE V1.10 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.1.1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -5751,7 +5784,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.10.1</title>
+  <title>Central Quant — Execution Console V1.10.1.1</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -5821,7 +5854,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.10.1</h1>
+  <h1>Central Quant — Execution Console V1.10.1.1</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
