@@ -6757,7 +6757,7 @@ def trade_close_outcome_v1_log_route():
 # posições reais abertas. Esta camada classifica o Trade Registry e faz o gate
 # de execução real olhar somente para risco REAL ou UNKNOWN.
 
-REGISTRY_MODE_SEGREGATION_V1_VERSION = "2026-07-06-REGISTRY-MODE-SEGREGATION-V1"
+REGISTRY_MODE_SEGREGATION_V1_VERSION = "2026-07-06-REGISTRY-MODE-SEGREGATION-V1.1"
 REGISTRY_MODE_SEGREGATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_mode_segregation_v1_latest.json"
 REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_mode_segregation_v1_events.jsonl"
 
@@ -6847,6 +6847,14 @@ def registry_mode_segregation_v1_classify_trade(trade, key=None):
     broker_position_id = meta.get("broker_position_id") or trade.get("broker_position_id")
     live_order_id = meta.get("live_order_id") or trade.get("live_order_id") or trade.get("order_id") or trade.get("broker_order_id")
     execution_sent = _rms_v1_boolish(trade.get("execution_sent") if "execution_sent" in trade else meta.get("execution_sent"))
+    realized_pnl = trade.get("realized_pnl") if trade.get("realized_pnl") is not None else trade.get("net_pnl")
+    outcome_obj = meta.get("outcome") if isinstance(meta.get("outcome"), dict) else {}
+    outcome_evaluated = bool(
+        trade.get("outcome_evaluated")
+        or meta.get("outcome_evaluated")
+        or str(trade.get("outcome_status") or meta.get("outcome_status") or outcome_obj.get("status") or "").upper() == "OUTCOME_EVALUATED"
+    )
+    is_closed = status == "CLOSED" or str(trade.get("status") or "").upper() == "CLOSED"
 
     reasons = []
     signals = {
@@ -6862,6 +6870,9 @@ def registry_mode_segregation_v1_classify_trade(trade, key=None):
         "broker_contracts": broker_contracts,
         "broker_position_id_present": bool(broker_position_id),
         "live_order_id_present": bool(live_order_id),
+        "realized_pnl_present": realized_pnl is not None,
+        "outcome_evaluated": outcome_evaluated,
+        "is_closed": is_closed,
     }
 
     # 1) PAPER explícito vence qualquer inferência fraca de sync.
@@ -6889,9 +6900,24 @@ def registry_mode_segregation_v1_classify_trade(trade, key=None):
         mode = "SYNC_ONLY"
         confidence = "MEDIUM"
     # 5) Se qty real existir em trade fechado com PnL real, inferimos REAL com cautela.
-    elif qty is not None and (trade.get("realized_pnl") is not None or trade.get("net_pnl") is not None):
+    elif qty is not None and realized_pnl is not None:
         reasons.append("numeric qty and realized/net pnl present")
         mode = "REAL"
+        confidence = "MEDIUM"
+    # 6) V1.1: trade fechado histórico/sync recuperado de outcome event, sem evidência broker, não deve virar UNKNOWN.
+    elif (
+        is_closed
+        and outcome_evaluated
+        and "trade_close_outcome_events" in source_l
+        and qty is None
+        and realized_pnl is None
+        and not broker_position_id
+        and not live_order_id
+        and broker_contracts is None
+        and execution_sent is not True
+    ):
+        reasons.append("closed historical outcome event without broker evidence classified as sync-only")
+        mode = "SYNC_ONLY"
         confidence = "MEDIUM"
     else:
         reasons.append("insufficient evidence to classify safely")
@@ -7122,6 +7148,7 @@ def registry_mode_segregation_v1_health_route():
     payload["module"] = "registry_mode_segregation_v1"
     payload["notes"] = [
         "Classifica trades do Registry como REAL, PAPER, VERIFY, SYNC_ONLY ou UNKNOWN.",
+        "V1.1 corrige CLOSED histórico sem evidência broker: outcome event sem qty/PnL real vira SYNC_ONLY, não UNKNOWN.",
         "Final Gate deve ignorar PAPER/VERIFY/SYNC_ONLY para execução real.",
         "UNKNOWN bloqueia por segurança até classificação ou correção do Registry.",
         "Use commit=true para gravar registry_mode em cada trade.",
@@ -7804,7 +7831,7 @@ def execution_console_route():
             "version": REGISTRY_PERSISTENCE_V1_VERSION,
             "rule": "Nova execução real é bloqueada se houver posição real existente sem Registry confirmado/persistido.",
         },
-        "execution_console_registry_mode_segregation_v1": {
+        "execution_console_registry_mode_segregation_v1_1": {
             "enabled": True,
             "version": REGISTRY_MODE_SEGREGATION_V1_VERSION,
             "rule": "Final Gate usa REAL/UNKNOWN para bloqueio; PAPER/VERIFY/SYNC_ONLY não contam como posição real.",
