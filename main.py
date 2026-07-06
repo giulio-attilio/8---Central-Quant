@@ -3310,7 +3310,7 @@ def trade_registry_sync_v1_health_route():
 # ==========================================================
 # POST-EXECUTION SAFETY CHECK V1 — REAL POSITION / STOP / REGISTRY
 # ==========================================================
-POST_EXECUTION_SAFETY_CHECK_V1_VERSION = "2026-07-06-POST-EXECUTION-SAFETY-CHECK-V1"
+POST_EXECUTION_SAFETY_CHECK_V1_VERSION = "2026-07-06-POST-EXECUTION-SAFETY-CHECK-V1.1"
 
 
 def _pesc_v1_norm_symbol(value):
@@ -3768,11 +3768,494 @@ def post_execution_safety_check_v1_route(symbol=None, side=None):
     setup = request.args.get("setup") or bot
     return build_post_execution_safety_check_v1(symbol=symbol, side=side, bot=bot, setup=setup)
 
+
+
+# ==========================================================
+# POST-EXECUTION SAFETY CHECK V1.1 — BROKER ORDERS INTROSPECTION + REGISTRY REPAIR
+# ==========================================================
+# V1.1 mantém a API da V1, mas sobrescreve helpers para:
+# - procurar objetos internos do broker que exponham fetch_open_orders/fetch_orders;
+# - tentar endpoints raw read-only de ordens abertas/trigger/stop quando disponíveis;
+# - permitir reparo explícito do Trade Registry via query string com acknowledgement.
+POST_EXECUTION_SAFETY_CHECK_V1_VERSION = "2026-07-06-POST-EXECUTION-SAFETY-CHECK-V1.1"
+
+
+def _pesc_v11_json_list_from_response(raw):
+    """Extrai uma lista de ordens de respostas comuns: list, dict.data, dict.result, dict.orders."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in ("data", "result", "orders", "orderList", "list", "items", "rows"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = _pesc_v11_json_list_from_response(value)
+                if nested:
+                    return nested
+        # Algumas APIs retornam a ordem única diretamente como dict.
+        if any(k in raw for k in ("id", "orderId", "clientOrderID", "clientOrderId", "symbol", "type")):
+            return [raw]
+    return []
+
+
+def _pesc_v11_broker_callable_inventory(limit=120):
+    names = []
+    try:
+        if central_broker is None:
+            return []
+        for name in sorted(dir(central_broker)):
+            if name.startswith("__"):
+                continue
+            try:
+                value = getattr(central_broker, name)
+                if callable(value):
+                    names.append(name)
+            except Exception:
+                pass
+    except Exception:
+        return []
+    return names[:limit]
+
+
+def _pesc_v11_exchange_candidates():
+    """Encontra candidatos de exchange/client dentro do módulo broker sem depender do nome exato."""
+    candidates = []
+    seen = set()
+
+    def add(obj, source):
+        if obj is None:
+            return
+        oid = id(obj)
+        if oid in seen:
+            return
+        has_order_method = any(callable(getattr(obj, m, None)) for m in (
+            "fetch_open_orders", "fetch_orders", "fetch_order", "fetch_closed_orders"
+        ))
+        has_raw_get = any(("order" in str(name).lower() and str(name).lower().startswith(("get", "fetch", "swap", "private"))) for name in dir(obj)[:500])
+        if has_order_method or has_raw_get:
+            seen.add(oid)
+            candidates.append({"source": source, "object": obj, "type": type(obj).__name__})
+
+    try:
+        if central_broker is None:
+            return []
+        # Atributos diretos comuns.
+        for name in (
+            "exchange", "client", "ccxt_exchange", "bingx", "bingx_client", "BINGX", "EXCHANGE", "CLIENT",
+            "_exchange", "_client", "_bingx", "exchange_client", "broker_client"
+        ):
+            try:
+                add(getattr(central_broker, name, None), f"broker.{name}")
+            except Exception:
+                pass
+        # Qualquer atributo do módulo com cara de exchange.
+        for name in sorted(dir(central_broker)):
+            if name.startswith("__"):
+                continue
+            try:
+                value = getattr(central_broker, name)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            if any(callable(getattr(value, m, None)) for m in ("fetch_open_orders", "fetch_orders", "fetch_positions")):
+                add(value, f"broker.{name}")
+        # Fábricas/getters sem argumentos.
+        for name in (
+            "get_exchange", "get_client", "get_bingx", "get_bingx_client", "get_ccxt_exchange",
+            "exchange_factory", "create_exchange", "build_exchange", "init_exchange", "get_broker"
+        ):
+            fn = getattr(central_broker, name, None)
+            if callable(fn):
+                try:
+                    add(fn(), f"broker.{name}()")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return candidates
+
+
+def _pesc_v11_order_call_attempt(attempts, label, fn, call_variants):
+    raw = None
+    last_err = None
+    for args, kwargs in call_variants:
+        try:
+            raw = fn(*args, **kwargs)
+            attempts.append({"function": label, "args": list(args), "kwargs": kwargs, "ok": True, "error": None})
+            return raw, None
+        except Exception as exc:
+            last_err = str(exc)
+            attempts.append({"function": label, "args": list(args), "kwargs": kwargs, "ok": False, "error": last_err})
+    return None, last_err
+
+
+def _pesc_v11_fetch_open_orders(symbol=None, side=None):
+    """Busca ordens abertas/stop/trigger com fallback amplo e read-only."""
+    attempts = []
+    raw_batches = []
+    last_err = None
+    symbol_norm = _pesc_v1_norm_symbol(symbol)
+    side_norm = _pesc_v1_norm_side(side)
+    market_symbol = _pesc_v1_market_symbol(symbol_norm)
+    bingx_symbol = _pesc_v1_bingx_symbol(symbol_norm)
+    symbol_variants = [market_symbol, bingx_symbol, symbol_norm, None]
+
+    # 1) Funções expostas diretamente pelo broker.py.
+    for fn_name in (
+        "get_open_orders", "fetch_open_orders", "get_orders", "open_orders",
+        "get_stop_orders", "fetch_stop_orders", "get_trigger_orders", "fetch_trigger_orders",
+        "get_plan_orders", "fetch_plan_orders", "get_pending_orders", "fetch_pending_orders",
+    ):
+        fn = getattr(central_broker, fn_name, None) if central_broker is not None else None
+        if not callable(fn):
+            attempts.append({"function": fn_name, "ok": False, "error": "missing"})
+            continue
+        variants = []
+        for sym in symbol_variants:
+            variants.append(((sym,), {})) if sym is not None else variants.append(((), {}))
+        raw, last_err = _pesc_v11_order_call_attempt(attempts, fn_name, fn, variants)
+        if raw is not None:
+            raw_batches.append({"source": fn_name, "raw": raw})
+
+    # 2) Objetos internos de exchange/client, incluindo getters.
+    exchange_candidates = _pesc_v11_exchange_candidates()
+    for cand in exchange_candidates:
+        ex = cand.get("object")
+        source = cand.get("source")
+        for method_name in ("fetch_open_orders", "fetch_orders", "fetch_closed_orders"):
+            fn = getattr(ex, method_name, None)
+            if not callable(fn):
+                continue
+            variants = []
+            for sym in symbol_variants:
+                if sym is None:
+                    variants.append(((), {}))
+                else:
+                    variants.append(((sym,), {}))
+                    variants.append(((sym, None, None, {"symbol": bingx_symbol, "positionSide": side_norm}), {}))
+                    variants.append(((), {"symbol": sym}))
+            raw, last_err = _pesc_v11_order_call_attempt(attempts, f"{source}.{method_name}", fn, variants[:12])
+            if raw is not None:
+                raw_batches.append({"source": f"{source}.{method_name}", "raw": raw})
+
+        # 3) Métodos CCXT/raw read-only com nome contendo Order/Trigger/Stop.
+        raw_method_names = []
+        try:
+            for name in dir(ex):
+                lname = name.lower()
+                if not callable(getattr(ex, name, None)):
+                    continue
+                if not any(word in lname for word in ("order", "trigger", "stop", "plan")):
+                    continue
+                if any(bad in lname for bad in ("create", "cancel", "delete", "post", "place", "submit", "amend")):
+                    continue
+                if lname.startswith(("fetch", "get", "private", "swap")):
+                    raw_method_names.append(name)
+        except Exception:
+            raw_method_names = []
+        # Prioriza nomes de ordens abertas.
+        raw_method_names = sorted(set(raw_method_names), key=lambda n: ("open" not in n.lower(), "trigger" not in n.lower(), n))[:30]
+        for name in raw_method_names:
+            fn = getattr(ex, name, None)
+            if not callable(fn):
+                continue
+            variants = [(({"symbol": bingx_symbol},), {}), (({"symbol": market_symbol},), {}), (({"symbol": symbol_norm},), {}), ((), {})]
+            raw, last_err = _pesc_v11_order_call_attempt(attempts, f"{source}.{name}", fn, variants)
+            if raw is not None:
+                raw_batches.append({"source": f"{source}.{name}", "raw": raw})
+
+    orders = []
+    seen = set()
+    for batch in raw_batches:
+        for order in _pesc_v11_json_list_from_response(batch.get("raw")):
+            if not isinstance(order, dict):
+                continue
+            slim = _pesc_v1_slim_order(order)
+            if symbol_norm and slim.get("symbol") and slim.get("symbol") != symbol_norm:
+                continue
+            status = str(slim.get("status") or "").upper()
+            # Se endpoint é de ordens abertas, status vazio pode ser aceito.
+            if status and status not in {"OPEN", "NEW", "PARTIALLY_FILLED", "PENDING", "TRIGGER", "TRIGGERING", "UNTRIGGERED", "NOT_TRIGGERED", "WORKING"}:
+                continue
+            oid = str(slim.get("id") or slim.get("clientOrderId") or json.dumps(slim, sort_keys=True, default=str))
+            if oid in seen:
+                continue
+            seen.add(oid)
+            slim["source"] = batch.get("source")
+            orders.append(slim)
+
+    return {
+        "ok": bool(raw_batches),
+        "error": last_err,
+        "attempts": attempts[:120],
+        "orders": orders,
+        "count": len(orders),
+        "raw_batch_count": len(raw_batches),
+        "exchange_candidates": [{"source": c.get("source"), "type": c.get("type")} for c in exchange_candidates],
+        "broker_callable_inventory_sample": _pesc_v11_broker_callable_inventory(80),
+    }
+
+
+def _pesc_v11_trade_registry_matches(symbol=None, side=None, bot=None, setup=None):
+    """Leitura mais robusta do Trade Registry, sem depender apenas de get_open_positions_central."""
+    matches = []
+    diagnostics = {"sources": []}
+    symbol_norm = _pesc_v1_norm_symbol(symbol)
+    side_norm = _pesc_v1_norm_side(side)
+    bot_norm = str(bot or "").upper().strip()
+    setup_norm = str(setup or "").upper().strip()
+
+    def iter_trades_from_registry_obj(registry):
+        if not isinstance(registry, dict):
+            return []
+        values = []
+        for key in ("open_trades", "open", "trades", "positions"):
+            raw = registry.get(key)
+            if isinstance(raw, dict):
+                values.extend(list(raw.values()))
+            elif isinstance(raw, list):
+                values.extend(raw)
+        return [t for t in values if isinstance(t, dict)]
+
+    trade_sources = []
+    try:
+        trades = get_open_positions_central() if callable(globals().get("get_open_positions_central")) else []
+        trade_sources.append(("get_open_positions_central", trades or []))
+    except Exception as exc:
+        diagnostics["get_open_positions_central_error"] = str(exc)
+    try:
+        if central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)):
+            registry = central_trade_registry.load_registry()
+            trade_sources.append(("central_trade_registry.load_registry", iter_trades_from_registry_obj(registry)))
+            diagnostics["trade_registry_file"] = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", ""))
+    except Exception as exc:
+        diagnostics["load_registry_error"] = str(exc)
+    try:
+        snap = central_trade_registry_snapshot(include_trades=True) if callable(globals().get("central_trade_registry_snapshot")) else {}
+        trade_sources.append(("central_trade_registry_snapshot", snap.get("open_trades") or []))
+    except Exception as exc:
+        diagnostics["snapshot_error"] = str(exc)
+
+    seen = set()
+    for source, trades in trade_sources:
+        diagnostics["sources"].append({"source": source, "count": len(trades) if isinstance(trades, list) else None})
+        if isinstance(trades, dict):
+            trades = list(trades.values())
+        if not isinstance(trades, list):
+            continue
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            tsymbol = _pesc_v1_norm_symbol(trade.get("symbol_clean") or trade.get("symbol") or trade.get("ativo") or trade.get("pair"))
+            tside = _pesc_v1_norm_side(trade.get("side") or trade.get("direction"))
+            tbot = str(trade.get("bot") or "").upper().strip()
+            tsetup = str(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label") or "").upper().strip()
+            status = str(trade.get("status") or "").upper().strip()
+            if symbol_norm and tsymbol != symbol_norm:
+                continue
+            if side_norm and tside != side_norm:
+                continue
+            if bot_norm and tbot and tbot != bot_norm:
+                continue
+            if setup_norm and tsetup and tsetup != setup_norm:
+                continue
+            if status and status not in {"OPEN", "ACTIVE", "LIVE", ""}:
+                continue
+            key = str(trade.get("trade_id") or trade.get("id") or trade.get("signal_id") or f"{tbot}:{tsetup}:{tsymbol}:{tside}")
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append({
+                "trade_id": trade.get("trade_id") or trade.get("id") or trade.get("signal_id"),
+                "bot": trade.get("bot"),
+                "setup": trade.get("setup") or trade.get("signal_type") or trade.get("setup_label"),
+                "symbol": tsymbol,
+                "side": tside,
+                "entry": trade.get("entry") or trade.get("entrada"),
+                "sl": trade.get("sl") or trade.get("stop"),
+                "tp50": trade.get("tp50") or trade.get("tp"),
+                "qty": trade.get("qty") or trade.get("quantity") or trade.get("contracts"),
+                "status": trade.get("status"),
+                "metadata": trade.get("metadata") if isinstance(trade.get("metadata"), dict) else None,
+                "source": source,
+            })
+    return {"ok": True, "matches": matches, "count": len(matches), "diagnostics": diagnostics}
+
+
+def _pesc_v11_registry_repair_from_position(position, symbol=None, side=None, bot=None, setup=None, commit=False, ack=None):
+    """Repara Registry explicitamente, usando a posição real da corretora como fonte."""
+    if not commit:
+        return {"attempted": False, "committed": False, "status": "REPAIR_NOT_REQUESTED"}
+    if str(ack or "").strip() != "CENTRAL_MANAGED_EXISTING_POSITION":
+        return {"attempted": True, "committed": False, "status": "ACK_REQUIRED", "required_ack": "CENTRAL_MANAGED_EXISTING_POSITION"}
+    if not isinstance(position, dict):
+        return {"attempted": True, "committed": False, "status": "NO_POSITION_TO_REPAIR"}
+    candidate = {
+        "bot": bot or "FALCON",
+        "setup": setup or bot or "FALCON",
+        "symbol": symbol or position.get("symbol"),
+        "side": side or position.get("side"),
+        "entry": position.get("entryPrice"),
+        "sl": (request.args.get("sl") if "request" in globals() else None) or None,
+        "tp50": (request.args.get("tp50") if "request" in globals() else None) or None,
+        "qty": position.get("contracts"),
+        "source": "post_execution_safety_repair_v1_1",
+        "metadata": {
+            "sync_version": POST_EXECUTION_SAFETY_CHECK_V1_VERSION,
+            "sync_reason": "BROKER_POSITION_FOUND_BUT_REGISTRY_MISSING",
+            "repaired_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+            "broker_position_id": position.get("id"),
+            "broker_entry_price": position.get("entryPrice"),
+            "broker_contracts": position.get("contracts"),
+            "broker_notional": position.get("notional"),
+            "broker_unrealized_pnl": position.get("unrealizedPnl"),
+            "manual_ack": ack,
+        },
+    }
+    if callable(globals().get("trade_registry_sync_v1_register_candidate")):
+        try:
+            res = trade_registry_sync_v1_register_candidate(candidate, commit=True)
+            res["attempted"] = True
+            res["repair_candidate"] = candidate
+            return res
+        except Exception as exc:
+            return {"attempted": True, "committed": False, "status": "REPAIR_ERROR", "error": str(exc), "repair_candidate": candidate}
+    return {"attempted": True, "committed": False, "status": "REGISTER_FUNCTION_MISSING", "repair_candidate": candidate}
+
+
+def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup=None, source_result=None):
+    symbol_norm = _pesc_v1_norm_symbol(symbol or "BTCUSDT")
+    side_norm = _pesc_v1_norm_side(side or "SHORT")
+    bot = bot or "FALCON"
+    setup = setup or bot
+
+    repair_registry = False
+    ack = None
+    try:
+        repair_registry = str(request.args.get("repair_registry") or request.args.get("repair") or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+        ack = request.args.get("ack") or request.args.get("existing_position_ack")
+    except Exception:
+        pass
+
+    positions_payload = _pesc_v1_fetch_positions(symbol_norm, side_norm)
+    orders_payload = _pesc_v11_fetch_open_orders(symbol_norm, side_norm)
+    registry_payload = _pesc_v11_trade_registry_matches(symbol_norm, side_norm, bot=bot, setup=setup)
+
+    positions = positions_payload.get("positions") or []
+    orders = orders_payload.get("orders") or []
+    protective_orders = [o for o in orders if _pesc_v1_is_protective_order(o, side_norm)]
+
+    attached_stop_in_position = []
+    for p in positions:
+        if p.get("stopLossPrice") or p.get("takeProfitPrice"):
+            attached_stop_in_position.append({
+                "position_id": p.get("id"),
+                "stopLossPrice": p.get("stopLossPrice"),
+                "takeProfitPrice": p.get("takeProfitPrice"),
+            })
+
+    position_found = len(positions) > 0
+    registry_match = bool(registry_payload.get("count", 0) > 0)
+    registry_repair = {"attempted": False, "committed": False, "status": "NOT_NEEDED_OR_NOT_REQUESTED"}
+    if position_found and not registry_match:
+        registry_repair = _pesc_v11_registry_repair_from_position(
+            positions[0], symbol=symbol_norm, side=side_norm, bot=bot, setup=setup,
+            commit=repair_registry, ack=ack,
+        )
+        if registry_repair.get("ok") or registry_repair.get("status") in {"REGISTERED", "ALREADY_REGISTERED"}:
+            registry_payload = _pesc_v11_trade_registry_matches(symbol_norm, side_norm, bot=bot, setup=setup)
+            registry_match = bool(registry_payload.get("count", 0) > 0)
+
+    stop_confirmed = bool(attached_stop_in_position or protective_orders)
+
+    if not position_found:
+        status = "NO_OPEN_POSITION_FOUND"
+        ok = True
+        requires_manual_attention = False
+    elif stop_confirmed and registry_match:
+        status = "OPEN_POSITION_PROTECTED_AND_REGISTERED"
+        ok = True
+        requires_manual_attention = False
+    elif stop_confirmed and not registry_match:
+        status = "OPEN_POSITION_PROTECTED_BUT_REGISTRY_NOT_CONFIRMED"
+        ok = False
+        requires_manual_attention = True
+    elif (not stop_confirmed) and registry_match:
+        status = "OPEN_POSITION_REGISTERED_BUT_STOP_NOT_CONFIRMED"
+        ok = False
+        requires_manual_attention = True
+    else:
+        status = "OPEN_POSITION_UNPROTECTED_OR_UNKNOWN"
+        ok = False
+        requires_manual_attention = True
+
+    source_live = {}
+    if isinstance(source_result, dict):
+        payload_result = source_result.get("payload") if isinstance(source_result.get("payload"), dict) else source_result
+        source_live = (payload_result or {}).get("live_result") if isinstance(payload_result, dict) else {}
+        source_live = source_live if isinstance(source_live, dict) else {}
+
+    return {
+        "ok": ok,
+        "version": POST_EXECUTION_SAFETY_CHECK_V1_VERSION,
+        "status": status,
+        "generated_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+        "symbol": symbol_norm,
+        "side": side_norm,
+        "bot": bot,
+        "setup": setup,
+        "requires_manual_attention": requires_manual_attention,
+        "position_found": position_found,
+        "position_count": len(positions),
+        "positions": positions,
+        "attached_stop_in_position": attached_stop_in_position,
+        "open_orders_checked": bool(orders_payload.get("ok")),
+        "open_orders_count": len(orders),
+        "protective_orders_count": len(protective_orders),
+        "protective_orders": protective_orders,
+        "stop_confirmed_by_central": stop_confirmed,
+        "trade_registry": registry_payload,
+        "registry_match": registry_match,
+        "registry_repair": registry_repair,
+        "source_execution": {
+            "status": source_live.get("status"),
+            "sent": source_live.get("sent"),
+            "order_id": source_live.get("order_id") or source_live.get("id"),
+            "client_order_id": source_live.get("client_order_id"),
+            "error": source_live.get("error"),
+        },
+        "diagnostics": {
+            "positions_fetch": {
+                "ok": positions_payload.get("ok"),
+                "error": positions_payload.get("error"),
+                "attempts": positions_payload.get("attempts"),
+            },
+            "orders_fetch": {
+                "ok": orders_payload.get("ok"),
+                "error": orders_payload.get("error"),
+                "attempts": orders_payload.get("attempts"),
+                "raw_batch_count": orders_payload.get("raw_batch_count"),
+                "exchange_candidates": orders_payload.get("exchange_candidates"),
+                "broker_callable_inventory_sample": orders_payload.get("broker_callable_inventory_sample"),
+            },
+        },
+        "notes": [
+            "V1.1 consulta posição real, tenta encontrar objetos internos do broker para ordens abertas/trigger/stop e cruza com Trade Registry.",
+            "Se o stop manual aparecer como trigger/order separada e o broker expuser a função/objeto, stop_confirmed_by_central vira true.",
+            "Se Registry estiver vazio após deploy, use repair_registry=true com ack=CENTRAL_MANAGED_EXISTING_POSITION para reparar explicitamente.",
+            "Se stop_confirmed_by_central continuar false, mantenha o stop manual na BingX e envie diagnostics.orders_fetch para adicionarmos o endpoint exato do broker.",
+        ],
+    }
+
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.9 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.
+    EXECUTION CONSOLE V1.9 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3790,7 +4273,7 @@ def execution_console_route():
       client_order_id curto enviado ao broker/BingX.
     - Real Execution Final Gate V1: antes do botão vermelho chamar o Engine em dry_run=False,
       valida checklist final de autorização, piloto, limites, posição, IDs e stop.
-    - Post-Execution Safety Check V1: após envio real, consulta posição, ordens de proteção/stop e Trade Registry.
+    - Post-Execution Safety Check V1.1: após envio real, consulta posição, ordens de proteção/stop e Trade Registry.
     """
     import urllib.parse
 
@@ -4799,7 +5282,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.9</title>
+  <title>Central Quant — Execution Console V1.9.1</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -4869,7 +5352,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.9</h1>
+  <h1>Central Quant — Execution Console V1.9.1</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -4880,7 +5363,7 @@ def execution_console_route():
     <p class="info">V1.6 / Signal ID Refresh: cada novo POST gera um signal_id novo; refresh/F5 via PRG apenas recarrega o resultado salvo.</p>
     <p class="info">Broker Client Order ID V1: a Central mantém um signal_id completo e envia ao broker/BingX um client_order_id curto e único.</p>
     <p class="info">Real Execution Final Gate V1: antes de execução real, a Central valida token, piloto, limites, posição, IDs e stop.</p>
-    <p class="info">Post-Execution Safety Check V1: após ordem real, a Central consulta posição, ordens de proteção/stop e Trade Registry.</p>
+    <p class="info">Post-Execution Safety Check V1.1: após ordem real, a Central consulta posição, ordens de proteção/stop e Trade Registry.</p>
   </div>
 
   <form method="post" class="card" action="{esc(request.path)}">
