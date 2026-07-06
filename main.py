@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-LIVE-ROUTE-V2.5.8
+# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -3008,6 +3008,305 @@ def execution_engine_verify_route():
 
 
 
+
+
+@app.route("/executionconsole", methods=["GET", "POST"])
+@app.route("/execution/console", methods=["GET", "POST"])
+def execution_console_route():
+    """
+    EXECUTION CONSOLE V1 — interface segura para preview e execução real.
+
+    Objetivo:
+    - Evitar uso manual de Postman/JSON na primeira operação real.
+    - Mostrar tela HTML simples com payload fixo/editável.
+    - Preview usa run_execution_engine(... dry_run=True).
+    - Execução real usa run_execution_engine(... dry_run=False) somente com confirmação explícita.
+    - Mantém todos os guards existentes: Executive Policy, Real Pilot Guard,
+      Confirmation Guard, Authorization Token e Broker kill switches.
+    """
+    def _field(name, default=""):
+        if request.method == "POST":
+            return str((request.form.get(name) or request.args.get(name) or default)).strip()
+        return str(request.args.get(name, default)).strip()
+
+    action = _field("action", "preview")
+    confirm = _field("confirm", "")
+
+    payload = {
+        "decision": "ALLOW",
+        "bot": _field("bot", "FALCON").upper(),
+        "setup": _field("setup", "FALCON").upper(),
+        "symbol": _field("symbol", "BTCUSDT").upper().replace("/", "").replace(":USDT", ""),
+        "side": _field("side", "SHORT").upper(),
+        "entry": _field("entry", "108000"),
+        "sl": _field("sl", "109000"),
+        "tp50": _field("tp50", "107000"),
+        "risk_pct": float(_field("risk_pct", "2") or 2),
+        "signal_id": f"EXECUTION-CONSOLE-V1-{int(time.time())}",
+    }
+
+    result = None
+    status_code = 200
+    message = None
+
+    if request.method == "POST":
+        try:
+            # Preview seguro
+            if action == "preview":
+                result = run_execution_engine(
+                    payload=payload,
+                    mode="LIVE",
+                    dry_run=True,
+                )
+                message = "Preview executado. Nenhuma ordem real foi enviada."
+
+            # Execução real deliberada
+            elif action == "execute":
+                required_phrase = os.environ.get("EXECUTION_LIVE_CONFIRMATION_PHRASE", "EXECUTE_REAL_TRADE")
+                if confirm != required_phrase:
+                    result = {
+                        "ok": False,
+                        "status": "CONFIRMATION_REQUIRED",
+                        "sent": False,
+                        "reason": "Confirmação inválida ou ausente.",
+                        "required_confirmation_value": required_phrase,
+                    }
+                    status_code = 400
+                    message = "Execução real bloqueada: confirmação inválida."
+                else:
+                    # Reaproveita o mesmo caminho seguro da rota /executionlive.
+                    # Aqui não chamamos a rota por HTTP; chamamos diretamente o Engine.
+                    policy_reasons = []
+                    policy_warnings = []
+                    executive_policy_eval = _apply_executive_policy_to_risk_reasons(
+                        trade_payload=payload,
+                        reasons=policy_reasons,
+                        warnings=policy_warnings,
+                    )
+
+                    if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
+                        result = {
+                            "ok": True,
+                            "status": "BLOCKED_BY_EXECUTIVE_POLICY",
+                            "sent": False,
+                            "decision": "DENY",
+                            "executive_policy": executive_policy_eval,
+                            "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
+                            "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
+                            "payload": payload,
+                        }
+                        message = "Execução real bloqueada por política executiva."
+                    else:
+                        if isinstance(executive_policy_eval, dict):
+                            payload["executive_policy"] = executive_policy_eval
+
+                        result = run_execution_engine(
+                            payload=payload,
+                            mode="LIVE",
+                            dry_run=False,
+                        )
+                        message = "Execução real solicitada. Verifique sent/order_id/status no resultado."
+
+            else:
+                result = {
+                    "ok": False,
+                    "status": "INVALID_ACTION",
+                    "sent": False,
+                    "reason": f"action inválida: {action}",
+                }
+                status_code = 400
+                message = "Ação inválida."
+
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "status": "EXECUTION_CONSOLE_ERROR",
+                "sent": False,
+                "error": str(exc),
+            }
+            status_code = 500
+            message = f"Erro na Execution Console: {exc}"
+
+    payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
+    result_json = json.dumps(result, ensure_ascii=False, indent=2, default=str) if result is not None else ""
+
+    # Campos resumidos para facilitar leitura
+    result_payload = result.get("payload") if isinstance(result, dict) else {}
+    live_result = result_payload.get("live_result") if isinstance(result_payload, dict) else None
+    if live_result is None and isinstance(result, dict):
+        live_result = result.get("live_result")
+    live_result = live_result if isinstance(live_result, dict) else {}
+
+    summary = {
+        "ok": result.get("ok") if isinstance(result, dict) else None,
+        "status": result_payload.get("status") if isinstance(result_payload, dict) else (result.get("status") if isinstance(result, dict) else None),
+        "sent": live_result.get("sent"),
+        "order_id": live_result.get("order_id") or live_result.get("id"),
+        "client_order_id": live_result.get("client_order_id"),
+        "live_status": live_result.get("status"),
+        "broker_error": live_result.get("error"),
+        "confirmation_guard": (live_result.get("confirmation_guard") or {}).get("status") if isinstance(live_result.get("confirmation_guard"), dict) else None,
+        "auth": (live_result.get("auth") or {}).get("status") if isinstance(live_result.get("auth"), dict) else None,
+    }
+    summary_json = json.dumps(summary, ensure_ascii=False, indent=2, default=str)
+
+    def esc(value):
+        return html.escape(str(value or ""))
+
+    html_body = f"""
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>Central Quant — Execution Console V1</title>
+  <style>
+    body {{
+      font-family: Arial, sans-serif;
+      margin: 28px;
+      background: #0f172a;
+      color: #e5e7eb;
+    }}
+    .card {{
+      background: #111827;
+      border: 1px solid #374151;
+      border-radius: 12px;
+      padding: 18px;
+      margin-bottom: 18px;
+    }}
+    h1, h2 {{ margin-top: 0; }}
+    label {{
+      display: block;
+      margin-top: 10px;
+      font-size: 13px;
+      color: #cbd5e1;
+    }}
+    input, select {{
+      width: 100%;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #4b5563;
+      background: #020617;
+      color: #e5e7eb;
+      box-sizing: border-box;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    button {{
+      padding: 12px 16px;
+      border: 0;
+      border-radius: 8px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-right: 10px;
+    }}
+    .preview {{ background: #2563eb; color: white; }}
+    .execute {{ background: #dc2626; color: white; }}
+    pre {{
+      white-space: pre-wrap;
+      background: #020617;
+      border: 1px solid #334155;
+      padding: 14px;
+      border-radius: 10px;
+      overflow-x: auto;
+    }}
+    .warn {{
+      color: #fbbf24;
+      font-weight: bold;
+    }}
+    .ok {{
+      color: #86efac;
+      font-weight: bold;
+    }}
+  </style>
+</head>
+<body>
+  <h1>Central Quant — Execution Console V1</h1>
+
+  <div class="card">
+    <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
+    <p>Para preview, nenhuma ordem real é enviada.</p>
+  </div>
+
+  <form method="post" class="card">
+    <h2>Trade</h2>
+    <div class="grid">
+      <div>
+        <label>Bot</label>
+        <input name="bot" value="{esc(payload.get('bot'))}">
+      </div>
+      <div>
+        <label>Setup</label>
+        <input name="setup" value="{esc(payload.get('setup'))}">
+      </div>
+      <div>
+        <label>Symbol</label>
+        <input name="symbol" value="{esc(payload.get('symbol'))}">
+      </div>
+      <div>
+        <label>Side</label>
+        <select name="side">
+          <option value="SHORT" {"selected" if payload.get("side") == "SHORT" else ""}>SHORT</option>
+          <option value="LONG" {"selected" if payload.get("side") == "LONG" else ""}>LONG</option>
+        </select>
+      </div>
+      <div>
+        <label>Entry</label>
+        <input name="entry" value="{esc(payload.get('entry'))}">
+      </div>
+      <div>
+        <label>SL</label>
+        <input name="sl" value="{esc(payload.get('sl'))}">
+      </div>
+      <div>
+        <label>TP50</label>
+        <input name="tp50" value="{esc(payload.get('tp50'))}">
+      </div>
+      <div>
+        <label>Risk %</label>
+        <input name="risk_pct" value="{esc(payload.get('risk_pct'))}">
+      </div>
+      <div>
+        <label>Confirmação para execução real</label>
+        <input name="confirm" value="" placeholder="EXECUTE_REAL_TRADE">
+      </div>
+    </div>
+
+    <br>
+    <button class="preview" type="submit" name="action" value="preview">Preview seguro</button>
+    <button class="execute" type="submit" name="action" value="execute">Executar ordem real</button>
+  </form>
+
+  <div class="card">
+    <h2>Payload</h2>
+    <pre>{esc(payload_json)}</pre>
+  </div>
+
+  <div class="card">
+    <h2>Resumo do resultado</h2>
+    <p>{esc(message or "Nenhuma ação executada ainda.")}</p>
+    <pre>{esc(summary_json)}</pre>
+  </div>
+
+  <div class="card">
+    <h2>Resultado completo</h2>
+    <pre>{esc(result_json or "Clique em Preview seguro antes da primeira execução real.")}</pre>
+  </div>
+
+  <div class="card">
+    <h2>Rotas úteis</h2>
+    <p><a style="color:#93c5fd" href="/executionenginehealth" target="_blank">/executionenginehealth</a></p>
+    <p><a style="color:#93c5fd" href="/executionenginelog" target="_blank">/executionenginelog</a></p>
+    <p><a style="color:#93c5fd" href="/executionverify?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT&entry=108000&sl=109000&tp50=107000" target="_blank">/executionverify BTC SHORT</a></p>
+  </div>
+</body>
+</html>
+"""
+    return html_body, status_code, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.route("/executionlive", methods=["GET", "POST"])
 @app.route("/execution/live", methods=["GET", "POST"])
 @app.route("/executionengine/live", methods=["GET", "POST"])
@@ -3235,6 +3534,7 @@ def execution_routes_compat_route():
             "Rotas de teste/run chamam o Execution Engine; respeitam as travas do V2.5.",
             "/executionverify força mode=LIVE com dry_run=True para validar o broker sem enviar ordem real.",
             "/executionlive exige POST + confirmação explícita e chama mode=LIVE com dry_run=False.",
+            "/executionconsole fornece interface HTML segura para preview e execução real confirmada.",
             "Não ativam operação real sozinhas.",
         ],
     }
