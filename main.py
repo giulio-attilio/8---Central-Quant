@@ -30655,6 +30655,499 @@ def execution_dry_run_hard_kill_switch_v1_health_route():
     }, 200
 
 
+# ==========================================================
+# DISASTER STOP HEDGE MODE FIX V1 — REMOVE REDUCEONLY IN HEDGE STOP
+# ==========================================================
+# Problema corrigido:
+# - BingX Hedge Mode rejeita stop/trigger quando o campo ReduceOnly é enviado.
+# - O stop de desastre deve usar positionSide correto + lado oposto + quantity,
+#   sem reduceOnly/closePosition no payload da ordem stop.
+DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION = "2026-07-06-DISASTER-STOP-HEDGE-MODE-FIX-V1"
+
+
+def _dshm_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _dshm_v1_upper(value):
+    return str(value or "").strip().upper()
+
+
+def _dshm_v1_position_side_from_values(*values):
+    for value in values:
+        side = _dshm_v1_upper(value)
+        if side in {"LONG", "SHORT"}:
+            return side
+    return ""
+
+
+def _dshm_v1_order_type_is_stoplike(order_type=None, params=None, kwargs=None):
+    text = " ".join([
+        _dshm_v1_upper(order_type),
+        _dshm_v1_upper((params or {}).get("type") if isinstance(params, dict) else None),
+        _dshm_v1_upper((kwargs or {}).get("type") if isinstance(kwargs, dict) else None),
+        _dshm_v1_upper((params or {}).get("orderType") if isinstance(params, dict) else None),
+    ])
+    if any(key in text for key in ("STOP", "TRIGGER", "TAKE_PROFIT", "TP", "SL")):
+        return True
+    if isinstance(params, dict):
+        return any(k in params for k in ("stopPrice", "triggerPrice", "stopLossPrice", "takeProfitPrice", "activationPrice"))
+    return False
+
+
+def _dshm_v1_clean_order_params(params=None, position_side=None, order_type=None):
+    """Remove campos proibidos pela BingX em Hedge Mode sem alterar stopPrice/trigger/positionSide."""
+    original = dict(params or {}) if isinstance(params, dict) else {}
+    cleaned = dict(original)
+    side = _dshm_v1_position_side_from_values(
+        position_side,
+        cleaned.get("positionSide"),
+        cleaned.get("position_side"),
+        cleaned.get("posSide"),
+    )
+    stoplike = _dshm_v1_order_type_is_stoplike(order_type=order_type, params=cleaned)
+    hedge_mode = bool(side in {"LONG", "SHORT"})
+    removed = {}
+    if hedge_mode and stoplike:
+        for key in ("reduceOnly", "reduce_only", "closePosition", "close_position"):
+            if key in cleaned:
+                removed[key] = cleaned.pop(key)
+        cleaned["positionSide"] = side
+    return {
+        "params": cleaned,
+        "removed": removed,
+        "hedge_mode": hedge_mode,
+        "position_side": side,
+        "stoplike": stoplike,
+        "changed": cleaned != original,
+        "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+    }
+
+
+def _dshm_v1_clean_broker_kwargs(kwargs=None):
+    kwargs = dict(kwargs or {})
+    position_side = _dshm_v1_position_side_from_values(
+        kwargs.get("position_side"),
+        kwargs.get("positionSide"),
+        kwargs.get("posSide"),
+        kwargs.get("position"),
+    )
+    hedge_mode = bool(position_side in {"LONG", "SHORT"})
+    removed = {}
+    if hedge_mode:
+        # Não deixamos o default reduce_only=True do broker gerar reduceOnly no payload.
+        # Passamos reduce_only=False como hint e o patch de exchange.create_order remove o campo
+        # caso o broker ainda tente serializar reduceOnly=False.
+        for key in ("reduceOnly", "closePosition", "close_position"):
+            if key in kwargs:
+                removed[key] = kwargs.pop(key)
+        kwargs["position_side"] = position_side
+        kwargs["positionSide"] = position_side
+        kwargs["reduce_only"] = False
+        kwargs["hedge_mode"] = True
+        kwargs["_disaster_stop_hedge_mode_fix_v1"] = True
+    return {
+        "kwargs": kwargs,
+        "removed": removed,
+        "hedge_mode": hedge_mode,
+        "position_side": position_side,
+        "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+    }
+
+
+def _dshm_v1_sanitize_result(value):
+    try:
+        if callable(globals().get("_execution_final_gate_v1_sanitize")):
+            return _execution_final_gate_v1_sanitize(value)
+    except Exception:
+        pass
+    try:
+        if callable(globals().get("_audit_sanitize")):
+            return _audit_sanitize(value)
+    except Exception:
+        pass
+    return value
+
+
+def _dshm_v1_dry_run_active():
+    try:
+        if callable(globals().get("_dry_run_hard_kill_v1_active")):
+            return bool(_dry_run_hard_kill_v1_active())
+    except Exception:
+        return False
+    return False
+
+
+def _dshm_v1_patch_create_disaster_stop_order():
+    if central_broker is None:
+        return {
+            "ok": False,
+            "patched": False,
+            "status": "BROKER_MODULE_MISSING",
+            "error": globals().get("BROKER_IMPORT_ERROR"),
+            "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+        }
+    name = "create_disaster_stop_order"
+    try:
+        current = getattr(central_broker, name, None)
+    except Exception as exc:
+        return {"ok": False, "patched": False, "status": "BROKER_FUNCTION_LOOKUP_ERROR", "error": str(exc), "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    if not callable(current):
+        return {"ok": True, "patched": False, "status": "BROKER_FUNCTION_NOT_PRESENT", "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    if getattr(central_broker, "_disaster_stop_hedge_mode_fix_v1_patched", False):
+        return {"ok": True, "patched": True, "status": "ALREADY_PATCHED", "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+
+    def _wrapped_create_disaster_stop_order(*args, **kwargs):
+        if _dshm_v1_dry_run_active():
+            return {
+                "ok": False,
+                "created": False,
+                "sent": False,
+                "blocked": True,
+                "status": "DRY_RUN_HARD_KILL_BLOCKED_LIVE_BROKER_CALL",
+                "function": "create_disaster_stop_order",
+                "reason": "dry_run=True: stop real bloqueado antes do broker.",
+                "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+            }
+        cleaned_payload = _dshm_v1_clean_broker_kwargs(kwargs)
+        cleaned_kwargs = cleaned_payload.get("kwargs") or {}
+        try:
+            result = current(*args, **cleaned_kwargs)
+            if isinstance(result, dict):
+                result.setdefault("disaster_stop_hedge_mode_fix", {
+                    "applied": True,
+                    "hedge_mode": cleaned_payload.get("hedge_mode"),
+                    "position_side": cleaned_payload.get("position_side"),
+                    "removed_for_bingx_hedge_mode": cleaned_payload.get("removed"),
+                    "token_value_exposed": False,
+                    "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+                })
+            return result
+        except TypeError as exc:
+            # Alguns wrappers não aceitam hedge_mode/_fix flags. Repetimos sem flags auxiliares.
+            retry_kwargs = dict(cleaned_kwargs)
+            for key in ("hedge_mode", "_disaster_stop_hedge_mode_fix_v1"):
+                retry_kwargs.pop(key, None)
+            try:
+                result = current(*args, **retry_kwargs)
+                if isinstance(result, dict):
+                    result.setdefault("disaster_stop_hedge_mode_fix", {
+                        "applied": True,
+                        "hedge_mode": cleaned_payload.get("hedge_mode"),
+                        "position_side": cleaned_payload.get("position_side"),
+                        "removed_for_bingx_hedge_mode": cleaned_payload.get("removed"),
+                        "retry_after_type_error": str(exc),
+                        "token_value_exposed": False,
+                        "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+                    })
+                return result
+            except Exception:
+                raise
+
+    try:
+        setattr(central_broker, "_disaster_stop_hedge_mode_fix_v1_original_create_disaster_stop_order", current)
+        setattr(central_broker, name, _wrapped_create_disaster_stop_order)
+        setattr(central_broker, "_disaster_stop_hedge_mode_fix_v1_patched", True)
+        return {"ok": True, "patched": True, "status": "BROKER_CREATE_DISASTER_STOP_ORDER_PATCHED", "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    except Exception as exc:
+        return {"ok": False, "patched": False, "status": "BROKER_PATCH_FAILED", "error": str(exc), "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+
+
+def _dshm_v1_exchange_candidates():
+    candidates = []
+    try:
+        if central_broker is not None:
+            for attr in ("exchange", "_exchange", "client"):
+                obj = getattr(central_broker, attr, None)
+                if obj is not None and obj not in [x[1] for x in candidates]:
+                    candidates.append((f"central_broker.{attr}", obj))
+    except Exception:
+        pass
+    return candidates
+
+
+def _dshm_v1_patch_exchange_create_order(exchange_label, exchange_obj):
+    if exchange_obj is None:
+        return {"exchange": exchange_label, "ok": False, "patched": False, "status": "EXCHANGE_MISSING", "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    try:
+        current = getattr(exchange_obj, "create_order", None)
+    except Exception as exc:
+        return {"exchange": exchange_label, "ok": False, "patched": False, "status": "CREATE_ORDER_LOOKUP_ERROR", "error": str(exc), "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    if not callable(current):
+        return {"exchange": exchange_label, "ok": True, "patched": False, "status": "CREATE_ORDER_NOT_PRESENT", "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    if getattr(exchange_obj, "_disaster_stop_hedge_mode_fix_v1_create_order_patched", False):
+        return {"exchange": exchange_label, "ok": True, "patched": True, "status": "ALREADY_PATCHED", "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+
+    def _wrapped_create_order(*args, **kwargs):
+        if _dshm_v1_dry_run_active():
+            return {
+                "ok": False,
+                "created": False,
+                "sent": False,
+                "blocked": True,
+                "status": "DRY_RUN_HARD_KILL_BLOCKED_EXCHANGE_CREATE_ORDER",
+                "function": "exchange.create_order",
+                "reason": "dry_run=True: chamada exchange.create_order bloqueada.",
+                "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+            }
+
+        args_list = list(args)
+        order_type = args_list[1] if len(args_list) > 1 else kwargs.get("type")
+        params = None
+        params_was_positional = False
+        if len(args_list) >= 6 and isinstance(args_list[5], dict):
+            params = args_list[5]
+            params_was_positional = True
+        elif isinstance(kwargs.get("params"), dict):
+            params = kwargs.get("params")
+        else:
+            params = {}
+        cleaned = _dshm_v1_clean_order_params(params=params, order_type=order_type)
+        if cleaned.get("changed"):
+            if params_was_positional:
+                args_list[5] = cleaned.get("params") or {}
+            else:
+                kwargs["params"] = cleaned.get("params") or {}
+        result = current(*tuple(args_list), **kwargs)
+        if isinstance(result, dict):
+            result.setdefault("disaster_stop_hedge_mode_fix", {
+                "applied": bool(cleaned.get("changed")),
+                "hedge_mode": cleaned.get("hedge_mode"),
+                "position_side": cleaned.get("position_side"),
+                "removed_for_bingx_hedge_mode": cleaned.get("removed"),
+                "order_type": order_type,
+                "exchange": exchange_label,
+                "token_value_exposed": False,
+                "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+            })
+        return result
+
+    try:
+        setattr(exchange_obj, "_disaster_stop_hedge_mode_fix_v1_original_create_order", current)
+        setattr(exchange_obj, "create_order", _wrapped_create_order)
+        setattr(exchange_obj, "_disaster_stop_hedge_mode_fix_v1_create_order_patched", True)
+        return {"exchange": exchange_label, "ok": True, "patched": True, "status": "EXCHANGE_CREATE_ORDER_PATCHED", "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    except Exception as exc:
+        return {"exchange": exchange_label, "ok": False, "patched": False, "status": "EXCHANGE_PATCH_FAILED", "error": str(exc), "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+
+
+def _dshm_v1_patch_engine_refs():
+    refs = []
+    try:
+        ee_module = importlib.import_module("execution_engine")
+    except Exception as exc:
+        return {"ok": False, "status": "EXECUTION_ENGINE_IMPORT_FAILED", "error": str(exc), "patched_refs": refs, "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+    try:
+        for attr in ("broker", "central_broker"):
+            module_broker = getattr(ee_module, attr, None)
+            if module_broker is None or central_broker is None:
+                continue
+            if hasattr(module_broker, "create_disaster_stop_order") and hasattr(central_broker, "create_disaster_stop_order"):
+                setattr(module_broker, "create_disaster_stop_order", getattr(central_broker, "create_disaster_stop_order"))
+                refs.append(f"execution_engine.{attr}.create_disaster_stop_order")
+            for ex_attr in ("exchange", "_exchange", "client"):
+                try:
+                    module_ex = getattr(module_broker, ex_attr, None)
+                    central_ex = getattr(central_broker, ex_attr, None)
+                    if module_ex is not None and central_ex is not None and hasattr(central_ex, "create_order"):
+                        setattr(module_ex, "create_order", getattr(central_ex, "create_order"))
+                        refs.append(f"execution_engine.{attr}.{ex_attr}.create_order")
+                except Exception as exc:
+                    refs.append(f"execution_engine.{attr}.{ex_attr}.create_order:ERROR:{exc}")
+    except Exception as exc:
+        refs.append(f"engine_refs_error:{exc}")
+    return {"ok": True, "status": "ENGINE_REFS_PATCHED" if refs else "NO_ENGINE_REFS_FOUND", "patched_refs": refs, "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+
+
+DISASTER_STOP_HEDGE_MODE_FIX_V1_BROKER_PATCH = _dshm_v1_patch_create_disaster_stop_order()
+DISASTER_STOP_HEDGE_MODE_FIX_V1_EXCHANGE_PATCHES = [_dshm_v1_patch_exchange_create_order(label, obj) for label, obj in _dshm_v1_exchange_candidates()]
+DISASTER_STOP_HEDGE_MODE_FIX_V1_ENGINE_PATCH = _dshm_v1_patch_engine_refs()
+
+
+# Reforço do Fallback V1: a tentativa manual/automática de stop agora também usa params sem ReduceOnly em Hedge Mode.
+def _dsf_v1_attempt_broker_stop_order(symbol, side, qty, stop_price, client_order_id):
+    """
+    Disaster Stop Fallback V1 + Hedge Mode Fix V1.
+    Tenta criar stop/trigger para fechar a posição em Hedge Mode sem reduceOnly/closePosition.
+    Não executa market close.
+    """
+    attempts = []
+    side_n = _dsf_v1_norm_side(side)
+    close_side = _dsf_v1_position_side_to_close_side(side_n)
+    market_symbol = _dsf_v1_market_symbol(symbol)
+    symbol_norm = _dsf_v1_norm_symbol(symbol)
+    stop_f = _dsf_v1_float(stop_price)
+    qty_f = _dsf_v1_float(qty)
+
+    if central_broker is None:
+        return {"ok": False, "attempts": [{"method": "broker_import", "ok": False, "error": BROKER_IMPORT_ERROR}], "status": "BROKER_IMPORT_ERROR", "hedge_mode_fix_version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION}
+
+    if not (symbol_norm and side_n in {"LONG", "SHORT"} and close_side and qty_f and qty_f > 0 and stop_f):
+        return {
+            "ok": False,
+            "status": "INVALID_STOP_ORDER_INPUT",
+            "attempts": [],
+            "inputs": {"symbol": symbol_norm, "side": side_n, "close_side": close_side, "qty": qty, "stop_price": stop_price},
+            "hedge_mode_fix_version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+        }
+
+    base_params = {
+        "stopPrice": stop_f,
+        "triggerPrice": stop_f,
+        "positionSide": side_n,
+        "workingType": "MARK_PRICE",
+        "clientOrderId": client_order_id,
+        "clientOrderID": client_order_id,
+        # Intencionalmente não incluímos reduceOnly/closePosition em Hedge Mode.
+    }
+    clean_info = _dshm_v1_clean_order_params(base_params, position_side=side_n, order_type="STOP_MARKET")
+    params = clean_info.get("params") or base_params
+
+    wrapper_methods = [
+        "create_disaster_stop_order",
+        "place_disaster_stop",
+        "place_stop_loss",
+        "create_stop_loss_order",
+        "place_stop_order",
+        "create_stop_order",
+    ]
+    for name in wrapper_methods:
+        fn = getattr(central_broker, name, None)
+        if not callable(fn):
+            attempts.append({"method": f"broker.{name}", "ok": False, "error": "missing"})
+            continue
+        kwargs = {
+            "symbol": symbol_norm,
+            "side": close_side,
+            "position_side": side_n,
+            "positionSide": side_n,
+            "amount": qty_f,
+            "qty": qty_f,
+            "stop_price": stop_f,
+            "sl": stop_f,
+            "reduce_only": False,
+            "client_order_id": client_order_id,
+            "params": params,
+            "hedge_mode": True,
+        }
+        try:
+            res = fn(**kwargs)
+            attempts.append({"method": f"broker.{name}", "ok": True, "result": _dshm_v1_sanitize_result(res), "hedge_mode_fix": clean_info})
+            return {"ok": True, "status": "STOP_ORDER_SUBMIT_ATTEMPTED", "method": f"broker.{name}", "result": res, "attempts": attempts, "hedge_mode_fix": clean_info}
+        except TypeError as exc:
+            attempts.append({"method": f"broker.{name}", "ok": False, "error": f"TypeError kwargs: {exc}", "hedge_mode_fix": clean_info})
+            try:
+                retry_kwargs = dict(kwargs)
+                for key in ("params", "hedge_mode", "positionSide"):
+                    retry_kwargs.pop(key, None)
+                res = fn(**retry_kwargs)
+                attempts.append({"method": f"broker.{name}:reduced_kwargs", "ok": True, "result": _dshm_v1_sanitize_result(res), "hedge_mode_fix": clean_info})
+                return {"ok": True, "status": "STOP_ORDER_SUBMIT_ATTEMPTED", "method": f"broker.{name}:reduced_kwargs", "result": res, "attempts": attempts, "hedge_mode_fix": clean_info}
+            except TypeError as exc2:
+                attempts.append({"method": f"broker.{name}:reduced_kwargs", "ok": False, "error": str(exc2), "hedge_mode_fix": clean_info})
+                try:
+                    res = fn(symbol_norm, close_side, qty_f, stop_f)
+                    attempts.append({"method": f"broker.{name}:positional", "ok": True, "result": _dshm_v1_sanitize_result(res), "hedge_mode_fix": clean_info})
+                    return {"ok": True, "status": "STOP_ORDER_SUBMIT_ATTEMPTED", "method": f"broker.{name}:positional", "result": res, "attempts": attempts, "hedge_mode_fix": clean_info}
+                except Exception as exc3:
+                    attempts.append({"method": f"broker.{name}:positional", "ok": False, "error": str(exc3), "hedge_mode_fix": clean_info})
+            except Exception as exc2:
+                attempts.append({"method": f"broker.{name}:reduced_kwargs", "ok": False, "error": str(exc2), "hedge_mode_fix": clean_info})
+        except Exception as exc:
+            attempts.append({"method": f"broker.{name}", "ok": False, "error": str(exc), "hedge_mode_fix": clean_info})
+
+    exchange = getattr(central_broker, "exchange", None) or getattr(central_broker, "_exchange", None) or getattr(central_broker, "client", None)
+    create_order = getattr(exchange, "create_order", None) if exchange is not None else None
+    if not callable(create_order):
+        attempts.append({"method": "exchange.create_order", "ok": False, "error": "missing"})
+        return {"ok": False, "status": "NO_STOP_ORDER_METHOD_AVAILABLE", "attempts": attempts, "hedge_mode_fix": clean_info}
+
+    order_types = ["STOP_MARKET", "STOP", "TRIGGER_MARKET"]
+    for order_type in order_types:
+        try:
+            order_clean = _dshm_v1_clean_order_params(params=params, position_side=side_n, order_type=order_type)
+            res = create_order(market_symbol, order_type, close_side.lower(), qty_f, None, order_clean.get("params") or params)
+            attempts.append({"method": "exchange.create_order", "type": order_type, "ok": True, "result": _dshm_v1_sanitize_result(res), "hedge_mode_fix": order_clean})
+            return {"ok": True, "status": "STOP_ORDER_SUBMIT_ATTEMPTED", "method": f"exchange.create_order:{order_type}", "result": res, "attempts": attempts, "hedge_mode_fix": order_clean}
+        except Exception as exc:
+            attempts.append({"method": "exchange.create_order", "type": order_type, "ok": False, "error": str(exc), "hedge_mode_fix": _dshm_v1_clean_order_params(params=params, position_side=side_n, order_type=order_type)})
+
+    return {"ok": False, "status": "STOP_ORDER_SUBMIT_FAILED", "attempts": attempts, "hedge_mode_fix": clean_info}
+
+
+@app.route("/disasterstophedgefix/health", methods=["GET"])
+@app.route("/disasterstop/hedgefix/health", methods=["GET"])
+@app.route("/disasterstophedgemodefix/health", methods=["GET"])
+def disaster_stop_hedge_mode_fix_v1_health_route():
+    sample_short_original = {
+        "stopPrice": 109000.0,
+        "triggerPrice": 109000.0,
+        "reduceOnly": True,
+        "closePosition": True,
+        "positionSide": "SHORT",
+        "workingType": "MARK_PRICE",
+        "clientOrderId": "DSHMFIX-SAMPLE-SHORT",
+    }
+    sample_long_original = {
+        "stopPrice": 107000.0,
+        "triggerPrice": 107000.0,
+        "reduceOnly": True,
+        "closePosition": True,
+        "positionSide": "LONG",
+        "workingType": "MARK_PRICE",
+        "clientOrderId": "DSHMFIX-SAMPLE-LONG",
+    }
+    sample_short = _dshm_v1_clean_order_params(sample_short_original, position_side="SHORT", order_type="STOP_MARKET")
+    sample_long = _dshm_v1_clean_order_params(sample_long_original, position_side="LONG", order_type="STOP_MARKET")
+    return {
+        "ok": True,
+        "module": "disaster_stop_hedge_mode_fix_v1",
+        "version": DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION,
+        "generated_at": _dshm_v1_now(),
+        "broker_patch": DISASTER_STOP_HEDGE_MODE_FIX_V1_BROKER_PATCH,
+        "exchange_patches": DISASTER_STOP_HEDGE_MODE_FIX_V1_EXCHANGE_PATCHES,
+        "engine_patch": DISASTER_STOP_HEDGE_MODE_FIX_V1_ENGINE_PATCH,
+        "sample_short_stop_params": {
+            "original": sample_short_original,
+            "cleaned": sample_short.get("params"),
+            "removed": sample_short.get("removed"),
+            "hedge_mode": sample_short.get("hedge_mode"),
+            "position_side": sample_short.get("position_side"),
+            "stoplike": sample_short.get("stoplike"),
+        },
+        "sample_long_stop_params": {
+            "original": sample_long_original,
+            "cleaned": sample_long.get("params"),
+            "removed": sample_long.get("removed"),
+            "hedge_mode": sample_long.get("hedge_mode"),
+            "position_side": sample_long.get("position_side"),
+            "stoplike": sample_long.get("stoplike"),
+        },
+        "rules": [
+            "Em Hedge Mode, stop de proteção não envia reduceOnly.",
+            "Em Hedge Mode, stop de proteção não envia closePosition.",
+            "SHORT fecha com BUY + positionSide SHORT.",
+            "LONG fecha com SELL + positionSide LONG.",
+            "Health não envia ordem real.",
+        ],
+        "routes": [
+            "/disasterstophedgefix/health",
+            "/disasterstop/hedgefix/health",
+            "/disasterstopfallback/health",
+            "/executiondryrunhardkill/health",
+            "/executionfinalgate/health",
+        ],
+        "token_value_exposed": False,
+    }, 200
+
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
