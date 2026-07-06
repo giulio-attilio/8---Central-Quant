@@ -5021,7 +5021,7 @@ def real_trade_lifecycle_monitor_v1_health():
 # - Persistir snapshot do Trade Registry e do estado real da BingX.
 # - Reconstruir o Registry quando houver posição real protegida, mas o arquivo OPEN estiver vazio.
 # - Bloquear nova execução real quando existir posição real sem Registry confirmado.
-REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1"
+REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1.1"
 REGISTRY_PERSISTENCE_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_latest.json"
 REGISTRY_PERSISTENCE_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_events.jsonl"
 
@@ -5318,35 +5318,97 @@ def registry_persistence_v1_rebuild_from_broker(symbol=None, side=None, bot=None
     }
 
 
-def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=None, commit=False, source="manual"):
+def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=None, commit=False, source="manual", ack=None, sl=None, tp50=None, auto_rebuild=False, block_empty_registry_snapshot=True):
+    """
+    Registry Persistence V1.1.
+
+    V1 salvava snapshot mesmo quando havia posição real protegida, mas Registry vazio.
+    Isso era útil para diagnóstico, mas perigoso se o snapshot "latest" passasse a representar
+    um estado sem OPEN. V1.1 muda a regra:
+    - Se houver posição real + stop confirmado + Registry ausente, commit é bloqueado por padrão.
+    - Com rebuild/auto_rebuild + ack explícito, o Registry é reconstruído antes do snapshot.
+    - O snapshot salvo, quando há posição aberta, deve preferir o estado pós-rebuild confirmado.
+    """
     live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
     registry_state = _rp_v1_registry_snapshot_full()
+
+    def needs_rebuild(ls):
+        return bool(
+            isinstance(ls, dict)
+            and ls.get("position_found")
+            and ls.get("stop_confirmed_by_central")
+            and not ls.get("registry_match")
+        )
+
+    rebuild_required = needs_rebuild(live_state)
+    auto_rebuild_result = None
+
+    if rebuild_required and auto_rebuild:
+        auto_rebuild_result = registry_persistence_v1_rebuild_from_broker(
+            symbol=symbol,
+            side=side,
+            bot=bot,
+            setup=setup,
+            commit=commit,
+            ack=ack,
+            sl=sl,
+            tp50=tp50,
+        )
+        # Recarrega tudo após tentativa de rebuild, mesmo em erro, para refletir estado real.
+        live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
+        registry_state = _rp_v1_registry_snapshot_full()
+        rebuild_required = needs_rebuild(live_state)
+
     payload = {
-        "ok": True,
+        "ok": not bool(rebuild_required),
         "version": REGISTRY_PERSISTENCE_V1_VERSION,
+        "status": "REGISTRY_PERSISTENCE_READY" if not rebuild_required else "REBUILD_REQUIRED_BEFORE_SNAPSHOT",
         "generated_at": _rp_v1_now(),
         "source": source,
         "data_dir_status": _rp_v1_data_dir_status(),
         "live_state": live_state,
         "registry_state": registry_state,
+        "rebuild_required": {
+            "required": bool(rebuild_required),
+            "reason": "POSITION_PROTECTED_BUT_REGISTRY_MISSING" if rebuild_required else None,
+            "required_ack": "CENTRAL_MANAGED_EXISTING_POSITION" if rebuild_required else None,
+            "recommended_route": f"/registrypersistence?symbol={_rp_v1_norm_symbol(symbol or 'BTCUSDT')}&side={_rp_v1_norm_side(side or 'SHORT')}&bot={_rp_v1_norm_bot(bot or 'FALCON')}&setup={str(setup or bot or 'FALCON').upper()}&rebuild=true&commit=true&ack=CENTRAL_MANAGED_EXISTING_POSITION" + (f"&sl={sl}" if sl is not None else ""),
+        },
+        "auto_rebuild": auto_rebuild_result,
         "summary": {
             "position_found": live_state.get("position_found"),
             "registry_match": live_state.get("registry_match"),
             "stop_confirmed_by_central": live_state.get("stop_confirmed_by_central"),
             "open_count": registry_state.get("open_count"),
+            "rebuild_required": bool(rebuild_required),
         },
     }
+
     save_result = {"attempted": False, "committed": False, "status": "COMMIT_NOT_REQUESTED"}
     if commit:
-        try:
-            _rp_v1_atomic_write_json(REGISTRY_PERSISTENCE_V1_LATEST_FILE, payload)
-            _rp_v1_append_event({"event": "REGISTRY_PERSISTENCE_SNAPSHOT", "generated_at": _rp_v1_now(), "summary": payload.get("summary"), "source": source})
-            save_result = {"attempted": True, "committed": True, "status": "SNAPSHOT_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
-        except Exception as exc:
-            save_result = {"attempted": True, "committed": False, "status": "SNAPSHOT_SAVE_ERROR", "error": str(exc), "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
+        if rebuild_required and block_empty_registry_snapshot:
+            save_result = {
+                "attempted": True,
+                "committed": False,
+                "status": "SNAPSHOT_BLOCKED_REBUILD_REQUIRED",
+                "reason": "posição real protegida existe, mas Registry não tem OPEN confirmado; use rebuild=true com ack explícito antes de salvar latest",
+                "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE),
+            }
+        else:
+            try:
+                _rp_v1_atomic_write_json(REGISTRY_PERSISTENCE_V1_LATEST_FILE, payload)
+                _rp_v1_append_event({
+                    "event": "REGISTRY_PERSISTENCE_SNAPSHOT",
+                    "generated_at": _rp_v1_now(),
+                    "summary": payload.get("summary"),
+                    "source": source,
+                    "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                })
+                save_result = {"attempted": True, "committed": True, "status": "SNAPSHOT_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
+            except Exception as exc:
+                save_result = {"attempted": True, "committed": False, "status": "SNAPSHOT_SAVE_ERROR", "error": str(exc), "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
     payload["snapshot_save"] = save_result
     return payload
-
 
 def registry_persistence_v1_restore_from_latest_snapshot(commit=False, ack=None):
     latest = _rp_v1_read_latest_snapshot()
@@ -5428,10 +5490,19 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
             tp50 = request.args.get("tp50")
         except Exception:
             pass
-        persistence = registry_persistence_v1_snapshot(symbol=symbol, side=side, bot=bot, setup=setup, commit=commit_snapshot, source="lifecycle_monitor")
-        # Se o lifecycle detectou posição protegida mas Registry ausente, permite rebuild explícito no mesmo fluxo.
-        if rebuild_requested and isinstance(lifecycle, dict) and lifecycle.get("position_found") and lifecycle.get("stop_confirmed_by_central") and not lifecycle.get("registry_match"):
-            persistence["rebuild"] = registry_persistence_v1_rebuild_from_broker(symbol=symbol, side=side, bot=bot, setup=setup, commit=True, ack=ack, sl=sl, tp50=tp50)
+        persistence = registry_persistence_v1_snapshot(
+            symbol=symbol,
+            side=side,
+            bot=bot,
+            setup=setup,
+            commit=commit_snapshot,
+            source="lifecycle_monitor",
+            ack=ack,
+            sl=sl,
+            tp50=tp50,
+            auto_rebuild=bool(rebuild_requested),
+        )
+        # Se restore foi pedido, continua exigindo ack específico.
         if restore_requested:
             persistence["restore"] = registry_persistence_v1_restore_from_latest_snapshot(commit=True, ack=ack)
         lifecycle["registry_persistence_v1"] = {
@@ -5458,13 +5529,23 @@ def registry_persistence_v1_route():
     setup = request.args.get("setup") or bot
     commit = _rp_v1_bool(request.args.get("commit") or request.args.get("persist"), False)
     rebuild = _rp_v1_bool(request.args.get("rebuild") or request.args.get("repair_registry") or request.args.get("rebuild_registry"), False)
+    auto_rebuild = _rp_v1_bool(request.args.get("auto_rebuild") or request.args.get("autorebuild"), False)
     restore = _rp_v1_bool(request.args.get("restore") or request.args.get("restore_registry") or request.args.get("restore_from_snapshot"), False)
     ack = request.args.get("ack") or request.args.get("registry_persistence_ack")
     sl = request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss")
     tp50 = request.args.get("tp50")
-    payload = registry_persistence_v1_snapshot(symbol=symbol, side=side, bot=bot, setup=setup, commit=commit, source="route")
-    if rebuild:
-        payload["rebuild"] = registry_persistence_v1_rebuild_from_broker(symbol=symbol, side=side, bot=bot, setup=setup, commit=commit, ack=ack, sl=sl, tp50=tp50)
+    payload = registry_persistence_v1_snapshot(
+        symbol=symbol,
+        side=side,
+        bot=bot,
+        setup=setup,
+        commit=commit,
+        source="route",
+        ack=ack,
+        sl=sl,
+        tp50=tp50,
+        auto_rebuild=bool(rebuild or auto_rebuild),
+    )
     if restore:
         payload["restore"] = registry_persistence_v1_restore_from_latest_snapshot(commit=commit, ack=ack)
     payload["routes"] = [
@@ -5501,7 +5582,7 @@ def registry_persistence_v1_health_route():
         },
         "notes": [
             "Registry Persistence V1 salva snapshot do Registry e do estado real da BingX.",
-            "Se houver posição real protegida e Registry vazio após deploy/restart, use rebuild com ack explícito.",
+            "Se houver posição real protegida e Registry vazio após deploy/restart, V1.1 bloqueia snapshot vazio e exige rebuild com ack explícito.",
             "O Final Gate consulta esta camada e bloqueia nova execução real se houver posição existente sem Registry confirmado.",
             "Para persistência real entre deploys no Render, CENTRAL_DATA_DIR ou DATA_DIR deve apontar para um disco persistente.",
         ],
@@ -5517,7 +5598,7 @@ def registry_persistence_v1_health_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.13 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.
+    EXECUTION CONSOLE V1.13 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -5536,7 +5617,7 @@ def execution_console_route():
     - Real Execution Final Gate V1: antes do botão vermelho chamar o Engine em dry_run=False,
       valida checklist final de autorização, piloto, limites, posição, IDs e stop.
     - Post-Execution Safety Check V1.1: após envio real, consulta posição, ordens de proteção/stop e Trade Registry.
-    - Registry Persistence V1: persiste snapshot/rebuild do Registry e bloqueia nova execução real se houver posição existente sem Registry confirmado.
+    - Registry Persistence V1.1: persiste snapshot/rebuild do Registry e bloqueia nova execução real se houver posição existente sem Registry confirmado.
     """
     import urllib.parse
 
@@ -6560,7 +6641,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.13</title>
+  <title>Central Quant — Execution Console V1.14</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -6630,7 +6711,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.13</h1>
+  <h1>Central Quant — Execution Console V1.14</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
