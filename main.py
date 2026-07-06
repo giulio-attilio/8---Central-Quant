@@ -3012,7 +3012,7 @@ def execution_engine_verify_route():
 # ==========================================================
 # TRADE REGISTRY SYNC V1 — EXECUTION/BROKER POSITION LINK
 # ==========================================================
-TRADE_REGISTRY_SYNC_V1_VERSION = "2026-07-06-TRADE-REGISTRY-SYNC-V1"
+TRADE_REGISTRY_SYNC_V1_VERSION = "2026-07-06-TRADE-REGISTRY-SYNC-V1.1"
 
 def _trs_v1_norm_symbol(value):
     try:
@@ -3296,8 +3296,8 @@ def trade_registry_sync_v1_health_route():
         "trade_registry_loaded": central_trade_registry is not None,
         "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
         "notes": [
-            "V1 registra automaticamente ordem real enviada pela Central no Trade Registry.",
-            "V1 também permite backfill controlado de posição real detectada no Execution Console com acknowledgement explícito.",
+            "V1.1 registra automaticamente ordem real enviada pela Central no Trade Registry e recalcula matches após o sync.",
+            "V1.1 também permite backfill controlado de posição real detectada no Execution Console com acknowledgement explícito e refresh imediato do estado.",
         ],
     }
 
@@ -3309,7 +3309,7 @@ def trade_registry_sync_v1_health_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.5 — PRG + Real Position Awareness + Trade Registry Sync V1.
+    EXECUTION CONSOLE V1.5.1 — PRG + Real Position Awareness + Trade Registry Sync V1.1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3604,28 +3604,45 @@ def execution_console_route():
                     mode="LIVE",
                     dry_run=True,
                 )
-                preflight_result, existing_position_state = _attach_existing_position_state(preflight_result, payload)
+
+                # V1.1: calcula estado ANTES do sync apenas para auditoria.
+                # O painel principal deve exibir o estado DEPOIS do sync, já com Registry recarregado.
+                preflight_result, existing_position_state_before_sync = _attach_existing_position_state(preflight_result, payload)
+                existing_position_state_after_sync = existing_position_state_before_sync
+
                 ack = str(payload.get("existing_position_ack") or "").strip().upper()
                 sync_result = trade_registry_sync_v1_backfill_from_existing_position_state(
                     payload=payload,
-                    existing_position_state=existing_position_state,
+                    existing_position_state=existing_position_state_before_sync,
                     commit=True,
                     ack=ack,
                 )
+
+                if sync_result.get("ok"):
+                    # Recarrega imediatamente o Trade Registry e recalcula o estado visual.
+                    # Isso elimina o falso central_managed_likely=false logo após BACKFILL_DONE.
+                    try:
+                        preflight_result, existing_position_state_after_sync = _attach_existing_position_state(preflight_result, payload)
+                        sync_result["post_sync_trade_registry_matches"] = (existing_position_state_after_sync or {}).get("trade_registry_matches")
+                        sync_result["post_sync_central_managed_likely"] = bool((existing_position_state_after_sync or {}).get("central_managed_likely"))
+                    except Exception as _sync_refresh_exc:
+                        sync_result["post_sync_refresh_error"] = str(_sync_refresh_exc)
+
                 result = {
                     "ok": bool(sync_result.get("ok")),
                     "status": sync_result.get("status"),
                     "sent": False,
                     "trade_registry_sync_v1": sync_result,
-                    "existing_position_state": existing_position_state,
+                    "existing_position_state": existing_position_state_after_sync,
+                    "existing_position_state_before_sync": existing_position_state_before_sync,
                     "preflight_result": preflight_result,
                     "payload": payload,
                 }
                 if sync_result.get("ok"):
-                    message = "Trade Registry Sync V1 executado: posição existente sincronizada/confirmada no Registry."
+                    message = "Trade Registry Sync V1.1 executado: posição sincronizada e estado pós-sync recalculado no Registry."
                 else:
                     status_code = 409 if sync_result.get("status") == "ACK_REQUIRED" else 400
-                    message = "Trade Registry Sync V1 bloqueado: selecione o reconhecimento de posição gerenciada pela Central."
+                    message = "Trade Registry Sync V1.1 bloqueado: selecione o reconhecimento de posição gerenciada pela Central."
 
             # Execução real deliberada
             elif action == "execute":
@@ -3704,13 +3721,27 @@ def execution_console_route():
                                 mode="LIVE",
                                 dry_run=False,
                             )
-                            result, _ = _attach_existing_position_state(result, payload)
+                            result, existing_position_state_before_sync = _attach_existing_position_state(result, payload)
                             sync_result = trade_registry_sync_v1_from_execution_result(payload, result, commit=True)
+
+                            # V1.1: se houve registro/seen no Trade Registry, recalcula o estado exibido
+                            # para que central_managed_likely e matches reflitam o Registry pós-sync.
+                            existing_position_state_after_sync = existing_position_state_before_sync
+                            if isinstance(sync_result, dict) and sync_result.get("ok"):
+                                try:
+                                    result, existing_position_state_after_sync = _attach_existing_position_state(result, payload)
+                                    sync_result["post_sync_trade_registry_matches"] = (existing_position_state_after_sync or {}).get("trade_registry_matches")
+                                    sync_result["post_sync_central_managed_likely"] = bool((existing_position_state_after_sync or {}).get("central_managed_likely"))
+                                except Exception as _sync_refresh_exc:
+                                    sync_result["post_sync_refresh_error"] = str(_sync_refresh_exc)
+
                             if isinstance(result, dict):
                                 result.setdefault("trade_registry_sync_v1", sync_result)
+                                result.setdefault("existing_position_state_before_sync", existing_position_state_before_sync)
+                                result.setdefault("existing_position_state", existing_position_state_after_sync)
                                 if isinstance(result.get("payload"), dict):
                                     result["payload"].setdefault("trade_registry_sync_v1", sync_result)
-                            message = "Execução real solicitada. Trade Registry Sync V1 aplicado quando houve ordem real enviada."
+                            message = "Execução real solicitada. Trade Registry Sync V1.1 aplicado quando houve ordem real enviada."
 
             else:
                 result = {
@@ -3800,7 +3831,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.5</title>
+  <title>Central Quant — Execution Console V1.5.1</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3870,14 +3901,14 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.5</h1>
+  <h1>Central Quant — Execution Console V1.5.1</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
     <p>Para preview, nenhuma ordem real é enviada. Em preview, <b>MISSING_EXECUTION_AUTH_TOKEN</b> é normal porque o token só existe em execução real.</p>
     <p class="info">Proteção PRG ativa: depois de Preview ou Execução, o POST vira Redirect e a tela final é carregada via GET. Apertar F5 não reenvia a ordem.</p>
     <p class="info">V1.4: a tela mostra posição real existente e exige reconhecimento explícito quando necessário.</p>
-    <p class="info">V1.5 / Trade Registry Sync V1: ordem real enviada pela Central é registrada imediatamente no Trade Registry; posição real detectada pode ser sincronizada com acknowledgement.</p>
+    <p class="info">V1.5.1 / Trade Registry Sync V1.1: ordem real enviada pela Central é registrada imediatamente no Trade Registry; posição real detectada é sincronizada e o estado pós-sync é recalculado.</p>
   </div>
 
   <form method="post" class="card">
