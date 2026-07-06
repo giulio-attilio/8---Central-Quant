@@ -4253,6 +4253,524 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
 
 
 
+# ==========================================================
+# DISASTER STOP FALLBACK V1 — POST-EXECUTION PROTECTION
+# ==========================================================
+DISASTER_STOP_FALLBACK_V1_VERSION = "2026-07-06-DISASTER-STOP-FALLBACK-V1"
+DISASTER_STOP_FALLBACK_V1_LATEST_FILE = CENTRAL_DATA_DIR / "disaster_stop_fallback_v1_latest.json"
+DISASTER_STOP_FALLBACK_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "disaster_stop_fallback_v1_events.jsonl"
+DISASTER_STOP_FALLBACK_V1_LOCK_FILE = CENTRAL_DATA_DIR / "disaster_stop_fallback_v1_lock.json"
+
+
+def _dsf_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _dsf_v1_atomic_write_json(path, payload):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        tmp.replace(path)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _dsf_v1_read_json(path, default=None):
+    try:
+        if not path.exists():
+            return default if default is not None else {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else (default if default is not None else {})
+    except Exception:
+        return default if default is not None else {}
+
+
+def _dsf_v1_append_event(payload):
+    try:
+        DISASTER_STOP_FALLBACK_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DISASTER_STOP_FALLBACK_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _dsf_v1_norm_symbol(value):
+    try:
+        return _pesc_v1_norm_symbol(value)
+    except Exception:
+        s = str(value or "").upper().strip()
+        return s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "").replace("-", "")
+
+
+def _dsf_v1_market_symbol(symbol):
+    try:
+        return _pesc_v1_market_symbol(symbol)
+    except Exception:
+        s = _dsf_v1_norm_symbol(symbol)
+        return f"{s[:-4]}/USDT:USDT" if s.endswith("USDT") and len(s) > 4 else s
+
+
+def _dsf_v1_norm_side(value):
+    try:
+        return _pesc_v1_norm_side(value)
+    except Exception:
+        s = str(value or "").upper().strip()
+        if s in {"SELL", "SHORT", "SHORTS"}:
+            return "SHORT"
+        if s in {"BUY", "LONG", "LONGS"}:
+            return "LONG"
+        return s
+
+
+def _dsf_v1_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return default
+
+
+def _dsf_v1_valid_stop(entry, sl, side):
+    entry_f = _dsf_v1_float(entry)
+    sl_f = _dsf_v1_float(sl)
+    side_n = _dsf_v1_norm_side(side)
+    if entry_f is None or sl_f is None:
+        return False, "ENTRY_OR_SL_MISSING"
+    if side_n == "LONG":
+        return sl_f < entry_f, None if sl_f < entry_f else "LONG_STOP_MUST_BE_BELOW_ENTRY"
+    if side_n == "SHORT":
+        return sl_f > entry_f, None if sl_f > entry_f else "SHORT_STOP_MUST_BE_ABOVE_ENTRY"
+    return False, "INVALID_SIDE"
+
+
+def _dsf_v1_first_nonempty(*values):
+    for value in values:
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _dsf_v1_extract_source_live(source_result):
+    if not isinstance(source_result, dict):
+        return {}
+    rp = source_result.get("payload") if isinstance(source_result.get("payload"), dict) else source_result
+    live = (rp or {}).get("live_result") if isinstance(rp, dict) else None
+    return live if isinstance(live, dict) else {}
+
+
+def _dsf_v1_live_sent(source_result):
+    live = _dsf_v1_extract_source_live(source_result)
+    status_text = str((live or {}).get("status") or (source_result or {}).get("status") or "")
+    return bool(isinstance(live, dict) and live.get("sent")) or ("LIVE_SENT" in status_text.upper())
+
+
+def _dsf_v1_position_qty(position):
+    if not isinstance(position, dict):
+        return None
+    for key in ("contracts", "amount", "qty", "quantity", "positionAmt", "notional"):
+        raw = position.get(key)
+        value = _dsf_v1_float(raw)
+        if value is not None and abs(value) > 0:
+            return abs(value)
+    return None
+
+
+def _dsf_v1_position_entry(position, fallback=None):
+    if isinstance(position, dict):
+        return _dsf_v1_first_nonempty(position.get("entryPrice"), position.get("entry"), position.get("avgPrice"), position.get("average"), fallback)
+    return fallback
+
+
+def _dsf_v1_position_side_to_close_side(side):
+    side_n = _dsf_v1_norm_side(side)
+    if side_n == "LONG":
+        return "SELL"
+    if side_n == "SHORT":
+        return "BUY"
+    return ""
+
+
+def _dsf_v1_client_order_id(bot, symbol, side):
+    bot_s = re.sub(r"[^A-Z0-9]", "", str(bot or "CQ").upper())[:5] or "CQ"
+    sym_s = re.sub(r"[^A-Z0-9]", "", _dsf_v1_norm_symbol(symbol))[:10] or "SYMBOL"
+    side_s = "S" if _dsf_v1_norm_side(side) == "SHORT" else "L"
+    suffix = str(int(time.time()))[-8:]
+    cid = f"DSF1-{bot_s}-{sym_s}-{side_s}-{suffix}"
+    return cid[:32]
+
+
+def _dsf_v1_read_lock():
+    lock = _dsf_v1_read_json(DISASTER_STOP_FALLBACK_V1_LOCK_FILE, default={})
+    if not isinstance(lock, dict):
+        lock = {}
+    return lock
+
+
+def _dsf_v1_write_lock(active, reason=None, payload=None):
+    lock = {
+        "active": bool(active),
+        "version": DISASTER_STOP_FALLBACK_V1_VERSION,
+        "updated_at": _dsf_v1_now(),
+        "reason": reason,
+    }
+    if isinstance(payload, dict):
+        lock.update(payload)
+    ok, err = _dsf_v1_atomic_write_json(DISASTER_STOP_FALLBACK_V1_LOCK_FILE, lock)
+    return {"ok": ok, "error": err, "lock": lock}
+
+
+def disaster_stop_fallback_v1_gate_check():
+    lock = _dsf_v1_read_lock()
+    active = bool(lock.get("active"))
+    return {
+        "ok": not active,
+        "version": DISASTER_STOP_FALLBACK_V1_VERSION,
+        "status": "DISASTER_STOP_FALLBACK_READY" if not active else "DISASTER_STOP_MANUAL_ATTENTION_LOCK_ACTIVE",
+        "lock_active": active,
+        "lock": lock,
+        "rule": "Bloqueia nova execução real se uma execução anterior gerou posição real sem stop confirmado.",
+    }
+
+
+def _dsf_v1_attempt_broker_stop_order(symbol, side, qty, stop_price, client_order_id):
+    """
+    Tenta criar stop reduce-only com chamadas conservadoras.
+    Não envia market close. Só tenta tipos STOP/TRIGGER com reduceOnly.
+    """
+    attempts = []
+    side_n = _dsf_v1_norm_side(side)
+    close_side = _dsf_v1_position_side_to_close_side(side_n)
+    market_symbol = _dsf_v1_market_symbol(symbol)
+    symbol_norm = _dsf_v1_norm_symbol(symbol)
+    stop_f = _dsf_v1_float(stop_price)
+    qty_f = _dsf_v1_float(qty)
+
+    if central_broker is None:
+        return {"ok": False, "attempts": [{"method": "broker_import", "ok": False, "error": BROKER_IMPORT_ERROR}], "status": "BROKER_IMPORT_ERROR"}
+
+    if not (symbol_norm and side_n in {"LONG", "SHORT"} and close_side and qty_f and qty_f > 0 and stop_f):
+        return {
+            "ok": False,
+            "status": "INVALID_STOP_ORDER_INPUT",
+            "attempts": [],
+            "inputs": {"symbol": symbol_norm, "side": side_n, "close_side": close_side, "qty": qty, "stop_price": stop_price},
+        }
+
+    params = {
+        "stopPrice": stop_f,
+        "triggerPrice": stop_f,
+        "reduceOnly": True,
+        "closePosition": True,
+        "positionSide": side_n,
+        "workingType": "MARK_PRICE",
+        "clientOrderId": client_order_id,
+        "clientOrderID": client_order_id,
+    }
+
+    # 1) Wrappers explícitos do broker, quando existirem.
+    wrapper_methods = [
+        "place_disaster_stop",
+        "place_stop_loss",
+        "create_stop_loss_order",
+        "place_stop_order",
+        "create_stop_order",
+    ]
+    for name in wrapper_methods:
+        fn = getattr(central_broker, name, None)
+        if not callable(fn):
+            attempts.append({"method": f"broker.{name}", "ok": False, "error": "missing"})
+            continue
+        try:
+            res = fn(
+                symbol=symbol_norm,
+                side=close_side,
+                position_side=side_n,
+                amount=qty_f,
+                qty=qty_f,
+                stop_price=stop_f,
+                sl=stop_f,
+                reduce_only=True,
+                client_order_id=client_order_id,
+            )
+            attempts.append({"method": f"broker.{name}", "ok": True, "result": res})
+            return {"ok": True, "status": "STOP_ORDER_SUBMIT_ATTEMPTED", "method": f"broker.{name}", "result": res, "attempts": attempts}
+        except TypeError as exc:
+            attempts.append({"method": f"broker.{name}", "ok": False, "error": f"TypeError kwargs: {exc}"})
+            try:
+                res = fn(symbol_norm, close_side, qty_f, stop_f)
+                attempts.append({"method": f"broker.{name}:positional", "ok": True, "result": res})
+                return {"ok": True, "status": "STOP_ORDER_SUBMIT_ATTEMPTED", "method": f"broker.{name}:positional", "result": res, "attempts": attempts}
+            except Exception as exc2:
+                attempts.append({"method": f"broker.{name}:positional", "ok": False, "error": str(exc2)})
+        except Exception as exc:
+            attempts.append({"method": f"broker.{name}", "ok": False, "error": str(exc)})
+
+    # 2) CCXT/exchange fallback. Somente tipos STOP/TRIGGER reduce-only.
+    exchange = getattr(central_broker, "exchange", None) or getattr(central_broker, "client", None)
+    create_order = getattr(exchange, "create_order", None) if exchange is not None else None
+    if not callable(create_order):
+        attempts.append({"method": "exchange.create_order", "ok": False, "error": "missing"})
+        return {"ok": False, "status": "NO_STOP_ORDER_METHOD_AVAILABLE", "attempts": attempts}
+
+    order_types = ["STOP_MARKET", "STOP", "TRIGGER_MARKET"]
+    for order_type in order_types:
+        try:
+            res = create_order(market_symbol, order_type, close_side.lower(), qty_f, None, params)
+            attempts.append({"method": "exchange.create_order", "type": order_type, "ok": True, "result": res})
+            return {"ok": True, "status": "STOP_ORDER_SUBMIT_ATTEMPTED", "method": f"exchange.create_order:{order_type}", "result": res, "attempts": attempts}
+        except Exception as exc:
+            attempts.append({"method": "exchange.create_order", "type": order_type, "ok": False, "error": str(exc)})
+
+    return {"ok": False, "status": "STOP_ORDER_SUBMIT_FAILED", "attempts": attempts}
+
+
+def build_disaster_stop_fallback_v1(symbol=None, side=None, bot=None, setup=None, sl=None, commit=False, ack=None, source_result=None, safety_before=None, auto=False):
+    symbol_norm = _dsf_v1_norm_symbol(symbol or (request.args.get("symbol") if "request" in globals() else None) or "BTCUSDT")
+    side_norm = _dsf_v1_norm_side(side or (request.args.get("side") if "request" in globals() else None) or "SHORT")
+    bot = bot or (request.args.get("bot") if "request" in globals() else None) or "FALCON"
+    setup = setup or (request.args.get("setup") if "request" in globals() else None) or bot
+    commit = bool(commit)
+    if not commit:
+        try:
+            commit = str(request.args.get("commit") or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+        except Exception:
+            commit = False
+    ack = ack or (request.args.get("ack") if "request" in globals() else None)
+
+    safety = safety_before if isinstance(safety_before, dict) else None
+    if safety is None:
+        safety = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup, source_result=source_result)
+
+    positions = (safety or {}).get("positions") if isinstance(safety, dict) else []
+    positions = positions if isinstance(positions, list) else []
+    position = positions[0] if positions else {}
+    position_found = bool((safety or {}).get("position_found"))
+    stop_confirmed_before = bool((safety or {}).get("stop_confirmed_by_central"))
+    registry_match = bool((safety or {}).get("registry_match"))
+
+    requested_sl = sl
+    try:
+        requested_sl = _dsf_v1_first_nonempty(requested_sl, request.args.get("sl"), request.args.get("stop"), request.args.get("stop_loss"))
+    except Exception:
+        pass
+
+    registry_trade = None
+    try:
+        matches = (((safety or {}).get("trade_registry") or {}).get("matches") or [])
+        registry_trade = matches[0] if matches else None
+    except Exception:
+        registry_trade = None
+    registry_trade = registry_trade if isinstance(registry_trade, dict) else {}
+
+    entry = _dsf_v1_position_entry(position, fallback=_dsf_v1_first_nonempty(registry_trade.get("entry"), None))
+    stop_price = _dsf_v1_first_nonempty(requested_sl, registry_trade.get("sl"), registry_trade.get("stop"), position.get("stopLossPrice"))
+    qty = _dsf_v1_position_qty(position)
+    client_order_id = _dsf_v1_client_order_id(bot, symbol_norm, side_norm)
+
+    live_sent = _dsf_v1_live_sent(source_result)
+    valid_stop, invalid_stop_reason = _dsf_v1_valid_stop(entry, stop_price, side_norm)
+    safety_after = None
+    submit_result = {"attempted": False, "submitted": False, "status": "NOT_ATTEMPTED"}
+    lock_update = {"attempted": False, "committed": False}
+    manual_attention = False
+
+    if not position_found:
+        status = "NO_OPEN_POSITION_FOUND"
+        ok = True
+        lock_update = _dsf_v1_write_lock(False, reason="NO_OPEN_POSITION_FOUND", payload={"symbol": symbol_norm, "side": side_norm}) if commit else {"attempted": False, "committed": False, "status": "LOCK_NOT_CHANGED"}
+    elif stop_confirmed_before:
+        status = "STOP_ALREADY_CONFIRMED"
+        ok = True
+        lock_update = _dsf_v1_write_lock(False, reason="STOP_ALREADY_CONFIRMED", payload={"symbol": symbol_norm, "side": side_norm}) if commit else {"attempted": False, "committed": False, "status": "LOCK_NOT_CHANGED"}
+    elif not valid_stop:
+        status = "VALID_DISASTER_STOP_PRICE_REQUIRED"
+        ok = False
+        manual_attention = True
+    elif not qty:
+        status = "POSITION_QTY_NOT_AVAILABLE_FOR_STOP_FALLBACK"
+        ok = False
+        manual_attention = True
+    elif not commit:
+        status = "DISASTER_STOP_FALLBACK_PREVIEW_READY"
+        ok = True
+    else:
+        allowed_acks = {"DISASTER_STOP_FALLBACK", "AUTO_POST_EXECUTION_STOP_FALLBACK", "PROTECT_OPEN_POSITION", "MANUAL_PROTECTION_CONFIRMED"}
+        ack_norm = str(ack or "").strip().upper()
+        if ack_norm not in allowed_acks:
+            status = "ACK_REQUIRED_FOR_STOP_FALLBACK"
+            ok = False
+            manual_attention = True
+        else:
+            submit_result = _dsf_v1_attempt_broker_stop_order(symbol_norm, side_norm, qty, stop_price, client_order_id)
+            submit_result["attempted"] = True
+            submit_result["submitted"] = bool(submit_result.get("ok"))
+            try:
+                time.sleep(0.8)
+            except Exception:
+                pass
+            safety_after = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup, source_result=source_result)
+            stop_confirmed_after = bool((safety_after or {}).get("stop_confirmed_by_central"))
+            position_found_after = bool((safety_after or {}).get("position_found"))
+            if stop_confirmed_after:
+                status = "DISASTER_STOP_CONFIRMED_AFTER_FALLBACK"
+                ok = True
+                manual_attention = False
+                lock_update = _dsf_v1_write_lock(False, reason="STOP_CONFIRMED_AFTER_FALLBACK", payload={"symbol": symbol_norm, "side": side_norm, "client_order_id": client_order_id})
+            elif not position_found_after:
+                status = "POSITION_NOT_FOUND_AFTER_FALLBACK_CHECK"
+                ok = True
+                manual_attention = False
+                lock_update = _dsf_v1_write_lock(False, reason="NO_POSITION_AFTER_FALLBACK_CHECK", payload={"symbol": symbol_norm, "side": side_norm})
+            else:
+                status = "MANUAL_ATTENTION_REQUIRED_STOP_NOT_CONFIRMED"
+                ok = False
+                manual_attention = True
+                lock_update = _dsf_v1_write_lock(True, reason="STOP_NOT_CONFIRMED_AFTER_FALLBACK", payload={
+                    "symbol": symbol_norm,
+                    "side": side_norm,
+                    "bot": bot,
+                    "setup": setup,
+                    "entry": entry,
+                    "sl": stop_price,
+                    "qty": qty,
+                    "client_order_id": client_order_id,
+                    "submit_status": submit_result.get("status"),
+                    "manual_action": "Criar stop reduce-only manualmente na BingX ou fechar/reduzir a posição e depois rodar /disasterstopfallback com commit=true.",
+                })
+
+    payload = {
+        "ok": bool(ok),
+        "version": DISASTER_STOP_FALLBACK_V1_VERSION,
+        "status": status,
+        "generated_at": _dsf_v1_now(),
+        "source": "auto_post_execution" if auto else "route",
+        "symbol": symbol_norm,
+        "side": side_norm,
+        "bot": bot,
+        "setup": setup,
+        "commit": {"attempted": commit, "ack": ack, "auto": bool(auto)},
+        "live_sent_detected": live_sent,
+        "position_found_before": position_found,
+        "registry_match_before": registry_match,
+        "stop_confirmed_before": stop_confirmed_before,
+        "stop_confirmed_after": bool((safety_after or {}).get("stop_confirmed_by_central")) if isinstance(safety_after, dict) else stop_confirmed_before,
+        "position_found_after": bool((safety_after or {}).get("position_found")) if isinstance(safety_after, dict) else position_found,
+        "requires_manual_attention": bool(manual_attention),
+        "inputs": {
+            "entry": entry,
+            "sl": stop_price,
+            "sl_valid": valid_stop,
+            "sl_invalid_reason": invalid_stop_reason,
+            "qty": qty,
+            "client_order_id": client_order_id,
+            "close_side": _dsf_v1_position_side_to_close_side(side_norm),
+        },
+        "submit_result": submit_result,
+        "lock_update": lock_update,
+        "safety_before": safety,
+        "safety_after": safety_after,
+        "gate": disaster_stop_fallback_v1_gate_check(),
+        "notes": [
+            "V1 só tenta criar stop reduce-only/trigger/stop; não executa fechamento a mercado.",
+            "Se o stop não for confirmado após a tentativa, a Central ativa lock para bloquear novas execuções reais.",
+            "Com lock ativo, proteja manualmente na BingX ou feche/reduza a posição antes de nova execução real.",
+        ],
+    }
+    _dsf_v1_atomic_write_json(DISASTER_STOP_FALLBACK_V1_LATEST_FILE, payload)
+    _dsf_v1_append_event({"event": "DISASTER_STOP_FALLBACK", **payload})
+    return payload
+
+
+def disaster_stop_fallback_v1_apply_after_execution(result, payload, safety_before=None):
+    """Aplica fallback automaticamente após ordem real enviada."""
+    if not isinstance(result, dict):
+        return None
+    if not _dsf_v1_live_sent(result):
+        return None
+    try:
+        return build_disaster_stop_fallback_v1(
+            symbol=(payload or {}).get("symbol"),
+            side=(payload or {}).get("side"),
+            bot=(payload or {}).get("bot"),
+            setup=(payload or {}).get("setup"),
+            sl=(payload or {}).get("sl") or (payload or {}).get("stop"),
+            commit=True,
+            ack="AUTO_POST_EXECUTION_STOP_FALLBACK",
+            source_result=result,
+            safety_before=safety_before,
+            auto=True,
+        )
+    except Exception as exc:
+        fallback = {
+            "ok": False,
+            "version": DISASTER_STOP_FALLBACK_V1_VERSION,
+            "status": "DISASTER_STOP_FALLBACK_ERROR",
+            "generated_at": _dsf_v1_now(),
+            "error": str(exc),
+            "requires_manual_attention": True,
+        }
+        _dsf_v1_atomic_write_json(DISASTER_STOP_FALLBACK_V1_LATEST_FILE, fallback)
+        _dsf_v1_append_event({"event": "DISASTER_STOP_FALLBACK_ERROR", **fallback})
+        try:
+            _dsf_v1_write_lock(True, reason="DISASTER_STOP_FALLBACK_ERROR", payload={"error": str(exc), "symbol": (payload or {}).get("symbol"), "side": (payload or {}).get("side")})
+        except Exception:
+            pass
+        return fallback
+
+
+@app.route("/disasterstopfallback/health", methods=["GET"])
+@app.route("/disasterstop/health", methods=["GET"])
+def disaster_stop_fallback_v1_health_route():
+    return {
+        "ok": True,
+        "module": "disaster_stop_fallback_v1",
+        "version": DISASTER_STOP_FALLBACK_V1_VERSION,
+        "generated_at": _dsf_v1_now(),
+        "latest_file": str(DISASTER_STOP_FALLBACK_V1_LATEST_FILE),
+        "events_file": str(DISASTER_STOP_FALLBACK_V1_EVENTS_FILE),
+        "lock_file": str(DISASTER_STOP_FALLBACK_V1_LOCK_FILE),
+        "gate": disaster_stop_fallback_v1_gate_check(),
+        "latest": _dsf_v1_read_json(DISASTER_STOP_FALLBACK_V1_LATEST_FILE, default={}),
+        "routes": [
+            "/disasterstopfallback/health",
+            "/disasterstopfallback?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON",
+            "/disasterstopfallback?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&sl=66750.9&commit=true&ack=DISASTER_STOP_FALLBACK",
+        ],
+        "notes": [
+            "Health não envia ordem.",
+            "Fallback com commit=true tenta criar stop reduce-only se houver posição aberta sem stop confirmado.",
+            "Lock ativo bloqueia nova execução real até proteção manual/automática ficar confirmada.",
+        ],
+    }
+
+
+@app.route("/disasterstopfallback", methods=["GET"])
+@app.route("/disasterstop", methods=["GET"])
+def disaster_stop_fallback_v1_route():
+    return build_disaster_stop_fallback_v1(
+        symbol=request.args.get("symbol"),
+        side=request.args.get("side"),
+        bot=request.args.get("bot"),
+        setup=request.args.get("setup"),
+        sl=request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss"),
+        commit=str(request.args.get("commit") or "").strip().lower() in {"1", "true", "yes", "sim", "on"},
+        ack=request.args.get("ack"),
+        source_result=None,
+        safety_before=None,
+        auto=False,
+    )
+
+
+
 
 # ==========================================================
 # REAL TRADE LIFECYCLE MONITOR V1.1.1 — REAL POSITION / REGISTRY LIFECYCLE
@@ -7603,6 +8121,15 @@ def execution_console_route():
             blocking=True,
         )
 
+        disaster_stop_fallback_gate = disaster_stop_fallback_v1_gate_check() if callable(globals().get("disaster_stop_fallback_v1_gate_check")) else {"ok": False, "status": "DISASTER_STOP_FALLBACK_FUNCTION_MISSING"}
+        add(
+            "DISASTER_STOP_FALLBACK_READY",
+            "Disaster Stop Fallback sem lock de atenção manual",
+            bool(disaster_stop_fallback_gate.get("ok")),
+            disaster_stop_fallback_gate,
+            blocking=True,
+        )
+
         bot = str(current_payload.get("bot") or "").upper().strip()
         symbol = _normalize_console_symbol(current_payload.get("symbol"))
         allowed_bots = [str(x).upper().strip() for x in (config.get("allowed_bots") or [])]
@@ -7704,6 +8231,8 @@ def execution_console_route():
                 "positions_checked": positions_checked,
                 "registry_persistence_ok": bool(registry_persistence_gate.get("ok")),
                 "trade_close_outcome_ok": bool(trade_close_outcome_gate.get("ok")),
+                "registry_mode_ok": bool(registry_mode_gate.get("ok")),
+                "disaster_stop_fallback_ok": bool(disaster_stop_fallback_gate.get("ok")),
                 "bot_allowed": bot_allowed,
                 "symbol_allowed": symbol_allowed,
                 "risk_ok": risk_ok,
@@ -8085,6 +8614,23 @@ def execution_console_route():
                                     "error": str(_pesc_exc),
                                 }
 
+                            disaster_stop_fallback_v1 = None
+                            try:
+                                if post_execution_safety_check is not None:
+                                    disaster_stop_fallback_v1 = disaster_stop_fallback_v1_apply_after_execution(
+                                        result=result,
+                                        payload=payload,
+                                        safety_before=post_execution_safety_check,
+                                    )
+                            except Exception as _dsf_attach_exc:
+                                disaster_stop_fallback_v1 = {
+                                    "ok": False,
+                                    "version": DISASTER_STOP_FALLBACK_V1_VERSION,
+                                    "status": "DISASTER_STOP_FALLBACK_ATTACH_ERROR",
+                                    "error": str(_dsf_attach_exc),
+                                    "requires_manual_attention": True,
+                                }
+
                             if isinstance(result, dict):
                                 result.setdefault("trade_registry_sync_v1", sync_result)
                                 result.setdefault("existing_position_state_before_sync", existing_position_state_before_sync)
@@ -8092,12 +8638,22 @@ def execution_console_route():
                                 result.setdefault("real_execution_final_gate_v1", final_gate)
                                 if post_execution_safety_check is not None:
                                     result.setdefault("post_execution_safety_check_v1", post_execution_safety_check)
+                                if disaster_stop_fallback_v1 is not None:
+                                    result.setdefault("disaster_stop_fallback_v1", disaster_stop_fallback_v1)
+                                    if disaster_stop_fallback_v1.get("requires_manual_attention"):
+                                        result["requires_manual_attention"] = True
+                                        result["post_execution_protection_status"] = disaster_stop_fallback_v1.get("status")
                                 if isinstance(result.get("payload"), dict):
                                     result["payload"].setdefault("trade_registry_sync_v1", sync_result)
                                     result["payload"].setdefault("real_execution_final_gate_v1", final_gate)
                                     if post_execution_safety_check is not None:
                                         result["payload"].setdefault("post_execution_safety_check_v1", post_execution_safety_check)
-                            message = "Execução real solicitada. Real Execution Final Gate V1 aprovado; Trade Registry Sync V1.1 e Post-Execution Safety Check V1 aplicados quando houve ordem real enviada."
+                                    if disaster_stop_fallback_v1 is not None:
+                                        result["payload"].setdefault("disaster_stop_fallback_v1", disaster_stop_fallback_v1)
+                            if isinstance(disaster_stop_fallback_v1, dict) and disaster_stop_fallback_v1.get("requires_manual_attention"):
+                                message = "ATENÇÃO: ordem real enviada, mas stop de desastre não foi confirmado. Disaster Stop Fallback V1 ativou lock/manual attention. Proteja manualmente na BingX antes de qualquer nova execução."
+                            else:
+                                message = "Execução real solicitada. Real Execution Final Gate V1 aprovado; Trade Registry Sync V1.1, Post-Execution Safety Check V1 e Disaster Stop Fallback V1 aplicados quando houve ordem real enviada."
 
             else:
                 result = {
@@ -8596,6 +9152,50 @@ def execution_engine_live_route():
         engine_result.setdefault("notes", [])
         if isinstance(engine_result.get("notes"), list):
             engine_result["notes"].append("/executionlive chama LIVE + dry_run=False e pode enviar ordem real se todos os guards aprovarem.")
+
+        # Disaster Stop Fallback V1 também protege a rota direta /executionlive.
+        try:
+            sync_result = trade_registry_sync_v1_from_execution_result(payload_for_engine, engine_result, commit=True)
+        except Exception as _sync_exc:
+            sync_result = {"ok": False, "status": "TRADE_REGISTRY_SYNC_ERROR", "error": str(_sync_exc)}
+        post_execution_safety_check = None
+        disaster_stop_fallback_v1 = None
+        try:
+            if _dsf_v1_live_sent(engine_result):
+                post_execution_safety_check = build_post_execution_safety_check_v1(
+                    symbol=payload_for_engine.get("symbol"),
+                    side=payload_for_engine.get("side"),
+                    bot=payload_for_engine.get("bot"),
+                    setup=payload_for_engine.get("setup"),
+                    source_result=engine_result,
+                )
+                disaster_stop_fallback_v1 = disaster_stop_fallback_v1_apply_after_execution(
+                    result=engine_result,
+                    payload=payload_for_engine,
+                    safety_before=post_execution_safety_check,
+                )
+        except Exception as _dsf_exc:
+            disaster_stop_fallback_v1 = {
+                "ok": False,
+                "version": DISASTER_STOP_FALLBACK_V1_VERSION,
+                "status": "DISASTER_STOP_FALLBACK_ROUTE_ERROR",
+                "error": str(_dsf_exc),
+                "requires_manual_attention": True,
+            }
+        engine_result.setdefault("trade_registry_sync_v1", sync_result)
+        if post_execution_safety_check is not None:
+            engine_result.setdefault("post_execution_safety_check_v1", post_execution_safety_check)
+        if disaster_stop_fallback_v1 is not None:
+            engine_result.setdefault("disaster_stop_fallback_v1", disaster_stop_fallback_v1)
+            if disaster_stop_fallback_v1.get("requires_manual_attention"):
+                engine_result["requires_manual_attention"] = True
+                engine_result["post_execution_protection_status"] = disaster_stop_fallback_v1.get("status")
+        if isinstance(engine_result.get("payload"), dict):
+            engine_result["payload"].setdefault("trade_registry_sync_v1", sync_result)
+            if post_execution_safety_check is not None:
+                engine_result["payload"].setdefault("post_execution_safety_check_v1", post_execution_safety_check)
+            if disaster_stop_fallback_v1 is not None:
+                engine_result["payload"].setdefault("disaster_stop_fallback_v1", disaster_stop_fallback_v1)
 
     return engine_result, (200 if isinstance(engine_result, dict) and engine_result.get("ok") else 400)
 
