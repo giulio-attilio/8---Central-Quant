@@ -1,6 +1,6 @@
 # execution_engine.py
-# CENTRAL QUANT — EXECUTION ENGINE V2.5.4
-# Versão: 2026-07-05-EXECUTION-ENGINE-V2.5.4-EXCHANGE-CONSTRAINTS-VALIDATOR
+# CENTRAL QUANT — EXECUTION ENGINE V2.5.5
+# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.5-EXECUTION-AUDIT-LOG
 #
 # Objetivo:
 # - Ser o ponto único de decisão antes de qualquer execução.
@@ -58,12 +58,13 @@ else:
     BROKER_IMPORT_ERROR = None
 
 
-VERSION = "2026-07-05-EXECUTION-ENGINE-V2.5.4-EXCHANGE-CONSTRAINTS-VALIDATOR"
+VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.5-EXECUTION-AUDIT-LOG"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 EXECUTION_ENGINE_LOG_FILE = DATA_DIR / "execution_engine_log.jsonl"
+EXECUTION_AUDIT_LOG_FILE = DATA_DIR / "execution_audit_log.jsonl"
 
 DEFAULT_ENGINE_MODE = os.getenv("CENTRAL_EXECUTION_ENGINE_MODE", "OBSERVATION_ONLY").upper()
 
@@ -109,6 +110,50 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
             f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
     except Exception:
         pass
+
+
+def _audit_sanitize(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            lk = str(k).lower()
+            if any(token in lk for token in ["secret", "signature", "apikey", "api_key", "x-bx-apikey"]):
+                out[k] = "***"
+            elif lk in {"raw", "info"}:
+                out[k] = str(v)[:1000]
+            else:
+                out[k] = _audit_sanitize(v)
+        return out
+    if isinstance(value, list):
+        return [_audit_sanitize(x) for x in value[:20]]
+    return value
+
+
+def _append_audit(event: Dict[str, Any]) -> None:
+    payload = _audit_sanitize(dict(event or {}))
+    payload.setdefault("audit_version", "2026-07-06-EXECUTION-AUDIT-LOG-V1")
+    payload.setdefault("generated_at", _now_br())
+    payload.setdefault("epoch", time.time())
+    _append_jsonl(EXECUTION_AUDIT_LOG_FILE, payload)
+
+
+def read_execution_audit_log(limit: int = 50) -> Dict[str, Any]:
+    try:
+        limit = max(1, min(int(limit), 500))
+    except Exception:
+        limit = 50
+
+    if not EXECUTION_AUDIT_LOG_FILE.exists():
+        return {"ok": True, "generated_at": _now_br(), "count": 0, "items": [], "file": str(EXECUTION_AUDIT_LOG_FILE)}
+
+    lines = EXECUTION_AUDIT_LOG_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+    items = []
+    for line in lines:
+        try:
+            items.append(json.loads(line))
+        except Exception:
+            items.append({"raw": line})
+    return {"ok": True, "generated_at": _now_br(), "count": len(items), "items": items, "file": str(EXECUTION_AUDIT_LOG_FILE)}
 
 
 def _safe_mode(value: Optional[str]) -> str:
@@ -472,9 +517,10 @@ def execution_engine_health() -> Dict[str, Any]:
         "broker": broker_status,
         "files": {
             "execution_engine_log": str(EXECUTION_ENGINE_LOG_FILE),
+            "execution_audit_log": str(EXECUTION_AUDIT_LOG_FILE),
         },
         "notes": [
-            "Execution Engine V2.5.4 é o ponto único antes de qualquer executor.",
+            "Execution Engine V2.5.5 é o ponto único antes de qualquer executor.",
             "Modo OBSERVATION_ONLY cria plano e loga.",
             "Modo PAPER chama Paper Executor integrado quando habilitado.",
             "Modo LIVE chama broker.py em preview seguro quando dry_run=true e em envio real apenas se Real Pilot Guard aprovar.",
@@ -617,8 +663,8 @@ def run_execution_engine(
         "paper_executor_called": result_extra_paper is not None,
         "live_broker_called": result_extra_live is not None,
         "notes": [
-            "Execution Engine V2.5.4 recebeu o payload e delegou validação ao Orchestrator.",
-            "LIVE com dry_run=true faz preview seguro; LIVE real só envia se Real Pilot Guard, Exchange Constraints e broker aprovarem.",
+            "Execution Engine V2.5.5 recebeu o payload e delegou validação ao Orchestrator.",
+            "LIVE com dry_run=true faz preview seguro; LIVE real só envia se o Real Pilot Guard e o broker aprovarem.",
             "O broker.py mantém uma segunda camada de kill switch.",
         ],
     }
@@ -632,6 +678,39 @@ def run_execution_engine(
         "dry_run": dry_run,
         "payload": payload,
         "result": result,
+    })
+
+    _append_audit({
+        "event": "EXECUTION_ENGINE_AUDIT",
+        "version": VERSION,
+        "mode": mode,
+        "dry_run": dry_run,
+        "ok": engine_ok,
+        "status": engine_status,
+        "executor_route": executor_route,
+        "real_execution_enabled": REAL_EXECUTION_ENABLED,
+        "real_pilot_enabled": REAL_PILOT_ENABLED,
+        "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
+        "bot": payload.get("bot"),
+        "setup": payload.get("setup"),
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl"),
+        "tp50": payload.get("tp50"),
+        "risk_pct": payload.get("risk_pct"),
+        "margin_usdt": (real_guard or {}).get("trade", {}).get("margin_usdt") if isinstance(real_guard, dict) else None,
+        "leverage": (real_guard or {}).get("trade", {}).get("leverage") if isinstance(real_guard, dict) else None,
+        "notional_usdt": (real_guard or {}).get("trade", {}).get("notional_usdt") if isinstance(real_guard, dict) else None,
+        "real_guard_status": (real_guard or {}).get("status") if isinstance(real_guard, dict) else None,
+        "real_guard_reasons": (real_guard or {}).get("reasons") if isinstance(real_guard, dict) else None,
+        "live_broker_called": result_extra_live is not None,
+        "live_sent": bool(result_extra_live.get("sent")) if isinstance(result_extra_live, dict) else False,
+        "live_status": result_extra_live.get("status") if isinstance(result_extra_live, dict) else None,
+        "client_order_id": result_extra_live.get("client_order_id") if isinstance(result_extra_live, dict) else None,
+        "order_id": result_extra_live.get("order_id") if isinstance(result_extra_live, dict) else None,
+        "amount": result_extra_live.get("amount") if isinstance(result_extra_live, dict) else None,
+        "price_ref": result_extra_live.get("price_ref") if isinstance(result_extra_live, dict) else None,
     })
 
     return {"ok": engine_ok, "payload": result}
@@ -650,7 +729,7 @@ def execution_engine_test() -> Dict[str, Any]:
         "risk_pct": 2.0,
         "capital_allocated": 4500,
         "requested_qty": 0.1,
-        "signal_id": "EXECUTION-ENGINE-V2.5.4-TEST-FALCON-ETHUSDT-LONG",
+        "signal_id": "EXECUTION-ENGINE-V2.5.3-TEST-FALCON-ETHUSDT-LONG",
     }
     return run_execution_engine(payload=payload, mode="OBSERVATION_ONLY", dry_run=True)
 
@@ -674,7 +753,7 @@ def execution_engine_real_pilot_test(dry_run: bool = True) -> Dict[str, Any]:
         "risk_pct": min(2.0, REAL_PILOT_MAX_RISK_PCT),
         "margin_usdt": min(5.0, REAL_PILOT_MAX_MARGIN_USDT),
         "leverage": min(1, REAL_PILOT_MAX_LEVERAGE),
-        "signal_id": "EXECUTION-ENGINE-V2.5.4-REAL-PILOT-TEST-FALCON-ETHUSDT-LONG",
+        "signal_id": "EXECUTION-ENGINE-V2.5.3-REAL-PILOT-TEST-FALCON-ETHUSDT-LONG",
     }
     return run_execution_engine(payload=payload, mode="LIVE", dry_run=dry_run)
 

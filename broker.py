@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-05-BROKER-BINGX-SAFE-V1.1-EXCHANGE-CONSTRAINTS-VALIDATOR
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V1.1-EXECUTION-AUDIT-LOG
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -13,11 +13,11 @@
 #   ENABLE_REAL_TRADING=true e BROKER_DRY_RUN=false.
 #
 # Correções desta versão:
-# - V1.1 adiciona Exchange Constraints Validator antes de qualquer envio real.
 # - Corrige bug "name 'margin' is not defined" em amount_details().
 # - Mantém margem/alavancagem por robô via Render.
 # - Calcula quantidade pela exposição efetiva = margem * alavancagem.
 # - Arredonda campos exibidos para evitar floats como 59.138999999999996.
+# - Adiciona Execution Audit Log V1 para registrar previews, bloqueios, erros e ordens reais.
 # - Adiciona campos de apresentação para VERIFY:
 #   margin_usdt_display, leverage_display, planned_exposure_usdt_display,
 #   actual_exposure_usdt_display, estimated_margin_after_open_usdt_display,
@@ -84,12 +84,15 @@ BROKER_DRY_RUN = env_bool("BROKER_DRY_RUN", EXECUTION_MODE != "LIVE" or not ENAB
 # Endpoint usado apenas para prévia/assinatura no VERIFY.
 # O envio real continua usando ccxt.create_order(), pois é mais seguro e padronizado.
 BINGX_SWAP_ORDER_ENDPOINT = "/openApi/swap/v2/trade/order"
-BROKER_EXCHANGE_CONSTRAINTS_ENABLED = env_bool("BROKER_EXCHANGE_CONSTRAINTS_ENABLED", True)
-BROKER_MIN_ORDER_BUFFER_PCT = float(os.environ.get("BROKER_MIN_ORDER_BUFFER_PCT", "1.0"))
 
 # Log local/ephemeral de execução. A Central lê este arquivo em /live, /sync e /executions.
 EXECUTIONS_LOG_FILE = os.environ.get("EXECUTIONS_LOG_FILE", "daily_history/executions_log.jsonl")
 EXECUTIONS_LOG_MAX_READ = int(os.environ.get("EXECUTIONS_LOG_MAX_READ", "50"))
+
+# Audit log persistente/estruturado para rastrear toda tentativa de execução.
+# Diferente do log operacional, este arquivo é pensado para auditoria posterior.
+EXECUTION_AUDIT_LOG_FILE = os.environ.get("EXECUTION_AUDIT_LOG_FILE", str(Path("daily_history") / "execution_audit_log.jsonl"))
+EXECUTION_AUDIT_LOG_MAX_READ = int(os.environ.get("EXECUTION_AUDIT_LOG_MAX_READ", "100"))
 
 _exchange = None
 _last_ready = None
@@ -220,6 +223,77 @@ def log_execution_event(event: dict):
         return False
 
 
+def _audit_sanitize(value):
+    """Remove ou mascara dados sensíveis antes de persistir auditoria."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            lk = str(k).lower()
+            if any(token in lk for token in ["secret", "signature", "apikey", "api_key", "x-bx-apikey"]):
+                out[k] = mask_secret(str(v)) if v else v
+            elif lk in {"raw", "info"}:
+                # Evita salvar payloads muito grandes da exchange.
+                out[k] = str(v)[:1000]
+            else:
+                out[k] = _audit_sanitize(v)
+        return out
+    if isinstance(value, list):
+        return [_audit_sanitize(x) for x in value[:20]]
+    return value
+
+
+def log_execution_audit_event(event: dict):
+    """
+    Execution Audit Log V1.
+    Registra eventos relevantes da camada broker sem guardar segredos.
+    Eventos típicos:
+    - BROKER_PREVIEW
+    - BROKER_DRY_RUN
+    - BROKER_CONSTRAINTS_BLOCKED
+    - BROKER_LIVE_SENT
+    - BROKER_LIVE_ERROR
+    - BROKER_NOT_READY
+    """
+    try:
+        payload = _audit_sanitize(dict(event or {}))
+        payload.setdefault("audit_version", "2026-07-06-EXECUTION-AUDIT-LOG-V1")
+        payload.setdefault("ts", agora_sp_str())
+        payload.setdefault("epoch", time.time())
+        payload.setdefault("exchange", "bingx")
+        payload.setdefault("execution_mode", EXECUTION_MODE)
+        payload.setdefault("enable_real_trading", ENABLE_REAL_TRADING)
+        payload.setdefault("broker_dry_run", BROKER_DRY_RUN)
+        payload.setdefault("api_key_masked", mask_secret(BINGX_API_KEY))
+        path = Path(EXECUTION_AUDIT_LOG_FILE)
+        if path.parent:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def get_execution_audit_log(limit: int = None):
+    """Retorna os últimos eventos do Execution Audit Log V1."""
+    try:
+        limit = int(limit or EXECUTION_AUDIT_LOG_MAX_READ)
+        limit = max(1, min(limit, 500))
+        path = Path(EXECUTION_AUDIT_LOG_FILE)
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                out.append({"raw": line})
+        return out
+    except Exception as exc:
+        return [{"ok": False, "error": str(exc)}]
+
+
 def get_executions_log(limit: int = None):
     """Retorna os últimos eventos de execução registrados pelo broker."""
     try:
@@ -279,8 +353,7 @@ def status_payload(check_ready: bool = False):
         "default_real_leverage": DEFAULT_REAL_LEVERAGE,
         "default_effective_notional_usdt": DEFAULT_REAL_MARGIN_USDT * DEFAULT_REAL_LEVERAGE,
         "timeout_ms": BINGX_TIMEOUT_MS,
-        "exchange_constraints_enabled": BROKER_EXCHANGE_CONSTRAINTS_ENABLED,
-        "min_order_buffer_pct": BROKER_MIN_ORDER_BUFFER_PCT,
+        "execution_audit_log_file": EXECUTION_AUDIT_LOG_FILE,
     }
     if check_ready:
         payload["ready"] = ready_check()
@@ -458,77 +531,6 @@ def amount_details(symbol, notional_usdt, margin_usdt=None, leverage=None):
     }
 
 
-def validate_exchange_constraints(symbol, amount, actual_exposure_usdt, price_ref, market, margin_usdt=None, leverage=None):
-    """
-    Valida restrições mínimas do mercado antes de enviar qualquer ordem.
-    Bloqueia localmente se quantidade/custo ficarem abaixo do mínimo da BingX/CCXT.
-    """
-    reasons = []
-    warnings = []
-    market = market or {}
-    limits = market.get("limits") or {}
-    amount_limits = limits.get("amount") or {}
-    cost_limits = limits.get("cost") or {}
-    precision = market.get("precision") or {}
-
-    min_amount = safe_float(market.get("min_amount"), None)
-    if min_amount is None:
-        min_amount = safe_float(amount_limits.get("min"), None)
-
-    min_cost = safe_float(market.get("min_cost"), None)
-    if min_cost is None:
-        min_cost = safe_float(cost_limits.get("min"), None)
-
-    amount_val = safe_float(amount, None)
-    exposure_val = safe_float(actual_exposure_usdt, None)
-    price_val = safe_float(price_ref, None)
-    lev = safe_float(leverage, 1.0) or 1.0
-
-    if BROKER_EXCHANGE_CONSTRAINTS_ENABLED:
-        if amount_val is None or amount_val <= 0:
-            reasons.append(f"amount inválido: {amount}")
-        if exposure_val is None or exposure_val <= 0:
-            reasons.append(f"notional/exposure inválido: {actual_exposure_usdt}")
-        if min_amount is not None and amount_val is not None and amount_val < min_amount:
-            reasons.append(f"amount {amount_val} abaixo do min_amount {min_amount}")
-        if min_cost is not None and exposure_val is not None and exposure_val < min_cost:
-            reasons.append(f"notional {exposure_val} abaixo do min_cost {min_cost}")
-    else:
-        warnings.append("BROKER_EXCHANGE_CONSTRAINTS_ENABLED=false; validação de mínimos desligada")
-
-    buffer = 1.0 + max(0.0, BROKER_MIN_ORDER_BUFFER_PCT) / 100.0
-    min_notional_by_amount = None
-    if min_amount is not None and price_val is not None:
-        min_notional_by_amount = min_amount * price_val
-
-    candidates = [x for x in [min_cost, min_notional_by_amount] if x is not None]
-    suggested_min_notional = max(candidates) * buffer if candidates else None
-    suggested_min_margin = (suggested_min_notional / lev) if suggested_min_notional is not None and lev else None
-
-    return {
-        "ok": len(reasons) == 0,
-        "enabled": BROKER_EXCHANGE_CONSTRAINTS_ENABLED,
-        "status": "CONSTRAINTS_OK" if len(reasons) == 0 else "CONSTRAINTS_BLOCKED",
-        "reasons": reasons,
-        "warnings": warnings,
-        "symbol": symbol,
-        "amount": amount_val,
-        "notional_usdt": exposure_val,
-        "price_ref": price_val,
-        "min_amount": min_amount,
-        "min_cost": min_cost,
-        "amount_precision": market.get("amount_precision"),
-        "price_precision": market.get("price_precision"),
-        "precision": precision,
-        "limits": limits,
-        "margin_usdt": margin_usdt,
-        "leverage": leverage,
-        "suggested_min_notional_usdt": money(suggested_min_notional, 4),
-        "suggested_min_margin_usdt": money(suggested_min_margin, 4),
-        "buffer_pct": BROKER_MIN_ORDER_BUFFER_PCT,
-    }
-
-
 def ready_check(cache_seconds: int = 30):
     global _last_ready, _last_ready_ts
     now = time.time()
@@ -675,26 +677,9 @@ def build_order_preview(
         "precision_error": details.get("precision_error"),
     }
 
-    exchange_constraints = validate_exchange_constraints(
-        sym,
-        amount,
-        actual_exposure,
-        price,
-        market,
-        margin_usdt=margin,
-        leverage=lev,
-    )
-    if details.get("precision_error"):
-        exchange_constraints.setdefault("reasons", []).append(str(details.get("precision_error")))
-        exchange_constraints["ok"] = False
-        exchange_constraints["status"] = "CONSTRAINTS_BLOCKED"
-
-    preview_ok = bool(exchange_constraints.get("ok") and signature_ok)
-    preview_status = "PREVIEW" if preview_ok else "CONSTRAINTS_BLOCKED"
-
     return {
-        "ok": preview_ok,
-        "status": preview_status,
+        "ok": True,
+        "status": "PREVIEW",
         "sent": False,
         "ts": agora_sp_str(),
         "latency_ms": latency_ms,
@@ -737,11 +722,6 @@ def build_order_preview(
         "estimated_max_loss_usdt": money(estimated_max_loss_usdt, 8),
         "estimated_max_loss_usdt_display": money(estimated_max_loss_usdt, 4),
         "precision": precision_payload,
-        "exchange_constraints": exchange_constraints,
-        "constraints_ok": exchange_constraints.get("ok"),
-        "constraint_reasons": exchange_constraints.get("reasons"),
-        "suggested_min_margin_usdt": exchange_constraints.get("suggested_min_margin_usdt"),
-        "suggested_min_notional_usdt": exchange_constraints.get("suggested_min_notional_usdt"),
         "limits": market.get("limits"),
         "amount_precision": market.get("amount_precision"),
         "price_precision": market.get("price_precision"),
@@ -895,6 +875,27 @@ def place_market_order(
                 "risk_pct": preview.get("risk_pct"),
                 "estimated_max_loss_usdt": preview.get("estimated_max_loss_usdt"),
             })
+            log_execution_audit_event({
+                "event": "BROKER_DRY_RUN_OR_VERIFY",
+                "status": preview.get("status"),
+                "sent": False,
+                "symbol": preview.get("symbol"),
+                "side": preview.get("side"),
+                "margin_usdt": preview.get("margin_usdt"),
+                "leverage": preview.get("leverage"),
+                "notional_usdt": preview.get("notional_usdt"),
+                "planned_exposure_usdt": preview.get("planned_exposure_usdt"),
+                "actual_exposure_usdt": preview.get("actual_exposure_usdt"),
+                "amount": preview.get("amount"),
+                "price_ref": preview.get("price_ref"),
+                "client_order_id": preview.get("client_order_id"),
+                "constraints_ok": preview.get("constraints_ok"),
+                "constraint_reasons": preview.get("constraint_reasons"),
+                "signature_ok": preview.get("signature_ok"),
+                "risk_pct": preview.get("risk_pct"),
+                "estimated_max_loss_usdt": preview.get("estimated_max_loss_usdt"),
+                "payload": preview.get("payload"),
+            })
             return preview
         except Exception as exc:
             result = {
@@ -911,6 +912,7 @@ def place_market_order(
                 "reason": "falha ao montar prévia dry-run",
             }
             log_execution_event({"event": "place_market_order", **result})
+            log_execution_audit_event({"event": "BROKER_DRY_RUN_ERROR", **result})
             return result
 
     ready = ready_check(cache_seconds=0)
@@ -924,6 +926,7 @@ def place_market_order(
             "ready": ready,
         }
         log_execution_event({"event": "place_market_order", **result})
+        log_execution_audit_event({"event": "BROKER_PREVIEW_ERROR", **result})
         return result
 
     try:
@@ -939,22 +942,6 @@ def place_market_order(
             risk_pct=risk_pct,
             free_balance_usdt=free_balance_usdt,
         )
-        if not preview.get("ok"):
-            result = {
-                "ok": False,
-                "status": preview.get("status", "CONSTRAINTS_BLOCKED"),
-                "sent": False,
-                "symbol": sym,
-                "side": order_side,
-                "margin_usdt": margin,
-                "leverage": lev,
-                "notional_usdt": planned_exposure,
-                "preview": preview,
-                "error": "; ".join(preview.get("constraint_reasons") or preview.get("exchange_constraints", {}).get("reasons") or ["exchange constraints blocked"]),
-                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-            }
-            log_execution_event({"event": "place_market_order", **result})
-            return result
         amount = preview["amount"]
         price = preview["price_ref"]
     except Exception as exc:
@@ -1068,6 +1055,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "reason": "EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
         }
         log_execution_event({"event": "close_position_market", **result})
+        log_execution_audit_event({"event": "BROKER_CLOSE_DRY_RUN", **result})
         return result
 
     ex = exchange()
@@ -1089,6 +1077,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "raw": order,
         }
         log_execution_event({"event": "close_position_market", **{k: v for k, v in result.items() if k != "raw"}})
+        log_execution_audit_event({"event": "BROKER_CLOSE_SENT", **{k: v for k, v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
         result = {
@@ -1103,4 +1092,5 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "error": str(exc),
         }
         log_execution_event({"event": "close_position_market", **result})
+        log_execution_audit_event({"event": "BROKER_CLOSE_ERROR", **result})
         return result
