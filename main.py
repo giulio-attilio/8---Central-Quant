@@ -894,6 +894,11 @@ def data_hora_sp_str():
     return agora_sp().strftime("%d/%m/%Y %H:%M")
 
 
+def agora_sp_str():
+    # Alias usado por módulos mais novos; mantém compatibilidade com data_hora_sp_str.
+    return data_hora_sp_str()
+
+
 def parse_data_hora_sp(value):
     try:
         if not value:
@@ -7949,7 +7954,7 @@ def build_execution_final_gate_route_v1(preflight=False):
         "module": "execution_final_gate_route_v1",
         "version": EXECUTION_FINAL_GATE_ROUTE_V1_VERSION,
         "status": "READY_FOR_REAL_EXECUTION_PRECHECK" if ok else "NOT_READY_FOR_REAL_EXECUTION_PRECHECK",
-        "generated_at": agora_sp_str() if callable(globals().get("agora_sp_str")) else None,
+        "generated_at": agora_sp_str(),
         "source": "preflight" if preflight else "health",
         "preflight_dry_run_attempted": bool(preflight),
         "payload_checked": payload,
