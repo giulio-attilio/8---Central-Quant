@@ -698,6 +698,8 @@ except Exception as _real_pnl_r_mapper_exc:
 
 BOT_NAME = os.environ.get("BOT_NAME", "Central Quant PRO FULL")
 TIMEZONE_BR = timezone(timedelta(hours=-3))
+# Alias compatível com módulos V1.x que usam TZ internamente.
+TZ = TIMEZONE_BR
 BASE_DIR = Path(__file__).resolve().parent
 BOTS_DIR = BASE_DIR / "bots"
 
