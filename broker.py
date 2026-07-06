@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V1.1-EXECUTION-AUDIT-LOG
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6-HEDGE-MODE-SUPPORT
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -18,6 +18,7 @@
 # - Calcula quantidade pela exposição efetiva = margem * alavancagem.
 # - Arredonda campos exibidos para evitar floats como 59.138999999999996.
 # - Adiciona Execution Audit Log V1 para registrar previews, bloqueios, erros e ordens reais.
+# - Adiciona Hedge Mode Support V2.6: envia positionSide=LONG/SHORT quando habilitado.
 # - Adiciona campos de apresentação para VERIFY:
 #   margin_usdt_display, leverage_display, planned_exposure_usdt_display,
 #   actual_exposure_usdt_display, estimated_margin_after_open_usdt_display,
@@ -80,6 +81,13 @@ BINGX_TIMEOUT_MS = int(os.environ.get("BINGX_TIMEOUT_MS", "15000"))
 ENABLE_REAL_TRADING = env_bool("ENABLE_REAL_TRADING", False)
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
 BROKER_DRY_RUN = env_bool("BROKER_DRY_RUN", EXECUTION_MODE != "LIVE" or not ENABLE_REAL_TRADING)
+
+# Hedge Mode:
+# - AUTO/true: envia positionSide=LONG/SHORT nas ordens.
+# - false/oneway: não envia positionSide.
+# Para sua conta BingX atual, o erro 109400 indicou Hedge Mode ativo.
+BINGX_POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", os.environ.get("BINGX_HEDGE_MODE", "HEDGE")).strip().upper()
+BINGX_HEDGE_MODE_ENABLED = env_bool("BINGX_HEDGE_MODE_ENABLED", BINGX_POSITION_MODE in {"HEDGE", "HEDGED", "DUAL", "TRUE", "YES", "1", "ON"})
 
 # Endpoint usado apenas para prévia/assinatura no VERIFY.
 # O envio real continua usando ccxt.create_order(), pois é mais seguro e padronizado.
@@ -158,6 +166,23 @@ def normalize_side(side: str) -> str:
 def bingx_api_side(side: str) -> str:
     """Lado para payload textual BingX."""
     return "BUY" if normalize_side(side) == "buy" else "SELL"
+
+
+def bingx_position_side(side: str):
+    """
+    PositionSide exigido pela BingX quando a conta está em Hedge Mode.
+    LONG -> positionSide LONG
+    SHORT -> positionSide SHORT
+    Em One-Way Mode, retorna None.
+    """
+    if not BINGX_HEDGE_MODE_ENABLED:
+        return None
+    s = str(side or "").upper().strip()
+    if s in {"LONG", "BUY"}:
+        return "LONG"
+    if s in {"SHORT", "SELL"}:
+        return "SHORT"
+    return None
 
 
 def safe_float(value, default=None):
@@ -343,6 +368,8 @@ def status_payload(check_ready: bool = False):
         "execution_mode": EXECUTION_MODE,
         "enable_real_trading": ENABLE_REAL_TRADING,
         "broker_dry_run": BROKER_DRY_RUN,
+        "position_mode": BINGX_POSITION_MODE,
+        "hedge_mode_enabled": BINGX_HEDGE_MODE_ENABLED,
         "api_key_configured": bool(BINGX_API_KEY),
         "api_secret_configured": bool(BINGX_API_SECRET),
         "api_key_masked": mask_secret(BINGX_API_KEY),
@@ -601,6 +628,7 @@ def build_order_preview(
     sym = normalize_symbol(symbol)
     order_side = normalize_side(side)
     api_side = bingx_api_side(side)
+    position_side = bingx_position_side(side)
 
     cfg = execution_config_for_bot(bot=bot, margin_usdt=margin_usdt, leverage=leverage)
     margin = cfg["margin_usdt"]
@@ -643,6 +671,8 @@ def build_order_preview(
     }
     if reduce_only:
         api_payload["reduceOnly"] = "true"
+    if position_side:
+        api_payload["positionSide"] = position_side
     if client_order_id:
         api_payload["clientOrderID"] = client_order_id
 
@@ -695,6 +725,9 @@ def build_order_preview(
         "market_symbol": market.get("symbol", sym),
         "side": order_side,
         "api_side": api_side,
+        "position_side": position_side,
+        "hedge_mode_enabled": BINGX_HEDGE_MODE_ENABLED,
+        "position_mode": BINGX_POSITION_MODE,
         "order_type": "market",
         "reduce_only": bool(reduce_only),
         "client_tag": client_tag,
@@ -766,7 +799,7 @@ def format_order_preview_text(preview: dict, title: str = "🧪 VERIFY BINGX") -
         f"Modo: {preview.get('execution_mode')} | Real trading: {preview.get('enable_real_trading')}\n"
         f"Exchange: {preview.get('exchange')} | Endpoint: {preview.get('method')} {preview.get('endpoint')}\n\n"
         f"Símbolo: {preview.get('symbol')} | BingX: {preview.get('bingx_symbol')}\n"
-        f"Side: {preview.get('api_side')} | Type: MARKET | ReduceOnly: {preview.get('reduce_only')}\n"
+        f"Side: {preview.get('api_side')} | PositionSide: {preview.get('position_side')} | Type: MARKET | ReduceOnly: {preview.get('reduce_only')}\n"
         f"Margin: {preview.get('margin_mode')} | Leverage: {preview.get('leverage_display')}\n\n"
         f"EXECUÇÃO\n"
         f"Margem usada: {preview.get('margin_usdt_display')} USDT\n"
@@ -857,6 +890,7 @@ def place_market_order(
                 "sent": False,
                 "symbol": preview.get("symbol"),
                 "side": preview.get("side"),
+                "position_side": preview.get("position_side"),
                 "margin_usdt": preview.get("margin_usdt"),
                 "leverage": preview.get("leverage"),
                 "notional_usdt": preview.get("notional_usdt"),
@@ -881,6 +915,7 @@ def place_market_order(
                 "sent": False,
                 "symbol": preview.get("symbol"),
                 "side": preview.get("side"),
+                "position_side": preview.get("position_side"),
                 "margin_usdt": preview.get("margin_usdt"),
                 "leverage": preview.get("leverage"),
                 "notional_usdt": preview.get("notional_usdt"),
@@ -951,6 +986,7 @@ def place_market_order(
             "sent": False,
             "symbol": sym,
             "side": order_side,
+            "position_side": position_side if "position_side" in locals() else bingx_position_side(side),
             "margin_usdt": margin,
             "leverage": lev,
             "notional_usdt": planned_exposure,
@@ -963,6 +999,9 @@ def place_market_order(
     params = {}
     if reduce_only:
         params["reduceOnly"] = True
+    position_side = bingx_position_side(side)
+    if position_side:
+        params["positionSide"] = position_side
     if client_tag:
         params["clientOrderId"] = str(client_tag)[:32]
 
@@ -1019,6 +1058,7 @@ def place_market_order(
             "symbol": sym,
             "bingx_symbol": bingx_api_symbol(sym),
             "side": order_side,
+            "position_side": position_side if "position_side" in locals() else bingx_position_side(side),
             "margin_usdt": margin,
             "leverage": lev,
             "notional_usdt": planned_exposure,
@@ -1035,6 +1075,7 @@ def place_market_order(
 def close_position_market(symbol, side, amount=None, notional_usdt=None):
     """Fechamento simples. side deve ser lado da posição: LONG fecha vendendo; SHORT fecha comprando."""
     close_side = "sell" if str(side).upper() in {"LONG", "BUY"} else "buy"
+    close_position_side = bingx_position_side(side)
     sym = normalize_symbol(symbol)
 
     if amount is None:
@@ -1050,6 +1091,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "symbol": sym,
             "bingx_symbol": bingx_api_symbol(sym),
             "side": close_side,
+            "position_side": close_position_side,
             "amount": amount,
             "reduce_only": True,
             "reason": "EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
@@ -1061,7 +1103,10 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
     ex = exchange()
     started = time.perf_counter()
     try:
-        order = ex.create_order(sym, "market", close_side, float(amount), None, {"reduceOnly": True})
+        params = {"reduceOnly": True}
+        if close_position_side:
+            params["positionSide"] = close_position_side
+        order = ex.create_order(sym, "market", close_side, float(amount), None, params)
         result = {
             "ok": True,
             "status": "SENT",
@@ -1071,6 +1116,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "symbol": sym,
             "bingx_symbol": bingx_api_symbol(sym),
             "side": close_side,
+            "position_side": close_position_side,
             "amount": amount,
             "reduce_only": True,
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
@@ -1086,6 +1132,7 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
             "sent": False,
             "symbol": sym,
             "side": close_side,
+            "position_side": close_position_side,
             "amount": amount,
             "reduce_only": True,
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
