@@ -31763,6 +31763,545 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
 
 
 
+# ==========================================================
+# REAL EXECUTION TELEGRAM NOTIFIER V1
+# ==========================================================
+# Objetivo:
+# - Avisar o CEO no Telegram quando houver tentativa de execução real.
+# - Não notificar dry_run/preflight para evitar spam.
+# - Enviar alerta vermelho se ordem real for enviada sem stop/safety OK.
+# - Registrar eventos em /data para auditoria.
+REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION = "2026-07-06-REAL-EXECUTION-TELEGRAM-NOTIFIER-V1"
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_EXECUTION_TELEGRAM_NOTIFIER_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_EXECUTION_TELEGRAM_NOTIFIER_V1 = None
+
+try:
+    REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_execution_telegram_notifier_v1_events.jsonl"
+    REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_execution_telegram_notifier_v1_latest.json"
+except Exception:
+    REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE = None
+    REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE = None
+
+_REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_RECENT = {}
+
+
+def _retg_v1_now():
+    try:
+        return agora_sp_str()
+    except Exception:
+        try:
+            return data_hora_sp_str()
+        except Exception:
+            return None
+
+
+def _retg_v1_bool(value, default=False):
+    try:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "y"}
+    except Exception:
+        return bool(default)
+
+
+def _retg_v1_env_bool(names, default=False):
+    for name in names:
+        try:
+            if os.environ.get(name) is not None:
+                return _retg_v1_bool(os.environ.get(name), default=default), name
+        except Exception:
+            pass
+    return bool(default), None
+
+
+def _retg_v1_config():
+    enabled, enabled_source = _retg_v1_env_bool([
+        "REAL_EXECUTION_TELEGRAM_NOTIFIER_ENABLED",
+        "CENTRAL_REAL_EXECUTION_TELEGRAM_ENABLED",
+        "REAL_EXECUTION_TELEGRAM_ENABLED",
+    ], default=True)
+    notify_blocked, notify_blocked_source = _retg_v1_env_bool([
+        "REAL_EXECUTION_TELEGRAM_NOTIFY_BLOCKED",
+        "CENTRAL_REAL_EXECUTION_TELEGRAM_NOTIFY_BLOCKED",
+    ], default=True)
+    notify_failures, notify_failures_source = _retg_v1_env_bool([
+        "REAL_EXECUTION_TELEGRAM_NOTIFY_FAILURES",
+        "CENTRAL_REAL_EXECUTION_TELEGRAM_NOTIFY_FAILURES",
+    ], default=True)
+    notify_dry_run, notify_dry_run_source = _retg_v1_env_bool([
+        "REAL_EXECUTION_TELEGRAM_NOTIFY_DRY_RUN",
+        "CENTRAL_REAL_EXECUTION_TELEGRAM_NOTIFY_DRY_RUN",
+    ], default=False)
+    try:
+        cooldown_seconds = int(os.environ.get("REAL_EXECUTION_TELEGRAM_DEDUP_SECONDS", os.environ.get("CENTRAL_SEND_DUPLICATE_WINDOW_SECONDS", "8")))
+    except Exception:
+        cooldown_seconds = 8
+    return {
+        "enabled": enabled,
+        "enabled_source": enabled_source,
+        "notify_blocked": notify_blocked,
+        "notify_blocked_source": notify_blocked_source,
+        "notify_failures": notify_failures,
+        "notify_failures_source": notify_failures_source,
+        "notify_dry_run": notify_dry_run,
+        "notify_dry_run_source": notify_dry_run_source,
+        "dedup_seconds": max(3, cooldown_seconds),
+        "telegram_token_configured": bool(globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")),
+        "telegram_chat_configured": bool(globals().get("CENTRAL_TELEGRAM_CHAT_ID")),
+        "token_value_exposed": False,
+    }
+
+
+def _retg_v1_safe_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _retg_v1_safe_get(mapping, *path, default=None):
+    cur = mapping
+    try:
+        for key in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(key)
+        return default if cur is None else cur
+    except Exception:
+        return default
+
+
+def _retg_v1_find_dict_by_key(obj, key):
+    try:
+        if isinstance(obj, dict):
+            if isinstance(obj.get(key), dict):
+                return obj.get(key)
+            for value in obj.values():
+                found = _retg_v1_find_dict_by_key(value, key)
+                if isinstance(found, dict):
+                    return found
+        elif isinstance(obj, list):
+            for value in obj[:20]:
+                found = _retg_v1_find_dict_by_key(value, key)
+                if isinstance(found, dict):
+                    return found
+    except Exception:
+        pass
+    return {}
+
+
+def _retg_v1_extract_result(result):
+    result = result if isinstance(result, dict) else {}
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    live_result = payload.get("live_result") if isinstance(payload.get("live_result"), dict) else {}
+    if not live_result:
+        live_result = result.get("live_result") if isinstance(result.get("live_result"), dict) else {}
+    if not live_result:
+        live_result = _retg_v1_find_dict_by_key(result, "live_result")
+    disaster_stop = live_result.get("disaster_stop") if isinstance(live_result.get("disaster_stop"), dict) else {}
+    if not disaster_stop:
+        disaster_stop = payload.get("disaster_stop") if isinstance(payload.get("disaster_stop"), dict) else {}
+    post_safety = live_result.get("post_execution_safety") if isinstance(live_result.get("post_execution_safety"), dict) else {}
+    if not post_safety:
+        post_safety = payload.get("post_execution_safety") if isinstance(payload.get("post_execution_safety"), dict) else {}
+    real_guard = result.get("real_pilot_guard_v1") if isinstance(result.get("real_pilot_guard_v1"), dict) else {}
+    if not real_guard:
+        real_guard = result.get("real_guard") if isinstance(result.get("real_guard"), dict) else {}
+    if not real_guard:
+        real_guard = payload.get("real_guard") if isinstance(payload.get("real_guard"), dict) else {}
+    if not real_guard:
+        real_guard = live_result.get("real_guard") if isinstance(live_result.get("real_guard"), dict) else {}
+    sent = bool(live_result.get("sent") or result.get("sent") or payload.get("sent"))
+    live_status = str(live_result.get("status") or result.get("status") or payload.get("status") or "").strip()
+    requires_manual_attention = bool(
+        live_result.get("requires_manual_attention")
+        or payload.get("requires_manual_attention")
+        or post_safety.get("requires_manual_attention")
+        or "FAILED" in live_status.upper()
+        or "VIOLATION" in live_status.upper()
+        or "MANUAL" in live_status.upper()
+    )
+    stop_status = str(disaster_stop.get("status") or live_result.get("disaster_stop_status") or "").strip()
+    stop_ok = bool(
+        disaster_stop.get("ok")
+        or disaster_stop.get("confirmed")
+        or disaster_stop.get("stop_confirmed")
+        or disaster_stop.get("stop_confirmed_by_central")
+        or "CONFIRMED" in stop_status.upper()
+        or "CREATED" in stop_status.upper()
+        or "OK" == stop_status.upper()
+    )
+    safety_status = str(post_safety.get("status") or live_result.get("safety_status") or payload.get("safety_status") or "").strip()
+    safety_ok = bool(post_safety.get("ok") or "OK" in safety_status.upper() or "PROTECTED" in safety_status.upper())
+    return {
+        "result_status": str(result.get("status") or payload.get("status") or live_status or "").strip(),
+        "live_status": live_status,
+        "sent": sent,
+        "order_id": live_result.get("order_id") or live_result.get("id") or _retg_v1_safe_get(live_result, "order", "id"),
+        "client_order_id": live_result.get("client_order_id") or live_result.get("clientOrderId") or live_result.get("clientOrderID") or _retg_v1_safe_get(live_result, "order", "clientOrderId"),
+        "disaster_stop": disaster_stop,
+        "disaster_stop_status": stop_status,
+        "stop_ok": stop_ok,
+        "post_execution_safety": post_safety,
+        "safety_status": safety_status,
+        "safety_ok": safety_ok,
+        "requires_manual_attention": requires_manual_attention,
+        "real_guard": real_guard,
+        "real_guard_ok": bool(real_guard.get("ok") or real_guard.get("allowed")),
+        "failed_blocking_codes": result.get("failed_blocking_codes") or real_guard.get("failed_blocking_codes") or [],
+    }
+
+
+def _retg_v1_payload_snapshot(payload, result_info=None):
+    payload = payload if isinstance(payload, dict) else {}
+    result_info = result_info if isinstance(result_info, dict) else {}
+    guard = result_info.get("real_guard") if isinstance(result_info.get("real_guard"), dict) else {}
+    trade = guard.get("trade") if isinstance(guard.get("trade"), dict) else {}
+    return {
+        "bot": str(payload.get("bot") or guard.get("bot") or "").upper(),
+        "setup": payload.get("setup") or guard.get("setup"),
+        "symbol": str(payload.get("symbol") or guard.get("symbol") or "").upper(),
+        "side": str(payload.get("side") or guard.get("side") or "").upper(),
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl") or payload.get("stop") or payload.get("stop_loss"),
+        "tp50": payload.get("tp50") or payload.get("tp") or payload.get("take_profit"),
+        "risk_pct": payload.get("risk_pct"),
+        "decision": payload.get("decision"),
+        "signal_id": payload.get("signal_id"),
+        "client_order_id": payload.get("client_order_id") or payload.get("clientOrderId") or payload.get("clientOrderID") or payload.get("broker_client_order_id") or result_info.get("client_order_id"),
+        "margin_usdt": trade.get("margin_usdt") if trade else payload.get("margin_usdt"),
+        "leverage": trade.get("leverage") if trade else payload.get("leverage"),
+        "notional_usdt": trade.get("notional_usdt") if trade else payload.get("notional_usdt"),
+    }
+
+
+def _retg_v1_classify_event(payload, result, dry_run=False, mode=None):
+    result = result if isinstance(result, dict) else {}
+    info = _retg_v1_extract_result(result)
+    status = str(info.get("result_status") or info.get("live_status") or result.get("status") or "").upper()
+    if _retg_v1_bool(dry_run, default=True):
+        return "DRY_RUN_PREVIEW", info
+    if "BLOCKED_BY_REAL_PILOT_GUARD" in status or status.startswith("BLOCKED") or info.get("failed_blocking_codes"):
+        return "REAL_EXECUTION_BLOCKED", info
+    if info.get("sent") and info.get("requires_manual_attention"):
+        return "REAL_EXECUTION_SENT_ATTENTION", info
+    if info.get("sent"):
+        return "REAL_EXECUTION_SENT", info
+    if result.get("ok") is False:
+        return "REAL_EXECUTION_FAILED_BEFORE_SEND", info
+    return "REAL_EXECUTION_RESULT", info
+
+
+def _retg_v1_build_message(event_type, payload=None, result=None, mode=None, dry_run=False):
+    result = result if isinstance(result, dict) else {}
+    event_type, info = _retg_v1_classify_event(payload, result, dry_run=dry_run, mode=mode)
+    snap = _retg_v1_payload_snapshot(payload, result_info=info)
+    guard = info.get("real_guard") if isinstance(info.get("real_guard"), dict) else {}
+    failed_codes = info.get("failed_blocking_codes") or guard.get("failed_blocking_codes") or []
+
+    if event_type == "REAL_EXECUTION_SENT_ATTENTION":
+        title = "🚨 TRADE REAL ENVIADO — ATENÇÃO MANUAL"
+    elif event_type == "REAL_EXECUTION_SENT":
+        title = "🚀 TRADE REAL EXECUTADO — CENTRAL QUANT"
+    elif event_type == "REAL_EXECUTION_BLOCKED":
+        title = "⛔ EXECUÇÃO REAL BLOQUEADA — CENTRAL QUANT"
+    elif event_type == "REAL_EXECUTION_FAILED_BEFORE_SEND":
+        title = "⚠️ EXECUÇÃO REAL FALHOU ANTES DO ENVIO"
+    else:
+        title = "ℹ️ EVENTO DE EXECUÇÃO REAL — CENTRAL QUANT"
+
+    lines = [title, f"Data/hora: {_retg_v1_now()}", ""]
+    lines += [
+        f"Bot: {snap.get('bot') or '-'}",
+        f"Setup: {snap.get('setup') or '-'}",
+        f"Ativo: {snap.get('symbol') or '-'}",
+        f"Side: {snap.get('side') or '-'}",
+        f"Margem: {snap.get('margin_usdt') if snap.get('margin_usdt') is not None else '-'} USDT",
+        f"Alavancagem: {snap.get('leverage') if snap.get('leverage') is not None else '-'}x",
+        f"Notional: {snap.get('notional_usdt') if snap.get('notional_usdt') is not None else '-'} USDT",
+        f"Entrada: {snap.get('entry') or '-'}",
+        f"SL: {snap.get('sl') or '-'}",
+        f"TP50: {snap.get('tp50') or '-'}",
+        "",
+        f"Status: {info.get('result_status') or info.get('live_status') or result.get('status') or '-'}",
+        f"Ordem enviada: {info.get('sent')}",
+        f"Order ID: {info.get('order_id') or '-'}",
+        f"Client Order ID: {snap.get('client_order_id') or info.get('client_order_id') or '-'}",
+        f"Disaster Stop: {info.get('disaster_stop_status') or '-'} | ok={info.get('stop_ok')}",
+        f"Post-Execution Safety: {info.get('safety_status') or '-'} | ok={info.get('safety_ok')}",
+        f"Real Pilot Guard: {guard.get('status') or '-'} | allowed={guard.get('allowed')}",
+    ]
+    if failed_codes:
+        lines += ["", "Bloqueios:"]
+        for code in failed_codes[:10]:
+            lines.append(f"- {code}")
+    if info.get("requires_manual_attention"):
+        lines += ["", "AÇÃO IMEDIATA:", "Confira a BingX agora e rode /postexecutionsafety para confirmar proteção."]
+    elif event_type == "REAL_EXECUTION_SENT":
+        lines += ["", "Próximo passo:", "Conferir /postexecutionsafety e /registrypersistence após a execução."]
+    elif event_type == "REAL_EXECUTION_BLOCKED":
+        lines += ["", "Nenhuma ordem real foi enviada."]
+    return "\n".join(lines), event_type, info
+
+
+def _retg_v1_dedup_key(event_type, payload=None, result_info=None):
+    snap = _retg_v1_payload_snapshot(payload, result_info=result_info or {})
+    order_id = (result_info or {}).get("order_id") or ""
+    client_id = snap.get("client_order_id") or (result_info or {}).get("client_order_id") or ""
+    return "|".join([
+        str(event_type),
+        str(snap.get("bot") or ""),
+        str(snap.get("setup") or ""),
+        str(snap.get("symbol") or ""),
+        str(snap.get("side") or ""),
+        str(order_id),
+        str(client_id),
+    ])
+
+
+def _retg_v1_is_duplicate(event_type, payload=None, result_info=None):
+    try:
+        config = _retg_v1_config()
+        key = _retg_v1_dedup_key(event_type, payload=payload, result_info=result_info)
+        now = time.time()
+        expired = [k for k, ts in _REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_RECENT.items() if now - ts > max(30, int(config.get("dedup_seconds") or 8) * 4)]
+        for k in expired[:200]:
+            _REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_RECENT.pop(k, None)
+        last = _REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_RECENT.get(key)
+        if last is not None and now - last < int(config.get("dedup_seconds") or 8):
+            return True
+        _REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_RECENT[key] = now
+    except Exception:
+        return False
+    return False
+
+
+def _retg_v1_append_event(event):
+    try:
+        event = dict(event or {})
+        event.setdefault("generated_at", _retg_v1_now())
+        event.setdefault("version", REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION)
+        if REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE is not None:
+            REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        if REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE is not None:
+            with open(REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE, "w", encoding="utf-8") as f:
+                json.dump(event, f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def real_execution_telegram_notifier_v1_notify(event_type=None, payload=None, result=None, mode=None, dry_run=False, force=False):
+    config = _retg_v1_config()
+    result = result if isinstance(result, dict) else {}
+    classified_event, info = _retg_v1_classify_event(payload, result, dry_run=dry_run, mode=mode)
+    event_type = event_type or classified_event
+
+    should_send = bool(config.get("enabled"))
+    if event_type == "DRY_RUN_PREVIEW" and not config.get("notify_dry_run"):
+        should_send = False
+    if event_type == "REAL_EXECUTION_BLOCKED" and not config.get("notify_blocked"):
+        should_send = False
+    if event_type == "REAL_EXECUTION_FAILED_BEFORE_SEND" and not config.get("notify_failures"):
+        should_send = False
+    if force:
+        should_send = True
+
+    message, event_type, info = _retg_v1_build_message(event_type, payload=payload, result=result, mode=mode, dry_run=dry_run)
+    duplicate = _retg_v1_is_duplicate(event_type, payload=payload, result_info=info)
+    if duplicate and not force:
+        should_send = False
+
+    sent = False
+    error = None
+    if should_send:
+        try:
+            token = globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")
+            chat_id = globals().get("CENTRAL_TELEGRAM_CHAT_ID")
+            if token and chat_id and callable(globals().get("telegram_send_with_token")):
+                sent = bool(telegram_send_with_token(token, chat_id, message, title="EXECUÇÃO REAL"))
+            elif token and chat_id:
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                response = requests.post(url, json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True}, timeout=20)
+                sent = response.status_code == 200
+                if not sent:
+                    error = response.text[:300]
+            else:
+                error = "CENTRAL_TELEGRAM_BOT_TOKEN ou CENTRAL_TELEGRAM_CHAT_ID ausente"
+        except Exception as exc:
+            error = str(exc)
+            sent = False
+
+    event = {
+        "ok": bool(sent) if should_send else True,
+        "module": "real_execution_telegram_notifier_v1",
+        "version": REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION,
+        "generated_at": _retg_v1_now(),
+        "event_type": event_type,
+        "should_send": should_send,
+        "sent": sent,
+        "duplicate": duplicate,
+        "error": error,
+        "config": config,
+        "summary": {
+            "result_status": info.get("result_status"),
+            "live_status": info.get("live_status"),
+            "order_sent": info.get("sent"),
+            "requires_manual_attention": info.get("requires_manual_attention"),
+            "stop_ok": info.get("stop_ok"),
+            "safety_ok": info.get("safety_ok"),
+            "failed_blocking_codes": info.get("failed_blocking_codes"),
+        },
+        "payload_snapshot": _retg_v1_payload_snapshot(payload, result_info=info),
+        "token_value_exposed": False,
+    }
+    _retg_v1_append_event(event)
+    return event
+
+
+@app.route("/realexecutiontelegram/health", methods=["GET"])
+@app.route("/realexecutiontelegram", methods=["GET"])
+@app.route("/real/executiontelegram/health", methods=["GET"])
+def real_execution_telegram_notifier_v1_health_route():
+    config = _retg_v1_config()
+    send_test = _retg_v1_bool(request.args.get("send_test"), default=False)
+    ack = str(request.args.get("ack") or "").strip().upper()
+    test_result = None
+    if send_test:
+        if ack != "REAL_EXECUTION_TELEGRAM_TEST":
+            test_result = {
+                "ok": False,
+                "sent": False,
+                "status": "ACK_REQUIRED",
+                "required_ack": "REAL_EXECUTION_TELEGRAM_TEST",
+            }
+        else:
+            payload = {
+                "bot": request.args.get("bot", "FALCON"),
+                "setup": request.args.get("setup", "FALCON"),
+                "symbol": request.args.get("symbol", "BTCUSDT"),
+                "side": request.args.get("side", "SHORT"),
+                "entry": request.args.get("entry", "108000"),
+                "sl": request.args.get("sl", "109000"),
+                "tp50": request.args.get("tp50", "107000"),
+                "notional_usdt": request.args.get("notional_usdt", "10"),
+                "margin_usdt": request.args.get("margin_usdt", "10"),
+                "leverage": request.args.get("leverage", "1"),
+            }
+            fake_result = {
+                "ok": True,
+                "status": "REAL_EXECUTION_TELEGRAM_TEST_ONLY",
+                "payload": {
+                    "live_result": {
+                        "ok": True,
+                        "sent": False,
+                        "status": "TEST_ONLY_NO_ORDER_SENT",
+                        "requires_manual_attention": False,
+                        "disaster_stop": {"ok": True, "status": "TEST_ONLY"},
+                        "post_execution_safety": {"ok": True, "status": "TEST_ONLY"},
+                    }
+                },
+            }
+            test_result = real_execution_telegram_notifier_v1_notify(
+                event_type="REAL_EXECUTION_RESULT",
+                payload=payload,
+                result=fake_result,
+                mode="LIVE",
+                dry_run=False,
+                force=True,
+            )
+    return {
+        "ok": bool(config.get("enabled") and config.get("telegram_token_configured") and config.get("telegram_chat_configured")),
+        "module": "real_execution_telegram_notifier_v1",
+        "version": REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION,
+        "generated_at": _retg_v1_now(),
+        "config": config,
+        "run_execution_engine_wrapped": callable(_ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_EXECUTION_TELEGRAM_NOTIFIER_V1),
+        "events_file": str(REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE) if REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_EVENTS_FILE is not None else None,
+        "latest_file": str(REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE) if REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE is not None else None,
+        "test_result": test_result,
+        "routes": [
+            "/realexecutiontelegram/health",
+            "/realexecutiontelegram/health?send_test=true&ack=REAL_EXECUTION_TELEGRAM_TEST",
+            "/executionfinalgate?preflight=true",
+            "/executionconsole",
+        ],
+        "notes": [
+            "Esta rota de health não envia ordem real.",
+            "send_test=true envia apenas uma mensagem de teste ao Telegram; não chama a BingX.",
+            "dry_run/preflight não gera alerta por padrão para evitar spam.",
+            "Execução real dry_run=False gera alerta quando enviada, bloqueada ou falha antes do envio.",
+        ],
+        "token_value_exposed": False,
+    }, 200
+
+
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    """
+    Real Execution Telegram Notifier V1 wrapper:
+    - Não altera decisão nem execução.
+    - Chama o runner protegido anterior.
+    - Se dry_run=False, notifica o Telegram com o resultado operacional real.
+    """
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_EXECUTION_TELEGRAM_NOTIFIER_V1
+    payload_dict = dict(payload or {}) if isinstance(payload, dict) else {}
+    dry = _retg_v1_bool(dry_run, default=True)
+    mode_norm = str(mode or payload_dict.get("mode") or "LIVE").upper().strip()
+    if not callable(original_runner):
+        result = {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_RUNNER_MISSING_AFTER_REAL_EXECUTION_TELEGRAM_NOTIFIER",
+            "sent": False,
+            "mode": mode_norm,
+            "dry_run": dry,
+            "version": REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION,
+        }
+        if not dry and mode_norm == "LIVE":
+            result["real_execution_telegram_notifier_v1"] = real_execution_telegram_notifier_v1_notify(
+                payload=payload_dict,
+                result=result,
+                mode=mode_norm,
+                dry_run=dry,
+            )
+        return result
+
+    result = original_runner(payload=payload_dict, mode=mode, dry_run=dry_run, *args, **kwargs)
+    try:
+        if isinstance(result, dict):
+            if (not dry and mode_norm == "LIVE") or bool(_retg_v1_config().get("notify_dry_run")):
+                notification = real_execution_telegram_notifier_v1_notify(
+                    payload=payload_dict,
+                    result=result,
+                    mode=mode_norm,
+                    dry_run=dry,
+                )
+                result.setdefault("real_execution_telegram_notifier_v1", notification)
+                if isinstance(result.get("payload"), dict):
+                    result["payload"].setdefault("real_execution_telegram_notifier_v1", notification)
+    except Exception as exc:
+        try:
+            if isinstance(result, dict):
+                result.setdefault("real_execution_telegram_notifier_v1", {
+                    "ok": False,
+                    "sent": False,
+                    "status": "NOTIFIER_ERROR",
+                    "error": str(exc),
+                    "version": REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION,
+                })
+        except Exception:
+            pass
+    return result
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
