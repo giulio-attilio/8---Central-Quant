@@ -30763,13 +30763,15 @@ def _dshm_v1_clean_broker_kwargs(kwargs=None):
 
 def _dshm_v1_sanitize_result(value):
     try:
-        if callable(globals().get("_execution_final_gate_v1_sanitize")):
-            return _execution_final_gate_v1_sanitize(value)
+        sanitizer = globals().get("_execution_final_gate_v1_sanitize")
+        if callable(sanitizer):
+            return sanitizer(value)
     except Exception:
         pass
     try:
-        if callable(globals().get("_audit_sanitize")):
-            return _audit_sanitize(value)
+        sanitizer = globals().get("_audit_sanitize")
+        if callable(sanitizer):
+            return sanitizer(value)
     except Exception:
         pass
     return value
