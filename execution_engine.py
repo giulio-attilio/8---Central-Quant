@@ -1,6 +1,6 @@
 # execution_engine.py
-# CENTRAL QUANT — EXECUTION ENGINE V2.5.6
-# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.6-EXECUTION-AUTH-TOKEN
+# CENTRAL QUANT — EXECUTION ENGINE V2.5.7
+# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.7-EXECUTION-CONFIRMATION-GUARD
 #
 # Objetivo:
 # - Ser o ponto único de decisão antes de qualquer execução.
@@ -58,7 +58,7 @@ else:
     BROKER_IMPORT_ERROR = None
 
 
-VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.6-EXECUTION-AUTH-TOKEN"
+VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.7-EXECUTION-CONFIRMATION-GUARD"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -102,6 +102,12 @@ REAL_PILOT_IGNORE_EXISTING_POSITIONS = os.getenv("REAL_PILOT_IGNORE_EXISTING_POS
 # Preview não precisa token; LIVE real precisa.
 EXECUTION_AUTH_TOKEN_ENABLED = os.getenv("EXECUTION_AUTH_TOKEN_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
 EXECUTION_AUTH_TOKEN_TTL_SECONDS = int(os.getenv("EXECUTION_AUTH_TOKEN_TTL_SECONDS", "30"))
+# Confirmation Guard: último airbag antes do broker em LIVE real.
+EXECUTION_CONFIRMATION_GUARD_ENABLED = os.getenv("EXECUTION_CONFIRMATION_GUARD_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+EXECUTION_CONFIRMATION_REQUIRE_TOKEN = os.getenv("EXECUTION_CONFIRMATION_REQUIRE_TOKEN", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+EXECUTION_CONFIRMATION_BLOCK_DUPLICATE_WINDOW_SECONDS = int(os.getenv("EXECUTION_CONFIRMATION_BLOCK_DUPLICATE_WINDOW_SECONDS", "300"))
+EXECUTION_CONFIRMATION_MIN_FREE_BALANCE_BUFFER_USDT = float(os.getenv("EXECUTION_CONFIRMATION_MIN_FREE_BALANCE_BUFFER_USDT", "0.25"))
+
 
 
 def _now_br() -> str:
@@ -512,6 +518,10 @@ def execution_engine_health() -> Dict[str, Any]:
             "require_stop": REAL_PILOT_REQUIRE_STOP,
             "execution_auth_token_enabled": EXECUTION_AUTH_TOKEN_ENABLED,
             "execution_auth_token_ttl_seconds": EXECUTION_AUTH_TOKEN_TTL_SECONDS,
+            "execution_confirmation_guard_enabled": EXECUTION_CONFIRMATION_GUARD_ENABLED,
+            "execution_confirmation_require_token": EXECUTION_CONFIRMATION_REQUIRE_TOKEN,
+            "execution_confirmation_duplicate_window_seconds": EXECUTION_CONFIRMATION_BLOCK_DUPLICATE_WINDOW_SECONDS,
+            "execution_confirmation_min_free_balance_buffer_usdt": EXECUTION_CONFIRMATION_MIN_FREE_BALANCE_BUFFER_USDT,
         },
         "orchestrator_loaded": callable(orchestrate_execution),
         "orchestrator_import_error": ORCHESTRATOR_IMPORT_ERROR,
@@ -527,12 +537,256 @@ def execution_engine_health() -> Dict[str, Any]:
             "execution_audit_log": str(EXECUTION_AUDIT_LOG_FILE),
         },
         "notes": [
-            "Execution Engine V2.5.6 é o ponto único antes de qualquer executor.",
+            "Execution Engine V2.5.7 é o ponto único antes de qualquer executor.",
             "Modo OBSERVATION_ONLY cria plano e loga.",
             "Modo PAPER chama Paper Executor integrado quando habilitado.",
             "Modo LIVE chama broker.py em preview seguro quando dry_run=true e em envio real apenas se Real Pilot Guard aprovar.",
             "Em caso de dúvida, bloqueia.",
         ],
+    }
+
+
+
+def _to_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _to_upper(value):
+    return str(value or "").upper().strip()
+
+
+def _recent_duplicate_execution(symbol: str, side: str, bot: str, window_seconds: int = 300) -> Dict[str, Any]:
+    """
+    Procura execução recente parecida no audit log / engine log.
+    Bloqueia repetição acidental por restart/retry/deploy.
+    """
+    now = time.time()
+    keys = {
+        "symbol": _to_upper(symbol),
+        "side": _to_upper(side),
+        "bot": _to_upper(bot),
+    }
+
+    checked = 0
+    matches = []
+
+    for path in [EXECUTION_AUDIT_LOG_FILE, EXECUTION_ENGINE_LOG_FILE]:
+        try:
+            if not path.exists():
+                continue
+            lines = path.read_text(encoding="utf-8").splitlines()[-300:]
+            for line in reversed(lines):
+                checked += 1
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+
+                epoch = _to_float(item.get("epoch"))
+                if epoch is not None and now - epoch > window_seconds:
+                    continue
+
+                item_symbol = _to_upper(item.get("symbol") or ((item.get("payload") or {}).get("symbol") if isinstance(item.get("payload"), dict) else None))
+                item_side = _to_upper(item.get("side") or ((item.get("payload") or {}).get("side") if isinstance(item.get("payload"), dict) else None))
+                item_bot = _to_upper(item.get("bot") or ((item.get("payload") or {}).get("bot") if isinstance(item.get("payload"), dict) else None))
+
+                if item_symbol == keys["symbol"] and item_side == keys["side"] and item_bot == keys["bot"]:
+                    status = _to_upper(item.get("status") or ((item.get("result") or {}).get("status") if isinstance(item.get("result"), dict) else None))
+                    sent = bool(item.get("sent") or ((item.get("result") or {}).get("live_sent") if isinstance(item.get("result"), dict) else False))
+                    if sent or status in {"SENT", "LIVE_PREVIEW_OK", "VERIFY", "DRY_RUN"}:
+                        matches.append({
+                            "path": str(path),
+                            "epoch": epoch,
+                            "status": status,
+                            "sent": sent,
+                            "symbol": item_symbol,
+                            "side": item_side,
+                            "bot": item_bot,
+                        })
+                        break
+        except Exception:
+            continue
+
+    return {
+        "checked": checked,
+        "duplicates": matches,
+        "duplicate": bool(matches),
+        "window_seconds": window_seconds,
+    }
+
+
+def execution_confirmation_guard(
+    *,
+    payload: Dict[str, Any],
+    mode: str,
+    dry_run: bool,
+    real_guard: Optional[Dict[str, Any]],
+    execution_auth_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Execution Confirmation Guard V2.5.7.
+    Último bloqueio antes de chamar broker.place_market_order() em LIVE real.
+
+    Em preview, retorna allowed=True com preview_only=True.
+    Em LIVE real, valida:
+    - token obrigatório se configurado;
+    - Real Pilot Guard aprovado;
+    - bot/símbolo permitidos;
+    - side/entry/stop coerentes;
+    - margem/alavancagem/notional dentro dos limites;
+    - saldo livre com buffer;
+    - duplicidade recente.
+    """
+    reasons = []
+    warnings = []
+    checks = {}
+
+    if not EXECUTION_CONFIRMATION_GUARD_ENABLED:
+        return {
+            "ok": True,
+            "allowed": True,
+            "status": "CONFIRMATION_GUARD_DISABLED",
+            "reasons": [],
+            "warnings": ["EXECUTION_CONFIRMATION_GUARD_ENABLED=false"],
+            "checks": {},
+        }
+
+    symbol = _to_upper(payload.get("symbol"))
+    side = _to_upper(payload.get("side"))
+    bot = _to_upper(payload.get("bot"))
+    entry = _to_float(payload.get("entry"))
+    stop = _to_float(payload.get("sl") if payload.get("sl") is not None else payload.get("stop"))
+    risk_pct = _to_float(payload.get("risk_pct"))
+
+    preview_only = bool(dry_run or mode != "LIVE")
+    checks["preview_only"] = preview_only
+    checks["mode"] = mode
+    checks["dry_run"] = dry_run
+
+    if preview_only:
+        return {
+            "ok": True,
+            "allowed": True,
+            "status": "CONFIRMATION_PREVIEW_ALLOWED",
+            "preview_only": True,
+            "reasons": [],
+            "warnings": ["Preview: Confirmation Guard não bloqueia porque não há envio real."],
+            "checks": checks,
+        }
+
+    if EXECUTION_CONFIRMATION_REQUIRE_TOKEN and not execution_auth_token:
+        reasons.append("execution_auth_token ausente para LIVE real")
+
+    if not isinstance(real_guard, dict) or not real_guard.get("allowed"):
+        reasons.append("Real Pilot Guard não aprovou a execução")
+    else:
+        trade = real_guard.get("trade") or {}
+        config = real_guard.get("config") or {}
+        broker_ready = ((real_guard.get("broker") or {}).get("ready") or {})
+        balance = broker_ready.get("balance") or {}
+
+        margin = _to_float(trade.get("margin_usdt"))
+        leverage = _to_float(trade.get("leverage"))
+        notional = _to_float(trade.get("notional_usdt"))
+        free_usdt = _to_float(balance.get("free_usdt"))
+
+        allowed_bots = set(_to_upper(x) for x in (config.get("allowed_bots") or []))
+        allowed_symbols = set(_to_upper(x) for x in (config.get("allowed_symbols") or []))
+
+        checks.update({
+            "bot": bot,
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "stop": stop,
+            "risk_pct": risk_pct,
+            "margin": margin,
+            "leverage": leverage,
+            "notional": notional,
+            "free_usdt": free_usdt,
+            "allowed_bots": sorted(list(allowed_bots)),
+            "allowed_symbols": sorted(list(allowed_symbols)),
+        })
+
+        if bot not in allowed_bots:
+            reasons.append(f"bot não autorizado: {bot}")
+
+        if symbol not in allowed_symbols:
+            reasons.append(f"symbol não autorizado: {symbol}")
+
+        if side not in {"LONG", "SHORT", "BUY", "SELL"}:
+            reasons.append(f"side inválido: {side}")
+
+        if entry is None:
+            reasons.append("entry ausente ou inválida")
+
+        if stop is None:
+            reasons.append("stop/sl ausente ou inválido")
+
+        if entry is not None and stop is not None:
+            if side in {"LONG", "BUY"} and stop >= entry:
+                reasons.append(f"stop inválido para LONG: stop={stop} >= entry={entry}")
+            if side in {"SHORT", "SELL"} and stop <= entry:
+                reasons.append(f"stop inválido para SHORT: stop={stop} <= entry={entry}")
+
+        max_margin = _to_float(config.get("max_margin_usdt"))
+        max_leverage = _to_float(config.get("max_leverage"))
+        max_notional = _to_float(config.get("max_notional_usdt"))
+        max_risk = _to_float(config.get("max_risk_pct"))
+
+        if margin is None or margin <= 0:
+            reasons.append("margin_usdt inválida")
+        elif max_margin is not None and margin > max_margin:
+            reasons.append(f"margin_usdt acima do limite: {margin}>{max_margin}")
+
+        if leverage is None or leverage <= 0:
+            reasons.append("leverage inválida")
+        elif max_leverage is not None and leverage > max_leverage:
+            reasons.append(f"leverage acima do limite: {leverage}>{max_leverage}")
+
+        if notional is None or notional <= 0:
+            reasons.append("notional_usdt inválido")
+        elif max_notional is not None and notional > max_notional:
+            reasons.append(f"notional_usdt acima do limite: {notional}>{max_notional}")
+
+        if risk_pct is None:
+            warnings.append("risk_pct ausente; Real Pilot Guard pode ter validado fallback")
+        elif max_risk is not None and risk_pct > max_risk:
+            reasons.append(f"risk_pct acima do limite: {risk_pct}>{max_risk}")
+
+        if free_usdt is None:
+            reasons.append("saldo livre indisponível no broker.ready")
+        elif margin is not None:
+            required = margin + EXECUTION_CONFIRMATION_MIN_FREE_BALANCE_BUFFER_USDT
+            checks["required_free_usdt_with_buffer"] = required
+            if free_usdt < required:
+                reasons.append(f"saldo livre insuficiente para margem+buffer: free={free_usdt} < required={required}")
+
+    duplicate = _recent_duplicate_execution(
+        symbol=symbol,
+        side=side,
+        bot=bot,
+        window_seconds=EXECUTION_CONFIRMATION_BLOCK_DUPLICATE_WINDOW_SECONDS,
+    )
+    checks["duplicate_check"] = duplicate
+    if duplicate.get("duplicate"):
+        reasons.append("execução parecida detectada na janela de duplicidade")
+
+    allowed = not reasons
+    return {
+        "ok": allowed,
+        "allowed": allowed,
+        "status": "CONFIRMATION_ALLOWED" if allowed else "CONFIRMATION_BLOCKED",
+        "preview_only": False,
+        "reasons": reasons,
+        "warnings": warnings,
+        "checks": checks,
+        "version": "2026-07-06-EXECUTION-CONFIRMATION-GUARD-V2.5.7",
     }
 
 
@@ -646,17 +900,41 @@ def run_execution_engine(
                 except Exception as exc:
                     execution_auth = {"ok": False, "error": str(exc)}
 
-            live_result = central_broker.place_market_order(
-                symbol=symbol,
-                side=side,
-                margin_usdt=margin,
-                reduce_only=False,
-                client_tag=client_tag,
-                leverage=leverage,
-                bot=bot,
-                risk_pct=risk_pct,
+            confirmation_guard = execution_confirmation_guard(
+                payload=payload,
+                mode=mode,
+                dry_run=dry_run,
+                real_guard=real_guard,
                 execution_auth_token=execution_auth_token,
             )
+
+            if not confirmation_guard.get("allowed"):
+                live_result = {
+                    "ok": False,
+                    "status": "CONFIRMATION_GUARD_BLOCKED",
+                    "sent": False,
+                    "confirmation_guard": confirmation_guard,
+                    "symbol": symbol,
+                    "side": side,
+                    "bot": bot,
+                    "margin_usdt": margin,
+                    "leverage": leverage,
+                    "risk_pct": risk_pct,
+                }
+            else:
+                live_result = central_broker.place_market_order(
+                    symbol=symbol,
+                    side=side,
+                    margin_usdt=margin,
+                    reduce_only=False,
+                    client_tag=client_tag,
+                    leverage=leverage,
+                    bot=bot,
+                    risk_pct=risk_pct,
+                    execution_auth_token=execution_auth_token,
+                )
+                if isinstance(live_result, dict):
+                    live_result.setdefault("confirmation_guard", confirmation_guard)
 
             if execution_auth is not None and isinstance(live_result, dict):
                 live_result.setdefault("execution_auth_issued", {k: v for k, v in execution_auth.items() if k != "token"})
@@ -698,8 +976,8 @@ def run_execution_engine(
         "paper_executor_called": result_extra_paper is not None,
         "live_broker_called": result_extra_live is not None,
         "notes": [
-            "Execution Engine V2.5.6 recebeu o payload e delegou validação ao Orchestrator.",
-            "LIVE com dry_run=true faz preview seguro; LIVE real só envia se o Real Pilot Guard e o broker aprovarem.",
+            "Execution Engine V2.5.7 recebeu o payload e delegou validação ao Orchestrator.",
+            "LIVE com dry_run=true faz preview seguro; LIVE real só envia se Real Pilot Guard, Confirmation Guard, Authorization Token e broker aprovarem.",
             "O broker.py mantém uma segunda camada de kill switch.",
         ],
     }
