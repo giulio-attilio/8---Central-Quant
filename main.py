@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1
+# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -30,6 +30,7 @@ import os
 import time
 import json
 import re
+import html
 import uuid
 import gc
 import threading
