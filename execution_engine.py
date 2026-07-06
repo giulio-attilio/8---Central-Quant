@@ -1,6 +1,6 @@
 # execution_engine.py
 # CENTRAL QUANT — EXECUTION ENGINE V2.5.8
-# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.8-EXECUTION-LIVE-ROUTE-SAFE-DUPLICATE-GUARD
+# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.9-DISASTER-STOP-PASS-THROUGH
 #
 # Objetivo:
 # - Ser o ponto único de decisão antes de qualquer execução.
@@ -58,7 +58,7 @@ else:
     BROKER_IMPORT_ERROR = None
 
 
-VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.8-EXECUTION-LIVE-ROUTE-SAFE-DUPLICATE-GUARD"
+VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.9-DISASTER-STOP-PASS-THROUGH"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -537,7 +537,7 @@ def execution_engine_health() -> Dict[str, Any]:
             "execution_audit_log": str(EXECUTION_AUDIT_LOG_FILE),
         },
         "notes": [
-            "Execution Engine V2.5.8 é o ponto único antes de qualquer executor.",
+            "Execution Engine V2.5.9 é o ponto único antes de qualquer executor.",
             "Modo OBSERVATION_ONLY cria plano e loga.",
             "Modo PAPER chama Paper Executor integrado quando habilitado.",
             "Modo LIVE chama broker.py em preview seguro quando dry_run=true e em envio real apenas se Real Pilot Guard aprovar.",
@@ -869,6 +869,7 @@ def run_execution_engine(
             margin = real_guard["trade"]["margin_usdt"]
             leverage = real_guard["trade"]["leverage"]
             risk_pct = real_guard["trade"]["risk_pct"]
+            stop_loss_price = real_guard["trade"].get("stop")
             client_tag = str(
                 payload.get("client_order_id")
                 or payload.get("client_tag")
@@ -934,6 +935,7 @@ def run_execution_engine(
                     bot=bot,
                     risk_pct=risk_pct,
                     execution_auth_token=execution_auth_token,
+                    stop_loss_price=stop_loss_price,
                 )
                 if isinstance(live_result, dict):
                     live_result.setdefault("confirmation_guard", confirmation_guard)
@@ -978,7 +980,7 @@ def run_execution_engine(
         "paper_executor_called": result_extra_paper is not None,
         "live_broker_called": result_extra_live is not None,
         "notes": [
-            "Execution Engine V2.5.8 recebeu o payload e delegou validação ao Orchestrator.",
+            "Execution Engine V2.5.9 recebeu o payload e delegou validação ao Orchestrator.",
             "LIVE com dry_run=true faz preview seguro; LIVE real só envia se Real Pilot Guard, Confirmation Guard, Authorization Token e broker aprovarem.",
             "O broker.py mantém uma segunda camada de kill switch.",
         ],
@@ -1026,6 +1028,8 @@ def run_execution_engine(
         "execution_auth_status": ((result_extra_live.get("auth") or {}).get("status") if isinstance(result_extra_live, dict) and isinstance(result_extra_live.get("auth"), dict) else None),
         "client_order_id": result_extra_live.get("client_order_id") if isinstance(result_extra_live, dict) else None,
         "order_id": result_extra_live.get("order_id") if isinstance(result_extra_live, dict) else None,
+        "disaster_stop_status": ((result_extra_live.get("disaster_stop") or {}).get("status") if isinstance(result_extra_live, dict) and isinstance(result_extra_live.get("disaster_stop"), dict) else None),
+        "disaster_stop_order_id": ((result_extra_live.get("disaster_stop") or {}).get("order_id") if isinstance(result_extra_live, dict) and isinstance(result_extra_live.get("disaster_stop"), dict) else None),
         "amount": result_extra_live.get("amount") if isinstance(result_extra_live, dict) else None,
         "price_ref": result_extra_live.get("price_ref") if isinstance(result_extra_live, dict) else None,
     })
@@ -1105,3 +1109,4 @@ def read_execution_engine_log(limit: int = 20) -> Dict[str, Any]:
         "count": len(items),
         "items": items,
     }
+
