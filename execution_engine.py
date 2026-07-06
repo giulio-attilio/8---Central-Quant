@@ -1,6 +1,6 @@
 # execution_engine.py
-# CENTRAL QUANT — EXECUTION ENGINE V2.5.3
-# Versão: 2026-07-05-EXECUTION-ENGINE-V2.5.3-EXECUTION-PREVIEW-GUARD
+# CENTRAL QUANT — EXECUTION ENGINE V2.5.4
+# Versão: 2026-07-05-EXECUTION-ENGINE-V2.5.4-EXCHANGE-CONSTRAINTS-VALIDATOR
 #
 # Objetivo:
 # - Ser o ponto único de decisão antes de qualquer execução.
@@ -58,7 +58,7 @@ else:
     BROKER_IMPORT_ERROR = None
 
 
-VERSION = "2026-07-05-EXECUTION-ENGINE-V2.5.3-EXECUTION-PREVIEW-GUARD"
+VERSION = "2026-07-05-EXECUTION-ENGINE-V2.5.4-EXCHANGE-CONSTRAINTS-VALIDATOR"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -474,7 +474,7 @@ def execution_engine_health() -> Dict[str, Any]:
             "execution_engine_log": str(EXECUTION_ENGINE_LOG_FILE),
         },
         "notes": [
-            "Execution Engine V2.5.3 é o ponto único antes de qualquer executor.",
+            "Execution Engine V2.5.4 é o ponto único antes de qualquer executor.",
             "Modo OBSERVATION_ONLY cria plano e loga.",
             "Modo PAPER chama Paper Executor integrado quando habilitado.",
             "Modo LIVE chama broker.py em preview seguro quando dry_run=true e em envio real apenas se Real Pilot Guard aprovar.",
@@ -617,8 +617,8 @@ def run_execution_engine(
         "paper_executor_called": result_extra_paper is not None,
         "live_broker_called": result_extra_live is not None,
         "notes": [
-            "Execution Engine V2.5.3 recebeu o payload e delegou validação ao Orchestrator.",
-            "LIVE com dry_run=true faz preview seguro; LIVE real só envia se o Real Pilot Guard e o broker aprovarem.",
+            "Execution Engine V2.5.4 recebeu o payload e delegou validação ao Orchestrator.",
+            "LIVE com dry_run=true faz preview seguro; LIVE real só envia se Real Pilot Guard, Exchange Constraints e broker aprovarem.",
             "O broker.py mantém uma segunda camada de kill switch.",
         ],
     }
@@ -650,7 +650,7 @@ def execution_engine_test() -> Dict[str, Any]:
         "risk_pct": 2.0,
         "capital_allocated": 4500,
         "requested_qty": 0.1,
-        "signal_id": "EXECUTION-ENGINE-V2.5.3-TEST-FALCON-ETHUSDT-LONG",
+        "signal_id": "EXECUTION-ENGINE-V2.5.4-TEST-FALCON-ETHUSDT-LONG",
     }
     return run_execution_engine(payload=payload, mode="OBSERVATION_ONLY", dry_run=True)
 
@@ -674,7 +674,7 @@ def execution_engine_real_pilot_test(dry_run: bool = True) -> Dict[str, Any]:
         "risk_pct": min(2.0, REAL_PILOT_MAX_RISK_PCT),
         "margin_usdt": min(5.0, REAL_PILOT_MAX_MARGIN_USDT),
         "leverage": min(1, REAL_PILOT_MAX_LEVERAGE),
-        "signal_id": "EXECUTION-ENGINE-V2.5.3-REAL-PILOT-TEST-FALCON-ETHUSDT-LONG",
+        "signal_id": "EXECUTION-ENGINE-V2.5.4-REAL-PILOT-TEST-FALCON-ETHUSDT-LONG",
     }
     return run_execution_engine(payload=payload, mode="LIVE", dry_run=dry_run)
 
