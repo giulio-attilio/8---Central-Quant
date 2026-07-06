@@ -3305,11 +3305,474 @@ def trade_registry_sync_v1_health_route():
 
 
 
+
+
+# ==========================================================
+# POST-EXECUTION SAFETY CHECK V1 — REAL POSITION / STOP / REGISTRY
+# ==========================================================
+POST_EXECUTION_SAFETY_CHECK_V1_VERSION = "2026-07-06-POST-EXECUTION-SAFETY-CHECK-V1"
+
+
+def _pesc_v1_norm_symbol(value):
+    try:
+        s = normalize_registry_symbol(value)
+    except Exception:
+        s = str(value or "").upper().strip()
+    return str(s or "").upper().replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "").replace("-", "")
+
+
+def _pesc_v1_market_symbol(symbol):
+    s = _pesc_v1_norm_symbol(symbol)
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}/USDT:USDT"
+    return str(symbol or s or "").strip()
+
+
+def _pesc_v1_bingx_symbol(symbol):
+    s = _pesc_v1_norm_symbol(symbol)
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}-USDT"
+    return s
+
+
+def _pesc_v1_norm_side(value):
+    side = str(value or "").upper().strip()
+    if side in {"SELL", "SHORT", "SHORTS"}:
+        return "SHORT"
+    if side in {"BUY", "LONG", "LONGS"}:
+        return "LONG"
+    if side.lower() == "short":
+        return "SHORT"
+    if side.lower() == "long":
+        return "LONG"
+    return side
+
+
+def _pesc_v1_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return default
+
+
+def _pesc_v1_abs_float(value, default=0.0):
+    v = _pesc_v1_float(value, default)
+    try:
+        return abs(float(v or 0.0))
+    except Exception:
+        return default
+
+
+def _pesc_v1_broker_call(name, *args, **kwargs):
+    if central_broker is None:
+        return None, f"broker import error: {BROKER_IMPORT_ERROR}"
+    fn = getattr(central_broker, name, None)
+    if not callable(fn):
+        return None, f"broker sem função {name}"
+    try:
+        return fn(*args, **kwargs), None
+    except TypeError:
+        # Algumas funções do broker podem não aceitar symbol/kwargs.
+        try:
+            return fn(), None
+        except Exception as exc:
+            return None, str(exc)
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _pesc_v1_position_symbol(pos):
+    info = pos.get("info") if isinstance(pos, dict) else {}
+    return _pesc_v1_norm_symbol(
+        (pos or {}).get("symbol")
+        or (info or {}).get("symbol")
+        or (info or {}).get("pair")
+        or (info or {}).get("currency")
+    )
+
+
+def _pesc_v1_position_side(pos):
+    info = pos.get("info") if isinstance(pos, dict) else {}
+    return _pesc_v1_norm_side(
+        (pos or {}).get("side")
+        or (info or {}).get("positionSide")
+        or (info or {}).get("side")
+    )
+
+
+def _pesc_v1_position_contracts(pos):
+    info = pos.get("info") if isinstance(pos, dict) else {}
+    return _pesc_v1_abs_float(
+        (pos or {}).get("contracts")
+        or (pos or {}).get("amount")
+        or (pos or {}).get("positionAmt")
+        or (info or {}).get("positionAmt")
+        or (info or {}).get("availableAmt")
+        or 0,
+        0.0,
+    )
+
+
+def _pesc_v1_position_notional(pos):
+    info = pos.get("info") if isinstance(pos, dict) else {}
+    return _pesc_v1_abs_float(
+        (pos or {}).get("notional")
+        or (pos or {}).get("positionValue")
+        or (pos or {}).get("initialMargin")
+        or (info or {}).get("positionValue")
+        or (info or {}).get("initialMargin")
+        or 0,
+        0.0,
+    )
+
+
+def _pesc_v1_slim_position(pos):
+    info = pos.get("info") if isinstance(pos, dict) else {}
+    return {
+        "id": (pos or {}).get("id") or (info or {}).get("positionId"),
+        "symbol": _pesc_v1_position_symbol(pos),
+        "raw_symbol": (pos or {}).get("symbol") or (info or {}).get("symbol"),
+        "side": _pesc_v1_position_side(pos),
+        "contracts": _pesc_v1_position_contracts(pos),
+        "notional": _pesc_v1_position_notional(pos),
+        "entryPrice": (pos or {}).get("entryPrice") or (pos or {}).get("entry_price") or (info or {}).get("avgPrice"),
+        "markPrice": (pos or {}).get("markPrice") or (info or {}).get("markPrice"),
+        "leverage": (pos or {}).get("leverage") or (info or {}).get("leverage"),
+        "unrealizedPnl": (pos or {}).get("unrealizedPnl") or (pos or {}).get("unrealized_pnl") or (info or {}).get("unrealizedProfit"),
+        "realizedPnl": (pos or {}).get("realizedPnl") or (info or {}).get("realisedProfit"),
+        "liquidationPrice": (pos or {}).get("liquidationPrice") or (info or {}).get("liquidationPrice"),
+        "stopLossPrice": (pos or {}).get("stopLossPrice") or (info or {}).get("stopLossPrice") or (info or {}).get("stopLoss"),
+        "takeProfitPrice": (pos or {}).get("takeProfitPrice") or (info or {}).get("takeProfitPrice") or (info or {}).get("takeProfit"),
+        "lastUpdateTimestamp": (pos or {}).get("lastUpdateTimestamp") or (info or {}).get("updateTime"),
+    }
+
+
+def _pesc_v1_fetch_positions(symbol=None, side=None):
+    symbol_norm = _pesc_v1_norm_symbol(symbol)
+    side_norm = _pesc_v1_norm_side(side)
+    attempts = []
+    raw = None
+    err = None
+    for fn_name in ("get_positions", "fetch_positions", "open_positions", "get_open_positions"):
+        raw, err = _pesc_v1_broker_call(fn_name)
+        attempts.append({"function": fn_name, "ok": err is None, "error": err})
+        if err is None:
+            break
+    if raw is None and central_broker is not None:
+        try:
+            exchange = getattr(central_broker, "exchange", None) or getattr(central_broker, "client", None)
+            fetch_positions = getattr(exchange, "fetch_positions", None) if exchange is not None else None
+            if callable(fetch_positions):
+                raw = fetch_positions([_pesc_v1_market_symbol(symbol)] if symbol else None)
+                err = None
+                attempts.append({"function": "exchange.fetch_positions", "ok": True, "error": None})
+        except Exception as exc:
+            err = str(exc)
+            attempts.append({"function": "exchange.fetch_positions", "ok": False, "error": err})
+    positions = []
+    for p in raw or []:
+        if not isinstance(p, dict):
+            continue
+        slim = _pesc_v1_slim_position(p)
+        if slim.get("contracts", 0) <= 0 and slim.get("notional", 0) <= 0:
+            continue
+        if symbol_norm and slim.get("symbol") != symbol_norm:
+            continue
+        if side_norm and slim.get("side") != side_norm:
+            continue
+        positions.append(slim)
+    return {"ok": err is None or bool(positions), "error": err, "attempts": attempts, "positions": positions, "count": len(positions)}
+
+
+def _pesc_v1_order_symbol(order):
+    info = order.get("info") if isinstance(order, dict) else {}
+    return _pesc_v1_norm_symbol(
+        (order or {}).get("symbol")
+        or (info or {}).get("symbol")
+        or (info or {}).get("market")
+    )
+
+
+def _pesc_v1_order_side(order):
+    info = order.get("info") if isinstance(order, dict) else {}
+    return _pesc_v1_norm_side((order or {}).get("side") or (info or {}).get("side"))
+
+
+def _pesc_v1_order_type(order):
+    info = order.get("info") if isinstance(order, dict) else {}
+    return str((order or {}).get("type") or (info or {}).get("type") or (info or {}).get("orderType") or "").upper()
+
+
+def _pesc_v1_order_status(order):
+    info = order.get("info") if isinstance(order, dict) else {}
+    return str((order or {}).get("status") or (info or {}).get("status") or (info or {}).get("state") or "").upper()
+
+
+def _pesc_v1_slim_order(order):
+    info = order.get("info") if isinstance(order, dict) else {}
+    return {
+        "id": (order or {}).get("id") or (info or {}).get("orderId"),
+        "clientOrderId": (order or {}).get("clientOrderId") or (order or {}).get("client_order_id") or (info or {}).get("clientOrderID") or (info or {}).get("clientOrderId"),
+        "symbol": _pesc_v1_order_symbol(order),
+        "raw_symbol": (order or {}).get("symbol") or (info or {}).get("symbol"),
+        "side": _pesc_v1_order_side(order),
+        "type": _pesc_v1_order_type(order),
+        "status": _pesc_v1_order_status(order),
+        "amount": (order or {}).get("amount") or (order or {}).get("remaining") or (info or {}).get("quantity") or (info or {}).get("origQty"),
+        "price": (order or {}).get("price") or (info or {}).get("price"),
+        "stopPrice": (order or {}).get("stopPrice") or (order or {}).get("triggerPrice") or (info or {}).get("stopPrice") or (info or {}).get("triggerPrice"),
+        "reduceOnly": bool((order or {}).get("reduceOnly") or (info or {}).get("reduceOnly") or (info or {}).get("closePosition")),
+        "positionSide": _pesc_v1_norm_side((order or {}).get("positionSide") or (info or {}).get("positionSide")),
+        "raw_keys": sorted(list((order or {}).keys()))[:30] if isinstance(order, dict) else [],
+    }
+
+
+def _pesc_v1_fetch_open_orders(symbol=None):
+    attempts = []
+    symbol_variants = [None]
+    if symbol:
+        symbol_variants = [_pesc_v1_market_symbol(symbol), _pesc_v1_bingx_symbol(symbol), _pesc_v1_norm_symbol(symbol), None]
+    raw_orders = None
+    last_err = None
+
+    for fn_name in (
+        "get_open_orders",
+        "fetch_open_orders",
+        "get_orders",
+        "open_orders",
+        "get_stop_orders",
+        "fetch_stop_orders",
+        "get_trigger_orders",
+        "fetch_trigger_orders",
+    ):
+        fn = getattr(central_broker, fn_name, None) if central_broker is not None else None
+        if not callable(fn):
+            attempts.append({"function": fn_name, "ok": False, "error": "missing"})
+            continue
+        for sym in symbol_variants:
+            try:
+                if sym is None:
+                    raw_orders = fn()
+                    args_used = []
+                else:
+                    raw_orders = fn(sym)
+                    args_used = [sym]
+                attempts.append({"function": fn_name, "args": args_used, "ok": True, "error": None})
+                last_err = None
+                break
+            except TypeError:
+                try:
+                    raw_orders = fn()
+                    attempts.append({"function": fn_name, "args": [], "ok": True, "error": None})
+                    last_err = None
+                    break
+                except Exception as exc:
+                    last_err = str(exc)
+                    attempts.append({"function": fn_name, "args": [] if sym is None else [sym], "ok": False, "error": last_err})
+            except Exception as exc:
+                last_err = str(exc)
+                attempts.append({"function": fn_name, "args": [] if sym is None else [sym], "ok": False, "error": last_err})
+        if raw_orders is not None:
+            break
+
+    if raw_orders is None and central_broker is not None:
+        try:
+            exchange = getattr(central_broker, "exchange", None) or getattr(central_broker, "client", None)
+            fetch_open_orders = getattr(exchange, "fetch_open_orders", None) if exchange is not None else None
+            if callable(fetch_open_orders):
+                for sym in symbol_variants:
+                    try:
+                        raw_orders = fetch_open_orders(sym) if sym is not None else fetch_open_orders()
+                        attempts.append({"function": "exchange.fetch_open_orders", "args": [] if sym is None else [sym], "ok": True, "error": None})
+                        last_err = None
+                        break
+                    except Exception as exc:
+                        last_err = str(exc)
+                        attempts.append({"function": "exchange.fetch_open_orders", "args": [] if sym is None else [sym], "ok": False, "error": last_err})
+        except Exception as exc:
+            last_err = str(exc)
+            attempts.append({"function": "exchange.fetch_open_orders", "ok": False, "error": last_err})
+
+    symbol_norm = _pesc_v1_norm_symbol(symbol)
+    orders = []
+    for order in raw_orders or []:
+        if not isinstance(order, dict):
+            continue
+        slim = _pesc_v1_slim_order(order)
+        if symbol_norm and slim.get("symbol") != symbol_norm:
+            continue
+        status = str(slim.get("status") or "").upper()
+        # Se o endpoint já é open_orders, status vazio também pode ser aceito.
+        if status and status not in {"OPEN", "NEW", "PARTIALLY_FILLED", "PENDING", "TRIGGER", "TRIGGERING", "UNTRIGGERED"}:
+            continue
+        orders.append(slim)
+    return {"ok": raw_orders is not None, "error": last_err, "attempts": attempts, "orders": orders, "count": len(orders)}
+
+
+def _pesc_v1_is_protective_order(order, position_side=None):
+    side = _pesc_v1_order_side(order)
+    position_side = _pesc_v1_norm_side(position_side)
+    typ = _pesc_v1_order_type(order)
+    info = order.get("info") if isinstance(order, dict) else {}
+    stop_price = (order or {}).get("stopPrice") or (order or {}).get("triggerPrice") or (info or {}).get("stopPrice") or (info or {}).get("triggerPrice")
+    reduce_only = bool((order or {}).get("reduceOnly") or (info or {}).get("reduceOnly") or (info or {}).get("closePosition"))
+    text = json.dumps(order, ensure_ascii=False, default=str).upper()
+    has_stop_language = any(key in text or key in typ for key in ("STOP", "SL", "LOSS", "TRIGGER", "TAKE_PROFIT", "TP"))
+    opposite_side = (position_side == "SHORT" and side == "LONG") or (position_side == "LONG" and side == "SHORT")
+    return bool((reduce_only or has_stop_language or stop_price) and (not position_side or opposite_side or reduce_only or has_stop_language))
+
+
+def _pesc_v1_trade_registry_matches(symbol=None, side=None):
+    matches = []
+    try:
+        trades = get_open_positions_central() if callable(globals().get("get_open_positions_central")) else []
+        for trade in trades or []:
+            if not isinstance(trade, dict):
+                continue
+            tsymbol = _pesc_v1_norm_symbol(trade.get("symbol_clean") or trade.get("symbol") or trade.get("ativo") or trade.get("pair"))
+            tside = _pesc_v1_norm_side(trade.get("side") or trade.get("direction"))
+            if symbol and tsymbol != _pesc_v1_norm_symbol(symbol):
+                continue
+            if side and tside != _pesc_v1_norm_side(side):
+                continue
+            matches.append({
+                "trade_id": trade.get("trade_id") or trade.get("id") or trade.get("signal_id"),
+                "bot": trade.get("bot"),
+                "setup": trade.get("setup") or trade.get("signal_type") or trade.get("setup_label"),
+                "symbol": tsymbol,
+                "side": tside,
+                "entry": trade.get("entry") or trade.get("entrada"),
+                "sl": trade.get("sl") or trade.get("stop"),
+                "tp50": trade.get("tp50") or trade.get("tp"),
+                "qty": trade.get("qty") or trade.get("quantity") or trade.get("contracts"),
+                "status": trade.get("status"),
+                "metadata": trade.get("metadata") if isinstance(trade.get("metadata"), dict) else None,
+            })
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "matches": [], "count": 0}
+    return {"ok": True, "matches": matches, "count": len(matches)}
+
+
+def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup=None, source_result=None):
+    symbol_norm = _pesc_v1_norm_symbol(symbol or "BTCUSDT")
+    side_norm = _pesc_v1_norm_side(side or "SHORT")
+    positions_payload = _pesc_v1_fetch_positions(symbol_norm, side_norm)
+    orders_payload = _pesc_v1_fetch_open_orders(symbol_norm)
+    registry_payload = _pesc_v1_trade_registry_matches(symbol_norm, side_norm)
+
+    positions = positions_payload.get("positions") or []
+    orders = orders_payload.get("orders") or []
+    protective_orders = [o for o in orders if _pesc_v1_is_protective_order(o, side_norm)]
+
+    attached_stop_in_position = []
+    for p in positions:
+        if p.get("stopLossPrice") or p.get("takeProfitPrice"):
+            attached_stop_in_position.append({
+                "position_id": p.get("id"),
+                "stopLossPrice": p.get("stopLossPrice"),
+                "takeProfitPrice": p.get("takeProfitPrice"),
+            })
+
+    position_found = len(positions) > 0
+    registry_match = bool(registry_payload.get("count", 0) > 0)
+    stop_confirmed = bool(attached_stop_in_position or protective_orders)
+
+    if not position_found:
+        status = "NO_OPEN_POSITION_FOUND"
+        ok = True
+        requires_manual_attention = False
+    elif stop_confirmed and registry_match:
+        status = "OPEN_POSITION_PROTECTED_AND_REGISTERED"
+        ok = True
+        requires_manual_attention = False
+    elif stop_confirmed and not registry_match:
+        status = "OPEN_POSITION_PROTECTED_BUT_REGISTRY_NOT_CONFIRMED"
+        ok = False
+        requires_manual_attention = True
+    elif (not stop_confirmed) and registry_match:
+        status = "OPEN_POSITION_REGISTERED_BUT_STOP_NOT_CONFIRMED"
+        ok = False
+        requires_manual_attention = True
+    else:
+        status = "OPEN_POSITION_UNPROTECTED_OR_UNKNOWN"
+        ok = False
+        requires_manual_attention = True
+
+    source_live = {}
+    if isinstance(source_result, dict):
+        payload_result = source_result.get("payload") if isinstance(source_result.get("payload"), dict) else source_result
+        source_live = (payload_result or {}).get("live_result") if isinstance(payload_result, dict) else {}
+        source_live = source_live if isinstance(source_live, dict) else {}
+
+    return {
+        "ok": ok,
+        "version": POST_EXECUTION_SAFETY_CHECK_V1_VERSION,
+        "status": status,
+        "generated_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+        "symbol": symbol_norm,
+        "side": side_norm,
+        "bot": bot,
+        "setup": setup,
+        "requires_manual_attention": requires_manual_attention,
+        "position_found": position_found,
+        "position_count": len(positions),
+        "positions": positions,
+        "attached_stop_in_position": attached_stop_in_position,
+        "open_orders_checked": bool(orders_payload.get("ok")),
+        "open_orders_count": len(orders),
+        "protective_orders_count": len(protective_orders),
+        "protective_orders": protective_orders,
+        "stop_confirmed_by_central": stop_confirmed,
+        "trade_registry": registry_payload,
+        "registry_match": registry_match,
+        "source_execution": {
+            "status": source_live.get("status"),
+            "sent": source_live.get("sent"),
+            "order_id": source_live.get("order_id") or source_live.get("id"),
+            "client_order_id": source_live.get("client_order_id"),
+            "error": source_live.get("error"),
+        },
+        "diagnostics": {
+            "positions_fetch": {
+                "ok": positions_payload.get("ok"),
+                "error": positions_payload.get("error"),
+                "attempts": positions_payload.get("attempts"),
+            },
+            "orders_fetch": {
+                "ok": orders_payload.get("ok"),
+                "error": orders_payload.get("error"),
+                "attempts": orders_payload.get("attempts"),
+            },
+        },
+        "notes": [
+            "V1 consulta posição real, tenta consultar ordens abertas/stop orders e cruza com Trade Registry.",
+            "Se a BingX não expõe stop no objeto da posição, o stop precisa aparecer em open_orders/trigger_orders para ser confirmado automaticamente.",
+            "Se você criou stop manualmente e este check ainda retornar STOP_NOT_CONFIRMED, mantenha o stop na BingX e me envie o resultado para adicionarmos o endpoint específico de ordens da sua conta.",
+        ],
+    }
+
+
+@app.route("/postexecutionsafety", methods=["GET"])
+@app.route("/postexecutioncheck", methods=["GET"])
+@app.route("/postexecution/safety", methods=["GET"])
+@app.route("/positioncheck", methods=["GET"])
+@app.route("/positioncheck/<symbol>", methods=["GET"])
+@app.route("/positioncheck/<symbol>/<side>", methods=["GET"])
+@app.route("/executionverify/<symbol>/<side>", methods=["GET"])
+def post_execution_safety_check_v1_route(symbol=None, side=None):
+    symbol = symbol or request.args.get("symbol") or "BTCUSDT"
+    side = side or request.args.get("side") or "SHORT"
+    bot = request.args.get("bot") or "FALCON"
+    setup = request.args.get("setup") or bot
+    return build_post_execution_safety_check_v1(symbol=symbol, side=side, bot=bot, setup=setup)
+
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.8 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1.
+    EXECUTION CONSOLE V1.9 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3327,6 +3790,7 @@ def execution_console_route():
       client_order_id curto enviado ao broker/BingX.
     - Real Execution Final Gate V1: antes do botão vermelho chamar o Engine em dry_run=False,
       valida checklist final de autorização, piloto, limites, posição, IDs e stop.
+    - Post-Execution Safety Check V1: após envio real, consulta posição, ordens de proteção/stop e Trade Registry.
     """
     import urllib.parse
 
@@ -4167,15 +4631,43 @@ def execution_console_route():
                                 except Exception as _sync_refresh_exc:
                                     sync_result["post_sync_refresh_error"] = str(_sync_refresh_exc)
 
+                            post_execution_safety_check = None
+                            try:
+                                live_result_for_safety = None
+                                if isinstance(result, dict):
+                                    rp = result.get("payload") if isinstance(result.get("payload"), dict) else result
+                                    live_result_for_safety = (rp or {}).get("live_result") if isinstance(rp, dict) else None
+                                live_sent_for_safety = bool(isinstance(live_result_for_safety, dict) and live_result_for_safety.get("sent"))
+                                status_for_safety = str((live_result_for_safety or {}).get("status") or (result or {}).get("status") or "")
+                                if live_sent_for_safety or "LIVE_SENT" in status_for_safety:
+                                    post_execution_safety_check = build_post_execution_safety_check_v1(
+                                        symbol=payload.get("symbol"),
+                                        side=payload.get("side"),
+                                        bot=payload.get("bot"),
+                                        setup=payload.get("setup"),
+                                        source_result=result,
+                                    )
+                            except Exception as _pesc_exc:
+                                post_execution_safety_check = {
+                                    "ok": False,
+                                    "version": POST_EXECUTION_SAFETY_CHECK_V1_VERSION,
+                                    "status": "POST_EXECUTION_SAFETY_CHECK_ERROR",
+                                    "error": str(_pesc_exc),
+                                }
+
                             if isinstance(result, dict):
                                 result.setdefault("trade_registry_sync_v1", sync_result)
                                 result.setdefault("existing_position_state_before_sync", existing_position_state_before_sync)
                                 result.setdefault("existing_position_state", existing_position_state_after_sync)
                                 result.setdefault("real_execution_final_gate_v1", final_gate)
+                                if post_execution_safety_check is not None:
+                                    result.setdefault("post_execution_safety_check_v1", post_execution_safety_check)
                                 if isinstance(result.get("payload"), dict):
                                     result["payload"].setdefault("trade_registry_sync_v1", sync_result)
                                     result["payload"].setdefault("real_execution_final_gate_v1", final_gate)
-                            message = "Execução real solicitada. Real Execution Final Gate V1 aprovado; Trade Registry Sync V1.1 aplicado quando houve ordem real enviada."
+                                    if post_execution_safety_check is not None:
+                                        result["payload"].setdefault("post_execution_safety_check_v1", post_execution_safety_check)
+                            message = "Execução real solicitada. Real Execution Final Gate V1 aprovado; Trade Registry Sync V1.1 e Post-Execution Safety Check V1 aplicados quando houve ordem real enviada."
 
             else:
                 result = {
@@ -4258,6 +4750,14 @@ def execution_console_route():
     real_execution_final_gate = real_execution_final_gate if isinstance(real_execution_final_gate, dict) else {}
     real_execution_final_gate_json = json.dumps(real_execution_final_gate or {"status": "NO_FINAL_GATE_YET"}, ensure_ascii=False, indent=2, default=str)
 
+    post_execution_safety_check = None
+    if isinstance(result, dict):
+        post_execution_safety_check = result.get("post_execution_safety_check_v1")
+        if post_execution_safety_check is None and isinstance(result.get("payload"), dict):
+            post_execution_safety_check = result.get("payload", {}).get("post_execution_safety_check_v1")
+    post_execution_safety_check = post_execution_safety_check if isinstance(post_execution_safety_check, dict) else {}
+    post_execution_safety_check_json = json.dumps(post_execution_safety_check or {"status": "NO_POST_EXECUTION_SAFETY_CHECK_YET"}, ensure_ascii=False, indent=2, default=str)
+
     summary = {
         "ok": result.get("ok") if isinstance(result, dict) else None,
         "status": result_payload.get("status") if isinstance(result_payload, dict) else (result.get("status") if isinstance(result, dict) else None),
@@ -4284,6 +4784,10 @@ def execution_console_route():
         "central_managed_likely": existing_position_state.get("central_managed_likely"),
         "existing_position_ack": payload.get("existing_position_ack"),
         "trade_registry_sync_v1": (result.get("trade_registry_sync_v1") if isinstance(result, dict) else None) or (result_payload.get("trade_registry_sync_v1") if isinstance(result_payload, dict) else None),
+        "post_execution_safety_check_status": post_execution_safety_check.get("status"),
+        "post_execution_position_found": post_execution_safety_check.get("position_found"),
+        "post_execution_stop_confirmed_by_central": post_execution_safety_check.get("stop_confirmed_by_central"),
+        "post_execution_requires_manual_attention": post_execution_safety_check.get("requires_manual_attention"),
     }
     summary_json = json.dumps(summary, ensure_ascii=False, indent=2, default=str)
 
@@ -4295,7 +4799,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.8</title>
+  <title>Central Quant — Execution Console V1.9</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -4365,7 +4869,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.8</h1>
+  <h1>Central Quant — Execution Console V1.9</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -4376,6 +4880,7 @@ def execution_console_route():
     <p class="info">V1.6 / Signal ID Refresh: cada novo POST gera um signal_id novo; refresh/F5 via PRG apenas recarrega o resultado salvo.</p>
     <p class="info">Broker Client Order ID V1: a Central mantém um signal_id completo e envia ao broker/BingX um client_order_id curto e único.</p>
     <p class="info">Real Execution Final Gate V1: antes de execução real, a Central valida token, piloto, limites, posição, IDs e stop.</p>
+    <p class="info">Post-Execution Safety Check V1: após ordem real, a Central consulta posição, ordens de proteção/stop e Trade Registry.</p>
   </div>
 
   <form method="post" class="card" action="{esc(request.path)}">
@@ -4471,6 +4976,12 @@ def execution_console_route():
   </div>
 
   <div class="card">
+    <h2>Post-Execution Safety Check V1</h2>
+    <p class="warn">Após execução real, este bloco verifica posição aberta, ordens de proteção/stop e registro no Trade Registry.</p>
+    <pre>{esc(post_execution_safety_check_json)}</pre>
+  </div>
+
+  <div class="card">
     <h2>Resultado completo</h2>
     <pre>{esc(result_json or "Clique em Preview seguro antes da primeira execução real.")}</pre>
   </div>
@@ -4480,6 +4991,9 @@ def execution_console_route():
     <p><a style="color:#93c5fd" href="/executionenginehealth" target="_blank">/executionenginehealth</a></p>
     <p><a style="color:#93c5fd" href="/executionenginelog" target="_blank">/executionenginelog</a></p>
     <p><a style="color:#93c5fd" href="/traderegistrysyncv1/health" target="_blank">/traderegistrysyncv1/health</a></p>
+    <p><a style="color:#93c5fd" href="/postexecutionsafety?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT" target="_blank">/postexecutionsafety BTC SHORT</a></p>
+    <p><a style="color:#93c5fd" href="/positioncheck/BTCUSDT/SHORT" target="_blank">/positioncheck/BTCUSDT/SHORT</a></p>
+    <p><a style="color:#93c5fd" href="/executionverify/BTCUSDT/SHORT" target="_blank">/executionverify/BTCUSDT/SHORT</a></p>
     <p><a style="color:#93c5fd" href="/executionverify?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT&entry=108000&sl=109000&tp50=107000" target="_blank">/executionverify BTC SHORT</a></p>
   </div>
 </body>
