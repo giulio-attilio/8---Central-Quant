@@ -2904,6 +2904,108 @@ def execution_engine_run_route():
     return engine_result
 
 
+@app.route("/executionverify", methods=["GET", "POST"])
+@app.route("/executionengineverify", methods=["GET", "POST"])
+@app.route("/execution/verify", methods=["GET", "POST"])
+@app.route("/execution/engine/verify", methods=["GET", "POST"])
+def execution_engine_verify_route():
+    """
+    Verificação completa do fluxo LIVE em dry-run.
+    - Força mode=LIVE para acionar Real Pilot Guard.
+    - Mantém dry_run=True para NÃO enviar ordem real.
+    - O broker.py ainda respeita ENABLE_REAL_TRADING/BROKER_DRY_RUN como segunda trava.
+    """
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
+
+    if not payload:
+        payload = {
+            "decision": "ALLOW",
+            "bot": "FALCON",
+            "setup": "FALCON",
+            "symbol": "ETHUSDT",
+            "side": "LONG",
+            "entry": 3500,
+            "sl": 3430,
+            "tp50": 3570,
+            "risk_pct": 2.0,
+            "capital_allocated": 4500,
+            "requested_qty": 0.1,
+            "signal_id": f"EXECUTION-VERIFY-V2.5.2-FALCON-ETHUSDT-LONG-{int(time.time())}",
+        }
+
+    payload.setdefault("decision", "ALLOW")
+    payload.setdefault("bot", "FALCON")
+    payload.setdefault("setup", payload.get("bot") or "FALCON")
+    payload.setdefault("symbol", "ETHUSDT")
+    payload.setdefault("side", "LONG")
+    payload.setdefault("entry", 3500)
+    payload.setdefault("sl", 3430)
+    payload.setdefault("tp50", 3570)
+    payload.setdefault("risk_pct", 2.0)
+    payload.setdefault("signal_id", f"EXECUTION-VERIFY-V2.5.2-{int(time.time())}")
+
+    policy_reasons = []
+    policy_warnings = []
+    executive_policy_eval = _apply_executive_policy_to_risk_reasons(
+        trade_payload=payload,
+        reasons=policy_reasons,
+        warnings=policy_warnings,
+    )
+
+    if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
+        blocked_payload = dict(payload or {})
+        blocked_payload["decision"] = "DENY"
+        blocked_payload["blocked_by"] = "EXECUTIVE_POLICY_MANAGER"
+        blocked_payload["executive_policy"] = executive_policy_eval
+        return {
+            "ok": True,
+            "route": "/executionverify",
+            "mode": "LIVE",
+            "dry_run": True,
+            "decision": "DENY",
+            "allowed": False,
+            "status": "BLOCKED_BY_EXECUTIVE_POLICY",
+            "blocked_by": "EXECUTIVE_POLICY_MANAGER",
+            "executive_policy": executive_policy_eval,
+            "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
+            "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
+            "payload": blocked_payload,
+            "notes": [
+                "Execution Verify protegido pelo Executive Policy Manager.",
+                "Nenhuma chamada a run_execution_engine foi feita porque a política executiva bloqueou a trade.",
+            ],
+        }
+
+    if isinstance(executive_policy_eval, dict):
+        payload["executive_policy"] = executive_policy_eval
+
+    engine_result = run_execution_engine(
+        payload=payload,
+        mode="LIVE",
+        dry_run=True,
+    )
+
+    if isinstance(engine_result, dict):
+        engine_result.setdefault("route", "/executionverify")
+        engine_result.setdefault("mode_forced", "LIVE")
+        engine_result.setdefault("dry_run_forced", True)
+        engine_result.setdefault("executive_policy", executive_policy_eval)
+        engine_result.setdefault("policy_gate", {
+            "checked": True,
+            "allowed": True,
+            "source": "executive_policy_manager",
+            "warnings": policy_warnings,
+        })
+        engine_result.setdefault("notes", [])
+        if isinstance(engine_result.get("notes"), list):
+            engine_result["notes"].append("/executionverify força LIVE + dry_run=True para testar o fluxo real sem enviar ordem.")
+
+    return engine_result
+
+
 @app.route("/executionenginetest")
 @app.route("/executiontest")
 @app.route("/execution_engine/test")
@@ -2930,7 +3032,7 @@ def execution_routes_compat_route():
     return {
         "ok": True,
         "module": "execution_routes_compat",
-        "version": "2026-07-05-EXECUTION-ROUTES-COMPAT-V2.5.1",
+        "version": "2026-07-05-EXECUTION-ROUTES-COMPAT-V2.5.2",
         "generated_at": data_hora_sp_str(),
         "routes": {
             "health": [
@@ -2957,10 +3059,17 @@ def execution_routes_compat_route():
                 "/execution_engine/run",
                 "/execution/engine/run",
             ],
+            "verify": [
+                "/executionverify",
+                "/executionengineverify",
+                "/execution/verify",
+                "/execution/engine/verify",
+            ],
         },
         "notes": [
             "Aliases sem underline adicionados para evitar not found.",
             "Rotas de teste/run chamam o Execution Engine; respeitam as travas do V2.5.",
+            "/executionverify força mode=LIVE com dry_run=True para validar o broker sem enviar ordem real.",
             "Não ativam operação real sozinhas.",
         ],
     }
