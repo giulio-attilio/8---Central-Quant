@@ -3015,7 +3015,7 @@ def execution_engine_verify_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.3 — Post/Redirect/Get.
+    EXECUTION CONSOLE V1.4 — PRG + Real Position Awareness.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3025,6 +3025,8 @@ def execution_console_route():
     - Mantém todos os guards existentes: Executive Policy, Real Pilot Guard,
       Confirmation Guard, Authorization Token e Broker kill switches.
     - V1.3 PRG: todo POST termina em redirect 303 para GET, impedindo reenvio por F5.
+    - V1.4: detecta posição real existente na BingX e exige reconhecimento explícito
+      quando a execução pode aumentar/conviver com uma posição já aberta pela Central.
     """
     import urllib.parse
 
@@ -3100,6 +3102,129 @@ def execution_console_route():
         except Exception:
             return float(default)
 
+    def _normalize_console_symbol(value):
+        return str(value or "").upper().replace("/", "").replace(":USDT", "").replace("-", "")
+
+    def _normalize_console_side(value):
+        side = str(value or "").upper().strip()
+        if side in {"SELL", "SHORT"}:
+            return "SHORT"
+        if side in {"BUY", "LONG"}:
+            return "LONG"
+        return side
+
+    def _extract_broker_positions_from_result(engine_result):
+        try:
+            payload_result = engine_result.get("payload") if isinstance(engine_result, dict) else {}
+            real_guard = (payload_result or {}).get("real_guard") if isinstance(payload_result, dict) else {}
+            broker = (real_guard or {}).get("broker") if isinstance(real_guard, dict) else {}
+            positions = (broker or {}).get("positions") if isinstance(broker, dict) else {}
+            sample = (positions or {}).get("sample") if isinstance(positions, dict) else []
+            if isinstance(sample, list):
+                return [p for p in sample if isinstance(p, dict)]
+        except Exception:
+            pass
+        return []
+
+    def _position_console_symbol(position):
+        info = position.get("info") if isinstance(position, dict) else {}
+        return _normalize_console_symbol(
+            position.get("symbol")
+            or (info or {}).get("symbol")
+            or (info or {}).get("pair")
+        )
+
+    def _position_console_side(position):
+        info = position.get("info") if isinstance(position, dict) else {}
+        return _normalize_console_side(
+            position.get("side")
+            or (info or {}).get("positionSide")
+            or (info or {}).get("side")
+        )
+
+    def _trade_registry_open_matches(symbol, side):
+        matches = []
+        try:
+            trades = get_open_positions_central() if callable(globals().get("get_open_positions_central")) else []
+            for trade in trades or []:
+                if not isinstance(trade, dict):
+                    continue
+                trade_symbol = _normalize_console_symbol(trade.get("symbol_clean") or trade.get("symbol") or trade.get("ativo") or trade.get("pair"))
+                trade_side = _normalize_console_side(trade.get("side") or trade.get("direction"))
+                if trade_symbol == _normalize_console_symbol(symbol) and trade_side == _normalize_console_side(side):
+                    matches.append({
+                        "bot": trade.get("bot"),
+                        "setup": trade.get("setup") or trade.get("signal_type") or trade.get("setup_label"),
+                        "symbol": trade_symbol,
+                        "side": trade_side,
+                        "entry": trade.get("entry") or trade.get("entrada"),
+                        "status": trade.get("status"),
+                        "signal_id": trade.get("signal_id") or trade.get("id") or trade.get("trade_id"),
+                    })
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "matches": []}
+        return {"ok": True, "matches": matches, "count": len(matches)}
+
+    def _build_existing_position_state(engine_result, current_payload):
+        symbol = _normalize_console_symbol((current_payload or {}).get("symbol"))
+        side = _normalize_console_side((current_payload or {}).get("side"))
+        broker_positions = _extract_broker_positions_from_result(engine_result)
+        same_side = []
+        opposite_side = []
+        for pos in broker_positions:
+            pos_symbol = _position_console_symbol(pos)
+            pos_side = _position_console_side(pos)
+            compact = {
+                "symbol": pos_symbol,
+                "side": pos_side,
+                "entryPrice": pos.get("entryPrice") or (pos.get("info") or {}).get("avgPrice"),
+                "contracts": pos.get("contracts") or (pos.get("info") or {}).get("positionAmt"),
+                "notional": pos.get("notional") or (pos.get("info") or {}).get("positionValue"),
+                "leverage": pos.get("leverage") or (pos.get("info") or {}).get("leverage"),
+                "unrealizedPnl": pos.get("unrealizedPnl") or (pos.get("info") or {}).get("unrealizedProfit"),
+            }
+            if pos_symbol == symbol and pos_side == side:
+                same_side.append(compact)
+            elif pos_symbol == symbol and pos_side and pos_side != side:
+                opposite_side.append(compact)
+        registry = _trade_registry_open_matches(symbol, side)
+        state = {
+            "version": "EXECUTION_CONSOLE_V1.4_REAL_POSITION_AWARENESS",
+            "symbol": symbol,
+            "side": side,
+            "broker_open_positions_seen": len(broker_positions),
+            "same_symbol_same_side_count": len(same_side),
+            "same_symbol_opposite_side_count": len(opposite_side),
+            "same_side_positions": same_side,
+            "opposite_side_positions": opposite_side,
+            "trade_registry_matches": registry,
+            "central_managed_likely": bool((registry or {}).get("count", 0) > 0),
+            "requires_existing_position_ack_for_real_execute": bool(len(same_side) > 0 or len(opposite_side) > 0),
+            "notes": [
+                "V1.4 não bloqueia posição existente da própria Central de forma cega.",
+                "Se houver posição real no mesmo ativo, execução real exige reconhecimento explícito no formulário.",
+                "A BingX continua sendo executor/custodiante; a Central deve manter a verdade operacional.",
+            ],
+        }
+        return state
+
+    def _attach_existing_position_state(engine_result, current_payload):
+        try:
+            if not isinstance(engine_result, dict):
+                return engine_result, None
+            state = _build_existing_position_state(engine_result, current_payload)
+            engine_result.setdefault("execution_console_v1_4", {})["existing_position_state"] = state
+            if isinstance(engine_result.get("payload"), dict):
+                engine_result["payload"].setdefault("execution_console_v1_4", {})["existing_position_state"] = state
+            return engine_result, state
+        except Exception as exc:
+            state = {"ok": False, "error": str(exc)}
+            try:
+                engine_result.setdefault("execution_console_v1_4", {})["existing_position_state_error"] = state
+            except Exception:
+                pass
+            return engine_result, state
+
     def _field(name, default=""):
         if request.method == "POST":
             return str((request.form.get(name) or request.args.get(name) or default)).strip()
@@ -3134,6 +3259,7 @@ def execution_console_route():
         "tp50": _field("tp50", "107000"),
         "risk_pct": _safe_float_field(_field("risk_pct", "2"), 2.0),
         "signal_id": _field("signal_id", f"EXECUTION-CONSOLE-V1-{int(time.time())}"),
+        "existing_position_ack": _field("existing_position_ack", ""),
     }
 
     result = None
@@ -3158,6 +3284,7 @@ def execution_console_route():
                     mode="LIVE",
                     dry_run=True,
                 )
+                result, existing_position_state = _attach_existing_position_state(result, payload)
 
                 # V1.3: em preview, MISSING_EXECUTION_AUTH_TOKEN é esperado.
                 # O token só deve ser gerado em execução real dry_run=False.
@@ -3192,38 +3319,69 @@ def execution_console_route():
                     status_code = 400
                     message = "Execução real bloqueada: confirmação inválida."
                 else:
-                    # Reaproveita o mesmo caminho seguro da rota /executionlive.
-                    # Aqui não chamamos a rota por HTTP; chamamos diretamente o Engine.
-                    policy_reasons = []
-                    policy_warnings = []
-                    executive_policy_eval = _apply_executive_policy_to_risk_reasons(
-                        trade_payload=payload,
-                        reasons=policy_reasons,
-                        warnings=policy_warnings,
+                    # V1.4: antes de qualquer execução real, roda um preview de estado.
+                    # Se já houver posição real no mesmo ativo, exige reconhecimento explícito
+                    # de que a posição é conhecida/gerenciada pela Central.
+                    preflight_result = run_execution_engine(
+                        payload=payload,
+                        mode="LIVE",
+                        dry_run=True,
                     )
+                    preflight_result, existing_position_state = _attach_existing_position_state(preflight_result, payload)
+                    ack = str(payload.get("existing_position_ack") or "").strip().upper()
+                    requires_ack = bool((existing_position_state or {}).get("requires_existing_position_ack_for_real_execute"))
 
-                    if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
+                    if requires_ack and ack != "CENTRAL_MANAGED_EXISTING_POSITION":
                         result = {
-                            "ok": True,
-                            "status": "BLOCKED_BY_EXECUTIVE_POLICY",
+                            "ok": False,
+                            "status": "EXISTING_REAL_POSITION_ACK_REQUIRED",
                             "sent": False,
-                            "decision": "DENY",
-                            "executive_policy": executive_policy_eval,
-                            "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
-                            "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
+                            "reason": "Existe posição real no mesmo ativo. Para executar, reconheça explicitamente que ela é conhecida e gerenciada pela Central.",
+                            "required_existing_position_ack": "CENTRAL_MANAGED_EXISTING_POSITION",
+                            "received_existing_position_ack": ack,
+                            "existing_position_state": existing_position_state,
+                            "preflight_result": preflight_result,
                             "payload": payload,
                         }
-                        message = "Execução real bloqueada por política executiva."
+                        status_code = 409
+                        message = "Execução real bloqueada: posição real existente exige reconhecimento explícito da Central."
                     else:
-                        if isinstance(executive_policy_eval, dict):
-                            payload["executive_policy"] = executive_policy_eval
+                        payload["execution_console_existing_position_state"] = existing_position_state
 
-                        result = run_execution_engine(
-                            payload=payload,
-                            mode="LIVE",
-                            dry_run=False,
+                        # Reaproveita o mesmo caminho seguro da rota /executionlive.
+                        # Aqui não chamamos a rota por HTTP; chamamos diretamente o Engine.
+                        policy_reasons = []
+                        policy_warnings = []
+                        executive_policy_eval = _apply_executive_policy_to_risk_reasons(
+                            trade_payload=payload,
+                            reasons=policy_reasons,
+                            warnings=policy_warnings,
                         )
-                        message = "Execução real solicitada. Verifique sent/order_id/status no resultado."
+
+                        if isinstance(executive_policy_eval, dict) and not executive_policy_eval.get("allowed", True):
+                            result = {
+                                "ok": True,
+                                "status": "BLOCKED_BY_EXECUTIVE_POLICY",
+                                "sent": False,
+                                "decision": "DENY",
+                                "executive_policy": executive_policy_eval,
+                                "existing_position_state": existing_position_state,
+                                "reasons": policy_reasons or executive_policy_eval.get("reasons") or ["Bloqueado por política executiva ativa."],
+                                "warnings": policy_warnings or executive_policy_eval.get("warnings") or [],
+                                "payload": payload,
+                            }
+                            message = "Execução real bloqueada por política executiva."
+                        else:
+                            if isinstance(executive_policy_eval, dict):
+                                payload["executive_policy"] = executive_policy_eval
+
+                            result = run_execution_engine(
+                                payload=payload,
+                                mode="LIVE",
+                                dry_run=False,
+                            )
+                            result, _ = _attach_existing_position_state(result, payload)
+                            message = "Execução real solicitada. Verifique sent/order_id/status no resultado."
 
             else:
                 result = {
@@ -3245,7 +3403,7 @@ def execution_console_route():
             status_code = 500
             message = f"Erro na Execution Console: {exc}"
 
-        # V1.3 PRG:
+        # V1.3/V1.4 PRG:
         # Depois de qualquer POST, salva resultado e redireciona para GET.
         # Assim F5 recarrega apenas o GET e nunca reenvia preview/execução real.
         result_id = _console_save_result(payload, result, message, status_code, action)
@@ -3260,6 +3418,7 @@ def execution_console_route():
             "tp50": payload.get("tp50"),
             "risk_pct": payload.get("risk_pct"),
             "signal_id": payload.get("signal_id"),
+            "existing_position_ack": payload.get("existing_position_ack"),
         }
         location = request.path + "?" + urllib.parse.urlencode(query, doseq=False)
         return "", 303, {"Location": location}
@@ -3274,6 +3433,16 @@ def execution_console_route():
         live_result = result.get("live_result")
     live_result = live_result if isinstance(live_result, dict) else {}
 
+    existing_position_state = None
+    if isinstance(result, dict):
+        existing_position_state = ((result.get("execution_console_v1_4") or {}).get("existing_position_state"))
+        if existing_position_state is None and isinstance(result.get("payload"), dict):
+            existing_position_state = ((result.get("payload", {}).get("execution_console_v1_4") or {}).get("existing_position_state"))
+        if existing_position_state is None:
+            existing_position_state = result.get("existing_position_state")
+    existing_position_state = existing_position_state if isinstance(existing_position_state, dict) else {}
+    existing_position_state_json = json.dumps(existing_position_state or {"status": "NO_STATE_YET"}, ensure_ascii=False, indent=2, default=str)
+
     summary = {
         "ok": result.get("ok") if isinstance(result, dict) else None,
         "status": result_payload.get("status") if isinstance(result_payload, dict) else (result.get("status") if isinstance(result, dict) else None),
@@ -3286,6 +3455,10 @@ def execution_console_route():
         "auth": (live_result.get("auth") or {}).get("status") if isinstance(live_result.get("auth"), dict) else None,
         "prg_result_id": result_id,
         "prg_mode": "POST_REDIRECT_GET" if result_id else "GET_ONLY",
+        "existing_same_side_count": existing_position_state.get("same_symbol_same_side_count"),
+        "existing_opposite_side_count": existing_position_state.get("same_symbol_opposite_side_count"),
+        "central_managed_likely": existing_position_state.get("central_managed_likely"),
+        "existing_position_ack": payload.get("existing_position_ack"),
     }
     summary_json = json.dumps(summary, ensure_ascii=False, indent=2, default=str)
 
@@ -3297,7 +3470,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.3 PRG</title>
+  <title>Central Quant — Execution Console V1.4</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3366,12 +3539,13 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.3 PRG</h1>
+  <h1>Central Quant — Execution Console V1.4</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
     <p>Para preview, nenhuma ordem real é enviada. Em preview, <b>MISSING_EXECUTION_AUTH_TOKEN</b> é normal porque o token só existe em execução real.</p>
     <p class="info">Proteção PRG ativa: depois de Preview ou Execução, o POST vira Redirect e a tela final é carregada via GET. Apertar F5 não reenvia a ordem.</p>
+    <p class="info">V1.4: a tela mostra posição real existente e, para execução real sobre posição já aberta, exige reconhecimento explícito de que a posição é gerenciada pela Central.</p>
   </div>
 
   <form method="post" class="card">
@@ -3417,6 +3591,14 @@ def execution_console_route():
         <input name="execution_confirm" value="" placeholder="Digite exatamente EXECUTE_REAL_TRADE">
         <small>O botão vermelho só funciona se este campo for preenchido exatamente com EXECUTE_REAL_TRADE.</small>
       </div>
+      <div>
+        <label>Posição real existente</label>
+        <select name="existing_position_ack">
+          <option value="" {"selected" if not payload.get("existing_position_ack") else ""}>Não reconhecer posição existente</option>
+          <option value="CENTRAL_MANAGED_EXISTING_POSITION" {"selected" if payload.get("existing_position_ack") == "CENTRAL_MANAGED_EXISTING_POSITION" else ""}>Reconheço: posição gerenciada pela Central</option>
+        </select>
+        <small>V1.4: se já houver posição real no ativo, a execução real só continua com este reconhecimento.</small>
+      </div>
     </div>
 
     <br>
@@ -3433,6 +3615,12 @@ def execution_console_route():
     <h2>Resumo do resultado</h2>
     <p>{esc(message or "Nenhuma ação executada ainda.")}</p>
     <pre>{esc(summary_json)}</pre>
+  </div>
+
+  <div class="card">
+    <h2>Estado real / posição existente — V1.4</h2>
+    <p class="info">Use este bloco para confirmar se a posição aberta na BingX é conhecida pela Central antes de qualquer execução real.</p>
+    <pre>{esc(existing_position_state_json)}</pre>
   </div>
 
   <div class="card">
