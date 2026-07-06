@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.1
+# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.2-CONFIRMATION-FIX
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -3031,7 +3031,19 @@ def execution_console_route():
         return str(request.args.get(name, default)).strip()
 
     action = _field("action", "preview")
-    confirm = _field("confirm", "")
+    # V1.2: aceita múltiplos nomes de campo e normaliza para evitar bloqueio por espaço/case.
+    confirm_raw = (
+        request.form.get("execution_confirm")
+        or request.form.get("confirm")
+        or request.form.get("confirmation")
+        or request.form.get("confirmation_phrase")
+        or request.args.get("execution_confirm")
+        or request.args.get("confirm")
+        or request.args.get("confirmation")
+        or request.args.get("confirmation_phrase")
+        or ""
+    )
+    confirm = str(confirm_raw or "").strip().upper()
 
     payload = {
         "decision": "ALLOW",
@@ -3063,7 +3075,7 @@ def execution_console_route():
 
             # Execução real deliberada
             elif action == "execute":
-                required_phrase = os.environ.get("EXECUTION_LIVE_CONFIRMATION_PHRASE", "EXECUTE_REAL_TRADE")
+                required_phrase = os.environ.get("EXECUTION_LIVE_CONFIRMATION_PHRASE", "EXECUTE_REAL_TRADE").strip().upper()
                 if confirm != required_phrase:
                     result = {
                         "ok": False,
@@ -3071,6 +3083,8 @@ def execution_console_route():
                         "sent": False,
                         "reason": "Confirmação inválida ou ausente.",
                         "required_confirmation_value": required_phrase,
+                        "received_confirmation": confirm,
+                        "received_confirmation_raw": str(confirm_raw or ""),
                     }
                     status_code = 400
                     message = "Execução real bloqueada: confirmação inválida."
@@ -3159,7 +3173,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1</title>
+  <title>Central Quant — Execution Console V1.2</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3224,7 +3238,7 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1</h1>
+  <h1>Central Quant — Execution Console V1.2</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
@@ -3271,7 +3285,8 @@ def execution_console_route():
       </div>
       <div>
         <label>Confirmação para execução real</label>
-        <input name="confirm" value="" placeholder="EXECUTE_REAL_TRADE">
+        <input name="execution_confirm" value="" placeholder="Digite exatamente EXECUTE_REAL_TRADE">
+        <small>O botão vermelho só funciona se este campo for preenchido exatamente com EXECUTE_REAL_TRADE.</small>
       </div>
     </div>
 
