@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6.2-EXECUTION-AUTH-TOKEN
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6.2a-EXECUTION-AUTH-TOKEN-SIGNATURE-FIX
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -931,6 +931,7 @@ def place_market_order(
     notional_usdt=None,
     risk_pct=None,
     free_balance_usdt=None,
+    execution_auth_token=None,
 ):
     """
     Broker V2.6.1 — Preview Isolation.
