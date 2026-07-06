@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7.2-DISASTER-STOP-PREVIEW-VAR-FIX
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7.3-DISASTER-STOP-PLACE-MARKET-VAR-FIX
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -1077,6 +1077,7 @@ def place_market_order(
       EXECUTION_MODE=LIVE + ENABLE_REAL_TRADING=true + BROKER_DRY_RUN=false.
     """
     started = time.perf_counter()
+    disaster_stop_result = None  # V2.7.3: inicializada dentro de place_market_order
     sym = normalize_symbol(symbol)
     order_side = normalize_side(side)
 
