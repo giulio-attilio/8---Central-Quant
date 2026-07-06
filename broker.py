@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7.1-DISASTER-STOP-SIGNATURE-FIX
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7.2-DISASTER-STOP-PREVIEW-VAR-FIX
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -670,6 +670,7 @@ def ready_check(cache_seconds: int = 30):
         return dict(_last_ready)
 
     started = time.perf_counter()
+    disaster_stop_result = None  # V2.7.2: também existe em preview/dry-run
     try:
         ex = exchange()
         server_time = None
