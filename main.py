@@ -3015,7 +3015,7 @@ def execution_engine_verify_route():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1 — interface segura para preview e execução real.
+    EXECUTION CONSOLE V1.3 — Post/Redirect/Get.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3024,13 +3024,91 @@ def execution_console_route():
     - Execução real usa run_execution_engine(... dry_run=False) somente com confirmação explícita.
     - Mantém todos os guards existentes: Executive Policy, Real Pilot Guard,
       Confirmation Guard, Authorization Token e Broker kill switches.
+    - V1.3 PRG: todo POST termina em redirect 303 para GET, impedindo reenvio por F5.
     """
+    import urllib.parse
+
+    def _console_store_path():
+        try:
+            return CENTRAL_DATA_DIR / "execution_console_prg_results.json"
+        except Exception:
+            return BASE_DIR / "execution_console_prg_results.json"
+
+    def _console_read_store():
+        path = _console_store_path()
+        try:
+            if not path.exists():
+                return {}
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _console_write_store(data):
+        path = _console_store_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data if isinstance(data, dict) else {}, f, ensure_ascii=False, indent=2, default=str)
+            return True
+        except Exception:
+            return False
+
+    def _console_save_result(payload, result, message, status_code, action):
+        store = _console_read_store()
+        rid = str(uuid.uuid4())
+        item = {
+            "id": rid,
+            "created_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+            "epoch": time.time(),
+            "action": action,
+            "payload": payload,
+            "result": result,
+            "message": message,
+            "status_code": int(status_code or 200),
+        }
+
+        store[rid] = item
+
+        # Mantém só os últimos 25 resultados para não crescer indefinidamente.
+        try:
+            ordered = sorted(
+                store.items(),
+                key=lambda kv: float((kv[1] or {}).get("epoch") or 0),
+                reverse=True,
+            )
+            store = dict(ordered[:25])
+        except Exception:
+            pass
+
+        _console_write_store(store)
+        return rid
+
+    def _console_load_result(rid):
+        if not rid:
+            return None
+        store = _console_read_store()
+        item = store.get(str(rid))
+        return item if isinstance(item, dict) else None
+
+    def _safe_float_field(value, default=2.0):
+        try:
+            if value is None or str(value).strip() == "":
+                return float(default)
+            return float(str(value).replace(",", ".").strip())
+        except Exception:
+            return float(default)
+
     def _field(name, default=""):
         if request.method == "POST":
             return str((request.form.get(name) or request.args.get(name) or default)).strip()
         return str(request.args.get(name, default)).strip()
 
     action = _field("action", "preview")
+    result_id = request.args.get("console_result_id") if request.method == "GET" else None
+    stored_item = _console_load_result(result_id)
+
     # V1.2: aceita múltiplos nomes de campo e normaliza para evitar bloqueio por espaço/case.
     confirm_raw = (
         request.form.get("execution_confirm")
@@ -3054,13 +3132,22 @@ def execution_console_route():
         "entry": _field("entry", "108000"),
         "sl": _field("sl", "109000"),
         "tp50": _field("tp50", "107000"),
-        "risk_pct": float(_field("risk_pct", "2") or 2),
-        "signal_id": f"EXECUTION-CONSOLE-V1-{int(time.time())}",
+        "risk_pct": _safe_float_field(_field("risk_pct", "2"), 2.0),
+        "signal_id": _field("signal_id", f"EXECUTION-CONSOLE-V1-{int(time.time())}"),
     }
 
     result = None
     status_code = 200
     message = None
+
+    # GET pós-redirect: apenas carrega o resultado salvo. Não executa nada.
+    if request.method == "GET" and stored_item:
+        stored_payload = stored_item.get("payload")
+        if isinstance(stored_payload, dict):
+            payload = stored_payload
+        result = stored_item.get("result")
+        message = stored_item.get("message") or "Resultado carregado via GET após redirect PRG."
+        status_code = 200
 
     if request.method == "POST":
         try:
@@ -3158,6 +3245,25 @@ def execution_console_route():
             status_code = 500
             message = f"Erro na Execution Console: {exc}"
 
+        # V1.3 PRG:
+        # Depois de qualquer POST, salva resultado e redireciona para GET.
+        # Assim F5 recarrega apenas o GET e nunca reenvia preview/execução real.
+        result_id = _console_save_result(payload, result, message, status_code, action)
+        query = {
+            "console_result_id": result_id,
+            "bot": payload.get("bot"),
+            "setup": payload.get("setup"),
+            "symbol": payload.get("symbol"),
+            "side": payload.get("side"),
+            "entry": payload.get("entry"),
+            "sl": payload.get("sl"),
+            "tp50": payload.get("tp50"),
+            "risk_pct": payload.get("risk_pct"),
+            "signal_id": payload.get("signal_id"),
+        }
+        location = request.path + "?" + urllib.parse.urlencode(query, doseq=False)
+        return "", 303, {"Location": location}
+
     payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
     result_json = json.dumps(result, ensure_ascii=False, indent=2, default=str) if result is not None else ""
 
@@ -3178,6 +3284,8 @@ def execution_console_route():
         "broker_error": live_result.get("error"),
         "confirmation_guard": (live_result.get("confirmation_guard") or {}).get("status") if isinstance(live_result.get("confirmation_guard"), dict) else None,
         "auth": (live_result.get("auth") or {}).get("status") if isinstance(live_result.get("auth"), dict) else None,
+        "prg_result_id": result_id,
+        "prg_mode": "POST_REDIRECT_GET" if result_id else "GET_ONLY",
     }
     summary_json = json.dumps(summary, ensure_ascii=False, indent=2, default=str)
 
@@ -3189,7 +3297,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.3</title>
+  <title>Central Quant — Execution Console V1.3 PRG</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3251,14 +3359,19 @@ def execution_console_route():
       color: #86efac;
       font-weight: bold;
     }}
+    .info {{
+      color: #93c5fd;
+      font-weight: bold;
+    }}
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.3</h1>
+  <h1>Central Quant — Execution Console V1.3 PRG</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
     <p>Para preview, nenhuma ordem real é enviada. Em preview, <b>MISSING_EXECUTION_AUTH_TOKEN</b> é normal porque o token só existe em execução real.</p>
+    <p class="info">Proteção PRG ativa: depois de Preview ou Execução, o POST vira Redirect e a tela final é carregada via GET. Apertar F5 não reenvia a ordem.</p>
   </div>
 
   <form method="post" class="card">
@@ -3337,6 +3450,7 @@ def execution_console_route():
 </html>
 """
     return html_body, status_code, {"Content-Type": "text/html; charset=utf-8"}
+
 
 
 @app.route("/executionlive", methods=["GET", "POST"])
