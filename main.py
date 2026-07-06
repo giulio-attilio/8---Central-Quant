@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.3-PREVIEW-AUTH-CLARITY
+# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.5-TRADE-REGISTRY-SYNC-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -3009,13 +3009,307 @@ def execution_engine_verify_route():
 
 
 
+# ==========================================================
+# TRADE REGISTRY SYNC V1 — EXECUTION/BROKER POSITION LINK
+# ==========================================================
+TRADE_REGISTRY_SYNC_V1_VERSION = "2026-07-06-TRADE-REGISTRY-SYNC-V1"
+
+def _trs_v1_norm_symbol(value):
+    try:
+        return normalize_registry_symbol(value)
+    except Exception:
+        s = str(value or "").upper().strip()
+        return s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "").replace("-", "")
+
+def _trs_v1_norm_side(value):
+    side = str(value or "").upper().strip()
+    if side in {"BUY", "LONG"}:
+        return "LONG"
+    if side in {"SELL", "SHORT"}:
+        return "SHORT"
+    if side.lower() == "long":
+        return "LONG"
+    if side.lower() == "short":
+        return "SHORT"
+    return side
+
+def _trs_v1_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+def _trs_v1_get_nested(value, *path, default=None):
+    cur = value
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return cur if cur is not None else default
+
+def _trs_v1_existing_open_match(symbol=None, side=None, bot=None, setup=None, order_id=None, position_id=None, client_order_id=None):
+    if central_trade_registry is None:
+        return {"ok": False, "exists": False, "reason": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry unavailable"}
+    try:
+        registry = central_trade_registry.load_registry()
+        open_raw = registry.get("open_trades", {}) if isinstance(registry, dict) else {}
+        if isinstance(open_raw, dict):
+            items = list(open_raw.values())
+        elif isinstance(open_raw, list):
+            items = open_raw
+        else:
+            items = []
+        symbol_n = _trs_v1_norm_symbol(symbol)
+        side_n = _trs_v1_norm_side(side)
+        bot_n = normalize_registry_bot(bot) if bot else None
+        setup_n = str(setup or "").upper().strip() if setup else None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            ids = {
+                str(item.get("order_id") or ""),
+                str(item.get("client_order_id") or ""),
+                str(item.get("position_id") or ""),
+                str(meta.get("order_id") or ""),
+                str(meta.get("client_order_id") or ""),
+                str(meta.get("position_id") or ""),
+                str(meta.get("broker_position_id") or ""),
+            }
+            if order_id and str(order_id) in ids:
+                return {"ok": True, "exists": True, "match_reason": "ORDER_ID", "trade": item}
+            if client_order_id and str(client_order_id) in ids:
+                return {"ok": True, "exists": True, "match_reason": "CLIENT_ORDER_ID", "trade": item}
+            if position_id and str(position_id) in ids:
+                return {"ok": True, "exists": True, "match_reason": "POSITION_ID", "trade": item}
+            item_symbol = _trs_v1_norm_symbol(item.get("symbol_clean") or item.get("symbol") or item.get("ativo") or item.get("pair"))
+            item_side = _trs_v1_norm_side(item.get("side") or item.get("direction"))
+            item_bot = normalize_registry_bot(item.get("bot") or "")
+            item_setup = str(item.get("setup") or item.get("signal_type") or item.get("setup_label") or "").upper().strip()
+            if symbol_n and side_n and item_symbol == symbol_n and item_side == side_n:
+                if (not bot_n or item_bot == bot_n) and (not setup_n or item_setup == setup_n):
+                    return {"ok": True, "exists": True, "match_reason": "SYMBOL_SIDE_BOT_SETUP", "trade": item}
+        return {"ok": True, "exists": False}
+    except Exception as exc:
+        return {"ok": False, "exists": False, "error": str(exc)}
+
+def _trs_v1_manual_register_open_trade(candidate):
+    registry = central_trade_registry.load_registry()
+    if not isinstance(registry, dict):
+        registry = {}
+    open_trades = registry.get("open_trades", {})
+    if not isinstance(open_trades, dict):
+        open_trades = {}
+    try:
+        trade_id = central_trade_registry.make_trade_id(
+            candidate.get("bot"), candidate.get("symbol"), candidate.get("side"), candidate.get("setup")
+        )
+    except Exception:
+        trade_id = candidate.get("trade_id") or f"{candidate.get('bot')}:{candidate.get('symbol')}:{candidate.get('side')}:{candidate.get('setup')}:{int(time.time())}"
+    suffix = 1
+    base_trade_id = str(trade_id)
+    while str(trade_id) in open_trades:
+        suffix += 1
+        trade_id = f"{base_trade_id}:{suffix}"
+    now = data_hora_sp_str() if callable(globals().get("data_hora_sp_str")) else None
+    trade = {
+        "trade_id": str(trade_id),
+        "bot": candidate.get("bot"),
+        "symbol": candidate.get("symbol"),
+        "symbol_clean": candidate.get("symbol"),
+        "side": candidate.get("side"),
+        "setup": candidate.get("setup"),
+        "entry": candidate.get("entry"),
+        "sl": candidate.get("sl"),
+        "tp50": candidate.get("tp50"),
+        "qty": candidate.get("qty"),
+        "status": "OPEN",
+        "source": candidate.get("source") or "trade_registry_sync_v1",
+        "opened_at": now,
+        "last_update": now,
+        "metadata": candidate.get("metadata") or {},
+    }
+    open_trades[str(trade_id)] = trade
+    registry["open_trades"] = open_trades
+    registry["updated_at"] = now
+    central_trade_registry.save_registry(registry)
+    return {"ok": True, "trade_id": str(trade_id), "trade": trade, "method": "manual_save_registry"}
+
+def trade_registry_sync_v1_register_candidate(candidate, commit=True):
+    if central_trade_registry is None:
+        return {"ok": False, "version": TRADE_REGISTRY_SYNC_V1_VERSION, "error": TRADE_REGISTRY_IMPORT_ERROR or "trade_registry unavailable", "committed": False}
+    candidate = dict(candidate or {})
+    candidate["symbol"] = _trs_v1_norm_symbol(candidate.get("symbol"))
+    candidate["side"] = _trs_v1_norm_side(candidate.get("side"))
+    candidate["bot"] = normalize_registry_bot(candidate.get("bot") or "UNKNOWN")
+    candidate["setup"] = str(candidate.get("setup") or candidate.get("bot") or "UNKNOWN").upper().strip()
+    meta = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    exists = _trs_v1_existing_open_match(
+        symbol=candidate.get("symbol"),
+        side=candidate.get("side"),
+        bot=candidate.get("bot"),
+        setup=candidate.get("setup"),
+        order_id=meta.get("order_id"),
+        client_order_id=meta.get("client_order_id"),
+        position_id=meta.get("position_id") or meta.get("broker_position_id"),
+    )
+    if exists.get("exists"):
+        return {"ok": True, "version": TRADE_REGISTRY_SYNC_V1_VERSION, "committed": False, "status": "ALREADY_REGISTERED", "match": exists}
+    if not commit:
+        return {"ok": True, "version": TRADE_REGISTRY_SYNC_V1_VERSION, "committed": False, "status": "DRY_RUN", "candidate": candidate}
+    try:
+        result = central_trade_registry.register_open_trade(
+            bot=candidate.get("bot"),
+            symbol=candidate.get("symbol"),
+            side=candidate.get("side"),
+            entry=candidate.get("entry"),
+            sl=candidate.get("sl"),
+            tp50=candidate.get("tp50"),
+            setup=candidate.get("setup"),
+            qty=candidate.get("qty"),
+            source=candidate.get("source") or "trade_registry_sync_v1",
+            metadata=meta,
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            result.setdefault("version", TRADE_REGISTRY_SYNC_V1_VERSION)
+            result.setdefault("status", "REGISTERED")
+            result.setdefault("committed", True)
+            return result
+        # Se a API retornou algo inesperado, cai no fallback manual.
+        manual = _trs_v1_manual_register_open_trade(candidate)
+        manual["api_result"] = result
+        manual["version"] = TRADE_REGISTRY_SYNC_V1_VERSION
+        manual["status"] = "REGISTERED_FALLBACK"
+        manual["committed"] = True
+        return manual
+    except TypeError:
+        manual = _trs_v1_manual_register_open_trade(candidate)
+        manual["version"] = TRADE_REGISTRY_SYNC_V1_VERSION
+        manual["status"] = "REGISTERED_FALLBACK_TYPEERROR"
+        manual["committed"] = True
+        return manual
+    except Exception as exc:
+        return {"ok": False, "version": TRADE_REGISTRY_SYNC_V1_VERSION, "status": "REGISTER_ERROR", "error": str(exc), "candidate": candidate, "committed": False}
+
+def trade_registry_sync_v1_from_execution_result(payload, engine_result, commit=True):
+    payload = dict(payload or {})
+    if not isinstance(engine_result, dict):
+        return {"ok": False, "version": TRADE_REGISTRY_SYNC_V1_VERSION, "status": "INVALID_ENGINE_RESULT", "committed": False}
+    root_payload = engine_result.get("payload") if isinstance(engine_result.get("payload"), dict) else engine_result
+    live = root_payload.get("live_result") if isinstance(root_payload, dict) else None
+    live = live if isinstance(live, dict) else {}
+    sent = bool(live.get("sent"))
+    order_id = live.get("order_id") or live.get("id")
+    client_order_id = live.get("client_order_id") or _trs_v1_get_nested(live, "preview", "client_order_id") or payload.get("signal_id")
+    if not sent and not order_id:
+        return {"ok": True, "version": TRADE_REGISTRY_SYNC_V1_VERSION, "status": "NO_REAL_ORDER_SENT", "committed": False, "sent": sent}
+    preview = live.get("preview") if isinstance(live.get("preview"), dict) else {}
+    candidate = {
+        "bot": payload.get("bot") or _trs_v1_get_nested(root_payload, "plan", "payload", "bot") or "UNKNOWN",
+        "setup": payload.get("setup") or _trs_v1_get_nested(root_payload, "plan", "payload", "setup") or payload.get("bot") or "UNKNOWN",
+        "symbol": payload.get("symbol") or live.get("symbol") or preview.get("bingx_symbol") or preview.get("market_symbol"),
+        "side": payload.get("side") or live.get("position_side") or live.get("side"),
+        "entry": payload.get("entry") or preview.get("price_ref"),
+        "sl": payload.get("sl") or payload.get("stop"),
+        "tp50": payload.get("tp50"),
+        "qty": preview.get("amount_final") or preview.get("amount") or _trs_v1_get_nested(preview, "payload", "quantity") or live.get("qty"),
+        "source": "execution_engine_real_trade_sync_v1",
+        "metadata": {
+            "sync_version": TRADE_REGISTRY_SYNC_V1_VERSION,
+            "sync_reason": "REAL_ORDER_SENT_BY_CENTRAL",
+            "synced_at": data_hora_sp_str() if callable(globals().get("data_hora_sp_str")) else None,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "signal_id": payload.get("signal_id"),
+            "execution_status": live.get("status"),
+            "margin_usdt": live.get("margin_usdt") or preview.get("margin_usdt"),
+            "leverage": live.get("leverage") or preview.get("leverage"),
+            "notional_usdt": live.get("notional_usdt") or preview.get("effective_notional_usdt"),
+            "price_ref": preview.get("price_ref"),
+            "execution_console": True,
+        },
+    }
+    return trade_registry_sync_v1_register_candidate(candidate, commit=commit)
+
+def trade_registry_sync_v1_backfill_from_existing_position_state(payload, existing_position_state, commit=True, ack=None):
+    payload = dict(payload or {})
+    state = existing_position_state if isinstance(existing_position_state, dict) else {}
+    ack_norm = str(ack or payload.get("existing_position_ack") or "").strip().upper()
+    if ack_norm != "CENTRAL_MANAGED_EXISTING_POSITION":
+        return {
+            "ok": False,
+            "version": TRADE_REGISTRY_SYNC_V1_VERSION,
+            "status": "ACK_REQUIRED",
+            "required_existing_position_ack": "CENTRAL_MANAGED_EXISTING_POSITION",
+            "committed": False,
+        }
+    positions = []
+    for key in ["same_side_positions", "opposite_side_positions"]:
+        vals = state.get(key) if isinstance(state.get(key), list) else []
+        positions.extend([v for v in vals if isinstance(v, dict)])
+    results = []
+    for pos in positions:
+        candidate = {
+            "bot": payload.get("bot") or "UNKNOWN",
+            "setup": payload.get("setup") or payload.get("bot") or "UNKNOWN",
+            "symbol": pos.get("symbol") or payload.get("symbol"),
+            "side": pos.get("side") or payload.get("side"),
+            "entry": pos.get("entryPrice") or payload.get("entry"),
+            "sl": payload.get("sl") or payload.get("stop"),
+            "tp50": payload.get("tp50"),
+            "qty": pos.get("contracts"),
+            "source": "broker_position_backfill_sync_v1",
+            "metadata": {
+                "sync_version": TRADE_REGISTRY_SYNC_V1_VERSION,
+                "sync_reason": "BROKER_POSITION_ACKNOWLEDGED_AS_CENTRAL_MANAGED",
+                "synced_at": data_hora_sp_str() if callable(globals().get("data_hora_sp_str")) else None,
+                "existing_position_ack": ack_norm,
+                "broker_position_id": pos.get("position_id") or pos.get("id"),
+                "broker_entry_price": pos.get("entryPrice"),
+                "broker_contracts": pos.get("contracts"),
+                "broker_notional": pos.get("notional"),
+                "broker_leverage": pos.get("leverage"),
+                "broker_unrealized_pnl": pos.get("unrealizedPnl"),
+                "signal_id": payload.get("signal_id"),
+                "execution_console": True,
+            },
+        }
+        results.append(trade_registry_sync_v1_register_candidate(candidate, commit=commit))
+    return {
+        "ok": all(bool(r.get("ok")) for r in results) if results else False,
+        "version": TRADE_REGISTRY_SYNC_V1_VERSION,
+        "status": "BACKFILL_DONE" if results else "NO_POSITIONS_TO_BACKFILL",
+        "committed": bool(commit),
+        "positions_seen": len(positions),
+        "registered_or_seen_count": len([r for r in results if r.get("ok")]),
+        "results": results,
+    }
+
+@app.route("/traderegistrysyncv1/health")
+@app.route("/trade_registry/sync/v1/health")
+def trade_registry_sync_v1_health_route():
+    return {
+        "ok": central_trade_registry is not None,
+        "version": TRADE_REGISTRY_SYNC_V1_VERSION,
+        "trade_registry_loaded": central_trade_registry is not None,
+        "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
+        "notes": [
+            "V1 registra automaticamente ordem real enviada pela Central no Trade Registry.",
+            "V1 também permite backfill controlado de posição real detectada no Execution Console com acknowledgement explícito.",
+        ],
+    }
+
+
+
 
 
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.4 — PRG + Real Position Awareness.
+    EXECUTION CONSOLE V1.5 — PRG + Real Position Awareness + Trade Registry Sync V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -3303,6 +3597,36 @@ def execution_console_route():
                 except Exception:
                     message = "Preview executado. Nenhuma ordem real foi enviada."
 
+            # Sincronização controlada de posição real existente no Trade Registry
+            elif action == "sync_existing":
+                preflight_result = run_execution_engine(
+                    payload=payload,
+                    mode="LIVE",
+                    dry_run=True,
+                )
+                preflight_result, existing_position_state = _attach_existing_position_state(preflight_result, payload)
+                ack = str(payload.get("existing_position_ack") or "").strip().upper()
+                sync_result = trade_registry_sync_v1_backfill_from_existing_position_state(
+                    payload=payload,
+                    existing_position_state=existing_position_state,
+                    commit=True,
+                    ack=ack,
+                )
+                result = {
+                    "ok": bool(sync_result.get("ok")),
+                    "status": sync_result.get("status"),
+                    "sent": False,
+                    "trade_registry_sync_v1": sync_result,
+                    "existing_position_state": existing_position_state,
+                    "preflight_result": preflight_result,
+                    "payload": payload,
+                }
+                if sync_result.get("ok"):
+                    message = "Trade Registry Sync V1 executado: posição existente sincronizada/confirmada no Registry."
+                else:
+                    status_code = 409 if sync_result.get("status") == "ACK_REQUIRED" else 400
+                    message = "Trade Registry Sync V1 bloqueado: selecione o reconhecimento de posição gerenciada pela Central."
+
             # Execução real deliberada
             elif action == "execute":
                 required_phrase = os.environ.get("EXECUTION_LIVE_CONFIRMATION_PHRASE", "EXECUTE_REAL_TRADE").strip().upper()
@@ -3381,7 +3705,12 @@ def execution_console_route():
                                 dry_run=False,
                             )
                             result, _ = _attach_existing_position_state(result, payload)
-                            message = "Execução real solicitada. Verifique sent/order_id/status no resultado."
+                            sync_result = trade_registry_sync_v1_from_execution_result(payload, result, commit=True)
+                            if isinstance(result, dict):
+                                result.setdefault("trade_registry_sync_v1", sync_result)
+                                if isinstance(result.get("payload"), dict):
+                                    result["payload"].setdefault("trade_registry_sync_v1", sync_result)
+                            message = "Execução real solicitada. Trade Registry Sync V1 aplicado quando houve ordem real enviada."
 
             else:
                 result = {
@@ -3459,6 +3788,7 @@ def execution_console_route():
         "existing_opposite_side_count": existing_position_state.get("same_symbol_opposite_side_count"),
         "central_managed_likely": existing_position_state.get("central_managed_likely"),
         "existing_position_ack": payload.get("existing_position_ack"),
+        "trade_registry_sync_v1": (result.get("trade_registry_sync_v1") if isinstance(result, dict) else None) or (result_payload.get("trade_registry_sync_v1") if isinstance(result_payload, dict) else None),
     }
     summary_json = json.dumps(summary, ensure_ascii=False, indent=2, default=str)
 
@@ -3470,7 +3800,7 @@ def execution_console_route():
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <title>Central Quant — Execution Console V1.4</title>
+  <title>Central Quant — Execution Console V1.5</title>
   <style>
     body {{
       font-family: Arial, sans-serif;
@@ -3516,6 +3846,7 @@ def execution_console_route():
     }}
     .preview {{ background: #2563eb; color: white; }}
     .execute {{ background: #dc2626; color: white; }}
+    .sync {{ background: #059669; color: white; }}
     pre {{
       white-space: pre-wrap;
       background: #020617;
@@ -3539,13 +3870,14 @@ def execution_console_route():
   </style>
 </head>
 <body>
-  <h1>Central Quant — Execution Console V1.4</h1>
+  <h1>Central Quant — Execution Console V1.5</h1>
 
   <div class="card">
     <p class="warn">A execução real só acontece se você clicar em “Executar ordem real” e preencher a confirmação exatamente como exigido.</p>
     <p>Para preview, nenhuma ordem real é enviada. Em preview, <b>MISSING_EXECUTION_AUTH_TOKEN</b> é normal porque o token só existe em execução real.</p>
     <p class="info">Proteção PRG ativa: depois de Preview ou Execução, o POST vira Redirect e a tela final é carregada via GET. Apertar F5 não reenvia a ordem.</p>
-    <p class="info">V1.4: a tela mostra posição real existente e, para execução real sobre posição já aberta, exige reconhecimento explícito de que a posição é gerenciada pela Central.</p>
+    <p class="info">V1.4: a tela mostra posição real existente e exige reconhecimento explícito quando necessário.</p>
+    <p class="info">V1.5 / Trade Registry Sync V1: ordem real enviada pela Central é registrada imediatamente no Trade Registry; posição real detectada pode ser sincronizada com acknowledgement.</p>
   </div>
 
   <form method="post" class="card">
@@ -3603,6 +3935,7 @@ def execution_console_route():
 
     <br>
     <button class="preview" type="submit" name="action" value="preview">Preview seguro</button>
+    <button class="sync" type="submit" name="action" value="sync_existing">Sincronizar posição existente no Registry</button>
     <button class="execute" type="submit" name="action" value="execute">Executar ordem real</button>
   </form>
 
@@ -3632,6 +3965,7 @@ def execution_console_route():
     <h2>Rotas úteis</h2>
     <p><a style="color:#93c5fd" href="/executionenginehealth" target="_blank">/executionenginehealth</a></p>
     <p><a style="color:#93c5fd" href="/executionenginelog" target="_blank">/executionenginelog</a></p>
+    <p><a style="color:#93c5fd" href="/traderegistrysyncv1/health" target="_blank">/traderegistrysyncv1/health</a></p>
     <p><a style="color:#93c5fd" href="/executionverify?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT&entry=108000&sl=109000&tp50=107000" target="_blank">/executionverify BTC SHORT</a></p>
   </div>
 </body>
