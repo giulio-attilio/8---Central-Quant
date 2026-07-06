@@ -5320,7 +5320,7 @@ def registry_persistence_v1_rebuild_from_broker(symbol=None, side=None, bot=None
 
 def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=None, commit=False, source="manual", ack=None, sl=None, tp50=None, auto_rebuild=False, block_empty_registry_snapshot=True):
     """
-    Registry Persistence V1.1 + Trade Close Outcome Evaluator V1.
+    Registry Persistence V1.2 + Trade Close Outcome Evaluator V1 + Registry Mode Segregation V1.
 
     V1 salvava snapshot mesmo quando havia posição real protegida, mas Registry vazio.
     Isso era útil para diagnóstico, mas perigoso se o snapshot "latest" passasse a representar
@@ -6429,11 +6429,392 @@ def trade_close_outcome_v1_log_route():
         return {"ok": False, "version": TRADE_CLOSE_OUTCOME_V1_VERSION, "status": "LOG_READ_ERROR", "error": str(exc), "events_file": str(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE)}
 
 
+
+
+# =============================================================================
+# REGISTRY MODE SEGREGATION V1 — REAL / PAPER / VERIFY / SYNC_ONLY / UNKNOWN
+# =============================================================================
+# Objetivo: impedir que o Final Gate trate trades PAPER/VERIFY/SYNC_ONLY como
+# posições reais abertas. Esta camada classifica o Trade Registry e faz o gate
+# de execução real olhar somente para risco REAL ou UNKNOWN.
+
+REGISTRY_MODE_SEGREGATION_V1_VERSION = "2026-07-06-REGISTRY-MODE-SEGREGATION-V1"
+REGISTRY_MODE_SEGREGATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_mode_segregation_v1_latest.json"
+REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_mode_segregation_v1_events.jsonl"
+
+
+def _rms_v1_now():
+    try:
+        return datetime.now(TZ).strftime("%d/%m/%Y %H:%M:%S")
+    except Exception:
+        return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _rms_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _rms_v1_boolish(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "y", "sim", "sent", "executed"):
+        return True
+    if s in ("0", "false", "no", "n", "nao", "não", "denied", "blocked"):
+        return False
+    return None
+
+
+def _rms_v1_text(*values):
+    parts = []
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, (dict, list)):
+            try:
+                parts.append(json.dumps(v, ensure_ascii=False, default=str))
+            except Exception:
+                parts.append(str(v))
+        else:
+            parts.append(str(v))
+    return " ".join(parts).lower()
+
+
+def _rms_v1_registry_items(registry):
+    registry = registry if isinstance(registry, dict) else {}
+    open_raw = registry.get("open_trades", {})
+    closed_raw = registry.get("closed_trades", [])
+
+    if isinstance(open_raw, dict):
+        open_items = [(str(k), v) for k, v in open_raw.items() if isinstance(v, dict)]
+    elif isinstance(open_raw, list):
+        open_items = [(str((v or {}).get("trade_id") or i), v) for i, v in enumerate(open_raw) if isinstance(v, dict)]
+    else:
+        open_items = []
+
+    if isinstance(closed_raw, dict):
+        closed_items = [(str(k), v) for k, v in closed_raw.items() if isinstance(v, dict)]
+    elif isinstance(closed_raw, list):
+        closed_items = [(str((v or {}).get("trade_id") or i), v) for i, v in enumerate(closed_raw) if isinstance(v, dict)]
+    else:
+        closed_items = []
+
+    return open_items, closed_items
+
+
+def registry_mode_segregation_v1_classify_trade(trade, key=None):
+    trade = trade if isinstance(trade, dict) else {}
+    meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+
+    source = str(trade.get("source") or meta.get("source") or "").strip()
+    status = str(trade.get("status") or meta.get("status") or "").upper().strip()
+    mode_raw = str(trade.get("mode") or meta.get("mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
+    execution_mode = str(trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
+    execution_status = str(trade.get("execution_status") or meta.get("execution_status") or "").upper().strip()
+    sync_from = str(meta.get("synced_from") or trade.get("synced_from") or "").lower().strip()
+    original_mode = str(meta.get("original_mode") or meta.get("mode") or trade.get("original_mode") or "").upper().strip()
+    source_l = source.lower()
+    txt = _rms_v1_text(trade, meta, source, status, mode_raw, execution_mode, execution_status, sync_from, original_mode)
+
+    qty = _rms_v1_float(trade.get("qty"), None)
+    broker_contracts = _rms_v1_float(meta.get("broker_contracts") or trade.get("broker_contracts"), None)
+    broker_position_id = meta.get("broker_position_id") or trade.get("broker_position_id")
+    live_order_id = meta.get("live_order_id") or trade.get("live_order_id") or trade.get("order_id") or trade.get("broker_order_id")
+    execution_sent = _rms_v1_boolish(trade.get("execution_sent") if "execution_sent" in trade else meta.get("execution_sent"))
+
+    reasons = []
+    signals = {
+        "key": key,
+        "source": source,
+        "status": status,
+        "mode_raw": mode_raw,
+        "execution_mode": execution_mode,
+        "execution_status": execution_status,
+        "execution_sent": execution_sent,
+        "sync_from": sync_from,
+        "qty": qty,
+        "broker_contracts": broker_contracts,
+        "broker_position_id_present": bool(broker_position_id),
+        "live_order_id_present": bool(live_order_id),
+    }
+
+    # 1) PAPER explícito vence qualquer inferência fraca de sync.
+    if mode_raw == "PAPER" or original_mode == "PAPER" or "\"mode\": \"paper\"" in txt or "mode paper" in txt:
+        reasons.append("metadata.mode/source indicates PAPER")
+        mode = "PAPER"
+        confidence = "HIGH"
+    # 2) VERIFY explícito ou execução negada: não é posição real enviada.
+    elif execution_mode == "VERIFY" or mode_raw == "VERIFY" or "EXECUTION_AUTH_DENIED" in execution_status or execution_sent is False:
+        reasons.append("execution mode/status indicates VERIFY or not sent")
+        mode = "VERIFY"
+        confidence = "HIGH"
+    # 3) Evidência forte de BingX/real: posição/order id real ou origem de reparo real.
+    elif broker_position_id or live_order_id or broker_contracts is not None or execution_sent is True or any(x in source_l for x in [
+        "post_execution_safety_repair", "registry_persistence_v1_rebuild", "closed_manual_recovery", "bingx", "broker", "real_execution", "execution_engine_live"
+    ]):
+        reasons.append("broker/live execution evidence found")
+        mode = "REAL"
+        confidence = "HIGH"
+    # 4) Sync interno/histórico/PAPER registry: serve para analytics, não para gate real.
+    elif sync_from == "central_open_positions" or any(x in source_l for x in [
+        "main_traderegistry_sync", "central_open_positions", "turtle.py", "smart_predator", "donkey", "falcon.py", "predator.py"
+    ]):
+        reasons.append("registry source indicates internal sync/strategy state, not broker execution")
+        mode = "SYNC_ONLY"
+        confidence = "MEDIUM"
+    # 5) Se qty real existir em trade fechado com PnL real, inferimos REAL com cautela.
+    elif qty is not None and (trade.get("realized_pnl") is not None or trade.get("net_pnl") is not None):
+        reasons.append("numeric qty and realized/net pnl present")
+        mode = "REAL"
+        confidence = "MEDIUM"
+    else:
+        reasons.append("insufficient evidence to classify safely")
+        mode = "UNKNOWN"
+        confidence = "LOW"
+
+    return {
+        "mode": mode,
+        "confidence": confidence,
+        "is_real": mode == "REAL",
+        "is_non_real": mode in ("PAPER", "VERIFY", "SYNC_ONLY"),
+        "reasons": reasons,
+        "signals": signals,
+        "version": REGISTRY_MODE_SEGREGATION_V1_VERSION,
+    }
+
+
+def _rms_v1_row(key, trade, bucket):
+    cls = registry_mode_segregation_v1_classify_trade(trade, key=key)
+    return {
+        "key": key,
+        "bucket": bucket,
+        "trade_id": trade.get("trade_id") or key,
+        "bot": trade.get("bot"),
+        "setup": trade.get("setup"),
+        "symbol": trade.get("symbol"),
+        "side": trade.get("side"),
+        "status": trade.get("status"),
+        "source": trade.get("source"),
+        "registry_mode": cls.get("mode"),
+        "confidence": cls.get("confidence"),
+        "is_real": cls.get("is_real"),
+        "reasons": cls.get("reasons"),
+        "signals": cls.get("signals"),
+    }
+
+
+def _rms_v1_atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _rms_v1_append_event(payload):
+    try:
+        REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def registry_mode_segregation_v1_analyze(commit=False, include_trades=True, source="manual"):
+    if central_trade_registry is None or not callable(getattr(central_trade_registry, "load_registry", None)):
+        return {
+            "ok": False,
+            "version": REGISTRY_MODE_SEGREGATION_V1_VERSION,
+            "status": "TRADE_REGISTRY_UNAVAILABLE",
+            "error": TRADE_REGISTRY_IMPORT_ERROR if "TRADE_REGISTRY_IMPORT_ERROR" in globals() else None,
+        }
+
+    try:
+        registry = central_trade_registry.load_registry()
+        open_items, closed_items = _rms_v1_registry_items(registry)
+        rows_open = [_rms_v1_row(k, t, "OPEN") for k, t in open_items]
+        rows_closed = [_rms_v1_row(k, t, "CLOSED") for k, t in closed_items]
+        all_rows = rows_open + rows_closed
+
+        def counts(rows):
+            out = {"REAL": 0, "PAPER": 0, "VERIFY": 0, "SYNC_ONLY": 0, "UNKNOWN": 0}
+            for r in rows:
+                m = r.get("registry_mode") or "UNKNOWN"
+                out[m] = out.get(m, 0) + 1
+            return out
+
+        open_by_mode = counts(rows_open)
+        closed_by_mode = counts(rows_closed)
+        total_by_mode = counts(all_rows)
+
+        unknown_open = [r for r in rows_open if r.get("registry_mode") == "UNKNOWN"]
+        real_open = [r for r in rows_open if r.get("registry_mode") == "REAL"]
+        non_real_open = [r for r in rows_open if r.get("registry_mode") in ("PAPER", "VERIFY", "SYNC_ONLY")]
+
+        commit_result = {"attempted": bool(commit), "committed": False, "status": "COMMIT_NOT_REQUESTED"}
+        if commit:
+            for key, trade in open_items + closed_items:
+                cls = registry_mode_segregation_v1_classify_trade(trade, key=key)
+                meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+                trade["metadata"] = meta
+                trade["registry_mode"] = cls.get("mode")
+                trade["registry_mode_confidence"] = cls.get("confidence")
+                trade["registry_mode_updated_at"] = _rms_v1_now()
+                meta["registry_mode"] = cls.get("mode")
+                meta["registry_mode_confidence"] = cls.get("confidence")
+                meta["registry_mode_reasons"] = cls.get("reasons")
+                meta["registry_mode_version"] = REGISTRY_MODE_SEGREGATION_V1_VERSION
+            if callable(getattr(central_trade_registry, "save_registry", None)):
+                central_trade_registry.save_registry(registry)
+                commit_result = {"attempted": True, "committed": True, "status": "REGISTRY_MODES_SAVED"}
+            else:
+                commit_result = {"attempted": True, "committed": False, "status": "SAVE_FUNCTION_UNAVAILABLE"}
+
+        payload = {
+            "ok": True,
+            "version": REGISTRY_MODE_SEGREGATION_V1_VERSION,
+            "status": "REGISTRY_MODE_SEGREGATED" if commit_result.get("committed") else "REGISTRY_MODE_ANALYZED",
+            "generated_at": _rms_v1_now(),
+            "source": source,
+            "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
+            "summary": {
+                "open_count": len(rows_open),
+                "closed_count": len(rows_closed),
+                "total_count": len(all_rows),
+                "open_by_mode": open_by_mode,
+                "closed_by_mode": closed_by_mode,
+                "total_by_mode": total_by_mode,
+                "real_open_count": len(real_open),
+                "non_real_open_count": len(non_real_open),
+                "unknown_open_count": len(unknown_open),
+                "final_gate_rule": "Use apenas REAL para bloqueios de posição real; UNKNOWN bloqueia por segurança; PAPER/VERIFY/SYNC_ONLY são ignorados no gate real.",
+            },
+            "commit": commit_result,
+            "routes": [
+                "/registrymodesegregation/health",
+                "/registrymodesegregation?commit=true",
+                "/registrymode/health",
+                "/registrymode?commit=true",
+            ],
+        }
+        if include_trades:
+            payload["open_trades"] = rows_open[:200]
+            payload["closed_trades"] = rows_closed[-200:]
+            payload["real_open_trades"] = real_open[:50]
+            payload["ignored_non_real_open_trades"] = non_real_open[:50]
+            payload["unknown_open_trades"] = unknown_open[:50]
+
+        try:
+            _rms_v1_atomic_write_json(REGISTRY_MODE_SEGREGATION_V1_LATEST_FILE, payload)
+            _rms_v1_append_event({"event": "REGISTRY_MODE_SEGREGATION", **payload})
+        except Exception as exc:
+            payload["persistence_warning"] = str(exc)
+
+        return payload
+    except Exception as exc:
+        return {"ok": False, "version": REGISTRY_MODE_SEGREGATION_V1_VERSION, "status": "REGISTRY_MODE_ANALYZE_ERROR", "error": str(exc)}
+
+
+def registry_mode_segregation_v1_gate_check(current_payload=None):
+    analysis = registry_mode_segregation_v1_analyze(commit=False, include_trades=False, source="final_gate")
+    if not analysis.get("ok"):
+        return {"ok": False, "version": REGISTRY_MODE_SEGREGATION_V1_VERSION, "status": analysis.get("status"), "error": analysis.get("error")}
+    summary = analysis.get("summary") or {}
+    unknown_open_count = int(summary.get("unknown_open_count") or 0)
+    real_open_count = int(summary.get("real_open_count") or 0)
+    non_real_open_count = int(summary.get("non_real_open_count") or 0)
+    ok = unknown_open_count == 0
+    return {
+        "ok": ok,
+        "version": REGISTRY_MODE_SEGREGATION_V1_VERSION,
+        "status": "REGISTRY_MODE_SEGREGATION_READY" if ok else "UNKNOWN_OPEN_TRADES_REQUIRE_REVIEW",
+        "real_open_count": real_open_count,
+        "ignored_non_real_open_count": non_real_open_count,
+        "unknown_open_count": unknown_open_count,
+        "open_by_mode": summary.get("open_by_mode"),
+        "rule": "Final Gate ignora PAPER/VERIFY/SYNC_ONLY e bloqueia UNKNOWN por segurança.",
+        "recommended_route": "/registrymodesegregation?commit=true",
+    }
+
+
+# Gate de outcome ajustado para execução real: somente CLOSED REAL/UNKNOWN sem outcome bloqueiam.
+try:
+    _trade_close_outcome_v1_gate_check_all_modes = trade_close_outcome_v1_gate_check
+except Exception:
+    _trade_close_outcome_v1_gate_check_all_modes = None
+
+
+def trade_close_outcome_v1_gate_check():
+    registry = _tco_v1_load_registry() if callable(globals().get("_tco_v1_load_registry")) else None
+    if registry is None:
+        return {"ok": False, "version": TRADE_CLOSE_OUTCOME_V1_VERSION, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR if "TRADE_REGISTRY_IMPORT_ERROR" in globals() else None}
+    closed_obj, items = _tco_v1_closed_items(registry)
+    blocking_unevaluated = []
+    ignored_unevaluated = []
+    evaluated_count = 0
+    for key, trade in items:
+        meta = _tco_v1_trade_meta(trade)
+        is_eval = bool(trade.get("outcome_evaluated") or meta.get("outcome_evaluated"))
+        cls = registry_mode_segregation_v1_classify_trade(trade, key=key) if callable(globals().get("registry_mode_segregation_v1_classify_trade")) else {"mode": "UNKNOWN"}
+        row = {"key": key, "trade_id": trade.get("trade_id") or key, "symbol": trade.get("symbol"), "side": trade.get("side"), "bot": trade.get("bot"), "setup": trade.get("setup"), "closed_at": trade.get("closed_at"), "registry_mode": cls.get("mode")}
+        if is_eval:
+            evaluated_count += 1
+            continue
+        if cls.get("mode") in ("REAL", "UNKNOWN"):
+            blocking_unevaluated.append(row)
+        else:
+            ignored_unevaluated.append(row)
+    ok = len(blocking_unevaluated) == 0
+    return {
+        "ok": ok,
+        "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+        "status": "ALL_REAL_CLOSED_TRADES_EVALUATED" if ok else "REAL_CLOSED_TRADES_REQUIRE_OUTCOME_EVALUATION",
+        "closed_count": len(items),
+        "evaluated_count": evaluated_count,
+        "blocking_unevaluated_count": len(blocking_unevaluated),
+        "ignored_non_real_unevaluated_count": len(ignored_unevaluated),
+        "unevaluated_count": len(blocking_unevaluated),
+        "unevaluated": blocking_unevaluated[:20],
+        "ignored_non_real_unevaluated": ignored_unevaluated[:20],
+        "rule": "Final Gate de execução real exige outcome apenas para CLOSED classificados como REAL ou UNKNOWN.",
+        "recommended_route": "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+    }
+
+
+@app.route("/registrymodesegregation", methods=["GET"])
+@app.route("/registrymode", methods=["GET"])
+def registry_mode_segregation_v1_route():
+    commit = str(request.args.get("commit") or "").lower() in ("1", "true", "yes", "sim")
+    return registry_mode_segregation_v1_analyze(commit=commit, include_trades=True, source="route")
+
+
+@app.route("/registrymodesegregation/health", methods=["GET"])
+@app.route("/registrymode/health", methods=["GET"])
+def registry_mode_segregation_v1_health_route():
+    payload = registry_mode_segregation_v1_analyze(commit=False, include_trades=False, source="health")
+    payload["module"] = "registry_mode_segregation_v1"
+    payload["notes"] = [
+        "Classifica trades do Registry como REAL, PAPER, VERIFY, SYNC_ONLY ou UNKNOWN.",
+        "Final Gate deve ignorar PAPER/VERIFY/SYNC_ONLY para execução real.",
+        "UNKNOWN bloqueia por segurança até classificação ou correção do Registry.",
+        "Use commit=true para gravar registry_mode em cada trade.",
+    ]
+    return payload
+
+
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.14 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.1 + Trade Close Outcome Evaluator V1.
+    EXECUTION CONSOLE V1.15 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.2 + Trade Close Outcome Evaluator V1 + Registry Mode Segregation V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -6453,7 +6834,8 @@ def execution_console_route():
       valida checklist final de autorização, piloto, limites, posição, IDs e stop.
     - Post-Execution Safety Check V1.1: após envio real, consulta posição, ordens de proteção/stop e Trade Registry.
     - Registry Persistence V1.1: persiste snapshot/rebuild do Registry e bloqueia nova execução real se houver posição existente sem Registry confirmado.
-    - Trade Close Outcome Evaluator V1: avalia trades CLOSED e bloqueia nova execução real se houver fechamento sem outcome.
+    - Trade Close Outcome Evaluator V1: avalia trades CLOSED REAL/UNKNOWN e bloqueia nova execução real se houver fechamento real sem outcome.
+    - Registry Mode Segregation V1: classifica Registry em REAL/PAPER/VERIFY/SYNC_ONLY/UNKNOWN e evita que PAPER/VERIFY bloqueie execução real.
     """
     import urllib.parse
 
@@ -6866,6 +7248,15 @@ def execution_console_route():
             blocking=True,
         )
 
+        registry_mode_gate = registry_mode_segregation_v1_gate_check(current_payload) if callable(globals().get("registry_mode_segregation_v1_gate_check")) else {"ok": False, "status": "REGISTRY_MODE_SEGREGATION_FUNCTION_MISSING"}
+        add(
+            "REGISTRY_MODE_SEGREGATION_READY",
+            "Registry Mode Segregation separou REAL/PAPER/VERIFY/SYNC_ONLY",
+            bool(registry_mode_gate.get("ok")),
+            registry_mode_gate,
+            blocking=True,
+        )
+
         bot = str(current_payload.get("bot") or "").upper().strip()
         symbol = _normalize_console_symbol(current_payload.get("symbol"))
         allowed_bots = [str(x).upper().strip() for x in (config.get("allowed_bots") or [])]
@@ -7093,6 +7484,11 @@ def execution_console_route():
             "enabled": True,
             "version": REGISTRY_PERSISTENCE_V1_VERSION,
             "rule": "Nova execução real é bloqueada se houver posição real existente sem Registry confirmado/persistido.",
+        },
+        "execution_console_registry_mode_segregation_v1": {
+            "enabled": True,
+            "version": REGISTRY_MODE_SEGREGATION_V1_VERSION,
+            "rule": "Final Gate usa REAL/UNKNOWN para bloqueio; PAPER/VERIFY/SYNC_ONLY não contam como posição real.",
         },
         "execution_console_v1_6": {
             "signal_id_refresh": True,
@@ -7682,6 +8078,7 @@ def execution_console_route():
     <p><a style="color:#93c5fd" href="/postexecutionsafety?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT" target="_blank">/postexecutionsafety BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/realtradelifecycle/BTCUSDT/SHORT?bot=FALCON&setup=FALCON" target="_blank">/realtradelifecycle BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/registrypersistence BTC SHORT persist snapshot</a></p>
+    <p><a style="color:#93c5fd" href="/registrymodesegregation?commit=true" target="_blank">/registrymodesegregation commit classifications</a></p>
     <p><a style="color:#93c5fd" href="/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/tradecloseoutcome BTC SHORT evaluate closed trade</a></p>
     <p><a style="color:#93c5fd" href="/lifecyclemonitor/BTCUSDT/SHORT?bot=FALCON&setup=FALCON&commit=true" target="_blank">/lifecyclemonitor BTC SHORT commit snapshot</a></p>
     <p><a style="color:#93c5fd" href="/positioncheck/BTCUSDT/SHORT" target="_blank">/positioncheck/BTCUSDT/SHORT</a></p>
