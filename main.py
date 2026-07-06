@@ -5021,7 +5021,7 @@ def real_trade_lifecycle_monitor_v1_health():
 # - Persistir snapshot do Trade Registry e do estado real da BingX.
 # - Reconstruir o Registry quando houver posição real protegida, mas o arquivo OPEN estiver vazio.
 # - Bloquear nova execução real quando existir posição real sem Registry confirmado.
-REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1.1"
+REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1.2"
 REGISTRY_PERSISTENCE_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_latest.json"
 REGISTRY_PERSISTENCE_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_events.jsonl"
 
@@ -5519,6 +5519,235 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
     return lifecycle
 
 
+
+
+# ==========================================================
+# REGISTRY PERSISTENCE V1.2 — CLOSED TRADE MANUAL RECOVERY
+# ==========================================================
+# Uso quando um deploy/restart deixou o trade fechado fora do trade_registry.json,
+# mas a posição já não existe na BingX e o usuário tem os dados do fechamento.
+# Segurança: exige commit=true e ack=RESTORE_CLOSED_TRADE_MANUAL.
+
+def _rp_v12_trade_key(symbol=None, side=None, bot=None, setup=None):
+    symbol_n = _rp_v1_norm_symbol(symbol or "BTCUSDT")
+    side_n = _rp_v1_norm_side(side or "SHORT")
+    bot_n = _rp_v1_norm_bot(bot or "FALCON")
+    setup_n = str(setup or bot_n or "FALCON").upper().strip()
+    return f"{bot_n}:{setup_n}:{symbol_n}:{side_n}", symbol_n, side_n, bot_n, setup_n
+
+
+def _rp_v12_load_raw_registry_safe():
+    try:
+        if central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)):
+            raw = central_trade_registry.load_registry()
+            if isinstance(raw, dict):
+                raw.setdefault("ok", True)
+                raw.setdefault("version", "2026-07-03-TRADE-REGISTRY-V1")
+                raw.setdefault("open_trades", {})
+                raw.setdefault("closed_trades", [])
+                return raw
+    except Exception:
+        pass
+    return {"ok": True, "version": "2026-07-03-TRADE-REGISTRY-V1", "open_trades": {}, "closed_trades": []}
+
+
+def _rp_v12_closed_trade_exists(raw_registry, trade_id):
+    for trade in (raw_registry or {}).get("closed_trades") or []:
+        if isinstance(trade, dict) and str(trade.get("trade_id") or "") == str(trade_id):
+            return trade
+    return None
+
+
+def registry_persistence_v12_recover_closed_trade_from_params(
+    symbol=None,
+    side=None,
+    bot=None,
+    setup=None,
+    commit=False,
+    ack=None,
+    entry=None,
+    qty=None,
+    sl=None,
+    tp50=None,
+    exit_price=None,
+    realized_pnl=None,
+    last_mark_price=None,
+    last_unrealized_pnl=None,
+    close_reason=None,
+):
+    trade_id, symbol_n, side_n, bot_n, setup_n = _rp_v12_trade_key(symbol=symbol, side=side, bot=bot, setup=setup)
+    live_state = _rp_v1_build_live_state(symbol=symbol_n, side=side_n, bot=bot_n, setup=setup_n)
+
+    if live_state.get("position_found"):
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "CANNOT_RECOVER_CLOSED_TRADE_WHILE_POSITION_OPEN",
+            "committed": False,
+            "trade_id": trade_id,
+            "live_state": live_state,
+        }
+
+    if str(ack or "").strip() != "RESTORE_CLOSED_TRADE_MANUAL":
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "ACK_REQUIRED",
+            "required_ack": "RESTORE_CLOSED_TRADE_MANUAL",
+            "committed": False,
+            "trade_id": trade_id,
+        }
+
+    raw = _rp_v12_load_raw_registry_safe()
+    existing = _rp_v12_closed_trade_exists(raw, trade_id)
+    if existing:
+        return {
+            "ok": True,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "CLOSED_TRADE_ALREADY_REGISTERED",
+            "committed": False,
+            "trade_id": trade_id,
+            "closed_trade": existing,
+        }
+
+    entry_f = _rp_v1_float(entry)
+    qty_f = _rp_v1_float(qty)
+    sl_f = _rp_v1_float(sl)
+    tp50_f = _rp_v1_float(tp50)
+    exit_f = _rp_v1_float(exit_price)
+    realized_f = _rp_v1_float(realized_pnl)
+    last_mark_f = _rp_v1_float(last_mark_price)
+    last_unrealized_f = _rp_v1_float(last_unrealized_pnl)
+
+    if entry_f is None:
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "ENTRY_REQUIRED", "committed": False, "trade_id": trade_id}
+
+    # Se exit_price não veio, usa o último mark conhecido apenas como referência estimada.
+    exit_reference = exit_f if exit_f is not None else last_mark_f
+    close_reason_s = str(close_reason or "MANUAL_CLOSE").upper().strip()
+
+    closed_trade = {
+        "trade_id": trade_id,
+        "bot": bot_n,
+        "setup": setup_n,
+        "symbol": symbol_n,
+        "side": side_n,
+        "status": "CLOSED",
+        "entry": entry_f,
+        "qty": qty_f,
+        "sl": sl_f,
+        "tp50": tp50_f,
+        "exit_price": exit_f,
+        "exit_price_source": "manual_param" if exit_f is not None else ("last_mark_price_estimate" if last_mark_f is not None else None),
+        "last_mark_price": last_mark_f,
+        "realized_pnl": realized_f,
+        "last_unrealized_pnl": last_unrealized_f,
+        "close_reason": close_reason_s,
+        "closed_at": _rp_v1_now(),
+        "last_update": _rp_v1_now(),
+        "source": "registry_persistence_v1_2_closed_manual_recovery",
+        "metadata": {
+            "recovery_version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "recovered_by": "registry_persistence_v1_2_closed_manual_recovery",
+            "manual_ack": "RESTORE_CLOSED_TRADE_MANUAL",
+            "recovered_at": _rp_v1_now(),
+            "position_found_at_recovery": bool(live_state.get("position_found")),
+            "safety_status_at_recovery": live_state.get("safety_status"),
+            "exit_reference": exit_reference,
+            "exit_reference_source": "exit_price" if exit_f is not None else ("last_mark_price" if last_mark_f is not None else None),
+            "note": "Trade fechado recuperado manualmente após snapshot latest vazio/restore sem CLOSED.",
+        },
+    }
+
+    if not commit:
+        return {
+            "ok": True,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "DRY_RUN_CLOSED_TRADE_RECOVERY_READY",
+            "committed": False,
+            "trade_id": trade_id,
+            "candidate": closed_trade,
+            "live_state": live_state,
+        }
+
+    if central_trade_registry is None or not callable(getattr(central_trade_registry, "save_registry", None)):
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "TRADE_REGISTRY_UNAVAILABLE", "committed": False, "trade_id": trade_id}
+
+    try:
+        raw.setdefault("open_trades", {})
+        raw.setdefault("closed_trades", [])
+        # Garante que não resta OPEN com a mesma chave.
+        if isinstance(raw.get("open_trades"), dict):
+            raw["open_trades"].pop(trade_id, None)
+        raw["closed_trades"].append(closed_trade)
+        raw["updated_at"] = _rp_v1_now()
+        central_trade_registry.save_registry(raw)
+
+        after_registry_state = _rp_v1_registry_snapshot_full()
+        latest_payload = {
+            "ok": True,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "REGISTRY_CLOSED_TRADE_RECOVERED",
+            "generated_at": _rp_v1_now(),
+            "source": "closed_manual_recovery",
+            "data_dir_status": _rp_v1_data_dir_status(),
+            "live_state": live_state,
+            "registry_state": after_registry_state,
+            "summary": {
+                "position_found": False,
+                "open_count": len((raw.get("open_trades") or {})) if isinstance(raw.get("open_trades"), dict) else None,
+                "closed_count": len(raw.get("closed_trades") or []),
+                "trade_id": trade_id,
+            },
+        }
+        _rp_v1_atomic_write_json(REGISTRY_PERSISTENCE_V1_LATEST_FILE, latest_payload)
+        _rp_v1_append_event({
+            "event": "REGISTRY_PERSISTENCE_CLOSED_TRADE_RECOVERY",
+            "generated_at": _rp_v1_now(),
+            "trade_id": trade_id,
+            "closed_trade": closed_trade,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+        })
+        return {
+            "ok": True,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "CLOSED_TRADE_RECOVERED_AND_SNAPSHOT_SAVED",
+            "committed": True,
+            "trade_id": trade_id,
+            "closed_trade": closed_trade,
+            "registry_state": after_registry_state,
+            "snapshot_save": {"attempted": True, "committed": True, "status": "SNAPSHOT_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)},
+        }
+    except Exception as exc:
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "CLOSED_TRADE_RECOVERY_SAVE_ERROR", "committed": False, "trade_id": trade_id, "error": str(exc)}
+
+
+@app.route("/registryclosedrecovery", methods=["GET"])
+@app.route("/registrypersistence/closedrecovery", methods=["GET"])
+def registry_persistence_v12_closed_recovery_route():
+    result = registry_persistence_v12_recover_closed_trade_from_params(
+        symbol=request.args.get("symbol") or "BTCUSDT",
+        side=request.args.get("side") or "SHORT",
+        bot=request.args.get("bot") or "FALCON",
+        setup=request.args.get("setup") or request.args.get("bot") or "FALCON",
+        commit=_rp_v1_bool(request.args.get("commit"), False),
+        ack=request.args.get("ack"),
+        entry=request.args.get("entry"),
+        qty=request.args.get("qty"),
+        sl=request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss"),
+        tp50=request.args.get("tp50"),
+        exit_price=request.args.get("exit_price"),
+        realized_pnl=request.args.get("realized_pnl") or request.args.get("pnl"),
+        last_mark_price=request.args.get("last_mark_price") or request.args.get("mark_price"),
+        last_unrealized_pnl=request.args.get("last_unrealized_pnl") or request.args.get("unrealized_pnl"),
+        close_reason=request.args.get("close_reason") or "MANUAL_CLOSE",
+    )
+    result["routes"] = [
+        "/registryclosedrecovery?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=63572.3&qty=0.0001&sl=66750.9&tp50=60393.7&last_mark_price=63811.3&last_unrealized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true&ack=RESTORE_CLOSED_TRADE_MANUAL",
+        "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+    ]
+    return result
+
 @app.route("/registrypersistence", methods=["GET"])
 @app.route("/registrypersistencev1", methods=["GET"])
 @app.route("/registry/persistence", methods=["GET"])
@@ -5553,6 +5782,7 @@ def registry_persistence_v1_route():
         "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
         "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&rebuild=true&commit=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=66750.9",
         "/registrypersistence?restore=true&commit=true&ack=RESTORE_REGISTRY_FROM_SNAPSHOT",
+        "/registryclosedrecovery?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=63572.3&qty=0.0001&sl=66750.9&tp50=60393.7&last_mark_price=63811.3&last_unrealized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true&ack=RESTORE_CLOSED_TRADE_MANUAL",
     ]
     return payload
 
@@ -5582,6 +5812,7 @@ def registry_persistence_v1_health_route():
         },
         "notes": [
             "Registry Persistence V1 salva snapshot do Registry e do estado real da BingX.",
+            "V1.2 adiciona recuperação manual segura de trade CLOSED quando o latest snapshot foi sobrescrito vazio.",
             "Se houver posição real protegida e Registry vazio após deploy/restart, V1.1 bloqueia snapshot vazio e exige rebuild com ack explícito.",
             "O Final Gate consulta esta camada e bloqueia nova execução real se houver posição existente sem Registry confirmado.",
             "Para persistência real entre deploys no Render, CENTRAL_DATA_DIR ou DATA_DIR deve apontar para um disco persistente.",
@@ -5590,6 +5821,7 @@ def registry_persistence_v1_health_route():
             "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
             "/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&rebuild=true&commit=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=66750.9",
             "/registrypersistence?restore=true&commit=true&ack=RESTORE_REGISTRY_FROM_SNAPSHOT",
+        "/registryclosedrecovery?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=63572.3&qty=0.0001&sl=66750.9&tp50=60393.7&last_mark_price=63811.3&last_unrealized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true&ack=RESTORE_CLOSED_TRADE_MANUAL",
             "/registrypersistence/health",
         ],
     }
