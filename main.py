@@ -4263,7 +4263,8 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
 # - Atualizar snapshot operacional no Registry quando commit=true.
 # - Reparar Registry dentro do lifecycle com repair_registry=true + ack explícito.
 # - Marcar CLOSED somente com posição ausente confirmada + ack explícito.
-REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1.2"
+REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1.3-TP50-RESOLVER"
+TP50_RESOLVER_V1_VERSION = "2026-07-06-TP50-RESOLVER-V1"
 
 
 def _rtlm_v1_bool(value, default=False):
@@ -4398,7 +4399,15 @@ def _rtlm_v1_update_open_trade_snapshot(symbol=None, side=None, bot=None, setup=
         meta["lifecycle_last_check_at"] = now
         meta["lifecycle_status"] = (lifecycle or {}).get("status")
         meta["lifecycle_stop_confirmed"] = (lifecycle or {}).get("stop_confirmed_by_central")
-        meta["lifecycle_tp50_hit"] = ((lifecycle or {}).get("tp50") or {}).get("hit")
+        tp50_payload = ((lifecycle or {}).get("tp50") or {})
+        meta["lifecycle_tp50_hit"] = tp50_payload.get("hit")
+        meta["tp50_resolver_version"] = tp50_payload.get("version")
+        meta["tp50_resolved"] = tp50_payload.get("resolved")
+        meta["tp50_source"] = tp50_payload.get("tp50_source")
+        meta["tp50_needs_review"] = tp50_payload.get("needs_tp50_review")
+        meta["tp50_invalid_reason"] = tp50_payload.get("invalid_reason")
+        if tp50_payload.get("resolved") and tp50_payload.get("tp50") is not None:
+            trade["tp50"] = tp50_payload.get("tp50")
         meta["lifecycle_current_pnl"] = ((lifecycle or {}).get("position") or {}).get("unrealizedPnl")
         meta["lifecycle_mark_price"] = ((lifecycle or {}).get("position") or {}).get("markPrice")
         meta["lifecycle_position_found"] = (lifecycle or {}).get("position_found")
@@ -4506,80 +4515,269 @@ def _rtlm_v1_first_registry_trade(safety, direct_matches=None):
     return {}
 
 
-def _rtlm_v1_tp50_status(position, registry_trade, side=None, request_tp50=None):
-    """
-    V1.2: valida coerência direcional do TP50 antes de marcar hit.
-
-    Para LONG, TP50 precisa estar acima da entrada.
-    Para SHORT, TP50 precisa estar abaixo da entrada.
-
-    Sem esta validação, um TP50 antigo/incoerente pode gerar falso positivo
-    (ex.: SHORT com entry real 63k e tp50=107k).
-    """
+def _rtlm_v1_directional_price_check(value, entry, side=None, kind="tp50"):
+    """Valida direção de TP/stop em relação à entrada real."""
+    value_f = _rtlm_v1_float(value)
+    entry_f = _rtlm_v1_float(entry)
     side_n = _rtlm_v1_norm_side(side)
-    tp50_source = None
-    tp50 = _rtlm_v1_float(request_tp50)
-    if tp50 is not None:
-        tp50_source = "request"
-    if tp50 is None and isinstance(registry_trade, dict):
-        raw_tp50 = registry_trade.get("tp50") or registry_trade.get("tp") or registry_trade.get("target")
-        tp50 = _rtlm_v1_float(raw_tp50)
-        if tp50 is not None:
-            tp50_source = "registry"
-
-    mark = _rtlm_v1_float((position or {}).get("markPrice") or (position or {}).get("lastPrice"))
-    entry = _rtlm_v1_float((position or {}).get("entryPrice") or (registry_trade or {}).get("entry"))
-
-    directionally_valid = None
-    invalid_reason = None
-    if tp50 is not None and entry is not None:
+    if value_f is None or entry_f is None:
+        return None, "MISSING_PRICE_OR_ENTRY"
+    if kind == "stop":
         if side_n == "SHORT":
-            directionally_valid = tp50 < entry
-            if not directionally_valid:
-                invalid_reason = "SHORT_TP50_MUST_BE_BELOW_ENTRY"
-        elif side_n == "LONG":
-            directionally_valid = tp50 > entry
-            if not directionally_valid:
-                invalid_reason = "LONG_TP50_MUST_BE_ABOVE_ENTRY"
+            return value_f > entry_f, None if value_f > entry_f else "SHORT_STOP_MUST_BE_ABOVE_ENTRY"
+        if side_n == "LONG":
+            return value_f < entry_f, None if value_f < entry_f else "LONG_STOP_MUST_BE_BELOW_ENTRY"
+        return False, "UNKNOWN_SIDE"
+    # tp50 / target
+    if side_n == "SHORT":
+        return value_f < entry_f, None if value_f < entry_f else "SHORT_TP50_MUST_BE_BELOW_ENTRY"
+    if side_n == "LONG":
+        return value_f > entry_f, None if value_f > entry_f else "LONG_TP50_MUST_BE_ABOVE_ENTRY"
+    return False, "UNKNOWN_SIDE"
+
+
+def _rtlm_v1_first_nonempty(*values):
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _rtlm_v1_extract_stop_reference(position=None, registry_trade=None, protective_orders=None, request_sl=None, side=None, entry=None):
+    """Escolhe um stop válido para cálculo automático de TP50."""
+    side_n = _rtlm_v1_norm_side(side)
+    candidates = []
+
+    def add_candidate(source, raw):
+        stop_f = _rtlm_v1_float(raw)
+        if stop_f is None:
+            return
+        valid, reason = _rtlm_v1_directional_price_check(stop_f, entry, side=side_n, kind="stop")
+        candidates.append({
+            "source": source,
+            "stop": stop_f,
+            "directionally_valid": valid,
+            "invalid_reason": reason,
+        })
+
+    add_candidate("request_sl", request_sl)
+    if isinstance(registry_trade, dict):
+        add_candidate("registry_sl", _rtlm_v1_first_nonempty(registry_trade.get("sl"), registry_trade.get("stop"), registry_trade.get("stop_loss"), registry_trade.get("disaster_stop")))
+    if isinstance(position, dict):
+        add_candidate("position_stopLossPrice", _rtlm_v1_first_nonempty(position.get("stopLossPrice"), position.get("stopPrice")))
+    for idx, order in enumerate(protective_orders or []):
+        if not isinstance(order, dict):
+            continue
+        # Para proteção, preferimos gatilho/stopPrice, não o preço médio/limit price.
+        stop_raw = _rtlm_v1_first_nonempty(
+            order.get("stopPrice"),
+            order.get("triggerPrice"),
+            order.get("stopLossPrice"),
+            order.get("actPrice"),
+        )
+        add_candidate(f"protective_order_{idx}:{order.get('source') or 'unknown'}", stop_raw)
+
+    valid_candidates = [c for c in candidates if c.get("directionally_valid") is True]
+    selected = None
+    if valid_candidates:
+        # Escolhe o stop mais próximo da entrada, pois costuma representar o stop operacional ativo.
+        entry_f = _rtlm_v1_float(entry)
+        if entry_f is not None:
+            selected = sorted(valid_candidates, key=lambda c: abs(float(c.get("stop")) - entry_f))[0]
         else:
-            directionally_valid = False
-            invalid_reason = "UNKNOWN_SIDE"
+            selected = valid_candidates[0]
+    return {
+        "selected": selected,
+        "candidates": candidates,
+        "valid_count": len(valid_candidates),
+    }
 
+
+def _rtlm_v1_eval_tp50_candidate(raw_tp50, source=None, position=None, side=None, entry=None, mark=None):
+    tp50 = _rtlm_v1_float(raw_tp50)
+    side_n = _rtlm_v1_norm_side(side)
+    entry_f = _rtlm_v1_float(entry)
+    mark_f = _rtlm_v1_float(mark)
+    valid, invalid_reason = _rtlm_v1_directional_price_check(tp50, entry_f, side=side_n, kind="tp50")
     hit = False
-    if tp50 is not None and mark is not None and directionally_valid is True:
+    if tp50 is not None and mark_f is not None and valid is True:
         if side_n == "SHORT":
-            hit = mark <= tp50
+            hit = mark_f <= tp50
         elif side_n == "LONG":
-            hit = mark >= tp50
-
+            hit = mark_f >= tp50
     distance_pct = None
-    if tp50 is not None and mark is not None and mark:
+    if tp50 is not None and mark_f is not None and mark_f:
         try:
             if side_n == "SHORT":
-                # positivo = ainda falta cair até o TP50; negativo = mark já abaixo do TP50
-                distance_pct = round(((mark - tp50) / mark) * 100.0, 6)
+                distance_pct = round(((mark_f - tp50) / mark_f) * 100.0, 6)
             elif side_n == "LONG":
-                # positivo = ainda falta subir até o TP50; negativo = mark já acima do TP50
-                distance_pct = round(((tp50 - mark) / mark) * 100.0, 6)
+                distance_pct = round(((tp50 - mark_f) / mark_f) * 100.0, 6)
         except Exception:
             distance_pct = None
-
-    needs_tp50_review = bool(tp50 is None or directionally_valid is False)
     return {
+        "source": source,
         "tp50": tp50,
-        "tp50_source": tp50_source,
+        "directionally_valid": valid,
+        "invalid_reason": invalid_reason,
+        "hit": bool(hit),
+        "distance_pct_to_tp50": distance_pct,
+    }
+
+
+def _rtlm_v1_resolve_tp50(position=None, registry_trade=None, side=None, request_tp50=None, request_sl=None, protective_orders=None, tp50_r_multiple=None):
+    """
+    TP50 Resolver V1.
+
+    Ordem de decisão:
+    1) TP50 recebido na rota, se direcionalmente válido.
+    2) TP50 salvo no Registry, se direcionalmente válido.
+    3) TP/takeProfit anexado na posição, se válido.
+    4) Cálculo automático a partir da entrada real e de um stop válido.
+
+    Regra do cálculo automático:
+    - SHORT: tp50 = entry - abs(stop - entry) * R
+    - LONG:  tp50 = entry + abs(entry - stop) * R
+    Por padrão R=1.0, coerente com os exemplos anteriores da Central em que TP50 ficava a 1R.
+    """
+    side_n = _rtlm_v1_norm_side(side)
+    mark = _rtlm_v1_float((position or {}).get("markPrice") or (position or {}).get("lastPrice"))
+    entry = _rtlm_v1_float(
+        _rtlm_v1_first_nonempty(
+            (position or {}).get("entryPrice"),
+            (registry_trade or {}).get("entry"),
+            (registry_trade or {}).get("entry_price"),
+        )
+    )
+
+    r_multiple = _rtlm_v1_float(tp50_r_multiple, None)
+    if r_multiple is None or r_multiple <= 0:
+        try:
+            import os
+            r_multiple = _rtlm_v1_float(os.getenv("CENTRAL_TP50_R_MULTIPLE"), None)
+        except Exception:
+            r_multiple = None
+    if r_multiple is None or r_multiple <= 0:
+        r_multiple = 1.0
+
+    candidates = []
+    rejected = []
+
+    def add_candidate(raw, source):
+        c = _rtlm_v1_eval_tp50_candidate(raw, source=source, position=position, side=side_n, entry=entry, mark=mark)
+        if c.get("tp50") is None:
+            return None
+        candidates.append(c)
+        if c.get("directionally_valid") is not True:
+            rejected.append(c)
+        return c
+
+    request_candidate = add_candidate(request_tp50, "request")
+    registry_candidate = None
+    if isinstance(registry_trade, dict):
+        registry_candidate = add_candidate(_rtlm_v1_first_nonempty(registry_trade.get("tp50"), registry_trade.get("tp"), registry_trade.get("target"), registry_trade.get("take_profit_50")), "registry")
+    position_candidate = None
+    if isinstance(position, dict):
+        position_candidate = add_candidate(_rtlm_v1_first_nonempty(position.get("takeProfitPrice"), position.get("tp50"), position.get("tp")), "position_takeProfitPrice")
+
+    selected = None
+    for c in candidates:
+        if c.get("directionally_valid") is True:
+            selected = c
+            break
+
+    stop_reference = _rtlm_v1_extract_stop_reference(
+        position=position,
+        registry_trade=registry_trade,
+        protective_orders=protective_orders,
+        request_sl=request_sl,
+        side=side_n,
+        entry=entry,
+    )
+
+    auto_candidate = None
+    if selected is None and entry is not None:
+        selected_stop = (stop_reference or {}).get("selected") or {}
+        stop = _rtlm_v1_float(selected_stop.get("stop"))
+        stop_valid = selected_stop.get("directionally_valid") is True
+        if stop is not None and stop_valid:
+            risk_abs = abs(stop - entry)
+            if risk_abs > 0:
+                if side_n == "SHORT":
+                    auto_tp50 = entry - (risk_abs * r_multiple)
+                elif side_n == "LONG":
+                    auto_tp50 = entry + (risk_abs * r_multiple)
+                else:
+                    auto_tp50 = None
+                if auto_tp50 is not None:
+                    # Conserva precisão suficiente sem sujar o JSON com muitos decimais.
+                    auto_tp50 = round(float(auto_tp50), 8)
+                    auto_candidate = _rtlm_v1_eval_tp50_candidate(
+                        auto_tp50,
+                        source=f"auto_from_entry_stop_{r_multiple:g}R",
+                        position=position,
+                        side=side_n,
+                        entry=entry,
+                        mark=mark,
+                    )
+                    auto_candidate["calculation"] = {
+                        "entry": entry,
+                        "stop": stop,
+                        "risk_abs": round(risk_abs, 8),
+                        "r_multiple": r_multiple,
+                        "formula": "SHORT: entry-risk*R; LONG: entry+risk*R",
+                        "stop_source": selected_stop.get("source"),
+                    }
+                    candidates.append(auto_candidate)
+                    if auto_candidate.get("directionally_valid") is True:
+                        selected = auto_candidate
+                    else:
+                        rejected.append(auto_candidate)
+
+    invalid_reason = None
+    if selected is None:
+        if rejected:
+            invalid_reason = rejected[0].get("invalid_reason")
+        elif entry is None:
+            invalid_reason = "ENTRY_NOT_AVAILABLE"
+        elif not ((stop_reference or {}).get("selected")):
+            invalid_reason = "VALID_STOP_NOT_AVAILABLE_FOR_AUTO_TP50"
+        else:
+            invalid_reason = "TP50_NOT_AVAILABLE"
+
+    resolved = bool(selected and selected.get("directionally_valid") is True and selected.get("tp50") is not None)
+    return {
+        "version": TP50_RESOLVER_V1_VERSION,
+        "resolved": resolved,
+        "tp50": selected.get("tp50") if selected else None,
+        "tp50_source": selected.get("source") if selected else None,
         "markPrice": mark,
         "entryPrice": entry,
         "side": side_n,
-        "hit": bool(hit),
-        "directionally_valid": directionally_valid,
-        "needs_tp50_review": needs_tp50_review,
-        "invalid_reason": invalid_reason,
-        "distance_pct_to_tp50": distance_pct,
-        "distance_pct_mark_to_tp50": distance_pct,
-        "rule": "SHORT TP50 precisa estar abaixo da entrada; LONG TP50 precisa estar acima da entrada. Hit só é calculado se o TP50 for coerente.",
+        "hit": bool(selected.get("hit")) if selected else False,
+        "directionally_valid": selected.get("directionally_valid") if selected else None,
+        "needs_tp50_review": not resolved,
+        "invalid_reason": None if resolved else invalid_reason,
+        "distance_pct_to_tp50": selected.get("distance_pct_to_tp50") if selected else None,
+        "distance_pct_mark_to_tp50": selected.get("distance_pct_to_tp50") if selected else None,
+        "r_multiple": r_multiple,
+        "stop_reference": stop_reference,
+        "candidates": candidates,
+        "rejected_candidates": rejected,
+        "calculation": selected.get("calculation") if selected else None,
+        "rule": "TP50 Resolver V1: usa TP50 válido da rota/Registry/posição ou calcula por entrada real + stop válido. SHORT exige TP50 abaixo da entrada; LONG exige TP50 acima da entrada.",
     }
 
+
+def _rtlm_v1_tp50_status(position, registry_trade, side=None, request_tp50=None, request_sl=None, protective_orders=None, tp50_r_multiple=None):
+    return _rtlm_v1_resolve_tp50(
+        position=position,
+        registry_trade=registry_trade,
+        side=side,
+        request_tp50=request_tp50,
+        request_sl=request_sl,
+        protective_orders=protective_orders,
+        tp50_r_multiple=tp50_r_multiple,
+    )
 
 def _rtlm_v1_protective_summary(safety):
     orders = (safety or {}).get("protective_orders") or []
@@ -4615,6 +4813,8 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         close_ack = request.args.get("close_ack") or request.args.get("ack")
         repair_ack = request.args.get("repair_ack") or request.args.get("ack") or request.args.get("existing_position_ack")
         request_tp50 = request.args.get("tp50")
+        request_sl = request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss")
+        request_tp50_r = request.args.get("tp50_r") or request.args.get("tp50_rr") or request.args.get("r_multiple")
     except Exception:
         commit = False
         close_commit = False
@@ -4622,6 +4822,8 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         close_ack = None
         repair_ack = None
         request_tp50 = None
+        request_sl = None
+        request_tp50_r = None
 
     safety = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
     direct_registry = _rtlm_v1_find_open_trades(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
@@ -4655,7 +4857,7 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
             stop_confirmed = bool((safety or {}).get("stop_confirmed_by_central"))
             protective_orders = _rtlm_v1_protective_summary(safety)
 
-    tp50_status = _rtlm_v1_tp50_status(position, registry_trade, side=side_norm, request_tp50=request_tp50)
+    tp50_status = _rtlm_v1_tp50_status(position, registry_trade, side=side_norm, request_tp50=request_tp50, request_sl=request_sl, protective_orders=protective_orders, tp50_r_multiple=request_tp50_r)
 
     if position_found and stop_confirmed and registry_match:
         status = "OPEN_MONITORED_PROTECTED_AND_REGISTERED"
@@ -4702,6 +4904,7 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         "stop_confirmed_by_central": stop_confirmed,
         "requires_manual_attention": requires_attention,
         "tp50_needs_review": tp50_needs_review,
+        "tp50_resolver_version": TP50_RESOLVER_V1_VERSION,
         "position": position or {},
         "protective_orders_count": len(protective_orders),
         "protective_orders": protective_orders,
@@ -4733,11 +4936,11 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         },
         "actions": [],
         "notes": [
-            "V1.2 monitora posição real, stop, PnL, TP50 e Registry.",
-            "V1.2 pode reparar o Registry com repair_registry=true e ack=CENTRAL_MANAGED_EXISTING_POSITION quando a posição real protegida existe, mas o registro OPEN não foi encontrado.",
-            "Por segurança, V1.2 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
+            "V1.3 monitora posição real, stop, PnL, TP50 e Registry com TP50 Resolver V1.",
+            "V1.3 pode reparar o Registry com repair_registry=true e ack=CENTRAL_MANAGED_EXISTING_POSITION quando a posição real protegida existe, mas o registro OPEN não foi encontrado.",
+            "Por segurança, V1.3 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
             "commit=true atualiza apenas snapshot/metadata do trade aberto; não cria nem fecha ordens na BingX.",
-            "V1.2 valida a coerência direcional do TP50 para evitar falso hit quando o alvo antigo não combina com a entrada real.",
+            "TP50 Resolver V1 resolve TP50 por rota/Registry/posição ou calcula automaticamente a partir da entrada real e stop válido; alvos incoerentes são rejeitados.",
         ],
     }
 
@@ -4791,17 +4994,18 @@ def real_trade_lifecycle_monitor_v1_health():
         "ok": True,
         "version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
         "module": "real_trade_lifecycle_monitor_v1",
+        "tp50_resolver_version": TP50_RESOLVER_V1_VERSION,
         "notes": [
             "Monitora posição real, stop, PnL, TP50 e Registry.",
             "Leitura segura por padrão; commit=true apenas atualiza snapshot do Registry.",
             "repair_registry=true com ack=CENTRAL_MANAGED_EXISTING_POSITION repara o OPEN quando a posição real protegida existe.",
-            "V1.2 valida TP50: SHORT exige TP50 abaixo da entrada real; LONG exige TP50 acima da entrada real.",
+            "V1.3 + TP50 Resolver V1: resolve TP50 válido ou calcula por entrada real + stop válido; rejeita alvo incoerente.",
             "Fechamento do Registry exige close_registry=true e ack=POSITION_CLOSED_CONFIRMED.",
         ],
         "routes": [
             "/realtradelifecycle/BTCUSDT/SHORT",
             "/lifecyclemonitor/BTCUSDT/SHORT?commit=true",
-            "/lifecyclemonitor/BTCUSDT/SHORT?repair_registry=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=109000&tp50=107000",
+            "/lifecyclemonitor/BTCUSDT/SHORT?repair_registry=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=66750.9",
             "/lifecyclemonitor/BTCUSDT/SHORT?close_registry=true&ack=POSITION_CLOSED_CONFIRMED",
             "/realtradelifecycle/health",
         ],
@@ -4811,7 +5015,7 @@ def real_trade_lifecycle_monitor_v1_health():
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.11 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.2.
+    EXECUTION CONSOLE V1.12 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
