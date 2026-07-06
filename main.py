@@ -5320,7 +5320,7 @@ def registry_persistence_v1_rebuild_from_broker(symbol=None, side=None, bot=None
 
 def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=None, commit=False, source="manual", ack=None, sl=None, tp50=None, auto_rebuild=False, block_empty_registry_snapshot=True):
     """
-    Registry Persistence V1.1.
+    Registry Persistence V1.1 + Trade Close Outcome Evaluator V1.
 
     V1 salvava snapshot mesmo quando havia posição real protegida, mas Registry vazio.
     Isso era útil para diagnóstico, mas perigoso se o snapshot "latest" passasse a representar
@@ -5594,11 +5594,614 @@ def registry_persistence_v1_health_route():
         ],
     }
 
+
+
+# ==========================================================
+# TRADE CLOSE OUTCOME EVALUATOR V1 — CLOSED TRADE → LEARNING INPUT
+# ==========================================================
+# Objetivo:
+# - Transformar um trade CLOSED do Registry em outcome operacional.
+# - Calcular saída, PnL, PnL %, R múltiplo, TP50 e motivo provável.
+# - Salvar outcome em /data e na metadata do trade fechado.
+# - Bloquear nova execução real se houver trade fechado ainda não avaliado.
+TRADE_CLOSE_OUTCOME_V1_VERSION = "2026-07-06-TRADE-CLOSE-OUTCOME-EVALUATOR-V1"
+TRADE_CLOSE_OUTCOME_V1_LATEST_FILE = CENTRAL_DATA_DIR / "trade_close_outcome_v1_latest.json"
+TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "trade_close_outcome_v1_events.jsonl"
+
+
+def _tco_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        return None
+
+
+def _tco_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "commit", "save"}
+
+
+def _tco_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return default
+
+
+def _tco_v1_norm_symbol(value):
+    try:
+        return _rtlm_v1_norm_symbol(value)
+    except Exception:
+        return str(value or "").upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _tco_v1_norm_side(value):
+    try:
+        return _rtlm_v1_norm_side(value)
+    except Exception:
+        s = str(value or "").upper().strip()
+        if s in {"SELL", "SHORT"}:
+            return "SHORT"
+        if s in {"BUY", "LONG"}:
+            return "LONG"
+        return s
+
+
+def _tco_v1_norm_bot(value):
+    try:
+        return _rtlm_v1_norm_bot(value)
+    except Exception:
+        return str(value or "FALCON").upper().strip()
+
+
+def _tco_v1_atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def _tco_v1_append_event(event):
+    try:
+        TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _tco_v1_registry_available():
+    return central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)) and callable(getattr(central_trade_registry, "save_registry", None))
+
+
+def _tco_v1_load_registry():
+    if not _tco_v1_registry_available():
+        return None
+    registry = central_trade_registry.load_registry()
+    return registry if isinstance(registry, dict) else {}
+
+
+def _tco_v1_closed_items(registry):
+    closed_raw = registry.get("closed_trades", []) if isinstance(registry, dict) else []
+    if isinstance(closed_raw, dict):
+        return closed_raw, [(str(k), v) for k, v in closed_raw.items() if isinstance(v, dict)]
+    if isinstance(closed_raw, list):
+        return closed_raw, [(str(t.get("trade_id") or i), t) for i, t in enumerate(closed_raw) if isinstance(t, dict)]
+    return [], []
+
+
+def _tco_v1_match_trade(trade, symbol=None, side=None, bot=None, setup=None, trade_id=None):
+    if not isinstance(trade, dict):
+        return False
+    if trade_id and str(trade.get("trade_id") or "") == str(trade_id):
+        return True
+    symbol_n = _tco_v1_norm_symbol(symbol) if symbol else None
+    side_n = _tco_v1_norm_side(side) if side else None
+    bot_n = _tco_v1_norm_bot(bot) if bot else None
+    setup_n = str(setup or "").upper().strip() if setup else None
+    tsymbol = _tco_v1_norm_symbol(trade.get("symbol_clean") or trade.get("symbol") or trade.get("ativo") or trade.get("pair"))
+    tside = _tco_v1_norm_side(trade.get("side") or trade.get("direction"))
+    tbot = _tco_v1_norm_bot(trade.get("bot") or "")
+    tsetup = str(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label") or "").upper().strip()
+    status = str(trade.get("status") or "").upper().strip()
+    if status and status not in {"CLOSED", "CLOSE", "DONE", "FINISHED"}:
+        return False
+    if symbol_n and tsymbol != symbol_n:
+        return False
+    if side_n and tside != side_n:
+        return False
+    if bot_n and tbot and tbot != bot_n:
+        return False
+    if setup_n and tsetup and tsetup != setup_n:
+        return False
+    return True
+
+
+def _tco_v1_find_closed_trade(symbol=None, side=None, bot=None, setup=None, trade_id=None):
+    registry = _tco_v1_load_registry()
+    if registry is None:
+        return {"ok": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR if "TRADE_REGISTRY_IMPORT_ERROR" in globals() else None}
+    closed_obj, items = _tco_v1_closed_items(registry)
+    matches = []
+    for key, trade in items:
+        if _tco_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup, trade_id=trade_id):
+            matches.append({"key": key, "trade": trade})
+    # Prefere o último trade compatível, pois closed_trades costuma ser append-only.
+    selected = matches[-1] if matches else None
+    return {
+        "ok": True,
+        "status": "MATCH_FOUND" if selected else "NO_MATCHING_CLOSED_TRADE",
+        "count": len(matches),
+        "matches": matches,
+        "selected": selected,
+        "registry": registry,
+        "closed_obj": closed_obj,
+        "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
+    }
+
+
+def _tco_v1_trade_meta(trade):
+    return trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+
+
+def _tco_v1_first_value(*values):
+    for v in values:
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _tco_v1_resolve_exit_price(trade, explicit_exit_price=None):
+    meta = _tco_v1_trade_meta(trade)
+    explicit = _tco_v1_float(explicit_exit_price)
+    if explicit is not None:
+        return explicit, "request_exit_price", "REAL_OR_MANUAL_INPUT"
+    candidates = [
+        ("trade_exit_price", trade.get("exit_price") or trade.get("exit") or trade.get("close_price") or trade.get("closed_price")),
+        ("metadata_exit_price", meta.get("exit_price") or meta.get("close_price") or meta.get("closed_price")),
+        ("last_mark_price", trade.get("last_mark_price")),
+        ("metadata_lifecycle_mark_price", meta.get("lifecycle_mark_price")),
+        ("metadata_broker_mark_price", meta.get("broker_mark_price")),
+    ]
+    for source, value in candidates:
+        val = _tco_v1_float(value)
+        if val is not None:
+            quality = "REAL_OR_REGISTRY" if "exit" in source or "close" in source else "ESTIMATED_FROM_LAST_MARK_PRICE"
+            return val, source, quality
+    return None, None, "MISSING_EXIT_PRICE"
+
+
+def _tco_v1_resolve_realized_pnl(trade, explicit_realized_pnl=None):
+    meta = _tco_v1_trade_meta(trade)
+    explicit = _tco_v1_float(explicit_realized_pnl)
+    if explicit is not None:
+        return explicit, "request_realized_pnl", "REAL_OR_MANUAL_INPUT"
+    candidates = [
+        ("trade_realized_pnl", trade.get("realized_pnl") or trade.get("pnl") or trade.get("pnl_usdt")),
+        ("metadata_realized_pnl", meta.get("realized_pnl") or meta.get("broker_realized_pnl") or meta.get("close_realized_pnl")),
+        ("last_unrealized_pnl", trade.get("last_unrealized_pnl")),
+        ("metadata_lifecycle_current_pnl", meta.get("lifecycle_current_pnl")),
+        ("metadata_broker_unrealized_pnl", meta.get("broker_unrealized_pnl")),
+    ]
+    for source, value in candidates:
+        val = _tco_v1_float(value)
+        if val is not None:
+            quality = "REAL_OR_REGISTRY" if "realized" in source and "unrealized" not in source else "ESTIMATED_FROM_LAST_UNREALIZED_PNL"
+            return val, source, quality
+    return None, None, "MISSING_REALIZED_PNL"
+
+
+def _tco_v1_compute_pnl(entry, exit_price, qty, side):
+    entry_f = _tco_v1_float(entry)
+    exit_f = _tco_v1_float(exit_price)
+    qty_f = _tco_v1_float(qty, 0.0) or 0.0
+    side_n = _tco_v1_norm_side(side)
+    if entry_f is None or exit_f is None:
+        return None, None, None
+    per_unit = (exit_f - entry_f) if side_n == "LONG" else (entry_f - exit_f)
+    pnl_usdt = per_unit * qty_f if qty_f else None
+    pnl_pct = (per_unit / entry_f) * 100.0 if entry_f else None
+    return pnl_usdt, pnl_pct, per_unit
+
+
+def _tco_v1_compute_r(entry, exit_price, stop, side):
+    entry_f = _tco_v1_float(entry)
+    exit_f = _tco_v1_float(exit_price)
+    stop_f = _tco_v1_float(stop)
+    side_n = _tco_v1_norm_side(side)
+    if entry_f is None or exit_f is None or stop_f is None:
+        return None, None
+    if side_n == "SHORT":
+        risk = stop_f - entry_f
+        reward = entry_f - exit_f
+    else:
+        risk = entry_f - stop_f
+        reward = exit_f - entry_f
+    if risk <= 0:
+        return None, {"risk_abs": risk, "invalid_reason": "INVALID_RISK_DISTANCE"}
+    return reward / risk, {"risk_abs": risk, "reward_abs": reward}
+
+
+def _tco_v1_tp50_result(entry, exit_price, tp50, side, lifecycle_tp50_hit=None):
+    entry_f = _tco_v1_float(entry)
+    exit_f = _tco_v1_float(exit_price)
+    tp50_f = _tco_v1_float(tp50)
+    side_n = _tco_v1_norm_side(side)
+    if tp50_f is None:
+        return {"tp50": None, "hit": bool(lifecycle_tp50_hit) if lifecycle_tp50_hit is not None else False, "source": "lifecycle" if lifecycle_tp50_hit is not None else "missing", "directionally_valid": None}
+    directionally_valid = None
+    invalid_reason = None
+    if entry_f is not None:
+        if side_n == "SHORT":
+            directionally_valid = tp50_f < entry_f
+            invalid_reason = None if directionally_valid else "SHORT_TP50_MUST_BE_BELOW_ENTRY"
+        elif side_n == "LONG":
+            directionally_valid = tp50_f > entry_f
+            invalid_reason = None if directionally_valid else "LONG_TP50_MUST_BE_ABOVE_ENTRY"
+    hit = False
+    if exit_f is not None and directionally_valid is not False:
+        hit = exit_f <= tp50_f if side_n == "SHORT" else exit_f >= tp50_f
+    elif lifecycle_tp50_hit is not None:
+        hit = bool(lifecycle_tp50_hit)
+    return {"tp50": tp50_f, "hit": bool(hit), "source": "exit_price", "directionally_valid": directionally_valid, "invalid_reason": invalid_reason}
+
+
+def _tco_v1_infer_close_reason(trade, explicit_close_reason=None, tp50_hit=False, r_multiple=None, pnl_usdt=None):
+    if explicit_close_reason:
+        return str(explicit_close_reason).upper().strip(), "request"
+    meta = _tco_v1_trade_meta(trade)
+    raw = str(trade.get("close_reason") or meta.get("close_reason") or "").upper().strip()
+    if raw in {"MANUAL_CLOSE", "MANUAL", "USER_CLOSE"}:
+        return "MANUAL_CLOSE", "registry"
+    if "STOP" in raw:
+        return "STOP_OR_PROTECTIVE_ORDER", "registry"
+    if "TP" in raw or "TAKE" in raw:
+        return "TAKE_PROFIT_OR_TP", "registry"
+    if raw == "BROKER_POSITION_NOT_FOUND":
+        # O lifecycle sabe que a posição sumiu, mas não sabe se foi manual, stop, TP ou liquidação.
+        if tp50_hit:
+            return "BROKER_POSITION_NOT_FOUND_AFTER_TP50", "inferred"
+        if pnl_usdt is not None and pnl_usdt > 0:
+            return "BROKER_POSITION_NOT_FOUND_WITH_PROFIT", "inferred"
+        if pnl_usdt is not None and pnl_usdt < 0:
+            return "BROKER_POSITION_NOT_FOUND_WITH_LOSS", "inferred"
+        return "BROKER_POSITION_NOT_FOUND", "registry"
+    if raw:
+        return raw, "registry"
+    return "UNKNOWN_CLOSE_REASON", "missing"
+
+
+def trade_close_outcome_v1_build(symbol=None, side=None, bot=None, setup=None, trade_id=None, exit_price=None, realized_pnl=None, fee=None, close_reason=None, commit=False):
+    symbol_n = _tco_v1_norm_symbol(symbol or "BTCUSDT")
+    side_n = _tco_v1_norm_side(side or "SHORT")
+    bot_n = _tco_v1_norm_bot(bot or "FALCON")
+    setup_n = str(setup or bot_n or "FALCON").upper().strip()
+    found = _tco_v1_find_closed_trade(symbol=symbol_n, side=side_n, bot=bot_n, setup=setup_n, trade_id=trade_id)
+    if not found.get("ok"):
+        return {"ok": False, "version": TRADE_CLOSE_OUTCOME_V1_VERSION, "status": found.get("status"), "error": found.get("error")}
+    selected = found.get("selected") or {}
+    if not selected:
+        return {
+            "ok": False,
+            "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+            "status": "NO_MATCHING_CLOSED_TRADE",
+            "symbol": symbol_n,
+            "side": side_n,
+            "bot": bot_n,
+            "setup": setup_n,
+            "closed_match_count": found.get("count"),
+            "trade_registry_file": found.get("trade_registry_file"),
+        }
+    key = selected.get("key")
+    trade = selected.get("trade") or {}
+    meta = _tco_v1_trade_meta(trade)
+    entry = _tco_v1_float(trade.get("entry") or meta.get("broker_entry_price") or meta.get("entry"))
+    qty = _tco_v1_float(trade.get("qty") or trade.get("contracts") or meta.get("broker_contracts"))
+    sl = _tco_v1_float(trade.get("sl") or trade.get("stop") or meta.get("stop") or ((meta.get("stop_reference") or {}).get("selected") or {}).get("stop"))
+    tp50 = _tco_v1_float(trade.get("tp50") or meta.get("tp50") or ((meta.get("tp50_resolver") or {}).get("tp50") if isinstance(meta.get("tp50_resolver"), dict) else None))
+    exit_price_f, exit_source, exit_quality = _tco_v1_resolve_exit_price(trade, explicit_exit_price=exit_price)
+    realized_pnl_f, realized_source, realized_quality = _tco_v1_resolve_realized_pnl(trade, explicit_realized_pnl=realized_pnl)
+    computed_pnl, pnl_pct, pnl_per_unit = _tco_v1_compute_pnl(entry, exit_price_f, qty, side_n)
+    if realized_pnl_f is None:
+        realized_pnl_f = computed_pnl
+        realized_source = "computed_from_entry_exit_qty" if computed_pnl is not None else None
+        realized_quality = "ESTIMATED_FROM_EXIT_PRICE" if computed_pnl is not None else "MISSING_REALIZED_PNL"
+    fee_f = _tco_v1_float(fee, 0.0) or 0.0
+    net_pnl = (realized_pnl_f - fee_f) if realized_pnl_f is not None else None
+    r_multiple, r_calc = _tco_v1_compute_r(entry, exit_price_f, sl, side_n)
+    tp50_payload = _tco_v1_tp50_result(entry, exit_price_f, tp50, side_n, lifecycle_tp50_hit=meta.get("lifecycle_tp50_hit"))
+    close_reason_final, close_reason_source = _tco_v1_infer_close_reason(trade, explicit_close_reason=close_reason, tp50_hit=tp50_payload.get("hit"), r_multiple=r_multiple, pnl_usdt=net_pnl if net_pnl is not None else realized_pnl_f)
+    data_quality_notes = []
+    if exit_quality and exit_quality.startswith("ESTIMATED"):
+        data_quality_notes.append("exit_price_estimado_pelo_ultimo_mark_price")
+    if realized_quality and realized_quality.startswith("ESTIMATED"):
+        data_quality_notes.append("pnl_estimado")
+    if exit_price_f is None:
+        data_quality_notes.append("exit_price_indisponivel")
+    if realized_pnl_f is None:
+        data_quality_notes.append("realized_pnl_indisponivel")
+    quality = "HIGH_REAL" if exit_quality == "REAL_OR_MANUAL_INPUT" and realized_quality == "REAL_OR_MANUAL_INPUT" else ("MEDIUM_ESTIMATED" if exit_price_f is not None or realized_pnl_f is not None else "LOW_INCOMPLETE")
+    outcome = {
+        "ok": True,
+        "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+        "status": "OUTCOME_EVALUATED" if quality != "LOW_INCOMPLETE" else "OUTCOME_INCOMPLETE",
+        "generated_at": _tco_v1_now(),
+        "trade_key": key,
+        "trade_id": trade.get("trade_id") or key,
+        "symbol": _tco_v1_norm_symbol(trade.get("symbol") or symbol_n),
+        "side": side_n,
+        "bot": _tco_v1_norm_bot(trade.get("bot") or bot_n),
+        "setup": str(trade.get("setup") or setup_n).upper().strip(),
+        "entry": entry,
+        "exit_price": exit_price_f,
+        "exit_price_source": exit_source,
+        "qty": qty,
+        "sl": sl,
+        "tp50": tp50,
+        "realized_pnl": realized_pnl_f,
+        "fee": fee_f,
+        "net_pnl": net_pnl,
+        "pnl_pct": round(pnl_pct, 8) if pnl_pct is not None else None,
+        "pnl_per_unit": pnl_per_unit,
+        "r_multiple": round(r_multiple, 8) if r_multiple is not None else None,
+        "r_calculation": r_calc,
+        "tp50_result": tp50_payload,
+        "close_reason": close_reason_final,
+        "close_reason_source": close_reason_source,
+        "data_quality": quality,
+        "data_quality_notes": data_quality_notes,
+        "sources": {
+            "exit_price": exit_quality,
+            "realized_pnl": realized_quality,
+            "realized_pnl_source": realized_source,
+            "trade_registry_file": found.get("trade_registry_file"),
+        },
+        "learning_payload": {
+            "bot": _tco_v1_norm_bot(trade.get("bot") or bot_n),
+            "setup": str(trade.get("setup") or setup_n).upper().strip(),
+            "symbol": _tco_v1_norm_symbol(trade.get("symbol") or symbol_n),
+            "side": side_n,
+            "entry": entry,
+            "exit_price": exit_price_f,
+            "qty": qty,
+            "sl": sl,
+            "tp50": tp50,
+            "tp50_hit": tp50_payload.get("hit"),
+            "pnl_usdt": net_pnl,
+            "pnl_pct": round(pnl_pct, 8) if pnl_pct is not None else None,
+            "r_multiple": round(r_multiple, 8) if r_multiple is not None else None,
+            "close_reason": close_reason_final,
+            "data_quality": quality,
+        },
+        "commit": {"attempted": False, "committed": False, "status": "COMMIT_NOT_REQUESTED"},
+    }
+    if commit:
+        outcome["commit"] = trade_close_outcome_v1_commit(found, selected, outcome)
+    return outcome
+
+
+def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
+    registry = found_payload.get("registry")
+    closed_obj = found_payload.get("closed_obj")
+    key = selected_payload.get("key")
+    if not isinstance(registry, dict):
+        return {"attempted": True, "committed": False, "status": "REGISTRY_NOT_AVAILABLE"}
+    if not isinstance(outcome, dict) or not outcome.get("ok"):
+        return {"attempted": True, "committed": False, "status": "INVALID_OUTCOME"}
+    updated = False
+    now = _tco_v1_now()
+    # Atualiza o trade fechado dentro da estrutura original, preservando lista/dict.
+    if isinstance(closed_obj, dict):
+        trade = closed_obj.get(key)
+        if isinstance(trade, dict):
+            meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+            meta["outcome_evaluated"] = True
+            meta["outcome_evaluated_at"] = now
+            meta["outcome_version"] = TRADE_CLOSE_OUTCOME_V1_VERSION
+            meta["outcome"] = outcome
+            trade["metadata"] = meta
+            trade["outcome_evaluated"] = True
+            trade["outcome_status"] = outcome.get("status")
+            trade["outcome_data_quality"] = outcome.get("data_quality")
+            trade["exit_price"] = outcome.get("exit_price")
+            trade["realized_pnl"] = outcome.get("realized_pnl")
+            trade["net_pnl"] = outcome.get("net_pnl")
+            trade["pnl_pct"] = outcome.get("pnl_pct")
+            trade["r_multiple"] = outcome.get("r_multiple")
+            trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+            trade["close_reason_evaluated"] = outcome.get("close_reason")
+            trade["last_update"] = now
+            closed_obj[key] = trade
+            registry["closed_trades"] = closed_obj
+            updated = True
+    elif isinstance(closed_obj, list):
+        for idx, trade in enumerate(closed_obj):
+            if not isinstance(trade, dict):
+                continue
+            trade_key = str(trade.get("trade_id") or idx)
+            if str(trade_key) != str(key):
+                continue
+            meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+            meta["outcome_evaluated"] = True
+            meta["outcome_evaluated_at"] = now
+            meta["outcome_version"] = TRADE_CLOSE_OUTCOME_V1_VERSION
+            meta["outcome"] = outcome
+            trade["metadata"] = meta
+            trade["outcome_evaluated"] = True
+            trade["outcome_status"] = outcome.get("status")
+            trade["outcome_data_quality"] = outcome.get("data_quality")
+            trade["exit_price"] = outcome.get("exit_price")
+            trade["realized_pnl"] = outcome.get("realized_pnl")
+            trade["net_pnl"] = outcome.get("net_pnl")
+            trade["pnl_pct"] = outcome.get("pnl_pct")
+            trade["r_multiple"] = outcome.get("r_multiple")
+            trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+            trade["close_reason_evaluated"] = outcome.get("close_reason")
+            trade["last_update"] = now
+            closed_obj[idx] = trade
+            registry["closed_trades"] = closed_obj
+            updated = True
+            break
+    if not updated:
+        return {"attempted": True, "committed": False, "status": "CLOSED_TRADE_NOT_FOUND_FOR_UPDATE"}
+    registry["updated_at"] = now
+    try:
+        central_trade_registry.save_registry(registry)
+        _tco_v1_atomic_write_json(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE, outcome)
+        _tco_v1_append_event(outcome)
+        return {
+            "attempted": True,
+            "committed": True,
+            "status": "OUTCOME_SAVED",
+            "latest_file": str(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE),
+            "events_file": str(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE),
+            "trade_key": key,
+        }
+    except Exception as exc:
+        return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
+
+
+def trade_close_outcome_v1_registry_status():
+    registry = _tco_v1_load_registry()
+    if registry is None:
+        return {"ok": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR if "TRADE_REGISTRY_IMPORT_ERROR" in globals() else None}
+    closed_obj, items = _tco_v1_closed_items(registry)
+    unevaluated = []
+    evaluated = []
+    for key, trade in items:
+        meta = _tco_v1_trade_meta(trade)
+        is_eval = bool(trade.get("outcome_evaluated") or meta.get("outcome_evaluated"))
+        row = {"key": key, "trade_id": trade.get("trade_id") or key, "symbol": trade.get("symbol"), "side": trade.get("side"), "bot": trade.get("bot"), "setup": trade.get("setup"), "closed_at": trade.get("closed_at")}
+        if is_eval:
+            evaluated.append(row)
+        else:
+            unevaluated.append(row)
+    return {
+        "ok": True,
+        "status": "OUTCOME_STATUS_READY",
+        "closed_count": len(items),
+        "evaluated_count": len(evaluated),
+        "unevaluated_count": len(unevaluated),
+        "unevaluated": unevaluated[:20],
+        "evaluated": evaluated[-20:],
+        "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
+    }
+
+
+def trade_close_outcome_v1_gate_check():
+    status = trade_close_outcome_v1_registry_status()
+    if not status.get("ok"):
+        return {"ok": False, "version": TRADE_CLOSE_OUTCOME_V1_VERSION, "status": status.get("status"), "error": status.get("error")}
+    unevaluated_count = int(status.get("unevaluated_count") or 0)
+    return {
+        "ok": unevaluated_count == 0,
+        "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+        "status": "ALL_CLOSED_TRADES_EVALUATED" if unevaluated_count == 0 else "CLOSED_TRADES_REQUIRE_OUTCOME_EVALUATION",
+        "closed_count": status.get("closed_count"),
+        "evaluated_count": status.get("evaluated_count"),
+        "unevaluated_count": unevaluated_count,
+        "unevaluated": status.get("unevaluated"),
+        "recommended_route": "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+    }
+
+
+@app.route("/tradecloseoutcome", methods=["GET"])
+@app.route("/tradecloseoutcomev1", methods=["GET"])
+@app.route("/trade/close/outcome", methods=["GET"])
+def trade_close_outcome_v1_route():
+    symbol = request.args.get("symbol") or "BTCUSDT"
+    side = request.args.get("side") or "SHORT"
+    bot = request.args.get("bot") or "FALCON"
+    setup = request.args.get("setup") or bot
+    trade_id = request.args.get("trade_id")
+    exit_price = request.args.get("exit_price") or request.args.get("exit") or request.args.get("close_price")
+    realized_pnl = request.args.get("realized_pnl") or request.args.get("pnl") or request.args.get("pnl_usdt")
+    fee = request.args.get("fee") or request.args.get("fees")
+    close_reason = request.args.get("close_reason") or request.args.get("reason")
+    commit = _tco_v1_bool(request.args.get("commit") or request.args.get("save"), False)
+    return trade_close_outcome_v1_build(
+        symbol=symbol,
+        side=side,
+        bot=bot,
+        setup=setup,
+        trade_id=trade_id,
+        exit_price=exit_price,
+        realized_pnl=realized_pnl,
+        fee=fee,
+        close_reason=close_reason,
+        commit=commit,
+    )
+
+
+@app.route("/tradecloseoutcome/health", methods=["GET"])
+@app.route("/tradecloseoutcomev1/health", methods=["GET"])
+def trade_close_outcome_v1_health_route():
+    status = trade_close_outcome_v1_registry_status()
+    latest = None
+    try:
+        if TRADE_CLOSE_OUTCOME_V1_LATEST_FILE.exists():
+            latest = json.loads(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        latest = {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+        "module": "trade_close_outcome_evaluator_v1",
+        "registry_status": status,
+        "latest_file": str(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE),
+        "events_file": str(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE),
+        "latest_summary": {
+            "ok": latest.get("ok") if isinstance(latest, dict) else None,
+            "trade_id": latest.get("trade_id") if isinstance(latest, dict) else None,
+            "status": latest.get("status") if isinstance(latest, dict) else None,
+            "data_quality": latest.get("data_quality") if isinstance(latest, dict) else None,
+            "net_pnl": latest.get("net_pnl") if isinstance(latest, dict) else None,
+            "r_multiple": latest.get("r_multiple") if isinstance(latest, dict) else None,
+        },
+        "notes": [
+            "Avalia trades CLOSED do Registry e gera learning_payload.",
+            "Sem exit_price/realized_pnl reais da BingX, V1 pode estimar usando último mark price e último PnL conhecido.",
+            "commit=true salva outcome em /data e na metadata do trade fechado.",
+            "O Final Gate bloqueia nova execução real enquanto houver trade fechado sem outcome.",
+        ],
+        "routes": [
+            "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON",
+            "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+            "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&exit_price=63811.3&realized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true",
+            "/tradecloseoutcome/health",
+        ],
+    }
+
+
+@app.route("/tradecloseoutcome/log", methods=["GET"])
+def trade_close_outcome_v1_log_route():
+    limit = int(_tco_v1_float(request.args.get("limit"), 50) or 50)
+    rows = []
+    try:
+        if TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE.exists():
+            lines = TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+            for line in lines:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    rows.append({"raw": line})
+        return {"ok": True, "version": TRADE_CLOSE_OUTCOME_V1_VERSION, "count": len(rows), "events_file": str(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE), "events": rows}
+    except Exception as exc:
+        return {"ok": False, "version": TRADE_CLOSE_OUTCOME_V1_VERSION, "status": "LOG_READ_ERROR", "error": str(exc), "events_file": str(TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE)}
+
+
 @app.route("/executionconsole", methods=["GET", "POST"])
 @app.route("/execution/console", methods=["GET", "POST"])
 def execution_console_route():
     """
-    EXECUTION CONSOLE V1.13 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.1.
+    EXECUTION CONSOLE V1.14 — PRG + Real Position Awareness + Trade Registry Sync V1.1 + Signal ID Refresh + Broker Client Order ID V1 + Real Execution Final Gate V1 + Post-Execution Safety Check V1.1 + Real Trade Lifecycle Monitor V1.3 + TP50 Resolver V1 + Registry Persistence V1.1 + Trade Close Outcome Evaluator V1.
 
     Objetivo:
     - Evitar uso manual de Postman/JSON na primeira operação real.
@@ -5618,6 +6221,7 @@ def execution_console_route():
       valida checklist final de autorização, piloto, limites, posição, IDs e stop.
     - Post-Execution Safety Check V1.1: após envio real, consulta posição, ordens de proteção/stop e Trade Registry.
     - Registry Persistence V1.1: persiste snapshot/rebuild do Registry e bloqueia nova execução real se houver posição existente sem Registry confirmado.
+    - Trade Close Outcome Evaluator V1: avalia trades CLOSED e bloqueia nova execução real se houver fechamento sem outcome.
     """
     import urllib.parse
 
@@ -6021,6 +6625,15 @@ def execution_console_route():
             blocking=True,
         )
 
+        trade_close_outcome_gate = trade_close_outcome_v1_gate_check() if callable(globals().get("trade_close_outcome_v1_gate_check")) else {"ok": False, "status": "TRADE_CLOSE_OUTCOME_FUNCTION_MISSING"}
+        add(
+            "TRADE_CLOSE_OUTCOME_EVALUATED",
+            "Trades fechados avaliados antes de nova execução real",
+            bool(trade_close_outcome_gate.get("ok")),
+            trade_close_outcome_gate,
+            blocking=True,
+        )
+
         bot = str(current_payload.get("bot") or "").upper().strip()
         symbol = _normalize_console_symbol(current_payload.get("symbol"))
         allowed_bots = [str(x).upper().strip() for x in (config.get("allowed_bots") or [])]
@@ -6121,6 +6734,7 @@ def execution_console_route():
                 "broker_ready": broker_available and broker_ready,
                 "positions_checked": positions_checked,
                 "registry_persistence_ok": bool(registry_persistence_gate.get("ok")),
+                "trade_close_outcome_ok": bool(trade_close_outcome_gate.get("ok")),
                 "bot_allowed": bot_allowed,
                 "symbol_allowed": symbol_allowed,
                 "risk_ok": risk_ok,
@@ -6836,6 +7450,7 @@ def execution_console_route():
     <p><a style="color:#93c5fd" href="/postexecutionsafety?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT" target="_blank">/postexecutionsafety BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/realtradelifecycle/BTCUSDT/SHORT?bot=FALCON&setup=FALCON" target="_blank">/realtradelifecycle BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/registrypersistence BTC SHORT persist snapshot</a></p>
+    <p><a style="color:#93c5fd" href="/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/tradecloseoutcome BTC SHORT evaluate closed trade</a></p>
     <p><a style="color:#93c5fd" href="/lifecyclemonitor/BTCUSDT/SHORT?bot=FALCON&setup=FALCON&commit=true" target="_blank">/lifecyclemonitor BTC SHORT commit snapshot</a></p>
     <p><a style="color:#93c5fd" href="/positioncheck/BTCUSDT/SHORT" target="_blank">/positioncheck/BTCUSDT/SHORT</a></p>
     <p><a style="color:#93c5fd" href="/executionverify/BTCUSDT/SHORT" target="_blank">/executionverify/BTCUSDT/SHORT</a></p>
