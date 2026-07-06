@@ -1,6 +1,6 @@
 # execution_engine.py
-# CENTRAL QUANT — EXECUTION ENGINE V2.5.5
-# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.5-EXECUTION-AUDIT-LOG
+# CENTRAL QUANT — EXECUTION ENGINE V2.5.6
+# Versão: 2026-07-06-EXECUTION-ENGINE-V2.5.6-EXECUTION-AUTH-TOKEN
 #
 # Objetivo:
 # - Ser o ponto único de decisão antes de qualquer execução.
@@ -58,7 +58,7 @@ else:
     BROKER_IMPORT_ERROR = None
 
 
-VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.5-EXECUTION-AUDIT-LOG"
+VERSION = "2026-07-06-EXECUTION-ENGINE-V2.5.6-EXECUTION-AUTH-TOKEN"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,6 +97,11 @@ REAL_PILOT_ALLOW_REDUCE_ONLY = os.getenv("REAL_PILOT_ALLOW_REDUCE_ONLY", "true")
 REAL_PILOT_MAX_OPEN_POSITIONS = int(os.getenv("REAL_PILOT_MAX_OPEN_POSITIONS", "1"))
 REAL_PILOT_BLOCK_IF_POSITIONS_UNKNOWN = os.getenv("REAL_PILOT_BLOCK_IF_POSITIONS_UNKNOWN", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
 REAL_PILOT_IGNORE_EXISTING_POSITIONS = os.getenv("REAL_PILOT_IGNORE_EXISTING_POSITIONS","false").strip().lower() in {"1","true","yes","sim","on"}
+
+# Token efêmero para autorizar envio real no broker.
+# Preview não precisa token; LIVE real precisa.
+EXECUTION_AUTH_TOKEN_ENABLED = os.getenv("EXECUTION_AUTH_TOKEN_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+EXECUTION_AUTH_TOKEN_TTL_SECONDS = int(os.getenv("EXECUTION_AUTH_TOKEN_TTL_SECONDS", "30"))
 
 
 def _now_br() -> str:
@@ -505,6 +510,8 @@ def execution_engine_health() -> Dict[str, Any]:
             "require_ready": REAL_PILOT_REQUIRE_READY,
             "require_entry": REAL_PILOT_REQUIRE_ENTRY,
             "require_stop": REAL_PILOT_REQUIRE_STOP,
+            "execution_auth_token_enabled": EXECUTION_AUTH_TOKEN_ENABLED,
+            "execution_auth_token_ttl_seconds": EXECUTION_AUTH_TOKEN_TTL_SECONDS,
         },
         "orchestrator_loaded": callable(orchestrate_execution),
         "orchestrator_import_error": ORCHESTRATOR_IMPORT_ERROR,
@@ -520,7 +527,7 @@ def execution_engine_health() -> Dict[str, Any]:
             "execution_audit_log": str(EXECUTION_AUDIT_LOG_FILE),
         },
         "notes": [
-            "Execution Engine V2.5.5 é o ponto único antes de qualquer executor.",
+            "Execution Engine V2.5.6 é o ponto único antes de qualquer executor.",
             "Modo OBSERVATION_ONLY cria plano e loga.",
             "Modo PAPER chama Paper Executor integrado quando habilitado.",
             "Modo LIVE chama broker.py em preview seguro quando dry_run=true e em envio real apenas se Real Pilot Guard aprovar.",
@@ -615,6 +622,30 @@ def run_execution_engine(
             )[:32]
 
             # Ordem real final. broker.py ainda bloqueia se EXECUTION_MODE/ENABLE_REAL_TRADING/BROKER_DRY_RUN não estiverem corretos.
+            execution_auth = None
+            execution_auth_token = None
+
+            # Token só é gerado para LIVE real, nunca para preview.
+            if (not dry_run) and EXECUTION_AUTH_TOKEN_ENABLED and hasattr(central_broker, "issue_execution_auth_token"):
+                try:
+                    execution_auth = central_broker.issue_execution_auth_token(
+                        context={
+                            "bot": bot,
+                            "symbol": symbol,
+                            "side": side,
+                            "margin_usdt": margin,
+                            "leverage": leverage,
+                            "risk_pct": risk_pct,
+                            "client_tag": client_tag,
+                            "source": "execution_engine",
+                            "version": VERSION,
+                        },
+                        ttl_seconds=EXECUTION_AUTH_TOKEN_TTL_SECONDS,
+                    )
+                    execution_auth_token = execution_auth.get("token")
+                except Exception as exc:
+                    execution_auth = {"ok": False, "error": str(exc)}
+
             live_result = central_broker.place_market_order(
                 symbol=symbol,
                 side=side,
@@ -624,7 +655,11 @@ def run_execution_engine(
                 leverage=leverage,
                 bot=bot,
                 risk_pct=risk_pct,
+                execution_auth_token=execution_auth_token,
             )
+
+            if execution_auth is not None and isinstance(live_result, dict):
+                live_result.setdefault("execution_auth_issued", {k: v for k, v in execution_auth.items() if k != "token"})
             result_extra_live = live_result
 
             if dry_run:
@@ -663,7 +698,7 @@ def run_execution_engine(
         "paper_executor_called": result_extra_paper is not None,
         "live_broker_called": result_extra_live is not None,
         "notes": [
-            "Execution Engine V2.5.5 recebeu o payload e delegou validação ao Orchestrator.",
+            "Execution Engine V2.5.6 recebeu o payload e delegou validação ao Orchestrator.",
             "LIVE com dry_run=true faz preview seguro; LIVE real só envia se o Real Pilot Guard e o broker aprovarem.",
             "O broker.py mantém uma segunda camada de kill switch.",
         ],

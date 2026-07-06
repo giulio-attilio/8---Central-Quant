@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6.1-PREVIEW-ISOLATION
+# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.6.2-EXECUTION-AUTH-TOKEN
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -20,6 +20,7 @@
 # - Adiciona Execution Audit Log V1 para registrar previews, bloqueios, erros e ordens reais.
 # - Adiciona Hedge Mode Support V2.6: envia positionSide=LONG/SHORT quando habilitado.
 # - V2.6.1 Preview Isolation: qualquer VERIFY/DRY_RUN retorna antes de create_order().
+# - V2.6.2 Execution Authorization Token: envio real exige token curto gerado pelo Execution Engine.
 # - Adiciona campos de apresentação para VERIFY:
 #   margin_usdt_display, leverage_display, planned_exposure_usdt_display,
 #   actual_exposure_usdt_display, estimated_margin_after_open_usdt_display,
@@ -40,6 +41,7 @@
 # ============================================================================
 
 import hashlib
+import secrets
 import hmac
 import json
 import os
@@ -89,6 +91,14 @@ BROKER_DRY_RUN = env_bool("BROKER_DRY_RUN", EXECUTION_MODE != "LIVE" or not ENAB
 # Para sua conta BingX atual, o erro 109400 indicou Hedge Mode ativo.
 BINGX_POSITION_MODE = os.environ.get("BINGX_POSITION_MODE", os.environ.get("BINGX_HEDGE_MODE", "HEDGE")).strip().upper()
 BINGX_HEDGE_MODE_ENABLED = env_bool("BINGX_HEDGE_MODE_ENABLED", BINGX_POSITION_MODE in {"HEDGE", "HEDGED", "DUAL", "TRUE", "YES", "1", "ON"})
+
+# Execution Authorization Token:
+# - Em LIVE real, o broker só chama create_order() se receber um token válido.
+# - O token é gerado pelo Execution Engine e expira rapidamente.
+# - Preview/VERIFY/DRY_RUN não exige token porque nunca chama create_order().
+EXECUTION_AUTH_TOKEN_ENABLED = env_bool("EXECUTION_AUTH_TOKEN_ENABLED", True)
+EXECUTION_AUTH_TOKEN_TTL_SECONDS = int(os.environ.get("EXECUTION_AUTH_TOKEN_TTL_SECONDS", "30"))
+_EXECUTION_AUTH_TOKENS = {}
 
 # Endpoint usado apenas para prévia/assinatura no VERIFY.
 # O envio real continua usando ccxt.create_order(), pois é mais seguro e padronizado.
@@ -362,6 +372,74 @@ def exchange():
 
 
 
+
+def _cleanup_execution_auth_tokens():
+    now = time.time()
+    expired = [token for token, data in list(_EXECUTION_AUTH_TOKENS.items()) if float(data.get("expires_at", 0)) < now]
+    for token in expired:
+        _EXECUTION_AUTH_TOKENS.pop(token, None)
+
+
+def issue_execution_auth_token(context: dict = None, ttl_seconds: int = None):
+    """
+    Gera token efêmero para autorizar UMA tentativa de envio real.
+    Chamado pelo Execution Engine imediatamente antes de chamar o broker em LIVE real.
+    """
+    _cleanup_execution_auth_tokens()
+    ttl = int(ttl_seconds or EXECUTION_AUTH_TOKEN_TTL_SECONDS)
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    _EXECUTION_AUTH_TOKENS[token] = {
+        "created_at": now,
+        "expires_at": now + max(1, ttl),
+        "used": False,
+        "context": dict(context or {}),
+    }
+    return {
+        "ok": True,
+        "token": token,
+        "expires_at": _EXECUTION_AUTH_TOKENS[token]["expires_at"],
+        "ttl_seconds": ttl,
+        "context": dict(context or {}),
+    }
+
+
+def validate_execution_auth_token(token: str, context: dict = None, consume: bool = True):
+    """
+    Valida token de autorização de execução real.
+    Em caso de sucesso, consome o token para evitar replay.
+    """
+    if not EXECUTION_AUTH_TOKEN_ENABLED:
+        return {"ok": True, "status": "AUTH_DISABLED", "reason": "EXECUTION_AUTH_TOKEN_ENABLED=false"}
+
+    _cleanup_execution_auth_tokens()
+
+    if not token:
+        return {"ok": False, "status": "MISSING_EXECUTION_AUTH_TOKEN", "reason": "execution_auth_token ausente"}
+
+    data = _EXECUTION_AUTH_TOKENS.get(str(token))
+    if not data:
+        return {"ok": False, "status": "INVALID_EXECUTION_AUTH_TOKEN", "reason": "token inexistente ou expirado"}
+
+    if data.get("used"):
+        return {"ok": False, "status": "USED_EXECUTION_AUTH_TOKEN", "reason": "token já utilizado"}
+
+    if float(data.get("expires_at", 0)) < time.time():
+        _EXECUTION_AUTH_TOKENS.pop(str(token), None)
+        return {"ok": False, "status": "EXPIRED_EXECUTION_AUTH_TOKEN", "reason": "token expirado"}
+
+    if consume:
+        data["used"] = True
+
+    return {
+        "ok": True,
+        "status": "EXECUTION_AUTH_TOKEN_OK",
+        "reason": "token válido",
+        "expires_at": data.get("expires_at"),
+        "context": data.get("context"),
+    }
+
+
 def is_real_live_send_enabled() -> bool:
     """
     Única condição autorizada para chamar create_order().
@@ -393,6 +471,9 @@ def status_payload(check_ready: bool = False):
         "execution_audit_log_file": EXECUTION_AUDIT_LOG_FILE,
         "preview_isolation_version": "2026-07-06-BROKER-V2.6.1",
         "live_send_enabled": is_real_live_send_enabled(),
+        "execution_auth_token_enabled": EXECUTION_AUTH_TOKEN_ENABLED,
+        "execution_auth_token_ttl_seconds": EXECUTION_AUTH_TOKEN_TTL_SECONDS,
+        "active_execution_auth_tokens": len(_EXECUTION_AUTH_TOKENS),
     }
     if check_ready:
         payload["ready"] = ready_check()
@@ -628,6 +709,7 @@ def build_order_preview(
     notional_usdt=None,
     risk_pct=None,
     free_balance_usdt=None,
+    execution_auth_token=None,
 ):
     """
     Monta a prévia completa de uma ordem market.
@@ -1023,7 +1105,44 @@ def place_market_order(
         })
         return result
 
-    # A partir daqui é LIVE real autorizado.
+    # A partir daqui é LIVE real autorizado pelas envs, mas ainda precisa do token efêmero.
+
+    # LIVE real autorizado pelas envs, mas ainda exige token efêmero do Execution Engine.
+    auth_payload = validate_execution_auth_token(
+        execution_auth_token,
+        context={
+            "symbol": sym,
+            "side": order_side,
+            "position_side": bingx_position_side(side),
+            "margin_usdt": margin,
+            "leverage": lev,
+            "planned_exposure": planned_exposure,
+            "client_tag": client_tag,
+        },
+        consume=True,
+    )
+    if not auth_payload.get("ok"):
+        result = {
+            "ok": False,
+            "status": "EXECUTION_AUTH_DENIED",
+            "sent": False,
+            "symbol": sym,
+            "side": order_side,
+            "position_side": bingx_position_side(side),
+            "margin_usdt": margin,
+            "leverage": lev,
+            "notional_usdt": planned_exposure,
+            "preview": preview,
+            "preview_isolation": True,
+            "live_send_enabled": live_send_enabled,
+            "auth": auth_payload,
+            "error": auth_payload.get("reason"),
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        log_execution_event({"event": "place_market_order", **result})
+        log_execution_audit_event({"event": "BROKER_EXECUTION_AUTH_DENIED", **result})
+        return result
+
     ready = ready_check(cache_seconds=0)
     if not ready.get("ok"):
         result = {
