@@ -30680,6 +30680,9 @@ def execution_dry_run_hard_kill_switch_v1_health_route():
             "/executionfinalgate/health",
             "/pilotcooldown/health",
             "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
+            "/realcloseautoevaluator/health",
+            "/realcloseautoevaluator?commit=true&ack=REAL_CLOSE_AUTO_EVALUATE",
+            "/tradecloseoutcome/health",
         ],
         "notes": [
             "Health não envia ordem real.",
@@ -34653,6 +34656,631 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
             pass
     return result
 
+
+# ==========================================================
+# REAL CLOSE AUTO EVALUATOR V1 — CLOSED REAL TRADE → OUTCOME
+# ==========================================================
+# Objetivo:
+# - Detectar trade REAL/UNKNOWN fechado e ainda sem outcome.
+# - Calcular outcome usando Trade Close Outcome Evaluator V1.
+# - Salvar outcome automaticamente quando houver dados suficientes.
+# - Não abre ordem, não fecha posição, não altera stop e não chama envio à BingX.
+REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION = "2026-07-06-REAL-CLOSE-AUTO-EVALUATOR-V1"
+REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE = CENTRAL_DATA_DIR / "real_close_auto_evaluator_v1_state.json"
+REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_close_auto_evaluator_v1_events.jsonl"
+REAL_CLOSE_AUTO_EVALUATOR_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_close_auto_evaluator_v1_latest.json"
+
+try:
+    _ORIGINAL_REAL_POSITION_WATCHDOG_ASSESS_FOR_REAL_CLOSE_AUTO_EVALUATOR_V1 = real_position_watchdog_v1_assess
+except Exception:
+    _ORIGINAL_REAL_POSITION_WATCHDOG_ASSESS_FOR_REAL_CLOSE_AUTO_EVALUATOR_V1 = None
+
+
+def _rcae_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return None
+
+
+def _rcae_v1_epoch():
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _rcae_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "ok", "ready", "enabled", "active", "commit", "save"}
+
+
+def _rcae_v1_env(names, default=None):
+    for name in names:
+        try:
+            value = os.environ.get(name)
+            if value is not None and str(value).strip() != "":
+                return value, name
+        except Exception:
+            continue
+    return default, None
+
+
+def _rcae_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return default
+
+
+def _rcae_v1_load_json(path, default=None):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return default if default is not None else {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else (default if default is not None else {})
+    except Exception:
+        return default if default is not None else {}
+
+
+def _rcae_v1_write_json(path, payload):
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        tmp.replace(p)
+        return True
+    except Exception:
+        return False
+
+
+def _rcae_v1_sanitize_public(obj):
+    sensitive = {"token", "api_secret", "secret", "authorization", "execution_auth", "execution_auth_token", "auth_token", "x_execution_auth_token"}
+    try:
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if any(s in lk for s in sensitive):
+                    out[k] = "***MASKED***" if v else v
+                else:
+                    out[k] = _rcae_v1_sanitize_public(v)
+            return out
+        if isinstance(obj, list):
+            return [_rcae_v1_sanitize_public(v) for v in obj]
+        return obj
+    except Exception:
+        return obj
+
+
+def _rcae_v1_append_event(event):
+    try:
+        event = event if isinstance(event, dict) else {"raw": str(event)}
+        event.setdefault("module", "real_close_auto_evaluator_v1")
+        event.setdefault("version", REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION)
+        event.setdefault("generated_at", _rcae_v1_now())
+        event.setdefault("ts_epoch", _rcae_v1_epoch())
+        event = _rcae_v1_sanitize_public(event)
+        REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_LATEST_FILE, event)
+        return True
+    except Exception:
+        return False
+
+
+def _rcae_v1_read_events(limit=20):
+    try:
+        limit = max(1, min(int(limit), 200))
+    except Exception:
+        limit = 20
+    rows = []
+    try:
+        if REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.exists():
+            lines = REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+            for line in lines[-limit:]:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    rows.append({"raw": line})
+    except Exception:
+        pass
+    return {"ok": True, "count": len(rows), "events": rows}
+
+
+def _rcae_v1_config():
+    enabled_raw, enabled_source = _rcae_v1_env([
+        "REAL_CLOSE_AUTO_EVALUATOR_ENABLED",
+        "CENTRAL_REAL_CLOSE_AUTO_EVALUATOR_ENABLED",
+        "REAL_PILOT_CLOSE_AUTO_EVALUATOR_ENABLED",
+    ], "true")
+    auto_commit_raw, auto_commit_source = _rcae_v1_env([
+        "REAL_CLOSE_AUTO_EVALUATOR_AUTO_COMMIT",
+        "CENTRAL_REAL_CLOSE_AUTO_EVALUATOR_AUTO_COMMIT",
+    ], "true")
+    commit_incomplete_raw, commit_incomplete_source = _rcae_v1_env([
+        "REAL_CLOSE_AUTO_EVALUATOR_COMMIT_INCOMPLETE",
+        "CENTRAL_REAL_CLOSE_AUTO_EVALUATOR_COMMIT_INCOMPLETE",
+    ], "false")
+    release_cooldown_raw, release_cooldown_source = _rcae_v1_env([
+        "REAL_CLOSE_AUTO_EVALUATOR_RELEASE_COOLDOWN_ON_OUTCOME",
+        "CENTRAL_REAL_CLOSE_AUTO_EVALUATOR_RELEASE_COOLDOWN_ON_OUTCOME",
+    ], "false")
+    modes_raw, modes_source = _rcae_v1_env([
+        "REAL_CLOSE_AUTO_EVALUATOR_MODES",
+        "CENTRAL_REAL_CLOSE_AUTO_EVALUATOR_MODES",
+    ], "REAL,UNKNOWN")
+    modes = []
+    try:
+        modes = [str(x).upper().strip() for x in str(modes_raw or "REAL,UNKNOWN").split(",") if str(x).strip()]
+    except Exception:
+        modes = ["REAL", "UNKNOWN"]
+    return {
+        "enabled": _rcae_v1_bool(enabled_raw, True),
+        "enabled_source": enabled_source,
+        "auto_commit": _rcae_v1_bool(auto_commit_raw, True),
+        "auto_commit_source": auto_commit_source,
+        "commit_incomplete": _rcae_v1_bool(commit_incomplete_raw, False),
+        "commit_incomplete_source": commit_incomplete_source,
+        "release_cooldown_on_outcome": _rcae_v1_bool(release_cooldown_raw, False),
+        "release_cooldown_on_outcome_source": release_cooldown_source,
+        "evaluate_modes": modes,
+        "evaluate_modes_source": modes_source,
+        "state_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE),
+        "events_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE),
+        "latest_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_LATEST_FILE),
+        "token_value_exposed": False,
+    }
+
+
+def _rcae_v1_norm_symbol(value):
+    try:
+        return _tco_v1_norm_symbol(value)
+    except Exception:
+        return str(value or "").upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _rcae_v1_norm_side(value):
+    try:
+        return _tco_v1_norm_side(value)
+    except Exception:
+        s = str(value or "").upper().strip()
+        if s in {"SELL", "SHORT"}:
+            return "SHORT"
+        if s in {"BUY", "LONG"}:
+            return "LONG"
+        return s
+
+
+def _rcae_v1_norm_bot(value):
+    try:
+        return _tco_v1_norm_bot(value)
+    except Exception:
+        return str(value or "FALCON").upper().strip()
+
+
+def _rcae_v1_trade_meta(trade):
+    try:
+        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+        return meta if isinstance(meta, dict) else {}
+    except Exception:
+        return {}
+
+
+def _rcae_v1_is_evaluated(trade):
+    if not isinstance(trade, dict):
+        return False
+    meta = _rcae_v1_trade_meta(trade)
+    outcome = meta.get("outcome") if isinstance(meta.get("outcome"), dict) else {}
+    return bool(
+        trade.get("outcome_evaluated")
+        or meta.get("outcome_evaluated")
+        or str(trade.get("outcome_status") or "").upper() == "OUTCOME_EVALUATED"
+        or str(outcome.get("status") or "").upper() == "OUTCOME_EVALUATED"
+    )
+
+
+def _rcae_v1_trade_mode(trade, key=None):
+    try:
+        if callable(globals().get("registry_mode_segregation_v1_classify_trade")):
+            cls = registry_mode_segregation_v1_classify_trade(trade, key=key)
+            if isinstance(cls, dict):
+                return str(cls.get("mode") or "UNKNOWN").upper(), cls
+    except Exception as exc:
+        return "UNKNOWN", {"ok": False, "error": str(exc)}
+    return "UNKNOWN", {"mode": "UNKNOWN", "source": "fallback"}
+
+
+def _rcae_v1_load_closed_items():
+    if not callable(globals().get("_tco_v1_load_registry")) or not callable(globals().get("_tco_v1_closed_items")):
+        return None, [], "TRADE_CLOSE_OUTCOME_HELPERS_UNAVAILABLE"
+    registry = _tco_v1_load_registry()
+    if registry is None:
+        return None, [], "TRADE_REGISTRY_UNAVAILABLE"
+    closed_obj, items = _tco_v1_closed_items(registry)
+    return registry, items, "OK"
+
+
+def _rcae_v1_candidate_matches(trade, payload=None, key=None):
+    payload = payload if isinstance(payload, dict) else {}
+    if not isinstance(trade, dict):
+        return False
+    trade_id = str(payload.get("trade_id") or payload.get("trade_key") or "").strip()
+    if trade_id:
+        return str(trade.get("trade_id") or key or "") == trade_id or str(key or "") == trade_id
+    symbol = _rcae_v1_norm_symbol(payload.get("symbol")) if payload.get("symbol") else None
+    side = _rcae_v1_norm_side(payload.get("side")) if payload.get("side") else None
+    bot = _rcae_v1_norm_bot(payload.get("bot")) if payload.get("bot") else None
+    setup = str(payload.get("setup") or "").upper().strip() if payload.get("setup") else None
+    if symbol and _rcae_v1_norm_symbol(trade.get("symbol") or trade.get("symbol_clean") or trade.get("pair")) != symbol:
+        return False
+    if side and _rcae_v1_norm_side(trade.get("side") or trade.get("direction")) != side:
+        return False
+    if bot:
+        tbot = _rcae_v1_norm_bot(trade.get("bot") or "")
+        if tbot and tbot != bot:
+            return False
+    if setup:
+        tsetup = str(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label") or "").upper().strip()
+        if tsetup and tsetup != setup:
+            return False
+    return True
+
+
+def _rcae_v1_find_candidates(payload=None):
+    config = _rcae_v1_config()
+    registry, items, status = _rcae_v1_load_closed_items()
+    if registry is None:
+        return {"ok": False, "status": status, "candidates": [], "error": status}
+    candidates = []
+    ignored = []
+    evaluated_count = 0
+    for key, trade in items:
+        if not isinstance(trade, dict):
+            continue
+        mode, mode_payload = _rcae_v1_trade_mode(trade, key=key)
+        is_eval = _rcae_v1_is_evaluated(trade)
+        row = {
+            "key": key,
+            "trade_id": trade.get("trade_id") or key,
+            "symbol": _rcae_v1_norm_symbol(trade.get("symbol") or trade.get("symbol_clean") or trade.get("pair")),
+            "side": _rcae_v1_norm_side(trade.get("side") or trade.get("direction")),
+            "bot": _rcae_v1_norm_bot(trade.get("bot") or ""),
+            "setup": str(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label") or "").upper().strip(),
+            "closed_at": trade.get("closed_at") or trade.get("last_update"),
+            "registry_mode": mode,
+            "outcome_evaluated": is_eval,
+            "mode_payload": mode_payload,
+            "trade": trade,
+        }
+        if is_eval:
+            evaluated_count += 1
+            continue
+        if mode not in set(config.get("evaluate_modes") or ["REAL", "UNKNOWN"]):
+            ignored.append(dict(row, ignore_reason="MODE_NOT_ENABLED_FOR_AUTO_EVALUATION"))
+            continue
+        if not _rcae_v1_candidate_matches(trade, payload=payload, key=key):
+            ignored.append(dict(row, ignore_reason="FILTER_NOT_MATCHED"))
+            continue
+        candidates.append(row)
+    return {
+        "ok": True,
+        "status": "REAL_CLOSE_CANDIDATES_READY",
+        "closed_count": len(items),
+        "evaluated_count": evaluated_count,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "ignored_count": len(ignored),
+        "ignored": ignored[:20],
+    }
+
+
+def _rcae_v1_candidate_public(row):
+    if not isinstance(row, dict):
+        return {}
+    return _rcae_v1_sanitize_public({k: v for k, v in row.items() if k not in {"trade", "mode_payload"}})
+
+
+def _rcae_v1_payload_snapshot(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    return _rcae_v1_sanitize_public({
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "bot": payload.get("bot"),
+        "setup": payload.get("setup"),
+        "trade_id": payload.get("trade_id") or payload.get("trade_key"),
+        "exit_price": payload.get("exit_price") or payload.get("exit") or payload.get("close_price"),
+        "realized_pnl": payload.get("realized_pnl") or payload.get("pnl") or payload.get("pnl_usdt"),
+        "fee": payload.get("fee") or payload.get("fees"),
+        "close_reason": payload.get("close_reason") or payload.get("reason"),
+    })
+
+
+def _rcae_v1_outcome_has_sufficient_quality(outcome):
+    if not isinstance(outcome, dict) or not outcome.get("ok"):
+        return False
+    status = str(outcome.get("status") or "").upper()
+    quality = str(outcome.get("data_quality") or "").upper()
+    if status == "OUTCOME_EVALUATED" and quality in {"HIGH_REAL", "MEDIUM_ESTIMATED", "REAL_OR_REGISTRY"}:
+        return True
+    if status == "OUTCOME_EVALUATED" and outcome.get("exit_price") is not None:
+        return True
+    return False
+
+
+def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, force=False):
+    payload = payload if isinstance(payload, dict) else {}
+    config = _rcae_v1_config()
+    commit_requested = config.get("auto_commit") if commit is None else bool(commit)
+    event_base = {
+        "ok": True,
+        "module": "real_close_auto_evaluator_v1",
+        "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+        "generated_at": _rcae_v1_now(),
+        "source": source,
+        "config": config,
+        "payload_snapshot": _rcae_v1_payload_snapshot(payload),
+        "token_value_exposed": False,
+    }
+    if not config.get("enabled"):
+        result = dict(event_base, status="REAL_CLOSE_AUTO_EVALUATOR_DISABLED", allowed=True, committed=False)
+        _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE, result)
+        _rcae_v1_append_event(result)
+        return _rcae_v1_sanitize_public(result)
+    if not callable(globals().get("trade_close_outcome_v1_build")):
+        result = dict(event_base, ok=False, status="TRADE_CLOSE_OUTCOME_V1_UNAVAILABLE", committed=False)
+        _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE, result)
+        _rcae_v1_append_event(result)
+        return _rcae_v1_sanitize_public(result)
+
+    candidates_payload = _rcae_v1_find_candidates(payload=payload)
+    if not candidates_payload.get("ok"):
+        result = dict(event_base, ok=False, status=candidates_payload.get("status") or "CANDIDATE_SCAN_ERROR", committed=False, candidate_scan=candidates_payload)
+        _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE, result)
+        _rcae_v1_append_event(result)
+        return _rcae_v1_sanitize_public(result)
+
+    candidates = candidates_payload.get("candidates") or []
+    if not candidates:
+        gate = None
+        try:
+            gate = trade_close_outcome_v1_gate_check() if callable(globals().get("trade_close_outcome_v1_gate_check")) else None
+        except Exception as exc:
+            gate = {"ok": False, "error": str(exc)}
+        result = dict(event_base, status="NO_REAL_CLOSED_TRADE_PENDING_OUTCOME", committed=False, candidate_count=0, candidate_scan={k: v for k, v in candidates_payload.items() if k != "candidates"}, trade_close_outcome_gate=gate)
+        _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE, result)
+        _rcae_v1_append_event(result)
+        return _rcae_v1_sanitize_public(result)
+
+    selected = candidates[-1]
+    trade = selected.get("trade") or {}
+    explicit_exit = payload.get("exit_price") or payload.get("exit") or payload.get("close_price")
+    explicit_pnl = payload.get("realized_pnl") or payload.get("pnl") or payload.get("pnl_usdt")
+    fee = payload.get("fee") or payload.get("fees")
+    close_reason = payload.get("close_reason") or payload.get("reason") or payload.get("close_reason_evaluated")
+    build_kwargs = {
+        "symbol": selected.get("symbol") or trade.get("symbol"),
+        "side": selected.get("side") or trade.get("side"),
+        "bot": selected.get("bot") or trade.get("bot") or "FALCON",
+        "setup": selected.get("setup") or trade.get("setup") or selected.get("bot") or "FALCON",
+        "trade_id": selected.get("trade_id") or selected.get("key"),
+        "exit_price": explicit_exit,
+        "realized_pnl": explicit_pnl,
+        "fee": fee,
+        "close_reason": close_reason,
+        "commit": False,
+    }
+    preview = trade_close_outcome_v1_build(**build_kwargs)
+    quality_ok = _rcae_v1_outcome_has_sufficient_quality(preview)
+    commit_allowed = bool(commit_requested and (quality_ok or config.get("commit_incomplete") or force))
+    outcome = preview
+    if commit_allowed:
+        build_kwargs["commit"] = True
+        outcome = trade_close_outcome_v1_build(**build_kwargs)
+
+    committed = bool(isinstance(outcome, dict) and isinstance(outcome.get("commit"), dict) and outcome.get("commit", {}).get("committed"))
+    status = "OUTCOME_AUTO_EVALUATED_AND_SAVED" if committed else ("OUTCOME_EVALUATED_NOT_COMMITTED" if quality_ok else "OUTCOME_INCOMPLETE_NOT_COMMITTED")
+    cooldown_release = None
+    if committed and config.get("release_cooldown_on_outcome") and callable(globals().get("pilot_cooldown_v1_release")):
+        try:
+            cooldown_release = pilot_cooldown_v1_release(reason="OUTCOME_EVALUATED", payload=payload)
+        except Exception as exc:
+            cooldown_release = {"ok": False, "status": "COOLDOWN_RELEASE_ERROR", "error": str(exc)}
+
+    result = dict(event_base)
+    result.update({
+        "status": status,
+        "committed": committed,
+        "commit_requested": commit_requested,
+        "commit_allowed": commit_allowed,
+        "quality_ok": quality_ok,
+        "candidate_count": len(candidates),
+        "selected_candidate": _rcae_v1_candidate_public(selected),
+        "outcome_summary": _rcae_v1_sanitize_public({
+            "ok": outcome.get("ok") if isinstance(outcome, dict) else None,
+            "status": outcome.get("status") if isinstance(outcome, dict) else None,
+            "data_quality": outcome.get("data_quality") if isinstance(outcome, dict) else None,
+            "trade_id": outcome.get("trade_id") if isinstance(outcome, dict) else None,
+            "symbol": outcome.get("symbol") if isinstance(outcome, dict) else None,
+            "side": outcome.get("side") if isinstance(outcome, dict) else None,
+            "bot": outcome.get("bot") if isinstance(outcome, dict) else None,
+            "setup": outcome.get("setup") if isinstance(outcome, dict) else None,
+            "entry": outcome.get("entry") if isinstance(outcome, dict) else None,
+            "exit_price": outcome.get("exit_price") if isinstance(outcome, dict) else None,
+            "net_pnl": outcome.get("net_pnl") if isinstance(outcome, dict) else None,
+            "pnl_pct": outcome.get("pnl_pct") if isinstance(outcome, dict) else None,
+            "r_multiple": outcome.get("r_multiple") if isinstance(outcome, dict) else None,
+            "tp50_hit": ((outcome.get("tp50_result") or {}).get("hit") if isinstance(outcome.get("tp50_result"), dict) else outcome.get("tp50_hit")) if isinstance(outcome, dict) else None,
+            "close_reason": outcome.get("close_reason") if isinstance(outcome, dict) else None,
+            "commit": outcome.get("commit") if isinstance(outcome, dict) else None,
+        }),
+        "outcome": outcome,
+        "cooldown_release": cooldown_release,
+        "notes": [
+            "Real Close Auto Evaluator V1 não abre, fecha ou altera ordens.",
+            "Ele usa o Registry e o Trade Close Outcome Evaluator V1 para calcular e salvar outcome de CLOSED REAL/UNKNOWN.",
+            "Outcome incompleto não é salvo automaticamente por padrão; envie exit_price/realized_pnl ou confira a BingX se necessário.",
+        ],
+    })
+    _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE, result)
+    _rcae_v1_append_event(result)
+    return _rcae_v1_sanitize_public(result)
+
+
+def real_close_auto_evaluator_v1_health_payload():
+    config = _rcae_v1_config()
+    scan = _rcae_v1_find_candidates(payload={})
+    latest = _rcae_v1_load_json(REAL_CLOSE_AUTO_EVALUATOR_V1_LATEST_FILE, default={})
+    gate = None
+    try:
+        gate = trade_close_outcome_v1_gate_check() if callable(globals().get("trade_close_outcome_v1_gate_check")) else None
+    except Exception as exc:
+        gate = {"ok": False, "error": str(exc)}
+    ok = bool(config.get("enabled") and callable(globals().get("trade_close_outcome_v1_build")) and scan.get("ok"))
+    return _rcae_v1_sanitize_public({
+        "ok": ok,
+        "module": "real_close_auto_evaluator_v1",
+        "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+        "generated_at": _rcae_v1_now(),
+        "status": "REAL_CLOSE_AUTO_EVALUATOR_READY" if ok else "REAL_CLOSE_AUTO_EVALUATOR_NOT_READY",
+        "config": config,
+        "candidate_count": scan.get("candidate_count") if isinstance(scan, dict) else None,
+        "closed_count": scan.get("closed_count") if isinstance(scan, dict) else None,
+        "evaluated_count": scan.get("evaluated_count") if isinstance(scan, dict) else None,
+        "ignored_count": scan.get("ignored_count") if isinstance(scan, dict) else None,
+        "candidates": [_rcae_v1_candidate_public(x) for x in (scan.get("candidates") or [])[:10]] if isinstance(scan, dict) else [],
+        "trade_close_outcome_gate": gate,
+        "latest_summary": {
+            "status": latest.get("status") if isinstance(latest, dict) else None,
+            "committed": latest.get("committed") if isinstance(latest, dict) else None,
+            "outcome_summary": latest.get("outcome_summary") if isinstance(latest, dict) else None,
+        },
+        "watchdog_wrapped": callable(_ORIGINAL_REAL_POSITION_WATCHDOG_ASSESS_FOR_REAL_CLOSE_AUTO_EVALUATOR_V1),
+        "events_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE),
+        "latest_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_LATEST_FILE),
+        "state_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE),
+        "routes": [
+            "/realcloseautoevaluator/health",
+            "/realcloseautoevaluator",
+            "/realcloseautoevaluator?commit=true&ack=REAL_CLOSE_AUTO_EVALUATE",
+            "/realcloseautoevaluator/log",
+            "/tradecloseoutcome/health",
+            "/realpilotdashboard",
+        ],
+        "notes": [
+            "Health é read-only e não salva outcome.",
+            "A avaliação automática roda quando o Watchdog detectar fechamento ou quando existir CLOSED REAL/UNKNOWN pendente.",
+            "commit=true pela rota exige ack=REAL_CLOSE_AUTO_EVALUATE.",
+        ],
+        "token_value_exposed": False,
+    })
+
+
+@app.route("/realcloseautoevaluator/health", methods=["GET"])
+@app.route("/real/closeautoevaluator/health", methods=["GET"])
+@app.route("/realcloseauto/health", methods=["GET"])
+def real_close_auto_evaluator_v1_health_route():
+    return real_close_auto_evaluator_v1_health_payload(), 200
+
+
+@app.route("/realcloseautoevaluator", methods=["GET", "POST"])
+@app.route("/real/closeautoevaluator", methods=["GET", "POST"])
+@app.route("/realcloseauto", methods=["GET", "POST"])
+def real_close_auto_evaluator_v1_route():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
+    commit_requested = _rcae_v1_bool(request.args.get("commit") or payload.get("commit") or request.args.get("save") or payload.get("save"), False)
+    ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
+    if commit_requested and ack != "REAL_CLOSE_AUTO_EVALUATE":
+        return {
+            "ok": False,
+            "status": "ACK_REQUIRED",
+            "required_ack": "REAL_CLOSE_AUTO_EVALUATE",
+            "note": "commit=true salva outcome no Registry; use apenas depois de conferir Dashboard/Watchdog/BingX.",
+            "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+            "token_value_exposed": False,
+        }, 400
+    force = _rcae_v1_bool(request.args.get("force") or payload.get("force"), False)
+    result = real_close_auto_evaluator_v1_run(payload=payload, source="route", commit=commit_requested if commit_requested else None, force=force)
+    return result, 200
+
+
+@app.route("/realcloseautoevaluator/log", methods=["GET"])
+@app.route("/real/closeautoevaluator/log", methods=["GET"])
+@app.route("/realcloseauto/log", methods=["GET"])
+def real_close_auto_evaluator_v1_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    payload = _rcae_v1_read_events(limit=limit)
+    payload.update({
+        "module": "real_close_auto_evaluator_v1",
+        "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+        "generated_at": _rcae_v1_now(),
+        "events_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_EVENTS_FILE),
+        "latest_file": str(REAL_CLOSE_AUTO_EVALUATOR_V1_LATEST_FILE),
+        "token_value_exposed": False,
+    })
+    return _rcae_v1_sanitize_public(payload), 200
+
+
+# Wrapper: quando o Watchdog perceber fechamento ou existir CLOSED REAL/UNKNOWN pendente,
+# o Auto Evaluator tenta gerar outcome sem tocar em ordens na BingX.
+def real_position_watchdog_v1_assess(*args, **kwargs):
+    original = _ORIGINAL_REAL_POSITION_WATCHDOG_ASSESS_FOR_REAL_CLOSE_AUTO_EVALUATOR_V1
+    if not callable(original):
+        return {
+            "ok": False,
+            "status": "REAL_POSITION_WATCHDOG_ORIGINAL_MISSING_FOR_AUTO_EVALUATOR",
+            "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+            "token_value_exposed": False,
+        }
+    result = original(*args, **kwargs)
+    try:
+        source = str(kwargs.get("source") or "watchdog")
+        payload = kwargs.get("payload")
+        if payload is None and args:
+            payload = args[0] if isinstance(args[0], dict) else {}
+        config = _rcae_v1_config()
+        pending_count = 0
+        try:
+            scan = _rcae_v1_find_candidates(payload={})
+            pending_count = int(scan.get("candidate_count") or 0) if isinstance(scan, dict) else 0
+        except Exception:
+            pending_count = 0
+        should_try = bool(config.get("enabled") and source.lower() not in {"health"} and (pending_count > 0 or (isinstance(result, dict) and result.get("closed_detected"))))
+        if should_try and isinstance(result, dict):
+            auto = real_close_auto_evaluator_v1_run(payload=payload if isinstance(payload, dict) else {}, source="watchdog:" + source, commit=config.get("auto_commit"), force=False)
+            result["real_close_auto_evaluator_v1"] = auto
+    except Exception as exc:
+        try:
+            if isinstance(result, dict):
+                result["real_close_auto_evaluator_v1"] = {
+                    "ok": False,
+                    "status": "REAL_CLOSE_AUTO_EVALUATOR_ATTACH_ERROR",
+                    "error": str(exc),
+                    "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+                    "token_value_exposed": False,
+                }
+        except Exception:
+            pass
+    return result
+
+
 # ==========================================================
 # REAL PILOT DASHBOARD V1 — ONE-PAGE READ-ONLY PILOT STATUS
 # ==========================================================
@@ -34909,6 +35537,11 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
         lambda: pilot_cooldown_v1_health_payload(),
         default={"ok": False, "status": "PILOT_COOLDOWN_UNAVAILABLE"},
     ) if callable(globals().get("pilot_cooldown_v1_health_payload")) else {"ok": False, "status": "PILOT_COOLDOWN_UNAVAILABLE"}
+    real_close_auto = _rpd_v1_safe_call(
+        "REAL_CLOSE_AUTO_EVALUATOR",
+        lambda: real_close_auto_evaluator_v1_health_payload(),
+        default={"ok": False, "status": "REAL_CLOSE_AUTO_EVALUATOR_UNAVAILABLE"},
+    ) if callable(globals().get("real_close_auto_evaluator_v1_health_payload")) else {"ok": False, "status": "REAL_CLOSE_AUTO_EVALUATOR_UNAVAILABLE"}
 
     guard_config = (guard or {}).get("config") if isinstance(guard, dict) else {}
     guard_trade = (guard or {}).get("trade") if isinstance(guard, dict) else {}
@@ -34926,6 +35559,8 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
     registry_ready = bool((registry_mode or {}).get("ok") and unknown_open_count == 0)
     cooldown_active = bool((cooldown or {}).get("active")) if isinstance(cooldown, dict) else False
     cooldown_ready = bool((cooldown or {}).get("ok")) if isinstance(cooldown, dict) else False
+    real_close_auto_ready = bool((real_close_auto or {}).get("ok")) if isinstance(real_close_auto, dict) else False
+    real_close_candidate_count = int((real_close_auto or {}).get("candidate_count") or 0) if isinstance(real_close_auto, dict) else 0
 
     blocking = []
     warnings = []
@@ -34945,6 +35580,8 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
         blocking.append("UNKNOWN_OPEN_POSITION_BLOCKS_REAL_EXECUTION")
     if not cooldown_ready:
         warnings.append("PILOT_COOLDOWN_NOT_READY")
+    if not real_close_auto_ready:
+        warnings.append("REAL_CLOSE_AUTO_EVALUATOR_NOT_READY")
 
     if requires_attention:
         overall_status = "ATTENTION_REQUIRED"
@@ -35003,6 +35640,13 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "remaining_minutes": (cooldown or {}).get("remaining_minutes") if isinstance(cooldown, dict) else None,
             "expires_at": (cooldown or {}).get("expires_at") if isinstance(cooldown, dict) else None,
         },
+        "outcome_auto_evaluator": {
+            "status": (real_close_auto or {}).get("status") if isinstance(real_close_auto, dict) else None,
+            "candidate_count": real_close_candidate_count,
+            "closed_count": (real_close_auto or {}).get("closed_count") if isinstance(real_close_auto, dict) else None,
+            "evaluated_count": (real_close_auto or {}).get("evaluated_count") if isinstance(real_close_auto, dict) else None,
+            "latest_summary": (real_close_auto or {}).get("latest_summary") if isinstance(real_close_auto, dict) else None,
+        },
         "components": {
             "auto_real_bridge": _rpd_v1_component_summary("Auto Real Execution Bridge", bridge),
             "execution_final_gate": _rpd_v1_component_summary("Execution Final Gate", final_gate),
@@ -35012,6 +35656,7 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "registry_mode": _rpd_v1_component_summary("Registry Mode Segregation", registry_mode),
             "registry_persistence": _rpd_v1_component_summary("Registry Persistence", registry_persistence),
             "pilot_cooldown": _rpd_v1_component_summary("Pilot Cooldown", cooldown),
+            "real_close_auto_evaluator": _rpd_v1_component_summary("Real Close Auto Evaluator", real_close_auto),
         },
         "latest": _rpd_v1_latest_events(limit=5),
         "details": {
@@ -35023,6 +35668,7 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "registry_mode": registry_mode,
             "registry_persistence": registry_persistence,
             "pilot_cooldown": cooldown,
+            "real_close_auto_evaluator": real_close_auto,
         } if deep else None,
         "routes": [
             "/realpilotdashboard",
@@ -35036,11 +35682,15 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "/executionfinalgate/health",
             "/pilotcooldown/health",
             "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
+            "/realcloseautoevaluator/health",
+            "/realcloseautoevaluator?commit=true&ack=REAL_CLOSE_AUTO_EVALUATE",
+            "/tradecloseoutcome/health",
         ],
         "notes": [
             "Dashboard V1 é read-only: não abre ordem, não fecha posição, não altera stop e não envia Telegram.",
             "ok=true significa que o piloto está pronto para aguardar sinal elegível; não significa que já existe trade aberto.",
             "A execução real automática continua limitada ao FALCON em BTCUSDT/ETHUSDT com Real Pilot Guard, Final Gate, deduplicação e Pilot Cooldown.",
+            "Real Close Auto Evaluator V1 fecha o ciclo pós-trade: detecta CLOSED REAL/UNKNOWN pendente e tenta salvar outcome sem tocar em ordens.",
         ],
         "token_value_exposed": False,
     }
@@ -35052,6 +35702,7 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
         "warnings": dashboard.get("warnings"),
         "positions": dashboard.get("positions"),
         "cooldown": dashboard.get("cooldown"),
+        "outcome_auto_evaluator": dashboard.get("outcome_auto_evaluator"),
         "pilot": dashboard.get("pilot"),
         "next_action": dashboard.get("next_action"),
         "source": source,
@@ -35102,3 +35753,4 @@ start_central_runtime_once()
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
+s
