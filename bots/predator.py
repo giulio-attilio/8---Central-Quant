@@ -1,6 +1,6 @@
 # Ajuste Central Quant: startup guard padronizado em 0 por padrão; arquitetura alinhada em PREDATOR.
 # SMART PREDATOR - SMC H1
-# Versão: 2026-06-27-SMART-PREDATOR-V6-H4-CONTEXT-BLOCK
+# Versão: 2026-07-07-SMART-PREDATOR-V6.1-AUTO-BROKER-PREVIEW-FIREWALL
 #
 # Stand-by para Central Quant:
 # - Estrutura padronizada como Donkey/Cobra/Meme.
@@ -69,7 +69,7 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 BOT_NAME = os.environ.get("BOT_NAME", "Smart Predator")
 SERVICE_MODE = "SMART_PREDATOR"
-BOT_VERSION = "2026-06-27-SMART-PREDATOR-V6-H4-CONTEXT-BLOCK"
+BOT_VERSION = "2026-07-07-SMART-PREDATOR-V6.1-AUTO-BROKER-PREVIEW-FIREWALL"
 
 # Padrão Central Quant: este bot não usa startup guard para sinais.
 # Mantido explícito para padronização de /health e evitar bloqueios após deploy.
@@ -136,6 +136,22 @@ PREDATOR_REAL_NOTIONAL_USDT = PREDATOR_REAL_MARGIN_USDT * PREDATOR_REAL_LEVERAGE
 PREDATOR_MAX_REAL_POSITIONS = int(os.environ.get("PREDATOR_MAX_REAL_POSITIONS", "1"))
 PREDATOR_REQUIRE_CENTRAL_RISK = env_bool("PREDATOR_REQUIRE_CENTRAL_RISK", True)
 PREDATOR_EXECUTION_NOTIFY = env_bool("PREDATOR_EXECUTION_NOTIFY", True)
+
+# ====================================================
+# AUTOMATIC BROKER PREVIEW FIREWALL V1
+# ====================================================
+# Objetivo:
+# - Permitir que o Predator gere sinais e alimente a Central.
+# - Bloquear chamadas automáticas ao broker em VERIFY/LIVE quando a origem é robô/scanner.
+# - Evitar ruído BROKER_PREVIEW_ISOLATED / DRY_RUN no /live causado por sinais automáticos.
+# - Preview de broker fica reservado para rotas manuais/console/testes explícitos.
+PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED = env_bool("PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED", True)
+PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW = env_bool("PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW", False)
+PREDATOR_AUTO_BROKER_READY_CHECK_ENABLED = env_bool("PREDATOR_AUTO_BROKER_READY_CHECK_ENABLED", False)
+PREDATOR_NOTIFY_AUTO_BROKER_PREVIEW_BLOCKED = env_bool("PREDATOR_NOTIFY_AUTO_BROKER_PREVIEW_BLOCKED", False)
+PREDATOR_EXECUTION_FIREWALL_LOG_KEY = "smartpredator:execution_firewall_events"
+PREDATOR_EXECUTION_FIREWALL_MAX_EVENTS = int(os.environ.get("PREDATOR_EXECUTION_FIREWALL_MAX_EVENTS", "200"))
+
 CENTRAL_BASE_URL = os.environ.get("CENTRAL_BASE_URL", f"http://127.0.0.1:{os.environ.get('PORT', '10000')}").rstrip("/")
 
 SCANNER_SLEEP_SECONDS = int(os.environ.get("PREDATOR_SCANNER_SLEEP_SECONDS", os.environ.get("SCANNER_SLEEP_SECONDS", "60")))
@@ -217,7 +233,13 @@ HEALTH = {
     "execution_last_run": None,
     "broker_import_error": BROKER_IMPORT_ERROR,
     "trade_registry_loaded": TRADE_REGISTRY_LOADED,
-    "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR
+    "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
+    "execution_firewall_enabled": PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED,
+    "execution_firewall_last_status": None,
+    "execution_firewall_last_origin": None,
+    "execution_firewall_last_symbol": None,
+    "execution_firewall_last_side": None,
+    "execution_firewall_last_at": None
 }
 
 DEFAULT_FUNNEL_STATS = {
@@ -1792,7 +1814,9 @@ def build_predator_execution_message(sig, risk, broker_result=None, ready=None, 
     status = broker_result.get("status")
     sent = broker_result.get("sent")
 
-    if not allowed:
+    if status == "AUTO_BROKER_PREVIEW_BLOCKED":
+        result_txt = "🧱 FIREWALL: preview automático do broker bloqueado antes da BingX."
+    elif not allowed:
         result_txt = "🚫 ORDEM BLOQUEADA PELO RISK MANAGER"
     elif mode == "VERIFY":
         result_txt = "🚫 VERIFY: ordem NÃO enviada."
@@ -1909,28 +1933,214 @@ def update_position_execution_fields(sig, risk, broker_result):
         print("ERRO update_position_execution_fields:", exc)
 
 
-def execute_predator_signal_safe(sig, risk_prechecked=None, local_gate_prechecked=None):
-    """Executa a camada VERIFY/LIVE do Smart Predator no padrão Falcon.
 
-    Quando o scanner já consultou o Risk Manager antes do registro, reutiliza
-    essa decisão para evitar dupla consulta e manter auditoria consistente.
+def _predator_origin_type(origin_type=None):
+    """Normaliza a origem da tentativa de execução/preview."""
+    origin = str(origin_type or "BOT_AUTOMATIC").upper().strip()
+    aliases = {
+        "BOT": "BOT_AUTOMATIC",
+        "SCANNER": "BOT_AUTOMATIC",
+        "AUTO": "BOT_AUTOMATIC",
+        "AUTOMATIC": "BOT_AUTOMATIC",
+        "BACKGROUND": "BACKGROUND_JOB",
+        "MANUAL": "MANUAL",
+        "CONSOLE": "EXECUTION_CONSOLE",
+        "EXECUTIONCONSOLE": "EXECUTION_CONSOLE",
+    }
+    return aliases.get(origin, origin or "UNKNOWN")
+
+
+def _predator_origin_is_automatic(origin_type=None):
+    origin = _predator_origin_type(origin_type)
+    return origin in {
+        "BOT_AUTOMATIC",
+        "BACKGROUND_JOB",
+        "SCANNER",
+        "UNKNOWN",
+        "AUTO",
+        "AUTOMATIC",
+    }
+
+
+def predator_should_block_automatic_broker_preview(origin_type=None):
+    """
+    Firewall V1:
+    - bloqueia preview automático do broker para origem robô/scanner;
+    - não bloqueia registro estatístico, Central Risk nem posição PAPER/VERIFY local;
+    - permite preview manual/console/teste explícito se chamado com origem manual.
+    """
+    if not PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED:
+        return False, "FIREWALL_DISABLED"
+
+    origin = _predator_origin_type(origin_type)
+    mode = str(PREDATOR_MODE or "PAPER").upper().strip()
+
+    if mode not in {"VERIFY", "LIVE"}:
+        return False, f"MODE_{mode}_DOES_NOT_CALL_BROKER_PREVIEW"
+
+    if not _predator_origin_is_automatic(origin):
+        return False, f"MANUAL_ORIGIN_ALLOWED:{origin}"
+
+    if PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW:
+        return False, "PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW=true"
+
+    return True, "AUTO_BROKER_PREVIEW_FIREWALL_BLOCK"
+
+
+def registrar_predator_execution_firewall_event(sig, broker_result, risk=None, local_gate=None, origin_type=None):
+    """Registra bloqueio do firewall no Redis e no histórico do robô."""
+    try:
+        origin = _predator_origin_type(origin_type)
+        event = {
+            "event": "AUTO_BROKER_PREVIEW_BLOCKED",
+            "date": data_hoje_sp_str(),
+            "datetime": data_hora_sp_str(),
+            "bot": "PREDATOR",
+            "setup": "SMART_PREDATOR",
+            "symbol": sig.get("symbol"),
+            "symbol_clean": sig.get("symbol_clean", nome_limpo(sig.get("symbol", ""))),
+            "side": sig.get("side"),
+            "score": sig.get("score"),
+            "quality": sig.get("quality"),
+            "risk_pct": sig.get("risk_pct"),
+            "mode": PREDATOR_MODE,
+            "origin_type": origin,
+            "sent": False,
+            "status": (broker_result or {}).get("status"),
+            "reason": (broker_result or {}).get("reason") or (broker_result or {}).get("error"),
+            "auto_trade": SMART_PREDATOR_AUTO_TRADE,
+            "firewall_enabled": PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED,
+            "allow_automatic_broker_preview": PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW,
+            "central_risk_decision": (risk or {}).get("decision") if isinstance(risk, dict) else None,
+            "central_risk_allowed": (risk or {}).get("allowed") if isinstance(risk, dict) else None,
+            "local_gate": local_gate or {},
+        }
+
+        # Log próprio compacto.
+        rows = redis_get_json(PREDATOR_EXECUTION_FIREWALL_LOG_KEY, [])
+        if not isinstance(rows, list):
+            rows = []
+        rows.append(event)
+        if len(rows) > PREDATOR_EXECUTION_FIREWALL_MAX_EVENTS:
+            rows = rows[-PREDATOR_EXECUTION_FIREWALL_MAX_EVENTS:]
+        redis_set_json(PREDATOR_EXECUTION_FIREWALL_LOG_KEY, rows)
+
+        # Também entra no histórico de trades/eventos do robô para auditoria.
+        registrar_evento_trade(event)
+        return event
+    except Exception as exc:
+        print("ERRO registrar_predator_execution_firewall_event:", exc)
+        return None
+
+
+def carregar_predator_execution_firewall_events(limit=20):
+    try:
+        rows = redis_get_json(PREDATOR_EXECUTION_FIREWALL_LOG_KEY, [])
+        if not isinstance(rows, list):
+            rows = []
+        return rows[-max(1, int(limit)):]
+    except Exception:
+        return []
+
+
+def montar_predator_execution_firewall_status():
+    rows = carregar_predator_execution_firewall_events(limit=10)
+    lines = [
+        "🧱 PREDATOR EXECUTION FIREWALL",
+        "",
+        f"Versão: {BOT_VERSION}",
+        f"Ativo: {check_bool(PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED)}",
+        f"Permitir preview automático: {check_bool(PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW)}",
+        f"Ready-check automático no broker: {check_bool(PREDATOR_AUTO_BROKER_READY_CHECK_ENABLED)}",
+        f"Notificar bloqueios automáticos: {check_bool(PREDATOR_NOTIFY_AUTO_BROKER_PREVIEW_BLOCKED)}",
+        f"Modo Predator: {PREDATOR_MODE}",
+        "",
+        "Regra:",
+        "- Sinais automáticos do Predator podem ser registrados e enviados para estatística.",
+        "- Chamadas automáticas ao broker em VERIFY/LIVE são bloqueadas antes do preview.",
+        "- Preview de broker fica reservado para console/rotas manuais/testes explícitos.",
+        "",
+        f"Eventos recentes: {len(rows)}",
+    ]
+    for item in rows[-10:]:
+        lines.append(
+            f"- {item.get('datetime')} | {item.get('symbol_clean')} {item.get('side')} | "
+            f"status={item.get('status')} | origem={item.get('origin_type')}"
+        )
+    return "\n".join(lines)
+
+
+def execute_predator_signal_safe(sig, risk_prechecked=None, local_gate_prechecked=None, origin_type="BOT_AUTOMATIC"):
+    """Executa a camada READY/VERIFY/LIVE do Smart Predator com firewall de preview automático.
+
+    Importante:
+    - O scanner automático pode gerar sinal, consultar a Central e registrar posição local.
+    - Por padrão, origem BOT_AUTOMATIC/UNKNOWN NÃO chama broker em VERIFY/LIVE, nem para preview.
+    - Preview de broker fica reservado para origem manual/console/teste explícito.
     """
     if not execution_mode_active():
         return None
 
+    origin = _predator_origin_type(origin_type)
     HEALTH["execution_last_run"] = data_hora_sp_str()
+    HEALTH["execution_firewall_last_origin"] = origin
+    HEALTH["execution_firewall_last_symbol"] = sig.get("symbol")
+    HEALTH["execution_firewall_last_side"] = sig.get("side")
+    HEALTH["execution_firewall_last_at"] = data_hora_sp_str()
+
     local_gate = local_gate_prechecked if isinstance(local_gate_prechecked, dict) else predator_local_live_gate(sig)
     risk = risk_prechecked if isinstance(risk_prechecked, dict) else central_can_open_trade(sig)
     allowed = bool(risk.get("allowed")) and bool(local_gate.get("allowed", True))
-    ready = broker_ready_payload()
+
+    block_preview, block_reason = predator_should_block_automatic_broker_preview(origin)
+
+    ready = {
+        "ok": None,
+        "status": "SKIPPED_BY_AUTO_BROKER_PREVIEW_FIREWALL",
+        "reason": block_reason,
+        "origin_type": origin,
+    } if block_preview and not PREDATOR_AUTO_BROKER_READY_CHECK_ENABLED else broker_ready_payload()
+
     broker_result = {}
 
-    if not allowed:
-        broker_result = {"ok": False, "status": "DENIED", "sent": False, "error": "Risk Manager DENY"}
+    if block_preview:
+        broker_result = {
+            "ok": False,
+            "status": "AUTO_BROKER_PREVIEW_BLOCKED",
+            "sent": False,
+            "blocked": True,
+            "broker_called": False,
+            "preview_called": False,
+            "origin_type": origin,
+            "mode": PREDATOR_MODE,
+            "symbol": sig.get("symbol"),
+            "side": sig.get("side"),
+            "bot": "PREDATOR",
+            "reason": block_reason,
+            "error": "Preview automático do broker bloqueado pelo Predator Execution Firewall.",
+            "firewall": {
+                "enabled": PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED,
+                "allow_automatic_broker_preview": PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW,
+                "auto_broker_ready_check_enabled": PREDATOR_AUTO_BROKER_READY_CHECK_ENABLED,
+                "version": BOT_VERSION,
+            },
+        }
+        registrar_predator_execution_firewall_event(sig, broker_result, risk=risk, local_gate=local_gate, origin_type=origin)
+    elif not allowed:
+        broker_result = {"ok": False, "status": "DENIED", "sent": False, "error": "Risk Manager DENY", "origin_type": origin}
     elif bingx_broker is None:
-        broker_result = {"ok": False, "status": "BROKER_IMPORT_ERROR", "sent": False, "error": BROKER_IMPORT_ERROR}
+        broker_result = {"ok": False, "status": "BROKER_IMPORT_ERROR", "sent": False, "error": BROKER_IMPORT_ERROR, "origin_type": origin}
     elif PREDATOR_MODE == "READY":
-        broker_result = {"ok": True, "status": "READY_ONLY", "sent": False, "margin_usdt": PREDATOR_REAL_MARGIN_USDT, "leverage": PREDATOR_REAL_LEVERAGE, "notional_usdt": PREDATOR_REAL_NOTIONAL_USDT, "effective_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT}
+        broker_result = {
+            "ok": True,
+            "status": "READY_ONLY",
+            "sent": False,
+            "origin_type": origin,
+            "margin_usdt": PREDATOR_REAL_MARGIN_USDT,
+            "leverage": PREDATOR_REAL_LEVERAGE,
+            "notional_usdt": PREDATOR_REAL_NOTIONAL_USDT,
+            "effective_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT,
+        }
     else:
         client_tag = f"PREDATOR-{nome_limpo(sig.get('symbol'))}-{int(time.time())}"
         try:
@@ -1943,19 +2153,35 @@ def execute_predator_signal_safe(sig, risk_prechecked=None, local_gate_prechecke
                 leverage=PREDATOR_REAL_LEVERAGE,
                 bot="PREDATOR",
             )
+            if isinstance(broker_result, dict):
+                broker_result.setdefault("origin_type", origin)
         except Exception as exc:
-            broker_result = {"ok": False, "status": "BROKER_EXCEPTION", "sent": False, "error": str(exc)}
+            broker_result = {"ok": False, "status": "BROKER_EXCEPTION", "sent": False, "error": str(exc), "origin_type": origin}
 
     HEALTH["execution_last_decision"] = risk.get("decision", "ALLOW" if risk.get("allowed") else "DENY")
     HEALTH["execution_last_result"] = broker_result.get("status")
     HEALTH["execution_last_error"] = broker_result.get("error")
+    HEALTH["execution_firewall_last_status"] = broker_result.get("status")
 
     update_position_execution_fields(sig, risk, broker_result)
 
     msg = build_predator_execution_message(sig, risk, broker_result, ready, local_gate)
-    if PREDATOR_EXECUTION_NOTIFY:
+
+    should_notify = bool(PREDATOR_EXECUTION_NOTIFY)
+    if broker_result.get("status") == "AUTO_BROKER_PREVIEW_BLOCKED" and not PREDATOR_NOTIFY_AUTO_BROKER_PREVIEW_BLOCKED:
+        should_notify = False
+
+    if should_notify:
         safe_send_telegram(msg)
-    return {"risk": risk, "ready": ready, "broker_result": broker_result, "message": msg}
+
+    return {
+        "risk": risk,
+        "ready": ready,
+        "broker_result": broker_result,
+        "message": msg,
+        "origin_type": origin,
+        "firewall_blocked": bool(block_preview),
+    }
 
 
 def montar_execution_status_texto():
@@ -1970,6 +2196,9 @@ def montar_execution_status_texto():
         f"Exposição efetiva: {PREDATOR_REAL_NOTIONAL_USDT} USDT\n"
         f"Max posições LIVE Predator: {PREDATOR_MAX_REAL_POSITIONS}\n"
         f"Central Risk obrigatório: {PREDATOR_REQUIRE_CENTRAL_RISK}\n"
+        f"Firewall preview automático: {PREDATOR_AUTO_BROKER_PREVIEW_FIREWALL_ENABLED}\n"
+        f"Permitir preview automático: {PREDATOR_ALLOW_AUTOMATIC_BROKER_PREVIEW}\n"
+        f"Ready-check automático broker: {PREDATOR_AUTO_BROKER_READY_CHECK_ENABLED}\n"
         f"Bloquear H4 forte contra: {PREDATOR_BLOCK_STRONG_H4_CONTRA}\n"
         f"ADX H4 forte contra: {PREDATOR_STRONG_H4_ADX}\n"
         f"Exceção H4 contra ativa: {PREDATOR_ALLOW_EXCEPTIONAL_COUNTER_H4}\n\n"
@@ -3626,6 +3855,7 @@ def scanner():
                                         s,
                                         risk_prechecked=risk_payload,
                                         local_gate_prechecked=local_gate,
+                                        origin_type="BOT_AUTOMATIC",
                                     )
                                 inc_funnel_stat("signals_sent")
                                 sinais_enviados += 1
@@ -3729,6 +3959,12 @@ def events_rota():
 @app.route("/execution")
 def execution_rota():
     return montar_execution_status_texto().replace("\n", "<br>")
+
+
+@app.route("/executionfirewall")
+@app.route("/predator/execution/firewall")
+def execution_firewall_rota():
+    return montar_predator_execution_firewall_status().replace("\n", "<br>")
 
 # ====================================================
 # THREADS MONITORADAS
