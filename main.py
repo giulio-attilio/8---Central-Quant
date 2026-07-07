@@ -37662,6 +37662,51 @@ def memory_diet_v1_health_route():
     }, 200
 
 
+
+# ==========================================================
+# BROKER AUTO PREVIEW FIREWALL — CENTRAL ROUTE V1
+# ==========================================================
+@app.route("/executionfirewall", methods=["GET"])
+@app.route("/predator/execution/firewall", methods=["GET"])
+@app.route("/broker/preview/firewall", methods=["GET"])
+def broker_auto_preview_firewall_route():
+    """
+    Rota central para enxergar o firewall de preview automático do broker.
+    A rota antiga no predator.py não aparece no serviço central porque o Predator usa outro Flask app interno.
+    """
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    if central_broker is not None and hasattr(central_broker, "broker_preview_firewall_health"):
+        try:
+            return central_broker.broker_preview_firewall_health(limit=limit), 200
+        except Exception as exc:
+            return {
+                "ok": False,
+                "module": "broker_auto_preview_firewall_route",
+                "status": "BROKER_FIREWALL_HEALTH_ERROR",
+                "error": str(exc),
+                "generated_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+            }, 500
+
+    # Fallback se broker.py ainda não foi atualizado.
+    return {
+        "ok": False,
+        "module": "broker_auto_preview_firewall_route",
+        "status": "BROKER_FIREWALL_NOT_AVAILABLE",
+        "broker_loaded": central_broker is not None,
+        "broker_import_error": BROKER_IMPORT_ERROR if "BROKER_IMPORT_ERROR" in globals() else None,
+        "generated_at": data_hora_sp_str() if "data_hora_sp_str" in globals() else None,
+        "required_file": "broker.py V2.7.5 com broker_preview_firewall_health",
+        "notes": [
+            "Esta rota agora fica no main.py, não no Flask app interno do Predator.",
+            "Se aparecer NOT_AVAILABLE, substitua broker.py pela versão V2.7.5 Auto Preview Firewall.",
+        ],
+    }, 200
+
 start_central_runtime_once()
 
 if __name__ == "__main__":

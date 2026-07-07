@@ -86,6 +86,17 @@ ENABLE_REAL_TRADING = env_bool("ENABLE_REAL_TRADING", False)
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
 BROKER_DRY_RUN = env_bool("BROKER_DRY_RUN", EXECUTION_MODE != "LIVE" or not ENABLE_REAL_TRADING)
 
+# Automatic Broker Preview Firewall V1
+# Bloqueia previews automáticos no broker para bots específicos quando o envio real não está habilitado.
+# Objetivo: impedir que sinais automáticos como PREDATOR gerem BROKER_PREVIEW_ISOLATED/DRY_RUN em /live.
+BROKER_AUTO_PREVIEW_FIREWALL_ENABLED = env_bool("BROKER_AUTO_PREVIEW_FIREWALL_ENABLED", True)
+BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS = {
+    x.strip().upper()
+    for x in os.environ.get("BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS", os.environ.get("PREDATOR_BROKER_PREVIEW_BLOCK_BOTS", "PREDATOR")).split(",")
+    if x.strip()
+}
+BROKER_AUTO_PREVIEW_FIREWALL_STATUS = os.environ.get("BROKER_AUTO_PREVIEW_FIREWALL_STATUS", "AUTO_BROKER_PREVIEW_BLOCKED").strip().upper()
+
 # Hedge Mode:
 # - AUTO/true: envia positionSide=LONG/SHORT nas ordens.
 # - false/oneway: não envia positionSide.
@@ -1076,6 +1087,72 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
         return result
 
 
+
+
+def _bot_key_for_firewall(bot):
+    try:
+        value = str(bot or "UNKNOWN").upper().strip()
+    except Exception:
+        value = "UNKNOWN"
+    aliases = {
+        "SMART_PREDATOR": "PREDATOR",
+        "SMARTPREDATOR": "PREDATOR",
+    }
+    return aliases.get(value, value)
+
+
+def broker_preview_firewall_health(limit: int = 20):
+    """Status leve do Automatic Broker Preview Firewall."""
+    blocked_recent = []
+    try:
+        rows = read_execution_audit_log(limit=max(1, min(int(limit), 100))).get("items") or []
+        for item in rows:
+            if isinstance(item, dict) and str(item.get("event") or "").upper() == BROKER_AUTO_PREVIEW_FIREWALL_STATUS:
+                blocked_recent.append(item)
+    except Exception:
+        blocked_recent = []
+    return {
+        "ok": True,
+        "module": "broker_auto_preview_firewall_v1",
+        "version": "2026-07-07-BROKER-AUTO-PREVIEW-FIREWALL-V1",
+        "generated_at": agora_sp_str(),
+        "enabled": BROKER_AUTO_PREVIEW_FIREWALL_ENABLED,
+        "blocked_bots": sorted(BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS),
+        "status_code": BROKER_AUTO_PREVIEW_FIREWALL_STATUS,
+        "execution_mode": EXECUTION_MODE,
+        "enable_real_trading": ENABLE_REAL_TRADING,
+        "broker_dry_run": BROKER_DRY_RUN,
+        "audit_file": str(EXECUTION_AUDIT_LOG_FILE),
+        "executions_file": str(EXECUTIONS_LOG_FILE),
+        "blocked_recent_count": len(blocked_recent),
+        "blocked_recent": blocked_recent[-limit:],
+        "notes": [
+            "Bloqueia preview automático antes de build_order_preview/place_market_order quando bot está na lista bloqueada.",
+            "Não bloqueia execução real quando live_send_enabled=True; esse caminho continua protegido por token/guards.",
+            "Para liberar preview automático, ajuste BROKER_AUTO_PREVIEW_FIREWALL_ENABLED=false ou remova o bot de BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS.",
+        ],
+    }
+
+
+def _automatic_broker_preview_firewall(*, sym, side, bot, client_tag, live_send_enabled):
+    """Retorna bloqueio para previews automáticos de bots específicos antes de tocar no broker."""
+    bot_key = _bot_key_for_firewall(bot)
+    if not BROKER_AUTO_PREVIEW_FIREWALL_ENABLED:
+        return {"blocked": False, "reason": "BROKER_AUTO_PREVIEW_FIREWALL_ENABLED=false", "bot_key": bot_key}
+    if live_send_enabled:
+        return {"blocked": False, "reason": "live_send_enabled=true", "bot_key": bot_key}
+    if bot_key not in BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS:
+        return {"blocked": False, "reason": f"bot fora da lista bloqueada: {bot_key}", "bot_key": bot_key}
+    return {
+        "blocked": True,
+        "reason": f"preview automático bloqueado para bot={bot_key}; envio real desarmado/preflight não manual",
+        "bot_key": bot_key,
+        "symbol": sym,
+        "side": side,
+        "client_tag": client_tag,
+        "blocked_bots": sorted(BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS),
+    }
+
 def place_market_order(
     symbol,
     side,
@@ -1124,6 +1201,49 @@ def place_market_order(
         return result
 
     live_send_enabled = is_real_live_send_enabled()
+
+    preview_firewall = _automatic_broker_preview_firewall(
+        sym=sym,
+        side=order_side,
+        bot=bot,
+        client_tag=client_tag,
+        live_send_enabled=live_send_enabled,
+    )
+    if preview_firewall.get("blocked"):
+        result = {
+            "ok": False,
+            "status": BROKER_AUTO_PREVIEW_FIREWALL_STATUS,
+            "sent": False,
+            "symbol": sym,
+            "side": order_side,
+            "bot": _bot_key_for_firewall(bot),
+            "margin_usdt": margin,
+            "leverage": lev,
+            "notional_usdt": planned_exposure,
+            "client_order_id": client_tag,
+            "reason": preview_firewall.get("reason"),
+            "preview_firewall": preview_firewall,
+            "preview_isolation": True,
+            "live_send_enabled": False,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        log_execution_event({
+            "event": "place_market_order",
+            "mode": EXECUTION_MODE,
+            "status": result.get("status"),
+            "sent": False,
+            "symbol": result.get("symbol"),
+            "side": result.get("side"),
+            "bot": result.get("bot"),
+            "client_order_id": result.get("client_order_id"),
+            "reason": result.get("reason"),
+            "preview_firewall": preview_firewall,
+        })
+        log_execution_audit_event({
+            "event": BROKER_AUTO_PREVIEW_FIREWALL_STATUS,
+            **result,
+        })
+        return result
 
     # SEMPRE monta preview antes, tanto para validação quanto para a ordem real.
     try:
