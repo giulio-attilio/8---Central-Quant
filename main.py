@@ -16589,6 +16589,65 @@ def _ceo_daily_v2_real_pnl_snapshot():
             "error": str(exc),
         }
 
+def _ceo_daily_v2_live_broker_snapshot():
+    """Snapshot explícito de posições REAIS na BingX versus LIVE registradas na Central.
+
+    Importante:
+    - total_positions_open / get_open_positions_central são posições estatísticas/registry dos robôs.
+    - broker_open_count é a leitura direta da BingX via broker.get_positions().
+    """
+    broker_positions = []
+    pos_err = None
+    central_live = []
+    central_live_err = None
+
+    try:
+        if "_broker_open_positions" in globals():
+            broker_positions, pos_err = _broker_open_positions()
+        else:
+            pos_err = "_broker_open_positions indisponível"
+    except Exception as exc:
+        broker_positions = []
+        pos_err = str(exc)
+
+    try:
+        if "_central_live_positions_payload" in globals():
+            central_live = _central_live_positions_payload()
+        else:
+            central_live_err = "_central_live_positions_payload indisponível"
+    except Exception as exc:
+        central_live = []
+        central_live_err = str(exc)
+
+    broker_keys = {
+        (str(p.get("symbol") or "").upper(), str(p.get("side") or "").upper())
+        for p in broker_positions
+        if isinstance(p, dict)
+    }
+    central_keys = {
+        (str(p.get("symbol") or "").upper(), str(p.get("side") or "").upper())
+        for p in central_live
+        if isinstance(p, dict)
+    }
+
+    only_bingx = sorted(list(broker_keys - central_keys))
+    only_central = sorted(list(central_keys - broker_keys))
+
+    return {
+        "ok": pos_err is None,
+        "source": "BINGX_BROKER_GET_POSITIONS",
+        "broker_open_count": len(broker_positions or []),
+        "central_live_count": len(central_live or []),
+        "position_mismatch": bool(only_bingx or only_central),
+        "only_bingx": only_bingx[:20],
+        "only_central": only_central[:20],
+        "broker_error": pos_err,
+        "central_live_error": central_live_err,
+        "broker_positions_sample": (broker_positions or [])[:10],
+        "central_live_sample": (central_live or [])[:10],
+    }
+
+
 
 def _ceo_daily_v2_open_pnl_snapshot():
     try:
@@ -16709,7 +16768,7 @@ def _ceo_daily_v2_status_and_actions(executive, pipeline, stability, pnl_history
             code = str(alert.get("code") or "").upper()
             title = str(alert.get("title") or "").lower()
             if "REAL_EXECUTION" in code or "execução real" in title or "execucao real" in title:
-                actions.append("Confirmar se execução REAL foi intencional e se o stop de desastre está configurado.")
+                actions.append("Execução REAL está habilitada para novas ordens; isso não significa posição real aberta. Confirmar se foi intencional e se o stop de desastre está configurado para futuras entradas.")
                 break
 
     today = (pnl_history or {}).get("today") or {}
@@ -16742,6 +16801,7 @@ def build_ceo_daily_report():
     pnl_history = _ceo_daily_v2_history_pnl_snapshot()
     real_pnl = _ceo_daily_v2_real_pnl_snapshot()
     open_pnl = _ceo_daily_v2_open_pnl_snapshot()
+    live_snapshot = _ceo_daily_v2_live_broker_snapshot()
     stability = runtime_stability_v1_snapshot(hours=24)
     pipe = _ceo_daily_v2_pipeline_summary(pipeline)
     decision = _ceo_daily_v2_status_and_actions(executive, pipeline, stability, pnl_history)
@@ -16792,24 +16852,34 @@ def build_ceo_daily_report():
         f"Alertas: ativos={decision['alert_counts'].get('active')} | críticos={decision['alert_counts'].get('critical')} | warnings={decision['alert_counts'].get('warning')}",
         "",
         "━━━━━━━━━━━━━━━━━━",
-        "2. RESULTADO / PNL",
+        "2. RESULTADO ESTATÍSTICO / PNL",
         "━━━━━━━━━━━━━━━━━━",
         f"Hoje: {today.get('trades', 0)} trade(s) fechado(s) | PnL {_ceo_daily_v2_fmt_pct(today.get('pnl_total_pct'))} | R {_ceo_daily_v2_fmt_r(today.get('r_total'))} | WR {today.get('win_rate_pct', 0)}%",
         f"Mês: {month.get('trades', 0)} trade(s) fechado(s) | PnL {_ceo_daily_v2_fmt_pct(month.get('pnl_total_pct'))} | R {_ceo_daily_v2_fmt_r(month.get('r_total'))} | WR {month.get('win_rate_pct', 0)}%",
         f"TP50 hoje: {today.get('tp50_hits', 0)} | Stops hoje: {today.get('stops', 0)} | BE hoje: {today.get('breakeven', 0)}",
+        "Fonte: histórico estatístico da Central; resultado financeiro real fica separado em Real PnL/R.",
     ]
 
     if open_pnl.get("has_open_pnl_fields"):
-        lines.append(f"Aberto estimado: PnL {_ceo_daily_v2_fmt_pct(open_pnl.get('pnl_est_total_pct'))} | R {_ceo_daily_v2_fmt_r(open_pnl.get('r_est_total'))}")
+        lines.append(f"Abertas na Central/robôs: {open_pnl.get('open_count', 0)} | PnL estimado {_ceo_daily_v2_fmt_pct(open_pnl.get('pnl_est_total_pct'))} | R {_ceo_daily_v2_fmt_r(open_pnl.get('r_est_total'))}")
     else:
-        lines.append(f"Aberto estimado: {open_pnl.get('open_count', 0)} posição(ões); PnL aberto não disponível nos campos atuais.")
+        lines.append(f"Abertas na Central/robôs: {open_pnl.get('open_count', 0)} posição(ões); PnL aberto não disponível nos campos atuais.")
 
+    real_diag = real_payload.get("diagnostics") or {}
+    real_complete = _ceo_daily_v2_int(real_diag.get("closed_complete"), 0)
+    real_incomplete = _ceo_daily_v2_int(real_diag.get("closed_incomplete"), 0)
     if real_pnl.get("ok") and real_mapped:
         parts = [f"Real PnL/R: {real_mapped} trade(s) mapeado(s)"]
-        if real_pnl_usdt is not None:
-            parts.append(f"USDT {_ceo_daily_v2_fmt_usdt(real_pnl_usdt)}")
-        if real_pnl_pct is not None:
-            parts.append(f"% {_ceo_daily_v2_fmt_pct(real_pnl_pct)}")
+        if real_complete > 0:
+            if real_pnl_usdt is not None:
+                parts.append(f"USDT {_ceo_daily_v2_fmt_usdt(real_pnl_usdt)}")
+            if real_pnl_pct is not None:
+                parts.append(f"% {_ceo_daily_v2_fmt_pct(real_pnl_pct)}")
+            parts.append(f"completos={real_complete}")
+        else:
+            parts.append("sem fechado completo para decisão financeira")
+        if real_incomplete:
+            parts.append(f"incompletos={real_incomplete}")
         lines.append(" | ".join(parts))
     elif real_pnl.get("available"):
         lines.append("Real PnL/R: disponível, mas sem trade real mapeado no snapshot compacto.")
@@ -16821,10 +16891,21 @@ def build_ceo_daily_report():
         "━━━━━━━━━━━━━━━━━━",
         "3. OPERAÇÃO E RISCO",
         "━━━━━━━━━━━━━━━━━━",
-        f"Posições abertas: {total_pos} | LONG {long_pos} | SHORT {short_pos} | dominante {dominant_side} {dominant_pct:.1f}%",
+        f"BingX reais abertas: {live_snapshot.get('broker_open_count', 0)} | Central LIVE registrada: {live_snapshot.get('central_live_count', 0)}",
+        f"Central/robôs monitorados: {total_pos} | LONG {long_pos} | SHORT {short_pos} | dominante {dominant_side} {dominant_pct:.1f}%",
         f"PAPER: abertas {positions.get('open', 0)} | fechadas {positions.get('closed', 0)} | outcomes pendentes {positions.get('pending_outcome', 0)}",
         f"Expansão: {'BLOQUEADA' if decision.get('status') in {'ATENÇÃO', 'CRÍTICO'} else 'PERMITIDA COM DISCIPLINA'}",
         f"Aumento de risco/lote: {'NÃO' if decision.get('status') in {'ATENÇÃO', 'CRÍTICO'} else 'SOMENTE COM AMOSTRA'}",
+    ]
+
+    if live_snapshot.get("broker_error"):
+        lines.append(f"Leitura BingX: ERRO — {live_snapshot.get('broker_error')}")
+    elif _ceo_daily_v2_int(live_snapshot.get("broker_open_count"), 0) == 0:
+        lines.append("Confirmação BingX: nenhuma posição real aberta.")
+    if live_snapshot.get("position_mismatch"):
+        lines.append("⚠️ Divergência Central LIVE x BingX detectada; consultar /sync antes de operar REAL.")
+
+    lines += [
         "",
         "━━━━━━━━━━━━━━━━━━",
         "4. ESTABILIDADE DA CENTRAL",
@@ -16883,7 +16964,7 @@ def build_ceo_daily_report():
     lines += [
         "",
         "Comandos úteis se precisar investigar:",
-        "/alertscheck /runtime/stability /realpnlr/text /riskstats /history /execution/pipeline/status /memory",
+        "/live /sync /alertscheck /runtime/stability /realpnlr/text /riskstats /history /execution/pipeline/status /memory",
     ]
 
     return "\n".join(lines)
