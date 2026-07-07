@@ -33303,6 +33303,792 @@ def can_open_trade_decision(payload: dict):
     return decision_result
 
 
+
+# ============================================================================
+# REAL POSITION WATCHDOG V1
+# ----------------------------------------------------------------------------
+# Watchdog read-only para a fase piloto real:
+# - não envia ordem;
+# - não fecha posição;
+# - não altera risco;
+# - verifica posição real aberta, stop, Registry, limite de tamanho e máximo de posições;
+# - envia Telegram em eventos relevantes/alertas;
+# - roda automaticamente depois de execução real dry_run=False e também por rota.
+# ============================================================================
+REAL_POSITION_WATCHDOG_V1_VERSION = "2026-07-06-REAL-POSITION-WATCHDOG-V1"
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_POSITION_WATCHDOG_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_POSITION_WATCHDOG_V1 = None
+
+try:
+    REAL_POSITION_WATCHDOG_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_position_watchdog_v1_events.jsonl"
+    REAL_POSITION_WATCHDOG_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_position_watchdog_v1_latest.json"
+    REAL_POSITION_WATCHDOG_V1_STATE_FILE = CENTRAL_DATA_DIR / "real_position_watchdog_v1_state.json"
+except Exception:
+    REAL_POSITION_WATCHDOG_V1_EVENTS_FILE = None
+    REAL_POSITION_WATCHDOG_V1_LATEST_FILE = None
+    REAL_POSITION_WATCHDOG_V1_STATE_FILE = None
+
+_REAL_POSITION_WATCHDOG_V1_RECENT_NOTICES = {}
+
+
+def _rpw_v1_now():
+    try:
+        return agora_sp_str()
+    except Exception:
+        try:
+            return data_hora_sp_str()
+        except Exception:
+            return None
+
+
+def _rpw_v1_bool(value, default=False):
+    try:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "y"}
+    except Exception:
+        return bool(default)
+
+
+def _rpw_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _rpw_v1_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(float(str(value).replace(",", ".")))
+    except Exception:
+        return int(default)
+
+
+def _rpw_v1_csv(value, default=None):
+    if value is None:
+        return list(default or [])
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip().upper() for x in value if str(x).strip()]
+    raw = str(value or "")
+    parts = []
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip().upper()
+        if item:
+            parts.append(item)
+    return parts or list(default or [])
+
+
+def _rpw_v1_norm_symbol(value):
+    try:
+        if callable(globals().get("_pesc_v1_norm_symbol")):
+            return _pesc_v1_norm_symbol(value)
+    except Exception:
+        pass
+    return str(value or "").upper().replace("/", "").replace(":USDT", "").strip()
+
+
+def _rpw_v1_norm_side(value):
+    try:
+        if callable(globals().get("_pesc_v1_norm_side")):
+            return _pesc_v1_norm_side(value)
+    except Exception:
+        pass
+    raw = str(value or "").upper().strip()
+    if raw in {"BUY", "LONG"}:
+        return "LONG"
+    if raw in {"SELL", "SHORT"}:
+        return "SHORT"
+    return raw
+
+
+def _rpw_v1_config():
+    allowed_symbols = _rpw_v1_csv(
+        os.environ.get("REAL_POSITION_WATCHDOG_SYMBOLS")
+        or os.environ.get("REAL_PILOT_ALLOWED_SYMBOLS")
+        or os.environ.get("CENTRAL_REAL_PILOT_ALLOWED_SYMBOLS"),
+        default=["BTCUSDT", "ETHUSDT"],
+    )
+    allowed_bots = _rpw_v1_csv(
+        os.environ.get("REAL_POSITION_WATCHDOG_BOTS")
+        or os.environ.get("REAL_PILOT_ALLOWED_BOTS")
+        or os.environ.get("CENTRAL_REAL_PILOT_ALLOWED_BOTS"),
+        default=["FALCON"],
+    )
+    return {
+        "enabled": _rpw_v1_bool(os.environ.get("REAL_POSITION_WATCHDOG_ENABLED"), True),
+        "notify_telegram": _rpw_v1_bool(os.environ.get("REAL_POSITION_WATCHDOG_NOTIFY_TELEGRAM"), True),
+        "notify_ok": _rpw_v1_bool(os.environ.get("REAL_POSITION_WATCHDOG_NOTIFY_OK"), False),
+        "notify_closed": _rpw_v1_bool(os.environ.get("REAL_POSITION_WATCHDOG_NOTIFY_CLOSED"), True),
+        "notify_alerts": _rpw_v1_bool(os.environ.get("REAL_POSITION_WATCHDOG_NOTIFY_ALERTS"), True),
+        "dedup_seconds": max(5, _rpw_v1_int(os.environ.get("REAL_POSITION_WATCHDOG_DEDUP_SECONDS"), 60)),
+        "allowed_symbols": allowed_symbols,
+        "allowed_bots": allowed_bots,
+        "max_open_positions": _rpw_v1_int(
+            os.environ.get("REAL_POSITION_WATCHDOG_MAX_OPEN_POSITIONS")
+            or os.environ.get("REAL_PILOT_MAX_OPEN_POSITIONS")
+            or os.environ.get("CENTRAL_REAL_PILOT_MAX_OPEN_POSITIONS"),
+            1,
+        ),
+        "max_notional_usdt": _rpw_v1_float(
+            os.environ.get("REAL_POSITION_WATCHDOG_MAX_NOTIONAL_USDT")
+            or os.environ.get("REAL_PILOT_MAX_NOTIONAL_USDT")
+            or os.environ.get("CENTRAL_REAL_PILOT_MAX_NOTIONAL_USDT"),
+            20.0,
+        ),
+        "telegram_token_configured": bool(globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")),
+        "telegram_chat_configured": bool(globals().get("CENTRAL_TELEGRAM_CHAT_ID")),
+        "token_value_exposed": False,
+    }
+
+
+def _rpw_v1_sanitize_public(obj):
+    try:
+        if callable(globals().get("_arb_v1_sanitize_public")):
+            return _arb_v1_sanitize_public(obj)
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        safe = {}
+        for key, value in obj.items():
+            kl = str(key).lower()
+            if "token" in kl or "secret" in kl or "api_key" in kl or "apikey" in kl:
+                safe[key] = "***MASKED***" if value else value
+            else:
+                safe[key] = _rpw_v1_sanitize_public(value)
+        return safe
+    if isinstance(obj, list):
+        return [_rpw_v1_sanitize_public(x) for x in obj]
+    return obj
+
+
+def _rpw_v1_load_json(path, default=None):
+    try:
+        if path is not None and Path(path).exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if data is not None else (default if default is not None else {})
+    except Exception:
+        pass
+    return default if default is not None else {}
+
+
+def _rpw_v1_write_json(path, payload):
+    try:
+        if path is None:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def _rpw_v1_append_event(event):
+    try:
+        event = dict(event or {})
+        event.setdefault("generated_at", _rpw_v1_now())
+        event.setdefault("version", REAL_POSITION_WATCHDOG_V1_VERSION)
+        event = _rpw_v1_sanitize_public(event)
+        if REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None:
+            REAL_POSITION_WATCHDOG_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _rpw_v1_write_json(REAL_POSITION_WATCHDOG_V1_LATEST_FILE, event)
+        return True
+    except Exception:
+        return False
+
+
+def _rpw_v1_read_events(limit=20):
+    events = []
+    try:
+        limit = max(1, min(200, int(limit or 20)))
+        if REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None and REAL_POSITION_WATCHDOG_V1_EVENTS_FILE.exists():
+            with open(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-limit:]
+            for line in lines:
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return {"ok": True, "count": len(events), "events": events}
+
+
+def _rpw_v1_position_notional(pos):
+    if not isinstance(pos, dict):
+        return 0.0
+    return abs(_rpw_v1_float(
+        pos.get("notional")
+        or pos.get("positionValue")
+        or pos.get("initialMargin")
+        or ((pos.get("info") or {}) if isinstance(pos.get("info"), dict) else {}).get("positionValue")
+        or 0,
+        0.0,
+    ) or 0.0)
+
+
+def _rpw_v1_snapshot_from_payload(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    return {
+        "bot": str(payload.get("bot") or "FALCON").upper().strip(),
+        "setup": str(payload.get("setup") or payload.get("bot") or "FALCON").upper().strip(),
+        "symbol": _rpw_v1_norm_symbol(payload.get("symbol") or ""),
+        "side": _rpw_v1_norm_side(payload.get("side") or ""),
+        "signal_id": payload.get("signal_id"),
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl"),
+        "tp50": payload.get("tp50"),
+        "client_order_id": payload.get("client_order_id") or payload.get("clientOrderId") or payload.get("clientOrderID") or payload.get("broker_client_order_id"),
+    }
+
+
+def _rpw_v1_get_registry_mode_gate(payload=None):
+    try:
+        fn = globals().get("registry_mode_segregation_v1_gate_check")
+        if callable(fn):
+            return fn(payload if isinstance(payload, dict) else {})
+    except Exception as exc:
+        return {"ok": False, "status": "REGISTRY_MODE_GATE_ERROR", "error": str(exc)}
+    return {"ok": False, "status": "REGISTRY_MODE_GATE_FUNCTION_MISSING"}
+
+
+def _rpw_v1_get_guard(payload=None):
+    try:
+        fn = globals().get("real_pilot_guard_v1_validate")
+        if callable(fn):
+            return fn(payload if isinstance(payload, dict) else {}, action="watchdog")
+    except Exception as exc:
+        return {"ok": False, "allowed": False, "status": "REAL_PILOT_GUARD_WATCHDOG_ERROR", "error": str(exc)}
+    return {"ok": False, "allowed": False, "status": "REAL_PILOT_GUARD_FUNCTION_MISSING"}
+
+
+def _rpw_v1_run_safety(symbol, side, bot="FALCON", setup="FALCON"):
+    try:
+        fn = globals().get("build_post_execution_safety_check_v1")
+        if callable(fn):
+            return fn(symbol=symbol, side=side, bot=bot, setup=setup)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "POST_EXECUTION_SAFETY_ERROR",
+            "error": str(exc),
+            "symbol": symbol,
+            "side": side,
+            "bot": bot,
+            "setup": setup,
+        }
+    return {
+        "ok": False,
+        "status": "POST_EXECUTION_SAFETY_FUNCTION_MISSING",
+        "symbol": symbol,
+        "side": side,
+        "bot": bot,
+        "setup": setup,
+    }
+
+
+def _rpw_v1_build_watch_targets(payload=None, all_allowed=True):
+    config = _rpw_v1_config()
+    snap = _rpw_v1_snapshot_from_payload(payload)
+    bot = snap.get("bot") or (config.get("allowed_bots") or ["FALCON"])[0]
+    setup = snap.get("setup") or bot
+    symbol = snap.get("symbol")
+    side = snap.get("side")
+    targets = []
+    if symbol and side:
+        targets.append({"symbol": symbol, "side": side, "bot": bot, "setup": setup})
+    if all_allowed or not targets:
+        for sym in config.get("allowed_symbols") or ["BTCUSDT", "ETHUSDT"]:
+            for sd in ("LONG", "SHORT"):
+                candidate = {"symbol": _rpw_v1_norm_symbol(sym), "side": sd, "bot": bot, "setup": setup}
+                if candidate not in targets:
+                    targets.append(candidate)
+    return targets
+
+
+def _rpw_v1_classify_watch(payload=None, source="manual", all_allowed=True):
+    config = _rpw_v1_config()
+    payload = payload if isinstance(payload, dict) else {}
+    snap = _rpw_v1_snapshot_from_payload(payload)
+    targets = _rpw_v1_build_watch_targets(payload, all_allowed=all_allowed)
+
+    safety_results = []
+    open_items = []
+    unprotected = []
+    unregistered = []
+    oversize = []
+    errors = []
+    max_notional = config.get("max_notional_usdt")
+
+    for target in targets:
+        safety = _rpw_v1_run_safety(
+            symbol=target.get("symbol"),
+            side=target.get("side"),
+            bot=target.get("bot"),
+            setup=target.get("setup"),
+        )
+        safety_results.append({
+            "target": target,
+            "ok": bool((safety or {}).get("ok")),
+            "status": (safety or {}).get("status"),
+            "requires_manual_attention": bool((safety or {}).get("requires_manual_attention")),
+            "position_found": bool((safety or {}).get("position_found")),
+            "position_count": (safety or {}).get("position_count"),
+            "protective_orders_count": (safety or {}).get("protective_orders_count"),
+            "stop_confirmed_by_central": bool((safety or {}).get("stop_confirmed_by_central")),
+            "registry_match": bool((safety or {}).get("registry_match")),
+            "positions": (safety or {}).get("positions") or [],
+            "protective_orders": (safety or {}).get("protective_orders") or [],
+            "diagnostics": (safety or {}).get("diagnostics") or {},
+        })
+        if not isinstance(safety, dict) or safety.get("ok") is False and safety.get("status") in {"POST_EXECUTION_SAFETY_ERROR", "POST_EXECUTION_SAFETY_FUNCTION_MISSING"}:
+            errors.append({"target": target, "status": (safety or {}).get("status"), "error": (safety or {}).get("error")})
+        if safety.get("position_found"):
+            for position in safety.get("positions") or []:
+                item = {
+                    "target": target,
+                    "position": position,
+                    "status": safety.get("status"),
+                    "stop_confirmed_by_central": bool(safety.get("stop_confirmed_by_central")),
+                    "registry_match": bool(safety.get("registry_match")),
+                    "requires_manual_attention": bool(safety.get("requires_manual_attention")),
+                    "protective_orders_count": safety.get("protective_orders_count"),
+                    "notional": _rpw_v1_position_notional(position),
+                }
+                open_items.append(item)
+                if not item.get("stop_confirmed_by_central"):
+                    unprotected.append(item)
+                if not item.get("registry_match"):
+                    unregistered.append(item)
+                if max_notional is not None and item.get("notional", 0.0) > float(max_notional) + 0.50:
+                    oversize.append(item)
+
+    open_count = len(open_items)
+    protected_count = len([x for x in open_items if x.get("stop_confirmed_by_central")])
+    registered_count = len([x for x in open_items if x.get("registry_match")])
+    max_open = int(config.get("max_open_positions") or 1)
+    too_many = open_count > max_open
+
+    state = _rpw_v1_load_json(REAL_POSITION_WATCHDOG_V1_STATE_FILE, default={})
+    prev_open_count = _rpw_v1_int((state or {}).get("last_open_count"), 0)
+    prev_status = (state or {}).get("last_status")
+    closed_detected = bool(prev_open_count > 0 and open_count == 0)
+
+    registry_mode = _rpw_v1_get_registry_mode_gate(payload)
+    guard = _rpw_v1_get_guard(payload if payload else {
+        "bot": snap.get("bot") or "FALCON",
+        "setup": snap.get("setup") or "FALCON",
+        "symbol": snap.get("symbol") or ((config.get("allowed_symbols") or ["BTCUSDT"])[0]),
+        "side": snap.get("side") or "SHORT",
+    })
+
+    if errors:
+        status = "WATCHDOG_READ_ERROR"
+        ok = False
+        severity = "P1"
+        requires_manual_attention = True
+    elif too_many:
+        status = "REAL_POSITION_LIMIT_BREACHED"
+        ok = False
+        severity = "P0"
+        requires_manual_attention = True
+    elif unprotected:
+        status = "REAL_POSITION_OPEN_WITHOUT_STOP_CONFIRMED"
+        ok = False
+        severity = "P0"
+        requires_manual_attention = True
+    elif unregistered:
+        status = "REAL_POSITION_OPEN_WITHOUT_REGISTRY_CONFIRMED"
+        ok = False
+        severity = "P0"
+        requires_manual_attention = True
+    elif oversize:
+        status = "REAL_POSITION_SIZE_LIMIT_BREACHED"
+        ok = False
+        severity = "P0"
+        requires_manual_attention = True
+    elif open_count > 0:
+        status = "REAL_POSITION_PROTECTED_AND_REGISTERED"
+        ok = True
+        severity = "INFO"
+        requires_manual_attention = False
+    elif closed_detected:
+        status = "REAL_POSITION_CLOSED_OR_NOT_FOUND_AFTER_OPEN"
+        ok = True
+        severity = "INFO"
+        requires_manual_attention = False
+    else:
+        status = "NO_REAL_POSITION_OPEN"
+        ok = True
+        severity = "INFO"
+        requires_manual_attention = False
+
+    event = {
+        "ok": ok,
+        "module": "real_position_watchdog_v1",
+        "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+        "generated_at": _rpw_v1_now(),
+        "source": source,
+        "status": status,
+        "severity": severity,
+        "requires_manual_attention": requires_manual_attention,
+        "config": config,
+        "payload_snapshot": snap,
+        "targets_checked": targets,
+        "open_position_count": open_count,
+        "protected_position_count": protected_count,
+        "registered_position_count": registered_count,
+        "unprotected_count": len(unprotected),
+        "unregistered_count": len(unregistered),
+        "oversize_count": len(oversize),
+        "previous_open_count": prev_open_count,
+        "previous_status": prev_status,
+        "closed_detected": closed_detected,
+        "open_positions": open_items,
+        "alerts": {
+            "too_many_positions": too_many,
+            "unprotected": unprotected,
+            "unregistered": unregistered,
+            "oversize": oversize,
+            "errors": errors,
+        },
+        "safety_results": safety_results,
+        "registry_mode": registry_mode,
+        "real_pilot_guard": guard,
+        "notes": [
+            "Watchdog V1 é read-only: não abre, fecha ou altera ordens.",
+            "Usa Post-Execution Safety, Registry Persistence e Registry Mode como fontes de verificação.",
+            "Se detectar posição real sem stop, excesso de posições ou ausência de Registry, gera alerta e requer atenção manual.",
+        ],
+        "token_value_exposed": False,
+    }
+    return event
+
+
+def _rpw_v1_message(event):
+    status = str((event or {}).get("status") or "").upper()
+    if status == "REAL_POSITION_OPEN_WITHOUT_STOP_CONFIRMED":
+        title = "🚨 POSIÇÃO REAL ABERTA SEM STOP CONFIRMADO"
+    elif status == "REAL_POSITION_OPEN_WITHOUT_REGISTRY_CONFIRMED":
+        title = "🚨 POSIÇÃO REAL SEM REGISTRY CONFIRMADO"
+    elif status in {"REAL_POSITION_LIMIT_BREACHED", "REAL_POSITION_SIZE_LIMIT_BREACHED"}:
+        title = "🚨 LIMITE DO PILOTO REAL VIOLADO"
+    elif status == "REAL_POSITION_PROTECTED_AND_REGISTERED":
+        title = "✅ POSIÇÃO REAL PROTEGIDA — CENTRAL QUANT"
+    elif status == "REAL_POSITION_CLOSED_OR_NOT_FOUND_AFTER_OPEN":
+        title = "ℹ️ POSIÇÃO REAL FECHADA OU NÃO ENCONTRADA"
+    elif status == "NO_REAL_POSITION_OPEN":
+        title = "ℹ️ WATCHDOG REAL — SEM POSIÇÃO ABERTA"
+    else:
+        title = "⚠️ REAL POSITION WATCHDOG — CENTRAL QUANT"
+
+    snap = (event or {}).get("payload_snapshot") or {}
+    cfg = (event or {}).get("config") or {}
+    lines = [title, f"Data/hora: {_rpw_v1_now()}", ""]
+    lines += [
+        f"Status: {(event or {}).get('status')}",
+        f"Open REAL: {(event or {}).get('open_position_count')}",
+        f"Protegidas: {(event or {}).get('protected_position_count')}",
+        f"Registradas: {(event or {}).get('registered_position_count')}",
+        f"Sem stop: {(event or {}).get('unprotected_count')}",
+        f"Sem Registry: {(event or {}).get('unregistered_count')}",
+        f"Acima do limite: {(event or {}).get('oversize_count')}",
+        "",
+        f"Bot: {snap.get('bot') or '-'}",
+        f"Setup: {snap.get('setup') or '-'}",
+        f"Ativo: {snap.get('symbol') or 'BTCUSDT/ETHUSDT'}",
+        f"Side: {snap.get('side') or '-'}",
+        f"Limite: {cfg.get('max_notional_usdt')} USDT | máx posições: {cfg.get('max_open_positions')}",
+    ]
+    open_positions = (event or {}).get("open_positions") or []
+    if open_positions:
+        lines += ["", "Posições:"]
+        for item in open_positions[:6]:
+            target = item.get("target") or {}
+            pos = item.get("position") or {}
+            lines.append(
+                f"- {target.get('symbol')} {target.get('side')} | notional={item.get('notional')} | "
+                f"stop={item.get('stop_confirmed_by_central')} | registry={item.get('registry_match')} | id={pos.get('id') or '-'}"
+            )
+    if (event or {}).get("requires_manual_attention"):
+        lines += ["", "AÇÃO IMEDIATA:", "Abra a BingX, confirme se existe stop de proteção e rode /postexecutionsafety."]
+    elif status == "REAL_POSITION_CLOSED_OR_NOT_FOUND_AFTER_OPEN":
+        lines += ["", "Próximo passo:", "Rodar /tradecloseoutcome para avaliar o resultado se o fechamento foi real."]
+    return "\n".join(lines)
+
+
+def _rpw_v1_notice_key(event):
+    open_parts = []
+    for item in (event or {}).get("open_positions") or []:
+        tgt = item.get("target") or {}
+        pos = item.get("position") or {}
+        open_parts.append(f"{tgt.get('symbol')}:{tgt.get('side')}:{pos.get('id') or pos.get('entryPrice') or item.get('notional')}")
+    return "|".join([
+        str((event or {}).get("status") or ""),
+        str((event or {}).get("open_position_count") or 0),
+        ",".join(sorted(open_parts))[:300],
+    ])
+
+
+def _rpw_v1_is_duplicate_notice(event):
+    try:
+        config = _rpw_v1_config()
+        key = _rpw_v1_notice_key(event)
+        now = time.time()
+        expired = [k for k, ts in _REAL_POSITION_WATCHDOG_V1_RECENT_NOTICES.items() if now - ts > max(120, int(config.get("dedup_seconds") or 60) * 4)]
+        for k in expired[:200]:
+            _REAL_POSITION_WATCHDOG_V1_RECENT_NOTICES.pop(k, None)
+        last = _REAL_POSITION_WATCHDOG_V1_RECENT_NOTICES.get(key)
+        if last is not None and now - last < int(config.get("dedup_seconds") or 60):
+            return True
+        _REAL_POSITION_WATCHDOG_V1_RECENT_NOTICES[key] = now
+    except Exception:
+        return False
+    return False
+
+
+def real_position_watchdog_v1_notify(event=None, force=False):
+    event = event if isinstance(event, dict) else {}
+    config = _rpw_v1_config()
+    should_send = bool(config.get("enabled") and config.get("notify_telegram"))
+    status = str(event.get("status") or "").upper()
+    if status == "NO_REAL_POSITION_OPEN" and not force:
+        should_send = False
+    if status == "REAL_POSITION_PROTECTED_AND_REGISTERED" and not config.get("notify_ok") and not force:
+        should_send = False
+    if status == "REAL_POSITION_CLOSED_OR_NOT_FOUND_AFTER_OPEN" and not config.get("notify_closed") and not force:
+        should_send = False
+    if event.get("requires_manual_attention") and not config.get("notify_alerts") and not force:
+        should_send = False
+    duplicate = _rpw_v1_is_duplicate_notice(event)
+    if duplicate and not force:
+        should_send = False
+
+    message = _rpw_v1_message(event)
+    sent = False
+    error = None
+    if should_send:
+        try:
+            token = globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")
+            chat_id = globals().get("CENTRAL_TELEGRAM_CHAT_ID")
+            if token and chat_id and callable(globals().get("telegram_send_with_token")):
+                sent = bool(telegram_send_with_token(token, chat_id, message, title="REAL POSITION WATCHDOG"))
+            elif token and chat_id:
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                response = requests.post(url, json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True}, timeout=20)
+                sent = response.status_code == 200
+                if not sent:
+                    error = response.text[:300]
+            else:
+                error = "CENTRAL_TELEGRAM_BOT_TOKEN ou CENTRAL_TELEGRAM_CHAT_ID ausente"
+        except Exception as exc:
+            error = str(exc)
+            sent = False
+    return {
+        "ok": bool(sent) if should_send else True,
+        "module": "real_position_watchdog_v1",
+        "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+        "generated_at": _rpw_v1_now(),
+        "should_send": should_send,
+        "sent": sent,
+        "duplicate": duplicate,
+        "error": error,
+        "status": event.get("status"),
+        "token_value_exposed": False,
+    }
+
+
+def real_position_watchdog_v1_assess(payload=None, source="manual", notify=False, force_notify=False, all_allowed=True):
+    event = _rpw_v1_classify_watch(payload=payload, source=source, all_allowed=all_allowed)
+    notification = None
+    try:
+        if notify or force_notify:
+            notification = real_position_watchdog_v1_notify(event, force=force_notify)
+            event["notification"] = notification
+    except Exception as exc:
+        event["notification"] = {"ok": False, "sent": False, "status": "WATCHDOG_NOTIFY_ERROR", "error": str(exc)}
+    _rpw_v1_append_event(event)
+    try:
+        _rpw_v1_write_json(REAL_POSITION_WATCHDOG_V1_STATE_FILE, {
+            "updated_at": _rpw_v1_now(),
+            "last_status": event.get("status"),
+            "last_open_count": event.get("open_position_count"),
+            "last_event": {
+                "status": event.get("status"),
+                "open_position_count": event.get("open_position_count"),
+                "protected_position_count": event.get("protected_position_count"),
+                "registered_position_count": event.get("registered_position_count"),
+            },
+        })
+    except Exception:
+        pass
+    return _rpw_v1_sanitize_public(event)
+
+
+def real_position_watchdog_v1_health_payload():
+    config = _rpw_v1_config()
+    preview = real_position_watchdog_v1_assess(
+        payload={"bot": "FALCON", "setup": "FALCON", "symbol": "BTCUSDT", "side": "SHORT"},
+        source="health",
+        notify=False,
+        force_notify=False,
+        all_allowed=True,
+    )
+    ok = bool(
+        config.get("enabled")
+        and callable(globals().get("build_post_execution_safety_check_v1"))
+        and callable(_ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_POSITION_WATCHDOG_V1)
+        and isinstance(preview, dict)
+        and preview.get("ok") is not False
+    )
+    return _rpw_v1_sanitize_public({
+        "ok": ok,
+        "module": "real_position_watchdog_v1",
+        "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+        "generated_at": _rpw_v1_now(),
+        "status": "REAL_POSITION_WATCHDOG_READY" if ok else "REAL_POSITION_WATCHDOG_NOT_READY",
+        "config": config,
+        "run_execution_engine_wrapped": callable(_ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_POSITION_WATCHDOG_V1),
+        "post_execution_safety_available": callable(globals().get("build_post_execution_safety_check_v1")),
+        "registry_mode_available": callable(globals().get("registry_mode_segregation_v1_gate_check")),
+        "real_pilot_guard_available": callable(globals().get("real_pilot_guard_v1_validate")),
+        "telegram_available": bool(config.get("telegram_token_configured") and config.get("telegram_chat_configured")),
+        "events_file": str(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE) if REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None else None,
+        "latest_file": str(REAL_POSITION_WATCHDOG_V1_LATEST_FILE) if REAL_POSITION_WATCHDOG_V1_LATEST_FILE is not None else None,
+        "state_file": str(REAL_POSITION_WATCHDOG_V1_STATE_FILE) if REAL_POSITION_WATCHDOG_V1_STATE_FILE is not None else None,
+        "preview": preview,
+        "routes": [
+            "/realpositionwatchdog/health",
+            "/realpositionwatchdog",
+            "/realpositionwatchdog?notify=true&ack=REAL_POSITION_WATCHDOG_NOTIFY",
+            "/realpositionwatchdog/log",
+            "/postexecutionsafety?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON",
+        ],
+        "notes": [
+            "Health/watchdog são read-only e não enviam ordem à BingX.",
+            "O wrapper roda automaticamente após execução real dry_run=False para conferir posição, stop e Registry.",
+            "Telegram só é enviado por padrão em alerta ou fechamento detectado; status OK não gera spam, salvo force_notify.",
+        ],
+        "token_value_exposed": False,
+    })
+
+
+@app.route("/realpositionwatchdog/health", methods=["GET"])
+@app.route("/real/positionwatchdog/health", methods=["GET"])
+def real_position_watchdog_v1_health_route():
+    return real_position_watchdog_v1_health_payload(), 200
+
+
+@app.route("/realpositionwatchdog", methods=["GET", "POST"])
+@app.route("/real/positionwatchdog", methods=["GET", "POST"])
+def real_position_watchdog_v1_route():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
+    payload.setdefault("bot", request.args.get("bot") or "FALCON")
+    payload.setdefault("setup", request.args.get("setup") or payload.get("bot") or "FALCON")
+    if request.args.get("symbol"):
+        payload["symbol"] = request.args.get("symbol")
+    if request.args.get("side"):
+        payload["side"] = request.args.get("side")
+    notify = _rpw_v1_bool(request.args.get("notify") or payload.get("notify"), False)
+    force_notify = _rpw_v1_bool(request.args.get("force_notify") or payload.get("force_notify"), False)
+    ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
+    if (notify or force_notify) and ack not in {"REAL_POSITION_WATCHDOG_NOTIFY", "REAL_POSITION_WATCHDOG_ALERT"}:
+        return {
+            "ok": False,
+            "status": "ACK_REQUIRED",
+            "required_ack": "REAL_POSITION_WATCHDOG_NOTIFY",
+            "note": "Esta rota é read-only; o ack apenas evita spam/alerta acidental no Telegram.",
+            "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+        }, 400
+    all_allowed = not bool(payload.get("symbol") and payload.get("side")) or _rpw_v1_bool(request.args.get("all_allowed"), False)
+    result = real_position_watchdog_v1_assess(
+        payload=payload,
+        source="route",
+        notify=notify,
+        force_notify=force_notify,
+        all_allowed=all_allowed,
+    )
+    return result, 200
+
+
+@app.route("/realpositionwatchdog/log", methods=["GET"])
+@app.route("/real/positionwatchdog/log", methods=["GET"])
+def real_position_watchdog_v1_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    payload = _rpw_v1_read_events(limit=limit)
+    payload.update({
+        "module": "real_position_watchdog_v1",
+        "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+        "generated_at": _rpw_v1_now(),
+        "events_file": str(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE) if REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None else None,
+        "latest_file": str(REAL_POSITION_WATCHDOG_V1_LATEST_FILE) if REAL_POSITION_WATCHDOG_V1_LATEST_FILE is not None else None,
+        "token_value_exposed": False,
+    })
+    return _rpw_v1_sanitize_public(payload), 200
+
+
+# Wrapper final: depois de qualquer execução real LIVE, o Watchdog faz auditoria read-only.
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_POSITION_WATCHDOG_V1
+    payload_dict = dict(payload or {}) if isinstance(payload, dict) else {}
+    dry = _rpw_v1_bool(dry_run, default=True)
+    mode_norm = str(mode or payload_dict.get("mode") or "LIVE").upper().strip()
+    if not callable(original_runner):
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_RUNNER_MISSING_AFTER_REAL_POSITION_WATCHDOG",
+            "sent": False,
+            "mode": mode_norm,
+            "dry_run": dry,
+            "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+            "token_value_exposed": False,
+        }
+
+    result = original_runner(payload=payload_dict, mode=mode, dry_run=dry_run, *args, **kwargs)
+    try:
+        if isinstance(result, dict) and (not dry) and mode_norm == "LIVE":
+            watch = real_position_watchdog_v1_assess(
+                payload=payload_dict,
+                source="after_live_execution",
+                notify=True,
+                force_notify=False,
+                all_allowed=True,
+            )
+            result.setdefault("real_position_watchdog_v1", watch)
+            if isinstance(result.get("payload"), dict):
+                result["payload"].setdefault("real_position_watchdog_v1", watch)
+    except Exception as exc:
+        try:
+            if isinstance(result, dict):
+                result.setdefault("real_position_watchdog_v1", {
+                    "ok": False,
+                    "status": "REAL_POSITION_WATCHDOG_ATTACH_ERROR",
+                    "error": str(exc),
+                    "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+                    "token_value_exposed": False,
+                })
+        except Exception:
+            pass
+    return result
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
