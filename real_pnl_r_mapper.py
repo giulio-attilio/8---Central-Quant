@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-REAL PNL/R MAPPER — CENTRAL QUANT V2.4.1
-Versão: 2026-07-05-REAL-PNL-R-MAPPER-V2.4.1
+REAL PNL/R MAPPER — CENTRAL QUANT V2.5
+Versão: 2026-07-07-REAL-PNL-R-MAPPER-V2.5
 
 Objetivo:
 - Mapear PnL real e R real a partir de trades encerrados.
@@ -32,7 +32,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-VERSION = "2026-07-05-REAL-PNL-R-MAPPER-V2.4.1"
+VERSION = "2026-07-07-REAL-PNL-R-MAPPER-V2.5"
 MODULE = "real_pnl_r_mapper"
 MODE = "OBSERVATION_ONLY"
 
@@ -41,8 +41,27 @@ TRADE_REGISTRY_FILE = os.path.join(DATA_DIR, "trade_registry.jsonl")
 HISTORY_EVENTS_FILE = os.path.join(DATA_DIR, "history_events.jsonl")
 HISTORY_EXPORT_FILE = os.path.join(DATA_DIR, "history_export.json")
 DECISION_LOG_FILE = os.path.join(DATA_DIR, "decision_log.jsonl")
+
+# Fontes potencialmente reais/auditáveis. Nem todas precisam existir.
+# O mapper V2.5 filtra os registros e só conta como Real PnL/R quando
+# houver marcador explícito de LIVE/REAL/BROKER/BINGX e não for dry_run/VERIFY/PAPER.
+EXECUTION_ENGINE_LOG_FILE = os.path.join(DATA_DIR, "execution_engine_log.jsonl")
+EXECUTION_LOG_FILE = os.path.join(DATA_DIR, "execution_log.jsonl")
+REAL_CLOSE_AUTO_EVALUATOR_EVENTS_FILE = os.path.join(DATA_DIR, "real_close_auto_evaluator_v1_events.jsonl")
+AUTO_REAL_EXECUTION_BRIDGE_EVENTS_FILE = os.path.join(DATA_DIR, "auto_real_execution_bridge_v1_events.jsonl")
+REAL_POSITION_WATCHDOG_EVENTS_FILE = os.path.join(DATA_DIR, "real_position_watchdog_v1_events.jsonl")
+
 OUTPUT_MAP_FILE = os.path.join(DATA_DIR, "real_pnl_r_map.json")
 OUTPUT_EVENTS_FILE = os.path.join(DATA_DIR, "real_pnl_r_events.jsonl")
+
+STRICT_REAL_SOURCES = os.environ.get("REAL_PNL_R_STRICT_REAL_SOURCES", "true").strip().lower() in {
+    "1", "true", "yes", "sim", "on"
+}
+ALLOW_LEGACY_HISTORY_SOURCES = os.environ.get("REAL_PNL_R_ALLOW_LEGACY_HISTORY_SOURCES", "false").strip().lower() in {
+    "1", "true", "yes", "sim", "on"
+}
+
+LEGACY_STATISTICAL_SOURCES = {"history_events", "history_export", "decision_log"}
 
 EMPTY_VALUES = {None, "", "null", "None", "NONE", "N/A", "nan", "NaN"}
 
@@ -250,6 +269,112 @@ def _source_list(value: Any) -> List[str]:
     if value:
         return [str(value)]
     return []
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    try:
+        s = str(value).strip().lower()
+    except Exception:
+        return default
+    if s in {"1", "true", "yes", "sim", "on", "live", "sent", "ok"}:
+        return True
+    if s in {"0", "false", "no", "nao", "não", "off", "dry_run", "paper", "verify"}:
+        return False
+    return default
+
+
+def _upper_values(row: Dict[str, Any], keys: Iterable[str]) -> List[str]:
+    merged = _flatten_payload(row)
+    values: List[str] = []
+    for key in keys:
+        value = merged.get(key)
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                if not _is_empty(item):
+                    values.append(str(item).upper().strip())
+        elif not _is_empty(value):
+            values.append(str(value).upper().strip())
+    return values
+
+
+def _is_real_trade_candidate(item: Dict[str, Any], raw_row: Dict[str, Any], source: str) -> bool:
+    """
+    Decide se um registro pode entrar no Real PnL/R auditável.
+
+    V2.5 é propositalmente conservador: histórico estatístico, decision_log,
+    PAPER, VERIFY, SHADOW e dry_run não entram como resultado financeiro real.
+    Para entrar, o registro precisa carregar marcador explícito de LIVE/REAL/BROKER/BINGX
+    ou evidência de envio real ao broker.
+    """
+    merged = _flatten_payload(raw_row if isinstance(raw_row, dict) else {})
+    source_name = str(source or "").lower().strip()
+
+    # Fontes legadas são estatísticas por padrão. Podem ser liberadas por env
+    # apenas se o registro também trouxer marcador real explícito.
+    legacy_source = source_name in LEGACY_STATISTICAL_SOURCES
+
+    mode_values = _upper_values(merged, [
+        "mode", "execution_mode", "order_mode", "run_mode", "environment",
+        "source_mode", "trade_mode", "payload_mode", "status_mode",
+    ])
+    source_values = _upper_values(merged, [
+        "source", "source_type", "origin", "executor", "executor_route",
+        "broker", "exchange", "venue", "execution_source", "registry_source",
+    ])
+    status_values = _upper_values(merged, [
+        "status", "event", "event_raw", "type", "kind", "route", "decision",
+    ])
+
+    combined = " ".join(mode_values + source_values + status_values)
+
+    dry_run = any(_safe_bool(merged.get(k), False) for k in [
+        "dry_run", "broker_dry_run", "preview", "preview_only", "test_mode", "paper", "shadow"
+    ])
+    if dry_run:
+        return False
+
+    # Exclui marcadores não reais quando não há LIVE explícito.
+    has_live_marker = any(x in combined for x in ["LIVE", "REAL", "BROKER", "BINGX", "EXCHANGE"])
+    has_non_real_marker = any(x in combined for x in ["PAPER", "VERIFY", "SHADOW", "OBSERVATION_ONLY", "DRY_RUN", "PREVIEW"])
+    if has_non_real_marker and not has_live_marker:
+        return False
+
+    sent_real = any(_safe_bool(merged.get(k), False) for k in [
+        "sent", "live_sent", "order_sent", "broker_sent", "real_sent", "executed", "filled"
+    ])
+    broker_ids = [
+        merged.get("live_order_id"), merged.get("bingx_order_id"), merged.get("broker_order_id"),
+        merged.get("exchange_order_id"), merged.get("orderId"), merged.get("order_id"),
+        merged.get("client_order_id"), merged.get("position_id"),
+    ]
+    has_broker_id = any(not _is_empty(x) and len(str(x)) >= 4 for x in broker_ids)
+
+    explicit_real_source = any(x in combined for x in [
+        "LIVE", "REAL", "BROKER", "BINGX", "EXCHANGE", "REAL_CLOSE", "LIVE_SENT"
+    ])
+
+    if legacy_source and not ALLOW_LEGACY_HISTORY_SOURCES:
+        # Mesmo com PnL%, history_events/decision_log não são prova financeira real.
+        return bool(explicit_real_source and (sent_real or has_broker_id))
+
+    return bool(explicit_real_source or sent_real or has_broker_id or item.get("source") in {
+        "execution_engine_log", "execution_log", "real_close_auto_evaluator",
+        "auto_real_execution_bridge", "real_position_watchdog",
+    })
+
+
+def _filter_real_rows(normalized: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Mantém apenas fechamentos reais auditáveis e completos o suficiente para estatística."""
+    out: List[Dict[str, Any]] = []
+    for row in normalized:
+        if not row.get("real_audit_candidate"):
+            continue
+        out.append(row)
+    return out
 
 
 # ==========================================================
@@ -587,12 +712,17 @@ def get_real_pnl_r_health() -> Dict[str, Any]:
             "history_events_exists": os.path.exists(HISTORY_EVENTS_FILE),
             "history_export_exists": os.path.exists(HISTORY_EXPORT_FILE),
             "decision_log_exists": os.path.exists(DECISION_LOG_FILE),
+            "execution_engine_log_exists": os.path.exists(EXECUTION_ENGINE_LOG_FILE),
+            "execution_log_exists": os.path.exists(EXECUTION_LOG_FILE),
+            "real_close_auto_evaluator_events_exists": os.path.exists(REAL_CLOSE_AUTO_EVALUATOR_EVENTS_FILE),
+            "auto_real_execution_bridge_events_exists": os.path.exists(AUTO_REAL_EXECUTION_BRIDGE_EVENTS_FILE),
+            "real_position_watchdog_events_exists": os.path.exists(REAL_POSITION_WATCHDOG_EVENTS_FILE),
             "output_map_exists": os.path.exists(OUTPUT_MAP_FILE),
             "output_events_exists": os.path.exists(OUTPUT_EVENTS_FILE),
         },
         "notes": [
-            "V2.4.1 mapeia PnL real e R real de trades encerrados.",
-            "Enriquece trades incompletos cruzando fontes por trade_id, bot/símbolo/lado e símbolo/lado.",
+            "V2.5 mapeia PnL/R real apenas quando há marcador auditável LIVE/REAL/BROKER/BINGX.",
+            "Por padrão, history_events, history_export e decision_log não entram como PnL real financeiro.",
             "Não executa ordens, não altera lotes e não muda risco real.",
         ],
     }
@@ -601,6 +731,13 @@ def get_real_pnl_r_health() -> Dict[str, Any]:
 def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Dict[str, Any]:
     raw_sources: List[Tuple[str, List[Dict[str, Any]]]] = [
         ("trade_registry", _read_jsonl(TRADE_REGISTRY_FILE, limit=limit)),
+        ("execution_engine_log", _read_jsonl(EXECUTION_ENGINE_LOG_FILE, limit=limit)),
+        ("execution_log", _read_jsonl(EXECUTION_LOG_FILE, limit=limit)),
+        ("real_close_auto_evaluator", _read_jsonl(REAL_CLOSE_AUTO_EVALUATOR_EVENTS_FILE, limit=limit)),
+        ("auto_real_execution_bridge", _read_jsonl(AUTO_REAL_EXECUTION_BRIDGE_EVENTS_FILE, limit=limit)),
+        ("real_position_watchdog", _read_jsonl(REAL_POSITION_WATCHDOG_EVENTS_FILE, limit=limit)),
+        # Fontes legadas continuam lidas para diagnóstico, mas V2.5 não as conta como Real PnL/R
+        # sem marcador explícito de broker/live.
         ("history_events", _read_jsonl(HISTORY_EVENTS_FILE, limit=limit)),
         ("history_export", _load_history_export_rows()),
         ("decision_log", _read_jsonl(DECISION_LOG_FILE, limit=limit)),
@@ -608,12 +745,20 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
 
     normalized: List[Dict[str, Any]] = []
     source_counts: Dict[str, int] = {}
+    skipped_non_real_count = 0
+    skipped_non_real_by_source: Dict[str, int] = defaultdict(int)
     for source, rows in raw_sources:
         source_counts[source] = len(rows)
         for row in rows:
             item = _normalize_trade(row, source)
-            if item:
-                normalized.append(item)
+            if not item:
+                continue
+            item["real_audit_candidate"] = _is_real_trade_candidate(item, row, source)
+            if STRICT_REAL_SOURCES and not item.get("real_audit_candidate"):
+                skipped_non_real_count += 1
+                skipped_non_real_by_source[source] += 1
+                continue
+            normalized.append(item)
 
     merged = _merge_trades(normalized)
     closed = [r for r in merged if r.get("closed") or r.get("status") == "CLOSED"]
@@ -626,13 +771,19 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "generated_at": _now_br(),
         "mode": MODE,
         "notes": [
-            "Real PnL/R Mapper V2.4.1 apenas observa e calcula métricas.",
-            "Não executa trades, não altera lotes e não altera policies ativas.",
+            "Real PnL/R Mapper V2.5 apenas observa e calcula métricas.",
+            "Só conta como resultado real financeiro registros auditáveis LIVE/REAL/BROKER/BINGX.",
+            "history_events/history_export/decision_log são fontes estatísticas e ficam fora por padrão.",
             "PnL% é calculado quando há entry/exit; R é calculado quando há entry/stop/exit.",
-            "Trades incompletos agora aparecem em diagnostics.by_issue, não como perda/zero silencioso.",
+            "Trades incompletos aparecem em diagnostics.by_issue, não como perda/zero silencioso.",
         ],
         "files": {
             "trade_registry": TRADE_REGISTRY_FILE,
+            "execution_engine_log": EXECUTION_ENGINE_LOG_FILE,
+            "execution_log": EXECUTION_LOG_FILE,
+            "real_close_auto_evaluator_events": REAL_CLOSE_AUTO_EVALUATOR_EVENTS_FILE,
+            "auto_real_execution_bridge_events": AUTO_REAL_EXECUTION_BRIDGE_EVENTS_FILE,
+            "real_position_watchdog_events": REAL_POSITION_WATCHDOG_EVENTS_FILE,
             "history_events": HISTORY_EVENTS_FILE,
             "history_export": HISTORY_EXPORT_FILE,
             "decision_log": DECISION_LOG_FILE,
@@ -640,6 +791,10 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
             "output_events": OUTPUT_EVENTS_FILE,
         },
         "source_counts": source_counts,
+        "strict_real_sources": STRICT_REAL_SOURCES,
+        "allow_legacy_history_sources": ALLOW_LEGACY_HISTORY_SOURCES,
+        "skipped_non_real_count": skipped_non_real_count,
+        "skipped_non_real_by_source": dict(sorted(skipped_non_real_by_source.items())),
         "normalized_count": len(normalized),
         "mapped_count": len(merged),
         "closed_count": len(closed),
@@ -679,12 +834,15 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:
     by_issue = diagnostics.get("by_issue", {}) or {}
 
     lines = []
-    lines.append("💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.4.1")
+    lines.append("💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.5")
     lines.append(f"Data/hora: {payload.get('generated_at')}")
     lines.append(f"Status: {'✅' if payload.get('ok') else '❌'}")
     lines.append(f"Modo: {payload.get('mode', MODE)}")
     lines.append("")
     lines.append("Resumo geral:")
+    if int(summary.get('trades', 0) or 0) <= 0:
+        lines.append("- Nenhum trade real fechado auditável encontrado.")
+        lines.append("- Histórico estatístico/PAPER/VERIFY não é contado como Real PnL/R financeiro na V2.5.")
     lines.append(f"- Trades fechados: {summary.get('trades', 0)}")
     lines.append(f"- Wins: {summary.get('wins', 0)} | Losses: {summary.get('losses', 0)} | BE: {summary.get('breakeven', 0)}")
     lines.append(f"- Win rate: {summary.get('win_rate_pct', 0)}%")
@@ -717,7 +875,8 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:
             )
     lines.append("")
     lines.append("Observação:")
-    lines.append("- V2.4.1 ainda não muda lote, risco ou execução. Ela melhora a ponte estatística entre resultado real e aprendizagem da Central.")
+    lines.append("- V2.5 não mistura history_events/decision_log com resultado real financeiro.")
+    lines.append("- Continua observacional: não muda lote, risco, execução ou policies ativas.")
     return "\n".join(lines)
 
 

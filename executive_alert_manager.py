@@ -1,6 +1,6 @@
 # executive_alert_manager.py
-# CENTRAL QUANT — EXECUTIVE ALERT MANAGER V2
-# Versão: 2026-07-04-EXECUTIVE-ALERT-MANAGER-V2
+# CENTRAL QUANT — EXECUTIVE ALERT MANAGER V2.1
+# Versão: 2026-07-07-EXECUTIVE-ALERT-MANAGER-V2.1
 #
 # Objetivo:
 # - Decidir quando a Central Quant deve interromper o CEO.
@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
-VERSION = "2026-07-04-EXECUTIVE-ALERT-MANAGER-V2"
+VERSION = "2026-07-07-EXECUTIVE-ALERT-MANAGER-V2.1"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -185,6 +185,146 @@ def _extract_memory_pct(pipeline: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _dict_at(d: Dict[str, Any], *keys: str) -> Dict[str, Any]:
+    cur: Any = d
+    for key in keys:
+        if not isinstance(cur, dict):
+            return {}
+        cur = cur.get(key)
+    return cur if isinstance(cur, dict) else {}
+
+
+def _extract_real_execution_context(pipeline: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extrai um contexto conservador sobre execução real.
+
+    Nem todo pipeline expõe /live ou /sync. Quando não há dados de posição,
+    V2.1 não presume exposição aberta; apenas sinaliza que a Central está armada.
+    """
+    pipeline = pipeline if isinstance(pipeline, dict) else {}
+    summary = pipeline.get("daily_report_summary") or {}
+    live_snapshot = (
+        pipeline.get("live_snapshot")
+        or pipeline.get("real_snapshot")
+        or pipeline.get("broker_snapshot")
+        or pipeline.get("sync_snapshot")
+        or pipeline.get("live")
+        or {}
+    )
+    sync = pipeline.get("sync") or pipeline.get("central_bingx_sync") or pipeline.get("live_sync") or {}
+    broker = pipeline.get("broker") or pipeline.get("broker_status") or {}
+
+    broker_open = _first_present(
+        live_snapshot.get("broker_open_count") if isinstance(live_snapshot, dict) else None,
+        live_snapshot.get("bingx_open_count") if isinstance(live_snapshot, dict) else None,
+        sync.get("broker_positions_count") if isinstance(sync, dict) else None,
+        sync.get("bingx_positions") if isinstance(sync, dict) else None,
+        pipeline.get("broker_open_count"),
+        pipeline.get("bingx_open_count"),
+        summary.get("broker_open_count") if isinstance(summary, dict) else None,
+    )
+    central_live = _first_present(
+        live_snapshot.get("central_live_count") if isinstance(live_snapshot, dict) else None,
+        sync.get("central_live_positions_count") if isinstance(sync, dict) else None,
+        sync.get("central_live_positions") if isinstance(sync, dict) else None,
+        pipeline.get("central_live_count"),
+        summary.get("central_live_count") if isinstance(summary, dict) else None,
+    )
+    only_broker = _first_present(
+        sync.get("only_broker_count") if isinstance(sync, dict) else None,
+        sync.get("only_bingx_count") if isinstance(sync, dict) else None,
+        pipeline.get("only_broker_count"),
+        pipeline.get("only_bingx_count"),
+    )
+    only_central = _first_present(
+        sync.get("only_central_count") if isinstance(sync, dict) else None,
+        pipeline.get("only_central_count"),
+    )
+
+    broker_ready = _first_present(
+        broker.get("ready") if isinstance(broker, dict) else None,
+        pipeline.get("broker_ready"),
+        pipeline.get("broker_available"),
+    )
+    disaster_stop_confirmed = _first_present(
+        pipeline.get("disaster_stop_confirmed"),
+        pipeline.get("disaster_stop_configured"),
+        live_snapshot.get("disaster_stop_confirmed") if isinstance(live_snapshot, dict) else None,
+    )
+    recent_live_sent = _first_present(
+        pipeline.get("recent_live_sent"),
+        pipeline.get("live_sent_recently"),
+        live_snapshot.get("recent_live_sent") if isinstance(live_snapshot, dict) else None,
+    )
+
+    return {
+        "real_execution_enabled": bool(pipeline.get("real_execution_enabled")),
+        "broker_open_count": _safe_int(broker_open, 0) if broker_open is not None else None,
+        "central_live_count": _safe_int(central_live, 0) if central_live is not None else None,
+        "only_broker_count": _safe_int(only_broker, 0) if only_broker is not None else 0,
+        "only_central_count": _safe_int(only_central, 0) if only_central is not None else 0,
+        "broker_ready": broker_ready,
+        "disaster_stop_confirmed": disaster_stop_confirmed,
+        "recent_live_sent": bool(recent_live_sent),
+    }
+
+
+def _real_execution_alert_from_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    broker_open = ctx.get("broker_open_count")
+    central_live = ctx.get("central_live_count")
+    only_broker = _safe_int(ctx.get("only_broker_count"), 0)
+    only_central = _safe_int(ctx.get("only_central_count"), 0)
+    broker_ready = ctx.get("broker_ready")
+    disaster_stop = ctx.get("disaster_stop_confirmed")
+
+    critical_reasons: List[str] = []
+    if only_broker > 0 or only_central > 0:
+        critical_reasons.append("divergência Central LIVE x BingX")
+    if broker_ready is False:
+        critical_reasons.append("broker não está pronto")
+    if ctx.get("recent_live_sent") and central_live in {None, 0}:
+        critical_reasons.append("execução LIVE recente sem posição LIVE registrada")
+    if broker_open and broker_open > 0 and disaster_stop is False:
+        critical_reasons.append("posição real aberta sem confirmação de stop de desastre")
+
+    if critical_reasons:
+        return {
+            "level": "CRITICAL",
+            "title": "Execução real com risco prático",
+            "message": "A execução real está ativada e há risco prático: " + "; ".join(critical_reasons) + ".",
+            "action": "Investigar /live e /sync imediatamente antes de qualquer nova entrada.",
+            "impact_score": 30,
+            "data": dict(ctx, critical_reasons=critical_reasons),
+        }
+
+    # Quando a Central está armada mas sem exposição/sinais de divergência, não é crítico.
+    if (broker_open == 0 or broker_open is None) and (central_live == 0 or central_live is None):
+        return {
+            "level": "WARNING",
+            "title": "Execução real habilitada sem exposição aberta",
+            "message": "A execução real está habilitada para futuras ordens, mas não há posição real aberta conhecida.",
+            "action": "Confirmar se o modo REAL é intencional e manter stop de desastre/limites prontos para futuras entradas.",
+            "impact_score": 8,
+            "data": ctx,
+        }
+
+    return {
+        "level": "WARNING",
+        "title": "Execução real habilitada",
+        "message": "A execução real está habilitada. Verificar /live e /sync para confirmar exposição e proteção.",
+        "action": "Operar defensivamente e não expandir risco sem validação do modo REAL.",
+        "impact_score": 12,
+        "data": ctx,
+    }
+
+
 def _calculate_health_score(alerts: List[Dict[str, Any]], pipeline: Dict[str, Any]) -> Dict[str, Any]:
     score = 100
     reasons = []
@@ -255,9 +395,10 @@ def executive_alert_manager_health() -> Dict[str, Any]:
             "adaptive_confidence_action_min": ADAPTIVE_CONFIDENCE_ACTION_MIN,
         },
         "notes": [
-            "V2 calcula Health Score operacional interno.",
-            "V2 detecta recuperação de alertas ativos.",
-            "V2 continua sem enviar Telegram diretamente; main deve enviar alerts_to_notify.",
+            "V2.1 calcula Health Score operacional interno.",
+            "V2.1 rebaixa REAL habilitado para WARNING quando não há exposição real/divergência conhecida.",
+            "V2.1 mantém CRITICAL quando há risco prático: divergência, broker não pronto, execução recente sem registro ou posição real sem stop confirmado.",
+            "V2.1 continua sem enviar Telegram diretamente; main deve enviar alerts_to_notify.",
         ],
     }
 
@@ -371,16 +512,18 @@ def _collect_alerts_from_pipeline(pipeline: Dict[str, Any]) -> List[Dict[str, An
             impact_score=10,
         ))
 
-    if bool(pipeline.get("real_execution_enabled")):
+    real_ctx = _extract_real_execution_context(pipeline)
+    if bool(real_ctx.get("real_execution_enabled")):
+        real_alert = _real_execution_alert_from_context(real_ctx)
         alerts.append(_new_alert(
-            level="CRITICAL",
+            level=real_alert.get("level", "WARNING"),
             category="EXECUTION",
             code="REAL_EXECUTION_ENABLED",
-            title="Execução real ativada",
-            message="A execução real está ativada.",
-            action="Confirmar se a ativação foi intencional e se o stop de desastre está configurado.",
-            data={"real_execution_enabled": True},
-            impact_score=30,
+            title=real_alert.get("title") or "Execução real habilitada",
+            message=real_alert.get("message") or "A execução real está habilitada.",
+            action=real_alert.get("action") or "Confirmar se a ativação foi intencional.",
+            data=real_alert.get("data") or real_ctx,
+            impact_score=_safe_int(real_alert.get("impact_score"), 8),
         ))
 
     memory_pct = _extract_memory_pct(pipeline)
@@ -550,7 +693,7 @@ def build_executive_alerts(check_only: bool = False) -> Dict[str, Any]:
         "notes": [
             "CRITICAL e WARNING podem gerar notificação conforme cooldown.",
             "RECOVERY pode notificar quando um alerta crítico é resolvido.",
-            "V2 calcula Health Score para uso interno e CEO Daily.",
+            "V2.1 calcula Health Score para uso interno e CEO Daily.",
         ],
     }
 
