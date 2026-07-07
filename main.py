@@ -31764,14 +31764,16 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
 
 
 # ==========================================================
-# REAL EXECUTION TELEGRAM NOTIFIER V1
+# REAL EXECUTION TELEGRAM NOTIFIER V1.1
 # ==========================================================
 # Objetivo:
 # - Avisar o CEO no Telegram quando houver tentativa de execução real.
 # - Não notificar dry_run/preflight para evitar spam.
 # - Enviar alerta vermelho se ordem real for enviada sem stop/safety OK.
 # - Registrar eventos em /data para auditoria.
-REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION = "2026-07-06-REAL-EXECUTION-TELEGRAM-NOTIFIER-V1"
+# - V1.1: o teste do Telegram usa a configuração atual do Real Pilot Guard
+#   em vez de valores fixos de 10 USDT.
+REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION = "2026-07-06-REAL-EXECUTION-TELEGRAM-NOTIFIER-V1.1-TEST-PAYLOAD-FROM-GUARD-CONFIG"
 
 try:
     _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_EXECUTION_TELEGRAM_NOTIFIER_V1 = run_execution_engine
@@ -31982,6 +31984,69 @@ def _retg_v1_payload_snapshot(payload, result_info=None):
     }
 
 
+
+
+def _retg_v1_build_test_payload_from_guard_config():
+    """
+    Monta o payload de teste do Telegram usando a mesma fonte de verdade
+    do piloto real: Real Pilot Guard + real_execution_config_for_bot.
+
+    Importante:
+    - Não envia ordem real.
+    - Não chama o Execution Engine.
+    - Pode consultar readiness/snapshot do broker porque o Guard já faz isso
+      em modo health/precheck, mas não chama endpoint de envio.
+    """
+    payload = {
+        "bot": request.args.get("bot", "FALCON"),
+        "setup": request.args.get("setup", request.args.get("bot", "FALCON")),
+        "symbol": request.args.get("symbol", "BTCUSDT"),
+        "side": request.args.get("side", "SHORT"),
+        "entry": request.args.get("entry", "108000"),
+        "sl": request.args.get("sl", "109000"),
+        "tp50": request.args.get("tp50", "107000"),
+    }
+
+    # Overrides explícitos continuam possíveis para teste dirigido, mas não há
+    # default fixo de 10 USDT. Sem override, o Guard resolve margem/alavancagem/notional.
+    for key in ("notional_usdt", "margin_usdt", "leverage", "risk_pct", "action", "reduce_only"):
+        try:
+            if key in request.args:
+                payload[key] = request.args.get(key)
+        except Exception:
+            pass
+
+    guard = None
+    try:
+        guard_fn = globals().get("real_pilot_guard_v1_validate")
+        if callable(guard_fn):
+            guard = guard_fn(payload, action="telegram_test")
+    except Exception as exc:
+        guard = {
+            "ok": False,
+            "allowed": False,
+            "status": "REAL_PILOT_GUARD_TEST_ERROR",
+            "error": str(exc),
+            "module": "real_pilot_guard_v1",
+            "version": globals().get("REAL_PILOT_GUARD_V1_VERSION"),
+            "token_value_exposed": False,
+        }
+
+    if isinstance(guard, dict):
+        payload["real_pilot_guard_v1"] = guard
+        payload["real_guard"] = guard
+        trade = guard.get("trade") if isinstance(guard.get("trade"), dict) else {}
+        # Preenche o payload somente com os valores resolvidos pelo Guard.
+        # A mensagem continua usando guard.trade como prioridade.
+        if trade.get("margin_usdt") is not None:
+            payload["margin_usdt"] = trade.get("margin_usdt")
+        if trade.get("leverage") is not None:
+            payload["leverage"] = trade.get("leverage")
+        if trade.get("notional_usdt") is not None:
+            payload["notional_usdt"] = trade.get("notional_usdt")
+
+    return payload, guard if isinstance(guard, dict) else {}
+
 def _retg_v1_classify_event(payload, result, dry_run=False, mode=None):
     result = result if isinstance(result, dict) else {}
     info = _retg_v1_extract_result(result)
@@ -32185,22 +32250,14 @@ def real_execution_telegram_notifier_v1_health_route():
                 "required_ack": "REAL_EXECUTION_TELEGRAM_TEST",
             }
         else:
-            payload = {
-                "bot": request.args.get("bot", "FALCON"),
-                "setup": request.args.get("setup", "FALCON"),
-                "symbol": request.args.get("symbol", "BTCUSDT"),
-                "side": request.args.get("side", "SHORT"),
-                "entry": request.args.get("entry", "108000"),
-                "sl": request.args.get("sl", "109000"),
-                "tp50": request.args.get("tp50", "107000"),
-                "notional_usdt": request.args.get("notional_usdt", "10"),
-                "margin_usdt": request.args.get("margin_usdt", "10"),
-                "leverage": request.args.get("leverage", "1"),
-            }
+            payload, guard = _retg_v1_build_test_payload_from_guard_config()
             fake_result = {
                 "ok": True,
                 "status": "REAL_EXECUTION_TELEGRAM_TEST_ONLY",
+                "real_pilot_guard_v1": guard,
+                "real_guard": guard,
                 "payload": {
+                    "real_guard": guard,
                     "live_result": {
                         "ok": True,
                         "sent": False,
@@ -32208,6 +32265,7 @@ def real_execution_telegram_notifier_v1_health_route():
                         "requires_manual_attention": False,
                         "disaster_stop": {"ok": True, "status": "TEST_ONLY"},
                         "post_execution_safety": {"ok": True, "status": "TEST_ONLY"},
+                        "real_guard": guard,
                     }
                 },
             }
@@ -32219,6 +32277,10 @@ def real_execution_telegram_notifier_v1_health_route():
                 dry_run=False,
                 force=True,
             )
+            if isinstance(test_result, dict):
+                test_result["test_payload_source"] = "real_pilot_guard_v1.trade"
+                test_result["guard_status"] = guard.get("status") if isinstance(guard, dict) else None
+                test_result["guard_allowed"] = guard.get("allowed") if isinstance(guard, dict) else None
     return {
         "ok": bool(config.get("enabled") and config.get("telegram_token_configured") and config.get("telegram_chat_configured")),
         "module": "real_execution_telegram_notifier_v1",
@@ -32238,6 +32300,7 @@ def real_execution_telegram_notifier_v1_health_route():
         "notes": [
             "Esta rota de health não envia ordem real.",
             "send_test=true envia apenas uma mensagem de teste ao Telegram; não chama a BingX.",
+            "V1.1: send_test usa margem/alavancagem/notional resolvidos pelo Real Pilot Guard.",
             "dry_run/preflight não gera alerta por padrão para evitar spam.",
             "Execução real dry_run=False gera alerta quando enviada, bloqueada ou falha antes do envio.",
         ],
