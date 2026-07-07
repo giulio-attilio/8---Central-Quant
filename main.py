@@ -37254,6 +37254,414 @@ def build_ceo_daily_report_v2(*args, **kwargs):
     return build_ceo_daily_report(*args, **kwargs)
 
 
+# ==========================================================
+# MEMORY DIET V1 — CEO DAILY SNAPSHOT SAFE BY DEFAULT
+# ==========================================================
+# Objetivo:
+# - Fazer /ceodaily ser leve por padrão no Render 512MB.
+# - Nunca montar PnL/ranking/history completos automaticamente.
+# - Salvar snapshot leve em /data/ceo_daily_snapshot.json.
+# - Deixar relatório completo apenas em /ceodaily/full, com trava de memória.
+MEMORY_DIET_V1_VERSION = "2026-07-07-MEMORY-DIET-V1"
+MEMORY_DIET_ENABLED = os.environ.get("MEMORY_DIET_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+MEMORY_DIET_CEO_DAILY_SAFE_BY_DEFAULT = os.environ.get("MEMORY_DIET_CEO_DAILY_SAFE_BY_DEFAULT", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+MEMORY_DIET_FULL_REPORT_THRESHOLD_MB = float(os.environ.get("MEMORY_DIET_FULL_REPORT_THRESHOLD_MB", "300"))
+MEMORY_DIET_FULL_REPORT_HARD_BLOCK_MB = float(os.environ.get("MEMORY_DIET_FULL_REPORT_HARD_BLOCK_MB", "390"))
+MEMORY_DIET_SNAPSHOT_FILE = CENTRAL_DATA_DIR / "ceo_daily_snapshot.json"
+
+try:
+    _MEMORY_DIET_ORIGINAL_FULL_CEO_DAILY_REPORT = _ORIGINAL_BUILD_CEO_DAILY_REPORT_FOR_MEMORY_SAFE_V2_2
+except Exception:
+    _MEMORY_DIET_ORIGINAL_FULL_CEO_DAILY_REPORT = None
+
+
+def _md_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return None
+
+
+def _md_v1_bool_arg(name, default=False):
+    try:
+        value = request.args.get(name)
+    except Exception:
+        value = None
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
+def _md_v1_memory_snapshot():
+    try:
+        if callable(globals().get("_meg_v1_memory_snapshot")):
+            return _meg_v1_memory_snapshot()
+    except Exception:
+        pass
+    try:
+        rss = current_rss_mb()
+        return {
+            "ok": True,
+            "rss_mb": rss,
+            "limit_mb": MEMORY_LIMIT_MB,
+            "usage_pct": memory_usage_pct(rss),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _md_v1_cleanup(reason="memory_diet_v1", force=False):
+    try:
+        if callable(globals().get("_meg_v1_cleanup")):
+            return _meg_v1_cleanup(reason=reason, force=force)
+    except Exception:
+        pass
+    try:
+        return _memory_cleanup(reason=reason, force=force)
+    except Exception as exc:
+        return {"ok": False, "reason": reason, "error": str(exc)}
+
+
+def _md_v1_env_bool(name, default=False):
+    try:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    except Exception:
+        return default
+
+
+def _md_v1_broker_mode():
+    try:
+        return str(os.environ.get("EXECUTION_MODE", "PAPER")).strip().upper()
+    except Exception:
+        return "UNKNOWN"
+
+
+def _md_v1_read_json(path, default=None):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return default
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _md_v1_write_snapshot(snapshot):
+    try:
+        MEMORY_DIET_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MEMORY_DIET_SNAPSHOT_FILE.with_suffix(MEMORY_DIET_SNAPSHOT_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        tmp.replace(MEMORY_DIET_SNAPSHOT_FILE)
+        return True
+    except Exception:
+        return False
+
+
+def _md_v1_runtime_snapshot():
+    try:
+        if callable(globals().get("runtime_stability_v1_snapshot")):
+            return runtime_stability_v1_snapshot(hours=24) or {}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {}
+
+
+def _md_v1_latest_execution_audit():
+    candidates = [
+        CENTRAL_DATA_DIR / "execution_attempt_audit_v1_latest.json",
+        CENTRAL_DATA_DIR / "execution_attempt_audit_v1.jsonl",
+        CENTRAL_DATA_DIR / "execution_audit_log.jsonl",
+        CENTRAL_DATA_DIR / "broker_execution_audit_log.jsonl",
+        Path("daily_history") / "execution_audit_log.jsonl",
+        Path("daily_history") / "executions_log.jsonl",
+    ]
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            if path.suffix == ".json":
+                item = _md_v1_read_json(path, {})
+                if isinstance(item, dict) and item:
+                    return {"source": str(path), "item": item}
+            else:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                for line in reversed(lines[-50:]):
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
+                    return {"source": str(path), "item": item}
+        except Exception:
+            continue
+    return {"source": None, "item": None}
+
+
+def _md_v1_build_snapshot(reason="SAFE_BY_DEFAULT", cleanup=None):
+    before = _md_v1_memory_snapshot()
+    before_mb = before.get("rss_mb")
+    if MEMORY_DIET_ENABLED and before_mb is not None and float(before_mb) >= MEMORY_EMERGENCY_CEO_DAILY_THRESHOLD_MB:
+        cleanup = cleanup or _md_v1_cleanup(reason="memory_diet_v1_before_safe_snapshot", force=True)
+
+    after = _md_v1_memory_snapshot()
+    stability = _md_v1_runtime_snapshot()
+    latest_audit = _md_v1_latest_execution_audit()
+
+    broker_mode = _md_v1_broker_mode()
+    enable_real = _md_v1_env_bool("ENABLE_REAL_TRADING", False)
+    central_real = _md_v1_env_bool("CENTRAL_REAL_EXECUTION_ENABLED", False)
+    real_pilot = _md_v1_env_bool("CENTRAL_REAL_PILOT_ENABLED", False)
+
+    current_mb = after.get("rss_mb") if isinstance(after, dict) else None
+    current_pct = after.get("usage_pct") if isinstance(after, dict) else None
+    hard = MEMORY_EMERGENCY_HARD_THRESHOLD_MB
+    threshold = MEMORY_EMERGENCY_CEO_DAILY_THRESHOLD_MB
+
+    if current_mb is not None and float(current_mb) >= hard:
+        ceo_status = "CRÍTICO"
+        decision = "PROTEGER_MEMÓRIA_IMEDIATAMENTE"
+    elif current_mb is not None and float(current_mb) >= threshold:
+        ceo_status = "ATENÇÃO"
+        decision = "MANTER_RELATÓRIO_SAFE_E_AGUARDAR_MEMÓRIA_BAIXAR"
+    elif (stability or {}).get("status") in {"CRITICAL", "ATTENTION"}:
+        ceo_status = "ATENÇÃO"
+        decision = "OBSERVAR_ESTABILIDADE"
+    else:
+        ceo_status = "OK"
+        decision = "OPERAR_SOMENTE_EM_VERIFY_COM_MONITORAMENTO"
+
+    if enable_real or central_real or real_pilot:
+        execution_state = "REAL_ARMADO_OU_PARCIALMENTE_ARMADO"
+    else:
+        execution_state = "REAL_DESARMADO"
+
+    snapshot = {
+        "ok": True,
+        "module": "memory_diet_v1",
+        "version": MEMORY_DIET_V1_VERSION,
+        "generated_at": _md_v1_now(),
+        "reason": reason,
+        "ceo_status": ceo_status,
+        "decision": decision,
+        "execution_state": execution_state,
+        "broker_mode": broker_mode,
+        "enable_real_trading": enable_real,
+        "central_real_execution_enabled": central_real,
+        "central_real_pilot_enabled": real_pilot,
+        "memory": {
+            "before": before,
+            "after": after,
+            "threshold_mb": threshold,
+            "hard_threshold_mb": hard,
+            "full_report_threshold_mb": MEMORY_DIET_FULL_REPORT_THRESHOLD_MB,
+            "full_report_hard_block_mb": MEMORY_DIET_FULL_REPORT_HARD_BLOCK_MB,
+            "cleanup": cleanup,
+        },
+        "runtime": {
+            "status": (stability or {}).get("status"),
+            "restart_like_count_24h": (stability or {}).get("restart_like_count_24h"),
+            "startup_events_24h": (stability or {}).get("startup_events_24h"),
+            "uptime_minutes": (stability or {}).get("uptime_minutes"),
+            "peak_memory_pct_observed": (stability or {}).get("peak_memory_pct_observed"),
+            "reasons": (stability or {}).get("reasons"),
+        },
+        "audit": {
+            "latest_source": latest_audit.get("source"),
+            "latest_event": ((latest_audit.get("item") or {}).get("event") if isinstance(latest_audit.get("item"), dict) else None),
+            "latest_status": ((latest_audit.get("item") or {}).get("status") if isinstance(latest_audit.get("item"), dict) else None),
+            "latest_origin_type": ((latest_audit.get("item") or {}).get("origin_type") if isinstance(latest_audit.get("item"), dict) else None),
+            "latest_symbol": ((latest_audit.get("item") or {}).get("symbol") if isinstance(latest_audit.get("item"), dict) else None),
+            "latest_side": ((latest_audit.get("item") or {}).get("side") if isinstance(latest_audit.get("item"), dict) else None),
+        },
+        "snapshot_file": str(MEMORY_DIET_SNAPSHOT_FILE),
+        "notes": [
+            "Memory Diet V1: /ceodaily é leve por padrão.",
+            "PnL, ranking, history e análises completas ficam fora do CEO Daily padrão para evitar OOM.",
+            "Use /ceodaily/full apenas quando a memória estiver baixa e com consciência do risco.",
+        ],
+    }
+    _md_v1_write_snapshot(snapshot)
+    return snapshot
+
+
+def _md_v1_safe_text(snapshot):
+    memory_after = ((snapshot or {}).get("memory") or {}).get("after") or {}
+    runtime = (snapshot or {}).get("runtime") or {}
+    audit = (snapshot or {}).get("audit") or {}
+    cleanup = (((snapshot or {}).get("memory") or {}).get("cleanup"))
+
+    lines = []
+    lines.append("🧠 CEO DAILY REPORT — CENTRAL QUANT V2.3 LIGHT")
+    lines.append(f"Data/hora: {snapshot.get('generated_at')}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("1. RESUMO EXECUTIVO")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append(f"Status CEO: {snapshot.get('ceo_status')}")
+    lines.append(f"Decisão principal: {snapshot.get('decision')}")
+    lines.append(f"Motivo: {snapshot.get('reason')}")
+    lines.append(f"Modo broker: {snapshot.get('broker_mode')} | Estado execução: {snapshot.get('execution_state')}")
+    lines.append(f"ENABLE_REAL_TRADING: {snapshot.get('enable_real_trading')} | CENTRAL_REAL_EXECUTION_ENABLED: {snapshot.get('central_real_execution_enabled')} | REAL_PILOT: {snapshot.get('central_real_pilot_enabled')}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("2. MEMÓRIA / ESTABILIDADE")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append(f"Memória atual: {memory_after.get('rss_mb')} MB | {memory_after.get('usage_pct')}% do limite {memory_after.get('limit_mb')} MB")
+    lines.append(f"Threshold relatório completo: {((snapshot.get('memory') or {}).get('full_report_threshold_mb'))} MB | hard block: {((snapshot.get('memory') or {}).get('full_report_hard_block_mb'))} MB")
+    lines.append(f"Runtime: {runtime.get('status')} | reinícios 24h: {runtime.get('restart_like_count_24h')} | uptime: {runtime.get('uptime_minutes')} min")
+    lines.append(f"Pico observado: {runtime.get('peak_memory_pct_observed')}%")
+    for reason in (runtime.get('reasons') or [])[:4]:
+        lines.append(f"- {reason}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("3. EXECUÇÃO / AUDITORIA")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("BingX/Central LIVE: use /live e /sync para confirmação operacional; esta versão LIGHT não consulta broker para evitar peso.")
+    if audit.get('latest_source'):
+        lines.append(f"Última auditoria: {audit.get('latest_event')} | status={audit.get('latest_status')} | origem={audit.get('latest_origin_type')} | {audit.get('latest_symbol')} {audit.get('latest_side')}")
+    else:
+        lines.append("Última auditoria: nenhuma tentativa nova registrada nos arquivos auditados.")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("4. PNL / ROBÔS")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("Suspenso no CEO Daily LIGHT para proteger memória. Use /riskstats ou /realpnlr/text somente com memória baixa e aguardando intervalo entre comandos.")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("5. AÇÃO NECESSÁRIA")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    if snapshot.get('ceo_status') == "CRÍTICO":
+        lines.append("- Não rodar relatórios completos agora.")
+        lines.append("- Rodar /memory/emergency, aguardar e só depois testar rotas leves.")
+        lines.append("- Manter execução real desativada até várias horas sem OOM/restart.")
+    elif snapshot.get('ceo_status') == "ATENÇÃO":
+        lines.append("- Manter CEO Daily em modo LIGHT.")
+        lines.append("- Monitorar /runtime/stability e evitar /history, /riskstats e relatórios grandes em sequência.")
+    else:
+        lines.append("- Continuar monitorando em VERIFY/REAL desarmado antes de qualquer nova liberação.")
+    if cleanup:
+        lines.append("")
+        lines.append(f"Cleanup: {cleanup}")
+    return "\n".join(lines)
+
+
+def _md_v1_full_text(force=False):
+    original = _MEMORY_DIET_ORIGINAL_FULL_CEO_DAILY_REPORT
+    if not callable(original):
+        snap = _md_v1_build_snapshot(reason="FULL_REPORT_UNAVAILABLE_ORIGINAL_MISSING")
+        return _md_v1_safe_text(snap)
+
+    before = _md_v1_memory_snapshot()
+    before_mb = before.get("rss_mb")
+    if MEMORY_DIET_ENABLED and before_mb is not None and not force:
+        if float(before_mb) >= MEMORY_DIET_FULL_REPORT_HARD_BLOCK_MB:
+            cleanup = _md_v1_cleanup(reason="memory_diet_full_hard_block", force=True)
+            snap = _md_v1_build_snapshot(reason=f"FULL_REPORT_HARD_BLOCKED rss={before_mb}MB", cleanup=cleanup)
+            return _md_v1_safe_text(snap)
+        if float(before_mb) >= MEMORY_DIET_FULL_REPORT_THRESHOLD_MB:
+            cleanup = _md_v1_cleanup(reason="memory_diet_full_soft_block", force=True)
+            snap = _md_v1_build_snapshot(reason=f"FULL_REPORT_SOFT_BLOCKED rss={before_mb}MB", cleanup=cleanup)
+            return _md_v1_safe_text(snap)
+
+    try:
+        _md_v1_cleanup(reason="memory_diet_before_full_report", force=True)
+        return original()
+    except MemoryError:
+        cleanup = _md_v1_cleanup(reason="memory_diet_full_memory_error", force=True)
+        snap = _md_v1_build_snapshot(reason="MEMORY_ERROR_DURING_FULL_REPORT", cleanup=cleanup)
+        return _md_v1_safe_text(snap)
+    finally:
+        try:
+            _md_v1_cleanup(reason="memory_diet_after_full_report", force=True)
+        except Exception:
+            pass
+
+
+# Override final: /ceodaily fica LIGHT por padrão.
+def build_ceo_daily_report(*args, **kwargs):
+    force_full = False
+    try:
+        force_full = _md_v1_bool_arg("full", False) or _md_v1_bool_arg("force", False)
+    except Exception:
+        force_full = False
+
+    if MEMORY_DIET_ENABLED and MEMORY_DIET_CEO_DAILY_SAFE_BY_DEFAULT and not force_full:
+        snap = _md_v1_build_snapshot(reason="MEMORY_DIET_SAFE_BY_DEFAULT")
+        return _md_v1_safe_text(snap)
+
+    return _md_v1_full_text(force=force_full)
+
+
+def build_ceo_daily_report_v2(*args, **kwargs):
+    return build_ceo_daily_report(*args, **kwargs)
+
+
+@app.route("/ceodaily/light", methods=["GET"])
+@app.route("/ceo/light", methods=["GET"])
+def ceo_daily_memory_diet_light_route():
+    snap = _md_v1_build_snapshot(reason="MANUAL_LIGHT_ROUTE")
+    return {"text": _md_v1_safe_text(snap), "snapshot": snap}, 200
+
+
+@app.route("/ceodaily/full", methods=["GET"])
+@app.route("/ceo/full", methods=["GET"])
+def ceo_daily_memory_diet_full_route():
+    force = _md_v1_bool_arg("force", False)
+    return {"text": _md_v1_full_text(force=force)}, 200
+
+
+@app.route("/ceodaily/snapshot", methods=["GET"])
+@app.route("/ceo/snapshot", methods=["GET"])
+def ceo_daily_memory_diet_snapshot_route():
+    refresh = _md_v1_bool_arg("refresh", True)
+    if refresh:
+        snap = _md_v1_build_snapshot(reason="SNAPSHOT_ROUTE_REFRESH")
+    else:
+        snap = _md_v1_read_json(MEMORY_DIET_SNAPSHOT_FILE, {}) or {}
+    return {"ok": True, "module": "memory_diet_v1", "version": MEMORY_DIET_V1_VERSION, "snapshot": snap}, 200
+
+
+@app.route("/memory/diet", methods=["GET"])
+@app.route("/memorydiet", methods=["GET"])
+def memory_diet_v1_health_route():
+    mem = _md_v1_memory_snapshot()
+    snap_exists = MEMORY_DIET_SNAPSHOT_FILE.exists()
+    return {
+        "ok": True,
+        "module": "memory_diet_v1",
+        "version": MEMORY_DIET_V1_VERSION,
+        "enabled": MEMORY_DIET_ENABLED,
+        "safe_by_default": MEMORY_DIET_CEO_DAILY_SAFE_BY_DEFAULT,
+        "generated_at": _md_v1_now(),
+        "memory": mem,
+        "thresholds": {
+            "emergency_ceo_daily_threshold_mb": MEMORY_EMERGENCY_CEO_DAILY_THRESHOLD_MB,
+            "emergency_hard_threshold_mb": MEMORY_EMERGENCY_HARD_THRESHOLD_MB,
+            "full_report_threshold_mb": MEMORY_DIET_FULL_REPORT_THRESHOLD_MB,
+            "full_report_hard_block_mb": MEMORY_DIET_FULL_REPORT_HARD_BLOCK_MB,
+        },
+        "snapshot_file": str(MEMORY_DIET_SNAPSHOT_FILE),
+        "snapshot_exists": snap_exists,
+        "routes": [
+            "/ceodaily",
+            "/ceodaily/light",
+            "/ceodaily/full",
+            "/ceodaily/snapshot",
+            "/memory/diet",
+        ],
+        "notes": [
+            "/ceodaily é LIGHT por padrão.",
+            "/ceodaily/full pode ser bloqueado se a memória estiver alta.",
+            "Não consulta broker nem monta PnL completo no relatório LIGHT.",
+        ],
+    }, 200
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
