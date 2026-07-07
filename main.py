@@ -30678,6 +30678,8 @@ def execution_dry_run_hard_kill_switch_v1_health_route():
             "/dryrunhardkill/health",
             "/executionfinalgate",
             "/executionfinalgate/health",
+            "/pilotcooldown/health",
+            "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
         ],
         "notes": [
             "Health não envia ordem real.",
@@ -34090,6 +34092,567 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
     return result
 
 
+
+# ==========================================================
+# PILOT COOLDOWN V1 — POST-REAL-TRADE SAFETY COOLDOWN
+# ==========================================================
+# Objetivo:
+# - Impedir nova execução real logo após uma execução real enviada.
+# - Bloquear LIVE dry_run=False enquanto o cooldown estiver ativo.
+# - Ser conservador e reversível via rota com ack explícito.
+# - Não envia ordem, não fecha posição e não altera stop.
+PILOT_COOLDOWN_V1_VERSION = "2026-07-06-PILOT-COOLDOWN-V1"
+PILOT_COOLDOWN_V1_STATE_FILE = CENTRAL_DATA_DIR / "pilot_cooldown_v1_state.json"
+PILOT_COOLDOWN_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "pilot_cooldown_v1_events.jsonl"
+PILOT_COOLDOWN_V1_LATEST_FILE = CENTRAL_DATA_DIR / "pilot_cooldown_v1_latest.json"
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_PILOT_COOLDOWN_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_PILOT_COOLDOWN_V1 = None
+
+
+def _pcd_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return None
+
+
+def _pcd_v1_epoch():
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _pcd_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "ok", "ready", "enabled", "active"}
+
+
+def _pcd_v1_env(names, default=None):
+    for name in names:
+        try:
+            value = os.environ.get(name)
+            if value is not None and str(value).strip() != "":
+                return value, name
+        except Exception:
+            continue
+    return default, None
+
+
+def _pcd_v1_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _pcd_v1_load_json(path, default=None):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return default if default is not None else {}
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else (default if default is not None else {})
+    except Exception:
+        return default if default is not None else {}
+
+
+def _pcd_v1_write_json(path, payload):
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        tmp.replace(p)
+        return True
+    except Exception:
+        return False
+
+
+def _pcd_v1_append_event(event):
+    try:
+        event = event if isinstance(event, dict) else {"raw": str(event)}
+        event.setdefault("module", "pilot_cooldown_v1")
+        event.setdefault("version", PILOT_COOLDOWN_V1_VERSION)
+        event.setdefault("generated_at", _pcd_v1_now())
+        event.setdefault("ts_epoch", _pcd_v1_epoch())
+        event = _pcd_v1_sanitize_public(event)
+        PILOT_COOLDOWN_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with PILOT_COOLDOWN_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _pcd_v1_write_json(PILOT_COOLDOWN_V1_LATEST_FILE, event)
+        return True
+    except Exception:
+        return False
+
+
+def _pcd_v1_read_events(limit=20):
+    try:
+        limit = max(1, min(int(limit), 200))
+    except Exception:
+        limit = 20
+    events = []
+    try:
+        if PILOT_COOLDOWN_V1_EVENTS_FILE.exists():
+            lines = PILOT_COOLDOWN_V1_EVENTS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+            for line in lines[-limit:]:
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    events.append({"raw": line})
+    except Exception:
+        pass
+    return {"ok": True, "count": len(events), "events": events}
+
+
+def _pcd_v1_sanitize_public(obj):
+    sensitive = {"token", "api_secret", "secret", "authorization", "execution_auth", "execution_auth_token", "auth_token", "x_execution_auth_token"}
+    try:
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if any(s in lk for s in sensitive):
+                    out[k] = "***MASKED***" if v else v
+                else:
+                    out[k] = _pcd_v1_sanitize_public(v)
+            return out
+        if isinstance(obj, list):
+            return [_pcd_v1_sanitize_public(v) for v in obj]
+        return obj
+    except Exception:
+        return obj
+
+
+def _pcd_v1_config():
+    enabled_raw, enabled_source = _pcd_v1_env([
+        "PILOT_COOLDOWN_ENABLED",
+        "REAL_PILOT_COOLDOWN_ENABLED",
+        "CENTRAL_REAL_PILOT_COOLDOWN_ENABLED",
+    ], "true")
+    seconds_raw, seconds_source = _pcd_v1_env([
+        "PILOT_COOLDOWN_SECONDS",
+        "REAL_PILOT_COOLDOWN_SECONDS",
+        "CENTRAL_REAL_PILOT_COOLDOWN_SECONDS",
+    ], None)
+    minutes_raw, minutes_source = _pcd_v1_env([
+        "PILOT_COOLDOWN_MINUTES",
+        "REAL_PILOT_COOLDOWN_MINUTES",
+        "CENTRAL_REAL_PILOT_COOLDOWN_MINUTES",
+    ], None)
+    if seconds_raw is not None:
+        duration_seconds = _pcd_v1_int(seconds_raw, 3600)
+        duration_source = seconds_source
+    elif minutes_raw is not None:
+        duration_seconds = _pcd_v1_int(float(minutes_raw) * 60, 3600)
+        duration_source = minutes_source
+    else:
+        duration_seconds = 3600
+        duration_source = None
+
+    min_seconds_raw, min_seconds_source = _pcd_v1_env([
+        "PILOT_COOLDOWN_MIN_SECONDS",
+        "REAL_PILOT_COOLDOWN_MIN_SECONDS",
+    ], "60")
+    max_seconds_raw, max_seconds_source = _pcd_v1_env([
+        "PILOT_COOLDOWN_MAX_SECONDS",
+        "REAL_PILOT_COOLDOWN_MAX_SECONDS",
+    ], "86400")
+    min_seconds = max(0, _pcd_v1_int(min_seconds_raw, 60))
+    max_seconds = max(min_seconds, _pcd_v1_int(max_seconds_raw, 86400))
+    duration_seconds = max(min_seconds, min(duration_seconds, max_seconds))
+
+    block_manual_raw, block_manual_source = _pcd_v1_env([
+        "PILOT_COOLDOWN_BLOCK_MANUAL_EXECUTION",
+        "REAL_PILOT_COOLDOWN_BLOCK_MANUAL_EXECUTION",
+    ], "true")
+    notify_raw, notify_source = _pcd_v1_env([
+        "PILOT_COOLDOWN_NOTIFY_BLOCKED",
+        "REAL_PILOT_COOLDOWN_NOTIFY_BLOCKED",
+    ], "true")
+
+    return {
+        "enabled": _pcd_v1_bool(enabled_raw, True),
+        "enabled_source": enabled_source,
+        "duration_seconds": duration_seconds,
+        "duration_minutes": round(duration_seconds / 60.0, 4),
+        "duration_source": duration_source,
+        "min_seconds": min_seconds,
+        "min_seconds_source": min_seconds_source,
+        "max_seconds": max_seconds,
+        "max_seconds_source": max_seconds_source,
+        "block_manual_execution": _pcd_v1_bool(block_manual_raw, True),
+        "block_manual_execution_source": block_manual_source,
+        "notify_blocked": _pcd_v1_bool(notify_raw, True),
+        "notify_blocked_source": notify_source,
+        "state_file": str(PILOT_COOLDOWN_V1_STATE_FILE),
+        "events_file": str(PILOT_COOLDOWN_V1_EVENTS_FILE),
+        "token_value_exposed": False,
+    }
+
+
+def _pcd_v1_payload_snapshot(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    return _pcd_v1_sanitize_public({
+        "bot": payload.get("bot"),
+        "setup": payload.get("setup"),
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "signal_id": payload.get("signal_id"),
+        "client_order_id": payload.get("client_order_id") or payload.get("clientOrderId") or payload.get("clientOrderID") or payload.get("broker_client_order_id"),
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl") or payload.get("stop") or payload.get("stop_loss"),
+        "tp50": payload.get("tp50"),
+        "margin_usdt": payload.get("margin_usdt"),
+        "notional_usdt": payload.get("notional_usdt"),
+        "leverage": payload.get("leverage"),
+    })
+
+
+def _pcd_v1_find_key(obj, wanted_keys):
+    wanted = {str(k).lower() for k in wanted_keys}
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if str(k).lower() in wanted:
+                    return v
+            for v in obj.values():
+                found = _pcd_v1_find_key(v, wanted)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _pcd_v1_find_key(item, wanted)
+                if found is not None:
+                    return found
+    except Exception:
+        return None
+    return None
+
+
+def _pcd_v1_result_indicates_order_sent(result):
+    if not isinstance(result, dict):
+        return False
+    try:
+        for key in ["sent", "order_sent", "live_sent", "live_broker_called"]:
+            value = _pcd_v1_find_key(result, {key})
+            if value is True:
+                return True
+            if isinstance(value, str) and value.strip().lower() in {"true", "1", "yes", "sent", "filled", "open", "closed"}:
+                return True
+        order_id = _pcd_v1_find_key(result, {"order_id", "id", "orderid"})
+        if order_id not in [None, "", "-", "0"]:
+            return True
+        status = str(_pcd_v1_find_key(result, {"status", "live_status", "result_status"}) or "").upper()
+        if any(token in status for token in ["LIVE_SENT", "ORDER_SENT", "ORDER_FILLED", "EXECUTED"]):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _pcd_v1_is_reduce_or_close(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    for key in ["reduce_only", "reduceOnly", "close_position", "closePosition", "is_close", "closing", "exit", "close_trade"]:
+        if _pcd_v1_bool(payload.get(key), False):
+            return True
+    action = str(payload.get("action") or payload.get("intent") or payload.get("route") or "").upper()
+    return any(token in action for token in ["CLOSE", "REDUCE", "EXIT"])
+
+
+def _pcd_v1_state():
+    return _pcd_v1_load_json(PILOT_COOLDOWN_V1_STATE_FILE, default={})
+
+
+def _pcd_v1_clear_if_expired(state=None):
+    state = state if isinstance(state, dict) else _pcd_v1_state()
+    now = _pcd_v1_epoch()
+    expires_epoch = float(state.get("expires_epoch") or 0)
+    active = bool(state.get("active")) and expires_epoch > now
+    if state.get("active") and not active and expires_epoch > 0:
+        state["active"] = False
+        state["status"] = "COOLDOWN_EXPIRED_READY"
+        state["expired_at"] = _pcd_v1_now()
+        state["expired_epoch"] = now
+        _pcd_v1_write_json(PILOT_COOLDOWN_V1_STATE_FILE, _pcd_v1_sanitize_public(state))
+        _pcd_v1_append_event({
+            "event": "COOLDOWN_EXPIRED",
+            "status": "COOLDOWN_EXPIRED_READY",
+            "state": state,
+        })
+    return state
+
+
+def pilot_cooldown_v1_assess(payload=None, source="assess"):
+    config = _pcd_v1_config()
+    state = _pcd_v1_clear_if_expired(_pcd_v1_state())
+    now = _pcd_v1_epoch()
+    expires_epoch = float(state.get("expires_epoch") or 0)
+    active = bool(state.get("active")) and expires_epoch > now and bool(config.get("enabled"))
+    remaining_seconds = max(0, int(expires_epoch - now)) if active else 0
+    status = "COOLDOWN_ACTIVE" if active else ("COOLDOWN_DISABLED" if not config.get("enabled") else "READY_NO_COOLDOWN")
+    allowed = not active
+    result = {
+        "ok": True,
+        "module": "pilot_cooldown_v1",
+        "version": PILOT_COOLDOWN_V1_VERSION,
+        "generated_at": _pcd_v1_now(),
+        "source": source,
+        "status": status,
+        "allowed": allowed,
+        "active": active,
+        "remaining_seconds": remaining_seconds,
+        "remaining_minutes": round(remaining_seconds / 60.0, 2),
+        "expires_at": state.get("expires_at") if active else None,
+        "expires_epoch": expires_epoch if active else None,
+        "last_started_at": state.get("started_at"),
+        "last_started_epoch": state.get("started_epoch"),
+        "last_reason": state.get("reason"),
+        "last_payload_snapshot": state.get("payload_snapshot"),
+        "config": config,
+        "state": _pcd_v1_sanitize_public(state),
+        "payload_snapshot": _pcd_v1_payload_snapshot(payload or {}),
+        "notes": [
+            "Pilot Cooldown V1 bloqueia nova execução real LIVE dry_run=False enquanto active=true.",
+            "Não bloqueia dry-run/preflight e não altera ordens existentes.",
+            "Release manual exige ack=PILOT_COOLDOWN_RELEASE.",
+        ],
+        "token_value_exposed": False,
+    }
+    return _pcd_v1_sanitize_public(result)
+
+
+def pilot_cooldown_v1_start(payload=None, result=None, reason="REAL_EXECUTION_SENT"):
+    config = _pcd_v1_config()
+    if not config.get("enabled"):
+        return pilot_cooldown_v1_assess(payload=payload, source="start_disabled")
+    now = _pcd_v1_epoch()
+    duration_seconds = int(config.get("duration_seconds") or 3600)
+    expires_epoch = now + duration_seconds
+    try:
+        expires_at = datetime.fromtimestamp(expires_epoch, TZ).strftime("%d/%m/%Y %H:%M:%S") if "TZ" in globals() else None
+    except Exception:
+        expires_at = None
+    state = {
+        "active": True,
+        "status": "COOLDOWN_ACTIVE",
+        "started_at": _pcd_v1_now(),
+        "started_epoch": now,
+        "expires_at": expires_at,
+        "expires_epoch": expires_epoch,
+        "duration_seconds": duration_seconds,
+        "duration_minutes": round(duration_seconds / 60.0, 4),
+        "reason": reason,
+        "payload_snapshot": _pcd_v1_payload_snapshot(payload or {}),
+        "result_summary": _pcd_v1_sanitize_public({
+            "sent": _pcd_v1_find_key(result, {"sent"}) if isinstance(result, dict) else None,
+            "order_sent": _pcd_v1_find_key(result, {"order_sent"}) if isinstance(result, dict) else None,
+            "live_sent": _pcd_v1_find_key(result, {"live_sent"}) if isinstance(result, dict) else None,
+            "order_id": _pcd_v1_find_key(result, {"order_id", "id", "orderid"}) if isinstance(result, dict) else None,
+            "status": _pcd_v1_find_key(result, {"status", "live_status", "result_status"}) if isinstance(result, dict) else None,
+        }),
+        "version": PILOT_COOLDOWN_V1_VERSION,
+        "token_value_exposed": False,
+    }
+    _pcd_v1_write_json(PILOT_COOLDOWN_V1_STATE_FILE, _pcd_v1_sanitize_public(state))
+    _pcd_v1_append_event({"event": "COOLDOWN_STARTED", "status": "COOLDOWN_ACTIVE", "state": state})
+    return pilot_cooldown_v1_assess(payload=payload, source="after_start")
+
+
+def pilot_cooldown_v1_release(reason="MANUAL_RELEASE", payload=None):
+    old_state = _pcd_v1_state()
+    state = dict(old_state or {})
+    state.update({
+        "active": False,
+        "status": "COOLDOWN_RELEASED",
+        "released_at": _pcd_v1_now(),
+        "released_epoch": _pcd_v1_epoch(),
+        "release_reason": reason,
+        "version": PILOT_COOLDOWN_V1_VERSION,
+        "token_value_exposed": False,
+    })
+    _pcd_v1_write_json(PILOT_COOLDOWN_V1_STATE_FILE, _pcd_v1_sanitize_public(state))
+    event = {
+        "event": "COOLDOWN_RELEASED",
+        "status": "COOLDOWN_RELEASED",
+        "reason": reason,
+        "state_before": old_state,
+        "state_after": state,
+        "payload_snapshot": _pcd_v1_payload_snapshot(payload or {}),
+    }
+    _pcd_v1_append_event(event)
+    return pilot_cooldown_v1_assess(payload=payload, source="after_release")
+
+
+def pilot_cooldown_v1_health_payload():
+    payload = pilot_cooldown_v1_assess(source="health")
+    payload["run_execution_engine_wrapped"] = callable(globals().get("_ORIGINAL_RUN_EXECUTION_ENGINE_FOR_PILOT_COOLDOWN_V1"))
+    payload["events_file"] = str(PILOT_COOLDOWN_V1_EVENTS_FILE)
+    payload["latest_file"] = str(PILOT_COOLDOWN_V1_LATEST_FILE)
+    payload["routes"] = [
+        "/pilotcooldown/health",
+        "/pilotcooldown",
+        "/pilotcooldown/log",
+        "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
+        "/realpilotdashboard",
+    ]
+    return _pcd_v1_sanitize_public(payload)
+
+
+@app.route("/pilotcooldown/health", methods=["GET"])
+@app.route("/pilot/cooldown/health", methods=["GET"])
+def pilot_cooldown_v1_health_route():
+    return pilot_cooldown_v1_health_payload(), 200
+
+
+@app.route("/pilotcooldown", methods=["GET", "POST"])
+@app.route("/pilot/cooldown", methods=["GET", "POST"])
+def pilot_cooldown_v1_route():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
+    return pilot_cooldown_v1_assess(payload=payload, source="route"), 200
+
+
+@app.route("/pilotcooldown/release", methods=["GET", "POST"])
+@app.route("/pilot/cooldown/release", methods=["GET", "POST"])
+def pilot_cooldown_v1_release_route():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
+    ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
+    if ack != "PILOT_COOLDOWN_RELEASE":
+        return {
+            "ok": False,
+            "status": "ACK_REQUIRED",
+            "required_ack": "PILOT_COOLDOWN_RELEASE",
+            "note": "Release manual remove a trava temporal; use apenas depois de conferir Dashboard/Watchdog/Registry.",
+            "version": PILOT_COOLDOWN_V1_VERSION,
+            "token_value_exposed": False,
+        }, 400
+    reason = str(request.args.get("reason") or payload.get("reason") or "MANUAL_RELEASE").strip() or "MANUAL_RELEASE"
+    result = pilot_cooldown_v1_release(reason=reason, payload=payload)
+    return result, 200
+
+
+@app.route("/pilotcooldown/log", methods=["GET"])
+@app.route("/pilot/cooldown/log", methods=["GET"])
+def pilot_cooldown_v1_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    payload = _pcd_v1_read_events(limit=limit)
+    payload.update({
+        "module": "pilot_cooldown_v1",
+        "version": PILOT_COOLDOWN_V1_VERSION,
+        "generated_at": _pcd_v1_now(),
+        "events_file": str(PILOT_COOLDOWN_V1_EVENTS_FILE),
+        "latest_file": str(PILOT_COOLDOWN_V1_LATEST_FILE),
+        "token_value_exposed": False,
+    })
+    return _pcd_v1_sanitize_public(payload), 200
+
+
+# Wrapper final: bloqueia nova execução real enquanto o piloto estiver em cooldown.
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_PILOT_COOLDOWN_V1
+    payload_dict = dict(payload or {}) if isinstance(payload, dict) else {}
+    dry = _pcd_v1_bool(dry_run, default=True)
+    mode_norm = str(mode or payload_dict.get("mode") or "LIVE").upper().strip()
+    is_live_real = (not dry) and mode_norm == "LIVE"
+    is_reduce_or_close = _pcd_v1_is_reduce_or_close(payload_dict)
+
+    if not callable(original_runner):
+        return {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_RUNNER_MISSING_AFTER_PILOT_COOLDOWN",
+            "sent": False,
+            "mode": mode_norm,
+            "dry_run": dry,
+            "version": PILOT_COOLDOWN_V1_VERSION,
+            "token_value_exposed": False,
+        }
+
+    if is_live_real and not is_reduce_or_close:
+        cooldown = pilot_cooldown_v1_assess(payload=payload_dict, source="before_live_execution")
+        if not cooldown.get("allowed"):
+            result = {
+                "ok": False,
+                "status": "PILOT_COOLDOWN_ACTIVE_BLOCKED",
+                "sent": False,
+                "order_sent": False,
+                "live_sent": False,
+                "live_broker_called": False,
+                "live_send_blocked": True,
+                "requires_manual_attention": False,
+                "mode": mode_norm,
+                "dry_run": dry,
+                "payload": _pcd_v1_payload_snapshot(payload_dict),
+                "pilot_cooldown_v1": cooldown,
+                "notes": [
+                    "Pilot Cooldown V1 bloqueou uma nova execução real antes de chamar a BingX.",
+                    "Aguarde o cooldown expirar ou libere manualmente com ack=PILOT_COOLDOWN_RELEASE após conferir segurança.",
+                ],
+                "version": PILOT_COOLDOWN_V1_VERSION,
+                "token_value_exposed": False,
+            }
+            _pcd_v1_append_event({
+                "event": "REAL_EXECUTION_BLOCKED_BY_COOLDOWN",
+                "status": "PILOT_COOLDOWN_ACTIVE_BLOCKED",
+                "payload_snapshot": _pcd_v1_payload_snapshot(payload_dict),
+                "cooldown": cooldown,
+            })
+            try:
+                if _pcd_v1_config().get("notify_blocked") and callable(globals().get("real_execution_telegram_notifier_v1_notify")):
+                    result["real_execution_telegram_notifier_v1"] = real_execution_telegram_notifier_v1_notify(
+                        event_type="REAL_EXECUTION_BLOCKED",
+                        payload=payload_dict,
+                        result=result,
+                        mode=mode_norm,
+                        dry_run=False,
+                        force=False,
+                    )
+            except Exception as exc:
+                result["pilot_cooldown_notify_error"] = str(exc)
+            return _pcd_v1_sanitize_public(result)
+
+    result = original_runner(payload=payload_dict, mode=mode, dry_run=dry_run, *args, **kwargs)
+
+    try:
+        if is_live_real and not is_reduce_or_close and _pcd_v1_result_indicates_order_sent(result):
+            cooldown_started = pilot_cooldown_v1_start(payload=payload_dict, result=result, reason="REAL_EXECUTION_SENT")
+            if isinstance(result, dict):
+                result.setdefault("pilot_cooldown_v1", cooldown_started)
+                if isinstance(result.get("payload"), dict):
+                    result["payload"].setdefault("pilot_cooldown_v1", cooldown_started)
+    except Exception as exc:
+        try:
+            if isinstance(result, dict):
+                result.setdefault("pilot_cooldown_v1", {
+                    "ok": False,
+                    "status": "PILOT_COOLDOWN_ATTACH_ERROR",
+                    "error": str(exc),
+                    "version": PILOT_COOLDOWN_V1_VERSION,
+                    "token_value_exposed": False,
+                })
+        except Exception:
+            pass
+    return result
+
 # ==========================================================
 # REAL PILOT DASHBOARD V1 — ONE-PAGE READ-ONLY PILOT STATUS
 # ==========================================================
@@ -34341,6 +34904,11 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
         lambda: registry_persistence_v1_health_route(),
         default={},
     )
+    cooldown = _rpd_v1_safe_call(
+        "PILOT_COOLDOWN",
+        lambda: pilot_cooldown_v1_health_payload(),
+        default={"ok": False, "status": "PILOT_COOLDOWN_UNAVAILABLE"},
+    ) if callable(globals().get("pilot_cooldown_v1_health_payload")) else {"ok": False, "status": "PILOT_COOLDOWN_UNAVAILABLE"}
 
     guard_config = (guard or {}).get("config") if isinstance(guard, dict) else {}
     guard_trade = (guard or {}).get("trade") if isinstance(guard, dict) else {}
@@ -34356,6 +34924,8 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
     telegram_ready = bool(telegram.get("ok"))
     watchdog_ready = bool((watchdog or {}).get("ok") and not requires_attention)
     registry_ready = bool((registry_mode or {}).get("ok") and unknown_open_count == 0)
+    cooldown_active = bool((cooldown or {}).get("active")) if isinstance(cooldown, dict) else False
+    cooldown_ready = bool((cooldown or {}).get("ok")) if isinstance(cooldown, dict) else False
 
     blocking = []
     warnings = []
@@ -34373,6 +34943,8 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
         blocking.append("REGISTRY_MODE_NOT_READY")
     if unknown_open_count > 0:
         blocking.append("UNKNOWN_OPEN_POSITION_BLOCKS_REAL_EXECUTION")
+    if not cooldown_ready:
+        warnings.append("PILOT_COOLDOWN_NOT_READY")
 
     if requires_attention:
         overall_status = "ATTENTION_REQUIRED"
@@ -34383,6 +34955,9 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
     elif open_position_count > 0 or real_open_count > 0:
         overall_status = "REAL_POSITION_OPEN_MONITORING"
         next_action = "Monitorar Watchdog/Registry até a posição real fechar e depois avaliar o outcome."
+    elif cooldown_active:
+        overall_status = "COOLDOWN_ACTIVE_WAIT"
+        next_action = "Aguardar o Pilot Cooldown expirar antes de aceitar nova execução real automática."
     else:
         overall_status = "READY_WAITING_FALCON_SIGNAL"
         next_action = "Aguardar sinal elegível do FALCON em BTCUSDT ou ETHUSDT; não usar o Execution Console."
@@ -34421,6 +34996,13 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "requires_manual_attention": requires_attention,
             "closed_detected": (watchdog or {}).get("closed_detected") if isinstance(watchdog, dict) else None,
         },
+        "cooldown": {
+            "active": cooldown_active,
+            "status": (cooldown or {}).get("status") if isinstance(cooldown, dict) else None,
+            "remaining_seconds": (cooldown or {}).get("remaining_seconds") if isinstance(cooldown, dict) else None,
+            "remaining_minutes": (cooldown or {}).get("remaining_minutes") if isinstance(cooldown, dict) else None,
+            "expires_at": (cooldown or {}).get("expires_at") if isinstance(cooldown, dict) else None,
+        },
         "components": {
             "auto_real_bridge": _rpd_v1_component_summary("Auto Real Execution Bridge", bridge),
             "execution_final_gate": _rpd_v1_component_summary("Execution Final Gate", final_gate),
@@ -34429,6 +35011,7 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "real_position_watchdog": _rpd_v1_component_summary("Real Position Watchdog", watchdog),
             "registry_mode": _rpd_v1_component_summary("Registry Mode Segregation", registry_mode),
             "registry_persistence": _rpd_v1_component_summary("Registry Persistence", registry_persistence),
+            "pilot_cooldown": _rpd_v1_component_summary("Pilot Cooldown", cooldown),
         },
         "latest": _rpd_v1_latest_events(limit=5),
         "details": {
@@ -34439,6 +35022,7 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "real_position_watchdog": watchdog,
             "registry_mode": registry_mode,
             "registry_persistence": registry_persistence,
+            "pilot_cooldown": cooldown,
         } if deep else None,
         "routes": [
             "/realpilotdashboard",
@@ -34450,11 +35034,13 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "/realexecutiontelegram/health",
             "/realpositionwatchdog",
             "/executionfinalgate/health",
+            "/pilotcooldown/health",
+            "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
         ],
         "notes": [
             "Dashboard V1 é read-only: não abre ordem, não fecha posição, não altera stop e não envia Telegram.",
             "ok=true significa que o piloto está pronto para aguardar sinal elegível; não significa que já existe trade aberto.",
-            "A execução real automática continua limitada ao FALCON em BTCUSDT/ETHUSDT com Real Pilot Guard, Final Gate e deduplicação.",
+            "A execução real automática continua limitada ao FALCON em BTCUSDT/ETHUSDT com Real Pilot Guard, Final Gate, deduplicação e Pilot Cooldown.",
         ],
         "token_value_exposed": False,
     }
@@ -34465,6 +35051,7 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
         "blocking": dashboard.get("blocking"),
         "warnings": dashboard.get("warnings"),
         "positions": dashboard.get("positions"),
+        "cooldown": dashboard.get("cooldown"),
         "pilot": dashboard.get("pilot"),
         "next_action": dashboard.get("next_action"),
         "source": source,
