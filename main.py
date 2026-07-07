@@ -34089,6 +34089,427 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
             pass
     return result
 
+
+# ==========================================================
+# REAL PILOT DASHBOARD V1 — ONE-PAGE READ-ONLY PILOT STATUS
+# ==========================================================
+# Objetivo:
+# - Consolidar em uma única rota o estado do piloto real.
+# - Não executa trade, não altera ordens, não muda risco e não envia Telegram.
+# - Resume: Bridge, Final Gate, Guard, Telegram, Watchdog, Registry e última execução.
+REAL_PILOT_DASHBOARD_V1_VERSION = "2026-07-06-REAL-PILOT-DASHBOARD-V1"
+REAL_PILOT_DASHBOARD_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_pilot_dashboard_v1_latest.json"
+REAL_PILOT_DASHBOARD_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_pilot_dashboard_v1_events.jsonl"
+
+
+def _rpd_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return None
+
+
+def _rpd_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "ok", "ready", "enabled"}
+
+
+def _rpd_v1_load_json(path, default=None):
+    try:
+        p = Path(path)
+        if not p.exists():
+            return default if default is not None else {}
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default if default is not None else {}
+
+
+def _rpd_v1_write_json(path, payload):
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        tmp.replace(p)
+        return True
+    except Exception:
+        return False
+
+
+def _rpd_v1_append_event(event):
+    try:
+        event = event if isinstance(event, dict) else {"raw": str(event)}
+        event.setdefault("module", "real_pilot_dashboard_v1")
+        event.setdefault("version", REAL_PILOT_DASHBOARD_V1_VERSION)
+        event.setdefault("generated_at", _rpd_v1_now())
+        REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        _rpd_v1_write_json(REAL_PILOT_DASHBOARD_V1_LATEST_FILE, event)
+    except Exception:
+        pass
+
+
+def _rpd_v1_read_events(limit=20):
+    try:
+        limit = max(1, min(int(limit), 200))
+    except Exception:
+        limit = 20
+    rows = []
+    try:
+        if REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.exists():
+            with REAL_PILOT_DASHBOARD_V1_EVENTS_FILE.open("r", encoding="utf-8") as f:
+                lines = f.readlines()[-limit:]
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    rows.append({"raw": line})
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "events": []}
+    return {"ok": True, "count": len(rows), "events": rows}
+
+
+def _rpd_v1_sanitize_public(obj):
+    try:
+        sanitizer = globals().get("_rpw_v1_sanitize_public") or globals().get("_arb_v1_sanitize_public") or globals().get("_execution_final_gate_v1_sanitize")
+        if callable(sanitizer):
+            return sanitizer(obj)
+    except Exception:
+        pass
+    try:
+        if isinstance(obj, dict):
+            clean = {}
+            for k, v in obj.items():
+                key = str(k).lower()
+                if any(s in key for s in ["token", "secret", "api_key", "apikey", "password"]):
+                    clean[k] = "***MASKED***" if v else v
+                else:
+                    clean[k] = _rpd_v1_sanitize_public(v)
+            clean["token_value_exposed"] = False
+            return clean
+        if isinstance(obj, list):
+            return [_rpd_v1_sanitize_public(x) for x in obj]
+    except Exception:
+        pass
+    return obj
+
+
+def _rpd_v1_safe_call(label, fn, default=None):
+    try:
+        if not callable(fn):
+            return {"ok": False, "status": f"{label}_MISSING"}
+        value = fn()
+        if isinstance(value, tuple):
+            value = value[0]
+        if not isinstance(value, dict):
+            value = {"ok": True, "status": f"{label}_RETURNED", "value": value}
+        return _rpd_v1_sanitize_public(value)
+    except Exception as exc:
+        return {"ok": False, "status": f"{label}_ERROR", "error": str(exc), "token_value_exposed": False}
+
+
+def _rpd_v1_sample_payload():
+    return {
+        "decision": "ALLOW",
+        "bot": "FALCON",
+        "setup": "FALCON",
+        "symbol": "BTCUSDT",
+        "side": "SHORT",
+        "entry": "108000",
+        "sl": "109000",
+        "tp50": "107000",
+        "risk_pct": 2.0,
+        "signal_id": f"REAL-PILOT-DASHBOARD-{int(time.time())}",
+        "mode": "VERIFY",
+    }
+
+
+def _rpd_v1_status_value(obj, default=None):
+    if not isinstance(obj, dict):
+        return default
+    for key in ["status", "result_status", "live_status"]:
+        if obj.get(key):
+            return obj.get(key)
+    return default
+
+
+def _rpd_v1_latest_file_for(path_name):
+    try:
+        p = globals().get(path_name)
+        if p is not None:
+            return _rpd_v1_load_json(p, default={})
+    except Exception:
+        pass
+    return {}
+
+
+def _rpd_v1_latest_events(limit=5):
+    latest = {}
+    for name, path_name in [
+        ("auto_real_bridge", "AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE"),
+        ("real_execution_telegram", "REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE"),
+        ("real_position_watchdog", "REAL_POSITION_WATCHDOG_V1_LATEST_FILE"),
+        ("registry_persistence", "REGISTRY_PERSISTENCE_V1_LATEST_FILE"),
+        ("trade_close_outcome", "TRADE_CLOSE_OUTCOME_V1_LATEST_FILE"),
+    ]:
+        latest[name] = _rpd_v1_sanitize_public(_rpd_v1_latest_file_for(path_name))
+    return latest
+
+
+def _rpd_v1_component_summary(name, payload, ok_codes=None):
+    payload = payload if isinstance(payload, dict) else {}
+    ok = bool(payload.get("ok"))
+    status = _rpd_v1_status_value(payload, "UNKNOWN")
+    failed = payload.get("failed_blocking_codes") or []
+    blocking_failed_count = payload.get("blocking_failed_count")
+    if isinstance(payload.get("preview"), dict):
+        prev = payload.get("preview") or {}
+        # Para health do Bridge/Watchdog, o status útil pode estar no preview.
+        status = status if status not in {None, "UNKNOWN"} else _rpd_v1_status_value(prev, status)
+        if prev.get("ok") is False:
+            ok = False
+    return {
+        "name": name,
+        "ok": ok,
+        "status": status,
+        "failed_blocking_codes": failed,
+        "blocking_failed_count": blocking_failed_count,
+        "version": payload.get("version"),
+        "generated_at": payload.get("generated_at"),
+    }
+
+
+def _rpd_v1_build_dashboard(deep=True, source="route"):
+    sample = _rpd_v1_sample_payload()
+
+    guard = _rpd_v1_safe_call(
+        "REAL_PILOT_GUARD",
+        lambda: real_pilot_guard_v1_validate(sample, action="dashboard"),
+        default={},
+    )
+    registry_mode = _rpd_v1_safe_call(
+        "REGISTRY_MODE_SEGREGATION",
+        lambda: registry_mode_segregation_v1_gate_check(sample),
+        default={},
+    )
+    final_gate = _rpd_v1_safe_call(
+        "EXECUTION_FINAL_GATE",
+        lambda: build_execution_final_gate_route_v1(preflight=False),
+        default={},
+    )
+    bridge = _rpd_v1_safe_call(
+        "AUTO_REAL_BRIDGE",
+        lambda: auto_real_execution_bridge_v1_health_payload(),
+        default={},
+    ) if deep else {"ok": callable(globals().get("auto_real_execution_bridge_v1_process")), "status": "AUTO_REAL_BRIDGE_SHALLOW_CHECK"}
+    watchdog = _rpd_v1_safe_call(
+        "REAL_POSITION_WATCHDOG",
+        lambda: real_position_watchdog_v1_assess(payload={"bot": "FALCON", "setup": "FALCON", "symbol": "BTCUSDT", "side": "SHORT"}, source="dashboard", notify=False, force_notify=False, all_allowed=True),
+        default={},
+    ) if deep else {"ok": callable(globals().get("real_position_watchdog_v1_assess")), "status": "REAL_POSITION_WATCHDOG_SHALLOW_CHECK"}
+
+    telegram_config = {}
+    try:
+        telegram_config = _retg_v1_config() if callable(globals().get("_retg_v1_config")) else {}
+    except Exception as exc:
+        telegram_config = {"ok": False, "error": str(exc)}
+    telegram = {
+        "ok": bool(telegram_config.get("enabled") and telegram_config.get("telegram_token_configured") and telegram_config.get("telegram_chat_configured")),
+        "module": "real_execution_telegram_notifier_v1",
+        "version": globals().get("REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_VERSION"),
+        "generated_at": _rpd_v1_now(),
+        "config": telegram_config,
+        "run_execution_engine_wrapped": callable(globals().get("_ORIGINAL_RUN_EXECUTION_ENGINE_FOR_REAL_EXECUTION_TELEGRAM_NOTIFIER_V1")),
+        "latest": _rpd_v1_latest_file_for("REAL_EXECUTION_TELEGRAM_NOTIFIER_V1_LATEST_FILE"),
+        "token_value_exposed": False,
+    }
+
+    registry_persistence = _rpd_v1_safe_call(
+        "REGISTRY_PERSISTENCE",
+        lambda: registry_persistence_v1_health_route(),
+        default={},
+    )
+
+    guard_config = (guard or {}).get("config") if isinstance(guard, dict) else {}
+    guard_trade = (guard or {}).get("trade") if isinstance(guard, dict) else {}
+    watchdog_status = str((watchdog or {}).get("status") or "").upper()
+    requires_attention = bool((watchdog or {}).get("requires_manual_attention"))
+    open_position_count = int((watchdog or {}).get("open_position_count") or 0) if isinstance(watchdog, dict) else 0
+    real_open_count = int((registry_mode or {}).get("real_open_count") or 0) if isinstance(registry_mode, dict) else 0
+    unknown_open_count = int((registry_mode or {}).get("unknown_open_count") or 0) if isinstance(registry_mode, dict) else 0
+    final_gate_failed = (final_gate or {}).get("failed_blocking_codes") or []
+    bridge_ready = bool(bridge.get("ok") and bridge.get("can_open_trade_wrapped", True)) if isinstance(bridge, dict) else False
+    guard_ready = bool((guard or {}).get("ok") and (guard or {}).get("allowed") and not (guard or {}).get("failed_blocking_codes"))
+    final_gate_ready = bool((final_gate or {}).get("ok") and not final_gate_failed and (final_gate or {}).get("blocking_failed_count", 0) in [0, None])
+    telegram_ready = bool(telegram.get("ok"))
+    watchdog_ready = bool((watchdog or {}).get("ok") and not requires_attention)
+    registry_ready = bool((registry_mode or {}).get("ok") and unknown_open_count == 0)
+
+    blocking = []
+    warnings = []
+    if not bridge_ready:
+        blocking.append("AUTO_REAL_BRIDGE_NOT_READY")
+    if not guard_ready:
+        blocking.append("REAL_PILOT_GUARD_NOT_ALLOWED")
+    if not final_gate_ready:
+        blocking.append("FINAL_GATE_NOT_READY")
+    if not telegram_ready:
+        warnings.append("TELEGRAM_NOTIFIER_NOT_READY")
+    if not watchdog_ready:
+        blocking.append("REAL_POSITION_WATCHDOG_ATTENTION_REQUIRED")
+    if not registry_ready:
+        blocking.append("REGISTRY_MODE_NOT_READY")
+    if unknown_open_count > 0:
+        blocking.append("UNKNOWN_OPEN_POSITION_BLOCKS_REAL_EXECUTION")
+
+    if requires_attention:
+        overall_status = "ATTENTION_REQUIRED"
+        next_action = "Verificar imediatamente o Watchdog e a BingX; não abrir nova execução enquanto houver atenção manual."
+    elif blocking:
+        overall_status = "NOT_READY"
+        next_action = "Corrigir os bloqueios listados antes de aguardar execução real automática."
+    elif open_position_count > 0 or real_open_count > 0:
+        overall_status = "REAL_POSITION_OPEN_MONITORING"
+        next_action = "Monitorar Watchdog/Registry até a posição real fechar e depois avaliar o outcome."
+    else:
+        overall_status = "READY_WAITING_FALCON_SIGNAL"
+        next_action = "Aguardar sinal elegível do FALCON em BTCUSDT ou ETHUSDT; não usar o Execution Console."
+
+    dashboard = {
+        "ok": len(blocking) == 0,
+        "module": "real_pilot_dashboard_v1",
+        "version": REAL_PILOT_DASHBOARD_V1_VERSION,
+        "generated_at": _rpd_v1_now(),
+        "source": source,
+        "status": overall_status,
+        "blocking": blocking,
+        "warnings": warnings,
+        "next_action": next_action,
+        "pilot": {
+            "real_execution_enabled": guard_config.get("real_execution_enabled"),
+            "real_pilot_enabled": guard_config.get("real_pilot_enabled"),
+            "allowed_bots": guard_config.get("allowed_bots") or ["FALCON"],
+            "allowed_symbols": guard_config.get("allowed_symbols") or ["BTCUSDT", "ETHUSDT"],
+            "max_margin_usdt": guard_config.get("max_margin_usdt"),
+            "max_notional_usdt": guard_config.get("max_notional_usdt"),
+            "max_leverage": guard_config.get("max_leverage"),
+            "max_open_positions": guard_config.get("max_open_positions"),
+            "current_trade_size": {
+                "margin_usdt": guard_trade.get("margin_usdt") if isinstance(guard_trade, dict) else None,
+                "notional_usdt": guard_trade.get("notional_usdt") if isinstance(guard_trade, dict) else None,
+                "leverage": guard_trade.get("leverage") if isinstance(guard_trade, dict) else None,
+            },
+        },
+        "positions": {
+            "open_position_count": open_position_count,
+            "real_open_count": real_open_count,
+            "unknown_open_count": unknown_open_count,
+            "protected_position_count": (watchdog or {}).get("protected_position_count") if isinstance(watchdog, dict) else None,
+            "registered_position_count": (watchdog or {}).get("registered_position_count") if isinstance(watchdog, dict) else None,
+            "requires_manual_attention": requires_attention,
+            "closed_detected": (watchdog or {}).get("closed_detected") if isinstance(watchdog, dict) else None,
+        },
+        "components": {
+            "auto_real_bridge": _rpd_v1_component_summary("Auto Real Execution Bridge", bridge),
+            "execution_final_gate": _rpd_v1_component_summary("Execution Final Gate", final_gate),
+            "real_pilot_guard": _rpd_v1_component_summary("Real Pilot Guard", guard),
+            "telegram_notifier": _rpd_v1_component_summary("Real Execution Telegram Notifier", telegram),
+            "real_position_watchdog": _rpd_v1_component_summary("Real Position Watchdog", watchdog),
+            "registry_mode": _rpd_v1_component_summary("Registry Mode Segregation", registry_mode),
+            "registry_persistence": _rpd_v1_component_summary("Registry Persistence", registry_persistence),
+        },
+        "latest": _rpd_v1_latest_events(limit=5),
+        "details": {
+            "auto_real_bridge": bridge,
+            "execution_final_gate": final_gate,
+            "real_pilot_guard": guard,
+            "telegram_notifier": telegram,
+            "real_position_watchdog": watchdog,
+            "registry_mode": registry_mode,
+            "registry_persistence": registry_persistence,
+        } if deep else None,
+        "routes": [
+            "/realpilotdashboard",
+            "/realpilotdashboard/health",
+            "/realpilotdashboard?deep=false",
+            "/realpilotdashboard/log",
+            "/autorealbridge/health",
+            "/realpilotguard/health",
+            "/realexecutiontelegram/health",
+            "/realpositionwatchdog",
+            "/executionfinalgate/health",
+        ],
+        "notes": [
+            "Dashboard V1 é read-only: não abre ordem, não fecha posição, não altera stop e não envia Telegram.",
+            "ok=true significa que o piloto está pronto para aguardar sinal elegível; não significa que já existe trade aberto.",
+            "A execução real automática continua limitada ao FALCON em BTCUSDT/ETHUSDT com Real Pilot Guard, Final Gate e deduplicação.",
+        ],
+        "token_value_exposed": False,
+    }
+    dashboard = _rpd_v1_sanitize_public(dashboard)
+    _rpd_v1_append_event({
+        "status": dashboard.get("status"),
+        "ok": dashboard.get("ok"),
+        "blocking": dashboard.get("blocking"),
+        "warnings": dashboard.get("warnings"),
+        "positions": dashboard.get("positions"),
+        "pilot": dashboard.get("pilot"),
+        "next_action": dashboard.get("next_action"),
+        "source": source,
+    })
+    return dashboard
+
+
+def real_pilot_dashboard_v1_health_payload():
+    payload = _rpd_v1_build_dashboard(deep=False, source="health")
+    payload["health_mode"] = "shallow"
+    payload["status"] = payload.get("status") or ("REAL_PILOT_DASHBOARD_READY" if payload.get("ok") else "REAL_PILOT_DASHBOARD_NOT_READY")
+    return payload
+
+
+@app.route("/realpilotdashboard/health", methods=["GET"])
+@app.route("/real/pilotdashboard/health", methods=["GET"])
+def real_pilot_dashboard_v1_health_route():
+    return real_pilot_dashboard_v1_health_payload(), 200
+
+
+@app.route("/realpilotdashboard", methods=["GET"])
+@app.route("/real/pilotdashboard", methods=["GET"])
+def real_pilot_dashboard_v1_route():
+    deep = not (str(request.args.get("deep") or "true").strip().lower() in {"0", "false", "no", "nao", "não", "shallow"})
+    return _rpd_v1_build_dashboard(deep=deep, source="route"), 200
+
+
+@app.route("/realpilotdashboard/log", methods=["GET"])
+@app.route("/real/pilotdashboard/log", methods=["GET"])
+def real_pilot_dashboard_v1_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    payload = _rpd_v1_read_events(limit=limit)
+    payload.update({
+        "module": "real_pilot_dashboard_v1",
+        "version": REAL_PILOT_DASHBOARD_V1_VERSION,
+        "generated_at": _rpd_v1_now(),
+        "events_file": str(REAL_PILOT_DASHBOARD_V1_EVENTS_FILE),
+        "latest_file": str(REAL_PILOT_DASHBOARD_V1_LATEST_FILE),
+        "token_value_exposed": False,
+    })
+    return _rpd_v1_sanitize_public(payload), 200
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
