@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-06-SUPER-CENTRAL-QUANT-V5-EXECUTION-CONSOLE-V1.5-TRADE-REGISTRY-SYNC-V1
+# Versão: 2026-07-07-SUPER-CENTRAL-QUANT-V5-CEO-DAILY-V2-PNL-STABILITY-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -1376,6 +1376,16 @@ CENTRAL_TIMELINE_LOG_FILE = CENTRAL_DATA_DIR / "timeline.jsonl"
 CENTRAL_SHADOW_POSITIONS_FILE = CENTRAL_DATA_DIR / "shadow_positions.json"
 CENTRAL_EXECUTION_STATS_FILE = CENTRAL_DATA_DIR / "execution_stats.json"
 CENTRAL_STATUS_SNAPSHOTS_FILE = CENTRAL_DATA_DIR / "status_snapshots.jsonl"
+
+# ==========================================================
+# RUNTIME STABILITY MONITOR V1 — STARTUP/RESTART TRACKING
+# ==========================================================
+# Registra cada inicialização do processo em arquivo persistente.
+# Isso permite o CEO Daily Report enxergar reinícios nas últimas 24h
+# sem depender manualmente dos logs do Render.
+CENTRAL_RUNTIME_STABILITY_V1_VERSION = "2026-07-07-RUNTIME-STABILITY-MONITOR-V1"
+CENTRAL_RUNTIME_EVENTS_FILE = CENTRAL_DATA_DIR / "central_runtime_events.jsonl"
+CENTRAL_RUNTIME_STATE_FILE = CENTRAL_DATA_DIR / "central_runtime_state.json"
 CENTRAL_DECISION_LOG_MAX_READ = int(os.environ.get("CENTRAL_DECISION_LOG_MAX_READ", "200"))
 CENTRAL_TIMELINE_MAX_READ = int(os.environ.get("CENTRAL_TIMELINE_MAX_READ", "300"))
 CENTRAL_TELEGRAM_OFFSET = None
@@ -1450,6 +1460,182 @@ def safe_round(value, ndigits=2, default=None):
         return round(float(value), ndigits)
     except Exception:
         return default
+
+
+# ==========================================================
+# RUNTIME STABILITY MONITOR V1
+# ==========================================================
+def _runtime_stability_v1_json_default(value):
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _runtime_stability_v1_append_event(event):
+    try:
+        CENTRAL_RUNTIME_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(event or {})
+        payload.setdefault("version", CENTRAL_RUNTIME_STABILITY_V1_VERSION)
+        payload.setdefault("generated_at", data_hora_sp_str())
+        payload.setdefault("epoch", time.time())
+        with CENTRAL_RUNTIME_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=_runtime_stability_v1_json_default) + "\n")
+        return True
+    except Exception as exc:
+        print(f"ERRO RUNTIME STABILITY append: {exc}")
+        return False
+
+
+def _runtime_stability_v1_write_state(state):
+    try:
+        CENTRAL_RUNTIME_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CENTRAL_RUNTIME_STATE_FILE.write_text(
+            json.dumps(state or {}, ensure_ascii=False, indent=2, default=_runtime_stability_v1_json_default),
+            encoding="utf-8",
+        )
+        return True
+    except Exception as exc:
+        print(f"ERRO RUNTIME STABILITY state: {exc}")
+        return False
+
+
+def _runtime_stability_v1_read_events(limit=2000):
+    try:
+        if not CENTRAL_RUNTIME_EVENTS_FILE.exists():
+            return []
+        lines = CENTRAL_RUNTIME_EVENTS_FILE.read_text(encoding="utf-8").splitlines()
+        if limit:
+            lines = lines[-int(limit):]
+        rows = []
+        for line in lines:
+            try:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    rows.append(item)
+            except Exception:
+                pass
+        return rows
+    except Exception:
+        return []
+
+
+def runtime_stability_v1_record_startup():
+    started_epoch = time.time()
+    event = {
+        "event": "CENTRAL_RUNTIME_STARTUP",
+        "status": "STARTED",
+        "pid": os.getpid() if hasattr(os, "getpid") else None,
+        "bot_name": BOT_NAME,
+        "execution_mode": EXECUTION_MODE if "EXECUTION_MODE" in globals() else None,
+        "real_execution_enabled": bool(ENABLE_REAL_TRADING) if "ENABLE_REAL_TRADING" in globals() else None,
+        "memory_mb": current_rss_mb() if "current_rss_mb" in globals() else None,
+        "started_epoch": started_epoch,
+        "started_at": data_hora_sp_str(),
+    }
+    ok = _runtime_stability_v1_append_event(event)
+    state = dict(event)
+    state["ok"] = ok
+    state["events_file"] = str(CENTRAL_RUNTIME_EVENTS_FILE)
+    state["state_file"] = str(CENTRAL_RUNTIME_STATE_FILE)
+    _runtime_stability_v1_write_state(state)
+    return state
+
+
+def runtime_stability_v1_snapshot(hours=24):
+    try:
+        now_epoch = time.time()
+        window_seconds = max(1, int(float(hours) * 3600))
+        start_epoch = now_epoch - window_seconds
+        rows = _runtime_stability_v1_read_events(limit=5000)
+        startup_rows = []
+        for item in rows:
+            if str(item.get("event") or "").upper() != "CENTRAL_RUNTIME_STARTUP":
+                continue
+            try:
+                epoch = float(item.get("epoch") or item.get("started_epoch") or 0)
+            except Exception:
+                epoch = 0
+            if epoch >= start_epoch:
+                startup_rows.append(item)
+
+        restart_like_count = len(startup_rows)
+        started_epoch = float((CENTRAL_HEALTH if "CENTRAL_HEALTH" in globals() else {}).get("started_epoch") or now_epoch)
+        uptime_minutes = round(max(0.0, now_epoch - started_epoch) / 60.0, 2)
+
+        try:
+            history = list(MEMORY_HISTORY)
+        except Exception:
+            history = []
+        usage_values = []
+        for snap in history:
+            try:
+                if snap.get("usage_pct") is not None:
+                    usage_values.append(float(snap.get("usage_pct")))
+            except Exception:
+                pass
+        current_memory = memory_snapshot("runtime_stability_v1_snapshot", store=True) if "memory_snapshot" in globals() else {}
+        try:
+            usage_values.append(float(current_memory.get("usage_pct")))
+        except Exception:
+            pass
+        peak_memory_pct = round(max(usage_values), 2) if usage_values else None
+
+        status = "OK"
+        reasons = []
+        if restart_like_count >= 4:
+            status = "CRITICAL"
+            reasons.append(f"{restart_like_count} inicializações/reinícios detectados nas últimas {hours}h.")
+        elif restart_like_count >= 2:
+            status = "ATTENTION"
+            reasons.append(f"{restart_like_count} inicializações/reinícios detectados nas últimas {hours}h.")
+
+        mem_pct = current_memory.get("usage_pct") or peak_memory_pct or 0
+        try:
+            mem_pct_f = float(mem_pct)
+        except Exception:
+            mem_pct_f = 0
+        if mem_pct_f >= 92:
+            status = "CRITICAL"
+            reasons.append(f"Memória em zona crítica: {mem_pct_f:.1f}%.")
+        elif mem_pct_f >= 85 and status == "OK":
+            status = "ATTENTION"
+            reasons.append(f"Memória em atenção: {mem_pct_f:.1f}%.")
+        elif mem_pct_f >= 85:
+            reasons.append(f"Memória em atenção: {mem_pct_f:.1f}%.")
+
+        if not reasons:
+            reasons.append("Sem sinais internos de instabilidade na janela monitorada.")
+
+        return {
+            "ok": status == "OK",
+            "module": "runtime_stability_v1",
+            "version": CENTRAL_RUNTIME_STABILITY_V1_VERSION,
+            "generated_at": data_hora_sp_str(),
+            "status": status,
+            "window_hours": hours,
+            "startup_events_24h": restart_like_count,
+            "restart_like_count_24h": restart_like_count,
+            "uptime_minutes": uptime_minutes,
+            "uptime_hours": round(uptime_minutes / 60.0, 2),
+            "current_memory_pct": current_memory.get("usage_pct"),
+            "current_memory_mb": current_memory.get("rss_mb"),
+            "peak_memory_pct_observed": peak_memory_pct,
+            "events_file": str(CENTRAL_RUNTIME_EVENTS_FILE),
+            "state_file": str(CENTRAL_RUNTIME_STATE_FILE),
+            "reasons": reasons,
+            "last_startups": startup_rows[-8:],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "module": "runtime_stability_v1",
+            "version": CENTRAL_RUNTIME_STABILITY_V1_VERSION,
+            "generated_at": data_hora_sp_str(),
+            "status": "ERROR",
+            "error": str(exc),
+            "reasons": [str(exc)],
+        }
 
 
 # ==========================================================
@@ -1691,11 +1877,17 @@ LOADED_BOTS = {}
 LOAD_ERRORS = {}
 CENTRAL_HEALTH = {
     "started_at": data_hora_sp_str(),
+    "started_epoch": time.time(),
     "last_watchdog_check": None,
     "last_watchdog_alert": None,
     "last_watchdog_alert_ts": 0,
     "watchdog_status": "OK",
 }
+
+try:
+    CENTRAL_HEALTH["runtime_startup"] = runtime_stability_v1_record_startup()
+except Exception as _runtime_startup_exc:
+    CENTRAL_HEALTH["runtime_startup"] = {"ok": False, "error": str(_runtime_startup_exc)}
 
 
 TRADE_REGISTRY_AUTOSYNC_STATUS = {
@@ -16146,99 +16338,553 @@ def build_executive_dashboard_json():
     }
 
 
+# ==========================================================
+# CEO DAILY REPORT V2 — PNL + ESTABILIDADE + AÇÃO PRÁTICA
+# ==========================================================
+def _ceo_daily_v2_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.replace("%", "").replace("USDT", "").replace("R", "").replace(",", ".").strip()
+            if value in {"", "-", "None", "none", "N/A"}:
+                return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _ceo_daily_v2_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _ceo_daily_v2_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "y"}
+
+
+def _ceo_daily_v2_pick_num(mapping, keys, default=0.0):
+    if not isinstance(mapping, dict):
+        return default
+    for key in keys:
+        if key in mapping and mapping.get(key) not in [None, "", "N/A", "-"]:
+            return _ceo_daily_v2_float(mapping.get(key), default)
+    return default
+
+
+def _ceo_daily_v2_fmt_pct(value):
+    value = _ceo_daily_v2_float(value, 0.0)
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}%"
+
+
+def _ceo_daily_v2_fmt_r(value):
+    value = _ceo_daily_v2_float(value, 0.0)
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}R"
+
+
+def _ceo_daily_v2_fmt_usdt(value):
+    if value is None:
+        return "N/A"
+    value = _ceo_daily_v2_float(value, 0.0)
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f} USDT"
+
+
+def _ceo_daily_v2_trade_epoch(trade):
+    if not isinstance(trade, dict):
+        return None
+    for key in ["exit_epoch", "closed_epoch", "epoch", "timestamp", "created_epoch", "updated_epoch"]:
+        try:
+            value = trade.get(key)
+            if value is not None:
+                epoch = float(value)
+                if epoch > 1000000000:
+                    return epoch
+        except Exception:
+            pass
+
+    for key in ["exit_time", "closed_at", "created_at", "ts", "generated_at", "opened_at"]:
+        raw = str(trade.get(key) or "").strip()
+        if not raw:
+            continue
+        for fmt in ["%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
+            try:
+                normalized = raw.replace("Z", "").split(".")[0]
+                dt = datetime.strptime(normalized[:19], fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TIMEZONE_BR)
+                return dt.timestamp()
+            except Exception:
+                pass
+    return None
+
+
+def _ceo_daily_v2_trade_pnl_pct(trade):
+    if not isinstance(trade, dict):
+        return 0.0
+    raw = trade.get("raw") if isinstance(trade.get("raw"), dict) else {}
+    for source in [trade, raw]:
+        value = _ceo_daily_v2_pick_num(
+            source,
+            ["pnl_pct", "result_pct", "profit_pct", "pnl_percent", "resultado_pct", "pnl"],
+            None,
+        )
+        if value is not None:
+            return value
+    return 0.0
+
+
+def _ceo_daily_v2_trade_r(trade):
+    if not isinstance(trade, dict):
+        return 0.0
+    raw = trade.get("raw") if isinstance(trade.get("raw"), dict) else {}
+    for source in [trade, raw]:
+        value = _ceo_daily_v2_pick_num(
+            source,
+            ["r_multiple", "result_r", "r_result", "pnl_r", "r"],
+            None,
+        )
+        if value is not None:
+            return value
+    return 0.0
+
+
+def _ceo_daily_v2_trade_result(trade):
+    if not isinstance(trade, dict):
+        return "BREAKEVEN"
+    result = str(trade.get("result") or trade.get("result_type") or "").upper().strip()
+    pnl = _ceo_daily_v2_trade_pnl_pct(trade)
+    if result in {"WIN", "LOSS", "BREAKEVEN", "BE"}:
+        return "BREAKEVEN" if result == "BE" else result
+    if pnl > 0:
+        return "WIN"
+    if pnl < 0:
+        return "LOSS"
+    return "BREAKEVEN"
+
+
+def _ceo_daily_v2_metrics_from_trades(trades):
+    rows = [t for t in (trades or []) if isinstance(t, dict)]
+    pnl_values = [_ceo_daily_v2_trade_pnl_pct(t) for t in rows]
+    r_values = [_ceo_daily_v2_trade_r(t) for t in rows]
+    wins = len([t for t in rows if _ceo_daily_v2_trade_result(t) == "WIN"])
+    losses = len([t for t in rows if _ceo_daily_v2_trade_result(t) == "LOSS"])
+    breakeven = len(rows) - wins - losses
+    tp50_hits = 0
+    stops = 0
+    for t in rows:
+        close_reason = str(t.get("close_reason") or t.get("exit_reason") or t.get("reason") or "").upper()
+        if _ceo_daily_v2_bool(t.get("tp50_hit"), False) or "TP50" in close_reason:
+            tp50_hits += 1
+        if "STOP" in close_reason or close_reason in {"SL", "STOP_LOSS", "LOSS"}:
+            stops += 1
+    trades_count = len(rows)
+    return {
+        "trades": trades_count,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "tp50_hits": tp50_hits,
+        "stops": stops,
+        "pnl_total_pct": round(sum(pnl_values), 4),
+        "pnl_avg_pct": round(sum(pnl_values) / max(trades_count, 1), 4) if trades_count else 0.0,
+        "r_total": round(sum(r_values), 4),
+        "r_avg": round(sum(r_values) / max(trades_count, 1), 4) if trades_count else 0.0,
+        "win_rate_pct": round(wins / max(wins + losses, 1) * 100, 2),
+        "tp50_hit_rate_pct": round(tp50_hits / max(trades_count, 1) * 100, 2),
+    }
+
+
+def _ceo_daily_v2_group_metrics(trades, field="bot", limit=8):
+    groups = {}
+    for trade in trades or []:
+        if not isinstance(trade, dict):
+            continue
+        key = str(trade.get(field) or "UNKNOWN").upper().strip()
+        groups.setdefault(key, []).append(trade)
+    scored = {key: _ceo_daily_v2_metrics_from_trades(rows) for key, rows in groups.items()}
+    return dict(sorted(scored.items(), key=lambda item: _ceo_daily_v2_float((item[1] or {}).get("pnl_total_pct"), 0), reverse=True)[:limit])
+
+
+def _ceo_daily_v2_history_pnl_snapshot(limit=8000):
+    try:
+        import history_manager as super_history_manager
+        if hasattr(super_history_manager, "load_closed_trades"):
+            trades = super_history_manager.load_closed_trades(limit=limit)
+        elif hasattr(super_history_manager, "build_closed_trades_payload"):
+            trades = (super_history_manager.build_closed_trades_payload(limit=limit) or {}).get("trades") or []
+        else:
+            trades = []
+    except Exception as exc:
+        return {
+            "ok": False,
+            "source": "SUPER_HISTORY",
+            "error": str(exc),
+            "today": _ceo_daily_v2_metrics_from_trades([]),
+            "month": _ceo_daily_v2_metrics_from_trades([]),
+            "all": _ceo_daily_v2_metrics_from_trades([]),
+            "by_bot_month": {},
+        }
+
+    now = agora_sp()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    today_trades = []
+    month_trades = []
+    for trade in trades or []:
+        epoch = _ceo_daily_v2_trade_epoch(trade)
+        if epoch is None:
+            continue
+        if epoch >= today_start:
+            today_trades.append(trade)
+        if epoch >= month_start:
+            month_trades.append(trade)
+
+    return {
+        "ok": True,
+        "source": "SUPER_HISTORY",
+        "generated_at": data_hora_sp_str(),
+        "trades_loaded": len(trades or []),
+        "today": _ceo_daily_v2_metrics_from_trades(today_trades),
+        "month": _ceo_daily_v2_metrics_from_trades(month_trades),
+        "all": _ceo_daily_v2_metrics_from_trades(trades or []),
+        "by_bot_today": _ceo_daily_v2_group_metrics(today_trades, "bot", limit=8),
+        "by_bot_month": _ceo_daily_v2_group_metrics(month_trades, "bot", limit=8),
+    }
+
+
+def _ceo_daily_v2_real_pnl_snapshot():
+    if not REAL_PNL_R_MAPPER_AVAILABLE or real_pnl_r_mapper is None:
+        return {
+            "ok": False,
+            "source": "REAL_PNL_R_MAPPER",
+            "available": False,
+            "error": REAL_PNL_R_MAPPER_IMPORT_ERROR,
+        }
+    try:
+        limit = min(300, int(globals().get("REAL_PNL_R_DEFAULT_LIMIT", 300) or 300))
+        payload = real_pnl_r_mapper.build_real_pnl_r_map(limit=limit, commit=False)
+        compact = _compact_real_pnl_payload(payload) if "_compact_real_pnl_payload" in globals() else payload
+        return {
+            "ok": bool((payload or {}).get("ok", True)),
+            "source": "REAL_PNL_R_MAPPER",
+            "available": True,
+            "limit": limit,
+            "payload": compact if isinstance(compact, dict) else {},
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "source": "REAL_PNL_R_MAPPER",
+            "available": True,
+            "error": str(exc),
+        }
+
+
+def _ceo_daily_v2_open_pnl_snapshot():
+    try:
+        open_trades = get_open_positions_central()
+    except Exception:
+        open_trades = []
+
+    by_bot = {}
+    pnl_values = []
+    r_values = []
+    for trade in open_trades or []:
+        if not isinstance(trade, dict):
+            continue
+        bot = str(trade.get("bot") or trade.get("robot") or "UNKNOWN").upper().strip()
+        pnl = _ceo_daily_v2_pick_num(
+            trade,
+            ["current_pnl_pct", "unrealized_pnl_pct", "runner_pct", "pnl_pct", "result_pct", "pnl"],
+            None,
+        )
+        r = _ceo_daily_v2_pick_num(
+            trade,
+            ["current_r", "runner_r", "unrealized_r", "pnl_r", "r_multiple", "result_r"],
+            None,
+        )
+        by_bot.setdefault(bot, {"open": 0, "pnl_est_pct": 0.0, "r_est": 0.0})
+        by_bot[bot]["open"] += 1
+        if pnl is not None:
+            pnl_values.append(pnl)
+            by_bot[bot]["pnl_est_pct"] = round(by_bot[bot]["pnl_est_pct"] + pnl, 4)
+        if r is not None:
+            r_values.append(r)
+            by_bot[bot]["r_est"] = round(by_bot[bot]["r_est"] + r, 4)
+
+    return {
+        "ok": True,
+        "source": "OPEN_POSITIONS_ESTIMATE",
+        "open_count": len(open_trades or []),
+        "pnl_est_total_pct": round(sum(pnl_values), 4) if pnl_values else None,
+        "r_est_total": round(sum(r_values), 4) if r_values else None,
+        "has_open_pnl_fields": bool(pnl_values or r_values),
+        "by_bot": by_bot,
+    }
+
+
+def _ceo_daily_v2_alert_counts(executive_alerts):
+    alerts = (executive_alerts or {}).get("alerts") or []
+    critical = 0
+    warning = 0
+    for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+        level = str(alert.get("level") or "").upper()
+        if level == "CRITICAL":
+            critical += 1
+        elif level == "WARNING":
+            warning += 1
+    return {
+        "active": _ceo_daily_v2_int((executive_alerts or {}).get("alerts_count"), len(alerts)),
+        "critical": critical,
+        "warning": warning,
+        "to_notify": _ceo_daily_v2_int((executive_alerts or {}).get("alerts_to_notify_count"), 0),
+        "alerts": alerts,
+    }
+
+
+def _ceo_daily_v2_pipeline_summary(pipeline):
+    components = (((pipeline or {}).get("pipeline") or {}).get("components") or {})
+    total = 0
+    ok = 0
+    failed = []
+    for name, comp in components.items():
+        if isinstance(comp, dict):
+            total += 1
+            if comp.get("ok"):
+                ok += 1
+            else:
+                failed.append(name)
+    return {"ok": ok, "total": total, "failed": failed, "components": components}
+
+
+def _ceo_daily_v2_status_and_actions(executive, pipeline, stability, pnl_history):
+    executive_alerts = (executive or {}).get("executive_alerts") or {}
+    alert_counts = _ceo_daily_v2_alert_counts(executive_alerts)
+    memory_pct = _ceo_daily_v2_float((executive or {}).get("memory_pct"), 0.0)
+    restarts = _ceo_daily_v2_int((stability or {}).get("restart_like_count_24h"), 0)
+    actions = []
+
+    status = "OK"
+    decision = "OPERAR_NORMAL_COM_MONITORAMENTO"
+
+    if alert_counts["critical"] > 0:
+        status = "ATENÇÃO"
+        decision = "INVESTIGAR_ALERTA_CRÍTICO"
+        actions.append("Investigar alerta crítico antes de expandir risco.")
+    if restarts >= 4:
+        status = "CRÍTICO"
+        decision = "INVESTIGAR_ESTABILIDADE"
+        actions.append("Investigar reinícios/Render antes de aumentar lote, risco ou número de posições.")
+    elif restarts >= 2:
+        if status == "OK":
+            status = "ATENÇÃO"
+            decision = "OPERAR_DEFENSIVO"
+        actions.append("Monitorar reinícios; se repetirem, pausar expansão.")
+    if memory_pct >= 92:
+        status = "CRÍTICO"
+        decision = "REDUZIR_RITMO_E_CORRIGIR_MEMÓRIA"
+        actions.append("Memória em zona crítica: reduzir endpoints pesados e investigar leak/pico.")
+    elif memory_pct >= 85:
+        if status == "OK":
+            status = "ATENÇÃO"
+            decision = "OPERAR_DEFENSIVO"
+        actions.append("Memória acima de 85%: manter operação defensiva e evitar relatórios pesados em loop.")
+
+    if (executive or {}).get("real_execution_enabled") and alert_counts["critical"] > 0:
+        for alert in alert_counts["alerts"]:
+            if not isinstance(alert, dict):
+                continue
+            code = str(alert.get("code") or "").upper()
+            title = str(alert.get("title") or "").lower()
+            if "REAL_EXECUTION" in code or "execução real" in title or "execucao real" in title:
+                actions.append("Confirmar se execução REAL foi intencional e se o stop de desastre está configurado.")
+                break
+
+    today = (pnl_history or {}).get("today") or {}
+    if _ceo_daily_v2_float(today.get("pnl_total_pct"), 0) < 0 and _ceo_daily_v2_int(today.get("trades"), 0) >= 3:
+        if status == "OK":
+            status = "ATENÇÃO"
+            decision = "OPERAR_DEFENSIVO"
+        actions.append("Dia negativo com amostra relevante: não aumentar risco hoje.")
+
+    if not actions:
+        actions.append("Nenhuma ação crítica. Manter monitoramento normal.")
+
+    # Remove duplicados preservando ordem.
+    deduped = []
+    for item in actions:
+        if item not in deduped:
+            deduped.append(item)
+
+    return {"status": status, "decision": decision, "actions": deduped[:6], "alert_counts": alert_counts}
+
+
 def build_ceo_daily_report():
     now = data_hora_sp_str()
 
     executive = build_executive_dashboard_json()
     pipeline = build_execution_pipeline_status()
-
     adaptive = pipeline.get("adaptive") or {}
     positions = pipeline.get("positions") or {}
-    alerts = pipeline.get("alerts") or []
 
-    risk_status = executive.get("risk_status", "OK")
-    confidence = adaptive.get("confidence", 0)
-    suggested_weight = adaptive.get("suggested_weight", 1.0)
-    action = adaptive.get("recommended_action", "WAIT_SAMPLE")
+    pnl_history = _ceo_daily_v2_history_pnl_snapshot()
+    real_pnl = _ceo_daily_v2_real_pnl_snapshot()
+    open_pnl = _ceo_daily_v2_open_pnl_snapshot()
+    stability = runtime_stability_v1_snapshot(hours=24)
+    pipe = _ceo_daily_v2_pipeline_summary(pipeline)
+    decision = _ceo_daily_v2_status_and_actions(executive, pipeline, stability, pnl_history)
 
-    components = ((pipeline.get("pipeline") or {}).get("components") or {})
+    confidence_payload = executive.get("ceo_confidence") or {}
+    confidence_score = _ceo_daily_v2_float(confidence_payload.get("score"), 0.0)
+    confidence_label = str(confidence_payload.get("label") or "N/A")
+
+    today = pnl_history.get("today") or {}
+    month = pnl_history.get("month") or {}
+    by_bot_month = pnl_history.get("by_bot_month") or {}
+    open_by_bot = open_pnl.get("by_bot") or {}
+
+    real_payload = real_pnl.get("payload") or {}
+    real_summary = real_payload.get("summary") or {}
+    real_mapped = real_payload.get("mapped_count") or real_payload.get("closed_count") or 0
+    real_pnl_usdt = _ceo_daily_v2_pick_num(
+        real_summary,
+        ["pnl_total_usdt", "realized_pnl_usdt", "net_pnl_usdt", "pnl_usdt", "profit_usdt"],
+        None,
+    )
+    real_pnl_pct = _ceo_daily_v2_pick_num(
+        real_summary,
+        ["pnl_total_pct", "realized_pnl_pct", "net_pnl_pct", "pnl_pct"],
+        None,
+    )
+
+    mode_text = "REAL" if executive.get("real_execution_enabled") else "VERIFY"
+    dominant_pct = 0.0
+    total_pos = _ceo_daily_v2_int(executive.get("positions"), 0)
+    long_pos = _ceo_daily_v2_int(executive.get("long"), 0)
+    short_pos = _ceo_daily_v2_int(executive.get("short"), 0)
+    if total_pos > 0:
+        dominant_pct = round(max(long_pos, short_pos) / max(total_pos, 1) * 100, 2)
+    dominant_side = "LONG" if long_pos >= short_pos else "SHORT"
 
     lines = [
-        "🧠 CEO DAILY REPORT — CENTRAL QUANT",
-        "",
+        "🧠 CEO DAILY REPORT — CENTRAL QUANT V2",
         f"Data/hora: {now}",
         "",
-        "════════════════════════════",
-        "STATUS GERAL DA CENTRAL QUANT",
-        "════════════════════════════",
-        f"Status Operacional: {executive.get('status', 'OK')}",
-        f"Modo de Execução: {'REAL' if executive.get('real_execution_enabled') else 'VERIFY'}",
-        f"Uso de Memória (Render): {float(executive.get('memory_pct') or 0):.1f}%",
-        f"Risco Operacional: {risk_status}",
-        f"Confiança Estatística: {float(confidence or 0):.1f}%",
+        "━━━━━━━━━━━━━━━━━━",
+        "1. RESUMO EXECUTIVO",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Status CEO: {decision.get('status')}",
+        f"Decisão principal: {decision.get('decision')}",
+        f"Modo: {mode_text} | Execução: {'ATIVA' if executive.get('real_execution_enabled') else 'BLOQUEADA/VERIFY'}",
+        f"CEO Confidence: {confidence_score:.2f}/100 — {confidence_label}",
+        f"Alertas: ativos={decision['alert_counts'].get('active')} | críticos={decision['alert_counts'].get('critical')} | warnings={decision['alert_counts'].get('warning')}",
         "",
-        "════════════════════════════",
-        "CEO CONFIDENCE INDEX",
-        "════════════════════════════",
-        _ceo_confidence_report_block(),
-        "",
-        "════════════════════════════",
-        "STRATEGIC ADVISOR",
-        "════════════════════════════",
-        _strategic_advisor_report_block(compact=True),
-        "",
-        "════════════════════════════",
-        "DECISION PACK",
-        "════════════════════════════",
-        _decision_pack_report_block(compact=True),
-        "",
-        "════════════════════════════",
-        "EXECUTIVE DECISION ENGINE",
-        "════════════════════════════",
-        _executive_decision_report_block(compact=True),
-        "",
-        "════════════════════════════",
-        "EXECUTIVE ALERT MANAGER",
-        "════════════════════════════",
-        _executive_alerts_report_block(),
-        "",
-        "════════════════════════════",
-        "PIPELINE",
-        "════════════════════════════",
-        f"Execution Engine: {'✅' if components.get('execution_engine', {}).get('ok') else '❌'}",
-        f"Paper Executor: {'✅' if components.get('paper_executor', {}).get('ok') else '❌'}",
-        f"Lifecycle: {'✅' if components.get('paper_lifecycle', {}).get('ok') else '❌'}",
-        f"Outcome Evaluator: {'✅' if components.get('outcome_evaluator', {}).get('ok') else '❌'}",
-        f"Adaptive Weights: {'✅' if components.get('adaptive_weights', {}).get('ok') else '❌'}",
-        "",
-        "════════════════════════════",
-        "OPERAÇÃO",
-        "════════════════════════════",
-        f"Posições abertas na Central: {executive.get('positions', 0)}",
-        f"LONG: {executive.get('long', 0)} | SHORT: {executive.get('short', 0)}",
-        f"PAPER abertas: {positions.get('open', 0)}",
-        f"PAPER fechadas: {positions.get('closed', 0)}",
-        f"Outcomes pendentes: {positions.get('pending_outcome', 0)}",
-        "",
-        "════════════════════════════",
-        "APRENDIZADO",
-        "════════════════════════════",
-        f"Ação sugerida: {action}",
-        f"Peso sugerido: {suggested_weight}",
-        f"Confiança Estatística: {float(confidence or 0):.1f}%",
-        f"Trades analisados: {adaptive.get('trades', 0)}",
-        "",
-        "════════════════════════════",
-        "AÇÃO NECESSÁRIA",
-        "════════════════════════════",
+        "━━━━━━━━━━━━━━━━━━",
+        "2. RESULTADO / PNL",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Hoje: {today.get('trades', 0)} trade(s) fechado(s) | PnL {_ceo_daily_v2_fmt_pct(today.get('pnl_total_pct'))} | R {_ceo_daily_v2_fmt_r(today.get('r_total'))} | WR {today.get('win_rate_pct', 0)}%",
+        f"Mês: {month.get('trades', 0)} trade(s) fechado(s) | PnL {_ceo_daily_v2_fmt_pct(month.get('pnl_total_pct'))} | R {_ceo_daily_v2_fmt_r(month.get('r_total'))} | WR {month.get('win_rate_pct', 0)}%",
+        f"TP50 hoje: {today.get('tp50_hits', 0)} | Stops hoje: {today.get('stops', 0)} | BE hoje: {today.get('breakeven', 0)}",
     ]
 
-    if alerts:
-        for alert in alerts:
-            lines.append(f"• {alert}")
+    if open_pnl.get("has_open_pnl_fields"):
+        lines.append(f"Aberto estimado: PnL {_ceo_daily_v2_fmt_pct(open_pnl.get('pnl_est_total_pct'))} | R {_ceo_daily_v2_fmt_r(open_pnl.get('r_est_total'))}")
     else:
-        lines.append("Nenhuma ação necessária.")
-        lines.append("A Central está operando normalmente.")
+        lines.append(f"Aberto estimado: {open_pnl.get('open_count', 0)} posição(ões); PnL aberto não disponível nos campos atuais.")
+
+    if real_pnl.get("ok") and real_mapped:
+        parts = [f"Real PnL/R: {real_mapped} trade(s) mapeado(s)"]
+        if real_pnl_usdt is not None:
+            parts.append(f"USDT {_ceo_daily_v2_fmt_usdt(real_pnl_usdt)}")
+        if real_pnl_pct is not None:
+            parts.append(f"% {_ceo_daily_v2_fmt_pct(real_pnl_pct)}")
+        lines.append(" | ".join(parts))
+    elif real_pnl.get("available"):
+        lines.append("Real PnL/R: disponível, mas sem trade real mapeado no snapshot compacto.")
+    else:
+        lines.append(f"Real PnL/R: indisponível ({real_pnl.get('error') or 'módulo não carregado'}).")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "3. OPERAÇÃO E RISCO",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Posições abertas: {total_pos} | LONG {long_pos} | SHORT {short_pos} | dominante {dominant_side} {dominant_pct:.1f}%",
+        f"PAPER: abertas {positions.get('open', 0)} | fechadas {positions.get('closed', 0)} | outcomes pendentes {positions.get('pending_outcome', 0)}",
+        f"Expansão: {'BLOQUEADA' if decision.get('status') in {'ATENÇÃO', 'CRÍTICO'} else 'PERMITIDA COM DISCIPLINA'}",
+        f"Aumento de risco/lote: {'NÃO' if decision.get('status') in {'ATENÇÃO', 'CRÍTICO'} else 'SOMENTE COM AMOSTRA'}",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "4. ESTABILIDADE DA CENTRAL",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Status estabilidade: {stability.get('status', 'UNKNOWN')}",
+        f"Inicializações/reinícios detectados 24h: {stability.get('restart_like_count_24h', 0)}",
+        f"Uptime atual: {stability.get('uptime_hours', 0)}h",
+        f"Memória atual: {float(executive.get('memory_pct') or 0):.1f}% | pico observado no processo: {stability.get('peak_memory_pct_observed', 'N/A')}%",
+    ]
+
+    for reason in (stability.get("reasons") or [])[:3]:
+        lines.append(f"- {reason}")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "5. PIPELINE E LEARNING",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Pipeline: {pipe.get('ok')}/{pipe.get('total')} componentes OK" if pipe.get("total") else "Pipeline: componentes detalhados indisponíveis",
+        f"Learning: ação {adaptive.get('recommended_action', 'WAIT_SAMPLE')} | confiança {float(adaptive.get('confidence') or 0):.1f}% | trades analisados {adaptive.get('trades', 0)}",
+    ]
+    if pipe.get("failed"):
+        lines.append("Falhas pipeline: " + ", ".join(pipe.get("failed")[:5]))
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "6. ROBÔS — PNL DO MÊS",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if by_bot_month:
+        for bot, stats in list(by_bot_month.items())[:8]:
+            open_stats = open_by_bot.get(bot, {})
+            lines.append(
+                f"{bot}: {stats.get('trades', 0)} fechados | PnL {_ceo_daily_v2_fmt_pct(stats.get('pnl_total_pct'))} | "
+                f"WR {stats.get('win_rate_pct', 0)}% | abertas {open_stats.get('open', 0)}"
+            )
+    else:
+        # Mostra abertas por robô quando ainda não há fechados no mês.
+        if open_by_bot:
+            for bot, stats in list(open_by_bot.items())[:8]:
+                lines.append(f"{bot}: 0 fechados no mês | abertas {stats.get('open', 0)}")
+        else:
+            lines.append("Ainda sem trades fechados no mês para ranking por robô.")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "7. AÇÃO NECESSÁRIA",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+    for action_item in decision.get("actions") or []:
+        lines.append(f"- {action_item}")
+
+    lines += [
+        "",
+        "Comandos úteis se precisar investigar:",
+        "/alertscheck /runtime/stability /realpnlr/text /riskstats /history /execution/pipeline/status /memory",
+    ]
 
     return "\n".join(lines)
 
@@ -17337,6 +17983,20 @@ def build_full_report():
     return "\n\n==============================\n".join(
         [f"==============================\n{title}\n==============================\n{text}" for title, text in build_full_parts()]
     )
+
+
+@app.route("/runtime/stability", methods=["GET"])
+@app.route("/runtimestability", methods=["GET"])
+@app.route("/restarts", methods=["GET"])
+def runtime_stability_v1_route():
+    try:
+        try:
+            hours = float(request.args.get("hours", "24"))
+        except Exception:
+            hours = 24
+        return runtime_stability_v1_snapshot(hours=hours), 200
+    except Exception as exc:
+        return {"ok": False, "module": "runtime_stability_v1", "error": str(exc)}, 500
 
 
 @app.route("/executive")
