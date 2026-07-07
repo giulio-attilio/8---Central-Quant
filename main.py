@@ -36551,6 +36551,18 @@ EXECUTION_ATTEMPT_AUDIT_V1_VERSION = "2026-07-07-EXECUTION-ATTEMPT-AUDIT-V1"
 EXECUTION_ATTEMPT_AUDIT_V1_FILE = CENTRAL_DATA_DIR / "execution_attempt_audit_v1.jsonl"
 EXECUTION_ATTEMPT_AUDIT_V1_LATEST_FILE = CENTRAL_DATA_DIR / "execution_attempt_audit_v1_latest.json"
 
+# ==========================================================
+# MEMORY EMERGENCY GUARD V1 — RENDER 512MB PROTECTION
+# ==========================================================
+# Em Render Free/512MB, o /ceodaily completo pode empurrar o processo para OOM
+# quando a memória já está alta. Este guard retorna um relatório mínimo antes de
+# carregar blocos pesados. Use ?force=true apenas conscientemente.
+MEMORY_EMERGENCY_GUARD_V1_VERSION = "2026-07-07-MEMORY-EMERGENCY-GUARD-V1"
+MEMORY_EMERGENCY_GUARD_ENABLED = os.environ.get("MEMORY_EMERGENCY_GUARD_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+MEMORY_EMERGENCY_CEO_DAILY_THRESHOLD_MB = float(os.environ.get("MEMORY_EMERGENCY_CEO_DAILY_THRESHOLD_MB", "360"))
+MEMORY_EMERGENCY_HARD_THRESHOLD_MB = float(os.environ.get("MEMORY_EMERGENCY_HARD_THRESHOLD_MB", "430"))
+MEMORY_EMERGENCY_FORCE_GC_BEFORE_HEAVY = os.environ.get("MEMORY_EMERGENCY_FORCE_GC_BEFORE_HEAVY", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+
 try:
     _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_ATTEMPT_AUDIT_V1 = run_execution_engine
 except Exception:
@@ -37027,6 +37039,128 @@ def _eaa_v1_combined_log(limit=50):
     }
 
 
+
+
+def _meg_v1_memory_snapshot():
+    try:
+        rss = current_rss_mb() if callable(globals().get("current_rss_mb")) else None
+    except Exception:
+        rss = None
+    try:
+        pct = memory_usage_pct(rss) if rss is not None and callable(globals().get("memory_usage_pct")) else None
+    except Exception:
+        pct = None
+    return {
+        "rss_mb": round(float(rss), 2) if rss is not None else None,
+        "usage_pct": round(float(pct), 2) if pct is not None else None,
+        "limit_mb": MEMORY_LIMIT_MB if "MEMORY_LIMIT_MB" in globals() else None,
+        "threshold_mb": MEMORY_EMERGENCY_CEO_DAILY_THRESHOLD_MB,
+        "hard_threshold_mb": MEMORY_EMERGENCY_HARD_THRESHOLD_MB,
+    }
+
+
+def _meg_v1_cleanup(reason="memory_emergency_guard", force=True):
+    try:
+        if callable(globals().get("_memory_cleanup")):
+            return _memory_cleanup(reason=reason, force=force)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "reason": reason}
+    try:
+        collected = gc.collect()
+        if callable(globals().get("malloc_trim_safe")):
+            malloc_trim_safe()
+        return {"ok": True, "reason": reason, "collected": collected}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "reason": reason}
+
+
+def _meg_v1_bool_arg(name, default=False):
+    try:
+        raw = request.args.get(name)
+    except Exception:
+        raw = None
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "sim", "on", "force"}
+
+
+def _meg_v1_minimal_ceo_daily(reason="MEMORY_PROTECTION_ACTIVE", cleanup=None):
+    now = _eaa_v1_now() if callable(globals().get("_eaa_v1_now")) else None
+    mem = _meg_v1_memory_snapshot()
+    stability = {}
+    try:
+        if callable(globals().get("runtime_stability_v1_snapshot")):
+            stability = runtime_stability_v1_snapshot(hours=24) or {}
+    except Exception as exc:
+        stability = {"ok": False, "error": str(exc)}
+
+    execution_mode = str(os.environ.get("EXECUTION_MODE") or os.environ.get("CENTRAL_EXECUTION_MODE") or "UNKNOWN").upper()
+    enable_real_trading = str(os.environ.get("ENABLE_REAL_TRADING", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    central_real_enabled = str(os.environ.get("CENTRAL_REAL_EXECUTION_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    real_pilot_enabled = str(os.environ.get("CENTRAL_REAL_PILOT_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+    lines = [
+        "🧠 CEO DAILY REPORT — CENTRAL QUANT V2.2 SAFE",
+        f"Data/hora: {now}",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "1. RESUMO EXECUTIVO",
+        "━━━━━━━━━━━━━━━━━━",
+        "Status CEO: CRÍTICO",
+        "Decisão principal: PROTEGER_MEMÓRIA_E_ESTABILIZAR_RENDER",
+        f"Motivo: {reason}",
+        f"Modo broker: {execution_mode} | ENABLE_REAL_TRADING: {enable_real_trading}",
+        f"Central real enabled: {central_real_enabled} | Real pilot: {real_pilot_enabled}",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "2. MEMÓRIA / ESTABILIDADE",
+        "━━━━━━━━━━━━━━━━━━",
+        f"Memória atual: {mem.get('rss_mb')} MB | {mem.get('usage_pct')}% do limite {mem.get('limit_mb')} MB",
+        f"Threshold CEO Daily completo: {mem.get('threshold_mb')} MB | hard: {mem.get('hard_threshold_mb')} MB",
+        f"Runtime status: {stability.get('status', 'UNKNOWN')} | reinícios 24h: {stability.get('restart_like_count_24h', 'N/A')}",
+        f"Uptime: {stability.get('uptime_minutes', 'N/A')} min | pico observado: {stability.get('peak_memory_pct_observed', 'N/A')}%",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "3. RESULTADO / PNL",
+        "━━━━━━━━━━━━━━━━━━",
+        "Relatório completo de PnL foi suspenso nesta chamada para evitar novo OOM no Render.",
+        "Use /riskstats e /realpnlr/text somente depois de estabilizar memória, com intervalo entre comandos.",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "4. AÇÃO NECESSÁRIA",
+        "━━━━━━━━━━━━━━━━━━",
+        "- Não rodar /ceodaily completo enquanto a memória estiver acima do threshold.",
+        "- Manter execução real desativada/VERIFY até o Render ficar estável.",
+        "- Rodar /memory/emergency e aguardar alguns minutos antes de novos relatórios pesados.",
+        "- Se persistir OOM sem comandos manuais, aplicar redução estrutural de módulos/bots ou subir plano de memória.",
+    ]
+    if cleanup is not None:
+        lines += ["", "Cleanup:", str(cleanup)[:600]]
+    return "\n".join(lines)
+
+
+@app.route("/memory/emergency", methods=["GET"])
+@app.route("/memoryemergency", methods=["GET"])
+def memory_emergency_guard_v1_route():
+    before = _meg_v1_memory_snapshot()
+    cleanup = _meg_v1_cleanup(reason="/memory/emergency", force=True)
+    after = _meg_v1_memory_snapshot()
+    return {
+        "ok": True,
+        "module": "memory_emergency_guard_v1",
+        "version": MEMORY_EMERGENCY_GUARD_V1_VERSION,
+        "generated_at": _eaa_v1_now() if callable(globals().get("_eaa_v1_now")) else None,
+        "enabled": MEMORY_EMERGENCY_GUARD_ENABLED,
+        "before": before,
+        "cleanup": cleanup,
+        "after": after,
+        "notes": [
+            "Esta rota força GC/malloc_trim quando disponível.",
+            "Ela não resolve leak estrutural, mas ajuda a baixar RSS após rotas pesadas.",
+            "Se RSS continuar alto, aguarde ou faça novo deploy após reduzir carga.",
+        ],
+    }, 200
+
 @app.route("/executionauditlog", methods=["GET"])
 @app.route("/execution/audit/log", methods=["GET"])
 @app.route("/executionattemptaudit/log", methods=["GET"])
@@ -37077,19 +37211,40 @@ def execution_attempt_audit_v1_health_route():
     }, 200
 
 
-# Wrapper leve para limpar memória depois do CEO Daily.
+# Wrapper com proteção de memória antes/depois do CEO Daily.
 def build_ceo_daily_report(*args, **kwargs):
     original = _ORIGINAL_BUILD_CEO_DAILY_REPORT_FOR_MEMORY_SAFE_V2_2
     if not callable(original):
         return "🧠 CEO DAILY REPORT — CENTRAL QUANT V2\n\nStatus: ERRO\nMotivo: build_ceo_daily_report original indisponível."
+
+    force_full = False
     try:
-        return original(*args, **kwargs)
+        force_full = _meg_v1_bool_arg("force", False) or _meg_v1_bool_arg("full", False)
+    except Exception:
+        force_full = False
+
+    before = _meg_v1_memory_snapshot()
+    before_mb = before.get("rss_mb")
+
+    if MEMORY_EMERGENCY_GUARD_ENABLED and not force_full and before_mb is not None and float(before_mb) >= MEMORY_EMERGENCY_CEO_DAILY_THRESHOLD_MB:
+        cleanup = _meg_v1_cleanup(reason="ceo_daily_v2_2_blocked_before_build", force=True)
+        return _meg_v1_minimal_ceo_daily(
+            reason=f"MEMORY_GUARD_BLOCKED_FULL_REPORT_BEFORE_BUILD rss={before_mb}MB",
+            cleanup=cleanup,
+        )
+
+    if MEMORY_EMERGENCY_GUARD_ENABLED and MEMORY_EMERGENCY_FORCE_GC_BEFORE_HEAVY:
+        _meg_v1_cleanup(reason="ceo_daily_v2_2_before_build", force=False)
+
+    try:
+        result = original(*args, **kwargs)
+        return result
+    except MemoryError:
+        cleanup = _meg_v1_cleanup(reason="ceo_daily_v2_2_memory_error", force=True)
+        return _meg_v1_minimal_ceo_daily(reason="MEMORY_ERROR_DURING_FULL_REPORT", cleanup=cleanup)
     finally:
         try:
-            if callable(globals().get("_memory_cleanup")):
-                _memory_cleanup(reason="ceo_daily_v2_2_after_build", force=True)
-            else:
-                gc.collect()
+            _meg_v1_cleanup(reason="ceo_daily_v2_2_after_build", force=True)
         except Exception:
             pass
 
