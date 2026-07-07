@@ -35288,7 +35288,7 @@ def real_position_watchdog_v1_assess(*args, **kwargs):
 # - Consolidar em uma única rota o estado do piloto real.
 # - Não executa trade, não altera ordens, não muda risco e não envia Telegram.
 # - Resume: Bridge, Final Gate, Guard, Telegram, Watchdog, Registry e última execução.
-REAL_PILOT_DASHBOARD_V1_VERSION = "2026-07-06-REAL-PILOT-DASHBOARD-V1"
+REAL_PILOT_DASHBOARD_V1_VERSION = "2026-07-06-REAL-PILOT-DASHBOARD-V1.1-LITE-DEFAULT"
 REAL_PILOT_DASHBOARD_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_pilot_dashboard_v1_latest.json"
 REAL_PILOT_DASHBOARD_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_pilot_dashboard_v1_events.jsonl"
 
@@ -35687,9 +35687,11 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "/tradecloseoutcome/health",
         ],
         "notes": [
-            "Dashboard V1 é read-only: não abre ordem, não fecha posição, não altera stop e não envia Telegram.",
+            "Dashboard V1.1 é read-only: não abre ordem, não fecha posição, não altera stop e não envia Telegram.",
+            "A rota /realpilotdashboard agora usa modo leve por padrão para evitar tela em branco/timeout por JSON grande.",
+            "Para diagnóstico completo, use /realpilotdashboard?deep=true apenas quando necessário.",
             "ok=true significa que o piloto está pronto para aguardar sinal elegível; não significa que já existe trade aberto.",
-            "A execução real automática continua limitada ao FALCON em BTCUSDT/ETHUSDT com Real Pilot Guard, Final Gate, deduplicação e Pilot Cooldown.",
+            "A execução real automática continua limitada ao FALCON, ativos permitidos no REAL_PILOT_ALLOWED_SYMBOLS, Real Pilot Guard, Final Gate, deduplicação e Pilot Cooldown.",
             "Real Close Auto Evaluator V1 fecha o ciclo pós-trade: detecta CLOSED REAL/UNKNOWN pendente e tenta salvar outcome sem tocar em ordens.",
         ],
         "token_value_exposed": False,
@@ -35726,8 +35728,32 @@ def real_pilot_dashboard_v1_health_route():
 @app.route("/realpilotdashboard", methods=["GET"])
 @app.route("/real/pilotdashboard", methods=["GET"])
 def real_pilot_dashboard_v1_route():
-    deep = not (str(request.args.get("deep") or "true").strip().lower() in {"0", "false", "no", "nao", "não", "shallow"})
-    return _rpd_v1_build_dashboard(deep=deep, source="route"), 200
+    # V1.1: modo leve por padrão.
+    # O modo deep gerava JSON muito grande porque incluía detalhes completos de Bridge, Final Gate e Watchdog;
+    # em alguns navegadores/Render isso podia parecer "tela em branco".
+    raw_deep = str(request.args.get("deep") or request.args.get("details") or "false").strip().lower()
+    deep = raw_deep in {"1", "true", "yes", "sim", "on", "full", "complete", "completo"}
+    payload = _rpd_v1_build_dashboard(deep=deep, source="route_deep" if deep else "route_lite")
+    payload["dashboard_mode"] = "deep" if deep else "lite"
+    payload["dashboard_v1_1_fix"] = {
+        "ok": True,
+        "reason": "lite_default_to_avoid_blank_or_timeout",
+        "deep_route": "/realpilotdashboard?deep=true",
+        "version": REAL_PILOT_DASHBOARD_V1_VERSION,
+    }
+    if not deep:
+        # Evita que arquivos latest antigos/diagnósticos extensos façam o JSON crescer demais no uso normal.
+        payload["details"] = None
+        latest = payload.get("latest")
+        if isinstance(latest, dict):
+            payload["latest_summary_only"] = {k: {
+                "ok": v.get("ok") if isinstance(v, dict) else None,
+                "status": v.get("status") if isinstance(v, dict) else None,
+                "generated_at": v.get("generated_at") if isinstance(v, dict) else None,
+                "version": v.get("version") if isinstance(v, dict) else None,
+            } for k, v in latest.items()}
+            payload["latest"] = None
+    return payload, 200
 
 
 @app.route("/realpilotdashboard/log", methods=["GET"])
@@ -35753,4 +35779,3 @@ start_central_runtime_once()
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
-s
