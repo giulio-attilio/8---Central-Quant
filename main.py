@@ -37707,6 +37707,317 @@ def broker_auto_preview_firewall_route():
         ],
     }, 200
 
+
+# ==========================================================
+# LIVE EXECUTION CLASSIFIER V1.1
+# ==========================================================
+# Objetivo:
+# - Separar no /live eventos seguros de VERIFY/DRY_RUN de tentativas reais.
+# - Mostrar bot/origem quando possível, especialmente FALCON VERIFY autorizado.
+# - Não altera execução, broker, risco ou envio real. É apenas leitura/classificação.
+
+LIVE_EXECUTION_CLASSIFIER_V1_VERSION = "2026-07-07-LIVE-EXECUTION-CLASSIFIER-V1.1"
+
+
+def _live_v11_str(value, default=""):
+    try:
+        if value is None:
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def _live_v11_upper(value, default=""):
+    return _live_v11_str(value, default).upper().strip()
+
+
+def _live_v11_event_tag(e):
+    if not isinstance(e, dict):
+        return ""
+    return _live_v11_str(
+        e.get("client_order_id")
+        or e.get("clientOrderId")
+        or e.get("client_tag")
+        or e.get("tag")
+        or e.get("order_client_id")
+        or ""
+    )
+
+
+def _live_v11_infer_bot(e):
+    if not isinstance(e, dict):
+        return "UNKNOWN"
+    raw = _live_v11_upper(e.get("bot") or e.get("bot_name") or e.get("source") or "")
+    tag = _live_v11_upper(_live_v11_event_tag(e))
+    symbol = _live_v11_upper(e.get("symbol") or "")
+    event = _live_v11_upper(e.get("event") or "")
+
+    if raw and raw not in {"NONE", "NULL", "UNKNOWN"}:
+        if raw in {"SMART_PREDATOR", "SMARTPREDATOR"}:
+            return "PREDATOR"
+        return raw
+
+    prefixes = [
+        ("FALCON", "FALCON"),
+        ("PREDATOR", "PREDATOR"),
+        ("SMART_PREDATOR", "PREDATOR"),
+        ("DONKEY", "DONKEY"),
+        ("COBRA", "COBRA"),
+        ("TURTLE", "TURTLE"),
+        ("TRENDPRO", "TRENDPRO"),
+        ("TREND_PRO", "TRENDPRO"),
+        ("MEME", "MEME"),
+    ]
+    for prefix, bot in prefixes:
+        if tag.startswith(prefix) or f"-{prefix}-" in tag or event.startswith(prefix):
+            return bot
+
+    # Fallback conservador: não inventa bot por símbolo.
+    return "UNKNOWN"
+
+
+def _live_v11_infer_mode(e, bot=None):
+    if not isinstance(e, dict):
+        return "UNKNOWN"
+    tag = _live_v11_upper(_live_v11_event_tag(e))
+    status = _live_v11_upper(e.get("status") or "")
+    mode = _live_v11_upper(e.get("mode") or e.get("execution_mode") or "")
+    bot = _live_v11_upper(bot or _live_v11_infer_bot(e))
+
+    if "VERIFY" in tag or status == "VERIFY":
+        return "VERIFY"
+    if "PAPER" in tag:
+        return "PAPER"
+    if status in {"DRY_RUN", "PREVIEW", "PREVIEW_ISOLATED"}:
+        if bot == "FALCON":
+            return "VERIFY"  # Falcon gera preview do broker exatamente no modo VERIFY.
+        return "DRY_RUN"
+    if status.startswith("AUTO_BROKER_PREVIEW_BLOCKED"):
+        return "BLOCKED"
+    if bool(e.get("sent")):
+        return "LIVE"
+    return mode or "UNKNOWN"
+
+
+def _live_v11_classify_event(e):
+    if not isinstance(e, dict):
+        return {
+            "class_code": "UNKNOWN_EVENT",
+            "label": "⚪ UNKNOWN_EVENT",
+            "bot": "UNKNOWN",
+            "mode": "UNKNOWN",
+            "safe": True,
+            "reason": "evento não-dict no execution log",
+        }
+
+    status = _live_v11_upper(e.get("status") or "")
+    event = _live_v11_upper(e.get("event") or "")
+    sent = bool(e.get("sent"))
+    tag = _live_v11_upper(_live_v11_event_tag(e))
+    bot = _live_v11_infer_bot(e)
+    mode = _live_v11_infer_mode(e, bot=bot)
+
+    if sent:
+        return {
+            "class_code": "LIVE_SENT",
+            "label": "🔴 LIVE_SENT",
+            "bot": bot,
+            "mode": "LIVE",
+            "safe": False,
+            "reason": "ordem enviada ao broker/exchange",
+        }
+
+    if status == "AUTO_BROKER_PREVIEW_BLOCKED" or event == "AUTO_BROKER_PREVIEW_BLOCKED":
+        return {
+            "class_code": "AUTO_PREVIEW_BLOCKED",
+            "label": "🛡️ AUTO_PREVIEW_BLOCKED",
+            "bot": bot,
+            "mode": "BLOCKED",
+            "safe": True,
+            "reason": "firewall bloqueou preview automático antes do broker",
+        }
+
+    if bot == "FALCON" and (mode == "VERIFY" or "FALCON-VERIFY" in tag):
+        return {
+            "class_code": "FALCON_VERIFY_AUTHORIZED",
+            "label": "🧪 FALCON_VERIFY_AUTORIZADO",
+            "bot": "FALCON",
+            "mode": "VERIFY",
+            "safe": True,
+            "reason": "Falcon em VERIFY: valida payload/ready e não envia ordem",
+        }
+
+    if status in {"DRY_RUN", "VERIFY"}:
+        return {
+            "class_code": "SAFE_DRY_RUN",
+            "label": "🧪 SAFE_DRY_RUN",
+            "bot": bot,
+            "mode": mode,
+            "safe": True,
+            "reason": "preview/dry-run sem envio real",
+        }
+
+    if status in {"EXECUTION_AUTH_DENIED", "REJECTED", "DENY", "BLOCKED"}:
+        return {
+            "class_code": "BLOCKED_OR_DENIED",
+            "label": "🚫 BLOCKED_OR_DENIED",
+            "bot": bot,
+            "mode": mode,
+            "safe": True,
+            "reason": "evento bloqueado/rejeitado sem envio",
+        }
+
+    return {
+        "class_code": "LEGACY_PREVIEW_OR_UNKNOWN",
+        "label": "⚪ LEGACY_PREVIEW_OR_UNKNOWN",
+        "bot": bot,
+        "mode": mode,
+        "safe": True,
+        "reason": "evento antigo ou sem metadados suficientes; sent=False",
+    }
+
+
+def _live_v11_summarize_classes(items):
+    summary = {}
+    for e in items or []:
+        c = _live_v11_classify_event(e)
+        code = c.get("class_code", "UNKNOWN")
+        summary[code] = int(summary.get(code, 0) or 0) + 1
+    return summary
+
+
+def _live_v11_format_event_line(e):
+    if not isinstance(e, dict):
+        return f"- {e}"
+    c = _live_v11_classify_event(e)
+    tag = _live_v11_event_tag(e)
+    tag_part = f" | tag={tag}" if tag else ""
+    status = e.get("status") or e.get("event") or "UNKNOWN"
+    order_id = e.get("order_id") or e.get("id") or "None"
+    return (
+        f"- {e.get('ts')} | {c.get('label')} | bot={c.get('bot')} | mode={c.get('mode')} | "
+        f"status={status} | sent={e.get('sent')} | {e.get('symbol')} {e.get('side')} | id={order_id}{tag_part}"
+    )
+
+
+def build_live_report():
+    """LIVE STATUS V1.1 — classifica DRY_RUN/VERIFY para evitar leitura errada de risco."""
+    ready = bingx_ready_payload() if BINGX_READY_CHECK_ENABLED else {"ok": None, "status": "READY_CHECK_DISABLED"}
+    balance = (ready.get("balance") or {}) if isinstance(ready, dict) else {}
+    broker_positions, pos_err = _broker_open_positions()
+    central_live = _central_live_positions_payload()
+    exec_items, exec_err = _execution_log_items(limit=20)
+    shown_items = (exec_items or [])[-8:]
+    class_summary = _live_v11_summarize_classes(exec_items or [])
+
+    lines = [
+        "🟢 LIVE STATUS — CENTRAL QUANT / BINGX V1.1",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Execution mode: {EXECUTION_MODE}",
+        f"ENABLE_REAL_TRADING: {ENABLE_REAL_TRADING}",
+        f"BROKER_DRY_RUN: {os.environ.get('BROKER_DRY_RUN', 'N/A')}",
+        f"Broker READY: {ready.get('ok')} | {ready.get('status')}",
+    ]
+    if ready.get("error"):
+        lines.append(f"Erro READY: {ready.get('error')}")
+    if balance:
+        lines.append(f"Saldo USDT total/free/used: {balance.get('total_usdt')} / {balance.get('free_usdt')} / {balance.get('used_usdt')}")
+
+    lines += ["", "POSIÇÕES BINGX"]
+    if pos_err:
+        lines.append(f"Erro ao ler posições: {pos_err}")
+    elif not broker_positions:
+        lines.append("Nenhuma posição aberta na BingX.")
+    else:
+        for p in broker_positions[:30]:
+            lines.append(
+                f"- {p.get('symbol')} {p.get('side')} | contracts={p.get('contracts')} | "
+                f"notional={p.get('notional')} | entry={p.get('entry_price')} | uPnL={p.get('unrealized_pnl')} | lev={p.get('leverage')}"
+            )
+
+    lines += ["", "POSIÇÕES LIVE REGISTRADAS NA CENTRAL"]
+    if not central_live:
+        lines.append("Nenhuma posição LIVE registrada na Central.")
+    else:
+        for p in central_live[:30]:
+            lines.append(f"- {p.get('bot')} {p.get('symbol')} {p.get('side')} {p.get('setup')} | order={p.get('order_id')}")
+
+    lines += ["", "CLASSIFICAÇÃO DAS ÚLTIMAS EXECUÇÕES"]
+    if not exec_err and exec_items:
+        safe_count = 0
+        risky_count = 0
+        for e in exec_items or []:
+            c = _live_v11_classify_event(e)
+            if c.get("safe"):
+                safe_count += 1
+            else:
+                risky_count += 1
+        lines.append(f"Eventos lidos: {len(exec_items)} | seguros/sem envio: {safe_count} | enviados/reais: {risky_count}")
+        if class_summary:
+            compact = ", ".join([f"{k}={v}" for k, v in sorted(class_summary.items())])
+            lines.append(f"Resumo: {compact}")
+    elif exec_err:
+        lines.append(f"Erro ao classificar log: {exec_err}")
+    else:
+        lines.append("Nenhum evento de execução para classificar.")
+
+    lines += ["", "ÚLTIMAS EXECUÇÕES"]
+    if exec_err:
+        lines.append(f"Erro ao ler log: {exec_err}")
+    elif not shown_items:
+        lines.append("Nenhum evento registrado ainda.")
+    else:
+        for e in shown_items:
+            lines.append(_live_v11_format_event_line(e))
+
+    lines += [
+        "",
+        "LEITURA EXECUTIVA",
+    ]
+    if not broker_positions and not central_live and not ENABLE_REAL_TRADING:
+        lines.append("✅ Sem posição real na BingX, sem LIVE registrada e execução real desarmada.")
+    if class_summary.get("FALCON_VERIFY_AUTHORIZED"):
+        lines.append("🧪 Eventos Falcon em VERIFY são validações autorizadas de payload/ready, sem envio real.")
+    if class_summary.get("AUTO_PREVIEW_BLOCKED"):
+        lines.append("🛡️ Há previews automáticos bloqueados pelo firewall antes do broker.")
+    if any(not _live_v11_classify_event(e).get("safe") for e in exec_items or []):
+        lines.append("🔴 Há evento com sent=True no log; auditar imediatamente.")
+
+    return "\n".join(lines)
+
+
+@app.route("/liveclassified")
+@app.route("/live/classified")
+def live_classified_route_v11():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    limit = max(1, min(limit, 100))
+    exec_items, exec_err = _execution_log_items(limit=limit)
+    classified = []
+    for e in exec_items or []:
+        c = _live_v11_classify_event(e)
+        item = dict(e) if isinstance(e, dict) else {"raw": e}
+        item["classification"] = c
+        classified.append(item)
+    return {
+        "ok": exec_err is None,
+        "module": "live_execution_classifier_v1_1",
+        "version": LIVE_EXECUTION_CLASSIFIER_V1_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "error": exec_err,
+        "count": len(classified),
+        "summary": _live_v11_summarize_classes(exec_items or []),
+        "items": classified,
+        "notes": [
+            "Classifica DRY_RUN/VERIFY/BLOCKED/LIVE_SENT sem alterar execução.",
+            "FALCON-VERIFY é exibido como validação autorizada e segura quando sent=False.",
+        ],
+    }, 200
+
 start_central_runtime_once()
 
 if __name__ == "__main__":

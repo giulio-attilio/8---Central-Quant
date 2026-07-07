@@ -1101,11 +1101,52 @@ def _bot_key_for_firewall(bot):
     return aliases.get(value, value)
 
 
+def _infer_bot_for_audit(bot=None, client_tag=None):
+    """Infere bot para auditoria sem alterar a lógica de execução."""
+    explicit = _bot_key_for_firewall(bot)
+    if explicit and explicit != "UNKNOWN":
+        return explicit
+    tag = str(client_tag or "").upper().strip()
+    if tag.startswith("FALCON") or "FALCON-" in tag:
+        return "FALCON"
+    if tag.startswith("PREDATOR") or "SMART_PREDATOR" in tag or "SMARTPREDATOR" in tag:
+        return "PREDATOR"
+    if tag.startswith("DONKEY"):
+        return "DONKEY"
+    if tag.startswith("COBRA"):
+        return "COBRA"
+    if tag.startswith("TURTLE"):
+        return "TURTLE"
+    if tag.startswith("TRENDPRO") or tag.startswith("TREND_PRO"):
+        return "TRENDPRO"
+    if tag.startswith("MEME"):
+        return "MEME"
+    return "UNKNOWN"
+
+
+def _classify_preview_audit(bot=None, client_tag=None, status=None, sent=False, live_send_enabled=False):
+    """Classificação humana para /live e auditorias."""
+    bot_key = _infer_bot_for_audit(bot=bot, client_tag=client_tag)
+    tag = str(client_tag or "").upper().strip()
+    status_norm = str(status or "").upper().strip()
+    if bool(sent):
+        return "LIVE_SENT"
+    if status_norm == BROKER_AUTO_PREVIEW_FIREWALL_STATUS:
+        return "AUTO_PREVIEW_BLOCKED"
+    if bot_key == "FALCON" and ("VERIFY" in tag or status_norm in {"VERIFY", "DRY_RUN"}):
+        return "FALCON_VERIFY_AUTHORIZED"
+    if status_norm in {"VERIFY", "DRY_RUN"}:
+        return "SAFE_DRY_RUN"
+    if not live_send_enabled:
+        return "PREVIEW_ISOLATED_NO_SEND"
+    return "UNKNOWN_NO_SEND"
+
+
 def broker_preview_firewall_health(limit: int = 20):
     """Status leve do Automatic Broker Preview Firewall."""
     blocked_recent = []
     try:
-        rows = read_execution_audit_log(limit=max(1, min(int(limit), 100))).get("items") or []
+        rows = get_execution_audit_log(limit=max(1, min(int(limit), 100))).get("items") or []
         for item in rows:
             if isinstance(item, dict) and str(item.get("event") or "").upper() == BROKER_AUTO_PREVIEW_FIREWALL_STATUS:
                 blocked_recent.append(item)
@@ -1201,11 +1242,12 @@ def place_market_order(
         return result
 
     live_send_enabled = is_real_live_send_enabled()
+    audit_bot = _infer_bot_for_audit(bot=bot, client_tag=client_tag)
 
     preview_firewall = _automatic_broker_preview_firewall(
         sym=sym,
         side=order_side,
-        bot=bot,
+        bot=audit_bot,
         client_tag=client_tag,
         live_send_enabled=live_send_enabled,
     )
@@ -1216,7 +1258,8 @@ def place_market_order(
             "sent": False,
             "symbol": sym,
             "side": order_side,
-            "bot": _bot_key_for_firewall(bot),
+            "bot": audit_bot,
+            "execution_classification": _classify_preview_audit(bot=audit_bot, client_tag=client_tag, status=BROKER_AUTO_PREVIEW_FIREWALL_STATUS, sent=False, live_send_enabled=live_send_enabled),
             "margin_usdt": margin,
             "leverage": lev,
             "notional_usdt": planned_exposure,
@@ -1235,6 +1278,7 @@ def place_market_order(
             "symbol": result.get("symbol"),
             "side": result.get("side"),
             "bot": result.get("bot"),
+            "execution_classification": result.get("execution_classification"),
             "client_order_id": result.get("client_order_id"),
             "reason": result.get("reason"),
             "preview_firewall": preview_firewall,
@@ -1328,6 +1372,14 @@ def place_market_order(
             "ok": bool(preview.get("ok")),
             "status": "VERIFY" if EXECUTION_MODE == "VERIFY" else "DRY_RUN",
             "sent": False,
+            "bot": audit_bot,
+            "execution_classification": _classify_preview_audit(
+                bot=audit_bot,
+                client_tag=client_tag,
+                status=("VERIFY" if EXECUTION_MODE == "VERIFY" else "DRY_RUN"),
+                sent=False,
+                live_send_enabled=live_send_enabled,
+            ),
             "reason": "PREVIEW_ISOLATION: EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
             "preview_isolation": True,
             "live_send_enabled": False,
@@ -1339,6 +1391,8 @@ def place_market_order(
             "sent": False,
             "symbol": result.get("symbol"),
             "side": result.get("side"),
+            "bot": result.get("bot"),
+            "execution_classification": result.get("execution_classification"),
             "position_side": result.get("position_side"),
             "margin_usdt": result.get("margin_usdt"),
             "leverage": result.get("leverage"),
@@ -1365,6 +1419,8 @@ def place_market_order(
             "sent": False,
             "symbol": result.get("symbol"),
             "side": result.get("side"),
+            "bot": result.get("bot"),
+            "execution_classification": result.get("execution_classification"),
             "position_side": result.get("position_side"),
             "margin_usdt": result.get("margin_usdt"),
             "leverage": result.get("leverage"),
