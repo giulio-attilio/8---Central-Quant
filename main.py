@@ -32365,6 +32365,944 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
     return result
 
 
+# ============================================================================
+# AUTO REAL EXECUTION BRIDGE V1
+# ----------------------------------------------------------------------------
+# Liga o ALLOW do FALCON ao Execution Engine real, mantendo todas as travas:
+# - somente FALCON
+# - somente BTCUSDT/ETHUSDT pelo Real Pilot Guard
+# - limite de margem/notional/alavancagem do piloto
+# - máximo 1 posição REAL aberta
+# - Final Gate antes de chamar dry_run=False
+# - deduplicação por signal_id
+# - Telegram Notifier V1.x no resultado real
+# ============================================================================
+AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION = "2026-07-06-AUTO-REAL-EXECUTION-BRIDGE-V1"
+
+try:
+    _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1 = can_open_trade_decision
+except Exception:
+    _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1 = None
+
+try:
+    AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "auto_real_execution_bridge_v1_events.jsonl"
+    AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE = CENTRAL_DATA_DIR / "auto_real_execution_bridge_v1_latest.json"
+    AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE = CENTRAL_DATA_DIR / "auto_real_execution_bridge_v1_state.json"
+except Exception:
+    AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE = None
+    AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE = None
+    AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE = None
+
+try:
+    _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT = threading.local()
+except Exception:
+    _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT = None
+
+
+def _arb_v1_now():
+    try:
+        return agora_sp_str()
+    except Exception:
+        try:
+            return data_hora_sp_str()
+        except Exception:
+            return None
+
+
+def _arb_v1_bool(value, default=False):
+    try:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "y"}
+    except Exception:
+        return bool(default)
+
+
+def _arb_v1_env_bool(names, default=False):
+    for name in names:
+        try:
+            if os.environ.get(name) is not None:
+                return _arb_v1_bool(os.environ.get(name), default=default), name
+        except Exception:
+            pass
+    return bool(default), None
+
+
+def _arb_v1_env_list(names, default=""):
+    for name in names:
+        try:
+            raw = os.environ.get(name)
+            if raw is not None:
+                values = [str(x).upper().strip() for x in str(raw).replace(";", ",").split(",") if str(x).strip()]
+                return values, name
+        except Exception:
+            pass
+    values = [str(x).upper().strip() for x in str(default).replace(";", ",").split(",") if str(x).strip()]
+    return values, None
+
+
+def _arb_v1_config():
+    enabled, enabled_source = _arb_v1_env_bool([
+        "AUTO_REAL_EXECUTION_BRIDGE_ENABLED",
+        "CENTRAL_AUTO_REAL_EXECUTION_BRIDGE_ENABLED",
+        "AUTO_REAL_BRIDGE_ENABLED",
+        "CENTRAL_AUTO_REAL_BRIDGE_ENABLED",
+    ], default=True)
+    execute_can_open, execute_can_open_source = _arb_v1_env_bool([
+        "AUTO_REAL_BRIDGE_EXECUTE_ON_CAN_OPEN_TRADE",
+        "CENTRAL_AUTO_REAL_BRIDGE_EXECUTE_ON_CAN_OPEN_TRADE",
+        "AUTO_REAL_EXECUTION_ON_CAN_OPEN_TRADE",
+    ], default=True)
+    require_signal_id, require_signal_id_source = _arb_v1_env_bool([
+        "AUTO_REAL_BRIDGE_REQUIRE_SIGNAL_ID",
+        "CENTRAL_AUTO_REAL_BRIDGE_REQUIRE_SIGNAL_ID",
+    ], default=True)
+    treat_verify_as_live, treat_verify_as_live_source = _arb_v1_env_bool([
+        "AUTO_REAL_BRIDGE_TREAT_VERIFY_AS_LIVE",
+        "CENTRAL_AUTO_REAL_BRIDGE_TREAT_VERIFY_AS_LIVE",
+    ], default=True)
+    notify_blocked, notify_blocked_source = _arb_v1_env_bool([
+        "AUTO_REAL_BRIDGE_NOTIFY_BLOCKED",
+        "CENTRAL_AUTO_REAL_BRIDGE_NOTIFY_BLOCKED",
+    ], default=True)
+    allowed_bots, allowed_bots_source = _arb_v1_env_list([
+        "AUTO_REAL_BRIDGE_ALLOWED_BOTS",
+        "CENTRAL_AUTO_REAL_BRIDGE_ALLOWED_BOTS",
+        "REAL_PILOT_ALLOWED_BOTS",
+        "CENTRAL_REAL_PILOT_ALLOWED_BOTS",
+    ], default="FALCON")
+    allowed_symbols, allowed_symbols_source = _arb_v1_env_list([
+        "AUTO_REAL_BRIDGE_ALLOWED_SYMBOLS",
+        "CENTRAL_AUTO_REAL_BRIDGE_ALLOWED_SYMBOLS",
+        "REAL_PILOT_ALLOWED_SYMBOLS",
+        "CENTRAL_REAL_PILOT_ALLOWED_SYMBOLS",
+    ], default="BTCUSDT,ETHUSDT")
+    try:
+        max_state_signals = int(os.environ.get("AUTO_REAL_BRIDGE_MAX_STATE_SIGNALS", "500"))
+    except Exception:
+        max_state_signals = 500
+    return {
+        "enabled": enabled,
+        "enabled_source": enabled_source,
+        "execute_on_can_open_trade": execute_can_open,
+        "execute_on_can_open_trade_source": execute_can_open_source,
+        "require_signal_id": require_signal_id,
+        "require_signal_id_source": require_signal_id_source,
+        "treat_verify_as_live": treat_verify_as_live,
+        "treat_verify_as_live_source": treat_verify_as_live_source,
+        "notify_blocked": notify_blocked,
+        "notify_blocked_source": notify_blocked_source,
+        "allowed_bots": allowed_bots,
+        "allowed_bots_source": allowed_bots_source,
+        "allowed_symbols": allowed_symbols,
+        "allowed_symbols_source": allowed_symbols_source,
+        "max_state_signals": max(50, max_state_signals),
+        "token_value_exposed": False,
+    }
+
+
+def _arb_v1_is_sensitive_key(key):
+    k = str(key or "").lower()
+    return (
+        "token" in k
+        or "secret" in k
+        or "apikey" in k
+        or "api_key" in k
+        or "authorization" in k
+        or "signature" in k
+        or "x-bx" in k
+    )
+
+
+def _arb_v1_sanitize_public(obj):
+    try:
+        if isinstance(obj, dict):
+            clean = {}
+            for key, value in obj.items():
+                clean[key] = "***MASKED***" if _arb_v1_is_sensitive_key(key) and value not in (None, "", False) else _arb_v1_sanitize_public(value)
+            return clean
+        if isinstance(obj, list):
+            return [_arb_v1_sanitize_public(x) for x in obj]
+    except Exception:
+        pass
+    return obj
+
+
+def _arb_v1_norm_symbol(value):
+    try:
+        if callable(globals().get("normalize_registry_symbol")):
+            return normalize_registry_symbol(value)
+    except Exception:
+        pass
+    try:
+        value = str(value or "").upper().strip().replace("/", "").replace("-", "").replace(":USDT", "")
+        if value and not value.endswith("USDT"):
+            value += "USDT"
+        return value
+    except Exception:
+        return ""
+
+
+def _arb_v1_norm_bot(value):
+    try:
+        if callable(globals().get("normalize_registry_bot")):
+            return normalize_registry_bot(value)
+    except Exception:
+        pass
+    return str(value or "").upper().strip()
+
+
+def _arb_v1_norm_side(value):
+    side = str(value or "").upper().strip()
+    if side in {"BUY", "LONG"}:
+        return "LONG"
+    if side in {"SELL", "SHORT"}:
+        return "SHORT"
+    return side
+
+
+def _arb_v1_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return default
+
+
+def _arb_v1_load_state():
+    try:
+        if AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE is not None and AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE.exists():
+            with open(AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("signals", {})
+                return data
+    except Exception:
+        pass
+    return {"signals": {}, "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION}
+
+
+def _arb_v1_save_state(state):
+    try:
+        if AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE is None:
+            return False
+        state = state if isinstance(state, dict) else {"signals": {}}
+        state.setdefault("signals", {})
+        # Evita crescimento infinito do arquivo de estado.
+        config = _arb_v1_config()
+        max_items = int(config.get("max_state_signals") or 500)
+        signals = state.get("signals") if isinstance(state.get("signals"), dict) else {}
+        if len(signals) > max_items:
+            ordered = sorted(signals.items(), key=lambda kv: str((kv[1] or {}).get("ts") or ""), reverse=True)
+            state["signals"] = dict(ordered[:max_items])
+        state["version"] = AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION
+        state["updated_at"] = _arb_v1_now()
+        AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def _arb_v1_append_event(event):
+    try:
+        event = event if isinstance(event, dict) else {"raw": str(event)}
+        event.setdefault("module", "auto_real_execution_bridge_v1")
+        event.setdefault("version", AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION)
+        event.setdefault("generated_at", _arb_v1_now())
+        event.setdefault("token_value_exposed", False)
+        event = _arb_v1_sanitize_public(event)
+        if AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE is not None:
+            AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        if AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE is not None:
+            with open(AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE, "w", encoding="utf-8") as f:
+                json.dump(event, f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def _arb_v1_read_events(limit=20):
+    rows = []
+    try:
+        path = AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE
+        if path is not None and path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        rows.append({"raw": line})
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "rows": []}
+    return {"ok": True, "count": len(rows), "rows": rows[-int(limit or 20):]}
+
+
+def _arb_v1_signal_id(payload, result=None):
+    payload = payload if isinstance(payload, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    for key in ["signal_id", "id", "trade_id", "client_order_id", "clientOrderId", "clientOrderID", "broker_client_order_id"]:
+        value = payload.get(key) or result.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _arb_v1_signal_key(payload, result=None, require_signal_id=True):
+    payload = payload if isinstance(payload, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    sig = _arb_v1_signal_id(payload, result)
+    if sig:
+        cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "-", sig.strip())[:160]
+        return "signal:" + cleaned
+    if require_signal_id:
+        return ""
+    parts = [
+        _arb_v1_norm_bot(payload.get("bot") or result.get("bot")),
+        _arb_v1_norm_symbol(payload.get("symbol") or result.get("symbol")),
+        _arb_v1_norm_side(payload.get("side") or result.get("side")),
+        str(payload.get("entry") or result.get("entry") or ""),
+        str(payload.get("sl") or payload.get("stop") or result.get("sl") or ""),
+        str(payload.get("tp50") or result.get("tp50") or ""),
+    ]
+    raw = ":".join(parts)
+    return "synthetic:" + re.sub(r"[^A-Z0-9_.:-]+", "-", raw.upper())[:180]
+
+
+def _arb_v1_make_client_order_id(payload, signal_key):
+    payload = payload if isinstance(payload, dict) else {}
+    bot = _arb_v1_norm_bot(payload.get("bot") or "FALCON")[:5]
+    symbol = _arb_v1_norm_symbol(payload.get("symbol") or "BTCUSDT")[:12]
+    side = _arb_v1_norm_side(payload.get("side") or "SHORT")[:1]
+    raw = re.sub(r"[^A-Za-z0-9]", "", str(signal_key or uuid.uuid4().hex).upper())
+    suffix = raw[-16:] if raw else uuid.uuid4().hex[:16].upper()
+    return f"ARB1-{bot}-{symbol}-{side}-{suffix}"[:44]
+
+
+def _arb_v1_normalize_payload(payload=None, risk_result=None, manual_defaults=False):
+    payload = dict(payload or {}) if isinstance(payload, dict) else {}
+    risk_result = risk_result if isinstance(risk_result, dict) else {}
+    if manual_defaults and not payload:
+        payload = {
+            "decision": "ALLOW",
+            "bot": "FALCON",
+            "setup": "FALCON",
+            "symbol": "BTCUSDT",
+            "side": "SHORT",
+            "entry": "108000",
+            "sl": "109000",
+            "tp50": "107000",
+            "risk_pct": 2.0,
+            "signal_id": f"AUTO-REAL-BRIDGE-TEST-{int(time.time())}",
+        }
+    bot = _arb_v1_norm_bot(payload.get("bot") or payload.get("robot") or payload.get("strategy") or risk_result.get("bot") or "")
+    setup = str(payload.get("setup") or payload.get("signal_type") or payload.get("setup_label") or risk_result.get("setup") or bot or "").upper().strip()
+    symbol = _arb_v1_norm_symbol(payload.get("symbol") or payload.get("symbol_clean") or payload.get("pair") or payload.get("ativo") or risk_result.get("symbol") or "")
+    side = _arb_v1_norm_side(payload.get("side") or payload.get("direction") or payload.get("signal") or risk_result.get("side") or "")
+    decision = str(payload.get("decision") or risk_result.get("decision") or "ALLOW").upper().strip()
+    payload.update({
+        "decision": decision,
+        "bot": bot,
+        "setup": setup or bot,
+        "symbol": symbol,
+        "side": side,
+        "mode": "LIVE",
+        "intended_live": True,
+        "auto_real_bridge_v1": True,
+        "auto_real_bridge_version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+    })
+    # Normaliza nomes críticos sem apagar campos originais úteis.
+    if payload.get("sl") is None:
+        payload["sl"] = payload.get("stop") or payload.get("stop_loss") or risk_result.get("sl")
+    if payload.get("tp50") is None:
+        payload["tp50"] = payload.get("tp") or payload.get("take_profit") or risk_result.get("tp50")
+    if payload.get("entry") is None:
+        payload["entry"] = payload.get("price") or risk_result.get("entry")
+    if payload.get("risk_pct") is None and risk_result.get("risk_pct") is not None:
+        payload["risk_pct"] = risk_result.get("risk_pct")
+    return payload
+
+
+def _arb_v1_payload_summary(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    return {
+        "bot": payload.get("bot"),
+        "setup": payload.get("setup"),
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl"),
+        "tp50": payload.get("tp50"),
+        "risk_pct": payload.get("risk_pct"),
+        "signal_id": payload.get("signal_id"),
+        "client_order_id": payload.get("client_order_id") or payload.get("clientOrderId") or payload.get("broker_client_order_id"),
+        "margin_usdt": payload.get("margin_usdt"),
+        "leverage": payload.get("leverage"),
+        "notional_usdt": payload.get("notional_usdt"),
+    }
+
+
+def _arb_v1_decision_allowed(risk_result=None, payload=None):
+    risk_result = risk_result if isinstance(risk_result, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    decision = str(risk_result.get("decision") or payload.get("decision") or "").upper().strip()
+    if risk_result.get("allowed") is True:
+        return True
+    if decision == "ALLOW":
+        return True
+    return False
+
+
+def _arb_v1_mode_allows_auto(payload=None, risk_result=None, config=None):
+    payload = payload if isinstance(payload, dict) else {}
+    risk_result = risk_result if isinstance(risk_result, dict) else {}
+    config = config or _arb_v1_config()
+    mode = str(payload.get("mode") or payload.get("execution_mode") or risk_result.get("mode") or "").upper().strip()
+    if mode == "LIVE":
+        return True
+    if mode == "VERIFY" and config.get("treat_verify_as_live"):
+        return True
+    # Alguns bots enviam intended_live sem preencher mode.
+    if _arb_v1_bool(payload.get("intended_live"), default=False):
+        return True
+    return False
+
+
+def _arb_v1_basic_eligibility(payload=None, risk_result=None, source="manual"):
+    config = _arb_v1_config()
+    payload = _arb_v1_normalize_payload(payload, risk_result)
+    reasons = []
+    warnings = []
+    bot = _arb_v1_norm_bot(payload.get("bot"))
+    symbol = _arb_v1_norm_symbol(payload.get("symbol"))
+    side = _arb_v1_norm_side(payload.get("side"))
+    signal_id = _arb_v1_signal_id(payload, risk_result)
+    if not config.get("enabled"):
+        reasons.append("AUTO_REAL_EXECUTION_BRIDGE_DISABLED")
+    if source == "can_open_trade" and not config.get("execute_on_can_open_trade"):
+        reasons.append("EXECUTE_ON_CAN_OPEN_TRADE_DISABLED")
+    if not _arb_v1_decision_allowed(risk_result, payload):
+        reasons.append("DECISION_NOT_ALLOW")
+    if bot not in set(config.get("allowed_bots") or []):
+        reasons.append(f"BOT_NOT_ALLOWED:{bot}")
+    if symbol not in set(config.get("allowed_symbols") or []):
+        reasons.append(f"SYMBOL_NOT_ALLOWED:{symbol}")
+    if side not in {"LONG", "SHORT"}:
+        reasons.append(f"SIDE_INVALID:{side}")
+    if config.get("require_signal_id") and not signal_id:
+        reasons.append("MISSING_SIGNAL_ID")
+    if not _arb_v1_mode_allows_auto(payload, risk_result, config):
+        reasons.append("MODE_NOT_LIVE_OR_VERIFY")
+    entry = _arb_v1_float(payload.get("entry"), None)
+    sl = _arb_v1_float(payload.get("sl"), None)
+    if entry is None or sl is None:
+        reasons.append("MISSING_ENTRY_OR_SL")
+    elif side == "SHORT" and not (sl > entry):
+        reasons.append("INVALID_SHORT_SL_DIRECTION")
+    elif side == "LONG" and not (sl < entry):
+        reasons.append("INVALID_LONG_SL_DIRECTION")
+    return {
+        "ok": len(reasons) == 0,
+        "eligible": len(reasons) == 0,
+        "reasons": reasons,
+        "warnings": warnings,
+        "config": config,
+        "payload": payload,
+        "signal_id": signal_id,
+        "token_value_exposed": False,
+    }
+
+
+def _arb_v1_call_final_gate_for_payload(payload=None, preflight=False):
+    payload = payload if isinstance(payload, dict) else {}
+    query = {}
+    for key in ["symbol", "side", "bot", "setup", "entry", "sl", "tp50", "risk_pct", "signal_id"]:
+        value = payload.get(key)
+        if value is not None:
+            query[key] = str(value)
+    query["preflight"] = "true" if preflight else "false"
+    try:
+        if callable(globals().get("build_execution_final_gate_route_v1")):
+            if "app" in globals() and hasattr(app, "test_request_context"):
+                with app.test_request_context("/autorealbridge/_final_gate", method="GET", query_string=query):
+                    return build_execution_final_gate_route_v1(preflight=preflight)
+            return build_execution_final_gate_route_v1(preflight=preflight)
+    except Exception as exc:
+        return {"ok": False, "status": "FINAL_GATE_ERROR", "error": str(exc), "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION}
+    return {"ok": False, "status": "FINAL_GATE_FUNCTION_MISSING", "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION}
+
+
+def _arb_v1_payload_with_auth(payload=None):
+    payload = dict(payload or {}) if isinstance(payload, dict) else {}
+    try:
+        if callable(globals().get("_efg_v1_payload_with_auth_token")):
+            return _efg_v1_payload_with_auth_token(payload)
+    except Exception:
+        pass
+    try:
+        token_value, token_source = _ee_auth_resolver_v1_configured_token() if callable(globals().get("_ee_auth_resolver_v1_configured_token")) else ("", None)
+        if token_value:
+            for key in [
+                "execution_auth_token", "auth_token", "EXECUTION_AUTH_TOKEN",
+                "central_execution_auth_token", "CENTRAL_EXECUTION_AUTH_TOKEN",
+                "real_execution_auth_token", "REAL_EXECUTION_AUTH_TOKEN",
+                "live_execution_auth_token", "EXECUTION_LIVE_AUTH_TOKEN",
+                "broker_execution_auth_token", "BINGX_EXECUTION_AUTH_TOKEN",
+                "token", "authorization_token", "x_execution_auth_token",
+            ]:
+                payload[key] = token_value
+            payload.setdefault("auth", {})["execution_auth_token"] = token_value
+            payload.setdefault("execution_auth", {})["execution_auth_token"] = token_value
+            payload["_auth_token_source"] = token_source
+            payload["_auth_token_passed_to_engine"] = True
+    except Exception:
+        payload["_auth_token_passed_to_engine"] = False
+    return payload
+
+
+def _arb_v1_notify_blocked(payload, result):
+    try:
+        if not _arb_v1_config().get("notify_blocked"):
+            return None
+        if callable(globals().get("real_execution_telegram_notifier_v1_notify")):
+            fake_result = {
+                "ok": False,
+                "status": result.get("status") or "AUTO_REAL_BRIDGE_BLOCKED",
+                "failed_blocking_codes": result.get("failed_blocking_codes") or result.get("reasons") or [],
+                "real_pilot_guard_v1": result.get("real_pilot_guard_v1") or result.get("guard"),
+                "payload": {
+                    "live_result": {
+                        "ok": False,
+                        "sent": False,
+                        "status": result.get("status") or "AUTO_REAL_BRIDGE_BLOCKED",
+                        "requires_manual_attention": False,
+                        "real_guard": result.get("real_pilot_guard_v1") or result.get("guard") or {},
+                    }
+                },
+            }
+            return real_execution_telegram_notifier_v1_notify(
+                event_type="REAL_EXECUTION_BLOCKED",
+                payload=payload,
+                result=fake_result,
+                mode="LIVE",
+                dry_run=False,
+                force=False,
+            )
+    except Exception as exc:
+        return {"ok": False, "status": "BLOCKED_NOTIFICATION_ERROR", "error": str(exc)}
+    return None
+
+
+def auto_real_execution_bridge_v1_process(payload=None, risk_result=None, source="manual", execute=False, dry_run=True, force_notify=False):
+    """
+    Processa um sinal candidato.
+
+    - execute=False/dry_run=True: somente diagnóstico/preview.
+    - execute=True/dry_run=False: chama run_execution_engine(... dry_run=False)
+      se todos os gates estiverem verdes.
+    """
+    ctx_active = False
+    try:
+        ctx_active = bool(getattr(_AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT, "active", False)) if _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT is not None else False
+    except Exception:
+        ctx_active = False
+    if ctx_active:
+        return {
+            "ok": True,
+            "status": "AUTO_REAL_BRIDGE_REENTRANT_SKIP",
+            "executed": False,
+            "source": source,
+            "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+            "token_value_exposed": False,
+        }
+
+    if _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT is not None:
+        _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT.active = True
+    try:
+        eligibility = _arb_v1_basic_eligibility(payload, risk_result, source=source)
+        payload_norm = eligibility.get("payload") or {}
+        config = eligibility.get("config") or _arb_v1_config()
+        signal_key = _arb_v1_signal_key(payload_norm, risk_result, require_signal_id=bool(config.get("require_signal_id")))
+        if signal_key:
+            client_order_id = _arb_v1_make_client_order_id(payload_norm, signal_key)
+            for key in ["client_order_id", "clientOrderId", "clientOrderID", "broker_client_order_id", "client_tag"]:
+                payload_norm.setdefault(key, client_order_id)
+        else:
+            client_order_id = None
+
+        base = {
+            "ok": bool(eligibility.get("eligible")),
+            "module": "auto_real_execution_bridge_v1",
+            "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+            "generated_at": _arb_v1_now(),
+            "source": source,
+            "execute_requested": bool(execute),
+            "dry_run": bool(dry_run),
+            "eligible": bool(eligibility.get("eligible")),
+            "reasons": eligibility.get("reasons") or [],
+            "warnings": eligibility.get("warnings") or [],
+            "signal_id": eligibility.get("signal_id"),
+            "signal_key": signal_key,
+            "client_order_id": client_order_id,
+            "payload": _arb_v1_payload_summary(payload_norm),
+            "config": config,
+            "executed": False,
+            "sent": False,
+            "token_value_exposed": False,
+        }
+
+        if not eligibility.get("eligible"):
+            base["status"] = "NOT_ELIGIBLE_FOR_AUTO_REAL_EXECUTION"
+            # Não envia Telegram para ruído normal de outros bots/símbolos; apenas audita.
+            _arb_v1_append_event(base)
+            return base
+
+        # Dedup antes de qualquer chamada real.
+        state = _arb_v1_load_state()
+        known = (state.get("signals") or {}).get(signal_key) if signal_key else None
+        if known:
+            base.update({
+                "ok": True,
+                "eligible": True,
+                "status": "DUPLICATE_SIGNAL_BLOCKED",
+                "duplicate": True,
+                "previous": known,
+                "executed": False,
+                "sent": False,
+            })
+            _arb_v1_append_event(base)
+            return base
+
+        final_gate = _arb_v1_call_final_gate_for_payload(payload_norm, preflight=bool(dry_run))
+        base["final_gate"] = _arb_v1_sanitize_public(final_gate)
+        final_gate_ok = bool(isinstance(final_gate, dict) and final_gate.get("ok") and not final_gate.get("failed_blocking_codes"))
+        if not final_gate_ok:
+            base.update({
+                "ok": False,
+                "status": "BLOCKED_BY_EXECUTION_FINAL_GATE",
+                "failed_blocking_codes": (final_gate or {}).get("failed_blocking_codes") if isinstance(final_gate, dict) else [],
+                "executed": False,
+                "sent": False,
+            })
+            base["telegram_notification"] = _arb_v1_notify_blocked(payload_norm, base) if (execute and not dry_run) or force_notify else None
+            _arb_v1_append_event(base)
+            return base
+
+        if dry_run or not execute:
+            base.update({
+                "ok": True,
+                "status": "AUTO_REAL_BRIDGE_PREVIEW_ONLY",
+                "executed": False,
+                "sent": False,
+                "notes": [
+                    "Preview seguro: nenhum envio real foi feito.",
+                    "Para executar pela rota manual, use execute=true&commit=true&ack=AUTO_REAL_EXECUTE.",
+                    "No caminho automático, a execução só acontece quando /can_open_trade retornar ALLOW para sinal elegível e deduplicado.",
+                ],
+            })
+            _arb_v1_append_event(base)
+            return base
+
+        if not callable(globals().get("run_execution_engine")):
+            base.update({
+                "ok": False,
+                "status": "RUN_EXECUTION_ENGINE_MISSING",
+                "executed": False,
+                "sent": False,
+            })
+            base["telegram_notification"] = _arb_v1_notify_blocked(payload_norm, base) if force_notify else None
+            _arb_v1_append_event(base)
+            return base
+
+        # Marca como reservado antes da chamada live para bloquear F5/retry do mesmo sinal.
+        state.setdefault("signals", {})[signal_key] = {
+            "ts": time.time(),
+            "generated_at": _arb_v1_now(),
+            "status": "EXECUTION_STARTED",
+            "source": source,
+            "payload": _arb_v1_payload_summary(payload_norm),
+            "client_order_id": client_order_id,
+        }
+        _arb_v1_save_state(state)
+
+        engine_payload = _arb_v1_payload_with_auth(payload_norm)
+        engine_payload["auto_real_bridge_v1_live"] = True
+        engine_payload["auto_real_bridge_signal_key"] = signal_key
+        engine_payload["auto_real_bridge_version"] = AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION
+        live_result = run_execution_engine(payload=engine_payload, mode="LIVE", dry_run=False)
+        live_result_public = _arb_v1_sanitize_public(live_result)
+        result_sent = False
+        try:
+            result_sent = bool(
+                (live_result or {}).get("sent")
+                or (((live_result or {}).get("payload") or {}).get("live_result") or {}).get("sent")
+                or ((live_result or {}).get("live_result") or {}).get("sent")
+            )
+        except Exception:
+            result_sent = False
+        result_status = str((live_result or {}).get("status") or (((live_result or {}).get("payload") or {}).get("live_result") or {}).get("status") or "").strip()
+        base.update({
+            "ok": bool(isinstance(live_result, dict) and live_result.get("ok")),
+            "status": result_status or "AUTO_REAL_BRIDGE_LIVE_RESULT",
+            "executed": True,
+            "sent": result_sent,
+            "live_result": live_result_public,
+        })
+        state = _arb_v1_load_state()
+        state.setdefault("signals", {})[signal_key] = {
+            "ts": time.time(),
+            "generated_at": _arb_v1_now(),
+            "status": base.get("status"),
+            "ok": base.get("ok"),
+            "sent": result_sent,
+            "source": source,
+            "payload": _arb_v1_payload_summary(payload_norm),
+            "client_order_id": client_order_id,
+        }
+        _arb_v1_save_state(state)
+        _arb_v1_append_event(base)
+        return base
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "module": "auto_real_execution_bridge_v1",
+            "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+            "generated_at": _arb_v1_now(),
+            "source": source,
+            "status": "AUTO_REAL_BRIDGE_ERROR",
+            "error": str(exc),
+            "executed": False,
+            "sent": False,
+            "token_value_exposed": False,
+        }
+        _arb_v1_append_event(result)
+        return result
+    finally:
+        try:
+            if _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT is not None:
+                _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT.active = False
+        except Exception:
+            pass
+
+
+def auto_real_execution_bridge_v1_health_payload():
+    config = _arb_v1_config()
+    sample_payload = {
+        "decision": "ALLOW",
+        "bot": "FALCON",
+        "setup": "FALCON",
+        "symbol": "BTCUSDT",
+        "side": "SHORT",
+        "entry": "108000",
+        "sl": "109000",
+        "tp50": "107000",
+        "risk_pct": 2.0,
+        "signal_id": f"AUTO-REAL-BRIDGE-HEALTH-{int(time.time())}",
+        "mode": "VERIFY",
+    }
+    preview = auto_real_execution_bridge_v1_process(
+        payload=sample_payload,
+        risk_result={"allowed": True, "decision": "ALLOW", "mode": "VERIFY"},
+        source="health_preview",
+        execute=False,
+        dry_run=True,
+    )
+    state = _arb_v1_load_state()
+    ok = bool(
+        config.get("enabled")
+        and callable(globals().get("run_execution_engine"))
+        and callable(_ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1)
+        and isinstance(preview, dict)
+        and preview.get("ok")
+    )
+    return {
+        "ok": ok,
+        "module": "auto_real_execution_bridge_v1",
+        "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+        "generated_at": _arb_v1_now(),
+        "status": "AUTO_REAL_EXECUTION_BRIDGE_READY" if ok else "AUTO_REAL_EXECUTION_BRIDGE_NOT_READY",
+        "config": config,
+        "can_open_trade_wrapped": callable(_ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1),
+        "run_execution_engine_available": callable(globals().get("run_execution_engine")),
+        "final_gate_available": callable(globals().get("build_execution_final_gate_route_v1")),
+        "real_pilot_guard_available": callable(globals().get("real_pilot_guard_v1_validate")),
+        "telegram_notifier_available": callable(globals().get("real_execution_telegram_notifier_v1_notify")),
+        "state_file": str(AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE) if AUTO_REAL_EXECUTION_BRIDGE_V1_STATE_FILE is not None else None,
+        "events_file": str(AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE) if AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE is not None else None,
+        "latest_file": str(AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE) if AUTO_REAL_EXECUTION_BRIDGE_V1_LATEST_FILE is not None else None,
+        "state_signal_count": len((state.get("signals") or {}) if isinstance(state, dict) else {}),
+        "preview": _arb_v1_sanitize_public(preview),
+        "routes": [
+            "/autorealbridge/health",
+            "/autorealbridge/test",
+            "/autorealbridge/log",
+            "/autorealbridge?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=108000&sl=109000&tp50=107000&signal_id=TEST-ONLY",
+            "/executionpipeline",
+            "/executionengine/health",
+            "/executionorchestrator/health",
+        ],
+        "notes": [
+            "Health/test não enviam ordem real.",
+            "O Bridge executa automaticamente apenas sinais ALLOW elegíveis, deduplicados e aprovados pelo Final Gate/Real Pilot Guard.",
+            "Por padrão exige signal_id para evitar F5/replay virar nova ordem.",
+            "A execução live manual pela rota exige execute=true&commit=true&ack=AUTO_REAL_EXECUTE.",
+        ],
+        "token_value_exposed": False,
+    }
+
+
+@app.route("/autorealbridge/health", methods=["GET"])
+@app.route("/auto/realbridge/health", methods=["GET"])
+@app.route("/executionorchestrator/health", methods=["GET"])
+@app.route("/execution/orchestrator/health", methods=["GET"])
+def auto_real_execution_bridge_v1_health_route():
+    return auto_real_execution_bridge_v1_health_payload(), 200
+
+
+@app.route("/autorealbridge/log", methods=["GET"])
+@app.route("/auto/realbridge/log", methods=["GET"])
+def auto_real_execution_bridge_v1_log_route():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except Exception:
+        limit = 20
+    payload = _arb_v1_read_events(limit=limit)
+    payload.update({
+        "module": "auto_real_execution_bridge_v1",
+        "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+        "generated_at": _arb_v1_now(),
+        "events_file": str(AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE) if AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE is not None else None,
+    })
+    return _arb_v1_sanitize_public(payload), 200
+
+
+@app.route("/autorealbridge/test", methods=["GET", "POST"])
+@app.route("/auto/realbridge/test", methods=["GET", "POST"])
+def auto_real_execution_bridge_v1_test_route():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
+    payload = _arb_v1_normalize_payload(payload, manual_defaults=True)
+    payload.setdefault("mode", "VERIFY")
+    payload.setdefault("signal_id", f"AUTO-REAL-BRIDGE-TEST-{int(time.time())}")
+    result = auto_real_execution_bridge_v1_process(
+        payload=payload,
+        risk_result={"allowed": True, "decision": "ALLOW", "mode": payload.get("mode") or "VERIFY"},
+        source="test_route",
+        execute=False,
+        dry_run=True,
+    )
+    return _arb_v1_sanitize_public(result), 200
+
+
+@app.route("/autorealbridge", methods=["GET", "POST"])
+@app.route("/auto/realbridge", methods=["GET", "POST"])
+def auto_real_execution_bridge_v1_route():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = {key: value for key, value in request.args.items()}
+    payload = _arb_v1_normalize_payload(payload, manual_defaults=True)
+    execute = _arb_v1_bool(request.args.get("execute") or payload.get("execute"), default=False)
+    commit = _arb_v1_bool(request.args.get("commit") or payload.get("commit"), default=False)
+    ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
+    dry_run = not (execute and commit and ack in {"AUTO_REAL_EXECUTE", "AUTO_REAL_EXECUTION_BRIDGE"})
+    if execute and not dry_run:
+        result = auto_real_execution_bridge_v1_process(
+            payload=payload,
+            risk_result={"allowed": True, "decision": "ALLOW", "mode": payload.get("mode") or "VERIFY"},
+            source="manual_route_live",
+            execute=True,
+            dry_run=False,
+            force_notify=True,
+        )
+    else:
+        result = auto_real_execution_bridge_v1_process(
+            payload=payload,
+            risk_result={"allowed": True, "decision": "ALLOW", "mode": payload.get("mode") or "VERIFY"},
+            source="manual_route_preview",
+            execute=False,
+            dry_run=True,
+        )
+        if execute and not commit:
+            result.setdefault("manual_live_requirements", {
+                "required_commit": "commit=true",
+                "required_ack": "AUTO_REAL_EXECUTE",
+                "example": "/autorealbridge?execute=true&commit=true&ack=AUTO_REAL_EXECUTE&...",
+            })
+    return _arb_v1_sanitize_public(result), 200
+
+
+# Aliases pedidos no diagnóstico do usuário.
+@app.route("/executionpipeline", methods=["GET"])
+def execution_pipeline_alias_autobridge_v1_route():
+    as_text = str(request.args.get("format", "")).strip().lower() in {"text", "txt", "1", "true"}
+    try:
+        if as_text and callable(globals().get("build_execution_pipeline_text")):
+            return build_execution_pipeline_text()
+        if callable(globals().get("build_execution_pipeline_status")):
+            return build_execution_pipeline_status()
+    except Exception as exc:
+        return {"ok": False, "status": "EXECUTION_PIPELINE_ALIAS_ERROR", "error": str(exc), "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION}, 500
+    return {"ok": False, "status": "EXECUTION_PIPELINE_FUNCTION_MISSING", "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION}, 404
+
+
+@app.route("/executionengine/health", methods=["GET"])
+def execution_engine_health_alias_autobridge_v1_route():
+    try:
+        if callable(globals().get("execution_engine_health")):
+            return execution_engine_health()
+    except Exception as exc:
+        return {"ok": False, "status": "EXECUTION_ENGINE_HEALTH_ALIAS_ERROR", "error": str(exc), "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION}, 500
+    return {"ok": False, "status": "EXECUTION_ENGINE_HEALTH_FUNCTION_MISSING", "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION}, 404
+
+
+# Wrapper final do Risk Manager: /can_open_trade continua respondendo ALLOW/DENY,
+# mas anexa a decisão/execução do Auto Real Execution Bridge quando o sinal for elegível.
+def can_open_trade_decision(payload: dict):
+    original = _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1
+    if callable(original):
+        decision_result = original(payload)
+    else:
+        decision_result = {
+            "ok": False,
+            "allowed": False,
+            "decision": "DENY",
+            "status": "ORIGINAL_CAN_OPEN_TRADE_DECISION_MISSING",
+            "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+        }
+    try:
+        bridge_result = auto_real_execution_bridge_v1_process(
+            payload=payload,
+            risk_result=decision_result if isinstance(decision_result, dict) else {},
+            source="can_open_trade",
+            execute=True,
+            dry_run=False,
+        )
+        if isinstance(decision_result, dict):
+            decision_result.setdefault("auto_real_execution_bridge_v1", _arb_v1_sanitize_public(bridge_result))
+    except Exception as exc:
+        if isinstance(decision_result, dict):
+            decision_result.setdefault("auto_real_execution_bridge_v1", {
+                "ok": False,
+                "status": "AUTO_REAL_BRIDGE_ATTACH_ERROR",
+                "error": str(exc),
+                "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+                "token_value_exposed": False,
+            })
+    return decision_result
+
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
