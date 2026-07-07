@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-06-BROKER-BINGX-SAFE-V2.7.3-DISASTER-STOP-PLACE-MARKET-VAR-FIX
+# Versão: 2026-07-07-BROKER-BINGX-SAFE-V2.7.4-UNIFIED-AUDIT-PATH
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -112,13 +112,17 @@ DISASTER_STOP_CLIENT_SUFFIX = os.environ.get("DISASTER_STOP_CLIENT_SUFFIX", "-DS
 # O envio real continua usando ccxt.create_order(), pois é mais seguro e padronizado.
 BINGX_SWAP_ORDER_ENDPOINT = "/openApi/swap/v2/trade/order"
 
-# Log local/ephemeral de execução. A Central lê este arquivo em /live, /sync e /executions.
-EXECUTIONS_LOG_FILE = os.environ.get("EXECUTIONS_LOG_FILE", "daily_history/executions_log.jsonl")
+# Log local/persistente de execução. A Central lê este arquivo em /live, /sync e /executions.
+# V2.7.4: por padrão usa CENTRAL_DATA_DIR para sobreviver melhor a restarts/deploys no Render.
+CENTRAL_DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR", os.environ.get("DATA_DIR", "/data")))
+BROKER_LEGACY_EXECUTIONS_LOG_FILE = Path("daily_history") / "executions_log.jsonl"
+BROKER_LEGACY_AUDIT_LOG_FILE = Path("daily_history") / "execution_audit_log.jsonl"
+EXECUTIONS_LOG_FILE = os.environ.get("EXECUTIONS_LOG_FILE", str(CENTRAL_DATA_DIR / "broker_executions_log.jsonl"))
 EXECUTIONS_LOG_MAX_READ = int(os.environ.get("EXECUTIONS_LOG_MAX_READ", "50"))
 
 # Audit log persistente/estruturado para rastrear toda tentativa de execução.
 # Diferente do log operacional, este arquivo é pensado para auditoria posterior.
-EXECUTION_AUDIT_LOG_FILE = os.environ.get("EXECUTION_AUDIT_LOG_FILE", str(Path("daily_history") / "execution_audit_log.jsonl"))
+EXECUTION_AUDIT_LOG_FILE = os.environ.get("EXECUTION_AUDIT_LOG_FILE", str(CENTRAL_DATA_DIR / "broker_execution_audit_log.jsonl"))
 EXECUTION_AUDIT_LOG_MAX_READ = int(os.environ.get("EXECUTION_AUDIT_LOG_MAX_READ", "100"))
 
 _exchange = None
@@ -318,44 +322,63 @@ def log_execution_audit_event(event: dict):
         return False
 
 
-def get_execution_audit_log(limit: int = None):
-    """Retorna os últimos eventos do Execution Audit Log V1."""
+def _read_jsonl_file(path, limit=None, source=None):
     try:
         limit = int(limit or EXECUTION_AUDIT_LOG_MAX_READ)
         limit = max(1, min(limit, 500))
-        path = Path(EXECUTION_AUDIT_LOG_FILE)
-        if not path.exists():
+        p = Path(path)
+        if not p.exists():
             return []
-        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[-limit:]
         out = []
         for line in lines:
             try:
-                out.append(json.loads(line))
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    item.setdefault("_source_file", str(p))
+                    item.setdefault("_source_name", source or str(p))
+                    out.append(item)
             except Exception:
-                out.append({"raw": line})
+                out.append({"raw": line[:1000], "_source_file": str(p), "_source_name": source or str(p)})
         return out
     except Exception as exc:
-        return [{"ok": False, "error": str(exc)}]
+        return [{"ok": False, "error": str(exc), "_source_file": str(path), "_source_name": source or str(path)}]
+
+
+def get_execution_audit_log(limit: int = None):
+    """Retorna os últimos eventos do Execution Audit Log, lendo caminho novo e legado."""
+    try:
+        limit = int(limit or EXECUTION_AUDIT_LOG_MAX_READ)
+        limit = max(1, min(limit, 500))
+    except Exception:
+        limit = EXECUTION_AUDIT_LOG_MAX_READ
+    rows = []
+    rows.extend(_read_jsonl_file(EXECUTION_AUDIT_LOG_FILE, limit=limit, source="broker_execution_audit_primary"))
+    try:
+        if str(BROKER_LEGACY_AUDIT_LOG_FILE) != str(EXECUTION_AUDIT_LOG_FILE):
+            rows.extend(_read_jsonl_file(BROKER_LEGACY_AUDIT_LOG_FILE, limit=limit, source="broker_execution_audit_legacy"))
+    except Exception:
+        pass
+    rows = sorted(rows, key=lambda x: float(x.get("epoch") or 0) if isinstance(x, dict) else 0, reverse=True)
+    return rows[:limit]
 
 
 def get_executions_log(limit: int = None):
-    """Retorna os últimos eventos de execução registrados pelo broker."""
+    """Retorna os últimos eventos de execução registrados pelo broker, lendo caminho novo e legado."""
     try:
         limit = int(limit or EXECUTIONS_LOG_MAX_READ)
-        path = Path(EXECUTIONS_LOG_FILE)
-        if not path.exists():
-            return []
-        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
-        out = []
-        for line in lines:
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                out.append({"raw": line})
-        return out
-    except Exception as exc:
-        return [{"ok": False, "error": str(exc)}]
-
+        limit = max(1, min(limit, 500))
+    except Exception:
+        limit = EXECUTIONS_LOG_MAX_READ
+    rows = []
+    rows.extend(_read_jsonl_file(EXECUTIONS_LOG_FILE, limit=limit, source="broker_executions_primary"))
+    try:
+        if str(BROKER_LEGACY_EXECUTIONS_LOG_FILE) != str(EXECUTIONS_LOG_FILE):
+            rows.extend(_read_jsonl_file(BROKER_LEGACY_EXECUTIONS_LOG_FILE, limit=limit, source="broker_executions_legacy"))
+    except Exception:
+        pass
+    rows = sorted(rows, key=lambda x: float(x.get("epoch") or 0) if isinstance(x, dict) else 0, reverse=True)
+    return rows[:limit]
 
 # ==============================================================================
 # EXCHANGE / STATUS

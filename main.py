@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Versão: 2026-07-07-SUPER-CENTRAL-QUANT-V5-CEO-DAILY-V2-PNL-STABILITY-V1
+# Versão: 2026-07-07-SUPER-CENTRAL-QUANT-V5-CEO-DAILY-V2.2-EXECUTION-AUDIT-V1
 #
 # Objetivo:
 # - Rodar os robôs em um único serviço Render.
@@ -1233,7 +1233,7 @@ MEMORY_STABILIZER_VERSION = "2026-07-05-MEMORY-STABILIZATION-V2.4.3"
 MEMORY_STABILIZER_ENABLED = os.environ.get("MEMORY_STABILIZER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
 MEMORY_STABILIZER_FORCE_GC_AFTER_REQUEST = os.environ.get("MEMORY_STABILIZER_FORCE_GC_AFTER_REQUEST", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
 MEMORY_STABILIZER_HEAVY_PATHS = {
-    "/relatorio", "/dashboard", "/executive", "/risk", "/heat", "/ranking",
+    "/ceodaily", "/ceo", "/ceo_daily", "/relatorio", "/dashboard", "/executive", "/risk", "/heat", "/ranking",
     "/history", "/history/raw", "/history/trades", "/history/trades/analytics",
     "/exporthistory", "/exportarhistory", "/realpnlr", "/realpnlr/text",
     "/policyeffect", "/policycompare", "/policyinsights", "/learning/state",
@@ -16514,7 +16514,29 @@ def _ceo_daily_v2_group_metrics(trades, field="bot", limit=8):
     return dict(sorted(scored.items(), key=lambda item: _ceo_daily_v2_float((item[1] or {}).get("pnl_total_pct"), 0), reverse=True)[:limit])
 
 
-def _ceo_daily_v2_history_pnl_snapshot(limit=8000):
+def _ceo_daily_v2_history_pnl_snapshot(limit=None):
+    """Memory Safe CEO Daily V2.2.
+
+    O CEO Daily não deve carregar histórico profundo por padrão no Render Free.
+    Mantém a leitura suficiente para o mês/dia, mas limita o volume para reduzir OOM.
+    Ajustável por env:
+    - CEO_DAILY_HISTORY_LIMIT, padrão 1500
+    - CEO_DAILY_HISTORY_MAX_LIMIT, padrão 2500
+    """
+    try:
+        default_limit = int(os.environ.get("CEO_DAILY_HISTORY_LIMIT", "1500"))
+    except Exception:
+        default_limit = 1500
+    try:
+        max_limit = int(os.environ.get("CEO_DAILY_HISTORY_MAX_LIMIT", "2500"))
+    except Exception:
+        max_limit = 2500
+    try:
+        limit = int(limit if limit is not None else default_limit)
+    except Exception:
+        limit = default_limit
+    limit = max(100, min(limit, max_limit))
+
     try:
         import history_manager as super_history_manager
         if hasattr(super_history_manager, "load_closed_trades"):
@@ -36514,6 +36536,568 @@ def real_pilot_dashboard_v1_log_route():
         "token_value_exposed": False,
     })
     return _rpd_v1_sanitize_public(payload), 200
+
+
+# ==========================================================
+# EXECUTION ATTEMPT AUDIT V1 + MEMORY SAFE CEO DAILY V2.2
+# ==========================================================
+# Objetivo:
+# - Toda chamada a run_execution_engine passa a deixar trilha unificada antes e depois.
+# - Identifica origem provável: console, rota live, verify/preflight, Telegram/API, bot automático ou desconhecida.
+# - Bloqueia LIVE real dry_run=False quando a origem for automática/desconhecida por padrão.
+# - Expõe /executionauditlog, /execution/audit/log e /executionaudit/last.
+# - Reduz risco de OOM no CEO Daily com cleanup pós-relatório e limits menores.
+EXECUTION_ATTEMPT_AUDIT_V1_VERSION = "2026-07-07-EXECUTION-ATTEMPT-AUDIT-V1"
+EXECUTION_ATTEMPT_AUDIT_V1_FILE = CENTRAL_DATA_DIR / "execution_attempt_audit_v1.jsonl"
+EXECUTION_ATTEMPT_AUDIT_V1_LATEST_FILE = CENTRAL_DATA_DIR / "execution_attempt_audit_v1_latest.json"
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_ATTEMPT_AUDIT_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_ATTEMPT_AUDIT_V1 = None
+
+try:
+    # A função existente no main.py é build_ceo_daily_report().
+    # Não referenciar build_ceo_daily_report_v2 aqui, porque ela não existe neste main.
+    _ORIGINAL_BUILD_CEO_DAILY_REPORT_FOR_MEMORY_SAFE_V2_2 = build_ceo_daily_report
+except Exception:
+    _ORIGINAL_BUILD_CEO_DAILY_REPORT_FOR_MEMORY_SAFE_V2_2 = None
+
+
+def _eaa_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return None
+
+
+def _eaa_v1_epoch():
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _eaa_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "y", "ok", "ready", "enabled"}
+
+
+def _eaa_v1_safe_str(value, default=""):
+    try:
+        if value is None:
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def _eaa_v1_normalize_symbol(value):
+    return _eaa_v1_safe_str(value).upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _eaa_v1_normalize_side(value):
+    side = _eaa_v1_safe_str(value).upper().strip()
+    if side in {"BUY", "LONG"}:
+        return "LONG"
+    if side in {"SELL", "SHORT"}:
+        return "SHORT"
+    return side
+
+
+def _eaa_v1_sanitize(obj):
+    sensitive_fragments = (
+        "token", "secret", "signature", "apikey", "api_key", "authorization",
+        "password", "x-bx-apikey", "cookie", "session"
+    )
+    try:
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if any(s in lk for s in sensitive_fragments):
+                    out[k] = "***MASKED***" if v not in (None, "", False) else v
+                elif lk in {"raw", "info", "html", "body"}:
+                    out[k] = _eaa_v1_safe_str(v)[:1000]
+                else:
+                    out[k] = _eaa_v1_sanitize(v)
+            return out
+        if isinstance(obj, list):
+            return [_eaa_v1_sanitize(x) for x in obj[:50]]
+    except Exception:
+        pass
+    return obj
+
+
+def _eaa_v1_write_json(path, payload):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _eaa_v1_append(event):
+    try:
+        payload = _eaa_v1_sanitize(dict(event or {}))
+        payload.setdefault("module", "execution_attempt_audit_v1")
+        payload.setdefault("version", EXECUTION_ATTEMPT_AUDIT_V1_VERSION)
+        payload.setdefault("generated_at", _eaa_v1_now())
+        payload.setdefault("epoch", _eaa_v1_epoch())
+        EXECUTION_ATTEMPT_AUDIT_V1_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with EXECUTION_ATTEMPT_AUDIT_V1_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        _eaa_v1_write_json(EXECUTION_ATTEMPT_AUDIT_V1_LATEST_FILE, payload)
+        return True
+    except Exception:
+        return False
+
+
+def _eaa_v1_request_context():
+    ctx = {
+        "has_request": False,
+        "path": None,
+        "method": None,
+        "endpoint": None,
+        "remote_addr": None,
+        "user_agent": None,
+        "referrer": None,
+        "args_keys": [],
+        "form_keys": [],
+        "json_keys": [],
+    }
+    try:
+        # request existe apenas dentro de contexto Flask.
+        path = getattr(request, "path", None)
+        method = getattr(request, "method", None)
+        ctx.update({
+            "has_request": bool(path or method),
+            "path": path,
+            "method": method,
+            "endpoint": getattr(request, "endpoint", None),
+            "remote_addr": getattr(request, "remote_addr", None),
+            "user_agent": str(getattr(request, "user_agent", "") or "")[:300],
+            "referrer": str(getattr(request, "referrer", "") or "")[:500],
+        })
+        try:
+            ctx["args_keys"] = sorted([str(k) for k in request.args.keys()])[:50]
+        except Exception:
+            pass
+        try:
+            ctx["form_keys"] = sorted([str(k) for k in request.form.keys()])[:50]
+        except Exception:
+            pass
+        try:
+            js = request.get_json(silent=True) or {}
+            if isinstance(js, dict):
+                ctx["json_keys"] = sorted([str(k) for k in js.keys()])[:50]
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return ctx
+
+
+def _eaa_v1_infer_origin(payload=None, mode=None, dry_run=True):
+    payload = payload if isinstance(payload, dict) else {}
+    req = _eaa_v1_request_context()
+    path = str(req.get("path") or "").lower()
+    endpoint = str(req.get("endpoint") or "").lower()
+    signal_id = str(payload.get("signal_id") or payload.get("client_order_id") or payload.get("trade_id") or "")
+    source = str(payload.get("source") or payload.get("origin") or payload.get("origin_type") or "").upper().strip()
+    dry = _eaa_v1_bool(dry_run, default=True)
+    mode_norm = str(mode or payload.get("mode") or "").upper().strip()
+
+    origin_type = "UNKNOWN"
+    confidence = "LOW"
+    reason = "Sem origem explícita."
+
+    if isinstance(payload.get("_execution_attempt_audit_v1"), dict):
+        previous = payload.get("_execution_attempt_audit_v1") or {}
+        if previous.get("origin_type"):
+            origin_type = str(previous.get("origin_type"))
+            confidence = "HIGH"
+            reason = "Origem já marcada no payload."
+    elif source in {"EXECUTION_CONSOLE", "MANUAL_API", "TELEGRAM", "BOT_AUTOMATIC", "FINAL_GATE_PREFLIGHT", "EXECUTION_LIVE_ROUTE"}:
+        origin_type = source
+        confidence = "HIGH"
+        reason = "Origem explícita no payload."
+    elif "executionconsole" in path or "execution/console" in path or "execution_console" in endpoint:
+        origin_type = "EXECUTION_CONSOLE"
+        confidence = "HIGH"
+        reason = "Chamada veio da rota Execution Console."
+    elif "executionlive" in path or "execution/live" in path or "execution_engine_live" in endpoint:
+        origin_type = "EXECUTION_LIVE_ROUTE"
+        confidence = "HIGH"
+        reason = "Chamada veio da rota /executionlive com confirmação explícita."
+    elif "executionverify" in path or "execution/verify" in path:
+        origin_type = "FINAL_GATE_PREFLIGHT"
+        confidence = "HIGH"
+        reason = "Chamada veio de rota de verify/preflight."
+    elif "telegram" in path or str(payload.get("telegram") or "").lower() in {"1", "true", "yes"}:
+        origin_type = "TELEGRAM"
+        confidence = "MEDIUM"
+        reason = "Chamada associada a rota/payload Telegram."
+    elif req.get("has_request"):
+        origin_type = "API_ROUTE"
+        confidence = "MEDIUM"
+        reason = "Chamada veio por request Flask, mas não era rota de execução conhecida."
+    elif signal_id or payload.get("bot") or payload.get("symbol") or payload.get("side"):
+        origin_type = "BOT_AUTOMATIC"
+        confidence = "MEDIUM"
+        reason = "Payload operacional sem request Flask; provável chamada automática interna/robô."
+    else:
+        origin_type = "UNKNOWN"
+        confidence = "LOW"
+        reason = "Sem request e sem campos suficientes no payload."
+
+    if dry and origin_type in {"UNKNOWN", "API_ROUTE"}:
+        origin_type = "DRY_RUN_PREFLIGHT"
+        confidence = "MEDIUM"
+        reason = "dry_run=True; classificado como preflight seguro sem envio real."
+
+    return {
+        "origin_type": origin_type,
+        "origin_confidence": confidence,
+        "origin_reason": reason,
+        "request": req,
+        "mode": mode_norm,
+        "dry_run": dry,
+        "payload_source": source or None,
+        "signal_id": signal_id[:120] if signal_id else None,
+    }
+
+
+def _eaa_v1_payload_snapshot(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    return _eaa_v1_sanitize({
+        "bot": payload.get("bot"),
+        "setup": payload.get("setup"),
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "entry": payload.get("entry"),
+        "sl": payload.get("sl") or payload.get("stop"),
+        "tp50": payload.get("tp50"),
+        "risk_pct": payload.get("risk_pct"),
+        "decision": payload.get("decision"),
+        "allowed": payload.get("allowed"),
+        "signal_id": payload.get("signal_id"),
+        "client_order_id": payload.get("client_order_id"),
+        "keys": sorted([str(k) for k in payload.keys() if not any(s in str(k).lower() for s in ("token", "secret", "signature", "authorization"))])[:80],
+    })
+
+
+def _eaa_v1_result_snapshot(result):
+    result = result if isinstance(result, dict) else {}
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    live_result = payload.get("live_result") if isinstance(payload.get("live_result"), dict) else result.get("live_result") if isinstance(result.get("live_result"), dict) else {}
+    return _eaa_v1_sanitize({
+        "ok": result.get("ok", payload.get("ok")),
+        "status": result.get("status") or payload.get("status") or live_result.get("status"),
+        "sent": bool(result.get("sent") or result.get("live_sent") or live_result.get("sent") or payload.get("live_sent")),
+        "mode": result.get("mode") or payload.get("mode"),
+        "dry_run": result.get("dry_run") if result.get("dry_run") is not None else payload.get("dry_run"),
+        "executor_route": result.get("executor_route") or payload.get("executor_route"),
+        "live_broker_called": payload.get("live_broker_called") or result.get("live_broker_called"),
+        "live_status": live_result.get("status"),
+        "auth_status": ((live_result.get("auth") or {}).get("status") if isinstance(live_result.get("auth"), dict) else None),
+        "order_id": live_result.get("order_id") or live_result.get("id"),
+        "client_order_id": live_result.get("client_order_id") or live_result.get("clientOrderId"),
+    })
+
+
+def _eaa_v1_should_block(mode, dry_run, origin):
+    mode_norm = str(mode or "").upper().strip()
+    dry = _eaa_v1_bool(dry_run, default=True)
+    origin_type = str((origin or {}).get("origin_type") or "UNKNOWN").upper().strip()
+    block_enabled = os.environ.get("CENTRAL_BLOCK_AUTOMATIC_LIVE_EXECUTION_WITHOUT_MANUAL_ORIGIN", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+    if not block_enabled:
+        return False, "block_disabled"
+    if mode_norm not in {"LIVE", "REAL"} or dry:
+        return False, "not_live_real_send"
+    allowed_manual = {"EXECUTION_CONSOLE", "EXECUTION_LIVE_ROUTE", "MANUAL_API"}
+    if origin_type in allowed_manual:
+        return False, "manual_origin_allowed"
+    return True, f"live real blocked because origin_type={origin_type}"
+
+
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    """Execution Attempt Audit V1 wrapper final."""
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_ATTEMPT_AUDIT_V1
+    payload_dict = dict(payload or {}) if isinstance(payload, dict) else {}
+    mode_norm = str(mode or payload_dict.get("mode") or "").upper().strip() or "OBSERVATION_ONLY"
+    dry = _eaa_v1_bool(dry_run, default=True)
+    origin = _eaa_v1_infer_origin(payload_dict, mode=mode_norm, dry_run=dry)
+    enriched_payload = dict(payload_dict)
+    enriched_payload["_execution_attempt_audit_v1"] = origin
+    enriched_payload.setdefault("execution_origin_type", origin.get("origin_type"))
+    enriched_payload.setdefault("execution_origin_confidence", origin.get("origin_confidence"))
+
+    attempt_id = f"EAA-{int(_eaa_v1_epoch())}-{uuid.uuid4().hex[:10].upper()}"
+    base_event = {
+        "attempt_id": attempt_id,
+        "event": "EXECUTION_ATTEMPT_RECEIVED",
+        "mode": mode_norm,
+        "dry_run": dry,
+        "origin": origin,
+        "payload_snapshot": _eaa_v1_payload_snapshot(enriched_payload),
+        "symbol": _eaa_v1_normalize_symbol(enriched_payload.get("symbol")),
+        "side": _eaa_v1_normalize_side(enriched_payload.get("side")),
+        "bot": str(enriched_payload.get("bot") or "").upper().strip(),
+        "sent": False,
+        "token_value_exposed": False,
+    }
+    _eaa_v1_append(base_event)
+
+    if not callable(original_runner):
+        result = {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_RUNNER_MISSING_AFTER_ATTEMPT_AUDIT",
+            "sent": False,
+            "mode": mode_norm,
+            "dry_run": dry,
+            "execution_attempt_audit_v1": {"attempt_id": attempt_id, "origin": origin, "blocked": True},
+            "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+            "token_value_exposed": False,
+        }
+        _eaa_v1_append({**base_event, "event": "EXECUTION_ATTEMPT_RUNNER_MISSING", "result": _eaa_v1_result_snapshot(result)})
+        return result
+
+    should_block, block_reason = _eaa_v1_should_block(mode_norm, dry, origin)
+    if should_block:
+        result = {
+            "ok": False,
+            "status": "LIVE_BLOCKED_BY_EXECUTION_ATTEMPT_AUDIT_V1",
+            "sent": False,
+            "order_sent": False,
+            "live_sent": False,
+            "live_broker_called": False,
+            "live_send_blocked": True,
+            "mode": mode_norm,
+            "dry_run": dry,
+            "reason": block_reason,
+            "origin_type": origin.get("origin_type"),
+            "origin_confidence": origin.get("origin_confidence"),
+            "payload": _eaa_v1_payload_snapshot(enriched_payload),
+            "execution_attempt_audit_v1": {
+                "attempt_id": attempt_id,
+                "blocked": True,
+                "origin": origin,
+                "reason": block_reason,
+                "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+            },
+            "notes": [
+                "Execution Attempt Audit V1 bloqueou LIVE real antes de qualquer chamada ao broker.",
+                "Para execução manual, use /executionconsole ou /executionlive com confirmação explícita.",
+            ],
+            "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+            "token_value_exposed": False,
+        }
+        _eaa_v1_append({**base_event, "event": "EXECUTION_ATTEMPT_BLOCKED", "status": result.get("status"), "reason": block_reason, "result": _eaa_v1_result_snapshot(result)})
+        return result
+
+    try:
+        result = original_runner(payload=enriched_payload, mode=mode, dry_run=dry_run, *args, **kwargs)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status": "EXECUTION_ENGINE_EXCEPTION_AFTER_ATTEMPT_AUDIT",
+            "sent": False,
+            "mode": mode_norm,
+            "dry_run": dry,
+            "error": str(exc),
+            "execution_attempt_audit_v1": {"attempt_id": attempt_id, "origin": origin, "exception": True},
+            "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+            "token_value_exposed": False,
+        }
+        _eaa_v1_append({**base_event, "event": "EXECUTION_ATTEMPT_EXCEPTION", "error": str(exc), "result": _eaa_v1_result_snapshot(result)})
+        return result
+
+    try:
+        if isinstance(result, dict):
+            result.setdefault("execution_attempt_audit_v1", {
+                "attempt_id": attempt_id,
+                "origin": origin,
+                "blocked": False,
+                "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+                "token_value_exposed": False,
+            })
+            if isinstance(result.get("payload"), dict):
+                result["payload"].setdefault("execution_attempt_audit_v1", result.get("execution_attempt_audit_v1"))
+    except Exception:
+        pass
+
+    _eaa_v1_append({**base_event, "event": "EXECUTION_ATTEMPT_COMPLETED", "result": _eaa_v1_result_snapshot(result)})
+    return result
+
+
+def _eaa_v1_read_jsonl(path, limit=100, source=None):
+    rows = []
+    try:
+        p = Path(path)
+        if not p.exists():
+            return rows
+        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit)):]
+        for line in lines:
+            try:
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    item.setdefault("_audit_source", source or str(p))
+                    rows.append(_eaa_v1_sanitize(item))
+            except Exception:
+                rows.append({"raw": line[:1000], "_audit_source": source or str(p)})
+    except Exception as exc:
+        rows.append({"ok": False, "error": str(exc), "_audit_source": source or str(path)})
+    return rows
+
+
+def _eaa_v1_combined_log(limit=50):
+    try:
+        limit = max(1, min(int(limit), 300))
+    except Exception:
+        limit = 50
+    sources = []
+    # Novo log unificado.
+    sources.append((EXECUTION_ATTEMPT_AUDIT_V1_FILE, "execution_attempt_audit_v1"))
+    # Logs do engine e broker quando existirem.
+    try:
+        sources.append((CENTRAL_DATA_DIR / "execution_audit_log.jsonl", "execution_engine_audit"))
+        sources.append((CENTRAL_DATA_DIR / "execution_engine_log.jsonl", "execution_engine_log"))
+    except Exception:
+        pass
+    try:
+        sources.append((Path(os.environ.get("EXECUTION_AUDIT_LOG_FILE", str(Path("daily_history") / "execution_audit_log.jsonl"))), "broker_execution_audit"))
+        sources.append((Path(os.environ.get("EXECUTIONS_LOG_FILE", "daily_history/executions_log.jsonl")), "broker_executions_log"))
+    except Exception:
+        pass
+
+    items = []
+    seen = set()
+    files = []
+    for path, source in sources:
+        try:
+            path_str = str(path)
+            files.append({"source": source, "path": path_str, "exists": Path(path).exists()})
+            for item in _eaa_v1_read_jsonl(path, limit=limit, source=source):
+                key = json.dumps({
+                    "source": source,
+                    "epoch": item.get("epoch") or item.get("ts_epoch") or item.get("timestamp"),
+                    "event": item.get("event") or item.get("status"),
+                    "symbol": item.get("symbol") or ((item.get("payload_snapshot") or {}).get("symbol") if isinstance(item.get("payload_snapshot"), dict) else None),
+                    "side": item.get("side") or ((item.get("payload_snapshot") or {}).get("side") if isinstance(item.get("payload_snapshot"), dict) else None),
+                }, sort_keys=True, default=str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(item)
+        except Exception:
+            continue
+
+    def sort_key(item):
+        for k in ("epoch", "ts_epoch", "timestamp"):
+            try:
+                if item.get(k) is not None:
+                    return float(item.get(k))
+            except Exception:
+                pass
+        return 0.0
+
+    items = sorted(items, key=sort_key, reverse=True)[:limit]
+    return {
+        "ok": True,
+        "module": "execution_attempt_audit_v1",
+        "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+        "generated_at": _eaa_v1_now(),
+        "count": len(items),
+        "items": items,
+        "files": files,
+        "notes": [
+            "Este log combina auditoria nova, engine, broker e executions_log quando disponíveis.",
+            "Eventos antigos sem origem explícita podem continuar aparecendo como UNKNOWN; a origem detalhada vale para novas tentativas após este deploy.",
+        ],
+    }
+
+
+@app.route("/executionauditlog", methods=["GET"])
+@app.route("/execution/audit/log", methods=["GET"])
+@app.route("/executionattemptaudit/log", methods=["GET"])
+def execution_attempt_audit_v1_log_route():
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except Exception:
+        limit = 50
+    return _eaa_v1_combined_log(limit=limit), 200
+
+
+@app.route("/executionaudit/last", methods=["GET"])
+@app.route("/execution/audit/last", methods=["GET"])
+def execution_attempt_audit_v1_last_route():
+    payload = _eaa_v1_combined_log(limit=1)
+    item = payload.get("items", [None])[0] if payload.get("items") else None
+    return {
+        "ok": True,
+        "module": "execution_attempt_audit_v1",
+        "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+        "generated_at": _eaa_v1_now(),
+        "item": item,
+        "count": 1 if item else 0,
+    }, 200
+
+
+@app.route("/executionaudit/health", methods=["GET"])
+@app.route("/execution/audit/health", methods=["GET"])
+def execution_attempt_audit_v1_health_route():
+    return {
+        "ok": True,
+        "module": "execution_attempt_audit_v1",
+        "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+        "generated_at": _eaa_v1_now(),
+        "block_automatic_live_without_manual_origin": os.environ.get("CENTRAL_BLOCK_AUTOMATIC_LIVE_EXECUTION_WITHOUT_MANUAL_ORIGIN", "true"),
+        "new_log_file": str(EXECUTION_ATTEMPT_AUDIT_V1_FILE),
+        "latest_file": str(EXECUTION_ATTEMPT_AUDIT_V1_LATEST_FILE),
+        "run_execution_engine_wrapped": callable(_ORIGINAL_RUN_EXECUTION_ENGINE_FOR_ATTEMPT_AUDIT_V1),
+        "routes": [
+            "/executionauditlog?limit=50",
+            "/executionaudit/last",
+            "/executionaudit/health",
+        ],
+        "notes": [
+            "LIVE dry_run=False vindo de origem BOT_AUTOMATIC/UNKNOWN é bloqueado por padrão antes do broker.",
+            "Console e /executionlive continuam possíveis, mas apenas com os guards e confirmações existentes.",
+        ],
+    }, 200
+
+
+# Wrapper leve para limpar memória depois do CEO Daily.
+def build_ceo_daily_report(*args, **kwargs):
+    original = _ORIGINAL_BUILD_CEO_DAILY_REPORT_FOR_MEMORY_SAFE_V2_2
+    if not callable(original):
+        return "🧠 CEO DAILY REPORT — CENTRAL QUANT V2\n\nStatus: ERRO\nMotivo: build_ceo_daily_report original indisponível."
+    try:
+        return original(*args, **kwargs)
+    finally:
+        try:
+            if callable(globals().get("_memory_cleanup")):
+                _memory_cleanup(reason="ceo_daily_v2_2_after_build", force=True)
+            else:
+                gc.collect()
+        except Exception:
+            pass
+
+
+def build_ceo_daily_report_v2(*args, **kwargs):
+    # Alias compatível para qualquer rota futura que chame explicitamente V2.
+    return build_ceo_daily_report(*args, **kwargs)
+
 
 start_central_runtime_once()
 

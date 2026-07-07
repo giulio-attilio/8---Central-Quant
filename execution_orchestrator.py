@@ -1,6 +1,6 @@
 # execution_orchestrator_v1.txt
 # CENTRAL QUANT — EXECUTION ORCHESTRATOR V1
-# Versao: 2026-07-04-EXECUTION-ORCHESTRATOR-V1
+# Versao: 2026-07-07-EXECUTION-ORCHESTRATOR-V1.1-AUDIT-ORIGIN
 #
 # Objetivo:
 # - Camada entre Decision/Risk/Allocator e execução real.
@@ -30,7 +30,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 
-VERSION = "2026-07-04-EXECUTION-ORCHESTRATOR-V1"
+VERSION = "2026-07-07-EXECUTION-ORCHESTRATOR-V1.1-AUDIT-ORIGIN"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -253,12 +253,21 @@ def orchestrate_execution(
         plan["errors"].append("idempotency_key já processada")
         plan["previous_seen_at"] = seen[idem_key].get("seen_at")
 
+    execution_origin = payload.get("_execution_attempt_audit_v1") if isinstance(payload.get("_execution_attempt_audit_v1"), dict) else {}
     event = {
         "event": "EXECUTION_PLAN_CREATED",
         "version": VERSION,
         "generated_at": _now_br(),
         "epoch": time.time(),
         "dry_run": dry_run,
+        "origin_type": execution_origin.get("origin_type"),
+        "origin_confidence": execution_origin.get("origin_confidence"),
+        "origin_reason": execution_origin.get("origin_reason"),
+        "request_path": ((execution_origin.get("request") or {}).get("path") if isinstance(execution_origin.get("request"), dict) else None),
+        "bot": (plan.get("payload") or {}).get("bot"),
+        "setup": (plan.get("payload") or {}).get("setup"),
+        "symbol": (plan.get("payload") or {}).get("symbol"),
+        "side": (plan.get("payload") or {}).get("side"),
         "plan": plan,
     }
 
