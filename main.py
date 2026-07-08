@@ -38665,7 +38665,7 @@ start_central_runtime_once()
 # - Não bloquear PAPER/READY/VERIFY.
 # - Não bloquear reduceOnly/fechamento/gestão.
 # ============================================================================
-REAL_PILOT_GUARD_V1_SAFE_VERSION = "2026-07-08-REAL-PILOT-GUARD-V1-CENTRAL-FINAL-WRAPPER"
+REAL_PILOT_GUARD_V1_SAFE_VERSION = "2026-07-08-REAL-PILOT-GUARD-V1.3-DIAGNOSTIC-TEXT-FIX"
 
 
 def _rpg_safe_now():
@@ -38945,12 +38945,19 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
     checks = []
 
     def add(code, ok, message, blocking=True, details=None):
-        item = {"code": code, "ok": bool(ok), "message": message, "blocking": bool(blocking), "details": details or {}}
+        ok_bool = bool(ok)
+        if isinstance(message, dict):
+            text = message.get("ok") if ok_bool else message.get("fail")
+            if not text:
+                text = message.get("message") or code
+        else:
+            text = message
+        item = {"code": code, "ok": ok_bool, "message": text, "blocking": bool(blocking), "details": details or {}}
         checks.append(item)
-        if blocking and not ok:
-            reasons.append(message)
-        elif (not blocking) and not ok:
-            warnings.append(message)
+        if blocking and not ok_bool:
+            reasons.append(text)
+        elif (not blocking) and not ok_bool:
+            warnings.append(text)
         return item
 
     if not applies:
@@ -38999,21 +39006,22 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
             "token_value_exposed": False,
         }
 
-    add("GUARD_ENABLED", cfg.get("guard_enabled"), "Real Pilot Guard V1.1 está desabilitado.")
-    add("REAL_PILOT_ENABLED", cfg.get("pilot_enabled"), "CENTRAL_REAL_PILOT_ENABLED/REAL_PILOT_ENABLED precisa estar true.")
-    add("CENTRAL_REAL_EXECUTION_ENABLED", cfg.get("central_real_execution_enabled"), "CENTRAL_REAL_EXECUTION_ENABLED precisa estar true.")
-    add("ENABLE_REAL_TRADING", cfg.get("enable_real_trading"), "ENABLE_REAL_TRADING precisa estar true.")
-    add("BROKER_DRY_RUN_FALSE", cfg.get("broker_dry_run") is False, "BROKER_DRY_RUN precisa estar false para piloto real.")
+    add("GUARD_ENABLED", cfg.get("guard_enabled"), {"ok": "Real Pilot Guard habilitado.", "fail": "Real Pilot Guard está desabilitado."})
+    add("REAL_PILOT_ENABLED", cfg.get("pilot_enabled"), {"ok": "CENTRAL_REAL_PILOT_ENABLED/REAL_PILOT_ENABLED=true.", "fail": "CENTRAL_REAL_PILOT_ENABLED/REAL_PILOT_ENABLED precisa estar true."})
+    add("CENTRAL_REAL_EXECUTION_ENABLED", cfg.get("central_real_execution_enabled"), {"ok": "CENTRAL_REAL_EXECUTION_ENABLED=true.", "fail": "CENTRAL_REAL_EXECUTION_ENABLED precisa estar true."})
+    add("ENABLE_REAL_TRADING", cfg.get("enable_real_trading"), {"ok": "ENABLE_REAL_TRADING=true.", "fail": "ENABLE_REAL_TRADING precisa estar true."})
+    add("BROKER_DRY_RUN_FALSE", cfg.get("broker_dry_run") is False, {"ok": "BROKER_DRY_RUN=false confirmado para piloto real.", "fail": "BROKER_DRY_RUN precisa estar false para piloto real."})
 
     allowed_bots = set(cfg.get("allowed_bots") or ["FALCON"])
-    add("BOT_ALLOWED", bot in allowed_bots, f"Bot {bot or 'N/A'} não está liberado para piloto real.", details={"allowed_bots": sorted(allowed_bots)})
+    add("BOT_ALLOWED", bot in allowed_bots, {"ok": f"Bot {bot or 'N/A'} liberado para piloto real.", "fail": f"Bot {bot or 'N/A'} não está liberado para piloto real."}, details={"allowed_bots": sorted(allowed_bots)})
 
     allowed_symbols = set(cfg.get("allowed_symbols") or ["*"])
     symbol_ok = ("*" in allowed_symbols) or (symbol in allowed_symbols)
-    add("SYMBOL_ALLOWED", symbol_ok, f"Símbolo {symbol or 'N/A'} não está liberado para piloto real.", details={"allowed_symbols": sorted(allowed_symbols)})
+    add("SYMBOL_ALLOWED", symbol_ok, {"ok": f"Símbolo {symbol or 'N/A'} liberado para piloto real.", "fail": f"Símbolo {symbol or 'N/A'} não está liberado para piloto real."}, details={"allowed_symbols": sorted(allowed_symbols)})
 
     max_notional = _rpg_safe_float(cfg.get("max_notional_usdt"), 20.0)
-    add("NOTIONAL_LIMIT", notional is not None and float(notional) <= float(max_notional), f"Notional {notional} USDT acima do limite do piloto {max_notional} USDT.", details={"notional_usdt": notional, "source": notional_source, "max_notional_usdt": max_notional})
+    notional_ok = notional is not None and float(notional) <= float(max_notional)
+    add("NOTIONAL_LIMIT", notional_ok, {"ok": f"Notional {notional} USDT dentro do limite do piloto {max_notional} USDT.", "fail": f"Notional {notional} USDT acima do limite do piloto {max_notional} USDT."}, details={"notional_usdt": notional, "source": notional_source, "max_notional_usdt": max_notional})
 
     counts = _rpg_safe_live_counts(payload)
     max_open = _rpg_safe_int(cfg.get("max_open_positions"), 1)
@@ -39022,7 +39030,7 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
     count_ok = effective_open is not None and effective_open < max_open and _rpg_safe_int(counts.get("unknown_open_count"), 0) == 0
     if effective_open is None and cfg.get("fail_closed"):
         count_ok = False
-    add("MAX_OPEN_REAL_POSITIONS", count_ok, f"Limite de posições reais do piloto atingido ou não confirmado: abertas={effective_open}, max={max_open}.", details={"counts": counts, "max_open_positions": max_open})
+    add("MAX_OPEN_REAL_POSITIONS", count_ok, {"ok": f"Capacidade disponível para nova posição real: abertas={effective_open}, max={max_open}.", "fail": f"Limite de posições reais do piloto atingido ou não confirmado: abertas={effective_open}, max={max_open}."}, details={"counts": counts, "max_open_positions": max_open})
 
     failed = [c for c in checks if c.get("blocking") and not c.get("ok")]
     allowed = len(failed) == 0
