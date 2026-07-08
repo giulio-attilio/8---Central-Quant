@@ -38520,6 +38520,133 @@ def turtle_risk_guard_text_route_v1():
     ]
     return {"text": "\n".join(lines)}, 200
 
+
+# ==============================================================================
+# TURTLE RISK GUARD CONNECTOR ROUTE V1.1 — CENTRAL PROXY
+# ==============================================================================
+
+def _turtle_connector_central_payload_v1_1():
+    """Expõe no app principal da Central o status do conector que mora em turtle.py.
+
+    O turtle.py possui seu próprio Flask app, mas no Render quem responde as URLs é
+    o Flask app principal do main.py. Por isso esta rota atua como proxy/diagnóstico
+    via LOADED_BOTS["TURTLE"].
+    """
+    turtle_module = None
+    try:
+        turtle_module = LOADED_BOTS.get("TURTLE")
+    except Exception:
+        turtle_module = None
+
+    base = {
+        "ok": False,
+        "module": "turtle_risk_guard_connector_central_route_v1_1",
+        "version": "2026-07-08-TURTLE-RISK-GUARD-CONNECTOR-CENTRAL-ROUTE-V1.1",
+        "generated_at": data_hora_sp_str(),
+        "central_route": True,
+        "turtle_bot_loaded": turtle_module is not None,
+        "turtle_load_error": None,
+        "env_gates": {
+            "ENABLE_TURTLE": os.environ.get("ENABLE_TURTLE"),
+            "ENABLE_TURTLE20": os.environ.get("ENABLE_TURTLE20"),
+            "ENABLE_TURTLE55": os.environ.get("ENABLE_TURTLE55"),
+            "TURTLE_ENABLED_SETUPS": os.environ.get("TURTLE_ENABLED_SETUPS"),
+            "TURTLE_RISK_GUARD_CONNECTOR_ENABLED": os.environ.get("TURTLE_RISK_GUARD_CONNECTOR_ENABLED"),
+            "TURTLE_RISK_GUARD_FAIL_CLOSED": os.environ.get("TURTLE_RISK_GUARD_FAIL_CLOSED"),
+        },
+        "notes": [
+            "Esta rota fica no main.py porque o Flask app do turtle.py não é o app público do Render.",
+            "O conector real roda dentro do turtle.py antes de salvar posição PAPER e antes de enviar Telegram.",
+        ],
+    }
+
+    try:
+        base["turtle_load_error"] = LOAD_ERRORS.get("TURTLE")
+    except Exception:
+        base["turtle_load_error"] = None
+
+    if turtle_module is None:
+        base["reason"] = "Turtle não carregado no LOADED_BOTS; confira ENABLE_TURTLE e erros em /bots ou /health."
+        return base
+
+    fn = getattr(turtle_module, "risk_guard_connector_payload", None)
+    if not callable(fn):
+        base["reason"] = "O turtle.py carregado não possui risk_guard_connector_payload(); arquivo do conector talvez não tenha sido deployado."
+        base["turtle_module_file"] = getattr(turtle_module, "__file__", None)
+        return base
+
+    try:
+        payload = fn()
+        if not isinstance(payload, dict):
+            payload = {"ok": False, "error": "risk_guard_connector_payload retornou payload inválido"}
+        payload.setdefault("ok", True)
+        payload["central_route"] = True
+        payload["central_route_version"] = base["version"]
+        payload["turtle_bot_loaded"] = True
+        payload["turtle_module_file"] = getattr(turtle_module, "__file__", None)
+        return payload
+    except Exception as exc:
+        base["reason"] = f"Erro ao chamar risk_guard_connector_payload(): {exc}"
+        base["turtle_module_file"] = getattr(turtle_module, "__file__", None)
+        return base
+
+
+def _turtle_connector_central_text_v1_1():
+    turtle_module = None
+    try:
+        turtle_module = LOADED_BOTS.get("TURTLE")
+    except Exception:
+        turtle_module = None
+
+    if turtle_module is not None:
+        text_fn = getattr(turtle_module, "risk_guard_connector_text", None)
+        if callable(text_fn):
+            try:
+                txt = text_fn()
+                if txt:
+                    return str(txt) + "\n\nFonte: main.py central proxy V1.1."
+            except Exception:
+                pass
+
+    payload = _turtle_connector_central_payload_v1_1()
+    env = payload.get("env_gates", {}) or {}
+    lines = [
+        "🐢 TURTLE RISK GUARD CONNECTOR V1 — CENTRAL PROXY",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅ ATIVO/ACESSÍVEL' if payload.get('ok') else '⚠️ NÃO CONFIRMADO'}",
+        f"Turtle carregado: {payload.get('turtle_bot_loaded')}",
+        f"Erro carga Turtle: {payload.get('turtle_load_error')}",
+        "",
+        "Env / setups:",
+        f"- ENABLE_TURTLE: {env.get('ENABLE_TURTLE')}",
+        f"- ENABLE_TURTLE20: {env.get('ENABLE_TURTLE20')}",
+        f"- ENABLE_TURTLE55: {env.get('ENABLE_TURTLE55')}",
+        f"- TURTLE_ENABLED_SETUPS: {env.get('TURTLE_ENABLED_SETUPS')}",
+        f"- TURTLE_RISK_GUARD_CONNECTOR_ENABLED: {env.get('TURTLE_RISK_GUARD_CONNECTOR_ENABLED')}",
+        f"- TURTLE_RISK_GUARD_FAIL_CLOSED: {env.get('TURTLE_RISK_GUARD_FAIL_CLOSED')}",
+    ]
+    if payload.get("reason"):
+        lines += ["", f"Motivo: {payload.get('reason')}"]
+    lines += ["", "Notas:"]
+    for note in payload.get("notes") or []:
+        lines.append(f"- {note}")
+    return "\n".join(lines)
+
+
+@app.route("/riskguardconnector")
+@app.route("/turtle/riskguardconnector")
+@app.route("/turtle/risk/guard/connector")
+def turtle_risk_guard_connector_central_route_v1_1():
+    payload = _turtle_connector_central_payload_v1_1()
+    return payload, 200
+
+
+@app.route("/riskguardconnector/text")
+@app.route("/turtle/riskguardconnector/text")
+@app.route("/turtle/risk/guard/connector/text")
+def turtle_risk_guard_connector_central_text_route_v1_1():
+    return {"text": _turtle_connector_central_text_v1_1()}, 200
+
 start_central_runtime_once()
 
 if __name__ == "__main__":
