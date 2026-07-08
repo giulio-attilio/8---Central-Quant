@@ -14279,6 +14279,442 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
     policy_payload["source"] = policy_payload.get("source") or "executive_decision_engine_fallback"
     return policy_payload
 
+
+# ==============================================================================
+# TURTLE RISK GUARD V1 — CENTRAL QUANT
+# ==============================================================================
+TURTLE_RISK_GUARD_VERSION = "2026-07-08-TURTLE-RISK-GUARD-V1"
+TURTLE_RISK_GUARD_ENABLED = str(os.environ.get("TURTLE_RISK_GUARD_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+TURTLE_RISK_GUARD_BLOCK_TURTLE55_SHORT = str(os.environ.get("TURTLE_RISK_GUARD_BLOCK_TURTLE55_SHORT", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+TURTLE_RISK_GUARD_BLOCK_NEG_EXPECTANCY = str(os.environ.get("TURTLE_RISK_GUARD_BLOCK_NEG_EXPECTANCY", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+TURTLE_RISK_GUARD_BLOCK_OBSERVATION_ONLY = str(os.environ.get("TURTLE_RISK_GUARD_BLOCK_OBSERVATION_ONLY", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY = int(os.environ.get("TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY", "8"))
+TURTLE_RISK_GUARD_MAX_CONSECUTIVE_STOPS_DAY = int(os.environ.get("TURTLE_RISK_GUARD_MAX_CONSECUTIVE_STOPS_DAY", "5"))
+TURTLE_RISK_GUARD_PF_R_OBSERVATION_THRESHOLD = float(os.environ.get("TURTLE_RISK_GUARD_PF_R_OBSERVATION_THRESHOLD", "1.0"))
+TURTLE_RISK_GUARD_HISTORY_LIMIT = int(os.environ.get("TURTLE_RISK_GUARD_HISTORY_LIMIT", "6000"))
+TURTLE_RISK_GUARD_DEFAULT_SETUPS = ["TURTLE20", "TURTLE55"]
+TURTLE_RISK_GUARD_DEFAULT_SIDES = ["LONG", "SHORT"]
+
+
+def _trg_v1_bool_env(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
+def _trg_v1_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _trg_v1_normalize_setup(value):
+    raw = str(value or "").upper().strip().replace(" ", "_").replace("-", "_")
+    if not raw:
+        return "UNKNOWN"
+    compact = raw.replace("_", "")
+    if "55" in compact:
+        return "TURTLE55"
+    if "20" in compact:
+        return "TURTLE20"
+    if compact in {"TURTLE", "TURTLEBREAKOUT", "TURTLEBREAKOUTPRO"}:
+        return "TURTLE"
+    return compact
+
+
+def _trg_v1_normalize_side(value):
+    side = str(value or "").upper().strip()
+    if side == "BUY":
+        return "LONG"
+    if side == "SELL":
+        return "SHORT"
+    return side or "UNKNOWN"
+
+
+def _trg_v1_event_bot(ev):
+    if not isinstance(ev, dict):
+        return ""
+    raw = ev.get("bot") or ev.get("robot") or ev.get("bot_name") or ev.get("source") or ""
+    text = str(raw or "").upper()
+    if "TURTLE" in text:
+        return "TURTLE"
+    return normalize_registry_bot(raw) if "normalize_registry_bot" in globals() else text.strip()
+
+
+def _trg_v1_event_setup(ev):
+    if not isinstance(ev, dict):
+        return "UNKNOWN"
+    return _trg_v1_normalize_setup(
+        ev.get("setup")
+        or ev.get("signal_type")
+        or ev.get("strategy")
+        or ev.get("setup_label")
+        or ev.get("system")
+        or ""
+    )
+
+
+def _trg_v1_event_side(ev):
+    if not isinstance(ev, dict):
+        return "UNKNOWN"
+    return _trg_v1_normalize_side(ev.get("side") or ev.get("direction") or ev.get("signal") or "")
+
+
+def _trg_v1_event_type(ev):
+    if not isinstance(ev, dict):
+        return ""
+    return str(ev.get("event_type") or ev.get("event") or ev.get("type") or ev.get("status") or "").upper()
+
+
+def _trg_v1_event_epoch(ev):
+    if not isinstance(ev, dict):
+        return None
+    for key in ("epoch", "timestamp", "ts_epoch", "created_epoch", "closed_epoch"):
+        try:
+            val = ev.get(key)
+            if val is None:
+                continue
+            f = float(val)
+            # Alguns timestamps de candle vêm em ms.
+            if f > 10_000_000_000:
+                f = f / 1000.0
+            return f
+        except Exception:
+            continue
+    return None
+
+
+def _trg_v1_today_key():
+    try:
+        return agora_sp().strftime("%d/%m/%Y")
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y")
+
+
+def _trg_v1_is_today(ev):
+    epoch = _trg_v1_event_epoch(ev)
+    try:
+        if epoch is not None:
+            dt = datetime.fromtimestamp(epoch, timezone(timedelta(hours=-3)))
+            return dt.strftime("%d/%m/%Y") == _trg_v1_today_key()
+    except Exception:
+        pass
+    text = " ".join(str(ev.get(k) or "") for k in ("ts", "created_at", "closed_at", "datetime", "date") if isinstance(ev, dict))
+    return _trg_v1_today_key() in text or data_hoje_sp_str() in text if "data_hoje_sp_str" in globals() else False
+
+
+def _trg_v1_is_closed_event(ev):
+    et = _trg_v1_event_type(ev)
+    if any(x in et for x in ("CLOSE", "CLOSED", "TRADE_CLOSED", "STOP", "SL", "TP", "BE")):
+        return True
+    if isinstance(ev, dict) and any(ev.get(k) is not None for k in ("result_r", "pnl_r", "result_pct", "pnl_pct", "exit_price")):
+        return True
+    return False
+
+
+def _trg_v1_is_stop_event(ev):
+    if not isinstance(ev, dict):
+        return False
+    hay = " ".join(str(ev.get(k) or "") for k in ("event", "event_type", "type", "status", "reason", "exit_reason", "result") ).upper()
+    if "STOP" in hay or "SL" in hay or "LOSS" in hay:
+        return True
+    rr = ev.get("result_r") if ev.get("result_r") is not None else ev.get("pnl_r")
+    if rr is not None:
+        return _trg_v1_float(rr, 0.0) < 0
+    pct = ev.get("result_pct") if ev.get("result_pct") is not None else ev.get("pnl_pct")
+    if pct is not None:
+        return _trg_v1_float(pct, 0.0) < 0
+    return False
+
+
+def _trg_v1_event_result_r(ev):
+    if not isinstance(ev, dict):
+        return None
+    for key in ("result_r", "pnl_r", "r", "r_result"):
+        if ev.get(key) is not None:
+            try:
+                return float(ev.get(key))
+            except Exception:
+                pass
+    # Fallback: se só houver result_pct e risk_pct, aproxima R.
+    pct = ev.get("result_pct") if ev.get("result_pct") is not None else ev.get("pnl_pct")
+    risk = ev.get("risk_pct") or ev.get("risk")
+    try:
+        pct_f = float(pct)
+        risk_f = abs(float(risk))
+        if risk_f > 0:
+            return pct_f / risk_f
+    except Exception:
+        pass
+    return None
+
+
+def _trg_v1_load_history_events(limit=None):
+    limit = int(limit or TURTLE_RISK_GUARD_HISTORY_LIMIT)
+    events = []
+    try:
+        import history_manager as _trg_history_manager
+        if hasattr(_trg_history_manager, "load_events"):
+            loaded = _trg_history_manager.load_events(limit=limit)
+            if isinstance(loaded, list):
+                events.extend(loaded)
+    except Exception:
+        pass
+    if events:
+        return events[-limit:]
+    candidate_paths = []
+    try:
+        candidate_paths.append(Path(getattr(super_history_manager, "HISTORY_EVENTS_FILE", CENTRAL_DATA_DIR / "history_events.jsonl")))
+    except Exception:
+        pass
+    try:
+        candidate_paths.extend([
+            Path(CENTRAL_DATA_DIR) / "history_events.jsonl",
+            Path(CENTRAL_DATA_DIR) / "history_export.jsonl",
+            Path("daily_history") / "history_events.jsonl",
+        ])
+    except Exception:
+        pass
+    seen_paths = []
+    for path in candidate_paths:
+        try:
+            if path in seen_paths:
+                continue
+            seen_paths.append(path)
+            if path.exists():
+                events.extend(_read_jsonl_tail(path, limit=limit) if "_read_jsonl_tail" in globals() else [])
+        except Exception:
+            continue
+    return events[-limit:]
+
+
+def _trg_v1_filter_turtle_events(events, setup=None, side=None, closed_only=False):
+    setup_n = _trg_v1_normalize_setup(setup) if setup else None
+    side_n = _trg_v1_normalize_side(side) if side else None
+    out = []
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        if _trg_v1_event_bot(ev) != "TURTLE":
+            continue
+        ev_setup = _trg_v1_event_setup(ev)
+        ev_side = _trg_v1_event_side(ev)
+        if setup_n and ev_setup not in {setup_n, "TURTLE"}:
+            continue
+        if side_n and ev_side not in {side_n, "UNKNOWN"}:
+            continue
+        if closed_only and not _trg_v1_is_closed_event(ev):
+            continue
+        out.append(ev)
+    return out
+
+
+def _trg_v1_stats_for(setup=None, side=None, events=None):
+    events = events if events is not None else _trg_v1_load_history_events()
+    rows = _trg_v1_filter_turtle_events(events, setup=setup, side=side, closed_only=True)
+    r_values = []
+    for ev in rows:
+        rr = _trg_v1_event_result_r(ev)
+        if rr is not None:
+            r_values.append(float(rr))
+    wins = len([x for x in r_values if x > 0])
+    losses = len([x for x in r_values if x < 0])
+    be = len([x for x in r_values if x == 0])
+    gross_win = sum(x for x in r_values if x > 0)
+    gross_loss = abs(sum(x for x in r_values if x < 0))
+    pf_r = 999.0 if gross_win > 0 and gross_loss == 0 else (gross_win / gross_loss if gross_loss > 0 else 0.0)
+    expectancy_r = (sum(r_values) / len(r_values)) if r_values else None
+
+    today_rows = [ev for ev in rows if _trg_v1_is_today(ev)]
+    today_stop_rows = [ev for ev in today_rows if _trg_v1_is_stop_event(ev)]
+    today_sorted = sorted(today_rows, key=lambda e: _trg_v1_event_epoch(e) or 0)
+    consecutive_stops = 0
+    for ev in reversed(today_sorted):
+        if _trg_v1_is_stop_event(ev):
+            consecutive_stops += 1
+        else:
+            break
+
+    return {
+        "setup": _trg_v1_normalize_setup(setup) if setup else "ALL",
+        "side": _trg_v1_normalize_side(side) if side else "ALL",
+        "trades": len(rows),
+        "r_sample": len(r_values),
+        "wins": wins,
+        "losses": losses,
+        "breakeven": be,
+        "expectancy_r": round(expectancy_r, 4) if expectancy_r is not None else None,
+        "profit_factor_r": round(pf_r, 4),
+        "gross_win_r": round(gross_win, 4),
+        "gross_loss_r": round(gross_loss, 4),
+        "today_closed": len(today_rows),
+        "today_stops": len(today_stop_rows),
+        "consecutive_stops_today": consecutive_stops,
+    }
+
+
+def _trg_v1_evaluate(payload, bot=None, setup=None, side=None, reduce_only=False):
+    bot_n = normalize_registry_bot(bot or (payload or {}).get("bot") or "") if "normalize_registry_bot" in globals() else str(bot or "").upper()
+    if bot_n != "TURTLE":
+        return {"applies": False, "enabled": TURTLE_RISK_GUARD_ENABLED, "version": TURTLE_RISK_GUARD_VERSION}
+
+    setup_n = _trg_v1_normalize_setup(setup or (payload or {}).get("setup") or (payload or {}).get("signal_type") or (payload or {}).get("strategy"))
+    side_n = _trg_v1_normalize_side(side or (payload or {}).get("side") or (payload or {}).get("direction") or (payload or {}).get("signal"))
+
+    if reduce_only:
+        return {
+            "applies": True,
+            "enabled": TURTLE_RISK_GUARD_ENABLED,
+            "version": TURTLE_RISK_GUARD_VERSION,
+            "allowed": True,
+            "decision": "ALLOW_REDUCE_ONLY",
+            "setup": setup_n,
+            "side": side_n,
+            "reasons": [],
+            "warnings": ["Turtle Risk Guard não bloqueia reduceOnly/fechamento."],
+        }
+
+    if not TURTLE_RISK_GUARD_ENABLED:
+        return {
+            "applies": True,
+            "enabled": False,
+            "version": TURTLE_RISK_GUARD_VERSION,
+            "allowed": True,
+            "decision": "DISABLED",
+            "setup": setup_n,
+            "side": side_n,
+            "reasons": [],
+            "warnings": ["TURTLE_RISK_GUARD_ENABLED=false"],
+        }
+
+    events = _trg_v1_load_history_events()
+    setup_side_stats = _trg_v1_stats_for(setup=setup_n, side=side_n, events=events)
+    setup_stats = _trg_v1_stats_for(setup=setup_n, side=None, events=events)
+    side_stats = _trg_v1_stats_for(setup=None, side=side_n, events=events)
+
+    reasons = []
+    warnings = []
+    actions = []
+
+    if TURTLE_RISK_GUARD_BLOCK_TURTLE55_SHORT and setup_n == "TURTLE55" and side_n == "SHORT":
+        reasons.append("Turtle Risk Guard V1: Turtle55 SHORT bloqueado após avaliação diária negativa.")
+        actions.append("BLOCK_TURTLE55_SHORT")
+
+    if setup_side_stats.get("consecutive_stops_today", 0) >= TURTLE_RISK_GUARD_MAX_CONSECUTIVE_STOPS_DAY:
+        reasons.append(
+            f"Turtle Risk Guard V1: {setup_n} {side_n} atingiu {setup_side_stats.get('consecutive_stops_today')} stops consecutivos hoje."
+        )
+        actions.append("BLOCK_DAILY_STOP_STREAK")
+
+    exp = setup_side_stats.get("expectancy_r")
+    if (
+        TURTLE_RISK_GUARD_BLOCK_NEG_EXPECTANCY
+        and setup_side_stats.get("r_sample", 0) >= TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY
+        and exp is not None
+        and float(exp) < 0
+    ):
+        reasons.append(
+            f"Turtle Risk Guard V1: expectancy negativa em {setup_n} {side_n}: {exp}R com amostra {setup_side_stats.get('r_sample')}."
+        )
+        actions.append("BLOCK_NEGATIVE_EXPECTANCY")
+    elif setup_side_stats.get("r_sample", 0) < TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY:
+        warnings.append(
+            f"Turtle Risk Guard V1: amostra ainda baixa para {setup_n} {side_n}: {setup_side_stats.get('r_sample')}/{TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY}."
+        )
+
+    pf_r = _trg_v1_float(setup_side_stats.get("profit_factor_r"), 0.0)
+    if setup_side_stats.get("r_sample", 0) >= TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY and pf_r < TURTLE_RISK_GUARD_PF_R_OBSERVATION_THRESHOLD:
+        msg = (
+            f"Turtle Risk Guard V1: {setup_n} {side_n} em OBSERVATION_ONLY; "
+            f"PF R {pf_r:.2f} < {TURTLE_RISK_GUARD_PF_R_OBSERVATION_THRESHOLD:.2f}."
+        )
+        if TURTLE_RISK_GUARD_BLOCK_OBSERVATION_ONLY:
+            reasons.append(msg)
+            actions.append("BLOCK_OBSERVATION_ONLY")
+        else:
+            warnings.append(msg)
+            actions.append("WARN_OBSERVATION_ONLY")
+
+    if not reasons:
+        warnings.append(
+            f"Turtle Risk Guard V1: {setup_n} {side_n} sem hard block específico nesta chamada."
+        )
+
+    return {
+        "applies": True,
+        "enabled": True,
+        "version": TURTLE_RISK_GUARD_VERSION,
+        "allowed": len(reasons) == 0,
+        "decision": "ALLOW" if len(reasons) == 0 else "DENY",
+        "setup": setup_n,
+        "side": side_n,
+        "actions": actions,
+        "reasons": reasons,
+        "warnings": warnings,
+        "stats": {
+            "setup_side": setup_side_stats,
+            "setup": setup_stats,
+            "side": side_stats,
+        },
+        "config": {
+            "block_turtle55_short": TURTLE_RISK_GUARD_BLOCK_TURTLE55_SHORT,
+            "min_trades_for_expectancy": TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY,
+            "block_negative_expectancy": TURTLE_RISK_GUARD_BLOCK_NEG_EXPECTANCY,
+            "max_consecutive_stops_day": TURTLE_RISK_GUARD_MAX_CONSECUTIVE_STOPS_DAY,
+            "pf_r_observation_threshold": TURTLE_RISK_GUARD_PF_R_OBSERVATION_THRESHOLD,
+            "block_observation_only": TURTLE_RISK_GUARD_BLOCK_OBSERVATION_ONLY,
+            "history_limit": TURTLE_RISK_GUARD_HISTORY_LIMIT,
+        },
+    }
+
+
+def _trg_v1_dashboard_payload():
+    events = _trg_v1_load_history_events()
+    rows = []
+    for setup in TURTLE_RISK_GUARD_DEFAULT_SETUPS:
+        for side in TURTLE_RISK_GUARD_DEFAULT_SIDES:
+            fake = {"bot": "TURTLE", "setup": setup, "side": side}
+            eval_payload = _trg_v1_evaluate(fake, bot="TURTLE", setup=setup, side=side, reduce_only=False)
+            rows.append({
+                "setup": setup,
+                "side": side,
+                "decision": eval_payload.get("decision"),
+                "allowed": eval_payload.get("allowed"),
+                "actions": eval_payload.get("actions"),
+                "reasons": eval_payload.get("reasons"),
+                "warnings": eval_payload.get("warnings"),
+                "stats": (eval_payload.get("stats") or {}).get("setup_side"),
+            })
+    return {
+        "ok": True,
+        "module": "turtle_risk_guard_v1",
+        "version": TURTLE_RISK_GUARD_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "enabled": TURTLE_RISK_GUARD_ENABLED,
+        "events_loaded": len(events),
+        "config": {
+            "block_turtle55_short": TURTLE_RISK_GUARD_BLOCK_TURTLE55_SHORT,
+            "min_trades_for_expectancy": TURTLE_RISK_GUARD_MIN_TRADES_FOR_EXPECTANCY,
+            "block_negative_expectancy": TURTLE_RISK_GUARD_BLOCK_NEG_EXPECTANCY,
+            "max_consecutive_stops_day": TURTLE_RISK_GUARD_MAX_CONSECUTIVE_STOPS_DAY,
+            "pf_r_observation_threshold": TURTLE_RISK_GUARD_PF_R_OBSERVATION_THRESHOLD,
+            "block_observation_only": TURTLE_RISK_GUARD_BLOCK_OBSERVATION_ONLY,
+            "history_limit": TURTLE_RISK_GUARD_HISTORY_LIMIT,
+        },
+        "rows": rows,
+        "notes": [
+            "V1 separa Turtle20/Turtle55 e LONG/SHORT.",
+            "Bloqueia Turtle55 SHORT por padrão após avaliação diária ruim.",
+            "Também bloqueia expectancy negativa com amostra mínima, streak de stops no dia e PF R abaixo de 1 em modo observation-only.",
+            "Não bloqueia reduceOnly/fechamentos.",
+        ],
+    }
+
+
 def can_open_trade_decision(payload: dict):
     """
     Risk Manager decisório da Central.
@@ -14377,6 +14813,7 @@ def can_open_trade_decision(payload: dict):
     reasons = []
     warnings = []
     executive_policy_payload = None
+    turtle_risk_guard_payload = {"applies": False, "enabled": TURTLE_RISK_GUARD_ENABLED, "version": TURTLE_RISK_GUARD_VERSION}
 
     if reduce_only and GLOBAL_RISK_ALLOW_REDUCE_ONLY:
         decision_result = {
@@ -14391,6 +14828,7 @@ def can_open_trade_decision(payload: dict):
             "reasons": [],
             "warnings": ["reduceOnly/fechamento permitido mesmo com travas de risco"],
             "executive_policy": _executive_policy_for_can_open_trade(),
+            "turtle_risk_guard": _trg_v1_evaluate(payload, bot=bot, setup=payload.get("setup") or payload.get("signal_type") or payload.get("strategy"), side=side, reduce_only=True),
             "memory": memory_risk,
             "exposure": {
                 "total": risk_total_pos,
@@ -14446,6 +14884,20 @@ def can_open_trade_decision(payload: dict):
         "setup": payload.get("setup") or payload.get("signal_type") or payload.get("strategy"),
         "category": payload.get("category") or payload.get("bot_category"),
     }, reasons, warnings)
+
+    # Turtle Risk Guard V1 — trava específica do Turtle definida pela avaliação diária dos bots.
+    turtle_risk_guard_payload = _trg_v1_evaluate(
+        payload,
+        bot=bot,
+        setup=payload.get("setup") or payload.get("signal_type") or payload.get("strategy"),
+        side=side,
+        reduce_only=reduce_only,
+    )
+    if turtle_risk_guard_payload.get("applies"):
+        for _reason in turtle_risk_guard_payload.get("reasons") or []:
+            reasons.append(str(_reason))
+        for _warning in turtle_risk_guard_payload.get("warnings") or []:
+            warnings.append(str(_warning))
 
     # Hard blocks globais da Central, valem para PAPER/VERIFY/LIVE.
     if memory_risk.get("blocked"):
@@ -14545,6 +14997,7 @@ def can_open_trade_decision(payload: dict):
         "reasons": reasons,
         "warnings": warnings,
         "executive_policy": executive_policy_payload,
+        "turtle_risk_guard": turtle_risk_guard_payload,
         "bingx_divergence": divergence_warning,
         "memory": memory_risk,
         "exposure": {
@@ -38017,6 +38470,55 @@ def live_classified_route_v11():
             "FALCON-VERIFY é exibido como validação autorizada e segura quando sent=False.",
         ],
     }, 200
+
+
+@app.route("/turtleriskguard")
+@app.route("/turtle/riskguard")
+@app.route("/turtle/risk/guard")
+def turtle_risk_guard_route_v1():
+    payload = _trg_v1_dashboard_payload()
+    return payload, 200
+
+
+@app.route("/turtleriskguard/text")
+@app.route("/turtle/riskguard/text")
+def turtle_risk_guard_text_route_v1():
+    payload = _trg_v1_dashboard_payload()
+    lines = [
+        "🐢 TURTLE RISK GUARD V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅ ATIVO' if payload.get('enabled') else '⚪ DESATIVADO'}",
+        f"Eventos lidos: {payload.get('events_loaded')}",
+        "",
+        "Regras V1:",
+        f"- Bloquear Turtle55 SHORT: {payload.get('config', {}).get('block_turtle55_short')}",
+        f"- Bloquear expectancy negativa após amostra mínima: {payload.get('config', {}).get('block_negative_expectancy')} | min={payload.get('config', {}).get('min_trades_for_expectancy')}",
+        f"- Bloquear após stops consecutivos no dia: {payload.get('config', {}).get('max_consecutive_stops_day')}",
+        f"- Observation-only quando PF R < {payload.get('config', {}).get('pf_r_observation_threshold')}: block={payload.get('config', {}).get('block_observation_only')}",
+        "",
+        "Decisões por setup/lado:",
+    ]
+    for row in payload.get("rows") or []:
+        stats = row.get("stats") or {}
+        decision = "ALLOW" if row.get("allowed") else "DENY"
+        lines.append(
+            f"- {row.get('setup')} {row.get('side')}: {decision} | "
+            f"trades={stats.get('trades')} | exp={stats.get('expectancy_r')}R | "
+            f"PF_R={stats.get('profit_factor_r')} | stops_hoje={stats.get('today_stops')} | "
+            f"streak={stats.get('consecutive_stops_today')}"
+        )
+        for reason in row.get("reasons") or []:
+            lines.append(f"  motivo: {reason}")
+        for warning in row.get("warnings") or []:
+            lines.append(f"  aviso: {warning}")
+    lines += [
+        "",
+        "Notas:",
+        "- O guard é aplicado dentro do /can_open_trade para entradas Turtle.",
+        "- Fechamentos/reduceOnly não são bloqueados.",
+        "- Se o turtle.py ainda não consultar /can_open_trade, envie o arquivo Turtle para ligar o guard no robô também.",
+    ]
+    return {"text": "\n".join(lines)}, 200
 
 start_central_runtime_once()
 
