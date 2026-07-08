@@ -1382,6 +1382,8 @@ def execute_signal_if_allowed(sig, positions=None):
                     notional_usdt=FALCON_REAL_NOTIONAL_USDT,
                     reduce_only=False,
                     client_tag=f"FALCON-VERIFY-{sig.get('setup')}-{int(time.time())}",
+                    bot="FALCON",
+                    stop_loss_price=sig.get("stop"),
                 )
                 sig["verify_order"] = verify_order
             except Exception as exc:
@@ -1411,12 +1413,48 @@ def execute_signal_if_allowed(sig, positions=None):
         return False, decision
 
     try:
+        client_tag = f"FALCON-LIVE-{sig.get('setup')}-{int(time.time())}"
+        execution_auth_token = None
+        execution_auth_result = None
+        if hasattr(central_broker, "issue_execution_auth_token"):
+            execution_auth_result = central_broker.issue_execution_auth_token(
+                context={
+                    "bot": "FALCON",
+                    "setup": sig.get("setup"),
+                    "symbol": sig.get("symbol"),
+                    "side": sig.get("side"),
+                    "notional_usdt": FALCON_REAL_NOTIONAL_USDT,
+                    "client_tag": client_tag,
+                    "stop_loss_price": sig.get("stop"),
+                    "source": "falcon_real_pilot_connector_v1",
+                }
+            )
+            if isinstance(execution_auth_result, dict) and execution_auth_result.get("ok"):
+                execution_auth_token = execution_auth_result.get("token")
+        else:
+            execution_auth_result = {"ok": False, "status": "BROKER_AUTH_TOKEN_FUNCTION_MISSING"}
+
+        if not execution_auth_token:
+            decision = {
+                "allowed": False,
+                "decision": "DENY",
+                "reasons": [f"Falcon Real Pilot Connector: token efêmero ausente: {execution_auth_result.get('status') if isinstance(execution_auth_result, dict) else execution_auth_result}"],
+                "warnings": [],
+            }
+            sig["execution_decision"] = decision
+            HEALTH["last_execution_decision"] = decision
+            HEALTH["last_execution_order"] = {"mode": mode, "sent": False, "auth": execution_auth_result}
+            return False, decision
+
         order = central_broker.place_market_order(
             symbol=sig.get("symbol"),
             side=sig.get("side"),
             notional_usdt=FALCON_REAL_NOTIONAL_USDT,
             reduce_only=False,
-            client_tag=f"FALCON-{sig.get('setup')}-{int(time.time())}",
+            client_tag=client_tag,
+            bot="FALCON",
+            execution_auth_token=execution_auth_token,
+            stop_loss_price=sig.get("stop"),
         )
         sig["live_order"] = order
         sig["live_order_id"] = order.get("id") or order.get("order_id")

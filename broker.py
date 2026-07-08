@@ -97,6 +97,38 @@ BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS = {
 }
 BROKER_AUTO_PREVIEW_FIREWALL_STATUS = os.environ.get("BROKER_AUTO_PREVIEW_FIREWALL_STATUS", "AUTO_BROKER_PREVIEW_BLOCKED").strip().upper()
 
+
+# Real Pilot Guard V1 — trava final no broker antes de create_order().
+# Mesmo que algum robô chame broker.place_market_order direto, o envio real só passa
+# se o piloto real estiver armado, o bot estiver na whitelist e o tamanho estiver dentro do limite.
+BROKER_REAL_PILOT_GUARD_ENABLED = env_bool("BROKER_REAL_PILOT_GUARD_ENABLED", env_bool("CENTRAL_REAL_PILOT_GUARD_ENABLED", True))
+BROKER_REAL_PILOT_FAIL_CLOSED = env_bool("BROKER_REAL_PILOT_FAIL_CLOSED", True)
+BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS = env_bool("BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS", True)
+BROKER_REAL_PILOT_ALLOWED_BOTS = {
+    x.strip().upper()
+    for x in os.environ.get(
+        "BROKER_REAL_PILOT_ALLOWED_BOTS",
+        os.environ.get("CENTRAL_REAL_PILOT_ALLOWED_BOTS", os.environ.get("REAL_PILOT_ALLOWED_BOTS", "FALCON")),
+    ).split(",")
+    if x.strip()
+}
+BROKER_REAL_PILOT_ALLOWED_SYMBOLS = {
+    x.strip().upper().replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "").replace("-", "")
+    for x in os.environ.get(
+        "BROKER_REAL_PILOT_ALLOWED_SYMBOLS",
+        os.environ.get("CENTRAL_REAL_PILOT_ALLOWED_SYMBOLS", os.environ.get("REAL_PILOT_ALLOWED_SYMBOLS", "*")),
+    ).split(",")
+    if x.strip()
+}
+BROKER_REAL_PILOT_MAX_NOTIONAL_USDT = float(os.environ.get(
+    "BROKER_REAL_PILOT_MAX_NOTIONAL_USDT",
+    os.environ.get("CENTRAL_REAL_PILOT_MAX_NOTIONAL_USDT", os.environ.get("REAL_PILOT_MAX_NOTIONAL_USDT", "20")),
+))
+BROKER_REAL_PILOT_MAX_OPEN_POSITIONS = int(float(os.environ.get(
+    "BROKER_REAL_PILOT_MAX_OPEN_POSITIONS",
+    os.environ.get("CENTRAL_REAL_PILOT_MAX_OPEN_POSITIONS", os.environ.get("REAL_PILOT_MAX_OPEN_POSITIONS", "1")),
+)))
+
 # Hedge Mode:
 # - AUTO/true: envia positionSide=LONG/SHORT nas ordens.
 # - false/oneway: não envia positionSide.
@@ -1146,7 +1178,7 @@ def broker_preview_firewall_health(limit: int = 20):
     """Status leve do Automatic Broker Preview Firewall."""
     blocked_recent = []
     try:
-        rows = get_execution_audit_log(limit=max(1, min(int(limit), 100))).get("items") or []
+        rows = get_execution_audit_log(limit=max(1, min(int(limit), 100))) or []
         for item in rows:
             if isinstance(item, dict) and str(item.get("event") or "").upper() == BROKER_AUTO_PREVIEW_FIREWALL_STATUS:
                 blocked_recent.append(item)
@@ -1192,6 +1224,141 @@ def _automatic_broker_preview_firewall(*, sym, side, bot, client_tag, live_send_
         "side": side,
         "client_tag": client_tag,
         "blocked_bots": sorted(BROKER_BLOCK_AUTOMATIC_PREVIEW_BOTS),
+    }
+
+
+def _broker_rpg_v1_bool_env(names, default=False):
+    for name in names:
+        try:
+            if name in os.environ:
+                return env_bool(name, default), name
+        except Exception:
+            pass
+    return bool(default), None
+
+
+def _broker_rpg_v1_norm_symbol(value):
+    return str(value or "").upper().strip().replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "").replace("-", "").replace("/", "")
+
+
+def _broker_rpg_v1_open_positions_count():
+    try:
+        positions = get_positions() or []
+    except Exception as exc:
+        return {"ok": False, "count": None, "error": str(exc), "positions_checked": False}
+    open_items = []
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        info = p.get("info") if isinstance(p.get("info"), dict) else {}
+        candidates = [
+            p.get("contracts"), p.get("contractSize"), p.get("positionAmt"), p.get("notional"), p.get("positionValue"),
+            info.get("positionAmt"), info.get("positionValue"), info.get("availableAmt"), info.get("size"),
+        ]
+        found = False
+        for value in candidates:
+            try:
+                if value is not None and abs(float(value)) > 0:
+                    found = True
+                    break
+            except Exception:
+                continue
+        if found:
+            open_items.append({
+                "symbol": p.get("symbol") or info.get("symbol"),
+                "side": p.get("side") or info.get("positionSide"),
+                "contracts": p.get("contracts") or info.get("positionAmt"),
+                "notional": p.get("notional") or p.get("positionValue") or info.get("positionValue"),
+            })
+    return {"ok": True, "count": len(open_items), "open_items": open_items[:10], "positions_checked": True}
+
+
+def broker_real_pilot_guard_v1_validate(*, symbol, side, bot=None, notional_usdt=None, preview=None, reduce_only=False, live_send_enabled=False, client_tag=None):
+    pilot_enabled, pilot_source = _broker_rpg_v1_bool_env([
+        "CENTRAL_REAL_PILOT_ENABLED", "REAL_PILOT_ENABLED", "EXECUTION_REAL_PILOT_ENABLED", "BINGX_REAL_PILOT_ENABLED"
+    ], False)
+    central_real_enabled, central_real_source = _broker_rpg_v1_bool_env([
+        "CENTRAL_REAL_EXECUTION_ENABLED", "REAL_EXECUTION_ENABLED", "EXECUTION_REAL_ENABLED", "ENABLE_REAL_EXECUTION"
+    ], False)
+    bot_key = _infer_bot_for_audit(bot=bot, client_tag=client_tag)
+    symbol_key = _broker_rpg_v1_norm_symbol(symbol)
+    preview = preview if isinstance(preview, dict) else {}
+    effective_notional = round_float(
+        preview.get("actual_exposure_usdt")
+        or preview.get("effective_notional_usdt")
+        or preview.get("notional_usdt")
+        or notional_usdt,
+        8,
+        None,
+    )
+    checks = []
+    reasons = []
+
+    def add(code, ok, message, details=None):
+        item = {"code": code, "ok": bool(ok), "message": message, "details": details or {}}
+        checks.append(item)
+        if not ok:
+            reasons.append(message)
+        return item
+
+    if not live_send_enabled:
+        return {
+            "ok": True,
+            "allowed": True,
+            "applies": False,
+            "status": "BROKER_REAL_PILOT_GUARD_NOT_APPLICABLE",
+            "version": "2026-07-08-BROKER-REAL-PILOT-GUARD-V1",
+            "reason": "live_send_enabled=false; broker ficará em preview/dry-run",
+        }
+
+    if reduce_only and BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS:
+        return {
+            "ok": True,
+            "allowed": True,
+            "applies": True,
+            "status": "BROKER_REAL_PILOT_REDUCE_ONLY_ALLOWED",
+            "version": "2026-07-08-BROKER-REAL-PILOT-GUARD-V1",
+            "bot": bot_key,
+            "symbol": symbol_key,
+            "reduce_only": True,
+            "reasons": [],
+            "checks": [],
+        }
+
+    add("BROKER_REAL_PILOT_GUARD_ENABLED", BROKER_REAL_PILOT_GUARD_ENABLED, "BROKER_REAL_PILOT_GUARD_ENABLED=false")
+    add("CENTRAL_REAL_PILOT_ENABLED", pilot_enabled, "CENTRAL_REAL_PILOT_ENABLED/REAL_PILOT_ENABLED precisa estar true", {"source": pilot_source})
+    add("CENTRAL_REAL_EXECUTION_ENABLED", central_real_enabled, "CENTRAL_REAL_EXECUTION_ENABLED precisa estar true", {"source": central_real_source})
+    add("ENABLE_REAL_TRADING", ENABLE_REAL_TRADING is True, "ENABLE_REAL_TRADING precisa estar true")
+    add("BROKER_DRY_RUN_FALSE", BROKER_DRY_RUN is False, "BROKER_DRY_RUN precisa estar false")
+    add("EXECUTION_MODE_LIVE", EXECUTION_MODE == "LIVE", "EXECUTION_MODE precisa estar LIVE")
+    add("BOT_ALLOWED", bot_key in BROKER_REAL_PILOT_ALLOWED_BOTS, f"Bot {bot_key} não está liberado no broker", {"allowed_bots": sorted(BROKER_REAL_PILOT_ALLOWED_BOTS)})
+    symbol_allowed = "*" in BROKER_REAL_PILOT_ALLOWED_SYMBOLS or symbol_key in BROKER_REAL_PILOT_ALLOWED_SYMBOLS
+    add("SYMBOL_ALLOWED", symbol_allowed, f"Símbolo {symbol_key} não está liberado no broker", {"allowed_symbols": sorted(BROKER_REAL_PILOT_ALLOWED_SYMBOLS)})
+    add("NOTIONAL_LIMIT", effective_notional is not None and float(effective_notional) <= BROKER_REAL_PILOT_MAX_NOTIONAL_USDT, f"Notional {effective_notional} USDT acima do limite {BROKER_REAL_PILOT_MAX_NOTIONAL_USDT} USDT", {"notional_usdt": effective_notional, "max_notional_usdt": BROKER_REAL_PILOT_MAX_NOTIONAL_USDT})
+    pos_count = _broker_rpg_v1_open_positions_count()
+    open_ok = bool(pos_count.get("ok") and int(pos_count.get("count") or 0) < BROKER_REAL_PILOT_MAX_OPEN_POSITIONS)
+    if not pos_count.get("ok") and BROKER_REAL_PILOT_FAIL_CLOSED:
+        open_ok = False
+    add("MAX_OPEN_REAL_POSITIONS", open_ok, f"Limite de posições reais atingido ou não confirmado: {pos_count.get('count')} / {BROKER_REAL_PILOT_MAX_OPEN_POSITIONS}", pos_count)
+
+    allowed = len(reasons) == 0
+    return {
+        "ok": allowed,
+        "allowed": allowed,
+        "applies": True,
+        "status": "BROKER_REAL_PILOT_GUARD_ALLOWED" if allowed else "BLOCKED_BY_BROKER_REAL_PILOT_GUARD",
+        "version": "2026-07-08-BROKER-REAL-PILOT-GUARD-V1",
+        "ts": agora_sp_str(),
+        "bot": bot_key,
+        "symbol": symbol_key,
+        "side": str(side or "").upper(),
+        "notional_usdt": effective_notional,
+        "max_notional_usdt": BROKER_REAL_PILOT_MAX_NOTIONAL_USDT,
+        "max_open_positions": BROKER_REAL_PILOT_MAX_OPEN_POSITIONS,
+        "open_positions": pos_count,
+        "checks": checks,
+        "reasons": reasons,
+        "token_value_exposed": False,
     }
 
 def place_market_order(
@@ -1440,9 +1607,41 @@ def place_market_order(
         })
         return result
 
-    # A partir daqui é LIVE real autorizado pelas envs, mas ainda precisa do token efêmero.
+    # A partir daqui é LIVE real autorizado pelas envs, mas ainda precisa passar pelo Real Pilot Guard do broker.
+    real_pilot_guard = broker_real_pilot_guard_v1_validate(
+        symbol=sym,
+        side=order_side,
+        bot=audit_bot,
+        notional_usdt=planned_exposure,
+        preview=preview,
+        reduce_only=reduce_only,
+        live_send_enabled=live_send_enabled,
+        client_tag=client_tag,
+    )
+    if not real_pilot_guard.get("allowed"):
+        result = {
+            "ok": False,
+            "status": "BLOCKED_BY_BROKER_REAL_PILOT_GUARD",
+            "sent": False,
+            "symbol": sym,
+            "side": order_side,
+            "bot": audit_bot,
+            "position_side": bingx_position_side(side),
+            "margin_usdt": margin,
+            "leverage": lev,
+            "notional_usdt": planned_exposure,
+            "preview": preview,
+            "real_pilot_guard_v1": real_pilot_guard,
+            "preview_isolation": True,
+            "live_send_enabled": live_send_enabled,
+            "error": "; ".join(real_pilot_guard.get("reasons") or ["Real Pilot Guard bloqueou envio real"]),
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        log_execution_event({"event": "place_market_order", **result})
+        log_execution_audit_event({"event": "BROKER_REAL_PILOT_GUARD_BLOCKED", **result})
+        return result
 
-    # LIVE real autorizado pelas envs, mas ainda exige token efêmero do Execution Engine.
+    # LIVE real autorizado pelas envs e pelo piloto, mas ainda exige token efêmero do Execution Engine.
     auth_payload = validate_execution_auth_token(
         execution_auth_token,
         context={
