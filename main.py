@@ -32851,7 +32851,11 @@ def real_pilot_guard_v1_validate(payload=None, action="execute"):
     return {
         "ok": allowed,
         "allowed": allowed,
-        "status": "REAL_PILOT_GUARD_ALLOWED" if allowed else "BLOCKED_BY_REAL_PILOT_GUARD",
+        "status": (
+            "REAL_PILOT_GUARD_ALLOWED" if allowed else
+            "BLOCKED_MISCONFIGURED_FALCON_MODE" if "FALCON_MODE_LIVE" in [c.get("code") for c in failed] else
+            "BLOCKED_BY_REAL_PILOT_GUARD"
+        ),
         "module": "real_pilot_guard_v1",
         "version": REAL_PILOT_GUARD_V1_VERSION,
         "generated_at": _rpg_v1_now(),
@@ -38665,7 +38669,7 @@ start_central_runtime_once()
 # - Não bloquear PAPER/READY/VERIFY.
 # - Não bloquear reduceOnly/fechamento/gestão.
 # ============================================================================
-REAL_PILOT_GUARD_V1_SAFE_VERSION = "2026-07-08-REAL-PILOT-GUARD-V1.3-DIAGNOSTIC-TEXT-FIX"
+REAL_PILOT_GUARD_V1_SAFE_VERSION = "2026-07-08-REAL-PILOT-GUARD-V1.4-FALCON-MODE-PREFLIGHT"
 
 
 def _rpg_safe_now():
@@ -38851,6 +38855,13 @@ def _rpg_safe_config():
         "CENTRAL_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS",
         "REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS",
     ], True)
+    require_falcon_live, require_falcon_live_source = _rpg_safe_env_bool([
+        "CENTRAL_REAL_PILOT_REQUIRE_FALCON_LIVE",
+        "REAL_PILOT_REQUIRE_FALCON_LIVE",
+    ], True)
+    falcon_mode, falcon_mode_source = _rpg_safe_env_text(["FALCON_MODE"], "VERIFY")
+    falcon_notional, falcon_notional_source = _rpg_safe_env_float(["FALCON_REAL_NOTIONAL_USDT"], None)
+    falcon_max_positions, falcon_max_positions_source = _rpg_safe_env_int(["FALCON_REAL_MAX_POSITIONS"], None)
     return {
         "guard_enabled": guard_enabled,
         "guard_enabled_source": guard_source or "default:true",
@@ -38874,6 +38885,14 @@ def _rpg_safe_config():
         "fail_closed_source": fail_source or "default:true",
         "allow_reduce_only_always": allow_reduce_only,
         "allow_reduce_only_always_source": reduce_source or "default:true",
+        "require_falcon_live_for_pilot": require_falcon_live,
+        "require_falcon_live_for_pilot_source": require_falcon_live_source or "default:true",
+        "falcon_mode": str(falcon_mode or "VERIFY").upper().strip(),
+        "falcon_mode_source": falcon_mode_source or "default:VERIFY",
+        "falcon_real_notional_usdt": falcon_notional,
+        "falcon_real_notional_usdt_source": falcon_notional_source,
+        "falcon_real_max_positions": falcon_max_positions,
+        "falcon_real_max_positions_source": falcon_max_positions_source,
     }
 
 
@@ -39012,6 +39031,25 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
     add("ENABLE_REAL_TRADING", cfg.get("enable_real_trading"), {"ok": "ENABLE_REAL_TRADING=true.", "fail": "ENABLE_REAL_TRADING precisa estar true."})
     add("BROKER_DRY_RUN_FALSE", cfg.get("broker_dry_run") is False, {"ok": "BROKER_DRY_RUN=false confirmado para piloto real.", "fail": "BROKER_DRY_RUN precisa estar false para piloto real."})
 
+    if bot == "FALCON":
+        falcon_mode = str(cfg.get("falcon_mode") or "VERIFY").upper().strip()
+        require_falcon_live = bool(cfg.get("require_falcon_live_for_pilot"))
+        falcon_mode_ok = (not require_falcon_live) or (falcon_mode == "LIVE")
+        add(
+            "FALCON_MODE_LIVE",
+            falcon_mode_ok,
+            {
+                "ok": f"FALCON_MODE={falcon_mode} confirmado para execução real do Falcon.",
+                "fail": f"FALCON_MODE precisa estar LIVE para piloto real; atual={falcon_mode}.",
+            },
+            blocking=True,
+            details={
+                "falcon_mode": falcon_mode,
+                "source": cfg.get("falcon_mode_source"),
+                "require_falcon_live_for_pilot": require_falcon_live,
+            },
+        )
+
     allowed_bots = set(cfg.get("allowed_bots") or ["FALCON"])
     add("BOT_ALLOWED", bot in allowed_bots, {"ok": f"Bot {bot or 'N/A'} liberado para piloto real.", "fail": f"Bot {bot or 'N/A'} não está liberado para piloto real."}, details={"allowed_bots": sorted(allowed_bots)})
 
@@ -39023,6 +39061,22 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
     notional_ok = notional is not None and float(notional) <= float(max_notional)
     add("NOTIONAL_LIMIT", notional_ok, {"ok": f"Notional {notional} USDT dentro do limite do piloto {max_notional} USDT.", "fail": f"Notional {notional} USDT acima do limite do piloto {max_notional} USDT."}, details={"notional_usdt": notional, "source": notional_source, "max_notional_usdt": max_notional})
 
+    if bot == "FALCON":
+        falcon_notional = _rpg_safe_float(cfg.get("falcon_real_notional_usdt"), None)
+        if falcon_notional is not None:
+            add(
+                "FALCON_REAL_NOTIONAL_CONFIG",
+                falcon_notional <= max_notional,
+                {
+                    "ok": f"FALCON_REAL_NOTIONAL_USDT={falcon_notional} dentro do limite central {max_notional} USDT.",
+                    "fail": f"FALCON_REAL_NOTIONAL_USDT={falcon_notional} acima do limite central {max_notional} USDT.",
+                },
+                blocking=False,
+                details={"falcon_real_notional_usdt": falcon_notional, "source": cfg.get("falcon_real_notional_usdt_source"), "max_notional_usdt": max_notional},
+            )
+        else:
+            warnings.append("FALCON_REAL_NOTIONAL_USDT não configurado; rota amostral usa notional do payload.")
+
     counts = _rpg_safe_live_counts(payload)
     max_open = _rpg_safe_int(cfg.get("max_open_positions"), 1)
     real_counts = [x for x in [counts.get("central_live_count"), counts.get("registry_real_open_count"), counts.get("broker_bingx_open_count")] if x is not None]
@@ -39031,6 +39085,22 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
     if effective_open is None and cfg.get("fail_closed"):
         count_ok = False
     add("MAX_OPEN_REAL_POSITIONS", count_ok, {"ok": f"Capacidade disponível para nova posição real: abertas={effective_open}, max={max_open}.", "fail": f"Limite de posições reais do piloto atingido ou não confirmado: abertas={effective_open}, max={max_open}."}, details={"counts": counts, "max_open_positions": max_open})
+
+    if bot == "FALCON":
+        falcon_max_positions = _rpg_safe_int(cfg.get("falcon_real_max_positions"), None)
+        if falcon_max_positions is not None:
+            add(
+                "FALCON_REAL_MAX_POSITIONS_CONFIG",
+                falcon_max_positions <= max_open,
+                {
+                    "ok": f"FALCON_REAL_MAX_POSITIONS={falcon_max_positions} compatível com limite central {max_open}.",
+                    "fail": f"FALCON_REAL_MAX_POSITIONS={falcon_max_positions} maior que limite central {max_open}; o guard central ainda bloqueará excesso.",
+                },
+                blocking=False,
+                details={"falcon_real_max_positions": falcon_max_positions, "source": cfg.get("falcon_real_max_positions_source"), "max_open_positions": max_open},
+            )
+        else:
+            warnings.append("FALCON_REAL_MAX_POSITIONS não configurado; limite central do piloto permanece ativo.")
 
     failed = [c for c in checks if c.get("blocking") and not c.get("ok")]
     allowed = len(failed) == 0
@@ -39125,7 +39195,7 @@ def build_live_pilot_guard_v1_text(sample_guard=None):
     lines = [
         "🧪 REAL PILOT GUARD V1 — CENTRAL QUANT",
         f"Data/hora: {_rpg_safe_now()}",
-        f"Status: {'✅ ARMED/ALLOW' if guard.get('allowed') else '🛑 BLOCKED/DISARMED'}",
+        f"Status: {'✅ ARMED/ALLOW' if guard.get('allowed') else ('🛑 BLOCKED/MISCONFIGURED' if guard.get('status') == 'BLOCKED_MISCONFIGURED_FALCON_MODE' else '🛑 BLOCKED/DISARMED')}",
         f"Versão: {REAL_PILOT_GUARD_V1_SAFE_VERSION}",
         "",
         "Configuração:",
@@ -39134,6 +39204,10 @@ def build_live_pilot_guard_v1_text(sample_guard=None):
         f"- Central real execution: {cfg.get('central_real_execution_enabled')} ({cfg.get('central_real_execution_enabled_source')})",
         f"- ENABLE_REAL_TRADING: {cfg.get('enable_real_trading')} ({cfg.get('enable_real_trading_source')})",
         f"- BROKER_DRY_RUN: {cfg.get('broker_dry_run')} ({cfg.get('broker_dry_run_source')})",
+        f"- FALCON_MODE: {cfg.get('falcon_mode')} ({cfg.get('falcon_mode_source')})",
+        f"- FALCON_REAL_NOTIONAL_USDT: {cfg.get('falcon_real_notional_usdt')} ({cfg.get('falcon_real_notional_usdt_source')})",
+        f"- FALCON_REAL_MAX_POSITIONS: {cfg.get('falcon_real_max_positions')} ({cfg.get('falcon_real_max_positions_source')})",
+        f"- Require Falcon LIVE: {cfg.get('require_falcon_live_for_pilot')} ({cfg.get('require_falcon_live_for_pilot_source')})",
         f"- Bots permitidos: {', '.join(cfg.get('allowed_bots') or [])}",
         f"- Símbolos permitidos: {', '.join(cfg.get('allowed_symbols') or [])}",
         f"- Max notional: {cfg.get('max_notional_usdt')} USDT",
@@ -39164,6 +39238,7 @@ def build_live_pilot_guard_v1_text(sample_guard=None):
         "",
         "Notas:",
         "- Esta rota não envia ordens.",
+        "- V1.4 também valida se o Falcon está realmente em LIVE antes do piloto real.",
         "- Para armar o piloto real, todos os checks precisam ficar verdes.",
         "- O broker ainda aplica uma trava própria antes de create_order().",
     ]
