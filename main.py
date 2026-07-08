@@ -38657,12 +38657,6 @@ def turtle_risk_guard_connector_central_text_route_v1_1():
 
 start_central_runtime_once()
 
-if __name__ == "__main__":
-    porta = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=porta)
-
-
-# ============================================================================
 # REAL PILOT GUARD V1 — CENTRAL FINAL WRAPPER 2026-07-08
 # ----------------------------------------------------------------------------
 # Objetivo:
@@ -39200,3 +39194,11 @@ def live_pilot_guard_v1_route():
 @app.route("/realpilotguard/v1/text", methods=["GET"])
 def live_pilot_guard_v1_text_route():
     return build_live_pilot_guard_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+if __name__ == "__main__":
+    porta = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=porta)
+
+
+# ============================================================================
