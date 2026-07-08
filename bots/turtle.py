@@ -1,6 +1,6 @@
 # ==============================================================================
 # TURTLE BREAKOUT PRO 2.0 - CENTRAL QUANT
-# Versão: 2026-06-23-TURTLE-BREAKOUT-PRO-100-100-FUNIL-PAPER
+# Versão: 2026-07-08-TURTLE-BREAKOUT-PRO-2-0-RISK-GUARD-CONNECTOR-V1
 #
 # Robô de pesquisa/paper para Central Quant.
 # NÃO executa ordens reais na BingX.
@@ -84,6 +84,14 @@ except Exception as _trade_registry_exc:
 
 app = Flask(__name__)
 
+
+def env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "y"}
+
+
 # ==============================================================================
 # CONFIG
 # ==============================================================================
@@ -147,6 +155,23 @@ MONTHLY_SUMMARY_HOUR = int(os.environ.get("TURTLE_MONTHLY_SUMMARY_HOUR", "0"))
 MONTHLY_SUMMARY_MINUTE = int(os.environ.get("TURTLE_MONTHLY_SUMMARY_MINUTE", "5"))
 
 ENABLED_SETUPS_RAW = os.environ.get("TURTLE_ENABLED_SETUPS", "20,55")
+
+# ==============================================================================
+# TURTLE RISK GUARD CONNECTOR V1
+# ==============================================================================
+# Liga o Turtle diretamente ao Risk Guard da Central antes de registrar sinal PAPER.
+# Também honra os toggles legados ENABLE_TURTLE20 / ENABLE_TURTLE55, quando existirem no Render.
+TURTLE_RISK_GUARD_CONNECTOR_VERSION = "2026-07-08-TURTLE-RISK-GUARD-CONNECTOR-V1"
+TURTLE_RISK_GUARD_CONNECTOR_ENABLED = env_bool("TURTLE_RISK_GUARD_CONNECTOR_ENABLED", True)
+TURTLE_RISK_GUARD_FAIL_CLOSED = env_bool("TURTLE_RISK_GUARD_FAIL_CLOSED", True)
+TURTLE_RISK_GUARD_TIMEOUT_SECONDS = float(os.environ.get("TURTLE_RISK_GUARD_TIMEOUT_SECONDS", "6"))
+TURTLE_RISK_GUARD_URL = os.environ.get(
+    "TURTLE_RISK_GUARD_URL",
+    os.environ.get(
+        "CENTRAL_CAN_OPEN_TRADE_URL",
+        f"http://127.0.0.1:{os.environ.get('PORT', '10000')}/can_open_trade",
+    ),
+)
 
 ALL_SETUPS = {
     "TURTLE20": {
@@ -261,6 +286,12 @@ HEALTH = {
     "ranking_month": [],
     "enabled_setups": list(SETUPS.keys()),
     "mode": "PAPER",
+    "risk_guard_connector_version": TURTLE_RISK_GUARD_CONNECTOR_VERSION,
+    "risk_guard_connector_enabled": TURTLE_RISK_GUARD_CONNECTOR_ENABLED,
+    "risk_guard_url": TURTLE_RISK_GUARD_URL,
+    "risk_guard_fail_closed": TURTLE_RISK_GUARD_FAIL_CLOSED,
+    "last_risk_guard_decision": None,
+    "risk_guard_blocked_today": 0,
     "trade_registry_loaded": TRADE_REGISTRY_LOADED,
     "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR,
 
@@ -275,6 +306,7 @@ HEALTH = {
         "reprovados_score": 0,
         "reprovados_cooldown": 0,
         "reprovados_posicao_ativa": 0,
+        "reprovados_risk_guard": 0,
         "sinais_enviados": 0,
     },
 }
@@ -811,6 +843,7 @@ def get_funnel():
             "reprovados_score": 0,
             "reprovados_cooldown": 0,
             "reprovados_posicao_ativa": 0,
+            "reprovados_risk_guard": 0,
             "sinais_enviados": 0,
         }
         redis_set_json(FUNNEL_KEY, data)
@@ -841,6 +874,7 @@ def funnel_snapshot():
         "reprovados_score": int(data.get("reprovados_score", 0) or 0),
         "reprovados_cooldown": int(data.get("reprovados_cooldown", 0) or 0),
         "reprovados_posicao_ativa": int(data.get("reprovados_posicao_ativa", 0) or 0),
+        "reprovados_risk_guard": int(data.get("reprovados_risk_guard", 0) or 0),
         "sinais_enviados": int(data.get("sinais_enviados", 0) or 0),
     }
 
@@ -1046,6 +1080,202 @@ def signal_message(sig):
     )
 
 
+def turtle_setup_env_gate(sig):
+    """Gate local para toggles legados ENABLE_TURTLE20 / ENABLE_TURTLE55.
+
+    Observação: o código original do Turtle usa TURTLE_ENABLED_SETUPS.
+    Este conector passa a respeitar também ENABLE_TURTLE20=false e ENABLE_TURTLE55=false
+    para preservar decisões operacionais antigas do Render.
+    """
+    setup = str((sig or {}).get("setup") or "").upper().strip()
+    reasons = []
+    warnings = []
+
+    if setup == "TURTLE20" and os.environ.get("ENABLE_TURTLE20") is not None and not env_bool("ENABLE_TURTLE20", True):
+        reasons.append("Turtle Risk Guard Connector V1: ENABLE_TURTLE20=false no Render.")
+    if setup == "TURTLE55" and os.environ.get("ENABLE_TURTLE55") is not None and not env_bool("ENABLE_TURTLE55", True):
+        reasons.append("Turtle Risk Guard Connector V1: ENABLE_TURTLE55=false no Render.")
+
+    return {
+        "ok": True,
+        "source": "LOCAL_ENV_GATE",
+        "allowed": len(reasons) == 0,
+        "decision": "ALLOW" if len(reasons) == 0 else "DENY",
+        "reasons": reasons,
+        "warnings": warnings,
+        "setup": setup,
+        "version": TURTLE_RISK_GUARD_CONNECTOR_VERSION,
+    }
+
+
+def build_turtle_risk_guard_payload(sig):
+    sig = sig if isinstance(sig, dict) else {}
+    return {
+        "bot": "TURTLE",
+        "bot_name": BOT_NAME,
+        "setup": sig.get("setup"),
+        "symbol": sig.get("symbol"),
+        "side": sig.get("side"),
+        "mode": "PAPER",
+        "execution_mode": "PAPER",
+        "intended_live": False,
+        "reduce_only": False,
+        "source": "turtle.py",
+        "connector": "TURTLE_RISK_GUARD_CONNECTOR_V1",
+        "entry": sig.get("entry"),
+        "stop": sig.get("stop") or sig.get("initial_stop"),
+        "sl": sig.get("stop") or sig.get("initial_stop"),
+        "tp50": sig.get("tp50"),
+        "risk_pct": sig.get("risk_pct"),
+        "score": sig.get("score_turtle"),
+        "quality": sig.get("quality"),
+        "signal_id": sig.get("id"),
+        "timeframe": sig.get("timeframe") or TIMEFRAME,
+        "created_at": sig.get("created_at") or data_hora_sp_str(),
+    }
+
+
+def call_turtle_risk_guard(sig):
+    if not TURTLE_RISK_GUARD_CONNECTOR_ENABLED:
+        return {
+            "ok": True,
+            "allowed": True,
+            "decision": "ALLOW",
+            "source": "CONNECTOR_DISABLED",
+            "reasons": [],
+            "warnings": ["TURTLE_RISK_GUARD_CONNECTOR_ENABLED=false"],
+            "version": TURTLE_RISK_GUARD_CONNECTOR_VERSION,
+        }
+
+    local_gate = turtle_setup_env_gate(sig)
+    if not local_gate.get("allowed", True):
+        return local_gate
+
+    payload = build_turtle_risk_guard_payload(sig)
+    try:
+        r = requests.post(TURTLE_RISK_GUARD_URL, json=payload, timeout=TURTLE_RISK_GUARD_TIMEOUT_SECONDS)
+        if r.status_code != 200:
+            return {
+                "ok": False,
+                "allowed": not TURTLE_RISK_GUARD_FAIL_CLOSED,
+                "decision": "DENY" if TURTLE_RISK_GUARD_FAIL_CLOSED else "ALLOW",
+                "source": "CENTRAL_HTTP_ERROR",
+                "status_code": r.status_code,
+                "reasons": [f"Turtle Risk Guard Connector V1: Central retornou HTTP {r.status_code}."] if TURTLE_RISK_GUARD_FAIL_CLOSED else [],
+                "warnings": [r.text[:240]],
+                "payload": payload,
+                "version": TURTLE_RISK_GUARD_CONNECTOR_VERSION,
+            }
+        data = r.json()
+        if not isinstance(data, dict):
+            data = {"ok": False, "allowed": False, "decision": "DENY", "reasons": ["payload inválido da Central"], "warnings": []}
+
+        allowed = bool(data.get("allowed", data.get("ok", False)))
+        decision = str(data.get("decision") or ("ALLOW" if allowed else "DENY")).upper()
+        if decision in {"DENY", "BLOCK", "BLOCKED", "REJECT", "REJECTED"}:
+            allowed = False
+
+        data["allowed"] = allowed
+        data["decision"] = "ALLOW" if allowed else "DENY"
+        data.setdefault("source", "CENTRAL_CAN_OPEN_TRADE")
+        data.setdefault("version", TURTLE_RISK_GUARD_CONNECTOR_VERSION)
+        data.setdefault("payload", payload)
+        return data
+    except Exception as exc:
+        return {
+            "ok": False,
+            "allowed": not TURTLE_RISK_GUARD_FAIL_CLOSED,
+            "decision": "DENY" if TURTLE_RISK_GUARD_FAIL_CLOSED else "ALLOW",
+            "source": "CENTRAL_UNAVAILABLE",
+            "reasons": [f"Turtle Risk Guard Connector V1: Central indisponível: {exc}"] if TURTLE_RISK_GUARD_FAIL_CLOSED else [],
+            "warnings": [str(exc)],
+            "payload": payload,
+            "version": TURTLE_RISK_GUARD_CONNECTOR_VERSION,
+        }
+
+
+def turtle_risk_guard_allows(sig):
+    decision = call_turtle_risk_guard(sig)
+    allowed = bool(decision.get("allowed", False))
+    sig["risk_guard_connector"] = decision
+    HEALTH["last_risk_guard_decision"] = {
+        "allowed": allowed,
+        "decision": decision.get("decision"),
+        "source": decision.get("source"),
+        "setup": sig.get("setup"),
+        "side": sig.get("side"),
+        "symbol": sig.get("symbol"),
+        "reasons": decision.get("reasons") or [],
+        "warnings": decision.get("warnings") or [],
+        "ts": data_hora_sp_str(),
+    }
+    if not allowed:
+        HEALTH["risk_guard_blocked_today"] = int(HEALTH.get("risk_guard_blocked_today", 0) or 0) + 1
+        HEALTH["last_warning"] = "; ".join([str(x) for x in (decision.get("reasons") or [])[:3]]) or "Turtle Risk Guard Connector V1 bloqueou sinal."
+    return allowed, decision
+
+
+def risk_guard_connector_payload():
+    return {
+        "ok": True,
+        "module": "turtle_risk_guard_connector_v1",
+        "version": TURTLE_RISK_GUARD_CONNECTOR_VERSION,
+        "generated_at": data_hora_sp_str(),
+        "enabled": TURTLE_RISK_GUARD_CONNECTOR_ENABLED,
+        "url": TURTLE_RISK_GUARD_URL,
+        "fail_closed": TURTLE_RISK_GUARD_FAIL_CLOSED,
+        "timeout_seconds": TURTLE_RISK_GUARD_TIMEOUT_SECONDS,
+        "env_gates": {
+            "ENABLE_TURTLE20": os.environ.get("ENABLE_TURTLE20"),
+            "ENABLE_TURTLE55": os.environ.get("ENABLE_TURTLE55"),
+            "TURTLE_ENABLED_SETUPS": ENABLED_SETUPS_RAW,
+            "active_setups_in_code": list(SETUPS.keys()),
+        },
+        "last_decision": HEALTH.get("last_risk_guard_decision"),
+        "blocked_today": HEALTH.get("risk_guard_blocked_today", 0),
+        "notes": [
+            "O conector roda antes de turtle_registry_open, antes de salvar posição PAPER e antes de enviar Telegram.",
+            "Gestão/fechamento de posições antigas não é bloqueada.",
+            "ENABLE_TURTLE20=false e ENABLE_TURTLE55=false agora são respeitados como gates locais, além do /can_open_trade da Central.",
+        ],
+    }
+
+
+def risk_guard_connector_text():
+    payload = risk_guard_connector_payload()
+    env = payload.get("env_gates", {})
+    last = payload.get("last_decision") or {}
+    lines = [
+        "🐢 TURTLE RISK GUARD CONNECTOR V1",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅ ATIVO' if payload.get('enabled') else '⚪ DESATIVADO'}",
+        f"Fail closed: {payload.get('fail_closed')}",
+        f"URL: {payload.get('url')}",
+        "",
+        "Env / setups:",
+        f"- ENABLE_TURTLE20: {env.get('ENABLE_TURTLE20')}",
+        f"- ENABLE_TURTLE55: {env.get('ENABLE_TURTLE55')}",
+        f"- TURTLE_ENABLED_SETUPS: {env.get('TURTLE_ENABLED_SETUPS')}",
+        f"- Setups ativos no código: {', '.join(env.get('active_setups_in_code') or [])}",
+        "",
+        f"Bloqueios nesta sessão: {payload.get('blocked_today')}",
+    ]
+    if last:
+        lines += [
+            "",
+            "Última decisão:",
+            f"- {last.get('symbol')} {last.get('setup')} {last.get('side')} | {last.get('decision')} | source={last.get('source')}",
+        ]
+        for r in last.get("reasons") or []:
+            lines.append(f"  motivo: {r}")
+        for w in last.get("warnings") or []:
+            lines.append(f"  aviso: {w}")
+    lines += ["", "Notas:"]
+    for note in payload.get("notes") or []:
+        lines.append(f"- {note}")
+    return "\n".join(lines)
+
+
 def scanner_loop():
     started = time.time()
 
@@ -1086,6 +1316,22 @@ def scanner_loop():
 
                     if time.time() - started < STARTUP_GUARD_SECONDS:
                         set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
+                        continue
+
+                    risk_allowed, risk_decision = turtle_risk_guard_allows(sig)
+                    if not risk_allowed:
+                        funnel_inc("reprovados_risk_guard")
+                        set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
+                        record_event(
+                            "TRADE_BLOCKED",
+                            sig,
+                            {
+                                "risk_guard_connector": risk_decision,
+                                "reasons": risk_decision.get("reasons", []),
+                                "warnings": risk_decision.get("warnings", []),
+                                "result": "DENY",
+                            },
+                        )
                         continue
 
                     pid = sig["id"]
@@ -1684,6 +1930,7 @@ def build_summary(period_name, trades, period_signals_override=None):
         f"Reprovados por score: {HEALTH.get('funnel_today', {}).get('reprovados_score', 0)}\n"
         f"Reprovados por cooldown: {HEALTH.get('funnel_today', {}).get('reprovados_cooldown', 0)}\n"
         f"Reprovados por posição ativa: {HEALTH.get('funnel_today', {}).get('reprovados_posicao_ativa', 0)}\n"
+        f"Reprovados pelo Risk Guard: {HEALTH.get('funnel_today', {}).get('reprovados_risk_guard', 0)}\n"
         f"Sinais enviados: {HEALTH.get('funnel_today', {}).get('sinais_enviados', 0)}\n\n"
         f"Trades encerrados: {stats['count']}\n"
         f"Wins: {stats['wins']}\n"
@@ -2091,6 +2338,20 @@ def summary_route():
     }
 
 
+@app.route("/riskguardconnector")
+@app.route("/turtle/riskguardconnector")
+@app.route("/turtle/risk/guard/connector")
+def risk_guard_connector_route():
+    return risk_guard_connector_payload()
+
+
+@app.route("/riskguardconnector/text")
+@app.route("/turtle/riskguardconnector/text")
+@app.route("/turtle/risk/guard/connector/text")
+def risk_guard_connector_text_route():
+    return {"text": risk_guard_connector_text()}
+
+
 @app.route("/reset_paper", methods=["POST"])
 def reset_paper_route():
     # Proteção simples para evitar reset acidental.
@@ -2126,6 +2387,8 @@ def startup():
         "Modo: PAPER / SEM BINGX\n"
         f"Timeframe: {TIMEFRAME}\n\n"
         f"Setups ativos: {', '.join(SETUPS.keys())}\n"
+        f"Risk Guard Connector: {'ON' if TURTLE_RISK_GUARD_CONNECTOR_ENABLED else 'OFF'} | fail_closed={TURTLE_RISK_GUARD_FAIL_CLOSED}\n"
+        f"ENABLE_TURTLE20={os.environ.get('ENABLE_TURTLE20')} | ENABLE_TURTLE55={os.environ.get('ENABLE_TURTLE55')}\n"
         f"Turtle20: entrada {ALL_SETUPS['TURTLE20']['entry_len']} / saída {ALL_SETUPS['TURTLE20']['exit_len']}\n"
         f"Turtle55: entrada {ALL_SETUPS['TURTLE55']['entry_len']} / saída {ALL_SETUPS['TURTLE55']['exit_len']}\n\n"
         f"Stop: {ATR_STOP_MULT} ATR\n"
