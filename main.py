@@ -41964,6 +41964,626 @@ def predator_paper_lifecycle_audit_v1_route():
 def predator_paper_lifecycle_audit_v1_text_route():
     return build_predator_paper_lifecycle_audit_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
+
+# ============================================================================
+# PREDATOR PAPER REGISTRY SYNC FIX V1
+# ============================================================================
+# Objetivo:
+# - Reparar o ciclo OPEN/CLOSED do Smart Predator PAPER no Trade Registry.
+# - Não altera execução, não envia ordens, não muda risco/policies.
+# - GET sem commit é preview. Commit exige ack explícito.
+PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION = "2026-07-09-PREDATOR-PAPER-REGISTRY-SYNC-FIX-V1"
+PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_registry_sync_fix_events.jsonl")
+PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_registry_sync_fix_latest.json")
+_PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE = {"ts": 0, "payload": None}
+
+
+def _pprsf_v1_now():
+    try:
+        return _ppla_v1_now()
+    except Exception:
+        try:
+            return data_hora_sp_str()
+        except Exception:
+            return None
+
+
+def _pprsf_v1_epoch_now():
+    try:
+        return _ppla_v1_epoch_now()
+    except Exception:
+        try:
+            return time.time()
+        except Exception:
+            return 0
+
+
+def _pprsf_v1_public(value, max_string=700):
+    try:
+        return _ppla_v1_public(value, max_string=max_string)
+    except Exception:
+        return value
+
+
+def _pprsf_v1_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "commit", "repair", "sync"}
+
+
+def _pprsf_v1_registry_available():
+    return central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)) and callable(getattr(central_trade_registry, "save_registry", None))
+
+
+def _pprsf_v1_load_registry():
+    if not _pprsf_v1_registry_available():
+        return None, "trade_registry unavailable"
+    try:
+        raw = central_trade_registry.load_registry()
+        if not isinstance(raw, dict):
+            raw = {}
+        raw.setdefault("open_trades", {})
+        raw.setdefault("closed_trades", [])
+        return raw, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _pprsf_v1_open_dict(registry):
+    if not isinstance(registry, dict):
+        return {}
+    raw = registry.get("open_trades", {})
+    if isinstance(raw, dict):
+        return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    if isinstance(raw, list):
+        out = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            tid = str(item.get("trade_id") or _ppla_v1_get_trade_id(item) or "").strip()
+            if tid:
+                out[tid] = item
+        return out
+    return {}
+
+
+def _pprsf_v1_closed_list(registry):
+    if not isinstance(registry, dict):
+        return []
+    raw = registry.get("closed_trades", [])
+    if isinstance(raw, dict):
+        return [x for x in raw.values() if isinstance(x, dict)]
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    return []
+
+
+def _pprsf_v1_trade_id_from_position(position):
+    if not isinstance(position, dict):
+        return None
+    tid = position.get("trade_registry_id") or position.get("trade_id")
+    if tid:
+        return str(tid)
+    symbol = _ppla_v1_norm_symbol(position.get("symbol_clean") or position.get("symbol"))
+    side = _ppla_v1_norm_side(position.get("side") or position.get("direction") or position.get("position_side"))
+    setup = str(position.get("setup") or position.get("signal_type") or position.get("origin") or "SMART_PREDATOR").upper().strip()
+    if symbol and symbol != "UNKNOWN" and side in {"LONG", "SHORT"}:
+        return f"PREDATOR:{setup}:{symbol}:{side}"
+    return None
+
+
+def _pprsf_v1_trade_id_from_closed_event(event):
+    if not isinstance(event, dict):
+        return None
+    raw = event.get("raw_public") if isinstance(event.get("raw_public"), dict) else {}
+    tid = raw.get("trade_id") or raw.get("uid") or event.get("event_key") or event.get("key")
+    if tid:
+        return str(tid)
+    symbol = _ppla_v1_norm_symbol(raw.get("symbol_clean") or raw.get("symbol") or event.get("symbol"))
+    side = _ppla_v1_norm_side(raw.get("side") or event.get("side"))
+    setup = str(raw.get("setup") or raw.get("signal_type") or event.get("setup") or "SMART_PREDATOR").upper().strip()
+    ts = str(raw.get("ts") or raw.get("closed_at") or event.get("ts") or "").replace("/", "").replace(":", "").replace(" ", "-")
+    if symbol and symbol != "UNKNOWN" and side in {"LONG", "SHORT"}:
+        return f"PREDATOR-CLOSED-{ts}-{symbol}-{side}-{setup}"
+    return None
+
+
+def _pprsf_v1_signature_trade(item):
+    try:
+        symbol = _ppla_v1_norm_symbol(item.get("symbol_clean") or item.get("symbol") or item.get("market_symbol"))
+        side = _ppla_v1_norm_side(item.get("side") or item.get("direction") or item.get("position_side"))
+        setup = str(item.get("setup") or item.get("signal_type") or item.get("origin") or "SMART_PREDATOR").upper().strip()
+        return f"{symbol}|{side}|{setup}"
+    except Exception:
+        return "UNKNOWN|UNKNOWN|UNKNOWN"
+
+
+def _pprsf_v1_build_open_trade_from_position(position):
+    trade_id = _pprsf_v1_trade_id_from_position(position)
+    symbol = _ppla_v1_norm_symbol(position.get("symbol_clean") or position.get("symbol"))
+    side = _ppla_v1_norm_side(position.get("side") or position.get("direction") or position.get("position_side"))
+    setup = str(position.get("setup") or position.get("signal_type") or position.get("origin") or "SMART_PREDATOR").upper().strip()
+    entry = _ppla_v1_float(position.get("entry"), default=None)
+    sl = _ppla_v1_float(position.get("sl"), default=_ppla_v1_float(position.get("initial_sl"), default=None))
+    tp50 = _ppla_v1_float(position.get("tp50"), default=None)
+    if not trade_id or symbol == "UNKNOWN" or side not in {"LONG", "SHORT"} or entry is None:
+        return None
+    created_at = position.get("created_at_txt") or position.get("opened_at") or position.get("datetime") or _pprsf_v1_now()
+    opened_epoch = _ppla_v1_float(position.get("created_at"), default=None)
+    trade = {
+        "trade_id": trade_id,
+        "bot": "PREDATOR",
+        "setup": setup,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp50": tp50,
+        "qty": position.get("qty") or position.get("amount") or position.get("quantity"),
+        "status": "OPEN",
+        "source": "predator_paper_registry_sync_fix_v1",
+        "opened_at": created_at,
+        "opened_epoch": opened_epoch,
+        "last_update": _pprsf_v1_now(),
+        "metadata": {
+            "synced_from": "predator_module_open_positions",
+            "sync_version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
+            "synced_at": _pprsf_v1_now(),
+            "execution_mode": "PAPER",
+            "execution_sent": False,
+            "auto_trade": position.get("auto_trade"),
+            "original_symbol": position.get("symbol"),
+            "status_original": position.get("status"),
+            "created_at": position.get("created_at"),
+            "created_at_txt": position.get("created_at_txt"),
+            "quality": position.get("quality"),
+            "score": position.get("score"),
+            "risk_pct": position.get("risk_pct"),
+            "h4_context": position.get("h4_context"),
+            "mfe_max_pct": position.get("mfe_max_pct"),
+            "mae_min_pct": position.get("mae_min_pct"),
+            "tp50_hit": position.get("tp50_hit"),
+            "be_active": position.get("be_active"),
+            "trailing_active": position.get("trailing_active"),
+        },
+    }
+    return trade
+
+
+def _pprsf_v1_extract_closed_raw(event):
+    if not isinstance(event, dict):
+        return {}
+    raw = event.get("raw_public") if isinstance(event.get("raw_public"), dict) else {}
+    inner = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+    merged = {}
+    merged.update(raw)
+    merged.update({f"raw_{k}": v for k, v in inner.items()})
+    # Keep common fields from inner as fallbacks when top-level is absent.
+    for k, v in inner.items():
+        merged.setdefault(k, v)
+    merged.setdefault("source_event_key", event.get("key") or event.get("event_key"))
+    merged.setdefault("source", event.get("source") or raw.get("source"))
+    merged.setdefault("kind", event.get("kind"))
+    merged.setdefault("ts", event.get("ts") or raw.get("ts") or inner.get("datetime"))
+    return merged
+
+
+def _pprsf_v1_build_closed_trade_from_event(event):
+    raw = _pprsf_v1_extract_closed_raw(event)
+    trade_id = _pprsf_v1_trade_id_from_closed_event(event)
+    symbol = _ppla_v1_norm_symbol(raw.get("symbol_clean") or raw.get("symbol"))
+    side = _ppla_v1_norm_side(raw.get("side"))
+    setup = str(raw.get("setup") or raw.get("signal_type") or "SMART_PREDATOR").upper().strip()
+    entry = _ppla_v1_float(raw.get("entry"), default=None)
+    exit_price = _ppla_v1_float(raw.get("exit_price"), default=_ppla_v1_float(raw.get("exit"), default=None))
+    pnl_pct = _ppla_v1_float(raw.get("result_pct"), default=_ppla_v1_float(raw.get("pnl_pct"), default=_ppla_v1_float(raw.get("pnl"), default=None)))
+    pnl_r = _ppla_v1_float(raw.get("result_r"), default=_ppla_v1_float(raw.get("pnl_r"), default=None))
+    if not trade_id or symbol == "UNKNOWN" or side not in {"LONG", "SHORT"} or entry is None:
+        return None
+    close_reason = str(raw.get("event_raw") or raw.get("close_reason") or raw.get("reason") or raw.get("event") or "PAPER_CLOSE").upper()
+    closed_at = raw.get("ts") or raw.get("closed_at") or raw.get("datetime") or _pprsf_v1_now()
+    trade = {
+        "trade_id": trade_id,
+        "bot": "PREDATOR",
+        "setup": setup,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "exit_price": exit_price,
+        "closed_at": closed_at,
+        "closed_epoch": _ppla_v1_float(raw.get("epoch"), default=None),
+        "sl": _ppla_v1_float(raw.get("stop"), default=None),
+        "tp50": _ppla_v1_float(raw.get("tp50"), default=None),
+        "qty": raw.get("qty"),
+        "status": "CLOSED",
+        "source": "predator_paper_registry_sync_fix_v1",
+        "close_reason": close_reason,
+        "result_pct": pnl_pct,
+        "pnl_pct": pnl_pct,
+        "result_r": pnl_r,
+        "pnl_r": pnl_r,
+        "last_update": _pprsf_v1_now(),
+        "metadata": {
+            "synced_from": "predator_paper_closed_history_events",
+            "sync_version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
+            "synced_at": _pprsf_v1_now(),
+            "execution_mode": "PAPER",
+            "execution_sent": False,
+            "source_event_key": raw.get("source_event_key"),
+            "source": raw.get("source"),
+            "kind": raw.get("kind"),
+            "quality": raw.get("quality"),
+            "score": raw.get("score"),
+            "risk_pct": raw.get("risk_pct"),
+            "mfe_max_pct": raw.get("mfe_max_pct"),
+            "mae_min_pct": raw.get("mae_min_pct"),
+            "mfe_max_r": raw.get("mfe_max_r"),
+            "mae_min_r": raw.get("mae_min_r"),
+            "tp50_hit": raw.get("tp50_hit"),
+            "management_cycles": raw.get("management_cycles"),
+        },
+    }
+    return trade
+
+
+def _pprsf_v1_existing_ids_and_signatures(registry):
+    open_d = _pprsf_v1_open_dict(registry)
+    closed_l = _pprsf_v1_closed_list(registry)
+    ids = set()
+    sig_open = set()
+    sig_closed = set()
+    for tid, item in open_d.items():
+        ids.add(str(item.get("trade_id") or tid))
+        sig_open.add(_pprsf_v1_signature_trade(item))
+    for item in closed_l:
+        if item.get("trade_id"):
+            ids.add(str(item.get("trade_id")))
+        sig_closed.add(_pprsf_v1_signature_trade(item) + "|" + str(item.get("closed_at") or item.get("exit_time") or ""))
+    return ids, sig_open, sig_closed
+
+
+def _pprsf_v1_closed_signature(trade):
+    return _pprsf_v1_signature_trade(trade) + "|" + str(trade.get("closed_at") or trade.get("exit_time") or "")
+
+
+def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_samples=True, use_cache=False):
+    now_epoch = _pprsf_v1_epoch_now()
+    if use_cache and not commit:
+        try:
+            cached = _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE.get("payload")
+            if cached and (now_epoch - float(_PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE.get("ts") or 0)) < 30:
+                return cached
+        except Exception:
+            pass
+
+    commit = bool(commit)
+    ack_ok = str(ack or "").strip().upper() == "PREDATOR_REGISTRY_SYNC_FIX"
+    errors = []
+    warnings = []
+    actions = []
+    open_repaired = []
+    closed_repaired = []
+    open_skipped = []
+    closed_skipped = []
+
+    registry, reg_err = _pprsf_v1_load_registry()
+    if registry is None:
+        payload = {
+            "ok": False,
+            "status": "REGISTRY_UNAVAILABLE",
+            "version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
+            "generated_at": _pprsf_v1_now(),
+            "commit": commit,
+            "committed": False,
+            "error": reg_err,
+        }
+        return payload
+
+    if commit and not ack_ok:
+        errors.append("Commit exige ack=PREDATOR_REGISTRY_SYNC_FIX.")
+
+    before_snapshot = predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False) if callable(globals().get("predator_paper_lifecycle_audit_v1_status")) else {}
+    samples = before_snapshot.get("samples") or {}
+    module_positions = samples.get("module_open_positions") or _ppla_v1_get_predator_module_positions_raw()
+    closed_events = []
+    try:
+        closed_events, _ = _ppla_v1_get_closed_paper_events(limit=2000)
+    except Exception:
+        closed_events = []
+
+    existing_ids, open_sigs, closed_sigs = _pprsf_v1_existing_ids_and_signatures(registry)
+    open_trades = _pprsf_v1_open_dict(registry)
+    closed_trades = _pprsf_v1_closed_list(registry)
+
+    planned_open = []
+    for pos in module_positions or []:
+        if not isinstance(pos, dict):
+            continue
+        trade = _pprsf_v1_build_open_trade_from_position(pos)
+        if not trade:
+            open_skipped.append({"reason": "INVALID_OPEN_POSITION", "position": _pprsf_v1_public(pos, max_string=260)})
+            continue
+        tid = str(trade.get("trade_id"))
+        sig = _pprsf_v1_signature_trade(trade)
+        if tid in existing_ids or sig in open_sigs:
+            open_skipped.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "reason": "ALREADY_IN_REGISTRY"})
+            continue
+        planned_open.append(trade)
+        if commit and ack_ok and not errors:
+            try:
+                open_trades[tid] = trade
+                existing_ids.add(tid)
+                open_sigs.add(sig)
+                open_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup")})
+            except Exception as exc:
+                errors.append(f"Falha ao inserir OPEN {tid}: {exc}")
+
+    planned_closed = []
+    for ev in closed_events or []:
+        trade = _pprsf_v1_build_closed_trade_from_event(ev)
+        if not trade:
+            closed_skipped.append({"reason": "INVALID_CLOSED_EVENT", "event": _pprsf_v1_public(ev, max_string=260)})
+            continue
+        tid = str(trade.get("trade_id"))
+        sig = _pprsf_v1_closed_signature(trade)
+        if tid in existing_ids or sig in closed_sigs:
+            closed_skipped.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "reason": "ALREADY_IN_REGISTRY"})
+            continue
+        planned_closed.append(trade)
+        if commit and ack_ok and not errors:
+            try:
+                closed_trades.append(trade)
+                existing_ids.add(tid)
+                closed_sigs.add(sig)
+                closed_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup"), "pnl_pct": trade.get("pnl_pct"), "pnl_r": trade.get("pnl_r")})
+            except Exception as exc:
+                errors.append(f"Falha ao inserir CLOSED {tid}: {exc}")
+
+    committed = False
+    save_error = None
+    if commit and ack_ok and not errors:
+        try:
+            registry["open_trades"] = open_trades
+            registry["closed_trades"] = closed_trades
+            registry["last_update"] = _pprsf_v1_now()
+            registry["last_sync"] = {
+                "source": "predator_paper_registry_sync_fix_v1",
+                "version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
+                "synced_at": _pprsf_v1_now(),
+                "open_repaired_count": len(open_repaired),
+                "closed_repaired_count": len(closed_repaired),
+            }
+            central_trade_registry.save_registry(registry)
+            committed = True
+            actions.append("REGISTRY_SAVED")
+        except Exception as exc:
+            save_error = str(exc)
+            errors.append(f"Falha ao salvar Trade Registry: {exc}")
+
+    after_snapshot = None
+    if committed:
+        try:
+            after_snapshot = predator_paper_lifecycle_audit_v1_status(include_samples=False, use_cache=False)
+        except Exception as exc:
+            after_snapshot = {"error": str(exc)}
+
+    if not planned_open and not planned_closed and not errors:
+        status = "OK_ALREADY_SYNCED"
+    elif commit and committed and not errors:
+        status = "REPAIRED"
+    elif commit and errors:
+        status = "COMMIT_ERROR"
+    elif planned_open or planned_closed:
+        status = "REPAIR_READY"
+    else:
+        status = "OK_NO_ACTION"
+
+    ok = status in {"OK_ALREADY_SYNCED", "REPAIRED", "OK_NO_ACTION", "REPAIR_READY"} and not errors
+    if planned_open and not commit:
+        warnings.append(f"OPEN pendente de reparo: {len(planned_open)}.")
+    if planned_closed and not commit:
+        warnings.append(f"CLOSED pendente de reparo: {len(planned_closed)}.")
+    if open_skipped:
+        warnings.append(f"OPEN ignorados: {len(open_skipped)}.")
+    if closed_skipped:
+        warnings.append(f"CLOSED ignorados: {len(closed_skipped)}.")
+
+    payload = {
+        "ok": ok,
+        "status": status,
+        "version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
+        "generated_at": _pprsf_v1_now(),
+        "commit": commit,
+        "committed": committed,
+        "ack_required": "PREDATOR_REGISTRY_SYNC_FIX",
+        "ack_ok": ack_ok,
+        "mode": (before_snapshot or {}).get("mode"),
+        "execution_enabled": (before_snapshot or {}).get("execution_enabled"),
+        "execution_firewall_enabled": (before_snapshot or {}).get("execution_firewall_enabled"),
+        "planned_open_repair_count": len(planned_open),
+        "planned_closed_repair_count": len(planned_closed),
+        "open_repaired_count": len(open_repaired),
+        "closed_repaired_count": len(closed_repaired),
+        "open_skipped_count": len(open_skipped),
+        "closed_skipped_count": len(closed_skipped),
+        "errors": errors,
+        "warnings": warnings,
+        "actions": actions,
+        "save_error": save_error,
+        "before_lifecycle_counts": (before_snapshot or {}).get("counts"),
+        "after_lifecycle_counts": (after_snapshot or {}).get("counts") if isinstance(after_snapshot, dict) else None,
+        "files": {
+            "events": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE,
+            "latest": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE,
+        },
+        "notes": [
+            "GET sem commit é preview/dry-run.",
+            "Commit exige commit=true&ack=PREDATOR_REGISTRY_SYNC_FIX.",
+            "Esta rota não envia ordens, não altera risco e não rearma execução real.",
+        ],
+        "token_value_exposed": False,
+    }
+    if include_samples:
+        payload["samples"] = {
+            "planned_open": [_pprsf_v1_public(x, max_string=320) for x in planned_open[:20]],
+            "planned_closed": [_pprsf_v1_public(x, max_string=320) for x in planned_closed[:20]],
+            "open_repaired": open_repaired[:50],
+            "closed_repaired": closed_repaired[:50],
+            "open_skipped": open_skipped[:20],
+            "closed_skipped": closed_skipped[:20],
+        }
+    try:
+        latest_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE)
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        latest_path.write_text(json.dumps(_pprsf_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        event_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE)
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        with event_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "event": "PREDATOR_PAPER_REGISTRY_SYNC_FIX_RUN",
+                "generated_at": payload.get("generated_at"),
+                "status": status,
+                "commit": commit,
+                "committed": committed,
+                "planned_open_repair_count": len(planned_open),
+                "planned_closed_repair_count": len(planned_closed),
+                "open_repaired_count": len(open_repaired),
+                "closed_repaired_count": len(closed_repaired),
+                "errors": errors[:5],
+                "warnings": warnings[:5],
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    try:
+        _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["ts"] = _pprsf_v1_epoch_now()
+        _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["payload"] = payload
+    except Exception:
+        pass
+    return payload
+
+
+def build_predator_paper_registry_sync_fix_v1_text(commit=False, ack=None):
+    payload = predator_paper_registry_sync_fix_v1_status(commit=commit, ack=ack, include_samples=False, use_cache=False)
+    b = payload.get("before_lifecycle_counts") or {}
+    a = payload.get("after_lifecycle_counts") or {}
+    lines = [
+        "🧩 PREDATOR PAPER REGISTRY SYNC FIX V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Modo / execução:",
+        f"- mode/execution_mode: {payload.get('mode')}",
+        f"- execution_enabled: {payload.get('execution_enabled')}",
+        f"- execution_firewall_enabled: {payload.get('execution_firewall_enabled')}",
+        "",
+        "Commit:",
+        f"- commit solicitado: {payload.get('commit')}",
+        f"- ack_ok: {payload.get('ack_ok')}",
+        f"- committed: {payload.get('committed')}",
+        "",
+        "Reparo planejado/executado:",
+        f"- OPEN planejado: {payload.get('planned_open_repair_count')}",
+        f"- CLOSED planejado: {payload.get('planned_closed_repair_count')}",
+        f"- OPEN reparado: {payload.get('open_repaired_count')}",
+        f"- CLOSED reparado: {payload.get('closed_repaired_count')}",
+        f"- OPEN ignorado: {payload.get('open_skipped_count')}",
+        f"- CLOSED ignorado: {payload.get('closed_skipped_count')}",
+        "",
+        "Lifecycle antes:",
+        f"- Module OPEN: {b.get('module_open_count')}",
+        f"- Registry OPEN: {b.get('registry_open_count')}",
+        f"- Registry CLOSED: {b.get('registry_closed_count')}",
+        f"- Missing OPEN: {b.get('missing_registry_open_count')}",
+        f"- Missing CLOSED: {b.get('missing_registry_closed_count')}",
+    ]
+    if a:
+        lines += [
+            "",
+            "Lifecycle depois:",
+            f"- Module OPEN: {a.get('module_open_count')}",
+            f"- Registry OPEN: {a.get('registry_open_count')}",
+            f"- Registry CLOSED: {a.get('registry_closed_count')}",
+            f"- Missing OPEN: {a.get('missing_registry_open_count')}",
+            f"- Missing CLOSED: {a.get('missing_registry_closed_count')}",
+        ]
+    if payload.get("errors"):
+        lines += ["", "Erros:"] + [f"- ❌ {x}" for x in payload.get("errors")]
+    if payload.get("warnings"):
+        lines += ["", "Avisos:"] + [f"- ⚠️ {x}" for x in payload.get("warnings")]
+    lines += [
+        "",
+        "Como aplicar reparo:",
+        "- Preview: /predator/registrysync/text",
+        "- Commit: /predator/registrysync/text?commit=true&ack=PREDATOR_REGISTRY_SYNC_FIX",
+        "",
+        "Leitura executiva:",
+        "- Esta rota corrige somente o Registry PAPER do Predator.",
+        "- Não envia ordens, não rearma LIVE e não altera risco.",
+        "- Depois do commit, rode /predator/lifecycleaudit/text para confirmar limpeza.",
+        "",
+        "Arquivos:",
+        f"- Eventos: {PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE}",
+        f"- Último snapshot: {PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE}",
+    ]
+    return "\n".join(lines)
+
+
+_ORIGINAL_BOT_HEALTH_FOR_PREDATOR_REGISTRY_SYNC_FIX_V1 = bot_health if "bot_health" in globals() else None
+
+
+def bot_health(key: str, cfg: dict):
+    original = _ORIGINAL_BOT_HEALTH_FOR_PREDATOR_REGISTRY_SYNC_FIX_V1
+    if callable(original):
+        payload = original(key, cfg)
+    else:
+        payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
+    try:
+        if str(key).upper() == "PREDATOR":
+            sync = predator_paper_registry_sync_fix_v1_status(commit=False, include_samples=False, use_cache=True)
+            overlay = {
+                "predator_registry_sync_status": sync.get("status"),
+                "predator_registry_sync_ok": sync.get("ok"),
+                "predator_registry_sync_version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
+                "predator_registry_open_planned_count": sync.get("planned_open_repair_count"),
+                "predator_registry_closed_planned_count": sync.get("planned_closed_repair_count"),
+                "predator_registry_open_repaired_count": sync.get("open_repaired_count"),
+                "predator_registry_closed_repaired_count": sync.get("closed_repaired_count"),
+                "predator_registry_sync_error": "; ".join(sync.get("errors") or []) if sync.get("errors") else None,
+                "predator_registry_sync_warnings": (sync.get("warnings") or [])[:5],
+            }
+            health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+            health.update(overlay)
+            payload["health"] = health
+            payload.update(overlay)
+    except Exception as exc:
+        try:
+            payload.setdefault("health", {})["predator_registry_sync_overlay_error"] = str(exc)
+        except Exception:
+            pass
+    return payload
+
+
+@app.route("/predator/registrysync", methods=["GET", "POST"])
+@app.route("/predator/paperregistrysync", methods=["GET", "POST"])
+def predator_paper_registry_sync_fix_v1_route():
+    body = request.get_json(silent=True) or {}
+    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+    ack = body.get("ack", request.args.get("ack"))
+    return predator_paper_registry_sync_fix_v1_status(commit=commit, ack=ack, include_samples=True, use_cache=False), 200
+
+
+@app.route("/predator/registrysync/text", methods=["GET", "POST"])
+@app.route("/predator/paperregistrysync/text", methods=["GET", "POST"])
+def predator_paper_registry_sync_fix_v1_text_route():
+    body = request.get_json(silent=True) or {}
+    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+    ack = body.get("ack", request.args.get("ack"))
+    return build_predator_paper_registry_sync_fix_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
