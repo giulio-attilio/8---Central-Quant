@@ -40804,7 +40804,7 @@ def falcon_live_audit_guard_v1_ack_route():
 #   PREVIEW ou SAFE_DRY_RUN.
 # - Expor diagnóstico leve no /predator/pnlaudit e /predator/pnlaudit/text.
 # - Expor campos resumidos no /bots/PREDATOR.
-PREDATOR_PNL_PAPER_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PNL-PAPER-AUDIT-V1.2-SOURCE-DEDUP"
+PREDATOR_PNL_PAPER_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PNL-PAPER-AUDIT-V1.3-SEMANTIC-DEDUP"
 PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_events.jsonl")
 PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_latest.json")
 
@@ -41134,9 +41134,99 @@ def _pppa_v1_closed_trade_id_from_event(ev):
     """Extrai trade_id de um fechamento em qualquer fonte pública/sanitizada."""
     try:
         raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
-        tid = ev.get("trade_id") or _pppa_v1_deep_find(raw, ["trade_id", "id", "uid", "source_trade_id"])
+        tid = ev.get("trade_id") or _pppa_v1_deep_find(raw, ["trade_id", "source_trade_id"])
         if tid is not None and str(tid).strip():
             return str(tid).strip()
+        # Compatibilidade: alguns eventos antigos só expõem uid; não usar campo genérico id
+        # antes do fingerprint semântico, porque ids internos podem variar por fonte.
+        uid = _pppa_v1_deep_find(raw, ["uid"])
+        if uid is not None and str(uid).strip():
+            return str(uid).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _pppa_v1_norm_text(value):
+    try:
+        return str(value or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _pppa_v1_round_key_num(value, digits=10):
+    try:
+        f = _pppa_v1_float(value, default=None)
+        if f is None:
+            return ""
+        return (f"{round(float(f), int(digits)):.{int(digits)}f}").rstrip("0").rstrip(".")
+    except Exception:
+        return ""
+
+
+def _pppa_v1_closed_at_key(value):
+    """Normaliza horário de fechamento para chave semântica.
+
+    Mantém minuto quando o formato já vem como DD/MM/YYYY HH:MM e remove segundos/ruído
+    quando vier string mais longa. Não tenta converter timezone para evitar falso match.
+    """
+    try:
+        txt = str(value or "").strip()
+        if not txt:
+            return ""
+        # Formato principal da Central: 09/07/2026 10:43
+        import re
+        m = re.search(r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})", txt)
+        if m:
+            return m.group(1)
+        m = re.search(r"(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2})", txt)
+        if m:
+            return m.group(1).replace("T", " ")
+        return txt[:16]
+    except Exception:
+        return ""
+
+
+def _pppa_v1_source_event_key_from_closed(ev):
+    """V1.3: encontra a chave do evento original que gerou um CLOSED no Registry.
+
+    O Registry Sync grava metadata.source_event_key. O history_event original aparece com
+    ev['key'] igual a essa chave. Usar esse vínculo antes de trade_id evita contar duas vezes
+    o mesmo fechamento quando ele aparece em history_events e no Trade Registry persistente.
+    """
+    try:
+        raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
+        for keys in (["source_event_key"], ["event_key"], ["source_key"]):
+            val = _pppa_v1_deep_find(raw, keys, max_depth=6)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        key = str(ev.get("key") or "").strip()
+        src = str(ev.get("source") or "").lower()
+        if key and ("history" in src or key.startswith("history_events")):
+            return key
+    except Exception:
+        pass
+    return None
+
+
+def _pppa_v1_closed_semantic_fingerprint(ev):
+    """Fingerprint semântico para deduplicar history_events/audit/registry.
+
+    Usa campos do fechamento em vez de depender apenas de trade_id. Isso cobre o caso
+    em que history_events e Trade Registry usam ids/uid diferentes para o mesmo trade.
+    """
+    try:
+        raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
+        symbol = _pppa_v1_norm_symbol(ev.get("symbol") or _pppa_v1_deep_find(raw, ["symbol", "symbol_clean", "pair", "market_symbol"]))
+        side = _pppa_v1_norm_side(ev.get("side") or _pppa_v1_deep_find(raw, ["side", "direction", "position_side", "positionSide"]))
+        setup = _pppa_v1_norm_text(ev.get("setup") or _pppa_v1_deep_find(raw, ["setup", "signal_type", "strategy_name"]) or "SMART_PREDATOR")
+        closed_at = _pppa_v1_closed_at_key(_pppa_v1_deep_find(raw, ["closed_at", "datetime", "ts", "context_ts", "generated_at"]) or ev.get("ts"))
+        entry = _pppa_v1_round_key_num(_pppa_v1_deep_find(raw, ["entry", "entry_price"]), digits=10)
+        exit_price = _pppa_v1_round_key_num(_pppa_v1_deep_find(raw, ["exit_price", "exit", "close_price"]), digits=10)
+        pnl_r = _pppa_v1_round_key_num(_pppa_v1_deep_find(raw, ["pnl_r", "result_r", "r", "r_multiple"]), digits=6)
+        pnl_pct = _pppa_v1_round_key_num(_pppa_v1_deep_find(raw, ["pnl_pct", "result_pct", "profit_pct", "pnl_percent", "pnl"]), digits=6)
+        if symbol and side and setup and closed_at and entry and exit_price:
+            return f"semantic|{symbol}|{side}|{setup}|{closed_at}|entry={entry}|exit={exit_price}|r={pnl_r}|pct={pnl_pct}"
     except Exception:
         pass
     return None
@@ -41145,27 +41235,47 @@ def _pppa_v1_closed_trade_id_from_event(ev):
 def _pppa_v1_closed_canonical_key(ev):
     """Chave única de fechamento PAPER para deduplicar history_events/audit/registry.
 
-    Preferência:
-    1) trade_id, quando disponível;
-    2) symbol + side + setup + closed_at + entry + exit_price.
+    V1.3 SEMANTIC DEDUP:
+    1) metadata.source_event_key / history event key, quando existir;
+    2) fingerprint semântico: symbol + side + setup + closed_at + entry + exit_price + pnl_r/pct;
+    3) trade_id/uid, como fallback;
+    4) fallback conservador.
     """
     try:
-        raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
+        source_event_key = _pppa_v1_source_event_key_from_closed(ev)
+        if source_event_key:
+            return "source_event_key|" + source_event_key
+
+        semantic = _pppa_v1_closed_semantic_fingerprint(ev)
+        if semantic:
+            return semantic
+
         trade_id = _pppa_v1_closed_trade_id_from_event(ev)
         if trade_id:
             return "trade_id|" + str(trade_id).upper().strip()
 
+        raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
         symbol = _pppa_v1_norm_symbol(ev.get("symbol") or _pppa_v1_deep_find(raw, ["symbol", "symbol_clean", "pair", "market_symbol"]))
         side = _pppa_v1_norm_side(ev.get("side") or _pppa_v1_deep_find(raw, ["side", "direction", "position_side", "positionSide"]))
-        setup = str(ev.get("setup") or _pppa_v1_deep_find(raw, ["setup", "signal_type", "strategy_name"]) or "SMART_PREDATOR").upper().strip()
-        closed_at = str(_pppa_v1_deep_find(raw, ["closed_at", "datetime", "ts", "context_ts", "generated_at"]) or ev.get("ts") or "").strip()
-        entry = _pppa_v1_float(_pppa_v1_deep_find(raw, ["entry", "entry_price"]), default=None)
-        exit_price = _pppa_v1_float(_pppa_v1_deep_find(raw, ["exit_price", "exit", "close_price"]), default=None)
-        entry_txt = "" if entry is None else str(round(float(entry), 10))
-        exit_txt = "" if exit_price is None else str(round(float(exit_price), 10))
-        return f"fallback|{symbol}|{side}|{setup}|{closed_at}|{entry_txt}|{exit_txt}"
+        setup = _pppa_v1_norm_text(ev.get("setup") or _pppa_v1_deep_find(raw, ["setup", "signal_type", "strategy_name"]) or "SMART_PREDATOR")
+        closed_at = _pppa_v1_closed_at_key(_pppa_v1_deep_find(raw, ["closed_at", "datetime", "ts", "context_ts", "generated_at"]) or ev.get("ts"))
+        return f"fallback|{symbol}|{side}|{setup}|{closed_at}|{str(ev.get('source') or '')}"
     except Exception:
         return "rawkey|" + str(ev.get("key") or uuid.uuid4())
+
+
+def _pppa_v1_duplicate_reason_for_group(group):
+    try:
+        sources = {str(x.get("source") or "").lower() for x in group}
+        if any("history" in s for s in sources) and any("trade_registry" in s for s in sources):
+            return "SAME_HISTORY_AND_REGISTRY_CLOSED"
+        if any("audit" in s for s in sources) and any("trade_registry" in s for s in sources):
+            return "SAME_AUDIT_AND_REGISTRY_CLOSED"
+        if len(sources) > 1:
+            return "SAME_TRADE_MULTIPLE_SOURCES"
+        return "SAME_TRADE_DUPLICATE_RECORD"
+    except Exception:
+        return "DUPLICATE_CLOSED"
 
 
 def _pppa_v1_pnl_fields_from_event(ev):
@@ -41210,7 +41320,7 @@ def _pppa_v1_registry_closed_as_events(registry):
 
 
 def _pppa_v1_build_pnl_stats(events, registry):
-    # V1.2: deduplica fechamentos entre history_events, audit logs e Trade Registry.
+    # V1.3: deduplica semanticamente fechamentos entre history_events, audit logs e Trade Registry.
     # SAFE_DRY_RUN, VERIFY, PREVIEW e REAL continuam excluídos do cálculo.
     raw_closed = []
     for ev in events:
@@ -41237,26 +41347,38 @@ def _pppa_v1_build_pnl_stats(events, registry):
         ck = _pppa_v1_closed_canonical_key(ev)
         item = dict(ev)
         item["canonical_key"] = ck
+        item["semantic_fingerprint"] = _pppa_v1_closed_semantic_fingerprint(ev)
+        item["source_event_key"] = _pppa_v1_source_event_key_from_closed(ev)
         grouped.setdefault(ck, []).append(item)
 
     unique_closed = []
     duplicate_closed = []
     sources_per_trade = []
+    duplicate_reasons = {}
     for ck, group in grouped.items():
         def _score(x):
             pnl_pct, pnl_r = _pppa_v1_pnl_fields_from_event(x)
             has_pnl = 1 if (pnl_pct is not None or pnl_r is not None) else 0
+            # Preferir history/audit em vez do espelho no registry, mas registry também é válido.
             return (has_pnl, _pppa_v1_closed_source_rank(x), str(x.get("ts") or ""))
 
         ordered = sorted(group, key=_score, reverse=True)
         chosen = dict(ordered[0])
+        reason = _pppa_v1_duplicate_reason_for_group(group) if len(group) > 1 else None
         chosen["duplicate_source_count"] = max(0, len(group) - 1)
+        chosen["duplicate_reason"] = reason
         chosen["sources"] = sorted(set(str(x.get("source") or "UNKNOWN") for x in group))
         unique_closed.append(chosen)
         if len(group) > 1:
-            duplicate_closed.extend(ordered[1:])
+            for dup in ordered[1:]:
+                d2 = dict(dup)
+                d2["duplicate_reason"] = reason
+                duplicate_closed.append(d2)
+            duplicate_reasons[reason or "DUPLICATE_CLOSED"] = duplicate_reasons.get(reason or "DUPLICATE_CLOSED", 0) + (len(group) - 1)
         sources_per_trade.append({
             "canonical_key": ck,
+            "semantic_fingerprint": chosen.get("semantic_fingerprint"),
+            "source_event_key": chosen.get("source_event_key"),
             "trade_id": _pppa_v1_closed_trade_id_from_event(chosen),
             "symbol": chosen.get("symbol"),
             "side": chosen.get("side"),
@@ -41264,6 +41386,7 @@ def _pppa_v1_build_pnl_stats(events, registry):
             "sources": chosen.get("sources"),
             "source_count": len(group),
             "duplicates_removed": max(0, len(group) - 1),
+            "duplicate_reason": reason,
         })
 
     # Ordem estável por timestamp para samples e relatórios.
@@ -41298,6 +41421,7 @@ def _pppa_v1_build_pnl_stats(events, registry):
         "raw_paper_closed_count": len(raw_closed),
         "duplicate_closed_count": len(duplicate_closed),
         "duplicate_closed_trade_count": duplicate_closed_trade_count,
+        "duplicate_reasons": duplicate_reasons,
         "paper_closed_with_pnl_count": len(with_pnl),
         "paper_closed_missing_pnl_count": len(missing_pnl),
         "wins": wins,
@@ -41310,12 +41434,13 @@ def _pppa_v1_build_pnl_stats(events, registry):
         "r_avg": round(sum(r_values) / len(r_values), 4) if r_values else 0.0,
         "profit_factor_pct": round(pf, 4),
         "sources_per_trade_count": len(sources_per_trade),
-        "sources_per_trade": [_pppa_v1_public(x, max_string=350) for x in sources_per_trade[-30:]],
-        "closed_sample": [_pppa_v1_public(x, max_string=350) for x in unique_closed[-10:]],
-        "duplicate_closed_sample": [_pppa_v1_public(x, max_string=250) for x in duplicate_closed[-10:]],
+        "sources_per_trade": [_pppa_v1_public(x, max_string=450) for x in sources_per_trade[-30:]],
+        "closed_sample": [_pppa_v1_public(x, max_string=450) for x in unique_closed[-10:]],
+        "duplicate_closed_sample": [_pppa_v1_public(x, max_string=350) for x in duplicate_closed[-10:]],
         "missing_pnl_sample": [_pppa_v1_public(x, max_string=250) for x in missing_pnl[-10:]],
-        "excluded_from_pnl_note": "SAFE_DRY_RUN, BROKER_PREVIEW, VERIFY e REAL_SENT_OR_LIVE_EVENT são excluídos do PnL estatístico/PAPER. V1.2 deduplica history/audit/registry antes de somar PnL/R.",
+        "excluded_from_pnl_note": "SAFE_DRY_RUN, BROKER_PREVIEW, VERIFY e REAL_SENT_OR_LIVE_EVENT são excluídos do PnL estatístico/PAPER. V1.3 deduplica semanticamente history/audit/registry antes de somar PnL/R.",
     }
+
 
 def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
     events, source_counts = _pppa_v1_collect_source_events(limit=limit)
@@ -41471,6 +41596,7 @@ def build_predator_pnl_paper_audit_v1_text():
         f"- R médio: {pnl.get('r_avg')}R",
         f"- Profit factor: {pnl.get('profit_factor_pct')}",
         f"- Trades com múltiplas fontes: {pnl.get('duplicate_closed_trade_count', 0)}",
+        f"- Motivos de duplicidade: {pnl.get('duplicate_reasons') or {}}",
         "",
         "Posições:",
         f"- Predator HEALTH last_positions_count: {mod.get('last_positions_count')}",
@@ -41487,7 +41613,7 @@ def build_predator_pnl_paper_audit_v1_text():
         "Leitura executiva:",
         "- Esta auditoria NÃO é PnL financeiro real; é limpeza estatística/PAPER do Predator.",
         "- SAFE_DRY_RUN/PREVIEW/VERIFY não devem entrar no resultado do robô.",
-        "- History/audit/registry são deduplicados antes de somar PnL/R.",
+        "- History/audit/registry são deduplicados semanticamente antes de somar PnL/R.",
         "- Predator deve continuar fora do LIVE até esta auditoria ficar limpa e consistente.",
         "",
         "Arquivos:",
@@ -41523,6 +41649,7 @@ def bot_health(key: str, cfg: dict):
                 "predator_paper_closed_unique_count": (audit.get("paper_pnl") or {}).get("unique_paper_closed_count"),
                 "predator_paper_closed_duplicate_count": (audit.get("paper_pnl") or {}).get("duplicate_closed_count"),
                 "predator_paper_closed_duplicate_trade_count": (audit.get("paper_pnl") or {}).get("duplicate_closed_trade_count"),
+                "predator_paper_closed_duplicate_reasons": (audit.get("paper_pnl") or {}).get("duplicate_reasons"),
                 "predator_paper_closed_with_pnl_count": (audit.get("paper_pnl") or {}).get("paper_closed_with_pnl_count"),
                 "predator_paper_closed_missing_pnl_count": (audit.get("paper_pnl") or {}).get("paper_closed_missing_pnl_count"),
                 "predator_paper_pnl_total_pct": (audit.get("paper_pnl") or {}).get("pnl_total_pct"),
