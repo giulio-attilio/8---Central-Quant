@@ -39751,7 +39751,7 @@ def live_pilot_guard_v1_text_route():
 # - Divergência Central x BingX bloqueia novas entradas LIVE.
 # - Expõe health em /bots/FALCON e rota /falcon/liveaudit/text.
 # ============================================================================
-FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION = "2026-07-09-FALCON-LIVE-EXECUTION-AUDIT-GUARD-V1.2-ACK-RECHECK-FIX"
+FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION = "2026-07-09-FALCON-LIVE-EXECUTION-AUDIT-GUARD-V1.3-BAD-EVENT-SEMANTIC-DEDUP"
 
 try:
     FALCON_LIVE_AUDIT_EVENTS_FILE = CENTRAL_DATA_DIR / "falcon_live_execution_audit.jsonl"
@@ -40222,6 +40222,12 @@ def _fleag_v1_event_indicates_bad_live_execution(e):
     """
     try:
         e = e if isinstance(e, dict) else {"raw": str(e)}
+        # Never count audit-control records themselves as failed LIVE executions.
+        # ACK rows can contain the text LIVE_SENT_BUT_DISASTER_STOP_FAILED inside
+        # acked_bad_event_keys, which must not create a new unacked failure.
+        control_event = str(e.get("event") or e.get("audit_event") or "").upper().strip()
+        if control_event in {"FALCON_LIVE_AUDIT_ACK", "FALCON_LIVE_EXECUTION_AUDIT_ACK"}:
+            return False
         values = _fleag_v1_deep_values(e)
         joined = " | ".join(values).upper()
         bot_raw = _fleag_v1_deep_find(e, ["bot", "robot", "strategy", "source_bot", "bot_name"])
@@ -40450,6 +40456,212 @@ def _fleag_v1_split_bad_events_by_ack_v1_2(bad_events_all, state):
             unacked_events.append(event)
     return acked_events, unacked_events
 
+
+# Falcon Live Audit Bad Event Semantic Dedup V1.3
+# ------------------------------------------------
+# V1.2 correctly persisted ACK keys, but a single historical bad execution could
+# still be read twice from different log sources/schemas. V1.3 deduplicates bad
+# events semantically BEFORE deciding whether the Falcon live audit must block.
+
+def _fleag_v1_canonical_status_v1_3(event):
+    try:
+        event = event if isinstance(event, dict) else {"raw": str(event)}
+        status_raw = _fleag_v1_deep_find(event, [
+            "status", "status_code", "event", "classification", "result_status", "execution_status"
+        ])
+        joined = " | ".join(_fleag_v1_deep_values(event)).upper()
+        status = str(status_raw or "").upper().strip()
+        if "LIVE_SENT_BUT_DISASTER_STOP_FAILED" in status or "LIVE_SENT_BUT_DISASTER_STOP_FAILED" in joined:
+            return "LIVE_SENT_BUT_DISASTER_STOP_FAILED"
+        if "DISASTER_STOP_FAILED" in status or "DISASTER_STOP_FAILED" in joined:
+            return "LIVE_SENT_BUT_DISASTER_STOP_FAILED"
+        if "LIVE_SENT" in status or "LIVE_SENT" in joined:
+            return "LIVE_SENT"
+        return status or "UNKNOWN_STATUS"
+    except Exception:
+        return "UNKNOWN_STATUS"
+
+
+def _fleag_v1_canonical_order_id_v1_3(event):
+    try:
+        event = event if isinstance(event, dict) else {}
+        # Prefer true exchange order IDs. Use tags/client IDs only as fallback.
+        for k in ["order_id", "exchange_order_id", "id"]:
+            v = _fleag_v1_deep_find(event, [k])
+            if v not in (None, ""):
+                s = str(v).strip()
+                if s and s.lower() != "none":
+                    return s
+        for k in ["client_order_id", "clientOrderId", "client_orderid", "client_tag", "tag"]:
+            v = _fleag_v1_deep_find(event, [k])
+            if v not in (None, ""):
+                s = str(v).strip()
+                if s and s.lower() != "none":
+                    return s
+    except Exception:
+        pass
+    return "NO_ORDER_ID"
+
+
+def _fleag_v1_canonical_symbol_v1_3(value):
+    try:
+        raw = str(value or "").upper().strip()
+        if raw:
+            raw = raw.replace("/", "").replace(":USDT", "").replace("-", "")
+            if raw and not raw.endswith("USDT"):
+                raw += "USDT"
+            return raw
+    except Exception:
+        pass
+    try:
+        return _fleag_v1_norm_symbol(value) or "UNKNOWN_SYMBOL"
+    except Exception:
+        return "UNKNOWN_SYMBOL"
+
+
+def _fleag_v1_canonical_side_v1_3(value):
+    try:
+        norm = _fleag_v1_norm_side(value)
+        if norm in {"LONG", "SHORT"}:
+            return norm
+        raw = str(value or "").upper().strip()
+        if raw in {"BUY", "BID"}:
+            return "LONG"
+        if raw in {"SELL", "ASK"}:
+            return "SHORT"
+        return raw or "UNKNOWN_SIDE"
+    except Exception:
+        return "UNKNOWN_SIDE"
+
+
+def _fleag_v1_bad_event_canonical_key_v1_3(event):
+    try:
+        event = event if isinstance(event, dict) else {"raw": str(event)}
+        order_id = _fleag_v1_canonical_order_id_v1_3(event)
+        status = _fleag_v1_canonical_status_v1_3(event)
+        symbol_raw = _fleag_v1_deep_find(event, ["symbol", "market_symbol", "pair", "instrument", "asset"])
+        side_raw = _fleag_v1_deep_find(event, ["side", "order_side", "position_side", "positionSide", "direction", "signal"])
+        symbol = _fleag_v1_canonical_symbol_v1_3(symbol_raw)
+        side = _fleag_v1_canonical_side_v1_3(side_raw)
+        if order_id != "NO_ORDER_ID":
+            return "|".join(["ORDER", order_id, status, symbol, side])[:300]
+        # Fallback only when order_id is unavailable. Include a time bucket/tag to avoid
+        # merging distinct failures in different moments.
+        tag = str(_fleag_v1_deep_find(event, ["tag", "client_tag", "client_order_id", "clientOrderId"]) or "NO_TAG").strip()
+        ts = str(_fleag_v1_deep_find(event, ["ts", "generated_at", "timestamp", "datetime", "time"]) or "NO_TIME").strip()
+        return "|".join(["FALLBACK", tag, status, symbol, side, ts])[:300]
+    except Exception:
+        try:
+            return (_fleag_v1_event_key(event) or json.dumps(_fleag_v1_public(event), ensure_ascii=False, sort_keys=True, default=str))[:300]
+        except Exception:
+            return "UNKNOWN_BAD_EVENT"
+
+
+def _fleag_v1_ack_key_to_canonical_candidates_v1_3(ack_key):
+    """Map old ACK keys to the V1.3 semantic canonical schema.
+
+    Old ACK keys look like:
+    order_id|status|timestamp|symbol|side
+    but the same event may later be read from another file with a different timestamp
+    or symbol format. V1.3 ignores timestamp when order_id is present.
+    """
+    out = set()
+    try:
+        s = str(ack_key or "").strip()
+        if not s:
+            return out
+        parts = s.split("|")
+        if len(parts) >= 5:
+            order_id = str(parts[0] or "").strip()
+            status = str(parts[1] or "").strip().upper() or "LIVE_SENT_BUT_DISASTER_STOP_FAILED"
+            symbol = _fleag_v1_canonical_symbol_v1_3(parts[3])
+            side = _fleag_v1_canonical_side_v1_3(parts[4])
+            if "DISASTER_STOP_FAILED" in status:
+                status = "LIVE_SENT_BUT_DISASTER_STOP_FAILED"
+            if order_id:
+                out.add("|".join(["ORDER", order_id, status, symbol, side])[:300])
+        # If an ACK key already came from V1.3 canonical format, preserve it.
+        if s.startswith("ORDER|") or s.startswith("FALLBACK|"):
+            out.add(s[:300])
+    except Exception:
+        pass
+    return out
+
+
+def _fleag_v1_ack_canonical_keys_v1_3(state):
+    out = set()
+    try:
+        for k in (state or {}).get("acked_bad_event_keys") or []:
+            out.update(_fleag_v1_ack_key_to_canonical_candidates_v1_3(k))
+    except Exception:
+        pass
+    return {x for x in out if str(x or "").strip()}
+
+
+def _fleag_v1_dedup_bad_events_v1_3(bad_events_all, state):
+    state = state if isinstance(state, dict) else {}
+    acked_keys = set(str(x) for x in (state.get("acked_bad_event_keys") or []) if str(x or "").strip())
+    acked_canonicals = _fleag_v1_ack_canonical_keys_v1_3(state)
+    groups = {}
+    for event in bad_events_all or []:
+        key = _fleag_v1_bad_event_canonical_key_v1_3(event)
+        groups.setdefault(key, []).append(event)
+
+    unique_events = []
+    unique_acked = []
+    unique_unacked = []
+    duplicate_samples = []
+    duplicate_count = 0
+
+    for key, items in groups.items():
+        # Use the first item as representative, but prefer one that directly matches
+        # old ACK candidate keys for easier human inspection.
+        representative = items[0] if items else {}
+        for item in items:
+            if _fleag_v1_is_bad_event_acked_v1_2(item, acked_keys):
+                representative = item
+                break
+
+        is_acked = False
+        if key in acked_canonicals:
+            is_acked = True
+        else:
+            for item in items:
+                if _fleag_v1_is_bad_event_acked_v1_2(item, acked_keys):
+                    is_acked = True
+                    break
+
+        unique_events.append(representative)
+        if is_acked:
+            unique_acked.append(representative)
+        else:
+            unique_unacked.append(representative)
+
+        if len(items) > 1:
+            duplicate_count += len(items) - 1
+            duplicate_samples.append(_fleag_v1_public({
+                "canonical_key": key,
+                "raw_count": len(items),
+                "acked": bool(is_acked),
+                "source_files": sorted(list({str((x or {}).get("_source_file") or "unknown") for x in items if isinstance(x, dict)}))[:8],
+                "sample_order_ids": sorted(list({str(_fleag_v1_canonical_order_id_v1_3(x)) for x in items}))[:5],
+            }))
+
+    return {
+        "raw_bad_events": list(bad_events_all or []),
+        "unique_bad_events": unique_events,
+        "unique_bad_events_acked": unique_acked,
+        "unique_bad_events_unacked": unique_unacked,
+        "raw_bad_events_total_count": len(bad_events_all or []),
+        "unique_bad_events_total_count": len(unique_events),
+        "unique_bad_events_acked_count": len(unique_acked),
+        "unique_bad_events_unacked_count": len(unique_unacked),
+        "duplicate_bad_events_removed_count": duplicate_count,
+        "duplicate_bad_event_groups_count": len([1 for v in groups.values() if len(v) > 1]),
+        "duplicate_bad_event_samples": duplicate_samples[:10],
+        "semantic_dedup_active": True,
+    }
+
 def _fleag_v1_read_jsonl_file(path, limit=200):
     rows = []
     try:
@@ -40554,13 +40766,18 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
     cfg = _fleag_v1_config()
     state = _fleag_v1_load_state()
     acked = set(state.get("acked_bad_event_keys") or [])
-    bad_events_all = _fleag_v1_read_bad_execution_events(limit=200)
-    bad_events_acked, bad_events = _fleag_v1_split_bad_events_by_ack_v1_2(bad_events_all, state)
+    raw_bad_events_all = _fleag_v1_read_bad_execution_events(limit=200)
+    dedup = _fleag_v1_dedup_bad_events_v1_3(raw_bad_events_all, state)
+    bad_events = dedup.get("unique_bad_events_unacked") or []
+    bad_events_acked = dedup.get("unique_bad_events_acked") or []
+    bad_events_unique = dedup.get("unique_bad_events") or []
     divergence = _fleag_v1_divergence_payload()
     reasons = []
     warnings = []
     if not cfg.get("enabled"):
         warnings.append("Falcon Live Execution Audit Guard desabilitado por ENV.")
+    if dedup.get("duplicate_bad_events_removed_count"):
+        warnings.append(f"Eventos ruins LIVE duplicados entre fontes removidos: {dedup.get('duplicate_bad_events_removed_count')}.")
     if cfg.get("block_on_previous_failure") and bad_events:
         reasons.append(f"Existe LIVE_SENT_BUT_DISASTER_STOP_FAILED não reconhecido: {len(bad_events)} evento(s).")
     if cfg.get("block_on_divergence") and divergence.get("only_bingx_count"):
@@ -40576,7 +40793,7 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
     if str(state.get("last_live_order_registry_status") or "").upper() in {"REGISTER_ERROR", "REGISTRY_SYNC_ERROR", "TRADE_REGISTRY_SYNC_FUNCTION_MISSING"}:
         reasons.append(f"Último registro LIVE falhou: {state.get('last_live_order_registry_status')}.")
     if not reasons and cfg.get("enabled"):
-        status = "OK_ACKED_HISTORY_CLEAR" if bad_events_all and not bad_events else "OK"
+        status = "OK_ACKED_HISTORY_CLEAR" if bad_events_unique and not bad_events else "OK"
     else:
         status = "BLOCKED"
     latest = None
@@ -40585,8 +40802,9 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
             latest = json.loads(FALCON_LIVE_AUDIT_LATEST_FILE.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
         latest = None
+    ack_status = "CLEAR" if bad_events_unique and not bad_events else ("NO_BAD_EVENTS" if not bad_events_unique else "UNACKED_BAD_EVENTS")
     return {
-        "ok": status == "OK",
+        "ok": status != "BLOCKED",
         "module": "falcon_live_execution_audit_guard_v1",
         "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
         "generated_at": _fleag_v1_now(),
@@ -40601,10 +40819,16 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
         "bad_execution_events_unacked_count": len(bad_events),
         "bad_execution_events_acked": bad_events_acked[-10:],
         "bad_execution_events_acked_count": len(bad_events_acked),
-        "bad_execution_events_total_count": len(bad_events_all),
+        "bad_execution_events_total_count": len(bad_events_unique),
+        "bad_execution_events_raw_total_count": dedup.get("raw_bad_events_total_count"),
+        "bad_execution_events_unique_total_count": dedup.get("unique_bad_events_total_count"),
+        "bad_execution_events_duplicate_removed_count": dedup.get("duplicate_bad_events_removed_count"),
+        "bad_execution_events_duplicate_groups_count": dedup.get("duplicate_bad_event_groups_count"),
+        "bad_execution_events_duplicate_samples": dedup.get("duplicate_bad_event_samples"),
         "acked_bad_event_keys_count": len(acked),
         "ack_recheck_fix_active": True,
-        "ack_recheck_status": "CLEAR" if bad_events_all and not bad_events else ("NO_BAD_EVENTS" if not bad_events_all else "UNACKED_BAD_EVENTS"),
+        "semantic_dedup_active": True,
+        "ack_recheck_status": ack_status,
         "latest_event": _fleag_v1_public(latest),
         "recent_events": _fleag_v1_read_events(limit=10) if include_recent else [],
         "routes": [
@@ -40900,9 +41124,13 @@ def bot_health(key: str, cfg: dict):
                 "live_audit_status": audit.get("live_audit_status"),
                 "live_audit_block_reason": audit.get("live_audit_block_reason"),
                 "falcon_live_audit_bad_events_total_count": audit.get("bad_execution_events_total_count"),
+                "falcon_live_audit_bad_events_raw_total_count": audit.get("bad_execution_events_raw_total_count"),
+                "falcon_live_audit_bad_events_unique_total_count": audit.get("bad_execution_events_unique_total_count"),
+                "falcon_live_audit_bad_events_duplicate_removed_count": audit.get("bad_execution_events_duplicate_removed_count"),
                 "falcon_live_audit_bad_events_acked_count": audit.get("bad_execution_events_acked_count"),
                 "falcon_live_audit_bad_events_unacked_count": audit.get("bad_execution_events_unacked_count"),
                 "falcon_live_audit_ack_recheck_status": audit.get("ack_recheck_status"),
+                "falcon_live_audit_semantic_dedup_active": audit.get("semantic_dedup_active"),
                 "falcon_live_audit_version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
             }
             health.update(overlay)
@@ -40945,11 +41173,14 @@ def build_falcon_live_audit_guard_v1_text():
         f"- LIVE sem stop: {div.get('live_without_stop_count')}",
         "",
         "Histórico LIVE com falha:",
-        f"- Eventos ruins totais: {payload.get('bad_execution_events_total_count')}",
+        f"- Eventos ruins brutos: {payload.get('bad_execution_events_raw_total_count')}",
+        f"- Eventos ruins únicos/deduplicados: {payload.get('bad_execution_events_unique_total_count')}",
+        f"- Duplicados removidos: {payload.get('bad_execution_events_duplicate_removed_count')}",
         f"- Eventos reconhecidos por ACK: {payload.get('bad_execution_events_acked_count')}",
         f"- Eventos ruins ainda não reconhecidos: {payload.get('bad_execution_events_unacked_count')}",
         f"- ACK keys salvas: {payload.get('acked_bad_event_keys_count')}",
         f"- ACK recheck: {payload.get('ack_recheck_status')}",
+        f"- Semantic dedup: {payload.get('semantic_dedup_active')}",
         "",
         "Bloqueios:",
     ]
@@ -40959,6 +41190,12 @@ def build_falcon_live_audit_guard_v1_text():
         lines.append("- ✅ Nenhum bloqueio ativo.")
     if payload.get("warnings"):
         lines += ["", "Avisos:"] + [f"- ⚠️ {x}" for x in payload.get("warnings")]
+    dup_samples = payload.get("bad_execution_events_duplicate_samples") or []
+    if dup_samples:
+        lines += ["", "Amostra de duplicidade:"]
+        for sample in dup_samples[:3]:
+            if isinstance(sample, dict):
+                lines.append(f"- canonical_key: {sample.get('canonical_key')} | raw_count: {sample.get('raw_count')} | acked: {sample.get('acked')}")
     lines += [
         "",
         "Arquivos:",
@@ -41005,6 +41242,9 @@ def falcon_live_audit_guard_v1_ack_route():
     for e in bad:
         try:
             keys.extend(sorted(_fleag_v1_bad_event_key_candidates_v1_2(e)))
+            ck = _fleag_v1_bad_event_canonical_key_v1_3(e)
+            if ck:
+                keys.append(ck)
         except Exception:
             k = _fleag_v1_event_key(e)
             if k:
