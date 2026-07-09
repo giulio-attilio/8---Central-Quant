@@ -1608,7 +1608,7 @@ def runtime_stability_v1_snapshot(hours=24):
             reasons.append("Sem sinais internos de instabilidade na janela monitorada.")
 
         return {
-            "ok": status == "OK",
+            "ok": status in {"OK", "OK_ACKED_HISTORY_CLEAR"},
             "module": "runtime_stability_v1",
             "version": CENTRAL_RUNTIME_STABILITY_V1_VERSION,
             "generated_at": data_hora_sp_str(),
@@ -39751,7 +39751,7 @@ def live_pilot_guard_v1_text_route():
 # - Divergência Central x BingX bloqueia novas entradas LIVE.
 # - Expõe health em /bots/FALCON e rota /falcon/liveaudit/text.
 # ============================================================================
-FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION = "2026-07-09-FALCON-LIVE-EXECUTION-AUDIT-GUARD-V1.1-HISTORICAL-DETECTION"
+FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION = "2026-07-09-FALCON-LIVE-EXECUTION-AUDIT-GUARD-V1.2-ACK-RECHECK-FIX"
 
 try:
     FALCON_LIVE_AUDIT_EVENTS_FILE = CENTRAL_DATA_DIR / "falcon_live_execution_audit.jsonl"
@@ -40248,6 +40248,208 @@ def _fleag_v1_event_indicates_bad_live_execution(e):
         return False
 
 
+
+
+def _fleag_v1_symbol_variants_v1_2(value):
+    """Build symbol variants so historical ACKs match both broker and Central schemas."""
+    variants = []
+    try:
+        raw = str(value or "").strip()
+        if raw:
+            variants.append(raw)
+            variants.append(raw.upper())
+            compact = raw.upper().replace("/", "").replace(":USDT", "")
+            if compact:
+                variants.append(compact)
+                if compact.endswith("USDT") and len(compact) > 4:
+                    base = compact[:-4]
+                    variants.append(f"{base}/USDT")
+                    variants.append(f"{base}/USDT:USDT")
+    except Exception:
+        pass
+    try:
+        norm = _fleag_v1_norm_symbol(value)
+        if norm:
+            variants.append(norm)
+            if str(norm).endswith("USDT") and len(str(norm)) > 4:
+                base = str(norm)[:-4]
+                variants.append(f"{base}/USDT")
+                variants.append(f"{base}/USDT:USDT")
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for x in variants:
+        sx = str(x or "").strip()
+        if sx and sx not in seen:
+            seen.add(sx)
+            out.append(sx)
+    return out or [""]
+
+
+def _fleag_v1_side_variants_v1_2(value):
+    """Build side variants so buy/LONG and sell/SHORT ACK formats match."""
+    variants = []
+    try:
+        raw = str(value or "").strip()
+        if raw:
+            variants += [raw, raw.upper(), raw.lower()]
+        norm = _fleag_v1_norm_side(raw)
+        if norm:
+            variants += [norm, norm.upper(), norm.lower()]
+            if norm == "LONG":
+                variants += ["buy", "BUY", "long", "LONG"]
+            elif norm == "SHORT":
+                variants += ["sell", "SELL", "short", "SHORT"]
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for x in variants:
+        sx = str(x or "").strip()
+        if sx and sx not in seen:
+            seen.add(sx)
+            out.append(sx)
+    return out or [""]
+
+
+def _fleag_v1_status_variants_v1_2(event):
+    variants = []
+    try:
+        event = event if isinstance(event, dict) else {"raw": str(event)}
+        status_raw = _fleag_v1_deep_find(event, [
+            "status", "status_code", "event", "classification", "result_status", "execution_status"
+        ])
+        if status_raw not in (None, ""):
+            variants.append(str(status_raw).strip())
+        joined = " | ".join(_fleag_v1_deep_values(event)).upper()
+        if "LIVE_SENT_BUT_DISASTER_STOP_FAILED" in joined:
+            variants.append("LIVE_SENT_BUT_DISASTER_STOP_FAILED")
+        elif "DISASTER_STOP_FAILED" in joined:
+            variants.append("DISASTER_STOP_FAILED")
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for x in variants:
+        sx = str(x or "").strip()
+        if sx and sx not in seen:
+            seen.add(sx)
+            out.append(sx)
+    return out or [""]
+
+
+def _fleag_v1_timestamp_variants_v1_2(event):
+    variants = []
+    try:
+        event = event if isinstance(event, dict) else {}
+        for k in ["ts", "generated_at", "timestamp", "datetime", "date_time", "time", "created_at", "updated_at"]:
+            v = _fleag_v1_deep_find(event, [k])
+            if v not in (None, ""):
+                variants.append(str(v).strip())
+        # Preserve the exact text used by /live when available inside compact rows.
+        raw_values = _fleag_v1_deep_values(event)
+        for v in raw_values:
+            s = str(v or "").strip()
+            if "/" in s and ":" in s and len(s) <= 32:
+                # This catches strings like 09/07/2026 12:15 without needing parsing.
+                if any(ch.isdigit() for ch in s):
+                    variants.append(s)
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for x in variants:
+        sx = str(x or "").strip()
+        if sx and sx not in seen:
+            seen.add(sx)
+            out.append(sx)
+    return out or [""]
+
+
+def _fleag_v1_order_id_variants_v1_2(event):
+    variants = []
+    try:
+        event = event if isinstance(event, dict) else {}
+        for k in [
+            "order_id", "id", "exchange_order_id", "client_order_id", "clientOrderId",
+            "client_orderid", "client_tag", "tag"
+        ]:
+            v = _fleag_v1_deep_find(event, [k])
+            if v not in (None, ""):
+                variants.append(str(v).strip())
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for x in variants:
+        sx = str(x or "").strip()
+        if sx and sx not in seen:
+            seen.add(sx)
+            out.append(sx)
+    return out or [""]
+
+
+def _fleag_v1_bad_event_key_candidates_v1_2(event, max_candidates=250):
+    """Return all canonical key formats that may represent the same bad historical LIVE event.
+
+    V1.1 saved ACK keys using one schema, while the recheck could see the same broker
+    event through another schema. V1.2 fixes that by comparing candidate key variants,
+    not a single brittle top-level key.
+    """
+    event = event if isinstance(event, dict) else {"raw": str(event)}
+    keys = set()
+    try:
+        old_key = _fleag_v1_event_key(event)
+        if old_key:
+            keys.add(str(old_key)[:260])
+    except Exception:
+        pass
+    try:
+        order_ids = _fleag_v1_order_id_variants_v1_2(event)
+        statuses = _fleag_v1_status_variants_v1_2(event)
+        timestamps = _fleag_v1_timestamp_variants_v1_2(event)
+        symbol_raw = _fleag_v1_deep_find(event, ["symbol", "market_symbol", "pair", "instrument", "asset"])
+        side_raw = _fleag_v1_deep_find(event, ["side", "order_side", "position_side", "positionSide", "direction", "signal"])
+        symbols = _fleag_v1_symbol_variants_v1_2(symbol_raw)
+        sides = _fleag_v1_side_variants_v1_2(side_raw)
+        for oid in order_ids[:10]:
+            for st in statuses[:8]:
+                for ts in timestamps[:12]:
+                    for sym in symbols[:8]:
+                        for side in sides[:8]:
+                            key = "|".join([str(oid or ""), str(st or ""), str(ts or ""), str(sym or ""), str(side or "")])[:260]
+                            if key.strip("|"):
+                                keys.add(key)
+                            if len(keys) >= max_candidates:
+                                return keys
+    except Exception:
+        pass
+    return keys
+
+
+def _fleag_v1_is_bad_event_acked_v1_2(event, acked_keys):
+    try:
+        acked = {str(x) for x in (acked_keys or []) if str(x or "").strip()}
+        if not acked:
+            return False
+        candidates = _fleag_v1_bad_event_key_candidates_v1_2(event)
+        return bool(candidates.intersection(acked))
+    except Exception:
+        return False
+
+
+def _fleag_v1_split_bad_events_by_ack_v1_2(bad_events_all, state):
+    acked_keys = set((state or {}).get("acked_bad_event_keys") or [])
+    acked_events = []
+    unacked_events = []
+    for event in bad_events_all or []:
+        if _fleag_v1_is_bad_event_acked_v1_2(event, acked_keys):
+            acked_events.append(event)
+        else:
+            unacked_events.append(event)
+    return acked_events, unacked_events
+
 def _fleag_v1_read_jsonl_file(path, limit=200):
     rows = []
     try:
@@ -40353,7 +40555,7 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
     state = _fleag_v1_load_state()
     acked = set(state.get("acked_bad_event_keys") or [])
     bad_events_all = _fleag_v1_read_bad_execution_events(limit=200)
-    bad_events = [e for e in bad_events_all if _fleag_v1_event_key(e) not in acked]
+    bad_events_acked, bad_events = _fleag_v1_split_bad_events_by_ack_v1_2(bad_events_all, state)
     divergence = _fleag_v1_divergence_payload()
     reasons = []
     warnings = []
@@ -40373,7 +40575,10 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
         reasons.append("Última ordem real com disaster stop FAILED.")
     if str(state.get("last_live_order_registry_status") or "").upper() in {"REGISTER_ERROR", "REGISTRY_SYNC_ERROR", "TRADE_REGISTRY_SYNC_FUNCTION_MISSING"}:
         reasons.append(f"Último registro LIVE falhou: {state.get('last_live_order_registry_status')}.")
-    status = "OK" if not reasons and cfg.get("enabled") else "BLOCKED"
+    if not reasons and cfg.get("enabled"):
+        status = "OK_ACKED_HISTORY_CLEAR" if bad_events_all and not bad_events else "OK"
+    else:
+        status = "BLOCKED"
     latest = None
     try:
         if FALCON_LIVE_AUDIT_LATEST_FILE.exists():
@@ -40394,7 +40599,12 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
         "divergence": divergence,
         "bad_execution_events_unacked": bad_events[-10:],
         "bad_execution_events_unacked_count": len(bad_events),
+        "bad_execution_events_acked": bad_events_acked[-10:],
+        "bad_execution_events_acked_count": len(bad_events_acked),
         "bad_execution_events_total_count": len(bad_events_all),
+        "acked_bad_event_keys_count": len(acked),
+        "ack_recheck_fix_active": True,
+        "ack_recheck_status": "CLEAR" if bad_events_all and not bad_events else ("NO_BAD_EVENTS" if not bad_events_all else "UNACKED_BAD_EVENTS"),
         "latest_event": _fleag_v1_public(latest),
         "recent_events": _fleag_v1_read_events(limit=10) if include_recent else [],
         "routes": [
@@ -40689,6 +40899,10 @@ def bot_health(key: str, cfg: dict):
                 "last_live_order_fail_safe_action": state.get("last_live_order_fail_safe_action"),
                 "live_audit_status": audit.get("live_audit_status"),
                 "live_audit_block_reason": audit.get("live_audit_block_reason"),
+                "falcon_live_audit_bad_events_total_count": audit.get("bad_execution_events_total_count"),
+                "falcon_live_audit_bad_events_acked_count": audit.get("bad_execution_events_acked_count"),
+                "falcon_live_audit_bad_events_unacked_count": audit.get("bad_execution_events_unacked_count"),
+                "falcon_live_audit_ack_recheck_status": audit.get("ack_recheck_status"),
                 "falcon_live_audit_version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
             }
             health.update(overlay)
@@ -40709,7 +40923,7 @@ def build_falcon_live_audit_guard_v1_text():
     lines = [
         "🛡️ FALCON LIVE EXECUTION AUDIT GUARD V1",
         f"Data/hora: {_fleag_v1_now()}",
-        f"Status: {'✅ OK' if payload.get('ok') else '🛑 BLOCKED'}",
+        f"Status: {'✅ ' + str(payload.get('live_audit_status') or 'OK') if payload.get('ok') else '🛑 BLOCKED'}",
         f"Versão: {FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}",
         "",
         "Última ordem real:",
@@ -40729,6 +40943,13 @@ def build_falcon_live_audit_guard_v1_text():
         f"- Só na BingX: {div.get('only_bingx_count')}",
         f"- Só na Central: {div.get('only_central_count')}",
         f"- LIVE sem stop: {div.get('live_without_stop_count')}",
+        "",
+        "Histórico LIVE com falha:",
+        f"- Eventos ruins totais: {payload.get('bad_execution_events_total_count')}",
+        f"- Eventos reconhecidos por ACK: {payload.get('bad_execution_events_acked_count')}",
+        f"- Eventos ruins ainda não reconhecidos: {payload.get('bad_execution_events_unacked_count')}",
+        f"- ACK keys salvas: {payload.get('acked_bad_event_keys_count')}",
+        f"- ACK recheck: {payload.get('ack_recheck_status')}",
         "",
         "Bloqueios:",
     ]
@@ -40780,19 +41001,27 @@ def falcon_live_audit_guard_v1_ack_route():
         }, 400
     state = _fleag_v1_load_state()
     bad = _fleag_v1_read_bad_execution_events(limit=200)
-    keys = [_fleag_v1_event_key(e) for e in bad if _fleag_v1_event_key(e)]
+    keys = []
+    for e in bad:
+        try:
+            keys.extend(sorted(_fleag_v1_bad_event_key_candidates_v1_2(e)))
+        except Exception:
+            k = _fleag_v1_event_key(e)
+            if k:
+                keys.append(k)
     existing = set(state.get("acked_bad_event_keys") or [])
-    existing.update(keys)
+    existing.update([str(k) for k in keys if str(k or "").strip()])
     state["acked_bad_event_keys"] = sorted(existing)[-500:]
     state["last_live_order_telegram_error"] = None
     state["live_audit_status"] = "ACKED_RECHECK_REQUIRED"
     state["live_audit_block_reason"] = None
     state["last_ack_at"] = _fleag_v1_now()
-    state["last_ack_bad_event_count"] = len(keys)
+    state["last_ack_bad_event_count"] = len(bad)
+    state["last_ack_key_count"] = len(keys)
     _fleag_v1_save_state(state)
-    event = {"event": "FALCON_LIVE_AUDIT_ACK", "acked_count": len(keys), "state": state}
+    event = {"event": "FALCON_LIVE_AUDIT_ACK", "acked_count": len(bad), "acked_key_count": len(keys), "state": state}
     _fleag_v1_append_event(event)
-    return {"ok": True, "status": "ACK_SAVED_RECHECK_REQUIRED", "acked_count": len(keys), "state": _fleag_v1_public(state), "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}, 200
+    return {"ok": True, "status": "ACK_SAVED_RECHECK_REQUIRED", "acked_count": len(bad), "acked_key_count": len(keys), "state": _fleag_v1_public(state), "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}, 200
 
 
 
