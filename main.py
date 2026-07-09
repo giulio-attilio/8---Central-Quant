@@ -40804,7 +40804,7 @@ def falcon_live_audit_guard_v1_ack_route():
 #   PREVIEW ou SAFE_DRY_RUN.
 # - Expor diagnóstico leve no /predator/pnlaudit e /predator/pnlaudit/text.
 # - Expor campos resumidos no /bots/PREDATOR.
-PREDATOR_PNL_PAPER_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PNL-PAPER-AUDIT-V1"
+PREDATOR_PNL_PAPER_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PNL-PAPER-AUDIT-V1.1-CLASSIFICATION-FIX"
 PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_events.jsonl")
 PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_latest.json")
 
@@ -40993,17 +40993,34 @@ def _pppa_v1_classify_item(item, source_name=""):
     status = str(_pppa_v1_deep_find(item, ["status", "result_status", "execution_status"]) or "").upper()
     event = str(_pppa_v1_deep_find(item, ["event", "event_type", "action", "type"]) or "").upper()
     mode = str(_pppa_v1_deep_find(item, ["mode", "execution_mode", "payload_mode"]) or "").upper()
-    sent = _pppa_v1_bool(_pppa_v1_deep_find(item, ["sent", "live_send_enabled", "order_sent"]), default=False)
-    if sent or mode == "LIVE" or "LIVE_SENT" in status or "LIVE_SENT" in event:
-        return "REAL_SENT_OR_LIVE_EVENT"
+
+    # V1.1: não classificar como REAL apenas porque execution_mode/mode veio LIVE.
+    # O Predator gerava previews/DRY_RUN com mode=LIVE, sent=False e enable_real_trading=False.
+    # Esses eventos devem ser excluídos do PnL como SAFE_DRY_RUN/BROKER_PREVIEW, não bloquear como REAL.
+    sent_raw = _pppa_v1_deep_find(item, ["sent", "order_sent", "live_sent", "exchange_sent"])
+    sent = _pppa_v1_bool(sent_raw, default=False)
+    enable_real_raw = _pppa_v1_deep_find(item, ["enable_real_trading", "real_execution_enabled"])
+    enable_real = _pppa_v1_bool(enable_real_raw, default=False) if enable_real_raw is not None else None
+    broker_dry_raw = _pppa_v1_deep_find(item, ["broker_dry_run", "dry_run"])
+    broker_dry = _pppa_v1_bool(broker_dry_raw, default=False) if broker_dry_raw is not None else None
+    preview_isolation = _pppa_v1_bool(_pppa_v1_deep_find(item, ["preview_isolation", "preview_only", "dry_run_preview"]), default=False)
+
     if "SAFE_DRY_RUN" in status or "SAFE_DRY_RUN" in event:
         return "SAFE_DRY_RUN"
-    if "DRY_RUN" in status or mode == "DRY_RUN":
+    if "DRY_RUN" in status or mode == "DRY_RUN" or broker_dry is True:
         return "SAFE_DRY_RUN"
-    if status == "PREVIEW" or event == "PREVIEW" or "PREVIEW" in source_name.upper():
+    if status == "PREVIEW" or event == "PREVIEW" or preview_isolation or "PREVIEW" in source_name.upper():
         return "BROKER_PREVIEW"
     if "VERIFY" in status or "VERIFY" in event or mode == "VERIFY":
         return "VERIFY"
+
+    # Só é REAL quando houve envio explícito, status LIVE_SENT ou evidência equivalente.
+    # mode=LIVE sozinho é insuficiente, especialmente em previews com enable_real_trading=false.
+    if sent or "LIVE_SENT" in status or "LIVE_SENT" in event:
+        return "REAL_SENT_OR_LIVE_EVENT"
+    if mode == "LIVE" and enable_real is True and "ORDER" in status and "FAILED" not in status:
+        return "REAL_SENT_OR_LIVE_EVENT"
+
     if "CLOSE" in event or "CLOSED" in status or "TRADE_CLOSED" in event or str(_pppa_v1_deep_find(item, ["closed_at"]) or ""):
         return "PAPER_CLOSED"
     if "OPEN" in event or "OPENED" in status or "TRADE_OPENED" in event or str(_pppa_v1_deep_find(item, ["opened_at"]) or ""):
@@ -41275,6 +41292,7 @@ def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
         "notes": [
             "Esta auditoria é estatística/PAPER; não altera execução, risco, policies ou posições.",
             "SAFE_DRY_RUN, PREVIEW, VERIFY e REAL são separados do PnL PAPER.",
+        "V1.1 não considera mode=LIVE sozinho como execução real; exige sent=True/LIVE_SENT ou evidência equivalente.",
             "Predator não deve ir para LIVE antes de zerar eventos críticos e validar PnL por fonte.",
         ],
         "token_value_exposed": False,
