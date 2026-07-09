@@ -43401,6 +43401,447 @@ def trade_registry_persistent_storage_fix_v1_text_route():
     return build_trade_registry_persistent_storage_fix_v1_text(force=force), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+
+# ==========================================================
+# BROKER DISASTER STOP PAYLOAD PREVIEW V1 — SAFE NO-SEND DIAGNOSTIC
+# ==========================================================
+BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_VERSION = "2026-07-09-BROKER-DISASTER-STOP-PAYLOAD-PREVIEW-V1"
+
+try:
+    BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_DATA_DIR = Path(CENTRAL_DATA_DIR)
+except Exception:
+    BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/data"))
+
+BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_LATEST_FILE = BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_DATA_DIR / "broker_disaster_stop_payload_preview_v1_latest.json"
+BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE = BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_DATA_DIR / "broker_disaster_stop_payload_preview_v1_events.jsonl"
+
+
+def _bdsp_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _bdsp_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _bdsp_v1_upper(value):
+    return str(value or "").strip().upper()
+
+
+def _bdsp_v1_norm_symbol(symbol):
+    s = str(symbol or "BTCUSDT").strip().upper()
+    s = s.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "")
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    if not s.endswith("USDT"):
+        s = f"{s}USDT"
+    return s
+
+
+def _bdsp_v1_market_symbol(symbol):
+    s = _bdsp_v1_norm_symbol(symbol)
+    if s.endswith("USDT"):
+        base = s[:-4]
+        return f"{base}/USDT:USDT"
+    return s
+
+
+def _bdsp_v1_position_side(side):
+    side_n = _bdsp_v1_upper(side)
+    if side_n in {"BUY", "BULL", "LONG"}:
+        return "LONG"
+    if side_n in {"SELL", "BEAR", "SHORT"}:
+        return "SHORT"
+    return "LONG"
+
+
+def _bdsp_v1_close_side(position_side):
+    side_n = _bdsp_v1_position_side(position_side)
+    return "sell" if side_n == "LONG" else "buy"
+
+
+def _bdsp_v1_default_stop(entry, side):
+    entry_f = _bdsp_v1_float(entry, 100000.0)
+    side_n = _bdsp_v1_position_side(side)
+    if side_n == "LONG":
+        return round(entry_f * 0.99, 8)
+    return round(entry_f * 1.01, 8)
+
+
+def _bdsp_v1_safe_sanitize(value):
+    try:
+        sanitizer = globals().get("_execution_final_gate_v1_sanitize")
+        if callable(sanitizer):
+            return sanitizer(value)
+    except Exception:
+        pass
+    try:
+        sanitizer = globals().get("_audit_sanitize")
+        if callable(sanitizer):
+            return sanitizer(value)
+    except Exception:
+        pass
+    return value
+
+
+def _bdsp_v1_write_json_atomic(path, payload):
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _bdsp_v1_append_event(payload):
+    try:
+        BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _bdsp_v1_get_broker_inner_status():
+    try:
+        broker_status = broker_status_payload() if callable(globals().get("broker_status_payload")) else {}
+        inner = broker_status.get("broker") if isinstance(broker_status, dict) else {}
+        return inner if isinstance(inner, dict) else {}
+    except Exception as exc:
+        return {"status_error": str(exc)}
+
+
+def _bdsp_v1_build_preview():
+    args = request.args if "request" in globals() else {}
+
+    symbol = _bdsp_v1_norm_symbol(args.get("symbol") or args.get("s") or "BTCUSDT")
+    position_side = _bdsp_v1_position_side(args.get("side") or args.get("positionSide") or args.get("position_side") or "LONG")
+    market_symbol = _bdsp_v1_market_symbol(symbol)
+    close_side = _bdsp_v1_close_side(position_side)
+
+    entry = _bdsp_v1_float(args.get("entry") or args.get("entry_price"), 100000.0)
+    stop_price = _bdsp_v1_float(args.get("sl") or args.get("stop") or args.get("stop_loss") or args.get("stop_price"), None)
+    if stop_price is None:
+        stop_price = _bdsp_v1_default_stop(entry, position_side)
+    qty = _bdsp_v1_float(args.get("qty") or args.get("amount") or args.get("contracts"), 0.0001)
+
+    bot = _bdsp_v1_upper(args.get("bot") or "FALCON")
+    setup = _bdsp_v1_upper(args.get("setup") or "FALCON15")
+    commit_requested = str(args.get("commit") or "").strip().lower() in {"1", "true", "yes", "sim"}
+
+    # Payload propositalmente "bruto", com campos que a BingX rejeita em Hedge Mode.
+    # O preview prova que a sanitização remove esses campos antes do envio real.
+    original_stop_params = {
+        "stopPrice": stop_price,
+        "triggerPrice": stop_price,
+        "reduceOnly": True,
+        "closePosition": True,
+        "positionSide": position_side,
+        "workingType": "MARK_PRICE",
+        "clientOrderId": f"BDSPV1-{bot}-{setup}-{symbol}-{position_side}",
+        "clientOrderID": f"BDSPV1-{bot}-{setup}-{symbol}-{position_side}",
+    }
+
+    if callable(globals().get("_dshm_v1_clean_order_params")):
+        cleaned_info = _dshm_v1_clean_order_params(original_stop_params, position_side=position_side, order_type="STOP_MARKET")
+    else:
+        cleaned = dict(original_stop_params)
+        removed = {}
+        for key in ("reduceOnly", "reduce_only", "closePosition", "close_position"):
+            if key in cleaned:
+                removed[key] = cleaned.pop(key)
+        cleaned["positionSide"] = position_side
+        cleaned_info = {
+            "params": cleaned,
+            "removed": removed,
+            "hedge_mode": position_side in {"LONG", "SHORT"},
+            "position_side": position_side,
+            "stoplike": True,
+            "changed": cleaned != original_stop_params,
+            "version": "fallback_cleaner_inside_preview_v1",
+        }
+
+    sanitized_stop_params = dict(cleaned_info.get("params") or {})
+
+    original_broker_kwargs = {
+        "symbol": symbol,
+        "side": close_side,
+        "position_side": position_side,
+        "positionSide": position_side,
+        "amount": qty,
+        "qty": qty,
+        "stop_price": stop_price,
+        "sl": stop_price,
+        "reduceOnly": True,
+        "closePosition": True,
+        "reduce_only": True,
+        "params": dict(original_stop_params),
+        "hedge_mode": True,
+        "client_order_id": f"BDSPV1-{bot}-{setup}-{symbol}-{position_side}",
+    }
+
+    if callable(globals().get("_dshm_v1_clean_broker_kwargs")):
+        cleaned_kwargs_info = _dshm_v1_clean_broker_kwargs(original_broker_kwargs)
+        sanitized_broker_kwargs = dict(cleaned_kwargs_info.get("kwargs") or {})
+    else:
+        sanitized_broker_kwargs = dict(original_broker_kwargs)
+        for key in ("reduceOnly", "closePosition"):
+            sanitized_broker_kwargs.pop(key, None)
+        sanitized_broker_kwargs["reduce_only"] = False
+        sanitized_broker_kwargs["position_side"] = position_side
+        sanitized_broker_kwargs["positionSide"] = position_side
+        cleaned_kwargs_info = {
+            "kwargs": sanitized_broker_kwargs,
+            "removed": {"reduceOnly": True, "closePosition": True},
+            "hedge_mode": True,
+            "position_side": position_side,
+            "version": "fallback_kwargs_cleaner_inside_preview_v1",
+        }
+    sanitized_broker_kwargs["params"] = sanitized_stop_params
+
+    exchange_create_order_preview = {
+        "method": "exchange.create_order",
+        "symbol": market_symbol,
+        "type": "STOP_MARKET",
+        "side": close_side,
+        "amount": qty,
+        "price": None,
+        "params": sanitized_stop_params,
+    }
+
+    bad_exchange_fields = [
+        key for key in ("reduceOnly", "reduce_only", "closePosition", "close_position")
+        if key in sanitized_stop_params
+    ]
+    position_side_ok = sanitized_stop_params.get("positionSide") == position_side
+    close_side_ok = (position_side == "LONG" and close_side == "sell") or (position_side == "SHORT" and close_side == "buy")
+    qty_ok = bool(qty and qty > 0)
+    stop_ok = bool(stop_price and stop_price > 0)
+    hedge_mode_detected = bool(cleaned_info.get("hedge_mode") or position_side in {"LONG", "SHORT"})
+    removed = cleaned_info.get("removed") or {}
+    reduce_only_removed = any(key in removed for key in ("reduceOnly", "reduce_only"))
+    close_position_removed = any(key in removed for key in ("closePosition", "close_position"))
+    disaster_stop_payload_safe = bool(
+        hedge_mode_detected
+        and not bad_exchange_fields
+        and position_side_ok
+        and close_side_ok
+        and qty_ok
+        and stop_ok
+    )
+
+    broker_inner = _bdsp_v1_get_broker_inner_status()
+
+    preview = {
+        "ok": bool(disaster_stop_payload_safe),
+        "status": "PAYLOAD_PREVIEW_OK_SAFE_NO_SEND" if disaster_stop_payload_safe else "PAYLOAD_PREVIEW_REVIEW_REQUIRED",
+        "module": "broker_disaster_stop_payload_preview_v1",
+        "version": BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_VERSION,
+        "generated_at": _bdsp_v1_now(),
+        "no_order_sent": True,
+        "sent": False,
+        "would_send_order": False,
+        "commit_requested": commit_requested,
+        "commit_ignored": True,
+        "token_value_exposed": False,
+        "inputs": {
+            "bot": bot,
+            "setup": setup,
+            "symbol": symbol,
+            "market_symbol": market_symbol,
+            "position_side": position_side,
+            "close_side": close_side,
+            "entry": entry,
+            "stop_price": stop_price,
+            "qty": qty,
+        },
+        "mode_flags": {
+            "execution_mode": os.getenv("EXECUTION_MODE"),
+            "enable_real_trading": os.getenv("ENABLE_REAL_TRADING"),
+            "broker_dry_run": os.getenv("BROKER_DRY_RUN"),
+            "falcon_mode": os.getenv("FALCON_MODE"),
+            "central_real_execution_enabled": os.getenv("CENTRAL_REAL_EXECUTION_ENABLED"),
+            "central_real_pilot_enabled": os.getenv("CENTRAL_REAL_PILOT_ENABLED"),
+        },
+        "validation": {
+            "disaster_stop_payload_safe": disaster_stop_payload_safe,
+            "hedge_mode_detected": hedge_mode_detected,
+            "position_side_ok": position_side_ok,
+            "close_side_ok": close_side_ok,
+            "qty_ok": qty_ok,
+            "stop_ok": stop_ok,
+            "bad_exchange_fields": bad_exchange_fields,
+            "reduceOnly_in_payload": "reduceOnly" in sanitized_stop_params or "reduce_only" in sanitized_stop_params,
+            "closePosition_in_payload": "closePosition" in sanitized_stop_params or "close_position" in sanitized_stop_params,
+            "reduce_only_removed_for_hedge_mode": reduce_only_removed,
+            "close_position_removed_for_hedge_mode": close_position_removed,
+            "positionSide": sanitized_stop_params.get("positionSide"),
+            "side": close_side,
+        },
+        "payloads": {
+            "original_unsafe_stop_params": original_stop_params,
+            "sanitized_stop_params": sanitized_stop_params,
+            "exchange_create_order_preview": exchange_create_order_preview,
+            "sanitized_broker_kwargs_preview": _bdsp_v1_safe_sanitize(sanitized_broker_kwargs),
+        },
+        "hedge_mode_fix": {
+            "main_fix_version": globals().get("DISASTER_STOP_HEDGE_MODE_FIX_V1_VERSION"),
+            "clean_order_params_version": cleaned_info.get("version"),
+            "clean_broker_kwargs_version": cleaned_kwargs_info.get("version"),
+            "removed_from_stop_params": removed,
+            "removed_from_broker_kwargs": cleaned_kwargs_info.get("removed") or {},
+            "broker_patch": globals().get("DISASTER_STOP_HEDGE_MODE_FIX_V1_BROKER_PATCH"),
+            "exchange_patches": globals().get("DISASTER_STOP_HEDGE_MODE_FIX_V1_EXCHANGE_PATCHES"),
+            "broker_reported_version": broker_inner.get("disaster_stop_hedge_mode_fix_version"),
+            "broker_last_disaster_stop_status": broker_inner.get("last_disaster_stop_status"),
+            "broker_last_disaster_stop_error": broker_inner.get("last_disaster_stop_error"),
+        },
+        "files": {
+            "latest": str(BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_LATEST_FILE),
+            "events": str(BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE),
+        },
+        "notes": [
+            "Esta rota é 100% preview: não chama broker, não cria stop e não envia ordem.",
+            "Ela valida o payload que o disaster stop deve usar em Hedge Mode.",
+            "Em Hedge Mode, reduceOnly/closePosition precisam ficar fora do params enviado para a BingX.",
+            "LONG deve fechar com SELL + positionSide LONG; SHORT deve fechar com BUY + positionSide SHORT.",
+        ],
+    }
+
+    latest_ok, latest_error = _bdsp_v1_write_json_atomic(BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_LATEST_FILE, preview)
+    event_payload = dict(preview)
+    event_payload.pop("payloads", None)
+    events_ok, events_error = _bdsp_v1_append_event(event_payload)
+    preview["diagnostic_write"] = {
+        "latest_ok": latest_ok,
+        "latest_error": latest_error,
+        "events_ok": events_ok,
+        "events_error": events_error,
+    }
+    return preview
+
+
+def _bdsp_v1_text(payload):
+    inputs = payload.get("inputs") or {}
+    validation = payload.get("validation") or {}
+    mode_flags = payload.get("mode_flags") or {}
+    hedge_fix = payload.get("hedge_mode_fix") or {}
+    payloads = payload.get("payloads") or {}
+    exchange_preview = payloads.get("exchange_create_order_preview") or {}
+    params = exchange_preview.get("params") or {}
+
+    lines = [
+        "🧪 BROKER DISASTER STOP PAYLOAD PREVIEW V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅ ' if payload.get('ok') else '⚠️ '}{payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Segurança:",
+        f"- no_order_sent: {payload.get('no_order_sent')}",
+        f"- sent: {payload.get('sent')}",
+        f"- would_send_order: {payload.get('would_send_order')}",
+        f"- commit_requested: {payload.get('commit_requested')}",
+        f"- commit_ignored: {payload.get('commit_ignored')}",
+        "",
+        "Modo atual:",
+        f"- EXECUTION_MODE: {mode_flags.get('execution_mode')}",
+        f"- ENABLE_REAL_TRADING: {mode_flags.get('enable_real_trading')}",
+        f"- BROKER_DRY_RUN: {mode_flags.get('broker_dry_run')}",
+        f"- FALCON_MODE: {mode_flags.get('falcon_mode')}",
+        f"- CENTRAL_REAL_EXECUTION_ENABLED: {mode_flags.get('central_real_execution_enabled')}",
+        f"- CENTRAL_REAL_PILOT_ENABLED: {mode_flags.get('central_real_pilot_enabled')}",
+        "",
+        "Input simulado:",
+        f"- bot/setup: {inputs.get('bot')} / {inputs.get('setup')}",
+        f"- symbol: {inputs.get('symbol')} | market_symbol: {inputs.get('market_symbol')}",
+        f"- positionSide: {inputs.get('position_side')}",
+        f"- close_side: {inputs.get('close_side')}",
+        f"- entry: {inputs.get('entry')}",
+        f"- stop_price: {inputs.get('stop_price')}",
+        f"- qty: {inputs.get('qty')}",
+        "",
+        "Validação Hedge Mode:",
+        f"- disaster_stop_payload_safe: {validation.get('disaster_stop_payload_safe')}",
+        f"- hedge_mode_detected: {validation.get('hedge_mode_detected')}",
+        f"- position_side_ok: {validation.get('position_side_ok')}",
+        f"- close_side_ok: {validation.get('close_side_ok')}",
+        f"- reduceOnly_in_payload: {validation.get('reduceOnly_in_payload')}",
+        f"- closePosition_in_payload: {validation.get('closePosition_in_payload')}",
+        f"- reduce_only_removed_for_hedge_mode: {validation.get('reduce_only_removed_for_hedge_mode')}",
+        f"- close_position_removed_for_hedge_mode: {validation.get('close_position_removed_for_hedge_mode')}",
+        f"- bad_exchange_fields: {validation.get('bad_exchange_fields')}",
+        "",
+        "Payload sanitizado para exchange.create_order:",
+        f"- symbol: {exchange_preview.get('symbol')}",
+        f"- type: {exchange_preview.get('type')}",
+        f"- side: {exchange_preview.get('side')}",
+        f"- amount: {exchange_preview.get('amount')}",
+        f"- price: {exchange_preview.get('price')}",
+        "- params:",
+        f"  stopPrice: {params.get('stopPrice')}",
+        f"  triggerPrice: {params.get('triggerPrice')}",
+        f"  positionSide: {params.get('positionSide')}",
+        f"  workingType: {params.get('workingType')}",
+        f"  reduceOnly presente: {'reduceOnly' in params or 'reduce_only' in params}",
+        f"  closePosition presente: {'closePosition' in params or 'close_position' in params}",
+        "",
+        "Hedge fix:",
+        f"- main_fix_version: {hedge_fix.get('main_fix_version')}",
+        f"- broker_reported_version: {hedge_fix.get('broker_reported_version')}",
+        f"- broker_last_disaster_stop_status: {hedge_fix.get('broker_last_disaster_stop_status')}",
+        f"- broker_last_disaster_stop_error: {hedge_fix.get('broker_last_disaster_stop_error')}",
+        f"- removed_from_stop_params: {hedge_fix.get('removed_from_stop_params')}",
+        "",
+        "Arquivos:",
+        f"- Último snapshot: {payload.get('files', {}).get('latest')}",
+        f"- Eventos: {payload.get('files', {}).get('events')}",
+        "",
+        "Leitura executiva:",
+    ]
+    if payload.get("ok"):
+        lines += [
+            "✅ O payload de disaster stop está sanitizado para Hedge Mode.",
+            "✅ reduceOnly/closePosition não entram no params enviado à BingX.",
+            "✅ Esta validação não enviou ordem e não criou stop real.",
+        ]
+    else:
+        lines += [
+            "⚠️ O payload ainda precisa de revisão antes de qualquer ACK do Falcon.",
+            "⚠️ Não rearmar LIVE enquanto esta validação não estiver segura.",
+        ]
+    return "\n".join(lines)
+
+
+@app.route("/broker/disasterstop/preview", methods=["GET"])
+@app.route("/broker/disasterstop/payloadpreview", methods=["GET"])
+@app.route("/disasterstop/preview", methods=["GET"])
+@app.route("/disasterstop/payloadpreview", methods=["GET"])
+def broker_disaster_stop_payload_preview_v1_route():
+    return _bdsp_v1_build_preview(), 200
+
+
+@app.route("/broker/disasterstop/preview/text", methods=["GET"])
+@app.route("/broker/disasterstop/payloadpreview/text", methods=["GET"])
+@app.route("/disasterstop/preview/text", methods=["GET"])
+@app.route("/disasterstop/payloadpreview/text", methods=["GET"])
+def broker_disaster_stop_payload_preview_v1_text_route():
+    payload = _bdsp_v1_build_preview()
+    return _bdsp_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
