@@ -39715,6 +39715,925 @@ def live_pilot_guard_v1_text_route():
     return build_live_pilot_guard_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+# ============================================================================
+# FALCON LIVE EXECUTION AUDIT GUARD V1
+# ----------------------------------------------------------------------------
+# Objetivo:
+# - Nenhuma ordem real do Falcon pode ficar silenciosa.
+# - Telegram pré-ordem é pré-condição para envio real.
+# - Telegram pós-ordem confirma resultado real.
+# - Stop de desastre falhado aciona fail-safe/alerta e bloqueia novas entradas.
+# - Divergência Central x BingX bloqueia novas entradas LIVE.
+# - Expõe health em /bots/FALCON e rota /falcon/liveaudit/text.
+# ============================================================================
+FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION = "2026-07-09-FALCON-LIVE-EXECUTION-AUDIT-GUARD-V1"
+
+try:
+    FALCON_LIVE_AUDIT_EVENTS_FILE = CENTRAL_DATA_DIR / "falcon_live_execution_audit.jsonl"
+    FALCON_LIVE_AUDIT_STATE_FILE = CENTRAL_DATA_DIR / "falcon_live_execution_audit_state.json"
+    FALCON_LIVE_AUDIT_LATEST_FILE = CENTRAL_DATA_DIR / "falcon_live_execution_audit_latest.json"
+except Exception:
+    from pathlib import Path as _FLEAGPath
+    FALCON_LIVE_AUDIT_EVENTS_FILE = _FLEAGPath("/data/falcon_live_execution_audit.jsonl")
+    FALCON_LIVE_AUDIT_STATE_FILE = _FLEAGPath("/data/falcon_live_execution_audit_state.json")
+    FALCON_LIVE_AUDIT_LATEST_FILE = _FLEAGPath("/data/falcon_live_execution_audit_latest.json")
+
+try:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_FALCON_LIVE_AUDIT_GUARD_V1 = run_execution_engine
+except Exception:
+    _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_FALCON_LIVE_AUDIT_GUARD_V1 = None
+
+try:
+    _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_FALCON_LIVE_AUDIT_GUARD_V1 = can_open_trade_decision
+except Exception:
+    _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_FALCON_LIVE_AUDIT_GUARD_V1 = None
+
+try:
+    _ORIGINAL_BOT_HEALTH_FOR_FALCON_LIVE_AUDIT_GUARD_V1 = bot_health
+except Exception:
+    _ORIGINAL_BOT_HEALTH_FOR_FALCON_LIVE_AUDIT_GUARD_V1 = None
+
+
+def _fleag_v1_now():
+    try:
+        return agora_sp_str()
+    except Exception:
+        try:
+            return data_hora_sp_str()
+        except Exception:
+            return None
+
+
+def _fleag_v1_bool(value, default=False):
+    try:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return bool(default)
+        return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "y"}
+    except Exception:
+        return bool(default)
+
+
+def _fleag_v1_env_bool(names, default=False):
+    for name in names:
+        try:
+            if os.environ.get(name) is not None:
+                return _fleag_v1_bool(os.environ.get(name), default=default), name
+        except Exception:
+            pass
+    return bool(default), None
+
+
+def _fleag_v1_config():
+    enabled, enabled_source = _fleag_v1_env_bool([
+        "FALCON_LIVE_AUDIT_GUARD_ENABLED",
+        "FALCON_LIVE_EXECUTION_AUDIT_GUARD_ENABLED",
+        "CENTRAL_FALCON_LIVE_AUDIT_GUARD_ENABLED",
+    ], default=True)
+    require_pre, require_pre_source = _fleag_v1_env_bool([
+        "FALCON_LIVE_AUDIT_REQUIRE_PRE_TELEGRAM",
+        "FALCON_LIVE_REQUIRE_PRE_ORDER_TELEGRAM",
+    ], default=True)
+    require_post, require_post_source = _fleag_v1_env_bool([
+        "FALCON_LIVE_AUDIT_REQUIRE_POST_TELEGRAM",
+        "FALCON_LIVE_REQUIRE_POST_ORDER_TELEGRAM",
+    ], default=True)
+    block_previous, block_previous_source = _fleag_v1_env_bool([
+        "FALCON_LIVE_AUDIT_BLOCK_ON_PREVIOUS_FAILURE",
+        "FALCON_LIVE_BLOCK_ON_PREVIOUS_FAILURE",
+    ], default=True)
+    auto_close, auto_close_source = _fleag_v1_env_bool([
+        "FALCON_LIVE_AUDIT_AUTO_CLOSE_ON_STOP_FAILURE",
+        "FALCON_LIVE_FAILSAFE_CLOSE_ON_STOP_FAILURE",
+    ], default=True)
+    block_divergence, block_divergence_source = _fleag_v1_env_bool([
+        "FALCON_LIVE_AUDIT_BLOCK_ON_DIVERGENCE",
+        "FALCON_LIVE_BLOCK_ON_DIVERGENCE",
+    ], default=True)
+    return {
+        "enabled": enabled,
+        "enabled_source": enabled_source,
+        "require_pre_order_telegram": require_pre,
+        "require_pre_order_telegram_source": require_pre_source,
+        "require_post_order_telegram": require_post,
+        "require_post_order_telegram_source": require_post_source,
+        "block_on_previous_failure": block_previous,
+        "block_on_previous_failure_source": block_previous_source,
+        "auto_close_on_stop_failure": auto_close,
+        "auto_close_on_stop_failure_source": auto_close_source,
+        "block_on_divergence": block_divergence,
+        "block_on_divergence_source": block_divergence_source,
+        "events_file": str(FALCON_LIVE_AUDIT_EVENTS_FILE),
+        "state_file": str(FALCON_LIVE_AUDIT_STATE_FILE),
+        "latest_file": str(FALCON_LIVE_AUDIT_LATEST_FILE),
+        "telegram_token_configured": bool(
+            os.environ.get("FALCON_TELEGRAM_BOT_TOKEN") or os.environ.get("FALCON_TOKEN") or globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")
+        ),
+        "telegram_chat_configured": bool(
+            os.environ.get("FALCON_TELEGRAM_CHAT_ID") or os.environ.get("FALCON_CHAT_ID") or globals().get("CENTRAL_TELEGRAM_CHAT_ID")
+        ),
+        "token_value_exposed": False,
+    }
+
+
+def _fleag_v1_norm_bot(value):
+    try:
+        if callable(globals().get("normalize_registry_bot")):
+            return normalize_registry_bot(value)
+    except Exception:
+        pass
+    return str(value or "").upper().strip()
+
+
+def _fleag_v1_norm_symbol(value):
+    try:
+        if callable(globals().get("normalize_registry_symbol")):
+            return normalize_registry_symbol(value)
+    except Exception:
+        pass
+    raw = str(value or "").upper().strip().replace("/", "").replace(":USDT", "")
+    if raw and not raw.endswith("USDT"):
+        raw += "USDT"
+    return raw
+
+
+def _fleag_v1_norm_side(value):
+    raw = str(value or "").upper().strip()
+    if raw in {"BUY", "LONG"}:
+        return "LONG"
+    if raw in {"SELL", "SHORT"}:
+        return "SHORT"
+    return raw
+
+
+def _fleag_v1_float(value, default=None):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _fleag_v1_sensitive_key(key):
+    k = str(key or "").lower()
+    return any(x in k for x in ["token", "secret", "apikey", "api_key", "authorization", "signature", "password"])
+
+
+def _fleag_v1_public(obj):
+    try:
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                out[k] = "***MASKED***" if _fleag_v1_sensitive_key(k) and v not in (None, "", False) else _fleag_v1_public(v)
+            return out
+        if isinstance(obj, list):
+            return [_fleag_v1_public(x) for x in obj]
+    except Exception:
+        pass
+    return obj
+
+
+def _fleag_v1_load_state():
+    try:
+        if FALCON_LIVE_AUDIT_STATE_FILE.exists():
+            with open(FALCON_LIVE_AUDIT_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("acked_bad_event_keys", [])
+                return data
+    except Exception:
+        pass
+    return {"version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION, "acked_bad_event_keys": []}
+
+
+def _fleag_v1_save_state(state):
+    try:
+        state = state if isinstance(state, dict) else {}
+        state.setdefault("version", FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION)
+        state.setdefault("acked_bad_event_keys", [])
+        state["updated_at"] = _fleag_v1_now()
+        FALCON_LIVE_AUDIT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(FALCON_LIVE_AUDIT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_fleag_v1_public(state), f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def _fleag_v1_append_event(event):
+    try:
+        row = event if isinstance(event, dict) else {"raw": str(event)}
+        row.setdefault("module", "falcon_live_execution_audit_guard_v1")
+        row.setdefault("version", FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION)
+        row.setdefault("generated_at", _fleag_v1_now())
+        row.setdefault("token_value_exposed", False)
+        row = _fleag_v1_public(row)
+        FALCON_LIVE_AUDIT_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(FALCON_LIVE_AUDIT_EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        with open(FALCON_LIVE_AUDIT_LATEST_FILE, "w", encoding="utf-8") as f:
+            json.dump(row, f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def _fleag_v1_read_events(limit=50):
+    rows = []
+    try:
+        if FALCON_LIVE_AUDIT_EVENTS_FILE.exists():
+            lines = FALCON_LIVE_AUDIT_EVENTS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit or 50)):]
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict):
+                        rows.append(_fleag_v1_public(item))
+                except Exception:
+                    rows.append({"raw": line[:1000]})
+    except Exception as exc:
+        rows.append({"ok": False, "error": str(exc)})
+    return rows
+
+
+def _fleag_v1_event_key(event):
+    event = event if isinstance(event, dict) else {}
+    return "|".join([
+        str(event.get("order_id") or event.get("id") or event.get("client_order_id") or event.get("client_tag") or ""),
+        str(event.get("status") or ""),
+        str(event.get("ts") or event.get("generated_at") or event.get("timestamp") or ""),
+        str(event.get("symbol") or ""),
+        str(event.get("side") or ""),
+    ])[:260]
+
+
+def _fleag_v1_select_telegram_credentials():
+    token = (
+        os.environ.get("FALCON_TELEGRAM_BOT_TOKEN")
+        or os.environ.get("FALCON_TOKEN")
+        or globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")
+        or os.environ.get("TELEGRAM_BOT_TOKEN")
+    )
+    chat_id = (
+        os.environ.get("FALCON_TELEGRAM_CHAT_ID")
+        or os.environ.get("FALCON_CHAT_ID")
+        or globals().get("CENTRAL_TELEGRAM_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+    )
+    source = "FALCON" if (os.environ.get("FALCON_TELEGRAM_BOT_TOKEN") or os.environ.get("FALCON_TOKEN")) else "CENTRAL_OR_GENERIC"
+    return token, chat_id, source
+
+
+def _fleag_v1_send_telegram(message, title="FALCON LIVE AUDIT"):
+    token, chat_id, source = _fleag_v1_select_telegram_credentials()
+    if not token or not chat_id:
+        return {"ok": False, "sent": False, "error": "Telegram token/chat ausente", "credential_source": source, "token_value_exposed": False}
+    try:
+        if callable(globals().get("telegram_send_with_token")):
+            sent = bool(telegram_send_with_token(token, chat_id, message, title=title))
+            return {"ok": sent, "sent": sent, "error": None if sent else "telegram_send_with_token retornou False", "credential_source": source, "token_value_exposed": False}
+        return {"ok": False, "sent": False, "error": "telegram_send_with_token indisponível", "credential_source": source, "token_value_exposed": False}
+    except Exception as exc:
+        return {"ok": False, "sent": False, "error": str(exc), "credential_source": source, "token_value_exposed": False}
+
+
+def _fleag_v1_payload_summary(payload):
+    p = payload if isinstance(payload, dict) else {}
+    return _fleag_v1_public({
+        "bot": p.get("bot"),
+        "setup": p.get("setup") or p.get("signal_type") or p.get("setup_label"),
+        "symbol": _fleag_v1_norm_symbol(p.get("symbol") or p.get("symbol_clean") or p.get("pair")),
+        "side": _fleag_v1_norm_side(p.get("side") or p.get("direction") or p.get("signal")),
+        "entry": p.get("entry") or p.get("entrada"),
+        "sl": p.get("sl") or p.get("stop") or p.get("stop_loss_price"),
+        "tp50": p.get("tp50"),
+        "notional_usdt": p.get("notional_usdt"),
+        "margin_usdt": p.get("margin_usdt"),
+        "leverage": p.get("leverage"),
+        "risk_pct": p.get("risk_pct"),
+        "mode": p.get("mode"),
+        "signal_id": p.get("signal_id"),
+        "client_order_id": p.get("client_order_id") or p.get("clientOrderId") or p.get("client_tag"),
+    })
+
+
+def _fleag_v1_extract_live_result(result):
+    result = result if isinstance(result, dict) else {}
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    live = payload.get("live_result") if isinstance(payload.get("live_result"), dict) else {}
+    if not live and isinstance(result.get("live_result"), dict):
+        live = result.get("live_result")
+    if not live and any(k in result for k in ["sent", "status", "order_id", "id", "disaster_stop"]):
+        live = result
+    return live if isinstance(live, dict) else {}
+
+
+def _fleag_v1_extract_sent(result):
+    result = result if isinstance(result, dict) else {}
+    live = _fleag_v1_extract_live_result(result)
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    return bool(result.get("sent") or result.get("live_sent") or payload.get("sent") or payload.get("live_sent") or live.get("sent"))
+
+
+def _fleag_v1_extract_order_id(result):
+    result = result if isinstance(result, dict) else {}
+    live = _fleag_v1_extract_live_result(result)
+    return live.get("order_id") or live.get("id") or result.get("order_id") or result.get("id")
+
+
+def _fleag_v1_extract_status(result):
+    result = result if isinstance(result, dict) else {}
+    live = _fleag_v1_extract_live_result(result)
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    return str(live.get("status") or result.get("status") or payload.get("status") or "").strip()
+
+
+def _fleag_v1_disaster_stop_status(result):
+    live = _fleag_v1_extract_live_result(result)
+    status = _fleag_v1_extract_status(result)
+    disaster = live.get("disaster_stop") if isinstance(live.get("disaster_stop"), dict) else {}
+    if "DISASTER_STOP_FAILED" in status.upper() or "STOP_FAILED" in status.upper():
+        return "FAILED"
+    if disaster:
+        ds_status = str(disaster.get("status") or "").upper()
+        if disaster.get("ok") or disaster.get("confirmed") or "OK" == ds_status or "CREATED" in ds_status or "CONFIRMED" in ds_status:
+            return "OK"
+        if disaster.get("error") or "FAILED" in ds_status or "ERROR" in ds_status:
+            return "FAILED"
+        return ds_status or "UNKNOWN"
+    return "UNKNOWN"
+
+
+def _fleag_v1_registry_sync(payload, result, protection_status):
+    try:
+        if callable(globals().get("trade_registry_sync_v1_from_execution_result")):
+            sync = trade_registry_sync_v1_from_execution_result(payload or {}, result or {}, commit=True)
+            if isinstance(sync, dict):
+                sync.setdefault("protection_status", protection_status)
+                return _fleag_v1_public(sync)
+        live = _fleag_v1_extract_live_result(result)
+        candidate = {
+            "bot": "FALCON",
+            "setup": (payload or {}).get("setup") or "FALCON15",
+            "symbol": (payload or {}).get("symbol") or live.get("symbol"),
+            "side": (payload or {}).get("side") or live.get("position_side") or live.get("side"),
+            "entry": (payload or {}).get("entry") or live.get("price_ref") or ((live.get("preview") or {}).get("price_ref") if isinstance(live.get("preview"), dict) else None),
+            "sl": (payload or {}).get("sl") or (payload or {}).get("stop"),
+            "tp50": (payload or {}).get("tp50"),
+            "qty": live.get("amount") or ((live.get("preview") or {}).get("amount") if isinstance(live.get("preview"), dict) else None),
+            "source": "falcon_live_execution_audit_guard_v1",
+            "metadata": {
+                "order_id": live.get("order_id") or live.get("id"),
+                "client_order_id": live.get("client_order_id") or live.get("client_tag"),
+                "protection_status": protection_status,
+                "audit_version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
+            },
+        }
+        if callable(globals().get("trade_registry_sync_v1_register_candidate")):
+            return _fleag_v1_public(trade_registry_sync_v1_register_candidate(candidate, commit=True))
+        return {"ok": False, "status": "TRADE_REGISTRY_SYNC_FUNCTION_MISSING", "candidate": candidate}
+    except Exception as exc:
+        return {"ok": False, "status": "REGISTRY_SYNC_ERROR", "error": str(exc)}
+
+
+def _fleag_v1_fail_safe_close(payload, result):
+    live = _fleag_v1_extract_live_result(result)
+    symbol = _fleag_v1_norm_symbol((payload or {}).get("symbol") or live.get("symbol"))
+    side = _fleag_v1_norm_side((payload or {}).get("side") or live.get("position_side") or live.get("side"))
+    amount = live.get("amount") or live.get("contracts")
+    if amount is None and isinstance(live.get("preview"), dict):
+        amount = live.get("preview", {}).get("amount") or live.get("preview", {}).get("amount_final")
+    if not symbol or not side:
+        return {"ok": False, "status": "FAILSAFE_CLOSE_MISSING_SYMBOL_SIDE", "symbol": symbol, "side": side}
+    try:
+        if globals().get("central_broker") is not None and callable(getattr(central_broker, "close_position_market", None)):
+            close = central_broker.close_position_market(symbol, side, amount=amount)
+            return _fleag_v1_public({"ok": bool(isinstance(close, dict) and close.get("ok")), "status": "FAILSAFE_CLOSE_SENT", "close_result": close, "symbol": symbol, "side": side, "amount": amount})
+        return {"ok": False, "status": "BROKER_CLOSE_POSITION_MARKET_MISSING", "symbol": symbol, "side": side, "amount": amount}
+    except Exception as exc:
+        return {"ok": False, "status": "FAILSAFE_CLOSE_ERROR", "error": str(exc), "symbol": symbol, "side": side, "amount": amount}
+
+
+def _fleag_v1_read_bad_execution_events(limit=200):
+    rows = []
+    try:
+        if callable(globals().get("_execution_log_items")):
+            items, err = _execution_log_items(limit=limit)
+            for item in items or []:
+                if isinstance(item, dict):
+                    rows.append(_fleag_v1_public(item))
+    except Exception:
+        pass
+    if not rows:
+        try:
+            p = FALCON_LIVE_AUDIT_EVENTS_FILE.parent / "broker_executions_log.jsonl"
+            if p.exists():
+                for line in p.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit)):]:
+                    try:
+                        item = json.loads(line)
+                        if isinstance(item, dict):
+                            rows.append(_fleag_v1_public(item))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    bad = []
+    for e in rows:
+        try:
+            bot = _fleag_v1_norm_bot(e.get("bot") or e.get("strategy") or "")
+            status = str(e.get("status") or e.get("event") or "").upper()
+            sent = bool(e.get("sent"))
+            if bot == "FALCON" and sent and ("LIVE_SENT_BUT_DISASTER_STOP_FAILED" in status or ("DISASTER" in status and "FAILED" in status)):
+                bad.append(e)
+        except Exception:
+            continue
+    return bad
+
+
+def _fleag_v1_divergence_payload():
+    broker_positions, broker_err = ([], None)
+    central_live = []
+    try:
+        broker_positions, broker_err = _broker_open_positions() if callable(globals().get("_broker_open_positions")) else ([], "_broker_open_positions missing")
+    except Exception as exc:
+        broker_positions, broker_err = [], str(exc)
+    try:
+        central_live = _central_live_positions_payload() if callable(globals().get("_central_live_positions_payload")) else []
+    except Exception:
+        central_live = []
+    broker_keys = {(_fleag_v1_norm_symbol(p.get("symbol")), _fleag_v1_norm_side(p.get("side"))) for p in broker_positions if isinstance(p, dict)}
+    central_keys = {(_fleag_v1_norm_symbol(p.get("symbol")), _fleag_v1_norm_side(p.get("side"))) for p in central_live if isinstance(p, dict)}
+    only_bingx = sorted([{"symbol": k[0], "side": k[1]} for k in broker_keys - central_keys], key=lambda x: (x.get("symbol"), x.get("side")))
+    only_central = sorted([{"symbol": k[0], "side": k[1]} for k in central_keys - broker_keys], key=lambda x: (x.get("symbol"), x.get("side")))
+    live_without_stop = []
+    for p in central_live:
+        if not isinstance(p, dict):
+            continue
+        if p.get("stop") in (None, "", 0, "0"):
+            live_without_stop.append({"symbol": p.get("symbol"), "side": p.get("side"), "bot": p.get("bot"), "setup": p.get("setup"), "order_id": p.get("order_id")})
+    return {
+        "ok": not broker_err,
+        "broker_error": broker_err,
+        "broker_bingx_open_count": len(broker_positions),
+        "central_live_count": len(central_live),
+        "only_bingx": only_bingx,
+        "only_bingx_count": len(only_bingx),
+        "only_central": only_central,
+        "only_central_count": len(only_central),
+        "live_without_stop": live_without_stop,
+        "live_without_stop_count": len(live_without_stop),
+    }
+
+
+def falcon_live_execution_audit_guard_v1_status(include_recent=True):
+    cfg = _fleag_v1_config()
+    state = _fleag_v1_load_state()
+    acked = set(state.get("acked_bad_event_keys") or [])
+    bad_events_all = _fleag_v1_read_bad_execution_events(limit=200)
+    bad_events = [e for e in bad_events_all if _fleag_v1_event_key(e) not in acked]
+    divergence = _fleag_v1_divergence_payload()
+    reasons = []
+    warnings = []
+    if not cfg.get("enabled"):
+        warnings.append("Falcon Live Execution Audit Guard desabilitado por ENV.")
+    if cfg.get("block_on_previous_failure") and bad_events:
+        reasons.append(f"Existe LIVE_SENT_BUT_DISASTER_STOP_FAILED não reconhecido: {len(bad_events)} evento(s).")
+    if cfg.get("block_on_divergence") and divergence.get("only_bingx_count"):
+        reasons.append(f"Posição só na BingX: {divergence.get('only_bingx_count')}.")
+    if cfg.get("block_on_divergence") and divergence.get("only_central_count"):
+        reasons.append(f"Posição só na Central: {divergence.get('only_central_count')}.")
+    if divergence.get("live_without_stop_count"):
+        reasons.append(f"Posição LIVE sem stop na Central: {divergence.get('live_without_stop_count')}.")
+    if state.get("last_live_order_telegram_error"):
+        reasons.append(f"Falha de Telegram em ordem real: {state.get('last_live_order_telegram_error')}.")
+    if str(state.get("last_live_order_disaster_stop_status") or "").upper() == "FAILED":
+        reasons.append("Última ordem real com disaster stop FAILED.")
+    if str(state.get("last_live_order_registry_status") or "").upper() in {"REGISTER_ERROR", "REGISTRY_SYNC_ERROR", "TRADE_REGISTRY_SYNC_FUNCTION_MISSING"}:
+        reasons.append(f"Último registro LIVE falhou: {state.get('last_live_order_registry_status')}.")
+    status = "OK" if not reasons and cfg.get("enabled") else "BLOCKED"
+    latest = None
+    try:
+        if FALCON_LIVE_AUDIT_LATEST_FILE.exists():
+            latest = json.loads(FALCON_LIVE_AUDIT_LATEST_FILE.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        latest = None
+    return {
+        "ok": status == "OK",
+        "module": "falcon_live_execution_audit_guard_v1",
+        "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
+        "generated_at": _fleag_v1_now(),
+        "live_audit_status": status,
+        "live_audit_block_reason": "; ".join(reasons) if reasons else None,
+        "reasons": reasons,
+        "warnings": warnings,
+        "config": cfg,
+        "state": _fleag_v1_public(state),
+        "divergence": divergence,
+        "bad_execution_events_unacked": bad_events[-10:],
+        "bad_execution_events_unacked_count": len(bad_events),
+        "bad_execution_events_total_count": len(bad_events_all),
+        "latest_event": _fleag_v1_public(latest),
+        "recent_events": _fleag_v1_read_events(limit=10) if include_recent else [],
+        "routes": [
+            "/falcon/liveaudit",
+            "/falcon/liveaudit/text",
+            "/falcon/liveaudit/ack?ack=FALCON_LIVE_AUDIT_ACK&clear_block=true",
+        ],
+        "token_value_exposed": False,
+    }
+
+
+def _fleag_v1_applies_to_live_falcon(payload, mode=None, dry_run=True):
+    p = payload if isinstance(payload, dict) else {}
+    bot = _fleag_v1_norm_bot(p.get("bot") or p.get("robot") or p.get("strategy"))
+    mode_norm = str(mode or p.get("mode") or p.get("execution_mode") or "").upper().strip()
+    dry = _fleag_v1_bool(dry_run, default=True)
+    return bool(bot == "FALCON" and mode_norm == "LIVE" and not dry)
+
+
+def _fleag_v1_pre_order_message(payload):
+    p = _fleag_v1_payload_summary(payload)
+    return "\n".join([
+        "🚨 FALCON LIVE — PRÉ-ORDEM OBRIGATÓRIA",
+        f"Data/hora: {_fleag_v1_now()}",
+        "",
+        f"Bot/setup: {p.get('bot')} / {p.get('setup')}",
+        f"Símbolo/lado: {p.get('symbol')} {p.get('side')}",
+        f"Entry estimado: {p.get('entry')}",
+        f"Stop: {p.get('sl')}",
+        f"TP50: {p.get('tp50')}",
+        f"Notional: {p.get('notional_usdt')} USDT | Margem: {p.get('margin_usdt')} USDT | Lev: {p.get('leverage')}",
+        f"Risco: {p.get('risk_pct')}%",
+        f"Modo: LIVE",
+        f"Signal/tag: {p.get('signal_id') or p.get('client_order_id')}",
+        "",
+        "Esta mensagem é pré-condição. Se ela falhar, a ordem real deve ser bloqueada.",
+    ])
+
+
+def _fleag_v1_post_order_message(payload, result, post_event):
+    p = _fleag_v1_payload_summary(payload)
+    live = _fleag_v1_extract_live_result(result)
+    status = _fleag_v1_extract_status(result)
+    return "\n".join([
+        "🔴 FALCON LIVE — CONFIRMAÇÃO DE ORDEM REAL" if post_event.get("requires_attention") else "🟢 FALCON LIVE — CONFIRMAÇÃO DE ORDEM REAL",
+        f"Data/hora: {_fleag_v1_now()}",
+        "",
+        f"Status: {status}",
+        f"Exchange order id: {_fleag_v1_extract_order_id(result)}",
+        f"Bot/setup: {p.get('bot')} / {p.get('setup')}",
+        f"Símbolo/lado: {p.get('symbol') or live.get('symbol')} {p.get('side') or live.get('position_side') or live.get('side')}",
+        f"Quantidade: {live.get('amount') or live.get('qty')}",
+        f"Entry/preço médio: {live.get('price_ref') or live.get('average') or live.get('avgPrice') or p.get('entry')}",
+        f"Notional: {live.get('notional_usdt') or p.get('notional_usdt')} USDT",
+        f"Tag/client_order_id: {live.get('client_order_id') or live.get('client_tag') or p.get('client_order_id') or p.get('signal_id')}",
+        "",
+        f"Disaster stop: {post_event.get('last_live_order_disaster_stop_status')}",
+        f"Registro Central: {post_event.get('last_live_order_registry_status')}",
+        f"Fail-safe: {post_event.get('last_live_order_fail_safe_action')}",
+        "",
+        "⚠️ Acompanhar /live, /sync e /falcon/liveaudit/text." if post_event.get("requires_attention") else "✅ Confirmação pós-ordem registrada.",
+    ])
+
+
+def falcon_live_execution_audit_guard_v1_pre_order(payload):
+    cfg = _fleag_v1_config()
+    status_payload = falcon_live_execution_audit_guard_v1_status(include_recent=False)
+    if not cfg.get("enabled"):
+        return {"ok": True, "status": "FALCON_LIVE_AUDIT_DISABLED", "applies": True, "warning": "guard disabled", "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}
+    if not status_payload.get("ok"):
+        event = {
+            "event": "FALCON_LIVE_ORDER_BLOCKED_BY_AUDIT_STATUS",
+            "ok": False,
+            "sent": False,
+            "payload": _fleag_v1_payload_summary(payload),
+            "live_audit_status": status_payload.get("live_audit_status"),
+            "live_audit_block_reason": status_payload.get("live_audit_block_reason"),
+        }
+        _fleag_v1_append_event(event)
+        return {"ok": False, "status": "BLOCKED_BY_FALCON_LIVE_AUDIT_GUARD", "sent": False, "reason": status_payload.get("live_audit_block_reason"), "audit": status_payload, "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}
+    if cfg.get("require_pre_order_telegram"):
+        msg = _fleag_v1_pre_order_message(payload)
+        tg = _fleag_v1_send_telegram(msg, title="FALCON LIVE PRÉ-ORDEM")
+        state = _fleag_v1_load_state()
+        state["last_pre_order_telegram_sent"] = bool(tg.get("sent"))
+        state["last_pre_order_telegram_error"] = tg.get("error")
+        state["last_pre_order_run"] = _fleag_v1_now()
+        if not tg.get("sent"):
+            state["last_live_order_telegram_sent"] = False
+            state["last_live_order_telegram_error"] = tg.get("error") or "Falha no Telegram pré-ordem."
+        _fleag_v1_save_state(state)
+        event = {"event": "FALCON_LIVE_PRE_ORDER_TELEGRAM", "ok": bool(tg.get("sent")), "telegram": tg, "payload": _fleag_v1_payload_summary(payload)}
+        _fleag_v1_append_event(event)
+        if not tg.get("sent"):
+            return {"ok": False, "status": "PRE_ORDER_TELEGRAM_FAILED_BLOCKED", "sent": False, "telegram": tg, "reason": tg.get("error"), "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}
+    return {"ok": True, "status": "PRE_ORDER_AUDIT_OK", "sent": False, "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}
+
+
+def falcon_live_execution_audit_guard_v1_post_order(payload, result):
+    sent = _fleag_v1_extract_sent(result)
+    status = _fleag_v1_extract_status(result)
+    stop_status = _fleag_v1_disaster_stop_status(result)
+    order_id = _fleag_v1_extract_order_id(result)
+    protection_status = "OPEN_PROTECTED" if stop_status == "OK" else ("OPEN_UNPROTECTED" if sent else "NO_ORDER_SENT")
+    registry = None
+    fail_safe_action = None
+    fail_safe = None
+    requires_attention = False
+    if sent:
+        registry = _fleag_v1_registry_sync(payload, result, protection_status=protection_status)
+        if stop_status == "FAILED":
+            requires_attention = True
+            if _fleag_v1_config().get("auto_close_on_stop_failure"):
+                fail_safe = _fleag_v1_fail_safe_close(payload, result)
+                fail_safe_action = "CLOSED_BY_FAILSAFE" if isinstance(fail_safe, dict) and fail_safe.get("ok") else "FAILSAFE_CLOSE_FAILED"
+                if fail_safe_action == "CLOSED_BY_FAILSAFE":
+                    protection_status = "CLOSED_BY_FAILSAFE"
+            else:
+                fail_safe_action = "BLOCK_NEW_ENTRIES_AND_ALERT"
+        else:
+            fail_safe_action = "NONE"
+    else:
+        fail_safe_action = "NONE"
+    registry_status = None
+    try:
+        registry_status = (registry or {}).get("status") or ("REGISTERED" if (registry or {}).get("ok") else None)
+    except Exception:
+        registry_status = None
+    post_event = {
+        "event": "FALCON_LIVE_POST_ORDER_AUDIT",
+        "ok": bool(sent and (stop_status != "FAILED") and not requires_attention),
+        "sent": bool(sent),
+        "status": status,
+        "order_id": order_id,
+        "payload": _fleag_v1_payload_summary(payload),
+        "live_result": _fleag_v1_public(_fleag_v1_extract_live_result(result)),
+        "last_live_order_disaster_stop_status": stop_status,
+        "last_live_order_registry_status": registry_status,
+        "last_live_order_fail_safe_action": fail_safe_action,
+        "registry_result": registry,
+        "fail_safe_result": fail_safe,
+        "requires_attention": requires_attention,
+    }
+    if sent and _fleag_v1_config().get("require_post_order_telegram"):
+        msg = _fleag_v1_post_order_message(payload, result, post_event)
+        title = "FALCON LIVE CRÍTICO" if requires_attention else "FALCON LIVE CONFIRMAÇÃO"
+        tg = _fleag_v1_send_telegram(msg, title=title)
+        post_event["post_order_telegram"] = tg
+    else:
+        tg = {"ok": True, "sent": False, "status": "POST_TELEGRAM_NOT_REQUIRED_OR_NO_ORDER"}
+        post_event["post_order_telegram"] = tg
+    state = _fleag_v1_load_state()
+    if sent:
+        state["last_live_order_at"] = _fleag_v1_now()
+        state["last_live_order_id"] = order_id
+        state["last_live_order_status"] = status
+        state["last_live_order_telegram_sent"] = bool(tg.get("sent")) if _fleag_v1_config().get("require_post_order_telegram") else None
+        state["last_live_order_telegram_error"] = tg.get("error") if not tg.get("sent") and _fleag_v1_config().get("require_post_order_telegram") else None
+        state["last_live_order_disaster_stop_status"] = stop_status
+        state["last_live_order_registry_status"] = registry_status
+        state["last_live_order_fail_safe_action"] = fail_safe_action
+        state["last_live_order_protection_status"] = protection_status
+        state["live_audit_status"] = "BLOCKED" if requires_attention or state.get("last_live_order_telegram_error") else "OK"
+        state["live_audit_block_reason"] = (
+            "Disaster stop failed" if requires_attention else (state.get("last_live_order_telegram_error") or None)
+        )
+    _fleag_v1_save_state(state)
+    _fleag_v1_append_event(post_event)
+    return _fleag_v1_public(post_event)
+
+
+def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    """Falcon Live Execution Audit Guard V1 wrapper final."""
+    original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_FALCON_LIVE_AUDIT_GUARD_V1
+    payload_dict = dict(payload or {}) if isinstance(payload, dict) else {}
+    mode_norm = str(mode or payload_dict.get("mode") or payload_dict.get("execution_mode") or "").upper().strip() or "LIVE"
+    dry = _fleag_v1_bool(dry_run, default=True)
+    applies = _fleag_v1_applies_to_live_falcon(payload_dict, mode=mode_norm, dry_run=dry)
+    if applies:
+        pre = falcon_live_execution_audit_guard_v1_pre_order(payload_dict)
+        if not pre.get("ok"):
+            return {
+                "ok": False,
+                "status": pre.get("status") or "BLOCKED_BY_FALCON_LIVE_AUDIT_GUARD",
+                "sent": False,
+                "live_sent": False,
+                "mode": mode_norm,
+                "dry_run": dry,
+                "falcon_live_execution_audit_guard_v1": pre,
+                "payload": {
+                    "ok": False,
+                    "status": pre.get("status") or "BLOCKED_BY_FALCON_LIVE_AUDIT_GUARD",
+                    "live_result": {
+                        "ok": False,
+                        "sent": False,
+                        "status": pre.get("status") or "BLOCKED_BY_FALCON_LIVE_AUDIT_GUARD",
+                        "requires_manual_attention": True,
+                    },
+                    "falcon_live_execution_audit_guard_v1": pre,
+                },
+                "reason": pre.get("reason"),
+                "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
+                "token_value_exposed": False,
+            }
+    if not callable(original_runner):
+        result = {"ok": False, "status": "RUN_EXECUTION_ENGINE_MISSING_AFTER_FALCON_LIVE_AUDIT_GUARD", "sent": False, "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}
+    else:
+        result = original_runner(payload=payload_dict, mode=mode, dry_run=dry_run, *args, **kwargs)
+    if applies:
+        try:
+            post = falcon_live_execution_audit_guard_v1_post_order(payload_dict, result)
+            if isinstance(result, dict):
+                result.setdefault("falcon_live_execution_audit_guard_v1", post)
+                if isinstance(result.get("payload"), dict):
+                    result["payload"].setdefault("falcon_live_execution_audit_guard_v1", post)
+        except Exception as exc:
+            err = {"ok": False, "status": "FALCON_LIVE_POST_AUDIT_ERROR", "error": str(exc), "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}
+            _fleag_v1_append_event({"event": "FALCON_LIVE_POST_AUDIT_ERROR", "error": str(exc), "payload": _fleag_v1_payload_summary(payload_dict)})
+            if isinstance(result, dict):
+                result.setdefault("falcon_live_execution_audit_guard_v1", err)
+    return result
+
+
+def can_open_trade_decision(payload: dict):
+    original = _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_FALCON_LIVE_AUDIT_GUARD_V1
+    p = dict(payload or {}) if isinstance(payload, dict) else {}
+    bot = _fleag_v1_norm_bot(p.get("bot") or p.get("robot") or p.get("strategy"))
+    mode_norm = str(p.get("mode") or p.get("execution_mode") or "").upper().strip()
+    intended_live = bool(p.get("intended_live") or mode_norm == "LIVE")
+    reduce_only = False
+    try:
+        reduce_only = bool(_risk_is_reduce_only(p)) if callable(globals().get("_risk_is_reduce_only")) else _fleag_v1_bool(p.get("reduce_only"), default=False)
+    except Exception:
+        reduce_only = _fleag_v1_bool(p.get("reduce_only"), default=False)
+    if bot == "FALCON" and intended_live and not reduce_only:
+        audit = falcon_live_execution_audit_guard_v1_status(include_recent=False)
+        if not audit.get("ok"):
+            result = {
+                "ok": True,
+                "allowed": False,
+                "decision": "DENY",
+                "bot": bot,
+                "symbol": _fleag_v1_norm_symbol(p.get("symbol")),
+                "side": _fleag_v1_norm_side(p.get("side")),
+                "mode": mode_norm,
+                "intended_live": intended_live,
+                "reduce_only": False,
+                "reasons": [audit.get("live_audit_block_reason") or "Falcon Live Audit Guard bloqueou nova entrada real."],
+                "warnings": [],
+                "status": "BLOCKED_BY_FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1",
+                "falcon_live_execution_audit_guard_v1": audit,
+                "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
+                "token_value_exposed": False,
+            }
+            try:
+                if callable(globals().get("append_decision_log")):
+                    append_decision_log(p, result)
+                    result["decision_log_saved"] = True
+            except Exception as exc:
+                result["decision_log_saved"] = False
+                result["decision_log_error"] = str(exc)
+            _fleag_v1_append_event({"event": "CAN_OPEN_TRADE_BLOCKED_BY_FALCON_LIVE_AUDIT", "payload": _fleag_v1_payload_summary(p), "audit": audit})
+            return result
+    if callable(original):
+        result = original(p)
+    else:
+        result = {"ok": False, "allowed": False, "decision": "DENY", "status": "ORIGINAL_CAN_OPEN_TRADE_MISSING_AFTER_FALCON_LIVE_AUDIT"}
+    try:
+        if isinstance(result, dict) and bot == "FALCON":
+            result.setdefault("falcon_live_execution_audit_guard_v1", falcon_live_execution_audit_guard_v1_status(include_recent=False))
+    except Exception:
+        pass
+    return result
+
+
+def bot_health(key: str, cfg: dict):
+    original = _ORIGINAL_BOT_HEALTH_FOR_FALCON_LIVE_AUDIT_GUARD_V1
+    if callable(original):
+        payload = original(key, cfg)
+    else:
+        payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
+    try:
+        if str(key).upper() == "FALCON":
+            audit = falcon_live_execution_audit_guard_v1_status(include_recent=False)
+            health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+            state = audit.get("state") if isinstance(audit.get("state"), dict) else {}
+            overlay = {
+                "last_live_order_telegram_sent": state.get("last_live_order_telegram_sent"),
+                "last_live_order_telegram_error": state.get("last_live_order_telegram_error"),
+                "last_live_order_disaster_stop_status": state.get("last_live_order_disaster_stop_status"),
+                "last_live_order_registry_status": state.get("last_live_order_registry_status"),
+                "last_live_order_fail_safe_action": state.get("last_live_order_fail_safe_action"),
+                "live_audit_status": audit.get("live_audit_status"),
+                "live_audit_block_reason": audit.get("live_audit_block_reason"),
+                "falcon_live_audit_version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
+            }
+            health.update(overlay)
+            payload["health"] = health
+            payload.update(overlay)
+    except Exception as exc:
+        try:
+            payload.setdefault("health", {})["live_audit_overlay_error"] = str(exc)
+        except Exception:
+            pass
+    return payload
+
+
+def build_falcon_live_audit_guard_v1_text():
+    payload = falcon_live_execution_audit_guard_v1_status(include_recent=True)
+    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    div = payload.get("divergence") if isinstance(payload.get("divergence"), dict) else {}
+    lines = [
+        "🛡️ FALCON LIVE EXECUTION AUDIT GUARD V1",
+        f"Data/hora: {_fleag_v1_now()}",
+        f"Status: {'✅ OK' if payload.get('ok') else '🛑 BLOCKED'}",
+        f"Versão: {FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}",
+        "",
+        "Última ordem real:",
+        f"- last_live_order_at: {state.get('last_live_order_at')}",
+        f"- last_live_order_id: {state.get('last_live_order_id')}",
+        f"- last_live_order_status: {state.get('last_live_order_status')}",
+        f"- Telegram enviado: {state.get('last_live_order_telegram_sent')}",
+        f"- Telegram erro: {state.get('last_live_order_telegram_error')}",
+        f"- Disaster stop: {state.get('last_live_order_disaster_stop_status')}",
+        f"- Registry: {state.get('last_live_order_registry_status')}",
+        f"- Fail-safe: {state.get('last_live_order_fail_safe_action')}",
+        f"- Proteção: {state.get('last_live_order_protection_status')}",
+        "",
+        "Divergência Central x BingX:",
+        f"- BingX abertas: {div.get('broker_bingx_open_count')}",
+        f"- Central LIVE: {div.get('central_live_count')}",
+        f"- Só na BingX: {div.get('only_bingx_count')}",
+        f"- Só na Central: {div.get('only_central_count')}",
+        f"- LIVE sem stop: {div.get('live_without_stop_count')}",
+        "",
+        "Bloqueios:",
+    ]
+    if payload.get("reasons"):
+        lines += [f"- ❌ {x}" for x in payload.get("reasons")]
+    else:
+        lines.append("- ✅ Nenhum bloqueio ativo.")
+    if payload.get("warnings"):
+        lines += ["", "Avisos:"] + [f"- ⚠️ {x}" for x in payload.get("warnings")]
+    lines += [
+        "",
+        "Arquivos:",
+        f"- Eventos: {FALCON_LIVE_AUDIT_EVENTS_FILE}",
+        f"- Estado: {FALCON_LIVE_AUDIT_STATE_FILE}",
+        "",
+        "Notas:",
+        "- Telegram pré-ordem é pré-condição para LIVE.",
+        "- Telegram pós-ordem é confirmação obrigatória de LIVE_SENT.",
+        "- Se disaster stop falhar, o guard tenta fail-safe close quando habilitado.",
+        "- Se status estiver BLOCKED, /can_open_trade nega novas entradas reais do Falcon.",
+        "- Para reconhecer uma falha histórica depois de corrigida, use /falcon/liveaudit/ack?ack=FALCON_LIVE_AUDIT_ACK&clear_block=true.",
+    ]
+    return "\n".join(lines)
+
+
+@app.route("/falcon/liveaudit", methods=["GET"])
+@app.route("/falcon/liveaudit/health", methods=["GET"])
+def falcon_live_audit_guard_v1_route():
+    return falcon_live_execution_audit_guard_v1_status(include_recent=True), 200
+
+
+@app.route("/falcon/liveaudit/text", methods=["GET"])
+def falcon_live_audit_guard_v1_text_route():
+    return build_falcon_live_audit_guard_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.route("/falcon/liveaudit/ack", methods=["GET", "POST"])
+def falcon_live_audit_guard_v1_ack_route():
+    ack = str(request.args.get("ack") or "").strip().upper()
+    clear_block = _fleag_v1_bool(request.args.get("clear_block"), default=False)
+    if ack != "FALCON_LIVE_AUDIT_ACK" or not clear_block:
+        return {
+            "ok": False,
+            "status": "ACK_REQUIRED",
+            "required_ack": "FALCON_LIVE_AUDIT_ACK",
+            "required_clear_block": "clear_block=true",
+            "warning": "Use apenas depois de corrigir/validar a causa do bloqueio.",
+            "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
+        }, 400
+    state = _fleag_v1_load_state()
+    bad = _fleag_v1_read_bad_execution_events(limit=200)
+    keys = [_fleag_v1_event_key(e) for e in bad if _fleag_v1_event_key(e)]
+    existing = set(state.get("acked_bad_event_keys") or [])
+    existing.update(keys)
+    state["acked_bad_event_keys"] = sorted(existing)[-500:]
+    state["last_live_order_telegram_error"] = None
+    state["live_audit_status"] = "ACKED_RECHECK_REQUIRED"
+    state["live_audit_block_reason"] = None
+    state["last_ack_at"] = _fleag_v1_now()
+    state["last_ack_bad_event_count"] = len(keys)
+    _fleag_v1_save_state(state)
+    event = {"event": "FALCON_LIVE_AUDIT_ACK", "acked_count": len(keys), "state": state}
+    _fleag_v1_append_event(event)
+    return {"ok": True, "status": "ACK_SAVED_RECHECK_REQUIRED", "acked_count": len(keys), "state": _fleag_v1_public(state), "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}, 200
+
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
