@@ -39726,7 +39726,7 @@ def live_pilot_guard_v1_text_route():
 # - Divergência Central x BingX bloqueia novas entradas LIVE.
 # - Expõe health em /bots/FALCON e rota /falcon/liveaudit/text.
 # ============================================================================
-FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION = "2026-07-09-FALCON-LIVE-EXECUTION-AUDIT-GUARD-V1"
+FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION = "2026-07-09-FALCON-LIVE-EXECUTION-AUDIT-GUARD-V1.1-HISTORICAL-DETECTION"
 
 try:
     FALCON_LIVE_AUDIT_EVENTS_FILE = CENTRAL_DATA_DIR / "falcon_live_execution_audit.jsonl"
@@ -40115,41 +40115,178 @@ def _fleag_v1_fail_safe_close(payload, result):
         return {"ok": False, "status": "FAILSAFE_CLOSE_ERROR", "error": str(exc), "symbol": symbol, "side": side, "amount": amount}
 
 
+def _fleag_v1_deep_values(obj, max_items=400):
+    """Collect small scalar values from nested dict/list for robust historical log detection."""
+    out = []
+    seen = 0
+    def walk(x):
+        nonlocal seen
+        if seen >= max_items:
+            return
+        seen += 1
+        try:
+            if isinstance(x, dict):
+                for k, v in x.items():
+                    if _fleag_v1_sensitive_key(k):
+                        continue
+                    walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x[:80]:
+                    walk(v)
+            elif x is not None:
+                s = str(x)
+                if s and len(s) <= 500:
+                    out.append(s)
+        except Exception:
+            pass
+    walk(obj)
+    return out
+
+
+def _fleag_v1_deep_find(obj, candidate_keys):
+    keys = {str(k).lower() for k in candidate_keys}
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if str(k).lower() in keys and v not in (None, ""):
+                    return v
+            for k, v in obj.items():
+                if _fleag_v1_sensitive_key(k):
+                    continue
+                found = _fleag_v1_deep_find(v, keys)
+                if found not in (None, ""):
+                    return found
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                found = _fleag_v1_deep_find(v, keys)
+                if found not in (None, ""):
+                    return found
+    except Exception:
+        return None
+    return None
+
+
+def _fleag_v1_is_trueish_deep(obj, candidate_keys):
+    keys = {str(k).lower() for k in candidate_keys}
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if lk in keys:
+                    if isinstance(v, bool):
+                        if v:
+                            return True
+                    else:
+                        sv = str(v).strip().lower()
+                        if sv in {"1", "true", "yes", "sim", "on", "sent", "live_sent"}:
+                            return True
+                if not _fleag_v1_sensitive_key(k) and _fleag_v1_is_trueish_deep(v, keys):
+                    return True
+        elif isinstance(obj, (list, tuple)):
+            return any(_fleag_v1_is_trueish_deep(v, keys) for v in obj)
+    except Exception:
+        return False
+    return False
+
+
+def _fleag_v1_event_indicates_bad_live_execution(e):
+    """Robustly detect previous Falcon LIVE events with failed disaster stop.
+
+    V1 only detected a narrow schema. V1.1 also detects the broker/live-log schema
+    used by /live, where fields can be nested and `bot/status/sent` may not be top-level.
+    """
+    try:
+        e = e if isinstance(e, dict) else {"raw": str(e)}
+        values = _fleag_v1_deep_values(e)
+        joined = " | ".join(values).upper()
+        bot_raw = _fleag_v1_deep_find(e, ["bot", "robot", "strategy", "source_bot", "bot_name"])
+        bot = _fleag_v1_norm_bot(bot_raw or "")
+        tag = str(_fleag_v1_deep_find(e, ["tag", "client_tag", "client_order_id", "clientOrderId", "client_orderid"]) or "")
+        status_raw = _fleag_v1_deep_find(e, ["status", "status_code", "event", "classification", "result_status", "execution_status"])
+        status = str(status_raw or "").upper()
+
+        is_falcon = (bot == "FALCON") or ("FALCON-LIVE" in tag.upper()) or ("BOT=FALCON" in joined) or ("FALCON" in joined and "LIVE_SENT" in joined)
+        is_live_sent = (
+            _fleag_v1_is_trueish_deep(e, ["sent", "live_sent", "order_sent", "sent_to_exchange"])
+            or "LIVE_SENT" in status
+            or "LIVE_SENT" in joined
+        )
+        stop_failed = (
+            "LIVE_SENT_BUT_DISASTER_STOP_FAILED" in status
+            or "LIVE_SENT_BUT_DISASTER_STOP_FAILED" in joined
+            or "DISASTER_STOP_FAILED" in status
+            or "DISASTER_STOP_FAILED" in joined
+            or ("DISASTER" in joined and "STOP" in joined and "FAILED" in joined)
+        )
+        return bool(is_falcon and is_live_sent and stop_failed)
+    except Exception:
+        return False
+
+
+def _fleag_v1_read_jsonl_file(path, limit=200):
+    rows = []
+    try:
+        p = path if hasattr(path, "exists") else FALCON_LIVE_AUDIT_EVENTS_FILE.parent / str(path)
+        if p.exists():
+            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit or 200)): ]
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict):
+                        item.setdefault("_source_file", str(p))
+                        rows.append(_fleag_v1_public(item))
+                except Exception:
+                    if line.strip():
+                        rows.append({"raw": line[:2000], "_source_file": str(p)})
+    except Exception:
+        pass
+    return rows
+
+
 def _fleag_v1_read_bad_execution_events(limit=200):
+    # Read ALL known sources, not only the first one that returns rows.
+    # This matters because _execution_log_items can return a compact view that misses
+    # the exact schema needed by the historical failure detector.
     rows = []
     try:
         if callable(globals().get("_execution_log_items")):
             items, err = _execution_log_items(limit=limit)
             for item in items or []:
                 if isinstance(item, dict):
+                    item.setdefault("_source_file", "_execution_log_items")
                     rows.append(_fleag_v1_public(item))
     except Exception:
         pass
-    if not rows:
+
+    parent = FALCON_LIVE_AUDIT_EVENTS_FILE.parent
+    for name in [
+        "broker_executions_log.jsonl",
+        "broker_execution_audit_log.jsonl",
+        "execution_engine_log.jsonl",
+        "auto_real_execution_bridge.jsonl",
+    ]:
         try:
-            p = FALCON_LIVE_AUDIT_EVENTS_FILE.parent / "broker_executions_log.jsonl"
-            if p.exists():
-                for line in p.read_text(encoding="utf-8", errors="ignore").splitlines()[-max(1, int(limit)):]:
-                    try:
-                        item = json.loads(line)
-                        if isinstance(item, dict):
-                            rows.append(_fleag_v1_public(item))
-                    except Exception:
-                        pass
+            rows.extend(_fleag_v1_read_jsonl_file(parent / name, limit=limit))
         except Exception:
             pass
+
+    try:
+        rows.extend(_fleag_v1_read_events(limit=limit))
+    except Exception:
+        pass
+
     bad = []
+    seen = set()
     for e in rows:
         try:
-            bot = _fleag_v1_norm_bot(e.get("bot") or e.get("strategy") or "")
-            status = str(e.get("status") or e.get("event") or "").upper()
-            sent = bool(e.get("sent"))
-            if bot == "FALCON" and sent and ("LIVE_SENT_BUT_DISASTER_STOP_FAILED" in status or ("DISASTER" in status and "FAILED" in status)):
-                bad.append(e)
+            if _fleag_v1_event_indicates_bad_live_execution(e):
+                key = _fleag_v1_event_key(e) or json.dumps(_fleag_v1_public(e), ensure_ascii=False, sort_keys=True, default=str)[:300]
+                if key not in seen:
+                    seen.add(key)
+                    bad.append(e)
         except Exception:
             continue
     return bad
-
 
 def _fleag_v1_divergence_payload():
     broker_positions, broker_err = ([], None)
