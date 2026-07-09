@@ -44325,6 +44325,697 @@ def broker_disaster_stop_payload_preview_v1_text_route():
     payload = _bdsp_v1_build_preview()
     return _bdsp_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
+
+# ==========================================================
+# FALCON REAL PILOT PREFLIGHT CHECKLIST V1 — SAFE NO-REARM DIAGNOSTIC
+# ==========================================================
+FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-07-09-FALCON-REAL-PILOT-PREFLIGHT-CHECKLIST-V1"
+
+try:
+    FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR = Path(CENTRAL_DATA_DIR)
+except Exception:
+    FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/data"))
+
+FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_LATEST_FILE = FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR / "falcon_real_pilot_preflight_checklist_v1_latest.json"
+FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE = FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR / "falcon_real_pilot_preflight_checklist_v1_events.jsonl"
+
+
+def _frpp_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        try:
+            return agora_sp_str()
+        except Exception:
+            return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _frpp_v1_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "sim", "s", "on", "ativo", "active", "enabled"}:
+        return True
+    if s in {"0", "false", "no", "n", "nao", "não", "off", "inativo", "inactive", "disabled"}:
+        return False
+    return bool(default)
+
+
+def _frpp_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _frpp_v1_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(float(str(value).replace(",", ".")))
+    except Exception:
+        return int(default)
+
+
+def _frpp_v1_env_bool(name, default=False):
+    return _frpp_v1_bool(os.environ.get(name), default)
+
+
+def _frpp_v1_upper(value):
+    return str(value or "").strip().upper()
+
+
+def _frpp_v1_safe_sanitize(value):
+    try:
+        sanitizer = globals().get("_execution_final_gate_v1_sanitize")
+        if callable(sanitizer):
+            return sanitizer(value)
+    except Exception:
+        pass
+    try:
+        sanitizer = globals().get("_audit_sanitize")
+        if callable(sanitizer):
+            return sanitizer(value)
+    except Exception:
+        pass
+    return value
+
+
+def _frpp_v1_write_json_atomic(path, payload):
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        tmp.replace(path)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _frpp_v1_append_event(payload):
+    try:
+        FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _frpp_v1_read_jsonl(path, limit=300):
+    rows = []
+    try:
+        path = Path(path)
+        if not path.exists():
+            return rows
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-int(limit):]
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    rows.append(obj)
+            except Exception:
+                continue
+    except Exception:
+        return rows
+    return rows
+
+
+def _frpp_v1_load_json(path):
+    try:
+        path = Path(path)
+        if path.exists():
+            obj = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _frpp_v1_env_snapshot():
+    return {
+        "execution_mode": os.environ.get("EXECUTION_MODE"),
+        "enable_real_trading_env": os.environ.get("ENABLE_REAL_TRADING"),
+        "enable_real_trading_bool": _frpp_v1_env_bool("ENABLE_REAL_TRADING", False),
+        "broker_dry_run_env": os.environ.get("BROKER_DRY_RUN"),
+        "broker_dry_run_bool": _frpp_v1_env_bool("BROKER_DRY_RUN", True),
+        "falcon_mode": os.environ.get("FALCON_MODE"),
+        "central_real_execution_enabled_env": os.environ.get("CENTRAL_REAL_EXECUTION_ENABLED"),
+        "central_real_execution_enabled_bool": _frpp_v1_env_bool("CENTRAL_REAL_EXECUTION_ENABLED", False),
+        "central_real_pilot_enabled_env": os.environ.get("CENTRAL_REAL_PILOT_ENABLED"),
+        "central_real_pilot_enabled_bool": _frpp_v1_env_bool("CENTRAL_REAL_PILOT_ENABLED", False),
+        "central_real_pilot_guard_enabled_env": os.environ.get("CENTRAL_REAL_PILOT_GUARD_ENABLED"),
+        "central_real_pilot_guard_enabled_bool": _frpp_v1_env_bool("CENTRAL_REAL_PILOT_GUARD_ENABLED", True),
+        "broker_real_pilot_guard_enabled_env": os.environ.get("BROKER_REAL_PILOT_GUARD_ENABLED"),
+        "broker_real_pilot_guard_enabled_bool": _frpp_v1_env_bool("BROKER_REAL_PILOT_GUARD_ENABLED", True),
+        "falcon_real_notional_usdt": os.environ.get("FALCON_REAL_NOTIONAL_USDT"),
+        "falcon_real_max_positions": os.environ.get("FALCON_REAL_MAX_POSITIONS"),
+        "real_allowed_bots": os.environ.get("CENTRAL_REAL_PILOT_ALLOWED_BOTS") or os.environ.get("CENTRAL_REAL_ALLOWED_BOTS") or os.environ.get("REAL_TRADING_ALLOWED_BOTS"),
+        "real_allowed_symbols": os.environ.get("CENTRAL_REAL_PILOT_ALLOWED_SYMBOLS") or os.environ.get("CENTRAL_REAL_ALLOWED_SYMBOLS") or os.environ.get("REAL_TRADING_ALLOWED_SYMBOLS"),
+    }
+
+
+def _frpp_v1_get_bots_snapshot():
+    out = {}
+    try:
+        for key, cfg in (BOT_CONFIGS if "BOT_CONFIGS" in globals() else {}).items():
+            try:
+                out[str(key).upper()] = bot_health(key, cfg) if callable(globals().get("bot_health")) else {}
+            except Exception as exc:
+                out[str(key).upper()] = {"error": str(exc)}
+    except Exception as exc:
+        out["_error"] = str(exc)
+    return out
+
+
+def _frpp_v1_get_falcon_audit():
+    try:
+        fn = globals().get("falcon_live_execution_audit_guard_v1_status")
+        if callable(fn):
+            return fn(include_recent=False) or {}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "live_audit_status": "ERROR"}
+    return {"ok": False, "error": "falcon_live_execution_audit_guard_v1_status unavailable", "live_audit_status": "UNAVAILABLE"}
+
+
+def _frpp_v1_get_broker_ready():
+    ready = {}
+    status = {}
+    try:
+        ready = bingx_ready_payload() if callable(globals().get("bingx_ready_payload")) else {}
+    except Exception as exc:
+        ready = {"ok": False, "status": "READY_ERROR", "error": str(exc)}
+    try:
+        status = broker_status_payload() if callable(globals().get("broker_status_payload")) else {}
+    except Exception as exc:
+        status = {"ok": False, "error": str(exc)}
+    broker_inner = status.get("broker") if isinstance(status, dict) else {}
+    if not isinstance(broker_inner, dict):
+        broker_inner = {}
+    return {"ready": ready if isinstance(ready, dict) else {}, "status": status if isinstance(status, dict) else {}, "broker": broker_inner}
+
+
+def _frpp_v1_get_divergence():
+    try:
+        fn = globals().get("_fleag_v1_divergence_payload")
+        if callable(fn):
+            return fn() or {}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        fn = globals().get("_rpg_safe_live_counts")
+        if callable(fn):
+            counts = fn({}) or {}
+            return {
+                "ok": not counts.get("errors"),
+                "broker_bingx_open_count": counts.get("broker_bingx_open_count"),
+                "central_live_count": counts.get("central_live_count"),
+                "only_bingx_count": None,
+                "only_central_count": None,
+                "live_without_stop_count": None,
+                "fallback_counts": counts,
+            }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": False, "error": "no divergence function available"}
+
+
+def _frpp_v1_get_runtime():
+    try:
+        fn = globals().get("runtime_stability_v1_snapshot")
+        if callable(fn):
+            return fn(hours=24) or {}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "status": "ERROR"}
+    return {"ok": False, "error": "runtime_stability_v1_snapshot unavailable", "status": "UNAVAILABLE"}
+
+
+def _frpp_v1_get_trade_registry_storage():
+    try:
+        fn = globals().get("trade_registry_persistent_storage_fix_v1_status")
+        if callable(fn):
+            return fn(force=False) or {}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "status": "ERROR"}
+    return {"ok": False, "error": "trade_registry_persistent_storage_fix_v1_status unavailable", "status": "UNAVAILABLE"}
+
+
+def _frpp_v1_get_disaster_preview_status():
+    events = []
+    latest = {}
+    try:
+        if "BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE" in globals():
+            events = _frpp_v1_read_jsonl(BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE, limit=300)
+    except Exception:
+        events = []
+    try:
+        if "BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_LATEST_FILE" in globals():
+            latest = _frpp_v1_load_json(BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_LATEST_FILE)
+    except Exception:
+        latest = {}
+    if latest:
+        events.append(latest)
+
+    def is_safe_preview(item, side):
+        if not isinstance(item, dict):
+            return False
+        inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+        validation = item.get("validation") if isinstance(item.get("validation"), dict) else {}
+        pos_side = _frpp_v1_upper(inputs.get("position_side") or inputs.get("positionSide") or validation.get("positionSide"))
+        return bool(
+            item.get("ok")
+            and str(item.get("status") or "").upper() == "PAYLOAD_PREVIEW_OK_SAFE_NO_SEND"
+            and item.get("no_order_sent") is True
+            and item.get("sent") is False
+            and item.get("would_send_order") is False
+            and pos_side == side
+            and validation.get("disaster_stop_payload_safe") is True
+            and validation.get("hedge_mode_detected") is True
+            and validation.get("position_side_ok") is True
+            and validation.get("close_side_ok") is True
+            and validation.get("reduceOnly_in_payload") is False
+            and validation.get("closePosition_in_payload") is False
+            and not (validation.get("bad_exchange_fields") or [])
+        )
+
+    long_items = [x for x in events if is_safe_preview(x, "LONG")]
+    short_items = [x for x in events if is_safe_preview(x, "SHORT")]
+    long_latest = long_items[-1] if long_items else None
+    short_latest = short_items[-1] if short_items else None
+    return {
+        "ok": bool(long_latest and short_latest),
+        "long_ok": bool(long_latest),
+        "short_ok": bool(short_latest),
+        "events_read": len(events),
+        "long_latest_generated_at": long_latest.get("generated_at") if isinstance(long_latest, dict) else None,
+        "short_latest_generated_at": short_latest.get("generated_at") if isinstance(short_latest, dict) else None,
+        "latest_file": str(globals().get("BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_LATEST_FILE", "")),
+        "events_file": str(globals().get("BROKER_DISASTER_STOP_PAYLOAD_PREVIEW_V1_EVENTS_FILE", "")),
+        "long_status": long_latest.get("status") if isinstance(long_latest, dict) else None,
+        "short_status": short_latest.get("status") if isinstance(short_latest, dict) else None,
+    }
+
+
+def _frpp_v1_build_checklist():
+    env = _frpp_v1_env_snapshot()
+    bots = _frpp_v1_get_bots_snapshot()
+    falcon_bot = bots.get("FALCON") if isinstance(bots.get("FALCON"), dict) else {}
+    falcon_health = falcon_bot.get("health") if isinstance(falcon_bot.get("health"), dict) else {}
+    predator_bot = bots.get("PREDATOR") if isinstance(bots.get("PREDATOR"), dict) else {}
+    predator_health = predator_bot.get("health") if isinstance(predator_bot.get("health"), dict) else {}
+    turtle_bot = bots.get("TURTLE") if isinstance(bots.get("TURTLE"), dict) else {}
+    turtle_health = turtle_bot.get("health") if isinstance(turtle_bot.get("health"), dict) else {}
+
+    falcon_audit = _frpp_v1_get_falcon_audit()
+    broker = _frpp_v1_get_broker_ready()
+    divergence = _frpp_v1_get_divergence()
+    runtime = _frpp_v1_get_runtime()
+    storage = _frpp_v1_get_trade_registry_storage()
+    disaster_preview = _frpp_v1_get_disaster_preview_status()
+
+    checks = []
+    reasons = []
+    warnings = []
+
+    def add(code, ok, message_ok, message_fail=None, blocking=True, details=None):
+        item = {
+            "code": code,
+            "ok": bool(ok),
+            "blocking": bool(blocking),
+            "message": message_ok if ok else (message_fail or message_ok),
+            "details": details or {},
+        }
+        checks.append(item)
+        if not ok and blocking:
+            reasons.append(item["message"])
+        elif not ok:
+            warnings.append(item["message"])
+        return item
+
+    enable_real = bool(env.get("enable_real_trading_bool"))
+    broker_dry = bool(env.get("broker_dry_run_bool"))
+    central_real = bool(env.get("central_real_execution_enabled_bool"))
+    central_pilot = bool(env.get("central_real_pilot_enabled_bool"))
+    falcon_mode = _frpp_v1_upper(env.get("falcon_mode") or falcon_health.get("mode") or falcon_health.get("execution_mode"))
+
+    add(
+        "ENV_ENABLE_REAL_TRADING_PRE_REARM_FALSE",
+        enable_real is False,
+        "ENABLE_REAL_TRADING está false antes do rearm.",
+        "ENABLE_REAL_TRADING não está false; não é um estado seguro de pré-rearm.",
+        True,
+        {"value": env.get("enable_real_trading_env"), "bool": enable_real},
+    )
+    add(
+        "ENV_BROKER_DRY_RUN_PRE_REARM_TRUE",
+        broker_dry is True,
+        "BROKER_DRY_RUN está true antes do rearm.",
+        "BROKER_DRY_RUN não está true; não é um estado seguro de pré-rearm.",
+        True,
+        {"value": env.get("broker_dry_run_env"), "bool": broker_dry},
+    )
+    add(
+        "ENV_CENTRAL_REAL_EXECUTION_FALSE",
+        central_real is False,
+        "CENTRAL_REAL_EXECUTION_ENABLED está false.",
+        "CENTRAL_REAL_EXECUTION_ENABLED está true antes do preflight final.",
+        True,
+        {"value": env.get("central_real_execution_enabled_env"), "bool": central_real},
+    )
+    add(
+        "ENV_CENTRAL_REAL_PILOT_FALSE",
+        central_pilot is False,
+        "CENTRAL_REAL_PILOT_ENABLED está false.",
+        "CENTRAL_REAL_PILOT_ENABLED está true antes do preflight final.",
+        True,
+        {"value": env.get("central_real_pilot_enabled_env"), "bool": central_pilot},
+    )
+    add(
+        "ENV_FALCON_VERIFY_PRE_REARM",
+        falcon_mode in {"VERIFY", "PAPER", "OFF", ""},
+        f"FALCON_MODE está em modo seguro de pré-rearm: {falcon_mode or 'N/A'}.",
+        f"FALCON_MODE não está em modo seguro de pré-rearm: {falcon_mode}.",
+        True,
+        {"falcon_mode": falcon_mode},
+    )
+
+    broker_ready_payload = broker.get("ready") if isinstance(broker.get("ready"), dict) else {}
+    broker_inner = broker.get("broker") if isinstance(broker.get("broker"), dict) else {}
+    ready_ok = bool(broker_ready_payload.get("ok") or broker_inner.get("ready") or broker_inner.get("ok"))
+    add(
+        "BROKER_READY_TRUE",
+        ready_ok,
+        "Broker READY true.",
+        "Broker não está READY.",
+        True,
+        {"ready": broker_ready_payload, "broker_status": _frpp_v1_safe_sanitize(broker_inner)},
+    )
+
+    broker_open_count = _frpp_v1_int(divergence.get("broker_bingx_open_count"), -1)
+    central_live_count = _frpp_v1_int(divergence.get("central_live_count"), -1)
+    only_bingx_count = _frpp_v1_int(divergence.get("only_bingx_count"), 0) if divergence.get("only_bingx_count") is not None else 0
+    only_central_count = _frpp_v1_int(divergence.get("only_central_count"), 0) if divergence.get("only_central_count") is not None else 0
+    live_without_stop_count = _frpp_v1_int(divergence.get("live_without_stop_count"), 0) if divergence.get("live_without_stop_count") is not None else 0
+    add(
+        "SYNC_BINGX_POSITIONS_ZERO",
+        broker_open_count == 0,
+        "BingX positions = 0.",
+        f"BingX positions não está 0: {broker_open_count}.",
+        True,
+        {"broker_bingx_open_count": broker_open_count},
+    )
+    add(
+        "SYNC_CENTRAL_LIVE_ZERO",
+        central_live_count == 0,
+        "Central LIVE positions = 0.",
+        f"Central LIVE positions não está 0: {central_live_count}.",
+        True,
+        {"central_live_count": central_live_count},
+    )
+    add(
+        "SYNC_NO_DIVERGENCE",
+        only_bingx_count == 0 and only_central_count == 0 and live_without_stop_count == 0,
+        "Sem divergência Central x BingX e sem LIVE sem stop.",
+        "Há divergência Central x BingX ou LIVE sem stop.",
+        True,
+        {"only_bingx_count": only_bingx_count, "only_central_count": only_central_count, "live_without_stop_count": live_without_stop_count},
+    )
+
+    audit_status = str(falcon_audit.get("live_audit_status") or "").upper()
+    audit_ok = bool(falcon_audit.get("ok")) and audit_status in {"OK_ACKED_HISTORY_CLEAR", "OK"}
+    add(
+        "FALCON_LIVE_AUDIT_CLEAR",
+        audit_ok,
+        f"Falcon Live Audit liberado: {audit_status}.",
+        f"Falcon Live Audit não está liberado: {audit_status}.",
+        True,
+        {
+            "live_audit_status": audit_status,
+            "block_reason": falcon_audit.get("live_audit_block_reason"),
+            "bad_events_total": falcon_audit.get("bad_execution_events_total_count"),
+            "bad_events_acked": falcon_audit.get("bad_execution_events_acked_count"),
+            "bad_events_unacked": falcon_audit.get("bad_execution_events_unacked_count"),
+        },
+    )
+
+    add(
+        "DISASTER_STOP_PREVIEW_LONG_OK",
+        bool(disaster_preview.get("long_ok")),
+        "Disaster stop preview LONG aprovado e safe no-send.",
+        "Disaster stop preview LONG não está aprovado.",
+        True,
+        disaster_preview,
+    )
+    add(
+        "DISASTER_STOP_PREVIEW_SHORT_OK",
+        bool(disaster_preview.get("short_ok")),
+        "Disaster stop preview SHORT aprovado e safe no-send.",
+        "Disaster stop preview SHORT não está aprovado.",
+        True,
+        disaster_preview,
+    )
+
+    telegram_ok = bool(falcon_bot.get("token_configured") and falcon_bot.get("chat_configured"))
+    add(
+        "FALCON_TELEGRAM_CONFIGURED",
+        telegram_ok,
+        "Telegram do Falcon configurado.",
+        "Telegram do Falcon não está completamente configurado.",
+        True,
+        {"token_configured": falcon_bot.get("token_configured"), "chat_configured": falcon_bot.get("chat_configured")},
+    )
+
+    storage_ok = bool(storage.get("persistent_storage_enabled") and storage.get("last_write_ok") and str(storage.get("registry_file_active") or "").startswith("/data/"))
+    add(
+        "TRADE_REGISTRY_PERSISTENT_OK",
+        storage_ok,
+        "Trade Registry persistente OK em /data.",
+        "Trade Registry persistente não está OK.",
+        True,
+        {
+            "status": storage.get("status"),
+            "registry_file_active": storage.get("registry_file_active"),
+            "persistent_storage_enabled": storage.get("persistent_storage_enabled"),
+            "last_load_ok": storage.get("last_load_ok"),
+            "last_write_ok": storage.get("last_write_ok"),
+            "open_count": (storage.get("current_counts") or {}).get("open_count"),
+            "closed_count": (storage.get("current_counts") or {}).get("closed_count"),
+        },
+    )
+
+    current_mem = _frpp_v1_float(runtime.get("current_memory_pct"), None)
+    peak_mem = _frpp_v1_float(runtime.get("peak_memory_pct_observed"), current_mem)
+    memory_ok = (current_mem is not None and current_mem < 75.0 and (peak_mem is None or peak_mem < 85.0))
+    add(
+        "RUNTIME_MEMORY_RISK_OK",
+        memory_ok,
+        f"Memória sem risco crítico: atual={current_mem}% | pico={peak_mem}%.",
+        f"Memória exige revisão antes do rearm: atual={current_mem}% | pico={peak_mem}%.",
+        True,
+        {"current_memory_pct": current_mem, "peak_memory_pct_observed": peak_mem, "runtime_status": runtime.get("status"), "runtime_ok": runtime.get("ok")},
+    )
+    restart_count = _frpp_v1_int(runtime.get("restart_like_count_24h"), 0)
+    add(
+        "RUNTIME_RESTARTS_OBSERVATION_ONLY",
+        restart_count < 3,
+        "Poucos restarts nas últimas 24h.",
+        f"Muitos restarts nas últimas 24h: {restart_count}. Provável efeito de deploys; observar antes de rearmar.",
+        False,
+        {"restart_like_count_24h": restart_count, "startup_events_24h": runtime.get("startup_events_24h"), "uptime_minutes": runtime.get("uptime_minutes")},
+    )
+
+    predator_mode = _frpp_v1_upper(predator_health.get("execution_mode") or predator_health.get("mode"))
+    predator_real_sent = _frpp_v1_int(predator_health.get("predator_real_sent_or_live_event_count"), 0)
+    predator_live_ok = predator_mode != "LIVE" and predator_real_sent == 0
+    add(
+        "PREDATOR_OUT_OF_LIVE",
+        predator_live_ok,
+        f"Predator fora do LIVE: {predator_mode or 'N/A'} | real_sent={predator_real_sent}.",
+        f"Predator não está claramente fora do LIVE: {predator_mode} | real_sent={predator_real_sent}.",
+        True,
+        {"execution_mode": predator_mode, "execution_enabled": predator_health.get("execution_enabled"), "real_sent_count": predator_real_sent},
+    )
+    predator_lifecycle_ok = bool(predator_health.get("predator_lifecycle_audit_ok"))
+    add(
+        "PREDATOR_LIFECYCLE_OK",
+        predator_lifecycle_ok,
+        "Predator lifecycle OK_WITH_WARNINGS, sem divergência OPEN/CLOSED.",
+        "Predator lifecycle ainda tem divergência; corrija antes do rearm.",
+        True,
+        {"status": predator_health.get("predator_lifecycle_audit_status"), "missing_open": predator_health.get("predator_lifecycle_missing_registry_open_count"), "missing_closed": predator_health.get("predator_lifecycle_missing_registry_closed_count")},
+    )
+
+    turtle_mode = _frpp_v1_upper(turtle_health.get("mode") or turtle_health.get("execution_mode"))
+    turtle_live_ok = turtle_mode != "LIVE"
+    add(
+        "TURTLE_OUT_OF_LIVE",
+        turtle_live_ok,
+        f"Turtle fora do LIVE: {turtle_mode or 'N/A'}.",
+        f"Turtle não está claramente fora do LIVE: {turtle_mode}.",
+        True,
+        {"mode": turtle_mode, "last_positions_count": turtle_health.get("last_positions_count")},
+    )
+
+    blocking_failed = [c for c in checks if c.get("blocking") and not c.get("ok")]
+    warning_checks = [c for c in checks if (not c.get("blocking")) and not c.get("ok")]
+    all_blocking_ok = not blocking_failed
+    status = "PREFLIGHT_OK_READY_FOR_MANUAL_REARM_PLAN" if all_blocking_ok else "PREFLIGHT_REVIEW_REQUIRED"
+
+    payload = {
+        "ok": bool(all_blocking_ok),
+        "status": status,
+        "module": "falcon_real_pilot_preflight_checklist_v1",
+        "version": FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION,
+        "generated_at": _frpp_v1_now(),
+        "no_order_sent": True,
+        "sent": False,
+        "would_send_order": False,
+        "rearm_executed": False,
+        "live_not_armed_by_this_route": True,
+        "manual_rearm_next_step_allowed": bool(all_blocking_ok),
+        "summary": {
+            "blocking_checks_total": len([c for c in checks if c.get("blocking")]),
+            "blocking_checks_failed": len(blocking_failed),
+            "warning_checks_failed": len(warning_checks),
+            "checks_total": len(checks),
+            "falcon_audit_status": audit_status,
+            "broker_bingx_open_count": broker_open_count,
+            "central_live_count": central_live_count,
+            "enable_real_trading": enable_real,
+            "broker_dry_run": broker_dry,
+            "falcon_mode": falcon_mode,
+            "runtime_memory_pct": current_mem,
+            "runtime_restart_count_24h": restart_count,
+        },
+        "checks": checks,
+        "blocking_failures": blocking_failed,
+        "warnings": warnings,
+        "reasons": reasons,
+        "env": env,
+        "snapshots": {
+            "falcon_audit": _frpp_v1_safe_sanitize(falcon_audit),
+            "broker_ready": _frpp_v1_safe_sanitize(broker.get("ready")),
+            "broker_status": _frpp_v1_safe_sanitize(broker.get("broker")),
+            "divergence": _frpp_v1_safe_sanitize(divergence),
+            "runtime": _frpp_v1_safe_sanitize(runtime),
+            "trade_registry_storage": _frpp_v1_safe_sanitize(storage),
+            "disaster_stop_preview": _frpp_v1_safe_sanitize(disaster_preview),
+            "falcon_bot": _frpp_v1_safe_sanitize({"token_configured": falcon_bot.get("token_configured"), "chat_configured": falcon_bot.get("chat_configured"), "health": falcon_health}),
+            "predator_bot": _frpp_v1_safe_sanitize({"health": predator_health}),
+            "turtle_bot": _frpp_v1_safe_sanitize({"health": turtle_health}),
+        },
+        "files": {
+            "latest": str(FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_LATEST_FILE),
+            "events": str(FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE),
+        },
+        "notes": [
+            "Esta rota é somente checklist/preflight: não envia ordem, não cria stop e não rearma LIVE.",
+            "Ela deve ser rodada antes de qualquer alteração manual de ENV para piloto real.",
+            "Mesmo com status OK, o próximo passo é preparar checklist de rearmamento, não ativar dinheiro real automaticamente.",
+        ],
+        "token_value_exposed": False,
+    }
+
+    write_ok, write_error = _frpp_v1_write_json_atomic(FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_LATEST_FILE, payload)
+    event_payload = dict(payload)
+    event_payload.pop("snapshots", None)
+    event_ok, event_error = _frpp_v1_append_event(event_payload)
+    payload["diagnostic_write"] = {
+        "latest_ok": write_ok,
+        "latest_error": write_error,
+        "events_ok": event_ok,
+        "events_error": event_error,
+    }
+    return payload
+
+
+def _frpp_v1_text(payload):
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    lines = [
+        "🧭 FALCON REAL PILOT PREFLIGHT CHECKLIST V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅ ' if payload.get('ok') else '🛑 '}{payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Segurança:",
+        f"- no_order_sent: {payload.get('no_order_sent')}",
+        f"- sent: {payload.get('sent')}",
+        f"- would_send_order: {payload.get('would_send_order')}",
+        f"- rearm_executed: {payload.get('rearm_executed')}",
+        f"- live_not_armed_by_this_route: {payload.get('live_not_armed_by_this_route')}",
+        "",
+        "Resumo executivo:",
+        f"- Blocking checks failed: {summary.get('blocking_checks_failed')} / {summary.get('blocking_checks_total')}",
+        f"- Warning checks failed: {summary.get('warning_checks_failed')}",
+        f"- ENABLE_REAL_TRADING: {summary.get('enable_real_trading')}",
+        f"- BROKER_DRY_RUN: {summary.get('broker_dry_run')}",
+        f"- FALCON_MODE: {summary.get('falcon_mode')}",
+        f"- Falcon audit: {summary.get('falcon_audit_status')}",
+        f"- BingX positions: {summary.get('broker_bingx_open_count')}",
+        f"- Central LIVE positions: {summary.get('central_live_count')}",
+        f"- Runtime memory: {summary.get('runtime_memory_pct')}%",
+        f"- Restarts 24h: {summary.get('runtime_restart_count_24h')}",
+        "",
+        "Checklist:",
+    ]
+    for c in payload.get("checks") or []:
+        if not isinstance(c, dict):
+            continue
+        icon = "✅" if c.get("ok") else ("❌" if c.get("blocking") else "⚠️")
+        lines.append(f"- {icon} {c.get('code')}: {c.get('message')}")
+    if payload.get("reasons"):
+        lines += ["", "Bloqueios:"] + [f"- ❌ {x}" for x in payload.get("reasons") or []]
+    if payload.get("warnings"):
+        lines += ["", "Avisos:"] + [f"- ⚠️ {x}" for x in payload.get("warnings") or []]
+    lines += [
+        "",
+        "Arquivos:",
+        f"- Último snapshot: {payload.get('files', {}).get('latest')}",
+        f"- Eventos: {payload.get('files', {}).get('events')}",
+        "",
+        "Leitura executiva:",
+    ]
+    if payload.get("ok"):
+        lines += [
+            "✅ O preflight está limpo para preparar um plano de rearmamento manual.",
+            "✅ A rota não enviou ordem e não ligou LIVE.",
+            "⚠️ Próximo passo ainda deve ser checklist de ENV/rearm controlado, não operar automaticamente.",
+        ]
+    else:
+        lines += [
+            "🛑 Ainda há bloqueios no preflight.",
+            "🛑 Não rearmar LIVE enquanto todos os checks bloqueantes não estiverem verdes.",
+        ]
+    return "\n".join(lines)
+
+
+@app.route("/falcon/realpilot/preflight", methods=["GET"])
+@app.route("/falcon/preflight", methods=["GET"])
+@app.route("/realpilot/preflight", methods=["GET"])
+@app.route("/realpilot/preflightchecklist", methods=["GET"])
+@app.route("/preflight/falcon", methods=["GET"])
+def falcon_real_pilot_preflight_checklist_v1_route():
+    return _frpp_v1_build_checklist(), 200
+
+
+@app.route("/falcon/realpilot/preflight/text", methods=["GET"])
+@app.route("/falcon/preflight/text", methods=["GET"])
+@app.route("/realpilot/preflight/text", methods=["GET"])
+@app.route("/realpilot/preflightchecklist/text", methods=["GET"])
+@app.route("/preflight/falcon/text", methods=["GET"])
+def falcon_real_pilot_preflight_checklist_v1_text_route():
+    payload = _frpp_v1_build_checklist()
+    return _frpp_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
