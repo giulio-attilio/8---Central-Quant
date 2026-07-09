@@ -41428,6 +41428,542 @@ def predator_pnl_paper_audit_v1_text_route():
     return build_predator_pnl_paper_audit_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+
+
+# ============================================================================
+# PREDATOR PAPER LIFECYCLE AUDIT V1
+# ============================================================================
+# Objetivo:
+# - Auditar o ciclo de vida PAPER do Smart Predator de ponta a ponta.
+# - Garantir que posições abertas no módulo estejam refletidas no Trade Registry.
+# - Garantir que fechamentos PAPER auditáveis estejam refletidos como CLOSED no Registry.
+# - Detectar posições presas, campos obrigatórios ausentes, duplicidades e divergências.
+PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PAPER-LIFECYCLE-AUDIT-V1"
+PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_lifecycle_audit_events.jsonl")
+PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_lifecycle_audit_latest.json")
+_PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE = {"ts": 0, "payload": None}
+
+
+def _ppla_v1_now():
+    try:
+        return _pppa_v1_now()
+    except Exception:
+        try:
+            return datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return None
+
+
+def _ppla_v1_epoch_now():
+    try:
+        return datetime.now(timezone(timedelta(hours=-3))).timestamp()
+    except Exception:
+        try:
+            return datetime.now().timestamp()
+        except Exception:
+            return 0
+
+
+def _ppla_v1_float(value, default=None):
+    try:
+        return _pppa_v1_float(value, default=default)
+    except Exception:
+        try:
+            if value is None or value == "":
+                return default
+            return float(str(value).replace("%", "").replace(",", ".").strip())
+        except Exception:
+            return default
+
+
+def _ppla_v1_public(value, max_string=600):
+    try:
+        return _pppa_v1_public(value, max_string=max_string)
+    except Exception:
+        return value
+
+
+def _ppla_v1_norm_symbol(value):
+    try:
+        return _pppa_v1_norm_symbol(value)
+    except Exception:
+        raw = str(value or "UNKNOWN").upper().strip()
+        return raw.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace("-USDT", "USDT").replace(":USDT", "")
+
+
+def _ppla_v1_norm_side(value):
+    try:
+        return _pppa_v1_norm_side(value)
+    except Exception:
+        raw = str(value or "UNKNOWN").upper().strip()
+        if raw == "BUY":
+            return "LONG"
+        if raw == "SELL":
+            return "SHORT"
+        return raw
+
+
+def _ppla_v1_get_trade_id(item):
+    if not isinstance(item, dict):
+        return None
+    try:
+        tid = item.get("trade_id") or item.get("trade_registry_id") or item.get("id") or item.get("uid")
+        if tid:
+            return str(tid)
+        symbol = _ppla_v1_norm_symbol(item.get("symbol_clean") or item.get("symbol") or item.get("market_symbol"))
+        side = _ppla_v1_norm_side(item.get("side") or item.get("direction") or item.get("position_side"))
+        setup = str(item.get("setup") or item.get("signal_type") or item.get("origin") or "SMART_PREDATOR").upper()
+        if symbol and side and symbol != "UNKNOWN" and side != "UNKNOWN":
+            return f"PREDATOR:{setup}:{symbol}:{side}"
+    except Exception:
+        return None
+    return None
+
+
+def _ppla_v1_trade_key(item):
+    if not isinstance(item, dict):
+        return "UNKNOWN|UNKNOWN|UNKNOWN"
+    symbol = _ppla_v1_norm_symbol(item.get("symbol_clean") or item.get("symbol") or item.get("market_symbol"))
+    side = _ppla_v1_norm_side(item.get("side") or item.get("direction") or item.get("position_side"))
+    setup = str(item.get("setup") or item.get("signal_type") or item.get("origin") or "SMART_PREDATOR").upper()
+    return f"{symbol}|{side}|{setup}"
+
+
+def _ppla_v1_closed_key_from_event(ev):
+    if not isinstance(ev, dict):
+        return "UNKNOWN|UNKNOWN|UNKNOWN|UNKNOWN"
+    raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
+    trade_id = raw.get("trade_id") or raw.get("uid") or ev.get("key")
+    if trade_id:
+        return str(trade_id)
+    ts = ev.get("ts") or raw.get("closed_at") or raw.get("ts") or raw.get("datetime")
+    return f"{_ppla_v1_trade_key(raw or ev)}|{ts or ''}"
+
+
+def _ppla_v1_get_predator_module_positions_raw():
+    module = None
+    try:
+        module = (globals().get("LOADED_BOTS") or {}).get("PREDATOR")
+    except Exception:
+        module = None
+    if module is None:
+        return []
+    try:
+        if callable(globals().get("get_open_positions_from_module")):
+            raw = get_open_positions_from_module(module, "PREDATOR") or []
+        elif hasattr(module, "carregar_posicoes"):
+            raw = module.carregar_posicoes() or []
+        else:
+            raw = []
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        return [x for x in (raw or []) if isinstance(x, dict)]
+    except Exception:
+        return []
+
+
+def _ppla_v1_get_predator_registry_full():
+    try:
+        snap = central_trade_registry_snapshot(include_trades=True) if callable(globals().get("central_trade_registry_snapshot")) else {}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "open_trades": [], "closed_trades": [], "open_count": 0, "closed_count": 0}
+    open_trades = snap.get("open_trades") or []
+    closed_trades = snap.get("closed_trades") or []
+    if isinstance(open_trades, dict):
+        open_trades = list(open_trades.values())
+    if isinstance(closed_trades, dict):
+        closed_trades = list(closed_trades.values())
+    def is_pred(t):
+        try:
+            return str(t.get("bot") or t.get("robot") or "").upper() == "PREDATOR"
+        except Exception:
+            return False
+    open_p = [t for t in open_trades if isinstance(t, dict) and is_pred(t)]
+    closed_p = [t for t in closed_trades if isinstance(t, dict) and is_pred(t)]
+    return {
+        "ok": bool(snap.get("ok", True)),
+        "error": snap.get("error"),
+        "registry_file": snap.get("trade_registry_file") or snap.get("registry_file"),
+        "open_count": len(open_p),
+        "closed_count": len(closed_p),
+        "open_trades": open_p,
+        "closed_trades": closed_p,
+    }
+
+
+def _ppla_v1_get_closed_paper_events(limit=1500):
+    try:
+        events, source_counts = _pppa_v1_collect_source_events(limit=limit)
+    except Exception:
+        return [], {}
+    closed = []
+    seen = set()
+    for ev in events or []:
+        if not isinstance(ev, dict) or ev.get("kind") != "PAPER_CLOSED":
+            continue
+        key = _ppla_v1_closed_key_from_event(ev)
+        if key in seen:
+            continue
+        seen.add(key)
+        closed.append(ev)
+    return closed, source_counts
+
+
+def _ppla_v1_missing_required_fields_open(position):
+    missing = []
+    if not _ppla_v1_norm_symbol(position.get("symbol_clean") or position.get("symbol") or position.get("market_symbol")) or _ppla_v1_norm_symbol(position.get("symbol_clean") or position.get("symbol") or position.get("market_symbol")) == "UNKNOWN":
+        missing.append("symbol")
+    if _ppla_v1_norm_side(position.get("side") or position.get("direction") or position.get("position_side")) not in {"LONG", "SHORT"}:
+        missing.append("side")
+    if _ppla_v1_float(position.get("entry"), default=None) is None:
+        missing.append("entry")
+    if _ppla_v1_float(position.get("sl"), default=None) is None and _ppla_v1_float(position.get("initial_sl"), default=None) is None:
+        missing.append("sl")
+    if _ppla_v1_float(position.get("tp50"), default=None) is None:
+        missing.append("tp50")
+    return missing
+
+
+def _ppla_v1_position_age_hours(position):
+    created = position.get("created_at") or position.get("opened_epoch") or position.get("epoch")
+    val = _ppla_v1_float(created, default=None)
+    if val is None:
+        return None
+    try:
+        if val > 20000000000:  # ms
+            val = val / 1000.0
+        return round((_ppla_v1_epoch_now() - val) / 3600.0, 2)
+    except Exception:
+        return None
+
+
+def _ppla_v1_validate_open_position(position, registry_match=None):
+    missing = _ppla_v1_missing_required_fields_open(position)
+    age_h = _ppla_v1_position_age_hours(position)
+    stale_hours = _ppla_v1_float(os.environ.get("PREDATOR_PAPER_LIFECYCLE_STALE_OPEN_HOURS"), default=48.0)
+    warnings = []
+    reasons = []
+    if missing:
+        reasons.append("Campos obrigatórios ausentes: " + ", ".join(missing))
+    status = str(position.get("status") or "").upper()
+    if status and status not in {"ABERTO", "OPEN", "OPENED", "RUNNING"}:
+        warnings.append(f"Status aberto incomum: {status}")
+    if position.get("closed_at") or position.get("close_reason"):
+        reasons.append("Posição parece aberta, mas contém closed_at/close_reason.")
+    if age_h is not None and stale_hours is not None and age_h > stale_hours:
+        warnings.append(f"Posição aberta há {age_h}h, acima do limite {stale_hours}h.")
+    if registry_match:
+        r_sl = _ppla_v1_float(registry_match.get("sl"), default=None)
+        p_sl = _ppla_v1_float(position.get("sl"), default=_ppla_v1_float(position.get("initial_sl"), default=None))
+        if r_sl is not None and p_sl is not None and abs(r_sl - p_sl) > max(abs(p_sl) * 0.001, 1e-8):
+            warnings.append(f"SL Registry diferente do módulo: registry={r_sl}, module={p_sl}")
+        r_tp = _ppla_v1_float(registry_match.get("tp50"), default=None)
+        p_tp = _ppla_v1_float(position.get("tp50"), default=None)
+        if r_tp is not None and p_tp is not None and abs(r_tp - p_tp) > max(abs(p_tp) * 0.001, 1e-8):
+            warnings.append(f"TP50 Registry diferente do módulo: registry={r_tp}, module={p_tp}")
+    return {"missing_fields": missing, "age_hours": age_h, "warnings": warnings, "reasons": reasons}
+
+
+def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, use_cache=False):
+    if use_cache:
+        try:
+            cached = _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE.get("payload")
+            ts = _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE.get("ts") or 0
+            if cached and (_ppla_v1_epoch_now() - ts) < 30:
+                return cached
+        except Exception:
+            pass
+
+    module_positions = _ppla_v1_get_predator_module_positions_raw()
+    registry = _ppla_v1_get_predator_registry_full()
+    registry_open = registry.get("open_trades") or []
+    registry_closed = registry.get("closed_trades") or []
+    closed_events, source_counts = _ppla_v1_get_closed_paper_events(limit=limit)
+
+    module_by_id = {}
+    module_by_key = {}
+    duplicate_open_trade_ids = []
+    for p in module_positions:
+        tid = _ppla_v1_get_trade_id(p)
+        key = _ppla_v1_trade_key(p)
+        if tid:
+            if tid in module_by_id:
+                duplicate_open_trade_ids.append(tid)
+            module_by_id[tid] = p
+        module_by_key[key] = p
+
+    registry_by_id = {}
+    registry_by_key = {}
+    duplicate_registry_open_ids = []
+    for t in registry_open:
+        tid = _ppla_v1_get_trade_id(t)
+        key = _ppla_v1_trade_key(t)
+        if tid:
+            if tid in registry_by_id:
+                duplicate_registry_open_ids.append(tid)
+            registry_by_id[tid] = t
+        registry_by_key[key] = t
+
+    missing_registry_open = []
+    open_field_issues = []
+    stale_open = []
+    open_warnings = []
+    for tid, p in module_by_id.items():
+        key = _ppla_v1_trade_key(p)
+        match = registry_by_id.get(tid) or registry_by_key.get(key)
+        if not match:
+            missing_registry_open.append({"trade_id": tid, "key": key, "position": _ppla_v1_public(p, max_string=260)})
+        validation = _ppla_v1_validate_open_position(p, match)
+        if validation.get("missing_fields") or validation.get("reasons"):
+            open_field_issues.append({"trade_id": tid, "key": key, "validation": validation, "position": _ppla_v1_public(p, max_string=260)})
+        if validation.get("age_hours") is not None and any("acima do limite" in str(w) for w in validation.get("warnings") or []):
+            stale_open.append({"trade_id": tid, "key": key, "age_hours": validation.get("age_hours")})
+        for w in validation.get("warnings") or []:
+            open_warnings.append({"trade_id": tid, "key": key, "warning": w})
+
+    orphan_registry_open = []
+    for tid, t in registry_by_id.items():
+        key = _ppla_v1_trade_key(t)
+        if tid not in module_by_id and key not in module_by_key:
+            orphan_registry_open.append({"trade_id": tid, "key": key, "registry_trade": _ppla_v1_public(t, max_string=260)})
+
+    closed_by_key = {}
+    for t in registry_closed:
+        tid = _ppla_v1_get_trade_id(t)
+        key = str(tid or _ppla_v1_trade_key(t))
+        closed_by_key[key] = t
+    missing_registry_closed = []
+    for ev in closed_events:
+        ev_key = _ppla_v1_closed_key_from_event(ev)
+        raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
+        raw_tid = raw.get("trade_id") or raw.get("uid")
+        base_key = _ppla_v1_trade_key(raw or ev)
+        matched = False
+        for candidate in [raw_tid, ev_key, base_key]:
+            if candidate and str(candidate) in closed_by_key:
+                matched = True
+                break
+        if not matched:
+            missing_registry_closed.append({"event_key": ev_key, "base_key": base_key, "event": _ppla_v1_public(ev, max_string=260)})
+
+    # Complemento com auditoria PnL para manter visão única.
+    try:
+        pnl_audit = predator_pnl_paper_audit_v1_status(include_samples=False, limit=limit)
+    except Exception as exc:
+        pnl_audit = {"ok": False, "status": "ERROR", "error": str(exc)}
+
+    reasons = []
+    warnings = []
+    status = "OK"
+
+    if pnl_audit.get("real_sent_or_live_event_count"):
+        reasons.append(f"Predator possui evento real/sent=True: {pnl_audit.get('real_sent_or_live_event_count')}. Auditoria bloqueada para LIVE.")
+    if missing_registry_open:
+        reasons.append(f"Posições abertas no módulo sem OPEN correspondente no Registry: {len(missing_registry_open)}.")
+    if orphan_registry_open:
+        reasons.append(f"OPEN no Registry sem posição aberta no módulo Predator: {len(orphan_registry_open)}.")
+    if missing_registry_closed:
+        reasons.append(f"Fechamentos PAPER auditáveis sem CLOSED correspondente no Registry: {len(missing_registry_closed)}.")
+    if open_field_issues:
+        reasons.append(f"Posições abertas com campos obrigatórios/estado inconsistente: {len(open_field_issues)}.")
+    if duplicate_open_trade_ids or duplicate_registry_open_ids:
+        reasons.append(f"Trade IDs duplicados em posições abertas: módulo={len(duplicate_open_trade_ids)}, registry={len(duplicate_registry_open_ids)}.")
+
+    safe_dry_count = pnl_audit.get("safe_dry_run_count") if isinstance(pnl_audit, dict) else None
+    if safe_dry_count:
+        warnings.append(f"SAFE_DRY_RUN detectado e excluído do PnL/lifecycle: {safe_dry_count} evento(s).")
+    if stale_open:
+        warnings.append(f"Posições PAPER abertas acima do limite de idade: {len(stale_open)}.")
+    if open_warnings:
+        warnings.append(f"Avisos de consistência em posições abertas: {len(open_warnings)}.")
+
+    if reasons:
+        status = "BLOCKED_FOR_LIFECYCLE_REVIEW"
+    elif warnings:
+        status = "OK_WITH_WARNINGS"
+
+    ok = not bool(reasons)
+    payload = {
+        "ok": ok,
+        "module": "predator_paper_lifecycle_audit_v1",
+        "version": PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_VERSION,
+        "generated_at": _ppla_v1_now(),
+        "status": status,
+        "reasons": reasons,
+        "warnings": warnings,
+        "mode": (pnl_audit or {}).get("mode"),
+        "execution_enabled": (pnl_audit or {}).get("execution_enabled"),
+        "execution_firewall_enabled": (pnl_audit or {}).get("execution_firewall_enabled"),
+        "counts": {
+            "module_open_count": len(module_positions),
+            "registry_open_count": len(registry_open),
+            "registry_closed_count": len(registry_closed),
+            "paper_closed_events_count": len(closed_events),
+            "missing_registry_open_count": len(missing_registry_open),
+            "orphan_registry_open_count": len(orphan_registry_open),
+            "missing_registry_closed_count": len(missing_registry_closed),
+            "open_field_issue_count": len(open_field_issues),
+            "stale_open_count": len(stale_open),
+            "duplicate_module_open_trade_id_count": len(duplicate_open_trade_ids),
+            "duplicate_registry_open_trade_id_count": len(duplicate_registry_open_ids),
+        },
+        "pnl_audit_summary": {
+            "status": pnl_audit.get("status") if isinstance(pnl_audit, dict) else None,
+            "ok": pnl_audit.get("ok") if isinstance(pnl_audit, dict) else None,
+            "safe_dry_run_count": pnl_audit.get("safe_dry_run_count") if isinstance(pnl_audit, dict) else None,
+            "real_sent_or_live_event_count": pnl_audit.get("real_sent_or_live_event_count") if isinstance(pnl_audit, dict) else None,
+            "paper_closed_count": ((pnl_audit.get("paper_pnl") or {}).get("paper_closed_count") if isinstance(pnl_audit, dict) else None),
+            "paper_pnl_total_pct": ((pnl_audit.get("paper_pnl") or {}).get("pnl_total_pct") if isinstance(pnl_audit, dict) else None),
+            "paper_r_total": ((pnl_audit.get("paper_pnl") or {}).get("r_total") if isinstance(pnl_audit, dict) else None),
+        },
+        "source_counts_read": source_counts,
+        "files": {
+            "events": PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE,
+            "latest": PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE,
+        },
+        "notes": [
+            "Esta auditoria é PAPER/lifecycle; não altera execução, risco, policies ou posições.",
+            "LIVE do Predator continua proibido enquanto houver BLOCKED_FOR_LIFECYCLE_REVIEW.",
+            "A auditoria compara módulo Predator, Trade Registry, history_events e auditoria de PnL/PAPER.",
+        ],
+        "token_value_exposed": False,
+    }
+    if include_samples:
+        payload["samples"] = {
+            "missing_registry_open": missing_registry_open[:20],
+            "orphan_registry_open": orphan_registry_open[:20],
+            "missing_registry_closed": missing_registry_closed[:20],
+            "open_field_issues": open_field_issues[:20],
+            "stale_open": stale_open[:20],
+            "open_warnings": open_warnings[:20],
+            "module_open_positions": [_ppla_v1_public(p, max_string=260) for p in module_positions[:20]],
+            "registry_open_trades": [_ppla_v1_public(t, max_string=260) for t in registry_open[:20]],
+        }
+    try:
+        latest_path = Path(PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE)
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        latest_path.write_text(json.dumps(_ppla_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        event_path = Path(PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE)
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        with event_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": "PREDATOR_PAPER_LIFECYCLE_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "counts": payload.get("counts"), "reasons": reasons[:5], "warnings": warnings[:5]}, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria lifecycle Predator: {exc}")
+    try:
+        _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["ts"] = _ppla_v1_epoch_now()
+        _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["payload"] = payload
+    except Exception:
+        pass
+    return payload
+
+
+def build_predator_paper_lifecycle_audit_v1_text():
+    payload = predator_paper_lifecycle_audit_v1_status(include_samples=False, use_cache=False)
+    c = payload.get("counts") or {}
+    p = payload.get("pnl_audit_summary") or {}
+    lines = [
+        "🧬 PREDATOR PAPER LIFECYCLE AUDIT V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Modo / execução:",
+        f"- mode/execution_mode: {payload.get('mode')}",
+        f"- execution_enabled: {payload.get('execution_enabled')}",
+        f"- execution_firewall_enabled: {payload.get('execution_firewall_enabled')}",
+        "",
+        "Ciclo PAPER:",
+        f"- Posições abertas no módulo Predator: {c.get('module_open_count')}",
+        f"- OPEN no Registry: {c.get('registry_open_count')}",
+        f"- CLOSED no Registry: {c.get('registry_closed_count')}",
+        f"- Fechamentos PAPER em history/audit: {c.get('paper_closed_events_count')}",
+        "",
+        "Divergências:",
+        f"- Abertas no módulo sem Registry OPEN: {c.get('missing_registry_open_count')}",
+        f"- Registry OPEN sem posição no módulo: {c.get('orphan_registry_open_count')}",
+        f"- Fechamentos sem Registry CLOSED: {c.get('missing_registry_closed_count')}",
+        f"- Abertas com campos/estado inconsistente: {c.get('open_field_issue_count')}",
+        f"- Abertas antigas/stale: {c.get('stale_open_count')}",
+        f"- Trade IDs duplicados módulo/registry: {c.get('duplicate_module_open_trade_id_count')} / {c.get('duplicate_registry_open_trade_id_count')}",
+        "",
+        "PnL PAPER associado:",
+        f"- PnL audit status: {p.get('status')}",
+        f"- REAL/sent=True Predator: {p.get('real_sent_or_live_event_count')}",
+        f"- SAFE_DRY_RUN excluído: {p.get('safe_dry_run_count')}",
+        f"- PAPER fechados: {p.get('paper_closed_count')}",
+        f"- PnL total: {p.get('paper_pnl_total_pct')}%",
+        f"- R total: {p.get('paper_r_total')}R",
+    ]
+    if payload.get("reasons"):
+        lines += ["", "Bloqueios/críticos:"] + [f"- ❌ {x}" for x in payload.get("reasons")]
+    if payload.get("warnings"):
+        lines += ["", "Avisos:"] + [f"- ⚠️ {x}" for x in payload.get("warnings")]
+    lines += [
+        "",
+        "Leitura executiva:",
+        "- Esta auditoria verifica o ciclo PAPER do Predator, não PnL financeiro real.",
+        "- Predator deve continuar fora do LIVE enquanto houver divergência lifecycle.",
+        "- O próximo passo, se houver bloqueio, é corrigir sync OPEN/CLOSED do Registry.",
+        "",
+        "Arquivos:",
+        f"- Eventos: {PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE}",
+        f"- Último snapshot: {PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE}",
+    ]
+    return "\n".join(lines)
+
+
+_ORIGINAL_BOT_HEALTH_FOR_PREDATOR_PAPER_LIFECYCLE_AUDIT_V1 = bot_health if "bot_health" in globals() else None
+
+
+def bot_health(key: str, cfg: dict):
+    original = _ORIGINAL_BOT_HEALTH_FOR_PREDATOR_PAPER_LIFECYCLE_AUDIT_V1
+    if callable(original):
+        payload = original(key, cfg)
+    else:
+        payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
+    try:
+        if str(key).upper() == "PREDATOR":
+            audit = predator_paper_lifecycle_audit_v1_status(include_samples=False, limit=800, use_cache=True)
+            c = audit.get("counts") or {}
+            health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+            overlay = {
+                "predator_lifecycle_audit_status": audit.get("status"),
+                "predator_lifecycle_audit_ok": audit.get("ok"),
+                "predator_lifecycle_audit_version": PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_VERSION,
+                "predator_lifecycle_module_open_count": c.get("module_open_count"),
+                "predator_lifecycle_registry_open_count": c.get("registry_open_count"),
+                "predator_lifecycle_registry_closed_count": c.get("registry_closed_count"),
+                "predator_lifecycle_paper_closed_events_count": c.get("paper_closed_events_count"),
+                "predator_lifecycle_missing_registry_open_count": c.get("missing_registry_open_count"),
+                "predator_lifecycle_orphan_registry_open_count": c.get("orphan_registry_open_count"),
+                "predator_lifecycle_missing_registry_closed_count": c.get("missing_registry_closed_count"),
+                "predator_lifecycle_open_field_issue_count": c.get("open_field_issue_count"),
+                "predator_lifecycle_stale_open_count": c.get("stale_open_count"),
+                "predator_lifecycle_warnings": audit.get("warnings", [])[:5],
+                "predator_lifecycle_reasons": audit.get("reasons", [])[:5],
+            }
+            health.update(overlay)
+            payload["health"] = health
+            payload.update(overlay)
+    except Exception as exc:
+        try:
+            payload.setdefault("health", {})["predator_lifecycle_audit_overlay_error"] = str(exc)
+        except Exception:
+            pass
+    return payload
+
+
+@app.route("/predator/lifecycleaudit", methods=["GET"])
+@app.route("/predator/paperlifecycle", methods=["GET"])
+def predator_paper_lifecycle_audit_v1_route():
+    return predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False), 200
+
+
+@app.route("/predator/lifecycleaudit/text", methods=["GET"])
+@app.route("/predator/paperlifecycle/text", methods=["GET"])
+def predator_paper_lifecycle_audit_v1_text_route():
+    return build_predator_paper_lifecycle_audit_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
