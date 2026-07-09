@@ -2045,12 +2045,29 @@ def bot_health(key: str, cfg: dict):
         health = dict(raw_health) if isinstance(raw_health, dict) else {}
         health["last_warning"] = clean_operational_warning(health.get("last_warning"))
 
+        # TREND PRO DAILY SUMMARY V1: garante e expõe campos do resumo diário no /bots.
+        try:
+            if str(key).upper() == "TRENDPRO" and "trendpro_daily_summary_v1_apply_health_overlay" in globals():
+                health = trendpro_daily_summary_v1_apply_health_overlay(module, health)
+        except Exception as _trend_daily_overlay_exc:
+            health.setdefault("last_summary_error", f"health_overlay: {_trend_daily_overlay_exc}")
+
         payload["health"] = health
         payload["last_scanner_run"] = health.get("last_scanner_run")
         payload["last_management_run"] = health.get("last_management_run")
         payload["last_error"] = health.get("last_error")
         payload["minutes_since_scanner"] = minutes_since(health.get("last_scanner_run"))
         payload["minutes_since_management"] = minutes_since(health.get("last_management_run"))
+
+        # Campos também no topo do /bots/TRENDPRO para leitura rápida.
+        if str(key).upper() == "TRENDPRO":
+            for _trend_daily_field in [
+                "daily_summary_time",
+                "daily_summary_sent_today",
+                "last_summary_run",
+                "last_summary_error",
+            ]:
+                payload[_trend_daily_field] = health.get(_trend_daily_field)
 
     memory_profile_step(f"after_bot_health_{key}")
     return payload
@@ -28182,6 +28199,419 @@ def learning_refresh_route():
     except Exception as exc:
         return {"ok": False, "error": str(exc)}, 500
 
+
+
+# ==========================================================
+# TREND PRO DAILY SUMMARY V1
+# - Envia resumo automático do Trend PRO às 23:55, mesmo sem sinais/trades/posições.
+# - Expõe daily_summary_time, daily_summary_sent_today, last_summary_run e
+#   last_summary_error no HEALTH do TRENDPRO e no /bots.
+# - Registra falha de Telegram quando o resumo não é enviado.
+# ==========================================================
+TRENDPRO_DAILY_SUMMARY_V1_VERSION = "2026-07-09-TRENDPRO-DAILY-SUMMARY-V1"
+TRENDPRO_DAILY_SUMMARY_ENABLED = env_bool("TRENDPRO_DAILY_SUMMARY_ENABLED", True)
+TRENDPRO_DAILY_SUMMARY_TIME = os.environ.get("TRENDPRO_DAILY_SUMMARY_TIME", "23:55")
+TRENDPRO_DAILY_SUMMARY_SEND_WITH_ZERO = env_bool("TRENDPRO_DAILY_SUMMARY_SEND_WITH_ZERO", True)
+TRENDPRO_DAILY_SUMMARY_STATE_FILE = CENTRAL_DATA_DIR / "trendpro_daily_summary_state.json"
+TRENDPRO_DAILY_SUMMARY_EVENTS_FILE = CENTRAL_DATA_DIR / "trendpro_daily_summary_events.jsonl"
+TRENDPRO_DAILY_SUMMARY_LOOP_SECONDS = int(os.environ.get("TRENDPRO_DAILY_SUMMARY_LOOP_SECONDS", "30"))
+
+
+def _trendpro_daily_summary_v1_append_event(event: dict) -> bool:
+    try:
+        TRENDPRO_DAILY_SUMMARY_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        row = dict(event or {})
+        row.setdefault("generated_at", data_hora_sp_str())
+        row.setdefault("module", "trendpro_daily_summary_v1")
+        row.setdefault("version", TRENDPRO_DAILY_SUMMARY_V1_VERSION)
+        with TRENDPRO_DAILY_SUMMARY_EVENTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        return True
+    except Exception as exc:
+        print("ERRO TRENDPRO DAILY SUMMARY append_event:", exc)
+        return False
+
+
+def trendpro_daily_summary_v1_load_state() -> dict:
+    try:
+        if TRENDPRO_DAILY_SUMMARY_STATE_FILE.exists():
+            data = json.loads(TRENDPRO_DAILY_SUMMARY_STATE_FILE.read_text(encoding="utf-8") or "{}")
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print("ERRO TRENDPRO DAILY SUMMARY load_state:", exc)
+    return {}
+
+
+def trendpro_daily_summary_v1_save_state(state: dict) -> bool:
+    try:
+        TRENDPRO_DAILY_SUMMARY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TRENDPRO_DAILY_SUMMARY_STATE_FILE.write_text(
+            json.dumps(state or {}, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        return True
+    except Exception as exc:
+        print("ERRO TRENDPRO DAILY SUMMARY save_state:", exc)
+        return False
+
+
+def trendpro_daily_summary_v1_today_key() -> str:
+    return agora_sp().strftime("%Y-%m-%d")
+
+
+def trendpro_daily_summary_v1_apply_health_overlay(module=None, health=None) -> dict:
+    """Aplica os campos de status do resumo diário no HEALTH do Trend PRO."""
+    today = trendpro_daily_summary_v1_today_key()
+    state = trendpro_daily_summary_v1_load_state()
+    if health is None:
+        raw = getattr(module, "HEALTH", {}) if module is not None else {}
+        health = dict(raw) if isinstance(raw, dict) else {}
+    else:
+        health = dict(health) if isinstance(health, dict) else {}
+
+    sent_date = state.get("sent_date")
+    last_ok = bool(state.get("last_ok"))
+    health["daily_summary_time"] = TRENDPRO_DAILY_SUMMARY_TIME
+    health["daily_summary_sent_today"] = bool(sent_date == today and last_ok)
+    health["last_summary_run"] = state.get("last_summary_run")
+    health["last_summary_error"] = state.get("last_summary_error")
+    health["daily_summary_enabled"] = TRENDPRO_DAILY_SUMMARY_ENABLED
+    health["daily_summary_version"] = TRENDPRO_DAILY_SUMMARY_V1_VERSION
+
+    if module is not None and hasattr(module, "HEALTH") and isinstance(getattr(module, "HEALTH", None), dict):
+        try:
+            module.HEALTH.update(health)
+        except Exception:
+            pass
+    return health
+
+
+def _trendpro_daily_summary_v1_safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _trendpro_daily_summary_v1_safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def trendpro_daily_summary_v1_build_text() -> str:
+    """Resumo compacto e sempre enviável, inclusive quando tudo estiver zerado."""
+    module = LOADED_BOTS.get("TRENDPRO")
+    health = trendpro_daily_summary_v1_apply_health_overlay(module)
+
+    # Campos básicos do health do Trend PRO. Defaults garantem envio mesmo zerado.
+    signals_today = _trendpro_daily_summary_v1_safe_int(
+        health.get("signals_today", health.get("last_signals_sent", 0)), 0
+    )
+    trades_today = _trendpro_daily_summary_v1_safe_int(
+        health.get("trades_closed_today", health.get("trades_today", 0)), 0
+    )
+    open_positions = _trendpro_daily_summary_v1_safe_int(
+        health.get("last_positions_count", health.get("positions_open", 0)), 0
+    )
+    watchlist_total = _trendpro_daily_summary_v1_safe_int(health.get("watchlist_total", health.get("last_watchlist_count", 0)), 0)
+    watchlist_valid = _trendpro_daily_summary_v1_safe_int(health.get("watchlist_valid", health.get("last_watchlist_count", 0)), 0)
+    stops_today = _trendpro_daily_summary_v1_safe_int(health.get("stops_today", 0), 0)
+    tp50_today = _trendpro_daily_summary_v1_safe_int(health.get("tp50_today", 0), 0)
+    be_today = _trendpro_daily_summary_v1_safe_int(health.get("be_today", 0), 0)
+    trailing_today = _trendpro_daily_summary_v1_safe_int(health.get("trailing_today", 0), 0)
+    pnl_today = health.get("pnl_today_pct", health.get("pnl_today", None))
+    expectancy_r = health.get("expectancy_r")
+    profit_factor_r = health.get("profit_factor_r")
+
+    status = "OK"
+    notes = []
+    if health.get("last_error"):
+        status = "ATENÇÃO"
+        notes.append(f"Erro: {health.get('last_error')}")
+    if health.get("last_warning"):
+        notes.append(f"Aviso: {health.get('last_warning')}")
+    if watchlist_total and watchlist_valid < watchlist_total:
+        status = "ATENÇÃO"
+        notes.append(f"Watchlist inválida/parcial: {watchlist_valid}/{watchlist_total}")
+    if not notes:
+        notes.append("Sem erro operacional reportado pelo robô.")
+
+    lines = [
+        "📊 TREND PRO DAILY SUMMARY V1",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Status: {status}",
+        f"Resumo automático: {TRENDPRO_DAILY_SUMMARY_TIME}",
+        "",
+        "==============================",
+        "ATIVIDADE DO DIA",
+        "==============================",
+        f"Sinais enviados: {signals_today}",
+        f"Trades fechados: {trades_today}",
+        f"Posições abertas: {open_positions}",
+        f"TP50 hoje: {tp50_today}",
+        f"Stops hoje: {stops_today}",
+        f"Breakeven hoje: {be_today}",
+        f"Trailing hoje: {trailing_today}",
+        "",
+        "==============================",
+        "SAÚDE OPERACIONAL",
+        "==============================",
+        f"Último scanner: {health.get('last_scanner_run')}",
+        f"Última gestão: {health.get('last_management_run')}",
+        f"Último sucesso: {health.get('last_success')}",
+        f"Watchlist: {watchlist_valid}/{watchlist_total}",
+        f"Telegram OK: {health.get('last_telegram_ok')}",
+        f"Último Telegram OK: {health.get('last_telegram_success')}",
+        f"Último erro Telegram: {health.get('last_telegram_error')}",
+        "",
+        "==============================",
+        "PERFORMANCE / LEARNING",
+        "==============================",
+        f"PnL hoje: {pnl_today if pnl_today is not None else 'n/d'}",
+        f"Expectancy R: {expectancy_r if expectancy_r is not None else 'n/d'}",
+        f"Profit Factor R: {profit_factor_r if profit_factor_r is not None else 'n/d'}",
+        "",
+        "==============================",
+        "LEITURA EXECUTIVA",
+        "==============================",
+    ]
+
+    if signals_today == 0 and trades_today == 0 and open_positions == 0:
+        lines.append("✅ Dia sem sinais, sem trades e sem posições abertas. Resumo enviado mesmo assim para confirmar presença operacional.")
+    else:
+        lines.append("✅ Resumo diário enviado com atividade registrada no Trend PRO.")
+
+    lines.extend([f"- {note}" for note in notes[:5]])
+    return "\n".join(lines)
+
+
+def trendpro_daily_summary_v1_status_payload() -> dict:
+    module = LOADED_BOTS.get("TRENDPRO")
+    health = trendpro_daily_summary_v1_apply_health_overlay(module)
+    state = trendpro_daily_summary_v1_load_state()
+    return {
+        "ok": True,
+        "module": "trendpro_daily_summary_v1",
+        "version": TRENDPRO_DAILY_SUMMARY_V1_VERSION,
+        "enabled": TRENDPRO_DAILY_SUMMARY_ENABLED,
+        "daily_summary_time": health.get("daily_summary_time"),
+        "daily_summary_sent_today": health.get("daily_summary_sent_today"),
+        "last_summary_run": health.get("last_summary_run"),
+        "last_summary_error": health.get("last_summary_error"),
+        "state_file": str(TRENDPRO_DAILY_SUMMARY_STATE_FILE),
+        "events_file": str(TRENDPRO_DAILY_SUMMARY_EVENTS_FILE),
+        "state": state,
+    }
+
+
+def trendpro_daily_summary_v1_record_failure(error: str, reason: str = "telegram_send_failed") -> dict:
+    now_s = data_hora_sp_str()
+    today = trendpro_daily_summary_v1_today_key()
+    err = str(error or reason)
+    state = trendpro_daily_summary_v1_load_state()
+    state.update({
+        "last_summary_run": now_s,
+        "last_summary_error": err,
+        "last_ok": False,
+        "last_reason": reason,
+        "last_attempt_date": today,
+    })
+    trendpro_daily_summary_v1_save_state(state)
+
+    module = LOADED_BOTS.get("TRENDPRO")
+    health = trendpro_daily_summary_v1_apply_health_overlay(module)
+    health.update({
+        "last_summary_run": now_s,
+        "last_summary_error": err,
+        "daily_summary_sent_today": False,
+        "last_telegram_attempt": now_s,
+        "last_telegram_ok": False,
+        "last_telegram_error": err,
+    })
+    if module is not None and hasattr(module, "HEALTH") and isinstance(getattr(module, "HEALTH", None), dict):
+        module.HEALTH.update(health)
+
+    event = {
+        "event": "TRENDPRO_DAILY_SUMMARY_TELEGRAM_FAILED",
+        "ok": False,
+        "error": err,
+        "reason": reason,
+        "date": today,
+    }
+    _trendpro_daily_summary_v1_append_event(event)
+    try:
+        import history_manager as super_history_manager
+        super_history_manager.log_event("TRENDPRO_DAILY_SUMMARY_TELEGRAM_FAILED", event, source="trendpro_daily_summary_v1")
+    except Exception:
+        pass
+    return {"ok": False, "error": err, "reason": reason}
+
+
+def trendpro_daily_summary_v1_run(send: bool = True, force: bool = False) -> dict:
+    """Gera e, se send=True, envia o resumo diário do Trend PRO."""
+    today = trendpro_daily_summary_v1_today_key()
+    state = trendpro_daily_summary_v1_load_state()
+    module = LOADED_BOTS.get("TRENDPRO")
+    health = trendpro_daily_summary_v1_apply_health_overlay(module)
+
+    if not force and state.get("sent_date") == today and bool(state.get("last_ok")):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "already_sent_today",
+            "sent_date": state.get("sent_date"),
+            "last_summary_run": state.get("last_summary_run"),
+        }
+
+    text = trendpro_daily_summary_v1_build_text()
+    now_s = data_hora_sp_str()
+
+    if not send:
+        return {
+            "ok": True,
+            "send": False,
+            "preview": True,
+            "text": text,
+            "health": health,
+        }
+
+    cfg = BOT_CONFIGS.get("TRENDPRO", {})
+    token = os.environ.get(cfg.get("token_env", ""))
+    chat_id = os.environ.get(cfg.get("chat_env", ""))
+    if not token or not chat_id:
+        return trendpro_daily_summary_v1_record_failure("Token/chat do Trend PRO ausente.", reason="telegram_credentials_missing")
+
+    ok = False
+    error = None
+    try:
+        if module is not None and hasattr(module, "HEALTH") and isinstance(getattr(module, "HEALTH", None), dict):
+            module.HEALTH["last_telegram_attempt"] = now_s
+        ok = bool(telegram_send_with_token(token, chat_id, text, title="TREND PRO DAILY SUMMARY"))
+        if not ok:
+            error = "telegram_send_with_token retornou False."
+    except Exception as exc:
+        ok = False
+        error = str(exc)
+
+    if not ok:
+        return trendpro_daily_summary_v1_record_failure(error or "Falha desconhecida no envio Telegram.", reason="telegram_send_failed")
+
+    state.update({
+        "sent_date": today,
+        "last_summary_run": now_s,
+        "last_summary_error": None,
+        "last_ok": True,
+        "last_reason": "sent",
+    })
+    trendpro_daily_summary_v1_save_state(state)
+
+    health.update({
+        "daily_summary_time": TRENDPRO_DAILY_SUMMARY_TIME,
+        "daily_summary_sent_today": True,
+        "last_summary_run": now_s,
+        "last_summary_error": None,
+        "last_telegram_attempt": now_s,
+        "last_telegram_ok": True,
+        "last_telegram_success": now_s,
+        "last_telegram_error": None,
+    })
+    if module is not None and hasattr(module, "HEALTH") and isinstance(getattr(module, "HEALTH", None), dict):
+        module.HEALTH.update(health)
+
+    event = {
+        "event": "TRENDPRO_DAILY_SUMMARY_SENT",
+        "ok": True,
+        "date": today,
+        "signals_today": _trendpro_daily_summary_v1_safe_int(health.get("signals_today", health.get("last_signals_sent", 0)), 0),
+        "trades_today": _trendpro_daily_summary_v1_safe_int(health.get("trades_closed_today", health.get("trades_today", 0)), 0),
+        "positions_open": _trendpro_daily_summary_v1_safe_int(health.get("last_positions_count", health.get("positions_open", 0)), 0),
+    }
+    _trendpro_daily_summary_v1_append_event(event)
+    try:
+        import history_manager as super_history_manager
+        super_history_manager.log_event("TRENDPRO_DAILY_SUMMARY_SENT", event, source="trendpro_daily_summary_v1")
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "sent": True,
+        "sent_date": today,
+        "last_summary_run": now_s,
+    }
+
+
+def trendpro_daily_summary_v1_loop():
+    if not TRENDPRO_DAILY_SUMMARY_ENABLED:
+        print("TRENDPRO DAILY SUMMARY V1 DESLIGADO POR ENV")
+        return
+    print(f"TRENDPRO DAILY SUMMARY V1 INICIADO — horário {TRENDPRO_DAILY_SUMMARY_TIME}")
+    while True:
+        try:
+            module = LOADED_BOTS.get("TRENDPRO")
+            if module is not None:
+                trendpro_daily_summary_v1_apply_health_overlay(module)
+            now = agora_sp()
+            current_hm = now.strftime("%H:%M")
+            if current_hm == TRENDPRO_DAILY_SUMMARY_TIME:
+                trendpro_daily_summary_v1_run(send=True, force=False)
+        except Exception as exc:
+            trendpro_daily_summary_v1_record_failure(str(exc), reason="loop_exception")
+            print("ERRO TRENDPRO DAILY SUMMARY LOOP:", exc)
+        time.sleep(max(10, TRENDPRO_DAILY_SUMMARY_LOOP_SECONDS))
+
+
+@app.route("/trendpro/daily_summary", methods=["GET", "POST"])
+@app.route("/trendpro/dailysummary", methods=["GET", "POST"])
+@app.route("/trendpro/summary/status", methods=["GET", "POST"])
+def trendpro_daily_summary_v1_route():
+    # Sem confirm, apenas status/preview. Com ?confirm=1&send=1, envia manualmente.
+    confirm_raw = request.args.get("confirm", "")
+    send_raw = request.args.get("send", "")
+    preview_raw = request.args.get("preview", "")
+    force_raw = request.args.get("force", "")
+    confirmed = str(confirm_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "confirm"}
+    send = str(send_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    preview = str(preview_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    force = str(force_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    if preview:
+        return trendpro_daily_summary_v1_run(send=False, force=True)
+    if confirmed and send:
+        return trendpro_daily_summary_v1_run(send=True, force=force)
+    return trendpro_daily_summary_v1_status_payload()
+
+
+@app.route("/trendpro/daily_summary/text")
+@app.route("/trendpro/dailysummary/text")
+def trendpro_daily_summary_v1_text_route():
+    status = trendpro_daily_summary_v1_status_payload()
+    health = status
+    lines = [
+        "📊 TREND PRO DAILY SUMMARY V1 — STATUS",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Enabled: {health.get('enabled')}",
+        f"Horário: {health.get('daily_summary_time')}",
+        f"Enviado hoje: {health.get('daily_summary_sent_today')}",
+        f"Última execução: {health.get('last_summary_run')}",
+        f"Último erro: {health.get('last_summary_error')}",
+        "",
+        "Campos expostos no /bots/TRENDPRO:",
+        "- daily_summary_time",
+        "- daily_summary_sent_today",
+        "- last_summary_run",
+        "- last_summary_error",
+    ]
+    return {"text": "\n".join(lines), "payload": status}
+
+
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED
 
@@ -28222,6 +28652,12 @@ def start_central_runtime_once():
         threading.Thread(target=central_daily_report_loop, daemon=True).start()
     else:
         print("RELATÓRIO DIÁRIO CENTRAL NÃO INICIADO: outro processo já é líder")
+
+    if TRENDPRO_DAILY_SUMMARY_ENABLED:
+        if acquire_runtime_file_lock("trendpro_daily_summary_v1"):
+            threading.Thread(target=trendpro_daily_summary_v1_loop, daemon=True).start()
+        else:
+            print("TRENDPRO DAILY SUMMARY V1 NÃO INICIADO: outro processo já é líder")
 
     start_central_command_routers()
 
