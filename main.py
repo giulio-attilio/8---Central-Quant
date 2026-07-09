@@ -42709,6 +42709,571 @@ def predator_paper_registry_sync_fix_v1_text_route():
     return build_predator_paper_registry_sync_fix_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+
+# ==========================================================
+# TRADE REGISTRY PERSISTENT STORAGE FIX V1
+# ==========================================================
+# Objetivo:
+# - Forçar o Trade Registry a usar o diretório persistente da Central (/data no Render).
+# - Migrar/mesclar registros legados de /opt/render/project/src/data sem apagar CLOSED.
+# - Proteger OPEN/CLOSED contra perda em deploy/restart.
+# - Expor diagnóstico em /traderegistry/storage/text e enriquecer /traderegistry/health.
+TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION = "2026-07-09-TRADE-REGISTRY-PERSISTENT-STORAGE-FIX-V1"
+TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE = CENTRAL_DATA_DIR / "trade_registry_storage_fix_v1_latest.json"
+TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "trade_registry_storage_fix_v1_events.jsonl"
+TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE = CENTRAL_DATA_DIR / "trade_registry_backup_latest.json"
+
+_TRPSF_V1_STATE = {
+    "patched": False,
+    "migration_done": False,
+    "active_file": None,
+    "legacy_files": [],
+    "last_status": None,
+    "last_load_ok": None,
+    "last_write_ok": None,
+    "last_error": None,
+    "migrated_from_legacy": False,
+}
+_TRPSF_V1_ORIGINAL_LOAD_REGISTRY = None
+_TRPSF_V1_ORIGINAL_SAVE_REGISTRY = None
+_TRPSF_V1_ORIGINAL_SNAPSHOT = central_trade_registry_snapshot if "central_trade_registry_snapshot" in globals() else None
+_TRPSF_V1_ORIGINAL_BOT_HEALTH = bot_health if "bot_health" in globals() else None
+
+
+def _trpsf_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        return None
+
+
+def _trpsf_v1_public(value, max_string=900):
+    if isinstance(value, dict):
+        return {str(k): _trpsf_v1_public(v, max_string=max_string) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_trpsf_v1_public(v, max_string=max_string) for v in value]
+    if isinstance(value, tuple):
+        return [_trpsf_v1_public(v, max_string=max_string) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, str):
+        if len(value) > max_string:
+            return value[:max_string] + "...<truncated>"
+        return value
+    return value
+
+
+def _trpsf_v1_atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+    return True
+
+
+def _trpsf_v1_read_json(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _trpsf_v1_default_registry():
+    return {
+        "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+        "updated_at": _trpsf_v1_now(),
+        "open_trades": {},
+        "closed_trades": [],
+    }
+
+
+def _trpsf_v1_iter_trades(value):
+    if isinstance(value, dict):
+        return [x for x in value.values() if isinstance(x, dict)]
+    if isinstance(value, list):
+        return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+def _trpsf_v1_norm_symbol(value):
+    try:
+        return normalize_registry_symbol(value)
+    except Exception:
+        return str(value or "").upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _trpsf_v1_norm_side(value):
+    s = str(value or "").upper().strip()
+    if s in {"BUY", "LONG"}:
+        return "LONG"
+    if s in {"SELL", "SHORT"}:
+        return "SHORT"
+    return s
+
+
+def _trpsf_v1_norm_setup(value):
+    return str(value or "").upper().strip()
+
+
+def _trpsf_v1_trade_key(trade, closed=False):
+    if not isinstance(trade, dict):
+        return None
+    trade_id = str(trade.get("trade_id") or trade.get("id") or "").strip()
+    if trade_id:
+        return "id|" + trade_id
+    symbol = _trpsf_v1_norm_symbol(trade.get("symbol_clean") or trade.get("symbol") or trade.get("market_symbol") or trade.get("ativo") or trade.get("pair"))
+    side = _trpsf_v1_norm_side(trade.get("side") or trade.get("direction"))
+    setup = _trpsf_v1_norm_setup(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label"))
+    entry = str(trade.get("entry") or trade.get("entry_price") or "").strip()
+    if closed:
+        closed_at = str(trade.get("closed_at") or trade.get("closed_ts") or trade.get("ts") or trade.get("datetime") or "").strip()
+        exit_price = str(trade.get("exit_price") or trade.get("exit") or trade.get("close_price") or "").strip()
+        result_r = str(trade.get("result_r") or trade.get("pnl_r") or "").strip()
+        return "closed|" + "|".join([symbol, side, setup, closed_at, entry, exit_price, result_r])
+    opened_at = str(trade.get("opened_at") or trade.get("created_at_txt") or trade.get("created_at") or "").strip()
+    return "open|" + "|".join([symbol, side, setup, entry, opened_at])
+
+
+def _trpsf_v1_registry_counts(registry):
+    registry = registry if isinstance(registry, dict) else {}
+    open_trades = _trpsf_v1_iter_trades(registry.get("open_trades"))
+    closed_trades = _trpsf_v1_iter_trades(registry.get("closed_trades"))
+    return {
+        "open_count": len(open_trades),
+        "closed_count": len(closed_trades),
+    }
+
+
+def _trpsf_v1_active_file():
+    try:
+        return Path(CENTRAL_DATA_DIR) / "trade_registry.json"
+    except Exception:
+        try:
+            return Path("/data/trade_registry.json")
+        except Exception:
+            return Path("trade_registry.json")
+
+
+def _trpsf_v1_legacy_candidate_paths():
+    candidates = []
+    try:
+        if central_trade_registry is not None:
+            p = getattr(central_trade_registry, "TRADE_REGISTRY_FILE", None)
+            if p:
+                candidates.append(Path(str(p)))
+    except Exception:
+        pass
+    try:
+        candidates.append(Path(BASE_DIR) / "data" / "trade_registry.json")
+    except Exception:
+        pass
+    for raw in [
+        "/opt/render/project/src/data/trade_registry.json",
+        "/data/trade_registry.json",
+        str(_trpsf_v1_active_file()),
+    ]:
+        try:
+            candidates.append(Path(raw))
+        except Exception:
+            pass
+    unique = []
+    seen = set()
+    for p in candidates:
+        try:
+            key = str(p.resolve()) if p.exists() else str(p)
+        except Exception:
+            key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return unique
+
+
+def _trpsf_v1_merge_registries(registries, active_exists=False):
+    merged = _trpsf_v1_default_registry()
+    open_map = {}
+    closed_map = {}
+    sources_used = []
+    for source_name, reg in registries:
+        if not isinstance(reg, dict):
+            continue
+        sources_used.append(str(source_name))
+        # Preserve non-trade metadata from active/current registries, but never let it erase trades.
+        for k, v in reg.items():
+            if k not in {"open_trades", "closed_trades"} and k not in merged:
+                merged[k] = v
+        for trade in _trpsf_v1_iter_trades(reg.get("open_trades")):
+            key = _trpsf_v1_trade_key(trade, closed=False)
+            if not key:
+                continue
+            trade_id = str(trade.get("trade_id") or key).strip()
+            open_map[trade_id] = dict(trade)
+        for trade in _trpsf_v1_iter_trades(reg.get("closed_trades")):
+            key = _trpsf_v1_trade_key(trade, closed=True)
+            if not key:
+                continue
+            if key not in closed_map:
+                closed_map[key] = dict(trade)
+    merged["open_trades"] = open_map
+    merged["closed_trades"] = list(closed_map.values())
+    merged["version"] = str(merged.get("version") or TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION)
+    merged["updated_at"] = _trpsf_v1_now()
+    return merged, sources_used
+
+
+def _trpsf_v1_bootstrap_registry(force=False):
+    """Migra para /data/trade_registry.json e mescla CLOSED legados sem apagar OPEN ativo."""
+    if _TRPSF_V1_STATE.get("migration_done") and not force:
+        return _TRPSF_V1_STATE.get("last_status") or {}
+    active = _trpsf_v1_active_file()
+    active.parent.mkdir(parents=True, exist_ok=True)
+    legacy_paths = _trpsf_v1_legacy_candidate_paths()
+    active_reg = _trpsf_v1_read_json(active)
+    active_exists = isinstance(active_reg, dict)
+    active_counts_before = _trpsf_v1_registry_counts(active_reg or {})
+
+    registries_for_closed = []
+    registries_for_full = []
+    if active_exists:
+        registries_for_full.append((str(active), active_reg))
+        registries_for_closed.append((str(active), active_reg))
+    for p in legacy_paths:
+        try:
+            if str(p) == str(active):
+                continue
+            reg = _trpsf_v1_read_json(p)
+            if not isinstance(reg, dict):
+                continue
+            counts = _trpsf_v1_registry_counts(reg)
+            if not active_exists:
+                registries_for_full.append((str(p), reg))
+            # CLOSED is cumulative history; merge it even when active exists.
+            if counts.get("closed_count", 0) > 0:
+                registries_for_closed.append((str(p), reg))
+        except Exception:
+            pass
+
+    if active_exists:
+        # Keep active OPEN authoritative, only recover CLOSED from legacy/persistent candidates.
+        base = dict(active_reg)
+        base["open_trades"] = active_reg.get("open_trades") if isinstance(active_reg, dict) else {}
+        closed_only = []
+        if registries_for_closed:
+            closed_merge, used = _trpsf_v1_merge_registries(registries_for_closed, active_exists=True)
+            closed_only = _trpsf_v1_iter_trades(closed_merge.get("closed_trades"))
+        base["closed_trades"] = closed_only if closed_only else _trpsf_v1_iter_trades(active_reg.get("closed_trades"))
+        migrated = len(closed_only) > active_counts_before.get("closed_count", 0)
+        merged = base
+        sources_used = [x[0] for x in registries_for_closed]
+    else:
+        if not registries_for_full:
+            merged = _trpsf_v1_default_registry()
+            sources_used = []
+            migrated = False
+        else:
+            merged, sources_used = _trpsf_v1_merge_registries(registries_for_full, active_exists=False)
+            migrated = True
+
+    merged["updated_at"] = _trpsf_v1_now()
+    merged["storage_fix_version"] = TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION
+    counts_after = _trpsf_v1_registry_counts(merged)
+    wrote = False
+    error = None
+    try:
+        if active_exists:
+            try:
+                _trpsf_v1_atomic_write_json(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE, active_reg)
+            except Exception:
+                pass
+        _trpsf_v1_atomic_write_json(active, merged)
+        wrote = True
+        _TRPSF_V1_STATE["last_write_ok"] = True
+    except Exception as exc:
+        error = str(exc)
+        _TRPSF_V1_STATE["last_write_ok"] = False
+        _TRPSF_V1_STATE["last_error"] = error
+
+    status = {
+        "ok": bool(wrote and central_trade_registry is not None),
+        "status": "ACTIVE_PERSISTENT" if wrote else "WRITE_ERROR",
+        "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+        "generated_at": _trpsf_v1_now(),
+        "persistent_storage_enabled": True,
+        "active_file": str(active),
+        "active_file_exists_before": bool(active_exists),
+        "legacy_files_checked": [str(p) for p in legacy_paths],
+        "sources_used": sources_used,
+        "migrated_from_legacy": bool(migrated),
+        "last_write_ok": bool(wrote),
+        "last_error": error,
+        "counts_before": active_counts_before,
+        "counts_after": counts_after,
+        "central_data_dir": str(CENTRAL_DATA_DIR),
+        "backup_file": str(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE),
+        "latest_file": str(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE),
+        "events_file": str(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE),
+        "notes": [
+            "TRADE_REGISTRY_FILE foi forçado para o disco persistente da Central.",
+            "OPEN ativo fica autoritativo; CLOSED legado é mesclado para não perder histórico.",
+            "Esta correção não envia ordens, não altera risco e não rearma LIVE.",
+        ],
+    }
+    try:
+        _trpsf_v1_atomic_write_json(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE, status)
+        with open(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(_trpsf_v1_public(status), ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    _TRPSF_V1_STATE["migration_done"] = True
+    _TRPSF_V1_STATE["migrated_from_legacy"] = bool(migrated)
+    _TRPSF_V1_STATE["last_status"] = status
+    return status
+
+
+def _trpsf_v1_patched_load_registry():
+    active = _trpsf_v1_active_file()
+    try:
+        _trpsf_v1_bootstrap_registry(force=False)
+        reg = _trpsf_v1_read_json(active)
+        if not isinstance(reg, dict):
+            reg = _trpsf_v1_default_registry()
+            _trpsf_v1_atomic_write_json(active, reg)
+        _TRPSF_V1_STATE["last_load_ok"] = True
+        return reg
+    except Exception as exc:
+        _TRPSF_V1_STATE["last_load_ok"] = False
+        _TRPSF_V1_STATE["last_error"] = str(exc)
+        return _trpsf_v1_default_registry()
+
+
+def _trpsf_v1_patched_save_registry(registry):
+    active = _trpsf_v1_active_file()
+    try:
+        if not isinstance(registry, dict):
+            registry = _trpsf_v1_default_registry()
+        registry = dict(registry)
+        registry.setdefault("open_trades", {})
+        registry.setdefault("closed_trades", [])
+        registry["updated_at"] = _trpsf_v1_now()
+        registry["storage_fix_version"] = TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION
+        _trpsf_v1_atomic_write_json(active, registry)
+        _TRPSF_V1_STATE["last_write_ok"] = True
+        _TRPSF_V1_STATE["last_error"] = None
+        return True
+    except Exception as exc:
+        _TRPSF_V1_STATE["last_write_ok"] = False
+        _TRPSF_V1_STATE["last_error"] = str(exc)
+        return False
+
+
+def _trpsf_v1_apply_patch():
+    global _TRPSF_V1_ORIGINAL_LOAD_REGISTRY, _TRPSF_V1_ORIGINAL_SAVE_REGISTRY
+    if central_trade_registry is None:
+        _TRPSF_V1_STATE["last_error"] = TRADE_REGISTRY_IMPORT_ERROR or "trade_registry unavailable"
+        return {
+            "ok": False,
+            "status": "TRADE_REGISTRY_UNAVAILABLE",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "error": _TRPSF_V1_STATE.get("last_error"),
+        }
+    try:
+        active = _trpsf_v1_active_file()
+        active.parent.mkdir(parents=True, exist_ok=True)
+        if not _TRPSF_V1_STATE.get("patched"):
+            _TRPSF_V1_ORIGINAL_LOAD_REGISTRY = getattr(central_trade_registry, "load_registry", None)
+            _TRPSF_V1_ORIGINAL_SAVE_REGISTRY = getattr(central_trade_registry, "save_registry", None)
+            try:
+                setattr(central_trade_registry, "DATA_DIR", Path(CENTRAL_DATA_DIR))
+            except Exception:
+                pass
+            try:
+                setattr(central_trade_registry, "TRADE_REGISTRY_FILE", active)
+            except Exception:
+                pass
+            try:
+                setattr(central_trade_registry, "load_registry", _trpsf_v1_patched_load_registry)
+                setattr(central_trade_registry, "save_registry", _trpsf_v1_patched_save_registry)
+            except Exception:
+                pass
+            _TRPSF_V1_STATE["patched"] = True
+            _TRPSF_V1_STATE["active_file"] = str(active)
+            _TRPSF_V1_STATE["legacy_files"] = [str(p) for p in _trpsf_v1_legacy_candidate_paths()]
+        status = _trpsf_v1_bootstrap_registry(force=False)
+        return status
+    except Exception as exc:
+        _TRPSF_V1_STATE["last_error"] = str(exc)
+        return {
+            "ok": False,
+            "status": "PATCH_ERROR",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "error": str(exc),
+        }
+
+
+def trade_registry_persistent_storage_fix_v1_status(force=False):
+    try:
+        if force:
+            _TRPSF_V1_STATE["migration_done"] = False
+        status = _trpsf_v1_apply_patch()
+    except Exception as exc:
+        status = {
+            "ok": False,
+            "status": "ERROR",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "generated_at": _trpsf_v1_now(),
+            "error": str(exc),
+        }
+    try:
+        active = _trpsf_v1_active_file()
+        current = _trpsf_v1_read_json(active)
+        status["current_counts"] = _trpsf_v1_registry_counts(current or {})
+        status["registry_file_active"] = str(active)
+        status["active_file_exists"] = active.exists()
+        status["trade_registry_module_file"] = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")) if central_trade_registry is not None else None
+        status["trade_registry_module_data_dir"] = str(getattr(central_trade_registry, "DATA_DIR", "")) if central_trade_registry is not None else None
+        status["patched_load_registry"] = bool(getattr(central_trade_registry, "load_registry", None) is _trpsf_v1_patched_load_registry) if central_trade_registry is not None else False
+        status["patched_save_registry"] = bool(getattr(central_trade_registry, "save_registry", None) is _trpsf_v1_patched_save_registry) if central_trade_registry is not None else False
+        status["last_load_ok"] = _TRPSF_V1_STATE.get("last_load_ok")
+        status["last_write_ok"] = _TRPSF_V1_STATE.get("last_write_ok")
+        status["last_error"] = _TRPSF_V1_STATE.get("last_error")
+    except Exception as exc:
+        status["status_append_error"] = str(exc)
+    try:
+        _TRPSF_V1_STATE["last_status"] = status
+        _trpsf_v1_atomic_write_json(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE, status)
+    except Exception:
+        pass
+    return status
+
+
+# Aplica patch no carregamento do main.py, antes das rotas processarem qualquer leitura/gravação do registry.
+try:
+    trade_registry_persistent_storage_fix_v1_status(force=False)
+except Exception:
+    pass
+
+
+def central_trade_registry_snapshot(include_trades=True):
+    original = _TRPSF_V1_ORIGINAL_SNAPSHOT
+    if callable(original):
+        payload = original(include_trades=include_trades)
+    else:
+        payload = {"ok": False, "loaded": False, "open_count": 0, "closed_count": 0}
+    try:
+        storage = trade_registry_persistent_storage_fix_v1_status(force=False)
+        payload.update({
+            "storage_fix_version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "persistent_storage_enabled": bool(storage.get("persistent_storage_enabled")),
+            "registry_file_active": storage.get("registry_file_active") or storage.get("active_file"),
+            "trade_registry_file": storage.get("registry_file_active") or storage.get("active_file") or payload.get("trade_registry_file"),
+            "data_dir": str(CENTRAL_DATA_DIR),
+            "migrated_from_legacy": storage.get("migrated_from_legacy"),
+            "last_write_ok": storage.get("last_write_ok"),
+            "last_load_ok": storage.get("last_load_ok"),
+            "storage_status": storage.get("status"),
+            "storage_last_error": storage.get("last_error") or storage.get("error"),
+        })
+    except Exception as exc:
+        payload["storage_fix_overlay_error"] = str(exc)
+    return payload
+
+
+def bot_health(key: str, cfg: dict):
+    original = _TRPSF_V1_ORIGINAL_BOT_HEALTH
+    if callable(original):
+        payload = original(key, cfg)
+    else:
+        payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
+    try:
+        storage = trade_registry_persistent_storage_fix_v1_status(force=False)
+        overlay = {
+            "trade_registry_storage_status": storage.get("status"),
+            "trade_registry_storage_ok": storage.get("ok"),
+            "trade_registry_storage_version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "trade_registry_file_active": storage.get("registry_file_active") or storage.get("active_file"),
+            "trade_registry_persistent_storage_enabled": storage.get("persistent_storage_enabled"),
+            "trade_registry_last_write_ok": storage.get("last_write_ok"),
+        }
+        health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+        health.update(overlay)
+        payload["health"] = health
+        if str(key).upper() == "PREDATOR":
+            payload.update(overlay)
+    except Exception as exc:
+        try:
+            payload.setdefault("health", {})["trade_registry_storage_overlay_error"] = str(exc)
+        except Exception:
+            pass
+    return payload
+
+
+def build_trade_registry_persistent_storage_fix_v1_text(force=False):
+    payload = trade_registry_persistent_storage_fix_v1_status(force=force)
+    counts = payload.get("current_counts") or payload.get("counts_after") or {}
+    before = payload.get("counts_before") or {}
+    lines = [
+        "🗄️ TRADE REGISTRY PERSISTENT STORAGE FIX V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at') or _trpsf_v1_now()}",
+        f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Storage ativo:",
+        f"- persistent_storage_enabled: {payload.get('persistent_storage_enabled')}",
+        f"- registry_file_active: {payload.get('registry_file_active') or payload.get('active_file')}",
+        f"- central_data_dir: {payload.get('central_data_dir')}",
+        f"- module TRADE_REGISTRY_FILE: {payload.get('trade_registry_module_file')}",
+        f"- module DATA_DIR: {payload.get('trade_registry_module_data_dir')}",
+        "",
+        "Migração / patch:",
+        f"- patched load_registry: {payload.get('patched_load_registry')}",
+        f"- patched save_registry: {payload.get('patched_save_registry')}",
+        f"- migrated_from_legacy: {payload.get('migrated_from_legacy')}",
+        f"- last_load_ok: {payload.get('last_load_ok')}",
+        f"- last_write_ok: {payload.get('last_write_ok')}",
+        f"- last_error: {payload.get('last_error') or payload.get('error')}",
+        "",
+        "Contagem Registry:",
+        f"- OPEN antes: {before.get('open_count')}",
+        f"- CLOSED antes: {before.get('closed_count')}",
+        f"- OPEN atual: {counts.get('open_count')}",
+        f"- CLOSED atual: {counts.get('closed_count')}",
+        "",
+        "Arquivos:",
+        f"- Último diagnóstico: {TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE}",
+        f"- Eventos: {TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE}",
+        f"- Backup ativo anterior: {TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE}",
+        "",
+        "Leitura executiva:",
+        "- O Trade Registry agora grava e lê pelo storage persistente da Central.",
+        "- A correção não envia ordens, não altera risco e não rearma LIVE.",
+        "- Se o Predator ainda mostrar CLOSED pendente, rode novamente o Registry Sync do Predator uma única vez.",
+    ]
+    return "\n".join(lines)
+
+
+@app.route("/traderegistry/storage", methods=["GET", "POST"])
+@app.route("/trade_registry/storage", methods=["GET", "POST"])
+@app.route("/trades/storage", methods=["GET", "POST"])
+def trade_registry_persistent_storage_fix_v1_route():
+    body = request.get_json(silent=True) or {}
+    force = _trpsf_v1_bool(body.get("force", request.args.get("force")), default=False) if "_trpsf_v1_bool" in globals() else str(body.get("force", request.args.get("force", ""))).lower() in {"1", "true", "yes", "sim", "on"}
+    return trade_registry_persistent_storage_fix_v1_status(force=force), 200
+
+
+@app.route("/traderegistry/storage/text", methods=["GET", "POST"])
+@app.route("/trade_registry/storage/text", methods=["GET", "POST"])
+@app.route("/trades/storage/text", methods=["GET", "POST"])
+def trade_registry_persistent_storage_fix_v1_text_route():
+    body = request.get_json(silent=True) or {}
+    force = _trpsf_v1_bool(body.get("force", request.args.get("force")), default=False) if "_trpsf_v1_bool" in globals() else str(body.get("force", request.args.get("force", ""))).lower() in {"1", "true", "yes", "sim", "on"}
+    return build_trade_registry_persistent_storage_fix_v1_text(force=force), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
