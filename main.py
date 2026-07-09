@@ -43852,6 +43852,20 @@ def build_trade_registry_persistent_storage_fix_v1_text(force=False):
     return "\n".join(lines)
 
 
+
+
+def _trpsf_v1_bool(value, default=False):
+    """Boolean parser used by Trade Registry Persistent Storage routes.
+
+    Added in the Falcon Live Audit V1.3.1 packaging fix to satisfy static analysis
+    and keep runtime behavior unchanged.
+    """
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "sim", "s", "on"}
+
 @app.route("/traderegistry/storage", methods=["GET", "POST"])
 @app.route("/trade_registry/storage", methods=["GET", "POST"])
 @app.route("/trades/storage", methods=["GET", "POST"])
