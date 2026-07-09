@@ -40796,6 +40796,620 @@ def falcon_live_audit_guard_v1_ack_route():
 
 
 
+# ============================================================================
+# PREDATOR PNL/PAPER AUDIT V1
+# ============================================================================
+# Objetivo:
+# - Auditar o PnL estatístico/PAPER do Smart Predator sem misturar REAL, VERIFY,
+#   PREVIEW ou SAFE_DRY_RUN.
+# - Expor diagnóstico leve no /predator/pnlaudit e /predator/pnlaudit/text.
+# - Expor campos resumidos no /bots/PREDATOR.
+PREDATOR_PNL_PAPER_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PNL-PAPER-AUDIT-V1"
+PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_events.jsonl")
+PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_latest.json")
+
+
+def _pppa_v1_now():
+    try:
+        if callable(globals().get("data_hora_sp_str")):
+            return data_hora_sp_str()
+    except Exception:
+        pass
+    try:
+        return datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return None
+
+
+def _pppa_v1_data_dir():
+    try:
+        d = globals().get("CENTRAL_DATA_DIR")
+        if d:
+            return Path(str(d))
+    except Exception:
+        pass
+    return Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")
+
+
+def _pppa_v1_public(value, max_string=500):
+    """Remove/mascara campos sensíveis e limita strings grandes para payloads públicos."""
+    sensitive = {"api_key", "api_secret", "secret", "signature", "x-bx-apikey", "token", "authorization", "execution_auth_token"}
+    try:
+        if isinstance(value, dict):
+            out = {}
+            for k, v in value.items():
+                kk = str(k).lower()
+                if any(s in kk for s in sensitive):
+                    out[k] = "***MASKED***"
+                else:
+                    out[k] = _pppa_v1_public(v, max_string=max_string)
+            return out
+        if isinstance(value, list):
+            return [_pppa_v1_public(x, max_string=max_string) for x in value[:100]]
+        if isinstance(value, str):
+            return value if len(value) <= max_string else value[:max_string] + "..."
+        return value
+    except Exception:
+        return None
+
+
+def _pppa_v1_read_jsonl_tail(path, limit=1000):
+    from collections import deque
+    p = Path(str(path))
+    rows = deque(maxlen=max(1, int(limit or 1000)))
+    if not p.exists():
+        return []
+    try:
+        with p.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = str(line or "").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    obj = {"raw": line}
+                if isinstance(obj, dict):
+                    rows.append(obj)
+        return list(rows)
+    except Exception:
+        return []
+
+
+def _pppa_v1_read_json_records(path, limit=1000):
+    p = Path(str(path))
+    if not p.exists():
+        return []
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return []
+    records = []
+    if isinstance(obj, list):
+        records.extend([x for x in obj if isinstance(x, dict)])
+    elif isinstance(obj, dict):
+        # Formatos comuns: {events: [...]}, {trades: [...]}, {history: [...]}, ou dict de trades.
+        for key in ["events", "trades", "history", "positions", "open_trades", "closed_trades"]:
+            val = obj.get(key)
+            if isinstance(val, list):
+                records.extend([x for x in val if isinstance(x, dict)])
+            elif isinstance(val, dict):
+                records.extend([x for x in val.values() if isinstance(x, dict)])
+        if not records:
+            records.append(obj)
+    return records[-max(1, int(limit or 1000)):]
+
+
+def _pppa_v1_deep_find(obj, keys, max_depth=5):
+    wanted = {str(k).lower() for k in keys}
+    stack = [(obj, 0)]
+    seen = set()
+    while stack:
+        cur, depth = stack.pop()
+        if id(cur) in seen or depth > max_depth:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                if str(k).lower() in wanted:
+                    return v
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append((v, depth + 1))
+        elif isinstance(cur, list):
+            for v in cur[:80]:
+                if isinstance(v, (dict, list)):
+                    stack.append((v, depth + 1))
+    return None
+
+
+def _pppa_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        if isinstance(value, str):
+            value = value.replace("%", "").replace(",", ".").strip()
+        return float(value)
+    except Exception:
+        return default
+
+
+def _pppa_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "sent"}
+
+
+def _pppa_v1_norm_bot(value):
+    raw = str(value or "").upper().strip().replace(" ", "_").replace("-", "_")
+    if raw in {"PREDATOR", "SMART_PREDATOR", "SMARTPREDATOR", "SMART"}:
+        return "PREDATOR"
+    return raw or "UNKNOWN"
+
+
+def _pppa_v1_norm_symbol(value):
+    raw = str(value or "UNKNOWN").upper().strip()
+    raw = raw.replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace("-USDT", "USDT")
+    return raw.replace(":USDT", "")
+
+
+def _pppa_v1_norm_side(value):
+    raw = str(value or "UNKNOWN").upper().strip()
+    if raw == "BUY":
+        return "LONG"
+    if raw == "SELL":
+        return "SHORT"
+    return raw
+
+
+def _pppa_v1_event_key(item, source=""):
+    order_id = _pppa_v1_deep_find(item, ["order_id", "id", "exchange_order_id"])
+    tag = _pppa_v1_deep_find(item, ["client_order_id", "clientOrderID", "client_tag", "tag", "signal_id"])
+    ts = _pppa_v1_deep_find(item, ["ts", "generated_at", "created_at", "opened_at", "closed_at", "timestamp", "epoch"])
+    event = _pppa_v1_deep_find(item, ["event", "event_type", "status", "action"])
+    symbol = _pppa_v1_norm_symbol(_pppa_v1_deep_find(item, ["symbol", "ativo", "pair", "market_symbol", "bingx_symbol"]))
+    side = _pppa_v1_norm_side(_pppa_v1_deep_find(item, ["side", "direction", "position_side", "positionSide"]))
+    return f"{source}|{tag or ''}|{order_id or ''}|{event or ''}|{ts or ''}|{symbol}|{side}"
+
+
+def _pppa_v1_is_predator_item(item):
+    bot = _pppa_v1_norm_bot(_pppa_v1_deep_find(item, ["bot", "robot", "strategy", "bot_name", "source_bot"]))
+    if bot == "PREDATOR":
+        return True
+    setup = str(_pppa_v1_deep_find(item, ["setup", "strategy_name", "origin", "source"]) or "").upper()
+    if "PREDATOR" in setup or "SMART_PREDATOR" in setup or "SMARTPREDATOR" in setup:
+        return True
+    tag = str(_pppa_v1_deep_find(item, ["client_order_id", "clientOrderID", "client_tag", "tag", "signal_id"]) or "").upper()
+    if tag.startswith("PREDATOR") or "SMART_PREDATOR" in tag:
+        return True
+    return False
+
+
+def _pppa_v1_classify_item(item, source_name=""):
+    status = str(_pppa_v1_deep_find(item, ["status", "result_status", "execution_status"]) or "").upper()
+    event = str(_pppa_v1_deep_find(item, ["event", "event_type", "action", "type"]) or "").upper()
+    mode = str(_pppa_v1_deep_find(item, ["mode", "execution_mode", "payload_mode"]) or "").upper()
+    sent = _pppa_v1_bool(_pppa_v1_deep_find(item, ["sent", "live_send_enabled", "order_sent"]), default=False)
+    if sent or mode == "LIVE" or "LIVE_SENT" in status or "LIVE_SENT" in event:
+        return "REAL_SENT_OR_LIVE_EVENT"
+    if "SAFE_DRY_RUN" in status or "SAFE_DRY_RUN" in event:
+        return "SAFE_DRY_RUN"
+    if "DRY_RUN" in status or mode == "DRY_RUN":
+        return "SAFE_DRY_RUN"
+    if status == "PREVIEW" or event == "PREVIEW" or "PREVIEW" in source_name.upper():
+        return "BROKER_PREVIEW"
+    if "VERIFY" in status or "VERIFY" in event or mode == "VERIFY":
+        return "VERIFY"
+    if "CLOSE" in event or "CLOSED" in status or "TRADE_CLOSED" in event or str(_pppa_v1_deep_find(item, ["closed_at"]) or ""):
+        return "PAPER_CLOSED"
+    if "OPEN" in event or "OPENED" in status or "TRADE_OPENED" in event or str(_pppa_v1_deep_find(item, ["opened_at"]) or ""):
+        return "PAPER_OPEN"
+    if "SIGNAL" in event or "SIGNAL" in status:
+        return "SIGNAL"
+    return "OTHER"
+
+
+def _pppa_v1_collect_source_events(limit=1200):
+    data_dir = _pppa_v1_data_dir()
+    source_files = [
+        ("history_events", data_dir / "history_events.jsonl", "jsonl"),
+        ("decision_log", data_dir / "decision_log.jsonl", "jsonl"),
+        ("execution_log", data_dir / "execution_log.jsonl", "jsonl"),
+        ("execution_engine_log", data_dir / "execution_engine_log.jsonl", "jsonl"),
+        ("broker_executions_log", data_dir / "broker_executions_log.jsonl", "jsonl"),
+        ("broker_execution_audit_log", data_dir / "broker_execution_audit_log.jsonl", "jsonl"),
+        ("history_export", data_dir / "history_export.json", "json"),
+        ("trade_registry_file", data_dir / "trade_registry.json", "json"),
+    ]
+    out = []
+    source_counts = {}
+    for source_name, path, kind in source_files:
+        rows = _pppa_v1_read_jsonl_tail(path, limit=limit) if kind == "jsonl" else _pppa_v1_read_json_records(path, limit=limit)
+        source_counts[source_name] = len(rows)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if not _pppa_v1_is_predator_item(row):
+                continue
+            cls = _pppa_v1_classify_item(row, source_name)
+            out.append({
+                "source": source_name,
+                "kind": cls,
+                "key": _pppa_v1_event_key(row, source_name),
+                "ts": _pppa_v1_deep_find(row, ["ts", "generated_at", "created_at", "opened_at", "closed_at", "timestamp"]),
+                "symbol": _pppa_v1_norm_symbol(_pppa_v1_deep_find(row, ["symbol", "ativo", "pair", "market_symbol", "bingx_symbol"])),
+                "side": _pppa_v1_norm_side(_pppa_v1_deep_find(row, ["side", "direction", "position_side", "positionSide"])),
+                "setup": _pppa_v1_deep_find(row, ["setup", "strategy_name"]),
+                "status": _pppa_v1_deep_find(row, ["status", "event", "event_type"]),
+                "sent": _pppa_v1_bool(_pppa_v1_deep_find(row, ["sent", "order_sent"]), default=False),
+                "raw_public": _pppa_v1_public(row, max_string=250),
+            })
+    return out, source_counts
+
+
+def _pppa_v1_registry_predator_snapshot():
+    snap = {}
+    try:
+        if callable(globals().get("central_trade_registry_snapshot")):
+            snap = central_trade_registry_snapshot(include_trades=True)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "open_count": 0, "closed_count": 0, "open_trades": [], "closed_trades": []}
+    open_trades = snap.get("open_trades") or []
+    closed_trades = snap.get("closed_trades") or []
+    if isinstance(open_trades, dict):
+        open_trades = list(open_trades.values())
+    if isinstance(closed_trades, dict):
+        closed_trades = list(closed_trades.values())
+    open_p = [t for t in open_trades if isinstance(t, dict) and _pppa_v1_norm_bot(t.get("bot") or t.get("robot")) == "PREDATOR"]
+    closed_p = [t for t in closed_trades if isinstance(t, dict) and _pppa_v1_norm_bot(t.get("bot") or t.get("robot")) == "PREDATOR"]
+    return {
+        "ok": bool(snap.get("ok")),
+        "error": snap.get("error"),
+        "registry_file": snap.get("trade_registry_file"),
+        "open_count": len(open_p),
+        "closed_count": len(closed_p),
+        "open_trades": [_pppa_v1_public(x, max_string=250) for x in open_p[:50]],
+        "closed_trades": [_pppa_v1_public(x, max_string=250) for x in closed_p[-50:]],
+    }
+
+
+def _pppa_v1_module_predator_snapshot():
+    module = None
+    try:
+        module = (globals().get("LOADED_BOTS") or {}).get("PREDATOR")
+    except Exception:
+        module = None
+    health = {}
+    positions = []
+    if module is not None:
+        try:
+            raw_health = getattr(module, "HEALTH", {}) or {}
+            if isinstance(raw_health, dict):
+                health = dict(raw_health)
+        except Exception:
+            health = {}
+        try:
+            if callable(globals().get("get_open_positions_from_module")):
+                positions = get_open_positions_from_module(module, "PREDATOR") or []
+            elif hasattr(module, "carregar_posicoes"):
+                raw = module.carregar_posicoes()
+                positions = list(raw.values()) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        except Exception:
+            positions = []
+    return {
+        "loaded": module is not None,
+        "health": _pppa_v1_public(health, max_string=250),
+        "mode": health.get("mode") or health.get("execution_mode"),
+        "execution_mode": health.get("execution_mode"),
+        "execution_enabled": health.get("execution_enabled"),
+        "firewall_enabled": health.get("execution_firewall_enabled"),
+        "last_positions_count": health.get("last_positions_count"),
+        "positions_count_read": len([p for p in positions if isinstance(p, dict)]),
+        "positions_sample": [_pppa_v1_public(p, max_string=250) for p in positions[:20] if isinstance(p, dict)],
+    }
+
+
+def _pppa_v1_build_pnl_stats(events, registry):
+    # Dedup de fechados PAPER por chave. SAFE_DRY_RUN, VERIFY, PREVIEW e REAL são excluídos do cálculo.
+    closed = []
+    seen = set()
+    for ev in events:
+        if ev.get("kind") != "PAPER_CLOSED":
+            continue
+        k = ev.get("key")
+        if k in seen:
+            continue
+        seen.add(k)
+        closed.append(ev)
+    # Complementa com closed_trades do registry sem duplicar quando tiver trade_id/key.
+    for t in registry.get("closed_trades") or []:
+        if not isinstance(t, dict):
+            continue
+        key = "registry_closed|" + str(t.get("trade_id") or t.get("id") or _pppa_v1_event_key(t, "trade_registry_closed"))
+        if key in seen:
+            continue
+        seen.add(key)
+        closed.append({
+            "source": "trade_registry_closed",
+            "kind": "PAPER_CLOSED",
+            "key": key,
+            "ts": t.get("closed_at") or t.get("updated_at"),
+            "symbol": _pppa_v1_norm_symbol(t.get("symbol") or t.get("symbol_clean")),
+            "side": _pppa_v1_norm_side(t.get("side") or t.get("direction")),
+            "setup": t.get("setup"),
+            "status": t.get("status") or t.get("exit_reason"),
+            "sent": False,
+            "raw_public": _pppa_v1_public(t, max_string=250),
+        })
+    with_pnl = []
+    missing_pnl = []
+    for ev in closed:
+        raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
+        pnl_pct = _pppa_v1_float(_pppa_v1_deep_find(raw, ["pnl_pct", "result_pct", "profit_pct", "pnl_percent"]), default=None)
+        pnl_r = _pppa_v1_float(_pppa_v1_deep_find(raw, ["pnl_r", "result_r", "r", "r_multiple"]), default=None)
+        if pnl_pct is None and pnl_r is None:
+            missing_pnl.append(ev)
+        else:
+            e2 = dict(ev)
+            e2["pnl_pct"] = pnl_pct
+            e2["pnl_r"] = pnl_r
+            with_pnl.append(e2)
+    pnl_values = [x.get("pnl_pct") for x in with_pnl if x.get("pnl_pct") is not None]
+    r_values = [x.get("pnl_r") for x in with_pnl if x.get("pnl_r") is not None]
+    wins = len([x for x in pnl_values if x > 0])
+    losses = len([x for x in pnl_values if x < 0])
+    be = len([x for x in pnl_values if x == 0])
+    gains = sum([x for x in pnl_values if x > 0])
+    abs_losses = abs(sum([x for x in pnl_values if x < 0]))
+    pf = (gains / abs_losses) if abs_losses > 0 else (999 if gains > 0 else 0)
+    denom = wins + losses + be
+    return {
+        "paper_closed_count": len(closed),
+        "paper_closed_with_pnl_count": len(with_pnl),
+        "paper_closed_missing_pnl_count": len(missing_pnl),
+        "wins": wins,
+        "losses": losses,
+        "breakeven": be,
+        "win_rate_pct": round((wins / denom * 100), 2) if denom else 0.0,
+        "pnl_total_pct": round(sum(pnl_values), 4) if pnl_values else 0.0,
+        "pnl_avg_pct": round(sum(pnl_values) / len(pnl_values), 4) if pnl_values else 0.0,
+        "r_total": round(sum(r_values), 4) if r_values else 0.0,
+        "r_avg": round(sum(r_values) / len(r_values), 4) if r_values else 0.0,
+        "profit_factor_pct": round(pf, 4),
+        "closed_sample": [_pppa_v1_public(x, max_string=250) for x in closed[-10:]],
+        "missing_pnl_sample": [_pppa_v1_public(x, max_string=250) for x in missing_pnl[-10:]],
+        "excluded_from_pnl_note": "SAFE_DRY_RUN, BROKER_PREVIEW, VERIFY e REAL_SENT_OR_LIVE_EVENT são excluídos do PnL estatístico/PAPER.",
+    }
+
+
+def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
+    events, source_counts = _pppa_v1_collect_source_events(limit=limit)
+    registry = _pppa_v1_registry_predator_snapshot()
+    module_snap = _pppa_v1_module_predator_snapshot()
+    by_kind = {}
+    by_source = {}
+    for ev in events:
+        by_kind[ev.get("kind")] = by_kind.get(ev.get("kind"), 0) + 1
+        by_source[ev.get("source")] = by_source.get(ev.get("source"), 0) + 1
+    real_events = [e for e in events if e.get("kind") == "REAL_SENT_OR_LIVE_EVENT"]
+    safe_events = [e for e in events if e.get("kind") == "SAFE_DRY_RUN"]
+    preview_events = [e for e in events if e.get("kind") == "BROKER_PREVIEW"]
+    verify_events = [e for e in events if e.get("kind") == "VERIFY"]
+    pnl = _pppa_v1_build_pnl_stats(events, registry)
+    warnings = []
+    reasons = []
+    status = "OK"
+
+    if real_events:
+        status = "BLOCKED_FOR_REAL_REVIEW"
+        reasons.append(f"Predator possui evento LIVE/sent=True detectado: {len(real_events)}. Auditar antes de qualquer LIVE.")
+    if safe_events:
+        warnings.append(f"SAFE_DRY_RUN detectado e excluído do PnL estatístico: {len(safe_events)} evento(s).")
+    if preview_events:
+        warnings.append(f"BROKER_PREVIEW detectado e excluído do PnL estatístico: {len(preview_events)} evento(s).")
+    if verify_events:
+        warnings.append(f"VERIFY detectado e excluído do PnL estatístico: {len(verify_events)} evento(s).")
+    if pnl.get("paper_closed_count") and pnl.get("paper_closed_missing_pnl_count"):
+        warnings.append(f"Há fechamentos PAPER sem PnL/R completo: {pnl.get('paper_closed_missing_pnl_count')}/{pnl.get('paper_closed_count')}.")
+    if not pnl.get("paper_closed_count"):
+        warnings.append("Nenhum fechamento PAPER do Predator com PnL auditável foi encontrado nas fontes lidas.")
+
+    health_count = module_snap.get("last_positions_count")
+    registry_open = registry.get("open_count")
+    module_read = module_snap.get("positions_count_read")
+    try:
+        if health_count is not None and module_read is not None and int(health_count) != int(module_read):
+            warnings.append(f"Divergência interna Predator: HEALTH last_positions_count={health_count}, posições lidas={module_read}.")
+    except Exception:
+        pass
+    try:
+        if registry_open and module_read is not None and int(registry_open) != int(module_read):
+            warnings.append(f"Divergência Registry x módulo Predator: registry_open={registry_open}, posições lidas={module_read}.")
+    except Exception:
+        pass
+
+    mode = str(module_snap.get("execution_mode") or module_snap.get("mode") or "").upper()
+    execution_enabled = module_snap.get("execution_enabled")
+    firewall_enabled = module_snap.get("firewall_enabled")
+    if mode and mode not in {"PAPER", "VERIFY", "DRY_RUN"}:
+        warnings.append(f"Predator não está em modo PAPER/VERIFY/DRY_RUN: {mode}.")
+    if execution_enabled is True:
+        warnings.append("Predator execution_enabled=True; manter false até auditoria terminar.")
+    if firewall_enabled is False:
+        warnings.append("Predator execution_firewall_enabled=False; recomendado manter firewall ligado.")
+
+    if status == "OK" and warnings:
+        status = "OK_WITH_WARNINGS"
+
+    ok = not bool(real_events)
+    payload = {
+        "ok": ok,
+        "module": "predator_pnl_paper_audit_v1",
+        "version": PREDATOR_PNL_PAPER_AUDIT_V1_VERSION,
+        "generated_at": _pppa_v1_now(),
+        "status": status,
+        "reasons": reasons,
+        "warnings": warnings,
+        "mode": mode or None,
+        "execution_enabled": execution_enabled,
+        "execution_firewall_enabled": firewall_enabled,
+        "source_counts_read": source_counts,
+        "events_total_count": len(events),
+        "by_kind": by_kind,
+        "by_source": by_source,
+        "real_sent_or_live_event_count": len(real_events),
+        "safe_dry_run_count": len(safe_events),
+        "broker_preview_count": len(preview_events),
+        "verify_count": len(verify_events),
+        "paper_pnl": pnl,
+        "module_snapshot": module_snap,
+        "registry_snapshot": registry,
+        "files": {
+            "events": PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE,
+            "latest": PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE,
+        },
+        "notes": [
+            "Esta auditoria é estatística/PAPER; não altera execução, risco, policies ou posições.",
+            "SAFE_DRY_RUN, PREVIEW, VERIFY e REAL são separados do PnL PAPER.",
+            "Predator não deve ir para LIVE antes de zerar eventos críticos e validar PnL por fonte.",
+        ],
+        "token_value_exposed": False,
+    }
+    if include_samples:
+        payload["samples"] = {
+            "real_events": [_pppa_v1_public(e, max_string=250) for e in real_events[-10:]],
+            "safe_dry_run_events": [_pppa_v1_public(e, max_string=250) for e in safe_events[-10:]],
+            "preview_events": [_pppa_v1_public(e, max_string=250) for e in preview_events[-10:]],
+        }
+    try:
+        latest_path = Path(PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE)
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        latest_path.write_text(json.dumps(_pppa_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        event_path = Path(PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE)
+        event_path.parent.mkdir(parents=True, exist_ok=True)
+        with event_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": "PREDATOR_PNL_PAPER_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "real_sent_or_live_event_count": len(real_events), "paper_pnl": pnl}, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria Predator: {exc}")
+    return payload
+
+
+def build_predator_pnl_paper_audit_v1_text():
+    payload = predator_pnl_paper_audit_v1_status(include_samples=False)
+    pnl = payload.get("paper_pnl") or {}
+    mod = payload.get("module_snapshot") or {}
+    reg = payload.get("registry_snapshot") or {}
+    lines = [
+        "🧾 PREDATOR PNL/PAPER AUDIT V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Modo / execução:",
+        f"- mode/execution_mode: {payload.get('mode')}",
+        f"- execution_enabled: {payload.get('execution_enabled')}",
+        f"- execution_firewall_enabled: {payload.get('execution_firewall_enabled')}",
+        "",
+        "Separação de fontes:",
+        f"- Eventos Predator lidos: {payload.get('events_total_count')}",
+        f"- PAPER fechado auditável: {pnl.get('paper_closed_count')}",
+        f"- PAPER com PnL/R: {pnl.get('paper_closed_with_pnl_count')}",
+        f"- PAPER sem PnL/R: {pnl.get('paper_closed_missing_pnl_count')}",
+        f"- SAFE_DRY_RUN excluído do PnL: {payload.get('safe_dry_run_count')}",
+        f"- BROKER_PREVIEW excluído do PnL: {payload.get('broker_preview_count')}",
+        f"- VERIFY excluído do PnL: {payload.get('verify_count')}",
+        f"- REAL/sent=True detectado: {payload.get('real_sent_or_live_event_count')}",
+        "",
+        "PnL PAPER auditado:",
+        f"- Trades fechados: {pnl.get('paper_closed_count')}",
+        f"- Wins/Losses/BE: {pnl.get('wins')} / {pnl.get('losses')} / {pnl.get('breakeven')}",
+        f"- Win rate: {pnl.get('win_rate_pct')}%",
+        f"- PnL total: {pnl.get('pnl_total_pct')}%",
+        f"- PnL médio: {pnl.get('pnl_avg_pct')}%",
+        f"- R total: {pnl.get('r_total')}R",
+        f"- R médio: {pnl.get('r_avg')}R",
+        f"- Profit factor: {pnl.get('profit_factor_pct')}",
+        "",
+        "Posições:",
+        f"- Predator HEALTH last_positions_count: {mod.get('last_positions_count')}",
+        f"- Posições lidas do módulo: {mod.get('positions_count_read')}",
+        f"- Registry open Predator: {reg.get('open_count')}",
+        f"- Registry closed Predator: {reg.get('closed_count')}",
+    ]
+    if payload.get("reasons"):
+        lines += ["", "Bloqueios/críticos:"] + [f"- ❌ {x}" for x in payload.get("reasons")]
+    if payload.get("warnings"):
+        lines += ["", "Avisos:"] + [f"- ⚠️ {x}" for x in payload.get("warnings")]
+    lines += [
+        "",
+        "Leitura executiva:",
+        "- Esta auditoria NÃO é PnL financeiro real; é limpeza estatística/PAPER do Predator.",
+        "- SAFE_DRY_RUN/PREVIEW/VERIFY não devem entrar no resultado do robô.",
+        "- Predator deve continuar fora do LIVE até esta auditoria ficar limpa e consistente.",
+        "",
+        "Arquivos:",
+        f"- Eventos: {PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE}",
+        f"- Último snapshot: {PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE}",
+    ]
+    return "\n".join(lines)
+
+
+_ORIGINAL_BOT_HEALTH_FOR_PREDATOR_PNL_PAPER_AUDIT_V1 = bot_health if "bot_health" in globals() else None
+
+
+def bot_health(key: str, cfg: dict):
+    original = _ORIGINAL_BOT_HEALTH_FOR_PREDATOR_PNL_PAPER_AUDIT_V1
+    if callable(original):
+        payload = original(key, cfg)
+    else:
+        payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
+    try:
+        if str(key).upper() == "PREDATOR":
+            audit = predator_pnl_paper_audit_v1_status(include_samples=False, limit=600)
+            health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+            overlay = {
+                "predator_pnl_audit_status": audit.get("status"),
+                "predator_pnl_audit_ok": audit.get("ok"),
+                "predator_pnl_audit_version": PREDATOR_PNL_PAPER_AUDIT_V1_VERSION,
+                "predator_real_sent_or_live_event_count": audit.get("real_sent_or_live_event_count"),
+                "predator_safe_dry_run_count": audit.get("safe_dry_run_count"),
+                "predator_broker_preview_count": audit.get("broker_preview_count"),
+                "predator_verify_count": audit.get("verify_count"),
+                "predator_paper_closed_count": (audit.get("paper_pnl") or {}).get("paper_closed_count"),
+                "predator_paper_closed_with_pnl_count": (audit.get("paper_pnl") or {}).get("paper_closed_with_pnl_count"),
+                "predator_paper_closed_missing_pnl_count": (audit.get("paper_pnl") or {}).get("paper_closed_missing_pnl_count"),
+                "predator_paper_pnl_total_pct": (audit.get("paper_pnl") or {}).get("pnl_total_pct"),
+                "predator_paper_r_total": (audit.get("paper_pnl") or {}).get("r_total"),
+                "predator_pnl_audit_warnings": audit.get("warnings", [])[:5],
+                "predator_pnl_audit_reasons": audit.get("reasons", [])[:5],
+            }
+            health.update(overlay)
+            payload["health"] = health
+            payload.update(overlay)
+    except Exception as exc:
+        try:
+            payload.setdefault("health", {})["predator_pnl_audit_overlay_error"] = str(exc)
+        except Exception:
+            pass
+    return payload
+
+
+@app.route("/predator/pnlaudit", methods=["GET"])
+@app.route("/predator/paperaudit", methods=["GET"])
+def predator_pnl_paper_audit_v1_route():
+    return predator_pnl_paper_audit_v1_status(include_samples=True), 200
+
+
+@app.route("/predator/pnlaudit/text", methods=["GET"])
+@app.route("/predator/paperaudit/text", methods=["GET"])
+def predator_pnl_paper_audit_v1_text_route():
+    return build_predator_pnl_paper_audit_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
