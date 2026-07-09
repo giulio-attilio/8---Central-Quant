@@ -13782,6 +13782,31 @@ def build_broker_health_report():
     bal = ready.get("balance") or {}
     if bal:
         lines.append(f"Saldo USDT total/free/used: {bal.get('total_usdt')} / {bal.get('free_usdt')} / {bal.get('used_usdt')}")
+
+    broker_inner = broker_status.get("broker") or {}
+    if isinstance(broker_inner, dict):
+        lines += [
+            "",
+            "Disaster Stop Hedge Mode Fix:",
+            f"- version: {broker_inner.get('disaster_stop_hedge_mode_fix_version')}",
+            f"- last_disaster_stop_status: {broker_inner.get('last_disaster_stop_status')}",
+            f"- last_disaster_stop_created: {broker_inner.get('last_disaster_stop_created')}",
+            f"- last_disaster_stop_error: {broker_inner.get('last_disaster_stop_error')}",
+        ]
+        payload_safe = broker_inner.get("last_disaster_stop_payload_sanitized")
+        if isinstance(payload_safe, dict) and payload_safe:
+            lines += [
+                "- last_disaster_stop_payload_sanitized:",
+                f"  symbol: {payload_safe.get('symbol')}",
+                f"  side: {payload_safe.get('side')} | positionSide: {payload_safe.get('positionSide')}",
+                f"  reduceOnly_in_payload: {payload_safe.get('reduceOnly_in_payload')}",
+                f"  hedge_mode_detected: {payload_safe.get('hedge_mode_detected')}",
+                f"  reduce_only_removed_for_hedge_mode: {payload_safe.get('reduce_only_removed_for_hedge_mode')}",
+                f"  disaster_stop_payload_safe: {payload_safe.get('disaster_stop_payload_safe')}",
+            ]
+        else:
+            lines.append("- last_disaster_stop_payload_sanitized: None")
+
     lines += ["", f"Últimos eventos broker lidos: {len(exec_items or [])}"]
     if err:
         lines.append(f"Aviso log: {err}")

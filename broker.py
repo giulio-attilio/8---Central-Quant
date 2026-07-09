@@ -1,6 +1,6 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
-# Versão: 2026-07-07-BROKER-BINGX-SAFE-V2.7.4-UNIFIED-AUDIT-PATH
+# Versão: 2026-07-09-BROKER-DISASTER-STOP-HEDGE-MODE-FIX-V1.1
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -22,6 +22,7 @@
 # - V2.6.1 Preview Isolation: qualquer VERIFY/DRY_RUN retorna antes de create_order().
 # - V2.6.2 Execution Authorization Token: envio real exige token curto gerado pelo Execution Engine.
 # - V2.7 Disaster Stop Manager: após MARKET real preenchida, cria stop de desastre na BingX.
+# - V2.7.8 / Fix V1.1: em Hedge Mode, disaster stop NÃO envia reduceOnly e mantém positionSide.
 # - Adiciona campos de apresentação para VERIFY:
 #   margin_usdt_display, leverage_display, planned_exposure_usdt_display,
 #   actual_exposure_usdt_display, estimated_margin_after_open_usdt_display,
@@ -150,6 +151,14 @@ DISASTER_STOP_REQUIRE_FOR_LIVE = env_bool("DISASTER_STOP_REQUIRE_FOR_LIVE", True
 DISASTER_STOP_WORKING_TYPE = os.environ.get("DISASTER_STOP_WORKING_TYPE", "MARK_PRICE").strip().upper()
 DISASTER_STOP_PRICE_BUFFER_PCT = float(os.environ.get("DISASTER_STOP_PRICE_BUFFER_PCT", "0"))
 DISASTER_STOP_CLIENT_SUFFIX = os.environ.get("DISASTER_STOP_CLIENT_SUFFIX", "-DS")
+
+# Broker Disaster Stop Hedge Mode Fix V1.1
+# BingX em Hedge Mode rejeita reduceOnly em ordens STOP/STOP_MARKET.
+# Portanto, para disaster stop em Hedge Mode, removemos reduceOnly e preservamos positionSide=LONG/SHORT.
+DISASTER_STOP_HEDGE_MODE_FIX_VERSION = "2026-07-09-BROKER-DISASTER-STOP-HEDGE-MODE-FIX-V1.1"
+_LAST_DISASTER_STOP_ERROR = None
+_LAST_DISASTER_STOP_PAYLOAD_SANITIZED = None
+_LAST_DISASTER_STOP_RESULT = None
 
 # Endpoint usado apenas para prévia/assinatura no VERIFY.
 # O envio real continua usando ccxt.create_order(), pois é mais seguro e padronizado.
@@ -552,6 +561,11 @@ def status_payload(check_ready: bool = False):
         "disaster_stop_require_for_live": DISASTER_STOP_REQUIRE_FOR_LIVE,
         "disaster_stop_working_type": DISASTER_STOP_WORKING_TYPE,
         "disaster_stop_price_buffer_pct": DISASTER_STOP_PRICE_BUFFER_PCT,
+        "disaster_stop_hedge_mode_fix_version": DISASTER_STOP_HEDGE_MODE_FIX_VERSION,
+        "last_disaster_stop_error": _LAST_DISASTER_STOP_ERROR,
+        "last_disaster_stop_payload_sanitized": _LAST_DISASTER_STOP_PAYLOAD_SANITIZED,
+        "last_disaster_stop_status": (_LAST_DISASTER_STOP_RESULT or {}).get("status") if isinstance(_LAST_DISASTER_STOP_RESULT, dict) else None,
+        "last_disaster_stop_created": (_LAST_DISASTER_STOP_RESULT or {}).get("created") if isinstance(_LAST_DISASTER_STOP_RESULT, dict) else None,
     }
     if check_ready:
         payload["ready"] = ready_check()
@@ -1044,14 +1058,52 @@ def _apply_disaster_stop_buffer(side: str, stop_price: float) -> float:
     return stop
 
 
+def _disaster_stop_hedge_mode_detected() -> bool:
+    mode = str(BINGX_POSITION_MODE or "").upper().strip()
+    return bool(BINGX_HEDGE_MODE_ENABLED or mode in {"HEDGE", "HEDGED", "DUAL", "TRUE", "YES", "1", "ON"})
+
+
+def _set_last_disaster_stop_diagnostic(result=None, error=None, payload_sanitized=None):
+    global _LAST_DISASTER_STOP_ERROR, _LAST_DISASTER_STOP_PAYLOAD_SANITIZED, _LAST_DISASTER_STOP_RESULT
+    _LAST_DISASTER_STOP_ERROR = error
+    _LAST_DISASTER_STOP_PAYLOAD_SANITIZED = payload_sanitized
+    if isinstance(result, dict):
+        _LAST_DISASTER_STOP_RESULT = {k: v for k, v in result.items() if k != "raw"}
+    else:
+        _LAST_DISASTER_STOP_RESULT = None
+
+
+def _build_disaster_stop_hedge_mode_fix_payload(position_side, reduce_only_requested=True):
+    hedge_mode_detected = _disaster_stop_hedge_mode_detected()
+    reduce_only_sent = bool(reduce_only_requested and not hedge_mode_detected)
+    return {
+        "version": DISASTER_STOP_HEDGE_MODE_FIX_VERSION,
+        "hedge_mode_detected": hedge_mode_detected,
+        "position_mode": BINGX_POSITION_MODE,
+        "hedge_mode_enabled": BINGX_HEDGE_MODE_ENABLED,
+        "position_side": position_side,
+        "reduce_only_requested": bool(reduce_only_requested),
+        "reduce_only_sent": reduce_only_sent,
+        "reduce_only_removed_for_hedge_mode": bool(reduce_only_requested and hedge_mode_detected),
+        "disaster_stop_payload_safe": True,
+        "token_value_exposed": False,
+    }
+
+
 def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag=None, entry_price=None):
     """
     Cria stop de desastre na BingX após abertura real.
     A posição aberta é fechada no sentido oposto:
     LONG -> SELL stop; SHORT -> BUY stop.
+
+    Fix V1.1:
+    - Em Hedge Mode, a BingX rejeita reduceOnly em STOP/STOP_MARKET.
+    - Portanto, removemos reduceOnly quando hedge_mode está ativo e mantemos positionSide.
     """
     if not DISASTER_STOP_ENABLED:
-        return {"ok": True, "enabled": False, "created": False, "status": "DISASTER_STOP_DISABLED"}
+        result = {"ok": True, "enabled": False, "created": False, "status": "DISASTER_STOP_DISABLED"}
+        _set_last_disaster_stop_diagnostic(result=result, error=None, payload_sanitized=None)
+        return result
 
     sym = normalize_symbol(symbol)
     normalized = normalize_side(side)
@@ -1059,20 +1111,51 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
 
     validation = validate_disaster_stop_price(side, entry_price, stop_loss_price)
     if not validation.get("ok"):
-        return {"ok": False, "enabled": True, "created": False, "status": "DISASTER_STOP_INVALID", "reason": validation.get("reason"), "validation": validation}
+        result = {
+            "ok": False,
+            "enabled": True,
+            "created": False,
+            "status": "DISASTER_STOP_INVALID",
+            "reason": validation.get("reason"),
+            "validation": validation,
+            "disaster_stop_hedge_mode_fix": _build_disaster_stop_hedge_mode_fix_payload(position_side),
+        }
+        _set_last_disaster_stop_diagnostic(result=result, error=validation.get("reason"), payload_sanitized=None)
+        return result
 
     stop_price = _apply_disaster_stop_buffer(side, float(stop_loss_price))
     close_side = "sell" if normalized == "buy" else "buy"
     client_order_id = (str(client_tag or f"CQ-{int(time.time())}")[:24] + DISASTER_STOP_CLIENT_SUFFIX)[:32]
 
+    fix_payload = _build_disaster_stop_hedge_mode_fix_payload(position_side, reduce_only_requested=True)
+    reduce_only_sent = bool(fix_payload.get("reduce_only_sent"))
+
     params = {
         "stopPrice": float(stop_price),
-        "reduceOnly": True,
         "workingType": DISASTER_STOP_WORKING_TYPE,
         "clientOrderId": client_order_id,
     }
+    if reduce_only_sent:
+        params["reduceOnly"] = True
     if position_side:
         params["positionSide"] = position_side
+
+    payload_sanitized = {
+        "symbol": sym,
+        "bingx_symbol": bingx_api_symbol(sym),
+        "type": "stop_market",
+        "side": close_side,
+        "amount": float(amount),
+        "stopPrice": float(stop_price),
+        "workingType": DISASTER_STOP_WORKING_TYPE,
+        "clientOrderId": client_order_id,
+        "positionSide": position_side,
+        "reduceOnly_in_payload": bool(reduce_only_sent),
+        "reduceOnly_value": True if reduce_only_sent else None,
+        "hedge_mode_detected": bool(fix_payload.get("hedge_mode_detected")),
+        "reduce_only_removed_for_hedge_mode": bool(fix_payload.get("reduce_only_removed_for_hedge_mode")),
+        "disaster_stop_payload_safe": True,
+    }
 
     ex = exchange()
     try:
@@ -1090,14 +1173,23 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
             "original_stop_price": float(stop_loss_price),
             "type": "stop_market",
             "working_type": DISASTER_STOP_WORKING_TYPE,
-            "reduce_only": True,
+            "reduce_only": bool(reduce_only_sent),
+            "reduce_only_requested": True,
+            "reduce_only_sent": bool(reduce_only_sent),
+            "hedge_mode_detected": bool(fix_payload.get("hedge_mode_detected")),
+            "reduce_only_removed_for_hedge_mode": bool(fix_payload.get("reduce_only_removed_for_hedge_mode")),
+            "disaster_stop_payload_safe": True,
+            "disaster_stop_payload_sanitized": payload_sanitized,
+            "disaster_stop_hedge_mode_fix": fix_payload,
             "client_order_id": client_order_id,
             "order_id": order.get("id"),
             "raw": order,
         }
+        _set_last_disaster_stop_diagnostic(result=result, error=None, payload_sanitized=payload_sanitized)
         log_execution_audit_event({"event": "BROKER_DISASTER_STOP_CREATED", **{k: v for k, v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
+        error_text = str(exc)
         result = {
             "ok": False,
             "enabled": True,
@@ -1111,10 +1203,18 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
             "original_stop_price": float(stop_loss_price),
             "type": "stop_market",
             "working_type": DISASTER_STOP_WORKING_TYPE,
-            "reduce_only": True,
+            "reduce_only": bool(reduce_only_sent),
+            "reduce_only_requested": True,
+            "reduce_only_sent": bool(reduce_only_sent),
+            "hedge_mode_detected": bool(fix_payload.get("hedge_mode_detected")),
+            "reduce_only_removed_for_hedge_mode": bool(fix_payload.get("reduce_only_removed_for_hedge_mode")),
+            "disaster_stop_payload_safe": True,
+            "disaster_stop_payload_sanitized": payload_sanitized,
+            "disaster_stop_hedge_mode_fix": fix_payload,
             "client_order_id": client_order_id,
-            "error": str(exc),
+            "error": error_text,
         }
+        _set_last_disaster_stop_diagnostic(result=result, error=error_text, payload_sanitized=payload_sanitized)
         log_execution_audit_event({"event": "BROKER_DISASTER_STOP_ERROR", **result})
         return result
 
@@ -1819,6 +1919,7 @@ def place_market_order(
             "client_tag": client_tag,
             "client_order_id": preview.get("client_order_id"),
             "preview": preview,
+            "disaster_stop": disaster_stop_result,
             "preview_isolation": True,
             "live_send_enabled": True,
             "margin_set": margin_set,
