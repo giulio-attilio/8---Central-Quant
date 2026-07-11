@@ -914,7 +914,7 @@ if __name__ == "__main__":
 # (/data/trade_registry.json), enquanto a V2.5 lia apenas trade_registry.jsonl.
 # Continua observacional: não envia ordens, não altera risco e não rearma LIVE.
 
-VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6.1-TYPE-SAFE-REGISTRY-RECON"
+VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6.2-STRICT-BROKER-EVIDENCE"
 TRADE_REGISTRY_JSON_FILE = os.path.join(DATA_DIR, "trade_registry.json")
 BROKER_EXECUTIONS_LOG_FILE = os.path.join(DATA_DIR, "broker_executions_log.jsonl")
 BROKER_EXECUTION_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "broker_execution_audit_log.jsonl")
@@ -995,24 +995,122 @@ def _read_trade_registry_json_rows(limit: Optional[int] = None) -> List[Dict[str
     return rows
 
 
-def _row_has_real_broker_evidence(row: Dict[str, Any]) -> bool:
+def _row_has_explicit_non_execution(row: Dict[str, Any]) -> bool:
+    """True quando o registro descreve bloqueio/preview e não uma ordem real."""
     merged = _flatten_payload(row if isinstance(row, dict) else {})
     meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
     combined = dict(merged)
     combined.update({f"metadata_{k}": v for k, v in meta.items()})
     txt = json.dumps(combined, ensure_ascii=False, default=str).upper()
-    markers = [
-        "LIVE", "REAL", "BINGX", "BROKER", "SENT", "FILLED", "ORDER_ID", "ORDERID",
-        "BINGX_ORDER_ID", "LIVE_ORDER_ID", "CLIENT_ORDER_ID", "FALCON-LIVE",
-        "DISASTER_STOP", "REAL_ORDER_SENT_BY_CENTRAL", "EXECUTION_ENGINE_REAL_TRADE_SYNC",
+
+    negative_markers = [
+        "NOT_ELIGIBLE_FOR_AUTO_REAL_EXECUTION",
+        "NOT_ELIGIBLE",
+        "ELIGIBILITY_DENIED",
+        "PRECHECK_DENY",
+        "PRECHECK_BLOCK",
+        "EXECUTION_BLOCKED",
+        "ORDER_BLOCKED",
+        "NOT_SENT",
+        "NO_ORDER_SENT",
+        "WOULD_NOT_SEND",
+        "WOULD_SEND_ORDER\": FALSE",
+        "DRY_RUN",
+        "SAFE_DRY_RUN",
+        "BROKER_DRY_RUN",
+        "\"MODE\": \"VERIFY\"",
+        "\"EXECUTION_MODE\": \"VERIFY\"",
+        "\"MODE\": \"PAPER\"",
+        "\"EXECUTION_MODE\": \"PAPER\"",
+        "\"MODE\": \"SHADOW\"",
+        "OBSERVATION_ONLY",
+        "PREVIEW_ONLY",
+        "\"PREVIEW\": TRUE",
+        "\"SENT\": FALSE",
+        "\"ORDER_SENT\": FALSE",
+        "\"LIVE_SENT\": FALSE",
+        "\"BROKER_SENT\": FALSE",
+        "\"REAL_SENT\": FALSE",
     ]
-    negatives = ["PAPER", "VERIFY", "DRY_RUN", "SAFE_DRY_RUN", "OBSERVATION_ONLY"]
-    has_marker = any(m in txt for m in markers)
-    # PAPER/VERIFY explícito só bloqueia se não houver evidência forte de order id real.
-    has_order = any(k in combined and not _is_empty(combined.get(k)) for k in ["order_id", "bingx_order_id", "live_order_id", "client_order_id", "metadata_order_id", "metadata_bingx_order_id"])
-    if has_order:
+    return any(marker in txt for marker in negative_markers)
+
+
+def _strong_broker_order_id(merged: Dict[str, Any], meta: Dict[str, Any]) -> Optional[str]:
+    """Retorna ID de ordem/posição da exchange; client_order_id isolado não é prova."""
+    keys = [
+        "bingx_order_id", "broker_order_id", "exchange_order_id", "live_order_id",
+        "order_id", "orderId", "position_id", "close_order_id", "exit_order_id",
+        "stop_order_id", "disaster_stop_order_id",
+    ]
+    for mapping in (merged, meta):
+        if not isinstance(mapping, dict):
+            continue
+        for key in keys:
+            value = mapping.get(key)
+            if _is_empty(value):
+                continue
+            value_s = _safe_str(value)
+            if len(value_s) >= 6:
+                return value_s
+    return None
+
+
+def _row_has_real_broker_evidence(row: Dict[str, Any]) -> bool:
+    """Exige evidência positiva de execução real e rejeita previews/bloqueios.
+
+    A palavra REAL dentro de NOT_ELIGIBLE_FOR_AUTO_REAL_EXECUTION não é prova.
+    client_order_id também não basta sozinho, pois pode nascer antes do envio.
+    """
+    merged = _flatten_payload(row if isinstance(row, dict) else {})
+    meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
+
+    if _row_has_explicit_non_execution(row):
+        return False
+
+    strong_order_id = _strong_broker_order_id(merged, meta)
+
+    sent_flags = [
+        "sent", "live_sent", "order_sent", "broker_sent", "real_sent",
+        "executed", "filled", "broker_filled", "exchange_filled",
+    ]
+    sent_real = any(
+        _safe_bool(mapping.get(key), False)
+        for mapping in (merged, meta)
+        if isinstance(mapping, dict)
+        for key in sent_flags
+    )
+
+    event_values = _upper_values(merged, [
+        "event", "event_raw", "status", "type", "kind", "route", "result",
+        "execution_status", "broker_status", "order_status",
+    ])
+    mode_values = _upper_values(merged, [
+        "mode", "execution_mode", "order_mode", "trade_mode", "environment",
+    ])
+    source_values = _upper_values(merged, [
+        "source", "source_type", "origin", "executor", "executor_route",
+        "broker", "exchange", "venue", "execution_source", "registry_source",
+    ])
+    combined = " ".join(event_values + mode_values + source_values)
+
+    positive_events = [
+        "LIVE_SENT", "ORDER_SENT", "ORDER_FILLED", "FILLED", "PARTIALLY_FILLED",
+        "POSITION_OPENED", "POSITION_CLOSED", "REAL_CLOSE", "BROKER_FILL",
+        "BINGX_FILL", "DISASTER_STOP_CREATED", "DISASTER_STOP_EXECUTED",
+        "STOP_EXECUTED", "TP50_REAL_EXECUTED", "REAL_ORDER_SENT_BY_CENTRAL",
+        "EXECUTION_ENGINE_REAL_TRADE_SYNC", "LIVE_ORDER_REGISTERED",
+    ]
+    explicit_positive_event = any(marker in combined for marker in positive_events)
+    explicit_live_mode = any(v in {"LIVE", "REAL"} for v in mode_values)
+    explicit_broker_source = any(
+        marker in combined for marker in ["BINGX", "BROKER", "EXCHANGE"]
+    )
+
+    if strong_order_id and (sent_real or explicit_positive_event or explicit_live_mode or explicit_broker_source):
         return True
-    if has_marker and not any(n in txt for n in negatives):
+    if sent_real and (explicit_positive_event or explicit_live_mode or explicit_broker_source):
+        return True
+    if explicit_positive_event and explicit_broker_source:
         return True
     return False
 
@@ -1020,14 +1118,27 @@ def _row_has_real_broker_evidence(row: Dict[str, Any]) -> bool:
 _ORIGINAL_IS_REAL_TRADE_CANDIDATE_V25 = _is_real_trade_candidate
 
 def _is_real_trade_candidate(item: Dict[str, Any], raw_row: Dict[str, Any], source: str) -> bool:  # type: ignore[override]
-    if str(source or "").lower() in {"trade_registry_json", "broker_executions_log", "broker_execution_audit_log"}:
+    source_name = str(source or "").lower().strip()
+
+    # Fontes operacionais podem conter muitos PRECHECK/BLOCKED/NOT_ELIGIBLE.
+    # O nome da fonte nunca basta; sempre exigimos evidência positiva no registro.
+    operational_sources = {
+        "trade_registry_json", "trade_registry_jsonl",
+        "broker_executions_log", "broker_execution_audit_log",
+        "execution_engine_log", "execution_log",
+        "real_close_auto_evaluator", "auto_real_execution_bridge",
+        "real_position_watchdog",
+    }
+    if source_name in operational_sources:
         return _row_has_real_broker_evidence(raw_row)
+
+    # Fontes estatísticas/legadas seguem conservadoras e ainda precisam
+    # satisfazer a evidência broker forte da V2.6.2.
     try:
-        if _ORIGINAL_IS_REAL_TRADE_CANDIDATE_V25(item, raw_row, source):
-            return True
+        legacy_candidate = bool(_ORIGINAL_IS_REAL_TRADE_CANDIDATE_V25(item, raw_row, source))
     except Exception:
-        pass
-    return _row_has_real_broker_evidence(raw_row)
+        legacy_candidate = False
+    return bool(legacy_candidate and _row_has_real_broker_evidence(raw_row))
 
 
 def _normalize_trade_v26(row: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
@@ -1082,7 +1193,7 @@ def get_real_pnl_r_health() -> Dict[str, Any]:  # type: ignore[override]
             "output_events_exists": os.path.exists(OUTPUT_EVENTS_FILE),
         },
         "notes": [
-            "V2.6.1 lê /data/trade_registry.json em múltiplos schemas e corrige valores list/dict com type-safety.",
+            "V2.6.2 lê /data/trade_registry.json e rejeita eventos PRECHECK/NOT_ELIGIBLE/VERIFY sem envio real.",
             "Conta como Real PnL/R apenas registros com evidência LIVE/REAL/BROKER/BINGX/order_id.",
             "Se a exchange fechou a posição mas não houver fill/PnL salvo, o trade aparece como incompleto em diagnostics.",
         ],
@@ -1134,7 +1245,7 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "generated_at": _now_br(),
         "mode": MODE,
         "notes": [
-            "Real PnL/R Mapper V2.6.1 lê Registry JSON persistente em múltiplos schemas e logs do broker.",
+            "Real PnL/R Mapper V2.6.2 lê Registry JSON e logs do broker com filtro estrito de evidência real.",
             "Não mistura PAPER/VERIFY sem evidência broker.",
             "Trades fechados sem PnL/exit/order fill aparecem no diagnóstico para reconciliação.",
         ],
@@ -1190,7 +1301,7 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:  # t
     diagnostics = payload.get("diagnostics", {}) or {}
     by_issue = diagnostics.get("by_issue", {}) or {}
     lines = [
-        "💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.6.1",
+        "💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.6.2",
         f"Data/hora: {payload.get('generated_at')}",
         f"Status: {'✅' if payload.get('ok') else '❌'}",
         f"Modo: {payload.get('mode', MODE)}",
@@ -1235,7 +1346,7 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:  # t
     lines += [
         "",
         "Observação:",
-        "- V2.6.1 lê /data/trade_registry.json em múltiplos schemas e logs broker_*.",
+        "- V2.6.2 exclui PRECHECK/NOT_ELIGIBLE/VERIFY e exige evidência positiva de envio/fill broker.",
         "- Continua observacional: não muda lote, risco, execução ou policies ativas.",
     ]
     return "\n".join(lines)
