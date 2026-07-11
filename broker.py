@@ -2427,7 +2427,7 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
 # - Nenhuma função chama create_order, cancel_order ou close_position_market.
 # - O resultado só é considerado completo quando existe fill de fechamento
 #   suficiente para a quantidade original e a posição não está mais aberta.
-REAL_CLOSE_RECONCILIATION_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-V1"
+REAL_CLOSE_RECONCILIATION_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-V1.1-INCOME-DEDUP-FILL-ENTRY"
 
 
 def _rcr_v1_epoch(value, default=None):
@@ -2663,8 +2663,71 @@ def fetch_order_trades(symbol, order_id=None, client_order_id=None, since=None, 
     }
 
 
+
+
+def _rcr_v1_income_identity(item):
+    """Chave estável para deduplicar lançamentos financeiros retornados por aliases da API."""
+    if not isinstance(item, dict):
+        return None
+    tran_id = str(_rcr_v1_first(item, "tranId", "transactionId", "transaction_id", default="") or "").strip()
+    if tran_id:
+        return f"TRAN:{tran_id}"
+    trade_id = str(_rcr_v1_first(item, "tradeId", "trade_id", default="") or "").strip()
+    income_type = str(_rcr_v1_first(item, "incomeType", "type", "category", default="") or "").upper().strip()
+    ts = _rcr_v1_first(item, "time", "timestamp", "transactTime", "createdTime", "created_at", default="")
+    amount = _rcr_v1_first(item, "income", "amount", "pnl", "profit", "change", default="")
+    asset = str(_rcr_v1_first(item, "asset", "currency", "code", default="") or "").upper().strip()
+    info_text = str(_rcr_v1_first(item, "info", default="") or "").strip()
+    symbol = str(_rcr_v1_first(item, "symbol", default="") or "").upper().replace("/", "").replace("-", "")
+    if trade_id or income_type or ts or amount not in (None, ""):
+        return "COMPOSITE:" + "|".join(map(str, (trade_id, income_type, ts, amount, asset, info_text, symbol)))
+    try:
+        return "RAW:" + json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return "RAW:" + str(item)
+
+
+def _rcr_v1_income_fingerprint(item):
+    """Fingerprint financeiro usado para detectar colisões ambíguas sob a mesma transação."""
+    return (
+        str(_rcr_v1_first(item, "tradeId", "trade_id", default="") or "").strip(),
+        str(_rcr_v1_first(item, "incomeType", "type", "category", default="") or "").upper().strip(),
+        str(_rcr_v1_first(item, "time", "timestamp", "transactTime", "createdTime", "created_at", default="") or "").strip(),
+        str(_rcr_v1_first(item, "income", "amount", "pnl", "profit", "change", default="") or "").strip(),
+        str(_rcr_v1_first(item, "asset", "currency", "code", default="") or "").upper().strip(),
+        str(_rcr_v1_first(item, "symbol", default="") or "").upper().strip(),
+    )
+
+
+def _rcr_v1_dedupe_income(rows):
+    """Remove duplicatas exatas e sinaliza colisões financeiras ambíguas."""
+    unique = []
+    seen = {}
+    duplicates_removed = 0
+    conflicts = []
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        key = _rcr_v1_income_identity(item)
+        fp = _rcr_v1_income_fingerprint(item)
+        if key in seen:
+            duplicates_removed += 1
+            if seen[key] != fp:
+                conflicts.append({"key": key, "first": list(seen[key]), "duplicate": list(fp)})
+            continue
+        seen[key] = fp
+        unique.append(item)
+    return {
+        "items": unique,
+        "raw_count": len([x for x in (rows or []) if isinstance(x, dict)]),
+        "deduped_count": len(unique),
+        "duplicates_removed": duplicates_removed,
+        "conflicts": conflicts,
+        "dedup_ok": not conflicts,
+    }
+
 def fetch_realized_income(symbol, since=None, limit=500):
-    """Consulta ledger/income read-only para PnL realizado, taxas e funding."""
+    """Consulta ledger/income read-only para PnL realizado, taxas e funding, com deduplicação."""
     sym = normalize_symbol(symbol)
     since_ms = int(float(since) * 1000) if since and float(since) < 10_000_000_000 else (int(float(since)) if since else None)
     ex = exchange()
@@ -2698,12 +2761,18 @@ def fetch_realized_income(symbol, since=None, limit=500):
     rows.extend(raw_rows)
     attempts.extend(raw_attempts)
     rows = [item for item in rows if _rcr_v1_symbol_matches(item, sym)]
+    dedup = _rcr_v1_dedupe_income(rows)
     return {
-        "ok": bool(rows) or any(item.get("ok") for item in attempts),
+        "ok": bool(dedup.get("items")) or any(item.get("ok") for item in attempts),
         "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
         "symbol": sym,
-        "items": rows,
-        "count": len(rows),
+        "items": dedup.get("items") or [],
+        "count": dedup.get("deduped_count", 0),
+        "raw_count": dedup.get("raw_count", 0),
+        "deduped_count": dedup.get("deduped_count", 0),
+        "duplicates_removed": dedup.get("duplicates_removed", 0),
+        "duplicate_conflicts": dedup.get("conflicts") or [],
+        "dedup_ok": bool(dedup.get("dedup_ok")),
         "attempts": attempts,
         "read_only": True,
         "sent": False,
@@ -2714,10 +2783,10 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
     """
     Reconcilia um trade já fechado usando ordem de entrada + fills opostos.
 
-    Retorna complete=True apenas quando:
-    - a ordem/fill de entrada foi identificada;
-    - fills de fechamento cobrem a quantidade original;
-    - não existe posição aberta do mesmo symbol/positionSide.
+    Prioridade de preço de entrada:
+    1) média ponderada dos fills reais de abertura;
+    2) preço médio da ordem real na BingX;
+    3) preço planejado/Registry apenas como fallback.
     """
     sym = normalize_symbol(symbol)
     side_n = str(side or "").upper().strip()
@@ -2731,7 +2800,8 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
     order_payload = fetch_order_by_id(sym, order_id=open_order_id, client_order_id=client_order_id)
     order = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else {}
     order_ts = _rcr_v1_item_timestamp(order) or start_epoch
-    entry = safe_float(entry_price, None) or _rcr_v1_price(order)
+    registry_entry = safe_float(entry_price, None)
+    order_entry = _rcr_v1_price(order)
     expected_qty = abs(safe_float(qty, 0.0) or 0.0) or _rcr_v1_amount(order)
 
     all_trades_payload = fetch_order_trades(
@@ -2778,14 +2848,18 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         if target_qty and selected_qty >= target_qty * 0.999:
             break
 
+    open_qty = sum(_rcr_v1_amount(item) for item in opening_fills)
+    open_cost = sum((_rcr_v1_price(item) or 0.0) * _rcr_v1_amount(item) for item in opening_fills)
+    opening_fill_entry = open_cost / open_qty if open_qty else None
+    entry = opening_fill_entry or order_entry or registry_entry
+    entry_source = "BROKER_OPENING_FILLS" if opening_fill_entry is not None else (
+        "BROKER_ORDER_AVERAGE" if order_entry is not None else "REGISTRY_FALLBACK"
+    )
+    if not expected_qty and open_qty:
+        expected_qty = open_qty
+
     weighted_cost = sum((_rcr_v1_price(item) or 0.0) * _rcr_v1_amount(item) for item in selected_closing)
     exit_price = weighted_cost / selected_qty if selected_qty > 0 else None
-    if entry is None and opening_fills:
-        open_qty = sum(_rcr_v1_amount(item) for item in opening_fills)
-        open_cost = sum((_rcr_v1_price(item) or 0.0) * _rcr_v1_amount(item) for item in opening_fills)
-        entry = open_cost / open_qty if open_qty else None
-        if not expected_qty:
-            expected_qty = open_qty
 
     opening_fee = sum(_rcr_v1_fee(item) for item in opening_fills)
     closing_fee = sum(_rcr_v1_fee(item) for item in selected_closing)
@@ -2834,7 +2908,8 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
 
     qty_complete = bool(expected_qty and selected_qty >= expected_qty * 0.999)
     position_closed = len(relevant_open) == 0
-    complete = bool(entry is not None and exit_price is not None and selected_qty > 0 and qty_complete and position_closed)
+    financial_dedup_ok = bool(income_payload.get("dedup_ok", True))
+    complete = bool(entry is not None and exit_price is not None and selected_qty > 0 and qty_complete and position_closed and financial_dedup_ok)
     net_pnl = (realized_gross or 0.0) - fee_total + funding if realized_gross is not None else None
     close_order_ids = sorted({value for value in (_rcr_v1_order_id(item) for item in selected_closing) if value})
     closed_at_epoch = max([_rcr_v1_item_timestamp(item) or 0.0 for item in selected_closing], default=0.0) or None
@@ -2853,6 +2928,8 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         issues.append("POSITION_STILL_OPEN")
     if realized_gross is None:
         issues.append("REALIZED_PNL_MISSING")
+    if not financial_dedup_ok:
+        issues.append("AMBIGUOUS_INCOME_DUPLICATES")
 
     return {
         "ok": True,
@@ -2869,6 +2946,10 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "client_order_id": client_order_id,
         "close_order_ids": close_order_ids,
         "entry_price": entry,
+        "entry_price_source": entry_source,
+        "opening_fill_entry_price": opening_fill_entry,
+        "order_entry_price": order_entry,
+        "registry_entry_price": registry_entry,
         "exit_price": exit_price,
         "expected_qty": expected_qty,
         "closed_qty": selected_qty,
@@ -2882,13 +2963,18 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "fee_total": fee_total,
         "funding": funding,
         "net_pnl": net_pnl,
+        "financial_dedup_ok": financial_dedup_ok,
+        "income_raw_count": income_payload.get("raw_count"),
+        "income_deduped_count": income_payload.get("deduped_count"),
+        "income_duplicates_removed": income_payload.get("duplicates_removed"),
+        "income_duplicate_conflicts": income_payload.get("duplicate_conflicts") or [],
         "opening_fills": opening_fills,
         "closing_fills": selected_closing,
         "income_items": income_payload.get("items") or [],
         "open_positions": relevant_open,
         "position_fetch_error": position_error,
         "issues": issues,
-        "data_quality": "HIGH_BROKER_RECONCILED" if complete else "LOW_INCOMPLETE",
+        "data_quality": "HIGH_BROKER_RECONCILED_DEDUPED" if complete else "LOW_INCOMPLETE",
         "order_lookup": order_payload,
         "trade_lookup": {
             "ok": all_trades_payload.get("ok"),
@@ -2898,6 +2984,12 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "income_lookup": {
             "ok": income_payload.get("ok"),
             "count": income_payload.get("count"),
+            "raw_count": income_payload.get("raw_count"),
+            "deduped_count": income_payload.get("deduped_count"),
+            "duplicates_removed": income_payload.get("duplicates_removed"),
+            "duplicate_conflicts": income_payload.get("duplicate_conflicts") or [],
+            "dedup_ok": income_payload.get("dedup_ok"),
             "attempts": income_payload.get("attempts"),
         },
     }
+

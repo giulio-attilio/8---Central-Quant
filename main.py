@@ -46158,14 +46158,14 @@ def falcon_disaster_stop_close_position_preview_route():
 
 
 # ==============================================================================
-# REAL CLOSE RECONCILIATION V1 — BROKER FILLS → REGISTRY → OUTCOME
+# REAL CLOSE RECONCILIATION V1.1 — INCOME DEDUP + BROKER FILL ENTRY
 # Patch: 2026-07-11-REAL-CLOSE-RECONCILIATION-MAIN-V1
 # ==============================================================================
 # Segurança:
 # - Todas as consultas à BingX são read-only.
 # - Nenhuma rota deste bloco abre, fecha, cancela ou altera ordens.
 # - Commit só ocorre com evidência broker completa; pela rota manual exige ACK.
-REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-MAIN-V1"
+REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-MAIN-V1.1-INCOME-DEDUP-FILL-ENTRY"
 REAL_CLOSE_RECONCILIATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_latest.json"
 REAL_CLOSE_RECONCILIATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_events.jsonl"
 
@@ -46431,7 +46431,14 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
     qty = _rcrm_v1_float(broker_result.get("expected_qty"), values.get("qty"))
     net_pnl = _rcrm_v1_float(broker_result.get("net_pnl"))
     metrics = _rcrm_v1_metrics(side, entry, values.get("stop"), exit_price, qty, net_pnl)
-    complete = bool(broker_result.get("complete") and values.get("order_id") and exit_price is not None and net_pnl is not None)
+    financial_dedup_ok = bool(broker_result.get("financial_dedup_ok", True))
+    complete = bool(
+        broker_result.get("complete")
+        and financial_dedup_ok
+        and values.get("order_id")
+        and exit_price is not None
+        and net_pnl is not None
+    )
     committed = False
     registry_update = None
     outcome = None
@@ -46444,12 +46451,21 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "real_close_reconciliation_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
             "broker_order_id": values.get("order_id"),
             "client_order_id": values.get("client_order_id"),
+            "registry_entry_price": values.get("entry"),
+            "broker_entry_price": entry,
+            "broker_entry_price_source": broker_result.get("entry_price_source"),
+            "broker_opening_fill_entry_price": broker_result.get("opening_fill_entry_price"),
+            "broker_order_entry_price": broker_result.get("order_entry_price"),
             "broker_close_order_ids": broker_result.get("close_order_ids") or [],
             "broker_realized_pnl_gross": broker_result.get("realized_pnl_gross"),
             "broker_fee_total": broker_result.get("fee_total"),
             "broker_funding": broker_result.get("funding"),
             "broker_net_pnl": net_pnl,
             "broker_data_quality": broker_result.get("data_quality"),
+            "broker_income_raw_count": broker_result.get("income_raw_count"),
+            "broker_income_deduped_count": broker_result.get("income_deduped_count"),
+            "broker_income_duplicates_removed": broker_result.get("income_duplicates_removed"),
+            "broker_financial_dedup_ok": financial_dedup_ok,
         }
         updater = getattr(central_trade_registry, "update_closed_trade", None)
         if callable(updater):
@@ -46512,6 +46528,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "order_id": values.get("order_id"),
             "client_order_id": values.get("client_order_id"),
             "entry": entry,
+            "entry_source": broker_result.get("entry_price_source"),
+            "registry_entry": values.get("entry"),
             "stop": values.get("stop"),
             "qty": qty,
         },
@@ -46523,6 +46541,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "Consulta broker é read-only e não envia ordem.",
             "Commit só é permitido com ordem real identificada, fills de fechamento completos e posição encerrada.",
             "PnL líquido preserva PnL realizado, taxas e funding em campos separados.",
+            "V1.1 deduplica lançamentos pelo tranId e prioriza o fill real da BingX como entrada.",
+            "Commit é bloqueado se houver colisão financeira ambígua após a deduplicação.",
         ],
     })
     public = _rcrm_v1_public(result)
@@ -46578,9 +46598,11 @@ def real_close_reconciliation_v1_route():
             "",
             f"Trade: {trade.get('bot')} {trade.get('symbol')} {trade.get('side')} {trade.get('setup')}",
             f"Order: {trade.get('order_id')} | Client: {trade.get('client_order_id')}",
-            f"Entrada: {trade.get('entry')} | Saída: {broker_result.get('exit_price')} | Qty: {trade.get('qty')}",
+            f"Entrada real: {trade.get('entry')} | Fonte: {trade.get('entry_source')} | Registry: {trade.get('registry_entry')}",
+            f"Saída: {broker_result.get('exit_price')} | Qty: {trade.get('qty')}",
             f"PnL bruto: {broker_result.get('realized_pnl_gross')} | Fees: {broker_result.get('fee_total')} | Funding: {broker_result.get('funding')}",
             f"PnL líquido: {broker_result.get('net_pnl')} | PnL%: {metrics.get('pnl_pct')} | R líquido: {metrics.get('r_net')}",
+            f"Income: raw={broker_result.get('income_raw_count')} | únicos={broker_result.get('income_deduped_count')} | removidos={broker_result.get('income_duplicates_removed')} | dedup_ok={broker_result.get('financial_dedup_ok')}",
             f"Issues: {broker_result.get('issues')}",
             "",
             "Segurança: consulta read-only; nenhuma ordem foi enviada.",
