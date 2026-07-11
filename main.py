@@ -1,4 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
+# Patch: 2026-07-11-LIVE-PARTIAL-REALPNL-V1 — rotas /live/v12, /falcon/liveorder/detail/text, /manualpositions/text
 # Versão: 2026-07-07-SUPER-CENTRAL-QUANT-V5-CEO-DAILY-V2.2-EXECUTION-AUDIT-V1
 #
 # Objetivo:
@@ -45014,6 +45015,1073 @@ def falcon_real_pilot_preflight_checklist_v1_route():
 def falcon_real_pilot_preflight_checklist_v1_text_route():
     payload = _frpp_v1_build_checklist()
     return _frpp_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ============================================================================
+# FALCON LIVE ORDER AUDIT DETAIL V1 + MANUAL POSITION AWARENESS V1
+# + LIVE STATUS V1.2 — HISTORICAL ACK AWARENESS
+# ----------------------------------------------------------------------------
+# Objetivo:
+# - Detalhar ordens reais Falcon sem enviar ordem, sem criar stop e sem alterar ENV.
+# - Distinguir evento histórico LIVE_SENT já reconhecido por ACK de evento novo/ativo.
+# - Expor awareness de posições manuais/externas BingX sem confundir com posições da Central.
+# - Atualizar /live para V1.2 com consciência de histórico ACK.
+# ============================================================================
+
+FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION = "2026-07-09-FALCON-LIVE-ORDER-AUDIT-DETAIL-V1"
+MANUAL_POSITION_AWARENESS_V1_VERSION = "2026-07-09-MANUAL-POSITION-AWARENESS-V1"
+LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION = "2026-07-09-LIVE-STATUS-V1.2-HISTORICAL-ACK-AWARENESS"
+
+try:
+    _FLOAD_V1_DATA_DIR = CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")
+except Exception:
+    _FLOAD_V1_DATA_DIR = Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")
+
+FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE = _FLOAD_V1_DATA_DIR / "falcon_live_order_audit_detail_v1_latest.json"
+FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_EVENTS_FILE = _FLOAD_V1_DATA_DIR / "falcon_live_order_audit_detail_v1_events.jsonl"
+MANUAL_POSITION_AWARENESS_V1_LATEST_FILE = _FLOAD_V1_DATA_DIR / "manual_position_awareness_v1_latest.json"
+MANUAL_POSITION_AWARENESS_V1_EVENTS_FILE = _FLOAD_V1_DATA_DIR / "manual_position_awareness_v1_events.jsonl"
+LIVE_STATUS_V12_LATEST_FILE = _FLOAD_V1_DATA_DIR / "live_status_v1_2_latest.json"
+
+
+def _flad_v1_now():
+    try:
+        if callable(globals().get("data_hora_sp_str")):
+            return data_hora_sp_str()
+    except Exception:
+        pass
+    try:
+        if callable(globals().get("agora_sp_str")):
+            return agora_sp_str()
+    except Exception:
+        pass
+    try:
+        return datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return None
+
+
+def _flad_v1_public(obj, max_string=1200):
+    sensitive = {"token", "secret", "apikey", "api_key", "authorization", "signature", "password", "x-bx-apikey"}
+    try:
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                lk = str(k).lower()
+                if any(s in lk for s in sensitive):
+                    out[k] = "***MASKED***" if v not in (None, "", False) else v
+                else:
+                    out[k] = _flad_v1_public(v, max_string=max_string)
+            return out
+        if isinstance(obj, list):
+            return [_flad_v1_public(x, max_string=max_string) for x in obj[:300]]
+        if isinstance(obj, str):
+            return obj if len(obj) <= max_string else obj[:max_string] + "..."
+        return obj
+    except Exception:
+        return None
+
+
+def _flad_v1_write_snapshot(path, payload):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(_flad_v1_public(payload), f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def _flad_v1_append_event(path, payload):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = _flad_v1_public(payload)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _flad_v1_str(value, default=""):
+    try:
+        if value is None:
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def _flad_v1_upper(value, default=""):
+    return _flad_v1_str(value, default=default).upper().strip()
+
+
+def _flad_v1_norm_symbol(value):
+    try:
+        if callable(globals().get("_fleag_v1_norm_symbol")):
+            return _fleag_v1_norm_symbol(value)
+    except Exception:
+        pass
+    try:
+        if callable(globals().get("normalize_registry_symbol")):
+            return normalize_registry_symbol(value)
+    except Exception:
+        pass
+    raw = _flad_v1_upper(value).replace("/", "").replace(":USDT", "")
+    if raw and not raw.endswith("USDT"):
+        raw += "USDT"
+    return raw
+
+
+def _flad_v1_norm_side(value):
+    try:
+        if callable(globals().get("_fleag_v1_norm_side")):
+            return _fleag_v1_norm_side(value)
+    except Exception:
+        pass
+    raw = _flad_v1_upper(value)
+    if raw in {"BUY", "LONG"}:
+        return "LONG"
+    if raw in {"SELL", "SHORT"}:
+        return "SHORT"
+    return raw
+
+
+def _flad_v1_event_tag(e):
+    try:
+        if callable(globals().get("_live_v11_event_tag")):
+            return _live_v11_event_tag(e)
+    except Exception:
+        pass
+    if not isinstance(e, dict):
+        return ""
+    return _flad_v1_str(e.get("client_order_id") or e.get("clientOrderId") or e.get("client_tag") or e.get("tag") or "")
+
+
+def _flad_v1_infer_bot(e):
+    try:
+        if callable(globals().get("_live_v11_infer_bot")):
+            return _live_v11_infer_bot(e)
+    except Exception:
+        pass
+    if not isinstance(e, dict):
+        return "UNKNOWN"
+    raw = _flad_v1_upper(e.get("bot") or e.get("bot_name") or e.get("source") or "")
+    tag = _flad_v1_upper(_flad_v1_event_tag(e))
+    joined = _flad_v1_upper(json.dumps(_flad_v1_public(e), ensure_ascii=False, default=str)[:3000])
+    if raw:
+        return "PREDATOR" if raw in {"SMART_PREDATOR", "SMARTPREDATOR"} else raw
+    if "FALCON" in tag or "FALCON" in joined:
+        return "FALCON"
+    if "PREDATOR" in tag or "PREDATOR" in joined:
+        return "PREDATOR"
+    return "UNKNOWN"
+
+
+def _flad_v1_deep_find(obj, keys):
+    try:
+        if callable(globals().get("_fleag_v1_deep_find")):
+            return _fleag_v1_deep_find(obj, keys)
+    except Exception:
+        pass
+    keys = {str(k).lower() for k in keys}
+    try:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if str(k).lower() in keys and v not in (None, ""):
+                    return v
+            for k, v in obj.items():
+                found = _flad_v1_deep_find(v, keys)
+                if found not in (None, ""):
+                    return found
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                found = _flad_v1_deep_find(v, keys)
+                if found not in (None, ""):
+                    return found
+    except Exception:
+        return None
+    return None
+
+
+def _flad_v1_bool_deep(obj, keys):
+    try:
+        if callable(globals().get("_fleag_v1_is_trueish_deep")):
+            return _fleag_v1_is_trueish_deep(obj, keys)
+    except Exception:
+        pass
+    val = _flad_v1_deep_find(obj, keys)
+    if isinstance(val, bool):
+        return val
+    return str(val or "").strip().lower() in {"1", "true", "yes", "sim", "on", "sent", "live_sent"}
+
+
+def _flad_v1_event_status(e):
+    if not isinstance(e, dict):
+        return ""
+    status = e.get("status") or e.get("event") or e.get("result_status") or e.get("execution_status")
+    if status not in (None, ""):
+        return _flad_v1_str(status).strip()
+    found = _flad_v1_deep_find(e, ["status", "event", "result_status", "execution_status"])
+    return _flad_v1_str(found).strip()
+
+
+def _flad_v1_event_order_id(e):
+    if not isinstance(e, dict):
+        return None
+    return (
+        e.get("order_id") or e.get("id") or e.get("exchange_order_id")
+        or _flad_v1_deep_find(e, ["order_id", "id", "exchange_order_id"])
+    )
+
+
+def _flad_v1_event_client_id(e):
+    if not isinstance(e, dict):
+        return None
+    return (
+        e.get("client_order_id") or e.get("clientOrderId") or e.get("client_tag") or e.get("tag")
+        or _flad_v1_deep_find(e, ["client_order_id", "clientOrderId", "client_tag", "tag"])
+    )
+
+
+def _flad_v1_is_live_sent(e):
+    if not isinstance(e, dict):
+        return False
+    status = _flad_v1_upper(_flad_v1_event_status(e))
+    joined = _flad_v1_upper(json.dumps(_flad_v1_public(e), ensure_ascii=False, default=str)[:5000])
+    return bool(
+        e.get("sent") is True
+        or _flad_v1_bool_deep(e, ["sent", "live_sent", "order_sent", "sent_to_exchange"])
+        or "LIVE_SENT" in status
+        or "LIVE_SENT" in joined
+    )
+
+
+def _flad_v1_is_falcon_live_sent(e):
+    return bool(_flad_v1_is_live_sent(e) and _flad_v1_infer_bot(e) == "FALCON")
+
+
+def _flad_v1_is_bad_stop_event(e):
+    try:
+        if callable(globals().get("_fleag_v1_event_indicates_bad_live_execution")):
+            return _fleag_v1_event_indicates_bad_live_execution(e)
+    except Exception:
+        pass
+    status = _flad_v1_upper(_flad_v1_event_status(e))
+    joined = _flad_v1_upper(json.dumps(_flad_v1_public(e), ensure_ascii=False, default=str)[:5000])
+    return bool("DISASTER_STOP_FAILED" in status or "LIVE_SENT_BUT_DISASTER_STOP_FAILED" in joined)
+
+
+def _flad_v1_canonical_bad_key(e):
+    try:
+        if callable(globals().get("_fleag_v1_bad_event_canonical_key_v1_3")):
+            return _fleag_v1_bad_event_canonical_key_v1_3(e)
+    except Exception:
+        pass
+    oid = _flad_v1_event_order_id(e) or "NO_ORDER_ID"
+    sym = _flad_v1_norm_symbol(_flad_v1_deep_find(e, ["symbol", "market_symbol", "pair", "instrument", "asset"]))
+    side = _flad_v1_norm_side(_flad_v1_deep_find(e, ["side", "position_side", "positionSide", "direction"]))
+    status = _flad_v1_upper(_flad_v1_event_status(e)) or "LIVE_SENT_BUT_DISASTER_STOP_FAILED"
+    if "DISASTER_STOP_FAILED" in status:
+        status = "LIVE_SENT_BUT_DISASTER_STOP_FAILED"
+    return "|".join(["ORDER", str(oid), status, sym, side])[:300]
+
+
+def _flad_v1_bad_event_acked(e, audit_payload=None):
+    try:
+        audit = audit_payload if isinstance(audit_payload, dict) else falcon_live_execution_audit_guard_v1_status(include_recent=False)
+    except Exception:
+        audit = {}
+    try:
+        key = _flad_v1_canonical_bad_key(e)
+        acked = audit.get("bad_execution_events_acked") or []
+        for item in acked:
+            if _flad_v1_canonical_bad_key(item) == key:
+                return True
+        state = audit.get("state") if isinstance(audit.get("state"), dict) else {}
+        if callable(globals().get("_fleag_v1_ack_canonical_keys_v1_3")) and key in _fleag_v1_ack_canonical_keys_v1_3(state):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _flad_v1_event_key(e):
+    oid = _flad_v1_event_order_id(e)
+    if oid not in (None, ""):
+        return "ORDER|" + str(oid)
+    client = _flad_v1_event_client_id(e)
+    if client not in (None, ""):
+        return "CLIENT|" + str(client)
+    try:
+        if callable(globals().get("_fleag_v1_bad_event_canonical_key_v1_3")):
+            return _fleag_v1_bad_event_canonical_key_v1_3(e)
+    except Exception:
+        pass
+    return json.dumps(_flad_v1_public(e), ensure_ascii=False, sort_keys=True, default=str)[:300]
+
+
+def _flad_v1_read_falcon_live_order_events(limit=300):
+    rows = []
+    try:
+        if callable(globals().get("_execution_log_items")):
+            items, err = _execution_log_items(limit=limit)
+            for item in items or []:
+                if isinstance(item, dict):
+                    it = dict(item)
+                    it.setdefault("_source_file", "_execution_log_items")
+                    rows.append(it)
+    except Exception:
+        pass
+    parent = FALCON_LIVE_AUDIT_EVENTS_FILE.parent if "FALCON_LIVE_AUDIT_EVENTS_FILE" in globals() else _FLOAD_V1_DATA_DIR
+    for name in [
+        "broker_executions_log.jsonl",
+        "broker_execution_audit_log.jsonl",
+        "execution_engine_log.jsonl",
+        "auto_real_execution_bridge.jsonl",
+        "falcon_live_execution_audit.jsonl",
+    ]:
+        try:
+            if callable(globals().get("_fleag_v1_read_jsonl_file")):
+                rows.extend(_fleag_v1_read_jsonl_file(parent / name, limit=limit))
+        except Exception:
+            pass
+    filtered = []
+    seen = set()
+    for e in rows:
+        try:
+            if not isinstance(e, dict) or not _flad_v1_is_falcon_live_sent(e):
+                continue
+            key = _flad_v1_event_key(e)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(_flad_v1_public(e))
+        except Exception:
+            continue
+    return filtered[-max(1, int(limit or 300)):]
+
+
+def _flad_v1_disaster_stop_detail(e):
+    disaster = None
+    try:
+        if isinstance(e, dict):
+            if isinstance(e.get("disaster_stop"), dict):
+                disaster = e.get("disaster_stop")
+            elif isinstance(e.get("live_result"), dict) and isinstance(e.get("live_result", {}).get("disaster_stop"), dict):
+                disaster = e.get("live_result", {}).get("disaster_stop")
+            elif isinstance(e.get("payload"), dict):
+                live = e.get("payload", {}).get("live_result") if isinstance(e.get("payload", {}).get("live_result"), dict) else {}
+                if isinstance(live.get("disaster_stop"), dict):
+                    disaster = live.get("disaster_stop")
+    except Exception:
+        disaster = None
+    disaster = disaster if isinstance(disaster, dict) else {}
+    status = _flad_v1_upper(disaster.get("status") or "")
+    if not status and _flad_v1_is_bad_stop_event(e):
+        status = "FAILED"
+    created = bool(disaster.get("created") or disaster.get("ok") or disaster.get("confirmed") or "CREATED" in status or "OK" == status)
+    failed = bool(disaster.get("error") or "FAILED" in status or "ERROR" in status)
+    return _flad_v1_public({
+        "present": bool(disaster),
+        "status": status or ("FAILED" if failed else "UNKNOWN"),
+        "created": created,
+        "failed": failed,
+        "error": disaster.get("error"),
+        "order_id": disaster.get("order_id") or disaster.get("id"),
+        "client_order_id": disaster.get("client_order_id") or disaster.get("clientOrderId"),
+        "position_side": disaster.get("position_side") or disaster.get("positionSide"),
+        "reduce_only": disaster.get("reduce_only") or disaster.get("reduceOnly"),
+        "raw": disaster,
+    })
+
+
+def _flad_v1_build_event_detail(e, audit_payload=None, state=None):
+    state = state if isinstance(state, dict) else {}
+    status = _flad_v1_event_status(e)
+    bad_stop = _flad_v1_is_bad_stop_event(e)
+    acked_history = bool(bad_stop and _flad_v1_bad_event_acked(e, audit_payload=audit_payload))
+    disaster = _flad_v1_disaster_stop_detail(e)
+    order_id = _flad_v1_event_order_id(e)
+    client_id = _flad_v1_event_client_id(e)
+    symbol = _flad_v1_norm_symbol(_flad_v1_deep_find(e, ["symbol", "market_symbol", "pair", "instrument", "asset"]) or (e.get("symbol") if isinstance(e, dict) else None))
+    side = _flad_v1_norm_side(_flad_v1_deep_find(e, ["side", "position_side", "positionSide", "direction"]) or (e.get("side") if isinstance(e, dict) else None))
+    if acked_history:
+        review_status = "HISTORICAL_ACKED_FAILURE"
+        action_required = False
+    elif bad_stop:
+        review_status = "LIVE_FAILURE_REQUIRES_REVIEW"
+        action_required = True
+    else:
+        review_status = "LIVE_ORDER_REQUIRES_TRACKING"
+        action_required = True
+    return _flad_v1_public({
+        "order_key": _flad_v1_event_key(e),
+        "review_status": review_status,
+        "action_required": action_required,
+        "historical_acked": acked_history,
+        "bad_stop_event": bad_stop,
+        "ts": e.get("ts") if isinstance(e, dict) else None,
+        "generated_at": e.get("generated_at") if isinstance(e, dict) else None,
+        "bot": _flad_v1_infer_bot(e),
+        "mode": "LIVE",
+        "status": status,
+        "sent": True,
+        "symbol": symbol,
+        "side": side,
+        "order_id": order_id,
+        "client_order_id": client_id,
+        "notional_usdt": _flad_v1_deep_find(e, ["notional_usdt", "notional", "effective_notional_usdt"]),
+        "amount": _flad_v1_deep_find(e, ["amount", "quantity", "qty", "contracts"]),
+        "price_ref": _flad_v1_deep_find(e, ["price_ref", "entry", "entry_price", "avg_price"]),
+        "telegram": {
+            "last_live_order_telegram_sent": state.get("last_live_order_telegram_sent"),
+            "last_live_order_telegram_error": state.get("last_live_order_telegram_error"),
+        },
+        "disaster_stop": disaster,
+        "registry": {
+            "last_live_order_registry_status": state.get("last_live_order_registry_status"),
+            "last_trade_registry_event": state.get("last_trade_registry_event"),
+        },
+        "protection": {
+            "last_live_order_protection_status": state.get("last_live_order_protection_status"),
+            "last_live_order_fail_safe_action": state.get("last_live_order_fail_safe_action"),
+        },
+        "source_file": e.get("_source_file") if isinstance(e, dict) else None,
+    })
+
+
+def _flad_v1_build_payload(limit=100):
+    try:
+        audit = falcon_live_execution_audit_guard_v1_status(include_recent=True)
+    except Exception as exc:
+        audit = {"ok": False, "error": str(exc), "live_audit_status": "AUDIT_READ_ERROR"}
+    state = audit.get("state") if isinstance(audit.get("state"), dict) else {}
+    events = _flad_v1_read_falcon_live_order_events(limit=limit)
+    details = [_flad_v1_build_event_detail(e, audit_payload=audit, state=state) for e in events]
+    historical_acked = [d for d in details if d.get("historical_acked")]
+    unacked_failures = [d for d in details if d.get("bad_stop_event") and not d.get("historical_acked")]
+    active_or_tracking = [d for d in details if d.get("action_required") and not d.get("bad_stop_event")]
+    divergence = audit.get("divergence") if isinstance(audit.get("divergence"), dict) else {}
+    if unacked_failures:
+        status = "BLOCKED_UNACKED_LIVE_FAILURE"
+        ok = False
+    elif not audit.get("ok"):
+        status = "BLOCKED_BY_FALCON_AUDIT"
+        ok = False
+    elif active_or_tracking:
+        status = "LIVE_ORDER_TRACKING_REQUIRED"
+        ok = True
+    elif historical_acked and not active_or_tracking:
+        status = "OK_HISTORICAL_ACKED_ONLY"
+        ok = True
+    else:
+        status = "OK_AWAITING_FIRST_REAL_ORDER"
+        ok = True
+    payload = {
+        "ok": ok,
+        "status": status,
+        "module": "falcon_live_order_audit_detail_v1",
+        "version": FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION,
+        "generated_at": _flad_v1_now(),
+        "no_order_sent_by_this_route": True,
+        "sent": False,
+        "would_send_order": False,
+        "rearm_executed": False,
+        "summary": {
+            "falcon_live_order_events": len(details),
+            "historical_acked_failures": len(historical_acked),
+            "unacked_failures": len(unacked_failures),
+            "active_or_tracking_orders": len(active_or_tracking),
+            "audit_status": audit.get("live_audit_status"),
+            "audit_ok": audit.get("ok"),
+            "bingx_open_count": divergence.get("broker_bingx_open_count"),
+            "central_live_count": divergence.get("central_live_count"),
+            "only_bingx_count": divergence.get("only_bingx_count"),
+            "only_central_count": divergence.get("only_central_count"),
+            "live_without_stop_count": divergence.get("live_without_stop_count"),
+        },
+        "latest_order_detail": details[-1] if details else None,
+        "orders": details[-20:],
+        "audit_snapshot": {
+            "live_audit_status": audit.get("live_audit_status"),
+            "ok": audit.get("ok"),
+            "reasons": audit.get("reasons"),
+            "warnings": audit.get("warnings"),
+            "bad_execution_events_acked_count": audit.get("bad_execution_events_acked_count"),
+            "bad_execution_events_unacked_count": audit.get("bad_execution_events_unacked_count"),
+            "ack_recheck_status": audit.get("ack_recheck_status"),
+            "semantic_dedup_active": audit.get("semantic_dedup_active"),
+        },
+        "files": {
+            "latest": str(FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE),
+            "events": str(FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_EVENTS_FILE),
+        },
+        "notes": [
+            "Esta rota é somente leitura: não envia ordem, não cria stop e não altera ENV.",
+            "Eventos LIVE_SENT antigos com disaster stop falhado podem aparecer como HISTORICAL_ACKED_FAILURE quando já reconhecidos pelo Falcon Audit.",
+            "Evento novo LIVE_SENT sem ACK histórico deve ser acompanhado em /live, /sync, /brokerhealth e /falcon/liveaudit/text.",
+        ],
+        "token_value_exposed": False,
+    }
+    _flad_v1_write_snapshot(FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE, payload)
+    _flad_v1_append_event(FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_EVENTS_FILE, {"event": "FALCON_LIVE_ORDER_AUDIT_DETAIL_SNAPSHOT", "status": status, "summary": payload.get("summary"), "generated_at": payload.get("generated_at")})
+    return _flad_v1_public(payload)
+
+
+def _flad_v1_text(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    lines = [
+        "🔎 FALCON LIVE ORDER AUDIT DETAIL V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Segurança:",
+        f"- no_order_sent_by_this_route: {payload.get('no_order_sent_by_this_route')}",
+        f"- sent: {payload.get('sent')}",
+        f"- would_send_order: {payload.get('would_send_order')}",
+        f"- rearm_executed: {payload.get('rearm_executed')}",
+        "",
+        "Resumo:",
+        f"- Eventos Falcon LIVE_SENT lidos: {summary.get('falcon_live_order_events')}",
+        f"- Falhas históricas reconhecidas por ACK: {summary.get('historical_acked_failures')}",
+        f"- Falhas ainda não reconhecidas: {summary.get('unacked_failures')}",
+        f"- Ordens reais novas/ativas para acompanhar: {summary.get('active_or_tracking_orders')}",
+        f"- Falcon audit: {summary.get('audit_status')} | ok={summary.get('audit_ok')}",
+        f"- BingX abertas: {summary.get('bingx_open_count')} | Central LIVE: {summary.get('central_live_count')}",
+        f"- Só BingX: {summary.get('only_bingx_count')} | Só Central: {summary.get('only_central_count')} | LIVE sem stop: {summary.get('live_without_stop_count')}",
+        "",
+        "Últimas ordens reais Falcon:",
+    ]
+    orders = payload.get("orders") or []
+    if not orders:
+        lines.append("- Nenhuma ordem real Falcon encontrada nos logs auditados.")
+    else:
+        for d in orders[-8:]:
+            if not isinstance(d, dict):
+                continue
+            icon = "🟡" if d.get("historical_acked") else ("🛑" if d.get("bad_stop_event") else "🔴")
+            lines.append(
+                f"- {icon} {d.get('ts') or d.get('generated_at')} | {d.get('review_status')} | "
+                f"{d.get('symbol')} {d.get('side')} | status={d.get('status')} | "
+                f"order={d.get('order_id')} | client={d.get('client_order_id')}"
+            )
+            ds = d.get("disaster_stop") if isinstance(d.get("disaster_stop"), dict) else {}
+            lines.append(f"  disaster_stop: status={ds.get('status')} | created={ds.get('created')} | failed={ds.get('failed')} | error={ds.get('error')}")
+    if payload.get("audit_snapshot"):
+        a = payload.get("audit_snapshot") or {}
+        lines += [
+            "",
+            "Falcon Audit snapshot:",
+            f"- bad acked: {a.get('bad_execution_events_acked_count')} | bad unacked: {a.get('bad_execution_events_unacked_count')} | ACK recheck: {a.get('ack_recheck_status')}",
+        ]
+    lines += [
+        "",
+        "Leitura executiva:",
+    ]
+    if payload.get("status") == "OK_AWAITING_FIRST_REAL_ORDER":
+        lines.append("✅ Falcon está armado/monitorável, mas ainda não há ordem real nova para auditar.")
+    elif payload.get("status") == "OK_HISTORICAL_ACKED_ONLY":
+        lines.append("✅ Só há falha histórica já reconhecida por ACK; não há bloqueio operacional novo.")
+    elif payload.get("status") == "LIVE_ORDER_TRACKING_REQUIRED":
+        lines.append("⚠️ Há ordem real que precisa ser acompanhada com /live, /sync, /brokerhealth e /falcon/liveaudit/text.")
+    else:
+        lines.append("🛑 Há falha real não reconhecida ou bloqueio do Falcon Audit; não abrir novas entradas.")
+    lines += [
+        "",
+        "Arquivos:",
+        f"- Último snapshot: {payload.get('files', {}).get('latest')}",
+        f"- Eventos: {payload.get('files', {}).get('events')}",
+    ]
+    return "\n".join(lines)
+
+
+@app.route("/falcon/liveorder/detail", methods=["GET"])
+@app.route("/falcon/live/order/detail", methods=["GET"])
+@app.route("/falcon/liveorderaudit", methods=["GET"])
+def falcon_live_order_audit_detail_v1_route():
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except Exception:
+        limit = 100
+    limit = max(20, min(limit, 500))
+    return _flad_v1_build_payload(limit=limit), 200
+
+
+@app.route("/falcon/liveorder/detail/text", methods=["GET"])
+@app.route("/falcon/live/order/detail/text", methods=["GET"])
+@app.route("/falcon/liveorderaudit/text", methods=["GET"])
+def falcon_live_order_audit_detail_v1_text_route():
+    try:
+        limit = int(request.args.get("limit", "100"))
+    except Exception:
+        limit = 100
+    limit = max(20, min(limit, 500))
+    payload = _flad_v1_build_payload(limit=limit)
+    return _flad_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ----------------------------------------------------------------------------
+# Manual Position Awareness V1
+# ----------------------------------------------------------------------------
+
+def _mpa_v1_position_key(p):
+    p = p if isinstance(p, dict) else {}
+    return (_flad_v1_norm_symbol(p.get("symbol") or p.get("market_symbol") or p.get("ativo") or p.get("pair")), _flad_v1_norm_side(p.get("side") or p.get("direction") or p.get("position_side") or p.get("positionSide")))
+
+
+def _mpa_v1_build_payload():
+    broker_positions, broker_err = ([], None)
+    central_live = []
+    try:
+        broker_positions, broker_err = _broker_open_positions() if callable(globals().get("_broker_open_positions")) else ([], "_broker_open_positions missing")
+    except Exception as exc:
+        broker_positions, broker_err = [], str(exc)
+    try:
+        central_live = _central_live_positions_payload() if callable(globals().get("_central_live_positions_payload")) else []
+    except Exception:
+        central_live = []
+    central_by_key = {}
+    for p in central_live or []:
+        if not isinstance(p, dict):
+            continue
+        central_by_key.setdefault(_mpa_v1_position_key(p), []).append(p)
+    broker_by_key = {}
+    for p in broker_positions or []:
+        if not isinstance(p, dict):
+            continue
+        broker_by_key.setdefault(_mpa_v1_position_key(p), []).append(p)
+
+    rows = []
+    manual_or_external = []
+    matched = []
+    central_only = []
+    for key, bps in broker_by_key.items():
+        cps = central_by_key.get(key) or []
+        for bp in bps:
+            row = {
+                "classification": "CENTRAL_LIVE_MATCHED" if cps else "MANUAL_OR_EXTERNAL_POSITION",
+                "symbol": key[0],
+                "side": key[1],
+                "source": "BINGX",
+                "broker_position": _flad_v1_public(bp),
+                "central_matches": _flad_v1_public(cps),
+                "action": "MONITOR_AS_CENTRAL_TRADE" if cps else "DO_NOT_ATTACH_TO_BOT_AUTOMATICALLY",
+                "notes": [
+                    "Posição existe na BingX e corresponde a LIVE da Central." if cps else "Posição existe na BingX sem LIVE correspondente na Central; tratar como manual/externa até prova contrária."
+                ],
+            }
+            rows.append(row)
+            (matched if cps else manual_or_external).append(row)
+    for key, cps in central_by_key.items():
+        if key in broker_by_key:
+            continue
+        for cp in cps:
+            row = {
+                "classification": "CENTRAL_ONLY_POSITION",
+                "symbol": key[0],
+                "side": key[1],
+                "source": "CENTRAL",
+                "central_position": _flad_v1_public(cp),
+                "action": "RECONCILE_BEFORE_NEW_LIVE_TRADE",
+                "notes": ["Central tem LIVE sem posição correspondente na BingX."],
+            }
+            rows.append(row)
+            central_only.append(row)
+    if broker_err:
+        status = "BROKER_POSITION_READ_ERROR"
+        ok = False
+    elif manual_or_external:
+        status = "MANUAL_OR_EXTERNAL_POSITION_PRESENT"
+        ok = True
+    elif central_only:
+        status = "CENTRAL_ONLY_RECONCILE_REQUIRED"
+        ok = False
+    elif matched:
+        status = "CENTRAL_LIVE_MATCHED"
+        ok = True
+    else:
+        status = "NO_OPEN_POSITIONS"
+        ok = True
+    payload = {
+        "ok": ok,
+        "status": status,
+        "module": "manual_position_awareness_v1",
+        "version": MANUAL_POSITION_AWARENESS_V1_VERSION,
+        "generated_at": _flad_v1_now(),
+        "no_order_sent_by_this_route": True,
+        "sent": False,
+        "would_send_order": False,
+        "summary": {
+            "broker_bingx_open_count": len(broker_positions or []),
+            "central_live_count": len(central_live or []),
+            "matched_count": len(matched),
+            "manual_or_external_count": len(manual_or_external),
+            "central_only_count": len(central_only),
+            "broker_error": broker_err,
+        },
+        "manual_or_external_positions": manual_or_external,
+        "matched_positions": matched,
+        "central_only_positions": central_only,
+        "all_rows": rows,
+        "files": {
+            "latest": str(MANUAL_POSITION_AWARENESS_V1_LATEST_FILE),
+            "events": str(MANUAL_POSITION_AWARENESS_V1_EVENTS_FILE),
+        },
+        "notes": [
+            "Esta rota é somente awareness: não fecha, não registra e não atribui posição manual a robô automaticamente.",
+            "Posição só na BingX deve ser tratada como manual/externa até haver metadata segura que prove origem da Central.",
+            "Serve para evitar que posição manual do usuário seja confundida com posição Falcon/robô.",
+        ],
+        "token_value_exposed": False,
+    }
+    _flad_v1_write_snapshot(MANUAL_POSITION_AWARENESS_V1_LATEST_FILE, payload)
+    _flad_v1_append_event(MANUAL_POSITION_AWARENESS_V1_EVENTS_FILE, {"event": "MANUAL_POSITION_AWARENESS_SNAPSHOT", "status": status, "summary": payload.get("summary"), "generated_at": payload.get("generated_at")})
+    return _flad_v1_public(payload)
+
+
+def _mpa_v1_text(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    s = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    lines = [
+        "🧭 MANUAL POSITION AWARENESS V1 — CENTRAL QUANT",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
+        f"Versão: {payload.get('version')}",
+        "",
+        "Segurança:",
+        f"- no_order_sent_by_this_route: {payload.get('no_order_sent_by_this_route')}",
+        f"- sent: {payload.get('sent')}",
+        f"- would_send_order: {payload.get('would_send_order')}",
+        "",
+        "Resumo:",
+        f"- BingX abertas: {s.get('broker_bingx_open_count')}",
+        f"- Central LIVE: {s.get('central_live_count')}",
+        f"- Casadas Central x BingX: {s.get('matched_count')}",
+        f"- Manuais/externas: {s.get('manual_or_external_count')}",
+        f"- Só na Central: {s.get('central_only_count')}",
+    ]
+    if s.get("broker_error"):
+        lines.append(f"- Erro broker: {s.get('broker_error')}")
+    lines += ["", "Posições manuais/externas:"]
+    manual = payload.get("manual_or_external_positions") or []
+    if not manual:
+        lines.append("- Nenhuma posição manual/externa detectada na BingX.")
+    else:
+        for row in manual:
+            bp = row.get("broker_position") if isinstance(row.get("broker_position"), dict) else {}
+            lines.append(
+                f"- ⚠️ {row.get('symbol')} {row.get('side')} | contracts={bp.get('contracts')} | "
+                f"notional={bp.get('notional')} | entry={bp.get('entry_price')} | uPnL={bp.get('unrealized_pnl')}"
+            )
+    lines += ["", "Casadas Central x BingX:"]
+    matched = payload.get("matched_positions") or []
+    if not matched:
+        lines.append("- Nenhuma posição LIVE casada no momento.")
+    else:
+        for row in matched:
+            lines.append(f"- ✅ {row.get('symbol')} {row.get('side')} | origem=Central/BingX casada")
+    central_only = payload.get("central_only_positions") or []
+    if central_only:
+        lines += ["", "Só na Central:"]
+        for row in central_only:
+            lines.append(f"- ❌ {row.get('symbol')} {row.get('side')} | reconciliar antes de nova entrada LIVE")
+    lines += [
+        "",
+        "Leitura executiva:",
+    ]
+    if payload.get("status") == "NO_OPEN_POSITIONS":
+        lines.append("✅ Não há posição aberta; nenhuma posição manual precisa ser isolada agora.")
+    elif payload.get("status") == "MANUAL_OR_EXTERNAL_POSITION_PRESENT":
+        lines.append("⚠️ Existe posição na BingX sem Central LIVE; não atribuir a robô automaticamente.")
+    elif payload.get("status") == "CENTRAL_LIVE_MATCHED":
+        lines.append("✅ Posições abertas estão casadas entre Central e BingX.")
+    else:
+        lines.append("🛑 Há divergência de posição; reconciliar antes de ampliar LIVE.")
+    lines += [
+        "",
+        "Arquivos:",
+        f"- Último snapshot: {payload.get('files', {}).get('latest')}",
+        f"- Eventos: {payload.get('files', {}).get('events')}",
+    ]
+    return "\n".join(lines)
+
+
+@app.route("/manualpositions", methods=["GET"])
+@app.route("/manual/positions", methods=["GET"])
+@app.route("/positions/manual", methods=["GET"])
+@app.route("/manualpositionawareness", methods=["GET"])
+def manual_position_awareness_v1_route():
+    return _mpa_v1_build_payload(), 200
+
+
+@app.route("/manualpositions/text", methods=["GET"])
+@app.route("/manual/positions/text", methods=["GET"])
+@app.route("/positions/manual/text", methods=["GET"])
+@app.route("/manualpositionawareness/text", methods=["GET"])
+def manual_position_awareness_v1_text_route():
+    payload = _mpa_v1_build_payload()
+    return _mpa_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ----------------------------------------------------------------------------
+# LIVE Status V1.2 — Historical ACK Awareness
+# ----------------------------------------------------------------------------
+
+def _live_v12_classify_event(e, audit_payload=None):
+    try:
+        base = _live_v11_classify_event(e) if callable(globals().get("_live_v11_classify_event")) else {}
+    except Exception:
+        base = {}
+    if not isinstance(base, dict):
+        base = {}
+    if not _flad_v1_is_live_sent(e):
+        return base or {"class_code": "UNKNOWN", "label": "⚪ UNKNOWN", "safe": True, "historical_acked": False}
+    bad_stop = _flad_v1_is_bad_stop_event(e)
+    acked_history = bool(bad_stop and _flad_v1_bad_event_acked(e, audit_payload=audit_payload))
+    out = dict(base)
+    out["safe"] = False
+    out["bot"] = _flad_v1_infer_bot(e)
+    out["mode"] = "LIVE"
+    out["bad_stop_event"] = bad_stop
+    out["historical_acked"] = acked_history
+    if acked_history:
+        out.update({
+            "class_code": "LIVE_SENT_ACKED_HISTORY",
+            "label": "🟡 LIVE_SENT_HISTÓRICO_ACK",
+            "safe_operationally_cleared": True,
+            "reason": "evento real antigo com falha reconhecida por ACK e limpo no Falcon Audit",
+        })
+    elif bad_stop:
+        out.update({
+            "class_code": "LIVE_SENT_UNACKED_FAILURE",
+            "label": "🛑 LIVE_SENT_FALHA_NÃO_ACK",
+            "safe_operationally_cleared": False,
+            "reason": "evento real com falha de disaster stop não reconhecida/limpa",
+        })
+    else:
+        out.update({
+            "class_code": "LIVE_SENT_REAL_TRACKING",
+            "label": "🔴 LIVE_SENT_REAL",
+            "safe_operationally_cleared": False,
+            "reason": "ordem real enviada; acompanhar stop, registry, sync e Telegram",
+        })
+    return out
+
+
+def _live_v12_summarize_classes(items, audit_payload=None):
+    summary = {}
+    for e in items or []:
+        c = _live_v12_classify_event(e, audit_payload=audit_payload)
+        code = c.get("class_code", "UNKNOWN")
+        summary[code] = int(summary.get(code, 0) or 0) + 1
+    return summary
+
+
+def _live_v12_format_event_line(e, audit_payload=None):
+    if not isinstance(e, dict):
+        return f"- {e}"
+    c = _live_v12_classify_event(e, audit_payload=audit_payload)
+    tag = _flad_v1_event_tag(e)
+    tag_part = f" | tag={tag}" if tag else ""
+    status = e.get("status") or e.get("event") or "UNKNOWN"
+    order_id = e.get("order_id") or e.get("id") or "None"
+    return (
+        f"- {e.get('ts')} | {c.get('label')} | bot={c.get('bot')} | mode={c.get('mode')} | "
+        f"status={status} | sent={e.get('sent')} | {e.get('symbol')} {e.get('side')} | id={order_id}{tag_part}"
+    )
+
+
+def build_live_report():
+    """LIVE STATUS V1.2 — diferencia histórico ACK de evento LIVE novo/ativo."""
+    ready = bingx_ready_payload() if BINGX_READY_CHECK_ENABLED else {"ok": None, "status": "READY_CHECK_DISABLED"}
+    balance = (ready.get("balance") or {}) if isinstance(ready, dict) else {}
+    broker_positions, pos_err = _broker_open_positions()
+    central_live = _central_live_positions_payload()
+    exec_items, exec_err = _execution_log_items(limit=50)
+    shown_items = (exec_items or [])[-8:]
+    try:
+        audit_payload = falcon_live_execution_audit_guard_v1_status(include_recent=False)
+    except Exception as exc:
+        audit_payload = {"ok": False, "live_audit_status": "AUDIT_READ_ERROR", "error": str(exc)}
+    try:
+        order_detail = _flad_v1_build_payload(limit=100)
+    except Exception as exc:
+        order_detail = {"ok": False, "status": "ORDER_DETAIL_ERROR", "error": str(exc), "summary": {}}
+    try:
+        manual_awareness = _mpa_v1_build_payload()
+    except Exception as exc:
+        manual_awareness = {"ok": False, "status": "MANUAL_AWARENESS_ERROR", "error": str(exc), "summary": {}}
+    class_summary = _live_v12_summarize_classes(exec_items or [], audit_payload=audit_payload)
+    safe_count = 0
+    live_sent_active_or_unacked = 0
+    live_sent_historical_acked = 0
+    for e in exec_items or []:
+        c = _live_v12_classify_event(e, audit_payload=audit_payload)
+        if c.get("safe"):
+            safe_count += 1
+        elif c.get("class_code") == "LIVE_SENT_ACKED_HISTORY":
+            live_sent_historical_acked += 1
+        else:
+            live_sent_active_or_unacked += 1
+
+    lines = [
+        "🟢 LIVE STATUS — CENTRAL QUANT / BINGX V1.2",
+        f"Data/hora: {data_hora_sp_str()}",
+        "",
+        f"Execution mode: {EXECUTION_MODE}",
+        f"ENABLE_REAL_TRADING: {ENABLE_REAL_TRADING}",
+        f"BROKER_DRY_RUN: {os.environ.get('BROKER_DRY_RUN', 'N/A')}",
+        f"Broker READY: {ready.get('ok')} | {ready.get('status')}",
+        f"Falcon audit: {audit_payload.get('live_audit_status')} | ok={audit_payload.get('ok')}",
+    ]
+    if ready.get("error"):
+        lines.append(f"Erro READY: {ready.get('error')}")
+    if balance:
+        lines.append(f"Saldo USDT total/free/used: {balance.get('total_usdt')} / {balance.get('free_usdt')} / {balance.get('used_usdt')}")
+
+    lines += ["", "POSIÇÕES BINGX"]
+    if pos_err:
+        lines.append(f"Erro ao ler posições: {pos_err}")
+    elif not broker_positions:
+        lines.append("Nenhuma posição aberta na BingX.")
+    else:
+        for p in broker_positions[:30]:
+            lines.append(
+                f"- {p.get('symbol')} {p.get('side')} | contracts={p.get('contracts')} | "
+                f"notional={p.get('notional')} | entry={p.get('entry_price')} | uPnL={p.get('unrealized_pnl')} | lev={p.get('leverage')}"
+            )
+
+    lines += ["", "POSIÇÕES LIVE REGISTRADAS NA CENTRAL"]
+    if not central_live:
+        lines.append("Nenhuma posição LIVE registrada na Central.")
+    else:
+        for p in central_live[:30]:
+            lines.append(f"- {p.get('bot')} {p.get('symbol')} {p.get('side')} {p.get('setup')} | order={p.get('order_id')}")
+
+    msum = manual_awareness.get("summary") if isinstance(manual_awareness.get("summary"), dict) else {}
+    lines += [
+        "",
+        "MANUAL POSITION AWARENESS",
+        f"Status: {manual_awareness.get('status')}",
+        f"- Manuais/externas: {msum.get('manual_or_external_count')}",
+        f"- Casadas Central x BingX: {msum.get('matched_count')}",
+        f"- Só na Central: {msum.get('central_only_count')}",
+    ]
+    for row in (manual_awareness.get("manual_or_external_positions") or [])[:5]:
+        bp = row.get("broker_position") if isinstance(row.get("broker_position"), dict) else {}
+        lines.append(f"  ⚠️ Manual/externa: {row.get('symbol')} {row.get('side')} | notional={bp.get('notional')} | entry={bp.get('entry_price')}")
+
+    lines += ["", "CLASSIFICAÇÃO DAS ÚLTIMAS EXECUÇÕES"]
+    if not exec_err and exec_items:
+        lines.append(
+            f"Eventos lidos: {len(exec_items)} | seguros/sem envio: {safe_count} | "
+            f"LIVE histórico ACK: {live_sent_historical_acked} | LIVE novo/ativo/não ACK: {live_sent_active_or_unacked}"
+        )
+        if class_summary:
+            compact = ", ".join([f"{k}={v}" for k, v in sorted(class_summary.items())])
+            lines.append(f"Resumo: {compact}")
+    elif exec_err:
+        lines.append(f"Erro ao classificar log: {exec_err}")
+    else:
+        lines.append("Nenhum evento de execução para classificar.")
+
+    odsum = order_detail.get("summary") if isinstance(order_detail.get("summary"), dict) else {}
+    lines += [
+        "",
+        "FALCON LIVE ORDER DETAIL",
+        f"Status: {order_detail.get('status')}",
+        f"- Falhas históricas ACK: {odsum.get('historical_acked_failures')}",
+        f"- Falhas não ACK: {odsum.get('unacked_failures')}",
+        f"- Ordens reais novas/ativas p/ acompanhar: {odsum.get('active_or_tracking_orders')}",
+    ]
+
+    lines += ["", "ÚLTIMAS EXECUÇÕES"]
+    if exec_err:
+        lines.append(f"Erro ao ler log: {exec_err}")
+    elif not shown_items:
+        lines.append("Nenhum evento registrado ainda.")
+    else:
+        for e in shown_items:
+            lines.append(_live_v12_format_event_line(e, audit_payload=audit_payload))
+
+    lines += ["", "LEITURA EXECUTIVA"]
+    if not broker_positions and not central_live and ENABLE_REAL_TRADING:
+        lines.append("✅ Piloto real armado, sem posição aberta na BingX e sem LIVE registrada na Central.")
+    elif not broker_positions and not central_live and not ENABLE_REAL_TRADING:
+        lines.append("✅ Sem posição real na BingX, sem LIVE registrada e execução real desarmada.")
+    if class_summary.get("FALCON_VERIFY_AUTHORIZED"):
+        lines.append("🧪 Eventos Falcon em VERIFY são validações autorizadas de payload/ready, sem envio real.")
+    if live_sent_historical_acked:
+        lines.append("🟡 Há LIVE_SENT histórico já reconhecido por ACK; não é bloqueio novo enquanto Falcon Audit continuar CLEAR.")
+    if live_sent_active_or_unacked:
+        lines.append("🔴 Há LIVE_SENT novo/ativo ou falha não reconhecida; acompanhar imediatamente com /falcon/liveorder/detail/text e /falcon/liveaudit/text.")
+    if manual_awareness.get("status") == "MANUAL_OR_EXTERNAL_POSITION_PRESENT":
+        lines.append("⚠️ Há posição manual/externa na BingX; não atribuir automaticamente a robô.")
+    if audit_payload.get("live_audit_status") in {"OK_ACKED_HISTORY_CLEAR", "OK"} and not live_sent_active_or_unacked:
+        lines.append("✅ Falcon Audit limpo: nenhuma falha LIVE nova não reconhecida.")
+
+    snapshot = {
+        "ok": True,
+        "module": "live_status_v1_2_historical_ack_awareness",
+        "version": LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION,
+        "generated_at": _flad_v1_now(),
+        "summary": {
+            "safe_count": safe_count,
+            "live_sent_historical_acked": live_sent_historical_acked,
+            "live_sent_active_or_unacked": live_sent_active_or_unacked,
+            "broker_bingx_open_count": len(broker_positions or []),
+            "central_live_count": len(central_live or []),
+            "manual_awareness_status": manual_awareness.get("status"),
+            "falcon_order_detail_status": order_detail.get("status"),
+            "falcon_audit_status": audit_payload.get("live_audit_status"),
+        },
+        "token_value_exposed": False,
+    }
+    _flad_v1_write_snapshot(LIVE_STATUS_V12_LATEST_FILE, snapshot)
+    return "\n".join(lines)
+
+
+@app.route("/live/status/v12", methods=["GET"])
+@app.route("/live/v12", methods=["GET"])
+def live_status_v12_route():
+    return {"text": build_live_report(), "version": LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION}, 200
+
+
+
+# ==============================================================================
+# PATCH 2026-07-11 — DISASTER STOP CLOSE-POSITION PREVIEW ROUTE V1
+# ==============================================================================
+@app.route("/falcon/disasterstop/closeposition/preview", methods=["GET"])
+@app.route("/falcon/disasterstop/closeposition/preview/text", methods=["GET"])
+def falcon_disaster_stop_close_position_preview_route():
+    symbol = request.args.get("symbol", "BTCUSDT")
+    side = request.args.get("side", "SHORT")
+    stop = request.args.get("stop") or request.args.get("sl") or "0"
+    entry = request.args.get("entry")
+    if central_broker is None or not hasattr(central_broker, "build_disaster_stop_close_position_preview"):
+        text = "🧪 DISASTER STOP CLOSE-POSITION PREVIEW\nStatus: ❌\nBroker/helper indisponível."
+        return {"ok": False, "text": text, "error": BROKER_IMPORT_ERROR or "helper missing"}, 500
+    payload = central_broker.build_disaster_stop_close_position_preview(symbol=symbol, side=side, stop_loss_price=stop, entry_price=entry, client_tag="FALCON-CP-PREVIEW")
+    lines = [
+        "🧪 DISASTER STOP CLOSE-POSITION PREVIEW — FALCON",
+        f"Data/hora: {data_hora_sp_str()}",
+        f"Status: {'✅' if payload.get('ok') else '❌'}",
+        f"Versão: {payload.get('version')}",
+        "",
+        f"Symbol: {payload.get('symbol')}",
+        f"Side fechamento: {payload.get('side')} | positionSide: {payload.get('position_side')}",
+        f"Stop: {payload.get('stop_price')}",
+        "",
+        "Payload preview:",
+        json.dumps(payload.get('payload_preview'), ensure_ascii=False, indent=2),
+        "",
+        "Observação: preview não envia ordem e não prova aceitação real da BingX.",
+    ]
+    payload["text"] = "\n".join(lines)
+    return payload, 200
 
 
 if __name__ == "__main__":

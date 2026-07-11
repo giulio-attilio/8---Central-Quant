@@ -1110,3 +1110,36 @@ def read_execution_engine_log(limit: int = 20) -> Dict[str, Any]:
         "items": items,
     }
 
+
+
+# ==============================================================================
+# PATCH 2026-07-11 — EXECUTION ENGINE PARTIAL-CAPABLE GUARD V1
+# ==============================================================================
+EXECUTION_ENGINE_PARTIAL_CAPABLE_GUARD_VERSION = "2026-07-11-EXECUTION-ENGINE-PARTIAL-CAPABLE-GUARD-V1"
+EXECUTION_ENGINE_REQUIRE_PARTIAL_CAPABLE_FOR_FALCON = os.getenv("EXECUTION_ENGINE_REQUIRE_PARTIAL_CAPABLE_FOR_FALCON", "true").strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+try:
+    _ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711 = validate_real_pilot_guard
+except Exception:
+    _ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711 = None
+
+
+def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry_run: bool = True) -> Dict[str, Any]:  # type: ignore[override]
+    result = _ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711(payload, plan, dry_run=dry_run) if callable(_ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711) else {"ok": False, "allowed": False, "reasons": ["validate_real_pilot_guard original indisponível"]}
+    try:
+        trade = result.get("trade") if isinstance(result, dict) else {}
+        bot = str((trade or {}).get("bot") or "").upper()
+        symbol = (trade or {}).get("symbol")
+        notional = _safe_float((trade or {}).get("notional_usdt"), None)
+        if bot == "FALCON" and EXECUTION_ENGINE_REQUIRE_PARTIAL_CAPABLE_FOR_FALCON and central_broker is not None and hasattr(central_broker, "partial_capability_from_notional"):
+            partial = central_broker.partial_capability_from_notional(symbol, notional, max_notional_usdt=REAL_PILOT_MAX_NOTIONAL_USDT, min_parts=2)
+            result.setdefault("partial_capable_guard", partial)
+            if not partial.get("partial_capable"):
+                result.setdefault("reasons", []).append("Falcon LIVE exige posição >= 2x minQty para TP50 real")
+                result["allowed"] = False
+                result["ok"] = False
+                result["status"] = "REAL_PILOT_BLOCKED_PARTIAL_NOT_CAPABLE"
+        result.setdefault("partial_capable_guard_version", EXECUTION_ENGINE_PARTIAL_CAPABLE_GUARD_VERSION)
+    except Exception as exc:
+        result.setdefault("warnings", []).append(f"partial_capable_guard_error: {exc}")
+    return result

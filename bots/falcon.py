@@ -1309,7 +1309,9 @@ def central_can_open_trade(sig, positions=None):
         "mode": FALCON_MODE,
         "intended_live": FALCON_MODE == "LIVE",
         "risk_pct": sig.get("risk_pct"),
-        "notional_usdt": FALCON_REAL_NOTIONAL_USDT,
+        # Usa o notional já resolvido no sinal.
+        # Não depende de variável local externa a esta função.
+        "notional_usdt": safe_float(sig.get("real_notional_usdt"), FALCON_REAL_NOTIONAL_USDT),
         "entry": sig.get("entry"),
         "stop": sig.get("stop"),
         "tp50": sig.get("tp50"),
@@ -1324,6 +1326,109 @@ def central_can_open_trade(sig, positions=None):
         return {"allowed": False, "decision": "DENY", "reasons": [f"central indisponível: {exc}"]}
 
 
+
+# ==============================================================================
+# PATCH 2026-07-11 — FALCON LIVE PARTIAL-CAPABLE SIZING / TP50 REAL V1
+# ==============================================================================
+FALCON_LIVE_PARTIAL_CAPABLE_SIZING_VERSION = "2026-07-11-FALCON-LIVE-PARTIAL-CAPABLE-SIZING-V1"
+FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION = "2026-07-11-FALCON-TP50-REAL-EXECUTION-AUDIT-V1"
+FALCON_REQUIRE_REAL_TP50_CAPABLE = str(os.environ.get("FALCON_REQUIRE_REAL_TP50_CAPABLE", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+FALCON_REAL_MAX_NOTIONAL_USDT = float(os.environ.get("FALCON_REAL_MAX_NOTIONAL_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "20")))
+FALCON_PARTIAL_MIN_PARTS = int(os.environ.get("FALCON_PARTIAL_MIN_PARTS", "2"))
+
+
+def falcon_resolve_partial_capable_notional(sig):
+    """Garante que o próximo LIVE tenha quantidade suficiente para TP50 real."""
+    planned = safe_float(sig.get("real_notional_usdt"), FALCON_REAL_NOTIONAL_USDT)
+    result = {
+        "ok": True,
+        "allowed": True,
+        "version": FALCON_LIVE_PARTIAL_CAPABLE_SIZING_VERSION,
+        "symbol": sig.get("symbol"),
+        "planned_notional_usdt": planned,
+        "notional_usdt": planned,
+        "require_real_tp50_capable": FALCON_REQUIRE_REAL_TP50_CAPABLE,
+        "max_notional_usdt": FALCON_REAL_MAX_NOTIONAL_USDT,
+        "status": "NOT_CHECKED",
+    }
+    if central_broker is None or not hasattr(central_broker, "ensure_partial_capable_notional"):
+        result.update({"ok": not FALCON_REQUIRE_REAL_TP50_CAPABLE, "allowed": not FALCON_REQUIRE_REAL_TP50_CAPABLE, "status": "BROKER_PARTIAL_HELPER_MISSING", "error": BROKER_IMPORT_ERROR})
+        return result
+    try:
+        audit = central_broker.ensure_partial_capable_notional(
+            symbol=sig.get("symbol"),
+            planned_notional_usdt=planned,
+            max_notional_usdt=FALCON_REAL_MAX_NOTIONAL_USDT,
+            min_parts=FALCON_PARTIAL_MIN_PARTS,
+        )
+        result.update(audit if isinstance(audit, dict) else {})
+        result["allowed"] = bool((not FALCON_REQUIRE_REAL_TP50_CAPABLE) or result.get("allowed") or result.get("partial_capable"))
+        if result.get("allowed") and result.get("notional_usdt"):
+            sig["real_notional_usdt"] = float(result.get("notional_usdt"))
+        return result
+    except Exception as exc:
+        result.update({"ok": False, "allowed": not FALCON_REQUIRE_REAL_TP50_CAPABLE, "status": "PARTIAL_CAPABLE_SIZING_ERROR", "error": str(exc)})
+        return result
+
+
+def falcon_try_execute_tp50_real_partial(pos, price):
+    """
+    No LIVE, tenta executar TP50 real parcial apenas se a posição comportar minQty.
+    Em PAPER/VERIFY/sem ordem real, registra TP50 virtual sem enviar ordem.
+    """
+    result = {
+        "ok": True,
+        "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+        "status": "TP50_VIRTUAL_ONLY",
+        "sent": False,
+        "symbol": pos.get("symbol"),
+        "side": pos.get("side"),
+        "price": price,
+        "reason": "not_live_or_no_real_order",
+    }
+    live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+    amount = safe_float(pos.get("qty"), None)
+    if amount is None or amount <= 0:
+        amount = safe_float(live_order.get("amount"), None)
+    has_real_order = bool(pos.get("live_order_id") or pos.get("bingx_order_id") or live_order.get("sent"))
+
+    if FALCON_MODE != "LIVE" or not ENABLE_REAL_TRADING or not has_real_order:
+        return result
+    if central_broker is None or not hasattr(central_broker, "tp50_partial_amount") or not hasattr(central_broker, "close_position_market"):
+        result.update({"ok": False, "status": "TP50_REAL_HELPER_MISSING", "reason": BROKER_IMPORT_ERROR or "broker helper missing"})
+        return result
+
+    try:
+        partial = central_broker.tp50_partial_amount(pos.get("symbol"), amount)
+        result["partial_audit"] = partial
+        if not partial.get("ok"):
+            result.update({"ok": True, "status": "TP50_VIRTUAL_ONLY_MIN_QTY", "reason": "posição não comporta parcial mínima"})
+            return result
+        close_amount = partial.get("tp50_amount")
+        client_tag = f"FALCON-TP50-{str(pos.get('setup') or 'FALCON')}-{int(time.time())}"
+        order = central_broker.close_position_market(
+            symbol=pos.get("symbol"),
+            side=pos.get("side"),
+            amount=close_amount,
+            client_tag=client_tag,
+            reason="TP50_REAL_PARTIAL",
+        )
+        result.update({
+            "ok": bool(order.get("ok")),
+            "status": "TP50_REAL_SENT" if order.get("sent") else order.get("status", "TP50_REAL_DRY_RUN"),
+            "sent": bool(order.get("sent")),
+            "tp50_amount": close_amount,
+            "runner_amount": partial.get("runner_amount"),
+            "client_tag": client_tag,
+            "order": order,
+            "reason": "real_partial_attempted",
+        })
+        return result
+    except Exception as exc:
+        result.update({"ok": False, "status": "TP50_REAL_ERROR", "error": str(exc), "reason": "exception"})
+        return result
+
+
 def execute_signal_if_allowed(sig, positions=None):
     """
     Decide e, se estiver LIVE, envia ordem real à BingX via broker.py.
@@ -1336,6 +1441,15 @@ def execute_signal_if_allowed(sig, positions=None):
     mode = FALCON_MODE
     sig["execution_mode"] = mode
     sig["real_notional_usdt"] = FALCON_REAL_NOTIONAL_USDT
+    partial_sizing = falcon_resolve_partial_capable_notional(sig) if mode in {"READY", "VERIFY", "LIVE"} else {"allowed": True, "notional_usdt": FALCON_REAL_NOTIONAL_USDT}
+    sig["partial_capable_sizing"] = partial_sizing
+    effective_real_notional = safe_float(partial_sizing.get("notional_usdt"), FALCON_REAL_NOTIONAL_USDT) if isinstance(partial_sizing, dict) else FALCON_REAL_NOTIONAL_USDT
+    sig["real_notional_usdt"] = effective_real_notional
+    if mode == "LIVE" and FALCON_REQUIRE_REAL_TP50_CAPABLE and not (isinstance(partial_sizing, dict) and partial_sizing.get("allowed")):
+        decision = {"allowed": False, "decision": "DENY", "reasons": ["TP50 real obrigatório, mas quantidade/notional não comporta parcial mínima"], "warnings": [str(partial_sizing.get("reason") or partial_sizing.get("status")) if isinstance(partial_sizing, dict) else "partial sizing indisponível"], "partial_capable_sizing": partial_sizing}
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
 
     if mode == "PAPER":
         decision = {"allowed": True, "decision": "PAPER", "reasons": [], "warnings": []}
@@ -1379,7 +1493,7 @@ def execute_signal_if_allowed(sig, positions=None):
                 verify_order = central_broker.place_market_order(
                     symbol=sig.get("symbol"),
                     side=sig.get("side"),
-                    notional_usdt=FALCON_REAL_NOTIONAL_USDT,
+                    notional_usdt=effective_real_notional,
                     reduce_only=False,
                     client_tag=f"FALCON-VERIFY-{sig.get('setup')}-{int(time.time())}",
                     bot="FALCON",
@@ -1423,7 +1537,9 @@ def execute_signal_if_allowed(sig, positions=None):
                     "setup": sig.get("setup"),
                     "symbol": sig.get("symbol"),
                     "side": sig.get("side"),
-                    "notional_usdt": FALCON_REAL_NOTIONAL_USDT,
+                    # Usa o notional já resolvido no sinal.
+        # Não depende de variável local externa a esta função.
+        "notional_usdt": safe_float(sig.get("real_notional_usdt"), FALCON_REAL_NOTIONAL_USDT),
                     "client_tag": client_tag,
                     "stop_loss_price": sig.get("stop"),
                     "source": "falcon_real_pilot_connector_v1",
@@ -1449,7 +1565,7 @@ def execute_signal_if_allowed(sig, positions=None):
         order = central_broker.place_market_order(
             symbol=sig.get("symbol"),
             side=sig.get("side"),
-            notional_usdt=FALCON_REAL_NOTIONAL_USDT,
+            notional_usdt=effective_real_notional,
             reduce_only=False,
             client_tag=client_tag,
             bot="FALCON",
@@ -1706,13 +1822,19 @@ def management_loop():
                     if tp_hit:
                         pos["tp50_hit"] = True
                         pos["candles_to_tp50"] = int(pos.get("management_cycles", 0))
-                        record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"]})
+                        tp50_real_execution = falcon_try_execute_tp50_real_partial(pos, price)
+                        pos["tp50_real_execution"] = tp50_real_execution
+                        pos["tp50_real_executed"] = bool(isinstance(tp50_real_execution, dict) and tp50_real_execution.get("sent"))
+                        pos["tp50_virtual_only"] = not pos.get("tp50_real_executed")
+                        record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"], "tp50_real_execution": tp50_real_execution})
+                        tp50_status = (tp50_real_execution or {}).get("status") if isinstance(tp50_real_execution, dict) else "TP50_VIRTUAL_ONLY"
                         safe_send_telegram(
                             f"🎯 TP50 FALCON - {symbol}\n\n"
                             f"Setup: {pos.get('setup')}\n"
                             f"Direção: {side}\n"
                             f"Preço atual: {fmt_price(price)}\n"
                             f"Resultado: {fmt_pct(pnl_pct_for_side(side, entry, tp50))} | +1,00R\n\n"
+                            f"TP50 real BingX: {tp50_status}\n"
                             f"Status: aguardando BE em {BE_TRIGGER_R}R"
                         )
                         changed = True

@@ -883,3 +883,282 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:
 if __name__ == "__main__":
     result = build_real_pnl_r_map(commit=True)
     print(build_real_pnl_r_text(result))
+
+
+# ==============================================================================
+# PATCH 2026-07-11 — REAL PNL/R MAPPER V2.6 — REGISTRY JSON + BINGX RECON
+# ==============================================================================
+# Corrige o principal gap visto no piloto real: o Trade Registry persistente é JSON
+# (/data/trade_registry.json), enquanto a V2.5 lia apenas trade_registry.jsonl.
+# Continua observacional: não envia ordens, não altera risco e não rearma LIVE.
+
+VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6-REGISTRY-JSON-BINGX-RECON"
+TRADE_REGISTRY_JSON_FILE = os.path.join(DATA_DIR, "trade_registry.json")
+BROKER_EXECUTIONS_LOG_FILE = os.path.join(DATA_DIR, "broker_executions_log.jsonl")
+BROKER_EXECUTION_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "broker_execution_audit_log.jsonl")
+
+
+def _read_trade_registry_json_rows(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    data = _read_json(TRADE_REGISTRY_JSON_FILE)
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(data, dict):
+        return rows
+    for item in (data.get("closed_trades") or []):
+        if isinstance(item, dict):
+            row = dict(item)
+            row.setdefault("status", "CLOSED")
+            row.setdefault("event", "TRADE_CLOSED")
+            row.setdefault("registry_file", TRADE_REGISTRY_JSON_FILE)
+            rows.append(row)
+    for item in (data.get("open_trades") or {}).values():
+        if isinstance(item, dict):
+            row = dict(item)
+            row.setdefault("status", "OPEN")
+            row.setdefault("event", "TRADE_OPEN")
+            row.setdefault("registry_file", TRADE_REGISTRY_JSON_FILE)
+            rows.append(row)
+    if limit and len(rows) > int(limit):
+        return rows[-int(limit):]
+    return rows
+
+
+def _row_has_real_broker_evidence(row: Dict[str, Any]) -> bool:
+    merged = _flatten_payload(row if isinstance(row, dict) else {})
+    meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
+    combined = dict(merged)
+    combined.update({f"metadata_{k}": v for k, v in meta.items()})
+    txt = json.dumps(combined, ensure_ascii=False, default=str).upper()
+    markers = [
+        "LIVE", "REAL", "BINGX", "BROKER", "SENT", "FILLED", "ORDER_ID", "ORDERID",
+        "BINGX_ORDER_ID", "LIVE_ORDER_ID", "CLIENT_ORDER_ID", "FALCON-LIVE",
+        "DISASTER_STOP", "REAL_ORDER_SENT_BY_CENTRAL", "EXECUTION_ENGINE_REAL_TRADE_SYNC",
+    ]
+    negatives = ["PAPER", "VERIFY", "DRY_RUN", "SAFE_DRY_RUN", "OBSERVATION_ONLY"]
+    has_marker = any(m in txt for m in markers)
+    # PAPER/VERIFY explícito só bloqueia se não houver evidência forte de order id real.
+    has_order = any(k in combined and not _is_empty(combined.get(k)) for k in ["order_id", "bingx_order_id", "live_order_id", "client_order_id", "metadata_order_id", "metadata_bingx_order_id"])
+    if has_order:
+        return True
+    if has_marker and not any(n in txt for n in negatives):
+        return True
+    return False
+
+
+_ORIGINAL_IS_REAL_TRADE_CANDIDATE_V25 = _is_real_trade_candidate
+
+def _is_real_trade_candidate(item: Dict[str, Any], raw_row: Dict[str, Any], source: str) -> bool:  # type: ignore[override]
+    if str(source or "").lower() in {"trade_registry_json", "broker_executions_log", "broker_execution_audit_log"}:
+        return _row_has_real_broker_evidence(raw_row)
+    try:
+        if _ORIGINAL_IS_REAL_TRADE_CANDIDATE_V25(item, raw_row, source):
+            return True
+    except Exception:
+        pass
+    return _row_has_real_broker_evidence(raw_row)
+
+
+def _normalize_trade_v26(row: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+    item = _normalize_trade(row, source)
+    if not item:
+        return None
+    merged = _flatten_payload(row if isinstance(row, dict) else {})
+    meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
+    # Enriquece campos financeiros reais quando existirem no registry/metadata/BingX.
+    for dst, keys in {
+        "realized_pnl_usdt": ["realized_pnl_usdt", "realizedPnl", "realized_pnl", "pnl_usdt", "closed_pnl_usdt", "income"],
+        "fees_usdt": ["fees_usdt", "fee_usdt", "commission", "fee", "fees"],
+        "entry_order_id": ["entry_order_id", "order_id", "bingx_order_id", "live_order_id"],
+        "exit_order_id": ["exit_order_id", "close_order_id", "stop_order_id"],
+        "client_order_id": ["client_order_id", "clientOrderId", "client_tag"],
+    }.items():
+        val = _pick(merged, keys, None)
+        if _is_empty(val) and isinstance(meta, dict):
+            val = _pick(meta, keys, None)
+        if not _is_empty(val):
+            item[dst] = val
+    # Se o registry usa result_pct/result_r, copie para pnl_pct/pnl_r.
+    if _is_empty(item.get("pnl_pct")):
+        val = _pick(merged, ["result_pct", "pnl_pct", "pnl_percent"], None)
+        if not _is_empty(val):
+            item["pnl_pct"] = _safe_float(val)
+    if _is_empty(item.get("pnl_r")):
+        val = _pick(merged, ["result_r", "pnl_r", "r"], None)
+        if not _is_empty(val):
+            item["pnl_r"] = _safe_float(val)
+    item["real_audit_candidate"] = _is_real_trade_candidate(item, row, source)
+    return item
+
+
+def get_real_pnl_r_health() -> Dict[str, Any]:  # type: ignore[override]
+    return {
+        "ok": True,
+        "available": True,
+        "module": MODULE,
+        "version": VERSION,
+        "mode": MODE,
+        "import_error": None,
+        "files": {
+            "trade_registry_json_exists": os.path.exists(TRADE_REGISTRY_JSON_FILE),
+            "trade_registry_jsonl_exists": os.path.exists(TRADE_REGISTRY_FILE),
+            "broker_executions_log_exists": os.path.exists(BROKER_EXECUTIONS_LOG_FILE),
+            "broker_execution_audit_log_exists": os.path.exists(BROKER_EXECUTION_AUDIT_LOG_FILE),
+            "history_events_exists": os.path.exists(HISTORY_EVENTS_FILE),
+            "history_export_exists": os.path.exists(HISTORY_EXPORT_FILE),
+            "decision_log_exists": os.path.exists(DECISION_LOG_FILE),
+            "output_map_exists": os.path.exists(OUTPUT_MAP_FILE),
+            "output_events_exists": os.path.exists(OUTPUT_EVENTS_FILE),
+        },
+        "notes": [
+            "V2.6 lê /data/trade_registry.json além do legado trade_registry.jsonl.",
+            "Conta como Real PnL/R apenas registros com evidência LIVE/REAL/BROKER/BINGX/order_id.",
+            "Se a exchange fechou a posição mas não houver fill/PnL salvo, o trade aparece como incompleto em diagnostics.",
+        ],
+    }
+
+
+def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Dict[str, Any]:  # type: ignore[override]
+    raw_sources: List[Tuple[str, List[Dict[str, Any]]]] = [
+        ("trade_registry_json", _read_trade_registry_json_rows(limit=limit)),
+        ("trade_registry_jsonl", _read_jsonl(TRADE_REGISTRY_FILE, limit=limit)),
+        ("broker_executions_log", _read_jsonl(BROKER_EXECUTIONS_LOG_FILE, limit=limit)),
+        ("broker_execution_audit_log", _read_jsonl(BROKER_EXECUTION_AUDIT_LOG_FILE, limit=limit)),
+        ("execution_engine_log", _read_jsonl(EXECUTION_ENGINE_LOG_FILE, limit=limit)),
+        ("execution_log", _read_jsonl(EXECUTION_LOG_FILE, limit=limit)),
+        ("real_close_auto_evaluator", _read_jsonl(REAL_CLOSE_AUTO_EVALUATOR_EVENTS_FILE, limit=limit)),
+        ("auto_real_execution_bridge", _read_jsonl(AUTO_REAL_EXECUTION_BRIDGE_EVENTS_FILE, limit=limit)),
+        ("real_position_watchdog", _read_jsonl(REAL_POSITION_WATCHDOG_EVENTS_FILE, limit=limit)),
+        ("history_events", _read_jsonl(HISTORY_EVENTS_FILE, limit=limit)),
+        ("history_export", _load_history_export_rows()),
+        ("decision_log", _read_jsonl(DECISION_LOG_FILE, limit=limit)),
+    ]
+
+    normalized: List[Dict[str, Any]] = []
+    source_counts: Dict[str, int] = {}
+    skipped_non_real_count = 0
+    skipped_non_real_by_source: Dict[str, int] = defaultdict(int)
+    for source, rows in raw_sources:
+        source_counts[source] = len(rows)
+        for row in rows:
+            item = _normalize_trade_v26(row, source)
+            if not item:
+                continue
+            if STRICT_REAL_SOURCES and not item.get("real_audit_candidate"):
+                skipped_non_real_count += 1
+                skipped_non_real_by_source[source] += 1
+                continue
+            normalized.append(item)
+
+    merged = _merge_trades(normalized)
+    closed = [r for r in merged if r.get("closed") or r.get("status") == "CLOSED"]
+    diagnostics = _diagnostics(merged)
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "version": VERSION,
+        "module": MODULE,
+        "generated_at": _now_br(),
+        "mode": MODE,
+        "notes": [
+            "Real PnL/R Mapper V2.6 lê Registry JSON persistente e logs do broker.",
+            "Não mistura PAPER/VERIFY sem evidência broker.",
+            "Trades fechados sem PnL/exit/order fill aparecem no diagnóstico para reconciliação.",
+        ],
+        "files": {
+            "trade_registry_json": TRADE_REGISTRY_JSON_FILE,
+            "trade_registry_jsonl": TRADE_REGISTRY_FILE,
+            "broker_executions_log": BROKER_EXECUTIONS_LOG_FILE,
+            "broker_execution_audit_log": BROKER_EXECUTION_AUDIT_LOG_FILE,
+            "execution_engine_log": EXECUTION_ENGINE_LOG_FILE,
+            "execution_log": EXECUTION_LOG_FILE,
+            "history_events": HISTORY_EVENTS_FILE,
+            "history_export": HISTORY_EXPORT_FILE,
+            "decision_log": DECISION_LOG_FILE,
+            "output_map": OUTPUT_MAP_FILE,
+            "output_events": OUTPUT_EVENTS_FILE,
+        },
+        "source_counts": source_counts,
+        "strict_real_sources": STRICT_REAL_SOURCES,
+        "skipped_non_real_count": skipped_non_real_count,
+        "skipped_non_real_by_source": dict(sorted(skipped_non_real_by_source.items())),
+        "normalized_count": len(normalized),
+        "mapped_count": len(merged),
+        "closed_count": len(closed),
+        "summary": _stats_for(closed),
+        "diagnostics": diagnostics,
+        "by_bot": _group_stats(closed, "bot"),
+        "by_setup": _group_stats(closed, "setup"),
+        "by_symbol": _group_stats(closed, "symbol"),
+        "by_side": _group_stats(closed, "side"),
+        "recent_closed": closed[-25:],
+    }
+    if commit:
+        _write_json(OUTPUT_MAP_FILE, payload)
+        _append_jsonl(OUTPUT_EVENTS_FILE, {
+            "event": "REAL_PNL_R_MAP_REBUILT",
+            "version": VERSION,
+            "generated_at": payload["generated_at"],
+            "mapped_count": payload["mapped_count"],
+            "closed_count": payload["closed_count"],
+            "summary": payload["summary"],
+            "diagnostics": payload["diagnostics"],
+        })
+        payload["committed"] = True
+    else:
+        payload["committed"] = False
+    return payload
+
+
+def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:  # type: ignore[override]
+    if payload is None:
+        payload = build_real_pnl_r_map(commit=False)
+    summary = payload.get("summary", {}) or {}
+    diagnostics = payload.get("diagnostics", {}) or {}
+    by_issue = diagnostics.get("by_issue", {}) or {}
+    lines = [
+        "💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.6",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {'✅' if payload.get('ok') else '❌'}",
+        f"Modo: {payload.get('mode', MODE)}",
+        "",
+        "Resumo geral:",
+    ]
+    if int(summary.get("trades", 0) or 0) <= 0:
+        lines.append("- Nenhum trade real fechado auditável completo encontrado.")
+        lines.append("- Se a BingX já fechou, falta fill/PnL financeiro salvo em fonte auditável ou o trade não carregou marcador broker/order_id.")
+    lines += [
+        f"- Trades fechados: {summary.get('trades', 0)}",
+        f"- Wins: {summary.get('wins', 0)} | Losses: {summary.get('losses', 0)} | BE: {summary.get('breakeven', 0)}",
+        f"- Win rate: {summary.get('win_rate_pct', 0)}%",
+        f"- PnL total: {summary.get('pnl_total_pct', 0)}%",
+        f"- PnL médio: {summary.get('pnl_avg_pct', 0)}%",
+        f"- R total: {summary.get('r_total', 0)}R",
+        f"- R médio: {summary.get('r_avg', 0)}R",
+        f"- Profit factor: {summary.get('profit_factor_pct', 0)}",
+        f"- Com PnL%: {summary.get('with_pnl_pct', 0)} | Com R: {summary.get('with_r', 0)}",
+        "",
+        "Fontes lidas:",
+    ]
+    for k, v in (payload.get("source_counts") or {}).items():
+        lines.append(f"- {k}: {v}")
+    lines += ["", "Diagnóstico:"]
+    lines.append(f"- Fechados completos: {diagnostics.get('closed_complete', 0)}")
+    lines.append(f"- Fechados incompletos: {diagnostics.get('closed_incomplete', 0)}")
+    if by_issue:
+        for issue, count in by_issue.items():
+            lines.append(f"- {issue}: {count}")
+    else:
+        lines.append("- Sem pendências de dados nos fechamentos mapeados.")
+    lines.append("")
+    lines.append("Por bot:")
+    by_bot = payload.get("by_bot") or {}
+    if not by_bot:
+        lines.append("- Sem trades fechados mapeados por bot.")
+    else:
+        for bot, st in by_bot.items():
+            lines.append(f"- {bot}: trades={st.get('trades', 0)} | win={st.get('win_rate_pct', 0)}% | PnL={st.get('pnl_total_pct', 0)}% | R={st.get('r_total', 0)}R")
+    lines += [
+        "",
+        "Observação:",
+        "- V2.6 lê /data/trade_registry.json e logs broker_* além das fontes antigas.",
+        "- Continua observacional: não muda lote, risco, execução ou policies ativas.",
+    ]
+    return "\n".join(lines)

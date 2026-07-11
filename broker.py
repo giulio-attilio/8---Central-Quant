@@ -2023,3 +2023,397 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
         log_execution_audit_event({"event": "BROKER_CLOSE_ERROR", **result})
         return result
 
+
+
+# ==============================================================================
+# PATCH 2026-07-11 — FALCON LIVE PARTIAL / REAL RECON HELPERS V1
+# ==============================================================================
+# Objetivo:
+# - Permitir sizing parcial-capaz: entrada >= 2x minQty para TP50 real.
+# - Expor auditoria de TP50 real possível/impossível.
+# - Fornecer busca defensiva de ordens/trades reais para reconciliação PnL/R.
+# - Corrigir fechamento parcial em Hedge Mode removendo reduceOnly se necessário.
+# Não altera env, não rearma LIVE e não envia ordem fora das travas já existentes.
+
+FALCON_PARTIAL_CAPABLE_SIZING_VERSION = "2026-07-11-FALCON-PARTIAL-CAPABLE-SIZING-V1"
+BINGX_REAL_RECONCILIATION_HELPERS_VERSION = "2026-07-11-BINGX-REAL-RECONCILIATION-HELPERS-V1"
+BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION = "2026-07-11-BROKER-CLOSE-MARKET-HEDGE-SAFE-V1"
+
+
+def _cq_patch_safe_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.replace(",", ".").replace("%", "").strip()
+            if not value:
+                return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def broker_market_limits(symbol):
+    """Retorna limites/precisão do mercado em formato estável para auditoria."""
+    try:
+        info = market_info(symbol)
+        limits = info.get("limits") or {}
+        amount_limits = limits.get("amount") or {}
+        cost_limits = limits.get("cost") or {}
+        precision = info.get("precision") or {}
+        min_amount = _cq_patch_safe_float(info.get("min_amount") or amount_limits.get("min"), None)
+        min_cost = _cq_patch_safe_float(info.get("min_cost") or cost_limits.get("min"), None)
+        return {
+            "ok": True,
+            "version": FALCON_PARTIAL_CAPABLE_SIZING_VERSION,
+            "symbol": normalize_symbol(symbol),
+            "bingx_symbol": bingx_api_symbol(symbol),
+            "min_amount": min_amount,
+            "min_cost": min_cost,
+            "amount_precision": info.get("amount_precision") or precision.get("amount"),
+            "price_precision": info.get("price_precision") or precision.get("price"),
+            "limits": limits,
+            "precision": precision,
+        }
+    except Exception as exc:
+        return {"ok": False, "version": FALCON_PARTIAL_CAPABLE_SIZING_VERSION, "symbol": normalize_symbol(symbol), "error": str(exc)}
+
+
+def partial_capability_from_notional(symbol, notional_usdt, max_notional_usdt=None, min_parts=2):
+    """
+    Audita se uma ordem permite TP50 real.
+    Regra: amount_total >= 2 * min_amount, de modo que TP50 e runner fiquem >= minQty.
+    """
+    sym = normalize_symbol(symbol)
+    max_notional = _cq_patch_safe_float(max_notional_usdt, None)
+    planned_notional = _cq_patch_safe_float(notional_usdt, 0.0) or 0.0
+    try:
+        details = amount_details(sym, planned_notional)
+        limits = broker_market_limits(sym)
+        min_amount = _cq_patch_safe_float((limits or {}).get("min_amount"), None)
+        price_ref = _cq_patch_safe_float(details.get("price_ref"), None)
+        amount = _cq_patch_safe_float(details.get("amount") or details.get("amount_final"), 0.0) or 0.0
+        required_amount = (float(min_amount) * float(min_parts)) if min_amount else None
+        required_notional = (required_amount * price_ref) if required_amount and price_ref else None
+        partial_amount = (amount / 2.0) if amount else 0.0
+        partial_capable = bool(min_amount and amount >= required_amount and partial_amount >= min_amount and (amount - partial_amount) >= min_amount)
+        required_fits_max = True if max_notional is None or required_notional is None else required_notional <= max_notional + 1e-12
+        return {
+            "ok": True,
+            "version": FALCON_PARTIAL_CAPABLE_SIZING_VERSION,
+            "symbol": sym,
+            "planned_notional_usdt": planned_notional,
+            "max_notional_usdt": max_notional,
+            "price_ref": price_ref,
+            "amount": amount,
+            "min_amount": min_amount,
+            "min_parts": min_parts,
+            "required_amount_for_real_tp50": required_amount,
+            "required_notional_for_real_tp50": required_notional,
+            "tp50_amount_if_half": partial_amount,
+            "runner_amount_if_half": amount - partial_amount,
+            "partial_capable": partial_capable,
+            "required_fits_max_notional": required_fits_max,
+            "status": "PARTIAL_CAPABLE" if partial_capable else ("NEEDS_NOTIONAL_UPSIZE" if required_fits_max else "BLOCKED_BY_MAX_NOTIONAL"),
+            "amount_details": details,
+            "market_limits": limits,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": FALCON_PARTIAL_CAPABLE_SIZING_VERSION,
+            "symbol": sym,
+            "planned_notional_usdt": planned_notional,
+            "max_notional_usdt": max_notional,
+            "partial_capable": False,
+            "status": "PARTIAL_CAPABILITY_ERROR",
+            "error": str(exc),
+        }
+
+
+def ensure_partial_capable_notional(symbol, planned_notional_usdt, max_notional_usdt=None, min_parts=2, safety_buffer_pct=0.25):
+    """
+    Se o notional planejado não permite TP50 real, sugere/retorna o menor notional
+    que permita amount >= 2x minQty, desde que caiba no teto configurado.
+    """
+    audit = partial_capability_from_notional(symbol, planned_notional_usdt, max_notional_usdt=max_notional_usdt, min_parts=min_parts)
+    if not audit.get("ok"):
+        audit["allowed"] = False
+        audit["notional_usdt"] = planned_notional_usdt
+        return audit
+    if audit.get("partial_capable"):
+        audit["allowed"] = True
+        audit["adjusted"] = False
+        audit["notional_usdt"] = planned_notional_usdt
+        return audit
+
+    required = _cq_patch_safe_float(audit.get("required_notional_for_real_tp50"), None)
+    max_notional = _cq_patch_safe_float(max_notional_usdt, None)
+    if required is None or required <= 0:
+        audit.update({"allowed": False, "adjusted": False, "notional_usdt": planned_notional_usdt, "reason": "required_notional_unavailable"})
+        return audit
+    adjusted = required * (1.0 + float(safety_buffer_pct or 0.0) / 100.0)
+    if max_notional is not None and adjusted > max_notional + 1e-12:
+        audit.update({
+            "allowed": False,
+            "adjusted": False,
+            "notional_usdt": planned_notional_usdt,
+            "suggested_notional_usdt": adjusted,
+            "reason": f"notional necessário para TP50 real ({adjusted:.8f}) excede máximo ({max_notional:.8f})",
+        })
+        return audit
+    # reaudita com o notional ajustado
+    adjusted_audit = partial_capability_from_notional(symbol, adjusted, max_notional_usdt=max_notional_usdt, min_parts=min_parts)
+    adjusted_audit.update({
+        "allowed": bool(adjusted_audit.get("partial_capable")),
+        "adjusted": True,
+        "original_notional_usdt": planned_notional_usdt,
+        "notional_usdt": adjusted,
+        "adjustment_reason": "planned_notional_below_2x_min_qty_for_real_tp50",
+    })
+    return adjusted_audit
+
+
+def tp50_partial_amount(symbol, total_amount):
+    """Calcula quantidade real de TP50 respeitando minQty."""
+    limits = broker_market_limits(symbol)
+    min_amount = _cq_patch_safe_float((limits or {}).get("min_amount"), None)
+    amount = _cq_patch_safe_float(total_amount, 0.0) or 0.0
+    half = amount / 2.0
+    ok = bool(min_amount and amount >= 2 * min_amount and half >= min_amount and (amount - half) >= min_amount)
+    # Para BTC atual, se total=0.0002 e min=0.0001, retorna 0.0001.
+    partial = min_amount if ok and half <= min_amount * 1.0000001 else half
+    return {
+        "ok": ok,
+        "version": FALCON_PARTIAL_CAPABLE_SIZING_VERSION,
+        "symbol": normalize_symbol(symbol),
+        "total_amount": amount,
+        "min_amount": min_amount,
+        "tp50_amount": partial if ok else None,
+        "runner_amount": (amount - partial) if ok else None,
+        "status": "TP50_REAL_AMOUNT_OK" if ok else "TP50_REAL_AMOUNT_TOO_SMALL",
+    }
+
+
+# Mantém uma referência do fechamento antigo para fallback interno.
+try:
+    _ORIGINAL_CLOSE_POSITION_MARKET_BEFORE_20260711_PATCH = close_position_market
+except Exception:
+    _ORIGINAL_CLOSE_POSITION_MARKET_BEFORE_20260711_PATCH = None
+
+
+def close_position_market(symbol, side, amount=None, notional_usdt=None, client_tag=None, reason="MANUAL_OR_TP50", allow_hedge_without_reduce_only=True):
+    """
+    Fechamento market seguro para parcial/TP50.
+    Em Hedge Mode, remove reduceOnly por padrão porque a BingX pode rejeitar reduceOnly em algumas ordens;
+    positionSide + lado oposto + quantidade exata fazem o fechamento da perna correta.
+    """
+    close_side = "sell" if str(side).upper() in {"LONG", "BUY"} else "buy"
+    close_position_side = bingx_position_side(side)
+    sym = normalize_symbol(symbol)
+
+    if amount is None:
+        if notional_usdt is None:
+            return {"ok": False, "status": "REJECTED", "sent": False, "error": "amount ou notional_usdt obrigatório", "version": BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION}
+        amount, _price = amount_from_notional(sym, float(notional_usdt))
+
+    amount = float(amount)
+    if amount <= 0:
+        return {"ok": False, "status": "REJECTED", "sent": False, "error": "amount inválido", "amount": amount, "version": BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION}
+
+    hedge_mode = _disaster_stop_hedge_mode_detected()
+    reduce_only_sent = not (hedge_mode and allow_hedge_without_reduce_only)
+
+    if EXECUTION_MODE != "LIVE" or not ENABLE_REAL_TRADING or BROKER_DRY_RUN:
+        result = {
+            "ok": True,
+            "status": "DRY_RUN",
+            "sent": False,
+            "symbol": sym,
+            "bingx_symbol": bingx_api_symbol(sym),
+            "side": close_side,
+            "position_side": close_position_side,
+            "amount": amount,
+            "reduce_only_requested": True,
+            "reduce_only_sent": bool(reduce_only_sent),
+            "reduce_only_removed_for_hedge_mode": bool(hedge_mode and not reduce_only_sent),
+            "reason": "EXECUTION_MODE não LIVE ou ENABLE_REAL_TRADING=false ou BROKER_DRY_RUN=true",
+            "close_reason": reason,
+            "version": BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION,
+        }
+        log_execution_event({"event": "close_position_market", **result})
+        log_execution_audit_event({"event": "BROKER_CLOSE_DRY_RUN", **result})
+        return result
+
+    ex = exchange()
+    started = time.perf_counter()
+    try:
+        params = {}
+        if reduce_only_sent:
+            params["reduceOnly"] = True
+        if close_position_side:
+            params["positionSide"] = close_position_side
+        if client_tag:
+            params["clientOrderId"] = str(client_tag)[:32]
+        order = ex.create_order(sym, "market", close_side, amount, None, params)
+        result = {
+            "ok": True,
+            "status": "SENT",
+            "sent": True,
+            "id": order.get("id"),
+            "order_id": order.get("id"),
+            "symbol": sym,
+            "bingx_symbol": bingx_api_symbol(sym),
+            "side": close_side,
+            "position_side": close_position_side,
+            "amount": amount,
+            "reduce_only_requested": True,
+            "reduce_only_sent": bool(reduce_only_sent),
+            "reduce_only_removed_for_hedge_mode": bool(hedge_mode and not reduce_only_sent),
+            "close_reason": reason,
+            "client_tag": client_tag,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "version": BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION,
+            "raw": order,
+        }
+        log_execution_event({"event": "close_position_market", **{k: v for k, v in result.items() if k != "raw"}})
+        log_execution_audit_event({"event": "BROKER_CLOSE_SENT", **{k: v for k, v in result.items() if k != "raw"}})
+        return result
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status": "ERROR",
+            "sent": False,
+            "symbol": sym,
+            "side": close_side,
+            "position_side": close_position_side,
+            "amount": amount,
+            "reduce_only_requested": True,
+            "reduce_only_sent": bool(reduce_only_sent),
+            "reduce_only_removed_for_hedge_mode": bool(hedge_mode and not reduce_only_sent),
+            "close_reason": reason,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "error": str(exc),
+            "version": BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION,
+        }
+        log_execution_event({"event": "close_position_market", **result})
+        log_execution_audit_event({"event": "BROKER_CLOSE_ERROR", **result})
+        return result
+
+
+def fetch_recent_orders(symbol=None, since=None, limit=100):
+    """Busca defensiva de ordens recentes via CCXT para reconciliação. Não envia ordens."""
+    sym = normalize_symbol(symbol) if symbol else None
+    ex = exchange()
+    rows = []
+    errors = []
+    for method_name in ["fetch_orders", "fetch_closed_orders", "fetch_open_orders"]:
+        method = getattr(ex, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            try:
+                data = method(sym, since, limit) if sym else method(None, since, limit)
+            except TypeError:
+                data = method(sym) if sym else method()
+            for item in data or []:
+                if isinstance(item, dict):
+                    item = dict(item)
+                    item.setdefault("_source_method", method_name)
+                    rows.append(item)
+        except Exception as exc:
+            errors.append({"method": method_name, "error": str(exc)})
+    return {"ok": True, "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION, "symbol": sym, "count": len(rows), "orders": rows[-int(limit or 100):], "errors": errors}
+
+
+def fetch_recent_my_trades(symbol=None, since=None, limit=100):
+    """Busca defensiva de trades/fills recentes via CCXT para reconciliação. Não envia ordens."""
+    sym = normalize_symbol(symbol) if symbol else None
+    ex = exchange()
+    try:
+        try:
+            data = ex.fetch_my_trades(sym, since, limit) if sym else ex.fetch_my_trades(None, since, limit)
+        except TypeError:
+            data = ex.fetch_my_trades(sym) if sym else ex.fetch_my_trades()
+        return {"ok": True, "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION, "symbol": sym, "count": len(data or []), "trades": data or []}
+    except Exception as exc:
+        return {"ok": False, "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION, "symbol": sym, "error": str(exc), "trades": []}
+
+
+def reconcile_order_from_bingx(symbol=None, order_id=None, client_order_id=None, since=None, limit=150):
+    """Tenta localizar ordem/trades/fills relacionados para alimentar Real PnL/R."""
+    orders_payload = fetch_recent_orders(symbol=symbol, since=since, limit=limit)
+    trades_payload = fetch_recent_my_trades(symbol=symbol, since=since, limit=limit)
+    oid = str(order_id or "").strip().lower()
+    cid = str(client_order_id or "").strip().lower()
+
+    def match_item(item):
+        if not isinstance(item, dict):
+            return False
+        values = [item.get("id"), item.get("order"), item.get("orderId"), item.get("clientOrderId"), item.get("client_order_id")]
+        info = item.get("info") if isinstance(item.get("info"), dict) else {}
+        values += [info.get("orderId"), info.get("orderID"), info.get("clientOrderId"), info.get("clientOrderID")]
+        vals = [str(x or "").strip().lower() for x in values]
+        return bool((oid and oid in vals) or (cid and cid in vals))
+
+    matched_orders = [o for o in (orders_payload.get("orders") or []) if match_item(o)]
+    matched_trades = [t for t in (trades_payload.get("trades") or []) if match_item(t)]
+    return {
+        "ok": True,
+        "version": BINGX_REAL_RECONCILIATION_HELPERS_VERSION,
+        "symbol": normalize_symbol(symbol) if symbol else None,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "matched_orders_count": len(matched_orders),
+        "matched_trades_count": len(matched_trades),
+        "matched_orders": matched_orders,
+        "matched_trades": matched_trades,
+        "orders_errors": orders_payload.get("errors"),
+        "trades_error": trades_payload.get("error") if not trades_payload.get("ok") else None,
+    }
+
+# ==============================================================================
+# PATCH 2026-07-11 — DISASTER STOP CLOSE-POSITION PREVIEW V1
+# ==============================================================================
+DISASTER_STOP_CLOSE_POSITION_PREVIEW_VERSION = "2026-07-11-DISASTER-STOP-CLOSE-POSITION-PREVIEW-V1"
+
+
+def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, client_tag=None, entry_price=None):
+    """
+    Preview observacional de payload para testar hipótese de stop 'posição inteira'.
+    Não envia ordem. A execução real desse modo só deve ser habilitada depois de teste controlado.
+    """
+    sym = normalize_symbol(symbol)
+    normalized = normalize_side(side)
+    position_side = bingx_position_side(side)
+    validation = validate_disaster_stop_price(side, entry_price, stop_loss_price)
+    stop_price = _apply_disaster_stop_buffer(side, float(stop_loss_price)) if validation.get("ok") else stop_loss_price
+    close_side = "sell" if normalized == "buy" else "buy"
+    client_order_id = (str(client_tag or f"CQ-CP-{int(time.time())}")[:24] + "-CPDS")[:32]
+    payload = {
+        "symbol": bingx_api_symbol(sym),
+        "side": close_side.upper(),
+        "type": "STOP_MARKET",
+        "stopPrice": float(stop_price) if _cq_patch_safe_float(stop_price) else stop_price,
+        "workingType": DISASTER_STOP_WORKING_TYPE,
+        "closePosition": True,
+        "clientOrderId": client_order_id,
+    }
+    if position_side:
+        payload["positionSide"] = position_side
+    return {
+        "ok": bool(validation.get("ok")),
+        "version": DISASTER_STOP_CLOSE_POSITION_PREVIEW_VERSION,
+        "mode": "PREVIEW_ONLY_NO_ORDER_SENT",
+        "symbol": sym,
+        "side": close_side,
+        "position_side": position_side,
+        "stop_price": stop_price,
+        "client_order_id": client_order_id,
+        "validation": validation,
+        "payload_preview": payload,
+        "notes": [
+            "Este preview não confirma que a BingX aceitará closePosition via CCXT/API.",
+            "Só habilitar envio real depois de teste controlado em tamanho mínimo e com Falcon desarmado.",
+        ],
+    }
