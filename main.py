@@ -44576,7 +44576,7 @@ def broker_disaster_stop_payload_preview_v1_text_route():
 # ==========================================================
 # FALCON REAL PILOT PREFLIGHT CHECKLIST V1 — SAFE NO-REARM DIAGNOSTIC
 # ==========================================================
-FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-07-11-FALCON-REAL-PILOT-PREFLIGHT-V1.1-MANUAL-INDEPENDENT"
+FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-07-11-FALCON-REAL-PILOT-PREFLIGHT-V1.2-PREDATOR-PAPER-LIFECYCLE-INDEPENDENT"
 
 try:
     FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR = Path(CENTRAL_DATA_DIR)
@@ -45101,13 +45101,30 @@ def _frpp_v1_build_checklist():
         {"execution_mode": predator_mode, "execution_enabled": predator_health.get("execution_enabled"), "real_sent_count": predator_real_sent},
     )
     predator_lifecycle_ok = bool(predator_health.get("predator_lifecycle_audit_ok"))
+    # O lifecycle PAPER do Predator não pertence ao domínio operacional LIVE do Falcon.
+    # Mantém visibilidade e alerta, mas só bloqueia o preflight se houver qualquer
+    # evidência de que o Predator não está isolado fora do LIVE.
+    predator_lifecycle_blocks_falcon = not predator_live_ok
+    predator_lifecycle_fail_message = (
+        "Predator lifecycle tem divergência e existe risco LIVE/REAL; corrija antes do rearm."
+        if predator_lifecycle_blocks_falcon
+        else "Predator lifecycle PAPER ainda tem divergência; aviso observacional, sem bloquear o Falcon enquanto execution_mode=PAPER e real_sent=0."
+    )
     add(
         "PREDATOR_LIFECYCLE_OK",
         predator_lifecycle_ok,
         "Predator lifecycle OK_WITH_WARNINGS, sem divergência OPEN/CLOSED.",
-        "Predator lifecycle ainda tem divergência; corrija antes do rearm.",
-        True,
-        {"status": predator_health.get("predator_lifecycle_audit_status"), "missing_open": predator_health.get("predator_lifecycle_missing_registry_open_count"), "missing_closed": predator_health.get("predator_lifecycle_missing_registry_closed_count")},
+        predator_lifecycle_fail_message,
+        predator_lifecycle_blocks_falcon,
+        {
+            "status": predator_health.get("predator_lifecycle_audit_status"),
+            "missing_open": predator_health.get("predator_lifecycle_missing_registry_open_count"),
+            "missing_closed": predator_health.get("predator_lifecycle_missing_registry_closed_count"),
+            "execution_mode": predator_mode,
+            "real_sent_count": predator_real_sent,
+            "scope": "PAPER_ONLY" if predator_live_ok else "LIVE_OR_REAL_RISK",
+            "blocks_falcon": predator_lifecycle_blocks_falcon,
+        },
     )
 
     turtle_mode = _frpp_v1_upper(turtle_health.get("mode") or turtle_health.get("execution_mode"))
