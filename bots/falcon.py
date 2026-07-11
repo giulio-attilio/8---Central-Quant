@@ -2383,6 +2383,672 @@ def start_threads():
     threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
 
 
+# ==============================================================================
+# PATCH 2026-07-11 — REAL POSITION MANAGEMENT HARDENING V1
+# ==============================================================================
+# Objetivos:
+# - TP50 LIVE só é confirmado após redução real e proteção do runner.
+# - Stop do runner é redimensionado após parcial para impedir reversão em Hedge Mode.
+# - BE/trailing só alteram o stop local depois de confirmação da troca na BingX.
+# - Cruzamento do stop LIVE nunca fecha apenas o Redis; confirma posição/ordem no broker.
+# - Divergência de quantidade bloqueia a ação, preservando independência entre robôs.
+
+FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION = "2026-07-11-FALCON-REAL-POSITION-MANAGEMENT-HARDENING-V1"
+FALCON_MANAGEMENT_FAILSAFE_ENABLED = str(os.environ.get("FALCON_MANAGEMENT_FAILSAFE_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+FALCON_MANAGEMENT_STOP_GRACE_SECONDS = int(os.environ.get("FALCON_MANAGEMENT_STOP_GRACE_SECONDS", "15"))
+FALCON_TP50_RETRY_SECONDS = int(os.environ.get("FALCON_TP50_RETRY_SECONDS", "20"))
+FALCON_MANAGEMENT_AMOUNT_TOLERANCE = float(os.environ.get("FALCON_MANAGEMENT_AMOUNT_TOLERANCE", "0.0000000001"))
+
+HEALTH.setdefault("real_management_version", FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION)
+HEALTH.setdefault("last_real_management_action", None)
+HEALTH.setdefault("last_real_management_error", None)
+HEALTH.setdefault("last_tp50_execution_status", None)
+HEALTH.setdefault("last_stop_replace_status", None)
+HEALTH.setdefault("last_live_stop_status", None)
+
+
+def falcon_is_live_real_position(pos):
+    if not isinstance(pos, dict):
+        return False
+    live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+    has_order = bool(pos.get("live_order_id") or pos.get("bingx_order_id") or live_order.get("order_id") or live_order.get("id"))
+    sent = bool(live_order.get("sent") or has_order)
+    return str(pos.get("execution_mode") or "").upper() == "LIVE" and has_order and sent
+
+
+def falcon_real_remaining_qty(pos):
+    for key in ("remaining_qty", "runner_qty", "qty", "initial_qty", "amount"):
+        value = safe_float(pos.get(key), None)
+        if value is not None and value > 0:
+            return value
+    live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+    return safe_float(live_order.get("amount"), 0.0)
+
+
+def falcon_issue_management_token(pos, operation, extra=None):
+    if central_broker is None or not hasattr(central_broker, "issue_execution_auth_token"):
+        return {"ok": False, "status": "MANAGEMENT_AUTH_HELPER_MISSING", "token": None, "error": BROKER_IMPORT_ERROR}
+    context = {
+        "bot": "FALCON",
+        "setup": pos.get("setup"),
+        "symbol": pos.get("symbol"),
+        "side": pos.get("side"),
+        "operation": operation,
+        "trade_id": pos.get("trade_registry_id") or pos.get("id"),
+        "source": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+    }
+    if isinstance(extra, dict):
+        context.update(extra)
+    try:
+        return central_broker.issue_execution_auth_token(context=context)
+    except Exception as exc:
+        return {"ok": False, "status": "MANAGEMENT_AUTH_ERROR", "token": None, "error": str(exc)}
+
+
+def falcon_sync_live_order_state(sig, order):
+    if not isinstance(sig, dict) or not isinstance(order, dict) or not order.get("sent"):
+        return sig
+    amount = safe_float(order.get("amount"), None)
+    if amount is None:
+        preview = order.get("preview") if isinstance(order.get("preview"), dict) else {}
+        amount = safe_float(preview.get("amount"), None)
+    disaster = order.get("disaster_stop") if isinstance(order.get("disaster_stop"), dict) else {}
+    if amount is not None and amount > 0:
+        sig["qty"] = amount
+        sig["initial_qty"] = amount
+        sig["remaining_qty"] = amount
+    sig["live_order_id"] = order.get("order_id") or order.get("id") or sig.get("live_order_id")
+    sig["bingx_order_id"] = sig.get("live_order_id")
+    sig["live_client_order_id"] = order.get("client_order_id") or order.get("client_tag")
+    sig["broker_entry_reference"] = order.get("price_ref")
+    sig["broker_stop_order_id"] = disaster.get("order_id") or sig.get("broker_stop_order_id")
+    sig["disaster_stop_order_id"] = sig.get("broker_stop_order_id")
+    sig["broker_stop_price"] = disaster.get("stop_price") or sig.get("stop")
+    sig["broker_stop_amount"] = disaster.get("amount") or amount
+    sig["broker_stop_status"] = disaster.get("status")
+    sig["real_management_version"] = FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION
+    sig["registry_mode"] = "REAL"
+    return sig
+
+
+# Envolve a função de entrada existente sem reescrever o gate.
+_ORIGINAL_EXECUTE_SIGNAL_IF_ALLOWED_BEFORE_RPM_V1 = execute_signal_if_allowed
+
+def execute_signal_if_allowed(sig, positions=None):
+    allowed, decision = _ORIGINAL_EXECUTE_SIGNAL_IF_ALLOWED_BEFORE_RPM_V1(sig, positions=positions)
+    order = sig.get("live_order") if isinstance(sig, dict) and isinstance(sig.get("live_order"), dict) else {}
+    if allowed and order.get("sent"):
+        falcon_sync_live_order_state(sig, order)
+    return allowed, decision
+
+
+# Envolve o registro para persistir IDs/quantidade do broker no OPEN real.
+_ORIGINAL_REGISTER_FALCON_TRADE_REGISTRY_OPEN_BEFORE_RPM_V1 = register_falcon_trade_registry_open
+
+def register_falcon_trade_registry_open(pos):
+    result = _ORIGINAL_REGISTER_FALCON_TRADE_REGISTRY_OPEN_BEFORE_RPM_V1(pos)
+    if falcon_is_live_real_position(pos) and central_trade_registry is not None and isinstance(result, dict) and result.get("ok"):
+        try:
+            trade_id = result.get("trade_id") or pos.get("trade_registry_id")
+            live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+            central_trade_registry.update_trade(
+                trade_id,
+                qty=falcon_real_remaining_qty(pos),
+                execution_mode="LIVE",
+                registry_mode="REAL",
+                order_id=pos.get("live_order_id"),
+                broker_order_id=pos.get("live_order_id"),
+                client_order_id=pos.get("live_client_order_id") or live_order.get("client_order_id"),
+                metadata={
+                    "registry_mode": "REAL",
+                    "execution_sent": True,
+                    "broker_order_id": pos.get("live_order_id"),
+                    "client_order_id": pos.get("live_client_order_id") or live_order.get("client_order_id"),
+                    "broker_stop_order_id": pos.get("broker_stop_order_id"),
+                    "broker_stop_price": pos.get("broker_stop_price"),
+                    "broker_stop_amount": pos.get("broker_stop_amount"),
+                    "initial_qty": pos.get("initial_qty"),
+                    "remaining_qty": pos.get("remaining_qty"),
+                    "partial_capable_sizing": pos.get("partial_capable_sizing"),
+                    "real_management_version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+                },
+            )
+        except Exception as exc:
+            HEALTH["last_real_management_error"] = f"registry live metadata: {exc}"
+    return result
+
+
+def falcon_update_registry_management(pos, **metadata):
+    if central_trade_registry is None:
+        return None
+    trade_id = pos.get("trade_registry_id")
+    if not trade_id:
+        trade_id = central_trade_registry.make_trade_id("FALCON", normalize_symbol_for_central(pos.get("symbol")), pos.get("side"), pos.get("setup"))
+    try:
+        top = {
+            # qty permanece a quantidade inicial do trade; runner fica em metadata.
+            "qty": safe_float(pos.get("initial_qty"), safe_float(pos.get("qty"), falcon_real_remaining_qty(pos))),
+            "sl": pos.get("stop"),
+            "metadata": {
+                "remaining_qty": pos.get("remaining_qty"),
+                "runner_qty": pos.get("runner_qty"),
+                "broker_stop_order_id": pos.get("broker_stop_order_id"),
+                "broker_stop_price": pos.get("broker_stop_price"),
+                "broker_stop_amount": pos.get("broker_stop_amount"),
+                "tp50_real_executed": pos.get("tp50_real_executed"),
+                "tp50_real_order_id": pos.get("tp50_real_order_id"),
+                "real_management_version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+                **metadata,
+            },
+        }
+        return central_trade_registry.update_trade(trade_id, **top)
+    except Exception as exc:
+        HEALTH["last_real_management_error"] = f"registry management: {exc}"
+        return None
+
+
+def _falcon_resize_runner_stop(pos, runner_amount, stop_price, reason):
+    old_order_id = pos.get("broker_stop_order_id") or pos.get("disaster_stop_order_id")
+    old_stop = safe_float(pos.get("broker_stop_price"), safe_float(pos.get("stop"), None))
+    token_payload = falcon_issue_management_token(pos, "REPLACE_STOP", {"reason": reason, "amount": runner_amount, "new_stop": stop_price})
+    token = token_payload.get("token") if isinstance(token_payload, dict) else None
+    if not token:
+        return {"ok": False, "status": "STOP_REPLACE_AUTH_TOKEN_MISSING", "auth": token_payload}
+    try:
+        result = central_broker.replace_position_stop_order(
+            symbol=pos.get("symbol"),
+            side=pos.get("side"),
+            old_order_id=old_order_id,
+            old_stop_price=old_stop,
+            new_stop_price=stop_price,
+            amount=runner_amount,
+            expected_position_amount=runner_amount,
+            client_tag=f"FALCON-{reason}-{int(time.time())}",
+            reason=reason,
+            execution_auth_token=token,
+            allow_same_price=(reason == "TP50_RESIZE"),
+        )
+        HEALTH["last_stop_replace_status"] = result.get("status") if isinstance(result, dict) else None
+        return result
+    except Exception as exc:
+        return {"ok": False, "status": "STOP_REPLACE_EXCEPTION", "error": str(exc)}
+
+
+def _falcon_finalize_tp50_after_partial(pos, runner_amount, price, close_result):
+    pos["tp50_partial_pending"] = False
+    pos["tp50_real_order_id"] = (close_result or {}).get("order_id")
+    pos["tp50_amount"] = safe_float((close_result or {}).get("filled_amount"), safe_float(pos.get("tp50_intended_amount"), 0.0))
+    pos["tp50_fill_price"] = safe_float((close_result or {}).get("average"), price)
+    pos["remaining_qty"] = max(0.0, runner_amount)
+    pos["runner_qty"] = pos["remaining_qty"]
+
+    if runner_amount <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE:
+        return {
+            "ok": True,
+            "status": "TP50_REAL_EXECUTED_POSITION_CLOSED",
+            "sent": True,
+            "confirmed": True,
+            "position_closed": True,
+            "protected": True,
+            "close_order": close_result,
+            "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+        }
+
+    stop_result = _falcon_resize_runner_stop(pos, runner_amount, safe_float(pos.get("stop")), "TP50_RESIZE")
+    if isinstance(stop_result, dict) and stop_result.get("ok"):
+        pos["broker_stop_order_id"] = stop_result.get("new_order_id") or pos.get("broker_stop_order_id")
+        pos["disaster_stop_order_id"] = pos.get("broker_stop_order_id")
+        pos["broker_stop_amount"] = runner_amount
+        pos["broker_stop_price"] = safe_float(pos.get("stop"))
+        pos["broker_stop_status"] = stop_result.get("status")
+        falcon_update_registry_management(pos, tp50_status="REAL_EXECUTED", stop_resize=stop_result)
+        return {
+            "ok": True,
+            "status": "TP50_REAL_EXECUTED_RUNNER_PROTECTED",
+            "sent": True,
+            "confirmed": True,
+            "position_closed": False,
+            "protected": True,
+            "runner_amount": runner_amount,
+            "close_order": close_result,
+            "stop_resize": stop_result,
+            "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+        }
+
+    rollback = stop_result.get("rollback") if isinstance(stop_result, dict) and isinstance(stop_result.get("rollback"), dict) else {}
+    if rollback.get("ok"):
+        pos["broker_stop_order_id"] = rollback.get("order_id")
+        pos["disaster_stop_order_id"] = rollback.get("order_id")
+        pos["broker_stop_amount"] = runner_amount
+        pos["broker_stop_price"] = rollback.get("stop_price") or pos.get("stop")
+        pos["broker_stop_status"] = "ROLLBACK_PROTECTED"
+        falcon_update_registry_management(pos, tp50_status="REAL_EXECUTED_STOP_ROLLBACK", stop_resize=stop_result)
+        return {
+            "ok": True,
+            "status": "TP50_REAL_EXECUTED_STOP_ROLLBACK_PROTECTED",
+            "sent": True,
+            "confirmed": True,
+            "position_closed": False,
+            "protected": True,
+            "runner_amount": runner_amount,
+            "close_order": close_result,
+            "stop_resize": stop_result,
+            "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+        }
+
+    if FALCON_MANAGEMENT_FAILSAFE_ENABLED and hasattr(central_broker, "managed_close_position_market"):
+        auth = falcon_issue_management_token(pos, "TP50_RUNNER_FAILSAFE_CLOSE", {"amount": runner_amount})
+        token = auth.get("token") if isinstance(auth, dict) else None
+        failsafe = central_broker.managed_close_position_market(
+            symbol=pos.get("symbol"),
+            side=pos.get("side"),
+            amount=runner_amount,
+            expected_position_amount=runner_amount,
+            client_tag=f"FALCON-TP50-FS-{int(time.time())}",
+            reason="TP50_STOP_RESIZE_FAILED",
+            execution_auth_token=token,
+        ) if token else {"ok": False, "status": "FAILSAFE_AUTH_MISSING", "auth": auth}
+        if failsafe.get("confirmed"):
+            pos["remaining_qty"] = 0.0
+            pos["runner_qty"] = 0.0
+            return {
+                "ok": True,
+                "status": "TP50_REAL_EXECUTED_RUNNER_FAILSAFE_CLOSED",
+                "sent": True,
+                "confirmed": True,
+                "position_closed": True,
+                "protected": True,
+                "close_order": close_result,
+                "stop_resize": stop_result,
+                "failsafe_close": failsafe,
+                "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+            }
+        return {
+            "ok": False,
+            "status": "TP50_REAL_CRITICAL_RUNNER_UNPROTECTED",
+            "sent": True,
+            "confirmed": True,
+            "position_closed": False,
+            "protected": False,
+            "close_order": close_result,
+            "stop_resize": stop_result,
+            "failsafe_close": failsafe,
+            "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+        }
+
+    return {
+        "ok": False,
+        "status": "TP50_REAL_CRITICAL_RUNNER_UNPROTECTED",
+        "sent": True,
+        "confirmed": True,
+        "position_closed": False,
+        "protected": False,
+        "close_order": close_result,
+        "stop_resize": stop_result,
+        "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+    }
+
+
+def falcon_try_execute_tp50_real_partial(pos, price):
+    result = {
+        "ok": True,
+        "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
+        "management_version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        "status": "TP50_VIRTUAL_ONLY",
+        "sent": False,
+        "confirmed": False,
+        "protected": True,
+        "symbol": pos.get("symbol"),
+        "side": pos.get("side"),
+        "price": price,
+        "reason": "not_live_or_no_real_order",
+    }
+    if not falcon_is_live_real_position(pos):
+        HEALTH["last_tp50_execution_status"] = result["status"]
+        return result
+    required = ["tp50_partial_amount", "managed_close_position_market", "managed_position_snapshot", "replace_position_stop_order"]
+    missing = [name for name in required if central_broker is None or not hasattr(central_broker, name)]
+    if missing:
+        result.update({"ok": False, "status": "TP50_REAL_HELPER_MISSING", "reason": ",".join(missing)})
+        HEALTH["last_tp50_execution_status"] = result["status"]
+        return result
+
+    # Recupera uma redução enviada anteriormente sem duplicar a ordem.
+    if pos.get("tp50_partial_pending"):
+        before = safe_float(pos.get("tp50_pre_amount"), falcon_real_remaining_qty(pos))
+        intended = safe_float(pos.get("tp50_intended_amount"), 0.0)
+        snapshot = central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side"))
+        current = safe_float(snapshot.get("amount"), None) if isinstance(snapshot, dict) else None
+        order_snapshot = central_broker.managed_order_snapshot(pos.get("symbol"), pos.get("tp50_real_order_id")) if hasattr(central_broker, "managed_order_snapshot") else {}
+        if current is not None and current <= max(0.0, before - intended) + max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, before * 1e-6):
+            recovered_close = {"order_id": pos.get("tp50_real_order_id"), "filled_amount": intended, "remaining_amount": current, "confirmed": True, "recovered": True, "order_snapshot": order_snapshot}
+            result = _falcon_finalize_tp50_after_partial(pos, current, price, recovered_close)
+            HEALTH["last_tp50_execution_status"] = result.get("status")
+            return result
+        status = str((order_snapshot or {}).get("status") or "UNKNOWN").upper()
+        if status not in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "ERROR"}:
+            result.update({"ok": True, "status": "TP50_REAL_PARTIAL_PENDING_CONFIRMATION", "sent": True, "confirmed": False, "position_snapshot": snapshot, "order_snapshot": order_snapshot})
+            HEALTH["last_tp50_execution_status"] = result["status"]
+            return result
+        pos["tp50_partial_pending"] = False
+
+    total_amount = falcon_real_remaining_qty(pos)
+    partial = central_broker.tp50_partial_amount(pos.get("symbol"), total_amount)
+    result["partial_audit"] = partial
+    if not partial.get("ok"):
+        result.update({"ok": False, "status": "TP50_REAL_BLOCKED_MIN_QTY", "reason": "posição LIVE não comporta parcial mínima"})
+        HEALTH["last_tp50_execution_status"] = result["status"]
+        return result
+
+    close_amount = safe_float(partial.get("tp50_amount"), 0.0)
+    auth = falcon_issue_management_token(pos, "TP50_REAL_PARTIAL", {"amount": close_amount, "expected_position_amount": total_amount})
+    token = auth.get("token") if isinstance(auth, dict) else None
+    if not token:
+        result.update({"ok": False, "status": "TP50_REAL_AUTH_TOKEN_MISSING", "auth": auth})
+        HEALTH["last_tp50_execution_status"] = result["status"]
+        return result
+
+    close_result = central_broker.managed_close_position_market(
+        symbol=pos.get("symbol"),
+        side=pos.get("side"),
+        amount=close_amount,
+        expected_position_amount=total_amount,
+        client_tag=f"FALCON-TP50-{str(pos.get('setup') or 'FALCON')}-{int(time.time())}",
+        reason="TP50_REAL_PARTIAL",
+        execution_auth_token=token,
+    )
+    pos["tp50_pre_amount"] = total_amount
+    pos["tp50_intended_amount"] = close_amount
+    pos["tp50_real_order_id"] = close_result.get("order_id") if isinstance(close_result, dict) else None
+    if not (isinstance(close_result, dict) and close_result.get("sent")):
+        result.update({"ok": False, "status": (close_result or {}).get("status", "TP50_REAL_CLOSE_FAILED"), "close_order": close_result})
+        HEALTH["last_tp50_execution_status"] = result["status"]
+        return result
+    if not close_result.get("confirmed"):
+        pos["tp50_partial_pending"] = True
+        result.update({"ok": True, "status": "TP50_REAL_PARTIAL_PENDING_CONFIRMATION", "sent": True, "confirmed": False, "close_order": close_result})
+        HEALTH["last_tp50_execution_status"] = result["status"]
+        return result
+
+    runner = safe_float(close_result.get("remaining_amount"), safe_float(partial.get("runner_amount"), 0.0))
+    result = _falcon_finalize_tp50_after_partial(pos, runner, price, close_result)
+    HEALTH["last_tp50_execution_status"] = result.get("status")
+    HEALTH["last_real_management_action"] = {"action": "TP50", "status": result.get("status"), "symbol": pos.get("symbol"), "ts": data_hora_sp_str()}
+    if not result.get("ok"):
+        HEALTH["last_real_management_error"] = result.get("status")
+    return result
+
+
+def falcon_apply_live_stop_update(pos, new_stop, reason):
+    remaining = falcon_real_remaining_qty(pos)
+    if remaining <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE:
+        return {"ok": False, "status": "STOP_UPDATE_NO_REMAINING_POSITION"}
+    result = _falcon_resize_runner_stop(pos, remaining, new_stop, reason)
+    applied = bool(isinstance(result, dict) and result.get("ok") and str(result.get("status", "")).startswith("STOP_REPLACED"))
+    if applied:
+        pos["stop"] = new_stop
+        pos["broker_stop_price"] = new_stop
+        pos["broker_stop_amount"] = remaining
+        pos["broker_stop_order_id"] = result.get("new_order_id") or pos.get("broker_stop_order_id")
+        pos["disaster_stop_order_id"] = pos.get("broker_stop_order_id")
+        pos["broker_stop_status"] = result.get("status")
+        falcon_update_registry_management(pos, stop_update_reason=reason, stop_update=result)
+    HEALTH["last_real_management_action"] = {"action": reason, "status": result.get("status") if isinstance(result, dict) else None, "symbol": pos.get("symbol"), "ts": data_hora_sp_str()}
+    if not applied:
+        HEALTH["last_real_management_error"] = result.get("status") if isinstance(result, dict) else "STOP_UPDATE_UNKNOWN"
+    return {"ok": applied, "applied": applied, "status": result.get("status") if isinstance(result, dict) else "STOP_UPDATE_UNKNOWN", "broker_result": result}
+
+
+def falcon_handle_live_stop_cross(pid, pos, price):
+    remaining_expected = falcon_real_remaining_qty(pos)
+    snapshot = central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side")) if central_broker and hasattr(central_broker, "managed_position_snapshot") else {"ok": False, "status": "POSITION_HELPER_MISSING"}
+    current_amount = safe_float(snapshot.get("amount"), None) if isinstance(snapshot, dict) else None
+    stop_order_id = pos.get("broker_stop_order_id") or pos.get("disaster_stop_order_id")
+    order_snapshot = central_broker.managed_order_snapshot(pos.get("symbol"), stop_order_id) if central_broker and hasattr(central_broker, "managed_order_snapshot") else {}
+
+    if snapshot.get("ok") and snapshot.get("position_closed"):
+        exit_price = safe_float(order_snapshot.get("average"), safe_float(pos.get("stop"), price))
+        HEALTH["last_live_stop_status"] = "BROKER_STOP_CONFIRMED_POSITION_CLOSED"
+        close_position(pid, pos, exit_price, "STOP_BROKER_CONFIRMED")
+        return {"closed": True, "status": "BROKER_STOP_CONFIRMED_POSITION_CLOSED", "snapshot": snapshot, "order_snapshot": order_snapshot}
+
+    if not snapshot.get("ok"):
+        HEALTH["last_live_stop_status"] = "STOP_POSITION_SNAPSHOT_ERROR"
+        HEALTH["last_real_management_error"] = snapshot.get("error") or snapshot.get("status")
+        return {"closed": False, "status": "STOP_POSITION_SNAPSHOT_ERROR", "snapshot": snapshot}
+
+    if remaining_expected > 0 and abs((current_amount or 0.0) - remaining_expected) > max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, remaining_expected * 1e-6):
+        HEALTH["last_live_stop_status"] = "STOP_POSITION_AMOUNT_MISMATCH"
+        HEALTH["last_real_management_error"] = "STOP_POSITION_AMOUNT_MISMATCH"
+        return {"closed": False, "status": "STOP_POSITION_AMOUNT_MISMATCH", "snapshot": snapshot}
+
+    now = time.time()
+    first_seen = safe_float(pos.get("live_stop_crossed_epoch"), None)
+    order_status = str((order_snapshot or {}).get("status") or "UNKNOWN").upper()
+    stop_invalid = order_status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "ERROR", "ORDER_SNAPSHOT_ERROR"}
+    if first_seen is None:
+        pos["live_stop_crossed_epoch"] = now
+        pos["live_stop_crossed_at"] = data_hora_sp_str()
+        record_event("LIVE_STOP_TRIGGER_WAIT", pos, {"price": price, "broker_snapshot": snapshot, "stop_order": order_snapshot})
+        if not (FALCON_MANAGEMENT_FAILSAFE_ENABLED and stop_invalid):
+            HEALTH["last_live_stop_status"] = "WAITING_BROKER_STOP_EXECUTION"
+            return {"closed": False, "status": "WAITING_BROKER_STOP_EXECUTION", "snapshot": snapshot, "order_snapshot": order_snapshot}
+        first_seen = now - FALCON_MANAGEMENT_STOP_GRACE_SECONDS
+
+    elapsed = now - first_seen
+    if not FALCON_MANAGEMENT_FAILSAFE_ENABLED or (elapsed < FALCON_MANAGEMENT_STOP_GRACE_SECONDS and not stop_invalid):
+        HEALTH["last_live_stop_status"] = "WAITING_BROKER_STOP_EXECUTION"
+        return {"closed": False, "status": "WAITING_BROKER_STOP_EXECUTION", "elapsed": elapsed, "snapshot": snapshot, "order_snapshot": order_snapshot}
+
+    # Evita que um stop residual dispare depois do market fail-safe e reverta a perna.
+    cancel_result = None
+    if stop_order_id and hasattr(central_broker, "cancel_managed_stop_order"):
+        cancel_auth = falcon_issue_management_token(pos, "STOP_FAILSAFE_CANCEL", {"order_id": stop_order_id})
+        cancel_token = cancel_auth.get("token") if isinstance(cancel_auth, dict) else None
+        if cancel_token:
+            cancel_result = central_broker.cancel_managed_stop_order(pos.get("symbol"), stop_order_id, execution_auth_token=cancel_token, reason="STOP_FAILSAFE_PRE_CLOSE")
+
+    # Reconsulta após tentar cancelar: se o stop executou nesse intervalo, não envia market duplicado.
+    post_cancel_snapshot = central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side"))
+    if isinstance(post_cancel_snapshot, dict) and post_cancel_snapshot.get("position_closed"):
+        exit_price = safe_float((order_snapshot or {}).get("average"), safe_float(pos.get("stop"), price))
+        HEALTH["last_live_stop_status"] = "BROKER_STOP_CONFIRMED_AFTER_CANCEL_RACE"
+        close_position(pid, pos, exit_price, "STOP_BROKER_CONFIRMED")
+        return {"closed": True, "status": "BROKER_STOP_CONFIRMED_AFTER_CANCEL_RACE", "cancel_stop": cancel_result, "snapshot": post_cancel_snapshot}
+    post_cancel_amount = safe_float((post_cancel_snapshot or {}).get("amount"), current_amount)
+    if not (isinstance(post_cancel_snapshot, dict) and post_cancel_snapshot.get("ok")):
+        HEALTH["last_live_stop_status"] = "STOP_FAILSAFE_POST_CANCEL_SNAPSHOT_ERROR"
+        return {"closed": False, "status": "STOP_FAILSAFE_POST_CANCEL_SNAPSHOT_ERROR", "cancel_stop": cancel_result, "snapshot": post_cancel_snapshot}
+
+    close_auth = falcon_issue_management_token(pos, "STOP_FAILSAFE_CLOSE", {"amount": post_cancel_amount})
+    close_token = close_auth.get("token") if isinstance(close_auth, dict) else None
+    failsafe = central_broker.managed_close_position_market(
+        symbol=pos.get("symbol"),
+        side=pos.get("side"),
+        amount=post_cancel_amount,
+        expected_position_amount=post_cancel_amount,
+        client_tag=f"FALCON-STOP-FS-{int(time.time())}",
+        reason="STOP_BROKER_NOT_CONFIRMED",
+        execution_auth_token=close_token,
+    ) if close_token else {"ok": False, "status": "STOP_FAILSAFE_AUTH_MISSING", "auth": close_auth}
+
+    if failsafe.get("confirmed"):
+        exit_price = safe_float(failsafe.get("average"), price)
+        HEALTH["last_live_stop_status"] = "STOP_FAILSAFE_MARKET_CONFIRMED"
+        close_position(pid, pos, exit_price, "STOP_FAILSAFE_MARKET")
+        return {"closed": True, "status": "STOP_FAILSAFE_MARKET_CONFIRMED", "cancel_stop": cancel_result, "failsafe": failsafe}
+
+    HEALTH["last_live_stop_status"] = "STOP_FAILSAFE_CRITICAL_NOT_CONFIRMED"
+    HEALTH["last_real_management_error"] = "STOP_FAILSAFE_CRITICAL_NOT_CONFIRMED"
+    safe_send_telegram(
+        f"🔴 FALCON LIVE CRÍTICO — {pos.get('symbol')}\n\n"
+        f"Stop cruzado, mas fechamento não foi confirmado.\n"
+        f"Status: {failsafe.get('status')}\n"
+        f"Quantidade broker: {current_amount}\n"
+        f"Verificação manual imediata necessária."
+    )
+    return {"closed": False, "status": "STOP_FAILSAFE_CRITICAL_NOT_CONFIRMED", "cancel_stop": cancel_result, "failsafe": failsafe}
+
+
+# Gestão substituta: PAPER permanece igual; LIVE usa confirmação broker.
+def management_loop():
+    while True:
+        try:
+            positions = get_positions()
+            closed_pids = []
+
+            for pid, pos in list(positions.items()):
+                symbol = pos["symbol"]
+                side = pos["side"]
+                entry = safe_float(pos["entry"])
+                stop = safe_float(pos["stop"])
+                tp50 = safe_float(pos["tp50"])
+                initial_stop = safe_float(pos.get("initial_stop", stop))
+                is_real = falcon_is_live_real_position(pos)
+
+                price = safe_fetch_price(symbol)
+                if price is None:
+                    continue
+                pos = update_mfe_mae(pos, price)
+
+                stopped = (side == "LONG" and price <= stop) or (side == "SHORT" and price >= stop)
+                if stopped:
+                    if is_real:
+                        live_stop = falcon_handle_live_stop_cross(pid, pos, price)
+                        if live_stop.get("closed"):
+                            closed_pids.append(pid)
+                        else:
+                            positions[pid] = pos
+                        continue
+                    close_position(pid, pos, stop, "STOP")
+                    closed_pids.append(pid)
+                    continue
+
+                if not pos.get("tp50_hit"):
+                    tp_hit = (side == "LONG" and price >= tp50) or (side == "SHORT" and price <= tp50)
+                    if tp_hit:
+                        last_attempt = safe_float(pos.get("tp50_last_attempt_epoch"), 0.0)
+                        if not is_real or pos.get("tp50_partial_pending") or time.time() - last_attempt >= FALCON_TP50_RETRY_SECONDS:
+                            pos["tp50_last_attempt_epoch"] = time.time()
+                            tp50_real_execution = falcon_try_execute_tp50_real_partial(pos, price)
+                            pos["tp50_real_execution"] = tp50_real_execution
+                            success_real = is_real and bool(tp50_real_execution.get("confirmed")) and bool(tp50_real_execution.get("protected"))
+                            virtual_success = not is_real
+                            if success_real or virtual_success:
+                                pos["tp50_hit"] = True
+                                pos["candles_to_tp50"] = int(pos.get("management_cycles", 0))
+                                pos["tp50_real_executed"] = bool(is_real and tp50_real_execution.get("sent"))
+                                pos["tp50_virtual_only"] = not pos.get("tp50_real_executed")
+                                pos["tp50_execution_classification"] = "REAL_EXECUTED" if pos.get("tp50_real_executed") else "VIRTUAL_ONLY"
+                                record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"], "tp50_real_execution": tp50_real_execution})
+                                safe_send_telegram(
+                                    f"🎯 TP50 FALCON - {symbol}\n\n"
+                                    f"Setup: {pos.get('setup')}\n"
+                                    f"Direção: {side}\n"
+                                    f"Preço atual: {fmt_price(price)}\n"
+                                    f"Resultado: {fmt_pct(pnl_pct_for_side(side, entry, tp50))} | +1,00R\n\n"
+                                    f"TP50 BingX: {tp50_real_execution.get('status')}\n"
+                                    f"Runner protegido: {tp50_real_execution.get('protected')}"
+                                )
+                                if tp50_real_execution.get("position_closed"):
+                                    close_position(pid, pos, price, "TP50_FAILSAFE_FULL_CLOSE")
+                                    closed_pids.append(pid)
+                                    continue
+                            else:
+                                record_event("TP50_MANAGEMENT_PENDING", pos, {"price": price, "tp50_real_execution": tp50_real_execution})
+                                if not tp50_real_execution.get("ok"):
+                                    safe_send_telegram(
+                                        f"🔴 TP50 REAL NÃO CONFIRMADO - {symbol}\n\n"
+                                        f"Status: {tp50_real_execution.get('status')}\n"
+                                        f"Nenhuma nova parcial será presumida como executada."
+                                    )
+
+                current_r = r_for_side(side, entry, initial_stop, price)
+
+                if pos.get("tp50_hit") and not pos.get("be_moved") and current_r >= BE_TRIGGER_R:
+                    candidate = entry * (1 + BE_OFFSET_PCT / 100) if side == "LONG" else entry * (1 - BE_OFFSET_PCT / 100)
+                    candidate = max(safe_float(pos["stop"]), candidate) if side == "LONG" else min(safe_float(pos["stop"]), candidate)
+                    if is_real:
+                        update = falcon_apply_live_stop_update(pos, candidate, "BE")
+                        if update.get("applied"):
+                            pos["be_moved"] = True
+                            record_event("BE", pos, {"new_stop": pos["stop"], "trigger_r": current_r, "broker_update": update})
+                            safe_send_telegram(f"🟡 BE REAL FALCON - {symbol}\n\nStop BingX confirmado: {fmt_price(pos['stop'])}\nR atual: {fmt_r(current_r)}")
+                    else:
+                        pos["stop"] = candidate
+                        pos["be_moved"] = True
+                        record_event("BE", pos, {"new_stop": pos["stop"], "trigger_r": current_r})
+                        safe_send_telegram(f"🟡 BE FALCON - {symbol}\n\nStop movido para: {fmt_price(pos['stop'])}\nR atual: {fmt_r(current_r)}")
+
+                if pos.get("be_moved") and current_r >= TRAIL_TRIGGER_R:
+                    trail = calc_chandelier_stop(pos)
+                    if trail is not None:
+                        old_stop = safe_float(pos["stop"])
+                        improved = (side == "LONG" and trail > old_stop) or (side == "SHORT" and trail < old_stop)
+                        if improved:
+                            if is_real:
+                                update = falcon_apply_live_stop_update(pos, trail, "TRAILING")
+                                if update.get("applied"):
+                                    pos["trailing_active"] = True
+                                    record_event("TRAILING", pos, {"new_stop": trail, "broker_update": update})
+                                    safe_send_telegram(f"🟣 TRAILING REAL FALCON - {symbol}\n\nStop BingX confirmado: {fmt_price(trail)}\nR atual: {fmt_r(current_r)}")
+                            else:
+                                pos["stop"] = trail
+                                pos["trailing_active"] = True
+                                record_event("TRAILING", pos, {"new_stop": trail})
+                                safe_send_telegram(f"🟣 TRAILING FALCON - {symbol}\n\nNovo stop: {fmt_price(trail)}\nR atual: {fmt_r(current_r)}")
+
+                pos["management_cycles"] = int(pos.get("management_cycles", 0)) + 1
+                positions[pid] = pos
+
+            for pid in closed_pids:
+                positions.pop(pid, None)
+
+            save_positions(positions)
+            HEALTH["last_management_run"] = data_hora_sp_str()
+            HEALTH["last_success"] = data_hora_sp_str()
+            HEALTH["last_error"] = None
+            refresh_health_stats()
+
+        except Exception as exc:
+            HEALTH["last_error"] = f"management: {exc}"
+            HEALTH["last_real_management_error"] = str(exc)
+            traceback.print_exc()
+
+        time.sleep(MANAGEMENT_SLEEP_SECONDS)
+
+
+_ORIGINAL_HEALTH_PAYLOAD_BEFORE_RPM_V1 = health_payload
+
+def health_payload():
+    payload = _ORIGINAL_HEALTH_PAYLOAD_BEFORE_RPM_V1()
+    payload["real_position_management"] = {
+        "version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        "enabled": True,
+        "failsafe_enabled": FALCON_MANAGEMENT_FAILSAFE_ENABLED,
+        "stop_grace_seconds": FALCON_MANAGEMENT_STOP_GRACE_SECONDS,
+        "tp50_retry_seconds": FALCON_TP50_RETRY_SECONDS,
+        "broker_helpers": {
+            "managed_position_snapshot": bool(central_broker is not None and hasattr(central_broker, "managed_position_snapshot")),
+            "managed_close_position_market": bool(central_broker is not None and hasattr(central_broker, "managed_close_position_market")),
+            "replace_position_stop_order": bool(central_broker is not None and hasattr(central_broker, "replace_position_stop_order")),
+            "cancel_managed_stop_order": bool(central_broker is not None and hasattr(central_broker, "cancel_managed_stop_order")),
+        },
+        "last_action": HEALTH.get("last_real_management_action"),
+        "last_error": HEALTH.get("last_real_management_error"),
+        "last_tp50_status": HEALTH.get("last_tp50_execution_status"),
+        "last_stop_replace_status": HEALTH.get("last_stop_replace_status"),
+        "last_live_stop_status": HEALTH.get("last_live_stop_status"),
+        "rules": [
+            "LIVE TP50 exige confirmação da redução e proteção do runner.",
+            "BE/trailing local só muda após confirmação do stop na BingX.",
+            "Divergência de quantidade bloqueia fechamento/troca de stop.",
+            "Stop LIVE cruzado exige confirmação broker ou market fail-safe.",
+        ],
+    }
+    return payload
+
+
 start_threads()
 
 if __name__ == "__main__":

@@ -2993,3 +2993,501 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         },
     }
 
+
+
+# ==============================================================================
+# PATCH 2026-07-11 — REAL POSITION MANAGEMENT HARDENING V1
+# ==============================================================================
+# Gestão protetiva read/write para posições reais já abertas.
+# - Confirma quantidade da perna correta antes de reduzir ou trocar stop.
+# - Exige token efêmero para cada escrita LIVE.
+# - Redimensiona stop após TP50 para evitar reversão em Hedge Mode.
+# - BE/trailing só são confirmados após atualização real do stop na BingX.
+# - Em falha de troca, tenta rollback para o stop anterior com a quantidade atual.
+
+REAL_POSITION_MANAGEMENT_HARDENING_VERSION = "2026-07-11-REAL-POSITION-MANAGEMENT-HARDENING-V1"
+BROKER_MANAGEMENT_CONFIRM_RETRIES = int(os.environ.get("BROKER_MANAGEMENT_CONFIRM_RETRIES", "3"))
+BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS = float(os.environ.get("BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS", "0.35"))
+BROKER_MANAGEMENT_AMOUNT_TOLERANCE = float(os.environ.get("BROKER_MANAGEMENT_AMOUNT_TOLERANCE", "0.0000000001"))
+
+
+def _rpm_norm_side(value):
+    value = str(value or "").upper().strip()
+    if value in {"LONG", "BUY"}:
+        return "LONG"
+    if value in {"SHORT", "SELL"}:
+        return "SHORT"
+    return value
+
+
+def _rpm_symbol_key(value):
+    return str(value or "").upper().replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "").replace("-", "")
+
+
+def _rpm_position_amount(item):
+    info = item.get("info") if isinstance(item, dict) and isinstance(item.get("info"), dict) else {}
+    candidates = [
+        item.get("contracts") if isinstance(item, dict) else None,
+        item.get("amount") if isinstance(item, dict) else None,
+        info.get("positionAmt"), info.get("positionAmount"), info.get("positionQty"),
+        info.get("positionQuantity"), info.get("positionSize"), info.get("availableAmt"),
+    ]
+    for value in candidates:
+        parsed = _cq_patch_safe_float(value, None)
+        if parsed is not None:
+            return abs(parsed)
+    return 0.0
+
+
+def _rpm_position_side(item):
+    info = item.get("info") if isinstance(item, dict) and isinstance(item.get("info"), dict) else {}
+    value = item.get("side") if isinstance(item, dict) else None
+    value = value or info.get("positionSide") or info.get("side")
+    return _rpm_norm_side(value)
+
+
+def _rpm_position_symbol(item):
+    info = item.get("info") if isinstance(item, dict) and isinstance(item.get("info"), dict) else {}
+    return _rpm_symbol_key((item.get("symbol") if isinstance(item, dict) else None) or info.get("symbol"))
+
+
+def managed_position_snapshot(symbol, side, expected_amount=None):
+    """Lê apenas a perna symbol+side e valida propriedade pela quantidade esperada."""
+    sym = normalize_symbol(symbol)
+    wanted_symbol = _rpm_symbol_key(sym)
+    wanted_side = _rpm_norm_side(side)
+    expected = _cq_patch_safe_float(expected_amount, None)
+    try:
+        rows = get_positions([sym])
+        matched = []
+        total = 0.0
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            if _rpm_position_symbol(item) != wanted_symbol:
+                continue
+            item_side = _rpm_position_side(item)
+            if item_side and item_side != wanted_side:
+                continue
+            amount = _rpm_position_amount(item)
+            if amount <= BROKER_MANAGEMENT_AMOUNT_TOLERANCE:
+                continue
+            total += amount
+            matched.append({
+                "symbol": item.get("symbol"),
+                "side": item_side,
+                "amount": amount,
+                "entry_price": _cq_patch_safe_float(item.get("entryPrice") or (item.get("info") or {}).get("avgPrice"), None),
+                "mark_price": _cq_patch_safe_float(item.get("markPrice") or (item.get("info") or {}).get("markPrice"), None),
+            })
+        mismatch = False
+        if expected is not None:
+            mismatch = abs(total - expected) > max(BROKER_MANAGEMENT_AMOUNT_TOLERANCE, abs(expected) * 1e-6)
+        return {
+            "ok": True,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+            "symbol": sym,
+            "side": wanted_side,
+            "amount": total,
+            "expected_amount": expected,
+            "position_closed": total <= BROKER_MANAGEMENT_AMOUNT_TOLERANCE,
+            "ownership_safe": not mismatch,
+            "amount_mismatch": mismatch,
+            "matched_count": len(matched),
+            "positions": matched,
+            "status": "POSITION_CLOSED" if total <= BROKER_MANAGEMENT_AMOUNT_TOLERANCE else ("POSITION_AMOUNT_MISMATCH" if mismatch else "POSITION_MATCHED"),
+            "read_only": True,
+            "sent": False,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+            "symbol": sym,
+            "side": wanted_side,
+            "amount": None,
+            "expected_amount": expected,
+            "ownership_safe": False,
+            "status": "POSITION_SNAPSHOT_ERROR",
+            "error": str(exc),
+            "read_only": True,
+            "sent": False,
+        }
+
+
+def managed_order_snapshot(symbol, order_id):
+    if not order_id:
+        return {"ok": False, "status": "ORDER_ID_MISSING", "sent": False, "read_only": True, "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION}
+    try:
+        ex = exchange()
+        order = ex.fetch_order(str(order_id), normalize_symbol(symbol))
+        info = order.get("info") if isinstance(order, dict) and isinstance(order.get("info"), dict) else {}
+        status = str((order or {}).get("status") or info.get("status") or "UNKNOWN").upper()
+        return {
+            "ok": True,
+            "status": status,
+            "order_id": str(order_id),
+            "filled": _cq_patch_safe_float((order or {}).get("filled") or info.get("executedQty"), 0.0),
+            "remaining": _cq_patch_safe_float((order or {}).get("remaining"), None),
+            "average": _cq_patch_safe_float((order or {}).get("average") or info.get("avgPrice"), None),
+            "stop_price": _cq_patch_safe_float((order or {}).get("stopLossPrice") or (order or {}).get("stopPrice") or info.get("stopPrice"), None),
+            "read_only": True,
+            "sent": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        }
+    except Exception as exc:
+        return {"ok": False, "status": "ORDER_SNAPSHOT_ERROR", "order_id": str(order_id), "error": str(exc), "read_only": True, "sent": False, "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION}
+
+
+def _rpm_live_write_enabled():
+    return EXECUTION_MODE == "LIVE" and ENABLE_REAL_TRADING is True and BROKER_DRY_RUN is False
+
+
+def _rpm_validate_auth(token, context):
+    return validate_execution_auth_token(token, context=context, consume=True)
+
+
+def _rpm_amount_to_precision(ex, symbol, amount):
+    try:
+        return float(ex.amount_to_precision(symbol, amount))
+    except Exception:
+        return float(amount)
+
+
+def _rpm_create_stop_live(ex, symbol, side, amount, stop_price, client_tag):
+    sym = normalize_symbol(symbol)
+    position_side = bingx_position_side(side)
+    close_side = "sell" if _rpm_norm_side(side) == "LONG" else "buy"
+    params = {
+        "stopPrice": float(stop_price),
+        "workingType": DISASTER_STOP_WORKING_TYPE,
+        "clientOrderId": str(client_tag or f"CQ-MGMT-{int(time.time())}")[:32],
+    }
+    hedge_mode = _disaster_stop_hedge_mode_detected()
+    if not hedge_mode:
+        params["reduceOnly"] = True
+    if position_side:
+        params["positionSide"] = position_side
+    amount = _rpm_amount_to_precision(ex, sym, amount)
+    return ex.create_order(sym, "stop_market", close_side, amount, None, params)
+
+
+def replace_position_stop_order(
+    symbol,
+    side,
+    old_order_id,
+    old_stop_price,
+    new_stop_price,
+    amount,
+    expected_position_amount=None,
+    client_tag=None,
+    reason="BE_OR_TRAILING",
+    execution_auth_token=None,
+    allow_same_price=False,
+):
+    """Troca o stop real da perna correta. Fail-closed com rollback do stop anterior."""
+    sym = normalize_symbol(symbol)
+    side_norm = _rpm_norm_side(side)
+    old_stop = _cq_patch_safe_float(old_stop_price, None)
+    new_stop = _cq_patch_safe_float(new_stop_price, None)
+    amount = _cq_patch_safe_float(amount, 0.0) or 0.0
+    expected = _cq_patch_safe_float(expected_position_amount, amount)
+    base = {
+        "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        "symbol": sym,
+        "side": side_norm,
+        "old_order_id": str(old_order_id) if old_order_id else None,
+        "old_stop_price": old_stop,
+        "new_stop_price": new_stop,
+        "amount": amount,
+        "expected_position_amount": expected,
+        "reason": reason,
+        "sent": False,
+        "would_send_order": False,
+    }
+    if amount <= 0 or new_stop is None or new_stop <= 0:
+        return {**base, "ok": False, "status": "STOP_REPLACE_INVALID_INPUT"}
+    if old_stop is not None and not allow_same_price:
+        improved = (side_norm == "LONG" and new_stop > old_stop) or (side_norm == "SHORT" and new_stop < old_stop)
+        if not improved:
+            return {**base, "ok": False, "status": "STOP_NOT_IMPROVED"}
+    if old_stop is not None and allow_same_price and abs(new_stop - old_stop) > max(1e-12, abs(old_stop) * 1e-9):
+        improved = (side_norm == "LONG" and new_stop > old_stop) or (side_norm == "SHORT" and new_stop < old_stop)
+        if not improved:
+            return {**base, "ok": False, "status": "STOP_NOT_IMPROVED"}
+
+    snapshot = managed_position_snapshot(sym, side_norm, expected_amount=expected)
+    base["position_snapshot_before"] = snapshot
+    if not snapshot.get("ok") or snapshot.get("position_closed") or not snapshot.get("ownership_safe"):
+        return {**base, "ok": False, "status": "STOP_REPLACE_POSITION_NOT_SAFE"}
+
+    try:
+        current_price = fetch_last_price(sym)
+    except Exception as exc:
+        return {**base, "ok": False, "status": "STOP_REPLACE_PRICE_ERROR", "error": str(exc)}
+    trigger_valid = (side_norm == "LONG" and new_stop < current_price) or (side_norm == "SHORT" and new_stop > current_price)
+    if not trigger_valid:
+        return {**base, "ok": False, "status": "STOP_TRIGGER_ALREADY_CROSSED", "current_price": current_price}
+
+    if not _rpm_live_write_enabled():
+        return {**base, "ok": True, "status": "STOP_REPLACE_DRY_RUN", "current_price": current_price, "would_send_order": True}
+
+    auth = _rpm_validate_auth(execution_auth_token, {"operation": "replace_position_stop_order", "symbol": sym, "side": side_norm, "amount": amount, "reason": reason})
+    if not auth.get("ok"):
+        return {**base, "ok": False, "status": "STOP_REPLACE_AUTH_DENIED", "auth": auth}
+
+    ex = exchange()
+    started = time.perf_counter()
+    edit_error = None
+    if old_order_id and bool((getattr(ex, "has", {}) or {}).get("editOrder")):
+        try:
+            close_side = "sell" if side_norm == "LONG" else "buy"
+            params = {"stopPrice": float(new_stop), "workingType": DISASTER_STOP_WORKING_TYPE}
+            if bingx_position_side(side_norm):
+                params["positionSide"] = bingx_position_side(side_norm)
+            if not _disaster_stop_hedge_mode_detected():
+                params["reduceOnly"] = True
+            edited = ex.edit_order(str(old_order_id), sym, "stop_market", close_side, _rpm_amount_to_precision(ex, sym, amount), None, params)
+            result = {**base, "ok": True, "status": "STOP_REPLACED_EDIT", "sent": True, "would_send_order": True, "new_order_id": (edited or {}).get("id") or str(old_order_id), "replacement_strategy": "EDIT_ORDER", "latency_ms": round((time.perf_counter()-started)*1000,2)}
+            log_execution_event({"event": "replace_position_stop_order", **result})
+            log_execution_audit_event({"event": "BROKER_STOP_REPLACED", **result})
+            return result
+        except Exception as exc:
+            edit_error = str(exc)
+
+    cancel_result = None
+    if old_order_id:
+        try:
+            cancel_result = ex.cancel_order(str(old_order_id), sym)
+        except Exception as exc:
+            cancel_result = {"ok": False, "error": str(exc)}
+
+    # Revalida a perna após o cancelamento: o stop antigo pode ter executado na corrida.
+    snapshot_after_cancel = managed_position_snapshot(sym, side_norm, expected_amount=expected)
+    if snapshot_after_cancel.get("position_closed"):
+        result = {
+            **base,
+            "ok": True,
+            "status": "POSITION_CLOSED_DURING_STOP_REPLACE",
+            "sent": False,
+            "would_send_order": True,
+            "cancel_result": cancel_result,
+            "edit_error": edit_error,
+            "position_snapshot_after_cancel": snapshot_after_cancel,
+            "replacement_strategy": "CANCEL_NO_RECREATE_POSITION_CLOSED",
+            "latency_ms": round((time.perf_counter()-started)*1000,2),
+        }
+        log_execution_audit_event({"event": "BROKER_STOP_REPLACE_POSITION_CLOSED", **result})
+        return result
+    if not snapshot_after_cancel.get("ok") or not snapshot_after_cancel.get("ownership_safe"):
+        result = {
+            **base,
+            "ok": False,
+            "status": "STOP_REPLACE_POST_CANCEL_POSITION_NOT_SAFE",
+            "cancel_result": cancel_result,
+            "edit_error": edit_error,
+            "position_snapshot_after_cancel": snapshot_after_cancel,
+            "latency_ms": round((time.perf_counter()-started)*1000,2),
+        }
+        log_execution_audit_event({"event": "BROKER_STOP_REPLACE_POST_CANCEL_BLOCKED", **result})
+        return result
+
+    new_tag = str(client_tag or f"FALCON-STOP-{int(time.time())}")[:32]
+    try:
+        new_order = _rpm_create_stop_live(ex, sym, side_norm, amount, new_stop, new_tag)
+        result = {
+            **base,
+            "ok": True,
+            "status": "STOP_REPLACED_CANCEL_CREATE",
+            "sent": True,
+            "would_send_order": True,
+            "new_order_id": (new_order or {}).get("id"),
+            "client_tag": new_tag,
+            "replacement_strategy": "CANCEL_CREATE",
+            "cancel_result": cancel_result,
+            "edit_error": edit_error,
+            "rollback_attempted": False,
+            "latency_ms": round((time.perf_counter()-started)*1000,2),
+        }
+        log_execution_event({"event": "replace_position_stop_order", **result})
+        log_execution_audit_event({"event": "BROKER_STOP_REPLACED", **result})
+        return result
+    except Exception as create_exc:
+        rollback = None
+        if old_stop is not None and old_stop > 0:
+            try:
+                rollback_tag = f"FALCON-RB-{int(time.time())}"[:32]
+                rollback_order = _rpm_create_stop_live(ex, sym, side_norm, amount, old_stop, rollback_tag)
+                rollback = {"ok": True, "order_id": (rollback_order or {}).get("id"), "stop_price": old_stop, "amount": amount}
+            except Exception as rollback_exc:
+                rollback = {"ok": False, "error": str(rollback_exc), "stop_price": old_stop, "amount": amount}
+        result = {
+            **base,
+            "ok": False,
+            "status": "STOP_REPLACE_FAILED_ROLLED_BACK" if rollback and rollback.get("ok") else "STOP_REPLACE_CRITICAL_UNPROTECTED",
+            "sent": False,
+            "would_send_order": True,
+            "cancel_result": cancel_result,
+            "edit_error": edit_error,
+            "create_error": str(create_exc),
+            "rollback_attempted": rollback is not None,
+            "rollback": rollback,
+            "latency_ms": round((time.perf_counter()-started)*1000,2),
+        }
+        log_execution_event({"event": "replace_position_stop_order", **result})
+        log_execution_audit_event({"event": "BROKER_STOP_REPLACE_ERROR", **result})
+        return result
+
+
+def managed_close_position_market(
+    symbol,
+    side,
+    amount,
+    expected_position_amount=None,
+    client_tag=None,
+    reason="MANAGED_CLOSE",
+    execution_auth_token=None,
+):
+    """Fecha parcial/total somente após validar a quantidade da perna correta."""
+    sym = normalize_symbol(symbol)
+    side_norm = _rpm_norm_side(side)
+    amount = _cq_patch_safe_float(amount, 0.0) or 0.0
+    expected = _cq_patch_safe_float(expected_position_amount, None)
+    base = {
+        "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        "symbol": sym,
+        "side": side_norm,
+        "amount": amount,
+        "expected_position_amount": expected,
+        "reason": reason,
+        "sent": False,
+        "confirmed": False,
+        "would_send_order": False,
+    }
+    if amount <= 0:
+        return {**base, "ok": False, "status": "MANAGED_CLOSE_INVALID_AMOUNT"}
+    snapshot_before = managed_position_snapshot(sym, side_norm, expected_amount=expected)
+    base["position_snapshot_before"] = snapshot_before
+    if not snapshot_before.get("ok") or snapshot_before.get("position_closed") or not snapshot_before.get("ownership_safe"):
+        return {**base, "ok": False, "status": "MANAGED_CLOSE_POSITION_NOT_SAFE"}
+    current_amount = _cq_patch_safe_float(snapshot_before.get("amount"), 0.0) or 0.0
+    if amount > current_amount + max(BROKER_MANAGEMENT_AMOUNT_TOLERANCE, current_amount * 1e-6):
+        return {**base, "ok": False, "status": "MANAGED_CLOSE_AMOUNT_EXCEEDS_POSITION", "current_amount": current_amount}
+
+    if not _rpm_live_write_enabled():
+        return {**base, "ok": True, "status": "MANAGED_CLOSE_DRY_RUN", "would_send_order": True, "remaining_amount": max(0.0, current_amount-amount)}
+
+    auth = _rpm_validate_auth(execution_auth_token, {"operation": "managed_close_position_market", "symbol": sym, "side": side_norm, "amount": amount, "reason": reason})
+    if not auth.get("ok"):
+        return {**base, "ok": False, "status": "MANAGED_CLOSE_AUTH_DENIED", "auth": auth}
+
+    ex = exchange()
+    close_side = "sell" if side_norm == "LONG" else "buy"
+    params = {}
+    if bingx_position_side(side_norm):
+        params["positionSide"] = bingx_position_side(side_norm)
+    if not _disaster_stop_hedge_mode_detected():
+        params["reduceOnly"] = True
+    if client_tag:
+        params["clientOrderId"] = str(client_tag)[:32]
+    started = time.perf_counter()
+    try:
+        precise_amount = _rpm_amount_to_precision(ex, sym, amount)
+        order = ex.create_order(sym, "market", close_side, precise_amount, None, params)
+        order_id = (order or {}).get("id")
+        target_remaining = max(0.0, current_amount - precise_amount)
+        snapshot_after = None
+        confirmed = False
+        for _ in range(max(1, BROKER_MANAGEMENT_CONFIRM_RETRIES)):
+            if BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS > 0:
+                time.sleep(BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS)
+            snapshot_after = managed_position_snapshot(sym, side_norm)
+            after_amount = _cq_patch_safe_float((snapshot_after or {}).get("amount"), None)
+            if after_amount is not None and after_amount <= target_remaining + max(BROKER_MANAGEMENT_AMOUNT_TOLERANCE, max(current_amount,1.0)*1e-6):
+                confirmed = True
+                break
+        result = {
+            **base,
+            "ok": True,
+            "status": "MANAGED_CLOSE_CONFIRMED" if confirmed else "MANAGED_CLOSE_SENT_UNCONFIRMED",
+            "sent": True,
+            "confirmed": confirmed,
+            "would_send_order": True,
+            "order_id": order_id,
+            "filled_amount": precise_amount if confirmed else _cq_patch_safe_float((order or {}).get("filled"), None),
+            "remaining_amount": _cq_patch_safe_float((snapshot_after or {}).get("amount"), target_remaining),
+            "position_snapshot_after": snapshot_after,
+            "latency_ms": round((time.perf_counter()-started)*1000,2),
+        }
+        log_execution_event({"event": "managed_close_position_market", **result})
+        log_execution_audit_event({"event": "BROKER_MANAGED_CLOSE_SENT", **result})
+        return result
+    except Exception as exc:
+        result = {**base, "ok": False, "status": "MANAGED_CLOSE_ERROR", "error": str(exc), "latency_ms": round((time.perf_counter()-started)*1000,2)}
+        log_execution_event({"event": "managed_close_position_market", **result})
+        log_execution_audit_event({"event": "BROKER_MANAGED_CLOSE_ERROR", **result})
+        return result
+
+
+def cancel_managed_stop_order(symbol, order_id, execution_auth_token=None, reason="POSITION_CLOSED_CLEANUP"):
+    sym = normalize_symbol(symbol)
+    base = {"ok": True, "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION, "symbol": sym, "order_id": str(order_id) if order_id else None, "reason": reason, "sent": False}
+    if not order_id:
+        return {**base, "status": "NO_STOP_ORDER_TO_CANCEL"}
+    if not _rpm_live_write_enabled():
+        return {**base, "status": "STOP_CANCEL_DRY_RUN", "would_send_order": True}
+    auth = _rpm_validate_auth(execution_auth_token, {"operation": "cancel_managed_stop_order", "symbol": sym, "order_id": str(order_id), "reason": reason})
+    if not auth.get("ok"):
+        return {**base, "ok": False, "status": "STOP_CANCEL_AUTH_DENIED", "auth": auth}
+    try:
+        result_raw = exchange().cancel_order(str(order_id), sym)
+        result = {**base, "status": "STOP_CANCELLED", "sent": True, "raw": result_raw}
+        log_execution_audit_event({"event": "BROKER_STOP_CANCELLED", **{k:v for k,v in result.items() if k != "raw"}})
+        return result
+    except Exception as exc:
+        return {**base, "ok": False, "status": "STOP_CANCEL_ERROR", "error": str(exc)}
+
+# Expõe o hardening no health existente do broker sem alterar rotas.
+_ORIGINAL_STATUS_PAYLOAD_BEFORE_RPM_V1 = status_payload
+
+def status_payload(check_ready: bool = False):
+    payload = _ORIGINAL_STATUS_PAYLOAD_BEFORE_RPM_V1(check_ready=check_ready)
+    payload["real_position_management"] = {
+        "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        "managed_position_snapshot": True,
+        "managed_order_snapshot": True,
+        "managed_close_position_market": True,
+        "replace_position_stop_order": True,
+        "cancel_managed_stop_order": True,
+        "amount_tolerance": BROKER_MANAGEMENT_AMOUNT_TOLERANCE,
+        "confirm_retries": BROKER_MANAGEMENT_CONFIRM_RETRIES,
+        "confirm_delay_seconds": BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS,
+        "live_write_enabled": _rpm_live_write_enabled(),
+        "notes": [
+            "Escritas LIVE exigem token efêmero.",
+            "Quantidade da perna é validada antes de parcial/stop.",
+            "Troca de stop tenta editOrder e usa cancel/create com rollback como fallback.",
+        ],
+    }
+    return payload
+
+
+def real_position_management_health():
+    return {
+        "ok": True,
+        "module": "real_position_management_hardening_v1",
+        "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        "live_write_enabled": _rpm_live_write_enabled(),
+        "execution_mode": EXECUTION_MODE,
+        "enable_real_trading": ENABLE_REAL_TRADING,
+        "broker_dry_run": BROKER_DRY_RUN,
+        "helpers": [
+            "managed_position_snapshot",
+            "managed_order_snapshot",
+            "managed_close_position_market",
+            "replace_position_stop_order",
+            "cancel_managed_stop_order",
+        ],
+        "sent": False,
+        "read_only": True,
+    }
