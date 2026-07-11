@@ -1,6 +1,6 @@
 # execution_orchestrator_v1.txt
 # CENTRAL QUANT — EXECUTION ORCHESTRATOR V1
-# Versao: 2026-07-07-EXECUTION-ORCHESTRATOR-V1.1-AUDIT-ORIGIN
+# Versao: 2026-07-11-EXECUTION-ORCHESTRATOR-V1.2-IDENTITY-ATOMIC-SEEN
 #
 # Objetivo:
 # - Camada entre Decision/Risk/Allocator e execução real.
@@ -25,12 +25,13 @@ import os
 import json
 import time
 import hashlib
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 
-VERSION = "2026-07-07-EXECUTION-ORCHESTRATOR-V1.1-AUDIT-ORIGIN"
+VERSION = "2026-07-11-EXECUTION-ORCHESTRATOR-V1.2-IDENTITY-ATOMIC-SEEN"
 
 DATA_DIR = Path(os.getenv("CENTRAL_DATA_DIR", "/opt/render/project/src/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,6 +41,7 @@ EXECUTION_SEEN_FILE = DATA_DIR / "execution_orchestrator_seen.json"
 
 DEFAULT_MODE = os.getenv("CENTRAL_EXECUTION_MODE", "OBSERVATION_ONLY").upper()
 REAL_EXECUTION_ENABLED = os.getenv("CENTRAL_REAL_EXECUTION_ENABLED", "false").lower() == "true"
+_SEEN_LOCK = threading.RLock()
 
 
 def _now_br() -> str:
@@ -56,10 +58,19 @@ def _load_seen() -> Dict[str, Any]:
 
 
 def _save_seen(data: Dict[str, Any]) -> None:
-    EXECUTION_SEEN_FILE.write_text(
+    """
+    Persistência atômica do ledger de idempotência.
+
+    Evita arquivo parcialmente escrito caso o processo seja interrompido
+    durante a gravação.
+    """
+    EXECUTION_SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = EXECUTION_SEEN_FILE.with_suffix(EXECUTION_SEEN_FILE.suffix + ".tmp")
+    temp_file.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
     )
+    temp_file.replace(EXECUTION_SEEN_FILE)
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
@@ -93,10 +104,29 @@ def _normalize_side(side: Any) -> Optional[str]:
     return None
 
 
-def build_idempotency_key(payload: Dict[str, Any]) -> str:
+def _identity_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Chave estável para impedir execução duplicada.
-    Usa campos de decisão/sinal quando existirem.
+    Identidade canônica do fluxo.
+
+    IDs explícitos prevalecem sobre atributos de mercado. Símbolo e lado
+    ajudam na auditoria, mas nunca são prova suficiente de ownership.
+    """
+    return {
+        "trade_id": payload.get("trade_id") or payload.get("trade_uuid"),
+        "lifecycle_id": payload.get("lifecycle_id"),
+        "signal_id": payload.get("signal_id"),
+        "decision_id": payload.get("decision_id") or payload.get("id"),
+        "client_order_id": payload.get("client_order_id") or payload.get("clientOrderId"),
+        "bot": payload.get("bot"),
+        "setup": payload.get("setup") or payload.get("strategy"),
+        "symbol": _clean_symbol(payload.get("symbol")),
+        "side": _normalize_side(payload.get("side")),
+    }
+
+
+def _legacy_idempotency_key(payload: Dict[str, Any]) -> str:
+    """
+    Chave V1.1 mantida para reconhecer intents gravadas por versões anteriores.
     """
     raw = {
         "decision_id": payload.get("decision_id") or payload.get("id") or payload.get("signal_id"),
@@ -107,6 +137,31 @@ def build_idempotency_key(payload: Dict[str, Any]) -> str:
         "entry": payload.get("entry") or payload.get("entry_price"),
         "sl": payload.get("sl") or payload.get("stop") or payload.get("stop_loss"),
         "tp50": payload.get("tp50") or payload.get("tp_50"),
+    }
+    encoded = json.dumps(raw, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24].upper()
+
+
+def build_idempotency_key(payload: Dict[str, Any]) -> str:
+    """
+    Chave estável para impedir execução duplicada.
+
+    Quando há IDs explícitos, a chave é baseada na identidade do lifecycle.
+    Na ausência deles, usa fallback compatível com a V1.1.
+    """
+    identity = _identity_fields(payload)
+    explicit_identity = {
+        key: identity.get(key)
+        for key in ("trade_id", "lifecycle_id", "signal_id", "decision_id", "client_order_id")
+        if identity.get(key)
+    }
+    if not explicit_identity:
+        return _legacy_idempotency_key(payload)
+
+    raw = {
+        **explicit_identity,
+        "bot": identity.get("bot"),
+        "setup": identity.get("setup"),
     }
     encoded = json.dumps(raw, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24].upper()
@@ -193,6 +248,8 @@ def build_execution_plan(
         "mode": mode,
         "execution_enabled": REAL_EXECUTION_ENABLED,
         "idempotency_key": idem_key,
+        "legacy_idempotency_key": _legacy_idempotency_key(payload),
+        "identity": _identity_fields(payload),
         "status": "READY_FOR_EXECUTION" if validation["ok"] else "BLOCKED",
         "action": "PLAN_ONLY",
         "route": "DECISION_TO_ORCHESTRATOR_TO_EXECUTOR",
@@ -244,14 +301,23 @@ def orchestrate_execution(
         capital_allocated=capital_allocated,
     )
 
-    seen = _load_seen()
     idem_key = plan["idempotency_key"]
+    legacy_idem_key = plan.get("legacy_idempotency_key")
 
-    if idem_key in seen:
-        plan["ok"] = False
-        plan["status"] = "DUPLICATE_BLOCKED"
-        plan["errors"].append("idempotency_key já processada")
-        plan["previous_seen_at"] = seen[idem_key].get("seen_at")
+    with _SEEN_LOCK:
+        seen = _load_seen()
+        previous_key = None
+        if idem_key in seen:
+            previous_key = idem_key
+        elif legacy_idem_key and legacy_idem_key in seen:
+            previous_key = legacy_idem_key
+
+        if previous_key:
+            plan["ok"] = False
+            plan["status"] = "DUPLICATE_BLOCKED"
+            plan["errors"].append("intenção idempotente já registrada")
+            plan["previous_seen_at"] = (seen.get(previous_key) or {}).get("seen_at")
+            plan["previous_idempotency_key"] = previous_key
 
     execution_origin = payload.get("_execution_attempt_audit_v1") if isinstance(payload.get("_execution_attempt_audit_v1"), dict) else {}
     event = {
@@ -273,16 +339,32 @@ def orchestrate_execution(
 
     _append_jsonl(EXECUTION_LOG_FILE, event)
 
+    # Preview/DRY RUN não deve consumir a identidade de uma futura execução.
+    # A reserva persistente ocorre somente quando a chamada não é dry_run.
     if plan["status"] == "READY_FOR_EXECUTION":
-        seen[idem_key] = {
-            "seen_at": _now_br(),
-            "symbol": plan["payload"].get("symbol"),
-            "side": plan["payload"].get("side"),
-            "bot": plan["payload"].get("bot"),
-            "setup": plan["payload"].get("setup"),
-            "mode": plan["mode"],
-        }
-        _save_seen(seen)
+        plan["idempotency_reserved"] = not dry_run
+        if not dry_run:
+            with _SEEN_LOCK:
+                seen = _load_seen()
+                # Revalida dentro do lock para reduzir corrida entre threads.
+                if idem_key in seen or (legacy_idem_key and legacy_idem_key in seen):
+                    plan["ok"] = False
+                    plan["status"] = "DUPLICATE_BLOCKED"
+                    plan["errors"].append("intenção idempotente registrada por chamada concorrente")
+                else:
+                    seen[idem_key] = {
+                        "seen_at": _now_br(),
+                        "symbol": plan["payload"].get("symbol"),
+                        "side": plan["payload"].get("side"),
+                        "bot": plan["payload"].get("bot"),
+                        "setup": plan["payload"].get("setup"),
+                        "mode": plan["mode"],
+                        "identity": plan.get("identity"),
+                        "legacy_idempotency_key": legacy_idem_key,
+                    }
+                    _save_seen(seen)
+    else:
+        plan["idempotency_reserved"] = False
 
     return {
         "ok": plan["ok"],
@@ -307,7 +389,7 @@ def execution_health() -> Dict[str, Any]:
         },
         "seen_count": len(seen),
         "notes": [
-            "V1 seguro: cria plano e loga, mas não executa ordem real.",
+            "V1.2 seguro: cria plano, identidade e ledger, mas não envia ordem diretamente.",
             "Próxima fase: conectar Paper Executor.",
             "Somente depois: conectar BingX Executor com stop de desastre.",
         ],
