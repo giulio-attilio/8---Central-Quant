@@ -471,7 +471,9 @@ def _normalize_trade(row: Dict[str, Any], source: str) -> Optional[Dict[str, Any
 
     pnl_pct = _safe_float(_pick(merged, ["pnl_pct", "pnl_percent", "profit_pct", "real_pnl_pct", "result_pct"]))
     r_value = _safe_float(_pick(merged, ["r", "r_result", "real_r", "r_multiple", "result_r"]))
-    pnl_usdt = _safe_float(_pick(merged, ["pnl_usdt", "realized_pnl", "realizedPnl", "profit_usdt", "net_pnl_usdt", "pnl"] ))
+    # Para fechamento REAL reconciliado, a verdade financeira é net_pnl.
+    # realized_pnl permanece disponível separadamente, mas não substitui fees/funding.
+    pnl_usdt = _safe_float(_pick(merged, ["net_pnl", "net_pnl_usdt", "pnl_usdt", "realized_pnl", "realizedPnl", "profit_usdt", "pnl"] ))
     qty = _safe_float(_pick(merged, ["qty", "quantity", "size", "amount", "contracts", "position_size"] ))
 
     closed = _infer_closed(merged)
@@ -914,7 +916,7 @@ if __name__ == "__main__":
 # (/data/trade_registry.json), enquanto a V2.5 lia apenas trade_registry.jsonl.
 # Continua observacional: não envia ordens, não altera risco e não rearma LIVE.
 
-VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6.2-STRICT-BROKER-EVIDENCE"
+VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6.3-RECONCILED-REAL-CLOSE"
 TRADE_REGISTRY_JSON_FILE = os.path.join(DATA_DIR, "trade_registry.json")
 BROKER_EXECUTIONS_LOG_FILE = os.path.join(DATA_DIR, "broker_executions_log.jsonl")
 BROKER_EXECUTION_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "broker_execution_audit_log.jsonl")
@@ -995,6 +997,49 @@ def _read_trade_registry_json_rows(limit: Optional[int] = None) -> List[Dict[str
     return rows
 
 
+def _authoritative_reconciled_real_close(row: Dict[str, Any]) -> bool:
+    """Reconhece um CLOSED REAL já reconciliado, mesmo que o metadata preserve
+    decisões históricas PRECHECK/NOT_ELIGIBLE anteriores ao envio manual/controlado.
+
+    A exceção é deliberadamente estreita: exige fechamento, modo REAL/LIVE, ID forte
+    de broker, preço de saída e evidência financeira reconciliada.
+    """
+    if not isinstance(row, dict):
+        return False
+
+    merged = _flatten_payload(row)
+    meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
+
+    status = _safe_str(_pick(merged, ["status", "state"], "")).upper()
+    event = _safe_str(_pick(merged, ["event", "event_raw", "type", "kind"], "")).upper()
+    closed = status in {"CLOSED", "CLOSE", "DONE", "FINISHED", "EXITED", "ENCERRADO", "FECHADO"} or event in {
+        "TRADE_CLOSED", "CLOSED", "POSITION_CLOSED", "REAL_CLOSE"
+    }
+    if not closed:
+        return False
+
+    registry_mode = _safe_str(_pick(merged, ["registry_mode", "trade_mode"], "")).upper()
+    execution_mode = _safe_str(_pick(merged, ["execution_mode", "mode"], "")).upper()
+    reconciled = _safe_bool(merged.get("real_close_reconciled"), False) or _safe_bool(meta.get("real_close_reconciled"), False)
+    data_quality = _safe_str(
+        _pick(merged, ["broker_data_quality", "data_quality"], None)
+        or _pick(meta, ["broker_data_quality", "data_quality"], "")
+    ).upper()
+
+    mode_ok = registry_mode == "REAL" or execution_mode in {"LIVE", "REAL"}
+    reconciliation_ok = reconciled or data_quality.startswith("HIGH_BROKER_RECONCILED") or data_quality == "HIGH_REAL"
+    if not (mode_ok and reconciliation_ok):
+        return False
+
+    strong_order_id = _strong_broker_order_id(merged, meta)
+    exit_price = _safe_float(_pick(merged, ["exit_price", "exit", "close_price", "avg_exit_price"]))
+    net_pnl = _safe_float(_pick(merged, ["net_pnl", "net_pnl_usdt", "pnl_usdt", "realized_pnl"]))
+    r_net = _safe_float(_pick(merged, ["pnl_r", "r_multiple", "r_net", "result_r"]))
+    financial_ok = net_pnl is not None or r_net is not None
+
+    return bool(strong_order_id and exit_price is not None and financial_ok)
+
+
 def _row_has_explicit_non_execution(row: Dict[str, Any]) -> bool:
     """True quando o registro descreve bloqueio/preview e não uma ordem real."""
     merged = _flatten_payload(row if isinstance(row, dict) else {})
@@ -1060,9 +1105,14 @@ def _row_has_real_broker_evidence(row: Dict[str, Any]) -> bool:
 
     A palavra REAL dentro de NOT_ELIGIBLE_FOR_AUTO_REAL_EXECUTION não é prova.
     client_order_id também não basta sozinho, pois pode nascer antes do envio.
+    Um CLOSED REAL reconciliado e financeiramente completo tem precedência sobre
+    decisões históricas negativas preservadas apenas para auditoria no metadata.
     """
     merged = _flatten_payload(row if isinstance(row, dict) else {})
     meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
+
+    if _authoritative_reconciled_real_close(row):
+        return True
 
     if _row_has_explicit_non_execution(row):
         return False
@@ -1149,7 +1199,10 @@ def _normalize_trade_v26(row: Dict[str, Any], source: str) -> Optional[Dict[str,
     meta = merged.get("metadata") if isinstance(merged.get("metadata"), dict) else {}
     # Enriquece campos financeiros reais quando existirem no registry/metadata/BingX.
     for dst, keys in {
-        "realized_pnl_usdt": ["realized_pnl_usdt", "realizedPnl", "realized_pnl", "pnl_usdt", "closed_pnl_usdt", "income"],
+        "net_pnl_usdt": ["net_pnl", "net_pnl_usdt", "pnl_usdt"],
+        "realized_pnl_usdt": ["realized_pnl_usdt", "realizedPnl", "realized_pnl", "closed_pnl_usdt", "income"],
+        "r_net": ["pnl_r", "r_net", "r_multiple", "result_r"],
+        "r_price": ["r_price"],
         "fees_usdt": ["fees_usdt", "fee_usdt", "commission", "fee", "fees"],
         "entry_order_id": ["entry_order_id", "order_id", "bingx_order_id", "live_order_id"],
         "exit_order_id": ["exit_order_id", "close_order_id", "stop_order_id"],
@@ -1160,6 +1213,16 @@ def _normalize_trade_v26(row: Dict[str, Any], source: str) -> Optional[Dict[str,
             val = _pick(meta, keys, None)
         if not _is_empty(val):
             item[dst] = val
+    # Em fechamento reconciliado, force as métricas líquidas de topo como verdade estatística.
+    if _authoritative_reconciled_real_close(row):
+        net_pnl = _safe_float(_pick(merged, ["net_pnl", "net_pnl_usdt", "pnl_usdt"]))
+        r_net = _safe_float(_pick(merged, ["pnl_r", "r_net", "r_multiple", "result_r"]))
+        if net_pnl is not None:
+            item["pnl_usdt"] = round(net_pnl, 8)
+        if r_net is not None:
+            item["r"] = round(r_net, 8)
+        item["financial_truth"] = "NET_PNL_AND_R_NET"
+
     # Se o registry usa result_pct/result_r, copie para pnl_pct/pnl_r.
     if _is_empty(item.get("pnl_pct")):
         val = _pick(merged, ["result_pct", "pnl_pct", "pnl_percent"], None)
@@ -1193,7 +1256,7 @@ def get_real_pnl_r_health() -> Dict[str, Any]:  # type: ignore[override]
             "output_events_exists": os.path.exists(OUTPUT_EVENTS_FILE),
         },
         "notes": [
-            "V2.6.2 lê /data/trade_registry.json e rejeita eventos PRECHECK/NOT_ELIGIBLE/VERIFY sem envio real.",
+            "V2.6.3 reconhece CLOSED REAL reconciliado no Registry sem confundir metadata histórico PRECHECK/NOT_ELIGIBLE.",
             "Conta como Real PnL/R apenas registros com evidência LIVE/REAL/BROKER/BINGX/order_id.",
             "Se a exchange fechou a posição mas não houver fill/PnL salvo, o trade aparece como incompleto em diagnostics.",
         ],
@@ -1245,7 +1308,7 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "generated_at": _now_br(),
         "mode": MODE,
         "notes": [
-            "Real PnL/R Mapper V2.6.2 lê Registry JSON e logs do broker com filtro estrito de evidência real.",
+            "Real PnL/R Mapper V2.6.3 lê Registry JSON e prioriza fechamentos REAL reconciliados e financeiramente completos.",
             "Não mistura PAPER/VERIFY sem evidência broker.",
             "Trades fechados sem PnL/exit/order fill aparecem no diagnóstico para reconciliação.",
         ],
@@ -1346,7 +1409,7 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:  # t
     lines += [
         "",
         "Observação:",
-        "- V2.6.2 exclui PRECHECK/NOT_ELIGIBLE/VERIFY e exige evidência positiva de envio/fill broker.",
+        "- V2.6.3 exclui PRECHECK/NOT_ELIGIBLE/VERIFY, mas aceita CLOSED REAL reconciliado com order_id, exit e net_pnl/R líquido.",
         "- Continua observacional: não muda lote, risco, execução ou policies ativas.",
     ]
     return "\n".join(lines)
