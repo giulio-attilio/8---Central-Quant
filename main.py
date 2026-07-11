@@ -22,7 +22,8 @@
 # - Pause os serviços antigos no Render antes de ativar o mesmo bot aqui.
 # - Se dois processos usarem o mesmo token Telegram com getUpdates, ocorre erro 409.
 # - O Turtle aqui é apenas carregado como módulo em bots/turtle.py.
-# - A execução real na BingX NÃO é feita pela Central.
+# - A execução real na BingX pode ser coordenada pela Central por meio do
+#   Execution Engine e do Broker, quando todos os gates LIVE estiverem aprovados.
 # - A memória por scanner interno de cada bot só pode ser medida dentro do próprio bot.
 #   Este main mede memória antes/depois de carregar, consultar health, posições,
 #   exposure, relatório, diagnóstico, selftest e rotas centralizadas.
@@ -39190,7 +39191,23 @@ def turtle_risk_guard_connector_central_route_v1_1():
 def turtle_risk_guard_connector_central_text_route_v1_1():
     return {"text": _turtle_connector_central_text_v1_1()}, 200
 
-start_central_runtime_once()
+# ==========================================================
+# CENTRAL RUNTIME AUTO-START GUARD V1
+# ==========================================================
+# Compatibilidade:
+# - default=true preserva o comportamento operacional atual no Render;
+# - CENTRAL_AUTO_START_RUNTIME=false permite importar main.py sem iniciar
+#   automaticamente threads, loops e serviços da Central.
+#
+# Arquitetura-alvo:
+# - o runtime deve ser iniciado por bootstrap explícito;
+# - esta trava é uma etapa intermediária e retrocompatível.
+CENTRAL_AUTO_START_RUNTIME = str(
+    os.environ.get("CENTRAL_AUTO_START_RUNTIME", "true")
+).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+if CENTRAL_AUTO_START_RUNTIME:
+    start_central_runtime_once()
 
 # REAL PILOT GUARD V1 — CENTRAL FINAL WRAPPER 2026-07-08
 # ----------------------------------------------------------------------------
