@@ -7998,7 +7998,7 @@ def trade_close_outcome_v1_log_route():
 # posições reais abertas. Esta camada classifica o Trade Registry e faz o gate
 # de execução real olhar somente para risco REAL ou UNKNOWN.
 
-REGISTRY_MODE_SEGREGATION_V1_VERSION = "2026-07-06-REGISTRY-MODE-SEGREGATION-V1.1"
+REGISTRY_MODE_SEGREGATION_V1_VERSION = "2026-07-11-REGISTRY-MODE-SEGREGATION-V1.2-EXPLICIT-MODE-PRIORITY"
 REGISTRY_MODE_SEGREGATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_mode_segregation_v1_latest.json"
 REGISTRY_MODE_SEGREGATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_mode_segregation_v1_events.jsonl"
 
@@ -8075,13 +8075,29 @@ def registry_mode_segregation_v1_classify_trade(trade, key=None):
 
     source = str(trade.get("source") or meta.get("source") or "").strip()
     status = str(trade.get("status") or meta.get("status") or "").upper().strip()
+    registry_mode_raw = str(trade.get("registry_mode") or meta.get("registry_mode") or "").upper().strip()
     mode_raw = str(trade.get("mode") or meta.get("mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
     execution_mode = str(trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
     execution_status = str(trade.get("execution_status") or meta.get("execution_status") or "").upper().strip()
     sync_from = str(meta.get("synced_from") or trade.get("synced_from") or "").lower().strip()
     original_mode = str(meta.get("original_mode") or meta.get("mode") or trade.get("original_mode") or "").upper().strip()
     source_l = source.lower()
-    txt = _rms_v1_text(trade, meta, source, status, mode_raw, execution_mode, execution_status, sync_from, original_mode)
+    bot_raw = str(trade.get("bot") or meta.get("bot") or "").upper().strip()
+    setup_raw = str(trade.get("setup") or meta.get("setup") or "").upper().strip()
+    txt = _rms_v1_text(
+        trade,
+        meta,
+        source,
+        status,
+        registry_mode_raw,
+        mode_raw,
+        execution_mode,
+        execution_status,
+        sync_from,
+        original_mode,
+        bot_raw,
+        setup_raw,
+    )
 
     qty = _rms_v1_float(trade.get("qty"), None)
     broker_contracts = _rms_v1_float(meta.get("broker_contracts") or trade.get("broker_contracts"), None)
@@ -8102,7 +8118,10 @@ def registry_mode_segregation_v1_classify_trade(trade, key=None):
         "key": key,
         "source": source,
         "status": status,
+        "registry_mode_raw": registry_mode_raw,
         "mode_raw": mode_raw,
+        "bot": bot_raw,
+        "setup": setup_raw,
         "execution_mode": execution_mode,
         "execution_status": execution_status,
         "execution_sent": execution_sent,
@@ -8116,36 +8135,78 @@ def registry_mode_segregation_v1_classify_trade(trade, key=None):
         "is_closed": is_closed,
     }
 
-    # 1) PAPER explícito vence qualquer inferência fraca de sync.
-    if mode_raw == "PAPER" or original_mode == "PAPER" or "\"mode\": \"paper\"" in txt or "mode paper" in txt:
-        reasons.append("metadata.mode/source indicates PAPER")
+    strong_real_evidence = bool(
+        broker_position_id
+        or live_order_id
+        or broker_contracts is not None
+        or execution_sent is True
+        or any(token in source_l for token in (
+            "post_execution_safety_repair",
+            "registry_persistence_v1_rebuild",
+            "closed_manual_recovery",
+            "bingx",
+            "broker",
+            "real_execution",
+            "execution_engine_live",
+        ))
+    )
+
+    explicit_paper_evidence = bool(
+        registry_mode_raw == "PAPER"
+        or mode_raw == "PAPER"
+        or original_mode == "PAPER"
+        or '"registry_mode": "paper"' in txt
+        or '"execution_mode": "paper"' in txt
+        or '"mode": "paper"' in txt
+        or "mode paper" in txt
+    )
+
+    predator_paper_evidence = bool(
+        bot_raw == "PREDATOR"
+        and is_closed
+        and not strong_real_evidence
+        and execution_sent is not True
+        and (
+            explicit_paper_evidence
+            or "smart_predator" in txt
+            or "paper_lifecycle" in txt
+            or "paper_executor" in txt
+            or "predator_paper" in txt
+            or source_l in {"predator", "smart_predator", "predator.py"}
+        )
+    )
+
+    # 1) Evidência broker positiva sempre vence metadata histórica PAPER/VERIFY.
+    if registry_mode_raw == "REAL" or strong_real_evidence:
+        reasons.append("explicit REAL registry mode or strong broker/live execution evidence found")
+        mode = "REAL"
+        confidence = "HIGH"
+    # 2) PAPER explícito, inclusive registry_mode normalizado pelo Trade Registry.
+    elif explicit_paper_evidence or predator_paper_evidence:
+        if predator_paper_evidence:
+            reasons.append("closed Predator trade has PAPER lifecycle evidence and no broker execution proof")
+        else:
+            reasons.append("explicit registry/mode/source indicates PAPER")
         mode = "PAPER"
         confidence = "HIGH"
-    # 2) VERIFY explícito ou execução negada: não é posição real enviada.
-    elif execution_mode == "VERIFY" or mode_raw == "VERIFY" or "EXECUTION_AUTH_DENIED" in execution_status or execution_sent is False:
+    # 3) VERIFY explícito ou execução negada: não é posição real enviada.
+    elif registry_mode_raw == "VERIFY" or execution_mode == "VERIFY" or mode_raw == "VERIFY" or "EXECUTION_AUTH_DENIED" in execution_status or execution_sent is False:
         reasons.append("execution mode/status indicates VERIFY or not sent")
         mode = "VERIFY"
         confidence = "HIGH"
-    # 3) Evidência forte de BingX/real: posição/order id real ou origem de reparo real.
-    elif broker_position_id or live_order_id or broker_contracts is not None or execution_sent is True or any(x in source_l for x in [
-        "post_execution_safety_repair", "registry_persistence_v1_rebuild", "closed_manual_recovery", "bingx", "broker", "real_execution", "execution_engine_live"
-    ]):
-        reasons.append("broker/live execution evidence found")
-        mode = "REAL"
-        confidence = "HIGH"
-    # 4) Sync interno/histórico/PAPER registry: serve para analytics, não para gate real.
-    elif sync_from == "central_open_positions" or any(x in source_l for x in [
+    # 4) SYNC_ONLY explícito ou sync interno/histórico.
+    elif registry_mode_raw == "SYNC_ONLY" or sync_from == "central_open_positions" or any(x in source_l for x in [
         "main_traderegistry_sync", "central_open_positions", "turtle.py", "smart_predator", "donkey", "falcon.py", "predator.py"
     ]):
-        reasons.append("registry source indicates internal sync/strategy state, not broker execution")
+        reasons.append("explicit sync-only mode or registry source indicates internal strategy state")
         mode = "SYNC_ONLY"
         confidence = "MEDIUM"
-    # 5) Se qty real existir em trade fechado com PnL real, inferimos REAL com cautela.
+    # 5) Se qty existir em trade fechado com PnL real, inferimos REAL com cautela.
     elif qty is not None and realized_pnl is not None:
         reasons.append("numeric qty and realized/net pnl present")
         mode = "REAL"
         confidence = "MEDIUM"
-    # 6) V1.1: trade fechado histórico/sync recuperado de outcome event, sem evidência broker, não deve virar UNKNOWN.
+    # 6) Trade fechado histórico recuperado de outcome, sem evidência broker.
     elif (
         is_closed
         and outcome_evaluated
@@ -8371,7 +8432,15 @@ def trade_close_outcome_v1_gate_check():
         "unevaluated": blocking_unevaluated[:20],
         "ignored_non_real_unevaluated": ignored_unevaluated[:20],
         "rule": "Final Gate de execução real exige outcome apenas para CLOSED classificados como REAL ou UNKNOWN.",
-        "recommended_route": "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+        "recommended_route": (
+            None
+            if ok
+            else (
+                "/registrymodesegregation/health"
+                if all(str(row.get("bot") or "").upper() == "PREDATOR" for row in blocking_unevaluated)
+                else "/tradecloseoutcome/health"
+            )
+        ),
     }
 
 
@@ -8389,7 +8458,7 @@ def registry_mode_segregation_v1_health_route():
     payload["module"] = "registry_mode_segregation_v1"
     payload["notes"] = [
         "Classifica trades do Registry como REAL, PAPER, VERIFY, SYNC_ONLY ou UNKNOWN.",
-        "V1.1 corrige CLOSED histórico sem evidência broker: outcome event sem qty/PnL real vira SYNC_ONLY, não UNKNOWN.",
+        "V1.2 respeita registry_mode explícito e classifica CLOSED Predator como PAPER somente sem qualquer prova broker/REAL.",
         "Final Gate deve ignorar PAPER/VERIFY/SYNC_ONLY para execução real.",
         "UNKNOWN bloqueia por segurança até classificação ou correção do Registry.",
         "Use commit=true para gravar registry_mode em cada trade.",
