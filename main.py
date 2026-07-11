@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Patch: 2026-07-11-LIVE-PARTIAL-REALPNL-V1 — rotas /live/v12, /falcon/liveorder/detail/text, /manualpositions/text
+# Patch: 2026-07-11-HOTFIX-V4.1 — LIVE completed-history reconciliation + Real PnL/R V2.6.1
 # Versão: 2026-07-07-SUPER-CENTRAL-QUANT-V5-CEO-DAILY-V2.2-EXECUTION-AUDIT-V1
 #
 # Objetivo:
@@ -45030,7 +45030,7 @@ def falcon_real_pilot_preflight_checklist_v1_text_route():
 
 FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION = "2026-07-09-FALCON-LIVE-ORDER-AUDIT-DETAIL-V1"
 MANUAL_POSITION_AWARENESS_V1_VERSION = "2026-07-09-MANUAL-POSITION-AWARENESS-V1"
-LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION = "2026-07-09-LIVE-STATUS-V1.2-HISTORICAL-ACK-AWARENESS"
+LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION = "2026-07-11-LIVE-STATUS-V1.2.1-COMPLETED-HISTORY-RECON"
 
 try:
     _FLOAD_V1_DATA_DIR = CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")
@@ -45858,7 +45858,25 @@ def manual_position_awareness_v1_text_route():
 # LIVE Status V1.2 — Historical ACK Awareness
 # ----------------------------------------------------------------------------
 
-def _live_v12_classify_event(e, audit_payload=None):
+def _live_v12_order_detail_match(e, order_detail=None):
+    """Localiza a mesma ordem no detalhe reconciliado por order/client id."""
+    if not isinstance(e, dict) or not isinstance(order_detail, dict):
+        return None
+    event_order = _flad_v1_event_order_id(e)
+    event_client = _flad_v1_event_tag(e)
+    for row in order_detail.get("orders") or []:
+        if not isinstance(row, dict):
+            continue
+        row_order = row.get("order_id")
+        row_client = row.get("client_order_id")
+        if event_order and row_order and str(event_order) == str(row_order):
+            return row
+        if event_client and row_client and str(event_client) == str(row_client):
+            return row
+    return None
+
+
+def _live_v12_classify_event(e, audit_payload=None, order_detail=None):
     try:
         base = _live_v11_classify_event(e) if callable(globals().get("_live_v11_classify_event")) else {}
     except Exception:
@@ -45867,20 +45885,39 @@ def _live_v12_classify_event(e, audit_payload=None):
         base = {}
     if not _flad_v1_is_live_sent(e):
         return base or {"class_code": "UNKNOWN", "label": "⚪ UNKNOWN", "safe": True, "historical_acked": False}
+
     bad_stop = _flad_v1_is_bad_stop_event(e)
     acked_history = bool(bad_stop and _flad_v1_bad_event_acked(e, audit_payload=audit_payload))
+    detail_row = _live_v12_order_detail_match(e, order_detail=order_detail)
+    completed_history = bool(
+        not bad_stop
+        and isinstance(detail_row, dict)
+        and detail_row.get("review_status") == "HISTORICAL_COMPLETED_OR_CLOSED"
+        and not detail_row.get("action_required")
+    )
+
     out = dict(base)
     out["safe"] = False
     out["bot"] = _flad_v1_infer_bot(e)
     out["mode"] = "LIVE"
     out["bad_stop_event"] = bad_stop
     out["historical_acked"] = acked_history
+    out["historical_completed"] = completed_history
+
     if acked_history:
         out.update({
             "class_code": "LIVE_SENT_ACKED_HISTORY",
             "label": "🟡 LIVE_SENT_HISTÓRICO_ACK",
             "safe_operationally_cleared": True,
             "reason": "evento real antigo com falha reconhecida por ACK e limpo no Falcon Audit",
+        })
+    elif completed_history:
+        out.update({
+            "class_code": "LIVE_SENT_COMPLETED_HISTORY",
+            "label": "🟢 LIVE_SENT_HISTÓRICO_CONCLUÍDO",
+            "safe": True,
+            "safe_operationally_cleared": True,
+            "reason": "ordem real já encerrada; BingX e Central sem posição e detalhe reconciliado como histórico",
         })
     elif bad_stop:
         out.update({
@@ -45899,19 +45936,19 @@ def _live_v12_classify_event(e, audit_payload=None):
     return out
 
 
-def _live_v12_summarize_classes(items, audit_payload=None):
+def _live_v12_summarize_classes(items, audit_payload=None, order_detail=None):
     summary = {}
     for e in items or []:
-        c = _live_v12_classify_event(e, audit_payload=audit_payload)
+        c = _live_v12_classify_event(e, audit_payload=audit_payload, order_detail=order_detail)
         code = c.get("class_code", "UNKNOWN")
         summary[code] = int(summary.get(code, 0) or 0) + 1
     return summary
 
 
-def _live_v12_format_event_line(e, audit_payload=None):
+def _live_v12_format_event_line(e, audit_payload=None, order_detail=None):
     if not isinstance(e, dict):
         return f"- {e}"
-    c = _live_v12_classify_event(e, audit_payload=audit_payload)
+    c = _live_v12_classify_event(e, audit_payload=audit_payload, order_detail=order_detail)
     tag = _flad_v1_event_tag(e)
     tag_part = f" | tag={tag}" if tag else ""
     status = e.get("status") or e.get("event") or "UNKNOWN"
@@ -45942,16 +45979,20 @@ def build_live_report():
         manual_awareness = _mpa_v1_build_payload()
     except Exception as exc:
         manual_awareness = {"ok": False, "status": "MANUAL_AWARENESS_ERROR", "error": str(exc), "summary": {}}
-    class_summary = _live_v12_summarize_classes(exec_items or [], audit_payload=audit_payload)
+    class_summary = _live_v12_summarize_classes(exec_items or [], audit_payload=audit_payload, order_detail=order_detail)
     safe_count = 0
     live_sent_active_or_unacked = 0
     live_sent_historical_acked = 0
+    live_sent_completed_history = 0
     for e in exec_items or []:
-        c = _live_v12_classify_event(e, audit_payload=audit_payload)
-        if c.get("safe"):
-            safe_count += 1
-        elif c.get("class_code") == "LIVE_SENT_ACKED_HISTORY":
+        c = _live_v12_classify_event(e, audit_payload=audit_payload, order_detail=order_detail)
+        class_code = c.get("class_code")
+        if class_code == "LIVE_SENT_ACKED_HISTORY":
             live_sent_historical_acked += 1
+        elif class_code == "LIVE_SENT_COMPLETED_HISTORY":
+            live_sent_completed_history += 1
+        elif c.get("safe"):
+            safe_count += 1
         else:
             live_sent_active_or_unacked += 1
 
@@ -46006,7 +46047,8 @@ def build_live_report():
     if not exec_err and exec_items:
         lines.append(
             f"Eventos lidos: {len(exec_items)} | seguros/sem envio: {safe_count} | "
-            f"LIVE histórico ACK: {live_sent_historical_acked} | LIVE novo/ativo/não ACK: {live_sent_active_or_unacked}"
+            f"LIVE histórico ACK: {live_sent_historical_acked} | LIVE histórico concluído: {live_sent_completed_history} | "
+            f"LIVE novo/ativo/não ACK: {live_sent_active_or_unacked}"
         )
         if class_summary:
             compact = ", ".join([f"{k}={v}" for k, v in sorted(class_summary.items())])
@@ -46033,7 +46075,7 @@ def build_live_report():
         lines.append("Nenhum evento registrado ainda.")
     else:
         for e in shown_items:
-            lines.append(_live_v12_format_event_line(e, audit_payload=audit_payload))
+            lines.append(_live_v12_format_event_line(e, audit_payload=audit_payload, order_detail=order_detail))
 
     lines += ["", "LEITURA EXECUTIVA"]
     if not broker_positions and not central_live and ENABLE_REAL_TRADING:
@@ -46044,6 +46086,8 @@ def build_live_report():
         lines.append("🧪 Eventos Falcon em VERIFY são validações autorizadas de payload/ready, sem envio real.")
     if live_sent_historical_acked:
         lines.append("🟡 Há LIVE_SENT histórico já reconhecido por ACK; não é bloqueio novo enquanto Falcon Audit continuar CLEAR.")
+    if live_sent_completed_history:
+        lines.append("🟢 A ordem real encerrada foi reconciliada como histórico concluído; não exige tracking ativo.")
     if live_sent_active_or_unacked:
         lines.append("🔴 Há LIVE_SENT novo/ativo ou falha não reconhecida; acompanhar imediatamente com /falcon/liveorder/detail/text e /falcon/liveaudit/text.")
     if manual_awareness.get("status") == "MANUAL_OR_EXTERNAL_POSITION_PRESENT":
@@ -46059,6 +46103,7 @@ def build_live_report():
         "summary": {
             "safe_count": safe_count,
             "live_sent_historical_acked": live_sent_historical_acked,
+            "live_sent_completed_history": live_sent_completed_history,
             "live_sent_active_or_unacked": live_sent_active_or_unacked,
             "broker_bingx_open_count": len(broker_positions or []),
             "central_live_count": len(central_live or []),

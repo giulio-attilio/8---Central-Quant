@@ -108,11 +108,22 @@ def _safe_str(value: Any, default: str = "") -> str:
 
 
 def _is_empty(value: Any) -> bool:
-    if value in EMPTY_VALUES:
+    """Verificação type-safe de vazio.
+
+    A V2.6 podia receber listas/dicts vindos do Registry/BingX e tentava
+    consultá-los diretamente em EMPTY_VALUES (set), causando:
+    TypeError: cannot use 'list' as a set element.
+    """
+    if value is None:
         return True
-    if isinstance(value, str) and value.strip() in EMPTY_VALUES:
-        return True
-    return False
+    if isinstance(value, str):
+        return value.strip() in EMPTY_VALUES
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    try:
+        return value in EMPTY_VALUES
+    except TypeError:
+        return False
 
 
 def _read_jsonl(path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -903,31 +914,82 @@ if __name__ == "__main__":
 # (/data/trade_registry.json), enquanto a V2.5 lia apenas trade_registry.jsonl.
 # Continua observacional: não envia ordens, não altera risco e não rearma LIVE.
 
-VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6-REGISTRY-JSON-BINGX-RECON"
+VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6.1-TYPE-SAFE-REGISTRY-RECON"
 TRADE_REGISTRY_JSON_FILE = os.path.join(DATA_DIR, "trade_registry.json")
 BROKER_EXECUTIONS_LOG_FILE = os.path.join(DATA_DIR, "broker_executions_log.jsonl")
 BROKER_EXECUTION_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "broker_execution_audit_log.jsonl")
 
 
 def _read_trade_registry_json_rows(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Lê formatos conhecidos do Registry persistente sem assumir um único schema.
+
+    Compatível com containers list/dict em closed_trades, open_trades, trades,
+    positions, items e registry. Preserva o trade_id quando o container é dict.
+    """
     data = _read_json(TRADE_REGISTRY_JSON_FILE)
+    if data is None:
+        return []
+
     rows: List[Dict[str, Any]] = []
-    if not isinstance(data, dict):
-        return rows
-    for item in (data.get("closed_trades") or []):
-        if isinstance(item, dict):
-            row = dict(item)
-            row.setdefault("status", "CLOSED")
-            row.setdefault("event", "TRADE_CLOSED")
-            row.setdefault("registry_file", TRADE_REGISTRY_JSON_FILE)
-            rows.append(row)
-    for item in (data.get("open_trades") or {}).values():
-        if isinstance(item, dict):
-            row = dict(item)
-            row.setdefault("status", "OPEN")
-            row.setdefault("event", "TRADE_OPEN")
-            row.setdefault("registry_file", TRADE_REGISTRY_JSON_FILE)
-            rows.append(row)
+    seen: set = set()
+
+    def add_row(item: Any, default_status: Optional[str] = None, container_key: Optional[str] = None) -> None:
+        if not isinstance(item, dict):
+            return
+        row = dict(item)
+        if container_key and _is_empty(row.get("trade_id")):
+            row["trade_id"] = str(container_key)
+        if default_status:
+            row.setdefault("status", default_status)
+            row.setdefault("event", "TRADE_CLOSED" if default_status == "CLOSED" else "TRADE_OPEN")
+        row.setdefault("registry_file", TRADE_REGISTRY_JSON_FILE)
+        fingerprint = (
+            _safe_str(row.get("trade_id") or row.get("id") or row.get("order_id")),
+            _safe_str(row.get("status") or row.get("state")),
+            _safe_str(row.get("symbol")),
+            _safe_str(row.get("side")),
+            _safe_str(row.get("closed_at") or row.get("opened_at") or row.get("timestamp")),
+        )
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        rows.append(row)
+
+    def consume(container: Any, default_status: Optional[str] = None) -> None:
+        if isinstance(container, list):
+            for item in container:
+                add_row(item, default_status=default_status)
+        elif isinstance(container, dict):
+            # Um dict pode ser um trade único ou um mapa trade_id -> trade.
+            trade_markers = {"symbol", "side", "status", "state", "entry", "entry_price", "order_id", "trade_id"}
+            if trade_markers.intersection(container.keys()):
+                add_row(container, default_status=default_status)
+            else:
+                for key, item in container.items():
+                    add_row(item, default_status=default_status, container_key=str(key))
+
+    if isinstance(data, list):
+        consume(data)
+    elif isinstance(data, dict):
+        known = [
+            ("closed_trades", "CLOSED"),
+            ("closed", "CLOSED"),
+            ("open_trades", "OPEN"),
+            ("open", "OPEN"),
+            ("trades", None),
+            ("positions", None),
+            ("items", None),
+            ("registry", None),
+            ("data", None),
+        ]
+        consumed_any = False
+        for key, default_status in known:
+            if key in data:
+                consume(data.get(key), default_status=default_status)
+                consumed_any = True
+        if not consumed_any:
+            consume(data)
+
     if limit and len(rows) > int(limit):
         return rows[-int(limit):]
     return rows
@@ -1020,7 +1082,7 @@ def get_real_pnl_r_health() -> Dict[str, Any]:  # type: ignore[override]
             "output_events_exists": os.path.exists(OUTPUT_EVENTS_FILE),
         },
         "notes": [
-            "V2.6 lê /data/trade_registry.json além do legado trade_registry.jsonl.",
+            "V2.6.1 lê /data/trade_registry.json em múltiplos schemas e corrige valores list/dict com type-safety.",
             "Conta como Real PnL/R apenas registros com evidência LIVE/REAL/BROKER/BINGX/order_id.",
             "Se a exchange fechou a posição mas não houver fill/PnL salvo, o trade aparece como incompleto em diagnostics.",
         ],
@@ -1062,6 +1124,9 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
     merged = _merge_trades(normalized)
     closed = [r for r in merged if r.get("closed") or r.get("status") == "CLOSED"]
     diagnostics = _diagnostics(merged)
+    open_real_candidates = [r for r in merged if not (r.get("closed") or r.get("status") == "CLOSED")]
+    diagnostics["real_candidates_not_closed"] = len(open_real_candidates)
+    diagnostics["real_candidates_not_closed_recent"] = open_real_candidates[-25:]
     payload: Dict[str, Any] = {
         "ok": True,
         "version": VERSION,
@@ -1069,7 +1134,7 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "generated_at": _now_br(),
         "mode": MODE,
         "notes": [
-            "Real PnL/R Mapper V2.6 lê Registry JSON persistente e logs do broker.",
+            "Real PnL/R Mapper V2.6.1 lê Registry JSON persistente em múltiplos schemas e logs do broker.",
             "Não mistura PAPER/VERIFY sem evidência broker.",
             "Trades fechados sem PnL/exit/order fill aparecem no diagnóstico para reconciliação.",
         ],
@@ -1125,7 +1190,7 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:  # t
     diagnostics = payload.get("diagnostics", {}) or {}
     by_issue = diagnostics.get("by_issue", {}) or {}
     lines = [
-        "💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.6",
+        "💰 REAL PNL/R MAPPER — CENTRAL QUANT V2.6.1",
         f"Data/hora: {payload.get('generated_at')}",
         f"Status: {'✅' if payload.get('ok') else '❌'}",
         f"Modo: {payload.get('mode', MODE)}",
@@ -1153,6 +1218,7 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:  # t
     lines += ["", "Diagnóstico:"]
     lines.append(f"- Fechados completos: {diagnostics.get('closed_complete', 0)}")
     lines.append(f"- Fechados incompletos: {diagnostics.get('closed_incomplete', 0)}")
+    lines.append(f"- Candidatos reais ainda sem fechamento financeiro reconciliado: {diagnostics.get('real_candidates_not_closed', 0)}")
     if by_issue:
         for issue, count in by_issue.items():
             lines.append(f"- {issue}: {count}")
@@ -1169,7 +1235,7 @@ def build_real_pnl_r_text(payload: Optional[Dict[str, Any]] = None) -> str:  # t
     lines += [
         "",
         "Observação:",
-        "- V2.6 lê /data/trade_registry.json e logs broker_* além das fontes antigas.",
+        "- V2.6.1 lê /data/trade_registry.json em múltiplos schemas e logs broker_*.",
         "- Continua observacional: não muda lote, risco, execução ou policies ativas.",
     ]
     return "\n".join(lines)
