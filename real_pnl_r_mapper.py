@@ -36,7 +36,18 @@ VERSION = "2026-07-07-REAL-PNL-R-MAPPER-V2.5"
 MODULE = "real_pnl_r_mapper"
 MODE = "OBSERVATION_ONLY"
 
-DATA_DIR = os.environ.get("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
+def _resolve_data_dir():
+    configured = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
+    if configured:
+        return configured
+    try:
+        if os.path.isdir("/data"):
+            return "/data"
+    except Exception:
+        pass
+    return "/opt/render/project/src/data"
+
+DATA_DIR = _resolve_data_dir()
 TRADE_REGISTRY_FILE = os.path.join(DATA_DIR, "trade_registry.jsonl")
 HISTORY_EVENTS_FILE = os.path.join(DATA_DIR, "history_events.jsonl")
 HISTORY_EXPORT_FILE = os.path.join(DATA_DIR, "history_export.json")

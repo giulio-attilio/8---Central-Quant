@@ -45258,6 +45258,19 @@ def _flad_v1_is_live_sent(e):
 
 
 def _flad_v1_is_falcon_live_sent(e):
+    # Control/audit ACK events are not real broker orders and must not appear as LIVE orders.
+    try:
+        ev = _flad_v1_upper(e.get("event") if isinstance(e, dict) else "")
+        st = _flad_v1_upper(_flad_v1_event_status(e))
+        if ev in {"FALCON_LIVE_AUDIT_ACK", "FALCON_LIVE_EXECUTION_AUDIT_ACK"} or st in {"FALCON_LIVE_AUDIT_ACK", "FALCON_LIVE_EXECUTION_AUDIT_ACK"}:
+            return False
+        # If there is no order id, client id, symbol or side, it is not a broker order.
+        has_order_identity = bool(_flad_v1_event_order_id(e) or _flad_v1_event_client_id(e))
+        has_trade_identity = bool(_flad_v1_deep_find(e, ["symbol", "market_symbol", "pair", "instrument", "asset"]) and _flad_v1_deep_find(e, ["side", "position_side", "positionSide", "direction"]))
+        if not (has_order_identity or has_trade_identity):
+            return False
+    except Exception:
+        pass
     return bool(_flad_v1_is_live_sent(e) and _flad_v1_infer_bot(e) == "FALCON")
 
 
@@ -45463,6 +45476,21 @@ def _flad_v1_build_payload(limit=100):
     unacked_failures = [d for d in details if d.get("bad_stop_event") and not d.get("historical_acked")]
     active_or_tracking = [d for d in details if d.get("action_required") and not d.get("bad_stop_event")]
     divergence = audit.get("divergence") if isinstance(audit.get("divergence"), dict) else {}
+    no_open_exposure = (
+        int(divergence.get("broker_bingx_open_count") or 0) == 0
+        and int(divergence.get("central_live_count") or 0) == 0
+        and int(divergence.get("only_bingx_count") or 0) == 0
+        and int(divergence.get("only_central_count") or 0) == 0
+        and int(divergence.get("live_without_stop_count") or 0) == 0
+    )
+    # A real order already closed and reconciled as no-open-position should not keep the system
+    # in LIVE_ORDER_TRACKING_REQUIRED forever. It remains visible as historical completed.
+    if no_open_exposure and not unacked_failures:
+        for d in details:
+            if d.get("review_status") == "LIVE_ORDER_REQUIRES_TRACKING":
+                d["review_status"] = "HISTORICAL_COMPLETED_OR_CLOSED"
+                d["action_required"] = False
+        active_or_tracking = []
     if unacked_failures:
         status = "BLOCKED_UNACKED_LIVE_FAILURE"
         ok = False
