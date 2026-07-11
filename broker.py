@@ -1,6 +1,7 @@
 # ==============================================================================
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
 # Versão: 2026-07-09-BROKER-DISASTER-STOP-HEDGE-MODE-FIX-V1.1
+# Patch adicional: 2026-07-11-REAL-CLOSE-RECONCILIATION-V1 (read-only order/fill/PnL)
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -2416,4 +2417,487 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
             "Este preview não confirma que a BingX aceitará closePosition via CCXT/API.",
             "Só habilitar envio real depois de teste controlado em tamanho mínimo e com Falcon desarmado.",
         ],
+    }
+
+# ==============================================================================
+# REAL CLOSE RECONCILIATION V1 — READ-ONLY BINGX ORDER/FILL/PNL
+# ==============================================================================
+# Segurança:
+# - Estas funções apenas consultam a BingX.
+# - Nenhuma função chama create_order, cancel_order ou close_position_market.
+# - O resultado só é considerado completo quando existe fill de fechamento
+#   suficiente para a quantidade original e a posição não está mais aberta.
+REAL_CLOSE_RECONCILIATION_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-V1"
+
+
+def _rcr_v1_epoch(value, default=None):
+    if value is None or value == "":
+        return default
+    try:
+        number = float(value)
+        if number > 10_000_000_000:
+            return number / 1000.0
+        if number > 1_000_000_000:
+            return number
+    except Exception:
+        pass
+    text = str(value).strip()
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TIMEZONE_BR if fmt.startswith("%d/%m") else timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            continue
+    return default
+
+
+def _rcr_v1_list_from_response(payload):
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("data", "orders", "order", "fills", "trades", "items", "list", "records", "income"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested = _rcr_v1_list_from_response(value)
+            if nested:
+                return nested
+            if key == "order":
+                return [value]
+    return []
+
+
+def _rcr_v1_info(item):
+    return item.get("info") if isinstance(item, dict) and isinstance(item.get("info"), dict) else {}
+
+
+def _rcr_v1_first(item, *keys, default=None):
+    if not isinstance(item, dict):
+        return default
+    info = _rcr_v1_info(item)
+    for key in keys:
+        value = item.get(key)
+        if value is None or value == "":
+            value = info.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _rcr_v1_order_id(item):
+    value = _rcr_v1_first(item, "order_id", "orderId", "orderID", "id", "order")
+    return str(value or "").strip()
+
+
+def _rcr_v1_client_id(item):
+    value = _rcr_v1_first(item, "client_order_id", "clientOrderId", "clientOrderID", "clientOid")
+    return str(value or "").strip()
+
+
+def _rcr_v1_item_timestamp(item):
+    return _rcr_v1_epoch(_rcr_v1_first(item, "timestamp", "time", "transactTime", "updateTime", "createdTime", "created_at"), None)
+
+
+def _rcr_v1_side(item):
+    side = str(_rcr_v1_first(item, "side", default="") or "").lower().strip()
+    if side in {"buy", "long"}:
+        return "buy"
+    if side in {"sell", "short"}:
+        return "sell"
+    return side
+
+
+def _rcr_v1_position_side(item):
+    side = str(_rcr_v1_first(item, "positionSide", "position_side", default="") or "").upper().strip()
+    return side
+
+
+def _rcr_v1_price(item):
+    return safe_float(_rcr_v1_first(item, "price", "average", "avgPrice", "filledPrice", "tradePrice", "executionPrice"), None)
+
+
+def _rcr_v1_amount(item):
+    return abs(safe_float(_rcr_v1_first(item, "amount", "qty", "quantity", "filled", "executedQty", "volume", "size"), 0.0) or 0.0)
+
+
+def _rcr_v1_fee(item):
+    if not isinstance(item, dict):
+        return 0.0
+    fee = item.get("fee")
+    if isinstance(fee, dict):
+        return abs(safe_float(fee.get("cost"), 0.0) or 0.0)
+    value = _rcr_v1_first(item, "fee", "commission", "tradeFee", "feeAmount")
+    return abs(safe_float(value, 0.0) or 0.0)
+
+
+def _rcr_v1_realized(item):
+    return safe_float(_rcr_v1_first(item, "realizedPnl", "realizedPNL", "realizedProfit", "profit", "closedPnl", "pnl"), None)
+
+
+def _rcr_v1_symbol_matches(item, symbol):
+    expected = bingx_api_symbol(symbol).replace("-", "").upper()
+    raw = str(_rcr_v1_first(item, "symbol", default="") or "").replace("/", "").replace(":USDT", "").replace("-", "").upper()
+    return not raw or raw == expected
+
+
+def _rcr_v1_call_raw(method_names, params):
+    ex = exchange()
+    attempts = []
+    rows = []
+    for method_name in method_names:
+        method = getattr(ex, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            response = method(dict(params or {}))
+            attempts.append({"method": method_name, "ok": True, "count": len(_rcr_v1_list_from_response(response))})
+            rows.extend(_rcr_v1_list_from_response(response))
+        except Exception as exc:
+            attempts.append({"method": method_name, "ok": False, "error": str(exc)[:500]})
+    return rows, attempts
+
+
+def fetch_order_by_id(symbol, order_id=None, client_order_id=None):
+    """Consulta read-only de uma ordem específica por orderId/clientOrderId."""
+    sym = normalize_symbol(symbol)
+    api_symbol = bingx_api_symbol(sym)
+    ex = exchange()
+    attempts = []
+    matches = []
+    oid = str(order_id or "").strip()
+    cid = str(client_order_id or "").strip()
+
+    if oid and callable(getattr(ex, "fetch_order", None)):
+        try:
+            item = ex.fetch_order(oid, sym)
+            attempts.append({"method": "fetch_order", "ok": True})
+            if isinstance(item, dict):
+                matches.append(item)
+        except Exception as exc:
+            attempts.append({"method": "fetch_order", "ok": False, "error": str(exc)[:500]})
+
+    params = {"symbol": api_symbol}
+    if oid:
+        params["orderId"] = oid
+    if cid:
+        params["clientOrderID"] = cid
+    raw_rows, raw_attempts = _rcr_v1_call_raw(
+        [
+            "swapV2PrivateGetTradeOrder",
+            "swap_v2_private_get_trade_order",
+            "swapV2PrivateGetTradeOpenOrder",
+            "swap_v2_private_get_trade_open_order",
+        ],
+        params,
+    )
+    attempts.extend(raw_attempts)
+    matches.extend(raw_rows)
+
+    # Fallback para listagem, sem executar nada.
+    recent = fetch_recent_orders(symbol=sym, since=None, limit=200)
+    attempts.extend(recent.get("errors") or [])
+    matches.extend(recent.get("orders") or [])
+
+    def is_match(item):
+        return bool((oid and _rcr_v1_order_id(item) == oid) or (cid and _rcr_v1_client_id(item) == cid))
+
+    matched = [item for item in matches if isinstance(item, dict) and is_match(item)]
+    selected = matched[-1] if matched else None
+    return {
+        "ok": bool(selected),
+        "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
+        "symbol": sym,
+        "order_id": oid or None,
+        "client_order_id": cid or None,
+        "order": selected,
+        "matched_count": len(matched),
+        "attempts": attempts,
+        "read_only": True,
+        "sent": False,
+    }
+
+
+def fetch_order_trades(symbol, order_id=None, client_order_id=None, since=None, limit=500):
+    """Consulta fills/trades e filtra por orderId/clientOrderId."""
+    sym = normalize_symbol(symbol)
+    since_ms = int(float(since) * 1000) if since and float(since) < 10_000_000_000 else (int(float(since)) if since else None)
+    payload = fetch_recent_my_trades(symbol=sym, since=since_ms, limit=limit)
+    rows = list(payload.get("trades") or [])
+    raw_rows, attempts = _rcr_v1_call_raw(
+        [
+            "swapV2PrivateGetTradeAllFillOrders",
+            "swap_v2_private_get_trade_all_fill_orders",
+            "swapV2PrivateGetTradeAllfillorders",
+        ],
+        {
+            "symbol": bingx_api_symbol(sym),
+            "startTime": since_ms,
+            "limit": min(max(int(limit or 500), 1), 1000),
+        },
+    )
+    rows.extend(raw_rows)
+    oid = str(order_id or "").strip()
+    cid = str(client_order_id or "").strip()
+    matched = [
+        item
+        for item in rows
+        if isinstance(item, dict)
+        and _rcr_v1_symbol_matches(item, sym)
+        and ((oid and _rcr_v1_order_id(item) == oid) or (cid and _rcr_v1_client_id(item) == cid))
+    ]
+    return {
+        "ok": bool(payload.get("ok") or raw_rows),
+        "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
+        "symbol": sym,
+        "trades": matched,
+        "all_trades": rows,
+        "matched_count": len(matched),
+        "attempts": attempts,
+        "error": payload.get("error"),
+        "read_only": True,
+        "sent": False,
+    }
+
+
+def fetch_realized_income(symbol, since=None, limit=500):
+    """Consulta ledger/income read-only para PnL realizado, taxas e funding."""
+    sym = normalize_symbol(symbol)
+    since_ms = int(float(since) * 1000) if since and float(since) < 10_000_000_000 else (int(float(since)) if since else None)
+    ex = exchange()
+    rows = []
+    attempts = []
+    fetch_ledger = getattr(ex, "fetch_ledger", None)
+    if callable(fetch_ledger):
+        try:
+            try:
+                data = fetch_ledger(None, since_ms, limit, {"type": BINGX_DEFAULT_TYPE})
+            except TypeError:
+                data = fetch_ledger(None, since_ms, limit)
+            rows.extend([item for item in data or [] if isinstance(item, dict)])
+            attempts.append({"method": "fetch_ledger", "ok": True, "count": len(data or [])})
+        except Exception as exc:
+            attempts.append({"method": "fetch_ledger", "ok": False, "error": str(exc)[:500]})
+
+    raw_rows, raw_attempts = _rcr_v1_call_raw(
+        [
+            "swapV2PrivateGetUserIncome",
+            "swap_v2_private_get_user_income",
+            "swapV3PrivateGetUserIncome",
+            "swap_v3_private_get_user_income",
+        ],
+        {
+            "symbol": bingx_api_symbol(sym),
+            "startTime": since_ms,
+            "limit": min(max(int(limit or 500), 1), 1000),
+        },
+    )
+    rows.extend(raw_rows)
+    attempts.extend(raw_attempts)
+    rows = [item for item in rows if _rcr_v1_symbol_matches(item, sym)]
+    return {
+        "ok": bool(rows) or any(item.get("ok") for item in attempts),
+        "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
+        "symbol": sym,
+        "items": rows,
+        "count": len(rows),
+        "attempts": attempts,
+        "read_only": True,
+        "sent": False,
+    }
+
+
+def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=None, opened_at=None, opened_epoch=None, qty=None, entry_price=None):
+    """
+    Reconcilia um trade já fechado usando ordem de entrada + fills opostos.
+
+    Retorna complete=True apenas quando:
+    - a ordem/fill de entrada foi identificada;
+    - fills de fechamento cobrem a quantidade original;
+    - não existe posição aberta do mesmo symbol/positionSide.
+    """
+    sym = normalize_symbol(symbol)
+    side_n = str(side or "").upper().strip()
+    open_side = "sell" if side_n in {"SHORT", "SELL"} else "buy"
+    close_side = "buy" if open_side == "sell" else "sell"
+    position_side = "SHORT" if open_side == "sell" else "LONG"
+    start_epoch = _rcr_v1_epoch(opened_epoch, None) or _rcr_v1_epoch(opened_at, None)
+    if start_epoch:
+        start_epoch = max(0.0, start_epoch - 300.0)
+
+    order_payload = fetch_order_by_id(sym, order_id=open_order_id, client_order_id=client_order_id)
+    order = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else {}
+    order_ts = _rcr_v1_item_timestamp(order) or start_epoch
+    entry = safe_float(entry_price, None) or _rcr_v1_price(order)
+    expected_qty = abs(safe_float(qty, 0.0) or 0.0) or _rcr_v1_amount(order)
+
+    all_trades_payload = fetch_order_trades(
+        sym,
+        order_id=open_order_id,
+        client_order_id=client_order_id,
+        since=order_ts or start_epoch,
+        limit=800,
+    )
+    all_trades = [item for item in (all_trades_payload.get("all_trades") or []) if isinstance(item, dict)]
+    all_trades.sort(key=lambda item: _rcr_v1_item_timestamp(item) or 0.0)
+
+    opening_fills = []
+    closing_candidates = []
+    oid = str(open_order_id or "").strip()
+    cid = str(client_order_id or "").strip()
+    for item in all_trades:
+        if not _rcr_v1_symbol_matches(item, sym):
+            continue
+        item_side = _rcr_v1_side(item)
+        item_position_side = _rcr_v1_position_side(item)
+        item_ts = _rcr_v1_item_timestamp(item)
+        is_open_id = bool((oid and _rcr_v1_order_id(item) == oid) or (cid and _rcr_v1_client_id(item) == cid))
+        if is_open_id or (item_side == open_side and order_ts and item_ts and abs(item_ts - order_ts) <= 180):
+            opening_fills.append(item)
+            continue
+        if item_side != close_side:
+            continue
+        if item_position_side and item_position_side != position_side:
+            continue
+        if order_ts and item_ts and item_ts < order_ts:
+            continue
+        closing_candidates.append(item)
+
+    selected_closing = []
+    selected_qty = 0.0
+    target_qty = expected_qty
+    for item in closing_candidates:
+        amount = _rcr_v1_amount(item)
+        if amount <= 0:
+            continue
+        selected_closing.append(item)
+        selected_qty += amount
+        if target_qty and selected_qty >= target_qty * 0.999:
+            break
+
+    weighted_cost = sum((_rcr_v1_price(item) or 0.0) * _rcr_v1_amount(item) for item in selected_closing)
+    exit_price = weighted_cost / selected_qty if selected_qty > 0 else None
+    if entry is None and opening_fills:
+        open_qty = sum(_rcr_v1_amount(item) for item in opening_fills)
+        open_cost = sum((_rcr_v1_price(item) or 0.0) * _rcr_v1_amount(item) for item in opening_fills)
+        entry = open_cost / open_qty if open_qty else None
+        if not expected_qty:
+            expected_qty = open_qty
+
+    opening_fee = sum(_rcr_v1_fee(item) for item in opening_fills)
+    closing_fee = sum(_rcr_v1_fee(item) for item in selected_closing)
+    fee_total = opening_fee + closing_fee
+    realized_values = [_rcr_v1_realized(item) for item in selected_closing]
+    realized_values = [value for value in realized_values if value is not None]
+    realized_gross = sum(realized_values) if realized_values else None
+    if realized_gross is None and entry is not None and exit_price is not None and selected_qty > 0:
+        realized_gross = ((entry - exit_price) if position_side == "SHORT" else (exit_price - entry)) * selected_qty
+
+    income_payload = fetch_realized_income(sym, since=order_ts or start_epoch, limit=800)
+    funding = 0.0
+    ledger_realized = 0.0
+    ledger_realized_found = False
+    for item in income_payload.get("items") or []:
+        item_ts = _rcr_v1_item_timestamp(item)
+        if order_ts and item_ts and item_ts < order_ts:
+            continue
+        type_text = str(_rcr_v1_first(item, "type", "incomeType", "category", default="") or "").upper()
+        amount = safe_float(_rcr_v1_first(item, "amount", "income", "pnl", "profit", "change"), None)
+        if amount is None:
+            continue
+        if "FUND" in type_text:
+            funding += amount
+        elif any(token in type_text for token in ("REALIZED", "PNL", "CLOSE")):
+            ledger_realized += amount
+            ledger_realized_found = True
+
+    if ledger_realized_found:
+        realized_gross = ledger_realized
+
+    positions = []
+    position_error = None
+    try:
+        positions = get_positions([sym])
+    except Exception as exc:
+        position_error = str(exc)
+    relevant_open = []
+    for pos in positions or []:
+        if not isinstance(pos, dict) or not _rcr_v1_symbol_matches(pos, sym):
+            continue
+        contracts = abs(safe_float(_rcr_v1_first(pos, "contracts", "positionAmt", "amount", "size"), 0.0) or 0.0)
+        pside = _rcr_v1_position_side(pos)
+        if contracts > 0 and (not pside or pside == position_side):
+            relevant_open.append(pos)
+
+    qty_complete = bool(expected_qty and selected_qty >= expected_qty * 0.999)
+    position_closed = len(relevant_open) == 0
+    complete = bool(entry is not None and exit_price is not None and selected_qty > 0 and qty_complete and position_closed)
+    net_pnl = (realized_gross or 0.0) - fee_total + funding if realized_gross is not None else None
+    close_order_ids = sorted({value for value in (_rcr_v1_order_id(item) for item in selected_closing) if value})
+    closed_at_epoch = max([_rcr_v1_item_timestamp(item) or 0.0 for item in selected_closing], default=0.0) or None
+    closed_at = datetime.fromtimestamp(closed_at_epoch, TIMEZONE_BR).strftime("%d/%m/%Y %H:%M:%S") if closed_at_epoch else None
+
+    issues = []
+    if not order_payload.get("ok") and not opening_fills:
+        issues.append("OPEN_ORDER_OR_FILL_NOT_FOUND")
+    if entry is None:
+        issues.append("ENTRY_PRICE_MISSING")
+    if not selected_closing:
+        issues.append("CLOSING_FILL_NOT_FOUND")
+    if expected_qty and not qty_complete:
+        issues.append("CLOSING_QTY_INCOMPLETE")
+    if not position_closed:
+        issues.append("POSITION_STILL_OPEN")
+    if realized_gross is None:
+        issues.append("REALIZED_PNL_MISSING")
+
+    return {
+        "ok": True,
+        "complete": complete,
+        "status": "BROKER_CLOSE_RECONCILED" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE",
+        "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
+        "generated_at": agora_sp_str(),
+        "read_only": True,
+        "sent": False,
+        "would_send_order": False,
+        "symbol": sym,
+        "side": position_side,
+        "open_order_id": open_order_id,
+        "client_order_id": client_order_id,
+        "close_order_ids": close_order_ids,
+        "entry_price": entry,
+        "exit_price": exit_price,
+        "expected_qty": expected_qty,
+        "closed_qty": selected_qty,
+        "qty_complete": qty_complete,
+        "position_closed": position_closed,
+        "closed_at": closed_at,
+        "closed_at_epoch": closed_at_epoch,
+        "realized_pnl_gross": realized_gross,
+        "opening_fee": opening_fee,
+        "closing_fee": closing_fee,
+        "fee_total": fee_total,
+        "funding": funding,
+        "net_pnl": net_pnl,
+        "opening_fills": opening_fills,
+        "closing_fills": selected_closing,
+        "income_items": income_payload.get("items") or [],
+        "open_positions": relevant_open,
+        "position_fetch_error": position_error,
+        "issues": issues,
+        "data_quality": "HIGH_BROKER_RECONCILED" if complete else "LOW_INCOMPLETE",
+        "order_lookup": order_payload,
+        "trade_lookup": {
+            "ok": all_trades_payload.get("ok"),
+            "error": all_trades_payload.get("error"),
+            "total_count": len(all_trades),
+        },
+        "income_lookup": {
+            "ok": income_payload.get("ok"),
+            "count": income_payload.get("count"),
+            "attempts": income_payload.get("attempts"),
+        },
     }

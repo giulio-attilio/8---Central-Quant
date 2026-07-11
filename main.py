@@ -1,5 +1,5 @@
 # CENTRAL QUANT PRO FULL - SUPERVISOR MODULAR
-# Patch: 2026-07-11-HOTFIX-V4.1 — LIVE completed-history reconciliation + Real PnL/R V2.6.1
+# Patch: 2026-07-11-REAL-CLOSE-RECONCILIATION-V1 — BingX fills → Registry REAL → Outcome
 # Versão: 2026-07-07-SUPER-CENTRAL-QUANT-V5-CEO-DAILY-V2.2-EXECUTION-AUDIT-V1
 #
 # Objetivo:
@@ -46155,6 +46155,608 @@ def falcon_disaster_stop_close_position_preview_route():
     ]
     payload["text"] = "\n".join(lines)
     return payload, 200
+
+
+# ==============================================================================
+# REAL CLOSE RECONCILIATION V1 — BROKER FILLS → REGISTRY → OUTCOME
+# Patch: 2026-07-11-REAL-CLOSE-RECONCILIATION-MAIN-V1
+# ==============================================================================
+# Segurança:
+# - Todas as consultas à BingX são read-only.
+# - Nenhuma rota deste bloco abre, fecha, cancela ou altera ordens.
+# - Commit só ocorre com evidência broker completa; pela rota manual exige ACK.
+REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-MAIN-V1"
+REAL_CLOSE_RECONCILIATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_latest.json"
+REAL_CLOSE_RECONCILIATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_events.jsonl"
+
+
+def _rcrm_v1_now():
+    try:
+        return data_hora_sp_str()
+    except Exception:
+        return datetime.now(TIMEZONE_BR).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _rcrm_v1_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "commit", "save"}
+
+
+def _rcrm_v1_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return default
+
+
+def _rcrm_v1_norm_symbol(value):
+    return str(value or "").upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _rcrm_v1_norm_side(value):
+    side = str(value or "").upper().strip()
+    if side in {"BUY", "LONG"}:
+        return "LONG"
+    if side in {"SELL", "SHORT"}:
+        return "SHORT"
+    return side
+
+
+def _rcrm_v1_meta(trade):
+    return trade.get("metadata") if isinstance(trade, dict) and isinstance(trade.get("metadata"), dict) else {}
+
+
+def _rcrm_v1_first(trade, *keys, default=None):
+    if not isinstance(trade, dict):
+        return default
+    meta = _rcrm_v1_meta(trade)
+    for key in keys:
+        value = trade.get(key)
+        if value is None or value == "":
+            value = meta.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _rcrm_v1_public(obj):
+    sensitive = ("token", "secret", "signature", "api_key", "apikey", "authorization")
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if any(part in str(key).lower() for part in sensitive):
+                out[key] = "***MASKED***" if value not in (None, "", False) else value
+            elif str(key).lower() in {"opening_fills", "closing_fills", "income_items", "all_trades", "order_lookup"}:
+                if isinstance(value, list):
+                    out[key] = [_rcrm_v1_public(item) for item in value[:20]]
+                elif isinstance(value, dict):
+                    out[key] = _rcrm_v1_public(value)
+                else:
+                    out[key] = value
+            else:
+                out[key] = _rcrm_v1_public(value)
+        return out
+    if isinstance(obj, list):
+        return [_rcrm_v1_public(item) for item in obj[:50]]
+    return obj
+
+
+def _rcrm_v1_write(path, payload):
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _rcrm_v1_append(path, payload):
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file_obj:
+            file_obj.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _rcrm_v1_find_closed_trade(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    if central_trade_registry is None:
+        return {"ok": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR}
+    trade_id = str(payload.get("trade_id") or payload.get("trade_key") or "").strip() or None
+    bot = str(payload.get("bot") or "FALCON").upper().strip()
+    symbol = _rcrm_v1_norm_symbol(payload.get("symbol") or "BTCUSDT")
+    side = _rcrm_v1_norm_side(payload.get("side") or "SHORT")
+    setup = str(payload.get("setup") or "").upper().strip() or None
+
+    getter = getattr(central_trade_registry, "get_closed_trade", None)
+    if callable(getter):
+        result = getter(trade_id=trade_id, bot=None if trade_id else bot, symbol=None if trade_id else symbol,
+                        side=None if trade_id else side, setup=None if trade_id else setup)
+        if isinstance(result, dict) and result.get("ok"):
+            return result
+        # O endpoint antigo recomenda setup=FALCON, enquanto o trade real é FALCON15.
+        if setup and not trade_id:
+            result = getter(bot=bot, symbol=symbol, side=side, setup=None)
+            if isinstance(result, dict) and result.get("ok"):
+                return result
+
+    try:
+        registry = central_trade_registry.load_registry()
+    except Exception as exc:
+        return {"ok": False, "status": "TRADE_REGISTRY_READ_ERROR", "error": str(exc)}
+    closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
+    if isinstance(closed, dict):
+        closed = list(closed.values())
+    matches = []
+    for index, trade in enumerate(closed if isinstance(closed, list) else []):
+        if not isinstance(trade, dict):
+            continue
+        if trade_id and str(trade.get("trade_id") or "") != trade_id:
+            continue
+        if not trade_id:
+            if str(trade.get("bot") or "").upper().strip() != bot:
+                continue
+            if _rcrm_v1_norm_symbol(trade.get("symbol")) != symbol:
+                continue
+            if _rcrm_v1_norm_side(trade.get("side")) != side:
+                continue
+            if setup and str(trade.get("setup") or "").upper().strip() not in {setup, "FALCON15", "FALCON30"}:
+                continue
+        matches.append((index, trade))
+    if not matches:
+        return {"ok": False, "status": "CLOSED_TRADE_NOT_FOUND", "trade_id": trade_id}
+    index, trade = matches[-1]
+    return {"ok": True, "status": "CLOSED", "index": index, "trade_id": trade.get("trade_id"), "trade": trade}
+
+
+def _rcrm_v1_execution_evidence(trade):
+    if central_broker is None:
+        return None
+    try:
+        rows = central_broker.get_executions_log(limit=500) if callable(getattr(central_broker, "get_executions_log", None)) else []
+    except Exception:
+        rows = []
+    symbol = _rcrm_v1_norm_symbol(trade.get("symbol"))
+    side = _rcrm_v1_norm_side(trade.get("side"))
+    bot = str(trade.get("bot") or "").upper().strip()
+    matches = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        sent = row.get("sent") is True or str(row.get("sent") or "").lower() == "true"
+        status = str(row.get("status") or "").upper()
+        if not sent and status not in {"SENT", "LIVE_SENT", "LIVE_SENT_BUT_DISASTER_STOP_FAILED"}:
+            continue
+        if _rcrm_v1_norm_symbol(row.get("symbol")) != symbol:
+            continue
+        if _rcrm_v1_norm_side(row.get("side")) != side:
+            continue
+        client_id = str(row.get("clientOrderId") or row.get("client_order_id") or row.get("client_tag") or "")
+        if bot and client_id and bot not in client_id.upper():
+            continue
+        matches.append(row)
+    return matches[-1] if matches else None
+
+
+def _rcrm_v1_values(trade):
+    evidence = _rcrm_v1_execution_evidence(trade) or {}
+    order_id = _rcrm_v1_first(trade, "broker_order_id", "live_order_id", "order_id", "orderId")
+    client_id = _rcrm_v1_first(trade, "client_order_id", "clientOrderId", "client_tag")
+    if not order_id:
+        order_id = evidence.get("order_id") or evidence.get("id") or evidence.get("orderId")
+    if not client_id:
+        client_id = evidence.get("clientOrderId") or evidence.get("client_order_id") or evidence.get("client_tag")
+    return {
+        "order_id": str(order_id or "").strip() or None,
+        "client_order_id": str(client_id or "").strip() or None,
+        "entry": _rcrm_v1_float(_rcrm_v1_first(trade, "entry", "entry_price", "avg_entry_price")),
+        "stop": _rcrm_v1_float(_rcrm_v1_first(trade, "sl", "stop", "stop_loss", "original_stop", "disaster_stop_price")),
+        "qty": _rcrm_v1_float(_rcrm_v1_first(trade, "qty", "contracts", "amount", "quantity")),
+        "opened_at": _rcrm_v1_first(trade, "opened_at", "entry_time", "created_at"),
+        "opened_epoch": _rcrm_v1_float(_rcrm_v1_first(trade, "opened_epoch", "entry_epoch", "timestamp")),
+        "execution_evidence": evidence,
+    }
+
+
+def _rcrm_v1_metrics(side, entry, stop, exit_price, qty, net_pnl):
+    side = _rcrm_v1_norm_side(side)
+    pnl_pct = None
+    r_price = None
+    r_net = None
+    risk_usdt = None
+    if entry and exit_price:
+        move = (entry - exit_price) if side == "SHORT" else (exit_price - entry)
+        pnl_pct = (move / entry) * 100.0 if entry else None
+        if stop:
+            risk_per_unit = (stop - entry) if side == "SHORT" else (entry - stop)
+            if risk_per_unit > 0:
+                r_price = move / risk_per_unit
+                if qty:
+                    risk_usdt = risk_per_unit * abs(qty)
+                    if net_pnl is not None and risk_usdt > 0:
+                        r_net = net_pnl / risk_usdt
+    return {
+        "pnl_pct": round(pnl_pct, 8) if pnl_pct is not None else None,
+        "r_price": round(r_price, 8) if r_price is not None else None,
+        "r_net": round(r_net, 8) if r_net is not None else None,
+        "risk_usdt": round(risk_usdt, 8) if risk_usdt is not None else None,
+    }
+
+
+def real_close_reconciliation_v1_run(payload=None, commit=False, source="route"):
+    payload = payload if isinstance(payload, dict) else {}
+    base = {
+        "ok": True,
+        "module": "real_close_reconciliation_v1",
+        "version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+        "generated_at": _rcrm_v1_now(),
+        "source": source,
+        "read_only_broker_lookup": True,
+        "sent": False,
+        "would_send_order": False,
+        "commit_requested": bool(commit),
+    }
+    if central_broker is None or not callable(getattr(central_broker, "reconcile_closed_trade", None)):
+        return dict(base, ok=False, status="BROKER_RECONCILIATION_HELPER_UNAVAILABLE", error=BROKER_IMPORT_ERROR)
+    found = _rcrm_v1_find_closed_trade(payload)
+    if not found.get("ok"):
+        return dict(base, ok=False, status=found.get("status"), error=found.get("error"), trade_lookup=found)
+    trade = found.get("trade") or {}
+    values = _rcrm_v1_values(trade)
+    symbol = _rcrm_v1_norm_symbol(trade.get("symbol") or payload.get("symbol"))
+    side = _rcrm_v1_norm_side(trade.get("side") or payload.get("side"))
+    broker_result = central_broker.reconcile_closed_trade(
+        symbol=symbol,
+        side=side,
+        open_order_id=values.get("order_id"),
+        client_order_id=values.get("client_order_id"),
+        opened_at=values.get("opened_at"),
+        opened_epoch=values.get("opened_epoch"),
+        qty=values.get("qty"),
+        entry_price=values.get("entry"),
+    )
+    entry = _rcrm_v1_float(broker_result.get("entry_price"), values.get("entry"))
+    exit_price = _rcrm_v1_float(broker_result.get("exit_price"))
+    qty = _rcrm_v1_float(broker_result.get("expected_qty"), values.get("qty"))
+    net_pnl = _rcrm_v1_float(broker_result.get("net_pnl"))
+    metrics = _rcrm_v1_metrics(side, entry, values.get("stop"), exit_price, qty, net_pnl)
+    complete = bool(broker_result.get("complete") and values.get("order_id") and exit_price is not None and net_pnl is not None)
+    committed = False
+    registry_update = None
+    outcome = None
+    if commit and complete:
+        metadata = {
+            "registry_mode": "REAL",
+            "execution_mode": "LIVE",
+            "real_close_reconciled": True,
+            "real_close_reconciled_at": _rcrm_v1_now(),
+            "real_close_reconciliation_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+            "broker_order_id": values.get("order_id"),
+            "client_order_id": values.get("client_order_id"),
+            "broker_close_order_ids": broker_result.get("close_order_ids") or [],
+            "broker_realized_pnl_gross": broker_result.get("realized_pnl_gross"),
+            "broker_fee_total": broker_result.get("fee_total"),
+            "broker_funding": broker_result.get("funding"),
+            "broker_net_pnl": net_pnl,
+            "broker_data_quality": broker_result.get("data_quality"),
+        }
+        updater = getattr(central_trade_registry, "update_closed_trade", None)
+        if callable(updater):
+            registry_update = updater(
+                trade_id=trade.get("trade_id") or found.get("trade_id"),
+                registry_mode="REAL",
+                execution_mode="LIVE",
+                broker_order_id=values.get("order_id"),
+                order_id=values.get("order_id"),
+                client_order_id=values.get("client_order_id"),
+                broker_close_order_ids=broker_result.get("close_order_ids") or [],
+                entry=entry,
+                exit_price=exit_price,
+                qty=qty,
+                realized_pnl=broker_result.get("realized_pnl_gross"),
+                fee=broker_result.get("fee_total"),
+                funding=broker_result.get("funding"),
+                net_pnl=net_pnl,
+                pnl_pct=metrics.get("pnl_pct"),
+                pnl_r=metrics.get("r_net") if metrics.get("r_net") is not None else metrics.get("r_price"),
+                r_multiple=metrics.get("r_net") if metrics.get("r_net") is not None else metrics.get("r_price"),
+                closed_at=broker_result.get("closed_at") or trade.get("closed_at"),
+                close_reason="BROKER_RECONCILED_CLOSE",
+                metadata=metadata,
+            )
+        else:
+            registry_update = {"ok": False, "error": "UPDATE_CLOSED_TRADE_UNAVAILABLE"}
+
+        if isinstance(registry_update, dict) and registry_update.get("ok") and callable(globals().get("trade_close_outcome_v1_build")):
+            realized_for_outcome = (_rcrm_v1_float(broker_result.get("realized_pnl_gross"), 0.0) or 0.0) + (_rcrm_v1_float(broker_result.get("funding"), 0.0) or 0.0)
+            outcome = trade_close_outcome_v1_build(
+                symbol=symbol,
+                side=side,
+                bot=trade.get("bot") or payload.get("bot") or "FALCON",
+                setup=trade.get("setup") or payload.get("setup") or "FALCON15",
+                trade_id=trade.get("trade_id") or found.get("trade_id"),
+                exit_price=exit_price,
+                realized_pnl=realized_for_outcome,
+                fee=_rcrm_v1_float(broker_result.get("fee_total"), 0.0) or 0.0,
+                close_reason="BROKER_RECONCILED_CLOSE",
+                commit=True,
+            )
+            committed = bool((outcome.get("commit") or {}).get("committed")) if isinstance(outcome, dict) else False
+
+    status = "BROKER_CLOSE_RECONCILED_AND_SAVED" if committed else (
+        "BROKER_CLOSE_RECONCILED_PREVIEW" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
+    )
+    result = dict(base)
+    result.update({
+        "status": status,
+        "complete": complete,
+        "committed": committed,
+        "trade": {
+            "trade_id": trade.get("trade_id"),
+            "bot": trade.get("bot"),
+            "setup": trade.get("setup"),
+            "symbol": symbol,
+            "side": side,
+            "registry_mode_before": trade.get("registry_mode") or _rcrm_v1_meta(trade).get("registry_mode"),
+            "order_id": values.get("order_id"),
+            "client_order_id": values.get("client_order_id"),
+            "entry": entry,
+            "stop": values.get("stop"),
+            "qty": qty,
+        },
+        "metrics": metrics,
+        "broker_reconciliation": broker_result,
+        "registry_update": registry_update,
+        "outcome": outcome,
+        "notes": [
+            "Consulta broker é read-only e não envia ordem.",
+            "Commit só é permitido com ordem real identificada, fills de fechamento completos e posição encerrada.",
+            "PnL líquido preserva PnL realizado, taxas e funding em campos separados.",
+        ],
+    })
+    public = _rcrm_v1_public(result)
+    _rcrm_v1_write(REAL_CLOSE_RECONCILIATION_V1_LATEST_FILE, public)
+    _rcrm_v1_append(REAL_CLOSE_RECONCILIATION_V1_EVENTS_FILE, public)
+    return public
+
+
+@app.route("/realclosereconciliation/health", methods=["GET"])
+@app.route("/real/close/reconciliation/health", methods=["GET"])
+def real_close_reconciliation_v1_health_route():
+    return {
+        "ok": bool(central_broker is not None and callable(getattr(central_broker, "reconcile_closed_trade", None))
+                   and central_trade_registry is not None and callable(getattr(central_trade_registry, "update_closed_trade", None))),
+        "module": "real_close_reconciliation_v1",
+        "version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+        "generated_at": _rcrm_v1_now(),
+        "broker_helper_available": bool(central_broker is not None and callable(getattr(central_broker, "reconcile_closed_trade", None))),
+        "closed_trade_update_available": bool(central_trade_registry is not None and callable(getattr(central_trade_registry, "update_closed_trade", None))),
+        "read_only_broker_lookup": True,
+        "sent": False,
+        "routes": ["/realclosereconciliation", "/realclosereconciliation?commit=true&ack=REAL_CLOSE_RECONCILE", "/realclosereconciliation/health"],
+    }, 200
+
+
+@app.route("/realclosereconciliation", methods=["GET", "POST"])
+@app.route("/realclosereconciliation/text", methods=["GET", "POST"])
+def real_close_reconciliation_v1_route():
+    payload = request.get_json(silent=True) if request.method == "POST" else {}
+    payload = dict(payload or {})
+    for key, value in request.args.items():
+        payload.setdefault(key, value)
+    commit = _rcrm_v1_bool(payload.get("commit") or payload.get("save"), False)
+    ack = str(payload.get("ack") or "").upper().strip()
+    if commit and ack != "REAL_CLOSE_RECONCILE":
+        return {
+            "ok": False,
+            "status": "ACK_REQUIRED",
+            "required_ack": "REAL_CLOSE_RECONCILE",
+            "note": "Sem ACK a rota apenas consulta a BingX e não altera o Registry.",
+            "version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+        }, 400
+    result = real_close_reconciliation_v1_run(payload=payload, commit=commit, source="route")
+    if request.path.endswith("/text"):
+        trade = result.get("trade") or {}
+        metrics = result.get("metrics") or {}
+        broker_result = result.get("broker_reconciliation") or {}
+        lines = [
+            "💰 REAL CLOSE RECONCILIATION — CENTRAL QUANT",
+            f"Data/hora: {result.get('generated_at')}",
+            f"Status: {result.get('status')}",
+            f"Completo: {result.get('complete')} | Commit: {result.get('committed')}",
+            "",
+            f"Trade: {trade.get('bot')} {trade.get('symbol')} {trade.get('side')} {trade.get('setup')}",
+            f"Order: {trade.get('order_id')} | Client: {trade.get('client_order_id')}",
+            f"Entrada: {trade.get('entry')} | Saída: {broker_result.get('exit_price')} | Qty: {trade.get('qty')}",
+            f"PnL bruto: {broker_result.get('realized_pnl_gross')} | Fees: {broker_result.get('fee_total')} | Funding: {broker_result.get('funding')}",
+            f"PnL líquido: {broker_result.get('net_pnl')} | PnL%: {metrics.get('pnl_pct')} | R líquido: {metrics.get('r_net')}",
+            f"Issues: {broker_result.get('issues')}",
+            "",
+            "Segurança: consulta read-only; nenhuma ordem foi enviada.",
+        ]
+        result["text"] = "\n".join(lines)
+    return result, 200 if result.get("ok") else 500
+
+
+# Health leve: evita que /realpositionwatchdog/health execute a varredura profunda de ordens.
+def real_position_watchdog_v1_health_payload():
+    try:
+        config = _rpw_v1_config()
+    except Exception as exc:
+        config = {"enabled": False, "error": str(exc)}
+    return _rpw_v1_sanitize_public({
+        "ok": bool(config.get("enabled") and callable(globals().get("real_position_watchdog_v1_assess"))),
+        "module": "real_position_watchdog_v1",
+        "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+        "patch_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+        "generated_at": _rcrm_v1_now(),
+        "status": "REAL_POSITION_WATCHDOG_READY_SHALLOW",
+        "config": config,
+        "assess_available": callable(globals().get("real_position_watchdog_v1_assess")),
+        "broker_positions_available": bool(central_broker is not None and callable(getattr(central_broker, "get_positions", None))),
+        "broker_reconciliation_available": bool(central_broker is not None and callable(getattr(central_broker, "reconcile_closed_trade", None))),
+        "events_file": str(REAL_POSITION_WATCHDOG_V1_EVENTS_FILE) if REAL_POSITION_WATCHDOG_V1_EVENTS_FILE is not None else None,
+        "latest_file": str(REAL_POSITION_WATCHDOG_V1_LATEST_FILE) if REAL_POSITION_WATCHDOG_V1_LATEST_FILE is not None else None,
+        "state_file": str(REAL_POSITION_WATCHDOG_V1_STATE_FILE) if REAL_POSITION_WATCHDOG_V1_STATE_FILE is not None else None,
+        "deep_check_route": "/realpositionwatchdog?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON15",
+        "notes": [
+            "Health é raso e read-only; não executa a varredura pesada de métodos da exchange.",
+            "Use /realpositionwatchdog para auditoria profunda de posição e stop.",
+        ],
+        "token_value_exposed": False,
+    })
+
+
+# Corrige /executionauditlog para ler os caminhos persistentes reais do broker.
+def _eaa_v1_combined_log(limit=50):
+    try:
+        limit = max(1, min(int(limit or 50), 500))
+    except Exception:
+        limit = 50
+    items = []
+    files = []
+    seen = set()
+
+    def add_rows(rows, source):
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            item.setdefault("_source_name", source)
+            key = json.dumps({
+                "source": source,
+                "epoch": item.get("epoch") or item.get("ts_epoch") or item.get("timestamp") or item.get("ts"),
+                "event": item.get("event") or item.get("status"),
+                "id": item.get("id") or item.get("order_id") or item.get("orderId"),
+                "client": item.get("clientOrderId") or item.get("client_order_id") or item.get("client_tag"),
+            }, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                items.append(item)
+
+    try:
+        if Path(EXECUTION_ATTEMPT_AUDIT_V1_FILE).exists():
+            files.append({"source": "execution_attempt_audit_v1", "path": str(EXECUTION_ATTEMPT_AUDIT_V1_FILE), "exists": True})
+            add_rows(_eaa_v1_read_jsonl(EXECUTION_ATTEMPT_AUDIT_V1_FILE, limit=limit, source="execution_attempt_audit_v1"), "execution_attempt_audit_v1")
+        else:
+            files.append({"source": "execution_attempt_audit_v1", "path": str(EXECUTION_ATTEMPT_AUDIT_V1_FILE), "exists": False})
+    except Exception:
+        pass
+
+    if central_broker is not None:
+        audit_path = getattr(central_broker, "EXECUTION_AUDIT_LOG_FILE", None)
+        exec_path = getattr(central_broker, "EXECUTIONS_LOG_FILE", None)
+        files.append({"source": "broker_execution_audit", "path": str(audit_path), "exists": bool(audit_path and Path(audit_path).exists())})
+        files.append({"source": "broker_executions_log", "path": str(exec_path), "exists": bool(exec_path and Path(exec_path).exists())})
+        try:
+            add_rows(central_broker.get_execution_audit_log(limit=limit), "broker_execution_audit")
+        except Exception:
+            pass
+        try:
+            add_rows(central_broker.get_executions_log(limit=limit), "broker_executions_log")
+        except Exception:
+            pass
+
+    def sort_key(item):
+        for key in ("epoch", "ts_epoch", "timestamp"):
+            try:
+                if item.get(key) is not None:
+                    return float(item.get(key))
+            except Exception:
+                pass
+        text = str(item.get("ts") or item.get("generated_at") or "")
+        try:
+            return datetime.strptime(text, "%d/%m/%Y %H:%M").replace(tzinfo=TIMEZONE_BR).timestamp()
+        except Exception:
+            return 0.0
+
+    items = sorted(items, key=sort_key, reverse=True)[:limit]
+    return {
+        "ok": True,
+        "module": "execution_attempt_audit_v1",
+        "version": EXECUTION_ATTEMPT_AUDIT_V1_VERSION,
+        "patch_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+        "generated_at": _rcrm_v1_now(),
+        "count": len(items),
+        "items": _rcrm_v1_public(items),
+        "files": files,
+        "notes": [
+            "Lê diretamente os arquivos persistentes configurados no broker.py.",
+            "A rota é read-only e não envia ordens.",
+        ],
+    }
+
+
+# Integra reconciliação broker ao Auto Evaluator sem aceitar dados incompletos.
+try:
+    _ORIGINAL_REAL_CLOSE_AUTO_EVALUATOR_RUN_FOR_RCR_V1 = real_close_auto_evaluator_v1_run
+except Exception:
+    _ORIGINAL_REAL_CLOSE_AUTO_EVALUATOR_RUN_FOR_RCR_V1 = None
+
+
+def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, force=False):
+    payload = payload if isinstance(payload, dict) else {}
+    original = _ORIGINAL_REAL_CLOSE_AUTO_EVALUATOR_RUN_FOR_RCR_V1
+    config = _rcae_v1_config() if callable(globals().get("_rcae_v1_config")) else {"auto_commit": False}
+    commit_requested = bool(config.get("auto_commit")) if commit is None else bool(commit)
+    reconciliation = None
+    try:
+        scan = _rcae_v1_find_candidates(payload=payload) if callable(globals().get("_rcae_v1_find_candidates")) else {}
+        candidates = scan.get("candidates") or [] if isinstance(scan, dict) else []
+        # Prioriza FALCON; trades PAPER do Predator deixam de ser UNKNOWN pelo Registry V1.2.
+        selected = next((item for item in reversed(candidates) if str(item.get("bot") or "").upper() == "FALCON"), None)
+        if selected:
+            reconcile_payload = {
+                "trade_id": selected.get("trade_id") or selected.get("key"),
+                "bot": selected.get("bot"),
+                "setup": selected.get("setup"),
+                "symbol": selected.get("symbol"),
+                "side": selected.get("side"),
+            }
+            reconciliation = real_close_reconciliation_v1_run(
+                payload=reconcile_payload,
+                commit=bool(commit_requested),
+                source="real_close_auto_evaluator:" + str(source),
+            )
+            if reconciliation.get("committed"):
+                return {
+                    "ok": True,
+                    "module": "real_close_auto_evaluator_v1",
+                    "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+                    "patch_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+                    "generated_at": _rcrm_v1_now(),
+                    "status": "BROKER_OUTCOME_AUTO_RECONCILED_AND_SAVED",
+                    "committed": True,
+                    "commit_requested": commit_requested,
+                    "broker_reconciliation": reconciliation,
+                    "token_value_exposed": False,
+                }
+    except Exception as exc:
+        reconciliation = {"ok": False, "status": "BROKER_RECONCILIATION_ATTACH_ERROR", "error": str(exc)}
+
+    if not callable(original):
+        return {
+            "ok": False,
+            "status": "REAL_CLOSE_AUTO_EVALUATOR_ORIGINAL_MISSING",
+            "broker_reconciliation": reconciliation,
+            "version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+        }
+    result = original(payload=payload, source=source, commit=commit, force=force)
+    if isinstance(result, dict):
+        result["broker_reconciliation"] = reconciliation
+        result["patch_version"] = REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION
+    return result
 
 
 if __name__ == "__main__":

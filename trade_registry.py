@@ -1,16 +1,21 @@
 # trade_registry.py
 # CENTRAL QUANT — Trade Registry
-# Versão: 2026-07-11-TRADE-REGISTRY-V1.1-PERSISTENT-METADATA
+# Versão: 2026-07-11-TRADE-REGISTRY-V1.2-CLOSED-TRADE-RECONCILIATION
 
-import os
+from __future__ import annotations
+
 import json
+import os
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any, Dict, Iterable, Optional, Tuple
+
+TIMEZONE_BR = timezone(timedelta(hours=-3))
 
 
-def _resolve_data_dir():
+def _resolve_data_dir() -> Path:
     configured = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
     if configured:
         return Path(configured)
@@ -21,34 +26,149 @@ def _resolve_data_dir():
         pass
     return Path(__file__).resolve().parent / "data"
 
+
 DATA_DIR = str(_resolve_data_dir())
 TRADE_REGISTRY_FILE = os.environ.get("TRADE_REGISTRY_FILE", str(Path(DATA_DIR) / "trade_registry.json"))
 TRADE_REGISTRY_LEGACY_FILE = str(Path(__file__).resolve().parent / "data" / "trade_registry.json")
-VERSION = "2026-07-11-TRADE-REGISTRY-V1.1-PERSISTENT-METADATA"
-_lock = threading.Lock()
+VERSION = "2026-07-11-TRADE-REGISTRY-V1.2-CLOSED-TRADE-RECONCILIATION"
+_lock = threading.RLock()
 
 __all__ = [
-    "DATA_DIR", "TRADE_REGISTRY_FILE", "TRADE_REGISTRY_LEGACY_FILE",
-    "load_registry", "save_registry", "make_trade_id", "register_open_trade",
-    "update_trade", "close_trade", "get_open_trades", "get_trade_registry_snapshot",
+    "DATA_DIR",
+    "TRADE_REGISTRY_FILE",
+    "TRADE_REGISTRY_LEGACY_FILE",
+    "load_registry",
+    "save_registry",
+    "make_trade_id",
+    "register_open_trade",
+    "update_trade",
+    "close_trade",
+    "get_open_trades",
+    "get_trade",
+    "get_closed_trade",
+    "update_closed_trade",
+    "set_trade_registry_mode",
+    "get_trade_registry_snapshot",
     "reset_trade_registry",
 ]
 
 
+def _now() -> str:
+    return datetime.now(TIMEZONE_BR).strftime("%d/%m/%Y %H:%M:%S")
 
-def _now():
-    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
-
-def _ensure_data_dir():
+def _ensure_data_dir() -> None:
     Path(TRADE_REGISTRY_FILE).parent.mkdir(parents=True, exist_ok=True)
 
 
-def _empty_registry():
-    return {"ok": True, "version": VERSION, "updated_at": _now(), "open_trades": {}, "closed_trades": []}
+def _empty_registry() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "version": VERSION,
+        "updated_at": _now(),
+        "open_trades": {},
+        "closed_trades": [],
+    }
 
 
-def _normalize_registry(data):
+def _normalize_symbol(symbol: Any) -> str:
+    return str(symbol or "UNKNOWN").upper().replace("/", "").replace(":USDT", "").replace("-", "").strip()
+
+
+def _normalize_side(side: Any) -> str:
+    value = str(side or "UNKNOWN").upper().strip()
+    if value in {"BUY", "LONG"}:
+        return "LONG"
+    if value in {"SELL", "SHORT"}:
+        return "SHORT"
+    return value
+
+
+def _normalize_mode(value: Any) -> Optional[str]:
+    mode = str(value or "").upper().strip()
+    aliases = {
+        "LIVE": "REAL",
+        "BROKER": "REAL",
+        "BINGX": "REAL",
+        "DRY_RUN": "VERIFY",
+        "PREVIEW": "VERIFY",
+        "OBSERVATION_ONLY": "VERIFY",
+    }
+    mode = aliases.get(mode, mode)
+    return mode if mode in {"REAL", "PAPER", "VERIFY", "SYNC_ONLY", "UNKNOWN"} else None
+
+
+def _boolish(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "sim", "on", "sent", "filled", "executed"}:
+        return True
+    if text in {"0", "false", "no", "nao", "não", "off", "blocked", "denied"}:
+        return False
+    return None
+
+
+def _infer_registry_mode(trade: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> str:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    explicit = (
+        _normalize_mode(trade.get("registry_mode"))
+        or _normalize_mode(metadata.get("registry_mode"))
+        or _normalize_mode(trade.get("execution_mode"))
+        or _normalize_mode(metadata.get("execution_mode"))
+        or _normalize_mode(trade.get("mode"))
+        or _normalize_mode(metadata.get("mode"))
+    )
+    # UNKNOWN é um estado provisório. Não deve vencer evidências mais fortes
+    # de PAPER/VERIFY/REAL encontradas no próprio trade ou na metadata.
+    if explicit and explicit != "UNKNOWN":
+        return explicit
+
+    sent = _boolish(trade.get("execution_sent"))
+    if sent is None:
+        sent = _boolish(metadata.get("execution_sent"))
+    broker_id = (
+        trade.get("broker_order_id")
+        or trade.get("live_order_id")
+        or trade.get("order_id")
+        or metadata.get("broker_order_id")
+        or metadata.get("live_order_id")
+        or metadata.get("order_id")
+    )
+    source = " ".join(
+        str(x or "").lower()
+        for x in [
+            trade.get("source"), metadata.get("source"), trade.get("status"), metadata.get("status"),
+            trade.get("bot"), metadata.get("bot"), trade.get("setup"), metadata.get("setup"),
+            trade.get("event"), metadata.get("event"),
+        ]
+    )
+    if sent is True or broker_id or any(token in source for token in ("bingx", "broker", "live_sent", "real_execution")):
+        return "REAL"
+    if any(token in source for token in ("paper", "smart_predator", "predator", "turtle", "donkey", "meme", "cobra", "trendpro", "trend_pro")):
+        return "PAPER"
+    if any(token in source for token in ("verify", "dry_run", "preview")) or sent is False:
+        return "VERIFY"
+    return "UNKNOWN"
+
+
+def _normalize_trade_record(trade: Dict[str, Any]) -> Dict[str, Any]:
+    trade = dict(trade or {})
+    meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    trade["metadata"] = meta
+    trade["bot"] = str(trade.get("bot") or "UNKNOWN").upper().strip()
+    trade["setup"] = str(trade.get("setup") or "DEFAULT").upper().strip()
+    trade["symbol"] = _normalize_symbol(trade.get("symbol"))
+    trade["side"] = _normalize_side(trade.get("side"))
+    trade.setdefault("trade_id", make_trade_id(trade.get("bot"), trade.get("symbol"), trade.get("side"), trade.get("setup")))
+    trade["registry_mode"] = _infer_registry_mode(trade, meta)
+    meta.setdefault("registry_mode", trade["registry_mode"])
+    return trade
+
+
+def _normalize_registry(data: Any) -> Dict[str, Any]:
     if not isinstance(data, dict):
         data = _empty_registry()
     data.setdefault("ok", True)
@@ -59,65 +179,110 @@ def _normalize_registry(data):
     if not isinstance(data.get("open_trades"), dict):
         data["open_trades"] = {}
     if not isinstance(data.get("closed_trades"), list):
-        data["closed_trades"] = []
+        if isinstance(data.get("closed_trades"), dict):
+            data["closed_trades"] = list(data["closed_trades"].values())
+        else:
+            data["closed_trades"] = []
+
+    data["open_trades"] = {
+        str(key): _normalize_trade_record(value)
+        for key, value in data["open_trades"].items()
+        if isinstance(value, dict)
+    }
+    data["closed_trades"] = [
+        _normalize_trade_record(value)
+        for value in data["closed_trades"]
+        if isinstance(value, dict)
+    ]
     data["version"] = VERSION
     data["registry_file_active"] = TRADE_REGISTRY_FILE
-    data["persistent_storage_enabled"] = str(Path(TRADE_REGISTRY_FILE)).startswith("/data") or bool(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR"))
+    data["persistent_storage_enabled"] = str(Path(TRADE_REGISTRY_FILE)).startswith("/data") or bool(
+        os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
+    )
     return data
 
 
-def load_registry():
+def load_registry() -> Dict[str, Any]:
     _ensure_data_dir()
     path = Path(TRADE_REGISTRY_FILE)
-    if not path.exists() and TRADE_REGISTRY_LEGACY_FILE != TRADE_REGISTRY_FILE and Path(TRADE_REGISTRY_LEGACY_FILE).exists():
-        try:
-            legacy = json.loads(Path(TRADE_REGISTRY_LEGACY_FILE).read_text(encoding="utf-8"))
-            reg = _normalize_registry(legacy)
+    with _lock:
+        if not path.exists() and TRADE_REGISTRY_LEGACY_FILE != TRADE_REGISTRY_FILE and Path(TRADE_REGISTRY_LEGACY_FILE).exists():
+            try:
+                legacy = json.loads(Path(TRADE_REGISTRY_LEGACY_FILE).read_text(encoding="utf-8"))
+                reg = _normalize_registry(legacy)
+                save_registry(reg)
+                return reg
+            except Exception:
+                pass
+        if not path.exists():
+            reg = _empty_registry()
             save_registry(reg)
             return reg
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return _normalize_registry(data)
         except Exception:
-            pass
-    if not path.exists():
-        reg = _empty_registry()
-        save_registry(reg)
-        return reg
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return _normalize_registry(data)
-    except Exception:
-        return _empty_registry()
+            return _empty_registry()
 
 
-def save_registry(registry):
+def save_registry(registry: Dict[str, Any]) -> None:
     _ensure_data_dir()
     registry = _normalize_registry(registry)
     registry["updated_at"] = _now()
     tmp = str(TRADE_REGISTRY_FILE) + ".tmp"
     with _lock:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(registry, f, ensure_ascii=False, indent=2, default=str)
+        with open(tmp, "w", encoding="utf-8") as file_obj:
+            json.dump(registry, file_obj, ensure_ascii=False, indent=2, default=str)
         os.replace(tmp, TRADE_REGISTRY_FILE)
 
 
-def make_trade_id(bot, symbol, side, setup=None):
-    bot = str(bot or "UNKNOWN").upper()
-    symbol = str(symbol or "UNKNOWN").upper().replace("/", "").replace(":USDT", "").replace("-", "")
-    side = str(side or "UNKNOWN").upper()
-    setup = str(setup or "DEFAULT").upper()
-    return f"{bot}:{setup}:{symbol}:{side}"
+def make_trade_id(bot: Any, symbol: Any, side: Any, setup: Any = None) -> str:
+    bot_n = str(bot or "UNKNOWN").upper().strip()
+    setup_n = str(setup or "DEFAULT").upper().strip()
+    return f"{bot_n}:{setup_n}:{_normalize_symbol(symbol)}:{_normalize_side(side)}"
 
 
-def register_open_trade(bot, symbol, side, entry, sl=None, tp50=None, setup=None, qty=None, source="central", metadata=None):
+def register_open_trade(
+    bot: Any,
+    symbol: Any,
+    side: Any,
+    entry: Any,
+    sl: Any = None,
+    tp50: Any = None,
+    setup: Any = None,
+    qty: Any = None,
+    source: str = "central",
+    metadata: Optional[Dict[str, Any]] = None,
+    registry_mode: Any = None,
+    execution_mode: Any = None,
+    broker_order_id: Any = None,
+    client_order_id: Any = None,
+    **extra: Any,
+) -> Dict[str, Any]:
     registry = load_registry()
-    trade_id = make_trade_id(bot, symbol, side, setup)
+    bot_n = str(bot or "UNKNOWN").upper().strip()
+    setup_n = str(setup or "DEFAULT").upper().strip()
+    symbol_n = _normalize_symbol(symbol)
+    side_n = _normalize_side(side)
+    trade_id = make_trade_id(bot_n, symbol_n, side_n, setup_n)
     meta = dict(metadata or {})
-    trade = {
+    mode = _normalize_mode(registry_mode) or _normalize_mode(execution_mode)
+    if mode:
+        meta["registry_mode"] = mode
+    if execution_mode is not None:
+        meta["execution_mode"] = str(execution_mode).upper().strip()
+    if broker_order_id is not None:
+        meta["broker_order_id"] = broker_order_id
+    if client_order_id is not None:
+        meta["client_order_id"] = client_order_id
+
+    trade: Dict[str, Any] = {
         "trade_id": trade_id,
         "status": "OPEN",
-        "bot": bot,
-        "setup": setup or "DEFAULT",
-        "symbol": symbol,
-        "side": side,
+        "bot": bot_n,
+        "setup": setup_n,
+        "symbol": symbol_n,
+        "side": side_n,
         "entry": entry,
         "sl": sl,
         "tp50": tp50,
@@ -128,76 +293,248 @@ def register_open_trade(bot, symbol, side, entry, sl=None, tp50=None, setup=None
         "last_update": _now(),
         "metadata": meta,
     }
+    if execution_mode is not None:
+        trade["execution_mode"] = str(execution_mode).upper().strip()
+    if broker_order_id is not None:
+        trade["broker_order_id"] = broker_order_id
+        trade["order_id"] = broker_order_id
+    if client_order_id is not None:
+        trade["client_order_id"] = client_order_id
+    for key, value in extra.items():
+        if value is not None:
+            trade[key] = value
+    trade = _normalize_trade_record(trade)
     registry["open_trades"][trade_id] = trade
     save_registry(registry)
     return {"ok": True, "action": "OPEN_REGISTERED", "trade_id": trade_id, "trade": trade}
 
 
-def update_trade(trade_id, **updates):
+def update_trade(trade_id: str, **updates: Any) -> Dict[str, Any]:
     registry = load_registry()
     trade = registry["open_trades"].get(trade_id)
     if not trade:
         return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
     for key, value in updates.items():
-        if value is not None:
-            if key == "metadata" and isinstance(value, dict):
-                trade.setdefault("metadata", {}).update(value)
-            else:
-                trade[key] = value
+        if value is None:
+            continue
+        if key == "metadata" and isinstance(value, dict):
+            trade.setdefault("metadata", {}).update(value)
+        else:
+            trade[key] = value
     trade["last_update"] = _now()
+    trade = _normalize_trade_record(trade)
     registry["open_trades"][trade_id] = trade
     save_registry(registry)
     return {"ok": True, "action": "TRADE_UPDATED", "trade_id": trade_id, "trade": trade}
 
 
-def close_trade(trade_id, exit_price=None, pnl_pct=None, pnl_r=None, reason=None, metadata=None):
+def _closed_trade_index(closed_trades: Iterable[Dict[str, Any]], trade_id: Optional[str] = None, bot: Any = None, symbol: Any = None, side: Any = None, setup: Any = None) -> Optional[int]:
+    expected_id = str(trade_id or "")
+    bot_n = str(bot or "").upper().strip() or None
+    symbol_n = _normalize_symbol(symbol) if symbol else None
+    side_n = _normalize_side(side) if side else None
+    setup_n = str(setup or "").upper().strip() or None
+    matches = []
+    for index, trade in enumerate(closed_trades):
+        if not isinstance(trade, dict):
+            continue
+        if expected_id and str(trade.get("trade_id") or "") == expected_id:
+            matches.append(index)
+            continue
+        if expected_id:
+            continue
+        if bot_n and str(trade.get("bot") or "").upper().strip() != bot_n:
+            continue
+        if symbol_n and _normalize_symbol(trade.get("symbol")) != symbol_n:
+            continue
+        if side_n and _normalize_side(trade.get("side")) != side_n:
+            continue
+        if setup_n and str(trade.get("setup") or "").upper().strip() != setup_n:
+            continue
+        matches.append(index)
+    return matches[-1] if matches else None
+
+
+def get_trade(trade_id: str) -> Dict[str, Any]:
+    registry = load_registry()
+    if trade_id in registry.get("open_trades", {}):
+        return {"ok": True, "status": "OPEN", "trade_id": trade_id, "trade": registry["open_trades"][trade_id]}
+    index = _closed_trade_index(registry.get("closed_trades", []), trade_id=trade_id)
+    if index is not None:
+        return {"ok": True, "status": "CLOSED", "trade_id": trade_id, "index": index, "trade": registry["closed_trades"][index]}
+    return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
+
+
+def get_closed_trade(trade_id: Optional[str] = None, bot: Any = None, symbol: Any = None, side: Any = None, setup: Any = None) -> Dict[str, Any]:
+    registry = load_registry()
+    index = _closed_trade_index(registry.get("closed_trades", []), trade_id=trade_id, bot=bot, symbol=symbol, side=side, setup=setup)
+    if index is None:
+        return {"ok": False, "error": "CLOSED_TRADE_NOT_FOUND", "trade_id": trade_id}
+    trade = registry["closed_trades"][index]
+    return {"ok": True, "status": "CLOSED", "trade_id": trade.get("trade_id"), "index": index, "trade": trade}
+
+
+def update_closed_trade(
+    trade_id: Optional[str] = None,
+    *,
+    bot: Any = None,
+    symbol: Any = None,
+    side: Any = None,
+    setup: Any = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    **updates: Any,
+) -> Dict[str, Any]:
+    registry = load_registry()
+    closed_trades = registry.get("closed_trades", [])
+    index = _closed_trade_index(closed_trades, trade_id=trade_id, bot=bot, symbol=symbol, side=side, setup=setup)
+    if index is None:
+        return {"ok": False, "error": "CLOSED_TRADE_NOT_FOUND", "trade_id": trade_id}
+
+    trade = dict(closed_trades[index])
+    for key, value in updates.items():
+        if value is not None:
+            trade[key] = value
+    if metadata:
+        trade.setdefault("metadata", {}).update(metadata)
+    trade["last_update"] = _now()
+    trade = _normalize_trade_record(trade)
+    closed_trades[index] = trade
+    registry["closed_trades"] = closed_trades
+    save_registry(registry)
+    return {
+        "ok": True,
+        "action": "CLOSED_TRADE_UPDATED",
+        "trade_id": trade.get("trade_id"),
+        "index": index,
+        "trade": trade,
+    }
+
+
+def set_trade_registry_mode(
+    trade_id: Optional[str],
+    registry_mode: Any,
+    *,
+    closed: Optional[bool] = None,
+    reason: Optional[str] = None,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    mode = _normalize_mode(registry_mode)
+    if not mode:
+        return {"ok": False, "error": "INVALID_REGISTRY_MODE", "registry_mode": registry_mode}
+    metadata = {
+        "registry_mode": mode,
+        "registry_mode_updated_at": _now(),
+    }
+    if reason:
+        metadata["registry_mode_reason"] = reason
+    if evidence:
+        metadata["registry_mode_evidence"] = evidence
+
+    registry = load_registry()
+    if closed is not True and trade_id in registry.get("open_trades", {}):
+        return update_trade(trade_id, registry_mode=mode, metadata=metadata)
+    return update_closed_trade(trade_id=trade_id, registry_mode=mode, metadata=metadata)
+
+
+def close_trade(
+    trade_id: str,
+    exit_price: Any = None,
+    pnl_pct: Any = None,
+    pnl_r: Any = None,
+    reason: Any = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    registry_mode: Any = None,
+    realized_pnl: Any = None,
+    fee: Any = None,
+    funding: Any = None,
+    broker_close_order_id: Any = None,
+    **extra: Any,
+) -> Dict[str, Any]:
     registry = load_registry()
     trade = registry["open_trades"].pop(trade_id, None)
     if not trade:
+        existing = get_closed_trade(trade_id=trade_id)
+        if existing.get("ok"):
+            return update_closed_trade(
+                trade_id=trade_id,
+                exit_price=exit_price,
+                pnl_pct=pnl_pct,
+                pnl_r=pnl_r,
+                result_pct=pnl_pct,
+                result_r=pnl_r,
+                close_reason=reason,
+                realized_pnl=realized_pnl,
+                fee=fee,
+                funding=funding,
+                broker_close_order_id=broker_close_order_id,
+                registry_mode=_normalize_mode(registry_mode),
+                metadata=metadata,
+                **extra,
+            )
         return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
+
     trade["status"] = "CLOSED"
     trade["exit_price"] = exit_price
     trade["pnl_pct"] = pnl_pct
     trade["pnl_r"] = pnl_r
-    # Compatibilidade com robôs que usam result_pct/result_r.
     trade["result_pct"] = pnl_pct if pnl_pct is not None else trade.get("result_pct")
     trade["result_r"] = pnl_r if pnl_r is not None else trade.get("result_r")
     trade["close_reason"] = reason
     trade["closed_at"] = _now()
     trade["closed_epoch"] = time.time()
     trade["last_update"] = _now()
+    if realized_pnl is not None:
+        trade["realized_pnl"] = realized_pnl
+    if fee is not None:
+        trade["fee"] = fee
+    if funding is not None:
+        trade["funding"] = funding
+    if broker_close_order_id is not None:
+        trade["broker_close_order_id"] = broker_close_order_id
+    if registry_mode is not None:
+        trade["registry_mode"] = _normalize_mode(registry_mode) or str(registry_mode).upper().strip()
     if metadata:
         trade.setdefault("metadata", {}).update(metadata)
+    for key, value in extra.items():
+        if value is not None:
+            trade[key] = value
+    trade = _normalize_trade_record(trade)
     registry["closed_trades"].append(trade)
     save_registry(registry)
     return {"ok": True, "action": "TRADE_CLOSED", "trade_id": trade_id, "trade": trade}
 
 
-def get_open_trades(bot=None, symbol=None, side=None):
+def get_open_trades(bot: Any = None, symbol: Any = None, side: Any = None) -> Dict[str, Any]:
     registry = load_registry()
     trades = list(registry.get("open_trades", {}).values())
     if bot:
-        trades = [t for t in trades if str(t.get("bot")).upper() == str(bot).upper()]
+        trades = [trade for trade in trades if str(trade.get("bot")).upper() == str(bot).upper()]
     if symbol:
-        norm = str(symbol).upper().replace("/", "").replace(":USDT", "").replace("-", "")
-        trades = [t for t in trades if str(t.get("symbol")).upper().replace("/", "").replace(":USDT", "").replace("-", "") == norm]
+        symbol_n = _normalize_symbol(symbol)
+        trades = [trade for trade in trades if _normalize_symbol(trade.get("symbol")) == symbol_n]
     if side:
-        trades = [t for t in trades if str(t.get("side")).upper() == str(side).upper()]
+        side_n = _normalize_side(side)
+        trades = [trade for trade in trades if _normalize_side(trade.get("side")) == side_n]
     return {"ok": True, "count": len(trades), "trades": trades}
 
 
-def get_trade_registry_snapshot():
+def get_trade_registry_snapshot() -> Dict[str, Any]:
     registry = load_registry()
     open_trades = list(registry.get("open_trades", {}).values())
     closed_trades = registry.get("closed_trades", [])
-    by_bot, by_symbol, by_side = {}, {}, {}
+    by_bot: Dict[str, int] = {}
+    by_symbol: Dict[str, int] = {}
+    by_side: Dict[str, int] = {}
+    by_mode: Dict[str, int] = {}
     for trade in open_trades:
         bot = trade.get("bot", "UNKNOWN")
         symbol = trade.get("symbol", "UNKNOWN")
         side = trade.get("side", "UNKNOWN")
+        mode = trade.get("registry_mode", "UNKNOWN")
         by_bot[bot] = by_bot.get(bot, 0) + 1
         by_symbol[symbol] = by_symbol.get(symbol, 0) + 1
         by_side[side] = by_side.get(side, 0) + 1
+        by_mode[mode] = by_mode.get(mode, 0) + 1
     return {
         "ok": True,
         "version": registry.get("version"),
@@ -209,11 +546,12 @@ def get_trade_registry_snapshot():
         "by_bot": by_bot,
         "by_symbol": by_symbol,
         "by_side": by_side,
+        "by_mode": by_mode,
         "open_trades": open_trades,
     }
 
 
-def reset_trade_registry(confirm=False):
+def reset_trade_registry(confirm: bool = False) -> Dict[str, Any]:
     if not confirm:
         return {"ok": False, "error": "CONFIRM_REQUIRED"}
     registry = _empty_registry()
