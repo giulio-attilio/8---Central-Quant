@@ -39428,45 +39428,116 @@ def _rpg_safe_config():
 
 
 def _rpg_safe_live_counts(payload=None):
+    """Conta apenas posições pertencentes à Central para o limite do Falcon.
+
+    Exposição manual/externa permanece visível, mas não consome o limite de
+    posições do Falcon. A única trava de ownership é colisão no mesmo símbolo e
+    mesmo lado, pois a BingX agrega essas quantidades e impediria gestão isolada.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    requested_symbol = _rpg_safe_norm_symbol(payload.get("symbol") or payload.get("symbol_clean") or payload.get("pair") or payload.get("ativo"))
+    requested_side = _rpg_safe_norm_side(payload.get("side") or payload.get("direction") or payload.get("signal"))
     counts = {
         "central_live_count": None,
         "registry_real_open_count": None,
         "broker_bingx_open_count": None,
+        "broker_bingx_open_count_total": None,
+        "broker_central_owned_open_count": None,
+        "manual_external_open_count": 0,
+        "manual_same_symbol_side_count": 0,
+        "manual_same_symbol_side": [],
         "unknown_open_count": None,
         "errors": [],
+        "ownership_policy_version": MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION,
+        "manual_external_blocks_falcon": False,
     }
+    central_rows = []
     try:
         fn = globals().get("_central_live_positions_payload")
         if callable(fn):
             rows = fn() or []
-            counts["central_live_count"] = len(rows) if isinstance(rows, list) else 0
+            central_rows = rows if isinstance(rows, list) else []
+            counts["central_live_count"] = len(central_rows)
     except Exception as exc:
         counts["errors"].append(f"central_live_count_error: {exc}")
     try:
         fn = globals().get("registry_mode_segregation_v1_gate_check")
         if callable(fn):
-            gate = fn(payload if isinstance(payload, dict) else {}) or {}
+            gate = fn(payload) or {}
             counts["registry_real_open_count"] = _rpg_safe_int(gate.get("real_open_count"), 0)
             counts["unknown_open_count"] = _rpg_safe_int(gate.get("unknown_open_count"), 0)
             counts["registry_mode_status"] = gate.get("status")
             counts["registry_mode_ok"] = bool(gate.get("ok"))
     except Exception as exc:
         counts["errors"].append(f"registry_mode_count_error: {exc}")
+
+    central_keys = set()
+    for p in central_rows:
+        if not isinstance(p, dict):
+            continue
+        key = (_rpg_safe_norm_symbol(p.get("symbol")), _rpg_safe_norm_side(p.get("side")))
+        if key[0] and key[1]:
+            central_keys.add(key)
+
     try:
         broker = globals().get("broker") or globals().get("central_broker")
         if broker is not None and hasattr(broker, "get_positions"):
             positions = broker.get_positions() or []
             open_items = []
+            broker_keys = set()
+            broker_map = {}
             for p in positions:
                 if not isinstance(p, dict):
                     continue
-                contracts = _rpg_safe_float(p.get("contracts") or p.get("contractSize") or p.get("positionAmt") or (p.get("info") or {}).get("positionAmt"), 0.0)
-                notional = _rpg_safe_float(p.get("notional") or p.get("positionValue") or (p.get("info") or {}).get("positionValue"), 0.0)
-                if abs(contracts or 0.0) > 0 or abs(notional or 0.0) > 0:
-                    open_items.append(p)
-            counts["broker_bingx_open_count"] = len(open_items)
+                info = p.get("info") if isinstance(p.get("info"), dict) else {}
+                contracts = _rpg_safe_float(p.get("contracts") or p.get("contractSize") or p.get("positionAmt") or info.get("positionAmt"), 0.0)
+                notional = _rpg_safe_float(p.get("notional") or p.get("positionValue") or info.get("positionValue"), 0.0)
+                if abs(contracts or 0.0) <= 0 and abs(notional or 0.0) <= 0:
+                    continue
+                open_items.append(p)
+                key = (
+                    _rpg_safe_norm_symbol(p.get("symbol") or info.get("symbol")),
+                    _rpg_safe_norm_side(p.get("side") or p.get("positionSide") or info.get("positionSide")),
+                )
+                if key[0] and key[1]:
+                    broker_keys.add(key)
+                    broker_map[key] = p
+
+            manual_keys = broker_keys - central_keys
+            owned_keys = broker_keys & central_keys
+            collision_key = (requested_symbol, requested_side)
+            collision = collision_key in manual_keys if requested_symbol and requested_side else False
+
+            counts["broker_bingx_open_count"] = len(open_items)  # compatibilidade/diagnóstico total
+            counts["broker_bingx_open_count_total"] = len(open_items)
+            counts["broker_central_owned_open_count"] = len(owned_keys)
+            counts["manual_external_open_count"] = len(manual_keys)
+            counts["manual_same_symbol_side_count"] = 1 if collision else 0
+            if collision:
+                p = broker_map.get(collision_key) or {}
+                counts["manual_same_symbol_side"] = [{
+                    "symbol": collision_key[0],
+                    "side": collision_key[1],
+                    "notional": p.get("notional"),
+                    "contracts": p.get("contracts"),
+                    "entry_price": p.get("entry_price") or p.get("entryPrice"),
+                }]
+            counts["manual_external_positions"] = [
+                {"symbol": k[0], "side": k[1]} for k in sorted(manual_keys)
+            ]
+            counts["broker_central_owned_positions"] = [
+                {"symbol": k[0], "side": k[1]} for k in sorted(owned_keys)
+            ]
     except Exception as exc:
         counts["errors"].append(f"broker_bingx_count_error: {exc}")
+
+    owned_candidates = [
+        counts.get("central_live_count"),
+        counts.get("registry_real_open_count"),
+        counts.get("broker_central_owned_open_count"),
+    ]
+    owned_candidates = [x for x in owned_candidates if x is not None]
+    counts["effective_central_owned_open_count"] = max(owned_candidates) if owned_candidates else None
     return counts
 
 
@@ -39610,12 +39681,41 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
 
     counts = _rpg_safe_live_counts(payload)
     max_open = _rpg_safe_int(cfg.get("max_open_positions"), 1)
-    real_counts = [x for x in [counts.get("central_live_count"), counts.get("registry_real_open_count"), counts.get("broker_bingx_open_count")] if x is not None]
-    effective_open = max(real_counts) if real_counts else None
+    effective_open = counts.get("effective_central_owned_open_count")
     count_ok = effective_open is not None and effective_open < max_open and _rpg_safe_int(counts.get("unknown_open_count"), 0) == 0
     if effective_open is None and cfg.get("fail_closed"):
         count_ok = False
-    add("MAX_OPEN_REAL_POSITIONS", count_ok, {"ok": f"Capacidade disponível para nova posição real: abertas={effective_open}, max={max_open}.", "fail": f"Limite de posições reais do piloto atingido ou não confirmado: abertas={effective_open}, max={max_open}."}, details={"counts": counts, "max_open_positions": max_open})
+    add(
+        "MAX_OPEN_REAL_POSITIONS",
+        count_ok,
+        {
+            "ok": f"Capacidade do Falcon disponível: posições Central-owned={effective_open}, max={max_open}; manuais não entram no limite.",
+            "fail": f"Limite de posições Central-owned do piloto atingido ou não confirmado: abertas={effective_open}, max={max_open}.",
+        },
+        details={"counts": counts, "max_open_positions": max_open, "manual_positions_counted": False},
+    )
+
+    manual_collision_count = _rpg_safe_int(counts.get("manual_same_symbol_side_count"), 0)
+    add(
+        "NO_MANUAL_SAME_SYMBOL_SIDE_COLLISION",
+        manual_collision_count == 0,
+        {
+            "ok": "Nenhuma posição manual no mesmo símbolo e lado; ownership permanece isolado.",
+            "fail": "Existe posição manual no mesmo símbolo e lado. A BingX agrega a quantidade; entrada Falcon bloqueada somente para evitar gestão sobre a posição manual.",
+        },
+        blocking=True,
+        details={
+            "requested_symbol": symbol,
+            "requested_side": side,
+            "manual_same_symbol_side_count": manual_collision_count,
+            "collisions": counts.get("manual_same_symbol_side") or [],
+        },
+    )
+    manual_external_count = _rpg_safe_int(counts.get("manual_external_open_count"), 0)
+    if manual_external_count:
+        warnings.append(
+            f"Há {manual_external_count} posição(ões) manual(is)/externa(s) na BingX; não contam no limite do Falcon e não serão gerenciadas pela Central."
+        )
 
     if bot == "FALCON":
         falcon_max_positions = _rpg_safe_int(cfg.get("falcon_real_max_positions"), None)
@@ -40797,7 +40897,18 @@ def _fleag_v1_read_bad_execution_events(limit=200):
             continue
     return bad
 
+MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION = "2026-07-11-MANUAL-POSITION-OWNERSHIP-ISOLATION-V1"
+MANUAL_POSITIONS_BLOCK_FALCON = False
+MANUAL_SAME_SYMBOL_SIDE_COLLISION_BLOCK = True
+
+
 def _fleag_v1_divergence_payload():
+    """Separa divergência da Central de exposição manual/externa.
+
+    Posições abertas na BingX sem LIVE correspondente na Central são observadas
+    como MANUAL_OR_EXTERNAL_POSITION. Elas não bloqueiam o Falcon e não são
+    adotadas, fechadas ou gerenciadas automaticamente.
+    """
     broker_positions, broker_err = ([], None)
     central_live = []
     try:
@@ -40808,27 +40919,83 @@ def _fleag_v1_divergence_payload():
         central_live = _central_live_positions_payload() if callable(globals().get("_central_live_positions_payload")) else []
     except Exception:
         central_live = []
-    broker_keys = {(_fleag_v1_norm_symbol(p.get("symbol")), _fleag_v1_norm_side(p.get("side"))) for p in broker_positions if isinstance(p, dict)}
-    central_keys = {(_fleag_v1_norm_symbol(p.get("symbol")), _fleag_v1_norm_side(p.get("side"))) for p in central_live if isinstance(p, dict)}
-    only_bingx = sorted([{"symbol": k[0], "side": k[1]} for k in broker_keys - central_keys], key=lambda x: (x.get("symbol"), x.get("side")))
-    only_central = sorted([{"symbol": k[0], "side": k[1]} for k in central_keys - broker_keys], key=lambda x: (x.get("symbol"), x.get("side")))
+
+    broker_map = {}
+    for p in broker_positions if isinstance(broker_positions, list) else []:
+        if not isinstance(p, dict):
+            continue
+        key = (_fleag_v1_norm_symbol(p.get("symbol")), _fleag_v1_norm_side(p.get("side")))
+        if key[0] and key[1]:
+            broker_map[key] = p
+    central_map = {}
+    for p in central_live if isinstance(central_live, list) else []:
+        if not isinstance(p, dict):
+            continue
+        key = (_fleag_v1_norm_symbol(p.get("symbol")), _fleag_v1_norm_side(p.get("side")))
+        if key[0] and key[1]:
+            central_map[key] = p
+
+    broker_keys = set(broker_map)
+    central_keys = set(central_map)
+    matched_keys = broker_keys & central_keys
+    manual_keys = broker_keys - central_keys
+    only_central_keys = central_keys - broker_keys
+
+    manual_external = []
+    for key in sorted(manual_keys):
+        p = broker_map.get(key) or {}
+        manual_external.append({
+            "symbol": key[0],
+            "side": key[1],
+            "classification": "MANUAL_OR_EXTERNAL_POSITION",
+            "notional": p.get("notional"),
+            "contracts": p.get("contracts"),
+            "entry_price": p.get("entry_price") or p.get("entryPrice"),
+            "leverage": p.get("leverage"),
+            "blocks_falcon": False,
+            "managed_by_central": False,
+        })
+
+    only_central = sorted(
+        [{"symbol": k[0], "side": k[1]} for k in only_central_keys],
+        key=lambda x: (x.get("symbol"), x.get("side")),
+    )
+    matched = sorted(
+        [{"symbol": k[0], "side": k[1]} for k in matched_keys],
+        key=lambda x: (x.get("symbol"), x.get("side")),
+    )
+
     live_without_stop = []
-    for p in central_live:
+    for p in central_live if isinstance(central_live, list) else []:
         if not isinstance(p, dict):
             continue
         if p.get("stop") in (None, "", 0, "0"):
-            live_without_stop.append({"symbol": p.get("symbol"), "side": p.get("side"), "bot": p.get("bot"), "setup": p.get("setup"), "order_id": p.get("order_id")})
+            live_without_stop.append({
+                "symbol": p.get("symbol"),
+                "side": p.get("side"),
+                "bot": p.get("bot"),
+                "setup": p.get("setup"),
+                "order_id": p.get("order_id"),
+            })
+
     return {
         "ok": not broker_err,
         "broker_error": broker_err,
-        "broker_bingx_open_count": len(broker_positions),
-        "central_live_count": len(central_live),
-        "only_bingx": only_bingx,
-        "only_bingx_count": len(only_bingx),
+        "broker_bingx_open_count": len(broker_map),
+        "central_live_count": len(central_map),
+        # Compatibilidade: only_bingx continua presente, mas agora é explicitamente manual/externa.
+        "only_bingx": manual_external,
+        "only_bingx_count": len(manual_external),
+        "manual_external_positions": manual_external,
+        "manual_external_count": len(manual_external),
+        "manual_external_blocks_falcon": False,
+        "matched": matched,
+        "matched_count": len(matched),
         "only_central": only_central,
         "only_central_count": len(only_central),
         "live_without_stop": live_without_stop,
         "live_without_stop_count": len(live_without_stop),
+        "ownership_policy_version": MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION,
     }
 
 
@@ -40850,8 +41017,11 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
         warnings.append(f"Eventos ruins LIVE duplicados entre fontes removidos: {dedup.get('duplicate_bad_events_removed_count')}.")
     if cfg.get("block_on_previous_failure") and bad_events:
         reasons.append(f"Existe LIVE_SENT_BUT_DISASTER_STOP_FAILED não reconhecido: {len(bad_events)} evento(s).")
-    if cfg.get("block_on_divergence") and divergence.get("only_bingx_count"):
-        reasons.append(f"Posição só na BingX: {divergence.get('only_bingx_count')}.")
+    if divergence.get("only_bingx_count"):
+        warnings.append(
+            f"Posições manuais/externas na BingX: {divergence.get('only_bingx_count')}; "
+            "observadas sem bloquear ou transferir gestão ao Falcon."
+        )
     if cfg.get("block_on_divergence") and divergence.get("only_central_count"):
         reasons.append(f"Posição só na Central: {divergence.get('only_central_count')}.")
     if divergence.get("live_without_stop_count"):
@@ -40885,6 +41055,13 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
         "config": cfg,
         "state": _fleag_v1_public(state),
         "divergence": divergence,
+        "manual_position_ownership": {
+            "version": MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION,
+            "manual_external_count": divergence.get("manual_external_count", divergence.get("only_bingx_count", 0)),
+            "manual_external_blocks_falcon": False,
+            "manual_external_managed_by_central": False,
+            "same_symbol_side_collision_block": True,
+        },
         "bad_execution_events_unacked": bad_events[-10:],
         "bad_execution_events_unacked_count": len(bad_events),
         "bad_execution_events_acked": bad_events_acked[-10:],
@@ -44399,7 +44576,7 @@ def broker_disaster_stop_payload_preview_v1_text_route():
 # ==========================================================
 # FALCON REAL PILOT PREFLIGHT CHECKLIST V1 — SAFE NO-REARM DIAGNOSTIC
 # ==========================================================
-FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-07-09-FALCON-REAL-PILOT-PREFLIGHT-CHECKLIST-V1"
+FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-07-11-FALCON-REAL-PILOT-PREFLIGHT-V1.1-MANUAL-INDEPENDENT"
 
 try:
     FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR = Path(CENTRAL_DATA_DIR)
@@ -44795,12 +44972,17 @@ def _frpp_v1_build_checklist():
     only_central_count = _frpp_v1_int(divergence.get("only_central_count"), 0) if divergence.get("only_central_count") is not None else 0
     live_without_stop_count = _frpp_v1_int(divergence.get("live_without_stop_count"), 0) if divergence.get("live_without_stop_count") is not None else 0
     add(
-        "SYNC_BINGX_POSITIONS_ZERO",
-        broker_open_count == 0,
-        "BingX positions = 0.",
-        f"BingX positions não está 0: {broker_open_count}.",
-        True,
-        {"broker_bingx_open_count": broker_open_count},
+        "BINGX_MANUAL_POSITIONS_INFORMATIONAL",
+        broker_open_count >= 0,
+        f"BingX possui {broker_open_count} posição(ões); posições sem vínculo Central são manuais/externas e não bloqueiam o Falcon.",
+        "Não foi possível confirmar a quantidade de posições na BingX.",
+        False,
+        {
+            "broker_bingx_open_count": broker_open_count,
+            "manual_external_count": only_bingx_count,
+            "manual_external_blocks_falcon": False,
+            "ownership_policy_version": MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION,
+        },
     )
     add(
         "SYNC_CENTRAL_LIVE_ZERO",
@@ -44811,12 +44993,17 @@ def _frpp_v1_build_checklist():
         {"central_live_count": central_live_count},
     )
     add(
-        "SYNC_NO_DIVERGENCE",
-        only_bingx_count == 0 and only_central_count == 0 and live_without_stop_count == 0,
-        "Sem divergência Central x BingX e sem LIVE sem stop.",
-        "Há divergência Central x BingX ou LIVE sem stop.",
+        "SYNC_NO_CENTRAL_OWNERSHIP_DIVERGENCE",
+        only_central_count == 0 and live_without_stop_count == 0,
+        "Sem posição Central órfã e sem LIVE da Central sem stop; posições apenas na BingX são tratadas como manuais/externas.",
+        "Há posição Central órfã ou LIVE da Central sem stop.",
         True,
-        {"only_bingx_count": only_bingx_count, "only_central_count": only_central_count, "live_without_stop_count": live_without_stop_count},
+        {
+            "manual_external_only_bingx_count": only_bingx_count,
+            "only_central_count": only_central_count,
+            "live_without_stop_count": live_without_stop_count,
+            "manual_external_blocks_falcon": False,
+        },
     )
 
     audit_status = str(falcon_audit.get("live_audit_status") or "").upper()
@@ -45099,7 +45286,7 @@ def falcon_real_pilot_preflight_checklist_v1_text_route():
 
 FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION = "2026-07-09-FALCON-LIVE-ORDER-AUDIT-DETAIL-V1"
 MANUAL_POSITION_AWARENESS_V1_VERSION = "2026-07-09-MANUAL-POSITION-AWARENESS-V1"
-LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION = "2026-07-11-LIVE-STATUS-V1.2.1-COMPLETED-HISTORY-RECON"
+LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION = "2026-07-11-LIVE-STATUS-V1.2.3-MANUAL-INDEPENDENT"
 
 try:
     _FLOAD_V1_DATA_DIR = CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")
@@ -45541,6 +45728,15 @@ def _flad_v1_build_payload(limit=100):
     state = audit.get("state") if isinstance(audit.get("state"), dict) else {}
     events = _flad_v1_read_falcon_live_order_events(limit=limit)
     details = [_flad_v1_build_event_detail(e, audit_payload=audit, state=state) for e in events]
+    reconciled_index = _live_v12_reconciled_closed_order_index()
+    # A identidade exata da ordem reconciliada prevalece sobre posições manuais
+    # abertas em outros símbolos. Posições externas são informativas e não
+    # reabrem tracking nem bloqueiam o Falcon.
+    for d in details:
+        if d.get("review_status") == "LIVE_ORDER_REQUIRES_TRACKING" and _live_v12_detail_is_reconciled_completed(d, reconciled_index):
+            d["review_status"] = "HISTORICAL_COMPLETED_OR_CLOSED"
+            d["action_required"] = False
+            d["completed_by_registry_order_identity"] = True
     historical_acked = [d for d in details if d.get("historical_acked")]
     unacked_failures = [d for d in details if d.get("bad_stop_event") and not d.get("historical_acked")]
     active_or_tracking = [d for d in details if d.get("action_required") and not d.get("bad_stop_event")]
@@ -45927,6 +46123,69 @@ def manual_position_awareness_v1_text_route():
 # LIVE Status V1.2 — Historical ACK Awareness
 # ----------------------------------------------------------------------------
 
+def _live_v12_reconciled_closed_order_index():
+    """Indexa ordens LIVE já encerradas e reconciliadas no Registry.
+
+    Posições manuais em outros símbolos não podem reabrir tracking de uma ordem
+    histórica do Falcon. A prova forte é o CLOSED REAL reconciliado por order/client id.
+    """
+    out = {"order_ids": set(), "client_order_ids": set(), "trade_ids": set(), "rows": []}
+    if central_trade_registry is None or not callable(getattr(central_trade_registry, "load_registry", None)):
+        return out
+    try:
+        registry = central_trade_registry.load_registry()
+    except Exception:
+        return out
+    closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
+    if isinstance(closed, dict):
+        closed = list(closed.values())
+    for trade in closed if isinstance(closed, list) else []:
+        if not isinstance(trade, dict):
+            continue
+        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+        status = str(trade.get("status") or "").upper().strip()
+        mode = str(trade.get("registry_mode") or meta.get("registry_mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
+        reconciled = bool(trade.get("real_close_reconciled") or meta.get("real_close_reconciled"))
+        if status != "CLOSED" or mode != "REAL" or not reconciled:
+            continue
+        order_ids = [
+            trade.get("broker_order_id"), trade.get("order_id"), trade.get("live_order_id"),
+            meta.get("broker_order_id"), meta.get("order_id"), meta.get("live_order_id"),
+        ]
+        client_ids = [
+            trade.get("client_order_id"), trade.get("clientOrderId"), trade.get("client_tag"),
+            meta.get("client_order_id"), meta.get("clientOrderId"), meta.get("client_tag"),
+        ]
+        clean_orders = {str(v).strip() for v in order_ids if v not in (None, "")}
+        clean_clients = {str(v).strip().lower() for v in client_ids if v not in (None, "")}
+        if not clean_orders and not clean_clients:
+            continue
+        out["order_ids"].update(clean_orders)
+        out["client_order_ids"].update(clean_clients)
+        if trade.get("trade_id"):
+            out["trade_ids"].add(str(trade.get("trade_id")))
+        out["rows"].append({
+            "trade_id": trade.get("trade_id"),
+            "symbol": _flad_v1_norm_symbol(trade.get("symbol")),
+            "side": _flad_v1_norm_side(trade.get("side")),
+            "order_ids": sorted(clean_orders),
+            "client_order_ids": sorted(clean_clients),
+        })
+    return out
+
+
+def _live_v12_detail_is_reconciled_completed(detail, reconciled_index=None):
+    if not isinstance(detail, dict) or detail.get("bad_stop_event"):
+        return False
+    idx = reconciled_index if isinstance(reconciled_index, dict) else _live_v12_reconciled_closed_order_index()
+    order_id = str(detail.get("order_id") or "").strip()
+    client_id = str(detail.get("client_order_id") or "").strip().lower()
+    return bool(
+        (order_id and order_id in (idx.get("order_ids") or set()))
+        or (client_id and client_id in (idx.get("client_order_ids") or set()))
+    )
+
+
 def _live_v12_order_detail_match(e, order_detail=None):
     """Localiza a mesma ordem no detalhe reconciliado por order/client id."""
     if not isinstance(e, dict) or not isinstance(order_detail, dict):
@@ -46108,7 +46367,7 @@ def build_live_report():
         f"- Casadas Central x BingX: {msum.get('matched_count')}",
         f"- Só na Central: {msum.get('central_only_count')}",
     ]
-    for row in (manual_awareness.get("manual_or_external_positions") or [])[:5]:
+    for row in (manual_awareness.get("manual_or_external_positions") or [])[:30]:
         bp = row.get("broker_position") if isinstance(row.get("broker_position"), dict) else {}
         lines.append(f"  ⚠️ Manual/externa: {row.get('symbol')} {row.get('side')} | notional={bp.get('notional')} | entry={bp.get('entry_price')}")
 
@@ -46160,7 +46419,9 @@ def build_live_report():
     if live_sent_active_or_unacked:
         lines.append("🔴 Há LIVE_SENT novo/ativo ou falha não reconhecida; acompanhar imediatamente com /falcon/liveorder/detail/text e /falcon/liveaudit/text.")
     if manual_awareness.get("status") == "MANUAL_OR_EXTERNAL_POSITION_PRESENT":
-        lines.append("⚠️ Há posição manual/externa na BingX; não atribuir automaticamente a robô.")
+        lines.append("⚠️ Há posição manual/externa na BingX; não atribuir automaticamente a robô e não gerenciar pela Central.")
+        lines.append("✅ Posições manuais não bloqueiam o Falcon e não entram no limite próprio do robô.")
+        lines.append("🛡️ Exceção de ownership: uma nova entrada Falcon no mesmo símbolo e mesmo lado é bloqueada, pois a BingX agregaria as quantidades.")
     if audit_payload.get("live_audit_status") in {"OK_ACKED_HISTORY_CLEAR", "OK"} and not live_sent_active_or_unacked:
         lines.append("✅ Falcon Audit limpo: nenhuma falha LIVE nova não reconhecida.")
 
@@ -46179,6 +46440,9 @@ def build_live_report():
             "manual_awareness_status": manual_awareness.get("status"),
             "falcon_order_detail_status": order_detail.get("status"),
             "falcon_audit_status": audit_payload.get("live_audit_status"),
+            "manual_external_count": msum.get("manual_or_external_count"),
+            "manual_external_blocks_falcon": False,
+            "ownership_policy_version": MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION,
         },
         "token_value_exposed": False,
     }
