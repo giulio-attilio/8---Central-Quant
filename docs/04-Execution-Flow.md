@@ -1,11 +1,11 @@
 # Fluxo de Execução
 
-Status: DRAFT
-Versão: 0.1
-Última revisão:
+Status: APPROVED
+Versão: 1.0
+Última revisão: 11/07/2026
 Responsável: CTO
 Implementação: Codex
-Aprovado: Não
+Aprovado: Sim
 
 ---
 
@@ -665,9 +665,57 @@ Nenhuma implementação isolada altera automaticamente este fluxo.
 
 ---
 
+# Event Timeline
+
+A sequência oficial de eventos da Central Quant é:
+
+`SIGNAL → DECISION → RISK → ENTRY_INTENT → ENTRY_SUBMITTING → ENTRY_CONFIRMED → ENTRY_PROTECTED → POSITION_MANAGED → TP50 → RUNNER → BREAK_EVEN → TRAILING → CLOSE → OUTCOME → ANALYTICS → LEARNING`
+
+- `SIGNAL`: sinal bruto recebido ou produzido por uma estratégia.
+- `DECISION`: decisão estruturada sobre aceitar, negar, bloquear ou revisar o sinal.
+- `RISK`: validação de risco, exposição, capital, limites e políticas executivas.
+- `ENTRY_INTENT`: intenção formal e persistível de abrir um trade.
+- `ENTRY_SUBMITTING`: estado transitório durante a tentativa de envio da ordem.
+- `ENTRY_CONFIRMED`: entrada confirmada por evidência válida de ordem ou fill.
+- `ENTRY_PROTECTED`: posição confirmada como protegida por stop operacional ou disaster stop físico.
+- `POSITION_MANAGED`: posição sob gestão ativa do lifecycle.
+- `TP50`: realização parcial de 50% ou evento equivalente definido pela estratégia.
+- `RUNNER`: parcela remanescente mantida após a realização parcial.
+- `BREAK_EVEN`: proteção movida para o preço de entrada ou nível equivalente.
+- `TRAILING`: proteção dinâmica que acompanha a evolução favorável do trade.
+- `CLOSE`: fechamento total confirmado.
+- `OUTCOME`: resultado final consolidado e atribuído ao trade correto.
+- `ANALYTICS`: processamento estatístico, métricas e avaliação de desempenho.
+- `LEARNING`: uso dos resultados para aprendizado, adaptação e evolução das políticas.
+
+Nem todo trade percorre todos os estados intermediários. `TP50`, `RUNNER`, `BREAK_EVEN` e `TRAILING` dependem da estratégia e das condições do trade; quando aplicáveis, a ordem dos eventos deve ser preservada. Toda confirmação depende de evidência suficiente, não apenas de intenção ou estado local. A Central Quant mantém autoridade sobre lifecycle e estatísticas, enquanto a exchange atua como executora, custodiante e fonte de evidências operacionais.
+
+---
+
+# Identity Chain
+
+A sequência oficial de identificadores é:
+
+`Signal ID → Decision ID → Trade ID → Lifecycle ID → Client Order ID → Exchange Order ID → Fill ID → Outcome ID`
+
+- `Signal ID`: identifica de forma única o sinal original.
+- `Decision ID`: identifica a decisão produzida a partir do sinal.
+- `Trade ID`: identidade lógica e permanente do trade dentro da Central Quant.
+- `Lifecycle ID`: identidade da instância de lifecycle e de sua máquina de estados.
+- `Client Order ID`: identificador criado pela Central para rastrear a ordem enviada.
+- `Exchange Order ID`: identificador atribuído pela exchange à ordem.
+- `Fill ID`: identificador de cada execução ou preenchimento confirmado.
+- `Outcome ID`: identificador do resultado final consolidado do trade.
+
+Esses IDs formam uma cadeia de rastreabilidade na qual cada identificador possui responsabilidade distinta e não deve ser reutilizado entre trades independentes. O `Trade ID` permanece estável durante toda a vida do trade, enquanto o `Lifecycle ID` identifica seu acompanhamento pela máquina de estados. O `Client Order ID` deve existir antes do envio; `Exchange Order ID` e `Fill ID` somente existem após confirmação da exchange.
+
+Um mesmo `Exchange Order ID` pode possuir múltiplos fills, e um mesmo `Trade ID` ou `Lifecycle ID` pode estar associado a múltiplas ordens. O `Outcome ID` deve referenciar os `Trade ID` e `Lifecycle ID` correspondentes. A cadeia completa deve permitir auditoria do sinal original até Analytics e Learning.
+
+---
+
 ## 53. Status final
 
-Este documento define o fluxo operacional oficial da arquitetura-alvo da Central Quant. Permanece DRAFT até auditoria e aprovação do CTO.
+Este documento define o fluxo operacional oficial aprovado da arquitetura-alvo da Central Quant.
 
 Ele não autoriza execução real, mudança de configuração, migração ou alteração de código.
 
