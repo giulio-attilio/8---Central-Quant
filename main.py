@@ -539,6 +539,147 @@ except Exception as _memory_profiler_exc:
 app = Flask(__name__)
 
 # ==========================================================
+# TRADE LIFECYCLE SHADOW OBSERVABILITY V1 — HTTP READ-ONLY
+# ==========================================================
+try:
+    from trade_lifecycle_shadow_observability import (
+        get_health as shadow_observability_get_health,
+        get_metrics as shadow_observability_get_metrics,
+        list_events as shadow_observability_list_events,
+        list_divergences as shadow_observability_list_divergences,
+        get_reconciliation_summary as shadow_observability_get_reconciliation_summary,
+    )
+    SHADOW_OBSERVABILITY_HTTP_IMPORT_OK = True
+except Exception:
+    shadow_observability_get_health = None
+    shadow_observability_get_metrics = None
+    shadow_observability_list_events = None
+    shadow_observability_list_divergences = None
+    shadow_observability_get_reconciliation_summary = None
+    SHADOW_OBSERVABILITY_HTTP_IMPORT_OK = False
+
+_SHADOW_HTTP_AUTHORITIES = {
+    "operational_authority": False,
+    "broker_access": False,
+    "registry_write_access": False,
+    "lifecycle_write_access": False,
+    "execution_control": False,
+    "automatic_repair": False,
+}
+_SHADOW_EVENT_QUERY_KEYS = {
+    "lifecycle_id", "trade_id", "event_id", "bot", "setup", "symbol",
+    "side", "event_type", "status", "date_from", "date_to", "limit", "cursor",
+}
+_SHADOW_DIVERGENCE_QUERY_KEYS = {
+    "lifecycle_id", "trade_id", "field", "severity", "resolved", "category",
+    "date_from", "date_to", "limit", "cursor",
+}
+
+
+def _shadow_http_status(payload):
+    status = str((payload or {}).get("status") or "").upper()
+    if status == "CURSOR_STALE":
+        return 409
+    if status in {"INVALID_FILTER", "INVALID_LIMIT", "INVALID_CURSOR"}:
+        return 400
+    if status in {"PAYLOAD_TOO_LARGE", "RESPONSE_TOO_LARGE"}:
+        return 413
+    if status == "UNAVAILABLE":
+        return 503
+    return 200
+
+
+def _shadow_http_error(status, message, *, code=500):
+    return {
+        "schema_version": "1.0",
+        "ok": False,
+        "status": status,
+        "module": "trade_lifecycle_shadow_observability",
+        "mode": "SHADOW",
+        **_SHADOW_HTTP_AUTHORITIES,
+        "warnings": [],
+        "errors": [message],
+    }, code
+
+
+def _shadow_query(allowed):
+    supplied = set(request.args.keys())
+    unknown = sorted(supplied - allowed)
+    if unknown:
+        return None, None, None, _shadow_http_error(
+            "INVALID_FILTER", "unknown query parameters: " + ", ".join(unknown), code=400
+        )
+    raw_limit = request.args.get("limit")
+    try:
+        limit = 50 if raw_limit in (None, "") else int(raw_limit)
+    except (TypeError, ValueError):
+        return None, None, None, _shadow_http_error("INVALID_LIMIT", "limit must be an integer", code=400)
+    cursor = request.args.get("cursor")
+    filters = {key: request.args.get(key) for key in allowed - {"limit", "cursor"} if request.args.get(key) is not None}
+    return filters, limit, cursor, None
+
+
+def _shadow_no_query():
+    supplied = sorted(set(request.args.keys()))
+    if supplied:
+        return _shadow_http_error(
+            "INVALID_FILTER", "this endpoint accepts no query parameters: " + ", ".join(supplied), code=400
+        )
+    return None
+
+
+def _shadow_call(function, *args, **kwargs):
+    if not SHADOW_OBSERVABILITY_HTTP_IMPORT_OK or not callable(function):
+        return _shadow_http_error("UNAVAILABLE", "shadow observability integration unavailable", code=503)
+    try:
+        payload = function(*args, **kwargs)
+        if not isinstance(payload, dict):
+            return _shadow_http_error("INTEGRATION_ERROR", "shadow observability returned an invalid contract", code=500)
+        return payload, _shadow_http_status(payload)
+    except Exception:
+        return _shadow_http_error("INTEGRATION_ERROR", "shadow observability request failed", code=500)
+
+
+@app.route("/shadowhealth", methods=["GET"])
+def shadow_observability_health_route():
+    error = _shadow_no_query()
+    if error:
+        return error
+    return _shadow_call(shadow_observability_get_health)
+
+
+@app.route("/shadowmetrics", methods=["GET"])
+def shadow_observability_metrics_route():
+    error = _shadow_no_query()
+    if error:
+        return error
+    return _shadow_call(shadow_observability_get_metrics)
+
+
+@app.route("/shadowevents", methods=["GET"])
+def shadow_observability_events_route():
+    filters, limit, cursor, error = _shadow_query(_SHADOW_EVENT_QUERY_KEYS)
+    if error:
+        return error
+    return _shadow_call(shadow_observability_list_events, filters=filters, limit=limit, cursor=cursor)
+
+
+@app.route("/shadowdivergences", methods=["GET"])
+def shadow_observability_divergences_route():
+    filters, limit, cursor, error = _shadow_query(_SHADOW_DIVERGENCE_QUERY_KEYS)
+    if error:
+        return error
+    return _shadow_call(shadow_observability_list_divergences, filters=filters, limit=limit, cursor=cursor)
+
+
+@app.route("/shadowreconciliation", methods=["GET"])
+def shadow_observability_reconciliation_route():
+    error = _shadow_no_query()
+    if error:
+        return error
+    return _shadow_call(shadow_observability_get_reconciliation_summary)
+
+# ==========================================================
 # MEMORY STABILIZER HELPERS V2.4.3
 # ==========================================================
 def _clamp_int(value, default=100, min_value=1, max_value=1000):
