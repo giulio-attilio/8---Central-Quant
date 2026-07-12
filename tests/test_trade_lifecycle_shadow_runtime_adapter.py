@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import trade_lifecycle_shadow_runtime_adapter as runtime_adapter_module
 from trade_lifecycle_shadow_runtime_adapter import TradeLifecycleShadowRuntimeAdapter
 
 
@@ -174,6 +175,66 @@ def test_metrics_are_structured(adapter):
     adapter.observe_event("SIGNAL", base(), persist=False)
     metrics = adapter.get_metrics()
     assert metrics["ok"] and metrics["metrics"]["observed"] == 1
+
+
+def test_public_read_only_wrappers_are_exported():
+    assert "get_shadow_runtime_adapter_health" in runtime_adapter_module.__all__
+    assert "get_shadow_runtime_adapter_metrics" in runtime_adapter_module.__all__
+    assert callable(runtime_adapter_module.get_shadow_runtime_adapter_health)
+    assert callable(runtime_adapter_module.get_shadow_runtime_adapter_metrics)
+
+
+def test_public_wrappers_delegate_to_same_official_instance(monkeypatch):
+    calls = {"health": 0, "metrics": 0}
+
+    class OfficialAdapterProbe:
+        def get_health(self):
+            calls["health"] += 1
+            return {"ok": True, "status": "DISABLED", "marker": "official"}
+
+        def get_metrics(self):
+            calls["metrics"] += 1
+            return {"ok": True, "status": "OK", "metrics": {"observed": 0}, "marker": "official"}
+
+        def observe_event(self, *args, **kwargs):
+            raise AssertionError("observe_event called")
+
+        def reconcile_trade(self, *args, **kwargs):
+            raise AssertionError("reconcile_trade called")
+
+        def reconcile_all(self, *args, **kwargs):
+            raise AssertionError("reconcile_all called")
+
+    official = OfficialAdapterProbe()
+    monkeypatch.setattr(runtime_adapter_module, "_default_adapter", official)
+    monkeypatch.setattr(runtime_adapter_module, "TradeLifecycleShadowRuntimeAdapter", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("second adapter created")))
+
+    assert runtime_adapter_module.get_shadow_runtime_adapter_health()["marker"] == "official"
+    assert runtime_adapter_module.get_shadow_runtime_adapter_metrics()["marker"] == "official"
+    assert calls == {"health": 1, "metrics": 1}
+
+
+def test_public_wrappers_do_not_mutate_metrics_or_create_files(tmp_path, monkeypatch):
+    official = TradeLifecycleShadowRuntimeAdapter(enabled=False, data_dir=tmp_path, manager=FakeManager())
+    monkeypatch.setattr(runtime_adapter_module, "_default_adapter", official)
+    before = official.get_metrics()["metrics"]
+    files_before = list(tmp_path.iterdir())
+
+    for _ in range(3):
+        assert isinstance(runtime_adapter_module.get_shadow_runtime_adapter_health(), dict)
+        assert isinstance(runtime_adapter_module.get_shadow_runtime_adapter_metrics(), dict)
+
+    assert official.get_metrics()["metrics"] == before
+    assert list(tmp_path.iterdir()) == files_before == []
+
+
+def test_public_wrappers_make_no_network_or_broker_import(monkeypatch):
+    monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("network")))
+    before_broker = sys.modules.get("broker")
+    health = runtime_adapter_module.get_shadow_runtime_adapter_health()
+    metrics = runtime_adapter_module.get_shadow_runtime_adapter_metrics()
+    assert isinstance(health, dict) and isinstance(metrics, dict)
+    assert sys.modules.get("broker") is before_broker
 
 
 def test_shadow_failure_does_not_change_official_result(adapter):

@@ -542,20 +542,21 @@ app = Flask(__name__)
 # TRADE LIFECYCLE SHADOW OBSERVABILITY V1 — HTTP READ-ONLY
 # ==========================================================
 try:
-    from trade_lifecycle_shadow_observability import (
-        get_health as shadow_observability_get_health,
-        get_metrics as shadow_observability_get_metrics,
-        list_events as shadow_observability_list_events,
-        list_divergences as shadow_observability_list_divergences,
-        get_reconciliation_summary as shadow_observability_get_reconciliation_summary,
+    from trade_lifecycle_shadow_observability import TradeLifecycleShadowObservability
+    from trade_lifecycle_shadow_runtime_adapter import (
+        get_shadow_runtime_adapter_health,
+        get_shadow_runtime_adapter_metrics,
+    )
+    from trade_lifecycle_manager import trade_lifecycle_health
+
+    _shadow_observability_http = TradeLifecycleShadowObservability(
+        adapter_health_provider=get_shadow_runtime_adapter_health,
+        adapter_metrics_provider=get_shadow_runtime_adapter_metrics,
+        lifecycle_health_provider=trade_lifecycle_health,
     )
     SHADOW_OBSERVABILITY_HTTP_IMPORT_OK = True
 except Exception:
-    shadow_observability_get_health = None
-    shadow_observability_get_metrics = None
-    shadow_observability_list_events = None
-    shadow_observability_list_divergences = None
-    shadow_observability_get_reconciliation_summary = None
+    _shadow_observability_http = None
     SHADOW_OBSERVABILITY_HTTP_IMPORT_OK = False
 
 _SHADOW_HTTP_AUTHORITIES = {
@@ -645,7 +646,7 @@ def shadow_observability_health_route():
     error = _shadow_no_query()
     if error:
         return error
-    return _shadow_call(shadow_observability_get_health)
+    return _shadow_call(getattr(_shadow_observability_http, "get_health", None))
 
 
 @app.route("/shadowmetrics", methods=["GET"])
@@ -653,7 +654,7 @@ def shadow_observability_metrics_route():
     error = _shadow_no_query()
     if error:
         return error
-    return _shadow_call(shadow_observability_get_metrics)
+    return _shadow_call(getattr(_shadow_observability_http, "get_metrics", None))
 
 
 @app.route("/shadowevents", methods=["GET"])
@@ -661,7 +662,7 @@ def shadow_observability_events_route():
     filters, limit, cursor, error = _shadow_query(_SHADOW_EVENT_QUERY_KEYS)
     if error:
         return error
-    return _shadow_call(shadow_observability_list_events, filters=filters, limit=limit, cursor=cursor)
+    return _shadow_call(getattr(_shadow_observability_http, "list_events", None), filters=filters, limit=limit, cursor=cursor)
 
 
 @app.route("/shadowdivergences", methods=["GET"])
@@ -669,7 +670,7 @@ def shadow_observability_divergences_route():
     filters, limit, cursor, error = _shadow_query(_SHADOW_DIVERGENCE_QUERY_KEYS)
     if error:
         return error
-    return _shadow_call(shadow_observability_list_divergences, filters=filters, limit=limit, cursor=cursor)
+    return _shadow_call(getattr(_shadow_observability_http, "list_divergences", None), filters=filters, limit=limit, cursor=cursor)
 
 
 @app.route("/shadowreconciliation", methods=["GET"])
@@ -677,7 +678,7 @@ def shadow_observability_reconciliation_route():
     error = _shadow_no_query()
     if error:
         return error
-    return _shadow_call(shadow_observability_get_reconciliation_summary)
+    return _shadow_call(getattr(_shadow_observability_http, "get_reconciliation_summary", None))
 
 # ==========================================================
 # MEMORY STABILIZER HELPERS V2.4.3

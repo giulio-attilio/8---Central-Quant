@@ -43,7 +43,7 @@ def get(client, route):
     return response, response.get_json()
 
 
-@mock.patch.object(central_main, "shadow_observability_get_health")
+@mock.patch.object(central_main._shadow_observability_http, "get_health")
 def test_shadowhealth_status_mapping(provider):
     with central_main.app.test_client() as client:
         for status, expected in (("OK", 200), ("DEGRADED", 200), ("DISABLED", 200), ("UNAVAILABLE", 503)):
@@ -52,7 +52,7 @@ def test_shadowhealth_status_mapping(provider):
             assert response.status_code == expected and body["status"] == status
 
 
-@mock.patch.object(central_main, "shadow_observability_get_metrics")
+@mock.patch.object(central_main._shadow_observability_http, "get_metrics")
 def test_shadowmetrics_status_mapping(provider):
     with central_main.app.test_client() as client:
         for status, expected in (("OK", 200), ("PARTIAL", 200), ("DISABLED", 200), ("UNAVAILABLE", 503)):
@@ -61,7 +61,7 @@ def test_shadowmetrics_status_mapping(provider):
             assert response.status_code == expected and body["status"] == status
 
 
-@mock.patch.object(central_main, "shadow_observability_list_events")
+@mock.patch.object(central_main._shadow_observability_http, "list_events")
 def test_shadowevents_without_filters_and_valid_limit(provider):
     provider.return_value = payload("OK", items=[])
     with central_main.app.test_client() as client:
@@ -71,7 +71,7 @@ def test_shadowevents_without_filters_and_valid_limit(provider):
         provider.assert_called_with(filters={}, limit=17, cursor=None)
 
 
-@mock.patch.object(central_main, "shadow_observability_list_events")
+@mock.patch.object(central_main._shadow_observability_http, "list_events")
 def test_shadowevents_forwards_all_allowed_filters_and_opaque_cursor(provider):
     provider.return_value = payload("PARTIAL", items=[])
     query = {
@@ -89,7 +89,7 @@ def test_shadowevents_forwards_all_allowed_filters_and_opaque_cursor(provider):
     )
 
 
-@mock.patch.object(central_main, "shadow_observability_list_events")
+@mock.patch.object(central_main._shadow_observability_http, "list_events")
 def test_shadowevents_module_error_mapping(provider):
     with central_main.app.test_client() as client:
         for status, expected in (("INVALID_FILTER", 400), ("INVALID_LIMIT", 400), ("INVALID_CURSOR", 400), ("CURSOR_STALE", 409), ("UNAVAILABLE", 503), ("PAYLOAD_TOO_LARGE", 413)):
@@ -97,7 +97,7 @@ def test_shadowevents_module_error_mapping(provider):
             assert client.get("/shadowevents").status_code == expected
 
 
-@mock.patch.object(central_main, "shadow_observability_list_events")
+@mock.patch.object(central_main._shadow_observability_http, "list_events")
 def test_shadowevents_rejects_invalid_limit_and_unknown_or_dangerous_parameters(provider):
     with central_main.app.test_client() as client:
         assert client.get("/shadowevents?limit=nope").status_code == 400
@@ -108,7 +108,7 @@ def test_shadowevents_rejects_invalid_limit_and_unknown_or_dangerous_parameters(
     provider.assert_not_called()
 
 
-@mock.patch.object(central_main, "shadow_observability_list_events")
+@mock.patch.object(central_main._shadow_observability_http, "list_events")
 def test_shadowevents_does_not_read_or_execute_json_body(provider):
     provider.return_value = payload("OK", items=[])
     with central_main.app.test_client() as client:
@@ -117,7 +117,7 @@ def test_shadowevents_does_not_read_or_execute_json_body(provider):
     provider.assert_called_once_with(filters={}, limit=50, cursor=None)
 
 
-@mock.patch.object(central_main, "shadow_observability_list_divergences")
+@mock.patch.object(central_main._shadow_observability_http, "list_divergences")
 def test_shadowdivergences_filters_resolved_and_cursor(provider):
     provider.return_value = payload("PARTIAL", items=[])
     query = {
@@ -138,7 +138,7 @@ def test_shadowdivergences_filters_resolved_and_cursor(provider):
     }
 
 
-@mock.patch.object(central_main, "shadow_observability_list_divergences")
+@mock.patch.object(central_main._shadow_observability_http, "list_divergences")
 def test_shadowdivergences_rejects_unknown_filter(provider):
     with central_main.app.test_client() as client:
         response = client.get("/shadowdivergences?path=x")
@@ -155,7 +155,7 @@ def test_parameterless_endpoints_reject_query_parameters():
             assert response.get_json()["status"] == "INVALID_FILTER"
 
 
-@mock.patch.object(central_main, "shadow_observability_get_reconciliation_summary")
+@mock.patch.object(central_main._shadow_observability_http, "get_reconciliation_summary")
 def test_shadowreconciliation_status_mapping(provider):
     with central_main.app.test_client() as client:
         for status, expected in (("NO_EVIDENCE", 200), ("DIVERGENCE", 200), ("PARTIAL", 200), ("UNKNOWN", 200), ("DISABLED", 200), ("UNAVAILABLE", 503)):
@@ -171,7 +171,7 @@ def test_non_get_methods_are_automatically_rejected():
                 assert method(route, json={"command": "repair"}).status_code == 405
 
 
-@mock.patch.object(central_main, "shadow_observability_get_health", side_effect=RuntimeError("C:/secret/path token=abc"))
+@mock.patch.object(central_main._shadow_observability_http, "get_health", side_effect=RuntimeError("C:/secret/path token=abc"))
 def test_exception_is_structured_sanitized_and_does_not_break_other_routes(provider):
     with central_main.app.test_client() as client:
         response, body = get(client, "/shadowhealth")
@@ -182,7 +182,7 @@ def test_exception_is_structured_sanitized_and_does_not_break_other_routes(provi
     provider.assert_called_once_with()
 
 
-@mock.patch.object(central_main, "shadow_observability_get_health", return_value="malformed")
+@mock.patch.object(central_main._shadow_observability_http, "get_health", return_value="malformed")
 def test_malformed_contract_is_structured(provider):
     with central_main.app.test_client() as client:
         response, body = get(client, "/shadowhealth")
@@ -191,7 +191,7 @@ def test_malformed_contract_is_structured(provider):
     assert all(body[key] is False for key in AUTHORITIES)
 
 
-@mock.patch.object(central_main, "shadow_observability_list_events")
+@mock.patch.object(central_main._shadow_observability_http, "list_events")
 def test_authorities_schema_and_external_position_are_preserved(provider):
     provider.return_value = payload("OK", items=[{"external_position": True, "bot": None, "setup": None}])
     with central_main.app.test_client() as client:
@@ -211,7 +211,7 @@ def test_import_guard_unavailable_is_fail_open(monkeypatch):
 def test_endpoints_do_not_change_trading_environment(monkeypatch):
     monkeypatch.setenv("ENABLE_REAL_TRADING", "sentinel-real")
     monkeypatch.setenv("BROKER_DRY_RUN", "sentinel-dry")
-    with mock.patch.object(central_main, "shadow_observability_get_health", return_value=payload("OK")):
+    with mock.patch.object(central_main._shadow_observability_http, "get_health", return_value=payload("OK")):
         with central_main.app.test_client() as client:
             assert client.get("/shadowhealth").status_code == 200
     assert os.environ["ENABLE_REAL_TRADING"] == "sentinel-real"
@@ -227,19 +227,19 @@ def test_shadow_http_source_has_no_mutable_or_operational_calls():
         "requests.", "socket.", "open(", "write_text", "write_bytes", "mkdir", "os.replace",
     ):
         assert forbidden not in section
-    assert "cursor=" not in section or "shadow_observability_list" in section
+    assert "cursor=" not in section or "list_events" in section or "list_divergences" in section
 
 
 def test_shadow_endpoints_create_or_modify_no_files(tmp_path):
     before = list(tmp_path.iterdir())
     fakes = {
-        "shadow_observability_get_health": lambda: payload("OK"),
-        "shadow_observability_get_metrics": lambda: payload("OK"),
-        "shadow_observability_list_events": lambda **kwargs: payload("OK", items=[]),
-        "shadow_observability_list_divergences": lambda **kwargs: payload("OK", items=[]),
-        "shadow_observability_get_reconciliation_summary": lambda: payload("NO_EVIDENCE"),
+        "get_health": lambda: payload("OK"),
+        "get_metrics": lambda: payload("OK"),
+        "list_events": lambda **kwargs: payload("OK", items=[]),
+        "list_divergences": lambda **kwargs: payload("OK", items=[]),
+        "get_reconciliation_summary": lambda: payload("NO_EVIDENCE"),
     }
-    with mock.patch.multiple(central_main, **fakes):
+    with mock.patch.multiple(central_main._shadow_observability_http, **fakes):
         with central_main.app.test_client() as client:
             for route in ROUTES:
                 assert client.get(route).status_code == 200
@@ -252,3 +252,66 @@ def test_routes_are_registered_and_existing_home_still_works():
         assert route in rules and "GET" in rules[route] and "POST" not in rules[route]
     with central_main.app.test_client() as client:
         assert client.get("/").status_code == 200
+
+
+def test_http_instance_is_wired_to_real_public_providers():
+    instance = central_main._shadow_observability_http
+    assert instance.adapter_health_provider is central_main.get_shadow_runtime_adapter_health
+    assert instance.adapter_metrics_provider is central_main.get_shadow_runtime_adapter_metrics
+    assert instance.lifecycle_health_provider is central_main.trade_lifecycle_health
+    source = Path(central_main.__file__).read_text(encoding="utf-8")
+    section = source.split("TRADE LIFECYCLE SHADOW OBSERVABILITY V1 — HTTP READ-ONLY", 1)[1].split("MEMORY STABILIZER HELPERS", 1)[0]
+    assert "TradeLifecycleShadowRuntimeAdapter(" not in section
+    assert "_default_adapter" not in section
+
+
+def test_healthy_providers_without_files_are_visible_and_not_unavailable(tmp_path, monkeypatch):
+    instance = central_main._shadow_observability_http
+    monkeypatch.setattr(instance, "enabled", True)
+    monkeypatch.setattr(instance, "state_file", tmp_path / "missing-state.json")
+    monkeypatch.setattr(instance, "events_file", tmp_path / "missing-events.jsonl")
+    monkeypatch.setattr(instance, "divergences_file", tmp_path / "missing-divergences.jsonl")
+    monkeypatch.setattr(instance, "adapter_health_provider", lambda: {"ok": True, "status": "DISABLED", "marker": "adapter-real"})
+    monkeypatch.setattr(instance, "adapter_metrics_provider", lambda: {"ok": True, "status": "OK", "metrics": {"observed": 7}})
+    monkeypatch.setattr(instance, "lifecycle_health_provider", lambda: {"ok": True, "status": "OK", "marker": "lifecycle-real"})
+
+    with central_main.app.test_client() as client:
+        health = client.get("/shadowhealth")
+        metrics = client.get("/shadowmetrics")
+    assert health.status_code == 200
+    health_payload = health.get_json()
+    assert health_payload["status"] in {"OK", "DEGRADED"}
+    assert health_payload["adapter"]["marker"] == "adapter-real"
+    assert health_payload["lifecycle"]["marker"] == "lifecycle-real"
+    assert metrics.get_json()["events"]["observed"] == 7
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unhealthy_real_provider_is_degraded_not_exception(tmp_path, monkeypatch):
+    instance = central_main._shadow_observability_http
+    monkeypatch.setattr(instance, "enabled", True)
+    monkeypatch.setattr(instance, "state_file", tmp_path / "state.json")
+    monkeypatch.setattr(instance, "events_file", tmp_path / "events.jsonl")
+    monkeypatch.setattr(instance, "divergences_file", tmp_path / "divergences.jsonl")
+    monkeypatch.setattr(instance, "adapter_health_provider", lambda: {"ok": False, "status": "ERROR"})
+    monkeypatch.setattr(instance, "lifecycle_health_provider", lambda: {"ok": True, "status": "OK"})
+    with central_main.app.test_client() as client:
+        assert client.get("/shadowhealth").get_json()["status"] == "DEGRADED"
+    monkeypatch.setattr(instance, "adapter_health_provider", lambda: {"ok": True, "status": "OK"})
+    monkeypatch.setattr(instance, "lifecycle_health_provider", lambda: {"ok": False, "status": "ERROR"})
+    with central_main.app.test_client() as client:
+        assert client.get("/shadowhealth").get_json()["status"] == "DEGRADED"
+
+
+def test_provider_exception_remains_structured_fail_open(tmp_path, monkeypatch):
+    instance = central_main._shadow_observability_http
+    monkeypatch.setattr(instance, "enabled", True)
+    monkeypatch.setattr(instance, "state_file", tmp_path / "state.json")
+    monkeypatch.setattr(instance, "events_file", tmp_path / "events.jsonl")
+    monkeypatch.setattr(instance, "divergences_file", tmp_path / "divergences.jsonl")
+    monkeypatch.setattr(instance, "adapter_health_provider", lambda: (_ for _ in ()).throw(RuntimeError("provider")))
+    monkeypatch.setattr(instance, "lifecycle_health_provider", lambda: {"ok": True, "status": "OK"})
+    with central_main.app.test_client() as client:
+        response = client.get("/shadowhealth")
+        assert response.status_code == 200
+        assert response.get_json()["status"] == "DEGRADED"

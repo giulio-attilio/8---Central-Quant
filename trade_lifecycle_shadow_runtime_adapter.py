@@ -281,4 +281,22 @@ def safe_reconcile_shadow_trade(registry_trade: Dict[str, Any], *, persist: bool
     return _default_adapter.reconcile_trade(registry_trade, persist=persist)
 
 
-__all__ = ["TradeLifecycleShadowRuntimeAdapter", "safe_observe_shadow_event", "safe_reconcile_shadow_trade", "VERSION", "MODE"]
+def get_shadow_runtime_adapter_health() -> Dict[str, Any]:
+    """Return health from the official runtime adapter without mutating it."""
+    return _default_adapter.get_health()
+
+
+def get_shadow_runtime_adapter_metrics() -> Dict[str, Any]:
+    """Return metrics from the official runtime adapter without mutating it."""
+    return _default_adapter.get_metrics()
+
+
+__all__ = [
+    "TradeLifecycleShadowRuntimeAdapter",
+    "safe_observe_shadow_event",
+    "safe_reconcile_shadow_trade",
+    "get_shadow_runtime_adapter_health",
+    "get_shadow_runtime_adapter_metrics",
+    "VERSION",
+    "MODE",
+]
