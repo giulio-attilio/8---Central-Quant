@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import os
 import time
 import threading
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
+LOGGER = logging.getLogger(__name__)
 
 
 def _resolve_data_dir() -> Path:
@@ -242,6 +245,24 @@ def make_trade_id(bot: Any, symbol: Any, side: Any, setup: Any = None) -> str:
     return f"{bot_n}:{setup_n}:{_normalize_symbol(symbol)}:{_normalize_side(side)}"
 
 
+def _observe_shadow_registry_snapshot(event_type: str, trade: Dict[str, Any]) -> None:
+    """Publish a post-persistence copy to Shadow Mode without affecting Registry."""
+    try:
+        from trade_lifecycle_shadow_runtime_adapter import (
+            safe_observe_shadow_event,
+            safe_reconcile_shadow_trade,
+        )
+
+        snapshot = copy.deepcopy(trade or {})
+        snapshot.setdefault("source_component", "TRADE_REGISTRY")
+        safe_observe_shadow_event(event_type, snapshot)
+        safe_reconcile_shadow_trade(snapshot)
+    except Exception as exc:
+        # Shadow observability is never part of the Registry success contract.
+        LOGGER.warning("trade registry shadow observation failed: %s", exc)
+        return
+
+
 def register_open_trade(
     bot: Any,
     symbol: Any,
@@ -306,6 +327,7 @@ def register_open_trade(
     trade = _normalize_trade_record(trade)
     registry["open_trades"][trade_id] = trade
     save_registry(registry)
+    _observe_shadow_registry_snapshot("SIGNAL_CREATED", trade)
     return {"ok": True, "action": "OPEN_REGISTERED", "trade_id": trade_id, "trade": trade}
 
 
@@ -325,6 +347,7 @@ def update_trade(trade_id: str, **updates: Any) -> Dict[str, Any]:
     trade = _normalize_trade_record(trade)
     registry["open_trades"][trade_id] = trade
     save_registry(registry)
+    _observe_shadow_registry_snapshot("TRADE_UPDATED", trade)
     return {"ok": True, "action": "TRADE_UPDATED", "trade_id": trade_id, "trade": trade}
 
 
@@ -401,6 +424,7 @@ def update_closed_trade(
     closed_trades[index] = trade
     registry["closed_trades"] = closed_trades
     save_registry(registry)
+    _observe_shadow_registry_snapshot("OUTCOME_CONFIRMED", trade)
     return {
         "ok": True,
         "action": "CLOSED_TRADE_UPDATED",
@@ -501,6 +525,7 @@ def close_trade(
     trade = _normalize_trade_record(trade)
     registry["closed_trades"].append(trade)
     save_registry(registry)
+    _observe_shadow_registry_snapshot("CLOSE_CONFIRMED", trade)
     return {"ok": True, "action": "TRADE_CLOSED", "trade_id": trade_id, "trade": trade}
 
 
