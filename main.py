@@ -15369,22 +15369,22 @@ def build_live_report():
 
 
 def build_sync_report():
-    broker_positions, pos_err = _broker_open_positions()
-    central_live = _central_live_positions_payload()
-
-    broker_keys = {(p.get("symbol"), str(p.get("side") or "").upper()) for p in broker_positions}
-    central_keys = {(p.get("symbol"), str(p.get("side") or "").upper()) for p in central_live}
-
-    only_bingx = sorted(list(broker_keys - central_keys))
-    only_central = sorted(list(central_keys - broker_keys))
-    matched = sorted(list(broker_keys & central_keys))
+    awareness = _mpa_v1_build_payload() if callable(globals().get("_mpa_v1_build_payload")) else {}
+    summary = awareness.get("summary") if isinstance(awareness.get("summary"), dict) else {}
+    matched_rows = awareness.get("matched_positions") or []
+    manual_external = awareness.get("manual_or_external_positions") or []
+    central_only_rows = awareness.get("central_only_positions") or []
+    matched = [(row.get("symbol"), row.get("side")) for row in matched_rows]
+    only_bingx = [(row.get("symbol"), row.get("side")) for row in manual_external]
+    only_central = [(row.get("symbol"), row.get("side")) for row in central_only_rows]
+    pos_err = summary.get("broker_error")
 
     lines = [
         "🔄 SYNC CENTRAL x BINGX",
         f"Data/hora: {data_hora_sp_str()}",
         "",
-        f"BingX positions: {len(broker_positions)}",
-        f"Central LIVE positions: {len(central_live)}",
+        f"BingX positions: {summary.get('broker_bingx_open_count', 0)}",
+        f"Central LIVE positions: {summary.get('central_live_count', 0)}",
         f"Casadas: {len(matched)}",
         f"Só na BingX: {len(only_bingx)}",
         f"Só na Central: {len(only_central)}",
@@ -15396,12 +15396,21 @@ def build_sync_report():
         lines += ["", "Casadas:"] + [f"- {sym} {side}" for sym, side in matched[:20]]
     if only_bingx:
         lines += ["", "⚠️ Só na BingX:"] + [f"- {sym} {side}" for sym, side in only_bingx[:20]]
+    if only_bingx:
+        lines += ["", "MANUAL_OR_EXTERNAL_POSITION_PRESENT:"]
+        for row in manual_external[:20]:
+            bp = row.get("broker_position") if isinstance(row.get("broker_position"), dict) else {}
+            lines.append(f"- Manual/externa: {row.get('symbol')} {row.get('side')} | notional={bp.get('notional')} | entry={bp.get('entry_price')}")
     if only_central:
         lines += ["", "⚠️ Só na Central:"] + [f"- {sym} {side}" for sym, side in only_central[:20]]
     if not only_bingx and not only_central:
         lines += ["", "✅ Central LIVE e BingX sincronizadas."]
     else:
         lines += ["", "Ação sugerida: antes de LIVE, investigar qualquer divergência acima."]
+    if only_bingx and not only_central:
+        lines[-1] = "Central LIVE e BingX sem divergência de ownership da Central. Há posições manuais/externas não gerenciadas pela Central."
+    elif only_central:
+        lines[-1] = "ALERTA CRÍTICO: há posição LIVE da Central sem correspondência na BingX; reconciliar antes de nova ação."
     return "\n".join(lines)
 
 
@@ -43157,6 +43166,10 @@ def _pprsf_v1_extract_closed_raw(event):
 
 def _pprsf_v1_build_closed_trade_from_event(event):
     raw = _pprsf_v1_extract_closed_raw(event)
+    kind = str(event.get("kind") or raw.get("kind") or "").upper()
+    mode = str(raw.get("execution_mode") or raw.get("mode") or "PAPER").upper()
+    if kind in {"SAFE_DRY_RUN", "BROKER_PREVIEW", "VERIFY", "REAL_SENT_OR_LIVE_EVENT"} or mode in {"SAFE_DRY_RUN", "VERIFY", "LIVE", "REAL"}:
+        return None
     trade_id = _pprsf_v1_trade_id_from_closed_event(event)
     symbol = _ppla_v1_norm_symbol(raw.get("symbol_clean") or raw.get("symbol"))
     side = _ppla_v1_norm_side(raw.get("side"))
@@ -43165,10 +43178,10 @@ def _pprsf_v1_build_closed_trade_from_event(event):
     exit_price = _ppla_v1_float(raw.get("exit_price"), default=_ppla_v1_float(raw.get("exit"), default=None))
     pnl_pct = _ppla_v1_float(raw.get("result_pct"), default=_ppla_v1_float(raw.get("pnl_pct"), default=_ppla_v1_float(raw.get("pnl"), default=None)))
     pnl_r = _ppla_v1_float(raw.get("result_r"), default=_ppla_v1_float(raw.get("pnl_r"), default=None))
-    if not trade_id or symbol == "UNKNOWN" or side not in {"LONG", "SHORT"} or entry is None:
+    closed_at = raw.get("ts") or raw.get("closed_at") or raw.get("datetime")
+    if not trade_id or symbol == "UNKNOWN" or side not in {"LONG", "SHORT"} or entry is None or exit_price is None or not closed_at:
         return None
     close_reason = str(raw.get("event_raw") or raw.get("close_reason") or raw.get("reason") or raw.get("event") or "PAPER_CLOSE").upper()
-    closed_at = raw.get("ts") or raw.get("closed_at") or raw.get("datetime") or _pprsf_v1_now()
     trade = {
         "trade_id": trade_id,
         "bot": "PREDATOR",
@@ -43225,12 +43238,17 @@ def _pprsf_v1_existing_ids_and_signatures(registry):
     for item in closed_l:
         if item.get("trade_id"):
             ids.add(str(item.get("trade_id")))
-        sig_closed.add(_pprsf_v1_signature_trade(item) + "|" + str(item.get("closed_at") or item.get("exit_time") or ""))
+        sig_closed.add(_pprsf_v1_closed_signature(item))
     return ids, sig_open, sig_closed
 
 
 def _pprsf_v1_closed_signature(trade):
-    return _pprsf_v1_signature_trade(trade) + "|" + str(trade.get("closed_at") or trade.get("exit_time") or "")
+    fields = (
+        trade.get("bot"), trade.get("setup"), trade.get("symbol"), trade.get("side"),
+        trade.get("opened_at") or trade.get("entry_time"), trade.get("closed_at") or trade.get("exit_time"),
+        trade.get("close_reason") or trade.get("exit_reason"), trade.get("entry"), trade.get("exit_price") or trade.get("exit"),
+    )
+    return "|".join(str(value or "") for value in fields)
 
 
 def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_samples=True, use_cache=False):
@@ -43391,6 +43409,9 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
         "planned_closed_repair_count": len(planned_closed),
         "open_repaired_count": len(open_repaired),
         "closed_repaired_count": len(closed_repaired),
+        "closed_pending_count": (0 if committed else len(planned_closed)) + len([x for x in closed_skipped if x.get("reason") == "INVALID_CLOSED_EVENT"]),
+        "repair_last_run": _pprsf_v1_now(),
+        "repair_last_error": "; ".join(errors) if errors else None,
         "open_skipped_count": len(open_skipped),
         "closed_skipped_count": len(closed_skipped),
         "errors": errors,
@@ -43419,28 +43440,29 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
             "open_skipped": open_skipped[:20],
             "closed_skipped": closed_skipped[:20],
         }
-    try:
-        latest_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE)
-        latest_path.parent.mkdir(parents=True, exist_ok=True)
-        latest_path.write_text(json.dumps(_pprsf_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
-        event_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE)
-        event_path.parent.mkdir(parents=True, exist_ok=True)
-        with event_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "event": "PREDATOR_PAPER_REGISTRY_SYNC_FIX_RUN",
-                "generated_at": payload.get("generated_at"),
-                "status": status,
-                "commit": commit,
-                "committed": committed,
-                "planned_open_repair_count": len(planned_open),
-                "planned_closed_repair_count": len(planned_closed),
-                "open_repaired_count": len(open_repaired),
-                "closed_repaired_count": len(closed_repaired),
-                "errors": errors[:5],
-                "warnings": warnings[:5],
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    if commit:
+        try:
+            latest_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE)
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            latest_path.write_text(json.dumps(_pprsf_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+            event_path = Path(PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE)
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "event": "PREDATOR_PAPER_REGISTRY_SYNC_FIX_RUN",
+                    "generated_at": payload.get("generated_at"),
+                    "status": status,
+                    "commit": commit,
+                    "committed": committed,
+                    "planned_open_repair_count": len(planned_open),
+                    "planned_closed_repair_count": len(planned_closed),
+                    "open_repaired_count": len(open_repaired),
+                    "closed_repaired_count": len(closed_repaired),
+                    "errors": errors[:5],
+                    "warnings": warnings[:5],
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
     try:
         _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["ts"] = _pprsf_v1_epoch_now()
         _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["payload"] = payload
@@ -43528,6 +43550,7 @@ def bot_health(key: str, cfg: dict):
     try:
         if str(key).upper() == "PREDATOR":
             sync = predator_paper_registry_sync_fix_v1_status(commit=False, include_samples=False, use_cache=True)
+            lifecycle_audit = predator_paper_lifecycle_audit_v1_status(include_samples=False, use_cache=True) if callable(globals().get("predator_paper_lifecycle_audit_v1_status")) else {}
             overlay = {
                 "predator_registry_sync_status": sync.get("status"),
                 "predator_registry_sync_ok": sync.get("ok"),
@@ -43536,8 +43559,12 @@ def bot_health(key: str, cfg: dict):
                 "predator_registry_closed_planned_count": sync.get("planned_closed_repair_count"),
                 "predator_registry_open_repaired_count": sync.get("open_repaired_count"),
                 "predator_registry_closed_repaired_count": sync.get("closed_repaired_count"),
+                "predator_registry_closed_pending_count": sync.get("closed_pending_count"),
+                "predator_registry_repair_last_run": sync.get("repair_last_run"),
+                "predator_registry_repair_last_error": sync.get("repair_last_error"),
                 "predator_registry_sync_error": "; ".join(sync.get("errors") or []) if sync.get("errors") else None,
                 "predator_registry_sync_warnings": (sync.get("warnings") or [])[:5],
+                "predator_lifecycle_audit_status": lifecycle_audit.get("status"),
             }
             health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
             health.update(overlay)
@@ -43553,6 +43580,7 @@ def bot_health(key: str, cfg: dict):
 
 @app.route("/predator/registrysync", methods=["GET", "POST"])
 @app.route("/predator/paperregistrysync", methods=["GET", "POST"])
+@app.route("/predator/registryrepair", methods=["GET", "POST"])
 def predator_paper_registry_sync_fix_v1_route():
     body = request.get_json(silent=True) or {}
     commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
@@ -43562,6 +43590,7 @@ def predator_paper_registry_sync_fix_v1_route():
 
 @app.route("/predator/registrysync/text", methods=["GET", "POST"])
 @app.route("/predator/paperregistrysync/text", methods=["GET", "POST"])
+@app.route("/predator/registryrepair/text", methods=["GET", "POST"])
 def predator_paper_registry_sync_fix_v1_text_route():
     body = request.get_json(silent=True) or {}
     commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)

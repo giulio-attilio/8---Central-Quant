@@ -22,6 +22,12 @@ import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
+from predator_daily_summary import (
+    append_predator_event,
+    build_daily_metrics,
+    daily_summary_health,
+    load_events_for_period,
+)
 
 # ====================================================
 # BROKER / EXECUÇÃO REAL SAFE MODE
@@ -517,6 +523,9 @@ def salvar_trades(dados):
 
 
 def registrar_evento_trade(evento):
+    persistent_result = append_predator_event(evento)
+    if not persistent_result.get("ok"):
+        HEALTH["predator_daily_summary_last_error"] = persistent_result.get("error")
     trades = carregar_trades()
     trades.append(evento)
     if len(trades) > 3000:
@@ -2640,8 +2649,12 @@ def gerenciar_posicoes():
 # ====================================================
 
 def filtrar_trades_periodo(data_prefix):
-    trades = carregar_trades()
-    return [t for t in trades if str(t.get("date", "")).startswith(data_prefix)]
+    loaded = load_events_for_period(data_prefix, carregar_trades())
+    HEALTH["predator_daily_summary_source"] = loaded.get("source")
+    HEALTH["predator_daily_summary_warning_count"] = loaded.get("warning_count")
+    if loaded.get("warnings"):
+        HEALTH["last_warning"] = "; ".join(loaded.get("warnings")[:3])
+    return loaded.get("events") or []
 
 
 
@@ -2855,6 +2868,15 @@ def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
     posicoes = carregar_posicoes()
     ativos = [p for p in posicoes.values() if p.get("status") != "ENCERRADO"]
     modo = predator_mode_label()
+    daily_metrics = build_daily_metrics(
+        data_prefix,
+        carregar_trades(),
+        active_count=len(ativos),
+    )
+    summary_warnings = daily_metrics.get("warnings") or []
+    warning_note = ""
+    if summary_warnings:
+        warning_note = "\n\n⚠️ CONSISTÊNCIA DAS FONTES\n" + "\n".join(f"- {item}" for item in summary_warnings[:5])
 
     return (
         f"{titulo}\n"
@@ -2881,9 +2903,12 @@ def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
         f"Lucro médio após TP50: {fmt_r(stats['expectancy_after_tp50_r'])}\n"
         f"Captura do movimento: {stats['trend_capture_pct']:.2f}%\n\n"
         f"TP50 atingidos: {stats['tp50_hits']}\n"
+        f"BE ativados: {daily_metrics.get('be_activated', 0)}\n"
         f"Tempo médio até TP50: {stats['avg_cycles_to_tp50']:.1f} ciclos de gestão\n"
         f"Tempo médio até fechamento: {stats['avg_management_cycles']:.1f} ciclos de gestão\n"
-        f"Trailings atualizados: {len(stats['trails'])}\n\n"
+        f"Trailings atualizados: {len(stats['trails'])}\n"
+        f"Saídas por TRAIL: {daily_metrics.get('trail_exits', 0)}\n"
+        f"Saídas por SL: {daily_metrics.get('sl_exits', 0)}\n\n"
         f"Resultado financeiro:\n{fmt_pct(stats['pnl_pct'])} | {fmt_r(stats['pnl_r'])}\n\n"
         f"Maior lucro durante o trade:\n{fmt_pct(stats['mfe_avg_pct'])} | {fmt_r(stats['mfe_avg_r'])}\n"
         f"Maior perda durante o trade:\n{fmt_pct(stats['mae_avg_pct'])} | {fmt_r(stats['mae_avg_r'])}\n"
@@ -2893,6 +2918,7 @@ def montar_resumo_por_periodo(data_prefix, titulo, data_txt):
         f"Melhor trade:\n{trade_line_predator(stats['best_trade'])}\n\n"
         f"Pior trade:\n{trade_line_predator(stats['worst_trade'])}\n\n"
         f"Trades Smart Predator ainda ativos: {len(ativos)}"
+        f"{warning_note}"
     )
 
 
@@ -3580,6 +3606,8 @@ def montar_health_tecnico():
         "last_watchdog_alert": HEALTH.get("last_watchdog_alert"),
         "watchdog_last_check": HEALTH.get("watchdog_last_check")
     }
+
+    payload.update(daily_summary_health())
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
 

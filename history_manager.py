@@ -1489,7 +1489,15 @@ def calculate_performance_metrics(events=None):
         event_name = normalize_event_type(event.get("event") or event.get("event_type") or event.get("type"), event)
         if event_name != "TRADE_CLOSED":
             continue
-        pnl = _safe_float(event.get("pnl_pct") or event.get("result_pct") or event.get("pnl") or event.get("resultado_pct"), None)
+        pnl_value = next(
+            (
+                event.get(field)
+                for field in ("pnl_pct", "result_pct", "pnl", "resultado_pct")
+                if event.get(field) is not None
+            ),
+            None,
+        )
+        pnl = _safe_float(pnl_value, None)
         if pnl is None:
             pnl = _safe_float(event.get("result"), None)
         if pnl is None:
@@ -1510,7 +1518,7 @@ def calculate_performance_metrics(events=None):
     avg_loss_pct = round(sum(loss_values) / len(loss_values), 4) if loss_values else 0.0
     payoff_ratio = round(avg_win_pct / avg_loss_pct, 4) if avg_loss_pct else 0.0
     profit_factor_pct = round(sum(win_values) / sum(loss_values), 4) if loss_values and sum(win_values) else 0.0
-    expectancy_pct = round((win_rate_pct / 100) * avg_win_pct - ((100 - win_rate_pct) / 100) * avg_loss_pct, 4) if trades else 0.0
+    expectancy_pct = round((wins / trades) * avg_win_pct, 4) if trades else 0.0
 
     max_win_streak = 0
     max_loss_streak = 0
