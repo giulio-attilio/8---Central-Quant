@@ -2,6 +2,7 @@
 # CENTRAL QUANT - BROKER BINGX SAFE MODE
 # Versão: 2026-07-09-BROKER-DISASTER-STOP-HEDGE-MODE-FIX-V1.1
 # Patch adicional: 2026-07-11-REAL-CLOSE-RECONCILIATION-V1 (read-only order/fill/PnL)
+# Auditoria CTO: 2026-07-11-BROKER-AUTH-TOKEN-THREAD-SAFETY-V1
 #
 # Objetivo:
 # - Isolar toda comunicação real com a BingX em um único arquivo.
@@ -49,6 +50,7 @@ import hmac
 import json
 import os
 import time
+import threading
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
@@ -145,6 +147,8 @@ BINGX_HEDGE_MODE_ENABLED = env_bool("BINGX_HEDGE_MODE_ENABLED", BINGX_POSITION_M
 EXECUTION_AUTH_TOKEN_ENABLED = env_bool("EXECUTION_AUTH_TOKEN_ENABLED", True)
 EXECUTION_AUTH_TOKEN_TTL_SECONDS = int(os.environ.get("EXECUTION_AUTH_TOKEN_TTL_SECONDS", "30"))
 _EXECUTION_AUTH_TOKENS = {}
+_EXECUTION_AUTH_TOKENS_LOCK = threading.RLock()
+BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION = "2026-07-11-BROKER-AUTH-TOKEN-THREAD-SAFETY-V1"
 
 # Disaster Stop Manager V2.7
 DISASTER_STOP_ENABLED = env_bool("DISASTER_STOP_ENABLED", True)
@@ -458,10 +462,24 @@ def exchange():
 
 
 def _cleanup_execution_auth_tokens():
+    """Remove tokens expirados de forma segura entre threads."""
     now = time.time()
-    expired = [token for token, data in list(_EXECUTION_AUTH_TOKENS.items()) if float(data.get("expires_at", 0)) < now]
-    for token in expired:
-        _EXECUTION_AUTH_TOKENS.pop(token, None)
+    with _EXECUTION_AUTH_TOKENS_LOCK:
+        expired = [
+            token
+            for token, data in list(_EXECUTION_AUTH_TOKENS.items())
+            if float(data.get("expires_at", 0)) < now
+        ]
+        for token in expired:
+            _EXECUTION_AUTH_TOKENS.pop(token, None)
+        return len(expired)
+
+
+def _active_execution_auth_token_count() -> int:
+    """Retorna a contagem atual sem iterar o dicionário fora do lock."""
+    _cleanup_execution_auth_tokens()
+    with _EXECUTION_AUTH_TOKENS_LOCK:
+        return len(_EXECUTION_AUTH_TOKENS)
 
 
 def issue_execution_auth_token(context: dict = None, ttl_seconds: int = None):
@@ -473,18 +491,21 @@ def issue_execution_auth_token(context: dict = None, ttl_seconds: int = None):
     ttl = int(ttl_seconds or EXECUTION_AUTH_TOKEN_TTL_SECONDS)
     token = secrets.token_urlsafe(32)
     now = time.time()
-    _EXECUTION_AUTH_TOKENS[token] = {
+    token_data = {
         "created_at": now,
         "expires_at": now + max(1, ttl),
         "used": False,
         "context": dict(context or {}),
     }
+    with _EXECUTION_AUTH_TOKENS_LOCK:
+        _EXECUTION_AUTH_TOKENS[token] = token_data
     return {
         "ok": True,
         "token": token,
-        "expires_at": _EXECUTION_AUTH_TOKENS[token]["expires_at"],
+        "expires_at": token_data["expires_at"],
         "ttl_seconds": ttl,
         "context": dict(context or {}),
+        "thread_safety_version": BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION,
     }
 
 
@@ -499,28 +520,55 @@ def validate_execution_auth_token(token: str, context: dict = None, consume: boo
     _cleanup_execution_auth_tokens()
 
     if not token:
-        return {"ok": False, "status": "MISSING_EXECUTION_AUTH_TOKEN", "reason": "execution_auth_token ausente"}
+        return {
+            "ok": False,
+            "status": "MISSING_EXECUTION_AUTH_TOKEN",
+            "reason": "execution_auth_token ausente",
+            "thread_safety_version": BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION,
+        }
 
-    data = _EXECUTION_AUTH_TOKENS.get(str(token))
-    if not data:
-        return {"ok": False, "status": "INVALID_EXECUTION_AUTH_TOKEN", "reason": "token inexistente ou expirado"}
+    token_key = str(token)
+    with _EXECUTION_AUTH_TOKENS_LOCK:
+        data = _EXECUTION_AUTH_TOKENS.get(token_key)
+        if not data:
+            return {
+                "ok": False,
+                "status": "INVALID_EXECUTION_AUTH_TOKEN",
+                "reason": "token inexistente ou expirado",
+                "thread_safety_version": BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION,
+            }
 
-    if data.get("used"):
-        return {"ok": False, "status": "USED_EXECUTION_AUTH_TOKEN", "reason": "token já utilizado"}
+        if data.get("used"):
+            return {
+                "ok": False,
+                "status": "USED_EXECUTION_AUTH_TOKEN",
+                "reason": "token já utilizado",
+                "thread_safety_version": BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION,
+            }
 
-    if float(data.get("expires_at", 0)) < time.time():
-        _EXECUTION_AUTH_TOKENS.pop(str(token), None)
-        return {"ok": False, "status": "EXPIRED_EXECUTION_AUTH_TOKEN", "reason": "token expirado"}
+        if float(data.get("expires_at", 0)) < time.time():
+            _EXECUTION_AUTH_TOKENS.pop(token_key, None)
+            return {
+                "ok": False,
+                "status": "EXPIRED_EXECUTION_AUTH_TOKEN",
+                "reason": "token expirado",
+                "thread_safety_version": BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION,
+            }
 
-    if consume:
-        data["used"] = True
+        # Test-and-set atômico: duas threads não conseguem consumir o mesmo token.
+        if consume:
+            data["used"] = True
+
+        expires_at = data.get("expires_at")
+        stored_context = dict(data.get("context") or {})
 
     return {
         "ok": True,
         "status": "EXECUTION_AUTH_TOKEN_OK",
         "reason": "token válido",
-        "expires_at": data.get("expires_at"),
-        "context": data.get("context"),
+        "expires_at": expires_at,
+        "context": stored_context,
+        "thread_safety_version": BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION,
     }
 
 
@@ -557,7 +605,8 @@ def status_payload(check_ready: bool = False):
         "live_send_enabled": is_real_live_send_enabled(),
         "execution_auth_token_enabled": EXECUTION_AUTH_TOKEN_ENABLED,
         "execution_auth_token_ttl_seconds": EXECUTION_AUTH_TOKEN_TTL_SECONDS,
-        "active_execution_auth_tokens": len(_EXECUTION_AUTH_TOKENS),
+        "active_execution_auth_tokens": _active_execution_auth_token_count(),
+        "execution_auth_token_thread_safety_version": BROKER_AUTH_TOKEN_THREAD_SAFETY_VERSION,
         "disaster_stop_enabled": DISASTER_STOP_ENABLED,
         "disaster_stop_require_for_live": DISASTER_STOP_REQUIRE_FOR_LIVE,
         "disaster_stop_working_type": DISASTER_STOP_WORKING_TYPE,
