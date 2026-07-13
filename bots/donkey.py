@@ -55,6 +55,7 @@ from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
+from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
     import trade_registry as central_trade_registry
@@ -4830,6 +4831,8 @@ def marcar_resumo_diario_enviado():
 
 
 def enviar_resumo_diario_se_preciso():
+    if not CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED:
+        return
     agora = agora_sp()
 
     if agora.hour != DAILY_SUMMARY_HOUR or agora.minute < DAILY_SUMMARY_MINUTE:

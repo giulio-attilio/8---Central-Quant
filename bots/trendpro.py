@@ -54,6 +54,7 @@ from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
+from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
     import trade_registry as central_trade_registry
@@ -5014,7 +5015,7 @@ def scanner():
 
             agora_brasil = agora_sp()
 
-            if agora_brasil.hour == 23 and agora_brasil.minute >= 55:
+            if CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED and agora_brasil.hour == 23 and agora_brasil.minute >= 55:
                 if not resumo_diario_ja_enviado():
                     print("ENVIANDO RESUMO DO DIA")
                     enviar_resumo_diario()

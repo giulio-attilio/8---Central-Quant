@@ -39,6 +39,11 @@ import threading
 import requests
 import importlib.util
 import ctypes
+from automatic_daily_summaries import (
+    CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED,
+    automatic_daily_summaries_health,
+    central_daily_report_automatic_enabled,
+)
 try:
     import fcntl
 except Exception:
@@ -11618,6 +11623,7 @@ def trade_registry_health_route():
 def health():
     payload = central_watchdog_status()
     payload["trade_registry"] = central_trade_registry_snapshot(include_trades=False)
+    payload.update(automatic_daily_summaries_health())
     return payload
 
 
@@ -27636,7 +27642,11 @@ def central_daily_report_loop():
     """
     global CENTRAL_DAILY_REPORT_SENT_DATE, CENTRAL_MONTHLY_REPORT_SENT_KEY
 
-    if not CENTRAL_DAILY_REPORT_ENABLED and not CENTRAL_MONTHLY_REPORT_ENABLED:
+    automatic_daily_enabled = central_daily_report_automatic_enabled(
+        CENTRAL_DAILY_REPORT_MODE,
+        CENTRAL_DAILY_REPORT_ENABLED,
+    )
+    if not automatic_daily_enabled and not CENTRAL_MONTHLY_REPORT_ENABLED:
         print("RELATÓRIOS AUTOMÁTICOS CENTRAL DESLIGADOS POR ENV")
         return
 
@@ -27647,7 +27657,7 @@ def central_daily_report_loop():
             today = now.strftime("%Y-%m-%d")
 
             # Relatório diário.
-            if CENTRAL_DAILY_REPORT_ENABLED and current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
+            if automatic_daily_enabled and current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
                 print(f"GERANDO EXECUTIVE REPORT DIÁRIO CENTRAL {today} {current_hm}")
                 try:
                     save_daily_snapshot(label="auto")
@@ -28522,7 +28532,9 @@ def trendpro_daily_summary_v1_apply_health_overlay(module=None, health=None) -> 
     health["daily_summary_sent_today"] = bool(sent_date == today and last_ok)
     health["last_summary_run"] = state.get("last_summary_run")
     health["last_summary_error"] = state.get("last_summary_error")
-    health["daily_summary_enabled"] = TRENDPRO_DAILY_SUMMARY_ENABLED
+    health["daily_summary_enabled"] = (
+        CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED and TRENDPRO_DAILY_SUMMARY_ENABLED
+    )
     health["daily_summary_version"] = TRENDPRO_DAILY_SUMMARY_V1_VERSION
 
     if module is not None and hasattr(module, "HEALTH") and isinstance(getattr(module, "HEALTH", None), dict):
@@ -28647,7 +28659,7 @@ def trendpro_daily_summary_v1_status_payload() -> dict:
         "ok": True,
         "module": "trendpro_daily_summary_v1",
         "version": TRENDPRO_DAILY_SUMMARY_V1_VERSION,
-        "enabled": TRENDPRO_DAILY_SUMMARY_ENABLED,
+        "enabled": CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED and TRENDPRO_DAILY_SUMMARY_ENABLED,
         "daily_summary_time": health.get("daily_summary_time"),
         "daily_summary_sent_today": health.get("daily_summary_sent_today"),
         "last_summary_run": health.get("last_summary_run"),
@@ -28796,7 +28808,7 @@ def trendpro_daily_summary_v1_run(send: bool = True, force: bool = False) -> dic
 
 
 def trendpro_daily_summary_v1_loop():
-    if not TRENDPRO_DAILY_SUMMARY_ENABLED:
+    if not CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED or not TRENDPRO_DAILY_SUMMARY_ENABLED:
         print("TRENDPRO DAILY SUMMARY V1 DESLIGADO POR ENV")
         return
     print(f"TRENDPRO DAILY SUMMARY V1 INICIADO — horário {TRENDPRO_DAILY_SUMMARY_TIME}")
@@ -28895,12 +28907,17 @@ def start_central_runtime_once():
     else:
         print("ROTEADOR TELEGRAM CENTRAL NÃO INICIADO: outro processo já é líder")
 
-    if acquire_runtime_file_lock("central_daily_report"):
-        threading.Thread(target=central_daily_report_loop, daemon=True).start()
-    else:
-        print("RELATÓRIO DIÁRIO CENTRAL NÃO INICIADO: outro processo já é líder")
+    central_daily_automatic_enabled = central_daily_report_automatic_enabled(
+        CENTRAL_DAILY_REPORT_MODE,
+        CENTRAL_DAILY_REPORT_ENABLED,
+    )
+    if central_daily_automatic_enabled or CENTRAL_MONTHLY_REPORT_ENABLED:
+        if acquire_runtime_file_lock("central_daily_report"):
+            threading.Thread(target=central_daily_report_loop, daemon=True).start()
+        else:
+            print("RELATÓRIO DIÁRIO CENTRAL NÃO INICIADO: outro processo já é líder")
 
-    if TRENDPRO_DAILY_SUMMARY_ENABLED:
+    if CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED and TRENDPRO_DAILY_SUMMARY_ENABLED:
         if acquire_runtime_file_lock("trendpro_daily_summary_v1"):
             threading.Thread(target=trendpro_daily_summary_v1_loop, daemon=True).start()
         else:

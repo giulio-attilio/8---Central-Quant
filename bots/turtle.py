@@ -61,6 +61,7 @@ from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask, request
 from upstash_redis import Redis
+from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 # ==============================================================================
 # TRADE REGISTRY — CENTRAL QUANT
@@ -1981,6 +1982,8 @@ def build_summary(period_name, trades, period_signals_override=None):
 
 
 def maybe_send_daily_summary():
+    if not CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED:
+        return
     now = agora_sp()
     if now.hour != DAILY_SUMMARY_HOUR or now.minute < DAILY_SUMMARY_MINUTE:
         return

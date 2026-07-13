@@ -24,6 +24,7 @@ import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
+from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from predator_daily_summary import (
     append_predator_event,
     build_daily_metrics,
@@ -3065,6 +3066,8 @@ def marcar_resumo_diario_enviado():
 
 
 def enviar_resumo_diario_se_preciso():
+    if not CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED:
+        return
     agora = agora_sp()
 
     if agora.hour != DAILY_SUMMARY_HOUR:
