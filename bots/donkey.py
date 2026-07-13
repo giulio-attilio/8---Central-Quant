@@ -50,6 +50,7 @@ import json
 import time
 import threading
 import requests
+from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
@@ -1300,7 +1301,7 @@ def enviar_texto(chat_id, msg):
 
 
 
-def safe_send_telegram(msg):
+def _safe_send_telegram_transport(msg):
     """
     Wrapper para garantir UTF-8 mesmo se send_telegram vier de telegram_utils.
     """
@@ -1331,7 +1332,7 @@ def safe_send_telegram(msg):
 
 
 
-def safe_send_telegram_donkey(msg):
+def _safe_send_telegram_donkey_transport(msg):
     """
     Envia mensagens exclusivas do Donkey para o bot/canal Donkey H4.
     Se DONKEY_TELEGRAM_BOT_TOKEN ou DONKEY_TELEGRAM_CHAT_ID não estiverem configurados,
@@ -1358,6 +1359,34 @@ def safe_send_telegram_donkey(msg):
         )
     except Exception as e:
         print("ERRO TELEGRAM DONKEY:", e)
+
+
+def safe_send_telegram(msg, *, event_type="PAPER_NOTIFICATION", manual_command=False, operational_critical=False):
+    result = send_automatic_telegram(
+        _safe_send_telegram_transport,
+        msg,
+        bot="DONKEY",
+        event_type=event_type,
+        mode="PAPER",
+        severity="CRITICAL" if operational_critical else None,
+        manual_command=manual_command,
+        operational_critical=operational_critical,
+    )
+    return bool(result.get("sent"))
+
+
+def safe_send_telegram_donkey(msg, *, event_type="PAPER_NOTIFICATION", manual_command=False, operational_critical=False):
+    result = send_automatic_telegram(
+        _safe_send_telegram_donkey_transport,
+        msg,
+        bot="DONKEY",
+        event_type=event_type,
+        mode="PAPER",
+        severity="CRITICAL" if operational_critical else None,
+        manual_command=manual_command,
+        operational_critical=operational_critical,
+    )
+    return bool(result.get("sent"))
 
 
 def eh_origem_donkey(p):
@@ -1636,7 +1665,7 @@ def enviar_alerta_watchdog(status):
         f"Última gestão:\n{status.get('last_management_run')}\n\n"
         f"Último erro:\n{status.get('last_error')}"
     )
-    safe_send_telegram_donkey(msg)
+    safe_send_telegram_donkey(msg, event_type="WATCHDOG_STALLED", operational_critical=True)
     HEALTH["last_watchdog_alert"] = data_hora_sp_str()
     HEALTH["last_watchdog_alert_ts"] = time.time()
 
@@ -4937,7 +4966,7 @@ def listen_commands():
                     enviar_texto(chat_id, montar_resumo_donkey())
 
                 elif texto == "/resumo_donkey":
-                    safe_send_telegram_donkey(montar_resumo_donkey())
+                    safe_send_telegram_donkey(montar_resumo_donkey(), event_type="MANUAL_RESUMO", manual_command=True)
 
                 elif texto == "/be":
                     enviar_texto(chat_id, montar_monitor_be())
@@ -5419,7 +5448,9 @@ def run_thread_guarded(nome, target):
                 safe_send_telegram_donkey(
                     f"🔴 THREAD DONKEY TRAVOU: {nome}\n\n"
                     f"Erro:\n{str(e)}\n\n"
-                    "A thread será reiniciada automaticamente."
+                    "A thread será reiniciada automaticamente.",
+                    event_type="RUNTIME_CRITICAL",
+                    operational_critical=True,
                 )
             except Exception:
                 pass

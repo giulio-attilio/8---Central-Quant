@@ -35,6 +35,7 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 import requests
+from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 import numpy as np
 from exchange_manager import get_exchange, load_markets_once
@@ -367,11 +368,24 @@ def send_telegram(message):
         return False
 
 
-def safe_send_telegram(message):
+def _safe_send_telegram_transport(message):
     try:
         return send_telegram(message)
     except Exception:
         return False
+
+
+def safe_send_telegram(message, *, event_type="FALCON_NOTIFICATION", mode=None, operational_critical=False):
+    result = send_automatic_telegram(
+        _safe_send_telegram_transport,
+        message,
+        bot="FALCON",
+        event_type=event_type,
+        mode=mode or FALCON_MODE,
+        severity="CRITICAL" if operational_critical else None,
+        operational_critical=operational_critical,
+    )
+    return bool(result.get("sent"))
 
 
 def redis_get_json(key, default):
@@ -1678,9 +1692,9 @@ def scanner_loop():
                     extra_exec = execution_decision_text(execution_decision)
                     if extra_exec:
                         msg += "\n\n" + extra_exec
-                    safe_send_telegram(msg)
+                    safe_send_telegram(msg, event_type="SIGNAL_LIVE_AUTHORIZED" if sig.get("execution_mode") == "LIVE" else "SIGNAL_PAPER", mode=sig.get("execution_mode"))
                     if FALCON_MODE == "VERIFY":
-                        safe_send_telegram(verify_message(sig))
+                        safe_send_telegram(verify_message(sig), event_type="VERIFY_PREVIEW", mode="VERIFY")
                     funnel_inc("sinais_enviados")
                     signals_sent += 1
 
@@ -1784,7 +1798,9 @@ def close_position(pid, pos, exit_price, reason):
         f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}\n"
         f"MAE: {fmt_pct(pos.get('mae_pct', 0))} | {fmt_r(pos.get('mae_r', 0))}\n"
         f"Devolução: {fmt_pct(giveback_pct)} | {fmt_r(giveback_r)}\n\n"
-        f"{emoji}"
+        f"{emoji}",
+        event_type="LIVE_TRADE_CLOSED" if str(pos.get("execution_mode") or "").upper() == "LIVE" else "PAPER_TRADE_CLOSED",
+        mode=pos.get("execution_mode") or "PAPER",
     )
     return trade
 
@@ -2077,7 +2093,7 @@ def maybe_send_daily_summary():
     key = f"{DAILY_SUMMARY_KEY}:{date_key()}"
     if redis_get_json(key, False):
         return
-    safe_send_telegram(build_summary("DIA", trades_today()))
+    safe_send_telegram(build_summary("DIA", trades_today()), event_type="AUTOMATIC_DAILY_SUMMARY", mode="PAPER")
     redis_set_json(key, True)
 
 
@@ -2092,7 +2108,7 @@ def maybe_send_monthly_summary():
         return
     trades = [t for t in get_trades() if previous_label in str(t.get("closed_at", ""))]
     period_signals = [s for s in get_signals() if previous_label in str(s.get("created_at", ""))]
-    safe_send_telegram(build_summary(f"MÊS {previous_label}", trades, period_signals_override=period_signals))
+    safe_send_telegram(build_summary(f"MÊS {previous_label}", trades, period_signals_override=period_signals), event_type="AUTOMATIC_MONTHLY_SUMMARY", mode="PAPER")
     redis_set_json(key, True)
 
 
@@ -2127,7 +2143,7 @@ def watchdog_loop():
                 HEALTH["watchdog_last_status"] = "ALERTA"
                 last = float(HEALTH.get("last_watchdog_alert_ts", 0) or 0)
                 if time.time() - last >= WATCHDOG_ALERT_COOLDOWN_SECONDS:
-                    safe_send_telegram("🚨 WATCHDOG FALCON STRIKE\n\n" + "\n".join([f"- {r}" for r in reasons]))
+                    safe_send_telegram("🚨 WATCHDOG FALCON STRIKE\n\n" + "\n".join([f"- {r}" for r in reasons]), event_type="WATCHDOG_STALLED", operational_critical=True)
                     HEALTH["last_watchdog_alert"] = data_hora_sp_str()
                     HEALTH["last_watchdog_alert_ts"] = time.time()
             else:
@@ -2359,7 +2375,7 @@ def run_thread_guarded(name, target):
             HEALTH["last_error"] = f"Thread {name} travou: {exc}"
             traceback.print_exc()
             try:
-                safe_send_telegram(f"🔴 THREAD FALCON TRAVOU: {name}\n\nErro:\n{exc}\n\nA thread será reiniciada.")
+                safe_send_telegram(f"🔴 THREAD FALCON TRAVOU: {name}\n\nErro:\n{exc}\n\nA thread será reiniciada.", event_type="RUNTIME_CRITICAL", operational_critical=True)
             except Exception:
                 pass
             time.sleep(10)
@@ -2888,7 +2904,10 @@ def falcon_handle_live_stop_cross(pid, pos, price):
         f"Stop cruzado, mas fechamento não foi confirmado.\n"
         f"Status: {failsafe.get('status')}\n"
         f"Quantidade broker: {current_amount}\n"
-        f"Verificação manual imediata necessária."
+        f"Verificação manual imediata necessária.",
+        event_type="LIVE_MANAGEMENT_ERROR",
+        mode="LIVE",
+        operational_critical=True,
     )
     return {"closed": False, "status": "STOP_FAILSAFE_CRITICAL_NOT_CONFIRMED", "cancel_stop": cancel_result, "failsafe": failsafe}
 
@@ -2951,7 +2970,9 @@ def management_loop():
                                     f"Preço atual: {fmt_price(price)}\n"
                                     f"Resultado: {fmt_pct(pnl_pct_for_side(side, entry, tp50))} | +1,00R\n\n"
                                     f"TP50 BingX: {tp50_real_execution.get('status')}\n"
-                                    f"Runner protegido: {tp50_real_execution.get('protected')}"
+                                    f"Runner protegido: {tp50_real_execution.get('protected')}",
+                                    event_type="TP50_LIVE" if is_real else "TP50_PAPER",
+                                    mode="LIVE" if is_real else "PAPER",
                                 )
                                 if tp50_real_execution.get("position_closed"):
                                     close_position(pid, pos, price, "TP50_FAILSAFE_FULL_CLOSE")
@@ -2963,7 +2984,10 @@ def management_loop():
                                     safe_send_telegram(
                                         f"🔴 TP50 REAL NÃO CONFIRMADO - {symbol}\n\n"
                                         f"Status: {tp50_real_execution.get('status')}\n"
-                                        f"Nenhuma nova parcial será presumida como executada."
+                                        f"Nenhuma nova parcial será presumida como executada.",
+                                        event_type="LIVE_MANAGEMENT_ERROR",
+                                        mode="LIVE",
+                                        operational_critical=True,
                                     )
 
                 current_r = r_for_side(side, entry, initial_stop, price)
@@ -2976,12 +3000,12 @@ def management_loop():
                         if update.get("applied"):
                             pos["be_moved"] = True
                             record_event("BE", pos, {"new_stop": pos["stop"], "trigger_r": current_r, "broker_update": update})
-                            safe_send_telegram(f"🟡 BE REAL FALCON - {symbol}\n\nStop BingX confirmado: {fmt_price(pos['stop'])}\nR atual: {fmt_r(current_r)}")
+                            safe_send_telegram(f"🟡 BE REAL FALCON - {symbol}\n\nStop BingX confirmado: {fmt_price(pos['stop'])}\nR atual: {fmt_r(current_r)}", event_type="BREAK_EVEN_LIVE", mode="LIVE")
                     else:
                         pos["stop"] = candidate
                         pos["be_moved"] = True
                         record_event("BE", pos, {"new_stop": pos["stop"], "trigger_r": current_r})
-                        safe_send_telegram(f"🟡 BE FALCON - {symbol}\n\nStop movido para: {fmt_price(pos['stop'])}\nR atual: {fmt_r(current_r)}")
+                        safe_send_telegram(f"🟡 BE FALCON - {symbol}\n\nStop movido para: {fmt_price(pos['stop'])}\nR atual: {fmt_r(current_r)}", event_type="BREAK_EVEN_PAPER", mode="PAPER")
 
                 if pos.get("be_moved") and current_r >= TRAIL_TRIGGER_R:
                     trail = calc_chandelier_stop(pos)
@@ -2994,12 +3018,12 @@ def management_loop():
                                 if update.get("applied"):
                                     pos["trailing_active"] = True
                                     record_event("TRAILING", pos, {"new_stop": trail, "broker_update": update})
-                                    safe_send_telegram(f"🟣 TRAILING REAL FALCON - {symbol}\n\nStop BingX confirmado: {fmt_price(trail)}\nR atual: {fmt_r(current_r)}")
+                                    safe_send_telegram(f"🟣 TRAILING REAL FALCON - {symbol}\n\nStop BingX confirmado: {fmt_price(trail)}\nR atual: {fmt_r(current_r)}", event_type="TRAILING_UPDATED_LIVE", mode="LIVE")
                             else:
                                 pos["stop"] = trail
                                 pos["trailing_active"] = True
                                 record_event("TRAILING", pos, {"new_stop": trail})
-                                safe_send_telegram(f"🟣 TRAILING FALCON - {symbol}\n\nNovo stop: {fmt_price(trail)}\nR atual: {fmt_r(current_r)}")
+                                safe_send_telegram(f"🟣 TRAILING FALCON - {symbol}\n\nNovo stop: {fmt_price(trail)}\nR atual: {fmt_r(current_r)}", event_type="TRAILING_UPDATED_PAPER", mode="PAPER")
 
                 pos["management_cycles"] = int(pos.get("management_cycles", 0)) + 1
                 positions[pid] = pos

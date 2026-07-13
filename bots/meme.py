@@ -49,6 +49,7 @@ import json
 import time
 import threading
 import requests
+from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
@@ -1300,7 +1301,7 @@ def enviar_texto(chat_id, msg):
 
 
 
-def safe_send_telegram(msg):
+def _safe_send_telegram_transport(msg):
     msg = normalizar_texto(msg)
 
     if not TOKEN or not CHAT_ID:
@@ -1326,6 +1327,20 @@ def safe_send_telegram(msg):
             time.sleep(0.5)
         except Exception as e:
             print("ERRO TELEGRAM MEME:", e)
+
+
+def safe_send_telegram(msg, *, event_type="PAPER_NOTIFICATION", manual_command=False, operational_critical=False):
+    result = send_automatic_telegram(
+        _safe_send_telegram_transport,
+        msg,
+        bot="MEME",
+        event_type=event_type,
+        mode="PAPER",
+        severity="CRITICAL" if operational_critical else None,
+        manual_command=manual_command,
+        operational_critical=operational_critical,
+    )
+    return bool(result.get("sent"))
 
 def mes_anterior_ref():
     hoje = agora_sp()
@@ -2773,7 +2788,7 @@ def enviar_early_a(s):
         f"Bollinger H1: {bollinger_txt}"
     )
 
-    safe_send_telegram(msg)
+    safe_send_telegram(msg, event_type="SIGNAL_PAPER")
 
 
 def enviar_sinal_h1(s):
@@ -4361,7 +4376,7 @@ def enviar_alerta_watchdog(status):
         f"Último erro:\n{status.get('last_error')}"
     )
 
-    safe_send_telegram(msg)
+    safe_send_telegram(msg, event_type="WATCHDOG_STALLED", operational_critical=True)
 
     HEALTH["last_watchdog_alert"] = data_hora_sp_str()
     HEALTH["last_watchdog_alert_ts"] = time.time()
@@ -4425,7 +4440,9 @@ def run_thread_guarded(nome, target):
                 safe_send_telegram(
                     f"🚨 MEME THREAD TRAVOU: {nome}\n\n"
                     f"Erro:\n{str(e)}\n\n"
-                    "A thread será reiniciada automaticamente."
+                    "A thread será reiniciada automaticamente.",
+                    event_type="RUNTIME_CRITICAL",
+                    operational_critical=True,
                 )
             except Exception:
                 pass

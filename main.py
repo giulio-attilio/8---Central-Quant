@@ -128,6 +128,10 @@ from automatic_daily_summaries import (
     automatic_daily_summaries_health,
     central_daily_report_automatic_enabled,
 )
+from telegram_notification_policy import (
+    send_automatic_telegram,
+    telegram_notification_policy_health,
+)
 from automatic_learning_policy import (
     automatic_learning_refresh_enabled,
     automatic_learning_refresh_health,
@@ -2556,7 +2560,14 @@ def send_central_alert(message: str):
     for module in LOADED_BOTS.values():
         try:
             if hasattr(module, "safe_send_telegram"):
-                module.safe_send_telegram(message)
+                try:
+                    module.safe_send_telegram(
+                        message,
+                        event_type="RUNTIME_CRITICAL",
+                        operational_critical=True,
+                    )
+                except TypeError:
+                    module.safe_send_telegram(message)
             elif hasattr(module, "send_telegram"):
                 module.send_telegram(message)
         except Exception:
@@ -11753,6 +11764,8 @@ def health():
     payload = central_watchdog_status()
     payload["trade_registry"] = central_trade_registry_snapshot(include_trades=False)
     payload.update(automatic_daily_summaries_health())
+    if callable(globals().get("telegram_notification_policy_health")):
+        payload.update(telegram_notification_policy_health())
     payload.update(
         automatic_learning_refresh_health(
             interval_seconds=max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS),
@@ -27912,11 +27925,13 @@ def central_daily_report_loop():
                     title = "CEO DAILY REPORT"
 
                 if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
-                    telegram_send_with_token(
+                    central_send_automatic_telegram(
                         CENTRAL_TELEGRAM_BOT_TOKEN,
                         CENTRAL_TELEGRAM_CHAT_ID,
                         payload,
                         title=title,
+                        event_type="AUTOMATIC_DAILY_SUMMARY",
+                        mode="PAPER",
                     )
                 else:
                     print("RELATÓRIO DIÁRIO CENTRAL NÃO ENVIADO: token/chat ausente")
@@ -27935,11 +27950,13 @@ def central_daily_report_loop():
                     print(f"GERANDO EXECUTIVE REPORT MENSAL CENTRAL {month_key} {current_hm}")
                     payload = build_executive_report_monthly()
                     if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
-                        telegram_send_with_token(
+                        central_send_automatic_telegram(
                             CENTRAL_TELEGRAM_BOT_TOKEN,
                             CENTRAL_TELEGRAM_CHAT_ID,
                             payload,
                             title="EXECUTIVE REPORT MENSAL",
+                            event_type="AUTOMATIC_MONTHLY_SUMMARY",
+                            mode="PAPER",
                         )
                     else:
                         print("RELATÓRIO MENSAL CENTRAL NÃO ENVIADO: token/chat ausente")
@@ -28150,6 +28167,30 @@ def telegram_send_with_token(token, chat_id, text, title=None):
     except Exception as exc:
         print("ERRO TELEGRAM CENTRAL ROUTER:", exc)
         return False
+
+
+def central_send_automatic_telegram(
+    token,
+    chat_id,
+    text,
+    *,
+    title=None,
+    bot="CENTRAL",
+    event_type,
+    mode,
+    severity=None,
+    operational_critical=False,
+):
+    result = send_automatic_telegram(
+        lambda message: telegram_send_with_token(token, chat_id, message, title=title),
+        text,
+        bot=bot,
+        event_type=event_type,
+        mode=mode,
+        severity=severity,
+        operational_critical=operational_critical,
+    )
+    return bool(result.get("sent"))
 
 
 def build_command_reply_for_module(key: str, module, cmd: str):
@@ -28999,7 +29040,17 @@ def trendpro_daily_summary_v1_run(send: bool = True, force: bool = False) -> dic
     try:
         if module is not None and hasattr(module, "HEALTH") and isinstance(getattr(module, "HEALTH", None), dict):
             module.HEALTH["last_telegram_attempt"] = now_s
-        ok = bool(telegram_send_with_token(token, chat_id, text, title="TREND PRO DAILY SUMMARY"))
+        ok = bool(
+            central_send_automatic_telegram(
+                token,
+                chat_id,
+                text,
+                title="TREND PRO DAILY SUMMARY",
+                bot="TRENDPRO",
+                event_type="AUTOMATIC_DAILY_SUMMARY",
+                mode="PAPER",
+            )
+        )
         if not ok:
             error = "telegram_send_with_token retornou False."
     except Exception as exc:
@@ -34376,14 +34427,17 @@ def real_execution_telegram_notifier_v1_notify(event_type=None, payload=None, re
         try:
             token = globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")
             chat_id = globals().get("CENTRAL_TELEGRAM_CHAT_ID")
-            if token and chat_id and callable(globals().get("telegram_send_with_token")):
-                sent = bool(telegram_send_with_token(token, chat_id, message, title="EXECUÇÃO REAL"))
-            elif token and chat_id:
-                url = f"https://api.telegram.org/bot{token}/sendMessage"
-                response = requests.post(url, json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True}, timeout=20)
-                sent = response.status_code == 200
-                if not sent:
-                    error = response.text[:300]
+            if token and chat_id:
+                sent = central_send_automatic_telegram(
+                    token,
+                    chat_id,
+                    message,
+                    title="EXECUÇÃO REAL",
+                    bot=str((payload or {}).get("bot") or "CENTRAL") if isinstance(payload, dict) else "CENTRAL",
+                    event_type=event_type,
+                    mode="DRY_RUN" if dry_run else "LIVE",
+                    operational_critical=bool(info.get("requires_manual_attention")),
+                )
             else:
                 error = "CENTRAL_TELEGRAM_BOT_TOKEN ou CENTRAL_TELEGRAM_CHAT_ID ausente"
         except Exception as exc:
@@ -36067,14 +36121,16 @@ def real_position_watchdog_v1_notify(event=None, force=False):
         try:
             token = globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")
             chat_id = globals().get("CENTRAL_TELEGRAM_CHAT_ID")
-            if token and chat_id and callable(globals().get("telegram_send_with_token")):
-                sent = bool(telegram_send_with_token(token, chat_id, message, title="REAL POSITION WATCHDOG"))
-            elif token and chat_id:
-                url = f"https://api.telegram.org/bot{token}/sendMessage"
-                response = requests.post(url, json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True}, timeout=20)
-                sent = response.status_code == 200
-                if not sent:
-                    error = response.text[:300]
+            if token and chat_id:
+                sent = central_send_automatic_telegram(
+                    token,
+                    chat_id,
+                    message,
+                    title="REAL POSITION WATCHDOG",
+                    event_type="REAL_POSITION_WATCHDOG",
+                    mode="LIVE",
+                    operational_critical=bool(event.get("requires_manual_attention")),
+                )
             else:
                 error = "CENTRAL_TELEGRAM_BOT_TOKEN ou CENTRAL_TELEGRAM_CHAT_ID ausente"
         except Exception as exc:
@@ -40616,13 +40672,22 @@ def _fleag_v1_select_telegram_credentials():
     return token, chat_id, source
 
 
-def _fleag_v1_send_telegram(message, title="FALCON LIVE AUDIT"):
+def _fleag_v1_send_telegram(message, title="FALCON LIVE AUDIT", event_type="FALCON_LIVE_AUDIT", operational_critical=False):
     token, chat_id, source = _fleag_v1_select_telegram_credentials()
     if not token or not chat_id:
         return {"ok": False, "sent": False, "error": "Telegram token/chat ausente", "credential_source": source, "token_value_exposed": False}
     try:
-        if callable(globals().get("telegram_send_with_token")):
-            sent = bool(telegram_send_with_token(token, chat_id, message, title=title))
+        if callable(globals().get("central_send_automatic_telegram")):
+            sent = central_send_automatic_telegram(
+                token,
+                chat_id,
+                message,
+                title=title,
+                bot="FALCON",
+                event_type=event_type,
+                mode="LIVE",
+                operational_critical=operational_critical,
+            )
             return {"ok": sent, "sent": sent, "error": None if sent else "telegram_send_with_token retornou False", "credential_source": source, "token_value_exposed": False}
         return {"ok": False, "sent": False, "error": "telegram_send_with_token indisponível", "credential_source": source, "token_value_exposed": False}
     except Exception as exc:
@@ -41594,7 +41659,7 @@ def falcon_live_execution_audit_guard_v1_pre_order(payload):
         return {"ok": False, "status": "BLOCKED_BY_FALCON_LIVE_AUDIT_GUARD", "sent": False, "reason": status_payload.get("live_audit_block_reason"), "audit": status_payload, "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION}
     if cfg.get("require_pre_order_telegram"):
         msg = _fleag_v1_pre_order_message(payload)
-        tg = _fleag_v1_send_telegram(msg, title="FALCON LIVE PRÉ-ORDEM")
+        tg = _fleag_v1_send_telegram(msg, title="FALCON LIVE PRÉ-ORDEM", event_type="FALCON_LIVE_PRE_ORDER_TELEGRAM")
         state = _fleag_v1_load_state()
         state["last_pre_order_telegram_sent"] = bool(tg.get("sent"))
         state["last_pre_order_telegram_error"] = tg.get("error")
@@ -41658,7 +41723,12 @@ def falcon_live_execution_audit_guard_v1_post_order(payload, result):
     if sent and _fleag_v1_config().get("require_post_order_telegram"):
         msg = _fleag_v1_post_order_message(payload, result, post_event)
         title = "FALCON LIVE CRÍTICO" if requires_attention else "FALCON LIVE CONFIRMAÇÃO"
-        tg = _fleag_v1_send_telegram(msg, title=title)
+        tg = _fleag_v1_send_telegram(
+            msg,
+            title=title,
+            event_type="DISASTER_STOP_FAILED" if requires_attention else "FALCON_LIVE_POST_ORDER_AUDIT",
+            operational_critical=requires_attention,
+        )
         post_event["post_order_telegram"] = tg
     else:
         tg = {"ok": True, "sent": False, "status": "POST_TELEGRAM_NOT_REQUIRED_OR_NO_ORDER"}

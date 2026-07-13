@@ -62,6 +62,7 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask, request
 from upstash_redis import Redis
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
+from telegram_notification_policy import send_automatic_telegram
 
 # ==============================================================================
 # TRADE REGISTRY — CENTRAL QUANT
@@ -1345,7 +1346,7 @@ def scanner_loop():
                     record_event("SIGNAL", sig, {"entry": sig["entry"], "stop": sig["stop"], "tp50": sig["tp50"]})
                     set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
 
-                    safe_send_telegram(signal_message(sig))
+                    send_automatic_telegram(safe_send_telegram, signal_message(sig), bot="TURTLE", event_type="SIGNAL_PAPER", mode="PAPER")
                     funnel_inc("sinais_enviados")
                     signals_sent += 1
 
@@ -1455,7 +1456,7 @@ def close_position(pid, pos, exit_price, reason):
     else:
         emoji = "🟡"
 
-    safe_send_telegram(
+    send_automatic_telegram(safe_send_telegram,
         f"🐢 SAÍDA {pos.get('setup_label', pos.get('setup'))} - {pos['symbol']}\n\n"
         f"Direção: {side}\n"
         f"Entrada: {fmt_price(entry)}\n"
@@ -1465,7 +1466,8 @@ def close_position(pid, pos, exit_price, reason):
         f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}\n"
         f"MAE: {fmt_pct(pos.get('mae_pct', 0))} | {fmt_r(pos.get('mae_r', 0))}\n"
         f"Devolução: {fmt_pct(giveback_pct)} | {fmt_r(giveback_r)}\n\n"
-        f"{emoji}"
+        f"{emoji}",
+        bot="TURTLE", event_type="PAPER_TRADE_CLOSED", mode="PAPER"
     )
 
     return trade
@@ -1515,13 +1517,14 @@ def management_loop():
                         turtle_registry_update(pos, "TP50", price=safe_float(price), candles_to_tp50=pos["candles_to_tp50"])
                         turtle_registry_update(pos, "BE", new_sl=safe_float(entry))
 
-                        safe_send_telegram(
+                        send_automatic_telegram(safe_send_telegram,
                             f"🐢 TP50 {pos.get('setup_label', pos.get('setup'))} - {symbol}\n\n"
                             f"Direção: {side}\n"
                             f"Preço atual: {fmt_price(price)}\n"
                             f"Stop movido para BE: {fmt_price(entry)}\n"
                             f"Tempo até TP50: {pos['candles_to_tp50']} ciclos de gestão\n\n"
-                            f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}"
+                            f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}",
+                            bot="TURTLE", event_type="TP50_PAPER", mode="PAPER"
                         )
 
                 exit_signal, exit_close = turtle_exit_signal(pos)
@@ -1992,7 +1995,7 @@ def maybe_send_daily_summary():
     if redis_get_json(key, False):
         return
 
-    safe_send_telegram(build_summary("DIA", trades_today()))
+    send_automatic_telegram(safe_send_telegram, build_summary("DIA", trades_today()), bot="TURTLE", event_type="AUTOMATIC_DAILY_SUMMARY", mode="PAPER")
     redis_set_json(key, True)
 
 
@@ -2009,7 +2012,7 @@ def maybe_send_monthly_summary():
 
     trades = [t for t in get_trades() if previous_label in str(t.get("closed_at", ""))]
     period_signals = [s for s in get_signals() if previous_label in str(s.get("created_at", ""))]
-    safe_send_telegram(build_summary(f"MÊS {previous_label}", trades, period_signals_override=period_signals))
+    send_automatic_telegram(safe_send_telegram, build_summary(f"MÊS {previous_label}", trades, period_signals_override=period_signals), bot="TURTLE", event_type="AUTOMATIC_MONTHLY_SUMMARY", mode="PAPER")
     redis_set_json(key, True)
 
 
@@ -2047,9 +2050,10 @@ def watchdog_loop():
                 HEALTH["watchdog_last_status"] = "ALERTA"
                 last = float(HEALTH.get("last_watchdog_alert_ts", 0) or 0)
                 if time.time() - last >= WATCHDOG_ALERT_COOLDOWN_SECONDS:
-                    safe_send_telegram(
+                    send_automatic_telegram(safe_send_telegram,
                         "🚨 WATCHDOG TURTLE BREAKOUT PRO 2.0\n\n"
-                        + "\n".join([f"- {r}" for r in reasons])
+                        + "\n".join([f"- {r}" for r in reasons]),
+                        bot="TURTLE", event_type="WATCHDOG_STALLED", mode="PAPER", severity="CRITICAL", operational_critical=True
                     )
                     HEALTH["last_watchdog_alert"] = data_hora_sp_str()
                     HEALTH["last_watchdog_alert_ts"] = time.time()
@@ -2385,7 +2389,7 @@ def startup():
     except Exception:
         pass
 
-    safe_send_telegram(
+    send_automatic_telegram(safe_send_telegram,
         "🐢 Turtle Breakout PRO 2.0 iniciado\n\n"
         "Modo: PAPER / SEM BINGX\n"
         f"Timeframe: {TIMEFRAME}\n\n"
@@ -2396,7 +2400,8 @@ def startup():
         f"Turtle55: entrada {ALL_SETUPS['TURTLE55']['entry_len']} / saída {ALL_SETUPS['TURTLE55']['exit_len']}\n\n"
         f"Stop: {ATR_STOP_MULT} ATR\n"
         f"TP50: {TP50_R}R\n"
-        "MFE/MAE, funil Turtle, devolução, captura de tendência, Score Turtle, runner aberto, expectancy, PF em R, ranking e estatísticas LONG/SHORT ativados."
+        "MFE/MAE, funil Turtle, devolução, captura de tendência, Score Turtle, runner aberto, expectancy, PF em R, ranking e estatísticas LONG/SHORT ativados.",
+        bot="TURTLE", event_type="BOT_STARTUP", mode="PAPER"
     )
 
     threading.Thread(target=scanner_loop, daemon=True).start()

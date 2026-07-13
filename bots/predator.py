@@ -25,6 +25,7 @@ from exchange_manager import get_exchange, load_markets_once
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
+from telegram_notification_policy import send_automatic_telegram
 from predator_daily_summary import (
     append_predator_event,
     build_daily_metrics,
@@ -382,7 +383,7 @@ def risco_label(risco_pct):
     return "🔴 ALTO"
 
 
-def safe_send_telegram(msg):
+def _safe_send_telegram_transport(msg):
     msg = normalizar_texto(msg)
 
     if not TOKEN or not CHAT_ID:
@@ -405,6 +406,19 @@ def safe_send_telegram(msg):
             time.sleep(0.35)
         except Exception as e:
             print("ERRO TELEGRAM:", e)
+
+
+def safe_send_telegram(msg, *, event_type="PREDATOR_NOTIFICATION", mode=None, operational_critical=False):
+    result = send_automatic_telegram(
+        _safe_send_telegram_transport,
+        msg,
+        bot="PREDATOR",
+        event_type=event_type,
+        mode=mode or PREDATOR_MODE,
+        severity="CRITICAL" if operational_critical else None,
+        operational_critical=operational_critical,
+    )
+    return bool(result.get("sent"))
 
 
 def enviar_texto(chat_id, msg):
@@ -496,7 +510,7 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
         )
         print(msg)
         if avisar_telegram:
-            safe_send_telegram(msg)
+            send_automatic_telegram(_safe_send_telegram_transport, msg, bot="PREDATOR", event_type="WATCHLIST_WARNING", mode=PREDATOR_MODE)
 
     return validos
 
@@ -2279,7 +2293,14 @@ def execute_predator_signal_safe(sig, risk_prechecked=None, local_gate_prechecke
         should_notify = False
 
     if should_notify:
-        safe_send_telegram(msg)
+        send_automatic_telegram(
+            _safe_send_telegram_transport,
+            msg,
+            bot="PREDATOR",
+            event_type="LIVE_ORDER_SENT" if broker_result.get("sent") else "LIVE_ORDER_BLOCKED",
+            mode=PREDATOR_MODE,
+            operational_critical=bool(PREDATOR_MODE == "LIVE" and broker_result.get("error")),
+        )
 
     return {
         "risk": risk,
@@ -2567,7 +2588,17 @@ def encerrar_posicao(symbol, p, preco_saida, motivo):
 
     registrar_trade_registry_close_predator(p, preco_saida, resultado, pnl_r, motivo)
 
-    safe_send_telegram(mensagem_saida(p, preco_saida, motivo, resultado))
+    close_message = mensagem_saida(p, preco_saida, motivo, resultado)
+    notification_mode = p.get("execution_mode") or globals().get("PREDATOR_MODE", "PAPER")
+    try:
+        safe_send_telegram(
+            close_message,
+            event_type="LIVE_TRADE_CLOSED" if str(notification_mode).upper() == "LIVE" else "PAPER_TRADE_CLOSED",
+            mode=notification_mode,
+        )
+    except TypeError:
+        # Compatibilidade com transportes legados/injetados que aceitam apenas texto.
+        safe_send_telegram(close_message)
 
 
 def gerenciar_posicoes():
@@ -2645,7 +2676,7 @@ def gerenciar_posicoes():
                         cycles_to_tp50=int(p.get("cycles_to_tp50", 0) or 0),
                     )
 
-                    safe_send_telegram(mensagem_tp50(p, preco))
+                    send_automatic_telegram(_safe_send_telegram_transport, mensagem_tp50(p, preco), bot="PREDATOR", event_type="TP50", mode=p.get("execution_mode") or PREDATOR_MODE)
                     alterou = True
 
             # Trailing após TP50
@@ -2676,7 +2707,7 @@ def gerenciar_posicoes():
                             new_sl=float(novo_trail),
                             trailing_active=True,
                         )
-                        safe_send_telegram(mensagem_trailing(p, sl_atual, novo_trail))
+                        send_automatic_telegram(_safe_send_telegram_transport, mensagem_trailing(p, sl_atual, novo_trail), bot="PREDATOR", event_type="TRAILING_UPDATED", mode=p.get("execution_mode") or PREDATOR_MODE)
                         alterou = True
 
                     if side == "SHORT" and novo_trail < sl_atual:
@@ -2700,7 +2731,7 @@ def gerenciar_posicoes():
                             new_sl=float(novo_trail),
                             trailing_active=True,
                         )
-                        safe_send_telegram(mensagem_trailing(p, sl_atual, novo_trail))
+                        send_automatic_telegram(_safe_send_telegram_transport, mensagem_trailing(p, sl_atual, novo_trail), bot="PREDATOR", event_type="TRAILING_UPDATED", mode=p.get("execution_mode") or PREDATOR_MODE)
                         alterou = True
 
             # Proteção temporal pós-ajuste
@@ -3077,7 +3108,7 @@ def enviar_resumo_diario_se_preciso():
     if resumo_diario_ja_enviado():
         return
 
-    safe_send_telegram(montar_resumo_diario())
+    send_automatic_telegram(_safe_send_telegram_transport, montar_resumo_diario(), bot="PREDATOR", event_type="AUTOMATIC_DAILY_SUMMARY", mode="PAPER")
     marcar_resumo_diario_enviado()
 
 
@@ -3103,7 +3134,7 @@ def enviar_resumo_mensal_se_preciso():
     if enviados.get(mes_ref):
         return
 
-    safe_send_telegram(montar_resumo_mensal())
+    send_automatic_telegram(_safe_send_telegram_transport, montar_resumo_mensal(), bot="PREDATOR", event_type="AUTOMATIC_MONTHLY_SUMMARY", mode="PAPER")
     enviados[mes_ref] = True
 
     if len(enviados) > 36:
@@ -3608,7 +3639,15 @@ def enviar_alerta_watchdog(status):
         f"Último erro:\n{status.get('last_error')}"
     )
 
-    safe_send_telegram(msg)
+    send_automatic_telegram(
+        _safe_send_telegram_transport,
+        msg,
+        bot="PREDATOR",
+        event_type="WATCHDOG_STALLED",
+        mode=PREDATOR_MODE,
+        severity="CRITICAL",
+        operational_critical=True,
+    )
     HEALTH["last_watchdog_alert"] = data_hora_sp_str()
     HEALTH["last_watchdog_alert_ts"] = time.time()
 
@@ -3760,7 +3799,7 @@ def enviar_startup_message_once():
     if startup_message_already_sent_today():
         print("Mensagem inicial Smart Predator já enviada hoje. Pulando envio.")
         return
-    safe_send_telegram(montar_startup_message())
+    send_automatic_telegram(_safe_send_telegram_transport, montar_startup_message(), bot="PREDATOR", event_type="BOT_STARTUP", mode="PAPER")
     marcar_startup_message_sent()
 
 # ====================================================
@@ -3977,7 +4016,13 @@ def scanner():
 
                             ok = registrar_posicao(s)
                             if ok:
-                                safe_send_telegram(formatar_sinal_predator(s))
+                                send_automatic_telegram(
+                                    _safe_send_telegram_transport,
+                                    formatar_sinal_predator(s),
+                                    bot="PREDATOR",
+                                    event_type="SIGNAL_LIVE_AUTHORIZED" if PREDATOR_MODE == "LIVE" else "SIGNAL_PAPER",
+                                    mode=PREDATOR_MODE,
+                                )
                                 if execution_mode_active():
                                     execute_predator_signal_safe(
                                         s,

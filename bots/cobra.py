@@ -17,6 +17,7 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
+from telegram_notification_policy import send_automatic_telegram
 
 try:
     import trade_registry as central_trade_registry
@@ -452,6 +453,18 @@ def send_telegram(msg):
         print("ERRO TELEGRAM COBRA:", e)
 
 
+def send_cobra_automatic(msg, event_type, *, operational_critical=False):
+    return send_automatic_telegram(
+        send_telegram,
+        msg,
+        bot="COBRA",
+        event_type=event_type,
+        mode="PAPER",
+        severity="CRITICAL" if operational_critical else None,
+        operational_critical=operational_critical,
+    )
+
+
 
 def startup_signal_guard_active():
     try:
@@ -477,7 +490,7 @@ def enviar_startup_cobra_uma_vez():
     except Exception:
         watchlist_count = HEALTH.get("watchlist_total", 0) or HEALTH.get("last_watchlist_count", 0)
 
-    send_telegram(
+    send_cobra_automatic(
         "🐍 Robô Cobra Attack iniciado\n\n"
         "Filtros ativos:\n"
         "Early Cobra ativo: ✅\n"
@@ -488,7 +501,8 @@ def enviar_startup_cobra_uma_vez():
         f"Limite de posições: {MAX_OPEN_POSITIONS}\n"
         f"Watchlist: {watchlist_count} ativos\n"
         f"Timeframe: {TIMEFRAME_H1} com contexto {TIMEFRAME_H4}\n"
-        f"Startup guard: {STARTUP_SIGNAL_GRACE_SECONDS}s"
+        f"Startup guard: {STARTUP_SIGNAL_GRACE_SECONDS}s",
+        "BOT_STARTUP",
     )
 
 def redis_get_json(key, padrao):
@@ -642,10 +656,11 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
     HEALTH["last_invalid_watchlist_check"] = data_hora_sp_str()
 
     if invalidos and avisar_telegram:
-        send_telegram(
+        send_cobra_automatic(
             "⚠️ Ativos inválidos na watchlist BingX:\n\n"
             + "\n".join(invalidos)
-            + "\n\nEles serão ignorados pelo Cobra Attack."
+            + "\n\nEles serão ignorados pelo Cobra Attack.",
+            "WATCHLIST_WARNING",
         )
 
     return validos
@@ -1065,34 +1080,37 @@ def enviar_sinal_cobra(s):
         f"Volume:\n{volume_txt}\n\n"
         f"RSI:\n{float(s.get('rsi', 0)):.2f}".replace(".", ",")
     )
-    send_telegram(msg)
+    send_cobra_automatic(msg, "SIGNAL_PAPER")
 
 def enviar_tp50(p, price):
-    send_telegram(
+    send_cobra_automatic(
         f"🟡 TP50 ATINGIDO - {p['symbol_clean']}\n\n"
         f"Setup:\n{setup_nome(p.get('signal_type'))}\n\n"
         f"Preço:\n{fmt_br(price)}\n\n"
         f"Entrada:\n{fmt_br(p['entry'])}\n\n"
-        f"PnL atual:\n{fmt_pct(pnl_pct(p['side'], float(p['entry']), float(price)))}"
+        f"PnL atual:\n{fmt_pct(pnl_pct(p['side'], float(p['entry']), float(price)))}",
+        "TP50_PAPER",
     )
 
 def enviar_be(p, new_sl):
-    send_telegram(
+    send_cobra_automatic(
         f"🟢 BREAKEVEN ATIVADO - {p['symbol_clean']}\n\n"
         f"Setup:\n{setup_nome(p.get('signal_type'))}\n\n"
-        f"Novo Stop:\n{fmt_br(new_sl)}"
+        f"Novo Stop:\n{fmt_br(new_sl)}",
+        "BREAK_EVEN_PAPER",
     )
 
 def enviar_trailing(p, new_sl):
-    send_telegram(
+    send_cobra_automatic(
         f"🟣 TRAILING ATUALIZADO - {p['symbol_clean']}\n\n"
         f"Setup:\n{setup_nome(p.get('signal_type'))}\n\n"
-        f"Stop Atual:\n{fmt_br(new_sl)}"
+        f"Stop Atual:\n{fmt_br(new_sl)}",
+        "TRAILING_UPDATED_PAPER",
     )
 
 def enviar_fechamento(p, price, reason, pnl):
     result_type = classificar_resultado(pnl)
-    send_telegram(
+    send_cobra_automatic(
         f"🟠 COBRA ENCERRADO - {p['symbol_clean']}\n\n"
         f"Setup:\n{setup_nome(p.get('signal_type'))}\n\n"
         f"Lado:\n{side_nome(p['side'])}\n\n"
@@ -1102,7 +1120,8 @@ def enviar_fechamento(p, price, reason, pnl):
         f"Resultado:\n{result_type}\n\n"
         f"PnL:\n{fmt_pct(pnl)}\n\n"
         f"MFE máximo:\n{fmt_pct(p.get('mfe_max_pct', 0))}\n\n"
-        f"Devolução:\n{fmt_pct(p.get('mfe_gave_back_pct', 0))}"
+        f"Devolução:\n{fmt_pct(p.get('mfe_gave_back_pct', 0))}",
+        "PAPER_TRADE_CLOSED",
     )
 
 
@@ -2296,7 +2315,7 @@ def enviar_resumo_diario_se_preciso():
         ja_enviado = redis_get_str(DAILY_SUMMARY_KEY)
         if ja_enviado == hoje:
             return
-        send_telegram(montar_resumo("dia"))
+        send_cobra_automatic(montar_resumo("dia"), "AUTOMATIC_DAILY_SUMMARY")
         redis_set_str(DAILY_SUMMARY_KEY, hoje)
     except Exception as e:
         HEALTH["last_error"] = f"Erro resumo diario: {e}"
@@ -2315,7 +2334,7 @@ def enviar_resumo_mensal_se_preciso():
         ja_enviado = redis_get_str(MONTHLY_SUMMARY_KEY)
         if ja_enviado == mes:
             return
-        send_telegram(montar_resumo("mes"))
+        send_cobra_automatic(montar_resumo("mes"), "AUTOMATIC_MONTHLY_SUMMARY")
         redis_set_str(MONTHLY_SUMMARY_KEY, mes)
     except Exception as e:
         HEALTH["last_error"] = f"Erro resumo mensal: {e}"
@@ -2453,10 +2472,12 @@ def pode_alertar(chave):
 
 def enviar_alerta_travamento(titulo, detalhe):
     try:
-        send_telegram(
+        send_cobra_automatic(
             f"🔴 {titulo}\n\n"
             f"{detalhe}\n\n"
-            f"Horário:\n{data_hora_sp_str()}"
+            f"Horário:\n{data_hora_sp_str()}",
+            "WATCHDOG_STALLED",
+            operational_critical=True,
         )
     except Exception as e:
         print("ERRO AO ENVIAR ALERTA WATCHDOG:", e)
