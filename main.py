@@ -44,6 +44,10 @@ from automatic_daily_summaries import (
     automatic_daily_summaries_health,
     central_daily_report_automatic_enabled,
 )
+from automatic_learning_policy import (
+    automatic_learning_refresh_enabled,
+    automatic_learning_refresh_health,
+)
 try:
     import fcntl
 except Exception:
@@ -11624,6 +11628,13 @@ def health():
     payload = central_watchdog_status()
     payload["trade_registry"] = central_trade_registry_snapshot(include_trades=False)
     payload.update(automatic_daily_summaries_health())
+    payload.update(
+        automatic_learning_refresh_health(
+            interval_seconds=max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS),
+            thread_started=LEARNING_AUTO_REFRESH_THREAD_STARTED,
+            legacy_enabled=LEARNING_AUTO_REFRESH_LEGACY_ENABLED,
+        )
+    )
     return payload
 
 
@@ -28400,13 +28411,19 @@ def learning_readiness_route():
 # Mantém learning_state.json atualizado sem depender de comando manual.
 # Não altera Policy, scores, risco, bots nem corretora.
 # ==========================================================
-LEARNING_AUTO_REFRESH_ENABLED = env_bool("LEARNING_AUTO_REFRESH_ENABLED", True)
+LEARNING_AUTO_REFRESH_LEGACY_ENABLED = env_bool("LEARNING_AUTO_REFRESH_ENABLED", True)
+LEARNING_AUTO_REFRESH_ENABLED = automatic_learning_refresh_enabled(
+    LEARNING_AUTO_REFRESH_LEGACY_ENABLED
+)
 LEARNING_AUTO_REFRESH_SECONDS = int(os.environ.get("LEARNING_AUTO_REFRESH_SECONDS", "900"))
 LEARNING_AUTO_REFRESH_MIN_SECONDS = 300
 LEARNING_AUTO_REFRESH_LAST = {"ts": None, "ok": None, "error": None, "summary": None, "readiness": None}
+LEARNING_AUTO_REFRESH_THREAD_STARTED = False
 
 
 def learning_auto_refresh_loop():
+    if not LEARNING_AUTO_REFRESH_ENABLED:
+        return
     interval = max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS)
     while True:
         try:
@@ -28431,13 +28448,21 @@ def learning_auto_refresh_loop():
 
 @app.route("/learning/auto/status")
 def learning_auto_status_route():
-    return {
+    payload = {
         "ok": True,
         "enabled": LEARNING_AUTO_REFRESH_ENABLED,
         "interval_seconds": max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS),
         "last": LEARNING_AUTO_REFRESH_LAST,
         "note": "Auto refresh apenas recalcula o estado do Learning. Não altera operação.",
     }
+    payload.update(
+        automatic_learning_refresh_health(
+            interval_seconds=max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS),
+            thread_started=LEARNING_AUTO_REFRESH_THREAD_STARTED,
+            legacy_enabled=LEARNING_AUTO_REFRESH_LEGACY_ENABLED,
+        )
+    )
+    return payload
 
 
 @app.route("/learning/refresh")
@@ -28872,7 +28897,7 @@ def trendpro_daily_summary_v1_text_route():
 
 
 def start_central_runtime_once():
-    global CENTRAL_RUNTIME_STARTED
+    global CENTRAL_RUNTIME_STARTED, LEARNING_AUTO_REFRESH_THREAD_STARTED
 
     with CENTRAL_RUNTIME_LOCK:
         if CENTRAL_RUNTIME_STARTED:
@@ -28898,9 +28923,13 @@ def start_central_runtime_once():
 
     if LEARNING_AUTO_REFRESH_ENABLED:
         if acquire_runtime_file_lock("learning_auto_refresh"):
-            threading.Thread(target=learning_auto_refresh_loop, daemon=True).start()
+            learning_thread = threading.Thread(target=learning_auto_refresh_loop, daemon=True)
+            learning_thread.start()
+            LEARNING_AUTO_REFRESH_THREAD_STARTED = True
         else:
             print("LEARNING AUTO REFRESH NÃO INICIADO: outro processo já é líder")
+    else:
+        print("LEARNING AUTO REFRESH DESABILITADO — policy default false")
 
     if acquire_runtime_file_lock("central_telegram_polling"):
         threading.Thread(target=central_telegram_command_loop, daemon=True).start()
