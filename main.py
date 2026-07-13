@@ -49,6 +49,22 @@ from automatic_learning_policy import (
     automatic_learning_refresh_health,
 )
 try:
+    from startup_disk_forensics import (
+        build_disk_forensics_health,
+        build_startup_summary as build_disk_forensics_startup_summary,
+        run_startup_disk_forensics,
+    )
+    STARTUP_DISK_FORENSICS_LOADED = True
+    STARTUP_DISK_FORENSICS_IMPORT_ERROR = None
+except Exception as _startup_disk_forensics_import_exc:
+    build_disk_forensics_health = None
+    build_disk_forensics_startup_summary = None
+    run_startup_disk_forensics = None
+    STARTUP_DISK_FORENSICS_LOADED = False
+    STARTUP_DISK_FORENSICS_IMPORT_ERROR = (
+        f"{type(_startup_disk_forensics_import_exc).__name__}: module import failed"
+    )
+try:
     import fcntl
 except Exception:
     fcntl = None
@@ -1523,6 +1539,35 @@ def _resolve_central_data_dir():
     return BASE_DIR / "data"
 
 CENTRAL_DATA_DIR = _resolve_central_data_dir()
+STARTUP_DISK_FORENSICS_RESULT = None
+if STARTUP_DISK_FORENSICS_LOADED and callable(run_startup_disk_forensics):
+    try:
+        STARTUP_DISK_FORENSICS_RESULT = run_startup_disk_forensics(
+            project_root=BASE_DIR,
+            central_data_dir=CENTRAL_DATA_DIR,
+        )
+        if STARTUP_DISK_FORENSICS_RESULT.get("enabled") and callable(
+            build_disk_forensics_startup_summary
+        ):
+            print(build_disk_forensics_startup_summary(STARTUP_DISK_FORENSICS_RESULT))
+    except Exception as _startup_disk_forensics_scan_exc:
+        STARTUP_DISK_FORENSICS_RESULT = {
+            "ok": False,
+            "module": "startup_disk_forensics",
+            "version": "1.0.0-READ-ONLY",
+            "enabled": True,
+            "read_only": True,
+            "error": f"{type(_startup_disk_forensics_scan_exc).__name__}: diagnostic failed",
+        }
+else:
+    STARTUP_DISK_FORENSICS_RESULT = {
+        "ok": False,
+        "module": "startup_disk_forensics",
+        "version": "1.0.0-READ-ONLY",
+        "enabled": False,
+        "read_only": True,
+        "error": STARTUP_DISK_FORENSICS_IMPORT_ERROR or "MODULE_UNAVAILABLE",
+    }
 CENTRAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 CENTRAL_DECISION_LOG_FILE = CENTRAL_DATA_DIR / "decision_log.jsonl"
 CENTRAL_TIMELINE_LOG_FILE = CENTRAL_DATA_DIR / "timeline.jsonl"
@@ -11635,7 +11680,44 @@ def health():
             legacy_enabled=LEARNING_AUTO_REFRESH_LEGACY_ENABLED,
         )
     )
+    if callable(build_disk_forensics_health):
+        payload.update(build_disk_forensics_health(STARTUP_DISK_FORENSICS_RESULT))
+    else:
+        payload.update(
+            {
+                "disk_forensics_available": False,
+                "disk_forensics_usage_pct": None,
+                "disk_forensics_free_mb": None,
+                "disk_forensics_partial": None,
+                "disk_forensics_largest_file": None,
+                "disk_forensics_largest_file_mb": None,
+            }
+        )
     return payload
+
+
+@app.route("/diskforensics", methods=["GET"])
+@app.route("/disk/forensics", methods=["GET"])
+def disk_forensics_route():
+    if request.args:
+        return {
+            "ok": False,
+            "module": "startup_disk_forensics",
+            "error": "QUERY_PARAMETERS_NOT_SUPPORTED",
+        }, 400
+    diagnostic_available = (
+        isinstance(STARTUP_DISK_FORENSICS_RESULT, dict)
+        and STARTUP_DISK_FORENSICS_RESULT.get("ok") is True
+        and STARTUP_DISK_FORENSICS_RESULT.get("enabled") is True
+        and bool(STARTUP_DISK_FORENSICS_RESULT.get("filesystems"))
+    )
+    if not diagnostic_available:
+        return {
+            "ok": False,
+            "module": "startup_disk_forensics",
+            "error": "STARTUP_DIAGNOSTIC_UNAVAILABLE",
+        }, 503
+    return STARTUP_DISK_FORENSICS_RESULT, 200
 
 
 @app.route("/watchdog")
