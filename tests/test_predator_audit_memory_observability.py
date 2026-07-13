@@ -153,7 +153,6 @@ def test_main_has_complete_predator_audit_stage_inventory_without_importing_main
         "serialize_lifecycle_latest",
         "export_event_journal",
         "build_text_report",
-        "retain_lifecycle_cache_payload",
     }
     assert required <= {value for value in required if f'"{value}"' in source}
     assert '@observe_predator_audit("predator_source_collection")' in source
@@ -167,8 +166,7 @@ def test_static_call_graph_exposes_repeated_cold_source_collection():
     assert "def _ppla_v1_get_closed_paper_events" in source
     assert source.count("_pppa_v1_collect_source_events(limit=limit)") >= 2
     assert "pnl_audit = predator_pnl_paper_audit_v1_status(include_samples=False, limit=limit)" in source
-    assert "audit = predator_pnl_paper_audit_v1_status(include_samples=False, limit=600)" in source
-    assert "audit = predator_paper_lifecycle_audit_v1_status(include_samples=False, limit=800, use_cache=True)" in source
-    assert "before_snapshot = predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False)" in source
+    assert "limit=PREDATOR_AUDIT_REQUEST_SHARED_LIMIT" in source
+    assert "before_snapshot = predator_paper_lifecycle_audit_v1_status(" in source
     assert "closed_events, closed_source_counts = _ppla_v1_get_closed_paper_events(limit=2000)" in source
     assert "sync = predator_paper_registry_sync_fix_v1_status(commit=False, include_samples=False, use_cache=True)" in source

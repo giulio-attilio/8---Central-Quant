@@ -84,8 +84,21 @@ def _repair_harness(tmp_path, closed_event=None):
         sigs = {"|".join(str(x.get(k) or "") for k in ("bot", "setup", "symbol", "side", "closed_at", "close_reason", "entry", "exit_price")) for x in reg["closed_trades"]}
         return ids, set(), sigs
 
+    class _NoopStage:
+        def __enter__(self):
+            return self
+
+        def finish(self, value=None, **kwargs):
+            return value
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
     namespace = {
-        "_PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE": {},
+        "request_cached_predator_audit": lambda audit: lambda function: function,
+        "observe_predator_audit": lambda audit: lambda function: function,
+        "predator_audit_stage": lambda *args, **kwargs: _NoopStage(),
+        "PREDATOR_AUDIT_REQUEST_SHARED_LIMIT": 2000,
         "PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION": "TEST",
         "PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE": str(tmp_path / "repair_events.jsonl"),
         "PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE": str(tmp_path / "repair_latest.json"),

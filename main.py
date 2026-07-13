@@ -2568,7 +2568,8 @@ def central_watchdog_loop():
         try:
             CENTRAL_HEALTH["last_watchdog_check"] = data_hora_sp_str()
             memory_profile_step("watchdog_loop_start")
-            status = central_watchdog_status()
+            with app.app_context():
+                status = central_watchdog_status()
             CENTRAL_HEALTH["watchdog_status"] = status["status"]
 
             if not status["ok"]:
@@ -41979,8 +41980,17 @@ except Exception:
             return function
         return decorate
 
+try:
+    from predator_audit_request_cache import request_cached_predator_audit
+except Exception:
+    def request_cached_predator_audit(audit):
+        def decorate(function):
+            return function
+        return decorate
+
 
 PREDATOR_PNL_PAPER_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PNL-PAPER-AUDIT-V1.3-SEMANTIC-DEDUP"
+PREDATOR_AUDIT_REQUEST_SHARED_LIMIT = 2000
 PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_events.jsonl")
 PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_latest.json")
 
@@ -42199,6 +42209,7 @@ def _pppa_v1_classify_item(item, source_name=""):
     return "OTHER"
 
 
+@request_cached_predator_audit("predator_source_collection")
 @observe_predator_audit("predator_source_collection")
 def _pppa_v1_collect_source_events(limit=1200):
     audit_name = "predator_source_collection"
@@ -42685,6 +42696,7 @@ def _pppa_v1_build_pnl_stats(events, registry):
     return result
 
 
+@request_cached_predator_audit("predator_pnl_paper_audit")
 @observe_predator_audit("predator_pnl_paper_audit")
 def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
     audit_name = "predator_pnl_paper_audit"
@@ -42921,7 +42933,10 @@ def bot_health(key: str, cfg: dict):
         payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
     try:
         if str(key).upper() == "PREDATOR":
-            audit = predator_pnl_paper_audit_v1_status(include_samples=False, limit=600)
+            audit = predator_pnl_paper_audit_v1_status(
+                include_samples=False,
+                limit=PREDATOR_AUDIT_REQUEST_SHARED_LIMIT,
+            )
             health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
             overlay = {
                 "predator_pnl_audit_status": audit.get("status"),
@@ -42980,7 +42995,6 @@ def predator_pnl_paper_audit_v1_text_route():
 PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PAPER-LIFECYCLE-AUDIT-V1"
 PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_lifecycle_audit_events.jsonl")
 PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_lifecycle_audit_latest.json")
-_PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE = {"ts": 0, "payload": None}
 
 
 def _ppla_v1_now():
@@ -43203,20 +43217,10 @@ def _ppla_v1_validate_open_position(position, registry_match=None):
     return {"missing_fields": missing, "age_hours": age_h, "warnings": warnings, "reasons": reasons}
 
 
+@request_cached_predator_audit("predator_paper_lifecycle_audit")
 @observe_predator_audit("predator_paper_lifecycle_audit")
 def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, use_cache=False):
     audit_name = "predator_paper_lifecycle_audit"
-    if use_cache:
-        try:
-            cached = _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE.get("payload")
-            ts = _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE.get("ts") or 0
-            if cached and (_ppla_v1_epoch_now() - ts) < 30:
-                with predator_audit_stage(audit_name, "cache_hit_retained_payload") as stage:
-                    stage.finish(cached, objects_produced=len(cached), cache_age_seconds=round(_ppla_v1_epoch_now() - ts, 3))
-                return cached
-        except Exception:
-            pass
-
     with predator_audit_stage(audit_name, "load_module_positions") as stage:
         module_positions = _ppla_v1_get_predator_module_positions_raw()
         stage.finish(module_positions, records_processed=len(module_positions), objects_produced=len(module_positions))
@@ -43452,13 +43456,6 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
             stage.finish(records_processed=1, objects_produced=0)
     except Exception as exc:
         payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria lifecycle Predator: {exc}")
-    try:
-        with predator_audit_stage(audit_name, "retain_lifecycle_cache_payload") as stage:
-            _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["ts"] = _ppla_v1_epoch_now()
-            _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["payload"] = payload
-            stage.finish(payload, objects_produced=len(payload), retained=True)
-    except Exception:
-        pass
     return payload
 
 
@@ -43534,7 +43531,11 @@ def bot_health(key: str, cfg: dict):
         payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
     try:
         if str(key).upper() == "PREDATOR":
-            audit = predator_paper_lifecycle_audit_v1_status(include_samples=False, limit=800, use_cache=True)
+            audit = predator_paper_lifecycle_audit_v1_status(
+                include_samples=False,
+                limit=PREDATOR_AUDIT_REQUEST_SHARED_LIMIT,
+                use_cache=True,
+            )
             c = audit.get("counts") or {}
             health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
             overlay = {
@@ -43586,7 +43587,6 @@ def predator_paper_lifecycle_audit_v1_text_route():
 PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION = "2026-07-09-PREDATOR-PAPER-REGISTRY-SYNC-FIX-V1"
 PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_EVENTS_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_registry_sync_fix_events.jsonl")
 PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_LATEST_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_paper_registry_sync_fix_latest.json")
-_PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE = {"ts": 0, "payload": None}
 
 
 def _pprsf_v1_now():
@@ -43868,20 +43868,10 @@ def _pprsf_v1_closed_signature(trade):
     return "|".join(str(value or "") for value in fields)
 
 
+@request_cached_predator_audit("predator_registry_sync_audit_pipeline")
 @observe_predator_audit("predator_registry_sync_audit_pipeline")
 def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_samples=True, use_cache=False):
     audit_name = "predator_registry_sync_audit_pipeline"
-    now_epoch = _pprsf_v1_epoch_now()
-    if use_cache and not commit:
-        try:
-            cached = _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE.get("payload")
-            if cached and (now_epoch - float(_PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE.get("ts") or 0)) < 30:
-                with predator_audit_stage(audit_name, "cache_hit_registry_sync_payload") as stage:
-                    stage.finish(cached, objects_produced=len(cached), retained=True)
-                return cached
-        except Exception:
-            pass
-
     commit = bool(commit)
     ack_ok = str(ack or "").strip().upper() == "PREDATOR_REGISTRY_SYNC_FIX"
     errors = []
@@ -43911,7 +43901,11 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
         errors.append("Commit exige ack=PREDATOR_REGISTRY_SYNC_FIX.")
 
     with predator_audit_stage(audit_name, "uncached_lifecycle_audit_snapshot") as stage:
-        before_snapshot = predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False) if callable(globals().get("predator_paper_lifecycle_audit_v1_status")) else {}
+        before_snapshot = predator_paper_lifecycle_audit_v1_status(
+            include_samples=True,
+            limit=PREDATOR_AUDIT_REQUEST_SHARED_LIMIT,
+            use_cache=False,
+        ) if callable(globals().get("predator_paper_lifecycle_audit_v1_status")) else {}
         stage.finish(before_snapshot, objects_produced=len(before_snapshot))
     samples = before_snapshot.get("samples") or {}
     module_positions = samples.get("module_open_positions") or _ppla_v1_get_predator_module_positions_raw()
@@ -44107,13 +44101,6 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
                 }, ensure_ascii=False) + "\n")
         except Exception:
             pass
-    try:
-        with predator_audit_stage(audit_name, "retain_registry_sync_cache_payload") as stage:
-            _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["ts"] = _pprsf_v1_epoch_now()
-            _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["payload"] = payload
-            stage.finish(payload, objects_produced=len(payload), retained=True)
-    except Exception:
-        pass
     return payload
 
 
