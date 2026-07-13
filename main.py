@@ -39,6 +39,90 @@ import threading
 import requests
 import importlib.util
 import ctypes
+from pathlib import Path
+
+
+# ==========================================================
+# CENTRAL DATA DIR + TIMELINE EMERGENCY RECOVERY V1
+# ==========================================================
+# Esta resolução precisa ocorrer antes de qualquer import operacional: alguns
+# módulos importados pela Central inicializam persistência durante o import.
+BASE_DIR = Path(__file__).resolve().parent
+BOTS_DIR = BASE_DIR / "bots"
+
+
+def _resolve_central_data_dir():
+    configured = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
+    if configured:
+        return Path(configured)
+    try:
+        if os.path.isdir("/data"):
+            return Path("/data")
+    except Exception:
+        pass
+    return BASE_DIR / "data"
+
+
+CENTRAL_DATA_DIR = _resolve_central_data_dir()
+
+# Deve permanecer antes dos imports operacionais, do Startup Disk Forensics,
+# do mkdir do data dir e de qualquer writer configurado pela Central. O módulo
+# só pode alterar CENTRAL_DATA_DIR/timeline.jsonl com flag explícita ativa.
+TIMELINE_EMERGENCY_RECOVERY_RESULT = None
+build_timeline_emergency_recovery_health = None
+try:
+    from timeline_emergency_recovery import (
+        build_startup_summary as build_timeline_emergency_recovery_startup_summary,
+        build_timeline_emergency_recovery_health,
+        run_timeline_emergency_recovery,
+    )
+    TIMELINE_EMERGENCY_RECOVERY_RESULT = run_timeline_emergency_recovery(
+        CENTRAL_DATA_DIR,
+        environ=os.environ,
+    )
+except Exception as _timeline_emergency_recovery_exc:
+    _timeline_recovery_enabled = str(
+        os.environ.get("CENTRAL_TIMELINE_EMERGENCY_RECOVERY_ENABLED", "false")
+    ).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    TIMELINE_EMERGENCY_RECOVERY_RESULT = {
+        "ok": False,
+        "module": "timeline_emergency_recovery",
+        "version": "1.0.0",
+        "enabled": _timeline_recovery_enabled,
+        "attempted": False,
+        "status": "ERROR",
+        "target": "timeline.jsonl",
+        "before": {},
+        "after": {},
+        "bytes_freed": 0,
+        "target_reached": False,
+        "one_shot": True,
+        "errors": [
+            f"startup:{type(_timeline_emergency_recovery_exc).__name__}"
+        ],
+        "warnings": [],
+    }
+
+try:
+    if callable(globals().get("build_timeline_emergency_recovery_startup_summary")):
+        print(
+            build_timeline_emergency_recovery_startup_summary(
+                TIMELINE_EMERGENCY_RECOVERY_RESULT
+            )
+        )
+    else:
+        print(
+            "TIMELINE EMERGENCY RECOVERY "
+            f"status={TIMELINE_EMERGENCY_RECOVERY_RESULT.get('status', 'ERROR')} "
+            "before_mb=None after_mb=None freed_mb=0.0 "
+            "usage_before=None usage_after=None"
+        )
+except Exception:
+    print(
+        "TIMELINE EMERGENCY RECOVERY status=ERROR before_mb=None "
+        "after_mb=None freed_mb=0.0 usage_before=None usage_after=None"
+    )
+
 from automatic_daily_summaries import (
     CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED,
     automatic_daily_summaries_health,
@@ -477,7 +561,6 @@ except Exception as e:
 
 
 
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from flask import Flask, request
@@ -1375,9 +1458,6 @@ BOT_NAME = os.environ.get("BOT_NAME", "Central Quant PRO FULL")
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 # Alias compatível com módulos V1.x que usam TZ internamente.
 TZ = TIMEZONE_BR
-BASE_DIR = Path(__file__).resolve().parent
-BOTS_DIR = BASE_DIR / "bots"
-
 WATCHDOG_CHECK_SECONDS = int(os.environ.get("WATCHDOG_CHECK_SECONDS", "300"))
 WATCHDOG_THRESHOLD_MINUTES = int(os.environ.get("WATCHDOG_THRESHOLD_MINUTES", "20"))
 WATCHDOG_ALERT_COOLDOWN_SECONDS = int(os.environ.get("WATCHDOG_ALERT_COOLDOWN_SECONDS", "3600"))
@@ -1527,18 +1607,6 @@ DAILY_HISTORY_DIR.mkdir(exist_ok=True)
 # - Isso alinha append_decision_log() com o arquivo lido pelo Policy Learning
 #   e evita gravar o log rico em /opt/render/project/src/data enquanto
 #   /policyeffect lê /data/decision_log.jsonl.
-def _resolve_central_data_dir():
-    configured = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
-    if configured:
-        return Path(configured)
-    try:
-        if os.path.isdir("/data"):
-            return Path("/data")
-    except Exception:
-        pass
-    return BASE_DIR / "data"
-
-CENTRAL_DATA_DIR = _resolve_central_data_dir()
 STARTUP_DISK_FORENSICS_RESULT = None
 if STARTUP_DISK_FORENSICS_LOADED and callable(run_startup_disk_forensics):
     try:
@@ -11702,6 +11770,47 @@ def health():
                 "disk_forensics_partial": None,
                 "disk_forensics_largest_file": None,
                 "disk_forensics_largest_file_mb": None,
+            }
+        )
+    _timeline_recovery_health_builder = globals().get(
+        "build_timeline_emergency_recovery_health"
+    )
+    _timeline_recovery_cached_result = globals().get(
+        "TIMELINE_EMERGENCY_RECOVERY_RESULT", {}
+    )
+    if callable(_timeline_recovery_health_builder):
+        payload.update(
+            _timeline_recovery_health_builder(_timeline_recovery_cached_result)
+        )
+    else:
+        _timeline_recovery_result = (
+            _timeline_recovery_cached_result
+            if isinstance(_timeline_recovery_cached_result, dict)
+            else {}
+        )
+        _timeline_recovery_before = _timeline_recovery_result.get("before") or {}
+        _timeline_recovery_after = _timeline_recovery_result.get("after") or {}
+        payload.update(
+            {
+                "timeline_emergency_recovery_enabled": bool(
+                    _timeline_recovery_result.get("enabled", False)
+                ),
+                "timeline_emergency_recovery_status": _timeline_recovery_result.get(
+                    "status", "ERROR"
+                ),
+                "timeline_emergency_recovery_attempted": bool(
+                    _timeline_recovery_result.get("attempted", False)
+                ),
+                "timeline_emergency_recovery_before_mb": _timeline_recovery_before.get(
+                    "file_size_mb"
+                ),
+                "timeline_emergency_recovery_after_mb": _timeline_recovery_after.get(
+                    "file_size_mb"
+                ),
+                "timeline_emergency_recovery_freed_mb": 0.0,
+                "timeline_emergency_recovery_target_reached": bool(
+                    _timeline_recovery_result.get("target_reached", False)
+                ),
             }
         )
     return payload
