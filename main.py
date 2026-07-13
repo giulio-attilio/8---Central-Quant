@@ -41955,6 +41955,31 @@ def falcon_live_audit_guard_v1_ack_route():
 #   PREVIEW ou SAFE_DRY_RUN.
 # - Expor diagnóstico leve no /predator/pnlaudit e /predator/pnlaudit/text.
 # - Expor campos resumidos no /bots/PREDATOR.
+try:
+    from predator_audit_observability import (
+        observe_predator_audit,
+        predator_audit_stage,
+    )
+except Exception:
+    class _PredatorAuditObservabilityNoop:
+        def __enter__(self):
+            return self
+
+        def finish(self, value=None, **kwargs):
+            return value
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def predator_audit_stage(*args, **kwargs):
+        return _PredatorAuditObservabilityNoop()
+
+    def observe_predator_audit(audit):
+        def decorate(function):
+            return function
+        return decorate
+
+
 PREDATOR_PNL_PAPER_AUDIT_V1_VERSION = "2026-07-09-PREDATOR-PNL-PAPER-AUDIT-V1.3-SEMANTIC-DEDUP"
 PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_events.jsonl")
 PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE = str((CENTRAL_DATA_DIR if "CENTRAL_DATA_DIR" in globals() else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_pnl_paper_audit_latest.json")
@@ -42174,7 +42199,9 @@ def _pppa_v1_classify_item(item, source_name=""):
     return "OTHER"
 
 
+@observe_predator_audit("predator_source_collection")
 def _pppa_v1_collect_source_events(limit=1200):
+    audit_name = "predator_source_collection"
     data_dir = _pppa_v1_data_dir()
     source_files = [
         ("history_events", data_dir / "history_events.jsonl", "jsonl"),
@@ -42189,26 +42216,47 @@ def _pppa_v1_collect_source_events(limit=1200):
     out = []
     source_counts = {}
     for source_name, path, kind in source_files:
-        rows = _pppa_v1_read_jsonl_tail(path, limit=limit) if kind == "jsonl" else _pppa_v1_read_json_records(path, limit=limit)
+        load_stage_name = {
+            "history_events": "load_history",
+            "decision_log": "load_decision_log",
+            "execution_log": "load_execution_log",
+            "execution_engine_log": "load_execution_engine_log",
+            "broker_executions_log": "load_broker_logs",
+            "broker_execution_audit_log": "load_broker_audit_logs",
+            "history_export": "load_history_export",
+            "trade_registry_file": "load_trade_registry_file",
+        }.get(source_name, f"load_{source_name}")
+        with predator_audit_stage(audit_name, load_stage_name, source=source_name, reader=kind) as stage:
+            rows = _pppa_v1_read_jsonl_tail(path, limit=limit) if kind == "jsonl" else _pppa_v1_read_json_records(path, limit=limit)
+            stage.finish(rows, records_processed=len(rows), objects_produced=len(rows))
         source_counts[source_name] = len(rows)
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if not _pppa_v1_is_predator_item(row):
-                continue
-            cls = _pppa_v1_classify_item(row, source_name)
-            out.append({
-                "source": source_name,
-                "kind": cls,
-                "key": _pppa_v1_event_key(row, source_name),
-                "ts": _pppa_v1_deep_find(row, ["ts", "generated_at", "created_at", "opened_at", "closed_at", "timestamp"]),
-                "symbol": _pppa_v1_norm_symbol(_pppa_v1_deep_find(row, ["symbol", "ativo", "pair", "market_symbol", "bingx_symbol"])),
-                "side": _pppa_v1_norm_side(_pppa_v1_deep_find(row, ["side", "direction", "position_side", "positionSide"])),
-                "setup": _pppa_v1_deep_find(row, ["setup", "strategy_name"]),
-                "status": _pppa_v1_deep_find(row, ["status", "event", "event_type"]),
-                "sent": _pppa_v1_bool(_pppa_v1_deep_find(row, ["sent", "order_sent"]), default=False),
-                "raw_public": _pppa_v1_public(row, max_string=250),
-            })
+        before_count = len(out)
+        with predator_audit_stage(
+            audit_name,
+            f"filter_normalize_{source_name}",
+            records_in=len(rows),
+            source=source_name,
+        ) as stage:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if not _pppa_v1_is_predator_item(row):
+                    continue
+                cls = _pppa_v1_classify_item(row, source_name)
+                out.append({
+                    "source": source_name,
+                    "kind": cls,
+                    "key": _pppa_v1_event_key(row, source_name),
+                    "ts": _pppa_v1_deep_find(row, ["ts", "generated_at", "created_at", "opened_at", "closed_at", "timestamp"]),
+                    "symbol": _pppa_v1_norm_symbol(_pppa_v1_deep_find(row, ["symbol", "ativo", "pair", "market_symbol", "bingx_symbol"])),
+                    "side": _pppa_v1_norm_side(_pppa_v1_deep_find(row, ["side", "direction", "position_side", "positionSide"])),
+                    "setup": _pppa_v1_deep_find(row, ["setup", "strategy_name"]),
+                    "status": _pppa_v1_deep_find(row, ["status", "event", "event_type"]),
+                    "sent": _pppa_v1_bool(_pppa_v1_deep_find(row, ["sent", "order_sent"]), default=False),
+                    "raw_public": _pppa_v1_public(row, max_string=250),
+                })
+            produced = len(out) - before_count
+            stage.finish(records_processed=len(rows), objects_produced=produced, retained_total=len(out))
     return out, source_counts
 
 
@@ -42463,9 +42511,12 @@ def _pppa_v1_registry_closed_as_events(registry):
     return out
 
 
+@observe_predator_audit("predator_pnl_grouping")
 def _pppa_v1_build_pnl_stats(events, registry):
     # V1.3: deduplica semanticamente fechamentos entre history_events, audit logs e Trade Registry.
     # SAFE_DRY_RUN, VERIFY, PREVIEW e REAL continuam excluídos do cálculo.
+    filter_stage = predator_audit_stage("predator_pnl_grouping", "filter_closed_and_merge_registry", records_in=len(events))
+    filter_stage.__enter__()
     raw_closed = []
     for ev in events:
         if ev.get("kind") == "PAPER_CLOSED":
@@ -42486,6 +42537,16 @@ def _pppa_v1_build_pnl_stats(events, registry):
             raw_closed.append(ev)
             registry_keys_already_seen.add(ck)
 
+    filter_stage.finish(
+        raw_closed,
+        records_processed=len(events) + len(registry_as_events),
+        objects_produced=len(raw_closed),
+        registry_events=len(registry_as_events),
+    )
+    filter_stage.__exit__(None, None, None)
+
+    grouping_stage = predator_audit_stage("predator_pnl_grouping", "group_by_canonical_trade", records_in=len(raw_closed))
+    grouping_stage.__enter__()
     grouped = {}
     for ev in raw_closed:
         ck = _pppa_v1_closed_canonical_key(ev)
@@ -42495,6 +42556,11 @@ def _pppa_v1_build_pnl_stats(events, registry):
         item["source_event_key"] = _pppa_v1_source_event_key_from_closed(ev)
         grouped.setdefault(ck, []).append(item)
 
+    grouping_stage.finish(grouped, records_processed=len(raw_closed), objects_produced=len(grouped))
+    grouping_stage.__exit__(None, None, None)
+
+    dedup_stage = predator_audit_stage("predator_pnl_grouping", "sort_and_deduplicate_groups", records_in=len(grouped))
+    dedup_stage.__enter__()
     unique_closed = []
     duplicate_closed = []
     sources_per_trade = []
@@ -42534,8 +42600,21 @@ def _pppa_v1_build_pnl_stats(events, registry):
         })
 
     # Ordem estável por timestamp para samples e relatórios.
-    unique_closed = sorted(unique_closed, key=lambda x: str(x.get("ts") or ""))
+    dedup_stage.finish(
+        {"unique_closed": unique_closed, "duplicate_closed": duplicate_closed, "sources_per_trade": sources_per_trade},
+        records_processed=len(grouped),
+        objects_produced=len(unique_closed) + len(duplicate_closed) + len(sources_per_trade),
+    )
+    dedup_stage.__exit__(None, None, None)
 
+    sort_stage = predator_audit_stage("predator_pnl_grouping", "sort_closed_chronologically", records_in=len(unique_closed))
+    sort_stage.__enter__()
+    unique_closed = sorted(unique_closed, key=lambda x: str(x.get("ts") or ""))
+    sort_stage.finish(unique_closed, records_processed=len(unique_closed), objects_produced=len(unique_closed))
+    sort_stage.__exit__(None, None, None)
+
+    pnl_filter_stage = predator_audit_stage("predator_pnl_grouping", "filter_pnl_records", records_in=len(unique_closed))
+    pnl_filter_stage.__enter__()
     with_pnl = []
     missing_pnl = []
     for ev in unique_closed:
@@ -42548,6 +42627,15 @@ def _pppa_v1_build_pnl_stats(events, registry):
             e2["pnl_r"] = pnl_r
             with_pnl.append(e2)
 
+    pnl_filter_stage.finish(
+        {"with_pnl": with_pnl, "missing_pnl": missing_pnl},
+        records_processed=len(unique_closed),
+        objects_produced=len(with_pnl) + len(missing_pnl),
+    )
+    pnl_filter_stage.__exit__(None, None, None)
+
+    aggregate_stage = predator_audit_stage("predator_pnl_grouping", "aggregate_pnl_metrics", records_in=len(with_pnl))
+    aggregate_stage.__enter__()
     pnl_values = [x.get("pnl_pct") for x in with_pnl if x.get("pnl_pct") is not None]
     r_values = [x.get("pnl_r") for x in with_pnl if x.get("pnl_r") is not None]
     wins = len([x for x in pnl_values if x > 0])
@@ -42558,7 +42646,15 @@ def _pppa_v1_build_pnl_stats(events, registry):
     pf = (gains / abs_losses) if abs_losses > 0 else (999 if gains > 0 else 0)
     denom = wins + losses + be
     duplicate_closed_trade_count = len([x for x in sources_per_trade if int(x.get("source_count") or 0) > 1])
-    return {
+    aggregate_stage.finish(
+        {"pnl_values": pnl_values, "r_values": r_values},
+        records_processed=len(with_pnl),
+        objects_produced=len(pnl_values) + len(r_values),
+    )
+    aggregate_stage.__exit__(None, None, None)
+    result_stage = predator_audit_stage("predator_pnl_grouping", "build_pnl_result_payload")
+    result_stage.__enter__()
+    result = {
         # Compatibilidade: paper_closed_count agora representa fechamentos únicos/deduplicados.
         "paper_closed_count": len(unique_closed),
         "unique_paper_closed_count": len(unique_closed),
@@ -42584,22 +42680,45 @@ def _pppa_v1_build_pnl_stats(events, registry):
         "missing_pnl_sample": [_pppa_v1_public(x, max_string=250) for x in missing_pnl[-10:]],
         "excluded_from_pnl_note": "SAFE_DRY_RUN, BROKER_PREVIEW, VERIFY e REAL_SENT_OR_LIVE_EVENT são excluídos do PnL estatístico/PAPER. V1.3 deduplica semanticamente history/audit/registry antes de somar PnL/R.",
     }
+    result_stage.finish(result, objects_produced=len(result))
+    result_stage.__exit__(None, None, None)
+    return result
 
 
+@observe_predator_audit("predator_pnl_paper_audit")
 def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
-    events, source_counts = _pppa_v1_collect_source_events(limit=limit)
-    registry = _pppa_v1_registry_predator_snapshot()
-    module_snap = _pppa_v1_module_predator_snapshot()
-    by_kind = {}
-    by_source = {}
-    for ev in events:
-        by_kind[ev.get("kind")] = by_kind.get(ev.get("kind"), 0) + 1
-        by_source[ev.get("source")] = by_source.get(ev.get("source"), 0) + 1
-    real_events = [e for e in events if e.get("kind") == "REAL_SENT_OR_LIVE_EVENT"]
-    safe_events = [e for e in events if e.get("kind") == "SAFE_DRY_RUN"]
-    preview_events = [e for e in events if e.get("kind") == "BROKER_PREVIEW"]
-    verify_events = [e for e in events if e.get("kind") == "VERIFY"]
-    pnl = _pppa_v1_build_pnl_stats(events, registry)
+    audit_name = "predator_pnl_paper_audit"
+    with predator_audit_stage(audit_name, "collect_all_sources") as stage:
+        events, source_counts = _pppa_v1_collect_source_events(limit=limit)
+        stage.finish(events, records_processed=sum(source_counts.values()), objects_produced=len(events))
+    with predator_audit_stage(audit_name, "load_registry") as stage:
+        registry = _pppa_v1_registry_predator_snapshot()
+        stage.finish(
+            registry,
+            records_processed=(registry.get("open_count") or 0) + (registry.get("closed_count") or 0),
+            objects_produced=(registry.get("open_count") or 0) + (registry.get("closed_count") or 0),
+        )
+    with predator_audit_stage(audit_name, "load_predator_module_snapshot") as stage:
+        module_snap = _pppa_v1_module_predator_snapshot()
+        stage.finish(module_snap, objects_produced=module_snap.get("positions_count_read") or 0)
+    with predator_audit_stage(audit_name, "aggregate_group_and_filter", records_in=len(events)) as stage:
+        by_kind = {}
+        by_source = {}
+        for ev in events:
+            by_kind[ev.get("kind")] = by_kind.get(ev.get("kind"), 0) + 1
+            by_source[ev.get("source")] = by_source.get(ev.get("source"), 0) + 1
+        real_events = [e for e in events if e.get("kind") == "REAL_SENT_OR_LIVE_EVENT"]
+        safe_events = [e for e in events if e.get("kind") == "SAFE_DRY_RUN"]
+        preview_events = [e for e in events if e.get("kind") == "BROKER_PREVIEW"]
+        verify_events = [e for e in events if e.get("kind") == "VERIFY"]
+        stage.finish(
+            {"by_kind": by_kind, "by_source": by_source},
+            records_processed=len(events),
+            objects_produced=len(by_kind) + len(by_source) + len(real_events) + len(safe_events) + len(preview_events) + len(verify_events),
+        )
+    with predator_audit_stage(audit_name, "build_pnl_aggregations", records_in=len(events)) as stage:
+        pnl = _pppa_v1_build_pnl_stats(events, registry)
+        stage.finish(pnl, records_processed=len(events), objects_produced=pnl.get("paper_closed_count") or 0)
     warnings = []
     reasons = []
     status = "OK"
@@ -42648,6 +42767,8 @@ def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
         status = "OK_WITH_WARNINGS"
 
     ok = not bool(real_events)
+    payload_stage = predator_audit_stage(audit_name, "build_payload", records_in=len(events))
+    payload_stage.__enter__()
     payload = {
         "ok": ok,
         "module": "predator_pnl_paper_audit_v1",
@@ -42683,27 +42804,46 @@ def predator_pnl_paper_audit_v1_status(include_samples=True, limit=1200):
         ],
         "token_value_exposed": False,
     }
+    payload_stage.finish(payload, records_processed=len(events), objects_produced=len(payload))
+    payload_stage.__exit__(None, None, None)
     if include_samples:
+        samples_stage = predator_audit_stage(audit_name, "build_sample_payloads")
+        samples_stage.__enter__()
         payload["samples"] = {
             "real_events": [_pppa_v1_public(e, max_string=250) for e in real_events[-10:]],
             "safe_dry_run_events": [_pppa_v1_public(e, max_string=250) for e in safe_events[-10:]],
             "preview_events": [_pppa_v1_public(e, max_string=250) for e in preview_events[-10:]],
         }
+        samples_stage.finish(payload["samples"], objects_produced=sum(len(x) for x in payload["samples"].values()))
+        samples_stage.__exit__(None, None, None)
     try:
         latest_path = Path(PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE)
         latest_path.parent.mkdir(parents=True, exist_ok=True)
-        latest_path.write_text(json.dumps(_pppa_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        with predator_audit_stage(audit_name, "serialize_latest_payload") as stage:
+            serialized_latest = json.dumps(_pppa_v1_public(payload), ensure_ascii=False, indent=2)
+            stage.finish(serialized_latest, objects_produced=1, serialized_chars=len(serialized_latest))
+        with predator_audit_stage(audit_name, "export_latest_payload") as stage:
+            latest_path.write_text(serialized_latest, encoding="utf-8")
+            stage.finish(records_processed=1, objects_produced=0)
         event_path = Path(PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE)
         event_path.parent.mkdir(parents=True, exist_ok=True)
-        with event_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"event": "PREDATOR_PNL_PAPER_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "real_sent_or_live_event_count": len(real_events), "paper_pnl": pnl}, ensure_ascii=False) + "\n")
+        with predator_audit_stage(audit_name, "serialize_event_export") as stage:
+            serialized_event = json.dumps({"event": "PREDATOR_PNL_PAPER_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "real_sent_or_live_event_count": len(real_events), "paper_pnl": pnl}, ensure_ascii=False) + "\n"
+            stage.finish(serialized_event, objects_produced=1, serialized_chars=len(serialized_event))
+        with predator_audit_stage(audit_name, "export_event_journal") as stage:
+            with event_path.open("a", encoding="utf-8") as fh:
+                fh.write(serialized_event)
+            stage.finish(records_processed=1, objects_produced=0)
     except Exception as exc:
         payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria Predator: {exc}")
     return payload
 
 
+@observe_predator_audit("predator_pnl_report")
 def build_predator_pnl_paper_audit_v1_text():
     payload = predator_pnl_paper_audit_v1_status(include_samples=False)
+    report_stage = predator_audit_stage("predator_pnl_report", "build_text_report")
+    report_stage.__enter__()
     pnl = payload.get("paper_pnl") or {}
     mod = payload.get("module_snapshot") or {}
     reg = payload.get("registry_snapshot") or {}
@@ -42764,7 +42904,10 @@ def build_predator_pnl_paper_audit_v1_text():
         f"- Eventos: {PREDATOR_PNL_PAPER_AUDIT_V1_EVENTS_FILE}",
         f"- Último snapshot: {PREDATOR_PNL_PAPER_AUDIT_V1_LATEST_FILE}",
     ]
-    return "\n".join(lines)
+    report = "\n".join(lines)
+    report_stage.finish(report, records_processed=len(lines), objects_produced=1)
+    report_stage.__exit__(None, None, None)
+    return report
 
 
 _ORIGINAL_BOT_HEALTH_FOR_PREDATOR_PNL_PAPER_AUDIT_V1 = bot_health if "bot_health" in globals() else None
@@ -43060,22 +43203,41 @@ def _ppla_v1_validate_open_position(position, registry_match=None):
     return {"missing_fields": missing, "age_hours": age_h, "warnings": warnings, "reasons": reasons}
 
 
+@observe_predator_audit("predator_paper_lifecycle_audit")
 def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, use_cache=False):
+    audit_name = "predator_paper_lifecycle_audit"
     if use_cache:
         try:
             cached = _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE.get("payload")
             ts = _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE.get("ts") or 0
             if cached and (_ppla_v1_epoch_now() - ts) < 30:
+                with predator_audit_stage(audit_name, "cache_hit_retained_payload") as stage:
+                    stage.finish(cached, objects_produced=len(cached), cache_age_seconds=round(_ppla_v1_epoch_now() - ts, 3))
                 return cached
         except Exception:
             pass
 
-    module_positions = _ppla_v1_get_predator_module_positions_raw()
-    registry = _ppla_v1_get_predator_registry_full()
+    with predator_audit_stage(audit_name, "load_module_positions") as stage:
+        module_positions = _ppla_v1_get_predator_module_positions_raw()
+        stage.finish(module_positions, records_processed=len(module_positions), objects_produced=len(module_positions))
+    with predator_audit_stage(audit_name, "load_registry_full_for_lifecycle_audit") as stage:
+        registry = _ppla_v1_get_predator_registry_full()
+        stage.finish(registry, objects_produced=len(registry.get("open_trades") or []) + len(registry.get("closed_trades") or []))
+    with predator_audit_stage(
+        audit_name,
+        "load_trade_lifecycle",
+        direct_loader_present=False,
+        note="current Predator Audit has no direct Trade Lifecycle loader",
+    ) as stage:
+        stage.finish(records_processed=0, objects_produced=0)
     registry_open = registry.get("open_trades") or []
     registry_closed = registry.get("closed_trades") or []
-    closed_events, source_counts = _ppla_v1_get_closed_paper_events(limit=limit)
+    with predator_audit_stage(audit_name, "load_closed_history_and_broker_sources") as stage:
+        closed_events, source_counts = _ppla_v1_get_closed_paper_events(limit=limit)
+        stage.finish(closed_events, records_processed=sum(source_counts.values()), objects_produced=len(closed_events))
 
+    indexing_stage = predator_audit_stage(audit_name, "build_open_trade_indexes", records_in=len(module_positions) + len(registry_open))
+    indexing_stage.__enter__()
     module_by_id = {}
     module_by_key = {}
     duplicate_open_trade_ids = []
@@ -43100,6 +43262,15 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
             registry_by_id[tid] = t
         registry_by_key[key] = t
 
+    indexing_stage.finish(
+        {"module_by_id": module_by_id, "module_by_key": module_by_key, "registry_by_id": registry_by_id, "registry_by_key": registry_by_key},
+        records_processed=len(module_positions) + len(registry_open),
+        objects_produced=len(module_by_id) + len(module_by_key) + len(registry_by_id) + len(registry_by_key),
+    )
+    indexing_stage.__exit__(None, None, None)
+
+    validation_stage = predator_audit_stage(audit_name, "validate_open_positions", records_in=len(module_by_id))
+    validation_stage.__enter__()
     missing_registry_open = []
     open_field_issues = []
     stale_open = []
@@ -43117,6 +43288,15 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
         for w in validation.get("warnings") or []:
             open_warnings.append({"trade_id": tid, "key": key, "warning": w})
 
+    validation_stage.finish(
+        {"missing": missing_registry_open, "field_issues": open_field_issues, "stale": stale_open, "warnings": open_warnings},
+        records_processed=len(module_by_id),
+        objects_produced=len(missing_registry_open) + len(open_field_issues) + len(stale_open) + len(open_warnings),
+    )
+    validation_stage.__exit__(None, None, None)
+
+    reconcile_stage = predator_audit_stage(audit_name, "group_and_reconcile_registry", records_in=len(registry_open) + len(registry_closed) + len(closed_events))
+    reconcile_stage.__enter__()
     orphan_registry_open = []
     for tid, t in registry_by_id.items():
         key = _ppla_v1_trade_key(t)
@@ -43142,9 +43322,18 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
         if not matched:
             missing_registry_closed.append({"event_key": ev_key, "base_key": base_key, "event": _ppla_v1_public(ev, max_string=260)})
 
+    reconcile_stage.finish(
+        {"orphans": orphan_registry_open, "closed_by_key": closed_by_key, "missing_closed": missing_registry_closed},
+        records_processed=len(registry_open) + len(registry_closed) + len(closed_events),
+        objects_produced=len(orphan_registry_open) + len(closed_by_key) + len(missing_registry_closed),
+    )
+    reconcile_stage.__exit__(None, None, None)
+
     # Complemento com auditoria PnL para manter visão única.
     try:
-        pnl_audit = predator_pnl_paper_audit_v1_status(include_samples=False, limit=limit)
+        with predator_audit_stage(audit_name, "nested_pnl_audit") as stage:
+            pnl_audit = predator_pnl_paper_audit_v1_status(include_samples=False, limit=limit)
+            stage.finish(pnl_audit, objects_produced=len(pnl_audit))
     except Exception as exc:
         pnl_audit = {"ok": False, "status": "ERROR", "error": str(exc)}
 
@@ -43179,6 +43368,8 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
         status = "OK_WITH_WARNINGS"
 
     ok = not bool(reasons)
+    payload_stage = predator_audit_stage(audit_name, "build_lifecycle_payload", records_in=len(module_positions) + len(registry_open) + len(registry_closed) + len(closed_events))
+    payload_stage.__enter__()
     payload = {
         "ok": ok,
         "module": "predator_paper_lifecycle_audit_v1",
@@ -43224,7 +43415,11 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
         ],
         "token_value_exposed": False,
     }
+    payload_stage.finish(payload, objects_produced=len(payload))
+    payload_stage.__exit__(None, None, None)
     if include_samples:
+        samples_stage = predator_audit_stage(audit_name, "build_lifecycle_sample_payloads")
+        samples_stage.__enter__()
         payload["samples"] = {
             "missing_registry_open": missing_registry_open[:20],
             "orphan_registry_open": orphan_registry_open[:20],
@@ -43235,26 +43430,43 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
             "module_open_positions": [_ppla_v1_public(p, max_string=260) for p in module_positions[:20]],
             "registry_open_trades": [_ppla_v1_public(t, max_string=260) for t in registry_open[:20]],
         }
+        samples_stage.finish(payload["samples"], objects_produced=sum(len(x) for x in payload["samples"].values()))
+        samples_stage.__exit__(None, None, None)
     try:
         latest_path = Path(PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE)
         latest_path.parent.mkdir(parents=True, exist_ok=True)
-        latest_path.write_text(json.dumps(_ppla_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        with predator_audit_stage(audit_name, "serialize_lifecycle_latest") as stage:
+            serialized_latest = json.dumps(_ppla_v1_public(payload), ensure_ascii=False, indent=2)
+            stage.finish(serialized_latest, objects_produced=1, serialized_chars=len(serialized_latest))
+        with predator_audit_stage(audit_name, "export_lifecycle_latest") as stage:
+            latest_path.write_text(serialized_latest, encoding="utf-8")
+            stage.finish(records_processed=1, objects_produced=0)
         event_path = Path(PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE)
         event_path.parent.mkdir(parents=True, exist_ok=True)
-        with event_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"event": "PREDATOR_PAPER_LIFECYCLE_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "counts": payload.get("counts"), "reasons": reasons[:5], "warnings": warnings[:5]}, ensure_ascii=False) + "\n")
+        with predator_audit_stage(audit_name, "serialize_lifecycle_event") as stage:
+            serialized_event = json.dumps({"event": "PREDATOR_PAPER_LIFECYCLE_AUDIT_RUN", "generated_at": payload.get("generated_at"), "status": status, "ok": ok, "counts": payload.get("counts"), "reasons": reasons[:5], "warnings": warnings[:5]}, ensure_ascii=False) + "\n"
+            stage.finish(serialized_event, objects_produced=1, serialized_chars=len(serialized_event))
+        with predator_audit_stage(audit_name, "export_lifecycle_event") as stage:
+            with event_path.open("a", encoding="utf-8") as fh:
+                fh.write(serialized_event)
+            stage.finish(records_processed=1, objects_produced=0)
     except Exception as exc:
         payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria lifecycle Predator: {exc}")
     try:
-        _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["ts"] = _ppla_v1_epoch_now()
-        _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["payload"] = payload
+        with predator_audit_stage(audit_name, "retain_lifecycle_cache_payload") as stage:
+            _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["ts"] = _ppla_v1_epoch_now()
+            _PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_CACHE["payload"] = payload
+            stage.finish(payload, objects_produced=len(payload), retained=True)
     except Exception:
         pass
     return payload
 
 
+@observe_predator_audit("predator_lifecycle_report")
 def build_predator_paper_lifecycle_audit_v1_text():
     payload = predator_paper_lifecycle_audit_v1_status(include_samples=False, use_cache=False)
+    report_stage = predator_audit_stage("predator_lifecycle_report", "build_text_report")
+    report_stage.__enter__()
     c = payload.get("counts") or {}
     p = payload.get("pnl_audit_summary") or {}
     lines = [
@@ -43305,7 +43517,10 @@ def build_predator_paper_lifecycle_audit_v1_text():
         f"- Eventos: {PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_EVENTS_FILE}",
         f"- Último snapshot: {PREDATOR_PAPER_LIFECYCLE_AUDIT_V1_LATEST_FILE}",
     ]
-    return "\n".join(lines)
+    report = "\n".join(lines)
+    report_stage.finish(report, records_processed=len(lines), objects_produced=1)
+    report_stage.__exit__(None, None, None)
+    return report
 
 
 _ORIGINAL_BOT_HEALTH_FOR_PREDATOR_PAPER_LIFECYCLE_AUDIT_V1 = bot_health if "bot_health" in globals() else None
@@ -43653,12 +43868,16 @@ def _pprsf_v1_closed_signature(trade):
     return "|".join(str(value or "") for value in fields)
 
 
+@observe_predator_audit("predator_registry_sync_audit_pipeline")
 def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_samples=True, use_cache=False):
+    audit_name = "predator_registry_sync_audit_pipeline"
     now_epoch = _pprsf_v1_epoch_now()
     if use_cache and not commit:
         try:
             cached = _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE.get("payload")
             if cached and (now_epoch - float(_PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE.get("ts") or 0)) < 30:
+                with predator_audit_stage(audit_name, "cache_hit_registry_sync_payload") as stage:
+                    stage.finish(cached, objects_produced=len(cached), retained=True)
                 return cached
         except Exception:
             pass
@@ -43673,7 +43892,9 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
     open_skipped = []
     closed_skipped = []
 
-    registry, reg_err = _pprsf_v1_load_registry()
+    with predator_audit_stage(audit_name, "load_registry_for_sync_audit") as stage:
+        registry, reg_err = _pprsf_v1_load_registry()
+        stage.finish(registry, objects_produced=len(registry or {}), error_present=bool(reg_err))
     if registry is None:
         payload = {
             "ok": False,
@@ -43689,15 +43910,25 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
     if commit and not ack_ok:
         errors.append("Commit exige ack=PREDATOR_REGISTRY_SYNC_FIX.")
 
-    before_snapshot = predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False) if callable(globals().get("predator_paper_lifecycle_audit_v1_status")) else {}
+    with predator_audit_stage(audit_name, "uncached_lifecycle_audit_snapshot") as stage:
+        before_snapshot = predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False) if callable(globals().get("predator_paper_lifecycle_audit_v1_status")) else {}
+        stage.finish(before_snapshot, objects_produced=len(before_snapshot))
     samples = before_snapshot.get("samples") or {}
     module_positions = samples.get("module_open_positions") or _ppla_v1_get_predator_module_positions_raw()
     closed_events = []
     try:
-        closed_events, _ = _ppla_v1_get_closed_paper_events(limit=2000)
+        with predator_audit_stage(audit_name, "duplicate_closed_source_collection") as stage:
+            closed_events, closed_source_counts = _ppla_v1_get_closed_paper_events(limit=2000)
+            stage.finish(closed_events, records_processed=sum(closed_source_counts.values()), objects_produced=len(closed_events))
     except Exception:
         closed_events = []
 
+    planning_stage = predator_audit_stage(
+        audit_name,
+        "build_sync_indexes_and_repair_plans",
+        records_in=len(module_positions or []) + len(closed_events or []),
+    )
+    planning_stage.__enter__()
     existing_ids, open_sigs, closed_sigs = _pprsf_v1_existing_ids_and_signatures(registry)
     open_trades = _pprsf_v1_open_dict(registry)
     closed_trades = _pprsf_v1_closed_list(registry)
@@ -43745,6 +43976,13 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
                 closed_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup"), "pnl_pct": trade.get("pnl_pct"), "pnl_r": trade.get("pnl_r")})
             except Exception as exc:
                 errors.append(f"Falha ao inserir CLOSED {tid}: {exc}")
+
+    planning_stage.finish(
+        {"existing_ids": existing_ids, "open_sigs": open_sigs, "closed_sigs": closed_sigs, "planned_open": planned_open, "planned_closed": planned_closed},
+        records_processed=len(module_positions or []) + len(closed_events or []),
+        objects_produced=len(existing_ids) + len(open_sigs) + len(closed_sigs) + len(planned_open) + len(planned_closed),
+    )
+    planning_stage.__exit__(None, None, None)
 
     committed = False
     save_error = None
@@ -43795,6 +44033,8 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
     if closed_skipped:
         warnings.append(f"CLOSED ignorados: {len(closed_skipped)}.")
 
+    payload_stage = predator_audit_stage(audit_name, "build_registry_sync_payload")
+    payload_stage.__enter__()
     payload = {
         "ok": ok,
         "status": status,
@@ -43833,6 +44073,8 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
         ],
         "token_value_exposed": False,
     }
+    payload_stage.finish(payload, objects_produced=len(payload))
+    payload_stage.__exit__(None, None, None)
     if include_samples:
         payload["samples"] = {
             "planned_open": [_pprsf_v1_public(x, max_string=320) for x in planned_open[:20]],
@@ -43866,8 +44108,10 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
         except Exception:
             pass
     try:
-        _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["ts"] = _pprsf_v1_epoch_now()
-        _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["payload"] = payload
+        with predator_audit_stage(audit_name, "retain_registry_sync_cache_payload") as stage:
+            _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["ts"] = _pprsf_v1_epoch_now()
+            _PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_CACHE["payload"] = payload
+            stage.finish(payload, objects_produced=len(payload), retained=True)
     except Exception:
         pass
     return payload
