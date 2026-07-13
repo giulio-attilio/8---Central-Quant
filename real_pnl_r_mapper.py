@@ -28,13 +28,16 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from history_memory_guard import AUTOMATIC_MAX_BYTES, AUTOMATIC_MAX_RECORDS, iter_jsonl_tail
 
 VERSION = "2026-07-07-REAL-PNL-R-MAPPER-V2.5"
 MODULE = "real_pnl_r_mapper"
 MODE = "OBSERVATION_ONLY"
+_JSONL_READ_METADATA = OrderedDict()
 
 def _resolve_data_dir():
     configured = os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR")
@@ -127,24 +130,22 @@ def _is_empty(value: Any) -> bool:
 
 
 def _read_jsonl(path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    rows: List[Dict[str, Any]] = []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    item = json.loads(line)
-                    if isinstance(item, dict):
-                        rows.append(item)
-                except Exception:
-                    continue
-        if limit and len(rows) > limit:
-            return rows[-limit:]
-        return rows
+        result = iter_jsonl_tail(
+            path,
+            max_records=limit if limit is not None else AUTOMATIC_MAX_RECORDS,
+            max_bytes=AUTOMATIC_MAX_BYTES,
+            operation=f"real_pnl_r_mapper:{os.path.basename(path)}",
+        )
+        _JSONL_READ_METADATA[os.path.basename(path)] = {
+            key: result[key] for key in (
+                "partial", "coverage_complete", "records_examined", "bytes_read",
+                "max_records", "max_bytes", "source_size_bytes",
+            )
+        }
+        while len(_JSONL_READ_METADATA) > 32:
+            _JSONL_READ_METADATA.popitem(last=False)
+        return result["records"]
     except Exception:
         return []
 
@@ -753,6 +754,7 @@ def get_real_pnl_r_health() -> Dict[str, Any]:
 
 
 def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Dict[str, Any]:
+    _JSONL_READ_METADATA.clear()
     raw_sources: List[Tuple[str, List[Dict[str, Any]]]] = [
         ("trade_registry", _read_jsonl(TRADE_REGISTRY_FILE, limit=limit)),
         ("execution_engine_log", _read_jsonl(EXECUTION_ENGINE_LOG_FILE, limit=limit)),
@@ -815,6 +817,14 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
             "output_events": OUTPUT_EVENTS_FILE,
         },
         "source_counts": source_counts,
+        "source_coverage": dict(_JSONL_READ_METADATA),
+        "partial": any(item.get("partial") for item in _JSONL_READ_METADATA.values()),
+        "coverage_complete": all(item.get("coverage_complete") for item in _JSONL_READ_METADATA.values()),
+        "records_examined": sum(item.get("records_examined", 0) for item in _JSONL_READ_METADATA.values()),
+        "bytes_read": sum(item.get("bytes_read", 0) for item in _JSONL_READ_METADATA.values()),
+        "max_records": limit if limit is not None else AUTOMATIC_MAX_RECORDS,
+        "max_bytes": AUTOMATIC_MAX_BYTES,
+        "source_size_bytes": sum(item.get("source_size_bytes", 0) for item in _JSONL_READ_METADATA.values()),
         "strict_real_sources": STRICT_REAL_SOURCES,
         "allow_legacy_history_sources": ALLOW_LEGACY_HISTORY_SOURCES,
         "skipped_non_real_count": skipped_non_real_count,
@@ -1264,6 +1274,7 @@ def get_real_pnl_r_health() -> Dict[str, Any]:  # type: ignore[override]
 
 
 def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Dict[str, Any]:  # type: ignore[override]
+    _JSONL_READ_METADATA.clear()
     raw_sources: List[Tuple[str, List[Dict[str, Any]]]] = [
         ("trade_registry_json", _read_trade_registry_json_rows(limit=limit)),
         ("trade_registry_jsonl", _read_jsonl(TRADE_REGISTRY_FILE, limit=limit)),
@@ -1326,6 +1337,14 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
             "output_events": OUTPUT_EVENTS_FILE,
         },
         "source_counts": source_counts,
+        "source_coverage": dict(_JSONL_READ_METADATA),
+        "partial": any(item.get("partial") for item in _JSONL_READ_METADATA.values()),
+        "coverage_complete": all(item.get("coverage_complete") for item in _JSONL_READ_METADATA.values()),
+        "records_examined": sum(item.get("records_examined", 0) for item in _JSONL_READ_METADATA.values()),
+        "bytes_read": sum(item.get("bytes_read", 0) for item in _JSONL_READ_METADATA.values()),
+        "max_records": limit if limit is not None else AUTOMATIC_MAX_RECORDS,
+        "max_bytes": AUTOMATIC_MAX_BYTES,
+        "source_size_bytes": sum(item.get("source_size_bytes", 0) for item in _JSONL_READ_METADATA.values()),
         "strict_real_sources": STRICT_REAL_SOURCES,
         "skipped_non_real_count": skipped_non_real_count,
         "skipped_non_real_by_source": dict(sorted(skipped_non_real_by_source.items())),

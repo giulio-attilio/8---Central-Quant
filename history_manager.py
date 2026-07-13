@@ -26,6 +26,13 @@ from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+from history_memory_guard import (
+    AUTOMATIC_MAX_BYTES,
+    AUTOMATIC_MAX_RECORDS,
+    iter_jsonl_tail,
+    validate_history_limits,
+)
+
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 
@@ -68,7 +75,14 @@ def ensure_history_files():
 ensure_history_files()
 
 
-HISTORY_MAX_READ = int(os.environ.get("HISTORY_MAX_READ", "2000"))
+HISTORY_MAX_READ = min(
+    AUTOMATIC_MAX_RECORDS,
+    max(1, int(os.environ.get("HISTORY_MAX_READ", str(AUTOMATIC_MAX_RECORDS)))),
+)
+HISTORY_MAX_BYTES = min(
+    AUTOMATIC_MAX_BYTES,
+    max(1, int(os.environ.get("HISTORY_MAX_BYTES", str(AUTOMATIC_MAX_BYTES)))),
+)
 HISTORY_REPORT_DAYS = int(os.environ.get("HISTORY_REPORT_DAYS", "7"))
 HISTORY_DEDUP_ENABLED = str(os.environ.get("HISTORY_DEDUP_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
 HISTORY_DEDUP_MAX_KEYS = int(os.environ.get("HISTORY_DEDUP_MAX_KEYS", "5000"))
@@ -123,26 +137,33 @@ def _append_jsonl(path: Path, item: dict):
         return False
 
 
-def _read_jsonl_tail(path: Path, limit=None):
+def _read_jsonl_tail(path: Path, limit=None, max_bytes=None, include_metadata=False, operation=None):
     try:
-        limit = int(limit or HISTORY_MAX_READ)
-        if not path.exists():
-            return []
-        with path.open("r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
-        rows = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                rows.append({"raw": line})
-        return rows
+        limit, max_bytes = validate_history_limits(
+            limit if limit is not None else HISTORY_MAX_READ,
+            max_bytes if max_bytes is not None else HISTORY_MAX_BYTES,
+        )
+        result = iter_jsonl_tail(
+            path,
+            max_records=limit,
+            max_bytes=max_bytes,
+            invalid_as_raw=True,
+            operation=operation or f"history_manager:{Path(path).name}",
+        )
+        return result if include_metadata else result["records"]
+    except ValueError:
+        raise
     except Exception as exc:
-        print(f"ERRO HISTORY read_jsonl {path}: {exc}")
-        return []
+        print(f"ERRO HISTORY read_jsonl {Path(path).name}: {type(exc).__name__}")
+        empty = {
+            "records": [], "partial": False, "coverage_complete": False,
+            "records_examined": 0, "bytes_read": 0,
+            "max_records": int(limit or HISTORY_MAX_READ),
+            "max_bytes": int(max_bytes or HISTORY_MAX_BYTES),
+            "source_size_bytes": 0, "invalid_lines": 0,
+            "incomplete_last_line": False, "read_error": type(exc).__name__,
+        }
+        return empty if include_metadata else []
 
 
 def _count_jsonl(path: Path):
@@ -1323,10 +1344,17 @@ def wrap_central_functions(globals_dict):
     return True
 
 
-def load_events(limit=None, filters=None):
-    events = _read_jsonl_tail(HISTORY_EVENTS_FILE, limit=limit or HISTORY_MAX_READ)
+def load_events(limit=None, filters=None, max_bytes=None, include_metadata=False):
+    page = _read_jsonl_tail(
+        HISTORY_EVENTS_FILE,
+        limit=limit if limit is not None else HISTORY_MAX_READ,
+        max_bytes=max_bytes if max_bytes is not None else HISTORY_MAX_BYTES,
+        include_metadata=True,
+        operation="history_manager.load_events",
+    )
+    events = page["records"]
     if not filters:
-        return events
+        return page if include_metadata else events
 
     filters = filters or {}
     bot = str(filters.get("bot") or "").strip().upper()
@@ -1376,6 +1404,11 @@ def load_events(limit=None, filters=None):
         if not _match_date(event.get("ts")):
             continue
         filtered.append(event)
+    if include_metadata:
+        page = dict(page)
+        page["records"] = filtered
+        page["records_matched"] = len(filtered)
+        return page
     return filtered
 
 
@@ -1528,7 +1561,12 @@ def query_history(bot=None, symbol=None, setup=None, side=None, result=None, day
             cutoff = (agora_sp() - timedelta(days=days_value)).strftime("%d/%m/%Y %H:%M")
             filters["date_from"] = cutoff
 
-    events = load_events(limit=limit or HISTORY_MAX_READ, filters=filters)
+    page = load_events(
+        limit=limit if limit is not None else HISTORY_MAX_READ,
+        filters=filters,
+        include_metadata=True,
+    )
+    events = page["records"]
     return {
         "filters": {
             "bot": bot or None,
@@ -1541,6 +1579,10 @@ def query_history(bot=None, symbol=None, setup=None, side=None, result=None, day
         },
         "stats": calculate_stats(rows=events),
         "events": events,
+        **{key: page[key] for key in (
+            "partial", "coverage_complete", "records_examined", "bytes_read",
+            "max_records", "max_bytes", "source_size_bytes",
+        )},
     }
 
 
@@ -1644,7 +1686,11 @@ def group_stats(group_by="bot", events=None, filters=None):
 
 
 def build_history_payload(limit=None):
-    events = load_events(limit=limit or HISTORY_MAX_READ)
+    page = load_events(
+        limit=limit if limit is not None else HISTORY_MAX_READ,
+        include_metadata=True,
+    )
+    events = page["records"]
     events = [event for event in events if not is_admin_event(event)]
     by_event = Counter()
     by_bot = Counter()
@@ -1695,6 +1741,10 @@ def build_history_payload(limit=None):
     return {
         "ok": True,
         "generated_at": data_hora_sp_str(),
+        **{key: page[key] for key in (
+            "partial", "coverage_complete", "records_examined", "bytes_read",
+            "max_records", "max_bytes", "source_size_bytes",
+        )},
         "files": {
             "history_events": str(HISTORY_EVENTS_FILE),
             "decision_log": str(DECISION_LOG_FILE),
@@ -1703,6 +1753,7 @@ def build_history_payload(limit=None):
             "closed_trades": str(CLOSED_TRADES_FILE),
         },
         "totals": {
+            "scope": "BOUNDED_TAIL" if page["partial"] else "COMPLETE_SOURCE",
             "events": len(events),
             "signals": by_event.get("SIGNAL_CREATED", 0),
             "opened": by_event.get("TRADE_OPENED", 0),
@@ -1744,8 +1795,9 @@ def build_history_report(days=None):
     lines = [
         "📚 SUPER HISTORY — CENTRAL QUANT",
         f"Data/hora: {payload.get('generated_at')}",
+        f"Cobertura: {'PARCIAL (cauda limitada)' if payload.get('partial') else 'COMPLETA'}",
         "",
-        "Eventos registrados:",
+        "Eventos examinados na cauda:" if payload.get("partial") else "Eventos registrados:",
         f"Sinais: {totals.get('signals', 0)}",
         f"Entradas: {totals.get('opened', 0)}",
         f"Encerrados: {totals.get('closed', 0)}",
@@ -1754,7 +1806,7 @@ def build_history_report(days=None):
         f"BE: {totals.get('breakeven', 0)}",
         f"Trailing: {totals.get('trailing', 0)}",
         "",
-        "Performance registrada:",
+        "Performance da cauda examinada:" if payload.get("partial") else "Performance registrada:",
         f"Wins: {perf.get('wins', 0)} | Losses: {perf.get('losses', 0)} | BE: {perf.get('breakeven', 0)}",
         f"Win rate: {perf.get('win_rate_pct', 0)}%",
         f"PnL total: {perf.get('pnl_total_pct', 0)}%",

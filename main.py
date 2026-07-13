@@ -13443,20 +13443,15 @@ def _append_jsonl(path, item):
 
 def _read_jsonl_tail(path, limit=50):
     try:
-        if not path.exists():
-            return []
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-int(limit):]
-        rows = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                rows.append({"raw": line})
-        return rows
+        from history_memory_guard import AUTOMATIC_MAX_BYTES, iter_jsonl_tail
+
+        return iter_jsonl_tail(
+            path,
+            max_records=int(limit),
+            max_bytes=AUTOMATIC_MAX_BYTES,
+            invalid_as_raw=True,
+            operation=f"main.jsonl_tail:{Path(path).name}",
+        )["records"]
     except Exception as exc:
         print(f"ERRO read_jsonl_tail {path}:", exc)
         return []
@@ -17954,7 +17949,7 @@ def _event_epoch_value(event):
     return None
 
 
-def _history_events_for_period(start_dt, end_dt, limit=20000):
+def _history_events_for_period(start_dt, end_dt, limit=10000):
     try:
         import history_manager as super_history_manager
         if hasattr(super_history_manager, "load_events"):
@@ -18761,7 +18756,7 @@ def _executive_monthly_health_block(start_dt, end_dt):
 def build_executive_report_monthly():
     """Relatório mensal consolidando o mês anterior com Executive Monthly Report V2."""
     start_dt, end_dt, month_key, month_label = _month_bounds_previous()
-    events = _history_events_for_period(start_dt, end_dt, limit=30000)
+    events = _history_events_for_period(start_dt, end_dt, limit=10000)
 
     by_event = {}
     blocked_by_reason = {}
@@ -19485,13 +19480,19 @@ def build_history_stats_payload():
         return {"ok": False, "error": str(exc)}
 
     try:
+        page = super_history_manager.load_events(include_metadata=True)
+        events = page["records"]
         return {
             "ok": True,
             "generated_at": super_history_manager.data_hora_sp_str(),
-            "general": super_history_manager.calculate_stats(),
-            "by_bot": super_history_manager.group_stats(group_by="bot"),
-            "by_symbol": super_history_manager.group_stats(group_by="symbol"),
-            "by_setup": super_history_manager.group_stats(group_by="setup"),
+            "general": super_history_manager.calculate_stats(events=events),
+            "by_bot": super_history_manager.group_stats(group_by="bot", events=events),
+            "by_symbol": super_history_manager.group_stats(group_by="symbol", events=events),
+            "by_setup": super_history_manager.group_stats(group_by="setup", events=events),
+            **{key: page[key] for key in (
+                "partial", "coverage_complete", "records_examined", "bytes_read",
+                "max_records", "max_bytes", "source_size_bytes",
+            )},
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -26542,7 +26543,14 @@ def history_events_route():
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
-    limit = request.args.get("limit", default="50", type=int)
+    limit = request.args.get("limit", default=50, type=int)
+    max_bytes = request.args.get("max_bytes", default=16 * 1024 * 1024, type=int)
+    try:
+        from history_memory_guard import validate_history_limits
+
+        limit, max_bytes = validate_history_limits(limit, max_bytes)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_HISTORY_LIMIT", "detail": str(exc)}, 400
     bot = request.args.get("bot", default="", type=str)
     symbol = request.args.get("symbol", default="", type=str)
     event_type = request.args.get("event_type", default="", type=str)
@@ -26555,8 +26563,14 @@ def history_events_route():
     if event_type:
         filters["event_type"] = event_type
 
-    events = super_history_manager.load_events(limit=limit, filters=filters)
-    return {"ok": True, "count": len(events), "events": events}
+    page = super_history_manager.load_events(
+        limit=limit,
+        max_bytes=max_bytes,
+        filters=filters,
+        include_metadata=True,
+    )
+    events = page.pop("records")
+    return {"ok": True, "count": len(events), "events": events, **page}
 
 
 @app.route("/history/events/latest")
@@ -26584,6 +26598,12 @@ def history_query_route():
     result = request.args.get("result", default="", type=str)
     days = request.args.get("days", default="", type=str)
     limit = request.args.get("limit", default="50", type=str)
+    try:
+        from history_memory_guard import validate_history_limits
+
+        validate_history_limits(limit, 16 * 1024 * 1024)
+    except ValueError as exc:
+        return {"ok": False, "error": "INVALID_HISTORY_LIMIT", "detail": str(exc)}, 400
 
     return {
         "ok": True,
@@ -41985,24 +42005,17 @@ def _pppa_v1_public(value, max_string=500):
 
 
 def _pppa_v1_read_jsonl_tail(path, limit=1000):
-    from collections import deque
-    p = Path(str(path))
-    rows = deque(maxlen=max(1, int(limit or 1000)))
-    if not p.exists():
-        return []
     try:
-        with p.open("r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                line = str(line or "").strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    obj = {"raw": line}
-                if isinstance(obj, dict):
-                    rows.append(obj)
-        return list(rows)
+        from history_memory_guard import AUTOMATIC_MAX_BYTES, iter_jsonl_tail
+
+        p = Path(str(path))
+        return iter_jsonl_tail(
+            p,
+            max_records=max(1, int(limit or 1000)),
+            max_bytes=AUTOMATIC_MAX_BYTES,
+            invalid_as_raw=True,
+            operation=f"predator_audit:{p.name}",
+        )["records"]
     except Exception:
         return []
 

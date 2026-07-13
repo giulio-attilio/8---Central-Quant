@@ -249,6 +249,25 @@ def test_main_health_only_merges_lightweight_learning_contract():
         "auto_learning_refresh_disabled_reason": "DISABLED_BY_POLICY",
     }
     calls = []
+    forbidden_calls = []
+
+    def forbidden(name):
+        return lambda *args, **kwargs: forbidden_calls.append(name) or pytest.fail(
+            f"health attempted forbidden operation: {name}"
+        )
+
+    disk = {
+        "disk_forensics_available": False,
+        "disk_forensics_usage_pct": None,
+        "disk_forensics_free_mb": None,
+        "disk_forensics_partial": None,
+        "disk_forensics_largest_file": None,
+        "disk_forensics_largest_file_mb": None,
+    }
+    timeline = {
+        "timeline_emergency_recovery_enabled": False,
+        "timeline_emergency_recovery_status": "DISABLED",
+    }
     namespace = {
         "central_watchdog_status": lambda: {"ok": True},
         "central_trade_registry_snapshot": lambda include_trades=False: {"ok": True},
@@ -259,6 +278,15 @@ def test_main_health_only_merges_lightweight_learning_contract():
         "LEARNING_AUTO_REFRESH_MIN_SECONDS": 300,
         "LEARNING_AUTO_REFRESH_THREAD_STARTED": False,
         "LEARNING_AUTO_REFRESH_LEGACY_ENABLED": True,
+        "build_disk_forensics_health": lambda cached: disk.copy(),
+        "STARTUP_DISK_FORENSICS_RESULT": {"ok": False},
+        "build_timeline_emergency_recovery_health": lambda cached: timeline.copy(),
+        "TIMELINE_EMERGENCY_RECOVERY_RESULT": {"enabled": False},
+        "load_events": forbidden("history_events"),
+        "iter_jsonl_tail": forbidden("iter_jsonl_tail"),
+        "open": forbidden("filesystem"),
+        "redis": forbidden("redis"),
+        "socket": forbidden("network"),
     }
     result = _compile_function(_function_node("health"), namespace)()
     assert calls == [
@@ -266,6 +294,9 @@ def test_main_health_only_merges_lightweight_learning_contract():
     ]
     for key, value in expected.items():
         assert result[key] == value
+    for key, value in {**disk, **timeline}.items():
+        assert result[key] == value
+    assert forbidden_calls == []
 
 
 def test_auto_status_is_lightweight_and_does_not_run_learning():

@@ -318,6 +318,32 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
         "auto_daily_summaries_last_skipped_at": None,
         "auto_daily_summaries_skipped_bots": [],
     }
+    forbidden_calls = []
+
+    def forbidden(name):
+        return lambda *args, **kwargs: forbidden_calls.append(name) or pytest.fail(
+            f"health attempted forbidden operation: {name}"
+        )
+
+    learning = {
+        "auto_learning_refresh_enabled": False,
+        "auto_learning_refresh_thread_started": False,
+        "auto_learning_refresh_manual_available": True,
+        "auto_learning_refresh_interval_seconds": 900,
+        "auto_learning_refresh_disabled_reason": "DISABLED_BY_POLICY",
+    }
+    disk = {
+        "disk_forensics_available": True,
+        "disk_forensics_usage_pct": 50.0,
+        "disk_forensics_free_mb": 1024.0,
+        "disk_forensics_partial": False,
+        "disk_forensics_largest_file": "history_events.jsonl",
+        "disk_forensics_largest_file_mb": 295.0,
+    }
+    timeline = {
+        "timeline_emergency_recovery_enabled": False,
+        "timeline_emergency_recovery_status": "DISABLED",
+    }
     namespace = {
         "central_watchdog_status": lambda: {"ok": True},
         "central_trade_registry_snapshot": lambda include_trades=False: {
@@ -325,6 +351,20 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
             "include_trades": include_trades,
         },
         "automatic_daily_summaries_health": lambda: expected.copy(),
+        "automatic_learning_refresh_health": lambda **kwargs: learning.copy(),
+        "LEARNING_AUTO_REFRESH_SECONDS": 900,
+        "LEARNING_AUTO_REFRESH_MIN_SECONDS": 300,
+        "LEARNING_AUTO_REFRESH_THREAD_STARTED": False,
+        "LEARNING_AUTO_REFRESH_LEGACY_ENABLED": False,
+        "build_disk_forensics_health": lambda cached: disk.copy(),
+        "STARTUP_DISK_FORENSICS_RESULT": {"ok": True, "cached": True},
+        "build_timeline_emergency_recovery_health": lambda cached: timeline.copy(),
+        "TIMELINE_EMERGENCY_RECOVERY_RESULT": {"enabled": False},
+        "load_events": forbidden("history_events"),
+        "iter_jsonl_tail": forbidden("iter_jsonl_tail"),
+        "open": forbidden("filesystem"),
+        "redis": forbidden("redis"),
+        "socket": forbidden("network"),
     }
 
     result = _run_isolated_function(node, namespace)
@@ -333,6 +373,9 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
     assert result["trade_registry"]["include_trades"] is False
     for field, value in expected.items():
         assert result[field] == value
+    for field, value in {**learning, **disk, **timeline}.items():
+        assert result[field] == value
+    assert forbidden_calls == []
 
 
 def test_scanners_and_position_management_are_not_gated_by_daily_summary_flag():

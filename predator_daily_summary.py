@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from history_memory_guard import AUTOMATIC_MAX_BYTES, AUTOMATIC_MAX_RECORDS, iter_jsonl_tail
+
 
 VERSION = "2026-07-12-PREDATOR-DAILY-SUMMARY-FROM-EVENT-LOG-V1"
 _lock = threading.RLock()
@@ -69,15 +71,30 @@ def read_predator_event_log() -> Dict[str, Any]:
     events: List[Dict[str, Any]] = []
     invalid = 0
     warnings: List[str] = []
+    source_pages: List[Dict[str, Any]] = []
 
     def read_rows(source_path: Path, central_history: bool = False) -> None:
         nonlocal invalid
         if not source_path.exists():
             warnings.append(f"Fonte persistente não existe: {source_path}")
             return
-        for line in source_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        page = iter_jsonl_tail(
+            source_path,
+            max_records=AUTOMATIC_MAX_RECORDS,
+            max_bytes=AUTOMATIC_MAX_BYTES,
+            operation=(
+                "predator_daily_summary.history_events"
+                if central_history else "predator_daily_summary.predator_events"
+            ),
+        )
+        source_pages.append(page)
+        if page["partial"]:
+            warnings.append(
+                f"Fonte {source_path.name} limitada à cauda; métricas do período são parciais."
+            )
+        invalid += int(page.get("invalid_lines") or 0)
+        for row in page["records"]:
             try:
-                row = json.loads(line)
                 if isinstance(row, dict):
                     if central_history:
                         source = str(row.get("source") or "").upper()
@@ -108,8 +125,6 @@ def read_predator_event_log() -> Dict[str, Any]:
                         events.append(normalized)
                     else:
                         events.append(row)
-                else:
-                    invalid += 1
             except (TypeError, ValueError, json.JSONDecodeError):
                 invalid += 1
 
@@ -122,7 +137,23 @@ def read_predator_event_log() -> Dict[str, Any]:
     if invalid:
         warnings.append(f"Event logs contêm {invalid} linha(s) inválida(s).")
     ok = path.exists() or history_event_log_path().exists()
-    return {"ok": ok, "status": "LOADED" if ok else "EVENT_LOG_MISSING", "events": events, "invalid_lines": invalid, "warnings": warnings, "path": str(path), "history_path": str(history_event_log_path())}
+    partial = any(bool(page.get("partial")) for page in source_pages)
+    return {
+        "ok": ok,
+        "status": "LOADED" if ok else "EVENT_LOG_MISSING",
+        "events": events,
+        "invalid_lines": invalid,
+        "warnings": warnings,
+        "path": str(path),
+        "history_path": str(history_event_log_path()),
+        "partial": partial,
+        "coverage_complete": not partial,
+        "records_examined": sum(int(page.get("records_examined") or 0) for page in source_pages),
+        "bytes_read": sum(int(page.get("bytes_read") or 0) for page in source_pages),
+        "max_records": AUTOMATIC_MAX_RECORDS,
+        "max_bytes": AUTOMATIC_MAX_BYTES,
+        "source_size_bytes": sum(int(page.get("source_size_bytes") or 0) for page in source_pages),
+    }
 
 
 def load_events_for_period(date_prefix: str, memory_events: Optional[Iterable[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -150,6 +181,10 @@ def load_events_for_period(date_prefix: str, memory_events: Optional[Iterable[Di
         "warnings": warnings,
         "warning_count": len(warnings),
         "path": log.get("path"),
+        **{key: log.get(key) for key in (
+            "partial", "coverage_complete", "records_examined", "bytes_read",
+            "max_records", "max_bytes", "source_size_bytes",
+        )},
     }
 
 
