@@ -14,6 +14,8 @@
 from flask import Flask
 import os
 import json
+import logging
+import re
 import time
 import threading
 import requests
@@ -28,6 +30,9 @@ from predator_daily_summary import (
     daily_summary_health,
     load_events_for_period,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 # ====================================================
 # BROKER / EXECUÇÃO REAL SAFE MODE
@@ -546,6 +551,21 @@ def _predator_registry_trade_id(symbol, side, setup="SMART_PREDATOR"):
     return f"PREDATOR:{setup}:{nome_limpo(symbol)}:{side}"
 
 
+def _predator_registry_safe_text(value, limit=240):
+    text = str(value or "").replace("\r", " ").replace("\n", " ")
+    text = re.sub(
+        r"(?i)\b(token|authorization|api[_-]?key|secret|password)\b\s*[:=]\s*[^\s,;]+",
+        "[REDACTED]",
+        text,
+    )
+    return text[:limit]
+
+
+def _predator_registry_close_log(marker, **fields):
+    safe_fields = {key: value for key, value in fields.items() if value is not None}
+    LOGGER.warning("%s %s", marker, json.dumps(safe_fields, ensure_ascii=False, sort_keys=True, default=str))
+
+
 def registrar_trade_registry_open_predator(s, p=None):
     """Registra abertura no Trade Registry sem interferir na lógica do robô."""
     if not TRADE_REGISTRY_LOADED or register_open_trade is None:
@@ -619,13 +639,49 @@ def registrar_trade_registry_update_predator(p, event, **extra):
 
 
 def registrar_trade_registry_close_predator(p, exit_price, pnl_pct_value, pnl_r_value=None, reason=None):
-    if not TRADE_REGISTRY_LOADED or close_trade is None:
-        return None
-    try:
-        trade_id = p.get("trade_registry_id") or _predator_registry_trade_id(
-            p.get("symbol"), p.get("side"), p.get("signal_type", "SMART_PREDATOR")
+    explicit_trade_id = p.get("trade_registry_id")
+    fallback_trade_id = _predator_registry_trade_id(
+        p.get("symbol"), p.get("side"), p.get("signal_type", "SMART_PREDATOR")
+    )
+    trade_id = explicit_trade_id or fallback_trade_id
+    common = {
+        "symbol": p.get("symbol_clean") or p.get("symbol"),
+        "side": p.get("side"),
+        "bot": "PREDATOR",
+        "setup": p.get("signal_type") or "SMART_PREDATOR",
+    }
+    if not TRADE_REGISTRY_LOADED:
+        _predator_registry_close_log(
+            "PREDATOR_REGISTRY_CLOSE_SKIPPED", reason="REGISTRY_NOT_LOADED", trade_id=trade_id, **common
         )
-        return close_trade(
+        return {"ok": False, "status": "REGISTRY_NOT_LOADED", "attempted": False, "trade_id": trade_id, "registry_result": None}
+    if not callable(close_trade):
+        _predator_registry_close_log(
+            "PREDATOR_REGISTRY_CLOSE_SKIPPED", reason="CLOSE_TRADE_NOT_CALLABLE", trade_id=trade_id, **common
+        )
+        return {"ok": False, "status": "CLOSE_TRADE_NOT_CALLABLE", "attempted": False, "trade_id": trade_id, "registry_result": None}
+    if not trade_id:
+        _predator_registry_close_log(
+            "PREDATOR_REGISTRY_CLOSE_SKIPPED", reason="MISSING_TRADE_ID", trade_id="", **common
+        )
+        return {"ok": False, "status": "MISSING_TRADE_ID", "attempted": False, "trade_id": "", "registry_result": None}
+
+    _predator_registry_close_log(
+        "PREDATOR_REGISTRY_CLOSE_ATTEMPT",
+        trade_registry_id_present=bool(explicit_trade_id),
+        trade_registry_id=explicit_trade_id,
+        fallback_trade_id=fallback_trade_id,
+        trade_id=trade_id,
+        close_reason=reason,
+        exit_price=exit_price,
+        pnl_pct=pnl_pct_value,
+        pnl_r=pnl_r_value,
+        trade_registry_loaded=TRADE_REGISTRY_LOADED,
+        close_trade_callable=callable(close_trade),
+        **common,
+    )
+    try:
+        raw_result = close_trade(
             trade_id,
             exit_price=float(exit_price) if exit_price is not None else None,
             pnl_pct=float(pnl_pct_value) if pnl_pct_value is not None else None,
@@ -645,9 +701,50 @@ def registrar_trade_registry_close_predator(p, exit_price, pnl_pct_value, pnl_r_
                 "closed_by": "smart_predator",
             },
         )
+        result = raw_result if isinstance(raw_result, dict) else {}
+        result_ok = bool(result.get("ok"))
+        action = _predator_registry_safe_text(result.get("action"))
+        raw_status = _predator_registry_safe_text(result.get("status"))
+        error = _predator_registry_safe_text(result.get("error"))
+        result_reason = _predator_registry_safe_text(result.get("reason"))
+        if result_ok and action in {"TRADE_CLOSED", "CLOSED_TRADE_UPDATED"}:
+            status = action
+        elif raw_status == "TRADE_NOT_FOUND" or error == "TRADE_NOT_FOUND":
+            status = "TRADE_NOT_FOUND"
+        elif raw_status == "ERROR" or error:
+            status = "ERROR"
+        else:
+            status = "UNKNOWN_RESULT"
+        safe_result = {
+            "ok": result_ok,
+            "status": status,
+            "action": action or None,
+            "reason": result_reason or None,
+            "error": error or None,
+        }
+        _predator_registry_close_log(
+            "PREDATOR_REGISTRY_CLOSE_RESULT",
+            trade_id=trade_id,
+            return_type=type(raw_result).__name__,
+            **safe_result,
+        )
+        return {"ok": result_ok, "status": status, "attempted": True, "trade_id": trade_id, "registry_result": safe_result}
     except Exception as exc:
-        print("ERRO TRADE_REGISTRY CLOSE PREDATOR:", exc)
-        return None
+        error = _predator_registry_safe_text(exc)
+        _predator_registry_close_log(
+            "PREDATOR_REGISTRY_CLOSE_EXCEPTION",
+            exception_type=type(exc).__name__,
+            error=error,
+            trade_id=trade_id,
+            **common,
+        )
+        return {
+            "ok": False,
+            "status": "ERROR",
+            "attempted": True,
+            "trade_id": trade_id,
+            "registry_result": {"ok": False, "status": "ERROR", "error": error},
+        }
 
 
 def carregar_sweep_state():
