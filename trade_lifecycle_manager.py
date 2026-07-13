@@ -26,6 +26,7 @@ QUANTITY_TOLERANCE = 1e-9
 
 class LifecycleState(str, Enum):
     SIGNAL_DETECTED = "SIGNAL_DETECTED"
+    PAPER_POSITION_OPEN = "PAPER_POSITION_OPEN"
     DECISION_PENDING = "DECISION_PENDING"
     DECISION_ALLOWED = "DECISION_ALLOWED"
     DECISION_DENIED = "DECISION_DENIED"
@@ -62,6 +63,8 @@ class LifecycleState(str, Enum):
 
 class LifecycleEvent(str, Enum):
     SIGNAL_CREATED = "SIGNAL_CREATED"
+    PAPER_POSITION_OPENED = "PAPER_POSITION_OPENED"
+    PAPER_POSITION_CLOSED = "PAPER_POSITION_CLOSED"
     DECISION_PENDING_RECORDED = "DECISION_PENDING_RECORDED"
     DECISION_ALLOWED_RECORDED = "DECISION_ALLOWED_RECORDED"
     DECISION_DENIED_RECORDED = "DECISION_DENIED_RECORDED"
@@ -107,6 +110,10 @@ DYNAMIC = "__DYNAMIC__"
 TRANSITION_MATRIX: Dict[str, Dict[str, str]] = {
     LifecycleState.SIGNAL_DETECTED.value: {
         LifecycleEvent.DECISION_PENDING_RECORDED.value: LifecycleState.DECISION_PENDING.value,
+        LifecycleEvent.PAPER_POSITION_OPENED.value: LifecycleState.PAPER_POSITION_OPEN.value,
+    },
+    LifecycleState.PAPER_POSITION_OPEN.value: {
+        LifecycleEvent.PAPER_POSITION_CLOSED.value: LifecycleState.CLOSE_CONFIRMED.value,
     },
     LifecycleState.DECISION_PENDING.value: {
         LifecycleEvent.DECISION_ALLOWED_RECORDED.value: LifecycleState.DECISION_ALLOWED.value,
@@ -492,6 +499,10 @@ def create_lifecycle(payload: Dict[str, Any], persist: bool = True) -> Dict[str,
         snapshot["revision"] = 1
         snapshot["history"].append({
             "event_type": LifecycleEvent.EXTERNAL_POSITION_DETECTED.value if external else LifecycleEvent.SIGNAL_CREATED.value,
+            "event_id": payload.get("event_id"),
+            "trade_id": snapshot.get("trade_id"),
+            "lifecycle_id": lifecycle_id,
+            "mode": snapshot.get("mode"),
             "previous_state": "",
             "current_state": state,
             "occurred_at": str(payload.get("occurred_at") or snapshot["created_at"]),
@@ -606,6 +617,32 @@ def _validate_event_evidence(snapshot: Dict[str, Any], event: Dict[str, Any], ev
     supplied_trade = _event_value(event, "trade_id")
     if supplied_trade and str(supplied_trade) != str(snapshot.get("trade_id")):
         reasons.append("event trade_id does not match")
+    paper_events = {
+        LifecycleEvent.PAPER_POSITION_OPENED.value,
+        LifecycleEvent.PAPER_POSITION_CLOSED.value,
+    }
+    if event_type in paper_events and snapshot.get("mode") != "PAPER":
+        reasons.append("paper position event requires PAPER lifecycle mode")
+    if event_type in paper_events and str(_event_value(event, "registry_source_component") or "").upper().strip() != "TRADE_REGISTRY":
+        reasons.append("paper position event requires TRADE_REGISTRY evidence")
+    if event_type == LifecycleEvent.PAPER_POSITION_OPENED.value:
+        if str(_event_value(event, "registry_status", "status") or "").upper().strip() != "OPEN":
+            reasons.append("paper position opened requires Registry OPEN status")
+    if event_type == LifecycleEvent.PAPER_POSITION_CLOSED.value:
+        if str(_event_value(event, "registry_status", "status") or "").upper().strip() != "CLOSED":
+            reasons.append("paper position closed requires Registry CLOSED status")
+        if _event_value(event, "closed_at") in (None, ""):
+            reasons.append("paper position closed requires closed_at")
+        close_evidence = (
+            "exit_price",
+            "close_reason",
+            "pnl_pct",
+            "pnl_r",
+            "result_pct",
+            "result_r",
+        )
+        if not any(_event_value(event, key) not in (None, "") for key in close_evidence):
+            reasons.append("paper position closed requires exit evidence")
     if event_type == LifecycleEvent.ENTRY_INTENT_CREATED.value and not _event_value(event, "client_order_id"):
         reasons.append("client_order_id is required for entry intent")
     if event_type == LifecycleEvent.ENTRY_SUBMITTED.value and not (snapshot.get("client_order_id") or _event_value(event, "client_order_id")):
@@ -845,6 +882,10 @@ def apply_event(lifecycle_id: str, event: Dict[str, Any], persist: bool = True) 
             return _result(snapshot, ok=True, status="DUPLICATE_FILL", duplicate=True, warnings=warnings)
 
         current = str(snapshot.get("state") or "")
+        if current == LifecycleState.CLOSE_CONFIRMED.value and event_type == LifecycleEvent.PAPER_POSITION_CLOSED.value:
+            semantic_reasons = _validate_event_evidence(snapshot, normalized, event_type, current)
+            if not semantic_reasons:
+                return _result(snapshot, ok=True, status="PAPER_POSITION_ALREADY_CLOSED", duplicate=True, warnings=warnings)
         decision = validate_transition(current, event_type)
         target = TRANSITION_MATRIX.get(current, {}).get(event_type)
         if target == DYNAMIC:
@@ -889,6 +930,8 @@ def apply_event(lifecycle_id: str, event: Dict[str, Any], persist: bool = True) 
             "shadow_event_id": normalized.get("shadow_event_id"),
             "event_type": event_type,
             "lifecycle_id": lifecycle_id,
+            "trade_id": snapshot.get("trade_id"),
+            "mode": snapshot.get("mode"),
             "source_component": normalized["source_component"],
             "occurred_at": normalized["occurred_at"],
             "received_at": normalized["received_at"],

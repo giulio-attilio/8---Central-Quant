@@ -47,6 +47,20 @@ def event(event_type: str, number: int, **evidence):
     }
 
 
+def paper_event(event_type: str, number: int, **updates):
+    opened = event_type == "PAPER_POSITION_OPENED"
+    evidence = {
+        "trade_id": "TR-A",
+        "mode": "PAPER",
+        "registry_source_component": "TRADE_REGISTRY",
+        "registry_status": "OPEN" if opened else "CLOSED",
+    }
+    if not opened:
+        evidence.update({"closed_at": "2026-07-13T21:30:35+00:00", "exit_price": 101.0})
+    evidence.update(updates)
+    return event(event_type, number, **evidence)
+
+
 def create(manager, suffix: str = "A", **updates):
     result = manager.create_lifecycle(lifecycle_payload(suffix, **updates), persist=False)
     assert result["ok"]
@@ -529,3 +543,90 @@ def test_53_blocked_event_preserves_quantity_invariants(manager):
     assert after["quantity_filled"] == before["quantity_filled"]
     assert after["quantity_closed"] == before["quantity_closed"]
     assert after["quantity_open"] == pytest.approx(after["quantity_filled"] - after["quantity_closed"])
+
+
+def test_54_paper_state_events_and_transitions_are_explicit(manager):
+    assert manager.LifecycleState.PAPER_POSITION_OPEN.value == "PAPER_POSITION_OPEN"
+    assert manager.LifecycleEvent.PAPER_POSITION_OPENED.value == "PAPER_POSITION_OPENED"
+    assert manager.LifecycleEvent.PAPER_POSITION_CLOSED.value == "PAPER_POSITION_CLOSED"
+    assert manager.TRANSITION_MATRIX["SIGNAL_DETECTED"]["PAPER_POSITION_OPENED"] == "PAPER_POSITION_OPEN"
+    assert manager.TRANSITION_MATRIX["PAPER_POSITION_OPEN"]["PAPER_POSITION_CLOSED"] == "CLOSE_CONFIRMED"
+    assert "CLOSE_CONFIRMED" not in manager.TRANSITION_MATRIX["SIGNAL_DETECTED"]
+
+
+def test_55_paper_open_and_close_record_expected_history(manager):
+    created = create(manager, mode="PAPER", quantity_planned=0.0)
+    opened = manager.apply_event("LC-A", paper_event("PAPER_POSITION_OPENED", 1), persist=False)
+    closed = manager.apply_event("LC-A", paper_event("PAPER_POSITION_CLOSED", 2), persist=False)
+
+    assert created["current_state"] == "SIGNAL_DETECTED"
+    assert opened["current_state"] == "PAPER_POSITION_OPEN"
+    assert closed["current_state"] == "CLOSE_CONFIRMED"
+    history = closed["snapshot"]["history"]
+    assert [(item["previous_state"], item["current_state"]) for item in history] == [
+        ("", "SIGNAL_DETECTED"),
+        ("SIGNAL_DETECTED", "PAPER_POSITION_OPEN"),
+        ("PAPER_POSITION_OPEN", "CLOSE_CONFIRMED"),
+    ]
+    assert all(item.get("trade_id") == "TR-A" for item in history)
+    assert all(item.get("lifecycle_id") == "LC-A" for item in history)
+    assert all(item.get("mode") == "PAPER" for item in history)
+
+
+def test_56_paper_events_are_blocked_out_of_order(manager):
+    create(manager, mode="PAPER", quantity_planned=0.0)
+    paper_close = manager.apply_event("LC-A", paper_event("PAPER_POSITION_CLOSED", 1), persist=False)
+    live_close = manager.apply_event("LC-A", event("CLOSE_CONFIRMED", 2), persist=False)
+    assert paper_close["blocked"] and paper_close["current_state"] == "SIGNAL_DETECTED"
+    assert live_close["blocked"] and live_close["current_state"] == "SIGNAL_DETECTED"
+
+
+def test_57_live_lifecycle_rejects_paper_events(manager):
+    create(manager, mode="LIVE")
+    result = manager.apply_event("LC-A", paper_event("PAPER_POSITION_OPENED", 1), persist=False)
+    assert result["blocked"]
+    assert result["current_state"] == "SIGNAL_DETECTED"
+    assert "PAPER lifecycle mode" in " ".join(result["reasons"])
+
+
+def test_58_paper_open_and_close_are_idempotent(manager):
+    create(manager, mode="PAPER", quantity_planned=0.0)
+    opened_event = paper_event("PAPER_POSITION_OPENED", 1)
+    assert manager.apply_event("LC-A", opened_event, persist=False)["event_applied"]
+    assert manager.apply_event("LC-A", opened_event, persist=False)["duplicate"]
+
+    closed_event = paper_event("PAPER_POSITION_CLOSED", 2)
+    first_close = manager.apply_event("LC-A", closed_event, persist=False)
+    same_close = manager.apply_event("LC-A", closed_event, persist=False)
+    before_semantic_duplicate = manager.get_lifecycle("LC-A")["snapshot"]
+    different_close = manager.apply_event("LC-A", paper_event("PAPER_POSITION_CLOSED", 3), persist=False)
+    after_semantic_duplicate = manager.get_lifecycle("LC-A")["snapshot"]
+
+    assert first_close["event_applied"]
+    assert same_close["duplicate"]
+    assert different_close["duplicate"] and different_close["status"] == "PAPER_POSITION_ALREADY_CLOSED"
+    assert after_semantic_duplicate["updated_at"] == before_semantic_duplicate["updated_at"]
+    assert after_semantic_duplicate["close"] == before_semantic_duplicate["close"]
+    assert after_semantic_duplicate["outcome"] == before_semantic_duplicate["outcome"]
+    assert after_semantic_duplicate["divergences"] == before_semantic_duplicate["divergences"]
+
+
+def test_59_paper_events_preserve_trade_and_lifecycle_identity(manager):
+    create(manager, mode="PAPER", quantity_planned=0.0)
+    wrong_trade = manager.apply_event("LC-A", paper_event("PAPER_POSITION_OPENED", 1, trade_id="TR-OTHER"), persist=False)
+    wrong_lifecycle_event = paper_event("PAPER_POSITION_OPENED", 2)
+    wrong_lifecycle_event["lifecycle_id"] = "LC-OTHER"
+    wrong_lifecycle = manager.apply_event("LC-A", wrong_lifecycle_event, persist=False)
+    assert wrong_trade["blocked"]
+    assert wrong_lifecycle["blocked"]
+    assert manager.get_lifecycle("LC-A")["snapshot"]["state"] == "SIGNAL_DETECTED"
+
+
+def test_60_paper_open_closed_projection_matches_registry(manager):
+    create(manager, mode="PAPER", quantity_planned=0.0)
+    manager.apply_event("LC-A", paper_event("PAPER_POSITION_OPENED", 1), persist=False)
+    opened = manager.compare_with_registry("LC-A", {"trade_id": "TR-A", "mode": "PAPER", "status": "OPEN"})
+    manager.apply_event("LC-A", paper_event("PAPER_POSITION_CLOSED", 2), persist=False)
+    closed = manager.compare_with_registry("LC-A", {"trade_id": "TR-A", "mode": "PAPER", "status": "CLOSED"})
+    assert not any(item["field"] == "open_closed_status" for item in opened["differences"])
+    assert not any(item["field"] == "open_closed_status" for item in closed["differences"])

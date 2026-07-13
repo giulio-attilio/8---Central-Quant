@@ -210,6 +210,203 @@ def test_real_mode_difference_still_diverges_with_real_manager(monkeypatch, tmp_
     assert mode_difference["registry_value"] == "LIVE"
 
 
+def paper_registry_open(**updates):
+    payload = base(
+        mode="PAPER",
+        status="OPEN",
+        source_component="TRADE_REGISTRY",
+        quantity_planned=0.0,
+        event_id="REGISTRY-PAPER-OPEN",
+    )
+    payload.update(updates)
+    return payload
+
+
+def paper_registry_close(opened, **updates):
+    payload = copy.deepcopy(opened)
+    payload.update({
+        "status": "CLOSED",
+        "closed_at": "2026-07-13T21:30:35+00:00",
+        "exit_price": 101.0,
+        "close_reason": "SL",
+        "pnl_pct": 1.0,
+        "pnl_r": 0.5,
+        "event_id": "REGISTRY-PAPER-CLOSE",
+    })
+    payload.update(updates)
+    return payload
+
+
+def test_registry_paper_signal_opens_explicit_paper_lifecycle(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    payload = paper_registry_open()
+    original = copy.deepcopy(payload)
+
+    result = item.observe_event("SIGNAL_CREATED", payload, persist=False)
+
+    assert result["status"] == "APPLIED"
+    assert result["manager_result"]["current_state"] == "PAPER_POSITION_OPEN"
+    assert result["manager_result"]["paper_position_transition"]["applied"] is True
+    assert result["manager_result"]["paper_position_transition"]["derived_event_id"].startswith("CENTRAL-SHADOW-PAPER-EVENT-")
+    assert payload == original
+
+
+@pytest.mark.parametrize(
+    "mode_fields",
+    [
+        {"metadata": {"execution_mode": "PAPER"}},
+        {"registry_mode": "PAPER"},
+    ],
+)
+def test_registry_paper_mode_aliases_open_paper_lifecycle(monkeypatch, tmp_path, mode_fields):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    payload = paper_registry_open()
+    payload.pop("mode")
+    payload.update(mode_fields)
+
+    result = item.observe_event("SIGNAL_CREATED", payload, persist=False)
+
+    assert result["manager_result"]["snapshot"]["mode"] == "PAPER"
+    assert result["manager_result"]["current_state"] == "PAPER_POSITION_OPEN"
+
+
+@pytest.mark.parametrize(
+    "updates,removed,expected_reason",
+    [
+        ({}, "status", "REGISTRY_STATUS_IS_NOT_OPEN"),
+        ({"mode": "LIVE"}, None, "MODE_IS_NOT_PAPER"),
+        ({"mode": "UNKNOWN"}, None, "MODE_IS_NOT_PAPER"),
+    ],
+)
+def test_non_eligible_registry_signal_remains_signal_detected(monkeypatch, tmp_path, updates, removed, expected_reason):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    payload = paper_registry_open(**updates)
+    if removed:
+        payload.pop(removed)
+
+    result = item.observe_event("SIGNAL_CREATED", payload, persist=False)
+
+    assert result["manager_result"]["snapshot"]["state"] == "SIGNAL_DETECTED"
+    assert result["manager_result"]["paper_position_transition"]["reason"] == expected_reason
+
+
+def test_registry_paper_close_translates_and_reconciles_closed(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = paper_registry_open()
+    closed = paper_registry_close(opened)
+    original = copy.deepcopy(closed)
+    item.observe_event("SIGNAL_CREATED", opened, persist=False)
+
+    result = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+    reconciled = item.reconcile_trade(closed, persist=False)
+
+    assert result["status"] == "APPLIED"
+    assert result["manager_result"]["current_state"] == "CLOSE_CONFIRMED"
+    assert result["manager_result"]["paper_position_transition"]["derived_event_type"] == "PAPER_POSITION_CLOSED"
+    assert not any(row["field"] == "open_closed_status" for row in reconciled["comparison"]["differences"])
+    assert closed == original
+
+
+@pytest.mark.parametrize(
+    "removed,expected_reason",
+    [
+        (("closed_at",), "CLOSED_AT_MISSING"),
+        (("exit_price", "close_reason", "pnl_pct", "pnl_r", "result_pct", "result_r"), "PAPER_CLOSE_EVIDENCE_MISSING"),
+    ],
+)
+def test_incomplete_registry_paper_close_stays_blocked(monkeypatch, tmp_path, removed, expected_reason):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = paper_registry_open()
+    item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    closed = paper_registry_close(opened)
+    for key in removed:
+        closed.pop(key, None)
+
+    result = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+
+    assert result["status"] == "BLOCKED"
+    assert result["manager_result"]["snapshot"]["state"] == "PAPER_POSITION_OPEN"
+    assert result["manager_result"]["paper_position_transition"]["reason"] == expected_reason
+
+
+def test_live_close_contract_remains_blocked_from_signal_detected(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    live = base(mode="LIVE", status="OPEN", source_component="TRADE_REGISTRY", event_id="LIVE-OPEN")
+    item.observe_event("SIGNAL_CREATED", live, persist=False)
+    live_close = copy.deepcopy(live)
+    live_close.update({"status": "CLOSED", "closed_at": "2026-07-13T21:30:35+00:00", "exit_price": 101.0, "event_id": "LIVE-CLOSE"})
+
+    result = item.observe_event("CLOSE_CONFIRMED", live_close, persist=False)
+
+    assert result["status"] == "BLOCKED"
+    assert result["manager_result"]["current_state"] == "SIGNAL_DETECTED"
+    assert result["manager_result"]["paper_position_transition"]["reason"] == "MODE_IS_NOT_PAPER"
+
+
+def test_paper_close_without_lifecycle_does_not_create_one(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    closed = paper_registry_close(paper_registry_open())
+
+    result = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+
+    assert result["status"] == "BLOCKED"
+    assert result["manager_result"]["status"] == "LIFECYCLE_NOT_FOUND"
+    assert manager.trade_lifecycle_health()["lifecycle_count"] == 0
+
+
+def test_paper_close_is_idempotent_for_same_and_new_source_events(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = paper_registry_open()
+    closed = paper_registry_close(opened)
+    item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    first = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+    before = manager.get_lifecycle("LC-1")["snapshot"]
+    same = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+    newer = paper_registry_close(opened, event_id="REGISTRY-PAPER-CLOSE-2")
+    semantic_duplicate = item.observe_event("CLOSE_CONFIRMED", newer, persist=False)
+    after = manager.get_lifecycle("LC-1")["snapshot"]
+
+    assert first["status"] == "APPLIED"
+    assert same["status"] == "DUPLICATE"
+    assert semantic_duplicate["status"] == "DUPLICATE"
+    assert semantic_duplicate["manager_result"]["status"] == "PAPER_POSITION_ALREADY_CLOSED"
+    assert after["updated_at"] == before["updated_at"]
+    assert after["close"] == before["close"]
+    assert after["outcome"] == before["outcome"]
+    assert after["divergences"] == before["divergences"]
+
+
+def test_registry_closed_against_open_paper_lifecycle_is_real_divergence(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = paper_registry_open()
+    item.observe_event("SIGNAL_CREATED", opened, persist=False)
+
+    reconciled = item.reconcile_trade(paper_registry_close(opened), persist=False)
+
+    assert any(row["field"] == "open_closed_status" for row in reconciled["comparison"]["differences"])
+
+
+def test_registry_external_paper_position_never_enters_paper_lifecycle(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    external = paper_registry_open(external_position=True, bot="FALCON")
+
+    result = item.observe_event("EXTERNAL_POSITION", external, persist=False)
+
+    assert result["manager_result"]["snapshot"]["state"] == "MANUAL_POSITION_DETECTED"
+    assert result["manager_result"]["snapshot"]["bot"] == ""
+    assert result["manager_result"]["paper_position_transition"]["reason"] == "EXTERNAL_OR_MANUAL_POSITION"
+
+
 def test_two_bots_same_symbol_remain_independent(tmp_path):
     manager = FakeManager()
     item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)

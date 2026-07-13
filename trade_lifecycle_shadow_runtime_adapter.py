@@ -120,6 +120,54 @@ def _resolve_lifecycle_id(record: Mapping[str, Any], canonical_identity: Mapping
     return {"value": f"CENTRAL-SHADOW-LIFECYCLE-{digest.upper()}", "source": "DERIVED_CANONICAL_IDENTITY"}
 
 
+def _upper_first(record: Mapping[str, Any], keys: Iterable[str]) -> str:
+    return str(_first(record, keys) or "").upper().strip()
+
+
+def _derived_paper_event_id(source_event_id: str, lifecycle_id: str, event_type: str) -> str:
+    material = f"{source_event_id}|{lifecycle_id}|{event_type}"
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32].upper()
+    return f"CENTRAL-SHADOW-PAPER-EVENT-{digest}"
+
+
+def _paper_event(event_type: str, source_event_id: str, lifecycle_id: str, trade_id: str, original: Mapping[str, Any]) -> Dict[str, Any]:
+    evidence = {
+        "trade_id": trade_id,
+        "mode": "PAPER",
+        "registry_status": _upper_first(original, ("status",)),
+        "registry_source_component": "TRADE_REGISTRY",
+        "source_event_id": source_event_id,
+    }
+    if event_type == "PAPER_POSITION_CLOSED":
+        evidence["closed_at"] = _first(original, ("closed_at",))
+        for key in ("exit_price", "close_reason", "pnl_pct", "pnl_r", "result_pct", "result_r"):
+            value = _first(original, (key,))
+            if value not in (None, ""):
+                evidence[key] = value
+    occurred_at = _first(original, ("occurred_at", "timestamp", "updated_at", "last_update", "closed_at", "opened_at")) or _now()
+    return {
+        "event_id": _derived_paper_event_id(source_event_id, lifecycle_id, event_type),
+        "event_type": event_type,
+        "lifecycle_id": lifecycle_id,
+        "source_component": "TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER",
+        "occurred_at": str(occurred_at),
+        "evidence": evidence,
+        "payload": {"registry_event_type": "SIGNAL_CREATED" if event_type == "PAPER_POSITION_OPENED" else "CLOSE_CONFIRMED"},
+    }
+
+
+def _manager_result_summary(result: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "ok": bool(result.get("ok")),
+        "status": result.get("status"),
+        "event_applied": bool(result.get("event_applied")),
+        "duplicate": bool(result.get("duplicate")),
+        "lifecycle_id": result.get("lifecycle_id"),
+        "trade_id": result.get("trade_id"),
+        "current_state": result.get("current_state"),
+    }
+
+
 class TradeLifecycleShadowRuntimeAdapter:
     """Thread-safe, fail-open adapter with no operational authority."""
 
@@ -165,6 +213,64 @@ class TradeLifecycleShadowRuntimeAdapter:
         digest = hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
         return f"CENTRAL-SHADOW-EVENT-{digest[:32].upper()}"
 
+    def _manager_snapshot(self, lifecycle_id: str) -> Dict[str, Any]:
+        getter = getattr(self.manager, "get_lifecycle", None)
+        if not callable(getter):
+            return {}
+        result = getter(lifecycle_id)
+        return copy.deepcopy(result.get("snapshot") or {}) if isinstance(result, dict) else {}
+
+    @staticmethod
+    def _paper_open_skip_reason(original: Mapping[str, Any], external: bool, identity: Mapping[str, str], lifecycle_id: str, create_result: Mapping[str, Any]) -> Optional[str]:
+        if external:
+            return "EXTERNAL_OR_MANUAL_POSITION"
+        if _upper_first(original, ("source_component",)) != "TRADE_REGISTRY":
+            return "SOURCE_IS_NOT_TRADE_REGISTRY"
+        if _upper_first(original, ("mode", "execution_mode", "registry_mode")) != "PAPER":
+            return "MODE_IS_NOT_PAPER"
+        if _upper_first(original, ("status",)) != "OPEN":
+            return "REGISTRY_STATUS_IS_NOT_OPEN"
+        supplied_trade_id = str(_first(original, ("trade_id", "canonical_trade_id")) or "").strip()
+        if not supplied_trade_id or supplied_trade_id != str(identity.get("value") or ""):
+            return "TRADE_ID_MISSING_OR_MISMATCHED"
+        if not lifecycle_id:
+            return "LIFECYCLE_ID_MISSING"
+        if not create_result.get("ok") or not create_result.get("event_applied") or create_result.get("duplicate"):
+            return "LIFECYCLE_NOT_NEWLY_CREATED"
+        snapshot = create_result.get("snapshot") if isinstance(create_result.get("snapshot"), Mapping) else {}
+        if str(snapshot.get("lifecycle_id") or "") != lifecycle_id or str(snapshot.get("trade_id") or "") != supplied_trade_id:
+            return "CREATED_LIFECYCLE_IDENTITY_MISMATCH"
+        if snapshot.get("state") != "SIGNAL_DETECTED" or snapshot.get("mode") != "PAPER":
+            return "CREATED_LIFECYCLE_STATE_OR_MODE_MISMATCH"
+        return None
+
+    @staticmethod
+    def _paper_close_skip_reason(original: Mapping[str, Any], external: bool, identity: Mapping[str, str], lifecycle_id: str, snapshot: Mapping[str, Any]) -> Optional[str]:
+        if external:
+            return "EXTERNAL_OR_MANUAL_POSITION"
+        if _upper_first(original, ("source_component",)) != "TRADE_REGISTRY":
+            return "SOURCE_IS_NOT_TRADE_REGISTRY"
+        if _upper_first(original, ("mode", "execution_mode", "registry_mode")) != "PAPER":
+            return "MODE_IS_NOT_PAPER"
+        if _upper_first(original, ("status",)) != "CLOSED":
+            return "REGISTRY_STATUS_IS_NOT_CLOSED"
+        if _first(original, ("closed_at",)) in (None, ""):
+            return "CLOSED_AT_MISSING"
+        if not any(_first(original, (key,)) not in (None, "") for key in ("exit_price", "close_reason", "pnl_pct", "pnl_r", "result_pct", "result_r")):
+            return "PAPER_CLOSE_EVIDENCE_MISSING"
+        supplied_trade_id = str(_first(original, ("trade_id", "canonical_trade_id")) or "").strip()
+        if not supplied_trade_id or supplied_trade_id != str(identity.get("value") or ""):
+            return "TRADE_ID_MISSING_OR_MISMATCHED"
+        if not snapshot:
+            return "LIFECYCLE_NOT_FOUND"
+        if str(snapshot.get("lifecycle_id") or "") != lifecycle_id or str(snapshot.get("trade_id") or "") != supplied_trade_id:
+            return "LIFECYCLE_IDENTITY_MISMATCH"
+        if snapshot.get("mode") != "PAPER":
+            return "LIFECYCLE_MODE_IS_NOT_PAPER"
+        if snapshot.get("state") not in {"PAPER_POSITION_OPEN", "CLOSE_CONFIRMED"}:
+            return "LIFECYCLE_IS_NOT_PAPER_POSITION_OPEN"
+        return None
+
     def observe_event(self, event_type: str, payload: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
         """Normalize and forward a factual event; never propagate an exception."""
         try:
@@ -181,16 +287,42 @@ class TradeLifecycleShadowRuntimeAdapter:
             if not lifecycle_id:
                 return self._result("INSUFFICIENT_IDENTITY", ok=False, forwarded=False, reasons=["canonical trade identity missing"])
             event_id = self._event_id(canonical, identity["value"] or lifecycle_id, original)
-            key = f"{lifecycle_id}|{canonical}|{event_id}"
             with self._lock:
                 self._metrics["observed"] += 1
+                manager_event_type = canonical
+                paper_transition = {
+                    "source_event_type": canonical,
+                    "derived_event_type": None,
+                    "attempted": False,
+                    "applied": False,
+                    "status": "NOT_APPLICABLE",
+                    "reason": None,
+                }
+                if canonical == "CLOSE_CONFIRMED":
+                    current_snapshot = self._manager_snapshot(lifecycle_id)
+                    skip_reason = self._paper_close_skip_reason(original, external, identity, lifecycle_id, current_snapshot)
+                    paper_transition.update({
+                        "status": "SKIPPED" if skip_reason else "ELIGIBLE",
+                        "reason": skip_reason,
+                        "lifecycle_state_before": current_snapshot.get("state"),
+                    })
+                    if skip_reason is None:
+                        manager_event_type = "PAPER_POSITION_CLOSED"
+                        paper_transition["derived_event_type"] = manager_event_type
+
+                key = f"{lifecycle_id}|{manager_event_type}|{event_id}"
                 if key in self._seen:
                     self._metrics["duplicate"] += 1
                     return self._result("DUPLICATE", duplicate=True, event_id=event_id, lifecycle_id=lifecycle_id, lifecycle_id_source=lifecycle["source"], identity_source=identity["source"])
-                event = {"event_id": event_id, "event_type": canonical, "lifecycle_id": lifecycle_id, "source_component": str(_first(original, ("source_component", "source")) or "SHADOW_RUNTIME_ADAPTER"), "occurred_at": str(_first(original, ("occurred_at", "timestamp", "updated_at")) or _now()), "evidence": _json_safe(original.get("evidence") or original), "payload": _json_safe(original)}
+                event = {"event_id": event_id, "event_type": manager_event_type, "lifecycle_id": lifecycle_id, "source_component": str(_first(original, ("source_component", "source")) or "SHADOW_RUNTIME_ADAPTER"), "occurred_at": str(_first(original, ("occurred_at", "timestamp", "updated_at", "last_update", "closed_at", "opened_at")) or _now()), "evidence": _json_safe(original.get("evidence") or original), "payload": _json_safe(original)}
+                if manager_event_type == "PAPER_POSITION_CLOSED":
+                    event = _paper_event(manager_event_type, event_id, lifecycle_id, identity["value"], original)
+                    paper_transition.update({"attempted": True, "derived_event_id": event["event_id"]})
                 if canonical in {"SIGNAL_CREATED", "EXTERNAL_POSITION_DETECTED"}:
                     create_payload = copy.deepcopy(original)
                     create_payload.update({"lifecycle_id": lifecycle_id, "trade_id": "" if external else identity["value"], "external_position": external, "manual_position": external})
+                    create_payload.setdefault("event_id", event_id)
+                    create_payload.setdefault("occurred_at", event["occurred_at"])
                     canonical_mode = _first(original, ("mode", "execution_mode", "registry_mode"))
                     if canonical_mode not in (None, ""):
                         create_payload["mode"] = canonical_mode
@@ -199,13 +331,43 @@ class TradeLifecycleShadowRuntimeAdapter:
                         create_payload["setup"] = ""
                         create_payload["signal_id"] = ""
                         create_payload["decision_id"] = ""
-                    result = self.manager.create_lifecycle(create_payload, persist=persist)
+                    create_result = self.manager.create_lifecycle(create_payload, persist=persist)
+                    skip_reason = self._paper_open_skip_reason(original, external, identity, lifecycle_id, create_result)
+                    paper_transition.update({
+                        "status": "SKIPPED" if skip_reason else "ELIGIBLE",
+                        "reason": skip_reason,
+                        "lifecycle_create": _manager_result_summary(create_result),
+                    })
+                    if skip_reason is None:
+                        paper_event = _paper_event("PAPER_POSITION_OPENED", event_id, lifecycle_id, identity["value"], original)
+                        paper_transition.update({"attempted": True, "derived_event_type": paper_event["event_type"], "derived_event_id": paper_event["event_id"]})
+                        paper_result = self.manager.apply_event(lifecycle_id, paper_event, persist=persist)
+                        result = copy.deepcopy(paper_result)
+                        result["lifecycle_create"] = _manager_result_summary(create_result)
+                        paper_transition.update({
+                            "applied": bool(paper_result.get("event_applied")),
+                            "status": paper_result.get("status"),
+                            "reason": "; ".join(str(item) for item in (paper_result.get("reasons") or [])) or None,
+                            "lifecycle_state_after": paper_result.get("current_state"),
+                        })
+                    else:
+                        result = copy.deepcopy(create_result)
+                    result["paper_position_transition"] = copy.deepcopy(paper_transition)
                 elif canonical == "TRADE_UPDATED":
                     # Lifecycle V3 has no dedicated generic-update transition. Keep this as a shadow-only observation
                     # without mutating lifecycle state or implying a management/TP/close transition.
                     result = {"ok": True, "event_applied": False, "duplicate": False, "blocked": False, "status": "NOOP", "warning": "TRADE_UPDATED is a registry-side observation and does not map to a lifecycle transition"}
                 else:
                     result = self.manager.apply_event(lifecycle_id, event, persist=persist)
+                    if canonical == "CLOSE_CONFIRMED":
+                        paper_transition.update({
+                            "applied": bool(result.get("event_applied")),
+                            "status": result.get("status"),
+                            "reason": paper_transition.get("reason") or "; ".join(str(item) for item in (result.get("reasons") or [])) or None,
+                            "lifecycle_state_after": result.get("current_state"),
+                        })
+                        result = copy.deepcopy(result)
+                        result["paper_position_transition"] = copy.deepcopy(paper_transition)
                 if result.get("duplicate"):
                     self._seen.add(key)
                     self._metrics["duplicate"] += 1
@@ -217,7 +379,7 @@ class TradeLifecycleShadowRuntimeAdapter:
                 else:
                     self._metrics["blocked"] += 1
                     status = "BLOCKED"
-                journal = {"timestamp": _now(), "event_id": event_id, "event_type": canonical, "lifecycle_id": lifecycle_id, "lifecycle_id_source": lifecycle["source"], "identity": identity, "identity_source": identity["source"], "status": status, "manager_result": _json_safe(result)}
+                journal = {"timestamp": _now(), "event_id": event_id, "event_type": manager_event_type, "source_event_type": canonical, "lifecycle_id": lifecycle_id, "lifecycle_id_source": lifecycle["source"], "identity": identity, "identity_source": identity["source"], "status": status, "paper_position_transition": _json_safe(paper_transition), "manager_result": _json_safe(result)}
                 if persist:
                     self._append(self.events_file, journal)
                     self._persist_state()
