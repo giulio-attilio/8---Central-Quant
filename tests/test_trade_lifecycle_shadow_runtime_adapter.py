@@ -73,6 +73,143 @@ def test_normalization_and_payload_immutability(adapter):
     assert adapter.manager.created[0]["trade_id"] == "TR-1"
 
 
+@pytest.mark.parametrize(
+    "mode_fields,expected",
+    [
+        ({"metadata": {"execution_mode": "PAPER"}}, "PAPER"),
+        ({"execution_mode": "LIVE"}, "LIVE"),
+        ({"metadata": {"mode": "PAPER"}}, "PAPER"),
+        ({"registry_mode": "PAPER"}, "PAPER"),
+        ({"metadata": {"registry_mode": "PAPER"}}, "PAPER"),
+    ],
+)
+def test_signal_mode_alias_is_canonicalized_for_manager(tmp_path, mode_fields, expected):
+    manager = FakeManager()
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = base()
+    payload.pop("mode")
+    payload.update(mode_fields)
+
+    result = item.observe_event("SIGNAL", payload, persist=False)
+
+    assert result["status"] == "APPLIED"
+    assert manager.created[0]["mode"] == expected
+
+
+@pytest.mark.parametrize(
+    "mode_fields,expected",
+    [
+        ({"mode": "LIVE", "execution_mode": "PAPER", "registry_mode": "VERIFY"}, "LIVE"),
+        ({"execution_mode": "PAPER", "registry_mode": "LIVE"}, "PAPER"),
+    ],
+)
+def test_signal_mode_alias_priority_is_deterministic(tmp_path, mode_fields, expected):
+    manager = FakeManager()
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = base()
+    payload.pop("mode")
+    payload.update(mode_fields)
+
+    item.observe_event("SIGNAL", payload, persist=False)
+
+    assert manager.created[0]["mode"] == expected
+
+
+def test_missing_mode_alias_does_not_inject_mode(tmp_path):
+    manager = FakeManager()
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = base()
+    payload.pop("mode")
+
+    item.observe_event("SIGNAL", payload, persist=False)
+
+    assert "mode" not in manager.created[0]
+
+
+def test_invalid_mode_alias_is_forwarded_without_adapter_normalization(tmp_path):
+    manager = FakeManager()
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = base(mode="INVALID_MODE")
+
+    item.observe_event("SIGNAL", payload, persist=False)
+
+    assert manager.created[0]["mode"] == "INVALID_MODE"
+
+
+def test_mode_canonicalization_preserves_payload_and_identifiers(tmp_path):
+    manager = FakeManager()
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = base(
+        lifecycle_id="LC-MODE",
+        trade_id="TR-MODE",
+        event_id="EVENT-MODE",
+        metadata={"execution_mode": "PAPER", "nested": {"values": [1]}},
+    )
+    payload.pop("mode")
+    original = copy.deepcopy(payload)
+
+    result = item.observe_event("SIGNAL", payload, persist=False)
+
+    assert payload == original
+    assert result["lifecycle_id"] == "LC-MODE"
+    assert result["event_id"] == "EVENT-MODE"
+    assert result["identity_source"] == "TRADE_ID"
+    assert manager.created[0]["lifecycle_id"] == "LC-MODE"
+    assert manager.created[0]["trade_id"] == "TR-MODE"
+    assert manager.created[0]["mode"] == "PAPER"
+
+
+def _isolated_lifecycle_manager(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR", str(tmp_path / "manager"))
+    sys.modules.pop("trade_lifecycle_manager", None)
+    return importlib.import_module("trade_lifecycle_manager")
+
+
+@pytest.mark.parametrize("mode_value", [None, "INVALID_MODE"])
+def test_missing_or_invalid_mode_remains_unknown_in_real_manager(monkeypatch, tmp_path, mode_value):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    payload = base()
+    if mode_value is None:
+        payload.pop("mode")
+    else:
+        payload["mode"] = mode_value
+
+    observed = item.observe_event("SIGNAL", payload, persist=False)
+
+    assert observed["manager_result"]["snapshot"]["mode"] == "UNKNOWN"
+
+
+def test_predator_paper_alias_matches_registry_with_real_manager(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    payload = base(metadata={"execution_mode": "PAPER"}, registry_mode="PAPER")
+    payload.pop("mode")
+
+    observed = item.observe_event("SIGNAL", payload, persist=False)
+    reconciled = item.reconcile_trade(payload, persist=False)
+
+    assert observed["manager_result"]["snapshot"]["mode"] == "PAPER"
+    assert reconciled["status"] == "MATCH"
+    assert not any(row.get("field") == "mode" for row in reconciled["comparison"]["differences"])
+
+
+def test_real_mode_difference_still_diverges_with_real_manager(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    lifecycle_payload = base(mode="PAPER")
+    registry_payload = copy.deepcopy(lifecycle_payload)
+    registry_payload["mode"] = "LIVE"
+
+    item.observe_event("SIGNAL", lifecycle_payload, persist=False)
+    reconciled = item.reconcile_trade(registry_payload, persist=False)
+
+    mode_difference = next(row for row in reconciled["comparison"]["differences"] if row.get("field") == "mode")
+    assert reconciled["status"] == "PARTIAL_MATCH"
+    assert mode_difference["shadow_value"] == "PAPER"
+    assert mode_difference["registry_value"] == "LIVE"
+
+
 def test_two_bots_same_symbol_remain_independent(tmp_path):
     manager = FakeManager()
     item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)

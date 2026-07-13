@@ -191,6 +191,9 @@ class TradeLifecycleShadowRuntimeAdapter:
                 if canonical in {"SIGNAL_CREATED", "EXTERNAL_POSITION_DETECTED"}:
                     create_payload = copy.deepcopy(original)
                     create_payload.update({"lifecycle_id": lifecycle_id, "trade_id": "" if external else identity["value"], "external_position": external, "manual_position": external})
+                    canonical_mode = _first(original, ("mode", "execution_mode", "registry_mode"))
+                    if canonical_mode not in (None, ""):
+                        create_payload["mode"] = canonical_mode
                     if external:
                         create_payload["bot"] = ""
                         create_payload["setup"] = ""
