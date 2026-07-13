@@ -101,6 +101,25 @@ def _canonical_identity(record: Mapping[str, Any]) -> Dict[str, str]:
     return {"value": value, "source": source.upper()}
 
 
+def _resolve_lifecycle_id(record: Mapping[str, Any], canonical_identity: Mapping[str, str], *, external: bool = False) -> Dict[str, str]:
+    explicit = _first(record, ("lifecycle_id",))
+    if explicit is not None and str(explicit).strip():
+        return {"value": str(explicit), "source": "EXPLICIT_LIFECYCLE_ID"}
+    if external:
+        digest = hashlib.sha256(json.dumps(record, sort_keys=True, default=str).encode()).hexdigest()[:24]
+        return {"value": f"CENTRAL-SHADOW-EXTERNAL-{digest.upper()}", "source": "EXTERNAL_POSITION"}
+    identity_value = str(canonical_identity.get("value") or "").strip()
+    if not identity_value:
+        return {"value": "", "source": "INSUFFICIENT_IDENTITY"}
+    material = {
+        "schema": "CENTRAL_SHADOW_LIFECYCLE_ID_V1",
+        "identity_source": str(canonical_identity.get("source") or ""),
+        "identity_value": identity_value,
+    }
+    digest = hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()[:32]
+    return {"value": f"CENTRAL-SHADOW-LIFECYCLE-{digest.upper()}", "source": "DERIVED_CANONICAL_IDENTITY"}
+
+
 class TradeLifecycleShadowRuntimeAdapter:
     """Thread-safe, fail-open adapter with no operational authority."""
 
@@ -156,16 +175,10 @@ class TradeLifecycleShadowRuntimeAdapter:
             if not self.enabled:
                 return self._result("DISABLED", forwarded=False, event_type=canonical)
             identity = _canonical_identity(original)
-            lifecycle_id = str(_first(original, ("lifecycle_id",)) or "").strip()
             external = bool(_first(original, ("external_position", "manual_position"))) or canonical == "EXTERNAL_POSITION_DETECTED"
-            if external and not lifecycle_id:
-                lifecycle_id = f"CENTRAL-SHADOW-EXTERNAL-{hashlib.sha256(json.dumps(original, sort_keys=True, default=str).encode()).hexdigest()[:24].upper()}"
+            lifecycle = _resolve_lifecycle_id(original, identity, external=external)
+            lifecycle_id = lifecycle["value"]
             if not lifecycle_id:
-                if external:
-                    lifecycle_id = f"CENTRAL-SHADOW-EXTERNAL-{hashlib.sha256(json.dumps(original, sort_keys=True, default=str).encode()).hexdigest()[:24].upper()}"
-                else:
-                    return self._result("INSUFFICIENT_IDENTITY", ok=False, forwarded=False, reasons=["lifecycle_id missing"])
-            if not identity["value"] and not external:
                 return self._result("INSUFFICIENT_IDENTITY", ok=False, forwarded=False, reasons=["canonical trade identity missing"])
             event_id = self._event_id(canonical, identity["value"] or lifecycle_id, original)
             key = f"{lifecycle_id}|{canonical}|{event_id}"
@@ -173,7 +186,7 @@ class TradeLifecycleShadowRuntimeAdapter:
                 self._metrics["observed"] += 1
                 if key in self._seen:
                     self._metrics["duplicate"] += 1
-                    return self._result("DUPLICATE", duplicate=True, event_id=event_id, lifecycle_id=lifecycle_id)
+                    return self._result("DUPLICATE", duplicate=True, event_id=event_id, lifecycle_id=lifecycle_id, lifecycle_id_source=lifecycle["source"], identity_source=identity["source"])
                 event = {"event_id": event_id, "event_type": canonical, "lifecycle_id": lifecycle_id, "source_component": str(_first(original, ("source_component", "source")) or "SHADOW_RUNTIME_ADAPTER"), "occurred_at": str(_first(original, ("occurred_at", "timestamp", "updated_at")) or _now()), "evidence": _json_safe(original.get("evidence") or original), "payload": _json_safe(original)}
                 if canonical in {"SIGNAL_CREATED", "EXTERNAL_POSITION_DETECTED"}:
                     create_payload = copy.deepcopy(original)
@@ -201,11 +214,11 @@ class TradeLifecycleShadowRuntimeAdapter:
                 else:
                     self._metrics["blocked"] += 1
                     status = "BLOCKED"
-                journal = {"timestamp": _now(), "event_id": event_id, "event_type": canonical, "lifecycle_id": lifecycle_id, "identity": identity, "status": status, "manager_result": _json_safe(result)}
+                journal = {"timestamp": _now(), "event_id": event_id, "event_type": canonical, "lifecycle_id": lifecycle_id, "lifecycle_id_source": lifecycle["source"], "identity": identity, "identity_source": identity["source"], "status": status, "manager_result": _json_safe(result)}
                 if persist:
                     self._append(self.events_file, journal)
                     self._persist_state()
-                return self._result(status, ok=status in {"APPLIED", "DUPLICATE"}, duplicate=status == "DUPLICATE", forwarded=True, event_id=event_id, lifecycle_id=lifecycle_id, manager_result=result)
+                return self._result(status, ok=status in {"APPLIED", "DUPLICATE"}, duplicate=status == "DUPLICATE", forwarded=True, event_id=event_id, lifecycle_id=lifecycle_id, lifecycle_id_source=lifecycle["source"], identity_source=identity["source"], manager_result=result)
         except Exception as exc:
             with self._lock:
                 self._metrics["errors"] += 1
@@ -215,12 +228,18 @@ class TradeLifecycleShadowRuntimeAdapter:
 
     def reconcile_trade(self, registry_trade: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
         try:
+            if not isinstance(registry_trade, dict):
+                return self._result("INVALID_CONTRACT", ok=False, reconciled=False, reasons=["registry_trade must be dict"])
             if not self.enabled:
                 return self._result("DISABLED", reconciled=False)
-            lifecycle_id = str(_first(registry_trade, ("lifecycle_id",)) or "")
+            original = copy.deepcopy(registry_trade)
+            identity = _canonical_identity(original)
+            external = bool(_first(original, ("external_position", "manual_position")))
+            lifecycle = _resolve_lifecycle_id(original, identity, external=external)
+            lifecycle_id = lifecycle["value"]
             if not lifecycle_id:
-                return self._result("INSUFFICIENT_IDENTITY", ok=False, reconciled=False)
-            comparison = self.manager.compare_with_registry(lifecycle_id, copy.deepcopy(registry_trade))
+                return self._result("INSUFFICIENT_IDENTITY", ok=False, reconciled=False, reasons=["canonical trade identity missing"])
+            comparison = self.manager.compare_with_registry(lifecycle_id, original)
             with self._lock:
                 self._metrics["reconciled"] += 1
                 differences = comparison.get("differences") or []
@@ -234,7 +253,7 @@ class TradeLifecycleShadowRuntimeAdapter:
                         self._append(self.divergences_file, {"timestamp": _now(), "key": key, **difference})
                 if persist:
                     self._persist_state()
-            return self._result(comparison.get("status", "UNKNOWN"), ok=True, reconciled=True, comparison=comparison)
+            return self._result(comparison.get("status", "UNKNOWN"), ok=True, reconciled=True, lifecycle_id=lifecycle_id, lifecycle_id_source=lifecycle["source"], identity_source=identity["source"], comparison=comparison)
         except Exception as exc:
             with self._lock:
                 self._metrics["errors"] += 1

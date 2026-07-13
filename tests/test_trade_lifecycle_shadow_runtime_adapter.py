@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import json
 import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -114,7 +115,8 @@ def test_runtime_event_mapping(adapter, legacy, canonical):
 
 def test_missing_lifecycle_is_fail_open(adapter):
     result = adapter.observe_event("ENTRY_FILL", base(lifecycle_id=""), persist=False)
-    assert result["status"] == "INSUFFICIENT_IDENTITY"
+    assert result["status"] == "APPLIED"
+    assert result["lifecycle_id"].startswith("CENTRAL-SHADOW-LIFECYCLE-")
     assert result["production_blocked"] is False
 
 
@@ -300,6 +302,125 @@ def test_close_out_of_order_is_fail_open(monkeypatch, tmp_path):
     assert result["status"] == "BLOCKED"
     assert result["production_blocked"] is False
     assert result["ok"] is False
+
+
+def test_predator_registry_trade_without_lifecycle_id_is_observed_applied_and_journaled(tmp_path):
+    manager = FakeManager()
+    adapter = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = {
+        "trade_id": "PREDATOR:SMART_PREDATOR:ARBUSDT:LONG",
+        "bot": "PREDATOR",
+        "setup": "SMART_PREDATOR",
+        "symbol": "ARBUSDT",
+        "side": "LONG",
+        "entry": 0.09299,
+        "sl": 0.09225,
+        "tp50": 0.09447,
+        "status": "OPEN",
+    }
+    original = copy.deepcopy(payload)
+
+    result = adapter.observe_event("SIGNAL", payload, persist=True)
+
+    assert result["ok"] is True
+    assert result["status"] == "APPLIED"
+    assert result["lifecycle_id"].startswith("CENTRAL-SHADOW-LIFECYCLE-")
+    assert result["lifecycle_id_source"] == "DERIVED_CANONICAL_IDENTITY"
+    assert result["identity_source"] == "TRADE_ID"
+    assert result["production_blocked"] is False
+    assert result["operational_authority"] is False
+    assert adapter.get_metrics()["metrics"] == {"observed": 1, "applied": 1, "duplicate": 0, "blocked": 0, "errors": 0, "reconciled": 0, "divergences": 0}
+    assert manager.created[0]["lifecycle_id"] == result["lifecycle_id"]
+    assert payload == original
+    journal = json.loads(adapter.events_file.read_text(encoding="utf-8").splitlines()[0])
+    assert journal["lifecycle_id"] == result["lifecycle_id"]
+    assert journal["lifecycle_id_source"] == "DERIVED_CANONICAL_IDENTITY"
+
+
+@pytest.mark.parametrize("identity_field", ["trade_id", "registry_id", "execution_id", "decision_id", "signal_id"])
+def test_each_canonical_identity_can_derive_lifecycle_id(tmp_path, identity_field):
+    manager = FakeManager()
+    adapter = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = {identity_field: f"{identity_field}-1"}
+
+    result = adapter.observe_event("SIGNAL", payload, persist=False)
+
+    assert result["status"] == "APPLIED"
+    assert result["identity_source"] == identity_field.upper()
+    assert manager.created[0]["lifecycle_id"] == result["lifecycle_id"]
+
+
+def test_fallback_identity_can_derive_lifecycle_id(adapter):
+    result = adapter.observe_event("SIGNAL", {"bot": "PREDATOR", "setup": "SMART_PREDATOR"}, persist=False)
+    assert result["status"] == "APPLIED"
+    assert result["identity_source"] == "DETERMINISTIC_FALLBACK"
+
+
+def test_derived_lifecycle_is_deterministic_across_instances_and_restart(tmp_path):
+    payload = {"trade_id": "TR-STABLE"}
+    first = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "same", manager=FakeManager())
+    before_restart = first.observe_event("SIGNAL", payload, persist=True)
+    second = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "same", manager=FakeManager())
+    after_restart = second.observe_event("SIGNAL", payload, persist=False)
+    third = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "other", manager=FakeManager())
+    other_process = third.observe_event("SIGNAL", payload, persist=False)
+    assert before_restart["lifecycle_id"] == after_restart["lifecycle_id"] == other_process["lifecycle_id"]
+
+
+def test_different_canonical_trades_derive_different_lifecycles(tmp_path):
+    first = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "a", manager=FakeManager()).observe_event("SIGNAL", {"trade_id": "TR-A"}, persist=False)
+    second = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "b", manager=FakeManager()).observe_event("SIGNAL", {"trade_id": "TR-B"}, persist=False)
+    assert first["lifecycle_id"] != second["lifecycle_id"]
+
+
+def test_explicit_lifecycle_id_is_preserved_exactly(adapter):
+    result = adapter.observe_event("SIGNAL", {"trade_id": "TR-EXPLICIT", "metadata": {"lifecycle_id": "LC-EXPLICIT"}}, persist=False)
+    assert result["lifecycle_id"] == "LC-EXPLICIT"
+    assert result["lifecycle_id_source"] == "EXPLICIT_LIFECYCLE_ID"
+
+
+def test_external_lifecycle_remains_segregated(adapter):
+    result = adapter.observe_event("EXTERNAL_POSITION", {"external_position": True, "bot": "FALCON", "symbol": "BTCUSDT", "side": "LONG"}, persist=False)
+    assert result["lifecycle_id"].startswith("CENTRAL-SHADOW-EXTERNAL-")
+    assert result["lifecycle_id_source"] == "EXTERNAL_POSITION"
+    assert adapter.manager.created[0]["bot"] == ""
+    assert adapter.manager.created[0]["trade_id"] == ""
+
+
+def test_truly_insufficient_identity_is_not_observed(adapter):
+    result = adapter.observe_event("SIGNAL", {}, persist=False)
+    assert result["status"] == "INSUFFICIENT_IDENTITY"
+    assert result["reasons"] == ["canonical trade identity missing"]
+    assert adapter.get_metrics()["metrics"]["observed"] == 0
+
+
+def test_observe_and_reconcile_use_same_derived_lifecycle(tmp_path):
+    manager = FakeManager()
+    adapter = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = {"trade_id": "TR-SAME", "comparison": "MATCH"}
+    observed = adapter.observe_event("SIGNAL", payload, persist=False)
+    reconciled = adapter.reconcile_trade(payload, persist=False)
+    assert reconciled["lifecycle_id"] == observed["lifecycle_id"]
+    assert reconciled["lifecycle_id_source"] == "DERIVED_CANONICAL_IDENTITY"
+
+
+def test_derived_lifecycle_keeps_duplicate_and_concurrency_idempotent(tmp_path):
+    manager = FakeManager()
+    adapter = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = {"trade_id": "TR-CONCURRENT", "event_id": "DERIVED-CONCURRENT"}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: adapter.observe_event("SIGNAL", payload, persist=False), range(20)))
+    assert sum(result["status"] == "APPLIED" for result in results) == 1
+    assert sum(result.get("duplicate", False) for result in results) == 19
+    assert len(manager.created) == 1
+
+
+def test_same_symbol_side_for_different_bots_remains_independent_with_derived_ids(tmp_path):
+    manager = FakeManager()
+    adapter = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    falcon = adapter.observe_event("SIGNAL", {"trade_id": "FALCON:BTCUSDT:LONG", "bot": "FALCON", "symbol": "BTCUSDT", "side": "LONG"}, persist=False)
+    predator = adapter.observe_event("SIGNAL", {"trade_id": "PREDATOR:BTCUSDT:LONG", "bot": "PREDATOR", "symbol": "BTCUSDT", "side": "LONG"}, persist=False)
+    assert falcon["lifecycle_id"] != predator["lifecycle_id"]
 
 
 def test_registry_functions_keep_official_result_with_shadow_failures(monkeypatch, tmp_path):
