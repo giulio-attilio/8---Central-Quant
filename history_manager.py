@@ -16,13 +16,15 @@
 # ============================================================================
 
 import ast
+import hashlib
 import json
 import os
+import threading
 import time
 import uuid
+from collections import Counter, OrderedDict, defaultdict
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from collections import Counter, defaultdict
 
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
@@ -71,6 +73,8 @@ HISTORY_REPORT_DAYS = int(os.environ.get("HISTORY_REPORT_DAYS", "7"))
 HISTORY_DEDUP_ENABLED = str(os.environ.get("HISTORY_DEDUP_ENABLED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
 HISTORY_DEDUP_MAX_KEYS = int(os.environ.get("HISTORY_DEDUP_MAX_KEYS", "5000"))
 HISTORY_AUTO_BACKFILL_CLOSED = str(os.environ.get("HISTORY_AUTO_BACKFILL_CLOSED", "true")).lower() in {"1", "true", "yes", "sim", "on"}
+_PROCESS_SEEN_UIDS = OrderedDict()
+_PROCESS_SEEN_UIDS_LOCK = threading.Lock()
 
 
 def agora_sp():
@@ -206,6 +210,13 @@ def get_status():
         "dedup_max_keys": HISTORY_DEDUP_MAX_KEYS,
         "auto_backfill_closed": HISTORY_AUTO_BACKFILL_CLOSED,
     }
+
+
+def configure_timeline_writer(path):
+    """Point the canonical History timeline writer at the Central data path."""
+    global TIMELINE_LOG_FILE
+    TIMELINE_LOG_FILE = Path(path)
+    return TIMELINE_LOG_FILE
 
 
 def _first(payload, keys, default=None):
@@ -411,21 +422,70 @@ def _extract_side(payload):
 
 def _event_uid(event_type, payload, source=None, trade_id=None):
     payload = payload if isinstance(payload, dict) else {}
-    raw = _first(payload, ["event_id", "uid", "id"])
-    if raw:
-        return str(raw)
-    tid = trade_id or _first(payload, ["trade_id", "position_id", "client_trade_id"])
-    event_ts = _first(payload, ["event_ts", "timestamp", "created_at", "closed_at", "ts"])
-    symbol = normalize_symbol(_first(payload, ["symbol", "ativo", "pair"]))
-    side = normalize_side(_first(payload, ["side", "direction", "signal"]))
-    setup = str(_first(payload, ["setup", "signal_type", "strategy"], "")).upper()
-    return f"{source or ''}|{event_type}|{tid or ''}|{symbol}|{side}|{setup}|{event_ts or ''}"
+    explicit = _first(payload, ["event_id", "uid"])
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    material = {
+        "event": str(event_type or "EVENT").upper().strip(),
+        "trade_id": str(
+            trade_id
+            or _first(payload, ["trade_id", "position_id", "client_trade_id"], "")
+            or ""
+        ),
+        "source": str(source or payload.get("source") or "").lower().strip(),
+        "bot": str(_first(payload, ["bot", "bot_name", "strategy"], "") or "").upper().strip(),
+        "symbol": normalize_symbol(_first(payload, ["symbol", "ativo", "pair"], "")),
+        "side": normalize_side(_first(payload, ["side", "direction", "signal"], "")),
+        "setup": str(_first(payload, ["setup", "signal_type", "strategy"], "") or "").upper().strip(),
+        "timestamp": str(
+            _first(payload, ["event_ts", "timestamp", "created_at", "closed_at", "ts"], "")
+            or ""
+        ),
+        "identity": {
+            key: payload.get(key)
+            for key in (
+                "lifecycle_id",
+                "signal_id",
+                "decision_id",
+                "execution_id",
+                "client_order_id",
+                "exchange_order_id",
+                "state",
+                "status",
+                "decision",
+                "reason",
+                "new_stop",
+                "stop",
+                "price",
+                "exit_price",
+                "result",
+                "result_pct",
+                "pnl_pct",
+            )
+            if payload.get(key) is not None
+        },
+    }
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+    return "TIMELINE-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest().upper()
 
 
 def _dedup_seen(uid):
     if not HISTORY_DEDUP_ENABLED:
         return False
     try:
+        with _PROCESS_SEEN_UIDS_LOCK:
+            if uid in _PROCESS_SEEN_UIDS:
+                _PROCESS_SEEN_UIDS.move_to_end(uid)
+                return True
+            _PROCESS_SEEN_UIDS[uid] = time.time()
+            while len(_PROCESS_SEEN_UIDS) > HISTORY_DEDUP_MAX_KEYS:
+                _PROCESS_SEEN_UIDS.popitem(last=False)
         seen = _read_json(HISTORY_SEEN_FILE, {})
         if not isinstance(seen, dict):
             seen = {}
@@ -632,7 +692,7 @@ def is_admin_event(event):
 
 def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     event_type, payload = _coerce_event_args(event_type, payload)
-    raw = payload if isinstance(payload, dict) else {"value": payload}
+    raw = dict(payload) if isinstance(payload, dict) else {"value": payload}
     event = classify_event(event_type, raw)
 
     bot_value = _extract_bot(raw)
@@ -677,7 +737,8 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
         elif source_name == "turtle":
             setup = "TURTLE"
 
-    tid = trade_id or _first(raw, ["trade_id", "position_id", "client_trade_id"])
+    explicit_tid = trade_id or _first(raw, ["trade_id", "position_id", "client_trade_id"])
+    tid = explicit_tid
     if not tid:
         stamp = agora_sp().strftime("%Y%m%d-%H%M%S")
         tid = f"{bot[:12]}-{stamp}-{symbol or 'NA'}-{uuid.uuid4().hex[:6].upper()}"
@@ -688,11 +749,17 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
     score = _safe_float(_first(raw, ["score", "signal_score", "meme_score", "qualidade_pontos"]), None)
 
     result_value = _first(raw, ["result", "decision", "status", "result_type"])
+    operational_ts = _first(raw, ["event_ts", "timestamp", "created_at", "closed_at", "ts"])
+    operational_epoch = _safe_float(raw.get("epoch"), None)
+    details = raw.get("details") if "details" in raw else None
+    raw_payload = dict(raw)
+    if "details" in raw_payload:
+        raw_payload.pop("details")
 
     item = {
-        "uid": _event_uid(event, raw, source=source, trade_id=tid),
-        "ts": data_hora_sp_str(),
-        "epoch": time.time(),
+        "uid": _event_uid(event, raw, source=source, trade_id=explicit_tid),
+        "ts": str(operational_ts or data_hora_sp_str()),
+        "epoch": operational_epoch if operational_epoch is not None else time.time(),
         "event": event,
         "event_raw": str(event_type or "EVENT").upper() if not is_bad_string_value(event_type) else event,
         "source": str(source or raw.get("source") or bot or "central").lower(),
@@ -712,7 +779,9 @@ def normalize_payload(event_type, payload=None, source=None, trade_id=None):
         "result_r": result_r,
         "result": result_value,
         "reason": _first(raw, ["reason", "motivo", "exit_reason"]),
-        "raw": raw,
+        "state": str(_first(raw, ["state", "status"], event) or event).upper(),
+        "details": details,
+        "raw": raw_payload,
     }
     return item
 
@@ -1125,10 +1194,11 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
         if uid and _dedup_seen(uid):
             return {"ok": True, "dedup": True, "uid": uid}
         ok = _append_jsonl(HISTORY_EVENTS_FILE, item)
+        timeline_written = False
         if ok and item.get("event") in {"RISK_DECISION", "RISK_ALLOW", "RISK_DENY", "TRADE_BLOCKED"}:
             _append_jsonl(DECISION_LOG_FILE, item)
         if ok and item.get("event") not in {"CENTRAL_COMMAND", "BOT_COMMAND"}:
-            _append_jsonl(TIMELINE_LOG_FILE, item)
+            timeline_written = _append_jsonl(TIMELINE_LOG_FILE, item)
 
         closed_trade_result = None
         if ok and item.get("event") == "TRADE_CLOSED":
@@ -1156,7 +1226,16 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
                     journal_result = {"ok": False, "error": str(journal_exc)}
                 lifecycle_result = lifecycle_result or {"ok": False, "error": str(journal_exc)}
 
-        return {"ok": ok, "dedup": False, "event": item, "context": context_result, "closed_trade": closed_trade_result, "journal": journal_result, "lifecycle": lifecycle_result}
+        return {
+            "ok": ok,
+            "dedup": False,
+            "event": item,
+            "timeline_written": timeline_written,
+            "context": context_result,
+            "closed_trade": closed_trade_result,
+            "journal": journal_result,
+            "lifecycle": lifecycle_result,
+        }
     except Exception as exc:
         return {"ok": False, "dedup": False, "error": str(exc), "event": {"event_type": event_type, "payload": payload}}
 
@@ -1190,7 +1269,15 @@ def wrap_bot_module(module, bot_key=None):
         wrapped = True
 
     fn = getattr(module, "record_event", None)
-    if callable(fn) and not getattr(fn, "_history_wrapped", False):
+    emits_history_directly = bool(
+        getattr(fn, "_history_emits_directly", False)
+        or callable(getattr(module, "falcon_log_super_history", None))
+    )
+    if callable(fn) and emits_history_directly:
+        fn._history_wrapped = True
+        fn._history_single_writer = True
+        wrapped = True
+    elif callable(fn) and not getattr(fn, "_history_wrapped", False):
         original = fn
         def record_event_wrapper(event_type, pos, extra=None, *args, **kwargs):
             result = original(event_type, pos, extra=extra, *args, **kwargs)
@@ -1217,38 +1304,13 @@ def wrap_central_functions(globals_dict):
 
     append_decision = globals_dict.get("append_decision_log")
     if callable(append_decision) and not getattr(append_decision, "_history_wrapped", False):
-        original = append_decision
-        def append_decision_log_wrapper(payload, decision_result, *args, **kwargs):
-            result = original(payload, decision_result, *args, **kwargs)
-            try:
-                merged = {}
-                if isinstance(payload, dict):
-                    merged.update(payload)
-                if isinstance(decision_result, dict):
-                    merged.update(decision_result)
-                if isinstance(result, dict):
-                    merged.update(result)
-                log_event("RISK_DECISION", merged, source="central", trade_id=merged.get("trade_id"))
-            except Exception as exc:
-                print("ERRO HISTORY append_decision_log:", exc)
-            return result
-        append_decision_log_wrapper._history_wrapped = True
-        globals_dict["append_decision_log"] = append_decision_log_wrapper
+        append_decision._history_wrapped = True
+        append_decision._history_single_writer = True
 
     append_timeline = globals_dict.get("append_timeline_event")
     if callable(append_timeline) and not getattr(append_timeline, "_history_wrapped", False):
-        original = append_timeline
-        def append_timeline_event_wrapper(event_type, bot=None, symbol=None, side=None, trade_id=None, state=None, details=None, *args, **kwargs):
-            result = original(event_type, bot=bot, symbol=symbol, side=side, trade_id=trade_id, state=state, details=details, *args, **kwargs)
-            try:
-                payload = dict(details or {}) if isinstance(details, dict) else {"details": details}
-                payload.update({"bot": bot, "symbol": symbol, "side": side, "state": state})
-                log_event(event_type, payload, source="central", trade_id=trade_id)
-            except Exception as exc:
-                print("ERRO HISTORY append_timeline_event:", exc)
-            return result
-        append_timeline_event_wrapper._history_wrapped = True
-        globals_dict["append_timeline_event"] = append_timeline_event_wrapper
+        append_timeline._history_wrapped = True
+        append_timeline._history_single_writer = True
 
     loaded = globals_dict.get("LOADED_BOTS")
     if isinstance(loaded, dict):

@@ -1574,6 +1574,17 @@ CENTRAL_TIMELINE_LOG_FILE = CENTRAL_DATA_DIR / "timeline.jsonl"
 CENTRAL_SHADOW_POSITIONS_FILE = CENTRAL_DATA_DIR / "shadow_positions.json"
 CENTRAL_EXECUTION_STATS_FILE = CENTRAL_DATA_DIR / "execution_stats.json"
 CENTRAL_STATUS_SNAPSHOTS_FILE = CENTRAL_DATA_DIR / "status_snapshots.jsonl"
+try:
+    import history_manager as _canonical_timeline_history_manager
+    if hasattr(_canonical_timeline_history_manager, "configure_timeline_writer"):
+        _canonical_timeline_history_manager.configure_timeline_writer(
+            CENTRAL_TIMELINE_LOG_FILE
+        )
+except Exception as _canonical_timeline_writer_exc:
+    print(
+        "AVISO timeline single-writer indisponível:",
+        type(_canonical_timeline_writer_exc).__name__,
+    )
 
 # ==========================================================
 # RUNTIME STABILITY MONITOR V1 — STARTUP/RESTART TRACKING
@@ -13440,7 +13451,6 @@ def append_timeline_event(event_type, bot=None, symbol=None, side=None, trade_id
         "side": str(side or "").upper(),
         "details": details or {},
     }
-    _append_jsonl(CENTRAL_TIMELINE_LOG_FILE, item)
     _emit_history_event(event_type, bot=bot, symbol=symbol, side=side, trade_id=item.get("trade_id"), state=item.get("state"), details=item)
     return item
 
