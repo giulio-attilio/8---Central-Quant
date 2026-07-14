@@ -4,8 +4,10 @@ import copy
 import importlib
 import json
 import socket
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,7 @@ class FakeManager:
         self.created = []
         self.applied = []
         self.fail = False
+        self.last_registry_trade = {}
 
     def create_lifecycle(self, payload, persist=True):
         if self.fail:
@@ -33,7 +36,40 @@ class FakeManager:
         return {"ok": True, "event_applied": True, "snapshot": {"lifecycle_id": lifecycle_id}}
 
     def compare_with_registry(self, lifecycle_id, trade):
-        return {"status": trade.get("comparison", "MATCH"), "differences": trade.get("differences", [])}
+        self.last_registry_trade = copy.deepcopy(trade)
+        status = trade.get("comparison", "MATCH")
+        differences = trade.get("differences", [])
+        return {
+            "ok": status == "MATCH",
+            "status": status,
+            "compared_fields": trade.get("compared_fields", 10),
+            "matching_fields": trade.get("matching_fields", 10 if status == "MATCH" else 9),
+            "differences": differences,
+        }
+
+    def get_lifecycle(self, lifecycle_id):
+        trade = self.last_registry_trade
+        quantity = trade.get("remaining_quantity", trade.get("qty", 1.0))
+        stop_order_id = trade.get("broker_stop_order_id", "STOP-BASE")
+        return {
+            "ok": True,
+            "snapshot": {
+                "lifecycle_id": lifecycle_id,
+                "trade_id": trade.get("trade_id", "TR-1"),
+                "signal_id": trade.get("signal_id", "SIG-1"),
+                "decision_id": trade.get("decision_id", ""),
+                "bot": trade.get("bot", "FALCON"),
+                "setup": trade.get("setup", "ORB"),
+                "symbol": trade.get("symbol", "BTCUSDT"),
+                "side": trade.get("side", "LONG"),
+                "mode": "LIVE" if trade.get("mode") == "REAL" else trade.get("mode", "LIVE"),
+                "state": "ENTRY_PROTECTED",
+                "quantity_open": quantity,
+                "client_order_id": trade.get("client_order_id", "CLIENT-BASE"),
+                "exchange_order_id": trade.get("broker_order_id", "ORDER-BASE"),
+                "disaster_stop": {"confirmed": True, "order_id": stop_order_id},
+            },
+        }
 
     def trade_lifecycle_health(self):
         return {"ok": True, "shadow_mode": True}
@@ -45,7 +81,14 @@ def adapter(tmp_path):
 
 
 def base(**updates):
-    item = {"lifecycle_id": "LC-1", "trade_id": "TR-1", "signal_id": "SIG-1", "bot": "FALCON", "setup": "ORB", "symbol": "BTCUSDT", "side": "LONG", "mode": "LIVE", "quantity_planned": 1.0, "timestamp": "2026-07-12T00:00:00Z"}
+    item = {
+        "lifecycle_id": "LC-1", "trade_id": "TR-1", "signal_id": "SIG-1",
+        "bot": "FALCON", "setup": "ORB", "symbol": "BTCUSDT", "side": "LONG",
+        "mode": "LIVE", "status": "OPEN", "qty": 1.0, "quantity_planned": 1.0,
+        "client_order_id": "CLIENT-BASE", "broker_order_id": "ORDER-BASE",
+        "broker_stop_order_id": "STOP-BASE", "protected": True,
+        "timestamp": "2026-07-12T00:00:00Z",
+    }
     item.update(updates)
     return item
 
@@ -185,6 +228,9 @@ def test_predator_paper_alias_matches_registry_with_real_manager(monkeypatch, tm
     item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
     payload = base(metadata={"execution_mode": "PAPER"}, registry_mode="PAPER")
     payload.pop("mode")
+    payload.pop("qty")
+    payload.pop("protected")
+    payload.pop("broker_stop_order_id")
 
     observed = item.observe_event("SIGNAL", payload, persist=False)
     reconciled = item.reconcile_trade(payload, persist=False)
@@ -474,12 +520,376 @@ def test_reconciliation_match(adapter):
     assert result["reconciled"] is True
 
 
+def test_real_registry_mode_matches_normalized_live_shadow_mode(tmp_path):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    result = item.reconcile_trade(base(mode="REAL", comparison="MATCH"), persist=False)
+    assert result["status"] == "MATCH"
+    assert result["shadow_validation"]["eligible"] is True
+
+
 def test_reconciliation_divergence_is_deduplicated(adapter):
     difference = {"field": "status", "shadow_value": "OPEN", "registry_value": "CLOSED", "severity": "CRITICAL"}
     trade = base(comparison="DIVERGENCE", differences=[difference])
     adapter.reconcile_trade(trade, persist=False)
     adapter.reconcile_trade(trade, persist=False)
     assert adapter.get_metrics()["metrics"]["divergences"] == 1
+
+
+def test_reconciliation_match_persists_explicit_shadow_validated_event(tmp_path):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    trade = base(
+        comparison="MATCH",
+        decision_id="DEC-1",
+        client_order_id="CLIENT-1",
+        broker_order_id="ORDER-1",
+        broker_stop_order_id="STOP-1",
+        updated_at="2026-07-14T11:00:30Z",
+    )
+    result = item.reconcile_trade(trade, persist=True)
+    journal = [json.loads(line) for line in item.events_file.read_text(encoding="utf-8").splitlines()]
+    assert result["status"] == "MATCH"
+    assert result["shadow_validation"]["eligible"] is True
+    assert result["shadow_validation"]["persisted"] is True
+    assert len(journal) == 1
+    assert journal[0]["event_type"] == "SHADOW_VALIDATED"
+    assert journal[0]["status"] == "MATCH"
+    assert journal[0]["trade_id"] == "TR-1"
+    assert journal[0]["decision_id"] == "DEC-1"
+    assert journal[0]["client_order_id"] == "CLIENT-1"
+    assert journal[0]["broker_order_id"] == "ORDER-1"
+    assert journal[0]["broker_stop_order_id"] == "STOP-1"
+    assert {
+        "quantity_open", "client_order_id", "exchange_order_id",
+        "protection", "disaster_stop_order_id",
+    }.issubset(journal[0]["validated_fields"])
+    assert journal[0]["validated_values"]["exchange_order_id"] == "ORDER-1"
+    assert journal[0]["validated_values"]["disaster_stop_order_id"] == "STOP-1"
+    assert journal[0]["operational_authority"] is False
+    assert journal[0]["differences"] == []
+
+
+def test_shadow_validated_is_idempotent_across_retry_and_restart(tmp_path):
+    trade = base(comparison="MATCH", broker_order_id="ORDER-IDEMPOTENT", updated_at="2026-07-14T11:00:30Z")
+    first = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    initial = first.reconcile_trade(trade, persist=True)
+    retry = first.reconcile_trade(trade, persist=True)
+    restarted = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    after_restart = restarted.reconcile_trade(trade, persist=True)
+    rows = [json.loads(line) for line in first.events_file.read_text(encoding="utf-8").splitlines()]
+    assert initial["shadow_validation"]["persisted"] is True
+    assert retry["shadow_validation"]["duplicate"] is True
+    assert after_restart["shadow_validation"]["duplicate"] is True
+    assert len(rows) == 1
+
+
+def test_shadow_validation_append_is_idempotent_across_processes(tmp_path):
+    script = """
+import json
+import sys
+from pathlib import Path
+from trade_lifecycle_shadow_runtime_adapter import TradeLifecycleShadowRuntimeAdapter
+
+adapter = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=Path(sys.argv[1]))
+event = {
+    "event_id": "CENTRAL-SHADOW-VALIDATED-CROSS-PROCESS",
+    "event_type": "SHADOW_VALIDATED",
+    "status": "MATCH",
+}
+print(json.dumps({"appended": adapter._append_event_once(event)}))
+"""
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    results = [process.communicate(timeout=30) for process in processes]
+    assert all(process.returncode == 0 for process in processes), results
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "trade_lifecycle_shadow_runtime_events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["event_id"] == "CENTRAL-SHADOW-VALIDATED-CROSS-PROCESS"
+
+
+def test_non_operational_registry_timestamp_change_does_not_duplicate_validation(tmp_path):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    first = item.reconcile_trade(base(updated_at="2026-07-14T11:00:30Z"), persist=True)
+    second = item.reconcile_trade(base(
+        updated_at="2026-07-14T11:01:30Z",
+        decision_id="DECISION-ENRICHED-LATER",
+        compared_fields=11,
+        matching_fields=11,
+    ), persist=True)
+    rows = item.events_file.read_text(encoding="utf-8").splitlines()
+    assert first["shadow_validation"]["persisted"] is True
+    assert second["shadow_validation"]["duplicate"] is True
+    assert len(rows) == 1
+
+
+def test_material_quantity_change_creates_new_validation_revision(tmp_path):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    first = item.reconcile_trade(base(remaining_quantity=1.0), persist=True)
+    second = item.reconcile_trade(base(remaining_quantity=0.5), persist=True)
+    rows = [json.loads(line) for line in item.events_file.read_text(encoding="utf-8").splitlines()]
+    assert first["shadow_validation"]["persisted"] is True
+    assert second["shadow_validation"]["persisted"] is True
+    assert first["shadow_validation"]["event"]["event_id"] != second["shadow_validation"]["event"]["event_id"]
+    assert len(rows) == 2
+
+
+@pytest.mark.parametrize("status", ["PARTIAL_MATCH", "DIVERGENCE", "INSUFFICIENT_EVIDENCE"])
+def test_non_match_reconciliation_never_persists_shadow_validated(tmp_path, status):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    differences = [] if status == "INSUFFICIENT_EVIDENCE" else [{"field": "quantity", "shadow_value": 0, "registry_value": 1}]
+    result = item.reconcile_trade(base(comparison=status, differences=differences), persist=True)
+    assert result["shadow_validation"]["eligible"] is False
+    assert not item.events_file.exists()
+
+
+def test_match_without_compared_fields_is_not_shadow_validation(tmp_path):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    result = item.reconcile_trade(base(comparison="MATCH", compared_fields=0, matching_fields=0), persist=True)
+    assert result["status"] == "MATCH"
+    assert result["shadow_validation"]["eligible"] is False
+    assert not item.events_file.exists()
+
+
+def test_match_with_only_identity_evidence_is_not_shadow_validation(tmp_path):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    result = item.reconcile_trade(base(comparison="MATCH", compared_fields=1, matching_fields=1), persist=True)
+    assert result["status"] == "MATCH"
+    assert result["shadow_validation"]["eligible"] is False
+    assert not item.events_file.exists()
+
+
+def test_live_match_without_confirmed_shadow_protection_is_not_validated(tmp_path):
+    manager = FakeManager()
+    manager.get_lifecycle = lambda lifecycle_id: {
+        "ok": True,
+        "snapshot": {"lifecycle_id": lifecycle_id, "state": "ENTRY_SUBMITTING", "disaster_stop": {}},
+    }
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    result = item.reconcile_trade(base(comparison="MATCH"), persist=True)
+    assert result["status"] == "MATCH"
+    assert result["shadow_validation"]["eligible"] is False
+    assert not item.events_file.exists()
+
+
+@pytest.mark.parametrize("field", ["exchange_order_id", "disaster_stop_order_id"])
+def test_live_match_requires_explicit_matching_order_and_stop_identity(tmp_path, field):
+    manager = FakeManager()
+    original_get = manager.get_lifecycle
+
+    def mismatched(lifecycle_id):
+        result = original_get(lifecycle_id)
+        if field == "exchange_order_id":
+            result["snapshot"]["exchange_order_id"] = "OTHER-ENTRY-ORDER"
+        else:
+            result["snapshot"]["disaster_stop"]["order_id"] = "OTHER-STOP-ORDER"
+        return result
+
+    manager.get_lifecycle = mismatched
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    result = item.reconcile_trade(base(comparison="MATCH"), persist=True)
+    assert result["status"] == "MATCH"
+    assert result["shadow_validation"]["eligible"] is False
+    assert not item.events_file.exists()
+
+
+def test_shadow_validation_persistence_failure_is_fail_open(adapter, monkeypatch):
+    monkeypatch.setattr(adapter, "_append_event_once", lambda event: (_ for _ in ()).throw(OSError("disk")))
+    result = adapter.reconcile_trade(base(comparison="MATCH"), persist=True)
+    assert result["status"] == "MATCH"
+    assert result["reconciled"] is True
+    assert result["shadow_validation"]["persisted"] is False
+    assert result["shadow_validation"]["error"].startswith("OSError")
+    assert result["operational_authority"] is False
+
+
+def test_distinct_execution_identities_get_distinct_validation_events(tmp_path):
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
+    first = item.reconcile_trade(base(comparison="MATCH", broker_order_id="ORDER-A", opened_at="2026-07-14T10:00:00Z"), persist=True)
+    second = item.reconcile_trade(base(comparison="MATCH", broker_order_id="ORDER-B", opened_at="2026-07-15T10:00:00Z"), persist=True)
+    rows = item.events_file.read_text(encoding="utf-8").splitlines()
+    assert first["shadow_validation"]["event"]["event_id"] != second["shadow_validation"]["event"]["event_id"]
+    assert len(rows) == 2
+
+
+def _live_registry_open(**updates):
+    payload = {
+        "trade_id": "FALCON:FALCON15:SOLUSDT:SHORT",
+        "bot": "FALCON",
+        "setup": "FALCON15",
+        "symbol": "SOLUSDT",
+        "side": "SHORT",
+        "mode": "LIVE",
+        "status": "OPEN",
+        "source_component": "TRADE_REGISTRY",
+        "opened_at": "2026-07-14T11:00:18Z",
+        "entry": 76.912,
+        "qty": 0.12,
+        "metadata": {
+            "execution_decision": {"allowed": True, "decision": "ALLOW"},
+        },
+    }
+    payload.update(updates)
+    return payload
+
+
+def test_live_registry_observation_advances_only_to_factual_submission(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _live_registry_open()
+
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    lifecycle_id = created["lifecycle_id"]
+    after_decision = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert after_decision["state"] == "RISK_APPROVED"
+    assert after_decision["quantity_planned"] == pytest.approx(0.12)
+    assert after_decision["quantity_filled"] == 0
+    assert after_decision["fill_ids"] == []
+
+    updated = copy.deepcopy(opened)
+    updated.update({
+        "execution_sent": True,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "broker_order_id": "2077030442691940352",
+        "broker_stop_order_id": "2077030444402577408",
+        "order_id": "2077030442691940352",
+        "last_update": "2026-07-14T11:00:22Z",
+    })
+    updated["metadata"].update({
+        "execution_sent": True,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "broker_order_id": "2077030442691940352",
+        "broker_stop_order_id": "2077030444402577408",
+        "broker_stop_price": 77.5585142857143,
+        "broker_stop_amount": 0.12,
+    })
+    observed = item.observe_event("TRADE_UPDATED", updated, persist=False)
+    snapshot = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert observed["status"] == "APPLIED"
+    assert snapshot["state"] == "ENTRY_SUBMITTING"
+    assert snapshot["client_order_id"] == "FALCON-LIVE-FALCON15-1784037618"
+    assert snapshot["exchange_order_id"] == "2077030442691940352"
+    assert snapshot["quantity_filled"] == 0
+    assert snapshot["disaster_stop"] == {}
+
+    comparison = item.reconcile_trade(updated, persist=False)
+    assert comparison["status"] == "PARTIAL_MATCH"
+    assert comparison["shadow_validation"]["eligible"] is False
+
+
+def test_live_registry_preview_or_missing_order_does_not_advance_submission(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _live_registry_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    update = copy.deepcopy(opened)
+    update.update({"execution_sent": False, "client_order_id": "CLIENT", "broker_order_id": None})
+
+    observed = item.observe_event("TRADE_UPDATED", update, persist=False)
+    snapshot = manager.get_lifecycle(created["lifecycle_id"])["snapshot"]
+    assert observed["status"] == "BLOCKED"
+    assert snapshot["state"] == "RISK_APPROVED"
+    assert snapshot["fill_ids"] == []
+
+
+def test_generic_order_id_cannot_stand_in_for_typed_entry_order(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _live_registry_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    update = copy.deepcopy(opened)
+    update.update({
+        "execution_sent": True,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "order_id": "POSSIBLY-A-STOP-ORDER",
+    })
+    observed = item.observe_event("TRADE_UPDATED", update, persist=False)
+    snapshot = manager.get_lifecycle(created["lifecycle_id"])["snapshot"]
+    assert observed["status"] == "BLOCKED"
+    assert snapshot["state"] == "RISK_APPROVED"
+    assert snapshot["exchange_order_id"] is None
+
+
+def test_late_decision_id_does_not_block_factual_submission_sequence(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _live_registry_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    update = copy.deepcopy(opened)
+    update.update({
+        "decision_id": "DECISION-ARRIVED-LATER",
+        "execution_sent": True,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "broker_order_id": "2077030442691940352",
+    })
+    observed = item.observe_event("TRADE_UPDATED", update, persist=False)
+    snapshot = manager.get_lifecycle(created["lifecycle_id"])["snapshot"]
+    assert observed["status"] == "APPLIED"
+    assert snapshot["state"] == "ENTRY_SUBMITTING"
+    assert snapshot["exchange_order_id"] == "2077030442691940352"
+
+
+def test_real_manager_match_naturally_persists_shadow_validated_after_explicit_fill_and_stop(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _live_registry_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    lifecycle_id = created["lifecycle_id"]
+    registry = copy.deepcopy(opened)
+    registry.update({
+        "execution_sent": True,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "broker_order_id": "2077030442691940352",
+        "order_id": "2077030442691940352",
+        "protected": True,
+        "broker_stop_order_id": "2077030444402577408",
+        "last_update": "2026-07-14T11:00:22Z",
+    })
+    registry["metadata"].update({
+        "execution_sent": True,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "broker_order_id": "2077030442691940352",
+    })
+    item.observe_event("TRADE_UPDATED", registry, persist=False)
+    fill = {
+        **registry,
+        "lifecycle_id": lifecycle_id,
+        "event_id": "FILL-EVENT-1",
+        "fill_id": "FILL-2077030442691940352",
+        "quantity": 0.12,
+        "price": 76.912,
+        "exchange_order_id": "2077030442691940352",
+    }
+    assert item.observe_event("ENTRY_FILL", fill, persist=False)["status"] == "APPLIED"
+    stop = {
+        **registry,
+        "lifecycle_id": lifecycle_id,
+        "event_id": "STOP-EVENT-1",
+        "order_id": "2077030444402577408",
+        "status": "OPEN",
+        "side": "BUY",
+        "trigger_price": 77.5585142857143,
+        "protected_quantity": 0.12,
+        "timestamp": "2026-07-14T11:00:23Z",
+    }
+    assert item.observe_event("STOP_CONFIRMED", stop, persist=False)["status"] == "APPLIED"
+
+    matched = item.reconcile_trade(registry, persist=True)
+    duplicate = item.reconcile_trade(registry, persist=True)
+    rows = [json.loads(line) for line in item.events_file.read_text(encoding="utf-8").splitlines()]
+    assert matched["status"] == "MATCH"
+    assert matched["shadow_validation"]["persisted"] is True
+    assert duplicate["shadow_validation"]["duplicate"] is True
+    assert [row["event_type"] for row in rows] == ["SHADOW_VALIDATED"]
 
 
 def test_reconcile_all_includes_open_and_closed(adapter):

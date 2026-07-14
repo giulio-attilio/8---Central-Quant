@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
@@ -20,6 +21,8 @@ VERSION = "2026-07-13-TRADE-TIMELINE-VALIDATOR-V1"
 LOGGER = logging.getLogger(__name__)
 JSONL_MAX_BYTES = 64 * 1024 * 1024
 JSONL_MAX_VALID_LINES = 100_000
+CORRELATION_PRE_OPEN_SECONDS = 15 * 60
+CORRELATION_POST_CLOSE_SECONDS = 24 * 60 * 60
 
 COMPONENTS = (
     "registry",
@@ -64,6 +67,7 @@ EVENT_ORDER = (
 )
 
 REPEATABLE_EVENTS = {"TRAILING_UPDATED", "PARTIAL_CLOSE"}
+OBSERVATIONAL_META_EVENTS = {"SHADOW_VALIDATED"}
 
 EVENT_ALIASES = {
     "SIGNAL": "SIGNAL_RECEIVED",
@@ -113,8 +117,6 @@ EVENT_ALIASES = {
     "OUTCOME_RECORDED": "LIFECYCLE_FINISHED",
     "LEARNING_ELIGIBILITY_CONFIRMED": "LIFECYCLE_FINISHED",
     "SHADOW_VALIDATED": "SHADOW_VALIDATED",
-    "MATCH": "SHADOW_VALIDATED",
-    "RECONCILIATION_COMPLETED": "SHADOW_VALIDATED",
 }
 
 IDENTITY_KEYS = {
@@ -129,7 +131,33 @@ IDENTITY_KEYS = {
     "clientorderid",
     "exchange_order_id",
     "broker_order_id",
+    "broker_stop_order_id",
+    "disaster_stop_order_id",
     "order_id",
+    "fill_id",
+    "fill_ids",
+}
+
+IDENTITY_KEY_ALIASES = {
+    "clientorderid": "client_order_id",
+}
+
+IDENTITY_GROUPS = {
+    "trade_id": "trade",
+    "trade_uuid": "trade_uuid",
+    "registry_id": "registry",
+    "lifecycle_id": "lifecycle",
+    "execution_id": "execution",
+    "decision_id": "decision",
+    "signal_id": "signal",
+    "client_order_id": "client_order",
+    "exchange_order_id": "order",
+    "broker_order_id": "order",
+    "broker_stop_order_id": "order",
+    "disaster_stop_order_id": "order",
+    "order_id": "order",
+    "fill_id": "fill",
+    "fill_ids": "fill",
 }
 
 TIMESTAMP_KEYS = (
@@ -154,16 +182,23 @@ def _data_dir(environ: Optional[Mapping[str, str]] = None) -> Path:
     return Path(configured) if configured else Path(__file__).resolve().parent / "data"
 
 
+def _shadow_data_dir(environ: Optional[Mapping[str, str]] = None) -> Path:
+    env = environ or os.environ
+    configured = env.get("TRADE_LIFECYCLE_SHADOW_DATA_DIR")
+    return Path(configured) if configured else _data_dir(env)
+
+
 def default_source_paths(environ: Optional[Mapping[str, str]] = None) -> Dict[str, tuple[Path, ...]]:
     root = _data_dir(environ)
+    shadow_root = _shadow_data_dir(environ)
     return {
         "registry": (Path((environ or os.environ).get("TRADE_REGISTRY_FILE", root / "trade_registry.json")),),
-        "lifecycle": (root / "trade_lifecycle_shadow_snapshot.json", root / "trade_lifecycle_shadow_events.jsonl"),
+        "lifecycle": (shadow_root / "trade_lifecycle_shadow_snapshot.json", shadow_root / "trade_lifecycle_shadow_events.jsonl"),
         "history_manager": (root / "history_events.jsonl",),
         "execution_engine": (root / "execution_engine_log.jsonl", root / "execution_audit_log.jsonl"),
         "execution_orchestrator": (root / "execution_orchestrator_log.jsonl",),
         "broker": (root / "broker_executions_log.jsonl", root / "broker_execution_audit_log.jsonl"),
-        "shadow_runtime": (root / "trade_lifecycle_shadow_runtime_events.jsonl", root / "trade_lifecycle_shadow_runtime_divergences.jsonl"),
+        "shadow_runtime": (shadow_root / "trade_lifecycle_shadow_runtime_events.jsonl", shadow_root / "trade_lifecycle_shadow_runtime_divergences.jsonl"),
         "timeline": (root / "timeline.jsonl",),
         "telegram": (root / "real_execution_telegram_notifier_v1_events.jsonl", root / "real_execution_telegram_notifier_v1_latest.json"),
     }
@@ -192,17 +227,317 @@ def _walk_dicts(value: Any) -> Iterable[Mapping[str, Any]]:
             yield from _walk_dicts(child)
 
 
-def _identity_values(record: Mapping[str, Any]) -> set[str]:
-    values: set[str] = set()
+def _identity_key(value: Any) -> str:
+    key = str(value or "").lower().strip()
+    return IDENTITY_KEY_ALIASES.get(key, key)
+
+
+def _identity_pairs(record: Mapping[str, Any]) -> Dict[str, set[str]]:
+    """Collect typed IDs without treating arbitrary values as ownership."""
+    found: Dict[str, set[str]] = {}
     for item in _walk_dicts(record):
-        for key, value in item.items():
-            if str(key).lower() in IDENTITY_KEYS and value not in (None, ""):
-                values.add(str(value).strip())
-    return values
+        for raw_key, raw_value in item.items():
+            key = _identity_key(raw_key)
+            if key not in IDENTITY_KEYS:
+                continue
+            values = raw_value if isinstance(raw_value, (list, tuple, set)) else (raw_value,)
+            for value in values:
+                if value in (None, "") or isinstance(value, Mapping):
+                    continue
+                text = str(value).strip()
+                if text:
+                    found.setdefault(key, set()).add(text)
+    return found
 
 
-def _matches(record: Mapping[str, Any], identifiers: set[str]) -> bool:
-    return bool(_identity_values(record) & identifiers)
+def _identity_values(record: Mapping[str, Any]) -> set[str]:
+    return {value for values in _identity_pairs(record).values() for value in values}
+
+
+def _normalize_symbol(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).upper().strip().replace("-", "").replace("/", "")
+    if ":" in text:
+        text = text.split(":", 1)[0]
+    return text or None
+
+
+def _normalize_side(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = str(value).upper().strip()
+    if text in {"BUY", "LONG"}:
+        return "LONG"
+    if text in {"SELL", "SHORT"}:
+        return "SHORT"
+    return text or None
+
+
+def _direct_value(record: Mapping[str, Any], *keys: str) -> Any:
+    containers = [record]
+    for name in ("metadata", "payload", "evidence", "trade", "snapshot", "result"):
+        value = record.get(name)
+        if isinstance(value, Mapping):
+            containers.append(value)
+    for container in containers:
+        for key in keys:
+            if container.get(key) not in (None, ""):
+                return container.get(key)
+    return None
+
+
+def _record_event_name(record: Mapping[str, Any]) -> str:
+    value = _direct_value(record, "event_type", "event", "action", "type")
+    return str(value or "").upper().strip().replace(" ", "_")
+
+
+def _record_profile(record: Mapping[str, Any], component: str) -> Dict[str, Optional[str]]:
+    event_name = _record_event_name(record)
+    side_value = _direct_value(record, "position_side", "positionSide")
+    if side_value in (None, "") and not (component == "broker" and "DISASTER_STOP" in event_name):
+        side_value = _direct_value(record, "side", "direction")
+    return {
+        "bot": str(_direct_value(record, "bot", "bot_name") or "").upper().strip() or None,
+        "setup": str(_direct_value(record, "setup", "strategy") or "").upper().strip() or None,
+        "symbol": _normalize_symbol(_direct_value(record, "symbol", "bingx_symbol")),
+        "side": _normalize_side(side_value),
+    }
+
+
+def _is_derived_stop_client_id(value: str) -> bool:
+    return str(value or "").upper().endswith("-DS")
+
+
+def _derived_stop_client_id(parent: str) -> str:
+    return (str(parent or "")[:24] + "-DS")[:32]
+
+
+def _strict_derived_stop_relation(
+    record: Mapping[str, Any],
+    component: str,
+    grouped: Mapping[str, set[str]],
+    context: "CorrelationContext",
+) -> bool:
+    """Accept ``-DS`` only as a strict child of a proven entry client ID.
+
+    The derived value is supporting ownership evidence exclusively for a
+    factual Broker disaster-stop creation. It never promotes a generic/truncated
+    suffix into an independent trade identity.
+    """
+    event_name = _record_event_name(record)
+    if component != "broker" or event_name not in {"BROKER_DISASTER_STOP_CREATED", "BROKER_DISASTER_STOP_ERROR"}:
+        return False
+    status = str(_direct_value(record, "status") or "").upper().strip()
+    created_fact = (
+        event_name == "BROKER_DISASTER_STOP_CREATED"
+        and _true(_direct_value(record, "ok"))
+        and _true(_direct_value(record, "created"))
+        and status == "DISASTER_STOP_CREATED"
+        and _direct_value(record, "order_id", "broker_stop_order_id", "disaster_stop_order_id") not in (None, "")
+    )
+    failed_fact = (
+        event_name == "BROKER_DISASTER_STOP_ERROR"
+        and not _true(_direct_value(record, "ok"))
+        and not _true(_direct_value(record, "created"))
+        and status == "DISASTER_STOP_ERROR"
+    )
+    if not (created_fact or failed_fact):
+        return False
+    supplied = {value for value in grouped.get("client_order", set()) if _is_derived_stop_client_id(value)}
+    parents = {value for value in context.trusted.get("client_order", set()) if not _is_derived_stop_client_id(value)}
+    expected = {_derived_stop_client_id(parent) for parent in parents}
+    return bool(supplied & expected)
+
+
+@dataclass
+class CorrelationContext:
+    """Typed, rejection-first correlation state shared by read-only sources."""
+
+    trade_id: str
+    trusted: Dict[str, set[str]] = field(default_factory=dict)
+    trusted_typed: Dict[str, set[str]] = field(default_factory=dict)
+    profile: Dict[str, Optional[str]] = field(default_factory=lambda: {"bot": None, "setup": None, "symbol": None, "side": None})
+    opened_epoch: Optional[float] = None
+    closed_epoch: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self.trusted.setdefault("trade", set()).add(self.trade_id)
+        self.trusted_typed.setdefault("trade_id", set()).add(self.trade_id)
+
+
+def new_correlation_context(trade_id: str) -> CorrelationContext:
+    return CorrelationContext(str(trade_id or "").strip())
+
+
+def _grouped_identities(record: Mapping[str, Any]) -> Dict[str, set[str]]:
+    grouped: Dict[str, set[str]] = {}
+    for key, values in _identity_pairs(record).items():
+        group = IDENTITY_GROUPS.get(key)
+        if group:
+            grouped.setdefault(group, set()).update(values)
+    return grouped
+
+
+def _profile_conflicts(record: Mapping[str, Any], component: str, context: CorrelationContext) -> bool:
+    candidate = _record_profile(record, component)
+    return any(context.profile.get(key) and value and context.profile[key] != value for key, value in candidate.items())
+
+
+def _time_conflicts(record: Mapping[str, Any], context: CorrelationContext) -> bool:
+    epoch, _ = _first_timestamp(record)
+    if epoch is None:
+        return False
+    if context.opened_epoch is not None and epoch < context.opened_epoch - CORRELATION_PRE_OPEN_SECONDS:
+        return True
+    if (
+        context.closed_epoch is not None
+        and _record_event_name(record) not in OBSERVATIONAL_META_EVENTS
+        and epoch > context.closed_epoch + CORRELATION_POST_CLOSE_SECONDS
+    ):
+        return True
+    return False
+
+
+def _has_scoped_identity_conflict(record: Mapping[str, Any], context: CorrelationContext) -> bool:
+    # Orders, client IDs and fills repeat within one lifecycle. Canonical trade
+    # aliases and instance IDs do not and must agree by their own typed field.
+    pairs = _identity_pairs(record)
+    for key in ("trade_uuid", "registry_id", "lifecycle_id", "execution_id", "decision_id", "signal_id"):
+        known = context.trusted_typed.get(key, set())
+        supplied = pairs.get(key, set())
+        if known and supplied:
+            if not (known & supplied):
+                return True
+    return False
+
+
+def _unrelated_client_order(grouped: Mapping[str, set[str]], context: CorrelationContext) -> bool:
+    """Reject another execution's client ID under a reused logical trade ID.
+
+    A truncated ``-DS`` identifier is supporting context only. It is excluded
+    here and can never establish ownership without another trusted identifier.
+    """
+    supplied = {value for value in grouped.get("client_order", set()) if not _is_derived_stop_client_id(value)}
+    known = {value for value in context.trusted.get("client_order", set()) if not _is_derived_stop_client_id(value)}
+    if not supplied or not known or supplied & known:
+        return False
+    other_instance_match = any(
+        context.trusted.get(group, set()) & grouped.get(group, set())
+        for group in ("lifecycle", "execution", "decision", "signal", "order")
+    )
+    return not other_instance_match
+
+
+def _record_matches_context(record: Mapping[str, Any], component: str, context: CorrelationContext) -> bool:
+    grouped = _grouped_identities(record)
+    explicit_trade_ids = _identity_pairs(record).get("trade_id", set())
+    if explicit_trade_ids and explicit_trade_ids != {context.trade_id}:
+        return False
+    if _profile_conflicts(record, component, context) or _time_conflicts(record, context):
+        return False
+
+    exact_trade = context.trade_id in explicit_trade_ids
+    strong_match = False
+    for group, supplied in grouped.items():
+        known = context.trusted.get(group, set())
+        if group == "client_order":
+            supplied = {value for value in supplied if not _is_derived_stop_client_id(value)}
+        if known & supplied:
+            strong_match = True
+            break
+    derived_stop_match = _strict_derived_stop_relation(record, component, grouped, context)
+    if not (exact_trade or strong_match or derived_stop_match):
+        return False
+    if _has_scoped_identity_conflict(record, context):
+        return False
+    if exact_trade and _unrelated_client_order(grouped, context):
+        return False
+    return True
+
+
+def _promote_record(record: Mapping[str, Any], component: str, context: CorrelationContext) -> None:
+    pairs = _identity_pairs(record)
+    grouped = _grouped_identities(record)
+    for key, values in pairs.items():
+        context.trusted_typed.setdefault(key, set()).update(values)
+    for group, values in grouped.items():
+        safe_values = values
+        if group == "client_order":
+            safe_values = {value for value in values if not _is_derived_stop_client_id(value)}
+        context.trusted.setdefault(group, set()).update(safe_values)
+    if component == "registry":
+        profile = _record_profile(record, component)
+        for key, value in profile.items():
+            if value:
+                context.profile[key] = value
+        opened_value = _direct_value(record, "opened_at")
+        closed_value = _direct_value(record, "closed_at")
+        opened, _ = _parse_timestamp(opened_value) if opened_value not in (None, "") else (None, None)
+        closed, _ = _parse_timestamp(closed_value) if closed_value not in (None, "") else (None, None)
+        if opened is not None:
+            context.opened_epoch = opened
+        if closed is not None:
+            context.closed_epoch = closed
+
+
+def _registry_candidates(data: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    candidates: list[Mapping[str, Any]] = []
+    opened = data.get("open_trades")
+    if isinstance(opened, Mapping):
+        candidates.extend(item for item in opened.values() if isinstance(item, Mapping))
+    closed = data.get("closed_trades")
+    if isinstance(closed, list):
+        candidates.extend(item for item in closed if isinstance(item, Mapping))
+    if isinstance(data.get("trade"), Mapping):
+        candidates.append(data["trade"])
+    return candidates or [data]
+
+
+def _component_candidates(component: str, record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    if component == "registry":
+        return _registry_candidates(record)
+    if component == "lifecycle" and isinstance(record.get("lifecycles"), Mapping):
+        return [item for item in record["lifecycles"].values() if isinstance(item, Mapping)]
+    return [record]
+
+
+def _registry_rank(record: Mapping[str, Any]) -> tuple[int, float]:
+    status = str(_direct_value(record, "status") or "").upper()
+    epoch = None
+    for key in ("opened_at", "updated_at", "closed_at", "created_at"):
+        value = _direct_value(record, key)
+        if value not in (None, ""):
+            epoch, _ = _parse_timestamp(value)
+        if epoch is not None:
+            break
+    return (1 if status == "OPEN" else 0, epoch or 0.0)
+
+
+def correlate_source_records(
+    component: str,
+    records: Iterable[Mapping[str, Any]],
+    context: CorrelationContext,
+) -> list[Mapping[str, Any]]:
+    """Return only records supported by typed IDs and consistency checks."""
+    candidates = [candidate for row in records for candidate in _component_candidates(component, row)]
+    if component == "registry":
+        exact = [row for row in candidates if context.trade_id in _identity_pairs(row).get("trade_id", set())]
+        if not exact:
+            return []
+        selected = max(exact, key=_registry_rank)
+        if _profile_conflicts(selected, component, context):
+            return []
+        _promote_record(selected, component, context)
+        return [selected]
+
+    matched: list[Mapping[str, Any]] = []
+    for record in candidates:
+        if not _record_matches_context(record, component, context):
+            continue
+        matched.append(record)
+        _promote_record(record, component, context)
+    return matched
 
 
 def _new_reader_metadata() -> Dict[str, Any]:
@@ -265,39 +600,17 @@ def _read_path(path: Path, metadata: Optional[Dict[str, Any]] = None) -> Iterabl
         yield from (item for item in data if isinstance(item, Mapping))
 
 
-def _registry_records(data: Mapping[str, Any], identifiers: set[str]) -> list[Mapping[str, Any]]:
-    candidates: list[Mapping[str, Any]] = []
-    opened = data.get("open_trades")
-    if isinstance(opened, Mapping):
-        candidates.extend(item for item in opened.values() if isinstance(item, Mapping))
-    closed = data.get("closed_trades")
-    if isinstance(closed, list):
-        candidates.extend(item for item in closed if isinstance(item, Mapping))
-    if data.get("trade") and isinstance(data["trade"], Mapping):
-        candidates.append(data["trade"])
-    if not candidates:
-        candidates.append(data)
-    return [item for item in candidates if _matches(item, identifiers)]
-
-
-def _default_reader(component: str, paths: tuple[Path, ...], shared_identifiers: Optional[set[str]] = None) -> Callable[[str], Dict[str, Any]]:
+def _default_reader(component: str, paths: tuple[Path, ...], context: Optional[CorrelationContext] = None) -> Callable[[str], Dict[str, Any]]:
     def read(trade_id: str) -> Dict[str, Any]:
-        identifiers = shared_identifiers if shared_identifiers is not None else set()
-        identifiers.add(str(trade_id).strip())
-        matched: list[Mapping[str, Any]] = []
+        active_context = context if context is not None else new_correlation_context(trade_id)
+        candidates: list[Mapping[str, Any]] = []
         reader_metadata = _new_reader_metadata()
         for path in paths:
             path_metadata = _new_reader_metadata()
             for row in _read_path(path, path_metadata):
-                if component == "registry":
-                    found = _registry_records(row, identifiers)
-                    matched.extend(found)
-                    for item in found:
-                        identifiers.update(_identity_values(item))
-                elif _matches(row, identifiers):
-                    matched.append(row)
-                    identifiers.update(_identity_values(row))
+                candidates.append(row)
             _merge_reader_metadata(reader_metadata, path_metadata)
+        matched = correlate_source_records(component, candidates, active_context)
         return {"records": matched, "_reader_metadata": reader_metadata}
 
     return read
@@ -305,8 +618,23 @@ def _default_reader(component: str, paths: tuple[Path, ...], shared_identifiers:
 
 def build_default_sources(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Callable[[str], Dict[str, Any]]]:
     """Constroi leitores locais. Nao le arquivos ate a validacao ser solicitada."""
-    identifiers: set[str] = set()
-    return {name: _default_reader(name, paths, identifiers) for name, paths in default_source_paths(environ).items()}
+    context = new_correlation_context("")
+
+    def reader_for(name: str, paths: tuple[Path, ...]) -> Callable[[str], Dict[str, Any]]:
+        def read(trade_id: str) -> Dict[str, Any]:
+            if context.trade_id != str(trade_id or "").strip():
+                fresh = new_correlation_context(trade_id)
+                context.trade_id = fresh.trade_id
+                context.trusted = fresh.trusted
+                context.trusted_typed = fresh.trusted_typed
+                context.profile = fresh.profile
+                context.opened_epoch = None
+                context.closed_epoch = None
+            return _default_reader(name, paths, context)(trade_id)
+
+        return read
+
+    return {name: reader_for(name, paths) for name, paths in default_source_paths(environ).items()}
 
 
 def _coerce_records(value: Any) -> list[Mapping[str, Any]]:
@@ -381,11 +709,112 @@ def _first_timestamp(record: Mapping[str, Any], preferred: Optional[str] = None)
 
 
 def _raw_event(record: Mapping[str, Any]) -> str:
+    direct = _record_event_name(record)
+    if direct:
+        return direct
     for item in _walk_dicts(record):
         for key in ("event_type", "event", "action", "type"):
             if item.get(key) not in (None, ""):
                 return str(item[key]).upper().strip().replace(" ", "_")
     return ""
+
+
+def _true(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").lower().strip() in {"1", "true", "yes", "sim", "on"}
+
+
+def _confirmed_broker_send(record: Mapping[str, Any]) -> bool:
+    status = str(_direct_value(record, "status") or "").upper().strip()
+    order_id = _direct_value(record, "order_id", "broker_order_id", "exchange_order_id", "id")
+    sent_with_stop_failure = status == "LIVE_SENT_BUT_DISASTER_STOP_FAILED"
+    validated_fields = _direct_value(record, "validated_fields")
+    validated = {str(item) for item in validated_fields} if isinstance(validated_fields, (list, tuple, set)) else set()
+    required = {"trade_id", "bot", "setup", "symbol", "side", "mode", "status"}
+    mode = str(_direct_value(record, "mode") or "").upper().strip()
+    registry_status = str(_direct_value(record, "registry_status") or "").upper().strip()
+    if mode in {"LIVE", "REAL"}:
+        required.update({"quantity_open", "client_order_id", "exchange_order_id"})
+        if registry_status == "OPEN":
+            required.update({"protection", "disaster_stop_order_id"})
+    return (
+        _true(_direct_value(record, "sent"))
+        and order_id not in (None, "")
+        and ((_true(_direct_value(record, "ok")) and status == "SENT") or sent_with_stop_failure)
+    )
+
+
+def _confirmed_fill(record: Mapping[str, Any]) -> bool:
+    return _direct_value(record, "fill_id") not in (None, "") and _direct_value(record, "quantity", "filled_quantity", "amount") not in (None, "")
+
+
+def _decision_allow_live(record: Mapping[str, Any]) -> bool:
+    candidates = [record]
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    for container in (record, metadata):
+        decision = container.get("execution_decision")
+        if isinstance(decision, Mapping):
+            candidates.append(decision)
+    for decision in candidates:
+        mode = str(decision.get("mode") or decision.get("execution_mode") or _direct_value(record, "mode", "execution_mode", "registry_mode") or "").upper().strip()
+        name = str(decision.get("decision") or "").upper().strip()
+        if mode in {"LIVE", "REAL"} and name == "ALLOW" and _true(decision.get("allowed")):
+            return True
+    return False
+
+
+def _explicit_decision_timestamp(record: Mapping[str, Any]) -> Any:
+    """Return only a timestamp owned by the persisted execution decision.
+
+    Registry ``opened_at``/``updated_at`` values describe persistence or the
+    position, not necessarily when Risk approved the trade. Using them for a
+    derived RISK_APPROVED event can invert the factual Broker chronology.
+    """
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+    for container in (record, metadata):
+        decision = container.get("execution_decision")
+        if not isinstance(decision, Mapping):
+            continue
+        for key in ("decided_at", "occurred_at", "timestamp", "created_at"):
+            if decision.get(key) not in (None, ""):
+                return decision[key]
+    return None
+
+
+def _shadow_match_evidence(record: Mapping[str, Any]) -> bool:
+    status = str(_direct_value(record, "status", "comparison_status") or "").upper().strip()
+    differences = _direct_value(record, "differences", "divergences")
+    authority = _direct_value(record, "operational_authority")
+    compared = _direct_value(record, "compared_fields")
+    matching = _direct_value(record, "matching_fields")
+    try:
+        comparison_complete = int(compared) > 0 and int(matching) == int(compared)
+    except (TypeError, ValueError):
+        comparison_complete = False
+    explicitly_observational = authority is False or str(authority or "").lower().strip() in {"0", "false", "no", "nao", "não"}
+    validated_fields = _direct_value(record, "validated_fields")
+    validated = {str(item) for item in validated_fields} if isinstance(validated_fields, (list, tuple, set)) else set()
+    required = {"trade_id", "bot", "setup", "symbol", "side", "mode", "status"}
+    mode = str(_direct_value(record, "mode") or "").upper().strip()
+    registry_status = str(_direct_value(record, "registry_status") or "").upper().strip()
+    if mode in {"LIVE", "REAL"}:
+        required.update({"quantity_open", "client_order_id", "exchange_order_id"})
+        if registry_status == "OPEN":
+            required.update({"protection", "disaster_stop_order_id"})
+    return (
+        _raw_event(record) == "SHADOW_VALIDATED"
+        and status == "MATCH"
+        and not differences
+        and explicitly_observational
+        and _true(_direct_value(record, "shadow_mode"))
+        and str(_direct_value(record, "source_component") or "").upper().strip()
+        == "TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER"
+        and comparison_complete
+        and mode in {"PAPER", "VERIFY", "LIVE", "REAL"}
+        and registry_status in {"OPEN", "CLOSED"}
+        and required.issubset(validated)
+    )
 
 
 def _event(component: str, canonical: str, raw: str, record: Mapping[str, Any], preferred_ts: Optional[str] = None) -> Dict[str, Any]:
@@ -403,6 +832,7 @@ def _event(component: str, canonical: str, raw: str, record: Mapping[str, Any], 
         "timestamp": timestamp,
         "epoch": epoch,
         "event_id": str(event_id) if event_id else None,
+        "fact_order_id": str(_direct_value(record, "broker_order_id", "exchange_order_id", "order_id") or "") or None,
         "identifiers": ids,
     }
 
@@ -419,8 +849,32 @@ def _events_from_record(component: str, record: Mapping[str, Any]) -> list[Dict[
 
     raw = _raw_event(record)
     canonical = EVENT_ALIASES.get(raw)
-    if canonical:
+    conditional_broker_alias = canonical == "BROKER_ACK"
+    conditional_shadow_alias = canonical == "SHADOW_VALIDATED"
+    if canonical and not conditional_broker_alias and not conditional_shadow_alias:
         events.append(_event(component, canonical, raw, record))
+    elif canonical == "BROKER_ACK" and (_confirmed_broker_send(record) or (raw == "ENTRY_FILL_RECORDED" and _confirmed_fill(record))):
+        events.append(_event(component, canonical, raw, record))
+    elif canonical == "SHADOW_VALIDATED" and component in {"shadow_runtime", "timeline"} and _shadow_match_evidence(record):
+        events.append(_event(component, canonical, raw, record))
+
+    if component in {"registry", "history_manager", "execution_engine", "execution_orchestrator", "timeline"} and _decision_allow_live(record) and not any(item["event"] == "RISK_APPROVED" for item in events):
+        risk_event = _event(component, "RISK_APPROVED", "DECISION_ALLOW_LIVE", record)
+        decision_timestamp = _explicit_decision_timestamp(record)
+        risk_event["epoch"], risk_event["timestamp"] = (
+            _parse_timestamp(decision_timestamp) if decision_timestamp not in (None, "") else (None, None)
+        )
+        events.append(risk_event)
+
+    if raw == "PLACE_MARKET_ORDER" and _confirmed_broker_send(record):
+        # A factual SENT call proves the request and, when its parallel
+        # BROKER_LIVE_SENT audit row is absent, the send and broker ACK too.
+        events.append(_event(component, "EXECUTION_REQUESTED", raw, record))
+        events.append(_event(component, "LIVE_ORDER_SENT", raw, record))
+        events.append(_event(component, "BROKER_ACK", raw, record))
+    if raw in {"BROKER_LIVE_SENT", "BROKER_LIVE_SENT_BUT_DISASTER_STOP_FAILED"} and _confirmed_broker_send(record):
+        events.append(_event(component, "LIVE_ORDER_SENT", raw, record))
+        events.append(_event(component, "BROKER_ACK", raw, record))
 
     if component == "registry":
         if record.get("opened_at") or str(record.get("status", "")).upper() in {"OPEN", "CLOSED"}:
@@ -431,17 +885,29 @@ def _events_from_record(component: str, record: Mapping[str, Any]) -> list[Dict[
         state = str(record.get("state") or record.get("current_state") or "").upper()
         if state in {"OUTCOME_RECORDED", "LEARNING_ELIGIBLE"}:
             events.append(_event(component, "LIFECYCLE_FINISHED", state, record))
-    if component == "shadow_runtime":
-        status = str(record.get("status") or record.get("comparison") or "").upper()
-        if status in {"MATCH", "APPLIED", "EVENT_APPLIED"}:
-            events.append(_event(component, "SHADOW_VALIDATED", status, record))
     return events
 
 
 def _deduplicate_extracted(events: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
     seen = set()
     result = []
+    aliases: Dict[tuple[str, str, str], int] = {}
     for item in events:
+        if (
+            item["event"] in {"LIVE_ORDER_SENT", "BROKER_ACK"}
+            and item.get("fact_order_id")
+            and item.get("raw_event") in {
+                "PLACE_MARKET_ORDER", "BROKER_LIVE_SENT",
+                "BROKER_LIVE_SENT_BUT_DISASTER_STOP_FAILED",
+            }
+        ):
+            alias_key = (item["component"], item["event"], str(item["fact_order_id"]))
+            previous_index = aliases.get(alias_key)
+            if previous_index is not None and result[previous_index].get("raw_event") != item.get("raw_event"):
+                if item.get("raw_event") in {"BROKER_LIVE_SENT", "BROKER_LIVE_SENT_BUT_DISASTER_STOP_FAILED"}:
+                    result[previous_index] = item
+                continue
+            aliases.setdefault(alias_key, len(result))
         key = (item["component"], item["event"], item.get("event_id"), item.get("timestamp"), tuple(item.get("identifiers") or ()))
         if key in seen:
             continue
@@ -461,7 +927,7 @@ def _duplicates(events: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
     for (name, component), items in groups.items():
         if len(items) < 2:
             continue
-        if name in REPEATABLE_EVENTS:
+        if name in REPEATABLE_EVENTS or name in OBSERVATIONAL_META_EVENTS:
             fingerprints = {}
             for item in items:
                 fingerprint = item.get("event_id") or (item.get("component"), item.get("timestamp"), item.get("raw_event"))
@@ -482,6 +948,8 @@ def _chronology(events: list[Dict[str, Any]]) -> Dict[str, Any]:
     highest = -1
     previous = None
     for item in timestamped:
+        if item["event"] in OBSERVATIONAL_META_EVENTS:
+            continue
         current = index.get(item["event"], highest)
         if current < highest and item["event"] not in REPEATABLE_EVENTS:
             violations.append({"event": item["event"], "timestamp": item["timestamp"], "after": previous})
@@ -493,34 +961,109 @@ def _chronology(events: list[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _latencies(events: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
-    timestamped = sorted((item for item in events if item.get("epoch") is not None), key=lambda item: item["epoch"])
+    timestamped = sorted((item for item in events if item.get("epoch") is not None and item["event"] not in OBSERVATIONAL_META_EVENTS), key=lambda item: item["epoch"])
     result = []
     for before, after in zip(timestamped, timestamped[1:]):
         result.append({"from": before["event"], "to": after["event"], "latency_ms": round((after["epoch"] - before["epoch"]) * 1000, 3)})
     return result
 
 
-def _facts(records: list[Mapping[str, Any]]) -> Dict[str, Any]:
-    aliases = {
-        "status": ("status", "state", "current_state"),
-        "symbol": ("symbol",),
-        "side": ("side", "position_side"),
-        "entry": ("entry", "entry_price", "average_price", "avg_price"),
-        "exit": ("exit_price", "close_price", "exit"),
-        "quantity": ("quantity_open", "quantity", "qty", "filled", "amount"),
-    }
+def _row_value(records: list[Mapping[str, Any]], *keys: str) -> Any:
+    for record in reversed(records):
+        for container in (record, record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}):
+            for key in keys:
+                if container.get(key) not in (None, ""):
+                    return container.get(key)
+    return None
+
+
+def _row_value_by_alias(records: list[Mapping[str, Any]], *keys: str) -> Any:
+    """Honor canonical alias precedence across root and direct metadata."""
+    for key in keys:
+        for record in reversed(records):
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+            for container in (record, metadata):
+                if container.get(key) not in (None, ""):
+                    return container.get(key)
+    return None
+
+
+def _registry_quantity(records: list[Mapping[str, Any]]) -> Any:
+    remaining = _row_value_by_alias(records, "remaining_quantity", "remaining_qty", "quantity_open", "open_qty")
+    if remaining not in (None, ""):
+        return remaining
+    return _row_value_by_alias(records, "initial_quantity", "initial_qty", "original_quantity", "quantity", "qty")
+
+
+def _broker_quantity(records: list[Mapping[str, Any]]) -> Any:
+    reduction_observed = any(
+        _record_event_name(record) in {
+            "TP50_FILL_RECORDED", "TP50_CONFIRMED", "PARTIAL_CLOSE",
+            "CLOSE_FILL_RECORDED", "CLOSE_PARTIAL_RECORDED", "CLOSE_CONFIRMED",
+            "LIVE_TRADE_CLOSED",
+        }
+        for record in records
+    )
+    for record in reversed(records):
+        raw = _record_event_name(record)
+        if "DISASTER_STOP" in raw:
+            continue
+        contracts = _direct_value(record, "contracts")
+        if contracts not in (None, ""):
+            return contracts
+    if not reduction_observed:
+        for record in reversed(records):
+            raw = _record_event_name(record)
+            if raw in {
+                "BROKER_LIVE_SENT", "BROKER_LIVE_SENT_BUT_DISASTER_STOP_FAILED",
+                "PLACE_MARKET_ORDER",
+            } and _confirmed_broker_send(record):
+                value = _direct_value(record, "contracts", "quantity", "qty", "amount")
+                if value not in (None, ""):
+                    return value
+    for record in reversed(records):
+        raw = _record_event_name(record)
+        position_fact = _direct_value(record, "position_found") is True or str(_direct_value(record, "position_status") or "").upper() in {"OPEN", "ACTIVE"}
+        if position_fact and "DISASTER_STOP" not in raw:
+            value = _direct_value(record, "quantity", "qty")
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _facts(records: list[Mapping[str, Any]], component: str) -> Dict[str, Any]:
     facts: Dict[str, Any] = {}
-    for record in records:
-        for item in _walk_dicts(record):
-            for canonical, keys in aliases.items():
-                for key in keys:
-                    if item.get(key) not in (None, ""):
-                        facts[canonical] = item[key]
-                        break
-    return facts
+    if component == "registry":
+        facts["status"] = _row_value(records, "status")
+        facts["quantity"] = _registry_quantity(records)
+    elif component == "broker":
+        facts["status"] = _row_value(records, "position_status")
+        if facts["status"] in (None, ""):
+            for record in reversed(records):
+                if _direct_value(record, "position_found") is not None:
+                    facts["status"] = _direct_value(record, "status")
+                    break
+        facts["quantity"] = _broker_quantity(records)
+    elif component == "shadow_runtime":
+        facts["status"] = _row_value(records, "state", "current_state", "lifecycle_state")
+        facts["quantity"] = _row_value(records, "quantity_open", "quantity", "qty", "filled")
+    else:
+        facts["status"] = _row_value(records, "status", "state", "current_state")
+        facts["quantity"] = _row_value(records, "quantity_open", "quantity", "qty", "filled")
+    facts.update({
+        "symbol": _row_value(records, "symbol"),
+        "side": _row_value(records, "position_side", "side"),
+        "entry": _row_value(records, "entry", "entry_price", "average_price", "avg_price", "price_ref"),
+        "exit": _row_value(records, "exit_price", "close_price", "exit"),
+    })
+    return {key: value for key, value in facts.items() if value not in (None, "")}
 
 
-def _equal_fact(left: Any, right: Any) -> bool:
+def _equal_fact(left: Any, right: Any, field: Optional[str] = None) -> bool:
+    if field == "symbol":
+        return _normalize_symbol(left) == _normalize_symbol(right)
+    if field == "side":
+        return _normalize_side(left) == _normalize_side(right)
     try:
         a, b = float(left), float(right)
         return abs(a - b) <= max(1e-8, max(abs(a), abs(b)) * 1e-8)
@@ -535,7 +1078,7 @@ def _compare(left_name: str, right_name: str, facts: Mapping[str, Mapping[str, A
     left, right = facts.get(left_name, {}), facts.get(right_name, {})
     result = []
     for field in sorted(set(left) & set(right)):
-        if not _equal_fact(left[field], right[field]):
+        if not _equal_fact(left[field], right[field], field):
             result.append({"components": [left_name, right_name], "field": field, "left": _json_safe(left[field]), "right": _json_safe(right[field])})
     return result
 
@@ -555,6 +1098,7 @@ class TradeTimelineValidator:
         records: Dict[str, list[Mapping[str, Any]]] = {}
         errors = []
         warnings = []
+        correlation = new_correlation_context(identity)
 
         if not identity:
             errors.append({"component": "validator", "error_type": "ValueError", "message": "trade_id is required"})
@@ -567,7 +1111,7 @@ class TradeTimelineValidator:
                 continue
             try:
                 value = source(identity) if callable(source) else source
-                rows = _coerce_records(value)
+                rows = correlate_source_records(name, _coerce_records(value), correlation)
                 reader_metadata = _reader_metadata(value)
                 records[name] = rows
                 fully_corrupt = bool(
@@ -612,7 +1156,7 @@ class TradeTimelineValidator:
         missing = [name for name in REQUIRED_EVENTS if name not in present]
         duplicates = _duplicates(events)
         chronology = _chronology(events)
-        facts = {name: _facts(rows) for name, rows in records.items()}
+        facts = {name: _facts(rows, name) for name, rows in records.items()}
         divergences = _compare("registry", "broker", facts) + _compare("lifecycle", "shadow_runtime", facts)
         timeline_absent = components["timeline"]["status"] != "AVAILABLE"
         validation_errors = bool(errors or missing or duplicates or divergences or not chronology["ordered"] or timeline_absent or not identity)
@@ -687,8 +1231,11 @@ __all__ = [
     "COMPONENTS",
     "EVENT_ORDER",
     "REQUIRED_EVENTS",
+    "CorrelationContext",
     "TradeTimelineValidator",
     "build_default_sources",
+    "correlate_source_records",
     "default_source_paths",
+    "new_correlation_context",
     "validate_trade_timeline",
 ]
