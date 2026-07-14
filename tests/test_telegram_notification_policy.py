@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,7 +42,67 @@ def test_false_preserves_legacy_behavior():
 def test_live_automatic_is_allowed():
     result = decide(mode="LIVE", event_type="LIVE_ORDER_SENT")
     assert result["allowed"] is True
-    assert result["reason"] == "LIVE_EVENT"
+    assert result["reason"] == "LIVE_OPERATIONAL_EVENT"
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    ["FALCON_STARTUP", "BOT_STARTUP", "FALCON_NOTIFICATION", "UNRECOGNIZED_LIVE_EVENT", None],
+)
+def test_live_informational_unknown_or_missing_event_is_blocked(event_type):
+    result = decide(bot="FALCON", mode="LIVE", event_type=event_type)
+    assert result["allowed"] is False
+    assert result["reason"] == "LIVE_EVENT_NOT_ALLOWLISTED"
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "REAL_EXECUTION_SENT",
+        "REAL_EXECUTION_BLOCKED",
+        "DISASTER_STOP_FAILED",
+        "TP50_LIVE",
+        "BREAK_EVEN_LIVE",
+        "TRAILING_UPDATED_LIVE",
+        "LIVE_TRADE_CLOSED",
+    ],
+)
+def test_recognized_live_operational_events_are_allowed(event_type):
+    result = decide(bot="FALCON", mode="LIVE", event_type=event_type)
+    assert result["allowed"] is True
+    assert result["reason"] == "LIVE_OPERATIONAL_EVENT"
+
+
+def test_operational_allowlist_covers_real_trade_lifecycle_contract():
+    required = {
+        "SIGNAL_LIVE_AUTHORIZED",
+        "REAL_EXECUTION_SENT",
+        "REAL_EXECUTION_SENT_ATTENTION",
+        "REAL_EXECUTION_BLOCKED",
+        "REAL_EXECUTION_FAILED_BEFORE_SEND",
+        "FALCON_LIVE_PRE_ORDER_TELEGRAM",
+        "FALCON_LIVE_POST_ORDER_AUDIT",
+        "DISASTER_STOP_REQUESTED",
+        "DISASTER_STOP_CREATED",
+        "DISASTER_STOP_CONFIRMED",
+        "DISASTER_STOP_FAILED",
+        "TP50_LIVE",
+        "PARTIAL_EXIT_LIVE",
+        "BREAK_EVEN_LIVE",
+        "TRAILING_STARTED_LIVE",
+        "TRAILING_UPDATED_LIVE",
+        "STOP_UPDATED_LIVE",
+        "STOP_EXECUTED_LIVE",
+        "LIVE_TRADE_CLOSED",
+        "LIVE_MANAGEMENT_ERROR",
+        "LIVE_POSITION_DIVERGENCE",
+        "OWNERSHIP_ERROR",
+        "BROKER_CRITICAL",
+    }
+    assert required <= policy.LIVE_OPERATIONAL_EVENT_TYPES
+    assert {"FALCON_STARTUP", "BOT_STARTUP", "FALCON_NOTIFICATION"}.isdisjoint(
+        policy.LIVE_OPERATIONAL_EVENT_TYPES
+    )
 
 
 @pytest.mark.parametrize("mode", ["PAPER", "VERIFY", "DRY_RUN", "SHADOW", "OBSERVATION_ONLY", None, "UNKNOWN"])
@@ -68,9 +129,21 @@ def test_severity_alone_does_not_override_policy():
     assert decide(severity="P0", operational_critical=False)["allowed"] is False
 
 
-def test_falcon_paper_is_blocked_and_predator_live_is_allowed():
-    assert decide(bot="FALCON", mode="PAPER")["allowed"] is False
-    assert decide(bot="PREDATOR", mode="LIVE")["allowed"] is True
+def test_operational_event_requires_live_mode_and_is_bot_agnostic():
+    assert decide(bot="FALCON", mode="PAPER", event_type="REAL_EXECUTION_SENT")["allowed"] is False
+    assert decide(bot="FALCON", mode="VERIFY", event_type="REAL_EXECUTION_SENT")["allowed"] is False
+    assert decide(bot="PREDATOR", mode="LIVE", event_type="SIGNAL_LIVE_AUTHORIZED")["allowed"] is True
+
+
+def test_flag_false_restores_legacy_falcon_startup():
+    result = decide(
+        bot="FALCON",
+        mode="LIVE",
+        event_type="FALCON_STARTUP",
+        environ={"CENTRAL_TELEGRAM_LIVE_ONLY_ENABLED": "false"},
+    )
+    assert result["allowed"] is True
+    assert result["reason"] == "LEGACY_POLICY_DISABLED"
 
 
 def test_canonical_arguments_win_over_metadata_and_input_is_immutable():
@@ -109,6 +182,43 @@ def test_policy_logs_never_include_message_body(capsys):
     output = capsys.readouterr().out
     assert "TELEGRAM_NOTIFICATION_BLOCKED" in output
     assert secret_body not in output
+
+
+def test_strict_live_logs_and_counters(capsys):
+    before = policy.telegram_notification_policy_health({})
+    sender = lambda _message: True
+    policy.send_automatic_telegram(
+        sender,
+        "startup body",
+        bot="FALCON",
+        event_type="FALCON_STARTUP",
+        mode="LIVE",
+        environ={},
+    )
+    policy.send_automatic_telegram(
+        sender,
+        "unknown body",
+        bot="FALCON",
+        event_type="UNKNOWN_LIVE_EVENT",
+        mode="LIVE",
+        environ={},
+    )
+    policy.send_automatic_telegram(
+        sender,
+        "real body",
+        bot="FALCON",
+        event_type="REAL_EXECUTION_SENT",
+        mode="LIVE",
+        environ={},
+    )
+    after = policy.telegram_notification_policy_health({})
+    assert after["telegram_auto_blocked_live_informational"] == before["telegram_auto_blocked_live_informational"] + 1
+    assert after["telegram_auto_blocked_unknown_event"] == before["telegram_auto_blocked_unknown_event"] + 1
+    assert after["telegram_auto_allowed_live_operational"] == before["telegram_auto_allowed_live_operational"] + 1
+    output = capsys.readouterr().out
+    assert "event_type=FALCON_STARTUP mode=LIVE reason=LIVE_EVENT_NOT_ALLOWLISTED" in output
+    assert "event_type=REAL_EXECUTION_SENT mode=LIVE reason=LIVE_OPERATIONAL_EVENT" in output
+    assert "startup body" not in output
 
 
 def test_send_helper_allows_live_manual_and_critical():
@@ -157,11 +267,14 @@ def test_health_is_lightweight_and_in_memory():
         "telegram_live_auto_notifications_enabled",
         "telegram_critical_notifications_enabled",
         "telegram_auto_allowed_live",
+        "telegram_auto_allowed_live_operational",
         "telegram_auto_allowed_critical",
         "telegram_auto_allowed_manual",
         "telegram_auto_blocked_paper",
         "telegram_auto_blocked_verify",
         "telegram_auto_blocked_unknown",
+        "telegram_auto_blocked_live_informational",
+        "telegram_auto_blocked_unknown_event",
     }
     assert expected <= set(health)
     assert health["telegram_paper_auto_notifications_enabled"] is False
@@ -229,6 +342,86 @@ def test_falcon_real_and_verify_contexts_are_explicit():
         assert event in source
 
 
+def _compile_falcon_function(name, namespace):
+    source = (ROOT / "bots/falcon.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == name)
+    node.decorator_list = []
+    isolated = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(isolated)
+    exec(compile(isolated, "<isolated-falcon-telegram>", "exec"), namespace)
+    return namespace[name]
+
+
+def _falcon_startup_harness(monkeypatch, live_only):
+    monkeypatch.setenv("CENTRAL_TELEGRAM_LIVE_ONLY_ENABLED", "true" if live_only else "false")
+    transports = []
+    policy_namespace = {
+        "send_automatic_telegram": policy.send_automatic_telegram,
+        "_safe_send_telegram_transport": lambda message: transports.append(message) or True,
+        "FALCON_MODE": "LIVE",
+    }
+    safe_send = _compile_falcon_function("safe_send_telegram", policy_namespace)
+
+    started = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            started.append({"target": target, "args": args, "daemon": daemon, "started": False})
+
+        def start(self):
+            started[-1]["started"] = True
+
+    namespace = {
+        "HEALTH": {},
+        "data_hora_sp_str": lambda: "2026-07-13 12:00:00",
+        "safe_send_telegram": safe_send,
+        "SETUPS": {"FALCON15": {}, "FALCON30": {}},
+        "TIMEFRAME": "15m",
+        "ORB_START_HOUR": 9,
+        "ORB_START_MINUTE": 30,
+        "ORB_TRADE_END_HOUR": 12,
+        "ORB_TRADE_END_MINUTE": 0,
+        "ALIGNMENT_MODE": "off",
+        "FALCON_MODE": "LIVE",
+        "threading": SimpleNamespace(Thread=FakeThread),
+        "run_thread_guarded": lambda *args: None,
+        "scanner_loop": lambda: None,
+        "management_loop": lambda: None,
+        "summary_loop": lambda: None,
+        "watchdog_loop": lambda: None,
+    }
+    startup = _compile_falcon_function("start_threads", namespace)
+    startup()
+    return transports, started, namespace["HEALTH"]
+
+
+def test_falcon_startup_is_blocked_but_initialization_is_preserved(monkeypatch):
+    transports, started, health = _falcon_startup_harness(monkeypatch, live_only=True)
+    assert transports == []
+    assert len(started) == 4
+    assert all(item["started"] and item["daemon"] for item in started)
+    assert health["started_at"] == "2026-07-13 12:00:00"
+
+
+def test_falcon_startup_returns_to_legacy_transport_when_flag_is_false(monkeypatch):
+    transports, started, _health = _falcon_startup_harness(monkeypatch, live_only=False)
+    assert len(transports) == 1
+    assert "Falcon Strike iniciado" in transports[0]
+    assert len(started) == 4
+
+
+def test_falcon_startup_has_explicit_informational_context_and_no_new_cooldown():
+    source = (ROOT / "bots/falcon.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "start_threads")
+    function_source = ast.get_source_segment(source, node)
+    assert 'event_type="FALCON_STARTUP"' in function_source
+    assert "operational_critical=False" in function_source
+    assert "manual_command=False" in function_source
+    assert "cooldown" not in function_source.lower()
+
+
 def test_central_manual_command_transport_remains_direct():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     start = source.index("def central_telegram_command_loop")
@@ -236,3 +429,5 @@ def test_central_manual_command_transport_remains_direct():
     command_loop = source[start:end]
     assert "telegram_send_with_token" in command_loop
     assert "central_send_automatic_telegram" not in command_loop
+    for command in ("/live", "/sync", "/bots", "/health", "/resumo"):
+        assert command in source

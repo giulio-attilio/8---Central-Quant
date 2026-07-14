@@ -375,7 +375,14 @@ def _safe_send_telegram_transport(message):
         return False
 
 
-def safe_send_telegram(message, *, event_type="FALCON_NOTIFICATION", mode=None, operational_critical=False):
+def safe_send_telegram(
+    message,
+    *,
+    event_type="FALCON_NOTIFICATION",
+    mode=None,
+    operational_critical=False,
+    manual_command=False,
+):
     result = send_automatic_telegram(
         _safe_send_telegram_transport,
         message,
@@ -384,6 +391,7 @@ def safe_send_telegram(message, *, event_type="FALCON_NOTIFICATION", mode=None, 
         mode=mode or FALCON_MODE,
         severity="CRITICAL" if operational_critical else None,
         operational_critical=operational_critical,
+        manual_command=manual_command,
     )
     return bool(result.get("sent"))
 
@@ -2390,7 +2398,11 @@ def start_threads():
         f"ORB NY: {ORB_START_HOUR:02d}:{ORB_START_MINUTE:02d}\n"
         f"Opera até: {ORB_TRADE_END_HOUR:02d}:{ORB_TRADE_END_MINUTE:02d} NY\n"
         f"Alinhamento: {ALIGNMENT_MODE}\n"
-        f"Modo: {FALCON_MODE} / {'BINGX AUTO' if FALCON_MODE == 'LIVE' else ('VERIFY SEM ENVIO' if FALCON_MODE == 'VERIFY' else 'BINGX BLOQUEADA')}"
+        f"Modo: {FALCON_MODE} / {'BINGX AUTO' if FALCON_MODE == 'LIVE' else ('VERIFY SEM ENVIO' if FALCON_MODE == 'VERIFY' else 'BINGX BLOQUEADA')}",
+        event_type="FALCON_STARTUP",
+        mode=FALCON_MODE,
+        operational_critical=False,
+        manual_command=False,
     )
     threading.Thread(target=run_thread_guarded, args=("scanner", scanner_loop), daemon=True).start()
     threading.Thread(target=run_thread_guarded, args=("management", management_loop), daemon=True).start()

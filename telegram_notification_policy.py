@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 _TRUE_VALUES = {"1", "true", "yes", "sim", "on"}
 _VERIFY_MODES = {"VERIFY", "DRY_RUN", "SHADOW", "OBSERVATION_ONLY"}
-_LIVE_EVENT_TYPES = frozenset(
+LIVE_OPERATIONAL_EVENT_TYPES = frozenset(
     {
         "SIGNAL_LIVE_AUTHORIZED",
         "LIVE_ORDER_SENT",
@@ -25,7 +25,9 @@ _LIVE_EVENT_TYPES = frozenset(
         "REAL_EXECUTION_BLOCKED",
         "REAL_EXECUTION_FAILED_BEFORE_SEND",
         "REAL_EXECUTION_RESULT",
+        "DISASTER_STOP_REQUESTED",
         "DISASTER_STOP_CREATED",
+        "DISASTER_STOP_CONFIRMED",
         "DISASTER_STOP_FAILED",
         "TP50_LIVE",
         "PARTIAL_EXIT_LIVE",
@@ -46,13 +48,46 @@ _LIVE_EVENT_TYPES = frozenset(
     }
 )
 
+LIVE_INFORMATIONAL_EVENT_TYPES = frozenset(
+    {
+        "FALCON_NOTIFICATION",
+        "FALCON_STARTUP",
+        "BOT_STARTUP",
+        "STARTUP",
+        "READY",
+        "READINESS",
+        "CONFIGURATION",
+        "HEARTBEAT",
+        "SCANNER_STARTED",
+        "WATCHDOG_STARTED",
+        "STATUS",
+        "FALCON_LIVE_AUDIT",
+    }
+)
+
+CRITICAL_EVENT_TYPES = frozenset(
+    {
+        "RUNTIME_CRITICAL",
+        "OOM",
+        "FILESYSTEM_CRITICAL",
+        "BROKER_CRITICAL",
+        "DISASTER_STOP_FAILED",
+        "LIVE_MANAGEMENT_ERROR",
+        "LIVE_POSITION_DIVERGENCE",
+        "OWNERSHIP_ERROR",
+    }
+)
+
 _METRICS = {
     "telegram_auto_allowed_live": 0,
+    "telegram_auto_allowed_live_operational": 0,
     "telegram_auto_allowed_critical": 0,
     "telegram_auto_allowed_manual": 0,
     "telegram_auto_blocked_paper": 0,
     "telegram_auto_blocked_verify": 0,
     "telegram_auto_blocked_unknown": 0,
+    "telegram_auto_blocked_live_informational": 0,
+    "telegram_auto_blocked_unknown_event": 0,
     "telegram_auto_last_blocked_at": None,
     "telegram_auto_last_blocked_bot": None,
     "telegram_auto_last_blocked_event": None,
@@ -101,10 +136,12 @@ def should_send_automatic_telegram(
             allowed, reason = True, "CRITICAL_OVERRIDE"
         elif not enabled:
             allowed, reason = True, "LEGACY_POLICY_DISABLED"
-        elif normalized_mode == "LIVE":
-            allowed, reason = True, "LIVE_EVENT"
-        else:
+        elif normalized_mode != "LIVE":
             allowed, reason = False, "LIVE_ONLY_POLICY"
+        elif normalized_event not in LIVE_OPERATIONAL_EVENT_TYPES:
+            allowed, reason = False, "LIVE_EVENT_NOT_ALLOWLISTED"
+        else:
+            allowed, reason = True, "LIVE_OPERATIONAL_EVENT"
 
         return {
             "allowed": allowed,
@@ -116,7 +153,9 @@ def should_send_automatic_telegram(
             "critical_override": operational_critical is True,
             "manual_override": manual_command is True,
             "live_only_enabled": enabled,
-            "known_live_event": normalized_event in _LIVE_EVENT_TYPES,
+            "known_live_event": normalized_event in LIVE_OPERATIONAL_EVENT_TYPES,
+            "live_operational_event": normalized_event in LIVE_OPERATIONAL_EVENT_TYPES,
+            "live_informational_event": normalized_event in LIVE_INFORMATIONAL_EVENT_TYPES,
         }
     except Exception:
         # Manual/crítico explicitamente marcado continua permitido; o restante fecha.
@@ -132,6 +171,8 @@ def should_send_automatic_telegram(
             "manual_override": manual_command is True,
             "live_only_enabled": True,
             "known_live_event": False,
+            "live_operational_event": False,
+            "live_informational_event": False,
         }
 
 
@@ -143,9 +184,14 @@ def _record_decision(decision):
             _METRICS["telegram_auto_allowed_critical"] += 1
         elif decision.get("allowed") and decision.get("mode") == "LIVE":
             _METRICS["telegram_auto_allowed_live"] += 1
+            _METRICS["telegram_auto_allowed_live_operational"] += 1
         elif not decision.get("allowed"):
             mode = decision.get("mode")
-            if mode == "PAPER":
+            if mode == "LIVE" and decision.get("live_informational_event"):
+                key = "telegram_auto_blocked_live_informational"
+            elif mode == "LIVE":
+                key = "telegram_auto_blocked_unknown_event"
+            elif mode == "PAPER":
                 key = "telegram_auto_blocked_paper"
             elif mode in _VERIFY_MODES:
                 key = "telegram_auto_blocked_verify"
@@ -168,7 +214,7 @@ def _log_decision(decision):
             elif decision.get("critical_override"):
                 reason = "CRITICAL_OVERRIDE"
             elif decision.get("mode") == "LIVE":
-                reason = "LIVE_EVENT"
+                reason = "LIVE_OPERATIONAL_EVENT"
             else:
                 return
             print(
@@ -241,6 +287,9 @@ def telegram_notification_policy_health(environ=None):
 
 
 __all__ = [
+    "CRITICAL_EVENT_TYPES",
+    "LIVE_INFORMATIONAL_EVENT_TYPES",
+    "LIVE_OPERATIONAL_EVENT_TYPES",
     "send_automatic_telegram",
     "should_send_automatic_telegram",
     "telegram_live_only_enabled",
