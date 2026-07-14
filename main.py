@@ -48006,6 +48006,147 @@ def trade_timeline_validator_v1_route():
         }, 500
 
 
+# ============================================================================
+# LIVE TRADE SNAPSHOT V1 — MANUAL READ-ONLY HTTP SURFACE
+# ============================================================================
+@app.route("/trade_snapshot", methods=["GET"])
+def live_trade_snapshot_v1_route():
+    """Constroi um snapshot manual sem autoridade ou efeito operacional."""
+    raw_trade_id = request.args.get("trade_id")
+    if raw_trade_id is None:
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_REQUIRED",
+            "fail_open": True,
+            "production_blocked": False,
+            "operational_impact": False,
+        }, 400
+    if not isinstance(raw_trade_id, str):
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_MUST_BE_TEXT",
+            "fail_open": True,
+            "production_blocked": False,
+            "operational_impact": False,
+        }, 400
+
+    trade_id = raw_trade_id.strip()
+    if not trade_id:
+        return {
+            "ok": False,
+            "trade_id": "",
+            "error": "TRADE_ID_REQUIRED",
+            "fail_open": True,
+            "production_blocked": False,
+            "operational_impact": False,
+        }, 400
+    if len(trade_id) > 256:
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_TOO_LONG",
+            "max_length": 256,
+            "fail_open": True,
+            "production_blocked": False,
+            "operational_impact": False,
+        }, 400
+    if (
+        trade_id in {".", ".."}
+        or any(char in trade_id for char in ("/", "\\", "\x00"))
+        or any(ord(char) < 32 or ord(char) == 127 for char in trade_id)
+    ):
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_INVALID",
+            "fail_open": True,
+            "production_blocked": False,
+            "operational_impact": False,
+        }, 400
+
+    try:
+        # Import local: a interface permanece manual e fora do startup.
+        from live_trade_snapshot import build_live_trade_snapshot
+
+        report = build_live_trade_snapshot(trade_id)
+        if not isinstance(report, dict):
+            raise TypeError("live trade snapshot returned a non-dict report")
+
+        public_keys = (
+            "ok",
+            "snapshot_version",
+            "generated_at",
+            "trade_id",
+            "snapshot_status",
+            "trade_status",
+            "fail_open",
+            "production_blocked",
+            "operational_impact",
+            "identity",
+            "trade",
+            "broker",
+            "registry",
+            "lifecycle",
+            "execution",
+            "risk_protection",
+            "management",
+            "shadow",
+            "telegram",
+            "timeline_validation",
+            "external_exposure",
+            "component_status",
+            "divergences",
+            "warnings",
+            "errors",
+            "grace_windows_seconds",
+            "coverage",
+            "duration_ms",
+        )
+        payload = {key: report.get(key) for key in public_keys}
+        payload["trade_id"] = trade_id
+        payload["fail_open"] = True
+        payload["production_blocked"] = False
+        payload["operational_impact"] = False
+        return payload, 200
+    except Exception as exc:
+        try:
+            app.logger.exception(
+                "live trade snapshot route failed: %s",
+                type(exc).__name__,
+            )
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "snapshot_version": "LIVE_TRADE_SNAPSHOT_V1",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "trade_id": trade_id,
+            "snapshot_status": "ERROR",
+            "trade_status": "UNKNOWN",
+            "fail_open": True,
+            "production_blocked": False,
+            "operational_impact": False,
+            "identity": {},
+            "trade": {},
+            "broker": {},
+            "registry": {},
+            "lifecycle": {},
+            "execution": {},
+            "risk_protection": {},
+            "management": {},
+            "shadow": {},
+            "telegram": {},
+            "timeline_validation": {},
+            "external_exposure": {},
+            "component_status": {},
+            "divergences": [],
+            "warnings": [],
+            "errors": [{"code": "LIVE_TRADE_SNAPSHOT_ROUTE_INTERNAL_ERROR"}],
+        }, 500
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
