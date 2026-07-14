@@ -106,6 +106,53 @@ def stop_evidence(quantity: float = 2.0):
     }
 
 
+def registry_live_entry_confirmation(suffix: str = "A", **updates):
+    evidence = {
+        "registry_live_open_post_ack": True,
+        "registry_source_component": "TRADE_REGISTRY",
+        "registry_status": "OPEN",
+        "mode": "LIVE",
+        "execution_sent": True,
+        "trade_id": f"TR-{suffix}",
+        "client_order_id": f"CLIENT-{suffix}",
+        "exchange_order_id": f"ORDER-{suffix}",
+        "quantity": 2.0,
+        "entry_price_theoretical": 100.0,
+        "entry_price_reference": 100.25,
+        "opened_at": "2026-07-14T11:00:22+00:00",
+    }
+    evidence.update(updates)
+    return evidence
+
+
+def broker_tp50_reduction(order_id: str = "TP50-ORDER-1", quantity: float = 0.5, **updates):
+    evidence = {
+        "broker_reduction_confirmed": True,
+        "broker_order_id": order_id,
+        "quantity": quantity,
+    }
+    evidence.update(updates)
+    return evidence
+
+
+def registry_live_close(suffix: str = "A", quantity: float = 2.0, **updates):
+    evidence = {
+        "registry_live_closed_factual": True,
+        "registry_source_component": "TRADE_REGISTRY",
+        "registry_status": "CLOSED",
+        "mode": "LIVE",
+        "trade_id": f"TR-{suffix}",
+        "closed_at": "2026-07-14T12:32:04+00:00",
+        "close_reason": "STOP_FAILSAFE_MARKET",
+        "quantity": quantity,
+        "exit_price": 77.621,
+        "result_pct": -0.9218,
+        "result_r": -1.0966,
+    }
+    evidence.update(updates)
+    return evidence
+
+
 def advance_to_managed(manager, suffix: str = "A"):
     lifecycle_id = advance_to_entry_confirmed(manager, suffix)
     assert manager.apply_event(lifecycle_id, event("DISASTER_STOP_REQUESTED", 8), persist=False)["ok"]
@@ -320,6 +367,23 @@ def test_26_recovery(manager):
         persist=False,
     )
     assert completed["current_state"] == "ENTRY_PROTECTED"
+
+
+def test_recovery_required_is_cleared_by_factual_disaster_stop_confirmation(manager):
+    lifecycle_id = advance_to_entry_confirmed(manager)
+    manager.apply_event(lifecycle_id, event("DISASTER_STOP_FAILED", 8, reason="reject"), persist=False)
+    manager.mark_recovery_required(lifecycle_id, "stop missing", persist=False)
+
+    completed = manager.apply_event(
+        lifecycle_id,
+        event("DISASTER_STOP_CONFIRMED", 9, **stop_evidence()),
+        persist=False,
+    )
+
+    assert completed["current_state"] == "ENTRY_PROTECTED"
+    assert completed["snapshot"]["recovery"]["required"] is False
+    assert completed["snapshot"]["recovery"]["completed"] is True
+    assert completed["snapshot"]["recovery"]["completed_by"] == "DISASTER_STOP_CONFIRMED"
 
 
 def test_27_manual_position_remains_external(manager):
@@ -630,3 +694,541 @@ def test_60_paper_open_closed_projection_matches_registry(manager):
     closed = manager.compare_with_registry("LC-A", {"trade_id": "TR-A", "mode": "PAPER", "status": "CLOSED"})
     assert not any(item["field"] == "open_closed_status" for item in opened["differences"])
     assert not any(item["field"] == "open_closed_status" for item in closed["differences"])
+
+
+def test_61_registry_live_open_post_ack_confirms_entry_without_inventing_fill(manager):
+    lifecycle_id = advance_to_submitting(manager)
+    result = manager.apply_event(
+        lifecycle_id,
+        event("ENTRY_CONFIRMED", 21, **registry_live_entry_confirmation()),
+        persist=False,
+    )
+
+    assert result["current_state"] == "ENTRY_CONFIRMED"
+    assert result["snapshot"]["quantity_filled"] == pytest.approx(2.0)
+    assert result["snapshot"]["quantity_open"] == pytest.approx(2.0)
+    assert result["snapshot"]["fill_ids"] == []
+    assert result["snapshot"]["entry_confirmation"] == {
+        "confirmed": True,
+        "source": "REGISTRY_LIVE_OPEN_POST_ACK",
+        "event_id": "EV-21",
+        "trade_id": "TR-A",
+        "client_order_id": "CLIENT-A",
+        "exchange_order_id": "ORDER-A",
+        "quantity": 2.0,
+        "entry_price_theoretical": 100.0,
+        "entry_price_reference": 100.25,
+        "entry_price_confirmed": None,
+        "opened_at": "2026-07-14T11:00:22+00:00",
+        "confirmed_at": result["snapshot"]["entry_confirmation"]["confirmed_at"],
+    }
+    assert result["snapshot"]["entry_price_theoretical"] == 100.0
+    assert result["snapshot"]["entry_price_reference"] == 100.25
+    assert result["snapshot"]["entry_price_confirmed"] is None
+
+
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("registry_live_open_post_ack", False),
+        ("registry_source_component", "OTHER"),
+        ("registry_status", "CLOSED"),
+        ("mode", "PAPER"),
+        ("execution_sent", False),
+        ("trade_id", None),
+        ("client_order_id", None),
+        ("exchange_order_id", None),
+        ("quantity", 0.0),
+    ],
+)
+def test_62_registry_live_entry_confirmation_rejects_weak_evidence(manager, field, bad_value):
+    lifecycle_id = advance_to_submitting(manager)
+    evidence = registry_live_entry_confirmation()
+    evidence[field] = bad_value
+    result = manager.apply_event(lifecycle_id, event("ENTRY_CONFIRMED", 21, **evidence), persist=False)
+
+    assert result["blocked"]
+    assert result["current_state"] == "ENTRY_SUBMITTING"
+    assert result["snapshot"]["quantity_filled"] == 0.0
+    assert result["snapshot"]["quantity_open"] == 0.0
+    assert result["snapshot"]["fill_ids"] == []
+
+
+def test_63_registry_live_entry_confirmation_requires_explicit_event_id(manager):
+    lifecycle_id = advance_to_submitting(manager)
+    item = event("ENTRY_CONFIRMED", 21, **registry_live_entry_confirmation())
+    item.pop("event_id")
+    result = manager.apply_event(lifecycle_id, item, persist=False)
+
+    assert result["blocked"]
+    assert any("requires event_id" in reason for reason in result["reasons"])
+    assert result["snapshot"]["fill_ids"] == []
+
+
+def test_64_registry_live_entry_confirmation_is_idempotent_by_order(manager):
+    lifecycle_id = advance_to_submitting(manager)
+    first = manager.apply_event(lifecycle_id, event("ENTRY_CONFIRMED", 21, **registry_live_entry_confirmation()), persist=False)
+    duplicate = manager.apply_event(lifecycle_id, event("ENTRY_CONFIRMED", 22, **registry_live_entry_confirmation()), persist=False)
+
+    assert first["event_applied"]
+    assert duplicate["duplicate"] and duplicate["status"] == "DUPLICATE_REGISTRY_ENTRY_CONFIRMATION"
+    assert duplicate["snapshot"]["quantity_filled"] == pytest.approx(2.0)
+    assert duplicate["snapshot"]["fill_ids"] == []
+
+
+def test_65_tp50_broker_reduction_without_fill_preserves_identity_and_quantities(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("TP50_REQUESTED", 21, quantity=1.0), persist=False)
+    result = manager.apply_event(
+        lifecycle_id,
+        event("TP50_FILL_RECORDED", 22, **broker_tp50_reduction()),
+        persist=False,
+    )
+
+    assert result["current_state"] == "TP50_PENDING"
+    assert result["snapshot"]["quantity_closed"] == pytest.approx(0.5)
+    assert result["snapshot"]["quantity_open"] == pytest.approx(1.5)
+    assert result["snapshot"]["fill_ids"] == ["FILL-A-1"]
+    assert result["snapshot"]["tp50"]["broker_order_ids"] == ["TP50-ORDER-1"]
+    assert result["snapshot"]["tp50"]["quantity_confirmed"] == pytest.approx(0.5)
+
+
+def test_66_tp50_broker_reduction_is_idempotent_by_broker_order(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("TP50_REQUESTED", 21, quantity=1.0), persist=False)
+    manager.apply_event(lifecycle_id, event("TP50_FILL_RECORDED", 22, **broker_tp50_reduction()), persist=False)
+    duplicate = manager.apply_event(lifecycle_id, event("TP50_FILL_RECORDED", 23, **broker_tp50_reduction()), persist=False)
+
+    assert duplicate["duplicate"] and duplicate["status"] == "DUPLICATE_BROKER_REDUCTION"
+    assert duplicate["snapshot"]["quantity_closed"] == pytest.approx(0.5)
+    assert duplicate["snapshot"]["quantity_open"] == pytest.approx(1.5)
+    assert duplicate["snapshot"]["fill_ids"] == ["FILL-A-1"]
+
+
+def test_67_tp50_same_broker_order_with_different_quantity_is_blocked(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("TP50_REQUESTED", 21, quantity=1.0), persist=False)
+    manager.apply_event(lifecycle_id, event("TP50_FILL_RECORDED", 22, **broker_tp50_reduction()), persist=False)
+    result = manager.apply_event(
+        lifecycle_id,
+        event("TP50_FILL_RECORDED", 23, **broker_tp50_reduction(quantity=0.4)),
+        persist=False,
+    )
+
+    assert result["blocked"]
+    assert any("different quantity" in reason for reason in result["reasons"])
+    assert result["snapshot"]["quantity_closed"] == pytest.approx(0.5)
+    assert result["snapshot"]["quantity_open"] == pytest.approx(1.5)
+
+
+def test_68_tp50_broker_reduction_requires_order_id(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("TP50_REQUESTED", 21, quantity=1.0), persist=False)
+    result = manager.apply_event(
+        lifecycle_id,
+        event("TP50_FILL_RECORDED", 22, **broker_tp50_reduction(order_id=None)),
+        persist=False,
+    )
+
+    assert result["blocked"]
+    assert result["snapshot"]["quantity_closed"] == 0.0
+    assert result["snapshot"]["fill_ids"] == ["FILL-A-1"]
+
+
+def test_69_registry_live_closed_confirms_close_without_inventing_fill(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("CLOSE_REQUESTED", 21, quantity=2.0), persist=False)
+    result = manager.apply_event(
+        lifecycle_id,
+        event("CLOSE_CONFIRMED", 22, **registry_live_close()),
+        persist=False,
+    )
+
+    assert result["current_state"] == "CLOSE_CONFIRMED"
+    assert result["snapshot"]["quantity_closed"] == pytest.approx(2.0)
+    assert result["snapshot"]["quantity_open"] == 0.0
+    assert result["snapshot"]["fill_ids"] == ["FILL-A-1"]
+    assert result["snapshot"]["close"]["factual_registry_close"] is True
+    assert result["snapshot"]["close"]["close_reason"] == "STOP_FAILSAFE_MARKET"
+    assert result["snapshot"]["close"]["quantity_confirmed"] == pytest.approx(2.0)
+
+
+def test_70_registry_live_close_is_semantically_idempotent(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("CLOSE_REQUESTED", 21, quantity=2.0), persist=False)
+    manager.apply_event(lifecycle_id, event("CLOSE_CONFIRMED", 22, **registry_live_close()), persist=False)
+    duplicate = manager.apply_event(lifecycle_id, event("CLOSE_CONFIRMED", 23, **registry_live_close()), persist=False)
+
+    assert duplicate["duplicate"] and duplicate["status"] == "DUPLICATE_REGISTRY_CLOSE"
+    assert duplicate["snapshot"]["quantity_closed"] == pytest.approx(2.0)
+    assert duplicate["snapshot"]["quantity_open"] == 0.0
+    assert duplicate["snapshot"]["fill_ids"] == ["FILL-A-1"]
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"quantity": 1.0},
+        {"registry_source_component": "OTHER"},
+        {"registry_status": "OPEN"},
+        {"mode": "PAPER"},
+        {"trade_id": None},
+        {"closed_at": None},
+        {"close_reason": None},
+    ],
+)
+def test_71_registry_live_close_rejects_incomplete_or_inconsistent_evidence(manager, updates):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("CLOSE_REQUESTED", 21, quantity=2.0), persist=False)
+    result = manager.apply_event(
+        lifecycle_id,
+        event("CLOSE_CONFIRMED", 22, **registry_live_close(**updates)),
+        persist=False,
+    )
+
+    assert result["blocked"]
+    assert result["current_state"] == "CLOSE_PENDING"
+    assert result["snapshot"]["quantity_closed"] == 0.0
+    assert result["snapshot"]["quantity_open"] == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "DISASTER_STOP_CREATED",
+        "ROLLBACK_PROTECTED",
+        "STOP_REPLACED",
+        "STOP_REPLACED_EDIT",
+        "STOP_REPLACED_CANCEL_CREATE",
+    ],
+)
+def test_72_disaster_stop_accepts_explicit_active_broker_statuses(manager, status):
+    lifecycle_id = advance_to_entry_confirmed(manager)
+    evidence = stop_evidence()
+    evidence.update({"status": status, "symbol": "BTC/USDT:USDT", "position_side": "LONG", "action_side": "SELL"})
+    result = manager.apply_event(lifecycle_id, event("DISASTER_STOP_CONFIRMED", 21, **evidence), persist=False)
+
+    assert result["current_state"] == "ENTRY_PROTECTED"
+    assert result["snapshot"]["disaster_stop"]["status"] == status
+    assert result["snapshot"]["disaster_stop"]["side"] == "SHORT"
+    assert result["snapshot"]["disaster_stop"]["position_side"] == "LONG"
+
+
+@pytest.mark.parametrize(
+    "updates,reason_fragment",
+    [
+        ({"symbol": "ETHUSDT"}, "symbol does not match"),
+        ({"position_side": "SHORT"}, "position_side does not match"),
+        ({"action_side": "BUY"}, "action side is not protective"),
+        ({"status": "CANCELED"}, "status is not active"),
+    ],
+)
+def test_73_disaster_stop_rejects_identity_side_or_inactive_status(manager, updates, reason_fragment):
+    lifecycle_id = advance_to_entry_confirmed(manager)
+    evidence = stop_evidence()
+    evidence.update({"symbol": "BTCUSDT", "position_side": "LONG", "action_side": "SELL", **updates})
+    result = manager.apply_event(lifecycle_id, event("DISASTER_STOP_CONFIRMED", 21, **evidence), persist=False)
+
+    assert result["blocked"]
+    assert result["current_state"] == "ENTRY_CONFIRMED"
+    assert any(reason_fragment in reason for reason in result["reasons"])
+
+
+def test_74_registry_closed_quantity_projection_is_status_aware(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("CLOSE_REQUESTED", 21, quantity=2.0), persist=False)
+    manager.apply_event(lifecycle_id, event("CLOSE_CONFIRMED", 22, **registry_live_close()), persist=False)
+    result = manager.compare_with_registry(
+        lifecycle_id,
+        {
+            "trade_id": "TR-A", "bot": "FALCON", "setup": "ORB",
+            "symbol": "BTCUSDT", "side": "LONG", "mode": "LIVE",
+            "status": "CLOSED", "qty": 2.0,
+        },
+    )
+
+    assert result["status"] == "MATCH"
+    assert not any(item["field"] == "quantity_open" for item in result["differences"])
+
+
+def test_75_registry_open_remaining_quantity_precedes_initial_qty(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("TP50_REQUESTED", 21, quantity=1.0), persist=False)
+    manager.apply_event(lifecycle_id, event("TP50_FILL_RECORDED", 22, **broker_tp50_reduction()), persist=False)
+    result = manager.compare_with_registry(
+        lifecycle_id,
+        {
+            "trade_id": "TR-A", "bot": "FALCON", "setup": "ORB",
+            "symbol": "BTCUSDT", "side": "LONG", "mode": "LIVE",
+            "status": "OPEN", "qty": 2.0, "metadata": {"remaining_qty": 1.5},
+        },
+    )
+
+    assert result["status"] == "MATCH"
+    assert not any(item["field"] == "quantity_open" for item in result["differences"])
+
+
+def test_76_full_live_factual_cycle_can_finish_without_invented_fill_ids(manager):
+    lifecycle_id = advance_to_submitting(manager)
+    entry = manager.apply_event(
+        lifecycle_id,
+        event("ENTRY_CONFIRMED", 21, **registry_live_entry_confirmation()),
+        persist=False,
+    )
+    stop = stop_evidence()
+    stop.update({"status": "DISASTER_STOP_CREATED", "symbol": "BTCUSDT", "position_side": "LONG", "action_side": "SELL"})
+    protected = manager.apply_event(lifecycle_id, event("DISASTER_STOP_CONFIRMED", 22, **stop), persist=False)
+    manager.apply_event(lifecycle_id, event("CLOSE_REQUESTED", 23, quantity=2.0), persist=False)
+    closed = manager.apply_event(lifecycle_id, event("CLOSE_CONFIRMED", 24, **registry_live_close()), persist=False)
+    outcome = manager.record_outcome(
+        lifecycle_id,
+        {"outcome_id": "CENTRAL-OUTCOME-TR-A", "result_pct": -0.9218, "result_r": -1.0966, "exit_reason": "STOP_FAILSAFE_MARKET"},
+        persist=False,
+    )
+
+    assert entry["snapshot"]["fill_ids"] == []
+    assert protected["current_state"] == "ENTRY_PROTECTED"
+    assert closed["current_state"] == "CLOSE_CONFIRMED"
+    assert outcome["current_state"] == "OUTCOME_RECORDED"
+    assert outcome["snapshot"]["quantity_open"] == 0.0
+    assert outcome["snapshot"]["quantity_closed"] == pytest.approx(2.0)
+    assert outcome["snapshot"]["fill_ids"] == []
+
+
+@pytest.mark.parametrize(
+    "price_field",
+    ["entry_price_confirmed", "executed_price", "average_price", "average", "fill_price"],
+)
+def test_77_registry_live_entry_records_only_explicit_factual_execution_price(manager, price_field):
+    lifecycle_id = advance_to_submitting(manager)
+    evidence = registry_live_entry_confirmation(**{price_field: 100.75})
+    result = manager.apply_event(lifecycle_id, event("ENTRY_CONFIRMED", 21, **evidence), persist=False)
+
+    assert result["current_state"] == "ENTRY_CONFIRMED"
+    assert result["snapshot"]["entry_price_confirmed"] == pytest.approx(100.75)
+    assert result["snapshot"]["entry_confirmation"]["entry_price_confirmed"] == pytest.approx(100.75)
+    assert result["snapshot"]["entry_price_theoretical"] == pytest.approx(100.0)
+    assert result["snapshot"]["entry_price_reference"] == pytest.approx(100.25)
+    assert result["snapshot"]["fill_ids"] == []
+
+
+def test_78_registry_live_entry_never_promotes_generic_price_to_confirmed(manager):
+    lifecycle_id = advance_to_submitting(manager)
+    evidence = registry_live_entry_confirmation(entry_price_reference=None, price=101.5)
+    result = manager.apply_event(lifecycle_id, event("ENTRY_CONFIRMED", 21, **evidence), persist=False)
+
+    assert result["current_state"] == "ENTRY_CONFIRMED"
+    assert result["snapshot"]["entry_price_reference"] == pytest.approx(101.5)
+    assert result["snapshot"]["entry_price_confirmed"] is None
+    assert result["snapshot"]["entry_confirmation"]["entry_price_confirmed"] is None
+    assert result["snapshot"]["fill_ids"] == []
+
+
+@pytest.mark.parametrize(
+    "source_state,setup_events",
+    [
+        ("TP50_PENDING", [("TP50_REQUESTED", {"quantity": 1.0})]),
+        (
+            "TP50_CONFIRMED",
+            [
+                ("TP50_REQUESTED", {"quantity": 1.0}),
+                ("TP50_FILL_RECORDED", broker_tp50_reduction(quantity=1.0)),
+                ("TP50_CONFIRMED", {}),
+            ],
+        ),
+        ("BREAK_EVEN_PENDING", [("BREAK_EVEN_REQUESTED", {"stop_price": 100.0})]),
+        ("TRAILING_PENDING", [("TRAILING_REQUESTED", {"stop_price": 101.0})]),
+    ],
+)
+def test_79_factual_failsafe_close_can_start_from_protected_pending_states(manager, source_state, setup_events):
+    lifecycle_id = advance_to_managed(manager)
+    for offset, (event_type, evidence) in enumerate(setup_events, start=21):
+        result = manager.apply_event(lifecycle_id, event(event_type, offset, **evidence), persist=False)
+        assert result["ok"], result
+    assert manager.get_lifecycle(lifecycle_id)["snapshot"]["state"] == source_state
+
+    open_quantity = manager.get_lifecycle(lifecycle_id)["snapshot"]["quantity_open"]
+    close_requested = manager.apply_event(
+        lifecycle_id,
+        event("CLOSE_REQUESTED", 30, quantity=open_quantity, reason="STOP_FAILSAFE"),
+        persist=False,
+    )
+
+    assert close_requested["event_applied"]
+    assert close_requested["previous_state"] == source_state
+    assert close_requested["current_state"] == "CLOSE_PENDING"
+
+
+def test_80_factual_failsafe_close_can_finish_after_recovery_required(manager):
+    lifecycle_id = advance_to_entry_confirmed(manager)
+    stop_failed = manager.apply_event(
+        lifecycle_id,
+        event("DISASTER_STOP_FAILED", 21, reason="STOP_REPLACEMENT_FAILED"),
+        persist=False,
+    )
+    assert stop_failed["current_state"] == "ENTRY_CONFIRMED_STOP_MISSING"
+    recovery = manager.mark_recovery_required(
+        lifecycle_id,
+        "STOP_REPLACEMENT_FAILED",
+        {"broker_stop_status": "REPLACE_FAILED"},
+        persist=False,
+    )
+    assert recovery["current_state"] == "RECOVERY_REQUIRED"
+
+    close_requested = manager.apply_event(
+        lifecycle_id,
+        event("CLOSE_REQUESTED", 22, quantity=2.0, reason="STOP_FAILSAFE_MARKET"),
+        persist=False,
+    )
+    closed = manager.apply_event(
+        lifecycle_id,
+        event("CLOSE_CONFIRMED", 23, **registry_live_close()),
+        persist=False,
+    )
+
+    assert close_requested["previous_state"] == "RECOVERY_REQUIRED"
+    assert close_requested["current_state"] == "CLOSE_PENDING"
+    assert closed["current_state"] == "CLOSE_CONFIRMED"
+    assert closed["snapshot"]["quantity_closed"] == pytest.approx(2.0)
+    assert closed["snapshot"]["quantity_open"] == 0.0
+
+
+def test_81_registry_close_confirms_position_already_reduced_to_zero_by_tp50(manager):
+    lifecycle_id = advance_to_managed(manager)
+    entry_order_id = manager.get_lifecycle(lifecycle_id)["snapshot"]["exchange_order_id"]
+    manager.apply_event(lifecycle_id, event("TP50_REQUESTED", 21, quantity=2.0), persist=False)
+    reduced = manager.apply_event(
+        lifecycle_id,
+        event("TP50_FILL_RECORDED", 22, **broker_tp50_reduction(quantity=2.0)),
+        persist=False,
+    )
+    manager.apply_event(lifecycle_id, event("TP50_CONFIRMED", 23), persist=False)
+    manager.apply_event(
+        lifecycle_id,
+        event("CLOSE_REQUESTED", 24, quantity=2.0, reason="TP50_FAILSAFE_FULL_CLOSE"),
+        persist=False,
+    )
+    closed = manager.apply_event(
+        lifecycle_id,
+        event(
+            "CLOSE_CONFIRMED",
+            25,
+            **registry_live_close(close_reason="TP50_FAILSAFE_FULL_CLOSE"),
+        ),
+        persist=False,
+    )
+
+    assert reduced["snapshot"]["quantity_open"] == 0.0
+    assert closed["current_state"] == "CLOSE_CONFIRMED"
+    assert closed["snapshot"]["quantity_closed"] == pytest.approx(2.0)
+    assert closed["snapshot"]["quantity_open"] == 0.0
+    assert closed["snapshot"]["exchange_order_id"] == entry_order_id
+    assert "TP50-ORDER-1" not in closed["snapshot"]["fill_ids"]
+
+
+def test_82_management_order_ids_never_replace_entry_exchange_order_identity(manager):
+    lifecycle_id = advance_to_managed(manager)
+    entry_order_id = manager.get_lifecycle(lifecycle_id)["snapshot"]["exchange_order_id"]
+    manager.apply_event(
+        lifecycle_id,
+        event("BREAK_EVEN_REQUESTED", 21, order_id="STOP-BE-1", stop_price=100.0),
+        persist=False,
+    )
+    confirmed = manager.apply_event(
+        lifecycle_id,
+        event("BREAK_EVEN_CONFIRMED", 22, order_id="STOP-BE-1", stop_price=100.0),
+        persist=False,
+    )
+
+    assert confirmed["current_state"] == "BREAK_EVEN_ACTIVE"
+    assert confirmed["snapshot"]["exchange_order_id"] == entry_order_id
+
+
+def test_83_replacement_stop_refreshes_physical_protection_without_changing_management_state(manager):
+    lifecycle_id = advance_to_managed(manager)
+    replacement = stop_evidence()
+    replacement.update({
+        "order_id": "STOP-2",
+        "status": "STOP_REPLACED_EDIT",
+        "timestamp": "2026-07-11T00:02:00+00:00",
+    })
+
+    result = manager.apply_event(
+        lifecycle_id,
+        event("DISASTER_STOP_CONFIRMED", 21, **replacement),
+        persist=False,
+    )
+
+    assert result["event_applied"]
+    assert result["previous_state"] == "POSITION_MANAGED"
+    assert result["current_state"] == "POSITION_MANAGED"
+    assert result["snapshot"]["disaster_stop"]["order_id"] == "STOP-2"
+    assert result["snapshot"]["disaster_stop"]["confirmed"] is True
+
+
+def test_84_unprotected_stop_update_invalidates_old_stop_until_recovery(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(
+        lifecycle_id,
+        event("TRAILING_REQUESTED", 21, stop_price=101.0),
+        persist=False,
+    )
+    required = manager.mark_recovery_required(
+        lifecycle_id,
+        "STOP_REPLACE_CRITICAL_UNPROTECTED",
+        {"stop_update_failed": True, "status": "STOP_REPLACE_CRITICAL_UNPROTECTED"},
+        persist=False,
+    )
+
+    assert required["current_state"] == "RECOVERY_REQUIRED"
+    assert required["snapshot"]["disaster_stop"]["confirmed"] is False
+    assert required["snapshot"]["disaster_stop"]["invalidated_by"] == "STOP_UPDATE_FAILED"
+    assert required["snapshot"]["recovery"]["previous_disaster_stop"]["order_id"] == "STOP-1"
+
+    replacement = stop_evidence()
+    replacement.update({
+        "order_id": "ROLLBACK-STOP-2",
+        "status": "ROLLBACK_PROTECTED",
+        "timestamp": "2026-07-11T00:02:00+00:00",
+    })
+    recovered = manager.apply_event(
+        lifecycle_id,
+        event("DISASTER_STOP_CONFIRMED", 22, **replacement),
+        persist=False,
+    )
+
+    assert recovered["current_state"] == "ENTRY_PROTECTED"
+    assert recovered["snapshot"]["recovery"]["required"] is False
+    assert recovered["snapshot"]["disaster_stop"]["confirmed"] is True
+    assert recovered["snapshot"]["disaster_stop"]["order_id"] == "ROLLBACK-STOP-2"
+
+
+def test_85_closed_registry_comparison_ignores_historical_protection_flag(manager):
+    lifecycle_id = advance_to_managed(manager)
+    manager.apply_event(lifecycle_id, event("TRAILING_REQUESTED", 21, stop_price=101.0), persist=False)
+    manager.mark_recovery_required(
+        lifecycle_id,
+        "STOP_REPLACE_CRITICAL_UNPROTECTED",
+        {"stop_update_failed": True, "status": "STOP_REPLACE_CRITICAL_UNPROTECTED"},
+        persist=False,
+    )
+    manager.apply_event(lifecycle_id, event("CLOSE_REQUESTED", 22, quantity=2.0), persist=False)
+    manager.apply_event(lifecycle_id, event("CLOSE_CONFIRMED", 23, **registry_live_close()), persist=False)
+
+    result = manager.compare_with_registry(
+        lifecycle_id,
+        {
+            "trade_id": "TR-A",
+            "bot": "FALCON",
+            "setup": "ORB",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "mode": "LIVE",
+            "status": "CLOSED",
+            "qty": 2.0,
+            "metadata": {"disaster_stop_confirmed": True},
+        },
+    )
+
+    assert result["status"] == "MATCH"
+    assert not any(item["field"] == "protection" for item in result["differences"])

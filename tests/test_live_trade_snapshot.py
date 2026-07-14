@@ -8,6 +8,7 @@ import threading
 import pytest
 
 import live_trade_snapshot as snapshot_module
+import trade_timeline_validator as timeline_validator_module
 from live_trade_snapshot import GRACE_WINDOWS, build_live_trade_snapshot
 
 
@@ -718,3 +719,210 @@ def test_current_live_trade_snapshot_is_protected_and_final_events_remain_not_du
     assert result["execution"]["order_sent"] is True
     assert result["execution"]["broker_acknowledged"] is True
     json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "ENTRY_CONFIRMED", "ENTRY_CONFIRMED_STOP_MISSING", "ENTRY_PROTECTED",
+        "POSITION_MANAGED", "TP50_PENDING", "TP50_CONFIRMED", "RUNNER_PROTECTED",
+        "BREAK_EVEN_PENDING", "BREAK_EVEN_ACTIVE", "TRAILING_PENDING",
+        "TRAILING_ACTIVE", "CLOSE_PENDING", "CLOSE_PARTIALLY_CONFIRMED",
+        "CLOSE_CONFIRMED", "OUTCOME_PENDING", "OUTCOME_RECORDED",
+        "LEARNING_ELIGIBLE",
+    ],
+)
+def test_every_post_entry_state_preserves_entry_confirmation(state):
+    registry_status = "CLOSED" if state in {"CLOSE_CONFIRMED", "OUTCOME_PENDING", "OUTCOME_RECORDED", "LEARNING_ELIGIBLE"} else "OPEN"
+    registry = _record(
+        status=registry_status,
+        opened_at=BASE_TIME - 600,
+        closed_at=BASE_TIME - 10 if registry_status == "CLOSED" else None,
+        remaining_quantity=0 if registry_status == "CLOSED" else 1,
+        disaster_stop_confirmed=True,
+    )
+    lifecycle = _record(state=state, disaster_stop={"confirmed": True})
+    broker = _record(status=registry_status, position_status=registry_status, position_found=registry_status == "OPEN", contracts=0 if registry_status == "CLOSED" else 1)
+    result = build_live_trade_snapshot(
+        TRADE_ID,
+        sources=_sources(registry=[registry], lifecycle=[lifecycle], broker=[broker]),
+        now_epoch=BASE_TIME,
+    )
+    assert result["lifecycle"]["entry_confirmed"] is True
+
+
+def test_lifecycle_buckets_and_terminal_states_drive_confirmed_flags():
+    registry = _record(status="CLOSED", opened_at=BASE_TIME - 1000, closed_at=BASE_TIME - 10, remaining_quantity=0)
+    lifecycle = _record(
+        state="OUTCOME_RECORDED",
+        quantity_open=0,
+        disaster_stop={"confirmed": True},
+        tp50={"confirmed": True},
+        break_even={"confirmed": True},
+        trailing={"confirmed": True},
+        close={"confirmed": True},
+        outcome_id="OUT-1",
+        outcome={"confirmed": True},
+    )
+    broker = _record(status="CLOSED", position_status="CLOSED", position_found=False, contracts=0)
+    result = build_live_trade_snapshot(
+        TRADE_ID,
+        sources=_sources(registry=[registry], lifecycle=[lifecycle], broker=[broker]),
+        now_epoch=BASE_TIME,
+    )
+    assert result["lifecycle"]["disaster_stop_confirmed"] is True
+    assert result["lifecycle"]["tp50_confirmed"] is True
+    assert result["lifecycle"]["break_even_confirmed"] is True
+    assert result["lifecycle"]["trailing_confirmed"] is True
+    assert result["lifecycle"]["close_confirmed"] is True
+    assert result["lifecycle"]["outcome_recorded"] is True
+
+
+def test_outcome_pending_preserves_confirmed_close_without_claiming_outcome():
+    registry = _record(status="CLOSED", opened_at=BASE_TIME - 1000, closed_at=BASE_TIME - 10, remaining_quantity=0)
+    lifecycle = _record(state="OUTCOME_PENDING", quantity_open=0, close={"confirmed": True}, outcome={})
+    broker = _record(status="CLOSED", position_status="CLOSED", position_found=False, contracts=0)
+    result = build_live_trade_snapshot(
+        TRADE_ID,
+        sources=_sources(registry=[registry], lifecycle=[lifecycle], broker=[broker]),
+        now_epoch=BASE_TIME,
+    )
+    assert result["lifecycle"]["close_confirmed"] is True
+    assert result["lifecycle"]["outcome_recorded"] is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "SIGNAL_DETECTED", "DECISION_PENDING", "DECISION_ALLOWED", "RISK_PENDING",
+        "RISK_APPROVED", "ENTRY_INTENT_RECORDED", "ENTRY_SUBMITTING",
+        "ENTRY_SUBMISSION_UNKNOWN", "ENTRY_PARTIALLY_FILLED", "ENTRY_CONFIRMED",
+        "ENTRY_CONFIRMED_STOP_MISSING", "ENTRY_PROTECTED", "POSITION_MANAGED",
+        "TP50_PENDING", "TP50_CONFIRMED", "RUNNER_PROTECTED", "BREAK_EVEN_PENDING",
+        "BREAK_EVEN_ACTIVE", "TRAILING_PENDING", "TRAILING_ACTIVE", "CLOSE_PENDING",
+        "CLOSE_PARTIALLY_CONFIRMED", "RECOVERY_REQUIRED", "RECONCILIATION_REQUIRED",
+    ],
+)
+def test_registry_closed_conflicts_with_every_nonclosed_lifecycle_state(state):
+    registry = _record(status="CLOSED", opened_at=BASE_TIME - 1000, closed_at=BASE_TIME - 10, remaining_quantity=0)
+    lifecycle = _record(state=state)
+    broker = _record(status="CLOSED", position_status="CLOSED", position_found=False, contracts=0)
+    result = build_live_trade_snapshot(
+        TRADE_ID,
+        sources=_sources(registry=[registry], lifecycle=[lifecycle], broker=[broker]),
+        now_epoch=BASE_TIME,
+    )
+    assert any(item.get("code") == "LIFECYCLE_REGISTRY_STATE_CONFLICT" for item in result["divergences"])
+
+
+@pytest.mark.parametrize("state", ["CLOSE_CONFIRMED", "OUTCOME_PENDING", "OUTCOME_RECORDED", "LEARNING_ELIGIBLE"])
+def test_registry_open_conflicts_with_every_closed_lifecycle_state(state):
+    registry = _record(status="OPEN", opened_at=BASE_TIME - 600, remaining_quantity=1, disaster_stop_confirmed=True)
+    lifecycle = _record(state=state, close={"confirmed": True}, disaster_stop={"confirmed": True})
+    broker = _record(status="OPEN", position_status="OPEN", position_found=True, contracts=1)
+    result = build_live_trade_snapshot(
+        TRADE_ID,
+        sources=_sources(registry=[registry], lifecycle=[lifecycle], broker=[broker]),
+        now_epoch=BASE_TIME,
+    )
+    assert any(item.get("code") == "LIFECYCLE_REGISTRY_STATE_CONFLICT" for item in result["divergences"])
+
+
+def test_synthetic_closed_live_flow_uses_real_validator_and_terminal_shadow_contract(monkeypatch):
+    monkeypatch.setattr(snapshot_module, "validate_trade_timeline", timeline_validator_module.validate_trade_timeline)
+    trade_id = "FALCON:FALCON15:SOLUSDT:SHORT"
+    opened_at = "2026-07-14T11:00:22Z"
+    closed_at = "2026-07-14T12:32:04Z"
+    registry = {
+        "trade_id": trade_id,
+        "lifecycle_id": "LC-FALCON-SOL-LIVE",
+        "bot": "FALCON", "setup": "FALCON15", "symbol": "SOLUSDT",
+        "side": "SHORT", "mode": "LIVE", "status": "CLOSED",
+        "entry": 76.912, "exit_price": 77.621,
+        "initial_quantity": 0.12, "remaining_quantity": 0.0,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "broker_order_id": "2077030442691940352",
+        "broker_stop_order_id": "2077030444402577408",
+        "opened_at": opened_at, "closed_at": closed_at,
+        "close_reason": "STOP_FAILSAFE_MARKET", "result_pct": -0.9218,
+        "result_r": -1.0966,
+        "metadata": {
+            "execution_decision": {
+                "allowed": True, "decision": "ALLOW", "mode": "LIVE",
+                "occurred_at": "2026-07-14T11:00:19Z",
+            },
+        },
+    }
+    lifecycle = {
+        **{key: registry[key] for key in ("trade_id", "lifecycle_id", "bot", "setup", "symbol", "side", "mode")},
+        "state": "OUTCOME_RECORDED", "quantity_filled": 0.12,
+        "quantity_closed": 0.12, "quantity_open": 0.0,
+        "client_order_id": registry["client_order_id"],
+        "exchange_order_id": registry["broker_order_id"],
+        "disaster_stop": {
+            "confirmed": True, "order_id": registry["broker_stop_order_id"],
+            "status": "OPEN", "trigger_price": 77.5585142857143,
+            "protected_quantity": 0.12,
+        },
+        "close": {"confirmed": True, "reason": "STOP_FAILSAFE_MARKET", "confirmed_at": closed_at},
+        "outcome_id": "OUT-FALCON-SOL-LIVE",
+        "outcome": {"confirmed": True, "result_pct": -0.9218, "result_r": -1.0966},
+        "updated_at": "2026-07-14T12:32:05Z",
+        "history": [
+            {"trade_id": trade_id, "event_type": "SIGNAL_CREATED", "event_id": "LC-SIGNAL", "applied": True, "occurred_at": "2026-07-14T11:00:18Z"},
+            {"trade_id": trade_id, "event_type": "ENTRY_CONFIRMED", "event_id": "LC-ENTRY", "applied": True, "fill_id": "FILL-ENTRY", "quantity": 0.12, "occurred_at": opened_at},
+            {"trade_id": trade_id, "event_type": "DISASTER_STOP_CONFIRMED", "event_id": "LC-STOP", "applied": True, "occurred_at": "2026-07-14T11:00:23Z"},
+            {"trade_id": trade_id, "event_type": "CLOSE_CONFIRMED", "event_id": "LC-CLOSE", "applied": True, "occurred_at": closed_at},
+            {"trade_id": trade_id, "event_type": "OUTCOME_CONFIRMED", "event_id": "LC-OUTCOME", "applied": True, "previous_state": "OUTCOME_PENDING", "current_state": "OUTCOME_RECORDED", "quantity_after": 0.0, "outcome_id": "OUT-FALCON-SOL-LIVE", "occurred_at": "2026-07-14T12:32:05Z"},
+        ],
+    }
+    broker = {
+        "trade_id": trade_id, "event": "PLACE_MARKET_ORDER", "ok": True,
+        "sent": True, "status": "SENT", "order_id": registry["broker_order_id"],
+        "broker_order_id": registry["broker_order_id"],
+        "client_order_id": registry["client_order_id"], "symbol": "SOLUSDT",
+        "position_side": "SHORT", "position_status": "CLOSED",
+        "position_found": False, "contracts": 0.0, "entry_price": 76.93,
+        "exit_price": 77.621, "timestamp": "2026-07-14T11:00:20Z",
+    }
+    shadow = {
+        "trade_id": trade_id, "lifecycle_id": registry["lifecycle_id"],
+        "event_type": "SHADOW_VALIDATED", "event_id": "SHADOW-CLOSED-FALCON-SOL",
+        "source_component": "TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER",
+        "status": "MATCH", "comparison_status": "MATCH", "differences": [],
+        "shadow_mode": True, "operational_authority": False,
+        "compared_fields": 13, "matching_fields": 13, "mode": "LIVE",
+        "registry_status": "CLOSED", "timestamp": "2026-07-14T12:32:06Z",
+        "validated_fields": [
+            "trade_id", "bot", "setup", "symbol", "side", "mode", "status",
+            "quantity_open", "client_order_id", "exchange_order_id",
+            "lifecycle_terminal", "close_confirmed", "outcome_recorded",
+            "quantity_closed", "closed_at", "close_reason",
+        ],
+        "validated_values": {
+            "trade_id": trade_id, "bot": "FALCON", "setup": "FALCON15",
+            "symbol": "SOLUSDT", "side": "SHORT", "mode": "LIVE",
+            "status": "CLOSED", "quantity_open": 0.0, "quantity_closed": 0.12,
+            "client_order_id": registry["client_order_id"],
+            "exchange_order_id": registry["broker_order_id"],
+            "lifecycle_terminal": True, "close_confirmed": True,
+            "outcome_recorded": True, "closed_at": closed_at,
+            "close_reason": "STOP_FAILSAFE_MARKET",
+        },
+    }
+    sources = _sources(registry=[registry], lifecycle=[lifecycle], broker=[broker])
+    sources["shadow_runtime"] = [shadow]
+    sources["timeline"] = [{"trade_id": trade_id, "event_type": "SIGNAL_RECEIVED", "event_id": "TIMELINE-SIGNAL", "timestamp": "2026-07-14T11:00:18Z"}]
+    result = build_live_trade_snapshot(trade_id, sources=sources, now_epoch=BASE_TIME)
+    found = {item["event"] for item in result["timeline_validation"]["events_found"]}
+    assert result["lifecycle"]["lifecycle_found"] is True
+    assert result["lifecycle"]["current_state"] == "OUTCOME_RECORDED"
+    assert result["lifecycle"]["entry_confirmed"] is True
+    assert result["lifecycle"]["disaster_stop_confirmed"] is True
+    assert result["lifecycle"]["close_confirmed"] is True
+    assert result["lifecycle"]["outcome_recorded"] is True
+    assert {"LIFECYCLE_FINISHED", "SHADOW_VALIDATED"}.issubset(found)
+    assert result["shadow"]["matched"] is True
+    assert result["timeline_validation"]["missing_events"] == []
+    assert result["divergences"] == []
+    assert result["snapshot_status"] == "HEALTHY"

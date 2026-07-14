@@ -40,6 +40,23 @@ IDENTITY_KEYS = {
     "disaster_stop_order_id", "order_id", "fill_id", "fill_ids",
 }
 FINAL_EVENTS = {"LIVE_TRADE_CLOSED", "REGISTRY_CLOSE", "LIFECYCLE_FINISHED"}
+ENTRY_CONFIRMED_STATES = {
+    "ENTRY_CONFIRMED", "ENTRY_CONFIRMED_STOP_MISSING", "ENTRY_PROTECTED",
+    "POSITION_MANAGED", "TP50_PENDING", "TP50_CONFIRMED", "RUNNER_PROTECTED",
+    "BREAK_EVEN_PENDING", "BREAK_EVEN_ACTIVE", "TRAILING_PENDING",
+    "TRAILING_ACTIVE", "CLOSE_PENDING", "CLOSE_PARTIALLY_CONFIRMED",
+    "CLOSE_CONFIRMED", "OUTCOME_PENDING", "OUTCOME_RECORDED",
+    "LEARNING_ELIGIBLE",
+}
+PROTECTED_STATES = {
+    "ENTRY_PROTECTED", "POSITION_MANAGED", "TP50_PENDING", "TP50_CONFIRMED",
+    "RUNNER_PROTECTED", "BREAK_EVEN_PENDING", "BREAK_EVEN_ACTIVE",
+    "TRAILING_PENDING", "TRAILING_ACTIVE",
+}
+CLOSED_LIFECYCLE_STATES = {
+    "CLOSE_CONFIRMED", "OUTCOME_PENDING", "OUTCOME_RECORDED",
+    "LEARNING_ELIGIBLE",
+}
 
 
 def _now_iso() -> str:
@@ -122,6 +139,34 @@ def _event_names(records: Iterable[Mapping[str, Any]]) -> list[str]:
             if raw not in (None, ""):
                 names.append(str(raw).upper().strip().replace(" ", "_"))
     return names
+
+
+def _confirmed_lifecycle_event(records: Iterable[Mapping[str, Any]], event_type: str) -> bool:
+    expected = str(event_type).upper().strip()
+    for record in records:
+        for item in _walk(record):
+            raw = item.get("event_type") or item.get("event") or item.get("action")
+            if str(raw or "").upper().strip().replace(" ", "_") != expected:
+                continue
+            if item.get("applied") is False or _bool(item.get("blocked")):
+                continue
+            return True
+    return False
+
+
+def _lifecycle_bucket(records: Iterable[Mapping[str, Any]], name: str) -> Mapping[str, Any]:
+    rows = list(records)
+    for record in reversed(rows):
+        containers = [record]
+        for key in ("snapshot", "result"):
+            value = record.get(key)
+            if isinstance(value, Mapping):
+                containers.append(value)
+        for container in containers:
+            value = container.get(name)
+            if isinstance(value, Mapping):
+                return value
+    return {}
 
 
 def _timestamp_epoch(value: Any) -> Optional[float]:
@@ -272,6 +317,12 @@ def _lifecycle_block(rows: list[Mapping[str, Any]], status: str) -> Dict[str, An
     events = _event_names(rows)
     state = str(_first(rows, "state", "current_state") or "UNKNOWN").upper()
     history = _first(rows, "events_applied", "history")
+    disaster_stop = _lifecycle_bucket(rows, "disaster_stop")
+    tp50 = _lifecycle_bucket(rows, "tp50")
+    break_even = _lifecycle_bucket(rows, "break_even")
+    trailing = _lifecycle_bucket(rows, "trailing")
+    close = _lifecycle_bucket(rows, "close")
+    outcome = _lifecycle_bucket(rows, "outcome")
     return {
         "available": status not in {"UNAVAILABLE", "ERROR"},
         "lifecycle_found": bool(rows),
@@ -281,14 +332,14 @@ def _lifecycle_block(rows: list[Mapping[str, Any]], status: str) -> Dict[str, An
         "transition_count": len(history) if isinstance(history, list) else len(events),
         "last_transition": events[-1] if events else None,
         "last_transition_at": _first(rows, "last_transition_at", "occurred_at", "updated_at"),
-        "entry_confirmed": "ENTRY_CONFIRMED" in events or state in {"ENTRY_CONFIRMED", "ENTRY_PROTECTED", "POSITION_MANAGED"},
-        "disaster_stop_confirmed": "DISASTER_STOP_CONFIRMED" in events or _bool(_first(rows, "disaster_stop_confirmed")),
-        "tp50_confirmed": any(name in events for name in ("TP50_CONFIRMED", "TP50_FILL_RECORDED")),
-        "break_even_confirmed": "BREAK_EVEN_CONFIRMED" in events,
-        "trailing_confirmed": "TRAILING_CONFIRMED" in events,
-        "close_confirmed": "CLOSE_CONFIRMED" in events or state in {"CLOSE_CONFIRMED", "OUTCOME_RECORDED", "LEARNING_ELIGIBLE"},
-        "outcome_recorded": "OUTCOME_CONFIRMED" in events or state in {"OUTCOME_RECORDED", "LEARNING_ELIGIBLE"},
-        "learning_eligible": "LEARNING_ELIGIBILITY_CONFIRMED" in events or state == "LEARNING_ELIGIBLE",
+        "entry_confirmed": _confirmed_lifecycle_event(rows, "ENTRY_CONFIRMED") or state in ENTRY_CONFIRMED_STATES,
+        "disaster_stop_confirmed": _confirmed_lifecycle_event(rows, "DISASTER_STOP_CONFIRMED") or _bool(disaster_stop.get("confirmed")) or state in PROTECTED_STATES,
+        "tp50_confirmed": _confirmed_lifecycle_event(rows, "TP50_CONFIRMED") or _bool(tp50.get("confirmed")) or state in {"TP50_CONFIRMED", "RUNNER_PROTECTED"},
+        "break_even_confirmed": _confirmed_lifecycle_event(rows, "BREAK_EVEN_CONFIRMED") or _bool(break_even.get("confirmed")) or state == "BREAK_EVEN_ACTIVE",
+        "trailing_confirmed": _confirmed_lifecycle_event(rows, "TRAILING_CONFIRMED") or _bool(trailing.get("confirmed")) or state == "TRAILING_ACTIVE",
+        "close_confirmed": _confirmed_lifecycle_event(rows, "CLOSE_CONFIRMED") or _bool(close.get("confirmed")) or state in CLOSED_LIFECYCLE_STATES,
+        "outcome_recorded": _confirmed_lifecycle_event(rows, "OUTCOME_CONFIRMED") or _bool(outcome.get("confirmed")) or state in {"OUTCOME_RECORDED", "LEARNING_ELIGIBLE"},
+        "learning_eligible": _confirmed_lifecycle_event(rows, "LEARNING_ELIGIBILITY_CONFIRMED") or state == "LEARNING_ELIGIBLE",
         "blocked_events": int(_first(rows, "blocked_events") or 0),
         "divergences": copy.deepcopy(_first(rows, "divergences") or []),
         "source_authority": "CENTRAL_QUANT_LIFECYCLE",
@@ -621,8 +672,8 @@ def build_live_trade_snapshot(
                 divergences.append(_safe_issue("registry_broker", "REGISTRY_OPEN_WITHOUT_BROKER_POSITION", severity="CRITICAL"))
         lifecycle_state = str(lifecycle.get("current_state") or "UNKNOWN").upper()
         if registry["record_found"] and lifecycle["lifecycle_found"]:
-            lifecycle_closed = lifecycle["close_confirmed"] or lifecycle_state in {"OUTCOME_RECORDED", "LEARNING_ELIGIBLE"}
-            if (trade_status == "OPEN" and lifecycle_closed) or (trade_status == "CLOSED" and lifecycle_state in {"ENTRY_CONFIRMED", "ENTRY_PROTECTED", "POSITION_MANAGED"}):
+            lifecycle_closed = lifecycle["close_confirmed"] or lifecycle_state in CLOSED_LIFECYCLE_STATES
+            if (trade_status == "OPEN" and lifecycle_closed) or (trade_status == "CLOSED" and lifecycle_state not in CLOSED_LIFECYCLE_STATES):
                 divergences.append(_safe_issue("registry_lifecycle", "LIFECYCLE_REGISTRY_STATE_CONFLICT", severity="CRITICAL"))
         if unprotected:
             divergences.append(_safe_issue("risk_protection", "LIVE_POSITION_WITHOUT_DISASTER_STOP", severity="CRITICAL"))

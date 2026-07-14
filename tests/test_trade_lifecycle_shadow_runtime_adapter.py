@@ -93,10 +93,14 @@ def base(**updates):
     return item
 
 
-def test_disabled_by_default(tmp_path, monkeypatch):
+def test_enabled_by_default_and_explicit_false_is_kill_switch(tmp_path, monkeypatch):
     monkeypatch.delenv("TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER_ENABLED", raising=False)
     item = TradeLifecycleShadowRuntimeAdapter(data_dir=tmp_path, manager=FakeManager())
-    assert item.observe_event("SIGNAL", base())["status"] == "DISABLED"
+    assert item.observe_event("SIGNAL", base(), persist=False)["status"] == "APPLIED"
+
+    monkeypatch.setenv("TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER_ENABLED", "false")
+    disabled = TradeLifecycleShadowRuntimeAdapter(data_dir=tmp_path, manager=FakeManager())
+    assert disabled.observe_event("SIGNAL", base(), persist=False)["status"] == "DISABLED"
 
 
 def test_health_declares_shadow_authority(adapter):
@@ -335,8 +339,13 @@ def test_non_eligible_registry_signal_remains_signal_detected(monkeypatch, tmp_p
 
     result = item.observe_event("SIGNAL_CREATED", payload, persist=False)
 
-    assert result["manager_result"]["snapshot"]["state"] == "SIGNAL_DETECTED"
-    assert result["manager_result"]["paper_position_transition"]["reason"] == expected_reason
+    if updates.get("mode") == "LIVE":
+        assert result["status"] == "NOT_ELIGIBLE"
+        assert result["manager_result"]["snapshot"] == {}
+        assert result["manager_result"]["live_position_transition"]["reason"] == "REGISTRY_LIVE_ELIGIBILITY_FAILED"
+    else:
+        assert result["manager_result"]["snapshot"]["state"] == "SIGNAL_DETECTED"
+        assert result["manager_result"]["paper_position_transition"]["reason"] == expected_reason
 
 
 def test_registry_paper_close_translates_and_reconciles_closed(monkeypatch, tmp_path):
@@ -390,9 +399,9 @@ def test_live_close_contract_remains_blocked_from_signal_detected(monkeypatch, t
 
     result = item.observe_event("CLOSE_CONFIRMED", live_close, persist=False)
 
-    assert result["status"] == "BLOCKED"
-    assert result["manager_result"]["current_state"] == "SIGNAL_DETECTED"
-    assert result["manager_result"]["paper_position_transition"]["reason"] == "MODE_IS_NOT_PAPER"
+    assert result["status"] == "NOT_ELIGIBLE"
+    assert result["manager_result"]["snapshot"] == {}
+    assert result["manager_result"]["live_position_transition"]["reason"] == "REGISTRY_LIVE_ELIGIBILITY_FAILED"
 
 
 def test_paper_close_without_lifecycle_does_not_create_one(monkeypatch, tmp_path):
@@ -712,6 +721,31 @@ def test_shadow_validation_persistence_failure_is_fail_open(adapter, monkeypatch
     assert result["operational_authority"] is False
 
 
+def test_shadow_validation_lock_contention_is_bounded_and_fail_open(adapter, monkeypatch):
+    def always_locked(*_args, **_kwargs):
+        raise OSError("lock busy")
+
+    monkeypatch.setattr(runtime_adapter_module, "SHADOW_STORAGE_LOCK_TIMEOUT_SECONDS", 0.01)
+    if runtime_adapter_module.os.name == "nt":
+        fake_lock_module = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=always_locked)
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_lock_module)
+    else:
+        fake_lock_module = SimpleNamespace(LOCK_EX=1, LOCK_NB=2, LOCK_UN=8, flock=always_locked)
+        monkeypatch.setitem(sys.modules, "fcntl", fake_lock_module)
+
+    started = __import__("time").monotonic()
+    result = adapter.reconcile_trade(base(comparison="MATCH"), persist=True)
+    elapsed = __import__("time").monotonic() - started
+
+    assert elapsed < 0.5
+    assert result["status"] == "MATCH"
+    assert result["ok"] is True
+    assert result["fail_open"] is True
+    assert result["operational_result_preserved"] is True
+    assert result["shadow_validation"]["persisted"] is False
+    assert result["shadow_validation"]["error"].startswith("TimeoutError")
+
+
 def test_distinct_execution_identities_get_distinct_validation_events(tmp_path):
     item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=FakeManager())
     first = item.reconcile_trade(base(comparison="MATCH", broker_order_id="ORDER-A", opened_at="2026-07-14T10:00:00Z"), persist=True)
@@ -742,7 +776,39 @@ def _live_registry_open(**updates):
     return payload
 
 
-def test_live_registry_observation_advances_only_to_factual_submission(monkeypatch, tmp_path):
+def _factual_live_open(**updates):
+    payload = _live_registry_open(
+        lifecycle_id="CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-1784037618",
+        execution_sent=True,
+        client_order_id="FALCON-LIVE-FALCON15-1784037618",
+        broker_order_id="2077030442691940352",
+        broker_entry_reference=76.93,
+        initial_qty=0.12,
+        remaining_qty=0.12,
+        protected=True,
+        disaster_stop_confirmed=True,
+        broker_stop_order_id="2077030444402577408",
+        broker_stop_status="DISASTER_STOP_CREATED",
+        broker_stop_side="BUY",
+        broker_stop_symbol="SOLUSDT",
+        broker_stop_price=77.5585142857143,
+        broker_stop_amount=0.12,
+        broker_stop_confirmed_at="2026-07-14T11:00:23Z",
+        last_update="2026-07-14T11:00:23Z",
+    )
+    payload["metadata"].update({
+        key: value
+        for key, value in payload.items()
+        if key.startswith("broker_") or key in {
+            "execution_sent", "client_order_id", "initial_qty", "remaining_qty",
+            "protected", "disaster_stop_confirmed", "last_update",
+        }
+    })
+    payload.update(updates)
+    return payload
+
+
+def test_live_registry_observation_reconstructs_factual_post_ack_entry(monkeypatch, tmp_path):
     manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
     item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
     opened = _live_registry_open()
@@ -775,14 +841,18 @@ def test_live_registry_observation_advances_only_to_factual_submission(monkeypat
     observed = item.observe_event("TRADE_UPDATED", updated, persist=False)
     snapshot = manager.get_lifecycle(lifecycle_id)["snapshot"]
     assert observed["status"] == "APPLIED"
-    assert snapshot["state"] == "ENTRY_SUBMITTING"
+    assert snapshot["state"] == "ENTRY_CONFIRMED"
     assert snapshot["client_order_id"] == "FALCON-LIVE-FALCON15-1784037618"
     assert snapshot["exchange_order_id"] == "2077030442691940352"
-    assert snapshot["quantity_filled"] == 0
+    assert snapshot["quantity_filled"] == pytest.approx(0.12)
+    assert snapshot["quantity_open"] == pytest.approx(0.12)
+    assert snapshot["entry_price_confirmed"] is None
+    assert snapshot["entry_price_theoretical"] == pytest.approx(76.912)
     assert snapshot["disaster_stop"] == {}
 
     comparison = item.reconcile_trade(updated, persist=False)
-    assert comparison["status"] == "PARTIAL_MATCH"
+    assert comparison["status"] == "LIFECYCLE_INCOMPLETE"
+    assert comparison["reconciled"] is False
     assert comparison["shadow_validation"]["eligible"] is False
 
 
@@ -796,7 +866,8 @@ def test_live_registry_preview_or_missing_order_does_not_advance_submission(monk
 
     observed = item.observe_event("TRADE_UPDATED", update, persist=False)
     snapshot = manager.get_lifecycle(created["lifecycle_id"])["snapshot"]
-    assert observed["status"] == "BLOCKED"
+    assert observed["status"] == "INSUFFICIENT_EVIDENCE"
+    assert observed["duplicate"] is False
     assert snapshot["state"] == "RISK_APPROVED"
     assert snapshot["fill_ids"] == []
 
@@ -814,7 +885,8 @@ def test_generic_order_id_cannot_stand_in_for_typed_entry_order(monkeypatch, tmp
     })
     observed = item.observe_event("TRADE_UPDATED", update, persist=False)
     snapshot = manager.get_lifecycle(created["lifecycle_id"])["snapshot"]
-    assert observed["status"] == "BLOCKED"
+    assert observed["status"] == "INSUFFICIENT_EVIDENCE"
+    assert observed["duplicate"] is False
     assert snapshot["state"] == "RISK_APPROVED"
     assert snapshot["exchange_order_id"] is None
 
@@ -834,11 +906,11 @@ def test_late_decision_id_does_not_block_factual_submission_sequence(monkeypatch
     observed = item.observe_event("TRADE_UPDATED", update, persist=False)
     snapshot = manager.get_lifecycle(created["lifecycle_id"])["snapshot"]
     assert observed["status"] == "APPLIED"
-    assert snapshot["state"] == "ENTRY_SUBMITTING"
+    assert snapshot["state"] == "ENTRY_CONFIRMED"
     assert snapshot["exchange_order_id"] == "2077030442691940352"
 
 
-def test_real_manager_match_naturally_persists_shadow_validated_after_explicit_fill_and_stop(monkeypatch, tmp_path):
+def test_real_manager_match_persists_validation_after_registry_entry_and_stop_facts(monkeypatch, tmp_path):
     manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
     item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
     opened = _live_registry_open()
@@ -852,44 +924,596 @@ def test_real_manager_match_naturally_persists_shadow_validated_after_explicit_f
         "order_id": "2077030442691940352",
         "protected": True,
         "broker_stop_order_id": "2077030444402577408",
+        "broker_stop_status": "DISASTER_STOP_CREATED",
+        "broker_stop_side": "BUY",
+        "broker_stop_symbol": "SOLUSDT",
+        "broker_stop_price": 77.5585142857143,
+        "broker_stop_amount": 0.12,
+        "broker_stop_confirmed_at": "2026-07-14T11:00:23Z",
         "last_update": "2026-07-14T11:00:22Z",
     })
     registry["metadata"].update({
         "execution_sent": True,
         "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
         "broker_order_id": "2077030442691940352",
+        "broker_stop_status": "DISASTER_STOP_CREATED",
+        "broker_stop_side": "BUY",
+        "broker_stop_symbol": "SOLUSDT",
+        "broker_stop_price": 77.5585142857143,
+        "broker_stop_amount": 0.12,
+        "broker_stop_confirmed_at": "2026-07-14T11:00:23Z",
     })
     item.observe_event("TRADE_UPDATED", registry, persist=False)
-    fill = {
-        **registry,
-        "lifecycle_id": lifecycle_id,
-        "event_id": "FILL-EVENT-1",
-        "fill_id": "FILL-2077030442691940352",
-        "quantity": 0.12,
-        "price": 76.912,
-        "exchange_order_id": "2077030442691940352",
-    }
-    assert item.observe_event("ENTRY_FILL", fill, persist=False)["status"] == "APPLIED"
-    stop = {
-        **registry,
-        "lifecycle_id": lifecycle_id,
-        "event_id": "STOP-EVENT-1",
-        "order_id": "2077030444402577408",
-        "status": "OPEN",
-        "side": "BUY",
-        "trigger_price": 77.5585142857143,
-        "protected_quantity": 0.12,
-        "timestamp": "2026-07-14T11:00:23Z",
-    }
-    assert item.observe_event("STOP_CONFIRMED", stop, persist=False)["status"] == "APPLIED"
+    snapshot = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert snapshot["state"] == "ENTRY_PROTECTED"
+    assert snapshot["fill_ids"] == []
+    assert snapshot["disaster_stop"]["order_id"] == "2077030444402577408"
 
     matched = item.reconcile_trade(registry, persist=True)
     duplicate = item.reconcile_trade(registry, persist=True)
     rows = [json.loads(line) for line in item.events_file.read_text(encoding="utf-8").splitlines()]
-    assert matched["status"] == "MATCH"
+    assert matched["status"] == "MATCH", matched.get("reasons")
     assert matched["shadow_validation"]["persisted"] is True
     assert duplicate["shadow_validation"]["duplicate"] is True
     assert [row["event_type"] for row in rows] == ["SHADOW_VALIDATED"]
+
+
+@pytest.mark.parametrize("mode", ["PREVIEW", "VERIFY", "DRY_RUN", "SAFE_DRY_RUN"])
+def test_registry_non_operational_modes_never_create_live_lifecycle(tmp_path, mode):
+    manager = FakeManager()
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path, manager=manager)
+    payload = _live_registry_open(mode=mode)
+
+    result = item.observe_event("SIGNAL_CREATED", payload, persist=False)
+
+    assert result["status"] == "NOT_ELIGIBLE"
+    assert result["fail_open"] is True
+    assert result["operational_result_preserved"] is True
+    assert manager.created == []
+    assert manager.applied == []
+
+
+def test_explicit_live_lifecycle_identity_separates_same_structural_trade(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    first = _factual_live_open()
+    second = _factual_live_open(
+        lifecycle_id="CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-SECOND",
+        client_order_id="FALCON-LIVE-FALCON15-SECOND",
+        broker_order_id="ENTRY-ORDER-SECOND",
+        broker_stop_order_id="STOP-ORDER-SECOND",
+        last_update="2026-07-14T11:01:23Z",
+    )
+
+    first_result = item.observe_event("SIGNAL_CREATED", first, persist=False)
+    second_result = item.observe_event("SIGNAL_CREATED", second, persist=False)
+
+    assert first["trade_id"] == second["trade_id"]
+    assert first_result["lifecycle_id"] != second_result["lifecycle_id"]
+    assert manager.get_lifecycle(first_result["lifecycle_id"])["snapshot"]["client_order_id"] == first["client_order_id"]
+    assert manager.get_lifecycle(second_result["lifecycle_id"])["snapshot"]["client_order_id"] == second["client_order_id"]
+    assert manager.get_trade_lifecycles(first["trade_id"])["count"] == 2
+
+
+def test_registry_initial_stop_failure_enters_shadow_recovery(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    payload = _factual_live_open(
+        protected=False,
+        disaster_stop_confirmed=False,
+        broker_stop_status="LIVE_SENT_BUT_STOP_FAILED",
+        broker_stop_order_id=None,
+        broker_stop_confirmed_at=None,
+    )
+
+    observed = item.observe_event("SIGNAL_CREATED", payload, persist=False)
+    snapshot = manager.get_lifecycle(observed["lifecycle_id"])["snapshot"]
+
+    assert observed["status"] == "APPLIED"
+    assert snapshot["state"] == "RECOVERY_REQUIRED"
+    assert snapshot["disaster_stop"]["confirmed"] is False
+    assert snapshot["recovery"]["required"] is True
+    assert snapshot["fill_ids"] == []
+
+
+def test_reconciliation_waits_for_complete_live_lifecycle_without_comparing(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    incomplete = _live_registry_open(
+        execution_sent=True,
+        client_order_id="CLIENT-INCOMPLETE",
+        broker_order_id="ORDER-INCOMPLETE",
+        last_update="2026-07-14T11:00:24Z",
+    )
+    created = item.observe_event("SIGNAL_CREATED", incomplete, persist=False)
+    manager.compare_with_registry = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("comparison must not run"))
+
+    result = item.reconcile_trade(incomplete, persist=True)
+
+    assert created["status"] == "APPLIED"
+    assert result["status"] == "LIFECYCLE_INCOMPLETE"
+    assert result["reconciled"] is False
+    assert result["shadow_validation"]["eligible"] is False
+    assert not item.events_file.exists()
+    assert not item.divergences_file.exists()
+
+
+def test_live_management_close_outcome_and_terminal_validation(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _factual_live_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    lifecycle_id = created["lifecycle_id"]
+    initial = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert initial["state"] == "ENTRY_PROTECTED"
+    assert initial["entry_price_theoretical"] == pytest.approx(76.912)
+    assert initial["entry_price_reference"] == pytest.approx(76.93)
+    assert initial["entry_price_confirmed"] is None
+
+    tp50 = copy.deepcopy(opened)
+    tp50.update({
+        "tp50_real_executed": True,
+        "tp50_status": "REAL_EXECUTED",
+        "tp50_real_order_id": "TP50-ORDER-1",
+        "tp50_amount": 0.06,
+        "remaining_qty": 0.06,
+        "broker_stop_order_id": "RUNNER-STOP-1",
+        "broker_stop_status": "STOP_REPLACED_CANCEL_CREATE",
+        "broker_stop_amount": 0.06,
+        "broker_stop_confirmed_at": "2026-07-14T11:05:00Z",
+        "last_update": "2026-07-14T11:05:00Z",
+    })
+    assert item.observe_event("TRADE_UPDATED", tp50, persist=False)["status"] == "APPLIED"
+    after_tp50 = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert after_tp50["state"] == "RUNNER_PROTECTED"
+    assert after_tp50["quantity_open"] == pytest.approx(0.06)
+    assert after_tp50["quantity_closed"] == pytest.approx(0.06)
+    assert after_tp50["fill_ids"] == []
+    assert after_tp50["tp50"]["broker_order_ids"] == ["TP50-ORDER-1"]
+
+    break_even = copy.deepcopy(tp50)
+    break_even.update({
+        "stop_update_reason": "BREAK_EVEN",
+        "stop_update": {"ok": True, "status": "STOP_REPLACED_EDIT", "new_order_id": "BE-STOP-1"},
+        "broker_stop_order_id": "BE-STOP-1",
+        "broker_stop_status": "STOP_REPLACED_EDIT",
+        "broker_stop_price": 76.912,
+        "broker_stop_confirmed_at": "2026-07-14T11:06:00Z",
+        "last_update": "2026-07-14T11:06:00Z",
+    })
+    assert item.observe_event("TRADE_UPDATED", break_even, persist=False)["status"] == "APPLIED"
+    assert manager.get_lifecycle(lifecycle_id)["snapshot"]["state"] == "BREAK_EVEN_ACTIVE"
+
+    trailing_ids = []
+    trailing = copy.deepcopy(break_even)
+    for number, (order_id, stop_price) in enumerate((("TRAIL-STOP-1", 76.50), ("TRAIL-STOP-2", 76.20)), start=1):
+        trailing.update({
+            "stop_update_reason": "TRAILING",
+            "stop_update": {"ok": True, "status": "STOP_REPLACED_EDIT", "new_order_id": order_id},
+            "broker_stop_order_id": order_id,
+            "broker_stop_status": "STOP_REPLACED_EDIT",
+            "broker_stop_price": stop_price,
+            "broker_stop_confirmed_at": f"2026-07-14T11:0{6 + number}:00Z",
+            "last_update": f"2026-07-14T11:0{6 + number}:00Z",
+        })
+        result = item.observe_event("TRADE_UPDATED", trailing, persist=False)
+        assert result["status"] == "APPLIED"
+        trailing_ids.extend(
+            step["event_id"]
+            for step in result["manager_result"]["live_position_transition"]["steps"]
+            if step["event_type"] == "TRAILING_CONFIRMED"
+        )
+    assert len(set(trailing_ids)) == 2
+    assert manager.get_lifecycle(lifecycle_id)["snapshot"]["state"] == "TRAILING_ACTIVE"
+
+    closed = copy.deepcopy(trailing)
+    closed.update({
+        "status": "CLOSED",
+        "closed_at": "2026-07-14T11:10:00Z",
+        "close_reason": "STOP_FAILSAFE_MARKET",
+        "exit_price": 77.62,
+        "result_pct": -0.9218,
+        "result_r": -1.0966,
+        "pnl_usdt": -0.85,
+        # Registry intentionally retains the runner quantity after CLOSED.
+        "remaining_qty": 0.06,
+        "last_update": "2026-07-14T11:10:00Z",
+    })
+    completed = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+    terminal = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert completed["status"] == "APPLIED"
+    assert terminal["state"] == "OUTCOME_RECORDED"
+    assert terminal["quantity_open"] == pytest.approx(0.0)
+    assert terminal["quantity_closed"] == pytest.approx(0.12)
+    assert terminal["exchange_order_id"] == "2077030442691940352"
+    assert terminal["close"]["quantity_confirmed"] == pytest.approx(0.06)
+    assert terminal["close"]["close_reason"] == "STOP_FAILSAFE_MARKET"
+    assert terminal["outcome"]["closed_quantity"] == pytest.approx(0.12)
+    assert terminal["outcome"]["entry_price_theoretical"] == pytest.approx(76.912)
+    assert terminal["outcome"]["entry_price_reference"] == pytest.approx(76.93)
+    assert "entry_price_confirmed" not in terminal["outcome"]
+
+    matched = item.reconcile_trade(closed, persist=True)
+    assert matched["status"] == "MATCH", matched.get("reasons")
+    assert matched["shadow_validation"]["persisted"] is True
+    validation = matched["shadow_validation"]["event"]
+    assert validation["fail_open"] is True
+    assert validation["operational_result_preserved"] is True
+    assert {
+        "lifecycle_terminal", "close_confirmed", "outcome_recorded", "quantity_open",
+        "quantity_closed", "closed_at", "close_reason",
+    }.issubset(validation["validated_fields"])
+    assert validation["validated_values"]["lifecycle_terminal"] is True
+    assert validation["validated_values"]["quantity_open"] == 0.0
+
+    from trade_timeline_validator import validate_trade_timeline
+
+    timeline = validate_trade_timeline(
+        closed["trade_id"],
+        sources={"lifecycle": [terminal], "shadow_runtime": [validation]},
+    )
+    found = {event["event"] for event in timeline["events_found"]}
+    assert "LIFECYCLE_FINISHED" in found
+    assert "SHADOW_VALIDATED" in found
+
+
+def test_registry_post_persistence_hook_completes_live_lifecycle_naturally(monkeypatch, tmp_path):
+    central_dir = tmp_path / "central"
+    shadow_dir = tmp_path / "shadow"
+    lifecycle_id = "CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-E2E-1"
+    monkeypatch.setenv("CENTRAL_DATA_DIR", str(central_dir))
+    monkeypatch.setenv("TRADE_REGISTRY_FILE", str(central_dir / "trade_registry.json"))
+    monkeypatch.setenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR", str(shadow_dir))
+    monkeypatch.setenv("TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER_ENABLED", "true")
+    for name in (
+        "trade_registry",
+        "trade_lifecycle_shadow_runtime_adapter",
+        "trade_lifecycle_manager",
+    ):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    manager = importlib.import_module("trade_lifecycle_manager")
+    adapter_module = importlib.import_module("trade_lifecycle_shadow_runtime_adapter")
+    registry = importlib.import_module("trade_registry")
+
+    opened = registry.register_open_trade(
+        bot="FALCON",
+        symbol="SOLUSDT",
+        side="SHORT",
+        entry=76.912,
+        sl=77.5585142857143,
+        tp50=76.2654857142857,
+        setup="FALCON15",
+        qty=0.12,
+        source="falcon",
+        registry_mode="REAL",
+        execution_mode="LIVE",
+        lifecycle_id=lifecycle_id,
+        metadata={
+            "lifecycle_id": lifecycle_id,
+            "execution_decision": {"allowed": True, "decision": "ALLOW", "mode": "LIVE"},
+        },
+    )
+    assert opened["ok"] is True
+    trade_id = opened["trade_id"]
+    after_open = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert after_open["state"] == "RISK_APPROVED"
+
+    updated = registry.update_trade(
+        trade_id,
+        lifecycle_id=lifecycle_id,
+        execution_mode="LIVE",
+        registry_mode="REAL",
+        order_id="ENTRY-E2E-1",
+        broker_order_id="ENTRY-E2E-1",
+        client_order_id="FALCON-LIVE-E2E-1",
+        metadata={
+            "lifecycle_id": lifecycle_id,
+            "execution_sent": True,
+            "broker_entry_reference": 76.93,
+            "initial_qty": 0.12,
+            "remaining_qty": 0.12,
+            "protected": True,
+            "disaster_stop_confirmed": True,
+            "broker_stop_order_id": "STOP-E2E-1",
+            "broker_stop_status": "DISASTER_STOP_CREATED",
+            "broker_stop_side": "BUY",
+            "broker_stop_symbol": "SOLUSDT",
+            "broker_stop_price": 77.5585142857143,
+            "broker_stop_amount": 0.12,
+            "broker_stop_confirmed_at": "14/07/2026 11:00:23",
+        },
+    )
+    assert updated["ok"] is True
+    protected = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert protected["state"] == "ENTRY_PROTECTED"
+    assert protected["exchange_order_id"] == "ENTRY-E2E-1"
+    assert protected["disaster_stop"]["order_id"] == "STOP-E2E-1"
+
+    closed = registry.close_trade(
+        trade_id,
+        exit_price=77.62,
+        pnl_pct=-0.9218,
+        pnl_r=-1.0966,
+        realized_pnl=-0.85,
+        reason="STOP_FAILSAFE_MARKET",
+        metadata={
+            "lifecycle_id": lifecycle_id,
+            "remaining_qty": 0.12,
+        },
+    )
+    assert closed["ok"] is True
+    terminal = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert terminal["state"] == "OUTCOME_RECORDED"
+    assert terminal["quantity_open"] == pytest.approx(0.0)
+    assert terminal["quantity_closed"] == pytest.approx(0.12)
+    assert terminal["close"]["close_reason"] == "STOP_FAILSAFE_MARKET"
+    assert terminal["outcome"]["confirmed"] is True
+
+    runtime_rows = [
+        json.loads(line)
+        for line in adapter_module._default_adapter.events_file.read_text(encoding="utf-8").splitlines()
+    ]
+    closed_validations = [
+        row
+        for row in runtime_rows
+        if row.get("event_type") == "SHADOW_VALIDATED" and row.get("registry_status") == "CLOSED"
+    ]
+    assert len(closed_validations) == 1
+    assert closed_validations[0]["validated_values"]["lifecycle_terminal"] is True
+
+    from trade_timeline_validator import validate_trade_timeline
+
+    timeline = validate_trade_timeline(
+        trade_id,
+        sources={"lifecycle": [terminal], "shadow_runtime": runtime_rows},
+    )
+    found = {item["event"] for item in timeline["events_found"]}
+    assert {"LIFECYCLE_FINISHED", "SHADOW_VALIDATED"}.issubset(found)
+
+
+def test_tp50_full_close_transitions_to_outcome_without_double_count(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _factual_live_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    lifecycle_id = created["lifecycle_id"]
+    full_tp50 = copy.deepcopy(opened)
+    full_tp50.update({
+        "tp50_real_executed": True,
+        "tp50_status": "REAL_EXECUTED_POSITION_CLOSED",
+        "tp50_real_order_id": "TP50-FULL-ORDER",
+        "tp50_amount": 0.12,
+        "remaining_qty": 0.0,
+        "last_update": "2026-07-14T11:05:00Z",
+    })
+    assert item.observe_event("TRADE_UPDATED", full_tp50, persist=False)["status"] == "APPLIED"
+    after_tp50 = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert after_tp50["state"] == "TP50_CONFIRMED"
+    assert after_tp50["quantity_open"] == 0.0
+    assert after_tp50["quantity_closed"] == pytest.approx(0.12)
+
+    closed = copy.deepcopy(full_tp50)
+    closed.update({
+        "status": "CLOSED",
+        "closed_at": "2026-07-14T11:05:01Z",
+        "close_reason": "TP50_REAL_EXECUTED_POSITION_CLOSED",
+        "exit_price": 75.90,
+        "result_pct": 1.1,
+        "result_r": 1.0,
+        "last_update": "2026-07-14T11:05:01Z",
+    })
+    result = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+    terminal = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert result["status"] == "APPLIED"
+    assert terminal["state"] == "OUTCOME_RECORDED"
+    assert terminal["quantity_open"] == 0.0
+    assert terminal["quantity_closed"] == pytest.approx(0.12)
+    assert terminal["outcome"]["closed_quantity"] == pytest.approx(0.12)
+
+
+def test_unprotected_stop_update_enters_recovery_and_factual_failsafe_close_completes(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _factual_live_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    lifecycle_id = created["lifecycle_id"]
+    failed = copy.deepcopy(opened)
+    failed.update({
+        "stop_update_failed": True,
+        "stop_update_status": "STOP_REPLACE_CRITICAL_UNPROTECTED",
+        "stop_update_reason": "BREAK_EVEN",
+        "stop_update": {"ok": False, "status": "STOP_REPLACE_CRITICAL_UNPROTECTED", "rollback": {"ok": False}},
+        "last_update": "2026-07-14T11:06:00Z",
+    })
+    assert item.observe_event("TRADE_UPDATED", failed, persist=False)["status"] == "APPLIED"
+    recovering = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert recovering["state"] == "RECOVERY_REQUIRED"
+    assert recovering["recovery"]["required"] is True
+    assert recovering["disaster_stop"]["confirmed"] is False
+
+    closed = copy.deepcopy(failed)
+    closed.update({
+        "status": "CLOSED",
+        "closed_at": "2026-07-14T11:07:00Z",
+        "close_reason": "STOP_FAILSAFE_MARKET",
+        "exit_price": 77.80,
+        "result_pct": -1.0,
+        "result_r": -1.0,
+        "remaining_qty": 0.12,
+        "last_update": "2026-07-14T11:07:00Z",
+    })
+    result = item.observe_event("CLOSE_CONFIRMED", closed, persist=False)
+    terminal = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert result["status"] == "APPLIED"
+    assert terminal["state"] == "OUTCOME_RECORDED"
+    assert terminal["quantity_open"] == 0.0
+    assert terminal["close"]["close_reason"] == "STOP_FAILSAFE_MARKET"
+
+
+def test_later_physical_stop_confirmation_recovers_shadow_lifecycle(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _factual_live_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    lifecycle_id = created["lifecycle_id"]
+    failed = copy.deepcopy(opened)
+    failed.update({
+        "stop_update_failed": True,
+        "stop_update_status": "STOP_REPLACE_CRITICAL_UNPROTECTED",
+        "stop_update_reason": "BREAK_EVEN",
+        "stop_update": {"ok": False, "status": "STOP_REPLACE_CRITICAL_UNPROTECTED", "rollback": {"ok": False}},
+        "last_update": "2026-07-14T11:06:00Z",
+    })
+    item.observe_event("TRADE_UPDATED", failed, persist=False)
+    assert manager.get_lifecycle(lifecycle_id)["snapshot"]["state"] == "RECOVERY_REQUIRED"
+
+    repaired = copy.deepcopy(failed)
+    repaired.update({
+        "stop_update_failed": True,
+        "stop_update_status": "STOP_REPLACE_FAILED_ROLLED_BACK",
+        "stop_update": {
+            "ok": False,
+            "status": "STOP_REPLACE_FAILED_ROLLED_BACK",
+            "rollback": {"ok": True, "order_id": "ROLLBACK-STOP-1"},
+        },
+        "broker_stop_order_id": "ROLLBACK-STOP-1",
+        "broker_stop_status": "ROLLBACK_PROTECTED",
+        "broker_stop_price": 77.5585142857143,
+        "broker_stop_amount": 0.12,
+        "broker_stop_confirmed_at": "2026-07-14T11:06:05Z",
+        "last_update": "2026-07-14T11:06:05Z",
+    })
+    result = item.observe_event("TRADE_UPDATED", repaired, persist=False)
+    snapshot = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert result["status"] == "APPLIED"
+    assert snapshot["state"] == "ENTRY_PROTECTED"
+    assert snapshot["disaster_stop"]["order_id"] == "ROLLBACK-STOP-1"
+    assert snapshot["recovery"]["required"] is False
+    assert snapshot["recovery"]["completed"] is True
+    assert snapshot["recovery"]["completed_by"] == "DISASTER_STOP_CONFIRMED"
+
+
+def test_immediate_stop_rollback_refreshes_shadow_and_old_retry_cannot_regress_it(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _factual_live_open()
+    lifecycle_id = item.observe_event("SIGNAL_CREATED", opened, persist=False)["lifecycle_id"]
+
+    break_even = copy.deepcopy(opened)
+    break_even.update({
+        "stop_update_reason": "BREAK_EVEN",
+        "stop_update_confirmed": True,
+        "stop_update_confirmed_at": "2026-07-14T11:05:00Z",
+        "stop_update": {"ok": True, "status": "STOP_REPLACED_EDIT", "new_order_id": "BE-STOP-1"},
+        "broker_stop_order_id": "BE-STOP-1",
+        "broker_stop_status": "STOP_REPLACED_EDIT",
+        "broker_stop_price": 76.912,
+        "broker_stop_confirmed_at": "2026-07-14T11:05:00Z",
+        "last_update": "2026-07-14T11:05:00Z",
+    })
+    assert item.observe_event("TRADE_UPDATED", break_even, persist=False)["status"] == "APPLIED"
+    assert manager.get_lifecycle(lifecycle_id)["snapshot"]["state"] == "BREAK_EVEN_ACTIVE"
+
+    rollback = copy.deepcopy(break_even)
+    rollback.update({
+        "stop_update_reason": "TRAILING",
+        "stop_update_failed": True,
+        "stop_update_recovered": True,
+        "stop_update_confirmed": False,
+        "stop_update_final_protection_confirmed": True,
+        "stop_update_confirmed_at": "2026-07-14T11:06:00Z",
+        "stop_update": {
+            "ok": False,
+            "status": "STOP_REPLACE_FAILED_ROLLED_BACK",
+            "rollback": {"ok": True, "order_id": "ROLLBACK-STOP-2"},
+        },
+        "broker_stop_order_id": "ROLLBACK-STOP-2",
+        "broker_stop_status": "ROLLBACK_PROTECTED",
+        "broker_stop_price": 76.912,
+        "broker_stop_amount": 0.12,
+        "broker_stop_confirmed_at": "2026-07-14T11:06:00Z",
+        "disaster_stop_confirmed": True,
+        "last_update": "2026-07-14T11:06:00Z",
+    })
+    observed = item.observe_event("TRADE_UPDATED", rollback, persist=False)
+    snapshot = manager.get_lifecycle(lifecycle_id)["snapshot"]
+
+    assert observed["status"] == "APPLIED"
+    assert snapshot["state"] == "BREAK_EVEN_ACTIVE"
+    assert snapshot["disaster_stop"]["order_id"] == "ROLLBACK-STOP-2"
+    assert item.reconcile_trade(rollback, persist=False)["status"] == "MATCH"
+
+    stale_retry = copy.deepcopy(opened)
+    stale_retry["event_id"] = "STALE-STOP-RETRY"
+    stale_retry["last_update"] = "2026-07-14T11:00:23Z"
+    item.observe_event("TRADE_UPDATED", stale_retry, persist=False)
+    after_stale_retry = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    assert after_stale_retry["disaster_stop"]["order_id"] == "ROLLBACK-STOP-2"
+
+
+def test_live_history_uses_factual_per_step_timestamps(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    payload = _factual_live_open(
+        created_at="2026-07-14T11:00:00Z",
+        opened_at="2026-07-14T11:00:22Z",
+        broker_ack_at="2026-07-14T11:00:20Z",
+        broker_stop_confirmed_at="2026-07-14T11:00:23Z",
+        last_update="2026-07-14T11:00:23Z",
+    )
+    payload["metadata"].update({
+        "execution_decision": {
+            "allowed": True,
+            "decision": "ALLOW",
+            "occurred_at": "2026-07-14T11:00:10Z",
+        },
+        "broker_ack_at": "2026-07-14T11:00:20Z",
+    })
+
+    result = item.observe_event("SIGNAL_CREATED", payload, persist=False)
+    history = manager.get_lifecycle(result["lifecycle_id"])["snapshot"]["history"]
+    occurred_at = {
+        row["event_type"]: row.get("occurred_at")
+        for row in history
+        if row.get("applied") is True
+    }
+
+    assert occurred_at["SIGNAL_CREATED"] == "2026-07-14T11:00:00Z"
+    assert occurred_at["DECISION_PENDING_RECORDED"] == "2026-07-14T11:00:10Z"
+    assert occurred_at["RISK_APPROVED_RECORDED"] == "2026-07-14T11:00:10Z"
+    assert occurred_at["ENTRY_SUBMITTED"] == "2026-07-14T11:00:20Z"
+    assert occurred_at["ENTRY_CONFIRMED"] == "2026-07-14T11:00:22Z"
+    assert occurred_at["DISASTER_STOP_CONFIRMED"] == "2026-07-14T11:00:23Z"
+
+
+def test_tp50_resize_failure_records_tp50_before_recovery(monkeypatch, tmp_path):
+    manager = _isolated_lifecycle_manager(monkeypatch, tmp_path)
+    item = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=tmp_path / "adapter", manager=manager)
+    opened = _factual_live_open()
+    created = item.observe_event("SIGNAL_CREATED", opened, persist=False)
+    lifecycle_id = created["lifecycle_id"]
+    failed = copy.deepcopy(opened)
+    failed.update({
+        "tp50_real_executed": True,
+        "tp50_status": "REAL_EXECUTED_STOP_RESIZE_FAILED",
+        "tp50_real_order_id": "TP50-FAIL-ORDER",
+        "tp50_amount": 0.06,
+        "remaining_qty": 0.06,
+        "stop_update_failed": True,
+        "stop_update_status": "STOP_REPLACE_CRITICAL_UNPROTECTED",
+        "stop_update_reason": "TP50_RESIZE",
+        "stop_update": {"ok": False, "status": "STOP_REPLACE_CRITICAL_UNPROTECTED", "rollback": {"ok": False}},
+        "last_update": "2026-07-14T11:05:00Z",
+    })
+
+    result = item.observe_event("TRADE_UPDATED", failed, persist=False)
+    snapshot = manager.get_lifecycle(lifecycle_id)["snapshot"]
+    history_types = [row.get("event_type") for row in snapshot["history"]]
+    assert result["status"] == "APPLIED"
+    assert snapshot["state"] == "RECOVERY_REQUIRED"
+    assert snapshot["quantity_closed"] == pytest.approx(0.06)
+    assert history_types.index("TP50_CONFIRMED") < history_types.index("RECOVERY_REQUESTED")
 
 
 def test_reconcile_all_includes_open_and_closed(adapter):

@@ -12,10 +12,14 @@ from trade_timeline_validator import COMPONENTS, REQUIRED_EVENTS, validate_trade
 
 TRADE_ID = "TR-LIVE-1"
 SHADOW_VALIDATED_BASE_FIELDS = ["trade_id", "bot", "setup", "symbol", "side", "mode", "status"]
-SHADOW_VALIDATED_LIVE_CLOSED_FIELDS = SHADOW_VALIDATED_BASE_FIELDS + [
+SHADOW_VALIDATED_LIVE_FIELDS = SHADOW_VALIDATED_BASE_FIELDS + [
     "quantity_open", "client_order_id", "exchange_order_id",
 ]
-SHADOW_VALIDATED_LIVE_OPEN_FIELDS = SHADOW_VALIDATED_LIVE_CLOSED_FIELDS + [
+SHADOW_VALIDATED_LIVE_CLOSED_FIELDS = SHADOW_VALIDATED_LIVE_FIELDS + [
+    "lifecycle_terminal", "close_confirmed", "outcome_recorded",
+    "quantity_closed", "closed_at", "close_reason",
+]
+SHADOW_VALIDATED_LIVE_OPEN_FIELDS = SHADOW_VALIDATED_LIVE_FIELDS + [
     "protection", "disaster_stop_order_id",
 ]
 
@@ -31,10 +35,62 @@ def event(name, second, **updates):
     return row
 
 
+def closed_shadow_values(**updates):
+    values = {
+        "trade_id": TRADE_ID,
+        "bot": "FALCON",
+        "setup": "ORB",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "mode": "LIVE",
+        "status": "CLOSED",
+        "quantity_open": 0.0,
+        "quantity_closed": 1.0,
+        "client_order_id": "CLIENT-1",
+        "exchange_order_id": "ORDER-1",
+        "lifecycle_terminal": True,
+        "close_confirmed": True,
+        "outcome_recorded": True,
+        "closed_at": "2026-07-13T12:00:10Z",
+        "close_reason": "STOP_FAILSAFE_MARKET",
+    }
+    values.update(updates)
+    return values
+
+
+def open_shadow_values(**updates):
+    values = {
+        "trade_id": "FALCON:FALCON15:SOLUSDT:SHORT",
+        "bot": "FALCON",
+        "setup": "FALCON15",
+        "symbol": "SOLUSDT",
+        "side": "SHORT",
+        "mode": "LIVE",
+        "status": "OPEN",
+        "quantity_open": 0.12,
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "exchange_order_id": "2077030442691940352",
+        "protection": True,
+        "disaster_stop_order_id": "2077030444402577408",
+    }
+    values.update(updates)
+    return values
+
+
 def valid_sources():
     return {
         "registry": [{"trade_id": TRADE_ID, "status": "CLOSED", "symbol": "BTCUSDT", "side": "LONG", "entry": 100.0, "exit_price": 110.0, "qty": 1.0, "opened_at": "2026-07-13T12:00:05Z", "closed_at": "2026-07-13T12:00:10Z"}],
-        "lifecycle": [event("SIGNAL_RECEIVED", 1), event("RISK_APPROVED", 2), event("LIFECYCLE_FINISHED", 12, status="CLOSED", symbol="BTCUSDT", side="LONG", entry=100.0, exit_price=110.0, quantity=1.0)],
+        "lifecycle": [
+            event("SIGNAL_RECEIVED", 1),
+            event("RISK_APPROVED", 2),
+            event(
+                "OUTCOME_CONFIRMED", 12, status="CLOSED", symbol="BTCUSDT",
+                side="LONG", entry=100.0, exit_price=110.0, quantity=1.0,
+                applied=True, previous_state="OUTCOME_PENDING",
+                current_state="OUTCOME_RECORDED", quantity_after=0.0,
+                outcome_id="OUTCOME-1",
+            ),
+        ],
         "history_manager": [event("EXECUTION_REQUESTED", 3), event("TP50", 7), event("BREAK_EVEN", 8), event("TRAILING_UPDATED", 9)],
         "execution_engine": [event("LIVE_ORDER_SENT", 4)],
         "execution_orchestrator": [event("PARTIAL_CLOSE", 9)],
@@ -46,6 +102,7 @@ def valid_sources():
             side="LONG", entry=100.0, exit_price=110.0, quantity=1.0,
             mode="LIVE", registry_status="CLOSED",
             validated_fields=SHADOW_VALIDATED_LIVE_CLOSED_FIELDS,
+            validated_values=closed_shadow_values(),
         )],
         "timeline": [event("POSITION_OPEN", 6), event("REGISTRY_CLOSE", 11)],
         "telegram": [event("TELEGRAM_SENT", 6)],
@@ -164,6 +221,7 @@ def _write_jsonl_lines(path, lines):
 
 def _validate_from_data_dir(tmp_path, monkeypatch, trade_id=TRADE_ID):
     monkeypatch.setenv("CENTRAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("TRADE_LIFECYCLE_SHADOW_DATA_DIR", str(tmp_path))
     return validate_trade_timeline(trade_id)
 
 
@@ -256,9 +314,15 @@ def test_complete_trade_with_corrupt_line_still_passes(tmp_path, monkeypatch):
                 "compared_fields": 10, "matching_fields": 10, "differences": [],
                 "mode": "LIVE", "registry_status": "CLOSED",
                 "validated_fields": SHADOW_VALIDATED_LIVE_CLOSED_FIELDS,
+                "validated_values": closed_shadow_values(),
             }
         valid.append(json.dumps(event(name, index + 1, **updates)))
     _write_jsonl_lines(tmp_path / "timeline.jsonl", [valid[0], "{corrupt-middle", *valid[1:]])
+    _write_jsonl_lines(tmp_path / "trade_lifecycle_shadow_events.jsonl", [json.dumps(event(
+        "OUTCOME_CONFIRMED", 20, applied=True,
+        previous_state="OUTCOME_PENDING", current_state="OUTCOME_RECORDED",
+        quantity_after=0.0, outcome_id="OUTCOME-CORRUPT-TEST",
+    ))])
 
     report = _validate_from_data_dir(tmp_path, monkeypatch)
 
@@ -566,10 +630,189 @@ def test_shadow_validated_requires_explicit_match_without_differences():
         "compared_fields": 12, "matching_fields": 12,
         "mode": "LIVE", "registry_status": "OPEN",
         "validated_fields": SHADOW_VALIDATED_LIVE_OPEN_FIELDS,
+        "validated_values": open_shadow_values(),
         "timestamp": "2026-07-14T11:00:30Z", "event_id": "SV-1",
     }
     report = validate_trade_timeline(matched["trade_id"], sources=_falcon_sources(shadow_runtime=[matched]))
     assert "SHADOW_VALIDATED" in _found(report)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("quantity_open", 0),
+        ("quantity_open", None),
+        ("client_order_id", None),
+        ("exchange_order_id", None),
+        ("protection", False),
+        ("protection", None),
+        ("disaster_stop_order_id", None),
+        ("bot", None),
+        ("trade_id", "OTHER-TRADE"),
+        ("mode", "PAPER"),
+        ("status", "CLOSED"),
+    ],
+)
+def test_open_shadow_validation_rejects_missing_false_or_incoherent_values(field, value):
+    row = {
+        "trade_id": "FALCON:FALCON15:SOLUSDT:SHORT",
+        "client_order_id": "FALCON-LIVE-FALCON15-1784037618",
+        "broker_order_id": "2077030442691940352",
+        "broker_stop_order_id": "2077030444402577408",
+        "event_type": "SHADOW_VALIDATED",
+        "status": "MATCH",
+        "differences": [],
+        "operational_authority": False,
+        "shadow_mode": True,
+        "source_component": "TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER",
+        "compared_fields": 12,
+        "matching_fields": 12,
+        "mode": "LIVE",
+        "registry_status": "OPEN",
+        "validated_fields": SHADOW_VALIDATED_LIVE_OPEN_FIELDS,
+        "validated_values": open_shadow_values(**{field: value}),
+        "timestamp": "2026-07-14T11:00:30Z",
+        "event_id": f"SV-INVALID-{field}-{value}",
+    }
+    report = validate_trade_timeline(row["trade_id"], sources=_falcon_sources(shadow_runtime=[row]))
+    assert "SHADOW_VALIDATED" not in _found(report)
+
+
+def _complete_lifecycle_snapshot(**updates):
+    snapshot = {
+        "trade_id": "FALCON:FALCON15:SOLUSDT:SHORT",
+        "lifecycle_id": "LC-FALCON-SOL-LIVE",
+        "state": "OUTCOME_RECORDED",
+        "quantity_open": 0.0,
+        "quantity_closed": 0.12,
+        "close": {"confirmed": True, "reason": "STOP_FAILSAFE_MARKET"},
+        "outcome_id": "OUT-FALCON-SOL-LIVE",
+        "outcome": {"confirmed": True, "result_pct": -0.9218, "result_r": -1.0966},
+        "updated_at": "2026-07-14T12:32:05Z",
+    }
+    snapshot.update(updates)
+    return snapshot
+
+
+def test_lifecycle_finished_is_derived_from_complete_terminal_snapshot():
+    report = validate_trade_timeline(
+        "FALCON:FALCON15:SOLUSDT:SHORT",
+        sources=_falcon_sources(lifecycle=[_complete_lifecycle_snapshot()]),
+    )
+    finished = [item for item in report["events_found"] if item["event"] == "LIFECYCLE_FINISHED"]
+    assert len(finished) == 1
+    assert finished[0]["component"] == "lifecycle"
+    assert finished[0]["raw_event"] == "OUTCOME_RECORDED"
+
+
+def test_applied_outcome_transition_is_factual_lifecycle_finished_evidence():
+    applied = {
+        "trade_id": "FALCON:FALCON15:SOLUSDT:SHORT",
+        "lifecycle_id": "LC-FALCON-SOL-LIVE",
+        "event_type": "OUTCOME_CONFIRMED",
+        "event_id": "OUTCOME-APPLIED-1",
+        "applied": True,
+        "previous_state": "OUTCOME_PENDING",
+        "current_state": "OUTCOME_RECORDED",
+        "quantity_after": 0.0,
+        "outcome_id": "OUT-FALCON-SOL-LIVE",
+        "occurred_at": "2026-07-14T12:32:05Z",
+    }
+    report = validate_trade_timeline(
+        applied["trade_id"],
+        sources=_falcon_sources(lifecycle=[applied]),
+    )
+    assert "LIFECYCLE_FINISHED" in _found(report)
+
+
+@pytest.mark.parametrize(
+    "component,row",
+    [
+        ("registry", {"event_type": "OUTCOME_CONFIRMED", "status": "CLOSED"}),
+        ("shadow_runtime", {"event_type": "OUTCOME_CONFIRMED", "status": "MATCH"}),
+        ("lifecycle", _complete_lifecycle_snapshot(state="CLOSE_CONFIRMED")),
+        ("lifecycle", _complete_lifecycle_snapshot(state="OUTCOME_PENDING")),
+        ("lifecycle", _complete_lifecycle_snapshot(close={})),
+        ("lifecycle", _complete_lifecycle_snapshot(outcome={})),
+        ("lifecycle", _complete_lifecycle_snapshot(outcome_id=None)),
+        ("lifecycle", _complete_lifecycle_snapshot(quantity_open=0.01)),
+    ],
+)
+def test_incomplete_or_non_lifecycle_outcome_never_finishes_lifecycle(component, row):
+    record = {"trade_id": "FALCON:FALCON15:SOLUSDT:SHORT", **row}
+    report = validate_trade_timeline(
+        record["trade_id"],
+        sources=_falcon_sources(**{component: [record]}),
+    )
+    assert "LIFECYCLE_FINISHED" not in _found(report)
+
+
+def _closed_shadow_event(**updates):
+    row = {
+        "trade_id": "FALCON:FALCON15:SOLUSDT:SHORT",
+        "event_type": "SHADOW_VALIDATED",
+        "status": "MATCH",
+        "differences": [],
+        "operational_authority": False,
+        "shadow_mode": True,
+        "source_component": "TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER",
+        "compared_fields": 13,
+        "matching_fields": 13,
+        "mode": "LIVE",
+        "registry_status": "CLOSED",
+        "validated_fields": SHADOW_VALIDATED_LIVE_CLOSED_FIELDS,
+        "validated_values": closed_shadow_values(
+            trade_id="FALCON:FALCON15:SOLUSDT:SHORT",
+            bot="FALCON", setup="FALCON15", symbol="SOLUSDT", side="SHORT",
+            quantity_closed=0.12,
+            client_order_id="FALCON-LIVE-FALCON15-1784037618",
+            exchange_order_id="2077030442691940352",
+            closed_at="2026-07-14T12:32:04Z",
+        ),
+        "timestamp": "2026-07-14T12:32:06Z",
+        "event_id": "SHADOW-CLOSED-1",
+    }
+    row.update(updates)
+    return row
+
+
+def test_closed_shadow_validation_requires_complete_terminal_close_scope():
+    row = _closed_shadow_event()
+    report = validate_trade_timeline(row["trade_id"], sources=_falcon_sources(shadow_runtime=[row]))
+    assert "SHADOW_VALIDATED" in _found(report)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "lifecycle_terminal", "close_confirmed", "outcome_recorded",
+        "quantity_open", "quantity_closed", "closed_at", "close_reason",
+    ],
+)
+def test_closed_shadow_validation_rejects_missing_explicit_field(missing_field):
+    row = _closed_shadow_event()
+    row["validated_fields"] = [field for field in row["validated_fields"] if field != missing_field]
+    report = validate_trade_timeline(row["trade_id"], sources=_falcon_sources(shadow_runtime=[row]))
+    assert "SHADOW_VALIDATED" not in _found(report)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("lifecycle_terminal", False),
+        ("close_confirmed", False),
+        ("outcome_recorded", False),
+        ("quantity_open", 0.01),
+        ("quantity_closed", 0.0),
+        ("closed_at", None),
+        ("close_reason", ""),
+    ],
+)
+def test_closed_shadow_validation_rejects_invalid_terminal_value(field, value):
+    row = _closed_shadow_event()
+    row["validated_values"] = {**row["validated_values"], field: value}
+    report = validate_trade_timeline(row["trade_id"], sources=_falcon_sources(shadow_runtime=[row]))
+    assert "SHADOW_VALIDATED" not in _found(report)
 
 
 @pytest.mark.parametrize(
@@ -592,8 +835,8 @@ def test_applied_or_divergent_shadow_record_is_not_validation(row):
 def test_shadow_validation_is_meta_event_and_does_not_break_chronology():
     sources = valid_sources()
     sources["shadow_runtime"] = [
-        event("SHADOW_VALIDATED", 5, status="MATCH", differences=[], operational_authority=False, shadow_mode=True, source_component="TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER", compared_fields=10, matching_fields=10, mode="LIVE", registry_status="CLOSED", validated_fields=SHADOW_VALIDATED_LIVE_CLOSED_FIELDS, event_id="SV-A"),
-        event("SHADOW_VALIDATED", 9, status="MATCH", differences=[], operational_authority=False, shadow_mode=True, source_component="TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER", compared_fields=10, matching_fields=10, mode="LIVE", registry_status="CLOSED", validated_fields=SHADOW_VALIDATED_LIVE_CLOSED_FIELDS, event_id="SV-B"),
+        event("SHADOW_VALIDATED", 5, status="MATCH", differences=[], operational_authority=False, shadow_mode=True, source_component="TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER", compared_fields=10, matching_fields=10, mode="LIVE", registry_status="CLOSED", validated_fields=SHADOW_VALIDATED_LIVE_CLOSED_FIELDS, validated_values=closed_shadow_values(), event_id="SV-A"),
+        event("SHADOW_VALIDATED", 9, status="MATCH", differences=[], operational_authority=False, shadow_mode=True, source_component="TRADE_LIFECYCLE_SHADOW_RUNTIME_ADAPTER", compared_fields=10, matching_fields=10, mode="LIVE", registry_status="CLOSED", validated_fields=SHADOW_VALIDATED_LIVE_CLOSED_FIELDS, validated_values=closed_shadow_values(), event_id="SV-B"),
     ]
     report = validate_trade_timeline(TRADE_ID, sources=sources)
     assert report["chronology"]["ordered"] is True
@@ -760,6 +1003,7 @@ def test_shadow_paths_follow_dedicated_shadow_data_dir(tmp_path, monkeypatch):
         "compared_fields": 12, "matching_fields": 12, "timestamp": "2026-07-14T11:01:00Z",
         "mode": "LIVE", "registry_status": "OPEN",
         "validated_fields": SHADOW_VALIDATED_LIVE_OPEN_FIELDS,
+        "validated_values": open_shadow_values(),
     }
     (shadow / "trade_lifecycle_shadow_runtime_events.jsonl").write_text(json.dumps(shadow_event) + "\n", encoding="utf-8")
     monkeypatch.setenv("CENTRAL_DATA_DIR", str(central))

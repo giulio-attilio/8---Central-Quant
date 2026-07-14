@@ -608,6 +608,7 @@ def register_falcon_trade_registry_open(pos):
             setup=pos.get("setup"),
             qty=pos.get("qty") or pos.get("amount"),
             source="falcon",
+            lifecycle_id=pos.get("lifecycle_id"),
             metadata={
                 "falcon_position_id": pos.get("id"),
                 "setup_label": pos.get("setup_label"),
@@ -619,6 +620,7 @@ def register_falcon_trade_registry_open(pos):
                 "ny_date": pos.get("ny_date"),
                 "created_at": pos.get("created_at"),
                 "execution_decision": pos.get("execution_decision"),
+                "lifecycle_id": pos.get("lifecycle_id"),
             },
         )
         if isinstance(result, dict) and result.get("ok"):
@@ -668,6 +670,7 @@ def close_falcon_trade_registry(pos, exit_price=None, result_pct=None, result_r=
                 pos.get("setup"),
             )
 
+        tp50_execution = pos.get("tp50_real_execution") if isinstance(pos.get("tp50_real_execution"), dict) else {}
         result = central_trade_registry.close_trade(
             trade_id=trade_id,
             exit_price=exit_price,
@@ -684,6 +687,19 @@ def close_falcon_trade_registry(pos, exit_price=None, result_pct=None, result_r=
                 "mae_r": pos.get("mae_r"),
                 "giveback_pct": pos.get("giveback_pct"),
                 "giveback_r": pos.get("giveback_r"),
+                # Cópia observacional dos fatos LIVE já concluídos. O close
+                # oficial acima continua sendo a única mutação de lifecycle do
+                # Registry; estes campos não autorizam nem executam gestão.
+                "broker_entry_reference": pos.get("broker_entry_reference"),
+                "broker_order_id": pos.get("live_order_id"),
+                "client_order_id": pos.get("live_client_order_id"),
+                "initial_qty": pos.get("initial_qty"),
+                "remaining_qty": pos.get("remaining_qty"),
+                "tp50_real_executed": pos.get("tp50_real_executed"),
+                "tp50_real_order_id": pos.get("tp50_real_order_id"),
+                "tp50_amount": pos.get("tp50_amount"),
+                "tp50_fill_price": pos.get("tp50_fill_price"),
+                "tp50_status": tp50_execution.get("status"),
             },
         )
         HEALTH["last_trade_registry_event"] = {
@@ -2491,12 +2507,27 @@ def falcon_sync_live_order_state(sig, order):
     sig["live_order_id"] = order.get("order_id") or order.get("id") or sig.get("live_order_id")
     sig["bingx_order_id"] = sig.get("live_order_id")
     sig["live_client_order_id"] = order.get("client_order_id") or order.get("client_tag")
+    lifecycle_identity = sig.get("live_client_order_id") or sig.get("live_order_id")
+    if lifecycle_identity and not sig.get("lifecycle_id"):
+        sig["lifecycle_id"] = f"CENTRAL-FALCON-LIFECYCLE:{lifecycle_identity}"
     sig["broker_entry_reference"] = order.get("price_ref")
+    sig["broker_ack_at"] = order.get("ts")
     sig["broker_stop_order_id"] = disaster.get("order_id") or sig.get("broker_stop_order_id")
     sig["disaster_stop_order_id"] = sig.get("broker_stop_order_id")
     sig["broker_stop_price"] = disaster.get("stop_price") or sig.get("stop")
     sig["broker_stop_amount"] = disaster.get("amount") or amount
     sig["broker_stop_status"] = disaster.get("status")
+    # Preserve the factual Broker response for the passive Lifecycle observer.
+    # These fields never authorize or change the stop; they are copied only
+    # after ``place_market_order`` has returned its disaster-stop result.
+    sig["broker_stop_side"] = disaster.get("side")
+    sig["broker_stop_symbol"] = disaster.get("symbol")
+    sig["broker_stop_confirmed_at"] = disaster.get("timestamp") or order.get("ts")
+    sig["disaster_stop_confirmed"] = bool(
+        disaster.get("ok") is True
+        and disaster.get("created") is True
+        and disaster.get("order_id")
+    )
     sig["real_management_version"] = FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION
     sig["registry_mode"] = "REAL"
     return sig
@@ -2527,17 +2558,26 @@ def register_falcon_trade_registry_open(pos):
                 qty=falcon_real_remaining_qty(pos),
                 execution_mode="LIVE",
                 registry_mode="REAL",
+                lifecycle_id=pos.get("lifecycle_id"),
                 order_id=pos.get("live_order_id"),
                 broker_order_id=pos.get("live_order_id"),
                 client_order_id=pos.get("live_client_order_id") or live_order.get("client_order_id"),
                 metadata={
                     "registry_mode": "REAL",
+                    "lifecycle_id": pos.get("lifecycle_id"),
                     "execution_sent": True,
+                    "broker_entry_reference": pos.get("broker_entry_reference"),
+                    "broker_ack_at": pos.get("broker_ack_at"),
                     "broker_order_id": pos.get("live_order_id"),
                     "client_order_id": pos.get("live_client_order_id") or live_order.get("client_order_id"),
                     "broker_stop_order_id": pos.get("broker_stop_order_id"),
                     "broker_stop_price": pos.get("broker_stop_price"),
                     "broker_stop_amount": pos.get("broker_stop_amount"),
+                    "broker_stop_status": pos.get("broker_stop_status"),
+                    "broker_stop_side": pos.get("broker_stop_side"),
+                    "broker_stop_symbol": pos.get("broker_stop_symbol"),
+                    "broker_stop_confirmed_at": pos.get("broker_stop_confirmed_at"),
+                    "disaster_stop_confirmed": pos.get("disaster_stop_confirmed"),
                     "initial_qty": pos.get("initial_qty"),
                     "remaining_qty": pos.get("remaining_qty"),
                     "partial_capable_sizing": pos.get("partial_capable_sizing"),
@@ -2566,8 +2606,15 @@ def falcon_update_registry_management(pos, **metadata):
                 "broker_stop_order_id": pos.get("broker_stop_order_id"),
                 "broker_stop_price": pos.get("broker_stop_price"),
                 "broker_stop_amount": pos.get("broker_stop_amount"),
+                "broker_stop_status": pos.get("broker_stop_status"),
+                "broker_stop_side": pos.get("broker_stop_side"),
+                "broker_stop_symbol": pos.get("broker_stop_symbol"),
+                "broker_stop_confirmed_at": pos.get("broker_stop_confirmed_at"),
+                "disaster_stop_confirmed": pos.get("disaster_stop_confirmed"),
                 "tp50_real_executed": pos.get("tp50_real_executed"),
                 "tp50_real_order_id": pos.get("tp50_real_order_id"),
+                "tp50_amount": pos.get("tp50_amount"),
+                "tp50_fill_price": pos.get("tp50_fill_price"),
                 "real_management_version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
                 **metadata,
             },
@@ -2627,12 +2674,27 @@ def _falcon_finalize_tp50_after_partial(pos, runner_amount, price, close_result)
 
     stop_result = _falcon_resize_runner_stop(pos, runner_amount, safe_float(pos.get("stop")), "TP50_RESIZE")
     if isinstance(stop_result, dict) and stop_result.get("ok"):
+        stop_confirmed_at = data_hora_sp_str()
         pos["broker_stop_order_id"] = stop_result.get("new_order_id") or pos.get("broker_stop_order_id")
         pos["disaster_stop_order_id"] = pos.get("broker_stop_order_id")
         pos["broker_stop_amount"] = runner_amount
         pos["broker_stop_price"] = safe_float(pos.get("stop"))
         pos["broker_stop_status"] = stop_result.get("status")
-        falcon_update_registry_management(pos, tp50_status="REAL_EXECUTED", stop_resize=stop_result)
+        pos["broker_stop_confirmed_at"] = stop_confirmed_at
+        falcon_update_registry_management(
+            pos,
+            tp50_status="REAL_EXECUTED",
+            stop_resize=stop_result,
+            stop_update_reason="TP50_RESIZE",
+            stop_update=stop_result,
+            stop_update_status=stop_result.get("status"),
+            stop_update_failed=False,
+            stop_update_recovered=False,
+            stop_update_confirmed=True,
+            stop_update_confirmed_at=stop_confirmed_at,
+            stop_update_final_protection_confirmed=True,
+            disaster_stop_confirmed=True,
+        )
         return {
             "ok": True,
             "status": "TP50_REAL_EXECUTED_RUNNER_PROTECTED",
@@ -2648,12 +2710,27 @@ def _falcon_finalize_tp50_after_partial(pos, runner_amount, price, close_result)
 
     rollback = stop_result.get("rollback") if isinstance(stop_result, dict) and isinstance(stop_result.get("rollback"), dict) else {}
     if rollback.get("ok"):
+        rollback_confirmed_at = data_hora_sp_str()
         pos["broker_stop_order_id"] = rollback.get("order_id")
         pos["disaster_stop_order_id"] = rollback.get("order_id")
         pos["broker_stop_amount"] = runner_amount
         pos["broker_stop_price"] = rollback.get("stop_price") or pos.get("stop")
         pos["broker_stop_status"] = "ROLLBACK_PROTECTED"
-        falcon_update_registry_management(pos, tp50_status="REAL_EXECUTED_STOP_ROLLBACK", stop_resize=stop_result)
+        pos["broker_stop_confirmed_at"] = rollback_confirmed_at
+        falcon_update_registry_management(
+            pos,
+            tp50_status="REAL_EXECUTED_STOP_ROLLBACK",
+            stop_resize=stop_result,
+            stop_update_reason="TP50_RESIZE",
+            stop_update=stop_result,
+            stop_update_status=stop_result.get("status"),
+            stop_update_failed=True,
+            stop_update_recovered=True,
+            stop_update_confirmed=False,
+            stop_update_confirmed_at=rollback_confirmed_at,
+            stop_update_final_protection_confirmed=True,
+            disaster_stop_confirmed=True,
+        )
         return {
             "ok": True,
             "status": "TP50_REAL_EXECUTED_STOP_ROLLBACK_PROTECTED",
@@ -2666,6 +2743,27 @@ def _falcon_finalize_tp50_after_partial(pos, runner_amount, price, close_result)
             "stop_resize": stop_result,
             "version": FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION,
         }
+
+    stop_failure_confirmed_at = data_hora_sp_str()
+    falcon_update_registry_management(
+        pos,
+        tp50_status="REAL_EXECUTED_STOP_UPDATE_FAILED",
+        stop_resize=stop_result,
+        stop_update_reason="TP50_RESIZE",
+        stop_update=stop_result,
+        stop_update_status=stop_result.get("status") if isinstance(stop_result, dict) else "STOP_UPDATE_FAILED",
+        stop_update_failed=True,
+        stop_update_recovered=False,
+        stop_update_confirmed=False,
+        stop_update_confirmed_at=stop_failure_confirmed_at,
+        stop_update_final_protection_confirmed=False,
+        broker_stop_order_id=None,
+        broker_stop_price=None,
+        broker_stop_amount=None,
+        broker_stop_status=stop_result.get("status") if isinstance(stop_result, dict) else "STOP_UPDATE_FAILED",
+        broker_stop_confirmed_at=stop_failure_confirmed_at,
+        disaster_stop_confirmed=False,
+    )
 
     if FALCON_MANAGEMENT_FAILSAFE_ENABLED and hasattr(central_broker, "managed_close_position_market"):
         auth = falcon_issue_management_token(pos, "TP50_RUNNER_FAILSAFE_CLOSE", {"amount": runner_amount})
@@ -2817,13 +2915,49 @@ def falcon_apply_live_stop_update(pos, new_stop, reason):
     result = _falcon_resize_runner_stop(pos, remaining, new_stop, reason)
     applied = bool(isinstance(result, dict) and result.get("ok") and str(result.get("status", "")).startswith("STOP_REPLACED"))
     if applied:
+        stop_confirmed_at = data_hora_sp_str()
         pos["stop"] = new_stop
         pos["broker_stop_price"] = new_stop
         pos["broker_stop_amount"] = remaining
         pos["broker_stop_order_id"] = result.get("new_order_id") or pos.get("broker_stop_order_id")
         pos["disaster_stop_order_id"] = pos.get("broker_stop_order_id")
         pos["broker_stop_status"] = result.get("status")
-        falcon_update_registry_management(pos, stop_update_reason=reason, stop_update=result)
+        pos["broker_stop_confirmed_at"] = stop_confirmed_at
+        falcon_update_registry_management(
+            pos,
+            stop_update_reason=reason,
+            stop_update=result,
+            stop_update_status=result.get("status"),
+            stop_update_failed=False,
+            stop_update_recovered=False,
+            stop_update_confirmed=True,
+            stop_update_confirmed_at=stop_confirmed_at,
+            stop_update_final_protection_confirmed=True,
+            disaster_stop_confirmed=True,
+        )
+    elif isinstance(result, dict) and result.get("ok") is False:
+        # Persistir a falha factual somente como evidência observacional. A
+        # chamada é fail-open e não altera o retorno nem tenta recovery/ordem.
+        rollback = result.get("rollback") if isinstance(result.get("rollback"), dict) else {}
+        rollback_protected = bool(rollback.get("ok") and rollback.get("order_id"))
+        stop_observed_at = data_hora_sp_str()
+        falcon_update_registry_management(
+            pos,
+            stop_update_reason=reason,
+            stop_update=result,
+            stop_update_status=result.get("status"),
+            stop_update_failed=True,
+            stop_update_recovered=rollback_protected,
+            stop_update_confirmed=False,
+            stop_update_confirmed_at=stop_observed_at,
+            stop_update_final_protection_confirmed=rollback_protected,
+            broker_stop_order_id=rollback.get("order_id") if rollback_protected else None,
+            broker_stop_price=rollback.get("stop_price") if rollback_protected else None,
+            broker_stop_amount=rollback.get("amount") if rollback_protected else None,
+            broker_stop_status="ROLLBACK_PROTECTED" if rollback_protected else result.get("status"),
+            broker_stop_confirmed_at=stop_observed_at,
+            disaster_stop_confirmed=rollback_protected,
+        )
     HEALTH["last_real_management_action"] = {"action": reason, "status": result.get("status") if isinstance(result, dict) else None, "symbol": pos.get("symbol"), "ts": data_hora_sp_str()}
     if not applied:
         HEALTH["last_real_management_error"] = result.get("status") if isinstance(result, dict) else "STOP_UPDATE_UNKNOWN"

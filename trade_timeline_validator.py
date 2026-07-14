@@ -23,6 +23,7 @@ JSONL_MAX_BYTES = 64 * 1024 * 1024
 JSONL_MAX_VALID_LINES = 100_000
 CORRELATION_PRE_OPEN_SECONDS = 15 * 60
 CORRELATION_POST_CLOSE_SECONDS = 24 * 60 * 60
+ENTRY_REFERENCE_TOLERANCE_RATIO = 0.001
 
 COMPONENTS = (
     "registry",
@@ -68,6 +69,7 @@ EVENT_ORDER = (
 
 REPEATABLE_EVENTS = {"TRAILING_UPDATED", "PARTIAL_CLOSE"}
 OBSERVATIONAL_META_EVENTS = {"SHADOW_VALIDATED"}
+LIFECYCLE_TERMINAL_STATES = {"OUTCOME_RECORDED", "LEARNING_ELIGIBLE"}
 
 EVENT_ALIASES = {
     "SIGNAL": "SIGNAL_RECEIVED",
@@ -802,6 +804,80 @@ def _shadow_match_evidence(record: Mapping[str, Any]) -> bool:
         required.update({"quantity_open", "client_order_id", "exchange_order_id"})
         if registry_status == "OPEN":
             required.update({"protection", "disaster_stop_order_id"})
+        elif registry_status == "CLOSED":
+            required.update({
+                "lifecycle_terminal",
+                "close_confirmed",
+                "outcome_recorded",
+                "quantity_closed",
+                "closed_at",
+                "close_reason",
+            })
+    validated_values = _direct_value(record, "validated_values")
+    values = validated_values if isinstance(validated_values, Mapping) else {}
+    live_values_valid = True
+    if mode in {"LIVE", "REAL"}:
+        base_value_fields = {"trade_id", "bot", "setup", "symbol", "side", "mode", "status"}
+        base_values_present = all(values.get(field) not in (None, "") for field in base_value_fields)
+        record_trade_id = _direct_value(record, "trade_id")
+        record_client_order_id = _direct_value(record, "client_order_id")
+        record_exchange_order_id = _direct_value(record, "exchange_order_id", "broker_order_id")
+        record_stop_order_id = _direct_value(record, "disaster_stop_order_id", "broker_stop_order_id")
+        normalized_value_mode = "LIVE" if str(values.get("mode") or "").upper().strip() in {"LIVE", "REAL"} else str(values.get("mode") or "").upper().strip()
+        normalized_record_mode = "LIVE" if mode in {"LIVE", "REAL"} else mode
+        coherent = bool(
+            str(values.get("trade_id") or "") == str(record_trade_id or "")
+            and normalized_value_mode == normalized_record_mode
+            and str(values.get("status") or "").upper().strip() == registry_status
+            and (record_client_order_id in (None, "") or str(values.get("client_order_id") or "") == str(record_client_order_id))
+            and (record_exchange_order_id in (None, "") or str(values.get("exchange_order_id") or "") == str(record_exchange_order_id))
+            and (record_stop_order_id in (None, "") or str(values.get("disaster_stop_order_id") or "") == str(record_stop_order_id))
+        )
+        for field, normalizer in (
+            ("bot", lambda value: str(value or "").upper().strip()),
+            ("setup", lambda value: str(value or "").upper().strip()),
+            ("symbol", _normalize_symbol),
+            ("side", _normalize_side),
+        ):
+            record_value = _direct_value(record, field)
+            if record_value not in (None, "") and normalizer(values.get(field)) != normalizer(record_value):
+                coherent = False
+        live_values_valid = bool(
+            base_values_present
+            and values.get("client_order_id") not in (None, "")
+            and values.get("exchange_order_id") not in (None, "")
+            and coherent
+        )
+
+    open_values_valid = True
+    if mode in {"LIVE", "REAL"} and registry_status == "OPEN":
+        try:
+            quantity_open_positive = float(values.get("quantity_open")) > 0
+        except (TypeError, ValueError):
+            quantity_open_positive = False
+        open_values_valid = bool(
+            quantity_open_positive
+            and values.get("protection") is True
+            and values.get("disaster_stop_order_id") not in (None, "")
+        )
+
+    closed_values_valid = True
+    if mode in {"LIVE", "REAL"} and registry_status == "CLOSED":
+        try:
+            quantity_open_zero = abs(float(values.get("quantity_open"))) <= 1e-9
+            quantity_closed_positive = float(values.get("quantity_closed")) > 0
+        except (TypeError, ValueError):
+            quantity_open_zero = False
+            quantity_closed_positive = False
+        closed_values_valid = bool(
+            _true(values.get("lifecycle_terminal"))
+            and _true(values.get("close_confirmed"))
+            and _true(values.get("outcome_recorded"))
+            and quantity_open_zero
+            and quantity_closed_positive
+            and values.get("closed_at") not in (None, "")
+            and values.get("close_reason") not in (None, "")
+        )
     return (
         _raw_event(record) == "SHADOW_VALIDATED"
         and status == "MATCH"
@@ -814,6 +890,52 @@ def _shadow_match_evidence(record: Mapping[str, Any]) -> bool:
         and mode in {"PAPER", "VERIFY", "LIVE", "REAL"}
         and registry_status in {"OPEN", "CLOSED"}
         and required.issubset(validated)
+        and live_values_valid
+        and open_values_valid
+        and closed_values_valid
+    )
+
+
+def _zero_quantity(value: Any) -> bool:
+    try:
+        return abs(float(value)) <= 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _lifecycle_finished_evidence(record: Mapping[str, Any]) -> bool:
+    """Accept only a factual, completed Manager lifecycle.
+
+    A full snapshot proves completion through its terminal state, confirmed close,
+    confirmed outcome identity, and reconciled zero open quantity.  The append-only
+    event log can prove the same fact with the canonical applied outcome transition.
+    Registry and Shadow records are deliberately excluded by the caller.
+    """
+    raw = _raw_event(record)
+    previous_state = str(_direct_value(record, "previous_state") or "").upper().strip()
+    current_state = str(_direct_value(record, "current_state", "state") or "").upper().strip()
+    outcome_id = _direct_value(record, "outcome_id")
+    if (
+        raw == "OUTCOME_CONFIRMED"
+        and _true(_direct_value(record, "applied", "event_applied"))
+        and previous_state == "OUTCOME_PENDING"
+        and current_state == "OUTCOME_RECORDED"
+        and _zero_quantity(_direct_value(record, "quantity_after", "quantity_open"))
+        and outcome_id not in (None, "")
+    ):
+        return True
+
+    snapshot = record.get("snapshot") if isinstance(record.get("snapshot"), Mapping) else record
+    state = str(snapshot.get("state") or snapshot.get("current_state") or "").upper().strip()
+    close = snapshot.get("close") if isinstance(snapshot.get("close"), Mapping) else {}
+    outcome = snapshot.get("outcome") if isinstance(snapshot.get("outcome"), Mapping) else {}
+    snapshot_outcome_id = snapshot.get("outcome_id") or outcome.get("outcome_id")
+    return bool(
+        state in LIFECYCLE_TERMINAL_STATES
+        and _true(close.get("confirmed"))
+        and _true(outcome.get("confirmed"))
+        and snapshot_outcome_id not in (None, "")
+        and _zero_quantity(snapshot.get("quantity_open"))
     )
 
 
@@ -847,15 +969,20 @@ def _events_from_record(component: str, record: Mapping[str, Any]) -> list[Dict[
     for item in embedded:
         events.extend(_events_from_record(component, item))
 
-    raw = _raw_event(record)
+    # Embedded history is already expanded above. Do not reinterpret the parent
+    # snapshot as its first nested event, which would duplicate that fact.
+    raw = _record_event_name(record) if embedded else _raw_event(record)
     canonical = EVENT_ALIASES.get(raw)
     conditional_broker_alias = canonical == "BROKER_ACK"
     conditional_shadow_alias = canonical == "SHADOW_VALIDATED"
-    if canonical and not conditional_broker_alias and not conditional_shadow_alias:
+    conditional_lifecycle_finish = canonical == "LIFECYCLE_FINISHED"
+    if canonical and not conditional_broker_alias and not conditional_shadow_alias and not conditional_lifecycle_finish:
         events.append(_event(component, canonical, raw, record))
     elif canonical == "BROKER_ACK" and (_confirmed_broker_send(record) or (raw == "ENTRY_FILL_RECORDED" and _confirmed_fill(record))):
         events.append(_event(component, canonical, raw, record))
     elif canonical == "SHADOW_VALIDATED" and component in {"shadow_runtime", "timeline"} and _shadow_match_evidence(record):
+        events.append(_event(component, canonical, raw, record))
+    elif canonical == "LIFECYCLE_FINISHED" and component == "lifecycle" and _lifecycle_finished_evidence(record):
         events.append(_event(component, canonical, raw, record))
 
     if component in {"registry", "history_manager", "execution_engine", "execution_orchestrator", "timeline"} and _decision_allow_live(record) and not any(item["event"] == "RISK_APPROVED" for item in events):
@@ -883,7 +1010,7 @@ def _events_from_record(component: str, record: Mapping[str, Any]) -> list[Dict[
             events.append(_event(component, "REGISTRY_CLOSE", "REGISTRY_CLOSE", record, "closed_at"))
     if component == "lifecycle":
         state = str(record.get("state") or record.get("current_state") or "").upper()
-        if state in {"OUTCOME_RECORDED", "LEARNING_ELIGIBLE"}:
+        if not any(item["event"] == "LIFECYCLE_FINISHED" for item in events) and _lifecycle_finished_evidence(record):
             events.append(_event(component, "LIFECYCLE_FINISHED", state, record))
     return events
 
@@ -1066,7 +1193,8 @@ def _equal_fact(left: Any, right: Any, field: Optional[str] = None) -> bool:
         return _normalize_side(left) == _normalize_side(right)
     try:
         a, b = float(left), float(right)
-        return abs(a - b) <= max(1e-8, max(abs(a), abs(b)) * 1e-8)
+        tolerance = ENTRY_REFERENCE_TOLERANCE_RATIO if field == "entry" else 1e-8
+        return abs(a - b) <= max(1e-8, max(abs(a), abs(b)) * tolerance)
     except (TypeError, ValueError):
         aliases = {"FILLED": "OPEN", "OPENED": "OPEN", "FINISHED": "CLOSED", "CLOSE_CONFIRMED": "CLOSED", "OUTCOME_RECORDED": "CLOSED"}
         a = aliases.get(str(left).upper(), str(left).upper())

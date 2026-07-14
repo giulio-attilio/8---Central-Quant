@@ -23,6 +23,20 @@ VERSION = "3.0.0-SHADOW"
 SCHEMA_VERSION = 1
 QUANTITY_TOLERANCE = 1e-9
 
+ACTIVE_DISASTER_STOP_STATUSES = {
+    "OPEN",
+    "NEW",
+    "ACTIVE",
+    "WORKING",
+    "STOP_ACTIVE",
+    "DISASTER_STOP_CREATED",
+    "ROLLBACK_PROTECTED",
+    "STOP_REPLACED",
+    "STOP_REPLACED_CONFIRMED",
+    "STOP_REPLACED_EDIT",
+    "STOP_REPLACED_CANCEL_CREATE",
+}
+
 
 class LifecycleState(str, Enum):
     SIGNAL_DETECTED = "SIGNAL_DETECTED"
@@ -163,10 +177,12 @@ TRANSITION_MATRIX: Dict[str, Dict[str, str]] = {
         LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
     },
     LifecycleState.ENTRY_PROTECTED.value: {
+        LifecycleEvent.DISASTER_STOP_CONFIRMED.value: LifecycleState.ENTRY_PROTECTED.value,
         LifecycleEvent.POSITION_MANAGEMENT_STARTED.value: LifecycleState.POSITION_MANAGED.value,
         LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
     },
     LifecycleState.POSITION_MANAGED.value: {
+        LifecycleEvent.DISASTER_STOP_CONFIRMED.value: LifecycleState.POSITION_MANAGED.value,
         LifecycleEvent.TP50_REQUESTED.value: LifecycleState.TP50_PENDING.value,
         LifecycleEvent.BREAK_EVEN_REQUESTED.value: LifecycleState.BREAK_EVEN_PENDING.value,
         LifecycleEvent.TRAILING_REQUESTED.value: LifecycleState.TRAILING_PENDING.value,
@@ -176,31 +192,39 @@ TRANSITION_MATRIX: Dict[str, Dict[str, str]] = {
     LifecycleState.TP50_PENDING.value: {
         LifecycleEvent.TP50_FILL_RECORDED.value: LifecycleState.TP50_PENDING.value,
         LifecycleEvent.TP50_CONFIRMED.value: LifecycleState.TP50_CONFIRMED.value,
+        LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
         LifecycleEvent.RECONCILIATION_REQUESTED.value: LifecycleState.RECONCILIATION_REQUIRED.value,
     },
     LifecycleState.TP50_CONFIRMED.value: {
+        LifecycleEvent.DISASTER_STOP_CONFIRMED.value: LifecycleState.TP50_CONFIRMED.value,
         LifecycleEvent.RUNNER_PROTECTION_CONFIRMED.value: LifecycleState.RUNNER_PROTECTED.value,
+        LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
         LifecycleEvent.RECOVERY_REQUESTED.value: LifecycleState.RECOVERY_REQUIRED.value,
     },
     LifecycleState.RUNNER_PROTECTED.value: {
+        LifecycleEvent.DISASTER_STOP_CONFIRMED.value: LifecycleState.RUNNER_PROTECTED.value,
         LifecycleEvent.BREAK_EVEN_REQUESTED.value: LifecycleState.BREAK_EVEN_PENDING.value,
         LifecycleEvent.TRAILING_REQUESTED.value: LifecycleState.TRAILING_PENDING.value,
         LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
     },
     LifecycleState.BREAK_EVEN_PENDING.value: {
         LifecycleEvent.BREAK_EVEN_CONFIRMED.value: LifecycleState.BREAK_EVEN_ACTIVE.value,
+        LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
         LifecycleEvent.RECOVERY_REQUESTED.value: LifecycleState.RECOVERY_REQUIRED.value,
     },
     LifecycleState.BREAK_EVEN_ACTIVE.value: {
+        LifecycleEvent.DISASTER_STOP_CONFIRMED.value: LifecycleState.BREAK_EVEN_ACTIVE.value,
         LifecycleEvent.TRAILING_REQUESTED.value: LifecycleState.TRAILING_PENDING.value,
         LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
         LifecycleEvent.BREAK_EVEN_REQUESTED.value: LifecycleState.BREAK_EVEN_PENDING.value,
     },
     LifecycleState.TRAILING_PENDING.value: {
         LifecycleEvent.TRAILING_CONFIRMED.value: LifecycleState.TRAILING_ACTIVE.value,
+        LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
         LifecycleEvent.RECOVERY_REQUESTED.value: LifecycleState.RECOVERY_REQUIRED.value,
     },
     LifecycleState.TRAILING_ACTIVE.value: {
+        LifecycleEvent.DISASTER_STOP_CONFIRMED.value: LifecycleState.TRAILING_ACTIVE.value,
         LifecycleEvent.TRAILING_REQUESTED.value: LifecycleState.TRAILING_PENDING.value,
         LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
     },
@@ -235,6 +259,7 @@ TRANSITION_MATRIX: Dict[str, Dict[str, str]] = {
         LifecycleEvent.RECOVERY_COMPLETED.value: DYNAMIC,
         LifecycleEvent.RECONCILIATION_REQUESTED.value: LifecycleState.RECONCILIATION_REQUIRED.value,
         LifecycleEvent.DISASTER_STOP_CONFIRMED.value: LifecycleState.ENTRY_PROTECTED.value,
+        LifecycleEvent.CLOSE_REQUESTED.value: LifecycleState.CLOSE_PENDING.value,
     },
     LifecycleState.MANUAL_POSITION_DETECTED.value: {
         LifecycleEvent.EXTERNAL_POSITION_CLASSIFIED.value: LifecycleState.EXTERNAL_EXPOSURE_ONLY.value,
@@ -421,7 +446,9 @@ def _new_snapshot(payload: Mapping[str, Any], state: str) -> Dict[str, Any]:
         "quantity_open": 0.0,
         "quantity_closed": 0.0,
         "entry_price_theoretical": payload.get("entry_price_theoretical"),
+        "entry_price_reference": payload.get("entry_price_reference"),
         "entry_price_confirmed": None,
+        "entry_confirmation": {},
         "disaster_stop": {},
         "tp50": {},
         "runner": {},
@@ -465,6 +492,36 @@ def _record_divergence(snapshot: Dict[str, Any], field: str, shadow_value: Any, 
             global _last_error
             _last_error = f"divergence_write_error: {exc}"
     return item
+
+
+def _semantic_duplicate_result(
+    snapshot: Dict[str, Any],
+    event: Mapping[str, Any],
+    event_key: str,
+    reason: str,
+    status: str,
+    warnings: List[str],
+    persist: bool,
+) -> Dict[str, Any]:
+    global _last_error
+    record = {
+        "event_type": event.get("event_type"),
+        "event_key": event_key,
+        "event_id": event.get("event_id"),
+        "received_at": event.get("received_at"),
+        "applied": False,
+        "duplicate": True,
+        "reason": reason,
+    }
+    snapshot.setdefault("history", []).append(record)
+    if persist:
+        try:
+            _append_jsonl(EVENTS_FILE, {**record, "lifecycle_id": snapshot.get("lifecycle_id")})
+            _atomic_write_snapshot()
+        except OSError as exc:
+            _last_error = f"semantic_duplicate_persist_error: {exc}"
+            warnings.append(_last_error)
+    return _result(snapshot, ok=True, status=status, duplicate=True, warnings=warnings)
 
 
 def create_lifecycle(payload: Dict[str, Any], persist: bool = True) -> Dict[str, Any]:
@@ -584,6 +641,42 @@ def _event_value(event: Dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _is_registry_live_entry_confirmation(event: Mapping[str, Any]) -> bool:
+    """Identify the explicit Adapter contract for a factual LIVE Registry OPEN."""
+    return _event_value(dict(event), "registry_live_open_post_ack") is True
+
+
+def _is_broker_reduction_confirmation(event: Mapping[str, Any]) -> bool:
+    """Identify a TP50 reduction confirmed by a factual Broker order."""
+    return _event_value(dict(event), "broker_reduction_confirmed") is True
+
+
+def _is_registry_live_close_confirmation(event: Mapping[str, Any]) -> bool:
+    """Identify the explicit Adapter contract for a factual LIVE Registry CLOSED."""
+    return _event_value(dict(event), "registry_live_closed_factual") is True
+
+
+def _factual_close_key(event: Mapping[str, Any]) -> str:
+    material = {
+        "trade_id": _event_value(dict(event), "trade_id"),
+        "closed_at": _event_value(dict(event), "closed_at"),
+        "close_reason": _event_value(dict(event), "close_reason", "exit_reason", "reason"),
+        "quantity": _event_value(dict(event), "quantity", "closed_quantity"),
+        "broker_order_id": _event_value(dict(event), "broker_order_id", "exchange_order_id", "close_order_id"),
+    }
+    encoded = json.dumps(_json_safe(material), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _expected_protective_side(position_side: Any) -> str:
+    normalized = _normalize_side(position_side)
+    if normalized == "LONG":
+        return "SHORT"
+    if normalized == "SHORT":
+        return "LONG"
+    return ""
+
+
 def _resolve_dynamic_target(snapshot: Dict[str, Any], event: Dict[str, Any], event_type: str) -> str:
     if event_type == LifecycleEvent.ENTRY_FILL_RECORDED.value:
         quantity = max(0.0, _safe_float(_event_value(event, "quantity", "filled_quantity")))
@@ -655,17 +748,73 @@ def _validate_event_evidence(snapshot: Dict[str, Any], event: Dict[str, Any], ev
         LifecycleEvent.CLOSE_FILL_RECORDED.value,
         LifecycleEvent.CLOSE_PARTIAL_RECORDED.value,
     }
+    fill_id = _event_value(event, "fill_id")
+    registry_entry_confirmation = (
+        event_type == LifecycleEvent.ENTRY_CONFIRMED.value
+        and not fill_id
+        and _is_registry_live_entry_confirmation(event)
+    )
+    broker_reduction_confirmation = (
+        event_type == LifecycleEvent.TP50_FILL_RECORDED.value
+        and not fill_id
+        and _is_broker_reduction_confirmation(event)
+    )
     if event_type in fill_events:
-        if not _event_value(event, "fill_id"):
-            if event_type == LifecycleEvent.ENTRY_CONFIRMED.value and snapshot.get("quantity_filled", 0.0) > QUANTITY_TOLERANCE:
+        if not fill_id:
+            if registry_entry_confirmation or broker_reduction_confirmation:
+                pass
+            elif event_type == LifecycleEvent.ENTRY_CONFIRMED.value and snapshot.get("quantity_filled", 0.0) > QUANTITY_TOLERANCE:
                 pass
             else:
                 reasons.append("fill_id is required")
         if _safe_float(_event_value(event, "quantity", "filled_quantity", "closed_quantity")) <= 0:
-            if event_type == LifecycleEvent.ENTRY_CONFIRMED.value and snapshot.get("quantity_filled", 0.0) > QUANTITY_TOLERANCE:
+            if event_type == LifecycleEvent.ENTRY_CONFIRMED.value and snapshot.get("quantity_filled", 0.0) > QUANTITY_TOLERANCE and not registry_entry_confirmation:
                 pass
             else:
                 reasons.append("positive fill quantity is required")
+    if registry_entry_confirmation:
+        if not event.get("event_id"):
+            reasons.append("Registry LIVE entry confirmation requires event_id")
+        if str(_event_value(event, "registry_source_component") or "").upper().strip() != "TRADE_REGISTRY":
+            reasons.append("Registry LIVE entry confirmation requires TRADE_REGISTRY evidence")
+        if str(_event_value(event, "registry_status", "status") or "").upper().strip() != "OPEN":
+            reasons.append("Registry LIVE entry confirmation requires Registry OPEN status")
+        if _normalize_mode(_event_value(event, "mode", "execution_mode", "registry_mode")) != "LIVE":
+            reasons.append("Registry LIVE entry confirmation requires LIVE mode")
+        if _event_value(event, "execution_sent") is not True:
+            reasons.append("Registry LIVE entry confirmation requires execution_sent=true")
+        if not supplied_trade:
+            reasons.append("Registry LIVE entry confirmation requires trade_id")
+        client_order_id = _event_value(event, "client_order_id")
+        exchange_order_id = _event_value(event, "exchange_order_id", "broker_order_id")
+        if client_order_id in (None, ""):
+            reasons.append("Registry LIVE entry confirmation requires client_order_id")
+        elif snapshot.get("client_order_id") and str(snapshot["client_order_id"]) != str(client_order_id):
+            reasons.append("Registry LIVE entry confirmation client_order_id does not match")
+        if exchange_order_id in (None, ""):
+            reasons.append("Registry LIVE entry confirmation requires exchange_order_id")
+        elif snapshot.get("exchange_order_id") and str(snapshot["exchange_order_id"]) != str(exchange_order_id):
+            reasons.append("Registry LIVE entry confirmation exchange_order_id does not match")
+        confirmed_quantity = _safe_float(_event_value(event, "quantity", "filled_quantity"))
+        if confirmed_quantity <= 0:
+            reasons.append("Registry LIVE entry confirmation requires positive quantity")
+        elif confirmed_quantity + QUANTITY_TOLERANCE < _safe_float(snapshot.get("quantity_filled")):
+            reasons.append("Registry LIVE entry confirmation cannot reduce confirmed quantity")
+    if broker_reduction_confirmation:
+        if not event.get("event_id"):
+            reasons.append("Broker reduction confirmation requires event_id")
+        broker_order_id = _event_value(event, "broker_order_id", "exchange_order_id", "order_id")
+        if broker_order_id in (None, ""):
+            reasons.append("Broker reduction confirmation requires broker_order_id")
+        reduction_quantity = _safe_float(_event_value(event, "quantity", "closed_quantity"))
+        if reduction_quantity <= 0:
+            reasons.append("Broker reduction confirmation requires positive quantity")
+        for reduction in snapshot.get("tp50", {}).get("broker_reductions", []):
+            if not isinstance(reduction, dict) or str(reduction.get("broker_order_id") or "") != str(broker_order_id or ""):
+                continue
+            if abs(_safe_float(reduction.get("quantity")) - reduction_quantity) > QUANTITY_TOLERANCE:
+                reasons.append("Broker reduction order was already recorded with a different quantity")
+            break
     quantity = _safe_float(_event_value(event, "quantity", "filled_quantity", "closed_quantity"))
     quantity_open = _safe_float(snapshot.get("quantity_open"))
     if event_type in {LifecycleEvent.CLOSE_FILL_RECORDED.value, LifecycleEvent.TP50_FILL_RECORDED.value}:
@@ -695,17 +844,60 @@ def _validate_event_evidence(snapshot: Dict[str, Any], event: Dict[str, Any], ev
         missing = [key for key in required if _event_value(event, key) in (None, "")]
         if missing:
             reasons.append("disaster stop evidence missing: " + ", ".join(missing))
-        status = str(_event_value(event, "status") or "").upper()
-        if status and status not in {"OPEN", "NEW", "ACTIVE"}:
+        status = str(_event_value(event, "status") or "").upper().strip()
+        if status and status not in ACTIVE_DISASTER_STOP_STATUSES:
             reasons.append("disaster stop status is not active")
         protected = _safe_float(_event_value(event, "protected_quantity"), -1.0)
         if protected <= 0:
             reasons.append("disaster stop protected_quantity must be positive")
         elif snapshot.get("quantity_open", 0.0) > QUANTITY_TOLERANCE and abs(protected - snapshot["quantity_open"]) > QUANTITY_TOLERANCE:
             reasons.append("disaster stop protected_quantity does not match lifecycle open quantity")
+        supplied_symbol = _event_value(event, "symbol")
+        if supplied_symbol not in (None, ""):
+            normalized_symbol = str(supplied_symbol).upper().replace("/", "").replace("-", "").split(":", 1)[0]
+            snapshot_symbol = str(snapshot.get("symbol") or "").upper().replace("/", "").replace("-", "").split(":", 1)[0]
+            if normalized_symbol != snapshot_symbol:
+                reasons.append("disaster stop symbol does not match lifecycle symbol")
+        supplied_position_side = _event_value(event, "position_side")
+        if supplied_position_side not in (None, "") and _normalize_side(supplied_position_side) != _normalize_side(snapshot.get("side")):
+            reasons.append("disaster stop position_side does not match lifecycle side")
+        protective_side = _event_value(event, "action_side", "order_side", "side")
+        expected_protective_side = _expected_protective_side(snapshot.get("side"))
+        if protective_side not in (None, "") and expected_protective_side and _normalize_side(protective_side) != expected_protective_side:
+            reasons.append("disaster stop action side is not protective for lifecycle side")
     if event_type == LifecycleEvent.RUNNER_PROTECTION_CONFIRMED.value and _safe_float(_event_value(event, "protected_quantity"), -1.0) < 0:
         reasons.append("runner protected_quantity is required")
-    if event_type == LifecycleEvent.CLOSE_CONFIRMED.value and snapshot.get("quantity_open", 0.0) > QUANTITY_TOLERANCE:
+    registry_close_confirmation = (
+        event_type == LifecycleEvent.CLOSE_CONFIRMED.value
+        and _is_registry_live_close_confirmation(event)
+    )
+    if registry_close_confirmation:
+        if not event.get("event_id"):
+            reasons.append("Registry LIVE close confirmation requires event_id")
+        if str(_event_value(event, "registry_source_component") or "").upper().strip() != "TRADE_REGISTRY":
+            reasons.append("Registry LIVE close confirmation requires TRADE_REGISTRY evidence")
+        if str(_event_value(event, "registry_status", "status") or "").upper().strip() != "CLOSED":
+            reasons.append("Registry LIVE close confirmation requires Registry CLOSED status")
+        if _normalize_mode(_event_value(event, "mode", "execution_mode", "registry_mode")) != "LIVE":
+            reasons.append("Registry LIVE close confirmation requires LIVE mode")
+        if not supplied_trade:
+            reasons.append("Registry LIVE close confirmation requires trade_id")
+        if _event_value(event, "closed_at") in (None, ""):
+            reasons.append("Registry LIVE close confirmation requires closed_at")
+        if _event_value(event, "close_reason", "exit_reason", "reason") in (None, ""):
+            reasons.append("Registry LIVE close confirmation requires close_reason")
+        close_quantity = _safe_float(_event_value(event, "quantity", "closed_quantity"))
+        if close_quantity <= 0:
+            reasons.append("Registry LIVE close confirmation requires positive quantity")
+        else:
+            quantity_open = _safe_float(snapshot.get("quantity_open"))
+            expected_close = quantity_open if quantity_open > QUANTITY_TOLERANCE else _safe_float(snapshot.get("quantity_closed"))
+            if expected_close <= 0 or abs(close_quantity - expected_close) > QUANTITY_TOLERANCE:
+                reasons.append(
+                    "Registry LIVE close confirmation quantity must equal lifecycle open "
+                    "or already-confirmed closed quantity"
+                )
+    elif event_type == LifecycleEvent.CLOSE_CONFIRMED.value and snapshot.get("quantity_open", 0.0) > QUANTITY_TOLERANCE:
         reasons.append("close confirmation requires zero open quantity")
     if event_type == LifecycleEvent.OUTCOME_CONFIRMED.value and not (snapshot.get("outcome_id") or _event_value(event, "outcome_id")):
         reasons.append("outcome_id is required")
@@ -720,27 +912,93 @@ def _apply_quantities_and_details(snapshot: Dict[str, Any], event: Dict[str, Any
     exchange_id = _event_value(event, "exchange_order_id", "broker_order_id", "order_id")
     if client_id:
         snapshot["client_order_id"] = str(client_id)
-    if exchange_id and event_type != LifecycleEvent.DISASTER_STOP_CONFIRMED.value:
+    entry_order_events = {
+        LifecycleEvent.ENTRY_INTENT_CREATED.value,
+        LifecycleEvent.ENTRY_SUBMITTED.value,
+        LifecycleEvent.ENTRY_FILL_RECORDED.value,
+        LifecycleEvent.ENTRY_PARTIAL_RECORDED.value,
+        LifecycleEvent.ENTRY_CONFIRMED.value,
+    }
+    if exchange_id and event_type in entry_order_events:
         snapshot["exchange_order_id"] = str(exchange_id)
 
     if event_type in {LifecycleEvent.ENTRY_FILL_RECORDED.value, LifecycleEvent.ENTRY_PARTIAL_RECORDED.value, LifecycleEvent.ENTRY_CONFIRMED.value}:
-        fill_id = str(_event_value(event, "fill_id"))
+        raw_fill_id = _event_value(event, "fill_id")
+        fill_id = str(raw_fill_id) if raw_fill_id not in (None, "") else ""
         quantity = _safe_float(_event_value(event, "quantity", "filled_quantity"))
         if fill_id and fill_id not in snapshot["fill_ids"]:
             snapshot["fill_ids"].append(fill_id)
             snapshot["quantity_filled"] += quantity
             snapshot["entry_price_confirmed"] = _event_value(event, "price", "fill_price") or snapshot.get("entry_price_confirmed")
+        elif event_type == LifecycleEvent.ENTRY_CONFIRMED.value and _is_registry_live_entry_confirmation(event):
+            snapshot["quantity_filled"] = quantity
+            entry_price_theoretical = _event_value(event, "entry_price_theoretical", "planned_entry_price")
+            entry_price_reference = _event_value(
+                event,
+                "entry_price_reference",
+                "reference_price",
+                "entry_price",
+                "price",
+            )
+            entry_price_confirmed = _event_value(
+                event,
+                "entry_price_confirmed",
+                "executed_price",
+                "average_price",
+                "average",
+                "fill_price",
+            )
+            if entry_price_theoretical not in (None, ""):
+                snapshot["entry_price_theoretical"] = entry_price_theoretical
+            if entry_price_reference not in (None, ""):
+                snapshot["entry_price_reference"] = entry_price_reference
+            if entry_price_confirmed not in (None, ""):
+                snapshot["entry_price_confirmed"] = entry_price_confirmed
+            snapshot["entry_confirmation"] = {
+                "confirmed": True,
+                "source": "REGISTRY_LIVE_OPEN_POST_ACK",
+                "event_id": event.get("event_id"),
+                "trade_id": _event_value(event, "trade_id"),
+                "client_order_id": _event_value(event, "client_order_id"),
+                "exchange_order_id": _event_value(event, "exchange_order_id", "broker_order_id"),
+                "quantity": quantity,
+                "entry_price_theoretical": snapshot.get("entry_price_theoretical"),
+                "entry_price_reference": snapshot.get("entry_price_reference"),
+                "entry_price_confirmed": snapshot.get("entry_price_confirmed"),
+                "opened_at": _event_value(event, "opened_at"),
+                "confirmed_at": event["received_at"],
+            }
     elif event_type in {LifecycleEvent.TP50_FILL_RECORDED.value, LifecycleEvent.CLOSE_FILL_RECORDED.value, LifecycleEvent.CLOSE_PARTIAL_RECORDED.value}:
-        fill_id = str(_event_value(event, "fill_id"))
+        raw_fill_id = _event_value(event, "fill_id")
+        fill_id = str(raw_fill_id) if raw_fill_id not in (None, "") else ""
         quantity = _safe_float(_event_value(event, "quantity", "closed_quantity"))
-        if fill_id not in snapshot["fill_ids"]:
+        if fill_id and fill_id not in snapshot["fill_ids"]:
             snapshot["fill_ids"].append(fill_id)
             snapshot["quantity_closed"] += quantity
         bucket = snapshot["tp50"] if event_type == LifecycleEvent.TP50_FILL_RECORDED.value else snapshot["close"]
-        bucket.setdefault("fill_ids", [])
-        if fill_id not in bucket["fill_ids"]:
-            bucket["fill_ids"].append(fill_id)
-        bucket["quantity_confirmed"] = _safe_float(bucket.get("quantity_confirmed")) + quantity
+        if fill_id:
+            bucket.setdefault("fill_ids", [])
+            if fill_id not in bucket["fill_ids"]:
+                bucket["fill_ids"].append(fill_id)
+            bucket["quantity_confirmed"] = _safe_float(bucket.get("quantity_confirmed")) + quantity
+        elif event_type == LifecycleEvent.TP50_FILL_RECORDED.value and _is_broker_reduction_confirmation(event):
+            broker_order_id = str(_event_value(event, "broker_order_id", "exchange_order_id", "order_id"))
+            bucket.setdefault("broker_order_ids", []).append(broker_order_id)
+            bucket["quantity_confirmed"] = _safe_float(bucket.get("quantity_confirmed")) + quantity
+            reduction = {
+                "confirmed": True,
+                "event_id": event.get("event_id"),
+                "broker_order_id": broker_order_id,
+                "quantity": quantity,
+                "confirmed_at": event["received_at"],
+            }
+            bucket.setdefault("broker_reductions", []).append(reduction)
+            bucket["last_broker_reduction"] = reduction
+            snapshot["quantity_closed"] += quantity
+    elif event_type == LifecycleEvent.CLOSE_CONFIRMED.value and _is_registry_live_close_confirmation(event):
+        quantity = _safe_float(_event_value(event, "quantity", "closed_quantity"))
+        outstanding = max(0.0, snapshot["quantity_filled"] - snapshot["quantity_closed"])
+        snapshot["quantity_closed"] += min(quantity, outstanding)
 
     if 0 < snapshot["quantity_closed"] - snapshot["quantity_filled"] <= QUANTITY_TOLERANCE:
         snapshot["quantity_closed"] = snapshot["quantity_filled"]
@@ -755,11 +1013,21 @@ def _apply_quantities_and_details(snapshot: Dict[str, Any], event: Dict[str, Any
             "confirmed": True,
             "order_id": _event_value(event, "order_id"),
             "status": _event_value(event, "status"),
-            "side": _normalize_side(_event_value(event, "side")),
+            "side": _normalize_side(_event_value(event, "action_side", "order_side", "side")),
+            "symbol": _event_value(event, "symbol"),
+            "position_side": _normalize_side(_event_value(event, "position_side")) if _event_value(event, "position_side") not in (None, "") else None,
             "trigger_price": _safe_float(_event_value(event, "trigger_price")),
             "protected_quantity": _safe_float(_event_value(event, "protected_quantity")),
             "timestamp": _event_value(event, "timestamp"),
         }
+        if str(snapshot.get("state") or "") == LifecycleState.RECOVERY_REQUIRED.value:
+            snapshot["recovery"].update({
+                "required": False,
+                "completed": True,
+                "target_state": LifecycleState.ENTRY_PROTECTED.value,
+                "completed_by": LifecycleEvent.DISASTER_STOP_CONFIRMED.value,
+                "evidence": _deepcopy(event["evidence"]),
+            })
     elif event_type == LifecycleEvent.DISASTER_STOP_FAILED.value:
         snapshot["disaster_stop"].update({"confirmed": False, "failed": True, "reason": _event_value(event, "reason")})
     elif event_type == LifecycleEvent.TP50_REQUESTED.value:
@@ -780,6 +1048,22 @@ def _apply_quantities_and_details(snapshot: Dict[str, Any], event: Dict[str, Any
         snapshot["close"].update({"requested": True, "requested_quantity": _safe_float(_event_value(event, "quantity"), snapshot["quantity_open"])})
     elif event_type == LifecycleEvent.CLOSE_CONFIRMED.value or target == LifecycleState.CLOSE_CONFIRMED.value:
         snapshot["close"].update({"confirmed": True, "confirmed_at": event["received_at"]})
+        if event_type == LifecycleEvent.CLOSE_CONFIRMED.value and _is_registry_live_close_confirmation(event):
+            quantity = _safe_float(_event_value(event, "quantity", "closed_quantity"))
+            snapshot["close"].update({
+                "factual_registry_close": True,
+                "source": "REGISTRY_LIVE_CLOSED",
+                "event_id": event.get("event_id"),
+                "factual_key": _factual_close_key(event),
+                "quantity_confirmed": quantity,
+                "closed_at": _event_value(event, "closed_at"),
+                "close_reason": _event_value(event, "close_reason", "exit_reason", "reason"),
+                "exit_price": _event_value(event, "exit_price"),
+                "result_pct": _event_value(event, "result_pct", "pnl_pct"),
+                "result_r": _event_value(event, "result_r", "pnl_r"),
+                "pnl_usdt": _event_value(event, "pnl_usdt", "realized_pnl"),
+                "evidence": _deepcopy(event["evidence"]),
+            })
     elif event_type in {LifecycleEvent.OUTCOME_CREATED.value, LifecycleEvent.OUTCOME_CONFIRMED.value}:
         outcome = _event_value(event, "outcome")
         if isinstance(outcome, dict):
@@ -793,7 +1077,20 @@ def _apply_quantities_and_details(snapshot: Dict[str, Any], event: Dict[str, Any
     elif event_type == LifecycleEvent.RECONCILIATION_COMPLETED.value:
         snapshot["reconciliation"].update({"required": False, "completed": True, "target_state": target, "evidence": _deepcopy(event["evidence"])})
     elif event_type == LifecycleEvent.RECOVERY_REQUESTED.value:
-        snapshot["recovery"] = {"required": True, "reason": _event_value(event, "reason"), "evidence": _deepcopy(event["evidence"])}
+        previous_stop = _deepcopy(snapshot.get("disaster_stop") or {})
+        snapshot["recovery"] = {
+            "required": True,
+            "reason": _event_value(event, "reason"),
+            "evidence": _deepcopy(event["evidence"]),
+        }
+        if _event_value(event, "stop_update_failed") is True:
+            snapshot["recovery"]["previous_disaster_stop"] = previous_stop
+            snapshot["disaster_stop"].update({
+                "confirmed": False,
+                "invalidated_by": "STOP_UPDATE_FAILED",
+                "invalidated_at": event["received_at"],
+                "failure_status": _event_value(event, "status"),
+            })
     elif event_type == LifecycleEvent.RECOVERY_COMPLETED.value:
         snapshot["recovery"].update({"required": False, "completed": True, "target_state": target, "evidence": _deepcopy(event["evidence"])})
         if target == LifecycleState.ENTRY_PROTECTED.value:
@@ -801,7 +1098,9 @@ def _apply_quantities_and_details(snapshot: Dict[str, Any], event: Dict[str, Any
                 "confirmed": True,
                 "order_id": _event_value(event, "order_id"),
                 "status": _event_value(event, "status"),
-                "side": _normalize_side(_event_value(event, "side")),
+                "side": _normalize_side(_event_value(event, "action_side", "order_side", "side")),
+                "symbol": _event_value(event, "symbol"),
+                "position_side": _normalize_side(_event_value(event, "position_side")) if _event_value(event, "position_side") not in (None, "") else None,
                 "trigger_price": _safe_float(_event_value(event, "trigger_price")),
                 "protected_quantity": _safe_float(_event_value(event, "protected_quantity")),
                 "timestamp": _event_value(event, "timestamp"),
@@ -851,6 +1150,46 @@ def apply_event(lifecycle_id: str, event: Dict[str, Any], persist: bool = True) 
                     _last_error = f"duplicate_persist_error: {exc}"
                     warnings.append(_last_error)
             return _result(snapshot, ok=True, status="DUPLICATE_EVENT", duplicate=True, warnings=warnings)
+
+        if event_type == LifecycleEvent.ENTRY_CONFIRMED.value and _is_registry_live_entry_confirmation(normalized):
+            confirmation = snapshot.get("entry_confirmation") if isinstance(snapshot.get("entry_confirmation"), dict) else {}
+            exchange_order_id = str(_event_value(normalized, "exchange_order_id", "broker_order_id") or "")
+            quantity = _safe_float(_event_value(normalized, "quantity", "filled_quantity"))
+            if (
+                confirmation.get("confirmed") is True
+                and exchange_order_id
+                and str(confirmation.get("exchange_order_id") or "") == exchange_order_id
+                and abs(_safe_float(confirmation.get("quantity")) - quantity) <= QUANTITY_TOLERANCE
+            ):
+                return _semantic_duplicate_result(
+                    snapshot, normalized, key, "Registry LIVE entry confirmation already applied",
+                    "DUPLICATE_REGISTRY_ENTRY_CONFIRMATION", warnings, persist,
+                )
+
+        if event_type == LifecycleEvent.TP50_FILL_RECORDED.value and _is_broker_reduction_confirmation(normalized):
+            broker_order_id = str(_event_value(normalized, "broker_order_id", "exchange_order_id", "order_id") or "")
+            quantity = _safe_float(_event_value(normalized, "quantity", "closed_quantity"))
+            reductions = snapshot.get("tp50", {}).get("broker_reductions", [])
+            matching_reduction = next(
+                (
+                    item for item in reductions
+                    if isinstance(item, dict) and str(item.get("broker_order_id") or "") == broker_order_id
+                ),
+                None,
+            )
+            if matching_reduction and abs(_safe_float(matching_reduction.get("quantity")) - quantity) <= QUANTITY_TOLERANCE:
+                return _semantic_duplicate_result(
+                    snapshot, normalized, key, "Broker reduction order already applied",
+                    "DUPLICATE_BROKER_REDUCTION", warnings, persist,
+                )
+
+        if event_type == LifecycleEvent.CLOSE_CONFIRMED.value and _is_registry_live_close_confirmation(normalized):
+            close = snapshot.get("close") if isinstance(snapshot.get("close"), dict) else {}
+            if close.get("factual_registry_close") is True and close.get("factual_key") == _factual_close_key(normalized):
+                return _semantic_duplicate_result(
+                    snapshot, normalized, key, "Registry LIVE close confirmation already applied",
+                    "DUPLICATE_REGISTRY_CLOSE", warnings, persist,
+                )
 
         fill_event_types = {
             LifecycleEvent.ENTRY_FILL_RECORDED.value,
@@ -1141,6 +1480,23 @@ def _registry_protection_value(record: Dict[str, Any]) -> Optional[bool]:
     return None
 
 
+def _registry_quantity_open(record: Dict[str, Any]) -> Any:
+    """Project lifecycle-open quantity without treating initial qty as remaining."""
+    status = str(_registry_value(record, "status") or "").upper().strip()
+    if status == "CLOSED":
+        return 0.0
+    remaining = _registry_value(
+        record,
+        "remaining_quantity",
+        "remaining_qty",
+        "quantity_open",
+        "open_qty",
+    )
+    if _has_comparison_evidence(remaining):
+        return remaining
+    return _registry_value(record, "quantity", "qty")
+
+
 def compare_with_registry(lifecycle_id: str, registry_trade: Dict[str, Any]) -> Dict[str, Any]:
     """Compare with a caller-supplied registry record; never import or mutate it."""
     if not isinstance(registry_trade, dict):
@@ -1151,6 +1507,8 @@ def compare_with_registry(lifecycle_id: str, registry_trade: Dict[str, Any]) -> 
         if not snapshot:
             return {"ok": False, "status": "INSUFFICIENT_EVIDENCE", "shadow_mode": True, "differences": [], "reasons": ["lifecycle not found"]}
         registry_exchange_order_id = _registry_value(registry_trade, "exchange_order_id", "broker_order_id", "order_id")
+        registry_status = _normalize_optional_text(_registry_value(registry_trade, "status"), upper=True)
+        registry_protection = None if registry_status == "CLOSED" else _registry_protection_value(registry_trade)
         comparisons = {
             "trade_id": (snapshot.get("trade_id"), _normalize_optional_text(_registry_value(registry_trade, "trade_id"))),
             "bot": (_normalize_optional_text(snapshot.get("bot"), upper=True), _normalize_optional_text(_registry_value(registry_trade, "bot"), upper=True)),
@@ -1159,11 +1517,11 @@ def compare_with_registry(lifecycle_id: str, registry_trade: Dict[str, Any]) -> 
             "side": (_normalize_optional_side(snapshot.get("side")), _normalize_optional_side(_registry_value(registry_trade, "side"))),
             "mode": (_normalize_optional_mode(snapshot.get("mode")), _normalize_optional_mode(_registry_value(registry_trade, "mode", "execution_mode", "registry_mode"))),
             "state": (snapshot.get("state"), _normalize_optional_text(_registry_value(registry_trade, "state", "lifecycle_state"), upper=True)),
-            "quantity_open": (snapshot.get("quantity_open"), _registry_value(registry_trade, "quantity_open", "open_qty", "qty")),
+            "quantity_open": (snapshot.get("quantity_open"), _registry_quantity_open(registry_trade)),
             "quantity_closed": (snapshot.get("quantity_closed"), _registry_value(registry_trade, "quantity_closed", "closed_qty")),
             "exchange_order_id": (snapshot.get("exchange_order_id"), _normalize_optional_text(registry_exchange_order_id)),
-            "protection": (bool(snapshot.get("disaster_stop", {}).get("confirmed")), _registry_protection_value(registry_trade)),
-            "open_closed_status": ("CLOSED" if snapshot.get("state") in {LifecycleState.CLOSE_CONFIRMED.value, LifecycleState.OUTCOME_PENDING.value, LifecycleState.OUTCOME_RECORDED.value, LifecycleState.LEARNING_ELIGIBLE.value} else "OPEN", _normalize_optional_text(_registry_value(registry_trade, "status"), upper=True)),
+            "protection": (bool(snapshot.get("disaster_stop", {}).get("confirmed")), registry_protection),
+            "open_closed_status": ("CLOSED" if snapshot.get("state") in {LifecycleState.CLOSE_CONFIRMED.value, LifecycleState.OUTCOME_PENDING.value, LifecycleState.OUTCOME_RECORDED.value, LifecycleState.LEARNING_ELIGIBLE.value} else "OPEN", registry_status),
             "outcome": (snapshot.get("outcome"), _registry_value(registry_trade, "outcome")),
         }
         critical_fields = {"trade_id", "bot", "symbol", "side"}
