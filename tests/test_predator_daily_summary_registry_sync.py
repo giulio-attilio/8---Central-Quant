@@ -115,6 +115,14 @@ def _repair_harness(tmp_path, closed_event=None):
         "_pprsf_v1_build_closed_trade_from_event": build,
         "_pprsf_v1_signature_trade": lambda trade: "open",
         "_pprsf_v1_closed_signature": lambda trade: "|".join(str(trade.get(k) or "") for k in ("bot", "setup", "symbol", "side", "closed_at", "close_reason", "entry", "exit_price")),
+        "_pprsf_v1_recalculate_lifecycle_counts_from_registry": lambda reg: {
+            "module_open_count": 0,
+            "registry_open_count": len(reg["open_trades"]),
+            "registry_closed_count": len(reg["closed_trades"]),
+            "missing_registry_open_count": 0,
+            "orphan_registry_open_count": len(reg["open_trades"]),
+            "missing_registry_closed_count": 0 if reg["closed_trades"] else 1,
+        },
         "_pprsf_v1_public": lambda value, **kwargs: value,
         "central_trade_registry": storage,
         "Path": Path,
@@ -149,12 +157,20 @@ def test_07_safe_dry_run_is_not_repaired(tmp_path):
     assert result["closed_repaired_count"] == 0 and registry["closed_trades"] == []
 
 
+def test_08_registry_sync_recalculates_after_counts_from_saved_registry(tmp_path):
+    fn, registry, _ = _repair_harness(tmp_path)
+    result = fn(commit=True, ack="PREDATOR_REGISTRY_SYNC_FIX")
+    assert len(registry["closed_trades"]) == 1
+    assert result["after_lifecycle_counts"]["registry_closed_count"] == 1
+    assert result["after_lifecycle_counts"]["missing_registry_closed_count"] == 0
+
+
 def _sync_report(awareness):
     namespace = {"_mpa_v1_build_payload": lambda: awareness, "data_hora_sp_str": lambda: "12/07/2026 10:00"}
     return _function_from_main("build_sync_report", namespace)()
 
 
-def test_08_sync_classifies_bingx_only_as_manual_external():
+def test_09_sync_classifies_bingx_only_as_manual_external():
     report = _sync_report({"status": "MANUAL_OR_EXTERNAL_POSITION_PRESENT", "summary": {"broker_bingx_open_count": 1, "central_live_count": 0}, "matched_positions": [], "central_only_positions": [], "manual_or_external_positions": [{"symbol": "ETHUSDT", "side": "LONG", "broker_position": {"notional": 20, "entry_price": 2000}}]})
     assert "MANUAL_OR_EXTERNAL_POSITION_PRESENT" in report and "Manual/externa: ETHUSDT LONG" in report
 
@@ -175,21 +191,21 @@ def _live_counts(request_symbol, broker_symbol, central=None):
     return fn({"symbol": request_symbol, "side": "LONG"})
 
 
-def test_09_manual_other_symbol_does_not_block_falcon():
+def test_10_manual_other_symbol_does_not_block_falcon():
     counts = _live_counts("BTCUSDT", "ETHUSDT")
     assert counts["manual_external_blocks_falcon"] is False and counts["manual_same_symbol_side_count"] == 0
 
 
-def test_10_manual_same_symbol_side_blocks_new_falcon_entry():
+def test_11_manual_same_symbol_side_blocks_new_falcon_entry():
     counts = _live_counts("BTCUSDT", "BTCUSDT")
     assert counts["manual_same_symbol_side_count"] == 1
 
 
-def test_11_central_only_remains_critical_divergence():
+def test_12_central_only_remains_critical_divergence():
     report = _sync_report({"status": "CENTRAL_ONLY_RECONCILE_REQUIRED", "summary": {"broker_bingx_open_count": 0, "central_live_count": 1}, "matched_positions": [], "manual_or_external_positions": [], "central_only_positions": [{"symbol": "BTCUSDT", "side": "LONG"}]})
     assert "ALERTA CRÍTICO" in report and "Só na Central" in report
 
 
-def test_12_matched_position_remains_matched():
+def test_13_matched_position_remains_matched():
     report = _sync_report({"status": "CENTRAL_LIVE_MATCHED", "summary": {"broker_bingx_open_count": 1, "central_live_count": 1}, "matched_positions": [{"symbol": "BTCUSDT", "side": "LONG"}], "manual_or_external_positions": [], "central_only_positions": []})
     assert "Casadas: 1" in report and "BTCUSDT LONG" in report

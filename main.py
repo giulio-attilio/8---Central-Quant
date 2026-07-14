@@ -43938,6 +43938,53 @@ def _pprsf_v1_closed_signature(trade):
     return "|".join(str(value or "") for value in fields)
 
 
+def _pprsf_v1_recalculate_lifecycle_counts_from_registry(registry):
+    """Recalcula o pós-reparo diretamente do Registry recém-salvo."""
+    module_positions = _ppla_v1_get_predator_module_positions_raw()
+    registry_open = [
+        item for item in _pprsf_v1_open_dict(registry).values()
+        if str(item.get("bot") or item.get("robot") or "").upper() == "PREDATOR"
+    ]
+    registry_closed = [
+        item for item in _pprsf_v1_closed_list(registry)
+        if str(item.get("bot") or item.get("robot") or "").upper() == "PREDATOR"
+    ]
+    module_by_id = {_ppla_v1_get_trade_id(item): item for item in module_positions if _ppla_v1_get_trade_id(item)}
+    module_keys = {_ppla_v1_trade_key(item) for item in module_positions}
+    registry_by_id = {_ppla_v1_get_trade_id(item): item for item in registry_open if _ppla_v1_get_trade_id(item)}
+    registry_keys = {_ppla_v1_trade_key(item) for item in registry_open}
+    missing_open = sum(
+        1 for trade_id, item in module_by_id.items()
+        if trade_id not in registry_by_id and _ppla_v1_trade_key(item) not in registry_keys
+    )
+    orphan_open = sum(
+        1 for item in registry_open
+        if _ppla_v1_get_trade_id(item) not in module_by_id and _ppla_v1_trade_key(item) not in module_keys
+    )
+    closed_by_key = {}
+    for item in registry_closed:
+        trade_id = _ppla_v1_get_trade_id(item)
+        closed_by_key[str(trade_id or _ppla_v1_trade_key(item))] = item
+    closed_events, _ = _ppla_v1_get_closed_paper_events(limit=2000)
+    missing_closed = 0
+    for event in closed_events:
+        event_key = _ppla_v1_closed_key_from_event(event)
+        raw = event.get("raw_public") if isinstance(event.get("raw_public"), dict) else {}
+        raw_trade_id = raw.get("trade_id") or raw.get("uid")
+        base_key = _ppla_v1_trade_key(raw or event)
+        if not any(candidate and str(candidate) in closed_by_key for candidate in (raw_trade_id, event_key, base_key)):
+            missing_closed += 1
+    return {
+        "module_open_count": len(module_positions),
+        "registry_open_count": len(registry_open),
+        "registry_closed_count": len(registry_closed),
+        "paper_closed_events_count": len(closed_events),
+        "missing_registry_open_count": missing_open,
+        "orphan_registry_open_count": orphan_open,
+        "missing_registry_closed_count": missing_closed,
+    }
+
+
 @request_cached_predator_audit("predator_registry_sync_audit_pipeline")
 @observe_predator_audit("predator_registry_sync_audit_pipeline")
 def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_samples=True, use_cache=False):
@@ -44073,6 +44120,16 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
     if committed:
         try:
             after_snapshot = predator_paper_lifecycle_audit_v1_status(include_samples=False, use_cache=False)
+            fresh_registry, fresh_error = _pprsf_v1_load_registry()
+            if fresh_registry is not None:
+                direct_counts = _pprsf_v1_recalculate_lifecycle_counts_from_registry(fresh_registry)
+                after_snapshot = dict(after_snapshot or {})
+                after_snapshot["counts"] = {
+                    **((after_snapshot.get("counts") or {}) if isinstance(after_snapshot, dict) else {}),
+                    **direct_counts,
+                }
+            elif fresh_error:
+                warnings.append(f"Registry pós-reparo indisponível para recontagem: {fresh_error}")
         except Exception as exc:
             after_snapshot = {"error": str(exc)}
 
@@ -44299,6 +44356,283 @@ def predator_paper_registry_sync_fix_v1_text_route():
     commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
     ack = body.get("ack", request.args.get("ack"))
     return build_predator_paper_registry_sync_fix_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ============================================================================
+# PREDATOR REGISTRY ORPHAN OPEN CLEANUP V1 — PAPER ONLY
+# ============================================================================
+PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION = "2026-07-14-PREDATOR-REGISTRY-ORPHAN-OPEN-CLEANUP-V1"
+PREDATOR_ORPHAN_OPEN_FIX_V1_EVENTS_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_orphan_open_fix_v1_events.jsonl")
+PREDATOR_ORPHAN_OPEN_FIX_V1_LATEST_FILE = str((_pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data")) / "predator_orphan_open_fix_v1_latest.json")
+_PREDATOR_ORPHAN_OPEN_FIX_V1_STATE = {"status": "NEVER_RUN", "pending": None, "planned": 0, "repaired": 0, "last_run": None, "last_error": None}
+
+
+def _poof_v1_trade_mode(trade):
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    return str(
+        trade.get("registry_mode")
+        or trade.get("execution_mode")
+        or trade.get("mode")
+        or metadata.get("registry_mode")
+        or metadata.get("execution_mode")
+        or "UNKNOWN"
+    ).upper().strip()
+
+
+def _poof_v1_plan_orphans(registry, module_positions):
+    module_ids = {_ppla_v1_get_trade_id(item) for item in module_positions if _ppla_v1_get_trade_id(item)}
+    module_keys = {_ppla_v1_trade_key(item) for item in module_positions}
+    planned = []
+    skipped = []
+    for registry_key, trade in _pprsf_v1_open_dict(registry).items():
+        if str(trade.get("bot") or trade.get("robot") or "").upper() != "PREDATOR":
+            continue
+        trade_id = str(trade.get("trade_id") or registry_key)
+        trade_key = _ppla_v1_trade_key(trade)
+        if trade_id in module_ids or trade_key in module_keys:
+            continue
+        mode = _poof_v1_trade_mode(trade)
+        if mode != "PAPER":
+            skipped.append({"trade_id": trade_id, "reason": "NOT_CONFIRMED_PAPER", "mode": mode})
+            continue
+        planned.append({
+            "registry_key": str(registry_key),
+            "trade_id": trade_id,
+            "trade_key": trade_key,
+            "mode": mode,
+            "registry_trade": _pprsf_v1_public(trade, max_string=360),
+        })
+    return planned, skipped
+
+
+def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_samples=True, track_state=True):
+    commit = bool(commit)
+    ack_ok = str(ack or "").strip().upper() == "PREDATOR_ORPHAN_OPEN_FIX"
+    generated_at = _pprsf_v1_now()
+    errors = []
+    warnings = []
+    repaired = []
+    registry, registry_error = _pprsf_v1_load_registry()
+    lifecycle_before = predator_paper_lifecycle_audit_v1_status(include_samples=False, use_cache=False) if callable(globals().get("predator_paper_lifecycle_audit_v1_status")) else {}
+    mode = str((lifecycle_before or {}).get("mode") or "UNKNOWN").upper()
+    execution_enabled = (lifecycle_before or {}).get("execution_enabled")
+    execution_firewall_enabled = (lifecycle_before or {}).get("execution_firewall_enabled")
+    if registry is None:
+        errors.append(f"Trade Registry indisponível: {registry_error}")
+        planned, skipped = [], []
+    else:
+        module_positions = _ppla_v1_get_predator_module_positions_raw()
+        planned, skipped = _poof_v1_plan_orphans(registry, module_positions)
+    if commit and not ack_ok:
+        errors.append("Commit exige ack=PREDATOR_ORPHAN_OPEN_FIX.")
+    if commit and mode != "PAPER":
+        errors.append("Commit bloqueado: auditoria deve confirmar mode/execution_mode=PAPER.")
+    if commit and execution_enabled is not False:
+        errors.append("Commit bloqueado: execution_enabled deve estar explicitamente False.")
+    if commit and execution_firewall_enabled is not True:
+        errors.append("Commit bloqueado: execution_firewall_enabled deve estar explicitamente True.")
+
+    committed = False
+    if commit and ack_ok and registry is not None and not errors:
+        try:
+            open_trades = _pprsf_v1_open_dict(registry)
+            closed_trades = list(_pprsf_v1_closed_list(registry))
+            closed_index = {
+                str(item.get("trade_id")): index
+                for index, item in enumerate(closed_trades)
+                if item.get("trade_id")
+            }
+            for item in planned:
+                source_trade = open_trades.pop(item["registry_key"], None)
+                if not isinstance(source_trade, dict):
+                    skipped.append({"trade_id": item["trade_id"], "reason": "OPEN_DISAPPEARED_BEFORE_COMMIT"})
+                    continue
+                metadata = dict(source_trade.get("metadata") or {})
+                metadata.update({
+                    "sync_version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
+                    "synced_at": generated_at,
+                    "source": "predator_orphan_open_fix_v1",
+                    "reason": "REGISTRY_OPEN_WITHOUT_MODULE_POSITION",
+                    "previous_status": "OPEN",
+                    "execution_mode": "PAPER",
+                })
+                if item["trade_id"] in closed_index:
+                    index = closed_index[item["trade_id"]]
+                    existing = dict(closed_trades[index])
+                    existing_metadata = dict(existing.get("metadata") or {})
+                    existing_metadata.update(metadata)
+                    existing["metadata"] = existing_metadata
+                    existing["last_update"] = generated_at
+                    closed_trades[index] = existing
+                    action = "EXISTING_CLOSED_RECONCILED"
+                else:
+                    reconciled = dict(source_trade)
+                    for pnl_field in ("pnl_pct", "result_pct", "pnl_r", "result_r", "realized_pnl", "realized_pnl_usdt"):
+                        reconciled.pop(pnl_field, None)
+                    reconciled.update({
+                        "status": "CLOSED",
+                        "close_reason": "ORPHAN_REGISTRY_OPEN_RECONCILED",
+                        "closed_at": generated_at,
+                        "last_update": generated_at,
+                        "metadata": metadata,
+                    })
+                    closed_index[item["trade_id"]] = len(closed_trades)
+                    closed_trades.append(reconciled)
+                    action = "CLOSED_RECONCILED_ORPHAN"
+                repaired.append({"trade_id": item["trade_id"], "action": action})
+            registry["open_trades"] = open_trades
+            registry["closed_trades"] = closed_trades
+            registry["last_update"] = generated_at
+            registry["last_orphan_open_fix"] = {
+                "version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
+                "source": "predator_orphan_open_fix_v1",
+                "synced_at": generated_at,
+                "repaired_count": len(repaired),
+            }
+            central_trade_registry.save_registry(registry)
+            committed = True
+        except Exception as exc:
+            errors.append(f"Falha ao salvar Trade Registry: {exc}")
+
+    lifecycle_after = None
+    if committed:
+        try:
+            fresh_registry, fresh_error = _pprsf_v1_load_registry()
+            if fresh_registry is None:
+                raise RuntimeError(fresh_error or "Registry pós-reparo indisponível")
+            lifecycle_after = {"counts": _pprsf_v1_recalculate_lifecycle_counts_from_registry(fresh_registry)}
+        except Exception as exc:
+            errors.append(f"Falha ao recalcular lifecycle após reparo: {exc}")
+
+    if errors:
+        status = "COMMIT_BLOCKED" if commit and not committed else "ERROR"
+    elif committed:
+        status = "REPAIRED"
+    elif planned:
+        status = "REPAIR_READY"
+    else:
+        status = "OK_NO_ORPHANS"
+    after_counts = (lifecycle_after or {}).get("counts") or {}
+    pending_count = after_counts.get("orphan_registry_open_count") if committed else len(planned)
+    payload = {
+        "ok": not bool(errors),
+        "status": status,
+        "version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
+        "generated_at": generated_at,
+        "mode": mode,
+        "execution_mode": mode,
+        "execution_enabled": execution_enabled,
+        "execution_firewall_enabled": execution_firewall_enabled,
+        "commit": commit,
+        "ack_required": "PREDATOR_ORPHAN_OPEN_FIX",
+        "ack_ok": ack_ok,
+        "committed": committed,
+        "orphan_open_pending_count": pending_count,
+        "orphan_open_planned_count": len(planned),
+        "orphan_open_repaired_count": len(repaired),
+        "orphan_open_skipped_count": len(skipped),
+        "before_lifecycle_counts": (lifecycle_before or {}).get("counts"),
+        "after_lifecycle_counts": after_counts or None,
+        "warnings": warnings,
+        "errors": errors,
+        "files": {"events": PREDATOR_ORPHAN_OPEN_FIX_V1_EVENTS_FILE, "latest": PREDATOR_ORPHAN_OPEN_FIX_V1_LATEST_FILE},
+    }
+    if include_samples:
+        payload["samples"] = {"planned_orphans": planned[:20], "repaired": repaired[:20], "skipped": skipped[:20]}
+    if track_state:
+        state_update = {
+            "status": status,
+            "pending": pending_count,
+            "planned": len(planned),
+            "last_run": generated_at,
+            "last_error": "; ".join(errors) if errors else None,
+        }
+        if commit:
+            state_update["repaired"] = len(repaired)
+        _PREDATOR_ORPHAN_OPEN_FIX_V1_STATE.update(state_update)
+    if commit:
+        try:
+            latest_path = Path(PREDATOR_ORPHAN_OPEN_FIX_V1_LATEST_FILE)
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            latest_path.write_text(json.dumps(_pprsf_v1_public(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+            event_path = Path(PREDATOR_ORPHAN_OPEN_FIX_V1_EVENTS_FILE)
+            event_path.parent.mkdir(parents=True, exist_ok=True)
+            with event_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"event": "PREDATOR_ORPHAN_OPEN_FIX_V1_RUN", "generated_at": generated_at, "status": status, "committed": committed, "planned": len(planned), "repaired": len(repaired), "errors": errors[:5]}, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            payload.setdefault("warnings", []).append(f"Falha ao gravar auditoria do orphan fix: {exc}")
+    return payload
+
+
+def build_predator_registry_orphan_open_fix_v1_text(commit=False, ack=None):
+    payload = predator_registry_orphan_open_fix_v1_status(commit=commit, ack=ack, include_samples=True)
+    before = payload.get("before_lifecycle_counts") or {}
+    after = payload.get("after_lifecycle_counts") or {}
+    lines = [
+        "🧹 PREDATOR REGISTRY ORPHAN OPEN CLEANUP V1 — CENTRAL QUANT",
+        f"Status: {payload.get('status')}",
+        f"mode/execution_mode: {payload.get('mode')}",
+        f"execution_enabled: {payload.get('execution_enabled')}",
+        f"execution_firewall_enabled: {payload.get('execution_firewall_enabled')}",
+        f"commit solicitado: {payload.get('commit')}",
+        f"ack_ok: {payload.get('ack_ok')}",
+        f"committed: {payload.get('committed')}",
+        f"orphan_open_planned_count: {payload.get('orphan_open_planned_count')}",
+        f"orphan_open_repaired_count: {payload.get('orphan_open_repaired_count')}",
+        f"orphan_open_skipped_count: {payload.get('orphan_open_skipped_count')}",
+        "",
+        f"Lifecycle antes: {json.dumps(before, ensure_ascii=False)}",
+        f"Lifecycle depois: {json.dumps(after, ensure_ascii=False)}",
+        f"Samples: {json.dumps((payload.get('samples') or {}).get('planned_orphans') or [], ensure_ascii=False)}",
+        f"Warnings: {json.dumps(payload.get('warnings') or [], ensure_ascii=False)}",
+        f"Errors: {json.dumps(payload.get('errors') or [], ensure_ascii=False)}",
+        f"Eventos: {(payload.get('files') or {}).get('events')}",
+        f"Snapshot: {(payload.get('files') or {}).get('latest')}",
+        "",
+        "Preview: /predator/orphanopenfix/text",
+        "Commit: /predator/orphanopenfix/text?commit=true&ack=PREDATOR_ORPHAN_OPEN_FIX",
+    ]
+    return "\n".join(lines)
+
+
+_ORIGINAL_BOT_HEALTH_FOR_PREDATOR_ORPHAN_OPEN_FIX_V1 = bot_health if "bot_health" in globals() else None
+
+
+def bot_health(key: str, cfg: dict):
+    original = _ORIGINAL_BOT_HEALTH_FOR_PREDATOR_ORPHAN_OPEN_FIX_V1
+    payload = original(key, cfg) if callable(original) else {"name": cfg.get("name"), "enabled": False, "loaded": False}
+    if str(key).upper() == "PREDATOR":
+        try:
+            preview = predator_registry_orphan_open_fix_v1_status(commit=False, include_samples=False, track_state=False)
+            overlay = {
+                "predator_orphan_open_fix_status": preview.get("status"),
+                "predator_orphan_open_pending_count": preview.get("orphan_open_pending_count"),
+                "predator_orphan_open_planned_count": preview.get("orphan_open_planned_count"),
+                "predator_orphan_open_repaired_count": _PREDATOR_ORPHAN_OPEN_FIX_V1_STATE.get("repaired"),
+                "predator_orphan_open_fix_last_run": _PREDATOR_ORPHAN_OPEN_FIX_V1_STATE.get("last_run"),
+                "predator_orphan_open_fix_last_error": _PREDATOR_ORPHAN_OPEN_FIX_V1_STATE.get("last_error"),
+            }
+            payload.update(overlay)
+            payload.setdefault("health", {}).update(overlay)
+        except Exception as exc:
+            payload["predator_orphan_open_fix_last_error"] = str(exc)
+    return payload
+
+
+@app.route("/predator/orphanopenfix", methods=["GET", "POST"])
+def predator_registry_orphan_open_fix_v1_route():
+    body = request.get_json(silent=True) or {}
+    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+    ack = body.get("ack", request.args.get("ack"))
+    return predator_registry_orphan_open_fix_v1_status(commit=commit, ack=ack, include_samples=True), 200
+
+
+@app.route("/predator/orphanopenfix/text", methods=["GET", "POST"])
+def predator_registry_orphan_open_fix_v1_text_route():
+    body = request.get_json(silent=True) or {}
+    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+    ack = body.get("ack", request.args.get("ack"))
+    return build_predator_registry_orphan_open_fix_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 
