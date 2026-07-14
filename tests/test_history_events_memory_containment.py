@@ -4,7 +4,7 @@ import ast
 import importlib
 import json
 import os
-import socket
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -443,7 +443,43 @@ def test_reader_result_is_json_serializable(tmp_path):
     json.dumps(guard.iter_jsonl_tail(path, 10, 1024), ensure_ascii=False)
 
 
-def test_no_test_uses_real_data_network_redis_or_broker(monkeypatch):
-    monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: pytest.fail("network attempted"))
-    assert "redis" not in sys.modules
-    assert "broker" not in sys.modules
+def test_no_test_uses_real_data_network_redis_or_broker():
+    code = """
+import socket
+import sys
+
+def network_blocked(*args, **kwargs):
+    raise AssertionError("network attempted while importing history_memory_guard")
+
+socket.socket = network_blocked
+socket.create_connection = network_blocked
+socket.getaddrinfo = network_blocked
+
+import history_memory_guard
+
+for forbidden in ("redis", "broker", "main", "execution_engine"):
+    assert forbidden not in sys.modules, f"unexpected import: {forbidden}"
+"""
+    env = os.environ.copy()
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(ROOT) + (os.pathsep + current_pythonpath if current_pythonpath else "")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, (
+        "history_memory_guard isolation subprocess failed\n"
+        f"returncode={result.returncode}\n"
+        f"stdout={result.stdout!r}\n"
+        f"stderr={result.stderr!r}\n"
+        f"code:\n{code}"
+    )
