@@ -47880,6 +47880,132 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
     return result
 
 
+# ============================================================================
+# TRADE TIMELINE VALIDATOR V1 — MANUAL READ-ONLY HTTP SURFACE
+# ============================================================================
+@app.route("/trade_timeline", methods=["GET"])
+def trade_timeline_validator_v1_route():
+    """Executa auditoria manual sem autoridade ou efeito operacional."""
+    raw_trade_id = request.args.get("trade_id")
+    if raw_trade_id is None:
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_REQUIRED",
+            "fail_open": True,
+            "production_blocked": False,
+        }, 400
+    if not isinstance(raw_trade_id, str):
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_MUST_BE_TEXT",
+            "fail_open": True,
+            "production_blocked": False,
+        }, 400
+
+    trade_id = raw_trade_id.strip()
+    if not trade_id:
+        return {
+            "ok": False,
+            "trade_id": "",
+            "error": "TRADE_ID_REQUIRED",
+            "fail_open": True,
+            "production_blocked": False,
+        }, 400
+    if len(trade_id) > 256:
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_TOO_LONG",
+            "max_length": 256,
+            "fail_open": True,
+            "production_blocked": False,
+        }, 400
+    if trade_id in {".", ".."} or any(char in trade_id for char in ("/", "\\", "\x00")) or any(ord(char) < 32 or ord(char) == 127 for char in trade_id):
+        return {
+            "ok": False,
+            "trade_id": None,
+            "error": "TRADE_ID_INVALID",
+            "fail_open": True,
+            "production_blocked": False,
+        }, 400
+
+    try:
+        # Import local: evita acoplamento/ciclo no startup e mantém a consulta manual.
+        from trade_timeline_validator import validate_trade_timeline
+
+        report = validate_trade_timeline(trade_id)
+        if not isinstance(report, dict):
+            raise TypeError("trade timeline validator returned a non-dict report")
+
+        validation_status = str(report.get("result") or ("PASS" if report.get("valid") else "FAIL")).upper()
+        component_status = {}
+        for name, detail in (report.get("components") or {}).items():
+            if isinstance(detail, dict):
+                component_status[str(name)] = str(detail.get("status") or "UNKNOWN")
+            else:
+                component_status[str(name)] = "UNKNOWN"
+
+        def public_issues(items, kind):
+            output = []
+            for item in items or []:
+                if isinstance(item, dict):
+                    safe = {
+                        key: item.get(key)
+                        for key in ("component", "error_type", "code", "status")
+                        if item.get(key) not in (None, "")
+                    }
+                    output.append(safe or {"type": kind})
+                else:
+                    output.append({"type": kind})
+            return output
+
+        payload = {
+            "ok": bool(report.get("ok", True)),
+            "trade_id": trade_id,
+            "validation_status": validation_status,
+            "pass": validation_status == "PASS",
+            "fail_open": bool(report.get("fail_open", True)),
+            "production_blocked": False,
+            "generated_at": report.get("generated_at") or datetime.now(timezone.utc).isoformat(),
+            "component_status": component_status,
+            "events_found": report.get("events_found") or [],
+            "missing_events": report.get("events_missing") or [],
+            "duplicate_events": report.get("events_duplicated") or [],
+            "divergences": report.get("divergences") or [],
+            "latencies": report.get("latencies") or [],
+            "warnings": public_issues(report.get("warnings"), "VALIDATOR_WARNING"),
+            "errors": public_issues(report.get("errors"), "VALIDATOR_ERROR"),
+        }
+        return payload, 200
+    except Exception as exc:
+        try:
+            app.logger.exception(
+                "trade timeline validator route failed: %s",
+                type(exc).__name__,
+            )
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "trade_id": trade_id,
+            "validation_status": "ERROR",
+            "pass": False,
+            "fail_open": True,
+            "production_blocked": False,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "component_status": {},
+            "events_found": [],
+            "missing_events": [],
+            "duplicate_events": [],
+            "divergences": [],
+            "latencies": [],
+            "warnings": [],
+            "errors": [{"code": "TRADE_TIMELINE_ROUTE_INTERNAL_ERROR"}],
+        }, 500
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
