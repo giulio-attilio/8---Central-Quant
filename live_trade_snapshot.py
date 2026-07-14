@@ -390,11 +390,20 @@ def build_live_trade_snapshot(
             except (TypeError, ValueError):
                 pass
 
-        degraded = any(detail.get("status") in {"ERROR", "DEGRADED", "PARTIAL"} for name, detail in component_status.items() if name not in {"telegram", "falcon", "external_exposure"})
+        relevant_component_status = {
+            name: detail
+            for name, detail in component_status.items()
+            if name not in {"telegram", "falcon", "external_exposure"}
+        }
+        source_error = any(detail.get("status") == "ERROR" for detail in relevant_component_status.values())
+        degraded = any(detail.get("status") in {"ERROR", "DEGRADED", "PARTIAL"} for detail in relevant_component_status.values())
         identified = bool(matched_records)
         incomplete = bool(overdue_missing or pending or (identified and not lifecycle["lifecycle_found"]))
         if not identified:
-            snapshot_status = "DEGRADED" if degraded else "NOT_FOUND"
+            # Cobertura parcial sem qualquer identidade correlacionada não muda
+            # ausência de evidência para degradação. Um erro real de fonte torna
+            # a conclusão de ausência não conclusiva, mas ainda permite snapshot.
+            snapshot_status = "DEGRADED" if source_error else "NOT_FOUND"
         elif divergences:
             snapshot_status = "DIVERGENT"
         elif degraded:

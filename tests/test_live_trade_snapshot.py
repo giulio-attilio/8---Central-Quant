@@ -72,6 +72,102 @@ def test_not_found_is_successful_observational_result():
     assert result["production_blocked"] is False
 
 
+def test_not_found_with_partial_history_preserves_coverage():
+    sources = _sources()
+    sources["history_manager"] = {
+        "records": [],
+        "_reader_metadata": {
+            "valid_lines": 100,
+            "invalid_lines": 0,
+            "partial": True,
+            "coverage_limited": True,
+            "bytes_scanned": 1024,
+        },
+    }
+    result = build_live_trade_snapshot(TRADE_ID, sources=sources, now_epoch=BASE_TIME)
+    assert result["snapshot_status"] == "NOT_FOUND"
+    assert result["component_status"]["history_manager"]["status"] == "PARTIAL"
+    assert result["coverage"]["history_manager"]["coverage_limited"] is True
+    assert result["identity"]["matched_by"] == []
+
+
+def test_not_found_with_fully_corrupt_timeline_preserves_degraded_source():
+    sources = _sources()
+    sources["timeline"] = {
+        "records": [],
+        "available": True,
+        "_reader_metadata": {
+            "valid_lines": 0,
+            "invalid_lines": 3,
+            "partial": True,
+            "coverage_limited": True,
+        },
+    }
+    result = build_live_trade_snapshot(TRADE_ID, sources=sources, now_epoch=BASE_TIME)
+    assert result["snapshot_status"] == "NOT_FOUND"
+    assert result["component_status"]["timeline"]["status"] == "DEGRADED"
+    assert any(item["code"] == "CORRUPT_JSONL_LINES_SKIPPED" for item in result["warnings"])
+    assert result["identity"]["matched_by"] == []
+
+
+def test_source_error_without_identity_is_degraded_not_internal_error():
+    sources = _sources()
+    sources["history_manager"] = lambda _: (_ for _ in ()).throw(PermissionError("denied"))
+    result = build_live_trade_snapshot(TRADE_ID, sources=sources, now_epoch=BASE_TIME)
+    assert result["snapshot_status"] == "DEGRADED"
+    assert result["component_status"]["history_manager"]["status"] == "ERROR"
+    assert result["identity"]["identity_confidence"] == "NONE"
+    assert result["identity"]["matched_by"] == []
+    assert result["fail_open"] is True
+
+
+def test_any_proven_identifier_prevents_not_found_with_partial_history():
+    sources = _sources(registry=[_record(status="CLOSED")], lifecycle=[_record(state="OUTCOME_RECORDED")], broker=[_record(status="CLOSED", position_found=False)])
+    sources["history_manager"] = {
+        "records": [],
+        "_reader_metadata": {"valid_lines": 1, "partial": True, "coverage_limited": True},
+    }
+    result = build_live_trade_snapshot(TRADE_ID, sources=sources, now_epoch=BASE_TIME)
+    assert result["snapshot_status"] == "DEGRADED"
+    assert result["identity"]["identity_confidence"] == "HIGH"
+    assert "trade_id" in result["identity"]["matched_by"]
+
+
+def test_identified_trade_with_partially_corrupt_but_useful_timeline_is_degraded():
+    sources = _sources(
+        registry=[_record(status="CLOSED")],
+        lifecycle=[_record(state="OUTCOME_RECORDED")],
+        broker=[_record(status="CLOSED", position_found=False)],
+    )
+    sources["timeline"] = {
+        "records": [_record(event_type="OUTCOME_CONFIRMED")],
+        "_reader_metadata": {
+            "valid_lines": 1,
+            "invalid_lines": 2,
+            "partial": True,
+            "coverage_limited": True,
+        },
+    }
+    result = build_live_trade_snapshot(TRADE_ID, sources=sources, now_epoch=BASE_TIME)
+    assert result["snapshot_status"] == "DEGRADED"
+    assert result["component_status"]["timeline"]["status"] == "PARTIAL"
+    assert result["component_status"]["timeline"]["records"] == 1
+
+
+def test_divergence_precedes_partial_source_for_identified_trade():
+    registry = _record(status="OPEN", opened_at=BASE_TIME - 600)
+    lifecycle = _record(state="ENTRY_CONFIRMED")
+    broker = _record(status="OPEN", position_found=True)
+    sources = _sources(registry=[registry], lifecycle=[lifecycle], broker=[broker])
+    sources["history_manager"] = {
+        "records": [],
+        "_reader_metadata": {"valid_lines": 1, "partial": True, "coverage_limited": True},
+    }
+    result = build_live_trade_snapshot(TRADE_ID, sources=sources, now_epoch=BASE_TIME)
+    assert result["snapshot_status"] == "DIVERGENT"
+    assert result["risk_protection"]["unprotected_position"] is True
+
+
 def test_healthy_open_trade_with_position_and_stop():
     opened = BASE_TIME - 600
     registry = _record(status="OPEN", opened_at=opened, qty=1.0, remaining_quantity=1.0, disaster_stop_confirmed=True)
