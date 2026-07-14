@@ -18,6 +18,8 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 VERSION = "2026-07-13-TRADE-TIMELINE-VALIDATOR-V1"
 LOGGER = logging.getLogger(__name__)
+JSONL_MAX_BYTES = 64 * 1024 * 1024
+JSONL_MAX_VALID_LINES = 100_000
 
 COMPONENTS = (
     "registry",
@@ -203,19 +205,60 @@ def _matches(record: Mapping[str, Any], identifiers: set[str]) -> bool:
     return bool(_identity_values(record) & identifiers)
 
 
-def _read_path(path: Path) -> Iterable[Mapping[str, Any]]:
+def _new_reader_metadata() -> Dict[str, Any]:
+    return {
+        "files_considered": 0,
+        "files_read": 0,
+        "lines_scanned": 0,
+        "valid_lines": 0,
+        "invalid_lines": 0,
+        "partial": False,
+        "bytes_scanned": 0,
+        "coverage_limited": False,
+    }
+
+
+def _merge_reader_metadata(target: Dict[str, Any], source: Mapping[str, Any]) -> None:
+    for key in ("files_considered", "files_read", "lines_scanned", "valid_lines", "invalid_lines", "bytes_scanned"):
+        target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
+    target["partial"] = bool(target.get("partial") or source.get("partial"))
+    target["coverage_limited"] = bool(target.get("coverage_limited") or source.get("coverage_limited"))
+
+
+def _read_path(path: Path, metadata: Optional[Dict[str, Any]] = None) -> Iterable[Mapping[str, Any]]:
+    stats = metadata if metadata is not None else _new_reader_metadata()
+    stats["files_considered"] = int(stats.get("files_considered", 0) or 0) + 1
     if not path.exists() or not path.is_file():
         return
     if path.suffix.lower() == ".jsonl":
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
+        with path.open("rb") as handle:
+            stats["files_read"] = int(stats.get("files_read", 0) or 0) + 1
+            for raw_line in handle:
+                if int(stats.get("bytes_scanned", 0) or 0) + len(raw_line) > JSONL_MAX_BYTES:
+                    stats["partial"] = True
+                    stats["coverage_limited"] = True
+                    break
+                stats["bytes_scanned"] = int(stats.get("bytes_scanned", 0) or 0) + len(raw_line)
+                stats["lines_scanned"] = int(stats.get("lines_scanned", 0) or 0) + 1
+                if not raw_line.strip():
                     continue
-                item = json.loads(line)
+                try:
+                    item = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    stats["invalid_lines"] = int(stats.get("invalid_lines", 0) or 0) + 1
+                    continue
+                stats["valid_lines"] = int(stats.get("valid_lines", 0) or 0) + 1
                 if isinstance(item, Mapping):
                     yield item
+                if int(stats.get("valid_lines", 0) or 0) >= JSONL_MAX_VALID_LINES:
+                    stats["partial"] = True
+                    stats["coverage_limited"] = True
+                    break
         return
+    stats["files_read"] = int(stats.get("files_read", 0) or 0) + 1
+    stats["bytes_scanned"] = path.stat().st_size
     data = json.loads(path.read_text(encoding="utf-8"))
+    stats["valid_lines"] = 1
     if isinstance(data, Mapping):
         yield data
     elif isinstance(data, list):
@@ -237,13 +280,15 @@ def _registry_records(data: Mapping[str, Any], identifiers: set[str]) -> list[Ma
     return [item for item in candidates if _matches(item, identifiers)]
 
 
-def _default_reader(component: str, paths: tuple[Path, ...], shared_identifiers: Optional[set[str]] = None) -> Callable[[str], list[Mapping[str, Any]]]:
-    def read(trade_id: str) -> list[Mapping[str, Any]]:
+def _default_reader(component: str, paths: tuple[Path, ...], shared_identifiers: Optional[set[str]] = None) -> Callable[[str], Dict[str, Any]]:
+    def read(trade_id: str) -> Dict[str, Any]:
         identifiers = shared_identifiers if shared_identifiers is not None else set()
         identifiers.add(str(trade_id).strip())
         matched: list[Mapping[str, Any]] = []
+        reader_metadata = _new_reader_metadata()
         for path in paths:
-            for row in _read_path(path):
+            path_metadata = _new_reader_metadata()
+            for row in _read_path(path, path_metadata):
                 if component == "registry":
                     found = _registry_records(row, identifiers)
                     matched.extend(found)
@@ -252,12 +297,13 @@ def _default_reader(component: str, paths: tuple[Path, ...], shared_identifiers:
                 elif _matches(row, identifiers):
                     matched.append(row)
                     identifiers.update(_identity_values(row))
-        return matched
+            _merge_reader_metadata(reader_metadata, path_metadata)
+        return {"records": matched, "_reader_metadata": reader_metadata}
 
     return read
 
 
-def build_default_sources(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Callable[[str], list[Mapping[str, Any]]]]:
+def build_default_sources(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Callable[[str], Dict[str, Any]]]:
     """Constroi leitores locais. Nao le arquivos ate a validacao ser solicitada."""
     identifiers: set[str] = set()
     return {name: _default_reader(name, paths, identifiers) for name, paths in default_source_paths(environ).items()}
@@ -269,7 +315,7 @@ def _coerce_records(value: Any) -> list[Mapping[str, Any]]:
     if isinstance(value, Mapping):
         for key in ("records", "items", "events", "lifecycles"):
             if isinstance(value.get(key), list):
-                head = {k: v for k, v in value.items() if k != key}
+                head = {k: v for k, v in value.items() if k not in {key, "_reader_metadata"}}
                 rows = [item for item in value[key] if isinstance(item, Mapping)]
                 return ([head] if head else []) + rows
         return [value]
@@ -278,6 +324,21 @@ def _coerce_records(value: Any) -> list[Mapping[str, Any]]:
     if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
         return [item for item in value if isinstance(item, Mapping)]
     return []
+
+
+def _reader_metadata(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping) or not isinstance(value.get("_reader_metadata"), Mapping):
+        return {}
+    metadata = value["_reader_metadata"]
+    return {
+        "lines_scanned": int(metadata.get("lines_scanned", 0) or 0),
+        "valid_lines": int(metadata.get("valid_lines", 0) or 0),
+        "invalid_lines": int(metadata.get("invalid_lines", 0) or 0),
+        "partial": bool(metadata.get("partial", False)),
+        "bytes_scanned": int(metadata.get("bytes_scanned", 0) or 0),
+        "coverage_limited": bool(metadata.get("coverage_limited", False)),
+        "files_read": int(metadata.get("files_read", 0) or 0),
+    }
 
 
 def _parse_timestamp(value: Any) -> tuple[Optional[float], Optional[str]]:
@@ -493,6 +554,7 @@ class TradeTimelineValidator:
         components: Dict[str, Dict[str, Any]] = {}
         records: Dict[str, list[Mapping[str, Any]]] = {}
         errors = []
+        warnings = []
 
         if not identity:
             errors.append({"component": "validator", "error_type": "ValueError", "message": "trade_id is required"})
@@ -506,9 +568,33 @@ class TradeTimelineValidator:
             try:
                 value = source(identity) if callable(source) else source
                 rows = _coerce_records(value)
+                reader_metadata = _reader_metadata(value)
                 records[name] = rows
-                components[name] = {"status": "AVAILABLE" if rows else "NO_EVIDENCE", "records": len(rows)}
-                _structured_log(self.logger, "info", "TRADE_TIMELINE_SOURCE_READ", trade_id=identity, component=name, status=components[name]["status"], records=len(rows))
+                fully_corrupt = bool(
+                    reader_metadata.get("files_read", 0) > 0
+                    and reader_metadata.get("lines_scanned", 0) > 0
+                    and reader_metadata.get("valid_lines", 0) == 0
+                    and reader_metadata.get("invalid_lines", 0) > 0
+                )
+                status = "AVAILABLE" if rows else ("DEGRADED" if fully_corrupt else "NO_EVIDENCE")
+                components[name] = {"status": status, "records": len(rows), **reader_metadata}
+                if reader_metadata.get("invalid_lines", 0) > 0:
+                    warnings.append({
+                        "component": name,
+                        "code": "CORRUPT_JSONL_LINES_SKIPPED",
+                        "count": reader_metadata["invalid_lines"],
+                    })
+                _structured_log(
+                    self.logger,
+                    "info",
+                    "TRADE_TIMELINE_SOURCE_READ",
+                    trade_id=identity,
+                    component=name,
+                    status=status,
+                    records=len(rows),
+                    invalid_lines=reader_metadata.get("invalid_lines", 0),
+                    partial=reader_metadata.get("partial", False),
+                )
             except Exception as exc:
                 records[name] = []
                 components[name] = {"status": "ERROR", "records": 0, "error_type": type(exc).__name__, "error": str(exc)[:300]}
@@ -558,6 +644,7 @@ class TradeTimelineValidator:
             "chronology": chronology,
             "latencies": _latencies(events),
             "divergences": divergences,
+            "warnings": warnings,
             "errors": errors,
             "summary": {
                 "events_found": len(events),
@@ -565,6 +652,7 @@ class TradeTimelineValidator:
                 "duplicate_groups": len(duplicates),
                 "divergences": len(divergences),
                 "component_errors": len(errors),
+                "warnings": len(warnings),
                 "timeline_available": not timeline_absent,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 3),
             },
