@@ -202,9 +202,15 @@ DAILY_SUMMARY_KEY = "falcon:daily_summary_sent"
 MONTHLY_SUMMARY_KEY = "falcon:monthly_summary_sent"
 LAST_CANDLES_KEY = "falcon:last_scanned_candles_by_symbol"
 FUNNEL_KEY = "falcon:funnel"
+FALCON_MANAGEMENT_ALERT_GUARD_KEY = "falcon:management_alert_guard:v1"
+FALCON_CENTRAL_ONLY_TOMBSTONES_KEY = "falcon:central_only_reconcile:tombstones:v1"
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 redis_lock = threading.Lock()
+position_mutation_lock = threading.RLock()
+management_alert_guard_lock = threading.RLock()
+_management_alert_guard_memory = {}
+_central_only_tombstones_memory = {}
 
 exchange = get_exchange()
 
@@ -268,6 +274,19 @@ HEALTH = {
     "cq_framework_import_error": CQ_FRAMEWORK_IMPORT_ERROR,
     "last_execution_decision": None,
     "last_execution_order": None,
+    "falcon_disaster_stop_active_verified": False,
+    "falcon_disaster_stop_trigger_type": None,
+    "falcon_disaster_stop_order_status": None,
+    "falcon_disaster_stop_order_id": None,
+    "falcon_disaster_stop_last_checked_at": None,
+    "falcon_disaster_stop_protection_matches_position": False,
+    "falcon_stop_anomaly_detected": False,
+    "falcon_stop_anomaly_last_reason": None,
+    "falcon_management_spam_guard_status": "READY",
+    "falcon_management_spam_guard_last_reason": None,
+    "falcon_management_spam_guard_suppressed_count": 0,
+    "falcon_management_spam_guard_last_suppressed_at": None,
+    "falcon_central_only_pending_count": 0,
 }
 
 # ==============================================================================
@@ -573,13 +592,19 @@ def r_for_side(side, entry, initial_stop, price):
 
 
 def get_positions():
-    data = redis_get_json(POSITIONS_KEY, {})
-    return data if isinstance(data, dict) else {}
+    with position_mutation_lock:
+        data = redis_get_json(POSITIONS_KEY, {})
+        return data if isinstance(data, dict) else {}
 
 
 def save_positions(positions):
-    HEALTH["last_positions_count"] = len(positions)
-    return redis_set_json(POSITIONS_KEY, positions)
+    with position_mutation_lock:
+        safe_positions = positions if isinstance(positions, dict) else {}
+        tombstone_filter = globals().get("falcon_filter_reconciled_positions")
+        if callable(tombstone_filter):
+            safe_positions = tombstone_filter(safe_positions)
+        HEALTH["last_positions_count"] = len(safe_positions)
+        return redis_set_json(POSITIONS_KEY, safe_positions)
 
 
 def register_falcon_trade_registry_open(pos):
@@ -1922,6 +1947,7 @@ def management_loop():
             for pid in closed_pids:
                 positions.pop(pid, None)
 
+            falcon_refresh_management_safety_health(positions)
             save_positions(positions)
             HEALTH["last_management_run"] = data_hora_sp_str()
             HEALTH["last_success"] = data_hora_sp_str()
@@ -2445,6 +2471,10 @@ FALCON_MANAGEMENT_FAILSAFE_ENABLED = str(os.environ.get("FALCON_MANAGEMENT_FAILS
 FALCON_MANAGEMENT_STOP_GRACE_SECONDS = int(os.environ.get("FALCON_MANAGEMENT_STOP_GRACE_SECONDS", "15"))
 FALCON_TP50_RETRY_SECONDS = int(os.environ.get("FALCON_TP50_RETRY_SECONDS", "20"))
 FALCON_MANAGEMENT_AMOUNT_TOLERANCE = float(os.environ.get("FALCON_MANAGEMENT_AMOUNT_TOLERANCE", "0.0000000001"))
+FALCON_STOP_VERIFY_INTERVAL_SECONDS = max(5, int(os.environ.get("FALCON_STOP_VERIFY_INTERVAL_SECONDS", "15")))
+FALCON_STOP_VERIFY_PERSIST_SECONDS = max(15, int(os.environ.get("FALCON_STOP_VERIFY_PERSIST_SECONDS", "60")))
+FALCON_MANAGEMENT_ALERT_COOLDOWN_SECONDS = max(60, int(os.environ.get("FALCON_MANAGEMENT_ALERT_COOLDOWN_SECONDS", "3600")))
+FALCON_CENTRAL_ONLY_EVIDENCE_MAX_AGE_SECONDS = max(30, int(os.environ.get("FALCON_CENTRAL_ONLY_EVIDENCE_MAX_AGE_SECONDS", "30")))
 
 HEALTH.setdefault("real_management_version", FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION)
 HEALTH.setdefault("last_real_management_action", None)
@@ -2517,6 +2547,7 @@ def falcon_sync_live_order_state(sig, order):
     sig["broker_stop_price"] = disaster.get("stop_price") or sig.get("stop")
     sig["broker_stop_amount"] = disaster.get("amount") or amount
     sig["broker_stop_status"] = disaster.get("status")
+    sig["broker_stop_trigger_type"] = disaster.get("working_type") or disaster.get("trigger_type")
     # Preserve the factual Broker response for the passive Lifecycle observer.
     # These fields never authorize or change the stop; they are copied only
     # after ``place_market_order`` has returned its disaster-stop result.
@@ -2574,6 +2605,7 @@ def register_falcon_trade_registry_open(pos):
                     "broker_stop_price": pos.get("broker_stop_price"),
                     "broker_stop_amount": pos.get("broker_stop_amount"),
                     "broker_stop_status": pos.get("broker_stop_status"),
+                    "broker_stop_trigger_type": pos.get("broker_stop_trigger_type"),
                     "broker_stop_side": pos.get("broker_stop_side"),
                     "broker_stop_symbol": pos.get("broker_stop_symbol"),
                     "broker_stop_confirmed_at": pos.get("broker_stop_confirmed_at"),
@@ -2607,6 +2639,7 @@ def falcon_update_registry_management(pos, **metadata):
                 "broker_stop_price": pos.get("broker_stop_price"),
                 "broker_stop_amount": pos.get("broker_stop_amount"),
                 "broker_stop_status": pos.get("broker_stop_status"),
+                "broker_stop_trigger_type": pos.get("broker_stop_trigger_type"),
                 "broker_stop_side": pos.get("broker_stop_side"),
                 "broker_stop_symbol": pos.get("broker_stop_symbol"),
                 "broker_stop_confirmed_at": pos.get("broker_stop_confirmed_at"),
@@ -2623,6 +2656,835 @@ def falcon_update_registry_management(pos, **metadata):
     except Exception as exc:
         HEALTH["last_real_management_error"] = f"registry management: {exc}"
         return None
+
+
+def _falcon_management_norm_symbol(value):
+    return str(value or "").upper().strip().replace("/", "").replace(":USDT", "").replace("-", "")
+
+
+def _falcon_management_norm_side(value):
+    side = str(value or "").upper().strip()
+    if side in {"BUY", "LONG"}:
+        return "LONG"
+    if side in {"SELL", "SHORT"}:
+        return "SHORT"
+    return side
+
+
+def falcon_position_identity(pos, position_id=None):
+    """Return the strong Central identity used by reconciliation and alert dedup."""
+    pos = pos if isinstance(pos, dict) else {}
+    live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+    return {
+        "position_id": str(position_id or pos.get("id") or "").strip() or None,
+        "trade_id": str(pos.get("trade_registry_id") or pos.get("trade_id") or "").strip() or None,
+        "lifecycle_id": str(pos.get("lifecycle_id") or "").strip() or None,
+        "order_id": str(pos.get("live_order_id") or pos.get("bingx_order_id") or live_order.get("order_id") or live_order.get("id") or "").strip() or None,
+        "client_order_id": str(pos.get("live_client_order_id") or pos.get("client_order_id") or live_order.get("client_order_id") or live_order.get("client_tag") or "").strip() or None,
+        "symbol": _falcon_management_norm_symbol(pos.get("symbol")),
+        "side": _falcon_management_norm_side(pos.get("side")),
+    }
+
+
+def falcon_position_identity_fingerprint(pos, position_id=None):
+    identity = falcon_position_identity(pos, position_id=position_id)
+    strong = identity.get("lifecycle_id") or identity.get("client_order_id") or identity.get("order_id") or identity.get("position_id")
+    if not strong:
+        return ""
+    return "|".join([
+        identity.get("symbol") or "",
+        identity.get("side") or "",
+        identity.get("position_id") or "",
+        identity.get("lifecycle_id") or "",
+        identity.get("client_order_id") or "",
+        identity.get("order_id") or "",
+    ])[:700]
+
+
+def falcon_position_tombstone_keys(pos, position_id=None):
+    """Build operational tombstone keys; reusable position IDs are never identity."""
+    identity = falcon_position_identity(pos, position_id=position_id)
+    keys = []
+    for label, field in (
+        ("LIFECYCLE", "lifecycle_id"),
+        ("CLIENT", "client_order_id"),
+        ("ORDER", "order_id"),
+    ):
+        value = identity.get(field)
+        if value not in (None, ""):
+            keys.append(f"{label}|{str(value).strip()}")
+    return keys
+
+
+def _falcon_prune_timestamped_map(value, now_epoch=None, max_items=500, max_age_seconds=2592000):
+    now_epoch = safe_float(now_epoch, time.time())
+    source = value if isinstance(value, dict) else {}
+    kept = {}
+    ordered = []
+    for key, item in source.items():
+        item = item if isinstance(item, dict) else {}
+        epoch = safe_float(item.get("updated_epoch") or item.get("last_attempt_epoch") or item.get("reconciled_epoch"), 0.0)
+        if epoch and now_epoch - epoch > max_age_seconds:
+            continue
+        ordered.append((epoch, str(key), item))
+    for _, key, item in sorted(ordered, reverse=True)[:max_items]:
+        kept[key] = item
+    return kept
+
+
+def falcon_filter_reconciled_positions(positions):
+    """Drop exact tombstoned identities before any Redis save, including stale saves."""
+    positions = positions if isinstance(positions, dict) else {}
+    tombstones = _falcon_prune_timestamped_map(redis_get_json(FALCON_CENTRAL_ONLY_TOMBSTONES_KEY, {}))
+    for key, value in _central_only_tombstones_memory.items():
+        tombstones.setdefault(key, value)
+    if not tombstones:
+        return positions
+    filtered = {}
+    for pid, pos in positions.items():
+        identity_keys = falcon_position_tombstone_keys(pos, position_id=pid)
+        if any(key in tombstones for key in identity_keys):
+            continue
+        filtered[pid] = pos
+    return filtered
+
+
+def _falcon_management_alert_fingerprint(pos, reason, position_id=None):
+    base = falcon_position_identity_fingerprint(pos, position_id=position_id)
+    return f"{base}|{str(reason or '').upper().strip()}" if base else ""
+
+
+def falcon_management_alert_decision(pos, reason, now_epoch=None, position_id=None):
+    """Persist alert intent before transport so repeated management cycles are deduplicated."""
+    now_epoch = safe_float(now_epoch, time.time())
+    now_text = data_hora_sp_str()
+    fingerprint = _falcon_management_alert_fingerprint(pos, reason, position_id=position_id)
+    if not fingerprint:
+        HEALTH["falcon_management_spam_guard_status"] = "IDENTITY_INSUFFICIENT"
+        HEALTH["falcon_management_spam_guard_last_reason"] = reason
+        return {"send": False, "suppressed": True, "status": "IDENTITY_INSUFFICIENT", "fingerprint": None}
+    with management_alert_guard_lock:
+        persisted_guard = redis_get_json(FALCON_MANAGEMENT_ALERT_GUARD_KEY, {})
+        guard = _falcon_prune_timestamped_map(
+            persisted_guard if isinstance(persisted_guard, dict) else _management_alert_guard_memory,
+            now_epoch=now_epoch,
+        )
+        for key, value in _management_alert_guard_memory.items():
+            guard.setdefault(key, value)
+        previous = guard.get(fingerprint) if isinstance(guard.get(fingerprint), dict) else {}
+        last_attempt = safe_float(previous.get("last_attempt_epoch"), 0.0)
+        suppressed = bool(last_attempt and now_epoch - last_attempt < FALCON_MANAGEMENT_ALERT_COOLDOWN_SECONDS)
+        entry = dict(previous)
+        entry.update({
+            "fingerprint": fingerprint,
+            "reason": str(reason or "").upper().strip(),
+            "last_attempt_epoch": last_attempt if suppressed else now_epoch,
+            "last_attempt_at": previous.get("last_attempt_at") if suppressed else now_text,
+            "updated_epoch": now_epoch,
+            "updated_at": now_text,
+        })
+        if suppressed:
+            entry["suppressed_count"] = int(entry.get("suppressed_count") or 0) + 1
+            entry["last_suppressed_at"] = now_text
+        else:
+            entry["attempt_count"] = int(entry.get("attempt_count") or 0) + 1
+        guard[fingerprint] = entry
+        _management_alert_guard_memory.clear()
+        _management_alert_guard_memory.update(guard)
+        persisted = redis_set_json(FALCON_MANAGEMENT_ALERT_GUARD_KEY, guard)
+    pos["management_alert_guard"] = dict(entry)
+    pos["management_alert_reason"] = str(reason or "").upper().strip()
+    HEALTH["falcon_management_spam_guard_last_reason"] = str(reason or "").upper().strip()
+    if suppressed:
+        HEALTH["falcon_management_spam_guard_status"] = "SUPPRESSED_COOLDOWN"
+        HEALTH["falcon_management_spam_guard_suppressed_count"] = int(HEALTH.get("falcon_management_spam_guard_suppressed_count") or 0) + 1
+        HEALTH["falcon_management_spam_guard_last_suppressed_at"] = now_text
+    else:
+        HEALTH["falcon_management_spam_guard_status"] = "ALERT_ALLOWED"
+    return {
+        "send": not suppressed,
+        "suppressed": suppressed,
+        "status": "SUPPRESSED_COOLDOWN" if suppressed else "ALERT_ALLOWED",
+        "fingerprint": fingerprint,
+        "cooldown_seconds": FALCON_MANAGEMENT_ALERT_COOLDOWN_SECONDS,
+        "persisted": bool(persisted),
+        "entry": dict(entry),
+    }
+
+
+def falcon_clear_management_alert(pos=None, position_id=None, reason=None):
+    pos = pos if isinstance(pos, dict) else {}
+    base = falcon_position_identity_fingerprint(pos, position_id=position_id)
+    expected = _falcon_management_alert_fingerprint(pos, reason, position_id=position_id) if reason else None
+    removed = 0
+    with management_alert_guard_lock:
+        guard = _falcon_prune_timestamped_map(redis_get_json(FALCON_MANAGEMENT_ALERT_GUARD_KEY, {}))
+        for key, value in _management_alert_guard_memory.items():
+            guard.setdefault(key, value)
+        for key in list(guard):
+            if (expected and key == expected) or (base and key.startswith(base + "|")):
+                guard.pop(key, None)
+                removed += 1
+        _management_alert_guard_memory.clear()
+        _management_alert_guard_memory.update(guard)
+        persisted = redis_set_json(FALCON_MANAGEMENT_ALERT_GUARD_KEY, guard)
+    if removed:
+        HEALTH["falcon_management_spam_guard_status"] = "CLEARED_AFTER_RECONCILIATION"
+    return {"ok": bool(persisted), "removed": removed, "persisted": bool(persisted), "no_order_sent": True}
+
+
+def falcon_reconcile_remove_position(position_id=None, order_id=None, client_order_id=None, lifecycle_id=None, trade_id=None):
+    """Remove one exact Central-only position without Broker, PnL, Telegram or close logic."""
+    requested = {
+        "order_id": str(order_id).strip() if order_id not in (None, "") else None,
+        "client_order_id": str(client_order_id).strip() if client_order_id not in (None, "") else None,
+        "lifecycle_id": str(lifecycle_id).strip() if lifecycle_id not in (None, "") else None,
+    }
+    if not any(requested.values()):
+        return {"ok": False, "status": "STRONG_IDENTITY_REQUIRED", "removed": False, "no_order_sent": True}
+    now_epoch = time.time()
+    now_text = data_hora_sp_str()
+    with position_mutation_lock:
+        positions = get_positions()
+        matches = []
+        identity_candidates = 0
+        identity_conflicts = []
+        rejected_reasons = []
+        for pid, pos in positions.items():
+            identity = falcon_position_identity(pos, position_id=pid)
+            typed_matches = [
+                bool(supplied and identity.get(field) and str(supplied) == str(identity.get(field)))
+                for field, supplied in requested.items()
+            ]
+            conflicts = []
+            for supplied, current, label in (
+                (order_id, identity.get("order_id"), "order_id"),
+                (client_order_id, identity.get("client_order_id"), "client_order_id"),
+                (lifecycle_id, identity.get("lifecycle_id"), "lifecycle_id"),
+                (trade_id, identity.get("trade_id"), "trade_id"),
+            ):
+                if supplied not in (None, "") and current not in (None, "") and str(supplied) != str(current):
+                    conflicts.append(label)
+            same_position = position_id not in (None, "") and str(pid) == str(position_id)
+            if conflicts and (same_position or any(typed_matches)):
+                identity_conflicts.append({"position_id": str(pid), "fields": sorted(conflicts)})
+                continue
+            if conflicts or not any(typed_matches):
+                continue
+            if position_id not in (None, "") and str(pid) != str(position_id):
+                identity_conflicts.append({"position_id": str(pid), "fields": ["position_id"]})
+                continue
+            identity_candidates += 1
+            evidence = pos.get("central_only_evidence") if isinstance(pos.get("central_only_evidence"), dict) else {}
+            evidence_epoch = safe_float(evidence.get("checked_epoch"), 0.0)
+            evidence_fresh = bool(
+                evidence_epoch
+                and -5 <= now_epoch - evidence_epoch <= FALCON_CENTRAL_ONLY_EVIDENCE_MAX_AGE_SECONDS
+            )
+            live_mode = str(pos.get("execution_mode") or "").upper() == "LIVE" or str(pos.get("registry_mode") or "").upper() == "REAL"
+            evidence_position_qty = safe_float(evidence.get("position_qty"), None)
+            evidence_matched_count = evidence.get("matched_count")
+            try:
+                evidence_matched_count = int(evidence_matched_count) if evidence_matched_count is not None else None
+            except Exception:
+                evidence_matched_count = None
+            terminal_stop_status = str(evidence.get("stop_order_status") or "").upper().strip() in {
+                "ORDER_NOT_FOUND", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FAILED", "FILLED", "EXECUTED", "CLOSED",
+            }
+            evidence_identity_ok = all(
+                evidence.get(field) in (None, "")
+                or identity.get(field) not in (None, "") and str(evidence.get(field)) == str(identity.get(field))
+                for field in ("trade_id", "lifecycle_id", "order_id", "client_order_id")
+            )
+            evidence_trade_id_ok = bool(
+                identity.get("trade_id")
+                and evidence.get("trade_id") not in (None, "")
+                and str(evidence.get("trade_id")) == str(identity.get("trade_id"))
+            )
+            evidence_strong_match = any(
+                evidence.get(field) not in (None, "")
+                and identity.get(field) not in (None, "")
+                and str(evidence.get(field)) == str(identity.get(field))
+                for field in ("lifecycle_id", "order_id", "client_order_id")
+            )
+            evidence_identity_ok = bool(
+                evidence_identity_ok
+                and evidence_trade_id_ok
+                and evidence_strong_match
+                and _falcon_management_norm_symbol(evidence.get("symbol")) == identity.get("symbol")
+                and _falcon_management_norm_side(evidence.get("side")) == identity.get("side")
+            )
+            eligible = bool(
+                live_mode
+                and pos.get("central_only_reconcile_required") is True
+                and evidence.get("broker_flat") is True
+                and evidence_position_qty is not None
+                and 0 <= evidence_position_qty <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+                and evidence_matched_count is not None
+                and evidence_matched_count == 0
+                and evidence.get("read_only") is True
+                and evidence.get("sent") is False
+                and evidence.get("stop_order_active") is False
+                and terminal_stop_status
+                and evidence_identity_ok
+                and evidence_fresh
+            )
+            if not eligible:
+                rejected_reasons.append({"position_id": str(pid), "reason": "CENTRAL_ONLY_EVIDENCE_NOT_ELIGIBLE"})
+                continue
+            matches.append((pid, pos))
+        if not matches:
+            if identity_conflicts:
+                return {
+                    "ok": False,
+                    "status": "POSITION_IDENTITY_CONFLICT",
+                    "removed": False,
+                    "conflicts": identity_conflicts,
+                    "no_order_sent": True,
+                }
+            if identity_candidates:
+                return {
+                    "ok": False,
+                    "status": "POSITION_NOT_RECONCILABLE",
+                    "removed": False,
+                    "reasons": rejected_reasons,
+                    "no_order_sent": True,
+                }
+            return {"ok": True, "status": "ALREADY_REMOVED", "removed": False, "already_removed": True, "no_order_sent": True}
+        if len(matches) != 1:
+            return {"ok": False, "status": "AMBIGUOUS_POSITION_IDENTITY", "removed": False, "matches": len(matches), "no_order_sent": True}
+        matched_pid, matched_pos = matches[0]
+        tombstone_keys = falcon_position_tombstone_keys(matched_pos, position_id=matched_pid)
+        if not tombstone_keys:
+            return {"ok": False, "status": "POSITION_IDENTITY_MISSING", "removed": False, "no_order_sent": True}
+        tombstones = _falcon_prune_timestamped_map(redis_get_json(FALCON_CENTRAL_ONLY_TOMBSTONES_KEY, {}), now_epoch=now_epoch)
+        tombstone = {
+            "position_id": str(matched_pid),
+            "trade_id": trade_id or matched_pos.get("trade_registry_id"),
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "lifecycle_id": lifecycle_id,
+            "reason": "CENTRAL_ONLY_BROKER_FLAT_RECONCILED",
+            "reconciled_at": now_text,
+            "reconciled_epoch": now_epoch,
+            "updated_epoch": now_epoch,
+        }
+        for key in tombstone_keys:
+            tombstones[key] = dict(tombstone, tombstone_key=key)
+        if not redis_set_json(FALCON_CENTRAL_ONLY_TOMBSTONES_KEY, tombstones):
+            return {"ok": False, "status": "TOMBSTONE_PERSIST_FAILED", "removed": False, "no_order_sent": True}
+        _central_only_tombstones_memory.clear()
+        _central_only_tombstones_memory.update(tombstones)
+        positions.pop(matched_pid, None)
+        saved = save_positions(positions)
+        if not saved:
+            return {"ok": False, "status": "POSITION_SAVE_FAILED", "removed": False, "no_order_sent": True}
+        alert_clear = falcon_clear_management_alert(matched_pos, position_id=matched_pid)
+        falcon_refresh_management_safety_health(positions)
+        return {
+            "ok": True,
+            "status": "CENTRAL_ONLY_POSITION_REMOVED",
+            "removed": True,
+            "position_id": str(matched_pid),
+            "tombstone_keys": tombstone_keys,
+            "alert_clear": alert_clear,
+            "no_order_sent": True,
+        }
+
+
+def _falcon_stop_status_flags(status, order_snapshot=None):
+    status = str(status or "UNKNOWN").upper().strip()
+    order_snapshot = order_snapshot if isinstance(order_snapshot, dict) else {}
+    active = status in {"OPEN", "NEW", "ACTIVE", "PENDING", "TRIGGER_PENDING", "PARTIALLY_FILLED"}
+    filled_qty = safe_float(order_snapshot.get("filled"), 0.0)
+    filled = status in {"FILLED", "EXECUTED"} or (status == "CLOSED" and filled_qty > 0)
+    triggered = status in {"TRIGGERED", "TRIGGERING"}
+    cancelled = status in {"CANCELED", "CANCELLED", "EXPIRED"}
+    rejected = status in {"REJECTED", "FAILED"}
+    return {"active": active, "filled": filled, "triggered": triggered, "cancelled": cancelled, "rejected": rejected}
+
+
+def _falcon_management_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "sim", "on"}:
+        return True
+    if text in {"0", "false", "no", "nao", "não", "off"}:
+        return False
+    return None
+
+
+def _falcon_protective_stop_evidence(order_snapshot, identity, expected_amount=None):
+    """Validate that an exact fetched order is a protective stop for this lifecycle side."""
+    order_snapshot = order_snapshot if isinstance(order_snapshot, dict) else {}
+    identity = identity if isinstance(identity, dict) else {}
+    order_type = str(order_snapshot.get("type") or "UNKNOWN").upper().strip().replace("-", "_")
+    valid_types = {"STOP", "STOP_MARKET", "STOP_LOSS", "STOP_LOSS_LIMIT"}
+    expected_close_side = "SELL" if identity.get("side") == "LONG" else "BUY"
+    actual_side = str(order_snapshot.get("side") or "").upper().strip()
+    expected_position_side = str(identity.get("side") or "").upper().strip()
+    actual_position_side = str(order_snapshot.get("position_side") or "").upper().strip()
+    reduce_only = _falcon_management_bool(order_snapshot.get("reduce_only"))
+    close_position = _falcon_management_bool(order_snapshot.get("close_position"))
+    ownership_semantics = bool(
+        reduce_only is True
+        or close_position is True
+        or (expected_position_side in {"LONG", "SHORT"} and actual_position_side == expected_position_side)
+    )
+    remaining_amount = safe_float(order_snapshot.get("remaining"), None)
+    original_amount = safe_float(order_snapshot.get("amount"), None)
+    amount = remaining_amount if remaining_amount is not None and remaining_amount > FALCON_MANAGEMENT_AMOUNT_TOLERANCE else original_amount
+    expected = safe_float(expected_amount, None)
+    amount_matches = bool(
+        amount is not None
+        and amount > 0
+        and (
+            expected is None
+            or expected <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+            or abs(amount - expected) <= max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, max(amount, expected) * 1e-6)
+        )
+    )
+    return {
+        "protective": bool(
+            order_snapshot.get("ok")
+            and order_type in valid_types
+            and actual_side == expected_close_side
+            and safe_float(order_snapshot.get("stop_price"), 0.0) > 0
+            and ownership_semantics
+            and amount_matches
+        ),
+        "order_type": order_type,
+        "expected_close_side": expected_close_side,
+        "actual_side": actual_side,
+        "expected_position_side": expected_position_side,
+        "actual_position_side": actual_position_side,
+        "reduce_only": reduce_only,
+        "close_position": close_position,
+        "ownership_semantics": ownership_semantics,
+        "amount": amount,
+        "amount_matches": amount_matches,
+    }
+
+
+def _falcon_stop_not_found_evidence(order_snapshot):
+    order_snapshot = order_snapshot if isinstance(order_snapshot, dict) else {}
+    return str(order_snapshot.get("status") or "").upper().strip() == "ORDER_NOT_FOUND"
+
+
+def _falcon_confirmed_stop_fill_evidence(pos, position_id, order_snapshot, expected_amount):
+    """Confirm an exact, protective and quantity-complete disaster-stop fill."""
+    pos = pos if isinstance(pos, dict) else {}
+    order_snapshot = order_snapshot if isinstance(order_snapshot, dict) else {}
+    expected_stop_id = str(pos.get("broker_stop_order_id") or pos.get("disaster_stop_order_id") or "").strip()
+    actual_stop_id = str(order_snapshot.get("order_id") or order_snapshot.get("id") or "").strip()
+    expected = safe_float(expected_amount, None)
+    filled_qty = safe_float(order_snapshot.get("filled"), 0.0)
+    average = safe_float(order_snapshot.get("average"), None)
+    flags = _falcon_stop_status_flags(order_snapshot.get("status"), order_snapshot)
+    protective = _falcon_protective_stop_evidence(
+        order_snapshot,
+        falcon_position_identity(pos, position_id=position_id),
+        expected_amount=expected,
+    )
+    quantity_complete = bool(
+        expected is not None
+        and expected > 0
+        and filled_qty > 0
+        and abs(filled_qty - expected) <= max(
+            FALCON_MANAGEMENT_AMOUNT_TOLERANCE,
+            max(filled_qty, expected) * 1e-6,
+        )
+    )
+    confirmed = bool(
+        flags.get("filled")
+        and expected_stop_id
+        and actual_stop_id == expected_stop_id
+        and pos.get("entry_ownership_verified") is True
+        and protective.get("protective")
+        and quantity_complete
+        and average is not None
+        and average > 0
+    )
+    return {
+        "confirmed": confirmed,
+        "expected_stop_order_id": expected_stop_id or None,
+        "actual_stop_order_id": actual_stop_id or None,
+        "entry_ownership_verified": pos.get("entry_ownership_verified") is True,
+        "protective": bool(protective.get("protective")),
+        "quantity_complete": quantity_complete,
+        "filled_qty": filled_qty,
+        "expected_qty": expected,
+        "average": average,
+        "flags": flags,
+        "protective_evidence": protective,
+    }
+
+
+def _falcon_update_stop_health(result):
+    HEALTH["falcon_disaster_stop_active_verified"] = bool(
+        result.get("stop_order_active")
+        and result.get("stop_order_identity_match")
+        and result.get("protection_matches_position")
+        and result.get("stop_order_protective_verified")
+        and result.get("entry_ownership_verified")
+    )
+    HEALTH["falcon_disaster_stop_trigger_type"] = result.get("trigger_type")
+    HEALTH["falcon_disaster_stop_order_status"] = result.get("stop_order_status")
+    HEALTH["falcon_disaster_stop_order_id"] = result.get("stop_order_id")
+    HEALTH["falcon_disaster_stop_last_checked_at"] = result.get("stop_order_last_checked_at")
+    HEALTH["falcon_disaster_stop_protection_matches_position"] = bool(result.get("protection_matches_position"))
+    HEALTH["falcon_stop_anomaly_detected"] = bool(result.get("stop_anomaly_detected"))
+    HEALTH["falcon_stop_anomaly_last_reason"] = result.get("stop_anomaly_reason")
+    if result.get("central_only_reconcile_required"):
+        HEALTH["falcon_central_only_pending_count"] = max(1, int(HEALTH.get("falcon_central_only_pending_count") or 0))
+
+
+def falcon_refresh_management_safety_health(positions):
+    """Aggregate safety health so one healthy trade cannot hide another anomaly."""
+    positions = positions if isinstance(positions, dict) else {}
+    live_rows = [
+        row for row in positions.values()
+        if isinstance(row, dict)
+        and (str(row.get("execution_mode") or "").upper() == "LIVE" or str(row.get("registry_mode") or "").upper() == "REAL")
+    ]
+    pending = [row for row in live_rows if row.get("central_only_reconcile_required")]
+    anomalies = [row for row in live_rows if row.get("stop_anomaly_detected")]
+    HEALTH["falcon_central_only_pending_count"] = len(pending)
+    HEALTH["falcon_disaster_stop_active_verified"] = bool(live_rows) and all(bool(row.get("disaster_stop_active_verified")) for row in live_rows)
+    HEALTH["falcon_disaster_stop_protection_matches_position"] = bool(live_rows) and all(bool(row.get("protection_matches_position")) for row in live_rows)
+    HEALTH["falcon_stop_anomaly_detected"] = bool(anomalies)
+    selected = (anomalies or pending or live_rows)[-1] if (anomalies or pending or live_rows) else {}
+    HEALTH["falcon_stop_anomaly_last_reason"] = selected.get("stop_anomaly_last_reason")
+    HEALTH["falcon_disaster_stop_trigger_type"] = (selected.get("live_stop_verification") or {}).get("trigger_type") or selected.get("stop_order_trigger_type") or selected.get("broker_stop_trigger_type")
+    HEALTH["falcon_disaster_stop_order_status"] = selected.get("stop_order_status")
+    HEALTH["falcon_disaster_stop_order_id"] = selected.get("stop_order_id") or selected.get("broker_stop_order_id")
+    HEALTH["falcon_disaster_stop_last_checked_at"] = selected.get("stop_order_last_checked_at")
+    return {
+        "live_count": len(live_rows),
+        "central_only_pending_count": len(pending),
+        "anomaly_count": len(anomalies),
+    }
+
+
+def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_registry=True):
+    """Read Broker position/stop facts before any normal LIVE management action."""
+    now_epoch = safe_float(now_epoch, time.time())
+    now_text = data_hora_sp_str()
+    cached = pos.get("live_stop_verification") if isinstance(pos.get("live_stop_verification"), dict) else {}
+    last_epoch = safe_float(pos.get("stop_order_last_checked_epoch"), 0.0)
+    if not force and cached and last_epoch and now_epoch - last_epoch < FALCON_STOP_VERIFY_INTERVAL_SECONDS:
+        result = dict(cached)
+        result["cached"] = True
+        _falcon_update_stop_health(result)
+        return result
+    identity = falcon_position_identity(pos)
+    remaining = falcon_real_remaining_qty(pos)
+    stop_order_id = pos.get("broker_stop_order_id") or pos.get("disaster_stop_order_id")
+    result = {
+        "ok": False,
+        "status": "STOP_VERIFICATION_NOT_RUN",
+        "management_allowed": False,
+        "central_only_reconcile_required": False,
+        "failsafe_eligible": False,
+        "read_only": True,
+        "sent": False,
+        "stop_order_id": str(stop_order_id) if stop_order_id not in (None, "") else None,
+        "entry_order_id": identity.get("order_id"),
+        "entry_order_status": "UNKNOWN",
+        "entry_order_filled_qty": None,
+        "entry_ownership_verified": False,
+        "trigger_price": safe_float(pos.get("broker_stop_price"), safe_float(pos.get("stop"), None)),
+        "trigger_type": None,
+        "trigger_type_creation_evidence": pos.get("broker_stop_trigger_type"),
+        "stop_order_type": None,
+        "stop_side": pos.get("broker_stop_side"),
+        "stop_position_side": None,
+        "stop_reduce_only": None,
+        "stop_close_position": None,
+        "stop_order_status": "UNKNOWN",
+        "stop_order_active": False,
+        "stop_order_filled": False,
+        "stop_order_triggered": False,
+        "stop_order_cancelled": False,
+        "stop_order_rejected": False,
+        "stop_order_full_fill_confirmed": False,
+        "stop_order_last_checked_at": now_text,
+        "stop_order_last_checked_epoch": now_epoch,
+        "protected_qty": None,
+        "protected_qty_expected": safe_float(pos.get("broker_stop_amount"), remaining),
+        "position_qty": None,
+        "protection_matches_position": False,
+        "stop_anomaly_detected": False,
+        "stop_anomaly_reason": None,
+        "identity": identity,
+    }
+    if central_broker is None or not hasattr(central_broker, "managed_position_snapshot"):
+        result.update({"status": "POSITION_VERIFICATION_HELPER_MISSING", "stop_anomaly_detected": True, "stop_anomaly_reason": "POSITION_VERIFICATION_HELPER_MISSING"})
+    else:
+        try:
+            position_snapshot = central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side"), expected_amount=remaining)
+        except Exception as exc:
+            position_snapshot = {"ok": False, "status": "POSITION_SNAPSHOT_EXCEPTION", "error": str(exc), "read_only": True, "sent": False}
+        result["position_snapshot"] = position_snapshot
+        if not isinstance(position_snapshot, dict) or not position_snapshot.get("ok"):
+            result.update({"status": "POSITION_VERIFICATION_ERROR", "stop_anomaly_detected": True, "stop_anomaly_reason": "POSITION_VERIFICATION_ERROR"})
+        else:
+            position_qty = safe_float(position_snapshot.get("amount"), 0.0)
+            result["position_qty"] = position_qty
+            entry_snapshot = {}
+            entry_order_id = identity.get("order_id")
+            if entry_order_id and hasattr(central_broker, "managed_order_snapshot"):
+                try:
+                    entry_snapshot = central_broker.managed_order_snapshot(pos.get("symbol"), entry_order_id)
+                except Exception as exc:
+                    entry_snapshot = {"ok": False, "status": "ENTRY_ORDER_SNAPSHOT_EXCEPTION", "error": str(exc), "read_only": True, "sent": False}
+            elif not entry_order_id:
+                entry_snapshot = {"ok": False, "status": "ENTRY_ORDER_ID_MISSING", "read_only": True, "sent": False}
+            else:
+                entry_snapshot = {"ok": False, "status": "ORDER_VERIFICATION_HELPER_MISSING", "read_only": True, "sent": False}
+            result["entry_order_snapshot"] = entry_snapshot
+            entry_status = str((entry_snapshot or {}).get("status") or "UNKNOWN").upper().strip()
+            entry_filled = safe_float((entry_snapshot or {}).get("filled"), 0.0)
+            expected_entry_side = "BUY" if identity.get("side") == "LONG" else "SELL"
+            actual_entry_side = str((entry_snapshot or {}).get("side") or "").upper().strip()
+            expected_client_id = str(identity.get("client_order_id") or "").strip()
+            actual_client_id = str((entry_snapshot or {}).get("client_order_id") or "").strip()
+            client_matches = bool(not expected_client_id or (actual_client_id and expected_client_id == actual_client_id))
+            entry_quantity_covers_position = bool(
+                entry_filled > 0
+                and (
+                    position_qty <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+                    or entry_filled + max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, entry_filled * 1e-6) >= position_qty
+                )
+            )
+            entry_ownership_verified = bool(
+                (entry_snapshot or {}).get("ok")
+                and entry_status in {"FILLED", "EXECUTED", "CLOSED"}
+                and actual_entry_side == expected_entry_side
+                and client_matches
+                and entry_quantity_covers_position
+            )
+            result.update({
+                "entry_order_status": entry_status,
+                "entry_order_filled_qty": entry_filled,
+                "entry_order_side": actual_entry_side,
+                "entry_order_client_id": actual_client_id or None,
+                "entry_ownership_verified": entry_ownership_verified,
+            })
+            order_snapshot = {}
+            if stop_order_id and hasattr(central_broker, "managed_order_snapshot"):
+                try:
+                    order_snapshot = central_broker.managed_order_snapshot(pos.get("symbol"), stop_order_id)
+                except Exception as exc:
+                    order_snapshot = {"ok": False, "status": "ORDER_SNAPSHOT_EXCEPTION", "error": str(exc), "read_only": True, "sent": False}
+            elif not stop_order_id:
+                order_snapshot = {"ok": False, "status": "ORDER_ID_MISSING", "read_only": True, "sent": False}
+            else:
+                order_snapshot = {"ok": False, "status": "ORDER_VERIFICATION_HELPER_MISSING", "read_only": True, "sent": False}
+            result["order_snapshot"] = order_snapshot
+            order_status = str((order_snapshot or {}).get("status") or "UNKNOWN").upper().strip()
+            actual_stop_order_id = str((order_snapshot or {}).get("order_id") or (order_snapshot or {}).get("id") or "").strip()
+            stop_order_identity_match = bool(
+                stop_order_id not in (None, "")
+                and actual_stop_order_id
+                and actual_stop_order_id == str(stop_order_id).strip()
+            )
+            flags = _falcon_stop_status_flags(order_status, order_snapshot)
+            filled_qty = safe_float((order_snapshot or {}).get("filled"), 0.0)
+            fill_expected = safe_float(pos.get("broker_stop_amount"), remaining)
+            terminal_stop_evidence = _falcon_protective_stop_evidence(order_snapshot, identity, expected_amount=remaining)
+            full_fill_confirmed = bool(
+                flags["filled"]
+                and result.get("entry_ownership_verified")
+                and str((order_snapshot or {}).get("order_id") or (order_snapshot or {}).get("id") or "").strip() == str(stop_order_id or "").strip()
+                and terminal_stop_evidence.get("protective")
+                and filled_qty > 0
+                and fill_expected is not None
+                and fill_expected > 0
+                and abs(filled_qty - fill_expected) <= max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, max(filled_qty, fill_expected) * 1e-6)
+                and remaining > 0
+                and abs(filled_qty - remaining) <= max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, max(filled_qty, remaining) * 1e-6)
+            )
+            result.update({
+                "stop_order_status": order_status,
+                "stop_order_identity_match": stop_order_identity_match,
+                "stop_order_active": flags["active"],
+                "stop_order_filled": flags["filled"],
+                "stop_order_full_fill_confirmed": full_fill_confirmed,
+                "stop_order_triggered": flags["triggered"],
+                "stop_order_cancelled": flags["cancelled"],
+                "stop_order_rejected": flags["rejected"],
+                "trigger_price": safe_float((order_snapshot or {}).get("stop_price"), result.get("trigger_price")),
+                "trigger_type": (order_snapshot or {}).get("working_type"),
+                "stop_order_type": (order_snapshot or {}).get("type"),
+                "stop_side": (order_snapshot or {}).get("side") or result.get("stop_side"),
+                "stop_position_side": (order_snapshot or {}).get("position_side"),
+                "stop_reduce_only": _falcon_management_bool((order_snapshot or {}).get("reduce_only")),
+                "stop_close_position": _falcon_management_bool((order_snapshot or {}).get("close_position")),
+                "protected_qty": safe_float((order_snapshot or {}).get("remaining"), safe_float((order_snapshot or {}).get("amount"), None)),
+                "terminal_stop_protective_evidence": terminal_stop_evidence,
+            })
+            if position_snapshot.get("position_closed") or position_qty <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE:
+                terminal_or_absent = bool(flags["filled"] or flags["cancelled"] or flags["rejected"] or _falcon_stop_not_found_evidence(order_snapshot))
+                if terminal_or_absent:
+                    manual_suspected = not full_fill_confirmed
+                    result.update({
+                        "ok": True,
+                        "status": "CENTRAL_ONLY_RECONCILE_REQUIRED",
+                        "central_only_reconcile_required": True,
+                        "management_allowed": False,
+                        "stop_anomaly_detected": bool(not full_fill_confirmed or flags["cancelled"] or flags["rejected"]),
+                        "stop_anomaly_reason": "BROKER_FLAT_STOP_NOT_FILLED" if manual_suspected else None,
+                        "manual_user_close_suspected": manual_suspected,
+                        "broker_stop_execution_suspected": bool(full_fill_confirmed),
+                    })
+                else:
+                    result.update({
+                        "status": "BROKER_FLAT_STOP_TERMINAL_STATE_UNCONFIRMED",
+                        "management_allowed": False,
+                        "stop_anomaly_detected": True,
+                        "stop_anomaly_reason": "BROKER_FLAT_WITH_ACTIVE_OR_UNKNOWN_STOP",
+                        "manual_intervention_required": True,
+                    })
+            elif not position_snapshot.get("ownership_safe", True):
+                result.update({"status": "POSITION_OWNERSHIP_UNSAFE", "stop_anomaly_detected": True, "stop_anomaly_reason": "POSITION_AMOUNT_MISMATCH"})
+            elif not order_snapshot.get("ok"):
+                order_error_status = str(order_snapshot.get("status") or "").upper().strip()
+                not_found = order_error_status == "ORDER_ID_MISSING" or _falcon_stop_not_found_evidence(order_snapshot)
+                result.update({
+                    "status": "DISASTER_STOP_NOT_FOUND" if not_found else "STOP_ORDER_VERIFICATION_ERROR",
+                    "stop_anomaly_detected": True,
+                    "stop_anomaly_reason": "DISASTER_STOP_NOT_FOUND" if not_found else "STOP_ORDER_VERIFICATION_ERROR",
+                    "failsafe_eligible": False,
+                    "failsafe_block_reason": "LIFECYCLE_OWNERSHIP_NOT_PROVEN_BY_BROKER_POSITION_SNAPSHOT",
+                    "manual_intervention_required": bool(not_found),
+                })
+            else:
+                protected_qty = safe_float(result.get("protected_qty"), 0.0)
+                quantity_match = bool(protected_qty > 0 and abs(protected_qty - position_qty) <= max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, max(protected_qty, position_qty) * 1e-6))
+                result["protection_matches_position"] = quantity_match
+                protective = _falcon_protective_stop_evidence(order_snapshot, identity, expected_amount=position_qty)
+                protective_type = bool(protective.get("protective"))
+                result["stop_order_protective_evidence"] = protective
+                result["stop_order_protective_verified"] = protective_type
+                if flags["active"] and stop_order_identity_match and quantity_match and protective_type and result.get("entry_ownership_verified"):
+                    result.update({"ok": True, "status": "DISASTER_STOP_ACTIVE_VERIFIED", "management_allowed": True})
+                elif flags["cancelled"] or flags["rejected"] or flags["filled"] or flags["triggered"]:
+                    result.update({
+                        "status": "DISASTER_STOP_INACTIVE_WITH_POSITION_OPEN",
+                        "stop_anomaly_detected": True,
+                        "stop_anomaly_reason": f"STOP_{order_status}_POSITION_STILL_OPEN",
+                        "failsafe_eligible": False,
+                        "failsafe_block_reason": "LIFECYCLE_OWNERSHIP_NOT_PROVEN_BY_BROKER_POSITION_SNAPSHOT",
+                        "manual_intervention_required": True,
+                    })
+                elif flags["active"] and not quantity_match:
+                    result.update({"status": "DISASTER_STOP_QUANTITY_MISMATCH", "stop_anomaly_detected": True, "stop_anomaly_reason": "PROTECTION_QUANTITY_MISMATCH"})
+                elif flags["active"] and not stop_order_identity_match:
+                    result.update({"status": "DISASTER_STOP_IDENTITY_MISMATCH", "stop_anomaly_detected": True, "stop_anomaly_reason": "STOP_ORDER_IDENTITY_MISMATCH"})
+                elif flags["active"] and not protective_type:
+                    result.update({"status": "DISASTER_STOP_EVIDENCE_INSUFFICIENT", "stop_anomaly_detected": True, "stop_anomaly_reason": "STOP_TYPE_SIDE_OR_CLOSE_SEMANTICS_NOT_CONFIRMED"})
+                elif flags["active"] and not result.get("entry_ownership_verified"):
+                    result.update({"status": "ENTRY_LIFECYCLE_OWNERSHIP_NOT_CONFIRMED", "stop_anomaly_detected": True, "stop_anomaly_reason": "ENTRY_ORDER_FILL_IDENTITY_NOT_CONFIRMED"})
+                else:
+                    result.update({"status": "DISASTER_STOP_STATUS_UNKNOWN", "stop_anomaly_detected": True, "stop_anomaly_reason": "DISASTER_STOP_STATUS_UNKNOWN"})
+
+    result["cached"] = False
+    pos["stop_order_id"] = result.get("stop_order_id")
+    pos["stop_order_status"] = result.get("stop_order_status")
+    pos["stop_order_trigger_type"] = result.get("trigger_type")
+    pos["stop_order_type"] = result.get("stop_order_type")
+    pos["stop_order_side"] = result.get("stop_side")
+    pos["stop_position_side"] = result.get("stop_position_side")
+    pos["stop_reduce_only"] = result.get("stop_reduce_only")
+    pos["stop_close_position"] = result.get("stop_close_position")
+    pos["stop_order_active"] = result.get("stop_order_active")
+    pos["stop_order_filled"] = result.get("stop_order_filled")
+    pos["stop_order_full_fill_confirmed"] = result.get("stop_order_full_fill_confirmed")
+    pos["stop_order_cancelled"] = result.get("stop_order_cancelled")
+    pos["stop_order_rejected"] = result.get("stop_order_rejected")
+    pos["stop_order_last_checked_at"] = result.get("stop_order_last_checked_at")
+    pos["stop_order_last_checked_epoch"] = now_epoch
+    pos["protected_qty"] = result.get("protected_qty")
+    pos["position_qty"] = result.get("position_qty")
+    pos["protection_matches_position"] = result.get("protection_matches_position")
+    pos["entry_ownership_verified"] = result.get("entry_ownership_verified")
+    pos["disaster_stop_active_verified"] = bool(result.get("stop_order_active") and result.get("stop_order_identity_match") and result.get("protection_matches_position") and result.get("stop_order_protective_verified") and result.get("entry_ownership_verified"))
+    pos["stop_anomaly_detected"] = result.get("stop_anomaly_detected")
+    pos["stop_anomaly_last_reason"] = result.get("stop_anomaly_reason")
+    pos["central_only_reconcile_required"] = bool(result.get("central_only_reconcile_required"))
+    pos["live_management_block_reason"] = None if result.get("management_allowed") else result.get("status")
+    if result.get("central_only_reconcile_required"):
+        pos["central_only_evidence"] = {
+            "status": "CENTRAL_ONLY_RECONCILE_REQUIRED",
+            "broker_flat": True,
+            "position_closed": True,
+            "position_qty": result.get("position_qty"),
+            "matched_count": (result.get("position_snapshot") or {}).get("matched_count"),
+            "read_only": True,
+            "sent": False,
+            "checked_at": now_text,
+            "checked_epoch": now_epoch,
+            "symbol": identity.get("symbol"),
+            "side": identity.get("side"),
+            "trade_id": identity.get("trade_id"),
+            "lifecycle_id": identity.get("lifecycle_id"),
+            "order_id": identity.get("order_id"),
+            "client_order_id": identity.get("client_order_id"),
+            "stop_order_id": result.get("stop_order_id"),
+            "stop_order_status": result.get("stop_order_status"),
+            "stop_order_active": result.get("stop_order_active"),
+            "stop_order_filled": result.get("stop_order_filled"),
+            "stop_order_full_fill_confirmed": result.get("stop_order_full_fill_confirmed"),
+            "stop_order_cancelled": result.get("stop_order_cancelled"),
+            "stop_order_rejected": result.get("stop_order_rejected"),
+            "stop_order_type": result.get("stop_order_type"),
+            "stop_position_side": result.get("stop_position_side"),
+            "stop_reduce_only": result.get("stop_reduce_only"),
+            "stop_close_position": result.get("stop_close_position"),
+            "trigger_price": result.get("trigger_price"),
+            "trigger_type": result.get("trigger_type"),
+            "manual_user_close_suspected": result.get("manual_user_close_suspected"),
+            "stop_anomaly_suspected": result.get("stop_anomaly_detected"),
+            "stop_order_average": (result.get("order_snapshot") or {}).get("average"),
+            "stop_order_filled_qty": (result.get("order_snapshot") or {}).get("filled"),
+            "stop_order_timestamp": (result.get("order_snapshot") or {}).get("timestamp"),
+        }
+    else:
+        pos.pop("central_only_evidence", None)
+    previous_signature = str(pos.get("stop_verification_signature") or "")
+    signature = "|".join(str(result.get(key)) for key in (
+        "status", "stop_order_status", "stop_order_active", "stop_order_filled",
+        "stop_order_cancelled", "stop_order_rejected", "position_qty", "protected_qty",
+        "protection_matches_position", "entry_ownership_verified", "central_only_reconcile_required",
+    ))
+    pos["stop_verification_signature"] = signature
+    pos["live_stop_verification"] = dict(result)
+    last_persisted = safe_float(pos.get("stop_verification_persisted_epoch"), 0.0)
+    should_persist = bool(persist_registry and (signature != previous_signature or now_epoch - last_persisted >= FALCON_STOP_VERIFY_PERSIST_SECONDS))
+    if should_persist:
+        falcon_update_registry_management(
+            pos,
+            stop_verification={key: result.get(key) for key in (
+                "status", "stop_order_id", "trigger_price", "trigger_type", "stop_order_type", "stop_side",
+                "stop_position_side", "stop_reduce_only", "stop_close_position", "entry_order_id", "entry_order_status",
+                "entry_order_filled_qty", "entry_ownership_verified", "stop_order_status", "stop_order_identity_match", "stop_order_active",
+                "stop_order_filled", "stop_order_full_fill_confirmed", "stop_order_triggered", "stop_order_cancelled",
+                "stop_order_rejected", "stop_order_last_checked_at", "protected_qty", "position_qty",
+                "protection_matches_position", "stop_order_protective_verified", "stop_anomaly_detected", "stop_anomaly_reason",
+                "central_only_reconcile_required", "read_only", "sent",
+            )},
+            central_only_evidence=pos.get("central_only_evidence"),
+            disaster_stop_active_verified=pos.get("disaster_stop_active_verified"),
+            stop_anomaly_detected=pos.get("stop_anomaly_detected"),
+            stop_anomaly_last_reason=pos.get("stop_anomaly_last_reason"),
+        )
+        pos["stop_verification_persisted_epoch"] = now_epoch
+    _falcon_update_stop_health(result)
+    return result
 
 
 def _falcon_resize_runner_stop(pos, runner_amount, stop_price, reason):
@@ -2964,18 +3826,33 @@ def falcon_apply_live_stop_update(pos, new_stop, reason):
     return {"ok": applied, "applied": applied, "status": result.get("status") if isinstance(result, dict) else "STOP_UPDATE_UNKNOWN", "broker_result": result}
 
 
-def falcon_handle_live_stop_cross(pid, pos, price):
+def falcon_handle_live_stop_cross(pid, pos, price, force_fail_safe=False, verified_position_snapshot=None, verified_order_snapshot=None):
     remaining_expected = falcon_real_remaining_qty(pos)
-    snapshot = central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side")) if central_broker and hasattr(central_broker, "managed_position_snapshot") else {"ok": False, "status": "POSITION_HELPER_MISSING"}
+    snapshot = verified_position_snapshot if isinstance(verified_position_snapshot, dict) else (
+        central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side"), expected_amount=remaining_expected) if central_broker and hasattr(central_broker, "managed_position_snapshot") else {"ok": False, "status": "POSITION_HELPER_MISSING"}
+    )
     current_amount = safe_float(snapshot.get("amount"), None) if isinstance(snapshot, dict) else None
     stop_order_id = pos.get("broker_stop_order_id") or pos.get("disaster_stop_order_id")
-    order_snapshot = central_broker.managed_order_snapshot(pos.get("symbol"), stop_order_id) if central_broker and hasattr(central_broker, "managed_order_snapshot") else {}
+    order_snapshot = verified_order_snapshot if isinstance(verified_order_snapshot, dict) else (
+        central_broker.managed_order_snapshot(pos.get("symbol"), stop_order_id) if central_broker and hasattr(central_broker, "managed_order_snapshot") else {}
+    )
 
     if snapshot.get("ok") and snapshot.get("position_closed"):
-        exit_price = safe_float(order_snapshot.get("average"), safe_float(pos.get("stop"), price))
-        HEALTH["last_live_stop_status"] = "BROKER_STOP_CONFIRMED_POSITION_CLOSED"
-        close_position(pid, pos, exit_price, "STOP_BROKER_CONFIRMED")
-        return {"closed": True, "status": "BROKER_STOP_CONFIRMED_POSITION_CLOSED", "snapshot": snapshot, "order_snapshot": order_snapshot}
+        stop_fill = _falcon_confirmed_stop_fill_evidence(pos, pid, order_snapshot, remaining_expected)
+        if stop_fill.get("confirmed"):
+            HEALTH["last_live_stop_status"] = "BROKER_STOP_CONFIRMED_POSITION_CLOSED"
+            close_position(pid, pos, stop_fill.get("average"), "STOP_BROKER_CONFIRMED")
+            return {"closed": True, "status": "BROKER_STOP_CONFIRMED_POSITION_CLOSED", "snapshot": snapshot, "order_snapshot": order_snapshot}
+        verification = falcon_verify_live_disaster_stop(pos, force=True)
+        HEALTH["last_live_stop_status"] = verification.get("status")
+        return {
+            "closed": False,
+            "status": verification.get("status") or "BROKER_FLAT_WITHOUT_CONFIRMED_STOP_FILL",
+            "central_only_reconcile_required": bool(verification.get("central_only_reconcile_required")),
+            "snapshot": snapshot,
+            "order_snapshot": order_snapshot,
+            "verification": verification,
+        }
 
     if not snapshot.get("ok"):
         HEALTH["last_live_stop_status"] = "STOP_POSITION_SNAPSHOT_ERROR"
@@ -2990,20 +3867,45 @@ def falcon_handle_live_stop_cross(pid, pos, price):
     now = time.time()
     first_seen = safe_float(pos.get("live_stop_crossed_epoch"), None)
     order_status = str((order_snapshot or {}).get("status") or "UNKNOWN").upper()
-    stop_invalid = order_status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "ERROR", "ORDER_SNAPSHOT_ERROR"}
+    # Erro transitório de leitura não prova ausência do stop e nunca acelera um
+    # fechamento destrutivo. Somente um estado factual inativo/not-found pode
+    # habilitar a política fail-safe existente.
+    order_flags = _falcon_stop_status_flags(order_status, order_snapshot)
+    stop_invalid = bool(order_flags.get("cancelled") or order_flags.get("rejected") or order_flags.get("filled") or _falcon_stop_not_found_evidence(order_snapshot))
     if first_seen is None:
         pos["live_stop_crossed_epoch"] = now
         pos["live_stop_crossed_at"] = data_hora_sp_str()
         record_event("LIVE_STOP_TRIGGER_WAIT", pos, {"price": price, "broker_snapshot": snapshot, "stop_order": order_snapshot})
-        if not (FALCON_MANAGEMENT_FAILSAFE_ENABLED and stop_invalid):
+        if not (FALCON_MANAGEMENT_FAILSAFE_ENABLED and (stop_invalid or force_fail_safe)):
             HEALTH["last_live_stop_status"] = "WAITING_BROKER_STOP_EXECUTION"
             return {"closed": False, "status": "WAITING_BROKER_STOP_EXECUTION", "snapshot": snapshot, "order_snapshot": order_snapshot}
         first_seen = now - FALCON_MANAGEMENT_STOP_GRACE_SECONDS
 
     elapsed = now - first_seen
-    if not FALCON_MANAGEMENT_FAILSAFE_ENABLED or (elapsed < FALCON_MANAGEMENT_STOP_GRACE_SECONDS and not stop_invalid):
+    if not FALCON_MANAGEMENT_FAILSAFE_ENABLED or (elapsed < FALCON_MANAGEMENT_STOP_GRACE_SECONDS and not stop_invalid and not force_fail_safe):
         HEALTH["last_live_stop_status"] = "WAITING_BROKER_STOP_EXECUTION"
         return {"closed": False, "status": "WAITING_BROKER_STOP_EXECUTION", "elapsed": elapsed, "snapshot": snapshot, "order_snapshot": order_snapshot}
+
+    protective_evidence = _falcon_protective_stop_evidence(
+        order_snapshot,
+        falcon_position_identity(pos, position_id=pid),
+        expected_amount=remaining_expected,
+    )
+    protective_order_proven = bool(
+        stop_order_id
+        and protective_evidence.get("protective")
+        and pos.get("entry_ownership_verified") is True
+    )
+    if not protective_order_proven:
+        HEALTH["last_live_stop_status"] = "STOP_FAILSAFE_OWNERSHIP_EVIDENCE_INSUFFICIENT"
+        HEALTH["last_real_management_error"] = "STOP_FAILSAFE_OWNERSHIP_EVIDENCE_INSUFFICIENT"
+        return {
+            "closed": False,
+            "status": "STOP_FAILSAFE_OWNERSHIP_EVIDENCE_INSUFFICIENT",
+            "manual_intervention_required": True,
+            "snapshot": snapshot,
+            "order_snapshot": order_snapshot,
+        }
 
     # Evita que um stop residual dispare depois do market fail-safe e reverta a perna.
     cancel_result = None
@@ -3014,16 +3916,32 @@ def falcon_handle_live_stop_cross(pid, pos, price):
             cancel_result = central_broker.cancel_managed_stop_order(pos.get("symbol"), stop_order_id, execution_auth_token=cancel_token, reason="STOP_FAILSAFE_PRE_CLOSE")
 
     # Reconsulta após tentar cancelar: se o stop executou nesse intervalo, não envia market duplicado.
-    post_cancel_snapshot = central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side"))
+    post_cancel_snapshot = central_broker.managed_position_snapshot(pos.get("symbol"), pos.get("side"), expected_amount=remaining_expected)
     if isinstance(post_cancel_snapshot, dict) and post_cancel_snapshot.get("position_closed"):
-        exit_price = safe_float((order_snapshot or {}).get("average"), safe_float(pos.get("stop"), price))
-        HEALTH["last_live_stop_status"] = "BROKER_STOP_CONFIRMED_AFTER_CANCEL_RACE"
-        close_position(pid, pos, exit_price, "STOP_BROKER_CONFIRMED")
-        return {"closed": True, "status": "BROKER_STOP_CONFIRMED_AFTER_CANCEL_RACE", "cancel_stop": cancel_result, "snapshot": post_cancel_snapshot}
+        final_order_snapshot = central_broker.managed_order_snapshot(pos.get("symbol"), stop_order_id) if hasattr(central_broker, "managed_order_snapshot") else order_snapshot
+        final_stop_fill = _falcon_confirmed_stop_fill_evidence(pos, pid, final_order_snapshot, remaining_expected)
+        if final_stop_fill.get("confirmed"):
+            HEALTH["last_live_stop_status"] = "BROKER_STOP_CONFIRMED_AFTER_CANCEL_RACE"
+            close_position(pid, pos, final_stop_fill.get("average"), "STOP_BROKER_CONFIRMED")
+            return {"closed": True, "status": "BROKER_STOP_CONFIRMED_AFTER_CANCEL_RACE", "cancel_stop": cancel_result, "snapshot": post_cancel_snapshot, "order_snapshot": final_order_snapshot}
+        verification = falcon_verify_live_disaster_stop(pos, force=True)
+        HEALTH["last_live_stop_status"] = verification.get("status")
+        return {
+            "closed": False,
+            "status": verification.get("status") or "BROKER_FLAT_AFTER_CANCEL_WITHOUT_CONFIRMED_FILL",
+            "central_only_reconcile_required": bool(verification.get("central_only_reconcile_required")),
+            "cancel_stop": cancel_result,
+            "snapshot": post_cancel_snapshot,
+            "order_snapshot": final_order_snapshot,
+            "verification": verification,
+        }
     post_cancel_amount = safe_float((post_cancel_snapshot or {}).get("amount"), current_amount)
     if not (isinstance(post_cancel_snapshot, dict) and post_cancel_snapshot.get("ok")):
         HEALTH["last_live_stop_status"] = "STOP_FAILSAFE_POST_CANCEL_SNAPSHOT_ERROR"
         return {"closed": False, "status": "STOP_FAILSAFE_POST_CANCEL_SNAPSHOT_ERROR", "cancel_stop": cancel_result, "snapshot": post_cancel_snapshot}
+    if not post_cancel_snapshot.get("ownership_safe") or abs((post_cancel_amount or 0.0) - remaining_expected) > max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, remaining_expected * 1e-6):
+        HEALTH["last_live_stop_status"] = "STOP_FAILSAFE_POST_CANCEL_OWNERSHIP_UNSAFE"
+        return {"closed": False, "status": "STOP_FAILSAFE_POST_CANCEL_OWNERSHIP_UNSAFE", "cancel_stop": cancel_result, "snapshot": post_cancel_snapshot}
 
     close_auth = falcon_issue_management_token(pos, "STOP_FAILSAFE_CLOSE", {"amount": post_cancel_amount})
     close_token = close_auth.get("token") if isinstance(close_auth, dict) else None
@@ -3073,6 +3991,70 @@ def management_loop():
                 tp50 = safe_float(pos["tp50"])
                 initial_stop = safe_float(pos.get("initial_stop", stop))
                 is_real = falcon_is_live_real_position(pos)
+
+                live_mode = str(pos.get("execution_mode") or "").upper() == "LIVE" or str(pos.get("registry_mode") or "").upper() == "REAL"
+                if live_mode and not is_real:
+                    pos["live_management_block_reason"] = "LIVE_ORDER_IDENTITY_INSUFFICIENT"
+                    pos["stop_anomaly_detected"] = True
+                    pos["stop_anomaly_last_reason"] = "LIVE_ORDER_IDENTITY_INSUFFICIENT"
+                    HEALTH["falcon_stop_anomaly_detected"] = True
+                    HEALTH["falcon_stop_anomaly_last_reason"] = "LIVE_ORDER_IDENTITY_INSUFFICIENT"
+                    alert = falcon_management_alert_decision(pos, "LIVE_ORDER_IDENTITY_INSUFFICIENT", position_id=pid)
+                    if alert.get("send"):
+                        record_event("FALCON_LIVE_IDENTITY_INSUFFICIENT", pos, {"position_id": pid})
+                        safe_send_telegram(
+                            f"FALCON LIVE IDENTITY INSUFFICIENT - {symbol}\n\n"
+                            f"Side: {side}\n"
+                            f"A gestao LIVE foi bloqueada antes de TP50, BE, trailing ou close.\n"
+                            f"Reconciliacao manual e necessaria.",
+                            event_type="FALCON_LIVE_IDENTITY_INSUFFICIENT",
+                            mode="LIVE",
+                            operational_critical=True,
+                        )
+                    positions[pid] = pos
+                    continue
+
+                # Preflight obrigatório: nenhuma gestão normal pode ocorrer se
+                # a perna já não existe no broker ou se a proteção física está
+                # factual/criticamente inválida.
+                if is_real:
+                    verification = falcon_verify_live_disaster_stop(pos)
+                    if not verification.get("management_allowed"):
+                        reason = str(verification.get("status") or "LIVE_MANAGEMENT_PREFLIGHT_BLOCKED")
+                        alert = falcon_management_alert_decision(pos, reason, position_id=pid)
+                        if verification.get("central_only_reconcile_required"):
+                            if alert.get("send"):
+                                record_event("FALCON_CENTRAL_ONLY_RECONCILE_REQUIRED", pos, {"verification": verification})
+                                safe_send_telegram(
+                                    f"🔴 FALCON CENTRAL-ONLY RECONCILE REQUIRED - {symbol}\n\n"
+                                    f"Side: {side}\n"
+                                    f"Order: {pos.get('live_order_id') or pos.get('bingx_order_id')}\n"
+                                    f"Client: {pos.get('live_client_order_id')}\n"
+                                    f"A BingX está flat; TP50, parcial, BE, trailing e close normal foram interrompidos.\n"
+                                    f"Use /falcon/centralonly/reconcile/text para preview factual.",
+                                    event_type="FALCON_CENTRAL_ONLY_RECONCILE_REQUIRED",
+                                    mode="LIVE",
+                                    operational_critical=True,
+                                )
+                            positions[pid] = pos
+                            continue
+
+                        if alert.get("send"):
+                            record_event("FALCON_DISASTER_STOP_VERIFICATION_BLOCKED", pos, {"verification": verification})
+                            safe_send_telegram(
+                                f"🔴 FALCON DISASTER STOP VERIFICATION BLOCKED - {symbol}\n\n"
+                                f"Side: {side}\n"
+                                f"Status: {verification.get('status')}\n"
+                                f"Stop order: {verification.get('stop_order_id')} / {verification.get('stop_order_status')}\n"
+                                f"Posição broker: {verification.get('position_qty')}\n"
+                                f"Gestão normal bloqueada; intervenção manual pode ser necessária.",
+                                event_type="FALCON_DISASTER_STOP_ANOMALY",
+                                mode="LIVE",
+                                operational_critical=True,
+                            )
+
+                        positions[pid] = pos
+                        continue
 
                 price = safe_fetch_price(symbol)
                 if price is None:
@@ -3127,14 +4109,17 @@ def management_loop():
                             else:
                                 record_event("TP50_MANAGEMENT_PENDING", pos, {"price": price, "tp50_real_execution": tp50_real_execution})
                                 if not tp50_real_execution.get("ok"):
-                                    safe_send_telegram(
-                                        f"🔴 TP50 REAL NÃO CONFIRMADO - {symbol}\n\n"
-                                        f"Status: {tp50_real_execution.get('status')}\n"
-                                        f"Nenhuma nova parcial será presumida como executada.",
-                                        event_type="LIVE_MANAGEMENT_ERROR",
-                                        mode="LIVE",
-                                        operational_critical=True,
-                                    )
+                                    tp50_reason = f"TP50:{tp50_real_execution.get('status') or 'NOT_CONFIRMED'}"
+                                    tp50_alert = falcon_management_alert_decision(pos, tp50_reason, position_id=pid)
+                                    if tp50_alert.get("send"):
+                                        safe_send_telegram(
+                                            f"🔴 TP50 REAL NÃO CONFIRMADO - {symbol}\n\n"
+                                            f"Status: {tp50_real_execution.get('status')}\n"
+                                            f"Nenhuma nova parcial será presumida como executada.",
+                                            event_type="LIVE_MANAGEMENT_ERROR",
+                                            mode="LIVE",
+                                            operational_critical=True,
+                                        )
 
                 current_r = r_for_side(side, entry, initial_stop, price)
 
@@ -3177,6 +4162,7 @@ def management_loop():
             for pid in closed_pids:
                 positions.pop(pid, None)
 
+            falcon_refresh_management_safety_health(positions)
             save_positions(positions)
             HEALTH["last_management_run"] = data_hora_sp_str()
             HEALTH["last_success"] = data_hora_sp_str()
@@ -3195,12 +4181,32 @@ _ORIGINAL_HEALTH_PAYLOAD_BEFORE_RPM_V1 = health_payload
 
 def health_payload():
     payload = _ORIGINAL_HEALTH_PAYLOAD_BEFORE_RPM_V1()
+    safety_fields = [
+        "falcon_central_only_pending_count",
+        "falcon_disaster_stop_active_verified",
+        "falcon_disaster_stop_trigger_type",
+        "falcon_disaster_stop_order_status",
+        "falcon_disaster_stop_order_id",
+        "falcon_disaster_stop_last_checked_at",
+        "falcon_disaster_stop_protection_matches_position",
+        "falcon_stop_anomaly_detected",
+        "falcon_stop_anomaly_last_reason",
+        "falcon_management_spam_guard_status",
+        "falcon_management_spam_guard_last_reason",
+        "falcon_management_spam_guard_suppressed_count",
+        "falcon_management_spam_guard_last_suppressed_at",
+    ]
+    for field in safety_fields:
+        payload[field] = HEALTH.get(field)
     payload["real_position_management"] = {
         "version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
         "enabled": True,
         "failsafe_enabled": FALCON_MANAGEMENT_FAILSAFE_ENABLED,
         "stop_grace_seconds": FALCON_MANAGEMENT_STOP_GRACE_SECONDS,
         "tp50_retry_seconds": FALCON_TP50_RETRY_SECONDS,
+        "stop_verify_interval_seconds": FALCON_STOP_VERIFY_INTERVAL_SECONDS,
+        "stop_verify_persist_seconds": FALCON_STOP_VERIFY_PERSIST_SECONDS,
+        "management_alert_cooldown_seconds": FALCON_MANAGEMENT_ALERT_COOLDOWN_SECONDS,
         "broker_helpers": {
             "managed_position_snapshot": bool(central_broker is not None and hasattr(central_broker, "managed_position_snapshot")),
             "managed_close_position_market": bool(central_broker is not None and hasattr(central_broker, "managed_close_position_market")),
@@ -3212,6 +4218,8 @@ def health_payload():
         "last_tp50_status": HEALTH.get("last_tp50_execution_status"),
         "last_stop_replace_status": HEALTH.get("last_stop_replace_status"),
         "last_live_stop_status": HEALTH.get("last_live_stop_status"),
+        "disaster_stop_verification": {field: HEALTH.get(field) for field in safety_fields if field.startswith("falcon_disaster_stop_") or field.startswith("falcon_stop_anomaly_")},
+        "spam_guard": {field: HEALTH.get(field) for field in safety_fields if field.startswith("falcon_management_spam_guard_")},
         "rules": [
             "LIVE TP50 exige confirmação da redução e proteção do runner.",
             "BE/trailing local só muda após confirmação do stop na BingX.",

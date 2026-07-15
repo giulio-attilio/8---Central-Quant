@@ -73,6 +73,7 @@ def test_live_order_projection_preserves_complete_factual_stop_without_importing
             "side": "buy",
             "amount": 0.12,
             "stop_price": 77.5585142857143,
+            "working_type": "MARK_PRICE",
         },
     }
 
@@ -81,6 +82,7 @@ def test_live_order_projection_preserves_complete_factual_stop_without_importing
     assert projected["broker_stop_order_id"] == "2077030444402577408"
     assert projected["lifecycle_id"] == "CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-1784037618"
     assert projected["broker_stop_status"] == "DISASTER_STOP_CREATED"
+    assert projected["broker_stop_trigger_type"] == "MARK_PRICE"
     assert projected["broker_stop_side"] == "buy"
     assert projected["broker_stop_symbol"] == "SOL/USDT:USDT"
     assert projected["broker_stop_confirmed_at"] == "14/07/2026 11:00:22"

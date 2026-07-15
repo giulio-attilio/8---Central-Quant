@@ -280,7 +280,6 @@ def register_open_trade(
     client_order_id: Any = None,
     **extra: Any,
 ) -> Dict[str, Any]:
-    registry = load_registry()
     bot_n = str(bot or "UNKNOWN").upper().strip()
     setup_n = str(setup or "DEFAULT").upper().strip()
     symbol_n = _normalize_symbol(symbol)
@@ -325,28 +324,34 @@ def register_open_trade(
         if value is not None:
             trade[key] = value
     trade = _normalize_trade_record(trade)
-    registry["open_trades"][trade_id] = trade
-    save_registry(registry)
+    # Registry mutations are whole-document writes.  Hold the same reentrant
+    # lock across load/modify/save so an older writer cannot resurrect a trade
+    # that reconciliation has already moved to CLOSED.
+    with _lock:
+        registry = load_registry()
+        registry["open_trades"][trade_id] = trade
+        save_registry(registry)
     _observe_shadow_registry_snapshot("SIGNAL_CREATED", trade)
     return {"ok": True, "action": "OPEN_REGISTERED", "trade_id": trade_id, "trade": trade}
 
 
 def update_trade(trade_id: str, **updates: Any) -> Dict[str, Any]:
-    registry = load_registry()
-    trade = registry["open_trades"].get(trade_id)
-    if not trade:
-        return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
-    for key, value in updates.items():
-        if value is None:
-            continue
-        if key == "metadata" and isinstance(value, dict):
-            trade.setdefault("metadata", {}).update(value)
-        else:
-            trade[key] = value
-    trade["last_update"] = _now()
-    trade = _normalize_trade_record(trade)
-    registry["open_trades"][trade_id] = trade
-    save_registry(registry)
+    with _lock:
+        registry = load_registry()
+        trade = registry["open_trades"].get(trade_id)
+        if not trade:
+            return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if key == "metadata" and isinstance(value, dict):
+                trade.setdefault("metadata", {}).update(value)
+            else:
+                trade[key] = value
+        trade["last_update"] = _now()
+        trade = _normalize_trade_record(trade)
+        registry["open_trades"][trade_id] = trade
+        save_registry(registry)
     _observe_shadow_registry_snapshot("TRADE_UPDATED", trade)
     return {"ok": True, "action": "TRADE_UPDATED", "trade_id": trade_id, "trade": trade}
 
@@ -407,23 +412,24 @@ def update_closed_trade(
     metadata: Optional[Dict[str, Any]] = None,
     **updates: Any,
 ) -> Dict[str, Any]:
-    registry = load_registry()
-    closed_trades = registry.get("closed_trades", [])
-    index = _closed_trade_index(closed_trades, trade_id=trade_id, bot=bot, symbol=symbol, side=side, setup=setup)
-    if index is None:
-        return {"ok": False, "error": "CLOSED_TRADE_NOT_FOUND", "trade_id": trade_id}
+    with _lock:
+        registry = load_registry()
+        closed_trades = registry.get("closed_trades", [])
+        index = _closed_trade_index(closed_trades, trade_id=trade_id, bot=bot, symbol=symbol, side=side, setup=setup)
+        if index is None:
+            return {"ok": False, "error": "CLOSED_TRADE_NOT_FOUND", "trade_id": trade_id}
 
-    trade = dict(closed_trades[index])
-    for key, value in updates.items():
-        if value is not None:
-            trade[key] = value
-    if metadata:
-        trade.setdefault("metadata", {}).update(metadata)
-    trade["last_update"] = _now()
-    trade = _normalize_trade_record(trade)
-    closed_trades[index] = trade
-    registry["closed_trades"] = closed_trades
-    save_registry(registry)
+        trade = dict(closed_trades[index])
+        for key, value in updates.items():
+            if value is not None:
+                trade[key] = value
+        if metadata:
+            trade.setdefault("metadata", {}).update(metadata)
+        trade["last_update"] = _now()
+        trade = _normalize_trade_record(trade)
+        closed_trades[index] = trade
+        registry["closed_trades"] = closed_trades
+        save_registry(registry)
     _observe_shadow_registry_snapshot("OUTCOME_CONFIRMED", trade)
     return {
         "ok": True,
@@ -460,6 +466,37 @@ def set_trade_registry_mode(
     return update_closed_trade(trade_id=trade_id, registry_mode=mode, metadata=metadata)
 
 
+def _identity_value(trade: Dict[str, Any], field: str) -> Any:
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    aliases = {
+        "lifecycle_id": ("lifecycle_id",),
+        "order_id": ("broker_order_id", "order_id", "live_order_id", "entry_order_id"),
+        "client_order_id": ("client_order_id", "clientOrderId", "client_tag"),
+    }
+    for key in aliases.get(field, (field,)):
+        value = trade.get(key)
+        if value in (None, ""):
+            value = metadata.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _identity_matches(trade: Dict[str, Any], expected_identity: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
+    expected = expected_identity if isinstance(expected_identity, dict) else {}
+    compared = {}
+    for field in ("lifecycle_id", "order_id", "client_order_id"):
+        expected_value = expected.get(field)
+        if expected_value in (None, ""):
+            continue
+        current_value = _identity_value(trade, field)
+        compared[field] = {"expected": str(expected_value), "current": None if current_value in (None, "") else str(current_value)}
+        if current_value in (None, "") or str(current_value) != str(expected_value):
+            return False, compared
+    return bool(compared), compared
+
+
 def close_trade(
     trade_id: str,
     exit_price: Any = None,
@@ -472,59 +509,119 @@ def close_trade(
     fee: Any = None,
     funding: Any = None,
     broker_close_order_id: Any = None,
+    expected_identity: Optional[Dict[str, Any]] = None,
+    clear_financial_results: bool = False,
     **extra: Any,
 ) -> Dict[str, Any]:
-    registry = load_registry()
-    trade = registry["open_trades"].pop(trade_id, None)
-    if not trade:
-        existing = get_closed_trade(trade_id=trade_id)
-        if existing.get("ok"):
-            return update_closed_trade(
-                trade_id=trade_id,
-                exit_price=exit_price,
-                pnl_pct=pnl_pct,
-                pnl_r=pnl_r,
-                result_pct=pnl_pct,
-                result_r=pnl_r,
-                close_reason=reason,
-                realized_pnl=realized_pnl,
-                fee=fee,
-                funding=funding,
-                broker_close_order_id=broker_close_order_id,
-                registry_mode=_normalize_mode(registry_mode),
-                metadata=metadata,
-                **extra,
-            )
-        return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
+    with _lock:
+        registry = load_registry()
+        current = registry["open_trades"].get(trade_id)
+        if current and expected_identity is not None:
+            identity_ok, identity_comparison = _identity_matches(current, expected_identity)
+            if not identity_ok:
+                return {
+                    "ok": False,
+                    "error": "TRADE_IDENTITY_MISMATCH",
+                    "trade_id": trade_id,
+                    "identity_comparison": identity_comparison,
+                }
+        trade = registry["open_trades"].pop(trade_id, None)
+        if not trade:
+            existing = get_closed_trade(trade_id=trade_id)
+            if existing.get("ok"):
+                if expected_identity is not None:
+                    identity_ok, identity_comparison = _identity_matches(existing.get("trade") or {}, expected_identity)
+                    if not identity_ok:
+                        return {
+                            "ok": False,
+                            "error": "TRADE_IDENTITY_MISMATCH",
+                            "trade_id": trade_id,
+                            "identity_comparison": identity_comparison,
+                        }
+                    # Compare-and-close callers asked to close an OPEN record.
+                    # A concurrent factual close wins and must never have its
+                    # reason, outcome or economics rewritten by reconciliation.
+                    return {
+                        "ok": True,
+                        "action": "TRADE_ALREADY_CLOSED",
+                        "trade_id": trade_id,
+                        "trade": existing.get("trade"),
+                        "identity_comparison": identity_comparison,
+                    }
+                return update_closed_trade(
+                    trade_id=trade_id,
+                    exit_price=exit_price,
+                    pnl_pct=pnl_pct,
+                    pnl_r=pnl_r,
+                    result_pct=pnl_pct,
+                    result_r=pnl_r,
+                    close_reason=reason,
+                    realized_pnl=realized_pnl,
+                    fee=fee,
+                    funding=funding,
+                    broker_close_order_id=broker_close_order_id,
+                    registry_mode=_normalize_mode(registry_mode),
+                    metadata=metadata,
+                    **extra,
+                )
+            return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
 
-    trade["status"] = "CLOSED"
-    trade["exit_price"] = exit_price
-    trade["pnl_pct"] = pnl_pct
-    trade["pnl_r"] = pnl_r
-    trade["result_pct"] = pnl_pct if pnl_pct is not None else trade.get("result_pct")
-    trade["result_r"] = pnl_r if pnl_r is not None else trade.get("result_r")
-    trade["close_reason"] = reason
-    trade["closed_at"] = _now()
-    trade["closed_epoch"] = time.time()
-    trade["last_update"] = _now()
-    if realized_pnl is not None:
-        trade["realized_pnl"] = realized_pnl
-    if fee is not None:
-        trade["fee"] = fee
-    if funding is not None:
-        trade["funding"] = funding
-    if broker_close_order_id is not None:
-        trade["broker_close_order_id"] = broker_close_order_id
-    if registry_mode is not None:
-        trade["registry_mode"] = _normalize_mode(registry_mode) or str(registry_mode).upper().strip()
-    if metadata:
-        trade.setdefault("metadata", {}).update(metadata)
-    for key, value in extra.items():
-        if value is not None:
-            trade[key] = value
-    trade = _normalize_trade_record(trade)
-    registry["closed_trades"].append(trade)
-    save_registry(registry)
+        trade["status"] = "CLOSED"
+        trade["exit_price"] = exit_price
+        trade["pnl_pct"] = pnl_pct
+        trade["pnl_r"] = pnl_r
+        trade["result_pct"] = None if clear_financial_results else (pnl_pct if pnl_pct is not None else trade.get("result_pct"))
+        trade["result_r"] = None if clear_financial_results else (pnl_r if pnl_r is not None else trade.get("result_r"))
+        if clear_financial_results:
+            # A broker-flat reconciliation without factual close economics must
+            # not leave an older provisional alias available to statistics or
+            # learning.  Explicit metadata is preserved for audit; only the
+            # top-level financial result projections are made unknown.
+            for field in (
+                "pnl_pct",
+                "pnl_r",
+                "result_pct",
+                "result_r",
+                "realized_pnl",
+                "realized_pnl_usdt",
+                "net_pnl",
+                "net_pnl_usdt",
+                "pnl_usdt",
+                "profit_usdt",
+                "profit_loss",
+                "r_multiple",
+                "outcome",
+                "outcome_id",
+                "broker_close_order_id",
+                "close_order_id",
+                "close_qty",
+                "closed_qty",
+                "fee",
+                "funding",
+            ):
+                trade[field] = None
+        trade["close_reason"] = reason
+        trade["closed_at"] = _now()
+        trade["closed_epoch"] = time.time()
+        trade["last_update"] = _now()
+        if realized_pnl is not None:
+            trade["realized_pnl"] = realized_pnl
+        if fee is not None:
+            trade["fee"] = fee
+        if funding is not None:
+            trade["funding"] = funding
+        if broker_close_order_id is not None:
+            trade["broker_close_order_id"] = broker_close_order_id
+        if registry_mode is not None:
+            trade["registry_mode"] = _normalize_mode(registry_mode) or str(registry_mode).upper().strip()
+        if metadata:
+            trade.setdefault("metadata", {}).update(metadata)
+        for key, value in extra.items():
+            if value is not None:
+                trade[key] = value
+        trade = _normalize_trade_record(trade)
+        registry["closed_trades"].append(trade)
+        save_registry(registry)
     _observe_shadow_registry_snapshot("CLOSE_CONFIRMED", trade)
     return {"ok": True, "action": "TRADE_CLOSED", "trade_id": trade_id, "trade": trade}
 

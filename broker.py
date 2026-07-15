@@ -3165,6 +3165,7 @@ def managed_position_snapshot(symbol, side, expected_amount=None):
 
 
 def managed_order_snapshot(symbol, order_id):
+    """Read one managed order without mutating it or inferring lifecycle ownership."""
     if not order_id:
         return {"ok": False, "status": "ORDER_ID_MISSING", "sent": False, "read_only": True, "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION}
     try:
@@ -3172,20 +3173,45 @@ def managed_order_snapshot(symbol, order_id):
         order = ex.fetch_order(str(order_id), normalize_symbol(symbol))
         info = order.get("info") if isinstance(order, dict) and isinstance(order.get("info"), dict) else {}
         status = str((order or {}).get("status") or info.get("status") or "UNKNOWN").upper()
+        order_type = str((order or {}).get("type") or info.get("type") or info.get("orderType") or "UNKNOWN").upper()
+        order_side = str((order or {}).get("side") or info.get("side") or "UNKNOWN").upper()
+        factual_order_id = (order or {}).get("id") or info.get("orderId") or info.get("order_id")
         return {
             "ok": True,
             "status": status,
-            "order_id": str(order_id),
+            "order_id": str(factual_order_id) if factual_order_id not in (None, "") else None,
+            "requested_order_id": str(order_id),
+            "client_order_id": (order or {}).get("clientOrderId") or info.get("clientOrderId") or info.get("clientOrderID"),
+            "type": order_type,
+            "side": order_side,
+            "amount": _cq_patch_safe_float((order or {}).get("amount") or info.get("origQty") or info.get("quantity"), None),
             "filled": _cq_patch_safe_float((order or {}).get("filled") or info.get("executedQty"), 0.0),
             "remaining": _cq_patch_safe_float((order or {}).get("remaining"), None),
             "average": _cq_patch_safe_float((order or {}).get("average") or info.get("avgPrice"), None),
+            "timestamp": (order or {}).get("datetime") or (order or {}).get("timestamp") or info.get("updateTime") or info.get("time"),
             "stop_price": _cq_patch_safe_float((order or {}).get("stopLossPrice") or (order or {}).get("stopPrice") or info.get("stopPrice"), None),
+            "working_type": info.get("workingType") or info.get("triggerType"),
+            "position_side": info.get("positionSide"),
+            "reduce_only": (order or {}).get("reduceOnly") if (order or {}).get("reduceOnly") is not None else info.get("reduceOnly"),
+            "close_position": (order or {}).get("closePosition") if (order or {}).get("closePosition") is not None else info.get("closePosition"),
             "read_only": True,
             "sent": False,
             "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
         }
     except Exception as exc:
-        return {"ok": False, "status": "ORDER_SNAPSHOT_ERROR", "order_id": str(order_id), "error": str(exc), "read_only": True, "sent": False, "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION}
+        exc_name = type(exc).__name__
+        order_not_found_type = getattr(ccxt, "OrderNotFound", None)
+        status = "ORDER_NOT_FOUND" if (exc_name == "OrderNotFound" or (order_not_found_type is not None and isinstance(exc, order_not_found_type))) else "ORDER_SNAPSHOT_ERROR"
+        return {
+            "ok": False,
+            "status": status,
+            "order_id": str(order_id),
+            "error_type": exc_name,
+            "error": str(exc),
+            "read_only": True,
+            "sent": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        }
 
 
 def _rpm_live_write_enabled():

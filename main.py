@@ -15635,8 +15635,12 @@ def _central_live_positions_payload():
             )
             if not is_live:
                 continue
+            central_only_evidence = p.get("central_only_evidence") if isinstance(p.get("central_only_evidence"), dict) else {}
             rows.append({
                 "bot": key,
+                "position_id": p.get("id") or p.get("position_id"),
+                "trade_id": p.get("trade_registry_id") or p.get("trade_id"),
+                "lifecycle_id": p.get("lifecycle_id"),
                 "symbol": normalize_symbol_for_risk(p.get("symbol") or p.get("ativo") or p.get("pair")),
                 "side": str(p.get("side") or p.get("direction") or "").upper(),
                 "setup": p.get("setup") or p.get("setup_label"),
@@ -15644,6 +15648,12 @@ def _central_live_positions_payload():
                 "stop": p.get("stop") or p.get("sl") or p.get("stop_atual"),
                 "tp50": p.get("tp50"),
                 "order_id": p.get("live_order_id") or p.get("bingx_order_id"),
+                "client_order_id": p.get("live_client_order_id") or p.get("client_order_id"),
+                "quantity": p.get("remaining_qty") or p.get("runner_qty") or p.get("qty") or p.get("amount"),
+                "execution_mode": p.get("execution_mode"),
+                "registry_mode": p.get("registry_mode"),
+                "central_only_reconcile_required": bool(p.get("central_only_reconcile_required")),
+                "central_only_evidence": _flad_v1_public(central_only_evidence) if callable(globals().get("_flad_v1_public")) else dict(central_only_evidence),
             })
     return rows
 
@@ -45130,6 +45140,11 @@ def bot_health(key: str, cfg: dict):
         payload["health"] = health
         if str(key).upper() == "PREDATOR":
             payload.update(overlay)
+        if str(key).upper() == "FALCON" and callable(globals().get("_fcor_v1_health_overlay")):
+            falcon_overlay = _fcor_v1_health_overlay()
+            health.update(falcon_overlay)
+            payload["health"] = health
+            payload.update(falcon_overlay)
     except Exception as exc:
         try:
             payload.setdefault("health", {})["trade_registry_storage_overlay_error"] = str(exc)
@@ -46676,12 +46691,18 @@ def _flad_v1_bad_event_acked(e, audit_payload=None):
 
 
 def _flad_v1_event_key(e):
+    phase = _flad_v1_upper(
+        _flad_v1_event_status(e)
+        or (e.get("event") if isinstance(e, dict) else None)
+        or (e.get("event_type") if isinstance(e, dict) else None)
+        or "UNKNOWN"
+    )
     oid = _flad_v1_event_order_id(e)
     if oid not in (None, ""):
-        return "ORDER|" + str(oid)
+        return "ORDER|" + str(oid) + "|" + phase
     client = _flad_v1_event_client_id(e)
     if client not in (None, ""):
-        return "CLIENT|" + str(client)
+        return "CLIENT|" + str(client) + "|" + phase
     try:
         if callable(globals().get("_fleag_v1_bad_event_canonical_key_v1_3")):
             return _fleag_v1_bad_event_canonical_key_v1_3(e)
@@ -46765,6 +46786,14 @@ def _flad_v1_disaster_stop_detail(e):
     })
 
 
+def _flad_v1_is_managed_close_confirmed(e):
+    if not isinstance(e, dict):
+        return False
+    status = _flad_v1_event_status(e)
+    event_name = _flad_v1_upper(e.get("event") or e.get("event_type") or e.get("action"))
+    return "MANAGED_CLOSE_CONFIRMED" in {status, event_name}
+
+
 def _flad_v1_build_event_detail(e, audit_payload=None, state=None):
     state = state if isinstance(state, dict) else {}
     status = _flad_v1_event_status(e)
@@ -46775,21 +46804,32 @@ def _flad_v1_build_event_detail(e, audit_payload=None, state=None):
     client_id = _flad_v1_event_client_id(e)
     symbol = _flad_v1_norm_symbol(_flad_v1_deep_find(e, ["symbol", "market_symbol", "pair", "instrument", "asset"]) or (e.get("symbol") if isinstance(e, dict) else None))
     side = _flad_v1_norm_side(_flad_v1_deep_find(e, ["side", "position_side", "positionSide", "direction"]) or (e.get("side") if isinstance(e, dict) else None))
+    management_confirmed = _flad_v1_is_managed_close_confirmed(e)
     if acked_history:
         review_status = "HISTORICAL_ACKED_FAILURE"
         action_required = False
+        tracking_active = False
     elif bad_stop:
         review_status = "LIVE_FAILURE_REQUIRES_REVIEW"
         action_required = True
+        tracking_active = False
+    elif management_confirmed:
+        review_status = "HISTORICAL_MANAGEMENT_CONFIRMED"
+        action_required = False
+        tracking_active = False
     else:
         review_status = "LIVE_ORDER_REQUIRES_TRACKING"
         action_required = True
+        tracking_active = True
     return _flad_v1_public({
         "order_key": _flad_v1_event_key(e),
         "review_status": review_status,
         "action_required": action_required,
         "historical_acked": acked_history,
         "bad_stop_event": bad_stop,
+        "management_event": management_confirmed,
+        "tracking_active": tracking_active,
+        "reconciliation_required": False,
         "ts": e.get("ts") if isinstance(e, dict) else None,
         "generated_at": e.get("generated_at") if isinstance(e, dict) else None,
         "bot": _flad_v1_infer_bot(e),
@@ -46820,6 +46860,49 @@ def _flad_v1_build_event_detail(e, audit_payload=None, state=None):
     })
 
 
+def _flad_v1_central_only_identity_index():
+    out = {"order_ids": set(), "client_order_ids": set(), "trade_ids": set(), "rows": []}
+    try:
+        rows = _central_live_positions_payload() if callable(globals().get("_central_live_positions_payload")) else []
+    except Exception:
+        rows = []
+    for row in rows or []:
+        if not isinstance(row, dict) or str(row.get("bot") or "").upper() != "FALCON" or not row.get("central_only_reconcile_required"):
+            continue
+        evidence = row.get("central_only_evidence") if isinstance(row.get("central_only_evidence"), dict) else {}
+        if evidence.get("broker_flat") is not True or evidence.get("read_only") is not True or evidence.get("sent") is not False:
+            continue
+        order_id = row.get("order_id") or evidence.get("order_id")
+        client_id = row.get("client_order_id") or evidence.get("client_order_id")
+        trade_id = row.get("trade_id") or evidence.get("trade_id")
+        if order_id not in (None, ""):
+            out["order_ids"].add(str(order_id).strip())
+        if client_id not in (None, ""):
+            out["client_order_ids"].add(str(client_id).strip().lower())
+        if trade_id not in (None, ""):
+            out["trade_ids"].add(str(trade_id).strip())
+        if order_id not in (None, "") or client_id not in (None, ""):
+            out["rows"].append(_flad_v1_public(row))
+    return out
+
+
+def _flad_v1_detail_is_central_only(detail, central_only_index=None):
+    if not isinstance(detail, dict):
+        return False
+    index = central_only_index if isinstance(central_only_index, dict) else _flad_v1_central_only_identity_index()
+    order_id = str(detail.get("order_id") or "").strip()
+    client_id = str(detail.get("client_order_id") or "").strip().lower()
+    symbol = _flad_v1_norm_symbol(detail.get("symbol"))
+    side = _flad_v1_norm_side(detail.get("side"))
+    for row in index.get("rows") or []:
+        row_order = str(row.get("order_id") or "").strip()
+        row_client = str(row.get("client_order_id") or "").strip().lower()
+        id_matches = bool((order_id and row_order == order_id) or (client_id and row_client == client_id))
+        if id_matches and symbol and side and _flad_v1_norm_symbol(row.get("symbol")) == symbol and _flad_v1_norm_side(row.get("side")) == side:
+            return True
+    return False
+
+
 def _flad_v1_build_payload(limit=100):
     try:
         audit = falcon_live_execution_audit_guard_v1_status(include_recent=True)
@@ -46829,35 +46912,31 @@ def _flad_v1_build_payload(limit=100):
     events = _flad_v1_read_falcon_live_order_events(limit=limit)
     details = [_flad_v1_build_event_detail(e, audit_payload=audit, state=state) for e in events]
     reconciled_index = _live_v12_reconciled_closed_order_index()
+    central_only_index = _flad_v1_central_only_identity_index()
     # A identidade exata da ordem reconciliada prevalece sobre posições manuais
     # abertas em outros símbolos. Posições externas são informativas e não
     # reabrem tracking nem bloqueiam o Falcon.
     for d in details:
-        if d.get("review_status") == "LIVE_ORDER_REQUIRES_TRACKING" and _live_v12_detail_is_reconciled_completed(d, reconciled_index):
+        if d.get("review_status") == "LIVE_ORDER_REQUIRES_TRACKING" and _flad_v1_detail_is_central_only(d, central_only_index):
+            d["review_status"] = "CENTRAL_ONLY_RECONCILE_REQUIRED"
+            d["action_required"] = True
+            d["tracking_active"] = False
+            d["reconciliation_required"] = True
+        elif d.get("review_status") == "LIVE_ORDER_REQUIRES_TRACKING" and _live_v12_detail_is_reconciled_completed(d, reconciled_index):
             d["review_status"] = "HISTORICAL_COMPLETED_OR_CLOSED"
             d["action_required"] = False
+            d["tracking_active"] = False
             d["completed_by_registry_order_identity"] = True
     historical_acked = [d for d in details if d.get("historical_acked")]
     unacked_failures = [d for d in details if d.get("bad_stop_event") and not d.get("historical_acked")]
-    active_or_tracking = [d for d in details if d.get("action_required") and not d.get("bad_stop_event")]
+    active_or_tracking = [d for d in details if d.get("tracking_active") and not d.get("bad_stop_event")]
+    pending_reconcile = [d for d in details if d.get("reconciliation_required")]
     divergence = audit.get("divergence") if isinstance(audit.get("divergence"), dict) else {}
-    no_open_exposure = (
-        int(divergence.get("broker_bingx_open_count") or 0) == 0
-        and int(divergence.get("central_live_count") or 0) == 0
-        and int(divergence.get("only_bingx_count") or 0) == 0
-        and int(divergence.get("only_central_count") or 0) == 0
-        and int(divergence.get("live_without_stop_count") or 0) == 0
-    )
-    # A real order already closed and reconciled as no-open-position should not keep the system
-    # in LIVE_ORDER_TRACKING_REQUIRED forever. It remains visible as historical completed.
-    if no_open_exposure and not unacked_failures:
-        for d in details:
-            if d.get("review_status") == "LIVE_ORDER_REQUIRES_TRACKING":
-                d["review_status"] = "HISTORICAL_COMPLETED_OR_CLOSED"
-                d["action_required"] = False
-        active_or_tracking = []
     if unacked_failures:
         status = "BLOCKED_UNACKED_LIVE_FAILURE"
+        ok = False
+    elif pending_reconcile:
+        status = "CENTRAL_ONLY_RECONCILE_REQUIRED"
         ok = False
     elif not audit.get("ok"):
         status = "BLOCKED_BY_FALCON_AUDIT"
@@ -46886,6 +46965,7 @@ def _flad_v1_build_payload(limit=100):
             "historical_acked_failures": len(historical_acked),
             "unacked_failures": len(unacked_failures),
             "active_or_tracking_orders": len(active_or_tracking),
+            "central_only_pending_reconcile_orders": len(pending_reconcile),
             "audit_status": audit.get("live_audit_status"),
             "audit_ok": audit.get("ok"),
             "bingx_open_count": divergence.get("broker_bingx_open_count"),
@@ -46942,6 +47022,7 @@ def _flad_v1_text(payload):
         f"- Falhas históricas reconhecidas por ACK: {summary.get('historical_acked_failures')}",
         f"- Falhas ainda não reconhecidas: {summary.get('unacked_failures')}",
         f"- Ordens reais novas/ativas para acompanhar: {summary.get('active_or_tracking_orders')}",
+        f"- Central-only pendentes de reconciliação: {summary.get('central_only_pending_reconcile_orders')}",
         f"- Falcon audit: {summary.get('audit_status')} | ok={summary.get('audit_ok')}",
         f"- BingX abertas: {summary.get('bingx_open_count')} | Central LIVE: {summary.get('central_live_count')}",
         f"- Só BingX: {summary.get('only_bingx_count')} | Só Central: {summary.get('only_central_count')} | LIVE sem stop: {summary.get('live_without_stop_count')}",
@@ -46980,6 +47061,8 @@ def _flad_v1_text(payload):
         lines.append("✅ Só há falha histórica já reconhecida por ACK; não há bloqueio operacional novo.")
     elif payload.get("status") == "LIVE_ORDER_TRACKING_REQUIRED":
         lines.append("⚠️ Há ordem real que precisa ser acompanhada com /live, /sync, /brokerhealth e /falcon/liveaudit/text.")
+    elif payload.get("status") == "CENTRAL_ONLY_RECONCILE_REQUIRED":
+        lines.append("🛑 Há posição somente na Central; a gestão normal permanece bloqueada até reconciliação factual.")
     else:
         lines.append("🛑 Há falha real não reconhecida ou bloqueio do Falcon Audit; não abrir novas entradas.")
     lines += [
@@ -47243,14 +47326,33 @@ def _live_v12_reconciled_closed_order_index():
         if not isinstance(trade, dict):
             continue
         meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+        if str(trade.get("bot") or "").upper().strip() != "FALCON":
+            continue
         status = str(trade.get("status") or "").upper().strip()
         mode = str(trade.get("registry_mode") or meta.get("registry_mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
-        reconciled = bool(trade.get("real_close_reconciled") or meta.get("real_close_reconciled"))
-        if status != "CLOSED" or mode != "REAL" or not reconciled:
+        close_reason = str(trade.get("close_reason") or meta.get("close_reason") or "").upper().strip()
+        factual_close_reasons = {
+            "STOP_BROKER_CONFIRMED",
+            "STOP_FAILSAFE_MARKET",
+            "TP50_FAILSAFE_FULL_CLOSE",
+            "BROKER_RECONCILED_CLOSE",
+            "CENTRAL_ONLY_BROKER_FLAT_RECONCILED",
+            "MANAGED_CLOSE_CONFIRMED",
+        }
+        reconciled = bool(
+            trade.get("real_close_reconciled")
+            or meta.get("real_close_reconciled")
+            or trade.get("central_only_broker_flat_reconciled")
+            or meta.get("central_only_broker_flat_reconciled")
+            or close_reason in factual_close_reasons
+        )
+        if status != "CLOSED" or mode not in {"REAL", "LIVE"} or not reconciled:
             continue
         order_ids = [
             trade.get("broker_order_id"), trade.get("order_id"), trade.get("live_order_id"),
+            trade.get("entry_order_id"), trade.get("broker_close_order_id"), trade.get("close_order_id"),
             meta.get("broker_order_id"), meta.get("order_id"), meta.get("live_order_id"),
+            meta.get("entry_order_id"), meta.get("broker_close_order_id"), meta.get("close_order_id"),
         ]
         client_ids = [
             trade.get("client_order_id"), trade.get("clientOrderId"), trade.get("client_tag"),
@@ -47280,10 +47382,16 @@ def _live_v12_detail_is_reconciled_completed(detail, reconciled_index=None):
     idx = reconciled_index if isinstance(reconciled_index, dict) else _live_v12_reconciled_closed_order_index()
     order_id = str(detail.get("order_id") or "").strip()
     client_id = str(detail.get("client_order_id") or "").strip().lower()
-    return bool(
-        (order_id and order_id in (idx.get("order_ids") or set()))
-        or (client_id and client_id in (idx.get("client_order_ids") or set()))
-    )
+    symbol = _flad_v1_norm_symbol(detail.get("symbol"))
+    side = _flad_v1_norm_side(detail.get("side"))
+    for row in idx.get("rows") or []:
+        id_matches = bool(
+            (order_id and order_id in set(row.get("order_ids") or []))
+            or (client_id and client_id in set(row.get("client_order_ids") or []))
+        )
+        if id_matches and symbol and side and row.get("symbol") == symbol and row.get("side") == side:
+            return True
+    return False
 
 
 def _live_v12_order_detail_match(e, order_detail=None):
@@ -47315,8 +47423,14 @@ def _live_v12_classify_event(e, audit_payload=None, order_detail=None):
         return base or {"class_code": "UNKNOWN", "label": "⚪ UNKNOWN", "safe": True, "historical_acked": False}
 
     bad_stop = _flad_v1_is_bad_stop_event(e)
+    management_confirmed = _flad_v1_is_managed_close_confirmed(e)
     acked_history = bool(bad_stop and _flad_v1_bad_event_acked(e, audit_payload=audit_payload))
     detail_row = _live_v12_order_detail_match(e, order_detail=order_detail)
+    central_only_reconcile = bool(
+        isinstance(detail_row, dict)
+        and detail_row.get("review_status") == "CENTRAL_ONLY_RECONCILE_REQUIRED"
+        and detail_row.get("reconciliation_required")
+    )
     completed_history = bool(
         not bad_stop
         and isinstance(detail_row, dict)
@@ -47331,6 +47445,9 @@ def _live_v12_classify_event(e, audit_payload=None, order_detail=None):
     out["bad_stop_event"] = bad_stop
     out["historical_acked"] = acked_history
     out["historical_completed"] = completed_history
+    out["management_event"] = management_confirmed
+    out["reconciliation_required"] = central_only_reconcile
+    out["tracking_active"] = False
 
     if acked_history:
         out.update({
@@ -47347,6 +47464,23 @@ def _live_v12_classify_event(e, audit_payload=None, order_detail=None):
             "safe_operationally_cleared": True,
             "reason": "ordem real já encerrada; BingX e Central sem posição e detalhe reconciliado como histórico",
         })
+    elif management_confirmed:
+        out.update({
+            "class_code": "LIVE_MANAGEMENT_CONFIRMED_HISTORY",
+            "label": "🟢 LIVE_GESTÃO_CONFIRMADA",
+            "safe": True,
+            "safe_operationally_cleared": True,
+            "reason": "evento de gestão confirmado; não é uma nova ordem de entrada ativa",
+        })
+    elif central_only_reconcile:
+        out.update({
+            "class_code": "LIVE_SENT_CENTRAL_ONLY_RECONCILE",
+            "label": "🟠 LIVE_CENTRAL_ONLY_RECONCILE",
+            "safe": False,
+            "safe_operationally_cleared": False,
+            "tracking_active": False,
+            "reason": "posição existe somente na Central e aguarda reconciliação factual",
+        })
     elif bad_stop:
         out.update({
             "class_code": "LIVE_SENT_UNACKED_FAILURE",
@@ -47358,6 +47492,7 @@ def _live_v12_classify_event(e, audit_payload=None, order_detail=None):
         out.update({
             "class_code": "LIVE_SENT_REAL_TRACKING",
             "label": "🔴 LIVE_SENT_REAL",
+            "tracking_active": True,
             "safe_operationally_cleared": False,
             "reason": "ordem real enviada; acompanhar stop, registry, sync e Telegram",
         })
@@ -47412,6 +47547,7 @@ def build_live_report():
     live_sent_active_or_unacked = 0
     live_sent_historical_acked = 0
     live_sent_completed_history = 0
+    live_sent_central_only_reconcile = 0
     for e in exec_items or []:
         c = _live_v12_classify_event(e, audit_payload=audit_payload, order_detail=order_detail)
         class_code = c.get("class_code")
@@ -47419,6 +47555,8 @@ def build_live_report():
             live_sent_historical_acked += 1
         elif class_code == "LIVE_SENT_COMPLETED_HISTORY":
             live_sent_completed_history += 1
+        elif class_code == "LIVE_SENT_CENTRAL_ONLY_RECONCILE":
+            live_sent_central_only_reconcile += 1
         elif c.get("safe"):
             safe_count += 1
         else:
@@ -47476,6 +47614,7 @@ def build_live_report():
         lines.append(
             f"Eventos lidos: {len(exec_items)} | seguros/sem envio: {safe_count} | "
             f"LIVE histórico ACK: {live_sent_historical_acked} | LIVE histórico concluído: {live_sent_completed_history} | "
+            f"LIVE Central-only: {live_sent_central_only_reconcile} | "
             f"LIVE novo/ativo/não ACK: {live_sent_active_or_unacked}"
         )
         if class_summary:
@@ -47494,6 +47633,7 @@ def build_live_report():
         f"- Falhas históricas ACK: {odsum.get('historical_acked_failures')}",
         f"- Falhas não ACK: {odsum.get('unacked_failures')}",
         f"- Ordens reais novas/ativas p/ acompanhar: {odsum.get('active_or_tracking_orders')}",
+        f"- Central-only pendentes de reconciliação: {odsum.get('central_only_pending_reconcile_orders')}",
     ]
 
     lines += ["", "ÚLTIMAS EXECUÇÕES"]
@@ -47516,6 +47656,8 @@ def build_live_report():
         lines.append("🟡 Há LIVE_SENT histórico já reconhecido por ACK; não é bloqueio novo enquanto Falcon Audit continuar CLEAR.")
     if live_sent_completed_history:
         lines.append("🟢 A ordem real encerrada foi reconciliada como histórico concluído; não exige tracking ativo.")
+    if live_sent_central_only_reconcile:
+        lines.append("🟠 Há posição somente na Central aguardando reconciliação factual; não é tracking normal de ordem ativa.")
     if live_sent_active_or_unacked:
         lines.append("🔴 Há LIVE_SENT novo/ativo ou falha não reconhecida; acompanhar imediatamente com /falcon/liveorder/detail/text e /falcon/liveaudit/text.")
     if manual_awareness.get("status") == "MANUAL_OR_EXTERNAL_POSITION_PRESENT":
@@ -47534,6 +47676,7 @@ def build_live_report():
             "safe_count": safe_count,
             "live_sent_historical_acked": live_sent_historical_acked,
             "live_sent_completed_history": live_sent_completed_history,
+            "live_sent_central_only_reconcile": live_sent_central_only_reconcile,
             "live_sent_active_or_unacked": live_sent_active_or_unacked,
             "broker_bingx_open_count": len(broker_positions or []),
             "central_live_count": len(central_live or []),
@@ -48479,6 +48622,686 @@ def live_trade_snapshot_v1_route():
             "warnings": [],
             "errors": [{"code": "LIVE_TRADE_SNAPSHOT_ROUTE_INTERNAL_ERROR"}],
         }, 500
+
+
+# ============================================================================
+# FALCON CENTRAL-ONLY MANUAL CLOSE RECONCILIATION V1
+# ============================================================================
+FALCON_CENTRAL_ONLY_RECONCILIATION_V1_VERSION = "2026-07-15-FALCON-CENTRAL-ONLY-RECONCILIATION-V1"
+FALCON_CENTRAL_ONLY_RECONCILIATION_V1_ACK = "FALCON_CENTRAL_ONLY_RECONCILE"
+FALCON_CENTRAL_ONLY_RECONCILIATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "falcon_central_only_reconciliation_v1_latest.json"
+FALCON_CENTRAL_ONLY_RECONCILIATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "falcon_central_only_reconciliation_v1_events.jsonl"
+_FCOR_V1_LOCK = threading.RLock()
+_FCOR_V1_STATE = {
+    "status": "NOT_RUN",
+    "last_run": None,
+    "last_error": None,
+    "last_reconciled_count": 0,
+}
+
+
+def _fcor_v1_now():
+    return data_hora_sp_str() if callable(globals().get("data_hora_sp_str")) else datetime.now(timezone.utc).isoformat()
+
+
+def _fcor_v1_falcon_module():
+    modules = globals().get("LOADED_BOTS") or {}
+    return modules.get("FALCON") if isinstance(modules, dict) else None
+
+
+def _fcor_v1_raw_positions():
+    module = _fcor_v1_falcon_module()
+    getter = getattr(module, "get_positions", None) if module is not None else None
+    if not callable(getter):
+        return [], "FALCON_POSITION_READER_UNAVAILABLE"
+    try:
+        raw = getter()
+    except Exception as exc:
+        return [], f"FALCON_POSITION_READ_ERROR:{type(exc).__name__}"
+    if isinstance(raw, dict):
+        return [(str(pid), dict(pos)) for pid, pos in raw.items() if isinstance(pos, dict)], None
+    if isinstance(raw, list):
+        rows = []
+        for index, pos in enumerate(raw):
+            if isinstance(pos, dict):
+                rows.append((str(pos.get("id") or pos.get("position_id") or index), dict(pos)))
+        return rows, None
+    return [], "FALCON_POSITION_STORAGE_INVALID"
+
+
+def _fcor_v1_meta(record):
+    return record.get("metadata") if isinstance(record, dict) and isinstance(record.get("metadata"), dict) else {}
+
+
+def _fcor_v1_value(record, *keys):
+    record = record if isinstance(record, dict) else {}
+    meta = _fcor_v1_meta(record)
+    for key in keys:
+        if record.get(key) not in (None, ""):
+            return record.get(key)
+        if meta.get(key) not in (None, ""):
+            return meta.get(key)
+    return None
+
+
+def _fcor_v1_identity(pos, position_id=None):
+    pos = pos if isinstance(pos, dict) else {}
+    live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+    return {
+        "position_id": str(position_id or pos.get("id") or pos.get("position_id") or "").strip() or None,
+        "trade_id": str(pos.get("trade_registry_id") or pos.get("trade_id") or "").strip() or None,
+        "lifecycle_id": str(pos.get("lifecycle_id") or "").strip() or None,
+        "order_id": str(pos.get("live_order_id") or pos.get("bingx_order_id") or live_order.get("order_id") or live_order.get("id") or "").strip() or None,
+        "client_order_id": str(pos.get("live_client_order_id") or pos.get("client_order_id") or live_order.get("client_order_id") or live_order.get("client_tag") or "").strip() or None,
+        "symbol": _flad_v1_norm_symbol(pos.get("symbol")),
+        "side": _flad_v1_norm_side(pos.get("side")),
+    }
+
+
+def _fcor_v1_registry_identity(trade):
+    return {
+        "trade_id": str(_fcor_v1_value(trade, "trade_id") or "").strip() or None,
+        "lifecycle_id": str(_fcor_v1_value(trade, "lifecycle_id") or "").strip() or None,
+        "order_id": str(_fcor_v1_value(trade, "broker_order_id", "order_id", "live_order_id", "entry_order_id") or "").strip() or None,
+        "client_order_id": str(_fcor_v1_value(trade, "client_order_id", "clientOrderId", "client_tag") or "").strip() or None,
+        "symbol": _flad_v1_norm_symbol(_fcor_v1_value(trade, "symbol")),
+        "side": _flad_v1_norm_side(_fcor_v1_value(trade, "side")),
+    }
+
+
+def _fcor_v1_reconciled_closed_index(registry):
+    closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
+    if isinstance(closed, dict):
+        closed = list(closed.values())
+    out = {}
+    for trade in closed if isinstance(closed, list) else []:
+        if not isinstance(trade, dict):
+            continue
+        meta = _fcor_v1_meta(trade)
+        if str(trade.get("bot") or "").upper() == "FALCON" and bool(trade.get("central_only_broker_flat_reconciled") or meta.get("central_only_broker_flat_reconciled")):
+            trade_id = str(trade.get("trade_id") or "").strip()
+            if trade_id:
+                out[trade_id] = trade
+    return out
+
+
+def _fcor_v1_factual_closed_index(registry):
+    """Index exact terminal Falcon REAL records for stale module cleanup only."""
+    closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
+    if isinstance(closed, dict):
+        closed = list(closed.values())
+    out = {}
+    for trade in closed if isinstance(closed, list) else []:
+        if not isinstance(trade, dict):
+            continue
+        meta = _fcor_v1_meta(trade)
+        mode = str(trade.get("registry_mode") or meta.get("registry_mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
+        trade_id = str(trade.get("trade_id") or "").strip()
+        if str(trade.get("status") or "").upper().strip() == "CLOSED" and str(trade.get("bot") or "").upper().strip() == "FALCON" and mode in {"REAL", "LIVE"} and trade_id:
+            out.setdefault(trade_id, []).append(trade)
+    return out
+
+
+def _fcor_v1_evidence_reasons(pos, identity, now_epoch=None):
+    now_epoch = float(now_epoch if now_epoch is not None else time.time())
+    evidence = pos.get("central_only_evidence") if isinstance(pos.get("central_only_evidence"), dict) else {}
+    reasons = []
+    module = _fcor_v1_falcon_module()
+    max_age = int(getattr(module, "FALCON_CENTRAL_ONLY_EVIDENCE_MAX_AGE_SECONDS", 300) or 300) if module is not None else 300
+    checked_epoch = _safe_float(evidence.get("checked_epoch"), 0.0)
+    if pos.get("central_only_reconcile_required") is not True:
+        reasons.append("CENTRAL_ONLY_STATE_NOT_CONFIRMED")
+    if evidence.get("broker_flat") is not True or evidence.get("position_closed") is not True:
+        reasons.append("BROKER_FLAT_NOT_CONFIRMED")
+    if evidence.get("read_only") is not True or evidence.get("sent") is not False:
+        reasons.append("BROKER_EVIDENCE_NOT_READ_ONLY")
+    position_qty = _safe_float(evidence.get("position_qty"), None)
+    if position_qty is None or position_qty < 0:
+        reasons.append("BROKER_POSITION_QUANTITY_MISSING")
+    elif position_qty > 0:
+        reasons.append("BROKER_POSITION_STILL_OPEN")
+    try:
+        matched_count = int(evidence.get("matched_count")) if evidence.get("matched_count") is not None else -1
+    except Exception:
+        matched_count = -1
+    if matched_count != 0:
+        reasons.append("BROKER_MATCHED_POSITION_PRESENT")
+    if not checked_epoch or now_epoch - checked_epoch > max_age or checked_epoch - now_epoch > 5:
+        reasons.append("BROKER_FLAT_EVIDENCE_STALE")
+    if evidence.get("stop_order_active") is not False:
+        reasons.append("STOP_TERMINAL_STATE_NOT_CONFIRMED")
+    terminal_statuses = {"ORDER_NOT_FOUND", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FAILED", "FILLED", "EXECUTED", "CLOSED"}
+    stop_status = str(evidence.get("stop_order_status") or "").upper().strip()
+    if stop_status not in terminal_statuses:
+        reasons.append("STOP_TERMINAL_STATE_NOT_CONFIRMED")
+    for field in ("trade_id", "lifecycle_id", "order_id", "client_order_id"):
+        supplied = evidence.get(field)
+        expected = identity.get(field)
+        if supplied not in (None, "") and expected not in (None, "") and str(supplied) != str(expected):
+            reasons.append(f"EVIDENCE_{field.upper()}_MISMATCH")
+    if identity.get("trade_id") and str(evidence.get("trade_id") or "") != str(identity.get("trade_id")):
+        reasons.append("EVIDENCE_TRADE_ID_REQUIRED")
+    evidence_strong_match = any(
+        evidence.get(field) not in (None, "")
+        and identity.get(field) not in (None, "")
+        and str(evidence.get(field)) == str(identity.get(field))
+        for field in ("lifecycle_id", "order_id", "client_order_id")
+    )
+    if not evidence_strong_match:
+        reasons.append("BROKER_EVIDENCE_STRONG_IDENTITY_REQUIRED")
+    if _flad_v1_norm_symbol(evidence.get("symbol")) != identity.get("symbol"):
+        reasons.append("EVIDENCE_SYMBOL_MISMATCH")
+    if _flad_v1_norm_side(evidence.get("side")) != identity.get("side"):
+        reasons.append("EVIDENCE_SIDE_MISMATCH")
+    return sorted(set(reasons)), evidence
+
+
+def _fcor_v1_candidate(position_id, pos, registry, now_epoch=None):
+    identity = _fcor_v1_identity(pos, position_id=position_id)
+    evidence_reasons, evidence = _fcor_v1_evidence_reasons(pos, identity, now_epoch=now_epoch)
+    live_mode = str(pos.get("execution_mode") or "").upper() == "LIVE" or str(pos.get("registry_mode") or "").upper() == "REAL"
+    if not live_mode:
+        evidence_reasons.append("POSITION_NOT_LIVE")
+    if not identity.get("trade_id"):
+        evidence_reasons.append("TRADE_ID_REQUIRED")
+    if not any(identity.get(field) for field in ("lifecycle_id", "order_id", "client_order_id")):
+        evidence_reasons.append("STRONG_OPERATIONAL_ID_REQUIRED")
+
+    open_trades = registry.get("open_trades", {}) if isinstance(registry, dict) else {}
+    open_trade = open_trades.get(identity.get("trade_id")) if isinstance(open_trades, dict) and identity.get("trade_id") else None
+    closed_candidates = _fcor_v1_factual_closed_index(registry).get(identity.get("trade_id"), [])
+    closed_trade = None
+    for item in reversed(closed_candidates if isinstance(closed_candidates, list) else [closed_candidates]):
+        if not isinstance(item, dict):
+            continue
+        item_identity = _fcor_v1_registry_identity(item)
+        if item_identity.get("symbol") != identity.get("symbol") or item_identity.get("side") != identity.get("side"):
+            continue
+        compared = [
+            (identity.get(field), item_identity.get(field))
+            for field in ("lifecycle_id", "order_id", "client_order_id")
+            if identity.get(field) and item_identity.get(field)
+        ]
+        if compared and all(str(local) == str(registry_value) for local, registry_value in compared):
+            closed_trade = item
+            break
+    trade = open_trade or closed_trade
+    action = "CLOSE_REGISTRY_AND_REMOVE_MODULE" if open_trade else ("REMOVE_STALE_MODULE_POSITION" if closed_trade else None)
+    if not isinstance(trade, dict):
+        evidence_reasons.append("MATCHING_REGISTRY_TRADE_NOT_FOUND")
+        registry_identity = {}
+        matched_identity = {}
+    else:
+        registry_identity = _fcor_v1_registry_identity(trade)
+        meta = _fcor_v1_meta(trade)
+        mode = str(trade.get("registry_mode") or meta.get("registry_mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
+        if str(trade.get("bot") or "").upper() != "FALCON":
+            evidence_reasons.append("REGISTRY_BOT_NOT_FALCON")
+        if mode not in {"REAL", "LIVE"}:
+            evidence_reasons.append("REGISTRY_TRADE_NOT_REAL")
+        if registry_identity.get("trade_id") != identity.get("trade_id"):
+            evidence_reasons.append("REGISTRY_TRADE_ID_MISMATCH")
+        if registry_identity.get("symbol") != identity.get("symbol"):
+            evidence_reasons.append("REGISTRY_SYMBOL_MISMATCH")
+        if registry_identity.get("side") != identity.get("side"):
+            evidence_reasons.append("REGISTRY_SIDE_MISMATCH")
+        typed_matches = 0
+        matched_identity = {}
+        for field in ("lifecycle_id", "order_id", "client_order_id"):
+            local_value = identity.get(field)
+            registry_value = registry_identity.get(field)
+            if local_value and registry_value:
+                if str(local_value) != str(registry_value):
+                    evidence_reasons.append(f"REGISTRY_{field.upper()}_MISMATCH")
+                else:
+                    typed_matches += 1
+                    matched_identity[field] = local_value
+        if typed_matches == 0:
+            evidence_reasons.append("REGISTRY_STRONG_IDENTITY_MATCH_REQUIRED")
+
+    reasons = sorted(set(evidence_reasons))
+    filled_qty = _safe_float(evidence.get("stop_order_filled_qty"), 0.0)
+    expected_lifecycle_qty = _safe_float(
+        pos.get("remaining_qty") or pos.get("runner_qty") or pos.get("qty") or pos.get("initial_qty") or pos.get("amount"),
+        None,
+    )
+    expected_stop_qty = _safe_float(pos.get("broker_stop_amount"), expected_lifecycle_qty)
+    full_fill_quantity_reconciled = bool(
+        filled_qty > 0
+        and expected_lifecycle_qty is not None
+        and expected_lifecycle_qty > 0
+        and expected_stop_qty is not None
+        and expected_stop_qty > 0
+        and abs(filled_qty - expected_lifecycle_qty) <= max(1e-9, max(filled_qty, expected_lifecycle_qty) * 1e-6)
+        and abs(filled_qty - expected_stop_qty) <= max(1e-9, max(filled_qty, expected_stop_qty) * 1e-6)
+    )
+    reliable_stop_fill = bool(
+        str(evidence.get("stop_order_status") or "").upper().strip() in {"FILLED", "EXECUTED", "CLOSED"}
+        and evidence.get("stop_order_filled") is True
+        and evidence.get("stop_order_full_fill_confirmed") is True
+        and full_fill_quantity_reconciled
+        and _safe_float(evidence.get("stop_order_average"), 0.0) > 0
+    )
+    return {
+        "eligible": not reasons and action is not None,
+        "action": action,
+        "reasons": reasons,
+        "position_id": position_id,
+        "position": pos,
+        "trade": trade,
+        "identity": identity,
+        "registry_identity": registry_identity,
+        "matched_identity": matched_identity,
+        "evidence": evidence,
+        "reliable_stop_fill": reliable_stop_fill,
+        "full_fill_quantity_reconciled": full_fill_quantity_reconciled,
+        "close_price": _safe_float(evidence.get("stop_order_average"), None) if reliable_stop_fill else None,
+        "close_qty": _safe_float(evidence.get("stop_order_filled_qty"), None) if reliable_stop_fill else None,
+        "close_order_id": evidence.get("stop_order_id") if reliable_stop_fill else None,
+        "close_timestamp": evidence.get("stop_order_timestamp") if reliable_stop_fill else None,
+    }
+
+
+def _fcor_v1_build_plan(now_epoch=None):
+    now_epoch = float(now_epoch if now_epoch is not None else time.time())
+    positions, position_error = _fcor_v1_raw_positions()
+    if central_trade_registry is None or not callable(getattr(central_trade_registry, "load_registry", None)):
+        return {"planned": [], "skipped": [], "positions": positions, "registry": {}, "errors": [position_error or "TRADE_REGISTRY_UNAVAILABLE"]}
+    try:
+        registry = central_trade_registry.load_registry()
+    except Exception as exc:
+        return {"planned": [], "skipped": [], "positions": positions, "registry": {}, "errors": [position_error or f"TRADE_REGISTRY_READ_ERROR:{type(exc).__name__}"]}
+    planned = []
+    skipped = []
+    for position_id, pos in positions:
+        evidence = pos.get("central_only_evidence") if isinstance(pos.get("central_only_evidence"), dict) else {}
+        if not (pos.get("central_only_reconcile_required") or evidence.get("status") == "CENTRAL_ONLY_RECONCILE_REQUIRED"):
+            continue
+        candidate = _fcor_v1_candidate(position_id, pos, registry, now_epoch=now_epoch)
+        (planned if candidate.get("eligible") else skipped).append(candidate)
+    errors = [position_error] if position_error else []
+    return {"planned": planned, "skipped": skipped, "positions": positions, "registry": registry, "errors": errors}
+
+
+def _fcor_v1_counts(plan):
+    positions = plan.get("positions") or []
+    central_live = 0
+    central_only = 0
+    broker_scope_count = 0
+    for _, pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        if str(pos.get("execution_mode") or "").upper() == "LIVE" or str(pos.get("registry_mode") or "").upper() == "REAL":
+            central_live += 1
+        evidence = pos.get("central_only_evidence") if isinstance(pos.get("central_only_evidence"), dict) else {}
+        if pos.get("central_only_reconcile_required"):
+            central_only += 1
+            try:
+                broker_scope_count += max(0, int(evidence.get("matched_count") or 0))
+            except (TypeError, ValueError):
+                # Reporting must remain available even when a malformed value
+                # already caused the candidate itself to fail closed.
+                broker_scope_count += 0
+    return {
+        "central_live": central_live,
+        "bingx_positions": broker_scope_count,
+        "only_central": central_only,
+        "bingx_count_scope": "FALCON_CENTRAL_ONLY_EVIDENCE_SYMBOL_SIDE",
+    }
+
+
+def _fcor_v1_atomic_write(path, payload):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + ".tmp")
+        temp.write_text(json.dumps(_flad_v1_public(payload), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        os.replace(temp, path)
+        return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}:{exc}"
+
+
+def _fcor_v1_append(path, payload):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_flad_v1_public(payload), ensure_ascii=False, default=str) + "\n")
+        return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}:{exc}"
+
+
+def _fcor_v1_sample(candidate):
+    pos = candidate.get("position") if isinstance(candidate.get("position"), dict) else {}
+    identity = candidate.get("identity") if isinstance(candidate.get("identity"), dict) else {}
+    return {
+        "symbol": identity.get("symbol"),
+        "side": identity.get("side"),
+        "setup": pos.get("setup"),
+        "trade_id": identity.get("trade_id"),
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "order_id": identity.get("order_id"),
+        "client_order_id": identity.get("client_order_id"),
+        "opened_at": pos.get("opened_at") or pos.get("created_at"),
+        "entry": pos.get("entry"),
+        "reason": "CENTRAL_LIVE_WITH_BROKER_FLAT",
+        "action": candidate.get("action"),
+        "skip_reasons": candidate.get("reasons") or [],
+    }
+
+
+def _fcor_v1_reconciliation_metadata(candidate, central_live_before, reconciled_at):
+    trade = candidate.get("trade") if isinstance(candidate.get("trade"), dict) else {}
+    pos = candidate.get("position") if isinstance(candidate.get("position"), dict) else {}
+    evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
+    return {
+        "source": "falcon_central_only_reconcile_v1",
+        "reconciled_by": "falcon_central_only_reconcile_v1",
+        "reconciled_at": reconciled_at,
+        "reason": "CENTRAL_LIVE_WITH_BROKER_FLAT",
+        "central_only_broker_flat_reconciled": True,
+        "evidence_bingx_positions": int(evidence.get("matched_count") or 0),
+        "evidence_central_live_positions": central_live_before,
+        "evidence_checked_at": evidence.get("checked_at"),
+        "manual_user_close_suspected": bool(evidence.get("manual_user_close_suspected", True)),
+        "stop_anomaly_suspected": bool(evidence.get("stop_anomaly_suspected", True)),
+        "original_sl": (
+            pos.get("initial_stop")
+            if pos.get("initial_stop") is not None
+            else _fcor_v1_meta(trade).get("original_sl")
+            if _fcor_v1_meta(trade).get("original_sl") is not None
+            else _fcor_v1_meta(trade).get("initial_stop")
+            if _fcor_v1_meta(trade).get("initial_stop") is not None
+            else trade.get("sl")
+            if trade.get("sl") is not None
+            else pos.get("stop")
+        ),
+        "outcome_status": "RECONCILED_WITHOUT_PNL",
+        "financial_reconciliation_pending": True,
+        "learning_eligible": False,
+        "learning_exclusion_reason": "REAL_CLOSE_PNL_EVIDENCE_PENDING",
+        "close_evidence_source": "BROKER_STOP_FILL" if candidate.get("reliable_stop_fill") else "BROKER_FLAT_ONLY",
+        "close_qty": candidate.get("close_qty") if candidate.get("reliable_stop_fill") else None,
+        "close_timestamp": candidate.get("close_timestamp") if candidate.get("reliable_stop_fill") else None,
+    }
+
+
+def _fcor_v1_build_payload(commit_requested=False, ack=None):
+    commit_requested = bool(commit_requested)
+    ack_ok = bool(commit_requested and str(ack or "") == FALCON_CENTRAL_ONLY_RECONCILIATION_V1_ACK)
+    generated_at = _fcor_v1_now()
+    with _FCOR_V1_LOCK:
+        before_plan = _fcor_v1_build_plan()
+        before = _fcor_v1_counts(before_plan)
+        planned = before_plan.get("planned") or []
+        skipped = list(before_plan.get("skipped") or [])
+        warnings = []
+        errors = list(before_plan.get("errors") or [])
+        results = []
+        reconciled_count = 0
+        registry_closed_count = 0
+        if commit_requested and not ack_ok:
+            warnings.append("ACK_REQUIRED:FALCON_CENTRAL_ONLY_RECONCILE")
+        if ack_ok:
+            module = _fcor_v1_falcon_module()
+            remove_fn = getattr(module, "falcon_reconcile_remove_position", None) if module is not None else None
+            if not callable(remove_fn):
+                errors.append("FALCON_RECONCILIATION_HELPER_UNAVAILABLE")
+            for original in planned if callable(remove_fn) else []:
+                # Rebuild immediately before mutation; stale broker-flat evidence
+                # or changed identity must stop this item fail-closed.
+                current_plan = _fcor_v1_build_plan()
+                current = next((item for item in current_plan.get("planned") or [] if item.get("identity", {}).get("trade_id") == original.get("identity", {}).get("trade_id")), None)
+                if current is None:
+                    skipped.append(dict(original, reasons=["CANDIDATE_CHANGED_BEFORE_COMMIT"]))
+                    continue
+                identity = current.get("identity") or {}
+                registry_result = {"ok": True, "action": "ALREADY_RECONCILED"}
+                if current.get("action") == "CLOSE_REGISTRY_AND_REMOVE_MODULE":
+                    metadata = _fcor_v1_reconciliation_metadata(current, before.get("central_live"), generated_at)
+                    try:
+                        registry_result = central_trade_registry.close_trade(
+                            identity.get("trade_id"),
+                            exit_price=current.get("close_price"),
+                            pnl_pct=None,
+                            pnl_r=None,
+                            reason="CENTRAL_ONLY_BROKER_FLAT_RECONCILED",
+                            metadata=metadata,
+                            registry_mode="REAL",
+                            broker_close_order_id=current.get("close_order_id"),
+                        close_qty=current.get("close_qty"),
+                        closed_at=current.get("close_timestamp"),
+                            expected_identity=current.get("matched_identity") or {},
+                            clear_financial_results=True,
+                            central_only_broker_flat_reconciled=True,
+                            financial_reconciliation_pending=True,
+                            learning_eligible=False,
+                            outcome_status="RECONCILED_WITHOUT_PNL",
+                        )
+                    except Exception as exc:
+                        registry_result = {
+                            "ok": False,
+                            "error": "REGISTRY_CLOSE_EXCEPTION",
+                            "error_type": type(exc).__name__,
+                        }
+                    if not isinstance(registry_result, dict) or not registry_result.get("ok"):
+                        errors.append(f"REGISTRY_CLOSE_FAILED:{identity.get('trade_id')}")
+                        results.append({"identity": identity, "registry": registry_result, "module": None})
+                        continue
+                    if registry_result.get("action") == "TRADE_CLOSED":
+                        registry_closed_count += 1
+                try:
+                    removal = remove_fn(
+                        position_id=current.get("position_id"),
+                        order_id=identity.get("order_id"),
+                        client_order_id=identity.get("client_order_id"),
+                        lifecycle_id=identity.get("lifecycle_id"),
+                        trade_id=identity.get("trade_id"),
+                    )
+                except Exception as exc:
+                    removal = {
+                        "ok": False,
+                        "removed": False,
+                        "status": "MODULE_REMOVE_EXCEPTION",
+                        "error_type": type(exc).__name__,
+                        "no_order_sent": True,
+                    }
+                if isinstance(removal, dict) and removal.get("ok") and (removal.get("removed") or removal.get("already_removed")):
+                    reconciled_count += 1
+                else:
+                    errors.append(f"MODULE_POSITION_REMOVE_FAILED:{identity.get('trade_id')}:{(removal or {}).get('status') if isinstance(removal, dict) else 'INVALID_RESULT'}")
+                results.append({"identity": identity, "registry": registry_result, "module": removal})
+
+        after_plan = _fcor_v1_build_plan()
+        after = _fcor_v1_counts(after_plan)
+        already_reconciled_count = len(_fcor_v1_reconciled_closed_index(after_plan.get("registry") or {}))
+        if errors:
+            status = "PARTIAL_OR_BLOCKED"
+        elif commit_requested and not ack_ok:
+            status = "ACK_REQUIRED"
+        elif not commit_requested:
+            status = "PREVIEW_READY" if planned else ("PREVIEW_BLOCKED" if skipped else "NO_CENTRAL_ONLY_POSITION")
+        elif reconciled_count:
+            status = "RECONCILED"
+        elif already_reconciled_count and not after.get("only_central"):
+            status = "ALREADY_RECONCILED"
+        elif skipped:
+            status = "BLOCKED_NO_ELIGIBLE_POSITION"
+        else:
+            status = "NO_CENTRAL_ONLY_POSITION"
+        committed = bool(ack_ok and not errors and status in {"RECONCILED", "ALREADY_RECONCILED", "NO_CENTRAL_ONLY_POSITION"})
+        payload = {
+            "ok": not errors and status not in {"ACK_REQUIRED", "PARTIAL_OR_BLOCKED", "PREVIEW_BLOCKED", "BLOCKED_NO_ELIGIBLE_POSITION"},
+            "status": status,
+            "version": FALCON_CENTRAL_ONLY_RECONCILIATION_V1_VERSION,
+            "generated_at": generated_at,
+            "commit_requested": commit_requested,
+            "ack_ok": ack_ok,
+            "committed": committed,
+            "idempotent": status == "ALREADY_RECONCILED",
+            "execution_mode": globals().get("EXECUTION_MODE"),
+            "enable_real_trading": globals().get("ENABLE_REAL_TRADING"),
+            "broker_dry_run": os.environ.get("BROKER_DRY_RUN", "N/A"),
+            "no_order_sent_by_this_route": True,
+            "would_send_order": False,
+            "broker_called_by_this_route": False,
+            "central_live_before": before.get("central_live"),
+            "central_live_after": after.get("central_live"),
+            "bingx_positions_before": before.get("bingx_positions"),
+            "bingx_positions_after": after.get("bingx_positions"),
+            "bingx_rechecked_after_commit": False,
+            "bingx_position_count_source": "FRESH_PREFLIGHT_EVIDENCE_CARRIED_THROUGH_COMMIT",
+            "only_central_before": before.get("only_central"),
+            "only_central_after": after.get("only_central"),
+            "bingx_count_scope": before.get("bingx_count_scope"),
+            "planned_count": len(planned),
+            "reconciled_count": reconciled_count,
+            "registry_closed_count": registry_closed_count,
+            "skipped_count": len(skipped),
+            "samples": [_fcor_v1_sample(item) for item in planned[:20]],
+            "skipped_samples": [_fcor_v1_sample(item) for item in skipped[:20]],
+            "results": _flad_v1_public(results),
+            "warnings": warnings,
+            "errors": errors,
+            "files": {
+                "latest": str(FALCON_CENTRAL_ONLY_RECONCILIATION_V1_LATEST_FILE),
+                "events": str(FALCON_CENTRAL_ONLY_RECONCILIATION_V1_EVENTS_FILE),
+            },
+        }
+        if ack_ok:
+            latest_ok, latest_error = _fcor_v1_atomic_write(FALCON_CENTRAL_ONLY_RECONCILIATION_V1_LATEST_FILE, payload)
+            event_ok, event_error = _fcor_v1_append(FALCON_CENTRAL_ONLY_RECONCILIATION_V1_EVENTS_FILE, {
+                "event": "FALCON_CENTRAL_ONLY_RECONCILIATION_COMMIT",
+                "generated_at": generated_at,
+                "status": status,
+                "planned_count": len(planned),
+                "reconciled_count": reconciled_count,
+                "skipped_count": len(skipped),
+                "samples": payload.get("samples"),
+                "errors": errors,
+                "no_order_sent_by_this_route": True,
+            })
+            payload["persistence"] = {"latest_ok": latest_ok, "latest_error": latest_error, "events_ok": event_ok, "events_error": event_error}
+            if not latest_ok or not event_ok:
+                payload["warnings"].append("RECONCILIATION_AUDIT_PERSISTENCE_ERROR")
+        if ack_ok:
+            _FCOR_V1_STATE.update({
+                "status": status,
+                "last_run": generated_at,
+                "last_error": ";".join(errors) if errors else None,
+                "last_reconciled_count": reconciled_count,
+            })
+        return _flad_v1_public(payload)
+
+
+def _fcor_v1_health_overlay():
+    positions, position_error = _fcor_v1_raw_positions()
+    pending = sum(1 for _, pos in positions if isinstance(pos, dict) and pos.get("central_only_reconcile_required"))
+    module = _fcor_v1_falcon_module()
+    health = getattr(module, "HEALTH", {}) if module is not None else {}
+    health = health if isinstance(health, dict) else {}
+    status = _FCOR_V1_STATE.get("status")
+    if position_error:
+        status = "POSITION_READ_ERROR"
+    if pending and status in {None, "NOT_RUN", "RECONCILED", "ALREADY_RECONCILED", "NO_CENTRAL_ONLY_POSITION"}:
+        status = "CENTRAL_ONLY_RECONCILE_REQUIRED"
+    fields = {
+        "falcon_central_only_reconcile_status": status,
+        "falcon_central_only_pending_count": pending,
+        "falcon_central_only_last_run": _FCOR_V1_STATE.get("last_run"),
+        "falcon_central_only_last_error": position_error or _FCOR_V1_STATE.get("last_error"),
+        "falcon_central_only_last_reconciled_count": _FCOR_V1_STATE.get("last_reconciled_count"),
+    }
+    for key in (
+        "falcon_disaster_stop_active_verified",
+        "falcon_disaster_stop_trigger_type",
+        "falcon_disaster_stop_order_status",
+        "falcon_disaster_stop_order_id",
+        "falcon_disaster_stop_last_checked_at",
+        "falcon_disaster_stop_protection_matches_position",
+        "falcon_stop_anomaly_detected",
+        "falcon_stop_anomaly_last_reason",
+        "falcon_management_spam_guard_status",
+        "falcon_management_spam_guard_last_reason",
+        "falcon_management_spam_guard_suppressed_count",
+        "falcon_management_spam_guard_last_suppressed_at",
+    ):
+        fields[key] = health.get(key)
+    return fields
+
+
+def _fcor_v1_text(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    lines = [
+        "FALCON CENTRAL-ONLY MANUAL CLOSE RECONCILIATION V1",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {payload.get('status')}",
+        f"Commit solicitado: {payload.get('commit_requested')}",
+        f"ACK correto: {payload.get('ack_ok')}",
+        f"Committed: {payload.get('committed')}",
+        "",
+        "Seguranca:",
+        f"- execution_mode: {payload.get('execution_mode')}",
+        f"- ENABLE_REAL_TRADING: {payload.get('enable_real_trading')}",
+        f"- BROKER_DRY_RUN: {payload.get('broker_dry_run')}",
+        f"- no_order_sent_by_this_route: {payload.get('no_order_sent_by_this_route')}",
+        f"- would_send_order: {payload.get('would_send_order')}",
+        f"- broker_called_by_this_route: {payload.get('broker_called_by_this_route')}",
+        "",
+        "Antes / depois:",
+        f"- Central LIVE: {payload.get('central_live_before')} -> {payload.get('central_live_after')}",
+        f"- BingX positions (evidencia factual pre-commit; sem nova chamada pelo endpoint): {payload.get('bingx_positions_before')} -> {payload.get('bingx_positions_after')}",
+        f"- BingX rechecked after commit: {payload.get('bingx_rechecked_after_commit')}",
+        f"- So na Central: {payload.get('only_central_before')} -> {payload.get('only_central_after')}",
+        f"- planned_count: {payload.get('planned_count')}",
+        f"- reconciled_count: {payload.get('reconciled_count')}",
+        f"- skipped_count: {payload.get('skipped_count')}",
+        "",
+        "Amostras:",
+    ]
+    for sample in payload.get("samples") or []:
+        lines.append(
+            f"- {sample.get('symbol')} {sample.get('side')} | order={sample.get('order_id')} | "
+            f"client={sample.get('client_order_id')} | lifecycle={sample.get('lifecycle_id')} | "
+            f"opened_at={sample.get('opened_at')} | entry={sample.get('entry')} | reason={sample.get('reason')}"
+        )
+    if not payload.get("samples"):
+        lines.append("- Nenhuma posicao elegivel.")
+    lines += ["", "Warnings:"] + [f"- {item}" for item in (payload.get("warnings") or [])]
+    if not payload.get("warnings"):
+        lines.append("- Nenhum.")
+    lines += ["", "Errors:"] + [f"- {item}" for item in (payload.get("errors") or [])]
+    if not payload.get("errors"):
+        lines.append("- Nenhum.")
+    lines += [
+        "",
+        "Arquivos:",
+        f"- Snapshot: {payload.get('files', {}).get('latest')}",
+        f"- Eventos: {payload.get('files', {}).get('events')}",
+    ]
+    return "\n".join(lines)
+
+
+def _fcor_v1_request_commit_ack():
+    body = request.get_json(silent=True) if request.method == "POST" else {}
+    body = body if isinstance(body, dict) else {}
+    raw_commit = request.args.get("commit", body.get("commit", False))
+    commit_requested = str(raw_commit).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    ack = request.args.get("ack", body.get("ack"))
+    return commit_requested, ack
+
+
+@app.route("/falcon/centralonly/reconcile", methods=["GET", "POST"])
+def falcon_central_only_reconciliation_v1_route():
+    commit_requested, ack = _fcor_v1_request_commit_ack()
+    return _fcor_v1_build_payload(commit_requested=commit_requested, ack=ack), 200
+
+
+@app.route("/falcon/centralonly/reconcile/text", methods=["GET", "POST"])
+def falcon_central_only_reconciliation_v1_text_route():
+    commit_requested, ack = _fcor_v1_request_commit_ack()
+    payload = _fcor_v1_build_payload(commit_requested=commit_requested, ack=ack)
+    return _fcor_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 if __name__ == "__main__":
