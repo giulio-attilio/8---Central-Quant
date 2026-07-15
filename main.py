@@ -128,6 +128,7 @@ from automatic_daily_summaries import (
     automatic_daily_summaries_health,
     central_daily_report_automatic_enabled,
 )
+from redis_bandwidth import build_redis_bandwidth_text, redis_bandwidth_report
 from telegram_notification_policy import (
     send_automatic_telegram,
     telegram_notification_policy_health,
@@ -11862,6 +11863,18 @@ def watchdog():
 @app.route("/bots")
 def bots():
     return {key: bot_health(key, cfg) for key, cfg in BOT_CONFIGS.items()}
+
+
+@app.route("/redis/bandwidth", methods=["GET"])
+def redis_bandwidth_route():
+    """Expose in-memory aggregates without issuing diagnostic Redis commands."""
+    return redis_bandwidth_report(limit=20)
+
+
+@app.route("/redis/bandwidth/text", methods=["GET"])
+def redis_bandwidth_text_route():
+    """Human-readable, payload-free Redis bandwidth diagnostic."""
+    return build_redis_bandwidth_text(limit=20), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/bot/<key>")

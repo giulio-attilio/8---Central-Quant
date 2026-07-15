@@ -55,6 +55,7 @@ from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
+from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
@@ -613,7 +614,7 @@ def validar_watchlist_bingx(watchlist, avisar_telegram=False):
 
 def redis_get_json(key, padrao):
     try:
-        data = redis.get(key)
+        data = bandwidth_redis_get(redis, key, caller=__name__)
         if data is None:
             return padrao
         if isinstance(data, str):
@@ -626,7 +627,7 @@ def redis_get_json(key, padrao):
 
 def redis_set_json(key, value):
     try:
-        redis.set(key, json.dumps(value, ensure_ascii=False))
+        bandwidth_redis_set(redis, key, json.dumps(value, ensure_ascii=False), caller=__name__)
     except Exception as e:
         print(f"ERRO REDIS SET {key}:", e)
 

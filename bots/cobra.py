@@ -16,6 +16,7 @@ from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
+from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
 
@@ -476,12 +477,12 @@ def enviar_startup_cobra_uma_vez():
     chave = "cobra:startup_msg_last_ts_v4"
     agora = time.time()
     try:
-        ultimo = redis.get(chave)
+        ultimo = bandwidth_redis_get(redis, chave, caller=__name__)
         ultimo = float(ultimo or 0)
         if agora - ultimo < STARTUP_ALERT_COOLDOWN_SECONDS:
             print("Startup Cobra já avisado recentemente. Pulando Telegram.")
             return
-        redis.set(chave, str(agora))
+        bandwidth_redis_set(redis, chave, str(agora), caller=__name__)
     except Exception as e:
         print("Erro na trava startup Cobra:", e)
 
@@ -507,7 +508,7 @@ def enviar_startup_cobra_uma_vez():
 
 def redis_get_json(key, padrao):
     try:
-        data = redis.get(key)
+        data = bandwidth_redis_get(redis, key, caller=__name__)
         if data is None:
             return padrao
         if isinstance(data, str):
@@ -519,7 +520,7 @@ def redis_get_json(key, padrao):
 
 def redis_set_json(key, value):
     try:
-        redis.set(key, json.dumps(value, ensure_ascii=False))
+        bandwidth_redis_set(redis, key, json.dumps(value, ensure_ascii=False), caller=__name__)
     except Exception as e:
         print(f"ERRO REDIS SET {key}:", e)
 
@@ -2179,7 +2180,7 @@ def processar_comando(texto):
 
 def redis_get_number(key, padrao=0):
     try:
-        valor = redis.get(key)
+        valor = bandwidth_redis_get(redis, key, caller=__name__)
         if valor is None:
             return padrao
         return int(float(valor))
@@ -2194,7 +2195,7 @@ def telegram_update_ja_processado(update_id):
         ultimo = redis_get_number(TELEGRAM_LAST_UPDATE_KEY, 0)
         if update_id <= ultimo:
             return True
-        redis.set(TELEGRAM_LAST_UPDATE_KEY, str(update_id))
+        bandwidth_redis_set(redis, TELEGRAM_LAST_UPDATE_KEY, str(update_id), caller=__name__)
         return False
     except Exception as e:
         print("ERRO DEDUPE UPDATE COBRA:", e)
@@ -2206,12 +2207,12 @@ def comando_em_cooldown(chat_id, cmd):
     try:
         chave = f"{TELEGRAM_COMMAND_DEDUP_PREFIX}:{chat_id}:{cmd}"
         agora = time.time()
-        ultimo = redis.get(chave)
+        ultimo = bandwidth_redis_get(redis, chave, caller=__name__, no_cache=True)
         ultimo = float(ultimo or 0)
         if agora - ultimo < TELEGRAM_COMMAND_DEDUP_SECONDS:
             print(f"COMANDO COBRA IGNORADO POR DEDUPE: {cmd}")
             return True
-        redis.set(chave, str(agora))
+        bandwidth_redis_set(redis, chave, str(agora), caller=__name__)
         return False
     except Exception as e:
         print("ERRO DEDUPE COMANDO COBRA:", e)
@@ -2281,7 +2282,7 @@ def listen_commands():
 
 def redis_get_str(key, padrao=None):
     try:
-        data = redis.get(key)
+        data = bandwidth_redis_get(redis, key, caller=__name__)
         if data is None:
             return padrao
         if isinstance(data, str):
@@ -2293,7 +2294,7 @@ def redis_get_str(key, padrao=None):
 
 def redis_set_str(key, value):
     try:
-        redis.set(key, str(value))
+        bandwidth_redis_set(redis, key, str(value), caller=__name__)
     except Exception as e:
         print(f"ERRO REDIS SET STR {key}:", e)
 

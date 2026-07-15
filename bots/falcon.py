@@ -42,6 +42,7 @@ from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask
 from upstash_redis import Redis
+from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
@@ -418,7 +419,7 @@ def safe_send_telegram(
 def redis_get_json(key, default):
     try:
         with redis_lock:
-            raw = redis.get(key)
+            raw = bandwidth_redis_get(redis, key, caller=__name__)
         if raw is None:
             return default
         if isinstance(raw, bytes):
@@ -434,7 +435,7 @@ def redis_get_json(key, default):
 def redis_set_json(key, value):
     try:
         with redis_lock:
-            redis.set(key, json.dumps(value, ensure_ascii=False))
+            bandwidth_redis_set(redis, key, json.dumps(value, ensure_ascii=False), caller=__name__)
         return True
     except Exception as exc:
         HEALTH["last_warning"] = f"redis set {key}: {exc}"
