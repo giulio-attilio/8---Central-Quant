@@ -199,7 +199,7 @@ def test_17_text_report_is_serializable_small_and_payload_free():
     report = bandwidth.redis_bandwidth_report()
     text = bandwidth.build_redis_bandwidth_text()
     json.dumps(report)
-    assert text.startswith("REDIS BANDWIDTH DIET V1")
+    assert text.startswith("REDIS BANDWIDTH DIET V2")
     assert len(text.encode("utf-8")) < 64 * 1024
     assert "x" * 64 not in text
 

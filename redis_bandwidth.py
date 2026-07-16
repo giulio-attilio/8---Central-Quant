@@ -18,12 +18,27 @@ from datetime import date, datetime, timezone
 from typing import Any, Deque, Dict, Iterable, Mapping, Optional, Tuple
 
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 DEFAULT_TOP_LIMIT = 20
 DEFAULT_MAX_CARDINALITY = 512
 DEFAULT_MAX_RUNTIME_KEYS = 256
 DEFAULT_DAILY_FLAG_TTL_SECONDS = 45 * 24 * 60 * 60
 DEFAULT_SAFE_CACHE_SECONDS = 5.0
+HISTORY_HOT_KEY_CACHE_SECONDS = 60.0
+PAPER_POSITION_CACHE_SECONDS = 15.0
+
+HOT_KEY_POLICIES: Dict[str, Dict[str, Any]] = {
+    "falcon:events": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "turtle_pro:events": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "smartpredator:positions": {"policy": "PAPER_POSITION_CACHE_LIVE_FRESH", "cache_seconds": PAPER_POSITION_CACHE_SECONDS},
+    "turtle_pro:trades": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "turtle_pro:signals": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "falcon:signals": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "donkey:positions": {"policy": "PAPER_POSITION_CACHE_LIVE_FRESH", "cache_seconds": PAPER_POSITION_CACHE_SECONDS},
+    "falcon:trades": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "donkey:trades": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "cobra:positions": {"policy": "PAPER_POSITION_CACHE_LIVE_FRESH", "cache_seconds": PAPER_POSITION_CACHE_SECONDS},
+}
 
 _TRUE_VALUES = {"1", "true", "yes", "sim", "on"}
 _UUID_OR_LONG_ID = re.compile(
@@ -42,6 +57,8 @@ _started_at = datetime.now(timezone.utc).isoformat()
 _cache_hits = 0
 _sets_skipped = 0
 _bytes_avoided = 0
+_cache_bytes_avoided = 0
+_set_bytes_avoided = 0
 _instrumentation_errors = 0
 _last_error: Optional[str] = None
 
@@ -187,17 +204,52 @@ def classify_redis_key(key: Any) -> Dict[str, Any]:
     }
 
 
-def safe_cache_seconds_for_key(key: Any) -> float:
-    """Only reporting/telemetry keys receive an automatic short cache."""
+def _execution_mode_for_caller(caller: Any) -> str:
+    """Resolve only public mode flags; never read credentials or mutate env."""
+    name = sanitize_caller(caller).lower()
+    if name.endswith("falcon"):
+        value = os.environ.get("FALCON_MODE") or os.environ.get("EXECUTION_MODE")
+    elif name.endswith("predator"):
+        value = os.environ.get("PREDATOR_MODE") or os.environ.get("SMART_PREDATOR_MODE")
+    elif name.endswith("meme") or name.endswith("turtle"):
+        value = "PAPER"
+    else:
+        value = os.environ.get("EXECUTION_MODE")
+    return str(value or "PAPER").strip().upper()
+
+
+def safe_cache_seconds_for_key(
+    key: Any,
+    *,
+    execution_mode: Optional[str] = None,
+    critical: bool = False,
+) -> float:
+    """Return the conservative V2 cache policy for one key and context."""
+    if critical:
+        return 0.0
     lowered = sanitize_redis_key(key).lower()
-    safe_markers = (
-        "funnel",
-        ":events",
-        "execution_firewall_events",
-        "boot_history",
-        "last_scanned",
-    )
-    return DEFAULT_SAFE_CACHE_SECONDS if any(marker in lowered for marker in safe_markers) else 0.0
+    if lowered.endswith((":events", ":trades", ":signals")) or "execution_firewall_events" in lowered:
+        return HISTORY_HOT_KEY_CACHE_SECONDS
+    if lowered.endswith(":positions"):
+        mode = str(execution_mode or "UNKNOWN").strip().upper()
+        if mode in {"PAPER", "VERIFY", "DRY_RUN", "OBSERVATION_ONLY"}:
+            return PAPER_POSITION_CACHE_SECONDS
+        return 0.0
+    if any(marker in lowered for marker in ("funnel", "boot_history", "last_scanned")):
+        return 30.0
+    return 0.0
+
+
+def redis_key_requires_fresh_read(key: Any, *, execution_mode: Optional[str] = None) -> bool:
+    """Make the LIVE position freshness rule explicit and independently testable."""
+    lowered = sanitize_redis_key(key).lower()
+    mode = str(execution_mode or "UNKNOWN").strip().upper()
+    return lowered.endswith(":positions") and mode not in {
+        "PAPER",
+        "VERIFY",
+        "DRY_RUN",
+        "OBSERVATION_ONLY",
+    }
 
 
 def ttl_seconds_for_key(key: Any) -> Optional[int]:
@@ -306,9 +358,14 @@ def redis_get(
     no_cache: bool = False,
 ) -> Any:
     """Call ``GET`` with optional safe local caching and aggregate metrics."""
-    global _cache_hits, _bytes_avoided
+    global _cache_hits, _bytes_avoided, _cache_bytes_avoided
     cache_key = (id(client), str(key))
-    ttl = safe_cache_seconds_for_key(key) if cache_ttl_seconds is None else max(0.0, float(cache_ttl_seconds))
+    inferred_mode = _execution_mode_for_caller(caller)
+    ttl = (
+        safe_cache_seconds_for_key(key, execution_mode=inferred_mode)
+        if cache_ttl_seconds is None
+        else max(0.0, float(cache_ttl_seconds))
+    )
     if no_cache or not bandwidth_diet_enabled():
         ttl = 0.0
     now_mono = time.monotonic()
@@ -318,7 +375,9 @@ def redis_get(
                 cached = _cache.get(cache_key)
                 if cached and cached.get("client") is client and now_mono - cached["stored_at"] <= ttl:
                     _cache_hits += 1
-                    _bytes_avoided += _payload_size(cached["value"])
+                    avoided = _payload_size(cached["value"])
+                    _cache_bytes_avoided += avoided
+                    _bytes_avoided += avoided
                     return cached["value"]
         except Exception as exc:
             _record_internal_error(exc)
@@ -351,13 +410,14 @@ def redis_set(
     caller: str = "UNKNOWN",
     skip_unchanged: bool = True,
     ttl_seconds: Optional[int] = None,
+    cache_ttl_seconds: Optional[float] = None,
 ) -> Any:
     """Call ``SET`` while avoiding a locally confirmed identical rewrite.
 
     No comparison ``GET`` is issued.  A skip is possible only after this process
     observed the exact value through a successful GET or SET.
     """
-    global _sets_skipped, _bytes_avoided
+    global _sets_skipped, _bytes_avoided, _set_bytes_avoided
     cache_key = (id(client), str(key))
     size = _payload_size(value)
     digest: Optional[str] = None
@@ -378,6 +438,7 @@ def redis_set(
                 )
                 if should_skip:
                     _sets_skipped += 1
+                    _set_bytes_avoided += size
                     _bytes_avoided += size
         except Exception as exc:
             _record_internal_error(exc)
@@ -414,7 +475,12 @@ def redis_set(
                     "seen_at": now_mono,
                     "source": "SET",
                 }
-            safe_cache_seconds = safe_cache_seconds_for_key(key) if bandwidth_diet_enabled() else 0.0
+            inferred_mode = _execution_mode_for_caller(caller)
+            safe_cache_seconds = (
+                safe_cache_seconds_for_key(key, execution_mode=inferred_mode)
+                if cache_ttl_seconds is None
+                else max(0.0, float(cache_ttl_seconds))
+            ) if bandwidth_diet_enabled() else 0.0
             if safe_cache_seconds > 0:
                 _cache[cache_key] = {"client": client, "value": value, "stored_at": now_mono}
             else:
@@ -496,12 +562,18 @@ def redis_bandwidth_report(limit: int = DEFAULT_TOP_LIMIT) -> Dict[str, Any]:
         cache_hits = _cache_hits
         sets_skipped = _sets_skipped
         bytes_avoided = _bytes_avoided
+        cache_bytes_avoided = _cache_bytes_avoided
+        set_bytes_avoided = _set_bytes_avoided
         errors = _instrumentation_errors
         last_error = _last_error
 
     keys_by_bytes = _aggregate(entries, "key")
     operations = _aggregate(entries, "op")
     callers = _aggregate(entries, "caller")
+    for rows in (keys_by_bytes, operations, callers):
+        for row in rows.values():
+            count = max(1, int(row.get("count") or 0))
+            row["avg_payload_bytes"] = round(int(row.get("total_bytes") or 0) / count, 2)
     observed_keys = sorted(keys_by_bytes)
     temporary_without_ttl = []
     for key in observed_keys:
@@ -511,6 +583,8 @@ def redis_bandwidth_report(limit: int = DEFAULT_TOP_LIMIT) -> Dict[str, Any]:
 
     total_ops = sum(int(item.get("count") or 0) for item in entries)
     total_bytes = sum(int(item.get("total_bytes") or 0) for item in entries)
+    potential_total = total_bytes + bytes_avoided
+    savings_pct = round((bytes_avoided / potential_total * 100.0), 2) if potential_total else 0.0
     warnings = []
     recommendations = []
     if not instrumentation_enabled():
@@ -522,12 +596,37 @@ def redis_bandwidth_report(limit: int = DEFAULT_TOP_LIMIT) -> Dict[str, Any]:
     top_key_rows = _top(keys_by_bytes.values(), limit=limit, sort_field="total_bytes")
     if top_key_rows:
         recommendations.append(f"Prioritize repeated reads/writes for {top_key_rows[0]['key']}.")
+    for row in top_key_rows[:5]:
+        key = row["key"]
+        policy = HOT_KEY_POLICIES.get(key)
+        if policy:
+            recommendations.append(
+                f"{key}: V2 {policy['policy']} active ({policy['cache_seconds']:g}s); "
+                f"observed average {row['avg_payload_bytes']} bytes/call."
+            )
     if sets_skipped:
         recommendations.append(f"Keep skip-unchanged enabled; {sets_skipped} identical SET operation(s) were avoided.")
     if cache_hits:
         recommendations.append(f"Short safe caches avoided {cache_hits} Redis GET operation(s).")
     if not recommendations:
         recommendations.append("Collect a representative window before changing source-of-truth keys or execution paths.")
+
+    top_hot_keys_status = []
+    for key, policy in HOT_KEY_POLICIES.items():
+        observed = keys_by_bytes.get(key) or {}
+        top_hot_keys_status.append(
+            {
+                "key": key,
+                "optimized_v2": True,
+                "policy": policy["policy"],
+                "cache_seconds": policy["cache_seconds"],
+                "live_positions_no_cache": policy["policy"] == "PAPER_POSITION_CACHE_LIVE_FRESH",
+                "observed_calls": int(observed.get("count") or 0),
+                "observed_bytes": int(observed.get("total_bytes") or 0),
+                "avg_bytes_per_call": float(observed.get("avg_payload_bytes") or 0.0),
+            }
+        )
+    largest_avg = _top(keys_by_bytes.values(), limit=1, sort_field="avg_payload_bytes")
 
     return {
         "ok": True,
@@ -539,13 +638,18 @@ def redis_bandwidth_report(limit: int = DEFAULT_TOP_LIMIT) -> Dict[str, Any]:
         "total_ops_observed": total_ops,
         "total_bytes_estimated": total_bytes,
         "bytes_avoided_estimated": bytes_avoided,
+        "bytes_avoided_by_cache": cache_bytes_avoided,
+        "bytes_avoided_by_set_skipped": set_bytes_avoided,
+        "estimated_savings_after_v2_pct": savings_pct,
         "cache_hits": cache_hits,
         "sets_skipped": sets_skipped,
         "top_keys_by_bytes": top_key_rows,
         "top_keys_by_calls": _top(keys_by_bytes.values(), limit=limit, sort_field="count"),
         "top_operations_by_bytes": _top(operations.values(), limit=limit, sort_field="total_bytes"),
         "top_callers_by_bytes": _top(callers.values(), limit=limit, sort_field="total_bytes"),
+        "largest_key_by_avg_bytes_per_call": largest_avg[0] if largest_avg else None,
         "largest_payloads": largest,
+        "top_hot_keys_status": top_hot_keys_status,
         "temporary_keys_without_ttl": temporary_without_ttl[:limit],
         "old_daily_flags": _old_daily_flags(observed_keys)[:limit],
         "ttl_applied": ttl_applied,
@@ -565,7 +669,7 @@ def build_redis_bandwidth_text(limit: int = DEFAULT_TOP_LIMIT) -> str:
     report = redis_bandwidth_report(limit=limit)
     window = report["window"]
     lines = [
-        "REDIS BANDWIDTH DIET V1",
+        "REDIS BANDWIDTH DIET V2",
         f"Status: {report['status']}",
         f"Instrumentation: {'ENABLED' if report['instrumentation_enabled'] else 'DISABLED'}",
         f"Diet: {'ENABLED' if report['diet_enabled'] else 'DISABLED'}",
@@ -573,6 +677,9 @@ def build_redis_bandwidth_text(limit: int = DEFAULT_TOP_LIMIT) -> str:
         f"Observed operations: {report['total_ops_observed']}",
         f"Estimated bytes: {report['total_bytes_estimated']}",
         f"Estimated bytes avoided: {report['bytes_avoided_estimated']}",
+        f"Bytes avoided by cache: {report['bytes_avoided_by_cache']}",
+        f"Bytes avoided by SET skipped: {report['bytes_avoided_by_set_skipped']}",
+        f"Estimated savings after V2: {report['estimated_savings_after_v2_pct']}%",
         f"Cache hits: {report['cache_hits']}",
         f"SETs skipped: {report['sets_skipped']}",
         "",
@@ -585,6 +692,21 @@ def build_redis_bandwidth_text(limit: int = DEFAULT_TOP_LIMIT) -> str:
     )
     if not rows:
         lines.append("- no observations")
+    largest_avg = report.get("largest_key_by_avg_bytes_per_call")
+    lines.extend(["", "Largest key by average bytes/call:"])
+    if largest_avg:
+        lines.append(
+            f"- key={largest_avg['key']} avg_bytes={largest_avg['avg_payload_bytes']} "
+            f"calls={largest_avg['count']}"
+        )
+    else:
+        lines.append("- no observations")
+    lines.extend(["", "V2 hot key status:"])
+    lines.extend(
+        f"- key={item['key']} optimized={item['optimized_v2']} policy={item['policy']} "
+        f"cache={item['cache_seconds']:g}s live_positions_no_cache={item['live_positions_no_cache']}"
+        for item in report["top_hot_keys_status"]
+    )
     lines.extend(["", "Top operations by estimated bytes:"])
     rows = report["top_operations_by_bytes"]
     lines.extend(
@@ -612,6 +734,7 @@ def reset_redis_bandwidth_state(confirm: bool = False) -> Dict[str, Any]:
     """Reset in-memory observability/cache state; intended for tests only."""
     global _metrics, _largest_payloads, _cache, _last_values, _ttl_applied
     global _started_at, _cache_hits, _sets_skipped, _bytes_avoided
+    global _cache_bytes_avoided, _set_bytes_avoided
     global _instrumentation_errors, _last_error
     if confirm is not True:
         return {"ok": False, "status": "CONFIRM_REQUIRED"}
@@ -625,6 +748,8 @@ def reset_redis_bandwidth_state(confirm: bool = False) -> Dict[str, Any]:
         _cache_hits = 0
         _sets_skipped = 0
         _bytes_avoided = 0
+        _cache_bytes_avoided = 0
+        _set_bytes_avoided = 0
         _instrumentation_errors = 0
         _last_error = None
     return {"ok": True, "status": "RESET"}
@@ -632,11 +757,15 @@ def reset_redis_bandwidth_state(confirm: bool = False) -> Dict[str, Any]:
 
 __all__ = [
     "VERSION",
+    "HOT_KEY_POLICIES",
+    "HISTORY_HOT_KEY_CACHE_SECONDS",
+    "PAPER_POSITION_CACHE_SECONDS",
     "instrumentation_enabled",
     "bandwidth_diet_enabled",
     "sanitize_redis_key",
     "classify_redis_key",
     "safe_cache_seconds_for_key",
+    "redis_key_requires_fresh_read",
     "ttl_seconds_for_key",
     "redis_get",
     "redis_set",

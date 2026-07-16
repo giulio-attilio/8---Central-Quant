@@ -2355,6 +2355,39 @@ def bot_health(key: str, cfg: dict):
     return payload
 
 
+def light_bot_health(key: str, cfg: dict):
+    """Build watchdog and /bots health from in-memory scalar state only.
+
+    It deliberately avoids bot loaders, Redis histories, Registry audits,
+    lifecycle audits, and position readers.
+    """
+    module = LOADED_BOTS.get(key)
+    raw_health = getattr(module, "HEALTH", {}) if module is not None else {}
+    raw_health = raw_health if isinstance(raw_health, dict) else {}
+    health = {
+        field: value
+        for field, value in raw_health.items()
+        if value is None or isinstance(value, (bool, int, float, str))
+    }
+    health["last_warning"] = clean_operational_warning(health.get("last_warning"))
+    return {
+        "name": cfg["name"],
+        "enabled": env_bool(cfg["enabled_env"], default=False),
+        "loaded": module is not None,
+        "token_configured": bool(os.environ.get(cfg["token_env"])),
+        "chat_configured": bool(os.environ.get(cfg["chat_env"])),
+        "load_error": LOAD_ERRORS.get(key),
+        "health": health,
+        "last_scanner_run": health.get("last_scanner_run"),
+        "last_management_run": health.get("last_management_run"),
+        "last_error": health.get("last_error"),
+        "minutes_since_scanner": minutes_since(health.get("last_scanner_run")),
+        "minutes_since_management": minutes_since(health.get("last_management_run")),
+        "health_source": "MODULE_MEMORY_LIGHT",
+        "heavy_history_loaded": False,
+    }
+
+
 def get_open_positions_from_module(module, key=None):
     positions = []
     label = key or getattr(module, "__name__", "unknown")
@@ -2525,7 +2558,7 @@ def central_watchdog_status():
     bots = {}
 
     for key, cfg in BOT_CONFIGS.items():
-        b = bot_health(key, cfg)
+        b = light_bot_health(key, cfg)
         bots[key] = b
 
         if not b["enabled"]:
@@ -11862,7 +11895,7 @@ def watchdog():
 
 @app.route("/bots")
 def bots():
-    return {key: bot_health(key, cfg) for key, cfg in BOT_CONFIGS.items()}
+    return {key: light_bot_health(key, cfg) for key, cfg in BOT_CONFIGS.items()}
 
 
 @app.route("/redis/bandwidth", methods=["GET"])
