@@ -50186,6 +50186,16 @@ def bot_health(key: str, cfg: dict):
         overlay = _frpol_v1_health_overlay()
         health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
         health.update(overlay)
+        warning = str(health.get("last_warning") or "")
+        stale_limit_markers = (
+            "Limite de posições reais atingido ou não confirmado",
+            "limite real Falcon atingido",
+        )
+        stale_limit_warning = any(marker.lower() in warning.lower() for marker in stale_limit_markers)
+        if overlay.get("falcon_real_position_ownership_limit_allowed") is True and stale_limit_warning:
+            health["last_warning"] = None
+            health["falcon_position_ownership_stale_warning_cleared"] = True
+            payload["falcon_position_ownership_stale_warning_cleared"] = True
         payload["health"] = health
         payload.update(overlay)
     if str(key).upper() == "PREDATOR":

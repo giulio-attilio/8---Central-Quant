@@ -91,12 +91,18 @@ def _falcon_live(**updates):
 
 
 def test_manual_btc_long_does_not_block_falcon_sol_long():
-    result = _evaluate(symbol="SOLUSDT", side="LONG", broker=[_manual_btc_long()])
+    for symbol, side in (
+        ("SOLUSDT", "LONG"),
+        ("SOLUSDT", "SHORT"),
+        ("XRPUSDT", "LONG"),
+        ("XRPUSDT", "SHORT"),
+    ):
+        result = _evaluate(symbol=symbol, side=side, broker=[_manual_btc_long()])
 
-    assert result["allowed"] is True
-    assert result["status"] == "allowed_with_external_manual_position"
-    assert result["falcon_owned_limit_count"] == 0
-    assert result["manual_external_ignored_for_falcon_own_limit"] is True
+        assert result["allowed"] is True
+        assert result["status"] == "allowed_with_external_manual_position"
+        assert result["falcon_owned_limit_count"] == 0
+        assert result["manual_external_ignored_for_falcon_own_limit"] is True
 
 
 def test_manual_btc_long_does_not_block_falcon_xrp_short():
@@ -188,6 +194,29 @@ def test_health_overlay_exposes_current_classification_not_stale_warning():
     assert overlay["falcon_real_position_ownership_limit_active_block"] is False
     assert overlay["falcon_manual_external_ignored_for_own_limit"] is True
     assert "Limite de posições reais atingido" not in str(overlay)
+
+
+def test_bots_health_clears_only_stale_aggregate_limit_warning():
+    current = _evaluate(symbol="SOLUSDT", side="LONG", broker=[_manual_btc_long()])
+    original = lambda _key, _cfg: {
+        "health": {
+            "last_warning": "execução bloqueada: ordem rejeitada: Limite de posições reais atingido ou não confirmado: 1 / 1",
+        }
+    }
+    namespace = {
+        "_ORIGINAL_BOT_HEALTH_FOR_PREDATOR_AUTO_CLOSED_SYNC_V1": original,
+        "_frpol_v1_health_overlay": lambda: {
+            "falcon_real_position_ownership_limit_status": current["status"],
+            "falcon_real_position_ownership_limit_allowed": current["allowed"],
+        },
+    }
+    bot_health = _functions(MAIN, {"bot_health"}, namespace)["bot_health"]
+
+    payload = bot_health("FALCON", {"name": "Falcon"})
+
+    assert payload["health"]["last_warning"] is None
+    assert payload["health"]["falcon_position_ownership_stale_warning_cleared"] is True
+    assert payload["falcon_real_position_ownership_limit_status"] == "allowed_with_external_manual_position"
 
 
 def _broker_validator(now=1_784_225_600.0):
