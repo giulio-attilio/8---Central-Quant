@@ -1395,6 +1395,62 @@ def central_can_open_trade(sig, positions=None):
 # ==============================================================================
 # PATCH 2026-07-11 — FALCON LIVE PARTIAL-CAPABLE SIZING / TP50 REAL V1
 # ==============================================================================
+FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION = "2026-07-16-FALCON-REAL-POSITION-OWNERSHIP-LIMIT-V1"
+FALCON_OWNERSHIP_EVIDENCE_MAX_AGE_SECONDS = 30.0
+
+
+def falcon_validate_position_ownership_limit_evidence(decision, sig=None, now_epoch=None):
+    """Validate Central ownership evidence before the Broker can be reached."""
+    decision = decision if isinstance(decision, dict) else {}
+    sig = sig if isinstance(sig, dict) else {}
+    evidence = decision.get("falcon_real_position_ownership_limit_v1")
+    if not isinstance(evidence, dict):
+        guard = decision.get("real_pilot_guard_v1") if isinstance(decision.get("real_pilot_guard_v1"), dict) else {}
+        evidence = guard.get("falcon_real_position_ownership_limit_v1")
+    reasons = []
+    if not isinstance(evidence, dict):
+        return {"ok": False, "status": "FALCON_OWNERSHIP_EVIDENCE_MISSING", "reasons": ["Falcon ownership evidence is required"], "evidence": None}
+    if evidence.get("version") != FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION:
+        reasons.append("ownership evidence version mismatch")
+    if evidence.get("allowed") is not True:
+        reasons.append("ownership evidence did not allow the entry")
+    if evidence.get("audit_ok") is not True or evidence.get("registry_mode_ok") is not True:
+        reasons.append("Falcon audit or Registry ownership is not confirmed")
+    numeric_checks = (
+        ("falcon_central_only_pending_count", "Falcon Central-only position is pending"),
+        ("falcon_ownership_uncertain_count", "Falcon ownership is uncertain"),
+        ("central_bingx_critical_divergence_count", "Central x BingX critical divergence is active"),
+        ("manual_same_symbol_side_count", "MANUAL_EXTERNAL_SAME_SYMBOL_SIDE_BLOCK"),
+        ("manual_same_symbol_opposite_ambiguous_count", "Manual position mode is ambiguous for the requested symbol"),
+    )
+    for field, reason in numeric_checks:
+        try:
+            if int(evidence.get(field) or 0) > 0:
+                reasons.append(reason)
+        except (TypeError, ValueError):
+            reasons.append(f"invalid ownership evidence field: {field}")
+    expected_symbol = normalize_symbol_for_central(sig.get("symbol"))
+    expected_side = str(sig.get("side") or "").upper().strip()
+    expected_side = "LONG" if expected_side in {"BUY", "LONG"} else ("SHORT" if expected_side in {"SELL", "SHORT"} else expected_side)
+    if expected_symbol and evidence.get("requested_symbol") != expected_symbol:
+        reasons.append("ownership evidence symbol mismatch")
+    if expected_side and evidence.get("requested_side") != expected_side:
+        reasons.append("ownership evidence side mismatch")
+    generated_epoch = evidence.get("generated_epoch")
+    try:
+        age = float(now_epoch if now_epoch is not None else time.time()) - float(generated_epoch)
+        if age < -1.0 or age > FALCON_OWNERSHIP_EVIDENCE_MAX_AGE_SECONDS:
+            reasons.append("ownership evidence expired")
+    except (TypeError, ValueError):
+        reasons.append("ownership evidence timestamp missing")
+    return {
+        "ok": not reasons,
+        "status": "FALCON_OWNERSHIP_EVIDENCE_OK" if not reasons else "FALCON_OWNERSHIP_EVIDENCE_BLOCKED",
+        "reasons": reasons,
+        "evidence": evidence,
+    }
+
+
 FALCON_LIVE_PARTIAL_CAPABLE_SIZING_VERSION = "2026-07-11-FALCON-LIVE-PARTIAL-CAPABLE-SIZING-V1"
 FALCON_TP50_REAL_EXECUTION_AUDIT_VERSION = "2026-07-11-FALCON-TP50-REAL-EXECUTION-AUDIT-V1"
 FALCON_REQUIRE_REAL_TP50_CAPABLE = str(os.environ.get("FALCON_REQUIRE_REAL_TP50_CAPABLE", "true")).lower() in {"1", "true", "yes", "sim", "on"}
@@ -1591,6 +1647,21 @@ def execute_signal_if_allowed(sig, positions=None):
         HEALTH["last_execution_decision"] = decision
         return False, decision
 
+    ownership_check = falcon_validate_position_ownership_limit_evidence(decision, sig=sig)
+    sig["falcon_real_position_ownership_limit_v1"] = ownership_check
+    if not ownership_check.get("ok"):
+        decision = {
+            "allowed": False,
+            "decision": "DENY",
+            "status": ownership_check.get("status"),
+            "reasons": list(ownership_check.get("reasons") or ["Falcon ownership evidence unavailable"]),
+            "warnings": [],
+            "falcon_real_position_ownership_limit_v1": ownership_check,
+        }
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
+
     try:
         client_tag = f"FALCON-LIVE-{sig.get('setup')}-{int(time.time())}"
         execution_auth_token = None
@@ -1636,6 +1707,7 @@ def execute_signal_if_allowed(sig, positions=None):
             bot="FALCON",
             execution_auth_token=execution_auth_token,
             stop_loss_price=sig.get("stop"),
+            falcon_position_ownership_limit=ownership_check.get("evidence"),
         )
         sig["live_order"] = order
         sig["live_order_id"] = order.get("id") or order.get("order_id")

@@ -15649,7 +15649,7 @@ def _broker_open_positions():
         contracts = p.get("contracts") or p.get("contractSize") or p.get("amount") or p.get("positionAmt")
         notional = p.get("notional") or p.get("initialMargin") or p.get("margin")
         symbol = normalize_symbol_for_risk(p.get("symbol") or (p.get("info") or {}).get("symbol"))
-        side = str(p.get("side") or (p.get("info") or {}).get("side") or "").upper()
+        side = str(p.get("side") or (p.get("info") or {}).get("side") or (p.get("info") or {}).get("positionSide") or "").upper()
         # CCXT costuma retornar contracts=0 para posição zerada.
         try:
             contracts_f = abs(float(contracts or 0))
@@ -15664,6 +15664,8 @@ def _broker_open_positions():
         rows.append({
             "symbol": symbol,
             "side": side,
+            "position_side": p.get("positionSide") or (p.get("info") or {}).get("positionSide"),
+            "position_mode": p.get("positionMode") or (p.get("info") or {}).get("positionMode"),
             "contracts": contracts,
             "notional": notional,
             "entry_price": p.get("entryPrice") or p.get("entry_price") or (p.get("info") or {}).get("avgPrice"),
@@ -39759,6 +39761,7 @@ if CENTRAL_AUTO_START_RUNTIME:
 # - Não bloquear reduceOnly/fechamento/gestão.
 # ============================================================================
 REAL_PILOT_GUARD_V1_SAFE_VERSION = "2026-07-08-REAL-PILOT-GUARD-V1.4-FALCON-MODE-PREFLIGHT"
+FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION = "2026-07-16-FALCON-REAL-POSITION-OWNERSHIP-LIMIT-V1"
 
 
 def _rpg_safe_now():
@@ -39985,6 +39988,193 @@ def _rpg_safe_config():
     }
 
 
+def _frpol_v1_identity(row):
+    """Return strong Central identity tokens; market attributes are excluded."""
+    row = row if isinstance(row, dict) else {}
+    aliases = (
+        ("trade_id", ("trade_id", "trade_registry_id")),
+        ("lifecycle_id", ("lifecycle_id",)),
+        ("client_order_id", ("client_order_id", "live_client_order_id")),
+        ("exchange_order_id", ("exchange_order_id", "order_id", "live_order_id", "bingx_order_id")),
+        ("position_id", ("position_id", "id")),
+    )
+    tokens = []
+    for identity_type, keys in aliases:
+        value = next((row.get(key) for key in keys if row.get(key) not in (None, "")), None)
+        if value not in (None, ""):
+            tokens.append(f"{identity_type}:{str(value).strip()}")
+    return tuple(tokens)
+
+
+def _frpol_v1_position_key(row):
+    row = row if isinstance(row, dict) else {}
+    return (
+        _rpg_safe_norm_symbol(row.get("symbol") or row.get("market_symbol")),
+        _rpg_safe_norm_side(row.get("side") or row.get("position_side") or row.get("positionSide")),
+    )
+
+
+def _frpol_v1_evaluate(payload, central_rows, broker_rows, audit, registry_gate, max_positions=1, errors=None):
+    """Evaluate Falcon's own LIVE limit without adopting external positions."""
+    payload = payload if isinstance(payload, dict) else {}
+    central_rows = [row for row in (central_rows or []) if isinstance(row, dict)]
+    broker_rows = [row for row in (broker_rows or []) if isinstance(row, dict)]
+    audit = audit if isinstance(audit, dict) else {}
+    registry_gate = registry_gate if isinstance(registry_gate, dict) else {}
+    max_positions = max(1, _rpg_safe_int(max_positions, 1))
+    requested_symbol = _rpg_safe_norm_symbol(payload.get("symbol") or payload.get("symbol_clean") or payload.get("pair") or payload.get("ativo"))
+    requested_side = _rpg_safe_norm_side(payload.get("side") or payload.get("direction") or payload.get("signal"))
+
+    central_by_key = {}
+    for row in central_rows:
+        key = _frpol_v1_position_key(row)
+        if key[0] and key[1]:
+            central_by_key.setdefault(key, []).append(row)
+    broker_by_key = {}
+    for row in broker_rows:
+        key = _frpol_v1_position_key(row)
+        if key[0] and key[1]:
+            broker_by_key.setdefault(key, []).append(row)
+
+    central_keys = set(central_by_key)
+    broker_keys = set(broker_by_key)
+    manual_keys = broker_keys - central_keys
+    matched_keys = broker_keys & central_keys
+    central_only_keys = central_keys - broker_keys
+
+    falcon_identity_keys = set()
+    falcon_uncertain_rows = []
+    falcon_rows = []
+    other_central_rows = []
+    central_only_falcon_rows = []
+    for row in central_rows:
+        if _rpg_safe_norm_bot(row.get("bot")) != "FALCON":
+            other_central_rows.append(row)
+            continue
+        falcon_rows.append(row)
+        identity = _frpol_v1_identity(row)
+        if identity:
+            falcon_identity_keys.add(identity[0])
+        else:
+            falcon_uncertain_rows.append(row)
+        if row.get("central_only_reconcile_required") or _frpol_v1_position_key(row) in central_only_keys:
+            central_only_falcon_rows.append(row)
+
+    manual_positions = []
+    same_symbol_side = []
+    same_symbol_opposite_ambiguous = []
+    for key in sorted(manual_keys):
+        for row in broker_by_key.get(key) or []:
+            position_side = str(row.get("position_side") or row.get("positionSide") or "").upper().strip()
+            position_mode = str(row.get("position_mode") or row.get("positionMode") or "").upper().strip()
+            explicit_hedge_side = position_side in {"LONG", "SHORT"} or position_mode in {"HEDGE", "HEDGED"}
+            item = {
+                "symbol": key[0],
+                "side": key[1],
+                "position_side": position_side or None,
+                "position_mode": position_mode or None,
+                "classification": "MANUAL_OR_EXTERNAL_POSITION",
+                "managed_by_central": False,
+                "counts_for_falcon_own_limit": False,
+            }
+            manual_positions.append(item)
+            if requested_symbol and requested_side and key == (requested_symbol, requested_side):
+                same_symbol_side.append(item)
+            elif requested_symbol and key[0] == requested_symbol and key[1] != requested_side and not explicit_hedge_side:
+                same_symbol_opposite_ambiguous.append(item)
+
+    unknown_registry_count = _rpg_safe_int(registry_gate.get("unknown_open_count"), 0)
+    ownership_uncertain_count = len(falcon_uncertain_rows) + max(0, unknown_registry_count)
+    falcon_owned_limit_count = len(falcon_identity_keys) + len(falcon_uncertain_rows)
+    audit_ok = audit.get("ok") is True
+    registry_ok = registry_gate.get("ok") is True and unknown_registry_count == 0
+    source_errors = [str(item) for item in (errors or []) if str(item)]
+    critical_divergence_count = len(central_only_keys)
+
+    reason_codes = []
+    reasons = []
+
+    def block(code, message):
+        if code not in reason_codes:
+            reason_codes.append(code)
+            reasons.append(message)
+
+    if source_errors:
+        block("OWNERSHIP_SOURCE_ERROR", "Falha ao confirmar as fontes de ownership; entrada Falcon bloqueada por segurança.")
+    if not audit_ok:
+        block("FALCON_AUDIT_NOT_OK", "Falcon Live Audit não está OK; nova entrada bloqueada.")
+    if not registry_ok:
+        block("OWNERSHIP_REGISTRY_NOT_OK", "Registry contém modo/ownership ausente ou não confirmado.")
+    if ownership_uncertain_count:
+        block("FALCON_OWNERSHIP_UNCERTAIN", "Há posição que pode pertencer ao Falcon sem identidade forte suficiente.")
+    if critical_divergence_count:
+        block("CENTRAL_BINGX_CRITICAL_DIVERGENCE", "Há posição Central-only; reconciliar antes de nova entrada Falcon.")
+    if central_only_falcon_rows:
+        block("FALCON_CENTRAL_ONLY_PENDING", "Há lifecycle Falcon Central-only pendente de reconciliação.")
+    if falcon_owned_limit_count >= max_positions:
+        block("FALCON_OWN_POSITION_LIMIT_REACHED", f"Limite próprio do Falcon atingido: {falcon_owned_limit_count}/{max_positions}.")
+    if same_symbol_side:
+        block("MANUAL_EXTERNAL_SAME_SYMBOL_SIDE_BLOCK", "Posição manual/externa no mesmo símbolo e lado; a BingX agregaria quantidades.")
+    if same_symbol_opposite_ambiguous:
+        block("MANUAL_EXTERNAL_SAME_SYMBOL_MODE_AMBIGUOUS_BLOCK", "Posição manual/externa no mesmo símbolo e modo de posição ambíguo; entrada bloqueada.")
+
+    allowed = not reason_codes
+    if "FALCON_CENTRAL_ONLY_PENDING" in reason_codes or "CENTRAL_BINGX_CRITICAL_DIVERGENCE" in reason_codes:
+        status = "blocked_by_central_only_pending"
+    elif "FALCON_OWNERSHIP_UNCERTAIN" in reason_codes or "OWNERSHIP_SOURCE_ERROR" in reason_codes or "FALCON_AUDIT_NOT_OK" in reason_codes or "OWNERSHIP_REGISTRY_NOT_OK" in reason_codes:
+        status = "blocked_by_ownership_uncertainty"
+    elif "FALCON_OWN_POSITION_LIMIT_REACHED" in reason_codes:
+        status = "blocked_by_own_falcon_limit"
+    elif "MANUAL_EXTERNAL_SAME_SYMBOL_SIDE_BLOCK" in reason_codes:
+        status = "blocked_by_manual_same_symbol_side"
+    elif reason_codes:
+        status = "blocked_by_ownership_uncertainty"
+    elif manual_positions:
+        status = "allowed_with_external_manual_position"
+    else:
+        status = "allowed_no_open_positions"
+
+    return {
+        "ok": allowed,
+        "allowed": allowed,
+        "status": status,
+        "version": FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION,
+        "generated_at": _rpg_safe_now(),
+        "generated_epoch": time.time(),
+        "bot": "FALCON",
+        "requested_symbol": requested_symbol,
+        "requested_side": requested_side,
+        "max_positions": max_positions,
+        "falcon_owned_limit_count": falcon_owned_limit_count,
+        "falcon_live_confirmed_count": len(falcon_identity_keys),
+        "falcon_tracking_active_count": len(falcon_identity_keys),
+        "falcon_central_only_pending_count": len(central_only_falcon_rows),
+        "falcon_ownership_uncertain_count": ownership_uncertain_count,
+        "central_other_bots_open_count": len(other_central_rows),
+        "central_bingx_critical_divergence_count": critical_divergence_count,
+        "central_live_count": len(central_rows),
+        "broker_bingx_open_count": len(broker_rows),
+        "broker_position_keys": sorted(f"{key[0]}|{key[1]}" for key in broker_keys),
+        "matched_market_attributes_count": len(matched_keys),
+        "matched_market_attributes_are_ownership_proof": False,
+        "manual_external_open_count": len(manual_positions),
+        "manual_external_positions": manual_positions,
+        "manual_same_symbol_side_count": len(same_symbol_side),
+        "manual_same_symbol_side": same_symbol_side,
+        "manual_same_symbol_opposite_ambiguous_count": len(same_symbol_opposite_ambiguous),
+        "manual_external_ignored_for_falcon_own_limit": bool(manual_positions),
+        "manual_external_managed_by_central": False,
+        "audit_ok": audit_ok,
+        "audit_status": audit.get("live_audit_status") or audit.get("status"),
+        "registry_mode_ok": registry_ok,
+        "registry_unknown_open_count": unknown_registry_count,
+        "reason_codes": reason_codes,
+        "reasons": reasons,
+        "source_errors": source_errors,
+        "operational_action_performed": False,
+    }
+
+
 def _rpg_safe_live_counts(payload=None):
     """Conta apenas posições pertencentes à Central para o limite do Falcon.
 
@@ -40097,6 +40287,106 @@ def _rpg_safe_live_counts(payload=None):
     owned_candidates = [x for x in owned_candidates if x is not None]
     counts["effective_central_owned_open_count"] = max(owned_candidates) if owned_candidates else None
     return counts
+
+
+def _frpol_v1_collect(payload=None):
+    """Read current ownership sources without changing positions or orders."""
+    payload = payload if isinstance(payload, dict) else {}
+    errors = []
+    central_rows = []
+    broker_rows = []
+    registry_gate = {}
+    audit = {}
+    try:
+        fn = globals().get("_central_live_positions_payload")
+        if not callable(fn):
+            raise RuntimeError("_central_live_positions_payload missing")
+        central_rows = fn() or []
+        if not isinstance(central_rows, list):
+            raise TypeError("central LIVE payload must be a list")
+    except Exception as exc:
+        errors.append(f"central_live_error: {exc}")
+        central_rows = []
+    try:
+        fn = globals().get("_broker_open_positions")
+        if not callable(fn):
+            raise RuntimeError("_broker_open_positions missing")
+        broker_rows, broker_error = fn()
+        broker_rows = broker_rows if isinstance(broker_rows, list) else []
+        if broker_error:
+            errors.append(f"broker_positions_error: {broker_error}")
+    except Exception as exc:
+        errors.append(f"broker_positions_error: {exc}")
+        broker_rows = []
+    try:
+        fn = globals().get("registry_mode_segregation_v1_gate_check")
+        if not callable(fn):
+            raise RuntimeError("registry mode gate missing")
+        registry_gate = fn(payload) or {}
+        if not isinstance(registry_gate, dict):
+            raise TypeError("registry mode gate must return a dict")
+    except Exception as exc:
+        errors.append(f"registry_mode_error: {exc}")
+        registry_gate = {}
+    try:
+        fn = globals().get("falcon_live_execution_audit_guard_v1_status")
+        if not callable(fn):
+            raise RuntimeError("Falcon audit missing")
+        audit = fn(include_recent=False) or {}
+        if not isinstance(audit, dict):
+            raise TypeError("Falcon audit must return a dict")
+    except Exception as exc:
+        errors.append(f"falcon_audit_error: {exc}")
+        audit = {}
+
+    cfg = _rpg_safe_config()
+    ownership = _frpol_v1_evaluate(
+        payload,
+        central_rows,
+        broker_rows,
+        audit,
+        registry_gate,
+        max_positions=cfg.get("max_open_positions"),
+        errors=errors,
+    )
+    return {
+        "central_live_count": len(central_rows),
+        "registry_real_open_count": _rpg_safe_int(registry_gate.get("real_open_count"), 0),
+        "unknown_open_count": _rpg_safe_int(registry_gate.get("unknown_open_count"), 0),
+        "registry_mode_status": registry_gate.get("status"),
+        "registry_mode_ok": registry_gate.get("ok") is True,
+        "broker_bingx_open_count": len(broker_rows),
+        "broker_bingx_open_count_total": len(broker_rows),
+        "broker_central_owned_open_count": ownership.get("matched_market_attributes_count"),
+        "manual_external_open_count": ownership.get("manual_external_open_count"),
+        "manual_same_symbol_side_count": ownership.get("manual_same_symbol_side_count"),
+        "manual_same_symbol_side": ownership.get("manual_same_symbol_side"),
+        "manual_external_positions": ownership.get("manual_external_positions"),
+        "manual_external_blocks_falcon": False,
+        "effective_central_owned_open_count": ownership.get("falcon_owned_limit_count"),
+        "falcon_owned_limit_count": ownership.get("falcon_owned_limit_count"),
+        "falcon_real_position_ownership_limit_v1": ownership,
+        "ownership_policy_version": FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION,
+        "errors": errors,
+    }
+
+
+def _frpol_v1_health_overlay():
+    """Expose a current, read-only classification instead of stale warnings."""
+    counts = _frpol_v1_collect({"bot": "FALCON"})
+    ownership = counts.get("falcon_real_position_ownership_limit_v1") or {}
+    return {
+        "falcon_real_position_ownership_limit_status": ownership.get("status"),
+        "falcon_real_position_ownership_limit_allowed": ownership.get("allowed"),
+        "falcon_real_position_ownership_limit_active_block": not bool(ownership.get("allowed")),
+        "falcon_real_position_ownership_limit_reason_codes": ownership.get("reason_codes") or [],
+        "falcon_owned_real_position_count": ownership.get("falcon_owned_limit_count"),
+        "falcon_manual_external_open_count": ownership.get("manual_external_open_count"),
+        "falcon_manual_external_ignored_for_own_limit": ownership.get("manual_external_ignored_for_falcon_own_limit"),
+        "falcon_central_only_pending_count": ownership.get("falcon_central_only_pending_count"),
+        "falcon_position_ownership_limit_last_check": ownership.get("generated_at"),
+        "falcon_position_ownership_limit_version": FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION,
+    }
 
 
 def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
@@ -40237,14 +40527,15 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
         else:
             warnings.append("FALCON_REAL_NOTIONAL_USDT não configurado; rota amostral usa notional do payload.")
 
-    counts = _rpg_safe_live_counts(payload)
+    counts = _frpol_v1_collect(payload) if bot == "FALCON" else _rpg_safe_live_counts(payload)
     max_open = _rpg_safe_int(cfg.get("max_open_positions"), 1)
-    effective_open = counts.get("effective_central_owned_open_count")
-    count_ok = effective_open is not None and effective_open < max_open and _rpg_safe_int(counts.get("unknown_open_count"), 0) == 0
+    ownership_limit = counts.get("falcon_real_position_ownership_limit_v1") if bot == "FALCON" else None
+    effective_open = counts.get("falcon_owned_limit_count") if bot == "FALCON" else counts.get("effective_central_owned_open_count")
+    count_ok = effective_open is not None and effective_open < max_open
     if effective_open is None and cfg.get("fail_closed"):
         count_ok = False
     add(
-        "MAX_OPEN_REAL_POSITIONS",
+        "FALCON_OWN_REAL_POSITION_LIMIT" if bot == "FALCON" else "MAX_OPEN_REAL_POSITIONS",
         count_ok,
         {
             "ok": f"Capacidade do Falcon disponível: posições Central-owned={effective_open}, max={max_open}; manuais não entram no limite.",
@@ -40253,13 +40544,29 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
         details={"counts": counts, "max_open_positions": max_open, "manual_positions_counted": False},
     )
 
+    if bot == "FALCON" and isinstance(ownership_limit, dict):
+        evidence_codes = set(ownership_limit.get("reason_codes") or []) - {
+            "FALCON_OWN_POSITION_LIMIT_REACHED",
+            "MANUAL_EXTERNAL_SAME_SYMBOL_SIDE_BLOCK",
+            "MANUAL_EXTERNAL_SAME_SYMBOL_MODE_AMBIGUOUS_BLOCK",
+        }
+        add(
+            "FALCON_OWNERSHIP_EVIDENCE_SAFE",
+            not evidence_codes,
+            {
+                "ok": "Ownership Falcon, Registry, auditoria e reconciliação confirmados.",
+                "fail": "Ownership Falcon não pôde ser confirmado com segurança: " + ", ".join(sorted(evidence_codes)),
+            },
+            details={"reason_codes": sorted(evidence_codes)},
+        )
+
     manual_collision_count = _rpg_safe_int(counts.get("manual_same_symbol_side_count"), 0)
     add(
-        "NO_MANUAL_SAME_SYMBOL_SIDE_COLLISION",
+        "MANUAL_EXTERNAL_SAME_SYMBOL_SIDE_BLOCK",
         manual_collision_count == 0,
         {
             "ok": "Nenhuma posição manual no mesmo símbolo e lado; ownership permanece isolado.",
-            "fail": "Existe posição manual no mesmo símbolo e lado. A BingX agrega a quantidade; entrada Falcon bloqueada somente para evitar gestão sobre a posição manual.",
+            "fail": "MANUAL_EXTERNAL_SAME_SYMBOL_SIDE_BLOCK: existe posição manual/externa no mesmo símbolo e lado; a BingX agregaria quantidades.",
         },
         blocking=True,
         details={
@@ -40269,6 +40576,17 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
             "collisions": counts.get("manual_same_symbol_side") or [],
         },
     )
+    if bot == "FALCON" and isinstance(ownership_limit, dict):
+        ambiguous_count = _rpg_safe_int(ownership_limit.get("manual_same_symbol_opposite_ambiguous_count"), 0)
+        add(
+            "MANUAL_EXTERNAL_SAME_SYMBOL_MODE_AMBIGUOUS_BLOCK",
+            ambiguous_count == 0,
+            {
+                "ok": "Nenhuma colisão manual ambígua no mesmo símbolo.",
+                "fail": "Posição manual no mesmo símbolo com modo hedge/one-way não confirmado; entrada Falcon bloqueada.",
+            },
+            details={"ambiguous_count": ambiguous_count},
+        )
     manual_external_count = _rpg_safe_int(counts.get("manual_external_open_count"), 0)
     if manual_external_count:
         warnings.append(
@@ -40319,6 +40637,7 @@ def real_pilot_guard_v1_safe_validate(payload=None, source="can_open_trade"):
         },
         "config": cfg,
         "counts": counts,
+        "falcon_real_position_ownership_limit_v1": ownership_limit,
         "checks": checks,
         "failed_blocking_codes": [c.get("code") for c in failed],
         "reasons": reasons,
@@ -40349,6 +40668,8 @@ def can_open_trade_decision(payload: dict):
     try:
         guard = real_pilot_guard_v1_safe_validate(payload, source="can_open_trade")
         result["real_pilot_guard_v1"] = guard
+        if isinstance(guard.get("falcon_real_position_ownership_limit_v1"), dict):
+            result["falcon_real_position_ownership_limit_v1"] = guard.get("falcon_real_position_ownership_limit_v1")
         if guard.get("applies") and not guard.get("allowed"):
             result["allowed"] = False
             result["decision"] = "DENY"
@@ -49857,6 +50178,12 @@ def bot_health(key: str, cfg: dict):
     }
     if isolated_compatibility and str(key).upper() == "FALCON" and callable(globals().get("_fcor_v1_health_overlay")):
         overlay = _fcor_v1_health_overlay()
+        health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+        health.update(overlay)
+        payload["health"] = health
+        payload.update(overlay)
+    if str(key).upper() == "FALCON" and callable(globals().get("_frpol_v1_health_overlay")):
+        overlay = _frpol_v1_health_overlay()
         health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
         health.update(overlay)
         payload["health"] = health

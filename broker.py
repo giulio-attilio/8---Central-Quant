@@ -1391,6 +1391,15 @@ def _broker_rpg_v1_norm_symbol(value):
     return str(value or "").upper().strip().replace("/USDT:USDT", "USDT").replace("/USDT", "USDT").replace(":USDT", "").replace("-", "").replace("/", "")
 
 
+def _broker_rpg_v1_norm_side(value):
+    side = str(value or "").upper().strip()
+    if side in {"BUY", "LONG"}:
+        return "LONG"
+    if side in {"SELL", "SHORT"}:
+        return "SHORT"
+    return side
+
+
 def _broker_rpg_v1_open_positions_count():
     try:
         positions = get_positions() or []
@@ -1417,13 +1426,90 @@ def _broker_rpg_v1_open_positions_count():
             open_items.append({
                 "symbol": p.get("symbol") or info.get("symbol"),
                 "side": p.get("side") or info.get("positionSide"),
+                "position_side": p.get("positionSide") or info.get("positionSide"),
                 "contracts": p.get("contracts") or info.get("positionAmt"),
                 "notional": p.get("notional") or p.get("positionValue") or info.get("positionValue"),
             })
     return {"ok": True, "count": len(open_items), "open_items": open_items[:10], "positions_checked": True}
 
 
-def broker_real_pilot_guard_v1_validate(*, symbol, side, bot=None, notional_usdt=None, preview=None, reduce_only=False, live_send_enabled=False, client_tag=None):
+FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION = "2026-07-16-FALCON-REAL-POSITION-OWNERSHIP-LIMIT-V1"
+FALCON_OWNERSHIP_EVIDENCE_MAX_AGE_SECONDS = 30.0
+
+
+def _broker_validate_falcon_ownership_limit(evidence, *, symbol, side, position_snapshot, max_positions):
+    """Fail closed unless fresh Central evidence matches the Broker snapshot."""
+    reasons = []
+    evidence = evidence if isinstance(evidence, dict) else {}
+    if evidence.get("version") != FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION:
+        reasons.append("ownership evidence version mismatch")
+    if evidence.get("allowed") is not True:
+        reasons.append("ownership evidence did not allow entry")
+    if evidence.get("audit_ok") is not True or evidence.get("registry_mode_ok") is not True:
+        reasons.append("audit or Registry ownership not confirmed")
+    if evidence.get("operational_action_performed") is not False:
+        reasons.append("ownership evidence action marker invalid")
+    for key in (
+        "falcon_central_only_pending_count",
+        "falcon_ownership_uncertain_count",
+        "central_bingx_critical_divergence_count",
+        "manual_same_symbol_side_count",
+        "manual_same_symbol_opposite_ambiguous_count",
+    ):
+        try:
+            if int(evidence.get(key) or 0) != 0:
+                reasons.append(f"{key} is not zero")
+        except (TypeError, ValueError):
+            reasons.append(f"{key} is invalid")
+    symbol_key = _broker_rpg_v1_norm_symbol(symbol)
+    side_key = _broker_rpg_v1_norm_side(side)
+    if evidence.get("requested_symbol") != symbol_key:
+        reasons.append("ownership evidence symbol mismatch")
+    if evidence.get("requested_side") != side_key:
+        reasons.append("ownership evidence side mismatch")
+    try:
+        age = time.time() - float(evidence.get("generated_epoch"))
+        if age < -1.0 or age > FALCON_OWNERSHIP_EVIDENCE_MAX_AGE_SECONDS:
+            reasons.append("ownership evidence expired")
+    except (TypeError, ValueError):
+        reasons.append("ownership evidence timestamp missing")
+    try:
+        falcon_count = int(evidence.get("falcon_owned_limit_count"))
+        if falcon_count < 0 or falcon_count >= int(max_positions):
+            reasons.append("Falcon own position limit reached or invalid")
+    except (TypeError, ValueError):
+        falcon_count = None
+        reasons.append("Falcon own position count missing")
+
+    position_snapshot = position_snapshot if isinstance(position_snapshot, dict) else {}
+    actual_items = position_snapshot.get("open_items") if isinstance(position_snapshot.get("open_items"), list) else []
+    actual_keys = sorted({
+        f"{_broker_rpg_v1_norm_symbol(item.get('symbol'))}|{_broker_rpg_v1_norm_side(item.get('side'))}"
+        for item in actual_items if isinstance(item, dict)
+    })
+    expected_keys = sorted({str(item) for item in (evidence.get("broker_position_keys") or [])})
+    if not position_snapshot.get("ok"):
+        reasons.append("Broker position snapshot unavailable")
+    try:
+        if int(position_snapshot.get("count") or 0) != int(evidence.get("broker_bingx_open_count") or 0):
+            reasons.append("Broker position count changed after Central decision")
+    except (TypeError, ValueError):
+        reasons.append("Broker position count evidence is invalid")
+    if actual_keys != expected_keys:
+        reasons.append("Broker position keys changed after Central decision")
+    return {
+        "ok": not reasons,
+        "allowed": not reasons,
+        "status": "FALCON_OWNERSHIP_LIMIT_EVIDENCE_CONFIRMED" if not reasons else "FALCON_OWNERSHIP_LIMIT_EVIDENCE_BLOCKED",
+        "version": FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION,
+        "reasons": reasons,
+        "falcon_owned_limit_count": falcon_count,
+        "broker_position_keys": actual_keys,
+        "manual_external_ignored_for_falcon_own_limit": evidence.get("manual_external_ignored_for_falcon_own_limit") is True,
+    }
+
+
+def broker_real_pilot_guard_v1_validate(*, symbol, side, bot=None, notional_usdt=None, preview=None, reduce_only=False, live_send_enabled=False, client_tag=None, falcon_position_ownership_limit=None):
     pilot_enabled, pilot_source = _broker_rpg_v1_bool_env([
         "CENTRAL_REAL_PILOT_ENABLED", "REAL_PILOT_ENABLED", "EXECUTION_REAL_PILOT_ENABLED", "BINGX_REAL_PILOT_ENABLED"
     ], False)
@@ -1486,10 +1572,31 @@ def broker_real_pilot_guard_v1_validate(*, symbol, side, bot=None, notional_usdt
     add("SYMBOL_ALLOWED", symbol_allowed, f"Símbolo {symbol_key} não está liberado no broker", {"allowed_symbols": sorted(BROKER_REAL_PILOT_ALLOWED_SYMBOLS)})
     add("NOTIONAL_LIMIT", effective_notional is not None and float(effective_notional) <= BROKER_REAL_PILOT_MAX_NOTIONAL_USDT, f"Notional {effective_notional} USDT acima do limite {BROKER_REAL_PILOT_MAX_NOTIONAL_USDT} USDT", {"notional_usdt": effective_notional, "max_notional_usdt": BROKER_REAL_PILOT_MAX_NOTIONAL_USDT})
     pos_count = _broker_rpg_v1_open_positions_count()
-    open_ok = bool(pos_count.get("ok") and int(pos_count.get("count") or 0) < BROKER_REAL_PILOT_MAX_OPEN_POSITIONS)
-    if not pos_count.get("ok") and BROKER_REAL_PILOT_FAIL_CLOSED:
-        open_ok = False
-    add("MAX_OPEN_REAL_POSITIONS", open_ok, f"Limite de posições reais atingido ou não confirmado: {pos_count.get('count')} / {BROKER_REAL_PILOT_MAX_OPEN_POSITIONS}", pos_count)
+    ownership_validation = None
+    if bot_key == "FALCON":
+        ownership_validation = _broker_validate_falcon_ownership_limit(
+            falcon_position_ownership_limit,
+            symbol=symbol_key,
+            side=side,
+            position_snapshot=pos_count,
+            max_positions=BROKER_REAL_PILOT_MAX_OPEN_POSITIONS,
+        )
+        open_ok = ownership_validation.get("allowed") is True
+        add(
+            "FALCON_OWN_REAL_POSITION_LIMIT",
+            open_ok,
+            (
+                f"Limite próprio Falcon confirmado: {ownership_validation.get('falcon_owned_limit_count')} / {BROKER_REAL_PILOT_MAX_OPEN_POSITIONS}; posição manual/externa não consome o limite."
+                if open_ok
+                else "Ownership/limite próprio Falcon ausente, alterado ou não confirmado."
+            ),
+            {"position_snapshot": pos_count, "ownership_validation": ownership_validation},
+        )
+    else:
+        open_ok = bool(pos_count.get("ok") and int(pos_count.get("count") or 0) < BROKER_REAL_PILOT_MAX_OPEN_POSITIONS)
+        if not pos_count.get("ok") and BROKER_REAL_PILOT_FAIL_CLOSED:
+            open_ok = False
+        add("MAX_OPEN_REAL_POSITIONS", open_ok, f"Limite de posições reais atingido ou não confirmado: {pos_count.get('count')} / {BROKER_REAL_PILOT_MAX_OPEN_POSITIONS}", pos_count)
 
     allowed = len(reasons) == 0
     return {
@@ -1506,6 +1613,7 @@ def broker_real_pilot_guard_v1_validate(*, symbol, side, bot=None, notional_usdt
         "max_notional_usdt": BROKER_REAL_PILOT_MAX_NOTIONAL_USDT,
         "max_open_positions": BROKER_REAL_PILOT_MAX_OPEN_POSITIONS,
         "open_positions": pos_count,
+        "falcon_position_ownership_limit": ownership_validation,
         "checks": checks,
         "reasons": reasons,
         "token_value_exposed": False,
@@ -1524,6 +1632,7 @@ def place_market_order(
     free_balance_usdt=None,
     execution_auth_token=None,
     stop_loss_price=None,
+    falcon_position_ownership_limit=None,
 ):
     """
     Broker V2.6.1 — Preview Isolation.
@@ -1767,6 +1876,7 @@ def place_market_order(
         reduce_only=reduce_only,
         live_send_enabled=live_send_enabled,
         client_tag=client_tag,
+        falcon_position_ownership_limit=falcon_position_ownership_limit,
     )
     if not real_pilot_guard.get("allowed"):
         result = {
