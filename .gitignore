@@ -6,6 +6,7 @@ __pycache__/
 
 # Test caches
 .pytest_cache/
+.pytest_tmp*/
 .coverage
 htmlcov/
 
@@ -29,3 +30,11 @@ Thumbs.db
 
 # Runtime lock files
 data/*.lock
+
+# Local runtime data and snapshots
+data/*.json
+data/*.jsonl
+
+# Local audit and inventory reports
+disk_forensics*.diff
+codex_inventory_report.md
