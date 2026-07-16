@@ -50223,6 +50223,287 @@ def predator_auto_closed_sync_v1_text_route():
     return build_predator_auto_closed_sync_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+# ============================================================================
+# FALCON BLOCKED TRADES DIAGNOSTIC V1 — READ ONLY
+# ============================================================================
+
+FALCON_BLOCKED_DIAGNOSTIC_V1_VERSION = "1.0.0"
+FALCON_BLOCKED_DIAGNOSTIC_V1_DEFAULT_LIMIT = 20
+FALCON_BLOCKED_DIAGNOSTIC_V1_MAX_LIMIT = 100
+FALCON_BLOCKED_DIAGNOSTIC_V1_MAX_SCAN = 1000
+FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN = "UNKNOWN_IN_EVENT"
+
+
+def _fbd_v1_limit(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = FALCON_BLOCKED_DIAGNOSTIC_V1_DEFAULT_LIMIT
+    return max(1, min(parsed, FALCON_BLOCKED_DIAGNOSTIC_V1_MAX_LIMIT))
+
+
+def _fbd_v1_containers(event):
+    """Return only known event containers; never query operational state."""
+    if not isinstance(event, dict):
+        return []
+    containers = [event]
+    for key in ("raw", "falcon_event", "execution_decision", "context", "details"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+    for key in ("falcon_event", "execution_decision", "context", "details"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    return containers
+
+
+def _fbd_v1_first(event, *keys):
+    for container in _fbd_v1_containers(event):
+        for key in keys:
+            value = container.get(key)
+            if value is not None and value != "" and value != [] and value != {}:
+                return value
+    return None
+
+
+def _fbd_v1_text(value, default=None, max_length=240):
+    fallback = FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN if default is None else default
+    if value is None or value == "" or value == [] or value == {}:
+        return fallback
+    if isinstance(value, (list, tuple, set)):
+        value = "; ".join(str(item) for item in value if item not in (None, ""))
+    elif isinstance(value, dict):
+        return fallback
+    text = " ".join(str(value).replace("\r", " ").replace("\n", " ").split())
+    return text[:max_length] if text else fallback
+
+
+def _fbd_v1_event_name(event):
+    return _fbd_v1_text(
+        _fbd_v1_first(event, "event", "event_type", "type", "state", "status"),
+        default="UNKNOWN",
+        max_length=80,
+    ).upper()
+
+
+def _fbd_v1_is_falcon_blocked(event):
+    if not isinstance(event, dict):
+        return False
+    if _fbd_v1_event_name(event) != "TRADE_BLOCKED":
+        return False
+    bot = _fbd_v1_text(_fbd_v1_first(event, "bot", "bot_name", "strategy"), default="", max_length=80).upper()
+    source = _fbd_v1_text(_fbd_v1_first(event, "source"), default="", max_length=80).upper()
+    return bot == "FALCON" or (not bot and source == "FALCON")
+
+
+def _fbd_v1_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    text = str(value or "").strip().upper()
+    if text in {"TRUE", "YES", "SIM", "1", "OK", "ALLOW", "ALLOWED", "BLOCKED"}:
+        return True
+    if text in {"FALSE", "NO", "NAO", "NÃO", "0", "DENY", "DENIED", "CLEAR"}:
+        return False
+    return FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN
+
+
+def _fbd_v1_epoch(value):
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fbd_v1_guard_category(guard, reason):
+    evidence = f"{guard} {reason}".upper()
+    if guard == FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN and reason == FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN:
+        return "unknown"
+    if any(token in evidence for token in ("OWNERSHIP", "MANUAL_EXTERNAL", "CENTRAL_ONLY", "POSITION_OWNERSHIP")):
+        return "ownership"
+    if any(token in evidence for token in ("BROKER_PILOT", "BROKER PILOT", "REAL_PILOT", "PILOT_GUARD")):
+        return "broker_pilot_guard"
+    if any(token in evidence for token in ("RISK", "RISCO", "EXPOSURE", "DRAWDOWN")):
+        return "risk"
+    return "other"
+
+
+def _fbd_v1_build_item(event, source_file="history_events.jsonl"):
+    reason = _fbd_v1_text(_fbd_v1_first(event, "block_reason", "reason", "motivo", "reasons"))
+    guard = _fbd_v1_text(_fbd_v1_first(event, "block_guard", "guard", "guard_name", "blocked_by"))
+    category = _fbd_v1_guard_category(guard, reason)
+    audit_value = _fbd_v1_first(event, "falcon_audit_ok", "audit_ok", "falcon_audit_status", "live_audit_status")
+    audit = _fbd_v1_bool(audit_value) if audit_value is not None else FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN
+    if isinstance(audit_value, str):
+        audit_status = audit_value.strip().upper()
+        if audit_status.startswith("OK"):
+            audit = True
+        elif any(token in audit_status for token in ("BLOCK", "DENY", "FAIL", "CRITICAL", "NOT_OK")):
+            audit = False
+    setup = _fbd_v1_text(_fbd_v1_first(event, "setup", "setup_label", "signal_type"), default="UNKNOWN", max_length=80).upper()
+    recommendation = (
+        "instrumentar bloqueio na origem"
+        if reason == FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN
+        else "revisar a evidencia registrada pelo guard antes de qualquer acao operacional"
+    )
+    return {
+        "timestamp": _fbd_v1_text(_fbd_v1_first(event, "ts", "created_at", "timestamp", "event_created_at"), default="UNKNOWN", max_length=80),
+        "symbol": _fbd_v1_text(_fbd_v1_first(event, "symbol"), default="UNKNOWN", max_length=40).upper(),
+        "side": _fbd_v1_text(_fbd_v1_first(event, "side", "direction"), default="UNKNOWN", max_length=20).upper(),
+        "setup": setup,
+        "candidate": setup if setup in {"FALCON15", "FALCON30"} else FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN,
+        "event_type": _fbd_v1_event_name(event),
+        "status": _fbd_v1_text(_fbd_v1_first(event, "status", "state"), default="TRADE_BLOCKED", max_length=80).upper(),
+        "sent": _fbd_v1_bool(_fbd_v1_first(event, "sent", "order_sent", "real_sent")),
+        "execution_mode": _fbd_v1_text(_fbd_v1_first(event, "execution_mode", "mode"), max_length=30).upper(),
+        "guard": guard,
+        "block_reason": reason,
+        "reason": reason,
+        "decision": _fbd_v1_text(_fbd_v1_first(event, "decision", "result", "risk_decision"), max_length=80),
+        "score": _fbd_v1_first(event, "score", "decision_score", "score_falcon"),
+        "risk_pct": _fbd_v1_first(event, "risk_pct", "risk"),
+        "source": _fbd_v1_text(_fbd_v1_first(event, "source"), default="falcon", max_length=80),
+        "source_file": _fbd_v1_text(_fbd_v1_first(event, "source_file"), default=source_file, max_length=120),
+        "bingx_position": _fbd_v1_first(event, "bingx_position", "bingx_positions", "bingx_position_count") if _fbd_v1_first(event, "bingx_position", "bingx_positions", "bingx_position_count") is not None else FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN,
+        "central_live_position": _fbd_v1_first(event, "central_live", "central_live_position", "central_live_positions", "central_live_count") if _fbd_v1_first(event, "central_live", "central_live_position", "central_live_positions", "central_live_count") is not None else FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN,
+        "central_only": _fbd_v1_first(event, "central_only", "central_only_count", "central_only_pending") if _fbd_v1_first(event, "central_only", "central_only_count", "central_only_pending") is not None else FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN,
+        "manual_external_same_symbol_side": _fbd_v1_bool(_fbd_v1_first(event, "manual_external_same_symbol_side", "manual_conflict", "same_symbol_side_manual_conflict")),
+        "falcon_audit_ok": audit,
+        "broker_pilot_guard_blocked": True if category == "broker_pilot_guard" else _fbd_v1_bool(_fbd_v1_first(event, "broker_pilot_guard_blocked")),
+        "ownership_guard_blocked": True if category == "ownership" else _fbd_v1_bool(_fbd_v1_first(event, "ownership_guard_blocked")),
+        "risk_guard_blocked": True if category == "risk" else _fbd_v1_bool(_fbd_v1_first(event, "risk_guard_blocked")),
+        "category": category,
+        "recommendation": recommendation,
+    }
+
+
+def _fbd_v1_load_events(scan_limit):
+    """Read a bounded local history tail. This function never calls Broker/BingX."""
+    import history_manager as manager
+
+    loaded = manager.load_events(limit=scan_limit, include_metadata=True)
+    if isinstance(loaded, dict):
+        rows = loaded.get("records") or []
+        source = str(getattr(manager, "HISTORY_EVENTS_FILE", "history_events.jsonl"))
+        return rows, Path(source).name, loaded.get("read_error")
+    return loaded if isinstance(loaded, list) else [], "history_events.jsonl", None
+
+
+def build_falcon_blocked_diagnostic_v1(limit=20):
+    safe_limit = _fbd_v1_limit(limit)
+    scan_limit = min(FALCON_BLOCKED_DIAGNOSTIC_V1_MAX_SCAN, max(100, safe_limit * 10))
+    try:
+        rows, source_file, read_error = _fbd_v1_load_events(scan_limit)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": FALCON_BLOCKED_DIAGNOSTIC_V1_VERSION,
+            "status": "SOURCE_READ_ERROR",
+            "read_only": True,
+            "events_analyzed": 0,
+            "blocked_count": 0,
+            "limit": safe_limit,
+            "items": [],
+            "summary": {"risk": 0, "broker_pilot_guard": 0, "ownership": 0, "other": 0, "unknown": 0},
+            "warnings": [f"history source unavailable: {type(exc).__name__}"],
+            "error": type(exc).__name__,
+        }
+
+    valid_rows = [row for row in (rows or []) if isinstance(row, dict)]
+    malformed_count = len(rows or []) - len(valid_rows)
+    blocked_indexed = [(index, row) for index, row in enumerate(valid_rows) if _fbd_v1_is_falcon_blocked(row)]
+    blocked_indexed.sort(key=lambda pair: (_fbd_v1_epoch(pair[1].get("epoch")), pair[0]), reverse=True)
+    blocked = [row for _, row in blocked_indexed]
+    items = [_fbd_v1_build_item(row, source_file=source_file) for row in blocked[:safe_limit]]
+    summary = {"risk": 0, "broker_pilot_guard": 0, "ownership": 0, "other": 0, "unknown": 0}
+    for item in items:
+        summary[item["category"]] = summary.get(item["category"], 0) + 1
+    warnings = []
+    if read_error:
+        warnings.append(f"history tail partial/read error: {_fbd_v1_text(read_error, max_length=80)}")
+    if malformed_count:
+        warnings.append(f"ignored malformed events: {malformed_count}")
+    return {
+        "ok": not bool(read_error),
+        "version": FALCON_BLOCKED_DIAGNOSTIC_V1_VERSION,
+        "status": "OK" if not read_error else "PARTIAL",
+        "read_only": True,
+        "events_analyzed": len(rows or []),
+        "falcon_blocked_found": len(blocked),
+        "blocked_count": len(items),
+        "limit": safe_limit,
+        "source_file": source_file,
+        "items": items,
+        "summary": summary,
+        "warnings": warnings,
+    }
+
+
+def build_falcon_blocked_diagnostic_v1_text(limit=20):
+    payload = build_falcon_blocked_diagnostic_v1(limit=limit)
+    lines = [
+        "FALCON BLOCKED TRADES — V1",
+        f"Status: {payload.get('status')}",
+        f"Eventos analisados: {payload.get('events_analyzed', 0)}",
+        f"Bloqueios exibidos: {payload.get('blocked_count', 0)}",
+        f"Fonte: {payload.get('source_file', 'UNKNOWN')}",
+        "",
+    ]
+    if not payload.get("items"):
+        lines.append("Nenhum bloqueio Falcon encontrado no recorte recente.")
+    for index, item in enumerate(payload.get("items") or [], start=1):
+        lines += [
+            f"{index}. {item.get('timestamp')} | {item.get('symbol')} {item.get('side')} | {item.get('setup')}",
+            f"   status: {item.get('status')}",
+            f"   event_type: {item.get('event_type')}",
+            f"   sent: {item.get('sent')}",
+            f"   execution_mode: {item.get('execution_mode')}",
+            f"   candidate: {item.get('candidate')}",
+            f"   reason: {item.get('reason')}",
+            f"   guard: {item.get('guard')}",
+            f"   decision: {item.get('decision')}",
+            f"   score: {item.get('score') if item.get('score') is not None else FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN}",
+            f"   risk_pct: {item.get('risk_pct') if item.get('risk_pct') is not None else FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN}",
+            f"   source: {item.get('source')} | file: {item.get('source_file')}",
+            f"   bingx_positions: {item.get('bingx_position')}",
+            f"   central_live: {item.get('central_live_position')}",
+            f"   central_only: {item.get('central_only')}",
+            f"   manual_conflict: {item.get('manual_external_same_symbol_side')}",
+            f"   audit_ok: {item.get('falcon_audit_ok')}",
+            f"   broker_pilot_guard_blocked: {item.get('broker_pilot_guard_blocked')}",
+            f"   ownership_guard_blocked: {item.get('ownership_guard_blocked')}",
+            f"   risk_guard_blocked: {item.get('risk_guard_blocked')}",
+            f"   recommendation: {item.get('recommendation')}",
+            "",
+        ]
+    summary = payload.get("summary") or {}
+    lines += [
+        "Resumo:",
+        f"- bloqueios por risk: {summary.get('risk', 0)}",
+        f"- bloqueios por broker pilot guard: {summary.get('broker_pilot_guard', 0)}",
+        f"- bloqueios por ownership: {summary.get('ownership', 0)}",
+        f"- bloqueios por outros guards registrados: {summary.get('other', 0)}",
+        f"- bloqueios por unknown: {summary.get('unknown', 0)}",
+    ]
+    for warning in payload.get("warnings") or []:
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+@app.route("/falcon/blocked", methods=["GET"])
+def falcon_blocked_diagnostic_v1_route():
+    return build_falcon_blocked_diagnostic_v1(limit=request.args.get("limit", FALCON_BLOCKED_DIAGNOSTIC_V1_DEFAULT_LIMIT)), 200
+
+
+@app.route("/falcon/blocked/text", methods=["GET"])
+def falcon_blocked_diagnostic_v1_text_route():
+    text = build_falcon_blocked_diagnostic_v1_text(limit=request.args.get("limit", FALCON_BLOCKED_DIAGNOSTIC_V1_DEFAULT_LIMIT))
+    return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=porta)
