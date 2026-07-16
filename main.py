@@ -2617,6 +2617,16 @@ def central_watchdog_loop():
                 status = central_watchdog_status()
             CENTRAL_HEALTH["watchdog_status"] = status["status"]
 
+            # Predator PAPER lifecycle hardening is deliberately outside the
+            # execution path.  The late-bound callback exists only after the
+            # whole module has loaded and is fail-isolated from the watchdog.
+            auto_closed_sync = globals().get("predator_auto_closed_sync_v1_tick")
+            if callable(auto_closed_sync):
+                try:
+                    auto_closed_sync()
+                except Exception as auto_sync_exc:
+                    CENTRAL_HEALTH["predator_auto_closed_sync_last_error"] = str(auto_sync_exc)
+
             if not status["ok"]:
                 last = float(CENTRAL_HEALTH.get("last_watchdog_alert_ts", 0) or 0)
                 if time.time() - last >= WATCHDOG_ALERT_COOLDOWN_SECONDS:
@@ -49348,6 +49358,532 @@ def falcon_central_only_reconciliation_v1_text_route():
     commit_requested, ack = _fcor_v1_request_commit_ack()
     payload = _fcor_v1_build_payload(commit_requested=commit_requested, ack=ack)
     return _fcor_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ============================================================================
+# PREDATOR AUTO CLOSED REGISTRY SYNC HARDENING V1 - PAPER ONLY
+# ============================================================================
+PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION = "2026-07-16-PREDATOR-AUTO-CLOSED-REGISTRY-SYNC-HARDENING-V1"
+PREDATOR_AUTO_CLOSED_SYNC_V1_ACK = "PREDATOR_AUTO_CLOSED_SYNC_FIX"
+PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED = str(
+    os.environ.get("PREDATOR_AUTO_CLOSED_SYNC_ENABLED", "true")
+).strip().lower() in {"1", "true", "yes", "sim", "on"}
+try:
+    PREDATOR_AUTO_CLOSED_SYNC_V1_MAX_PER_CYCLE = max(
+        1,
+        min(20, int(os.environ.get("PREDATOR_AUTO_CLOSED_SYNC_MAX_PER_CYCLE", "3"))),
+    )
+except Exception:
+    PREDATOR_AUTO_CLOSED_SYNC_V1_MAX_PER_CYCLE = 3
+try:
+    PREDATOR_AUTO_CLOSED_SYNC_V1_COOLDOWN_SECONDS = max(
+        60,
+        int(os.environ.get("PREDATOR_AUTO_CLOSED_SYNC_COOLDOWN_SECONDS", "300")),
+    )
+except Exception:
+    PREDATOR_AUTO_CLOSED_SYNC_V1_COOLDOWN_SECONDS = 300
+
+_PACS_V1_DATA_DIR = _pppa_v1_data_dir() if callable(globals().get("_pppa_v1_data_dir")) else Path(
+    os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "/data"
+)
+PREDATOR_AUTO_CLOSED_SYNC_V1_EVENTS_FILE = str(_PACS_V1_DATA_DIR / "predator_auto_closed_sync_v1_events.jsonl")
+PREDATOR_AUTO_CLOSED_SYNC_V1_LATEST_FILE = str(_PACS_V1_DATA_DIR / "predator_auto_closed_sync_v1_latest.json")
+_PREDATOR_AUTO_CLOSED_SYNC_V1_LOCK = threading.RLock()
+_PREDATOR_AUTO_CLOSED_SYNC_V1_STATE = {
+    "status": "NEVER_RUN",
+    "last_run": None,
+    "last_attempt_epoch": 0.0,
+    "last_repaired_count": 0,
+    "total_repaired_count": 0,
+    "pending_count": None,
+    "last_error": None,
+    "reason": "NOT_RUN",
+}
+
+
+def _pacs_v1_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on", "sent", "live"}
+
+
+def _pacs_v1_explicit_trade_id(event):
+    """Return only factual source identity; never synthesize ownership."""
+    raw = _pprsf_v1_extract_closed_raw(event) if isinstance(event, dict) else {}
+    value = raw.get("trade_id") or raw.get("uid")
+    return str(value).strip() if value not in (None, "") else None
+
+
+def _pacs_v1_event_safety(event):
+    if not isinstance(event, dict):
+        return False, "INVALID_EVENT"
+    raw = _pprsf_v1_extract_closed_raw(event)
+    if str(event.get("kind") or raw.get("kind") or "").upper() != "PAPER_CLOSED":
+        return False, "NOT_PAPER_CLOSED"
+    bot = str(raw.get("bot") or raw.get("robot") or "PREDATOR").upper().strip()
+    if bot != "PREDATOR":
+        return False, "NOT_PREDATOR"
+    for container in (event, raw, raw.get("raw") if isinstance(raw.get("raw"), dict) else {}):
+        mode = str(container.get("execution_mode") or container.get("mode") or "").upper().strip()
+        if mode and mode != "PAPER":
+            return False, f"EVENT_MODE_{mode}"
+        kind = str(container.get("kind") or container.get("event") or container.get("status") or "").upper()
+        if any(marker in kind for marker in ("LIVE_SENT", "REAL_SENT", "REAL_EXECUTION")):
+            return False, "REAL_OR_LIVE_EVENT"
+        for key in ("sent", "execution_sent", "real_sent", "order_sent", "live_sent"):
+            if key in container and _pacs_v1_bool(container.get(key), default=False):
+                return False, f"{key.upper()}_TRUE"
+    if not _pacs_v1_explicit_trade_id(event):
+        return False, "MISSING_EXPLICIT_TRADE_ID"
+    return True, "PAPER_EVENT_CONFIRMED"
+
+
+def _pacs_v1_plan_closed_repairs(registry, closed_events):
+    open_trades = _pprsf_v1_open_dict(registry)
+    closed_trades = _pprsf_v1_closed_list(registry)
+    open_ids = {str(item.get("trade_id") or key) for key, item in open_trades.items()}
+    closed_ids = {str(item.get("trade_id")) for item in closed_trades if item.get("trade_id")}
+    closed_signatures = {_pprsf_v1_closed_signature(item) for item in closed_trades}
+    candidates = {}
+    skipped = []
+    for event in closed_events or []:
+        safe, reason = _pacs_v1_event_safety(event)
+        trade_id = _pacs_v1_explicit_trade_id(event)
+        if not safe:
+            skipped.append({"trade_id": trade_id, "reason": reason})
+            continue
+        trade = _pprsf_v1_build_closed_trade_from_event(event)
+        if not isinstance(trade, dict) or str(trade.get("trade_id") or "") != trade_id:
+            skipped.append({"trade_id": trade_id, "reason": "INVALID_OR_MISMATCHED_CLOSED_EVENT"})
+            continue
+        candidates.setdefault(trade_id, []).append((trade, event))
+
+    planned = []
+    ambiguous = []
+    for trade_id, items in sorted(candidates.items()):
+        signatures = {_pprsf_v1_closed_signature(item[0]) for item in items}
+        if len(signatures) != 1:
+            ambiguous.append({"trade_id": trade_id, "reason": "AMBIGUOUS_TRADE_ID", "candidate_count": len(items)})
+            continue
+        trade, event = items[0]
+        signature = next(iter(signatures))
+        if trade_id in closed_ids or signature in closed_signatures:
+            skipped.append({"trade_id": trade_id, "reason": "ALREADY_CLOSED"})
+            continue
+        if trade_id in open_ids:
+            skipped.append({"trade_id": trade_id, "reason": "TRADE_STILL_OPEN_IN_REGISTRY"})
+            continue
+        trade = json.loads(json.dumps(trade, ensure_ascii=False, default=str))
+        trade["source"] = "predator_auto_closed_sync_v1"
+        metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+        metadata.update({
+            "sync_version": PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION,
+            "synced_at": _pprsf_v1_now(),
+            "source": "predator_auto_closed_sync_v1",
+            "reason": "PREDATOR_PAPER_CLOSED_MISSING_FROM_REGISTRY",
+            "execution_mode": "PAPER",
+            "execution_sent": False,
+            "source_event_key": (event.get("key") or event.get("event_key")),
+        })
+        trade["metadata"] = metadata
+        planned.append(trade)
+    return {"planned": planned, "skipped": skipped, "ambiguous": ambiguous}
+
+
+def _pacs_v1_storage_status():
+    if not _pprsf_v1_registry_available():
+        return {"ok": False, "reason": "REGISTRY_UNAVAILABLE", "active_file": None}
+    active = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "") or "")
+    configured = str(os.environ.get("CENTRAL_DATA_DIR") or os.environ.get("DATA_DIR") or "").strip()
+    normalized_active = active.replace("\\", "/")
+    normalized_configured = configured.replace("\\", "/").rstrip("/")
+    persistent = normalized_active.startswith("/data/") or bool(
+        normalized_configured and (
+            normalized_active == normalized_configured
+            or normalized_active.startswith(normalized_configured + "/")
+        )
+    )
+    state = globals().get("_TRPSF_V1_STATE") if isinstance(globals().get("_TRPSF_V1_STATE"), dict) else {}
+    if state.get("last_load_ok") is False or state.get("last_write_ok") is False:
+        persistent = False
+    return {
+        "ok": bool(persistent),
+        "reason": "PERSISTENT_STORAGE_READY" if persistent else "NON_PERSISTENT_STORAGE",
+        "active_file": active or None,
+    }
+
+
+def _pacs_v1_lifecycle_blockers(snapshot):
+    counts = snapshot.get("counts") if isinstance(snapshot, dict) and isinstance(snapshot.get("counts"), dict) else {}
+    required = {
+        "missing_registry_open_count",
+        "orphan_registry_open_count",
+        "missing_registry_closed_count",
+        "open_field_issue_count",
+        "duplicate_module_open_trade_id_count",
+        "duplicate_registry_open_trade_id_count",
+    }
+    missing = sorted(required.difference(counts))
+    blockers = ["LIFECYCLE_COUNTS_INCOMPLETE:" + ",".join(missing)] if missing else []
+    for field in sorted(required.difference({"missing_registry_closed_count"})):
+        try:
+            if int(counts.get(field) or 0) != 0:
+                blockers.append(f"{field}={counts.get(field)}")
+        except Exception:
+            blockers.append(f"{field}=INVALID")
+    real_count = ((snapshot.get("pnl_audit_summary") or {}).get("real_sent_or_live_event_count") if isinstance(snapshot, dict) else None)
+    if real_count is None:
+        blockers.append("REAL_SENT_OR_LIVE_COUNT_UNKNOWN")
+    else:
+        try:
+            if int(real_count) != 0:
+                blockers.append(f"real_sent_or_live_event_count={real_count}")
+        except Exception:
+            blockers.append("REAL_SENT_OR_LIVE_COUNT_INVALID")
+    return blockers
+
+
+def _pacs_v1_atomic_write_json(path, payload):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(target.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    os.replace(temp, target)
+
+
+def _pacs_v1_write_audit(payload):
+    try:
+        _pacs_v1_atomic_write_json(PREDATOR_AUTO_CLOSED_SYNC_V1_LATEST_FILE, payload)
+        events = Path(PREDATOR_AUTO_CLOSED_SYNC_V1_EVENTS_FILE)
+        events.parent.mkdir(parents=True, exist_ok=True)
+        with events.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "event": "PREDATOR_AUTO_CLOSED_SYNC_RUN",
+                "generated_at": payload.get("generated_at"),
+                "status": payload.get("status"),
+                "automatic": payload.get("automatic"),
+                "repaired_count": payload.get("repaired_count"),
+                "pending_count": payload.get("pending_count"),
+                "repaired_trade_ids": payload.get("repaired_trade_ids"),
+                "reason": payload.get("reason"),
+                "errors": payload.get("errors"),
+            }, ensure_ascii=False, default=str) + "\n")
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def _pacs_v1_health_overlay():
+    state = _PREDATOR_AUTO_CLOSED_SYNC_V1_STATE
+    return {
+        "predator_auto_closed_sync_status": state.get("status"),
+        "predator_auto_closed_sync_last_run": state.get("last_run"),
+        "predator_auto_closed_sync_repaired_count": state.get("last_repaired_count", 0),
+        "predator_auto_closed_sync_total_repaired_count": state.get("total_repaired_count", 0),
+        "predator_auto_closed_sync_pending_count": state.get("pending_count"),
+        "predator_auto_closed_sync_last_error": state.get("last_error"),
+        "predator_auto_closed_sync_enabled": PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED,
+        "predator_auto_closed_sync_reason": state.get("reason"),
+    }
+
+
+def predator_auto_closed_sync_v1_status(commit=False, ack=None, automatic=False, include_samples=True):
+    """Project factual Predator PAPER closures into Registry, never execution."""
+    commit = bool(commit)
+    automatic = bool(automatic)
+    ack_ok = str(ack or "").strip().upper() == PREDATOR_AUTO_CLOSED_SYNC_V1_ACK
+    generated_at = _pprsf_v1_now()
+    errors = []
+    warnings = []
+    repaired = []
+    before = {}
+    after_counts = None
+    registry, registry_error = _pprsf_v1_load_registry()
+    if registry is None:
+        errors.append(f"REGISTRY_UNAVAILABLE:{registry_error}")
+        plan = {"planned": [], "skipped": [], "ambiguous": []}
+        closed_events = []
+    else:
+        before = predator_paper_lifecycle_audit_v1_status(
+            include_samples=True,
+            limit=PREDATOR_AUDIT_REQUEST_SHARED_LIMIT,
+            use_cache=False,
+        )
+        closed_events, _ = _ppla_v1_get_closed_paper_events(limit=PREDATOR_AUDIT_REQUEST_SHARED_LIMIT)
+        plan = _pacs_v1_plan_closed_repairs(registry, closed_events)
+
+    mode = str((before or {}).get("mode") or "").upper().strip()
+    execution_enabled = (before or {}).get("execution_enabled")
+    firewall_enabled = (before or {}).get("execution_firewall_enabled")
+    storage = _pacs_v1_storage_status()
+    blockers = _pacs_v1_lifecycle_blockers(before) if registry is not None else []
+    if not PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED:
+        blockers.append("FEATURE_DISABLED")
+    if mode != "PAPER":
+        blockers.append(f"EXECUTION_MODE_NOT_PAPER:{mode or 'UNKNOWN'}")
+    if execution_enabled is not False:
+        blockers.append(f"EXECUTION_ENABLED_NOT_FALSE:{execution_enabled}")
+    if firewall_enabled is not True:
+        blockers.append(f"EXECUTION_FIREWALL_NOT_TRUE:{firewall_enabled}")
+    if not storage.get("ok"):
+        blockers.append(storage.get("reason") or "STORAGE_NOT_PERSISTENT")
+    if plan.get("ambiguous"):
+        blockers.append(f"AMBIGUOUS_TRADE_ID_COUNT:{len(plan.get('ambiguous') or [])}")
+    unsafe_skips = [item for item in plan.get("skipped") or [] if item.get("reason") not in {"ALREADY_CLOSED"}]
+    if unsafe_skips:
+        blockers.append(f"UNSAFE_OR_INVALID_EVENT_COUNT:{len(unsafe_skips)}")
+    missing_closed = ((before.get("counts") or {}).get("missing_registry_closed_count") if isinstance(before, dict) else None)
+    if missing_closed is not None:
+        expected = len(plan.get("planned") or [])
+        if int(missing_closed or 0) != expected:
+            blockers.append(f"MISSING_CLOSED_PLAN_MISMATCH:{missing_closed}!={expected}")
+    if commit and not automatic and not ack_ok:
+        blockers.append("ACK_REQUIRED")
+
+    max_per_cycle = PREDATOR_AUTO_CLOSED_SYNC_V1_MAX_PER_CYCLE
+    planned = list(plan.get("planned") or [])
+    selected = planned[:max_per_cycle]
+    committed = False
+    if commit and not blockers and selected:
+        registry_lock = getattr(central_trade_registry, "_lock", None)
+        acquired = False
+        try:
+            if registry_lock is not None and callable(getattr(registry_lock, "acquire", None)):
+                registry_lock.acquire()
+                acquired = True
+            fresh_registry, fresh_error = _pprsf_v1_load_registry()
+            if fresh_registry is None:
+                raise RuntimeError(f"REGISTRY_RELOAD_FAILED:{fresh_error}")
+            fresh_plan = _pacs_v1_plan_closed_repairs(fresh_registry, closed_events)
+            selected_ids = [item.get("trade_id") for item in selected]
+            fresh_by_id = {item.get("trade_id"): item for item in fresh_plan.get("planned") or []}
+            if any(trade_id not in fresh_by_id for trade_id in selected_ids):
+                raise RuntimeError("REGISTRY_CHANGED_DURING_SYNC")
+            working = json.loads(json.dumps(fresh_registry, ensure_ascii=False, default=str))
+            closed_list = _pprsf_v1_closed_list(working)
+            for trade_id in selected_ids:
+                trade = fresh_by_id[trade_id]
+                closed_list.append(trade)
+                repaired.append({"trade_id": trade_id, "closed_at": trade.get("closed_at")})
+            working["closed_trades"] = closed_list
+            working["last_update"] = generated_at
+            working["last_sync"] = {
+                "source": "predator_auto_closed_sync_v1",
+                "version": PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION,
+                "synced_at": generated_at,
+                "closed_repaired_count": len(repaired),
+                "automatic": automatic,
+            }
+            central_trade_registry.save_registry(working)
+            committed = True
+            after_counts = _pprsf_v1_recalculate_lifecycle_counts_from_registry(working)
+        except Exception as exc:
+            errors.append(str(exc))
+            repaired = []
+            committed = False
+        finally:
+            if acquired:
+                registry_lock.release()
+    elif commit and not blockers and not selected:
+        after_counts = (before or {}).get("counts")
+
+    pending_count = len(planned) - len(repaired)
+    if errors:
+        status = "ERROR"
+    elif blockers:
+        status = "BLOCKED_FAIL_CLOSED"
+    elif committed and pending_count:
+        status = "REPAIRED_PARTIAL"
+    elif committed:
+        status = "REPAIRED"
+    elif planned:
+        status = "REPAIR_READY"
+    else:
+        status = "OK_ALREADY_SYNCED"
+    reason = blockers[0] if blockers else (
+        "REPAIR_LIMIT_REACHED" if status == "REPAIRED_PARTIAL" else status
+    )
+    payload = {
+        "ok": not bool(errors or blockers),
+        "status": status,
+        "version": PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION,
+        "generated_at": generated_at,
+        "enabled": PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED,
+        "automatic": automatic,
+        "commit_requested": commit,
+        "ack_required": PREDATOR_AUTO_CLOSED_SYNC_V1_ACK,
+        "ack_ok": ack_ok or automatic,
+        "committed": committed,
+        "mode": mode or None,
+        "execution_enabled": execution_enabled,
+        "execution_firewall_enabled": firewall_enabled,
+        "real_sent_or_live_event_count": ((before.get("pnl_audit_summary") or {}).get("real_sent_or_live_event_count") if isinstance(before, dict) else None),
+        "max_repairs_per_cycle": max_per_cycle,
+        "planned_count": len(planned),
+        "selected_count": len(selected),
+        "repaired_count": len(repaired),
+        "pending_count": pending_count,
+        "skipped_count": len(plan.get("skipped") or []),
+        "ambiguous_count": len(plan.get("ambiguous") or []),
+        "reason": reason,
+        "blockers": blockers,
+        "warnings": warnings,
+        "errors": errors,
+        "repaired_trade_ids": [item.get("trade_id") for item in repaired],
+        "before_lifecycle_counts": (before or {}).get("counts"),
+        "after_lifecycle_counts": after_counts,
+        "after_lifecycle_status": (
+            "OK_WITH_WARNINGS"
+            if committed and after_counts and not any(int(after_counts.get(key) or 0) for key in (
+                "missing_registry_open_count", "orphan_registry_open_count", "missing_registry_closed_count"
+            ))
+            else None
+        ),
+        "storage": storage,
+        "files": {
+            "events": PREDATOR_AUTO_CLOSED_SYNC_V1_EVENTS_FILE,
+            "latest": PREDATOR_AUTO_CLOSED_SYNC_V1_LATEST_FILE,
+        },
+        "no_order_sent": True,
+        "broker_called": False,
+    }
+    if include_samples:
+        payload["samples"] = {
+            "planned": planned[:10],
+            "repaired": repaired[:10],
+            "skipped": (plan.get("skipped") or [])[:10],
+            "ambiguous": (plan.get("ambiguous") or [])[:10],
+        }
+    previous_status = _PREDATOR_AUTO_CLOSED_SYNC_V1_STATE.get("status")
+    should_write_audit = commit and (
+        not automatic
+        or committed
+        or bool(errors)
+        or previous_status != payload.get("status")
+    )
+    if should_write_audit:
+        audit_error = _pacs_v1_write_audit(payload)
+        if audit_error:
+            payload["errors"].append(f"AUDIT_WRITE_ERROR:{audit_error}")
+            payload["ok"] = False
+            payload["status"] = "REPAIRED_WITH_AUDIT_ERROR" if committed else "ERROR"
+    with _PREDATOR_AUTO_CLOSED_SYNC_V1_LOCK:
+        state = _PREDATOR_AUTO_CLOSED_SYNC_V1_STATE
+        state["status"] = payload.get("status")
+        state["last_run"] = generated_at
+        if commit:
+            state["last_attempt_epoch"] = time.time()
+        state["last_repaired_count"] = len(repaired)
+        state["total_repaired_count"] = int(state.get("total_repaired_count") or 0) + len(repaired)
+        state["pending_count"] = pending_count
+        state["last_error"] = "; ".join(payload.get("errors") or []) or None
+        state["reason"] = payload.get("reason")
+    return payload
+
+
+def predator_auto_closed_sync_v1_tick(force=False):
+    if not PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED:
+        return {"ok": True, "status": "DISABLED", "enabled": False}
+    now = time.time()
+    with _PREDATOR_AUTO_CLOSED_SYNC_V1_LOCK:
+        last = float(_PREDATOR_AUTO_CLOSED_SYNC_V1_STATE.get("last_attempt_epoch") or 0.0)
+    if not force and now - last < PREDATOR_AUTO_CLOSED_SYNC_V1_COOLDOWN_SECONDS:
+        return {"ok": True, "status": "COOLDOWN", "enabled": True, "next_in_seconds": int(PREDATOR_AUTO_CLOSED_SYNC_V1_COOLDOWN_SECONDS - (now - last))}
+    return predator_auto_closed_sync_v1_status(commit=True, automatic=True, include_samples=False)
+
+
+def build_predator_auto_closed_sync_v1_text(commit=False, ack=None):
+    payload = predator_auto_closed_sync_v1_status(commit=commit, ack=ack, automatic=False, include_samples=True)
+    before = payload.get("before_lifecycle_counts") or {}
+    after = payload.get("after_lifecycle_counts") or {}
+    lines = [
+        "PREDATOR AUTO CLOSED REGISTRY SYNC HARDENING V1",
+        f"Data/hora: {payload.get('generated_at')}",
+        f"Status: {payload.get('status')}",
+        f"Enabled: {payload.get('enabled')}",
+        f"Reason: {payload.get('reason')}",
+        "",
+        "Seguranca:",
+        f"- execution_mode: {payload.get('mode')}",
+        f"- execution_enabled: {payload.get('execution_enabled')}",
+        f"- execution_firewall_enabled: {payload.get('execution_firewall_enabled')}",
+        f"- REAL/sent=True: {payload.get('real_sent_or_live_event_count')}",
+        f"- broker_called: {payload.get('broker_called')}",
+        f"- no_order_sent: {payload.get('no_order_sent')}",
+        "",
+        "Preview/commit:",
+        f"- commit solicitado: {payload.get('commit_requested')}",
+        f"- ack_ok: {payload.get('ack_ok')}",
+        f"- committed: {payload.get('committed')}",
+        f"- planejados: {payload.get('planned_count')}",
+        f"- selecionados no ciclo: {payload.get('selected_count')}",
+        f"- reparados: {payload.get('repaired_count')}",
+        f"- pendentes: {payload.get('pending_count')}",
+        f"- limite por ciclo: {payload.get('max_repairs_per_cycle')}",
+        "",
+        "Lifecycle antes/depois:",
+        f"- Missing CLOSED: {before.get('missing_registry_closed_count')} -> {after.get('missing_registry_closed_count')}",
+        f"- Orphan OPEN: {before.get('orphan_registry_open_count')} -> {after.get('orphan_registry_open_count')}",
+        f"- Status depois: {payload.get('after_lifecycle_status')}",
+        "",
+        "Uso:",
+        "- Preview: /predator/autoclosedsync/text",
+        f"- Commit manual: /predator/autoclosedsync/text?commit=true&ack={PREDATOR_AUTO_CLOSED_SYNC_V1_ACK}",
+        "",
+        "Blockers:",
+    ]
+    lines.extend([f"- {item}" for item in payload.get("blockers") or []] or ["- Nenhum."])
+    lines += ["", "Errors:"]
+    lines.extend([f"- {item}" for item in payload.get("errors") or []] or ["- Nenhum."])
+    lines += ["", "Arquivos:", f"- Eventos: {PREDATOR_AUTO_CLOSED_SYNC_V1_EVENTS_FILE}", f"- Snapshot: {PREDATOR_AUTO_CLOSED_SYNC_V1_LATEST_FILE}"]
+    return "\n".join(lines)
+
+
+_ORIGINAL_BOT_HEALTH_FOR_PREDATOR_AUTO_CLOSED_SYNC_V1 = bot_health if "bot_health" in globals() else None
+
+
+def bot_health(key: str, cfg: dict):
+    original = globals().get("_ORIGINAL_BOT_HEALTH_FOR_PREDATOR_AUTO_CLOSED_SYNC_V1")
+    isolated_compatibility = not callable(original)
+    if isolated_compatibility:
+        # Alguns testes e diagnósticos compilam somente a última definição de
+        # bot_health. Nesse contexto, preserve o contrato do wrapper anterior
+        # sem exigir que a atribuição global intermediária também seja copiada.
+        original = globals().get("_TRPSF_V1_ORIGINAL_BOT_HEALTH")
+    payload = original(key, cfg) if callable(original) else {
+        "name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"
+    }
+    if isolated_compatibility and str(key).upper() == "FALCON" and callable(globals().get("_fcor_v1_health_overlay")):
+        overlay = _fcor_v1_health_overlay()
+        health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+        health.update(overlay)
+        payload["health"] = health
+        payload.update(overlay)
+    if str(key).upper() == "PREDATOR":
+        overlay = _pacs_v1_health_overlay()
+        health = payload.get("health") if isinstance(payload.get("health"), dict) else {}
+        health.update(overlay)
+        payload["health"] = health
+        payload.update(overlay)
+    return payload
+
+
+@app.route("/predator/autoclosedsync", methods=["GET", "POST"])
+def predator_auto_closed_sync_v1_route():
+    body = request.get_json(silent=True) or {}
+    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+    ack = body.get("ack", request.args.get("ack"))
+    return predator_auto_closed_sync_v1_status(commit=commit, ack=ack, automatic=False, include_samples=True), 200
+
+
+@app.route("/predator/autoclosedsync/text", methods=["GET", "POST"])
+def predator_auto_closed_sync_v1_text_route():
+    body = request.get_json(silent=True) or {}
+    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+    ack = body.get("ack", request.args.get("ack"))
+    return build_predator_auto_closed_sync_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 if __name__ == "__main__":
