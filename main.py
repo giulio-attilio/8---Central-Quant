@@ -127,6 +127,7 @@ from automatic_daily_summaries import (
     CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED,
     automatic_daily_summaries_health,
     central_daily_report_automatic_enabled,
+    central_daily_report_policy_reason,
 )
 from redis_bandwidth import build_redis_bandwidth_text, redis_bandwidth_report
 from telegram_notification_policy import (
@@ -1516,6 +1517,10 @@ CENTRAL_TELEGRAM_CHAT_ID = os.environ.get("CENTRAL_TELEGRAM_CHAT_ID")
 CENTRAL_TELEGRAM_POLLING_ENABLED = env_bool("CENTRAL_TELEGRAM_POLLING_ENABLED", True)
 CENTRAL_DAILY_REPORT_ENABLED = env_bool("CENTRAL_DAILY_REPORT_ENABLED", True)
 CENTRAL_DAILY_REPORT_TIME = os.environ.get("CENTRAL_DAILY_REPORT_TIME", "23:55")
+CENTRAL_DAILY_REPORT_RETRY_COOLDOWN_SECONDS = max(
+    60,
+    int(os.environ.get("CENTRAL_DAILY_REPORT_RETRY_COOLDOWN_SECONDS", "300")),
+)
 # A partir desta versão, "executivo" envia o Executive Report Diário compacto.
 # Use CENTRAL_DAILY_REPORT_MODE=dashboard, daily ou audit se quiser voltar aos modos antigos.
 CENTRAL_DAILY_REPORT_MODE = os.environ.get("CENTRAL_DAILY_REPORT_MODE", "executivo").strip().lower()
@@ -1678,6 +1683,12 @@ CENTRAL_SEND_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("CENTRAL_SEND_DUPLICA
 CENTRAL_TELEGRAM_ROUTER_STARTED = False
 CENTRAL_TELEGRAM_ROUTER_LOCK = threading.Lock()
 CENTRAL_DAILY_REPORT_SENT_DATE = None
+CENTRAL_DAILY_REPORT_THREAD_STARTED = False
+CENTRAL_DAILY_REPORT_LAST_RUN_AT = None
+CENTRAL_DAILY_REPORT_LAST_SUCCESS_AT = None
+CENTRAL_DAILY_REPORT_LAST_ERROR = None
+CENTRAL_DAILY_REPORT_LAST_STATUS = "NOT_RUN"
+CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH = None
 CENTRAL_MONTHLY_REPORT_SENT_KEY = None
 
 
@@ -11808,6 +11819,7 @@ def health():
     payload = central_watchdog_status()
     payload["trade_registry"] = central_trade_registry_snapshot(include_trades=False)
     payload.update(automatic_daily_summaries_health())
+    payload.update(central_daily_scheduler_health())
     if callable(globals().get("telegram_notification_policy_health")):
         payload.update(telegram_notification_policy_health())
     payload.update(
@@ -27948,13 +27960,186 @@ def central_telegram_command_loop():
         time.sleep(2)
 
 
+def _central_daily_report_scheduled_at(now):
+    """Return today's configured run time, or None for an invalid HH:MM."""
+    try:
+        hour_text, minute_text = str(CENTRAL_DAILY_REPORT_TIME).strip().split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            return None
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def central_daily_scheduler_health(now=None):
+    """Build lightweight scheduler health without generating a report."""
+    current = now or agora_sp()
+    enabled = central_daily_report_automatic_enabled(
+        CENTRAL_DAILY_REPORT_MODE,
+        CENTRAL_DAILY_REPORT_ENABLED,
+    )
+    policy_reason = central_daily_report_policy_reason(
+        CENTRAL_DAILY_REPORT_MODE,
+        CENTRAL_DAILY_REPORT_ENABLED,
+    )
+    scheduled = _central_daily_report_scheduled_at(current)
+    next_run = None
+    if enabled and scheduled is None:
+        policy_reason = "INVALID_DAILY_REPORT_TIME"
+    elif enabled:
+        today = current.strftime("%Y-%m-%d")
+        if CENTRAL_DAILY_REPORT_SENT_DATE == today:
+            next_run = scheduled + timedelta(days=1)
+        elif current < scheduled:
+            next_run = scheduled
+        else:
+            next_run = current
+            if CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH is not None:
+                retry_at = datetime.fromtimestamp(
+                    float(CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH)
+                    + CENTRAL_DAILY_REPORT_RETRY_COOLDOWN_SECONDS,
+                    tz=current.tzinfo,
+                )
+                if retry_at > current:
+                    next_run = retry_at
+    return {
+        "daily_summary_scheduler_enabled": bool(enabled and scheduled is not None),
+        "daily_summary_next_run_at": next_run.isoformat() if next_run else None,
+        "daily_summary_last_run_at": CENTRAL_DAILY_REPORT_LAST_RUN_AT,
+        "daily_summary_last_error": CENTRAL_DAILY_REPORT_LAST_ERROR,
+        "daily_summary_policy_reason": policy_reason,
+        "daily_summary_thread_started": bool(CENTRAL_DAILY_REPORT_THREAD_STARTED),
+        "daily_summary_last_success_at": CENTRAL_DAILY_REPORT_LAST_SUCCESS_AT,
+        "daily_summary_last_status": CENTRAL_DAILY_REPORT_LAST_STATUS,
+    }
+
+
+def central_daily_report_run_once(now=None):
+    """Attempt the Central daily report once without scheduling or looping."""
+    global CENTRAL_DAILY_REPORT_SENT_DATE
+    global CENTRAL_DAILY_REPORT_LAST_RUN_AT
+    global CENTRAL_DAILY_REPORT_LAST_SUCCESS_AT
+    global CENTRAL_DAILY_REPORT_LAST_ERROR
+    global CENTRAL_DAILY_REPORT_LAST_STATUS
+    global CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH
+
+    current = now or agora_sp()
+    today = current.strftime("%Y-%m-%d")
+    enabled = central_daily_report_automatic_enabled(
+        CENTRAL_DAILY_REPORT_MODE,
+        CENTRAL_DAILY_REPORT_ENABLED,
+    )
+    if not enabled:
+        CENTRAL_DAILY_REPORT_LAST_STATUS = "DISABLED"
+        return {"ok": True, "status": "DISABLED", "sent": False}
+
+    scheduled = _central_daily_report_scheduled_at(current)
+    if scheduled is None:
+        CENTRAL_DAILY_REPORT_LAST_STATUS = "INVALID_TIME"
+        CENTRAL_DAILY_REPORT_LAST_ERROR = "INVALID_DAILY_REPORT_TIME"
+        return {"ok": False, "status": "INVALID_TIME", "sent": False}
+    if CENTRAL_DAILY_REPORT_SENT_DATE == today:
+        CENTRAL_DAILY_REPORT_LAST_STATUS = "ALREADY_SENT"
+        return {"ok": True, "status": "ALREADY_SENT", "sent": False}
+    if current < scheduled:
+        CENTRAL_DAILY_REPORT_LAST_STATUS = "WAITING"
+        return {"ok": True, "status": "WAITING", "sent": False}
+
+    attempt_epoch = current.timestamp()
+    if (
+        CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH is not None
+        and attempt_epoch - float(CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH)
+        < CENTRAL_DAILY_REPORT_RETRY_COOLDOWN_SECONDS
+    ):
+        CENTRAL_DAILY_REPORT_LAST_STATUS = "RETRY_COOLDOWN"
+        return {"ok": True, "status": "RETRY_COOLDOWN", "sent": False}
+
+    CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH = attempt_epoch
+    CENTRAL_DAILY_REPORT_LAST_RUN_AT = current.isoformat()
+    CENTRAL_DAILY_REPORT_LAST_ERROR = None
+    CENTRAL_DAILY_REPORT_LAST_STATUS = "RUNNING"
+    print(f"GERANDO EXECUTIVE REPORT DIÁRIO CENTRAL {today} {current.strftime('%H:%M')}")
+
+    try:
+        try:
+            save_daily_snapshot(label="auto")
+        except Exception as exc:
+            print("ERRO SNAPSHOT RELATÓRIO DIÁRIO CENTRAL:", exc)
+
+        mode = (CENTRAL_DAILY_REPORT_MODE or "executivo").strip().lower()
+        if mode in {"completo", "full", "audit", "auditoria"}:
+            payload = build_audit_parts()
+            title = "RELATÓRIO DIÁRIO COMPLETO"
+            event_type = "AUTOMATIC_DAILY_SUMMARY"
+        elif mode in {"daily", "diario", "diário", "legacy"}:
+            payload = build_daily_report()
+            title = "RELATÓRIO DIÁRIO"
+            event_type = "AUTOMATIC_DAILY_SUMMARY"
+        elif mode in {"dashboard", "painel"}:
+            payload = build_dashboard_report()
+            title = "DASHBOARD DIÁRIO"
+            event_type = "AUTOMATIC_DAILY_SUMMARY"
+        else:
+            payload = build_ceo_daily_report()
+            title = "CEO DAILY REPORT"
+            event_type = "CENTRAL_CEO_DAILY_SUMMARY"
+    except Exception as exc:
+        CENTRAL_DAILY_REPORT_LAST_STATUS = "REPORT_BUILD_FAILED"
+        CENTRAL_DAILY_REPORT_LAST_ERROR = f"REPORT_BUILD_FAILED:{type(exc).__name__}"
+        return {"ok": False, "status": "REPORT_BUILD_FAILED", "sent": False}
+
+    try:
+        if not CENTRAL_TELEGRAM_BOT_TOKEN or not CENTRAL_TELEGRAM_CHAT_ID:
+            CENTRAL_DAILY_REPORT_LAST_STATUS = "CREDENTIALS_MISSING"
+            CENTRAL_DAILY_REPORT_LAST_ERROR = "TELEGRAM_CREDENTIALS_MISSING"
+            print("RELATÓRIO DIÁRIO CENTRAL NÃO ENVIADO: token/chat ausente")
+            return {"ok": False, "status": "CREDENTIALS_MISSING", "sent": False}
+
+        send_result = central_send_automatic_telegram(
+            CENTRAL_TELEGRAM_BOT_TOKEN,
+            CENTRAL_TELEGRAM_CHAT_ID,
+            payload,
+            title=title,
+            event_type=event_type,
+            mode="PAPER",
+            return_result=True,
+        )
+        result_payload = send_result if isinstance(send_result, dict) else {"sent": bool(send_result)}
+        if not result_payload.get("sent"):
+            reason = str(
+                result_payload.get("transport_error")
+                or (
+                    result_payload.get("reason")
+                    if not result_payload.get("allowed", True)
+                    else "TELEGRAM_SEND_FAILED"
+                )
+            )
+            CENTRAL_DAILY_REPORT_LAST_STATUS = "SEND_FAILED"
+            CENTRAL_DAILY_REPORT_LAST_ERROR = reason
+            return {"ok": False, "status": "SEND_FAILED", "sent": False, "reason": reason}
+
+        CENTRAL_DAILY_REPORT_SENT_DATE = today
+        CENTRAL_DAILY_REPORT_LAST_SUCCESS_AT = current.isoformat()
+        CENTRAL_DAILY_REPORT_LAST_ERROR = None
+        CENTRAL_DAILY_REPORT_LAST_STATUS = "SENT"
+        return {"ok": True, "status": "SENT", "sent": True}
+    finally:
+        try:
+            del payload
+        except Exception:
+            pass
+        force_gc_if_needed("central_daily_report_after_send", force=True)
+
+
 def central_daily_report_loop():
     """
     Envia relatórios automáticos pelo Telegram exclusivo da Central.
     - Diário: Executive Report compacto no horário configurado.
     - Mensal: dia 1 às 00:05 por padrão, consolidando o mês anterior.
     """
-    global CENTRAL_DAILY_REPORT_SENT_DATE, CENTRAL_MONTHLY_REPORT_SENT_KEY
+    global CENTRAL_MONTHLY_REPORT_SENT_KEY
 
     automatic_daily_enabled = central_daily_report_automatic_enabled(
         CENTRAL_DAILY_REPORT_MODE,
@@ -27968,48 +28153,10 @@ def central_daily_report_loop():
         try:
             now = agora_sp()
             current_hm = now.strftime("%H:%M")
-            today = now.strftime("%Y-%m-%d")
 
             # Relatório diário.
-            if automatic_daily_enabled and current_hm == CENTRAL_DAILY_REPORT_TIME and CENTRAL_DAILY_REPORT_SENT_DATE != today:
-                print(f"GERANDO EXECUTIVE REPORT DIÁRIO CENTRAL {today} {current_hm}")
-                try:
-                    save_daily_snapshot(label="auto")
-                except Exception as exc:
-                    print("ERRO SNAPSHOT RELATÓRIO DIÁRIO CENTRAL:", exc)
-
-                mode = (CENTRAL_DAILY_REPORT_MODE or "executivo").strip().lower()
-                if mode in {"completo", "full", "audit", "auditoria"}:
-                    payload = build_audit_parts()
-                    title = "RELATÓRIO DIÁRIO COMPLETO"
-                elif mode in {"daily", "diario", "diário", "legacy"}:
-                    payload = build_daily_report()
-                    title = "RELATÓRIO DIÁRIO"
-                elif mode in {"dashboard", "painel"}:
-                    payload = build_dashboard_report()
-                    title = "DASHBOARD DIÁRIO"
-                else:
-                    payload = build_ceo_daily_report()
-                    title = "CEO DAILY REPORT"
-
-                if CENTRAL_TELEGRAM_BOT_TOKEN and CENTRAL_TELEGRAM_CHAT_ID:
-                    central_send_automatic_telegram(
-                        CENTRAL_TELEGRAM_BOT_TOKEN,
-                        CENTRAL_TELEGRAM_CHAT_ID,
-                        payload,
-                        title=title,
-                        event_type="AUTOMATIC_DAILY_SUMMARY",
-                        mode="PAPER",
-                    )
-                else:
-                    print("RELATÓRIO DIÁRIO CENTRAL NÃO ENVIADO: token/chat ausente")
-
-                try:
-                    del payload
-                except Exception:
-                    pass
-                force_gc_if_needed("central_daily_report_after_send", force=True)
-                CENTRAL_DAILY_REPORT_SENT_DATE = today
+            if automatic_daily_enabled:
+                central_daily_report_run_once(now=now)
 
             # Relatório mensal: por padrão, dia 1 às 00:05, consolidando o mês anterior.
             if CENTRAL_MONTHLY_REPORT_ENABLED and now.day == CENTRAL_MONTHLY_REPORT_DAY and current_hm == CENTRAL_MONTHLY_REPORT_TIME:
@@ -28248,6 +28395,7 @@ def central_send_automatic_telegram(
     mode,
     severity=None,
     operational_critical=False,
+    return_result=False,
 ):
     result = send_automatic_telegram(
         lambda message: telegram_send_with_token(token, chat_id, message, title=title),
@@ -28258,7 +28406,7 @@ def central_send_automatic_telegram(
         severity=severity,
         operational_critical=operational_critical,
     )
-    return bool(result.get("sent"))
+    return result if return_result else bool(result.get("sent"))
 
 
 def build_command_reply_for_module(key: str, module, cmd: str):
@@ -29239,6 +29387,7 @@ def trendpro_daily_summary_v1_text_route():
 
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED, LEARNING_AUTO_REFRESH_THREAD_STARTED
+    global CENTRAL_DAILY_REPORT_THREAD_STARTED, CENTRAL_DAILY_REPORT_LAST_STATUS
 
     with CENTRAL_RUNTIME_LOCK:
         if CENTRAL_RUNTIME_STARTED:
@@ -29284,7 +29433,9 @@ def start_central_runtime_once():
     if central_daily_automatic_enabled or CENTRAL_MONTHLY_REPORT_ENABLED:
         if acquire_runtime_file_lock("central_daily_report"):
             threading.Thread(target=central_daily_report_loop, daemon=True).start()
+            CENTRAL_DAILY_REPORT_THREAD_STARTED = True
         else:
+            CENTRAL_DAILY_REPORT_LAST_STATUS = "LOCK_NOT_ACQUIRED"
             print("RELATÓRIO DIÁRIO CENTRAL NÃO INICIADO: outro processo já é líder")
 
     if CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED and TRENDPRO_DAILY_SUMMARY_ENABLED:

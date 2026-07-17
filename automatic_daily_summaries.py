@@ -54,7 +54,7 @@ def central_daily_report_automatic_enabled(
     legacy_daily_enabled: bool = True,
 ) -> bool:
     """Return whether the configured Central daily mode may run automatically."""
-    if not legacy_daily_enabled or not CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED:
+    if not legacy_daily_enabled:
         return False
     if mode is None:
         return False
@@ -62,10 +62,33 @@ def central_daily_report_automatic_enabled(
     if not normalized_mode:
         return False
     if normalized_mode in CENTRAL_STANDARD_DAILY_MODES:
-        return True
+        return CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
     if normalized_mode in CENTRAL_CEO_DAILY_MODES:
         return CENTRAL_AUTO_CEO_DAILY_ENABLED
     return False
+
+
+def central_daily_report_policy_reason(
+    mode: str | None,
+    legacy_daily_enabled: bool = True,
+) -> str:
+    """Explain the lightweight policy decision without building a report."""
+    if not legacy_daily_enabled:
+        return "DISABLED_LEGACY_DAILY_REPORT"
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode in CENTRAL_STANDARD_DAILY_MODES:
+        return (
+            "STANDARD_DAILY_POLICY"
+            if CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
+            else "DISABLED_GLOBAL_DAILY_POLICY"
+        )
+    if normalized_mode in CENTRAL_CEO_DAILY_MODES:
+        return (
+            "CENTRAL_CEO_DAILY_POLICY"
+            if CENTRAL_AUTO_CEO_DAILY_ENABLED
+            else "DISABLED_CEO_DAILY_POLICY"
+        )
+    return "DISABLED_UNKNOWN_DAILY_MODE"
 
 
 def automatic_daily_summaries_health() -> dict:
@@ -86,4 +109,5 @@ __all__ = [
     "CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED",
     "automatic_daily_summaries_health",
     "central_daily_report_automatic_enabled",
+    "central_daily_report_policy_reason",
 ]

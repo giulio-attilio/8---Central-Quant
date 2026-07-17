@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 _TRUE_VALUES = {"1", "true", "yes", "sim", "on"}
 _VERIFY_MODES = {"VERIFY", "DRY_RUN", "SHADOW", "OBSERVATION_ONLY"}
+CENTRAL_CEO_DAILY_EVENT_TYPE = "CENTRAL_CEO_DAILY_SUMMARY"
 LIVE_OPERATIONAL_EVENT_TYPES = frozenset(
     {
         "SIGNAL_LIVE_AUTHORIZED",
@@ -83,6 +84,7 @@ _METRICS = {
     "telegram_auto_allowed_live_operational": 0,
     "telegram_auto_allowed_critical": 0,
     "telegram_auto_allowed_manual": 0,
+    "telegram_auto_allowed_central_ceo_daily": 0,
     "telegram_auto_blocked_paper": 0,
     "telegram_auto_blocked_verify": 0,
     "telegram_auto_blocked_unknown": 0,
@@ -134,6 +136,11 @@ def should_send_automatic_telegram(
             allowed, reason = True, "MANUAL_COMMAND"
         elif operational_critical is True:
             allowed, reason = True, "CRITICAL_OVERRIDE"
+        elif (
+            normalized_bot == "CENTRAL"
+            and normalized_event == CENTRAL_CEO_DAILY_EVENT_TYPE
+        ):
+            allowed, reason = True, "CENTRAL_CEO_DAILY_POLICY"
         elif not enabled:
             allowed, reason = True, "LEGACY_POLICY_DISABLED"
         elif normalized_mode != "LIVE":
@@ -156,6 +163,10 @@ def should_send_automatic_telegram(
             "known_live_event": normalized_event in LIVE_OPERATIONAL_EVENT_TYPES,
             "live_operational_event": normalized_event in LIVE_OPERATIONAL_EVENT_TYPES,
             "live_informational_event": normalized_event in LIVE_INFORMATIONAL_EVENT_TYPES,
+            "central_ceo_daily_event": (
+                normalized_bot == "CENTRAL"
+                and normalized_event == CENTRAL_CEO_DAILY_EVENT_TYPE
+            ),
         }
     except Exception:
         # Manual/crítico explicitamente marcado continua permitido; o restante fecha.
@@ -173,6 +184,7 @@ def should_send_automatic_telegram(
             "known_live_event": False,
             "live_operational_event": False,
             "live_informational_event": False,
+            "central_ceo_daily_event": False,
         }
 
 
@@ -182,6 +194,8 @@ def _record_decision(decision):
             _METRICS["telegram_auto_allowed_manual"] += 1
         elif decision.get("critical_override"):
             _METRICS["telegram_auto_allowed_critical"] += 1
+        elif decision.get("central_ceo_daily_event") and decision.get("allowed"):
+            _METRICS["telegram_auto_allowed_central_ceo_daily"] += 1
         elif decision.get("allowed") and decision.get("mode") == "LIVE":
             _METRICS["telegram_auto_allowed_live"] += 1
             _METRICS["telegram_auto_allowed_live_operational"] += 1
@@ -213,6 +227,8 @@ def _log_decision(decision):
                 reason = "MANUAL_COMMAND"
             elif decision.get("critical_override"):
                 reason = "CRITICAL_OVERRIDE"
+            elif decision.get("central_ceo_daily_event"):
+                reason = "CENTRAL_CEO_DAILY_POLICY"
             elif decision.get("mode") == "LIVE":
                 reason = "LIVE_OPERATIONAL_EVENT"
             else:
@@ -282,12 +298,14 @@ def telegram_notification_policy_health(environ=None):
         "telegram_paper_auto_notifications_enabled": not enabled,
         "telegram_live_auto_notifications_enabled": True,
         "telegram_critical_notifications_enabled": True,
+        "telegram_central_ceo_daily_enabled": True,
         **dict(_METRICS),
     }
 
 
 __all__ = [
     "CRITICAL_EVENT_TYPES",
+    "CENTRAL_CEO_DAILY_EVENT_TYPE",
     "LIVE_INFORMATIONAL_EVENT_TYPES",
     "LIVE_OPERATIONAL_EVENT_TYPES",
     "send_automatic_telegram",

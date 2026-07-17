@@ -112,6 +112,46 @@ def test_non_live_automatic_is_blocked(mode):
     assert result["reason"] == "LIVE_ONLY_POLICY"
 
 
+def test_central_ceo_daily_is_the_only_paper_summary_policy_exception():
+    result = decide(
+        bot="CENTRAL",
+        event_type="CENTRAL_CEO_DAILY_SUMMARY",
+        mode="PAPER",
+    )
+    assert result["allowed"] is True
+    assert result["reason"] == "CENTRAL_CEO_DAILY_POLICY"
+    assert result["central_ceo_daily_event"] is True
+
+    calls = []
+    sent = policy.send_automatic_telegram(
+        lambda message: calls.append(message) or True,
+        "ceo daily",
+        bot="CENTRAL",
+        event_type="CENTRAL_CEO_DAILY_SUMMARY",
+        mode="PAPER",
+        environ={},
+    )
+    assert sent["sent"] is True
+    assert calls == ["ceo daily"]
+
+
+@pytest.mark.parametrize("bot", ["FALCON", "PREDATOR", "TURTLE", "DONKEY", "COBRA", "MEME", "TRENDPRO"])
+def test_bot_paper_daily_summaries_remain_blocked(bot):
+    result = decide(bot=bot, event_type="AUTOMATIC_DAILY_SUMMARY", mode="PAPER")
+    assert result["allowed"] is False
+    assert result["reason"] == "LIVE_ONLY_POLICY"
+
+
+def test_central_ceo_event_name_does_not_allow_another_bot():
+    result = decide(
+        bot="FALCON",
+        event_type="CENTRAL_CEO_DAILY_SUMMARY",
+        mode="PAPER",
+    )
+    assert result["allowed"] is False
+    assert result["reason"] == "LIVE_ONLY_POLICY"
+
+
 def test_manual_paper_is_allowed():
     result = decide(manual_command=True)
     assert result["allowed"] is True
@@ -270,6 +310,7 @@ def test_health_is_lightweight_and_in_memory():
         "telegram_auto_allowed_live_operational",
         "telegram_auto_allowed_critical",
         "telegram_auto_allowed_manual",
+        "telegram_auto_allowed_central_ceo_daily",
         "telegram_auto_blocked_paper",
         "telegram_auto_blocked_verify",
         "telegram_auto_blocked_unknown",
@@ -278,6 +319,7 @@ def test_health_is_lightweight_and_in_memory():
     }
     assert expected <= set(health)
     assert health["telegram_paper_auto_notifications_enabled"] is False
+    assert health["telegram_central_ceo_daily_enabled"] is True
 
 
 def test_policy_module_has_no_network_threads_or_persistence():
@@ -424,9 +466,14 @@ def test_falcon_startup_has_explicit_informational_context_and_no_new_cooldown()
 
 def test_central_manual_command_transport_remains_direct():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
-    start = source.index("def central_telegram_command_loop")
-    end = source.index("def central_daily_report_loop", start)
-    command_loop = source[start:end]
+    tree = ast.parse(source)
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "central_telegram_command_loop"
+    )
+    command_loop = ast.get_source_segment(source, node)
     assert "telegram_send_with_token" in command_loop
     assert "central_send_automatic_telegram" not in command_loop
     for command in ("/live", "/sync", "/bots", "/health", "/resumo"):

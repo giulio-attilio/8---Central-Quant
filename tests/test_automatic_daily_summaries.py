@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -146,13 +147,14 @@ def test_ceo_daily_modes_require_independent_ceo_flag(monkeypatch, mode):
     "mode",
     ["executivo", "executive", "ceo", "ceo_daily", "ceodaily", "light", "leve"],
 )
-def test_ceo_daily_modes_run_when_both_flags_are_enabled(monkeypatch, mode):
+def test_ceo_daily_modes_only_require_independent_ceo_flag(monkeypatch, mode):
     contract = _fresh_contract(
         monkeypatch,
-        CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED="true",
+        CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED="false",
         CENTRAL_AUTO_CEO_DAILY_ENABLED="true",
     )
     assert contract.central_daily_report_automatic_enabled(mode) is True
+    assert contract.central_daily_report_policy_reason(mode) == "CENTRAL_CEO_DAILY_POLICY"
 
 
 @pytest.mark.parametrize("mode", ["unknown", "executivoo", "ceo-daily", None, "", "   "])
@@ -178,8 +180,8 @@ def test_legacy_daily_disabled_blocks_every_mode(monkeypatch, mode):
     ) is False
 
 
-@pytest.mark.parametrize("mode", ["daily", "executivo", "unknown", None, ""])
-def test_global_flag_disabled_blocks_every_mode(monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["daily", "dashboard", "audit"])
+def test_global_flag_disabled_blocks_standard_modes(monkeypatch, mode):
     contract = _fresh_contract(
         monkeypatch,
         CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED="false",
@@ -232,12 +234,13 @@ def test_trendpro_and_meme_inline_schedulers_gate_before_summary_state_reads():
 
 def test_central_scheduler_gates_before_snapshot_builders_and_thread_start():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
-    loop_start = source.index("def central_daily_report_loop():")
-    loop_end = source.index("# CENTRAL TELEGRAM COMMAND ROUTER", loop_start)
-    loop = source[loop_start:loop_end]
-    assert loop.index("central_daily_report_automatic_enabled(") < loop.index(
+    attempt_start = source.index("def central_daily_report_run_once")
+    loop_start = source.index("def central_daily_report_loop():", attempt_start)
+    attempt = source[attempt_start:loop_start]
+    assert attempt.index("central_daily_report_automatic_enabled(") < attempt.index(
         'save_daily_snapshot(label="auto")'
     )
+    assert 'event_type = "CENTRAL_CEO_DAILY_SUMMARY"' in attempt
 
     runtime_start = source.index("def start_central_runtime_once():")
     runtime = source[runtime_start:]
@@ -344,6 +347,16 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
         "timeline_emergency_recovery_enabled": False,
         "timeline_emergency_recovery_status": "DISABLED",
     }
+    scheduler = {
+        "daily_summary_scheduler_enabled": False,
+        "daily_summary_next_run_at": None,
+        "daily_summary_last_run_at": None,
+        "daily_summary_last_error": None,
+        "daily_summary_policy_reason": "DISABLED_CEO_DAILY_POLICY",
+        "daily_summary_thread_started": False,
+        "daily_summary_last_success_at": None,
+        "daily_summary_last_status": "NOT_RUN",
+    }
     namespace = {
         "central_watchdog_status": lambda: {"ok": True},
         "central_trade_registry_snapshot": lambda include_trades=False: {
@@ -351,6 +364,7 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
             "include_trades": include_trades,
         },
         "automatic_daily_summaries_health": lambda: expected.copy(),
+        "central_daily_scheduler_health": lambda: scheduler.copy(),
         "automatic_learning_refresh_health": lambda **kwargs: learning.copy(),
         "LEARNING_AUTO_REFRESH_SECONDS": 900,
         "LEARNING_AUTO_REFRESH_MIN_SECONDS": 300,
@@ -373,9 +387,151 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
     assert result["trade_registry"]["include_trades"] is False
     for field, value in expected.items():
         assert result[field] == value
-    for field, value in {**learning, **disk, **timeline}.items():
+    for field, value in {**learning, **disk, **timeline, **scheduler}.items():
         assert result[field] == value
     assert forbidden_calls == []
+
+
+def _isolated_daily_scheduler(send_result=True):
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {
+        "_central_daily_report_scheduled_at",
+        "central_daily_scheduler_health",
+        "central_daily_report_run_once",
+    }
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    calls = []
+    namespace = {
+        "datetime": datetime,
+        "timedelta": timedelta,
+        "CENTRAL_DAILY_REPORT_MODE": "executivo",
+        "CENTRAL_DAILY_REPORT_ENABLED": True,
+        "CENTRAL_DAILY_REPORT_TIME": "23:55",
+        "CENTRAL_DAILY_REPORT_RETRY_COOLDOWN_SECONDS": 300,
+        "CENTRAL_DAILY_REPORT_SENT_DATE": None,
+        "CENTRAL_DAILY_REPORT_THREAD_STARTED": True,
+        "CENTRAL_DAILY_REPORT_LAST_RUN_AT": None,
+        "CENTRAL_DAILY_REPORT_LAST_SUCCESS_AT": None,
+        "CENTRAL_DAILY_REPORT_LAST_ERROR": None,
+        "CENTRAL_DAILY_REPORT_LAST_STATUS": "NOT_RUN",
+        "CENTRAL_DAILY_REPORT_LAST_ATTEMPT_EPOCH": None,
+        "CENTRAL_TELEGRAM_BOT_TOKEN": "test-token",
+        "CENTRAL_TELEGRAM_CHAT_ID": "test-chat",
+        "central_daily_report_automatic_enabled": lambda mode, legacy: True,
+        "central_daily_report_policy_reason": lambda mode, legacy: "CENTRAL_CEO_DAILY_POLICY",
+        "agora_sp": lambda: datetime(2026, 7, 17, 23, 56, tzinfo=timezone.utc),
+        "save_daily_snapshot": lambda **kwargs: calls.append(("snapshot", kwargs)),
+        "build_audit_parts": lambda: "audit",
+        "build_daily_report": lambda: "daily",
+        "build_dashboard_report": lambda: "dashboard",
+        "build_ceo_daily_report": lambda: calls.append(("build", "ceo")) or "ceo",
+        "central_send_automatic_telegram": lambda *args, **kwargs: (
+            calls.append(("send", kwargs))
+            or (
+                send_result
+                if isinstance(send_result, dict)
+                else {"allowed": True, "sent": bool(send_result)}
+            )
+        ),
+        "force_gc_if_needed": lambda *args, **kwargs: None,
+    }
+    isolated = ast.Module(body=nodes, type_ignores=[])
+    ast.fix_missing_locations(isolated)
+    exec(compile(isolated, "<isolated-central-daily-scheduler>", "exec"), namespace)
+    return namespace, calls
+
+
+def test_scheduler_does_not_mark_sent_when_transport_returns_false():
+    namespace, calls = _isolated_daily_scheduler(send_result=False)
+    now = datetime(2026, 7, 17, 23, 56, tzinfo=timezone.utc)
+
+    result = namespace["central_daily_report_run_once"](now=now)
+
+    assert result["status"] == "SEND_FAILED"
+    assert namespace["CENTRAL_DAILY_REPORT_SENT_DATE"] is None
+    assert any(call[0] == "send" for call in calls)
+
+
+def test_scheduler_marks_sent_only_after_confirmed_delivery():
+    namespace, calls = _isolated_daily_scheduler(send_result=True)
+    now = datetime(2026, 7, 17, 23, 56, tzinfo=timezone.utc)
+
+    result = namespace["central_daily_report_run_once"](now=now)
+
+    assert result == {"ok": True, "status": "SENT", "sent": True}
+    assert namespace["CENTRAL_DAILY_REPORT_SENT_DATE"] == "2026-07-17"
+    send_kwargs = next(call[1] for call in calls if call[0] == "send")
+    assert send_kwargs["event_type"] == "CENTRAL_CEO_DAILY_SUMMARY"
+    assert send_kwargs["mode"] == "PAPER"
+
+
+def test_policy_block_does_not_mark_scheduler_sent():
+    blocked = {"allowed": False, "sent": False, "reason": "LIVE_ONLY_POLICY"}
+    namespace, _calls = _isolated_daily_scheduler(send_result=blocked)
+
+    result = namespace["central_daily_report_run_once"](
+        now=datetime(2026, 7, 17, 23, 56, tzinfo=timezone.utc)
+    )
+
+    assert result["reason"] == "LIVE_ONLY_POLICY"
+    assert namespace["CENTRAL_DAILY_REPORT_SENT_DATE"] is None
+    assert namespace["CENTRAL_DAILY_REPORT_LAST_ERROR"] == "LIVE_ONLY_POLICY"
+
+
+def test_missing_telegram_credentials_do_not_mark_scheduler_sent():
+    namespace, calls = _isolated_daily_scheduler(send_result=True)
+    namespace["CENTRAL_TELEGRAM_BOT_TOKEN"] = None
+
+    result = namespace["central_daily_report_run_once"](
+        now=datetime(2026, 7, 17, 23, 56, tzinfo=timezone.utc)
+    )
+
+    assert result["status"] == "CREDENTIALS_MISSING"
+    assert namespace["CENTRAL_DAILY_REPORT_SENT_DATE"] is None
+    assert not any(call[0] == "send" for call in calls)
+
+
+def test_scheduler_runs_after_configured_minute_but_not_before_it():
+    before_namespace, before_calls = _isolated_daily_scheduler(send_result=True)
+    before = before_namespace["central_daily_report_run_once"](
+        now=datetime(2026, 7, 17, 23, 54, tzinfo=timezone.utc)
+    )
+    assert before["status"] == "WAITING"
+    assert before_calls == []
+
+    after_namespace, _after_calls = _isolated_daily_scheduler(send_result=True)
+    after = after_namespace["central_daily_report_run_once"](
+        now=datetime(2026, 7, 17, 23, 59, tzinfo=timezone.utc)
+    )
+    assert after["status"] == "SENT"
+
+
+def test_scheduler_failed_attempt_uses_retry_cooldown():
+    namespace, calls = _isolated_daily_scheduler(send_result=False)
+    first = datetime(2026, 7, 17, 23, 56, tzinfo=timezone.utc)
+    second = datetime(2026, 7, 17, 23, 57, tzinfo=timezone.utc)
+
+    assert namespace["central_daily_report_run_once"](now=first)["status"] == "SEND_FAILED"
+    assert namespace["central_daily_report_run_once"](now=second)["status"] == "RETRY_COOLDOWN"
+    assert len([call for call in calls if call[0] == "send"]) == 1
+
+
+def test_scheduler_health_is_lightweight_and_exposes_next_run():
+    namespace, calls = _isolated_daily_scheduler(send_result=True)
+    now = datetime(2026, 7, 17, 20, 0, tzinfo=timezone.utc)
+
+    health = namespace["central_daily_scheduler_health"](now=now)
+
+    assert health["daily_summary_scheduler_enabled"] is True
+    assert health["daily_summary_next_run_at"].endswith("23:55:00+00:00")
+    assert health["daily_summary_policy_reason"] == "CENTRAL_CEO_DAILY_POLICY"
+    assert health["daily_summary_thread_started"] is True
+    assert calls == []
 
 
 def test_scanners_and_position_management_are_not_gated_by_daily_summary_flag():
