@@ -227,5 +227,251 @@ def test_main_declares_read_only_preview_and_ack_commit_routes():
     source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
     assert '@app.route("/history/rotation/preview/text", methods=["GET"])' in source
     assert '@app.route("/history/rotation/commit/text", methods=["GET"])' in source
+    assert '@app.route("/history/rotation/emergency/preview/text", methods=["GET"])' in source
+    assert '@app.route("/history/rotation/emergency/commit/text", methods=["GET"])' in source
     assert "commit_history_events_rotation" in source
     assert "HISTORY_ROTATION_V1" in history_manager.HISTORY_ROTATION_V1_ACK
+
+
+def _write_emergency_sample(path: Path) -> bytes:
+    rows = [
+        {"event": "DEBUG_OLD", "execution_mode": "PAPER", "id": "drop-debug"},
+        {"event": "CUSTOM_UNCERTAIN_OLD", "id": "drop-uncertain"},
+        {"event": "LIVE_SENT", "execution_mode": "LIVE", "sent": True, "id": "keep-live"},
+        {"event": "TRADE_BLOCKED", "bot": "FALCON", "execution_mode": "PAPER", "id": "keep-falcon"},
+        {"event": "SIGNAL_OLD", "execution_mode": "PAPER", "id": "drop-signal"},
+        {"event": "DEBUG_RECENT_1", "execution_mode": "PAPER", "id": "recent-1"},
+        {"event": "DEBUG_RECENT_2", "execution_mode": "PAPER", "id": "recent-2"},
+    ]
+    raw = b"".join(json.dumps(row).encode("utf-8") + b"\n" for row in rows)
+    raw += b"{malformed-emergency-line\n"
+    path.write_bytes(raw)
+    return raw
+
+
+def test_emergency_preview_is_read_only_and_accepts_malformed_for_quarantine(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    before = _write_emergency_sample(path)
+
+    result = history_manager.preview_history_events_emergency_rotation(
+        keep_recent=2,
+        max_output_mb=1,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["status"] == "READY"
+    assert result["safe_to_commit"] is True
+    assert result["dry_run"] is True
+    assert result["malformed_lines_count"] == 1
+    assert result["malformed_line_numbers"] == [8]
+    assert result["quarantine_would_be_created"] is True
+    assert result["critical_preserved"] == 2
+    assert result["recent_preserved"] == 2
+    assert result["events_after"] == 4
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("ack", [None, "", "HISTORY_ROTATION_V1", "WRONG"])
+def test_emergency_commit_requires_strong_exact_ack(tmp_path, ack):
+    path = tmp_path / "history_events.jsonl"
+    before = _write_emergency_sample(path)
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        ack,
+        keep_recent=2,
+        max_output_mb=1,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["status"] == "ACK_REQUIRED"
+    assert result["committed"] is False
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_emergency_commit_preserves_recent_and_critical_and_writes_evidence(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    _write_emergency_sample(path)
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=2,
+        max_output_mb=1,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    rows = _read_rows(path)
+    assert result["status"] == "COMMITTED"
+    assert result["committed"] is True
+    assert result["backup_created"] is False
+    assert [row["id"] for row in rows] == ["keep-live", "keep-falcon", "recent-1", "recent-2"]
+    assert result["manifest_created"] is True
+    assert result["malformed_quarantine_created"] is True
+    manifest_path = Path(result["manifest_file"])
+    quarantine_path = Path(result["malformed_quarantine_file"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "COMMITTED"
+    assert manifest["malformed_lines_count"] == 1
+    assert manifest["malformed_line_numbers"] == [8]
+    assert manifest["policy"]["large_backup_created"] is False
+    assert manifest["emergency_ack_required"] == "HISTORY_ROTATION_EMERGENCY_V1"
+    assert quarantine_path.read_bytes() == b"{malformed-emergency-line\n"
+    assert not list(tmp_path.glob("*.bak"))
+
+
+def test_emergency_respects_max_output_by_reducing_noncritical_recent(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    rows = [{"event": "LIVE_SENT", "sent": True, "id": "critical"}]
+    rows.extend(
+        {"event": "DEBUG_RECENT", "execution_mode": "PAPER", "id": number, "padding": "x" * 1800}
+        for number in range(20)
+    )
+    _write_rows(path, rows)
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=20,
+        max_output_mb=0.01,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is True
+    assert path.stat().st_size <= int(0.01 * 1024 * 1024)
+    kept = _read_rows(path)
+    assert kept[0]["id"] == "critical"
+    assert len(kept) < len(rows)
+    assert "RECENT_NONCRITICAL_REDUCED_TO_FIT_OUTPUT_TARGET" in result["warnings"]
+
+
+def test_emergency_aborts_when_critical_evidence_exceeds_target(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    before = _write_rows(path, [
+        {"event": "LIVE_SENT", "sent": True, "padding": "x" * 5000},
+        {"event": "DEBUG_RECENT", "execution_mode": "PAPER"},
+    ])
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=1,
+        max_output_mb=0.001,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is False
+    assert result["reason"] == "CRITICAL_EVENTS_EXCEED_OUTPUT_TARGET"
+    assert path.read_bytes() == before
+
+
+def test_emergency_aborts_when_temp_cannot_fit(tmp_path, monkeypatch):
+    path = tmp_path / "history_events.jsonl"
+    before = _write_emergency_sample(path)
+    monkeypatch.setattr(history_manager.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 0})())
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=2,
+        max_output_mb=1,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is False
+    assert result["reason"] == "INSUFFICIENT_TEMP_SPACE"
+    assert path.read_bytes() == before
+
+
+def test_emergency_blocks_when_central_live_position_is_open(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    before = _write_emergency_sample(path)
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=2,
+        max_output_mb=1,
+        path=path,
+        central_live_positions_count=1,
+    )
+
+    assert result["committed"] is False
+    assert result["reason"] == "CENTRAL_LIVE_POSITIONS_OPEN"
+    assert path.read_bytes() == before
+
+
+def test_emergency_uses_os_replace_for_history_file(tmp_path, monkeypatch):
+    path = tmp_path / "history_events.jsonl"
+    _write_emergency_sample(path)
+    original_replace = history_manager.os.replace
+    destinations = []
+
+    def tracked_replace(source, destination):
+        destinations.append(Path(destination))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(history_manager.os, "replace", tracked_replace)
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=2,
+        max_output_mb=1,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is True
+    assert path in destinations
+
+
+def test_emergency_can_continue_with_hash_manifest_when_quarantine_does_not_fit(tmp_path, monkeypatch):
+    path = tmp_path / "history_events.jsonl"
+    malformed = b"{" + (b"x" * 400_000) + b"\n"
+    valid = b'{"event":"LIVE_SENT","sent":true}\n' + b'{"event":"DEBUG_RECENT","execution_mode":"PAPER"}\n'
+    path.write_bytes(valid + malformed)
+    free_bytes = (
+        history_manager.HISTORY_ROTATION_V1_MIN_FREE_RESERVE_BYTES
+        + history_manager.HISTORY_ROTATION_EMERGENCY_V1_MANIFEST_RESERVE_BYTES
+        + 100_000
+    )
+    monkeypatch.setattr(
+        history_manager.shutil,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"free": free_bytes})(),
+    )
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=1,
+        max_output_mb=0.1,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is True
+    assert result["malformed_quarantine_created"] is False
+    manifest = json.loads(Path(result["manifest_file"]).read_text(encoding="utf-8"))
+    assert manifest["malformed_line_numbers"] == [3]
+    assert len(manifest["malformed_line_hashes"]) == 1
+    assert "MALFORMED_CONTENT_HASH_ONLY_NO_QUARANTINE_SPACE" in result["warnings"]
+
+
+def test_emergency_without_live_provider_never_calls_network(tmp_path, monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("network attempted")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    path = tmp_path / "history_events.jsonl"
+    _write_emergency_sample(path)
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=2,
+        max_output_mb=1,
+        path=path,
+        central_live_positions_count=None,
+    )
+
+    assert result["committed"] is True
+    assert "CENTRAL_LIVE_POSITIONS_NOT_VERIFIED_NO_BROKER_CALL_PERFORMED" in result["warnings"]

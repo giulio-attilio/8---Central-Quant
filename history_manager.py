@@ -55,6 +55,11 @@ CLOSED_TRADES_FILE = DATA_DIR / "closed_trades.jsonl"
 HISTORY_ROTATION_V1_ACK = "HISTORY_ROTATION_V1"
 HISTORY_ROTATION_V1_KEEP_RECENT = 5000
 HISTORY_ROTATION_V1_MIN_FREE_RESERVE_BYTES = 1024 * 1024
+HISTORY_ROTATION_EMERGENCY_V1_ACK = "HISTORY_ROTATION_EMERGENCY_V1"
+HISTORY_ROTATION_EMERGENCY_V1_KEEP_RECENT = 1000
+HISTORY_ROTATION_EMERGENCY_V1_MAX_OUTPUT_MB = 10.0
+HISTORY_ROTATION_EMERGENCY_V1_MANIFEST_RESERVE_BYTES = 256 * 1024
+HISTORY_ROTATION_EMERGENCY_V1_MAX_MALFORMED_DETAILS = 1000
 HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES = frozenset({
     "LIVE_SENT",
     "BROKER_LIVE_SENT",
@@ -607,6 +612,462 @@ def commit_history_events_rotation(ack, keep_recent=HISTORY_ROTATION_V1_KEEP_REC
                 temp_path.unlink()
         except OSError:
             pass
+
+
+def _history_rotation_emergency_v1_inputs(keep_recent, max_output_mb):
+    try:
+        keep_recent = int(keep_recent)
+        max_output_mb = float(max_output_mb)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("keep_recent and max_output_mb must be numeric") from exc
+    if keep_recent < 1:
+        raise ValueError("keep_recent must be positive")
+    if max_output_mb <= 0:
+        raise ValueError("max_output_mb must be positive")
+    return min(keep_recent, HISTORY_ROTATION_V1_KEEP_RECENT), max_output_mb
+
+
+def preview_history_events_emergency_rotation(
+    keep_recent=HISTORY_ROTATION_EMERGENCY_V1_KEEP_RECENT,
+    max_output_mb=HISTORY_ROTATION_EMERGENCY_V1_MAX_OUTPUT_MB,
+    path=None,
+    central_live_positions_count=None,
+):
+    """Plan an aggressive low-disk rewrite without modifying history."""
+    keep_recent, max_output_mb = _history_rotation_emergency_v1_inputs(keep_recent, max_output_mb)
+    source = Path(path or HISTORY_EVENTS_FILE)
+    output_target_bytes = max(1, int(max_output_mb * 1024 * 1024))
+    warnings = [
+        "EMERGENCY_MODE_AGGRESSIVELY_REDUCES_NONCRITICAL_HISTORY",
+        "NO_LARGE_BACKUP_LOW_DISK_POLICY",
+    ]
+    base = {
+        "ok": False,
+        "status": "BLOCKED",
+        "version": "HISTORY_EVENTS_ROTATION_V1.1_EMERGENCY",
+        "emergency_mode": True,
+        "current_file": str(source),
+        "current_size_mb": 0.0,
+        "free_mb": 0.0,
+        "emergency_estimated_new_size_mb": 0.0,
+        "emergency_estimated_savings_mb": 0.0,
+        "events_read": 0,
+        "recent_preserved": 0,
+        "critical_preserved": 0,
+        "events_after": 0,
+        "dropped_count": 0,
+        "malformed_lines_count": 0,
+        "malformed_line_numbers": [],
+        "malformed_line_hashes": [],
+        "quarantine_would_be_created": False,
+        "output_target_mb": max_output_mb,
+        "requested_recent_limit": keep_recent,
+        "safe_to_commit": False,
+        "dry_run": True,
+        "reason": "UNKNOWN",
+        "central_live_positions_count": central_live_positions_count,
+        "critical_event_types_preserved": sorted(HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES),
+        "warnings": warnings,
+        "errors": [],
+    }
+    try:
+        if not source.exists():
+            base.update(reason="HISTORY_EVENTS_FILE_NOT_FOUND", errors=["HISTORY_EVENTS_FILE_NOT_FOUND"])
+            return base
+        if source.is_symlink() or not source.is_file():
+            base.update(reason="HISTORY_EVENTS_FILE_NOT_REGULAR", errors=["HISTORY_EVENTS_FILE_NOT_REGULAR"])
+            return base
+
+        try:
+            live_count = None if central_live_positions_count is None else int(central_live_positions_count)
+        except (TypeError, ValueError):
+            live_count = None
+            warnings.append("CENTRAL_LIVE_POSITION_COUNT_INVALID")
+        if live_count is None:
+            warnings.append("CENTRAL_LIVE_POSITIONS_NOT_VERIFIED_NO_BROKER_CALL_PERFORMED")
+        elif live_count < 0:
+            live_count = None
+            warnings.append("CENTRAL_LIVE_POSITION_COUNT_INVALID")
+        base["central_live_positions_count"] = live_count
+
+        with _HISTORY_EVENTS_ROTATION_LOCK:
+            source_stat = source.stat()
+            source_size = int(source_stat.st_size)
+        source_hash = hashlib.sha256()
+        events_read = 0
+        valid_events = 0
+        malformed_count = 0
+        malformed_bytes = 0
+        malformed_line_numbers = []
+        malformed_line_hashes = []
+        physical_line_number = 0
+        for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
+            source_hash.update(raw_line)
+            physical_line_number += 1
+            if not raw_line.strip():
+                continue
+            events_read += 1
+            _, error = _history_rotation_v1_parse_line(raw_line)
+            if error:
+                malformed_count += 1
+                malformed_bytes += len(raw_line)
+                if len(malformed_line_numbers) < HISTORY_ROTATION_EMERGENCY_V1_MAX_MALFORMED_DETAILS:
+                    malformed_line_numbers.append(physical_line_number)
+                    malformed_line_hashes.append(hashlib.sha256(raw_line).hexdigest())
+            else:
+                valid_events += 1
+
+        recent_from = max(0, valid_events - keep_recent)
+        valid_index = 0
+        critical_count = 0
+        critical_bytes = 0
+        recent_critical_count = 0
+        recent_candidates = []
+        observed_critical_types = set()
+        for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
+            if not raw_line.strip():
+                continue
+            event, error = _history_rotation_v1_parse_line(raw_line)
+            if error:
+                continue
+            is_recent = valid_index >= recent_from
+            classification, matched = _history_rotation_v1_classify(event)
+            observed_critical_types.update(matched)
+            if classification == "CRITICAL":
+                critical_count += 1
+                critical_bytes += len(raw_line)
+                if is_recent:
+                    recent_critical_count += 1
+            elif is_recent:
+                recent_candidates.append((valid_index, len(raw_line)))
+            valid_index += 1
+
+        selected_recent = set()
+        selected_recent_bytes = 0
+        remaining_output_bytes = max(0, output_target_bytes - critical_bytes)
+        for event_index, raw_size in reversed(recent_candidates):
+            if raw_size <= remaining_output_bytes:
+                selected_recent.add(event_index)
+                selected_recent_bytes += raw_size
+                remaining_output_bytes -= raw_size
+        if len(selected_recent) < len(recent_candidates):
+            warnings.append("RECENT_NONCRITICAL_REDUCED_TO_FIT_OUTPUT_TARGET")
+
+        estimated_output_bytes = critical_bytes + selected_recent_bytes
+        unique_events_after = critical_count + len(selected_recent)
+        dropped_count = max(0, events_read - unique_events_after)
+        free_bytes = int(shutil.disk_usage(source.parent).free)
+        base_temp_need = (
+            estimated_output_bytes
+            + HISTORY_ROTATION_V1_MIN_FREE_RESERVE_BYTES
+            + HISTORY_ROTATION_EMERGENCY_V1_MANIFEST_RESERVE_BYTES
+        )
+        quarantine_would_be_created = bool(
+            malformed_count
+            and free_bytes >= base_temp_need + malformed_bytes
+        )
+        total_temp_need = base_temp_need + (malformed_bytes if quarantine_would_be_created else 0)
+
+        base.update({
+            "ok": True,
+            "current_size_mb": _history_rotation_v1_mb(source_size),
+            "current_size_bytes": source_size,
+            "source_mtime_ns": int(source_stat.st_mtime_ns),
+            "source_prefix_sha256": source_hash.hexdigest(),
+            "free_mb": _history_rotation_v1_mb(free_bytes),
+            "free_bytes": free_bytes,
+            "emergency_estimated_new_size_mb": _history_rotation_v1_mb(estimated_output_bytes),
+            "emergency_estimated_new_size_bytes": estimated_output_bytes,
+            "emergency_estimated_savings_mb": _history_rotation_v1_mb(max(0, source_size - estimated_output_bytes)),
+            "events_read": events_read,
+            "valid_events": valid_events,
+            "recent_preserved": len(selected_recent) + recent_critical_count,
+            "critical_preserved": critical_count,
+            "events_after": unique_events_after,
+            "dropped_count": dropped_count,
+            "malformed_lines_count": malformed_count,
+            "malformed_bytes": malformed_bytes,
+            "malformed_line_numbers": malformed_line_numbers,
+            "malformed_line_hashes": malformed_line_hashes,
+            "malformed_details_truncated": malformed_count > len(malformed_line_numbers),
+            "quarantine_would_be_created": quarantine_would_be_created,
+            "required_temp_mb": _history_rotation_v1_mb(total_temp_need),
+            "critical_event_types_observed": sorted(observed_critical_types),
+            "_selected_recent_indexes": sorted(selected_recent),
+        })
+        if malformed_count and not quarantine_would_be_created:
+            warnings.append("MALFORMED_CONTENT_HASH_ONLY_NO_QUARANTINE_SPACE")
+        if live_count is not None and live_count > 0:
+            base.update(reason="CENTRAL_LIVE_POSITIONS_OPEN", errors=["CENTRAL_LIVE_POSITIONS_OPEN"])
+        elif critical_bytes > output_target_bytes:
+            base.update(reason="CRITICAL_EVENTS_EXCEED_OUTPUT_TARGET", errors=["CRITICAL_EVENTS_EXCEED_OUTPUT_TARGET"])
+        elif free_bytes < total_temp_need:
+            base.update(reason="INSUFFICIENT_TEMP_SPACE", errors=["INSUFFICIENT_TEMP_SPACE"])
+        elif dropped_count == 0 and malformed_count == 0:
+            base.update(status="NOT_NEEDED", reason="NOTHING_ELIGIBLE_FOR_EMERGENCY_COMPACTION")
+        else:
+            base.update(status="READY", safe_to_commit=True, reason="EMERGENCY_ACK_REQUIRED")
+        return base
+    except (OSError, ValueError, TypeError) as exc:
+        base.update(reason="EMERGENCY_PREVIEW_ERROR", errors=[f"{type(exc).__name__}:{exc}"])
+        return base
+
+
+def _history_rotation_emergency_v1_manifest_path(source, timestamp):
+    return source.parent / f"history_events_rotation_manifest_{timestamp}.json"
+
+
+def _history_rotation_emergency_v1_quarantine_path(source, timestamp):
+    return source.parent / f"history_events_malformed_quarantine_{timestamp}.jsonl"
+
+
+def _history_rotation_emergency_v1_write_json_fsync(path, payload):
+    with Path(path).open("x", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=_json_default)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _history_rotation_emergency_v1_validate_output(path, max_output_bytes):
+    output_size = Path(path).stat().st_size
+    if output_size > max_output_bytes:
+        raise ValueError("EMERGENCY_OUTPUT_EXCEEDS_TARGET")
+    records = 0
+    for raw_line in _history_rotation_v1_iter_snapshot(path, output_size):
+        if not raw_line.strip():
+            continue
+        _, error = _history_rotation_v1_parse_line(raw_line)
+        if error:
+            raise ValueError(f"EMERGENCY_OUTPUT_INVALID_JSONL:{error}")
+        records += 1
+    return records, output_size
+
+
+def commit_history_events_emergency_rotation(
+    ack,
+    keep_recent=HISTORY_ROTATION_EMERGENCY_V1_KEEP_RECENT,
+    max_output_mb=HISTORY_ROTATION_EMERGENCY_V1_MAX_OUTPUT_MB,
+    path=None,
+    central_live_positions_count=None,
+):
+    """Perform the separately acknowledged low-disk emergency rewrite."""
+    source = Path(path or HISTORY_EVENTS_FILE)
+    if str(ack or "").strip() != HISTORY_ROTATION_EMERGENCY_V1_ACK:
+        return {
+            "ok": False,
+            "status": "ACK_REQUIRED",
+            "version": "HISTORY_EVENTS_ROTATION_V1.1_EMERGENCY",
+            "emergency_mode": True,
+            "current_file": str(source),
+            "dry_run": False,
+            "safe_to_commit": False,
+            "committed": False,
+            "reason": "ACK_REQUIRED",
+            "errors": ["ACK_REQUIRED:HISTORY_ROTATION_EMERGENCY_V1"],
+            "warnings": [],
+        }
+
+    preview = preview_history_events_emergency_rotation(
+        keep_recent=keep_recent,
+        max_output_mb=max_output_mb,
+        path=source,
+        central_live_positions_count=central_live_positions_count,
+    )
+    result = {
+        **preview,
+        "dry_run": False,
+        "committed": False,
+        "backup_created": False,
+        "manifest_created": False,
+        "malformed_quarantine_created": False,
+        "before_size_mb": preview.get("current_size_mb", 0.0),
+        "after_size_mb": preview.get("current_size_mb", 0.0),
+        "events_before": preview.get("events_read", 0),
+        "events_removed": 0,
+    }
+    if not preview.get("safe_to_commit"):
+        result.pop("_selected_recent_indexes", None)
+        return result
+
+    keep_recent, max_output_mb = _history_rotation_emergency_v1_inputs(keep_recent, max_output_mb)
+    max_output_bytes = max(1, int(max_output_mb * 1024 * 1024))
+    source_size = int(preview["current_size_bytes"])
+    selected_recent = set(preview.get("_selected_recent_indexes") or [])
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    manifest_path = _history_rotation_emergency_v1_manifest_path(source, timestamp)
+    quarantine_path = _history_rotation_emergency_v1_quarantine_path(source, timestamp)
+    if manifest_path.exists() or quarantine_path.exists():
+        suffix = uuid.uuid4().hex[:8]
+        manifest_path = manifest_path.with_name(f"{manifest_path.stem}_{suffix}{manifest_path.suffix}")
+        quarantine_path = quarantine_path.with_name(f"{quarantine_path.stem}_{suffix}{quarantine_path.suffix}")
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
+    output_temp = source.with_name(f".{source.name}.emergency-v1-{token}.tmp")
+    quarantine_temp = source.with_name(f".{quarantine_path.name}.{token}.tmp")
+    manifest_temp = source.with_name(f".{manifest_path.name}.{token}.tmp")
+    created_final_paths = []
+    history_replaced = False
+    warnings = list(preview.get("warnings") or [])
+    errors = []
+    appended_events = 0
+    try:
+        source_hash = hashlib.sha256()
+        valid_index = 0
+        quarantine_handle = None
+        if preview.get("quarantine_would_be_created"):
+            quarantine_handle = quarantine_temp.open("xb")
+        try:
+            with output_temp.open("xb") as target:
+                for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
+                    source_hash.update(raw_line)
+                    if not raw_line.strip():
+                        continue
+                    event, error = _history_rotation_v1_parse_line(raw_line)
+                    if error:
+                        if quarantine_handle is not None:
+                            quarantine_handle.write(raw_line)
+                        continue
+                    classification, _ = _history_rotation_v1_classify(event)
+                    if classification == "CRITICAL" or valid_index in selected_recent:
+                        target.write(raw_line)
+                    valid_index += 1
+                target.flush()
+                os.fsync(target.fileno())
+            if quarantine_handle is not None:
+                quarantine_handle.flush()
+                os.fsync(quarantine_handle.fileno())
+        finally:
+            if quarantine_handle is not None:
+                quarantine_handle.close()
+
+        if source_hash.hexdigest() != preview.get("source_prefix_sha256"):
+            raise OSError("HISTORY_SOURCE_PREFIX_CHANGED_BEFORE_COMMIT")
+        validated_events, _ = _history_rotation_emergency_v1_validate_output(output_temp, max_output_bytes)
+
+        with _HISTORY_EVENTS_ROTATION_LOCK:
+            current_size = source.stat().st_size
+            if current_size < source_size:
+                raise OSError("HISTORY_SOURCE_SHRANK_BEFORE_EMERGENCY_REPLACE")
+            with source.open("rb") as current, output_temp.open("ab") as target:
+                current.seek(source_size)
+                remaining = current_size - source_size
+                while remaining:
+                    raw_line = current.readline(remaining)
+                    if not raw_line:
+                        raise OSError("HISTORY_APPENDED_TAIL_TRUNCATED")
+                    remaining -= len(raw_line)
+                    if raw_line.strip():
+                        _, error = _history_rotation_v1_parse_line(raw_line)
+                        if error:
+                            raise ValueError(f"MALFORMED_APPENDED_JSONL:{error}")
+                        appended_events += 1
+                    target.write(raw_line)
+                target.flush()
+                os.fsync(target.fileno())
+            if source.stat().st_size != current_size:
+                raise OSError("HISTORY_SOURCE_CHANGED_DURING_EMERGENCY_FINALIZE")
+            validated_events, output_size = _history_rotation_emergency_v1_validate_output(output_temp, max_output_bytes)
+            remaining_free = int(shutil.disk_usage(source.parent).free)
+            evidence_bytes = HISTORY_ROTATION_EMERGENCY_V1_MANIFEST_RESERVE_BYTES
+            if quarantine_temp.exists():
+                evidence_bytes += quarantine_temp.stat().st_size
+            if remaining_free < evidence_bytes + HISTORY_ROTATION_V1_MIN_FREE_RESERVE_BYTES:
+                raise OSError("INSUFFICIENT_SPACE_FOR_EMERGENCY_EVIDENCE")
+
+            manifest = {
+                "version": "HISTORY_EVENTS_ROTATION_V1.1_EMERGENCY",
+                "status": "PREPARED",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "before_size_mb": preview.get("current_size_mb"),
+                "after_size_mb": _history_rotation_v1_mb(output_size),
+                "events_before": preview.get("events_read"),
+                "events_after": validated_events,
+                "recent_preserved": preview.get("recent_preserved"),
+                "critical_preserved": preview.get("critical_preserved"),
+                "malformed_lines_count": preview.get("malformed_lines_count"),
+                "malformed_line_numbers": preview.get("malformed_line_numbers"),
+                "malformed_line_hashes": preview.get("malformed_line_hashes"),
+                "malformed_quarantine_created": bool(quarantine_temp.exists()),
+                "malformed_quarantine_file": str(quarantine_path) if quarantine_temp.exists() else None,
+                "dropped_count": preview.get("dropped_count"),
+                "policy": {
+                    "mode": "EMERGENCY_LOW_DISK_AGGRESSIVE",
+                    "recent_limit_requested": keep_recent,
+                    "output_target_mb": max_output_mb,
+                    "preserve_all_live_and_falcon_critical": True,
+                    "large_backup_created": False,
+                },
+                "emergency_ack_required": HISTORY_ROTATION_EMERGENCY_V1_ACK,
+                "central_live_positions_count": preview.get("central_live_positions_count"),
+                "source_prefix_sha256": preview.get("source_prefix_sha256"),
+                "errors": [],
+                "warnings": warnings,
+            }
+            _history_rotation_emergency_v1_write_json_fsync(manifest_temp, manifest)
+            if quarantine_temp.exists():
+                os.replace(quarantine_temp, quarantine_path)
+                created_final_paths.append(quarantine_path)
+            os.replace(manifest_temp, manifest_path)
+            created_final_paths.append(manifest_path)
+            os.replace(output_temp, source)
+            history_replaced = True
+
+        post_events, after_size = _history_rotation_emergency_v1_validate_output(source, max_output_bytes)
+        manifest.update({
+            "status": "COMMITTED",
+            "after_size_mb": _history_rotation_v1_mb(after_size),
+            "events_after": post_events,
+            "events_appended_during_compaction": appended_events,
+        })
+        manifest_update_temp = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            _history_rotation_emergency_v1_write_json_fsync(manifest_update_temp, manifest)
+            os.replace(manifest_update_temp, manifest_path)
+        finally:
+            if manifest_update_temp.exists():
+                manifest_update_temp.unlink()
+
+        result.update({
+            "ok": True,
+            "status": "COMMITTED",
+            "reason": "EMERGENCY_ATOMIC_REWRITE_COMPLETED",
+            "safe_to_commit": True,
+            "committed": True,
+            "manifest_created": True,
+            "manifest_file": str(manifest_path),
+            "malformed_quarantine_created": quarantine_path in created_final_paths,
+            "malformed_quarantine_file": str(quarantine_path) if quarantine_path in created_final_paths else None,
+            "after_size_mb": _history_rotation_v1_mb(after_size),
+            "events_after": post_events,
+            "events_removed": int(preview.get("dropped_count") or 0),
+            "events_appended_during_compaction": appended_events,
+            "warnings": warnings,
+            "errors": [],
+        })
+        result.pop("_selected_recent_indexes", None)
+        return result
+    except (OSError, ValueError, TypeError) as exc:
+        errors.append(f"{type(exc).__name__}:{exc}")
+        result.update({
+            "ok": bool(history_replaced),
+            "status": "COMMITTED_WITH_WARNINGS" if history_replaced else "ERROR",
+            "reason": "POST_COMMIT_EVIDENCE_ERROR" if history_replaced else "EMERGENCY_COMMIT_FAILED",
+            "committed": history_replaced,
+            "manifest_created": manifest_path in created_final_paths,
+            "manifest_file": str(manifest_path) if manifest_path in created_final_paths else None,
+            "malformed_quarantine_created": quarantine_path in created_final_paths,
+            "malformed_quarantine_file": str(quarantine_path) if quarantine_path in created_final_paths else None,
+            "warnings": warnings,
+            "errors": errors,
+        })
+        result.pop("_selected_recent_indexes", None)
+        return result
+    finally:
+        for temp_path in (output_temp, quarantine_temp, manifest_temp):
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
 
 
 def configure_timeline_writer(path):

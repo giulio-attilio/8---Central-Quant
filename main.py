@@ -26711,6 +26711,112 @@ def history_rotation_v1_commit_text_route():
     return _history_rotation_v1_text(payload), status_code, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+def _history_rotation_v11_local_central_live_count():
+    provider = globals().get("_central_live_positions_payload")
+    if not callable(provider):
+        return None, "CENTRAL_LIVE_POSITIONS_PROVIDER_UNAVAILABLE"
+    try:
+        rows = provider()
+    except Exception as exc:
+        return None, f"CENTRAL_LIVE_POSITIONS_PROVIDER_ERROR:{type(exc).__name__}"
+    if not isinstance(rows, list):
+        return None, "CENTRAL_LIVE_POSITIONS_PROVIDER_INVALID"
+    return len(rows), None
+
+
+def _history_rotation_emergency_v11_text(payload):
+    lines = [
+        "HISTORY EVENTS ROTATION / COMPACTION — V1.1 EMERGENCY",
+        "Modo: EMERGENCY LOW DISK — redução agressiva de histórico não crítico",
+        f"Status: {payload.get('status')}",
+        f"Arquivo: {payload.get('current_file')}",
+        f"Dry run: {payload.get('dry_run')}",
+        f"Safe to commit: {payload.get('safe_to_commit')}",
+        f"Reason: {payload.get('reason')}",
+        f"Tamanho atual MB: {payload.get('current_size_mb')}",
+        f"Espaço livre MB: {payload.get('free_mb')}",
+        f"Estimativa emergency MB: {payload.get('emergency_estimated_new_size_mb')}",
+        f"Economia emergency estimada MB: {payload.get('emergency_estimated_savings_mb')}",
+        f"Target máximo de output MB: {payload.get('output_target_mb')}",
+        f"Eventos lidos: {payload.get('events_read', 0)}",
+        f"Eventos recentes preservados: {payload.get('recent_preserved', 0)}",
+        f"Eventos críticos preservados: {payload.get('critical_preserved', 0)}",
+        f"Eventos após: {payload.get('events_after', 0)}",
+        f"Eventos removidos: {payload.get('dropped_count', payload.get('events_removed', 0))}",
+        f"Linhas malformadas: {payload.get('malformed_lines_count', 0)}",
+        f"Linhas malformadas — números: {payload.get('malformed_line_numbers', [])}",
+        f"Quarantine prevista: {payload.get('quarantine_would_be_created')}",
+        f"Central LIVE positions: {payload.get('central_live_positions_count')}",
+        "Backup grande: não criado por política de baixo disco",
+    ]
+    if "committed" in payload:
+        lines.extend([
+            f"Committed: {payload.get('committed')}",
+            f"Manifest created: {payload.get('manifest_created')}",
+            f"Manifest file: {payload.get('manifest_file')}",
+            f"Malformed quarantine created: {payload.get('malformed_quarantine_created')}",
+            f"Malformed quarantine file: {payload.get('malformed_quarantine_file')}",
+            f"Before size MB: {payload.get('before_size_mb')}",
+            f"After size MB: {payload.get('after_size_mb')}",
+        ])
+    for warning in payload.get("warnings") or []:
+        lines.append(f"Warning: {warning}")
+    for error in payload.get("errors") or []:
+        lines.append(f"Error: {error}")
+    return "\n".join(lines)
+
+
+@app.route("/history/rotation/emergency/preview/text", methods=["GET"])
+def history_rotation_emergency_v11_preview_text_route():
+    live_count, live_warning = _history_rotation_v11_local_central_live_count()
+    try:
+        import history_manager as super_history_manager
+        payload = super_history_manager.preview_history_events_emergency_rotation(
+            central_live_positions_count=live_count,
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "status": "ERROR",
+            "emergency_mode": True,
+            "dry_run": True,
+            "safe_to_commit": False,
+            "reason": "EMERGENCY_PREVIEW_UNAVAILABLE",
+            "errors": [f"{type(exc).__name__}:{exc}"],
+            "warnings": [],
+        }
+    if live_warning:
+        payload.setdefault("warnings", []).append(live_warning)
+    return _history_rotation_emergency_v11_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.route("/history/rotation/emergency/commit/text", methods=["GET"])
+def history_rotation_emergency_v11_commit_text_route():
+    live_count, live_warning = _history_rotation_v11_local_central_live_count()
+    try:
+        import history_manager as super_history_manager
+        payload = super_history_manager.commit_history_events_emergency_rotation(
+            ack=request.args.get("ack", ""),
+            central_live_positions_count=live_count,
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "status": "ERROR",
+            "emergency_mode": True,
+            "dry_run": False,
+            "safe_to_commit": False,
+            "committed": False,
+            "reason": "EMERGENCY_COMMIT_UNAVAILABLE",
+            "errors": [f"{type(exc).__name__}:{exc}"],
+            "warnings": [],
+        }
+    if live_warning:
+        payload.setdefault("warnings", []).append(live_warning)
+    status_code = 200 if payload.get("status") != "ACK_REQUIRED" else 400
+    return _history_rotation_emergency_v11_text(payload), status_code, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 @app.route("/history/events")
 def history_events_route():
     try:
