@@ -26634,6 +26634,83 @@ def history_stats_route():
     return build_history_stats_payload()
 
 
+def _history_rotation_v1_text(payload):
+    critical = ", ".join(payload.get("critical_event_types_preserved") or []) or "N/A"
+    lines = [
+        "HISTORY EVENTS ROTATION / COMPACTION — V1",
+        f"Status: {payload.get('status')}",
+        f"Arquivo: {payload.get('current_file')}",
+        f"Dry run: {payload.get('dry_run')}",
+        f"Safe to commit: {payload.get('safe_to_commit')}",
+        f"Reason: {payload.get('reason')}",
+        f"Tamanho atual MB: {payload.get('current_size_mb')}",
+        f"Estimativa após compactação MB: {payload.get('estimated_new_size_mb')}",
+        f"Economia estimada MB: {payload.get('estimated_savings_mb', 0.0)}",
+        f"Eventos lidos: {payload.get('events_read', 0)}",
+        f"Eventos recentes preservados: {payload.get('events_keep_recent', 0)}",
+        f"Eventos críticos antigos preservados: {payload.get('events_keep_critical', 0)}",
+        f"Eventos incertos preservados: {payload.get('events_keep_uncertain', 0)}",
+        f"Eventos elegíveis para remoção: {payload.get('events_drop_or_archive', 0)}",
+        f"Linhas inválidas: {payload.get('invalid_lines', 0)}",
+        f"Tipos críticos preservados: {critical}",
+    ]
+    if "committed" in payload:
+        lines.extend([
+            f"Committed: {payload.get('committed')}",
+            f"Backup created: {payload.get('backup_created')}",
+            f"Before size MB: {payload.get('before_size_mb')}",
+            f"After size MB: {payload.get('after_size_mb')}",
+            f"Events before: {payload.get('events_before')}",
+            f"Events after: {payload.get('events_after')}",
+            f"Events preserved recent: {payload.get('events_preserved_recent')}",
+            f"Events preserved critical: {payload.get('events_preserved_critical')}",
+            f"Events removed: {payload.get('events_removed')}",
+        ])
+    for warning in payload.get("warnings") or []:
+        lines.append(f"Warning: {warning}")
+    for error in payload.get("errors") or []:
+        lines.append(f"Error: {error}")
+    return "\n".join(lines)
+
+
+@app.route("/history/rotation/preview/text", methods=["GET"])
+def history_rotation_v1_preview_text_route():
+    try:
+        import history_manager as super_history_manager
+        payload = super_history_manager.preview_history_events_rotation()
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "status": "ERROR",
+            "dry_run": True,
+            "safe_to_commit": False,
+            "reason": "PREVIEW_UNAVAILABLE",
+            "errors": [f"{type(exc).__name__}:{exc}"],
+        }
+    return _history_rotation_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.route("/history/rotation/commit/text", methods=["GET"])
+def history_rotation_v1_commit_text_route():
+    try:
+        import history_manager as super_history_manager
+        payload = super_history_manager.commit_history_events_rotation(
+            ack=request.args.get("ack", ""),
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "status": "ERROR",
+            "dry_run": False,
+            "safe_to_commit": False,
+            "committed": False,
+            "reason": "COMMIT_UNAVAILABLE",
+            "errors": [f"{type(exc).__name__}:{exc}"],
+        }
+    status_code = 200 if payload.get("status") != "ACK_REQUIRED" else 400
+    return _history_rotation_v1_text(payload), status_code, {"Content-Type": "text/plain; charset=utf-8"}
+
+
 @app.route("/history/events")
 def history_events_route():
     try:

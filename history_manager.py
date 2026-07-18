@@ -19,6 +19,7 @@ import ast
 import hashlib
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -50,6 +51,57 @@ TIMELINE_LOG_FILE = DATA_DIR / "timeline.jsonl"
 HISTORY_EXPORT_FILE = DATA_DIR / "history_export.json"
 HISTORY_SEEN_FILE = DATA_DIR / "history_seen.json"
 CLOSED_TRADES_FILE = DATA_DIR / "closed_trades.jsonl"
+
+HISTORY_ROTATION_V1_ACK = "HISTORY_ROTATION_V1"
+HISTORY_ROTATION_V1_KEEP_RECENT = 5000
+HISTORY_ROTATION_V1_MIN_FREE_RESERVE_BYTES = 1024 * 1024
+HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES = frozenset({
+    "LIVE_SENT",
+    "BROKER_LIVE_SENT",
+    "LIVE_SENT_BUT_DISASTER_STOP_FAILED",
+    "BROKER_LIVE_SENT_BUT_DISASTER_STOP_FAILED",
+    "LIVE_SENT_COMPLETED_HISTORY",
+    "LIVE_SENT_ACKED_HISTORY",
+    "LIVE_CENTRAL_ONLY_RECONCILE",
+    "LIVE_SENT_CENTRAL_ONLY_RECONCILE",
+    "FALCON_DISASTER_STOP_VERIFICATION_BLOCKED",
+    "FALCON_CENTRAL_ONLY_RECONCILE_REQUIRED",
+    "FALCON_LIVE_AUDIT_ACK",
+    "FALCON_LIVE_EXECUTION_AUDIT_ACK",
+})
+_HISTORY_ROTATION_V1_CRITICAL_MARKERS = (
+    "LIVE_SENT",
+    "LIVE_ORDER",
+    "DISASTER_STOP",
+    "CENTRAL_ONLY",
+    "ACK",
+    "RECONCIL",
+    "RECOVERY",
+    "TRADE_OPEN",
+    "TRADE_CLOSED",
+    "POSITION_OPEN",
+    "POSITION_CLOSED",
+    "FILL",
+    "OUTCOME",
+    "TP50",
+    "BREAKEVEN",
+    "BREAK_EVEN",
+    "TRAILING",
+    "STOP_",
+)
+_HISTORY_ROTATION_V1_INFORMATIONAL_MARKERS = (
+    "PREVIEW",
+    "DEBUG",
+    "HEALTH",
+    "HEARTBEAT",
+    "FUNNEL",
+    "SCAN",
+    "SCANNER",
+    "SIGNAL",
+    "OBSERVATION",
+    "DIAGNOSTIC",
+)
+_HISTORY_EVENTS_ROTATION_LOCK = threading.RLock()
 
 
 def ensure_history_files():
@@ -126,7 +178,14 @@ def _safe_int(value, default=0):
         return default
 
 
-def _append_jsonl(path: Path, item: dict):
+def _is_history_events_path(path):
+    try:
+        return Path(path).resolve() == Path(HISTORY_EVENTS_FILE).resolve()
+    except Exception:
+        return Path(path) == Path(HISTORY_EVENTS_FILE)
+
+
+def _append_jsonl_unlocked(path: Path, item: dict):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -135,6 +194,13 @@ def _append_jsonl(path: Path, item: dict):
     except Exception as exc:
         print(f"ERRO HISTORY append_jsonl {path}: {exc}")
         return False
+
+
+def _append_jsonl(path: Path, item: dict):
+    if _is_history_events_path(path):
+        with _HISTORY_EVENTS_ROTATION_LOCK:
+            return _append_jsonl_unlocked(Path(path), item)
+    return _append_jsonl_unlocked(Path(path), item)
 
 
 def _read_jsonl_tail(path: Path, limit=None, max_bytes=None, include_metadata=False, operation=None):
@@ -231,6 +297,316 @@ def get_status():
         "dedup_max_keys": HISTORY_DEDUP_MAX_KEYS,
         "auto_backfill_closed": HISTORY_AUTO_BACKFILL_CLOSED,
     }
+
+
+def _history_rotation_v1_mb(value):
+    return round(max(0, int(value or 0)) / (1024 * 1024), 3)
+
+
+def _history_rotation_v1_containers(event):
+    containers = [event]
+    for key in ("payload", "metadata", "evidence", "details"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    return containers
+
+
+def _history_rotation_v1_values(event, keys):
+    values = []
+    for container in _history_rotation_v1_containers(event):
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, ""):
+                values.append(value)
+    return values
+
+
+def _history_rotation_v1_upper_values(event, keys):
+    return [str(value).strip().upper() for value in _history_rotation_v1_values(event, keys)]
+
+
+def _history_rotation_v1_sent(event):
+    for value in _history_rotation_v1_values(event, ("sent", "real_sent", "order_sent")):
+        if value is True or str(value).strip().lower() in {"1", "true", "yes", "sim", "sent"}:
+            return True
+    return False
+
+
+def _history_rotation_v1_classify(event):
+    event_values = _history_rotation_v1_upper_values(
+        event,
+        ("event", "event_type", "type", "status", "class_code", "kind", "action"),
+    )
+    modes = set(_history_rotation_v1_upper_values(
+        event,
+        ("execution_mode", "mode", "registry_mode", "environment"),
+    ))
+    ownership = " ".join(_history_rotation_v1_upper_values(
+        event,
+        ("bot", "robot", "source", "source_component", "setup"),
+    ))
+    joined = " ".join(event_values)
+    exact_types = {value for value in event_values if value}
+
+    critical = bool(exact_types & HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES)
+    critical = critical or _history_rotation_v1_sent(event) or bool(modes & {"LIVE", "REAL"})
+    critical = critical or any(marker in joined for marker in _HISTORY_ROTATION_V1_CRITICAL_MARKERS)
+    critical = critical or ("FALCON" in ownership and "TRADE_BLOCKED" in joined)
+    if critical:
+        matched = sorted(exact_types & HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES)
+        return "CRITICAL", matched
+
+    explicitly_non_live = bool(modes & {"PAPER", "VERIFY", "DRY_RUN", "PREVIEW", "SHADOW"})
+    informational = any(marker in joined for marker in _HISTORY_ROTATION_V1_INFORMATIONAL_MARKERS)
+    if explicitly_non_live or informational:
+        return "DROPPABLE", []
+    return "PRESERVE_UNCERTAIN", []
+
+
+def _history_rotation_v1_parse_line(raw_line):
+    try:
+        event = json.loads(raw_line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, type(exc).__name__
+    if not isinstance(event, dict):
+        return None, "JSON_VALUE_NOT_OBJECT"
+    return event, None
+
+
+def _history_rotation_v1_iter_snapshot(path, source_size):
+    consumed = 0
+    with Path(path).open("rb") as handle:
+        while consumed < source_size:
+            raw_line = handle.readline(source_size - consumed)
+            if not raw_line:
+                break
+            consumed += len(raw_line)
+            yield raw_line
+    if consumed != source_size:
+        raise OSError("HISTORY_SOURCE_SIZE_CHANGED_DURING_SCAN")
+
+
+def preview_history_events_rotation(keep_recent=HISTORY_ROTATION_V1_KEEP_RECENT, path=None):
+    """Build a streaming, read-only compaction plan for history_events.jsonl."""
+    try:
+        keep_recent = int(keep_recent)
+    except (TypeError, ValueError):
+        raise TypeError("keep_recent must be an integer")
+    if keep_recent < 1:
+        raise ValueError("keep_recent must be positive")
+
+    source = Path(path or HISTORY_EVENTS_FILE)
+    base = {
+        "ok": False,
+        "status": "BLOCKED",
+        "version": "HISTORY_EVENTS_ROTATION_V1",
+        "current_file": str(source),
+        "current_size_mb": 0.0,
+        "estimated_new_size_mb": 0.0,
+        "events_read": 0,
+        "events_keep_recent": 0,
+        "events_keep_critical": 0,
+        "events_keep_uncertain": 0,
+        "events_drop_or_archive": 0,
+        "critical_event_types_preserved": sorted(HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES),
+        "invalid_lines": 0,
+        "dry_run": True,
+        "safe_to_commit": False,
+        "reason": "UNKNOWN",
+        "errors": [],
+        "warnings": [],
+    }
+    try:
+        if not source.exists():
+            base.update(reason="HISTORY_EVENTS_FILE_NOT_FOUND", errors=["HISTORY_EVENTS_FILE_NOT_FOUND"])
+            return base
+        if source.is_symlink() or not source.is_file():
+            base.update(reason="HISTORY_EVENTS_FILE_NOT_REGULAR", errors=["HISTORY_EVENTS_FILE_NOT_REGULAR"])
+            return base
+
+        with _HISTORY_EVENTS_ROTATION_LOCK:
+            source_stat = source.stat()
+            source_size = int(source_stat.st_size)
+        base["current_size_mb"] = _history_rotation_v1_mb(source_size)
+        base["source_size_bytes"] = source_size
+        base["source_mtime_ns"] = int(source_stat.st_mtime_ns)
+
+        events_read = 0
+        invalid_lines = 0
+        for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
+            if not raw_line.strip():
+                continue
+            events_read += 1
+            _, error = _history_rotation_v1_parse_line(raw_line)
+            if error:
+                invalid_lines += 1
+
+        recent_from = max(0, events_read - keep_recent)
+        line_index = 0
+        kept_bytes = 0
+        keep_recent_count = 0
+        keep_critical_count = 0
+        keep_uncertain_count = 0
+        drop_count = 0
+        observed_critical_types = set()
+        for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
+            if not raw_line.strip():
+                continue
+            event, error = _history_rotation_v1_parse_line(raw_line)
+            is_recent = line_index >= recent_from
+            line_index += 1
+            if error:
+                kept_bytes += len(raw_line)
+                continue
+            classification, matched = _history_rotation_v1_classify(event)
+            observed_critical_types.update(matched)
+            if is_recent:
+                keep_recent_count += 1
+                kept_bytes += len(raw_line)
+            elif classification == "CRITICAL":
+                keep_critical_count += 1
+                kept_bytes += len(raw_line)
+            elif classification == "PRESERVE_UNCERTAIN":
+                keep_uncertain_count += 1
+                kept_bytes += len(raw_line)
+            else:
+                drop_count += 1
+
+        free_bytes = int(shutil.disk_usage(source.parent).free)
+        required_temp_bytes = kept_bytes + HISTORY_ROTATION_V1_MIN_FREE_RESERVE_BYTES
+        base.update({
+            "ok": True,
+            "events_read": events_read,
+            "events_keep_recent": keep_recent_count,
+            "events_keep_critical": keep_critical_count,
+            "events_keep_uncertain": keep_uncertain_count,
+            "events_drop_or_archive": drop_count,
+            "invalid_lines": invalid_lines,
+            "estimated_new_size_mb": _history_rotation_v1_mb(kept_bytes),
+            "estimated_new_size_bytes": kept_bytes,
+            "estimated_savings_mb": _history_rotation_v1_mb(max(0, source_size - kept_bytes)),
+            "available_free_mb": _history_rotation_v1_mb(free_bytes),
+            "required_temp_mb": _history_rotation_v1_mb(required_temp_bytes),
+            "critical_event_types_observed": sorted(observed_critical_types),
+        })
+        if invalid_lines:
+            base.update(status="BLOCKED", reason="MALFORMED_JSONL", errors=[f"MALFORMED_JSONL_LINES:{invalid_lines}"])
+        elif drop_count == 0:
+            base.update(status="NOT_NEEDED", reason="NOTHING_ELIGIBLE_FOR_COMPACTION")
+        elif free_bytes < required_temp_bytes:
+            base.update(status="BLOCKED", reason="INSUFFICIENT_TEMP_SPACE", errors=["INSUFFICIENT_TEMP_SPACE"])
+        else:
+            base.update(status="READY", safe_to_commit=True, reason="SAFE_STREAMING_ATOMIC_REWRITE")
+        return base
+    except (OSError, ValueError, TypeError) as exc:
+        base.update(reason="PREVIEW_ERROR", errors=[f"{type(exc).__name__}:{exc}"])
+        return base
+
+
+def _history_rotation_v1_should_keep(event, is_recent):
+    if is_recent:
+        return True
+    classification, _ = _history_rotation_v1_classify(event)
+    return classification != "DROPPABLE"
+
+
+def commit_history_events_rotation(ack, keep_recent=HISTORY_ROTATION_V1_KEEP_RECENT, path=None):
+    """Atomically compact history events after an explicit ACK."""
+    source = Path(path or HISTORY_EVENTS_FILE)
+    preview = preview_history_events_rotation(keep_recent=keep_recent, path=source)
+    result = {
+        **preview,
+        "dry_run": False,
+        "committed": False,
+        "backup_created": False,
+        "before_size_mb": preview.get("current_size_mb", 0.0),
+        "after_size_mb": preview.get("current_size_mb", 0.0),
+        "events_before": preview.get("events_read", 0),
+        "events_after": preview.get("events_read", 0),
+        "events_preserved_recent": preview.get("events_keep_recent", 0),
+        "events_preserved_critical": preview.get("events_keep_critical", 0),
+        "events_removed": 0,
+    }
+    if str(ack or "").strip() != HISTORY_ROTATION_V1_ACK:
+        result.update(status="ACK_REQUIRED", reason="ACK_REQUIRED", safe_to_commit=False)
+        result["errors"] = ["ACK_REQUIRED:HISTORY_ROTATION_V1"]
+        return result
+    if not preview.get("safe_to_commit"):
+        return result
+
+    source_size = int(preview["source_size_bytes"])
+    events_before = int(preview["events_read"])
+    recent_from = max(0, events_before - int(keep_recent))
+    temp_path = source.with_name(f".{source.name}.rotation-v1-{os.getpid()}-{uuid.uuid4().hex}.tmp")
+    appended_events = 0
+    warnings = list(preview.get("warnings") or [])
+    warnings.append("ATOMIC_REWRITE_WITHOUT_BACKUP")
+    try:
+        line_index = 0
+        with temp_path.open("xb") as target:
+            for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
+                if not raw_line.strip():
+                    continue
+                event, error = _history_rotation_v1_parse_line(raw_line)
+                if error:
+                    raise ValueError(f"MALFORMED_JSONL_DURING_COMMIT:{error}")
+                is_recent = line_index >= recent_from
+                line_index += 1
+                if _history_rotation_v1_should_keep(event, is_recent):
+                    target.write(raw_line)
+            target.flush()
+            os.fsync(target.fileno())
+
+        with _HISTORY_EVENTS_ROTATION_LOCK:
+            current_size = source.stat().st_size
+            if current_size < source_size:
+                raise OSError("HISTORY_SOURCE_SHRANK_BEFORE_REPLACE")
+            with source.open("rb") as current, temp_path.open("ab") as target:
+                current.seek(source_size)
+                remaining = current_size - source_size
+                while remaining:
+                    raw_line = current.readline(remaining)
+                    if not raw_line:
+                        raise OSError("HISTORY_APPENDED_TAIL_TRUNCATED")
+                    remaining -= len(raw_line)
+                    if raw_line.strip():
+                        _, error = _history_rotation_v1_parse_line(raw_line)
+                        if error:
+                            raise ValueError(f"MALFORMED_APPENDED_JSONL:{error}")
+                        appended_events += 1
+                    target.write(raw_line)
+                target.flush()
+                os.fsync(target.fileno())
+            if source.stat().st_size != current_size:
+                raise OSError("HISTORY_SOURCE_CHANGED_DURING_FINALIZE")
+            os.replace(temp_path, source)
+
+        after_size = source.stat().st_size
+        events_removed = int(preview["events_drop_or_archive"])
+        result.update({
+            "ok": True,
+            "status": "COMMITTED",
+            "reason": "ATOMIC_REWRITE_COMPLETED",
+            "safe_to_commit": True,
+            "committed": True,
+            "after_size_mb": _history_rotation_v1_mb(after_size),
+            "events_after": events_before - events_removed + appended_events,
+            "events_removed": events_removed,
+            "events_appended_during_compaction": appended_events,
+            "warnings": warnings,
+            "errors": [],
+        })
+        return result
+    except (OSError, ValueError, TypeError) as exc:
+        result.update(status="ERROR", reason="COMMIT_FAILED", errors=[f"{type(exc).__name__}:{exc}"], warnings=warnings)
+        return result
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
 
 def configure_timeline_writer(path):
