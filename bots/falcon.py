@@ -2626,6 +2626,11 @@ def falcon_sync_live_order_state(sig, order):
     # after ``place_market_order`` has returned its disaster-stop result.
     sig["broker_stop_side"] = disaster.get("side")
     sig["broker_stop_symbol"] = disaster.get("symbol")
+    sig["broker_stop_type"] = disaster.get("type")
+    sig["broker_stop_position_side"] = disaster.get("position_side")
+    sig["broker_stop_reduce_only"] = disaster.get("reduce_only")
+    sig["broker_stop_close_position"] = disaster.get("close_position")
+    sig["broker_stop_hedge_mode_detected"] = disaster.get("hedge_mode_detected")
     sig["broker_stop_confirmed_at"] = disaster.get("timestamp") or order.get("ts")
     sig["disaster_stop_confirmed"] = bool(
         disaster.get("ok") is True
@@ -2681,6 +2686,11 @@ def register_falcon_trade_registry_open(pos):
                     "broker_stop_trigger_type": pos.get("broker_stop_trigger_type"),
                     "broker_stop_side": pos.get("broker_stop_side"),
                     "broker_stop_symbol": pos.get("broker_stop_symbol"),
+                    "broker_stop_type": pos.get("broker_stop_type"),
+                    "broker_stop_position_side": pos.get("broker_stop_position_side"),
+                    "broker_stop_reduce_only": pos.get("broker_stop_reduce_only"),
+                    "broker_stop_close_position": pos.get("broker_stop_close_position"),
+                    "broker_stop_hedge_mode_detected": pos.get("broker_stop_hedge_mode_detected"),
                     "broker_stop_confirmed_at": pos.get("broker_stop_confirmed_at"),
                     "disaster_stop_confirmed": pos.get("disaster_stop_confirmed"),
                     "initial_qty": pos.get("initial_qty"),
@@ -2715,6 +2725,11 @@ def falcon_update_registry_management(pos, **metadata):
                 "broker_stop_trigger_type": pos.get("broker_stop_trigger_type"),
                 "broker_stop_side": pos.get("broker_stop_side"),
                 "broker_stop_symbol": pos.get("broker_stop_symbol"),
+                "broker_stop_type": pos.get("broker_stop_type"),
+                "broker_stop_position_side": pos.get("broker_stop_position_side"),
+                "broker_stop_reduce_only": pos.get("broker_stop_reduce_only"),
+                "broker_stop_close_position": pos.get("broker_stop_close_position"),
+                "broker_stop_hedge_mode_detected": pos.get("broker_stop_hedge_mode_detected"),
                 "broker_stop_confirmed_at": pos.get("broker_stop_confirmed_at"),
                 "disaster_stop_confirmed": pos.get("disaster_stop_confirmed"),
                 "tp50_real_executed": pos.get("tp50_real_executed"),
@@ -3090,55 +3105,289 @@ def _falcon_management_bool(value):
     return None
 
 
-def _falcon_protective_stop_evidence(order_snapshot, identity, expected_amount=None):
-    """Validate that an exact fetched order is a protective stop for this lifecycle side."""
-    order_snapshot = order_snapshot if isinstance(order_snapshot, dict) else {}
+def _falcon_stop_creation_evidence(pos, identity, expected_stop_order_id):
+    """Return immutable Central creation evidence eligible only by strong lifecycle identity."""
+    pos = pos if isinstance(pos, dict) else {}
     identity = identity if isinstance(identity, dict) else {}
-    order_type = str(order_snapshot.get("type") or "UNKNOWN").upper().strip().replace("-", "_")
-    valid_types = {"STOP", "STOP_MARKET", "STOP_LOSS", "STOP_LOSS_LIMIT"}
-    expected_close_side = "SELL" if identity.get("side") == "LONG" else "BUY"
-    actual_side = str(order_snapshot.get("side") or "").upper().strip()
-    expected_position_side = str(identity.get("side") or "").upper().strip()
-    actual_position_side = str(order_snapshot.get("position_side") or "").upper().strip()
-    reduce_only = _falcon_management_bool(order_snapshot.get("reduce_only"))
-    close_position = _falcon_management_bool(order_snapshot.get("close_position"))
-    ownership_semantics = bool(
-        reduce_only is True
-        or close_position is True
-        or (expected_position_side in {"LONG", "SHORT"} and actual_position_side == expected_position_side)
+    live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+    disaster = live_order.get("disaster_stop") if isinstance(live_order.get("disaster_stop"), dict) else {}
+    creation_order_id = str(
+        disaster.get("order_id")
+        or pos.get("broker_stop_order_id")
+        or pos.get("disaster_stop_order_id")
+        or ""
+    ).strip()
+    expected_order_id = str(expected_stop_order_id or "").strip()
+    strong_lifecycle_identity = bool(
+        identity.get("lifecycle_id")
+        and (identity.get("order_id") or identity.get("client_order_id"))
     )
-    remaining_amount = safe_float(order_snapshot.get("remaining"), None)
-    original_amount = safe_float(order_snapshot.get("amount"), None)
-    amount = remaining_amount if remaining_amount is not None and remaining_amount > FALCON_MANAGEMENT_AMOUNT_TOLERANCE else original_amount
-    expected = safe_float(expected_amount, None)
-    amount_matches = bool(
-        amount is not None
-        and amount > 0
-        and (
-            expected is None
-            or expected <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE
-            or abs(amount - expected) <= max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, max(amount, expected) * 1e-6)
-        )
+    eligible = bool(
+        expected_order_id
+        and creation_order_id == expected_order_id
+        and strong_lifecycle_identity
     )
     return {
-        "protective": bool(
-            order_snapshot.get("ok")
-            and order_type in valid_types
-            and actual_side == expected_close_side
-            and safe_float(order_snapshot.get("stop_price"), 0.0) > 0
-            and ownership_semantics
-            and amount_matches
-        ),
+        "eligible": eligible,
+        "order_id": creation_order_id or None,
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "symbol": disaster.get("symbol") or pos.get("broker_stop_symbol"),
+        "side": disaster.get("side") or pos.get("broker_stop_side"),
+        "type": disaster.get("type") or pos.get("broker_stop_type"),
+        "position_side": disaster.get("position_side") or pos.get("broker_stop_position_side"),
+        "reduce_only": disaster.get("reduce_only") if disaster.get("reduce_only") is not None else pos.get("broker_stop_reduce_only"),
+        "close_position": disaster.get("close_position") if disaster.get("close_position") is not None else pos.get("broker_stop_close_position"),
+        "stop_price": disaster.get("stop_price") or pos.get("broker_stop_price") or pos.get("stop"),
+        "working_type": disaster.get("working_type") or disaster.get("trigger_type") or pos.get("broker_stop_trigger_type"),
+        "amount": disaster.get("amount") or pos.get("broker_stop_amount"),
+        "hedge_mode_detected": disaster.get("hedge_mode_detected") if disaster.get("hedge_mode_detected") is not None else pos.get("broker_stop_hedge_mode_detected"),
+        "source": "CENTRAL_DISASTER_STOP_CREATION_EVIDENCE",
+    }
+
+
+def _falcon_protective_stop_evidence(
+    order_snapshot,
+    identity,
+    expected_amount=None,
+    reference_price=None,
+    creation_evidence=None,
+    hedge_mode=None,
+    expected_stop_order_id=None,
+):
+    """Pure, fail-closed semantic verification for one exact disaster-stop order."""
+    order_snapshot = order_snapshot if isinstance(order_snapshot, dict) else {}
+    identity = identity if isinstance(identity, dict) else {}
+    creation = creation_evidence if isinstance(creation_evidence, dict) and creation_evidence.get("eligible") else {}
+
+    def present(value):
+        return value is not None and str(value).strip().upper() not in {"", "UNKNOWN", "NONE", "NULL"}
+
+    def token(value):
+        return str(value or "").upper().strip().replace("-", "_").replace(" ", "_")
+
+    def factual_or_creation(key, *aliases):
+        factual_value = order_snapshot.get(key)
+        if not present(factual_value):
+            for alias in aliases:
+                factual_value = order_snapshot.get(alias)
+                if present(factual_value):
+                    break
+        if present(factual_value):
+            return factual_value, "BROKER"
+        creation_value = creation.get(key)
+        if present(creation_value):
+            return creation_value, "CENTRAL_CREATION_FALLBACK"
+        return None, "MISSING"
+
+    order_type_value, order_type_source = factual_or_creation("type")
+    order_type = token(order_type_value)
+    take_profit_type = bool(order_type == "TP" or "TAKE_PROFIT" in order_type or "TAKEPROFIT" in order_type)
+    valid_types = {"STOP", "STOP_MARKET", "STOP_LOSS", "TRIGGER_MARKET"}
+    type_valid = bool(order_type in valid_types and not take_profit_type)
+
+    expected_symbol = _falcon_management_norm_symbol(identity.get("symbol"))
+    symbol_value, symbol_source = factual_or_creation("symbol")
+    actual_symbol = _falcon_management_norm_symbol(symbol_value)
+    symbol_matches = bool(expected_symbol and actual_symbol and actual_symbol == expected_symbol)
+
+    expected_position_side = _falcon_management_norm_side(identity.get("side"))
+    expected_close_side = "SELL" if expected_position_side == "LONG" else "BUY"
+    side_value, side_source = factual_or_creation("side")
+    actual_side = token(side_value)
+    close_side_matches = bool(expected_position_side in {"LONG", "SHORT"} and actual_side == expected_close_side)
+
+    position_side_value, position_side_source = factual_or_creation("position_side")
+    actual_position_side = _falcon_management_norm_side(position_side_value)
+    reduce_only_value, reduce_only_source = factual_or_creation("reduce_only")
+    close_position_value, close_position_source = factual_or_creation("close_position")
+    reduce_only = _falcon_management_bool(reduce_only_value)
+    close_position = _falcon_management_bool(close_position_value)
+    reduce_only_confirmed = reduce_only is True
+    close_position_token = token(close_position_value)
+    close_position_confirmed = bool(close_position is True or close_position_token in {"100", "100%", "FULL", "ALL"})
+
+    close_semantic = token(order_snapshot.get("close_semantic"))
+    expected_close_semantic = f"CLOSE_{expected_position_side}" if expected_position_side in {"LONG", "SHORT"} else ""
+    close_semantic_matches = bool(
+        expected_close_semantic
+        and (
+            expected_close_semantic in close_semantic
+            or close_semantic in {expected_position_side, f"CLOSE{expected_position_side}"}
+        )
+    )
+    conflicting_close_semantic = bool(
+        close_semantic
+        and any(value in close_semantic for value in {"CLOSE_LONG", "CLOSE_SHORT"})
+        and not close_semantic_matches
+    )
+
+    explicit_hedge = _falcon_management_bool(hedge_mode)
+    if explicit_hedge is None:
+        explicit_hedge = _falcon_management_bool(creation.get("hedge_mode_detected"))
+    if explicit_hedge is None and actual_position_side in {"LONG", "SHORT"}:
+        explicit_hedge = True
+    hedge_mode_confirmed = explicit_hedge is True
+    position_side_matches = bool(
+        (
+            actual_position_side == expected_position_side
+            if actual_position_side
+            else (close_position_confirmed or close_semantic_matches)
+        )
+        if hedge_mode_confirmed
+        else actual_position_side in {"", expected_position_side}
+    )
+    if hedge_mode_confirmed:
+        close_semantics_confirmed = bool(
+            position_side_matches
+            or close_position_confirmed
+            or close_semantic_matches
+        )
+    else:
+        close_semantics_confirmed = bool(reduce_only_confirmed or close_position_confirmed)
+
+    stop_price_value, stop_price_source = factual_or_creation("stop_price")
+    stop_price = safe_float(stop_price_value, None)
+    reference = safe_float(reference_price, None)
+    trigger_direction_valid = bool(
+        stop_price is not None
+        and stop_price > 0
+        and reference is not None
+        and reference > 0
+        and (
+            (expected_position_side == "LONG" and stop_price < reference)
+            or (expected_position_side == "SHORT" and stop_price > reference)
+        )
+    )
+    working_type_value, working_type_source = factual_or_creation("working_type")
+    working_type = token(working_type_value)
+    trigger_type_valid = working_type in {"MARK", "MARK_PRICE", "MARKET_PRICE"}
+
+    remaining_amount = safe_float(order_snapshot.get("remaining"), None)
+    amount_value, amount_source = factual_or_creation("amount")
+    original_amount = safe_float(amount_value, None)
+    amount = remaining_amount if remaining_amount is not None and remaining_amount > FALCON_MANAGEMENT_AMOUNT_TOLERANCE else original_amount
+    expected = safe_float(expected_amount, None)
+    close_percent = safe_float(str(order_snapshot.get("close_percent") or "").replace("%", ""), None)
+    full_close_confirmed = bool(close_position_confirmed or (close_percent is not None and close_percent >= 100.0))
+    quantity_covers_position = bool(
+        full_close_confirmed
+        or (
+            amount is not None
+            and amount > 0
+            and (
+                expected is None
+                or expected <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+                or amount + max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, max(amount, expected) * 1e-6) >= expected
+            )
+        )
+    )
+
+    actual_order_id = str(order_snapshot.get("order_id") or order_snapshot.get("id") or "").strip()
+    expected_order_id = str(expected_stop_order_id or "").strip()
+    order_identity_matches = bool(not expected_order_id or (actual_order_id and actual_order_id == expected_order_id))
+
+    conflicts = []
+    creation_fallback_eligible = bool(creation)
+    if creation_fallback_eligible:
+        factual_symbol = _falcon_management_norm_symbol(order_snapshot.get("symbol"))
+        creation_symbol = _falcon_management_norm_symbol(creation.get("symbol"))
+        if factual_symbol and creation_symbol and factual_symbol != creation_symbol:
+            conflicts.append("SYMBOL_CONFLICT")
+        factual_side = token(order_snapshot.get("side"))
+        creation_side = token(creation.get("side"))
+        if factual_side and factual_side != "UNKNOWN" and creation_side and factual_side != creation_side:
+            conflicts.append("SIDE_CONFLICT")
+        factual_position_side = _falcon_management_norm_side(order_snapshot.get("position_side"))
+        creation_position_side = _falcon_management_norm_side(creation.get("position_side"))
+        if factual_position_side and creation_position_side and factual_position_side != creation_position_side:
+            conflicts.append("POSITION_SIDE_CONFLICT")
+        factual_type = token(order_snapshot.get("type"))
+        creation_type = token(creation.get("type"))
+        factual_type_stop = factual_type in valid_types
+        creation_type_stop = creation_type in valid_types
+        if factual_type and factual_type != "UNKNOWN" and creation_type and factual_type_stop != creation_type_stop:
+            conflicts.append("ORDER_TYPE_CONFLICT")
+    factual_conflict = bool(conflicts or conflicting_close_semantic)
+    if conflicting_close_semantic:
+        conflicts.append("CLOSE_SEMANTIC_CONFLICT")
+
+    status = token(order_snapshot.get("status"))
+    status_active = status in {"OPEN", "NEW", "ACTIVE", "PENDING", "TRIGGER_PENDING", "PARTIALLY_FILLED"}
+    protective_semantics_valid = bool(
+        order_snapshot.get("ok")
+        and order_identity_matches
+        and type_valid
+        and symbol_matches
+        and close_side_matches
+        and position_side_matches
+        and close_semantics_confirmed
+        and trigger_direction_valid
+        and trigger_type_valid
+        and quantity_covers_position
+        and not factual_conflict
+    )
+    semantic_stop_valid = bool(protective_semantics_valid and status_active)
+    predicates = {
+        "type_valid": type_valid,
+        "symbol_matches": symbol_matches,
+        "close_side_matches": close_side_matches,
+        "position_side_matches": position_side_matches,
+        "reduce_only_confirmed": reduce_only_confirmed,
+        "close_position_confirmed": close_position_confirmed,
+        "close_semantics_confirmed": close_semantics_confirmed,
+        "trigger_direction_valid": trigger_direction_valid,
+        "trigger_type_valid": trigger_type_valid,
+        "quantity_covers_position": quantity_covers_position,
+        "status_active": status_active,
+        "order_identity_matches": order_identity_matches,
+        "factual_conflict": factual_conflict,
+        "semantic_stop_valid": semantic_stop_valid,
+    }
+    required_true_predicates = (
+        "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
+        "close_semantics_confirmed", "trigger_direction_valid", "trigger_type_valid",
+        "quantity_covers_position", "status_active", "order_identity_matches",
+    )
+    failure_reasons = [name.upper() for name in required_true_predicates if predicates.get(name) is False]
+    if factual_conflict:
+        failure_reasons.append("FACTUAL_CONFLICT")
+    return {
+        "protective": protective_semantics_valid,
+        "protective_semantics_valid": protective_semantics_valid,
+        "semantic_stop_valid": semantic_stop_valid,
+        "predicates": predicates,
+        **predicates,
+        "failure_reasons": failure_reasons,
+        "factual_conflicts": conflicts,
         "order_type": order_type,
+        "order_type_source": order_type_source,
+        "expected_symbol": expected_symbol,
+        "actual_symbol": actual_symbol,
+        "symbol_source": symbol_source,
         "expected_close_side": expected_close_side,
         "actual_side": actual_side,
+        "side_source": side_source,
         "expected_position_side": expected_position_side,
         "actual_position_side": actual_position_side,
+        "position_side_source": position_side_source,
         "reduce_only": reduce_only,
+        "reduce_only_source": reduce_only_source,
         "close_position": close_position,
-        "ownership_semantics": ownership_semantics,
+        "close_position_source": close_position_source,
+        "close_semantic": close_semantic or None,
+        "close_semantics_confirmed": close_semantics_confirmed,
+        "hedge_mode": hedge_mode_confirmed,
+        "stop_price": stop_price,
+        "stop_price_source": stop_price_source,
+        "reference_price": reference,
+        "working_type": working_type,
+        "working_type_source": working_type_source,
         "amount": amount,
-        "amount_matches": amount_matches,
+        "amount_source": amount_source,
+        "expected_amount": expected,
+        "full_close_confirmed": full_close_confirmed,
+        "amount_matches": quantity_covers_position,
+        "creation_fallback_eligible": creation_fallback_eligible,
     }
 
 
@@ -3161,6 +3410,8 @@ def _falcon_confirmed_stop_fill_evidence(pos, position_id, order_snapshot, expec
         order_snapshot,
         falcon_position_identity(pos, position_id=position_id),
         expected_amount=expected,
+        reference_price=pos.get("entry"),
+        expected_stop_order_id=expected_stop_id,
     )
     quantity_complete = bool(
         expected is not None
@@ -3211,6 +3462,15 @@ def _falcon_update_stop_health(result):
     HEALTH["falcon_disaster_stop_protection_matches_position"] = bool(result.get("protection_matches_position"))
     HEALTH["falcon_stop_anomaly_detected"] = bool(result.get("stop_anomaly_detected"))
     HEALTH["falcon_stop_anomaly_last_reason"] = result.get("stop_anomaly_reason")
+    predicates = result.get("stop_semantic_predicates") if isinstance(result.get("stop_semantic_predicates"), dict) else {}
+    HEALTH["falcon_disaster_stop_semantic_predicates"] = dict(predicates)
+    HEALTH["falcon_disaster_stop_semantic_failure_reasons"] = list(result.get("stop_semantic_failure_reasons") or [])
+    for predicate_name in (
+        "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
+        "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
+        "close_semantics_confirmed", "quantity_covers_position", "status_active", "semantic_stop_valid",
+    ):
+        HEALTH[f"falcon_disaster_stop_{predicate_name}"] = result.get(predicate_name, predicates.get(predicate_name))
     if result.get("central_only_reconcile_required"):
         HEALTH["falcon_central_only_pending_count"] = max(1, int(HEALTH.get("falcon_central_only_pending_count") or 0))
 
@@ -3235,6 +3495,16 @@ def falcon_refresh_management_safety_health(positions):
     HEALTH["falcon_disaster_stop_order_status"] = selected.get("stop_order_status")
     HEALTH["falcon_disaster_stop_order_id"] = selected.get("stop_order_id") or selected.get("broker_stop_order_id")
     HEALTH["falcon_disaster_stop_last_checked_at"] = selected.get("stop_order_last_checked_at")
+    verification = selected.get("live_stop_verification") if isinstance(selected.get("live_stop_verification"), dict) else {}
+    predicates = verification.get("stop_semantic_predicates") if isinstance(verification.get("stop_semantic_predicates"), dict) else {}
+    HEALTH["falcon_disaster_stop_semantic_predicates"] = dict(predicates)
+    HEALTH["falcon_disaster_stop_semantic_failure_reasons"] = list(verification.get("stop_semantic_failure_reasons") or [])
+    for predicate_name in (
+        "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
+        "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
+        "close_semantics_confirmed", "quantity_covers_position", "status_active", "semantic_stop_valid",
+    ):
+        HEALTH[f"falcon_disaster_stop_{predicate_name}"] = verification.get(predicate_name, predicates.get(predicate_name))
     return {
         "live_count": len(live_rows),
         "central_only_pending_count": len(pending),
@@ -3256,6 +3526,7 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
     identity = falcon_position_identity(pos)
     remaining = falcon_real_remaining_qty(pos)
     stop_order_id = pos.get("broker_stop_order_id") or pos.get("disaster_stop_order_id")
+    creation_stop_evidence = _falcon_stop_creation_evidence(pos, identity, stop_order_id)
     result = {
         "ok": False,
         "status": "STOP_VERIFICATION_NOT_RUN",
@@ -3292,6 +3563,10 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
         "protection_matches_position": False,
         "stop_anomaly_detected": False,
         "stop_anomaly_reason": None,
+        "semantic_stop_valid": False,
+        "stop_semantic_predicates": {},
+        "stop_semantic_failure_reasons": [],
+        "stop_creation_evidence_eligible": bool(creation_stop_evidence.get("eligible")),
         "identity": identity,
     }
     if central_broker is None or not hasattr(central_broker, "managed_position_snapshot"):
@@ -3368,7 +3643,15 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
             flags = _falcon_stop_status_flags(order_status, order_snapshot)
             filled_qty = safe_float((order_snapshot or {}).get("filled"), 0.0)
             fill_expected = safe_float(pos.get("broker_stop_amount"), remaining)
-            terminal_stop_evidence = _falcon_protective_stop_evidence(order_snapshot, identity, expected_amount=remaining)
+            terminal_stop_evidence = _falcon_protective_stop_evidence(
+                order_snapshot,
+                identity,
+                expected_amount=remaining,
+                reference_price=pos.get("entry"),
+                creation_evidence=creation_stop_evidence,
+                hedge_mode=creation_stop_evidence.get("hedge_mode_detected"),
+                expected_stop_order_id=stop_order_id,
+            )
             full_fill_confirmed = bool(
                 flags["filled"]
                 and result.get("entry_ownership_verified")
@@ -3439,10 +3722,32 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                 protected_qty = safe_float(result.get("protected_qty"), 0.0)
                 quantity_match = bool(protected_qty > 0 and abs(protected_qty - position_qty) <= max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, max(protected_qty, position_qty) * 1e-6))
                 result["protection_matches_position"] = quantity_match
-                protective = _falcon_protective_stop_evidence(order_snapshot, identity, expected_amount=position_qty)
-                protective_type = bool(protective.get("protective"))
+                protective = _falcon_protective_stop_evidence(
+                    order_snapshot,
+                    identity,
+                    expected_amount=position_qty,
+                    reference_price=pos.get("entry"),
+                    creation_evidence=creation_stop_evidence,
+                    hedge_mode=creation_stop_evidence.get("hedge_mode_detected"),
+                    expected_stop_order_id=stop_order_id,
+                )
+                protective_type = bool(protective.get("semantic_stop_valid"))
+                quantity_match = bool(protective.get("quantity_covers_position"))
+                if protected_qty <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE and protective.get("full_close_confirmed"):
+                    protected_qty = position_qty
+                result["protected_qty"] = protected_qty
+                result["protection_matches_position"] = quantity_match
                 result["stop_order_protective_evidence"] = protective
                 result["stop_order_protective_verified"] = protective_type
+                result["semantic_stop_valid"] = protective_type
+                result["stop_semantic_predicates"] = dict(protective.get("predicates") or {})
+                result["stop_semantic_failure_reasons"] = list(protective.get("failure_reasons") or [])
+                for predicate_name in (
+                    "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
+                    "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
+                    "close_semantics_confirmed", "quantity_covers_position", "status_active", "semantic_stop_valid",
+                ):
+                    result[predicate_name] = protective.get(predicate_name)
                 if flags["active"] and stop_order_identity_match and quantity_match and protective_type and result.get("entry_ownership_verified"):
                     result.update({"ok": True, "status": "DISASTER_STOP_ACTIVE_VERIFIED", "management_allowed": True})
                 elif flags["cancelled"] or flags["rejected"] or flags["filled"] or flags["triggered"]:
@@ -3459,7 +3764,12 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                 elif flags["active"] and not stop_order_identity_match:
                     result.update({"status": "DISASTER_STOP_IDENTITY_MISMATCH", "stop_anomaly_detected": True, "stop_anomaly_reason": "STOP_ORDER_IDENTITY_MISMATCH"})
                 elif flags["active"] and not protective_type:
-                    result.update({"status": "DISASTER_STOP_EVIDENCE_INSUFFICIENT", "stop_anomaly_detected": True, "stop_anomaly_reason": "STOP_TYPE_SIDE_OR_CLOSE_SEMANTICS_NOT_CONFIRMED"})
+                    result.update({
+                        "status": "DISASTER_STOP_EVIDENCE_INSUFFICIENT",
+                        "stop_anomaly_detected": True,
+                        "stop_anomaly_reason": "STOP_TYPE_SIDE_OR_CLOSE_SEMANTICS_NOT_CONFIRMED",
+                        "stop_anomaly_details": list(protective.get("failure_reasons") or []),
+                    })
                 elif flags["active"] and not result.get("entry_ownership_verified"):
                     result.update({"status": "ENTRY_LIFECYCLE_OWNERSHIP_NOT_CONFIRMED", "stop_anomaly_detected": True, "stop_anomaly_reason": "ENTRY_ORDER_FILL_IDENTITY_NOT_CONFIRMED"})
                 else:
@@ -3485,6 +3795,9 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
     pos["position_qty"] = result.get("position_qty")
     pos["protection_matches_position"] = result.get("protection_matches_position")
     pos["entry_ownership_verified"] = result.get("entry_ownership_verified")
+    pos["semantic_stop_valid"] = result.get("semantic_stop_valid")
+    pos["stop_semantic_predicates"] = dict(result.get("stop_semantic_predicates") or {})
+    pos["stop_semantic_failure_reasons"] = list(result.get("stop_semantic_failure_reasons") or [])
     pos["disaster_stop_active_verified"] = bool(result.get("stop_order_active") and result.get("stop_order_identity_match") and result.get("protection_matches_position") and result.get("stop_order_protective_verified") and result.get("entry_ownership_verified"))
     pos["stop_anomaly_detected"] = result.get("stop_anomaly_detected")
     pos["stop_anomaly_last_reason"] = result.get("stop_anomaly_reason")
@@ -3532,7 +3845,7 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
     signature = "|".join(str(result.get(key)) for key in (
         "status", "stop_order_status", "stop_order_active", "stop_order_filled",
         "stop_order_cancelled", "stop_order_rejected", "position_qty", "protected_qty",
-        "protection_matches_position", "entry_ownership_verified", "central_only_reconcile_required",
+        "protection_matches_position", "semantic_stop_valid", "entry_ownership_verified", "central_only_reconcile_required",
     ))
     pos["stop_verification_signature"] = signature
     pos["live_stop_verification"] = dict(result)
@@ -3548,6 +3861,10 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                 "stop_order_filled", "stop_order_full_fill_confirmed", "stop_order_triggered", "stop_order_cancelled",
                 "stop_order_rejected", "stop_order_last_checked_at", "protected_qty", "position_qty",
                 "protection_matches_position", "stop_order_protective_verified", "stop_anomaly_detected", "stop_anomaly_reason",
+                "semantic_stop_valid", "stop_semantic_predicates", "stop_semantic_failure_reasons",
+                "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
+                "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
+                "close_semantics_confirmed", "quantity_covers_position", "status_active",
                 "central_only_reconcile_required", "read_only", "sent",
             )},
             central_only_evidence=pos.get("central_only_evidence"),

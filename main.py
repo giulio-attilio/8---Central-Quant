@@ -11819,7 +11819,11 @@ def health():
     payload = central_watchdog_status()
     payload["trade_registry"] = central_trade_registry_snapshot(include_trades=False)
     payload.update(automatic_daily_summaries_health())
-    payload.update(central_daily_scheduler_health())
+    daily_scheduler_health_fn = globals().get("central_daily_scheduler_health")
+    if callable(daily_scheduler_health_fn):
+        daily_scheduler_health = daily_scheduler_health_fn()
+        if isinstance(daily_scheduler_health, dict):
+            payload.update(daily_scheduler_health)
     if callable(globals().get("telegram_notification_policy_health")):
         payload.update(telegram_notification_policy_health())
     payload.update(

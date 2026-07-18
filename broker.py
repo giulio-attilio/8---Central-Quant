@@ -3274,6 +3274,154 @@ def managed_position_snapshot(symbol, side, expected_amount=None):
         }
 
 
+def _normalize_managed_order_payload(order, requested_symbol=None, requested_order_id=None):
+    """Normalize factual order evidence without exposing the raw exchange payload."""
+    payload = order if isinstance(order, dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+
+    def first_present(*candidates):
+        for candidate in candidates:
+            if candidate is not None and candidate != "":
+                return candidate
+        return None
+
+    factual_order_id = first_present(
+        payload.get("id"),
+        info.get("orderId"),
+        info.get("order_id"),
+    )
+    factual_symbol = first_present(
+        payload.get("symbol"),
+        info.get("symbol"),
+        info.get("contract"),
+        info.get("instrument"),
+    )
+    order_type = first_present(
+        payload.get("type"),
+        payload.get("orderType"),
+        info.get("type"),
+        info.get("orderType"),
+        info.get("planType"),
+        info.get("triggerOrderType"),
+    )
+    order_side = first_present(payload.get("side"), info.get("side"), info.get("orderSide"))
+    position_side = first_present(
+        info.get("positionSide"),
+        info.get("position_side"),
+        info.get("posSide"),
+        payload.get("positionSide"),
+        payload.get("position_side"),
+        payload.get("posSide"),
+    )
+    reduce_only = first_present(
+        info.get("reduceOnly"),
+        info.get("reduce_only"),
+        payload.get("reduceOnly"),
+        payload.get("reduce_only"),
+    )
+    close_position = first_present(
+        info.get("closePosition"),
+        info.get("close_position"),
+        info.get("closeAll"),
+        info.get("closeAllPosition"),
+        payload.get("closePosition"),
+        payload.get("close_position"),
+    )
+    close_semantic = first_present(
+        payload.get("closeSide"),
+        payload.get("positionAction"),
+        payload.get("orderAction"),
+        info.get("closeSide"),
+        info.get("closeType"),
+        info.get("positionAction"),
+        info.get("orderAction"),
+        info.get("tradeType"),
+        info.get("intent"),
+    )
+    close_percent = first_present(
+        payload.get("closePercent"),
+        payload.get("closePercentage"),
+        info.get("closePercent"),
+        info.get("closePercentage"),
+        info.get("closeRate"),
+        info.get("percentage"),
+    )
+    stop_price = first_present(
+        payload.get("stopLossPrice"),
+        payload.get("stopPrice"),
+        payload.get("triggerPrice"),
+        info.get("stopLossPrice"),
+        info.get("stopPrice"),
+        info.get("triggerPrice"),
+        payload.get("price"),
+        info.get("price"),
+    )
+    working_type = first_present(
+        payload.get("workingType"),
+        payload.get("triggerType"),
+        payload.get("triggerPriceType"),
+        info.get("workingType"),
+        info.get("triggerType"),
+        info.get("triggerPriceType"),
+    )
+    return {
+        "status": str(first_present(payload.get("status"), info.get("status"), "UNKNOWN")).upper(),
+        "order_id": str(factual_order_id) if factual_order_id is not None else None,
+        "requested_order_id": str(requested_order_id) if requested_order_id not in (None, "") else None,
+        "client_order_id": first_present(
+            payload.get("clientOrderId"),
+            payload.get("clientOrderID"),
+            info.get("clientOrderId"),
+            info.get("clientOrderID"),
+            info.get("client_order_id"),
+        ),
+        "symbol": factual_symbol,
+        "requested_symbol": requested_symbol,
+        "type": str(order_type or "UNKNOWN").upper(),
+        "side": str(order_side or "UNKNOWN").upper(),
+        "position_side": position_side,
+        "reduce_only": reduce_only,
+        "close_position": close_position,
+        "close_semantic": close_semantic,
+        "close_percent": close_percent,
+        "amount": _cq_patch_safe_float(first_present(
+            payload.get("amount"),
+            payload.get("quantity"),
+            payload.get("origQty"),
+            info.get("origQty"),
+            info.get("quantity"),
+            info.get("qty"),
+            info.get("orderQty"),
+        ), None),
+        "filled": _cq_patch_safe_float(first_present(
+            payload.get("filled"),
+            payload.get("executedQty"),
+            info.get("executedQty"),
+            info.get("filledQty"),
+        ), 0.0),
+        "remaining": _cq_patch_safe_float(first_present(
+            payload.get("remaining"),
+            info.get("remainingQty"),
+            info.get("leftQty"),
+        ), None),
+        "average": _cq_patch_safe_float(first_present(
+            payload.get("average"),
+            payload.get("avgPrice"),
+            info.get("avgPrice"),
+        ), None),
+        "timestamp": first_present(
+            payload.get("datetime"),
+            payload.get("timestamp"),
+            info.get("updateTime"),
+            info.get("time"),
+        ),
+        "stop_price": _cq_patch_safe_float(stop_price, None),
+        "working_type": working_type,
+        "raw_info_available": bool(info),
+        "raw_info_exposed": False,
+    }
+
+
 def managed_order_snapshot(symbol, order_id):
     """Read one managed order without mutating it or inferring lifecycle ownership."""
     if not order_id:
@@ -3281,29 +3429,14 @@ def managed_order_snapshot(symbol, order_id):
     try:
         ex = exchange()
         order = ex.fetch_order(str(order_id), normalize_symbol(symbol))
-        info = order.get("info") if isinstance(order, dict) and isinstance(order.get("info"), dict) else {}
-        status = str((order or {}).get("status") or info.get("status") or "UNKNOWN").upper()
-        order_type = str((order or {}).get("type") or info.get("type") or info.get("orderType") or "UNKNOWN").upper()
-        order_side = str((order or {}).get("side") or info.get("side") or "UNKNOWN").upper()
-        factual_order_id = (order or {}).get("id") or info.get("orderId") or info.get("order_id")
+        normalized = _normalize_managed_order_payload(
+            order,
+            requested_symbol=normalize_symbol(symbol),
+            requested_order_id=order_id,
+        )
         return {
+            **normalized,
             "ok": True,
-            "status": status,
-            "order_id": str(factual_order_id) if factual_order_id not in (None, "") else None,
-            "requested_order_id": str(order_id),
-            "client_order_id": (order or {}).get("clientOrderId") or info.get("clientOrderId") or info.get("clientOrderID"),
-            "type": order_type,
-            "side": order_side,
-            "amount": _cq_patch_safe_float((order or {}).get("amount") or info.get("origQty") or info.get("quantity"), None),
-            "filled": _cq_patch_safe_float((order or {}).get("filled") or info.get("executedQty"), 0.0),
-            "remaining": _cq_patch_safe_float((order or {}).get("remaining"), None),
-            "average": _cq_patch_safe_float((order or {}).get("average") or info.get("avgPrice"), None),
-            "timestamp": (order or {}).get("datetime") or (order or {}).get("timestamp") or info.get("updateTime") or info.get("time"),
-            "stop_price": _cq_patch_safe_float((order or {}).get("stopLossPrice") or (order or {}).get("stopPrice") or info.get("stopPrice"), None),
-            "working_type": info.get("workingType") or info.get("triggerType"),
-            "position_side": info.get("positionSide"),
-            "reduce_only": (order or {}).get("reduceOnly") if (order or {}).get("reduceOnly") is not None else info.get("reduceOnly"),
-            "close_position": (order or {}).get("closePosition") if (order or {}).get("closePosition") is not None else info.get("closePosition"),
             "read_only": True,
             "sent": False,
             "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,

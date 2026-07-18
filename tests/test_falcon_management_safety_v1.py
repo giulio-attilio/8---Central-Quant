@@ -34,10 +34,14 @@ def _load_functions(names: tuple[str, ...], globals_dict: dict) -> dict:
 
 def _load_broker_function(name: str, globals_dict: dict):
     tree = ast.parse(BROKER_SOURCE.read_text(encoding="utf-8"))
-    definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name]
-    assert definitions, name
+    names = ("_normalize_managed_order_payload", name) if name == "managed_order_snapshot" else (name,)
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert {node.name for node in definitions} == set(names), name
     namespace = dict(globals_dict)
-    exec(compile(ast.Module(body=[definitions[-1]], type_ignores=[]), str(BROKER_SOURCE), "exec"), namespace)
+    exec(compile(ast.Module(body=sorted(definitions, key=lambda node: node.lineno), type_ignores=[]), str(BROKER_SOURCE), "exec"), namespace)
     return namespace[name]
 
 
@@ -63,6 +67,13 @@ def _position(**updates):
         "broker_stop_order_id": "STOP-1",
         "broker_stop_amount": 2.0,
         "broker_stop_price": 1.8,
+        "broker_stop_symbol": "XRPUSDT",
+        "broker_stop_side": "SELL",
+        "broker_stop_type": "STOP_MARKET",
+        "broker_stop_position_side": "LONG",
+        "broker_stop_reduce_only": False,
+        "broker_stop_hedge_mode_detected": True,
+        "broker_stop_trigger_type": "MARK_PRICE",
         "live_order_id": "ORDER-1",
         "live_client_order_id": "CLIENT-1",
         "lifecycle_id": "LIFECYCLE-1",
@@ -143,6 +154,7 @@ def _order_snapshot(status="OPEN", *, ok=True, amount=2.0, filled=0.0):
         "amount": amount,
         "filled": filled,
         "stop_price": 1.8,
+        "symbol": "XRPUSDT",
         "side": "SELL",
         "type": "STOP_MARKET",
         "working_type": "MARK_PRICE",
@@ -162,6 +174,7 @@ def _verifier(broker: _ReadOnlyBroker, health: dict | None = None):
             "falcon_position_identity",
             "_falcon_stop_status_flags",
             "_falcon_management_bool",
+            "_falcon_stop_creation_evidence",
             "_falcon_protective_stop_evidence",
             "_falcon_stop_not_found_evidence",
             "_falcon_update_stop_health",
@@ -189,8 +202,9 @@ def _verifier(broker: _ReadOnlyBroker, health: dict | None = None):
 def test_stop_active_is_factually_verified_without_mutating_broker():
     broker = _ReadOnlyBroker(_position_snapshot(), _order_snapshot("OPEN"))
     position = _position()
+    health = {}
 
-    result = _verifier(broker)(position, now_epoch=1000.0, force=True, persist_registry=False)
+    result = _verifier(broker, health=health)(position, now_epoch=1000.0, force=True, persist_registry=False)
 
     assert result["ok"] is True
     assert result["status"] == "DISASTER_STOP_ACTIVE_VERIFIED"
@@ -202,6 +216,8 @@ def test_stop_active_is_factually_verified_without_mutating_broker():
     assert result["stop_order_type"] == "STOP_MARKET"
     assert result["entry_ownership_verified"] is True
     assert position["disaster_stop_active_verified"] is True
+    assert health["falcon_disaster_stop_semantic_stop_valid"] is True
+    assert health["falcon_disaster_stop_semantic_predicates"]["type_valid"] is True
     assert [call[0] for call in broker.read_calls] == ["position", "order", "order"]
     assert broker.mutation_calls == []
 
@@ -224,7 +240,249 @@ def test_active_order_without_protective_type_side_or_close_semantics_is_rejecte
     assert result["management_allowed"] is False
     assert result["status"] == "DISASTER_STOP_EVIDENCE_INSUFFICIENT"
     assert result["stop_anomaly_reason"] == "STOP_TYPE_SIDE_OR_CLOSE_SEMANTICS_NOT_CONFIRMED"
+    assert result["semantic_stop_valid"] is False
+    assert result["stop_semantic_failure_reasons"]
     assert broker.mutation_calls == []
+
+
+def _semantic_evidence(*, side="LONG", order_updates=None, hedge_mode=True, creation=None):
+    order = _order_snapshot("OPEN")
+    identity = {
+        "symbol": "XRPUSDT",
+        "side": side,
+        "lifecycle_id": "LIFECYCLE-1",
+        "order_id": "ORDER-1",
+        "client_order_id": "CLIENT-1",
+    }
+    reference = 2.0
+    if side == "SHORT":
+        order.update({"side": "BUY", "position_side": "SHORT", "stop_price": 2.2})
+    if order_updates:
+        order.update(order_updates)
+    namespace = _load_functions(
+        (
+            "_falcon_management_norm_symbol",
+            "_falcon_management_norm_side",
+            "_falcon_management_bool",
+            "_falcon_protective_stop_evidence",
+        ),
+        {
+            "safe_float": _safe_float,
+            "FALCON_MANAGEMENT_AMOUNT_TOLERANCE": 1e-9,
+        },
+    )
+    return namespace["_falcon_protective_stop_evidence"](
+        order,
+        identity,
+        expected_amount=2.0,
+        reference_price=reference,
+        creation_evidence=creation,
+        hedge_mode=hedge_mode,
+        expected_stop_order_id="STOP-1",
+    )
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+def test_hedge_mode_accepts_opposite_close_side_with_matching_position_side(side):
+    evidence = _semantic_evidence(side=side)
+
+    assert evidence["semantic_stop_valid"] is True
+    assert evidence["close_side_matches"] is True
+    assert evidence["position_side_matches"] is True
+    assert evidence["status_active"] is True
+
+
+@pytest.mark.parametrize(
+    ("side", "wrong_close_side"),
+    [("LONG", "BUY"), ("SHORT", "SELL")],
+)
+def test_side_that_can_increase_hedge_position_is_rejected(side, wrong_close_side):
+    evidence = _semantic_evidence(side=side, order_updates={"side": wrong_close_side})
+
+    assert evidence["semantic_stop_valid"] is False
+    assert evidence["close_side_matches"] is False
+
+
+def test_conflicting_position_side_is_rejected():
+    evidence = _semantic_evidence(order_updates={"position_side": "SHORT"})
+
+    assert evidence["semantic_stop_valid"] is False
+    assert evidence["position_side_matches"] is False
+
+
+def test_trigger_market_alias_is_accepted_only_with_protective_semantics():
+    evidence = _semantic_evidence(order_updates={"type": "TRIGGER_MARKET"})
+
+    assert evidence["type_valid"] is True
+    assert evidence["trigger_direction_valid"] is True
+    assert evidence["semantic_stop_valid"] is True
+
+
+@pytest.mark.parametrize("order_type", ["TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TP"])
+def test_take_profit_alias_is_never_accepted_as_disaster_stop(order_type):
+    evidence = _semantic_evidence(order_updates={"type": order_type})
+
+    assert evidence["type_valid"] is False
+    assert evidence["semantic_stop_valid"] is False
+
+
+def test_one_way_requires_reduce_only_or_close_position():
+    blocked = _semantic_evidence(
+        hedge_mode=False,
+        order_updates={"position_side": None, "reduce_only": False, "close_position": None},
+    )
+    allowed = _semantic_evidence(
+        hedge_mode=False,
+        order_updates={"position_side": None, "reduce_only": True, "close_position": None},
+    )
+
+    assert blocked["close_semantics_confirmed"] is False
+    assert blocked["semantic_stop_valid"] is False
+    assert allowed["reduce_only_confirmed"] is True
+    assert allowed["semantic_stop_valid"] is True
+
+
+def test_close_position_true_string_can_prove_full_close_without_quantity():
+    evidence = _semantic_evidence(
+        hedge_mode=False,
+        order_updates={
+            "position_side": None,
+            "reduce_only": None,
+            "close_position": "true",
+            "amount": None,
+            "remaining": None,
+        },
+    )
+
+    assert evidence["close_position_confirmed"] is True
+    assert evidence["full_close_confirmed"] is True
+    assert evidence["quantity_covers_position"] is True
+    assert evidence["semantic_stop_valid"] is True
+
+
+def test_close_long_alias_can_prove_hedge_leg_semantics_when_position_side_is_absent():
+    evidence = _semantic_evidence(
+        hedge_mode=True,
+        order_updates={"position_side": None, "close_semantic": "Close Long"},
+    )
+
+    assert evidence["position_side_matches"] is True
+    assert evidence["close_semantics_confirmed"] is True
+    assert evidence["semantic_stop_valid"] is True
+
+
+def test_symbol_mismatch_and_undercoverage_are_fail_closed():
+    symbol = _semantic_evidence(order_updates={"symbol": "SOLUSDT"})
+    quantity = _semantic_evidence(order_updates={"amount": 1.5, "remaining": 1.5})
+
+    assert symbol["symbol_matches"] is False
+    assert symbol["semantic_stop_valid"] is False
+    assert quantity["quantity_covers_position"] is False
+    assert quantity["semantic_stop_valid"] is False
+
+
+@pytest.mark.parametrize(
+    ("side", "wrong_stop"),
+    [("LONG", 2.2), ("SHORT", 1.8)],
+)
+def test_trigger_in_non_protective_direction_is_rejected(side, wrong_stop):
+    evidence = _semantic_evidence(side=side, order_updates={"stop_price": wrong_stop})
+
+    assert evidence["trigger_direction_valid"] is False
+    assert evidence["semantic_stop_valid"] is False
+
+
+def test_creation_evidence_only_fills_missing_fields_and_never_overwrites_conflict():
+    creation = {
+        "eligible": True,
+        "order_id": "STOP-1",
+        "lifecycle_id": "LIFECYCLE-1",
+        "symbol": "XRPUSDT",
+        "side": "SELL",
+        "type": "STOP_MARKET",
+        "position_side": "LONG",
+        "reduce_only": False,
+        "stop_price": 1.8,
+        "working_type": "MARK_PRICE",
+        "amount": 2.0,
+        "hedge_mode_detected": True,
+    }
+    missing = _semantic_evidence(
+        creation=creation,
+        order_updates={
+            "symbol": None,
+            "type": None,
+            "position_side": None,
+            "stop_price": None,
+            "working_type": None,
+            "amount": None,
+            "remaining": None,
+        },
+    )
+    conflict = _semantic_evidence(creation=creation, order_updates={"side": "BUY"})
+
+    assert missing["creation_fallback_eligible"] is True
+    assert missing["semantic_stop_valid"] is True
+    assert missing["order_type_source"] == "CENTRAL_CREATION_FALLBACK"
+    assert conflict["factual_conflict"] is True
+    assert "SIDE_CONFLICT" in conflict["factual_conflicts"]
+    assert conflict["actual_side"] == "BUY"
+    assert conflict["semantic_stop_valid"] is False
+
+
+def test_creation_fallback_requires_exact_stop_order_and_strong_lifecycle_identity():
+    namespace = _load_functions(
+        ("_falcon_stop_creation_evidence",),
+        {},
+    )
+    build = namespace["_falcon_stop_creation_evidence"]
+    position = _position()
+    eligible = build(position, {
+        "lifecycle_id": "LIFECYCLE-1",
+        "order_id": "ORDER-1",
+        "client_order_id": "CLIENT-1",
+    }, "STOP-1")
+    missing_lifecycle = build(position, {"order_id": "ORDER-1"}, "STOP-1")
+    wrong_stop = build(position, {
+        "lifecycle_id": "LIFECYCLE-1",
+        "order_id": "ORDER-1",
+    }, "OTHER-STOP")
+
+    assert eligible["eligible"] is True
+    assert missing_lifecycle["eligible"] is False
+    assert wrong_stop["eligible"] is False
+
+
+@pytest.mark.parametrize("position_alias", ["posSide", "position_side"])
+def test_broker_normalizer_recognizes_position_and_close_aliases(position_alias):
+    normalizer = _load_broker_function(
+        "_normalize_managed_order_payload",
+        {"_cq_patch_safe_float": _safe_float},
+    )
+    normalized = normalizer({
+        "id": "STOP-1",
+        "status": "open",
+        "info": {
+            "symbol": "XRP-USDT",
+            "planType": "TRIGGER_MARKET",
+            "side": "SELL",
+            position_alias: "LONG",
+            "closePosition": "true",
+            "triggerPrice": "1.8",
+            "triggerPriceType": "MARK_PRICE",
+            "origQty": "2.0",
+            "positionAction": "Close Long",
+        },
+    }, requested_symbol="XRPUSDT", requested_order_id="STOP-1")
+
+    assert normalized["position_side"] == "LONG"
+    assert normalized["close_position"] == "true"
+    assert normalized["type"] == "TRIGGER_MARKET"
+    assert normalized["stop_price"] == pytest.approx(1.8)
+    assert normalized["working_type"] == "MARK_PRICE"
+    assert normalized["close_semantic"] == "Close Long"
+    assert normalized["raw_info_available"] is True
+    assert normalized["raw_info_exposed"] is False
 
 
 def test_active_stop_does_not_authorize_management_without_entry_fill_identity():
@@ -830,6 +1088,7 @@ def test_management_loop_central_only_preflight_skips_all_normal_management_and_
             "falcon_position_identity",
             "_falcon_stop_status_flags",
             "_falcon_management_bool",
+            "_falcon_stop_creation_evidence",
             "_falcon_protective_stop_evidence",
             "_falcon_stop_not_found_evidence",
             "_falcon_update_stop_health",
@@ -918,6 +1177,7 @@ def test_two_management_cycles_emit_one_central_only_alert_and_never_tp50_spam()
             "falcon_management_alert_decision",
             "_falcon_stop_status_flags",
             "_falcon_management_bool",
+            "_falcon_stop_creation_evidence",
             "_falcon_protective_stop_evidence",
             "_falcon_stop_not_found_evidence",
             "_falcon_update_stop_health",
