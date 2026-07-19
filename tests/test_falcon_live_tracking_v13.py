@@ -46,6 +46,36 @@ def _event_detail(order_id: str) -> dict:
     }
 
 
+def _build_live_order_detail_payload(audit, detail=None, *, central_only=False, reconciled=False):
+    detail = copy.deepcopy(detail or _event_detail("XRP-ENTRY-1"))
+    order_id = detail.get("order_id")
+    namespace = {
+        "falcon_live_execution_audit_guard_v1_status": lambda **_kwargs: copy.deepcopy(audit),
+        "_flad_v1_read_falcon_live_order_events": lambda limit=100: [{"order_id": order_id}],
+        "_flad_v1_build_event_detail": lambda _event, **_kwargs: copy.deepcopy(detail),
+        "_live_v12_reconciled_closed_order_index": lambda: {
+            "order_ids": {order_id} if reconciled else set(),
+            "client_order_ids": set(),
+        },
+        "_flad_v1_central_only_identity_index": lambda: {
+            "order_ids": {order_id} if central_only else set(),
+            "client_order_ids": set(),
+            "rows": [],
+        },
+        "_flad_v1_detail_is_central_only": lambda row, index: row.get("order_id") in index.get("order_ids", set()),
+        "_live_v12_detail_is_reconciled_completed": lambda row, index: row.get("order_id") in index.get("order_ids", set()),
+        "_flad_v1_now": lambda: "2026-07-19T00:00:00Z",
+        "_flad_v1_public": _public,
+        "_flad_v1_write_snapshot": lambda *_args, **_kwargs: None,
+        "_flad_v1_append_event": lambda *_args, **_kwargs: None,
+        "FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION": "V1.1-TEST",
+        "FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE": Path("unused-latest.json"),
+        "FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_EVENTS_FILE": Path("unused-events.jsonl"),
+    }
+    _functions({"_flad_v1_build_payload"}, namespace)
+    return namespace["_flad_v1_build_payload"]()
+
+
 def test_managed_close_confirmed_is_management_history_not_active_tracking():
     namespace = {
         "_flad_v1_event_status": lambda event: str(event.get("status") or "").upper(),
@@ -242,43 +272,155 @@ def test_order_detail_separates_xrp_central_only_from_tracking_and_clears_after_
     assert all(row["review_status"] == "HISTORICAL_COMPLETED_OR_CLOSED" for row in after["orders"])
 
 
-def test_pending_real_order_remains_tracking_even_when_current_exposure_is_zero():
+def test_xrp_like_live_sent_is_historical_when_central_audit_is_flat():
+    audit = {
+        "ok": True,
+        "live_audit_status": "OK_ACKED_HISTORY_CLEAR",
+        "state": {},
+        "divergence": {
+            "broker_bingx_open_count": 2,
+            "central_live_count": 0,
+            "only_bingx_count": 2,
+            "only_central_count": 0,
+            "live_without_stop_count": 0,
+        },
+    }
+    detail = {
+        **_event_detail("2078483751332171776"),
+        "client_order_id": "FALCON-XRP-LONG-1",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+        "status": "LIVE_SENT",
+        "disaster_stop": {"status": "CLOSED", "created": True, "failed": False},
+    }
+
+    payload = _build_live_order_detail_payload(audit, detail)
+
+    assert payload["status"] == "OK_HISTORICAL_COMPLETED_OR_CLOSED"
+    assert payload["summary"]["active_or_tracking_orders"] == 0
+    assert payload["summary"]["historical_completed_or_closed_orders"] == 1
+    row = payload["orders"][0]
+    assert row["review_status"] == "HISTORICAL_COMPLETED_OR_CLOSED"
+    assert row["tracking_active"] is False
+    assert row["action_required"] is False
+    assert row["completed_by_flat_central_audit"] is True
+    assert row["order_id"] == "2078483751332171776"
+    assert row["client_order_id"] == "FALCON-XRP-LONG-1"
+    assert row["symbol"] == "XRPUSDT" and row["side"] == "LONG"
+    assert row["disaster_stop"] == {"status": "CLOSED", "created": True, "failed": False}
+    assert payload["no_order_sent_by_this_route"] is True
+    assert payload["sent"] is False
+    assert payload["would_send_order"] is False
+    assert payload["broker_called"] is False
+
+
+def test_live_order_remains_tracking_when_central_position_is_open():
     audit = {
         "ok": True,
         "live_audit_status": "OK",
         "state": {},
         "divergence": {
-            "broker_bingx_open_count": 0,
-            "central_live_count": 0,
-            "only_bingx_count": 0,
+            "central_live_count": 1,
             "only_central_count": 0,
             "live_without_stop_count": 0,
         },
     }
-    namespace = {
-        "falcon_live_execution_audit_guard_v1_status": lambda **_kwargs: copy.deepcopy(audit),
-        "_flad_v1_read_falcon_live_order_events": lambda limit=100: [{"order_id": "PENDING-1"}],
-        "_flad_v1_build_event_detail": lambda event, **_kwargs: _event_detail(event["order_id"]),
-        "_live_v12_reconciled_closed_order_index": lambda: {"order_ids": set(), "client_order_ids": set()},
-        "_flad_v1_central_only_identity_index": lambda: {"order_ids": set(), "client_order_ids": set(), "rows": []},
-        "_flad_v1_detail_is_central_only": lambda _detail, _index: False,
-        "_live_v12_detail_is_reconciled_completed": lambda _detail, _index: False,
-        "_flad_v1_now": lambda: "2026-07-15T00:00:00Z",
-        "_flad_v1_public": _public,
-        "_flad_v1_write_snapshot": lambda *_args, **_kwargs: None,
-        "_flad_v1_append_event": lambda *_args, **_kwargs: None,
-        "FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION": "V1.3-TEST",
-        "FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE": Path("unused-latest.json"),
-        "FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_EVENTS_FILE": Path("unused-events.jsonl"),
-    }
-    _functions({"_flad_v1_build_payload"}, namespace)
 
-    payload = namespace["_flad_v1_build_payload"]()
+    payload = _build_live_order_detail_payload(audit)
 
     assert payload["status"] == "LIVE_ORDER_TRACKING_REQUIRED"
-    assert payload["summary"]["active_or_tracking_orders"] == 1
-    assert payload["orders"][0]["tracking_active"] is True
     assert payload["orders"][0]["review_status"] == "LIVE_ORDER_REQUIRES_TRACKING"
+    assert payload["orders"][0]["tracking_active"] is True
+
+
+def test_unknown_or_non_integer_counts_do_not_prove_flat_state():
+    audit = {
+        "ok": True,
+        "live_audit_status": "OK",
+        "state": {},
+        "divergence": {
+            "central_live_count": None,
+            "only_central_count": "0",
+            "live_without_stop_count": False,
+        },
+    }
+
+    payload = _build_live_order_detail_payload(audit)
+
+    assert payload["status"] == "LIVE_ORDER_TRACKING_REQUIRED"
+    assert "completed_by_flat_central_audit" not in payload["orders"][0]
+
+
+def test_live_without_stop_never_receives_flat_historical_reclassification():
+    audit = {
+        "ok": True,
+        "live_audit_status": "OK",
+        "state": {},
+        "divergence": {
+            "central_live_count": 0,
+            "only_central_count": 0,
+            "live_without_stop_count": 1,
+        },
+    }
+
+    payload = _build_live_order_detail_payload(audit)
+
+    assert payload["status"] == "LIVE_ORDER_TRACKING_REQUIRED"
+    assert payload["orders"][0]["tracking_active"] is True
+
+
+def test_unacked_failure_and_non_ok_audit_keep_blocking_precedence():
+    flat = {
+        "central_live_count": 0,
+        "only_central_count": 0,
+        "live_without_stop_count": 0,
+    }
+    failure = {
+        **_event_detail("FAILED-1"),
+        "review_status": "LIVE_FAILURE_REQUIRES_REVIEW",
+        "tracking_active": False,
+        "bad_stop_event": True,
+        "historical_acked": False,
+    }
+    unacked = _build_live_order_detail_payload(
+        {"ok": True, "live_audit_status": "OK", "state": {}, "divergence": flat},
+        failure,
+    )
+    divergent = _build_live_order_detail_payload(
+        {"ok": False, "live_audit_status": "BLOCKED", "state": {}, "divergence": flat},
+    )
+
+    assert unacked["status"] == "BLOCKED_UNACKED_LIVE_FAILURE"
+    assert unacked["orders"][0]["review_status"] == "LIVE_FAILURE_REQUIRES_REVIEW"
+    assert divergent["status"] == "BLOCKED_BY_FALCON_AUDIT"
+    assert divergent["orders"][0]["review_status"] == "LIVE_ORDER_REQUIRES_TRACKING"
+
+
+def test_historical_acked_failure_keeps_existing_classification():
+    acked = {
+        **_event_detail("ACKED-1"),
+        "review_status": "HISTORICAL_ACKED_FAILURE",
+        "tracking_active": False,
+        "action_required": False,
+        "bad_stop_event": True,
+        "historical_acked": True,
+    }
+    payload = _build_live_order_detail_payload(
+        {
+            "ok": True,
+            "live_audit_status": "OK_ACKED_HISTORY_CLEAR",
+            "state": {},
+            "divergence": {
+                "central_live_count": 0,
+                "only_central_count": 0,
+                "live_without_stop_count": 0,
+            },
+        },
+        acked,
+    )
+
+    assert payload["status"] == "OK_HISTORICAL_ACKED_ONLY"
+    assert payload["orders"][0]["review_status"] == "HISTORICAL_ACKED_FAILURE"
 
 
 def test_falcon_audit_clears_only_after_factual_central_only_divergence_disappears(tmp_path):

@@ -47139,7 +47139,7 @@ def falcon_real_pilot_preflight_checklist_v1_text_route():
 # - Atualizar /live para V1.2 com consciência de histórico ACK.
 # ============================================================================
 
-FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION = "2026-07-09-FALCON-LIVE-ORDER-AUDIT-DETAIL-V1"
+FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_VERSION = "2026-07-19-FALCON-LIVE-ORDER-AUDIT-DETAIL-V1.1"
 MANUAL_POSITION_AWARENESS_V1_VERSION = "2026-07-09-MANUAL-POSITION-AWARENESS-V1"
 LIVE_STATUS_V12_HISTORICAL_ACK_AWARENESS_VERSION = "2026-07-11-LIVE-STATUS-V1.2.3-MANUAL-INDEPENDENT"
 
@@ -47653,6 +47653,18 @@ def _flad_v1_build_payload(limit=100):
     details = [_flad_v1_build_event_detail(e, audit_payload=audit, state=state) for e in events]
     reconciled_index = _live_v12_reconciled_closed_order_index()
     central_only_index = _flad_v1_central_only_identity_index()
+    divergence = audit.get("divergence") if isinstance(audit.get("divergence"), dict) else {}
+    audit_status = str(audit.get("live_audit_status") or "").upper()
+    flat_central_audit = bool(
+        audit.get("ok") is True
+        and audit_status.startswith("OK")
+        and type(divergence.get("central_live_count")) is int
+        and divergence.get("central_live_count") == 0
+        and type(divergence.get("only_central_count")) is int
+        and divergence.get("only_central_count") == 0
+        and type(divergence.get("live_without_stop_count")) is int
+        and divergence.get("live_without_stop_count") == 0
+    )
     # A identidade exata da ordem reconciliada prevalece sobre posições manuais
     # abertas em outros símbolos. Posições externas são informativas e não
     # reabrem tracking nem bloqueiam o Falcon.
@@ -47667,11 +47679,16 @@ def _flad_v1_build_payload(limit=100):
             d["action_required"] = False
             d["tracking_active"] = False
             d["completed_by_registry_order_identity"] = True
+        elif d.get("review_status") == "LIVE_ORDER_REQUIRES_TRACKING" and flat_central_audit:
+            d["review_status"] = "HISTORICAL_COMPLETED_OR_CLOSED"
+            d["action_required"] = False
+            d["tracking_active"] = False
+            d["completed_by_flat_central_audit"] = True
     historical_acked = [d for d in details if d.get("historical_acked")]
     unacked_failures = [d for d in details if d.get("bad_stop_event") and not d.get("historical_acked")]
     active_or_tracking = [d for d in details if d.get("tracking_active") and not d.get("bad_stop_event")]
     pending_reconcile = [d for d in details if d.get("reconciliation_required")]
-    divergence = audit.get("divergence") if isinstance(audit.get("divergence"), dict) else {}
+    historical_completed = [d for d in details if d.get("review_status") == "HISTORICAL_COMPLETED_OR_CLOSED"]
     if unacked_failures:
         status = "BLOCKED_UNACKED_LIVE_FAILURE"
         ok = False
@@ -47687,6 +47704,9 @@ def _flad_v1_build_payload(limit=100):
     elif historical_acked and not active_or_tracking:
         status = "OK_HISTORICAL_ACKED_ONLY"
         ok = True
+    elif historical_completed and not active_or_tracking:
+        status = "OK_HISTORICAL_COMPLETED_OR_CLOSED"
+        ok = True
     else:
         status = "OK_AWAITING_FIRST_REAL_ORDER"
         ok = True
@@ -47699,6 +47719,7 @@ def _flad_v1_build_payload(limit=100):
         "no_order_sent_by_this_route": True,
         "sent": False,
         "would_send_order": False,
+        "broker_called": False,
         "rearm_executed": False,
         "summary": {
             "falcon_live_order_events": len(details),
@@ -47706,6 +47727,7 @@ def _flad_v1_build_payload(limit=100):
             "unacked_failures": len(unacked_failures),
             "active_or_tracking_orders": len(active_or_tracking),
             "central_only_pending_reconcile_orders": len(pending_reconcile),
+            "historical_completed_or_closed_orders": len(historical_completed),
             "audit_status": audit.get("live_audit_status"),
             "audit_ok": audit.get("ok"),
             "bingx_open_count": divergence.get("broker_bingx_open_count"),
@@ -47755,6 +47777,7 @@ def _flad_v1_text(payload):
         f"- no_order_sent_by_this_route: {payload.get('no_order_sent_by_this_route')}",
         f"- sent: {payload.get('sent')}",
         f"- would_send_order: {payload.get('would_send_order')}",
+        f"- broker_called: {payload.get('broker_called')}",
         f"- rearm_executed: {payload.get('rearm_executed')}",
         "",
         "Resumo:",
@@ -47799,6 +47822,8 @@ def _flad_v1_text(payload):
         lines.append("✅ Falcon está armado/monitorável, mas ainda não há ordem real nova para auditar.")
     elif payload.get("status") == "OK_HISTORICAL_ACKED_ONLY":
         lines.append("✅ Só há falha histórica já reconhecida por ACK; não há bloqueio operacional novo.")
+    elif payload.get("status") == "OK_HISTORICAL_COMPLETED_OR_CLOSED":
+        lines.append("OK: ordens LIVE_SENT historicas; Central LIVE, Central-only e LIVE sem stop estao zerados.")
     elif payload.get("status") == "LIVE_ORDER_TRACKING_REQUIRED":
         lines.append("⚠️ Há ordem real que precisa ser acompanhada com /live, /sync, /brokerhealth e /falcon/liveaudit/text.")
     elif payload.get("status") == "CENTRAL_ONLY_RECONCILE_REQUIRED":
