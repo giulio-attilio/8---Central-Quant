@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from flask import Flask, request as flask_request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,7 @@ def _load_main_functions(namespace):
         "_fmcor_v1_present",
         "_fmcor_v1_text_value",
         "_fmcor_v1_identifier",
+        "_fmcor_v12_extract_query_params",
         "_fmcor_v1_trade_values",
         "_fmcor_v1_has_stronger_outcome",
         "_fmcor_v1_classification",
@@ -214,6 +216,14 @@ def _harness(trade=None, *, closed=None, positions=None, open_trades=None, fail_
         "central_trade_registry": registry,
         "FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION": "TEST-V1",
         "FALCON_MANUAL_CLOSE_OUTCOME_V1_ACK": "FALCON_MANUAL_CLOSE_OUTCOME_V1",
+        "_FMCOR_V1_REQUIRED_QUERY_PARAMS": (
+            "trade_id", "lifecycle_id", "close_event_id", "exit_price",
+            "close_timestamp", "closed_quantity", "close_reason",
+        ),
+        "_FMCOR_V1_ALLOWED_QUERY_PARAMS": (
+            "trade_id", "lifecycle_id", "close_event_id", "exit_price",
+            "close_timestamp", "closed_quantity", "close_reason", "commit", "ack",
+        ),
         "_FMCOR_V1_LOCK": threading.RLock(),
     }
     return _load_main_functions(namespace), registry, falcon
@@ -335,6 +345,100 @@ def test_commit_with_collision_writes_only_lifecycle_selected_trade_and_retries_
     assert registry.closed[1]["outcome_status"] == "OUTCOME_RECORDED"
     assert registry.closed[1]["entry"] == pytest.approx(1.0871)
     assert len(falcon.projections) == 1
+
+
+def _flask_client_for_harness(namespace):
+    app = Flask(__name__)
+    app.testing = True
+    namespace["request"] = flask_request
+    app.add_url_rule(
+        "/falcon/manualclose/outcome/text",
+        endpoint=f"manual-close-{id(namespace)}",
+        view_func=namespace["falcon_manual_close_outcome_v1_text_route"],
+        methods=["GET"],
+    )
+    return app.test_client()
+
+
+def test_flask_route_extracts_and_decodes_real_encoded_query_string_lifecycle_first():
+    old_verify, live_real, _ = _xrp_trade_id_collision_fixture()
+    ns, registry, _ = _harness(closed=[old_verify, live_real])
+    captured = {}
+    original_build = ns["_fmcor_v1_build_payload"]
+
+    def capture_build(params, **kwargs):
+        captured["params"] = copy.deepcopy(params)
+        captured["kwargs"] = copy.deepcopy(kwargs)
+        return original_build(params, **kwargs)
+
+    ns["_fmcor_v1_build_payload"] = capture_build
+    client = _flask_client_for_harness(ns)
+    response = client.get(
+        "/falcon/manualclose/outcome/text?"
+        "trade_id=FALCON%3AFALCON15%3AXRPUSDT%3ALONG&"
+        "lifecycle_id=CENTRAL-FALCON-LIFECYCLE%3AFALCON-LIVE-FALCON15-1784384114&"
+        "close_event_id=XRP_MANUAL_TP50_20260718_1837&"
+        "exit_price=1.0902&"
+        "close_timestamp=2026-07-18T18%3A37%3A00-03%3A00&"
+        "closed_quantity=9&"
+        "close_reason=TP50_MANUAL_FULL_CLOSE"
+    )
+
+    assert response.status_code == 200
+    assert captured["params"] == {
+        "trade_id": "FALCON:FALCON15:XRPUSDT:LONG",
+        "lifecycle_id": "CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-1784384114",
+        "close_event_id": "XRP_MANUAL_TP50_20260718_1837",
+        "exit_price": "1.0902",
+        "close_timestamp": "2026-07-18T18:37:00-03:00",
+        "closed_quantity": "9",
+        "close_reason": "TP50_MANUAL_FULL_CLOSE",
+    }
+    diagnostics = captured["kwargs"]["query_diagnostics"]
+    assert diagnostics["query_params_present"] is True
+    assert diagnostics["missing_required_params"] == []
+    text = response.get_data(as_text=True)
+    assert "Status: PREVIEW_READY" in text
+    assert "Trade: FALCON:FALCON15:XRPUSDT:LONG" in text
+    assert "Lifecycle: CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-1784384114" in text
+    assert "Entry factual: 1.0871" in text
+    assert "PnL %: 0.2851623585686784" in text
+    assert "Gross PnL USDT: 0.027900000000000924" in text
+    assert "Resultado R: 1.0598290598291513" in text
+    assert "TP50 hit: True" in text
+    assert "Committed: False" in text
+    assert "no_order_sent_by_this_route: True" in text
+    assert "broker_called: False" in text
+    assert registry.write_calls == []
+
+
+def test_flask_route_without_query_blocks_before_registry_resolution():
+    ns, registry, _ = _harness()
+    response = _flask_client_for_harness(ns).get("/falcon/manualclose/outcome/text")
+
+    text = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "QUERY_PARAMETERS_NOT_RECEIVED" in text
+    assert "LIFECYCLE_ID_MISMATCH" not in text
+    assert registry.write_calls == []
+
+
+def test_flask_route_missing_lifecycle_reports_required_query_parameter_first():
+    old_verify, live_real, _ = _xrp_trade_id_collision_fixture()
+    ns, registry, _ = _harness(closed=[old_verify, live_real])
+    response = _flask_client_for_harness(ns).get(
+        "/falcon/manualclose/outcome/text?"
+        "trade_id=FALCON%3AFALCON15%3AXRPUSDT%3ALONG&"
+        "close_event_id=XRP_MANUAL_TP50_20260718_1837&exit_price=1.0902&"
+        "close_timestamp=2026-07-18T18%3A37%3A00-03%3A00&closed_quantity=9&"
+        "close_reason=TP50_MANUAL_FULL_CLOSE"
+    )
+
+    text = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "REQUIRED_QUERY_PARAMETER_MISSING:lifecycle_id" in text
+    assert "CANDIDATE_RESOLVED_BY_LIFECYCLE_ID" not in text
+    assert registry.write_calls == []
 
 
 def test_sol_like_manual_close_outcome_is_supported():

@@ -50076,9 +50076,19 @@ def falcon_central_only_reconciliation_v1_text_route():
 # ============================================================================
 # FALCON MANUAL CLOSE OUTCOME RECONCILIATION V1
 # ============================================================================
-FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION = "2026-07-19-FALCON-MANUAL-CLOSE-OUTCOME-V1.1-LIFECYCLE-FIRST"
+FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION = "2026-07-19-FALCON-MANUAL-CLOSE-OUTCOME-V1.2-QUERY-PARAMETER-EXTRACTION"
 FALCON_MANUAL_CLOSE_OUTCOME_V1_ACK = "FALCON_MANUAL_CLOSE_OUTCOME_V1"
 _FMCOR_V1_LOCK = threading.RLock()
+_FMCOR_V1_REQUIRED_QUERY_PARAMS = (
+    "trade_id",
+    "lifecycle_id",
+    "close_event_id",
+    "exit_price",
+    "close_timestamp",
+    "closed_quantity",
+    "close_reason",
+)
+_FMCOR_V1_ALLOWED_QUERY_PARAMS = (*_FMCOR_V1_REQUIRED_QUERY_PARAMS, "commit", "ack")
 
 
 def _fmcor_v1_present(value):
@@ -50095,6 +50105,38 @@ def _fmcor_v1_identifier(value):
     if text is None or ".." in text or "/" in text or "\\" in text:
         return None
     return text
+
+
+def _fmcor_v12_extract_query_params(args):
+    """Extract the manual administrative request without exposing ACK values."""
+    args = args if args is not None else {}
+    received_keys = sorted(
+        key for key in _FMCOR_V1_ALLOWED_QUERY_PARAMS
+        if key in args
+    )
+    params = {
+        key: args.get(key)
+        for key in _FMCOR_V1_REQUIRED_QUERY_PARAMS
+    }
+    missing = [
+        key for key, value in params.items()
+        if not _fmcor_v1_present(value)
+    ]
+    query_params_present = bool(received_keys)
+    commit_requested = str(args.get("commit") or "").strip().lower() in {
+        "1", "true", "yes", "sim", "on",
+    }
+    return {
+        "params": params,
+        "commit_requested": commit_requested,
+        "ack": args.get("ack"),
+        "diagnostics": {
+            "query_param_keys": received_keys,
+            "query_params_present": query_params_present,
+            "missing_required_params": missing,
+            "query_parameters": dict(params),
+        },
+    }
 
 
 def _fmcor_v1_trade_values(trade, *keys, normalizer=None):
@@ -50423,10 +50465,54 @@ def _fmcor_v1_build_candidate(params):
     }
 
 
-def _fmcor_v1_build_payload(params, commit_requested=False, ack=None):
+def _fmcor_v1_build_payload(params, commit_requested=False, ack=None, query_diagnostics=None):
     commit_requested = bool(commit_requested)
     ack_ok = bool(commit_requested and str(ack or "") == FALCON_MANUAL_CLOSE_OUTCOME_V1_ACK)
     generated_at = _fcor_v1_now()
+    query_diagnostics = dict(query_diagnostics or {})
+    query_param_keys = list(query_diagnostics.get("query_param_keys") or [])
+    query_params_present = query_diagnostics.get("query_params_present")
+    missing_required_params = list(query_diagnostics.get("missing_required_params") or [])
+    query_parameters = dict(query_diagnostics.get("query_parameters") or {})
+    if query_diagnostics:
+        preflight_reasons = []
+        if not query_params_present:
+            preflight_reasons.append("QUERY_PARAMETERS_NOT_RECEIVED")
+        elif missing_required_params:
+            preflight_reasons.extend(
+                f"REQUIRED_QUERY_PARAMETER_MISSING:{name}"
+                for name in missing_required_params
+            )
+        if preflight_reasons:
+            return _flad_v1_public({
+                "ok": False,
+                "status": "BLOCKED",
+                "version": FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION,
+                "generated_at": generated_at,
+                "commit_requested": commit_requested,
+                "ack_ok": ack_ok,
+                "committed": False,
+                "idempotent": False,
+                "read_only": True,
+                "no_order_sent_by_this_route": True,
+                "sent": False,
+                "would_send_order": False,
+                "broker_called": False,
+                "cancel_called": False,
+                "close_called": False,
+                "projection_pending": False,
+                "query_param_keys": query_param_keys,
+                "query_params_present": bool(query_params_present),
+                "missing_required_params": missing_required_params,
+                "query_parameters": query_parameters,
+                "reasons": preflight_reasons,
+                "resolution_diagnostics": [],
+                "candidate_count": 0,
+                "trade_id_candidate_count": 0,
+                "outcome": None,
+                "registry_result": None,
+                "falcon_projection": None,
+            })
     with _FMCOR_V1_LOCK:
         candidate = _fmcor_v1_build_candidate(params)
         outcome = candidate.get("outcome") if isinstance(candidate.get("outcome"), dict) else None
@@ -50500,6 +50586,10 @@ def _fmcor_v1_build_payload(params, commit_requested=False, ack=None):
             "cancel_called": False,
             "close_called": False,
             "projection_pending": projection_pending,
+            "query_param_keys": query_param_keys,
+            "query_params_present": query_params_present,
+            "missing_required_params": missing_required_params,
+            "query_parameters": query_parameters,
             "reasons": candidate.get("reasons") or [],
             "resolution_diagnostics": candidate.get("resolution_diagnostics") or [],
             "candidate_count": candidate.get("candidate_count", 0),
@@ -50513,19 +50603,28 @@ def _fmcor_v1_build_payload(params, commit_requested=False, ack=None):
 def _fmcor_v1_text(payload):
     payload = payload if isinstance(payload, dict) else {}
     outcome = payload.get("outcome") if isinstance(payload.get("outcome"), dict) else {}
+    query_parameters = payload.get("query_parameters") if isinstance(payload.get("query_parameters"), dict) else {}
+    trade_id = outcome.get("trade_id") or query_parameters.get("trade_id")
+    lifecycle_id = outcome.get("lifecycle_id") or query_parameters.get("lifecycle_id")
+    close_event_id = outcome.get("close_event_id") or query_parameters.get("close_event_id")
+    exit_price = outcome.get("exit_price") if outcome.get("exit_price") is not None else query_parameters.get("exit_price")
+    closed_quantity = outcome.get("closed_quantity") if outcome.get("closed_quantity") is not None else query_parameters.get("closed_quantity")
     lines = [
-        "FALCON MANUAL CLOSE OUTCOME RECONCILIATION V1",
+        "FALCON MANUAL CLOSE OUTCOME RECONCILIATION V1.2",
         f"Status: {payload.get('status')}",
         f"Commit solicitado: {payload.get('commit_requested')}",
         f"ACK correto: {payload.get('ack_ok')}",
         f"Committed: {payload.get('committed')}",
-        f"Trade: {outcome.get('trade_id')}",
-        f"Lifecycle: {outcome.get('lifecycle_id')}",
-        f"Close event: {outcome.get('close_event_id')}",
+        f"Query param keys: {payload.get('query_param_keys')}",
+        f"Query params present: {payload.get('query_params_present')}",
+        f"Missing required params: {payload.get('missing_required_params')}",
+        f"Trade: {trade_id}",
+        f"Lifecycle: {lifecycle_id}",
+        f"Close event: {close_event_id}",
         f"Classificacao: {outcome.get('close_classification')}",
         f"Entry factual: {outcome.get('entry')} ({outcome.get('entry_source')})",
-        f"Exit factual informado: {outcome.get('exit_price')}",
-        f"Quantidade fechada: {outcome.get('closed_quantity')}",
+        f"Exit factual informado: {exit_price}",
+        f"Quantidade fechada: {closed_quantity}",
         f"PnL %: {outcome.get('pnl_pct')}",
         f"Gross PnL USDT: {outcome.get('gross_pnl_usdt')}",
         f"Resultado R: {outcome.get('result_r')}",
@@ -50549,15 +50648,13 @@ def _fmcor_v1_text(payload):
 
 @app.route("/falcon/manualclose/outcome/text", methods=["GET"])
 def falcon_manual_close_outcome_v1_text_route():
-    params = {
-        key: request.args.get(key)
-        for key in (
-            "trade_id", "lifecycle_id", "close_event_id", "exit_price",
-            "close_timestamp", "closed_quantity", "close_reason",
-        )
-    }
-    commit_requested = str(request.args.get("commit") or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
-    payload = _fmcor_v1_build_payload(params, commit_requested=commit_requested, ack=request.args.get("ack"))
+    extracted = _fmcor_v12_extract_query_params(request.args)
+    payload = _fmcor_v1_build_payload(
+        extracted["params"],
+        commit_requested=extracted["commit_requested"],
+        ack=extracted["ack"],
+        query_diagnostics=extracted["diagnostics"],
+    )
     return _fmcor_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
