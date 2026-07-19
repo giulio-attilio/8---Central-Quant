@@ -2399,7 +2399,7 @@ def light_bot_health(key: str, cfg: dict):
     }
 
 
-def get_open_positions_from_module(module, key=None):
+def get_open_positions_from_module(module, key=None, raise_on_error=False):
     positions = []
     label = key or getattr(module, "__name__", "unknown")
     memory_profile_step(f"before_positions_{label}")
@@ -2409,6 +2409,8 @@ def get_open_positions_from_module(module, key=None):
         elif hasattr(module, "get_positions"):
             raw = module.get_positions()
         else:
+            if raise_on_error:
+                raise RuntimeError("LOCAL_POSITION_LOADER_UNAVAILABLE")
             raw = {}
 
         if isinstance(raw, dict):
@@ -2416,6 +2418,8 @@ def get_open_positions_from_module(module, key=None):
         elif isinstance(raw, list):
             iterable = raw
         else:
+            if raise_on_error:
+                raise TypeError("LOCAL_POSITION_LOADER_RETURNED_INVALID_TYPE")
             iterable = []
 
         for p in iterable:
@@ -2426,7 +2430,8 @@ def get_open_positions_from_module(module, key=None):
                 continue
             positions.append(p)
     except Exception:
-        pass
+        if raise_on_error:
+            raise
     finally:
         memory_profile_step(f"after_positions_{label}")
     return positions
@@ -15692,12 +15697,21 @@ def _broker_open_positions():
     return rows, None
 
 
-def _central_live_positions_payload():
+def _central_live_positions_payload(strict=False):
     rows = []
     for key, module in LOADED_BOTS.items():
         try:
-            positions = get_open_positions_from_module(module)
+            if strict:
+                positions = get_open_positions_from_module(
+                    module,
+                    key=key,
+                    raise_on_error=True,
+                )
+            else:
+                positions = get_open_positions_from_module(module)
         except Exception:
+            if strict:
+                raise
             positions = []
         for p in positions:
             if not isinstance(p, dict):
@@ -26714,21 +26728,22 @@ def history_rotation_v1_commit_text_route():
 def _history_rotation_v11_local_central_live_count():
     provider = globals().get("_central_live_positions_payload")
     if not callable(provider):
-        return None, "CENTRAL_LIVE_POSITIONS_PROVIDER_UNAVAILABLE"
+        return None, False, "CENTRAL_LIVE_POSITIONS_PROVIDER_UNAVAILABLE"
     try:
-        rows = provider()
+        rows = provider(strict=True)
     except Exception as exc:
-        return None, f"CENTRAL_LIVE_POSITIONS_PROVIDER_ERROR:{type(exc).__name__}"
+        return None, False, f"CENTRAL_LIVE_POSITIONS_PROVIDER_ERROR:{type(exc).__name__}"
     if not isinstance(rows, list):
-        return None, "CENTRAL_LIVE_POSITIONS_PROVIDER_INVALID"
-    return len(rows), None
+        return None, False, "CENTRAL_LIVE_POSITIONS_PROVIDER_INVALID"
+    return len(rows), True, None
 
 
 def _history_rotation_emergency_v11_text(payload):
     lines = [
-        "HISTORY EVENTS ROTATION / COMPACTION — V1.1 EMERGENCY",
-        "Modo: EMERGENCY LOW DISK — redução agressiva de histórico não crítico",
+        "HISTORY EVENTS ROTATION / COMPACTION — V1.2 EMERGENCY",
+        "Modo: EMERGENCY CRITICAL SLIM PROJECTION",
         f"Status: {payload.get('status')}",
+        f"Policy: {payload.get('policy')}",
         f"Arquivo: {payload.get('current_file')}",
         f"Dry run: {payload.get('dry_run')}",
         f"Safe to commit: {payload.get('safe_to_commit')}",
@@ -26741,12 +26756,18 @@ def _history_rotation_emergency_v11_text(payload):
         f"Eventos lidos: {payload.get('events_read', 0)}",
         f"Eventos recentes preservados: {payload.get('recent_preserved', 0)}",
         f"Eventos críticos preservados: {payload.get('critical_preserved', 0)}",
+        f"Críticos brutos encontrados: {payload.get('raw_critical_events_count', 0)}",
+        f"Críticos antigos projetados slim: {payload.get('slim_critical_events_count', 0)}",
+        f"Eventos recentes mantidos brutos: {payload.get('raw_recent_events_count', 0)}",
+        f"Eventos projetados no output: {payload.get('projected_events_count', 0)}",
         f"Eventos após: {payload.get('events_after', 0)}",
         f"Eventos removidos: {payload.get('dropped_count', payload.get('events_removed', 0))}",
         f"Linhas malformadas: {payload.get('malformed_lines_count', 0)}",
         f"Linhas malformadas — números: {payload.get('malformed_line_numbers', [])}",
         f"Quarantine prevista: {payload.get('quarantine_would_be_created')}",
         f"Central LIVE positions: {payload.get('central_live_positions_count')}",
+        f"Central LIVE positions known: {payload.get('central_live_positions_known')}",
+        f"Central LIVE positions error: {payload.get('central_live_positions_error')}",
         "Backup grande: não criado por política de baixo disco",
     ]
     if "committed" in payload:
@@ -26768,11 +26789,13 @@ def _history_rotation_emergency_v11_text(payload):
 
 @app.route("/history/rotation/emergency/preview/text", methods=["GET"])
 def history_rotation_emergency_v11_preview_text_route():
-    live_count, live_warning = _history_rotation_v11_local_central_live_count()
+    live_count, live_known, live_warning = _history_rotation_v11_local_central_live_count()
     try:
         import history_manager as super_history_manager
         payload = super_history_manager.preview_history_events_emergency_rotation(
             central_live_positions_count=live_count,
+            central_live_positions_known=live_known,
+            central_live_positions_error=live_warning,
         )
     except Exception as exc:
         payload = {
@@ -26792,12 +26815,14 @@ def history_rotation_emergency_v11_preview_text_route():
 
 @app.route("/history/rotation/emergency/commit/text", methods=["GET"])
 def history_rotation_emergency_v11_commit_text_route():
-    live_count, live_warning = _history_rotation_v11_local_central_live_count()
+    live_count, live_known, live_warning = _history_rotation_v11_local_central_live_count()
     try:
         import history_manager as super_history_manager
         payload = super_history_manager.commit_history_events_emergency_rotation(
             ack=request.args.get("ack", ""),
             central_live_positions_count=live_count,
+            central_live_positions_known=live_known,
+            central_live_positions_error=live_warning,
         )
     except Exception as exc:
         payload = {
@@ -50619,11 +50644,18 @@ def _fbd_v1_text(value, default=None, max_length=240):
 
 
 def _fbd_v1_event_name(event):
-    return _fbd_v1_text(
+    event_name = _fbd_v1_text(
         _fbd_v1_first(event, "event", "event_type", "type", "state", "status"),
         default="UNKNOWN",
         max_length=80,
     ).upper()
+    if event_name == "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT":
+        return _fbd_v1_text(
+            _fbd_v1_first(event, "original_event", "original_event_type"),
+            default=event_name,
+            max_length=80,
+        ).upper()
+    return event_name
 
 
 def _fbd_v1_is_falcon_blocked(event):

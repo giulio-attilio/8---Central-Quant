@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
+import copy
+import hashlib
 import json
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -272,6 +276,175 @@ def test_emergency_preview_is_read_only_and_accepts_malformed_for_quarantine(tmp
     assert path.read_bytes() == before
 
 
+def test_emergency_preview_uses_slim_projection_when_raw_critical_exceeds_target(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    _write_rows(path, [
+        {
+            "event": "LIVE_SENT",
+            "timestamp": "2026-07-18T10:00:00Z",
+            "sent": True,
+            "symbol": "SOLUSDT",
+            "raw_exchange_response": "x" * 50_000,
+        },
+        {"event": "DEBUG_RECENT", "execution_mode": "PAPER"},
+    ])
+
+    result = history_manager.preview_history_events_emergency_rotation(
+        keep_recent=1,
+        max_output_mb=0.01,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["status"] == "READY"
+    assert result["safe_to_commit"] is True
+    assert result["policy"] == "EMERGENCY_CRITICAL_SLIM_PROJECTION"
+    assert result["raw_critical_events_count"] == 1
+    assert result["slim_critical_events_count"] == 1
+    assert result["raw_recent_events_count"] == 1
+    assert result["raw_critical_bytes"] > int(0.01 * 1024 * 1024)
+    assert result["emergency_estimated_new_size_bytes"] <= int(0.01 * 1024 * 1024)
+    assert result["projected_events_count"] == 2
+
+
+def test_slim_projection_preserves_live_fields_and_removes_giant_payload(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    old_event = {
+        "event": "LIVE_SENT",
+        "timestamp": "2026-07-18T10:00:00Z",
+        "bot": "FALCON",
+        "symbol": "SOLUSDT",
+        "side": "LONG",
+        "setup": "FALCON15",
+        "execution_mode": "LIVE",
+        "status": "SENT",
+        "sent": True,
+        "exchange_order_id": "ORDER-123",
+        "client_order_id": "CLIENT-123",
+        "tag": "FALCON:SOL:1",
+        "ack_key": "ACK-123",
+        "reason": "ORDER_CONFIRMED",
+        "payload": {
+            "raw_exchange_response": "x" * 100_000,
+            "candles": [{"open": number} for number in range(100)],
+        },
+    }
+    raw = _write_rows(path, [old_event, {"event": "DEBUG_RECENT", "execution_mode": "PAPER"}])
+    first_raw = raw.splitlines(keepends=True)[0]
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=1,
+        max_output_mb=0.02,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is True
+    projection = _read_rows(path)[0]
+    assert projection == {
+        "event": "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT",
+        "original_event": "LIVE_SENT",
+        "original_timestamp": "2026-07-18T10:00:00Z",
+        "original_line": 1,
+        "original_sha256": hashlib.sha256(first_raw).hexdigest(),
+        "bot": "FALCON",
+        "symbol": "SOLUSDT",
+        "side": "LONG",
+        "setup": "FALCON15",
+        "mode": "LIVE",
+        "status": "SENT",
+        "order_id": "ORDER-123",
+        "client_order_id": "CLIENT-123",
+        "tag": "FALCON:SOL:1",
+        "sent": True,
+        "disaster_stop_status": None,
+        "disaster_stop_created": None,
+        "disaster_stop_failed": None,
+        "disaster_stop_error": None,
+        "disaster_stop_order_id": None,
+        "ack_key": "ACK-123",
+        "reason": "ORDER_CONFIRMED",
+        "preserved_by": "history_rotation_v1_2",
+        "projection_version": "V1.2",
+    }
+    assert "payload" not in projection
+    assert "raw_exchange_response" not in projection
+    assert "candles" not in projection
+
+
+def test_slim_projection_preserves_falcon_disaster_stop_semantics(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    _write_rows(path, [
+        {
+            "event": "FALCON_DISASTER_STOP_VERIFICATION_BLOCKED",
+            "timestamp": "2026-07-18T10:01:00Z",
+            "bot": "FALCON",
+            "symbol": "SOLUSDT",
+            "side": "LONG",
+            "setup": "FALCON15",
+            "execution_mode": "LIVE",
+            "status": "BLOCKED",
+            "sent": False,
+            "reason": "STOP_TYPE_SIDE_OR_CLOSE_SEMANTICS_NOT_CONFIRMED",
+            "disaster_stop": {
+                "status": "OPEN",
+                "created": True,
+                "failed": False,
+                "order_id": "STOP-123",
+                "error": "semantic evidence incomplete",
+                "raw": "y" * 100_000,
+            },
+        },
+        {"event": "DEBUG_RECENT", "execution_mode": "PAPER"},
+    ])
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=1,
+        max_output_mb=0.02,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is True
+    projection = _read_rows(path)[0]
+    assert projection["original_event"] == "FALCON_DISASTER_STOP_VERIFICATION_BLOCKED"
+    assert projection["disaster_stop_status"] == "OPEN"
+    assert projection["disaster_stop_created"] is True
+    assert projection["disaster_stop_failed"] is False
+    assert projection["disaster_stop_order_id"] == "STOP-123"
+    assert projection["disaster_stop_error"] == "semantic evidence incomplete"
+    assert projection["reason"] == "STOP_TYPE_SIDE_OR_CLOSE_SEMANTICS_NOT_CONFIRMED"
+    assert "raw" not in projection
+
+
+def test_slim_projection_is_idempotent_on_next_preview(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    _write_rows(path, [
+        {"event": "LIVE_SENT", "sent": True, "symbol": "SOLUSDT", "payload": {"huge": "x" * 50_000}},
+        {"event": "DEBUG_RECENT", "execution_mode": "PAPER"},
+    ])
+    committed = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=1,
+        max_output_mb=0.02,
+        path=path,
+        central_live_positions_count=0,
+    )
+    assert committed["committed"] is True
+
+    second = history_manager.preview_history_events_emergency_rotation(
+        keep_recent=1,
+        max_output_mb=0.02,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert second["status"] == "NOT_NEEDED"
+    assert second["slim_projection_savings_bytes"] == 0
+
+
 @pytest.mark.parametrize("ack", [None, "", "HISTORY_ROTATION_V1", "WRONG"])
 def test_emergency_commit_requires_strong_exact_ack(tmp_path, ack):
     path = tmp_path / "history_events.jsonl"
@@ -307,7 +480,12 @@ def test_emergency_commit_preserves_recent_and_critical_and_writes_evidence(tmp_
     assert result["status"] == "COMMITTED"
     assert result["committed"] is True
     assert result["backup_created"] is False
-    assert [row["id"] for row in rows] == ["keep-live", "keep-falcon", "recent-1", "recent-2"]
+    assert [row["event"] for row in rows[:2]] == [
+        "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT",
+        "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT",
+    ]
+    assert [row["original_event"] for row in rows[:2]] == ["LIVE_SENT", "TRADE_BLOCKED"]
+    assert [row["id"] for row in rows[2:]] == ["recent-1", "recent-2"]
     assert result["manifest_created"] is True
     assert result["malformed_quarantine_created"] is True
     manifest_path = Path(result["manifest_file"])
@@ -317,6 +495,10 @@ def test_emergency_commit_preserves_recent_and_critical_and_writes_evidence(tmp_
     assert manifest["malformed_lines_count"] == 1
     assert manifest["malformed_line_numbers"] == [8]
     assert manifest["policy"]["large_backup_created"] is False
+    assert manifest["policy"]["mode"] == "EMERGENCY_CRITICAL_SLIM_PROJECTION"
+    assert manifest["policy"]["estimated_loss"] == "raw_payload_not_preserved_but_hash_kept"
+    assert manifest["slim_projection_evidence"]["original_line_embedded_per_projection"] is True
+    assert manifest["slim_projection_evidence"]["original_sha256_embedded_per_projection"] is True
     assert manifest["emergency_ack_required"] == "HISTORY_ROTATION_EMERGENCY_V1"
     assert quarantine_path.read_bytes() == b"{malformed-emergency-line\n"
     assert not list(tmp_path.glob("*.bak"))
@@ -342,7 +524,7 @@ def test_emergency_respects_max_output_by_reducing_noncritical_recent(tmp_path):
     assert result["committed"] is True
     assert path.stat().st_size <= int(0.01 * 1024 * 1024)
     kept = _read_rows(path)
-    assert kept[0]["id"] == "critical"
+    assert kept[0]["original_event"] == "LIVE_SENT"
     assert len(kept) < len(rows)
     assert "RECENT_NONCRITICAL_REDUCED_TO_FIT_OUTPUT_TARGET" in result["warnings"]
 
@@ -350,8 +532,8 @@ def test_emergency_respects_max_output_by_reducing_noncritical_recent(tmp_path):
 def test_emergency_aborts_when_critical_evidence_exceeds_target(tmp_path):
     path = tmp_path / "history_events.jsonl"
     before = _write_rows(path, [
+        {"event": "DEBUG_OLD", "execution_mode": "PAPER"},
         {"event": "LIVE_SENT", "sent": True, "padding": "x" * 5000},
-        {"event": "DEBUG_RECENT", "execution_mode": "PAPER"},
     ])
 
     result = history_manager.commit_history_events_emergency_rotation(
@@ -363,7 +545,7 @@ def test_emergency_aborts_when_critical_evidence_exceeds_target(tmp_path):
     )
 
     assert result["committed"] is False
-    assert result["reason"] == "CRITICAL_EVENTS_EXCEED_OUTPUT_TARGET"
+    assert result["reason"] == "SLIM_CRITICAL_AND_RECENT_CRITICAL_EXCEED_OUTPUT_TARGET"
     assert path.read_bytes() == before
 
 
@@ -463,7 +645,7 @@ def test_emergency_without_live_provider_never_calls_network(tmp_path, monkeypat
 
     monkeypatch.setattr(socket, "socket", forbidden)
     path = tmp_path / "history_events.jsonl"
-    _write_emergency_sample(path)
+    before = _write_emergency_sample(path)
 
     result = history_manager.commit_history_events_emergency_rotation(
         history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
@@ -473,5 +655,148 @@ def test_emergency_without_live_provider_never_calls_network(tmp_path, monkeypat
         central_live_positions_count=None,
     )
 
-    assert result["committed"] is True
+    assert result["committed"] is False
+    assert result["safe_to_commit"] is False
+    assert result["reason"] == "CENTRAL_LIVE_POSITIONS_UNKNOWN"
+    assert result["central_live_positions_count"] is None
+    assert result["central_live_positions_known"] is False
+    assert path.read_bytes() == before
     assert "CENTRAL_LIVE_POSITIONS_NOT_VERIFIED_NO_BROKER_CALL_PERFORMED" in result["warnings"]
+
+
+def test_emergency_preview_and_commit_fail_closed_on_live_loader_error(tmp_path):
+    path = tmp_path / "history_events.jsonl"
+    before = _write_emergency_sample(path)
+    kwargs = {
+        "keep_recent": 2,
+        "max_output_mb": 1,
+        "path": path,
+        "central_live_positions_count": 0,
+        "central_live_positions_known": False,
+        "central_live_positions_error": "CENTRAL_LIVE_POSITIONS_PROVIDER_ERROR:OSError",
+    }
+
+    preview = history_manager.preview_history_events_emergency_rotation(**kwargs)
+    committed = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        **kwargs,
+    )
+
+    for result in (preview, committed):
+        assert result["safe_to_commit"] is False
+        assert result["reason"] == "CENTRAL_LIVE_POSITIONS_UNKNOWN"
+        assert result["central_live_positions_count"] is None
+        assert result["central_live_positions_known"] is False
+        assert result["central_live_positions_error"] == "CENTRAL_LIVE_POSITIONS_PROVIDER_ERROR:OSError"
+    assert committed["committed"] is False
+    assert path.read_bytes() == before
+
+
+def _compile_falcon_blocked_semantic_helpers():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / "main.py").read_text(encoding="utf-8"))
+    names = {
+        "_fbd_v1_containers",
+        "_fbd_v1_first",
+        "_fbd_v1_text",
+        "_fbd_v1_event_name",
+        "_fbd_v1_is_falcon_blocked",
+        "_fbd_v1_bool",
+        "_fbd_v1_guard_category",
+        "_fbd_v1_build_item",
+    }
+    nodes = [
+        copy.deepcopy(node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert {node.name for node in nodes} == names
+    module = ast.Module(body=sorted(nodes, key=lambda node: node.lineno), type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {"FALCON_BLOCKED_DIAGNOSTIC_V1_UNKNOWN": "UNKNOWN_IN_EVENT"}
+    exec(compile(module, "<history-rotation-slim-compatibility>", "exec"), namespace)
+    return namespace
+
+
+def test_main_live_guard_propagates_local_loader_failure():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / "main.py").read_text(encoding="utf-8"))
+    names = {
+        "get_open_positions_from_module",
+        "_central_live_positions_payload",
+        "_history_rotation_v11_local_central_live_count",
+    }
+    nodes = [
+        copy.deepcopy(node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    module = SimpleNamespace(
+        __name__="falcon_test",
+        carregar_posicoes=lambda: (_ for _ in ()).throw(OSError("local loader failed")),
+    )
+    namespace = {
+        "LOADED_BOTS": {"FALCON": module},
+        "memory_profile_step": lambda _label: None,
+    }
+    compiled = ast.Module(body=sorted(nodes, key=lambda node: node.lineno), type_ignores=[])
+    ast.fix_missing_locations(compiled)
+    exec(compile(compiled, "<history-rotation-live-guard>", "exec"), namespace)
+
+    count, known, error = namespace["_history_rotation_v11_local_central_live_count"]()
+
+    assert count is None
+    assert known is False
+    assert error == "CENTRAL_LIVE_POSITIONS_PROVIDER_ERROR:OSError"
+
+
+def test_emergency_end_to_end_slim_event_remains_visible_to_diagnostics(tmp_path, monkeypatch):
+    path = tmp_path / "history_events.jsonl"
+    blocked = {
+        "event": "TRADE_BLOCKED",
+        "bot": "FALCON",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+        "setup": "FALCON30",
+        "execution_mode": "LIVE",
+        "result": "DENY",
+        "reason": "RISK_LIMIT_REACHED",
+        "payload": {"raw": "x" * 50_000},
+    }
+    raw = _write_rows(path, [blocked, {"event": "DEBUG_RECENT", "execution_mode": "PAPER"}])
+    path.write_bytes(raw + b"{malformed-end-to-end\n")
+
+    result = history_manager.commit_history_events_emergency_rotation(
+        history_manager.HISTORY_ROTATION_EMERGENCY_V1_ACK,
+        keep_recent=1,
+        max_output_mb=0.02,
+        path=path,
+        central_live_positions_count=0,
+    )
+
+    assert result["committed"] is True
+    monkeypatch.setattr(history_manager, "HISTORY_EVENTS_FILE", path)
+    loaded = history_manager.load_events(
+        limit=20,
+        filters={"event_type": "TRADE_BLOCKED"},
+    )
+    assert len(loaded) == 1
+    projected = loaded[0]
+    assert projected["event"] == "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT"
+    assert history_manager.effective_history_event_name(projected) == "TRADE_BLOCKED"
+
+    diagnostic = _compile_falcon_blocked_semantic_helpers()
+    assert diagnostic["_fbd_v1_event_name"](projected) == "TRADE_BLOCKED"
+    assert diagnostic["_fbd_v1_is_falcon_blocked"](projected) is True
+    item = diagnostic["_fbd_v1_build_item"](projected)
+    assert item["event_type"] == "TRADE_BLOCKED"
+    assert item["symbol"] == "XRPUSDT"
+
+    manifest = json.loads(Path(result["manifest_file"]).read_text(encoding="utf-8"))
+    assert manifest["malformed_details_truncated"] is False
+    assert manifest["malformed_details_total"] == 1
+    assert manifest["malformed_details_in_manifest"] == 1
+    assert manifest["critical_slim_projection"] is True
+    assert manifest["raw_payload_not_preserved_but_hash_kept"] is True
+    assert manifest["central_live_positions_known"] is True
+    assert manifest["central_live_positions_error"] is None

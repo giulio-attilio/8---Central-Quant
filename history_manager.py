@@ -61,6 +61,7 @@ HISTORY_ROTATION_EMERGENCY_V1_MAX_OUTPUT_MB = 10.0
 HISTORY_ROTATION_EMERGENCY_V1_MANIFEST_RESERVE_BYTES = 256 * 1024
 HISTORY_ROTATION_EMERGENCY_V1_MAX_MALFORMED_DETAILS = 1000
 HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES = frozenset({
+    "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT",
     "LIVE_SENT",
     "BROKER_LIVE_SENT",
     "LIVE_SENT_BUT_DISASTER_STOP_FAILED",
@@ -627,11 +628,170 @@ def _history_rotation_emergency_v1_inputs(keep_recent, max_output_mb):
     return min(keep_recent, HISTORY_ROTATION_V1_KEEP_RECENT), max_output_mb
 
 
+def _history_rotation_v12_first(event, keys, default=None):
+    for value in _history_rotation_v1_values(event, keys):
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def effective_history_event_name(event, default=""):
+    """Return the diagnostic event name, including V1.2 slim projections."""
+    if not isinstance(event, dict):
+        return default
+    event_name = _history_rotation_v12_first(
+        event,
+        ("event", "event_type", "type", "state", "status"),
+        default,
+    )
+    if str(event_name or "").strip().upper() == "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT":
+        event_name = _history_rotation_v12_first(
+            event,
+            ("original_event", "original_event_type"),
+            event_name,
+        )
+    return str(event_name or default).strip()
+
+
+def _history_rotation_v12_scalar(value, max_chars=240):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("status", "reason", "message", "error", "code", "type"):
+            if value.get(key) not in (None, ""):
+                value = value.get(key)
+                break
+        else:
+            return f"DICT_KEYS:{','.join(sorted(str(key) for key in value)[:12])}"
+    elif isinstance(value, (list, tuple, set)):
+        return f"{type(value).__name__.upper()}_COUNT:{len(value)}"
+    if isinstance(value, (bool, int, float)):
+        return value
+    text = str(value).strip()
+    if len(text) > max_chars:
+        return text[:max_chars] + "…"
+    return text
+
+
+def _history_rotation_v12_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "sim", "on", "sent", "created", "confirmed", "failed"}:
+        return True
+    if text in {"0", "false", "no", "nao", "não", "off", "none"}:
+        return False
+    return None
+
+
+def _history_rotation_v12_disaster_stop(event):
+    nested = None
+    for container in _history_rotation_v1_containers(event):
+        for key in ("disaster_stop", "disaster_stop_evidence", "stop_evidence", "protection"):
+            candidate = container.get(key)
+            if isinstance(candidate, dict):
+                nested = candidate
+                break
+        if nested is not None:
+            break
+    nested = nested or {}
+
+    def first(nested_keys, event_keys=None):
+        for key in nested_keys:
+            if nested.get(key) not in (None, ""):
+                return nested.get(key)
+        return _history_rotation_v12_first(event, event_keys or nested_keys)
+
+    return {
+        "status": _history_rotation_v12_scalar(first(
+            ("status", "disaster_stop_status", "broker_stop_status", "stop_status"),
+            ("disaster_stop_status", "broker_stop_status", "stop_status"),
+        )),
+        "created": _history_rotation_v12_bool(first(
+            ("created", "confirmed", "disaster_stop_created", "stop_created"),
+            ("disaster_stop_created", "stop_created"),
+        )),
+        "failed": _history_rotation_v12_bool(first(
+            ("failed", "disaster_stop_failed", "stop_failed"),
+            ("disaster_stop_failed", "stop_failed"),
+        )),
+        "error": _history_rotation_v12_scalar(first(
+            ("error", "reason", "disaster_stop_error", "stop_error"),
+            ("disaster_stop_error", "stop_error"),
+        )),
+        "order_id": _history_rotation_v12_scalar(first(
+            ("order_id", "disaster_stop_order_id", "stop_order_id"),
+            ("disaster_stop_order_id", "stop_order_id"),
+        )),
+    }
+
+
+def _history_rotation_v12_projection(event, original_line, raw_line):
+    event_name = _history_rotation_v12_first(event, ("original_event", "event", "event_type", "type"), "UNKNOWN")
+    timestamp = _history_rotation_v12_first(
+        event,
+        ("original_timestamp", "timestamp", "occurred_at", "created_at", "generated_at", "datetime", "date"),
+    )
+    original_sha256 = event.get("original_sha256") or hashlib.sha256(raw_line).hexdigest()
+    original_line_value = event.get("original_line") or original_line
+    sent_value = _history_rotation_v12_first(event, ("sent", "real_sent", "order_sent"))
+    disaster_stop = _history_rotation_v12_disaster_stop(event)
+    order_id = _history_rotation_v12_first(
+        event,
+        ("exchange_order_id", "broker_order_id", "live_order_id", "order_id"),
+    ) or disaster_stop.get("order_id")
+    client_order_id = _history_rotation_v12_first(
+        event,
+        ("client_order_id", "live_client_order_id", "clientOrderId"),
+    )
+    projection = {
+        "event": "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT",
+        "original_event": _history_rotation_v12_scalar(event_name, max_chars=120),
+        "original_timestamp": _history_rotation_v12_scalar(timestamp, max_chars=80),
+        "original_line": original_line_value,
+        "original_sha256": str(original_sha256),
+        "bot": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("bot", "robot", "source_component")), max_chars=80),
+        "symbol": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("symbol", "pair", "ativo")), max_chars=40),
+        "side": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("side", "direction", "position_side", "positionSide")), max_chars=24),
+        "setup": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("setup", "setup_label", "strategy")), max_chars=80),
+        "mode": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("execution_mode", "mode", "registry_mode")), max_chars=24),
+        "status": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("status", "result_status", "order_status")), max_chars=120),
+        "order_id": _history_rotation_v12_scalar(order_id, max_chars=120),
+        "client_order_id": _history_rotation_v12_scalar(client_order_id, max_chars=160),
+        "tag": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("tag", "client_tag", "order_tag")), max_chars=160),
+        "sent": _history_rotation_v12_bool(sent_value),
+        "disaster_stop_status": disaster_stop.get("status"),
+        "disaster_stop_created": disaster_stop.get("created"),
+        "disaster_stop_failed": disaster_stop.get("failed"),
+        "disaster_stop_error": disaster_stop.get("error"),
+        "disaster_stop_order_id": disaster_stop.get("order_id"),
+        "ack_key": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("ack_key", "ack", "acknowledgement_key", "audit_ack_key")), max_chars=160),
+        "reason": _history_rotation_v12_scalar(_history_rotation_v12_first(event, ("reason", "block_reason", "error", "message"))),
+        "preserved_by": "history_rotation_v1_2",
+        "projection_version": "V1.2",
+    }
+    return projection
+
+
+def _history_rotation_v12_projection_line(event, original_line, raw_line):
+    projection = _history_rotation_v12_projection(event, original_line, raw_line)
+    return json.dumps(
+        projection,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8") + b"\n"
+
+
 def preview_history_events_emergency_rotation(
     keep_recent=HISTORY_ROTATION_EMERGENCY_V1_KEEP_RECENT,
     max_output_mb=HISTORY_ROTATION_EMERGENCY_V1_MAX_OUTPUT_MB,
     path=None,
     central_live_positions_count=None,
+    central_live_positions_known=None,
+    central_live_positions_error=None,
 ):
     """Plan an aggressive low-disk rewrite without modifying history."""
     keep_recent, max_output_mb = _history_rotation_emergency_v1_inputs(keep_recent, max_output_mb)
@@ -644,11 +804,14 @@ def preview_history_events_emergency_rotation(
     base = {
         "ok": False,
         "status": "BLOCKED",
-        "version": "HISTORY_EVENTS_ROTATION_V1.1_EMERGENCY",
+        "version": "HISTORY_EVENTS_ROTATION_V1.2_EMERGENCY",
         "emergency_mode": True,
+        "policy": "EMERGENCY_CRITICAL_SLIM_PROJECTION",
         "current_file": str(source),
         "current_size_mb": 0.0,
         "free_mb": 0.0,
+        "estimated_new_size_mb": 0.0,
+        "estimated_savings_mb": 0.0,
         "emergency_estimated_new_size_mb": 0.0,
         "emergency_estimated_savings_mb": 0.0,
         "events_read": 0,
@@ -659,6 +822,11 @@ def preview_history_events_emergency_rotation(
         "malformed_lines_count": 0,
         "malformed_line_numbers": [],
         "malformed_line_hashes": [],
+        "malformed_details_truncated": False,
+        "malformed_details_total": 0,
+        "malformed_details_in_manifest": 0,
+        "critical_slim_projection": True,
+        "raw_payload_not_preserved_but_hash_kept": True,
         "quarantine_would_be_created": False,
         "output_target_mb": max_output_mb,
         "requested_recent_limit": keep_recent,
@@ -666,6 +834,8 @@ def preview_history_events_emergency_rotation(
         "dry_run": True,
         "reason": "UNKNOWN",
         "central_live_positions_count": central_live_positions_count,
+        "central_live_positions_known": False,
+        "central_live_positions_error": None,
         "critical_event_types_preserved": sorted(HISTORY_ROTATION_V1_CRITICAL_EVENT_TYPES),
         "warnings": warnings,
         "errors": [],
@@ -678,17 +848,30 @@ def preview_history_events_emergency_rotation(
             base.update(reason="HISTORY_EVENTS_FILE_NOT_REGULAR", errors=["HISTORY_EVENTS_FILE_NOT_REGULAR"])
             return base
 
+        live_error = str(central_live_positions_error or "").strip() or None
+        live_known = (
+            central_live_positions_count is not None and live_error is None
+            if central_live_positions_known is None
+            else bool(central_live_positions_known)
+        )
         try:
-            live_count = None if central_live_positions_count is None else int(central_live_positions_count)
+            live_count = int(central_live_positions_count) if live_known else None
         except (TypeError, ValueError):
             live_count = None
-            warnings.append("CENTRAL_LIVE_POSITION_COUNT_INVALID")
-        if live_count is None:
-            warnings.append("CENTRAL_LIVE_POSITIONS_NOT_VERIFIED_NO_BROKER_CALL_PERFORMED")
-        elif live_count < 0:
+            live_known = False
+            live_error = "CENTRAL_LIVE_POSITION_COUNT_INVALID"
+        if live_count is not None and live_count < 0:
             live_count = None
-            warnings.append("CENTRAL_LIVE_POSITION_COUNT_INVALID")
+            live_known = False
+            live_error = "CENTRAL_LIVE_POSITION_COUNT_INVALID"
+        if live_error:
+            live_known = False
+            live_count = None
+        if not live_known:
+            warnings.append("CENTRAL_LIVE_POSITIONS_NOT_VERIFIED_NO_BROKER_CALL_PERFORMED")
         base["central_live_positions_count"] = live_count
+        base["central_live_positions_known"] = live_known
+        base["central_live_positions_error"] = live_error
 
         with _HISTORY_EVENTS_ROTATION_LOCK:
             source_stat = source.stat()
@@ -719,12 +902,18 @@ def preview_history_events_emergency_rotation(
 
         recent_from = max(0, valid_events - keep_recent)
         valid_index = 0
-        critical_count = 0
-        critical_bytes = 0
+        physical_line_number = 0
+        raw_critical_count = 0
+        raw_critical_bytes = 0
+        old_raw_critical_bytes = 0
+        slim_critical_count = 0
+        slim_critical_bytes = 0
         recent_critical_count = 0
+        recent_critical_bytes = 0
         recent_candidates = []
         observed_critical_types = set()
         for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
+            physical_line_number += 1
             if not raw_line.strip():
                 continue
             event, error = _history_rotation_v1_parse_line(raw_line)
@@ -734,17 +923,29 @@ def preview_history_events_emergency_rotation(
             classification, matched = _history_rotation_v1_classify(event)
             observed_critical_types.update(matched)
             if classification == "CRITICAL":
-                critical_count += 1
-                critical_bytes += len(raw_line)
+                raw_critical_count += 1
+                raw_critical_bytes += len(raw_line)
                 if is_recent:
                     recent_critical_count += 1
+                    recent_critical_bytes += len(raw_line)
+                else:
+                    old_raw_critical_bytes += len(raw_line)
+                    slim_critical_count += 1
+                    slim_critical_bytes += len(
+                        _history_rotation_v12_projection_line(
+                            event,
+                            physical_line_number,
+                            raw_line,
+                        )
+                    )
             elif is_recent:
                 recent_candidates.append((valid_index, len(raw_line)))
             valid_index += 1
 
         selected_recent = set()
         selected_recent_bytes = 0
-        remaining_output_bytes = max(0, output_target_bytes - critical_bytes)
+        critical_output_bytes = slim_critical_bytes + recent_critical_bytes
+        remaining_output_bytes = max(0, output_target_bytes - critical_output_bytes)
         for event_index, raw_size in reversed(recent_candidates):
             if raw_size <= remaining_output_bytes:
                 selected_recent.add(event_index)
@@ -752,9 +953,15 @@ def preview_history_events_emergency_rotation(
                 remaining_output_bytes -= raw_size
         if len(selected_recent) < len(recent_candidates):
             warnings.append("RECENT_NONCRITICAL_REDUCED_TO_FIT_OUTPUT_TARGET")
+        if slim_critical_count:
+            warnings.extend([
+                "CRITICAL_OLD_EVENTS_CONVERTED_TO_SLIM_PROJECTIONS",
+                "RAW_CRITICAL_PAYLOAD_NOT_PRESERVED_HASH_RETAINED",
+            ])
 
-        estimated_output_bytes = critical_bytes + selected_recent_bytes
-        unique_events_after = critical_count + len(selected_recent)
+        estimated_output_bytes = critical_output_bytes + selected_recent_bytes
+        slim_projection_savings_bytes = max(0, old_raw_critical_bytes - slim_critical_bytes)
+        unique_events_after = raw_critical_count + len(selected_recent)
         dropped_count = max(0, events_read - unique_events_after)
         free_bytes = int(shutil.disk_usage(source.parent).free)
         base_temp_need = (
@@ -776,13 +983,25 @@ def preview_history_events_emergency_rotation(
             "source_prefix_sha256": source_hash.hexdigest(),
             "free_mb": _history_rotation_v1_mb(free_bytes),
             "free_bytes": free_bytes,
+            "estimated_new_size_mb": _history_rotation_v1_mb(estimated_output_bytes),
+            "estimated_savings_mb": _history_rotation_v1_mb(max(0, source_size - estimated_output_bytes)),
             "emergency_estimated_new_size_mb": _history_rotation_v1_mb(estimated_output_bytes),
             "emergency_estimated_new_size_bytes": estimated_output_bytes,
             "emergency_estimated_savings_mb": _history_rotation_v1_mb(max(0, source_size - estimated_output_bytes)),
             "events_read": events_read,
             "valid_events": valid_events,
             "recent_preserved": len(selected_recent) + recent_critical_count,
-            "critical_preserved": critical_count,
+            "critical_preserved": raw_critical_count,
+            "raw_critical_events_count": raw_critical_count,
+            "raw_critical_bytes": raw_critical_bytes,
+            "old_raw_critical_bytes": old_raw_critical_bytes,
+            "slim_critical_events_count": slim_critical_count,
+            "slim_critical_estimated_bytes": slim_critical_bytes,
+            "slim_projection_savings_bytes": slim_projection_savings_bytes,
+            "slim_projection_savings_mb": _history_rotation_v1_mb(slim_projection_savings_bytes),
+            "raw_recent_events_count": len(selected_recent) + recent_critical_count,
+            "raw_recent_critical_events_count": recent_critical_count,
+            "projected_events_count": unique_events_after,
             "events_after": unique_events_after,
             "dropped_count": dropped_count,
             "malformed_lines_count": malformed_count,
@@ -790,6 +1009,8 @@ def preview_history_events_emergency_rotation(
             "malformed_line_numbers": malformed_line_numbers,
             "malformed_line_hashes": malformed_line_hashes,
             "malformed_details_truncated": malformed_count > len(malformed_line_numbers),
+            "malformed_details_total": malformed_count,
+            "malformed_details_in_manifest": len(malformed_line_numbers),
             "quarantine_would_be_created": quarantine_would_be_created,
             "required_temp_mb": _history_rotation_v1_mb(total_temp_need),
             "critical_event_types_observed": sorted(observed_critical_types),
@@ -797,13 +1018,21 @@ def preview_history_events_emergency_rotation(
         })
         if malformed_count and not quarantine_would_be_created:
             warnings.append("MALFORMED_CONTENT_HASH_ONLY_NO_QUARANTINE_SPACE")
-        if live_count is not None and live_count > 0:
+        if not live_known:
+            base.update(
+                reason="CENTRAL_LIVE_POSITIONS_UNKNOWN",
+                errors=[live_error or "CENTRAL_LIVE_POSITIONS_UNKNOWN"],
+            )
+        elif live_count > 0:
             base.update(reason="CENTRAL_LIVE_POSITIONS_OPEN", errors=["CENTRAL_LIVE_POSITIONS_OPEN"])
-        elif critical_bytes > output_target_bytes:
-            base.update(reason="CRITICAL_EVENTS_EXCEED_OUTPUT_TARGET", errors=["CRITICAL_EVENTS_EXCEED_OUTPUT_TARGET"])
+        elif critical_output_bytes > output_target_bytes:
+            base.update(
+                reason="SLIM_CRITICAL_AND_RECENT_CRITICAL_EXCEED_OUTPUT_TARGET",
+                errors=["SLIM_CRITICAL_AND_RECENT_CRITICAL_EXCEED_OUTPUT_TARGET"],
+            )
         elif free_bytes < total_temp_need:
             base.update(reason="INSUFFICIENT_TEMP_SPACE", errors=["INSUFFICIENT_TEMP_SPACE"])
-        elif dropped_count == 0 and malformed_count == 0:
+        elif dropped_count == 0 and malformed_count == 0 and slim_projection_savings_bytes == 0:
             base.update(status="NOT_NEEDED", reason="NOTHING_ELIGIBLE_FOR_EMERGENCY_COMPACTION")
         else:
             base.update(status="READY", safe_to_commit=True, reason="EMERGENCY_ACK_REQUIRED")
@@ -849,6 +1078,8 @@ def commit_history_events_emergency_rotation(
     max_output_mb=HISTORY_ROTATION_EMERGENCY_V1_MAX_OUTPUT_MB,
     path=None,
     central_live_positions_count=None,
+    central_live_positions_known=None,
+    central_live_positions_error=None,
 ):
     """Perform the separately acknowledged low-disk emergency rewrite."""
     source = Path(path or HISTORY_EVENTS_FILE)
@@ -856,7 +1087,7 @@ def commit_history_events_emergency_rotation(
         return {
             "ok": False,
             "status": "ACK_REQUIRED",
-            "version": "HISTORY_EVENTS_ROTATION_V1.1_EMERGENCY",
+            "version": "HISTORY_EVENTS_ROTATION_V1.2_EMERGENCY",
             "emergency_mode": True,
             "current_file": str(source),
             "dry_run": False,
@@ -872,6 +1103,8 @@ def commit_history_events_emergency_rotation(
         max_output_mb=max_output_mb,
         path=source,
         central_live_positions_count=central_live_positions_count,
+        central_live_positions_known=central_live_positions_known,
+        central_live_positions_error=central_live_positions_error,
     )
     result = {
         **preview,
@@ -893,6 +1126,7 @@ def commit_history_events_emergency_rotation(
     max_output_bytes = max(1, int(max_output_mb * 1024 * 1024))
     source_size = int(preview["current_size_bytes"])
     selected_recent = set(preview.get("_selected_recent_indexes") or [])
+    recent_from = max(0, int(preview.get("valid_events") or 0) - keep_recent)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     manifest_path = _history_rotation_emergency_v1_manifest_path(source, timestamp)
     quarantine_path = _history_rotation_emergency_v1_quarantine_path(source, timestamp)
@@ -912,6 +1146,7 @@ def commit_history_events_emergency_rotation(
     try:
         source_hash = hashlib.sha256()
         valid_index = 0
+        physical_line_number = 0
         quarantine_handle = None
         if preview.get("quarantine_would_be_created"):
             quarantine_handle = quarantine_temp.open("xb")
@@ -919,6 +1154,7 @@ def commit_history_events_emergency_rotation(
             with output_temp.open("xb") as target:
                 for raw_line in _history_rotation_v1_iter_snapshot(source, source_size):
                     source_hash.update(raw_line)
+                    physical_line_number += 1
                     if not raw_line.strip():
                         continue
                     event, error = _history_rotation_v1_parse_line(raw_line)
@@ -927,7 +1163,16 @@ def commit_history_events_emergency_rotation(
                             quarantine_handle.write(raw_line)
                         continue
                     classification, _ = _history_rotation_v1_classify(event)
-                    if classification == "CRITICAL" or valid_index in selected_recent:
+                    is_recent = valid_index >= recent_from
+                    if classification == "CRITICAL" and not is_recent:
+                        target.write(
+                            _history_rotation_v12_projection_line(
+                                event,
+                                physical_line_number,
+                                raw_line,
+                            )
+                        )
+                    elif classification == "CRITICAL" or valid_index in selected_recent:
                         target.write(raw_line)
                     valid_index += 1
                 target.flush()
@@ -974,7 +1219,7 @@ def commit_history_events_emergency_rotation(
                 raise OSError("INSUFFICIENT_SPACE_FOR_EMERGENCY_EVIDENCE")
 
             manifest = {
-                "version": "HISTORY_EVENTS_ROTATION_V1.1_EMERGENCY",
+                "version": "HISTORY_EVENTS_ROTATION_V1.2_EMERGENCY",
                 "status": "PREPARED",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "before_size_mb": preview.get("current_size_mb"),
@@ -983,21 +1228,40 @@ def commit_history_events_emergency_rotation(
                 "events_after": validated_events,
                 "recent_preserved": preview.get("recent_preserved"),
                 "critical_preserved": preview.get("critical_preserved"),
+                "raw_critical_events_count": preview.get("raw_critical_events_count"),
+                "slim_critical_events_count": preview.get("slim_critical_events_count"),
+                "raw_recent_events_count": preview.get("raw_recent_events_count"),
+                "projected_events_count": preview.get("projected_events_count"),
+                "slim_projection_evidence": {
+                    "original_line_embedded_per_projection": True,
+                    "original_sha256_embedded_per_projection": True,
+                    "raw_payload_preserved": False,
+                },
                 "malformed_lines_count": preview.get("malformed_lines_count"),
                 "malformed_line_numbers": preview.get("malformed_line_numbers"),
                 "malformed_line_hashes": preview.get("malformed_line_hashes"),
+                "malformed_details_truncated": bool(preview.get("malformed_details_truncated")),
+                "malformed_details_total": int(preview.get("malformed_lines_count") or 0),
+                "malformed_details_in_manifest": len(preview.get("malformed_line_numbers") or []),
                 "malformed_quarantine_created": bool(quarantine_temp.exists()),
                 "malformed_quarantine_file": str(quarantine_path) if quarantine_temp.exists() else None,
                 "dropped_count": preview.get("dropped_count"),
+                "critical_slim_projection": True,
+                "raw_payload_not_preserved_but_hash_kept": True,
                 "policy": {
-                    "mode": "EMERGENCY_LOW_DISK_AGGRESSIVE",
+                    "mode": "EMERGENCY_CRITICAL_SLIM_PROJECTION",
                     "recent_limit_requested": keep_recent,
                     "output_target_mb": max_output_mb,
                     "preserve_all_live_and_falcon_critical": True,
+                    "old_critical_payload_policy": "SLIM_SYNTHETIC_WITH_ORIGINAL_SHA256",
+                    "estimated_loss": "raw_payload_not_preserved_but_hash_kept",
+                    "no_large_backup_low_disk_policy": True,
                     "large_backup_created": False,
                 },
                 "emergency_ack_required": HISTORY_ROTATION_EMERGENCY_V1_ACK,
                 "central_live_positions_count": preview.get("central_live_positions_count"),
+                "central_live_positions_known": preview.get("central_live_positions_known"),
+                "central_live_positions_error": preview.get("central_live_positions_error"),
                 "source_prefix_sha256": preview.get("source_prefix_sha256"),
                 "errors": [],
                 "warnings": warnings,
@@ -2236,7 +2500,7 @@ def load_events(limit=None, filters=None, max_bytes=None, include_metadata=False
             continue
         if result and str(event.get("result") or "").upper() != result:
             continue
-        if event_type and str(event.get("event") or "").upper() != event_type:
+        if event_type and effective_history_event_name(event).upper() != event_type:
             continue
         if not _match_date(event.get("ts")):
             continue
@@ -2273,7 +2537,7 @@ def calculate_stats(events=None, filters=None, rows=None):
         raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
 
         event_name = normalize_event_type(
-            event.get("event") or event.get("event_type") or event.get("type"),
+            effective_history_event_name(event),
             event,
         )
 
