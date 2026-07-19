@@ -50659,6 +50659,326 @@ def falcon_manual_close_outcome_v1_text_route():
 
 
 # ============================================================================
+# FALCON MANUAL CLOSE OUTCOME DIAGNOSTIC V1 - READ ONLY
+# ============================================================================
+FALCON_MANUAL_CLOSE_DIAGNOSTIC_V1_VERSION = "2026-07-19-FALCON-MANUAL-CLOSE-DIAGNOSTIC-V1"
+_FMCD_V1_QUERY_FIELDS = (
+    "lifecycle_id", "trade_id", "client_order_id", "broker_order_id", "symbol", "side",
+)
+_FMCD_V1_LIVEORDER_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _fmcd_v1_extract_query(args):
+    args = args if args is not None else {}
+    keys = [key for key in _FMCD_V1_QUERY_FIELDS if key in args]
+    query = {}
+    for key in _FMCD_V1_QUERY_FIELDS:
+        value = _fmcor_v1_text_value(args.get(key), max_length=256)
+        if value is None:
+            continue
+        if key == "symbol":
+            value = _flad_v1_norm_symbol(value)
+        elif key == "side":
+            value = _flad_v1_norm_side(value)
+        query[key] = value
+    return {"query_param_keys": keys, "query_params_present": bool(keys), "query": query}
+
+
+def _fmcd_v1_identity(record):
+    record = record if isinstance(record, dict) else {}
+    return {
+        "lifecycle_id": str(_fcor_v1_value(record, "lifecycle_id") or "").strip() or None,
+        "trade_id": str(_fcor_v1_value(record, "trade_id", "trade_registry_id") or "").strip() or None,
+        "client_order_id": str(_fcor_v1_value(
+            record, "client_order_id", "clientOrderId", "client_tag", "live_client_order_id",
+        ) or "").strip() or None,
+        "broker_order_id": str(_fcor_v1_value(
+            record, "broker_order_id", "order_id", "live_order_id", "entry_order_id",
+            "exchange_order_id", "bingx_order_id",
+        ) or "").strip() or None,
+        "symbol": _flad_v1_norm_symbol(_fcor_v1_value(record, "symbol", "market_symbol", "pair")),
+        "side": _flad_v1_norm_side(_fcor_v1_value(record, "side", "position_side", "positionSide", "direction")),
+    }
+
+
+def _fmcd_v1_matches(record, query):
+    query = query if isinstance(query, dict) else {}
+    if not query:
+        return False
+    identity = _fmcd_v1_identity(record)
+    strong_fields = ("lifecycle_id", "trade_id", "client_order_id", "broker_order_id")
+    requested_strong = [field for field in strong_fields if query.get(field)]
+    if requested_strong and not any(identity.get(field) == query.get(field) for field in requested_strong):
+        return False
+    for field in ("symbol", "side"):
+        if query.get(field) and identity.get(field) != query.get(field):
+            return False
+    return bool(requested_strong or query.get("symbol") or query.get("side"))
+
+
+def _fmcd_v1_exact_identity_matches(rows, field, requested_value):
+    if not requested_value:
+        return 0
+    return sum(
+        1 for row in (rows or [])
+        if isinstance(row, dict) and _fmcd_v1_identity(row).get(field) == requested_value
+    )
+
+
+def _fmcd_v1_safe_match(record, source):
+    record = record if isinstance(record, dict) else {}
+    identity = _fmcd_v1_identity(record)
+    return {
+        "source": source,
+        "status": _fcor_v1_value(record, "status", "review_status", "event", "event_type"),
+        "bot": _fcor_v1_value(record, "bot", "owner", "bot_owner"),
+        "symbol": identity.get("symbol"),
+        "side": identity.get("side"),
+        "trade_id": identity.get("trade_id"),
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "client_order_id": identity.get("client_order_id"),
+        "broker_order_id": identity.get("broker_order_id"),
+        "execution_mode": _fcor_v1_value(record, "execution_mode"),
+        "registry_mode": _fcor_v1_value(record, "registry_mode"),
+        "entry": _fcor_v1_value(record, "entry", "entry_fill_price", "entry_price_confirmed"),
+        "qty": _fcor_v1_value(record, "qty", "quantity", "amount"),
+        "initial_qty": _fcor_v1_value(record, "initial_qty"),
+        "remaining_qty": _fcor_v1_value(record, "remaining_qty", "runner_qty"),
+        "outcome_status": _fcor_v1_value(record, "outcome_status"),
+        "financial_reconciliation_pending": _fcor_v1_value(record, "financial_reconciliation_pending"),
+        "central_only_broker_flat_reconciled": _fcor_v1_value(record, "central_only_broker_flat_reconciled"),
+        "closed_at": _fcor_v1_value(record, "closed_at"),
+        "opened_at": _fcor_v1_value(record, "opened_at", "created_at"),
+        "close_reason": _fcor_v1_value(record, "close_reason", "exit_reason"),
+    }
+
+
+def _fmcd_v1_read_registry():
+    reader = getattr(central_trade_registry, "load_registry_read_only", None) if central_trade_registry is not None else None
+    if not callable(reader):
+        return [], [], "TRADE_REGISTRY_READ_ONLY_READER_UNAVAILABLE"
+    try:
+        registry = reader()
+    except Exception as exc:
+        return [], [], f"TRADE_REGISTRY_READ_ERROR:{type(exc).__name__}"
+    if not isinstance(registry, dict):
+        return [], [], "TRADE_REGISTRY_PAYLOAD_INVALID"
+    open_raw = registry.get("open_trades", {})
+    closed_raw = registry.get("closed_trades", [])
+    open_rows = list(open_raw.values()) if isinstance(open_raw, dict) else list(open_raw) if isinstance(open_raw, list) else []
+    closed_rows = list(closed_raw.values()) if isinstance(closed_raw, dict) else list(closed_raw) if isinstance(closed_raw, list) else []
+    return (
+        [dict(row) for row in open_rows if isinstance(row, dict)],
+        [dict(row) for row in closed_rows if isinstance(row, dict)],
+        None,
+    )
+
+
+def _fmcd_v1_read_falcon_memory():
+    try:
+        rows, error = _fcor_v1_raw_positions()
+    except Exception as exc:
+        return [], f"FALCON_POSITION_READ_ERROR:{type(exc).__name__}"
+    return [dict(row) for _, row in rows if isinstance(row, dict)], error
+
+
+def _fmcd_v1_read_liveorder_detail_snapshot():
+    try:
+        path = FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE
+        if not path.exists():
+            return [], "LIVEORDER_DETAIL_SNAPSHOT_NOT_FOUND"
+        if path.stat().st_size > _FMCD_V1_LIVEORDER_SNAPSHOT_MAX_BYTES:
+            return [], "LIVEORDER_DETAIL_SNAPSHOT_TOO_LARGE"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return [], "LIVEORDER_DETAIL_SNAPSHOT_INVALID"
+        orders = payload.get("orders") if isinstance(payload.get("orders"), list) else []
+        return [dict(row) for row in orders if isinstance(row, dict)], None
+    except Exception as exc:
+        return [], f"LIVEORDER_DETAIL_SNAPSHOT_READ_ERROR:{type(exc).__name__}"
+
+
+def _fmcd_v1_build_payload(query_info):
+    query_info = query_info if isinstance(query_info, dict) else {}
+    query = dict(query_info.get("query") or {})
+    query_keys = list(query_info.get("query_param_keys") or [])
+    reasons = []
+    source_errors = []
+    if not query:
+        reasons.append("QUERY_PARAMETERS_NOT_RECEIVED")
+        open_rows, closed_rows, falcon_rows, liveorder_rows = [], [], [], []
+        registry_error = falcon_error = liveorder_error = None
+        registry_source_available = False
+        falcon_memory_source_available = False
+        liveorder_snapshot_source_available = False
+    else:
+        open_rows, closed_rows, registry_error = _fmcd_v1_read_registry()
+        falcon_rows, falcon_error = _fmcd_v1_read_falcon_memory()
+        liveorder_rows, liveorder_error = _fmcd_v1_read_liveorder_detail_snapshot()
+        source_errors.extend(error for error in (registry_error, falcon_error, liveorder_error) if error)
+        registry_source_available = registry_error is None
+        falcon_memory_source_available = falcon_error is None
+        liveorder_snapshot_source_available = liveorder_error is None
+
+    registry_open = [_fmcd_v1_safe_match(row, "trade_registry.open_trades") for row in open_rows if _fmcd_v1_matches(row, query)]
+    registry_closed = [_fmcd_v1_safe_match(row, "trade_registry.closed_trades") for row in closed_rows if _fmcd_v1_matches(row, query)]
+    falcon_matches = [_fmcd_v1_safe_match(row, "falcon.positions") for row in falcon_rows if _fmcd_v1_matches(row, query)]
+    liveorder_matches = [_fmcd_v1_safe_match(row, "falcon.liveorder.detail.snapshot") for row in liveorder_rows if _fmcd_v1_matches(row, query)]
+    registry_rows = [*open_rows, *closed_rows]
+
+    registry_exact_client_order_matches = _fmcd_v1_exact_identity_matches(
+        registry_rows, "client_order_id", query.get("client_order_id"),
+    )
+    registry_exact_broker_order_matches = _fmcd_v1_exact_identity_matches(
+        registry_rows, "broker_order_id", query.get("broker_order_id"),
+    )
+    falcon_exact_client_order_matches = _fmcd_v1_exact_identity_matches(
+        falcon_rows, "client_order_id", query.get("client_order_id"),
+    )
+    falcon_exact_broker_order_matches = _fmcd_v1_exact_identity_matches(
+        falcon_rows, "broker_order_id", query.get("broker_order_id"),
+    )
+    liveorder_exact_client_order_matches = _fmcd_v1_exact_identity_matches(
+        liveorder_rows, "client_order_id", query.get("client_order_id"),
+    )
+    liveorder_exact_broker_order_matches = _fmcd_v1_exact_identity_matches(
+        liveorder_rows, "broker_order_id", query.get("broker_order_id"),
+    )
+
+    if registry_source_available and query.get("lifecycle_id") and not any(
+        _fmcd_v1_identity(row).get("lifecycle_id") == query.get("lifecycle_id")
+        for row in registry_rows
+    ):
+        reasons.append("LIFECYCLE_NOT_FOUND_IN_TRADE_REGISTRY")
+    client_outside_registry = bool(
+        registry_source_available
+        and query.get("client_order_id")
+        and registry_exact_client_order_matches == 0
+        and (
+            (falcon_memory_source_available and falcon_exact_client_order_matches > 0)
+            or (liveorder_snapshot_source_available and liveorder_exact_client_order_matches > 0)
+        )
+    )
+    broker_outside_registry = bool(
+        registry_source_available
+        and query.get("broker_order_id")
+        and registry_exact_broker_order_matches == 0
+        and (
+            (falcon_memory_source_available and falcon_exact_broker_order_matches > 0)
+            or (liveorder_snapshot_source_available and liveorder_exact_broker_order_matches > 0)
+        )
+    )
+    if client_outside_registry or broker_outside_registry:
+        reasons.append("ORDER_FOUND_OUTSIDE_REGISTRY")
+    client_liveorder_gap = bool(
+        registry_source_available
+        and liveorder_snapshot_source_available
+        and query.get("client_order_id")
+        and registry_exact_client_order_matches == 0
+        and liveorder_exact_client_order_matches > 0
+    )
+    broker_liveorder_gap = bool(
+        registry_source_available
+        and liveorder_snapshot_source_available
+        and query.get("broker_order_id")
+        and registry_exact_broker_order_matches == 0
+        and liveorder_exact_broker_order_matches > 0
+    )
+    if client_liveorder_gap or broker_liveorder_gap:
+        reasons.append("LIVEORDER_DETAIL_REGISTRY_GAP")
+
+    matches = [*registry_open, *registry_closed, *falcon_matches, *liveorder_matches]
+    if source_errors:
+        status = "DIAGNOSTIC_PARTIAL_SOURCE_ERRORS"
+        ok = False
+    else:
+        status = "DIAGNOSTIC_COMPLETE_WITH_GAPS" if reasons else "DIAGNOSTIC_COMPLETE"
+        ok = True
+    return _flad_v1_public({
+        "ok": ok,
+        "status": status,
+        "version": FALCON_MANUAL_CLOSE_DIAGNOSTIC_V1_VERSION,
+        "generated_at": _fcor_v1_now(),
+        "read_only": True,
+        "no_order_sent_by_this_route": True,
+        "broker_called": False,
+        "write_executed": False,
+        "registry_write": False,
+        "query_param_keys": query_keys,
+        "query_params_present": bool(query),
+        "query_params": query,
+        "registry_open_matches": len(registry_open),
+        "registry_closed_matches": len(registry_closed),
+        "registry_all_matches": len(registry_open) + len(registry_closed),
+        "falcon_memory_matches": len(falcon_matches),
+        "liveorder_detail_matches": len(liveorder_matches),
+        "registry_source_available": registry_source_available,
+        "falcon_memory_source_available": falcon_memory_source_available,
+        "liveorder_snapshot_source_available": liveorder_snapshot_source_available,
+        "registry_exact_client_order_matches": registry_exact_client_order_matches,
+        "registry_exact_broker_order_matches": registry_exact_broker_order_matches,
+        "falcon_exact_client_order_matches": falcon_exact_client_order_matches,
+        "falcon_exact_broker_order_matches": falcon_exact_broker_order_matches,
+        "liveorder_exact_client_order_matches": liveorder_exact_client_order_matches,
+        "liveorder_exact_broker_order_matches": liveorder_exact_broker_order_matches,
+        "registry_report_collections_checked": ["open_trades", "closed_trades"],
+        "reasons": sorted(set(reasons)),
+        "source_errors": source_errors,
+        "matches": matches,
+    })
+
+
+def _fmcd_v1_text(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    lines = [
+        "FALCON MANUAL CLOSE OUTCOME DIAGNOSTIC V1",
+        f"Status: {payload.get('status')}",
+        f"ok={payload.get('ok')}",
+        f"no_order_sent_by_this_route={payload.get('no_order_sent_by_this_route')}",
+        f"broker_called={payload.get('broker_called')}",
+        f"write_executed={payload.get('write_executed')}",
+        f"registry_write={payload.get('registry_write')}",
+        f"query_param_keys={payload.get('query_param_keys')}",
+        f"query_params={payload.get('query_params')}",
+        f"registry_open_matches={payload.get('registry_open_matches')}",
+        f"registry_closed_matches={payload.get('registry_closed_matches')}",
+        f"registry_all_matches={payload.get('registry_all_matches')}",
+        f"falcon_memory_matches={payload.get('falcon_memory_matches')}",
+        f"liveorder_detail_matches={payload.get('liveorder_detail_matches')}",
+        f"registry_source_available={payload.get('registry_source_available')}",
+        f"falcon_memory_source_available={payload.get('falcon_memory_source_available')}",
+        f"liveorder_snapshot_source_available={payload.get('liveorder_snapshot_source_available')}",
+        f"registry_exact_client_order_matches={payload.get('registry_exact_client_order_matches')}",
+        f"registry_exact_broker_order_matches={payload.get('registry_exact_broker_order_matches')}",
+        f"falcon_exact_client_order_matches={payload.get('falcon_exact_client_order_matches')}",
+        f"falcon_exact_broker_order_matches={payload.get('falcon_exact_broker_order_matches')}",
+        f"liveorder_exact_client_order_matches={payload.get('liveorder_exact_client_order_matches')}",
+        f"liveorder_exact_broker_order_matches={payload.get('liveorder_exact_broker_order_matches')}",
+        "Reasons:",
+    ]
+    lines.extend(f"- {reason}" for reason in (payload.get("reasons") or []))
+    if not payload.get("reasons"):
+        lines.append("- Nenhum.")
+    if payload.get("source_errors"):
+        lines.append("Source errors:")
+        lines.extend(f"- {error}" for error in payload.get("source_errors") or [])
+    lines.append("Matches:")
+    for index, match in enumerate(payload.get("matches") or [], 1):
+        fields = " | ".join(f"{key}={value}" for key, value in match.items())
+        lines.append(f"{index}. {fields}")
+    if not payload.get("matches"):
+        lines.append("- Nenhum.")
+    return "\n".join(lines)
+
+
+@app.route("/falcon/manualclose/diagnostic/text", methods=["GET"])
+def falcon_manual_close_diagnostic_v1_text_route():
+    query_info = _fmcd_v1_extract_query(request.args)
+    payload = _fmcd_v1_build_payload(query_info)
+    return _fmcd_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ============================================================================
 # PREDATOR AUTO CLOSED REGISTRY SYNC HARDENING V1 - PAPER ONLY
 # ============================================================================
 PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION = "2026-07-16-PREDATOR-AUTO-CLOSED-REGISTRY-SYNC-HARDENING-V1"

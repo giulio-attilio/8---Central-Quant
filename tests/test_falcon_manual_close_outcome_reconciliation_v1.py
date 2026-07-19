@@ -74,6 +74,17 @@ def _load_main_functions(namespace):
         "_fmcor_v1_build_payload",
         "_fmcor_v1_text",
         "falcon_manual_close_outcome_v1_text_route",
+        "_fmcd_v1_extract_query",
+        "_fmcd_v1_identity",
+        "_fmcd_v1_matches",
+        "_fmcd_v1_exact_identity_matches",
+        "_fmcd_v1_safe_match",
+        "_fmcd_v1_read_registry",
+        "_fmcd_v1_read_falcon_memory",
+        "_fmcd_v1_read_liveorder_detail_snapshot",
+        "_fmcd_v1_build_payload",
+        "_fmcd_v1_text",
+        "falcon_manual_close_diagnostic_v1_text_route",
     }
     if _MAIN_FUNCTION_CODE is None:
         tree = ast.parse(MAIN_SOURCE.read_text(encoding="utf-8"))
@@ -161,8 +172,13 @@ class FakeRegistry:
         self.closed = copy.deepcopy(closed or [])
         self.open = copy.deepcopy(open_trades or {})
         self.write_calls = []
+        self.read_only_calls = 0
 
     def load_registry(self):
+        return {"open_trades": copy.deepcopy(self.open), "closed_trades": copy.deepcopy(self.closed)}
+
+    def load_registry_read_only(self):
+        self.read_only_calls += 1
         return {"open_trades": copy.deepcopy(self.open), "closed_trades": copy.deepcopy(self.closed)}
 
     def record_manual_close_outcome(self, trade_id, close_event_id, outcome, expected_identity=None):
@@ -225,7 +241,16 @@ def _harness(trade=None, *, closed=None, positions=None, open_trades=None, fail_
             "close_timestamp", "closed_quantity", "close_reason", "commit", "ack",
         ),
         "_FMCOR_V1_LOCK": threading.RLock(),
+        "FALCON_MANUAL_CLOSE_DIAGNOSTIC_V1_VERSION": "TEST-DIAGNOSTIC-V1",
+        "_FMCD_V1_QUERY_FIELDS": (
+            "lifecycle_id", "trade_id", "client_order_id", "broker_order_id", "symbol", "side",
+        ),
+        "_FMCD_V1_LIVEORDER_SNAPSHOT_MAX_BYTES": 2 * 1024 * 1024,
     }
+    namespace["_fcor_v1_raw_positions"] = lambda: (
+        [(str(key), copy.deepcopy(value)) for key, value in falcon.get_positions().items()],
+        None,
+    )
     return _load_main_functions(namespace), registry, falcon
 
 
@@ -439,6 +464,354 @@ def test_flask_route_missing_lifecycle_reports_required_query_parameter_first():
     assert "REQUIRED_QUERY_PARAMETER_MISSING:lifecycle_id" in text
     assert "CANDIDATE_RESOLVED_BY_LIFECYCLE_ID" not in text
     assert registry.write_calls == []
+
+
+def _diagnostic_client(namespace, liveorder_rows=None, liveorder_error=None):
+    namespace["_fmcd_v1_read_liveorder_detail_snapshot"] = lambda: (
+        copy.deepcopy(liveorder_rows or []),
+        liveorder_error,
+    )
+    app = Flask(__name__)
+    app.testing = True
+    namespace["request"] = flask_request
+    app.add_url_rule(
+        "/falcon/manualclose/diagnostic/text",
+        endpoint=f"manual-close-diagnostic-{id(namespace)}",
+        view_func=namespace["falcon_manual_close_diagnostic_v1_text_route"],
+        methods=["GET"],
+    )
+    return app.test_client()
+
+
+def test_manual_close_diagnostic_finds_closed_registry_trade_by_lifecycle():
+    ns, registry, _ = _harness()
+    response = _diagnostic_client(ns).get(
+        "/falcon/manualclose/diagnostic/text?lifecycle_id=LC-XRP"
+    )
+
+    text = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "registry_open_matches=0" in text
+    assert "registry_closed_matches=1" in text
+    assert "registry_all_matches=1" in text
+    assert "source=trade_registry.closed_trades" in text
+    assert "lifecycle_id=LC-XRP" in text
+    assert "LIFECYCLE_NOT_FOUND_IN_TRADE_REGISTRY" not in text
+    assert registry.read_only_calls == 1
+    assert registry.write_calls == []
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_field"),
+    [
+        ("client_order_id=CLIENT-XRP", "client_order_id=CLIENT-XRP"),
+        ("broker_order_id=ORDER-XRP", "broker_order_id=ORDER-XRP"),
+    ],
+)
+def test_manual_close_diagnostic_finds_registry_order_identities(query, expected_field):
+    ns, registry, _ = _harness()
+    response = _diagnostic_client(ns).get(
+        f"/falcon/manualclose/diagnostic/text?{query}"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "registry_closed_matches=1" in text
+    assert expected_field in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" not in text
+    assert registry.write_calls == []
+
+
+def test_manual_close_diagnostic_lists_reused_trade_id_without_selecting_candidate():
+    old_verify, live_real, params = _xrp_trade_id_collision_fixture()
+    ns, registry, _ = _harness(closed=[old_verify, live_real])
+    response = _diagnostic_client(ns).get(
+        "/falcon/manualclose/diagnostic/text?trade_id=" + params["trade_id"]
+    )
+
+    text = response.get_data(as_text=True)
+    assert "registry_closed_matches=2" in text
+    assert "registry_all_matches=2" in text
+    assert "entry=1.1123" in text
+    assert "entry=1.0871" in text
+    assert text.count("source=trade_registry.closed_trades") == 2
+    assert registry.write_calls == []
+
+
+def test_manual_close_diagnostic_without_params_is_safe_and_skips_sources():
+    ns, registry, _ = _harness()
+    response = _diagnostic_client(ns).get("/falcon/manualclose/diagnostic/text")
+
+    text = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert "QUERY_PARAMETERS_NOT_RECEIVED" in text
+    assert "registry_all_matches=0" in text
+    assert "no_order_sent_by_this_route=True" in text
+    assert "broker_called=False" in text
+    assert "write_executed=False" in text
+    assert "registry_write=False" in text
+    assert registry.read_only_calls == 0
+    assert registry.write_calls == []
+
+
+def test_manual_close_diagnostic_reports_liveorder_registry_gap_without_broker_or_write():
+    liveorder = {
+        "status": "HISTORICAL_COMPLETED_OR_CLOSED",
+        "bot": "FALCON",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+        "order_id": "2078483751332171776",
+        "client_order_id": "FALCON-LIVE-FALCON15-1784384114",
+        "entry": 1.0871,
+        "qty": 9.0,
+    }
+    ns, registry, _ = _harness(closed=[])
+    ns["central_broker"] = SimpleNamespace(
+        get_positions=lambda: pytest.fail("broker called"),
+        get_executions_log=lambda *args, **kwargs: pytest.fail("broker called"),
+    )
+    response = _diagnostic_client(ns, [liveorder]).get(
+        "/falcon/manualclose/diagnostic/text?"
+        "broker_order_id=2078483751332171776&symbol=XRPUSDT&side=LONG"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "registry_all_matches=0" in text
+    assert "liveorder_detail_matches=1" in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" in text
+    assert "LIVEORDER_DETAIL_REGISTRY_GAP" in text
+    assert "liveorder_exact_broker_order_matches=1" in text
+    assert "source=falcon.liveorder.detail.snapshot" in text
+    assert "broker_called=False" in text
+    assert "write_executed=False" in text
+    assert registry.write_calls == []
+
+
+def test_invalid_registry_is_partial_and_never_infers_absence_reasons():
+    ns, registry, _ = _harness(closed=[])
+
+    def invalid_registry():
+        raise json.JSONDecodeError("invalid", "{", 1)
+
+    registry.load_registry_read_only = invalid_registry
+    liveorder = {
+        "status": "HISTORICAL_COMPLETED_OR_CLOSED",
+        "lifecycle_id": "LC-MISSING",
+        "client_order_id": "CLIENT-OUTSIDE",
+        "order_id": "ORDER-OUTSIDE",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+    }
+    response = _diagnostic_client(ns, [liveorder]).get(
+        "/falcon/manualclose/diagnostic/text?"
+        "lifecycle_id=LC-MISSING&client_order_id=CLIENT-OUTSIDE&"
+        "broker_order_id=ORDER-OUTSIDE"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "Status: DIAGNOSTIC_PARTIAL_SOURCE_ERRORS" in text
+    assert "ok=False" in text
+    assert "registry_source_available=False" in text
+    assert "TRADE_REGISTRY_READ_ERROR:JSONDecodeError" in text
+    assert "LIFECYCLE_NOT_FOUND_IN_TRADE_REGISTRY" not in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" not in text
+    assert "LIVEORDER_DETAIL_REGISTRY_GAP" not in text
+    assert registry.write_calls == []
+
+
+def test_general_trade_match_does_not_prove_requested_broker_order():
+    trade_id = "FALCON:FALCON15:XRPUSDT:LONG"
+    liveorder = {
+        "trade_id": trade_id,
+        "order_id": "OTHER-ORDER",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+    }
+    ns, registry, _ = _harness(closed=[])
+    response = _diagnostic_client(ns, [liveorder]).get(
+        "/falcon/manualclose/diagnostic/text?"
+        f"trade_id={trade_id}&broker_order_id=REQUESTED-ORDER"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "liveorder_detail_matches=1" in text
+    assert "liveorder_exact_broker_order_matches=0" in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" not in text
+    assert "LIVEORDER_DETAIL_REGISTRY_GAP" not in text
+    assert registry.write_calls == []
+
+
+def test_general_lifecycle_match_does_not_prove_requested_client_order():
+    falcon_position = {
+        "lifecycle_id": "LC-FALCON-MEMORY",
+        "client_order_id": "OTHER-CLIENT",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+    }
+    ns, registry, _ = _harness(closed=[], positions={"P": falcon_position})
+    response = _diagnostic_client(ns).get(
+        "/falcon/manualclose/diagnostic/text?"
+        "lifecycle_id=LC-FALCON-MEMORY&client_order_id=REQUESTED-CLIENT"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "falcon_memory_matches=1" in text
+    assert "falcon_exact_client_order_matches=0" in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" not in text
+    assert registry.write_calls == []
+
+
+def test_exact_client_order_in_liveorder_proves_registry_gap():
+    liveorder = {
+        "client_order_id": "CLIENT-EXACT-OUTSIDE",
+        "order_id": "ORDER-OTHER",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+    }
+    ns, registry, _ = _harness(closed=[])
+    response = _diagnostic_client(ns, [liveorder]).get(
+        "/falcon/manualclose/diagnostic/text?client_order_id=CLIENT-EXACT-OUTSIDE"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "liveorder_exact_client_order_matches=1" in text
+    assert "registry_exact_client_order_matches=0" in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" in text
+    assert "LIVEORDER_DETAIL_REGISTRY_GAP" in text
+    assert registry.write_calls == []
+
+
+def test_exact_client_order_in_registry_prevents_gap_despite_other_strong_match():
+    trade = _base_trade(client_order_id="CLIENT-IN-REGISTRY")
+    liveorder = {
+        "trade_id": trade["trade_id"],
+        "client_order_id": "OTHER-CLIENT",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+    }
+    ns, registry, _ = _harness(trade)
+    response = _diagnostic_client(ns, [liveorder]).get(
+        "/falcon/manualclose/diagnostic/text?"
+        f"trade_id={trade['trade_id']}&client_order_id=CLIENT-IN-REGISTRY"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "registry_exact_client_order_matches=1" in text
+    assert "liveorder_detail_matches=1" in text
+    assert "liveorder_exact_client_order_matches=0" in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" not in text
+    assert "LIVEORDER_DETAIL_REGISTRY_GAP" not in text
+    assert registry.write_calls == []
+
+
+def test_missing_liveorder_snapshot_is_partial_and_does_not_infer_gap():
+    ns, registry, _ = _harness(closed=[])
+    response = _diagnostic_client(
+        ns,
+        liveorder_error="LIVEORDER_DETAIL_SNAPSHOT_NOT_FOUND",
+    ).get(
+        "/falcon/manualclose/diagnostic/text?broker_order_id=ORDER-NOT-OBSERVED"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "Status: DIAGNOSTIC_PARTIAL_SOURCE_ERRORS" in text
+    assert "ok=False" in text
+    assert "liveorder_snapshot_source_available=False" in text
+    assert "LIVEORDER_DETAIL_SNAPSHOT_NOT_FOUND" in text
+    assert "LIVEORDER_DETAIL_REGISTRY_GAP" not in text
+    assert "ORDER_FOUND_OUTSIDE_REGISTRY" not in text
+    assert registry.write_calls == []
+
+
+def test_manual_close_diagnostic_does_not_mutate_source_records():
+    ns, _, _ = _harness(closed=[])
+    registry_closed = [_base_trade()]
+    falcon_rows = [{"lifecycle_id": "LC-XRP", "symbol": "XRPUSDT", "side": "LONG"}]
+    liveorder_rows = [{"order_id": "ORDER-XRP", "symbol": "XRPUSDT", "side": "LONG"}]
+    originals = copy.deepcopy((registry_closed, falcon_rows, liveorder_rows))
+    ns["_fmcd_v1_read_registry"] = lambda: ([], registry_closed, None)
+    ns["_fmcd_v1_read_falcon_memory"] = lambda: (falcon_rows, None)
+    ns["_fmcd_v1_read_liveorder_detail_snapshot"] = lambda: (liveorder_rows, None)
+
+    ns["_fmcd_v1_build_payload"]({
+        "query_param_keys": ["lifecycle_id", "broker_order_id"],
+        "query": {"lifecycle_id": "LC-XRP", "broker_order_id": "ORDER-XRP"},
+    })
+
+    assert (registry_closed, falcon_rows, liveorder_rows) == originals
+
+
+def test_truly_missing_registry_is_available_empty_and_stays_read_only():
+    ns, registry, _ = _harness(closed=[])
+    response = _diagnostic_client(ns).get(
+        "/falcon/manualclose/diagnostic/text?lifecycle_id=LC-NOT-PRESENT"
+    )
+
+    text = response.get_data(as_text=True)
+    assert "registry_source_available=True" in text
+    assert "registry_all_matches=0" in text
+    assert "LIFECYCLE_NOT_FOUND_IN_TRADE_REGISTRY" in text
+    assert "TRADE_REGISTRY_READ_ERROR" not in text
+    assert registry.write_calls == []
+
+
+def test_registry_read_only_loader_never_creates_missing_registry(tmp_path, monkeypatch):
+    registry_path = tmp_path / "missing" / "trade_registry.json"
+    monkeypatch.setenv("TRADE_REGISTRY_FILE", str(registry_path))
+    spec = importlib.util.spec_from_file_location("trade_registry_read_only_diagnostic_test", REGISTRY_SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "TRADE_REGISTRY_LEGACY_FILE", str(tmp_path / "missing-legacy.json"))
+    monkeypatch.setattr(module, "save_registry", lambda *args, **kwargs: pytest.fail("registry write"))
+
+    snapshot = module.load_registry_read_only()
+
+    assert snapshot["open_trades"] == {}
+    assert snapshot["closed_trades"] == []
+    assert not registry_path.exists()
+
+
+def test_registry_read_only_loader_propagates_invalid_json_without_write(tmp_path, monkeypatch):
+    registry_path = tmp_path / "trade_registry.json"
+    invalid_content = '{"closed_trades": ['
+    registry_path.write_text(invalid_content, encoding="utf-8")
+    monkeypatch.setenv("TRADE_REGISTRY_FILE", str(registry_path))
+    spec = importlib.util.spec_from_file_location("trade_registry_invalid_read_only_test", REGISTRY_SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "TRADE_REGISTRY_LEGACY_FILE", str(tmp_path / "missing-legacy.json"))
+    monkeypatch.setattr(module, "save_registry", lambda *args, **kwargs: pytest.fail("registry write"))
+
+    with pytest.raises(json.JSONDecodeError):
+        module.load_registry_read_only()
+
+    assert registry_path.read_text(encoding="utf-8") == invalid_content
+
+
+def test_manual_close_diagnostic_source_has_no_writer_or_broker_reader_path():
+    source = MAIN_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {
+        "_fmcd_v1_read_registry",
+        "_fmcd_v1_read_falcon_memory",
+        "_fmcd_v1_read_liveorder_detail_snapshot",
+        "_fmcd_v1_build_payload",
+        "falcon_manual_close_diagnostic_v1_text_route",
+    }
+    diagnostic_source = "\n".join(
+        ast.get_source_segment(source, node) or ""
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    )
+
+    assert "save_registry(" not in diagnostic_source
+    assert "_flad_v1_write_snapshot(" not in diagnostic_source
+    assert "_flad_v1_append_event(" not in diagnostic_source
+    assert "_flad_v1_build_payload(" not in diagnostic_source
+    assert "_flad_v1_read_falcon_live_order_events(" not in diagnostic_source
+    assert "_execution_log_items(" not in diagnostic_source
+    assert "central_broker" not in diagnostic_source
 
 
 def test_sol_like_manual_close_outcome_is_supported():

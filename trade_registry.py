@@ -41,6 +41,7 @@ __all__ = [
     "TRADE_REGISTRY_FILE",
     "TRADE_REGISTRY_LEGACY_FILE",
     "load_registry",
+    "load_registry_read_only",
     "save_registry",
     "make_trade_id",
     "register_open_trade",
@@ -227,6 +228,22 @@ def load_registry() -> Dict[str, Any]:
             return _normalize_registry(data)
         except Exception:
             return _empty_registry()
+
+
+def load_registry_read_only() -> Dict[str, Any]:
+    """Read the active Registry snapshot without creating or migrating files."""
+    path = Path(TRADE_REGISTRY_FILE)
+    legacy_path = Path(TRADE_REGISTRY_LEGACY_FILE)
+    with _lock:
+        source = path
+        if not source.exists() and legacy_path != path and legacy_path.exists():
+            source = legacy_path
+        if not source.exists():
+            return _normalize_registry(_empty_registry())
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("invalid trade registry payload")
+        return _normalize_registry(payload)
 
 
 def save_registry(registry: Dict[str, Any]) -> None:
