@@ -50,6 +50,7 @@ __all__ = [
     "get_trade",
     "get_closed_trade",
     "update_closed_trade",
+    "record_manual_close_outcome",
     "set_trade_registry_mode",
     "get_trade_registry_snapshot",
     "reset_trade_registry",
@@ -483,6 +484,136 @@ def _identity_value(trade: Dict[str, Any], field: str) -> Any:
     return None
 
 
+def record_manual_close_outcome(
+    trade_id: str,
+    close_event_id: str,
+    outcome: Dict[str, Any],
+    *,
+    expected_identity: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Atomically attach a factual administrative outcome to one closed trade.
+
+    This function has no execution authority.  It only updates an existing
+    CLOSED Registry record and makes retries idempotent by close_event_id.
+    """
+    event_id = str(close_event_id or "").strip()
+    payload = dict(outcome or {})
+    if not trade_id or not event_id:
+        return {"ok": False, "error": "MANUAL_CLOSE_OUTCOME_IDENTITY_REQUIRED", "trade_id": trade_id}
+
+    with _lock:
+        registry = load_registry()
+        if str(trade_id) in registry.get("open_trades", {}):
+            return {"ok": False, "error": "TRADE_STILL_OPEN", "trade_id": trade_id}
+        closed_trades = registry.get("closed_trades", [])
+        matching_indexes = [
+            index
+            for index, item in enumerate(closed_trades)
+            if isinstance(item, dict) and str(item.get("trade_id") or "") == str(trade_id)
+        ]
+        if len(matching_indexes) != 1:
+            return {
+                "ok": False,
+                "error": "CLOSED_TRADE_CANDIDATE_COUNT_INVALID",
+                "trade_id": trade_id,
+                "candidate_count": len(matching_indexes),
+            }
+
+        index = matching_indexes[0]
+        trade = dict(closed_trades[index])
+        metadata = dict(trade.get("metadata") or {}) if isinstance(trade.get("metadata"), dict) else {}
+        if str(trade.get("status") or "").upper().strip() != "CLOSED":
+            return {"ok": False, "error": "TRADE_NOT_CLOSED", "trade_id": trade_id}
+        if str(trade.get("bot") or "").upper().strip() != "FALCON":
+            return {"ok": False, "error": "TRADE_NOT_FALCON", "trade_id": trade_id}
+        if expected_identity is not None:
+            identity_ok, identity_comparison = _identity_matches(trade, expected_identity)
+            if not identity_ok:
+                return {
+                    "ok": False,
+                    "error": "TRADE_IDENTITY_MISMATCH",
+                    "trade_id": trade_id,
+                    "identity_comparison": identity_comparison,
+                }
+
+        manual_keys = list(trade.get("manual_close_outcome_keys") or metadata.get("manual_close_outcome_keys") or [])
+        manual_keys = [str(value) for value in manual_keys if value not in (None, "")]
+        outcome_id = str(payload.get("outcome_id") or "").strip()
+        existing_outcome_id = str(trade.get("outcome_id") or metadata.get("outcome_id") or "").strip()
+        if event_id in manual_keys and outcome_id and existing_outcome_id and existing_outcome_id != outcome_id:
+            return {
+                "ok": False,
+                "error": "CLOSE_EVENT_ID_OUTCOME_CONFLICT",
+                "trade_id": trade_id,
+                "existing_outcome_id": existing_outcome_id,
+                "requested_outcome_id": outcome_id,
+            }
+        if event_id in manual_keys or (outcome_id and existing_outcome_id == outcome_id):
+            return {
+                "ok": True,
+                "action": "ALREADY_APPLIED",
+                "trade_id": trade_id,
+                "trade": trade,
+                "outcome_id": existing_outcome_id or outcome_id,
+            }
+
+        existing_status = str(trade.get("outcome_status") or metadata.get("outcome_status") or "").upper().strip()
+        existing_source = str(trade.get("outcome_source") or metadata.get("outcome_source") or "").upper().strip()
+        pending = _boolish(trade.get("financial_reconciliation_pending"))
+        if pending is None:
+            pending = _boolish(metadata.get("financial_reconciliation_pending"))
+        economic_fields = (
+            "exit_price", "pnl_pct", "result_pct", "pnl_r", "result_r",
+            "realized_pnl", "gross_pnl_usdt", "outcome_id",
+        )
+        economic_evidence = any(
+            trade.get(field) not in (None, "") or metadata.get(field) not in (None, "")
+            for field in economic_fields
+        )
+        pending_statuses = {"", "PENDING_OUTCOME", "RECONCILED_WITHOUT_PNL"}
+        stronger_source = bool(existing_source and existing_source != "MANUAL_CLOSE_RECONCILIATION")
+        if existing_outcome_id or stronger_source or (existing_status not in pending_statuses and economic_evidence) or (pending is False and economic_evidence):
+            return {
+                "ok": False,
+                "error": "STRONGER_FACTUAL_OUTCOME_ALREADY_EXISTS",
+                "trade_id": trade_id,
+                "existing_outcome_id": existing_outcome_id or None,
+                "existing_outcome_status": existing_status or None,
+                "existing_outcome_source": existing_source or None,
+            }
+
+        lifecycle_id = str(payload.get("lifecycle_id") or "").strip()
+        idempotency_key = f"{lifecycle_id}:{event_id}" if lifecycle_id else event_id
+        manual_keys = list(dict.fromkeys([*manual_keys, event_id, idempotency_key]))
+        financial_fields = (
+            "exit_price", "closed_quantity", "close_timestamp", "close_reason",
+            "close_classification", "pnl_pct", "result_pct", "gross_pnl_usdt",
+            "pnl_r", "result_r", "tp50_hit", "outcome_status", "outcome_source",
+            "financial_reconciliation_pending", "learning_eligible", "outcome_id",
+            "outcome_hash", "data_quality", "lifecycle_id", "close_event_id",
+        )
+        for field in financial_fields:
+            if field in payload:
+                trade[field] = payload.get(field)
+        trade["manual_close_outcome_keys"] = manual_keys
+        trade["last_update"] = _now()
+        metadata.update({field: trade.get(field) for field in financial_fields if field in trade})
+        metadata["manual_close_outcome_keys"] = list(manual_keys)
+        trade["metadata"] = metadata
+        trade = _normalize_trade_record(trade)
+        closed_trades[index] = trade
+        registry["closed_trades"] = closed_trades
+        save_registry(registry)
+
+    _observe_shadow_registry_snapshot("OUTCOME_CONFIRMED", trade)
+    return {
+        "ok": True,
+        "action": "OUTCOME_RECORDED",
+        "trade_id": trade_id,
+        "outcome_id": trade.get("outcome_id"),
+        "index": index,
+        "trade": trade,
+    }
 def _identity_matches(trade: Dict[str, Any], expected_identity: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
     expected = expected_identity if isinstance(expected_identity, dict) else {}
     compared = {}

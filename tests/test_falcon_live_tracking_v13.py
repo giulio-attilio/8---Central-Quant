@@ -569,7 +569,7 @@ def test_central_live_payload_preserves_exact_ids_quantity_and_broker_flat_evide
     assert row["central_only_evidence"] is not evidence
 
 
-def test_falcon_health_overlay_exposes_all_17_reconciliation_stop_and_spam_fields():
+def test_falcon_health_overlay_exposes_all_20_reconciliation_stop_spam_and_projection_fields():
     stop_and_spam = {
         "falcon_disaster_stop_active_verified": True,
         "falcon_disaster_stop_trigger_type": "MARK_PRICE",
@@ -583,6 +583,9 @@ def test_falcon_health_overlay_exposes_all_17_reconciliation_stop_and_spam_field
         "falcon_management_spam_guard_last_reason": None,
         "falcon_management_spam_guard_suppressed_count": 2,
         "falcon_management_spam_guard_last_suppressed_at": "2026-07-15T00:59:00Z",
+        "falcon_manual_close_outcome_projection_pending": False,
+        "falcon_manual_close_outcome_projection_status": "PROJECTED",
+        "falcon_manual_close_outcome_last_outcome_id": "OUTCOME-1",
     }
     namespace = {
         "_fcor_v1_raw_positions": lambda: ([
@@ -608,7 +611,7 @@ def test_falcon_health_overlay_exposes_all_17_reconciliation_stop_and_spam_field
         *stop_and_spam.keys(),
     }
 
-    assert len(expected) == 17
+    assert len(expected) == 20
     assert set(overlay) == expected
     assert overlay["falcon_central_only_reconcile_status"] == "CENTRAL_ONLY_RECONCILE_REQUIRED"
     assert overlay["falcon_central_only_pending_count"] == 1

@@ -209,6 +209,7 @@ FALCON_CENTRAL_ONLY_TOMBSTONES_KEY = "falcon:central_only_reconcile:tombstones:v
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 redis_lock = threading.Lock()
 position_mutation_lock = threading.RLock()
+manual_close_outcome_projection_lock = threading.RLock()
 management_alert_guard_lock = threading.RLock()
 _management_alert_guard_memory = {}
 _central_only_tombstones_memory = {}
@@ -757,6 +758,125 @@ def close_falcon_trade_registry(pos, exit_price=None, result_pct=None, result_r=
 def get_trades():
     data = redis_get_json(TRADES_KEY, [])
     return data if isinstance(data, list) else []
+
+
+def falcon_project_manual_close_outcome(outcome):
+    """Project one Registry-authoritative outcome into Falcon statistics only.
+
+    The helper never calls close_position, Registry or Broker.  It writes only
+    the bounded Falcon statistical history and is idempotent across retries.
+    """
+    row = dict(outcome or {}) if isinstance(outcome, dict) else {}
+    outcome_id = str(row.get("outcome_id") or "").strip()
+    lifecycle_id = str(row.get("lifecycle_id") or "").strip()
+    close_event_id = str(row.get("close_event_id") or "").strip()
+    projection_key = f"{lifecycle_id}:{close_event_id}" if lifecycle_id and close_event_id else ""
+    if str(row.get("bot") or "").upper().strip() != "FALCON" or not outcome_id or not projection_key:
+        return {
+            "ok": False,
+            "status": "INVALID_OUTCOME_PROJECTION",
+            "projection_pending": True,
+            "no_order_sent": True,
+        }
+
+    try:
+        with manual_close_outcome_projection_lock:
+            warning_before = HEALTH.get("last_warning")
+            raw_trades = redis_get_json(TRADES_KEY, None)
+            warning_after = HEALTH.get("last_warning")
+            if raw_trades is None and warning_after != warning_before and str(warning_after or "").startswith("redis get"):
+                raise RuntimeError("falcon trades read failed")
+            if raw_trades is not None and not isinstance(raw_trades, list):
+                raise ValueError("falcon trades storage invalid")
+            trades = list(raw_trades or [])
+            for existing in trades:
+                if not isinstance(existing, dict):
+                    continue
+                existing_key = f"{existing.get('lifecycle_id')}:{existing.get('close_event_id')}"
+                if str(existing.get("outcome_id") or "") == outcome_id or existing_key == projection_key:
+                    HEALTH["falcon_manual_close_outcome_projection_pending"] = False
+                    HEALTH["falcon_manual_close_outcome_projection_status"] = "ALREADY_PROJECTED"
+                    HEALTH["falcon_manual_close_outcome_last_outcome_id"] = outcome_id
+                    return {
+                        "ok": True,
+                        "status": "ALREADY_PROJECTED",
+                        "already_projected": True,
+                        "projection_pending": False,
+                        "outcome_id": outcome_id,
+                        "no_order_sent": True,
+                    }
+
+            projection = {
+                "status": "CLOSED",
+                "bot": "FALCON",
+                "setup": row.get("setup"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "trade_id": row.get("trade_id"),
+                "lifecycle_id": lifecycle_id,
+                "order_id": row.get("order_id"),
+                "close_event_id": close_event_id,
+                "outcome_id": outcome_id,
+                "outcome_hash": row.get("outcome_hash"),
+                "outcome_source": "MANUAL_CLOSE_RECONCILIATION",
+                "data_quality": row.get("data_quality") or "MANUAL_CONFIRMED",
+                "entry": row.get("entry"),
+                "initial_stop": row.get("initial_stop"),
+                "exit_price": row.get("exit_price"),
+                "closed_quantity": row.get("closed_quantity"),
+                "closed_at": row.get("close_timestamp"),
+                "exit_reason": row.get("close_reason"),
+                "close_reason": row.get("close_reason"),
+                "close_classification": row.get("close_classification"),
+                "pnl_pct": row.get("pnl_pct"),
+                "result_pct": row.get("pnl_pct"),
+                "gross_pnl_usdt": row.get("gross_pnl_usdt"),
+                "pnl_r": row.get("result_r"),
+                "result_r": row.get("result_r"),
+                "tp50_hit": bool(row.get("tp50_hit")),
+                "learning_eligible": bool(row.get("learning_eligible", True)),
+                "manual_close_outcome_projection": True,
+            }
+            trades.append(projection)
+            if len(trades) > 5000:
+                trades = trades[-5000:]
+            stored = redis_set_json(TRADES_KEY, trades)
+            if not stored:
+                HEALTH["falcon_manual_close_outcome_projection_pending"] = True
+                HEALTH["falcon_manual_close_outcome_projection_status"] = "PROJECTION_WRITE_FAILED"
+                HEALTH["falcon_manual_close_outcome_last_outcome_id"] = outcome_id
+                return {
+                    "ok": False,
+                    "status": "PROJECTION_WRITE_FAILED",
+                    "projection_pending": True,
+                    "outcome_id": outcome_id,
+                    "no_order_sent": True,
+                }
+    except Exception as exc:
+        HEALTH["falcon_manual_close_outcome_projection_pending"] = True
+        HEALTH["falcon_manual_close_outcome_projection_status"] = "PROJECTION_EXCEPTION"
+        HEALTH["falcon_manual_close_outcome_last_outcome_id"] = outcome_id
+        HEALTH["last_warning"] = f"falcon manual close outcome projection: {type(exc).__name__}"
+        return {
+            "ok": False,
+            "status": "PROJECTION_EXCEPTION",
+            "projection_pending": True,
+            "outcome_id": outcome_id,
+            "error_type": type(exc).__name__,
+            "no_order_sent": True,
+        }
+
+    HEALTH["falcon_manual_close_outcome_projection_pending"] = False
+    HEALTH["falcon_manual_close_outcome_projection_status"] = "PROJECTED"
+    HEALTH["falcon_manual_close_outcome_last_outcome_id"] = outcome_id
+    return {
+        "ok": True,
+        "status": "PROJECTED",
+        "already_projected": False,
+        "projection_pending": False,
+        "outcome_id": outcome_id,
+        "no_order_sent": True,
+    }
 
 
 def get_signals():

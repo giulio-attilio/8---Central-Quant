@@ -34,6 +34,7 @@ import json
 import re
 import html
 import uuid
+import hashlib
 import gc
 import threading
 import requests
@@ -49990,6 +49991,9 @@ def _fcor_v1_health_overlay():
         "falcon_management_spam_guard_last_reason",
         "falcon_management_spam_guard_suppressed_count",
         "falcon_management_spam_guard_last_suppressed_at",
+        "falcon_manual_close_outcome_projection_pending",
+        "falcon_manual_close_outcome_projection_status",
+        "falcon_manual_close_outcome_last_outcome_id",
     ):
         fields[key] = health.get(key)
     return fields
@@ -50067,6 +50071,433 @@ def falcon_central_only_reconciliation_v1_text_route():
     commit_requested, ack = _fcor_v1_request_commit_ack()
     payload = _fcor_v1_build_payload(commit_requested=commit_requested, ack=ack)
     return _fcor_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ============================================================================
+# FALCON MANUAL CLOSE OUTCOME RECONCILIATION V1
+# ============================================================================
+FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION = "2026-07-19-FALCON-MANUAL-CLOSE-OUTCOME-V1"
+FALCON_MANUAL_CLOSE_OUTCOME_V1_ACK = "FALCON_MANUAL_CLOSE_OUTCOME_V1"
+_FMCOR_V1_LOCK = threading.RLock()
+
+
+def _fmcor_v1_present(value):
+    return value is not None and str(value).strip() != ""
+
+
+def _fmcor_v1_text_value(value, max_length=256):
+    text = str(value or "").strip()
+    return text if text and len(text) <= max_length else None
+
+
+def _fmcor_v1_identifier(value):
+    text = _fmcor_v1_text_value(value)
+    if text is None or ".." in text or "/" in text or "\\" in text:
+        return None
+    return text
+
+
+def _fmcor_v1_trade_values(trade, *keys, normalizer=None):
+    trade = trade if isinstance(trade, dict) else {}
+    meta = _fcor_v1_meta(trade)
+    values = []
+    for key in keys:
+        for container in (trade, meta):
+            value = container.get(key)
+            if not _fmcor_v1_present(value):
+                continue
+            value = normalizer(value) if callable(normalizer) else str(value).strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def _fmcor_v1_has_stronger_outcome(trade, close_event_id, outcome_id=None):
+    trade = trade if isinstance(trade, dict) else {}
+    meta = _fcor_v1_meta(trade)
+    keys = [str(value) for value in (trade.get("manual_close_outcome_keys") or meta.get("manual_close_outcome_keys") or [])]
+    existing_id = str(trade.get("outcome_id") or meta.get("outcome_id") or "").strip()
+    if str(close_event_id or "") in keys and outcome_id and existing_id and existing_id != outcome_id:
+        return True, False
+    if str(close_event_id or "") in keys or (outcome_id and existing_id == outcome_id):
+        return False, True
+    status = str(trade.get("outcome_status") or meta.get("outcome_status") or "").upper().strip()
+    source = str(trade.get("outcome_source") or meta.get("outcome_source") or "").upper().strip()
+    pending = trade.get("financial_reconciliation_pending")
+    if pending is None:
+        pending = meta.get("financial_reconciliation_pending")
+    economics = any(
+        trade.get(field) not in (None, "") or meta.get(field) not in (None, "")
+        for field in (
+            "exit_price", "pnl_pct", "result_pct", "pnl_r", "result_r",
+            "realized_pnl", "gross_pnl_usdt", "outcome_id",
+        )
+    )
+    stronger = bool(
+        existing_id
+        or (source and source != "MANUAL_CLOSE_RECONCILIATION")
+        or (status not in {"", "PENDING_OUTCOME", "RECONCILED_WITHOUT_PNL"} and economics)
+        or (pending is False and economics)
+    )
+    return stronger, False
+
+
+def _fmcor_v1_classification(close_reason):
+    reason = str(close_reason or "").upper().strip().replace("-", "_").replace(" ", "_")
+    if "TP50" in reason:
+        return "TP50_MANUAL_FULL_CLOSE"
+    if "STOP" in reason:
+        return "STOP_MANUAL_CLOSE"
+    if "BROKER_FLAT" in reason or "RECONCIL" in reason:
+        return "BROKER_FLAT_RECONCILED"
+    return "MANUAL_CLOSE"
+
+
+def _fmcor_v1_module_positions(module):
+    getter = getattr(module, "get_positions", None) if module is not None else None
+    if not callable(getter):
+        return None, "FALCON_POSITION_READER_UNAVAILABLE"
+    try:
+        raw = getter()
+    except Exception as exc:
+        return None, f"FALCON_POSITION_READ_ERROR:{type(exc).__name__}"
+    if isinstance(raw, dict):
+        return [dict(value) for value in raw.values() if isinstance(value, dict)], None
+    if isinstance(raw, list):
+        return [dict(value) for value in raw if isinstance(value, dict)], None
+    return None, "FALCON_POSITION_STORAGE_INVALID"
+
+
+def _fmcor_v1_build_candidate(params):
+    params = dict(params or {})
+    reasons = []
+    trade_id = _fmcor_v1_identifier(params.get("trade_id"))
+    lifecycle_id = _fmcor_v1_identifier(params.get("lifecycle_id"))
+    close_event_id = _fmcor_v1_identifier(params.get("close_event_id"))
+    close_timestamp = _fmcor_v1_text_value(params.get("close_timestamp"), max_length=100)
+    close_reason = _fmcor_v1_text_value(params.get("close_reason"), max_length=128)
+    exit_price = _safe_float(params.get("exit_price"), None)
+    closed_quantity = _safe_float(params.get("closed_quantity"), None)
+    if not trade_id:
+        reasons.append("TRADE_ID_REQUIRED")
+    if not lifecycle_id:
+        reasons.append("LIFECYCLE_ID_REQUIRED")
+    if not close_event_id:
+        reasons.append("CLOSE_EVENT_ID_REQUIRED")
+    if exit_price is None or exit_price <= 0:
+        reasons.append("EXIT_PRICE_REQUIRED")
+    if not close_timestamp:
+        reasons.append("CLOSE_TIMESTAMP_REQUIRED")
+    if closed_quantity is None or closed_quantity <= 0:
+        reasons.append("CLOSED_QUANTITY_REQUIRED")
+    if not close_reason:
+        reasons.append("CLOSE_REASON_REQUIRED")
+    if reasons:
+        return {"eligible": False, "reasons": sorted(set(reasons)), "trade": None, "outcome": None, "already_applied": False}
+
+    if central_trade_registry is None or not callable(getattr(central_trade_registry, "load_registry", None)):
+        return {"eligible": False, "reasons": ["TRADE_REGISTRY_UNAVAILABLE"], "trade": None, "outcome": None, "already_applied": False}
+    try:
+        registry = central_trade_registry.load_registry()
+    except Exception as exc:
+        return {"eligible": False, "reasons": [f"TRADE_REGISTRY_READ_ERROR:{type(exc).__name__}"], "trade": None, "outcome": None, "already_applied": False}
+
+    open_trades = registry.get("open_trades", {}) if isinstance(registry, dict) else {}
+    if isinstance(open_trades, dict) and str(trade_id) in open_trades:
+        reasons.append("POSITION_STILL_OPEN")
+    closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
+    if isinstance(closed, dict):
+        closed = list(closed.values())
+    candidates = [
+        dict(item) for item in closed if isinstance(item, dict) and str(item.get("trade_id") or "") == trade_id
+    ] if isinstance(closed, list) else []
+    if len(candidates) != 1:
+        reasons.append("CLOSED_TRADE_CANDIDATE_COUNT_INVALID")
+        return {
+            "eligible": False,
+            "reasons": sorted(set(reasons)),
+            "candidate_count": len(candidates),
+            "trade": candidates[0] if len(candidates) == 1 else None,
+            "outcome": None,
+            "already_applied": False,
+        }
+    trade = candidates[0]
+    meta = _fcor_v1_meta(trade)
+    if str(trade.get("status") or "").upper().strip() != "CLOSED":
+        reasons.append("TRADE_NOT_CLOSED")
+    bot_values = _fmcor_v1_trade_values(trade, "bot", "owner", "bot_owner", normalizer=lambda value: str(value).upper().strip())
+    if not bot_values or any(value != "FALCON" for value in bot_values):
+        reasons.append("TRADE_OR_LIFECYCLE_NOT_FALCON")
+    mode = str(trade.get("registry_mode") or meta.get("registry_mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
+    if mode not in {"REAL", "LIVE"}:
+        reasons.append("TRADE_NOT_LIVE")
+    if any(bool(trade.get(field) or meta.get(field)) for field in ("external_position", "manual_position", "external_exposure")):
+        reasons.append("EXTERNAL_POSITION_OWNERSHIP_RISK")
+
+    lifecycle_values = _fmcor_v1_trade_values(trade, "lifecycle_id")
+    if len(lifecycle_values) != 1 or lifecycle_values[0] != lifecycle_id:
+        reasons.append("LIFECYCLE_ID_MISMATCH")
+    symbol_values = _fmcor_v1_trade_values(trade, "symbol", normalizer=_flad_v1_norm_symbol)
+    side_values = _fmcor_v1_trade_values(trade, "side", normalizer=_flad_v1_norm_side)
+    order_values = _fmcor_v1_trade_values(trade, "broker_order_id", "order_id", "live_order_id", "entry_order_id")
+    if len(symbol_values) != 1:
+        reasons.append("SYMBOL_IDENTITY_DIVERGENCE")
+    if len(side_values) != 1 or side_values[0] not in {"LONG", "SHORT"}:
+        reasons.append("SIDE_IDENTITY_DIVERGENCE")
+    if len(order_values) != 1:
+        reasons.append("ORDER_IDENTITY_DIVERGENCE")
+
+    broker_flat_reconciled = bool(trade.get("central_only_broker_flat_reconciled") or meta.get("central_only_broker_flat_reconciled"))
+    if not broker_flat_reconciled:
+        reasons.append("BROKER_FLAT_RECONCILIATION_NOT_CONFIRMED")
+    if bool(trade.get("central_only_reconcile_required") or meta.get("central_only_reconcile_required")):
+        reasons.append("CENTRAL_ONLY_RECONCILIATION_PENDING")
+
+    module = _fcor_v1_falcon_module()
+    module_positions, module_error = _fmcor_v1_module_positions(module)
+    if module_positions is None:
+        if not broker_flat_reconciled:
+            reasons.append(module_error or "FALCON_POSITION_STATE_UNKNOWN")
+    else:
+        for position in module_positions:
+            position_identity = _fcor_v1_identity(position)
+            strong_match = any(
+                position_identity.get(field) and str(position_identity.get(field)) == expected
+                for field, expected in (
+                    ("trade_id", trade_id),
+                    ("lifecycle_id", lifecycle_id),
+                    ("order_id", order_values[0] if len(order_values) == 1 else None),
+                )
+                if expected
+            )
+            if not strong_match:
+                continue
+            if position.get("central_only_reconcile_required"):
+                reasons.append("CENTRAL_ONLY_RECONCILIATION_PENDING")
+            else:
+                reasons.append("POSITION_STILL_OPEN")
+
+    entry_fields = (
+        ("broker_entry_reference", "BROKER_ENTRY_REFERENCE"),
+        ("entry_fill_price", "ENTRY_FILL_PRICE"),
+        ("entry_price_confirmed", "ENTRY_PRICE_CONFIRMED"),
+        ("filled_entry_price", "FILLED_ENTRY_PRICE"),
+        ("entry", "REGISTRY_FALCON_LIVE_ENTRY"),
+    )
+    entry = None
+    entry_source = None
+    for field, source in entry_fields:
+        value = _safe_float(_fcor_v1_value(trade, field), None)
+        if value is not None and value > 0:
+            entry, entry_source = value, source
+            break
+    if entry is None or not order_values or not lifecycle_values:
+        reasons.append("FACTUAL_ENTRY_REQUIRED")
+
+    lifecycle_qty = _safe_float(_fcor_v1_value(trade, "initial_qty", "qty", "amount", "quantity"), None)
+    if lifecycle_qty is None or lifecycle_qty <= 0:
+        reasons.append("LIFECYCLE_QUANTITY_REQUIRED")
+    elif closed_quantity > lifecycle_qty + max(1e-9, lifecycle_qty * 1e-6):
+        reasons.append("CLOSED_QUANTITY_EXCEEDS_LIFECYCLE")
+    elif closed_quantity + max(1e-9, lifecycle_qty * 1e-6) < lifecycle_qty:
+        reasons.append("PARTIAL_CLOSE_NOT_FINAL_OUTCOME")
+
+    initial_stop = _safe_float(_fcor_v1_value(trade, "original_sl", "initial_stop", "sl"), None)
+    side = side_values[0] if len(side_values) == 1 else None
+    direction = 1.0 if side == "LONG" else -1.0 if side == "SHORT" else 0.0
+    pnl_pct = direction * (exit_price - entry) / entry * 100.0 if entry and direction else None
+    gross_pnl_usdt = direction * (exit_price - entry) * closed_quantity if entry and direction else None
+    risk_per_unit = abs(entry - initial_stop) if entry is not None and initial_stop is not None else None
+    result_r = direction * (exit_price - entry) / risk_per_unit if risk_per_unit and risk_per_unit > 0 and direction else None
+    classification = _fmcor_v1_classification(close_reason)
+    tp50_hit = bool(
+        classification == "TP50_MANUAL_FULL_CLOSE"
+        or trade.get("tp50_hit")
+        or meta.get("tp50_hit")
+        or trade.get("tp50_real_executed")
+        or meta.get("tp50_real_executed")
+    )
+    canonical = {
+        "trade_id": trade_id,
+        "lifecycle_id": lifecycle_id,
+        "close_event_id": close_event_id,
+        "exit_price": exit_price,
+        "close_timestamp": close_timestamp,
+        "closed_quantity": closed_quantity,
+        "close_reason": close_reason,
+        "entry": entry,
+        "side": side,
+    }
+    outcome_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+    outcome_id = f"FALCON-MANUAL-CLOSE-{outcome_hash[:24].upper()}"
+    stronger, already_applied = _fmcor_v1_has_stronger_outcome(trade, close_event_id, outcome_id=outcome_id)
+    if stronger:
+        reasons.append("STRONGER_FACTUAL_OUTCOME_ALREADY_EXISTS")
+    outcome = {
+        **canonical,
+        "outcome_id": outcome_id,
+        "outcome_hash": outcome_hash,
+        "outcome_status": "OUTCOME_RECORDED",
+        "outcome_source": "MANUAL_CLOSE_RECONCILIATION",
+        "financial_reconciliation_pending": False,
+        "learning_eligible": True,
+        "data_quality": "MANUAL_CONFIRMED",
+        "bot": "FALCON",
+        "setup": trade.get("setup"),
+        "symbol": symbol_values[0] if len(symbol_values) == 1 else None,
+        "order_id": order_values[0] if len(order_values) == 1 else None,
+        "initial_stop": initial_stop,
+        "entry_source": entry_source,
+        "pnl_pct": pnl_pct,
+        "gross_pnl_usdt": gross_pnl_usdt,
+        "result_r": result_r,
+        "tp50_hit": tp50_hit,
+        "close_classification": classification,
+    }
+    return {
+        "eligible": not reasons,
+        "reasons": sorted(set(reasons)),
+        "candidate_count": 1,
+        "trade": trade,
+        "outcome": outcome,
+        "already_applied": already_applied,
+        "module_available": module is not None,
+        "module_error": module_error,
+        "expected_identity": {
+            "lifecycle_id": lifecycle_id,
+            "order_id": outcome.get("order_id"),
+        },
+    }
+
+
+def _fmcor_v1_build_payload(params, commit_requested=False, ack=None):
+    commit_requested = bool(commit_requested)
+    ack_ok = bool(commit_requested and str(ack or "") == FALCON_MANUAL_CLOSE_OUTCOME_V1_ACK)
+    generated_at = _fcor_v1_now()
+    with _FMCOR_V1_LOCK:
+        candidate = _fmcor_v1_build_candidate(params)
+        outcome = candidate.get("outcome") if isinstance(candidate.get("outcome"), dict) else None
+        registry_result = None
+        projection = None
+        committed = False
+        if not candidate.get("eligible"):
+            status = "BLOCKED"
+        elif commit_requested and not ack_ok:
+            status = "ACK_REQUIRED"
+        elif not commit_requested:
+            status = "ALREADY_APPLIED" if candidate.get("already_applied") else "PREVIEW_READY"
+        else:
+            recorder = getattr(central_trade_registry, "record_manual_close_outcome", None)
+            if not callable(recorder):
+                status = "REGISTRY_OUTCOME_WRITER_UNAVAILABLE"
+            else:
+                try:
+                    registry_result = recorder(
+                        outcome.get("trade_id"),
+                        outcome.get("close_event_id"),
+                        outcome,
+                        expected_identity=candidate.get("expected_identity") or {},
+                    )
+                except Exception as exc:
+                    registry_result = {"ok": False, "error": "REGISTRY_OUTCOME_EXCEPTION", "error_type": type(exc).__name__}
+                if not isinstance(registry_result, dict) or not registry_result.get("ok"):
+                    status = "REGISTRY_OUTCOME_FAILED"
+                else:
+                    committed = True
+                    module = _fcor_v1_falcon_module()
+                    projector = getattr(module, "falcon_project_manual_close_outcome", None) if module is not None else None
+                    if callable(projector):
+                        projection_payload = dict(outcome)
+                        projection_payload.update({
+                            "trade_id": outcome.get("trade_id"),
+                            "setup": candidate.get("trade", {}).get("setup"),
+                        })
+                        try:
+                            projection = projector(projection_payload)
+                        except Exception as exc:
+                            projection = {"ok": False, "status": "PROJECTION_EXCEPTION", "error_type": type(exc).__name__, "projection_pending": True, "no_order_sent": True}
+                    else:
+                        projection = {"ok": False, "status": "FALCON_PROJECTION_UNAVAILABLE", "projection_pending": True, "no_order_sent": True}
+                    health = getattr(module, "HEALTH", None) if module is not None else None
+                    if isinstance(health, dict):
+                        health["falcon_manual_close_outcome_projection_pending"] = not bool(projection.get("ok"))
+                        health["falcon_manual_close_outcome_projection_status"] = projection.get("status")
+                        health["falcon_manual_close_outcome_last_outcome_id"] = outcome.get("outcome_id")
+                    already = registry_result.get("action") == "ALREADY_APPLIED"
+                    if not projection.get("ok"):
+                        status = "ALREADY_APPLIED_PROJECTION_PENDING" if already else "OUTCOME_RECORDED_PROJECTION_PENDING"
+                    else:
+                        status = "ALREADY_APPLIED" if already else "OUTCOME_RECORDED"
+
+        projection_pending = bool(projection and projection.get("projection_pending"))
+        return _flad_v1_public({
+            "ok": status in {"PREVIEW_READY", "OUTCOME_RECORDED", "ALREADY_APPLIED", "OUTCOME_RECORDED_PROJECTION_PENDING", "ALREADY_APPLIED_PROJECTION_PENDING"},
+            "status": status,
+            "version": FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION,
+            "generated_at": generated_at,
+            "commit_requested": commit_requested,
+            "ack_ok": ack_ok,
+            "committed": committed,
+            "idempotent": status.startswith("ALREADY_APPLIED"),
+            "read_only": not committed,
+            "no_order_sent_by_this_route": True,
+            "sent": False,
+            "would_send_order": False,
+            "broker_called": False,
+            "cancel_called": False,
+            "close_called": False,
+            "projection_pending": projection_pending,
+            "reasons": candidate.get("reasons") or [],
+            "candidate_count": candidate.get("candidate_count", 0),
+            "outcome": outcome,
+            "registry_result": registry_result,
+            "falcon_projection": projection,
+        })
+
+
+def _fmcor_v1_text(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    outcome = payload.get("outcome") if isinstance(payload.get("outcome"), dict) else {}
+    lines = [
+        "FALCON MANUAL CLOSE OUTCOME RECONCILIATION V1",
+        f"Status: {payload.get('status')}",
+        f"Commit solicitado: {payload.get('commit_requested')}",
+        f"ACK correto: {payload.get('ack_ok')}",
+        f"Committed: {payload.get('committed')}",
+        f"Trade: {outcome.get('trade_id')}",
+        f"Lifecycle: {outcome.get('lifecycle_id')}",
+        f"Close event: {outcome.get('close_event_id')}",
+        f"Classificacao: {outcome.get('close_classification')}",
+        f"Entry factual: {outcome.get('entry')} ({outcome.get('entry_source')})",
+        f"Exit factual informado: {outcome.get('exit_price')}",
+        f"Quantidade fechada: {outcome.get('closed_quantity')}",
+        f"PnL %: {outcome.get('pnl_pct')}",
+        f"Gross PnL USDT: {outcome.get('gross_pnl_usdt')}",
+        f"Resultado R: {outcome.get('result_r')}",
+        f"TP50 hit: {outcome.get('tp50_hit')}",
+        f"Projection pending: {payload.get('projection_pending')}",
+        f"no_order_sent_by_this_route: {payload.get('no_order_sent_by_this_route')}",
+        f"broker_called: {payload.get('broker_called')}",
+        "Reasons:",
+    ]
+    lines.extend(f"- {reason}" for reason in (payload.get("reasons") or []))
+    if not payload.get("reasons"):
+        lines.append("- Nenhum.")
+    return "\n".join(lines)
+
+
+@app.route("/falcon/manualclose/outcome/text", methods=["GET"])
+def falcon_manual_close_outcome_v1_text_route():
+    params = {
+        key: request.args.get(key)
+        for key in (
+            "trade_id", "lifecycle_id", "close_event_id", "exit_price",
+            "close_timestamp", "closed_quantity", "close_reason",
+        )
+    }
+    commit_requested = str(request.args.get("commit") or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+    payload = _fmcor_v1_build_payload(params, commit_requested=commit_requested, ack=request.args.get("ack"))
+    return _fmcor_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 # ============================================================================
