@@ -50076,7 +50076,7 @@ def falcon_central_only_reconciliation_v1_text_route():
 # ============================================================================
 # FALCON MANUAL CLOSE OUTCOME RECONCILIATION V1
 # ============================================================================
-FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION = "2026-07-19-FALCON-MANUAL-CLOSE-OUTCOME-V1"
+FALCON_MANUAL_CLOSE_OUTCOME_V1_VERSION = "2026-07-19-FALCON-MANUAL-CLOSE-OUTCOME-V1.1-LIFECYCLE-FIRST"
 FALCON_MANUAL_CLOSE_OUTCOME_V1_ACK = "FALCON_MANUAL_CLOSE_OUTCOME_V1"
 _FMCOR_V1_LOCK = threading.RLock()
 
@@ -50171,6 +50171,7 @@ def _fmcor_v1_module_positions(module):
 def _fmcor_v1_build_candidate(params):
     params = dict(params or {})
     reasons = []
+    resolution_diagnostics = []
     trade_id = _fmcor_v1_identifier(params.get("trade_id"))
     lifecycle_id = _fmcor_v1_identifier(params.get("lifecycle_id"))
     close_event_id = _fmcor_v1_identifier(params.get("close_event_id"))
@@ -50192,8 +50193,16 @@ def _fmcor_v1_build_candidate(params):
         reasons.append("CLOSED_QUANTITY_REQUIRED")
     if not close_reason:
         reasons.append("CLOSE_REASON_REQUIRED")
-    if reasons:
-        return {"eligible": False, "reasons": sorted(set(reasons)), "trade": None, "outcome": None, "already_applied": False}
+    non_identity_reasons = [reason for reason in reasons if reason != "LIFECYCLE_ID_REQUIRED"]
+    if non_identity_reasons:
+        return {
+            "eligible": False,
+            "reasons": sorted(set(reasons)),
+            "resolution_diagnostics": resolution_diagnostics,
+            "trade": None,
+            "outcome": None,
+            "already_applied": False,
+        }
 
     if central_trade_registry is None or not callable(getattr(central_trade_registry, "load_registry", None)):
         return {"eligible": False, "reasons": ["TRADE_REGISTRY_UNAVAILABLE"], "trade": None, "outcome": None, "already_applied": False}
@@ -50203,25 +50212,67 @@ def _fmcor_v1_build_candidate(params):
         return {"eligible": False, "reasons": [f"TRADE_REGISTRY_READ_ERROR:{type(exc).__name__}"], "trade": None, "outcome": None, "already_applied": False}
 
     open_trades = registry.get("open_trades", {}) if isinstance(registry, dict) else {}
-    if isinstance(open_trades, dict) and str(trade_id) in open_trades:
-        reasons.append("POSITION_STILL_OPEN")
+    open_records = list(open_trades.values()) if isinstance(open_trades, dict) else []
     closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
     if isinstance(closed, dict):
         closed = list(closed.values())
-    candidates = [
-        dict(item) for item in closed if isinstance(item, dict) and str(item.get("trade_id") or "") == trade_id
-    ] if isinstance(closed, list) else []
-    if len(candidates) != 1:
-        reasons.append("CLOSED_TRADE_CANDIDATE_COUNT_INVALID")
+    closed_records = [dict(item) for item in closed if isinstance(item, dict)] if isinstance(closed, list) else []
+    trade_id_candidates = [
+        item for item in closed_records if str(item.get("trade_id") or "") == trade_id
+    ]
+    if not lifecycle_id:
+        if len(trade_id_candidates) > 1:
+            reasons.append("LIFECYCLE_ID_REQUIRED_WHEN_TRADE_ID_NOT_UNIQUE")
         return {
             "eligible": False,
             "reasons": sorted(set(reasons)),
+            "resolution_diagnostics": resolution_diagnostics,
+            "candidate_count": len(trade_id_candidates),
+            "trade_id_candidate_count": len(trade_id_candidates),
+            "trade": None,
+            "outcome": None,
+            "already_applied": False,
+        }
+
+    candidates = []
+    for item in closed_records:
+        item_lifecycles = _fmcor_v1_trade_values(item, "lifecycle_id")
+        item_bots = _fmcor_v1_trade_values(
+            item,
+            "bot", "owner", "bot_owner",
+            normalizer=lambda value: str(value).upper().strip(),
+        )
+        if (
+            lifecycle_id in item_lifecycles
+            and str(item.get("status") or "").upper().strip() == "CLOSED"
+            and item_bots
+            and all(value == "FALCON" for value in item_bots)
+        ):
+            candidates.append(item)
+    if len(candidates) != 1:
+        reasons.extend(("LIFECYCLE_ID_MISMATCH", "CLOSED_FALCON_LIFECYCLE_CANDIDATE_COUNT_INVALID"))
+        return {
+            "eligible": False,
+            "reasons": sorted(set(reasons)),
+            "resolution_diagnostics": resolution_diagnostics,
             "candidate_count": len(candidates),
+            "trade_id_candidate_count": len(trade_id_candidates),
             "trade": candidates[0] if len(candidates) == 1 else None,
             "outcome": None,
             "already_applied": False,
         }
     trade = candidates[0]
+    resolution_diagnostics.append("CANDIDATE_RESOLVED_BY_LIFECYCLE_ID")
+    if len(trade_id_candidates) > 1:
+        resolution_diagnostics.append("TRADE_ID_COLLISION_IGNORED_AFTER_LIFECYCLE_MATCH")
+    if str(trade.get("trade_id") or "") != trade_id:
+        reasons.append("TRADE_ID_MISMATCH")
+
+    for open_trade in open_records:
+        if not isinstance(open_trade, dict):
+            continue
+        if lifecycle_id in _fmcor_v1_trade_values(open_trade, "lifecycle_id"):
+            reasons.append("POSITION_STILL_OPEN")
     meta = _fcor_v1_meta(trade)
     if str(trade.get("status") or "").upper().strip() != "CLOSED":
         reasons.append("TRADE_NOT_CLOSED")
@@ -50240,11 +50291,14 @@ def _fmcor_v1_build_candidate(params):
     symbol_values = _fmcor_v1_trade_values(trade, "symbol", normalizer=_flad_v1_norm_symbol)
     side_values = _fmcor_v1_trade_values(trade, "side", normalizer=_flad_v1_norm_side)
     order_values = _fmcor_v1_trade_values(trade, "broker_order_id", "order_id", "live_order_id", "entry_order_id")
+    client_order_values = _fmcor_v1_trade_values(trade, "client_order_id", "clientOrderId", "client_tag")
     if len(symbol_values) != 1:
         reasons.append("SYMBOL_IDENTITY_DIVERGENCE")
     if len(side_values) != 1 or side_values[0] not in {"LONG", "SHORT"}:
         reasons.append("SIDE_IDENTITY_DIVERGENCE")
     if len(order_values) != 1:
+        reasons.append("ORDER_IDENTITY_DIVERGENCE")
+    if len(client_order_values) > 1:
         reasons.append("ORDER_IDENTITY_DIVERGENCE")
 
     broker_flat_reconciled = bool(trade.get("central_only_broker_flat_reconciled") or meta.get("central_only_broker_flat_reconciled"))
@@ -50261,14 +50315,9 @@ def _fmcor_v1_build_candidate(params):
     else:
         for position in module_positions:
             position_identity = _fcor_v1_identity(position)
-            strong_match = any(
-                position_identity.get(field) and str(position_identity.get(field)) == expected
-                for field, expected in (
-                    ("trade_id", trade_id),
-                    ("lifecycle_id", lifecycle_id),
-                    ("order_id", order_values[0] if len(order_values) == 1 else None),
-                )
-                if expected
+            strong_match = bool(
+                position_identity.get("lifecycle_id")
+                and str(position_identity.get("lifecycle_id")) == lifecycle_id
             )
             if not strong_match:
                 continue
@@ -50346,6 +50395,7 @@ def _fmcor_v1_build_candidate(params):
         "setup": trade.get("setup"),
         "symbol": symbol_values[0] if len(symbol_values) == 1 else None,
         "order_id": order_values[0] if len(order_values) == 1 else None,
+        "client_order_id": client_order_values[0] if len(client_order_values) == 1 else None,
         "initial_stop": initial_stop,
         "entry_source": entry_source,
         "pnl_pct": pnl_pct,
@@ -50357,7 +50407,9 @@ def _fmcor_v1_build_candidate(params):
     return {
         "eligible": not reasons,
         "reasons": sorted(set(reasons)),
+        "resolution_diagnostics": resolution_diagnostics,
         "candidate_count": 1,
+        "trade_id_candidate_count": len(trade_id_candidates),
         "trade": trade,
         "outcome": outcome,
         "already_applied": already_applied,
@@ -50366,6 +50418,7 @@ def _fmcor_v1_build_candidate(params):
         "expected_identity": {
             "lifecycle_id": lifecycle_id,
             "order_id": outcome.get("order_id"),
+            "client_order_id": outcome.get("client_order_id"),
         },
     }
 
@@ -50448,7 +50501,9 @@ def _fmcor_v1_build_payload(params, commit_requested=False, ack=None):
             "close_called": False,
             "projection_pending": projection_pending,
             "reasons": candidate.get("reasons") or [],
+            "resolution_diagnostics": candidate.get("resolution_diagnostics") or [],
             "candidate_count": candidate.get("candidate_count", 0),
+            "trade_id_candidate_count": candidate.get("trade_id_candidate_count", 0),
             "outcome": outcome,
             "registry_result": registry_result,
             "falcon_projection": projection,
@@ -50478,8 +50533,14 @@ def _fmcor_v1_text(payload):
         f"Projection pending: {payload.get('projection_pending')}",
         f"no_order_sent_by_this_route: {payload.get('no_order_sent_by_this_route')}",
         f"broker_called: {payload.get('broker_called')}",
-        "Reasons:",
+        "Resolution diagnostics:",
     ]
+    lines.extend(f"- {item}" for item in (payload.get("resolution_diagnostics") or []))
+    if not payload.get("resolution_diagnostics"):
+        lines.append("- Nenhum.")
+    lines.extend([
+        "Reasons:",
+    ])
     lines.extend(f"- {reason}" for reason in (payload.get("reasons") or []))
     if not payload.get("reasons"):
         lines.append("- Nenhum.")

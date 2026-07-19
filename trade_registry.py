@@ -500,27 +500,56 @@ def record_manual_close_outcome(
     payload = dict(outcome or {})
     if not trade_id or not event_id:
         return {"ok": False, "error": "MANUAL_CLOSE_OUTCOME_IDENTITY_REQUIRED", "trade_id": trade_id}
+    expected = expected_identity if isinstance(expected_identity, dict) else {}
+    lifecycle_id = str(expected.get("lifecycle_id") or payload.get("lifecycle_id") or "").strip()
+    if not lifecycle_id:
+        return {"ok": False, "error": "MANUAL_CLOSE_OUTCOME_LIFECYCLE_ID_REQUIRED", "trade_id": trade_id}
 
     with _lock:
         registry = load_registry()
-        if str(trade_id) in registry.get("open_trades", {}):
-            return {"ok": False, "error": "TRADE_STILL_OPEN", "trade_id": trade_id}
+        open_trades = registry.get("open_trades", {})
+        open_records = list(open_trades.values()) if isinstance(open_trades, dict) else []
+        if any(
+            isinstance(item, dict)
+            and str(_identity_value(item, "lifecycle_id") or "").strip() == lifecycle_id
+            for item in open_records
+        ):
+            return {
+                "ok": False,
+                "error": "TRADE_STILL_OPEN",
+                "trade_id": trade_id,
+                "lifecycle_id": lifecycle_id,
+            }
         closed_trades = registry.get("closed_trades", [])
         matching_indexes = [
             index
             for index, item in enumerate(closed_trades)
-            if isinstance(item, dict) and str(item.get("trade_id") or "") == str(trade_id)
+            if (
+                isinstance(item, dict)
+                and str(_identity_value(item, "lifecycle_id") or "").strip() == lifecycle_id
+                and str(item.get("status") or "").upper().strip() == "CLOSED"
+                and str(item.get("bot") or "").upper().strip() == "FALCON"
+            )
         ]
         if len(matching_indexes) != 1:
             return {
                 "ok": False,
-                "error": "CLOSED_TRADE_CANDIDATE_COUNT_INVALID",
+                "error": "CLOSED_FALCON_LIFECYCLE_CANDIDATE_COUNT_INVALID",
                 "trade_id": trade_id,
+                "lifecycle_id": lifecycle_id,
                 "candidate_count": len(matching_indexes),
             }
 
         index = matching_indexes[0]
         trade = dict(closed_trades[index])
+        if str(trade.get("trade_id") or "") != str(trade_id):
+            return {
+                "ok": False,
+                "error": "TRADE_ID_MISMATCH",
+                "trade_id": trade_id,
+                "resolved_trade_id": trade.get("trade_id"),
+                "lifecycle_id": lifecycle_id,
+            }
         metadata = dict(trade.get("metadata") or {}) if isinstance(trade.get("metadata"), dict) else {}
         if str(trade.get("status") or "").upper().strip() != "CLOSED":
             return {"ok": False, "error": "TRADE_NOT_CLOSED", "trade_id": trade_id}

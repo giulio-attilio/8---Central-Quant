@@ -170,7 +170,18 @@ class FakeRegistry:
             "outcome": outcome,
             "expected_identity": expected_identity,
         }))
-        trade = next(item for item in self.closed if item.get("trade_id") == trade_id)
+        lifecycle_id = (expected_identity or {}).get("lifecycle_id") or outcome.get("lifecycle_id")
+        candidates = [
+            item for item in self.closed
+            if item.get("lifecycle_id") == lifecycle_id
+            and item.get("status") == "CLOSED"
+            and item.get("bot") == "FALCON"
+        ]
+        if len(candidates) != 1:
+            return {"ok": False, "error": "CLOSED_FALCON_LIFECYCLE_CANDIDATE_COUNT_INVALID"}
+        trade = candidates[0]
+        if trade.get("trade_id") != trade_id:
+            return {"ok": False, "error": "TRADE_ID_MISMATCH"}
         keys = trade.setdefault("manual_close_outcome_keys", [])
         if close_event_id in keys:
             return {"ok": True, "action": "ALREADY_APPLIED", "trade": copy.deepcopy(trade), "outcome_id": trade.get("outcome_id")}
@@ -181,8 +192,11 @@ class FakeRegistry:
         return {"ok": True, "action": "OUTCOME_RECORDED", "trade": copy.deepcopy(trade), "outcome_id": trade.get("outcome_id")}
 
 
-def _harness(trade=None, *, positions=None, open_trades=None, fail_projection=False):
-    registry = FakeRegistry([trade or _base_trade()], open_trades=open_trades)
+def _harness(trade=None, *, closed=None, positions=None, open_trades=None, fail_projection=False):
+    registry = FakeRegistry(
+        copy.deepcopy(closed) if closed is not None else [trade or _base_trade()],
+        open_trades=open_trades,
+    )
     falcon = FakeFalcon(positions=positions, fail_projection=fail_projection)
     namespace = {
         "json": json,
@@ -217,6 +231,110 @@ def test_xrp_like_tp50_manual_full_close_calculates_factual_outcome():
     assert outcome["gross_pnl_usdt"] == pytest.approx((1.0902 - 1.0871) * 9)
     assert outcome["result_r"] == pytest.approx((1.0902 - 1.0871) / (1.0871 - 1.08))
     assert registry.write_calls == []
+
+
+def _xrp_trade_id_collision_fixture():
+    trade_id = "FALCON:FALCON15:XRPUSDT:LONG"
+    old_verify = _base_trade(
+        trade_id=trade_id,
+        lifecycle_id="CENTRAL-FALCON-LIFECYCLE:FALCON-VERIFY-OLD-XRP",
+        broker_order_id="VERIFY-ORDER-XRP",
+        client_order_id="FALCON-VERIFY-OLD-XRP",
+        entry=1.1123,
+        registry_mode="VERIFY",
+        execution_mode="VERIFY",
+    )
+    live_real = _base_trade(
+        trade_id=trade_id,
+        lifecycle_id="CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-1784384114",
+        broker_order_id="2078483751332171776",
+        client_order_id="FALCON-LIVE-FALCON15-1784384114",
+        entry=1.0871,
+        initial_qty=9.0,
+        qty=9.0,
+        sl=1.084175,
+        tp50=1.090025,
+        registry_mode="REAL",
+        execution_mode="LIVE",
+        central_only_broker_flat_reconciled=True,
+        financial_reconciliation_pending=True,
+        outcome_status="RECONCILED_WITHOUT_PNL",
+        learning_eligible=False,
+    )
+    params = _params(
+        trade_id=trade_id,
+        lifecycle_id=live_real["lifecycle_id"],
+        close_event_id="XRP_MANUAL_TP50_20260718_1837",
+        exit_price="1.0902",
+        close_timestamp="2026-07-18T18:37:00-03:00",
+        closed_quantity="9",
+        close_reason="TP50_MANUAL_FULL_CLOSE",
+    )
+    return old_verify, live_real, params
+
+
+def test_lifecycle_first_resolves_live_trade_despite_reused_trade_id():
+    old_verify, live_real, params = _xrp_trade_id_collision_fixture()
+    ns, registry, _ = _harness(closed=[old_verify, live_real])
+
+    payload = ns["_fmcor_v1_build_payload"](params)
+
+    assert payload["status"] == "PREVIEW_READY"
+    assert payload["candidate_count"] == 1
+    assert payload["trade_id_candidate_count"] == 2
+    assert payload["resolution_diagnostics"] == [
+        "CANDIDATE_RESOLVED_BY_LIFECYCLE_ID",
+        "TRADE_ID_COLLISION_IGNORED_AFTER_LIFECYCLE_MATCH",
+    ]
+    outcome = payload["outcome"]
+    assert outcome["entry"] == pytest.approx(1.0871)
+    assert outcome["order_id"] == "2078483751332171776"
+    assert outcome["client_order_id"] == "FALCON-LIVE-FALCON15-1784384114"
+    assert outcome["pnl_pct"] == pytest.approx(0.2851623585686696)
+    assert outcome["gross_pnl_usdt"] == pytest.approx(0.0279)
+    assert outcome["result_r"] == pytest.approx(1.0614, abs=0.002)
+    assert outcome["tp50_hit"] is True
+    assert not {
+        "TRADE_NOT_LIVE",
+        "POSITION_STILL_OPEN",
+        "LIFECYCLE_ID_MISMATCH",
+        "ORDER_IDENTITY_DIVERGENCE",
+        "FACTUAL_ENTRY_REQUIRED",
+    }.intersection(payload["reasons"])
+    assert registry.write_calls == []
+
+
+def test_trade_id_collision_without_lifecycle_is_fail_closed():
+    old_verify, live_real, params = _xrp_trade_id_collision_fixture()
+    ns, registry, _ = _harness(closed=[old_verify, live_real])
+    params["lifecycle_id"] = ""
+
+    payload = ns["_fmcor_v1_build_payload"](params)
+
+    assert payload["status"] == "BLOCKED"
+    assert "LIFECYCLE_ID_REQUIRED" in payload["reasons"]
+    assert "LIFECYCLE_ID_REQUIRED_WHEN_TRADE_ID_NOT_UNIQUE" in payload["reasons"]
+    assert registry.write_calls == []
+
+
+def test_commit_with_collision_writes_only_lifecycle_selected_trade_and_retries_idempotently():
+    old_verify, live_real, params = _xrp_trade_id_collision_fixture()
+    ns, registry, falcon = _harness(closed=[old_verify, live_real])
+
+    first = ns["_fmcor_v1_build_payload"](
+        params, commit_requested=True, ack="FALCON_MANUAL_CLOSE_OUTCOME_V1"
+    )
+    second = ns["_fmcor_v1_build_payload"](
+        params, commit_requested=True, ack="FALCON_MANUAL_CLOSE_OUTCOME_V1"
+    )
+
+    assert first["status"] == "OUTCOME_RECORDED"
+    assert second["status"] == "ALREADY_APPLIED"
+    assert registry.closed[0].get("outcome_id") is None
+    assert registry.closed[0]["entry"] == pytest.approx(1.1123)
+    assert registry.closed[1]["outcome_status"] == "OUTCOME_RECORDED"
+    assert registry.closed[1]["entry"] == pytest.approx(1.0871)
+    assert len(falcon.projections) == 1
 
 
 def test_sol_like_manual_close_outcome_is_supported():
@@ -411,7 +529,15 @@ def test_registry_writer_is_atomic_and_idempotent(tmp_path, monkeypatch):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "_observe_shadow_registry_snapshot", lambda *args, **kwargs: None)
-    module.save_registry({"open_trades": {}, "closed_trades": [_base_trade()]})
+    old_collision = _base_trade(
+        lifecycle_id="LC-XRP-OLD-VERIFY",
+        broker_order_id="ORDER-XRP-OLD",
+        client_order_id="CLIENT-XRP-OLD",
+        entry=1.1123,
+        registry_mode="VERIFY",
+        execution_mode="VERIFY",
+    )
+    module.save_registry({"open_trades": {}, "closed_trades": [old_collision, _base_trade()]})
     outcome = {
         "trade_id": "TR-XRP", "lifecycle_id": "LC-XRP", "close_event_id": "CLOSE-XRP-MANUAL-1",
         "outcome_id": "OUT-XRP-1", "outcome_hash": "HASH-XRP-1", "outcome_status": "OUTCOME_RECORDED",
@@ -429,7 +555,9 @@ def test_registry_writer_is_atomic_and_idempotent(tmp_path, monkeypatch):
 
     assert first.get("action") == "OUTCOME_RECORDED", first
     assert second.get("action") == "ALREADY_APPLIED", second
-    assert len(saved) == 1
-    assert saved[0]["outcome_id"] == "OUT-XRP-1"
-    assert saved[0]["financial_reconciliation_pending"] is False
-    assert saved[0]["manual_close_outcome_keys"] == ["CLOSE-XRP-MANUAL-1", "LC-XRP:CLOSE-XRP-MANUAL-1"]
+    assert len(saved) == 2
+    assert saved[0].get("outcome_id") is None
+    assert saved[0]["entry"] == pytest.approx(1.1123)
+    assert saved[1]["outcome_id"] == "OUT-XRP-1"
+    assert saved[1]["financial_reconciliation_pending"] is False
+    assert saved[1]["manual_close_outcome_keys"] == ["CLOSE-XRP-MANUAL-1", "LC-XRP:CLOSE-XRP-MANUAL-1"]
