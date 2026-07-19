@@ -3285,6 +3285,22 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
                 return candidate
         return None
 
+    def typed_value(field_name, *candidates):
+        selected = None
+        for source, candidate in candidates:
+            if candidate is not None and candidate != "":
+                value = str(candidate).upper().strip()
+                type_sources.append({
+                    "field": field_name,
+                    "source": source,
+                    "value": value,
+                })
+                if selected is None:
+                    selected = value
+        return selected
+
+    type_sources = []
+
     factual_order_id = first_present(
         payload.get("id"),
         info.get("orderId"),
@@ -3296,14 +3312,27 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
         info.get("contract"),
         info.get("instrument"),
     )
-    order_type = first_present(
-        payload.get("type"),
-        payload.get("orderType"),
-        info.get("type"),
-        info.get("orderType"),
-        info.get("planType"),
-        info.get("triggerOrderType"),
+    execution_type = typed_value(
+        "execution_type",
+        ("payload.type", payload.get("type")),
+        ("info.type", info.get("type")),
     )
+    order_type = typed_value(
+        "order_type",
+        ("payload.orderType", payload.get("orderType")),
+        ("info.orderType", info.get("orderType")),
+    )
+    plan_type = typed_value(
+        "plan_type",
+        ("payload.planType", payload.get("planType")),
+        ("info.planType", info.get("planType")),
+    )
+    trigger_order_type = typed_value(
+        "trigger_order_type",
+        ("payload.triggerOrderType", payload.get("triggerOrderType")),
+        ("info.triggerOrderType", info.get("triggerOrderType")),
+    )
+    legacy_type = first_present(execution_type, order_type, plan_type, trigger_order_type)
     order_side = first_present(payload.get("side"), info.get("side"), info.get("orderSide"))
     position_side = first_present(
         info.get("positionSide"),
@@ -3346,11 +3375,18 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
         info.get("closeRate"),
         info.get("percentage"),
     )
-    stop_price = first_present(
+    stop_loss_price = first_present(
         payload.get("stopLossPrice"),
+        info.get("stopLossPrice"),
+    )
+    take_profit_price = first_present(
+        payload.get("takeProfitPrice"),
+        info.get("takeProfitPrice"),
+    )
+    stop_price = first_present(
+        stop_loss_price,
         payload.get("stopPrice"),
         payload.get("triggerPrice"),
-        info.get("stopLossPrice"),
         info.get("stopPrice"),
         info.get("triggerPrice"),
         payload.get("price"),
@@ -3377,7 +3413,15 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
         ),
         "symbol": factual_symbol,
         "requested_symbol": requested_symbol,
-        "type": str(order_type or "UNKNOWN").upper(),
+        # ``type`` is retained for compatibility.  The independent fields below
+        # prevent a generic execution type (for example MARKET) from hiding the
+        # factual purpose of a BingX stop plan.
+        "type": str(legacy_type or "UNKNOWN").upper(),
+        "execution_type": execution_type,
+        "order_type": order_type,
+        "plan_type": plan_type,
+        "trigger_order_type": trigger_order_type,
+        "type_sources": type_sources,
         "side": str(order_side or "UNKNOWN").upper(),
         "position_side": position_side,
         "reduce_only": reduce_only,
@@ -3416,6 +3460,8 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
             info.get("time"),
         ),
         "stop_price": _cq_patch_safe_float(stop_price, None),
+        "stop_loss_price": _cq_patch_safe_float(stop_loss_price, None),
+        "take_profit_price": _cq_patch_safe_float(take_profit_price, None),
         "working_type": working_type,
         "raw_info_available": bool(info),
         "raw_info_exposed": False,

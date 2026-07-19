@@ -3175,15 +3175,116 @@ def _falcon_protective_stop_evidence(
         if present(factual_value):
             return factual_value, "BROKER"
         creation_value = creation.get(key)
+        if not present(creation_value):
+            for alias in aliases:
+                creation_value = creation.get(alias)
+                if present(creation_value):
+                    break
         if present(creation_value):
             return creation_value, "CENTRAL_CREATION_FALLBACK"
         return None, "MISSING"
 
-    order_type_value, order_type_source = factual_or_creation("type")
+    actual_order_id = str(order_snapshot.get("order_id") or order_snapshot.get("id") or "").strip()
+    expected_order_id = str(expected_stop_order_id or "").strip()
+    order_identity_matches = bool(not expected_order_id or (actual_order_id and actual_order_id == expected_order_id))
+    lifecycle_identity_present = bool(
+        identity.get("lifecycle_id")
+        and (identity.get("order_id") or identity.get("client_order_id"))
+    )
+    strong_ownership = bool(expected_order_id and order_identity_matches and lifecycle_identity_present)
+
+    execution_type_value, execution_type_source = factual_or_creation("execution_type", "type")
+    if present(order_snapshot.get("execution_type")):
+        order_type_value, order_type_source = factual_or_creation("order_type")
+    else:
+        # Compatibility for snapshots produced before the normalizer exposed
+        # execution_type and order_type independently.
+        order_type_value, order_type_source = factual_or_creation("order_type", "type")
+    plan_type_value, plan_type_source = factual_or_creation("plan_type")
+    trigger_order_type_value, trigger_order_type_source = factual_or_creation("trigger_order_type")
+    execution_type = token(execution_type_value)
     order_type = token(order_type_value)
-    take_profit_type = bool(order_type == "TP" or "TAKE_PROFIT" in order_type or "TAKEPROFIT" in order_type)
+    plan_type = token(plan_type_value)
+    trigger_order_type = token(trigger_order_type_value)
+    normalized_type_sources = order_snapshot.get("type_sources")
+    if not isinstance(normalized_type_sources, list):
+        normalized_type_sources = []
+    source_type_tokens = [
+        token(item.get("value"))
+        for item in normalized_type_sources
+        if isinstance(item, dict) and present(item.get("value"))
+    ]
+    type_tokens = [
+        value
+        for value in (execution_type, order_type, plan_type, trigger_order_type, *source_type_tokens)
+        if value
+    ]
+
+    def is_take_profit_type(value):
+        return bool(value == "TP" or "TAKE_PROFIT" in value or "TAKEPROFIT" in value)
+
+    stop_loss_price_value, stop_loss_price_source = factual_or_creation("stop_loss_price")
+    take_profit_price_value, take_profit_price_source = factual_or_creation("take_profit_price")
+    stop_loss_price = safe_float(stop_loss_price_value, None)
+    take_profit_price = safe_float(take_profit_price_value, None)
+    stop_type_tokens = [value for value in type_tokens if "STOP" in value and not is_take_profit_type(value)]
+    take_profit_type_tokens = [value for value in type_tokens if is_take_profit_type(value)]
+    stop_loss_evidence_present = bool(stop_type_tokens or present(stop_loss_price_value))
+    take_profit_evidence_present = bool(take_profit_type_tokens or present(take_profit_price_value))
     valid_types = {"STOP", "STOP_MARKET", "STOP_LOSS", "TRIGGER_MARKET"}
-    type_valid = bool(order_type in valid_types and not take_profit_type)
+    direct_type = next((value for value in type_tokens if value in valid_types), None)
+    explicit_market_sl_evidence = bool(
+        present(stop_loss_price_value)
+        or any(
+            "STOP" in value and not is_take_profit_type(value)
+            for value in (order_type, plan_type, trigger_order_type)
+            if value
+        )
+        or any(
+            item.get("field") != "execution_type"
+            and "STOP" in token(item.get("value"))
+            and not is_take_profit_type(token(item.get("value")))
+            for item in normalized_type_sources
+            if isinstance(item, dict)
+        )
+    )
+    if stop_loss_evidence_present and take_profit_evidence_present:
+        type_valid = False
+        type_valid_reason = "SL_TP_EVIDENCE_CONFLICT"
+    elif take_profit_evidence_present:
+        type_valid = False
+        type_valid_reason = "TAKE_PROFIT_EVIDENCE_PRESENT"
+    elif execution_type == "MARKET":
+        type_valid = bool(explicit_market_sl_evidence and strong_ownership)
+        if not explicit_market_sl_evidence:
+            type_valid_reason = "MARKET_WITHOUT_EXPLICIT_STOP_LOSS_EVIDENCE"
+        elif not strong_ownership:
+            type_valid_reason = "MARKET_WITHOUT_STRONG_OWNERSHIP"
+        else:
+            type_valid_reason = "MARKET_WITH_EXPLICIT_STOP_LOSS_EVIDENCE"
+    elif direct_type:
+        type_valid = True
+        type_valid_reason = "DIRECT_PROTECTIVE_TYPE"
+    else:
+        type_valid = False
+        type_valid_reason = "UNSUPPORTED_ORDER_TYPE"
+
+    type_source_summary = [
+        {
+            "field": field,
+            "value": value or None,
+            "source": source,
+        }
+        for field, value, source in (
+            ("execution_type", execution_type, execution_type_source),
+            ("order_type", order_type, order_type_source),
+            ("plan_type", plan_type, plan_type_source),
+            ("trigger_order_type", trigger_order_type, trigger_order_type_source),
+        )
+        if value
+    ]
+    if normalized_type_sources:
+        type_source_summary = [dict(item) for item in normalized_type_sources if isinstance(item, dict)]
 
     expected_symbol = _falcon_management_norm_symbol(identity.get("symbol"))
     symbol_value, symbol_source = factual_or_creation("symbol")
@@ -3282,10 +3383,6 @@ def _falcon_protective_stop_evidence(
         )
     )
 
-    actual_order_id = str(order_snapshot.get("order_id") or order_snapshot.get("id") or "").strip()
-    expected_order_id = str(expected_stop_order_id or "").strip()
-    order_identity_matches = bool(not expected_order_id or (actual_order_id and actual_order_id == expected_order_id))
-
     conflicts = []
     creation_fallback_eligible = bool(creation)
     if creation_fallback_eligible:
@@ -3301,12 +3398,18 @@ def _falcon_protective_stop_evidence(
         creation_position_side = _falcon_management_norm_side(creation.get("position_side"))
         if factual_position_side and creation_position_side and factual_position_side != creation_position_side:
             conflicts.append("POSITION_SIDE_CONFLICT")
-        factual_type = token(order_snapshot.get("type"))
+        factual_type = direct_type or execution_type or token(order_snapshot.get("type"))
         creation_type = token(creation.get("type"))
-        factual_type_stop = factual_type in valid_types
+        factual_type_stop = bool(stop_loss_evidence_present or factual_type in valid_types)
         creation_type_stop = creation_type in valid_types
         if factual_type and factual_type != "UNKNOWN" and creation_type and factual_type_stop != creation_type_stop:
             conflicts.append("ORDER_TYPE_CONFLICT")
+        creation_lifecycle_id = str(creation.get("lifecycle_id") or "").strip()
+        identity_lifecycle_id = str(identity.get("lifecycle_id") or "").strip()
+        if creation_lifecycle_id and identity_lifecycle_id and creation_lifecycle_id != identity_lifecycle_id:
+            conflicts.append("LIFECYCLE_ID_CONFLICT")
+    if stop_loss_evidence_present and take_profit_evidence_present:
+        conflicts.append("SL_TP_EVIDENCE_CONFLICT")
     factual_conflict = bool(conflicts or conflicting_close_semantic)
     if conflicting_close_semantic:
         conflicts.append("CLOSE_SEMANTIC_CONFLICT")
@@ -3340,6 +3443,7 @@ def _falcon_protective_stop_evidence(
         "quantity_covers_position": quantity_covers_position,
         "status_active": status_active,
         "order_identity_matches": order_identity_matches,
+        "strong_ownership": strong_ownership,
         "factual_conflict": factual_conflict,
         "semantic_stop_valid": semantic_stop_valid,
     }
@@ -3361,6 +3465,20 @@ def _falcon_protective_stop_evidence(
         "factual_conflicts": conflicts,
         "order_type": order_type,
         "order_type_source": order_type_source,
+        "execution_type": execution_type or None,
+        "execution_type_source": execution_type_source,
+        "plan_type": plan_type or None,
+        "plan_type_source": plan_type_source,
+        "trigger_order_type": trigger_order_type or None,
+        "trigger_order_type_source": trigger_order_type_source,
+        "stop_loss_price": stop_loss_price,
+        "stop_loss_price_source": stop_loss_price_source,
+        "take_profit_price": take_profit_price,
+        "take_profit_price_source": take_profit_price_source,
+        "stop_loss_evidence_present": stop_loss_evidence_present,
+        "take_profit_evidence_present": take_profit_evidence_present,
+        "type_source_summary": type_source_summary,
+        "type_valid_reason": type_valid_reason,
         "expected_symbol": expected_symbol,
         "actual_symbol": actual_symbol,
         "symbol_source": symbol_source,
@@ -3465,6 +3583,13 @@ def _falcon_update_stop_health(result):
     predicates = result.get("stop_semantic_predicates") if isinstance(result.get("stop_semantic_predicates"), dict) else {}
     HEALTH["falcon_disaster_stop_semantic_predicates"] = dict(predicates)
     HEALTH["falcon_disaster_stop_semantic_failure_reasons"] = list(result.get("stop_semantic_failure_reasons") or [])
+    HEALTH["falcon_disaster_stop_execution_type"] = result.get("execution_type")
+    HEALTH["falcon_disaster_stop_plan_type"] = result.get("plan_type")
+    HEALTH["falcon_disaster_stop_trigger_order_type"] = result.get("trigger_order_type")
+    HEALTH["falcon_disaster_stop_stop_loss_evidence_present"] = result.get("stop_loss_evidence_present")
+    HEALTH["falcon_disaster_stop_take_profit_evidence_present"] = result.get("take_profit_evidence_present")
+    HEALTH["falcon_disaster_stop_type_source_summary"] = list(result.get("type_source_summary") or [])
+    HEALTH["falcon_disaster_stop_type_valid_reason"] = result.get("type_valid_reason")
     for predicate_name in (
         "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
         "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
@@ -3499,6 +3624,13 @@ def falcon_refresh_management_safety_health(positions):
     predicates = verification.get("stop_semantic_predicates") if isinstance(verification.get("stop_semantic_predicates"), dict) else {}
     HEALTH["falcon_disaster_stop_semantic_predicates"] = dict(predicates)
     HEALTH["falcon_disaster_stop_semantic_failure_reasons"] = list(verification.get("stop_semantic_failure_reasons") or [])
+    HEALTH["falcon_disaster_stop_execution_type"] = verification.get("execution_type")
+    HEALTH["falcon_disaster_stop_plan_type"] = verification.get("plan_type")
+    HEALTH["falcon_disaster_stop_trigger_order_type"] = verification.get("trigger_order_type")
+    HEALTH["falcon_disaster_stop_stop_loss_evidence_present"] = verification.get("stop_loss_evidence_present")
+    HEALTH["falcon_disaster_stop_take_profit_evidence_present"] = verification.get("take_profit_evidence_present")
+    HEALTH["falcon_disaster_stop_type_source_summary"] = list(verification.get("type_source_summary") or [])
+    HEALTH["falcon_disaster_stop_type_valid_reason"] = verification.get("type_valid_reason")
     for predicate_name in (
         "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
         "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
@@ -3544,6 +3676,13 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
         "trigger_type": None,
         "trigger_type_creation_evidence": pos.get("broker_stop_trigger_type"),
         "stop_order_type": None,
+        "execution_type": None,
+        "plan_type": None,
+        "trigger_order_type": None,
+        "stop_loss_evidence_present": False,
+        "take_profit_evidence_present": False,
+        "type_source_summary": [],
+        "type_valid_reason": "NOT_EVALUATED",
         "stop_side": pos.get("broker_stop_side"),
         "stop_position_side": None,
         "stop_reduce_only": None,
@@ -3742,6 +3881,12 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                 result["semantic_stop_valid"] = protective_type
                 result["stop_semantic_predicates"] = dict(protective.get("predicates") or {})
                 result["stop_semantic_failure_reasons"] = list(protective.get("failure_reasons") or [])
+                for diagnostic_name in (
+                    "execution_type", "plan_type", "trigger_order_type",
+                    "stop_loss_evidence_present", "take_profit_evidence_present",
+                    "type_source_summary", "type_valid_reason",
+                ):
+                    result[diagnostic_name] = protective.get(diagnostic_name)
                 for predicate_name in (
                     "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
                     "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
@@ -3796,6 +3941,13 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
     pos["protection_matches_position"] = result.get("protection_matches_position")
     pos["entry_ownership_verified"] = result.get("entry_ownership_verified")
     pos["semantic_stop_valid"] = result.get("semantic_stop_valid")
+    pos["stop_execution_type"] = result.get("execution_type")
+    pos["stop_plan_type"] = result.get("plan_type")
+    pos["stop_trigger_order_type"] = result.get("trigger_order_type")
+    pos["stop_loss_evidence_present"] = result.get("stop_loss_evidence_present")
+    pos["take_profit_evidence_present"] = result.get("take_profit_evidence_present")
+    pos["stop_type_source_summary"] = list(result.get("type_source_summary") or [])
+    pos["stop_type_valid_reason"] = result.get("type_valid_reason")
     pos["stop_semantic_predicates"] = dict(result.get("stop_semantic_predicates") or {})
     pos["stop_semantic_failure_reasons"] = list(result.get("stop_semantic_failure_reasons") or [])
     pos["disaster_stop_active_verified"] = bool(result.get("stop_order_active") and result.get("stop_order_identity_match") and result.get("protection_matches_position") and result.get("stop_order_protective_verified") and result.get("entry_ownership_verified"))
@@ -3862,6 +4014,9 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                 "stop_order_rejected", "stop_order_last_checked_at", "protected_qty", "position_qty",
                 "protection_matches_position", "stop_order_protective_verified", "stop_anomaly_detected", "stop_anomaly_reason",
                 "semantic_stop_valid", "stop_semantic_predicates", "stop_semantic_failure_reasons",
+                "execution_type", "plan_type", "trigger_order_type",
+                "stop_loss_evidence_present", "take_profit_evidence_present",
+                "type_source_summary", "type_valid_reason",
                 "type_valid", "symbol_matches", "close_side_matches", "position_side_matches",
                 "reduce_only_confirmed", "close_position_confirmed", "trigger_direction_valid",
                 "close_semantics_confirmed", "quantity_covers_position", "status_active",

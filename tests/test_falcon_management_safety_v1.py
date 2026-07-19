@@ -222,6 +222,47 @@ def test_stop_active_is_factually_verified_without_mutating_broker():
     assert broker.mutation_calls == []
 
 
+def test_xrp_like_market_stop_plan_is_verified_and_diagnostics_are_propagated():
+    normalizer = _load_broker_function(
+        "_normalize_managed_order_payload",
+        {"_cq_patch_safe_float": _safe_float},
+    )
+    stop = normalizer({
+        "id": "STOP-1",
+        "type": "market",
+        "status": "open",
+        "symbol": "XRPUSDT",
+        "side": "sell",
+        "amount": 2.0,
+        "info": {
+            "planType": "STOP_LOSS",
+            "stopLossPrice": "1.8",
+            "triggerPriceType": "MARK_PRICE",
+            "positionSide": "LONG",
+            "positionAction": "Close Long",
+        },
+    }, requested_symbol="XRPUSDT", requested_order_id="STOP-1")
+    stop.update({"ok": True, "read_only": True, "sent": False})
+    broker = _ReadOnlyBroker(_position_snapshot(), stop)
+    health = {}
+
+    result = _verifier(broker, health=health)(
+        _position(), now_epoch=1000.0, force=True, persist_registry=False
+    )
+
+    assert result["status"] == "DISASTER_STOP_ACTIVE_VERIFIED"
+    assert result["management_allowed"] is True
+    assert result["semantic_stop_valid"] is True
+    assert result["execution_type"] == "MARKET"
+    assert result["plan_type"] == "STOP_LOSS"
+    assert result["trigger_order_type"] is None
+    assert result["stop_loss_evidence_present"] is True
+    assert result["take_profit_evidence_present"] is False
+    assert result["type_valid_reason"] == "MARKET_WITH_EXPLICIT_STOP_LOSS_EVIDENCE"
+    assert health["falcon_disaster_stop_type_valid_reason"] == result["type_valid_reason"]
+    assert broker.mutation_calls == []
+
+
 @pytest.mark.parametrize(
     "updates",
     [
@@ -245,7 +286,7 @@ def test_active_order_without_protective_type_side_or_close_semantics_is_rejecte
     assert broker.mutation_calls == []
 
 
-def _semantic_evidence(*, side="LONG", order_updates=None, hedge_mode=True, creation=None):
+def _semantic_evidence(*, side="LONG", order_updates=None, hedge_mode=True, creation=None, identity_updates=None):
     order = _order_snapshot("OPEN")
     identity = {
         "symbol": "XRPUSDT",
@@ -254,6 +295,8 @@ def _semantic_evidence(*, side="LONG", order_updates=None, hedge_mode=True, crea
         "order_id": "ORDER-1",
         "client_order_id": "CLIENT-1",
     }
+    if identity_updates:
+        identity.update(identity_updates)
     reference = 2.0
     if side == "SHORT":
         order.update({"side": "BUY", "position_side": "SHORT", "stop_price": 2.2})
@@ -318,7 +361,136 @@ def test_trigger_market_alias_is_accepted_only_with_protective_semantics():
     assert evidence["semantic_stop_valid"] is True
 
 
-@pytest.mark.parametrize("order_type", ["TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TP"])
+@pytest.mark.parametrize("order_type", ["STOP", "STOP_MARKET", "STOP_LOSS", "TRIGGER_MARKET"])
+def test_direct_protective_order_types_remain_accepted(order_type):
+    evidence = _semantic_evidence(order_updates={"type": order_type})
+
+    assert evidence["type_valid"] is True
+    assert evidence["type_valid_reason"] == "DIRECT_PROTECTIVE_TYPE"
+    assert evidence["semantic_stop_valid"] is True
+
+
+def test_market_execution_with_explicit_stop_loss_plan_is_accepted_fail_closed():
+    evidence = _semantic_evidence(order_updates={
+        "type": "MARKET",
+        "execution_type": "MARKET",
+        "plan_type": "STOP_LOSS",
+        "stop_loss_price": 1.8,
+        "close_semantic": "Close Long",
+    })
+
+    assert evidence["execution_type"] == "MARKET"
+    assert evidence["plan_type"] == "STOP_LOSS"
+    assert evidence["stop_loss_evidence_present"] is True
+    assert evidence["take_profit_evidence_present"] is False
+    assert evidence["strong_ownership"] is True
+    assert evidence["type_valid"] is True
+    assert evidence["type_valid_reason"] == "MARKET_WITH_EXPLICIT_STOP_LOSS_EVIDENCE"
+    assert evidence["semantic_stop_valid"] is True
+
+
+def test_market_with_trigger_price_alone_is_not_a_semantic_stop():
+    evidence = _semantic_evidence(order_updates={
+        "type": "MARKET",
+        "execution_type": "MARKET",
+        "order_type": None,
+        "plan_type": None,
+        "trigger_order_type": None,
+        "stop_loss_price": None,
+    })
+
+    assert evidence["trigger_direction_valid"] is True
+    assert evidence["stop_loss_evidence_present"] is False
+    assert evidence["type_valid"] is False
+    assert evidence["type_valid_reason"] == "MARKET_WITHOUT_EXPLICIT_STOP_LOSS_EVIDENCE"
+    assert evidence["semantic_stop_valid"] is False
+
+
+@pytest.mark.parametrize(
+    "order_updates",
+    [
+        {"plan_type": "TAKE_PROFIT"},
+        {"take_profit_price": 2.2},
+    ],
+)
+def test_market_with_any_take_profit_evidence_is_rejected(order_updates):
+    payload = {
+        "type": "MARKET",
+        "execution_type": "MARKET",
+    }
+    payload.update(order_updates)
+    evidence = _semantic_evidence(order_updates=payload)
+
+    assert evidence["take_profit_evidence_present"] is True
+    assert evidence["type_valid"] is False
+    assert evidence["type_valid_reason"] == "TAKE_PROFIT_EVIDENCE_PRESENT"
+    assert evidence["semantic_stop_valid"] is False
+
+
+def test_simultaneous_stop_loss_and_take_profit_evidence_is_a_conflict():
+    evidence = _semantic_evidence(order_updates={
+        "type": "MARKET",
+        "execution_type": "MARKET",
+        "plan_type": "STOP_LOSS",
+        "trigger_order_type": "TAKE_PROFIT_MARKET",
+        "stop_loss_price": 1.8,
+        "take_profit_price": 2.2,
+    })
+
+    assert evidence["stop_loss_evidence_present"] is True
+    assert evidence["take_profit_evidence_present"] is True
+    assert evidence["type_valid_reason"] == "SL_TP_EVIDENCE_CONFLICT"
+    assert "SL_TP_EVIDENCE_CONFLICT" in evidence["factual_conflicts"]
+    assert evidence["semantic_stop_valid"] is False
+
+
+def test_market_requires_exact_stop_order_and_strong_lifecycle_identity():
+    wrong_order = _semantic_evidence(order_updates={
+        "id": "OTHER-STOP",
+        "order_id": "OTHER-STOP",
+        "type": "MARKET",
+        "execution_type": "MARKET",
+        "plan_type": "STOP_LOSS",
+        "stop_loss_price": 1.8,
+    })
+    missing_lifecycle = _semantic_evidence(
+        identity_updates={"lifecycle_id": None},
+        order_updates={
+            "type": "MARKET",
+            "execution_type": "MARKET",
+            "plan_type": "STOP_LOSS",
+            "stop_loss_price": 1.8,
+        },
+    )
+
+    assert wrong_order["order_identity_matches"] is False
+    assert wrong_order["strong_ownership"] is False
+    assert wrong_order["semantic_stop_valid"] is False
+    assert missing_lifecycle["strong_ownership"] is False
+    assert missing_lifecycle["type_valid_reason"] == "MARKET_WITHOUT_STRONG_OWNERSHIP"
+    assert missing_lifecycle["semantic_stop_valid"] is False
+
+
+def test_conflicting_creation_lifecycle_is_rejected():
+    creation = {
+        "eligible": True,
+        "order_id": "STOP-1",
+        "lifecycle_id": "OTHER-LIFECYCLE",
+        "symbol": "XRPUSDT",
+        "side": "SELL",
+        "type": "STOP_MARKET",
+        "position_side": "LONG",
+        "stop_price": 1.8,
+        "working_type": "MARK_PRICE",
+        "amount": 2.0,
+    }
+    evidence = _semantic_evidence(creation=creation)
+
+    assert "LIFECYCLE_ID_CONFLICT" in evidence["factual_conflicts"]
+    assert evidence["semantic_stop_valid"] is False
+
+
+@pytest.mark.parametrize("order_type", ["TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TAKEPROFIT", "TP"])
 def test_take_profit_alias_is_never_accepted_as_disaster_stop(order_type):
     evidence = _semantic_evidence(order_updates={"type": order_type})
 
@@ -483,6 +655,45 @@ def test_broker_normalizer_recognizes_position_and_close_aliases(position_alias)
     assert normalized["close_semantic"] == "Close Long"
     assert normalized["raw_info_available"] is True
     assert normalized["raw_info_exposed"] is False
+
+
+def test_broker_normalizer_keeps_market_execution_and_stop_plan_separate():
+    normalizer = _load_broker_function(
+        "_normalize_managed_order_payload",
+        {"_cq_patch_safe_float": _safe_float},
+    )
+    normalized = normalizer({
+        "id": "STOP-1",
+        "type": "market",
+        "orderType": "market",
+        "status": "open",
+        "info": {
+            "symbol": "XRP-USDT",
+            "orderType": "STOP_LOSS",
+            "planType": "STOP_LOSS",
+            "triggerOrderType": "STOP_MARKET",
+            "stopLossPrice": "1.0842",
+            "side": "SELL",
+            "positionSide": "LONG",
+            "origQty": "9",
+        },
+    }, requested_symbol="XRPUSDT", requested_order_id="STOP-1")
+
+    assert normalized["type"] == "MARKET"
+    assert normalized["execution_type"] == "MARKET"
+    assert normalized["order_type"] == "MARKET"
+    assert normalized["plan_type"] == "STOP_LOSS"
+    assert normalized["trigger_order_type"] == "STOP_MARKET"
+    assert normalized["stop_loss_price"] == pytest.approx(1.0842)
+    assert normalized["take_profit_price"] is None
+    assert normalized["stop_price"] == pytest.approx(1.0842)
+    assert normalized["type_sources"] == [
+        {"field": "execution_type", "source": "payload.type", "value": "MARKET"},
+        {"field": "order_type", "source": "payload.orderType", "value": "MARKET"},
+        {"field": "order_type", "source": "info.orderType", "value": "STOP_LOSS"},
+        {"field": "plan_type", "source": "info.planType", "value": "STOP_LOSS"},
+        {"field": "trigger_order_type", "source": "info.triggerOrderType", "value": "STOP_MARKET"},
+    ]
 
 
 def test_active_stop_does_not_authorize_management_without_entry_fill_identity():
