@@ -3503,6 +3503,1104 @@ def managed_order_snapshot(symbol, order_id):
         }
 
 
+FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_VERSION = "2026-07-19-FALCON-DISASTER-STOP-FAILURE-FORENSICS-V1"
+
+
+def _dsff_v1_first(payload, info, *keys):
+    for key in keys:
+        value = payload.get(key) if isinstance(payload, dict) else None
+        if value in (None, "") and isinstance(info, dict):
+            value = info.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _dsff_v1_safe_text(value, max_length=500):
+    if value in (None, ""):
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    lowered = text.lower()
+    looks_like_absolute_path = bool(
+        text.startswith(("/", "\\"))
+        or (len(text) >= 3 and text[1] == ":" and text[2] in {"/", "\\"})
+    )
+    if looks_like_absolute_path or any(token in lowered for token in (
+        "api_key", "apikey", "apisecret", "signature=", "x-bx-apikey",
+        "authorization:", "authorization=", "bearer ", "secret=", "secret:",
+        "token=", "token:", "access_token", "cookie:",
+        "c:\\", "c:/", "/data/", "/home/", "/opt/", "/var/",
+    )):
+        return "REDACTED_SENSITIVE_VALUE"
+    return text[:max(1, int(max_length))]
+
+
+def _dsff_v1_safe_scalar(value, max_length=500):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, (dict, list, tuple, set)):
+        return None
+    return _dsff_v1_safe_text(value, max_length=max_length)
+
+
+def _dsff_v1_epoch(value):
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+        return number / 1000.0 if number > 10_000_000_000 else number
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _dsff_v1_list_from_response(payload, limit=1000):
+    """Extract bounded order/fill rows, including BingX's raw ``fill_orders`` key."""
+    limit = max(1, min(int(limit or 1000), 1000))
+    if isinstance(payload, list):
+        return [item for item in payload[:limit] if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in (
+        "data", "orders", "order", "fill_orders", "fills", "trades",
+        "items", "list", "records",
+    ):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value[:limit] if isinstance(item, dict)]
+        if isinstance(value, dict):
+            nested = _dsff_v1_list_from_response(value, limit=limit)
+            if nested:
+                return nested
+            if key == "order":
+                return [value]
+    # Some private GET aliases return the order directly under ``data`` rather
+    # than under an additional ``order`` collection.  Accept only objects with
+    # a factual order identity; never project an arbitrary response envelope.
+    if any(payload.get(key) not in (None, "") for key in (
+        "orderId", "orderID", "order_id", "id", "clientOrderId",
+    )):
+        return [payload]
+    return []
+
+
+def _dsff_v1_call_raw(method_names, params):
+    """Call only explicitly supplied private GET readers and expose no response body."""
+    ex = exchange()
+    rows = []
+    attempts = []
+    ccxt_pacing_enabled = bool(getattr(ex, "enableRateLimit", False))
+    selected = next(
+        (
+            (method_name, getattr(ex, method_name, None))
+            for method_name in method_names
+            if callable(getattr(ex, method_name, None))
+        ),
+        None,
+    )
+    if selected is None:
+        return rows, attempts
+    method_name, method = selected
+    try:
+        response = method(dict(params or {}))
+        response_limit = max(1, min(int((params or {}).get("limit") or 300), 1000))
+        response_containers = [response]
+        if isinstance(response, dict) and isinstance(response.get("data"), dict):
+            response_containers.append(response.get("data"))
+        response_code = None
+        for container in response_containers:
+            if not isinstance(container, dict):
+                continue
+            for key in ("code", "errorCode", "retCode"):
+                if container.get(key) not in (None, ""):
+                    response_code = container.get(key)
+                    break
+            if response_code not in (None, ""):
+                break
+        code_text = str(response_code or "0").strip().upper()
+        response_code_ok = code_text in {"0", "000000", "SUCCESS", "OK"}
+        if not response_code_ok:
+            attempts.append({
+                "method": method_name,
+                "ok": False,
+                "error_type": "RAW_RESPONSE_CODE_NON_ZERO",
+                "response_code": _dsff_v1_safe_text(response_code, max_length=40),
+                "rate_limit_pacing_applied": ccxt_pacing_enabled,
+            })
+            return rows, attempts
+
+        extracted = _dsff_v1_list_from_response(response, limit=response_limit)
+        rows.extend(extracted[:response_limit])
+        has_more = False
+        cursor_present = False
+        total_count = None
+        for container in response_containers:
+            if not isinstance(container, dict):
+                continue
+            has_more = bool(has_more or container.get("hasMore") is True or container.get("has_more") is True)
+            cursor_present = bool(cursor_present or any(
+                container.get(key) not in (None, "")
+                for key in ("nextPageCursor", "nextCursor", "cursor", "nextPageToken")
+            ))
+            for key in ("total", "totalCount", "total_count"):
+                try:
+                    if container.get(key) not in (None, ""):
+                        total_count = int(container.get(key))
+                        break
+                except (TypeError, ValueError):
+                    continue
+        attempts.append({
+            "method": method_name,
+            "ok": True,
+            "count": len(extracted),
+            "has_more": has_more,
+            "cursor_present": cursor_present,
+            "total_count": total_count,
+            "pagination_incomplete": bool(
+                has_more or cursor_present
+                or (total_count is not None and total_count > len(extracted))
+            ),
+            "rate_limit_pacing_applied": ccxt_pacing_enabled,
+        })
+    except Exception as exc:
+        # Aliases name the same physical endpoint.  A failed request is never
+        # retried through another alias because that would duplicate the
+        # private call while making telemetry look like a harmless fallback.
+        attempts.append({
+            "method": method_name,
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "rate_limit_pacing_applied": ccxt_pacing_enabled,
+        })
+    return rows[:max(1, min(int((params or {}).get("limit") or 300), 1000))], attempts
+
+
+def _dsff_v1_normalize_order(order, source, requested_order_id=None, record_kind="order"):
+    """Project only safe terminal/trigger evidence from a broker reader response."""
+    payload = order if isinstance(order, dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    is_trade = str(record_kind or "order").lower().strip() == "trade"
+    # A trade/fill ``id`` identifies the fill, not the parent order.  Accept it
+    # as an order identity only for order snapshots; fill records must carry a
+    # factual orderId/order field before their own id can be projected.
+    order_id = _dsff_v1_first(
+        payload,
+        info,
+        *(("orderId", "orderID", "order_id", "order") if is_trade
+          else ("orderId", "orderID", "order_id", "order", "id")),
+    )
+
+    def first_with_source(keys):
+        for key in keys:
+            for container_name, container in (("payload", payload), ("info", info)):
+                value = container.get(key) if isinstance(container, dict) else None
+                if value not in (None, ""):
+                    return value, f"{container_name}.{key}"
+        return None, None
+
+    def unit_for(quantity_source):
+        key = str(quantity_source or "").split(".")[-1]
+        source_name = str(source or "").lower()
+        if "all_fill_orders" in source_name or key == "volume":
+            return "COIN"
+        if "swap_v2.trade.order" in source_name or "swap_v2.trade.all_orders" in source_name:
+            return "COIN"
+        if key in {"amount", "filled", "remaining"}:
+            return "CCXT_BASE_OR_CONTRACT"
+        return "UNKNOWN"
+
+    requested_keys = (
+        ("requestedQty", "requestedSize", "requestedAmount")
+        if is_trade
+        else ("origQty", "orderQty", "quantity", "qty", "size", "amount")
+    )
+    executed_keys = (
+        "executedQty", "filledQty", "executedQuantity", "dealSize", "filled",
+        *(("volume", "qty", "quantity", "size", "amount") if is_trade else ()),
+    )
+    requested_raw, requested_quantity_source = first_with_source(requested_keys)
+    executed_raw, executed_quantity_source = first_with_source(executed_keys)
+    remaining_raw, remaining_quantity_source = first_with_source(("remaining", "remainingQty", "leftQty"))
+    requested_quantity = _cq_patch_safe_float(requested_raw, None)
+    executed_quantity = _cq_patch_safe_float(executed_raw, None)
+    remaining_quantity = _cq_patch_safe_float(remaining_raw, None)
+    requested_quantity_unit = unit_for(requested_quantity_source)
+    executed_quantity_unit = unit_for(executed_quantity_source)
+    remaining_quantity_unit = unit_for(remaining_quantity_source)
+    quantity_units_compatible = bool(
+        requested_quantity is not None
+        and executed_quantity is not None
+        and requested_quantity_unit != "UNKNOWN"
+        and requested_quantity_unit == executed_quantity_unit
+    )
+    if remaining_quantity is None and quantity_units_compatible:
+        remaining_quantity = max(0.0, requested_quantity - executed_quantity)
+        remaining_quantity_source = "derived.requested_minus_executed"
+        remaining_quantity_unit = requested_quantity_unit
+    primary_quantity_source = executed_quantity_source if executed_quantity is not None else requested_quantity_source
+    primary_quantity_unit = executed_quantity_unit if executed_quantity is not None else requested_quantity_unit
+    raw_status = _dsff_v1_first(
+        {}, info, "status", "orderStatus", "triggerStatus", "state",
+    ) or payload.get("status")
+    unified_status = payload.get("status")
+    failure_reason = _dsff_v1_safe_text(_dsff_v1_first(
+        payload,
+        info,
+        "failureReason",
+        "failReason",
+        "rejectReason",
+        "errorMessage",
+        "errorMsg",
+        "reason",
+        "msg",
+        "message",
+    ))
+    failure_code = _dsff_v1_safe_text(_dsff_v1_first(
+        payload, info, "failureCode", "failCode", "rejectCode", "errorCode", "code",
+    ), max_length=120)
+    raw_requested_order_id = _dsff_v1_first(
+        payload, info, "requestedOrderId", "requestedOrderID", "requested_order_id",
+    )
+    fill_id = _dsff_v1_first(
+        payload, info, "tradeId", "tradeID", "trade_id", "fillId", "fillID", "fill_id",
+    )
+    if is_trade and order_id not in (None, "") and fill_id in (None, ""):
+        fill_id = _dsff_v1_first(payload, info, "id")
+    fill_time = _dsff_v1_safe_scalar(_dsff_v1_first(
+        payload, info, "tradeTime", "fillTime", "filledTime", "executedTime", "timestamp", "time", "datetime",
+    )) if is_trade else None
+    fill_quantity = executed_quantity if is_trade else None
+    fill_price = _cq_patch_safe_float(_dsff_v1_first(
+        payload, info, "fillPrice", "price", "avgPrice", "averagePrice", "average",
+    ), None) if is_trade else None
+    fill_fee = _cq_patch_safe_float(_dsff_v1_first(
+        payload, info, "fee", "commission", "fillFee", "tradingFee",
+    ), None) if is_trade else None
+    fill_realized_pnl = _cq_patch_safe_float(_dsff_v1_first(
+        payload, info, "realizedPnl", "realizedPNL", "realizedProfit", "pnl",
+    ), None) if is_trade else None
+    return {
+        "source": str(source or "broker_read_only")[:120],
+        "record_kind": "trade" if is_trade else "order",
+        "order_id": str(order_id) if order_id not in (None, "") else None,
+        "requested_order_id": _dsff_v1_safe_text(
+            requested_order_id if requested_order_id not in (None, "") else raw_requested_order_id,
+            max_length=128,
+        ),
+        "client_order_id": _dsff_v1_safe_text(_dsff_v1_first(
+            payload, info, "clientOrderId", "clientOrderID", "client_order_id", "clientOid",
+        ), max_length=128),
+        "parent_order_id": _dsff_v1_safe_text(_dsff_v1_first(
+            payload, info, "parentOrderId", "parentOrderID", "parent_order_id", "sourceOrderId",
+        ), max_length=128),
+        "plan_order_id": _dsff_v1_safe_text(_dsff_v1_first(
+            payload, info, "planOrderId", "planOrderID", "plan_order_id",
+        ), max_length=128),
+        "trigger_order_id": _dsff_v1_safe_text(_dsff_v1_first(
+            payload, info, "triggerOrderId", "triggerOrderID", "trigger_order_id",
+        ), max_length=128),
+        "derived_order_id": _dsff_v1_safe_text(_dsff_v1_first(
+            payload, info, "derivedOrderId", "childOrderId", "executeOrderId", "executeOrderID",
+        ), max_length=128),
+        "symbol": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "symbol", "contract", "instrument"), max_length=64),
+        "side": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "side", "orderSide"), max_length=16),
+        "position_side": _dsff_v1_safe_text(_dsff_v1_first(
+            payload, info, "positionSide", "position_side", "posSide",
+        ), max_length=16),
+        "type": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "type"), max_length=64),
+        "plan_type": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "planType"), max_length=64),
+        "order_type": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "orderType"), max_length=64),
+        "trigger_order_type": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "triggerOrderType"), max_length=64),
+        "trigger_type": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "triggerType"), max_length=64),
+        "working_type": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "workingType", "triggerPriceType"), max_length=64),
+        "status": _dsff_v1_safe_text(unified_status, max_length=64),
+        "raw_status": _dsff_v1_safe_text(raw_status, max_length=64),
+        "plan_status": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "planStatus"), max_length=64),
+        "execute_status": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "executeStatus"), max_length=64),
+        "failure_status": _dsff_v1_safe_text(_dsff_v1_first(payload, info, "failureStatus", "failStatus"), max_length=64),
+        "failure_code": failure_code,
+        "failure_reason": failure_reason,
+        "trigger_price": _cq_patch_safe_float(_dsff_v1_first(
+            payload, info, "triggerPrice", "stopPrice", "stopLossPrice",
+        ), None),
+        "stop_price": _cq_patch_safe_float(_dsff_v1_first(
+            payload, info, "stopPrice", "stopLossPrice", "triggerPrice",
+        ), None),
+        "requested_quantity": requested_quantity,
+        "executed_quantity": executed_quantity,
+        "remaining_quantity": remaining_quantity,
+        "quantity_unit": primary_quantity_unit,
+        "quantity_source": primary_quantity_source,
+        "requested_quantity_unit": requested_quantity_unit,
+        "requested_quantity_source": requested_quantity_source,
+        "executed_quantity_unit": executed_quantity_unit,
+        "executed_quantity_source": executed_quantity_source,
+        "fill_id": _dsff_v1_safe_text(fill_id, max_length=128) if is_trade else None,
+        "fill_time": fill_time,
+        "fill_quantity": fill_quantity,
+        "fill_quantity_unit": executed_quantity_unit if is_trade else None,
+        "fill_quantity_source": executed_quantity_source if is_trade else None,
+        "fill_price": fill_price,
+        "fill_fee": fill_fee,
+        "fill_realized_pnl": fill_realized_pnl,
+        "remaining_quantity_unit": remaining_quantity_unit,
+        "remaining_quantity_source": remaining_quantity_source,
+        "quantity_units_compatible": quantity_units_compatible,
+        "average_fill_price": _cq_patch_safe_float(_dsff_v1_first(
+            payload, info, "avgPrice", "averagePrice", "fillPrice", "average", "price",
+        ), None),
+        "close_position": _dsff_v1_safe_scalar(_dsff_v1_first(payload, info, "closePosition", "close_position", "closeAll")),
+        "reduce_only": _dsff_v1_safe_scalar(_dsff_v1_first(payload, info, "reduceOnly", "reduce_only")),
+        "created_at": _dsff_v1_safe_scalar(_dsff_v1_first(
+            payload, info, "datetime", "createTime", "createdTime", "created_at", "time",
+        )),
+        "triggered_at": _dsff_v1_safe_scalar(_dsff_v1_first(payload, info, "triggerTime", "triggeredTime", "triggered_at")),
+        "failed_at": _dsff_v1_safe_scalar(_dsff_v1_first(payload, info, "failTime", "failedTime", "failed_at")),
+        "canceled_at": _dsff_v1_safe_scalar(_dsff_v1_first(
+            payload, info, "cancelTime", "canceledTime", "cancelledTime", "canceled_at",
+        )),
+        "updated_at": _dsff_v1_safe_scalar(_dsff_v1_first(
+            payload, info, "lastUpdateTimestamp", "updateTime", "updatedTime", "filledTime", "timestamp", "time",
+        )),
+        "raw_payload_exposed": False,
+    }
+
+
+def _dsff_v1_related_to_stop(record, stop_order_id):
+    """Describe stop identity without silently collapsing plan and child IDs."""
+    if not isinstance(record, dict) or not stop_order_id:
+        return {
+            "related": False,
+            "conflict": False,
+            "matched_fields": [],
+            "conflicting_fields": [],
+            "role": "UNRELATED",
+        }
+    wanted = str(stop_order_id)
+    identity_fields = (
+        "order_id", "requested_order_id", "plan_order_id",
+        "trigger_order_id", "parent_order_id",
+    )
+    matched_fields = [
+        field for field in identity_fields
+        if str(record.get(field) or "") == wanted
+    ]
+    # ``trigger_order_id`` may legitimately point from the plan order to a
+    # different child execution.  It is a match when equal to the stop ID, but
+    # a different trigger ID is not by itself an identity conflict.  A
+    # conflicting requested/plan identity remains fail-closed.
+    order_id = str(record.get("order_id") or "")
+    requested_value = str(record.get("requested_order_id") or "")
+    plan_value = str(record.get("plan_order_id") or "")
+    conflicting_fields = []
+    if matched_fields:
+        # Querying an already-discovered child by its own ID is consistent
+        # with plan_order_id=stop.  It becomes conflicting only when the
+        # requested ID differs from both the stop and the returned order.
+        if requested_value and requested_value != wanted and requested_value != order_id:
+            conflicting_fields.append("requested_order_id")
+        if plan_value and plan_value != wanted:
+            conflicting_fields.append("plan_order_id")
+    conflict = bool(matched_fields and conflicting_fields)
+    if conflict:
+        role = "IDENTITY_CONFLICT"
+    elif order_id == wanted:
+        role = "STOP_ORDER"
+    elif any(field in matched_fields for field in (
+        "plan_order_id", "trigger_order_id", "parent_order_id",
+    )):
+        role = "DERIVED_ORDER"
+    elif "requested_order_id" in matched_fields:
+        # The exact lookup requested the plan ID but returned a different ID
+        # without any factual parent/plan/trigger linkage.  Preserve this as
+        # ambiguous evidence; never promote it to either plan or child.
+        role = "REQUESTED_STOP_RESPONSE_ID_DIFFERENT"
+    else:
+        role = "UNRELATED"
+    return {
+        "related": bool(matched_fields),
+        "conflict": conflict,
+        "matched_fields": matched_fields,
+        "conflicting_fields": conflicting_fields,
+        "role": role,
+    }
+
+
+def disaster_stop_failure_forensics_read_only(
+    symbol,
+    side=None,
+    stop_order_id=None,
+    entry_order_id=None,
+    manual_close_order_id=None,
+    client_order_id=None,
+    failure_timestamp=None,
+    manual_close_timestamp=None,
+    limit=1000,
+):
+    """Read bounded order/fill evidence without creating, cancelling or closing anything.
+
+    Private readers are deliberately ordered: exact raw orders, one bounded
+    ``allOrders`` call, exact derived orders, exact ``allFillOrders`` calls,
+    CCXT fallbacks only for insufficient raw sources, and finally position
+    exposure.  The shared CCXT instance provides ``enableRateLimit`` pacing.
+    """
+    sym = normalize_symbol(symbol)
+    api_symbol = bingx_api_symbol(sym)
+    limit = max(20, min(int(limit or 1000), 1000))
+    reported_anchor_timestamp = failure_timestamp or manual_close_timestamp
+    reported_anchor_epoch = _dsff_v1_epoch(reported_anchor_timestamp)
+    factual_anchor_timestamp = None
+    factual_anchor_epoch = None
+    history_window_basis = "UNAVAILABLE"
+    history_window_anchor_conflict = False
+    history_window_complete = False
+    since_ms = None
+    end_ms = None
+    reader_calls_attempted = []
+    reader_calls_completed = []
+    reader_calls_skipped_as_redundant = []
+    reader_errors = []
+    identity_filters = []
+    normalized = []
+    rate_limit_pacing_applied = False
+    raw_reader_metadata = {}
+
+    def compact_symbol(value):
+        return str(value or "").upper().replace("/", "").replace("-", "").replace(":USDT", "").strip()
+
+    expected_symbol = compact_symbol(sym)
+
+    def add_order(value, source, requested_id=None, record_kind="order", exact_fill_id=None):
+        if not isinstance(value, dict):
+            return None
+        row = _dsff_v1_normalize_order(
+            value,
+            source,
+            requested_order_id=requested_id,
+            record_kind=record_kind,
+        )
+        row_symbol = compact_symbol(row.get("symbol"))
+        if row_symbol and expected_symbol and row_symbol != expected_symbol:
+            identity_filters.append({
+                "source": str(source or "reader")[:120],
+                "reason": "SYMBOL_MISMATCH_FILTERED",
+            })
+            return None
+        if exact_fill_id and str(row.get("order_id") or "") != str(exact_fill_id):
+            identity_filters.append({
+                "source": str(source or "reader")[:120],
+                "reason": "ORDER_ID_MISMATCH_FILTERED",
+            })
+            return None
+        normalized.append(row)
+        return row
+
+    def raw_read(label, method_names, params):
+        nonlocal rate_limit_pacing_applied
+        try:
+            rows, attempts = _dsff_v1_call_raw(method_names, params)
+        except Exception as exc:
+            reader_errors.append({"source": label[:120], "error_type": type(exc).__name__})
+            return [], False
+        raw_reader_metadata[label] = [dict(item) for item in attempts if isinstance(item, dict)]
+        if not attempts:
+            reader_errors.append({"source": label[:120], "error_type": "RAW_GET_ALIAS_UNAVAILABLE"})
+            return [], False
+        successful = False
+        for attempt in attempts:
+            method = str(attempt.get("method") or "private_get")[:120]
+            call_label = f"{label}:{method}"[:240]
+            reader_calls_attempted.append(call_label)
+            rate_limit_pacing_applied = bool(
+                rate_limit_pacing_applied or attempt.get("rate_limit_pacing_applied")
+            )
+            if attempt.get("ok"):
+                successful = True
+                reader_calls_completed.append(call_label)
+            else:
+                error_record = {
+                    "source": call_label,
+                    "error_type": str(attempt.get("error_type") or "READER_ERROR")[:120],
+                }
+                if attempt.get("response_code") not in (None, ""):
+                    error_record["response_code"] = _dsff_v1_safe_text(
+                        attempt.get("response_code"), max_length=40
+                    )
+                reader_errors.append(error_record)
+        return rows, successful
+
+    def direct_ccxt_read(label, method_names, method_args):
+        """Invoke exactly one public CCXT reader and account for that call."""
+        nonlocal rate_limit_pacing_applied
+        try:
+            ex = exchange()
+        except Exception as exc:
+            reader_errors.append({"source": label[:120], "error_type": type(exc).__name__})
+            return None, False
+        selected = next(
+            (
+                (method_name, getattr(ex, method_name, None))
+                for method_name in method_names
+                if callable(getattr(ex, method_name, None))
+            ),
+            None,
+        )
+        if selected is None:
+            reader_errors.append({"source": label[:120], "error_type": "CCXT_READER_UNAVAILABLE"})
+            return None, False
+        method_name, method = selected
+        call_label = f"{label}:{method_name}"[:240]
+        reader_calls_attempted.append(call_label)
+        rate_limit_pacing_applied = bool(
+            rate_limit_pacing_applied or getattr(ex, "enableRateLimit", False)
+        )
+        try:
+            result = method(*tuple(method_args or ()))
+            reader_calls_completed.append(call_label)
+            return result, True
+        except Exception as exc:
+            reader_errors.append({"source": call_label, "error_type": type(exc).__name__})
+            return None, False
+
+    known_order_requests = []
+    for role, order_id in (
+        ("stop", stop_order_id),
+        ("entry", entry_order_id),
+        ("manual_close", manual_close_order_id),
+    ):
+        clean_id = str(order_id or "").strip()
+        if clean_id:
+            known_order_requests.append((role, clean_id))
+
+    exact_raw_sufficient = {}
+    exact_order_ids_seen = set()
+    for role, order_id in known_order_requests:
+        if order_id in exact_order_ids_seen:
+            reader_calls_skipped_as_redundant.append(f"exact_raw_order:{role}:duplicate_order_id")
+            continue
+        exact_order_ids_seen.add(order_id)
+        rows, successful = raw_read(
+            f"exact_raw_order:{role}",
+            ["swapV2PrivateGetTradeOrder", "swap_v2_private_get_trade_order"],
+            {"symbol": api_symbol, "orderId": order_id},
+        )
+        added = [
+            add_order(
+                item,
+                f"bingx.swap_v2.trade.order.{role}",
+                requested_id=order_id,
+            )
+            for item in rows
+        ]
+        exact_raw_sufficient[order_id] = bool(successful and any(added))
+
+    # The exact stop reader is the authoritative source for the historical
+    # anchor.  If the raw alias did not return a usable row, try one bounded
+    # exact CCXT lookup before considering any time-window reader.
+    wanted_stop = str(stop_order_id or "").strip()
+    if wanted_stop and not exact_raw_sufficient.get(wanted_stop):
+        payload, successful = direct_ccxt_read(
+            "ccxt_fetch_order:stop_anchor",
+            ("fetch_order",),
+            (wanted_stop, sym),
+        )
+        if successful:
+            added = add_order(
+                payload,
+                "bingx.ccxt.fetch_order.stop_anchor",
+                requested_id=wanted_stop,
+            )
+            exact_raw_sufficient[wanted_stop] = bool(added)
+
+    exact_stop_rows = [
+        row for row in normalized
+        if wanted_stop and str(row.get("order_id") or "").strip() == wanted_stop
+    ]
+    for field in ("failed_at", "canceled_at", "triggered_at", "updated_at", "created_at"):
+        for row in exact_stop_rows:
+            value = row.get(field)
+            epoch = _dsff_v1_epoch(value)
+            if epoch is not None:
+                factual_anchor_timestamp = value
+                factual_anchor_epoch = epoch
+                break
+        if factual_anchor_epoch is not None:
+            break
+    if factual_anchor_epoch is not None:
+        anchor = factual_anchor_epoch
+        history_window_basis = "FACTUAL_STOP_ORDER_TIMESTAMP"
+    elif reported_anchor_epoch is not None:
+        anchor = reported_anchor_epoch
+        history_window_basis = "REPORTED_OPERATOR_TIMESTAMP"
+    else:
+        anchor = None
+    history_window_anchor_conflict = bool(
+        factual_anchor_epoch is not None
+        and reported_anchor_epoch is not None
+        and abs(factual_anchor_epoch - reported_anchor_epoch) > 1.0
+    )
+    if anchor is not None:
+        since_ms = int(max(0.0, anchor - 86_400.0) * 1000)
+        end_ms = int((anchor + 86_400.0) * 1000)
+        history_window_complete = True
+    else:
+        reader_errors.append({
+            "source": "history_window",
+            "error_type": "HISTORY_WINDOW_ANCHOR_UNAVAILABLE",
+        })
+
+    all_orders_requested_limit = limit
+    if history_window_complete:
+        raw_orders, all_orders_successful = raw_read(
+            "bounded_raw_all_orders",
+            ["swapV2PrivateGetTradeAllOrders", "swap_v2_private_get_trade_all_orders"],
+            {
+                "symbol": api_symbol,
+                "limit": all_orders_requested_limit,
+                "startTime": since_ms,
+                "endTime": end_ms,
+            },
+        )
+    else:
+        raw_orders, all_orders_successful = [], False
+        reader_calls_skipped_as_redundant.append(
+            "bounded_raw_all_orders:history_window_unavailable"
+        )
+    all_orders_returned_count = len(raw_orders)
+    all_orders_saturated = bool(
+        history_window_complete
+        and all_orders_returned_count >= all_orders_requested_limit
+    )
+    all_orders_pagination_incomplete = any(
+        item.get("pagination_incomplete") is True
+        for item in raw_reader_metadata.get("bounded_raw_all_orders", [])
+    )
+    if all_orders_saturated:
+        reader_errors.append({
+            "source": "bounded_raw_all_orders",
+            "error_type": "ALL_ORDERS_RESULT_SATURATED",
+        })
+        all_orders_successful = False
+    if all_orders_pagination_incomplete:
+        reader_errors.append({
+            "source": "bounded_raw_all_orders",
+            "error_type": "ALL_ORDERS_PAGINATION_INCOMPLETE",
+        })
+        all_orders_successful = False
+    all_order_rows = []
+    for item in raw_orders:
+        row = add_order(item, "bingx.swap_v2.trade.all_orders")
+        if row is not None:
+            all_order_rows.append(row)
+
+    def exact_detail_is_sufficient(row, order_id):
+        return bool(
+            isinstance(row, dict)
+            and str(row.get("order_id") or "") == str(order_id or "")
+            and any(row.get(field) not in (None, "") for field in (
+                "status", "raw_status", "plan_status", "execute_status",
+                "requested_quantity", "executed_quantity", "created_at", "updated_at",
+            ))
+        )
+
+    for _role, known_id in known_order_requests:
+        if any(exact_detail_is_sufficient(row, known_id) for row in all_order_rows):
+            exact_raw_sufficient[known_id] = True
+
+    def collect_derived_ids():
+        found = []
+        seen_ids = set()
+        for row in normalized:
+            relation = _dsff_v1_related_to_stop(row, wanted_stop)
+            if relation.get("conflict"):
+                continue
+            row_id = str(row.get("order_id") or "").strip()
+            if row_id == wanted_stop:
+                candidates = (row.get("derived_order_id"), row.get("trigger_order_id"))
+            elif (
+                str(row.get("parent_order_id") or "") == wanted_stop
+                or str(row.get("plan_order_id") or "") == wanted_stop
+                or str(row.get("trigger_order_id") or "") == wanted_stop
+            ):
+                candidates = (row_id,)
+            else:
+                candidates = ()
+            for candidate in candidates:
+                clean = str(candidate or "").strip()
+                if clean and clean != wanted_stop and clean not in seen_ids:
+                    seen_ids.add(clean)
+                    found.append(clean)
+        return found
+
+    derived_order_ids = collect_derived_ids()
+    for derived_id in derived_order_ids:
+        if any(exact_detail_is_sufficient(row, derived_id) for row in all_order_rows):
+            exact_raw_sufficient[derived_id] = True
+        if derived_id in exact_order_ids_seen:
+            reader_calls_skipped_as_redundant.append("exact_raw_order:derived:duplicate_order_id")
+            continue
+        exact_order_ids_seen.add(derived_id)
+        rows, successful = raw_read(
+            "exact_raw_order:derived",
+            ["swapV2PrivateGetTradeOrder", "swap_v2_private_get_trade_order"],
+            {"symbol": api_symbol, "orderId": derived_id},
+        )
+        added = [
+            add_order(
+                item,
+                "bingx.swap_v2.trade.order.derived",
+                requested_id=derived_id,
+            )
+            for item in rows
+        ]
+        exact_raw_sufficient[derived_id] = bool(
+            exact_raw_sufficient.get(derived_id) or (successful and any(added))
+        )
+
+    # A derived detail may expose a factual child ID not present in allOrders.
+    for derived_id in collect_derived_ids():
+        if derived_id not in derived_order_ids:
+            derived_order_ids.append(derived_id)
+
+    fill_order_ids = []
+    fill_ids_seen = set()
+    for order_id in [
+        str(stop_order_id or "").strip(),
+        str(manual_close_order_id or "").strip(),
+        str(entry_order_id or "").strip(),
+        *derived_order_ids,
+    ]:
+        if not order_id:
+            continue
+        if order_id in fill_ids_seen:
+            reader_calls_skipped_as_redundant.append("exact_raw_fill:duplicate_order_id")
+            continue
+        fill_ids_seen.add(order_id)
+        fill_order_ids.append(order_id)
+
+    exact_fill_sources_sufficient = True
+    if not fill_order_ids:
+        reader_calls_skipped_as_redundant.append("all_fill_orders_without_order_id:security_skip")
+        exact_fill_sources_sufficient = False
+    if fill_order_ids and not history_window_complete:
+        reader_calls_skipped_as_redundant.append(
+            "all_fill_orders:history_window_unavailable"
+        )
+        exact_fill_sources_sufficient = False
+    for order_id in (fill_order_ids if history_window_complete else []):
+        rows, successful = raw_read(
+            "exact_raw_fill",
+            [
+                "swapV2PrivateGetTradeAllFillOrders",
+                "swap_v2_private_get_trade_all_fill_orders",
+                "swapV2PrivateGetTradeAllfillorders",
+            ],
+            {
+                "tradingUnit": "COIN",
+                "startTs": since_ms,
+                "endTs": end_ms,
+                "orderId": order_id,
+            },
+        )
+        exact_fill_sources_sufficient = bool(exact_fill_sources_sufficient and successful)
+        for item in rows:
+            add_order(
+                item,
+                "bingx.swap_v2.trade.all_fill_orders",
+                requested_id=order_id,
+                record_kind="trade",
+                exact_fill_id=order_id,
+            )
+
+    # Raw exact detail is preferred.  Fallbacks call one public CCXT method
+    # directly; the legacy fetch_order_by_id helper is intentionally not used
+    # because it fans out to fetch_order, another raw order request and three
+    # recent-order readers internally.
+    fallback_order_requests = list(known_order_requests)
+    fallback_order_requests.extend(("derived", item) for item in derived_order_ids)
+    fallback_seen = set()
+    for role, order_id in fallback_order_requests:
+        if order_id in fallback_seen:
+            reader_calls_skipped_as_redundant.append(f"ccxt_fetch_order:{role}:duplicate_order_id")
+            continue
+        fallback_seen.add(order_id)
+        if exact_raw_sufficient.get(order_id):
+            reader_calls_skipped_as_redundant.append(f"ccxt_fetch_order:{role}:raw_source_sufficient")
+            continue
+        payload, successful = direct_ccxt_read(
+            f"ccxt_fetch_order:{role}",
+            ("fetch_order",),
+            (order_id, sym),
+        )
+        if successful:
+            add_order(
+                payload,
+                f"bingx.ccxt.fetch_order.{role}",
+                requested_id=order_id,
+            )
+
+    if all_orders_successful:
+        reader_calls_skipped_as_redundant.append("fetch_recent_orders:raw_all_orders_sufficient")
+    elif history_window_complete:
+        recent_orders, successful = direct_ccxt_read(
+            "ccxt_orders_fallback",
+            ("fetch_orders", "fetch_closed_orders", "fetch_open_orders"),
+            (sym, since_ms, limit),
+        )
+        if successful:
+            for item in recent_orders or []:
+                add_order(item, "bingx.ccxt.orders_fallback")
+    else:
+        reader_calls_skipped_as_redundant.append(
+            "ccxt_orders_fallback:history_window_unavailable"
+        )
+
+    if client_order_id and not entry_order_id:
+        client_match_found = any(
+            str(row.get("client_order_id") or "") == str(client_order_id)
+            for row in normalized
+        )
+        reader_calls_skipped_as_redundant.append(
+            "entry_client:bounded_order_source_match"
+            if client_match_found
+            else "entry_client:no_match_no_additional_reader"
+        )
+
+    if fill_order_ids and exact_fill_sources_sufficient:
+        reader_calls_skipped_as_redundant.append("ccxt_fetch_my_trades:raw_exact_fills_sufficient")
+    elif fill_order_ids and history_window_complete:
+        recent_trades, successful = direct_ccxt_read(
+            "ccxt_fetch_my_trades",
+            ("fetch_my_trades",),
+            (sym, since_ms, limit),
+        )
+        if successful:
+            for item in recent_trades or []:
+                row = _dsff_v1_normalize_order(item, "bingx.fetch_my_trades", record_kind="trade")
+                if str(row.get("order_id") or "") in fill_ids_seen:
+                    add_order(item, "bingx.fetch_my_trades", record_kind="trade")
+                else:
+                    identity_filters.append({
+                        "source": "bingx.fetch_my_trades",
+                        "reason": "ORDER_ID_MISMATCH_FILTERED",
+                    })
+    elif fill_order_ids:
+        reader_calls_skipped_as_redundant.append(
+            "ccxt_fetch_my_trades:history_window_unavailable"
+        )
+
+    position = None
+    if sym and side:
+        position_rows, successful = direct_ccxt_read(
+            "ccxt_fetch_positions",
+            ("fetch_positions",),
+            ([sym],),
+        )
+        if successful:
+            wanted_side = str(side or "").upper().strip()
+            wanted_side = "LONG" if wanted_side in {"BUY", "LONG"} else "SHORT"
+            matched_count = 0
+            total_amount = 0.0
+            for item in position_rows or []:
+                if not isinstance(item, dict):
+                    continue
+                info = item.get("info") if isinstance(item.get("info"), dict) else {}
+                row_symbol = _dsff_v1_first(item, info, "symbol", "contract")
+                if row_symbol and compact_symbol(row_symbol) != expected_symbol:
+                    continue
+                row_side = str(_dsff_v1_first(
+                    item, info, "positionSide", "position_side", "side", "posSide",
+                ) or "").upper().strip()
+                row_side = "LONG" if row_side in {"BUY", "LONG"} else ("SHORT" if row_side in {"SELL", "SHORT"} else "")
+                if row_side and row_side != wanted_side:
+                    continue
+                amount = _cq_patch_safe_float(_dsff_v1_first(
+                    item, info, "contracts", "positionAmt", "positionAmount", "amount", "availableAmt",
+                ), 0.0)
+                amount = abs(float(amount or 0.0))
+                if amount <= 0:
+                    continue
+                matched_count += 1
+                total_amount += amount
+            position = {
+                "ok": True,
+                "status": "POSITION_CLOSED" if total_amount <= 0 else "POSITION_MATCHED",
+                "symbol": sym,
+                "side": wanted_side,
+                "amount": total_amount,
+                "position_closed": total_amount <= 0,
+                "matched_count": matched_count,
+                "read_only": True,
+                "sent": False,
+                "ownership_safe": False,
+                "ownership_basis": "SYMBOL_SIDE_EXPOSURE_ONLY",
+            }
+
+    # Fallback evidence can reveal a relationship omitted by the raw source
+    # (for example, a triggerOrderId retained only in the unified payload).
+    # Recompute the bounded identity set for classification, but do not launch
+    # a second reader cascade.
+    for derived_id in collect_derived_ids():
+        if derived_id not in derived_order_ids:
+            derived_order_ids.append(derived_id)
+
+    deduplicated = []
+    seen = set()
+    for row in normalized:
+        key = (
+            row.get("source"), row.get("order_id"), row.get("requested_order_id"),
+            row.get("plan_order_id"), row.get("raw_status"), row.get("status"),
+            row.get("fill_id"), row.get("fill_time"), row.get("executed_quantity"),
+            row.get("updated_at"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(row)
+
+    def with_relation(row, relation):
+        projected = dict(row)
+        projected["stop_identity_related"] = bool(relation.get("related"))
+        projected["stop_identity_conflict"] = bool(relation.get("conflict"))
+        projected["stop_identity_matched_fields"] = list(relation.get("matched_fields") or [])
+        projected["stop_identity_conflicting_fields"] = list(relation.get("conflicting_fields") or [])
+        projected["stop_identity_role"] = relation.get("role")
+        return projected
+
+    stop_rows = []
+    derived_rows = []
+    identity_conflicts = []
+    identity_ambiguous = []
+    derived_id_set = set(derived_order_ids)
+    for row in deduplicated:
+        relation = _dsff_v1_related_to_stop(row, wanted_stop)
+        row_id = str(row.get("order_id") or "")
+        role_collision = (
+            relation.get("role") == "DERIVED_ORDER"
+            and row_id != wanted_stop
+            and (
+                (manual_close_order_id and row_id == str(manual_close_order_id))
+                or (entry_order_id and row_id == str(entry_order_id))
+            )
+        )
+        if role_collision:
+            relation = dict(relation)
+            relation["conflict"] = True
+            relation["role"] = "IDENTITY_CONFLICT"
+            relation["conflicting_fields"] = list(relation.get("conflicting_fields") or []) + [
+                "manual_close_order_id"
+                if manual_close_order_id and row_id == str(manual_close_order_id)
+                else "entry_order_id"
+            ]
+        if relation.get("conflict"):
+            identity_conflicts.append(with_relation(row, relation))
+            # Conflicting identity is preserved only as diagnostic evidence.
+            # It must never become a factual plan/child row or drive outcome.
+            continue
+        if relation.get("role") == "REQUESTED_STOP_RESPONSE_ID_DIFFERENT":
+            identity_ambiguous.append(with_relation(row, relation))
+        if relation.get("role") == "STOP_ORDER" and row_id == wanted_stop:
+            stop_rows.append(with_relation(row, relation))
+            continue
+        factual_derived = bool(
+            row_id
+            and row_id != wanted_stop
+            and (
+                relation.get("role") == "DERIVED_ORDER"
+                or row_id in derived_id_set
+                or str(row.get("parent_order_id") or "") == wanted_stop
+                or str(row.get("plan_order_id") or "") == wanted_stop
+                or str(row.get("trigger_order_id") or "") == wanted_stop
+            )
+        )
+        if factual_derived:
+            derived_rows.append(with_relation(row, relation))
+
+    factual_stop_ids = {
+        str(row.get("order_id")) for row in stop_rows if row.get("order_id") not in (None, "")
+    }
+    if factual_stop_ids:
+        derived_rows = [
+            row for row in derived_rows
+            if str(row.get("order_id") or "") not in factual_stop_ids
+        ]
+    factual_derived_ids = {
+        str(row.get("order_id")) for row in derived_rows if row.get("order_id") not in (None, "")
+    }
+
+    entry_rows = [
+        row for row in deduplicated
+        if (entry_order_id and str(row.get("order_id") or "") == str(entry_order_id))
+        or (client_order_id and str(row.get("client_order_id") or "") == str(client_order_id))
+    ]
+    manual_close_rows = [
+        row for row in deduplicated
+        if manual_close_order_id and str(row.get("order_id") or "") == str(manual_close_order_id)
+    ]
+    return {
+        "ok": bool(stop_rows or derived_rows or entry_rows or manual_close_rows or (isinstance(position, dict) and position.get("ok"))),
+        "status": "READ_ONLY_LOOKUP_COMPLETE" if not reader_errors else "READ_ONLY_LOOKUP_PARTIAL",
+        "version": FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_VERSION,
+        "read_only": True,
+        "sent": False,
+        "cancel_called": False,
+        "close_called": False,
+        "position_modified": False,
+        "symbol": sym,
+        "stop_order_id": str(stop_order_id) if stop_order_id not in (None, "") else None,
+        "entry_order_id": str(entry_order_id) if entry_order_id not in (None, "") else None,
+        "manual_close_order_id": str(manual_close_order_id) if manual_close_order_id not in (None, "") else None,
+        "all_orders_params_contract": ["symbol", "limit", "startTime", "endTime"],
+        "all_orders_requested_limit": all_orders_requested_limit,
+        "all_orders_returned_count": all_orders_returned_count,
+        "all_orders_saturated": all_orders_saturated,
+        "all_orders_pagination_incomplete": all_orders_pagination_incomplete,
+        "all_fill_orders_params_contract": ["tradingUnit", "startTs", "endTs", "orderId"],
+        "all_fill_orders_trading_unit": "COIN",
+        "history_window_basis": history_window_basis,
+        "history_window_start": since_ms,
+        "history_window_end": end_ms,
+        "factual_anchor_timestamp": _dsff_v1_safe_scalar(factual_anchor_timestamp),
+        "reported_anchor_timestamp": _dsff_v1_safe_scalar(reported_anchor_timestamp),
+        "history_window_anchor_conflict": history_window_anchor_conflict,
+        "history_window_complete": history_window_complete,
+        "reader_calls": list(reader_calls_attempted),
+        "reader_calls_attempted": reader_calls_attempted,
+        "reader_calls_completed": reader_calls_completed,
+        "reader_calls_skipped_as_redundant": reader_calls_skipped_as_redundant,
+        "reader_calls_attempted_count": len(reader_calls_attempted),
+        "reader_calls_completed_count": len(reader_calls_completed),
+        "reader_calls_skipped_as_redundant_count": len(reader_calls_skipped_as_redundant),
+        "rate_limit_pacing_applied": rate_limit_pacing_applied,
+        "rate_limit_pacing_source": "CCXT_ENABLE_RATE_LIMIT_SHARED_EXCHANGE",
+        "reader_errors": reader_errors[:100],
+        "identity_filters": identity_filters[:100],
+        "stop_orders": stop_rows,
+        "plan_orders": list(stop_rows),
+        "derived_orders": derived_rows,
+        "stop_order_ids": sorted(factual_stop_ids),
+        "derived_order_ids": sorted(factual_derived_ids),
+        "stop_derived_order_ids_disjoint": factual_stop_ids.isdisjoint(factual_derived_ids),
+        "entry_orders": entry_rows,
+        "manual_close_orders": manual_close_rows,
+        "identity_conflicts": identity_conflicts,
+        "identity_ambiguous": identity_ambiguous,
+        "position": position,
+        "raw_payload_exposed": False,
+    }
+
+
 def _rpm_live_write_enabled():
     return EXECUTION_MODE == "LIVE" and ENABLE_REAL_TRADING is True and BROKER_DRY_RUN is False
 

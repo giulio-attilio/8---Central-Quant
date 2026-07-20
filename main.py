@@ -50979,6 +50979,3979 @@ def falcon_manual_close_diagnostic_v1_text_route():
 
 
 # ============================================================================
+# FALCON DISASTER STOP TRIGGER FAILURE FORENSICS V1 - READ ONLY
+# ============================================================================
+FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_VERSION = "2026-07-19-FALCON-DISASTER-STOP-FAILURE-FORENSICS-V1"
+FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_ACK = "FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1"
+_FDSFF_V1_QUERY_FIELDS = (
+    "stop_order_id", "entry_order_id", "manual_close_order_id", "lifecycle_id", "client_order_id",
+    "symbol", "side", "failure_timestamp", "manual_close_timestamp",
+    "manual_close_price", "manual_close_quantity", "manual_close_value_usdt",
+    "manual_close_gross_pnl_usdt", "manual_close_fee_usdt", "close_reason",
+)
+_FDSFF_V1_LOCAL_LIMIT = 300
+_FDSFF_V1_MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
+_FDSFF_V1_ORDER_FIELDS = (
+    "source", "record_kind", "event", "order_id", "requested_order_id", "plan_order_id",
+    "client_order_id", "parent_order_id", "trigger_order_id", "derived_order_id",
+    "entry_order_id", "stop_order_id", "manual_close_order_id",
+    "lifecycle_id", "trade_id", "bot", "external_position", "symbol", "side", "position_side", "type",
+    "stop_identity_related", "stop_identity_conflict", "stop_identity_role",
+    "plan_type", "order_type", "trigger_order_type", "trigger_type", "working_type",
+    "status", "raw_status", "plan_status", "execute_status", "failure_status",
+    "failure_code", "failure_reason", "trigger_price", "stop_price",
+    "requested_quantity", "executed_quantity", "remaining_quantity",
+    "quantity_unit", "quantity_source", "requested_quantity_unit",
+    "requested_quantity_source", "executed_quantity_unit", "executed_quantity_source",
+    "fill_id", "fill_time", "fill_quantity", "fill_quantity_unit",
+    "fill_quantity_source", "fill_price", "fill_fee", "fill_realized_pnl",
+    "average_fill_price", "close_position", "reduce_only", "created_at",
+    "triggered_at", "failed_at", "canceled_at", "filled_at", "executed_at",
+    "closed_at", "updated_at",
+    "operational_correlation_role", "operational_correlation_basis",
+    "operational_correlation_conflict", "failsafe_close_order_id",
+    "failsafe_reason", "failsafe_sent", "failsafe_confirmed", "failsafe_status",
+    "failsafe_timestamp", "failsafe_amount", "failsafe_expected_position_amount",
+    "operational_correlation_quantity_basis", "incident_reported_quantity",
+    "failsafe_order_sent", "failsafe_execution_confirmed",
+    "failsafe_filled_amount", "failsafe_remaining_amount",
+    "failsafe_timestamp_source_field", "failsafe_timestamp_basis",
+    "failsafe_timestamp_precision", "failsafe_timestamp_epoch_start",
+    "failsafe_timestamp_epoch_end", "failsafe_timestamp_timezone_basis",
+    "failsafe_timestamp_evidence_conflict", "failsafe_attempt_inside_incident_window",
+    "failsafe_timing_basis", "failsafe_timing_conflict", "failure_phase",
+    "failsafe_incident_time_relation", "failsafe_interval_fully_inside",
+    "failsafe_overlaps_start_boundary", "failsafe_overlaps_end_boundary",
+    "failsafe_clock_skew_tolerance_only",
+    "timestamp", "ts", "epoch", "epoch_ms",
+)
+
+
+def _fdsff_v1_response_headers():
+    """Return fixed anti-cache headers for every private forensic response."""
+    return {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def _fdsff_v1_text_value(value, max_length=256):
+    if value is None:
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if not text:
+        return None
+    return text[:max(1, int(max_length))]
+
+
+def _fdsff_v1_bool(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
+def _fdsff_v1_admin_auth():
+    """Adapt the existing execution header-token guard without exposing credentials."""
+    try:
+        query_keys = {str(key or "").lower() for key in getattr(request, "args", {}).keys()}
+    except Exception:
+        query_keys = set()
+    if any("token" in key or "authorization" in key or key in {"auth", "api_key", "apikey"} for key in query_keys):
+        return {
+            "available": True,
+            "authenticated": False,
+            "status": "ADMIN_AUTH_REQUIRED",
+        }
+    resolver = globals().get("_ee_auth_resolver_v1_resolve")
+    if not callable(resolver):
+        return {
+            "available": False,
+            "authenticated": False,
+            "status": "ADMIN_AUTH_GUARD_UNAVAILABLE",
+        }
+    try:
+        resolved = resolver(allow_env_fallback=False)
+    except Exception:
+        return {
+            "available": False,
+            "authenticated": False,
+            "status": "ADMIN_AUTH_GUARD_UNAVAILABLE",
+        }
+    resolved = resolved if isinstance(resolved, dict) else {}
+    resolver_status = str(resolved.get("status") or "").upper().strip()
+    configured = resolved.get("configured") is not False
+    if not configured or resolver_status == "MISSING_CONFIGURED_EXECUTION_AUTH_TOKEN":
+        return {
+            "available": False,
+            "authenticated": False,
+            "status": "ADMIN_AUTH_GUARD_UNAVAILABLE",
+        }
+    matched_source = str(resolved.get("matched_source") or "")
+    authenticated = bool(resolved.get("ok") and matched_source.startswith("request.headers."))
+    return {
+        "available": True,
+        "authenticated": authenticated,
+        "status": "ADMIN_AUTH_OK" if authenticated else "ADMIN_AUTH_REQUIRED",
+    }
+
+
+def _fdsff_v1_extract_query(args):
+    args = args if args is not None else {}
+    query = {}
+    for field in _FDSFF_V1_QUERY_FIELDS:
+        value = _fdsff_v1_text_value(args.get(field))
+        if value is None:
+            continue
+        safe_value = _fdsff_v1_safe_scalar(value, 256)
+        if safe_value == "REDACTED_SENSITIVE_VALUE":
+            query[field] = safe_value
+            continue
+        if field == "symbol":
+            value = _flad_v1_norm_symbol(value)
+        elif field == "side":
+            value = _flad_v1_norm_side(value)
+        query[field] = value
+    live_lookup_requested = _fdsff_v1_bool(args.get("live_lookup"))
+    ack_ok = bool(
+        live_lookup_requested
+        and str(args.get("ack") or "").strip() == FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_ACK
+    )
+    return {
+        "query": query,
+        "query_param_keys": [field for field in _FDSFF_V1_QUERY_FIELDS if field in args],
+        "live_lookup_requested": live_lookup_requested,
+        "live_lookup_ack_ok": ack_ok,
+    }
+
+
+def _fdsff_v1_safe_scalar(value, max_length=500):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    lowered = text.lower()
+    looks_like_absolute_path = bool(
+        text.startswith(("/", "\\"))
+        or (len(text) >= 3 and text[1] == ":" and text[2] in {"/", "\\"})
+    )
+    if looks_like_absolute_path or any(token in lowered for token in (
+        "api_key", "apikey", "apisecret", "x-bx-apikey", "signature=",
+        "authorization:", "authorization=", "bearer ", "secret=", "secret:",
+        "token=", "token:", "access_token", "cookie:", "c:\\", "c:/",
+        "/data/", "/home/", "/opt/", "/var/",
+    )):
+        return "REDACTED_SENSITIVE_VALUE"
+    return text[:max(1, int(max_length))]
+
+
+def _fdsff_v1_walk_dicts(record, max_depth=4, max_dicts=100):
+    if not isinstance(record, dict):
+        return []
+    out = []
+    queue = [(record, 0)]
+    seen = set()
+    while queue and len(out) < max_dicts:
+        current, depth = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(current)
+        if depth >= max_depth:
+            continue
+        for key, value in current.items():
+            if str(key).lower() in {"raw", "headers", "request", "response"}:
+                continue
+            if isinstance(value, dict):
+                queue.append((value, depth + 1))
+    return out
+
+
+def _fdsff_v1_first(record, *keys):
+    for current in _fdsff_v1_walk_dicts(record):
+        for key in keys:
+            value = current.get(key)
+            if value not in (None, "") and not isinstance(value, (dict, list, tuple, set)):
+                return value
+    return None
+
+
+def _fdsff_v1_event_name(record):
+    event = _fdsff_v1_first(record, "event", "event_type", "type", "action")
+    if str(event or "").upper() == "HISTORY_ROTATION_PRESERVED_CRITICAL_EVENT":
+        event = _fdsff_v1_first(record, "original_event") or event
+    return str(event or "").upper().strip()
+
+
+def _fdsff_v1_safe_record(record, source):
+    record = record if isinstance(record, dict) else {}
+    event = _fdsff_v1_event_name(record)
+    generic_order_id = _fdsff_v1_first(record, "order_id", "orderId", "id")
+    auxiliary_context = any(token in event for token in (
+        "FAILSAFE", "MANAGED_CLOSE", "MANUAL_CLOSE", "ALERT", "VERIFICATION_BLOCKED", "ANOMALY",
+    ))
+    stop_context = not auxiliary_context and ("DISASTER_STOP" in event or event.startswith("STOP_"))
+    entry_context = not auxiliary_context and any(token in event for token in (
+        "ENTRY", "LIVE_SENT", "ORDER_SENT", "POSITION_OPEN",
+    ))
+    stop_order_id = _fdsff_v1_first(
+        record, "stop_order_id", "broker_stop_order_id", "disaster_stop_order_id",
+    )
+    entry_order_id = _fdsff_v1_first(
+        record, "entry_order_id", "live_order_id", "broker_order_id", "bingx_order_id",
+    )
+    manual_close_order_id = _fdsff_v1_first(
+        record, "manual_close_order_id", "close_order_id", "manual_order_id",
+    )
+    if stop_context and stop_order_id in (None, ""):
+        stop_order_id = generic_order_id
+    elif entry_context and entry_order_id in (None, ""):
+        entry_order_id = generic_order_id
+    raw_side = _fdsff_v1_first(record, "side", "order_side", "direction")
+    raw_position_side = _fdsff_v1_first(record, "position_side", "positionSide")
+    requested_quantity = _fdsff_v1_first(
+        record, "requested_quantity", "amount", "quantity", "qty", "initial_qty", "origQty",
+    )
+    executed_quantity = _fdsff_v1_first(
+        record, "executed_quantity", "filled", "executedQty", "filledQty", "closed_quantity",
+    )
+    safe = {
+        "source": str(source or "local")[:120],
+        "record_kind": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "record_kind", "recordKind",
+        ), 32),
+        "event": event or None,
+        "order_id": _fdsff_v1_safe_scalar(generic_order_id, 128),
+        "requested_order_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "requested_order_id", "requestedOrderId",
+        ), 128),
+        "plan_order_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "plan_order_id", "planOrderId",
+        ), 128),
+        "stop_order_id": _fdsff_v1_safe_scalar(stop_order_id, 128),
+        "entry_order_id": _fdsff_v1_safe_scalar(entry_order_id, 128),
+        "manual_close_order_id": _fdsff_v1_safe_scalar(manual_close_order_id, 128),
+        "client_order_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "client_order_id", "clientOrderId", "clientOrderID", "live_client_order_id", "client_tag",
+        ), 128),
+        "parent_order_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "parent_order_id", "parentOrderId", "sourceOrderId",
+        ), 128),
+        "trigger_order_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "trigger_order_id", "triggerOrderId",
+        ), 128),
+        "derived_order_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "derived_order_id", "derivedOrderId", "childOrderId", "executeOrderId",
+        ), 128),
+        "lifecycle_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "lifecycle_id"), 256),
+        "trade_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "trade_id", "trade_registry_id"), 256),
+        "bot": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "bot", "owner_bot", "robot"), 64),
+        "external_position": _fdsff_v1_first(record, "external_position", "is_external_position"),
+        "symbol": _flad_v1_norm_symbol(_fdsff_v1_first(record, "symbol", "market_symbol", "pair")),
+        "side": _fdsff_v1_safe_scalar(str(raw_side).upper().strip() if raw_side not in (None, "") else None, 16),
+        "position_side": _fdsff_v1_safe_scalar(
+            _flad_v1_norm_side(raw_position_side) if raw_position_side not in (None, "") else None,
+            16,
+        ),
+        "type": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "execution_type", "type"), 64),
+        "plan_type": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "plan_type", "planType"), 64),
+        "order_type": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "order_type", "orderType"), 64),
+        "trigger_order_type": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "trigger_order_type", "triggerOrderType"), 64),
+        "trigger_type": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "trigger_type", "triggerType"), 64),
+        "working_type": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "working_type", "workingType"), 64),
+        "status": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "status", "order_status"), 64),
+        "raw_status": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "raw_status", "rawStatus"), 64),
+        "plan_status": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "plan_status", "planStatus"), 64),
+        "execute_status": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "execute_status", "executeStatus"), 64),
+        "failure_status": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "failure_status", "failureStatus"), 64),
+        "stop_identity_related": _fdsff_v1_first(record, "stop_identity_related"),
+        "stop_identity_conflict": _fdsff_v1_first(record, "stop_identity_conflict"),
+        "stop_identity_role": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "stop_identity_role"), 80),
+        "failure_code": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "failure_code", "failureCode", "failCode", "rejectCode", "errorCode",
+        ), 120),
+        "failure_reason": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "failure_reason", "failureReason", "failReason", "rejectReason", "errorMessage",
+        ), 500),
+        "diagnostic_reason": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "diagnostic_reason", "reason", "stop_anomaly_reason", "failsafe_block_reason", "block_reason",
+        ), 500),
+        "position_still_open_after_failure": _fdsff_v1_first(
+            record, "position_still_open_after_failure", "position_was_still_open_after_failure",
+        ),
+        "position_qty": _fdsff_v1_first(record, "position_qty", "broker_position_qty"),
+        "failsafe_attempted": _fdsff_v1_first(record, "failsafe_attempted", "close_attempted"),
+        "failsafe_executed": _fdsff_v1_first(record, "failsafe_executed", "close_executed"),
+        "failsafe_decision": _fdsff_v1_first(record, "failsafe_decision", "decision"),
+        "failsafe_block_reason": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "failsafe_block_reason", "block_reason",
+        ), 500),
+        "ownership_status": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "ownership_status", "entry_ownership_status",
+        ), 120),
+        "critical_alert_attempted": _fdsff_v1_first(record, "critical_alert_attempted"),
+        # ``alert_sent`` is intentionally not an alias: it is generic and does
+        # not prove transport or delivery of this critical stop alert.
+        "telegram_sent": _fdsff_v1_first(record, "telegram_sent"),
+        "critical_alert_transport_called": _fdsff_v1_first(
+            record, "critical_alert_transport_called", "telegram_transport_called", "transport_called",
+        ),
+        "alert_suppressed": _fdsff_v1_first(record, "alert_suppressed", "suppressed"),
+        "alert_status": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "alert_status", "falcon_management_spam_guard_status", "spam_guard_status",
+        ), 120),
+        "alert_block_reason": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "alert_block_reason", "falcon_management_spam_guard_last_reason",
+        ), 500),
+        "alert_suppressed_count": _fdsff_v1_first(
+            record, "alert_suppressed_count", "falcon_management_spam_guard_suppressed_count",
+        ),
+        "alert_last_suppressed_at": _fdsff_v1_first(
+            record, "alert_last_suppressed_at", "falcon_management_spam_guard_last_suppressed_at",
+        ),
+        "error_type": _fdsff_v1_safe_scalar(_fdsff_v1_first(record, "error_type"), 120),
+        "trigger_price": _fdsff_v1_first(record, "trigger_price", "triggerPrice"),
+        "stop_price": _fdsff_v1_first(record, "stop_price", "stopPrice", "stop_loss_price", "stopLossPrice"),
+        "requested_quantity": requested_quantity,
+        "executed_quantity": executed_quantity,
+        "remaining_quantity": _fdsff_v1_first(record, "remaining_quantity", "remaining", "remainingQty"),
+        "quantity_unit": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "quantity_unit", "quantityUnit", "tradingUnit",
+        ), 32),
+        "quantity_source": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "quantity_source", "quantitySource",
+        ), 120),
+        "requested_quantity_unit": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "requested_quantity_unit", "requestedQuantityUnit",
+        ), 32),
+        "requested_quantity_source": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "requested_quantity_source", "requestedQuantitySource",
+        ), 120),
+        "executed_quantity_unit": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "executed_quantity_unit", "executedQuantityUnit",
+        ), 32),
+        "executed_quantity_source": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "executed_quantity_source", "executedQuantitySource",
+        ), 120),
+        "fill_id": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "fill_id", "fillId", "fillID", "tradeId", "tradeID",
+        ), 128),
+        "fill_time": _fdsff_v1_first(
+            record, "fill_time", "fillTime", "filledTime", "tradeTime",
+        ),
+        "fill_quantity": _fdsff_v1_first(
+            record, "fill_quantity", "fillQuantity", "volume",
+        ),
+        "fill_quantity_unit": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "fill_quantity_unit", "fillQuantityUnit", "tradingUnit",
+        ), 32),
+        "fill_quantity_source": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "fill_quantity_source", "fillQuantitySource",
+        ), 120),
+        "fill_price": _fdsff_v1_first(record, "fill_price", "fillPrice"),
+        "fill_fee": _fdsff_v1_first(record, "fill_fee", "fillFee", "fee", "commission"),
+        "fill_realized_pnl": _fdsff_v1_first(
+            record, "fill_realized_pnl", "realizedPnl", "realizedPNL", "realizedProfit",
+        ),
+        "average_fill_price": _fdsff_v1_first(record, "average_fill_price", "average", "avgPrice", "fillPrice"),
+        "close_position": _fdsff_v1_first(record, "close_position", "closePosition"),
+        "reduce_only": _fdsff_v1_first(record, "reduce_only", "reduceOnly"),
+        "created_at": _fdsff_v1_first(record, "created_at", "createTime", "createdTime"),
+        "triggered_at": _fdsff_v1_first(record, "triggered_at", "triggerTime", "triggeredTime"),
+        "failed_at": _fdsff_v1_first(record, "failed_at", "failTime", "failedTime"),
+        "canceled_at": _fdsff_v1_first(record, "canceled_at", "cancelTime", "canceledTime", "cancelledTime"),
+        "filled_at": _fdsff_v1_first(record, "filled_at", "filledTime", "fillTime", "tradeTime"),
+        "executed_at": _fdsff_v1_first(record, "executed_at", "executeTime", "executedTime"),
+        "closed_at": _fdsff_v1_first(record, "closed_at", "closeTime", "closedTime"),
+        "updated_at": _fdsff_v1_first(record, "updated_at", "updateTime", "timestamp", "ts"),
+        "timestamp": _fdsff_v1_first(record, "timestamp"),
+        "ts": _fdsff_v1_first(record, "ts"),
+        "epoch": _fdsff_v1_first(record, "epoch"),
+        "epoch_ms": _fdsff_v1_first(record, "epoch_ms"),
+        "failure_phase": _fdsff_v1_safe_scalar(_fdsff_v1_first(
+            record, "failure_phase", "failurePhase",
+        ), 80),
+    }
+    projected = {key: _fdsff_v1_safe_scalar(value) for key, value in safe.items() if value not in (None, "")}
+    for field in ("stop_identity_matched_fields", "stop_identity_conflicting_fields"):
+        values = record.get(field) if isinstance(record.get(field), (list, tuple, set)) else []
+        cleaned = [
+            _fdsff_v1_safe_scalar(value, 80)
+            for value in list(values)[:20]
+            if _fdsff_v1_safe_scalar(value, 80) not in (None, "")
+        ]
+        if cleaned:
+            projected[field] = cleaned
+    return projected
+
+
+def _fdsff_v1_matches(record, query):
+    if not isinstance(record, dict) or not isinstance(query, dict):
+        return False
+    safe = _fdsff_v1_safe_record(record, "match")
+    if safe.get("stop_identity_conflict") is True or str(safe.get("stop_identity_role") or "").upper() == "IDENTITY_CONFLICT":
+        return False
+    record_bot = str(safe.get("bot") or "").upper().strip()
+    if record_bot and record_bot != "FALCON":
+        return False
+    if safe.get("external_position") is True:
+        return False
+    exact_stop = bool(
+        query.get("stop_order_id")
+        and str(query.get("stop_order_id")) in {
+            str(safe.get("stop_order_id") or ""), str(safe.get("order_id") or ""),
+            str(safe.get("requested_order_id") or ""), str(safe.get("plan_order_id") or ""),
+            str(safe.get("trigger_order_id") or ""),
+        }
+    )
+    exact_entry = bool(
+        query.get("entry_order_id")
+        and str(query.get("entry_order_id")) in {
+            str(safe.get("entry_order_id") or ""), str(safe.get("order_id") or ""),
+        }
+    )
+    exact_manual_close = bool(
+        query.get("manual_close_order_id")
+        and str(query.get("manual_close_order_id")) in {
+            str(safe.get("manual_close_order_id") or ""),
+            str(safe.get("order_id") or "") if "MANUAL_CLOSE" in str(safe.get("event") or "").upper() else "",
+        }
+    )
+    exact_order_role = bool(exact_stop or exact_entry or exact_manual_close)
+    position_side = _flad_v1_norm_side(safe.get("position_side")) if safe.get("position_side") else None
+    inferred_side = _flad_v1_norm_side(safe.get("side")) if safe.get("side") else None
+    record_side = position_side or inferred_side
+    if query.get("symbol") and safe.get("symbol") and str(query.get("symbol")) != str(safe.get("symbol")):
+        return False
+    if query.get("lifecycle_id") and safe.get("lifecycle_id") and str(query.get("lifecycle_id")) != str(safe.get("lifecycle_id")):
+        return False
+    if query.get("side") and position_side:
+        if _flad_v1_norm_side(query.get("side")) != position_side:
+            return False
+    elif query.get("side") and inferred_side and not exact_order_role:
+        if _flad_v1_norm_side(query.get("side")) != inferred_side:
+            return False
+
+    exact_lifecycle = bool(query.get("lifecycle_id") and str(query.get("lifecycle_id")) == str(safe.get("lifecycle_id") or ""))
+    exact_client = bool(query.get("client_order_id") and str(query.get("client_order_id")) == str(safe.get("client_order_id") or ""))
+    if exact_order_role:
+        return True
+
+    if query.get("stop_order_id") and safe.get("stop_order_id"):
+        return False
+    if query.get("entry_order_id") and safe.get("entry_order_id"):
+        return False
+    if query.get("manual_close_order_id") and safe.get("manual_close_order_id"):
+        return False
+    if exact_lifecycle or exact_client:
+        return True
+
+    strong_requested = any(query.get(field) for field in (
+        "stop_order_id", "entry_order_id", "manual_close_order_id", "lifecycle_id", "client_order_id",
+    ))
+    if strong_requested:
+        return False
+    # Symbol/side are filters only; they never prove Falcon ownership.
+    return False
+
+
+def _fdsff_v1_event_time_evidence(record, source=None):
+    """Normalize factual ledger time without treating minute logs as instants.
+
+    The broker execution ledger records ``ts`` in operational Sao Paulo time
+    with minute precision.  The audit ledger additionally records numeric
+    ``epoch``.  Numeric epoch is therefore authoritative when both exist, but
+    all parseable observations are retained so a conflicting textual clock is
+    visible instead of silently discarded.
+    """
+    record = record if isinstance(record, dict) else {}
+    operational_tz = globals().get("TIMEZONE_BR")
+    if operational_tz is None:
+        operational_tz = timezone(timedelta(hours=-3))
+    observations = []
+    seen = set()
+
+    def add_observation(field, raw_value, basis, precision, epoch_start, epoch_end, timezone_basis):
+        marker = (str(field), str(raw_value), str(basis))
+        if marker in seen:
+            return
+        seen.add(marker)
+        observations.append({
+            "value": _fdsff_v1_safe_scalar(raw_value, 120),
+            "source_field": str(field),
+            "basis": str(basis),
+            "precision": str(precision),
+            "epoch_start": float(epoch_start),
+            "epoch_end": float(epoch_end),
+            "timezone_basis": str(timezone_basis),
+        })
+
+    for field in ("epoch", "epoch_ms"):
+        raw_value = _fdsff_v1_first(record, field)
+        if raw_value in (None, "") or isinstance(raw_value, bool):
+            continue
+        try:
+            numeric = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if field == "epoch_ms" or abs(numeric) > 10_000_000_000:
+            numeric /= 1000.0
+            basis = "NUMERIC_EPOCH_MILLISECONDS"
+        else:
+            basis = "NUMERIC_EPOCH_SECONDS"
+        add_observation(
+            field, raw_value, basis, "EXACT_SECOND_OR_BETTER",
+            numeric, numeric, "UTC_EPOCH",
+        )
+
+    timestamp_fields = (
+        "timestamp", "created_at", "updated_at", "failure_timestamp", "failed_at",
+        "triggered_at", "canceled_at", "filled_at", "executed_at", "closed_at",
+        "ts", "failsafe_timestamp",
+    )
+    textual = []
+    for field in timestamp_fields:
+        raw_value = _fdsff_v1_first(record, field)
+        if raw_value in (None, "") or isinstance(raw_value, (bool, int, float)):
+            continue
+        marker = (field, str(raw_value))
+        if marker not in textual:
+            textual.append(marker)
+
+    for field, raw_value in textual:
+        text = str(raw_value).strip()
+        iso_candidate = bool(re.match(
+            r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$",
+            text,
+        ))
+        if not iso_candidate:
+            continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        timezone_basis = "ISO_EXPLICIT_TIMEZONE"
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=operational_tz)
+            timezone_basis = "NAIVE_ISO_ASSUMED_SAO_PAULO_UTC_MINUS_03"
+        has_seconds = bool(re.search(r"[T ]\d{2}:\d{2}:\d{2}", text))
+        epoch_start = parsed.timestamp()
+        if has_seconds:
+            precision = "EXACT_SECOND_OR_BETTER"
+            epoch_end = epoch_start
+        else:
+            precision = "MINUTE_INTERVAL"
+            epoch_start = parsed.replace(second=0, microsecond=0).timestamp()
+            epoch_end = epoch_start + 60.0 - 1e-6
+        add_observation(
+            field, raw_value, "ISO_8601_TIMESTAMP", precision,
+            epoch_start, epoch_end, timezone_basis,
+        )
+
+    for field, raw_value in textual:
+        text = str(raw_value).strip()
+        for fmt, precision, basis in (
+            ("%d/%m/%Y %H:%M:%S", "EXACT_SECOND_OR_BETTER", "SAO_PAULO_LOGGER_SECOND"),
+            ("%d/%m/%Y %H:%M", "MINUTE_INTERVAL", "SAO_PAULO_LOGGER_MINUTE"),
+        ):
+            try:
+                parsed = datetime.strptime(text, fmt).replace(tzinfo=operational_tz)
+            except (TypeError, ValueError):
+                continue
+            epoch_start = parsed.timestamp()
+            epoch_end = epoch_start if precision == "EXACT_SECOND_OR_BETTER" else epoch_start + 60.0 - 1e-6
+            add_observation(
+                field, raw_value, basis, precision, epoch_start, epoch_end,
+                "SAO_PAULO_UTC_MINUS_03",
+            )
+            break
+
+    if not observations:
+        return {
+            "value": None,
+            "source_field": None,
+            "basis": "UNPARSEABLE_OR_MISSING",
+            "precision": "UNKNOWN",
+            "epoch_start": None,
+            "epoch_end": None,
+            "timezone_basis": "UNKNOWN",
+            "evidence_conflict": False,
+            "observations": [],
+            "source": _fdsff_v1_safe_scalar(source, 120),
+        }
+
+    primary = observations[0]
+    conflicts = []
+    for observation in observations[1:]:
+        tolerance = 1.0 if (
+            primary["precision"] == "EXACT_SECOND_OR_BETTER"
+            and observation["precision"] == "EXACT_SECOND_OR_BETTER"
+        ) else 0.0
+        overlaps = bool(
+            observation["epoch_end"] + tolerance >= primary["epoch_start"]
+            and observation["epoch_start"] - tolerance <= primary["epoch_end"]
+        )
+        if not overlaps:
+            conflicts.append({
+                "source_field": observation["source_field"],
+                "value": observation["value"],
+                "basis": observation["basis"],
+            })
+    return {
+        **primary,
+        "evidence_conflict": bool(conflicts),
+        "conflicts": conflicts,
+        "observations": observations,
+        "source": _fdsff_v1_safe_scalar(source, 120),
+    }
+
+
+def _fdsff_v1_incident_time_relation(record, query):
+    event_time = _fdsff_v1_event_time_evidence(record)
+    start_time = _fdsff_v1_event_time_evidence({"timestamp": (query or {}).get("failure_timestamp")})
+    end_time = _fdsff_v1_event_time_evidence({"timestamp": (query or {}).get("manual_close_timestamp")})
+    complete = bool(
+        event_time.get("epoch_start") is not None
+        and start_time.get("epoch_start") is not None
+        and end_time.get("epoch_start") is not None
+    )
+    def classify_interval(interval):
+        if not complete or not isinstance(interval, dict):
+            return {
+                "relation": "INCIDENT_WINDOW_OR_FACTUAL_TIMESTAMP_MISSING",
+                "interval_fully_inside": None,
+                "overlaps_start_boundary": None,
+                "overlaps_end_boundary": None,
+                "outside_before": None,
+                "outside_after": None,
+                "clock_skew_tolerance_only": None,
+            }
+        event_start = interval.get("epoch_start")
+        event_end = interval.get("epoch_end")
+        window_start = start_time.get("epoch_start")
+        # The manual close boundary is exclusive.  Even an exact event at the
+        # same timestamp does not prove that the event preceded the close.
+        window_end = end_time.get("epoch_start")
+        if None in (event_start, event_end, window_start, window_end):
+            return {
+                "relation": "INCIDENT_WINDOW_OR_FACTUAL_TIMESTAMP_MISSING",
+                "interval_fully_inside": None,
+                "overlaps_start_boundary": None,
+                "overlaps_end_boundary": None,
+                "outside_before": None,
+                "outside_after": None,
+                "clock_skew_tolerance_only": None,
+            }
+        interval_fully_inside = bool(
+            event_start >= window_start and event_end < window_end
+        )
+        covers_both = bool(event_start < window_start and event_end >= window_end)
+        overlaps_start = bool(
+            not covers_both
+            and event_start < window_start <= event_end
+            and event_end < window_end
+        )
+        overlaps_end = bool(
+            not covers_both
+            and event_start < window_end <= event_end
+            and event_start >= window_start
+        )
+        outside_before = bool(event_end < window_start)
+        outside_after = bool(event_start >= window_end)
+        exact = interval.get("precision") == "EXACT_SECOND_OR_BETTER"
+        skew_before = bool(
+            exact and outside_before and 0.0 <= window_start - event_end <= 5.0
+        )
+        skew_after = bool(
+            exact and outside_after and 0.0 <= event_start - window_end <= 5.0
+        )
+        if interval_fully_inside:
+            relation = "FULLY_INSIDE_INCIDENT_WINDOW"
+        elif covers_both:
+            relation = "COVERS_BOTH_INCIDENT_BOUNDARIES"
+        elif overlaps_start:
+            relation = "OVERLAPS_INCIDENT_START_BOUNDARY"
+        elif overlaps_end:
+            relation = "OVERLAPS_INCIDENT_END_BOUNDARY"
+        elif skew_before:
+            relation = "CLOCK_SKEW_TOLERANCE_ONLY_BEFORE"
+        elif skew_after:
+            relation = "CLOCK_SKEW_TOLERANCE_ONLY_AFTER"
+        elif outside_before:
+            relation = "OUTSIDE_BEFORE_INCIDENT"
+        elif outside_after:
+            relation = "OUTSIDE_AFTER_INCIDENT"
+        else:
+            relation = "INCIDENT_WINDOW_OR_FACTUAL_TIMESTAMP_MISSING"
+        return {
+            "relation": relation,
+            "interval_fully_inside": interval_fully_inside,
+            "overlaps_start_boundary": overlaps_start,
+            "overlaps_end_boundary": overlaps_end,
+            "covers_both_boundaries": covers_both,
+            "outside_before": outside_before,
+            "outside_after": outside_after,
+            "clock_skew_tolerance_only": bool(skew_before or skew_after),
+        }
+
+    primary_relation = classify_interval(event_time)
+    observation_relations = []
+    for observation in event_time.get("observations") or []:
+        if not isinstance(observation, dict):
+            continue
+        observation_relations.append({
+            "source_field": observation.get("source_field"),
+            "value": observation.get("value"),
+            "basis": observation.get("basis"),
+            "precision": observation.get("precision"),
+            **classify_interval(observation),
+        })
+    return {
+        "event": event_time,
+        "start": start_time,
+        "end": end_time,
+        "complete": complete,
+        "inside": primary_relation.get("interval_fully_inside"),
+        **primary_relation,
+        "observation_relations": observation_relations,
+        "basis": (
+            f"STRICT_INCIDENT_ATTRIBUTION:{primary_relation.get('relation')}:{event_time.get('basis')}:{event_time.get('precision')}"
+            if complete else "INCIDENT_WINDOW_OR_FACTUAL_TIMESTAMP_MISSING"
+        ),
+        "conflict": bool(
+            event_time.get("evidence_conflict")
+            or primary_relation.get("interval_fully_inside") is False
+        ),
+    }
+
+
+def _fdsff_v1_operational_failsafe_record(record, source, query):
+    """Correlate the Falcon stop fail-safe audit without weakening ownership.
+
+    ``STOP_BROKER_NOT_CONFIRMED`` is emitted exclusively by the Falcon disaster
+    stop fail-safe in the current repository.  Because its broker audit has no
+    lifecycle/order identity, correlation is deliberately limited to the two
+    broker ledgers, exact semantics and the factual incident window.  A five
+    second tolerance only accommodates logger/clock boundary jitter.
+    """
+    if not isinstance(record, dict) or not isinstance(query, dict):
+        return None
+    normalized_source = str(source or "").lower().strip()
+    if normalized_source not in {"broker.execution_audit", "broker.executions"}:
+        return None
+    event = _fdsff_v1_event_name(record)
+    if event not in {
+        "BROKER_MANAGED_CLOSE_SENT",
+        "BROKER_MANAGED_CLOSE_ERROR",
+        "MANAGED_CLOSE_POSITION_MARKET",
+    }:
+        return None
+    reason = str(_fdsff_v1_first(record, "reason") or "").upper().strip()
+    if reason != "STOP_BROKER_NOT_CONFIRMED":
+        return None
+    query_symbol = _flad_v1_norm_symbol(query.get("symbol"))
+    record_symbol = _flad_v1_norm_symbol(_fdsff_v1_first(record, "symbol", "market_symbol", "pair"))
+    query_side = _flad_v1_norm_side(query.get("side"))
+    record_side = _flad_v1_norm_side(_fdsff_v1_first(record, "position_side", "positionSide", "side"))
+    if not query_symbol or not record_symbol or query_symbol != record_symbol:
+        return None
+    if not query_side or not record_side or query_side != record_side:
+        return None
+
+    time_relation = _fdsff_v1_incident_time_relation(record, query)
+    time_evidence = time_relation.get("event") or {}
+    timestamp = time_evidence.get("value")
+    temporal_complete = bool(time_relation.get("complete"))
+    inside_incident_window = time_relation.get("inside")
+    incident_time_relation = str(time_relation.get("relation") or "")
+    temporal_candidate_conflicts = {
+        "OVERLAPS_INCIDENT_START_BOUNDARY": "INCIDENT_WINDOW_START_BOUNDARY_AMBIGUOUS",
+        "OVERLAPS_INCIDENT_END_BOUNDARY": "INCIDENT_WINDOW_END_BOUNDARY_AMBIGUOUS",
+        "COVERS_BOTH_INCIDENT_BOUNDARIES": "INCIDENT_WINDOW_BOTH_BOUNDARIES_AMBIGUOUS",
+        "CLOCK_SKEW_TOLERANCE_ONLY_BEFORE": "INCIDENT_CLOCK_SKEW_BEFORE_START_CANDIDATE",
+        "CLOCK_SKEW_TOLERANCE_ONLY_AFTER": "INCIDENT_CLOCK_SKEW_AFTER_END_CANDIDATE",
+    }
+    temporal_candidate_conflict = temporal_candidate_conflicts.get(incident_time_relation)
+    # Weak broker-ledger evidence far outside the factual window is unrelated
+    # to this incident. Boundary and clock-skew ambiguity remain visible as
+    # candidates but are never promoted to a factual attempt.
+    if (
+        temporal_complete
+        and inside_incident_window is False
+        and temporal_candidate_conflict is None
+    ):
+        return None
+
+    amount = _fdsff_v1_float(_fdsff_v1_first(record, "amount"))
+    expected_amount = _fdsff_v1_float(_fdsff_v1_first(record, "expected_position_amount"))
+    incident_quantity = _fdsff_v1_float(query.get("manual_close_quantity"))
+    quantity_tolerance = max(
+        1e-9,
+        max(
+            abs(amount or 0.0),
+            abs(expected_amount or 0.0),
+            abs(incident_quantity or 0.0),
+        ) * 1e-6,
+    )
+    internal_quantity_conflict = bool(
+        amount is not None
+        and expected_amount is not None
+        and abs(amount - expected_amount) > quantity_tolerance
+    )
+    incident_quantity_missing = bool(
+        incident_quantity is not None
+        and (amount is None or expected_amount is None)
+    )
+    incident_quantity_conflict = bool(
+        incident_quantity is not None
+        and not incident_quantity_missing
+        and (
+            abs(amount - incident_quantity) > quantity_tolerance
+            or abs(expected_amount - incident_quantity) > quantity_tolerance
+        )
+    )
+    quantity_conflict = bool(
+        internal_quantity_conflict
+        or incident_quantity_missing
+        or incident_quantity_conflict
+    )
+    positive = bool(
+        temporal_complete
+        and inside_incident_window is True
+        and not quantity_conflict
+    )
+    conflict = None
+    if temporal_candidate_conflict:
+        conflict = temporal_candidate_conflict
+    elif incident_quantity_conflict:
+        conflict = "INCIDENT_QUANTITY_MISMATCH"
+    elif incident_quantity_missing:
+        conflict = "INCIDENT_QUANTITY_UNAVAILABLE"
+    elif internal_quantity_conflict:
+        conflict = "FAILSAFE_QUANTITY_MISMATCH"
+    elif not temporal_complete:
+        conflict = "INCIDENT_WINDOW_OR_FACTUAL_TIMESTAMP_MISSING"
+
+    projected = _fdsff_v1_safe_record(record, normalized_source)
+    raw_confirmed = _fdsff_v1_first(record, "confirmed")
+    raw_sent = _fdsff_v1_first(record, "sent")
+    def tri_bool(value):
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        if normalized in {"1", "true", "yes", "sim", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "nao", "não", "off"}:
+            return False
+        return None
+
+    confirmed = tri_bool(raw_confirmed)
+    sent = tri_bool(raw_sent)
+    status = _fdsff_v1_first(record, "status")
+    status_upper = str(status or "").upper().strip()
+    is_error = bool(
+        event == "BROKER_MANAGED_CLOSE_ERROR"
+        or status_upper == "MANAGED_CLOSE_ERROR"
+    )
+    is_sent = bool(
+        event == "BROKER_MANAGED_CLOSE_SENT"
+        or status_upper in {"MANAGED_CLOSE_CONFIRMED", "MANAGED_CLOSE_SENT_UNCONFIRMED"}
+    )
+    order_sent = sent
+    execution_confirmed = confirmed
+    executed = None
+    failure_phase = str(_fdsff_v1_first(record, "failure_phase", "failurePhase") or "").upper().strip()
+    close_order_id = _fdsff_v1_safe_scalar(
+        _fdsff_v1_first(record, "order_id", "orderId"), 128
+    )
+    explicit_pre_transport_failure = failure_phase == "BEFORE_CREATE_ORDER"
+    if is_error:
+        if close_order_id or sent is True:
+            order_sent = True
+            execution_confirmed = None
+            executed = None
+        elif explicit_pre_transport_failure:
+            order_sent = False
+            execution_confirmed = False
+            executed = False
+        else:
+            # ``sent=False`` and ``confirmed=False`` are defaults created
+            # before the try block.  The exception may have happened during
+            # create_order or during later confirmation reads, so neither is
+            # factual negative evidence on its own.
+            order_sent = None
+            execution_confirmed = None
+            executed = None
+    elif is_sent:
+        order_sent = sent if sent is not None else True
+        if status_upper == "MANAGED_CLOSE_CONFIRMED" or confirmed is True:
+            execution_confirmed = True
+            executed = True
+        elif status_upper == "MANAGED_CLOSE_SENT_UNCONFIRMED" or confirmed is False:
+            execution_confirmed = False
+            # SENT_UNCONFIRMED proves only that confirmation was not obtained;
+            # it does not prove zero execution.
+            executed = None
+    projected.update({
+        "operational_correlation_role": (
+            "FAILSAFE_CLOSE_AUDIT" if positive else "FAILSAFE_CLOSE_AUDIT_CANDIDATE"
+        ),
+        "operational_correlation_basis": (
+            "BROKER_LEDGER+EXACT_EVENT+EXACT_REASON+SYMBOL+POSITION_SIDE+INCIDENT_WINDOW"
+            if positive
+            else "BROKER_LEDGER+EXACT_EVENT+EXACT_REASON+SYMBOL+POSITION_SIDE"
+        ),
+        "operational_correlation_conflict": conflict,
+        "operational_correlation_quantity_basis": (
+            "USER_REPORTED_MANUAL_CLOSE_QUANTITY"
+            if incident_quantity is not None
+            else "EVENT_INTERNAL_AMOUNT_EXPECTED_MATCH_ONLY"
+        ),
+        "incident_reported_quantity": incident_quantity,
+        "failsafe_close_order_id": close_order_id,
+        "failsafe_reason": "STOP_BROKER_NOT_CONFIRMED",
+        "failsafe_sent": sent,
+        "failsafe_confirmed": confirmed,
+        "failsafe_order_sent": order_sent,
+        "failsafe_execution_confirmed": execution_confirmed,
+        "failsafe_status": _fdsff_v1_safe_scalar(status, 80),
+        "failsafe_timestamp": _fdsff_v1_safe_scalar(timestamp, 120),
+        "failsafe_timestamp_source_field": time_evidence.get("source_field"),
+        "failsafe_timestamp_basis": time_evidence.get("basis"),
+        "failsafe_timestamp_precision": time_evidence.get("precision"),
+        "failsafe_timestamp_epoch_start": time_evidence.get("epoch_start"),
+        "failsafe_timestamp_epoch_end": time_evidence.get("epoch_end"),
+        "failsafe_timestamp_timezone_basis": time_evidence.get("timezone_basis"),
+        "failsafe_timestamp_evidence_conflict": time_evidence.get("evidence_conflict"),
+        "failsafe_timestamp_observations": time_evidence.get("observations") or [],
+        "failsafe_timestamp_observation_relations": time_relation.get("observation_relations") or [],
+        "failsafe_attempt_inside_incident_window": inside_incident_window,
+        "failsafe_incident_time_relation": incident_time_relation,
+        "failsafe_interval_fully_inside": time_relation.get("interval_fully_inside"),
+        "failsafe_overlaps_start_boundary": time_relation.get("overlaps_start_boundary"),
+        "failsafe_overlaps_end_boundary": time_relation.get("overlaps_end_boundary"),
+        "failsafe_clock_skew_tolerance_only": time_relation.get("clock_skew_tolerance_only"),
+        "failsafe_timing_basis": time_relation.get("basis"),
+        "failsafe_timing_conflict": time_relation.get("conflict"),
+        "failsafe_error_semantics": (
+            "FAILSAFE_ERROR_PRE_TRANSPORT_FACTUAL"
+            if is_error and explicit_pre_transport_failure
+            else "FAILSAFE_ERROR_ORDER_SENT_EXECUTION_INCONCLUSIVE"
+            if is_error and order_sent is True
+            else "FAILSAFE_ERROR_SEND_AND_EXECUTION_INCONCLUSIVE"
+            if is_error else None
+        ),
+        "failsafe_amount": amount,
+        "failsafe_expected_position_amount": expected_amount,
+        "failsafe_filled_amount": _fdsff_v1_float(
+            _fdsff_v1_first(record, "filled_amount")
+        ),
+        "failsafe_remaining_amount": _fdsff_v1_float(
+            _fdsff_v1_first(record, "remaining_amount")
+        ),
+    })
+    if positive:
+        projected["failsafe_attempted"] = True
+        if executed is None:
+            projected.pop("failsafe_executed", None)
+        else:
+            projected["failsafe_executed"] = executed
+    return {
+        key: (
+            [
+                {
+                    nested_key: _fdsff_v1_safe_scalar(nested_value, 120)
+                    for nested_key, nested_value in item.items()
+                    if nested_value not in (None, "")
+                }
+                for item in value[:10]
+                if isinstance(item, dict)
+            ]
+            if key in {
+                "failsafe_timestamp_observations",
+                "failsafe_timestamp_observation_relations",
+            } and isinstance(value, list)
+            else _fdsff_v1_safe_scalar(value)
+        )
+        for key, value in projected.items()
+        if value not in (None, "")
+    }
+
+
+def _fdsff_v1_group_failsafe_attempts(rows):
+    """Group complementary ledger observations without inventing uniqueness."""
+    rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+
+    def upper(value):
+        return str(value or "").upper().strip()
+
+    def number(value):
+        return _fdsff_v1_float(value)
+
+    def compatible_number(left, right):
+        left_value = number(left)
+        right_value = number(right)
+        if left_value is None or right_value is None:
+            return left_value is None and right_value is None
+        tolerance = max(1e-9, max(abs(left_value), abs(right_value), 1.0) * 1e-6)
+        return abs(left_value - right_value) <= tolerance
+
+    def status_family(row):
+        event = upper(row.get("event"))
+        status = upper(row.get("failsafe_status") or row.get("status"))
+        if "ERROR" in event or "ERROR" in status:
+            return "ERROR"
+        if "SENT_UNCONFIRMED" in status:
+            return "SENT_UNCONFIRMED"
+        if "CONFIRMED" in status and "NOT_CONFIRMED" not in status:
+            return "CONFIRMED"
+        if "OWNERSHIP" in status or "BLOCK" in status:
+            return "BLOCKED"
+        return status or event or "UNKNOWN"
+
+    def time_evidence(row):
+        start = number(row.get("failsafe_timestamp_epoch_start"))
+        end = number(row.get("failsafe_timestamp_epoch_end"))
+        if start is not None and end is not None:
+            return {"epoch_start": start, "epoch_end": end}
+        return _fdsff_v1_event_time_evidence(row)
+
+    def intervals_overlap(left, right):
+        left_time = time_evidence(left)
+        right_time = time_evidence(right)
+        if left_time.get("epoch_start") is None or right_time.get("epoch_start") is None:
+            return False
+        return bool(
+            left_time.get("epoch_end") >= right_time.get("epoch_start")
+            and right_time.get("epoch_end") >= left_time.get("epoch_start")
+        )
+
+    def complementary_sources(left, right):
+        return {
+            str(left.get("source") or "").lower().strip(),
+            str(right.get("source") or "").lower().strip(),
+        } == {"broker.executions", "broker.execution_audit"}
+
+    def can_pair(left, right):
+        if not complementary_sources(left, right):
+            return False
+        if str(left.get("failsafe_close_order_id") or "").strip() or str(right.get("failsafe_close_order_id") or "").strip():
+            return False
+        if _flad_v1_norm_symbol(left.get("symbol")) != _flad_v1_norm_symbol(right.get("symbol")):
+            return False
+        if _flad_v1_norm_side(left.get("position_side") or left.get("side")) != _flad_v1_norm_side(right.get("position_side") or right.get("side")):
+            return False
+        if upper(left.get("failsafe_reason")) != upper(right.get("failsafe_reason")):
+            return False
+        if status_family(left) != status_family(right):
+            return False
+        if not compatible_number(left.get("failsafe_amount"), right.get("failsafe_amount")):
+            return False
+        if not compatible_number(
+            left.get("failsafe_expected_position_amount"),
+            right.get("failsafe_expected_position_amount"),
+        ):
+            return False
+        return intervals_overlap(left, right)
+
+    groups = []
+    consumed = set()
+    order_groups = {}
+    for index, row in enumerate(rows):
+        order_id = str(row.get("failsafe_close_order_id") or "").strip()
+        if order_id:
+            order_groups.setdefault(order_id, []).append(index)
+    for order_id, indices in order_groups.items():
+        groups.append((f"ORDER_ID:{order_id}", "FACTUAL_ORDER_ID", indices))
+        consumed.update(indices)
+
+    remaining = [index for index in range(len(rows)) if index not in consumed]
+    compatibility = {
+        index: [other for other in remaining if other != index and can_pair(rows[index], rows[other])]
+        for index in remaining
+    }
+    ambiguous = {
+        index for index, matches in compatibility.items() if len(matches) > 1
+    }
+    for index in remaining:
+        if index in consumed or index in ambiguous:
+            continue
+        matches = [other for other in compatibility[index] if other not in consumed and other not in ambiguous]
+        if len(matches) != 1:
+            continue
+        other = matches[0]
+        if compatibility.get(other) == [index]:
+            groups.append((
+                f"CROSS_LEDGER:{min(index, other)}:{max(index, other)}",
+                "COMPLEMENTARY_LEDGER_OBSERVATIONS",
+                [index, other],
+            ))
+            consumed.update({index, other})
+    for index in remaining:
+        if index not in consumed:
+            groups.append((f"OBSERVATION:{index}", "UNDEDUPLICATED_OBSERVATION", [index]))
+            consumed.add(index)
+
+    dedup_inconclusive = bool(ambiguous)
+
+    def tri_aggregate(observations, field):
+        values = [row.get(field) for row in observations]
+        factual = [value for value in values if isinstance(value, bool)]
+        unresolved = len(factual) != len(values)
+        if any(value is True for value in factual):
+            return True
+        if factual and all(value is False for value in factual) and not unresolved:
+            return False
+        return None
+
+    def scalar_amount(observations, field):
+        values = [number(row.get(field)) for row in observations]
+        values = [value for value in values if value is not None]
+        if not values:
+            return None, False, []
+        reference = values[0]
+        compatible = all(compatible_number(reference, value) for value in values[1:])
+        return (reference if compatible else None), not compatible, values
+
+    attempts = []
+    amount_conflict = False
+    for attempt_key, identity_basis, indices in groups:
+        observations = [rows[index] for index in indices]
+        order_sent = tri_aggregate(observations, "failsafe_order_sent")
+        execution_confirmed = tri_aggregate(observations, "failsafe_execution_confirmed")
+        executed = tri_aggregate(observations, "failsafe_executed")
+        amount, amount_mismatch, amount_values = scalar_amount(observations, "failsafe_amount")
+        expected, expected_mismatch, expected_values = scalar_amount(
+            observations, "failsafe_expected_position_amount"
+        )
+        filled, filled_mismatch, filled_values = scalar_amount(observations, "failsafe_filled_amount")
+        remaining_amount, remaining_mismatch, remaining_values = scalar_amount(
+            observations, "failsafe_remaining_amount"
+        )
+        attempt_amount_conflict = bool(
+            amount_mismatch or expected_mismatch or filled_mismatch or remaining_mismatch
+        )
+        amount_conflict = amount_conflict or attempt_amount_conflict
+        times = [time_evidence(row) for row in observations]
+        time_starts = [item.get("epoch_start") for item in times if item.get("epoch_start") is not None]
+        time_ends = [item.get("epoch_end") for item in times if item.get("epoch_end") is not None]
+        inside_values = [
+            row.get("failsafe_attempt_inside_incident_window")
+            for row in observations
+            if isinstance(row.get("failsafe_attempt_inside_incident_window"), bool)
+        ]
+        inside = (
+            True if any(value is True for value in inside_values)
+            else False if inside_values and all(value is False for value in inside_values)
+            else None
+        )
+        timing_bases = list(dict.fromkeys(
+            str(row.get("failsafe_timing_basis"))
+            for row in observations
+            if row.get("failsafe_timing_basis") not in (None, "")
+        ))
+        incident_relations = list(dict.fromkeys(
+            str(row.get("failsafe_incident_time_relation"))
+            for row in observations
+            if row.get("failsafe_incident_time_relation") not in (None, "")
+        ))
+        status_families = list(dict.fromkeys(status_family(row) for row in observations))
+        statuses = list(dict.fromkeys(
+            str(row.get("failsafe_status") or row.get("status"))
+            for row in observations
+            if row.get("failsafe_status") not in (None, "") or row.get("status") not in (None, "")
+        ))
+        error_inconclusive = any(
+            row.get("failsafe_error_semantics") == "FAILSAFE_ERROR_SEND_AND_EXECUTION_INCONCLUSIVE"
+            for row in observations
+        )
+        resolved = bool(executed is True or executed is False or execution_confirmed is True)
+        attempts.append({
+            "attempt_key": attempt_key,
+            "identity_basis": identity_basis,
+            "observation_count": len(observations),
+            "sources": list(dict.fromkeys(str(row.get("source") or "") for row in observations)),
+            "status_families": status_families,
+            "statuses": statuses,
+            "failsafe_close_order_id": next((
+                row.get("failsafe_close_order_id") for row in observations
+                if row.get("failsafe_close_order_id") not in (None, "")
+            ), None),
+            "failsafe_order_sent": order_sent,
+            "failsafe_execution_confirmed": execution_confirmed,
+            "failsafe_executed": executed,
+            "failsafe_amount": amount,
+            "failsafe_expected_position_amount": expected,
+            "failsafe_filled_amount": filled,
+            "failsafe_remaining_amount": remaining_amount,
+            "failsafe_amount_values": amount_values,
+            "failsafe_expected_position_amount_values": expected_values,
+            "failsafe_filled_amount_values": filled_values,
+            "failsafe_remaining_amount_values": remaining_values,
+            "amount_evidence_conflict": attempt_amount_conflict,
+            "timestamp_epoch_start": min(time_starts) if time_starts else None,
+            "timestamp_epoch_end": max(time_ends) if time_ends else None,
+            "failsafe_attempt_inside_incident_window": inside,
+            "failsafe_incident_time_relation": (
+                incident_relations[0]
+                if len(incident_relations) == 1
+                else "MULTIPLE_INCIDENT_TIME_RELATIONS" if incident_relations else None
+            ),
+            "failsafe_interval_fully_inside": bool(
+                observations
+                and all(row.get("failsafe_interval_fully_inside") is True for row in observations)
+            ),
+            "failsafe_overlaps_start_boundary": any(
+                row.get("failsafe_overlaps_start_boundary") is True for row in observations
+            ),
+            "failsafe_overlaps_end_boundary": any(
+                row.get("failsafe_overlaps_end_boundary") is True for row in observations
+            ),
+            "failsafe_clock_skew_tolerance_only": any(
+                row.get("failsafe_clock_skew_tolerance_only") is True for row in observations
+            ),
+            "failsafe_timing_basis": timing_bases[0] if len(timing_bases) == 1 else "MULTIPLE_TIMING_BASES" if timing_bases else None,
+            "failsafe_timing_conflict": any(row.get("failsafe_timing_conflict") is True for row in observations),
+            "error_send_and_execution_inconclusive": error_inconclusive,
+            "resolved": resolved,
+            "observations": observations,
+        })
+
+    return {
+        "observation_count": len(rows),
+        "attempt_count": None if dedup_inconclusive else len(attempts),
+        "attempts": attempts,
+        "multiple_attempts": None if dedup_inconclusive else len(attempts) > 1,
+        "dedup_inconclusive": dedup_inconclusive,
+        "amount_evidence_conflict": amount_conflict,
+    }
+
+
+def _fdsff_v1_merge_record_categories(categories, limit):
+    """Return a bounded, deduplicated, category-fair forensic projection."""
+    categories = categories if isinstance(categories, dict) else {}
+    names = list(categories)
+    bounded_limit = max(0, int(limit or 0))
+    rows_by_category = {
+        name: [row for row in (categories.get(name) or []) if isinstance(row, dict)]
+        for name in names
+    }
+    counts_before = {name: len(rows_by_category[name]) for name in names}
+    counts_after = {name: 0 for name in names}
+    offsets = {name: 0 for name in names}
+    seen = set()
+    projected = []
+    while len(projected) < bounded_limit:
+        progressed = False
+        for name in names:
+            rows = rows_by_category[name]
+            while offsets[name] < len(rows):
+                row = rows[offsets[name]]
+                offsets[name] += 1
+                marker = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                projected.append(row)
+                counts_after[name] += 1
+                progressed = True
+                break
+            if len(projected) >= bounded_limit:
+                break
+        if not progressed:
+            break
+    candidate_count = sum(counts_before.values())
+    return projected, {
+        "candidates_count": candidate_count,
+        "projected_count": len(projected),
+        "truncated": len(projected) < len(seen) or candidate_count > len(projected),
+        "category_counts_before": counts_before,
+        "category_counts_after": counts_after,
+    }
+
+
+def _fdsff_v1_read_registry(query):
+    reader = getattr(central_trade_registry, "load_registry_read_only", None) if central_trade_registry is not None else None
+    if not callable(reader):
+        return [], "TRADE_REGISTRY_READ_ONLY_READER_UNAVAILABLE"
+    try:
+        registry = reader()
+    except Exception as exc:
+        return [], f"TRADE_REGISTRY_READ_ERROR:{type(exc).__name__}"
+    if not isinstance(registry, dict):
+        return [], "TRADE_REGISTRY_PAYLOAD_INVALID"
+    matches = []
+    for collection_name in ("open_trades", "closed_trades"):
+        raw = registry.get(collection_name, {} if collection_name == "open_trades" else [])
+        rows = list(raw.values()) if isinstance(raw, dict) else list(raw) if isinstance(raw, list) else []
+        for row in rows:
+            bot = str(row.get("bot") or row.get("owner_bot") or "").upper().strip() if isinstance(row, dict) else ""
+            if bot and bot != "FALCON":
+                continue
+            if isinstance(row, dict) and _fdsff_v1_matches(row, query):
+                projected = _fdsff_v1_safe_record(row, f"trade_registry.{collection_name}")
+                projected["registry_collection"] = collection_name
+                matches.append(projected)
+    return matches[:_FDSFF_V1_LOCAL_LIMIT], None
+
+
+def _fdsff_v1_read_falcon_health(query):
+    modules = globals().get("LOADED_BOTS") or {}
+    module = modules.get("FALCON") if isinstance(modules, dict) else None
+    health = getattr(module, "HEALTH", None) if module is not None else None
+    if not isinstance(health, dict):
+        return [], "FALCON_HEALTH_UNAVAILABLE"
+    synthetic = {
+        "event": "FALCON_HEALTH_SNAPSHOT",
+        "status": health.get("falcon_disaster_stop_order_status"),
+        "stop_order_id": health.get("falcon_disaster_stop_order_id"),
+        "trigger_type": health.get("falcon_disaster_stop_trigger_type"),
+        "symbol": health.get("falcon_stop_anomaly_symbol"),
+        "side": health.get("falcon_stop_anomaly_side"),
+        "diagnostic_reason": health.get("falcon_stop_anomaly_last_reason"),
+        "falcon_management_spam_guard_status": health.get("falcon_management_spam_guard_status"),
+        "falcon_management_spam_guard_last_reason": health.get("falcon_management_spam_guard_last_reason"),
+        "falcon_management_spam_guard_suppressed_count": health.get("falcon_management_spam_guard_suppressed_count"),
+        "falcon_management_spam_guard_last_suppressed_at": health.get("falcon_management_spam_guard_last_suppressed_at"),
+        "updated_at": health.get("falcon_disaster_stop_last_checked_at"),
+    }
+    return ([_fdsff_v1_safe_record(synthetic, "falcon.health")] if _fdsff_v1_matches(synthetic, query) else []), None
+
+
+def _fdsff_v1_read_snapshot_records(path, source, query):
+    try:
+        if path is None or not path.exists():
+            return [], f"{source.upper().replace('.', '_')}_NOT_FOUND"
+        if path.stat().st_size > _FDSFF_V1_MAX_SNAPSHOT_BYTES:
+            return [], f"{source.upper().replace('.', '_')}_TOO_LARGE"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [], f"{source.upper().replace('.', '_')}_READ_ERROR:{type(exc).__name__}"
+    direct_identity_keys = {
+        "order_id", "orderId", "stop_order_id", "broker_stop_order_id",
+        "requested_order_id", "requestedOrderId", "plan_order_id", "planOrderId",
+        "entry_order_id", "broker_order_id", "manual_close_order_id", "close_order_id",
+        "lifecycle_id", "client_order_id", "clientOrderId",
+    }
+    candidates = [payload] if isinstance(payload, dict) and any(payload.get(key) not in (None, "") for key in direct_identity_keys) else []
+    if isinstance(payload, dict):
+        for key in ("orders", "details", "events", "positions", "matches"):
+            if isinstance(payload.get(key), list):
+                candidates.extend(item for item in payload.get(key)[:_FDSFF_V1_LOCAL_LIMIT] if isinstance(item, dict))
+    matches = [
+        _fdsff_v1_safe_record(row, source)
+        for row in candidates
+        if isinstance(row, dict) and _fdsff_v1_matches(row, query)
+    ]
+    return matches[:_FDSFF_V1_LOCAL_LIMIT], None
+
+
+def _fdsff_v1_read_local_events(query):
+    sources = []
+    try:
+        history_path = getattr(super_history_manager, "HISTORY_EVENTS_FILE", None)
+    except Exception:
+        history_path = None
+    sources.append((Path(history_path) if history_path is not None else None, "history.events"))
+    try:
+        execution_audit_path = getattr(central_broker, "EXECUTION_AUDIT_LOG_FILE", None)
+        executions_path = getattr(central_broker, "EXECUTIONS_LOG_FILE", None)
+    except Exception:
+        execution_audit_path = None
+        executions_path = None
+    sources.extend([
+        (Path(execution_audit_path) if execution_audit_path is not None else None, "broker.execution_audit"),
+        (Path(executions_path) if executions_path is not None else None, "broker.executions"),
+    ])
+    for global_name, source in (
+        ("FALCON_LIVE_AUDIT_EVENTS_FILE", "falcon.live_audit"),
+        ("CENTRAL_TIMELINE_LOG_FILE", "central.timeline"),
+    ):
+        path = globals().get(global_name)
+        sources.append((Path(path) if path is not None else None, source))
+
+    incident_start = query.get("failure_timestamp")
+    incident_end = query.get("manual_close_timestamp") or _fcor_v1_now()
+    incident_start_evidence = _fdsff_v1_event_time_evidence({"timestamp": incident_start})
+    incident_end_evidence = _fdsff_v1_event_time_evidence({"timestamp": incident_end})
+    per_source_matches = []
+    metadata = []
+    errors = []
+    seen_paths = set()
+    for path, source in sources:
+        marker = str(path) if path is not None else f"MISSING:{source}"
+        if path is not None and marker in seen_paths:
+            continue
+        if path is not None:
+            seen_paths.add(marker)
+        source_meta = {
+            "source": source,
+            "rows_read": 0,
+            "configured_limit": _FDSFF_V1_LOCAL_LIMIT,
+            "saturated": False,
+            "oldest_timestamp": None,
+            "newest_timestamp": None,
+            "incident_window_start": incident_start,
+            "incident_window_end": incident_end,
+            "incident_window_covered": False,
+            # None of the current generic ledgers proves that every relevant
+            # Telegram transport attempt is audited end-to-end.
+            "critical_alert_transport_audit_complete": False,
+            "read_error": None,
+        }
+        if path is None:
+            source_meta["read_error"] = "SOURCE_PATH_UNAVAILABLE"
+            errors.append(f"{source}:SOURCE_PATH_UNAVAILABLE")
+            metadata.append(source_meta)
+            per_source_matches.append([])
+            continue
+        if not path.exists():
+            source_meta["read_error"] = "SOURCE_NOT_FOUND"
+            errors.append(f"{source}:SOURCE_NOT_FOUND")
+            metadata.append(source_meta)
+            per_source_matches.append([])
+            continue
+        try:
+            from history_memory_guard import AUTOMATIC_MAX_BYTES, iter_jsonl_tail
+
+            tail = iter_jsonl_tail(
+                path,
+                max_records=_FDSFF_V1_LOCAL_LIMIT,
+                max_bytes=AUTOMATIC_MAX_BYTES,
+                invalid_as_raw=False,
+                operation=f"falcon_disaster_stop_forensics_{source.replace('.', '_')}",
+            )
+            rows = list(tail.get("records") or [])
+            source_meta["rows_read"] = len(rows)
+            source_meta["saturated"] = bool(
+                len(rows) >= _FDSFF_V1_LOCAL_LIMIT or tail.get("partial")
+            )
+            if int(tail.get("invalid_lines") or 0) > 0:
+                source_meta["read_error"] = "INVALID_JSONL_LINES"
+                errors.append(f"{source}:INVALID_JSONL_LINES")
+        except Exception as exc:
+            source_meta["read_error"] = f"READ_ERROR:{type(exc).__name__}"
+            errors.append(f"{source}:{source_meta['read_error']}")
+            metadata.append(source_meta)
+            per_source_matches.append([])
+            continue
+        timestamp_intervals = []
+        source_matches = []
+        for row in rows or []:
+            event_time = _fdsff_v1_event_time_evidence(row, source) if isinstance(row, dict) else {}
+            if event_time.get("epoch_start") is not None:
+                timestamp_intervals.append(event_time)
+            if isinstance(row, dict):
+                operational_failsafe = _fdsff_v1_operational_failsafe_record(
+                    row, source, query
+                )
+                if operational_failsafe is not None:
+                    source_matches.append(operational_failsafe)
+                elif _fdsff_v1_matches(row, query):
+                    source_matches.append(_fdsff_v1_safe_record(row, source))
+        if timestamp_intervals:
+            source_meta["oldest_timestamp"] = min(
+                timestamp_intervals, key=lambda item: item.get("epoch_start")
+            ).get("value")
+            source_meta["newest_timestamp"] = max(
+                timestamp_intervals, key=lambda item: item.get("epoch_end")
+            ).get("value")
+        source_meta["incident_window_covered"] = bool(
+            rows
+            and len(timestamp_intervals) == len(rows)
+            and incident_start_evidence.get("epoch_start") is not None
+            and incident_end_evidence.get("epoch_end") is not None
+            and min(
+                (item.get("epoch_start") for item in timestamp_intervals),
+                default=float("inf"),
+            ) <= incident_start_evidence.get("epoch_start")
+            and max(
+                (item.get("epoch_end") for item in timestamp_intervals),
+                default=float("-inf"),
+            ) >= incident_end_evidence.get("epoch_end")
+        )
+        metadata.append(source_meta)
+        per_source_matches.append(source_matches)
+
+    # Round-robin keeps later sources visible when an earlier source is noisy.
+    matches = []
+    offsets = [0] * len(per_source_matches)
+    while len(matches) < _FDSFF_V1_LOCAL_LIMIT:
+        progressed = False
+        for index, source_matches in enumerate(per_source_matches):
+            if offsets[index] >= len(source_matches):
+                continue
+            matches.append(source_matches[offsets[index]])
+            offsets[index] += 1
+            progressed = True
+            if len(matches) >= _FDSFF_V1_LOCAL_LIMIT:
+                break
+        if not progressed:
+            break
+    return matches, errors, len(metadata), metadata
+
+
+def _fdsff_v1_safe_live_lookup(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    def bounded_count(name, fallback):
+        try:
+            return max(0, min(int(payload.get(name, fallback) or 0), 10000))
+        except (TypeError, ValueError):
+            return max(0, min(int(fallback or 0), 10000))
+
+    attempted = [
+        str(item)[:120] for item in (payload.get("reader_calls_attempted") or [])[:30]
+    ]
+    completed = [
+        str(item)[:120] for item in (payload.get("reader_calls_completed") or [])[:30]
+    ]
+    skipped = [
+        str(item)[:120] for item in (payload.get("reader_calls_skipped_as_redundant") or [])[:30]
+    ]
+    result = {
+        "ok": bool(payload.get("ok")),
+        "status": _fdsff_v1_safe_scalar(payload.get("status"), 120),
+        "read_only": bool(payload.get("read_only", True)),
+        "sent": bool(payload.get("sent", False)),
+        "cancel_called": bool(payload.get("cancel_called", False)),
+        "close_called": bool(payload.get("close_called", False)),
+        "position_modified": bool(payload.get("position_modified", False)),
+        "reader_calls": [str(item)[:120] for item in (payload.get("reader_calls") or [])[:20]],
+        "reader_calls_attempted": attempted,
+        "reader_calls_completed": completed,
+        "reader_calls_skipped_as_redundant": skipped,
+        "reader_calls_attempted_count": bounded_count("reader_calls_attempted_count", len(attempted)),
+        "reader_calls_completed_count": bounded_count("reader_calls_completed_count", len(completed)),
+        "reader_calls_skipped_as_redundant_count": bounded_count(
+            "reader_calls_skipped_as_redundant_count", len(skipped)
+        ),
+        "rate_limit_pacing_applied": bool(payload.get("rate_limit_pacing_applied", False)),
+        "all_orders_params_contract": [
+            str(item)[:80] for item in (payload.get("all_orders_params_contract") or [])[:20]
+        ],
+        "all_orders_requested_limit": bounded_count("all_orders_requested_limit", 0),
+        "all_orders_returned_count": bounded_count("all_orders_returned_count", 0),
+        "all_orders_saturated": bool(payload.get("all_orders_saturated", False)),
+        "all_orders_pagination_incomplete": bool(
+            payload.get("all_orders_pagination_incomplete", False)
+        ),
+        "all_fill_orders_params_contract": [
+            str(item)[:80] for item in (payload.get("all_fill_orders_params_contract") or [])[:20]
+        ],
+        "all_fill_orders_trading_unit": _fdsff_v1_safe_scalar(
+            payload.get("all_fill_orders_trading_unit"), 32
+        ),
+        "history_window_basis": _fdsff_v1_safe_scalar(
+            payload.get("history_window_basis"), 80
+        ),
+        "history_window_start": _fdsff_v1_safe_scalar(payload.get("history_window_start"), 80),
+        "history_window_end": _fdsff_v1_safe_scalar(payload.get("history_window_end"), 80),
+        "factual_anchor_timestamp": _fdsff_v1_safe_scalar(
+            payload.get("factual_anchor_timestamp"), 80
+        ),
+        "reported_anchor_timestamp": _fdsff_v1_safe_scalar(
+            payload.get("reported_anchor_timestamp"), 80
+        ),
+        "history_window_anchor_conflict": bool(
+            payload.get("history_window_anchor_conflict", False)
+        ),
+        "history_window_complete": bool(payload.get("history_window_complete", False)),
+        "reader_errors": [],
+        "identity_filters": [],
+        "stop_orders": [],
+        "plan_orders": [],
+        "derived_orders": [],
+        "entry_orders": [],
+        "manual_close_orders": [],
+        "identity_conflicts": [],
+        "identity_ambiguous": [],
+        "position": None,
+        "raw_payload_exposed": False,
+    }
+    for error in (payload.get("reader_errors") or [])[:20]:
+        if isinstance(error, dict):
+            result["reader_errors"].append({
+                "source": _fdsff_v1_safe_scalar(error.get("source"), 120),
+                "error_type": _fdsff_v1_safe_scalar(error.get("error_type"), 120),
+                "response_code": _fdsff_v1_safe_scalar(error.get("response_code"), 40),
+            })
+    for item in (payload.get("identity_filters") or [])[:100]:
+        if isinstance(item, dict):
+            result["identity_filters"].append({
+                "source": _fdsff_v1_safe_scalar(item.get("source"), 120),
+                "reason": _fdsff_v1_safe_scalar(item.get("reason"), 120),
+            })
+    for collection in (
+        "stop_orders", "plan_orders", "derived_orders", "entry_orders",
+        "manual_close_orders", "identity_conflicts", "identity_ambiguous",
+    ):
+        for row in (payload.get(collection) or [])[:_FDSFF_V1_LOCAL_LIMIT]:
+            if not isinstance(row, dict):
+                continue
+            projected = {
+                key: _fdsff_v1_safe_scalar(row.get(key))
+                for key in _FDSFF_V1_ORDER_FIELDS
+                if row.get(key) not in (None, "")
+            }
+            for field in ("stop_identity_matched_fields", "stop_identity_conflicting_fields"):
+                values = row.get(field) if isinstance(row.get(field), (list, tuple, set)) else []
+                cleaned = [
+                    _fdsff_v1_safe_scalar(value, 80)
+                    for value in list(values)[:20]
+                    if _fdsff_v1_safe_scalar(value, 80) not in (None, "")
+                ]
+                if cleaned:
+                    projected[field] = cleaned
+            result[collection].append(projected)
+    position = payload.get("position")
+    if isinstance(position, dict):
+        result["position"] = {
+            key: _fdsff_v1_safe_scalar(position.get(key))
+            for key in (
+                "ok", "status", "symbol", "side", "amount", "position_closed",
+                "ownership_safe", "ownership_basis", "matched_count", "read_only", "sent",
+            )
+            if position.get(key) not in (None, "")
+        }
+    return result
+
+
+def _fdsff_v1_epoch(value):
+    record = {"timestamp": value}
+    try:
+        if value not in (None, "") and not isinstance(value, bool):
+            float(value)
+            record = {"epoch": value}
+    except (TypeError, ValueError):
+        pass
+    return _fdsff_v1_event_time_evidence(record).get("epoch_start")
+
+
+def _fdsff_v1_float(value):
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fdsff_v1_classify(records, live_lookup, query):
+    records = [row for row in (records or []) if isinstance(row, dict)]
+    live_lookup = live_lookup if isinstance(live_lookup, dict) else {}
+    live_source_complete_for_absence = bool(
+        str(live_lookup.get("status") or "").upper() == "READ_ONLY_LOOKUP_COMPLETE"
+        and not live_lookup.get("reader_errors")
+        and live_lookup.get("history_window_complete") is True
+        and not live_lookup.get("all_orders_saturated")
+        and not live_lookup.get("all_orders_pagination_incomplete")
+    )
+    local_negative_evidence_complete = bool(
+        live_lookup.get("local_negative_evidence_complete") is True
+    )
+    critical_alert_negative_evidence_complete = bool(
+        live_lookup.get("critical_alert_negative_evidence_complete") is True
+    )
+    target_stop_id = str(query.get("stop_order_id") or "").strip()
+    target_manual_close_id = str(query.get("manual_close_order_id") or "").strip()
+
+    def upper(value):
+        return str(value or "").upper().strip()
+
+    def falcon_ownership_eligible(row):
+        bot = upper(row.get("bot"))
+        return bool((not bot or bot == "FALCON") and row.get("external_position") is not True)
+
+    def stop_relation(row):
+        """Keep plan and child roles separate and reject ambiguous identity."""
+        order_id = str(row.get("order_id") or "").strip()
+        stop_id = str(row.get("stop_order_id") or "").strip()
+        requested_id = str(row.get("requested_order_id") or "").strip()
+        plan_id = str(row.get("plan_order_id") or "").strip()
+        trigger_id = str(row.get("trigger_order_id") or "").strip()
+        parent_id = str(row.get("parent_order_id") or "").strip()
+        explicit_role = upper(row.get("stop_identity_role"))
+        matched_fields = [
+            name for name, value in (
+                ("order_id", order_id), ("stop_order_id", stop_id),
+                ("requested_order_id", requested_id), ("plan_order_id", plan_id),
+                ("trigger_order_id", trigger_id), ("parent_order_id", parent_id),
+            )
+            if target_stop_id and value == target_stop_id
+        ]
+        preserved_conflicting_fields = (
+            row.get("stop_identity_conflicting_fields")
+            if isinstance(row.get("stop_identity_conflicting_fields"), (list, tuple, set))
+            else []
+        )
+        conflicting_fields = [
+            str(field).strip()
+            for field in preserved_conflicting_fields
+            if str(field or "").strip()
+        ]
+        if matched_fields:
+            if stop_id and stop_id != target_stop_id:
+                conflicting_fields.append("stop_order_id")
+            # An exact child lookup legitimately carries requested_order_id equal
+            # to its own factual order_id while plan_order_id points to the stop.
+            # Only a third, unrelated requested identity is conflicting.
+            if requested_id and requested_id not in {target_stop_id, order_id}:
+                conflicting_fields.append("requested_order_id")
+            if plan_id and plan_id != target_stop_id:
+                conflicting_fields.append("plan_order_id")
+        conflicting_fields = list(dict.fromkeys(conflicting_fields))
+        conflict = bool(
+            row.get("stop_identity_conflict") is True
+            or explicit_role == "IDENTITY_CONFLICT"
+            or conflicting_fields
+        )
+        if conflict:
+            role = "IDENTITY_CONFLICT"
+        elif order_id == target_stop_id:
+            role = "STOP_ORDER"
+        elif order_id and order_id != target_stop_id and target_stop_id in {plan_id, trigger_id, parent_id}:
+            role = "DERIVED_ORDER"
+        elif requested_id == target_stop_id and order_id and order_id != target_stop_id:
+            role = "REQUESTED_STOP_RESPONSE_ID_DIFFERENT"
+        elif stop_id == target_stop_id and order_id in {"", target_stop_id}:
+            role = "STOP_ORDER"
+        elif explicit_role == "REQUESTED_STOP_RESPONSE_ID_DIFFERENT" and matched_fields:
+            role = "REQUESTED_STOP_RESPONSE_ID_DIFFERENT"
+        else:
+            role = "UNRELATED"
+        return {
+            "related": bool(matched_fields),
+            "conflict": conflict,
+            "role": role,
+            "matched_fields": matched_fields,
+            "conflicting_fields": conflicting_fields,
+        }
+
+    def evidence_key(row):
+        return tuple(str(row.get(field) or "") for field in (
+            "source", "record_kind", "event", "order_id", "stop_order_id", "requested_order_id",
+            "plan_order_id", "parent_order_id", "trigger_order_id", "derived_order_id",
+            "fill_id", "fill_time", "raw_status", "status", "executed_quantity", "updated_at",
+        ))
+
+    all_identity_rows = []
+    seen_identity_rows = set()
+    for row in [
+        *records,
+        *(live_lookup.get("stop_orders") or []),
+        *(live_lookup.get("plan_orders") or []),
+        *(live_lookup.get("derived_orders") or []),
+        *(live_lookup.get("identity_conflicts") or []),
+        *(live_lookup.get("identity_ambiguous") or []),
+    ]:
+        if not isinstance(row, dict) or not falcon_ownership_eligible(row):
+            continue
+        key = evidence_key(row)
+        if key in seen_identity_rows:
+            continue
+        seen_identity_rows.add(key)
+        all_identity_rows.append(row)
+
+    related_rows = [(row, stop_relation(row)) for row in all_identity_rows]
+    stop_identity_conflict_rows = [row for row, relation in related_rows if relation.get("conflict")]
+    stop_identity_ambiguous_rows = [
+        row for row, relation in related_rows
+        if not relation.get("conflict")
+        and relation.get("role") == "REQUESTED_STOP_RESPONSE_ID_DIFFERENT"
+    ]
+    stop_rows = [
+        row for row, relation in related_rows
+        if not relation.get("conflict")
+        and relation.get("role") == "STOP_ORDER"
+    ]
+    child_ids = {
+        str(value).strip()
+        for row in stop_rows
+        for value in (row.get("derived_order_id"), row.get("trigger_order_id"))
+        if value not in (None, "") and str(value).strip() != target_stop_id
+    }
+    child_ids.update(
+        str(row.get("order_id") or "").strip()
+        for row, relation in related_rows
+        if not relation.get("conflict")
+        and relation.get("role") == "DERIVED_ORDER"
+        and str(row.get("order_id") or "").strip() not in {"", target_stop_id}
+    )
+    derived_rows = [
+        row for row, relation in related_rows
+        if not relation.get("conflict")
+        and str(row.get("order_id") or "").strip() not in {"", target_stop_id, target_manual_close_id}
+        and (
+            relation.get("role") == "DERIVED_ORDER"
+            or str(row.get("order_id") or "").strip() in child_ids
+        )
+    ]
+    local_manual_close_rows = [
+        row for row in records
+        if target_manual_close_id
+        and target_manual_close_id in {
+            str(row.get("manual_close_order_id") or "").strip(),
+            str(row.get("order_id") or "").strip()
+            if "MANUAL_CLOSE" in upper(row.get("event")) else "",
+        }
+    ]
+    live_manual_close_rows = [
+        row for row in (live_lookup.get("manual_close_orders") or [])
+        if target_manual_close_id and str(row.get("order_id") or "").strip() == target_manual_close_id
+    ]
+    manual_close_rows = [
+        row for row in [*local_manual_close_rows, *live_manual_close_rows]
+        if falcon_ownership_eligible(row)
+        and row not in stop_identity_conflict_rows
+    ]
+
+    def is_trade_row(row):
+        source = upper(row.get("source")).replace("-", "_").replace(".", "_")
+        return bool(
+            upper(row.get("record_kind")) == "TRADE"
+            or "ALL_FILL_ORDERS" in source
+            or "ALLFILLORDERS" in source
+            or "FETCH_MY_TRADES" in source
+        )
+
+    def status_channel(row, *fields):
+        return [
+            upper(row.get(field))
+            for field in fields
+            if row.get(field) not in (None, "")
+        ]
+
+    def order_statuses(row):
+        # A fill/trade status describes that fill, never the whole order.
+        # Preserve the raw exchange status as the first terminal diagnostic;
+        # the unified status remains visible as a second, separate value.
+        return [] if is_trade_row(row) else status_channel(row, "raw_status", "status")
+
+    def plan_statuses(row):
+        return status_channel(row, "plan_status")
+
+    def execute_statuses(row, *, factual_derived=False):
+        # executeStatus belongs to the executor only when the row has already
+        # been resolved as a factual child/derived order.
+        if is_trade_row(row) or not factual_derived:
+            return []
+        return status_channel(row, "execute_status")
+
+    def failure_channel_statuses(row):
+        return status_channel(row, "failure_status")
+
+    stop_order_statuses = [status for row in stop_rows for status in order_statuses(row)]
+    derived_order_statuses = [status for row in derived_rows for status in order_statuses(row)]
+    stop_plan_statuses = [status for row in stop_rows for status in plan_statuses(row)]
+    derived_plan_statuses = [status for row in derived_rows for status in plan_statuses(row)]
+    stop_execute_statuses = [
+        status for row in stop_rows for status in execute_statuses(row, factual_derived=False)
+    ]
+    derived_execute_statuses = [
+        status for row in derived_rows for status in execute_statuses(row, factual_derived=True)
+    ]
+    all_failure_channel_statuses = [
+        status for row in [*stop_rows, *derived_rows]
+        for status in failure_channel_statuses(row)
+    ]
+    stop_statuses = [*stop_order_statuses, *stop_plan_statuses, *stop_execute_statuses]
+    derived_statuses = [
+        *derived_order_statuses, *derived_plan_statuses, *derived_execute_statuses,
+    ]
+    stop_events = [upper(row.get("event")) for row in stop_rows]
+    derived_events = [upper(row.get("event")) for row in derived_rows]
+    trigger_statuses = {"TRIGGERED", "TRIGGERING"}
+    failure_statuses = {"FAILED", "REJECTED", "ERROR", "DISASTER_STOP_FAILED", "DISASTER_STOP_ERROR"}
+    cancel_statuses = {"CANCELED", "CANCELLED", "EXPIRED"}
+    filled_statuses = {"FILLED", "EXECUTED", "CLOSED_FILLED", "STOP_FILLED"}
+    stop_created = bool(stop_rows) and (
+        any(event in {"BROKER_DISASTER_STOP_CREATED", "DISASTER_STOP_CREATED", "STOP_CREATED"} for event in stop_events)
+        or any(row.get("order_id") or row.get("stop_order_id") for row in stop_rows)
+    )
+    triggered = bool(
+        derived_rows
+        or any(status in trigger_statuses for status in [
+            *stop_order_statuses, *stop_plan_statuses,
+            *derived_order_statuses, *derived_plan_statuses, *derived_execute_statuses,
+        ])
+        or any(event in {"STOP_TRIGGERED", "DISASTER_STOP_TRIGGERED"} for event in stop_events)
+        or any(row.get("triggered_at") for row in stop_rows)
+    )
+    all_terminal_statuses = [
+        *stop_order_statuses, *derived_order_statuses,
+        *stop_plan_statuses, *derived_plan_statuses,
+        *derived_execute_statuses, *all_failure_channel_statuses,
+    ]
+    all_terminal_events = [*stop_events, *derived_events]
+    failed = bool(
+        any(status in failure_statuses or status.endswith("_FAILED") or status.endswith("_REJECTED") for status in all_terminal_statuses)
+        or any(event in {"STOP_FAILED", "DISASTER_STOP_FAILED", "BROKER_DISASTER_STOP_ERROR"} for event in all_terminal_events)
+    )
+    canceled = any(status in cancel_statuses for status in all_terminal_statuses)
+    def canonical_quantity_unit(value):
+        unit = upper(value).replace("-", "_").replace(" ", "_")
+        if unit in {"COIN", "BASE", "BASE_ASSET", "ASSET", "VOLUME"}:
+            return "COIN"
+        if unit in {"CONT", "CONTRACT", "CONTRACTS"}:
+            return "CONT"
+        if unit in {"QUOTE", "QUOTE_ASSET", "USDT", "NOTIONAL"}:
+            return "QUOTE"
+        return None
+
+    def quantity_evidence(rows, field):
+        """Select the largest cumulative order snapshot; never sum snapshots."""
+        candidates = []
+        unit_field = f"{field}_unit"
+        source_field = f"{field}_source"
+        for row in rows:
+            if is_trade_row(row):
+                continue
+            value = _fdsff_v1_float(row.get(field))
+            if value is None or value < 0:
+                continue
+            raw_unit = row.get(unit_field) or row.get("quantity_unit")
+            candidates.append({
+                "value": value,
+                "unit": canonical_quantity_unit(raw_unit),
+                "raw_unit": raw_unit,
+                "source": row.get(source_field) or row.get("quantity_source") or row.get("source"),
+            })
+        known_units = {item["unit"] for item in candidates if item.get("unit")}
+        unit_conflict = len(known_units) > 1
+        selected_unit = next(iter(known_units)) if len(known_units) == 1 else None
+        selectable = [item for item in candidates if item.get("unit") == selected_unit] if selected_unit else candidates
+        return {
+            "value": max((item["value"] for item in selectable), default=None),
+            "unit": selected_unit,
+            "unit_conflict": unit_conflict,
+            "sources": sorted({str(item.get("source")) for item in selectable if item.get("source")})[:20],
+        }
+
+    def aggregate_unique_fills(rows, requested_unit=None, requested_total=None):
+        """Deduplicate factual fills and sum only complete, compatible evidence."""
+        unique = {}
+        order = []
+        keyless_count = 0
+        duplicate_payload_conflict = False
+        fill_order_identity_conflict = False
+        for row in rows:
+            if not is_trade_row(row):
+                continue
+            order_id = str(row.get("order_id") or "").strip()
+            fill_id = str(row.get("fill_id") or "").strip()
+            fill_time = (
+                row.get("fill_time") or row.get("filled_at") or row.get("executed_at")
+                or row.get("updated_at") or row.get("created_at")
+            )
+            quantity = _fdsff_v1_float(
+                row.get("fill_quantity")
+                if row.get("fill_quantity") not in (None, "")
+                else row.get("executed_quantity")
+            )
+            raw_unit = (
+                row.get("fill_quantity_unit") or row.get("executed_quantity_unit")
+                or row.get("quantity_unit")
+            )
+            unit = canonical_quantity_unit(raw_unit)
+            price = _fdsff_v1_float(
+                row.get("fill_price")
+                if row.get("fill_price") not in (None, "")
+                else row.get("average_fill_price")
+            )
+            fee = _fdsff_v1_float(row.get("fill_fee"))
+            if fill_id:
+                key = ("FILL_ID", fill_id)
+            elif order_id and fill_time not in (None, "") and quantity is not None and price is not None:
+                key = ("FALLBACK", order_id, str(fill_time), quantity, price, fee)
+            else:
+                keyless_count += 1
+                continue
+            candidate = {
+                "key": key,
+                "order_id": order_id,
+                "fill_id": fill_id or None,
+                "time": fill_time,
+                "epoch": _fdsff_v1_epoch(fill_time),
+                "quantity": quantity,
+                "unit": unit,
+                "raw_unit": raw_unit,
+                "price": price,
+                "fee": fee,
+                "source": row.get("fill_quantity_source") or row.get("executed_quantity_source") or row.get("source"),
+                "observed_order_ids": {order_id} if order_id else set(),
+                "observed_sources": {
+                    str(row.get("source") or row.get("fill_quantity_source") or "")
+                } - {""},
+            }
+            previous = unique.get(key)
+            if previous is not None:
+                previous["observed_order_ids"].update(candidate["observed_order_ids"])
+                previous["observed_sources"].update(candidate["observed_sources"])
+                if len(previous["observed_order_ids"]) > 1:
+                    fill_order_identity_conflict = True
+                if any(previous.get(field) != candidate.get(field) for field in ("quantity", "unit", "price", "fee")):
+                    duplicate_payload_conflict = True
+                continue
+            unique[key] = candidate
+            order.append(key)
+
+        fills = [unique[key] for key in order]
+        units = {item.get("unit") for item in fills if item.get("unit")}
+        unknown_unit = any(item.get("unit") is None for item in fills)
+        incompatible_with_request = bool(
+            requested_unit and units and any(unit != requested_unit for unit in units)
+        )
+        unit_conflict = bool(len(units) > 1 or incompatible_with_request)
+        missing_quantity = any(item.get("quantity") is None or item.get("quantity") < 0 for item in fills)
+        aggregation_inconclusive = bool(
+            keyless_count or unknown_unit or unit_conflict or missing_quantity
+            or duplicate_payload_conflict or fill_order_identity_conflict
+        )
+        usable = bool(fills and not aggregation_inconclusive)
+        quantity = sum(item["quantity"] for item in fills) if usable else None
+        unit = next(iter(units)) if usable and len(units) == 1 else None
+        timed_fills = sorted(
+            (item for item in fills if item.get("epoch") is not None),
+            key=lambda item: item["epoch"],
+        )
+        first_fill_time = timed_fills[0].get("time") if timed_fills else None
+        last_fill_time = timed_fills[-1].get("time") if timed_fills else None
+        completion_fill_time = None
+        if usable and timed_fills:
+            if (
+                requested_total is not None and requested_total > 0
+                and requested_unit is not None
+                and unit == requested_unit
+            ):
+                running = 0.0
+                for item in timed_fills:
+                    running += item["quantity"]
+                    if running + 1e-12 >= requested_total:
+                        completion_fill_time = item.get("time")
+                        break
+            elif requested_total is None:
+                completion_fill_time = last_fill_time
+        weighted_average_price = None
+        if usable and quantity and all(item.get("price") is not None for item in fills):
+            weighted_average_price = sum(item["quantity"] * item["price"] for item in fills) / quantity
+        observed_quantity_once = (
+            sum(item["quantity"] for item in fills)
+            if fills and all(item.get("quantity") is not None and item.get("quantity") >= 0 for item in fills)
+            else None
+        )
+        return {
+            "value": quantity,
+            "unit": unit,
+            "fill_count": len(fills),
+            "fill_ids": [item["fill_id"] for item in fills if item.get("fill_id")][:100],
+            "sources": sorted({str(item.get("source")) for item in fills if item.get("source")})[:20],
+            "aggregation_source": (
+                "SUM_UNIQUE_EXACT_FILLS" if usable
+                else "EXACT_FILLS_INCONCLUSIVE" if fills or keyless_count
+                else "NO_EXACT_FILLS"
+            ),
+            "aggregation_inconclusive": aggregation_inconclusive,
+            "unit_conflict": unit_conflict,
+            "unknown_unit": unknown_unit,
+            "keyless_count": keyless_count,
+            "duplicate_conflict": duplicate_payload_conflict,
+            "fill_duplicate_payload_conflict": duplicate_payload_conflict,
+            "fill_order_identity_conflict": fill_order_identity_conflict,
+            "observed_quantity_once": observed_quantity_once,
+            "fill_order_observations": [
+                {
+                    "fill_id": item.get("fill_id"),
+                    "observed_order_ids": sorted(item.get("observed_order_ids") or [])[:20],
+                    "observed_sources": sorted(item.get("observed_sources") or [])[:20],
+                }
+                for item in fills[:100]
+                if item.get("fill_id")
+            ],
+            "first_fill_time": first_fill_time,
+            "last_fill_time": last_fill_time,
+            "completion_fill_time": completion_fill_time,
+            "weighted_average_price": weighted_average_price,
+        }
+
+    requested_evidence = quantity_evidence(stop_rows, "requested_quantity")
+    stop_executed_evidence = quantity_evidence(stop_rows, "executed_quantity")
+    derived_executed_evidence = quantity_evidence(derived_rows, "executed_quantity")
+    requested_quantity = requested_evidence.get("value")
+    requested_quantity_unit = requested_evidence.get("unit")
+    fill_evidence = aggregate_unique_fills(
+        [*stop_rows, *derived_rows],
+        requested_unit=requested_quantity_unit,
+        requested_total=requested_quantity,
+    )
+    derived_fill_evidence = aggregate_unique_fills(
+        derived_rows,
+        requested_unit=requested_quantity_unit,
+        requested_total=requested_quantity,
+    )
+    stop_plan_executed_quantity = stop_executed_evidence.get("value")
+    derived_executed_quantity = (
+        derived_fill_evidence.get("value")
+        if derived_fill_evidence.get("aggregation_source") == "SUM_UNIQUE_EXACT_FILLS"
+        else derived_executed_evidence.get("value")
+    )
+    if fill_evidence.get("aggregation_source") == "SUM_UNIQUE_EXACT_FILLS":
+        executed_quantity = fill_evidence.get("value")
+        executed_quantity_unit = fill_evidence.get("unit")
+        executed_quantity_sources = fill_evidence.get("sources")
+        executed_quantity_aggregation_source = "SUM_UNIQUE_EXACT_FILLS"
+    else:
+        executed_evidence = derived_executed_evidence if derived_rows else stop_executed_evidence
+        executed_quantity = executed_evidence.get("value")
+        executed_quantity_unit = executed_evidence.get("unit")
+        executed_quantity_sources = executed_evidence.get("sources")
+        executed_quantity_aggregation_source = (
+            "MAX_CUMULATIVE_ORDER_SNAPSHOT" if executed_quantity is not None
+            else fill_evidence.get("aggregation_source")
+        )
+    quantity_units_compatible = bool(
+        requested_quantity_unit
+        and executed_quantity_unit
+        and requested_quantity_unit == executed_quantity_unit
+        and not requested_evidence.get("unit_conflict")
+        and not fill_evidence.get("unit_conflict")
+        and not (
+            executed_quantity_aggregation_source == "MAX_CUMULATIVE_ORDER_SNAPSHOT"
+            and (derived_executed_evidence if derived_rows else stop_executed_evidence).get("unit_conflict")
+        )
+    )
+    fill_aggregation_blocks_confirmation = bool(
+        fill_evidence.get("fill_count")
+        and fill_evidence.get("aggregation_inconclusive")
+    )
+    quantity_unit_conflict = bool(
+        requested_evidence.get("unit_conflict")
+        or fill_evidence.get("unit_conflict")
+        or (
+            executed_quantity_aggregation_source == "MAX_CUMULATIVE_ORDER_SNAPSHOT"
+            and (derived_executed_evidence if derived_rows else stop_executed_evidence).get("unit_conflict")
+        )
+        or (
+            requested_quantity_unit and executed_quantity_unit
+            and requested_quantity_unit != executed_quantity_unit
+        )
+    )
+    stop_filled_status = any(status in filled_statuses for status in stop_order_statuses)
+    derived_filled_status = any(
+        status in filled_statuses
+        for status in [*derived_order_statuses, *derived_execute_statuses]
+    )
+    order_filled_status = bool(stop_filled_status or derived_filled_status)
+    exact_quantitative_fill_evidence_present = any(
+        is_trade_row(row)
+        and _fdsff_v1_float(
+            row.get("fill_quantity")
+            if row.get("fill_quantity") not in (None, "")
+            else row.get("executed_quantity")
+        ) is not None
+        for row in [*stop_rows, *derived_rows]
+    )
+    quantities_comparable = bool(
+        requested_quantity is not None
+        and executed_quantity is not None
+        and requested_quantity_unit is not None
+        and executed_quantity_unit is not None
+        and quantity_units_compatible
+        and not quantity_unit_conflict
+        and not fill_aggregation_blocks_confirmation
+    )
+    quantity_unit_inconclusive = bool(
+        executed_quantity is not None
+        and (
+            requested_quantity_unit is None
+            or executed_quantity_unit is None
+            or not quantity_units_compatible
+            or quantity_unit_conflict
+        )
+    )
+    quantity_reaches_requested = bool(
+        quantities_comparable
+        and requested_quantity is not None
+        and executed_quantity is not None
+        and executed_quantity > 0
+        and executed_quantity + 1e-12 >= requested_quantity
+    )
+    explicit_quantity_conflict = bool(
+        quantities_comparable
+        and executed_quantity is not None
+        and (
+            abs(executed_quantity) <= 1e-12
+            or (
+                requested_quantity is not None
+                and executed_quantity + 1e-12 < requested_quantity
+            )
+        )
+    )
+    filled_quantity_conflict = bool(
+        order_filled_status
+        and explicit_quantity_conflict
+        and not quantity_reaches_requested
+    )
+    quantity_confirmation_available = bool(quantities_comparable)
+    zero_fill = bool(
+        quantity_confirmation_available
+        and executed_quantity is not None
+        and abs(executed_quantity) <= 1e-12
+    )
+    factual_order_filled_status = any(
+        upper(row.get("record_kind")) == "ORDER"
+        and any(status in filled_statuses for status in order_statuses(row))
+        for row in [*stop_rows, *derived_rows]
+    )
+    status_fill_with_quantity_unavailable = bool(
+        factual_order_filled_status
+        and executed_quantity is None
+        and not exact_quantitative_fill_evidence_present
+        and not stop_identity_ambiguous_rows
+        and not stop_identity_conflict_rows
+        and not failed
+        and not canceled
+    )
+    full_fill = bool(
+        quantity_reaches_requested
+        or status_fill_with_quantity_unavailable
+    )
+    terminal_evidence_conflict = bool(
+        (full_fill and failed)
+        or filled_quantity_conflict
+        or (order_filled_status and failed)
+    )
+    incident = bool(
+        terminal_evidence_conflict
+        or (failed and not full_fill)
+        or (canceled and not full_fill)
+        or (triggered and zero_fill and not full_fill)
+    )
+    terminal_rows = [*stop_rows, *derived_rows]
+    def terminal_candidate_statuses(row):
+        return [
+            *order_statuses(row),
+            *plan_statuses(row),
+            *execute_statuses(row, factual_derived=row in derived_rows),
+            *failure_channel_statuses(row),
+        ]
+
+    failure_rows = [
+        row for row in terminal_rows
+        if any(
+            status in failure_statuses or status.endswith("_FAILED") or status.endswith("_REJECTED")
+            for status in terminal_candidate_statuses(row)
+        )
+        or upper(row.get("event")) in {"STOP_FAILED", "DISASTER_STOP_FAILED", "BROKER_DISASTER_STOP_ERROR"}
+    ]
+    canceled_incident_rows = [
+        row for row in terminal_rows
+        if not full_fill and any(status in cancel_statuses for status in terminal_candidate_statuses(row))
+    ]
+    incident_detail_rows = [*failure_rows, *canceled_incident_rows]
+    failure_reason = next((row.get("failure_reason") for row in incident_detail_rows if row.get("failure_reason")), None) if incident else None
+    failure_code = next((row.get("failure_code") for row in incident_detail_rows if row.get("failure_code")), None) if incident else None
+    manual_requested_evidence = quantity_evidence(manual_close_rows, "requested_quantity")
+    manual_snapshot_evidence = quantity_evidence(manual_close_rows, "executed_quantity")
+    manual_reported_quantity = _fdsff_v1_float(query.get("manual_close_quantity"))
+    manual_requested_total = manual_requested_evidence.get("value")
+    if manual_requested_total is None:
+        manual_requested_total = manual_reported_quantity
+    manual_requested_unit = manual_requested_evidence.get("unit")
+    manual_fill_evidence = aggregate_unique_fills(
+        manual_close_rows,
+        requested_unit=manual_requested_unit,
+        requested_total=manual_requested_total,
+    )
+    if manual_fill_evidence.get("aggregation_source") == "SUM_UNIQUE_EXACT_FILLS":
+        manual_close_executed_quantity = manual_fill_evidence.get("value")
+        manual_close_executed_quantity_unit = manual_fill_evidence.get("unit")
+        manual_close_executed_quantity_source = "SUM_UNIQUE_EXACT_FILLS"
+    elif manual_snapshot_evidence.get("value") is not None:
+        manual_close_executed_quantity = manual_snapshot_evidence.get("value")
+        manual_close_executed_quantity_unit = manual_snapshot_evidence.get("unit")
+        manual_close_executed_quantity_source = "MAX_CUMULATIVE_ORDER_SNAPSHOT"
+    else:
+        manual_close_executed_quantity = manual_reported_quantity
+        manual_close_executed_quantity_unit = None
+        manual_close_executed_quantity_source = (
+            "USER_REPORTED_QUANTITY" if manual_reported_quantity is not None
+            else manual_fill_evidence.get("aggregation_source")
+        )
+    reported_failure_timestamp = query.get("failure_timestamp")
+    reported_manual_close_timestamp = query.get("manual_close_timestamp")
+    reported_failure_epoch = _fdsff_v1_epoch(reported_failure_timestamp)
+    reported_manual_close_epoch = _fdsff_v1_epoch(reported_manual_close_timestamp)
+    live_stop_source_rows = [
+        row
+        for collection in ("stop_orders", "plan_orders")
+        for row in (live_lookup.get(collection) or [])
+        if isinstance(row, dict)
+    ]
+    live_derived_source_rows = [
+        row for row in (live_lookup.get("derived_orders") or []) if isinstance(row, dict)
+    ]
+    factual_failure_rows = [
+        row for row in incident_detail_rows
+        if str(row.get("source") or "").lower().startswith("bingx")
+        or row in live_stop_source_rows
+        or row in live_derived_source_rows
+    ]
+    factual_manual_close_rows = [
+        row for row in manual_close_rows
+        if str(row.get("source") or "").lower().startswith("bingx")
+        or row in live_manual_close_rows
+    ]
+    def first_factual_timestamp(rows, fields, row_filter=None):
+        for field in fields:
+            for row in rows:
+                if row_filter is not None and not row_filter(row, field):
+                    continue
+                if row.get(field) not in (None, ""):
+                    return row.get(field)
+        return None
+
+    bingx_failure_timestamp = first_factual_timestamp(
+        factual_failure_rows,
+        ("failed_at", "canceled_at", "updated_at"),
+    )
+
+    terminal_order_rows = [
+        row for row in factual_manual_close_rows
+        if not is_trade_row(row)
+        and set(order_statuses(row)).intersection(filled_statuses)
+    ]
+    factual_manual_fill_evidence = aggregate_unique_fills(
+        factual_manual_close_rows,
+        requested_unit=manual_requested_unit,
+        requested_total=manual_requested_total,
+    )
+    factual_fill_timestamps = []
+    for row in factual_manual_close_rows:
+        if not is_trade_row(row):
+            continue
+        value = (
+            row.get("fill_time") or row.get("filled_at") or row.get("executed_at")
+            or row.get("closed_at") or row.get("updated_at") or row.get("created_at")
+        )
+        epoch = _fdsff_v1_epoch(value)
+        if epoch is not None:
+            factual_fill_timestamps.append((epoch, value))
+    latest_factual_fill_timestamp = (
+        max(factual_fill_timestamps, key=lambda item: item[0])[1]
+        if factual_fill_timestamps else None
+    )
+    # A trade/fill record is the factual execution source.  An order-detail
+    # ``updated_at`` may move minutes later, so it is only a bounded fallback
+    # when no fill reader returned a usable timestamp.  Plain order
+    # ``created_at`` is never promoted to the manual close time.
+    # Never treat the first arbitrary trade row as the completed-close time.
+    # Exact fills must reach the requested quantity; otherwise only a factual
+    # terminal order timestamp may serve as a bounded fallback.
+    bingx_manual_close_timestamp = factual_manual_fill_evidence.get(
+        "completion_fill_time"
+    ) or (
+        latest_factual_fill_timestamp if manual_requested_total is None else None
+    ) or first_factual_timestamp(
+        terminal_order_rows,
+        ("filled_at", "executed_at", "closed_at", "updated_at"),
+    )
+    bingx_failure_epoch = _fdsff_v1_epoch(bingx_failure_timestamp)
+    bingx_manual_close_epoch = _fdsff_v1_epoch(bingx_manual_close_timestamp)
+    manual_after_factual_failure = bool(
+        bingx_failure_epoch is not None
+        and bingx_manual_close_epoch is not None
+        and bingx_manual_close_epoch > bingx_failure_epoch
+    )
+    manual_after_reported_failure = bool(
+        not manual_after_factual_failure
+        and reported_failure_epoch is not None
+        and reported_manual_close_epoch is not None
+        and reported_manual_close_epoch > reported_failure_epoch
+    )
+    failure_timestamp_conflict = bool(
+        bingx_failure_epoch is not None
+        and reported_failure_epoch is not None
+        and abs(bingx_failure_epoch - reported_failure_epoch) > 1.0
+    )
+    manual_close_timestamp_conflict = bool(
+        bingx_manual_close_epoch is not None
+        and reported_manual_close_epoch is not None
+        and abs(bingx_manual_close_epoch - reported_manual_close_epoch) > 1.0
+    )
+    manual_epoch = bingx_manual_close_epoch or reported_manual_close_epoch
+    position = live_lookup.get("position") if isinstance(live_lookup.get("position"), dict) else {}
+    current_position_amount = _fdsff_v1_float(position.get("amount"))
+    symbol_side_exposure_currently_open = bool(
+        position.get("ok") is True
+        and current_position_amount is not None
+        and current_position_amount > 0
+    )
+    position_currently_open = bool(
+        position.get("ok") is True
+        and position.get("ownership_safe") is True
+        and current_position_amount is not None
+        and current_position_amount > 0
+    )
+    explicit_position_after_failure = any(
+        row.get("position_still_open_after_failure") is True
+        for row in records
+    )
+    position_open_after_failure = bool(incident and explicit_position_after_failure)
+    failsafe_rows = []
+    failsafe_candidate_rows = []
+    for row in records:
+        correlation_role = upper(row.get("operational_correlation_role"))
+        if correlation_role == "FAILSAFE_CLOSE_AUDIT_CANDIDATE":
+            failsafe_candidate_rows.append(row)
+            continue
+        haystack = " ".join(str(row.get(key) or "") for key in (
+            "event", "status", "diagnostic_reason", "failsafe_block_reason",
+        )).upper()
+        strong_identity = bool(
+            not row.get("stop_identity_conflict")
+            and (
+                (
+                    target_stop_id
+                    and target_stop_id in {
+                        str(row.get("stop_order_id") or "").strip(),
+                        str(row.get("order_id") or "").strip(),
+                    }
+                )
+                or (
+                    query.get("lifecycle_id")
+                    and str(query.get("lifecycle_id"))
+                    == str(row.get("lifecycle_id") or "")
+                )
+                or (
+                    query.get("client_order_id")
+                    and str(query.get("client_order_id"))
+                    == str(row.get("client_order_id") or "")
+                )
+            )
+        )
+        explicit_falcon_failsafe = bool(
+            "FAILSAFE" in haystack
+            and strong_identity
+            and upper(row.get("bot")) in {"", "FALCON"}
+        )
+        is_failsafe_evidence = bool(
+            correlation_role == "FAILSAFE_CLOSE_AUDIT"
+            or row.get("failsafe_attempted") is True
+            or explicit_falcon_failsafe
+        )
+        if not is_failsafe_evidence:
+            continue
+        annotated = dict(row)
+        if upper(annotated.get("status")) == "STOP_FAILSAFE_MARKET_CONFIRMED":
+            annotated.setdefault("failsafe_order_sent", True)
+            annotated.setdefault("failsafe_execution_confirmed", True)
+            annotated.setdefault("failsafe_executed", True)
+        relation = _fdsff_v1_incident_time_relation(annotated, query)
+        annotated.setdefault("failsafe_attempt_inside_incident_window", relation.get("inside"))
+        annotated.setdefault("failsafe_timing_basis", relation.get("basis"))
+        annotated.setdefault("failsafe_timing_conflict", relation.get("conflict"))
+        event_time = relation.get("event") or {}
+        annotated.setdefault("failsafe_timestamp", event_time.get("value"))
+        annotated.setdefault("failsafe_timestamp_source_field", event_time.get("source_field"))
+        annotated.setdefault("failsafe_timestamp_basis", event_time.get("basis"))
+        annotated.setdefault("failsafe_timestamp_precision", event_time.get("precision"))
+        annotated.setdefault("failsafe_timestamp_epoch_start", event_time.get("epoch_start"))
+        annotated.setdefault("failsafe_timestamp_epoch_end", event_time.get("epoch_end"))
+        annotated.setdefault("failsafe_timestamp_timezone_basis", event_time.get("timezone_basis"))
+        annotated.setdefault("failsafe_timestamp_evidence_conflict", event_time.get("evidence_conflict"))
+        annotated.setdefault("failsafe_incident_time_relation", relation.get("relation"))
+        annotated.setdefault("failsafe_interval_fully_inside", relation.get("interval_fully_inside"))
+        annotated.setdefault("failsafe_overlaps_start_boundary", relation.get("overlaps_start_boundary"))
+        annotated.setdefault("failsafe_overlaps_end_boundary", relation.get("overlaps_end_boundary"))
+        annotated.setdefault("failsafe_clock_skew_tolerance_only", relation.get("clock_skew_tolerance_only"))
+        if relation.get("complete") and relation.get("inside") is False:
+            if strong_identity:
+                relation_conflicts = {
+                    "OVERLAPS_INCIDENT_START_BOUNDARY": "INCIDENT_WINDOW_START_BOUNDARY_AMBIGUOUS",
+                    "OVERLAPS_INCIDENT_END_BOUNDARY": "INCIDENT_WINDOW_END_BOUNDARY_AMBIGUOUS",
+                    "COVERS_BOTH_INCIDENT_BOUNDARIES": "INCIDENT_WINDOW_BOTH_BOUNDARIES_AMBIGUOUS",
+                    "CLOCK_SKEW_TOLERANCE_ONLY_BEFORE": "INCIDENT_CLOCK_SKEW_BEFORE_START_CANDIDATE",
+                    "CLOCK_SKEW_TOLERANCE_ONLY_AFTER": "INCIDENT_CLOCK_SKEW_AFTER_END_CANDIDATE",
+                }
+                annotated["operational_correlation_role"] = "FAILSAFE_CLOSE_AUDIT_CANDIDATE"
+                annotated["operational_correlation_conflict"] = relation_conflicts.get(
+                    relation.get("relation"), "FAILSAFE_ATTEMPT_OUTSIDE_INCIDENT_WINDOW"
+                )
+                annotated["failsafe_timing_conflict"] = True
+                failsafe_candidate_rows.append(annotated)
+            # Weak broker/local identity outside this incident is unrelated.
+            continue
+        failsafe_rows.append(annotated)
+    has_failsafe_candidate = bool(failsafe_candidate_rows)
+    failsafe_blocked_by_ownership = any(
+        "OWNERSHIP" in " ".join(str(row.get(key) or "") for key in (
+            "event", "status", "diagnostic_reason", "failsafe_block_reason", "ownership_status",
+        )).upper()
+        for row in failsafe_rows
+    )
+    grouped_failsafe = _fdsff_v1_group_failsafe_attempts(failsafe_rows)
+    failsafe_attempts = grouped_failsafe.get("attempts") or []
+    failsafe_close_attempt_found = bool(failsafe_attempts)
+
+    def aggregate_attempt_bool(field, *, any_true=True):
+        values = [attempt.get(field) for attempt in failsafe_attempts]
+        factual = [value for value in values if isinstance(value, bool)]
+        unresolved = len(factual) != len(values)
+        if any_true and any(value is True for value in factual):
+            return True
+        if factual and all(value is False for value in factual) and not unresolved:
+            return False
+        return None
+
+    failsafe_order_sent = aggregate_attempt_bool("failsafe_order_sent")
+    failsafe_execution_confirmed = aggregate_attempt_bool("failsafe_execution_confirmed")
+    failsafe_executed = aggregate_attempt_bool("failsafe_executed")
+    failsafe_any_execution_confirmed = any(
+        attempt.get("failsafe_execution_confirmed") is True
+        for attempt in failsafe_attempts
+    )
+    failsafe_all_attempts_resolved = bool(
+        failsafe_attempts
+        and grouped_failsafe.get("dedup_inconclusive") is not True
+        and all(attempt.get("resolved") is True for attempt in failsafe_attempts)
+    )
+
+    def aggregate_attempt_amount(field):
+        values = [
+            _fdsff_v1_float(attempt.get(field))
+            for attempt in failsafe_attempts
+            if _fdsff_v1_float(attempt.get(field)) is not None
+        ]
+        if not values:
+            return None, False
+        reference = values[0]
+        tolerance = max(1e-9, max(abs(value) for value in values + [1.0]) * 1e-6)
+        compatible = all(abs(value - reference) <= tolerance for value in values[1:])
+        return (reference if compatible else None), not compatible
+
+    failsafe_filled_amount, filled_amount_conflict = aggregate_attempt_amount(
+        "failsafe_filled_amount"
+    )
+    failsafe_remaining_amount, remaining_amount_conflict = aggregate_attempt_amount(
+        "failsafe_remaining_amount"
+    )
+    failsafe_amount_evidence_conflict = bool(
+        grouped_failsafe.get("amount_evidence_conflict")
+        or filled_amount_conflict
+        or remaining_amount_conflict
+    )
+    if grouped_failsafe.get("amount_evidence_conflict"):
+        failsafe_filled_amount = None
+        failsafe_remaining_amount = None
+    failsafe_bool_conflict = any(
+        any(attempt.get(field) is True for attempt in failsafe_attempts)
+        and any(attempt.get(field) is False for attempt in failsafe_attempts)
+        for field in (
+            "failsafe_order_sent", "failsafe_execution_confirmed", "failsafe_executed",
+        )
+    )
+    failsafe_timestamp_conflict = any(
+        row.get("failsafe_timestamp_evidence_conflict") is True
+        for row in failsafe_rows + failsafe_candidate_rows
+    )
+    failsafe_evidence_conflict = bool(
+        failsafe_bool_conflict
+        or failsafe_amount_evidence_conflict
+        or failsafe_timestamp_conflict
+    )
+    failsafe_inside_values = [
+        attempt.get("failsafe_attempt_inside_incident_window")
+        for attempt in failsafe_attempts
+    ]
+    failsafe_attempt_inside_incident_window = (
+        True if any(value is True for value in failsafe_inside_values)
+        else False if failsafe_inside_values and all(value is False for value in failsafe_inside_values)
+        else None
+    )
+    failsafe_attempt_before_manual_close = bool(
+        failsafe_close_attempt_found
+        and failsafe_attempt_inside_incident_window is True
+    )
+    timing_bases = list(dict.fromkeys(
+        str(value)
+        for value in (
+            [attempt.get("failsafe_timing_basis") for attempt in failsafe_attempts]
+            + [row.get("failsafe_timing_basis") for row in failsafe_candidate_rows]
+        )
+        if value not in (None, "")
+    ))
+    failsafe_timing_basis = (
+        timing_bases[0] if len(timing_bases) == 1
+        else "MULTIPLE_TIMING_BASES" if timing_bases else None
+    )
+    failsafe_timing_conflict = bool(
+        failsafe_timestamp_conflict
+        or any(attempt.get("failsafe_timing_conflict") is True for attempt in failsafe_attempts)
+        or any(row.get("failsafe_attempt_inside_incident_window") is False for row in failsafe_candidate_rows)
+    )
+    critical_event_names = {
+        "FALCON_DISASTER_STOP_ANOMALY",
+        "FALCON_DISASTER_STOP_VERIFICATION_BLOCKED",
+    }
+    critical_condition_rows = [row for row in records if upper(row.get("event")) in critical_event_names]
+
+    def critical_alert_context(row):
+        event = upper(row.get("event"))
+        health_stop_state = bool(
+            str(row.get("source") or "").lower() == "falcon.health"
+            and target_stop_id
+            and str(row.get("stop_order_id") or "").strip() == target_stop_id
+            and "STOP" in upper(
+                row.get("diagnostic_reason") or row.get("alert_block_reason")
+            )
+        )
+        return bool(
+            event in critical_event_names
+            or "CRITICAL_ALERT" in event
+            or "DISASTER_STOP_ANOMALY" in event
+            or health_stop_state
+            or row.get("critical_alert_attempted") is True
+            or row.get("critical_alert_transport_called") is True
+            or (
+                row.get("telegram_sent") is True
+                and target_stop_id
+                and str(row.get("stop_order_id") or "").strip() == target_stop_id
+            )
+        )
+
+    critical_alert_state_rows = [
+        row for row in records
+        if critical_alert_context(row)
+        and (
+            row.get("alert_status") not in (None, "")
+            or row.get("alert_suppressed") is True
+            or row.get("alert_block_reason") not in (None, "")
+            or "BLOCK" in upper(row.get("status"))
+        )
+    ]
+    alert_attempt_events = {
+        "FALCON_CRITICAL_ALERT_ATTEMPT",
+        "FALCON_CRITICAL_ALERT_TRANSPORT_ATTEMPT",
+        "TELEGRAM_ALERT_ATTEMPT",
+        "TELEGRAM_SEND_ATTEMPT",
+    }
+    critical_alert_attempt_rows = [
+        row for row in records
+        if critical_alert_context(row)
+        and (
+            row.get("critical_alert_attempted") is True
+            or upper(row.get("event")) in alert_attempt_events
+            or row.get("telegram_sent") is True
+        )
+    ]
+    critical_alert_transport_rows = [
+        row for row in records
+        if critical_alert_context(row)
+        and (
+            row.get("critical_alert_transport_called") is True
+            or upper(row.get("event")) in {
+                "FALCON_CRITICAL_ALERT_TRANSPORT_ATTEMPT",
+                "TELEGRAM_ALERT_ATTEMPT",
+                "TELEGRAM_SEND_ATTEMPT",
+            }
+            or row.get("telegram_sent") is True
+        )
+    ]
+    critical_alert_delivery_confirmed = any(
+        row.get("telegram_sent") is True for row in critical_alert_attempt_rows
+    )
+    critical_alert_suppressed = any(
+        row.get("alert_suppressed") is True or upper(row.get("alert_status")) == "SUPPRESSED_COOLDOWN"
+        for row in critical_alert_state_rows
+    )
+    critical_alert_blocked = any(
+        bool(row.get("alert_block_reason"))
+        or any(
+            marker in " ".join((
+                upper(row.get("alert_status")),
+                upper(row.get("status")),
+                upper(row.get("diagnostic_reason")),
+            ))
+            for marker in ("BLOCK", "DENIED", "REJECTED", "IDENTITY_INSUFFICIENT")
+        )
+        for row in critical_alert_state_rows
+    )
+    derived_order_found = (
+        True if derived_rows
+        else False if live_source_complete_for_absence
+        else None
+    )
+    manual_close_derived_conflict_rows = []
+    for row, relation in related_rows:
+        if not target_manual_close_id or str(row.get("order_id") or "").strip() != target_manual_close_id:
+            continue
+        conflicting_fields = set(relation.get("conflicting_fields") or [])
+        factual_stop_link = target_stop_id in {
+            str(row.get("parent_order_id") or "").strip(),
+            str(row.get("plan_order_id") or "").strip(),
+            str(row.get("trigger_order_id") or "").strip(),
+        }
+        preserved_role = upper(row.get("stop_identity_role"))
+        preserved_manual_derived_collision = bool(
+            "MANUAL" in preserved_role and "DERIVED" in preserved_role
+        )
+        if (
+            factual_stop_link
+            or "manual_close_order_id" in conflicting_fields
+            or preserved_manual_derived_collision
+        ):
+            manual_close_derived_conflict_rows.append(row)
+    manual_close_linked_as_derived = bool(manual_close_derived_conflict_rows)
+    manual_close_positive_evidence = bool(
+        manual_close_rows
+        or any(
+            target_manual_close_id
+            and str(row.get("order_id") or "").strip() == target_manual_close_id
+            for row in stop_identity_conflict_rows
+        )
+    )
+    manual_close_order_found = (
+        True if manual_close_positive_evidence
+        else False if live_source_complete_for_absence
+        else None
+    )
+    identity_conflicting_fields = {
+        field
+        for row in stop_identity_conflict_rows
+        for field in (stop_relation(row).get("conflicting_fields") or [])
+    }
+
+    classifications = []
+    if stop_created:
+        classifications.append("STOP_CREATED")
+    if triggered:
+        classifications.append("STOP_TRIGGERED")
+        if derived_order_found is True:
+            classifications.append("STOP_DERIVED_ORDER_FOUND")
+        elif derived_order_found is False:
+            classifications.append("STOP_DERIVED_ORDER_NOT_FOUND")
+        else:
+            classifications.append("STOP_DERIVED_ORDER_EVIDENCE_INCONCLUSIVE")
+    if full_fill:
+        classifications.append("STOP_FILLED")
+        if status_fill_with_quantity_unavailable:
+            classifications.append("STOP_FILLED_BY_ORDER_STATUS_QUANTITY_UNAVAILABLE")
+    if filled_quantity_conflict:
+        classifications.append("STOP_FILLED_QUANTITY_CONFLICT")
+    if fill_evidence.get("fill_order_identity_conflict"):
+        classifications.append("FILL_ORDER_IDENTITY_CONFLICT")
+    if fill_evidence.get("fill_duplicate_payload_conflict"):
+        classifications.append("FILL_DUPLICATE_PAYLOAD_CONFLICT")
+    if triggered and zero_fill and not full_fill:
+        classifications.append("STOP_TRIGGERED_ZERO_FILL")
+    if failed:
+        classifications.append("STOP_FAILED")
+    if terminal_evidence_conflict:
+        classifications.append("STOP_TERMINAL_EVIDENCE_CONFLICT")
+    explicit_canceled_before_trigger = bool(
+        any(event == "STOP_CANCELED_BEFORE_TRIGGER" for event in all_terminal_events)
+        or any(status in {"NOT_TRIGGERED", "UNTRIGGERED"} for status in all_terminal_statuses)
+    )
+    if canceled:
+        if triggered:
+            classifications.append("STOP_CANCELED_AFTER_TRIGGER")
+        elif explicit_canceled_before_trigger:
+            classifications.append("STOP_CANCELED_BEFORE_TRIGGER")
+        else:
+            classifications.append("STOP_CANCELED_TRIGGER_PHASE_UNKNOWN")
+    if incident:
+        classifications.append("FAILURE_REASON_AVAILABLE" if (failure_reason or failure_code) else "FAILURE_REASON_UNAVAILABLE")
+    if position_open_after_failure:
+        classifications.append("POSITION_WAS_STILL_OPEN_AFTER_FAILURE")
+    if manual_after_factual_failure:
+        classifications.append("MANUAL_CLOSE_AFTER_FACTUAL_FAILURE")
+    elif manual_after_reported_failure:
+        classifications.append("MANUAL_CLOSE_AFTER_REPORTED_FAILURE_TIMESTAMP")
+    if failure_timestamp_conflict:
+        classifications.append("FAILURE_TIMESTAMP_CONFLICT")
+    if manual_close_timestamp_conflict:
+        # Contract-level marker covers any API x operator timestamp conflict;
+        # the specific marker preserves which side of the timeline diverged.
+        if "FAILURE_TIMESTAMP_CONFLICT" not in classifications:
+            classifications.append("FAILURE_TIMESTAMP_CONFLICT")
+        classifications.append("MANUAL_CLOSE_TIMESTAMP_CONFLICT")
+    if manual_close_order_found is True:
+        classifications.append("MANUAL_CLOSE_ORDER_FOUND")
+    if target_manual_close_id and target_stop_id and target_manual_close_id != target_stop_id:
+        classifications.append("MANUAL_CLOSE_ORDER_DISTINCT_FROM_STOP")
+    if manual_close_linked_as_derived:
+        classifications.append("MANUAL_CLOSE_ORDER_LINKED_AS_DERIVED_CONFLICT")
+        classifications.append("MANUAL_CLOSE_DERIVED_IDENTITY_CONFLICT")
+    if stop_identity_conflict_rows:
+        classifications.append("STOP_IDENTITY_CONFLICT")
+    if "plan_order_id" in identity_conflicting_fields:
+        classifications.append("STOP_PLAN_ORDER_IDENTITY_CONFLICT")
+    if "requested_order_id" in identity_conflicting_fields:
+        classifications.append("STOP_REQUESTED_ORDER_IDENTITY_CONFLICT")
+    if stop_identity_ambiguous_rows:
+        classifications.append("STOP_IDENTITY_AMBIGUOUS")
+    if failsafe_close_attempt_found:
+        classifications.append("FAILSAFE_CLOSE_ATTEMPT_FOUND")
+    elif has_failsafe_candidate:
+        classifications.append("FAILSAFE_EVIDENCE_CONFLICT_OR_CANDIDATE")
+    elif local_negative_evidence_complete:
+        classifications.append("FAILSAFE_CLOSE_ATTEMPT_NOT_FOUND")
+    else:
+        classifications.append("FAILSAFE_EVIDENCE_INCONCLUSIVE")
+    if failsafe_blocked_by_ownership:
+        classifications.append("FAILSAFE_BLOCKED_BY_OWNERSHIP")
+    if grouped_failsafe.get("multiple_attempts") is True:
+        classifications.append("FAILSAFE_MULTIPLE_ATTEMPTS")
+    if grouped_failsafe.get("dedup_inconclusive") is True:
+        classifications.append("FAILSAFE_DEDUP_INCONCLUSIVE")
+    if any(
+        attempt.get("error_send_and_execution_inconclusive") is True
+        for attempt in failsafe_attempts
+    ):
+        classifications.append("FAILSAFE_ERROR_SEND_AND_EXECUTION_INCONCLUSIVE")
+    if any(
+        attempt.get("failsafe_order_sent") is True
+        and attempt.get("failsafe_executed") is None
+        for attempt in failsafe_attempts
+    ):
+        classifications.append("FAILSAFE_UNRESOLVED_SENT_ATTEMPT")
+    if failsafe_evidence_conflict:
+        classifications.append("FAILSAFE_EVIDENCE_CONFLICT")
+    if failsafe_amount_evidence_conflict:
+        classifications.append("FAILSAFE_AMOUNT_EVIDENCE_CONFLICT")
+    if failsafe_timestamp_conflict:
+        classifications.append("TIMESTAMP_EVIDENCE_CONFLICT")
+    if failsafe_timing_conflict:
+        classifications.append("FAILSAFE_TIMING_CONFLICT")
+    if critical_condition_rows:
+        classifications.append("CRITICAL_CONDITION_FOUND")
+    if critical_alert_state_rows:
+        classifications.append("CRITICAL_ALERT_STATE_FOUND")
+    if critical_alert_attempt_rows:
+        classifications.extend(("CRITICAL_ALERT_ATTEMPT_FOUND", "CRITICAL_ALERT_FOUND"))
+    elif critical_alert_negative_evidence_complete:
+        classifications.extend(("CRITICAL_ALERT_ATTEMPT_NOT_FOUND", "CRITICAL_ALERT_NOT_FOUND"))
+    else:
+        classifications.append("CRITICAL_ALERT_EVIDENCE_INCONCLUSIVE")
+    if critical_alert_transport_rows:
+        classifications.append("CRITICAL_ALERT_TRANSPORT_CALLED")
+    elif critical_alert_negative_evidence_complete:
+        classifications.append("CRITICAL_ALERT_TRANSPORT_NOT_CALLED")
+    if critical_alert_suppressed:
+        classifications.append("CRITICAL_ALERT_SUPPRESSED")
+    if critical_alert_blocked:
+        classifications.append("CRITICAL_ALERT_BLOCKED")
+    terminal_known = bool(full_fill or failed or canceled)
+    if stop_created and not terminal_known and not triggered:
+        classifications.append("STOP_TERMINAL_STATUS_INCONCLUSIVE")
+    quantity_mismatch = (
+        bool(executed_quantity > 0 and executed_quantity + 1e-12 < requested_quantity)
+        if quantities_comparable else None
+    )
+    stop_terminal_status = next((
+        status for status in stop_order_statuses
+        if status in failure_statuses or status in cancel_statuses or status in filled_statuses
+        or status.endswith("_FAILED") or status.endswith("_REJECTED")
+    ), None)
+    derived_terminal_status = next((
+        status for status in [*derived_order_statuses, *derived_execute_statuses]
+        if status in filled_statuses or status in failure_statuses or status in cancel_statuses
+        or status.endswith("_FAILED") or status.endswith("_REJECTED")
+    ), None)
+    plan_terminal_status = next((
+        status for status in [*stop_plan_statuses, *derived_plan_statuses]
+        if status in failure_statuses or status in cancel_statuses
+        or status.endswith("_FAILED") or status.endswith("_REJECTED")
+    ), None)
+    failure_terminal_status = next((
+        status for status in all_failure_channel_statuses
+        if status in failure_statuses or status in cancel_statuses
+        or status.endswith("_FAILED") or status.endswith("_REJECTED")
+    ), None)
+    if incident:
+        failure_cause_status = "FACTUAL_FAILURE_REASON_AVAILABLE" if (failure_reason or failure_code) else "UNKNOWN_WITHOUT_FACTUAL_BINGX_REASON"
+    else:
+        failure_cause_status = "NOT_APPLICABLE_NO_FACTUAL_FAILURE"
+    manual_close_fill_prices = [
+        value for value in (_fdsff_v1_float(row.get("average_fill_price")) for row in manual_close_rows)
+        if value is not None and value > 0
+    ]
+    manual_close_average_fill_price = (
+        manual_fill_evidence.get("weighted_average_price")
+        if manual_fill_evidence.get("weighted_average_price") is not None
+        else max(manual_close_fill_prices)
+        if manual_close_fill_prices
+        else _fdsff_v1_float(query.get("manual_close_price"))
+    )
+    if quantity_unit_inconclusive:
+        stop_fill_evidence_status = "STOP_FILL_QUANTITY_UNIT_INCONCLUSIVE"
+    elif filled_quantity_conflict and zero_fill:
+        stop_fill_evidence_status = "STOP_FILLED_STATUS_ZERO_QUANTITY_CONFLICT"
+    elif filled_quantity_conflict:
+        stop_fill_evidence_status = "STOP_FILLED_STATUS_PARTIAL_QUANTITY_CONFLICT"
+    elif full_fill and status_fill_with_quantity_unavailable:
+        stop_fill_evidence_status = "STOP_FILLED_BY_ORDER_STATUS_QUANTITY_UNAVAILABLE"
+    elif full_fill:
+        stop_fill_evidence_status = "STOP_FILL_CONFIRMED"
+    elif zero_fill:
+        stop_fill_evidence_status = "STOP_ZERO_FILL_CONFIRMED"
+    else:
+        stop_fill_evidence_status = "STOP_FILL_UNKNOWN"
+    return {
+        "classifications": classifications,
+        "stop_created": stop_created,
+        "stop_triggered": triggered,
+        "derived_order_found": derived_order_found,
+        "stop_filled": full_fill,
+        "stop_failed": failed,
+        "stop_canceled": canceled,
+        "terminal_status_known": terminal_known,
+        "terminal_status": (
+            derived_terminal_status or stop_terminal_status
+            or failure_terminal_status or plan_terminal_status
+        ),
+        "stop_terminal_status": stop_terminal_status,
+        "derived_terminal_status": derived_terminal_status,
+        "order_statuses": sorted(set([*stop_order_statuses, *derived_order_statuses])),
+        "plan_statuses": sorted(set([*stop_plan_statuses, *derived_plan_statuses])),
+        "execute_statuses": sorted(set(derived_execute_statuses)),
+        "failure_statuses": sorted(set(all_failure_channel_statuses)),
+        "requested_quantity": requested_quantity,
+        "requested_quantity_unit": requested_quantity_unit,
+        "requested_quantity_sources": requested_evidence.get("sources"),
+        "executed_quantity": executed_quantity,
+        "executed_quantity_unit": executed_quantity_unit,
+        "executed_quantity_sources": executed_quantity_sources,
+        "executed_quantity_aggregation_source": executed_quantity_aggregation_source,
+        "fill_count": fill_evidence.get("fill_count"),
+        "fill_ids": fill_evidence.get("fill_ids"),
+        "fill_first_timestamp": fill_evidence.get("first_fill_time"),
+        "fill_last_timestamp": fill_evidence.get("last_fill_time"),
+        "fill_completion_timestamp": fill_evidence.get("completion_fill_time"),
+        "fill_aggregation_inconclusive": fill_evidence.get("aggregation_inconclusive"),
+        "fill_keyless_count": fill_evidence.get("keyless_count"),
+        "fill_order_identity_conflict": fill_evidence.get("fill_order_identity_conflict"),
+        "fill_duplicate_payload_conflict": fill_evidence.get("fill_duplicate_payload_conflict"),
+        "fill_observed_quantity_once": fill_evidence.get("observed_quantity_once"),
+        "fill_order_observations": fill_evidence.get("fill_order_observations"),
+        "stop_plan_executed_quantity": stop_plan_executed_quantity,
+        "derived_executed_quantity": derived_executed_quantity,
+        "quantity_units_compatible": quantity_units_compatible,
+        "quantity_unit_conflict": quantity_unit_conflict,
+        "quantity_unit_inconclusive": quantity_unit_inconclusive,
+        "quantity_mismatch": quantity_mismatch,
+        "failure_code": failure_code,
+        "failure_reason": failure_reason,
+        "failure_cause_status": failure_cause_status,
+        "terminal_evidence_conflict": terminal_evidence_conflict,
+        "quantity_confirmation_available": quantity_confirmation_available,
+        "stop_fill_evidence_status": stop_fill_evidence_status,
+        "position_was_still_open_after_failure": position_open_after_failure,
+        "position_currently_open_at_lookup": position_currently_open,
+        "symbol_side_exposure_currently_open_at_lookup": symbol_side_exposure_currently_open,
+        "position_ownership_basis": position.get("ownership_basis"),
+        "position_evidence_basis": "EXPLICIT_PERSISTED_EVENT" if position_open_after_failure else None,
+        "bingx_failure_timestamp": bingx_failure_timestamp,
+        "bingx_manual_close_timestamp": bingx_manual_close_timestamp,
+        "reported_failure_timestamp": reported_failure_timestamp,
+        "reported_manual_close_timestamp": reported_manual_close_timestamp,
+        "failure_timestamp_conflict": failure_timestamp_conflict,
+        "manual_close_timestamp_conflict": manual_close_timestamp_conflict,
+        "manual_close_occurred_after_failure": manual_after_factual_failure,
+        "manual_close_after_reported_failure_timestamp": manual_after_reported_failure,
+        "manual_close_timing_basis": (
+            "BINGX_FACTUAL_TIMESTAMPS"
+            if manual_after_factual_failure
+            else "OPERATOR_REPORTED_TIMESTAMPS"
+            if manual_after_reported_failure
+            else None
+        ),
+        "failure_to_manual_close_seconds": (
+            round(bingx_manual_close_epoch - bingx_failure_epoch, 3)
+            if manual_after_factual_failure
+            else round(reported_manual_close_epoch - reported_failure_epoch, 3)
+            if manual_after_reported_failure
+            else None
+        ),
+        "reported_failure_to_manual_close_seconds": (
+            round(reported_manual_close_epoch - reported_failure_epoch, 3)
+            if manual_after_reported_failure else None
+        ),
+        "manual_close_order_found": manual_close_order_found,
+        "manual_close_order_id": target_manual_close_id or None,
+        "manual_close_order_distinct_from_stop": bool(
+            target_manual_close_id and target_stop_id and target_manual_close_id != target_stop_id
+        ),
+        "manual_close_order_linked_as_derived_conflict": manual_close_linked_as_derived,
+        "stop_plan_order_identity_conflict": "plan_order_id" in identity_conflicting_fields,
+        "stop_requested_order_identity_conflict": "requested_order_id" in identity_conflicting_fields,
+        "stop_identity_conflict": bool(stop_identity_conflict_rows),
+        "stop_identity_ambiguous": bool(stop_identity_ambiguous_rows),
+        "identity_ambiguous_count": len(stop_identity_ambiguous_rows),
+        "identity_ambiguous": [
+            {
+                "source": row.get("source"),
+                "event": row.get("event"),
+                "order_id": row.get("order_id"),
+                "requested_order_id": row.get("requested_order_id"),
+                "plan_order_id": row.get("plan_order_id"),
+                "parent_order_id": row.get("parent_order_id"),
+                "trigger_order_id": row.get("trigger_order_id"),
+                "stop_identity_role": "REQUESTED_STOP_RESPONSE_ID_DIFFERENT",
+            }
+            for row in stop_identity_ambiguous_rows[:20]
+        ],
+        "stop_identity_roles": sorted({
+            str(relation.get("role"))
+            for _row, relation in related_rows
+            if relation.get("related") and not relation.get("conflict")
+        }),
+        "identity_conflicts": (
+            [
+                {
+                    "source": row.get("source"),
+                    "event": row.get("event"),
+                    "order_id": row.get("order_id"),
+                    "stop_order_id": row.get("stop_order_id"),
+                    "requested_order_id": row.get("requested_order_id"),
+                    "plan_order_id": row.get("plan_order_id"),
+                    "parent_order_id": row.get("parent_order_id"),
+                    "trigger_order_id": row.get("trigger_order_id"),
+                    "stop_identity_role": "IDENTITY_CONFLICT",
+                    "stop_identity_conflicting_fields": stop_relation(row).get("conflicting_fields"),
+                }
+                for row in stop_identity_conflict_rows[:20]
+            ]
+            + [
+                {
+                    "source": row.get("source"),
+                    "event": row.get("event"),
+                    "order_id": row.get("order_id"),
+                    "parent_order_id": row.get("parent_order_id"),
+                    "plan_order_id": row.get("plan_order_id"),
+                    "trigger_order_id": row.get("trigger_order_id"),
+                    "stop_identity_role": "MANUAL_CLOSE_ORDER_LINKED_AS_DERIVED_CONFLICT",
+                    "stop_identity_conflicting_fields": ["manual_close_order_id"],
+                }
+                for row in manual_close_derived_conflict_rows[:20]
+                if row not in stop_identity_conflict_rows
+            ]
+        )[:20],
+        "manual_close_executed_quantity": manual_close_executed_quantity,
+        "manual_close_executed_quantity_unit": manual_close_executed_quantity_unit,
+        "manual_close_executed_quantity_source": manual_close_executed_quantity_source,
+        "manual_close_fill_count": manual_fill_evidence.get("fill_count"),
+        "manual_close_fill_ids": manual_fill_evidence.get("fill_ids"),
+        "manual_close_first_fill_timestamp": factual_manual_fill_evidence.get("first_fill_time"),
+        "manual_close_last_fill_timestamp": factual_manual_fill_evidence.get("last_fill_time"),
+        "manual_close_completion_fill_timestamp": factual_manual_fill_evidence.get("completion_fill_time"),
+        "manual_close_fill_aggregation_inconclusive": manual_fill_evidence.get("aggregation_inconclusive"),
+        "manual_close_average_fill_price": manual_close_average_fill_price,
+        "manual_close_reported_value_usdt": _fdsff_v1_float(query.get("manual_close_value_usdt")),
+        "manual_close_reported_gross_pnl_usdt": _fdsff_v1_float(query.get("manual_close_gross_pnl_usdt")),
+        "manual_close_reported_fee_usdt": _fdsff_v1_float(query.get("manual_close_fee_usdt")),
+        "manual_close_reported_reason": query.get("close_reason"),
+        "manual_close_reported_fields_basis": "USER_SUPPLIED_READ_ONLY_CORRELATION" if target_manual_close_id else None,
+        "failsafe_close_attempt_found": (
+            True if failsafe_close_attempt_found
+            else False if local_negative_evidence_complete and not has_failsafe_candidate
+            else None
+        ),
+        "failsafe_executed": (
+            failsafe_executed
+            if failsafe_executed is not None
+            else False if (
+                not failsafe_close_attempt_found
+                and not has_failsafe_candidate
+                and local_negative_evidence_complete
+            )
+            else None
+        ),
+        "failsafe_attempt_before_manual_close_found": (
+            True if failsafe_attempt_before_manual_close
+            else False if (
+                not failsafe_close_attempt_found
+                and local_negative_evidence_complete
+                and not has_failsafe_candidate
+            )
+            else None
+        ),
+        "failsafe_order_sent": failsafe_order_sent,
+        "failsafe_execution_confirmed": failsafe_execution_confirmed,
+        "failsafe_filled_amount": failsafe_filled_amount,
+        "failsafe_remaining_amount": failsafe_remaining_amount,
+        "failsafe_observation_count": int(grouped_failsafe.get("observation_count") or 0) + len(failsafe_candidate_rows),
+        "failsafe_attempt_count": grouped_failsafe.get("attempt_count"),
+        "failsafe_attempts": failsafe_attempts[:20],
+        "failsafe_multiple_attempts": grouped_failsafe.get("multiple_attempts"),
+        "failsafe_dedup_inconclusive": grouped_failsafe.get("dedup_inconclusive"),
+        "failsafe_evidence_conflict": failsafe_evidence_conflict,
+        "failsafe_any_execution_confirmed": failsafe_any_execution_confirmed,
+        "failsafe_all_attempts_resolved": failsafe_all_attempts_resolved,
+        "failsafe_amount_evidence_conflict": failsafe_amount_evidence_conflict,
+        "failsafe_attempt_inside_incident_window": failsafe_attempt_inside_incident_window,
+        "failsafe_timing_basis": failsafe_timing_basis,
+        "failsafe_timing_conflict": failsafe_timing_conflict,
+        "failsafe_blocked_by_ownership": (
+            True if failsafe_blocked_by_ownership
+            else False if local_negative_evidence_complete else None
+        ),
+        "critical_condition_found": (
+            True if critical_condition_rows
+            else False if local_negative_evidence_complete else None
+        ),
+        "critical_alert_state_found": (
+            True if critical_alert_state_rows
+            else False if local_negative_evidence_complete else None
+        ),
+        "critical_alert_attempt_found": (
+            True if critical_alert_attempt_rows
+            else False if critical_alert_negative_evidence_complete else None
+        ),
+        "critical_alert_transport_called": (
+            True if critical_alert_transport_rows
+            else False if critical_alert_negative_evidence_complete else None
+        ),
+        "critical_alert_found": (
+            True if critical_alert_attempt_rows
+            else False if critical_alert_negative_evidence_complete else None
+        ),
+        "critical_alert_delivery_confirmed": (
+            True if critical_alert_delivery_confirmed
+            else False if critical_alert_negative_evidence_complete else None
+        ),
+        "critical_alert_delivery_status": (
+            "CONFIRMED" if critical_alert_delivery_confirmed
+            else "NOT_CONFIRMED" if critical_alert_negative_evidence_complete
+            else "UNKNOWN_INCOMPLETE_SOURCES"
+        ),
+        "critical_alert_suppressed": (
+            True if critical_alert_suppressed
+            else False if local_negative_evidence_complete else None
+        ),
+        "critical_alert_blocked": (
+            True if critical_alert_blocked
+            else False if local_negative_evidence_complete else None
+        ),
+        "negative_evidence_scope": (
+            "COMPLETE_BOUNDED_LOCAL_INCIDENT_WINDOW"
+            if local_negative_evidence_complete
+            else "INCOMPLETE_OR_LOCAL_ONLY_SOURCES_NO_ABSENCE_CLAIM"
+        ),
+        "critical_alert_negative_evidence_complete": critical_alert_negative_evidence_complete,
+        "critical_alert_negative_evidence_basis": live_lookup.get(
+            "critical_alert_negative_evidence_basis"
+        ),
+        "failsafe_evidence": [
+            {
+                key: row.get(key)
+                for key in (
+                    "source", "event", "status", "created_at", "updated_at",
+                    "failsafe_attempted", "failsafe_executed", "failsafe_decision",
+                    "failsafe_block_reason", "ownership_status", "diagnostic_reason", "error_type",
+                    "operational_correlation_role", "operational_correlation_basis",
+                    "operational_correlation_conflict", "failsafe_close_order_id",
+                    "failsafe_reason", "failsafe_sent", "failsafe_confirmed",
+                    "failsafe_status", "failsafe_timestamp", "failsafe_amount",
+                    "failsafe_expected_position_amount",
+                    "operational_correlation_quantity_basis", "incident_reported_quantity",
+                    "failsafe_order_sent", "failsafe_execution_confirmed",
+                    "failsafe_filled_amount", "failsafe_remaining_amount",
+                    "failsafe_timestamp_source_field", "failsafe_timestamp_basis",
+                    "failsafe_timestamp_precision", "failsafe_timestamp_epoch_start",
+                    "failsafe_timestamp_epoch_end", "failsafe_timestamp_timezone_basis",
+                    "failsafe_timestamp_evidence_conflict",
+                    "failsafe_attempt_inside_incident_window", "failsafe_timing_basis",
+                    "failsafe_timing_conflict", "failsafe_error_semantics",
+                    "failsafe_incident_time_relation", "failsafe_interval_fully_inside",
+                    "failsafe_overlaps_start_boundary", "failsafe_overlaps_end_boundary",
+                    "failsafe_clock_skew_tolerance_only",
+                )
+                if row.get(key) not in (None, "")
+            }
+            for row in failsafe_rows[:20]
+        ],
+        "failsafe_candidate_evidence": [
+            {
+                key: row.get(key)
+                for key in (
+                    "source", "event", "operational_correlation_role",
+                    "operational_correlation_basis", "operational_correlation_conflict",
+                    "failsafe_reason", "failsafe_status", "failsafe_timestamp",
+                    "failsafe_amount", "failsafe_expected_position_amount",
+                    "operational_correlation_quantity_basis", "incident_reported_quantity",
+                    "failsafe_order_sent", "failsafe_execution_confirmed",
+                    "failsafe_filled_amount", "failsafe_remaining_amount",
+                    "failsafe_timestamp_source_field", "failsafe_timestamp_basis",
+                    "failsafe_timestamp_precision", "failsafe_timestamp_epoch_start",
+                    "failsafe_timestamp_epoch_end", "failsafe_timestamp_timezone_basis",
+                    "failsafe_timestamp_evidence_conflict",
+                    "failsafe_attempt_inside_incident_window", "failsafe_timing_basis",
+                    "failsafe_timing_conflict", "failsafe_error_semantics",
+                    "failsafe_incident_time_relation", "failsafe_interval_fully_inside",
+                    "failsafe_overlaps_start_boundary", "failsafe_overlaps_end_boundary",
+                    "failsafe_clock_skew_tolerance_only",
+                )
+                if row.get(key) not in (None, "")
+            }
+            for row in failsafe_candidate_rows[:20]
+        ],
+        "critical_alert_state_evidence": [
+            {
+                key: row.get(key)
+                for key in (
+                    "source", "event", "status", "stop_order_id", "lifecycle_id", "client_order_id",
+                    "created_at", "updated_at", "alert_status",
+                    "alert_suppressed", "alert_block_reason", "alert_last_suppressed_at",
+                )
+                if row.get(key) not in (None, "")
+            }
+            for row in critical_alert_state_rows[:20]
+        ],
+        "critical_alert_evidence": [
+            {
+                key: row.get(key)
+                for key in (
+                    "source", "event", "status", "stop_order_id", "lifecycle_id", "client_order_id",
+                    "created_at", "updated_at", "critical_alert_attempted",
+                    "critical_alert_transport_called", "telegram_sent", "alert_status",
+                )
+                if row.get(key) not in (None, "")
+            }
+            for row in critical_alert_attempt_rows[:20]
+        ],
+        "evidence_counts": {
+            "stop_records": len(stop_rows),
+            "derived_orders": len(derived_rows),
+            "identity_conflicts": len(stop_identity_conflict_rows),
+            "identity_ambiguous": len(stop_identity_ambiguous_rows),
+            "fills": fill_evidence.get("fill_count"),
+            "manual_close_fills": manual_fill_evidence.get("fill_count"),
+            "manual_close_orders": len(manual_close_rows),
+            "failsafe_records": len(failsafe_rows),
+            "critical_alert_state_records": len(critical_alert_state_rows),
+            "critical_alert_attempt_records": len(critical_alert_attempt_rows),
+            "critical_alert_transport_records": len(critical_alert_transport_rows),
+            "critical_condition_records": len(critical_condition_rows),
+        },
+    }
+
+
+def _fdsff_v1_build_payload(query_info, admin_auth=None, route_state=None):
+    query_info = query_info if isinstance(query_info, dict) else {}
+    route_state = route_state if isinstance(route_state, dict) else {}
+    route_state.setdefault("broker_call_state", "NOT_CALLED")
+    route_state.setdefault("broker_called", False)
+    raw_admin_auth = admin_auth if isinstance(admin_auth, dict) else _fdsff_v1_admin_auth()
+    admin_auth = {
+        "available": bool(raw_admin_auth.get("available")),
+        "authenticated": bool(raw_admin_auth.get("authenticated")),
+        "status": str(raw_admin_auth.get("status") or "ADMIN_AUTH_REQUIRED")[:80],
+    }
+    if not admin_auth.get("available") or not admin_auth.get("authenticated"):
+        blocked_reason = (
+            "ADMIN_AUTH_GUARD_UNAVAILABLE"
+            if not admin_auth.get("available")
+            else "ADMIN_AUTH_REQUIRED"
+        )
+        return {
+            "ok": False,
+            "status": blocked_reason,
+            "version": FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_VERSION,
+            "generated_at": _fcor_v1_now(),
+            "read_only": True,
+            "no_order_sent_by_this_route": True,
+            "would_send_order": False,
+            "cancel_called": False,
+            "close_called": False,
+            "position_modified": False,
+            "registry_write": False,
+            "management_executed": False,
+            "reconciliation_executed": False,
+            "broker_called": False,
+            "broker_call_state": "NOT_CALLED",
+            "admin_auth": admin_auth,
+            "query_param_keys": [],
+            "query": {},
+            "live_lookup_requested": False,
+            "live_lookup_ack_ok": False,
+            "local_source_counts": {
+                "registry": 0,
+                "falcon_health": 0,
+                "liveorder_snapshot": 0,
+                "bounded_events": 0,
+                "bounded_jsonl_sources_checked": 0,
+            },
+            "local_records": [],
+            "live_lookup": {
+                "status": "BLOCKED_ADMIN_AUTH",
+                "reader_calls": [],
+                "reader_errors": [],
+                "stop_orders": [],
+                "plan_orders": [],
+                "derived_orders": [],
+                "entry_orders": [],
+                "manual_close_orders": [],
+                "identity_conflicts": [],
+            },
+            "findings": {
+                "failure_cause_status": "UNKNOWN_WITHOUT_AUTHORIZED_SOURCES",
+                "classifications": [],
+            },
+            "reasons": [blocked_reason],
+            "source_errors": [],
+            "code_gap_findings": [],
+            "raw_payload_exposed": False,
+        }
+    query = dict(query_info.get("query") or {})
+    reasons = []
+    source_errors = []
+    local_events = []
+    registry_matches = []
+    health_matches = []
+    snapshot_matches = []
+    local_sources_checked = 0
+    local_source_metadata = []
+    if not any(query.get(field) for field in (
+        "stop_order_id", "entry_order_id", "manual_close_order_id",
+        "lifecycle_id", "client_order_id",
+    )):
+        reasons.append("FORENSIC_IDENTITY_REQUIRED")
+    else:
+        registry_matches, registry_error = _fdsff_v1_read_registry(query)
+        health_matches, health_error = _fdsff_v1_read_falcon_health(query)
+        snapshot_matches, snapshot_error = _fdsff_v1_read_snapshot_records(
+            FALCON_LIVE_ORDER_AUDIT_DETAIL_V1_LATEST_FILE,
+            "falcon.liveorder.snapshot",
+            query,
+        )
+        local_result = _fdsff_v1_read_local_events(query)
+        if isinstance(local_result, tuple) and len(local_result) >= 4:
+            local_events, local_errors, local_sources_checked, local_source_metadata = local_result[:4]
+        else:
+            local_events, local_errors, local_sources_checked = local_result
+            local_source_metadata = []
+        source_errors.extend(error for error in (registry_error, health_error, snapshot_error) if error)
+        source_errors.extend(local_errors)
+
+    local_sources_saturated = [
+        str(item.get("source"))[:120]
+        for item in local_source_metadata
+        if isinstance(item, dict) and item.get("saturated") is True
+    ]
+    local_incident_window_covered = bool(
+        len(local_source_metadata) >= 5
+        and all(
+            isinstance(item, dict) and item.get("incident_window_covered") is True
+            for item in local_source_metadata
+        )
+    )
+    local_negative_evidence_complete = bool(
+        local_incident_window_covered
+        and all(
+            isinstance(item, dict)
+            and not item.get("read_error")
+            and item.get("saturated") is not True
+            for item in local_source_metadata
+        )
+    )
+    local_source_completeness = (
+        "COMPLETE_INCIDENT_WINDOW"
+        if local_negative_evidence_complete
+        else "INCOMPLETE_INCIDENT_WINDOW"
+    )
+    complete_alert_transport_sources = [
+        str(item.get("source"))[:120]
+        for item in local_source_metadata
+        if isinstance(item, dict)
+        and item.get("critical_alert_transport_audit_complete") is True
+        and item.get("incident_window_covered") is True
+        and item.get("saturated") is not True
+        and not item.get("read_error")
+    ]
+    critical_alert_negative_evidence_complete = bool(
+        complete_alert_transport_sources
+    )
+    critical_alert_negative_evidence_basis = (
+        "COMPLETE_TELEGRAM_TRANSPORT_LEDGER:"
+        + ",".join(sorted(complete_alert_transport_sources))
+        if critical_alert_negative_evidence_complete
+        else "NO_COMPLETE_TELEGRAM_TRANSPORT_LEDGER_PROVEN"
+    )
+
+    live_lookup_requested = bool(query_info.get("live_lookup_requested"))
+    live_lookup_ack_ok = bool(query_info.get("live_lookup_ack_ok"))
+    broker_called = False
+    broker_call_state = "NOT_CALLED"
+    live_lookup = {
+        "ok": False,
+        "status": "LOCAL_ONLY",
+        "read_only": True,
+        "sent": False,
+        "cancel_called": False,
+        "close_called": False,
+        "position_modified": False,
+        "reader_calls": [],
+        "reader_calls_attempted": [],
+        "reader_calls_completed": [],
+        "reader_calls_skipped_as_redundant": [],
+        "rate_limit_pacing_applied": False,
+        "all_orders_requested_limit": 0,
+        "all_orders_returned_count": 0,
+        "all_orders_saturated": False,
+        "all_orders_pagination_incomplete": False,
+        "history_window_basis": "UNAVAILABLE",
+        "history_window_start": None,
+        "history_window_end": None,
+        "factual_anchor_timestamp": None,
+        "reported_anchor_timestamp": None,
+        "history_window_anchor_conflict": False,
+        "history_window_complete": False,
+        "reader_errors": [],
+        "stop_orders": [],
+        "plan_orders": [],
+        "derived_orders": [],
+        "entry_orders": [],
+        "manual_close_orders": [],
+        "identity_conflicts": [],
+        "position": None,
+        "raw_payload_exposed": False,
+    }
+    if live_lookup_requested and not live_lookup_ack_ok:
+        reasons.append("LIVE_LOOKUP_ACK_REQUIRED")
+        live_lookup["status"] = "BLOCKED_ACK_REQUIRED"
+    elif live_lookup_requested and live_lookup_ack_ok:
+        if not query.get("stop_order_id") or not query.get("symbol"):
+            reasons.append("LIVE_LOOKUP_REQUIRES_STOP_ORDER_ID_AND_SYMBOL")
+            live_lookup["status"] = "BLOCKED_IDENTITY_REQUIRED"
+        else:
+            reader = getattr(central_broker, "disaster_stop_failure_forensics_read_only", None) if central_broker is not None else None
+            if not callable(reader):
+                reasons.append("LIVE_LOOKUP_READER_UNAVAILABLE")
+                live_lookup["status"] = "READER_UNAVAILABLE"
+            else:
+                broker_called = True
+                broker_call_state = "READ_ONLY_CALL_STARTED"
+                route_state["broker_called"] = True
+                route_state["broker_call_state"] = broker_call_state
+                try:
+                    raw_live_lookup = reader(
+                        symbol=query.get("symbol"),
+                        side=query.get("side"),
+                        stop_order_id=query.get("stop_order_id"),
+                        entry_order_id=query.get("entry_order_id"),
+                        manual_close_order_id=query.get("manual_close_order_id"),
+                        client_order_id=query.get("client_order_id"),
+                        failure_timestamp=query.get("failure_timestamp"),
+                        manual_close_timestamp=query.get("manual_close_timestamp"),
+                        limit=1000,
+                    )
+                    broker_call_state = "READ_ONLY_CALL_COMPLETED"
+                    route_state["broker_call_state"] = broker_call_state
+                    live_lookup = _fdsff_v1_safe_live_lookup(raw_live_lookup)
+                except Exception as exc:
+                    live_lookup["status"] = f"READ_ONLY_LOOKUP_ERROR:{type(exc).__name__}"
+                    source_errors.append(f"live_lookup:READ_ERROR:{type(exc).__name__}")
+
+    for reader_error in live_lookup.get("reader_errors") or []:
+        if isinstance(reader_error, dict):
+            source_errors.append(
+                "live_lookup:"
+                + str(reader_error.get("source") or "reader")[:120]
+                + ":"
+                + str(reader_error.get("error_type") or "READER_ERROR")[:120]
+            )
+
+    live_lookup["local_negative_evidence_complete"] = local_negative_evidence_complete
+    live_lookup["critical_alert_negative_evidence_complete"] = (
+        critical_alert_negative_evidence_complete
+    )
+    live_lookup["critical_alert_negative_evidence_basis"] = (
+        critical_alert_negative_evidence_basis
+    )
+    record_categories = {
+        "bounded_events": local_events[:_FDSFF_V1_LOCAL_LIMIT],
+        "liveorder_snapshot": snapshot_matches[:60],
+        "registry": registry_matches[:60],
+        "falcon_health": health_matches[:10],
+    }
+    classification_records, _classification_metrics = _fdsff_v1_merge_record_categories(
+        record_categories, _FDSFF_V1_LOCAL_LIMIT + 60 + 60 + 10
+    )
+    local_records, local_projection_metrics = _fdsff_v1_merge_record_categories(
+        record_categories, _FDSFF_V1_LOCAL_LIMIT
+    )
+    findings = _fdsff_v1_classify(classification_records, live_lookup, query)
+    live_reader_complete = bool(
+        live_lookup_requested
+        and live_lookup_ack_ok
+        and broker_call_state == "READ_ONLY_CALL_COMPLETED"
+        and str(live_lookup.get("status") or "").upper() == "READ_ONLY_LOOKUP_COMPLETE"
+        and not live_lookup.get("reader_errors")
+        and live_lookup.get("history_window_complete") is True
+        and not live_lookup.get("all_orders_saturated")
+        and not live_lookup.get("all_orders_pagination_incomplete")
+    )
+    absence_claims_supported = bool(
+        live_reader_complete and local_negative_evidence_complete
+    )
+    findings["local_source_completeness"] = local_source_completeness
+    findings["local_negative_evidence_complete"] = local_negative_evidence_complete
+    findings["critical_alert_negative_evidence_complete"] = (
+        critical_alert_negative_evidence_complete
+    )
+    findings["critical_alert_negative_evidence_basis"] = (
+        critical_alert_negative_evidence_basis
+    )
+    findings["local_sources_saturated"] = local_sources_saturated
+    findings["local_incident_window_covered"] = local_incident_window_covered
+    if live_lookup.get("all_orders_saturated"):
+        if "ALL_ORDERS_RESULT_SATURATED" not in findings["classifications"]:
+            findings["classifications"].append("ALL_ORDERS_RESULT_SATURATED")
+    if live_lookup.get("all_orders_pagination_incomplete"):
+        if "ALL_ORDERS_PAGINATION_INCOMPLETE" not in findings["classifications"]:
+            findings["classifications"].append("ALL_ORDERS_PAGINATION_INCOMPLETE")
+    if source_errors:
+        source_completeness = "PARTIAL_WITH_REPORTED_ERRORS"
+    elif live_reader_complete:
+        source_completeness = "BOUNDED_LOCAL_AND_AUTHORIZED_LIVE_READERS_COMPLETE"
+    elif live_lookup_requested:
+        source_completeness = "BOUNDED_LOCAL_WITH_LIVE_LOOKUP_INCOMPLETE_OR_BLOCKED"
+    else:
+        source_completeness = "BOUNDED_LOCAL_ONLY_LIVE_NOT_CONSULTED"
+    findings["source_completeness"] = source_completeness
+    findings["absence_claims_supported"] = absence_claims_supported
+    findings["negative_evidence_scope"] = (
+        "BOUNDED_LOCAL_AND_AUTHORIZED_LIVE_SOURCES"
+        if absence_claims_supported
+        else "INCOMPLETE_OR_LOCAL_ONLY_SOURCES_NO_ABSENCE_CLAIM"
+    )
+    if not live_reader_complete:
+        live_negative_classifications = {
+            "STOP_DERIVED_ORDER_NOT_FOUND",
+        }
+        findings["classifications"] = [
+            item for item in (findings.get("classifications") or [])
+            if item not in live_negative_classifications
+        ]
+        if findings.get("derived_order_found") is not True:
+            findings["derived_order_found"] = None
+            if (
+                findings.get("stop_triggered")
+                and "STOP_DERIVED_ORDER_EVIDENCE_INCONCLUSIVE" not in findings["classifications"]
+            ):
+                findings["classifications"].append("STOP_DERIVED_ORDER_EVIDENCE_INCONCLUSIVE")
+        if findings.get("manual_close_order_found") is not True:
+            findings["manual_close_order_found"] = None
+    if not local_negative_evidence_complete:
+        local_negative_classifications = {
+            "FAILSAFE_CLOSE_ATTEMPT_NOT_FOUND",
+        }
+        findings["classifications"] = [
+            item for item in (findings.get("classifications") or [])
+            if item not in local_negative_classifications
+        ]
+        if findings.get("failsafe_blocked_by_ownership") is not True:
+            findings["failsafe_blocked_by_ownership"] = None
+        if findings.get("critical_condition_found") is not True:
+            findings["critical_condition_found"] = None
+        if findings.get("critical_alert_state_found") is not True:
+            findings["critical_alert_state_found"] = None
+        if not findings.get("failsafe_close_attempt_found"):
+            findings["failsafe_close_attempt_found"] = None
+            findings["failsafe_executed"] = None
+            findings["failsafe_attempt_before_manual_close_found"] = None
+            if "FAILSAFE_EVIDENCE_INCONCLUSIVE" not in findings["classifications"]:
+                findings["classifications"].append("FAILSAFE_EVIDENCE_INCONCLUSIVE")
+    if not critical_alert_negative_evidence_complete:
+        alert_negative_classifications = {
+            "CRITICAL_ALERT_ATTEMPT_NOT_FOUND",
+            "CRITICAL_ALERT_TRANSPORT_NOT_CALLED",
+            "CRITICAL_ALERT_NOT_FOUND",
+        }
+        findings["classifications"] = [
+            item for item in (findings.get("classifications") or [])
+            if item not in alert_negative_classifications
+        ]
+        if not findings.get("critical_alert_attempt_found"):
+            findings["critical_alert_attempt_found"] = None
+            findings["critical_alert_transport_called"] = None
+            findings["critical_alert_found"] = None
+            findings["critical_alert_delivery_confirmed"] = None
+            findings["critical_alert_delivery_status"] = "UNKNOWN_INCOMPLETE_SOURCES"
+            if "CRITICAL_ALERT_EVIDENCE_INCONCLUSIVE" not in findings["classifications"]:
+                findings["classifications"].append("CRITICAL_ALERT_EVIDENCE_INCONCLUSIVE")
+    if not findings.get("terminal_status_known"):
+        reasons.append("TERMINAL_STATUS_NOT_FACTUALLY_PROVEN")
+    if findings.get("failure_cause_status") == "UNKNOWN_WITHOUT_FACTUAL_BINGX_REASON":
+        reasons.append("BINGX_ZERO_FILL_CAUSE_UNKNOWN")
+    status = "FORENSICS_PARTIAL_SOURCE_ERRORS" if source_errors else (
+        "FORENSICS_INCONCLUSIVE" if reasons else "FORENSICS_COMPLETE"
+    )
+    return {
+        "ok": not bool(source_errors),
+        "status": status,
+        "version": FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_VERSION,
+        "generated_at": _fcor_v1_now(),
+        "read_only": True,
+        "no_order_sent_by_this_route": True,
+        "would_send_order": False,
+        "cancel_called": False,
+        "close_called": False,
+        "position_modified": False,
+        "registry_write": False,
+        "management_executed": False,
+        "reconciliation_executed": False,
+        "broker_called": broker_called,
+        "broker_call_state": broker_call_state,
+        "admin_auth": admin_auth,
+        "query_param_keys": list(query_info.get("query_param_keys") or []),
+        "query": query,
+        "live_lookup_requested": live_lookup_requested,
+        "live_lookup_ack_ok": live_lookup_ack_ok,
+        "local_source_counts": {
+            "registry": len(registry_matches),
+            "falcon_health": len(health_matches),
+            "liveorder_snapshot": len(snapshot_matches),
+            "bounded_events": len(local_events),
+            "bounded_jsonl_sources_checked": local_sources_checked,
+        },
+        "local_records_candidates_count": local_projection_metrics.get("candidates_count", 0),
+        "local_records_projected_count": local_projection_metrics.get("projected_count", 0),
+        "local_records_truncated": bool(local_projection_metrics.get("truncated")),
+        "local_records_category_counts": {
+            "before": local_projection_metrics.get("category_counts_before", {}),
+            "after": local_projection_metrics.get("category_counts_after", {}),
+        },
+        "local_records": local_records,
+        "local_source_metadata": local_source_metadata,
+        "live_lookup": live_lookup,
+        "findings": findings,
+        "reasons": sorted(set(reasons)),
+        "source_errors": source_errors,
+        "code_gap_findings": [
+            "MANAGED_ORDER_SNAPSHOT_DOES_NOT_TRACK_TRIGGER_PLAN_HISTORY_OR_DERIVED_MARKET_ORDER",
+            "TERMINAL_STOP_WITH_OPEN_POSITION_BLOCKS_MANAGEMENT_BEFORE_STOP_CROSS_FAILSAFE",
+            "BROKER_FLAT_STOP_NOT_FILLED_IS_ONLY_CLASSIFIED_AFTER_BROKER_POSITION_IS_FLAT",
+            "PROCESS_LOCAL_DISASTER_STOP_CREATION_DIAGNOSTICS_ARE_LOST_ON_RESTART",
+            "STOP_CLIENT_ORDER_ID_TRUNCATION_WEAKENS_SECONDARY_CORRELATION",
+        ],
+        "raw_payload_exposed": False,
+    }
+
+
+def _fdsff_v1_text(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    findings = payload.get("findings") if isinstance(payload.get("findings"), dict) else {}
+    live = payload.get("live_lookup") if isinstance(payload.get("live_lookup"), dict) else {}
+    lines = [
+        "FALCON DISASTER STOP TRIGGER FAILURE FORENSICS V1",
+        f"Status: {payload.get('status')}",
+        f"generated_at={payload.get('generated_at')}",
+        f"no_order_sent_by_this_route={payload.get('no_order_sent_by_this_route')}",
+        f"would_send_order={payload.get('would_send_order')}",
+        f"cancel_called={payload.get('cancel_called')}",
+        f"close_called={payload.get('close_called')}",
+        f"position_modified={payload.get('position_modified')}",
+        f"registry_write={payload.get('registry_write')}",
+        f"management_executed={payload.get('management_executed')}",
+        f"reconciliation_executed={payload.get('reconciliation_executed')}",
+        f"broker_called={payload.get('broker_called')}",
+        f"broker_call_state={payload.get('broker_call_state')}",
+        f"admin_auth={payload.get('admin_auth')}",
+        f"live_lookup_requested={payload.get('live_lookup_requested')}",
+        f"live_lookup_ack_ok={payload.get('live_lookup_ack_ok')}",
+        f"live_lookup_status={live.get('status')}",
+        f"query_param_keys={payload.get('query_param_keys')}",
+        f"query={payload.get('query')}",
+        f"local_source_counts={payload.get('local_source_counts')}",
+        f"local_records_candidates_count={payload.get('local_records_candidates_count')}",
+        f"local_records_projected_count={payload.get('local_records_projected_count')}",
+        f"local_records_truncated={payload.get('local_records_truncated')}",
+        f"local_records_category_counts={payload.get('local_records_category_counts')}",
+        f"live_reader_calls={live.get('reader_calls')}",
+        f"live_reader_calls_attempted={live.get('reader_calls_attempted')}",
+        f"live_reader_calls_completed={live.get('reader_calls_completed')}",
+        f"live_reader_calls_skipped_as_redundant={live.get('reader_calls_skipped_as_redundant')}",
+        f"live_reader_calls_attempted_count={live.get('reader_calls_attempted_count')}",
+        f"live_reader_calls_completed_count={live.get('reader_calls_completed_count')}",
+        f"live_reader_calls_skipped_as_redundant_count={live.get('reader_calls_skipped_as_redundant_count')}",
+        f"rate_limit_pacing_applied={live.get('rate_limit_pacing_applied')}",
+        f"all_orders_params_contract={live.get('all_orders_params_contract')}",
+        f"all_fill_orders_params_contract={live.get('all_fill_orders_params_contract')}",
+        f"all_fill_orders_trading_unit={live.get('all_fill_orders_trading_unit')}",
+        f"identity_filters={live.get('identity_filters')}",
+        f"live_reader_errors={live.get('reader_errors')}",
+        "",
+        "Resultado factual:",
+        f"- terminal_status={findings.get('terminal_status')}",
+        f"- stop_terminal_status={findings.get('stop_terminal_status')}",
+        f"- derived_terminal_status={findings.get('derived_terminal_status')}",
+        f"- order_statuses={findings.get('order_statuses')}",
+        f"- plan_statuses={findings.get('plan_statuses')}",
+        f"- execute_statuses={findings.get('execute_statuses')}",
+        f"- failure_statuses={findings.get('failure_statuses')}",
+        f"- terminal_status_known={findings.get('terminal_status_known')}",
+        f"- stop_triggered={findings.get('stop_triggered')}",
+        f"- derived_order_found={findings.get('derived_order_found')}",
+        f"- requested_quantity={findings.get('requested_quantity')}",
+        f"- requested_quantity_unit={findings.get('requested_quantity_unit')}",
+        f"- executed_quantity={findings.get('executed_quantity')}",
+        f"- executed_quantity_unit={findings.get('executed_quantity_unit')}",
+        f"- executed_quantity_aggregation_source={findings.get('executed_quantity_aggregation_source')}",
+        f"- fill_count={findings.get('fill_count')}",
+        f"- fill_ids={findings.get('fill_ids')}",
+        f"- fill_first_timestamp={findings.get('fill_first_timestamp')}",
+        f"- fill_last_timestamp={findings.get('fill_last_timestamp')}",
+        f"- fill_completion_timestamp={findings.get('fill_completion_timestamp')}",
+        f"- fill_aggregation_inconclusive={findings.get('fill_aggregation_inconclusive')}",
+        f"- fill_order_identity_conflict={findings.get('fill_order_identity_conflict')}",
+        f"- fill_duplicate_payload_conflict={findings.get('fill_duplicate_payload_conflict')}",
+        f"- fill_observed_quantity_once={findings.get('fill_observed_quantity_once')}",
+        f"- fill_order_observations={findings.get('fill_order_observations')}",
+        f"- quantity_units_compatible={findings.get('quantity_units_compatible')}",
+        f"- quantity_unit_conflict={findings.get('quantity_unit_conflict')}",
+        f"- quantity_unit_inconclusive={findings.get('quantity_unit_inconclusive')}",
+        f"- stop_plan_executed_quantity={findings.get('stop_plan_executed_quantity')}",
+        f"- derived_executed_quantity={findings.get('derived_executed_quantity')}",
+        f"- quantity_mismatch={findings.get('quantity_mismatch')}",
+        f"- failure_code={findings.get('failure_code')}",
+        f"- failure_reason={findings.get('failure_reason')}",
+        f"- failure_cause_status={findings.get('failure_cause_status')}",
+        f"- terminal_evidence_conflict={findings.get('terminal_evidence_conflict')}",
+        f"- quantity_confirmation_available={findings.get('quantity_confirmation_available')}",
+        f"- stop_identity_conflict={findings.get('stop_identity_conflict')}",
+        f"- stop_plan_order_identity_conflict={findings.get('stop_plan_order_identity_conflict')}",
+        f"- stop_requested_order_identity_conflict={findings.get('stop_requested_order_identity_conflict')}",
+        f"- stop_identity_ambiguous={findings.get('stop_identity_ambiguous')}",
+        f"- identity_ambiguous_count={findings.get('identity_ambiguous_count')}",
+        f"- identity_ambiguous={findings.get('identity_ambiguous')}",
+        f"- stop_identity_roles={findings.get('stop_identity_roles')}",
+        f"- identity_conflicts={findings.get('identity_conflicts')}",
+        f"- stop_fill_evidence_status={findings.get('stop_fill_evidence_status')}",
+        f"- failure_to_manual_close_seconds={findings.get('failure_to_manual_close_seconds')}",
+        f"- reported_failure_to_manual_close_seconds={findings.get('reported_failure_to_manual_close_seconds')}",
+        f"- bingx_failure_timestamp={findings.get('bingx_failure_timestamp')}",
+        f"- bingx_manual_close_timestamp={findings.get('bingx_manual_close_timestamp')}",
+        f"- reported_failure_timestamp={findings.get('reported_failure_timestamp')}",
+        f"- reported_manual_close_timestamp={findings.get('reported_manual_close_timestamp')}",
+        f"- failure_timestamp_conflict={findings.get('failure_timestamp_conflict')}",
+        f"- manual_close_timestamp_conflict={findings.get('manual_close_timestamp_conflict')}",
+        f"- manual_close_timing_basis={findings.get('manual_close_timing_basis')}",
+        f"- manual_close_order_found={findings.get('manual_close_order_found')}",
+        f"- manual_close_order_id={findings.get('manual_close_order_id')}",
+        f"- manual_close_order_distinct_from_stop={findings.get('manual_close_order_distinct_from_stop')}",
+        f"- manual_close_order_linked_as_derived_conflict={findings.get('manual_close_order_linked_as_derived_conflict')}",
+        f"- manual_close_executed_quantity={findings.get('manual_close_executed_quantity')}",
+        f"- manual_close_executed_quantity_unit={findings.get('manual_close_executed_quantity_unit')}",
+        f"- manual_close_executed_quantity_source={findings.get('manual_close_executed_quantity_source')}",
+        f"- manual_close_fill_count={findings.get('manual_close_fill_count')}",
+        f"- manual_close_fill_ids={findings.get('manual_close_fill_ids')}",
+        f"- manual_close_first_fill_timestamp={findings.get('manual_close_first_fill_timestamp')}",
+        f"- manual_close_last_fill_timestamp={findings.get('manual_close_last_fill_timestamp')}",
+        f"- manual_close_completion_fill_timestamp={findings.get('manual_close_completion_fill_timestamp')}",
+        f"- manual_close_average_fill_price={findings.get('manual_close_average_fill_price')}",
+        f"- manual_close_reported_value_usdt={findings.get('manual_close_reported_value_usdt')}",
+        f"- manual_close_reported_gross_pnl_usdt={findings.get('manual_close_reported_gross_pnl_usdt')}",
+        f"- manual_close_reported_fee_usdt={findings.get('manual_close_reported_fee_usdt')}",
+        f"- manual_close_reported_reason={findings.get('manual_close_reported_reason')}",
+        f"- manual_close_reported_fields_basis={findings.get('manual_close_reported_fields_basis')}",
+        f"- position_currently_open_at_lookup={findings.get('position_currently_open_at_lookup')}",
+        f"- symbol_side_exposure_currently_open_at_lookup={findings.get('symbol_side_exposure_currently_open_at_lookup')}",
+        f"- position_ownership_basis={findings.get('position_ownership_basis')}",
+        f"- position_was_still_open_after_failure={findings.get('position_was_still_open_after_failure')}",
+        f"- failsafe_close_attempt_found={findings.get('failsafe_close_attempt_found')}",
+        f"- failsafe_order_sent={findings.get('failsafe_order_sent')}",
+        f"- failsafe_execution_confirmed={findings.get('failsafe_execution_confirmed')}",
+        f"- failsafe_executed={findings.get('failsafe_executed')}",
+        f"- failsafe_filled_amount={findings.get('failsafe_filled_amount')}",
+        f"- failsafe_remaining_amount={findings.get('failsafe_remaining_amount')}",
+        f"- failsafe_attempt_before_manual_close_found={findings.get('failsafe_attempt_before_manual_close_found')}",
+        f"- failsafe_observation_count={findings.get('failsafe_observation_count')}",
+        f"- failsafe_attempt_count={findings.get('failsafe_attempt_count')}",
+        f"- failsafe_multiple_attempts={findings.get('failsafe_multiple_attempts')}",
+        f"- failsafe_dedup_inconclusive={findings.get('failsafe_dedup_inconclusive')}",
+        f"- failsafe_evidence_conflict={findings.get('failsafe_evidence_conflict')}",
+        f"- failsafe_any_execution_confirmed={findings.get('failsafe_any_execution_confirmed')}",
+        f"- failsafe_all_attempts_resolved={findings.get('failsafe_all_attempts_resolved')}",
+        f"- failsafe_amount_evidence_conflict={findings.get('failsafe_amount_evidence_conflict')}",
+        f"- failsafe_attempt_inside_incident_window={findings.get('failsafe_attempt_inside_incident_window')}",
+        f"- failsafe_timing_basis={findings.get('failsafe_timing_basis')}",
+        f"- failsafe_timing_conflict={findings.get('failsafe_timing_conflict')}",
+        f"- failsafe_blocked_by_ownership={findings.get('failsafe_blocked_by_ownership')}",
+        f"- critical_alert_found={findings.get('critical_alert_found')}",
+        f"- critical_condition_found={findings.get('critical_condition_found')}",
+        f"- critical_alert_state_found={findings.get('critical_alert_state_found')}",
+        f"- critical_alert_attempt_found={findings.get('critical_alert_attempt_found')}",
+        f"- critical_alert_transport_called={findings.get('critical_alert_transport_called')}",
+        f"- critical_alert_delivery_confirmed={findings.get('critical_alert_delivery_confirmed')}",
+        f"- critical_alert_delivery_status={findings.get('critical_alert_delivery_status')}",
+        f"- critical_alert_suppressed={findings.get('critical_alert_suppressed')}",
+        f"- critical_alert_blocked={findings.get('critical_alert_blocked')}",
+        f"- negative_evidence_scope={findings.get('negative_evidence_scope')}",
+        f"- source_completeness={findings.get('source_completeness')}",
+        f"- absence_claims_supported={findings.get('absence_claims_supported')}",
+        f"- local_source_completeness={findings.get('local_source_completeness')}",
+        f"- local_negative_evidence_complete={findings.get('local_negative_evidence_complete')}",
+        f"- critical_alert_negative_evidence_complete={findings.get('critical_alert_negative_evidence_complete')}",
+        f"- critical_alert_negative_evidence_basis={findings.get('critical_alert_negative_evidence_basis')}",
+        f"- local_sources_saturated={findings.get('local_sources_saturated')}",
+        f"- local_incident_window_covered={findings.get('local_incident_window_covered')}",
+        f"- all_orders_requested_limit={live.get('all_orders_requested_limit')}",
+        f"- all_orders_returned_count={live.get('all_orders_returned_count')}",
+        f"- all_orders_saturated={live.get('all_orders_saturated')}",
+        f"- all_orders_pagination_incomplete={live.get('all_orders_pagination_incomplete')}",
+        f"- history_window_basis={live.get('history_window_basis')}",
+        f"- history_window_start={live.get('history_window_start')}",
+        f"- history_window_end={live.get('history_window_end')}",
+        f"- factual_anchor_timestamp={live.get('factual_anchor_timestamp')}",
+        f"- reported_anchor_timestamp={live.get('reported_anchor_timestamp')}",
+        f"- history_window_anchor_conflict={live.get('history_window_anchor_conflict')}",
+        f"- history_window_complete={live.get('history_window_complete')}",
+        "",
+        "Classificacoes:",
+    ]
+    lines.extend(f"- {item}" for item in (findings.get("classifications") or []))
+    lines += ["", "Lacunas comprovadas no codigo:"]
+    lines.extend(f"- {item}" for item in (payload.get("code_gap_findings") or []))
+    lines += ["", "Reasons:"]
+    lines.extend(f"- {item}" for item in (payload.get("reasons") or []))
+    if payload.get("source_errors"):
+        lines += ["", "Source errors:"]
+        lines.extend(f"- {item}" for item in payload.get("source_errors") or [])
+    lines += ["", "Completude das fontes locais:"]
+    for item in payload.get("local_source_metadata") or []:
+        if not isinstance(item, dict):
+            continue
+        lines.append("- " + " | ".join(
+            f"{key}={item.get(key)}"
+            for key in (
+                "source", "rows_read", "configured_limit", "saturated",
+                "oldest_timestamp", "newest_timestamp", "incident_window_start",
+                "incident_window_end", "incident_window_covered",
+                "critical_alert_transport_audit_complete", "read_error",
+            )
+        ))
+    lines += ["", "Evidencias locais seguras:"]
+    for index, row in enumerate((payload.get("local_records") or [])[:100], 1):
+        fields = " | ".join(f"{key}={value}" for key, value in row.items())
+        lines.append(f"{index}. {fields}")
+    if not payload.get("local_records"):
+        lines.append("- Nenhuma nos limites consultados.")
+    lines += ["", "Evidencias live seguras:"]
+    for collection in (
+        "stop_orders", "plan_orders", "derived_orders", "entry_orders",
+        "manual_close_orders", "identity_conflicts", "identity_ambiguous",
+    ):
+        for row in (live.get(collection) or [])[:100]:
+            fields = " | ".join(f"{key}={value}" for key, value in row.items())
+            lines.append(f"- {collection}: {fields}")
+    if not any(live.get(collection) for collection in (
+        "stop_orders", "plan_orders", "derived_orders", "entry_orders",
+        "manual_close_orders", "identity_conflicts", "identity_ambiguous",
+    )):
+        lines.append("- Nenhuma / consulta nao autorizada ou inconclusiva.")
+    lines += ["", "Evidencias de fail-safe seguras:"]
+    for row in findings.get("failsafe_evidence") or []:
+        lines.append("- " + " | ".join(f"{key}={value}" for key, value in row.items()))
+    if not findings.get("failsafe_evidence"):
+        lines.append(
+            "- Nenhuma nos leitores completos e limitados."
+            if findings.get("absence_claims_supported")
+            else "- Inconclusiva: fontes locais/live incompletas ou live nao consultada."
+        )
+    for row in findings.get("failsafe_candidate_evidence") or []:
+        lines.append("- candidate: " + " | ".join(f"{key}={value}" for key, value in row.items()))
+    lines += ["", "Tentativas de fail-safe deduplicadas:"]
+    for attempt in findings.get("failsafe_attempts") or []:
+        if not isinstance(attempt, dict):
+            continue
+        lines.append("- " + " | ".join(
+            f"{key}={attempt.get(key)}"
+            for key in (
+                "attempt_key", "identity_basis", "observation_count", "sources",
+                "statuses", "failsafe_close_order_id", "failsafe_order_sent",
+                "failsafe_execution_confirmed", "failsafe_executed",
+                "failsafe_filled_amount", "failsafe_remaining_amount",
+                "failsafe_attempt_inside_incident_window",
+                "failsafe_incident_time_relation", "failsafe_interval_fully_inside",
+                "failsafe_overlaps_start_boundary", "failsafe_overlaps_end_boundary",
+                "failsafe_clock_skew_tolerance_only", "resolved",
+            )
+        ))
+    if not findings.get("failsafe_attempts"):
+        lines.append("- Nenhuma tentativa positiva deduplicada.")
+    lines += ["", "Estado de alerta critico seguro:"]
+    for row in findings.get("critical_alert_state_evidence") or []:
+        lines.append("- " + " | ".join(f"{key}={value}" for key, value in row.items()))
+    if not findings.get("critical_alert_state_evidence"):
+        lines.append("- Nenhum estado nos limites consultados.")
+    lines += ["", "Tentativas de alerta critico seguras:"]
+    for row in findings.get("critical_alert_evidence") or []:
+        lines.append("- " + " | ".join(f"{key}={value}" for key, value in row.items()))
+    if not findings.get("critical_alert_evidence"):
+        lines.append(
+            "- Nenhuma no ledger completo de transporte."
+            if findings.get("critical_alert_negative_evidence_complete")
+            else "- Inconclusiva: nenhum ledger completo do transporte Telegram foi comprovado."
+        )
+    rendered = "\n".join(lines)
+    encoded = rendered.encode("utf-8")
+    max_bytes = 256 * 1024
+    if len(encoded) > max_bytes:
+        marker = "\n\nOUTPUT_TRUNCATED_AT_256_KIB=True"
+        rendered = encoded[: max_bytes - len(marker.encode("utf-8"))].decode("utf-8", errors="ignore") + marker
+    return rendered
+
+
+@app.route("/falcon/disasterstop/failure/diagnostic/text", methods=["GET"])
+def falcon_disaster_stop_failure_forensics_v1_text_route():
+    route_state = {"broker_call_state": "NOT_CALLED", "broker_called": False}
+    try:
+        admin_auth = _fdsff_v1_admin_auth()
+        if not admin_auth.get("available") or not admin_auth.get("authenticated"):
+            payload = _fdsff_v1_build_payload({}, admin_auth=admin_auth, route_state=route_state)
+            status_code = 503 if not admin_auth.get("available") else 403
+            return _fdsff_v1_text(payload), status_code, _fdsff_v1_response_headers()
+        query_info = _fdsff_v1_extract_query(request.args)
+        payload = _fdsff_v1_build_payload(
+            query_info,
+            admin_auth=admin_auth,
+            route_state=route_state,
+        )
+        return _fdsff_v1_text(payload), 200, _fdsff_v1_response_headers()
+    except Exception as exc:
+        previous_call_state = str(route_state.get("broker_call_state") or "NOT_CALLED")
+        broker_state_unknown = previous_call_state != "NOT_CALLED"
+        payload = {
+            "status": "FORENSICS_ROUTE_ERROR",
+            "generated_at": _fcor_v1_now(),
+            "no_order_sent_by_this_route": True,
+            "would_send_order": False,
+            "cancel_called": False,
+            "close_called": False,
+            "position_modified": False,
+            "registry_write": False,
+            "management_executed": False,
+            "reconciliation_executed": False,
+            "broker_called": None if broker_state_unknown else False,
+            "broker_call_state": "UNKNOWN_AFTER_ROUTE_ERROR" if broker_state_unknown else "NOT_CALLED",
+            "admin_auth": {"available": False, "authenticated": False, "status": "UNKNOWN_AFTER_ROUTE_ERROR"},
+            "findings": {"failure_cause_status": "UNKNOWN_WITHOUT_FACTUAL_BINGX_REASON", "classifications": []},
+            "code_gap_findings": [],
+            "reasons": [f"INTERNAL_ROUTE_ERROR:{type(exc).__name__}"],
+            "source_errors": [],
+            "local_records": [],
+            "live_lookup": {},
+        }
+        return _fdsff_v1_text(payload), 500, _fdsff_v1_response_headers()
+
+
+# ============================================================================
 # PREDATOR AUTO CLOSED REGISTRY SYNC HARDENING V1 - PAPER ONLY
 # ============================================================================
 PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION = "2026-07-16-PREDATOR-AUTO-CLOSED-REGISTRY-SYNC-HARDENING-V1"
