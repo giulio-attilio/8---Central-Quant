@@ -20,9 +20,12 @@ MAIN_FUNCTIONS = {
     "_fdsff_v1_text_value",
     "_fdsff_v1_bool",
     "_fdsff_v1_extract_query",
+    "_fdsff_v1_support_confirmation_scope",
     "_fdsff_v1_safe_scalar",
     "_fdsff_v1_walk_dicts",
     "_fdsff_v1_first",
+    "_fdsff_v1_all_scalars",
+    "_fdsff_v1_client_order_ids",
     "_fdsff_v1_event_name",
     "_fdsff_v1_safe_record",
     "_fdsff_v1_matches",
@@ -35,6 +38,7 @@ MAIN_FUNCTIONS = {
     "_fdsff_v1_read_falcon_health",
     "_fdsff_v1_read_snapshot_records",
     "_fdsff_v1_read_local_events",
+    "_fdsff_v1_duplicate_client_order_id_audit",
     "_fdsff_v1_admin_auth",
     "_fdsff_v1_safe_live_lookup",
     "_fdsff_v1_epoch",
@@ -196,7 +200,7 @@ def _main_namespace(*, local_records=None, live_result=None, registry=None):
         "_FDSFF_V1_LOCAL_LIMIT": 300,
         "_FDSFF_V1_MAX_SNAPSHOT_BYTES": 2 * 1024 * 1024,
         "_FDSFF_V1_ORDER_FIELDS": (
-            "source", "record_kind", "event", "order_id", "client_order_id", "parent_order_id",
+            "source", "record_kind", "event", "order_id", "client_order_id", "client_order_ids", "parent_order_id",
             "requested_order_id", "plan_order_id", "trigger_order_id", "derived_order_id",
             "entry_order_id", "stop_order_id", "manual_close_order_id",
             "lifecycle_id", "trade_id", "symbol", "side", "position_side", "type",
@@ -227,10 +231,31 @@ def _main_namespace(*, local_records=None, live_result=None, registry=None):
             "failsafe_incident_time_relation", "failsafe_interval_fully_inside",
             "failsafe_overlaps_start_boundary", "failsafe_overlaps_end_boundary",
             "failsafe_clock_skew_tolerance_only",
+            "terminal_stop_emergency", "terminal_stop_emergency_incident_id",
+            "terminal_stop_emergency_lifecycle_id", "terminal_stop_emergency_client_order_id",
+            "terminal_stop_emergency_operation", "terminal_stop_emergency_attempt_state",
+            "terminal_stop_emergency_send_attempted", "terminal_stop_emergency_sent",
+            "terminal_stop_emergency_confirmed", "terminal_stop_emergency_send_outcome_unknown",
+            "terminal_stop_emergency_order_id", "terminal_stop_emergency_filled_amount",
+            "terminal_stop_emergency_remaining_amount", "terminal_stop_emergency_timestamp",
+            "terminal_stop_emergency_status",
             "timestamp", "ts", "epoch", "epoch_ms",
         ),
         "FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_VERSION": "TEST-V1",
         "FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1_ACK": "FALCON_DISASTER_STOP_FAILURE_FORENSICS_V1",
+        "FALCON_DISASTER_STOP_FAILURE_SUPPORT_CONFIRMED_CAUSE": "DUPLICATE_CLIENT_ORDER_ID",
+        "FALCON_DISASTER_STOP_FAILURE_SUPPORT_CONFIRMED_BASIS": "BINGX_SUPPORT_CASE",
+        "FALCON_DISASTER_STOP_FAILURE_DUPLICATED_CLIENT_ORDER_ID": "FALCON-LIVE-FALCON15-178-DS",
+        "FALCON_DISASTER_STOP_FAILURE_SUPPORT_CONFIRMED_STOP_ORDER_ID": "2078846241538150400",
+        "FALCON_DISASTER_STOP_FAILURE_SUPPORT_CONFIRMED_LIFECYCLE_IDS": (
+            "CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-1784470538",
+        ),
+        "FALCON_DISASTER_STOP_FAILURE_CLIENT_ORDER_ID_SCOPE": "ACCOUNT_WIDE",
+        "FALCON_DISASTER_STOP_FAILURE_CLIENT_ORDER_ID_UNIQUENESS": "PERSISTENT_LIFETIME",
+        "FALCON_DISASTER_STOP_FAILURE_CLIENT_ORDER_ID_CASE_SENSITIVE": False,
+        "FALCON_DISASTER_STOP_FAILURE_AFFECTED_DATES": (
+            "2026-07-14", "2026-07-15", "2026-07-19",
+        ),
         "_flad_v1_norm_symbol": _norm_symbol,
         "_flad_v1_norm_side": _norm_side,
         "_fcor_v1_now": lambda: "2026-07-19T15:00:00Z",
@@ -435,6 +460,12 @@ def test_terminal_failed_zero_fill_projects_failure_reason_and_code():
     assert "STOP_FAILED" in result["classifications"]
     assert "FAILURE_REASON_AVAILABLE" in result["classifications"]
     assert result["terminal_status"] == "FAILED"
+    assert result["stop_terminal_status"] == "FAILED"
+    assert result["stop_failed"] is True
+    assert result["stop_canceled"] is False
+    assert "STOP_CANCELED_AFTER_TRIGGER" not in result["classifications"]
+    assert "STOP_CANCELED_TRIGGER_PHASE_UNKNOWN" not in result["classifications"]
+    assert result["order_statuses"] == ["CANCELED", "FAILED"]
     assert result["failure_code"] == "109400"
 
 
@@ -999,6 +1030,160 @@ def test_manual_close_order_is_correlated_without_contaminating_stop_fill():
     assert result["manual_close_order_distinct_from_stop"] is True
     assert result["manual_close_order_linked_as_derived_conflict"] is False
     assert result["failsafe_attempt_before_manual_close_found"] is False
+
+
+def _factual_full_manual_close_live(*, executed_quantity=0.13, executed_unit="COIN"):
+    return _empty_live(
+        stop_orders=[{
+            "source": "bingx.swap_v2.trade.order.stop",
+            "record_kind": "order",
+            "order_id": "STOP-1",
+            "status": "canceled",
+            "raw_status": "FAILED",
+            "plan_status": "TRIGGERED",
+            "requested_quantity": 0.13,
+            "requested_quantity_unit": "COIN",
+            "executed_quantity": 0.0,
+            "executed_quantity_unit": "COIN",
+            "failed_at": "2026-07-19T13:36:34-03:00",
+        }],
+        manual_close_orders=[
+            {
+                "source": "bingx.swap_v2.trade.order.manual_close",
+                "record_kind": "order",
+                "order_id": "MANUAL-1",
+                "raw_status": "FILLED",
+                "requested_quantity": 0.13,
+                "requested_quantity_unit": "COIN",
+                "executed_quantity": executed_quantity,
+                "executed_quantity_unit": executed_unit,
+                "filled_at": "2026-07-19T13:39:33-03:00",
+            },
+            {
+                "source": "bingx.swap_v2.trade.all_fill_orders",
+                "record_kind": "trade",
+                "order_id": "MANUAL-1",
+                "raw_status": "FILLED",
+                "fill_id": "MANUAL-FILL-1",
+                "fill_time": "2026-07-19T13:39:33-03:00",
+                "fill_quantity": executed_quantity,
+                "fill_quantity_unit": executed_unit,
+                "executed_quantity": executed_quantity,
+                "executed_quantity_unit": executed_unit,
+                "fill_price": 75.924,
+            },
+        ],
+        position={
+            "ok": True,
+            "amount": 0.0,
+            "position_closed": True,
+            "ownership_safe": True,
+            "ownership_basis": "EXACT_LIFECYCLE_AND_ORDER_IDS",
+        },
+    )
+
+
+def test_factual_full_manual_close_after_failed_stop_infers_historical_open_position_while_currently_flat():
+    namespace, _, _ = _main_namespace()
+    result = namespace["_fdsff_v1_classify"](
+        [],
+        _factual_full_manual_close_live(),
+        {
+            "stop_order_id": "STOP-1",
+            "manual_close_order_id": "MANUAL-1",
+            "symbol": "SOLUSDT",
+            "side": "LONG",
+            "failure_timestamp": "2026-07-19T13:36:34-03:00",
+            "manual_close_timestamp": "2026-07-19T13:39:33-03:00",
+            "manual_close_quantity": "0.13",
+        },
+    )
+
+    assert result["terminal_status"] == "FAILED"
+    assert result["stop_failed"] is True
+    assert result["stop_canceled"] is False
+    assert result["manual_close_occurred_after_failure"] is True
+    assert result["factual_manual_close_full_quantity"] is True
+    assert result["factual_manual_close_execution_basis"] == "SUM_UNIQUE_EXACT_FILLS"
+    assert result["position_open_after_failure_inferred_from_manual_close"] is True
+    assert result["position_was_still_open_after_failure"] is True
+    assert result["position_currently_open_at_lookup"] is False
+    assert result["position_evidence_basis"] == "FACTUAL_FULL_MANUAL_CLOSE_AFTER_FAILURE"
+    assert "POSITION_WAS_STILL_OPEN_AFTER_FAILURE" in result["classifications"]
+
+    text = namespace["_fdsff_v1_text"]({
+        "status": "FORENSICS_COMPLETE",
+        "findings": result,
+        "live_lookup": {},
+        "local_records": [],
+        "reasons": [],
+        "source_errors": [],
+    })
+    assert "terminal_status=FAILED" in text
+    assert "position_currently_open_at_lookup=False" in text
+    assert "position_open_after_failure_inferred_from_manual_close=True" in text
+    assert "position_was_still_open_after_failure=True" in text
+    assert "position_evidence_basis=FACTUAL_FULL_MANUAL_CLOSE_AFTER_FAILURE" in text
+
+
+@pytest.mark.parametrize(
+    ("executed_quantity", "executed_unit"),
+    [
+        (0.07, "COIN"),
+        (0.13, "CONT"),
+    ],
+)
+def test_partial_or_unit_incompatible_manual_close_does_not_infer_historical_open_position(
+    executed_quantity,
+    executed_unit,
+):
+    namespace, _, _ = _main_namespace()
+    result = namespace["_fdsff_v1_classify"](
+        [],
+        _factual_full_manual_close_live(
+            executed_quantity=executed_quantity,
+            executed_unit=executed_unit,
+        ),
+        {
+            "stop_order_id": "STOP-1",
+            "manual_close_order_id": "MANUAL-1",
+            "symbol": "SOLUSDT",
+            "side": "LONG",
+            "failure_timestamp": "2026-07-19T13:36:34-03:00",
+            "manual_close_timestamp": "2026-07-19T13:39:33-03:00",
+            "manual_close_quantity": "0.13",
+        },
+    )
+
+    assert result["factual_manual_close_full_quantity"] is False
+    assert result["position_open_after_failure_inferred_from_manual_close"] is False
+    assert result["position_was_still_open_after_failure"] is False
+    assert result["position_evidence_basis"] is None
+
+
+def test_reported_only_manual_close_never_infers_historical_open_position():
+    namespace, _, _ = _main_namespace()
+    result = _classify(
+        namespace,
+        stop=[{
+            "order_id": "STOP-1",
+            "raw_status": "FAILED",
+            "requested_quantity": 0.13,
+            "requested_quantity_unit": "COIN",
+            "executed_quantity": 0.0,
+            "executed_quantity_unit": "COIN",
+        }],
+        manual_close_order_id="MANUAL-1",
+        failure_timestamp="2026-07-19T13:36:34-03:00",
+        manual_close_timestamp="2026-07-19T13:39:33-03:00",
+        manual_close_quantity="0.13",
+    )
+
+    assert result["manual_close_after_reported_failure_timestamp"] is True
+    assert result["manual_close_occurred_after_failure"] is False
+    assert result["factual_manual_close_full_quantity"] is False
+    assert result["position_open_after_failure_inferred_from_manual_close"] is False
+    assert result["position_was_still_open_after_failure"] is False
 
 
 def test_creation_updated_at_never_overrides_supplied_failure_timestamp():
@@ -4651,3 +4836,608 @@ def test_review9_text_exposes_strict_incident_relation_fields():
     })
     assert "failsafe_incident_time_relation=FULLY_INSIDE_INCIDENT_WINDOW" in text
     assert "failsafe_interval_fully_inside=True" in text
+
+
+# ============================================================================
+# REVIEW 2 ITEM 6 - terminal disaster-stop emergency projection
+# ============================================================================
+
+
+def _review2_item6_terminal_emergency(**updates):
+    row = {
+        "event": "BROKER_MANAGED_CLOSE_SENT",
+        "reason": "STOP_TERMINAL_FAILURE_POSITION_STILL_OPEN",
+        "symbol": "SOLUSDT",
+        "side": "LONG",
+        "amount": 0.13,
+        "expected_position_amount": 0.13,
+        "incident_id": "FALCON-TERMINAL-STOP-INCIDENT-1",
+        "lifecycle_id": "LC-SOL",
+        "client_tag": "FALCON-TDS-0123456789abcdef",
+        "emergency_operation": "TERMINAL_STOP_EMERGENCY_CLOSE",
+        "attempt_state": "SENT_UNCONFIRMED",
+        "send_attempted": True,
+        "sent": True,
+        "confirmed": False,
+        "send_outcome_unknown": False,
+        "order_id": "TERMINAL-CLOSE-1",
+        "filled_amount": 0.05,
+        "remaining_amount": 0.08,
+        "status": "MANAGED_CLOSE_SENT_UNCONFIRMED",
+        "ts": "19/07/2026 13:38",
+        "epoch": _review8_epoch(13, 38, 17),
+    }
+    row.update(updates)
+    return row
+
+
+def _review2_item6_project(namespace, **updates):
+    return namespace["_fdsff_v1_operational_failsafe_record"](
+        _review2_item6_terminal_emergency(**updates),
+        "broker.execution_audit",
+        _review6_incident_query(),
+    )
+
+
+def test_review2_item6_terminal_emergency_reason_has_its_own_safe_projection():
+    namespace, _, _ = _main_namespace()
+
+    projected = _review2_item6_project(namespace)
+
+    assert projected["operational_correlation_role"] == "FAILSAFE_CLOSE_AUDIT"
+    assert projected["failsafe_reason"] == "STOP_TERMINAL_FAILURE_POSITION_STILL_OPEN"
+    assert projected["terminal_stop_emergency"] is True
+    assert projected["terminal_stop_emergency_incident_id"] == "FALCON-TERMINAL-STOP-INCIDENT-1"
+    assert projected["terminal_stop_emergency_lifecycle_id"] == "LC-SOL"
+    assert projected["terminal_stop_emergency_client_order_id"] == "FALCON-TDS-0123456789abcdef"
+    assert projected["terminal_stop_emergency_operation"] == "TERMINAL_STOP_EMERGENCY_CLOSE"
+    assert projected["terminal_stop_emergency_attempt_state"] == "SENT_UNCONFIRMED"
+    assert projected["terminal_stop_emergency_send_attempted"] is True
+    assert projected["terminal_stop_emergency_sent"] is True
+    assert projected["terminal_stop_emergency_confirmed"] is False
+    assert projected["terminal_stop_emergency_send_outcome_unknown"] is False
+    assert projected["terminal_stop_emergency_order_id"] == "TERMINAL-CLOSE-1"
+    assert projected["terminal_stop_emergency_filled_amount"] == pytest.approx(0.05)
+    assert projected["terminal_stop_emergency_remaining_amount"] == pytest.approx(0.08)
+    assert projected["terminal_stop_emergency_timestamp"] == pytest.approx(
+        _review8_epoch(13, 38, 17)
+    )
+    assert projected["terminal_stop_emergency_status"] == "MANAGED_CLOSE_SENT_UNCONFIRMED"
+    assert "stop_order_id" not in projected
+
+
+def test_review2_item6_terminal_emergency_has_own_classifications_and_never_becomes_stop_fill():
+    namespace, _, _ = _main_namespace()
+    projected = _review2_item6_project(namespace)
+    live = _empty_live(stop_orders=[{
+        "order_id": "2078846241538150400",
+        "raw_status": "FAILED",
+        "status": "CANCELED",
+        "requested_quantity": 0.13,
+        "executed_quantity": 0.0,
+        "requested_quantity_unit": "COIN",
+        "executed_quantity_unit": "COIN",
+    }])
+
+    result = namespace["_fdsff_v1_classify"](
+        [projected], live, _review6_incident_query()
+    )
+
+    assert result["terminal_stop_emergency_attempt_found"] is True
+    assert result["terminal_stop_emergency_incident_id"] == "FALCON-TERMINAL-STOP-INCIDENT-1"
+    assert result["terminal_stop_emergency_lifecycle_id"] == "LC-SOL"
+    assert result["terminal_stop_emergency_client_order_id"] == "FALCON-TDS-0123456789abcdef"
+    assert result["terminal_stop_emergency_send_attempted"] is True
+    assert result["terminal_stop_emergency_sent"] is True
+    assert result["terminal_stop_emergency_confirmed"] is False
+    assert result["terminal_stop_emergency_order_id"] == "TERMINAL-CLOSE-1"
+    assert result["terminal_stop_emergency_filled_amount"] == pytest.approx(0.05)
+    assert result["terminal_stop_emergency_remaining_amount"] == pytest.approx(0.08)
+    assert {
+        "TERMINAL_STOP_EMERGENCY_ATTEMPT_FOUND",
+        "TERMINAL_STOP_EMERGENCY_SEND_ATTEMPTED",
+        "TERMINAL_STOP_EMERGENCY_SENT_UNCONFIRMED",
+    }.issubset(result["classifications"])
+    assert result["executed_quantity"] == pytest.approx(0.0)
+    assert result["fill_count"] == 0
+    assert result["derived_order_found"] is False
+    assert result["terminal_stop_emergency_evidence"][0][
+        "terminal_stop_emergency_order_id"
+    ] == "TERMINAL-CLOSE-1"
+
+
+def test_review2_item6_confirmed_terminal_emergency_has_confirmed_classification():
+    namespace, _, _ = _main_namespace()
+    projected = _review2_item6_project(
+        namespace,
+        attempt_state="CONFIRMED",
+        confirmed=True,
+        filled_amount=0.13,
+        remaining_amount=0.0,
+        status="MANAGED_CLOSE_CONFIRMED",
+    )
+
+    result = namespace["_fdsff_v1_classify"](
+        [projected], _empty_live(), _review6_incident_query()
+    )
+
+    assert result["terminal_stop_emergency_confirmed"] is True
+    assert "TERMINAL_STOP_EMERGENCY_CLOSE_CONFIRMED" in result["classifications"]
+    assert "TERMINAL_STOP_EMERGENCY_SENT_UNCONFIRMED" not in result["classifications"]
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_conflict"),
+    [
+        (
+            {"client_tag": "FALCON-LIVE-SOL"},
+            "TERMINAL_EMERGENCY_CLIENT_ID_MISSING_OR_INVALID",
+        ),
+        (
+            {"lifecycle_id": "OTHER-LIFECYCLE"},
+            "TERMINAL_EMERGENCY_LIFECYCLE_MISMATCH",
+        ),
+        (
+            {"emergency_operation": "TP50_REAL_PARTIAL"},
+            "TERMINAL_EMERGENCY_OPERATION_MISMATCH",
+        ),
+    ],
+)
+def test_review2_item6_terminal_emergency_weak_or_mismatched_identity_is_candidate(
+    updates, expected_conflict,
+):
+    namespace, _, _ = _main_namespace()
+
+    projected = _review2_item6_project(namespace, **updates)
+    result = namespace["_fdsff_v1_classify"](
+        [projected], _empty_live(), _review6_incident_query()
+    )
+
+    assert projected["operational_correlation_role"] == "FAILSAFE_CLOSE_AUDIT_CANDIDATE"
+    assert projected["operational_correlation_conflict"] == expected_conflict
+    assert result["terminal_stop_emergency_attempt_found"] is None
+    assert not result["terminal_stop_emergency_evidence"]
+    assert result["terminal_stop_emergency_candidate_evidence"]
+    assert "TERMINAL_STOP_EMERGENCY_EVIDENCE_CANDIDATE" in result["classifications"]
+
+
+def test_review2_item6_legacy_reason_remains_separate_from_terminal_emergency():
+    namespace, _, _ = _main_namespace()
+    legacy = namespace["_fdsff_v1_operational_failsafe_record"](
+        _review6_real_failsafe(),
+        "broker.execution_audit",
+        _review6_incident_query(),
+    )
+
+    result = namespace["_fdsff_v1_classify"](
+        [legacy], _empty_live(), _review6_incident_query()
+    )
+
+    assert legacy["failsafe_reason"] == "STOP_BROKER_NOT_CONFIRMED"
+    assert "terminal_stop_emergency" not in legacy
+    assert result["failsafe_close_attempt_found"] is True
+    assert result["terminal_stop_emergency_attempt_found"] is False
+    assert not any(
+        classification.startswith("TERMINAL_STOP_EMERGENCY_")
+        for classification in result["classifications"]
+    )
+
+
+def test_review2_item6_terminal_emergency_text_exposes_safe_channels():
+    namespace, _, _ = _main_namespace()
+    projected = _review2_item6_project(namespace)
+    findings = namespace["_fdsff_v1_classify"](
+        [projected], _empty_live(), _review6_incident_query()
+    )
+
+    text = namespace["_fdsff_v1_text"]({
+        "status": "FORENSICS_COMPLETE",
+        "findings": findings,
+        "live_lookup": {},
+        "local_records": [],
+        "reasons": [],
+        "source_errors": [],
+    })
+
+    assert "terminal_stop_emergency_attempt_found=True" in text
+    assert "terminal_stop_emergency_incident_id=FALCON-TERMINAL-STOP-INCIDENT-1" in text
+    assert "terminal_stop_emergency_lifecycle_id=LC-SOL" in text
+    assert "terminal_stop_emergency_client_order_id=FALCON-TDS-0123456789abcdef" in text
+    assert "terminal_stop_emergency_send_attempted=True" in text
+    assert "terminal_stop_emergency_sent=True" in text
+    assert "terminal_stop_emergency_confirmed=False" in text
+    assert "terminal_stop_emergency_order_id=TERMINAL-CLOSE-1" in text
+    assert "terminal_stop_emergency_filled_amount=0.05" in text
+    assert "terminal_stop_emergency_remaining_amount=0.08" in text
+    assert "terminal_stop_emergency_status=MANAGED_CLOSE_SENT_UNCONFIRMED" in text
+
+
+# ---------------------------------------------------------------------------
+# P0: BingX support-confirmed duplicate clientOrderID evidence.
+# ---------------------------------------------------------------------------
+
+P0_DUPLICATED_CLIENT_ORDER_ID = "FALCON-LIVE-FALCON15-178-DS"
+P0_SUPPORT_CONFIRMED_STOP_ORDER_ID = "2078846241538150400"
+P0_SUPPORT_CONFIRMED_LIFECYCLE_ID = (
+    "CENTRAL-FALCON-LIFECYCLE:FALCON-LIVE-FALCON15-1784470538"
+)
+
+
+def test_p0_support_cause_is_separate_from_api_failure_and_lists_exact_local_occurrence():
+    local = [
+        {
+            "source": "broker.execution_audit",
+            "event": "DISASTER_STOP_FAILED",
+            "stop_order_id": P0_SUPPORT_CONFIRMED_STOP_ORDER_ID,
+            "order_id": P0_SUPPORT_CONFIRMED_STOP_ORDER_ID,
+            "client_order_id": P0_DUPLICATED_CLIENT_ORDER_ID,
+            "symbol": "SOLUSDT",
+            "side": "SELL",
+            "position_side": "LONG",
+            "status": "FAILED",
+            "executed_quantity": 0.0,
+            "updated_at": "2026-07-19T13:36:34-03:00",
+        },
+        {
+            "source": "trade_registry.closed_trades",
+            "event": "FALCON_LIVE_AUDIT_ACK",
+            "stop_order_id": P0_SUPPORT_CONFIRMED_STOP_ORDER_ID,
+            "entry_order_id": "ENTRY-1",
+            "client_order_id": "FALCON-LIVE-1",
+            "lifecycle_id": P0_SUPPORT_CONFIRMED_LIFECYCLE_ID,
+            "trade_id": "FALCON:FALCON15:SOLUSDT:LONG",
+            "bot": "FALCON",
+            "symbol": "SOLUSDT",
+            "side": "LONG",
+            "status": "CLOSED",
+        },
+        {
+            "source": "broker.execution_audit",
+            "event": "BROKER_DISASTER_STOP_CREATED",
+            "stop_order_id": "OTHER-STOP",
+            "order_id": "OTHER-STOP",
+            "client_order_id": "UNRELATED-CLIENT-ID",
+            "symbol": "SOLUSDT",
+            "position_side": "LONG",
+        },
+    ]
+    namespace, broker, registry = _main_namespace(local_records=local)
+
+    payload = _build(
+        namespace,
+        stop_order_id=P0_SUPPORT_CONFIRMED_STOP_ORDER_ID,
+        lifecycle_id=P0_SUPPORT_CONFIRMED_LIFECYCLE_ID,
+        failure_timestamp="2026-07-19T13:36:34-03:00",
+    )
+    findings = payload["findings"]
+
+    # The API-derived channel remains inconclusive; support evidence has its own
+    # explicit source and does not rewrite failure_reason/failure_cause_status.
+    assert findings["failure_cause_status"] == "UNKNOWN_WITHOUT_FACTUAL_BINGX_REASON"
+    assert findings["api_failure_cause_status"] == "UNKNOWN_WITHOUT_FACTUAL_BINGX_REASON"
+    assert findings["failure_cause_resolution_status"] == "SUPPORT_CONFIRMED"
+    assert findings["support_confirmed_failure_cause"] == "DUPLICATE_CLIENT_ORDER_ID"
+    assert findings["support_confirmed_failure_basis"] == "BINGX_SUPPORT_CASE"
+    assert findings["duplicated_client_order_id"] == P0_DUPLICATED_CLIENT_ORDER_ID
+    assert findings["client_order_id_scope"] == "ACCOUNT_WIDE"
+    assert findings["client_order_id_uniqueness"] == "PERSISTENT_LIFETIME"
+    assert findings["client_order_id_case_sensitive"] is False
+    assert findings["affected_dates"] == [
+        "2026-07-14", "2026-07-15", "2026-07-19",
+    ]
+    assert findings["duplicated_client_order_id_local_occurrence_count"] == 1
+    assert findings["duplicated_client_order_id_local_audit_complete"] is True
+    occurrence = findings["duplicated_client_order_id_local_occurrences"][0]
+    assert occurrence["client_order_id"] == P0_DUPLICATED_CLIENT_ORDER_ID
+    assert occurrence["order_id"] == P0_SUPPORT_CONFIRMED_STOP_ORDER_ID
+    assert occurrence["associated_lifecycle_ids"] == [
+        P0_SUPPORT_CONFIRMED_LIFECYCLE_ID
+    ]
+    assert occurrence["associated_trade_ids"] == [
+        "FALCON:FALCON15:SOLUSDT:LONG"
+    ]
+    assert occurrence["associated_entry_order_ids"] == ["ENTRY-1"]
+    assert all(
+        row["client_order_id"].upper() == P0_DUPLICATED_CLIENT_ORDER_ID
+        for row in findings["duplicated_client_order_id_local_occurrences"]
+    )
+    assert payload["duplicated_client_order_id_local_audit"]["raw_payload_exposed"] is False
+    assert broker.mutation_calls == []
+    assert registry.write_calls == []
+
+    rendered = namespace["_fdsff_v1_text"](payload)
+    assert "support_confirmed_failure_cause=DUPLICATE_CLIENT_ORDER_ID" in rendered
+    assert "failure_cause_resolution_status=SUPPORT_CONFIRMED" in rendered
+    assert "support_confirmed_failure_basis=BINGX_SUPPORT_CASE" in rendered
+    assert f"duplicated_client_order_id={P0_DUPLICATED_CLIENT_ORDER_ID}" in rendered
+    assert "client_order_id_scope=ACCOUNT_WIDE" in rendered
+    assert "client_order_id_uniqueness=PERSISTENT_LIFETIME" in rendered
+    assert "client_order_id_case_sensitive=False" in rendered
+    assert "affected_dates=['2026-07-14', '2026-07-15', '2026-07-19']" in rendered
+    assert "duplicated_client_order_id_local_occurrence_count=1" in rendered
+    assert (
+        f"associated_lifecycle_ids=['{P0_SUPPORT_CONFIRMED_LIFECYCLE_ID}']"
+        in rendered
+    )
+
+
+def test_p0_unrelated_stop_never_inherits_support_confirmed_duplicate_cause():
+    local = [{
+        "source": "broker.execution_audit",
+        "event": "DISASTER_STOP_FAILED",
+        "stop_order_id": "UNRELATED-STOP",
+        "order_id": "UNRELATED-STOP",
+        "client_order_id": P0_DUPLICATED_CLIENT_ORDER_ID,
+        "symbol": "SOLUSDT",
+        "position_side": "LONG",
+        "status": "FAILED",
+        "updated_at": "2026-07-19T13:36:34-03:00",
+    }]
+    namespace, broker, registry = _main_namespace(local_records=local)
+
+    payload = _build(
+        namespace,
+        stop_order_id="UNRELATED-STOP",
+        lifecycle_id="UNRELATED-LIFECYCLE",
+        client_order_id="UNRELATED-ENTRY-CLIENT-ID",
+        failure_timestamp="2026-07-19T13:36:34-03:00",
+    )
+    findings = payload["findings"]
+
+    assert findings["failure_cause_resolution_status"] == (
+        "NOT_SUPPORT_CONFIRMED_FOR_INCIDENT"
+    )
+    assert findings["support_confirmation_scope_matched"] is False
+    assert findings["support_confirmed_failure_cause"] is None
+    assert findings["support_confirmed_failure_basis"] is None
+    assert findings["duplicated_client_order_id"] is None
+    assert findings["duplicated_client_order_id_local_occurrence_count"] is None
+    assert findings["duplicated_client_order_id_local_audit_basis"] == (
+        "NOT_RUN_SUPPORT_CONFIRMATION_SCOPE_MISMATCH"
+    )
+    assert broker.mutation_calls == []
+    assert registry.write_calls == []
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"client_order_id": P0_DUPLICATED_CLIENT_ORDER_ID.lower()},
+        {"lifecycle_id": P0_SUPPORT_CONFIRMED_LIFECYCLE_ID},
+    ],
+)
+def test_p0_exact_legacy_client_or_known_lifecycle_matches_support_scope(identity):
+    namespace, _, _ = _main_namespace()
+    payload = _build(
+        namespace,
+        stop_order_id=None,
+        lifecycle_id=identity.get("lifecycle_id", "UNRELATED-LIFECYCLE"),
+        client_order_id=identity.get(
+            "client_order_id", "UNRELATED-ENTRY-CLIENT-ID"
+        ),
+        failure_timestamp=None,
+    )
+
+    assert payload["findings"]["failure_cause_resolution_status"] == (
+        "SUPPORT_CONFIRMED"
+    )
+    assert payload["findings"]["support_confirmation_scope_matched"] is True
+
+
+def test_p0_known_date_without_strong_incident_identity_is_not_support_confirmed():
+    namespace, _, _ = _main_namespace()
+    payload = _build(
+        namespace,
+        stop_order_id=None,
+        lifecycle_id="UNRELATED-LIFECYCLE",
+        client_order_id="UNRELATED-ENTRY-CLIENT-ID",
+        failure_timestamp="2026-07-19T13:36:34-03:00",
+        manual_close_timestamp=None,
+    )
+
+    assert payload["findings"]["failure_cause_resolution_status"] == (
+        "NOT_SUPPORT_CONFIRMED_FOR_INCIDENT"
+    )
+    assert payload["findings"]["support_confirmation_scope_basis"] == (
+        "KNOWN_AFFECTED_DATE_WITHOUT_STRONG_INCIDENT_IDENTITY"
+    )
+
+
+def test_p0_account_wide_case_insensitive_readers_preserve_observed_client_id_case(tmp_path):
+    lowercase_id = P0_DUPLICATED_CLIENT_ORDER_ID.lower()
+    record = {
+        "event": "DISASTER_STOP_FAILED",
+        "order_id": "ACCOUNT-WIDE-STOP",
+        "clientOrderID": lowercase_id,
+        "bot": "TRENDPRO",
+        "external_position": True,
+        "updated_at": "2026-07-14T12:00:00Z",
+    }
+    registry = FakeRegistry(closed_trades=[record])
+    namespace, _, _ = _main_namespace(registry=registry)
+    query = {
+        "client_order_id": P0_DUPLICATED_CLIENT_ORDER_ID,
+        "_account_wide_client_order_id_audit": True,
+    }
+
+    # Account-wide means neither another bot nor an external-position marker may
+    # hide a collision.  Comparison is normalized, but evidence keeps its factual
+    # observed spelling for auditability.
+    assert namespace["_fdsff_v1_matches"](record, query) is True
+    registry_matches, registry_error = namespace["_fdsff_v1_read_registry_real"](query)
+    assert registry_error is None
+    assert registry_matches[0]["client_order_id"] == lowercase_id
+
+    snapshot_path = tmp_path / "liveorder-snapshot.json"
+    snapshot_path.write_text(json.dumps(record), encoding="utf-8")
+    snapshot_matches, snapshot_error = namespace[
+        "_fdsff_v1_read_snapshot_records_real"
+    ](snapshot_path, "test.snapshot", query)
+    assert snapshot_error is None
+    assert snapshot_matches[0]["client_order_id"] == lowercase_id
+
+    history_path = tmp_path / "history-events.jsonl"
+    history_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    missing = tmp_path / "missing.jsonl"
+    namespace["super_history_manager"] = type(
+        "HistorySource", (), {"HISTORY_EVENTS_FILE": history_path}
+    )()
+    namespace["central_broker"] = type(
+        "BrokerSources",
+        (),
+        {
+            "EXECUTION_AUDIT_LOG_FILE": missing,
+            "EXECUTIONS_LOG_FILE": missing,
+        },
+    )()
+    namespace["FALCON_LIVE_AUDIT_EVENTS_FILE"] = missing
+    namespace["CENTRAL_TIMELINE_LOG_FILE"] = missing
+    local_matches, _, sources_checked, metadata = namespace[
+        "_fdsff_v1_read_local_events_real"
+    ](query)
+    assert 1 <= sources_checked <= 5
+    assert len(metadata) == sources_checked
+    assert local_matches[0]["client_order_id"] == lowercase_id
+
+    namespace["_fdsff_v1_read_registry"] = lambda _query: (registry_matches, None)
+    namespace["_fdsff_v1_read_snapshot_records"] = lambda *_args: (
+        snapshot_matches, None,
+    )
+    namespace["_fdsff_v1_read_local_events"] = lambda _query: (
+        local_matches, [], 5, [
+            {
+                "source": f"source-{index}",
+                "saturated": False,
+                "read_error": None,
+            }
+            for index in range(5)
+        ],
+    )
+    audit = namespace["_fdsff_v1_duplicate_client_order_id_audit"](
+        P0_DUPLICATED_CLIENT_ORDER_ID
+    )
+    assert audit["occurrence_count"] >= 1
+    assert any(
+        item["client_order_id"] == lowercase_id
+        for item in audit["occurrences"]
+    )
+    assert all(
+        item["client_order_id_match_basis"]
+        == "CASE_NORMALIZED_EXACT_CLIENT_ORDER_ID"
+        for item in audit["occurrences"]
+    )
+
+
+def test_p0_nested_legacy_id_is_not_hidden_by_a_different_top_level_alias():
+    namespace, _, _ = _main_namespace()
+    record = {
+        "event": "DISASTER_STOP_FAILED",
+        "order_id": "STOP-NESTED",
+        "client_order_id": "FDS1-UNRELATED-ACCOUNT-ID",
+        "info": {
+            "clientOrderID": P0_DUPLICATED_CLIENT_ORDER_ID.lower(),
+        },
+        "bot": "OTHER_BOT",
+        "external_position": True,
+    }
+    query = {
+        "client_order_id": P0_DUPLICATED_CLIENT_ORDER_ID,
+        "_account_wide_client_order_id_audit": True,
+    }
+
+    assert namespace["_fdsff_v1_matches"](record, query) is True
+    safe = namespace["_fdsff_v1_safe_record"](record, "test")
+    assert safe["client_order_ids"] == [
+        "FDS1-UNRELATED-ACCOUNT-ID",
+        P0_DUPLICATED_CLIENT_ORDER_ID.lower(),
+    ]
+
+    namespace["_fdsff_v1_read_registry"] = lambda _query: ([record], None)
+    namespace["_fdsff_v1_read_snapshot_records"] = lambda *_args: ([], None)
+    namespace["_fdsff_v1_read_local_events"] = lambda _query: (
+        [],
+        [],
+        5,
+        [
+            {"source": f"source-{index}", "saturated": False, "read_error": None}
+            for index in range(5)
+        ],
+    )
+
+    audit = namespace["_fdsff_v1_duplicate_client_order_id_audit"](
+        P0_DUPLICATED_CLIENT_ORDER_ID
+    )
+
+    assert audit["occurrence_count"] == 1
+    assert audit["evidence_record_count"] == 1
+    assert audit["unique_occurrence_count"] == 1
+    assert audit["occurrences"][0]["client_order_id"] == (
+        P0_DUPLICATED_CLIENT_ORDER_ID.lower()
+    )
+
+
+def test_p0_duplicate_client_order_id_local_audit_is_explicitly_partial_when_source_saturated():
+    namespace, broker, registry = _main_namespace()
+    occurrence = {
+        "source": "broker.execution_audit",
+        "event": "BROKER_DISASTER_STOP_CREATED",
+        "stop_order_id": P0_SUPPORT_CONFIRMED_STOP_ORDER_ID,
+        "order_id": P0_SUPPORT_CONFIRMED_STOP_ORDER_ID,
+        "client_order_id": P0_DUPLICATED_CLIENT_ORDER_ID,
+        "symbol": "SOLUSDT",
+        "position_side": "LONG",
+    }
+    metadata = [
+        {
+            "source": f"source-{index}",
+            "saturated": index == 0,
+            "read_error": None,
+            "incident_window_covered": False,
+            "critical_alert_transport_audit_complete": False,
+        }
+        for index in range(5)
+    ]
+    namespace["_fdsff_v1_read_local_events"] = lambda _query: (
+        [copy.deepcopy(occurrence)], [], 5, copy.deepcopy(metadata)
+    )
+
+    payload = _build(
+        namespace,
+        stop_order_id=P0_SUPPORT_CONFIRMED_STOP_ORDER_ID,
+    )
+    findings = payload["findings"]
+
+    assert findings["duplicated_client_order_id_local_occurrence_count"] == 1
+    assert findings["duplicated_client_order_id_local_audit_complete"] is False
+    assert findings["duplicated_client_order_id_local_audit_basis"] == (
+        "PARTIAL_BOUNDED_LOCAL_SOURCES_NO_ABSENCE_CLAIM"
+    )
+    assert findings["duplicated_client_order_id_local_sources_saturated"] == [
+        "source-0"
+    ]
+    assert broker.mutation_calls == []
+    assert registry.write_calls == []
+
+
+def test_p0_canonical_fec1_terminal_emergency_id_is_correlated_with_legacy_compatibility_preserved():
+    namespace, _, _ = _main_namespace()
+    canonical = _review2_item6_project(
+        namespace,
+        client_tag="FEC1-" + ("A" * 24),
+    )
+    legacy = _review2_item6_project(namespace)
+
+    canonical_result = namespace["_fdsff_v1_classify"](
+        [canonical], _empty_live(), _review6_incident_query()
+    )
+    legacy_result = namespace["_fdsff_v1_classify"](
+        [legacy], _empty_live(), _review6_incident_query()
+    )
+
+    assert canonical["operational_correlation_role"] == "FAILSAFE_CLOSE_AUDIT"
+    assert canonical_result["terminal_stop_emergency_attempt_found"] is True
+    assert canonical_result["terminal_stop_emergency_client_order_id"] == (
+        "FEC1-" + ("A" * 24)
+    )
+    assert legacy["operational_correlation_role"] == "FAILSAFE_CLOSE_AUDIT"
+    assert legacy_result["terminal_stop_emergency_attempt_found"] is True

@@ -321,6 +321,9 @@ class TradeLifecycleShadowObservability:
         try:
             padded = token + "=" * (-len(token) % 4)
             signed = base64.urlsafe_b64decode(padded.encode())
+            canonical = base64.urlsafe_b64encode(signed).decode().rstrip("=")
+            if not hmac.compare_digest(token, canonical):
+                raise ValueError("INVALID_CURSOR")
             raw, supplied = signed[:-32], signed[-32:]
             expected = hmac.new(self._cursor_secret, raw, hashlib.sha256).digest()
             if not hmac.compare_digest(supplied, expected):

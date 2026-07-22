@@ -142,6 +142,17 @@ IDENTITY_KEYS = {
 
 IDENTITY_KEY_ALIASES = {
     "clientorderid": "client_order_id",
+    # Canonical Falcon stop IDs are persisted under stop-specific field names
+    # by the position/Registry projections.  Normalize those names into the
+    # client-order identity group so an opaque FDS1 hash is correlated only by
+    # exact equality.  Unlike the historical ``*-DS`` format, an FDS1 value is
+    # never reconstructed from (or prefix-matched against) the entry ID.
+    "broker_stop_client_order_id": "client_order_id",
+    "brokerstopclientorderid": "client_order_id",
+    "disaster_stop_client_order_id": "client_order_id",
+    "disasterstopclientorderid": "client_order_id",
+    "falcon_disaster_stop_client_order_id": "client_order_id",
+    "falcondisasterstopclientorderid": "client_order_id",
 }
 
 IDENTITY_GROUPS = {
@@ -311,8 +322,18 @@ def _is_derived_stop_client_id(value: str) -> bool:
     return str(value or "").upper().endswith("-DS")
 
 
-def _derived_stop_client_id(parent: str) -> str:
-    return (str(parent or "")[:24] + "-DS")[:32]
+def _legacy_derived_stop_client_id_matches_parent(value: str, parent: str) -> bool:
+    """Recognize the historical sliced ``-DS`` format without generating it."""
+
+    derived = str(value or "").upper().strip()
+    trusted_parent = str(parent or "").upper().strip()
+    if not derived.endswith("-DS"):
+        return False
+    legacy_prefix = derived.removesuffix("-DS")
+    return bool(
+        len(legacy_prefix) == 24
+        and trusted_parent.startswith(legacy_prefix)
+    )
 
 
 def _strict_derived_stop_relation(
@@ -348,8 +369,11 @@ def _strict_derived_stop_relation(
         return False
     supplied = {value for value in grouped.get("client_order", set()) if _is_derived_stop_client_id(value)}
     parents = {value for value in context.trusted.get("client_order", set()) if not _is_derived_stop_client_id(value)}
-    expected = {_derived_stop_client_id(parent) for parent in parents}
-    return bool(supplied & expected)
+    return any(
+        _legacy_derived_stop_client_id_matches_parent(child, parent)
+        for child in supplied
+        for parent in parents
+    )
 
 
 @dataclass

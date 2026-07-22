@@ -32,6 +32,28 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 
 try:
+    from account_client_order_id import (
+        ROLE_ENTRY,
+        ROLE_INITIAL_DISASTER_STOP,
+        build_canonical_operation_id,
+        generate_account_client_order_id,
+        normalize_account_client_order_id,
+        record_account_client_order_attempt_outcome,
+        reserve_account_client_order_attempt,
+    )
+except Exception as exc:
+    ROLE_ENTRY = "ENTRY"
+    ROLE_INITIAL_DISASTER_STOP = "INITIAL_DISASTER_STOP"
+    build_canonical_operation_id = None
+    generate_account_client_order_id = None
+    normalize_account_client_order_id = None
+    record_account_client_order_attempt_outcome = None
+    reserve_account_client_order_attempt = None
+    ACCOUNT_CLIENT_ORDER_ID_IMPORT_ERROR = str(exc)
+else:
+    ACCOUNT_CLIENT_ORDER_ID_IMPORT_ERROR = None
+
+try:
     from execution_orchestrator import orchestrate_execution, execution_health
 except Exception as exc:
     orchestrate_execution = None
@@ -198,6 +220,228 @@ def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return int(float(value))
     except Exception:
         return default
+
+
+def _execution_entry_client_order_identity(
+    payload: Dict[str, Any],
+    plan: Dict[str, Any],
+    *,
+    bot: str,
+    symbol: str,
+    side: str,
+    require_explicit_lifecycle: bool = False,
+) -> Dict[str, Any]:
+    """Build one stable operation and one explicit factual entry attempt.
+
+    The operation identity deliberately excludes the attempt. Re-entering the
+    same request therefore resolves to the same attempt and cannot send again;
+    a distinct attempt must be explicit and is still subject to the permanent
+    account-wide authority's reconciliation authorization.
+    """
+
+    if not (
+        callable(build_canonical_operation_id)
+        and callable(generate_account_client_order_id)
+        and callable(reserve_account_client_order_attempt)
+    ):
+        return {
+            "ok": False,
+            "status": "CLIENT_ORDER_ID_AUTHORITY_UNAVAILABLE",
+            "error": ACCOUNT_CLIENT_ORDER_ID_IMPORT_ERROR,
+        }
+
+    plan_identity = plan.get("identity") if isinstance(plan.get("identity"), dict) else {}
+    explicit_lifecycle_id = payload.get("lifecycle_id") or plan_identity.get("lifecycle_id")
+    lifecycle_candidates = (
+        ("LIFECYCLE_ID", explicit_lifecycle_id),
+        ("TRADE_ID", payload.get("trade_id") or plan_identity.get("trade_id")),
+        ("SIGNAL_ID", payload.get("signal_id") or plan_identity.get("signal_id")),
+        ("DECISION_ID", payload.get("decision_id") or plan_identity.get("decision_id")),
+    )
+    lifecycle_source = None
+    lifecycle_id = None
+    for source, value in lifecycle_candidates:
+        if str(value or "").strip():
+            lifecycle_source = source
+            lifecycle_id = str(value).strip()
+            break
+    if require_explicit_lifecycle and not str(explicit_lifecycle_id or "").strip():
+        return {
+            "ok": False,
+            "status": "CLIENT_ORDER_LIFECYCLE_ID_REQUIRED",
+            "error": "Factual LIVE entry requires an explicit lifecycle_id",
+        }
+    if not lifecycle_id:
+        return {
+            "ok": False,
+            "status": "CLIENT_ORDER_LIFECYCLE_IDENTITY_REQUIRED",
+            "error": "LIVE entry requires lifecycle_id or an equivalent strong trade/signal/decision identity",
+        }
+
+    attempt_candidates = (
+        payload.get("client_order_attempt_id"),
+        payload.get("execution_attempt_id"),
+        payload.get("execution_request_id"),
+        payload.get("request_id"),
+        payload.get("signal_id"),
+        payload.get("decision_id"),
+        plan.get("idempotency_key"),
+    )
+    attempt_id = next(
+        (str(value).strip() for value in attempt_candidates if str(value or "").strip()),
+        None,
+    )
+    if not attempt_id:
+        return {
+            "ok": False,
+            "status": "CLIENT_ORDER_ATTEMPT_ID_REQUIRED",
+            "error": "LIVE entry requires a stable execution attempt identity",
+        }
+
+    attempt_sequence = payload.get("client_order_attempt_sequence")
+    if attempt_sequence is None:
+        attempt_sequence = payload.get("execution_attempt_sequence", 0)
+
+    try:
+        canonical_operation_id = build_canonical_operation_id(
+            bot=bot,
+            role=ROLE_ENTRY,
+            lifecycle_id=lifecycle_id,
+            symbol=symbol,
+            side=side,
+            stop_revision=0,
+            order_type="MARKET",
+        )
+        identity = {
+            "bot": bot,
+            "role": ROLE_ENTRY,
+            "lifecycle_id": lifecycle_id,
+            "symbol": symbol,
+            "side": side,
+            "attempt_id": attempt_id,
+            "attempt_sequence": attempt_sequence,
+            "canonical_operation_id": canonical_operation_id,
+            "stop_revision": 0,
+            "order_type": "MARKET",
+        }
+        client_order_id = generate_account_client_order_id(**identity)
+        supplied_client_order_id = str(
+            payload.get("client_order_id") or payload.get("client_tag") or ""
+        ).strip()
+        if supplied_client_order_id:
+            normalize_account_client_order_id(supplied_client_order_id)
+        if supplied_client_order_id and supplied_client_order_id.upper() != client_order_id:
+            return {
+                "ok": False,
+                "status": "CLIENT_ORDER_ID_DOES_NOT_MATCH_CANONICAL_ATTEMPT",
+                "client_order_id": client_order_id,
+                "canonical_operation_id": canonical_operation_id,
+                "attempt_id": attempt_id,
+                "attempt_sequence": attempt_sequence,
+                "lifecycle_id": lifecycle_id,
+                "lifecycle_id_source": lifecycle_source,
+            }
+        return {
+            "ok": True,
+            "status": "CLIENT_ORDER_IDENTITY_READY",
+            "identity": identity,
+            "client_order_id": client_order_id,
+            "canonical_operation_id": canonical_operation_id,
+            "attempt_id": attempt_id,
+            "attempt_sequence": attempt_sequence,
+            "lifecycle_id": lifecycle_id,
+            "lifecycle_id_source": lifecycle_source,
+        }
+    except Exception as exc:
+        status = str(exc) if str(exc).startswith("CLIENT_ORDER_ID_") else "CLIENT_ORDER_IDENTITY_INVALID"
+        return {
+            "ok": False,
+            "status": status,
+            "error_type": type(exc).__name__,
+            "lifecycle_id": lifecycle_id,
+            "lifecycle_id_source": lifecycle_source,
+            "attempt_id": attempt_id,
+            "attempt_sequence": attempt_sequence,
+        }
+
+
+def _execution_disaster_stop_reservation_factory(
+    entry_order_identity: Dict[str, Any],
+):
+    """Return a factory that permanently reserves the initial stop attempt."""
+
+    def reserve_initial_disaster_stop(
+        *,
+        entry_order_id,
+        entry_client_order_id,
+        symbol,
+        side,
+        revision=0,
+        attempt=0,
+    ):
+        if not (
+            entry_order_identity.get("ok")
+            and callable(build_canonical_operation_id)
+            and callable(generate_account_client_order_id)
+            and callable(reserve_account_client_order_attempt)
+        ):
+            return {
+                "ok": False,
+                "send_allowed": False,
+                "status": "CLIENT_ORDER_ID_AUTHORITY_UNAVAILABLE",
+            }
+        try:
+            if not str(entry_order_id or "").strip():
+                return {
+                    "ok": False,
+                    "send_allowed": False,
+                    "status": "ENTRY_ORDER_ID_REQUIRED",
+                }
+            lifecycle_id = entry_order_identity["lifecycle_id"]
+            attempt_sequence = int(attempt)
+            stop_attempt_id = (
+                f"{entry_order_identity['attempt_id']}:INITIAL_DISASTER_STOP:"
+                f"{int(revision)}:{attempt_sequence}"
+            )
+            canonical_operation_id = build_canonical_operation_id(
+                bot=entry_order_identity["identity"]["bot"],
+                role=ROLE_INITIAL_DISASTER_STOP,
+                lifecycle_id=lifecycle_id,
+                symbol=symbol,
+                side=side,
+                entry_client_order_id=entry_client_order_id,
+                entry_order_id=entry_order_id,
+                stop_revision=revision,
+                order_type="STOP_MARKET",
+            )
+            identity = {
+                "bot": entry_order_identity["identity"]["bot"],
+                "role": ROLE_INITIAL_DISASTER_STOP,
+                "lifecycle_id": lifecycle_id,
+                "symbol": symbol,
+                "side": side,
+                "entry_client_order_id": entry_client_order_id,
+                "entry_order_id": entry_order_id,
+                "stop_revision": revision,
+                "order_type": "STOP_MARKET",
+                "canonical_operation_id": canonical_operation_id,
+                "attempt_id": stop_attempt_id,
+                "attempt_sequence": attempt_sequence,
+            }
+            client_order_id = generate_account_client_order_id(**identity)
+            return reserve_account_client_order_attempt(
+                identity,
+                client_order_id=client_order_id,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "send_allowed": False,
+                "status": "CLIENT_ORDER_ID_RESERVATION_ERROR",
+                "error_type": type(exc).__name__,
+            }
+
+    return reserve_initial_disaster_stop
 
 
 def _normalize_symbol(symbol: Any) -> str:
@@ -802,6 +1046,34 @@ def run_execution_engine(
 
     mode = _safe_mode(mode or payload.get("mode"))
 
+    # Project the canonical attempt ID into the Orchestrator identity before
+    # its persistent duplicate gate.  This lets a separately-authorized new
+    # attempt have a distinct idempotency key while the same attempt remains
+    # blocked.  The account authority is still the final send gate.
+    if mode == "LIVE":
+        projected_account_identity = _execution_entry_client_order_identity(
+            payload,
+            {},
+            bot=str(payload.get("bot") or "").upper().strip(),
+            symbol=_normalize_symbol(payload.get("symbol")),
+            side=_normalize_side(payload.get("side")),
+            require_explicit_lifecycle=not dry_run,
+        )
+        if projected_account_identity.get("ok"):
+            payload = dict(payload)
+            payload["client_order_id"] = projected_account_identity[
+                "client_order_id"
+            ]
+            payload["canonical_operation_id"] = projected_account_identity[
+                "canonical_operation_id"
+            ]
+            payload["client_order_attempt_id"] = projected_account_identity[
+                "attempt_id"
+            ]
+            payload["client_order_attempt_sequence"] = projected_account_identity[
+                "attempt_sequence"
+            ]
+
     if not callable(orchestrate_execution):
         result = {
             "ok": False,
@@ -830,6 +1102,7 @@ def run_execution_engine(
     result_extra_paper = None
     result_extra_live = None
     real_guard = None
+    live_broker_called = False
 
     if mode == "OBSERVATION_ONLY":
         executor_route = "PLAN_ONLY"
@@ -854,7 +1127,17 @@ def run_execution_engine(
         executor_route = "LIVE_GUARD"
         real_guard = validate_real_pilot_guard(payload=payload, plan=plan, dry_run=dry_run)
 
-        if not real_guard.get("allowed"):
+        if not (
+            isinstance(orchestration, dict)
+            and orchestration.get("ok") is True
+            and plan.get("status") == "READY_FOR_EXECUTION"
+        ):
+            engine_ok = False
+            engine_status = "LIVE_BLOCKED_BY_ORCHESTRATOR"
+            plan.setdefault("errors", []).append(
+                "LIVE bloqueado: plano do Orchestrator não está READY_FOR_EXECUTION"
+            )
+        elif not real_guard.get("allowed"):
             engine_ok = False
             engine_status = "LIVE_BLOCKED_BY_PILOT_GUARD"
             plan.setdefault("errors", []).extend(real_guard.get("reasons") or [])
@@ -870,13 +1153,15 @@ def run_execution_engine(
             leverage = real_guard["trade"]["leverage"]
             risk_pct = real_guard["trade"]["risk_pct"]
             stop_loss_price = real_guard["trade"].get("stop")
-            client_tag = str(
-                payload.get("client_order_id")
-                or payload.get("client_tag")
-                or payload.get("trade_id")
-                or payload.get("signal_id")
-                or f"CQ-{bot}-{symbol}-{int(time.time())}"
-            )[:32]
+            account_order_identity = _execution_entry_client_order_identity(
+                payload,
+                plan,
+                bot=bot,
+                symbol=symbol,
+                side=side,
+                require_explicit_lifecycle=not dry_run,
+            )
+            client_tag = account_order_identity.get("client_order_id")
 
             # Ordem real final. broker.py ainda bloqueia se EXECUTION_MODE/ENABLE_REAL_TRADING/BROKER_DRY_RUN não estiverem corretos.
             execution_auth = None
@@ -911,7 +1196,25 @@ def run_execution_engine(
                 execution_auth_token=execution_auth_token,
             )
 
-            if not confirmation_guard.get("allowed"):
+            if not account_order_identity.get("ok"):
+                live_result = {
+                    "ok": False,
+                    "status": account_order_identity.get("status")
+                    or "CLIENT_ORDER_IDENTITY_INVALID",
+                    "sent": False,
+                    "send_attempted": False,
+                    "send_outcome_unknown": False,
+                    "confirmation_guard": confirmation_guard,
+                    "account_client_order_identity": account_order_identity,
+                    "symbol": symbol,
+                    "side": side,
+                    "bot": bot,
+                    "margin_usdt": margin,
+                    "leverage": leverage,
+                    "risk_pct": risk_pct,
+                }
+                plan.setdefault("errors", []).append(live_result["status"])
+            elif not confirmation_guard.get("allowed"):
                 live_result = {
                     "ok": False,
                     "status": "CONFIRMATION_GUARD_BLOCKED",
@@ -923,22 +1226,145 @@ def run_execution_engine(
                     "margin_usdt": margin,
                     "leverage": leverage,
                     "risk_pct": risk_pct,
+                    "client_order_id": client_tag,
+                    "account_client_order_identity": account_order_identity,
                 }
             else:
-                live_result = central_broker.place_market_order(
-                    symbol=symbol,
-                    side=side,
-                    margin_usdt=margin,
-                    reduce_only=False,
-                    client_tag=client_tag,
-                    leverage=leverage,
-                    bot=bot,
-                    risk_pct=risk_pct,
-                    execution_auth_token=execution_auth_token,
-                    stop_loss_price=stop_loss_price,
-                )
-                if isinstance(live_result, dict):
-                    live_result.setdefault("confirmation_guard", confirmation_guard)
+                reservation = None
+                if not dry_run:
+                    try:
+                        reservation = reserve_account_client_order_attempt(
+                            account_order_identity["identity"],
+                            client_order_id=client_tag,
+                        )
+                    except Exception as exc:
+                        reservation = {
+                            "ok": False,
+                            "send_allowed": False,
+                            "status": "CLIENT_ORDER_ID_AUTHORITY_ERROR",
+                            "error_type": type(exc).__name__,
+                        }
+
+                if not dry_run and not (
+                    isinstance(reservation, dict)
+                    and reservation.get("send_allowed") is True
+                    and reservation.get("status") == "RESERVED_UNIQUE"
+                ):
+                    live_result = {
+                        "ok": False,
+                        "status": (reservation or {}).get("status")
+                        or "CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+                        "sent": False,
+                        "send_attempted": False,
+                        "send_outcome_unknown": False,
+                        "confirmation_guard": confirmation_guard,
+                        "account_client_order_identity": account_order_identity,
+                        "client_order_id_reservation": reservation,
+                        "client_order_id": client_tag,
+                        "canonical_operation_id": account_order_identity.get(
+                            "canonical_operation_id"
+                        ),
+                        "attempt_id": account_order_identity.get("attempt_id"),
+                        "symbol": symbol,
+                        "side": side,
+                        "bot": bot,
+                        "margin_usdt": margin,
+                        "leverage": leverage,
+                        "risk_pct": risk_pct,
+                        "reconciliation_required": True,
+                    }
+                    plan.setdefault("errors", []).append(live_result["status"])
+                else:
+                    live_broker_called = True
+                    try:
+                        live_result = central_broker.place_market_order(
+                            symbol=symbol,
+                            side=side,
+                            margin_usdt=margin,
+                            reduce_only=False,
+                            client_tag=client_tag,
+                            leverage=leverage,
+                            bot=bot,
+                            risk_pct=risk_pct,
+                            execution_auth_token=execution_auth_token,
+                            stop_loss_price=stop_loss_price,
+                            client_order_id_reservation=reservation,
+                            disaster_stop_client_order_id_factory=(
+                                None
+                                if dry_run
+                                else _execution_disaster_stop_reservation_factory(
+                                    account_order_identity
+                                )
+                            ),
+                        )
+                    except Exception as exc:
+                        live_result = {
+                            "ok": False,
+                            "status": "CREATE_ORDER_OUTCOME_UNKNOWN",
+                            "sent": None,
+                            "send_attempted": True,
+                            "send_outcome_unknown": True,
+                            "reconciliation_required": True,
+                            "error_type": type(exc).__name__,
+                        }
+                    if not isinstance(live_result, dict):
+                        live_result = {
+                            "ok": False,
+                            "status": "CREATE_ORDER_OUTCOME_UNKNOWN",
+                            "sent": None,
+                            "send_attempted": True,
+                            "send_outcome_unknown": True,
+                            "reconciliation_required": True,
+                            "error_type": "INVALID_BROKER_RESULT",
+                        }
+                    if isinstance(live_result, dict):
+                        live_result.setdefault("confirmation_guard", confirmation_guard)
+                        live_result.setdefault(
+                            "account_client_order_identity", account_order_identity
+                        )
+                        live_result.setdefault(
+                            "client_order_id_reservation", reservation
+                        )
+                        live_result.setdefault("client_order_id", client_tag)
+                        live_result.setdefault(
+                            "canonical_operation_id",
+                            account_order_identity.get("canonical_operation_id"),
+                        )
+                        live_result.setdefault(
+                            "attempt_id", account_order_identity.get("attempt_id")
+                        )
+                        sent_state = live_result.get("sent")
+                        send_attempted_state = live_result.get("send_attempted")
+                        outcome_state = (
+                            "ACKNOWLEDGED"
+                            if sent_state is True
+                            else "PRE_SEND_FAILED_ATTEMPT_CONSUMED"
+                            if (
+                                sent_state is False
+                                and send_attempted_state is False
+                                and live_result.get("send_outcome_unknown") is not True
+                            )
+                            else "CREATE_ORDER_OUTCOME_UNKNOWN"
+                        )
+                        live_result["lifecycle_blocked"] = (
+                            outcome_state == "CREATE_ORDER_OUTCOME_UNKNOWN"
+                        )
+                        live_result["blocked_lifecycle_id"] = (
+                            account_order_identity.get("lifecycle_id")
+                            if live_result["lifecycle_blocked"]
+                            else None
+                        )
+                        live_result["reconciliation_required"] = bool(
+                            live_result.get("reconciliation_required")
+                            or live_result["lifecycle_blocked"]
+                        )
+                        if not dry_run and callable(record_account_client_order_attempt_outcome):
+                            live_result["client_order_attempt_outcome"] = (
+                                record_account_client_order_attempt_outcome(
+                                    reservation,
+                                    outcome_state=outcome_state,
+                                )
+                            )
 
             if execution_auth is not None and isinstance(live_result, dict):
                 live_result.setdefault("execution_auth_issued", {k: v for k, v in execution_auth.items() if k != "token"})
@@ -978,7 +1404,7 @@ def run_execution_engine(
         "paper_result": result_extra_paper,
         "live_result": result_extra_live,
         "paper_executor_called": result_extra_paper is not None,
-        "live_broker_called": result_extra_live is not None,
+        "live_broker_called": live_broker_called,
         "notes": [
             "Execution Engine V2.5.9 recebeu o payload e delegou validação ao Orchestrator.",
             "LIVE com dry_run=true faz preview seguro; LIVE real só envia se Real Pilot Guard, Confirmation Guard, Authorization Token e broker aprovarem.",
@@ -1021,8 +1447,8 @@ def run_execution_engine(
         "notional_usdt": (real_guard or {}).get("trade", {}).get("notional_usdt") if isinstance(real_guard, dict) else None,
         "real_guard_status": (real_guard or {}).get("status") if isinstance(real_guard, dict) else None,
         "real_guard_reasons": (real_guard or {}).get("reasons") if isinstance(real_guard, dict) else None,
-        "live_broker_called": result_extra_live is not None,
-        "live_sent": bool(result_extra_live.get("sent")) if isinstance(result_extra_live, dict) else False,
+        "live_broker_called": live_broker_called,
+        "live_sent": result_extra_live.get("sent") if isinstance(result_extra_live, dict) else None,
         "live_status": result_extra_live.get("status") if isinstance(result_extra_live, dict) else None,
         "confirmation_guard_status": ((result_extra_live.get("confirmation_guard") or {}).get("status") if isinstance(result_extra_live, dict) and isinstance(result_extra_live.get("confirmation_guard"), dict) else None),
         "execution_auth_status": ((result_extra_live.get("auth") or {}).get("status") if isinstance(result_extra_live, dict) and isinstance(result_extra_live.get("auth"), dict) else None),

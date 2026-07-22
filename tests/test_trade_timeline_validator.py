@@ -864,6 +864,100 @@ def test_truncated_ds_id_alone_never_establishes_timeline_ownership():
     assert report["components"]["timeline"]["records"] == 0
 
 
+@pytest.mark.parametrize(
+    "registry_field",
+    [
+        "broker_stop_client_order_id",
+        "disaster_stop_client_order_id",
+        "falcon_disaster_stop_client_order_id",
+    ],
+)
+def test_canonical_fds1_stop_id_correlates_only_by_exact_registry_alias(registry_field):
+    canonical_stop_id = "FDS1-0123456789ABCDEF01234567"
+    registry = _falcon_registry()
+    registry["metadata"] = {
+        **registry["metadata"],
+        registry_field: canonical_stop_id,
+    }
+    registry["metadata"].pop("broker_stop_order_id", None)
+    stop = {
+        "event": "BROKER_DISASTER_STOP_CREATED",
+        "ok": True,
+        "created": True,
+        "status": "DISASTER_STOP_CREATED",
+        "order_id": "FDS1-STOP-ORDER",
+        "client_order_id": canonical_stop_id,
+        "symbol": "SOLUSDT",
+        "position_side": "SHORT",
+        "timestamp": "2026-07-14T11:00:22Z",
+    }
+
+    matched = validate_trade_timeline(
+        registry["trade_id"],
+        sources=_falcon_sources(registry=[registry], broker=[stop]),
+    )
+    mismatched = validate_trade_timeline(
+        registry["trade_id"],
+        sources=_falcon_sources(
+            registry=[registry],
+            broker=[{**stop, "client_order_id": "FDS1-FFFFFFFFFFFFFFFFFFFFFFFF"}],
+        ),
+    )
+
+    assert matched["components"]["broker"]["records"] == 1
+    assert mismatched["components"]["broker"]["records"] == 0
+
+
+def test_canonical_fds1_nested_disaster_stop_evidence_correlates_exactly():
+    canonical_stop_id = "FDS1-89ABCDEF0123456789ABCDEF"
+    registry = _falcon_registry()
+    registry["metadata"] = {
+        **registry["metadata"],
+        "live_order": {"disaster_stop": {"client_order_id": canonical_stop_id}},
+    }
+    registry["metadata"].pop("broker_stop_order_id", None)
+    stop = {
+        "event": "BROKER_DISASTER_STOP_ERROR",
+        "ok": False,
+        "created": False,
+        "status": "DISASTER_STOP_ERROR",
+        "client_order_id": canonical_stop_id,
+        "symbol": "SOLUSDT",
+        "position_side": "SHORT",
+        "timestamp": "2026-07-14T11:00:22Z",
+    }
+
+    report = validate_trade_timeline(
+        registry["trade_id"],
+        sources=_falcon_sources(registry=[registry], broker=[stop]),
+    )
+
+    assert report["components"]["broker"]["records"] == 1
+
+
+def test_legacy_derived_ds_relation_remains_supported_for_historical_broker_fact():
+    registry = _falcon_registry()
+    registry["metadata"].pop("broker_stop_order_id", None)
+    stop = {
+        "event": "BROKER_DISASTER_STOP_CREATED",
+        "ok": True,
+        "created": True,
+        "status": "DISASTER_STOP_CREATED",
+        "order_id": "LEGACY-STOP-ORDER",
+        "client_order_id": "FALCON-LIVE-FALCON15-178-DS",
+        "symbol": "SOLUSDT",
+        "position_side": "SHORT",
+        "timestamp": "2026-07-14T11:00:22Z",
+    }
+
+    report = validate_trade_timeline(
+        registry["trade_id"],
+        sources=_falcon_sources(registry=[registry], broker=[stop]),
+    )
+
+    assert report["components"]["broker"]["records"] == 1
+
+
 def test_same_symbol_and_side_different_bot_is_rejected_after_id_candidate():
     foreign = {
         "broker_order_id": "2077030442691940352", "bot": "DONKEY", "symbol": "SOLUSDT",

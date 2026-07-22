@@ -62,6 +62,14 @@ _set_bytes_avoided = 0
 _instrumentation_errors = 0
 _last_error: Optional[str] = None
 
+_COMPARE_AND_DELETE_SCRIPT = """
+local current = redis.call("GET", KEYS[1])
+if current == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+""".strip()
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -168,6 +176,7 @@ def classify_redis_key(key: Any) -> Dict[str, Any]:
         "confirmed",
         "be_monitor",
         "sweep_state",
+        "client_order",
     )
     temporary_markers = (
         "daily_summary_sent",
@@ -510,6 +519,118 @@ def redis_set(
     return result
 
 
+def redis_set_if_absent(
+    client: Any,
+    key: Any,
+    value: Any,
+    *,
+    caller: str = "UNKNOWN",
+) -> Any:
+    """Atomically SET one value only when the key is absent.
+
+    This intentionally bypasses skip-unchanged and local caches: callers use
+    it for cross-worker ownership locks whose truth must remain in Redis.
+    """
+    size = _payload_size(value)
+    try:
+        # There is deliberately no read/check fallback here.  A client that
+        # cannot execute SET NX must fail closed instead of acquiring a lock
+        # through a process-local decision.
+        result = client.set(key, value, nx=True)
+    except Exception as exc:
+        _record_internal_error(exc)
+        _invalidate_local_authority_state(client, key)
+        raise
+    _invalidate_local_authority_state(client, key)
+    try:
+        _record_operation(
+            "SET_NX" if result not in (None, False) else "SET_NX_REJECTED",
+            key,
+            caller,
+            bytes_in=size,
+            payload_bytes=size,
+        )
+    except Exception as exc:
+        _record_internal_error(exc)
+    return result
+
+
+def redis_get_authoritative(
+    client: Any,
+    key: Any,
+    *,
+    caller: str = "UNKNOWN",
+) -> Any:
+    """Read one authority key directly from Redis, never from local cache."""
+    _invalidate_local_authority_state(client, key)
+    return redis_get(client, key, caller=caller, no_cache=True)
+
+
+def redis_compare_and_delete(
+    client: Any,
+    key: Any,
+    expected_owner: Any,
+    *,
+    caller: str = "UNKNOWN",
+) -> bool:
+    """Atomically delete ``key`` only when its value equals ``expected_owner``.
+
+    Redis executes the comparison and deletion as one Lua script.  There is no
+    GET-then-DELETE or local fallback: when ``EVAL`` is unavailable or fails,
+    the exception is propagated and the lock remains authoritative in Redis.
+    """
+    evaluator = getattr(client, "eval", None)
+    if not callable(evaluator):
+        exc = RuntimeError("atomic Redis EVAL is unavailable")
+        _record_internal_error(exc)
+        _invalidate_local_authority_state(client, key)
+        raise exc
+
+    if isinstance(expected_owner, bytes):
+        try:
+            expected_owner = expected_owner.decode("utf-8")
+        except UnicodeDecodeError as decode_exc:
+            _record_internal_error(decode_exc)
+            raise ValueError("expected_owner must be UTF-8 text") from decode_exc
+    elif not isinstance(expected_owner, str):
+        expected_owner = str(expected_owner)
+    if not expected_owner:
+        raise ValueError("expected_owner is required")
+
+    try:
+        result = evaluator(
+            _COMPARE_AND_DELETE_SCRIPT,
+            keys=[str(key)],
+            args=[expected_owner],
+        )
+    except Exception as exc:
+        _record_internal_error(exc)
+        _invalidate_local_authority_state(client, key)
+        raise
+
+    _invalidate_local_authority_state(client, key)
+    deleted = result is True or result == 1 or str(result).strip() == "1"
+    try:
+        _record_operation(
+            "COMPARE_DELETE" if deleted else "COMPARE_DELETE_MISMATCH",
+            key,
+            caller,
+            bytes_in=_payload_size(expected_owner),
+            payload_bytes=_payload_size(expected_owner),
+        )
+    except Exception as exc:
+        _record_internal_error(exc)
+    return deleted
+
+
+def _invalidate_local_authority_state(client: Any, key: Any) -> None:
+    """Discard process-local observations for an authority key."""
+    cache_key = (id(client), str(key))
+    with _lock:
+        _cache.pop(cache_key, None)
+        _last_values.pop(cache_key, None)
+
+
 def invalidate_redis_cache(client: Any, key: Any) -> None:
     with _lock:
         _cache.pop((id(client), str(key)), None)
@@ -768,7 +889,10 @@ __all__ = [
     "redis_key_requires_fresh_read",
     "ttl_seconds_for_key",
     "redis_get",
+    "redis_get_authoritative",
     "redis_set",
+    "redis_set_if_absent",
+    "redis_compare_and_delete",
     "invalidate_redis_cache",
     "redis_bandwidth_report",
     "build_redis_bandwidth_text",

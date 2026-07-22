@@ -14,6 +14,7 @@
 from flask import Flask
 import os
 import json
+import hashlib
 import logging
 import re
 import time
@@ -24,7 +25,20 @@ import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
-from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
+from redis_bandwidth import (
+    redis_get as bandwidth_redis_get,
+    redis_get_authoritative as bandwidth_redis_get_authoritative,
+    redis_set as bandwidth_redis_set,
+    redis_set_if_absent as bandwidth_redis_set_if_absent,
+)
+from account_client_order_id import (
+    ROLE_ENTRY,
+    ROLE_INITIAL_DISASTER_STOP,
+    build_canonical_operation_id,
+    generate_account_client_order_id,
+    record_account_client_order_attempt_outcome,
+    reserve_account_client_order_attempt,
+)
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
 from predator_daily_summary import (
@@ -1853,6 +1867,219 @@ def predator_local_live_gate(sig):
     return {"allowed": len(reasons) == 0, "reasons": reasons}
 
 
+def _predator_entry_account_identity(sig):
+    """Build stable operation/attempt identities for one Predator entry."""
+
+    signal = dict(sig or {})
+    symbol = nome_limpo(signal.get("symbol"))
+    side = str(signal.get("side") or signal.get("signal") or "").upper().strip()
+    setup = str(signal.get("setup") or signal.get("signal_type") or "SMART_PREDATOR").upper().strip()
+    explicit_lifecycle_id = str(signal.get("lifecycle_id") or "").strip()
+    explicit_signal_id = str(signal.get("signal_id") or signal.get("id") or "").strip()
+    signal_timestamp = signal.get("timestamp")
+
+    if not symbol or side not in {"LONG", "SHORT"}:
+        return {
+            "ok": False,
+            "status": "CLIENT_ORDER_IDENTITY_INVALID",
+            "error": "Predator entry requires canonical symbol and side",
+        }
+    if not explicit_lifecycle_id and not explicit_signal_id and signal_timestamp in (None, "", 0, "0"):
+        return {
+            "ok": False,
+            "status": "CLIENT_ORDER_LIFECYCLE_IDENTITY_REQUIRED",
+            "error": "Predator entry requires lifecycle_id, signal_id, or factual signal timestamp",
+        }
+
+    identity_material = json.dumps(
+        {
+            "bot": "PREDATOR",
+            "setup": setup,
+            "symbol": symbol,
+            "side": side,
+            "signal_id": explicit_signal_id,
+            "signal_timestamp": signal_timestamp,
+            "entry": signal.get("entry"),
+            "sl": signal.get("sl"),
+            "tp50": signal.get("tp50"),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    identity_digest = hashlib.sha256(identity_material.encode("utf-8")).hexdigest().upper()
+    lifecycle_id = explicit_lifecycle_id or f"PREDATOR-LIFECYCLE-{identity_digest}"
+    attempt_id = str(
+        signal.get("client_order_attempt_id")
+        or signal.get("execution_attempt_id")
+        or signal.get("execution_request_id")
+        or explicit_signal_id
+        or f"PREDATOR-ENTRY-ATTEMPT-{identity_digest}"
+    ).strip()
+    attempt_sequence = signal.get("client_order_attempt_sequence")
+    if attempt_sequence is None:
+        attempt_sequence = signal.get("execution_attempt_sequence", 0)
+
+    try:
+        canonical_operation_id = build_canonical_operation_id(
+            bot="PREDATOR",
+            role=ROLE_ENTRY,
+            lifecycle_id=lifecycle_id,
+            symbol=symbol,
+            side=side,
+            stop_revision=0,
+            order_type="MARKET",
+        )
+        identity = {
+            "bot": "PREDATOR",
+            "role": ROLE_ENTRY,
+            "lifecycle_id": lifecycle_id,
+            "symbol": symbol,
+            "side": side,
+            "attempt_id": attempt_id,
+            "attempt_sequence": attempt_sequence,
+            "canonical_operation_id": canonical_operation_id,
+            "stop_revision": 0,
+            "order_type": "MARKET",
+        }
+        return {
+            "ok": True,
+            "status": "CLIENT_ORDER_IDENTITY_READY",
+            "identity": identity,
+            "client_order_id": generate_account_client_order_id(**identity),
+            "canonical_operation_id": canonical_operation_id,
+            "attempt_id": attempt_id,
+            "attempt_sequence": attempt_sequence,
+            "lifecycle_id": lifecycle_id,
+            "lifecycle_id_source": (
+                "EXPLICIT_LIFECYCLE_ID"
+                if explicit_lifecycle_id
+                else "DERIVED_FROM_IMMUTABLE_SIGNAL"
+            ),
+        }
+    except Exception as exc:
+        status = str(exc) if str(exc).startswith("CLIENT_ORDER_ID_") else "CLIENT_ORDER_IDENTITY_INVALID"
+        return {
+            "ok": False,
+            "status": status,
+            "error_type": type(exc).__name__,
+            "lifecycle_id": lifecycle_id,
+            "attempt_id": attempt_id,
+            "attempt_sequence": attempt_sequence,
+        }
+
+
+def _predator_reserve_entry_attempt(account_identity):
+    try:
+        return reserve_account_client_order_attempt(
+            account_identity["identity"],
+            client_order_id=account_identity["client_order_id"],
+            redis_client=redis,
+            set_if_absent=bandwidth_redis_set_if_absent,
+            get_authoritative=bandwidth_redis_get_authoritative,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "send_allowed": False,
+            "status": "CLIENT_ORDER_ID_AUTHORITY_ERROR",
+            "error_type": type(exc).__name__,
+        }
+
+
+def _predator_disaster_stop_reservation_factory(entry_account_identity):
+    def reserve_initial_disaster_stop(
+        *,
+        entry_order_id,
+        entry_client_order_id,
+        symbol,
+        side,
+        revision=0,
+        attempt=0,
+    ):
+        if not str(entry_order_id or "").strip():
+            return {
+                "ok": False,
+                "send_allowed": False,
+                "status": "ENTRY_ORDER_ID_REQUIRED",
+            }
+        try:
+            attempt_sequence = int(attempt)
+            stop_attempt_id = (
+                f"{entry_account_identity['attempt_id']}:INITIAL_DISASTER_STOP:"
+                f"{int(revision)}:{attempt_sequence}"
+            )
+            canonical_operation_id = build_canonical_operation_id(
+                bot="PREDATOR",
+                role=ROLE_INITIAL_DISASTER_STOP,
+                lifecycle_id=entry_account_identity["lifecycle_id"],
+                symbol=symbol,
+                side=side,
+                entry_client_order_id=entry_client_order_id,
+                entry_order_id=entry_order_id,
+                stop_revision=revision,
+                order_type="STOP_MARKET",
+            )
+            identity = {
+                "bot": "PREDATOR",
+                "role": ROLE_INITIAL_DISASTER_STOP,
+                "lifecycle_id": entry_account_identity["lifecycle_id"],
+                "symbol": symbol,
+                "side": side,
+                "entry_client_order_id": entry_client_order_id,
+                "entry_order_id": entry_order_id,
+                "stop_revision": revision,
+                "order_type": "STOP_MARKET",
+                "canonical_operation_id": canonical_operation_id,
+                "attempt_id": stop_attempt_id,
+                "attempt_sequence": attempt_sequence,
+            }
+            client_order_id = generate_account_client_order_id(**identity)
+            return reserve_account_client_order_attempt(
+                identity,
+                client_order_id=client_order_id,
+                redis_client=redis,
+                set_if_absent=bandwidth_redis_set_if_absent,
+                get_authoritative=bandwidth_redis_get_authoritative,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "send_allowed": False,
+                "status": "CLIENT_ORDER_ID_RESERVATION_ERROR",
+                "error_type": type(exc).__name__,
+            }
+
+    return reserve_initial_disaster_stop
+
+
+def _predator_broker_live_send_state():
+    if str(PREDATOR_MODE or "").upper().strip() != "LIVE":
+        return {"known": True, "enabled": False, "status": "NOT_LIVE"}
+    checker = getattr(bingx_broker, "is_real_live_send_enabled", None)
+    if not callable(checker):
+        return {
+            "known": False,
+            "enabled": False,
+            "status": "BROKER_LIVE_SEND_STATE_UNKNOWN",
+        }
+    try:
+        enabled = checker() is True
+        return {
+            "known": True,
+            "enabled": enabled,
+            "status": "LIVE_SEND_ENABLED" if enabled else "LIVE_SEND_DISABLED",
+        }
+    except Exception as exc:
+        return {
+            "known": False,
+            "enabled": False,
+            "status": "BROKER_LIVE_SEND_STATE_ERROR",
+            "error_type": type(exc).__name__,
+        }
+
+
 def build_predator_execution_message(sig, risk, broker_result=None, ready=None, local_gate=None):
     broker_result = broker_result or {}
     ready = ready or {}
@@ -1990,7 +2217,7 @@ def build_predator_execution_message(sig, risk, broker_result=None, ready=None, 
         f"Saldo livre após abertura estimado: {_money(balance_after, 2)} USDT",
         f"Margin: {getattr(bingx_broker, 'BINGX_MARGIN_MODE', 'N/A') if bingx_broker else 'N/A'}",
         f"ReduceOnly: False",
-        f"Client tag: PREDATOR-{symbol}-{int(time.time())}",
+        f"Client tag: {broker_result.get('client_order_id') or 'N/A'}",
     ]
 
     if precision:
@@ -2037,9 +2264,22 @@ def update_position_execution_fields(sig, risk, broker_result):
         p["execution_leverage"] = PREDATOR_REAL_LEVERAGE
         p["execution_notional_usdt"] = PREDATOR_REAL_NOTIONAL_USDT
         p["execution_status"] = broker_result.get("status") if isinstance(broker_result, dict) else None
-        p["execution_sent"] = bool(broker_result.get("sent")) if isinstance(broker_result, dict) else False
+        p["execution_sent"] = broker_result.get("sent") if isinstance(broker_result, dict) else None
+        p["execution_send_outcome_unknown"] = bool(
+            broker_result.get("send_outcome_unknown")
+        ) if isinstance(broker_result, dict) else False
         p["live_order_id"] = broker_result.get("order_id") or broker_result.get("id") if isinstance(broker_result, dict) else None
         p["bingx_order_id"] = p.get("live_order_id")
+        account_identity = (
+            broker_result.get("account_client_order_identity")
+            if isinstance(broker_result, dict)
+            and isinstance(broker_result.get("account_client_order_identity"), dict)
+            else {}
+        )
+        p["lifecycle_id"] = p.get("lifecycle_id") or account_identity.get("lifecycle_id")
+        p["live_client_order_id"] = broker_result.get("client_order_id")
+        p["canonical_operation_id"] = broker_result.get("canonical_operation_id")
+        p["client_order_attempt_id"] = broker_result.get("attempt_id")
         p["broker_result_last"] = broker_result if isinstance(broker_result, dict) else {}
         posicoes[symbol] = p
         salvar_posicoes(posicoes)
@@ -2049,7 +2289,12 @@ def update_position_execution_fields(sig, risk, broker_result):
             execution_mode=PREDATOR_MODE,
             execution_status=p.get("execution_status"),
             execution_sent=p.get("execution_sent"),
+            execution_send_outcome_unknown=p.get("execution_send_outcome_unknown"),
             live_order_id=p.get("live_order_id"),
+            live_client_order_id=p.get("live_client_order_id"),
+            lifecycle_id=p.get("lifecycle_id"),
+            canonical_operation_id=p.get("canonical_operation_id"),
+            client_order_attempt_id=p.get("client_order_attempt_id"),
         )
     except Exception as exc:
         print("ERRO update_position_execution_fields:", exc)
@@ -2264,21 +2509,163 @@ def execute_predator_signal_safe(sig, risk_prechecked=None, local_gate_prechecke
             "effective_notional_usdt": PREDATOR_REAL_NOTIONAL_USDT,
         }
     else:
-        client_tag = f"PREDATOR-{nome_limpo(sig.get('symbol'))}-{int(time.time())}"
-        try:
-            broker_result = bingx_broker.place_market_order(
-                sig.get("symbol"),
-                sig.get("side"),
-                PREDATOR_REAL_MARGIN_USDT,
-                reduce_only=False,
-                client_tag=client_tag,
-                leverage=PREDATOR_REAL_LEVERAGE,
-                bot="PREDATOR",
-            )
-            if isinstance(broker_result, dict):
+        account_identity = _predator_entry_account_identity(sig)
+        live_send_state = _predator_broker_live_send_state()
+        reservation = None
+
+        if not account_identity.get("ok"):
+            broker_result = {
+                "ok": False,
+                "status": account_identity.get("status")
+                or "CLIENT_ORDER_IDENTITY_INVALID",
+                "sent": False,
+                "send_attempted": False,
+                "broker_called": False,
+                "origin_type": origin,
+                "account_client_order_identity": account_identity,
+            }
+        elif PREDATOR_MODE == "LIVE" and not live_send_state.get("known"):
+            broker_result = {
+                "ok": False,
+                "status": live_send_state.get("status")
+                or "BROKER_LIVE_SEND_STATE_UNKNOWN",
+                "sent": False,
+                "send_attempted": False,
+                "broker_called": False,
+                "origin_type": origin,
+                "account_client_order_identity": account_identity,
+                "broker_live_send_state": live_send_state,
+            }
+        else:
+            if live_send_state.get("enabled") is True:
+                reservation = _predator_reserve_entry_attempt(account_identity)
+
+            if live_send_state.get("enabled") is True and not (
+                isinstance(reservation, dict)
+                and reservation.get("send_allowed") is True
+                and reservation.get("status") == "RESERVED_UNIQUE"
+            ):
+                broker_result = {
+                    "ok": False,
+                    "status": (reservation or {}).get("status")
+                    or "CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+                    "sent": False,
+                    "send_attempted": False,
+                    "send_outcome_unknown": False,
+                    "broker_called": False,
+                    "origin_type": origin,
+                    "client_order_id": account_identity.get("client_order_id"),
+                    "canonical_operation_id": account_identity.get(
+                        "canonical_operation_id"
+                    ),
+                    "attempt_id": account_identity.get("attempt_id"),
+                    "account_client_order_identity": account_identity,
+                    "client_order_id_reservation": reservation,
+                    "reconciliation_required": True,
+                }
+            else:
+                try:
+                    broker_result = bingx_broker.place_market_order(
+                        sig.get("symbol"),
+                        sig.get("side"),
+                        PREDATOR_REAL_MARGIN_USDT,
+                        reduce_only=False,
+                        client_tag=account_identity["client_order_id"],
+                        leverage=PREDATOR_REAL_LEVERAGE,
+                        bot="PREDATOR",
+                        risk_pct=sig.get("risk_pct"),
+                        stop_loss_price=sig.get("sl"),
+                        client_order_id_reservation=reservation,
+                        disaster_stop_client_order_id_factory=(
+                            _predator_disaster_stop_reservation_factory(
+                                account_identity
+                            )
+                            if live_send_state.get("enabled") is True
+                            else None
+                        ),
+                    )
+                except Exception as exc:
+                    if live_send_state.get("enabled") is True:
+                        broker_result = {
+                            "ok": False,
+                            "status": "CREATE_ORDER_OUTCOME_UNKNOWN",
+                            "sent": None,
+                            "send_attempted": True,
+                            "send_outcome_unknown": True,
+                            "reconciliation_required": True,
+                            "error_type": type(exc).__name__,
+                        }
+                    else:
+                        broker_result = {
+                            "ok": False,
+                            "status": "BROKER_PREVIEW_EXCEPTION",
+                            "sent": False,
+                            "send_attempted": False,
+                            "error_type": type(exc).__name__,
+                        }
+                if not isinstance(broker_result, dict):
+                    broker_result = {
+                        "ok": False,
+                        "status": "CREATE_ORDER_OUTCOME_UNKNOWN"
+                        if live_send_state.get("enabled") is True
+                        else "INVALID_BROKER_PREVIEW_RESULT",
+                        "sent": None if live_send_state.get("enabled") is True else False,
+                        "send_attempted": live_send_state.get("enabled") is True,
+                        "send_outcome_unknown": live_send_state.get("enabled") is True,
+                        "reconciliation_required": live_send_state.get("enabled") is True,
+                    }
                 broker_result.setdefault("origin_type", origin)
-        except Exception as exc:
-            broker_result = {"ok": False, "status": "BROKER_EXCEPTION", "sent": False, "error": str(exc), "origin_type": origin}
+                broker_result.setdefault("broker_called", True)
+                broker_result.setdefault(
+                    "client_order_id", account_identity.get("client_order_id")
+                )
+                broker_result.setdefault(
+                    "canonical_operation_id",
+                    account_identity.get("canonical_operation_id"),
+                )
+                broker_result.setdefault("attempt_id", account_identity.get("attempt_id"))
+                broker_result.setdefault(
+                    "account_client_order_identity", account_identity
+                )
+                broker_result.setdefault(
+                    "client_order_id_reservation", reservation
+                )
+                broker_result.setdefault("broker_live_send_state", live_send_state)
+
+                if live_send_state.get("enabled") is True:
+                    sent_state = broker_result.get("sent")
+                    send_attempted_state = broker_result.get("send_attempted")
+                    outcome_state = (
+                        "ACKNOWLEDGED"
+                        if sent_state is True
+                        else "PRE_SEND_FAILED_ATTEMPT_CONSUMED"
+                        if (
+                            sent_state is False
+                            and send_attempted_state is False
+                            and broker_result.get("send_outcome_unknown") is not True
+                        )
+                        else "CREATE_ORDER_OUTCOME_UNKNOWN"
+                    )
+                    broker_result["lifecycle_blocked"] = (
+                        outcome_state == "CREATE_ORDER_OUTCOME_UNKNOWN"
+                    )
+                    broker_result["blocked_lifecycle_id"] = (
+                        account_identity.get("lifecycle_id")
+                        if broker_result["lifecycle_blocked"]
+                        else None
+                    )
+                    broker_result["reconciliation_required"] = bool(
+                        broker_result.get("reconciliation_required")
+                        or broker_result["lifecycle_blocked"]
+                    )
+                    broker_result["client_order_attempt_outcome"] = (
+                        record_account_client_order_attempt_outcome(
+                            reservation,
+                            outcome_state=outcome_state,
+                            redis_client=redis,
+                            set_if_absent=bandwidth_redis_set_if_absent,
+                        )
+                    )
 
     HEALTH["execution_last_decision"] = risk.get("decision", "ALLOW" if risk.get("allowed") else "DENY")
     HEALTH["execution_last_result"] = broker_result.get("status")

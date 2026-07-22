@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -17,16 +19,32 @@ class FakeRedis:
         self.get_calls = []
         self.set_calls = []
         self.expire_calls = []
+        self.eval_calls = []
         self.keys_calls = 0
+        self._lock = threading.Lock()
 
     def get(self, key):
-        self.get_calls.append(key)
-        return self.values.get(key)
+        with self._lock:
+            self.get_calls.append(key)
+            return self.values.get(key)
 
-    def set(self, key, value):
-        self.set_calls.append((key, value))
-        self.values[key] = value
-        return True
+    def set(self, key, value, nx=False):
+        with self._lock:
+            self.set_calls.append((key, value))
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+    def eval(self, script, keys=None, args=None):
+        with self._lock:
+            self.eval_calls.append((script, list(keys or []), list(args or [])))
+            key = keys[0]
+            expected_owner = args[0]
+            if self.values.get(key) != expected_owner:
+                return 0
+            del self.values[key]
+            return 1
 
     def expire(self, key, seconds):
         self.expire_calls.append((key, seconds))
@@ -269,3 +287,120 @@ def test_26_temporary_unknown_and_permanent_classification_is_conservative():
     assert bandwidth.classify_redis_key("custom:unreviewed")["classification"] == "UNKNOWN"
     assert bandwidth.ttl_seconds_for_key("custom:unreviewed") is None
     assert bandwidth.classify_redis_key("trade:lifecycle:v1")["classification"] == "PERMANENT"
+
+
+def test_27_atomic_set_if_absent_never_uses_local_cache_as_lock_authority():
+    client = FakeRedis()
+
+    first = bandwidth.redis_set_if_absent(
+        client,
+        "falcon:terminal-stop:lock",
+        "owner-1",
+        caller="bots.falcon",
+    )
+    second = bandwidth.redis_set_if_absent(
+        client,
+        "falcon:terminal-stop:lock",
+        "owner-2",
+        caller="bots.falcon",
+    )
+
+    assert first is True
+    assert second is False
+    assert client.values["falcon:terminal-stop:lock"] == "owner-1"
+    operations = {
+        row["op"]: row["count"]
+        for row in bandwidth.redis_bandwidth_report()["top_operations_by_bytes"]
+    }
+    assert operations == {"SET_NX": 1, "SET_NX_REJECTED": 1}
+
+
+def test_28_atomic_set_nx_allows_exactly_one_concurrent_owner():
+    client = FakeRedis()
+    barrier = threading.Barrier(2)
+
+    def acquire(owner):
+        barrier.wait(timeout=2)
+        return bandwidth.redis_set_if_absent(
+            client,
+            "falcon:terminal-stop:lifecycle-lock",
+            owner,
+            caller="bots.falcon",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(acquire, ("worker-1", "worker-2")))
+
+    assert sorted(outcomes) == [False, True]
+    assert client.values["falcon:terminal-stop:lifecycle-lock"] in {"worker-1", "worker-2"}
+
+
+def test_29_compare_and_delete_is_one_atomic_eval_and_wrong_owner_cannot_delete():
+    key = "falcon:terminal-stop:lifecycle-lock"
+    client = FakeRedis({key: "owner-current"})
+
+    assert bandwidth.redis_compare_and_delete(
+        client, key, "owner-wrong", caller="bots.falcon"
+    ) is False
+    assert client.values[key] == "owner-current"
+    assert client.get_calls == []
+
+    assert bandwidth.redis_compare_and_delete(
+        client, key, "owner-current", caller="bots.falcon"
+    ) is True
+    assert key not in client.values
+    assert len(client.eval_calls) == 2
+
+
+def test_30_old_owner_cannot_delete_lock_reacquired_by_new_worker():
+    key = "falcon:terminal-stop:lifecycle-lock"
+    client = FakeRedis({key: "owner-old"})
+    assert bandwidth.redis_compare_and_delete(client, key, "owner-old") is True
+    assert bandwidth.redis_set_if_absent(client, key, "owner-new") is True
+
+    assert bandwidth.redis_compare_and_delete(client, key, "owner-old") is False
+    assert client.values[key] == "owner-new"
+
+
+def test_31_compare_and_delete_fails_closed_when_eval_is_unavailable():
+    class RedisWithoutEval:
+        def __init__(self):
+            self.values = {"lock": "owner"}
+
+    client = RedisWithoutEval()
+    with pytest.raises(RuntimeError, match="EVAL is unavailable"):
+        bandwidth.redis_compare_and_delete(client, "lock", "owner")
+    assert client.values["lock"] == "owner"
+
+
+def test_32_compare_and_delete_fails_closed_when_eval_errors():
+    class FailingEvalRedis(FakeRedis):
+        def eval(self, script, keys=None, args=None):
+            raise OSError("redis unavailable")
+
+    client = FailingEvalRedis({"lock": "owner"})
+    with pytest.raises(OSError, match="redis unavailable"):
+        bandwidth.redis_compare_and_delete(client, "lock", "owner")
+    assert client.values["lock"] == "owner"
+    assert client.get_calls == []
+
+
+def test_33_authoritative_get_bypasses_and_discards_stale_local_cache():
+    key = "falcon:terminal-stop:lifecycle-lock"
+    client = FakeRedis({key: "owner-old"})
+    assert bandwidth.redis_get(client, key, cache_ttl_seconds=30) == "owner-old"
+    client.values[key] = "owner-current"
+
+    assert bandwidth.redis_get_authoritative(client, key, caller="bots.falcon") == "owner-current"
+    client.values[key] = "owner-new"
+    assert bandwidth.redis_get(client, key, cache_ttl_seconds=30) == "owner-new"
+    assert client.get_calls == [key, key, key]
+
+
+def test_34_set_nx_failure_has_no_non_atomic_fallback():
+    class RedisWithoutNx:
+        def set(self, key, value):
+            raise AssertionError("non-atomic set must not be attempted")
+
+    with pytest.raises(TypeError):
+        bandwidth.redis_set_if_absent(RedisWithoutNx(), "lock", "owner")

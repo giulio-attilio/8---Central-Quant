@@ -49,6 +49,7 @@ import secrets
 import hmac
 import json
 import os
+import re
 import time
 import threading
 from pathlib import Path
@@ -56,6 +57,22 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
 import ccxt
+
+from account_client_order_id import (
+    ROLE_BREAK_EVEN_STOP,
+    ROLE_EMERGENCY_TERMINAL_STOP_CLOSE,
+    ROLE_ENTRY,
+    ROLE_INITIAL_DISASTER_STOP,
+    ROLE_MANAGED_CLOSE,
+    ROLE_REPLACEMENT_STOP,
+    ROLE_ROLLBACK_STOP,
+    ROLE_TP50_CLOSE,
+    ROLE_TRAILING_STOP,
+    claim_account_client_order_send_authorization,
+    normalize_account_client_order_id,
+    record_account_client_order_attempt_outcome,
+    verify_account_client_order_id_reservation,
+)
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 
@@ -69,6 +86,697 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
+def _broker_factual_writes_enabled():
+    """Return whether a public Broker writer may reach the exchange."""
+
+    return bool(
+        str(EXECUTION_MODE or "").upper().strip() == "LIVE"
+        and ENABLE_REAL_TRADING
+        and not BROKER_DRY_RUN
+    )
+
+
+def validate_broker_client_order_id(value, *, required=False):
+    """Validate an exchange clientOrderId without ever truncating it.
+
+    A composed identifier that exceeds the BingX boundary is invalid.  Cutting
+    it here would discard entropy and can silently alias two logical orders.
+    """
+    if value is None:
+        if required:
+            raise ValueError("client_order_id is required")
+        return None
+    text = str(value).strip().upper()
+    if not text:
+        if required:
+            raise ValueError("client_order_id is required")
+        return None
+    if len(text) > BROKER_CLIENT_ORDER_ID_MAX_LENGTH:
+        raise ValueError("CLIENT_ORDER_ID_INVALID_LENGTH")
+    if not _BROKER_CLIENT_ORDER_ID_PATTERN.fullmatch(text):
+        raise ValueError("CLIENT_ORDER_ID_INVALID_CHARACTERS")
+    return text
+
+
+def _broker_account_reservation_verification(
+    reservation,
+    client_order_id,
+    reservation_verifier=None,
+):
+    """Read the permanent account ledger immediately before an exchange send."""
+
+    verifier = reservation_verifier or verify_account_client_order_id_reservation
+    try:
+        result = verifier(
+            reservation or {}, expected_client_order_id=client_order_id
+        )
+    except TypeError:
+        # Test fakes and legacy injected verifiers may use positional arguments.
+        try:
+            result = verifier(reservation or {}, client_order_id)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "send_allowed": False,
+                "status": "CLIENT_ORDER_ID_AUTHORITY_ERROR",
+                "client_order_id": client_order_id,
+                "persistent": False,
+                "error_type": type(exc).__name__,
+            }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "send_allowed": False,
+            "status": "CLIENT_ORDER_ID_AUTHORITY_ERROR",
+            "client_order_id": client_order_id,
+            "persistent": False,
+            "error_type": type(exc).__name__,
+        }
+    result = dict(result) if isinstance(result, dict) else {}
+    try:
+        attempt_sequence = int(result.get("attempt_sequence"))
+    except (TypeError, ValueError):
+        attempt_sequence = None
+    verified = bool(
+        result.get("ok") is True
+        and result.get("send_allowed") is True
+        and result.get("status") == "RESERVED_UNIQUE"
+        and result.get("persistent") is True
+        and result.get("client_order_id_reserved") is True
+        and result.get("client_order_id_unique") is True
+        and str(result.get("client_order_id") or "").upper() == client_order_id
+        and result.get("canonical_operation_id")
+        and result.get("attempt_id")
+        and result.get("attempt_identity_hash")
+        and attempt_sequence is not None
+        and attempt_sequence >= 0
+    )
+    result["attempt_sequence"] = attempt_sequence
+    result["ok"] = verified
+    result["send_allowed"] = verified
+    if not verified:
+        result.setdefault("status", "CLIENT_ORDER_ID_RESERVATION_REQUIRED")
+    return result
+
+
+def _broker_account_order_context(
+    symbol, order_type, order_side, params, reservation_verification, expected_roles
+):
+    """Bind one permanent reservation to the factual order about to be sent."""
+
+    verification = (
+        reservation_verification
+        if isinstance(reservation_verification, dict)
+        else {}
+    )
+    params = params if isinstance(params, dict) else {}
+    role = str(verification.get("role") or "").upper().strip()
+    reserved_symbol = str(verification.get("symbol") or "").upper().strip()
+    requested_symbol = str(symbol or "").upper().strip()
+    for fragment in ("/", "-"):
+        reserved_symbol = reserved_symbol.replace(fragment, "")
+        requested_symbol = requested_symbol.replace(fragment, "")
+    if reserved_symbol.endswith(":USDT"):
+        reserved_symbol = reserved_symbol[:-5]
+    if requested_symbol.endswith(":USDT"):
+        requested_symbol = requested_symbol[:-5]
+
+    reserved_order_type = str(
+        verification.get("order_type") or ""
+    ).upper().strip().replace("-", "_")
+    requested_order_type = str(order_type or "").upper().strip().replace("-", "_")
+    reserved_side = str(verification.get("side") or "").upper().strip()
+    order_side_norm = str(order_side or "").upper().strip()
+    position_side = str(
+        params.get("positionSide") or params.get("position_side") or ""
+    ).upper().strip()
+    if position_side in {"BUY", "SELL"}:
+        position_side = "LONG" if position_side == "BUY" else "SHORT"
+    if role == ROLE_ENTRY:
+        factual_position_side = "LONG" if order_side_norm == "BUY" else (
+            "SHORT" if order_side_norm == "SELL" else ""
+        )
+    else:
+        factual_position_side = position_side or (
+            "LONG" if order_side_norm == "SELL" else (
+                "SHORT" if order_side_norm == "BUY" else ""
+            )
+        )
+    allowed_roles = {
+        str(value or "").upper().strip() for value in (expected_roles or ())
+        if str(value or "").strip()
+    }
+    checks = {
+        "role_matches_writer": bool(role and role in allowed_roles),
+        "symbol_matches_writer": bool(
+            reserved_symbol and reserved_symbol == requested_symbol
+        ),
+        "side_matches_writer": bool(
+            reserved_side and reserved_side == factual_position_side
+        ),
+        "order_type_matches_writer": bool(
+            reserved_order_type and reserved_order_type == requested_order_type
+        ),
+        "lifecycle_identity_present": bool(verification.get("lifecycle_id")),
+        "attempt_identity_present": bool(
+            verification.get("canonical_operation_id")
+            and verification.get("attempt_id")
+            and verification.get("attempt_identity_hash")
+        ),
+    }
+    failed_checks = [name for name, valid in checks.items() if not valid]
+    return {
+        "ok": not failed_checks,
+        "status": (
+            "CLIENT_ORDER_ID_RESERVATION_CONTEXT_MATCH"
+            if not failed_checks
+            else "CLIENT_ORDER_ID_RESERVATION_CONTEXT_MISMATCH"
+        ),
+        **checks,
+        "failed_checks": failed_checks,
+        "role": role or None,
+        "symbol": reserved_symbol or None,
+        "side": reserved_side or None,
+        "order_type": reserved_order_type or None,
+        "requested_symbol": requested_symbol or None,
+        "requested_position_side": factual_position_side or None,
+        "requested_order_type": requested_order_type or None,
+    }
+
+
+def _broker_returned_client_order_id(order):
+    order = order if isinstance(order, dict) else {}
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    observed = []
+    for source in (order, info):
+        for key in (
+            "clientOrderId",
+            "clientOrderID",
+            "client_order_id",
+            "clientOid",
+            "client_orderId",
+        ):
+            value = source.get(key)
+            if value not in (None, ""):
+                try:
+                    normalized = normalize_account_client_order_id(str(value))
+                except Exception:
+                    normalized = str(value).strip().upper() or None
+                if normalized:
+                    observed.append(normalized)
+    unique = set(observed)
+    return observed[0] if len(unique) == 1 else None
+
+
+def _broker_material_disaster_stop_confirmation(
+    order,
+    *,
+    expected_symbol,
+    expected_close_side,
+    expected_position_side,
+    expected_amount,
+    expected_stop_price,
+    entry_price,
+):
+    """Validate factual material returned for a newly-created protective stop.
+
+    A successful ``create_order`` response is not protection by itself.  The
+    returned order must describe the exact leg, close direction, quantity and
+    protective trigger that were requested.  Missing evidence fails closed.
+    """
+
+    payload = order if isinstance(order, dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+
+    def values(*keys):
+        observed = []
+        for source in (payload, info):
+            for key in keys:
+                value = source.get(key)
+                if value not in (None, ""):
+                    observed.append(value)
+        return observed
+
+    def first(*keys):
+        observed = values(*keys)
+        return observed[0] if observed else None
+
+    def number(value):
+        try:
+            if value in (None, "") or isinstance(value, bool):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def truthy(value):
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {
+            "1", "true", "yes", "y", "on",
+        }
+
+    def canonical_symbol(value):
+        text = str(value or "").upper().strip().replace(":USDT", "")
+        return text.replace("/", "").replace("-", "")
+
+    factual_symbols = {
+        canonical_symbol(value)
+        for value in values("symbol", "contract", "instrument")
+        if canonical_symbol(value)
+    }
+    factual_symbol = next(iter(factual_symbols), "")
+    requested_symbol = canonical_symbol(expected_symbol)
+    factual_sides = {
+        str(value).lower().strip()
+        for value in values("side", "orderSide")
+        if str(value).strip()
+    }
+    factual_side = next(iter(factual_sides), "")
+    requested_close_side = str(expected_close_side or "").lower().strip()
+    factual_position_sides = {
+        str(value).upper().strip()
+        for value in values("positionSide", "position_side", "posSide")
+        if str(value).strip()
+    }
+    factual_position_side = next(iter(factual_position_sides), "")
+    requested_position_side = str(expected_position_side or "").upper().strip()
+
+    type_values = {
+        str(value).upper().strip()
+        for value in values("type", "orderType", "planType", "triggerOrderType")
+        if value not in (None, "")
+    }
+    stop_loss_prices = [
+        number(value)
+        for value in values("stopLossPrice", "stop_loss_price")
+        if number(value) is not None
+    ]
+    take_profit_prices = [
+        number(value)
+        for value in values("takeProfitPrice", "take_profit_price")
+        if number(value) is not None
+    ]
+    trigger_prices = [
+        number(value)
+        for value in values(
+            "stopLossPrice", "stop_loss_price", "stopPrice", "triggerPrice"
+        )
+        if number(value) is not None
+    ]
+    factual_amounts = [
+        number(value)
+        for value in values("amount", "origQty", "quantity", "qty", "orderQty")
+        if number(value) is not None
+    ]
+    stop_loss_price = stop_loss_prices[0] if stop_loss_prices else None
+    take_profit_price = take_profit_prices[0] if take_profit_prices else None
+    trigger_price = trigger_prices[0] if trigger_prices else None
+    factual_amount = factual_amounts[0] if factual_amounts else None
+    requested_amount = number(expected_amount)
+    requested_stop_price = number(expected_stop_price)
+    factual_entry_price = number(entry_price)
+
+    take_profit_evidence_present = bool(
+        take_profit_price is not None
+        or any(
+            "TAKE_PROFIT" in value or "TAKEPROFIT" in value
+            for value in type_values
+        )
+    )
+    stop_loss_evidence_present = bool(
+        stop_loss_price is not None
+        or any(
+            value in {"STOP", "STOP_MARKET", "STOP_LOSS", "TRIGGER_MARKET"}
+            or ("STOP" in value and "TAKE_PROFIT" not in value)
+            for value in type_values
+        )
+    )
+
+    symbol_matches = bool(
+        factual_symbols and factual_symbols == {requested_symbol}
+    )
+    close_side_matches = bool(
+        factual_sides and factual_sides == {requested_close_side}
+    )
+    if requested_position_side:
+        position_side_matches = bool(
+            factual_position_sides
+            and factual_position_sides == {requested_position_side}
+        )
+        close_semantics_valid = position_side_matches
+    else:
+        position_side_matches = not factual_position_sides or factual_position_sides <= {
+            "BOTH", "NET"
+        }
+        close_semantics_valid = bool(
+            any(truthy(value) for value in values("reduceOnly", "reduce_only"))
+            or any(
+                truthy(value)
+                for value in values("closePosition", "close_position", "closeAll")
+            )
+        )
+
+    trigger_present = bool(trigger_price is not None and trigger_price > 0)
+    trigger_matches_requested = bool(
+        trigger_prices
+        and requested_stop_price is not None
+        and all(
+            abs(value - requested_stop_price)
+            <= max(1e-12, abs(requested_stop_price) * 1e-8)
+            for value in trigger_prices
+        )
+    )
+    if factual_entry_price is None or factual_entry_price <= 0:
+        trigger_direction_valid = False
+    elif requested_position_side == "SHORT" or requested_close_side == "buy":
+        trigger_direction_valid = bool(
+            trigger_present and trigger_price > factual_entry_price
+        )
+    else:
+        trigger_direction_valid = bool(
+            trigger_present and trigger_price < factual_entry_price
+        )
+
+    quantity_matches = bool(
+        factual_amounts
+        and requested_amount is not None
+        and requested_amount > 0
+        and all(
+            abs(value - requested_amount)
+            <= max(1e-12, abs(requested_amount) * 1e-8)
+            for value in factual_amounts
+        )
+    )
+    type_valid = bool(
+        stop_loss_evidence_present and not take_profit_evidence_present
+    )
+
+    checks = {
+        "symbol_matches": symbol_matches,
+        "close_side_matches": close_side_matches,
+        "position_side_matches": position_side_matches,
+        "close_semantics_valid": close_semantics_valid,
+        "type_valid": type_valid,
+        "trigger_present": trigger_present,
+        "trigger_matches_requested": trigger_matches_requested,
+        "trigger_direction_valid": trigger_direction_valid,
+        "quantity_matches": quantity_matches,
+    }
+    failed_checks = [name for name, valid in checks.items() if not valid]
+    return {
+        "materially_valid": not failed_checks,
+        **checks,
+        "failed_checks": failed_checks,
+        "factual_symbol": factual_symbol or None,
+        "factual_side": factual_side or None,
+        "factual_position_side": factual_position_side or None,
+        "factual_amount": factual_amount,
+        "factual_trigger_price": trigger_price,
+        "factual_symbols": sorted(factual_symbols),
+        "factual_sides": sorted(factual_sides),
+        "factual_position_sides": sorted(factual_position_sides),
+        "factual_amounts": factual_amounts,
+        "factual_trigger_prices": trigger_prices,
+        "type_values": sorted(type_values),
+        "stop_loss_evidence_present": stop_loss_evidence_present,
+        "take_profit_evidence_present": take_profit_evidence_present,
+    }
+
+
+def _create_order_with_reserved_attempt(
+    ex,
+    symbol,
+    order_type,
+    side,
+    amount,
+    price,
+    params,
+    *,
+    client_order_id_reservation,
+    expected_reservation_roles,
+    client_order_id_reservation_verifier=None,
+    send_state=None,
+):
+    """The sole raw ``create_order`` boundary for Central-managed orders."""
+
+    send_state = send_state if isinstance(send_state, dict) else {}
+    params = dict(params or {})
+
+    def persist_attempt_outcome(
+        outcome_state, *, reason=None, failure_phase=None
+    ):
+        """Persist the material send outcome without changing the send fact."""
+
+        try:
+            outcome_kwargs = {"outcome_state": outcome_state}
+            if reason not in (None, ""):
+                outcome_kwargs["reason"] = str(reason)[:120]
+            if failure_phase not in (None, ""):
+                outcome_kwargs["failure_phase"] = str(failure_phase)[:80]
+            outcome = record_account_client_order_attempt_outcome(
+                client_order_id_reservation or {}, **outcome_kwargs
+            )
+        except Exception as exc:
+            outcome = {
+                "ok": False,
+                "status": "ATTEMPT_OUTCOME_PERSISTENCE_ERROR",
+                "persistent": False,
+                "id_released": False,
+                "error_type": type(exc).__name__,
+            }
+        outcome = dict(outcome) if isinstance(outcome, dict) else {}
+        materially_persisted = bool(
+            outcome.get("ok") is True and outcome.get("persistent") is True
+        )
+        outcome["ok"] = materially_persisted
+        outcome["persistent"] = materially_persisted
+        outcome["materially_persisted"] = materially_persisted
+        outcome["requested_outcome_state"] = outcome_state
+        outcome["reconciliation_required"] = bool(
+            outcome.get("reconciliation_required") or not materially_persisted
+        )
+        if not materially_persisted:
+            outcome.setdefault("status", "ATTEMPT_OUTCOME_PERSISTENCE_ERROR")
+        return outcome
+    raw_client_order_id = (
+        params.get("clientOrderId")
+        or params.get("clientOrderID")
+        or params.get("client_order_id")
+    )
+    try:
+        exact_client_order_id = validate_broker_client_order_id(
+            raw_client_order_id, required=True
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": str(exc)
+            if str(exc).startswith("CLIENT_ORDER_ID_")
+            else "CLIENT_ORDER_ID_REQUIRED",
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "client_order_id": None,
+            "error_type": type(exc).__name__,
+        }
+    params["clientOrderId"] = exact_client_order_id
+    params.pop("clientOrderID", None)
+    params.pop("client_order_id", None)
+    verification = _broker_account_reservation_verification(
+        client_order_id_reservation,
+        exact_client_order_id,
+        reservation_verifier=client_order_id_reservation_verifier,
+    )
+    if not verification.get("ok"):
+        return {
+            "ok": False,
+            "status": verification.get("status")
+            or "CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "client_order_id": exact_client_order_id,
+            "client_order_id_reserved": False,
+            "client_order_id_unique": False,
+            "reservation_verification": verification,
+        }
+    context_verification = _broker_account_order_context(
+        symbol,
+        order_type,
+        side,
+        params,
+        verification,
+        expected_reservation_roles,
+    )
+    if not context_verification.get("ok"):
+        outcome_persistence = persist_attempt_outcome(
+            "PRE_SEND_FAILED_ATTEMPT_CONSUMED",
+            reason=context_verification.get("status")
+            or "CLIENT_ORDER_ID_RESERVATION_CONTEXT_MISMATCH",
+            failure_phase="PRE_SEND_CONTEXT_VALIDATION",
+        )
+        return {
+            "ok": False,
+            "status": context_verification.get("status"),
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "client_order_id": exact_client_order_id,
+            "client_order_id_reserved": True,
+            "client_order_id_unique": True,
+            "reservation_verification": verification,
+            "reservation_context": context_verification,
+            "reconciliation_required": True,
+            "attempt_outcome_persistent": outcome_persistence.get(
+                "materially_persisted"
+            ) is True,
+            "attempt_outcome_persistence_ok": outcome_persistence.get(
+                "materially_persisted"
+            ) is True,
+            "attempt_outcome_persistence": outcome_persistence,
+        }
+    try:
+        send_claim = claim_account_client_order_send_authorization(
+            client_order_id_reservation or {},
+            expected_client_order_id=exact_client_order_id,
+        )
+    except Exception as exc:
+        send_claim = {
+            "ok": False,
+            "send_allowed": False,
+            "send_claimed": False,
+            "status": "CLIENT_ORDER_SEND_CLAIM_AUTHORITY_ERROR",
+            "client_order_id": exact_client_order_id,
+            "persistent": False,
+            "reconciliation_required": True,
+            "error_type": type(exc).__name__,
+        }
+    claim_verified = bool(
+        isinstance(send_claim, dict)
+        and send_claim.get("ok") is True
+        and send_claim.get("send_allowed") is True
+        and send_claim.get("send_claimed") is True
+        and send_claim.get("status") == "SEND_CLAIMED"
+        and send_claim.get("persistent") is True
+        and str(send_claim.get("client_order_id") or "").upper()
+        == exact_client_order_id
+        and send_claim.get("canonical_operation_id")
+        == verification.get("canonical_operation_id")
+        and send_claim.get("attempt_id") == verification.get("attempt_id")
+        and send_claim.get("attempt_identity_hash")
+        == verification.get("attempt_identity_hash")
+        and send_claim.get("attempt_sequence")
+        == verification.get("attempt_sequence")
+        and send_claim.get("attempt_disposition") == "SEND_CLAIMED"
+    )
+    if not claim_verified:
+        claim_status = (send_claim or {}).get("status")
+        if bool(
+            isinstance(send_claim, dict)
+            and send_claim.get("ok") is True
+            and send_claim.get("send_claimed") is True
+        ):
+            claim_status = "CLIENT_ORDER_SEND_CLAIM_CONTEXT_MISMATCH"
+        return {
+            "ok": False,
+            "status": claim_status or "CLIENT_ORDER_SEND_CLAIM_REQUIRED",
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "client_order_id": exact_client_order_id,
+            "client_order_id_reserved": True,
+            "client_order_id_unique": True,
+            "send_claimed": bool((send_claim or {}).get("send_claimed")),
+            "reconciliation_required": bool(
+                (send_claim or {}).get("reconciliation_required")
+            ),
+            "reservation_verification": verification,
+            "send_claim": send_claim,
+        }
+    send_state.update(
+        {
+            "phase": "SEND_CLAIMED_PRE_CREATE",
+            "send_claimed": True,
+            "send_claim": send_claim,
+            "send_attempted": True,
+            "create_returned": False,
+            "client_order_id": exact_client_order_id,
+        }
+    )
+    send_state["phase"] = "CREATE_ORDER_CALL"
+    try:
+        order = ex.create_order(
+            symbol, order_type, side, amount, price, params
+        )
+    except Exception:
+        outcome_persistence = persist_attempt_outcome(
+            "CREATE_ORDER_OUTCOME_UNKNOWN"
+        )
+        send_state.update(
+            {
+                "phase": "CREATE_ORDER_OUTCOME_UNKNOWN",
+                "send_outcome_unknown": True,
+                "attempt_outcome_persistent": outcome_persistence.get(
+                    "materially_persisted"
+                ) is True,
+                "attempt_outcome_persistence_ok": outcome_persistence.get(
+                    "materially_persisted"
+                ) is True,
+                "reconciliation_required": True,
+                "attempt_outcome_persistence": outcome_persistence,
+            }
+        )
+        raise
+    send_state.update(
+        {
+            "phase": "POST_CREATE_RETURN",
+            "create_returned": True,
+            "send_outcome_unknown": False,
+        }
+    )
+    returned_client_order_id = _broker_returned_client_order_id(order)
+    outcome_persistence = persist_attempt_outcome("ACKNOWLEDGED")
+    outcome_persisted = bool(
+        outcome_persistence.get("materially_persisted") is True
+    )
+    send_state.update(
+        {
+            "attempt_outcome_persistence": outcome_persistence,
+            "attempt_outcome_persistent": outcome_persisted,
+            "attempt_outcome_persistence_ok": outcome_persisted,
+            "reconciliation_required": not outcome_persisted,
+        }
+    )
+    return {
+        "ok": outcome_persisted,
+        "status": (
+            "CREATE_ORDER_RETURNED"
+            if outcome_persisted
+            else "CREATE_ORDER_RETURNED_OUTCOME_PERSISTENCE_ERROR"
+        ),
+        "sent": True,
+        "send_attempted": True,
+        "send_outcome_unknown": False,
+        "order": order,
+        "client_order_id": exact_client_order_id,
+        "client_order_id_reserved": True,
+        "client_order_id_unique": True,
+        "send_claimed": True,
+        "attempt_outcome_persistent": outcome_persisted,
+        "attempt_outcome_persistence_ok": outcome_persisted,
+        "reconciliation_required": not outcome_persisted,
+        "reservation_verification": verification,
+        "reservation_context": context_verification,
+        "send_claim": send_claim,
+        "attempt_outcome_persistence": outcome_persistence,
+        "returned_client_order_id": returned_client_order_id,
+        "returned_client_order_id_matches": bool(
+            returned_client_order_id == exact_client_order_id
+        ),
+    }
 
 
 BINGX_API_KEY = os.environ.get("BINGX_API_KEY") or os.environ.get("BINGX_KEY")
@@ -156,6 +864,8 @@ DISASTER_STOP_REQUIRE_FOR_LIVE = env_bool("DISASTER_STOP_REQUIRE_FOR_LIVE", True
 DISASTER_STOP_WORKING_TYPE = os.environ.get("DISASTER_STOP_WORKING_TYPE", "MARK_PRICE").strip().upper()
 DISASTER_STOP_PRICE_BUFFER_PCT = float(os.environ.get("DISASTER_STOP_PRICE_BUFFER_PCT", "0"))
 DISASTER_STOP_CLIENT_SUFFIX = os.environ.get("DISASTER_STOP_CLIENT_SUFFIX", "-DS")
+BROKER_CLIENT_ORDER_ID_MAX_LENGTH = 32
+_BROKER_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Z0-9_-]{1,32}$")
 
 # Broker Disaster Stop Hedge Mode Fix V1.1
 # BingX em Hedge Mode rejeita reduceOnly em ordens STOP/STOP_MARKET.
@@ -616,6 +1326,9 @@ def status_payload(check_ready: bool = False):
         "last_disaster_stop_payload_sanitized": _LAST_DISASTER_STOP_PAYLOAD_SANITIZED,
         "last_disaster_stop_status": (_LAST_DISASTER_STOP_RESULT or {}).get("status") if isinstance(_LAST_DISASTER_STOP_RESULT, dict) else None,
         "last_disaster_stop_created": (_LAST_DISASTER_STOP_RESULT or {}).get("created") if isinstance(_LAST_DISASTER_STOP_RESULT, dict) else None,
+        "last_disaster_stop_client_order_id_reserved": (_LAST_DISASTER_STOP_RESULT or {}).get("client_order_id_reserved") if isinstance(_LAST_DISASTER_STOP_RESULT, dict) else None,
+        "last_disaster_stop_client_order_id_unique": (_LAST_DISASTER_STOP_RESULT or {}).get("client_order_id_unique") if isinstance(_LAST_DISASTER_STOP_RESULT, dict) else None,
+        "last_disaster_stop_operationally_armed": (_LAST_DISASTER_STOP_RESULT or {}).get("stop_operationally_armed") if isinstance(_LAST_DISASTER_STOP_RESULT, dict) else None,
     }
     if check_ready:
         payload["ready"] = ready_check()
@@ -879,7 +1592,9 @@ def build_order_preview(
     market = details.get("market") or {}
     actual_exposure = details.get("effective_notional_usdt")
 
-    client_order_id = str(client_tag or f"CQ-{int(time.time())}")[:32]
+    client_order_id = validate_broker_client_order_id(
+        client_tag or f"CQ-{int(time.time())}", required=True
+    )
 
     free_balance = safe_float(free_balance_usdt)
     if free_balance is None:
@@ -1140,7 +1855,19 @@ def _build_disaster_stop_hedge_mode_fix_payload(position_side, reduce_only_reque
     }
 
 
-def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag=None, entry_price=None):
+def create_disaster_stop_order(
+    symbol,
+    side,
+    amount,
+    stop_loss_price,
+    client_tag=None,
+    entry_price=None,
+    client_order_id=None,
+    client_order_id_unique=None,
+    client_order_id_reservation_status=None,
+    client_order_id_reservation=None,
+    client_order_id_reservation_verifier=None,
+):
     """
     Cria stop de desastre na BingX após abertura real.
     A posição aberta é fechada no sentido oposto:
@@ -1154,12 +1881,89 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
         result = {"ok": True, "enabled": False, "created": False, "status": "DISASTER_STOP_DISABLED"}
         _set_last_disaster_stop_diagnostic(result=result, error=None, payload_sanitized=None)
         return result
+    if not _broker_factual_writes_enabled():
+        result = {
+            "ok": True,
+            "enabled": True,
+            "created": False,
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "confirmed": False,
+            "status": "DISASTER_STOP_DRY_RUN",
+            "client_order_id_reserved": False,
+            "client_order_id_unique": False,
+            "stop_created": False,
+            "stop_materially_valid": False,
+            "stop_operationally_armed": False,
+        }
+        _set_last_disaster_stop_diagnostic(
+            result=result, error=None, payload_sanitized=None
+        )
+        return result
 
-    sym = normalize_symbol(symbol)
-    normalized = normalize_side(side)
-    position_side = bingx_position_side(side)
+    try:
+        sym = normalize_symbol(symbol)
+        normalized = normalize_side(side)
+        position_side = bingx_position_side(side)
+        amount_value = float(amount)
+        stop_loss_value = float(stop_loss_price)
+        entry_value = (
+            float(entry_price) if entry_price not in (None, "") else None
+        )
+        if not sym or amount_value <= 0 or stop_loss_value <= 0:
+            raise ValueError("DISASTER_STOP_INVALID_INPUT")
+    except Exception as exc:
+        error_details = _managed_exception_details(exc)
+        result = {
+            "ok": False,
+            "enabled": True,
+            "created": False,
+            "sent": False,
+            "confirmed": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "status": "DISASTER_STOP_INVALID_INPUT",
+            "stop_created": False,
+            "stop_operationally_armed": False,
+            **error_details,
+        }
+        _set_last_disaster_stop_diagnostic(
+            result=result,
+            error=error_details["error"],
+            payload_sanitized=None,
+        )
+        return result
 
-    validation = validate_disaster_stop_price(side, entry_price, stop_loss_price)
+    try:
+        exact_client_order_id = validate_broker_client_order_id(
+            client_order_id, required=True
+        )
+    except Exception as exc:
+        error_details = _managed_exception_details(exc)
+        result = {
+            "ok": False,
+            "enabled": True,
+            "created": False,
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "status": (
+                str(exc)
+                if str(exc).startswith("CLIENT_ORDER_ID_")
+                else "DISASTER_STOP_CLIENT_ORDER_ID_REQUIRED"
+            ),
+            "reason": error_details["error"],
+            "error_type": error_details["error_type"],
+            "client_order_id": None,
+            "client_order_id_unique": False,
+            "client_order_id_reservation_status": client_order_id_reservation_status,
+        }
+        _set_last_disaster_stop_diagnostic(
+            result=result, error=result["reason"], payload_sanitized=None
+        )
+        return result
+    validation = validate_disaster_stop_price(side, entry_value, stop_loss_value)
     if not validation.get("ok"):
         result = {
             "ok": False,
@@ -1173,9 +1977,9 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
         _set_last_disaster_stop_diagnostic(result=result, error=validation.get("reason"), payload_sanitized=None)
         return result
 
-    stop_price = _apply_disaster_stop_buffer(side, float(stop_loss_price))
+    stop_price = _apply_disaster_stop_buffer(side, stop_loss_value)
     close_side = "sell" if normalized == "buy" else "buy"
-    client_order_id = (str(client_tag or f"CQ-{int(time.time())}")[:24] + DISASTER_STOP_CLIENT_SUFFIX)[:32]
+    client_order_id = exact_client_order_id
 
     fix_payload = _build_disaster_stop_hedge_mode_fix_payload(position_side, reduce_only_requested=True)
     reduce_only_sent = bool(fix_payload.get("reduce_only_sent"))
@@ -1195,7 +1999,7 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
         "bingx_symbol": bingx_api_symbol(sym),
         "type": "stop_market",
         "side": close_side,
-        "amount": float(amount),
+        "amount": amount_value,
         "stopPrice": float(stop_price),
         "workingType": DISASTER_STOP_WORKING_TYPE,
         "clientOrderId": client_order_id,
@@ -1205,22 +2009,135 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
         "hedge_mode_detected": bool(fix_payload.get("hedge_mode_detected")),
         "reduce_only_removed_for_hedge_mode": bool(fix_payload.get("reduce_only_removed_for_hedge_mode")),
         "disaster_stop_payload_safe": True,
+        "client_order_id_unique": True,
+        "client_order_id_reservation_status": client_order_id_reservation_status,
     }
 
-    ex = exchange()
+    send_state = {
+        "phase": "PRE_SEND_SETUP",
+        "send_attempted": False,
+        "create_returned": False,
+    }
     try:
-        order = ex.create_order(sym, "stop_market", close_side, float(amount), None, params)
+        ex = exchange()
+        create_result = _create_order_with_reserved_attempt(
+            ex,
+            sym,
+            "stop_market",
+            close_side,
+            amount_value,
+            None,
+            params,
+            client_order_id_reservation=client_order_id_reservation,
+            expected_reservation_roles={ROLE_INITIAL_DISASTER_STOP},
+            client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+            send_state=send_state,
+        )
+        if not create_result.get("ok"):
+            create_sent = create_result.get("sent")
+            create_send_attempted = bool(create_result.get("send_attempted"))
+            create_outcome_unknown = bool(
+                create_result.get("send_outcome_unknown")
+            )
+            result = {
+                "ok": False,
+                "enabled": True,
+                "created": (
+                    True if create_sent is True
+                    else None if create_outcome_unknown else False
+                ),
+                "sent": create_sent,
+                "confirmed": (
+                    None
+                    if create_sent is True or create_outcome_unknown
+                    else False
+                ),
+                "send_attempted": create_send_attempted,
+                "send_outcome_unknown": create_outcome_unknown,
+                "status": create_result.get("status")
+                or "DISASTER_STOP_CLIENT_ORDER_ID_NOT_UNIQUE",
+                "reason": "authoritative lifetime clientOrderID reservation is required",
+                "client_order_id": exact_client_order_id,
+                "client_order_id_reserved": create_result.get(
+                    "client_order_id_reserved"
+                ) is True,
+                "client_order_id_unique": create_result.get(
+                    "client_order_id_unique"
+                ) is True,
+                "client_order_id_reservation_status": client_order_id_reservation_status,
+                "attempt_outcome_persistence": create_result.get(
+                    "attempt_outcome_persistence"
+                ),
+                "attempt_outcome_persistence_ok": create_result.get(
+                    "attempt_outcome_persistence_ok"
+                ) is True,
+                "reconciliation_required": bool(
+                    create_result.get("reconciliation_required")
+                    or create_sent is True
+                    or create_outcome_unknown
+                ),
+                "reservation_verification": create_result.get(
+                    "reservation_verification"
+                ),
+            }
+            _set_last_disaster_stop_diagnostic(
+                result=result, error=result["reason"], payload_sanitized=payload_sanitized
+            )
+            return result
+        order = create_result.get("order") or {}
+        order_info = (
+            order.get("info") if isinstance(order.get("info"), dict) else {}
+        )
+        status_values = {
+            str(value).upper().strip()
+            for value in (order.get("status"), order_info.get("status"))
+            if value not in (None, "")
+        }
+        active_statuses = {
+            "OPEN",
+            "NEW",
+            "PENDING",
+            "ACTIVE",
+            "TRIGGER_PENDING",
+            "NOT_TRIGGERED",
+        }
+        status_active = bool(status_values and status_values <= active_statuses)
+        returned_id_matches = create_result.get("returned_client_order_id_matches") is True
+        material_confirmation = _broker_material_disaster_stop_confirmation(
+            order,
+            expected_symbol=sym,
+            expected_close_side=close_side,
+            expected_position_side=position_side,
+            expected_amount=amount_value,
+            expected_stop_price=float(stop_price),
+            entry_price=entry_value,
+        )
+        operationally_armed = bool(
+            create_result.get("client_order_id_unique") is True
+            and returned_id_matches
+            and status_active
+            and order.get("id")
+            and material_confirmation.get("materially_valid") is True
+        )
         result = {
-            "ok": True,
+            "ok": operationally_armed,
             "enabled": True,
             "created": True,
-            "status": "DISASTER_STOP_CREATED",
+            "sent": True,
+            "confirmed": operationally_armed,
+            "send_attempted": True,
+            "send_outcome_unknown": False,
+            "status": (
+                "DISASTER_STOP_CREATED"
+                if operationally_armed
+                else "DISASTER_STOP_CREATED_NOT_ARMED"
+            ),
             "symbol": sym,
             "side": close_side,
             "position_side": position_side,
-            "amount": float(amount),
+            "amount": amount_value,
             "stop_price": float(stop_price),
-            "original_stop_price": float(stop_loss_price),
+            "original_stop_price": stop_loss_value,
             "type": "stop_market",
             "working_type": DISASTER_STOP_WORKING_TYPE,
             "reduce_only": bool(reduce_only_sent),
@@ -1232,6 +2149,30 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
             "disaster_stop_payload_sanitized": payload_sanitized,
             "disaster_stop_hedge_mode_fix": fix_payload,
             "client_order_id": client_order_id,
+            "client_order_id_unique": True,
+            "client_order_id_reserved": True,
+            "client_order_id_reservation_status": "RESERVED_UNIQUE",
+            "reservation_verification": create_result.get("reservation_verification"),
+            "returned_client_order_id": create_result.get("returned_client_order_id"),
+            "returned_client_order_id_matches": returned_id_matches,
+            "stop_created": True,
+            "stop_status_active": status_active,
+            "stop_status_values": sorted(status_values),
+            "stop_materially_valid": material_confirmation.get(
+                "materially_valid"
+            ) is True,
+            "stop_material_confirmation": material_confirmation,
+            "stop_operationally_armed": operationally_armed,
+            "attempt_outcome_persistence": create_result.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": create_result.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                not operationally_armed
+                or create_result.get("reconciliation_required")
+            ),
             "order_id": order.get("id"),
             "raw": order,
         }
@@ -1239,18 +2180,51 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
         log_execution_audit_event({"event": "BROKER_DISASTER_STOP_CREATED", **{k: v for k, v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
-        error_text = str(exc)
+        error_details = _managed_exception_details(exc)
+        send_attempted = bool(send_state.get("send_attempted"))
+        create_returned = bool(send_state.get("create_returned"))
+        if create_returned:
+            created = True
+            sent = True
+            confirmed = None
+            send_outcome_unknown = False
+        elif send_attempted:
+            created = None
+            sent = None
+            confirmed = None
+            send_outcome_unknown = True
+        else:
+            created = False
+            sent = False
+            confirmed = False
+            send_outcome_unknown = False
         result = {
             "ok": False,
             "enabled": True,
-            "created": False,
+            "created": created,
+            "sent": sent,
+            "confirmed": confirmed,
+            "send_attempted": send_attempted,
+            "send_outcome_unknown": send_outcome_unknown,
+            "attempt_outcome_persistence": send_state.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": send_state.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                send_state.get("reconciliation_required")
+                or sent is True
+                or send_outcome_unknown
+            ),
+            "failure_phase": send_state.get("phase") or "PRE_SEND_SETUP",
             "status": "DISASTER_STOP_ERROR",
             "symbol": sym,
             "side": close_side,
             "position_side": position_side,
-            "amount": float(amount),
+            "amount": amount_value,
             "stop_price": float(stop_price),
-            "original_stop_price": float(stop_loss_price),
+            "original_stop_price": stop_loss_value,
             "type": "stop_market",
             "working_type": DISASTER_STOP_WORKING_TYPE,
             "reduce_only": bool(reduce_only_sent),
@@ -1262,9 +2236,16 @@ def create_disaster_stop_order(symbol, side, amount, stop_loss_price, client_tag
             "disaster_stop_payload_sanitized": payload_sanitized,
             "disaster_stop_hedge_mode_fix": fix_payload,
             "client_order_id": client_order_id,
-            "error": error_text,
+            "client_order_id_unique": True,
+            "client_order_id_reservation_status": client_order_id_reservation_status,
+            "reconcile_by_client_order_id": client_order_id,
+            **error_details,
         }
-        _set_last_disaster_stop_diagnostic(result=result, error=error_text, payload_sanitized=payload_sanitized)
+        _set_last_disaster_stop_diagnostic(
+            result=result,
+            error=error_details["error"],
+            payload_sanitized=payload_sanitized,
+        )
         log_execution_audit_event({"event": "BROKER_DISASTER_STOP_ERROR", **result})
         return result
 
@@ -1633,6 +2614,10 @@ def place_market_order(
     execution_auth_token=None,
     stop_loss_price=None,
     falcon_position_ownership_limit=None,
+    disaster_stop_client_order_id_factory=None,
+    entry_client_order_id_unique=None,
+    client_order_id_reservation=None,
+    client_order_id_reservation_verifier=None,
 ):
     """
     Broker V2.6.1 — Preview Isolation.
@@ -1867,6 +2852,57 @@ def place_market_order(
         return result
 
     # A partir daqui é LIVE real autorizado pelas envs, mas ainda precisa passar pelo Real Pilot Guard do broker.
+    try:
+        exact_entry_client_order_id = validate_broker_client_order_id(
+            preview.get("client_order_id") if isinstance(preview, dict) else client_tag,
+            required=True,
+        )
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "status": str(exc)
+            if str(exc).startswith("CLIENT_ORDER_ID_")
+            else "CLIENT_ORDER_ID_REQUIRED",
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "symbol": sym,
+            "side": order_side,
+            "bot": audit_bot,
+            "client_order_id": None,
+            "preview_isolation": True,
+            "live_send_enabled": live_send_enabled,
+        }
+        log_execution_audit_event({
+            "event": "BROKER_CLIENT_ORDER_ID_RESERVATION_BLOCKED", **result
+        })
+        return result
+    entry_reservation_verification = _broker_account_reservation_verification(
+        client_order_id_reservation,
+        exact_entry_client_order_id,
+        reservation_verifier=client_order_id_reservation_verifier,
+    )
+    if not entry_reservation_verification.get("ok"):
+        result = {
+            "ok": False,
+            "status": entry_reservation_verification.get("status")
+            or "CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "symbol": sym,
+            "side": order_side,
+            "bot": audit_bot,
+            "client_order_id": exact_entry_client_order_id,
+            "reservation_verification": entry_reservation_verification,
+            "preview_isolation": True,
+            "live_send_enabled": live_send_enabled,
+        }
+        log_execution_audit_event({
+            "event": "BROKER_CLIENT_ORDER_ID_RESERVATION_BLOCKED", **result
+        })
+        return result
+
     real_pilot_guard = broker_real_pilot_guard_v1_validate(
         symbol=sym,
         side=order_side,
@@ -1988,8 +3024,18 @@ def place_market_order(
     if position_side:
         params["positionSide"] = position_side
     if client_tag:
-        params["clientOrderId"] = str(client_tag)[:32]
+        params["clientOrderId"] = validate_broker_client_order_id(
+            client_tag, required=True
+        )
 
+    entry_send_state = {
+        "phase": "PRE_SEND_SETUP",
+        "send_attempted": False,
+        "create_returned": False,
+    }
+    entry_send_attempted = False
+    entry_create_returned = False
+    entry_order_id = None
     ex = exchange()
     try:
         margin_set = None
@@ -2007,19 +3053,174 @@ def place_market_order(
         except Exception as exc:
             leverage_set = {"ok": False, "error": str(exc)}
 
-        order = ex.create_order(sym, "market", order_side, amount, None, params)
+        entry_create_result = _create_order_with_reserved_attempt(
+            ex,
+            sym,
+            "market",
+            order_side,
+            amount,
+            None,
+            params,
+            client_order_id_reservation=client_order_id_reservation,
+            expected_reservation_roles={ROLE_ENTRY},
+            client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+            send_state=entry_send_state,
+        )
+        entry_sent = entry_create_result.get("sent")
+        entry_send_attempted = bool(
+            entry_create_result.get("send_attempted")
+        )
+        entry_outcome_unknown = bool(
+            entry_create_result.get("send_outcome_unknown")
+        )
+        entry_order = (
+            entry_create_result.get("order")
+            if isinstance(entry_create_result.get("order"), dict)
+            else {}
+        )
+        entry_acknowledged = bool(
+            entry_sent is True
+            and entry_send_attempted
+            and not entry_outcome_unknown
+            and entry_order.get("id")
+            and entry_create_result.get("returned_client_order_id_matches")
+            is True
+        )
+        entry_outcome_persistence_ok = (
+            entry_create_result.get("attempt_outcome_persistence_ok") is True
+        )
+        entry_ack_persistence_degraded = bool(
+            entry_acknowledged and not entry_outcome_persistence_ok
+        )
+        # A falha em persistir o ACK não desfaz o fato de que a entrada já
+        # foi enviada.  Nesse caso, continuar exclusivamente para armar o
+        # disaster stop; nunca repetir a entrada.  O resultado final permanece
+        # degradado e exige reconciliação.
+        if not entry_create_result.get("ok") and not entry_acknowledged:
+            result = {
+                "ok": False,
+                "status": entry_create_result.get("status")
+                or "CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+                "sent": entry_sent,
+                "send_attempted": bool(
+                    entry_create_result.get("send_attempted")
+                ),
+                "send_outcome_unknown": entry_outcome_unknown,
+                "attempt_outcome_persistence": entry_create_result.get(
+                    "attempt_outcome_persistence"
+                ),
+                "attempt_outcome_persistence_ok": entry_create_result.get(
+                    "attempt_outcome_persistence_ok"
+                ) is True,
+                "reconciliation_required": bool(
+                    entry_create_result.get("reconciliation_required")
+                    or entry_sent is True
+                    or entry_outcome_unknown
+                ),
+                "symbol": sym,
+                "side": order_side,
+                "bot": audit_bot,
+                "client_order_id": exact_entry_client_order_id,
+                "order_id": entry_order.get("id"),
+                "returned_client_order_id": entry_create_result.get(
+                    "returned_client_order_id"
+                ),
+                "returned_client_order_id_matches": entry_create_result.get(
+                    "returned_client_order_id_matches"
+                ) is True,
+                "entry_acknowledged": entry_acknowledged,
+                "reservation_verification": entry_create_result.get(
+                    "reservation_verification"
+                ),
+            }
+            log_execution_audit_event({
+                "event": "BROKER_CLIENT_ORDER_ID_RESERVATION_BLOCKED", **result
+            })
+            return result
+        order = entry_order
+        entry_create_returned = True
+        entry_order_id = (order or {}).get("id")
 
         disaster_stop_result = None
         if DISASTER_STOP_ENABLED:
-            disaster_stop_result = create_disaster_stop_order(
-                symbol=sym,
-                side=side,
-                amount=amount,
-                stop_loss_price=stop_loss_price,
-                client_tag=client_tag,
-                entry_price=preview.get("price_ref") if isinstance(preview, dict) else None,
-            )
-            if DISASTER_STOP_REQUIRE_FOR_LIVE and not (isinstance(disaster_stop_result, dict) and disaster_stop_result.get("ok")):
+            reservation = None
+            if callable(disaster_stop_client_order_id_factory):
+                try:
+                    reservation = disaster_stop_client_order_id_factory(
+                        entry_order_id=(order or {}).get("id"),
+                        entry_client_order_id=preview.get("client_order_id")
+                        if isinstance(preview, dict)
+                        else client_tag,
+                        symbol=sym,
+                        side=position_side or side,
+                        revision=0,
+                        attempt=0,
+                    )
+                except Exception as exc:
+                    reservation = {
+                        "ok": False,
+                        "send_allowed": False,
+                        "client_order_id_unique": False,
+                        "status": "CLIENT_ORDER_ID_RESERVATION_ERROR",
+                        "error": str(exc),
+                    }
+            elif audit_bot == "FALCON":
+                reservation = {
+                    "ok": False,
+                    "send_allowed": False,
+                    "client_order_id_unique": (
+                        (reservation or {}).get("client_order_id_unique") is True
+                    ),
+                    "status": "CLIENT_ORDER_ID_RESERVATION_FACTORY_REQUIRED",
+                }
+            else:
+                reservation = {
+                    "ok": False,
+                    "send_allowed": False,
+                    "client_order_id_unique": False,
+                    "status": "CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+                }
+
+            if not (
+                isinstance(reservation, dict)
+                and reservation.get("send_allowed") is True
+                and reservation.get("client_order_id_unique") is True
+                and reservation.get("client_order_id")
+            ):
+                disaster_stop_result = {
+                    "ok": False,
+                    "enabled": True,
+                    "created": False,
+                    "sent": False,
+                    "send_attempted": False,
+                    "send_outcome_unknown": False,
+                    "status": (reservation or {}).get("status")
+                    or "CLIENT_ORDER_ID_RESERVATION_BLOCKED",
+                    "client_order_id": (reservation or {}).get("client_order_id"),
+                    "client_order_id_unique": False,
+                    "client_order_id_reservation_status": (reservation or {}).get("status"),
+                    "collision_detected": bool(
+                        (reservation or {}).get("collision_detected")
+                    ),
+                }
+            else:
+                disaster_stop_result = create_disaster_stop_order(
+                    symbol=sym,
+                    side=side,
+                    amount=amount,
+                    stop_loss_price=stop_loss_price,
+                    client_tag=client_tag,
+                    entry_price=preview.get("price_ref") if isinstance(preview, dict) else None,
+                    client_order_id=reservation.get("client_order_id"),
+                    client_order_id_unique=True,
+                    client_order_id_reservation_status=reservation.get("status"),
+                    client_order_id_reservation=reservation,
+                    client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+                )
+            if DISASTER_STOP_REQUIRE_FOR_LIVE and not (
+                isinstance(disaster_stop_result, dict)
+                and disaster_stop_result.get("stop_operationally_armed") is True
+            ):
                 latency_ms = round((time.perf_counter() - started) * 1000, 2)
                 result = {
                     "ok": False,
@@ -2042,6 +3243,17 @@ def place_market_order(
                     "price_ref": preview.get("price_ref") if isinstance(preview, dict) else None,
                     "client_tag": client_tag,
                     "client_order_id": preview.get("client_order_id") if isinstance(preview, dict) else None,
+                    "attempt_outcome_persistence": entry_create_result.get(
+                        "attempt_outcome_persistence"
+                    ),
+                    "attempt_outcome_persistence_ok": entry_create_result.get(
+                        "attempt_outcome_persistence_ok"
+                    ) is True,
+                    "entry_acknowledged": entry_acknowledged,
+                    "entry_ack_persistence_degraded": (
+                        entry_ack_persistence_degraded
+                    ),
+                    "reconciliation_required": True,
                     "preview": preview,
                     "disaster_stop": disaster_stop_result,
                     "raw": order,
@@ -2053,9 +3265,21 @@ def place_market_order(
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         result = {
-            "ok": True,
-            "status": "SENT",
+            "ok": not entry_ack_persistence_degraded,
+            "status": (
+                "LIVE_SENT_PROTECTED_ENTRY_ACK_PERSISTENCE_ERROR"
+                if entry_ack_persistence_degraded
+                and isinstance(disaster_stop_result, dict)
+                and disaster_stop_result.get("stop_operationally_armed") is True
+                else "LIVE_SENT_ENTRY_ACK_PERSISTENCE_ERROR"
+                if entry_ack_persistence_degraded
+                else "SENT"
+            ),
             "sent": True,
+            "send_attempted": True,
+            "send_outcome_unknown": False,
+            "entry_acknowledged": entry_acknowledged,
+            "entry_ack_persistence_degraded": entry_ack_persistence_degraded,
             "ts": agora_sp_str(),
             "latency_ms": latency_ms,
             "id": order.get("id"),
@@ -2078,6 +3302,16 @@ def place_market_order(
             "reduce_only": bool(reduce_only),
             "client_tag": client_tag,
             "client_order_id": preview.get("client_order_id"),
+            "attempt_outcome_persistence": entry_create_result.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": entry_create_result.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                entry_ack_persistence_degraded
+                or entry_create_result.get("reconciliation_required")
+            ),
             "preview": preview,
             "disaster_stop": disaster_stop_result,
             "preview_isolation": True,
@@ -2090,10 +3324,35 @@ def place_market_order(
         log_execution_audit_event({"event": "BROKER_LIVE_SENT", **{k: v for k, v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
+        entry_send_attempted = bool(entry_send_state.get("send_attempted"))
+        entry_create_returned = bool(entry_send_state.get("create_returned"))
+        if entry_create_returned:
+            sent = True
+            send_outcome_unknown = False
+        elif entry_send_attempted:
+            sent = None
+            send_outcome_unknown = True
+        else:
+            sent = False
+            send_outcome_unknown = False
         result = {
             "ok": False,
             "status": "ERROR",
-            "sent": False,
+            "sent": sent,
+            "send_attempted": bool(entry_send_attempted),
+            "send_outcome_unknown": send_outcome_unknown,
+            "attempt_outcome_persistence": entry_send_state.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": entry_send_state.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                entry_send_state.get("reconciliation_required")
+                or sent is True
+                or send_outcome_unknown
+            ),
+            "order_id": entry_order_id,
             "symbol": sym,
             "bingx_symbol": bingx_api_symbol(sym),
             "side": order_side,
@@ -2141,13 +3400,30 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None):
         log_execution_audit_event({"event": "BROKER_CLOSE_DRY_RUN", **result})
         return result
 
-    ex = exchange()
     started = time.perf_counter()
+    send_state = {
+        "phase": "PRE_SEND_SETUP",
+        "send_attempted": False,
+        "create_returned": False,
+        "send_outcome_unknown": False,
+    }
     try:
+        ex = exchange()
         params = {"reduceOnly": True}
         if close_position_side:
             params["positionSide"] = close_position_side
-        order = ex.create_order(sym, "market", close_side, float(amount), None, params)
+        return {
+            "ok": False,
+            "status": "DEPRECATED_UNRESERVED_CLOSE_BLOCKED",
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "symbol": sym,
+            "side": close_side,
+            "amount": amount,
+            "client_order_id_reserved": False,
+            "client_order_id_unique": False,
+        }
         result = {
             "ok": True,
             "status": "SENT",
@@ -2362,7 +3638,17 @@ except Exception:
     _ORIGINAL_CLOSE_POSITION_MARKET_BEFORE_20260711_PATCH = None
 
 
-def close_position_market(symbol, side, amount=None, notional_usdt=None, client_tag=None, reason="MANUAL_OR_TP50", allow_hedge_without_reduce_only=True):
+def close_position_market(
+    symbol,
+    side,
+    amount=None,
+    notional_usdt=None,
+    client_tag=None,
+    reason="MANUAL_OR_TP50",
+    allow_hedge_without_reduce_only=True,
+    client_order_id_reservation=None,
+    client_order_id_reservation_verifier=None,
+):
     """
     Fechamento market seguro para parcial/TP50.
     Em Hedge Mode, remove reduceOnly por padrão porque a BingX pode rejeitar reduceOnly em algumas ordens;
@@ -2407,15 +3693,69 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None, client_
 
     ex = exchange()
     started = time.perf_counter()
+    send_state = {
+        "phase": "PRE_SEND_SETUP",
+        "send_attempted": False,
+        "create_returned": False,
+        "send_outcome_unknown": False,
+    }
     try:
         params = {}
         if reduce_only_sent:
             params["reduceOnly"] = True
         if close_position_side:
             params["positionSide"] = close_position_side
-        if client_tag:
-            params["clientOrderId"] = str(client_tag)[:32]
-        order = ex.create_order(sym, "market", close_side, amount, None, params)
+        params["clientOrderId"] = client_tag
+        create_result = _create_order_with_reserved_attempt(
+            ex,
+            sym,
+            "market",
+            close_side,
+            amount,
+            None,
+            params,
+            client_order_id_reservation=client_order_id_reservation,
+            expected_reservation_roles={
+                ROLE_TP50_CLOSE,
+                ROLE_EMERGENCY_TERMINAL_STOP_CLOSE,
+                ROLE_MANAGED_CLOSE,
+            },
+            client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+            send_state=send_state,
+        )
+        if not create_result.get("ok"):
+            create_sent = create_result.get("sent")
+            create_outcome_unknown = bool(
+                create_result.get("send_outcome_unknown")
+            )
+            return {
+                "ok": False,
+                "status": create_result.get("status")
+                or "CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+                "sent": create_sent,
+                "send_attempted": bool(create_result.get("send_attempted")),
+                "send_outcome_unknown": create_outcome_unknown,
+                "attempt_outcome_persistence": create_result.get(
+                    "attempt_outcome_persistence"
+                ),
+                "attempt_outcome_persistence_ok": create_result.get(
+                    "attempt_outcome_persistence_ok"
+                ) is True,
+                "reconciliation_required": bool(
+                    create_result.get("reconciliation_required")
+                    or create_sent is True
+                    or create_outcome_unknown
+                ),
+                "symbol": sym,
+                "side": close_side,
+                "amount": amount,
+                "client_order_id": create_result.get("client_order_id"),
+                "reservation_verification": create_result.get(
+                    "reservation_verification"
+                ),
+                "version": BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION,
+            }
+        order = create_result.get("order") or {}
         result = {
             "ok": True,
             "status": "SENT",
@@ -2432,6 +3772,28 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None, client_
             "reduce_only_removed_for_hedge_mode": bool(hedge_mode and not reduce_only_sent),
             "close_reason": reason,
             "client_tag": client_tag,
+            "client_order_id": create_result.get("client_order_id"),
+            "client_order_id_reserved": create_result.get(
+                "client_order_id_reserved"
+            ),
+            "client_order_id_unique": create_result.get(
+                "client_order_id_unique"
+            ),
+            "returned_client_order_id": create_result.get(
+                "returned_client_order_id"
+            ),
+            "returned_client_order_id_matches": create_result.get(
+                "returned_client_order_id_matches"
+            ),
+            "attempt_outcome_persistence": create_result.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": create_result.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                create_result.get("reconciliation_required")
+            ),
             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "version": BROKER_CLOSE_MARKET_HEDGE_SAFE_VERSION,
             "raw": order,
@@ -2440,10 +3802,26 @@ def close_position_market(symbol, side, amount=None, notional_usdt=None, client_
         log_execution_audit_event({"event": "BROKER_CLOSE_SENT", **{k: v for k, v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
+        send_attempted = bool(send_state.get("send_attempted"))
+        create_returned = bool(send_state.get("create_returned"))
         result = {
             "ok": False,
             "status": "ERROR",
-            "sent": False,
+            "sent": True if create_returned else (None if send_attempted else False),
+            "send_attempted": send_attempted,
+            "send_outcome_unknown": bool(send_attempted and not create_returned),
+            "attempt_outcome_persistence": send_state.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": send_state.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                send_state.get("reconciliation_required")
+                or create_returned
+                or (send_attempted and not create_returned)
+            ),
+            "reconcile_by_client_order_id": send_state.get("client_order_id"),
             "symbol": sym,
             "side": close_side,
             "position_side": close_position_side,
@@ -2549,7 +3927,9 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
     validation = validate_disaster_stop_price(side, entry_price, stop_loss_price)
     stop_price = _apply_disaster_stop_buffer(side, float(stop_loss_price)) if validation.get("ok") else stop_loss_price
     close_side = "sell" if normalized == "buy" else "buy"
-    client_order_id = (str(client_tag or f"CQ-CP-{int(time.time())}")[:24] + "-CPDS")[:32]
+    client_order_id = validate_broker_client_order_id(
+        client_tag or f"CQ-CPDS-{int(time.time())}", required=True
+    )
     payload = {
         "symbol": bingx_api_symbol(sym),
         "side": close_side.upper(),
@@ -3268,10 +4648,73 @@ def managed_position_snapshot(symbol, side, expected_amount=None):
             "expected_amount": expected,
             "ownership_safe": False,
             "status": "POSITION_SNAPSHOT_ERROR",
-            "error": str(exc),
+            **_managed_exception_details(exc),
             "read_only": True,
             "sent": False,
         }
+
+
+def _managed_sanitize_exception_text(value, limit=240):
+    """Return bounded diagnostics without credentials, signed URLs, or host paths."""
+    if value in (None, ""):
+        return "ERROR_DETAILS_UNAVAILABLE"
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    # URLs can carry credentials in either the authority or query string.  The
+    # diagnostic does not need the endpoint, so redact the complete URL.
+    text = re.sub(r"(?i)https?://[^\s,;]+", "[REDACTED_URL]", text)
+    # Do not disclose host filesystem layout through exchange/client errors.
+    text = re.sub(r"(?i)(?<![a-z0-9_])[a-z]:[\\/][^\s,;]*", "[REDACTED_PATH]", text)
+    text = re.sub(r"(?<![\w:])/(?:[^/\s]+/)*[^/\s,;]+", "[REDACTED_PATH]", text)
+    credential = r"(?:api[_-]?key|apikey|token|secret|authorization|signature|cookie)"
+    text = re.sub(
+        rf"(?i)\b{credential}\b\s*[:=]\s*(?:bearer\s+)?[^\s,;&]+",
+        "[REDACTED_CREDENTIAL]",
+        text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+[^\s,;&]+", "[REDACTED_CREDENTIAL]", text)
+    # Remove even field names left without a value; they are not operationally
+    # useful and their absence makes the public contract easy to verify.
+    text = re.sub(rf"(?i)\b{credential}\b", "[REDACTED_FIELD]", text)
+    bounded_limit = max(1, min(500, int(limit)))
+    return (text or "ERROR_DETAILS_REDACTED")[:bounded_limit]
+
+
+def _managed_exception_details(exc, limit=240):
+    return {
+        "error_type": str(type(exc).__name__ or "Exception")[:120],
+        "error": _managed_sanitize_exception_text(exc, limit=limit),
+    }
+
+
+def _managed_sanitize_snapshot_value(value, depth=0):
+    """Bound recursively normalized read-only evidence; never project raw payloads."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _managed_sanitize_exception_text(value, limit=240)
+    if depth >= 4:
+        return "[REDACTED_NESTING_LIMIT]"
+    if isinstance(value, list):
+        return [
+            _managed_sanitize_snapshot_value(item, depth=depth + 1)
+            for item in value[:20]
+        ]
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _managed_sanitize_snapshot_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:60]
+        }
+    return _managed_sanitize_exception_text(value, limit=240)
+
+
+def _managed_symbol_identity(value):
+    normalized = str(normalize_symbol(value) or "").upper().strip()
+    return (
+        normalized.replace(":USDT", "")
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+    )
 
 
 def _normalize_managed_order_payload(order, requested_symbol=None, requested_order_id=None):
@@ -3298,6 +4741,18 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
                 if selected is None:
                     selected = value
         return selected
+
+    def safe_diagnostic_text(value, limit=240):
+        if value in (None, ""):
+            return None
+        text = str(value).replace("\r", " ").replace("\n", " ").strip()
+        lowered = text.lower()
+        if any(token in lowered for token in (
+            "api_key", "apikey", "secret", "signature=", "authorization",
+            "bearer ", "token=", "cookie:", "c:\\", "c:/", "/data/", "/home/",
+        )):
+            return "REDACTED_SENSITIVE_VALUE"
+        return text[:max(1, int(limit))]
 
     type_sources = []
 
@@ -3400,8 +4855,50 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
         info.get("triggerType"),
         info.get("triggerPriceType"),
     )
+    raw_status = first_present(
+        payload.get("raw_status"),
+        payload.get("rawStatus"),
+        info.get("status"),
+        info.get("orderStatus"),
+        info.get("planStatus"),
+        info.get("executeStatus"),
+    )
+    failure_code = first_present(
+        payload.get("failure_code"), payload.get("errorCode"), payload.get("code"),
+        info.get("failureCode"), info.get("errorCode"), info.get("code"),
+    )
+    failure_reason = first_present(
+        payload.get("failure_reason"), payload.get("errorMessage"), payload.get("message"),
+        info.get("failureReason"), info.get("errorMessage"), info.get("msg"), info.get("message"),
+    )
+    executed_quantity = first_present(
+        payload.get("executed_quantity"), payload.get("executedQty"), payload.get("filled"),
+        info.get("executedQty"), info.get("filledQty"),
+    )
+    remaining_quantity = first_present(
+        payload.get("remaining_quantity"), payload.get("remaining"),
+        info.get("remainingQty"), info.get("leftQty"),
+    )
+    derived_order_id = first_present(
+        payload.get("derived_order_id"), payload.get("triggeredOrderId"),
+        info.get("derivedOrderId"), info.get("triggeredOrderId"), info.get("executeOrderId"),
+    )
+    raw_fills = first_present(payload.get("fills"), payload.get("trades"), info.get("fills"))
+    sanitized_fills = []
+    if isinstance(raw_fills, list):
+        for fill in raw_fills[:20]:
+            if not isinstance(fill, dict):
+                continue
+            fill_info = fill.get("info") if isinstance(fill.get("info"), dict) else {}
+            sanitized_fills.append({
+                "id": safe_diagnostic_text(first_present(fill.get("id"), fill.get("tradeId"), fill_info.get("tradeId")), 120),
+                "order_id": safe_diagnostic_text(first_present(fill.get("order"), fill.get("orderId"), fill_info.get("orderId")), 120),
+                "amount": _cq_patch_safe_float(first_present(fill.get("amount"), fill.get("qty"), fill_info.get("qty")), None),
+                "price": _cq_patch_safe_float(first_present(fill.get("price"), fill_info.get("price")), None),
+            })
     return {
         "status": str(first_present(payload.get("status"), info.get("status"), "UNKNOWN")).upper(),
+        "raw_status": str(raw_status).upper().strip() if raw_status not in (None, "") else None,
         "order_id": str(factual_order_id) if factual_order_id is not None else None,
         "requested_order_id": str(requested_order_id) if requested_order_id not in (None, "") else None,
         "client_order_id": first_present(
@@ -3448,6 +4945,13 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
             info.get("remainingQty"),
             info.get("leftQty"),
         ), None),
+        "executed_quantity": _cq_patch_safe_float(executed_quantity, None),
+        "remaining_quantity": _cq_patch_safe_float(remaining_quantity, None),
+        "failure_code": safe_diagnostic_text(failure_code, 120),
+        "failure_reason": safe_diagnostic_text(failure_reason),
+        "derived_order_id": safe_diagnostic_text(derived_order_id, 120),
+        "fills": sanitized_fills,
+        "fills_count": len(raw_fills) if isinstance(raw_fills, list) else 0,
         "average": _cq_patch_safe_float(first_present(
             payload.get("average"),
             payload.get("avgPrice"),
@@ -3466,6 +4970,80 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
         "raw_info_available": bool(info),
         "raw_info_exposed": False,
     }
+
+
+def managed_open_orders_snapshot(symbol):
+    """Read a bounded, exact-symbol projection of currently open broker orders."""
+    max_orders = 100
+    try:
+        sym = normalize_symbol(symbol)
+        if not sym:
+            return {
+                "ok": False,
+                "status": "OPEN_ORDERS_SYMBOL_REQUIRED",
+                "symbol": None,
+                "orders": [],
+                "count": 0,
+                "read_only": True,
+                "sent": False,
+                "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+            }
+        ex = exchange()
+        raw_orders = ex.fetch_open_orders(sym)
+        if raw_orders is None:
+            raw_orders = []
+        if not isinstance(raw_orders, list):
+            raise TypeError("fetch_open_orders returned a non-list payload")
+
+        expected_identity = _managed_symbol_identity(sym)
+        projected = []
+        mismatched_count = 0
+        for raw_order in raw_orders[:max_orders]:
+            normalized = _normalize_managed_order_payload(
+                raw_order,
+                requested_symbol=sym,
+            )
+            actual_identity = _managed_symbol_identity(normalized.get("symbol"))
+            if not actual_identity or actual_identity != expected_identity:
+                mismatched_count += 1
+                continue
+            normalized["symbol_matches_request"] = True
+            projected.append(_managed_sanitize_snapshot_value(normalized))
+
+        truncated = len(raw_orders) > max_orders
+        complete = not truncated and mismatched_count == 0
+        if truncated:
+            status = "OPEN_ORDERS_SNAPSHOT_LIMIT_EXCEEDED"
+        elif mismatched_count:
+            status = "OPEN_ORDERS_SYMBOL_SCOPE_MISMATCH"
+        else:
+            status = "OPEN_ORDERS_SNAPSHOT_OK"
+        return {
+            "ok": complete,
+            "status": status,
+            "symbol": sym,
+            "orders": projected,
+            "count": len(projected),
+            "source_count": len(raw_orders),
+            "mismatched_count": mismatched_count,
+            "truncated": truncated,
+            "read_only": True,
+            "sent": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        }
+    except Exception as exc:
+        safe_symbol = _managed_sanitize_exception_text(symbol, limit=120) if symbol else None
+        return {
+            "ok": False,
+            "status": "OPEN_ORDERS_SNAPSHOT_ERROR",
+            "symbol": safe_symbol,
+            "orders": [],
+            "count": 0,
+            **_managed_exception_details(exc),
+            "read_only": True,
+            "sent": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        }
 
 
 def managed_order_snapshot(symbol, order_id):
@@ -3495,8 +5073,69 @@ def managed_order_snapshot(symbol, order_id):
             "ok": False,
             "status": status,
             "order_id": str(order_id),
-            "error_type": exc_name,
-            "error": str(exc),
+            **_managed_exception_details(exc),
+            "read_only": True,
+            "sent": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        }
+
+
+def managed_historical_order_snapshot(symbol, order_id):
+    """Locate exact historical terminal evidence after an open/exact lookup miss."""
+    if not order_id:
+        return {
+            "ok": False,
+            "status": "ORDER_ID_MISSING",
+            "order_id": None,
+            "read_only": True,
+            "sent": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        }
+    try:
+        lookup = fetch_order_by_id(symbol, order_id=str(order_id))
+        raw_order = lookup.get("order") if isinstance(lookup, dict) and isinstance(lookup.get("order"), dict) else None
+        if not raw_order:
+            return {
+                "ok": False,
+                "status": "HISTORICAL_ORDER_NOT_FOUND",
+                "order_id": str(order_id),
+                "historical_lookup_matched_count": int((lookup or {}).get("matched_count") or 0),
+                "read_only": True,
+                "sent": False,
+                "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+            }
+        normalized = _normalize_managed_order_payload(
+            raw_order,
+            requested_symbol=normalize_symbol(symbol),
+            requested_order_id=order_id,
+        )
+        actual_id = str(normalized.get("order_id") or "").strip()
+        if actual_id != str(order_id).strip():
+            return {
+                "ok": False,
+                "status": "HISTORICAL_ORDER_IDENTITY_MISMATCH",
+                "order_id": actual_id or None,
+                "requested_order_id": str(order_id),
+                "historical_lookup_matched_count": int((lookup or {}).get("matched_count") or 0),
+                "read_only": True,
+                "sent": False,
+                "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+            }
+        return {
+            **normalized,
+            "ok": True,
+            "historical": True,
+            "historical_lookup_matched_count": int((lookup or {}).get("matched_count") or 0),
+            "read_only": True,
+            "sent": False,
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "HISTORICAL_ORDER_SNAPSHOT_ERROR",
+            "order_id": str(order_id),
+            **_managed_exception_details(exc),
             "read_only": True,
             "sent": False,
             "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
@@ -3597,6 +5236,11 @@ def _dsff_v1_list_from_response(payload, limit=1000):
 
 def _dsff_v1_call_raw(method_names, params):
     """Call only explicitly supplied private GET readers and expose no response body."""
+    send_state = {
+        "phase": "PRE_SEND_SETUP",
+        "send_attempted": False,
+        "create_returned": False,
+    }
     ex = exchange()
     rows = []
     attempts = []
@@ -4616,14 +6260,32 @@ def _rpm_amount_to_precision(ex, symbol, amount):
         return float(amount)
 
 
-def _rpm_create_stop_live(ex, symbol, side, amount, stop_price, client_tag):
+def _rpm_create_stop_live(
+    ex,
+    symbol,
+    side,
+    amount,
+    stop_price,
+    client_tag,
+    send_state=None,
+    client_order_id_reservation=None,
+    client_order_id_reservation_verifier=None,
+):
+    send_state = send_state if isinstance(send_state, dict) else {}
+    send_state.update({
+        "phase": "PRE_SEND_SETUP",
+        "send_attempted": False,
+        "create_returned": False,
+    })
     sym = normalize_symbol(symbol)
     position_side = bingx_position_side(side)
     close_side = "sell" if _rpm_norm_side(side) == "LONG" else "buy"
     params = {
         "stopPrice": float(stop_price),
         "workingType": DISASTER_STOP_WORKING_TYPE,
-        "clientOrderId": str(client_tag or f"CQ-MGMT-{int(time.time())}")[:32],
+        "clientOrderId": validate_broker_client_order_id(
+            client_tag, required=True
+        ),
     }
     hedge_mode = _disaster_stop_hedge_mode_detected()
     if not hedge_mode:
@@ -4631,7 +6293,79 @@ def _rpm_create_stop_live(ex, symbol, side, amount, stop_price, client_tag):
     if position_side:
         params["positionSide"] = position_side
     amount = _rpm_amount_to_precision(ex, sym, amount)
-    return ex.create_order(sym, "stop_market", close_side, amount, None, params)
+    return _create_order_with_reserved_attempt(
+        ex,
+        sym,
+        "stop_market",
+        close_side,
+        amount,
+        None,
+        params,
+        client_order_id_reservation=client_order_id_reservation,
+        expected_reservation_roles={
+            ROLE_REPLACEMENT_STOP,
+            ROLE_ROLLBACK_STOP,
+            ROLE_BREAK_EVEN_STOP,
+            ROLE_TRAILING_STOP,
+        },
+        client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+        send_state=send_state,
+    )
+
+
+def _rpm_stop_create_confirmation(
+    create_result,
+    *,
+    symbol,
+    side,
+    amount,
+    stop_price,
+    current_price,
+):
+    """Confirm a replacement/rollback stop from factual returned material."""
+
+    create_result = create_result if isinstance(create_result, dict) else {}
+    order = create_result.get("order") if isinstance(create_result.get("order"), dict) else {}
+    info = order.get("info") if isinstance(order.get("info"), dict) else {}
+    status_values = {
+        str(value).upper().strip()
+        for value in (order.get("status"), info.get("status"))
+        if value not in (None, "")
+    }
+    active_statuses = {
+        "OPEN", "NEW", "PENDING", "ACTIVE", "TRIGGER_PENDING", "NOT_TRIGGERED",
+    }
+    side_norm = _rpm_norm_side(side)
+    close_side = "sell" if side_norm == "LONG" else "buy"
+    material = _broker_material_disaster_stop_confirmation(
+        order,
+        expected_symbol=normalize_symbol(symbol),
+        expected_close_side=close_side,
+        expected_position_side=bingx_position_side(side),
+        expected_amount=amount,
+        expected_stop_price=stop_price,
+        entry_price=current_price,
+    )
+    armed = bool(
+        create_result.get("ok") is True
+        and create_result.get("client_order_id_unique") is True
+        and create_result.get("returned_client_order_id_matches") is True
+        and order.get("id")
+        and status_values
+        and status_values <= active_statuses
+        and material.get("materially_valid") is True
+    )
+    return {
+        "operationally_armed": armed,
+        "order_id": order.get("id"),
+        "status_values": sorted(status_values),
+        "status_active": bool(status_values and status_values <= active_statuses),
+        "returned_client_order_id": create_result.get("returned_client_order_id"),
+        "returned_client_order_id_matches": create_result.get(
+            "returned_client_order_id_matches"
+        ) is True,
+        "material_confirmation": material,
+    }
 
 
 def replace_position_stop_order(
@@ -4646,6 +6380,12 @@ def replace_position_stop_order(
     reason="BE_OR_TRAILING",
     execution_auth_token=None,
     allow_same_price=False,
+    rollback_client_tag=None,
+    client_order_id_unique=None,
+    rollback_client_order_id_unique=None,
+    client_order_id_reservation=None,
+    rollback_client_order_id_reservation=None,
+    client_order_id_reservation_verifier=None,
 ):
     """Troca o stop real da perna correta. Fail-closed com rollback do stop anterior."""
     sym = normalize_symbol(symbol)
@@ -4665,10 +6405,85 @@ def replace_position_stop_order(
         "expected_position_amount": expected,
         "reason": reason,
         "sent": False,
+        "confirmed": False,
+        "send_attempted": False,
+        "send_outcome_unknown": False,
         "would_send_order": False,
     }
     if amount <= 0 or new_stop is None or new_stop <= 0:
         return {**base, "ok": False, "status": "STOP_REPLACE_INVALID_INPUT"}
+    try:
+        new_tag = validate_broker_client_order_id(client_tag, required=True)
+        rollback_tag = validate_broker_client_order_id(
+            rollback_client_tag, required=True
+        )
+    except Exception as exc:
+        return {
+            **base,
+            "ok": False,
+            "status": (
+                str(exc)
+                if str(exc).startswith("CLIENT_ORDER_ID_")
+                else "STOP_REPLACE_CLIENT_ORDER_ID_REQUIRED"
+            ),
+            **_managed_exception_details(exc),
+        }
+    if new_tag == rollback_tag:
+        return {
+            **base,
+            "ok": False,
+            "status": "STOP_REPLACE_CLIENT_ORDER_ID_COLLISION",
+            "client_order_id": new_tag,
+            "rollback_client_order_id": rollback_tag,
+            "sent": False,
+            "confirmed": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+        }
+    primary_reservation_verification = _broker_account_reservation_verification(
+        client_order_id_reservation,
+        new_tag,
+        reservation_verifier=client_order_id_reservation_verifier,
+    )
+    if not primary_reservation_verification.get("ok"):
+        return {
+            **base,
+            "ok": False,
+            "status": primary_reservation_verification.get("status")
+            or "STOP_REPLACE_CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+            "client_order_id": new_tag,
+            "client_order_id_reserved": False,
+            "client_order_id_unique": False,
+            "reservation_verification": primary_reservation_verification,
+        }
+    rollback_reservation_verification = _broker_account_reservation_verification(
+        rollback_client_order_id_reservation,
+        rollback_tag,
+        reservation_verifier=client_order_id_reservation_verifier,
+    )
+    if not rollback_reservation_verification.get("ok"):
+        return {
+            **base,
+            "ok": False,
+            "status": rollback_reservation_verification.get("status")
+            or "STOP_REPLACE_ROLLBACK_CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+            "client_order_id": rollback_tag,
+            "client_order_id_reserved": False,
+            "client_order_id_unique": False,
+            "rollback_reservation_verification": rollback_reservation_verification,
+        }
+    base.update(
+        {
+            "client_order_id": new_tag,
+            "client_order_id_reserved": True,
+            "client_order_id_unique": True,
+            "reservation_verification": primary_reservation_verification,
+            "rollback_client_order_id": rollback_tag,
+            "rollback_client_order_id_reserved": True,
+            "rollback_client_order_id_unique": True,
+            "rollback_reservation_verification": rollback_reservation_verification,
+        }
+    )
     if old_stop is not None and not allow_same_price:
         improved = (side_norm == "LONG" and new_stop > old_stop) or (side_norm == "SHORT" and new_stop < old_stop)
         if not improved:
@@ -4686,7 +6501,12 @@ def replace_position_stop_order(
     try:
         current_price = fetch_last_price(sym)
     except Exception as exc:
-        return {**base, "ok": False, "status": "STOP_REPLACE_PRICE_ERROR", "error": str(exc)}
+        return {
+            **base,
+            "ok": False,
+            "status": "STOP_REPLACE_PRICE_ERROR",
+            **_managed_exception_details(exc),
+        }
     trigger_valid = (side_norm == "LONG" and new_stop < current_price) or (side_norm == "SHORT" and new_stop > current_price)
     if not trigger_valid:
         return {**base, "ok": False, "status": "STOP_TRIGGER_ALREADY_CROSSED", "current_price": current_price}
@@ -4700,29 +6520,67 @@ def replace_position_stop_order(
 
     ex = exchange()
     started = time.perf_counter()
-    edit_error = None
-    if old_order_id and bool((getattr(ex, "has", {}) or {}).get("editOrder")):
-        try:
-            close_side = "sell" if side_norm == "LONG" else "buy"
-            params = {"stopPrice": float(new_stop), "workingType": DISASTER_STOP_WORKING_TYPE}
-            if bingx_position_side(side_norm):
-                params["positionSide"] = bingx_position_side(side_norm)
-            if not _disaster_stop_hedge_mode_detected():
-                params["reduceOnly"] = True
-            edited = ex.edit_order(str(old_order_id), sym, "stop_market", close_side, _rpm_amount_to_precision(ex, sym, amount), None, params)
-            result = {**base, "ok": True, "status": "STOP_REPLACED_EDIT", "sent": True, "would_send_order": True, "new_order_id": (edited or {}).get("id") or str(old_order_id), "replacement_strategy": "EDIT_ORDER", "latency_ms": round((time.perf_counter()-started)*1000,2)}
-            log_execution_event({"event": "replace_position_stop_order", **result})
-            log_execution_audit_event({"event": "BROKER_STOP_REPLACED", **result})
-            return result
-        except Exception as exc:
-            edit_error = str(exc)
+    # BingX lifetime clientOrderID uniqueness makes editOrder unsuitable here:
+    # an exchange/CCXT implementation may realize an edit as a cancel/create
+    # without preserving our account-wide reservation boundary.  Every factual
+    # replacement therefore follows the explicit cancel/create path below and
+    # consumes the already-reserved replacement ID.
+    edit_error = "EDIT_ORDER_DISABLED_ACCOUNT_CLIENT_ORDER_ID_V1"
 
     cancel_result = None
     if old_order_id:
         try:
             cancel_result = ex.cancel_order(str(old_order_id), sym)
         except Exception as exc:
-            cancel_result = {"ok": False, "error": str(exc)}
+            cancel_result = {"ok": False, **_managed_exception_details(exc)}
+
+        cancel_payload = cancel_result if isinstance(cancel_result, dict) else {}
+        cancel_info = (
+            cancel_payload.get("info")
+            if isinstance(cancel_payload.get("info"), dict)
+            else {}
+        )
+        cancel_statuses = {
+            str(value).upper().strip()
+            for value in (cancel_payload.get("status"), cancel_info.get("status"))
+            if value not in (None, "")
+        }
+        cancel_ids = {
+            str(value)
+            for value in (
+                cancel_payload.get("id"),
+                cancel_payload.get("orderId"),
+                cancel_info.get("orderId"),
+                cancel_info.get("order_id"),
+            )
+            if value not in (None, "")
+        }
+        cancel_confirmed = bool(
+            cancel_statuses
+            and cancel_statuses <= {"CANCELED", "CANCELLED"}
+            and (not cancel_ids or cancel_ids == {str(old_order_id)})
+        )
+        if not cancel_confirmed:
+            result = {
+                **base,
+                "ok": False,
+                "status": "STOP_REPLACE_CANCEL_UNCONFIRMED",
+                "sent": False,
+                "confirmed": False,
+                "send_attempted": False,
+                "send_outcome_unknown": False,
+                "would_send_order": False,
+                "cancel_result": cancel_result,
+                "cancel_status_values": sorted(cancel_statuses),
+                "cancel_order_ids": sorted(cancel_ids),
+                "edit_error": edit_error,
+                "replacement_strategy": "CANCEL_REQUIRED_BEFORE_CREATE",
+                "latency_ms": round((time.perf_counter()-started)*1000,2),
+            }
+            log_execution_audit_event(
+                {"event": "BROKER_STOP_REPLACE_CANCEL_UNCONFIRMED", **result}
+            )
+            return result
 
     # Revalida a perna após o cancelamento: o stop antigo pode ter executado na corrida.
     snapshot_after_cancel = managed_position_snapshot(sym, side_norm, expected_amount=expected)
@@ -4754,18 +6612,96 @@ def replace_position_stop_order(
         log_execution_audit_event({"event": "BROKER_STOP_REPLACE_POST_CANCEL_BLOCKED", **result})
         return result
 
-    new_tag = str(client_tag or f"FALCON-STOP-{int(time.time())}")[:32]
+    create_state = {}
+    new_create_result = None
     try:
-        new_order = _rpm_create_stop_live(ex, sym, side_norm, amount, new_stop, new_tag)
+        new_create_result = _rpm_create_stop_live(
+            ex,
+            sym,
+            side_norm,
+            amount,
+            new_stop,
+            new_tag,
+            create_state,
+            client_order_id_reservation=client_order_id_reservation,
+            client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+        )
+        if not new_create_result.get("ok"):
+            raise RuntimeError(
+                new_create_result.get("status")
+                or "STOP_REPLACE_CLIENT_ORDER_ID_RESERVATION_REQUIRED"
+            )
+        new_confirmation = _rpm_stop_create_confirmation(
+            new_create_result,
+            symbol=sym,
+            side=side_norm,
+            amount=amount,
+            stop_price=new_stop,
+            current_price=current_price,
+        )
+        if not new_confirmation.get("operationally_armed"):
+            result = {
+                **base,
+                "ok": False,
+                "status": "STOP_REPLACE_CREATED_NOT_ARMED",
+                "sent": True,
+                "confirmed": False,
+                "send_attempted": True,
+                "send_outcome_unknown": False,
+                "would_send_order": True,
+                "new_order_id": new_confirmation.get("order_id"),
+                "client_tag": new_tag,
+                "client_order_id": new_tag,
+                "replacement_strategy": "CANCEL_CREATE_RECONCILIATION_REQUIRED",
+                "cancel_result": cancel_result,
+                "edit_error": edit_error,
+                "replacement_confirmation": new_confirmation,
+                "attempt_outcome_persistence": new_create_result.get(
+                    "attempt_outcome_persistence"
+                ),
+                "attempt_outcome_persistence_ok": new_create_result.get(
+                    "attempt_outcome_persistence_ok"
+                ) is True,
+                "reconciliation_required": True,
+                "rollback_attempted": False,
+                "latency_ms": round((time.perf_counter()-started)*1000,2),
+            }
+            log_execution_event(
+                {"event": "replace_position_stop_order", **result}
+            )
+            log_execution_audit_event(
+                {"event": "BROKER_STOP_REPLACE_NOT_ARMED", **result}
+            )
+            return result
         result = {
             **base,
             "ok": True,
             "status": "STOP_REPLACED_CANCEL_CREATE",
             "sent": True,
+            "confirmed": True,
+            "send_attempted": True,
+            "send_outcome_unknown": False,
             "would_send_order": True,
-            "new_order_id": (new_order or {}).get("id"),
+            "new_order_id": new_confirmation.get("order_id"),
             "client_tag": new_tag,
+            "client_order_id": new_tag,
+            "returned_client_order_id": new_create_result.get(
+                "returned_client_order_id"
+            ),
+            "returned_client_order_id_matches": new_create_result.get(
+                "returned_client_order_id_matches"
+            ),
+            "attempt_outcome_persistence": new_create_result.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": new_create_result.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                new_create_result.get("reconciliation_required")
+            ),
             "replacement_strategy": "CANCEL_CREATE",
+            "replacement_confirmation": new_confirmation,
             "cancel_result": cancel_result,
             "edit_error": edit_error,
             "rollback_attempted": False,
@@ -4775,23 +6711,178 @@ def replace_position_stop_order(
         log_execution_audit_event({"event": "BROKER_STOP_REPLACED", **result})
         return result
     except Exception as create_exc:
+        create_error_details = _managed_exception_details(create_exc)
+        if create_state.get("create_returned"):
+            result = {
+                **base,
+                "ok": False,
+                "status": "STOP_REPLACE_CREATED_CONFIRMATION_ERROR",
+                "sent": True,
+                "confirmed": None,
+                "send_attempted": True,
+                "send_outcome_unknown": False,
+                "would_send_order": True,
+                "client_tag": new_tag,
+                "client_order_id": new_tag,
+                "replacement_strategy": "CANCEL_CREATE_NO_RETRY",
+                "cancel_result": cancel_result,
+                "edit_error": edit_error,
+                "failure_phase": create_state.get("phase"),
+                "create_result": new_create_result,
+                "attempt_outcome_persistence": create_state.get(
+                    "attempt_outcome_persistence"
+                ),
+                "attempt_outcome_persistence_ok": create_state.get(
+                    "attempt_outcome_persistence_ok"
+                ) is True,
+                "reconciliation_required": True,
+                "rollback_attempted": False,
+                "rollback": None,
+                **create_error_details,
+                "latency_ms": round((time.perf_counter()-started)*1000,2),
+            }
+            log_execution_event(
+                {"event": "replace_position_stop_order", **result}
+            )
+            log_execution_audit_event(
+                {"event": "BROKER_STOP_REPLACE_CONFIRMATION_ERROR", **result}
+            )
+            return result
+        if create_state.get("send_attempted"):
+            result = {
+                **base,
+                "ok": False,
+                "status": "STOP_REPLACE_CREATE_OUTCOME_UNKNOWN",
+                "sent": None,
+                "confirmed": None,
+                "send_attempted": True,
+                "send_outcome_unknown": True,
+                "would_send_order": True,
+                "client_tag": new_tag,
+                "client_order_id": new_tag,
+                "replacement_strategy": "CANCEL_CREATE_RECONCILIATION_REQUIRED",
+                "cancel_result": cancel_result,
+                "edit_error": edit_error,
+                "failure_phase": create_state.get("phase"),
+                "create_error": create_error_details["error"],
+                "error_type": create_error_details["error_type"],
+                "create_result": new_create_result,
+                "attempt_outcome_persistence": create_state.get(
+                    "attempt_outcome_persistence"
+                ),
+                "attempt_outcome_persistence_ok": create_state.get(
+                    "attempt_outcome_persistence_ok"
+                ) is True,
+                "reconciliation_required": True,
+                "rollback_attempted": False,
+                "rollback": None,
+                "latency_ms": round((time.perf_counter()-started)*1000,2),
+            }
+            log_execution_event({"event": "replace_position_stop_order", **result})
+            log_execution_audit_event({"event": "BROKER_STOP_REPLACE_OUTCOME_UNKNOWN", **result})
+            return result
         rollback = None
         if old_stop is not None and old_stop > 0:
+            rollback_state = {}
+            rollback_create_result = None
             try:
-                rollback_tag = f"FALCON-RB-{int(time.time())}"[:32]
-                rollback_order = _rpm_create_stop_live(ex, sym, side_norm, amount, old_stop, rollback_tag)
-                rollback = {"ok": True, "order_id": (rollback_order or {}).get("id"), "stop_price": old_stop, "amount": amount}
+                rollback_create_result = _rpm_create_stop_live(
+                    ex,
+                    sym,
+                    side_norm,
+                    amount,
+                    old_stop,
+                    rollback_tag,
+                    rollback_state,
+                    client_order_id_reservation=rollback_client_order_id_reservation,
+                    client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+                )
+                if not rollback_create_result.get("ok"):
+                    raise RuntimeError(
+                        rollback_create_result.get("status")
+                        or "STOP_REPLACE_ROLLBACK_CLIENT_ORDER_ID_RESERVATION_REQUIRED"
+                    )
+                rollback_confirmation = _rpm_stop_create_confirmation(
+                    rollback_create_result,
+                    symbol=sym,
+                    side=side_norm,
+                    amount=amount,
+                    stop_price=old_stop,
+                    current_price=current_price,
+                )
+                rollback_armed = bool(
+                    rollback_confirmation.get("operationally_armed")
+                )
+                rollback = {
+                    "ok": rollback_armed,
+                    "sent": True,
+                    "confirmed": rollback_armed,
+                    "send_attempted": True,
+                    "send_outcome_unknown": False,
+                    "order_id": rollback_confirmation.get("order_id"),
+                    "client_order_id": rollback_tag,
+                    "returned_client_order_id": rollback_create_result.get(
+                        "returned_client_order_id"
+                    ),
+                    "returned_client_order_id_matches": rollback_create_result.get(
+                        "returned_client_order_id_matches"
+                    ),
+                    "attempt_outcome_persistence": rollback_create_result.get(
+                        "attempt_outcome_persistence"
+                    ),
+                    "attempt_outcome_persistence_ok": rollback_create_result.get(
+                        "attempt_outcome_persistence_ok"
+                    ) is True,
+                    "stop_price": old_stop,
+                    "amount": amount,
+                    "reconciliation_required": bool(
+                        not rollback_armed
+                        or rollback_create_result.get("reconciliation_required")
+                    ),
+                    "confirmation": rollback_confirmation,
+                }
             except Exception as rollback_exc:
-                rollback = {"ok": False, "error": str(rollback_exc), "stop_price": old_stop, "amount": amount}
+                rollback_error_details = _managed_exception_details(rollback_exc)
+                rollback_returned = bool(rollback_state.get("create_returned"))
+                rollback_unknown = bool(
+                    rollback_state.get("send_attempted")
+                    and not rollback_returned
+                )
+                rollback = {
+                    "ok": False,
+                    "sent": True if rollback_returned else (None if rollback_unknown else False),
+                    "confirmed": None if (rollback_returned or rollback_unknown) else False,
+                    "send_attempted": bool(rollback_state.get("send_attempted")),
+                    "send_outcome_unknown": rollback_unknown,
+                    "client_order_id": rollback_tag,
+                    "create_result": rollback_create_result,
+                    "attempt_outcome_persistence": rollback_state.get(
+                        "attempt_outcome_persistence"
+                    ),
+                    "attempt_outcome_persistence_ok": rollback_state.get(
+                        "attempt_outcome_persistence_ok"
+                    ) is True,
+                    "reconciliation_required": bool(
+                        rollback_returned or rollback_unknown
+                    ),
+                    **rollback_error_details,
+                    "stop_price": old_stop,
+                    "amount": amount,
+                }
         result = {
             **base,
             "ok": False,
             "status": "STOP_REPLACE_FAILED_ROLLED_BACK" if rollback and rollback.get("ok") else "STOP_REPLACE_CRITICAL_UNPROTECTED",
             "sent": False,
+            "confirmed": False,
+            "send_attempted": bool(create_state.get("send_attempted")),
+            "send_outcome_unknown": False,
             "would_send_order": True,
             "cancel_result": cancel_result,
             "edit_error": edit_error,
-            "create_error": str(create_exc),
+            "create_error": create_error_details["error"],
+            "error_type": create_error_details["error_type"],
+            "create_result": new_create_result,
             "rollback_attempted": rollback is not None,
             "rollback": rollback,
             "latency_ms": round((time.perf_counter()-started)*1000,2),
@@ -4809,23 +6900,82 @@ def managed_close_position_market(
     client_tag=None,
     reason="MANAGED_CLOSE",
     execution_auth_token=None,
+    client_order_id_unique=None,
+    client_order_id_reservation=None,
+    client_order_id_reservation_verifier=None,
 ):
     """Fecha parcial/total somente após validar a quantidade da perna correta."""
     sym = normalize_symbol(symbol)
     side_norm = _rpm_norm_side(side)
     amount = _cq_patch_safe_float(amount, 0.0) or 0.0
     expected = _cq_patch_safe_float(expected_position_amount, None)
+    client_tag_value = str(client_tag) if client_tag is not None else None
+    try:
+        client_order_id = validate_broker_client_order_id(
+            client_tag_value, required=True
+        )
+    except Exception as exc:
+        return {
+            "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+            "symbol": sym,
+            "side": side_norm,
+            "amount": amount,
+            "expected_position_amount": expected,
+            "client_tag": client_tag_value,
+            "client_order_id": None,
+            "reason": reason,
+            "ok": False,
+            "status": (
+                str(exc)
+                if str(exc).startswith("CLIENT_ORDER_ID_")
+                else "MANAGED_CLOSE_CLIENT_ORDER_ID_REQUIRED"
+            ),
+            "sent": False,
+            "confirmed": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "phase": "PRE_SEND_SETUP",
+            "would_send_order": False,
+            **_managed_exception_details(exc),
+        }
     base = {
         "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
         "symbol": sym,
         "side": side_norm,
         "amount": amount,
         "expected_position_amount": expected,
+        "client_tag": client_tag_value,
+        "client_order_id": client_order_id,
         "reason": reason,
         "sent": False,
         "confirmed": False,
+        "send_attempted": False,
+        "send_outcome_unknown": False,
+        "phase": "PRE_SEND_SETUP",
         "would_send_order": False,
     }
+    reservation_verification = _broker_account_reservation_verification(
+        client_order_id_reservation,
+        client_order_id,
+        reservation_verifier=client_order_id_reservation_verifier,
+    )
+    if not reservation_verification.get("ok"):
+        return {
+            **base,
+            "ok": False,
+            "status": reservation_verification.get("status")
+            or "MANAGED_CLOSE_CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+            "client_order_id_reserved": False,
+            "client_order_id_unique": False,
+            "reservation_verification": reservation_verification,
+        }
+    base.update(
+        {
+            "client_order_id_reserved": True,
+            "client_order_id_unique": True,
+            "reservation_verification": reservation_verification,
+        }
+    )
     if amount <= 0:
         return {**base, "ok": False, "status": "MANAGED_CLOSE_INVALID_AMOUNT"}
     snapshot_before = managed_position_snapshot(sym, side_norm, expected_amount=expected)
@@ -4837,26 +6987,115 @@ def managed_close_position_market(
         return {**base, "ok": False, "status": "MANAGED_CLOSE_AMOUNT_EXCEEDS_POSITION", "current_amount": current_amount}
 
     if not _rpm_live_write_enabled():
-        return {**base, "ok": True, "status": "MANAGED_CLOSE_DRY_RUN", "would_send_order": True, "remaining_amount": max(0.0, current_amount-amount)}
+        return {
+            **base,
+            "ok": True,
+            "status": "MANAGED_CLOSE_DRY_RUN",
+            "would_send_order": True,
+            "remaining_amount": current_amount,
+        }
 
     auth = _rpm_validate_auth(execution_auth_token, {"operation": "managed_close_position_market", "symbol": sym, "side": side_norm, "amount": amount, "reason": reason})
     if not auth.get("ok"):
         return {**base, "ok": False, "status": "MANAGED_CLOSE_AUTH_DENIED", "auth": auth}
 
-    ex = exchange()
-    close_side = "sell" if side_norm == "LONG" else "buy"
-    params = {}
-    if bingx_position_side(side_norm):
-        params["positionSide"] = bingx_position_side(side_norm)
-    if not _disaster_stop_hedge_mode_detected():
-        params["reduceOnly"] = True
-    if client_tag:
-        params["clientOrderId"] = str(client_tag)[:32]
     started = time.perf_counter()
+    phase = "PRE_SEND_SETUP"
+    send_attempted = False
+    create_returned = False
+    factual_remaining_amount = None
+    order_id = None
+    order_average = None
+    order_timestamp = None
+    order_filled_amount = None
+    send_state = {
+        "phase": "PRE_SEND_SETUP",
+        "send_attempted": False,
+        "create_returned": False,
+        "send_outcome_unknown": False,
+    }
+    create_result = None
     try:
+        ex = exchange()
+        close_side = "sell" if side_norm == "LONG" else "buy"
+        params = {}
+        position_side = bingx_position_side(side_norm)
+        if position_side:
+            params["positionSide"] = position_side
+        hedge_mode = _disaster_stop_hedge_mode_detected()
+        if not hedge_mode:
+            params["reduceOnly"] = True
+        if client_order_id:
+            params["clientOrderId"] = client_order_id
         precise_amount = _rpm_amount_to_precision(ex, sym, amount)
-        order = ex.create_order(sym, "market", close_side, precise_amount, None, params)
+        create_result = _create_order_with_reserved_attempt(
+            ex,
+            sym,
+            "market",
+            close_side,
+            precise_amount,
+            None,
+            params,
+            client_order_id_reservation=client_order_id_reservation,
+            expected_reservation_roles={
+                ROLE_TP50_CLOSE,
+                ROLE_EMERGENCY_TERMINAL_STOP_CLOSE,
+                ROLE_MANAGED_CLOSE,
+            },
+            client_order_id_reservation_verifier=client_order_id_reservation_verifier,
+            send_state=send_state,
+        )
+        if not create_result.get("ok"):
+            create_sent = create_result.get("sent")
+            create_outcome_unknown = bool(
+                create_result.get("send_outcome_unknown")
+            )
+            return {
+                **base,
+                "ok": False,
+                "status": create_result.get("status")
+                or "MANAGED_CLOSE_CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+                "sent": create_sent,
+                "confirmed": (
+                    None
+                    if create_sent is True or create_outcome_unknown
+                    else False
+                ),
+                "send_attempted": bool(create_result.get("send_attempted")),
+                "send_outcome_unknown": create_outcome_unknown,
+                "would_send_order": bool(
+                    create_result.get("send_attempted")
+                ),
+                "attempt_outcome_persistence": create_result.get(
+                    "attempt_outcome_persistence"
+                ),
+                "attempt_outcome_persistence_ok": create_result.get(
+                    "attempt_outcome_persistence_ok"
+                ) is True,
+                "reconciliation_required": bool(
+                    create_result.get("reconciliation_required")
+                    or create_sent is True
+                    or create_outcome_unknown
+                ),
+                "reservation_verification": create_result.get(
+                    "reservation_verification"
+                ),
+            }
+        order = create_result.get("order") or {}
+        send_attempted = True
+        create_returned = True
+        phase = "POST_CREATE_CONFIRMATION"
         order_id = (order or {}).get("id")
+        order_info = (order or {}).get("info") if isinstance((order or {}).get("info"), dict) else {}
+        order_average = _cq_patch_safe_float(
+            (order or {}).get("average") or (order or {}).get("avgPrice") or order_info.get("avgPrice"),
+            None,
+        )
+        order_timestamp = (
+            (order or {}).get("datetime") or (order or {}).get("timestamp")
+            or order_info.get("updateTime") or order_info.get("time")
+        )
+        order_filled_amount = _cq_patch_safe_float((order or {}).get("filled"), None)
         target_remaining = max(0.0, current_amount - precise_amount)
         snapshot_after = None
         confirmed = False
@@ -4864,7 +7103,11 @@ def managed_close_position_market(
             if BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS > 0:
                 time.sleep(BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS)
             snapshot_after = managed_position_snapshot(sym, side_norm)
-            after_amount = _cq_patch_safe_float((snapshot_after or {}).get("amount"), None)
+            after_amount = None
+            if isinstance(snapshot_after, dict) and snapshot_after.get("ok"):
+                after_amount = _cq_patch_safe_float(snapshot_after.get("amount"), None)
+                if after_amount is not None:
+                    factual_remaining_amount = after_amount
             if after_amount is not None and after_amount <= target_remaining + max(BROKER_MANAGEMENT_AMOUNT_TOLERANCE, max(current_amount,1.0)*1e-6):
                 confirmed = True
                 break
@@ -4874,10 +7117,30 @@ def managed_close_position_market(
             "status": "MANAGED_CLOSE_CONFIRMED" if confirmed else "MANAGED_CLOSE_SENT_UNCONFIRMED",
             "sent": True,
             "confirmed": confirmed,
+            "send_attempted": True,
+            "send_outcome_unknown": False,
             "would_send_order": True,
+            "phase": "POST_CREATE_CONFIRMATION",
             "order_id": order_id,
-            "filled_amount": precise_amount if confirmed else _cq_patch_safe_float((order or {}).get("filled"), None),
-            "remaining_amount": _cq_patch_safe_float((snapshot_after or {}).get("amount"), target_remaining),
+            "returned_client_order_id": create_result.get(
+                "returned_client_order_id"
+            ),
+            "returned_client_order_id_matches": create_result.get(
+                "returned_client_order_id_matches"
+            ),
+            "attempt_outcome_persistence": create_result.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": create_result.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                not confirmed or create_result.get("reconciliation_required")
+            ),
+            "average": order_average,
+            "timestamp": order_timestamp,
+            "filled_amount": precise_amount if confirmed else order_filled_amount,
+            "remaining_amount": factual_remaining_amount,
             "position_snapshot_after": snapshot_after,
             "latency_ms": round((time.perf_counter()-started)*1000,2),
         }
@@ -4885,7 +7148,52 @@ def managed_close_position_market(
         log_execution_audit_event({"event": "BROKER_MANAGED_CLOSE_SENT", **result})
         return result
     except Exception as exc:
-        result = {**base, "ok": False, "status": "MANAGED_CLOSE_ERROR", "error": str(exc), "latency_ms": round((time.perf_counter()-started)*1000,2)}
+        send_attempted = bool(send_state.get("send_attempted"))
+        create_returned = bool(send_state.get("create_returned"))
+        if not create_returned:
+            phase = send_state.get("phase") or phase
+        if send_attempted and not create_returned:
+            sent = None
+            confirmed = None
+            send_outcome_unknown = True
+        elif create_returned:
+            sent = True
+            confirmed = None
+            send_outcome_unknown = False
+        else:
+            sent = False
+            confirmed = False
+            send_outcome_unknown = False
+        result = {
+            **base,
+            "ok": False,
+            "status": "MANAGED_CLOSE_ERROR",
+            "sent": sent,
+            "confirmed": confirmed,
+            "send_attempted": send_attempted,
+            "send_outcome_unknown": send_outcome_unknown,
+            "attempt_outcome_persistence": send_state.get(
+                "attempt_outcome_persistence"
+            ),
+            "attempt_outcome_persistence_ok": send_state.get(
+                "attempt_outcome_persistence_ok"
+            ) is True,
+            "reconciliation_required": bool(
+                send_state.get("reconciliation_required")
+                or sent is True
+                or send_outcome_unknown
+            ),
+            "would_send_order": True,
+            "phase": phase,
+            "failure_phase": phase,
+            "order_id": order_id,
+            "average": order_average,
+            "timestamp": order_timestamp,
+            "filled_amount": order_filled_amount,
+            "remaining_amount": factual_remaining_amount,
+            **_managed_exception_details(exc),
+            "latency_ms": round((time.perf_counter()-started)*1000,2),
+        }
         log_execution_event({"event": "managed_close_position_market", **result})
         log_execution_audit_event({"event": "BROKER_MANAGED_CLOSE_ERROR", **result})
         return result
@@ -4907,7 +7215,12 @@ def cancel_managed_stop_order(symbol, order_id, execution_auth_token=None, reaso
         log_execution_audit_event({"event": "BROKER_STOP_CANCELLED", **{k:v for k,v in result.items() if k != "raw"}})
         return result
     except Exception as exc:
-        return {**base, "ok": False, "status": "STOP_CANCEL_ERROR", "error": str(exc)}
+        return {
+            **base,
+            "ok": False,
+            "status": "STOP_CANCEL_ERROR",
+            **_managed_exception_details(exc),
+        }
 
 # Expõe o hardening no health existente do broker sem alterar rotas.
 _ORIGINAL_STATUS_PAYLOAD_BEFORE_RPM_V1 = status_payload
@@ -4928,7 +7241,7 @@ def status_payload(check_ready: bool = False):
         "notes": [
             "Escritas LIVE exigem token efêmero.",
             "Quantidade da perna é validada antes de parcial/stop.",
-            "Troca de stop tenta editOrder e usa cancel/create com rollback como fallback.",
+            "Troca de stop usa cancel/create com clientOrderID account-wide novo e rollback reservado.",
         ],
     }
     return payload
