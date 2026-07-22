@@ -509,6 +509,10 @@ def _identity_value(trade: Dict[str, Any], field: str) -> Any:
     return None
 
 
+def _normalize_identity_setup(value: Any) -> str:
+    return "".join(str(value or "").upper().split())
+
+
 def _identity_values(trade: Dict[str, Any], field: str) -> List[str]:
     trade = trade if isinstance(trade, dict) else {}
     metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
@@ -535,7 +539,9 @@ def _identity_values(trade: Dict[str, Any], field: str) -> List[str]:
                 text = _normalize_symbol(value)
             elif field == "side":
                 text = _normalize_side(value)
-            elif field in {"bot", "setup", "registry_mode", "execution_mode", "status"}:
+            elif field == "setup":
+                text = _normalize_identity_setup(value)
+            elif field in {"bot", "registry_mode", "execution_mode", "status"}:
                 text = str(value).upper().strip()
             else:
                 text = str(value).strip()
@@ -726,7 +732,9 @@ def _identity_matches(trade: Dict[str, Any], expected_identity: Optional[Dict[st
             normalized_expected = _normalize_symbol(expected_value)
         elif field == "side":
             normalized_expected = _normalize_side(expected_value)
-        elif field in {"bot", "setup", "registry_mode", "execution_mode", "status"}:
+        elif field == "setup":
+            normalized_expected = _normalize_identity_setup(expected_value)
+        elif field in {"bot", "registry_mode", "execution_mode", "status"}:
             normalized_expected = str(expected_value).upper().strip()
         else:
             normalized_expected = str(expected_value).strip()

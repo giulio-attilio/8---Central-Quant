@@ -43,6 +43,10 @@ def _norm_bot(value):
     return str(value or "FALCON").upper().strip()
 
 
+def _norm_setup(value):
+    return "".join(str(value or "").upper().split())
+
+
 def _value(record, *keys):
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     for key in keys:
@@ -162,9 +166,9 @@ class FakeRegistry:
             "symbol": _norm_symbol(_value(trade, "symbol", "symbol_clean")),
             "side": _norm_side(_value(trade, "side", "direction")),
             "bot": _norm_bot(_value(trade, "bot")),
-            "setup": str(_value(trade, "setup", "signal_type", "setup_label") or "")
-            .upper()
-            .strip(),
+            "setup": _norm_setup(
+                _value(trade, "setup", "signal_type", "setup_label")
+            ),
             "registry_mode": str(_value(trade, "registry_mode") or "").upper().strip(),
             "execution_mode": str(_value(trade, "execution_mode") or "").upper().strip(),
             "status": str(_value(trade, "status") or "").upper().strip(),
@@ -625,6 +629,26 @@ def test_xrp_preview_resolves_exact_missing_trade_without_any_write():
     assert registry.state == before
     assert registry.close_calls == []
     assert broker.position_reads == []
+    assert broker.writer_calls == []
+
+
+def test_xrp_preview_accepts_legacy_setup_whitespace_alias_without_write():
+    ns, registry, broker, _ = _harness(
+        open_trades={TRADE_ID: _base_trade(setup="FALCON 15")}
+    )
+    before = copy.deepcopy(registry.state)
+
+    result = ns["_rtlm_v14_apply_missing_from_bots_close"](
+        _known_flat_lifecycle(), _identity(ns), close_registry=False, ack=None
+    )
+
+    close = result["missing_from_bots_close"]
+    assert result["status"] == "MISSING_FROM_BOTS_EXACT_CLOSE_READY"
+    assert close["exact_open_match_count"] == 1
+    assert close["safe_to_close"] is True
+    assert close["committed"] is False
+    assert registry.state == before
+    assert registry.close_calls == []
     assert broker.writer_calls == []
 
 
@@ -1657,6 +1681,61 @@ def test_http_get_reports_only_safe_identity_divergence_for_single_candidate():
     assert broker.writer_calls == []
 
 
+def test_http_get_preserves_original_setup_and_reports_canonical_conflict():
+    candidate = _base_trade(setup="FALCON 30")
+    ns, registry, broker, _ = _harness(
+        open_trades={TRADE_ID: candidate}
+    )
+    client = _flask_client_for_harness(ns)
+
+    response = client.get(
+        "/realtradelifecycle",
+        query_string=_route_params(setup="Falcon 15"),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["registry_close"]["open_trade_id_match_count"] == 1
+    assert payload["registry_close"]["exact_open_match_count"] == 0
+    assert payload["identity_comparison"]["setup"] == {
+        "expected": "Falcon 15",
+        "primary_value": "FALCON 30",
+        "all_current_values": ["FALCON 30"],
+        "canonical_expected": "FALCON15",
+        "canonical_primary_value": "FALCON30",
+        "all_current_canonical_values": ["FALCON30"],
+        "result": "CONFLICT",
+    }
+    assert registry.close_calls == []
+    assert registry.save_calls == 0
+    assert broker.writer_calls == []
+
+
+def test_http_post_closes_xrp_with_legacy_setup_alias_without_broker_writer():
+    ns, registry, broker, _ = _harness(
+        open_trades={TRADE_ID: _base_trade(setup="FALCON 15")}
+    )
+    client = _flask_client_for_harness(ns)
+
+    response = client.post(
+        "/realtradelifecycle/close",
+        json=_post_payload(setup="FALCON15"),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "MISSING_FROM_BOTS_REGISTRY_CLOSED"
+    assert TRADE_ID not in registry.state["open_trades"]
+    assert len(registry.close_calls) == 1
+    assert broker.position_reads == [
+        ("XRPUSDT", "LONG"),
+        ("XRPUSDT", "LONG"),
+    ]
+    assert broker.writer_calls == []
+
+
 def test_http_post_does_not_expose_get_identity_divergence_diagnostic():
     candidate = _base_trade(lifecycle_id="WRONG-LIFECYCLE")
     ns, registry, broker, _ = _harness(
@@ -2286,6 +2365,62 @@ def test_trade_registry_strong_compare_and_close_is_atomic(tmp_path, monkeypatch
     state = trade_registry.load_registry_read_only()
     assert TRADE_ID not in state["open_trades"]
     assert len(state["closed_trades"]) == 1
+
+
+def test_trade_registry_atomic_close_accepts_legacy_setup_whitespace_alias(
+    tmp_path, monkeypatch
+):
+    trade_registry = _isolated_trade_registry(
+        tmp_path, "trade_registry-legacy-setup.json"
+    )
+    trade_registry.save_registry(
+        {
+            "open_trades": {
+                TRADE_ID: _base_trade(setup="FALCON 15")
+            },
+            "closed_trades": [],
+        }
+    )
+
+    result = trade_registry.close_trade(
+        TRADE_ID,
+        reason="BROKER_POSITION_NOT_FOUND_CONFIRMED",
+        expected_identity={"setup": "FALCON15"},
+        expected_open_trade_id_count=1,
+    )
+
+    assert result["ok"] is True
+    assert result["action"] == "TRADE_CLOSED"
+    state = trade_registry.load_registry_read_only()
+    assert TRADE_ID not in state["open_trades"]
+    assert state["closed_trades"][0]["setup"] == "FALCON 15"
+
+
+def test_trade_registry_atomic_close_rejects_different_falcon_setup(
+    tmp_path, monkeypatch
+):
+    trade_registry = _isolated_trade_registry(
+        tmp_path, "trade_registry-different-setup.json"
+    )
+    trade_registry.save_registry(
+        {
+            "open_trades": {
+                TRADE_ID: _base_trade(setup="FALCON30")
+            },
+            "closed_trades": [],
+        }
+    )
+
+    result = trade_registry.close_trade(
+        TRADE_ID,
+        reason="BROKER_POSITION_NOT_FOUND_CONFIRMED",
+        expected_identity={"setup": "FALCON15"},
+        expected_open_trade_id_count=1,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "TRADE_IDENTITY_MISMATCH"
+    assert TRADE_ID in trade_registry.load_registry_read_only()["open_trades"]
 
 
 def test_trade_registry_strong_compare_rejects_conflicting_alias(tmp_path, monkeypatch):

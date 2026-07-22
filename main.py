@@ -6220,7 +6220,9 @@ def _rtlm_v14_normalize_identity_field(field, value):
     if field == "bot":
         return _rtlm_v1_norm_bot(value)
     text = _rtlm_v14_clean_identity(value)
-    if field in {"setup", "registry_mode", "execution_mode", "status"}:
+    if field == "setup":
+        return "".join(text.upper().split())
+    if field in {"registry_mode", "execution_mode", "status"}:
         return text.upper()
     return text
 
@@ -6321,7 +6323,7 @@ def _rtlm_v14_missing_close_identity(
         "symbol": _rtlm_v1_norm_symbol(symbol) if _rtlm_v14_clean_identity(symbol) else "",
         "side": _rtlm_v1_norm_side(side) if _rtlm_v14_clean_identity(side) else "",
         "bot": _rtlm_v1_norm_bot(bot) if _rtlm_v14_clean_identity(bot) else "",
-        "setup": _rtlm_v14_clean_identity(setup).upper(),
+        "setup": _rtlm_v14_normalize_identity_field("setup", setup),
         "registry_mode": _rtlm_v14_clean_identity(registry_mode).upper(),
         "execution_mode": _rtlm_v14_clean_identity(execution_mode).upper(),
     }
@@ -6527,6 +6529,24 @@ def _rtlm_v14_resolve_missing_from_bots_close(identity, lifecycle=None):
         result["_trade_id_match_values"] = {
             field: sorted(values)
             for field, values in match_values.items()
+        }
+        original_setup_values = _rtlm_v14_trade_values(
+            trade_id_match.get("trade"),
+            "setup",
+            "signal_type",
+            "setup_label",
+        )
+        result["_trade_id_match_original_setup"] = {
+            "primary_value": _rtlm_v14_clean_identity(
+                _rtlm_v14_trade_value(
+                    trade_id_match.get("trade"),
+                    "setup",
+                    "signal_type",
+                    "setup_label",
+                )
+            )
+            or None,
+            "all_current_values": original_setup_values,
         }
     if len(trade_id_matches) != 1:
         result["status"] = "MISSING_FROM_BOTS_OPEN_TRADE_ID_COUNT_INVALID"
@@ -7766,7 +7786,9 @@ def _rtlm_v15_identity_from_mapping(mapping):
     )
 
 
-def _rtlm_v16_identity_divergence_diagnostic(resolution):
+def _rtlm_v16_identity_divergence_diagnostic(
+    resolution, expected_setup_original=None
+):
     """Project one mismatched Registry candidate without exposing its payload."""
 
     resolution = resolution if isinstance(resolution, dict) else {}
@@ -7788,6 +7810,13 @@ def _rtlm_v16_identity_divergence_diagnostic(resolution):
     values_by_field = (
         resolution.get("_trade_id_match_values")
         if isinstance(resolution.get("_trade_id_match_values"), dict)
+        else {}
+    )
+    original_setup = (
+        resolution.get("_trade_id_match_original_setup")
+        if isinstance(
+            resolution.get("_trade_id_match_original_setup"), dict
+        )
         else {}
     )
     if not record:
@@ -7828,12 +7857,29 @@ def _rtlm_v16_identity_divergence_diagnostic(resolution):
             result = "MATCH"
         else:
             result = "CONFLICT"
-        comparison[field] = {
-            "expected": expected or None,
-            "primary_value": primary or None,
-            "all_current_values": current_values,
-            "result": result,
-        }
+        if field == "setup":
+            comparison[field] = {
+                "expected": (
+                    _rtlm_v14_clean_identity(expected_setup_original)
+                    or expected
+                    or None
+                ),
+                "primary_value": original_setup.get("primary_value"),
+                "all_current_values": list(
+                    original_setup.get("all_current_values") or []
+                ),
+                "canonical_expected": expected or None,
+                "canonical_primary_value": primary or None,
+                "all_current_canonical_values": current_values,
+                "result": result,
+            }
+        else:
+            comparison[field] = {
+                "expected": expected or None,
+                "primary_value": primary or None,
+                "all_current_values": current_values,
+                "result": result,
+            }
     return {
         "candidate_registry_key": record.get("registry_key") or None,
         "identity_comparison": comparison,
@@ -8006,7 +8052,8 @@ def real_trade_lifecycle_monitor_v1_route(symbol=None, side=None):
             precomputed_resolution=preview_resolution,
         )
         divergence_diagnostic = _rtlm_v16_identity_divergence_diagnostic(
-            preview_resolution
+            preview_resolution,
+            expected_setup_original=query_setup,
         )
         if isinstance(divergence_diagnostic, dict):
             result.update(divergence_diagnostic)
