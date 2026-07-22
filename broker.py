@@ -3966,7 +3966,7 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
 # - Nenhuma função chama create_order, cancel_order ou close_position_market.
 # - O resultado só é considerado completo quando existe fill de fechamento
 #   suficiente para a quantidade original e a posição não está mais aberta.
-REAL_CLOSE_RECONCILIATION_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-V1.1-INCOME-DEDUP-FILL-ENTRY"
+REAL_CLOSE_RECONCILIATION_V1_VERSION = "2026-07-22-REAL-CLOSE-RECONCILIATION-V1.1-REVIEW3-FEE-TIME-CONFLICT"
 
 
 def _rcr_v1_epoch(value, default=None):
@@ -4060,7 +4060,165 @@ def _rcr_v1_price(item):
 
 
 def _rcr_v1_amount(item):
-    return abs(safe_float(_rcr_v1_first(item, "amount", "qty", "quantity", "filled", "executedQty", "volume", "size"), 0.0) or 0.0)
+    if not isinstance(item, dict):
+        return 0.0
+    info = _rcr_v1_info(item)
+    raw_volume = info.get("volume")
+    if raw_volume not in (None, ""):
+        return abs(safe_float(raw_volume, 0.0) or 0.0)
+
+    # info.amount may be quote notional on raw BingX payloads.  It must never
+    # be interpreted as contracts.  Standardized CCXT amount remains the last
+    # fallback only when no factual quantity/volume field exists.
+    for source, keys in (
+        (item, ("qty", "quantity", "filled", "executedQty", "volume", "size")),
+        (info, ("qty", "quantity", "filled", "executedQty", "size")),
+        (item, ("amount",)),
+    ):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return abs(safe_float(value, 0.0) or 0.0)
+    return 0.0
+
+
+def _rcr_v1_reference_ids(item):
+    if not isinstance(item, dict):
+        return set()
+    info = _rcr_v1_info(item)
+    keys = (
+        "order_id",
+        "orderId",
+        "orderID",
+        "order",
+        "tradeId",
+        "trade_id",
+        "id",
+        "client_order_id",
+        "clientOrderId",
+        "clientOrderID",
+    )
+    values = set()
+    for source in (item, info):
+        for key in keys:
+            value = source.get(key)
+            text = str(value or "").strip()
+            if text:
+                values.add(text)
+    return values
+
+
+def _rcr_v11_income_symbol_matches(item, symbol):
+    """Income financeiro exige simbolo factual; simbolo ausente nunca associa fee."""
+    raw_symbol = str(
+        _rcr_v1_first(item, "symbol", default="") or ""
+    ).strip()
+    return bool(raw_symbol) and _rcr_v1_symbol_matches(item, symbol)
+
+
+def _rcr_v11_time_window(timestamps, padding_seconds=300.0):
+    values = [float(value) for value in (timestamps or []) if value is not None]
+    if not values:
+        return None
+    return (
+        min(values) - float(padding_seconds),
+        max(values) + float(padding_seconds),
+    )
+
+
+def _rcr_v11_in_time_window(timestamp, window):
+    return bool(
+        timestamp is not None
+        and window
+        and window[0] <= float(timestamp) <= window[1]
+    )
+
+
+def _rcr_v11_fee_income_role(
+    item,
+    symbol,
+    opening_reference_ids,
+    closing_reference_ids,
+    opening_window,
+    closing_window,
+):
+    """Classifica fee factual sem depender de orderId inexistente no income BingX."""
+    type_text = str(
+        _rcr_v1_first(item, "incomeType", "type", "category", default="") or ""
+    ).upper().strip()
+    raw_info = item.get("info") if isinstance(item, dict) else None
+    info_text = raw_info if isinstance(raw_info, str) else ""
+    info_key = "".join(character for character in info_text.upper() if character.isalnum())
+    is_fee = bool(
+        "FEE" in type_text
+        or "COMMISSION" in type_text
+        or "OPENINGFEE" in info_key
+        or "CLOSINGFEE" in info_key
+    )
+    result = {
+        "is_fee": is_fee,
+        "role": None,
+        "ambiguous": False,
+        "reason": None,
+        "semantic_roles": [],
+        "reference_roles": [],
+        "time_roles": [],
+    }
+    if not is_fee:
+        return result
+
+    # Texto isolado nao comprova associacao: simbolo e horario factuais sao
+    # obrigatorios antes de considerar a semantica do campo info.
+    item_ts = _rcr_v1_item_timestamp(item)
+    if not _rcr_v11_income_symbol_matches(item, symbol) or item_ts is None:
+        return result
+
+    semantic_roles = set()
+    if "OPENINGFEE" in info_key:
+        semantic_roles.add("OPENING")
+    if "CLOSINGFEE" in info_key:
+        semantic_roles.add("CLOSING")
+
+    references = _rcr_v1_reference_ids(item)
+    reference_roles = set()
+    if references & set(opening_reference_ids or set()):
+        reference_roles.add("OPENING")
+    if references & set(closing_reference_ids or set()):
+        reference_roles.add("CLOSING")
+
+    time_roles = set()
+    if _rcr_v11_in_time_window(item_ts, opening_window):
+        time_roles.add("OPENING")
+    if _rcr_v11_in_time_window(item_ts, closing_window):
+        time_roles.add("CLOSING")
+
+    result.update(
+        {
+            "semantic_roles": sorted(semantic_roles),
+            "reference_roles": sorted(reference_roles),
+            "time_roles": sorted(time_roles),
+        }
+    )
+
+    if len(semantic_roles) > 1 or len(reference_roles) > 1:
+        result.update(ambiguous=True, reason="MULTIPLE_FEE_ASSOCIATIONS")
+        return result
+    if semantic_roles and reference_roles and semantic_roles != reference_roles:
+        result.update(ambiguous=True, reason="CONFLICTING_FEE_ASSOCIATION_EVIDENCE")
+        return result
+
+    evidence_roles = semantic_roles or reference_roles
+    candidates = evidence_roles & time_roles if evidence_roles else time_roles
+    if evidence_roles and time_roles and not candidates:
+        result.update(
+            ambiguous=True,
+            reason="CONFLICTING_FEE_ASSOCIATION_EVIDENCE",
+        )
+    elif len(candidates) > 1:
+        result.update(ambiguous=True, reason="MULTIPLE_FEE_ASSOCIATIONS")
+    elif len(candidates) == 1:
+        result["role"] = next(iter(candidates))
+    return result
 
 
 def _rcr_v1_fee(item):
@@ -4400,9 +4558,9 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
     weighted_cost = sum((_rcr_v1_price(item) or 0.0) * _rcr_v1_amount(item) for item in selected_closing)
     exit_price = weighted_cost / selected_qty if selected_qty > 0 else None
 
-    opening_fee = sum(_rcr_v1_fee(item) for item in opening_fills)
-    closing_fee = sum(_rcr_v1_fee(item) for item in selected_closing)
-    fee_total = opening_fee + closing_fee
+    opening_fill_fee = sum(_rcr_v1_fee(item) for item in opening_fills)
+    closing_fill_fee = sum(_rcr_v1_fee(item) for item in selected_closing)
+    order_opening_fee = _rcr_v1_fee(order)
     realized_values = [_rcr_v1_realized(item) for item in selected_closing]
     realized_values = [value for value in realized_values if value is not None]
     realized_gross = sum(realized_values) if realized_values else None
@@ -4413,6 +4571,27 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
     funding = 0.0
     ledger_realized = 0.0
     ledger_realized_found = False
+    ledger_opening_fee = 0.0
+    ledger_closing_fee = 0.0
+    ledger_opening_fee_found = False
+    ledger_closing_fee_found = False
+    fee_income_tran_ids = []
+    close_order_ids = sorted({value for value in (_rcr_v1_order_id(item) for item in selected_closing) if value})
+    opening_reference_ids = {str(value) for value in (oid, cid) if value}
+    closing_reference_ids = set(close_order_ids)
+    for item in opening_fills:
+        opening_reference_ids.update(_rcr_v1_reference_ids(item))
+    opening_reference_ids.update(_rcr_v1_reference_ids(order))
+    for item in selected_closing:
+        closing_reference_ids.update(_rcr_v1_reference_ids(item))
+    opening_window = _rcr_v11_time_window(
+        [order_ts]
+        + [_rcr_v1_item_timestamp(item) for item in opening_fills]
+    )
+    closing_window = _rcr_v11_time_window(
+        [_rcr_v1_item_timestamp(item) for item in selected_closing]
+    )
+    fee_association_ambiguities = []
     for item in income_payload.get("items") or []:
         item_ts = _rcr_v1_item_timestamp(item)
         if order_ts and item_ts and item_ts < order_ts:
@@ -4423,12 +4602,66 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
             continue
         if "FUND" in type_text:
             funding += amount
+        elif "FEE" in type_text or "COMMISSION" in type_text:
+            fee_value = abs(amount)
+            tran_id = str(
+                _rcr_v1_first(
+                    item,
+                    "tranId",
+                    "transactionId",
+                    "transaction_id",
+                    default="",
+                )
+                or ""
+            ).strip()
+            association = _rcr_v11_fee_income_role(
+                item,
+                sym,
+                opening_reference_ids,
+                closing_reference_ids,
+                opening_window,
+                closing_window,
+            )
+            if association.get("ambiguous"):
+                fee_association_ambiguities.append(
+                    {
+                        "tran_id": tran_id or None,
+                        "trade_id": str(
+                            _rcr_v1_first(item, "tradeId", "trade_id", default="")
+                            or ""
+                        ).strip()
+                        or None,
+                        "reason": association.get("reason"),
+                        "semantic_roles": association.get("semantic_roles") or [],
+                        "reference_roles": association.get("reference_roles") or [],
+                        "time_roles": association.get("time_roles") or [],
+                    }
+                )
+                continue
+            if association.get("role") == "OPENING":
+                ledger_opening_fee += fee_value
+                ledger_opening_fee_found = True
+                if tran_id:
+                    fee_income_tran_ids.append(tran_id)
+            elif association.get("role") == "CLOSING":
+                ledger_closing_fee += fee_value
+                ledger_closing_fee_found = True
+                if tran_id:
+                    fee_income_tran_ids.append(tran_id)
         elif any(token in type_text for token in ("REALIZED", "PNL", "CLOSE")):
             ledger_realized += amount
             ledger_realized_found = True
 
     if ledger_realized_found:
         realized_gross = ledger_realized
+
+    opening_fee = (
+        ledger_opening_fee
+        if ledger_opening_fee_found
+        else (opening_fill_fee if opening_fill_fee > 0 else order_opening_fee)
+    )
+    closing_fee = ledger_closing_fee if ledger_closing_fee_found else closing_fill_fee
+    fee_total = opening_fee + closing_fee
 
     positions = []
     position_error = None
@@ -4445,12 +4678,22 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         if contracts > 0 and (not pside or pside == position_side):
             relevant_open.append(pos)
 
-    qty_complete = bool(expected_qty and selected_qty >= expected_qty * 0.999)
+    qty_tolerance = max(abs(expected_qty) * 0.001, 1e-12) if expected_qty else 0.0
+    qty_exceeds_expected = bool(
+        expected_qty and selected_qty > expected_qty + qty_tolerance
+    )
+    qty_complete = bool(
+        expected_qty
+        and abs(selected_qty - expected_qty) <= qty_tolerance
+        and not qty_exceeds_expected
+    )
     position_closed = len(relevant_open) == 0
-    financial_dedup_ok = bool(income_payload.get("dedup_ok", True))
+    fee_association_ok = not fee_association_ambiguities
+    financial_dedup_ok = bool(
+        income_payload.get("dedup_ok", True) and fee_association_ok
+    )
     complete = bool(entry is not None and exit_price is not None and selected_qty > 0 and qty_complete and position_closed and financial_dedup_ok)
     net_pnl = (realized_gross or 0.0) - fee_total + funding if realized_gross is not None else None
-    close_order_ids = sorted({value for value in (_rcr_v1_order_id(item) for item in selected_closing) if value})
     closed_at_epoch = max([_rcr_v1_item_timestamp(item) or 0.0 for item in selected_closing], default=0.0) or None
     closed_at = datetime.fromtimestamp(closed_at_epoch, TIMEZONE_BR).strftime("%d/%m/%Y %H:%M:%S") if closed_at_epoch else None
 
@@ -4461,19 +4704,36 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         issues.append("ENTRY_PRICE_MISSING")
     if not selected_closing:
         issues.append("CLOSING_FILL_NOT_FOUND")
-    if expected_qty and not qty_complete:
+    if qty_exceeds_expected:
+        issues.append("CLOSING_QTY_EXCEEDS_EXPECTED")
+    elif expected_qty and not qty_complete:
         issues.append("CLOSING_QTY_INCOMPLETE")
     if not position_closed:
         issues.append("POSITION_STILL_OPEN")
     if realized_gross is None:
         issues.append("REALIZED_PNL_MISSING")
     if not financial_dedup_ok:
-        issues.append("AMBIGUOUS_INCOME_DUPLICATES")
+        if income_payload.get("dedup_ok", True):
+            issues.append("AMBIGUOUS_FEE_ASSOCIATION")
+        else:
+            issues.append("AMBIGUOUS_INCOME_DUPLICATES")
 
     return {
         "ok": True,
         "complete": complete,
-        "status": "BROKER_CLOSE_RECONCILED" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE",
+        "status": (
+            "BROKER_CLOSE_RECONCILED"
+            if complete
+            else (
+                "CLOSING_QTY_EXCEEDS_EXPECTED"
+                if qty_exceeds_expected
+                else (
+                    "FEE_ASSOCIATION_INCONCLUSIVE"
+                    if not fee_association_ok
+                    else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
+                )
+            )
+        ),
         "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
         "generated_at": agora_sp_str(),
         "read_only": True,
@@ -4492,6 +4752,8 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "exit_price": exit_price,
         "expected_qty": expected_qty,
         "closed_qty": selected_qty,
+        "qty_tolerance": qty_tolerance,
+        "qty_exceeds_expected": qty_exceeds_expected,
         "qty_complete": qty_complete,
         "position_closed": position_closed,
         "closed_at": closed_at,
@@ -4500,6 +4762,19 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "opening_fee": opening_fee,
         "closing_fee": closing_fee,
         "fee_total": fee_total,
+        "opening_fee_source": (
+            "INCOME_LEDGER_DEDUPED"
+            if ledger_opening_fee_found
+            else ("OPENING_FILLS" if opening_fill_fee > 0 else "ORDER")
+        ),
+        "closing_fee_source": (
+            "INCOME_LEDGER_DEDUPED"
+            if ledger_closing_fee_found
+            else "CLOSING_FILLS"
+        ),
+        "fee_income_tran_ids": sorted(set(fee_income_tran_ids)),
+        "fee_association_ok": fee_association_ok,
+        "fee_association_ambiguities": fee_association_ambiguities,
         "funding": funding,
         "net_pnl": net_pnl,
         "financial_dedup_ok": financial_dedup_ok,

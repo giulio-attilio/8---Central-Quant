@@ -50175,7 +50175,7 @@ def falcon_disaster_stop_close_position_preview_route():
 # - Todas as consultas à BingX são read-only.
 # - Nenhuma rota deste bloco abre, fecha, cancela ou altera ordens.
 # - Commit só ocorre com evidência broker completa; pela rota manual exige ACK.
-REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-11-REAL-CLOSE-RECONCILIATION-MAIN-V1.1-INCOME-DEDUP-FILL-ENTRY"
+REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-22-REAL-CLOSE-RECONCILIATION-V1.1-REVIEW3-FEE-TIME-CONFLICT"
 REAL_CLOSE_RECONCILIATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_latest.json"
 REAL_CLOSE_RECONCILIATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_events.jsonl"
 
@@ -50404,6 +50404,62 @@ def _rcrm_v1_metrics(side, entry, stop, exit_price, qty, net_pnl):
     }
 
 
+def _rcrm_v11_manual_outcome_conflict(trade, broker_exit_price):
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = _rcrm_v1_meta(trade)
+    nested_outcome = (
+        trade.get("outcome") if isinstance(trade.get("outcome"), dict) else {}
+    )
+
+    def first_key(key):
+        for source in (trade, metadata, nested_outcome):
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    # Campos especificos de outcome sempre vencem status/source genericos,
+    # independentemente da camada em que foram persistidos.
+    outcome_status = str(
+        first_key("outcome_status") or first_key("status") or ""
+    ).upper().strip()
+    outcome_source = str(
+        first_key("outcome_source") or first_key("source") or ""
+    ).upper().strip()
+    outcome_id = str(first_key("outcome_id") or "").strip() or None
+    data_quality = str(first_key("data_quality") or "").upper().strip()
+    existing_exit = _rcrm_v1_float(
+        first_key("exit_price") or first_key("close_price")
+    )
+    broker_exit = _rcrm_v1_float(broker_exit_price)
+    manual_outcome_present = bool(
+        outcome_source == "MANUAL_CLOSE_RECONCILIATION"
+        or data_quality == "MANUAL_CONFIRMED"
+        or (outcome_status == "OUTCOME_RECORDED" and outcome_id)
+    )
+    tolerance = max(abs(broker_exit or 0.0) * 1e-9, 1e-12)
+    exit_conflict = bool(
+        manual_outcome_present
+        and existing_exit is not None
+        and broker_exit is not None
+        and abs(existing_exit - broker_exit) > tolerance
+    )
+    return {
+        "manual_outcome_present": manual_outcome_present,
+        "conflict": exit_conflict,
+        "reason": "MANUAL_OUTCOME_EXIT_PRICE_CONFLICT" if exit_conflict else None,
+        "existing": {
+            "outcome_id": outcome_id,
+            "outcome_status": outcome_status or None,
+            "outcome_source": outcome_source or None,
+            "data_quality": data_quality or None,
+            "exit_price": existing_exit,
+        },
+        "broker": {"exit_price": broker_exit},
+        "exit_price_tolerance": tolerance,
+    }
+
+
 def real_close_reconciliation_v1_run(payload=None, commit=False, source="route"):
     payload = payload if isinstance(payload, dict) else {}
     base = {
@@ -50442,13 +50498,15 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
     net_pnl = _rcrm_v1_float(broker_result.get("net_pnl"))
     metrics = _rcrm_v1_metrics(side, entry, values.get("stop"), exit_price, qty, net_pnl)
     financial_dedup_ok = bool(broker_result.get("financial_dedup_ok", True))
-    complete = bool(
+    broker_complete = bool(
         broker_result.get("complete")
         and financial_dedup_ok
         and values.get("order_id")
         and exit_price is not None
         and net_pnl is not None
     )
+    outcome_conflict = _rcrm_v11_manual_outcome_conflict(trade, exit_price)
+    complete = bool(broker_complete and not outcome_conflict.get("conflict"))
     committed = False
     registry_update = None
     outcome = None
@@ -50468,6 +50526,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "broker_order_entry_price": broker_result.get("order_entry_price"),
             "broker_close_order_ids": broker_result.get("close_order_ids") or [],
             "broker_realized_pnl_gross": broker_result.get("realized_pnl_gross"),
+            "broker_opening_fee": broker_result.get("opening_fee"),
+            "broker_closing_fee": broker_result.get("closing_fee"),
             "broker_fee_total": broker_result.get("fee_total"),
             "broker_funding": broker_result.get("funding"),
             "broker_net_pnl": net_pnl,
@@ -50520,13 +50580,22 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             )
             committed = bool((outcome.get("commit") or {}).get("committed")) if isinstance(outcome, dict) else False
 
-    status = "BROKER_CLOSE_RECONCILED_AND_SAVED" if committed else (
-        "BROKER_CLOSE_RECONCILED_PREVIEW" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
-    )
+    if outcome_conflict.get("conflict"):
+        status = "REAL_CLOSE_OUTCOME_CONFLICT"
+    elif broker_result.get("status") in {
+        "CLOSING_QTY_EXCEEDS_EXPECTED",
+        "FEE_ASSOCIATION_INCONCLUSIVE",
+    }:
+        status = broker_result.get("status")
+    else:
+        status = "BROKER_CLOSE_RECONCILED_AND_SAVED" if committed else (
+            "BROKER_CLOSE_RECONCILED_PREVIEW" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
+        )
     result = dict(base)
     result.update({
         "status": status,
         "complete": complete,
+        "broker_complete": broker_complete,
         "committed": committed,
         "trade": {
             "trade_id": trade.get("trade_id"),
@@ -50545,6 +50614,19 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         },
         "metrics": metrics,
         "broker_reconciliation": broker_result,
+        "outcome_conflict": outcome_conflict,
+        "commit_blocked_reason": (
+            outcome_conflict.get("reason")
+            if outcome_conflict.get("conflict")
+            else (
+                broker_result.get("status")
+                if broker_result.get("status") in {
+                    "CLOSING_QTY_EXCEEDS_EXPECTED",
+                    "FEE_ASSOCIATION_INCONCLUSIVE",
+                }
+                else None
+            )
+        ),
         "registry_update": registry_update,
         "outcome": outcome,
         "notes": [
@@ -50552,6 +50634,9 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "Commit só é permitido com ordem real identificada, fills de fechamento completos e posição encerrada.",
             "PnL líquido preserva PnL realizado, taxas e funding em campos separados.",
             "V1.1 deduplica lançamentos pelo tranId e prioriza o fill real da BingX como entrada.",
+            "V1.1 usa info.volume como quantidade factual raw e bloqueia excesso sobre a quantidade esperada.",
+            "Fees sem orderId usam simbolo, horario, semantica opening/closing e tradeId quando disponivel; associacao multipla bloqueia o commit.",
+            "Outcome manual conflitante nunca é sobrescrito nem duplicado.",
             "Commit é bloqueado se houver colisão financeira ambígua após a deduplicação.",
         ],
     })
