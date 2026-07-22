@@ -866,6 +866,16 @@ def _memory_cleanup(reason="request", force=False):
         return {"ok": False, "reason": reason, "error": str(exc)}
 
 
+def _rtlm_private_no_store_headers():
+    return {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Content-Type-Options": "nosniff",
+        "Vary": "X-Execution-Auth-Token",
+    }
+
+
 @app.after_request
 def memory_stabilizer_after_request(response):
     """
@@ -873,9 +883,16 @@ def memory_stabilizer_after_request(response):
     Não altera o body da resposta, apenas reduz chance de RSS ficar preso no Render.
     """
     try:
+        path = str(getattr(request, "path", "") or "")
+        if (
+            path.startswith("/realtradelifecycle")
+            or path.startswith("/lifecyclemonitor")
+            or path == "/trade/lifecycle"
+        ):
+            for key, value in _rtlm_private_no_store_headers().items():
+                response.headers[key] = value
         if not MEMORY_STABILIZER_ENABLED or not MEMORY_STABILIZER_FORCE_GC_AFTER_REQUEST:
             return response
-        path = str(getattr(request, "path", "") or "")
         is_heavy = path in MEMORY_STABILIZER_HEAVY_PATHS or any(path.startswith(prefix + "/") for prefix in MEMORY_STABILIZER_HEAVY_PATHS)
         current = current_rss_mb() or 0
         if is_heavy or current >= MEMORY_GC_THRESHOLD_MB:
@@ -4521,41 +4538,174 @@ def _pesc_v1_slim_position(pos):
     }
 
 
-def _pesc_v1_fetch_positions(symbol=None, side=None):
+def _pesc_v1_fetch_positions(symbol=None, side=None, strict_raw_exchange=False):
     symbol_norm = _pesc_v1_norm_symbol(symbol)
     side_norm = _pesc_v1_norm_side(side)
     attempts = []
     raw = None
     err = None
-    for fn_name in ("get_positions", "fetch_positions", "open_positions", "get_open_positions"):
-        raw, err = _pesc_v1_broker_call(fn_name)
-        attempts.append({"function": fn_name, "ok": err is None, "error": err})
-        if err is None:
-            break
-    if raw is None and central_broker is not None:
+
+    # The administrative MISSING_FROM_BOTS close must distinguish a factual
+    # empty exchange response from an unknown/falsy response.  The legacy
+    # broker.get_positions() API intentionally normalizes ``None`` to ``[]``;
+    # that is convenient for diagnostics but is not strong enough evidence to
+    # authorize a Registry close.  The strict path therefore reads the raw
+    # CCXT response and preserves its exact shape.
+    if strict_raw_exchange:
         try:
-            exchange = getattr(central_broker, "exchange", None) or getattr(central_broker, "client", None)
-            fetch_positions = getattr(exchange, "fetch_positions", None) if exchange is not None else None
-            if callable(fetch_positions):
-                raw = fetch_positions([_pesc_v1_market_symbol(symbol)] if symbol else None)
-                err = None
-                attempts.append({"function": "exchange.fetch_positions", "ok": True, "error": None})
+            if central_broker is None:
+                raise RuntimeError(f"broker import error: {BROKER_IMPORT_ERROR}")
+            exchange_factory = getattr(central_broker, "exchange", None)
+            if not callable(exchange_factory):
+                raise RuntimeError("broker sem exchange factory")
+            exchange = exchange_factory()
+            fetch_positions = getattr(exchange, "fetch_positions", None)
+            if not callable(fetch_positions):
+                raise RuntimeError("exchange sem função fetch_positions")
+            markets = [_pesc_v1_market_symbol(symbol)] if symbol else None
+            try:
+                raw = fetch_positions(markets)
+            except TypeError:
+                raw = fetch_positions()
+            err = None
+            attempts.append(
+                {
+                    "function": "exchange.fetch_positions.raw",
+                    "ok": True,
+                    "error": None,
+                }
+            )
         except Exception as exc:
             err = str(exc)
-            attempts.append({"function": "exchange.fetch_positions", "ok": False, "error": err})
+            attempts.append(
+                {
+                    "function": "exchange.fetch_positions.raw",
+                    "ok": False,
+                    "error": err,
+                }
+            )
+    else:
+        for fn_name in ("get_positions", "fetch_positions", "open_positions", "get_open_positions"):
+            raw, err = _pesc_v1_broker_call(fn_name)
+            attempts.append({"function": fn_name, "ok": err is None, "error": err})
+            if err is None:
+                break
+        if raw is None and central_broker is not None:
+            try:
+                exchange = getattr(central_broker, "exchange", None) or getattr(central_broker, "client", None)
+                fetch_positions = getattr(exchange, "fetch_positions", None) if exchange is not None else None
+                if callable(fetch_positions):
+                    raw = fetch_positions([_pesc_v1_market_symbol(symbol)] if symbol else None)
+                    err = None
+                    attempts.append({"function": "exchange.fetch_positions", "ok": True, "error": None})
+            except Exception as exc:
+                err = str(exc)
+                attempts.append({"function": "exchange.fetch_positions", "ok": False, "error": err})
+    response_received = raw is not None
+    response_shape_valid = (
+        isinstance(raw, list)
+        if strict_raw_exchange
+        else isinstance(raw, (list, tuple))
+    )
+    if response_received and not response_shape_valid and err is None:
+        err = f"invalid positions response shape: {type(raw).__name__}"
     positions = []
-    for p in raw or []:
+    invalid_position_row_count = 0
+    invalid_position_quantity_count = 0
+    ambiguous_matching_symbol_count = 0
+    ignored_zero_position_count = 0
+    for p in (raw if response_shape_valid else []):
         if not isinstance(p, dict):
+            invalid_position_row_count += 1
             continue
         slim = _pesc_v1_slim_position(p)
-        if slim.get("contracts", 0) <= 0 and slim.get("notional", 0) <= 0:
+        row_symbol = slim.get("symbol")
+        row_side = slim.get("side")
+        if strict_raw_exchange:
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
+            raw_quantity_values = (
+                p.get("contracts"),
+                p.get("amount"),
+                p.get("positionAmt"),
+                info.get("positionAmt"),
+                info.get("availableAmt"),
+                p.get("notional"),
+                p.get("positionValue"),
+                p.get("initialMargin"),
+                info.get("positionValue"),
+                info.get("initialMargin"),
+            )
+            present_quantity_values = [
+                value
+                for value in raw_quantity_values
+                if value is not None and str(value).strip() != ""
+            ]
+            parsed_quantity_values = [
+                _pesc_v1_float(value, None) for value in present_quantity_values
+            ]
+            quantity_evidence_valid = bool(
+                present_quantity_values
+                and all(
+                    not isinstance(raw_value, bool)
+                    and parsed_value is not None
+                    and parsed_value == parsed_value
+                    and abs(parsed_value) != float("inf")
+                    for raw_value, parsed_value in zip(
+                        present_quantity_values, parsed_quantity_values
+                    )
+                )
+            )
+            if not quantity_evidence_valid:
+                invalid_position_row_count += 1
+                invalid_position_quantity_count += 1
+                continue
+            positive_position = any(
+                abs(float(value)) > 0 for value in parsed_quantity_values
+            )
+        else:
+            positive_position = bool(
+                slim.get("contracts", 0) > 0 or slim.get("notional", 0) > 0
+            )
+        if not row_symbol or row_side not in {"LONG", "SHORT"}:
+            invalid_position_row_count += 1
+            if positive_position and symbol_norm and row_symbol == symbol_norm:
+                ambiguous_matching_symbol_count += 1
+            continue
+        if not positive_position:
+            ignored_zero_position_count += 1
             continue
         if symbol_norm and slim.get("symbol") != symbol_norm:
             continue
         if side_norm and slim.get("side") != side_norm:
             continue
         positions.append(slim)
-    return {"ok": err is None or bool(positions), "error": err, "attempts": attempts, "positions": positions, "count": len(positions)}
+    position_rows_valid = bool(
+        response_shape_valid
+        and invalid_position_row_count == 0
+        and ambiguous_matching_symbol_count == 0
+    )
+    return {
+        "ok": bool(err is None and response_shape_valid and position_rows_valid),
+        "error": err,
+        "attempts": attempts,
+        "positions": positions,
+        "count": len(positions),
+        "response_received": response_received,
+        "response_shape_valid": response_shape_valid,
+        "position_rows_valid": position_rows_valid,
+        "raw_position_row_count": len(raw) if response_shape_valid else None,
+        "invalid_position_row_count": invalid_position_row_count,
+        "invalid_position_quantity_count": invalid_position_quantity_count,
+        "ambiguous_matching_symbol_count": ambiguous_matching_symbol_count,
+        "ignored_zero_position_count": ignored_zero_position_count,
+        "position_absence_confirmed": bool(
+            response_received
+            and response_shape_valid
+            and position_rows_valid
+            and err is None
+            and len(positions) == 0
+        ),
+    }
 
 
 def _pesc_v1_order_symbol(order):
@@ -4811,6 +4961,13 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
                 "ok": positions_payload.get("ok"),
                 "error": positions_payload.get("error"),
                 "attempts": positions_payload.get("attempts"),
+                "response_received": positions_payload.get("response_received"),
+                "response_shape_valid": positions_payload.get("response_shape_valid"),
+                "position_rows_valid": positions_payload.get("position_rows_valid"),
+                "invalid_position_row_count": positions_payload.get("invalid_position_row_count"),
+                "ambiguous_matching_symbol_count": positions_payload.get("ambiguous_matching_symbol_count"),
+                "position_absence_confirmed": positions_payload.get("position_absence_confirmed"),
+                "count": positions_payload.get("count"),
             },
             "orders_fetch": {
                 "ok": orders_payload.get("ok"),
@@ -5072,7 +5229,9 @@ def _pesc_v11_fetch_open_orders(symbol=None, side=None):
     }
 
 
-def _pesc_v11_trade_registry_matches(symbol=None, side=None, bot=None, setup=None):
+def _pesc_v11_trade_registry_matches(
+    symbol=None, side=None, bot=None, setup=None, strict_read_only=False
+):
     """Leitura mais robusta do Trade Registry, sem depender apenas de get_open_positions_central."""
     matches = []
     diagnostics = {"sources": []}
@@ -5094,23 +5253,72 @@ def _pesc_v11_trade_registry_matches(symbol=None, side=None, bot=None, setup=Non
         return [t for t in values if isinstance(t, dict)]
 
     trade_sources = []
-    try:
-        trades = get_open_positions_central() if callable(globals().get("get_open_positions_central")) else []
-        trade_sources.append(("get_open_positions_central", trades or []))
-    except Exception as exc:
-        diagnostics["get_open_positions_central_error"] = str(exc)
-    try:
-        if central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)):
-            registry = central_trade_registry.load_registry()
-            trade_sources.append(("central_trade_registry.load_registry", iter_trades_from_registry_obj(registry)))
-            diagnostics["trade_registry_file"] = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", ""))
-    except Exception as exc:
-        diagnostics["load_registry_error"] = str(exc)
-    try:
-        snap = central_trade_registry_snapshot(include_trades=True) if callable(globals().get("central_trade_registry_snapshot")) else {}
-        trade_sources.append(("central_trade_registry_snapshot", snap.get("open_trades") or []))
-    except Exception as exc:
-        diagnostics["snapshot_error"] = str(exc)
+    if strict_read_only:
+        reader = (
+            getattr(central_trade_registry, "load_registry_read_only", None)
+            if central_trade_registry is not None
+            else None
+        )
+        if not callable(reader):
+            return {
+                "ok": False,
+                "status": "TRADE_REGISTRY_READ_ONLY_LOADER_UNAVAILABLE",
+                "matches": [],
+                "count": 0,
+                "diagnostics": {
+                    "strict_read_only": True,
+                    "sources": [],
+                },
+            }
+        try:
+            registry = reader()
+        except Exception:
+            return {
+                "ok": False,
+                "status": "TRADE_REGISTRY_READ_ONLY_READ_ERROR",
+                "matches": [],
+                "count": 0,
+                "diagnostics": {
+                    "strict_read_only": True,
+                    "sources": [],
+                },
+            }
+        if not isinstance(registry, dict):
+            return {
+                "ok": False,
+                "status": "TRADE_REGISTRY_READ_ONLY_INVALID",
+                "matches": [],
+                "count": 0,
+                "diagnostics": {
+                    "strict_read_only": True,
+                    "sources": [],
+                },
+            }
+        trade_sources.append(
+            (
+                "central_trade_registry.load_registry_read_only",
+                iter_trades_from_registry_obj(registry),
+            )
+        )
+        diagnostics["strict_read_only"] = True
+    else:
+        try:
+            trades = get_open_positions_central() if callable(globals().get("get_open_positions_central")) else []
+            trade_sources.append(("get_open_positions_central", trades or []))
+        except Exception as exc:
+            diagnostics["get_open_positions_central_error"] = str(exc)
+        try:
+            if central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)):
+                registry = central_trade_registry.load_registry()
+                trade_sources.append(("central_trade_registry.load_registry", iter_trades_from_registry_obj(registry)))
+                diagnostics["trade_registry_file"] = str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", ""))
+        except Exception as exc:
+            diagnostics["load_registry_error"] = str(exc)
+        try:
+            snap = central_trade_registry_snapshot(include_trades=True) if callable(globals().get("central_trade_registry_snapshot")) else {}
+            trade_sources.append(("central_trade_registry_snapshot", snap.get("open_trades") or []))
+        except Exception as exc:
+            diagnostics["snapshot_error"] = str(exc)
 
     seen = set()
     for source, trades in trade_sources:
@@ -5199,7 +5407,14 @@ def _pesc_v11_registry_repair_from_position(position, symbol=None, side=None, bo
     return {"attempted": True, "committed": False, "status": "REGISTER_FUNCTION_MISSING", "repair_candidate": candidate}
 
 
-def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup=None, source_result=None):
+def build_post_execution_safety_check_v1(
+    symbol=None,
+    side=None,
+    bot=None,
+    setup=None,
+    source_result=None,
+    strict_read_only=False,
+):
     symbol_norm = _pesc_v1_norm_symbol(symbol or "BTCUSDT")
     side_norm = _pesc_v1_norm_side(side or "SHORT")
     bot = bot or "FALCON"
@@ -5212,10 +5427,19 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
         ack = request.args.get("ack") or request.args.get("existing_position_ack")
     except Exception:
         pass
+    if strict_read_only:
+        repair_registry = False
+        ack = None
 
     positions_payload = _pesc_v1_fetch_positions(symbol_norm, side_norm)
     orders_payload = _pesc_v11_fetch_open_orders(symbol_norm, side_norm)
-    registry_payload = _pesc_v11_trade_registry_matches(symbol_norm, side_norm, bot=bot, setup=setup)
+    registry_payload = _pesc_v11_trade_registry_matches(
+        symbol_norm,
+        side_norm,
+        bot=bot,
+        setup=setup,
+        strict_read_only=strict_read_only,
+    )
 
     positions = positions_payload.get("positions") or []
     orders = orders_payload.get("orders") or []
@@ -5233,13 +5457,19 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
     position_found = len(positions) > 0
     registry_match = bool(registry_payload.get("count", 0) > 0)
     registry_repair = {"attempted": False, "committed": False, "status": "NOT_NEEDED_OR_NOT_REQUESTED"}
-    if position_found and not registry_match:
+    if position_found and not registry_match and not strict_read_only:
         registry_repair = _pesc_v11_registry_repair_from_position(
             positions[0], symbol=symbol_norm, side=side_norm, bot=bot, setup=setup,
             commit=repair_registry, ack=ack,
         )
         if registry_repair.get("ok") or registry_repair.get("status") in {"REGISTERED", "ALREADY_REGISTERED"}:
-            registry_payload = _pesc_v11_trade_registry_matches(symbol_norm, side_norm, bot=bot, setup=setup)
+            registry_payload = _pesc_v11_trade_registry_matches(
+                symbol_norm,
+                side_norm,
+                bot=bot,
+                setup=setup,
+                strict_read_only=False,
+            )
             registry_match = bool(registry_payload.get("count", 0) > 0)
 
     stop_confirmed = bool(attached_stop_in_position or protective_orders)
@@ -5305,6 +5535,13 @@ def build_post_execution_safety_check_v1(symbol=None, side=None, bot=None, setup
                 "ok": positions_payload.get("ok"),
                 "error": positions_payload.get("error"),
                 "attempts": positions_payload.get("attempts"),
+                "response_received": positions_payload.get("response_received"),
+                "response_shape_valid": positions_payload.get("response_shape_valid"),
+                "position_rows_valid": positions_payload.get("position_rows_valid"),
+                "invalid_position_row_count": positions_payload.get("invalid_position_row_count"),
+                "ambiguous_matching_symbol_count": positions_payload.get("ambiguous_matching_symbol_count"),
+                "position_absence_confirmed": positions_payload.get("position_absence_confirmed"),
+                "count": positions_payload.get("count"),
             },
             "orders_fetch": {
                 "ok": orders_payload.get("ok"),
@@ -5859,7 +6096,7 @@ def disaster_stop_fallback_v1_route():
 # - Atualizar snapshot operacional no Registry quando commit=true.
 # - Reparar Registry dentro do lifecycle com repair_registry=true + ack explícito.
 # - Marcar CLOSED somente com posição ausente confirmada + ack explícito.
-REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-06-REAL-TRADE-LIFECYCLE-MONITOR-V1.3-TP50-RESOLVER"
+REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION = "2026-07-22-REAL-TRADE-LIFECYCLE-MONITOR-V1.6-STRICT-READ-ONLY-GET"
 TP50_RESOLVER_V1_VERSION = "2026-07-06-TP50-RESOLVER-V1"
 
 
@@ -5918,13 +6155,18 @@ def _rtlm_v1_trade_id(bot, setup, symbol, side):
 
 
 def _rtlm_v1_registry_available():
-    return central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)) and callable(getattr(central_trade_registry, "save_registry", None))
+    return central_trade_registry is not None and callable(
+        getattr(central_trade_registry, "load_registry_read_only", None)
+    )
 
 
 def _rtlm_v1_load_registry():
     if not _rtlm_v1_registry_available():
         return None
-    registry = central_trade_registry.load_registry()
+    reader = getattr(central_trade_registry, "load_registry_read_only", None)
+    if not callable(reader):
+        return None
+    registry = reader()
     return registry if isinstance(registry, dict) else {}
 
 
@@ -5935,6 +6177,684 @@ def _rtlm_v1_registry_open_items(registry):
     if isinstance(open_raw, list):
         return open_raw, [(str(t.get("trade_id") or i), t) for i, t in enumerate(open_raw) if isinstance(t, dict)]
     return {}, []
+
+
+def _rtlm_v14_clean_identity(value):
+    return str(value or "").strip()
+
+
+def _rtlm_v14_trade_value(trade, *keys):
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    for key in keys:
+        value = trade.get(key)
+        if value in (None, ""):
+            value = metadata.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _rtlm_v14_trade_values(trade, *keys):
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    values = []
+    for source in (trade, metadata):
+        for key in keys:
+            value = source.get(key)
+            if value in (None, ""):
+                continue
+            text = _rtlm_v14_clean_identity(value)
+            if text and text not in values:
+                values.append(text)
+    return values
+
+
+def _rtlm_v14_normalize_identity_field(field, value):
+    if value in (None, ""):
+        return ""
+    if field == "symbol":
+        return _rtlm_v1_norm_symbol(value)
+    if field == "side":
+        return _rtlm_v1_norm_side(value)
+    if field == "bot":
+        return _rtlm_v1_norm_bot(value)
+    text = _rtlm_v14_clean_identity(value)
+    if field in {"setup", "registry_mode", "execution_mode", "status"}:
+        return text.upper()
+    return text
+
+
+def _rtlm_v14_record_identity(trade, registry_key=None):
+    aliases = {
+        "trade_id": ("trade_id",),
+        "lifecycle_id": ("lifecycle_id",),
+        "client_order_id": ("client_order_id", "clientOrderId", "client_tag"),
+        "broker_order_id": (
+            "broker_order_id",
+            "order_id",
+            "live_order_id",
+            "entry_order_id",
+        ),
+        "symbol": ("symbol", "symbol_clean"),
+        "side": ("side", "direction"),
+        "bot": ("bot",),
+        "setup": ("setup", "signal_type", "setup_label"),
+        "registry_mode": ("registry_mode",),
+        "execution_mode": ("execution_mode",),
+        "status": ("status",),
+    }
+    values = {}
+    record = {"registry_key": _rtlm_v14_clean_identity(registry_key)}
+    for field, keys in aliases.items():
+        normalized = {
+            _rtlm_v14_normalize_identity_field(field, value)
+            for value in _rtlm_v14_trade_values(trade, *keys)
+        }
+        normalized.discard("")
+        values[field] = normalized
+        primary = _rtlm_v14_trade_value(trade, *keys)
+        record[field] = _rtlm_v14_normalize_identity_field(field, primary)
+    if not record["trade_id"] and record["registry_key"]:
+        record["trade_id"] = record["registry_key"]
+    return record, values
+
+
+def _rtlm_v14_record_matches_identity(
+    record,
+    values,
+    identity,
+    *,
+    expected_status,
+    require_canonical_key,
+    strict_status_aliases=True,
+):
+    expected = {
+        **(identity if isinstance(identity, dict) else {}),
+        "status": expected_status,
+    }
+    fields = (
+        "trade_id",
+        "lifecycle_id",
+        "client_order_id",
+        "broker_order_id",
+        "symbol",
+        "side",
+        "bot",
+        "setup",
+        "registry_mode",
+        "execution_mode",
+        "status",
+    )
+    if require_canonical_key and record.get("registry_key") != expected.get("trade_id"):
+        return False
+    for field in fields:
+        expected_value = _rtlm_v14_normalize_identity_field(
+            field, expected.get(field)
+        )
+        if not expected_value or record.get(field) != expected_value:
+            return False
+        if field == "status" and not strict_status_aliases:
+            continue
+        if values.get(field) != {expected_value}:
+            return False
+    return True
+
+
+def _rtlm_v14_missing_close_identity(
+    trade_id=None,
+    lifecycle_id=None,
+    client_order_id=None,
+    broker_order_id=None,
+    symbol=None,
+    side=None,
+    bot=None,
+    setup=None,
+    registry_mode=None,
+    execution_mode=None,
+):
+    return {
+        "trade_id": _rtlm_v14_clean_identity(trade_id),
+        "lifecycle_id": _rtlm_v14_clean_identity(lifecycle_id),
+        "client_order_id": _rtlm_v14_clean_identity(client_order_id),
+        "broker_order_id": _rtlm_v14_clean_identity(broker_order_id),
+        "symbol": _rtlm_v1_norm_symbol(symbol) if _rtlm_v14_clean_identity(symbol) else "",
+        "side": _rtlm_v1_norm_side(side) if _rtlm_v14_clean_identity(side) else "",
+        "bot": _rtlm_v1_norm_bot(bot) if _rtlm_v14_clean_identity(bot) else "",
+        "setup": _rtlm_v14_clean_identity(setup).upper(),
+        "registry_mode": _rtlm_v14_clean_identity(registry_mode).upper(),
+        "execution_mode": _rtlm_v14_clean_identity(execution_mode).upper(),
+    }
+
+
+def _rtlm_v14_build_position_evidence(identity, perform_read=True):
+    identity = identity if isinstance(identity, dict) else {}
+    payload = {
+        "ok": False,
+        "response_received": False,
+        "response_shape_valid": False,
+        "position_rows_valid": False,
+        "position_absence_confirmed": False,
+        "count": None,
+        "positions": [],
+        "error": "position read not attempted",
+    }
+    reader_called = False
+    if perform_read:
+        reader_called = True
+        try:
+            payload = _pesc_v1_fetch_positions(
+                identity.get("symbol"),
+                identity.get("side"),
+                strict_raw_exchange=True,
+            )
+        except Exception as exc:
+            payload = {
+                **payload,
+                "error": str(exc),
+            }
+    payload = payload if isinstance(payload, dict) else {
+        "ok": False,
+        "response_received": True,
+        "response_shape_valid": False,
+        "position_absence_confirmed": False,
+        "count": None,
+        "positions": [],
+        "error": "invalid position reader payload",
+    }
+    lookup_known = bool(
+        payload.get("ok") is True
+        and payload.get("response_received") is True
+        and payload.get("response_shape_valid") is True
+        and payload.get("position_rows_valid") is True
+        and isinstance(payload.get("count"), int)
+    )
+    count = payload.get("count") if lookup_known else None
+    position_found = bool(count > 0) if lookup_known else None
+    if payload.get("position_absence_confirmed") is True and count == 0:
+        status = "BROKER_POSITION_ABSENCE_CONFIRMED"
+    elif position_found is True:
+        status = "BROKER_POSITION_STILL_PRESENT"
+    else:
+        status = "BROKER_POSITION_LOOKUP_NOT_CONFIRMED"
+    return {
+        "ok": False,
+        "version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
+        "module": "real_trade_lifecycle_missing_from_bots_strong_close",
+        "generated_at": _rtlm_v1_now(),
+        "status": status,
+        "symbol": identity.get("symbol"),
+        "side": identity.get("side"),
+        "bot": identity.get("bot"),
+        "setup": identity.get("setup"),
+        "position_found": position_found,
+        "position_count": count,
+        "position": (
+            (payload.get("positions") or [None])[0]
+            if position_found is True
+            else None
+        ),
+        "requires_manual_attention": True,
+        "actions": [],
+        "broker_called": reader_called,
+        "broker_reader_called": reader_called,
+        "broker_reader_call_count": 1 if reader_called else 0,
+        "broker_writer_called": False,
+        "no_order_sent_by_this_route": True,
+        "sent": False,
+        "would_send_order": False,
+        "safety_check": {
+            "positions_fetch_ok": payload.get("ok") is True,
+            "positions_response_received": payload.get("response_received") is True,
+            "positions_response_shape_valid": payload.get("response_shape_valid") is True,
+            "position_rows_valid": payload.get("position_rows_valid") is True,
+            "position_absence_confirmed": payload.get("position_absence_confirmed") is True,
+            "position_count": count,
+            "invalid_position_row_count": payload.get("invalid_position_row_count"),
+            "ambiguous_matching_symbol_count": payload.get("ambiguous_matching_symbol_count"),
+            "position_error": payload.get("error"),
+        },
+    }
+
+
+def _rtlm_v14_resolve_missing_from_bots_close(identity, lifecycle=None):
+    """Resolve one Registry OPEN using only the complete immutable identity."""
+    identity = identity if isinstance(identity, dict) else {}
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+    required_fields = (
+        "trade_id",
+        "lifecycle_id",
+        "client_order_id",
+        "broker_order_id",
+        "symbol",
+        "side",
+        "bot",
+        "setup",
+        "registry_mode",
+        "execution_mode",
+    )
+    missing = [field for field in required_fields if identity.get(field) in (None, "")]
+    position_found = lifecycle.get("position_found")
+    safety = lifecycle.get("safety_check") if isinstance(lifecycle.get("safety_check"), dict) else {}
+    position_lookup_known = bool(
+        safety.get("positions_fetch_ok") is True
+        and safety.get("positions_response_received") is True
+        and safety.get("positions_response_shape_valid") is True
+        and safety.get("position_rows_valid") is True
+        and safety.get("position_absence_confirmed") is True
+        and safety.get("position_count") == 0
+    )
+    base = {
+        "ok": False,
+        "safe_to_close": False,
+        "read_only": True,
+        "position_found": position_found,
+        "position_lookup_known": position_lookup_known,
+        "required_identity_fields": list(required_fields),
+        "missing_identity_fields": missing,
+        "exact_open_match_count": 0,
+        "open_trade_id_match_count": 0,
+        "registry_open_total": None,
+        "identity": dict(identity),
+        "no_order_sent_by_this_route": True,
+        "sent": False,
+        "would_send_order": False,
+        "broker_called": bool(lifecycle.get("broker_reader_called")),
+        "broker_reader_called": bool(lifecycle.get("broker_reader_called")),
+        "broker_reader_call_count": int(
+            lifecycle.get("broker_reader_call_count", 0) or 0
+        ),
+        "broker_writer_called": False,
+        "registry_write": False,
+        "write_executed": False,
+    }
+    if missing:
+        return {**base, "status": "MISSING_FROM_BOTS_STRONG_IDENTITY_REQUIRED"}
+    if identity.get("registry_mode") != "REAL" or identity.get("execution_mode") != "LIVE":
+        return {**base, "status": "MISSING_FROM_BOTS_REAL_LIVE_MODE_REQUIRED"}
+    if not position_lookup_known:
+        return {**base, "status": "BROKER_POSITION_LOOKUP_NOT_CONFIRMED"}
+    if position_found is not False:
+        return {**base, "status": "BROKER_POSITION_STILL_PRESENT_OR_UNKNOWN"}
+
+    reader = getattr(central_trade_registry, "load_registry_read_only", None) if central_trade_registry is not None else None
+    if not callable(reader):
+        return {**base, "status": "TRADE_REGISTRY_READ_ONLY_LOADER_UNAVAILABLE"}
+    try:
+        registry = reader()
+    except Exception as exc:
+        return {
+            **base,
+            "status": "TRADE_REGISTRY_READ_ERROR",
+            "error": str(exc),
+        }
+    if not isinstance(registry, dict):
+        return {**base, "status": "TRADE_REGISTRY_INVALID"}
+
+    _open_obj, items = _rtlm_v1_registry_open_items(registry)
+    exact_matches = []
+    trade_id_matches = []
+    for key, trade in items:
+        if not isinstance(trade, dict):
+            continue
+        record, values = _rtlm_v14_record_identity(trade, registry_key=key)
+        if values.get("trade_id") == {identity["trade_id"]}:
+            trade_id_matches.append({"key": key, "trade": trade, "record": record})
+        if _rtlm_v14_record_matches_identity(
+            record,
+            values,
+            identity,
+            expected_status="MISSING_FROM_BOTS",
+            require_canonical_key=True,
+        ):
+            exact_matches.append({"key": key, "trade": trade, "record": record})
+
+    result = {
+        **base,
+        "registry_open_total": len(items),
+        "open_trade_id_match_count": len(trade_id_matches),
+        "exact_open_match_count": len(exact_matches),
+    }
+    if len(trade_id_matches) != 1:
+        result["status"] = "MISSING_FROM_BOTS_OPEN_TRADE_ID_COUNT_INVALID"
+        return result
+    if len(exact_matches) != 1:
+        result["status"] = "MISSING_FROM_BOTS_EXACT_OPEN_COUNT_INVALID"
+        return result
+    selected = exact_matches[0]
+    result.update(
+        {
+            "ok": True,
+            "safe_to_close": True,
+            "status": "MISSING_FROM_BOTS_EXACT_OPEN_MATCH_READY",
+            "candidate": dict(selected["record"]),
+            "_candidate_trade": selected["trade"],
+        }
+    )
+    return result
+
+
+def _rtlm_v14_confirm_registry_close(identity):
+    base = {
+        "confirmed": False,
+        "read_only": True,
+        "open_trade_id_match_count": None,
+        "closed_exact_match_count": None,
+    }
+    reader = (
+        getattr(central_trade_registry, "load_registry_read_only", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(reader):
+        return {**base, "status": "TRADE_REGISTRY_READ_ONLY_LOADER_UNAVAILABLE"}
+    try:
+        registry = reader()
+    except Exception as exc:
+        return {**base, "status": "TRADE_REGISTRY_READBACK_ERROR", "error": str(exc)}
+    if not isinstance(registry, dict):
+        return {**base, "status": "TRADE_REGISTRY_READBACK_INVALID"}
+
+    _open_obj, open_items = _rtlm_v1_registry_open_items(registry)
+    open_matches = []
+    for key, trade in open_items:
+        if not isinstance(trade, dict):
+            continue
+        record, values = _rtlm_v14_record_identity(trade, registry_key=key)
+        if values.get("trade_id") == {identity.get("trade_id")}:
+            open_matches.append(record)
+
+    closed_raw = registry.get("closed_trades", [])
+    if isinstance(closed_raw, dict):
+        closed_items = list(closed_raw.items())
+    elif isinstance(closed_raw, list):
+        closed_items = list(enumerate(closed_raw))
+    else:
+        closed_items = []
+    closed_matches = []
+    for key, trade in closed_items:
+        if not isinstance(trade, dict):
+            continue
+        record, values = _rtlm_v14_record_identity(trade, registry_key=key)
+        if not _rtlm_v14_record_matches_identity(
+            record,
+            values,
+            identity,
+            expected_status="CLOSED",
+            require_canonical_key=False,
+            strict_status_aliases=False,
+        ):
+            continue
+        marker = _rtlm_v14_trade_value(
+            trade, "missing_from_bots_strong_identity_validated"
+        )
+        close_reason = _rtlm_v14_clean_identity(
+            _rtlm_v14_trade_value(trade, "close_reason")
+        )
+        if marker is not True or close_reason != "BROKER_POSITION_NOT_FOUND_CONFIRMED":
+            continue
+        closed_matches.append(record)
+
+    confirmed = len(open_matches) == 0 and len(closed_matches) == 1
+    return {
+        **base,
+        "confirmed": confirmed,
+        "status": (
+            "REGISTRY_CLOSE_PERSISTENCE_CONFIRMED"
+            if confirmed
+            else "REGISTRY_CLOSE_PERSISTENCE_UNCONFIRMED"
+        ),
+        "open_trade_id_match_count": len(open_matches),
+        "closed_exact_match_count": len(closed_matches),
+    }
+
+
+def _rtlm_v14_close_missing_from_bots(resolution, commit=False, ack=None):
+    resolution = resolution if isinstance(resolution, dict) else {}
+    public_resolution = {
+        key: value for key, value in resolution.items() if not str(key).startswith("_")
+    }
+    base = {
+        **public_resolution,
+        "read_only": True,
+        "commit_requested": bool(commit),
+        "attempted": bool(commit),
+        "committed": False,
+        "registry_write": False,
+        "write_executed": False,
+        "no_order_sent_by_this_route": True,
+        "sent": False,
+        "would_send_order": False,
+        "broker_called": bool(public_resolution.get("broker_reader_called")),
+        "broker_reader_called": bool(public_resolution.get("broker_reader_called")),
+        "broker_reader_call_count": int(
+            public_resolution.get("broker_reader_call_count", 0) or 0
+        ),
+        "broker_writer_called": False,
+        "registry_write_attempted": False,
+        "registry_write_may_have_occurred": False,
+        "persistence_confirmed": False,
+    }
+    if not commit:
+        return {**base, "status": resolution.get("status") or "CLOSE_NOT_REQUESTED"}
+    if _rtlm_v14_clean_identity(ack) != "POSITION_CLOSED_CONFIRMED":
+        return {
+            **base,
+            "status": "ACK_REQUIRED",
+            "required_ack": "POSITION_CLOSED_CONFIRMED",
+        }
+    if resolution.get("safe_to_close") is not True:
+        return {**base, "status": resolution.get("status") or "STRONG_CLOSE_BLOCKED"}
+
+    closer = getattr(central_trade_registry, "close_trade", None) if central_trade_registry is not None else None
+    if not callable(closer):
+        return {**base, "status": "TRADE_REGISTRY_CLOSE_UNAVAILABLE"}
+    identity = resolution.get("identity") if isinstance(resolution.get("identity"), dict) else {}
+    expected_identity = {
+        "trade_id": identity.get("trade_id"),
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "client_order_id": identity.get("client_order_id"),
+        "order_id": identity.get("broker_order_id"),
+        "symbol": identity.get("symbol"),
+        "side": identity.get("side"),
+        "bot": identity.get("bot"),
+        "setup": identity.get("setup"),
+        "registry_mode": identity.get("registry_mode"),
+        "execution_mode": identity.get("execution_mode"),
+        "status": "MISSING_FROM_BOTS",
+    }
+    try:
+        base["registry_write_attempted"] = True
+        base["read_only"] = False
+        close_result = closer(
+            identity.get("trade_id"),
+            reason="BROKER_POSITION_NOT_FOUND_CONFIRMED",
+            registry_mode=identity.get("registry_mode"),
+            expected_identity=expected_identity,
+            expected_open_trade_id_count=1,
+            clear_financial_results=True,
+            central_only_broker_flat_reconciled=True,
+            financial_reconciliation_pending=True,
+            learning_eligible=False,
+            outcome_status="RECONCILED_WITHOUT_PNL",
+            metadata={
+                "closed_by_lifecycle_monitor": True,
+                "lifecycle_version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
+                "lifecycle_closed_at": _rtlm_v1_now(),
+                "close_ack": "POSITION_CLOSED_CONFIRMED",
+                "last_position_found": False,
+                "position_lookup_known": True,
+                "missing_from_bots_strong_identity_validated": True,
+            },
+        )
+    except Exception as exc:
+        return {**base, "status": "TRADE_REGISTRY_CLOSE_ERROR", "error": str(exc)}
+    committed = bool(
+        isinstance(close_result, dict)
+        and close_result.get("ok") is True
+        and close_result.get("action") == "TRADE_CLOSED"
+    )
+    if not committed:
+        return {
+            **base,
+            "status": (
+                "TRADE_ALREADY_CLOSED"
+                if isinstance(close_result, dict)
+                and close_result.get("action") == "TRADE_ALREADY_CLOSED"
+                else "TRADE_REGISTRY_CLOSE_BLOCKED"
+            ),
+            "idempotent": bool(
+                isinstance(close_result, dict)
+                and close_result.get("action") == "TRADE_ALREADY_CLOSED"
+            ),
+            "registry_result": close_result,
+        }
+    persistence = _rtlm_v14_confirm_registry_close(identity)
+    if persistence.get("confirmed") is not True:
+        return {
+            **base,
+            "ok": False,
+            "status": "REGISTRY_CLOSE_PERSISTENCE_UNCONFIRMED",
+            "committed": False,
+            "registry_write": None,
+            "write_executed": None,
+            "registry_write_may_have_occurred": True,
+            "persistence_confirmed": False,
+            "registry_result": close_result,
+            "persistence_confirmation": persistence,
+        }
+    return {
+        **base,
+        "ok": True,
+        "status": "MISSING_FROM_BOTS_REGISTRY_CLOSED",
+        "committed": True,
+        "registry_write": True,
+        "write_executed": True,
+        "registry_write_may_have_occurred": True,
+        "persistence_confirmed": True,
+        "registry_result": close_result,
+        "persistence_confirmation": persistence,
+    }
+
+
+def _rtlm_v14_apply_missing_from_bots_close(
+    lifecycle, identity, close_registry=False, ack=None
+):
+    lifecycle = dict(lifecycle or {})
+    strong_identity_fields = (
+        "trade_id",
+        "lifecycle_id",
+        "client_order_id",
+        "broker_order_id",
+    )
+    requested = bool(
+        close_registry
+        or any((identity or {}).get(field) for field in strong_identity_fields)
+    )
+    if not requested:
+        lifecycle["missing_from_bots_close"] = {
+            "attempted": False,
+            "committed": False,
+            "status": "NOT_REQUESTED",
+            "no_order_sent_by_this_route": True,
+            "sent": False,
+            "would_send_order": False,
+            "broker_called": False,
+            "broker_reader_called": False,
+            "broker_reader_call_count": 0,
+            "broker_writer_called": False,
+            "registry_write": False,
+            "write_executed": False,
+        }
+        return lifecycle
+
+    resolution = _rtlm_v14_resolve_missing_from_bots_close(
+        identity, lifecycle=lifecycle
+    )
+    if (
+        close_registry
+        and _rtlm_v14_clean_identity(ack) == "POSITION_CLOSED_CONFIRMED"
+        and resolution.get("safe_to_close") is True
+    ):
+        # Revalidate the broker-flat fact immediately before the atomic
+        # Registry compare-and-close. Only the existing position reader is
+        # called here; no Broker order writer is reachable from this path.
+        try:
+            fresh_positions = _pesc_v1_fetch_positions(
+                identity.get("symbol"),
+                identity.get("side"),
+                strict_raw_exchange=True,
+            )
+        except Exception as exc:
+            fresh_positions = {
+                "ok": False,
+                "response_received": False,
+                "response_shape_valid": False,
+                "position_rows_valid": False,
+                "position_absence_confirmed": False,
+                "count": None,
+                "error": str(exc),
+            }
+        fresh_flat_confirmed = bool(
+            isinstance(fresh_positions, dict)
+            and fresh_positions.get("ok") is True
+            and fresh_positions.get("response_received") is True
+            and fresh_positions.get("response_shape_valid") is True
+            and fresh_positions.get("position_rows_valid") is True
+            and fresh_positions.get("position_absence_confirmed") is True
+            and fresh_positions.get("count") == 0
+        )
+        lifecycle["position_found"] = False if fresh_flat_confirmed else None
+        lifecycle["broker_called"] = True
+        lifecycle["broker_reader_called"] = True
+        lifecycle["broker_reader_call_count"] = int(
+            lifecycle.get("broker_reader_call_count", 0) or 0
+        ) + 1
+        lifecycle["safety_check"] = {
+            **(
+                lifecycle.get("safety_check")
+                if isinstance(lifecycle.get("safety_check"), dict)
+                else {}
+            ),
+            "positions_fetch_ok": fresh_positions.get("ok") is True,
+            "positions_response_received": fresh_positions.get("response_received") is True,
+            "positions_response_shape_valid": fresh_positions.get("response_shape_valid") is True,
+            "position_rows_valid": fresh_positions.get("position_rows_valid") is True,
+            "position_absence_confirmed": fresh_positions.get("position_absence_confirmed") is True,
+            "position_count": fresh_positions.get("count"),
+            "fresh_commit_revalidation": True,
+        }
+        resolution = _rtlm_v14_resolve_missing_from_bots_close(
+            identity, lifecycle=lifecycle
+        )
+        resolution["fresh_position_revalidation"] = {
+            "ok": fresh_positions.get("ok") is True,
+            "response_received": fresh_positions.get("response_received") is True,
+            "response_shape_valid": fresh_positions.get("response_shape_valid") is True,
+            "position_rows_valid": fresh_positions.get("position_rows_valid") is True,
+            "position_absence_confirmed": fresh_positions.get("position_absence_confirmed") is True,
+            "count": fresh_positions.get("count"),
+            "error": fresh_positions.get("error"),
+        }
+    close_result = _rtlm_v14_close_missing_from_bots(
+        resolution, commit=close_registry, ack=ack
+    )
+    lifecycle["missing_from_bots_close"] = close_result
+    lifecycle["registry_close"] = close_result
+    if close_result.get("committed") is True:
+        lifecycle.setdefault("actions", []).append("REGISTRY_MARKED_CLOSED")
+        lifecycle["status"] = "MISSING_FROM_BOTS_REGISTRY_CLOSED"
+        lifecycle["ok"] = True
+        lifecycle["requires_manual_attention"] = False
+    elif close_result.get("safe_to_close") is True and not close_registry:
+        lifecycle["status"] = "MISSING_FROM_BOTS_EXACT_CLOSE_READY"
+        lifecycle["ok"] = False
+        lifecycle["requires_manual_attention"] = True
+    elif requested:
+        lifecycle["status"] = close_result.get("status") or "STRONG_CLOSE_BLOCKED"
+        lifecycle["ok"] = False
+        lifecycle["requires_manual_attention"] = True
+    return lifecycle
 
 
 def _rtlm_v1_match_trade(trade, symbol=None, side=None, bot=None, setup=None):
@@ -6024,68 +6944,19 @@ def _rtlm_v1_update_open_trade_snapshot(symbol=None, side=None, bot=None, setup=
 
 
 def _rtlm_v1_close_open_trade(symbol=None, side=None, bot=None, setup=None, lifecycle=None, commit=False, ack=None):
-    """Move trade OPEN para CLOSED apenas com confirmação explícita."""
-    if not commit:
-        return {"attempted": False, "committed": False, "status": "CLOSE_NOT_REQUESTED"}
-    if str(ack or "").strip().upper() not in {"POSITION_CLOSED_CONFIRMED", "CLOSE_CONFIRMED", "CLOSED_CONFIRMED"}:
-        return {
-            "attempted": True,
-            "committed": False,
-            "status": "ACK_REQUIRED",
-            "required_ack": "POSITION_CLOSED_CONFIRMED",
-        }
-    registry = _rtlm_v1_load_registry()
-    if registry is None:
-        return {"attempted": True, "committed": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR}
-    open_obj, items = _rtlm_v1_registry_open_items(registry)
-    closed_raw = registry.get("closed_trades", [])
-    if isinstance(closed_raw, dict):
-        closed_trades = list(closed_raw.values())
-    elif isinstance(closed_raw, list):
-        closed_trades = closed_raw
-    else:
-        closed_trades = []
-    closed_keys = []
-    now = _rtlm_v1_now()
-    for key, trade in list(items):
-        if not _rtlm_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup):
-            continue
-        trade = dict(trade)
-        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
-        meta.update({
-            "closed_by_lifecycle_monitor": True,
-            "lifecycle_version": REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION,
-            "lifecycle_closed_at": now,
-            "close_reason": "BROKER_POSITION_NOT_FOUND",
-            "close_ack": ack,
-            "last_lifecycle_status": (lifecycle or {}).get("status"),
-            "last_position_found": (lifecycle or {}).get("position_found"),
-            "stop_confirmed_before_close": (lifecycle or {}).get("stop_confirmed_by_central"),
-        })
-        trade["metadata"] = meta
-        trade["status"] = "CLOSED"
-        trade["closed_at"] = now
-        trade["last_update"] = now
-        trade["close_reason"] = "BROKER_POSITION_NOT_FOUND"
-        closed_trades.append(trade)
-        closed_keys.append(str(key))
-        if isinstance(open_obj, dict):
-            open_obj.pop(key, None)
-        elif isinstance(open_obj, list):
-            try:
-                open_obj.remove(trade)
-            except Exception:
-                pass
-    if not closed_keys:
-        return {"attempted": True, "committed": False, "status": "NO_MATCHING_OPEN_TRADE_TO_CLOSE"}
-    registry["open_trades"] = open_obj
-    registry["closed_trades"] = closed_trades
-    registry["updated_at"] = now
-    try:
-        central_trade_registry.save_registry(registry)
-    except Exception as exc:
-        return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
-    return {"attempted": True, "committed": True, "status": "CLOSED_REGISTERED", "closed_keys": closed_keys, "closed_count": len(closed_keys)}
+    """Legacy symbol/side writer is permanently disabled by V1.4."""
+    return {
+        "attempted": bool(commit),
+        "committed": False,
+        "status": "LEGACY_SYMBOL_SIDE_CLOSE_DISABLED",
+        "required_route": "/realtradelifecycle",
+        "required_ack": "POSITION_CLOSED_CONFIRMED",
+        "strong_identity_required": True,
+        "no_order_sent_by_this_route": True,
+        "broker_writer_called": False,
+        "registry_write": False,
+        "write_executed": False,
+    }
 
 
 def _rtlm_v1_first_position(safety):
@@ -6396,7 +7267,9 @@ def _rtlm_v1_protective_summary(safety):
     return stops
 
 
-def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setup=None):
+def build_real_trade_lifecycle_monitor_v1(
+    symbol=None, side=None, bot=None, setup=None, strict_read_only=False
+):
     symbol_norm = _rtlm_v1_norm_symbol(symbol or "BTCUSDT")
     side_norm = _rtlm_v1_norm_side(side or "SHORT")
     bot = _rtlm_v1_norm_bot(bot or "FALCON")
@@ -6420,8 +7293,20 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         request_tp50 = None
         request_sl = None
         request_tp50_r = None
+    if strict_read_only:
+        commit = False
+        close_commit = False
+        repair_registry = False
+        close_ack = None
+        repair_ack = None
 
-    safety = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
+    safety = build_post_execution_safety_check_v1(
+        symbol=symbol_norm,
+        side=side_norm,
+        bot=bot,
+        setup=setup,
+        strict_read_only=strict_read_only,
+    )
     direct_registry = _rtlm_v1_find_open_trades(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
     position = _rtlm_v1_first_position(safety)
     registry_trade = _rtlm_v1_first_registry_trade(safety, direct_registry.get("matches"))
@@ -6433,7 +7318,13 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
     # V1.1: permite reparar Registry dentro do próprio monitor quando há posição real
     # protegida, mas o deploy atual perdeu/não carregou o registro OPEN.
     lifecycle_registry_repair = {"attempted": False, "committed": False, "status": "NOT_REQUESTED"}
-    if position_found and stop_confirmed and (not registry_match) and repair_registry:
+    if (
+        not strict_read_only
+        and position_found
+        and stop_confirmed
+        and (not registry_match)
+        and repair_registry
+    ):
         lifecycle_registry_repair = _pesc_v11_registry_repair_from_position(
             position,
             symbol=symbol_norm,
@@ -6445,7 +7336,13 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         )
         if lifecycle_registry_repair.get("ok") or lifecycle_registry_repair.get("status") in {"REGISTERED", "ALREADY_REGISTERED"}:
             # Recarrega tudo após reparo para que o lifecycle já mostre o estado pós-reparo.
-            safety = build_post_execution_safety_check_v1(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
+            safety = build_post_execution_safety_check_v1(
+                symbol=symbol_norm,
+                side=side_norm,
+                bot=bot,
+                setup=setup,
+                strict_read_only=False,
+            )
             direct_registry = _rtlm_v1_find_open_trades(symbol=symbol_norm, side=side_norm, bot=bot, setup=setup)
             position = _rtlm_v1_first_position(safety)
             registry_trade = _rtlm_v1_first_registry_trade(safety, direct_registry.get("matches"))
@@ -6529,12 +7426,32 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
             "open_orders_checked": (safety or {}).get("open_orders_checked"),
             "open_orders_count": (safety or {}).get("open_orders_count"),
             "protective_orders_count": (safety or {}).get("protective_orders_count"),
+            "positions_fetch_ok": (
+                (((safety or {}).get("diagnostics") or {}).get("positions_fetch") or {}).get("ok")
+                is True
+            ),
+            "positions_response_received": (
+                (((safety or {}).get("diagnostics") or {}).get("positions_fetch") or {}).get("response_received")
+                is True
+            ),
+            "positions_response_shape_valid": (
+                (((safety or {}).get("diagnostics") or {}).get("positions_fetch") or {}).get("response_shape_valid")
+                is True
+            ),
+            "position_rows_valid": (
+                (((safety or {}).get("diagnostics") or {}).get("positions_fetch") or {}).get("position_rows_valid")
+                is True
+            ),
+            "position_absence_confirmed": (
+                (((safety or {}).get("diagnostics") or {}).get("positions_fetch") or {}).get("position_absence_confirmed")
+                is True
+            ),
         },
         "actions": [],
         "notes": [
             "V1.3 monitora posição real, stop, PnL, TP50 e Registry com TP50 Resolver V1.",
             "V1.3 pode reparar o Registry com repair_registry=true e ack=CENTRAL_MANAGED_EXISTING_POSITION quando a posição real protegida existe, mas o registro OPEN não foi encontrado.",
-            "Por segurança, V1.3 só fecha Registry quando posição some da corretora e close_registry=true com ack=POSITION_CLOSED_CONFIRMED.",
+            "V1.4 desabilita o fechamento legado por símbolo/lado; MISSING_FROM_BOTS exige identidade completa, ausência factual e ACK exato.",
             "commit=true atualiza apenas snapshot/metadata do trade aberto; não cria nem fecha ordens na BingX.",
             "TP50 Resolver V1 resolve TP50 por rota/Registry/posição ou calcula automaticamente a partir da entrada real e stop válido; alvos incoerentes são rejeitados.",
         ],
@@ -6553,21 +7470,279 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
         lifecycle["registry_update"] = {"attempted": False, "committed": False, "status": "NOT_APPLICABLE"}
 
     # Fechamento controlado do Registry quando posição não existe mais.
-    if (not position_found) and registry_match:
-        close_result = _rtlm_v1_close_open_trade(
-            symbol=symbol_norm, side=side_norm, bot=bot, setup=setup,
-            lifecycle=lifecycle, commit=close_commit, ack=close_ack,
-        )
-        lifecycle["registry_close"] = close_result
-        if close_result.get("committed"):
-            lifecycle["actions"].append("REGISTRY_MARKED_CLOSED")
-            lifecycle["status"] = "POSITION_CLOSED_AND_REGISTRY_UPDATED"
-            lifecycle["ok"] = True
-            lifecycle["requires_manual_attention"] = False
-    else:
-        lifecycle["registry_close"] = {"attempted": False, "committed": False, "status": "NOT_APPLICABLE"}
+    lifecycle["registry_close"] = {
+        "attempted": bool(close_commit),
+        "committed": False,
+        "status": (
+            "STRONG_IDENTITY_CLOSE_REQUIRED"
+            if close_commit
+            else "NOT_REQUESTED"
+        ),
+        "required_ack": "POSITION_CLOSED_CONFIRMED",
+        "no_order_sent_by_this_route": True,
+        "sent": False,
+        "would_send_order": False,
+        "broker_called": False,
+        "broker_writer_called": False,
+        "registry_write": False,
+        "write_executed": False,
+    }
 
     return lifecycle
+
+
+def _rtlm_v15_is_auth_material_key(key):
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    return bool(
+        "token" in normalized
+        or "authorization" in normalized
+        or normalized in {"auth", "execution_auth", "api_key", "apikey"}
+    )
+
+
+def _rtlm_v15_contains_auth_material(value, depth=0):
+    if depth > 8:
+        return True
+    if isinstance(value, dict) or hasattr(value, "keys"):
+        try:
+            keys = list(value.keys())
+        except Exception:
+            return True
+        for key in keys:
+            if _rtlm_v15_is_auth_material_key(key):
+                return True
+            try:
+                nested = value.get(key) if hasattr(value, "get") else None
+            except Exception:
+                return True
+            if isinstance(nested, (dict, list, tuple)) and _rtlm_v15_contains_auth_material(
+                nested, depth + 1
+            ):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(
+            _rtlm_v15_contains_auth_material(item, depth + 1) for item in value
+        )
+    return False
+
+
+def _rtlm_v15_admin_auth():
+    """Authenticate only the exact execution header, never query/JSON/context."""
+
+    try:
+        query = getattr(request, "args", None)
+        form = getattr(request, "form", None)
+        try:
+            body = request.get_json(silent=True)
+        except Exception:
+            body = None
+        if (
+            _rtlm_v15_contains_auth_material(query)
+            or _rtlm_v15_contains_auth_material(form)
+            or _rtlm_v15_contains_auth_material(body)
+        ):
+            return {
+                "ok": False,
+                "status": "EXECUTION_AUTH_HEADER_REQUIRED",
+                "http_status": 403,
+            }
+        headers = getattr(request, "headers", None)
+        exact_header = str(
+            _ee_auth_resolver_v1_get_from_mapping(
+                headers, "X-Execution-Auth-Token"
+            )
+            or ""
+        ).strip()
+        for alternative in (
+            "X-Execution-Auth",
+            "X-Central-Execution-Auth-Token",
+            "X-Real-Execution-Auth-Token",
+            "X-BingX-Execution-Auth-Token",
+            "Authorization",
+        ):
+            if str(
+                _ee_auth_resolver_v1_get_from_mapping(headers, alternative) or ""
+            ).strip():
+                return {
+                    "ok": False,
+                    "status": "EXECUTION_AUTH_HEADER_REQUIRED",
+                    "http_status": 403,
+                }
+        if not exact_header:
+            return {
+                "ok": False,
+                "status": "EXECUTION_AUTH_REQUIRED",
+                "http_status": 403,
+            }
+        resolver = globals().get("_ee_auth_resolver_v1_resolve")
+        if not callable(resolver):
+            return {
+                "ok": False,
+                "status": "EXECUTION_AUTH_UNAVAILABLE",
+                "http_status": 403,
+            }
+        resolved = resolver(allow_env_fallback=False)
+        if not isinstance(resolved, dict):
+            resolved = {}
+        if not (
+            resolved.get("ok") is True
+            and resolved.get("matched_source")
+            == "request.headers.X-Execution-Auth-Token"
+        ):
+            return {
+                "ok": False,
+                "status": "EXECUTION_AUTH_INVALID",
+                "http_status": 403,
+            }
+        return {"ok": True, "status": "EXECUTION_AUTH_OK", "http_status": 200}
+    except Exception:
+        try:
+            app.logger.exception("realtradelifecycle execution auth guard failed")
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "status": "EXECUTION_AUTH_UNAVAILABLE",
+            "http_status": 403,
+        }
+
+
+def _rtlm_v15_public_payload(value, depth=0):
+    """Project route responses without exceptions, filesystem paths or secrets."""
+
+    if depth > 16:
+        return None
+    if isinstance(value, dict):
+        projected = {}
+        for key, item in value.items():
+            key_text = str(key or "")
+            normalized = key_text.lower()
+            if (
+                key_text.startswith("_")
+                or normalized
+                in {
+                    "error",
+                    "errors",
+                    "exception",
+                    "traceback",
+                    "trade",
+                    "metadata",
+                    "payload",
+                    "raw",
+                    "registry_result",
+                    "configured_source",
+                    "checked_sources",
+                }
+                or "error" in normalized
+                or "exception" in normalized
+                or "traceback" in normalized
+                or "secret" in normalized
+                or "password" in normalized
+                or "token" in normalized
+                or "path" in normalized
+                or normalized.endswith("_file")
+                or normalized.endswith("_dir")
+                or "_directory" in normalized
+            ):
+                continue
+            if normalized in {"required_route", "required_close_route"}:
+                route_value = str(item or "").strip()
+                if route_value.startswith("/") and ".." not in route_value:
+                    projected[key_text] = route_value[:256]
+                continue
+            projected[key_text] = _rtlm_v15_public_payload(item, depth + 1)
+        return projected
+    if isinstance(value, (list, tuple)):
+        return [_rtlm_v15_public_payload(item, depth + 1) for item in value]
+    if isinstance(value, str):
+        text = value.replace("\r", " ").replace("\n", " ").strip()
+        lowered = text.lower()
+        absolute_or_traversal_path = bool(
+            text.startswith(("/", "\\\\", "//"))
+            or ":\\" in text
+            or (len(text) >= 3 and text[0].isalpha() and text[1] == ":" and text[2] == "/")
+            or lowered.startswith("file:")
+            or "../" in text
+            or "..\\" in text
+        )
+        credential_like = any(
+            marker in lowered
+            for marker in (
+                "bearer ",
+                "api_key=",
+                "api-key=",
+                "apikey=",
+                "secret=",
+                "secret:",
+                "token=",
+                "token:",
+            )
+        )
+        if (
+            absolute_or_traversal_path
+            or credential_like
+            or "traceback (most recent call last)" in lowered
+        ):
+            return "REDACTED"
+        return text[:512]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return None
+
+
+def _rtlm_v15_response(payload, status=200):
+    return (
+        _rtlm_v15_public_payload(payload),
+        int(status),
+        _rtlm_private_no_store_headers(),
+    )
+
+
+def _rtlm_v15_get_mutation_parameters():
+    false_values = {"", "0", "false", "no", "nao", "não", "off"}
+    mutation_names = (
+        "close_registry",
+        "mark_closed",
+        "commit",
+        "update_registry",
+        "repair_registry",
+        "repair",
+        "persist_registry",
+        "persist",
+        "registry_persistence_rebuild",
+        "rebuild_registry",
+        "restore_registry",
+        "restore_from_snapshot",
+    )
+    blocked = []
+    args = getattr(request, "args", None)
+    for name in mutation_names:
+        try:
+            present = name in args
+            value = str(args.get(name) or "").strip().lower() if present else ""
+        except Exception:
+            present = False
+            value = ""
+        if present and value not in false_values:
+            blocked.append(name)
+    return blocked
+
+
+def _rtlm_v15_identity_from_mapping(mapping):
+    mapping = mapping if isinstance(mapping, dict) or hasattr(mapping, "get") else {}
+    return _rtlm_v14_missing_close_identity(
+        trade_id=mapping.get("trade_id"),
+        lifecycle_id=mapping.get("lifecycle_id"),
+        client_order_id=mapping.get("client_order_id"),
+        broker_order_id=mapping.get("broker_order_id"),
+        symbol=mapping.get("symbol"),
+        side=mapping.get("side"),
+        bot=mapping.get("bot"),
+        setup=mapping.get("setup"),
+        registry_mode=mapping.get("registry_mode"),
+        execution_mode=mapping.get("execution_mode"),
+    )
 
 
 @app.route("/realtradelifecycle", methods=["GET"])
@@ -6576,11 +7751,326 @@ def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setu
 @app.route("/lifecyclemonitor/<symbol>/<side>", methods=["GET"])
 @app.route("/trade/lifecycle", methods=["GET"])
 def real_trade_lifecycle_monitor_v1_route(symbol=None, side=None):
-    symbol = symbol or request.args.get("symbol") or "BTCUSDT"
-    side = side or request.args.get("side") or "SHORT"
-    bot = request.args.get("bot") or "FALCON"
-    setup = request.args.get("setup") or bot
-    return build_real_trade_lifecycle_monitor_v1(symbol=symbol, side=side, bot=bot, setup=setup)
+    try:
+        try:
+            request_body = request.get_json(silent=True)
+        except Exception:
+            request_body = None
+        if (
+            _rtlm_v15_contains_auth_material(getattr(request, "args", None))
+            or _rtlm_v15_contains_auth_material(getattr(request, "form", None))
+            or _rtlm_v15_contains_auth_material(request_body)
+        ):
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "EXECUTION_AUTH_HEADER_REQUIRED",
+                    "read_only": True,
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                403,
+            )
+
+        mutation_params = _rtlm_v15_get_mutation_parameters()
+        if mutation_params:
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "GET_PREVIEW_ONLY",
+                    "blocked_mutation_parameters": mutation_params,
+                    "required_close_route": "/realtradelifecycle/close",
+                    "read_only": True,
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                405,
+            )
+
+        query_symbol = request.args.get("symbol")
+        query_side = request.args.get("side")
+        query_bot = request.args.get("bot")
+        query_setup = request.args.get("setup")
+        identity = _rtlm_v15_identity_from_mapping(
+            {
+                "trade_id": request.args.get("trade_id"),
+                "lifecycle_id": request.args.get("lifecycle_id"),
+                "client_order_id": request.args.get("client_order_id"),
+                "broker_order_id": request.args.get("broker_order_id"),
+                "symbol": symbol or query_symbol,
+                "side": side or query_side,
+                "bot": query_bot,
+                "setup": query_setup,
+                "registry_mode": request.args.get("registry_mode"),
+                "execution_mode": request.args.get("execution_mode"),
+            }
+        )
+        strong_flow_requested = any(
+            identity.get(field)
+            for field in (
+                "trade_id",
+                "lifecycle_id",
+                "client_order_id",
+                "broker_order_id",
+            )
+        )
+        if strong_flow_requested:
+            auth = _rtlm_v15_admin_auth()
+            if auth.get("ok") is not True:
+                return _rtlm_v15_response(
+                    {
+                        "ok": False,
+                        "status": auth.get("status") or "EXECUTION_AUTH_INVALID",
+                        "read_only": True,
+                        "registry_write": False,
+                        "write_executed": False,
+                        "broker_called": False,
+                        "broker_writer_called": False,
+                        "no_order_sent_by_this_route": True,
+                    },
+                    403,
+                )
+
+        path_query_conflicts = []
+        if (
+            symbol
+            and query_symbol
+            and _rtlm_v1_norm_symbol(symbol) != _rtlm_v1_norm_symbol(query_symbol)
+        ):
+            path_query_conflicts.append("symbol")
+        if (
+            side
+            and query_side
+            and _rtlm_v1_norm_side(side) != _rtlm_v1_norm_side(query_side)
+        ):
+            path_query_conflicts.append("side")
+        if path_query_conflicts:
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "PATH_QUERY_IDENTITY_CONFLICT",
+                    "conflicting_fields": path_query_conflicts,
+                    "read_only": True,
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                400,
+            )
+
+        monitor_symbol = symbol or query_symbol or "BTCUSDT"
+        monitor_side = side or query_side or "SHORT"
+        monitor_bot = query_bot or "FALCON"
+        monitor_setup = query_setup or monitor_bot
+        if strong_flow_requested:
+            required = (
+                "trade_id",
+                "lifecycle_id",
+                "client_order_id",
+                "broker_order_id",
+                "symbol",
+                "side",
+                "bot",
+                "setup",
+                "registry_mode",
+                "execution_mode",
+            )
+            identity_complete = all(identity.get(field) for field in required)
+            modes_valid = (
+                identity.get("registry_mode") == "REAL"
+                and identity.get("execution_mode") == "LIVE"
+            )
+            lifecycle = _rtlm_v14_build_position_evidence(
+                identity,
+                perform_read=bool(identity_complete and modes_valid),
+            )
+        else:
+            lifecycle = build_real_trade_lifecycle_monitor_v1(
+                symbol=monitor_symbol,
+                side=monitor_side,
+                bot=monitor_bot,
+                setup=monitor_setup,
+                strict_read_only=True,
+            )
+        result = _rtlm_v14_apply_missing_from_bots_close(
+            lifecycle,
+            identity,
+            close_registry=False,
+            ack=None,
+        )
+        result["read_only"] = True
+        result["registry_write"] = False
+        result["write_executed"] = False
+        return _rtlm_v15_response(result, 200)
+    except Exception:
+        try:
+            app.logger.exception("realtradelifecycle GET failed")
+        except Exception:
+            pass
+        return _rtlm_v15_response(
+            {
+                "ok": False,
+                "status": "REAL_TRADE_LIFECYCLE_INTERNAL_ERROR",
+                "read_only": True,
+                "registry_write": False,
+                "write_executed": False,
+                "broker_writer_called": False,
+                "no_order_sent_by_this_route": True,
+            },
+            500,
+        )
+
+
+@app.route("/realtradelifecycle/close", methods=["POST"])
+def real_trade_lifecycle_missing_from_bots_close_v15_route():
+    try:
+        auth = _rtlm_v15_admin_auth()
+        if auth.get("ok") is not True:
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": auth.get("status") or "EXECUTION_AUTH_INVALID",
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                403,
+            )
+        if list(getattr(request, "args", {}).keys()):
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "POST_QUERY_PARAMETERS_NOT_SUPPORTED",
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                400,
+            )
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "JSON_OBJECT_REQUIRED",
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                400,
+            )
+        required_fields = (
+            "trade_id",
+            "lifecycle_id",
+            "client_order_id",
+            "broker_order_id",
+            "symbol",
+            "side",
+            "bot",
+            "setup",
+            "registry_mode",
+            "execution_mode",
+        )
+        allowed_fields = set(required_fields) | {"ack"}
+        unexpected_fields = sorted(set(body) - allowed_fields)
+        missing_fields = [
+            field
+            for field in required_fields
+            if not isinstance(body.get(field), str) or not body.get(field).strip()
+        ]
+        oversized_fields = [
+            field
+            for field in required_fields
+            if isinstance(body.get(field), str) and len(body.get(field).strip()) > 256
+        ]
+        if unexpected_fields or missing_fields or oversized_fields:
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "MISSING_FROM_BOTS_STRONG_IDENTITY_REQUIRED",
+                    "unexpected_fields": unexpected_fields,
+                    "missing_identity_fields": missing_fields,
+                    "oversized_identity_fields": oversized_fields,
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                400,
+            )
+        ack = body.get("ack")
+        if not isinstance(ack, str) or ack.strip() != "POSITION_CLOSED_CONFIRMED":
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "ACK_REQUIRED",
+                    "required_ack": "POSITION_CLOSED_CONFIRMED",
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                400,
+            )
+        identity = _rtlm_v15_identity_from_mapping(body)
+        if (
+            identity.get("registry_mode") != "REAL"
+            or identity.get("execution_mode") != "LIVE"
+        ):
+            return _rtlm_v15_response(
+                {
+                    "ok": False,
+                    "status": "MISSING_FROM_BOTS_REAL_LIVE_MODE_REQUIRED",
+                    "registry_write": False,
+                    "write_executed": False,
+                    "broker_called": False,
+                    "broker_writer_called": False,
+                    "no_order_sent_by_this_route": True,
+                },
+                400,
+            )
+        lifecycle = _rtlm_v14_build_position_evidence(identity, perform_read=True)
+        result = _rtlm_v14_apply_missing_from_bots_close(
+            lifecycle,
+            identity,
+            close_registry=True,
+            ack=ack,
+        )
+        return _rtlm_v15_response(
+            result,
+            200 if (result.get("registry_close") or {}).get("committed") is True else 409,
+        )
+    except Exception:
+        try:
+            app.logger.exception("realtradelifecycle POST close failed")
+        except Exception:
+            pass
+        return _rtlm_v15_response(
+            {
+                "ok": False,
+                "status": "REAL_TRADE_LIFECYCLE_INTERNAL_ERROR",
+                "registry_write": False,
+                "write_executed": False,
+                "broker_writer_called": False,
+                "no_order_sent_by_this_route": True,
+            },
+            500,
+        )
 
 
 @app.route("/realtradelifecycle/health", methods=["GET"])
@@ -6593,16 +8083,15 @@ def real_trade_lifecycle_monitor_v1_health():
         "tp50_resolver_version": TP50_RESOLVER_V1_VERSION,
         "notes": [
             "Monitora posição real, stop, PnL, TP50 e Registry.",
-            "Leitura segura por padrão; commit=true apenas atualiza snapshot do Registry.",
-            "repair_registry=true com ack=CENTRAL_MANAGED_EXISTING_POSITION repara o OPEN quando a posição real protegida existe.",
+            "GET é exclusivamente read-only; todos os parâmetros mutantes são bloqueados.",
+            "Preview forte exige X-Execution-Auth-Token validado exclusivamente a partir de request.headers.",
             "V1.3 + TP50 Resolver V1: resolve TP50 válido ou calcula por entrada real + stop válido; rejeita alvo incoerente.",
-            "Fechamento do Registry exige close_registry=true e ack=POSITION_CLOSED_CONFIRMED.",
+            "Fechamento MISSING_FROM_BOTS existe somente via POST /realtradelifecycle/close, JSON com identidade completa REAL/LIVE e ACK exato.",
         ],
         "routes": [
             "/realtradelifecycle/BTCUSDT/SHORT",
-            "/lifecyclemonitor/BTCUSDT/SHORT?commit=true",
-            "/lifecyclemonitor/BTCUSDT/SHORT?repair_registry=true&ack=CENTRAL_MANAGED_EXISTING_POSITION&sl=66750.9",
-            "/lifecyclemonitor/BTCUSDT/SHORT?close_registry=true&ack=POSITION_CLOSED_CONFIRMED",
+            "/realtradelifecycle?trade_id=FALCON%3AFALCON15%3AXRPUSDT%3ALONG&lifecycle_id=LC&client_order_id=CLIENT&broker_order_id=ORDER&symbol=XRPUSDT&side=LONG&bot=FALCON&setup=FALCON15&registry_mode=REAL&execution_mode=LIVE",
+            "POST /realtradelifecycle/close",
             "/realtradelifecycle/health",
         ],
     }
@@ -6728,7 +8217,63 @@ def _rp_v1_read_latest_snapshot():
         return {"ok": False, "status": "READ_ERROR", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE), "error": str(exc)}
 
 
-def _rp_v1_registry_snapshot_full():
+def _rp_v1_registry_snapshot_full(strict_read_only=False):
+    if strict_read_only:
+        reader = (
+            getattr(central_trade_registry, "load_registry_read_only", None)
+            if central_trade_registry is not None
+            else None
+        )
+        if not callable(reader):
+            return {
+                "ok": False,
+                "status": "TRADE_REGISTRY_READ_ONLY_LOADER_UNAVAILABLE",
+                "strict_read_only": True,
+                "trade_registry_loaded": central_trade_registry is not None,
+                "open_count": None,
+                "snapshot": {},
+                "raw_registry": None,
+            }
+        try:
+            raw_registry = reader()
+        except Exception:
+            return {
+                "ok": False,
+                "status": "TRADE_REGISTRY_READ_ONLY_READ_ERROR",
+                "strict_read_only": True,
+                "trade_registry_loaded": True,
+                "open_count": None,
+                "snapshot": {},
+                "raw_registry": None,
+            }
+        if not isinstance(raw_registry, dict):
+            return {
+                "ok": False,
+                "status": "TRADE_REGISTRY_READ_ONLY_INVALID",
+                "strict_read_only": True,
+                "trade_registry_loaded": True,
+                "open_count": None,
+                "snapshot": {},
+                "raw_registry": None,
+            }
+        open_trades = raw_registry.get("open_trades", {})
+        if isinstance(open_trades, (dict, list)):
+            open_count = len(open_trades)
+        else:
+            open_count = None
+        return {
+            "ok": True,
+            "status": "TRADE_REGISTRY_READ_ONLY_LOADED",
+            "strict_read_only": True,
+            "trade_registry_loaded": True,
+            "open_count": open_count,
+            "snapshot": {
+                "ok": True,
+                "open_count": open_count,
+                "strict_read_only": True,
+            },
+            "raw_registry": raw_registry,
+        }
     snap = {}
     raw_registry = None
     try:
@@ -7355,8 +8900,48 @@ def registry_persistence_v1_gate_check(current_payload=None):
 _rtlm_v13_original_build_real_trade_lifecycle_monitor_v1 = build_real_trade_lifecycle_monitor_v1
 
 
-def build_real_trade_lifecycle_monitor_v1(symbol=None, side=None, bot=None, setup=None):
-    lifecycle = _rtlm_v13_original_build_real_trade_lifecycle_monitor_v1(symbol=symbol, side=side, bot=bot, setup=setup)
+def build_real_trade_lifecycle_monitor_v1(
+    symbol=None, side=None, bot=None, setup=None, strict_read_only=False
+):
+    lifecycle = _rtlm_v13_original_build_real_trade_lifecycle_monitor_v1(
+        symbol=symbol,
+        side=side,
+        bot=bot,
+        setup=setup,
+        strict_read_only=strict_read_only,
+    )
+    if strict_read_only:
+        registry_state = _rp_v1_registry_snapshot_full(strict_read_only=True)
+        lifecycle["registry_persistence_v1"] = {
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "STRICT_READ_ONLY_PREVIEW",
+            "strict_read_only": True,
+            "registry_read_only_available": registry_state.get("ok") is True,
+            "registry_read_status": registry_state.get("status"),
+            "summary": {
+                "open_count": registry_state.get("open_count"),
+            },
+            "snapshot_save": {
+                "attempted": False,
+                "committed": False,
+                "status": "STRICT_READ_ONLY_NOT_REQUESTED",
+            },
+            "rebuild": {
+                "attempted": False,
+                "committed": False,
+                "status": "STRICT_READ_ONLY_NOT_REQUESTED",
+            },
+            "restore": {
+                "attempted": False,
+                "committed": False,
+                "status": "STRICT_READ_ONLY_NOT_REQUESTED",
+            },
+            "persistent_snapshot_accessed": False,
+            "persistent_event_written": False,
+            "registry_write": False,
+            "write_executed": False,
+        }
+        return lifecycle
     try:
         commit_snapshot = False
         rebuild_requested = False

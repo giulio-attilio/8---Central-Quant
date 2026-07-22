@@ -12,7 +12,7 @@ import time
 import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 LOGGER = logging.getLogger(__name__)
@@ -488,9 +488,17 @@ def _identity_value(trade: Dict[str, Any], field: str) -> Any:
     trade = trade if isinstance(trade, dict) else {}
     metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
     aliases = {
+        "trade_id": ("trade_id",),
         "lifecycle_id": ("lifecycle_id",),
         "order_id": ("broker_order_id", "order_id", "live_order_id", "entry_order_id"),
         "client_order_id": ("client_order_id", "clientOrderId", "client_tag"),
+        "symbol": ("symbol", "symbol_clean"),
+        "side": ("side", "direction"),
+        "bot": ("bot",),
+        "setup": ("setup", "signal_type", "setup_label"),
+        "registry_mode": ("registry_mode",),
+        "execution_mode": ("execution_mode",),
+        "status": ("status",),
     }
     for key in aliases.get(field, (field,)):
         value = trade.get(key)
@@ -499,6 +507,41 @@ def _identity_value(trade: Dict[str, Any], field: str) -> Any:
         if value not in (None, ""):
             return value
     return None
+
+
+def _identity_values(trade: Dict[str, Any], field: str) -> List[str]:
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    aliases = {
+        "trade_id": ("trade_id",),
+        "lifecycle_id": ("lifecycle_id",),
+        "order_id": ("broker_order_id", "order_id", "live_order_id", "entry_order_id"),
+        "client_order_id": ("client_order_id", "clientOrderId", "client_tag"),
+        "symbol": ("symbol", "symbol_clean"),
+        "side": ("side", "direction"),
+        "bot": ("bot",),
+        "setup": ("setup", "signal_type", "setup_label"),
+        "registry_mode": ("registry_mode",),
+        "execution_mode": ("execution_mode",),
+        "status": ("status",),
+    }
+    values: List[str] = []
+    for source in (trade, metadata):
+        for key in aliases.get(field, (field,)):
+            value = source.get(key)
+            if value in (None, ""):
+                continue
+            if field == "symbol":
+                text = _normalize_symbol(value)
+            elif field == "side":
+                text = _normalize_side(value)
+            elif field in {"bot", "setup", "registry_mode", "execution_mode", "status"}:
+                text = str(value).upper().strip()
+            else:
+                text = str(value).strip()
+            if text not in values:
+                values.append(text)
+    return values
 
 
 def record_manual_close_outcome(
@@ -663,13 +706,41 @@ def record_manual_close_outcome(
 def _identity_matches(trade: Dict[str, Any], expected_identity: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
     expected = expected_identity if isinstance(expected_identity, dict) else {}
     compared = {}
-    for field in ("lifecycle_id", "order_id", "client_order_id"):
+    for field in (
+        "trade_id",
+        "lifecycle_id",
+        "order_id",
+        "client_order_id",
+        "symbol",
+        "side",
+        "bot",
+        "setup",
+        "registry_mode",
+        "execution_mode",
+        "status",
+    ):
         expected_value = expected.get(field)
         if expected_value in (None, ""):
             continue
-        current_value = _identity_value(trade, field)
-        compared[field] = {"expected": str(expected_value), "current": None if current_value in (None, "") else str(current_value)}
-        if current_value in (None, "") or str(current_value) != str(expected_value):
+        if field == "symbol":
+            normalized_expected = _normalize_symbol(expected_value)
+        elif field == "side":
+            normalized_expected = _normalize_side(expected_value)
+        elif field in {"bot", "setup", "registry_mode", "execution_mode", "status"}:
+            normalized_expected = str(expected_value).upper().strip()
+        else:
+            normalized_expected = str(expected_value).strip()
+        current_values = _identity_values(trade, field)
+        current_value = current_values[0] if current_values else None
+        compared[field] = {
+            "expected": normalized_expected,
+            "current": None if current_value in (None, "") else str(current_value),
+            "all_current_values": current_values,
+        }
+        if (
+            not current_values
+            or any(str(value) != normalized_expected for value in current_values)
+        ):
             return False, compared
     return bool(compared), compared
 
@@ -687,11 +758,29 @@ def close_trade(
     funding: Any = None,
     broker_close_order_id: Any = None,
     expected_identity: Optional[Dict[str, Any]] = None,
+    expected_open_trade_id_count: Optional[int] = None,
     clear_financial_results: bool = False,
     **extra: Any,
 ) -> Dict[str, Any]:
     with _lock:
         registry = load_registry()
+        if expected_open_trade_id_count is not None:
+            expected_trade_id = str(trade_id or "").strip()
+            matching_open_ids = [
+                str(key)
+                for key, item in registry.get("open_trades", {}).items()
+                if isinstance(item, dict)
+                and expected_trade_id in _identity_values(item, "trade_id")
+            ]
+            if len(matching_open_ids) != int(expected_open_trade_id_count):
+                return {
+                    "ok": False,
+                    "error": "TRADE_OPEN_IDENTITY_COUNT_MISMATCH",
+                    "trade_id": trade_id,
+                    "expected_open_trade_id_count": int(expected_open_trade_id_count),
+                    "actual_open_trade_id_count": len(matching_open_ids),
+                    "matching_registry_keys": matching_open_ids,
+                }
         current = registry["open_trades"].get(trade_id)
         if current and expected_identity is not None:
             identity_ok, identity_comparison = _identity_matches(current, expected_identity)
@@ -798,7 +887,13 @@ def close_trade(
                 trade[key] = value
         trade = _normalize_trade_record(trade)
         registry["closed_trades"].append(trade)
-        save_registry(registry)
+        save_result = save_registry(registry)
+        if save_result is False:
+            return {
+                "ok": False,
+                "error": "TRADE_REGISTRY_SAVE_FAILED",
+                "trade_id": trade_id,
+            }
     _observe_shadow_registry_snapshot("CLOSE_CONFIRMED", trade)
     return {"ok": True, "action": "TRADE_CLOSED", "trade_id": trade_id, "trade": trade}
 
