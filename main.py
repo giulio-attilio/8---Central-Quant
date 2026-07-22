@@ -6515,6 +6515,19 @@ def _rtlm_v14_resolve_missing_from_bots_close(identity, lifecycle=None):
         "open_trade_id_match_count": len(trade_id_matches),
         "exact_open_match_count": len(exact_matches),
     }
+    if len(trade_id_matches) == 1:
+        trade_id_match = trade_id_matches[0]
+        result["_trade_id_match_record"] = dict(
+            trade_id_match.get("record") or {}
+        )
+        _record, match_values = _rtlm_v14_record_identity(
+            trade_id_match.get("trade"),
+            registry_key=trade_id_match.get("key"),
+        )
+        result["_trade_id_match_values"] = {
+            field: sorted(values)
+            for field, values in match_values.items()
+        }
     if len(trade_id_matches) != 1:
         result["status"] = "MISSING_FROM_BOTS_OPEN_TRADE_ID_COUNT_INVALID"
         return result
@@ -6738,7 +6751,11 @@ def _rtlm_v14_close_missing_from_bots(resolution, commit=False, ack=None):
 
 
 def _rtlm_v14_apply_missing_from_bots_close(
-    lifecycle, identity, close_registry=False, ack=None
+    lifecycle,
+    identity,
+    close_registry=False,
+    ack=None,
+    precomputed_resolution=None,
 ):
     lifecycle = dict(lifecycle or {})
     strong_identity_fields = (
@@ -6768,8 +6785,12 @@ def _rtlm_v14_apply_missing_from_bots_close(
         }
         return lifecycle
 
-    resolution = _rtlm_v14_resolve_missing_from_bots_close(
-        identity, lifecycle=lifecycle
+    resolution = (
+        precomputed_resolution
+        if isinstance(precomputed_resolution, dict)
+        else _rtlm_v14_resolve_missing_from_bots_close(
+            identity, lifecycle=lifecycle
+        )
     )
     if (
         close_registry
@@ -7745,6 +7766,80 @@ def _rtlm_v15_identity_from_mapping(mapping):
     )
 
 
+def _rtlm_v16_identity_divergence_diagnostic(resolution):
+    """Project one mismatched Registry candidate without exposing its payload."""
+
+    resolution = resolution if isinstance(resolution, dict) else {}
+    if not (
+        resolution.get("open_trade_id_match_count") == 1
+        and resolution.get("exact_open_match_count") == 0
+    ):
+        return None
+    identity = (
+        resolution.get("identity")
+        if isinstance(resolution.get("identity"), dict)
+        else {}
+    )
+    record = (
+        resolution.get("_trade_id_match_record")
+        if isinstance(resolution.get("_trade_id_match_record"), dict)
+        else {}
+    )
+    values_by_field = (
+        resolution.get("_trade_id_match_values")
+        if isinstance(resolution.get("_trade_id_match_values"), dict)
+        else {}
+    )
+    if not record:
+        return None
+    fields = (
+        "trade_id",
+        "lifecycle_id",
+        "client_order_id",
+        "broker_order_id",
+        "symbol",
+        "side",
+        "bot",
+        "setup",
+        "registry_mode",
+        "execution_mode",
+        "status",
+    )
+    comparison = {}
+    for field in fields:
+        expected = (
+            "MISSING_FROM_BOTS"
+            if field == "status"
+            else _rtlm_v14_normalize_identity_field(field, identity.get(field))
+        )
+        primary = _rtlm_v14_normalize_identity_field(
+            field, record.get(field)
+        )
+        current_values = sorted(
+            {
+                _rtlm_v14_normalize_identity_field(field, value)
+                for value in (values_by_field.get(field) or [])
+                if _rtlm_v14_normalize_identity_field(field, value)
+            }
+        )
+        if not current_values:
+            result = "MISSING"
+        elif primary == expected and current_values == [expected]:
+            result = "MATCH"
+        else:
+            result = "CONFLICT"
+        comparison[field] = {
+            "expected": expected or None,
+            "primary_value": primary or None,
+            "all_current_values": current_values,
+            "result": result,
+        }
+    return {
+        "candidate_registry_key": record.get("registry_key") or None,
+        "identity_comparison": comparison,
+    }
+
+
 @app.route("/realtradelifecycle", methods=["GET"])
 @app.route("/realtradelifecycle/<symbol>/<side>", methods=["GET"])
 @app.route("/lifecyclemonitor", methods=["GET"])
@@ -7869,6 +7964,7 @@ def real_trade_lifecycle_monitor_v1_route(symbol=None, side=None):
         monitor_side = side or query_side or "SHORT"
         monitor_bot = query_bot or "FALCON"
         monitor_setup = query_setup or monitor_bot
+        preview_resolution = None
         if strong_flow_requested:
             required = (
                 "trade_id",
@@ -7891,6 +7987,9 @@ def real_trade_lifecycle_monitor_v1_route(symbol=None, side=None):
                 identity,
                 perform_read=bool(identity_complete and modes_valid),
             )
+            preview_resolution = _rtlm_v14_resolve_missing_from_bots_close(
+                identity, lifecycle=lifecycle
+            )
         else:
             lifecycle = build_real_trade_lifecycle_monitor_v1(
                 symbol=monitor_symbol,
@@ -7904,7 +8003,13 @@ def real_trade_lifecycle_monitor_v1_route(symbol=None, side=None):
             identity,
             close_registry=False,
             ack=None,
+            precomputed_resolution=preview_resolution,
         )
+        divergence_diagnostic = _rtlm_v16_identity_divergence_diagnostic(
+            preview_resolution
+        )
+        if isinstance(divergence_diagnostic, dict):
+            result.update(divergence_diagnostic)
         result["read_only"] = True
         result["registry_write"] = False
         result["write_executed"] = False

@@ -277,6 +277,7 @@ def _function_code():
         "_rtlm_v15_response",
         "_rtlm_v15_get_mutation_parameters",
         "_rtlm_v15_identity_from_mapping",
+        "_rtlm_v16_identity_divergence_diagnostic",
         "real_trade_lifecycle_monitor_v1_route",
         "real_trade_lifecycle_missing_from_bots_close_v15_route",
     }
@@ -1555,6 +1556,8 @@ def test_http_get_strong_preview_requires_exact_header_and_never_writes():
     assert payload["read_only"] is True
     assert payload["registry_write"] is False
     assert payload["write_executed"] is False
+    assert "candidate_registry_key" not in payload
+    assert "identity_comparison" not in payload
     assert registry.state == before
     assert registry.close_calls == []
     assert registry.save_calls == 0
@@ -1564,6 +1567,118 @@ def test_http_get_strong_preview_requires_exact_header_and_never_writes():
     assert broker.auth_calls == [
         {"args": (), "kwargs": {"allow_env_fallback": False}}
     ]
+
+
+def test_http_get_reports_only_safe_identity_divergence_for_single_candidate():
+    sentinel = "DO_NOT_EXPOSE_REGISTRY_METADATA"
+    candidate = _base_trade()
+    candidate.pop("client_order_id")
+    candidate["metadata"] = {
+        "lifecycle_id": "CENTRAL-FALCON-LIFECYCLE:STALE",
+        "secret": sentinel,
+        "token": "PRIVATE-TOKEN",
+        "path": r"C:\\private\\trade_registry.json",
+    }
+    ns, registry, broker, _ = _harness(
+        open_trades={TRADE_ID: candidate}
+    )
+    client = _flask_client_for_harness(ns)
+
+    response = client.get(
+        "/realtradelifecycle",
+        query_string=_route_params(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    _assert_no_store(response)
+    payload = response.get_json()
+    assert payload["status"] == "MISSING_FROM_BOTS_EXACT_OPEN_COUNT_INVALID"
+    assert payload["registry_close"]["open_trade_id_match_count"] == 1
+    assert payload["registry_close"]["exact_open_match_count"] == 0
+    assert payload["candidate_registry_key"] == TRADE_ID
+    comparison = payload["identity_comparison"]
+    assert set(comparison) == {
+        "trade_id",
+        "lifecycle_id",
+        "client_order_id",
+        "broker_order_id",
+        "symbol",
+        "side",
+        "bot",
+        "setup",
+        "registry_mode",
+        "execution_mode",
+        "status",
+    }
+    assert comparison["trade_id"] == {
+        "expected": TRADE_ID,
+        "primary_value": TRADE_ID,
+        "all_current_values": [TRADE_ID],
+        "result": "MATCH",
+    }
+    assert comparison["lifecycle_id"] == {
+        "expected": LIFECYCLE_ID,
+        "primary_value": LIFECYCLE_ID,
+        "all_current_values": sorted(
+            [LIFECYCLE_ID, "CENTRAL-FALCON-LIFECYCLE:STALE"]
+        ),
+        "result": "CONFLICT",
+    }
+    assert comparison["client_order_id"] == {
+        "expected": CLIENT_ORDER_ID,
+        "primary_value": None,
+        "all_current_values": [],
+        "result": "MISSING",
+    }
+    for field in (
+        "broker_order_id",
+        "symbol",
+        "side",
+        "bot",
+        "setup",
+        "registry_mode",
+        "execution_mode",
+        "status",
+    ):
+        assert comparison[field]["result"] == "MATCH"
+    serialized = response.get_data(as_text=True)
+    assert "metadata" not in serialized
+    assert sentinel not in serialized
+    assert "PRIVATE-TOKEN" not in serialized
+    assert "trade_registry.json" not in serialized
+    assert '"_trade_id_match_record"' not in serialized
+    assert '"_trade_id_match_values"' not in serialized
+    assert registry.read_calls == 1
+    assert registry.legacy_load_calls == 0
+    assert registry.save_calls == 0
+    assert registry.close_calls == []
+    assert broker.position_reads == [("XRPUSDT", "LONG")]
+    assert broker.writer_calls == []
+
+
+def test_http_post_does_not_expose_get_identity_divergence_diagnostic():
+    candidate = _base_trade(lifecycle_id="WRONG-LIFECYCLE")
+    ns, registry, broker, _ = _harness(
+        open_trades={TRADE_ID: candidate}
+    )
+    client = _flask_client_for_harness(ns)
+
+    response = client.post(
+        "/realtradelifecycle/close",
+        json=_post_payload(),
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    payload = response.get_json()
+    assert payload["status"] == "MISSING_FROM_BOTS_EXACT_OPEN_COUNT_INVALID"
+    assert "candidate_registry_key" not in payload
+    assert "identity_comparison" not in payload
+    assert registry.close_calls == []
+    assert registry.save_calls == 0
+    assert broker.position_reads == [("XRPUSDT", "LONG")]
+    assert broker.writer_calls == []
 
 
 def test_http_get_strong_preview_without_token_is_403_before_private_reads():
