@@ -50175,7 +50175,7 @@ def falcon_disaster_stop_close_position_preview_route():
 # - Todas as consultas à BingX são read-only.
 # - Nenhuma rota deste bloco abre, fecha, cancela ou altera ordens.
 # - Commit só ocorre com evidência broker completa; pela rota manual exige ACK.
-REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-22-REAL-CLOSE-RECONCILIATION-V1.1-REVIEW3-FEE-TIME-CONFLICT"
+REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-23-REAL-CLOSE-RECONCILIATION-V1.1-REVIEW8-COMPLETE-SELECTED-IDENTITY"
 REAL_CLOSE_RECONCILIATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_latest.json"
 REAL_CLOSE_RECONCILIATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_events.jsonl"
 
@@ -50283,51 +50283,344 @@ def _rcrm_v1_find_closed_trade(payload=None):
     payload = payload if isinstance(payload, dict) else {}
     if central_trade_registry is None:
         return {"ok": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR}
-    trade_id = str(payload.get("trade_id") or payload.get("trade_key") or "").strip() or None
-    bot = str(payload.get("bot") or "FALCON").upper().strip()
-    symbol = _rcrm_v1_norm_symbol(payload.get("symbol") or "BTCUSDT")
-    side = _rcrm_v1_norm_side(payload.get("side") or "SHORT")
-    setup = str(payload.get("setup") or "").upper().strip() or None
-
-    getter = getattr(central_trade_registry, "get_closed_trade", None)
-    if callable(getter):
-        result = getter(trade_id=trade_id, bot=None if trade_id else bot, symbol=None if trade_id else symbol,
-                        side=None if trade_id else side, setup=None if trade_id else setup)
-        if isinstance(result, dict) and result.get("ok"):
-            return result
-        # O endpoint antigo recomenda setup=FALCON, enquanto o trade real é FALCON15.
-        if setup and not trade_id:
-            result = getter(bot=bot, symbol=symbol, side=side, setup=None)
-            if isinstance(result, dict) and result.get("ok"):
-                return result
-
+    strong_identity_state = getattr(
+        central_trade_registry, "strong_identity_alias_state", None
+    )
+    strong_identity_normalize = getattr(
+        central_trade_registry, "normalize_strong_identity_value", None
+    )
+    strong_aliases = getattr(
+        central_trade_registry, "STRONG_IDENTITY_ALIASES", None
+    )
+    if (
+        not callable(strong_identity_state)
+        or not callable(strong_identity_normalize)
+        or not isinstance(strong_aliases, dict)
+    ):
+        return {
+            "ok": False,
+            "status": "REAL_CLOSE_STRONG_IDENTITY_HELPER_UNAVAILABLE",
+            "error": "CANONICAL_STRONG_IDENTITY_HELPER_REQUIRED",
+            "complete": False,
+            "committed": False,
+        }
+    strong_fields = tuple(strong_aliases)
+    supplied_strong_states = {
+        field: dict(strong_identity_state(payload, field) or {})
+        for field in strong_fields
+    }
+    supplied_alias_conflicts = [
+        {
+            "field": field,
+            "normalized_values": list(state.get("normalized_values") or []),
+            "aliases_present": list(state.get("aliases_present") or []),
+            "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+        }
+        for field, state in supplied_strong_states.items()
+        if state.get("conflict")
+    ]
+    if supplied_alias_conflicts:
+        return {
+            "ok": False,
+            "status": "REAL_CLOSE_SUPPLIED_STRONG_IDENTITY_ALIAS_CONFLICT",
+            "complete": False,
+            "broker_complete": False,
+            "committed": False,
+            "diagnostics": {
+                "strong_identity_alias_conflicts": supplied_alias_conflicts,
+            },
+        }
+    reader = getattr(central_trade_registry, "load_registry_read_only", None)
+    if not callable(reader):
+        return {
+            "ok": False,
+            "status": "TRADE_REGISTRY_READ_ONLY_UNAVAILABLE",
+            "error": "READ_ONLY_REGISTRY_REQUIRED",
+        }
     try:
-        registry = central_trade_registry.load_registry()
-    except Exception as exc:
-        return {"ok": False, "status": "TRADE_REGISTRY_READ_ERROR", "error": str(exc)}
+        registry = reader()
+    except Exception:
+        return {
+            "ok": False,
+            "status": "TRADE_REGISTRY_READ_ERROR",
+            "error": "READ_ONLY_REGISTRY_FAILED",
+        }
     closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
     if isinstance(closed, dict):
         closed = list(closed.values())
-    matches = []
-    for index, trade in enumerate(closed if isinstance(closed, list) else []):
-        if not isinstance(trade, dict):
+    records = [trade for trade in closed if isinstance(trade, dict)] if isinstance(closed, list) else []
+
+    aliases = {
+        "trade_id": ("trade_id",),
+        "symbol": ("symbol", "symbol_clean"),
+        "side": ("side", "direction"),
+        "bot": ("bot",),
+        "setup": ("setup", "setup_label", "signal_type"),
+        "registry_mode": ("registry_mode",),
+        "execution_mode": ("execution_mode",),
+        "status": ("status",),
+    }
+    strong_state_cache = {}
+
+    def canonical_strong_state(index, trade, field):
+        cache_key = (index, field)
+        if cache_key not in strong_state_cache:
+            state = dict(strong_identity_state(trade, field) or {})
+            state.setdefault("field", field)
+            state.setdefault("normalized_values", [])
+            state.setdefault("aliases_present", [])
+            state.setdefault("present", bool(state.get("normalized_values")))
+            state.setdefault("conflict", len(state.get("normalized_values") or []) > 1)
+            if state.get("conflict"):
+                state["value"] = None
+                state["reason"] = "STRONG_IDENTITY_ALIAS_CONFLICT"
+            strong_state_cache[cache_key] = state
+        return strong_state_cache[cache_key]
+
+    def normalize(field, value):
+        if field == "symbol":
+            return _rcrm_v1_norm_symbol(value)
+        if field == "side":
+            return _rcrm_v1_norm_side(value)
+        if field == "setup":
+            return "".join(str(value or "").upper().split())
+        if field in {"bot", "registry_mode", "execution_mode", "status"}:
+            return str(value or "").upper().strip()
+        return str(value or "").strip()
+
+    def identity_values(trade, field, index=None):
+        if field in strong_fields:
+            state = canonical_strong_state(index, trade, field)
+            return list(state.get("normalized_values") or [])
+        metadata = _rcrm_v1_meta(trade)
+        values = []
+        for source in (trade, metadata):
+            for key in aliases[field]:
+                value = source.get(key)
+                if value in (None, ""):
+                    continue
+                text = normalize(field, value)
+                if text and text not in values:
+                    values.append(text)
+        return values
+
+    def snapshot(index, trade):
+        def first(field):
+            if field in strong_fields:
+                return canonical_strong_state(index, trade, field).get("value")
+            values = identity_values(trade, field, index=index)
+            return values[0] if values else None
+
+        return {
+            "registry_index": index,
+            "trade_id": first("trade_id"),
+            "lifecycle_id": first("lifecycle_id"),
+            "client_order_id": first("client_order_id"),
+            "order_id": first("order_id"),
+            "order_ids": identity_values(trade, "order_id", index=index),
+            "symbol": first("symbol"),
+            "side": first("side"),
+            "bot": first("bot"),
+            "setup": first("setup"),
+            "registry_mode": first("registry_mode"),
+            "execution_mode": first("execution_mode"),
+            "status": first("status"),
+        }
+
+    trade_id = str(payload.get("trade_id") or payload.get("trade_key") or "").strip() or None
+    lifecycle_id = supplied_strong_states.get("lifecycle_id", {}).get("value")
+    client_order_id = supplied_strong_states.get("client_order_id", {}).get("value")
+    order_id = supplied_strong_states.get("order_id", {}).get("value")
+
+    def supplied_alias_values(field):
+        values = {}
+        for alias in strong_aliases.get(field, ()):
+            normalized = strong_identity_normalize(field, payload.get(alias))
+            if normalized:
+                values[alias] = normalized
+        return values
+
+    order_aliases = supplied_alias_values("order_id")
+
+    supplied_identity = {
+        "trade_id": trade_id,
+        "lifecycle_id": lifecycle_id,
+        "client_order_id": client_order_id,
+        "order_id": order_id,
+        "order_aliases": order_aliases,
+        "symbol": _rcrm_v1_norm_symbol(payload.get("symbol")) if payload.get("symbol") else None,
+        "side": _rcrm_v1_norm_side(payload.get("side")) if payload.get("side") else None,
+        "bot": normalize("bot", payload.get("bot")) if payload.get("bot") else None,
+        "setup": normalize("setup", payload.get("setup")) if payload.get("setup") else None,
+        "registry_mode": normalize("registry_mode", payload.get("registry_mode")) if payload.get("registry_mode") else None,
+        "execution_mode": normalize("execution_mode", payload.get("execution_mode")) if payload.get("execution_mode") else None,
+    }
+
+    strong_criteria = []
+    for field, source_key in (
+        ("lifecycle_id", "lifecycle_id"),
+        ("client_order_id", "client_order_id"),
+        ("order_id", "order_id"),
+    ):
+        value = supplied_strong_states.get(field, {}).get("value")
+        if value:
+            strong_criteria.append((field, value, source_key))
+
+    weak_expected = {
+        field: supplied_identity.get(field)
+        for field in ("trade_id", "symbol", "side", "bot", "setup", "registry_mode", "execution_mode")
+        if supplied_identity.get(field)
+    }
+    alias_conflicts_by_index = {}
+    all_alias_conflicts = []
+    for index, trade in enumerate(records):
+        conflicts = []
+        for field in strong_fields:
+            state = canonical_strong_state(index, trade, field)
+            if not state.get("conflict"):
+                continue
+            conflict = {
+                "field": field,
+                "normalized_values": list(state.get("normalized_values") or []),
+                "aliases_present": list(state.get("aliases_present") or []),
+                "registry_index": index,
+                "registry_mode": normalize("registry_mode", trade.get("registry_mode")) or None,
+                "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+            }
+            conflicts.append(conflict)
+            all_alias_conflicts.append(conflict)
+        alias_conflicts_by_index[index] = conflicts
+
+    criterion_matches = []
+    for field, expected, source_key in strong_criteria:
+        indexes = {
+            index
+            for index, trade in enumerate(records)
+            if not alias_conflicts_by_index[index]
+            and canonical_strong_state(index, trade, field).get("present")
+            and canonical_strong_state(index, trade, field).get("value") == expected
+        }
+        criterion_matches.append({"field": field, "source": source_key, "value": expected, "indexes": indexes})
+
+    corrupt_strong_candidate_indexes = {
+        index
+        for index, trade in enumerate(records)
+        if alias_conflicts_by_index[index]
+        and all(
+            expected
+            in (
+                canonical_strong_state(index, trade, field).get("normalized_values")
+                or []
+            )
+            for field, expected, _source_key in strong_criteria
+        )
+    } if strong_criteria else set()
+
+    status = None
+    candidate_indexes = set()
+    if strong_criteria:
+        if any(not item["indexes"] for item in criterion_matches):
+            status = (
+                "REAL_CLOSE_STRONG_IDENTITY_ALIAS_CONFLICT"
+                if corrupt_strong_candidate_indexes
+                else "REAL_CLOSE_STRONG_IDENTITY_NOT_FOUND"
+            )
+            candidate_indexes = set(corrupt_strong_candidate_indexes)
+        else:
+            candidate_indexes = set.intersection(*(item["indexes"] for item in criterion_matches))
+            if not candidate_indexes:
+                status = (
+                    "REAL_CLOSE_STRONG_IDENTITY_ALIAS_CONFLICT"
+                    if corrupt_strong_candidate_indexes
+                    else "REAL_CLOSE_STRONG_IDENTITY_CONFLICT"
+                )
+                candidate_indexes = set(corrupt_strong_candidate_indexes)
+            elif len(candidate_indexes) > 1:
+                status = "REAL_CLOSE_STRONG_IDENTITY_AMBIGUOUS"
+    else:
+        weak_candidate_indexes = {
+            index
+            for index, trade in enumerate(records)
+            if all(
+                expected in identity_values(trade, field, index=index)
+                for field, expected in weak_expected.items()
+            )
+        }
+        candidate_indexes = set(weak_candidate_indexes)
+        if not candidate_indexes:
+            status = "CLOSED_TRADE_NOT_FOUND"
+        elif any(alias_conflicts_by_index[index] for index in candidate_indexes):
+            status = "REAL_CLOSE_STRONG_IDENTITY_ALIAS_CONFLICT"
+        elif len(candidate_indexes) > 1:
+            status = "REAL_CLOSE_STRONG_IDENTITY_AMBIGUOUS"
+
+    selected_index = None
+    selected_trade = None
+    weak_conflicts = []
+    if status is None and len(candidate_indexes) == 1:
+        selected_index = next(iter(candidate_indexes))
+        selected_trade = records[selected_index]
+        weak_conflicts = [
+            field
+            for field, expected in weak_expected.items()
+            if expected not in identity_values(selected_trade, field, index=selected_index)
+        ]
+        if weak_conflicts:
+            status = "REAL_CLOSE_STRONG_IDENTITY_CONFLICT"
+            selected_index = None
+            selected_trade = None
+            candidate_indexes = set()
+
+    rejected = []
+    for index, trade in enumerate(records):
+        if status is None and index == selected_index:
             continue
-        if trade_id and str(trade.get("trade_id") or "") != trade_id:
-            continue
-        if not trade_id:
-            if str(trade.get("bot") or "").upper().strip() != bot:
-                continue
-            if _rcrm_v1_norm_symbol(trade.get("symbol")) != symbol:
-                continue
-            if _rcrm_v1_norm_side(trade.get("side")) != side:
-                continue
-            if setup and str(trade.get("setup") or "").upper().strip() not in {setup, "FALCON15", "FALCON30"}:
-                continue
-        matches.append((index, trade))
-    if not matches:
-        return {"ok": False, "status": "CLOSED_TRADE_NOT_FOUND", "trade_id": trade_id}
-    index, trade = matches[-1]
-    return {"ok": True, "status": "CLOSED", "index": index, "trade_id": trade.get("trade_id"), "trade": trade}
+        reasons = []
+        if alias_conflicts_by_index[index]:
+            reasons.append("STRONG_IDENTITY_ALIAS_CONFLICT")
+        for criterion in criterion_matches:
+            if index not in criterion["indexes"]:
+                reasons.append(f"{criterion['source']}_MISMATCH")
+        for field, expected in weak_expected.items():
+            if expected not in identity_values(trade, field, index=index):
+                reasons.append(f"{field}_MISMATCH")
+        item = snapshot(index, trade)
+        item["reasons"] = sorted(set(reasons))
+        item["strong_identity_alias_conflicts"] = alias_conflicts_by_index[index]
+        rejected.append(item)
+
+    diagnostics = {
+        "supplied_identity": supplied_identity,
+        "matched_identity": snapshot(selected_index, selected_trade) if selected_trade else None,
+        "candidate_count_before": len(records),
+        "candidate_count_after": 1 if selected_trade is not None and status is None else len(candidate_indexes),
+        "strong_identity_supplied": bool(strong_criteria),
+        "strong_match_counts": [
+            {"field": item["field"], "source": item["source"], "match_count": len(item["indexes"])}
+            for item in criterion_matches
+        ],
+        "weak_identity_conflicts": weak_conflicts,
+        "strong_identity_alias_conflicts": all_alias_conflicts,
+        "rejected_candidate_count": len(rejected),
+        "rejected_candidates": rejected[:20],
+    }
+    if status is not None:
+        return {
+            "ok": False,
+            "status": status,
+            "trade_id": trade_id,
+            "complete": False,
+            "committed": False,
+            "diagnostics": diagnostics,
+        }
+    return {
+        "ok": True,
+        "status": "CLOSED",
+        "index": selected_index,
+        "trade_id": selected_trade.get("trade_id"),
+        "trade": selected_trade,
+        "diagnostics": diagnostics,
+    }
 
 
 def _rcrm_v1_execution_evidence(trade):
@@ -50359,17 +50652,124 @@ def _rcrm_v1_execution_evidence(trade):
     return matches[-1] if matches else None
 
 
-def _rcrm_v1_values(trade):
-    evidence = _rcrm_v1_execution_evidence(trade) or {}
-    order_id = _rcrm_v1_first(trade, "broker_order_id", "live_order_id", "order_id", "orderId")
-    client_id = _rcrm_v1_first(trade, "client_order_id", "clientOrderId", "client_tag")
-    if not order_id:
-        order_id = evidence.get("order_id") or evidence.get("id") or evidence.get("orderId")
-    if not client_id:
-        client_id = evidence.get("clientOrderId") or evidence.get("client_order_id") or evidence.get("client_tag")
+def _rcrm_v11_selected_strong_identity(trade):
+    trade = trade if isinstance(trade, dict) else {}
+    if central_trade_registry is None:
+        return {
+            "ok": False,
+            "lifecycle_id": None,
+            "client_order_id": None,
+            "order_id": None,
+            "states": {},
+            "issues": ["TRADE_REGISTRY_UNAVAILABLE"],
+        }
+    state_reader = getattr(
+        central_trade_registry, "strong_identity_alias_state", None
+    )
+    normalizer = getattr(
+        central_trade_registry, "normalize_strong_identity_value", None
+    )
+    aliases = getattr(central_trade_registry, "STRONG_IDENTITY_ALIASES", None)
+    if (
+        not callable(state_reader)
+        or not callable(normalizer)
+        or not isinstance(aliases, dict)
+    ):
+        return {
+            "ok": False,
+            "lifecycle_id": None,
+            "client_order_id": None,
+            "order_id": None,
+            "states": {},
+            "issues": ["CANONICAL_STRONG_IDENTITY_HELPER_REQUIRED"],
+        }
+    states = {}
+    issues = []
+    for field in aliases:
+        state = dict(state_reader(trade, field) or {})
+        states[field] = state
+        if state.get("conflict"):
+            issues.append(f"{field.upper()}_ALIAS_CONFLICT")
+    identity = {
+        field: normalizer(field, states.get(field, {}).get("value")) or None
+        for field in aliases
+    }
+    if not any(identity.values()):
+        issues.append("SELECTED_STRONG_IDENTITY_MISSING")
     return {
-        "order_id": str(order_id or "").strip() or None,
-        "client_order_id": str(client_id or "").strip() or None,
+        "ok": not issues,
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "client_order_id": identity.get("client_order_id"),
+        "order_id": identity.get("order_id"),
+        "states": states,
+        "issues": issues,
+        "source": "TRADE_REGISTRY_CANONICAL_ALIASES",
+    }
+
+
+def _rcrm_v1_values(
+    trade,
+    selected_identity=None,
+    allow_execution_evidence=False,
+):
+    selected_identity = (
+        selected_identity
+        if isinstance(selected_identity, dict)
+        else _rcrm_v11_selected_strong_identity(trade)
+    )
+    order_id = selected_identity.get("order_id")
+    client_id = selected_identity.get("client_order_id")
+    identity_sources = {
+        "lifecycle_id": (
+            "TRADE_REGISTRY_CANONICAL_ALIASES"
+            if selected_identity.get("lifecycle_id")
+            else None
+        ),
+        "client_order_id": (
+            "TRADE_REGISTRY_CANONICAL_ALIASES" if client_id else None
+        ),
+        "order_id": "TRADE_REGISTRY_CANONICAL_ALIASES" if order_id else None,
+    }
+    evidence = {}
+    if allow_execution_evidence and (not order_id or not client_id):
+        evidence = _rcrm_v1_execution_evidence(trade) or {}
+        if not order_id:
+            order_id = (
+                evidence.get("order_id")
+                or evidence.get("id")
+                or evidence.get("orderId")
+            )
+            if order_id:
+                identity_sources["order_id"] = "LEGACY_EXECUTION_EVIDENCE"
+        if not client_id:
+            client_id = (
+                evidence.get("clientOrderID")
+                or evidence.get("clientOrderId")
+                or evidence.get("client_order_id")
+                or evidence.get("client_tag")
+            )
+            if client_id:
+                identity_sources["client_order_id"] = "LEGACY_EXECUTION_EVIDENCE"
+    normalizer = getattr(
+        central_trade_registry, "normalize_strong_identity_value", None
+    ) if central_trade_registry is not None else None
+    return {
+        "lifecycle_id": selected_identity.get("lifecycle_id"),
+        "order_id": (
+            normalizer("order_id", order_id)
+            if callable(normalizer)
+            else str(order_id or "").strip()
+        ) or None,
+        "client_order_id": (
+            normalizer("client_order_id", client_id)
+            if callable(normalizer)
+            else str(client_id or "").strip().upper()
+        ) or None,
+        "identity_sources": identity_sources,
+        "legacy_execution_evidence_used": any(
+            source == "LEGACY_EXECUTION_EVIDENCE"
+            for source in identity_sources.values()
+        ),
         "entry": _rcrm_v1_float(_rcrm_v1_first(trade, "entry", "entry_price", "avg_entry_price")),
         "stop": _rcrm_v1_float(_rcrm_v1_first(trade, "sl", "stop", "stop_loss", "original_stop", "disaster_stop_price")),
         "qty": _rcrm_v1_float(_rcrm_v1_first(trade, "qty", "contracts", "amount", "quantity")),
@@ -50460,6 +50860,102 @@ def _rcrm_v11_manual_outcome_conflict(trade, broker_exit_price):
     }
 
 
+def _rcrm_v11_validate_broker_identity(trade, values, broker_result):
+    trade = trade if isinstance(trade, dict) else {}
+    values = values if isinstance(values, dict) else {}
+    broker_result = broker_result if isinstance(broker_result, dict) else {}
+    comparisons = {}
+    strong_normalizer = getattr(
+        central_trade_registry, "normalize_strong_identity_value", None
+    ) if central_trade_registry is not None else None
+
+    def text_comparison(field, expected, factual, normalizer=None):
+        expected_raw = str(expected or "").strip()
+        factual_raw = str(factual or "").strip()
+        expected_value = normalizer(expected_raw) if expected_raw and normalizer else expected_raw
+        factual_value = normalizer(factual_raw) if factual_raw and normalizer else factual_raw
+        if not expected_value or not factual_value:
+            result = "MISSING"
+        else:
+            result = "MATCH" if expected_value == factual_value else "CONFLICT"
+        comparisons[field] = {
+            "expected": expected_raw or None,
+            "factual": factual_raw or None,
+            "result": result,
+        }
+
+    def numeric_comparison(field, expected, factual, tolerance):
+        expected_value = _rcrm_v1_float(expected)
+        factual_value = _rcrm_v1_float(factual)
+        if expected_value is None or factual_value is None:
+            result = "MISSING"
+        else:
+            result = (
+                "MATCH"
+                if abs(expected_value - factual_value) <= tolerance(expected_value)
+                else "CONFLICT"
+            )
+        comparisons[field] = {
+            "expected": expected_value,
+            "factual": factual_value,
+            "tolerance": tolerance(expected_value) if expected_value is not None else None,
+            "result": result,
+        }
+
+    text_comparison(
+        "order_id",
+        values.get("order_id"),
+        broker_result.get("open_order_id") or broker_result.get("order_id"),
+    )
+    text_comparison(
+        "client_order_id",
+        values.get("client_order_id"),
+        broker_result.get("client_order_id")
+        or broker_result.get("clientOrderId")
+        or broker_result.get("clientOrderID"),
+        (
+            lambda value: strong_normalizer("client_order_id", value)
+            if callable(strong_normalizer)
+            else str(value or "").strip().upper()
+        ),
+    )
+    text_comparison(
+        "symbol",
+        trade.get("symbol"),
+        broker_result.get("symbol"),
+        _rcrm_v1_norm_symbol,
+    )
+    text_comparison(
+        "side",
+        trade.get("side"),
+        broker_result.get("side"),
+        _rcrm_v1_norm_side,
+    )
+    numeric_comparison(
+        "qty",
+        values.get("qty"),
+        broker_result.get("expected_qty"),
+        lambda value: max(abs(value) * 0.001, 1e-12),
+    )
+    numeric_comparison(
+        "entry_price",
+        values.get("entry"),
+        broker_result.get("entry_price"),
+        lambda value: max(abs(value) * 1e-6, 1e-8),
+    )
+    issues = [
+        f"BROKER_{field.upper()}_{item['result']}"
+        for field, item in comparisons.items()
+        if item.get("result") != "MATCH"
+    ]
+    return {
+        "ok": not issues,
+        "status": "MATCH" if not issues else "DIVERGENCE",
+        "comparisons": comparisons,
+        "issues": issues,
+    }
+
+
 def real_close_reconciliation_v1_run(payload=None, commit=False, source="route"):
     payload = payload if isinstance(payload, dict) else {}
     base = {
@@ -50477,9 +50973,80 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         return dict(base, ok=False, status="BROKER_RECONCILIATION_HELPER_UNAVAILABLE", error=BROKER_IMPORT_ERROR)
     found = _rcrm_v1_find_closed_trade(payload)
     if not found.get("ok"):
-        return dict(base, ok=False, status=found.get("status"), error=found.get("error"), trade_lookup=found)
+        logical_block = str(found.get("status") or "").startswith(
+            (
+                "REAL_CLOSE_STRONG_IDENTITY_",
+                "REAL_CLOSE_SUPPLIED_STRONG_IDENTITY_",
+            )
+        )
+        return dict(
+            base,
+            ok=logical_block,
+            status=found.get("status"),
+            error=found.get("error"),
+            complete=False,
+            broker_complete=False,
+            committed=False,
+            diagnostics=found.get("diagnostics") or {},
+            trade_lookup=found,
+        )
     trade = found.get("trade") or {}
-    values = _rcrm_v1_values(trade)
+    lookup_diagnostics = dict(found.get("diagnostics") or {})
+    selected_identity = _rcrm_v11_selected_strong_identity(trade)
+    lookup_diagnostics["selected_strong_identity"] = selected_identity
+    strong_identity_selected = bool(
+        lookup_diagnostics.get("strong_identity_supplied")
+    )
+    selection_issues = list(selected_identity.get("issues") or [])
+    supplied_identity = lookup_diagnostics.get("supplied_identity") or {}
+    strong_normalizer = getattr(
+        central_trade_registry, "normalize_strong_identity_value", None
+    ) if central_trade_registry is not None else None
+    if strong_identity_selected:
+        for field in ("lifecycle_id", "client_order_id", "order_id"):
+            selected_value = selected_identity.get(field)
+            if not selected_value:
+                selection_issues.append(f"{field.upper()}_MISSING_AFTER_SELECTION")
+            supplied_value = supplied_identity.get(field)
+            if supplied_value in (None, ""):
+                continue
+            expected = (
+                strong_normalizer(field, supplied_value)
+                if callable(strong_normalizer)
+                else str(supplied_value).strip()
+            )
+            if selected_value and selected_value != expected:
+                selection_issues.append(f"{field.upper()}_MISMATCH_AFTER_SELECTION")
+    selection_issues = list(dict.fromkeys(selection_issues))
+    if strong_identity_selected:
+        lookup_diagnostics["selected_strong_identity_issues"] = selection_issues
+    if strong_identity_selected and selection_issues:
+        return dict(
+            base,
+            ok=True,
+            status="REAL_CLOSE_SELECTED_STRONG_IDENTITY_INCOMPLETE",
+            complete=False,
+            broker_complete=False,
+            committed=False,
+            diagnostics=lookup_diagnostics,
+            selected_strong_identity=selected_identity,
+            trade_lookup=found,
+        )
+    values = _rcrm_v1_values(
+        trade,
+        selected_identity=selected_identity,
+        allow_execution_evidence=not strong_identity_selected,
+    )
+    lookup_diagnostics["identity_sources"] = values.get("identity_sources") or {}
+    lookup_diagnostics["legacy_execution_evidence_used"] = bool(
+        values.get("legacy_execution_evidence_used")
+    )
+    canonical_writer_identity = {
+        "lifecycle_id": selected_identity.get("lifecycle_id"),
+        "client_order_id": selected_identity.get("client_order_id"),
+        "order_id": selected_identity.get("order_id"),
+    }
+    legacy_writer_identity_complete = all(canonical_writer_identity.values())
     symbol = _rcrm_v1_norm_symbol(trade.get("symbol") or payload.get("symbol"))
     side = _rcrm_v1_norm_side(trade.get("side") or payload.get("side"))
     broker_result = central_broker.reconcile_closed_trade(
@@ -50492,25 +51059,41 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         qty=values.get("qty"),
         entry_price=values.get("entry"),
     )
+    broker_identity_validation = _rcrm_v11_validate_broker_identity(
+        trade,
+        values,
+        broker_result,
+    )
     entry = _rcrm_v1_float(broker_result.get("entry_price"), values.get("entry"))
     exit_price = _rcrm_v1_float(broker_result.get("exit_price"))
     qty = _rcrm_v1_float(broker_result.get("expected_qty"), values.get("qty"))
     net_pnl = _rcrm_v1_float(broker_result.get("net_pnl"))
     metrics = _rcrm_v1_metrics(side, entry, values.get("stop"), exit_price, qty, net_pnl)
     financial_dedup_ok = bool(broker_result.get("financial_dedup_ok", True))
-    broker_complete = bool(
+    broker_evidence_complete = bool(
         broker_result.get("complete")
         and financial_dedup_ok
         and values.get("order_id")
         and exit_price is not None
         and net_pnl is not None
     )
+    broker_complete = bool(
+        broker_evidence_complete and broker_identity_validation.get("ok")
+    )
     outcome_conflict = _rcrm_v11_manual_outcome_conflict(trade, exit_price)
     complete = bool(broker_complete and not outcome_conflict.get("conflict"))
+    legacy_commit_identity_blocked = bool(
+        commit
+        and complete
+        and not strong_identity_selected
+        and not legacy_writer_identity_complete
+    )
+    if legacy_commit_identity_blocked:
+        complete = False
     committed = False
     registry_update = None
     outcome = None
-    if commit and complete:
+    if commit and complete and not legacy_commit_identity_blocked:
         metadata = {
             "registry_mode": "REAL",
             "execution_mode": "LIVE",
@@ -50519,6 +51102,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "real_close_reconciliation_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
             "broker_order_id": values.get("order_id"),
             "client_order_id": values.get("client_order_id"),
+            "lifecycle_id": selected_identity.get("lifecycle_id"),
             "registry_entry_price": values.get("entry"),
             "broker_entry_price": entry,
             "broker_entry_price_source": broker_result.get("entry_price_source"),
@@ -50541,6 +51125,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         if callable(updater):
             registry_update = updater(
                 trade_id=trade.get("trade_id") or found.get("trade_id"),
+                expected_identity=dict(canonical_writer_identity),
                 registry_mode="REAL",
                 execution_mode="LIVE",
                 broker_order_id=values.get("order_id"),
@@ -50580,8 +51165,12 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             )
             committed = bool((outcome.get("commit") or {}).get("committed")) if isinstance(outcome, dict) else False
 
-    if outcome_conflict.get("conflict"):
+    if not broker_identity_validation.get("ok"):
+        status = "REAL_CLOSE_BROKER_IDENTITY_DIVERGENCE"
+    elif outcome_conflict.get("conflict"):
         status = "REAL_CLOSE_OUTCOME_CONFLICT"
+    elif legacy_commit_identity_blocked:
+        status = "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
     elif broker_result.get("status") in {
         "CLOSING_QTY_EXCEEDS_EXPECTED",
         "FEE_ASSOCIATION_INCONCLUSIVE",
@@ -50595,6 +51184,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
     result.update({
         "status": status,
         "complete": complete,
+        "broker_evidence_complete": broker_evidence_complete,
         "broker_complete": broker_complete,
         "committed": committed,
         "trade": {
@@ -50604,6 +51194,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "symbol": symbol,
             "side": side,
             "registry_mode_before": trade.get("registry_mode") or _rcrm_v1_meta(trade).get("registry_mode"),
+            "lifecycle_id": selected_identity.get("lifecycle_id"),
             "order_id": values.get("order_id"),
             "client_order_id": values.get("client_order_id"),
             "entry": entry,
@@ -50614,17 +51205,28 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         },
         "metrics": metrics,
         "broker_reconciliation": broker_result,
+        "broker_identity_validation": broker_identity_validation,
+        "diagnostics": lookup_diagnostics,
+        "selected_strong_identity": selected_identity,
         "outcome_conflict": outcome_conflict,
         "commit_blocked_reason": (
-            outcome_conflict.get("reason")
-            if outcome_conflict.get("conflict")
+            "REAL_CLOSE_BROKER_IDENTITY_DIVERGENCE"
+            if not broker_identity_validation.get("ok")
             else (
-                broker_result.get("status")
-                if broker_result.get("status") in {
-                    "CLOSING_QTY_EXCEEDS_EXPECTED",
-                    "FEE_ASSOCIATION_INCONCLUSIVE",
-                }
-                else None
+                outcome_conflict.get("reason")
+                if outcome_conflict.get("conflict")
+                else (
+                    "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
+                    if legacy_commit_identity_blocked
+                    else (
+                        broker_result.get("status")
+                        if broker_result.get("status") in {
+                            "CLOSING_QTY_EXCEEDS_EXPECTED",
+                            "FEE_ASSOCIATION_INCONCLUSIVE",
+                        }
+                        else None
+                    )
+                )
             )
         ),
         "registry_update": registry_update,
@@ -50636,6 +51238,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "V1.1 deduplica lançamentos pelo tranId e prioriza o fill real da BingX como entrada.",
             "V1.1 usa info.volume como quantidade factual raw e bloqueia excesso sobre a quantidade esperada.",
             "Fees sem orderId usam simbolo, horario, semantica opening/closing e tradeId quando disponivel; associacao multipla bloqueia o commit.",
+            "V1.1 Review 4 resolve closed trade por intersecao de lifecycle/client/order e valida Registry contra o resultado factual do Broker.",
+            "V1.1 Review 7 preserva a identidade canonica selecionada ate o Broker e o Registry writer; fallback de execution evidence fica restrito ao lookup legado.",
             "Outcome manual conflitante nunca é sobrescrito nem duplicado.",
             "Commit é bloqueado se houver colisão financeira ambígua após a deduplicação.",
         ],

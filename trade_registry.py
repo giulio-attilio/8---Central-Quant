@@ -427,13 +427,99 @@ def update_closed_trade(
     symbol: Any = None,
     side: Any = None,
     setup: Any = None,
+    expected_identity: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     **updates: Any,
 ) -> Dict[str, Any]:
     with _lock:
         registry = load_registry()
         closed_trades = registry.get("closed_trades", [])
-        index = _closed_trade_index(closed_trades, trade_id=trade_id, bot=bot, symbol=symbol, side=side, setup=setup)
+        expected = expected_identity if isinstance(expected_identity, dict) else {}
+        expected_states = {
+            field: strong_identity_alias_state(expected, field)
+            for field in STRONG_IDENTITY_ALIASES
+        }
+        expected_alias_conflicts = [
+            {
+                "field": field,
+                "normalized_values": list(state.get("normalized_values") or []),
+                "aliases_present": list(state.get("aliases_present") or []),
+                "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+            }
+            for field, state in expected_states.items()
+            if state.get("conflict")
+        ]
+        if expected_alias_conflicts:
+            return {
+                "ok": False,
+                "error": "EXPECTED_STRONG_IDENTITY_ALIAS_CONFLICT",
+                "trade_id": trade_id,
+                "alias_conflicts": expected_alias_conflicts,
+            }
+        expected_strong = {
+            field: state.get("value")
+            for field, state in expected_states.items()
+            if state.get("present") and state.get("value")
+        }
+        if expected_strong:
+            matching_indexes = []
+            alias_conflicts = []
+            for candidate_index, candidate in enumerate(closed_trades):
+                if not isinstance(candidate, dict):
+                    continue
+                if trade_id and str(candidate.get("trade_id") or "").strip() != str(trade_id).strip():
+                    continue
+                states = {
+                    field: strong_identity_alias_state(candidate, field)
+                    for field in STRONG_IDENTITY_ALIASES
+                }
+                internally_consistent = not any(
+                    state.get("conflict") for state in states.values()
+                )
+                exact_match = all(
+                    states[field].get("present")
+                    and states[field].get("value") == value
+                    for field, value in expected_strong.items()
+                )
+                if internally_consistent and exact_match:
+                    matching_indexes.append(candidate_index)
+                    continue
+                supplied_values_present = all(
+                    value in (states[field].get("normalized_values") or [])
+                    for field, value in expected_strong.items()
+                )
+                if supplied_values_present:
+                    for field, state in states.items():
+                        if not state.get("conflict"):
+                            continue
+                        alias_conflicts.append(
+                            {
+                                "field": field,
+                                "normalized_values": list(state.get("normalized_values") or []),
+                                "aliases_present": list(state.get("aliases_present") or []),
+                                "registry_index": candidate_index,
+                                "registry_mode": str(candidate.get("registry_mode") or "").upper().strip() or None,
+                                "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+                            }
+                        )
+            if not matching_indexes and alias_conflicts:
+                return {
+                    "ok": False,
+                    "error": "CLOSED_TRADE_STRONG_IDENTITY_ALIAS_CONFLICT",
+                    "trade_id": trade_id,
+                    "candidate_count": 0,
+                    "alias_conflicts": alias_conflicts,
+                }
+            if len(matching_indexes) != 1:
+                return {
+                    "ok": False,
+                    "error": "CLOSED_TRADE_STRONG_IDENTITY_COUNT_INVALID",
+                    "trade_id": trade_id,
+                    "candidate_count": len(matching_indexes),
+                }
+            index = matching_indexes[0]
+        else:
+            index = _closed_trade_index(closed_trades, trade_id=trade_id, bot=bot, symbol=symbol, side=side, setup=setup)
         if index is None:
             return {"ok": False, "error": "CLOSED_TRADE_NOT_FOUND", "trade_id": trade_id}
 
@@ -487,11 +573,11 @@ def set_trade_registry_mode(
 def _identity_value(trade: Dict[str, Any], field: str) -> Any:
     trade = trade if isinstance(trade, dict) else {}
     metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    if field in STRONG_IDENTITY_ALIASES:
+        state = strong_identity_alias_state(trade, field)
+        return state.get("value") if not state.get("conflict") else None
     aliases = {
         "trade_id": ("trade_id",),
-        "lifecycle_id": ("lifecycle_id",),
-        "order_id": ("broker_order_id", "order_id", "live_order_id", "entry_order_id"),
-        "client_order_id": ("client_order_id", "clientOrderId", "client_tag"),
         "symbol": ("symbol", "symbol_clean"),
         "side": ("side", "direction"),
         "bot": ("bot",),
@@ -513,14 +599,77 @@ def _normalize_identity_setup(value: Any) -> str:
     return "".join(str(value or "").upper().split())
 
 
+STRONG_IDENTITY_ALIASES = {
+    "lifecycle_id": ("lifecycle_id", "trade_lifecycle_id"),
+    "client_order_id": (
+        "client_order_id",
+        "clientOrderId",
+        "clientOrderID",
+        "client_tag",
+    ),
+    "order_id": (
+        "open_order_id",
+        "broker_order_id",
+        "order_id",
+        "orderId",
+        "live_order_id",
+        "entry_order_id",
+    ),
+}
+
+
+def normalize_strong_identity_value(field: str, value: Any) -> str:
+    """Normalize one strong identifier without weakening exact identity."""
+    if field not in STRONG_IDENTITY_ALIASES:
+        return ""
+    normalized = str(value or "").strip()
+    if field == "client_order_id":
+        return normalized.upper()
+    return normalized
+
+
+def strong_identity_alias_state(trade: Dict[str, Any], field: str) -> Dict[str, Any]:
+    """Return the internally consistent value for one strong identity field.
+
+    Top-level and metadata aliases are deliberately inspected together.  A
+    record containing distinct non-empty values is corrupt for strong matching;
+    callers must not select it merely because one alias happens to match.
+    """
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    aliases = STRONG_IDENTITY_ALIASES.get(field, ())
+    normalized_values: List[str] = []
+    aliases_present: List[str] = []
+    for source_name, source in (("trade", trade), ("metadata", metadata)):
+        for alias in aliases:
+            raw_value = source.get(alias)
+            if raw_value in (None, ""):
+                continue
+            value = normalize_strong_identity_value(field, raw_value)
+            if not value:
+                continue
+            aliases_present.append(f"{source_name}.{alias}")
+            if value not in normalized_values:
+                normalized_values.append(value)
+    conflict = len(normalized_values) > 1
+    return {
+        "field": field,
+        "present": bool(normalized_values),
+        "value": normalized_values[0] if len(normalized_values) == 1 else None,
+        "normalized_values": normalized_values,
+        "aliases_present": aliases_present,
+        "conflict": conflict,
+        "reason": "STRONG_IDENTITY_ALIAS_CONFLICT" if conflict else None,
+    }
+
+
 def _identity_values(trade: Dict[str, Any], field: str) -> List[str]:
     trade = trade if isinstance(trade, dict) else {}
     metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    if field in STRONG_IDENTITY_ALIASES:
+        return list(strong_identity_alias_state(trade, field).get("normalized_values") or [])
     aliases = {
         "trade_id": ("trade_id",),
-        "lifecycle_id": ("lifecycle_id",),
-        "order_id": ("broker_order_id", "order_id", "live_order_id", "entry_order_id"),
-        "client_order_id": ("client_order_id", "clientOrderId", "client_tag"),
         "symbol": ("symbol", "symbol_clean"),
         "side": ("side", "direction"),
         "bot": ("bot",),
@@ -728,7 +877,11 @@ def _identity_matches(trade: Dict[str, Any], expected_identity: Optional[Dict[st
         expected_value = expected.get(field)
         if expected_value in (None, ""):
             continue
-        if field == "symbol":
+        if field in STRONG_IDENTITY_ALIASES:
+            normalized_expected = normalize_strong_identity_value(
+                field, expected_value
+            )
+        elif field == "symbol":
             normalized_expected = _normalize_symbol(expected_value)
         elif field == "side":
             normalized_expected = _normalize_side(expected_value)
@@ -738,16 +891,38 @@ def _identity_matches(trade: Dict[str, Any], expected_identity: Optional[Dict[st
             normalized_expected = str(expected_value).upper().strip()
         else:
             normalized_expected = str(expected_value).strip()
-        current_values = _identity_values(trade, field)
-        current_value = current_values[0] if current_values else None
+        strong_state = (
+            strong_identity_alias_state(trade, field)
+            if field in STRONG_IDENTITY_ALIASES
+            else None
+        )
+        current_values = (
+            list(strong_state.get("normalized_values") or [])
+            if strong_state is not None
+            else _identity_values(trade, field)
+        )
+        current_value = (
+            strong_state.get("value")
+            if strong_state is not None
+            else (current_values[0] if current_values else None)
+        )
         compared[field] = {
             "expected": normalized_expected,
             "current": None if current_value in (None, "") else str(current_value),
             "all_current_values": current_values,
         }
+        if strong_state is not None:
+            compared[field].update(
+                {
+                    "aliases_present": list(strong_state.get("aliases_present") or []),
+                    "conflict": bool(strong_state.get("conflict")),
+                    "reason": strong_state.get("reason"),
+                }
+            )
         if (
             not current_values
-            or any(str(value) != normalized_expected for value in current_values)
+            or (strong_state is not None and strong_state.get("conflict"))
+            or current_value != normalized_expected
         ):
             return False, compared
     return bool(compared), compared
