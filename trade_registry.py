@@ -51,6 +51,8 @@ __all__ = [
     "get_trade",
     "get_closed_trade",
     "update_closed_trade",
+    "preview_historical_strong_identity_backfill",
+    "backfill_historical_strong_identity",
     "record_manual_close_outcome",
     "set_trade_registry_mode",
     "get_trade_registry_snapshot",
@@ -661,6 +663,521 @@ def strong_identity_alias_state(trade: Dict[str, Any], field: str) -> Dict[str, 
         "conflict": conflict,
         "reason": "STRONG_IDENTITY_ALIAS_CONFLICT" if conflict else None,
     }
+
+
+HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_ACK = (
+    "REAL_CLOSE_STRONG_IDENTITY_BACKFILL_V1"
+)
+HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_VERSION = (
+    "2026-07-23-HISTORICAL-STRONG-IDENTITY-BACKFILL-V1"
+)
+
+
+def _historical_backfill_float(value: Any) -> Optional[float]:
+    try:
+        if value in (None, ""):
+            return None
+        return float(str(value).replace(",", ".").strip())
+    except Exception:
+        return None
+
+
+def _historical_backfill_outcome_summary(trade: Dict[str, Any]) -> Dict[str, Any]:
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    outcome = trade.get("outcome") if isinstance(trade.get("outcome"), dict) else {}
+
+    def first(key: str) -> Any:
+        for source in (trade, metadata, outcome):
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    return {
+        "outcome_status": first("outcome_status"),
+        "outcome_source": first("outcome_source"),
+        "outcome_id": first("outcome_id"),
+        "exit_price": first("exit_price"),
+        "data_quality": first("data_quality"),
+        "financial_reconciliation_pending": first(
+            "financial_reconciliation_pending"
+        ),
+    }
+
+
+def _historical_backfill_request_state(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    strong_states = {
+        field: strong_identity_alias_state(payload, field)
+        for field in STRONG_IDENTITY_ALIASES
+    }
+    issues: List[str] = []
+    alias_conflicts = []
+    for field, state in strong_states.items():
+        if state.get("conflict"):
+            alias_conflicts.append(
+                {
+                    "field": field,
+                    "normalized_values": list(
+                        state.get("normalized_values") or []
+                    ),
+                    "aliases_present": list(state.get("aliases_present") or []),
+                    "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+                }
+            )
+        elif not state.get("present"):
+            issues.append(f"{field.upper()}_REQUIRED")
+
+    def first(*keys: str) -> Any:
+        for key in keys:
+            value = payload.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    weak = {
+        "trade_id": str(first("trade_id") or "").strip(),
+        "bot": str(first("bot") or "").upper().strip(),
+        "setup": _normalize_identity_setup(first("setup")),
+        "symbol": _normalize_symbol(first("symbol")),
+        "side": _normalize_side(first("side")),
+        "registry_mode": str(
+            first("registry_mode", "expected_registry_mode") or ""
+        ).upper().strip(),
+        "execution_mode": str(
+            first("execution_mode", "expected_execution_mode") or ""
+        ).upper().strip(),
+        "entry": _historical_backfill_float(
+            first("entry", "entry_price", "factual_entry")
+        ),
+        "qty": _historical_backfill_float(
+            first("qty", "quantity", "initial_qty", "factual_qty")
+        ),
+    }
+    for field in (
+        "trade_id",
+        "bot",
+        "setup",
+        "symbol",
+        "side",
+        "registry_mode",
+        "execution_mode",
+    ):
+        if not weak[field] or weak[field] == "UNKNOWN":
+            issues.append(f"{field.upper()}_REQUIRED")
+    if weak["entry"] is None:
+        issues.append("ENTRY_REQUIRED")
+    if weak["qty"] is None or weak["qty"] <= 0:
+        issues.append("QTY_REQUIRED")
+    if weak["registry_mode"] != "REAL":
+        issues.append("REGISTRY_MODE_REAL_REQUIRED")
+    if weak["execution_mode"] != "LIVE":
+        issues.append("EXECUTION_MODE_LIVE_REQUIRED")
+    return {
+        "ok": not issues and not alias_conflicts,
+        "weak_identity": weak,
+        "proposed_identity": {
+            field: state.get("value")
+            for field, state in strong_states.items()
+        },
+        "strong_states": strong_states,
+        "issues": list(dict.fromkeys(issues)),
+        "alias_conflicts": alias_conflicts,
+    }
+
+
+def _historical_backfill_candidate_summary(
+    index: int,
+    trade: Dict[str, Any],
+) -> Dict[str, Any]:
+    strong_states = {
+        field: strong_identity_alias_state(trade, field)
+        for field in STRONG_IDENTITY_ALIASES
+    }
+    return {
+        "registry_index": index,
+        "trade_id": str(trade.get("trade_id") or "").strip() or None,
+        "status": str(trade.get("status") or "").upper().strip() or None,
+        "bot": str(trade.get("bot") or "").upper().strip() or None,
+        "setup": trade.get("setup"),
+        "setup_canonical": _normalize_identity_setup(trade.get("setup")),
+        "symbol": _normalize_symbol(trade.get("symbol")),
+        "side": _normalize_side(trade.get("side")),
+        "registry_mode": str(trade.get("registry_mode") or "").upper().strip()
+        or None,
+        "execution_mode": str(trade.get("execution_mode") or "").upper().strip()
+        or None,
+        "entry": _historical_backfill_float(
+            trade.get("entry")
+            if trade.get("entry") not in (None, "")
+            else trade.get("entry_price")
+        ),
+        "qty": _historical_backfill_float(
+            trade.get("qty")
+            if trade.get("qty") not in (None, "")
+            else trade.get("initial_qty")
+        ),
+        "current_identity": {
+            field: state.get("value")
+            for field, state in strong_states.items()
+        },
+        "strong_identity_states": strong_states,
+        "outcome": _historical_backfill_outcome_summary(trade),
+    }
+
+
+def _historical_backfill_evaluate(
+    registry: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    request_state = _historical_backfill_request_state(payload)
+    base = {
+        "ok": True,
+        "module": "historical_strong_identity_backfill_v1",
+        "version": HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_VERSION,
+        "read_only": True,
+        "no_order_sent_by_this_route": True,
+        "broker_called": False,
+        "committed": False,
+        "candidate_count": 0,
+        "registry_index": None,
+        "proposed_identity": request_state.get("proposed_identity") or {},
+        "diagnostics": {
+            "request_issues": request_state.get("issues") or [],
+            "request_alias_conflicts": request_state.get("alias_conflicts")
+            or [],
+            "weak_identity": request_state.get("weak_identity") or {},
+            "rejected_candidates": [],
+            "identity_ownership_conflicts": [],
+        },
+    }
+    if not request_state.get("ok"):
+        return {
+            **base,
+            "ok": False,
+            "status": (
+                "STRONG_IDENTITY_ALIAS_CONFLICT"
+                if request_state.get("alias_conflicts")
+                else "HISTORICAL_STRONG_IDENTITY_BACKFILL_INVALID_REQUEST"
+            ),
+        }
+
+    weak = request_state["weak_identity"]
+    closed = registry.get("closed_trades", []) if isinstance(registry, dict) else []
+    closed = closed if isinstance(closed, list) else []
+    matching_indexes: List[int] = []
+    rejected = []
+    entry_tolerance = max(abs(weak["entry"]) * 1e-8, 1e-10)
+    qty_tolerance = max(abs(weak["qty"]) * 1e-9, 1e-12)
+    for index, trade in enumerate(closed):
+        if not isinstance(trade, dict):
+            continue
+        reasons = []
+        candidate_entry = _historical_backfill_float(
+            trade.get("entry")
+            if trade.get("entry") not in (None, "")
+            else trade.get("entry_price")
+        )
+        candidate_qty = _historical_backfill_float(
+            trade.get("qty")
+            if trade.get("qty") not in (None, "")
+            else trade.get("initial_qty")
+        )
+        comparisons = (
+            (
+                "TRADE_ID_MISMATCH",
+                str(trade.get("trade_id") or "").strip() == weak["trade_id"],
+            ),
+            (
+                "BOT_MISMATCH",
+                str(trade.get("bot") or "").upper().strip() == weak["bot"],
+            ),
+            (
+                "SETUP_MISMATCH",
+                _normalize_identity_setup(trade.get("setup")) == weak["setup"],
+            ),
+            (
+                "SYMBOL_MISMATCH",
+                _normalize_symbol(trade.get("symbol")) == weak["symbol"],
+            ),
+            (
+                "SIDE_MISMATCH",
+                _normalize_side(trade.get("side")) == weak["side"],
+            ),
+            (
+                "REGISTRY_MODE_NOT_REAL",
+                str(trade.get("registry_mode") or "").upper().strip()
+                == "REAL",
+            ),
+            (
+                "EXECUTION_MODE_NOT_LIVE",
+                str(trade.get("execution_mode") or "").upper().strip()
+                == "LIVE",
+            ),
+            (
+                "STATUS_NOT_CLOSED",
+                str(trade.get("status") or "").upper().strip() == "CLOSED",
+            ),
+            (
+                "ENTRY_DIVERGENCE",
+                candidate_entry is not None
+                and abs(candidate_entry - weak["entry"]) <= entry_tolerance,
+            ),
+            (
+                "QTY_DIVERGENCE",
+                candidate_qty is not None
+                and abs(candidate_qty - weak["qty"]) <= qty_tolerance,
+            ),
+        )
+        reasons.extend(reason for reason, matched in comparisons if not matched)
+        if reasons:
+            if str(trade.get("trade_id") or "").strip() == weak["trade_id"]:
+                rejected.append(
+                    {
+                        "registry_index": index,
+                        "registry_mode": str(
+                            trade.get("registry_mode") or ""
+                        ).upper().strip()
+                        or None,
+                        "execution_mode": str(
+                            trade.get("execution_mode") or ""
+                        ).upper().strip()
+                        or None,
+                        "reasons": reasons,
+                    }
+                )
+            continue
+        matching_indexes.append(index)
+
+    base["candidate_count"] = len(matching_indexes)
+    base["diagnostics"]["rejected_candidates"] = rejected[:50]
+    base["diagnostics"]["entry_tolerance"] = entry_tolerance
+    base["diagnostics"]["qty_tolerance"] = qty_tolerance
+    if not matching_indexes:
+        return {
+            **base,
+            "status": "HISTORICAL_STRONG_IDENTITY_BACKFILL_NOT_FOUND",
+        }
+    if len(matching_indexes) != 1:
+        return {
+            **base,
+            "status": "HISTORICAL_STRONG_IDENTITY_BACKFILL_AMBIGUOUS",
+        }
+
+    index = matching_indexes[0]
+    trade = closed[index]
+    candidate = _historical_backfill_candidate_summary(index, trade)
+    base["registry_index"] = index
+    base["candidate"] = candidate
+    base["current_identity"] = candidate["current_identity"]
+    base["outcome"] = candidate["outcome"]
+    proposed = request_state["proposed_identity"]
+    current_states = candidate["strong_identity_states"]
+    candidate_conflicts = [
+        {
+            "field": field,
+            "normalized_values": list(state.get("normalized_values") or []),
+            "aliases_present": list(state.get("aliases_present") or []),
+            "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+        }
+        for field, state in current_states.items()
+        if state.get("conflict")
+    ]
+    mismatches = [
+        {
+            "field": field,
+            "current": state.get("value"),
+            "proposed": proposed.get(field),
+            "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+        }
+        for field, state in current_states.items()
+        if state.get("present")
+        and not state.get("conflict")
+        and state.get("value") != proposed.get(field)
+    ]
+    if candidate_conflicts or mismatches:
+        base["diagnostics"]["candidate_alias_conflicts"] = candidate_conflicts
+        base["diagnostics"]["candidate_identity_mismatches"] = mismatches
+        return {**base, "status": "STRONG_IDENTITY_ALIAS_CONFLICT"}
+
+    ownership_conflicts = []
+    open_trades = registry.get("open_trades", {}) if isinstance(registry, dict) else {}
+    records = []
+    if isinstance(open_trades, dict):
+        records.extend(
+            ("open_trades", key, value)
+            for key, value in open_trades.items()
+            if isinstance(value, dict)
+        )
+    records.extend(
+        ("closed_trades", other_index, value)
+        for other_index, value in enumerate(closed)
+        if isinstance(value, dict) and other_index != index
+    )
+    for source, record_key, other in records:
+        for field, expected in proposed.items():
+            state = strong_identity_alias_state(other, field)
+            if expected not in (state.get("normalized_values") or []):
+                continue
+            ownership_conflicts.append(
+                {
+                    "source": source,
+                    "registry_key": record_key,
+                    "field": field,
+                    "registry_mode": str(
+                        other.get("registry_mode") or ""
+                    ).upper().strip()
+                    or None,
+                    "has_manual_outcome": bool(
+                        str(
+                            _historical_backfill_outcome_summary(other).get(
+                                "outcome_source"
+                            )
+                            or ""
+                        ).upper()
+                        == "MANUAL_CLOSE_RECONCILIATION"
+                    ),
+                    "reason": "STRONG_IDENTITY_ALREADY_ASSIGNED",
+                }
+            )
+    if ownership_conflicts:
+        base["diagnostics"][
+            "identity_ownership_conflicts"
+        ] = ownership_conflicts
+        return {**base, "status": "STRONG_IDENTITY_ALIAS_CONFLICT"}
+
+    already_backfilled = all(
+        current_states[field].get("present")
+        and current_states[field].get("value") == proposed[field]
+        for field in STRONG_IDENTITY_ALIASES
+    )
+    return {
+        **base,
+        "status": (
+            "ALREADY_BACKFILLED"
+            if already_backfilled
+            else "HISTORICAL_STRONG_IDENTITY_BACKFILL_READY"
+        ),
+        "safe_to_commit": True,
+        "already_backfilled": already_backfilled,
+    }
+
+
+def preview_historical_strong_identity_backfill(
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Read-only preview for one historical CLOSED Registry record."""
+    try:
+        registry = load_registry_read_only()
+        return _historical_backfill_evaluate(registry, payload)
+    except Exception:
+        return {
+            "ok": False,
+            "module": "historical_strong_identity_backfill_v1",
+            "version": HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_VERSION,
+            "status": "TRADE_REGISTRY_READ_ERROR",
+            "read_only": True,
+            "no_order_sent_by_this_route": True,
+            "broker_called": False,
+            "committed": False,
+        }
+
+
+def backfill_historical_strong_identity(
+    payload: Dict[str, Any],
+    *,
+    ack: Any = None,
+) -> Dict[str, Any]:
+    """Atomically backfill strong aliases without changing trade economics."""
+    if str(ack or "").strip() != HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_ACK:
+        return {
+            "ok": False,
+            "module": "historical_strong_identity_backfill_v1",
+            "version": HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_VERSION,
+            "status": "ACK_REQUIRED",
+            "required_ack": HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_ACK,
+            "no_order_sent_by_this_route": True,
+            "broker_called": False,
+            "committed": False,
+        }
+    with _lock:
+        registry = load_registry()
+        evaluated = _historical_backfill_evaluate(registry, payload)
+        if evaluated.get("status") == "ALREADY_BACKFILLED":
+            return {**evaluated, "read_only": False, "committed": False}
+        if (
+            evaluated.get("status")
+            != "HISTORICAL_STRONG_IDENTITY_BACKFILL_READY"
+            or not evaluated.get("safe_to_commit")
+        ):
+            return {**evaluated, "read_only": False, "committed": False}
+
+        index = evaluated["registry_index"]
+        proposed = evaluated["proposed_identity"]
+        closed = registry.get("closed_trades", [])
+        trade = dict(closed[index])
+        before_financial = {
+            key: copy.deepcopy(trade.get(key))
+            for key in (
+                "trade_id",
+                "entry",
+                "entry_price",
+                "qty",
+                "initial_qty",
+                "exit",
+                "exit_price",
+                "outcome",
+                "pnl",
+                "pnl_pct",
+                "pnl_r",
+                "status",
+                "closed_at",
+                "close_timestamp",
+            )
+        }
+        trade.update(
+            {
+                "lifecycle_id": proposed["lifecycle_id"],
+                "client_order_id": proposed["client_order_id"],
+                "broker_order_id": proposed["order_id"],
+                "order_id": proposed["order_id"],
+                "open_order_id": proposed["order_id"],
+                "registry_mode": "REAL",
+                "execution_mode": "LIVE",
+            }
+        )
+        metadata = dict(trade.get("metadata") or {})
+        metadata["historical_strong_identity_backfill_v1"] = {
+            "version": HISTORICAL_STRONG_IDENTITY_BACKFILL_V1_VERSION,
+            "applied_at": _now(),
+            "source": "REAL_CLOSE_RECONCILIATION_ADMINISTRATIVE_BACKFILL",
+            "registry_index": index,
+            "proposed_identity": copy.deepcopy(proposed),
+        }
+        trade["metadata"] = metadata
+        after_financial = {
+            key: copy.deepcopy(trade.get(key))
+            for key in before_financial
+        }
+        if before_financial != after_financial:
+            return {
+                **evaluated,
+                "ok": False,
+                "status": "FINANCIAL_FIELDS_CHANGED_DURING_BACKFILL",
+                "read_only": False,
+                "committed": False,
+            }
+        closed[index] = trade
+        registry["closed_trades"] = closed
+        save_registry(registry)
+        result = _historical_backfill_evaluate(registry, payload)
+        return {
+            **result,
+            "status": "HISTORICAL_STRONG_IDENTITY_BACKFILLED",
+            "read_only": False,
+            "committed": True,
+        }
 
 
 def _identity_values(trade: Dict[str, Any], field: str) -> List[str]:

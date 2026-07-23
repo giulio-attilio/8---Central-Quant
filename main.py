@@ -51310,6 +51310,88 @@ def real_close_reconciliation_v1_route():
     return result, 200 if result.get("ok") else 500
 
 
+REAL_CLOSE_IDENTITY_BACKFILL_V1_ACK = "REAL_CLOSE_STRONG_IDENTITY_BACKFILL_V1"
+
+
+@app.route("/realcloseidentitybackfill", methods=["GET"])
+def real_close_identity_backfill_v1_route():
+    payload = dict(request.args.items())
+    commit_requested = _rcrm_v1_bool(payload.get("commit"), False)
+    ack = str(payload.get("ack") or "").strip()
+    base = {
+        "ok": True,
+        "module": "historical_strong_identity_backfill_v1",
+        "no_order_sent_by_this_route": True,
+        "broker_called": False,
+        "committed": False,
+    }
+    if central_trade_registry is None:
+        return {
+            **base,
+            "ok": False,
+            "status": "TRADE_REGISTRY_UNAVAILABLE",
+        }, 503
+    preview = getattr(
+        central_trade_registry,
+        "preview_historical_strong_identity_backfill",
+        None,
+    )
+    writer = getattr(
+        central_trade_registry,
+        "backfill_historical_strong_identity",
+        None,
+    )
+    if not callable(preview) or not callable(writer):
+        return {
+            **base,
+            "ok": False,
+            "status": "HISTORICAL_STRONG_IDENTITY_BACKFILL_HELPER_UNAVAILABLE",
+        }, 503
+    if commit_requested:
+        auth_guard = globals().get("_rtlm_v15_admin_auth")
+        if not callable(auth_guard):
+            return {
+                **base,
+                "ok": False,
+                "status": "EXECUTION_AUTH_UNAVAILABLE",
+            }, 403
+        auth_result = auth_guard()
+        if not isinstance(auth_result, dict) or not auth_result.get("ok"):
+            return {
+                **base,
+                "ok": False,
+                "status": (
+                    auth_result.get("status")
+                    if isinstance(auth_result, dict)
+                    else "EXECUTION_AUTH_INVALID"
+                ),
+            }, 403
+        if ack != REAL_CLOSE_IDENTITY_BACKFILL_V1_ACK:
+            return {
+                **base,
+                "ok": False,
+                "status": "ACK_REQUIRED",
+                "required_ack": REAL_CLOSE_IDENTITY_BACKFILL_V1_ACK,
+            }, 400
+    try:
+        result = (
+            writer(payload, ack=ack)
+            if commit_requested
+            else preview(payload)
+        )
+    except Exception:
+        return {
+            **base,
+            "ok": False,
+            "status": "HISTORICAL_STRONG_IDENTITY_BACKFILL_INTERNAL_ERROR",
+        }, 500
+    result = dict(result or {})
+    result["no_order_sent_by_this_route"] = True
+    result["broker_called"] = False
+    result.setdefault("committed", False)
+    return result, 200
+
+
 # Health leve: evita que /realpositionwatchdog/health execute a varredura profunda de ordens.
 def real_position_watchdog_v1_health_payload():
     try:
