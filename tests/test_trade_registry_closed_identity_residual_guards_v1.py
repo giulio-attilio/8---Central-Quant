@@ -333,6 +333,8 @@ def test_closed_identity_financial_conflicts_routes_are_read_only_and_show_field
             "closed_trades": [real, verify],
         },
         merge_closed_trade_records=registry_module.merge_closed_trade_records,
+        CLOSED_TRADE_FINANCIAL_ALIAS_FAMILIES=
+            registry_module.CLOSED_TRADE_FINANCIAL_ALIAS_FAMILIES,
         load_registry=lambda: pytest.fail("mutating loader called"),
         save_registry=lambda payload: pytest.fail("registry writer called"),
     )
@@ -347,6 +349,7 @@ def test_closed_identity_financial_conflicts_routes_are_read_only_and_show_field
             "_trpsf_v1_closed_trade_financial_source_values",
             "_trpsf_v1_closed_trade_outcome_summary",
             "_trpsf_v1_closed_trade_conflict_record_summary",
+            "_trpsf_v1_closed_trade_financial_conflict_sources",
             "trade_registry_closed_identity_financial_conflicts_v1",
             "build_trade_registry_closed_identity_financial_conflicts_v1_text",
             "trade_registry_closed_identity_financial_conflicts_v1_route",

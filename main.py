@@ -49991,6 +49991,65 @@ def _trpsf_v1_closed_trade_conflict_record_summary(index, trade, state):
     }
 
 
+def _trpsf_v1_closed_trade_financial_conflict_sources(trade):
+    if not isinstance(trade, dict):
+        return {}
+    alias_families = getattr(
+        central_trade_registry,
+        "CLOSED_TRADE_FINANCIAL_ALIAS_FAMILIES",
+        {},
+    )
+    sources = {}
+    containers = [
+        ("trade", trade),
+        (
+            "trade.metadata",
+            trade.get("metadata") if isinstance(trade.get("metadata"), dict) else None,
+        ),
+        (
+            "trade.outcome",
+            trade.get("outcome") if isinstance(trade.get("outcome"), dict) else None,
+        ),
+        (
+            "trade.metadata.outcome",
+            trade.get("metadata")
+            if isinstance(trade.get("metadata"), dict)
+            else {}
+        ),
+        ("trade.raw", trade.get("raw") if isinstance(trade.get("raw"), dict) else None),
+        (
+            "trade.source_event",
+            trade.get("source_event")
+            if isinstance(trade.get("source_event"), dict)
+            else None,
+        ),
+    ]
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    metadata_outcome = (
+        metadata.get("outcome") if isinstance(metadata.get("outcome"), dict) else None
+    )
+    containers[3] = ("trade.metadata.outcome", metadata_outcome)
+    for canonical, aliases in (alias_families or {}).items():
+        for alias in aliases:
+            for container_name, container in containers:
+                if not isinstance(container, dict):
+                    continue
+                if alias not in container:
+                    continue
+                value = container.get(alias)
+                if value in (None, "", [], {}):
+                    continue
+                sources.setdefault(canonical, []).append(
+                    {
+                        "canonical_field": canonical,
+                        "alias": alias,
+                        "path": f"{container_name}.{alias}",
+                        "value": value,
+                    }
+                )
+    return sources
+
+
 def trade_registry_closed_identity_financial_conflicts_v1():
     base = {
         "ok": False,
@@ -50064,8 +50123,10 @@ def trade_registry_closed_identity_financial_conflicts_v1():
                 for index, trade, state in group
             ]
             conflicting_values_by_field = {}
+            conflicting_value_sources_by_field = {}
             for field in conflict.get("financial_conflict_fields") or []:
                 value_set = set()
+                sources = []
                 for _, trade, _ in group:
                     for value in (
                         _trpsf_v1_closed_trade_financial_source_values(
@@ -50074,9 +50135,17 @@ def trade_registry_closed_identity_financial_conflicts_v1():
                         or []
                     ):
                         value_set.add(value)
+                    for source in (
+                        _trpsf_v1_closed_trade_financial_conflict_sources(
+                            trade
+                        ).get(field)
+                        or []
+                    ):
+                        sources.append(source)
                 conflicting_values_by_field[field] = sorted(
                     value_set, key=lambda v: str(v)
                 )
+                conflicting_value_sources_by_field[field] = sources
             conflict_entries.append(
                 {
                     "conflict_index": conflict_index,
@@ -50099,6 +50168,7 @@ def trade_registry_closed_identity_financial_conflicts_v1():
                         for _, _, state in group
                     ],
                     "conflicting_values_by_field": conflicting_values_by_field,
+                    "conflicting_value_sources_by_field": conflicting_value_sources_by_field,
                     "records": records,
                 }
             )
@@ -50169,6 +50239,16 @@ def build_trade_registry_closed_identity_financial_conflicts_v1_text():
                     f"net_pnl={record.get('net_pnl')}"
                 )
             )
+        for field, sources in (conflict.get("conflicting_value_sources_by_field") or {}).items():
+            for source in sources:
+                lines.append(
+                    (
+                        f"field={field} "
+                        f"path={source.get('path')} "
+                        f"alias={source.get('alias')} "
+                        f"value={source.get('value')}"
+                    )
+                )
     return "\n".join(lines)
 
 
