@@ -49902,6 +49902,276 @@ def build_trade_registry_closed_identity_audit_v1_text():
     return "\n".join(lines)
 
 
+def _trpsf_v1_closed_trade_financial_source_values(record):
+    values = {}
+    if not isinstance(record, dict):
+        return values
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
+    metadata_outcome = (
+        metadata.get("outcome") if isinstance(metadata.get("outcome"), dict) else {}
+    )
+    alias_families = getattr(
+        central_trade_registry,
+        "CLOSED_TRADE_FINANCIAL_ALIAS_FAMILIES",
+        {},
+    )
+    for source in (record, metadata, outcome, metadata_outcome):
+        if not isinstance(source, dict):
+            continue
+        for canonical, aliases in alias_families.items():
+            for alias in aliases:
+                value = source.get(alias)
+                if value in (None, "", [], {}):
+                    continue
+                values.setdefault(canonical, set()).add(value)
+    return {key: sorted(values[key], key=lambda v: str(v)) for key in values}
+
+
+def _trpsf_v1_closed_trade_outcome_summary(record):
+    if not isinstance(record, dict):
+        return {
+            "outcome_status": None,
+            "outcome_source": None,
+            "outcome_id": None,
+            "data_quality": None,
+        }
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
+    metadata_outcome = (
+        metadata.get("outcome") if isinstance(metadata.get("outcome"), dict) else {}
+    )
+    def first_field(field):
+        for source in (record, outcome, metadata, metadata_outcome):
+            value = source.get(field)
+            if value not in (None, "", [], {}):
+                return value
+        return None
+
+    return {
+        "outcome_status": first_field("outcome_status"),
+        "outcome_source": first_field("outcome_source"),
+        "outcome_id": first_field("outcome_id"),
+        "data_quality": first_field("data_quality"),
+    }
+
+
+def _trpsf_v1_closed_trade_conflict_record_summary(index, trade, state):
+    outcome = _trpsf_v1_closed_trade_outcome_summary(trade)
+    financial_values = _trpsf_v1_closed_trade_financial_source_values(trade)
+    return {
+        "registry_index": index,
+        "fingerprint": str(state.get("fingerprint") or ""),
+        "bot": trade.get("bot"),
+        "setup": trade.get("setup"),
+        "symbol": trade.get("symbol"),
+        "side": trade.get("side"),
+        "registry_mode": trade.get("registry_mode"),
+        "execution_mode": trade.get("execution_mode"),
+        "lifecycle_id": trade.get("lifecycle_id"),
+        "client_order_id": trade.get("client_order_id"),
+        "order_id": trade.get("order_id"),
+        "closed_at": trade.get("closed_at"),
+        "entry": trade.get("entry"),
+        "qty": trade.get("qty"),
+        "exit_price": next(
+            iter(financial_values.get("exit_price") or []),
+            None,
+        ),
+        "pnl": next(iter(financial_values.get("pnl") or []), None),
+        "pnl_pct": next(iter(financial_values.get("pnl_pct") or []), None),
+        "pnl_r": next(iter(financial_values.get("pnl_r") or []), None),
+        "fees": next(iter(financial_values.get("fees") or []), None),
+        "funding": next(iter(financial_values.get("funding") or []), None),
+        "net_pnl": next(iter(financial_values.get("net_pnl_usdt") or []), None),
+        "outcome_status": outcome.get("outcome_status"),
+        "outcome_source": outcome.get("outcome_source"),
+        "outcome_id": outcome.get("outcome_id"),
+        "data_quality": outcome.get("data_quality"),
+    }
+
+
+def trade_registry_closed_identity_financial_conflicts_v1():
+    base = {
+        "ok": False,
+        "status": "CLOSED_IDENTITY_AUDIT_UNAVAILABLE",
+        "version": "2026-07-23-CLOSED-TRADE-IDENTITY-AUDIT-V1",
+        "read_only": True,
+        "write_executed": False,
+        "registry_write": False,
+        "automatic_changes": False,
+        "broker_called": False,
+        "no_order_sent_by_this_route": True,
+        "conflict_count": 0,
+        "financial_conflict_count": 0,
+        "safe_to_commit": False,
+    }
+    loader = (
+        getattr(central_trade_registry, "load_registry_raw_read_only", None)
+        if central_trade_registry is not None
+        else None
+    )
+    merge_helper = (
+        getattr(central_trade_registry, "merge_closed_trade_records", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(loader) or not callable(merge_helper):
+        base["reason"] = "READ_ONLY_REGISTRY_OR_IDENTITY_HELPER_UNAVAILABLE"
+        return base
+    try:
+        registry = loader()
+        if not isinstance(registry, dict):
+            base["reason"] = "READ_ONLY_REGISTRY_INVALID"
+            return base
+        shape_errors = _trpsf_v1_registry_shape_errors(registry)
+        if shape_errors:
+            base.update(
+                {
+                    "status": "CLOSED_IDENTITY_AUDIT_INVALID_REGISTRY_SHAPE",
+                    "reason": "READ_ONLY_REGISTRY_INVALID_SHAPE",
+                    "source_shape_errors": shape_errors,
+                    "migration_compatible": False,
+                    "safe_to_commit": False,
+                }
+            )
+            return base
+        closed = _trpsf_v1_iter_trades(
+            registry.get("closed_trades"),
+            preserve_closed_collection_keys=True,
+        )
+        sources = [str(index) for index in range(len(closed))]
+        result = merge_helper(closed, sources=sources)
+        diagnostics = (
+            dict(result.get("diagnostics") or {})
+            if isinstance(result, dict)
+            else {}
+        )
+        conflicts = list(diagnostics.get("financial_conflicts") or [])
+        groups = {}
+        states = [_closed_trade_identity_state_v1(trade) for trade in closed]
+        for index, (trade, state) in enumerate(zip(closed, states)):
+            canonical = str(state.get("canonical_key") or "")
+            groups.setdefault(canonical, []).append((index, trade, state))
+        conflict_entries = []
+        for conflict_index, conflict in enumerate(conflicts):
+            canonical = str(conflict.get("canonical_key") or "")
+            group = groups.get(canonical) or []
+            records = [
+                _trpsf_v1_closed_trade_conflict_record_summary(
+                    index, trade, state
+                )
+                for index, trade, state in group
+            ]
+            conflicting_values_by_field = {}
+            for field in conflict.get("financial_conflict_fields") or []:
+                value_set = set()
+                for _, trade, _ in group:
+                    for value in (
+                        _trpsf_v1_closed_trade_financial_source_values(
+                            trade
+                        ).get(field)
+                        or []
+                    ):
+                        value_set.add(value)
+                conflicting_values_by_field[field] = sorted(
+                    value_set, key=lambda v: str(v)
+                )
+            conflict_entries.append(
+                {
+                    "conflict_index": conflict_index,
+                    "reason": str(conflict.get("reason") or ""),
+                    "financial_conflict_fields": list(
+                        conflict.get("financial_conflict_fields") or []
+                    ),
+                    "financial_difference_fields": list(
+                        conflict.get("financial_difference_fields") or []
+                    ),
+                    "identity": canonical,
+                    "canonical_key": canonical,
+                    "trade_id": str(conflict.get("trade_id") or ""),
+                    "record_count": len(group),
+                    "registry_indexes_envolvidos": [
+                        index for index, _, _ in group
+                    ],
+                    "source_fingerprints": [
+                        str(state.get("fingerprint") or "")
+                        for _, _, state in group
+                    ],
+                    "conflicting_values_by_field": conflicting_values_by_field,
+                    "records": records,
+                }
+            )
+        base.update(
+            {
+                "ok": True,
+                "status": (
+                    "CLOSED_IDENTITY_NO_FINANCIAL_CONFLICTS"
+                    if not conflict_entries
+                    else "CLOSED_IDENTITY_FINANCIAL_CONFLICTS_DETECTED"
+                ),
+                "current_closed_count": len(closed),
+                "financial_conflict_count": sum(
+                    len(item.get("financial_conflict_fields") or [])
+                    for item in conflicts
+                ),
+                "conflict_count": len(conflict_entries),
+                "conflicts": conflict_entries,
+                "safe_to_commit": False if conflict_entries else bool(
+                    diagnostics.get("safe_to_commit")
+                ),
+                "migration_compatible": False if conflict_entries else bool(
+                    diagnostics.get("safe_to_commit")
+                ),
+            }
+        )
+        return base
+    except Exception as exc:
+        base["reason"] = "CLOSED_IDENTITY_AUDIT_READ_ERROR"
+        base["error_type"] = type(exc).__name__
+        return base
+
+
+def build_trade_registry_closed_identity_financial_conflicts_v1_text():
+    payload = trade_registry_closed_identity_financial_conflicts_v1()
+    lines = [
+        "TRADE REGISTRY CLOSED IDENTITY FINANCIAL CONFLICTS V1",
+        f"status={payload.get('status')}",
+        f"read_only={payload.get('read_only')}",
+        f"write_executed={payload.get('write_executed')}",
+        f"registry_write={payload.get('registry_write')}",
+        f"broker_called={payload.get('broker_called')}",
+        f"no_order_sent_by_this_route={payload.get('no_order_sent_by_this_route')}",
+        f"conflict_count={payload.get('conflict_count')}",
+        f"financial_conflict_count={payload.get('financial_conflict_count')}",
+        f"safe_to_commit={payload.get('safe_to_commit')}",
+    ]
+    for conflict in payload.get("conflicts") or []:
+        lines.append(
+            (
+                f"conflict_index={conflict.get('conflict_index')} "
+                f"trade_id={conflict.get('trade_id')} "
+                f"identity={conflict.get('identity')} "
+                f"fields={','.join(conflict.get('financial_conflict_fields') or [])}"
+            )
+        )
+        for record in conflict.get("records") or []:
+            lines.append(
+                (
+                    f"record_index={record.get('registry_index')} "
+                    f"symbol={record.get('symbol')} "
+                    f"side={record.get('side')} "
+                    f"exit_price={record.get('exit_price')} "
+                    f"pnl={record.get('pnl')} "
+                    f"pnl_pct={record.get('pnl_pct')} "
+                    f"fees={record.get('fees')} "
+                    f"funding={record.get('funding')} "
+                    f"net_pnl={record.get('net_pnl')}"
+                )
+            )
+    return "\n".join(lines)
+
+
 try:
     trade_registry_persistent_storage_fix_v1_status(force=False)
 except Exception:
@@ -50154,6 +50424,32 @@ def trade_registry_closed_identity_audit_v1_route():
 def trade_registry_closed_identity_audit_v1_text_route():
     return (
         build_trade_registry_closed_identity_audit_v1_text(),
+        200,
+        {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.route("/traderegistry/closedidentity/conflicts", methods=["GET"])
+@app.route("/trade_registry/closedidentity/conflicts", methods=["GET"])
+@app.route("/trades/closedidentity/conflicts", methods=["GET"])
+def trade_registry_closed_identity_financial_conflicts_v1_route():
+    return (
+        trade_registry_closed_identity_financial_conflicts_v1(),
+        200,
+        {"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.route("/traderegistry/closedidentity/conflicts/text", methods=["GET"])
+@app.route("/trade_registry/closedidentity/conflicts/text", methods=["GET"])
+@app.route("/trades/closedidentity/conflicts/text", methods=["GET"])
+def trade_registry_closed_identity_financial_conflicts_v1_text_route():
+    return (
+        build_trade_registry_closed_identity_financial_conflicts_v1_text(),
         200,
         {
             "Content-Type": "text/plain; charset=utf-8",

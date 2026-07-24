@@ -274,3 +274,152 @@ def test_read_only_closed_identity_audit_rejects_malformed_raw_record_before_mer
     assert payload["write_executed"] is False
     assert payload["registry_write"] is False
     assert not (tmp_path / "trade_registry.json").exists()
+
+
+def test_closed_identity_financial_conflicts_routes_are_read_only_and_show_fields(
+    registry_module,
+):
+    real = {
+        "trade_id": "FALCON:FALCON15:XRPUSDT:LONG",
+        "status": "CLOSED",
+        "bot": "FALCON",
+        "setup": "FALCON15",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+        "registry_mode": "REAL",
+        "execution_mode": "LIVE",
+        "lifecycle_id": "LC-REAL-1",
+        "client_order_id": "CLIENT-REAL-1",
+        "order_id": "ORDER-REAL-1",
+        "entry": 1.0871,
+        "qty": 9,
+        "closed_at": "2026-07-18T18:37:00-03:00",
+        "outcome_status": "OUTCOME_RECORDED",
+        "outcome_source": "MANUAL_CLOSE_RECONCILIATION",
+        "outcome_id": "OUTCOME-REAL-1",
+        "exit_price": 1.0902,
+        "pnl_pct": 0.2851623585686696,
+        "fees": 0.5,
+        "funding": 0.0,
+        "net_pnl": 0.25,
+    }
+    verify = {
+        "trade_id": "FALCON:FALCON15:XRPUSDT:LONG",
+        "status": "CLOSED",
+        "bot": "FALCON",
+        "setup": "FALCON15",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+        "registry_mode": "REAL",
+        "execution_mode": "LIVE",
+        "lifecycle_id": "LC-REAL-1",
+        "client_order_id": "CLIENT-REAL-1",
+        "order_id": "ORDER-REAL-1",
+        "entry": 1.0871,
+        "qty": 9,
+        "closed_at": "2026-07-18T18:37:00-03:00",
+        "outcome_status": "OUTCOME_RECORDED",
+        "outcome_source": "MANUAL_CLOSE_RECONCILIATION",
+        "outcome_id": "OUTCOME-REAL-2",
+        "exit_price": 1.0910,
+        "pnl_pct": 0.3051623585686696,
+        "fees": 0.6,
+        "funding": 0.0,
+        "net_pnl": 0.35,
+    }
+    module = SimpleNamespace(
+        load_registry_raw_read_only=lambda: {
+            "open_trades": {},
+            "closed_trades": [real, verify],
+        },
+        merge_closed_trade_records=registry_module.merge_closed_trade_records,
+        load_registry=lambda: pytest.fail("mutating loader called"),
+        save_registry=lambda payload: pytest.fail("registry writer called"),
+    )
+    namespace = {
+        "central_trade_registry": module,
+        "_trpsf_v1_registry_shape_errors": lambda registry: [],
+        "_trpsf_v1_iter_trades": lambda value, preserve_closed_collection_keys=False: list(value or []),
+        "_closed_trade_identity_state_v1": registry_module.closed_trade_identity_state,
+    }
+    _compile_main_functions(
+        [
+            "_trpsf_v1_closed_trade_financial_source_values",
+            "_trpsf_v1_closed_trade_outcome_summary",
+            "_trpsf_v1_closed_trade_conflict_record_summary",
+            "trade_registry_closed_identity_financial_conflicts_v1",
+            "build_trade_registry_closed_identity_financial_conflicts_v1_text",
+            "trade_registry_closed_identity_financial_conflicts_v1_route",
+            "trade_registry_closed_identity_financial_conflicts_v1_text_route",
+        ],
+        namespace,
+    )
+    payload = namespace["trade_registry_closed_identity_financial_conflicts_v1"]()
+    assert payload["read_only"] is True
+    assert payload["write_executed"] is False
+    assert payload["registry_write"] is False
+    assert payload["broker_called"] is False
+    assert payload["no_order_sent_by_this_route"] is True
+    assert payload["safe_to_commit"] is False
+    assert payload["conflict_count"] == 1
+    assert payload["financial_conflict_count"] == 5
+    assert payload["conflicts"][0]["conflict_index"] == 0
+    assert payload["conflicts"][0]["trade_id"] == real["trade_id"]
+    assert "exit_price" in payload["conflicts"][0]["conflicting_values_by_field"]
+    assert "pnl_pct" in payload["conflicts"][0]["conflicting_values_by_field"]
+    assert payload["conflicts"][0]["records"][0]["bot"] == "FALCON"
+    assert payload["conflicts"][0]["records"][0]["registry_index"] == 0
+
+    text, status, headers = namespace["trade_registry_closed_identity_financial_conflicts_v1_text_route"]()
+    assert status == 200
+    assert "conflict_index=0" in text
+    assert "trade_id=FALCON:FALCON15:XRPUSDT:LONG" in text
+    assert "exit_price=" in text
+    assert "pnl_pct=" in text
+    assert "no_order_sent_by_this_route=True" in text
+
+
+def test_closed_identity_financial_conflicts_block_when_registry_shape_invalid(
+    registry_module,
+):
+    module = SimpleNamespace(
+        load_registry_raw_read_only=lambda: {
+            "open_trades": {},
+            "closed_trades": ["invalid"],
+        },
+        merge_closed_trade_records=registry_module.merge_closed_trade_records,
+        load_registry=lambda: pytest.fail("mutating loader called"),
+        save_registry=lambda payload: pytest.fail("registry writer called"),
+    )
+    namespace = {
+        "central_trade_registry": module,
+        "_trpsf_v1_registry_shape_errors": lambda registry: ["CLOSED_TRADES_INVALID_RECORD"],
+        "_trpsf_v1_iter_trades": lambda value, preserve_closed_collection_keys=False: pytest.fail(
+            "raw records must be shape-validated before conversion"
+        ),
+    }
+    _compile_main_functions(
+        ["trade_registry_closed_identity_financial_conflicts_v1"],
+        namespace,
+    )
+
+    payload = namespace["trade_registry_closed_identity_financial_conflicts_v1"]()
+    assert payload["read_only"] is True
+    assert payload["write_executed"] is False
+    assert payload["registry_write"] is False
+    assert payload["status"] == "CLOSED_IDENTITY_AUDIT_INVALID_REGISTRY_SHAPE"
+    assert payload["reason"] == "READ_ONLY_REGISTRY_INVALID_SHAPE"
+
+
+def test_closed_identity_financial_conflicts_block_when_helpers_missing():
+    namespace = {"central_trade_registry": SimpleNamespace()}
+    _compile_main_functions(
+        ["trade_registry_closed_identity_financial_conflicts_v1"],
+        namespace,
+    )
+    payload = namespace["trade_registry_closed_identity_financial_conflicts_v1"]()
+    assert payload["ok"] is False
+    assert payload["reason"] == "READ_ONLY_REGISTRY_OR_IDENTITY_HELPER_UNAVAILABLE"
+    assert payload["read_only"] is True
+    assert payload["write_executed"] is False
+    assert payload["registry_write"] is False
