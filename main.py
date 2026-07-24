@@ -4223,7 +4223,14 @@ def _trs_v1_manual_register_open_trade(candidate):
     open_trades[str(trade_id)] = trade
     registry["open_trades"] = open_trades
     registry["updated_at"] = now
-    central_trade_registry.save_registry(registry)
+    registry_write = central_trade_registry.save_registry(registry)
+    if registry_write is False:
+        return {
+            "ok": False,
+            "trade_id": str(trade_id),
+            "method": "manual_save_registry",
+            "error": "REGISTRY_SAVE_NOT_CONFIRMED",
+        }
     return {"ok": True, "trade_id": str(trade_id), "trade": trade, "method": "manual_save_registry"}
 
 def trade_registry_sync_v1_register_candidate(candidate, commit=True):
@@ -6978,7 +6985,9 @@ def _rtlm_v1_update_open_trade_snapshot(symbol=None, side=None, bot=None, setup=
         return {"attempted": True, "committed": False, "status": "NO_MATCHING_OPEN_TRADE"}
     registry["updated_at"] = now
     try:
-        central_trade_registry.save_registry(registry)
+        registry_write = central_trade_registry.save_registry(registry)
+        if registry_write is False:
+            raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
     except Exception as exc:
         return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
     return {"attempted": True, "committed": True, "status": "OPEN_TRADE_SNAPSHOT_UPDATED", "updated_keys": updated}
@@ -8261,6 +8270,9 @@ def real_trade_lifecycle_monitor_v1_health():
 REGISTRY_PERSISTENCE_V1_VERSION = "2026-07-06-REGISTRY-PERSISTENCE-V1.3"
 REGISTRY_PERSISTENCE_V1_LATEST_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_latest.json"
 REGISTRY_PERSISTENCE_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "registry_persistence_v1_events.jsonl"
+REGISTRY_PERSISTENCE_V1_PRE_RESTORE_BACKUP_FILE = (
+    CENTRAL_DATA_DIR / "registry_persistence_v1_pre_restore_backup.json"
+)
 
 
 def _rp_v1_now():
@@ -8363,7 +8375,15 @@ def _rp_v1_read_latest_snapshot():
     try:
         if not REGISTRY_PERSISTENCE_V1_LATEST_FILE.exists():
             return {"ok": False, "status": "NO_LATEST_SNAPSHOT", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
-        payload = json.loads(REGISTRY_PERSISTENCE_V1_LATEST_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(
+            REGISTRY_PERSISTENCE_V1_LATEST_FILE.read_text(encoding="utf-8")
+        )
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "status": "INVALID_SNAPSHOT",
+                "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE),
+            }
         return {"ok": True, "status": "LOADED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE), "snapshot": payload}
     except Exception as exc:
         return {"ok": False, "status": "READ_ERROR", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE), "error": str(exc)}
@@ -8428,15 +8448,31 @@ def _rp_v1_registry_snapshot_full(strict_read_only=False):
         }
     snap = {}
     raw_registry = None
+    registry_read_status = "TRADE_REGISTRY_UNAVAILABLE"
     try:
         snap = central_trade_registry_snapshot(include_trades=True) if callable(globals().get("central_trade_registry_snapshot")) else {}
     except Exception as exc:
         snap = {"ok": False, "snapshot_error": str(exc)}
-    try:
-        if central_trade_registry is not None and callable(getattr(central_trade_registry, "load_registry", None)):
-            raw_registry = central_trade_registry.load_registry()
-    except Exception as exc:
-        raw_registry = {"_load_error": str(exc)}
+    loader = (
+        getattr(central_trade_registry, "load_registry", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(loader):
+        registry_read_status = "TRADE_REGISTRY_LOADER_UNAVAILABLE"
+    else:
+        try:
+            raw_registry = loader()
+            registry_read_status = "TRADE_REGISTRY_LOADED"
+        except Exception:
+            raw_registry = None
+            registry_read_status = "TRADE_REGISTRY_READ_ERROR"
+    registry_read_known = bool(
+        isinstance(raw_registry, dict)
+        and "_load_error" not in raw_registry
+    )
+    if not registry_read_known and registry_read_status == "TRADE_REGISTRY_LOADED":
+        registry_read_status = "TRADE_REGISTRY_INVALID"
     open_count = None
     try:
         open_count = len((raw_registry or {}).get("open_trades") or {}) if isinstance(raw_registry, dict) else None
@@ -8448,7 +8484,9 @@ def _rp_v1_registry_snapshot_full(strict_read_only=False):
     except Exception:
         file_path = None
     return {
-        "ok": bool(central_trade_registry is not None),
+        "ok": registry_read_known,
+        "status": registry_read_status,
+        "registry_read_known": registry_read_known,
         "trade_registry_loaded": central_trade_registry is not None,
         "trade_registry_import_error": TRADE_REGISTRY_IMPORT_ERROR if "TRADE_REGISTRY_IMPORT_ERROR" in globals() else None,
         "trade_registry_file": file_path,
@@ -8479,17 +8517,122 @@ def _rp_v13_as_list(value):
     return []
 
 
+def _closed_trade_identity_state_v1(trade):
+    helper = (
+        getattr(central_trade_registry, "closed_trade_identity_state", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if callable(helper):
+        try:
+            return helper(trade if isinstance(trade, dict) else {})
+        except Exception:
+            pass
+    record = dict(trade or {}) if isinstance(trade, dict) else {}
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "version": "CLOSED-TRADE-IDENTITY-HELPER-UNAVAILABLE",
+        "canonical_key": "unmerged|" + fingerprint,
+        "identity_kind": "HELPER_UNAVAILABLE_PRESERVED",
+        "merge_tokens": [],
+        "fingerprint": fingerprint,
+        "trade_id": str(record.get("trade_id") or ""),
+        "has_alias_conflict": False,
+        "alias_conflicts": [],
+    }
+
+
+def _merge_closed_trade_records_v1(records, sources=None):
+    records = [dict(item) for item in (records or []) if isinstance(item, dict)]
+    helper = (
+        getattr(central_trade_registry, "merge_closed_trade_records", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if callable(helper):
+        try:
+            return helper(records, sources=sources)
+        except Exception as exc:
+            error = type(exc).__name__
+    else:
+        error = "HELPER_UNAVAILABLE"
+    preserved = sorted(
+        records,
+        key=lambda item: (
+            str(_closed_trade_identity_state_v1(item).get("canonical_key") or ""),
+            str(_closed_trade_identity_state_v1(item).get("fingerprint") or ""),
+        ),
+    )
+    return {
+        "records": preserved,
+        "diagnostics": {
+            "version": "CLOSED-TRADE-IDENTITY-FAIL-SAFE-PRESERVE-ALL",
+            "input_record_count": len(records),
+            "output_record_count": len(preserved),
+            "distinct_execution_count": len(preserved),
+            "duplicate_execution_copy_count": 0,
+            "helper_available": False,
+            "helper_error": error,
+            "protected": True,
+            "safe_to_commit": False,
+        },
+    }
+
+
+def _closed_trade_record_relation_v1(left, right):
+    """Classify two CLOSED records without treating a key as proof."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return "DISTINCT"
+    result = _merge_closed_trade_records_v1(
+        [left, right],
+        sources=["equivalence_left", "equivalence_right"],
+    )
+    records = (
+        result.get("records")
+        if isinstance(result, dict) and isinstance(result.get("records"), list)
+        else []
+    )
+    diagnostics = (
+        result.get("diagnostics")
+        if isinstance(result, dict)
+        and isinstance(result.get("diagnostics"), dict)
+        else {}
+    )
+    if (
+        diagnostics.get("safe_to_commit") is True
+        and len(records) == 1
+    ):
+        return "EQUIVALENT"
+    left_state = _closed_trade_identity_state_v1(left)
+    right_state = _closed_trade_identity_state_v1(right)
+    left_key = str(left_state.get("canonical_key") or "")
+    right_key = str(right_state.get("canonical_key") or "")
+    shared_tokens = set(left_state.get("merge_tokens") or []) & set(
+        right_state.get("merge_tokens") or []
+    )
+    if (left_key and left_key == right_key) or shared_tokens:
+        return "CONFLICT"
+    return "DISTINCT"
+
+
+def _closed_trade_records_equivalent_v1(left, right):
+    """Return True only when the canonical merge proves one safe execution."""
+    return _closed_trade_record_relation_v1(left, right) == "EQUIVALENT"
+
+
 def _rp_v13_trade_key(trade, fallback=None):
     if isinstance(trade, dict):
-        key = trade.get("trade_id") or trade.get("id") or trade.get("key")
+        key = _closed_trade_identity_state_v1(trade).get("canonical_key")
         if key:
             return str(key)
-        bot = str(trade.get("bot") or "").upper().strip()
-        setup = str(trade.get("setup") or bot or "").upper().strip()
-        symbol = _rp_v1_norm_symbol(trade.get("symbol") or "")
-        side = _rp_v1_norm_side(trade.get("side") or "")
-        if bot and setup and symbol and side:
-            return f"{bot}:{setup}:{symbol}:{side}"
     return str(fallback) if fallback is not None else None
 
 
@@ -8498,19 +8641,78 @@ def _rp_v13_closed_pairs_from_obj(closed_obj, source="unknown"):
     if isinstance(closed_obj, dict):
         for key, trade in closed_obj.items():
             if isinstance(trade, dict):
-                k = _rp_v13_trade_key(trade, key)
                 t = dict(trade)
-                t.setdefault("trade_id", k)
+                key_text = str(key or "").strip()
+                trade_id = str(t.get("trade_id") or "").strip()
+                if key_text and not trade_id and ":" in key_text:
+                    t["trade_id"] = key_text
+                    trade_id = key_text
+                elif key_text and key_text != trade_id:
+                    t["registry_collection_key"] = key_text
+                k = _rp_v13_trade_key(t, key)
                 pairs.append((k, t, source))
     elif isinstance(closed_obj, list):
         for idx, trade in enumerate(closed_obj):
             if isinstance(trade, dict):
-                k = _rp_v13_trade_key(trade, idx)
                 t = dict(trade)
-                if k:
-                    t.setdefault("trade_id", k)
+                k = _rp_v13_trade_key(t, idx)
                 pairs.append((k, t, source))
     return [(k, t, s) for k, t, s in pairs if k]
+
+
+def _rp_v13_closed_collection_errors(closed_obj, source):
+    if closed_obj is None:
+        return []
+    if not isinstance(closed_obj, (dict, list)):
+        return [f"{source}_INVALID_SHAPE"]
+    values = (
+        list(closed_obj.values())
+        if isinstance(closed_obj, dict)
+        else list(closed_obj)
+    )
+    if any(not isinstance(value, dict) for value in values):
+        return [f"{source}_INVALID_RECORD"]
+    return []
+
+
+def _rp_v13_snapshot_payload_errors(snapshot_payload):
+    if snapshot_payload is None:
+        return []
+    if not isinstance(snapshot_payload, dict):
+        return ["LATEST_SNAPSHOT_INVALID"]
+    errors = []
+    registry_state = snapshot_payload.get("registry_state")
+    if registry_state is not None and not isinstance(registry_state, dict):
+        errors.append("LATEST_SNAPSHOT_REGISTRY_STATE_INVALID")
+        return errors
+    registry_state = registry_state or {}
+    raw = registry_state.get("raw_registry")
+    if raw is not None and not isinstance(raw, dict):
+        errors.append("LATEST_SNAPSHOT_RAW_REGISTRY_INVALID")
+    elif isinstance(raw, dict):
+        if raw.get("open_trades") is not None and not isinstance(
+            raw.get("open_trades"), dict
+        ):
+            errors.append("LATEST_SNAPSHOT_OPEN_TRADES_INVALID")
+        errors.extend(
+            _rp_v13_closed_collection_errors(
+                raw.get("closed_trades"),
+                "LATEST_SNAPSHOT_RAW_CLOSED_TRADES",
+            )
+        )
+    snapshot_projection = registry_state.get("snapshot")
+    if snapshot_projection is not None and not isinstance(
+        snapshot_projection, dict
+    ):
+        errors.append("LATEST_SNAPSHOT_PROJECTION_INVALID")
+    elif isinstance(snapshot_projection, dict):
+        errors.extend(
+            _rp_v13_closed_collection_errors(
+                snapshot_projection.get("closed_trades"),
+                "LATEST_SNAPSHOT_PROJECTED_CLOSED_TRADES",
+            )
+        )
+    return sorted(set(errors))
 
 
 def _rp_v13_closed_pairs_from_snapshot_payload(snapshot_payload, source="latest_snapshot"):
@@ -8527,6 +8729,8 @@ def _rp_v13_closed_pairs_from_snapshot_payload(snapshot_payload, source="latest_
 
 def _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome"):
     if not isinstance(outcome, dict) or not outcome.get("ok"):
+        return None
+    if outcome.get("identity_has_alias_conflict"):
         return None
     trade_id = outcome.get("trade_id") or outcome.get("trade_key")
     symbol = _rp_v1_norm_symbol(outcome.get("symbol") or "")
@@ -8546,6 +8750,13 @@ def _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome"):
         "side": side,
         "status": "CLOSED",
         "source": source,
+        "registry_mode": outcome.get("registry_mode"),
+        "execution_mode": outcome.get("execution_mode"),
+        "lifecycle_id": outcome.get("lifecycle_id"),
+        "client_order_id": outcome.get("client_order_id"),
+        "broker_order_id": outcome.get("broker_order_id") or outcome.get("order_id"),
+        "order_id": outcome.get("order_id") or outcome.get("broker_order_id"),
+        "opened_at": outcome.get("opened_at"),
         "entry": outcome.get("entry"),
         "exit_price": outcome.get("exit_price"),
         "exit_price_source": outcome.get("exit_price_source"),
@@ -8563,7 +8774,10 @@ def _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome"):
         "outcome_status": outcome.get("status") or "OUTCOME_EVALUATED",
         "outcome_data_quality": outcome.get("data_quality"),
         "outcome_version": outcome.get("version") or globals().get("TRADE_CLOSE_OUTCOME_V1_VERSION"),
-        "closed_at": outcome.get("generated_at") or now,
+        "closed_at": (
+            outcome.get("closed_at")
+            or outcome.get("close_timestamp")
+        ),
         "last_update": outcome.get("generated_at") or now,
         "metadata": {
             "recovered_from_outcome_event": True,
@@ -8575,12 +8789,39 @@ def _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome"):
             "outcome": outcome,
         },
     }
+    for field in (
+        "registry_record_id",
+        "historical_record_id",
+        "closed_trade_id",
+        "record_id",
+        "position_id",
+        "falcon_position_id",
+        "execution_attempt_id",
+        "attempt_id",
+        "execution_id",
+        "trade_uuid",
+        "position_uuid",
+    ):
+        if outcome.get(field) not in (None, ""):
+            trade[field] = outcome.get(field)
+    identity_helper = globals().get("_closed_trade_identity_state_v1")
+    if callable(identity_helper):
+        identity_state = identity_helper(trade)
+        if (
+            identity_state.get("has_alias_conflict")
+            or identity_state.get("invalid_closed_status")
+            or identity_state.get("identity_kind")
+            == "LEGACY_INCOMPLETE_EXACT_ONLY"
+        ):
+            return None
     return trade
 
 
-def _rp_v13_closed_pairs_from_outcome_files():
+def _rp_v13_closed_pairs_from_outcome_files_with_status():
     pairs = []
-    seen = set()
+    malformed_count = 0
+    rejected_count = 0
+    read_errors = []
     # Eventos preservam todos os outcomes salvos; latest preserva apenas o último, mas serve como fallback.
     try:
         path = globals().get("TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE")
@@ -8592,25 +8833,49 @@ def _rp_v13_closed_pairs_from_outcome_files():
                 try:
                     outcome = json.loads(line)
                 except Exception:
+                    malformed_count += 1
+                    continue
+                if not isinstance(outcome, dict):
+                    malformed_count += 1
                     continue
                 trade = _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome_events")
                 key = _rp_v13_trade_key(trade) if trade else None
                 if trade and key:
                     pairs.append((key, trade, "trade_close_outcome_events"))
-                    seen.add(key)
+                elif isinstance(outcome, dict) and outcome.get("ok"):
+                    rejected_count += 1
     except Exception:
-        pass
+        read_errors.append("TRADE_CLOSE_OUTCOME_EVENTS_READ_ERROR")
     try:
         path = globals().get("TRADE_CLOSE_OUTCOME_V1_LATEST_FILE")
         if path and Path(path).exists():
             outcome = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(outcome, dict):
+                read_errors.append("TRADE_CLOSE_OUTCOME_LATEST_INVALID")
+                outcome = None
             trade = _rp_v13_outcome_to_closed_trade(outcome, source="trade_close_outcome_latest")
             key = _rp_v13_trade_key(trade) if trade else None
-            if trade and key and key not in seen:
+            if trade and key:
                 pairs.append((key, trade, "trade_close_outcome_latest"))
+            elif isinstance(outcome, dict) and outcome.get("ok"):
+                rejected_count += 1
     except Exception:
-        pass
-    return pairs
+        read_errors.append("TRADE_CLOSE_OUTCOME_LATEST_READ_ERROR")
+    if malformed_count:
+        read_errors.append("TRADE_CLOSE_OUTCOME_EVENTS_MALFORMED")
+    if rejected_count:
+        read_errors.append("TRADE_CLOSE_OUTCOME_IDENTITY_REJECTED")
+    return {
+        "pairs": pairs,
+        "safe_to_commit": not bool(read_errors),
+        "read_errors": sorted(set(read_errors)),
+        "malformed_count": malformed_count,
+        "rejected_count": rejected_count,
+    }
+
+
+def _rp_v13_closed_pairs_from_outcome_files():
+    return _rp_v13_closed_pairs_from_outcome_files_with_status().get("pairs") or []
 
 
 def _rp_v13_trade_score(trade):
@@ -8646,60 +8911,169 @@ def _rp_v13_merge_trade(existing, incoming):
     if not isinstance(incoming, dict):
         return dict(existing)
     # Se incoming é claramente melhor, ele vira base; caso contrário preserva existing.
-    if _rp_v13_trade_score(incoming) > _rp_v13_trade_score(existing):
-        base, extra = dict(incoming), existing
-    else:
-        base, extra = dict(existing), incoming
-    for k, v in (extra or {}).items():
-        if base.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
-            base[k] = v
-    meta = base.get("metadata") if isinstance(base.get("metadata"), dict) else {}
-    extra_meta = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
-    for k, v in extra_meta.items():
-        if meta.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
-            meta[k] = v
-    if meta:
-        base["metadata"] = meta
-    return base
+    result = _merge_closed_trade_records_v1([existing, incoming])
+    rows = result.get("records") if isinstance(result, dict) else []
+    if len(rows) == 1:
+        return dict(rows[0])
+    # Persistence uses the list-aware helper below.  This compatibility helper
+    # must never fuse two distinct executions into a hybrid record.
+    ordered = sorted(
+        (dict(existing), dict(incoming)),
+        key=lambda item: json.dumps(
+            item, ensure_ascii=False, sort_keys=True, default=str
+        ),
+    )
+    return ordered[0]
 
 
 def _rp_v13_merge_closed_history(raw_registry, latest_snapshot_payload=None):
-    raw = dict(raw_registry or {}) if isinstance(raw_registry, dict) else {"ok": True, "open_trades": {}, "closed_trades": []}
+    if not isinstance(raw_registry, dict) or "_load_error" in raw_registry:
+        return None, {
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "attempted": False,
+            "current_closed_count_before": None,
+            "merged_closed_count": None,
+            "recovered_closed_count": None,
+            "sources_by_trade": {},
+            "closed_identity": {
+                "safe_to_commit": False,
+                "source_read_errors": ["TRADE_REGISTRY_READ_UNKNOWN"],
+            },
+            "protected": False,
+            "status": "TRADE_REGISTRY_READ_UNKNOWN",
+        }
+    open_shape = raw_registry.get("open_trades")
+    closed_shape = raw_registry.get("closed_trades")
+    if (
+        open_shape is not None
+        and not isinstance(open_shape, dict)
+    ) or (
+        closed_shape is not None
+        and not isinstance(closed_shape, (dict, list))
+    ):
+        return None, {
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "attempted": False,
+            "current_closed_count_before": None,
+            "merged_closed_count": None,
+            "recovered_closed_count": None,
+            "sources_by_trade": {},
+            "closed_identity": {
+                "safe_to_commit": False,
+                "source_read_errors": ["TRADE_REGISTRY_INVALID_SHAPE"],
+            },
+            "protected": False,
+            "status": "TRADE_REGISTRY_INVALID_SHAPE",
+        }
+    current_collection_errors = _rp_v13_closed_collection_errors(
+        closed_shape,
+        "TRADE_REGISTRY_CLOSED_TRADES",
+    )
+    if current_collection_errors:
+        return None, {
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "attempted": False,
+            "current_closed_count_before": None,
+            "merged_closed_count": None,
+            "recovered_closed_count": None,
+            "sources_by_trade": {},
+            "closed_identity": {
+                "safe_to_commit": False,
+                "source_read_errors": current_collection_errors,
+            },
+            "protected": False,
+            "status": "TRADE_REGISTRY_INVALID_RECORD",
+        }
+    raw = dict(raw_registry)
+    snapshot_source_errors = _rp_v13_snapshot_payload_errors(
+        latest_snapshot_payload
+    )
     existing_closed_obj = raw.get("closed_trades")
-    merged = {}
-    sources = {}
-    for key, trade, source in _rp_v13_closed_pairs_from_obj(existing_closed_obj, source="current_registry"):
-        merged[key] = _rp_v13_merge_trade(merged.get(key), trade)
-        sources.setdefault(key, []).append(source)
-    for key, trade, source in _rp_v13_closed_pairs_from_snapshot_payload(latest_snapshot_payload, source="latest_snapshot"):
-        merged[key] = _rp_v13_merge_trade(merged.get(key), trade)
-        sources.setdefault(key, []).append(source)
-    for key, trade, source in _rp_v13_closed_pairs_from_outcome_files():
-        merged[key] = _rp_v13_merge_trade(merged.get(key), trade)
-        sources.setdefault(key, []).append(source)
+    pairs = []
+    pairs.extend(
+        _rp_v13_closed_pairs_from_obj(
+            existing_closed_obj, source="current_registry"
+        )
+    )
+    pairs.extend(
+        _rp_v13_closed_pairs_from_snapshot_payload(
+            latest_snapshot_payload, source="latest_snapshot"
+        )
+    )
+    outcome_status_loader = globals().get(
+        "_rp_v13_closed_pairs_from_outcome_files_with_status"
+    )
+    if callable(outcome_status_loader):
+        outcome_status = outcome_status_loader()
+        outcome_pairs = (
+            outcome_status.get("pairs")
+            if isinstance(outcome_status, dict)
+            else []
+        )
+    else:
+        outcome_status = {
+            "pairs": _rp_v13_closed_pairs_from_outcome_files(),
+            "safe_to_commit": True,
+            "read_errors": [],
+            "malformed_count": 0,
+            "rejected_count": 0,
+        }
+        outcome_pairs = outcome_status.get("pairs") or []
+    pairs.extend(outcome_pairs or [])
+    records = [trade for _key, trade, _source in pairs]
+    record_sources = [source for _key, _trade, source in pairs]
+    merge_result = _merge_closed_trade_records_v1(
+        records, sources=record_sources
+    )
+    identity_diagnostics = dict(merge_result.get("diagnostics") or {})
+    if not outcome_status.get("safe_to_commit", True):
+        identity_diagnostics["safe_to_commit"] = False
+        identity_diagnostics["source_read_errors"] = sorted(
+            set(
+                list(identity_diagnostics.get("source_read_errors") or [])
+                + list(outcome_status.get("read_errors") or [])
+            )
+        )
+    if snapshot_source_errors:
+        identity_diagnostics["safe_to_commit"] = False
+        identity_diagnostics["source_read_errors"] = sorted(
+            set(
+                list(identity_diagnostics.get("source_read_errors") or [])
+                + snapshot_source_errors
+            )
+        )
+    sources_by_trade = {}
+    for key, _trade, source in pairs:
+        sources_by_trade.setdefault(str(key), []).append(source)
+    sources_by_trade = {
+        key: sorted(set(values))
+        for key, values in sorted(sources_by_trade.items())
+    }
     # Produz lista estável; Trade Registry do projeto já usa lista para closed_trades.
-    closed_list = []
-    for key in sorted(merged.keys()):
-        trade = dict(merged[key])
-        trade.setdefault("trade_id", key)
+    closed_list = [
+        dict(trade)
+        for trade in (merge_result.get("records") or [])
+        if isinstance(trade, dict)
+    ]
+    for trade in closed_list:
         trade.setdefault("status", "CLOSED")
-        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
-        meta.setdefault("closed_history_sources", sorted(set(sources.get(key, []))))
-        trade["metadata"] = meta
-        closed_list.append(trade)
     before_count = len(_rp_v13_closed_pairs_from_obj(existing_closed_obj, source="current_registry"))
     raw["closed_trades"] = closed_list
     raw.setdefault("open_trades", {})
-    raw["updated_at"] = _rp_v1_now()
-    raw["closed_history_merged_by"] = REGISTRY_PERSISTENCE_V1_VERSION
-    raw["closed_history_merged_at"] = _rp_v1_now()
     return raw, {
         "version": REGISTRY_PERSISTENCE_V1_VERSION,
         "attempted": True,
         "current_closed_count_before": before_count,
         "merged_closed_count": len(closed_list),
         "recovered_closed_count": max(0, len(closed_list) - before_count),
-        "sources_by_trade": sources,
+        "sources_by_trade": sources_by_trade,
+        "closed_identity": identity_diagnostics,
+        "outcome_source_read": {
+            "safe_to_commit": bool(outcome_status.get("safe_to_commit", True)),
+            "read_errors": list(outcome_status.get("read_errors") or []),
+            "malformed_count": int(outcome_status.get("malformed_count") or 0),
+            "rejected_count": int(outcome_status.get("rejected_count") or 0),
+        },
         "protected": True,
     }
 
@@ -8879,7 +9253,20 @@ def registry_persistence_v1_rebuild_from_broker(symbol=None, side=None, bot=None
     }
 
 
-def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=None, commit=False, source="manual", ack=None, sl=None, tp50=None, auto_rebuild=False, block_empty_registry_snapshot=True):
+def registry_persistence_v1_snapshot(
+    symbol=None,
+    side=None,
+    bot=None,
+    setup=None,
+    commit=False,
+    source="manual",
+    ack=None,
+    sl=None,
+    tp50=None,
+    auto_rebuild=False,
+    block_empty_registry_snapshot=True,
+    _lock_held=False,
+):
     """
     Registry Persistence V1.3 + Trade Close Outcome Evaluator V1 + Registry Mode Segregation V1.
 
@@ -8889,12 +9276,133 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
     - Pode restaurar closed_trades a partir de /data/trade_close_outcome_v1_events.jsonl.
     - Continua bloqueando snapshot inseguro quando houver posição real protegida sem Registry.
     """
+    if commit and not _lock_held:
+        registry_lock = (
+            getattr(central_trade_registry, "_lock", None)
+            if central_trade_registry is not None
+            else None
+        )
+        if (
+            registry_lock is None
+            or not hasattr(registry_lock, "__enter__")
+            or not hasattr(registry_lock, "__exit__")
+        ):
+            return {
+                "ok": False,
+                "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "status": "SNAPSHOT_BLOCKED_REGISTRY_LOCK_UNAVAILABLE",
+                "snapshot_save": {
+                    "attempted": False,
+                    "committed": False,
+                    "status": "REGISTRY_LOCK_UNAVAILABLE",
+                },
+            }
+        with registry_lock:
+            return registry_persistence_v1_snapshot(
+                symbol=symbol,
+                side=side,
+                bot=bot,
+                setup=setup,
+                commit=True,
+                source=source,
+                ack=ack,
+                sl=sl,
+                tp50=tp50,
+                auto_rebuild=auto_rebuild,
+                block_empty_registry_snapshot=block_empty_registry_snapshot,
+                _lock_held=True,
+            )
+
+    def load_sources_and_merge():
+        state = _rp_v1_registry_snapshot_full()
+        latest = _rp_v1_read_latest_snapshot()
+        latest_payload = (
+            latest.get("snapshot")
+            if isinstance(latest, dict) and latest.get("ok")
+            else None
+        )
+        merged_raw, merge_meta = _rp_v13_merge_closed_history(
+            state.get("raw_registry"),
+            latest_snapshot_payload=latest_payload,
+        )
+        source_errors = []
+        if (
+            state.get("ok") is not True
+            or state.get("registry_read_known") is False
+            or not isinstance(state.get("raw_registry"), dict)
+        ):
+            source_errors.append(
+                state.get("status") or "TRADE_REGISTRY_READ_UNKNOWN"
+            )
+        if str((latest or {}).get("status") or "").upper() in {
+            "READ_ERROR",
+            "INVALID_SNAPSHOT",
+        }:
+            source_errors.append("LATEST_SNAPSHOT_READ_ERROR")
+        if isinstance(latest_payload, dict):
+            latest_registry_state = latest_payload.get("registry_state")
+            if latest_registry_state is not None:
+                latest_raw = (
+                    latest_registry_state.get("raw_registry")
+                    if isinstance(latest_registry_state, dict)
+                    else None
+                )
+                if not isinstance(latest_raw, dict):
+                    source_errors.append("LATEST_SNAPSHOT_REGISTRY_INVALID")
+                elif (
+                    latest_raw.get("open_trades") is not None
+                    and not isinstance(latest_raw.get("open_trades"), dict)
+                ) or (
+                    latest_raw.get("closed_trades") is not None
+                    and not isinstance(
+                        latest_raw.get("closed_trades"), (dict, list)
+                    )
+                ):
+                    source_errors.append(
+                        "LATEST_SNAPSHOT_REGISTRY_INVALID_SHAPE"
+                    )
+            snapshot_projection = latest_payload.get("snapshot")
+            if (
+                isinstance(snapshot_projection, dict)
+                and snapshot_projection.get("closed_trades") is not None
+                and not isinstance(
+                    snapshot_projection.get("closed_trades"), (dict, list)
+                )
+            ):
+                source_errors.append(
+                    "LATEST_SNAPSHOT_CLOSED_TRADES_INVALID_SHAPE"
+                )
+        merge_meta = dict(merge_meta or {})
+        identity_meta = dict(merge_meta.get("closed_identity") or {})
+        if source_errors:
+            identity_meta["safe_to_commit"] = False
+            identity_meta["source_read_errors"] = sorted(
+                set(
+                    list(identity_meta.get("source_read_errors") or [])
+                    + source_errors
+                )
+            )
+            merge_meta["protected"] = False
+            merge_meta["status"] = "PERSISTENCE_SOURCE_READ_ERROR"
+        merge_meta["closed_identity"] = identity_meta
+        state = _rp_v13_update_registry_state_with_raw(
+            state, merged_raw, merge_meta=merge_meta
+        )
+        return state, latest, merge_meta
+
     live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
-    registry_state = _rp_v1_registry_snapshot_full()
-    latest_for_merge = _rp_v1_read_latest_snapshot()
-    latest_snapshot_payload = (latest_for_merge.get("snapshot") if isinstance(latest_for_merge, dict) and latest_for_merge.get("ok") else None)
-    merged_registry_raw, closed_history_merge = _rp_v13_merge_closed_history(registry_state.get("raw_registry"), latest_snapshot_payload=latest_snapshot_payload)
-    registry_state = _rp_v13_update_registry_state_with_raw(registry_state, merged_registry_raw, merge_meta=closed_history_merge)
+    registry_state, latest_for_merge, closed_history_merge = (
+        load_sources_and_merge()
+    )
+    closed_identity_safe = bool(
+        ((closed_history_merge.get("closed_identity") or {}).get("safe_to_commit"))
+    )
+    source_read_errors = list(
+        ((closed_history_merge.get("closed_identity") or {}).get(
+            "source_read_errors"
+        ))
+        or []
+    )
 
     def needs_rebuild(ls):
         return bool(
@@ -8907,7 +9415,7 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
     rebuild_required = needs_rebuild(live_state)
     auto_rebuild_result = None
 
-    if rebuild_required and auto_rebuild:
+    if rebuild_required and auto_rebuild and closed_identity_safe:
         auto_rebuild_result = registry_persistence_v1_rebuild_from_broker(
             symbol=symbol,
             side=side,
@@ -8920,17 +9428,32 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
         )
         # Recarrega tudo após tentativa de rebuild, mesmo em erro, para refletir estado real.
         live_state = _rp_v1_build_live_state(symbol=symbol, side=side, bot=bot, setup=setup)
-        registry_state = _rp_v1_registry_snapshot_full()
-        latest_for_merge = _rp_v1_read_latest_snapshot()
-        latest_snapshot_payload = (latest_for_merge.get("snapshot") if isinstance(latest_for_merge, dict) and latest_for_merge.get("ok") else None)
-        merged_registry_raw, closed_history_merge = _rp_v13_merge_closed_history(registry_state.get("raw_registry"), latest_snapshot_payload=latest_snapshot_payload)
-        registry_state = _rp_v13_update_registry_state_with_raw(registry_state, merged_registry_raw, merge_meta=closed_history_merge)
+        registry_state, latest_for_merge, closed_history_merge = (
+            load_sources_and_merge()
+        )
+        closed_identity_safe = bool(
+            ((closed_history_merge.get("closed_identity") or {}).get("safe_to_commit"))
+        )
+        source_read_errors = list(
+            ((closed_history_merge.get("closed_identity") or {}).get(
+                "source_read_errors"
+            ))
+            or []
+        )
         rebuild_required = needs_rebuild(live_state)
 
     payload = {
-        "ok": not bool(rebuild_required),
+        "ok": not bool(rebuild_required) and closed_identity_safe,
         "version": REGISTRY_PERSISTENCE_V1_VERSION,
-        "status": "REGISTRY_PERSISTENCE_READY" if not rebuild_required else "REBUILD_REQUIRED_BEFORE_SNAPSHOT",
+        "status": (
+            "PERSISTENCE_SOURCE_READ_ERROR"
+            if source_read_errors
+            else "CLOSED_IDENTITY_REVIEW_REQUIRED"
+            if not closed_identity_safe
+            else "REGISTRY_PERSISTENCE_READY"
+            if not rebuild_required
+            else "REBUILD_REQUIRED_BEFORE_SNAPSHOT"
+        ),
         "generated_at": _rp_v1_now(),
         "source": source,
         "data_dir_status": _rp_v1_data_dir_status(),
@@ -8956,7 +9479,20 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
 
     save_result = {"attempted": False, "committed": False, "status": "COMMIT_NOT_REQUESTED"}
     if commit:
-        if rebuild_required and block_empty_registry_snapshot:
+        if source_read_errors:
+            save_result = {
+                "attempted": True,
+                "committed": False,
+                "status": "SNAPSHOT_BLOCKED_SOURCE_READ_ERROR",
+                "source_read_errors": source_read_errors,
+            }
+        elif not closed_identity_safe:
+            save_result = {
+                "attempted": True,
+                "committed": False,
+                "status": "SNAPSHOT_BLOCKED_CLOSED_IDENTITY_CONFLICT",
+            }
+        elif rebuild_required and block_empty_registry_snapshot:
             save_result = {
                 "attempted": True,
                 "committed": False,
@@ -8965,11 +9501,33 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
                 "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE),
             }
         else:
+            registry_committed = False
+            registry_save_result = {
+                "attempted": False,
+                "committed": False,
+                "status": "REGISTRY_SAVE_NOT_AVAILABLE",
+            }
             try:
-                registry_save_result = {"attempted": False, "committed": False, "status": "REGISTRY_SAVE_NOT_AVAILABLE"}
-                if central_trade_registry is not None and callable(getattr(central_trade_registry, "save_registry", None)) and isinstance((registry_state or {}).get("raw_registry"), dict):
-                    central_trade_registry.save_registry((registry_state or {}).get("raw_registry"))
-                    registry_save_result = {"attempted": True, "committed": True, "status": "REGISTRY_WITH_CLOSED_HISTORY_SAVED"}
+                registry_writer = (
+                    getattr(central_trade_registry, "save_registry", None)
+                    if central_trade_registry is not None
+                    else None
+                )
+                if not callable(registry_writer) or not isinstance(
+                    (registry_state or {}).get("raw_registry"), dict
+                ):
+                    raise RuntimeError("REGISTRY_SAVE_NOT_AVAILABLE")
+                registry_write = registry_writer(
+                    (registry_state or {}).get("raw_registry")
+                )
+                if registry_write is False:
+                    raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+                registry_committed = True
+                registry_save_result = {
+                    "attempted": True,
+                    "committed": True,
+                    "status": "REGISTRY_WITH_CLOSED_HISTORY_SAVED",
+                }
                 payload["registry_save"] = registry_save_result
                 _rp_v1_atomic_write_json(REGISTRY_PERSISTENCE_V1_LATEST_FILE, payload)
                 _rp_v1_append_event({
@@ -8982,21 +9540,134 @@ def registry_persistence_v1_snapshot(symbol=None, side=None, bot=None, setup=Non
                 })
                 save_result = {"attempted": True, "committed": True, "status": "SNAPSHOT_MERGED_AND_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE), "registry_save": registry_save_result}
             except Exception as exc:
-                save_result = {"attempted": True, "committed": False, "status": "SNAPSHOT_SAVE_ERROR", "error": str(exc), "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)}
+                save_result = {
+                    "attempted": True,
+                    "committed": bool(registry_committed),
+                    "status": (
+                        "SNAPSHOT_AUDIT_PERSISTENCE_ERROR_AFTER_REGISTRY_COMMIT"
+                        if registry_committed
+                        else "SNAPSHOT_SAVE_ERROR"
+                    ),
+                    "error_type": type(exc).__name__,
+                    "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE),
+                    "registry_save": registry_save_result,
+                }
     payload["snapshot_save"] = save_result
     return payload
 
-def registry_persistence_v1_restore_from_latest_snapshot(commit=False, ack=None):
+def registry_persistence_v1_restore_from_latest_snapshot(
+    commit=False, ack=None, _lock_held=False
+):
+    if commit and not _lock_held:
+        registry_lock = (
+            getattr(central_trade_registry, "_lock", None)
+            if central_trade_registry is not None
+            else None
+        )
+        if (
+            registry_lock is None
+            or not hasattr(registry_lock, "__enter__")
+            or not hasattr(registry_lock, "__exit__")
+        ):
+            return {
+                "ok": False,
+                "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "status": "RESTORE_BLOCKED_REGISTRY_LOCK_UNAVAILABLE",
+                "committed": False,
+            }
+        with registry_lock:
+            return registry_persistence_v1_restore_from_latest_snapshot(
+                commit=True,
+                ack=ack,
+                _lock_held=True,
+            )
     latest = _rp_v1_read_latest_snapshot()
     if not latest.get("ok"):
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": latest.get("status"), "latest": latest, "committed": False}
     if str(ack or "").strip() != "RESTORE_REGISTRY_FROM_SNAPSHOT":
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "ACK_REQUIRED", "required_ack": "RESTORE_REGISTRY_FROM_SNAPSHOT", "committed": False, "latest": {"path": latest.get("path")}}
     snapshot = latest.get("snapshot") or {}
-    raw_registry = (((snapshot.get("registry_state") or {}).get("raw_registry")) if isinstance(snapshot, dict) else None)
-    if not isinstance(raw_registry, dict):
+    snapshot_registry = (
+        ((snapshot.get("registry_state") or {}).get("raw_registry"))
+        if isinstance(snapshot, dict)
+        else None
+    )
+    if not isinstance(snapshot_registry, dict):
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "SNAPSHOT_HAS_NO_RAW_REGISTRY", "committed": False}
-    merged_raw, closed_history_merge = _rp_v13_merge_closed_history(raw_registry, latest_snapshot_payload=snapshot)
+    snapshot_validation, snapshot_validation_meta = _rp_v13_merge_closed_history(
+        snapshot_registry,
+        latest_snapshot_payload=None,
+    )
+    if not isinstance(snapshot_validation, dict) or not bool(
+        ((snapshot_validation_meta.get("closed_identity") or {}).get(
+            "safe_to_commit"
+        ))
+    ):
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "RESTORE_BLOCKED_INVALID_SNAPSHOT_REGISTRY",
+            "committed": False,
+            "closed_history_merge": snapshot_validation_meta,
+        }
+    current_state = _rp_v1_registry_snapshot_full()
+    current_registry = current_state.get("raw_registry")
+    if current_state.get("ok") is not True or not isinstance(
+        current_registry, dict
+    ):
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "RESTORE_BLOCKED_CURRENT_REGISTRY_READ_ERROR",
+            "committed": False,
+        }
+    current_open = current_registry.get("open_trades") or {}
+    snapshot_open = snapshot_registry.get("open_trades") or {}
+    if not isinstance(current_open, dict) or not isinstance(snapshot_open, dict):
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "RESTORE_BLOCKED_OPEN_TRADES_INVALID",
+            "committed": False,
+        }
+    current_open_fingerprint = json.dumps(
+        current_open,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    snapshot_open_fingerprint = json.dumps(
+        snapshot_open,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    if current_open_fingerprint != snapshot_open_fingerprint:
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "RESTORE_BLOCKED_OPEN_TRADES_DIVERGENCE",
+            "committed": False,
+            "current_open_count": len(current_open),
+            "snapshot_open_count": len(snapshot_open),
+        }
+    merged_raw, closed_history_merge = _rp_v13_merge_closed_history(
+        current_registry,
+        latest_snapshot_payload=snapshot,
+    )
+    closed_identity_safe = bool(
+        ((closed_history_merge.get("closed_identity") or {}).get("safe_to_commit"))
+    )
+    if not closed_identity_safe:
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "RESTORE_BLOCKED_CLOSED_IDENTITY_CONFLICT",
+            "committed": False,
+            "closed_history_merge": closed_history_merge,
+        }
     open_trades = merged_raw.get("open_trades") if isinstance(merged_raw, dict) else {}
     closed_trades = merged_raw.get("closed_trades") if isinstance(merged_raw, dict) else []
     open_count = len(open_trades) if isinstance(open_trades, dict) else len(_rp_v13_as_list(open_trades))
@@ -9007,14 +9678,32 @@ def registry_persistence_v1_restore_from_latest_snapshot(commit=False, ack=None)
         return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "DRY_RUN_RESTORE_AVAILABLE", "committed": False, "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge}
     if central_trade_registry is None or not callable(getattr(central_trade_registry, "save_registry", None)):
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "TRADE_REGISTRY_UNAVAILABLE", "committed": False}
+    registry_committed = False
     try:
+        _rp_v1_atomic_write_json(
+            REGISTRY_PERSISTENCE_V1_PRE_RESTORE_BACKUP_FILE,
+            current_registry,
+        )
         merged_raw["restored_by"] = REGISTRY_PERSISTENCE_V1_VERSION
         merged_raw["restored_at"] = _rp_v1_now()
-        central_trade_registry.save_registry(merged_raw)
+        registry_write = central_trade_registry.save_registry(merged_raw)
+        if registry_write is False:
+            raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+        registry_committed = True
         _rp_v1_append_event({"event": "REGISTRY_PERSISTENCE_RESTORE", "generated_at": _rp_v1_now(), "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge, "version": REGISTRY_PERSISTENCE_V1_VERSION})
         return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "REGISTRY_RESTORED_FROM_SNAPSHOT_WITH_CLOSED_HISTORY", "committed": True, "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge}
     except Exception as exc:
-        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "RESTORE_SAVE_ERROR", "committed": False, "error": str(exc)}
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": (
+                "RESTORE_AUDIT_PERSISTENCE_ERROR_AFTER_REGISTRY_COMMIT"
+                if registry_committed
+                else "RESTORE_SAVE_ERROR"
+            ),
+            "committed": bool(registry_committed),
+            "error_type": type(exc).__name__,
+        }
 
 
 def registry_persistence_v1_gate_check(current_payload=None):
@@ -9167,14 +9856,29 @@ def _rp_v12_load_raw_registry_safe():
                 raw.setdefault("closed_trades", [])
                 return raw
     except Exception:
-        pass
-    return {"ok": True, "version": "2026-07-03-TRADE-REGISTRY-V1", "open_trades": {}, "closed_trades": []}
+        return None
+    return None
 
 
 def _rp_v12_closed_trade_exists(raw_registry, trade_id):
-    for trade in (raw_registry or {}).get("closed_trades") or []:
-        if isinstance(trade, dict) and str(trade.get("trade_id") or "") == str(trade_id):
-            return trade
+    closed = (raw_registry or {}).get("closed_trades") or []
+    rows = list(closed.values()) if isinstance(closed, dict) else list(closed)
+    matches = [
+        trade
+        for trade in rows
+        if isinstance(trade, dict)
+        and str(trade.get("trade_id") or "") == str(trade_id)
+    ]
+    if matches:
+        # trade_id is a strategy key, not a CLOSED execution identity.  This
+        # legacy recovery API does not receive lifecycle/client/order IDs, so
+        # it must never claim ALREADY_REGISTERED or select a surviving VERIFY
+        # record on that weak key alone.
+        return {
+            "_closed_trade_strong_identity_required": True,
+            "trade_id": str(trade_id),
+            "candidate_count": len(matches),
+        }
     return None
 
 
@@ -9219,8 +9923,26 @@ def registry_persistence_v12_recover_closed_trade_from_params(
         }
 
     raw = _rp_v12_load_raw_registry_safe()
+    if not isinstance(raw, dict):
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "TRADE_REGISTRY_READ_ERROR",
+            "committed": False,
+            "trade_id": trade_id,
+        }
     existing = _rp_v12_closed_trade_exists(raw, trade_id)
     if existing:
+        if existing.get("_closed_trade_strong_identity_required"):
+            return {
+                "ok": False,
+                "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "status": "CLOSED_TRADE_STRONG_IDENTITY_REQUIRED",
+                "committed": False,
+                "trade_id": trade_id,
+                "candidate_count": existing.get("candidate_count"),
+                "reason": "TRADE_ID_IS_NOT_A_CLOSED_EXECUTION_IDENTITY",
+            }
         return {
             "ok": True,
             "version": REGISTRY_PERSISTENCE_V1_VERSION,
@@ -9301,7 +10023,9 @@ def registry_persistence_v12_recover_closed_trade_from_params(
             raw["open_trades"].pop(trade_id, None)
         raw["closed_trades"].append(closed_trade)
         raw["updated_at"] = _rp_v1_now()
-        central_trade_registry.save_registry(raw)
+        registry_write = central_trade_registry.save_registry(raw)
+        if registry_write is False:
+            raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
 
         after_registry_state = _rp_v1_registry_snapshot_full()
         latest_payload = {
@@ -9345,13 +10069,23 @@ def registry_persistence_v12_recover_closed_trade_from_params(
 @app.route("/registryclosedrecovery", methods=["GET"])
 @app.route("/registrypersistence/closedrecovery", methods=["GET"])
 def registry_persistence_v12_closed_recovery_route():
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    if _rp_v1_bool(request.args.get("commit"), False):
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "GET_IS_STRICTLY_READ_ONLY",
+            "committed": False,
+            "write_executed": False,
+            "reason": "AUTHENTICATED_POST_REQUIRED_FOR_ANY_REGISTRY_WRITE",
+        }, 400, headers
     result = registry_persistence_v12_recover_closed_trade_from_params(
         symbol=request.args.get("symbol") or "BTCUSDT",
         side=request.args.get("side") or "SHORT",
         bot=request.args.get("bot") or "FALCON",
         setup=request.args.get("setup") or request.args.get("bot") or "FALCON",
-        commit=_rp_v1_bool(request.args.get("commit"), False),
-        ack=request.args.get("ack"),
+        commit=False,
+        ack=None,
         entry=request.args.get("entry"),
         qty=request.args.get("qty"),
         sl=request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss"),
@@ -9366,7 +10100,8 @@ def registry_persistence_v12_closed_recovery_route():
         "/registryclosedrecovery?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=63572.3&qty=0.0001&sl=66750.9&tp50=60393.7&last_mark_price=63811.3&last_unrealized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true&ack=RESTORE_CLOSED_TRADE_MANUAL",
         "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
     ]
-    return result
+    result["write_executed"] = False
+    return result, 200, headers
 
 @app.route("/registrypersistence", methods=["GET"])
 @app.route("/registrypersistencev1", methods=["GET"])
@@ -9383,6 +10118,16 @@ def registry_persistence_v1_route():
     ack = request.args.get("ack") or request.args.get("registry_persistence_ack")
     sl = request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss")
     tp50 = request.args.get("tp50")
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    if commit or rebuild or auto_rebuild or restore:
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "GET_IS_STRICTLY_READ_ONLY",
+            "committed": False,
+            "write_executed": False,
+            "reason": "AUTHENTICATED_POST_REQUIRED_FOR_ANY_REGISTRY_WRITE",
+        }, 400, headers
     if restore:
         # V1.3: em restore, restaurar ANTES de salvar novo snapshot.
         # Isso evita sobrescrever o latest persistente com um Registry vazio recém-criado após deploy.
@@ -9433,7 +10178,8 @@ def registry_persistence_v1_route():
         "/registrypersistence?restore=true&commit=true&ack=RESTORE_REGISTRY_FROM_SNAPSHOT",
         "/registryclosedrecovery?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=63572.3&qty=0.0001&sl=66750.9&tp50=60393.7&last_mark_price=63811.3&last_unrealized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true&ack=RESTORE_CLOSED_TRADE_MANUAL",
     ]
-    return payload
+    payload["write_executed"] = False
+    return payload, 200, headers
 
 
 @app.route("/registrypersistence/health", methods=["GET"])
@@ -9577,23 +10323,61 @@ def _tco_v1_closed_items(registry):
     if isinstance(closed_raw, dict):
         return closed_raw, [(str(k), v) for k, v in closed_raw.items() if isinstance(v, dict)]
     if isinstance(closed_raw, list):
-        return closed_raw, [(str(t.get("trade_id") or i), t) for i, t in enumerate(closed_raw) if isinstance(t, dict)]
+        return closed_raw, [
+            (
+                "closed_index|"
+                + str(i)
+                + "|"
+                + str(
+                    _closed_trade_identity_state_v1(t).get("canonical_key")
+                    or "identity_unavailable"
+                ),
+                t,
+            )
+            for i, t in enumerate(closed_raw)
+            if isinstance(t, dict)
+        ]
     return [], []
 
 
-def _tco_v1_match_trade(trade, symbol=None, side=None, bot=None, setup=None, trade_id=None):
+def _tco_v1_match_trade(
+    trade,
+    symbol=None,
+    side=None,
+    bot=None,
+    setup=None,
+    trade_id=None,
+    expected_identity=None,
+):
     if not isinstance(trade, dict):
         return False
-    if trade_id and str(trade.get("trade_id") or "") == str(trade_id):
-        return True
+    if (
+        trade_id
+        and str(trade.get("trade_id") or "").strip()
+        != str(trade_id).strip()
+    ):
+        return False
     symbol_n = _tco_v1_norm_symbol(symbol) if symbol else None
     side_n = _tco_v1_norm_side(side) if side else None
     bot_n = _tco_v1_norm_bot(bot) if bot else None
-    setup_n = str(setup or "").upper().strip() if setup else None
+    setup_n = (
+        "".join(str(setup or "").upper().split())
+        if setup
+        else None
+    )
     tsymbol = _tco_v1_norm_symbol(trade.get("symbol_clean") or trade.get("symbol") or trade.get("ativo") or trade.get("pair"))
     tside = _tco_v1_norm_side(trade.get("side") or trade.get("direction"))
     tbot = _tco_v1_norm_bot(trade.get("bot") or "")
-    tsetup = str(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label") or "").upper().strip()
+    tsetup = "".join(
+        str(
+            trade.get("setup")
+            or trade.get("signal_type")
+            or trade.get("setup_label")
+            or ""
+        )
+        .upper()
+        .split()
+    )
     status = str(trade.get("status") or "").upper().strip()
     if status and status not in {"CLOSED", "CLOSE", "DONE", "FINISHED"}:
         return False
@@ -9605,23 +10389,74 @@ def _tco_v1_match_trade(trade, symbol=None, side=None, bot=None, setup=None, tra
         return False
     if setup_n and tsetup and tsetup != setup_n:
         return False
+    expected_identity = (
+        expected_identity if isinstance(expected_identity, dict) else {}
+    )
+    if expected_identity:
+        expected_state = _closed_trade_identity_state_v1(expected_identity)
+        trade_state = _closed_trade_identity_state_v1(trade)
+        if (
+            expected_state.get("has_alias_conflict")
+            or trade_state.get("has_alias_conflict")
+        ):
+            return False
+        expected_strong = expected_state.get("strong_identity") or {}
+        trade_strong = trade_state.get("strong_identity") or {}
+        for field, expected_value in expected_strong.items():
+            if not expected_value or trade_strong.get(field) != expected_value:
+                return False
+        expected_legacy = expected_state.get("legacy_fallback") or {}
+        trade_legacy = trade_state.get("legacy_fallback") or {}
+        for field in ("registry_mode", "execution_mode"):
+            expected_value = str(
+                expected_identity.get(field)
+                or expected_legacy.get(field)
+                or ""
+            ).upper().strip()
+            if not expected_value or expected_value == "UNKNOWN":
+                continue
+            if str(trade_legacy.get(field) or "").upper().strip() != expected_value:
+                return False
     return True
 
 
-def _tco_v1_find_closed_trade(symbol=None, side=None, bot=None, setup=None, trade_id=None):
+def _tco_v1_find_closed_trade(
+    symbol=None,
+    side=None,
+    bot=None,
+    setup=None,
+    trade_id=None,
+    expected_identity=None,
+):
     registry = _tco_v1_load_registry()
     if registry is None:
         return {"ok": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR if "TRADE_REGISTRY_IMPORT_ERROR" in globals() else None}
     closed_obj, items = _tco_v1_closed_items(registry)
     matches = []
     for key, trade in items:
-        if _tco_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup, trade_id=trade_id):
+        if _tco_v1_match_trade(
+            trade,
+            symbol=symbol,
+            side=side,
+            bot=bot,
+            setup=setup,
+            trade_id=trade_id,
+            expected_identity=expected_identity,
+        ):
             matches.append({"key": key, "trade": trade})
     # Prefere o último trade compatível, pois closed_trades costuma ser append-only.
-    selected = matches[-1] if matches else None
+    selected = matches[0] if len(matches) == 1 else None
     return {
         "ok": True,
-        "status": "MATCH_FOUND" if selected else "NO_MATCHING_CLOSED_TRADE",
+        "status": (
+            "MATCH_FOUND"
+            if selected
+            else (
+                "CLOSED_TRADE_IDENTITY_AMBIGUOUS"
+                if len(matches) > 1
+                else "NO_MATCHING_CLOSED_TRADE"
+            )
+        ),
         "count": len(matches),
         "matches": matches,
         "selected": selected,
@@ -9762,12 +10597,31 @@ def _tco_v1_infer_close_reason(trade, explicit_close_reason=None, tp50_hit=False
     return "UNKNOWN_CLOSE_REASON", "missing"
 
 
-def trade_close_outcome_v1_build(symbol=None, side=None, bot=None, setup=None, trade_id=None, exit_price=None, realized_pnl=None, fee=None, close_reason=None, commit=False):
+def trade_close_outcome_v1_build(
+    symbol=None,
+    side=None,
+    bot=None,
+    setup=None,
+    trade_id=None,
+    exit_price=None,
+    realized_pnl=None,
+    fee=None,
+    close_reason=None,
+    commit=False,
+    expected_identity=None,
+):
     symbol_n = _tco_v1_norm_symbol(symbol or "BTCUSDT")
     side_n = _tco_v1_norm_side(side or "SHORT")
     bot_n = _tco_v1_norm_bot(bot or "FALCON")
     setup_n = str(setup or bot_n or "FALCON").upper().strip()
-    found = _tco_v1_find_closed_trade(symbol=symbol_n, side=side_n, bot=bot_n, setup=setup_n, trade_id=trade_id)
+    found = _tco_v1_find_closed_trade(
+        symbol=symbol_n,
+        side=side_n,
+        bot=bot_n,
+        setup=setup_n,
+        trade_id=trade_id,
+        expected_identity=expected_identity,
+    )
     if not found.get("ok"):
         return {"ok": False, "version": TRADE_CLOSE_OUTCOME_V1_VERSION, "status": found.get("status"), "error": found.get("error")}
     selected = found.get("selected") or {}
@@ -9775,7 +10629,7 @@ def trade_close_outcome_v1_build(symbol=None, side=None, bot=None, setup=None, t
         return {
             "ok": False,
             "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
-            "status": "NO_MATCHING_CLOSED_TRADE",
+            "status": found.get("status") or "NO_MATCHING_CLOSED_TRADE",
             "symbol": symbol_n,
             "side": side_n,
             "bot": bot_n,
@@ -9785,6 +10639,8 @@ def trade_close_outcome_v1_build(symbol=None, side=None, bot=None, setup=None, t
         }
     key = selected.get("key")
     trade = selected.get("trade") or {}
+    identity_state = _closed_trade_identity_state_v1(trade)
+    strong_identity = identity_state.get("strong_identity") or {}
     meta = _tco_v1_trade_meta(trade)
     entry = _tco_v1_float(trade.get("entry") or meta.get("broker_entry_price") or meta.get("entry"))
     qty = _tco_v1_float(trade.get("qty") or trade.get("contracts") or meta.get("broker_contracts"))
@@ -9819,6 +10675,22 @@ def trade_close_outcome_v1_build(symbol=None, side=None, bot=None, setup=None, t
         "generated_at": _tco_v1_now(),
         "trade_key": key,
         "trade_id": trade.get("trade_id") or key,
+        "lifecycle_id": strong_identity.get("lifecycle_id"),
+        "client_order_id": strong_identity.get("client_order_id"),
+        "broker_order_id": strong_identity.get("order_id"),
+        "order_id": strong_identity.get("order_id"),
+        "registry_mode": identity_state.get("registry_mode"),
+        "execution_mode": identity_state.get("execution_mode"),
+        "opened_at": (identity_state.get("legacy_fallback") or {}).get(
+            "opened_at"
+        ),
+        "closed_at": (identity_state.get("legacy_fallback") or {}).get(
+            "closed_at"
+        ),
+        "identity_has_alias_conflict": bool(
+            identity_state.get("has_alias_conflict")
+        ),
+        "identity_alias_conflicts": identity_state.get("alias_conflicts") or [],
         "symbol": _tco_v1_norm_symbol(trade.get("symbol") or symbol_n),
         "side": side_n,
         "bot": _tco_v1_norm_bot(trade.get("bot") or bot_n),
@@ -9866,17 +10738,49 @@ def trade_close_outcome_v1_build(symbol=None, side=None, bot=None, setup=None, t
         },
         "commit": {"attempted": False, "committed": False, "status": "COMMIT_NOT_REQUESTED"},
     }
+    for specific_state in identity_state.get("specific_identity_states") or []:
+        field = str(specific_state.get("field") or "")
+        value = specific_state.get("value")
+        if field and value not in (None, "") and not specific_state.get("conflict"):
+            outcome[field] = value
     if commit:
         outcome["commit"] = trade_close_outcome_v1_commit(found, selected, outcome)
     return outcome
 
 
 def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
-    registry = found_payload.get("registry")
-    closed_obj = found_payload.get("closed_obj")
-    key = selected_payload.get("key")
+    selected_trade = (
+        selected_payload.get("trade")
+        if isinstance(selected_payload.get("trade"), dict)
+        else {}
+    )
+    selected_state = _closed_trade_identity_state_v1(selected_trade)
+    selected_key = str(selected_state.get("canonical_key") or "")
+    registry = _tco_v1_load_registry()
     if not isinstance(registry, dict):
-        return {"attempted": True, "committed": False, "status": "REGISTRY_NOT_AVAILABLE"}
+        return {
+            "attempted": True,
+            "committed": False,
+            "status": "REGISTRY_NOT_AVAILABLE",
+        }
+    closed_obj, fresh_items = _tco_v1_closed_items(registry)
+    fresh_matches = [
+        {"key": current_key, "trade": trade}
+        for current_key, trade in fresh_items
+        if _closed_trade_records_equivalent_v1(selected_trade, trade)
+    ]
+    if (
+        not selected_key
+        or selected_state.get("has_alias_conflict")
+        or len(fresh_matches) != 1
+    ):
+        return {
+            "attempted": True,
+            "committed": False,
+            "status": "CLOSED_TRADE_IDENTITY_CHANGED_BEFORE_UPDATE",
+            "candidate_count": len(fresh_matches),
+        }
+    key = fresh_matches[0].get("key")
     if not isinstance(outcome, dict) or not outcome.get("ok"):
         return {"attempted": True, "committed": False, "status": "INVALID_OUTCOME"}
     updated = False
@@ -9909,7 +10813,15 @@ def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
         for idx, trade in enumerate(closed_obj):
             if not isinstance(trade, dict):
                 continue
-            trade_key = str(trade.get("trade_id") or idx)
+            trade_key = (
+                "closed_index|"
+                + str(idx)
+                + "|"
+                + str(
+                    _closed_trade_identity_state_v1(trade).get("canonical_key")
+                    or "identity_unavailable"
+                )
+            )
             if str(trade_key) != str(key):
                 continue
             meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
@@ -9937,7 +10849,9 @@ def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
         return {"attempted": True, "committed": False, "status": "CLOSED_TRADE_NOT_FOUND_FOR_UPDATE"}
     registry["updated_at"] = now
     try:
-        central_trade_registry.save_registry(registry)
+        registry_write = central_trade_registry.save_registry(registry)
+        if registry_write is False:
+            raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
         _tco_v1_atomic_write_json(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE, outcome)
         _tco_v1_append_event(outcome)
         return {
@@ -10010,6 +10924,26 @@ def trade_close_outcome_v1_route():
     fee = request.args.get("fee") or request.args.get("fees")
     close_reason = request.args.get("close_reason") or request.args.get("reason")
     commit = _tco_v1_bool(request.args.get("commit") or request.args.get("save"), False)
+    expected_identity = {
+        key: request.args.get(key)
+        for key in (
+            "lifecycle_id",
+            "trade_lifecycle_id",
+            "client_order_id",
+            "clientOrderId",
+            "clientOrderID",
+            "client_tag",
+            "open_order_id",
+            "broker_order_id",
+            "order_id",
+            "orderId",
+            "live_order_id",
+            "entry_order_id",
+            "registry_mode",
+            "execution_mode",
+        )
+        if request.args.get(key) not in (None, "")
+    }
     return trade_close_outcome_v1_build(
         symbol=symbol,
         side=side,
@@ -10021,6 +10955,7 @@ def trade_close_outcome_v1_route():
         fee=fee,
         close_reason=close_reason,
         commit=commit,
+        expected_identity=expected_identity,
     )
 
 
@@ -10412,8 +11347,15 @@ def registry_mode_segregation_v1_analyze(commit=False, include_trades=True, sour
                 meta["registry_mode_reasons"] = cls.get("reasons")
                 meta["registry_mode_version"] = REGISTRY_MODE_SEGREGATION_V1_VERSION
             if callable(getattr(central_trade_registry, "save_registry", None)):
-                central_trade_registry.save_registry(registry)
-                commit_result = {"attempted": True, "committed": True, "status": "REGISTRY_MODES_SAVED"}
+                registry_write = central_trade_registry.save_registry(registry)
+                if registry_write is False:
+                    commit_result = {
+                        "attempted": True,
+                        "committed": False,
+                        "status": "REGISTRY_SAVE_NOT_CONFIRMED",
+                    }
+                else:
+                    commit_result = {"attempted": True, "committed": True, "status": "REGISTRY_MODES_SAVED"}
             else:
                 commit_result = {"attempted": True, "committed": False, "status": "SAVE_FUNCTION_UNAVAILABLE"}
 
@@ -12806,16 +13748,30 @@ def _trade_registry_report_count(items, key):
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
-def _trade_registry_report_duplicates(items):
+def _trade_registry_report_duplicates(items, canonical_closed=False):
     seen = {}
+    seen_closed = []
     duplicates = []
     for item in items:
-        trade_id = str(item.get("trade_id") or "").strip()
-        if not trade_id:
+        if canonical_closed:
+            identity = _closed_trade_identity_state_v1(item)
+            key = str(identity.get("canonical_key") or "").strip()
+            if not key:
+                continue
+            if any(
+                _closed_trade_records_equivalent_v1(item, existing)
+                for existing in seen_closed
+            ):
+                duplicates.append(key)
+            seen_closed.append(item)
             continue
-        if trade_id in seen:
-            duplicates.append(trade_id)
-        seen[trade_id] = True
+        else:
+            key = str(item.get("trade_id") or "").strip()
+        if not key:
+            continue
+        if key in seen:
+            duplicates.append(key)
+        seen[key] = True
     return sorted(set(duplicates))
 
 
@@ -12881,7 +13837,36 @@ def build_trade_registry_report():
     by_symbol = snap.get("by_symbol") or _trade_registry_report_count(open_trades, "symbol")
     by_side = snap.get("by_side") or _trade_registry_report_count(open_trades, "side")
     by_setup = _trade_registry_report_count(open_trades, "setup")
-    duplicates = _trade_registry_report_duplicates(open_trades + closed_trades)
+    open_duplicates = _trade_registry_report_duplicates(open_trades)
+    closed_duplicates = _trade_registry_report_duplicates(
+        closed_trades, canonical_closed=True
+    )
+    duplicates = sorted(set(open_duplicates + closed_duplicates))
+    try:
+        audit_reader = (
+            getattr(
+                central_trade_registry,
+                "audit_closed_trade_identities",
+                None,
+            )
+            if central_trade_registry is not None
+            else None
+        )
+        closed_identity_audit = (
+            audit_reader(closed_trades)
+            if callable(audit_reader)
+            else dict(
+                (_merge_closed_trade_records_v1(closed_trades).get(
+                    "diagnostics"
+                ))
+                or {}
+            )
+        )
+    except Exception:
+        closed_identity_audit = {
+            "safe_to_commit": False,
+            "status": "CLOSED_IDENTITY_AUDIT_UNAVAILABLE",
+        }
     integrity = _trade_registry_report_integrity(open_trades, closed_trades)
     conflicts = _trade_registry_report_conflicts(open_trades)
 
@@ -12930,7 +13915,13 @@ def build_trade_registry_report():
     lines += [""]
 
     lines += ["Conflitos e alertas:"]
-    if not duplicates and not conflicts["opposite_side"] and not conflicts["concentration"] and not integrity["problems_count"]:
+    if (
+        not duplicates
+        and bool(closed_identity_audit.get("safe_to_commit", True))
+        and not conflicts["opposite_side"]
+        and not conflicts["concentration"]
+        and not integrity["problems_count"]
+    ):
         lines.append("- Nenhum alerta crítico encontrado ✅")
     else:
         if duplicates:
@@ -12949,6 +13940,17 @@ def build_trade_registry_report():
                 lines.append(f"  • {item['symbol']}: {item['count']}/{item['limit']} posições")
         if integrity["problems_count"]:
             lines.append(f"- Trades com campos ausentes: {integrity['problems_count']}")
+        if not bool(closed_identity_audit.get("safe_to_commit", True)):
+            lines.append("- HistÃ³rico CLOSED exige revisÃ£o de identidade")
+    if int(
+        closed_identity_audit.get("trade_id_collision_group_count") or 0
+    ):
+        lines.append(
+            "- ColisÃµes informativas de trade_id com execuÃ§Ãµes preservadas: "
+            + str(
+                closed_identity_audit.get("trade_id_collision_group_count")
+            )
+        )
 
     lines += [
         "",
@@ -12958,7 +13960,12 @@ def build_trade_registry_report():
     ]
 
     payload = {
-        "ok": bool(snap.get("ok", True)) and integrity.get("score", 0) >= 90 and not duplicates,
+        "ok": (
+            bool(snap.get("ok", True))
+            and integrity.get("score", 0) >= 90
+            and not duplicates
+            and bool(closed_identity_audit.get("safe_to_commit", True))
+        ),
         "updated_at": data_hora_sp_str(),
         "open_count": open_count,
         "closed_count": closed_count,
@@ -12969,6 +13976,9 @@ def build_trade_registry_report():
         "dominant_side": dominant_side,
         "dominant_side_pct": dominant_pct,
         "duplicates": duplicates,
+        "open_duplicate_trade_ids": open_duplicates,
+        "closed_duplicate_execution_identities": closed_duplicates,
+        "closed_identity_audit": closed_identity_audit,
         "integrity": integrity,
         "conflicts": conflicts,
         "text": "\n".join(lines),
@@ -13083,26 +14093,27 @@ def _trade_registry_existing_trade_ids():
 
     try:
         if isinstance(registry, dict):
-            for section in ["open_trades", "closed_trades"]:
-                values = registry.get(section, {})
-                if isinstance(values, dict):
-                    iterable = values.values()
-                elif isinstance(values, list):
-                    iterable = values
-                else:
-                    iterable = []
-                for item in iterable:
-                    if isinstance(item, dict) and item.get("trade_id"):
-                        ids.add(str(item.get("trade_id")))
-                    elif isinstance(item, str):
-                        ids.add(item)
+            values = registry.get("open_trades", {})
+            if isinstance(values, dict):
+                iterable = values.values()
+            elif isinstance(values, list):
+                iterable = values
+            else:
+                iterable = []
+            for item in iterable:
+                if isinstance(item, dict) and item.get("trade_id"):
+                    ids.add(str(item.get("trade_id")))
+                elif isinstance(item, str):
+                    ids.add(item)
     except Exception:
         pass
 
     try:
         snapshot = central_trade_registry.get_trade_registry_snapshot()
         if isinstance(snapshot, dict):
-            for section in ["open_trades", "closed_trades"]:
+            # CLOSED trade_id is intentionally reusable across executions and
+            # must never suppress a new OPEN candidate.
+            for section in ["open_trades"]:
                 values = snapshot.get(section, [])
                 if isinstance(values, dict):
                     iterable = values.values()
@@ -13266,7 +14277,9 @@ def mark_registry_missing_trades(removed):
             })
 
         registry["open_trades"] = open_trades
-        central_trade_registry.save_registry(registry)
+        registry_write = central_trade_registry.save_registry(registry)
+        if registry_write is False:
+            return {"ok": False, "error": "REGISTRY_SAVE_NOT_CONFIRMED"}
 
         return {
             "ok": True,
@@ -34059,9 +35072,20 @@ def _tlm_find_trade(trades, trade_id=None, bot=None, symbol=None, side=None):
     bot_n = _tlm_norm_bot(bot)
     symbol_n = _tlm_norm_symbol(symbol)
     side_n = _tlm_norm_side(side)
-    for t in trades or []:
-        if trade_id and str(_tlm_trade_id(t) or "") == trade_id:
-            return t
+    trade_id_matches = [
+        t
+        for t in (trades or [])
+        if trade_id and str(_tlm_trade_id(t) or "") == trade_id
+    ]
+    if len(trade_id_matches) == 1:
+        return trade_id_matches[0]
+    if len(trade_id_matches) > 1:
+        return None
+    if trade_id:
+        # A supplied trade_id is a selector, not a hint. Falling back to weak
+        # bot/symbol/side fields could select another historical execution.
+        return None
+    fallback_matches = []
     for t in trades or []:
         if bot_n and _tlm_norm_bot(t.get("bot")) != bot_n:
             continue
@@ -34069,7 +35093,82 @@ def _tlm_find_trade(trades, trade_id=None, bot=None, symbol=None, side=None):
             continue
         if side_n and _tlm_trade_side(t) != side_n:
             continue
-        return t
+        fallback_matches.append(t)
+    return fallback_matches[0] if len(fallback_matches) == 1 else None
+
+
+def _tlm_related_closed_record(trade, records):
+    """Resolve one learning/outcome row without trusting trade_id alone."""
+    if not isinstance(trade, dict):
+        return None
+    trade_id = str(_tlm_trade_id(trade) or "").strip()
+    candidates = [
+        item
+        for item in (records or [])
+        if isinstance(item, dict)
+        and trade_id
+        and str(item.get("trade_id") or "") == trade_id
+    ]
+    if not candidates:
+        return None
+
+    trade_state = _closed_trade_identity_state_v1(trade)
+    if trade_state.get("has_alias_conflict"):
+        return None
+    trade_key = str(trade_state.get("canonical_key") or "")
+    exact = []
+    strong = []
+    trade_strong = trade_state.get("strong_identity") or {}
+    for candidate in candidates:
+        candidate_state = _closed_trade_identity_state_v1(candidate)
+        if candidate_state.get("has_alias_conflict"):
+            continue
+        candidate_key = str(candidate_state.get("canonical_key") or "")
+        candidate_strong = candidate_state.get("strong_identity") or {}
+        shared_fields = [
+            field
+            for field in ("lifecycle_id", "client_order_id", "order_id")
+            if trade_strong.get(field) and candidate_strong.get(field)
+        ]
+        compatible = all(
+            trade_strong[field] == candidate_strong[field]
+            for field in shared_fields
+        )
+        if trade_key and candidate_key == trade_key and compatible:
+            exact.append(candidate)
+            continue
+        lifecycle_match = bool(
+            trade_strong.get("lifecycle_id")
+            and candidate_strong.get("lifecycle_id")
+            and trade_strong["lifecycle_id"]
+            == candidate_strong["lifecycle_id"]
+        )
+        client_order_match = bool(
+            trade_strong.get("client_order_id")
+            and candidate_strong.get("client_order_id")
+            and trade_strong.get("order_id")
+            and candidate_strong.get("order_id")
+            and trade_strong["client_order_id"]
+            == candidate_strong["client_order_id"]
+            and trade_strong["order_id"] == candidate_strong["order_id"]
+        )
+        if compatible and (lifecycle_match or client_order_match):
+            strong.append(candidate)
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    if len(strong) == 1:
+        return strong[0]
+    if strong:
+        return None
+
+    # Legacy fallback is allowed only when neither side has strong identity
+    # and the reusable trade_id points to exactly one related row.
+    if not trade_strong and len(candidates) == 1:
+        candidate_state = _closed_trade_identity_state_v1(candidates[0])
+        if not (candidate_state.get("strong_identity") or {}):
+            return candidates[0]
     return None
 
 
@@ -34138,16 +35237,12 @@ def _tlm_open_trade_lifecycle_state(trade):
 def _tlm_closed_trade_lifecycle_state(trade, learning_records=None, outcome_records=None):
     pnl = _tlm_pnl_from_closed_trade(trade)
     tid = _tlm_trade_id(trade)
-    matching_learning = None
-    matching_outcome = None
-    for r in reversed(learning_records or []):
-        if str(r.get("trade_id") or "") == str(tid):
-            matching_learning = r
-            break
-    for r in reversed(outcome_records or []):
-        if str(r.get("trade_id") or "") == str(tid):
-            matching_outcome = r
-            break
+    matching_learning = _tlm_related_closed_record(
+        trade, list(reversed(learning_records or []))
+    )
+    matching_outcome = _tlm_related_closed_record(
+        trade, list(reversed(outcome_records or []))
+    )
     return {
         "trade_id": tid,
         "bot": _tlm_norm_bot(trade.get("bot")),
@@ -39236,13 +40331,93 @@ def _rcae_v1_load_closed_items():
     return registry, items, "OK"
 
 
+def _rcae_v1_supplied_strong_identity(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    alias_helper = (
+        getattr(central_trade_registry, "strong_identity_alias_state", None)
+        if central_trade_registry is not None
+        else None
+    )
+    aliases = (
+        getattr(central_trade_registry, "STRONG_IDENTITY_ALIASES", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(alias_helper) or not isinstance(aliases, dict):
+        return {
+            "available": False,
+            "values": {},
+            "conflicts": [],
+            "supplied": False,
+        }
+    states = {
+        field: dict(alias_helper(payload, field) or {})
+        for field in aliases
+    }
+    conflicts = [
+        {
+            "field": field,
+            "normalized_values": list(
+                state.get("normalized_values") or []
+            ),
+            "aliases_present": list(state.get("aliases_present") or []),
+            "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+        }
+        for field, state in states.items()
+        if state.get("conflict")
+    ]
+    values = {
+        field: state.get("value")
+        for field, state in states.items()
+        if state.get("value")
+    }
+    return {
+        "available": True,
+        "states": states,
+        "values": values,
+        "conflicts": conflicts,
+        "supplied": bool(
+            values
+            or any(state.get("present") for state in states.values())
+        ),
+    }
+
+
 def _rcae_v1_candidate_matches(trade, payload=None, key=None):
     payload = payload if isinstance(payload, dict) else {}
     if not isinstance(trade, dict):
         return False
+    supplied = _rcae_v1_supplied_strong_identity(payload)
+    if supplied.get("conflicts"):
+        return False
+    for field, expected in (supplied.get("values") or {}).items():
+        record_state_helper = (
+            getattr(
+                central_trade_registry,
+                "strong_identity_alias_state",
+                None,
+            )
+            if central_trade_registry is not None
+            else None
+        )
+        if not callable(record_state_helper):
+            return False
+        record_state = dict(record_state_helper(trade, field) or {})
+        if (
+            record_state.get("conflict")
+            or not record_state.get("value")
+            or record_state.get("value") != expected
+        ):
+            return False
     trade_id = str(payload.get("trade_id") or payload.get("trade_key") or "").strip()
-    if trade_id:
-        return str(trade.get("trade_id") or key or "") == trade_id or str(key or "") == trade_id
+    if trade_id and not (
+        str(trade.get("trade_id") or "").strip() == trade_id
+        or (
+            not trade.get("trade_id")
+            and str(key or "").strip() == trade_id
+        )
+    ):
+        return False
     symbol = _rcae_v1_norm_symbol(payload.get("symbol")) if payload.get("symbol") else None
     side = _rcae_v1_norm_side(payload.get("side")) if payload.get("side") else None
     bot = _rcae_v1_norm_bot(payload.get("bot")) if payload.get("bot") else None
@@ -39264,6 +40439,18 @@ def _rcae_v1_candidate_matches(trade, payload=None, key=None):
 
 def _rcae_v1_find_candidates(payload=None):
     config = _rcae_v1_config()
+    supplied_strong = _rcae_v1_supplied_strong_identity(payload)
+    if supplied_strong.get("conflicts"):
+        return {
+            "ok": False,
+            "status": "REAL_CLOSE_SUPPLIED_STRONG_IDENTITY_ALIAS_CONFLICT",
+            "candidates": [],
+            "diagnostics": {
+                "strong_identity_alias_conflicts": supplied_strong.get(
+                    "conflicts"
+                )
+            },
+        }
     registry, items, status = _rcae_v1_load_closed_items()
     if registry is None:
         return {"ok": False, "status": status, "candidates": [], "error": status}
@@ -39288,6 +40475,19 @@ def _rcae_v1_find_candidates(payload=None):
             "mode_payload": mode_payload,
             "trade": trade,
         }
+        identity_state = _closed_trade_identity_state_v1(trade)
+        strong_identity = identity_state.get("strong_identity") or {}
+        row.update(
+            {
+                "lifecycle_id": strong_identity.get("lifecycle_id"),
+                "client_order_id": strong_identity.get("client_order_id"),
+                "order_id": strong_identity.get("order_id"),
+                "closed_identity_key": identity_state.get("canonical_key"),
+                "strong_identity_alias_conflict": bool(
+                    identity_state.get("has_alias_conflict")
+                ),
+            }
+        )
         if is_eval:
             evaluated_count += 1
             continue
@@ -39307,6 +40507,7 @@ def _rcae_v1_find_candidates(payload=None):
         "candidates": candidates,
         "ignored_count": len(ignored),
         "ignored": ignored[:20],
+        "supplied_strong_identity": supplied_strong.get("values") or {},
     }
 
 
@@ -39387,7 +40588,63 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
         _rcae_v1_append_event(result)
         return _rcae_v1_sanitize_public(result)
 
-    selected = candidates[-1]
+    duplicate_execution_groups = []
+    grouped_indexes = set()
+    for left_index, left in enumerate(candidates):
+        if left_index in grouped_indexes:
+            continue
+        equivalent_indexes = [left_index]
+        left_trade = left.get("trade") if isinstance(left, dict) else None
+        for right_index in range(left_index + 1, len(candidates)):
+            right = candidates[right_index]
+            right_trade = (
+                right.get("trade") if isinstance(right, dict) else None
+            )
+            if _closed_trade_records_equivalent_v1(
+                left_trade, right_trade
+            ):
+                equivalent_indexes.append(right_index)
+        if len(equivalent_indexes) > 1:
+            grouped_indexes.update(equivalent_indexes)
+            duplicate_execution_groups.append(equivalent_indexes)
+    if duplicate_execution_groups:
+        result = dict(
+            event_base,
+            ok=False,
+            status="REAL_CLOSE_CLOSED_EXECUTION_DUPLICATE",
+            committed=False,
+            commit_requested=commit_requested,
+            candidate_count=len(candidates),
+            duplicate_execution_group_count=len(
+                duplicate_execution_groups
+            ),
+        )
+        _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE, result)
+        _rcae_v1_append_event(result)
+        return _rcae_v1_sanitize_public(result)
+    if len(candidates) > 1:
+        result = dict(
+            event_base,
+            ok=False,
+            status="REAL_CLOSE_MULTIPLE_DISTINCT_EXECUTIONS_PENDING",
+            committed=False,
+            commit_requested=commit_requested,
+            candidate_count=len(candidates),
+            supplied_strong_identity=(
+                candidates_payload.get("supplied_strong_identity") or {}
+            ),
+        )
+        _rcae_v1_write_json(REAL_CLOSE_AUTO_EVALUATOR_V1_STATE_FILE, result)
+        _rcae_v1_append_event(result)
+        return _rcae_v1_sanitize_public(result)
+
+    selected = sorted(
+        candidates,
+        key=lambda item: (
+            str(item.get("closed_identity_key") or ""),
+            str(item.get("trade_id") or item.get("key") or ""),
+        ),
+    )[-1]
     trade = selected.get("trade") or {}
     explicit_exit = payload.get("exit_price") or payload.get("exit") or payload.get("close_price")
     explicit_pnl = payload.get("realized_pnl") or payload.get("pnl") or payload.get("pnl_usdt")
@@ -39404,6 +40661,17 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
         "fee": fee,
         "close_reason": close_reason,
         "commit": False,
+        "expected_identity": {
+            "lifecycle_id": selected.get("lifecycle_id"),
+            "client_order_id": selected.get("client_order_id"),
+            "order_id": selected.get("order_id"),
+            "registry_mode": selected.get("registry_mode"),
+            "execution_mode": (
+                (selected.get("trade") or {}).get("execution_mode")
+                if isinstance(selected.get("trade"), dict)
+                else None
+            ),
+        },
     }
     preview = trade_close_outcome_v1_build(**build_kwargs)
     quality_ok = _rcae_v1_outcome_has_sufficient_quality(preview)
@@ -39527,6 +40795,14 @@ def real_close_auto_evaluator_v1_route():
     else:
         payload = {key: value for key, value in request.args.items()}
     commit_requested = _rcae_v1_bool(request.args.get("commit") or payload.get("commit") or request.args.get("save") or payload.get("save"), False)
+    if request.method != "POST" and commit_requested:
+        return {
+            "ok": False,
+            "status": "POST_REQUIRED_FOR_COMMIT",
+            "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+            "committed": False,
+            "token_value_exposed": False,
+        }, 405, {"Cache-Control": "no-store", "Pragma": "no-cache"}
     ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
     if commit_requested and ack != "REAL_CLOSE_AUTO_EVALUATE":
         return {
@@ -39536,10 +40812,18 @@ def real_close_auto_evaluator_v1_route():
             "note": "commit=true salva outcome no Registry; use apenas depois de conferir Dashboard/Watchdog/BingX.",
             "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
             "token_value_exposed": False,
-        }, 400
+        }, 400, {"Cache-Control": "no-store", "Pragma": "no-cache"}
     force = _rcae_v1_bool(request.args.get("force") or payload.get("force"), False)
-    result = real_close_auto_evaluator_v1_run(payload=payload, source="route", commit=commit_requested if commit_requested else None, force=force)
-    return result, 200
+    if request.method != "POST":
+        force = False
+    result = real_close_auto_evaluator_v1_run(
+        payload=payload,
+        source="route",
+        # GET is always an explicit preview; it must not inherit auto_commit.
+        commit=commit_requested if request.method == "POST" else False,
+        force=force,
+    )
+    return result, 200, {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
 
 @app.route("/realcloseautoevaluator/log", methods=["GET"])
@@ -44924,16 +46208,100 @@ def _pppa_v1_closed_semantic_fingerprint(ev):
     return None
 
 
+def _pppa_v1_closed_registry_record(ev):
+    """Project one PAPER_CLOSED event into a canonical Registry-shaped record."""
+    try:
+        raw = (
+            ev.get("raw_public")
+            if isinstance(ev.get("raw_public"), dict)
+            else {}
+        )
+        projected = dict(raw)
+        projected.setdefault(
+            "trade_id", _pppa_v1_closed_trade_id_from_event(ev)
+        )
+        projected.setdefault("bot", "PREDATOR")
+        projected.setdefault(
+            "setup",
+            ev.get("setup")
+            or _pppa_v1_deep_find(
+                raw, ["setup", "signal_type", "strategy_name"]
+            )
+            or "SMART_PREDATOR",
+        )
+        projected.setdefault(
+            "symbol",
+            ev.get("symbol")
+            or _pppa_v1_deep_find(
+                raw, ["symbol", "symbol_clean", "pair", "market_symbol"]
+            ),
+        )
+        projected.setdefault(
+            "side",
+            ev.get("side")
+            or _pppa_v1_deep_find(
+                raw, ["side", "direction", "position_side", "positionSide"]
+            ),
+        )
+        projected.setdefault(
+            "closed_at",
+            _pppa_v1_deep_find(
+                raw,
+                [
+                    "closed_at",
+                    "datetime",
+                    "ts",
+                    "context_ts",
+                    "generated_at",
+                ],
+            )
+            or ev.get("ts"),
+        )
+        projected["status"] = "CLOSED"
+        return projected
+    except Exception:
+        return None
+
+
+def _pppa_v1_closed_registry_identity(ev):
+    """Project a CLOSED event into the Registry's conservative identity model."""
+    try:
+        projected = _pppa_v1_closed_registry_record(ev)
+        if not isinstance(projected, dict):
+            raise ValueError("CLOSED_EVENT_PROJECTION_FAILED")
+        state = _closed_trade_identity_state_v1(projected)
+        return {
+            "key": str(state.get("canonical_key") or "").strip() or None,
+            "kind": state.get("identity_kind"),
+            "has_alias_conflict": bool(state.get("has_alias_conflict")),
+        }
+    except Exception:
+        return {"key": None, "kind": None, "has_alias_conflict": False}
+
+
 def _pppa_v1_closed_canonical_key(ev):
     """Chave única de fechamento PAPER para deduplicar history_events/audit/registry.
 
     V1.3 SEMANTIC DEDUP:
-    1) metadata.source_event_key / history event key, quando existir;
-    2) fingerprint semântico: symbol + side + setup + closed_at + entry + exit_price + pnl_r/pct;
-    3) trade_id/uid, como fallback;
-    4) fallback conservador.
+    1) canonical Registry identity, when strong/specific;
+    2) source event key;
+    3) complete semantic fingerprint;
+    4) canonical legacy/exact identity. A bare trade_id is never a key.
     """
     try:
+        registry_identity = _pppa_v1_closed_registry_identity(ev)
+        if (
+            registry_identity.get("key")
+            and registry_identity.get("kind")
+            in {
+                "LIFECYCLE_ID",
+                "CLIENT_AND_ORDER_ID",
+                "SPECIFIC_EXECUTION_ID",
+                "CONFLICT_QUARANTINED",
+            }
+        ):
+            return "registry_identity|" + registry_identity["key"]
+
         source_event_key = _pppa_v1_source_event_key_from_closed(ev)
         if source_event_key:
             return "source_event_key|" + source_event_key
@@ -44942,16 +46310,19 @@ def _pppa_v1_closed_canonical_key(ev):
         if semantic:
             return semantic
 
-        trade_id = _pppa_v1_closed_trade_id_from_event(ev)
-        if trade_id:
-            return "trade_id|" + str(trade_id).upper().strip()
+        if registry_identity.get("key"):
+            return "registry_identity|" + registry_identity["key"]
 
         raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
+        trade_id = _pppa_v1_closed_trade_id_from_event(ev)
         symbol = _pppa_v1_norm_symbol(ev.get("symbol") or _pppa_v1_deep_find(raw, ["symbol", "symbol_clean", "pair", "market_symbol"]))
         side = _pppa_v1_norm_side(ev.get("side") or _pppa_v1_deep_find(raw, ["side", "direction", "position_side", "positionSide"]))
         setup = _pppa_v1_norm_text(ev.get("setup") or _pppa_v1_deep_find(raw, ["setup", "signal_type", "strategy_name"]) or "SMART_PREDATOR")
         closed_at = _pppa_v1_closed_at_key(_pppa_v1_deep_find(raw, ["closed_at", "datetime", "ts", "context_ts", "generated_at"]) or ev.get("ts"))
-        return f"fallback|{symbol}|{side}|{setup}|{closed_at}|{str(ev.get('source') or '')}"
+        return (
+            f"fallback|{str(trade_id or '').upper().strip()}|{symbol}|"
+            f"{side}|{setup}|{closed_at}|{str(ev.get('key') or '')}"
+        )
     except Exception:
         return "rawkey|" + str(ev.get("key") or uuid.uuid4())
 
@@ -44996,10 +46367,20 @@ def _pppa_v1_registry_closed_as_events(registry):
     for t in registry.get("closed_trades") or []:
         if not isinstance(t, dict):
             continue
+        identity_key = str(
+            _closed_trade_identity_state_v1(t).get("canonical_key") or ""
+        )
         out.append({
             "source": "trade_registry_closed",
             "kind": "PAPER_CLOSED",
-            "key": "trade_registry_closed|" + str(t.get("trade_id") or t.get("id") or _pppa_v1_event_key(t, "trade_registry_closed")),
+            "key": "trade_registry_closed|"
+            + (
+                identity_key
+                or str(
+                    t.get("id")
+                    or _pppa_v1_event_key(t, "trade_registry_closed")
+                )
+            ),
             "ts": t.get("closed_at") or t.get("updated_at") or t.get("last_update"),
             "symbol": _pppa_v1_norm_symbol(t.get("symbol") or t.get("symbol_clean")),
             "side": _pppa_v1_norm_side(t.get("side") or t.get("direction")),
@@ -45026,16 +46407,8 @@ def _pppa_v1_build_pnl_stats(events, registry):
     # de uma fonte trade_registry_* em events. Assim evitamos contar o próprio Registry
     # duas vezes quando trade_registry.json também já foi lido em _collect_source_events.
     registry_as_events = _pppa_v1_registry_closed_as_events(registry)
-    registry_keys_already_seen = set()
-    for ev in raw_closed:
-        src = str(ev.get("source") or "").lower()
-        if "trade_registry" in src:
-            registry_keys_already_seen.add(_pppa_v1_closed_canonical_key(ev))
     for ev in registry_as_events:
-        ck = _pppa_v1_closed_canonical_key(ev)
-        if ck not in registry_keys_already_seen:
-            raw_closed.append(ev)
-            registry_keys_already_seen.add(ck)
+        raw_closed.append(ev)
 
     filter_stage.finish(
         raw_closed,
@@ -45047,14 +46420,64 @@ def _pppa_v1_build_pnl_stats(events, registry):
 
     grouping_stage = predator_audit_stage("predator_pnl_grouping", "group_by_canonical_trade", records_in=len(raw_closed))
     grouping_stage.__enter__()
-    grouped = {}
+    grouped_items = []
     for ev in raw_closed:
         ck = _pppa_v1_closed_canonical_key(ev)
         item = dict(ev)
         item["canonical_key"] = ck
         item["semantic_fingerprint"] = _pppa_v1_closed_semantic_fingerprint(ev)
         item["source_event_key"] = _pppa_v1_source_event_key_from_closed(ev)
-        grouped.setdefault(ck, []).append(item)
+        item["_closed_registry_record"] = _pppa_v1_closed_registry_record(ev)
+        grouped_items.append(item)
+
+    adjacency = [set([index]) for index in range(len(grouped_items))]
+    identity_conflicts = []
+    for left_index in range(len(grouped_items)):
+        left = grouped_items[left_index]
+        for right_index in range(left_index + 1, len(grouped_items)):
+            right = grouped_items[right_index]
+            relation = _closed_trade_record_relation_v1(
+                left.get("_closed_registry_record"),
+                right.get("_closed_registry_record"),
+            )
+            if relation == "CONFLICT":
+                identity_conflicts.append(
+                    {
+                        "left": left.get("canonical_key"),
+                        "right": right.get("canonical_key"),
+                        "reason": "CLOSED_EXECUTION_IDENTITY_CONFLICT",
+                    }
+                )
+                continue
+            same_fallback_key = bool(
+                left.get("canonical_key")
+                and left.get("canonical_key")
+                == right.get("canonical_key")
+            )
+            if relation == "EQUIVALENT" or (
+                relation == "DISTINCT" and same_fallback_key
+            ):
+                adjacency[left_index].add(right_index)
+                adjacency[right_index].add(left_index)
+
+    grouped = []
+    seen_indexes = set()
+    for start_index in range(len(grouped_items)):
+        if start_index in seen_indexes:
+            continue
+        pending = [start_index]
+        component_indexes = []
+        seen_indexes.add(start_index)
+        while pending:
+            current_index = pending.pop()
+            component_indexes.append(current_index)
+            for linked_index in sorted(adjacency[current_index]):
+                if linked_index not in seen_indexes:
+                    seen_indexes.add(linked_index)
+                    pending.append(linked_index)
+        grouped.append(
+            [grouped_items[index] for index in sorted(component_indexes)]
+        )
 
     grouping_stage.finish(grouped, records_processed=len(raw_closed), objects_produced=len(grouped))
     grouping_stage.__exit__(None, None, None)
@@ -45065,7 +46488,14 @@ def _pppa_v1_build_pnl_stats(events, registry):
     duplicate_closed = []
     sources_per_trade = []
     duplicate_reasons = {}
-    for ck, group in grouped.items():
+    for group in grouped:
+        ck = str(
+            sorted(
+                str(item.get("canonical_key") or "") for item in group
+            )[0]
+            if group
+            else ""
+        )
         def _score(x):
             pnl_pct, pnl_r = _pppa_v1_pnl_fields_from_event(x)
             has_pnl = 1 if (pnl_pct is not None or pnl_r is not None) else 0
@@ -45074,6 +46504,7 @@ def _pppa_v1_build_pnl_stats(events, registry):
 
         ordered = sorted(group, key=_score, reverse=True)
         chosen = dict(ordered[0])
+        chosen.pop("_closed_registry_record", None)
         reason = _pppa_v1_duplicate_reason_for_group(group) if len(group) > 1 else None
         chosen["duplicate_source_count"] = max(0, len(group) - 1)
         chosen["duplicate_reason"] = reason
@@ -45082,6 +46513,7 @@ def _pppa_v1_build_pnl_stats(events, registry):
         if len(group) > 1:
             for dup in ordered[1:]:
                 d2 = dict(dup)
+                d2.pop("_closed_registry_record", None)
                 d2["duplicate_reason"] = reason
                 duplicate_closed.append(d2)
             duplicate_reasons[reason or "DUPLICATE_CLOSED"] = duplicate_reasons.get(reason or "DUPLICATE_CLOSED", 0) + (len(group) - 1)
@@ -45162,6 +46594,8 @@ def _pppa_v1_build_pnl_stats(events, registry):
         "duplicate_closed_count": len(duplicate_closed),
         "duplicate_closed_trade_count": duplicate_closed_trade_count,
         "duplicate_reasons": duplicate_reasons,
+        "closed_identity_conflict_count": len(identity_conflicts),
+        "closed_identity_conflicts": identity_conflicts[:30],
         "paper_closed_with_pnl_count": len(with_pnl),
         "paper_closed_missing_pnl_count": len(missing_pnl),
         "wins": wins,
@@ -45796,22 +47230,41 @@ def predator_paper_lifecycle_audit_v1_status(include_samples=True, limit=1500, u
         if tid not in module_by_id and key not in module_by_key:
             orphan_registry_open.append({"trade_id": tid, "key": key, "registry_trade": _ppla_v1_public(t, max_string=260)})
 
+    closed_signature_fn = globals().get("_pprsf_v1_closed_signature")
+    closed_builder = globals().get("_pprsf_v1_build_closed_trade_from_event")
     closed_by_key = {}
-    for t in registry_closed:
-        tid = _ppla_v1_get_trade_id(t)
-        key = str(tid or _ppla_v1_trade_key(t))
-        closed_by_key[key] = t
+    if callable(closed_signature_fn):
+        for trade in registry_closed:
+            if not isinstance(trade, dict):
+                continue
+            key = closed_signature_fn(trade)
+            closed_by_key.setdefault(str(key), []).append(trade)
+    else:
+        for trade in registry_closed:
+            trade_id = _ppla_v1_get_trade_id(trade)
+            key = str(trade_id or _ppla_v1_trade_key(trade))
+            closed_by_key.setdefault(key, []).append(trade)
     missing_registry_closed = []
     for ev in closed_events:
         ev_key = _ppla_v1_closed_key_from_event(ev)
         raw = ev.get("raw_public") if isinstance(ev.get("raw_public"), dict) else {}
-        raw_tid = raw.get("trade_id") or raw.get("uid")
         base_key = _ppla_v1_trade_key(raw or ev)
-        matched = False
-        for candidate in [raw_tid, ev_key, base_key]:
-            if candidate and str(candidate) in closed_by_key:
-                matched = True
-                break
+        event_trade = (
+            closed_builder(ev) if callable(closed_builder) else None
+        )
+        if isinstance(event_trade, dict):
+            matched = any(
+                _closed_trade_records_equivalent_v1(
+                    event_trade, registry_trade
+                )
+                for registry_trade in registry_closed
+                if isinstance(registry_trade, dict)
+            )
+        else:
+            # A weak trade_id/event key is never proof of one CLOSED
+            # execution.  If a canonical candidate cannot be built, report it
+            # as unresolved instead of silently matching another lifecycle.
+            matched = False
         if not matched:
             missing_registry_closed.append({"event_key": ev_key, "base_key": base_key, "event": _ppla_v1_public(ev, max_string=260)})
 
@@ -46154,7 +47607,27 @@ def _pprsf_v1_closed_list(registry):
         return []
     raw = registry.get("closed_trades", [])
     if isinstance(raw, dict):
-        return [x for x in raw.values() if isinstance(x, dict)]
+        converter = globals().get("_trpsf_v1_iter_trades")
+        if callable(converter):
+            try:
+                return converter(
+                    raw, preserve_closed_collection_keys=True
+                )
+            except Exception:
+                return []
+        rows = []
+        for collection_key, value in raw.items():
+            if not isinstance(value, dict):
+                return []
+            item = dict(value)
+            key_text = str(collection_key or "").strip()
+            trade_id = str(item.get("trade_id") or "").strip()
+            if key_text and not trade_id and ":" in key_text:
+                item["trade_id"] = key_text
+            elif key_text and key_text != trade_id:
+                item["registry_collection_key"] = key_text
+            rows.append(item)
+        return rows
     if isinstance(raw, list):
         return [x for x in raw if isinstance(x, dict)]
     return []
@@ -46302,6 +47775,8 @@ def _pprsf_v1_build_closed_trade_from_event(event):
         "tp50": _ppla_v1_float(raw.get("tp50"), default=None),
         "qty": raw.get("qty"),
         "status": "CLOSED",
+        "registry_mode": "PAPER",
+        "execution_mode": "PAPER",
         "source": "predator_paper_registry_sync_fix_v1",
         "close_reason": close_reason,
         "result_pct": pnl_pct,
@@ -46314,6 +47789,7 @@ def _pprsf_v1_build_closed_trade_from_event(event):
             "sync_version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
             "synced_at": _pprsf_v1_now(),
             "execution_mode": "PAPER",
+            "registry_mode": "PAPER",
             "execution_sent": False,
             "source_event_key": raw.get("source_event_key"),
             "source": raw.get("source"),
@@ -46329,6 +47805,26 @@ def _pprsf_v1_build_closed_trade_from_event(event):
             "management_cycles": raw.get("management_cycles"),
         },
     }
+    aliases = (
+        getattr(central_trade_registry, "STRONG_IDENTITY_ALIASES", {})
+        if central_trade_registry is not None
+        else {}
+    )
+    containers = [
+        event,
+        raw,
+        raw.get("raw") if isinstance(raw.get("raw"), dict) else {},
+    ]
+    if isinstance(aliases, dict):
+        for field_aliases in aliases.values():
+            for alias in field_aliases or ():
+                for container in containers:
+                    if (
+                        isinstance(container, dict)
+                        and container.get(alias) not in (None, "")
+                    ):
+                        trade[alias] = container.get(alias)
+                        break
     return trade
 
 
@@ -46342,19 +47838,26 @@ def _pprsf_v1_existing_ids_and_signatures(registry):
         ids.add(str(item.get("trade_id") or tid))
         sig_open.add(_pprsf_v1_signature_trade(item))
     for item in closed_l:
-        if item.get("trade_id"):
-            ids.add(str(item.get("trade_id")))
         sig_closed.add(_pprsf_v1_closed_signature(item))
     return ids, sig_open, sig_closed
 
 
 def _pprsf_v1_closed_signature(trade):
-    fields = (
-        trade.get("bot"), trade.get("setup"), trade.get("symbol"), trade.get("side"),
-        trade.get("opened_at") or trade.get("entry_time"), trade.get("closed_at") or trade.get("exit_time"),
-        trade.get("close_reason") or trade.get("exit_reason"), trade.get("entry"), trade.get("exit_price") or trade.get("exit"),
+    state = _closed_trade_identity_state_v1(
+        trade if isinstance(trade, dict) else {}
     )
-    return "|".join(str(value or "") for value in fields)
+    canonical_key = state.get("canonical_key")
+    if canonical_key:
+        return str(canonical_key)
+    return "closed_unmerged|" + hashlib.sha256(
+        json.dumps(
+            trade if isinstance(trade, dict) else {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _pprsf_v1_recalculate_lifecycle_counts_from_registry(registry):
@@ -46380,18 +47883,15 @@ def _pprsf_v1_recalculate_lifecycle_counts_from_registry(registry):
         1 for item in registry_open
         if _ppla_v1_get_trade_id(item) not in module_by_id and _ppla_v1_trade_key(item) not in module_keys
     )
-    closed_by_key = {}
-    for item in registry_closed:
-        trade_id = _ppla_v1_get_trade_id(item)
-        closed_by_key[str(trade_id or _ppla_v1_trade_key(item))] = item
     closed_events, _ = _ppla_v1_get_closed_paper_events(limit=2000)
     missing_closed = 0
     for event in closed_events:
-        event_key = _ppla_v1_closed_key_from_event(event)
-        raw = event.get("raw_public") if isinstance(event.get("raw_public"), dict) else {}
-        raw_trade_id = raw.get("trade_id") or raw.get("uid")
-        base_key = _ppla_v1_trade_key(raw or event)
-        if not any(candidate and str(candidate) in closed_by_key for candidate in (raw_trade_id, event_key, base_key)):
+        event_trade = _pprsf_v1_build_closed_trade_from_event(event)
+        if not isinstance(event_trade, dict) or not any(
+            _closed_trade_records_equivalent_v1(event_trade, existing)
+            for existing in registry_closed
+            if isinstance(existing, dict)
+        ):
             missing_closed += 1
     return {
         "module_open_count": len(module_positions),
@@ -46494,14 +47994,30 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
             continue
         tid = str(trade.get("trade_id"))
         sig = _pprsf_v1_closed_signature(trade)
-        if tid in existing_ids or sig in closed_sigs:
+        comparison_pool = [
+            existing
+            for existing in list(closed_trades) + list(planned_closed)
+            if isinstance(existing, dict)
+        ]
+        relations = [
+            _closed_trade_record_relation_v1(trade, existing)
+            for existing in comparison_pool
+        ]
+        if "CONFLICT" in relations:
+            closed_skipped.append({
+                "trade_id": tid,
+                "symbol": trade.get("symbol"),
+                "side": trade.get("side"),
+                "reason": "CLOSED_EXECUTION_IDENTITY_CONFLICT",
+            })
+            continue
+        if "EQUIVALENT" in relations:
             closed_skipped.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "reason": "ALREADY_IN_REGISTRY"})
             continue
         planned_closed.append(trade)
         if commit and ack_ok and not errors:
             try:
                 closed_trades.append(trade)
-                existing_ids.add(tid)
                 closed_sigs.add(sig)
                 closed_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup"), "pnl_pct": trade.get("pnl_pct"), "pnl_r": trade.get("pnl_r")})
             except Exception as exc:
@@ -46528,7 +48044,9 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
                 "open_repaired_count": len(open_repaired),
                 "closed_repaired_count": len(closed_repaired),
             }
-            central_trade_registry.save_registry(registry)
+            registry_write = central_trade_registry.save_registry(registry)
+            if registry_write is False:
+                raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
             committed = True
             actions.append("REGISTRY_SAVED")
         except Exception as exc:
@@ -46856,15 +48374,58 @@ def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_
         try:
             open_trades = _pprsf_v1_open_dict(registry)
             closed_trades = list(_pprsf_v1_closed_list(registry))
-            closed_index = {
-                str(item.get("trade_id")): index
-                for index, item in enumerate(closed_trades)
-                if item.get("trade_id")
-            }
             for item in planned:
                 source_trade = open_trades.pop(item["registry_key"], None)
                 if not isinstance(source_trade, dict):
                     skipped.append({"trade_id": item["trade_id"], "reason": "OPEN_DISAPPEARED_BEFORE_COMMIT"})
+                    continue
+                identity_candidate = dict(source_trade)
+                for pnl_field in (
+                    "pnl_pct",
+                    "result_pct",
+                    "pnl_r",
+                    "result_r",
+                    "realized_pnl",
+                    "realized_pnl_usdt",
+                ):
+                    identity_candidate.pop(pnl_field, None)
+                identity_candidate["status"] = "CLOSED"
+                relations = [
+                    _closed_trade_record_relation_v1(
+                        identity_candidate, closed_trade
+                    )
+                    for closed_trade in closed_trades
+                ]
+                conflicting_closed_indexes = [
+                    index
+                    for index, relation in enumerate(relations)
+                    if relation == "CONFLICT"
+                ]
+                if conflicting_closed_indexes:
+                    open_trades[item["registry_key"]] = source_trade
+                    skipped.append(
+                        {
+                            "trade_id": item["trade_id"],
+                            "reason": "CLOSED_EXECUTION_IDENTITY_CONFLICT",
+                            "conflict_count": len(
+                                conflicting_closed_indexes
+                            ),
+                        }
+                    )
+                    continue
+                matching_closed_indexes = [
+                    index
+                    for index, relation in enumerate(relations)
+                    if relation == "EQUIVALENT"
+                ]
+                if len(matching_closed_indexes) > 1:
+                    open_trades[item["registry_key"]] = source_trade
+                    skipped.append(
+                        {
+                            "trade_id": item["trade_id"],
+                            "reason": "CLOSED_EXECUTION_IDENTITY_AMBIGUOUS",
+                        }
+                    )
                     continue
                 metadata = dict(source_trade.get("metadata") or {})
                 metadata.update({
@@ -46875,8 +48436,8 @@ def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_
                     "previous_status": "OPEN",
                     "execution_mode": "PAPER",
                 })
-                if item["trade_id"] in closed_index:
-                    index = closed_index[item["trade_id"]]
+                if len(matching_closed_indexes) == 1:
+                    index = matching_closed_indexes[0]
                     existing = dict(closed_trades[index])
                     existing_metadata = dict(existing.get("metadata") or {})
                     existing_metadata.update(metadata)
@@ -46885,9 +48446,7 @@ def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_
                     closed_trades[index] = existing
                     action = "EXISTING_CLOSED_RECONCILED"
                 else:
-                    reconciled = dict(source_trade)
-                    for pnl_field in ("pnl_pct", "result_pct", "pnl_r", "result_r", "realized_pnl", "realized_pnl_usdt"):
-                        reconciled.pop(pnl_field, None)
+                    reconciled = dict(identity_candidate)
                     reconciled.update({
                         "status": "CLOSED",
                         "close_reason": "ORPHAN_REGISTRY_OPEN_RECONCILED",
@@ -46895,21 +48454,23 @@ def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_
                         "last_update": generated_at,
                         "metadata": metadata,
                     })
-                    closed_index[item["trade_id"]] = len(closed_trades)
                     closed_trades.append(reconciled)
                     action = "CLOSED_RECONCILED_ORPHAN"
                 repaired.append({"trade_id": item["trade_id"], "action": action})
-            registry["open_trades"] = open_trades
-            registry["closed_trades"] = closed_trades
-            registry["last_update"] = generated_at
-            registry["last_orphan_open_fix"] = {
-                "version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
-                "source": "predator_orphan_open_fix_v1",
-                "synced_at": generated_at,
-                "repaired_count": len(repaired),
-            }
-            central_trade_registry.save_registry(registry)
-            committed = True
+            if repaired:
+                registry["open_trades"] = open_trades
+                registry["closed_trades"] = closed_trades
+                registry["last_update"] = generated_at
+                registry["last_orphan_open_fix"] = {
+                    "version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
+                    "source": "predator_orphan_open_fix_v1",
+                    "synced_at": generated_at,
+                    "repaired_count": len(repaired),
+                }
+                registry_write = central_trade_registry.save_registry(registry)
+                if registry_write is False:
+                    raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+                committed = True
         except Exception as exc:
             errors.append(f"Falha ao salvar Trade Registry: {exc}")
 
@@ -47072,17 +48633,37 @@ _TRPSF_V1_STATE = {
     "patched": False,
     "migration_done": False,
     "active_file": None,
+    "original_registry_file": None,
     "legacy_files": [],
     "last_status": None,
     "last_load_ok": None,
     "last_write_ok": None,
     "last_error": None,
     "migrated_from_legacy": False,
+    "temporary_read_source": None,
+    "temporary_read_only": False,
+    "write_allowed": False,
 }
 _TRPSF_V1_ORIGINAL_LOAD_REGISTRY = None
 _TRPSF_V1_ORIGINAL_SAVE_REGISTRY = None
 _TRPSF_V1_ORIGINAL_SNAPSHOT = central_trade_registry_snapshot if "central_trade_registry_snapshot" in globals() else None
 _TRPSF_V1_ORIGINAL_BOT_HEALTH = bot_health if "bot_health" in globals() else None
+
+
+def _trpsf_v1_registry_lock():
+    """Return the Registry's process lock; persistence never runs unlocked."""
+    lock = (
+        getattr(central_trade_registry, "_lock", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if (
+        lock is None
+        or not hasattr(lock, "__enter__")
+        or not hasattr(lock, "__exit__")
+    ):
+        return None
+    return lock
 
 
 def _trpsf_v1_now():
@@ -47136,12 +48717,43 @@ def _trpsf_v1_default_registry():
     }
 
 
-def _trpsf_v1_iter_trades(value):
+def _trpsf_v1_iter_trades(value, preserve_closed_collection_keys=False):
     if isinstance(value, dict):
-        return [x for x in value.values() if isinstance(x, dict)]
+        rows = []
+        for collection_key, raw in value.items():
+            if not isinstance(raw, dict):
+                continue
+            trade = dict(raw)
+            if preserve_closed_collection_keys:
+                key_text = str(collection_key or "").strip()
+                trade_id = str(trade.get("trade_id") or "").strip()
+                if key_text and not trade_id and ":" in key_text:
+                    trade["trade_id"] = key_text
+                    trade_id = key_text
+                elif key_text and key_text != trade_id:
+                    trade["registry_collection_key"] = key_text
+            rows.append(trade)
+        return rows
     if isinstance(value, list):
-        return [x for x in value if isinstance(x, dict)]
+        return [dict(x) for x in value if isinstance(x, dict)]
     return []
+
+
+def _trpsf_v1_registry_shape_errors(registry):
+    if not isinstance(registry, dict):
+        return ["REGISTRY_NOT_OBJECT"]
+    errors = []
+    for field in ("open_trades", "closed_trades"):
+        value = registry.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, (dict, list)):
+            errors.append(f"{field.upper()}_INVALID_SHAPE")
+            continue
+        rows = list(value.values()) if isinstance(value, dict) else list(value)
+        if any(not isinstance(row, dict) for row in rows):
+            errors.append(f"{field.upper()}_INVALID_RECORD")
+    return sorted(set(errors))
 
 
 def _trpsf_v1_norm_symbol(value):
@@ -47167,6 +48779,10 @@ def _trpsf_v1_norm_setup(value):
 def _trpsf_v1_trade_key(trade, closed=False):
     if not isinstance(trade, dict):
         return None
+    if closed:
+        state = _closed_trade_identity_state_v1(trade)
+        key = state.get("canonical_key")
+        return str(key) if key else None
     trade_id = str(trade.get("trade_id") or trade.get("id") or "").strip()
     if trade_id:
         return "id|" + trade_id
@@ -47174,11 +48790,6 @@ def _trpsf_v1_trade_key(trade, closed=False):
     side = _trpsf_v1_norm_side(trade.get("side") or trade.get("direction"))
     setup = _trpsf_v1_norm_setup(trade.get("setup") or trade.get("signal_type") or trade.get("setup_label"))
     entry = str(trade.get("entry") or trade.get("entry_price") or "").strip()
-    if closed:
-        closed_at = str(trade.get("closed_at") or trade.get("closed_ts") or trade.get("ts") or trade.get("datetime") or "").strip()
-        exit_price = str(trade.get("exit_price") or trade.get("exit") or trade.get("close_price") or "").strip()
-        result_r = str(trade.get("result_r") or trade.get("pnl_r") or "").strip()
-        return "closed|" + "|".join([symbol, side, setup, closed_at, entry, exit_price, result_r])
     opened_at = str(trade.get("opened_at") or trade.get("created_at_txt") or trade.get("created_at") or "").strip()
     return "open|" + "|".join([symbol, side, setup, entry, opened_at])
 
@@ -47186,7 +48797,9 @@ def _trpsf_v1_trade_key(trade, closed=False):
 def _trpsf_v1_registry_counts(registry):
     registry = registry if isinstance(registry, dict) else {}
     open_trades = _trpsf_v1_iter_trades(registry.get("open_trades"))
-    closed_trades = _trpsf_v1_iter_trades(registry.get("closed_trades"))
+    closed_trades = _trpsf_v1_iter_trades(
+        registry.get("closed_trades"), preserve_closed_collection_keys=True
+    )
     return {
         "open_count": len(open_trades),
         "closed_count": len(closed_trades),
@@ -47205,6 +48818,12 @@ def _trpsf_v1_active_file():
 
 def _trpsf_v1_legacy_candidate_paths():
     candidates = []
+    original_path = _TRPSF_V1_STATE.get("original_registry_file")
+    if original_path:
+        try:
+            candidates.append(Path(str(original_path)))
+        except Exception:
+            pass
     try:
         if central_trade_registry is not None:
             p = getattr(central_trade_registry, "TRADE_REGISTRY_FILE", None)
@@ -47239,51 +48858,307 @@ def _trpsf_v1_legacy_candidate_paths():
     return unique
 
 
+def _trpsf_v1_temporary_registry_source(active_file):
+    original_path = _TRPSF_V1_STATE.get("original_registry_file")
+    candidates = []
+    if original_path:
+        try:
+            candidates.append(Path(str(original_path)))
+        except Exception:
+            pass
+    for candidate in _trpsf_v1_legacy_candidate_paths():
+        try:
+            path = Path(candidate)
+        except Exception:
+            continue
+        candidates.append(path)
+    unique = []
+    seen = set()
+    for path in candidates:
+        try:
+            key = str(path.resolve()) if path.exists() else str(path)
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    valid_sources = []
+    invalid_shape = False
+    read_errors = False
+    active_resolved = None
+    try:
+        active_resolved = str(Path(active_file).resolve())
+    except Exception:
+        active_resolved = None
+    for path in unique:
+        try:
+            if active_resolved is not None and path.exists() and str(path.resolve()) == active_resolved:
+                continue
+        except Exception:
+            pass
+        if not path.exists():
+            continue
+        reg = _trpsf_v1_read_json(path)
+        if not isinstance(reg, dict):
+            read_errors = True
+            continue
+        shape_errors = _trpsf_v1_registry_shape_errors(reg)
+        if shape_errors:
+            invalid_shape = True
+            continue
+        valid_sources.append((path, reg))
+    if not valid_sources:
+        if invalid_shape:
+            return None, None, "LEGACY_REGISTRY_INVALID_SHAPE"
+        if read_errors:
+            return None, None, "LEGACY_REGISTRY_READ_ERROR"
+        return None, None, "NO_REGISTRY_SOURCES"
+    if len(valid_sources) > 1:
+        canonical = json.dumps(
+            valid_sources[0][1],
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if any(
+            json.dumps(reg, ensure_ascii=False, sort_keys=True, default=str) != canonical
+            for _, reg in valid_sources[1:]
+        ):
+            return None, None, "REGISTRY_MIGRATION_SOURCE_AMBIGUOUS"
+    chosen_path, chosen_registry = valid_sources[0]
+    if original_path:
+        try:
+            original_resolved = str(Path(original_path).resolve())
+            for path, reg in valid_sources:
+                if str(path.resolve()) == original_resolved:
+                    chosen_path, chosen_registry = path, reg
+                    break
+        except Exception:
+            pass
+    return chosen_path, chosen_registry, None
+
+
 def _trpsf_v1_merge_registries(registries, active_exists=False):
     merged = _trpsf_v1_default_registry()
-    open_map = {}
-    closed_map = {}
+    open_candidates = {}
+    closed_records = []
+    closed_sources = []
     sources_used = []
-    for source_name, reg in registries:
+    source_shape_errors = []
+    metadata_candidates = {}
+    ordered_registries = sorted(
+        list(registries or []),
+        key=lambda item: (
+            str(item[0]),
+            json.dumps(
+                item[1],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        ),
+    )
+    for source_name, reg in ordered_registries:
         if not isinstance(reg, dict):
+            source_shape_errors.append({
+                "source": str(source_name),
+                "errors": ["REGISTRY_NOT_OBJECT"],
+            })
+            continue
+        shape_errors = _trpsf_v1_registry_shape_errors(reg)
+        if shape_errors:
+            source_shape_errors.append({
+                "source": str(source_name),
+                "errors": shape_errors,
+            })
             continue
         sources_used.append(str(source_name))
-        # Preserve non-trade metadata from active/current registries, but never let it erase trades.
+        # Resolve non-trade metadata deterministically.  Active metadata remains
+        # authoritative in the active-file branch of bootstrap; this branch is
+        # primarily used when only legacy sources exist.
         for k, v in reg.items():
-            if k not in {"open_trades", "closed_trades"} and k not in merged:
-                merged[k] = v
+            if k in {
+                "open_trades",
+                "closed_trades",
+                "closed_history_identity_merge",
+                "updated_at",
+            }:
+                continue
+            document = json.dumps(
+                v,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            metadata_candidates.setdefault(str(k), {})[document] = v
         for trade in _trpsf_v1_iter_trades(reg.get("open_trades")):
             key = _trpsf_v1_trade_key(trade, closed=False)
             if not key:
                 continue
             trade_id = str(trade.get("trade_id") or key).strip()
-            open_map[trade_id] = dict(trade)
-        for trade in _trpsf_v1_iter_trades(reg.get("closed_trades")):
-            key = _trpsf_v1_trade_key(trade, closed=True)
-            if not key:
-                continue
-            if key not in closed_map:
-                closed_map[key] = dict(trade)
+            open_candidates.setdefault(trade_id, []).append(dict(trade))
+        for trade in _trpsf_v1_iter_trades(
+            reg.get("closed_trades"), preserve_closed_collection_keys=True
+        ):
+            closed_records.append(dict(trade))
+            closed_sources.append(str(source_name))
+    closed_merge = _merge_closed_trade_records_v1(
+        closed_records, sources=closed_sources
+    )
+    open_map = {}
+    open_identity_conflicts = []
+    for trade_id, candidates in sorted(open_candidates.items()):
+        unique = {
+            json.dumps(
+                candidate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ): candidate
+            for candidate in candidates
+        }
+        ordered_documents = sorted(unique)
+        open_map[trade_id] = dict(unique[ordered_documents[0]])
+        if len(ordered_documents) > 1:
+            open_identity_conflicts.append({
+                "trade_id": trade_id,
+                "record_count": len(ordered_documents),
+                "reason": "OPEN_TRADE_ID_COLLISION_WITH_DISTINCT_RECORDS",
+            })
+    closed_diagnostics = dict(closed_merge.get("diagnostics") or {})
+    metadata_conflicts = []
+    for field, values in sorted(metadata_candidates.items()):
+        documents = sorted(values)
+        if field not in merged and documents:
+            merged[field] = values[documents[0]]
+        if len(documents) > 1:
+            metadata_conflicts.append({
+                "field": field,
+                "value_count": len(documents),
+                "reason": "NON_TRADE_METADATA_CONFLICT_RESOLVED_DETERMINISTICALLY",
+            })
+    if source_shape_errors or open_identity_conflicts:
+        closed_diagnostics["safe_to_commit"] = False
+    closed_diagnostics["source_shape_error_count"] = len(
+        source_shape_errors
+    )
+    closed_diagnostics["source_shape_errors"] = source_shape_errors[:100]
+    closed_diagnostics["open_identity_conflict_count"] = len(
+        open_identity_conflicts
+    )
+    closed_diagnostics["open_identity_conflicts"] = (
+        open_identity_conflicts[:100]
+    )
+    closed_diagnostics["non_trade_metadata_conflict_count"] = len(
+        metadata_conflicts
+    )
+    closed_diagnostics["non_trade_metadata_conflicts"] = (
+        metadata_conflicts[:100]
+    )
     merged["open_trades"] = open_map
-    merged["closed_trades"] = list(closed_map.values())
+    merged["closed_trades"] = [
+        dict(trade)
+        for trade in (closed_merge.get("records") or [])
+        if isinstance(trade, dict)
+    ]
+    merged["closed_history_identity_merge"] = closed_diagnostics
     merged["version"] = str(merged.get("version") or TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION)
     merged["updated_at"] = _trpsf_v1_now()
-    return merged, sources_used
+    return merged, sorted(set(sources_used))
 
 
-def _trpsf_v1_bootstrap_registry(force=False):
+def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
     """Migra para /data/trade_registry.json e mescla CLOSED legados sem apagar OPEN ativo."""
+    lock_resolver = globals().get("_trpsf_v1_registry_lock")
+    if not _lock_held:
+        if not callable(lock_resolver):
+            return {
+                "ok": False,
+                "status": "REGISTRY_LOCK_UNAVAILABLE",
+                "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+                "generated_at": _trpsf_v1_now(),
+                "write_required": False,
+                "write_performed": False,
+                "last_write_ok": False,
+                "closed_history_identity_merge": {
+                    "safe_to_commit": False,
+                    "reason": "REGISTRY_LOCK_UNAVAILABLE",
+                },
+            }
+        registry_lock = lock_resolver()
+        if registry_lock is None:
+            return {
+                "ok": False,
+                "status": "REGISTRY_LOCK_UNAVAILABLE",
+                "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+                "generated_at": _trpsf_v1_now(),
+                "write_required": False,
+                "write_performed": False,
+                "last_write_ok": False,
+                "closed_history_identity_merge": {
+                    "safe_to_commit": False,
+                    "reason": "REGISTRY_LOCK_UNAVAILABLE",
+                },
+            }
+        with registry_lock:
+            return _trpsf_v1_bootstrap_registry(
+                force=force, _lock_held=True
+            )
     if _TRPSF_V1_STATE.get("migration_done") and not force:
         return _TRPSF_V1_STATE.get("last_status") or {}
     active = _trpsf_v1_active_file()
-    active.parent.mkdir(parents=True, exist_ok=True)
     legacy_paths = _trpsf_v1_legacy_candidate_paths()
+    active_file_exists = active.exists()
     active_reg = _trpsf_v1_read_json(active)
+    active_shape_errors = (
+        _trpsf_v1_registry_shape_errors(active_reg)
+        if isinstance(active_reg, dict)
+        else []
+    )
+    if active_file_exists and (
+        not isinstance(active_reg, dict) or active_shape_errors
+    ):
+        active_error = (
+            "ACTIVE_REGISTRY_INVALID_SHAPE"
+            if active_shape_errors
+            else "ACTIVE_REGISTRY_READ_ERROR"
+        )
+        status = {
+            "ok": False,
+            "status": active_error,
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "generated_at": _trpsf_v1_now(),
+            "persistent_storage_enabled": True,
+            "active_file_exists_before": True,
+            "migrated_from_legacy": False,
+            "write_required": False,
+            "write_performed": False,
+            "last_write_ok": False,
+            "last_error": active_error,
+            "source_shape_errors": active_shape_errors,
+            "counts_before": {"open_count": 0, "closed_count": 0},
+            "counts_after": {"open_count": 0, "closed_count": 0},
+            "closed_history_identity_merge": {
+                "safe_to_commit": False,
+                "reason": active_error,
+            },
+        }
+        _TRPSF_V1_STATE["migration_done"] = False
+        _TRPSF_V1_STATE["last_write_ok"] = False
+        _TRPSF_V1_STATE["last_error"] = active_error
+        _TRPSF_V1_STATE["last_status"] = status
+        return status
     active_exists = isinstance(active_reg, dict)
     active_counts_before = _trpsf_v1_registry_counts(active_reg or {})
 
     registries_for_closed = []
     registries_for_full = []
+    closed_identity_merge = {}
+    source_read_errors = []
     if active_exists:
         registries_for_full.append((str(active), active_reg))
         registries_for_closed.append((str(active), active_reg))
@@ -47291,8 +49166,18 @@ def _trpsf_v1_bootstrap_registry(force=False):
         try:
             if str(p) == str(active):
                 continue
+            source_exists = Path(p).exists()
             reg = _trpsf_v1_read_json(p)
+            if source_exists and not isinstance(reg, dict):
+                source_read_errors.append("LEGACY_REGISTRY_READ_ERROR")
+                continue
             if not isinstance(reg, dict):
+                continue
+            shape_errors = _trpsf_v1_registry_shape_errors(reg)
+            if shape_errors:
+                source_read_errors.append(
+                    "LEGACY_REGISTRY_INVALID_SHAPE"
+                )
                 continue
             counts = _trpsf_v1_registry_counts(reg)
             if not active_exists:
@@ -47301,51 +49186,207 @@ def _trpsf_v1_bootstrap_registry(force=False):
             if counts.get("closed_count", 0) > 0:
                 registries_for_closed.append((str(p), reg))
         except Exception:
-            pass
+            source_read_errors.append("LEGACY_REGISTRY_READ_ERROR")
+
+    if source_read_errors:
+        status = {
+            "ok": False,
+            "status": "LEGACY_REGISTRY_READ_ERROR",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "generated_at": _trpsf_v1_now(),
+            "persistent_storage_enabled": True,
+            "active_file_exists_before": bool(active_exists),
+            "migrated_from_legacy": False,
+            "write_required": False,
+            "write_performed": False,
+            "last_write_ok": False,
+            "last_error": "LEGACY_REGISTRY_READ_ERROR",
+            "source_read_error_count": len(source_read_errors),
+            "counts_before": active_counts_before,
+            "counts_after": active_counts_before,
+            "closed_history_identity_merge": {
+                "safe_to_commit": False,
+                "reason": "LEGACY_REGISTRY_READ_ERROR",
+            },
+        }
+        _TRPSF_V1_STATE["migration_done"] = False
+        _TRPSF_V1_STATE["last_write_ok"] = False
+        _TRPSF_V1_STATE["last_error"] = "LEGACY_REGISTRY_READ_ERROR"
+        _TRPSF_V1_STATE["last_status"] = status
+        return status
+
+    if not active_exists and not registries_for_full:
+        status = {
+            "ok": False,
+            "status": "NO_REGISTRY_SOURCES",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "generated_at": _trpsf_v1_now(),
+            "persistent_storage_enabled": True,
+            "active_file_exists_before": False,
+            "migrated_from_legacy": False,
+            "write_required": False,
+            "write_performed": False,
+            "last_write_ok": False,
+            "last_error": "NO_REGISTRY_SOURCES",
+            "counts_before": active_counts_before,
+            "counts_after": active_counts_before,
+            "closed_history_identity_merge": {
+                "safe_to_commit": False,
+                "reason": "NO_REGISTRY_SOURCES",
+            },
+        }
+        _TRPSF_V1_STATE["migration_done"] = False
+        _TRPSF_V1_STATE["last_write_ok"] = False
+        _TRPSF_V1_STATE["last_error"] = "NO_REGISTRY_SOURCES"
+        _TRPSF_V1_STATE["last_status"] = status
+        return status
 
     if active_exists:
         # Keep active OPEN authoritative, only recover CLOSED from legacy/persistent candidates.
         base = dict(active_reg)
+        base.pop("closed_history_identity_merge", None)
         base["open_trades"] = active_reg.get("open_trades") if isinstance(active_reg, dict) else {}
         closed_only = []
         if registries_for_closed:
             closed_merge, used = _trpsf_v1_merge_registries(registries_for_closed, active_exists=True)
-            closed_only = _trpsf_v1_iter_trades(closed_merge.get("closed_trades"))
-        base["closed_trades"] = closed_only if closed_only else _trpsf_v1_iter_trades(active_reg.get("closed_trades"))
-        migrated = len(closed_only) > active_counts_before.get("closed_count", 0)
+            closed_only = _trpsf_v1_iter_trades(
+                closed_merge.get("closed_trades"),
+                preserve_closed_collection_keys=True,
+            )
+            closed_identity_merge = dict(
+                closed_merge.get("closed_history_identity_merge") or {}
+            )
+        merge_safe = bool(closed_identity_merge.get("safe_to_commit", True))
+        if merge_safe:
+            base["closed_trades"] = (
+                closed_only
+                if closed_only
+                else _trpsf_v1_iter_trades(
+                    active_reg.get("closed_trades"),
+                    preserve_closed_collection_keys=True,
+                )
+            )
+        else:
+            # Alias conflicts or ambiguous bridges require an explicit repair;
+            # automatic startup must never rewrite the authoritative history.
+            base["closed_trades"] = _trpsf_v1_iter_trades(
+                active_reg.get("closed_trades"),
+                preserve_closed_collection_keys=True,
+            )
         merged = base
         sources_used = [x[0] for x in registries_for_closed]
     else:
-        if not registries_for_full:
-            merged = _trpsf_v1_default_registry()
-            sources_used = []
-            migrated = False
-        else:
-            merged, sources_used = _trpsf_v1_merge_registries(registries_for_full, active_exists=False)
-            migrated = True
+        merged, sources_used = _trpsf_v1_merge_registries(registries_for_full, active_exists=False)
+        closed_identity_merge = dict(
+            merged.get("closed_history_identity_merge") or {}
+        )
+        merged.pop("closed_history_identity_merge", None)
+        # The canonical merge already preserves every uncertain/conflicting
+        # source record in deterministic identity/fingerprint order.
 
-    merged["updated_at"] = _trpsf_v1_now()
+    if int(closed_identity_merge.get("open_identity_conflict_count") or 0):
+        status = {
+            "ok": False,
+            "status": "OPEN_IDENTITY_MERGE_BLOCKED",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "generated_at": _trpsf_v1_now(),
+            "persistent_storage_enabled": True,
+            "active_file_exists_before": bool(active_exists),
+            "migrated_from_legacy": False,
+            "write_required": False,
+            "write_performed": False,
+            "last_write_ok": False,
+            "last_error": "OPEN_IDENTITY_MERGE_BLOCKED",
+            "counts_before": active_counts_before,
+            "counts_after": _trpsf_v1_registry_counts(merged),
+            "closed_history_identity_merge": closed_identity_merge,
+        }
+        _TRPSF_V1_STATE["migration_done"] = False
+        _TRPSF_V1_STATE["last_write_ok"] = False
+        _TRPSF_V1_STATE["last_error"] = "OPEN_IDENTITY_MERGE_BLOCKED"
+        _TRPSF_V1_STATE["last_status"] = status
+        return status
+
+    merged.pop("closed_history_identity_merge", None)
     merged["storage_fix_version"] = TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION
     counts_after = _trpsf_v1_registry_counts(merged)
+    active_comparable = dict(active_reg or {})
+    active_comparable.pop("updated_at", None)
+    active_comparable.pop("closed_history_identity_merge", None)
+    merged_comparable = dict(merged)
+    merged_comparable.pop("updated_at", None)
+    write_required = (
+        not active_exists
+        or json.dumps(active_comparable, ensure_ascii=False, sort_keys=True, default=str)
+        != json.dumps(merged_comparable, ensure_ascii=False, sort_keys=True, default=str)
+    )
+    merge_safe = bool(closed_identity_merge.get("safe_to_commit", True))
+    if not merge_safe:
+        if active_exists:
+            merged = dict(active_reg)
+            counts_after = _trpsf_v1_registry_counts(merged)
+        # With no active Registry there is no authoritative target to rewrite.
+        # Preserve every source in place and require an explicit repair instead
+        # of creating an active file from an unsafe projection.
+        write_required = False
+    migrated = bool(
+        active_exists
+        and json.dumps(
+            _trpsf_v1_iter_trades(
+                (active_reg or {}).get("closed_trades"),
+                preserve_closed_collection_keys=True,
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        != json.dumps(
+            _trpsf_v1_iter_trades(
+                merged.get("closed_trades"),
+                preserve_closed_collection_keys=True,
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    ) or bool(not active_exists and sources_used)
+    if not merge_safe:
+        migrated = False
     wrote = False
+    write_ok = True
     error = None
     try:
-        if active_exists:
-            try:
-                _trpsf_v1_atomic_write_json(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE, active_reg)
-            except Exception:
-                pass
-        _trpsf_v1_atomic_write_json(active, merged)
-        wrote = True
+        if write_required and active_exists:
+            backup_result = _trpsf_v1_atomic_write_json(
+                TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE,
+                active_reg,
+            )
+            if backup_result is not True:
+                raise RuntimeError("REGISTRY_BACKUP_NOT_CONFIRMED")
+        if write_required:
+            merged["updated_at"] = _trpsf_v1_now()
+            write_result = _trpsf_v1_atomic_write_json(active, merged)
+            if write_result is not True:
+                raise RuntimeError("REGISTRY_WRITE_NOT_CONFIRMED")
+            wrote = True
         _TRPSF_V1_STATE["last_write_ok"] = True
     except Exception as exc:
         error = str(exc)
+        write_ok = False
         _TRPSF_V1_STATE["last_write_ok"] = False
         _TRPSF_V1_STATE["last_error"] = error
 
     status = {
-        "ok": bool(wrote and central_trade_registry is not None),
-        "status": "ACTIVE_PERSISTENT" if wrote else "WRITE_ERROR",
+        "ok": bool(
+            merge_safe and write_ok and central_trade_registry is not None
+        ),
+        "status": (
+            "CLOSED_IDENTITY_MERGE_BLOCKED"
+            if not merge_safe
+            else "ACTIVE_PERSISTENT"
+            if write_ok
+            else "WRITE_ERROR"
+        ),
         "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
         "generated_at": _trpsf_v1_now(),
         "persistent_storage_enabled": True,
@@ -47354,10 +49395,13 @@ def _trpsf_v1_bootstrap_registry(force=False):
         "legacy_files_checked": [str(p) for p in legacy_paths],
         "sources_used": sources_used,
         "migrated_from_legacy": bool(migrated),
-        "last_write_ok": bool(wrote),
+        "write_required": bool(write_required),
+        "write_performed": bool(wrote),
+        "last_write_ok": bool(write_ok),
         "last_error": error,
         "counts_before": active_counts_before,
         "counts_after": counts_after,
+        "closed_history_identity_merge": closed_identity_merge,
         "central_data_dir": str(CENTRAL_DATA_DIR),
         "backup_file": str(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE),
         "latest_file": str(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE),
@@ -47368,13 +49412,28 @@ def _trpsf_v1_bootstrap_registry(force=False):
             "Esta correção não envia ordens, não altera risco e não rearma LIVE.",
         ],
     }
-    try:
-        _trpsf_v1_atomic_write_json(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE, status)
-        with open(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(_trpsf_v1_public(status), ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    _TRPSF_V1_STATE["migration_done"] = True
+    if merge_safe:
+        try:
+            _trpsf_v1_atomic_write_json(
+                TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE,
+                status,
+            )
+            with open(
+                TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE,
+                "a",
+                encoding="utf-8",
+            ) as fh:
+                fh.write(
+                    json.dumps(
+                        _trpsf_v1_public(status), ensure_ascii=False
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+    _TRPSF_V1_STATE["migration_done"] = bool(
+        merge_safe and write_ok and (not write_required or wrote)
+    )
     _TRPSF_V1_STATE["migrated_from_legacy"] = bool(migrated)
     _TRPSF_V1_STATE["last_status"] = status
     return status
@@ -47383,30 +49442,95 @@ def _trpsf_v1_bootstrap_registry(force=False):
 def _trpsf_v1_patched_load_registry():
     active = _trpsf_v1_active_file()
     try:
-        _trpsf_v1_bootstrap_registry(force=False)
-        reg = _trpsf_v1_read_json(active)
-        if not isinstance(reg, dict):
-            reg = _trpsf_v1_default_registry()
-            _trpsf_v1_atomic_write_json(active, reg)
+        registry_lock = _trpsf_v1_registry_lock()
+        normalizer = (
+            getattr(central_trade_registry, "_normalize_registry", None)
+            if central_trade_registry is not None
+            else None
+        )
+        if registry_lock is None or not callable(normalizer):
+            raise RuntimeError("REGISTRY_READ_GUARDS_UNAVAILABLE")
+        with registry_lock:
+            active_reg = _trpsf_v1_read_json(active)
+            if active.exists() or isinstance(active_reg, dict):
+                if not isinstance(active_reg, dict):
+                    raise RuntimeError("ACTIVE_REGISTRY_INVALID")
+                shape_errors = _trpsf_v1_registry_shape_errors(active_reg)
+                if shape_errors:
+                    raise RuntimeError("ACTIVE_REGISTRY_INVALID_SHAPE")
+                normalized = normalizer(dict(active_reg))
+                if not isinstance(normalized, dict):
+                    raise RuntimeError("ACTIVE_REGISTRY_NORMALIZATION_FAILED")
+                _TRPSF_V1_STATE["temporary_read_source"] = None
+                _TRPSF_V1_STATE["temporary_read_only"] = False
+                _TRPSF_V1_STATE["write_allowed"] = True
+            else:
+                source_path, source_registry, source_error = _trpsf_v1_temporary_registry_source(active)
+                _TRPSF_V1_STATE["temporary_read_source"] = (
+                    str(source_path) if source_path else None
+                )
+                _TRPSF_V1_STATE["temporary_read_only"] = bool(source_path)
+                _TRPSF_V1_STATE["write_allowed"] = False
+                if source_error:
+                    raise RuntimeError(source_error)
+                if source_path is None:
+                    raise RuntimeError("TRADE_REGISTRY_PERSISTENCE_UNAVAILABLE")
+                normalized = normalizer(dict(source_registry))
+                if not isinstance(normalized, dict):
+                    raise RuntimeError("ACTIVE_REGISTRY_NORMALIZATION_FAILED")
         _TRPSF_V1_STATE["last_load_ok"] = True
-        return reg
+        _TRPSF_V1_STATE["last_error"] = None
+        return normalized
     except Exception as exc:
         _TRPSF_V1_STATE["last_load_ok"] = False
         _TRPSF_V1_STATE["last_error"] = str(exc)
-        return _trpsf_v1_default_registry()
+        raise RuntimeError("TRADE_REGISTRY_PERSISTENCE_UNAVAILABLE") from None
 
 
-def _trpsf_v1_patched_save_registry(registry):
+def _trpsf_v1_patched_save_registry(registry, _lock_held=False):
     active = _trpsf_v1_active_file()
     try:
+        lock_resolver = globals().get("_trpsf_v1_registry_lock")
+        if not _lock_held:
+            if not callable(lock_resolver):
+                raise RuntimeError("REGISTRY_LOCK_UNAVAILABLE")
+            registry_lock = lock_resolver()
+            if registry_lock is None:
+                raise RuntimeError("REGISTRY_LOCK_UNAVAILABLE")
+            with registry_lock:
+                return _trpsf_v1_patched_save_registry(
+                    registry, _lock_held=True
+                )
+        if not active.exists():
+            _TRPSF_V1_STATE["last_write_ok"] = False
+            _TRPSF_V1_STATE["last_error"] = "ACTIVE_REGISTRY_UNAVAILABLE"
+            return False
         if not isinstance(registry, dict):
-            registry = _trpsf_v1_default_registry()
-        registry = dict(registry)
+            _TRPSF_V1_STATE["last_write_ok"] = False
+            _TRPSF_V1_STATE["last_error"] = "INVALID_REGISTRY_PAYLOAD"
+            return False
+        normalizer = (
+            getattr(central_trade_registry, "_normalize_registry", None)
+            if central_trade_registry is not None
+            else None
+        )
+        if not callable(normalizer):
+            raise RuntimeError("REGISTRY_NORMALIZER_UNAVAILABLE")
+        registry = normalizer(dict(registry))
         registry.setdefault("open_trades", {})
         registry.setdefault("closed_trades", [])
+        shape_errors = _trpsf_v1_registry_shape_errors(registry)
+        if shape_errors:
+            _TRPSF_V1_STATE["last_write_ok"] = False
+            _TRPSF_V1_STATE["last_error"] = (
+                "INVALID_REGISTRY_SHAPE:" + ",".join(shape_errors)
+            )
+            return False
         registry["updated_at"] = _trpsf_v1_now()
         registry["storage_fix_version"] = TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION
-        _trpsf_v1_atomic_write_json(active, registry)
+        write_result = _trpsf_v1_atomic_write_json(active, registry)
+        if write_result is not True:
+            raise RuntimeError("REGISTRY_WRITE_NOT_CONFIRMED")
         _TRPSF_V1_STATE["last_write_ok"] = True
         _TRPSF_V1_STATE["last_error"] = None
         return True
@@ -47416,7 +49540,7 @@ def _trpsf_v1_patched_save_registry(registry):
         return False
 
 
-def _trpsf_v1_apply_patch():
+def _trpsf_v1_apply_patch(run_bootstrap=False, force=False):
     global _TRPSF_V1_ORIGINAL_LOAD_REGISTRY, _TRPSF_V1_ORIGINAL_SAVE_REGISTRY
     if central_trade_registry is None:
         _TRPSF_V1_STATE["last_error"] = TRADE_REGISTRY_IMPORT_ERROR or "trade_registry unavailable"
@@ -47428,8 +49552,14 @@ def _trpsf_v1_apply_patch():
         }
     try:
         active = _trpsf_v1_active_file()
-        active.parent.mkdir(parents=True, exist_ok=True)
         if not _TRPSF_V1_STATE.get("patched"):
+            original_registry_file = getattr(
+                central_trade_registry, "TRADE_REGISTRY_FILE", None
+            )
+            if original_registry_file:
+                _TRPSF_V1_STATE["original_registry_file"] = str(
+                    original_registry_file
+                )
             _TRPSF_V1_ORIGINAL_LOAD_REGISTRY = getattr(central_trade_registry, "load_registry", None)
             _TRPSF_V1_ORIGINAL_SAVE_REGISTRY = getattr(central_trade_registry, "save_registry", None)
             try:
@@ -47444,11 +49574,47 @@ def _trpsf_v1_apply_patch():
                 setattr(central_trade_registry, "load_registry", _trpsf_v1_patched_load_registry)
                 setattr(central_trade_registry, "save_registry", _trpsf_v1_patched_save_registry)
             except Exception:
-                pass
+                try:
+                    setattr(
+                        central_trade_registry,
+                        "load_registry",
+                        _TRPSF_V1_ORIGINAL_LOAD_REGISTRY,
+                    )
+                    setattr(
+                        central_trade_registry,
+                        "save_registry",
+                        _TRPSF_V1_ORIGINAL_SAVE_REGISTRY,
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError("REGISTRY_PATCH_INSTALL_FAILED")
+            if (
+                getattr(central_trade_registry, "load_registry", None)
+                is not _trpsf_v1_patched_load_registry
+                or getattr(central_trade_registry, "save_registry", None)
+                is not _trpsf_v1_patched_save_registry
+            ):
+                raise RuntimeError("REGISTRY_PATCH_INSTALL_NOT_CONFIRMED")
             _TRPSF_V1_STATE["patched"] = True
             _TRPSF_V1_STATE["active_file"] = str(active)
             _TRPSF_V1_STATE["legacy_files"] = [str(p) for p in _trpsf_v1_legacy_candidate_paths()]
-        status = _trpsf_v1_bootstrap_registry(force=False)
+            _TRPSF_V1_STATE["temporary_read_source"] = None
+            _TRPSF_V1_STATE["temporary_read_only"] = False
+            _TRPSF_V1_STATE["write_allowed"] = False
+        if run_bootstrap:
+            return _trpsf_v1_bootstrap_registry(force=bool(force))
+        status = {
+            "ok": True,
+            "status": "PATCH_INSTALLED_MIGRATION_PENDING",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "generated_at": _trpsf_v1_now(),
+            "persistent_storage_enabled": True,
+            "write_required": False,
+            "write_performed": False,
+            "last_write_ok": _TRPSF_V1_STATE.get("last_write_ok"),
+            "migration_requires_explicit_force": True,
+        }
+        _TRPSF_V1_STATE["last_status"] = status
         return status
     except Exception as exc:
         _TRPSF_V1_STATE["last_error"] = str(exc)
@@ -47460,19 +49626,36 @@ def _trpsf_v1_apply_patch():
         }
 
 
-def trade_registry_persistent_storage_fix_v1_status(force=False):
-    try:
-        if force:
-            _TRPSF_V1_STATE["migration_done"] = False
-        status = _trpsf_v1_apply_patch()
-    except Exception as exc:
-        status = {
-            "ok": False,
-            "status": "ERROR",
-            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
-            "generated_at": _trpsf_v1_now(),
-            "error": str(exc),
-        }
+def trade_registry_persistent_storage_fix_v1_status(
+    force=False, read_only=False
+):
+    if read_only:
+        status = dict(
+            _TRPSF_V1_STATE.get("last_status")
+            or {
+                "ok": False,
+                "status": "BOOTSTRAP_STATUS_NOT_AVAILABLE",
+                "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+                "generated_at": _trpsf_v1_now(),
+            }
+        )
+        status["read_only"] = True
+        status["write_executed"] = False
+    else:
+        try:
+            if force:
+                _TRPSF_V1_STATE["migration_done"] = False
+            status = _trpsf_v1_apply_patch(
+                run_bootstrap=bool(force), force=bool(force)
+            )
+        except Exception as exc:
+            status = {
+                "ok": False,
+                "status": "ERROR",
+                "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+                "generated_at": _trpsf_v1_now(),
+                "error": str(exc),
+            }
     try:
         active = _trpsf_v1_active_file()
         current = _trpsf_v1_read_json(active)
@@ -47486,17 +49669,239 @@ def trade_registry_persistent_storage_fix_v1_status(force=False):
         status["last_load_ok"] = _TRPSF_V1_STATE.get("last_load_ok")
         status["last_write_ok"] = _TRPSF_V1_STATE.get("last_write_ok")
         status["last_error"] = _TRPSF_V1_STATE.get("last_error")
+        status["migration_pending"] = bool(
+            _TRPSF_V1_STATE.get("patched")
+            and not _TRPSF_V1_STATE.get("migration_done")
+        )
+        status["temporary_read_source"] = _TRPSF_V1_STATE.get("temporary_read_source")
+        status["temporary_read_only"] = bool(
+            _TRPSF_V1_STATE.get("temporary_read_source")
+        )
+        status["write_allowed"] = bool(_TRPSF_V1_STATE.get("write_allowed"))
     except Exception as exc:
         status["status_append_error"] = str(exc)
-    try:
+    # Status/health reads must not create a new persistence write.  Bootstrap
+    # records its own one-shot diagnostic; subsequent projections stay cached.
+    if not read_only:
         _TRPSF_V1_STATE["last_status"] = status
-        _trpsf_v1_atomic_write_json(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE, status)
-    except Exception:
-        pass
     return status
 
 
 # Aplica patch no carregamento do main.py, antes das rotas processarem qualquer leitura/gravação do registry.
+def trade_registry_closed_identity_audit_v1():
+    """Preview CLOSED identity migration without invoking any Registry writer."""
+    base = {
+        "ok": False,
+        "status": "CLOSED_IDENTITY_AUDIT_UNAVAILABLE",
+        "version": "2026-07-23-CLOSED-TRADE-IDENTITY-AUDIT-V1",
+        "read_only": True,
+        "write_executed": False,
+        "registry_write": False,
+        "automatic_changes": False,
+        "broker_called": False,
+        "no_order_sent_by_this_route": True,
+    }
+    loader = (
+        getattr(central_trade_registry, "load_registry_raw_read_only", None)
+        if central_trade_registry is not None
+        else None
+    )
+    merge_helper = (
+        getattr(central_trade_registry, "merge_closed_trade_records", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(loader) or not callable(merge_helper):
+        base["reason"] = "READ_ONLY_REGISTRY_OR_IDENTITY_HELPER_UNAVAILABLE"
+        return base
+    try:
+        registry = loader()
+        if not isinstance(registry, dict):
+            base["reason"] = "READ_ONLY_REGISTRY_INVALID"
+            return base
+        shape_errors = _trpsf_v1_registry_shape_errors(registry)
+        if shape_errors:
+            base.update(
+                {
+                    "status": "CLOSED_IDENTITY_AUDIT_INVALID_REGISTRY_SHAPE",
+                    "reason": "READ_ONLY_REGISTRY_INVALID_SHAPE",
+                    "source_shape_errors": shape_errors,
+                    "migration_compatible": False,
+                    "safe_to_commit": False,
+                }
+            )
+            return base
+        closed = _trpsf_v1_iter_trades(
+            registry.get("closed_trades"),
+            preserve_closed_collection_keys=True,
+        )
+        result = merge_helper(closed)
+        raw_diagnostics = (
+            dict(result.get("diagnostics") or {})
+            if isinstance(result, dict)
+            else {}
+        )
+        diagnostic_keys = (
+            "version",
+            "input_record_count",
+            "output_record_count",
+            "distinct_execution_count",
+            "duplicate_execution_copy_count",
+            "trade_id_collision_group_count",
+            "trade_id_collision_record_count",
+            "real_verify_collision_group_count",
+            "strong_alias_conflict_count",
+            "invalid_closed_record_count",
+            "ambiguous_identity_bridge_count",
+            "financial_conflict_count",
+            "merge_group_count",
+            "safe_to_commit",
+        )
+        diagnostics = {
+            key: raw_diagnostics.get(key) for key in diagnostic_keys
+        }
+        projected = (
+            result.get("records")
+            if isinstance(result, dict) and isinstance(result.get("records"), list)
+            else []
+        )
+        projected_counts_by_trade_id = {}
+        for trade in projected:
+            state = _closed_trade_identity_state_v1(trade)
+            projected_trade_id = str(state.get("trade_id") or "").strip()
+            if projected_trade_id:
+                projected_counts_by_trade_id[projected_trade_id] = (
+                    projected_counts_by_trade_id.get(projected_trade_id, 0) + 1
+                )
+        groups = {}
+        for trade in closed:
+            state = _closed_trade_identity_state_v1(trade)
+            trade_id = str(state.get("trade_id") or "").strip()
+            if not trade_id:
+                continue
+            group = groups.setdefault(
+                trade_id,
+                {
+                    "trade_id": trade_id,
+                    "record_count": 0,
+                    "registry_modes": set(),
+                    "execution_modes": set(),
+                    "strong_alias_conflict_count": 0,
+                },
+            )
+            group["record_count"] += 1
+            group["registry_modes"].add(
+                str(state.get("registry_mode") or "UNKNOWN")
+            )
+            group["execution_modes"].add(
+                str(state.get("execution_mode") or "UNKNOWN")
+            )
+            if state.get("has_alias_conflict"):
+                group["strong_alias_conflict_count"] += 1
+        collision_preview = []
+        for trade_id, group in sorted(groups.items()):
+            if group.get("record_count", 0) <= 1:
+                continue
+            collision_preview.append(
+                {
+                    "trade_id": trade_id,
+                    "record_count": group.get("record_count"),
+                    "distinct_execution_identity_count": int(
+                        projected_counts_by_trade_id.get(trade_id, 0)
+                    ),
+                    "registry_modes": sorted(group.get("registry_modes") or set()),
+                    "execution_modes": sorted(
+                        group.get("execution_modes") or set()
+                    ),
+                    "real_verify_collision": bool(
+                        {"REAL", "VERIFY"}
+                        <= set(group.get("registry_modes") or set())
+                    ),
+                    "strong_alias_conflict_count": group.get(
+                        "strong_alias_conflict_count", 0
+                    ),
+                }
+            )
+        base.update(
+            {
+                "ok": True,
+                "status": "CLOSED_IDENTITY_AUDIT_READY",
+                "current_closed_count": len(closed),
+                "projected_closed_count": len(projected),
+                "projected_records_removed_as_proven_copies": max(
+                    0, len(closed) - len(projected)
+                ),
+                "trade_id_duplicate_group_count": len(collision_preview),
+                "collision_preview": collision_preview[:100],
+                "collision_preview_truncated": len(collision_preview) > 100,
+                "diagnostics": diagnostics,
+                "migration_compatible": bool(
+                    raw_diagnostics.get("safe_to_commit", False)
+                ),
+                "safe_to_commit": bool(
+                    raw_diagnostics.get("safe_to_commit", False)
+                ),
+            }
+        )
+        return base
+    except Exception as exc:
+        base["reason"] = "CLOSED_IDENTITY_AUDIT_READ_ERROR"
+        base["error_type"] = type(exc).__name__
+        return base
+
+
+def build_trade_registry_closed_identity_audit_v1_text():
+    payload = trade_registry_closed_identity_audit_v1()
+    diagnostics = payload.get("diagnostics") or {}
+    lines = [
+        "TRADE REGISTRY CLOSED IDENTITY AUDIT V1",
+        f"status={payload.get('status')}",
+        f"read_only={payload.get('read_only')}",
+        f"write_executed={payload.get('write_executed')}",
+        f"broker_called={payload.get('broker_called')}",
+        f"current_closed_count={payload.get('current_closed_count')}",
+        f"projected_closed_count={payload.get('projected_closed_count')}",
+        (
+            "projected_records_removed_as_proven_copies="
+            f"{payload.get('projected_records_removed_as_proven_copies')}"
+        ),
+        (
+            "trade_id_collision_group_count="
+            f"{diagnostics.get('trade_id_collision_group_count')}"
+        ),
+        (
+            "distinct_execution_count="
+            f"{diagnostics.get('distinct_execution_count')}"
+        ),
+        (
+            "real_verify_collision_group_count="
+            f"{diagnostics.get('real_verify_collision_group_count')}"
+        ),
+        (
+            "strong_alias_conflict_count="
+            f"{diagnostics.get('strong_alias_conflict_count')}"
+        ),
+        (
+            "invalid_closed_record_count="
+            f"{diagnostics.get('invalid_closed_record_count')}"
+        ),
+        (
+            "ambiguous_identity_bridge_count="
+            f"{diagnostics.get('ambiguous_identity_bridge_count')}"
+        ),
+        f"safe_to_commit={payload.get('safe_to_commit')}",
+    ]
+    for item in payload.get("collision_preview") or []:
+        lines.append(
+            "collision "
+            f"trade_id={item.get('trade_id')} "
+            f"records={item.get('record_count')} "
+            f"executions={item.get('distinct_execution_identity_count')} "
+            f"modes={','.join(item.get('registry_modes') or [])}"
+        )
+    return "\n".join(lines)
+
+
 try:
     trade_registry_persistent_storage_fix_v1_status(force=False)
 except Exception:
@@ -47510,7 +49915,9 @@ def central_trade_registry_snapshot(include_trades=True):
     else:
         payload = {"ok": False, "loaded": False, "open_count": 0, "closed_count": 0}
     try:
-        storage = trade_registry_persistent_storage_fix_v1_status(force=False)
+        storage = trade_registry_persistent_storage_fix_v1_status(
+            force=False, read_only=True
+        )
         payload.update({
             "storage_fix_version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
             "persistent_storage_enabled": bool(storage.get("persistent_storage_enabled")),
@@ -47523,6 +49930,43 @@ def central_trade_registry_snapshot(include_trades=True):
             "storage_status": storage.get("status"),
             "storage_last_error": storage.get("last_error") or storage.get("error"),
         })
+        identity_diagnostics = storage.get("closed_history_identity_merge") or {}
+        counts_before = storage.get("counts_before") or {}
+        counts_after = storage.get("counts_after") or {}
+        payload["closed_trade_identity_audit"] = {
+            "ok": True,
+            "status": "CACHED_BOOTSTRAP_DIAGNOSTIC",
+            "read_only": True,
+            "manual_audit_route": "/traderegistry/closedidentity",
+            "current_closed_count": counts_before.get("closed_count"),
+            "projected_closed_count": counts_after.get("closed_count"),
+            "merge_input_record_count": identity_diagnostics.get(
+                "input_record_count"
+            ),
+            "merge_output_record_count": identity_diagnostics.get(
+                "output_record_count"
+            ),
+            "trade_id_collision_group_count": identity_diagnostics.get(
+                "trade_id_collision_group_count"
+            ),
+            "distinct_execution_count": identity_diagnostics.get(
+                "distinct_execution_count"
+            ),
+            "real_verify_collision_group_count": identity_diagnostics.get(
+                "real_verify_collision_group_count"
+            ),
+            "strong_alias_conflict_count": identity_diagnostics.get(
+                "strong_alias_conflict_count"
+            ),
+            "invalid_closed_record_count": identity_diagnostics.get(
+                "invalid_closed_record_count"
+            ),
+            "ambiguous_identity_bridge_count": identity_diagnostics.get(
+                "ambiguous_identity_bridge_count"
+            ),
+            "safe_to_commit": identity_diagnostics.get("safe_to_commit"),
+            "automatic_changes": False,
+        }
     except Exception as exc:
         payload["storage_fix_overlay_error"] = str(exc)
     return payload
@@ -47535,7 +49979,9 @@ def bot_health(key: str, cfg: dict):
     else:
         payload = {"name": cfg.get("name"), "enabled": False, "loaded": False, "load_error": "original bot_health unavailable"}
     try:
-        storage = trade_registry_persistent_storage_fix_v1_status(force=False)
+        storage = trade_registry_persistent_storage_fix_v1_status(
+            force=False, read_only=True
+        )
         overlay = {
             "trade_registry_storage_status": storage.get("status"),
             "trade_registry_storage_ok": storage.get("ok"),
@@ -47562,8 +50008,12 @@ def bot_health(key: str, cfg: dict):
     return payload
 
 
-def build_trade_registry_persistent_storage_fix_v1_text(force=False):
-    payload = trade_registry_persistent_storage_fix_v1_status(force=force)
+def build_trade_registry_persistent_storage_fix_v1_text(
+    force=False, read_only=False
+):
+    payload = trade_registry_persistent_storage_fix_v1_status(
+        force=force, read_only=read_only
+    )
     counts = payload.get("current_counts") or payload.get("counts_after") or {}
     before = payload.get("counts_before") or {}
     lines = [
@@ -47620,22 +50070,146 @@ def _trpsf_v1_bool(value, default=False):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "y", "sim", "s", "on"}
 
+
+TRADE_REGISTRY_STORAGE_FORCE_ACK = (
+    "TRADE_REGISTRY_CLOSED_IDENTITY_MIGRATION_V1"
+)
+
+
+def _trpsf_v1_storage_route_request():
+    body = request.get_json(silent=True) or {}
+    body = body if isinstance(body, dict) else {}
+    query = getattr(request, "args", {}) or {}
+    query_force = _trpsf_v1_bool(query.get("force"), default=False)
+    body_force = _trpsf_v1_bool(body.get("force"), default=False)
+    force_requested = bool(query_force or body_force)
+    if not force_requested:
+        return {"ok": True, "force": False, "status_code": 200}
+    if str(getattr(request, "method", "GET")).upper() != "POST" or query_force:
+        return {
+            "ok": False,
+            "force": False,
+            "status": "POST_JSON_FORCE_REQUIRED",
+            "status_code": 400,
+        }
+    sensitive_keys = {
+        str(key or "").lower()
+        for key in list(query.keys()) + list(body.keys())
+        if "token" in str(key or "").lower()
+        or "authorization" in str(key or "").lower()
+        or str(key or "").lower() in {"auth", "api_key", "apikey"}
+    }
+    if sensitive_keys:
+        return {
+            "ok": False,
+            "force": False,
+            "status": "EXECUTION_AUTH_HEADER_REQUIRED",
+            "status_code": 403,
+        }
+    if str(body.get("ack") or "").strip() != TRADE_REGISTRY_STORAGE_FORCE_ACK:
+        return {
+            "ok": False,
+            "force": False,
+            "status": "ACK_REQUIRED",
+            "required_ack": TRADE_REGISTRY_STORAGE_FORCE_ACK,
+            "status_code": 400,
+        }
+    resolver = globals().get("_ee_auth_resolver_v1_resolve")
+    if not callable(resolver):
+        return {
+            "ok": False,
+            "force": False,
+            "status": "EXECUTION_AUTH_REQUIRED",
+            "status_code": 403,
+        }
+    try:
+        auth = resolver(allow_env_fallback=False)
+    except Exception:
+        auth = {}
+    matched_source = str((auth or {}).get("matched_source") or "")
+    if not ((auth or {}).get("ok") and matched_source.startswith("request.headers.")):
+        return {
+            "ok": False,
+            "force": False,
+            "status": "EXECUTION_AUTH_REQUIRED",
+            "status_code": 403,
+        }
+    return {"ok": True, "force": True, "status_code": 200}
+
+
+@app.route("/traderegistry/closedidentity", methods=["GET"])
+@app.route("/trade_registry/closedidentity", methods=["GET"])
+@app.route("/trades/closedidentity", methods=["GET"])
+def trade_registry_closed_identity_audit_v1_route():
+    return (
+        trade_registry_closed_identity_audit_v1(),
+        200,
+        {"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.route("/traderegistry/closedidentity/text", methods=["GET"])
+@app.route("/trade_registry/closedidentity/text", methods=["GET"])
+@app.route("/trades/closedidentity/text", methods=["GET"])
+def trade_registry_closed_identity_audit_v1_text_route():
+    return (
+        build_trade_registry_closed_identity_audit_v1_text(),
+        200,
+        {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
+
+
 @app.route("/traderegistry/storage", methods=["GET", "POST"])
 @app.route("/trade_registry/storage", methods=["GET", "POST"])
 @app.route("/trades/storage", methods=["GET", "POST"])
 def trade_registry_persistent_storage_fix_v1_route():
-    body = request.get_json(silent=True) or {}
-    force = _trpsf_v1_bool(body.get("force", request.args.get("force")), default=False) if "_trpsf_v1_bool" in globals() else str(body.get("force", request.args.get("force", ""))).lower() in {"1", "true", "yes", "sim", "on"}
-    return trade_registry_persistent_storage_fix_v1_status(force=force), 200
+    decision = _trpsf_v1_storage_route_request()
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    if not decision.get("ok"):
+        return {
+            "ok": False,
+            "status": decision.get("status"),
+            "required_ack": decision.get("required_ack"),
+            "write_executed": False,
+        }, int(decision.get("status_code") or 400), headers
+    return (
+        trade_registry_persistent_storage_fix_v1_status(
+            force=bool(decision.get("force")),
+            read_only=not bool(decision.get("force")),
+        ),
+        200,
+        headers,
+    )
 
 
 @app.route("/traderegistry/storage/text", methods=["GET", "POST"])
 @app.route("/trade_registry/storage/text", methods=["GET", "POST"])
 @app.route("/trades/storage/text", methods=["GET", "POST"])
 def trade_registry_persistent_storage_fix_v1_text_route():
-    body = request.get_json(silent=True) or {}
-    force = _trpsf_v1_bool(body.get("force", request.args.get("force")), default=False) if "_trpsf_v1_bool" in globals() else str(body.get("force", request.args.get("force", ""))).lower() in {"1", "true", "yes", "sim", "on"}
-    return build_trade_registry_persistent_storage_fix_v1_text(force=force), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    decision = _trpsf_v1_storage_route_request()
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+    }
+    if not decision.get("ok"):
+        return (
+            str(decision.get("status") or "REQUEST_BLOCKED"),
+            int(decision.get("status_code") or 400),
+            headers,
+        )
+    return (
+        build_trade_registry_persistent_storage_fix_v1_text(
+            force=bool(decision.get("force")),
+            read_only=not bool(decision.get("force")),
+        ),
+        200,
+        headers,
+    )
 
 
 
@@ -51517,15 +54091,137 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
     try:
         scan = _rcae_v1_find_candidates(payload=payload) if callable(globals().get("_rcae_v1_find_candidates")) else {}
         candidates = scan.get("candidates") or [] if isinstance(scan, dict) else []
-        # Prioriza FALCON; trades PAPER do Predator deixam de ser UNKNOWN pelo Registry V1.2.
-        selected = next((item for item in reversed(candidates) if str(item.get("bot") or "").upper() == "FALCON"), None)
+        falcon_candidates = [
+            item
+            for item in candidates
+            if str(item.get("bot") or "").upper() == "FALCON"
+        ]
+        duplicate_execution_groups = []
+        grouped_indexes = set()
+        for left_index, left in enumerate(falcon_candidates):
+            if left_index in grouped_indexes:
+                continue
+            equivalent_indexes = [left_index]
+            left_trade = (
+                left.get("trade") if isinstance(left, dict) else None
+            )
+            for right_index in range(
+                left_index + 1, len(falcon_candidates)
+            ):
+                right = falcon_candidates[right_index]
+                right_trade = (
+                    right.get("trade")
+                    if isinstance(right, dict)
+                    else None
+                )
+                if _closed_trade_records_equivalent_v1(
+                    left_trade, right_trade
+                ):
+                    equivalent_indexes.append(right_index)
+            if len(equivalent_indexes) > 1:
+                grouped_indexes.update(equivalent_indexes)
+                duplicate_execution_groups.append(equivalent_indexes)
+        if duplicate_execution_groups:
+            return {
+                "ok": False,
+                "module": "real_close_auto_evaluator_v1",
+                "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+                "patch_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+                "generated_at": _rcrm_v1_now(),
+                "status": "REAL_CLOSE_CLOSED_EXECUTION_DUPLICATE",
+                "committed": False,
+                "commit_requested": commit_requested,
+                "candidate_count": len(falcon_candidates),
+                "duplicate_execution_group_count": len(
+                    duplicate_execution_groups
+                ),
+                "broker_reconciliation": None,
+                "token_value_exposed": False,
+            }
+        if len(falcon_candidates) > 1:
+            return {
+                "ok": False,
+                "module": "real_close_auto_evaluator_v1",
+                "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+                "patch_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+                "generated_at": _rcrm_v1_now(),
+                "status": "REAL_CLOSE_MULTIPLE_DISTINCT_EXECUTIONS_PENDING",
+                "committed": False,
+                "commit_requested": commit_requested,
+                "candidate_count": len(falcon_candidates),
+                "supplied_strong_identity": (
+                    scan.get("supplied_strong_identity") or {}
+                    if isinstance(scan, dict)
+                    else {}
+                ),
+                "broker_reconciliation": None,
+                "token_value_exposed": False,
+            }
+        # Preserve prior Falcon priority, but make the choice independent of
+        # source/list order.
+        selected = (
+            sorted(
+                falcon_candidates,
+                key=lambda item: (
+                    str(item.get("closed_identity_key") or ""),
+                    str(item.get("trade_id") or item.get("key") or ""),
+                ),
+            )[-1]
+            if falcon_candidates
+            else None
+        )
         if selected:
+            selected_trade = (
+                selected.get("trade")
+                if isinstance(selected.get("trade"), dict)
+                else {}
+            )
+            selected_identity = _closed_trade_identity_state_v1(
+                selected_trade
+            )
+            strong_identity = selected_identity.get("strong_identity") or {}
+            missing_identity = [
+                field
+                for field in (
+                    "lifecycle_id",
+                    "client_order_id",
+                    "order_id",
+                )
+                if not strong_identity.get(field)
+            ]
+            if (
+                selected_identity.get("has_alias_conflict")
+                or missing_identity
+            ):
+                return {
+                    "ok": False,
+                    "module": "real_close_auto_evaluator_v1",
+                    "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
+                    "patch_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
+                    "generated_at": _rcrm_v1_now(),
+                    "status": (
+                        "REAL_CLOSE_SELECTED_STRONG_IDENTITY_ALIAS_CONFLICT"
+                        if selected_identity.get("has_alias_conflict")
+                        else "REAL_CLOSE_SELECTED_STRONG_IDENTITY_INCOMPLETE"
+                    ),
+                    "committed": False,
+                    "commit_requested": commit_requested,
+                    "missing_identity": missing_identity,
+                    "candidate_count": len(falcon_candidates),
+                    "broker_reconciliation": None,
+                    "token_value_exposed": False,
+                }
             reconcile_payload = {
                 "trade_id": selected.get("trade_id") or selected.get("key"),
                 "bot": selected.get("bot"),
                 "setup": selected.get("setup"),
                 "symbol": selected.get("symbol"),
                 "side": selected.get("side"),
+                "lifecycle_id": strong_identity.get("lifecycle_id"),
+                "client_order_id": strong_identity.get("client_order_id"),
+                "open_order_id": strong_identity.get("order_id"),
+                "broker_order_id": strong_identity.get("order_id"),
+                "order_id": strong_identity.get("order_id"),
             }
             reconciliation = real_close_reconciliation_v1_run(
                 payload=reconcile_payload,
@@ -51892,25 +54588,85 @@ def _fcor_v1_value(record, *keys):
 def _fcor_v1_identity(pos, position_id=None):
     pos = pos if isinstance(pos, dict) else {}
     live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+    strong_reader = (
+        getattr(central_trade_registry, "strong_identity_alias_state", None)
+        if central_trade_registry is not None
+        else None
+    )
+    flattened = {
+        "lifecycle_id": pos.get("lifecycle_id"),
+        "trade_lifecycle_id": pos.get("trade_lifecycle_id"),
+        "open_order_id": pos.get("live_order_id"),
+        "broker_order_id": pos.get("bingx_order_id"),
+        "order_id": live_order.get("order_id"),
+        "orderId": live_order.get("id"),
+        "client_order_id": pos.get("live_client_order_id"),
+        "clientOrderId": pos.get("client_order_id"),
+        "clientOrderID": live_order.get("client_order_id"),
+        "client_tag": live_order.get("client_tag"),
+    }
+    strong_states = {}
+    if callable(strong_reader):
+        try:
+            strong_states = {
+                field: strong_reader(flattened, field)
+                for field in ("lifecycle_id", "client_order_id", "order_id")
+            }
+        except Exception:
+            strong_states = {}
+    alias_conflicts = [
+        {
+            "field": field,
+            "reason": "STRONG_IDENTITY_ALIAS_CONFLICT",
+        }
+        for field, state in strong_states.items()
+        if state.get("conflict")
+    ]
     return {
         "position_id": str(position_id or pos.get("id") or pos.get("position_id") or "").strip() or None,
         "trade_id": str(pos.get("trade_registry_id") or pos.get("trade_id") or "").strip() or None,
-        "lifecycle_id": str(pos.get("lifecycle_id") or "").strip() or None,
-        "order_id": str(pos.get("live_order_id") or pos.get("bingx_order_id") or live_order.get("order_id") or live_order.get("id") or "").strip() or None,
-        "client_order_id": str(pos.get("live_client_order_id") or pos.get("client_order_id") or live_order.get("client_order_id") or live_order.get("client_tag") or "").strip() or None,
+        "lifecycle_id": (strong_states.get("lifecycle_id") or {}).get("value"),
+        "order_id": (strong_states.get("order_id") or {}).get("value"),
+        "client_order_id": (strong_states.get("client_order_id") or {}).get("value"),
         "symbol": _flad_v1_norm_symbol(pos.get("symbol")),
         "side": _flad_v1_norm_side(pos.get("side")),
+        "alias_conflicts": alias_conflicts,
+        "identity_helper_available": bool(strong_states),
     }
 
 
 def _fcor_v1_registry_identity(trade):
+    state_reader = (
+        getattr(central_trade_registry, "closed_trade_identity_state", None)
+        if central_trade_registry is not None
+        else None
+    )
+    state = {}
+    if callable(state_reader):
+        try:
+            state = state_reader(trade)
+        except Exception:
+            state = {}
+    strong = state.get("strong_identity") or {}
+    legacy = state.get("legacy_fallback") or {}
     return {
-        "trade_id": str(_fcor_v1_value(trade, "trade_id") or "").strip() or None,
-        "lifecycle_id": str(_fcor_v1_value(trade, "lifecycle_id") or "").strip() or None,
-        "order_id": str(_fcor_v1_value(trade, "broker_order_id", "order_id", "live_order_id", "entry_order_id") or "").strip() or None,
-        "client_order_id": str(_fcor_v1_value(trade, "client_order_id", "clientOrderId", "client_tag") or "").strip() or None,
-        "symbol": _flad_v1_norm_symbol(_fcor_v1_value(trade, "symbol")),
-        "side": _flad_v1_norm_side(_fcor_v1_value(trade, "side")),
+        "trade_id": str(state.get("trade_id") or "").strip() or None,
+        "lifecycle_id": strong.get("lifecycle_id"),
+        "order_id": strong.get("order_id"),
+        "client_order_id": strong.get("client_order_id"),
+        "symbol": _flad_v1_norm_symbol(legacy.get("symbol")),
+        "side": _flad_v1_norm_side(legacy.get("side")),
+        "bot": str(legacy.get("bot") or "").upper().strip() or None,
+        "status": str(legacy.get("status") or "").upper().strip() or None,
+        "registry_mode": (
+            str(legacy.get("registry_mode") or "").upper().strip() or None
+        ),
+        "execution_mode": (
+            str(legacy.get("execution_mode") or "").upper().strip() or None
+        ),
+        "canonical_key": state.get("canonical_key"),
+        "alias_conflicts": list(state.get("alias_conflicts") or []),
+        "identity_helper_available": bool(state),
     }
 
 
@@ -51926,7 +54682,7 @@ def _fcor_v1_reconciled_closed_index(registry):
         if str(trade.get("bot") or "").upper() == "FALCON" and bool(trade.get("central_only_broker_flat_reconciled") or meta.get("central_only_broker_flat_reconciled")):
             trade_id = str(trade.get("trade_id") or "").strip()
             if trade_id:
-                out[trade_id] = trade
+                out.setdefault(trade_id, []).append(trade)
     return out
 
 
@@ -51939,10 +54695,13 @@ def _fcor_v1_factual_closed_index(registry):
     for trade in closed if isinstance(closed, list) else []:
         if not isinstance(trade, dict):
             continue
-        meta = _fcor_v1_meta(trade)
-        mode = str(trade.get("registry_mode") or meta.get("registry_mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
-        trade_id = str(trade.get("trade_id") or "").strip()
-        if str(trade.get("status") or "").upper().strip() == "CLOSED" and str(trade.get("bot") or "").upper().strip() == "FALCON" and mode in {"REAL", "LIVE"} and trade_id:
+        identity = _fcor_v1_registry_identity(trade)
+        trade_id = str(identity.get("trade_id") or "").strip()
+        if (
+            identity.get("status") == "CLOSED"
+            and identity.get("bot") == "FALCON"
+            and trade_id
+        ):
             out.setdefault(trade_id, []).append(trade)
     return out
 
@@ -51951,6 +54710,13 @@ def _fcor_v1_evidence_reasons(pos, identity, now_epoch=None):
     now_epoch = float(now_epoch if now_epoch is not None else time.time())
     evidence = pos.get("central_only_evidence") if isinstance(pos.get("central_only_evidence"), dict) else {}
     reasons = []
+    if not identity.get("identity_helper_available"):
+        reasons.append("CANONICAL_IDENTITY_HELPER_UNAVAILABLE")
+    for conflict in identity.get("alias_conflicts") or []:
+        reasons.append(
+            "POSITION_STRONG_IDENTITY_ALIAS_CONFLICT:"
+            + str(conflict.get("field") or "UNKNOWN").upper()
+        )
     module = _fcor_v1_falcon_module()
     max_age = int(getattr(module, "FALCON_CENTRAL_ONLY_EVIDENCE_MAX_AGE_SECONDS", 300) or 300) if module is not None else 300
     checked_epoch = _safe_float(evidence.get("checked_epoch"), 0.0)
@@ -52009,27 +54775,88 @@ def _fcor_v1_candidate(position_id, pos, registry, now_epoch=None):
         evidence_reasons.append("POSITION_NOT_LIVE")
     if not identity.get("trade_id"):
         evidence_reasons.append("TRADE_ID_REQUIRED")
-    if not any(identity.get(field) for field in ("lifecycle_id", "order_id", "client_order_id")):
-        evidence_reasons.append("STRONG_OPERATIONAL_ID_REQUIRED")
+    missing_operational_identity = [
+        field
+        for field in ("lifecycle_id", "order_id", "client_order_id")
+        if not identity.get(field)
+    ]
+    if missing_operational_identity:
+        evidence_reasons.append("STRONG_OPERATIONAL_ID_INCOMPLETE")
+        evidence_reasons.extend(
+            f"{field.upper()}_REQUIRED"
+            for field in missing_operational_identity
+        )
 
     open_trades = registry.get("open_trades", {}) if isinstance(registry, dict) else {}
-    open_trade = open_trades.get(identity.get("trade_id")) if isinstance(open_trades, dict) and identity.get("trade_id") else None
+    open_rows = (
+        list(open_trades.values())
+        if isinstance(open_trades, dict)
+        else list(open_trades)
+        if isinstance(open_trades, list)
+        else []
+    )
+    open_candidates = [
+        item
+        for item in open_rows
+        if isinstance(item, dict)
+        and _fcor_v1_registry_identity(item).get("trade_id")
+        == identity.get("trade_id")
+    ]
     closed_candidates = _fcor_v1_factual_closed_index(registry).get(identity.get("trade_id"), [])
-    closed_trade = None
-    for item in reversed(closed_candidates if isinstance(closed_candidates, list) else [closed_candidates]):
-        if not isinstance(item, dict):
-            continue
-        item_identity = _fcor_v1_registry_identity(item)
-        if item_identity.get("symbol") != identity.get("symbol") or item_identity.get("side") != identity.get("side"):
-            continue
-        compared = [
-            (identity.get(field), item_identity.get(field))
-            for field in ("lifecycle_id", "order_id", "client_order_id")
-            if identity.get(field) and item_identity.get(field)
-        ]
-        if compared and all(str(local) == str(registry_value) for local, registry_value in compared):
-            closed_trade = item
-            break
+    registry_rejections = []
+
+    def exact_registry_matches(candidates, source):
+        matches = []
+        for item in candidates if isinstance(candidates, list) else [candidates]:
+            if not isinstance(item, dict):
+                continue
+            item_identity = _fcor_v1_registry_identity(item)
+            item_reasons = []
+            if not item_identity.get("identity_helper_available"):
+                item_reasons.append("CANONICAL_IDENTITY_HELPER_UNAVAILABLE")
+            if item_identity.get("alias_conflicts"):
+                item_reasons.append("REGISTRY_STRONG_IDENTITY_ALIAS_CONFLICT")
+            if item_identity.get("registry_mode") != "REAL":
+                item_reasons.append("REGISTRY_MODE_NOT_REAL")
+            if item_identity.get("execution_mode") != "LIVE":
+                item_reasons.append("EXECUTION_MODE_NOT_LIVE")
+            if item_identity.get("symbol") != identity.get("symbol"):
+                item_reasons.append("REGISTRY_SYMBOL_MISMATCH")
+            if item_identity.get("side") != identity.get("side"):
+                item_reasons.append("REGISTRY_SIDE_MISMATCH")
+            for field in ("lifecycle_id", "order_id", "client_order_id"):
+                local_value = identity.get(field)
+                registry_value = item_identity.get(field)
+                if not registry_value:
+                    item_reasons.append(f"REGISTRY_{field.upper()}_MISSING")
+                elif local_value and str(local_value) != str(registry_value):
+                    item_reasons.append(f"REGISTRY_{field.upper()}_MISMATCH")
+            if item_reasons:
+                registry_rejections.extend(item_reasons)
+                continue
+            matches.append((item, item_identity))
+        if len(matches) > 1:
+            evidence_reasons.append(
+                f"REGISTRY_{source}_STRONG_IDENTITY_AMBIGUOUS"
+            )
+        return matches
+
+    open_matches = exact_registry_matches(open_candidates, "OPEN")
+    closed_matches = exact_registry_matches(
+        closed_candidates if isinstance(closed_candidates, list) else [],
+        "CLOSED",
+    )
+    if open_matches and closed_matches:
+        evidence_reasons.append("REGISTRY_OPEN_CLOSED_IDENTITY_CONFLICT")
+    open_trade = open_matches[0][0] if len(open_matches) == 1 and not closed_matches else None
+    closed_trade = (
+        closed_matches[0][0]
+        if len(closed_matches) == 1 and not open_matches
+        else None
+    )
+    if not open_trade and not closed_trade:
+        evidence_reasons.extend(registry_rejections)
+        evidence_reasons.append("REGISTRY_STRONG_IDENTITY_MATCH_REQUIRED")
     trade = open_trade or closed_trade
     action = "CLOSE_REGISTRY_AND_REMOVE_MODULE" if open_trade else ("REMOVE_STALE_MODULE_POSITION" if closed_trade else None)
     if not isinstance(trade, dict):
@@ -52038,19 +54865,20 @@ def _fcor_v1_candidate(position_id, pos, registry, now_epoch=None):
         matched_identity = {}
     else:
         registry_identity = _fcor_v1_registry_identity(trade)
-        meta = _fcor_v1_meta(trade)
-        mode = str(trade.get("registry_mode") or meta.get("registry_mode") or trade.get("execution_mode") or meta.get("execution_mode") or "").upper().strip()
-        if str(trade.get("bot") or "").upper() != "FALCON":
+        if registry_identity.get("alias_conflicts"):
+            evidence_reasons.append("REGISTRY_STRONG_IDENTITY_ALIAS_CONFLICT")
+        if registry_identity.get("bot") != "FALCON":
             evidence_reasons.append("REGISTRY_BOT_NOT_FALCON")
-        if mode not in {"REAL", "LIVE"}:
+        if registry_identity.get("registry_mode") != "REAL":
             evidence_reasons.append("REGISTRY_TRADE_NOT_REAL")
+        if registry_identity.get("execution_mode") != "LIVE":
+            evidence_reasons.append("REGISTRY_TRADE_NOT_LIVE")
         if registry_identity.get("trade_id") != identity.get("trade_id"):
             evidence_reasons.append("REGISTRY_TRADE_ID_MISMATCH")
         if registry_identity.get("symbol") != identity.get("symbol"):
             evidence_reasons.append("REGISTRY_SYMBOL_MISMATCH")
         if registry_identity.get("side") != identity.get("side"):
             evidence_reasons.append("REGISTRY_SIDE_MISMATCH")
-        typed_matches = 0
         matched_identity = {}
         for field in ("lifecycle_id", "order_id", "client_order_id"):
             local_value = identity.get(field)
@@ -52059,9 +54887,12 @@ def _fcor_v1_candidate(position_id, pos, registry, now_epoch=None):
                 if str(local_value) != str(registry_value):
                     evidence_reasons.append(f"REGISTRY_{field.upper()}_MISMATCH")
                 else:
-                    typed_matches += 1
                     matched_identity[field] = local_value
-        if typed_matches == 0:
+            else:
+                evidence_reasons.append(
+                    f"REGISTRY_{field.upper()}_MISSING"
+                )
+        if len(matched_identity) != 3:
             evidence_reasons.append("REGISTRY_STRONG_IDENTITY_MATCH_REQUIRED")
 
     reasons = sorted(set(evidence_reasons))
@@ -52256,9 +55087,42 @@ def _fcor_v1_build_payload(commit_requested=False, ack=None):
                 # Rebuild immediately before mutation; stale broker-flat evidence
                 # or changed identity must stop this item fail-closed.
                 current_plan = _fcor_v1_build_plan()
-                current = next((item for item in current_plan.get("planned") or [] if item.get("identity", {}).get("trade_id") == original.get("identity", {}).get("trade_id")), None)
+                original_identity = original.get("identity") or {}
+                current_matches = [
+                    item
+                    for item in (current_plan.get("planned") or [])
+                    if all(
+                        str((item.get("identity") or {}).get(field) or "")
+                        == str(original_identity.get(field) or "")
+                        for field in (
+                            "position_id",
+                            "trade_id",
+                            "lifecycle_id",
+                            "order_id",
+                            "client_order_id",
+                            "symbol",
+                            "side",
+                        )
+                    )
+                ]
+                current = (
+                    current_matches[0]
+                    if len(current_matches) == 1
+                    else None
+                )
                 if current is None:
-                    skipped.append(dict(original, reasons=["CANDIDATE_CHANGED_BEFORE_COMMIT"]))
+                    skipped.append(
+                        dict(
+                            original,
+                            reasons=[
+                                (
+                                    "CANDIDATE_AMBIGUOUS_BEFORE_COMMIT"
+                                    if len(current_matches) > 1
+                                    else "CANDIDATE_CHANGED_BEFORE_COMMIT"
+                                )
+                            ],
+                        )
+                    )
                     continue
                 identity = current.get("identity") or {}
                 registry_result = {"ok": True, "action": "ALREADY_RECONCILED"}
@@ -52319,7 +55183,12 @@ def _fcor_v1_build_payload(commit_requested=False, ack=None):
 
         after_plan = _fcor_v1_build_plan()
         after = _fcor_v1_counts(after_plan)
-        already_reconciled_count = len(_fcor_v1_reconciled_closed_index(after_plan.get("registry") or {}))
+        already_reconciled_count = sum(
+            len(items)
+            for items in _fcor_v1_reconciled_closed_index(
+                after_plan.get("registry") or {}
+            ).values()
+        )
         if errors:
             status = "PARTIAL_OR_BLOCKED"
         elif commit_requested and not ack_ok:
@@ -58465,10 +61334,7 @@ def _pacs_v1_event_safety(event):
 def _pacs_v1_plan_closed_repairs(registry, closed_events):
     open_trades = _pprsf_v1_open_dict(registry)
     closed_trades = _pprsf_v1_closed_list(registry)
-    open_ids = {str(item.get("trade_id") or key) for key, item in open_trades.items()}
-    closed_ids = {str(item.get("trade_id")) for item in closed_trades if item.get("trade_id")}
-    closed_signatures = {_pprsf_v1_closed_signature(item) for item in closed_trades}
-    candidates = {}
+    candidate_items = []
     skipped = []
     for event in closed_events or []:
         safe, reason = _pacs_v1_event_safety(event)
@@ -58480,22 +61346,198 @@ def _pacs_v1_plan_closed_repairs(registry, closed_events):
         if not isinstance(trade, dict) or str(trade.get("trade_id") or "") != trade_id:
             skipped.append({"trade_id": trade_id, "reason": "INVALID_OR_MISMATCHED_CLOSED_EVENT"})
             continue
-        candidates.setdefault(trade_id, []).append((trade, event))
+        candidate_items.append((trade, event))
+
+    adjacency = [set([index]) for index in range(len(candidate_items))]
+    for left_index in range(len(candidate_items)):
+        for right_index in range(left_index + 1, len(candidate_items)):
+            relation = _closed_trade_record_relation_v1(
+                candidate_items[left_index][0],
+                candidate_items[right_index][0],
+            )
+            if relation != "DISTINCT":
+                adjacency[left_index].add(right_index)
+                adjacency[right_index].add(left_index)
+    candidate_components = []
+    seen_candidate_indexes = set()
+    for start_index in range(len(candidate_items)):
+        if start_index in seen_candidate_indexes:
+            continue
+        pending_indexes = [start_index]
+        component_indexes = []
+        seen_candidate_indexes.add(start_index)
+        while pending_indexes:
+            current_index = pending_indexes.pop()
+            component_indexes.append(current_index)
+            for linked_index in sorted(adjacency[current_index]):
+                if linked_index not in seen_candidate_indexes:
+                    seen_candidate_indexes.add(linked_index)
+                    pending_indexes.append(linked_index)
+        candidate_components.append(
+            [candidate_items[index] for index in sorted(component_indexes)]
+        )
 
     planned = []
     ambiguous = []
-    for trade_id, items in sorted(candidates.items()):
-        signatures = {_pprsf_v1_closed_signature(item[0]) for item in items}
-        if len(signatures) != 1:
-            ambiguous.append({"trade_id": trade_id, "reason": "AMBIGUOUS_TRADE_ID", "candidate_count": len(items)})
+    for items in candidate_components:
+        merge_result = _merge_closed_trade_records_v1(
+            [item[0] for item in items],
+            sources=["predator_paper_closed_event"] * len(items),
+        )
+        merge_diagnostics = (
+            merge_result.get("diagnostics")
+            if isinstance(merge_result, dict)
+            else {}
+        ) or {}
+        merged_records = (
+            merge_result.get("records")
+            if isinstance(merge_result, dict)
+            else []
+        ) or []
+        signature = (
+            _pprsf_v1_closed_signature(merged_records[0])
+            if len(merged_records) == 1
+            else "|".join(
+                sorted(
+                    _pprsf_v1_closed_signature(item[0])
+                    for item in items
+                )
+            )
+        )
+        trade_ids = sorted(
+            {
+                str(item[0].get("trade_id") or "")
+                for item in items
+                if isinstance(item[0], dict)
+            }
+        )
+        if (
+            merge_diagnostics.get("safe_to_commit") is not True
+            or len(merged_records) != 1
+        ):
+            ambiguous.append({
+                "trade_ids": trade_ids,
+                "identity": signature,
+                "reason": "AMBIGUOUS_CLOSED_EXECUTION_IDENTITY",
+                "candidate_count": len(items),
+            })
             continue
-        trade, event = items[0]
-        signature = next(iter(signatures))
-        if trade_id in closed_ids or signature in closed_signatures:
+        trade = dict(merged_records[0])
+        event = sorted(
+            (item[1] for item in items),
+            key=lambda value: json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )[0]
+        trade_id = str(trade.get("trade_id") or "")
+        existing_relations = [
+            _closed_trade_record_relation_v1(trade, existing)
+            for existing in closed_trades
+            if isinstance(existing, dict)
+        ]
+        if "CONFLICT" in existing_relations:
+            ambiguous.append({
+                "trade_ids": [trade_id],
+                "identity": signature,
+                "reason": "EXISTING_CLOSED_EXECUTION_IDENTITY_CONFLICT",
+                "candidate_count": 1,
+            })
+            continue
+        if "EQUIVALENT" in existing_relations:
             skipped.append({"trade_id": trade_id, "reason": "ALREADY_CLOSED"})
             continue
-        if trade_id in open_ids:
-            skipped.append({"trade_id": trade_id, "reason": "TRADE_STILL_OPEN_IN_REGISTRY"})
+        closed_state = _closed_trade_identity_state_v1(trade)
+        closed_strong = closed_state.get("strong_identity") or {}
+        open_conflicts = []
+        open_identity_conflicts = []
+        for registry_key, open_trade in open_trades.items():
+            if not isinstance(open_trade, dict):
+                continue
+            open_state = _closed_trade_identity_state_v1(open_trade)
+            open_strong = open_state.get("strong_identity") or {}
+            same_lifecycle = bool(
+                closed_strong.get("lifecycle_id")
+                and closed_strong.get("lifecycle_id")
+                == open_strong.get("lifecycle_id")
+            )
+            same_client_order = bool(
+                closed_strong.get("client_order_id")
+                and closed_strong.get("order_id")
+                and closed_strong.get("client_order_id")
+                == open_strong.get("client_order_id")
+                and closed_strong.get("order_id")
+                == open_strong.get("order_id")
+            )
+            strong_divergences = [
+                field
+                for field in (
+                    "lifecycle_id",
+                    "client_order_id",
+                    "order_id",
+                )
+                if closed_strong.get(field)
+                and open_strong.get(field)
+                and closed_strong.get(field) != open_strong.get(field)
+            ]
+            distinct_lifecycle = bool(
+                closed_strong.get("lifecycle_id")
+                and open_strong.get("lifecycle_id")
+                and closed_strong.get("lifecycle_id")
+                != open_strong.get("lifecycle_id")
+            )
+            distinct_client_order = bool(
+                closed_strong.get("client_order_id")
+                and closed_strong.get("order_id")
+                and open_strong.get("client_order_id")
+                and open_strong.get("order_id")
+                and (
+                    closed_strong.get("client_order_id"),
+                    closed_strong.get("order_id"),
+                )
+                != (
+                    open_strong.get("client_order_id"),
+                    open_strong.get("order_id"),
+                )
+            )
+            same_trade_id_without_distinguishing_identity = bool(
+                str(open_trade.get("trade_id") or registry_key) == trade_id
+                and not (distinct_lifecycle or distinct_client_order)
+            )
+            if (
+                (same_lifecycle or same_client_order)
+                and strong_divergences
+            ):
+                open_identity_conflicts.append(
+                    {
+                        "registry_key": str(registry_key),
+                        "fields": strong_divergences,
+                    }
+                )
+                continue
+            if (
+                same_lifecycle
+                or same_client_order
+                or same_trade_id_without_distinguishing_identity
+            ):
+                open_conflicts.append(str(registry_key))
+        if open_identity_conflicts:
+            ambiguous.append({
+                "trade_ids": [trade_id],
+                "identity": signature,
+                "reason": "OPEN_CLOSED_STRONG_IDENTITY_CONFLICT",
+                "candidate_count": 1,
+                "open_identity_conflicts": open_identity_conflicts,
+            })
+            continue
+        if open_conflicts:
+            skipped.append({
+                "trade_id": trade_id,
+                "reason": "TRADE_EXECUTION_STILL_OPEN_IN_REGISTRY",
+                "open_match_count": len(open_conflicts),
+            })
             continue
         trade = json.loads(json.dumps(trade, ensure_ascii=False, default=str))
         trade["source"] = "predator_auto_closed_sync_v1"
@@ -58679,16 +61721,30 @@ def predator_auto_closed_sync_v1_status(commit=False, ack=None, automatic=False,
             if fresh_registry is None:
                 raise RuntimeError(f"REGISTRY_RELOAD_FAILED:{fresh_error}")
             fresh_plan = _pacs_v1_plan_closed_repairs(fresh_registry, closed_events)
-            selected_ids = [item.get("trade_id") for item in selected]
-            fresh_by_id = {item.get("trade_id"): item for item in fresh_plan.get("planned") or []}
-            if any(trade_id not in fresh_by_id for trade_id in selected_ids):
+            selected_keys = [
+                _pprsf_v1_closed_signature(item) for item in selected
+            ]
+            fresh_by_key = {}
+            for item in fresh_plan.get("planned") or []:
+                key = _pprsf_v1_closed_signature(item)
+                if key in fresh_by_key:
+                    raise RuntimeError(
+                        "FRESH_PLAN_CLOSED_IDENTITY_AMBIGUOUS"
+                    )
+                fresh_by_key[key] = item
+            if any(key not in fresh_by_key for key in selected_keys):
                 raise RuntimeError("REGISTRY_CHANGED_DURING_SYNC")
             working = json.loads(json.dumps(fresh_registry, ensure_ascii=False, default=str))
             closed_list = _pprsf_v1_closed_list(working)
-            for trade_id in selected_ids:
-                trade = fresh_by_id[trade_id]
+            for identity_key in selected_keys:
+                trade = fresh_by_key[identity_key]
+                trade_id = trade.get("trade_id")
                 closed_list.append(trade)
-                repaired.append({"trade_id": trade_id, "closed_at": trade.get("closed_at")})
+                repaired.append({
+                    "trade_id": trade_id,
+                    "closed_identity": identity_key,
+                    "closed_at": trade.get("closed_at"),
+                })
             working["closed_trades"] = closed_list
             working["last_update"] = generated_at
             working["last_sync"] = {
@@ -58698,7 +61754,9 @@ def predator_auto_closed_sync_v1_status(commit=False, ack=None, automatic=False,
                 "closed_repaired_count": len(repaired),
                 "automatic": automatic,
             }
-            central_trade_registry.save_registry(working)
+            registry_write = central_trade_registry.save_registry(working)
+            if registry_write is False:
+                raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
             committed = True
             after_counts = _pprsf_v1_recalculate_lifecycle_counts_from_registry(working)
         except Exception as exc:

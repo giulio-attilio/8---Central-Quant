@@ -10,6 +10,11 @@ from pathlib import Path
 
 import pytest
 
+from trade_registry import (
+    closed_trade_identity_state as _canonical_closed_trade_identity_state,
+    merge_closed_trade_records as _canonical_merge_closed_trade_records,
+)
+
 
 def _function_from_main(name: str, namespace: dict):
     source = Path("main.py").read_text(encoding="utf-8")
@@ -84,6 +89,25 @@ def _repair_harness(tmp_path, closed_event=None):
         sigs = {"|".join(str(x.get(k) or "") for k in ("bot", "setup", "symbol", "side", "closed_at", "close_reason", "entry", "exit_price")) for x in reg["closed_trades"]}
         return ids, set(), sigs
 
+    def relation(left, right):
+        result = _canonical_merge_closed_trade_records([left, right])
+        diagnostics = result.get("diagnostics") or {}
+        if (
+            diagnostics.get("safe_to_commit") is True
+            and len(result.get("records") or []) == 1
+        ):
+            return "EQUIVALENT"
+        left_state = _canonical_closed_trade_identity_state(left)
+        right_state = _canonical_closed_trade_identity_state(right)
+        if (
+            left_state.get("canonical_key")
+            == right_state.get("canonical_key")
+            or set(left_state.get("merge_tokens") or [])
+            & set(right_state.get("merge_tokens") or [])
+        ):
+            return "CONFLICT"
+        return "DISTINCT"
+
     class _NoopStage:
         def __enter__(self):
             return self
@@ -115,6 +139,10 @@ def _repair_harness(tmp_path, closed_event=None):
         "_pprsf_v1_build_closed_trade_from_event": build,
         "_pprsf_v1_signature_trade": lambda trade: "open",
         "_pprsf_v1_closed_signature": lambda trade: "|".join(str(trade.get(k) or "") for k in ("bot", "setup", "symbol", "side", "closed_at", "close_reason", "entry", "exit_price")),
+        "_closed_trade_record_relation_v1": relation,
+        "_closed_trade_records_equivalent_v1": (
+            lambda left, right: relation(left, right) == "EQUIVALENT"
+        ),
         "_pprsf_v1_recalculate_lifecycle_counts_from_registry": lambda reg: {
             "module_open_count": 0,
             "registry_open_count": len(reg["open_trades"]),

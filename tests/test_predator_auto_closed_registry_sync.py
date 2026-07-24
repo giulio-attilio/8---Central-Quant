@@ -9,6 +9,11 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from trade_registry import (
+    closed_trade_identity_state as _canonical_closed_trade_identity_state,
+    merge_closed_trade_records as _canonical_merge_closed_trade_records,
+)
+
 
 MAIN = Path("main.py")
 _COMPILED_FUNCTIONS = None
@@ -52,6 +57,7 @@ def _event(trade_id, *, exit_price=101.0, mode="PAPER", sent=False):
             "symbol": "BTCUSDT",
             "side": "LONG",
             "setup": "SMART_PREDATOR",
+            "qty": 1.0,
             "entry": 100.0,
             "exit_price": exit_price,
             "closed_at": "2026-07-16 10:00:00",
@@ -100,26 +106,49 @@ def _harness(
             "setup": raw.get("setup"),
             "symbol": raw.get("symbol"),
             "side": raw.get("side"),
+            "qty": raw.get("qty"),
             "entry": raw.get("entry"),
             "exit_price": raw.get("exit_price"),
             "closed_at": raw.get("closed_at"),
             "status": "CLOSED",
+            "registry_mode": "PAPER",
+            "execution_mode": "PAPER",
             "pnl_pct": raw.get("pnl_pct"),
             "metadata": {},
         }
 
     def signature(trade):
-        return "|".join(str(trade.get(key) or "") for key in (
-            "bot", "setup", "symbol", "side", "closed_at", "entry", "exit_price"
-        ))
+        return str(
+            _canonical_closed_trade_identity_state(trade).get("canonical_key")
+            or ""
+        )
+
+    def equivalent(left, right):
+        result = _canonical_merge_closed_trade_records([left, right])
+        return bool(
+            (result.get("diagnostics") or {}).get("safe_to_commit") is True
+            and len(result.get("records") or []) == 1
+        )
 
     def counts(current):
-        closed_ids = {str(item.get("trade_id")) for item in current.get("closed_trades") or []}
-        explicit_ids = {
-            str((item.get("raw_public") or {}).get("trade_id"))
+        closed_rows = [
+            item
+            for item in current.get("closed_trades") or []
+            if isinstance(item, dict)
+        ]
+        event_rows = [
+            build(item)
             for item in events
-            if (item.get("raw_public") or {}).get("trade_id")
-        }
+            if isinstance(build(item), dict)
+        ]
+        missing_closed = sum(
+            1
+            for event_row in event_rows
+            if not any(
+                equivalent(event_row, closed_row)
+                for closed_row in closed_rows
+            )
+        )
         base = {
             "module_open_count": 0,
             "registry_open_count": 0,
@@ -127,7 +156,7 @@ def _harness(
             "paper_closed_events_count": len(events),
             "missing_registry_open_count": 0,
             "orphan_registry_open_count": 0,
-            "missing_registry_closed_count": len(explicit_ids.difference(closed_ids)),
+            "missing_registry_closed_count": missing_closed,
             "open_field_issue_count": 0,
             "stale_open_count": 0,
             "duplicate_module_open_trade_id_count": 0,
@@ -174,6 +203,8 @@ def _harness(
         "_pprsf_v1_closed_signature": signature,
         "_pprsf_v1_open_dict": lambda current: current.get("open_trades") or {},
         "_pprsf_v1_closed_list": lambda current: current.get("closed_trades") or [],
+        "_closed_trade_identity_state_v1": _canonical_closed_trade_identity_state,
+        "_merge_closed_trade_records_v1": _canonical_merge_closed_trade_records,
         "_pprsf_v1_registry_available": lambda: True,
         "_pprsf_v1_load_registry": lambda: (copy.deepcopy(registry), None),
         "_ppla_v1_get_closed_paper_events": lambda limit=0: (copy.deepcopy(events), {}),
@@ -190,6 +221,8 @@ def _harness(
         "_pacs_v1_bool",
         "_pacs_v1_explicit_trade_id",
         "_pacs_v1_event_safety",
+        "_closed_trade_record_relation_v1",
+        "_closed_trade_records_equivalent_v1",
         "_pacs_v1_plan_closed_repairs",
         "_pacs_v1_lifecycle_blockers",
         "_pacs_v1_atomic_write_json",
@@ -262,6 +295,7 @@ def test_existing_closed_is_not_duplicated(tmp_path):
         "trade_id": "PREDATOR-1", "bot": "PREDATOR", "setup": "SMART_PREDATOR",
         "symbol": "BTCUSDT", "side": "LONG", "entry": 100.0, "exit_price": 101.0,
         "closed_at": "2026-07-16 10:00:00", "status": "CLOSED", "pnl_pct": 1.0,
+        "qty": 1.0, "registry_mode": "PAPER", "execution_mode": "PAPER",
     }]
     ns, registry, storage = _harness(tmp_path, existing_closed=existing)
     result = ns["predator_auto_closed_sync_v1_status"](commit=True, automatic=True)

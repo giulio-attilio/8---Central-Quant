@@ -6,6 +6,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from trade_registry import (
+    closed_trade_identity_state as _canonical_closed_trade_identity_state,
+    merge_closed_trade_records as _canonical_merge_closed_trade_records,
+)
+
 
 MAIN = Path("main.py")
 
@@ -40,6 +45,10 @@ def _trade(trade_id, *, mode="PAPER", status="OPEN", bot="PREDATOR", pnl_marker=
         "side": "LONG",
         "status": status,
         "entry": 100,
+        "qty": 1,
+        "lifecycle_id": f"LC-{trade_id}",
+        "client_order_id": f"CLIENT-{trade_id}",
+        "order_id": f"ORDER-{trade_id}",
         "metadata": {"execution_mode": mode},
     }
     if pnl_marker:
@@ -97,9 +106,22 @@ def _harness(tmp_path, *, existing_closed_same_id=False, audit_mode="PAPER", exe
             "counts": recount(registry),
         },
         "_pprsf_v1_recalculate_lifecycle_counts_from_registry": recount,
+        "_closed_trade_identity_state_v1": (
+            _canonical_closed_trade_identity_state
+        ),
+        "_merge_closed_trade_records_v1": (
+            _canonical_merge_closed_trade_records
+        ),
         "central_trade_registry": storage,
     }
-    _functions({"_poof_v1_trade_mode", "_poof_v1_plan_orphans", "predator_registry_orphan_open_fix_v1_status", "build_predator_registry_orphan_open_fix_v1_text"}, namespace)
+    _functions({
+        "_closed_trade_record_relation_v1",
+        "_closed_trade_records_equivalent_v1",
+        "_poof_v1_trade_mode",
+        "_poof_v1_plan_orphans",
+        "predator_registry_orphan_open_fix_v1_status",
+        "build_predator_registry_orphan_open_fix_v1_text",
+    }, namespace)
     return namespace, registry, storage
 
 

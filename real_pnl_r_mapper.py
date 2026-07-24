@@ -25,6 +25,8 @@ Arquivos gerados:
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import math
 import os
@@ -33,6 +35,11 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from history_memory_guard import AUTOMATIC_MAX_BYTES, AUTOMATIC_MAX_RECORDS, iter_jsonl_tail
+from trade_registry import (
+    STRONG_IDENTITY_ALIASES,
+    closed_trade_identity_state,
+    merge_closed_trade_records,
+)
 
 VERSION = "2026-07-07-REAL-PNL-R-MAPPER-V2.5"
 MODULE = "real_pnl_r_mapper"
@@ -191,6 +198,141 @@ def _pick(d: Dict[str, Any], keys: Iterable[str], default: Any = None) -> Any:
         if k in d and not _is_empty(d.get(k)):
             return d.get(k)
     return default
+
+
+_CANONICAL_MERGE_PASSTHROUGH_FIELDS = (
+    "outcome",
+    "outcome_status",
+    "outcome_source",
+    "outcome_id",
+    "outcome_hash",
+    "data_quality",
+    "outcome_data_quality",
+    "exit_price",
+    "exit_avg_price",
+    "average_exit_price",
+    "closed_quantity",
+    "closed_qty",
+    "close_qty",
+    "remaining_qty",
+    "close_timestamp",
+    "close_reason",
+    "exit_reason",
+    "pnl",
+    "pnl_r",
+    "result",
+    "result_pct",
+    "result_r",
+    "r_multiple",
+    "gross_pnl",
+    "gross_pnl_usdt",
+    "net_pnl",
+    "net_pnl_usdt",
+    "realized_pnl",
+    "realized_pnl_usdt",
+    "profit_usdt",
+    "profit_loss",
+    "fee",
+    "fees",
+    "fees_usdt",
+    "opening_fee",
+    "closing_fee",
+    "funding",
+    "funding_fee",
+    "broker_close_order_id",
+    "close_order_id",
+    "exit_order_id",
+    "tp50_hit",
+    "financial_reconciliation_pending",
+    "learning_eligible",
+)
+
+
+def _project_closed_identity_fields(
+    item: Dict[str, Any], merged: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Keep evidence required by the shared canonical CLOSED identity merge."""
+    projected = dict(item or {})
+    merged = merged if isinstance(merged, dict) else {}
+    source_metadata = (
+        merged.get("metadata")
+        if isinstance(merged.get("metadata"), dict)
+        else {}
+    )
+    projected_metadata: Dict[str, Any] = {}
+
+    identity_state = closed_trade_identity_state(merged)
+    identity_states: List[Dict[str, Any]] = []
+    identity_states.extend(
+        state
+        for state in (
+            identity_state.get("strong_identity_states") or {}
+        ).values()
+        if isinstance(state, dict)
+    )
+    identity_states.extend(
+        state
+        for state in identity_state.get("specific_identity_states") or []
+        if isinstance(state, dict)
+    )
+    identity_states.extend(
+        state
+        for state in (
+            identity_state.get("legacy_identity_states") or {}
+        ).values()
+        if isinstance(state, dict)
+    )
+
+    for state in identity_states:
+        for alias_path in state.get("aliases_present") or []:
+            source_name, separator, alias = str(alias_path).partition(".")
+            if not separator or not alias:
+                continue
+            source = merged if source_name == "trade" else source_metadata
+            value = source.get(alias)
+            if _is_empty(value):
+                continue
+            if source_name == "metadata":
+                projected_metadata[alias] = copy.deepcopy(value)
+            elif alias not in projected or _is_empty(projected.get(alias)):
+                # Canonical mapper fields stay normalized; alternate aliases
+                # remain available for exact identity/conflict checks.
+                projected[alias] = copy.deepcopy(value)
+
+    for field in _CANONICAL_MERGE_PASSTHROUGH_FIELDS:
+        value = merged.get(field)
+        if not _is_empty(value) and (
+            field not in projected or _is_empty(projected.get(field))
+        ):
+            projected[field] = copy.deepcopy(value)
+        metadata_value = source_metadata.get(field)
+        if not _is_empty(metadata_value):
+            projected_metadata[field] = copy.deepcopy(metadata_value)
+
+    # Some operational event sources call execution_mode simply ``mode``.
+    if _is_empty(projected.get("execution_mode")):
+        execution_mode = _pick(merged, ["execution_mode", "mode"], None)
+        if not _is_empty(execution_mode):
+            projected["execution_mode"] = copy.deepcopy(execution_mode)
+    if _is_empty(projected.get("registry_mode")):
+        registry_mode = _pick(merged, ["registry_mode", "trade_mode"], None)
+        if not _is_empty(registry_mode):
+            projected["registry_mode"] = copy.deepcopy(registry_mode)
+
+    # Preserve every strong alias, including conflicting metadata aliases, so
+    # trade_registry can quarantine corruption instead of silently fusing it.
+    for aliases in STRONG_IDENTITY_ALIASES.values():
+        for alias in aliases:
+            value = merged.get(alias)
+            if not _is_empty(value):
+                projected[alias] = copy.deepcopy(value)
+            metadata_value = source_metadata.get(alias)
+            if not _is_empty(metadata_value):
+                projected_metadata[alias] = copy.deepcopy(metadata_value)
+
+    if projected_metadata:
+        projected["metadata"] = projected_metadata
+    return projected
 
 
 # ==========================================================
@@ -504,115 +646,156 @@ def _normalize_trade(row: Dict[str, Any], source: str) -> Optional[Dict[str, Any
         "raw_event": _safe_str(_pick(merged, ["event", "event_raw", "type", "status", "kind"]), ""),
         "timestamp": _pick(merged, ["timestamp", "epoch", "created_at", "entry_time", "opened_at", "closed_at", "generated_at"]),
     }
+    item = _project_closed_identity_fields(item, merged)
     return _recompute_metrics(item)
 
 
-def _field_quality_score(t: Dict[str, Any]) -> int:
-    score = 0
-    for field in ["bot", "setup", "symbol", "side"]:
-        if t.get(field) and t.get(field) != "UNKNOWN":
-            score += 1
-    for field in ["entry", "stop", "exit", "qty", "pnl_pct", "pnl_usdt", "r"]:
-        if t.get(field) is not None:
-            score += 2
-    if t.get("closed"):
-        score += 3
-    return score
+def _mapper_stable_record_key(record: Dict[str, Any]) -> Tuple[str, str]:
+    try:
+        identity = closed_trade_identity_state(record)
+        canonical_key = str(identity.get("canonical_key") or "")
+    except Exception:
+        canonical_key = ""
+    return (
+        canonical_key,
+        json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
 
 
-def _merge_two(current: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge conservador: preserva campos bons e completa campos vazios."""
-    merged = dict(current)
-    sources = set(_source_list(current.get("sources")) + _source_list(incoming.get("sources")) + [incoming.get("source")])
-    merged["sources"] = sorted([s for s in sources if s])
+def _mapper_observation_id(record: Dict[str, Any]) -> str:
+    """Return a deterministic, internal-only identifier for one observation."""
+    payload = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    # Se incoming é mais completo, ele pode preencher metadados UNKNOWN.
-    for k, v in incoming.items():
-        if k in {"sources"}:
+
+def _merge_trades_with_diagnostics(
+    trades: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge execution observations through the Registry identity contract.
+
+    ``trade_id`` and symbol/side match keys are never sufficient evidence.
+    A non-CLOSED observation may enrich a CLOSED record only when both expose a
+    shared typed canonical token.  Uncertain, financially conflicting, or
+    alias-conflicting records remain separate and make persistence fail-closed
+    through ``safe_to_commit``.
+    """
+    closed_marker = "__real_pnl_mapper_closed_observation_ids__"
+    open_marker = "__real_pnl_mapper_open_observation_ids__"
+    closed_records: List[Dict[str, Any]] = []
+    non_closed_records: List[Dict[str, Any]] = []
+    for trade in trades or []:
+        if not isinstance(trade, dict):
             continue
-        if _is_empty(v):
+        item = copy.deepcopy(trade)
+        if item.get("closed") or str(item.get("status") or "").upper() == "CLOSED":
+            item["closed"] = True
+            item["status"] = "CLOSED"
+            item[closed_marker] = [_mapper_observation_id(item)]
+            closed_records.append(item)
+        else:
+            non_closed_records.append(item)
+
+    closed_tokens = {
+        str(token)
+        for item in closed_records
+        for token in (
+            closed_trade_identity_state(item).get("merge_tokens") or []
+        )
+    }
+    canonical_candidates: List[Dict[str, Any]] = []
+    candidate_open_ids = set()
+    for item in non_closed_records:
+        projected = copy.deepcopy(item)
+        projected["closed"] = True
+        projected["status"] = "CLOSED"
+        state = closed_trade_identity_state(projected)
+        tokens = {str(token) for token in state.get("merge_tokens") or []}
+        # No coarse fallback is allowed here.  The shared token can only be a
+        # lifecycle, client+order, specific execution ID, or complete canonical
+        # legacy fallback emitted by trade_registry.
+        if not (tokens & closed_tokens):
             continue
-        if _is_empty(merged.get(k)) or merged.get(k) == "UNKNOWN":
-            merged[k] = v
+        observation_id = _mapper_observation_id(item)
+        projected[open_marker] = [observation_id]
+        canonical_candidates.append(projected)
+        candidate_open_ids.add(observation_id)
 
-    # Campos numéricos: preencher se faltam.
-    for k in ["entry", "stop", "exit", "qty", "pnl_pct", "pnl_usdt", "r"]:
-        if merged.get(k) is None and incoming.get(k) is not None:
-            merged[k] = incoming.get(k)
+    canonical_result = merge_closed_trade_records(
+        closed_records + canonical_candidates
+    )
+    diagnostics = copy.deepcopy(canonical_result.get("diagnostics") or {})
 
-    # Se qualquer fonte diz que fechou, consideramos closed.
-    merged["closed"] = bool(current.get("closed") or incoming.get("closed"))
-    merged["status"] = "CLOSED" if merged.get("closed") else merged.get("status", "MAPPED")
+    merged_closed: List[Dict[str, Any]] = []
+    consumed_open_ids = set()
+    for record in canonical_result.get("records") or []:
+        if not isinstance(record, dict):
+            continue
+        item = copy.deepcopy(record)
+        closed_observation_ids = {
+            str(value)
+            for value in item.pop(closed_marker, []) or []
+            if value
+        }
+        open_observation_ids = {
+            str(value)
+            for value in item.pop(open_marker, []) or []
+            if value
+        }
+        # A projected OPEN-only row is never exposed as a fabricated CLOSED.
+        # It is retained below in its original non-CLOSED form unless the
+        # canonical Registry merge actually joined it to a CLOSED observation.
+        if not closed_observation_ids:
+            continue
+        if open_observation_ids:
+            consumed_open_ids.update(open_observation_ids)
+        item["closed"] = True
+        item["status"] = "CLOSED"
+        if _is_empty(item.get("r")) and not _is_empty(item.get("pnl_r")):
+            item["r"] = _safe_float(item.get("pnl_r"))
+        merged_closed.append(_diagnose_trade(_recompute_metrics(item)))
 
-    # Mantém último evento bruto relevante.
-    if incoming.get("raw_event") and str(incoming.get("raw_event")).upper() in {"TRADE_CLOSED", "CLOSE", "CLOSED", "POSITION_CLOSED", "EXIT", "STOP", "TP"}:
-        merged["raw_event"] = incoming.get("raw_event")
-
-    return _recompute_metrics(merged)
+    merged_closed.sort(key=_mapper_stable_record_key)
+    normalized_open = [
+        _diagnose_trade(_recompute_metrics(copy.deepcopy(item)))
+        for item in non_closed_records
+        if _mapper_observation_id(item) not in consumed_open_ids
+    ]
+    normalized_open.sort(key=_mapper_stable_record_key)
+    diagnostics.update(
+        {
+            "mapper_identity_contract": "TRADE_REGISTRY_CLOSED_CANONICAL_IDENTITY",
+            "closed_input_count": len(closed_records),
+            "non_closed_input_count": len(non_closed_records),
+            "open_enrichment_candidate_count": len(canonical_candidates),
+            "open_enrichment_consumed_count": len(consumed_open_ids),
+            "open_enrichment_preserved_count": len(
+                candidate_open_ids - consumed_open_ids
+            ),
+            "trade_id_only_merge": False,
+            "symbol_side_merge": False,
+        }
+    )
+    return {
+        "records": merged_closed + normalized_open,
+        "diagnostics": diagnostics,
+    }
 
 
 def _merge_trades(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    1) Agrupa por trade_id quando o id parece confiável.
-    2) Enriquece fechamentos incompletos por bot/símbolo/lado.
-    3) Usa fallback por símbolo/lado para casos como trade_id='C'.
-    """
-    by_id: Dict[str, Dict[str, Any]] = {}
-
-    for t in trades:
-        tid = _safe_str(t.get("trade_id"))
-        if not tid:
-            tid = f"AUTO:{len(by_id)+1}"
-        if tid not in by_id:
-            by_id[tid] = t
-        else:
-            by_id[tid] = _merge_two(by_id[tid], t)
-
-    merged = list(by_id.values())
-
-    # Índices dos registros mais completos para enriquecer fechados incompletos.
-    by_match: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    by_loose: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for t in merged:
-        if t.get("match_key"):
-            by_match[t["match_key"]].append(t)
-        if t.get("loose_match_key"):
-            by_loose[t["loose_match_key"]].append(t)
-
-    for key in list(by_match.keys()):
-        by_match[key] = sorted(by_match[key], key=_field_quality_score, reverse=True)
-    for key in list(by_loose.keys()):
-        by_loose[key] = sorted(by_loose[key], key=_field_quality_score, reverse=True)
-
-    enriched: List[Dict[str, Any]] = []
-    for t in merged:
-        item = dict(t)
-        if item.get("closed"):
-            candidates = []
-            candidates.extend(by_match.get(item.get("match_key"), []))
-            candidates.extend(by_loose.get(item.get("loose_match_key"), []))
-            for c in candidates:
-                if c is item:
-                    continue
-                item = _merge_two(item, c)
-                if item.get("entry") is not None and item.get("exit") is not None and item.get("stop") is not None:
-                    break
-        enriched.append(_diagnose_trade(_recompute_metrics(item)))
-
-    # Dedup final: se dois registros ficaram com mesma identidade e ambos closed, mantém o mais completo.
-    final_by_key: Dict[str, Dict[str, Any]] = {}
-    for t in enriched:
-        dedup_key = t.get("trade_id") or f"{t.get('match_key')}|{t.get('timestamp')}"
-        # Para IDs ruins/curtos, dedup por match + timestamp aproximado textual.
-        if len(_safe_str(t.get("trade_id"))) < 6:
-            dedup_key = f"{t.get('match_key')}|{t.get('timestamp')}|{t.get('raw_event')}"
-        if dedup_key not in final_by_key:
-            final_by_key[dedup_key] = t
-        else:
-            old = final_by_key[dedup_key]
-            final_by_key[dedup_key] = _merge_two(old, t) if _field_quality_score(t) >= _field_quality_score(old) else _merge_two(t, old)
-
-    return list(final_by_key.values())
+    """Compatibility projection returning canonical merge records only."""
+    return list(_merge_trades_with_diagnostics(trades).get("records") or [])
 
 
 # ==========================================================
@@ -786,7 +969,9 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
                 continue
             normalized.append(item)
 
-    merged = _merge_trades(normalized)
+    merge_result = _merge_trades_with_diagnostics(normalized)
+    merged = list(merge_result.get("records") or [])
+    closed_identity_merge = dict(merge_result.get("diagnostics") or {})
     closed = [r for r in merged if r.get("closed") or r.get("status") == "CLOSED"]
     diagnostics = _diagnostics(merged)
 
@@ -832,6 +1017,7 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "normalized_count": len(normalized),
         "mapped_count": len(merged),
         "closed_count": len(closed),
+        "closed_identity_merge": closed_identity_merge,
         "summary": _stats_for(merged),
         "diagnostics": diagnostics,
         "by_bot": _group_stats(closed, "bot"),
@@ -841,7 +1027,13 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "recent_closed": closed[-25:],
     }
 
-    if commit:
+    if commit and not closed_identity_merge.get("safe_to_commit", True):
+        payload["ok"] = False
+        payload["status"] = "CLOSED_IDENTITY_REVIEW_REQUIRED"
+        payload["commit_blocked"] = True
+        payload["commit_block_reason"] = "CLOSED_IDENTITY_MERGE_UNSAFE"
+        payload["committed"] = False
+    elif commit:
         _write_json(OUTPUT_MAP_FILE, payload)
         _append_jsonl(OUTPUT_EVENTS_FILE, {
             "event": "REAL_PNL_R_MAP_REBUILT",
@@ -926,7 +1118,7 @@ if __name__ == "__main__":
 # (/data/trade_registry.json), enquanto a V2.5 lia apenas trade_registry.jsonl.
 # Continua observacional: não envia ordens, não altera risco e não rearma LIVE.
 
-VERSION = "2026-07-11-REAL-PNL-R-MAPPER-V2.6.3-RECONCILED-REAL-CLOSE"
+VERSION = "2026-07-23-REAL-PNL-R-MAPPER-V2.6.4-CLOSED-CANONICAL-IDENTITY"
 TRADE_REGISTRY_JSON_FILE = os.path.join(DATA_DIR, "trade_registry.json")
 BROKER_EXECUTIONS_LOG_FILE = os.path.join(DATA_DIR, "broker_executions_log.jsonl")
 BROKER_EXECUTION_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "broker_execution_audit_log.jsonl")
@@ -955,12 +1147,15 @@ def _read_trade_registry_json_rows(limit: Optional[int] = None) -> List[Dict[str
             row.setdefault("status", default_status)
             row.setdefault("event", "TRADE_CLOSED" if default_status == "CLOSED" else "TRADE_OPEN")
         row.setdefault("registry_file", TRADE_REGISTRY_JSON_FILE)
-        fingerprint = (
-            _safe_str(row.get("trade_id") or row.get("id") or row.get("order_id")),
-            _safe_str(row.get("status") or row.get("state")),
-            _safe_str(row.get("symbol")),
-            _safe_str(row.get("side")),
-            _safe_str(row.get("closed_at") or row.get("opened_at") or row.get("timestamp")),
+        # Reader-level dedup is exact-document-only.  Semantic identity belongs
+        # to merge_closed_trade_records; a coarse tuple omitting lifecycle or
+        # order aliases can erase an independent execution before that merge.
+        fingerprint = json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
         )
         if fingerprint in seen:
             return
@@ -1306,7 +1501,9 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
                 continue
             normalized.append(item)
 
-    merged = _merge_trades(normalized)
+    merge_result = _merge_trades_with_diagnostics(normalized)
+    merged = list(merge_result.get("records") or [])
+    closed_identity_merge = dict(merge_result.get("diagnostics") or {})
     closed = [r for r in merged if r.get("closed") or r.get("status") == "CLOSED"]
     diagnostics = _diagnostics(merged)
     open_real_candidates = [r for r in merged if not (r.get("closed") or r.get("status") == "CLOSED")]
@@ -1351,6 +1548,7 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "normalized_count": len(normalized),
         "mapped_count": len(merged),
         "closed_count": len(closed),
+        "closed_identity_merge": closed_identity_merge,
         "summary": _stats_for(closed),
         "diagnostics": diagnostics,
         "by_bot": _group_stats(closed, "bot"),
@@ -1359,7 +1557,13 @@ def build_real_pnl_r_map(limit: Optional[int] = None, commit: bool = True) -> Di
         "by_side": _group_stats(closed, "side"),
         "recent_closed": closed[-25:],
     }
-    if commit:
+    if commit and not closed_identity_merge.get("safe_to_commit", True):
+        payload["ok"] = False
+        payload["status"] = "CLOSED_IDENTITY_REVIEW_REQUIRED"
+        payload["commit_blocked"] = True
+        payload["commit_block_reason"] = "CLOSED_IDENTITY_MERGE_UNSAFE"
+        payload["committed"] = False
+    elif commit:
         _write_json(OUTPUT_MAP_FILE, payload)
         _append_jsonl(OUTPUT_EVENTS_FILE, {
             "event": "REAL_PNL_R_MAP_REBUILT",

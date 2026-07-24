@@ -28,6 +28,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 from history_memory_guard import (
+    ABSOLUTE_MAX_RECORDS,
     AUTOMATIC_MAX_BYTES,
     AUTOMATIC_MAX_RECORDS,
     iter_jsonl_tail,
@@ -1687,26 +1688,247 @@ def _derive_event_name_from_payload(payload):
     return "EVENT"
 
 
+_CLOSED_TRADE_IDENTITY_CHILD_FIELDS = (
+    "source_event",
+    "raw",
+    "metadata",
+)
+_CLOSED_TRADE_STRONG_IDENTITY_ALIASES = {
+    "lifecycle_id": (
+        "lifecycle_id",
+        "trade_lifecycle_id",
+    ),
+    "client_order_id": (
+        "client_order_id",
+        "clientOrderId",
+        "clientOrderID",
+        "client_tag",
+    ),
+    "order_id": (
+        "open_order_id",
+        "broker_order_id",
+        "exchange_order_id",
+        "order_id",
+        "orderId",
+        "live_order_id",
+        "entry_order_id",
+    ),
+}
+_CLOSED_TRADE_SPECIFIC_ID_FIELDS = (
+    "registry_record_id",
+    "historical_record_id",
+    "closed_trade_id",
+    "record_id",
+    "position_id",
+    "falcon_position_id",
+    "execution_attempt_id",
+    "attempt_id",
+    "execution_id",
+    "trade_uuid",
+    "position_uuid",
+)
+_CLOSED_TRADE_LEGACY_IDENTITY_ALIASES = {
+    "trade_id": ("trade_id",),
+    "registry_mode": ("registry_mode",),
+    "execution_mode": ("execution_mode", "mode"),
+    "opened_at": ("opened_at", "entry_time"),
+    "closed_at": (
+        "closed_at",
+        "close_timestamp",
+        "exit_time",
+        "ts",
+    ),
+    "entry": ("entry", "entry_price"),
+    "qty": ("qty", "initial_qty", "quantity"),
+}
+
+
+def _closed_trade_identity_nodes(record):
+    """Yield only known identity-bearing mappings, without following cycles."""
+    if not isinstance(record, dict):
+        return []
+    nodes = []
+    pending = [(record, 0)]
+    seen = set()
+    while pending:
+        node, depth = pending.pop()
+        if not isinstance(node, dict) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        nodes.append(node)
+        if depth >= 8:
+            continue
+        for field in reversed(_CLOSED_TRADE_IDENTITY_CHILD_FIELDS):
+            child = node.get(field)
+            if isinstance(child, dict):
+                pending.append((child, depth + 1))
+    return nodes
+
+
+def _closed_trade_normalize_identity_value(field, value):
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if field == "client_order_id":
+        return text.casefold()
+    if field in {"registry_mode", "execution_mode"}:
+        return text.upper()
+    if field in {"entry", "qty"}:
+        try:
+            number = float(text.replace(",", "."))
+            return format(number, ".15g")
+        except Exception:
+            return text
+    return text
+
+
+def _closed_trade_alias_state(record, field, aliases):
+    values = set()
+    aliases_present = set()
+    for node in _closed_trade_identity_nodes(record):
+        for alias in aliases:
+            if alias not in node:
+                continue
+            normalized = _closed_trade_normalize_identity_value(
+                field, node.get(alias)
+            )
+            if normalized:
+                values.add(normalized)
+                aliases_present.add(alias)
+    ordered_values = sorted(values)
+    return {
+        "field": field,
+        "value": ordered_values[0] if len(ordered_values) == 1 else None,
+        "normalized_values": ordered_values,
+        "aliases_present": sorted(aliases_present),
+        "conflict": len(ordered_values) > 1,
+    }
+
+
+def _closed_trade_identity_fingerprint(record):
+    try:
+        encoded = json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        encoded = repr(record)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _closed_trade_key(record):
+    """Return a conservative key for the CLOSED history projection.
+
+    The event UID remains authoritative when present.  Historical records
+    without a UID use execution identity, never ``trade_id`` alone.  Conflicting
+    or incomplete identities are quarantined by exact record fingerprint so
+    uncertain executions are preserved instead of silently fused.
+    """
     if not isinstance(record, dict):
         return ""
+
     uid = str(record.get("uid") or "").strip()
     if uid:
         return f"uid:{uid}"
-    trade_id = str(record.get("trade_id") or "").strip()
-    bot = str(record.get("bot") or "").strip().upper()
-    symbol = normalize_symbol(record.get("symbol") or "")
-    side = normalize_side(record.get("side") or "")
-    exit_time = str(record.get("exit_time") or record.get("created_at") or "").strip()
-    pnl = str(record.get("pnl_pct") if record.get("pnl_pct") is not None else "").strip()
-    if trade_id:
-        return f"trade:{trade_id}|{exit_time}|{pnl}"
-    return f"fallback:{bot}|{symbol}|{side}|{exit_time}|{pnl}"
+
+    strong_states = {
+        field: _closed_trade_alias_state(record, field, aliases)
+        for field, aliases in _CLOSED_TRADE_STRONG_IDENTITY_ALIASES.items()
+    }
+    specific_states = {
+        field: _closed_trade_alias_state(record, field, (field,))
+        for field in _CLOSED_TRADE_SPECIFIC_ID_FIELDS
+    }
+    legacy_states = {
+        field: _closed_trade_alias_state(record, field, aliases)
+        for field, aliases in _CLOSED_TRADE_LEGACY_IDENTITY_ALIASES.items()
+    }
+    if any(
+        state.get("conflict")
+        for state in (
+            list(strong_states.values())
+            + list(specific_states.values())
+            + list(legacy_states.values())
+        )
+    ):
+        return "conflict:" + _closed_trade_identity_fingerprint(record)
+
+    lifecycle_id = strong_states["lifecycle_id"].get("value")
+    client_order_id = strong_states["client_order_id"].get("value")
+    order_id = strong_states["order_id"].get("value")
+    specific_tokens = [
+        f"{field}={specific_states[field].get('value')}"
+        for field in _CLOSED_TRADE_SPECIFIC_ID_FIELDS
+        if specific_states[field].get("value")
+    ]
+    if lifecycle_id:
+        corroborating_tokens = []
+        if client_order_id:
+            corroborating_tokens.append(
+                f"client_order_id={client_order_id}"
+            )
+        if order_id:
+            corroborating_tokens.append(f"order_id={order_id}")
+        corroborating_tokens.extend(specific_tokens)
+        suffix = (
+            "|" + "|".join(corroborating_tokens)
+            if corroborating_tokens
+            else ""
+        )
+        return f"lifecycle:{lifecycle_id}{suffix}"
+    if client_order_id and order_id:
+        suffix = (
+            "|" + "|".join(specific_tokens) if specific_tokens else ""
+        )
+        return f"client_order:{client_order_id}|{order_id}{suffix}"
+
+    if specific_tokens:
+        return "specific:" + "|".join(specific_tokens)
+
+    legacy_values = {
+        field: state.get("value") or ""
+        for field, state in legacy_states.items()
+    }
+    legacy_material = "|".join(
+        legacy_values[field]
+        for field in (
+            "trade_id",
+            "registry_mode",
+            "execution_mode",
+            "opened_at",
+            "closed_at",
+            "entry",
+            "qty",
+        )
+    )
+    partial_strong_identity = bool(client_order_id or order_id)
+    legacy_complete = all(legacy_values.values())
+    if legacy_complete and not partial_strong_identity:
+        return "legacy:" + legacy_material
+
+    return (
+        "uncertain:"
+        + legacy_material
+        + "|"
+        + _closed_trade_identity_fingerprint(record)
+    )
 
 
 def _load_closed_trade_keys(limit=None):
     keys = set()
-    for row in _read_jsonl_tail(CLOSED_TRADES_FILE, limit=limit or HISTORY_MAX_READ * 5):
+    requested_limit = limit if limit is not None else HISTORY_MAX_READ * 5
+    bounded_limit = min(
+        ABSOLUTE_MAX_RECORDS,
+        max(1, _safe_int(requested_limit, HISTORY_MAX_READ)),
+    )
+    for row in _read_jsonl_tail(
+        CLOSED_TRADES_FILE, limit=bounded_limit
+    ):
         key = _closed_trade_key(row)
         if key:
             keys.add(key)

@@ -168,6 +168,18 @@ class FakeRegistry:
     def load_registry(self):
         return copy.deepcopy(self.payload)
 
+    @staticmethod
+    def strong_identity_alias_state(trade, field):
+        import trade_registry
+
+        return trade_registry.strong_identity_alias_state(trade, field)
+
+    @staticmethod
+    def closed_trade_identity_state(trade):
+        import trade_registry
+
+        return trade_registry.closed_trade_identity_state(trade)
+
     def close_trade(self, trade_id, **kwargs):
         self.operation_log.append("registry_close")
         self.close_calls.append({"trade_id": trade_id, **copy.deepcopy(kwargs)})
@@ -712,6 +724,148 @@ def test_stale_cleanup_selects_exact_lifecycle_when_trade_id_has_multiple_closed
     assert harness.registry.close_calls == []
     assert harness.module.positions == {}
     assert len(harness.registry.payload["closed_trades"]) == 2
+
+
+def test_stale_cleanup_rejects_partial_closed_identity_before_module_remove(
+    tmp_path,
+):
+    harness = _harness(tmp_path)
+    partial = harness.registry.payload["open_trades"].pop("TR-XRP")
+    partial.update(
+        {
+            "status": "CLOSED",
+            "close_reason": "FACTUAL_CLOSE",
+            "closed_at": FIXED_NOW,
+        }
+    )
+    partial.pop("broker_order_id")
+    partial.pop("client_order_id")
+    harness.registry.payload["closed_trades"].append(partial)
+
+    result = _build(harness, commit=True, ack=ACK)
+
+    assert result["reconciled_count"] == 0
+    reasons = result["skipped_samples"][0]["skip_reasons"]
+    assert "REGISTRY_ORDER_ID_MISSING" in reasons
+    assert "REGISTRY_CLIENT_ORDER_ID_MISSING" in reasons
+    assert harness.module.remove_calls == []
+    assert "POS-XRP" in harness.module.positions
+
+
+def test_stale_cleanup_rejects_internal_strong_alias_conflict(tmp_path):
+    harness = _harness(tmp_path)
+    corrupt = harness.registry.payload["open_trades"].pop("TR-XRP")
+    corrupt.update(
+        {
+            "status": "CLOSED",
+            "close_reason": "FACTUAL_CLOSE",
+            "closed_at": FIXED_NOW,
+        }
+    )
+    corrupt.setdefault("metadata", {})["trade_lifecycle_id"] = "LC-OTHER"
+    harness.registry.payload["closed_trades"].append(corrupt)
+
+    result = _build(harness, commit=True, ack=ACK)
+
+    assert result["reconciled_count"] == 0
+    reasons = result["skipped_samples"][0]["skip_reasons"]
+    assert "REGISTRY_STRONG_IDENTITY_ALIAS_CONFLICT" in reasons
+    assert harness.module.remove_calls == []
+
+
+@pytest.mark.parametrize(
+    ("registry_mode", "execution_mode", "expected_reason"),
+    [
+        ("REAL", "PAPER", "EXECUTION_MODE_NOT_LIVE"),
+        ("VERIFY", "LIVE", "REGISTRY_MODE_NOT_REAL"),
+    ],
+)
+def test_stale_cleanup_requires_real_and_live_modes_independently(
+    tmp_path, registry_mode, execution_mode, expected_reason
+):
+    harness = _harness(tmp_path)
+    closed = harness.registry.payload["open_trades"].pop("TR-XRP")
+    closed.update(
+        {
+            "status": "CLOSED",
+            "registry_mode": registry_mode,
+            "execution_mode": execution_mode,
+            "closed_at": FIXED_NOW,
+        }
+    )
+    harness.registry.payload["closed_trades"].append(closed)
+
+    result = _build(harness, commit=True, ack=ACK)
+
+    assert result["reconciled_count"] == 0
+    assert expected_reason in result["skipped_samples"][0]["skip_reasons"]
+    assert harness.module.remove_calls == []
+
+
+def test_stale_cleanup_blocks_ambiguous_exact_closed_execution_copies(
+    tmp_path,
+):
+    harness = _harness(tmp_path)
+    closed = harness.registry.payload["open_trades"].pop("TR-XRP")
+    closed.update({"status": "CLOSED", "closed_at": FIXED_NOW})
+    harness.registry.payload["closed_trades"].extend(
+        [closed, copy.deepcopy(closed)]
+    )
+
+    result = _build(harness, commit=True, ack=ACK)
+
+    assert result["reconciled_count"] == 0
+    assert (
+        "REGISTRY_CLOSED_STRONG_IDENTITY_AMBIGUOUS"
+        in result["skipped_samples"][0]["skip_reasons"]
+    )
+    assert harness.module.remove_calls == []
+
+
+def test_precommit_reselection_uses_complete_identity_for_same_trade_id(
+    tmp_path,
+):
+    harness = _harness(tmp_path)
+    first_position = copy.deepcopy(harness.module.positions["POS-XRP"])
+    second_position = copy.deepcopy(first_position)
+    second_position.update(
+        {
+            "id": "POS-XRP-SECOND",
+            "lifecycle_id": "LC-XRP-SECOND",
+            "live_order_id": "ORDER-XRP-SECOND",
+            "live_client_order_id": "CLIENT-XRP-SECOND",
+        }
+    )
+    second_position["central_only_evidence"].update(
+        {
+            "lifecycle_id": "LC-XRP-SECOND",
+            "order_id": "ORDER-XRP-SECOND",
+            "client_order_id": "CLIENT-XRP-SECOND",
+        }
+    )
+    harness.module.positions["POS-XRP-SECOND"] = second_position
+
+    first_closed = harness.registry.payload["open_trades"].pop("TR-XRP")
+    first_closed.update({"status": "CLOSED", "closed_at": FIXED_NOW})
+    second_closed = copy.deepcopy(first_closed)
+    second_closed.update(
+        {
+            "lifecycle_id": "LC-XRP-SECOND",
+            "broker_order_id": "ORDER-XRP-SECOND",
+            "client_order_id": "CLIENT-XRP-SECOND",
+        }
+    )
+    harness.registry.payload["closed_trades"].extend(
+        [first_closed, second_closed]
+    )
+
+    result = _build(harness, commit=True, ack=ACK)
+
+    assert result["reconciled_count"] == 2
+    assert harness.module.positions == {}
+    assert {
+        call["lifecycle_id"] for call in harness.module.remove_calls
+    } == {"LC-XRP", "LC-XRP-SECOND"}
 
 
 def test_registry_close_failure_keeps_module_position_and_returns_blocked(tmp_path):
