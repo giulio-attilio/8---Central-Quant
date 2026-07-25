@@ -383,6 +383,7 @@ def test_closed_identity_financial_conflicts_routes_are_read_only_and_show_field
 
     text, status, headers = namespace["trade_registry_closed_identity_financial_conflicts_v1_text_route"]()
     assert status == 200
+    assert "TRADE REGISTRY CLOSED IDENTITY FINANCIAL CONFLICTS V1" in text
     assert "conflict_index=0" in text
     assert "trade_id=FALCON:FALCON15:XRPUSDT:LONG" in text
     assert "exit_price=" in text

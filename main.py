@@ -50745,6 +50745,1246 @@ def build_trade_registry_closed_identity_financial_conflicts_v1_text():
     return "\n".join(lines)
 
 
+def _trpsf_v1_closed_trade_stop_evidence_alias_families():
+    return {
+        "initial_stop": {"initial_stop", "stop_initial", "sl_initial", "initial_sl"},
+        "current_stop": {"stop", "sl", "stop_atual", "current_stop"},
+        "disaster_stop": {
+            "disaster_stop",
+            "disaster_sl",
+            "disaster_stop_price",
+            "stop_loss",
+            "stop_loss_price",
+        },
+    }
+
+
+def _trpsf_v1_stop_evidence_alias_families():
+    return _trpsf_v1_closed_trade_stop_evidence_alias_families()
+
+
+def _trpsf_v1_stop_evidence_candidate_paths():
+    data_dir = Path(globals().get("CENTRAL_DATA_DIR") or ".")
+    return [
+        ("history_events.jsonl", data_dir / "history_events.jsonl", "jsonl"),
+        ("decision_log.jsonl", data_dir / "decision_log.jsonl", "jsonl"),
+        ("execution_log.jsonl", data_dir / "execution_log.jsonl", "jsonl"),
+        ("execution_engine_log.jsonl", data_dir / "execution_engine_log.jsonl", "jsonl"),
+        ("broker_executions_log.jsonl", data_dir / "broker_executions_log.jsonl", "jsonl"),
+        ("broker_execution_audit_log.jsonl", data_dir / "broker_execution_audit_log.jsonl", "jsonl"),
+        ("timeline.jsonl", data_dir / "timeline.jsonl", "jsonl"),
+        ("history_export.json", data_dir / "history_export.json", "json"),
+    ]
+
+
+def _trpsf_v1_stop_evidence_iter_trades(values):
+    if isinstance(values, dict):
+        return [value for value in values.values() if isinstance(value, dict)]
+    if isinstance(values, list):
+        return [value for value in values if isinstance(value, dict)]
+    return []
+
+
+def _trpsf_v1_stop_evidence_numeric(value):
+    numeric = _trpsf_v1_truncated_number(value)
+    return numeric if numeric is not None else None
+
+
+def _trpsf_v1_stop_evidence_identity_fields():
+    return {
+        "lifecycle_id": {
+            "aliases": {"lifecycle_id"},
+            "kind": "strong",
+        },
+        "client_order_id": {
+            "aliases": {"client_order_id"},
+            "kind": "strong",
+        },
+        "order_id": {
+            "aliases": {"order_id", "broker_order_id", "exchange_order_id"},
+            "kind": "strong",
+        },
+        "trade_id": {
+            "aliases": {"trade_id"},
+            "kind": "weak",
+        },
+        "symbol": {
+            "aliases": {"symbol"},
+            "kind": "weak",
+        },
+        "side": {
+            "aliases": {"side"},
+            "kind": "weak",
+        },
+    }
+
+
+def _trpsf_v1_stop_evidence_identity_tokens(identity):
+    identity = identity if isinstance(identity, dict) else {}
+    fields = _trpsf_v1_stop_evidence_identity_fields()
+
+    def _normalized(field, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if field in {"symbol", "side"}:
+            return text.upper()
+        return text
+
+    tokens = {}
+    for canonical_field, descriptor in fields.items():
+        value = identity.get(canonical_field)
+        if value is None:
+            for alias in descriptor.get("aliases") or set():
+                if alias in identity and identity.get(alias) not in {None, ""}:
+                    value = identity.get(alias)
+                    break
+        tokens[canonical_field] = _normalized(canonical_field, value)
+
+    registry_index = identity.get("registry_index")
+    try:
+        if registry_index is None or str(registry_index).strip() == "":
+            tokens["registry_index"] = None
+        else:
+            tokens["registry_index"] = int(str(registry_index).strip())
+    except Exception:
+        tokens["registry_index"] = None
+
+    tokens["opened_at"] = (
+        identity.get("opened_at")
+        or identity.get("entry_timestamp")
+        or identity.get("created_at")
+    )
+    return tokens
+
+
+def _trpsf_v1_stop_evidence_trade_identity(trade, fallback_index=None):
+    trade = trade if isinstance(trade, dict) else {}
+    tokens = _trpsf_v1_stop_evidence_identity_tokens(trade)
+    if tokens.get("registry_index") is None and fallback_index is not None:
+        try:
+            tokens["registry_index"] = int(fallback_index)
+        except Exception:
+            tokens["registry_index"] = None
+
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    outcome = metadata.get("outcome") if isinstance(metadata.get("outcome"), dict) else {}
+    tokens["opened_at"] = (
+        trade.get("opened_at")
+        or trade.get("entry_timestamp")
+        or metadata.get("opened_at")
+        or outcome.get("opened_at")
+        or metadata.get("entry_timestamp")
+    )
+    return tokens
+
+
+def _trpsf_v1_stop_evidence_trade_selector(
+    trade,
+    registry_index=None,
+    trade_id=None,
+    client_order_id=None,
+    order_id=None,
+    lifecycle_id=None,
+    symbol=None,
+    side=None,
+):
+    selection_identity = _trpsf_v1_stop_evidence_identity_tokens(
+        {
+            "registry_index": registry_index,
+            "trade_id": trade_id,
+            "client_order_id": client_order_id,
+            "order_id": order_id,
+            "lifecycle_id": lifecycle_id,
+            "symbol": symbol,
+            "side": side,
+        }
+    )
+    strong_fields = {"lifecycle_id", "client_order_id", "order_id"}
+    weak_fields = {"trade_id", "symbol", "side"}
+    provided_fields = [
+        field
+        for field in [
+            "lifecycle_id",
+            "client_order_id",
+            "order_id",
+            "trade_id",
+            "symbol",
+            "side",
+        ]
+        if selection_identity.get(field) is not None
+    ]
+    provided_strong = [field for field in provided_fields if field in strong_fields]
+    provided_weak = [field for field in provided_fields if field in weak_fields]
+    has_strong_selection = bool(
+        selection_identity.get("lifecycle_id")
+        or selection_identity.get("client_order_id")
+        or selection_identity.get("order_id")
+    )
+
+    if selection_identity.get("lifecycle_id"):
+        identity_strength = "STRONG"
+    elif selection_identity.get("client_order_id") and selection_identity.get("order_id"):
+        identity_strength = "STRONG"
+    elif has_strong_selection:
+        identity_strength = "MEDIUM"
+    elif provided_weak:
+        identity_strength = "WEAK"
+    else:
+        identity_strength = "NONE"
+
+    candidates = []
+    if isinstance(trade, dict) and trade.get("closed_trades") is not None:
+        candidates = _trpsf_v1_stop_evidence_iter_trades(trade.get("closed_trades"))
+    elif isinstance(trade, list):
+        candidates = _trpsf_v1_stop_evidence_iter_trades(trade)
+    elif isinstance(trade, dict):
+        candidates = [trade]
+
+    analyses = []
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_identity = _trpsf_v1_stop_evidence_trade_identity(candidate, fallback_index=index)
+        mismatched_fields = []
+        strong_mismatched_fields = []
+        for field in provided_fields:
+            expected = selection_identity.get(field)
+            actual = candidate_identity.get(field)
+            if expected != actual:
+                mismatched_fields.append(field)
+                if field in strong_fields:
+                    strong_mismatched_fields.append(field)
+        analyses.append(
+            {
+                "candidate": candidate,
+                "candidate_identity": candidate_identity,
+                "candidate_index": index,
+                "mismatched_fields": mismatched_fields,
+                "strong_mismatched_fields": strong_mismatched_fields,
+                "compatible": not mismatched_fields,
+            }
+        )
+
+    base = {
+        "status": "STOP_EVIDENCE_TRADE_NOT_FOUND",
+        "selection_identity": selection_identity,
+        "identity_strength": identity_strength,
+        "compatible_candidate_count": 0,
+        "candidate_count": len(analyses),
+        "provided_fields": provided_fields,
+        "provided_strong_fields": provided_strong,
+        "provided_weak_fields": provided_weak,
+        "selection_reason": "NO_COMPATIBLE_CANDIDATE",
+        "selected_trade": None,
+        "selected_identity": None,
+        "mismatch_diagnostics": [
+            {
+                "candidate_index": item.get("candidate_identity", {}).get("registry_index"),
+                "mismatched_fields": item.get("mismatched_fields") or [],
+                "strong_mismatched_fields": item.get("strong_mismatched_fields") or [],
+            }
+            for item in analyses
+        ],
+    }
+
+    indexed_identity = selection_identity.get("registry_index")
+    if indexed_identity is not None:
+        located = [
+            item
+            for item in analyses
+            if item.get("candidate_identity", {}).get("registry_index") == indexed_identity
+        ]
+        if not located:
+            base["selection_reason"] = "REGISTRY_INDEX_NOT_FOUND"
+            return base
+        located_item = located[0]
+        if located_item.get("mismatched_fields"):
+            base["selection_reason"] = (
+                "STRONG_IDENTITY_MISMATCH"
+                if located_item.get("strong_mismatched_fields")
+                else "IDENTITY_MISMATCH"
+            )
+            base["compatible_candidate_count"] = 0
+            return base
+        if identity_strength in {"WEAK", "NONE"}:
+            base["selection_reason"] = "WEAK_IDENTITY_NOT_ALLOWED_FOR_SELECTION"
+            return base
+        base.update(
+            {
+                "status": "STOP_EVIDENCE_READY",
+                "selection_reason": "REGISTRY_INDEX_VALIDATED",
+                "compatible_candidate_count": 1,
+                "selected_trade": located_item.get("candidate"),
+                "selected_identity": located_item.get("candidate_identity"),
+            }
+        )
+        return base
+
+    compatible = [item for item in analyses if item.get("compatible")]
+    base["compatible_candidate_count"] = len(compatible)
+
+    if len(compatible) > 1:
+        base["status"] = "STOP_EVIDENCE_TRADE_IDENTITY_AMBIGUOUS"
+        base["selection_reason"] = "MULTIPLE_COMPATIBLE_CANDIDATES"
+        return base
+
+    if not compatible:
+        base["selection_reason"] = "NO_COMPATIBLE_CANDIDATE"
+        return base
+
+    if identity_strength in {"WEAK", "NONE"}:
+        base["selection_reason"] = "WEAK_IDENTITY_NOT_ALLOWED_FOR_SELECTION"
+        return base
+
+    chosen = compatible[0]
+    base.update(
+        {
+            "status": "STOP_EVIDENCE_READY",
+            "selection_reason": "IDENTITY_VALIDATED",
+            "selected_trade": chosen.get("candidate"),
+            "selected_identity": chosen.get("candidate_identity"),
+        }
+    )
+    return base
+
+
+def _trpsf_v1_stop_evidence_event_alias(path=None, alias=None):
+    if alias is not None and str(alias).strip():
+        return str(alias).strip().lower()
+    if path is None:
+        return None
+    text = str(path).strip()
+    if not text:
+        return None
+    segment = text.split(".")[-1]
+    if "[" in segment:
+        segment = segment.split("[", 1)[0]
+    segment = segment.strip().lower()
+    return segment or None
+
+
+def _trpsf_v1_stop_evidence_record_identity_values(record):
+    fields = _trpsf_v1_stop_evidence_identity_fields()
+    values = {field: set() for field in fields}
+
+    def _normalize(field, value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if field in {"symbol", "side"}:
+            return text.upper()
+        return text
+
+    def walk(value, path=None, alias=None):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                walk(child, child_path, key)
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                child_path = f"{path}[{index}]" if path else f"[{index}]"
+                walk(child, child_path, alias)
+            return
+        alias_name = _trpsf_v1_stop_evidence_event_alias(path=path, alias=alias)
+        if alias_name is None:
+            return
+        for canonical_field, descriptor in fields.items():
+            if alias_name in (descriptor.get("aliases") or set()):
+                normalized = _normalize(canonical_field, value)
+                if normalized is not None:
+                    values[canonical_field].add(normalized)
+
+    walk(record)
+    return values
+
+
+def _trpsf_v1_stop_evidence_record_matches_trade(record, identity_tokens, raw_text=None):
+    identity_tokens = _trpsf_v1_stop_evidence_identity_tokens(identity_tokens)
+    record_values = (
+        _trpsf_v1_stop_evidence_record_identity_values(record)
+        if isinstance(record, dict)
+        else {field: set() for field in _trpsf_v1_stop_evidence_identity_fields()}
+    )
+
+    strong_fields = ["lifecycle_id", "client_order_id", "order_id"]
+    strong_mismatch_fields = []
+    for field in strong_fields:
+        record_field_values = record_values.get(field) or set()
+        if not record_field_values:
+            continue
+        expected = identity_tokens.get(field)
+        if expected is None or expected not in record_field_values:
+            strong_mismatch_fields.append(field)
+
+    if strong_mismatch_fields:
+        return {
+            "matched": False,
+            "rejected": True,
+            "rejection_reason": "STRONG_IDENTITY_MISMATCH",
+            "correlation_strength": "REJECTED",
+            "identity_mismatch_fields": strong_mismatch_fields,
+            "identity_values": {
+                key: sorted(values)
+                for key, values in record_values.items()
+                if values
+            },
+            "match_flags": {},
+        }
+
+    lifecycle_match = bool(
+        identity_tokens.get("lifecycle_id")
+        and identity_tokens.get("lifecycle_id")
+        in (record_values.get("lifecycle_id") or set())
+    )
+    client_match = bool(
+        identity_tokens.get("client_order_id")
+        and identity_tokens.get("client_order_id")
+        in (record_values.get("client_order_id") or set())
+    )
+    order_match = bool(
+        identity_tokens.get("order_id")
+        and identity_tokens.get("order_id") in (record_values.get("order_id") or set())
+    )
+    trade_id_match = bool(
+        identity_tokens.get("trade_id")
+        and identity_tokens.get("trade_id") in (record_values.get("trade_id") or set())
+    )
+    symbol_match = bool(
+        identity_tokens.get("symbol")
+        and identity_tokens.get("symbol") in (record_values.get("symbol") or set())
+    )
+    side_match = bool(
+        identity_tokens.get("side")
+        and identity_tokens.get("side") in (record_values.get("side") or set())
+    )
+    symbol_side_match = symbol_match and side_match
+
+    raw_text_value = str(raw_text or "")
+    raw_token_match = False
+    if raw_text_value:
+        for field in [
+            "lifecycle_id",
+            "client_order_id",
+            "order_id",
+            "trade_id",
+            "symbol",
+            "side",
+        ]:
+            token = identity_tokens.get(field)
+            if token is None:
+                continue
+            if field in {"symbol", "side"}:
+                if token.upper() in raw_text_value.upper():
+                    raw_token_match = True
+                    break
+            elif token in raw_text_value:
+                raw_token_match = True
+                break
+
+    if lifecycle_match or (client_match and order_match):
+        correlation_strength = "STRONG"
+    elif client_match or order_match:
+        correlation_strength = "MEDIUM"
+    elif trade_id_match or symbol_side_match or raw_token_match:
+        correlation_strength = "WEAK"
+    else:
+        correlation_strength = "NONE"
+
+    return {
+        "matched": correlation_strength != "NONE",
+        "rejected": False,
+        "rejection_reason": None,
+        "correlation_strength": correlation_strength,
+        "identity_mismatch_fields": [],
+        "identity_values": {
+            key: sorted(values)
+            for key, values in record_values.items()
+            if values
+        },
+        "match_flags": {
+            "lifecycle_id": lifecycle_match,
+            "client_order_id": client_match,
+            "order_id": order_match,
+            "trade_id": trade_id_match,
+            "symbol_side": symbol_side_match,
+            "raw_token": raw_token_match,
+        },
+    }
+
+
+def _trpsf_v1_stop_evidence_context(event_type, path, alias=None):
+    alias_name = _trpsf_v1_stop_evidence_event_alias(path=path, alias=alias)
+    if alias_name is None:
+        return None
+
+    event_type_n = str(event_type or "").lower()
+    update_event = any(
+        keyword in event_type_n
+        for keyword in ("update", "amend", "modify", "replace", "trail", "trailing")
+    )
+    families = _trpsf_v1_closed_trade_stop_evidence_alias_families()
+    initial_aliases = families.get("initial_stop") or set()
+    current_aliases = families.get("current_stop") or set()
+    disaster_aliases = families.get("disaster_stop") or set()
+
+    if alias_name in initial_aliases:
+        if update_event:
+            return "STOP_UPDATE"
+        return "INITIAL_STOP_CANDIDATE"
+    if alias_name in disaster_aliases:
+        return "DISASTER_STOP"
+    if alias_name in current_aliases:
+        if update_event:
+            return "STOP_UPDATE"
+        return "CURRENT_STOP"
+    return None
+
+
+def _trpsf_v1_stop_evidence_event_phase(event_type):
+    event_type_n = str(event_type or "").lower()
+    if any(
+        keyword in event_type_n
+        for keyword in ("update", "amend", "modify", "replace", "trail", "trailing")
+    ):
+        return "UPDATE"
+    if any(
+        keyword in event_type_n
+        for keyword in (
+            "open",
+            "entry",
+            "create",
+            "created",
+            "initial",
+            "plan",
+            "set",
+            "submit",
+            "new",
+        )
+    ):
+        return "INITIAL_PLAN_OR_ENTRY"
+    return "UNKNOWN"
+
+
+def _trpsf_v1_stop_evidence_parse_timestamp(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        dt_mod = __import__("datetime").datetime
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        return dt_mod.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _trpsf_v1_stop_evidence_temporal_relation(event_timestamp, opened_at):
+    if not event_timestamp or not opened_at:
+        return "UNKNOWN"
+    event_dt = _trpsf_v1_stop_evidence_parse_timestamp(event_timestamp)
+    open_dt = _trpsf_v1_stop_evidence_parse_timestamp(opened_at)
+    if event_dt is None or open_dt is None:
+        return "UNKNOWN"
+    try:
+        delta_seconds = (event_dt - open_dt).total_seconds()
+    except Exception:
+        return "UNKNOWN"
+    if delta_seconds < -300:
+        return "BEFORE_OPEN"
+    if delta_seconds <= 600:
+        return "AT_OPEN_WINDOW"
+    return "AFTER_OPEN"
+
+
+def _trpsf_v1_stop_evidence_extract_occurrences(
+    record,
+    source_file,
+    source_index=None,
+    line_number=None,
+    identity_tokens=None,
+    raw_text=None,
+):
+    if not isinstance(record, dict):
+        return {
+            "matched": False,
+            "occurrences": [],
+            "rejected_events": [],
+        }
+
+    identity_tokens = identity_tokens or {}
+    event_type = (
+        record.get("event_type")
+        or record.get("event")
+        or record.get("action")
+        or record.get("status")
+        or record.get("type")
+    )
+    timestamp = (
+        record.get("timestamp")
+        or record.get("ts")
+        or record.get("opened_at")
+        or record.get("created_at")
+        or record.get("updated_at")
+        or record.get("closed_at")
+    )
+
+    correlation = _trpsf_v1_stop_evidence_record_matches_trade(
+        record,
+        identity_tokens,
+        raw_text=raw_text,
+    )
+    if correlation.get("rejected"):
+        return {
+            "matched": False,
+            "occurrences": [],
+            "rejected_events": [
+                {
+                    "source_file": source_file,
+                    "source_index": source_index,
+                    "line_number": line_number,
+                    "event_type": event_type,
+                    "timestamp": timestamp,
+                    "rejection_reason": correlation.get("rejection_reason"),
+                    "identity_mismatch_fields": correlation.get("identity_mismatch_fields") or [],
+                }
+            ],
+        }
+    if not correlation.get("matched"):
+        return {
+            "matched": False,
+            "occurrences": [],
+            "rejected_events": [],
+        }
+
+    event_phase = _trpsf_v1_stop_evidence_event_phase(event_type)
+    temporal_relation = _trpsf_v1_stop_evidence_temporal_relation(
+        timestamp,
+        identity_tokens.get("opened_at"),
+    )
+    occurrences = []
+
+    def walk(value, path=None, alias=None):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                walk(child, child_path, key)
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                child_path = f"{path}[{index}]" if path else f"[{index}]"
+                walk(child, child_path, alias)
+            return
+
+        alias_name = _trpsf_v1_stop_evidence_event_alias(path=path, alias=alias)
+        classification = _trpsf_v1_stop_evidence_context(event_type, path, alias=alias_name)
+        if classification is None:
+            return
+
+        value_text = None if value is None else str(value).strip()
+        if value_text in {None, "", "None", "[]", "{}"}:
+            return
+
+        evidence_reason = {
+            "INITIAL_STOP_CANDIDATE": "explicit initial stop alias matched",
+            "CURRENT_STOP": "explicit current stop alias matched",
+            "DISASTER_STOP": "disaster stop alias matched",
+            "STOP_UPDATE": "update/amend/replace/trailing stop semantics detected",
+        }.get(classification, "classified stop evidence")
+
+        occurrences.append(
+            {
+                "source_file": source_file,
+                "source_index": source_index,
+                "line_number": line_number,
+                "event_type": event_type,
+                "timestamp": timestamp,
+                "path": path,
+                "alias": alias_name,
+                "value": value,
+                "classification": classification,
+                "correlation_strength": correlation.get("correlation_strength"),
+                "correlation_match_flags": correlation.get("match_flags") or {},
+                "temporal_relation": temporal_relation,
+                "event_phase": event_phase,
+                "source_supports_factual_initial_stop": source_file != "trade_registry.raw_read_only",
+                "evidence_reason": evidence_reason,
+            }
+        )
+
+    walk(record)
+    return {
+        "matched": True,
+        "occurrences": occurrences,
+        "rejected_events": [],
+    }
+
+
+def _trpsf_v1_stop_evidence_scan_file(path, source_file, identity_tokens, kind="jsonl"):
+    max_jsonl_lines = 2500
+    max_json_records = 2500
+    max_json_bytes = 1000000
+    result = {
+        "checked": False,
+        "occurrences": [],
+        "rejected_events": [],
+        "malformed_record_count": 0,
+        "source_read_errors": [],
+        "truncated": False,
+        "limits": {
+            "jsonl_max_lines": max_jsonl_lines,
+            "json_max_records": max_json_records,
+            "json_max_bytes": max_json_bytes,
+        },
+    }
+
+    path_obj = Path(path) if path is not None else None
+    if path_obj is None or not path_obj.exists():
+        return result
+
+    result["checked"] = True
+    try:
+        if kind == "jsonl":
+            with open(path_obj, "r", encoding="utf-8") as file_obj:
+                for line_number, line in enumerate(file_obj, start=1):
+                    if line_number > max_jsonl_lines:
+                        result["truncated"] = True
+                        break
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        record = json.loads(text)
+                    except Exception:
+                        result["malformed_record_count"] += 1
+                        continue
+                    if not isinstance(record, dict):
+                        result["malformed_record_count"] += 1
+                        continue
+                    extracted = _trpsf_v1_stop_evidence_extract_occurrences(
+                        record,
+                        source_file,
+                        source_index=line_number,
+                        line_number=line_number,
+                        identity_tokens=identity_tokens,
+                        raw_text=text,
+                    )
+                    result["occurrences"].extend(extracted.get("occurrences") or [])
+                    result["rejected_events"].extend(extracted.get("rejected_events") or [])
+        else:
+            try:
+                source_size = path_obj.stat().st_size
+            except Exception:
+                source_size = None
+            if source_size is not None and source_size > max_json_bytes:
+                result["truncated"] = True
+                result["source_read_errors"].append(
+                    {
+                        "source_file": source_file,
+                        "error_type": "SOURCE_FILE_TOO_LARGE",
+                        "message": f"file size exceeds json_max_bytes={max_json_bytes}",
+                    }
+                )
+                return result
+            with open(path_obj, "r", encoding="utf-8") as file_obj:
+                loaded = json.load(file_obj)
+            records = loaded if isinstance(loaded, list) else [loaded]
+            for record_index, record in enumerate(records, start=1):
+                if record_index > max_json_records:
+                    result["truncated"] = True
+                    break
+                if not isinstance(record, dict):
+                    result["malformed_record_count"] += 1
+                    continue
+                extracted = _trpsf_v1_stop_evidence_extract_occurrences(
+                    record,
+                    source_file,
+                    source_index=record_index,
+                    line_number=record_index,
+                    identity_tokens=identity_tokens,
+                    raw_text=None,
+                )
+                result["occurrences"].extend(extracted.get("occurrences") or [])
+                result["rejected_events"].extend(extracted.get("rejected_events") or [])
+    except Exception as exc:
+        result["source_read_errors"].append(
+            {
+                "source_file": source_file,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+        )
+    return result
+
+
+def _trpsf_v1_stop_evidence_load_registry_trade(identity_tokens):
+    identity_tokens = _trpsf_v1_stop_evidence_identity_tokens(identity_tokens)
+    result = {
+        "status": "STOP_EVIDENCE_TRADE_NOT_FOUND",
+        "selection": None,
+        "trade": None,
+        "selected_identity": identity_tokens,
+        "evidence": [],
+        "rejected_events": [],
+        "source_read_errors": [],
+    }
+
+    loader = (
+        getattr(central_trade_registry, "load_registry_raw_read_only", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(loader):
+        result["status"] = "STOP_EVIDENCE_SOURCE_READ_ERROR"
+        result["source_read_errors"].append(
+            {
+                "source_file": "trade_registry.raw_read_only",
+                "error_type": "LOADER_UNAVAILABLE",
+                "message": "load_registry_raw_read_only is unavailable",
+            }
+        )
+        return result
+
+    try:
+        registry = loader()
+    except Exception as exc:
+        result["status"] = "STOP_EVIDENCE_SOURCE_READ_ERROR"
+        result["source_read_errors"].append(
+            {
+                "source_file": "trade_registry.raw_read_only",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+        )
+        return result
+
+    closed_trades = _trpsf_v1_stop_evidence_iter_trades((registry or {}).get("closed_trades"))
+    selection = _trpsf_v1_stop_evidence_trade_selector(
+        {"closed_trades": closed_trades},
+        registry_index=identity_tokens.get("registry_index"),
+        trade_id=identity_tokens.get("trade_id"),
+        client_order_id=identity_tokens.get("client_order_id"),
+        order_id=identity_tokens.get("order_id"),
+        lifecycle_id=identity_tokens.get("lifecycle_id"),
+        symbol=identity_tokens.get("symbol"),
+        side=identity_tokens.get("side"),
+    )
+    result["selection"] = selection
+    result["status"] = selection.get("status") or "STOP_EVIDENCE_TRADE_NOT_FOUND"
+
+    selected_trade = selection.get("selected_trade")
+    if selected_trade is None:
+        return result
+
+    selected_identity = selection.get("selected_identity") or _trpsf_v1_stop_evidence_trade_identity(selected_trade)
+    result["selected_identity"] = selected_identity
+    result["trade"] = selected_trade
+    extracted = _trpsf_v1_stop_evidence_extract_occurrences(
+        selected_trade,
+        "trade_registry.raw_read_only",
+        source_index=selected_identity.get("registry_index"),
+        line_number=selected_identity.get("registry_index"),
+        identity_tokens=selected_identity,
+        raw_text=None,
+    )
+    result["evidence"].extend(extracted.get("occurrences") or [])
+    result["rejected_events"].extend(extracted.get("rejected_events") or [])
+    return result
+
+
+def _trpsf_v1_stop_evidence_reported_r_candidates(trade, calculated_gross_r=None):
+    trade = trade if isinstance(trade, dict) else {}
+    targets = {"pnl_r", "result_r", "r_multiple"}
+    candidates = []
+    seen_paths = set()
+
+    def walk(value, path=None, alias=None):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                walk(child, child_path, key)
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                child_path = f"{path}[{index}]" if path else f"[{index}]"
+                walk(child, child_path, alias)
+            return
+        alias_name = _trpsf_v1_stop_evidence_event_alias(path=path, alias=alias)
+        if alias_name not in targets:
+            return
+        path_key = str(path or alias_name)
+        if path_key in seen_paths:
+            return
+        numeric_value = _trpsf_v1_stop_evidence_numeric(value)
+        if numeric_value is None:
+            return
+        seen_paths.add(path_key)
+        candidate = {
+            "alias": alias_name,
+            "path": path_key,
+            "value": numeric_value,
+        }
+        if calculated_gross_r is not None:
+            candidate["absolute_difference"] = abs(calculated_gross_r - numeric_value)
+        candidates.append(candidate)
+
+    walk(trade)
+    return candidates
+
+
+def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
+    identity = identity if isinstance(identity, dict) else {}
+    if registry_index is None:
+        registry_index = identity.get("registry_index")
+    identity_tokens = _trpsf_v1_stop_evidence_identity_tokens(
+        {
+            "trade_id": identity.get("trade_id"),
+            "client_order_id": identity.get("client_order_id"),
+            "order_id": identity.get("order_id"),
+            "lifecycle_id": identity.get("lifecycle_id"),
+            "symbol": identity.get("symbol"),
+            "side": identity.get("side"),
+            "registry_index": registry_index,
+        }
+    )
+
+    payload = {
+        "ok": True,
+        "status": "STOP_EVIDENCE_NO_FACTUAL_INITIAL_STOP",
+        "read_only": True,
+        "write_executed": False,
+        "registry_write": False,
+        "broker_called": False,
+        "no_order_sent_by_this_route": True,
+        "factual_initial_stop_found": False,
+        "factual_initial_stop": None,
+        "factual_initial_stop_origin": None,
+        "candidate_count": 0,
+        "strong_candidate_count": 0,
+        "conflicting_candidates": [],
+        "safe_to_use_for_r_recalculation": False,
+        "calculated_gross_r": None,
+        "reported_r_candidates": [],
+        "comparison": {
+            "current_stop_hypothesis_gross_r": None,
+        },
+        "evidence": [],
+        "rejected_events": [],
+        "sources_checked": [],
+        "sources_missing": [],
+        "source_read_errors": [],
+        "malformed_record_count": 0,
+        "scan_truncated": False,
+        "scan_limits": {
+            "jsonl_max_lines": 2500,
+            "json_max_records": 2500,
+            "json_max_bytes": 1000000,
+        },
+        "trade": {
+            "trade_id": identity_tokens.get("trade_id"),
+            "client_order_id": identity_tokens.get("client_order_id"),
+            "order_id": identity_tokens.get("order_id"),
+            "lifecycle_id": identity_tokens.get("lifecycle_id"),
+            "symbol": identity_tokens.get("symbol"),
+            "side": identity_tokens.get("side"),
+            "registry_index": identity_tokens.get("registry_index"),
+            "entry": None,
+            "exit_price": None,
+            "opened_at": None,
+            "closed_at": None,
+        },
+        "trade_selection": None,
+    }
+
+    registry_resolution = _trpsf_v1_stop_evidence_load_registry_trade(identity_tokens)
+    payload["trade_selection"] = registry_resolution.get("selection")
+    payload["status"] = registry_resolution.get("status") or "STOP_EVIDENCE_TRADE_NOT_FOUND"
+    payload["source_read_errors"].extend(registry_resolution.get("source_read_errors") or [])
+    payload["sources_checked"].append("trade_registry.raw_read_only")
+    payload["evidence"].extend(registry_resolution.get("evidence") or [])
+    payload["rejected_events"].extend(registry_resolution.get("rejected_events") or [])
+
+    if payload["status"] in {
+        "STOP_EVIDENCE_TRADE_NOT_FOUND",
+        "STOP_EVIDENCE_TRADE_IDENTITY_AMBIGUOUS",
+    }:
+        return payload
+    if payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR" and registry_resolution.get("trade") is None:
+        return payload
+
+    trade = registry_resolution.get("trade") or {}
+    selected_identity = registry_resolution.get("selected_identity") or identity_tokens
+    payload["trade"] = {
+        "trade_id": selected_identity.get("trade_id"),
+        "client_order_id": selected_identity.get("client_order_id"),
+        "order_id": selected_identity.get("order_id"),
+        "lifecycle_id": selected_identity.get("lifecycle_id"),
+        "symbol": selected_identity.get("symbol"),
+        "side": selected_identity.get("side"),
+        "registry_index": selected_identity.get("registry_index"),
+        "entry": trade.get("entry"),
+        "exit_price": trade.get("exit_price"),
+        "opened_at": selected_identity.get("opened_at"),
+        "closed_at": trade.get("closed_at"),
+    }
+
+    for source_file, source_path, kind in _trpsf_v1_stop_evidence_candidate_paths():
+        source_path_obj = Path(source_path)
+        if not source_path_obj.exists():
+            payload["sources_missing"].append(source_file)
+            continue
+        payload["sources_checked"].append(source_file)
+        scan_result = _trpsf_v1_stop_evidence_scan_file(
+            source_path_obj,
+            source_file,
+            selected_identity,
+            kind=kind,
+        )
+        payload["evidence"].extend(scan_result.get("occurrences") or [])
+        payload["rejected_events"].extend(scan_result.get("rejected_events") or [])
+        payload["malformed_record_count"] += int(scan_result.get("malformed_record_count") or 0)
+        payload["source_read_errors"].extend(scan_result.get("source_read_errors") or [])
+        payload["scan_truncated"] = bool(payload["scan_truncated"] or scan_result.get("truncated"))
+        if isinstance(scan_result.get("limits"), dict):
+            payload["scan_limits"] = scan_result.get("limits")
+
+    initial_candidates = [
+        item
+        for item in (payload.get("evidence") or [])
+        if item.get("classification") == "INITIAL_STOP_CANDIDATE"
+    ]
+    all_initial_numeric_groups = {}
+    for item in initial_candidates:
+        normalized = _trpsf_v1_stop_evidence_numeric(item.get("value"))
+        if normalized is None:
+            continue
+        all_initial_numeric_groups.setdefault(normalized, []).append(item)
+    payload["candidate_count"] = len(all_initial_numeric_groups)
+
+    strong_initial_candidates = [
+        item
+        for item in initial_candidates
+        if item.get("correlation_strength") == "STRONG"
+        and item.get("source_supports_factual_initial_stop") is True
+        and item.get("event_phase") == "INITIAL_PLAN_OR_ENTRY"
+        and item.get("temporal_relation") in {"BEFORE_OPEN", "AT_OPEN_WINDOW", "UNKNOWN"}
+    ]
+    strong_initial_groups = {}
+    for item in strong_initial_candidates:
+        normalized = _trpsf_v1_stop_evidence_numeric(item.get("value"))
+        if normalized is None:
+            continue
+        strong_initial_groups.setdefault(normalized, []).append(item)
+    payload["strong_candidate_count"] = len(strong_initial_groups)
+
+    if len(strong_initial_groups) > 1:
+        payload["conflicting_candidates"] = [
+            candidate
+            for grouped in strong_initial_groups.values()
+            for candidate in grouped
+        ]
+
+    entry = _trpsf_v1_stop_evidence_numeric(trade.get("entry"))
+    exit_price = _trpsf_v1_stop_evidence_numeric(trade.get("exit_price"))
+    side_value = str(trade.get("side") or "").upper().strip()
+
+    blocking_source_error = bool(payload.get("source_read_errors")) or bool(payload.get("scan_truncated"))
+
+    factual_candidate = None
+    if len(strong_initial_groups) == 1:
+        factual_candidate = next(iter(next(iter(strong_initial_groups.values()))), None)
+
+    if (
+        factual_candidate is not None
+        and not blocking_source_error
+        and entry is not None
+        and exit_price is not None
+        and side_value in {"SHORT", "LONG"}
+    ):
+        factual_initial_stop = _trpsf_v1_stop_evidence_numeric(factual_candidate.get("value"))
+        if factual_initial_stop is not None:
+            if side_value == "SHORT":
+                initial_risk_per_unit = factual_initial_stop - entry
+                protective = initial_risk_per_unit > 0
+                calculated = (entry - exit_price) / initial_risk_per_unit if protective else None
+            else:
+                initial_risk_per_unit = entry - factual_initial_stop
+                protective = initial_risk_per_unit > 0
+                calculated = (exit_price - entry) / initial_risk_per_unit if protective else None
+            if protective and calculated is not None:
+                payload["factual_initial_stop_found"] = True
+                payload["factual_initial_stop"] = factual_initial_stop
+                payload["factual_initial_stop_origin"] = {
+                    "source_file": factual_candidate.get("source_file"),
+                    "source_index": factual_candidate.get("source_index"),
+                    "line_number": factual_candidate.get("line_number"),
+                    "path": factual_candidate.get("path"),
+                    "alias": factual_candidate.get("alias"),
+                    "timestamp": factual_candidate.get("timestamp"),
+                    "correlation_strength": factual_candidate.get("correlation_strength"),
+                    "temporal_relation": factual_candidate.get("temporal_relation"),
+                }
+                payload["calculated_gross_r"] = calculated
+
+    payload["reported_r_candidates"] = _trpsf_v1_stop_evidence_reported_r_candidates(
+        trade,
+        payload.get("calculated_gross_r"),
+    )
+
+    current_stop_candidates = [
+        item
+        for item in (payload.get("evidence") or [])
+        if item.get("classification") == "CURRENT_STOP"
+    ]
+    if current_stop_candidates and entry is not None and exit_price is not None and side_value in {"SHORT", "LONG"}:
+        strength_rank = {"STRONG": 0, "MEDIUM": 1, "WEAK": 2}
+        current_stop_candidates = sorted(
+            current_stop_candidates,
+            key=lambda item: (
+                strength_rank.get(item.get("correlation_strength"), 3),
+                str(item.get("timestamp") or ""),
+            ),
+        )
+        current_stop_value = _trpsf_v1_stop_evidence_numeric(current_stop_candidates[0].get("value"))
+        if current_stop_value is not None:
+            if side_value == "SHORT":
+                denominator = current_stop_value - entry
+                if denominator > 0:
+                    payload["comparison"]["current_stop_hypothesis_gross_r"] = (entry - exit_price) / denominator
+            else:
+                denominator = entry - current_stop_value
+                if denominator > 0:
+                    payload["comparison"]["current_stop_hypothesis_gross_r"] = (exit_price - entry) / denominator
+
+    if blocking_source_error and not payload.get("factual_initial_stop_found"):
+        payload["status"] = "STOP_EVIDENCE_SOURCE_READ_ERROR"
+    elif len(strong_initial_groups) > 1:
+        payload["status"] = "STOP_EVIDENCE_CONFLICTING_INITIAL_STOPS"
+    elif payload.get("factual_initial_stop_found"):
+        payload["status"] = "STOP_EVIDENCE_READY"
+    else:
+        payload["status"] = "STOP_EVIDENCE_NO_FACTUAL_INITIAL_STOP"
+
+    payload["safe_to_use_for_r_recalculation"] = bool(
+        payload.get("status") == "STOP_EVIDENCE_READY"
+        and payload.get("calculated_gross_r") is not None
+    )
+    return payload
+
+
+def build_trade_registry_closed_identity_stop_evidence_v1_text():
+    payload = _trpsf_v1_closed_trade_stop_evidence_v1(
+        identity={
+            "trade_id": getattr(request, "args", {}).get("trade_id") if globals().get("request") is not None else None,
+            "client_order_id": getattr(request, "args", {}).get("client_order_id") if globals().get("request") is not None else None,
+            "order_id": getattr(request, "args", {}).get("order_id") if globals().get("request") is not None else None,
+            "lifecycle_id": getattr(request, "args", {}).get("lifecycle_id") if globals().get("request") is not None else None,
+            "symbol": getattr(request, "args", {}).get("symbol") if globals().get("request") is not None else None,
+            "side": getattr(request, "args", {}).get("side") if globals().get("request") is not None else None,
+            "registry_index": getattr(request, "args", {}).get("registry_index") if globals().get("request") is not None else None,
+        }
+    )
+    lines = [
+        "TRADE REGISTRY CLOSED IDENTITY STOP EVIDENCE V1",
+        f"status={payload.get('status')}",
+        f"read_only={payload.get('read_only')}",
+        f"write_executed={payload.get('write_executed')}",
+        f"registry_write={payload.get('registry_write')}",
+        f"broker_called={payload.get('broker_called')}",
+        f"no_order_sent_by_this_route={payload.get('no_order_sent_by_this_route')}",
+        f"factual_initial_stop_found={payload.get('factual_initial_stop_found')}",
+        f"factual_initial_stop={payload.get('factual_initial_stop')}",
+        f"factual_initial_stop_origin={payload.get('factual_initial_stop_origin')}",
+        f"candidate_count={payload.get('candidate_count')}",
+        f"strong_candidate_count={payload.get('strong_candidate_count')}",
+        f"conflicting_candidates={payload.get('conflicting_candidates')}",
+        f"safe_to_use_for_r_recalculation={payload.get('safe_to_use_for_r_recalculation')}",
+        f"calculated_gross_r={payload.get('calculated_gross_r')}",
+        f"reported_r_candidates={payload.get('reported_r_candidates')}",
+        f"comparison={payload.get('comparison')}",
+        f"sources_checked={payload.get('sources_checked')}",
+        f"sources_missing={payload.get('sources_missing')}",
+        f"source_read_errors={payload.get('source_read_errors')}",
+        f"malformed_record_count={payload.get('malformed_record_count')}",
+        f"scan_truncated={payload.get('scan_truncated')}",
+        f"scan_limits={payload.get('scan_limits')}",
+    ]
+    for rejection in payload.get("rejected_events") or []:
+        lines.append(
+            (
+                f"rejected_source_file={rejection.get('source_file')} "
+                f"rejected_source_index={rejection.get('source_index')} "
+                f"rejected_line_number={rejection.get('line_number')} "
+                f"rejection_reason={rejection.get('rejection_reason')} "
+                f"identity_mismatch_fields={rejection.get('identity_mismatch_fields')}"
+            )
+        )
+    for item in payload.get("evidence") or []:
+        lines.append(
+            (
+                f"source_file={item.get('source_file')} "
+                f"source_index={item.get('source_index')} "
+                f"line_number={item.get('line_number')} "
+                f"event_type={item.get('event_type')} "
+                f"timestamp={item.get('timestamp')} "
+                f"path={item.get('path')} "
+                f"alias={item.get('alias')} "
+                f"value={item.get('value')} "
+                f"classification={item.get('classification')} "
+                f"correlation_strength={item.get('correlation_strength')} "
+                f"event_phase={item.get('event_phase')} "
+                f"temporal_relation={item.get('temporal_relation')} "
+                f"evidence_reason={item.get('evidence_reason')}"
+            )
+        )
+    return "\n".join(lines)
+
+
+@app.route("/traderegistry/closedidentity/conflicts/stop-evidence", methods=["GET"])
+@app.route("/trade_registry/closedidentity/conflicts/stop-evidence", methods=["GET"])
+@app.route("/trades/closedidentity/conflicts/stop-evidence", methods=["GET"])
+def trade_registry_closed_identity_stop_evidence_v1_route():
+    args = getattr(request, "args", {}) if globals().get("request") is not None else {}
+    payload = _trpsf_v1_closed_trade_stop_evidence_v1(
+        identity={
+            "trade_id": args.get("trade_id"),
+            "client_order_id": args.get("client_order_id"),
+            "order_id": args.get("order_id"),
+            "lifecycle_id": args.get("lifecycle_id"),
+            "symbol": args.get("symbol"),
+            "side": args.get("side"),
+            "registry_index": args.get("registry_index"),
+        }
+    )
+    return (
+        payload,
+        200,
+        {"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.route("/traderegistry/closedidentity/conflicts/stop-evidence/text", methods=["GET"])
+@app.route("/trade_registry/closedidentity/conflicts/stop-evidence/text", methods=["GET"])
+@app.route("/trades/closedidentity/conflicts/stop-evidence/text", methods=["GET"])
+def trade_registry_closed_identity_stop_evidence_v1_text_route():
+    return (
+        build_trade_registry_closed_identity_stop_evidence_v1_text(),
+        200,
+        {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
+
+
 try:
     trade_registry_persistent_storage_fix_v1_status(force=False)
 except Exception:
