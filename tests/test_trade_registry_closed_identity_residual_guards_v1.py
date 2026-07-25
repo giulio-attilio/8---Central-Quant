@@ -350,6 +350,14 @@ def test_closed_identity_financial_conflicts_routes_are_read_only_and_show_field
             "_trpsf_v1_closed_trade_outcome_summary",
             "_trpsf_v1_closed_trade_conflict_record_summary",
             "_trpsf_v1_closed_trade_financial_conflict_sources",
+            "_trpsf_v1_closed_trade_allowed_containers",
+            "_trpsf_v1_closed_trade_risk_input_alias_families",
+            "_trpsf_v1_closed_trade_risk_input_sources",
+            "_trpsf_v1_closed_trade_reported_r_candidate_sources",
+            "_trpsf_v1_truncated_number",
+            "_trpsf_v1_closed_trade_risk_input_comparison_value",
+            "_trpsf_v1_closed_trade_resolve_risk_input_field",
+            "_trpsf_v1_closed_trade_r_recalculation",
             "trade_registry_closed_identity_financial_conflicts_v1",
             "build_trade_registry_closed_identity_financial_conflicts_v1_text",
             "trade_registry_closed_identity_financial_conflicts_v1_route",
@@ -380,6 +388,14 @@ def test_closed_identity_financial_conflicts_routes_are_read_only_and_show_field
     assert "exit_price=" in text
     assert "pnl_pct=" in text
     assert "no_order_sent_by_this_route=True" in text
+    assert "required_missing_inputs=" in text
+    assert "required_conflicting_inputs=" in text
+    assert "optional_conflicting_inputs=" in text
+    assert "optional_invalid_inputs=" in text
+    assert "gross_r_ready=" in text
+    assert "net_r_ready=" in text
+    assert "partial_diagnostics=" in text
+    assert "net_r_block_reasons=" in text
 
 
 def test_closed_identity_financial_conflicts_block_when_registry_shape_invalid(

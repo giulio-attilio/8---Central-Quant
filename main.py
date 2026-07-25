@@ -50050,6 +50050,426 @@ def _trpsf_v1_closed_trade_financial_conflict_sources(trade):
     return sources
 
 
+def _trpsf_v1_closed_trade_allowed_containers(trade):
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    outcome = trade.get("outcome") if isinstance(trade.get("outcome"), dict) else {}
+    metadata_outcome = (
+        metadata.get("outcome") if isinstance(metadata.get("outcome"), dict) else {}
+    )
+    return [
+        ("trade", trade),
+        ("trade.metadata", metadata),
+        ("trade.outcome", outcome),
+        ("trade.metadata.outcome", metadata_outcome),
+        ("trade.raw", trade.get("raw") if isinstance(trade.get("raw"), dict) else None),
+        (
+            "trade.source_event",
+            trade.get("source_event")
+            if isinstance(trade.get("source_event"), dict)
+            else None,
+        ),
+    ]
+
+
+def _trpsf_v1_closed_trade_risk_input_alias_families():
+    return {
+        "entry": ("entry", "entry_price", "filled_entry_price"),
+        "initial_stop": ("initial_stop", "stop_initial", "sl_initial", "initial_sl"),
+        "stop": ("stop", "sl", "stop_atual", "current_stop"),
+        "stop_loss": ("stop_loss", "stop_loss_price"),
+        "original_stop": ("original_stop", "original_stop_price"),
+        "qty": ("qty", "quantity", "quantity_opened", "closed_quantity", "closed_qty"),
+        "side": ("side", "direction"),
+        "exit_price": ("exit_price", "exit", "exit_avg_price", "average_exit_price"),
+        "gross_pnl": ("gross_pnl",),
+        "realized_pnl": ("realized_pnl", "realized_pnl_usdt"),
+        "fees": ("fees", "fee"),
+        "opening_fee": ("opening_fee",),
+        "closing_fee": ("closing_fee",),
+        "funding": ("funding", "funding_fee"),
+        "net_pnl": ("net_pnl", "net_pnl_usdt"),
+        "initial_risk_per_unit": ("initial_risk_per_unit",),
+        "initial_risk_usdt": ("initial_risk_usdt", "risk_usdt"),
+    }
+
+
+def _trpsf_v1_closed_trade_risk_input_sources(trade):
+    if not isinstance(trade, dict):
+        return {}
+    alias_families = _trpsf_v1_closed_trade_risk_input_alias_families()
+    sources = {}
+    for canonical, aliases in alias_families.items():
+        for alias in aliases:
+            for container_name, container in _trpsf_v1_closed_trade_allowed_containers(
+                trade
+            ):
+                if not isinstance(container, dict):
+                    continue
+                if alias not in container:
+                    continue
+                value = container.get(alias)
+                if value in (None, "", [], {}):
+                    continue
+                sources.setdefault(canonical, []).append(
+                    {
+                        "canonical_field": canonical,
+                        "alias": alias,
+                        "path": f"{container_name}.{alias}",
+                        "value": value,
+                    }
+                )
+    return sources
+
+
+def _trpsf_v1_closed_trade_reported_r_candidate_sources(trade):
+    if not isinstance(trade, dict):
+        return []
+    alias_families = {
+        "pnl_r": ("pnl_r",),
+        "result_r": ("result_r", "r_multiple"),
+    }
+    candidates = []
+    for canonical, aliases in alias_families.items():
+        for alias in aliases:
+            for container_name, container in _trpsf_v1_closed_trade_allowed_containers(
+                trade
+            ):
+                if not isinstance(container, dict):
+                    continue
+                if alias not in container:
+                    continue
+                value = container.get(alias)
+                if value in (None, "", [], {}):
+                    continue
+                candidates.append(
+                    {
+                        "canonical_field": canonical,
+                        "alias": alias,
+                        "path": f"{container_name}.{alias}",
+                        "value": value,
+                    }
+                )
+    return candidates
+
+
+def _trpsf_v1_truncated_number(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _trpsf_v1_closed_trade_risk_input_comparison_value(value):
+    if isinstance(value, bool):
+        return value
+    numeric_value = _trpsf_v1_truncated_number(value)
+    if numeric_value is not None:
+        return numeric_value
+    return value
+
+
+def _trpsf_v1_closed_trade_resolve_risk_input_field(canonical_field, occurrences):
+    sources = []
+    normalized_values = []
+    distinct_values = []
+    for occurrence in occurrences or []:
+        if not isinstance(occurrence, dict):
+            continue
+        value = occurrence.get("value")
+        if value in (None, "", [], {}):
+            continue
+        source = {
+            "canonical_field": occurrence.get("canonical_field") or canonical_field,
+            "alias": occurrence.get("alias"),
+            "path": occurrence.get("path"),
+            "value": value,
+        }
+        sources.append(source)
+        normalized_value = _trpsf_v1_closed_trade_risk_input_comparison_value(value)
+        normalized_values.append(normalized_value)
+        if not any(existing == normalized_value for existing in distinct_values):
+            distinct_values.append(normalized_value)
+
+    if not sources:
+        return {
+            "canonical_field": canonical_field,
+            "status": "MISSING",
+            "value": None,
+            "sources": [],
+            "normalized_values": [],
+            "conflict": False,
+        }
+
+    conflict = len(distinct_values) > 1
+    return {
+        "canonical_field": canonical_field,
+        "status": "CONFLICT" if conflict else "RESOLVED",
+        "value": sources[0].get("value") if not conflict else None,
+        "sources": sources,
+        "normalized_values": normalized_values,
+        "conflict": conflict,
+    }
+
+
+def _trpsf_v1_closed_trade_r_recalculation(trade):
+    result = {
+        "status": "R_RECALCULATION_INPUTS_INCOMPLETE",
+        "required_missing_inputs": [],
+        "required_conflicting_inputs": [],
+        "optional_conflicting_inputs": [],
+        "optional_invalid_inputs": [],
+        "missing_inputs": [],
+        "conflicting_inputs": [],
+        "invalid_inputs": [],
+        "entry": None,
+        "initial_stop": None,
+        "stop": None,
+        "stop_loss": None,
+        "original_stop": None,
+        "qty": None,
+        "side": None,
+        "exit_price": None,
+        "gross_pnl": None,
+        "realized_pnl": None,
+        "fees": None,
+        "opening_fee": None,
+        "closing_fee": None,
+        "funding": None,
+        "net_pnl": None,
+        "initial_risk_per_unit": None,
+        "initial_risk_usdt": None,
+        "risk_formula": None,
+        "candidate_match_tolerance": 1e-8,
+        "gross_r": None,
+        "gross_r_ready": False,
+        "gross_pnl_from_prices": None,
+        "net_pnl_reported": None,
+        "net_r": None,
+        "net_r_ready": False,
+        "net_r_block_reasons": [],
+        "partial_diagnostics": False,
+        "calculation_performed": False,
+        "reported_r_candidates": [],
+        "candidate_matches": [],
+        "input_resolution_by_field": {},
+        "risk_input_sources_by_field": {},
+    }
+    risk_inputs = _trpsf_v1_closed_trade_risk_input_sources(trade)
+    alias_families = _trpsf_v1_closed_trade_risk_input_alias_families()
+    input_resolution_by_field = {}
+    for canonical_field in alias_families:
+        input_resolution_by_field[canonical_field] = (
+            _trpsf_v1_closed_trade_resolve_risk_input_field(
+                canonical_field,
+                risk_inputs.get(canonical_field) or [],
+            )
+        )
+
+    def resolved_value(field):
+        resolution = input_resolution_by_field.get(field) or {}
+        if resolution.get("status") != "RESOLVED":
+            return None
+        return resolution.get("value")
+
+    entry = resolved_value("entry")
+    initial_stop = resolved_value("initial_stop")
+    stop = resolved_value("stop")
+    stop_loss = resolved_value("stop_loss")
+    original_stop = resolved_value("original_stop")
+    exit_price = resolved_value("exit_price")
+    side = resolved_value("side")
+    qty = resolved_value("qty")
+    initial_risk_usdt = resolved_value("initial_risk_usdt")
+    net_pnl = resolved_value("net_pnl")
+
+    result["entry"] = entry
+    result["initial_stop"] = initial_stop
+    result["stop"] = stop
+    result["stop_loss"] = stop_loss
+    result["original_stop"] = original_stop
+    result["qty"] = qty
+    result["side"] = side
+    result["exit_price"] = exit_price
+    result["gross_pnl"] = resolved_value("gross_pnl")
+    result["realized_pnl"] = resolved_value("realized_pnl")
+    result["fees"] = resolved_value("fees")
+    result["opening_fee"] = resolved_value("opening_fee")
+    result["closing_fee"] = resolved_value("closing_fee")
+    result["funding"] = resolved_value("funding")
+    result["net_pnl"] = net_pnl
+    result["initial_risk_per_unit"] = None
+    result["initial_risk_usdt"] = initial_risk_usdt
+    result["net_pnl_reported"] = _trpsf_v1_truncated_number(net_pnl)
+    result["input_resolution_by_field"] = input_resolution_by_field
+    result["risk_input_sources_by_field"] = {
+        field: (resolution.get("sources") or [])
+        for field, resolution in input_resolution_by_field.items()
+    }
+
+    required_fields = ("entry", "initial_stop", "side", "exit_price")
+    for field in required_fields:
+        resolution = input_resolution_by_field.get(field) or {}
+        if resolution.get("status") == "MISSING":
+            result["required_missing_inputs"].append(field)
+        elif resolution.get("status") == "CONFLICT":
+            result["required_conflicting_inputs"].append(field)
+
+    for field in (
+        "qty",
+        "net_pnl",
+        "initial_risk_usdt",
+        "gross_pnl",
+        "realized_pnl",
+        "fees",
+        "opening_fee",
+        "closing_fee",
+        "funding",
+    ):
+        resolution = input_resolution_by_field.get(field) or {}
+        if resolution.get("status") == "CONFLICT":
+            result["optional_conflicting_inputs"].append(field)
+
+    result["missing_inputs"] = list(result["required_missing_inputs"])
+    result["conflicting_inputs"] = list(result["required_conflicting_inputs"]) + list(
+        result["optional_conflicting_inputs"]
+    )
+
+    result["reported_r_candidates"] = _trpsf_v1_closed_trade_reported_r_candidate_sources(
+        trade
+    )
+
+    if result["required_missing_inputs"] or result["required_conflicting_inputs"]:
+        result["status"] = "R_RECALCULATION_INPUTS_INCOMPLETE"
+        result["partial_diagnostics"] = bool(
+            result["optional_conflicting_inputs"] or result["optional_invalid_inputs"]
+        )
+        return result
+
+    entry_f = _trpsf_v1_truncated_number(entry)
+    initial_stop_f = _trpsf_v1_truncated_number(initial_stop)
+    exit_price_f = _trpsf_v1_truncated_number(exit_price)
+    qty_f = _trpsf_v1_truncated_number(qty)
+    initial_risk_usdt_f = _trpsf_v1_truncated_number(initial_risk_usdt)
+    net_pnl_f = _trpsf_v1_truncated_number(net_pnl)
+
+    if entry_f is None:
+        result["invalid_inputs"].append("ENTRY_NOT_NUMERIC")
+    if initial_stop_f is None:
+        result["invalid_inputs"].append("INITIAL_STOP_NOT_NUMERIC")
+    if exit_price_f is None:
+        result["invalid_inputs"].append("EXIT_PRICE_NOT_NUMERIC")
+    if result["invalid_inputs"]:
+        return result
+
+    side_value = str(side).upper().strip()
+    if side_value not in {"SHORT", "LONG"}:
+        result["invalid_inputs"].append("SIDE_NOT_SUPPORTED")
+        return result
+
+    if side_value == "SHORT":
+        result["risk_formula"] = "(entry - exit_price) / (initial_stop - entry)"
+        initial_risk_per_unit = initial_stop_f - entry_f
+        if initial_stop_f <= entry_f:
+            result["invalid_inputs"].append("INITIAL_STOP_NOT_PROTECTIVE_FOR_SHORT")
+    else:
+        result["risk_formula"] = "(exit_price - entry) / (entry - initial_stop)"
+        initial_risk_per_unit = entry_f - initial_stop_f
+        if initial_stop_f >= entry_f:
+            result["invalid_inputs"].append("INITIAL_STOP_NOT_PROTECTIVE_FOR_LONG")
+
+    result["initial_risk_per_unit"] = initial_risk_per_unit
+    if initial_risk_per_unit is None or initial_risk_per_unit <= 0:
+        result["invalid_inputs"].append("INITIAL_RISK_NOT_POSITIVE")
+
+    if result["invalid_inputs"]:
+        result["status"] = "R_RECALCULATION_INVALID_INITIAL_RISK"
+        return result
+
+    gross_r = None
+    if side_value == "SHORT":
+        gross_r = (entry_f - exit_price_f) / initial_risk_per_unit
+    else:
+        gross_r = (exit_price_f - entry_f) / initial_risk_per_unit
+    result["gross_r"] = gross_r
+    result["gross_r_ready"] = gross_r is not None
+    result["calculation_performed"] = gross_r is not None
+
+    qty_status = (input_resolution_by_field.get("qty") or {}).get("status")
+    if qty_status == "RESOLVED" and qty_f is not None:
+        if side_value == "SHORT":
+            result["gross_pnl_from_prices"] = (entry_f - exit_price_f) * qty_f
+        else:
+            result["gross_pnl_from_prices"] = (exit_price_f - entry_f) * qty_f
+    elif qty_status == "RESOLVED" and qty_f is None:
+        result["optional_invalid_inputs"].append("QTY_NOT_NUMERIC")
+
+    initial_risk_resolution = input_resolution_by_field.get("initial_risk_usdt") or {}
+    net_pnl_resolution = input_resolution_by_field.get("net_pnl") or {}
+    net_r_block_reasons = []
+
+    initial_risk_status = initial_risk_resolution.get("status")
+    if initial_risk_status == "MISSING":
+        net_r_block_reasons.append("INITIAL_RISK_USDT_MISSING")
+    elif initial_risk_status == "CONFLICT":
+        net_r_block_reasons.append("INITIAL_RISK_USDT_CONFLICT")
+    elif initial_risk_usdt_f is None:
+        net_r_block_reasons.append("INITIAL_RISK_USDT_NOT_NUMERIC")
+    elif initial_risk_usdt_f <= 0:
+        net_r_block_reasons.append("INITIAL_RISK_USDT_NOT_POSITIVE")
+
+    net_pnl_status = net_pnl_resolution.get("status")
+    if net_pnl_status == "MISSING":
+        net_r_block_reasons.append("NET_PNL_MISSING")
+    elif net_pnl_status == "CONFLICT":
+        net_r_block_reasons.append("NET_PNL_CONFLICT")
+    elif net_pnl_f is None:
+        net_r_block_reasons.append("NET_PNL_NOT_NUMERIC")
+
+    if not net_r_block_reasons:
+        result["net_r"] = net_pnl_f / initial_risk_usdt_f
+        result["net_r_ready"] = True
+    else:
+        result["net_r"] = None
+        result["net_r_ready"] = False
+    result["net_r_block_reasons"] = net_r_block_reasons
+
+    if initial_risk_status == "RESOLVED" and initial_risk_usdt_f is None:
+        result["optional_invalid_inputs"].append("INITIAL_RISK_USDT_NOT_NUMERIC")
+    if initial_risk_status == "RESOLVED" and initial_risk_usdt_f is not None and initial_risk_usdt_f <= 0:
+        result["optional_invalid_inputs"].append("INITIAL_RISK_USDT_NOT_POSITIVE")
+    if net_pnl_status == "RESOLVED" and net_pnl_f is None:
+        result["optional_invalid_inputs"].append("NET_PNL_NOT_NUMERIC")
+
+    reported_candidates = result["reported_r_candidates"]
+    candidate_matches = []
+    if gross_r is not None:
+        tolerance = result["candidate_match_tolerance"]
+        for candidate in reported_candidates:
+            candidate_value = _trpsf_v1_truncated_number(candidate.get("value"))
+            if candidate_value is None:
+                continue
+            absolute_difference = abs(candidate_value - gross_r)
+            candidate_matches.append(
+                {
+                    "canonical_field": candidate.get("canonical_field"),
+                    "alias": candidate.get("alias"),
+                    "path": candidate.get("path"),
+                    "candidate": candidate_value,
+                    "gross_r": gross_r,
+                    "absolute_difference": absolute_difference,
+                    "matches_within_tolerance": absolute_difference <= tolerance,
+                }
+            )
+    result["candidate_matches"] = candidate_matches
+    result["status"] = "R_RECALCULATION_READY"
+    result["partial_diagnostics"] = bool(
+        result["optional_conflicting_inputs"]
+        or result["optional_invalid_inputs"]
+        or result["net_r_block_reasons"]
+    )
+    return result
+
+
 def trade_registry_closed_identity_financial_conflicts_v1():
     base = {
         "ok": False,
@@ -50146,6 +50566,14 @@ def trade_registry_closed_identity_financial_conflicts_v1():
                     value_set, key=lambda v: str(v)
                 )
                 conflicting_value_sources_by_field[field] = sources
+            recalculations = []
+            for index, trade, _ in group:
+                recalculations.append(
+                    {
+                        "registry_index": index,
+                        "risk_inputs": _trpsf_v1_closed_trade_r_recalculation(trade),
+                    }
+                )
             conflict_entries.append(
                 {
                     "conflict_index": conflict_index,
@@ -50170,6 +50598,7 @@ def trade_registry_closed_identity_financial_conflicts_v1():
                     "conflicting_values_by_field": conflicting_values_by_field,
                     "conflicting_value_sources_by_field": conflicting_value_sources_by_field,
                     "records": records,
+                    "recalculations": recalculations,
                 }
             )
         base.update(
@@ -50249,6 +50678,70 @@ def build_trade_registry_closed_identity_financial_conflicts_v1_text():
                         f"value={source.get('value')}"
                     )
                 )
+        for recalculation in conflict.get("recalculations") or []:
+            lines.append(
+                f"recalculation_registry_index={recalculation.get('registry_index')}"
+            )
+            risk_inputs = recalculation.get("risk_inputs") or {}
+            for input_key in [
+                "entry",
+                "initial_stop",
+                "stop",
+                "stop_loss",
+                "original_stop",
+                "qty",
+                "side",
+                "exit_price",
+                "gross_pnl",
+                "realized_pnl",
+                "fees",
+                "funding",
+                "net_pnl",
+                "initial_risk_per_unit",
+                "initial_risk_usdt",
+            ]:
+                if input_key in risk_inputs:
+                    lines.append(
+                        f"{input_key}={risk_inputs.get(input_key)}"
+                    )
+            for candidate in risk_inputs.get("reported_r_candidates") or []:
+                lines.append(
+                    (
+                        f"candidate_field={candidate.get('canonical_field')} "
+                        f"alias={candidate.get('alias')} "
+                        f"path={candidate.get('path')} "
+                        f"value={candidate.get('value')}"
+                    )
+                )
+            for match in risk_inputs.get("candidate_matches") or []:
+                lines.append(
+                    (
+                        f"candidate_match_field={match.get('canonical_field')} "
+                        f"alias={match.get('alias')} "
+                        f"path={match.get('path')} "
+                        f"candidate={match.get('candidate')} "
+                        f"absolute_difference={match.get('absolute_difference')}"
+                    )
+                )
+            for key in [
+                "status",
+                "required_missing_inputs",
+                "required_conflicting_inputs",
+                "optional_conflicting_inputs",
+                "optional_invalid_inputs",
+                "missing_inputs",
+                "conflicting_inputs",
+                "gross_r_ready",
+                "gross_r",
+                "gross_pnl_from_prices",
+                "net_r_ready",
+                "partial_diagnostics",
+                "net_pnl_reported",
+                "net_r_block_reasons",
+                "net_r",
+            ]:
+                if key in risk_inputs:
+                    lines.append(f"{key}={risk_inputs.get(key)}")
     return "\n".join(lines)
 
 
