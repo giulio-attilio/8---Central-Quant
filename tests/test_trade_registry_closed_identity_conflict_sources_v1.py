@@ -114,6 +114,7 @@ def _compile_stop_evidence_namespace(
         "request": SimpleNamespace(args=request_args or {}),
         "_trpsf_v1_truncated_number": lambda value: float(value) if isinstance(value, (int, float, str)) and str(value).strip() not in {"", "None"} else None,
     }
+    namespace["_test_registry_state"] = registry
     _compile_main_functions(
         [
             "_trpsf_v1_truncated_number",
@@ -122,11 +123,21 @@ def _compile_stop_evidence_namespace(
             "_trpsf_v1_stop_evidence_candidate_paths",
             "_trpsf_v1_stop_evidence_iter_trades",
             "_trpsf_v1_stop_evidence_numeric",
+            "_trpsf_v1_stop_evidence_scan_limits",
+            "_trpsf_v1_stop_evidence_cap_list",
+            "_trpsf_v1_stop_evidence_public_identity",
+            "_trpsf_v1_stop_evidence_public_selection",
+            "_trpsf_v1_stop_evidence_public_limits",
+            "_trpsf_v1_stop_evidence_apply_public_limits",
             "_trpsf_v1_stop_evidence_identity_fields",
             "_trpsf_v1_stop_evidence_identity_tokens",
             "_trpsf_v1_stop_evidence_trade_identity",
             "_trpsf_v1_stop_evidence_trade_selector",
             "_trpsf_v1_stop_evidence_event_alias",
+            "_trpsf_v1_stop_evidence_path_components",
+            "_trpsf_v1_stop_evidence_is_registry_pre_execution_plan",
+            "_trpsf_v1_stop_evidence_strong_identity_tokens",
+            "_trpsf_v1_stop_evidence_line_should_parse",
             "_trpsf_v1_stop_evidence_record_identity_values",
             "_trpsf_v1_stop_evidence_record_matches_trade",
             "_trpsf_v1_stop_evidence_context",
@@ -718,6 +729,13 @@ def _base_stop_evidence_trade(**updates):
     return trade
 
 
+def _registry_first_closed_trade(namespace):
+    registry_state = namespace.get("_test_registry_state") or {}
+    closed_trades = registry_state.get("closed_trades") or []
+    assert closed_trades and isinstance(closed_trades[0], dict)
+    return closed_trades[0]
+
+
 def test_stop_evidence_route_lifecycle_id_exact_finds_factual_initial_stop(registry_module, tmp_path):
     trade = _base_stop_evidence_trade(sl=107.0)
     namespace = _compile_stop_evidence_namespace(
@@ -750,6 +768,7 @@ def test_stop_evidence_route_lifecycle_id_exact_finds_factual_initial_stop(regis
     assert any(
         item["classification"] == "INITIAL_STOP_CANDIDATE"
         and item["correlation_strength"] == "STRONG"
+        and item["temporal_within_priority_window"] is True
         for item in payload["evidence"]
     )
 
@@ -914,6 +933,117 @@ def test_stop_evidence_route_rejects_event_with_divergent_strong_id(registry_mod
     )
 
 
+def test_stop_evidence_unknown_expected_lifecycle_keeps_strong_client_order_correlation(
+    registry_module,
+    tmp_path,
+):
+    trade = _base_stop_evidence_trade(lifecycle_id=None)
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": "LC-EXTERNAL-ONLY",
+                    "client_order_id": trade["client_order_id"],
+                    "order_id": trade["order_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"client_order_id": trade["client_order_id"], "order_id": trade["order_id"]}
+    )
+    candidates = [
+        item
+        for item in payload["evidence"]
+        if item.get("classification") == "INITIAL_STOP_CANDIDATE"
+        and item.get("source_file") == "decision_log.jsonl"
+    ]
+    assert candidates
+    assert candidates[0]["correlation_strength"] == "STRONG"
+    assert candidates[0]["identity_unknown_expected_fields"] == ["lifecycle_id"]
+    assert candidates[0]["identity_mismatch_fields"] == []
+    assert candidates[0]["identity_match_fields"] == ["client_order_id", "order_id"]
+    assert candidates[0]["identity_absent_in_event_fields"] == []
+    assert "correlation_match_flags" not in candidates[0]
+    assert payload["trade"]["lifecycle_id"] is None
+    assert not any(
+        event.get("rejection_reason") == "STRONG_IDENTITY_MISMATCH"
+        for event in payload["rejected_events"]
+    )
+
+
+def test_stop_evidence_rejects_known_client_order_id_mismatch(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "history_events.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "client_order_id": "CLIENT-DIVERGENT",
+                    "order_id": trade["order_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    rejections = [
+        event
+        for event in payload["rejected_events"]
+        if event.get("rejection_reason") == "STRONG_IDENTITY_MISMATCH"
+    ]
+    assert rejections
+    assert "client_order_id" in (rejections[0].get("identity_mismatch_fields") or [])
+    assert isinstance(rejections[0].get("identity_match_fields"), list)
+    assert isinstance(rejections[0].get("identity_unknown_expected_fields"), list)
+    assert isinstance(rejections[0].get("identity_absent_in_event_fields"), list)
+
+
+def test_stop_evidence_rejects_known_order_id_mismatch(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "history_events.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "client_order_id": trade["client_order_id"],
+                    "order_id": "ORDER-DIVERGENT-EXPLICIT",
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert any(
+        event.get("rejection_reason") == "STRONG_IDENTITY_MISMATCH"
+        and "order_id" in (event.get("identity_mismatch_fields") or [])
+        for event in payload["rejected_events"]
+    )
+
+
 def test_stop_evidence_route_classifies_sl_alias_as_current_stop(registry_module, tmp_path):
     trade = _base_stop_evidence_trade()
     namespace = _compile_stop_evidence_namespace(
@@ -939,6 +1069,41 @@ def test_stop_evidence_route_classifies_sl_alias_as_current_stop(registry_module
         item["classification"] == "CURRENT_STOP" and item["alias"] == "sl"
         for item in payload["evidence"]
     )
+
+
+def test_stop_evidence_registry_pre_execution_sl_is_candidate_but_not_factual(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade(
+        metadata={
+            "execution_decision": {
+                "auto_real_execution_bridge_v1": {
+                    "payload": {
+                        "sl": 64440.46571428572,
+                    },
+                    "timestamp": "2026-07-10T11:30:00-03:00",
+                }
+            },
+            "outcome": {"r_multiple": -0.73},
+        }
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"], "registry_index": 59}
+    )
+    pre_execution_items = [
+        item for item in payload["evidence"]
+        if item.get("path") == "metadata.execution_decision.auto_real_execution_bridge_v1.payload.sl"
+    ]
+    assert pre_execution_items
+    assert pre_execution_items[0]["classification"] == "INITIAL_STOP_CANDIDATE"
+    assert pre_execution_items[0]["source_supports_factual_initial_stop"] is False
+    assert pre_execution_items[0]["evidence_reason"] == "PRE_EXECUTION_PLAN_WITHOUT_STRONG_EXECUTION_IDENTITY"
+    assert payload["factual_initial_stop_found"] is False
 
 
 def test_stop_evidence_route_does_not_classify_result_closed_last_update_as_stop(registry_module, tmp_path):
@@ -1145,7 +1310,9 @@ def test_stop_evidence_route_reports_malformed_jsonl_in_diagnostics(registry_mod
     assert payload["status"] == "STOP_EVIDENCE_READY"
 
 
-def test_stop_evidence_route_truncation_remains_fail_closed(registry_module, tmp_path):
+def test_stop_evidence_route_truncation_remains_fail_closed(registry_module, tmp_path, monkeypatch):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "4096")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "4096")
     trade = _base_stop_evidence_trade()
     rows = [
         {
@@ -1153,8 +1320,9 @@ def test_stop_evidence_route_truncation_remains_fail_closed(registry_module, tmp
             "timestamp": "2026-11-07T10:54:10-03:00",
             "lifecycle_id": trade["lifecycle_id"],
             "sequence": index,
+            "padding": "x" * 400,
         }
-        for index in range(2600)
+        for index in range(120)
     ]
     rows.append(
         {
@@ -1177,6 +1345,45 @@ def test_stop_evidence_route_truncation_remains_fail_closed(registry_module, tmp
     assert payload["scan_truncated"] is True
     assert payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR"
     assert payload["safe_to_use_for_r_recalculation"] is False
+    assert isinstance(payload.get("bytes_scanned"), int)
+    assert isinstance(payload.get("total_file_bytes"), int)
+
+
+def test_stop_evidence_route_large_unrelated_stream_does_not_force_source_error_when_scan_complete(
+    registry_module,
+    tmp_path,
+):
+    trade = _base_stop_evidence_trade()
+    rows = [
+        {
+            "event_type": "HEARTBEAT",
+            "timestamp": "2026-11-07T10:54:10-03:00",
+            "lifecycle_id": f"OTHER-{index}",
+            "sequence": index,
+        }
+        for index in range(500)
+    ]
+    rows.append(
+        {
+            "event_type": "ENTRY_PLAN_SET",
+            "timestamp": "2026-11-07T10:54:20-03:00",
+            "lifecycle_id": trade["lifecycle_id"],
+            "initial_stop": 106.0,
+        }
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"history_events.jsonl": rows},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert payload["scan_truncated"] is False
+    assert payload["status"] == "STOP_EVIDENCE_READY"
+    assert payload["source_read_errors"] == []
 
 
 def test_stop_evidence_route_is_read_only_and_exposes_security_flags(registry_module, tmp_path):
@@ -1199,3 +1406,733 @@ def test_stop_evidence_route_is_read_only_and_exposes_security_flags(registry_mo
     assert payload["no_order_sent_by_this_route"] is True
     assert isinstance(payload["sources_checked"], list)
     assert isinstance(payload["sources_missing"], list)
+    assert payload["trade_selection"] is not None
+    assert "selected_trade" not in payload["trade_selection"]
+    assert set(payload["trade_selection"].keys()) == {
+        "status",
+        "selection_reason",
+        "identity_strength",
+        "candidate_count",
+        "compatible_candidate_count",
+        "selected_identity",
+        "mismatch_count",
+        "mismatch_summary_truncated",
+    }
+    assert isinstance(payload.get("mismatch_diagnostic_count"), int)
+    assert isinstance(payload.get("rejected_event_count"), int)
+    assert isinstance(payload.get("evidence_count"), int)
+
+
+def test_stop_evidence_route_public_diagnostic_limits_are_applied(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    rows = []
+    for index in range(140):
+        rows.append(
+            {
+                "event_type": "ENTRY_PLAN_SET",
+                "timestamp": "2026-11-07T10:54:20-03:00",
+                "lifecycle_id": trade["lifecycle_id"],
+                "initial_stop": 106.0,
+                "sequence": index,
+            }
+        )
+    for index in range(80):
+        rows.append(
+            {
+                "event_type": "ENTRY_PLAN_SET",
+                "timestamp": "2026-11-07T10:54:20-03:00",
+                "client_order_id": trade["client_order_id"],
+                "order_id": f"ORDER-MISMATCH-{index}",
+                "initial_stop": 106.0,
+            }
+        )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"history_events.jsonl": rows},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"client_order_id": trade["client_order_id"], "order_id": trade["order_id"]}
+    )
+    assert payload["evidence_count"] > 100
+    assert payload["evidence_truncated"] is True
+    assert len(payload["evidence"]) == 100
+    assert payload["rejected_event_count"] > 25
+    assert payload["rejected_events_truncated"] is True
+    assert len(payload["rejected_events"]) == 25
+
+
+def test_stop_evidence_route_text_exposes_counters_and_scan_metrics(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "history_events.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+        request_args={"lifecycle_id": trade["lifecycle_id"]},
+    )
+
+    text = namespace["build_trade_registry_closed_identity_stop_evidence_v1_text"]()
+    assert "bytes_scanned=" in text
+    assert "total_file_bytes=" in text
+    assert "mismatch_diagnostic_count=" in text
+    assert "rejected_event_count=" in text
+    assert "evidence_count=" in text
+
+
+def test_stop_evidence_total_budget_never_exceeds_configured_cap_and_remaining_is_consistent(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "4096")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "5000")
+    trade = _base_stop_evidence_trade()
+    noisy_rows = [
+        {
+            "event_type": "HEARTBEAT",
+            "timestamp": "2026-11-07T10:54:10-03:00",
+            "lifecycle_id": trade["lifecycle_id"],
+            "payload": "x" * 300,
+        }
+        for _ in range(120)
+    ]
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": noisy_rows,
+            "execution_log.jsonl": noisy_rows,
+        },
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert payload["total_scan_budget_bytes"] == 5000
+    assert payload["bytes_scanned"] <= payload["total_scan_budget_bytes"]
+    assert payload["total_scan_budget_remaining_bytes"] == (
+        payload["total_scan_budget_bytes"] - payload["bytes_scanned"]
+    )
+    scanned_stats = [
+        stat
+        for stat in payload["source_scan_stats"]
+        if stat.get("source_scan_budget_bytes", 0) > 0
+    ]
+    assert scanned_stats
+    remaining = payload["total_scan_budget_bytes"]
+    for stat in scanned_stats:
+        assert stat["source_scan_budget_bytes"] <= remaining
+        assert stat["bytes_scanned"] <= stat["source_scan_budget_bytes"]
+        remaining -= stat["bytes_scanned"]
+    assert remaining == payload["total_scan_budget_remaining_bytes"]
+
+
+def test_stop_evidence_missing_source_does_not_consume_total_budget(registry_module, tmp_path, monkeypatch):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "2048")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "4096")
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    missing_stats = [
+        stat
+        for stat in payload["source_scan_stats"]
+        if stat.get("reason") == "SOURCE_NOT_FOUND"
+    ]
+    assert missing_stats
+    assert all(stat["source_scan_budget_bytes"] == 0 for stat in missing_stats)
+    assert all(stat["bytes_scanned"] == 0 for stat in missing_stats)
+    assert payload["bytes_scanned"] <= payload["total_scan_budget_bytes"]
+    assert payload["total_scan_budget_remaining_bytes"] == (
+        payload["total_scan_budget_bytes"] - payload["bytes_scanned"]
+    )
+
+
+def test_stop_evidence_budget_exhaustion_blocks_following_sources_and_is_fail_closed(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "2040")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "2040")
+    trade = _base_stop_evidence_trade()
+    # This compact line is 30 bytes with newline, so head budget (1020) is fully consumed.
+    large_noise = ['{"lifecycle_id":"LC-BTC-001"}' for _ in range(400)]
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": large_noise,
+            # 26 chars + CRLF newline -> 28 bytes, matching remaining budget in this setup.
+            "execution_log.jsonl": ["x" * 26],
+            "execution_engine_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ],
+        },
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert payload["scan_truncated"] is True
+    assert payload["total_scan_budget_exhausted"] is True
+    assert payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR"
+    assert payload["safe_to_use_for_r_recalculation"] is False
+    execution_stat = next(
+        stat for stat in payload["source_scan_stats"]
+        if stat["source_file"] == "execution_engine_log.jsonl"
+    )
+    assert execution_stat["reason"] == "TOTAL_SCAN_BUDGET_EXHAUSTED"
+
+
+def test_stop_evidence_source_priority_is_deterministic_and_documented(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    expected_priority = [
+        "decision_log.jsonl",
+        "execution_log.jsonl",
+        "execution_engine_log.jsonl",
+        "broker_executions_log.jsonl",
+        "broker_execution_audit_log.jsonl",
+        "history_events.jsonl",
+        "timeline.jsonl",
+        "history_export.json",
+    ]
+    assert payload["source_scan_priority"] == expected_priority
+    assert [stat["source_file"] for stat in payload["source_scan_stats"]] == expected_priority
+
+
+def test_stop_evidence_cache_hit_avoids_reopening_source_files(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    real_open = open
+    counters = {"reads": 0}
+
+    def counting_open(*args, **kwargs):
+        target = str(args[0]) if args else ""
+        mode = str(args[1]) if len(args) > 1 else str(kwargs.get("mode", "r"))
+        if (target.endswith(".jsonl") or target.endswith(".json")) and "r" in mode:
+            counters["reads"] += 1
+        return real_open(*args, **kwargs)
+
+    namespace["open"] = counting_open
+
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    reads_after_first = counters["reads"]
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    assert first["cache_hit"] is False
+    assert second["cache_hit"] is True
+    assert counters["reads"] == reads_after_first
+
+
+def test_stop_evidence_cache_invalidates_when_source_signature_changes(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    decision_path = tmp_path / "decision_log.jsonl"
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert first["cache_hit"] is False
+
+    decision_path.write_text(
+        decision_path.read_text(encoding="utf-8") + json.dumps(
+            {
+                "event_type": "HEARTBEAT",
+                "timestamp": "2026-11-07T10:55:00-03:00",
+                "lifecycle_id": trade["lifecycle_id"],
+                "payload": "mutated",
+            }
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert second["cache_hit"] is False
+
+
+def test_stop_evidence_cache_stores_only_sanitized_payload(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert payload["cache_hit"] is False
+
+    cache_state = namespace.get("_TRPSF_V1_STOP_EVIDENCE_CACHE_STATE") or {}
+    entries = cache_state.get("entries") or {}
+    assert entries
+    cached_payload = next(iter(entries.values())).get("payload") or {}
+    assert "selection_internal" not in cached_payload
+    assert "selected_trade" not in (cached_payload.get("trade_selection") or {})
+
+
+def test_stop_evidence_cache_invalidates_when_registry_entry_changes(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert first["cache_hit"] is False
+
+    registry_trade = _registry_first_closed_trade(namespace)
+    registry_trade["entry"] = 101.0
+
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert second["cache_hit"] is False
+    assert second["trade"]["entry"] == pytest.approx(101.0)
+
+
+def test_stop_evidence_cache_invalidates_when_registry_exit_price_changes(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert first["cache_hit"] is False
+
+    registry_trade = _registry_first_closed_trade(namespace)
+    registry_trade["exit_price"] = 109.25
+
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert second["cache_hit"] is False
+    assert second["trade"]["exit_price"] == pytest.approx(109.25)
+
+
+def test_stop_evidence_cache_invalidates_when_registry_pnl_fields_change(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade(
+        pnl_r=-0.81,
+        result_r=-0.77,
+        metadata={"outcome": {"r_multiple": -0.73}},
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert first["cache_hit"] is False
+
+    registry_trade = _registry_first_closed_trade(namespace)
+    registry_trade["pnl_r"] = -0.33
+    metadata_obj = registry_trade.setdefault("metadata", {})
+    outcome_obj = metadata_obj.setdefault("outcome", {})
+    outcome_obj["r_multiple"] = -0.44
+
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert second["cache_hit"] is False
+    values = {item.get("alias"): item.get("value") for item in second.get("reported_r_candidates") or []}
+    assert values.get("pnl_r") == pytest.approx(-0.33)
+    assert values.get("r_multiple") == pytest.approx(-0.44)
+
+
+def test_stop_evidence_cache_invalidates_when_registry_strong_identity_changes(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert first["cache_hit"] is False
+
+    registry_trade = _registry_first_closed_trade(namespace)
+    registry_trade["client_order_id"] = "CLIENT-CHANGED-FOR-CACHE"
+
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert second["cache_hit"] is False
+    assert second["trade"]["client_order_id"] == "CLIENT-CHANGED-FOR-CACHE"
+
+
+def test_stop_evidence_logs_unchanged_but_registry_changed_forces_cache_miss(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert first["cache_hit"] is False
+
+    registry_trade = _registry_first_closed_trade(namespace)
+    registry_trade["registry_mode"] = "VERIFY"
+
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert second["cache_hit"] is False
+
+
+def test_stop_evidence_cache_signature_changes_with_scan_budget(registry_module, tmp_path, monkeypatch):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "4096")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "12288")
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert first["cache_hit"] is False
+
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "2048")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "6144")
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert second["cache_hit"] is False
+    assert second["total_scan_budget_bytes"] == 6144
+
+
+def test_stop_evidence_cache_is_identity_scoped(registry_module, tmp_path):
+    trade_a = _base_stop_evidence_trade(
+        lifecycle_id="LC-BTC-001",
+        client_order_id="CLIENT-A",
+        order_id="ORDER-A",
+    )
+    trade_b = _base_stop_evidence_trade(
+        lifecycle_id="LC-BTC-002",
+        client_order_id="CLIENT-B",
+        order_id="ORDER-B",
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        closed_trades=[trade_a, trade_b],
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade_a["lifecycle_id"],
+                    "initial_stop": 106.0,
+                },
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:30-03:00",
+                    "lifecycle_id": trade_b["lifecycle_id"],
+                    "initial_stop": 107.0,
+                },
+            ]
+        },
+    )
+
+    a_first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade_a["lifecycle_id"]}
+    )
+    b_first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade_b["lifecycle_id"]}
+    )
+    a_second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade_a["lifecycle_id"]}
+    )
+    assert a_first["cache_hit"] is False
+    assert b_first["cache_hit"] is False
+    assert a_second["cache_hit"] is True
+
+
+def test_stop_evidence_tail_scan_records_byte_offsets(registry_module, tmp_path, monkeypatch):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "4096")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "12288")
+    trade = _base_stop_evidence_trade()
+    rows = [
+        {
+            "event_type": "HEARTBEAT",
+            "timestamp": "2026-11-07T10:54:10-03:00",
+            "lifecycle_id": f"OTHER-{index}",
+            "payload": "x" * 500,
+        }
+        for index in range(180)
+    ]
+    rows.append(
+        {
+            "event_type": "ENTRY_PLAN_SET",
+            "timestamp": "2026-11-07T10:54:20-03:00",
+            "lifecycle_id": trade["lifecycle_id"],
+            "initial_stop": 106.0,
+        }
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"history_events.jsonl": rows},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert payload["scan_truncated"] is True
+    tail_evidence = [
+        item for item in payload["evidence"]
+        if item.get("source_file") == "history_events.jsonl"
+        and str(item.get("source_index") or "").startswith("byte:")
+        and item.get("line_number") is None
+    ]
+    assert tail_evidence
+    assert all(isinstance(item.get("byte_offset_start"), int) for item in tail_evidence)
+    assert all(isinstance(item.get("byte_offset_end"), int) for item in tail_evidence)
+    assert all(item.get("byte_offset_end") > item.get("byte_offset_start") for item in tail_evidence)
+
+
+def test_stop_evidence_tail_strong_candidate_keeps_byte_offset_provenance(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "4096")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "12288")
+    trade = _base_stop_evidence_trade()
+    rows = [
+        {
+            "event_type": "HEARTBEAT",
+            "timestamp": "2026-11-07T10:54:10-03:00",
+            "lifecycle_id": f"OTHER-{index}",
+            "payload": "x" * 500,
+        }
+        for index in range(180)
+    ]
+    rows.append(
+        {
+            "event_type": "ENTRY_PLAN_SET",
+            "timestamp": "2026-11-07T10:54:20-03:00",
+            "lifecycle_id": trade["lifecycle_id"],
+            "initial_stop": 106.0,
+        }
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"history_events.jsonl": rows},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    strong_candidates = [
+        item for item in payload["evidence"]
+        if item.get("classification") == "INITIAL_STOP_CANDIDATE"
+        and item.get("correlation_strength") == "STRONG"
+        and item.get("source_file") == "history_events.jsonl"
+    ]
+    assert strong_candidates
+    assert all(str(item.get("source_index") or "").startswith("byte:") for item in strong_candidates)
+    assert all(isinstance(item.get("byte_offset_start"), int) for item in strong_candidates)
+    assert all(isinstance(item.get("byte_offset_end"), int) for item in strong_candidates)
+    assert payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR"
+
+
+def test_stop_evidence_source_scan_stats_public_shape_is_limited(registry_module, tmp_path):
+    trade = _base_stop_evidence_trade()
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": [
+                {
+                    "event_type": "ENTRY_PLAN_SET",
+                    "timestamp": "2026-11-07T10:54:20-03:00",
+                    "lifecycle_id": trade["lifecycle_id"],
+                    "initial_stop": 106.0,
+                }
+            ]
+        },
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    allowed_keys = {
+        "source_file",
+        "scan_strategy",
+        "source_scan_budget_bytes",
+        "bytes_scanned",
+        "total_file_bytes",
+        "scan_truncated",
+        "byte_ranges_examined",
+        "reason",
+    }
+    assert payload["source_scan_stats"]
+    for stat in payload["source_scan_stats"]:
+        assert set(stat.keys()) == allowed_keys

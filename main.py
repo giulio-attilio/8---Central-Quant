@@ -50766,12 +50766,12 @@ def _trpsf_v1_stop_evidence_alias_families():
 def _trpsf_v1_stop_evidence_candidate_paths():
     data_dir = Path(globals().get("CENTRAL_DATA_DIR") or ".")
     return [
-        ("history_events.jsonl", data_dir / "history_events.jsonl", "jsonl"),
         ("decision_log.jsonl", data_dir / "decision_log.jsonl", "jsonl"),
         ("execution_log.jsonl", data_dir / "execution_log.jsonl", "jsonl"),
         ("execution_engine_log.jsonl", data_dir / "execution_engine_log.jsonl", "jsonl"),
         ("broker_executions_log.jsonl", data_dir / "broker_executions_log.jsonl", "jsonl"),
         ("broker_execution_audit_log.jsonl", data_dir / "broker_execution_audit_log.jsonl", "jsonl"),
+        ("history_events.jsonl", data_dir / "history_events.jsonl", "jsonl"),
         ("timeline.jsonl", data_dir / "timeline.jsonl", "jsonl"),
         ("history_export.json", data_dir / "history_export.json", "json"),
     ]
@@ -50788,6 +50788,131 @@ def _trpsf_v1_stop_evidence_iter_trades(values):
 def _trpsf_v1_stop_evidence_numeric(value):
     numeric = _trpsf_v1_truncated_number(value)
     return numeric if numeric is not None else None
+
+
+def _trpsf_v1_stop_evidence_scan_limits():
+    default_max_source_scan_bytes = 32 * 1024 * 1024
+    default_max_total_scan_bytes = 96 * 1024 * 1024
+    env_source_value = None
+    env_total_value = None
+    try:
+        env_mod = __import__("os").environ
+        env_source_value = env_mod.get("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES")
+        env_total_value = env_mod.get("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES")
+    except Exception:
+        env_source_value = None
+        env_total_value = None
+    try:
+        max_source_scan_bytes = (
+            int(str(env_source_value).strip())
+            if env_source_value not in {None, ""}
+            else default_max_source_scan_bytes
+        )
+    except Exception:
+        max_source_scan_bytes = default_max_source_scan_bytes
+    try:
+        max_total_scan_bytes = (
+            int(str(env_total_value).strip())
+            if env_total_value not in {None, ""}
+            else default_max_total_scan_bytes
+        )
+    except Exception:
+        max_total_scan_bytes = default_max_total_scan_bytes
+
+    if max_source_scan_bytes <= 0:
+        max_source_scan_bytes = default_max_source_scan_bytes
+    if max_total_scan_bytes <= 0:
+        max_total_scan_bytes = default_max_total_scan_bytes
+
+    return {
+        "max_source_scan_bytes": max_source_scan_bytes,
+        "max_total_scan_bytes": max_total_scan_bytes,
+        "tail_scan_bytes": min(max_source_scan_bytes, 8 * 1024 * 1024),
+        "json_max_bytes": max_source_scan_bytes,
+    }
+
+
+def _trpsf_v1_stop_evidence_cap_list(values, max_items):
+    values = list(values or [])
+    if max_items is None or max_items < 0:
+        return values, len(values), False
+    return values[:max_items], len(values), len(values) > max_items
+
+
+def _trpsf_v1_stop_evidence_public_identity(identity):
+    identity = identity if isinstance(identity, dict) else {}
+    return {
+        "registry_index": identity.get("registry_index"),
+        "trade_id": identity.get("trade_id"),
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "client_order_id": identity.get("client_order_id"),
+        "order_id": identity.get("order_id"),
+        "symbol": identity.get("symbol"),
+        "side": identity.get("side"),
+        "opened_at": identity.get("opened_at"),
+    }
+
+
+def _trpsf_v1_stop_evidence_public_selection(selection):
+    selection = selection if isinstance(selection, dict) else {}
+    mismatch_diagnostics = selection.get("mismatch_diagnostics") or []
+    return {
+        "status": selection.get("status"),
+        "selection_reason": selection.get("selection_reason"),
+        "identity_strength": selection.get("identity_strength"),
+        "candidate_count": selection.get("candidate_count"),
+        "compatible_candidate_count": selection.get("compatible_candidate_count"),
+        "selected_identity": _trpsf_v1_stop_evidence_public_identity(selection.get("selected_identity") or {}),
+        "mismatch_count": len(mismatch_diagnostics),
+        "mismatch_summary_truncated": len(mismatch_diagnostics) > 10,
+    }
+
+
+def _trpsf_v1_stop_evidence_public_limits():
+    return {
+        "mismatch_diagnostics_max": 10,
+        "rejected_events_max": 25,
+        "evidence_max": 100,
+        "source_read_errors_max": 20,
+    }
+
+
+def _trpsf_v1_stop_evidence_apply_public_limits(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    limits = _trpsf_v1_stop_evidence_public_limits()
+
+    mismatch_limited, mismatch_count, mismatch_truncated = _trpsf_v1_stop_evidence_cap_list(
+        payload.get("mismatch_diagnostics") or [],
+        limits.get("mismatch_diagnostics_max"),
+    )
+    payload["mismatch_diagnostics"] = mismatch_limited
+    payload["mismatch_diagnostic_count"] = mismatch_count
+    payload["mismatch_diagnostics_truncated"] = mismatch_truncated
+
+    rejected_limited, rejected_count, rejected_truncated = _trpsf_v1_stop_evidence_cap_list(
+        payload.get("rejected_events") or [],
+        limits.get("rejected_events_max"),
+    )
+    payload["rejected_events"] = rejected_limited
+    payload["rejected_event_count"] = rejected_count
+    payload["rejected_events_truncated"] = rejected_truncated
+
+    evidence_limited, evidence_count, evidence_truncated = _trpsf_v1_stop_evidence_cap_list(
+        payload.get("evidence") or [],
+        limits.get("evidence_max"),
+    )
+    payload["evidence"] = evidence_limited
+    payload["evidence_count"] = evidence_count
+    payload["evidence_truncated"] = evidence_truncated
+
+    errors_limited, error_count, errors_truncated = _trpsf_v1_stop_evidence_cap_list(
+        payload.get("source_read_errors") or [],
+        limits.get("source_read_errors_max"),
+    )
+    payload["source_read_errors"] = errors_limited
+    payload["source_read_error_count"] = error_count
+    payload["source_read_errors_truncated"] = errors_truncated
+    return payload
 
 
 def _trpsf_v1_stop_evidence_identity_fields():
@@ -51066,6 +51191,102 @@ def _trpsf_v1_stop_evidence_event_alias(path=None, alias=None):
     return segment or None
 
 
+def _trpsf_v1_stop_evidence_path_components(path):
+    text = str(path or "").strip()
+    if not text:
+        return []
+    components = []
+    for segment in text.split("."):
+        clean = str(segment).split("[", 1)[0].strip().lower()
+        if clean:
+            components.append(clean)
+    return components
+
+
+def _trpsf_v1_stop_evidence_is_registry_pre_execution_plan(path, alias_name, source_file):
+    if source_file != "trade_registry.raw_read_only":
+        return False
+    if alias_name != "sl":
+        return False
+    components = _trpsf_v1_stop_evidence_path_components(path)
+    required = {
+        "metadata",
+        "execution_decision",
+        "auto_real_execution_bridge_v1",
+        "payload",
+        "sl",
+    }
+    return required.issubset(set(components))
+
+
+def _trpsf_v1_stop_evidence_strong_identity_tokens(identity_tokens):
+    identity_tokens = _trpsf_v1_stop_evidence_identity_tokens(identity_tokens)
+    values = []
+    for field in ["lifecycle_id", "client_order_id", "order_id"]:
+        token = identity_tokens.get(field)
+        if token is not None and token not in values:
+            values.append(token)
+    return values
+
+
+def _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
+    text_value = str(text or "")
+    if not text_value:
+        return False
+    identity_tokens = _trpsf_v1_stop_evidence_identity_tokens(identity_tokens)
+    strong_tokens = _trpsf_v1_stop_evidence_strong_identity_tokens(identity_tokens)
+    strong_token_hit = any(token in text_value for token in strong_tokens)
+
+    trade_id = identity_tokens.get("trade_id")
+    symbol = identity_tokens.get("symbol")
+    side = identity_tokens.get("side")
+    weak_trade_id_hit = bool(trade_id and trade_id in text_value)
+    weak_symbol_side_hit = bool(
+        symbol
+        and side
+        and symbol.upper() in text_value.upper()
+        and side.upper() in text_value.upper()
+    )
+    weak_hint = weak_trade_id_hit or weak_symbol_side_hit
+
+    strong_key_hint = any(
+        key_literal in text_value
+        for key_literal in (
+            '"lifecycle_id"',
+            '"client_order_id"',
+            '"order_id"',
+            '"broker_order_id"',
+            '"exchange_order_id"',
+        )
+    )
+    stop_alias_hint = any(
+        alias_literal in text_value.lower()
+        for alias_literal in (
+            '"initial_stop"',
+            '"stop_initial"',
+            '"sl_initial"',
+            '"initial_sl"',
+            '"stop"',
+            '"sl"',
+            '"stop_atual"',
+            '"current_stop"',
+            '"disaster_stop"',
+            '"disaster_sl"',
+            '"disaster_stop_price"',
+            '"stop_loss"',
+            '"stop_loss_price"',
+        )
+    )
+
+    if strong_token_hit:
+        return True
+    if weak_hint and strong_key_hint:
+        return True
+    if weak_hint and stop_alias_hint:
+        return True
+    return False
+
+
 def _trpsf_v1_stop_evidence_record_identity_values(record):
     fields = _trpsf_v1_stop_evidence_identity_fields()
     values = {field: set() for field in fields}
@@ -51113,28 +51334,37 @@ def _trpsf_v1_stop_evidence_record_matches_trade(record, identity_tokens, raw_te
     )
 
     strong_fields = ["lifecycle_id", "client_order_id", "order_id"]
-    strong_mismatch_fields = []
-    for field in strong_fields:
-        record_field_values = record_values.get(field) or set()
-        if not record_field_values:
-            continue
-        expected = identity_tokens.get(field)
-        if expected is None or expected not in record_field_values:
-            strong_mismatch_fields.append(field)
+    identity_match_fields = []
+    identity_mismatch_fields = []
+    identity_unknown_expected_fields = []
+    identity_absent_in_event_fields = []
 
-    if strong_mismatch_fields:
+    for field in strong_fields:
+        expected = identity_tokens.get(field)
+        record_field_values = record_values.get(field) or set()
+        has_expected = expected is not None
+        has_event_value = bool(record_field_values)
+
+        if has_expected and has_event_value:
+            if expected in record_field_values:
+                identity_match_fields.append(field)
+            else:
+                identity_mismatch_fields.append(field)
+        elif (not has_expected) and has_event_value:
+            identity_unknown_expected_fields.append(field)
+        elif has_expected and (not has_event_value):
+            identity_absent_in_event_fields.append(field)
+
+    if identity_mismatch_fields:
         return {
             "matched": False,
             "rejected": True,
             "rejection_reason": "STRONG_IDENTITY_MISMATCH",
             "correlation_strength": "REJECTED",
-            "identity_mismatch_fields": strong_mismatch_fields,
-            "identity_values": {
-                key: sorted(values)
-                for key, values in record_values.items()
-                if values
-            },
-            "match_flags": {},
+            "identity_match_fields": identity_match_fields,
+            "identity_mismatch_fields": identity_mismatch_fields,
+            "identity_unknown_expected_fields": identity_unknown_expected_fields,
+            "identity_absent_in_event_fields": identity_absent_in_event_fields,
         }
 
     lifecycle_match = bool(
@@ -51201,20 +51431,10 @@ def _trpsf_v1_stop_evidence_record_matches_trade(record, identity_tokens, raw_te
         "rejected": False,
         "rejection_reason": None,
         "correlation_strength": correlation_strength,
-        "identity_mismatch_fields": [],
-        "identity_values": {
-            key: sorted(values)
-            for key, values in record_values.items()
-            if values
-        },
-        "match_flags": {
-            "lifecycle_id": lifecycle_match,
-            "client_order_id": client_match,
-            "order_id": order_match,
-            "trade_id": trade_id_match,
-            "symbol_side": symbol_side_match,
-            "raw_token": raw_token_match,
-        },
+        "identity_match_fields": identity_match_fields,
+        "identity_mismatch_fields": identity_mismatch_fields,
+        "identity_unknown_expected_fields": identity_unknown_expected_fields,
+        "identity_absent_in_event_fields": identity_absent_in_event_fields,
     }
 
 
@@ -51277,31 +51497,68 @@ def _trpsf_v1_stop_evidence_parse_timestamp(value):
     text = str(value).strip()
     if not text:
         return None
-    try:
-        dt_mod = __import__("datetime").datetime
-        if text.endswith("Z"):
-            text = f"{text[:-1]}+00:00"
-        return dt_mod.fromisoformat(text)
-    except Exception:
-        return None
+    dt_mod = __import__("datetime").datetime
+    candidates = [text]
+    if text.endswith("Z"):
+        candidates.append(f"{text[:-1]}+00:00")
+    for candidate in candidates:
+        try:
+            return dt_mod.fromisoformat(candidate)
+        except Exception:
+            pass
+    for pattern in [
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ]:
+        try:
+            return dt_mod.strptime(text, pattern)
+        except Exception:
+            pass
+    return None
 
 
 def _trpsf_v1_stop_evidence_temporal_relation(event_timestamp, opened_at):
     if not event_timestamp or not opened_at:
-        return "UNKNOWN"
+        return {
+            "temporal_relation": "UNKNOWN",
+            "within_priority_window": None,
+            "delta_seconds": None,
+        }
     event_dt = _trpsf_v1_stop_evidence_parse_timestamp(event_timestamp)
     open_dt = _trpsf_v1_stop_evidence_parse_timestamp(opened_at)
     if event_dt is None or open_dt is None:
-        return "UNKNOWN"
+        return {
+            "temporal_relation": "UNKNOWN",
+            "within_priority_window": None,
+            "delta_seconds": None,
+        }
     try:
+        if (event_dt.tzinfo is None) != (open_dt.tzinfo is None):
+            event_dt = event_dt.replace(tzinfo=None)
+            open_dt = open_dt.replace(tzinfo=None)
         delta_seconds = (event_dt - open_dt).total_seconds()
     except Exception:
-        return "UNKNOWN"
-    if delta_seconds < -300:
-        return "BEFORE_OPEN"
-    if delta_seconds <= 600:
-        return "AT_OPEN_WINDOW"
-    return "AFTER_OPEN"
+        return {
+            "temporal_relation": "UNKNOWN",
+            "within_priority_window": None,
+            "delta_seconds": None,
+        }
+
+    if delta_seconds < 0:
+        relation = "BEFORE_OPEN"
+    elif delta_seconds <= 900:
+        relation = "AT_OPEN_WINDOW"
+    else:
+        relation = "AFTER_OPEN"
+
+    within_priority_window = (-1800 <= delta_seconds <= 900)
+    return {
+        "temporal_relation": relation,
+        "within_priority_window": within_priority_window,
+        "delta_seconds": delta_seconds,
+    }
 
 
 def _trpsf_v1_stop_evidence_extract_occurrences(
@@ -51311,6 +51568,8 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
     line_number=None,
     identity_tokens=None,
     raw_text=None,
+    byte_offset_start=None,
+    byte_offset_end=None,
 ):
     if not isinstance(record, dict):
         return {
@@ -51350,10 +51609,15 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
                     "source_file": source_file,
                     "source_index": source_index,
                     "line_number": line_number,
+                    "byte_offset_start": byte_offset_start,
+                    "byte_offset_end": byte_offset_end,
                     "event_type": event_type,
                     "timestamp": timestamp,
                     "rejection_reason": correlation.get("rejection_reason"),
+                    "identity_match_fields": correlation.get("identity_match_fields") or [],
                     "identity_mismatch_fields": correlation.get("identity_mismatch_fields") or [],
+                    "identity_unknown_expected_fields": correlation.get("identity_unknown_expected_fields") or [],
+                    "identity_absent_in_event_fields": correlation.get("identity_absent_in_event_fields") or [],
                 }
             ],
         }
@@ -51365,10 +51629,13 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
         }
 
     event_phase = _trpsf_v1_stop_evidence_event_phase(event_type)
-    temporal_relation = _trpsf_v1_stop_evidence_temporal_relation(
+    temporal_info = _trpsf_v1_stop_evidence_temporal_relation(
         timestamp,
         identity_tokens.get("opened_at"),
     )
+    temporal_relation = temporal_info.get("temporal_relation")
+    temporal_within_priority_window = temporal_info.get("within_priority_window")
+    temporal_delta_seconds = temporal_info.get("delta_seconds")
     occurrences = []
 
     def walk(value, path=None, alias=None):
@@ -51384,7 +51651,16 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
             return
 
         alias_name = _trpsf_v1_stop_evidence_event_alias(path=path, alias=alias)
-        classification = _trpsf_v1_stop_evidence_context(event_type, path, alias=alias_name)
+        pre_execution_registry_candidate = _trpsf_v1_stop_evidence_is_registry_pre_execution_plan(
+            path=path,
+            alias_name=alias_name,
+            source_file=source_file,
+        )
+        classification = "INITIAL_STOP_CANDIDATE" if pre_execution_registry_candidate else _trpsf_v1_stop_evidence_context(
+            event_type,
+            path,
+            alias=alias_name,
+        )
         if classification is None:
             return
 
@@ -51392,18 +51668,25 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
         if value_text in {None, "", "None", "[]", "{}"}:
             return
 
-        evidence_reason = {
-            "INITIAL_STOP_CANDIDATE": "explicit initial stop alias matched",
-            "CURRENT_STOP": "explicit current stop alias matched",
-            "DISASTER_STOP": "disaster stop alias matched",
-            "STOP_UPDATE": "update/amend/replace/trailing stop semantics detected",
-        }.get(classification, "classified stop evidence")
+        if pre_execution_registry_candidate:
+            evidence_reason = "PRE_EXECUTION_PLAN_WITHOUT_STRONG_EXECUTION_IDENTITY"
+            source_supports_factual_initial_stop = False
+        else:
+            evidence_reason = {
+                "INITIAL_STOP_CANDIDATE": "explicit initial stop alias matched",
+                "CURRENT_STOP": "explicit current stop alias matched",
+                "DISASTER_STOP": "disaster stop alias matched",
+                "STOP_UPDATE": "update/amend/replace/trailing stop semantics detected",
+            }.get(classification, "classified stop evidence")
+            source_supports_factual_initial_stop = source_file != "trade_registry.raw_read_only"
 
         occurrences.append(
             {
                 "source_file": source_file,
                 "source_index": source_index,
                 "line_number": line_number,
+                "byte_offset_start": byte_offset_start,
+                "byte_offset_end": byte_offset_end,
                 "event_type": event_type,
                 "timestamp": timestamp,
                 "path": path,
@@ -51411,10 +51694,15 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
                 "value": value,
                 "classification": classification,
                 "correlation_strength": correlation.get("correlation_strength"),
-                "correlation_match_flags": correlation.get("match_flags") or {},
+                "identity_match_fields": correlation.get("identity_match_fields") or [],
+                "identity_mismatch_fields": correlation.get("identity_mismatch_fields") or [],
+                "identity_unknown_expected_fields": correlation.get("identity_unknown_expected_fields") or [],
+                "identity_absent_in_event_fields": correlation.get("identity_absent_in_event_fields") or [],
                 "temporal_relation": temporal_relation,
+                "temporal_within_priority_window": temporal_within_priority_window,
+                "temporal_delta_seconds": temporal_delta_seconds,
                 "event_phase": event_phase,
-                "source_supports_factual_initial_stop": source_file != "trade_registry.raw_read_only",
+                "source_supports_factual_initial_stop": source_supports_factual_initial_stop,
                 "evidence_reason": evidence_reason,
             }
         )
@@ -51427,10 +51715,28 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
     }
 
 
-def _trpsf_v1_stop_evidence_scan_file(path, source_file, identity_tokens, kind="jsonl"):
-    max_jsonl_lines = 2500
-    max_json_records = 2500
-    max_json_bytes = 1000000
+def _trpsf_v1_stop_evidence_scan_file(
+    path,
+    source_file,
+    identity_tokens,
+    kind="jsonl",
+    source_scan_budget_bytes=None,
+):
+    scan_limits = _trpsf_v1_stop_evidence_scan_limits()
+    max_source_scan_bytes = int(scan_limits.get("max_source_scan_bytes") or 0)
+    tail_scan_bytes = int(scan_limits.get("tail_scan_bytes") or 0)
+    json_max_bytes = int(scan_limits.get("json_max_bytes") or max_source_scan_bytes)
+    try:
+        source_scan_budget_bytes = (
+            int(source_scan_budget_bytes)
+            if source_scan_budget_bytes is not None
+            else max_source_scan_bytes
+        )
+    except Exception:
+        source_scan_budget_bytes = max_source_scan_bytes
+    if source_scan_budget_bytes < 0:
+        source_scan_budget_bytes = 0
+
     result = {
         "checked": False,
         "occurrences": [],
@@ -51438,27 +51744,100 @@ def _trpsf_v1_stop_evidence_scan_file(path, source_file, identity_tokens, kind="
         "malformed_record_count": 0,
         "source_read_errors": [],
         "truncated": False,
+        "bytes_scanned": 0,
+        "total_file_bytes": None,
+        "scan_strategy": "FORWARD_STREAMING",
+        "source_scan_budget_bytes": source_scan_budget_bytes,
+        "byte_ranges_examined": [],
+        "reason": None,
         "limits": {
-            "jsonl_max_lines": max_jsonl_lines,
-            "json_max_records": max_json_records,
-            "json_max_bytes": max_json_bytes,
+            "max_source_scan_bytes": max_source_scan_bytes,
+            "max_total_scan_bytes": int(scan_limits.get("max_total_scan_bytes") or 0),
+            "tail_scan_bytes": tail_scan_bytes,
+            "json_max_bytes": json_max_bytes,
         },
     }
 
+    def _append_byte_range(start, end):
+        try:
+            start_i = int(start)
+            end_i = int(end)
+        except Exception:
+            return
+        if end_i <= start_i:
+            return
+        ranges = result.get("byte_ranges_examined") or []
+        if ranges:
+            last = ranges[-1]
+            last_end = int(last.get("end") or 0)
+            if start_i <= last_end:
+                last["end"] = max(last_end, end_i)
+                result["byte_ranges_examined"] = ranges
+                return
+        ranges.append({"start": start_i, "end": end_i})
+        result["byte_ranges_examined"] = ranges
+
     path_obj = Path(path) if path is not None else None
     if path_obj is None or not path_obj.exists():
+        result["reason"] = "SOURCE_NOT_FOUND"
+        return result
+
+    if source_scan_budget_bytes <= 0:
+        result["truncated"] = True
+        result["reason"] = "SOURCE_SCAN_BUDGET_ZERO"
         return result
 
     result["checked"] = True
     try:
+        result["total_file_bytes"] = int(path_obj.stat().st_size)
+    except Exception:
+        result["total_file_bytes"] = None
+
+    try:
         if kind == "jsonl":
-            with open(path_obj, "r", encoding="utf-8") as file_obj:
-                for line_number, line in enumerate(file_obj, start=1):
-                    if line_number > max_jsonl_lines:
-                        result["truncated"] = True
+            full_scan_allowed = (
+                isinstance(result.get("total_file_bytes"), int)
+                and result.get("total_file_bytes") <= source_scan_budget_bytes
+            )
+            head_budget = (
+                source_scan_budget_bytes
+                if full_scan_allowed
+                else max(1, source_scan_budget_bytes // 2)
+            )
+            tail_budget = (
+                0
+                if full_scan_allowed
+                else max(0, source_scan_budget_bytes - head_budget)
+            )
+            if not full_scan_allowed:
+                result["scan_strategy"] = "HEAD_AND_TAIL_WINDOWED_STREAMING"
+
+            parsed_offsets = set()
+            line_number = 0
+            with open(path_obj, "rb") as file_obj:
+                while True:
+                    line_start = file_obj.tell()
+                    raw_line = file_obj.readline()
+                    if not raw_line:
                         break
-                    text = line.strip()
+                    line_end = file_obj.tell()
+                    line_bytes = int(line_end - line_start)
+                    if result["bytes_scanned"] + line_bytes > head_budget:
+                        result["truncated"] = True
+                        result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                        break
+                    line_number += 1
+                    result["bytes_scanned"] += line_bytes
+                    _append_byte_range(line_start, line_end)
+                    text = raw_line.decode("utf-8", errors="ignore").strip()
                     if not text:
+                        continue
+                    parsed_offsets.add(int(line_start))
+                    if not _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
+                        if (text.startswith("{") and not text.endswith("}")) or (
+                            text.startswith("[") and not text.endswith("]")
+                        ):
+                            result["malformed_record_count"] += 1
                         continue
                     try:
                         record = json.loads(text)
@@ -51471,45 +51850,101 @@ def _trpsf_v1_stop_evidence_scan_file(path, source_file, identity_tokens, kind="
                     extracted = _trpsf_v1_stop_evidence_extract_occurrences(
                         record,
                         source_file,
-                        source_index=line_number,
+                        source_index=f"byte:{int(line_start)}",
                         line_number=line_number,
                         identity_tokens=identity_tokens,
                         raw_text=text,
+                        byte_offset_start=int(line_start),
+                        byte_offset_end=int(line_end),
                     )
                     result["occurrences"].extend(extracted.get("occurrences") or [])
                     result["rejected_events"].extend(extracted.get("rejected_events") or [])
+
+            if result.get("truncated") and tail_budget > 0:
+                try:
+                    with open(path_obj, "rb") as binary_obj:
+                        binary_obj.seek(0, 2)
+                        file_size = binary_obj.tell()
+                        tail_read_budget = max(0, source_scan_budget_bytes - result.get("bytes_scanned", 0))
+                        read_size = min(file_size, tail_budget, tail_scan_bytes, tail_read_budget)
+                        if read_size > 0:
+                            chunk_start = max(0, file_size - read_size)
+                            binary_obj.seek(chunk_start)
+                            chunk = binary_obj.read(read_size)
+                            result["bytes_scanned"] += len(chunk)
+                            _append_byte_range(chunk_start, chunk_start + len(chunk))
+                            tail_lines = chunk.splitlines(keepends=True)
+                            local_offset = 0
+                            if chunk_start > 0 and tail_lines:
+                                local_offset += len(tail_lines[0])
+                                tail_lines = tail_lines[1:]
+                            for raw_tail_line in tail_lines:
+                                line_start = int(chunk_start + local_offset)
+                                local_offset += len(raw_tail_line)
+                                line_end = int(chunk_start + local_offset)
+                                text = raw_tail_line.decode("utf-8", errors="ignore").strip()
+                                if not text or line_start in parsed_offsets:
+                                    continue
+                                parsed_offsets.add(line_start)
+                                if not _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
+                                    if (text.startswith("{") and not text.endswith("}")) or (
+                                        text.startswith("[") and not text.endswith("]")
+                                    ):
+                                        result["malformed_record_count"] += 1
+                                    continue
+                                try:
+                                    record = json.loads(text)
+                                except Exception:
+                                    result["malformed_record_count"] += 1
+                                    continue
+                                if not isinstance(record, dict):
+                                    result["malformed_record_count"] += 1
+                                    continue
+                                extracted = _trpsf_v1_stop_evidence_extract_occurrences(
+                                    record,
+                                    source_file,
+                                    source_index=f"byte:{line_start}",
+                                    line_number=None,
+                                    identity_tokens=identity_tokens,
+                                    raw_text=text,
+                                    byte_offset_start=line_start,
+                                    byte_offset_end=line_end,
+                                )
+                                result["occurrences"].extend(extracted.get("occurrences") or [])
+                                result["rejected_events"].extend(extracted.get("rejected_events") or [])
+                except Exception as exc:
+                    result["source_read_errors"].append(
+                        {
+                            "source_file": source_file,
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    )
         else:
-            try:
-                source_size = path_obj.stat().st_size
-            except Exception:
-                source_size = None
-            if source_size is not None and source_size > max_json_bytes:
+            source_size = result.get("total_file_bytes")
+            if source_size is not None and source_size > min(json_max_bytes, source_scan_budget_bytes):
                 result["truncated"] = True
-                result["source_read_errors"].append(
-                    {
-                        "source_file": source_file,
-                        "error_type": "SOURCE_FILE_TOO_LARGE",
-                        "message": f"file size exceeds json_max_bytes={max_json_bytes}",
-                    }
-                )
+                result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
                 return result
             with open(path_obj, "r", encoding="utf-8") as file_obj:
                 loaded = json.load(file_obj)
+            if source_size is not None:
+                result["bytes_scanned"] = min(source_size, source_scan_budget_bytes)
+                _append_byte_range(0, result["bytes_scanned"])
             records = loaded if isinstance(loaded, list) else [loaded]
             for record_index, record in enumerate(records, start=1):
-                if record_index > max_json_records:
-                    result["truncated"] = True
-                    break
                 if not isinstance(record, dict):
                     result["malformed_record_count"] += 1
                     continue
                 extracted = _trpsf_v1_stop_evidence_extract_occurrences(
                     record,
                     source_file,
-                    source_index=record_index,
+                    source_index="byte:0",
                     line_number=record_index,
                     identity_tokens=identity_tokens,
                     raw_text=None,
+                    byte_offset_start=0,
+                    byte_offset_end=None,
                 )
                 result["occurrences"].extend(extracted.get("occurrences") or [])
                 result["rejected_events"].extend(extracted.get("rejected_events") or [])
@@ -51521,6 +51956,17 @@ def _trpsf_v1_stop_evidence_scan_file(path, source_file, identity_tokens, kind="
                 "message": str(exc),
             }
         )
+
+    total_file_bytes = result.get("total_file_bytes")
+    bytes_scanned = result.get("bytes_scanned")
+    if isinstance(total_file_bytes, int) and isinstance(bytes_scanned, int):
+        if bytes_scanned > total_file_bytes:
+            result["bytes_scanned"] = total_file_bytes
+    if int(result.get("bytes_scanned") or 0) > source_scan_budget_bytes:
+        result["bytes_scanned"] = source_scan_budget_bytes
+        result["truncated"] = True
+        if not result.get("reason"):
+            result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
     return result
 
 
@@ -51576,7 +52022,8 @@ def _trpsf_v1_stop_evidence_load_registry_trade(identity_tokens):
         symbol=identity_tokens.get("symbol"),
         side=identity_tokens.get("side"),
     )
-    result["selection"] = selection
+    result["selection"] = _trpsf_v1_stop_evidence_public_selection(selection)
+    result["selection_internal"] = selection
     result["status"] = selection.get("status") or "STOP_EVIDENCE_TRADE_NOT_FOUND"
 
     selected_trade = selection.get("selected_trade")
@@ -51654,6 +52101,299 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
             "registry_index": registry_index,
         }
     )
+    scan_limits = _trpsf_v1_stop_evidence_scan_limits()
+    max_source_scan_bytes = int(scan_limits.get("max_source_scan_bytes") or 0)
+    max_total_scan_bytes = int(scan_limits.get("max_total_scan_bytes") or 0)
+    if max_source_scan_bytes <= 0:
+        max_source_scan_bytes = 32 * 1024 * 1024
+    if max_total_scan_bytes <= 0:
+        max_total_scan_bytes = 96 * 1024 * 1024
+    scan_limits["max_source_scan_bytes"] = max_source_scan_bytes
+    scan_limits["max_total_scan_bytes"] = max_total_scan_bytes
+
+    candidate_paths = _trpsf_v1_stop_evidence_candidate_paths()
+    source_scan_priority = [source_file for source_file, _source_path, _kind in candidate_paths]
+    stop_evidence_semantic_version = "STOP_EVIDENCE_V1.2.2"
+
+    env_mod = None
+    try:
+        env_mod = __import__("os").environ
+    except Exception:
+        env_mod = {}
+    try:
+        cache_ttl_seconds = int(str(env_mod.get("STOP_EVIDENCE_CACHE_TTL_SECONDS", "60")).strip())
+    except Exception:
+        cache_ttl_seconds = 60
+    try:
+        cache_max_entries = int(str(env_mod.get("STOP_EVIDENCE_CACHE_MAX_ENTRIES", "32")).strip())
+    except Exception:
+        cache_max_entries = 32
+    if cache_ttl_seconds < 0:
+        cache_ttl_seconds = 0
+    if cache_max_entries < 0:
+        cache_max_entries = 0
+    cache_enabled = cache_ttl_seconds > 0 and cache_max_entries > 0
+
+    cache_identity = {
+        "registry_index": identity_tokens.get("registry_index"),
+        "lifecycle_id": identity_tokens.get("lifecycle_id"),
+        "client_order_id": identity_tokens.get("client_order_id"),
+        "order_id": identity_tokens.get("order_id"),
+        "trade_id": identity_tokens.get("trade_id"),
+        "symbol": identity_tokens.get("symbol"),
+        "side": identity_tokens.get("side"),
+    }
+    cache_identity_key = tuple(
+        (key, cache_identity.get(key))
+        for key in [
+            "registry_index",
+            "lifecycle_id",
+            "client_order_id",
+            "order_id",
+            "trade_id",
+            "symbol",
+            "side",
+        ]
+    )
+
+    source_signature = []
+    for source_file, source_path, _kind in candidate_paths:
+        path_obj = Path(source_path)
+        signature_item = {
+            "source_file": source_file,
+            "path": str(path_obj),
+            "size": None,
+            "mtime_ns": None,
+        }
+        try:
+            if path_obj.exists():
+                stat_info = path_obj.stat()
+                signature_item["size"] = int(stat_info.st_size)
+                signature_item["mtime_ns"] = int(
+                    getattr(stat_info, "st_mtime_ns", int(float(stat_info.st_mtime) * 1_000_000_000))
+                )
+        except Exception:
+            pass
+        source_signature.append(signature_item)
+
+    time_mod = __import__("time")
+    copy_mod = __import__("copy")
+    cache_lock = globals().get("_TRPSF_V1_STOP_EVIDENCE_CACHE_LOCK")
+    if cache_lock is None:
+        try:
+            cache_lock = __import__("threading").Lock()
+            globals()["_TRPSF_V1_STOP_EVIDENCE_CACHE_LOCK"] = cache_lock
+        except Exception:
+            cache_lock = None
+    cache_state = globals().get("_TRPSF_V1_STOP_EVIDENCE_CACHE_STATE")
+    if not isinstance(cache_state, dict):
+        cache_state = {"entries": {}}
+        globals()["_TRPSF_V1_STOP_EVIDENCE_CACHE_STATE"] = cache_state
+
+    def _registry_path_signature():
+        registry_module = globals().get("central_trade_registry")
+        if registry_module is None:
+            return None
+
+        primary_path_text = None
+        for attr_name in [
+            "TRADE_REGISTRY_FILE",
+            "registry_file_active",
+            "trade_registry_file",
+            "active_file",
+            "REGISTRY_FILE",
+        ]:
+            candidate = getattr(registry_module, attr_name, None)
+            if candidate in {None, ""}:
+                continue
+            text = str(candidate).strip()
+            if text:
+                primary_path_text = text
+                break
+
+        legacy_path_text = getattr(registry_module, "TRADE_REGISTRY_LEGACY_FILE", None)
+        if legacy_path_text not in {None, ""}:
+            legacy_path_text = str(legacy_path_text).strip() or None
+        else:
+            legacy_path_text = None
+
+        if not primary_path_text and not legacy_path_text:
+            return None
+
+        active_path = None
+        try:
+            if primary_path_text:
+                primary_path = Path(primary_path_text)
+                if primary_path.exists():
+                    active_path = primary_path
+                elif legacy_path_text:
+                    legacy_path = Path(legacy_path_text)
+                    if legacy_path.exists() and str(legacy_path) != str(primary_path):
+                        active_path = legacy_path
+                    else:
+                        active_path = primary_path
+                else:
+                    active_path = primary_path
+            elif legacy_path_text:
+                active_path = Path(legacy_path_text)
+        except Exception:
+            active_path = None
+
+        if active_path is None:
+            return None
+
+        size = None
+        mtime_ns = None
+        try:
+            if active_path.exists():
+                stat_info = active_path.stat()
+                size = int(stat_info.st_size)
+                mtime_ns = int(
+                    getattr(
+                        stat_info,
+                        "st_mtime_ns",
+                        int(float(stat_info.st_mtime) * 1_000_000_000),
+                    )
+                )
+        except Exception:
+            pass
+
+        return {
+            "source_name": "trade_registry.raw_read_only",
+            "path": str(active_path),
+            "size": size,
+            "mtime_ns": mtime_ns,
+        }
+
+    def _registry_trade_signature(registry_resolution_obj):
+        registry_resolution_obj = (
+            registry_resolution_obj if isinstance(registry_resolution_obj, dict) else {}
+        )
+        selected_identity_obj = registry_resolution_obj.get("selected_identity") or {}
+        trade_obj = registry_resolution_obj.get("trade") or {}
+        metadata_obj = trade_obj.get("metadata") if isinstance(trade_obj.get("metadata"), dict) else {}
+        outcome_obj = metadata_obj.get("outcome") if isinstance(metadata_obj.get("outcome"), dict) else {}
+
+        signature = {
+            "registry_index": selected_identity_obj.get("registry_index"),
+            "trade_id": selected_identity_obj.get("trade_id") or trade_obj.get("trade_id"),
+            "lifecycle_id": selected_identity_obj.get("lifecycle_id") or trade_obj.get("lifecycle_id"),
+            "client_order_id": selected_identity_obj.get("client_order_id") or trade_obj.get("client_order_id"),
+            "order_id": selected_identity_obj.get("order_id") or trade_obj.get("order_id"),
+            "symbol": selected_identity_obj.get("symbol") or trade_obj.get("symbol"),
+            "side": selected_identity_obj.get("side") or trade_obj.get("side"),
+            "entry": _trpsf_v1_stop_evidence_numeric(trade_obj.get("entry")),
+            "exit_price": _trpsf_v1_stop_evidence_numeric(trade_obj.get("exit_price")),
+            "opened_at": selected_identity_obj.get("opened_at") or trade_obj.get("opened_at"),
+            "closed_at": trade_obj.get("closed_at"),
+            "pnl_r": _trpsf_v1_stop_evidence_numeric(trade_obj.get("pnl_r")),
+            "result_r": _trpsf_v1_stop_evidence_numeric(trade_obj.get("result_r")),
+            "r_multiple": _trpsf_v1_stop_evidence_numeric(
+                trade_obj.get("r_multiple") if trade_obj.get("r_multiple") is not None else outcome_obj.get("r_multiple")
+            ),
+            "sl": _trpsf_v1_stop_evidence_numeric(trade_obj.get("sl")),
+            "status": None if trade_obj.get("status") in {None, ""} else str(trade_obj.get("status")).strip(),
+            "registry_mode": None if trade_obj.get("registry_mode") in {None, ""} else str(trade_obj.get("registry_mode")).strip(),
+        }
+
+        signature_items = [
+            (field, signature.get(field))
+            for field in [
+                "registry_index",
+                "trade_id",
+                "lifecycle_id",
+                "client_order_id",
+                "order_id",
+                "symbol",
+                "side",
+                "entry",
+                "exit_price",
+                "opened_at",
+                "closed_at",
+                "pnl_r",
+                "result_r",
+                "r_multiple",
+                "sl",
+                "status",
+                "registry_mode",
+            ]
+        ]
+
+        return {
+            "source_name": "trade_registry.raw_read_only",
+            "trade_signature": signature_items,
+        }
+
+    def _build_cache_signature(registry_resolution_obj):
+        registry_signature = _registry_path_signature()
+        if registry_signature is None:
+            registry_signature = _registry_trade_signature(registry_resolution_obj)
+
+        return {
+            "source_signature": source_signature,
+            "registry_signature": registry_signature,
+            "scanner_context": {
+                "semantic_version": stop_evidence_semantic_version,
+                "source_scan_priority": list(source_scan_priority),
+                "max_source_scan_bytes": max_source_scan_bytes,
+                "max_total_scan_bytes": max_total_scan_bytes,
+            },
+        }
+
+    cache_signature = None
+
+    def _finalize_payload(payload_obj):
+        payload_obj = payload_obj if isinstance(payload_obj, dict) else {}
+        scanned = int(payload_obj.get("bytes_scanned") or 0)
+        if scanned < 0:
+            scanned = 0
+        if scanned > max_total_scan_bytes:
+            scanned = max_total_scan_bytes
+        payload_obj["bytes_scanned"] = scanned
+        payload_obj["total_scan_budget_bytes"] = max_total_scan_bytes
+        payload_obj["total_scan_budget_remaining_bytes"] = max(0, max_total_scan_bytes - scanned)
+        payload_obj["total_scan_budget_exhausted"] = bool(
+            payload_obj.get("total_scan_budget_exhausted")
+            or payload_obj.get("total_scan_budget_remaining_bytes", 0) <= 0
+        )
+        payload_obj["cache_hit"] = False
+        payload_obj["cache_age_seconds"] = None
+        payload_obj["cache_ttl_seconds"] = cache_ttl_seconds
+
+        trade_selection_public = payload_obj.get("trade_selection")
+        if isinstance(trade_selection_public, dict):
+            trade_selection_public.pop("selected_trade", None)
+        payload_obj.pop("selection_internal", None)
+
+        payload_obj = _trpsf_v1_stop_evidence_apply_public_limits(payload_obj)
+
+        if cache_enabled and cache_lock is not None:
+            sanitized_for_cache = copy_mod.deepcopy(payload_obj)
+            trade_selection_cached = sanitized_for_cache.get("trade_selection")
+            if isinstance(trade_selection_cached, dict):
+                trade_selection_cached.pop("selected_trade", None)
+            sanitized_for_cache.pop("selection_internal", None)
+
+            with cache_lock:
+                state_obj = globals().get("_TRPSF_V1_STOP_EVIDENCE_CACHE_STATE")
+                if not isinstance(state_obj, dict):
+                    state_obj = {"entries": {}}
+                    globals()["_TRPSF_V1_STOP_EVIDENCE_CACHE_STATE"] = state_obj
+                entries = state_obj.setdefault("entries", {})
+                now_epoch = float(time_mod.time())
+                entries[cache_identity_key] = {
+                    "created_at_epoch": now_epoch,
+                    "cache_signature": cache_signature,
+                    "payload": sanitized_for_cache,
+                }
+                while len(entries) > cache_max_entries:
+                    oldest_key = min(
+                        entries.keys(),
+                        key=lambda key: float((entries.get(key) or {}).get("created_at_epoch") or 0.0),
+                    )
+                    entries.pop(oldest_key, None)
+
+        return payload_obj
 
     payload = {
         "ok": True,
@@ -51682,11 +52422,14 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         "source_read_errors": [],
         "malformed_record_count": 0,
         "scan_truncated": False,
-        "scan_limits": {
-            "jsonl_max_lines": 2500,
-            "json_max_records": 2500,
-            "json_max_bytes": 1000000,
-        },
+        "scan_limits": scan_limits,
+        "bytes_scanned": 0,
+        "total_file_bytes": 0,
+        "total_scan_budget_bytes": max_total_scan_bytes,
+        "total_scan_budget_remaining_bytes": max_total_scan_bytes,
+        "total_scan_budget_exhausted": False,
+        "source_scan_priority": source_scan_priority,
+        "source_scan_stats": [],
         "trade": {
             "trade_id": identity_tokens.get("trade_id"),
             "client_order_id": identity_tokens.get("client_order_id"),
@@ -51701,10 +52444,47 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
             "closed_at": None,
         },
         "trade_selection": None,
+        "mismatch_diagnostics": [],
+        "cache_hit": False,
+        "cache_age_seconds": None,
+        "cache_ttl_seconds": cache_ttl_seconds,
     }
 
     registry_resolution = _trpsf_v1_stop_evidence_load_registry_trade(identity_tokens)
+    cache_signature = _build_cache_signature(registry_resolution)
+
+    if cache_enabled and cache_lock is not None:
+        now_epoch = float(time_mod.time())
+        with cache_lock:
+            entries = cache_state.setdefault("entries", {})
+            entry = entries.get(cache_identity_key)
+            if isinstance(entry, dict):
+                created_epoch = float(entry.get("created_at_epoch") or 0.0)
+                age_seconds = max(0.0, now_epoch - created_epoch)
+                signature_match = entry.get("cache_signature") == cache_signature
+                if age_seconds <= cache_ttl_seconds and signature_match:
+                    cached_payload = copy_mod.deepcopy(entry.get("payload") or {})
+                    cached_payload["cache_hit"] = True
+                    cached_payload["cache_age_seconds"] = age_seconds
+                    cached_payload["cache_ttl_seconds"] = cache_ttl_seconds
+                    trade_selection_cached = cached_payload.get("trade_selection")
+                    if isinstance(trade_selection_cached, dict):
+                        trade_selection_cached.pop("selected_trade", None)
+                    return cached_payload
+                entries.pop(cache_identity_key, None)
+
+            expired_keys = [
+                key
+                for key, cache_entry in list(entries.items())
+                if isinstance(cache_entry, dict)
+                and (now_epoch - float(cache_entry.get("created_at_epoch") or 0.0)) > cache_ttl_seconds
+            ]
+            for key in expired_keys:
+                entries.pop(key, None)
+
     payload["trade_selection"] = registry_resolution.get("selection")
+    selection_internal = registry_resolution.get("selection_internal") or {}
+    payload["mismatch_diagnostics"] = selection_internal.get("mismatch_diagnostics") or []
     payload["status"] = registry_resolution.get("status") or "STOP_EVIDENCE_TRADE_NOT_FOUND"
     payload["source_read_errors"].extend(registry_resolution.get("source_read_errors") or [])
     payload["sources_checked"].append("trade_registry.raw_read_only")
@@ -51715,9 +52495,9 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         "STOP_EVIDENCE_TRADE_NOT_FOUND",
         "STOP_EVIDENCE_TRADE_IDENTITY_AMBIGUOUS",
     }:
-        return payload
+        return _finalize_payload(payload)
     if payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR" and registry_resolution.get("trade") is None:
-        return payload
+        return _finalize_payload(payload)
 
     trade = registry_resolution.get("trade") or {}
     selected_identity = registry_resolution.get("selected_identity") or identity_tokens
@@ -51735,25 +52515,97 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         "closed_at": trade.get("closed_at"),
     }
 
-    for source_file, source_path, kind in _trpsf_v1_stop_evidence_candidate_paths():
+    remaining_total_budget = max_total_scan_bytes
+
+    for source_file, source_path, kind in candidate_paths:
         source_path_obj = Path(source_path)
         if not source_path_obj.exists():
             payload["sources_missing"].append(source_file)
+            payload["source_scan_stats"].append(
+                {
+                    "source_file": source_file,
+                    "scan_strategy": "NOT_EXAMINED",
+                    "source_scan_budget_bytes": 0,
+                    "bytes_scanned": 0,
+                    "total_file_bytes": None,
+                    "scan_truncated": False,
+                    "byte_ranges_examined": [],
+                    "reason": "SOURCE_NOT_FOUND",
+                }
+            )
             continue
+
+        if remaining_total_budget <= 0:
+            payload["scan_truncated"] = True
+            payload["total_scan_budget_exhausted"] = True
+            total_file_bytes = None
+            try:
+                total_file_bytes = int(source_path_obj.stat().st_size)
+            except Exception:
+                total_file_bytes = None
+            payload["source_scan_stats"].append(
+                {
+                    "source_file": source_file,
+                    "scan_strategy": "NOT_EXAMINED",
+                    "source_scan_budget_bytes": 0,
+                    "bytes_scanned": 0,
+                    "total_file_bytes": total_file_bytes,
+                    "scan_truncated": True,
+                    "byte_ranges_examined": [],
+                    "reason": "TOTAL_SCAN_BUDGET_EXHAUSTED",
+                }
+            )
+            payload["source_read_errors"].append(
+                {
+                    "source_file": source_file,
+                    "error_type": "TOTAL_SCAN_BUDGET_EXHAUSTED",
+                    "message": "source not examined because request total scan budget was exhausted",
+                }
+            )
+            continue
+
+        source_scan_budget_bytes = min(max_source_scan_bytes, remaining_total_budget)
         payload["sources_checked"].append(source_file)
         scan_result = _trpsf_v1_stop_evidence_scan_file(
             source_path_obj,
             source_file,
             selected_identity,
             kind=kind,
+            source_scan_budget_bytes=source_scan_budget_bytes,
         )
         payload["evidence"].extend(scan_result.get("occurrences") or [])
         payload["rejected_events"].extend(scan_result.get("rejected_events") or [])
         payload["malformed_record_count"] += int(scan_result.get("malformed_record_count") or 0)
         payload["source_read_errors"].extend(scan_result.get("source_read_errors") or [])
         payload["scan_truncated"] = bool(payload["scan_truncated"] or scan_result.get("truncated"))
+        scanned_from_source = int(scan_result.get("bytes_scanned") or 0)
+        if scanned_from_source < 0:
+            scanned_from_source = 0
+        scanned_from_source = min(scanned_from_source, source_scan_budget_bytes, remaining_total_budget)
+        payload["bytes_scanned"] += scanned_from_source
+        remaining_total_budget = max(0, remaining_total_budget - scanned_from_source)
+        payload["total_scan_budget_remaining_bytes"] = remaining_total_budget
+        if isinstance(scan_result.get("total_file_bytes"), int):
+            payload["total_file_bytes"] += int(scan_result.get("total_file_bytes") or 0)
+        payload["source_scan_stats"].append(
+            {
+                "source_file": source_file,
+                "scan_strategy": scan_result.get("scan_strategy"),
+                "source_scan_budget_bytes": source_scan_budget_bytes,
+                "bytes_scanned": scanned_from_source,
+                "total_file_bytes": scan_result.get("total_file_bytes"),
+                "scan_truncated": bool(scan_result.get("truncated")),
+                "byte_ranges_examined": scan_result.get("byte_ranges_examined") or [],
+                "reason": scan_result.get("reason"),
+            }
+        )
         if isinstance(scan_result.get("limits"), dict):
             payload["scan_limits"] = scan_result.get("limits")
+
+    payload["total_scan_budget_exhausted"] = bool(
+        payload.get("total_scan_budget_exhausted")
+        or payload.get("total_scan_budget_remaining_bytes", 0) <= 0
+    )
 
     initial_candidates = [
         item
@@ -51774,7 +52626,10 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         if item.get("correlation_strength") == "STRONG"
         and item.get("source_supports_factual_initial_stop") is True
         and item.get("event_phase") == "INITIAL_PLAN_OR_ENTRY"
-        and item.get("temporal_relation") in {"BEFORE_OPEN", "AT_OPEN_WINDOW", "UNKNOWN"}
+        and (
+            item.get("temporal_within_priority_window") is True
+            or item.get("temporal_within_priority_window") is None
+        )
     ]
     strong_initial_groups = {}
     for item in strong_initial_candidates:
@@ -51825,6 +52680,8 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
                     "source_file": factual_candidate.get("source_file"),
                     "source_index": factual_candidate.get("source_index"),
                     "line_number": factual_candidate.get("line_number"),
+                    "byte_offset_start": factual_candidate.get("byte_offset_start"),
+                    "byte_offset_end": factual_candidate.get("byte_offset_end"),
                     "path": factual_candidate.get("path"),
                     "alias": factual_candidate.get("alias"),
                     "timestamp": factual_candidate.get("timestamp"),
@@ -51876,7 +52733,7 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         payload.get("status") == "STOP_EVIDENCE_READY"
         and payload.get("calculated_gross_r") is not None
     )
-    return payload
+    return _finalize_payload(payload)
 
 
 def build_trade_registry_closed_identity_stop_evidence_v1_text():
@@ -51912,9 +52769,27 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
         f"sources_checked={payload.get('sources_checked')}",
         f"sources_missing={payload.get('sources_missing')}",
         f"source_read_errors={payload.get('source_read_errors')}",
+        f"source_read_error_count={payload.get('source_read_error_count')}",
+        f"source_read_errors_truncated={payload.get('source_read_errors_truncated')}",
         f"malformed_record_count={payload.get('malformed_record_count')}",
         f"scan_truncated={payload.get('scan_truncated')}",
         f"scan_limits={payload.get('scan_limits')}",
+        f"bytes_scanned={payload.get('bytes_scanned')}",
+        f"total_file_bytes={payload.get('total_file_bytes')}",
+        f"total_scan_budget_bytes={payload.get('total_scan_budget_bytes')}",
+        f"total_scan_budget_remaining_bytes={payload.get('total_scan_budget_remaining_bytes')}",
+        f"total_scan_budget_exhausted={payload.get('total_scan_budget_exhausted')}",
+        f"source_scan_priority={payload.get('source_scan_priority')}",
+        f"source_scan_stats={payload.get('source_scan_stats')}",
+        f"cache_hit={payload.get('cache_hit')}",
+        f"cache_age_seconds={payload.get('cache_age_seconds')}",
+        f"cache_ttl_seconds={payload.get('cache_ttl_seconds')}",
+        f"mismatch_diagnostic_count={payload.get('mismatch_diagnostic_count')}",
+        f"mismatch_diagnostics_truncated={payload.get('mismatch_diagnostics_truncated')}",
+        f"rejected_event_count={payload.get('rejected_event_count')}",
+        f"rejected_events_truncated={payload.get('rejected_events_truncated')}",
+        f"evidence_count={payload.get('evidence_count')}",
+        f"evidence_truncated={payload.get('evidence_truncated')}",
     ]
     for rejection in payload.get("rejected_events") or []:
         lines.append(
@@ -51922,8 +52797,13 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
                 f"rejected_source_file={rejection.get('source_file')} "
                 f"rejected_source_index={rejection.get('source_index')} "
                 f"rejected_line_number={rejection.get('line_number')} "
+                f"rejected_byte_offset_start={rejection.get('byte_offset_start')} "
+                f"rejected_byte_offset_end={rejection.get('byte_offset_end')} "
                 f"rejection_reason={rejection.get('rejection_reason')} "
+                f"identity_match_fields={rejection.get('identity_match_fields')} "
                 f"identity_mismatch_fields={rejection.get('identity_mismatch_fields')}"
+                f" identity_unknown_expected_fields={rejection.get('identity_unknown_expected_fields')}"
+                f" identity_absent_in_event_fields={rejection.get('identity_absent_in_event_fields')}"
             )
         )
     for item in payload.get("evidence") or []:
@@ -51932,6 +52812,8 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
                 f"source_file={item.get('source_file')} "
                 f"source_index={item.get('source_index')} "
                 f"line_number={item.get('line_number')} "
+                f"byte_offset_start={item.get('byte_offset_start')} "
+                f"byte_offset_end={item.get('byte_offset_end')} "
                 f"event_type={item.get('event_type')} "
                 f"timestamp={item.get('timestamp')} "
                 f"path={item.get('path')} "
@@ -51939,6 +52821,10 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
                 f"value={item.get('value')} "
                 f"classification={item.get('classification')} "
                 f"correlation_strength={item.get('correlation_strength')} "
+                f"identity_match_fields={item.get('identity_match_fields')} "
+                f"identity_mismatch_fields={item.get('identity_mismatch_fields')} "
+                f"identity_unknown_expected_fields={item.get('identity_unknown_expected_fields')} "
+                f"identity_absent_in_event_fields={item.get('identity_absent_in_event_fields')} "
                 f"event_phase={item.get('event_phase')} "
                 f"temporal_relation={item.get('temporal_relation')} "
                 f"evidence_reason={item.get('evidence_reason')}"
