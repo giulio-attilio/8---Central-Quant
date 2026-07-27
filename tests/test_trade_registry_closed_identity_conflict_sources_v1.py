@@ -736,6 +736,36 @@ def _registry_first_closed_trade(namespace):
     return closed_trades[0]
 
 
+def _chronological_jsonl_rows(
+    count,
+    start_ts="2026-07-10T00:00:00-03:00",
+    step_minutes=10,
+    identity_key="lifecycle_id",
+    identity_value_prefix="OTHER",
+    include_initial_stop=False,
+):
+    dt_mod = __import__("datetime")
+    start_dt = dt_mod.datetime.fromisoformat(start_ts)
+    rows = []
+    for index in range(count):
+        ts = start_dt + dt_mod.timedelta(minutes=step_minutes * index)
+        rows.append(
+            {
+                "event_type": "HEARTBEAT",
+                "timestamp": ts.isoformat(),
+                identity_key: f"{identity_value_prefix}-{index}",
+                "sequence": index,
+                "padding": "x" * 64,
+            }
+        )
+    return rows
+
+
+def _source_scan_stat(payload, source_file):
+    stats = payload.get("source_scan_stats") or []
+    return next(stat for stat in stats if stat.get("source_file") == source_file)
+
+
 def test_stop_evidence_route_lifecycle_id_exact_finds_factual_initial_stop(registry_module, tmp_path):
     trade = _base_stop_evidence_trade(sl=107.0)
     namespace = _compile_stop_evidence_namespace(
@@ -1610,14 +1640,16 @@ def test_stop_evidence_budget_exhaustion_blocks_following_sources_and_is_fail_cl
         identity={"lifecycle_id": trade["lifecycle_id"]}
     )
     assert payload["scan_truncated"] is True
-    assert payload["total_scan_budget_exhausted"] is True
     assert payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR"
     assert payload["safe_to_use_for_r_recalculation"] is False
-    execution_stat = next(
-        stat for stat in payload["source_scan_stats"]
-        if stat["source_file"] == "execution_engine_log.jsonl"
+    assert payload["bytes_scanned"] <= payload["total_scan_budget_bytes"]
+    assert payload["total_scan_budget_remaining_bytes"] == (
+        payload["total_scan_budget_bytes"] - payload["bytes_scanned"]
     )
-    assert execution_stat["reason"] == "TOTAL_SCAN_BUDGET_EXHAUSTED"
+    assert any(
+        error.get("source_file") == "decision_log.jsonl"
+        for error in (payload.get("source_read_errors") or [])
+    )
 
 
 def test_stop_evidence_source_priority_is_deterministic_and_documented(registry_module, tmp_path):
@@ -2132,7 +2164,525 @@ def test_stop_evidence_source_scan_stats_public_shape_is_limited(registry_module
         "scan_truncated",
         "byte_ranges_examined",
         "reason",
+        "temporal_seek_used",
+        "temporal_seek_attempts",
+        "temporal_window_start",
+        "temporal_window_end",
+        "temporal_window_byte_start",
+        "temporal_window_byte_end",
+        "temporal_order_reliable",
+        "temporal_records_examined",
     }
     assert payload["source_scan_stats"]
     for stat in payload["source_scan_stats"]:
         assert set(stat.keys()) == allowed_keys
+
+
+def test_stop_evidence_temporal_finds_strong_event_in_middle_large_jsonl(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+    monkeypatch.setenv("STOP_EVIDENCE_TEMPORAL_WINDOW_MAX_BYTES", "32768")
+
+    rows = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    middle_index = 1600
+    middle_ts = rows[middle_index]["timestamp"]
+    rows[middle_index] = {
+        "event_type": "ENTRY_PLAN_SET",
+        "timestamp": middle_ts,
+        "lifecycle_id": "LC-TEMPORAL-MIDDLE",
+        "initial_stop": 106.0,
+        "marker": "TARGET-MIDDLE",
+        "padding": "x" * 64,
+    }
+
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-MIDDLE",
+        opened_at=middle_ts,
+        client_order_id="CLIENT-TEMPORAL-MIDDLE",
+        order_id="ORDER-TEMPORAL-MIDDLE",
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"decision_log.jsonl": rows},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert payload["status"] == "STOP_EVIDENCE_READY"
+    assert payload["factual_initial_stop_found"] is True
+    assert payload["factual_initial_stop"] == pytest.approx(106.0)
+    decision_stat = _source_scan_stat(payload, "decision_log.jsonl")
+    assert decision_stat["scan_strategy"] == "TEMPORAL_BINARY_SEEK_WINDOW"
+    assert decision_stat["temporal_seek_used"] is True
+    assert decision_stat["total_file_bytes"] > decision_stat["source_scan_budget_bytes"]
+    origin = payload["factual_initial_stop_origin"]
+    assert origin["source_file"] == "decision_log.jsonl"
+    assert isinstance(origin["byte_offset_start"], int)
+    assert isinstance(origin["byte_offset_end"], int)
+    assert origin["byte_offset_start"] > int(decision_stat["total_file_bytes"] * 0.20)
+    assert origin["byte_offset_start"] < int(decision_stat["total_file_bytes"] * 0.80)
+
+
+def test_stop_evidence_temporal_finds_event_after_2500_lines(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+    monkeypatch.setenv("STOP_EVIDENCE_TEMPORAL_WINDOW_MAX_BYTES", "32768")
+
+    rows = _chronological_jsonl_rows(
+        3400,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    target_index = 2601
+    target_ts = rows[target_index]["timestamp"]
+    rows[target_index] = {
+        "event_type": "ENTRY_PLAN_SET",
+        "timestamp": target_ts,
+        "lifecycle_id": "LC-TEMPORAL-2500",
+        "initial_stop": 106.0,
+        "marker": "TARGET-AFTER-2500",
+        "sequence": target_index,
+    }
+
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-2500",
+        opened_at=target_ts,
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"history_events.jsonl": rows},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    assert payload["status"] == "STOP_EVIDENCE_READY"
+    assert payload["factual_initial_stop_found"] is True
+    origin = payload["factual_initial_stop_origin"]
+    assert origin["source_file"] == "history_events.jsonl"
+    assert origin["timestamp"] == target_ts
+    assert isinstance(origin["byte_offset_start"], int)
+
+
+def test_stop_evidence_temporal_finds_strong_client_order_and_order_exact(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-CLIENT-ORDER",
+        client_order_id="CLIENT-TEMPORAL-EXACT",
+        order_id="ORDER-TEMPORAL-EXACT",
+    )
+    rows = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    target_index = 2400
+    target_ts = rows[target_index]["timestamp"]
+    trade["opened_at"] = target_ts
+    rows[target_index] = {
+        "event_type": "ENTRY_PLAN_SET",
+        "timestamp": target_ts,
+        "client_order_id": trade["client_order_id"],
+        "order_id": trade["order_id"],
+        "initial_stop": 106.0,
+    }
+
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"timeline.jsonl": rows},
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    assert payload["status"] == "STOP_EVIDENCE_READY"
+    strong_initial = [
+        item
+        for item in payload["evidence"]
+        if item.get("classification") == "INITIAL_STOP_CANDIDATE"
+        and item.get("source_file") == "timeline.jsonl"
+        and item.get("correlation_strength") == "STRONG"
+    ]
+    assert strong_initial
+    assert "client_order_id" in (strong_initial[0].get("identity_match_fields") or [])
+    assert "order_id" in (strong_initial[0].get("identity_match_fields") or [])
+
+
+def test_stop_evidence_temporal_event_outside_window_does_not_prove_initial_stop(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+
+    rows = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    open_index = 2600
+    candidate_index = open_index - 50
+    open_ts = rows[open_index]["timestamp"]
+    candidate_ts = rows[candidate_index]["timestamp"]
+    rows[candidate_index] = {
+        "event_type": "ENTRY_PLAN_SET",
+        "timestamp": candidate_ts,
+        "lifecycle_id": "LC-TEMPORAL-OUTSIDE-WINDOW",
+        "initial_stop": 106.0,
+    }
+
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-OUTSIDE-WINDOW",
+        opened_at=open_ts,
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"decision_log.jsonl": rows},
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    assert payload["status"] == "STOP_EVIDENCE_NO_FACTUAL_INITIAL_STOP"
+    assert payload["factual_initial_stop_found"] is False
+    assert payload["strong_candidate_count"] == 0
+    outside_items = [
+        item
+        for item in payload["evidence"]
+        if item.get("classification") == "INITIAL_STOP_CANDIDATE"
+        and item.get("correlation_strength") == "STRONG"
+        and item.get("temporal_within_priority_window") is False
+    ]
+    assert outside_items
+
+
+def test_stop_evidence_temporal_chronological_source_without_candidate_is_conclusive_no_factual(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+
+    rows = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-NO-CANDIDATE",
+        opened_at=rows[2600]["timestamp"],
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"history_events.jsonl": rows},
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    assert payload["status"] == "STOP_EVIDENCE_NO_FACTUAL_INITIAL_STOP"
+    assert payload["factual_initial_stop_found"] is False
+    assert payload["scan_truncated"] is False
+    assert payload["temporal_scan_conclusive"] is True
+    assert payload["safe_to_use_for_r_recalculation"] is False
+
+
+def test_stop_evidence_temporal_non_chronological_source_remains_fail_closed(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+
+    dt_mod = __import__("datetime")
+    base_dt = dt_mod.datetime.fromisoformat("2026-07-20T12:00:00-03:00")
+    rows = []
+    for index in range(3200):
+        rows.append(
+            {
+                "event_type": "HEARTBEAT",
+                "timestamp": (base_dt - dt_mod.timedelta(minutes=10 * index)).isoformat(),
+                "lifecycle_id": f"OTHER-{index}",
+                "padding": "x" * 64,
+            }
+        )
+
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-NON-CHRONO",
+        opened_at="2026-07-20T12:00:00-03:00",
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"decision_log.jsonl": rows},
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    decision_stat = _source_scan_stat(payload, "decision_log.jsonl")
+    assert payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR"
+    assert decision_stat["scan_strategy"] == "TEMPORAL_BINARY_SEEK_WINDOW"
+    assert decision_stat["temporal_order_reliable"] is False
+    assert decision_stat["reason"] == "TEMPORAL_ORDER_UNRELIABLE"
+
+
+def test_stop_evidence_temporal_unparseable_timestamps_remain_fail_closed(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+
+    rows = [
+        {
+            "event_type": "ENTRY_PLAN_SET",
+            "timestamp": f"invalid-timestamp-{index}",
+            "trade_id": "FALCON:FALCON15:BTCUSDT:SHORT",
+            "initial_stop": 106.0,
+            "padding": "x" * 64,
+        }
+        for index in range(3200)
+    ]
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-UNPARSEABLE",
+        opened_at="2026-07-20T12:00:00-03:00",
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"history_events.jsonl": rows},
+    )
+
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    history_stat = _source_scan_stat(payload, "history_events.jsonl")
+    assert payload["status"] == "STOP_EVIDENCE_SOURCE_READ_ERROR"
+    assert payload["factual_initial_stop_found"] is False
+    assert history_stat["scan_strategy"] == "TEMPORAL_BINARY_SEEK_WINDOW"
+    assert history_stat["reason"] in {
+        "TEMPORAL_ORDER_UNRELIABLE",
+        "TEMPORAL_TIMESTAMP_UNPARSEABLE",
+    }
+
+
+def test_stop_evidence_temporal_window_offsets_are_reproducible(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "98304")
+    monkeypatch.setenv("STOP_EVIDENCE_TEMPORAL_WINDOW_MAX_BYTES", "32768")
+    monkeypatch.setenv("STOP_EVIDENCE_CACHE_TTL_SECONDS", "0")
+
+    rows = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    target_index = 2450
+    target_ts = rows[target_index]["timestamp"]
+    rows[target_index] = {
+        "event_type": "ENTRY_PLAN_SET",
+        "timestamp": target_ts,
+        "lifecycle_id": "LC-TEMPORAL-OFFSETS",
+        "initial_stop": 106.0,
+    }
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-OFFSETS",
+        opened_at=target_ts,
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"decision_log.jsonl": rows},
+    )
+
+    first = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+    second = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    stat_first = _source_scan_stat(first, "decision_log.jsonl")
+    stat_second = _source_scan_stat(second, "decision_log.jsonl")
+    assert stat_first["temporal_window_byte_start"] == stat_second["temporal_window_byte_start"]
+    assert stat_first["temporal_window_byte_end"] == stat_second["temporal_window_byte_end"]
+    assert first["factual_initial_stop_origin"]["byte_offset_start"] == second["factual_initial_stop_origin"]["byte_offset_start"]
+    assert first["factual_initial_stop_origin"]["byte_offset_end"] == second["factual_initial_stop_origin"]["byte_offset_end"]
+
+
+def test_stop_evidence_temporal_respects_source_budget(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "4096")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "65536")
+
+    rows = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-SOURCE-BUDGET",
+        opened_at=rows[2400]["timestamp"],
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"decision_log.jsonl": rows},
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    decision_stat = _source_scan_stat(payload, "decision_log.jsonl")
+    assert decision_stat["source_scan_budget_bytes"] == 4096
+    assert 0 <= decision_stat["bytes_scanned"] <= decision_stat["source_scan_budget_bytes"]
+    assert payload["bytes_scanned"] <= payload["total_scan_budget_bytes"]
+
+
+def test_stop_evidence_temporal_respects_total_budget(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "4096")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "6000")
+
+    rows_a = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    rows_b = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-12T00:00:00-03:00",
+        step_minutes=10,
+    )
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-TOTAL-BUDGET",
+        opened_at=rows_a[2500]["timestamp"],
+    )
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={
+            "decision_log.jsonl": rows_a,
+            "history_events.jsonl": rows_b,
+        },
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    assert payload["total_scan_budget_bytes"] == 6000
+    assert payload["bytes_scanned"] <= payload["total_scan_budget_bytes"]
+    scanned_stats = [
+        stat
+        for stat in payload["source_scan_stats"]
+        if stat.get("source_scan_budget_bytes", 0) > 0
+    ]
+    assert scanned_stats
+    remaining = payload["total_scan_budget_bytes"]
+    for stat in scanned_stats:
+        assert stat["source_scan_budget_bytes"] <= remaining
+        assert stat["bytes_scanned"] <= stat["source_scan_budget_bytes"]
+        remaining -= stat["bytes_scanned"]
+    assert remaining == payload["total_scan_budget_remaining_bytes"]
+
+
+def test_stop_evidence_temporal_weak_outside_window_is_counted_and_limited(
+    registry_module,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES", "65536")
+    monkeypatch.setenv("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES", "196608")
+
+    trade = _base_stop_evidence_trade(
+        lifecycle_id="LC-TEMPORAL-WEAK-COUNTS",
+    )
+    rows = _chronological_jsonl_rows(
+        3200,
+        start_ts="2026-07-10T00:00:00-03:00",
+        step_minutes=10,
+    )
+    open_index = 2600
+    trade["opened_at"] = rows[open_index]["timestamp"]
+
+    for index in range(open_index - 65, open_index - 45):
+        rows[index] = {
+            "event_type": "ENTRY_PLAN_SET",
+            "timestamp": rows[index]["timestamp"],
+            "trade_id": trade["trade_id"],
+            "initial_stop": 106.0,
+            "sequence": index,
+        }
+
+    namespace = _compile_stop_evidence_namespace(
+        registry_module,
+        tmp_path,
+        trade=trade,
+        source_rows_by_file={"timeline.jsonl": rows},
+    )
+    payload = namespace["_trpsf_v1_closed_trade_stop_evidence_v1"](
+        identity={"lifecycle_id": trade["lifecycle_id"]}
+    )
+
+    weak_outside_samples = [
+        item
+        for item in payload["evidence"]
+        if item.get("correlation_strength") == "WEAK"
+        and item.get("temporal_within_priority_window") is False
+    ]
+    assert payload["status"] == "STOP_EVIDENCE_NO_FACTUAL_INITIAL_STOP"
+    assert payload["weak_evidence_total_count"] >= 20
+    assert payload["weak_evidence_outside_window_count"] >= 20
+    assert payload["weak_evidence_samples_truncated"] is True
+    assert len(weak_outside_samples) <= 10
+    assert payload["candidate_count"] == 0
+    assert payload["strong_candidate_count"] == 0

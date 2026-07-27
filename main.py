@@ -50793,15 +50793,31 @@ def _trpsf_v1_stop_evidence_numeric(value):
 def _trpsf_v1_stop_evidence_scan_limits():
     default_max_source_scan_bytes = 32 * 1024 * 1024
     default_max_total_scan_bytes = 96 * 1024 * 1024
+    default_lookback_seconds = 6 * 60 * 60
+    default_lookahead_seconds = 1 * 60 * 60
+    default_temporal_seek_attempts = 24
+    default_temporal_window_max_bytes = 16 * 1024 * 1024
     env_source_value = None
     env_total_value = None
+    env_lookback_seconds = None
+    env_lookahead_seconds = None
+    env_temporal_seek_attempts = None
+    env_temporal_window_max_bytes = None
     try:
         env_mod = __import__("os").environ
         env_source_value = env_mod.get("STOP_EVIDENCE_MAX_SOURCE_SCAN_BYTES")
         env_total_value = env_mod.get("STOP_EVIDENCE_MAX_TOTAL_SCAN_BYTES")
+        env_lookback_seconds = env_mod.get("STOP_EVIDENCE_LOOKBACK_SECONDS")
+        env_lookahead_seconds = env_mod.get("STOP_EVIDENCE_LOOKAHEAD_SECONDS")
+        env_temporal_seek_attempts = env_mod.get("STOP_EVIDENCE_TEMPORAL_SEEK_ATTEMPTS")
+        env_temporal_window_max_bytes = env_mod.get("STOP_EVIDENCE_TEMPORAL_WINDOW_MAX_BYTES")
     except Exception:
         env_source_value = None
         env_total_value = None
+        env_lookback_seconds = None
+        env_lookahead_seconds = None
+        env_temporal_seek_attempts = None
+        env_temporal_window_max_bytes = None
     try:
         max_source_scan_bytes = (
             int(str(env_source_value).strip())
@@ -50824,11 +50840,57 @@ def _trpsf_v1_stop_evidence_scan_limits():
     if max_total_scan_bytes <= 0:
         max_total_scan_bytes = default_max_total_scan_bytes
 
+    try:
+        lookback_seconds = (
+            int(str(env_lookback_seconds).strip())
+            if env_lookback_seconds not in {None, ""}
+            else default_lookback_seconds
+        )
+    except Exception:
+        lookback_seconds = default_lookback_seconds
+    try:
+        lookahead_seconds = (
+            int(str(env_lookahead_seconds).strip())
+            if env_lookahead_seconds not in {None, ""}
+            else default_lookahead_seconds
+        )
+    except Exception:
+        lookahead_seconds = default_lookahead_seconds
+    try:
+        temporal_seek_attempts = (
+            int(str(env_temporal_seek_attempts).strip())
+            if env_temporal_seek_attempts not in {None, ""}
+            else default_temporal_seek_attempts
+        )
+    except Exception:
+        temporal_seek_attempts = default_temporal_seek_attempts
+    try:
+        temporal_window_max_bytes = (
+            int(str(env_temporal_window_max_bytes).strip())
+            if env_temporal_window_max_bytes not in {None, ""}
+            else default_temporal_window_max_bytes
+        )
+    except Exception:
+        temporal_window_max_bytes = default_temporal_window_max_bytes
+
+    if lookback_seconds < 0:
+        lookback_seconds = default_lookback_seconds
+    if lookahead_seconds < 0:
+        lookahead_seconds = default_lookahead_seconds
+    if temporal_seek_attempts <= 0:
+        temporal_seek_attempts = default_temporal_seek_attempts
+    if temporal_window_max_bytes <= 0:
+        temporal_window_max_bytes = default_temporal_window_max_bytes
+
     return {
         "max_source_scan_bytes": max_source_scan_bytes,
         "max_total_scan_bytes": max_total_scan_bytes,
         "tail_scan_bytes": min(max_source_scan_bytes, 8 * 1024 * 1024),
         "json_max_bytes": max_source_scan_bytes,
+        "lookback_seconds": lookback_seconds,
+        "lookahead_seconds": lookahead_seconds,
+        "temporal_seek_attempts": temporal_seek_attempts,
+        "temporal_window_max_bytes": temporal_window_max_bytes,
     }
 
 
@@ -51553,7 +51615,15 @@ def _trpsf_v1_stop_evidence_temporal_relation(event_timestamp, opened_at):
     else:
         relation = "AFTER_OPEN"
 
-    within_priority_window = (-1800 <= delta_seconds <= 900)
+    scan_limits = _trpsf_v1_stop_evidence_scan_limits()
+    lookback_seconds = int(scan_limits.get("lookback_seconds") or (6 * 60 * 60))
+    lookahead_seconds = int(scan_limits.get("lookahead_seconds") or (1 * 60 * 60))
+    if lookback_seconds < 0:
+        lookback_seconds = 6 * 60 * 60
+    if lookahead_seconds < 0:
+        lookahead_seconds = 1 * 60 * 60
+
+    within_priority_window = ((-1 * lookback_seconds) <= delta_seconds <= lookahead_seconds)
     return {
         "temporal_relation": relation,
         "within_priority_window": within_priority_window,
@@ -51570,6 +51640,7 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
     raw_text=None,
     byte_offset_start=None,
     byte_offset_end=None,
+    scan_strategy=None,
 ):
     if not isinstance(record, dict):
         return {
@@ -51611,6 +51682,7 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
                     "line_number": line_number,
                     "byte_offset_start": byte_offset_start,
                     "byte_offset_end": byte_offset_end,
+                    "scan_strategy": scan_strategy,
                     "event_type": event_type,
                     "timestamp": timestamp,
                     "rejection_reason": correlation.get("rejection_reason"),
@@ -51687,6 +51759,7 @@ def _trpsf_v1_stop_evidence_extract_occurrences(
                 "line_number": line_number,
                 "byte_offset_start": byte_offset_start,
                 "byte_offset_end": byte_offset_end,
+                "scan_strategy": scan_strategy,
                 "event_type": event_type,
                 "timestamp": timestamp,
                 "path": path,
@@ -51726,6 +51799,10 @@ def _trpsf_v1_stop_evidence_scan_file(
     max_source_scan_bytes = int(scan_limits.get("max_source_scan_bytes") or 0)
     tail_scan_bytes = int(scan_limits.get("tail_scan_bytes") or 0)
     json_max_bytes = int(scan_limits.get("json_max_bytes") or max_source_scan_bytes)
+    lookback_seconds = int(scan_limits.get("lookback_seconds") or (6 * 60 * 60))
+    lookahead_seconds = int(scan_limits.get("lookahead_seconds") or (1 * 60 * 60))
+    temporal_seek_attempts = int(scan_limits.get("temporal_seek_attempts") or 24)
+    temporal_window_max_bytes = int(scan_limits.get("temporal_window_max_bytes") or (16 * 1024 * 1024))
     try:
         source_scan_budget_bytes = (
             int(source_scan_budget_bytes)
@@ -51750,11 +51827,25 @@ def _trpsf_v1_stop_evidence_scan_file(
         "source_scan_budget_bytes": source_scan_budget_bytes,
         "byte_ranges_examined": [],
         "reason": None,
+        "temporal_seek_used": False,
+        "temporal_seek_attempts": 0,
+        "temporal_window_start": None,
+        "temporal_window_end": None,
+        "temporal_window_byte_start": None,
+        "temporal_window_byte_end": None,
+        "temporal_order_reliable": None,
+        "temporal_records_examined": 0,
+        "temporal_conclusive": False,
+        "temporal_inconclusive_reason": None,
         "limits": {
             "max_source_scan_bytes": max_source_scan_bytes,
             "max_total_scan_bytes": int(scan_limits.get("max_total_scan_bytes") or 0),
             "tail_scan_bytes": tail_scan_bytes,
             "json_max_bytes": json_max_bytes,
+            "lookback_seconds": lookback_seconds,
+            "lookahead_seconds": lookahead_seconds,
+            "temporal_seek_attempts": temporal_seek_attempts,
+            "temporal_window_max_bytes": temporal_window_max_bytes,
         },
     }
 
@@ -51776,6 +51867,123 @@ def _trpsf_v1_stop_evidence_scan_file(
                 return
         ranges.append({"start": start_i, "end": end_i})
         result["byte_ranges_examined"] = ranges
+
+    def _timestamp_from_record(record):
+        if not isinstance(record, dict):
+            return None
+        return (
+            record.get("timestamp")
+            or record.get("ts")
+            or record.get("opened_at")
+            or record.get("created_at")
+            or record.get("updated_at")
+            or record.get("closed_at")
+        )
+
+    def _normalize_datetime_pair(left_dt, right_dt):
+        if left_dt is None or right_dt is None:
+            return None, None
+        try:
+            if (left_dt.tzinfo is None) != (right_dt.tzinfo is None):
+                left_dt = left_dt.replace(tzinfo=None)
+                right_dt = right_dt.replace(tzinfo=None)
+        except Exception:
+            return None, None
+        return left_dt, right_dt
+
+    def _compare_datetimes(left_dt, right_dt):
+        left_n, right_n = _normalize_datetime_pair(left_dt, right_dt)
+        if left_n is None or right_n is None:
+            return None
+        try:
+            if left_n < right_n:
+                return -1
+            if left_n > right_n:
+                return 1
+            return 0
+        except Exception:
+            return None
+
+    def _read_probe_record(file_obj, offset, max_lines=6):
+        file_size_local = int(result.get("total_file_bytes") or 0)
+        if file_size_local <= 0:
+            return None
+        try:
+            offset_i = int(offset)
+        except Exception:
+            offset_i = 0
+        if offset_i < 0:
+            offset_i = 0
+        if offset_i >= file_size_local:
+            offset_i = max(0, file_size_local - 1)
+
+        file_obj.seek(offset_i)
+        if offset_i > 0:
+            partial_start = file_obj.tell()
+            partial_line = file_obj.readline()
+            partial_end = file_obj.tell()
+            partial_bytes = int(partial_end - partial_start)
+            if result["bytes_scanned"] + partial_bytes > source_scan_budget_bytes:
+                result["truncated"] = True
+                if not result.get("reason"):
+                    result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                if not result.get("temporal_inconclusive_reason"):
+                    result["temporal_inconclusive_reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                return None
+            result["bytes_scanned"] += partial_bytes
+            _append_byte_range(partial_start, partial_end)
+
+        for _ in range(max_lines):
+            line_start = file_obj.tell()
+            raw_line = file_obj.readline()
+            if not raw_line:
+                return None
+            line_end = file_obj.tell()
+            line_bytes = int(line_end - line_start)
+            if result["bytes_scanned"] + line_bytes > source_scan_budget_bytes:
+                result["truncated"] = True
+                if not result.get("reason"):
+                    result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                if not result.get("temporal_inconclusive_reason"):
+                    result["temporal_inconclusive_reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                return None
+            result["bytes_scanned"] += line_bytes
+            _append_byte_range(line_start, line_end)
+
+            text = raw_line.decode("utf-8", errors="ignore").strip()
+            if not text:
+                continue
+            try:
+                record = json.loads(text)
+            except Exception:
+                return {
+                    "line_start": int(line_start),
+                    "line_end": int(line_end),
+                    "record": None,
+                    "timestamp": None,
+                    "timestamp_dt": None,
+                    "text": text,
+                }
+            if not isinstance(record, dict):
+                return {
+                    "line_start": int(line_start),
+                    "line_end": int(line_end),
+                    "record": None,
+                    "timestamp": None,
+                    "timestamp_dt": None,
+                    "text": text,
+                }
+            timestamp_value = _timestamp_from_record(record)
+            timestamp_dt = _trpsf_v1_stop_evidence_parse_timestamp(timestamp_value)
+            return {
+                "line_start": int(line_start),
+                "line_end": int(line_end),
+                "record": record,
+                "timestamp": timestamp_value,
+                "timestamp_dt": timestamp_dt,
+                "text": text,
+            }
+        return None
 
     path_obj = Path(path) if path is not None else None
     if path_obj is None or not path_obj.exists():
@@ -51799,127 +52007,430 @@ def _trpsf_v1_stop_evidence_scan_file(
                 isinstance(result.get("total_file_bytes"), int)
                 and result.get("total_file_bytes") <= source_scan_budget_bytes
             )
-            head_budget = (
-                source_scan_budget_bytes
-                if full_scan_allowed
-                else max(1, source_scan_budget_bytes // 2)
-            )
-            tail_budget = (
-                0
-                if full_scan_allowed
-                else max(0, source_scan_budget_bytes - head_budget)
-            )
-            if not full_scan_allowed:
-                result["scan_strategy"] = "HEAD_AND_TAIL_WINDOWED_STREAMING"
-
             parsed_offsets = set()
-            line_number = 0
-            with open(path_obj, "rb") as file_obj:
-                while True:
-                    line_start = file_obj.tell()
-                    raw_line = file_obj.readline()
-                    if not raw_line:
-                        break
-                    line_end = file_obj.tell()
-                    line_bytes = int(line_end - line_start)
-                    if result["bytes_scanned"] + line_bytes > head_budget:
-                        result["truncated"] = True
-                        result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
-                        break
-                    line_number += 1
-                    result["bytes_scanned"] += line_bytes
-                    _append_byte_range(line_start, line_end)
-                    text = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not text:
-                        continue
-                    parsed_offsets.add(int(line_start))
-                    if not _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
-                        if (text.startswith("{") and not text.endswith("}")) or (
-                            text.startswith("[") and not text.endswith("]")
-                        ):
+            if full_scan_allowed:
+                line_number = 0
+                with open(path_obj, "rb") as file_obj:
+                    while True:
+                        line_start = file_obj.tell()
+                        raw_line = file_obj.readline()
+                        if not raw_line:
+                            break
+                        line_end = file_obj.tell()
+                        line_bytes = int(line_end - line_start)
+                        if result["bytes_scanned"] + line_bytes > source_scan_budget_bytes:
+                            result["truncated"] = True
+                            result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                            break
+                        line_number += 1
+                        result["bytes_scanned"] += line_bytes
+                        _append_byte_range(line_start, line_end)
+                        text = raw_line.decode("utf-8", errors="ignore").strip()
+                        if not text:
+                            continue
+                        parsed_offsets.add(int(line_start))
+                        if not _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
+                            if (text.startswith("{") and not text.endswith("}")) or (
+                                text.startswith("[") and not text.endswith("]")
+                            ):
+                                result["malformed_record_count"] += 1
+                            continue
+                        try:
+                            record = json.loads(text)
+                        except Exception:
                             result["malformed_record_count"] += 1
-                        continue
-                    try:
-                        record = json.loads(text)
-                    except Exception:
-                        result["malformed_record_count"] += 1
-                        continue
-                    if not isinstance(record, dict):
-                        result["malformed_record_count"] += 1
-                        continue
-                    extracted = _trpsf_v1_stop_evidence_extract_occurrences(
-                        record,
-                        source_file,
-                        source_index=f"byte:{int(line_start)}",
-                        line_number=line_number,
-                        identity_tokens=identity_tokens,
-                        raw_text=text,
-                        byte_offset_start=int(line_start),
-                        byte_offset_end=int(line_end),
-                    )
-                    result["occurrences"].extend(extracted.get("occurrences") or [])
-                    result["rejected_events"].extend(extracted.get("rejected_events") or [])
+                            continue
+                        if not isinstance(record, dict):
+                            result["malformed_record_count"] += 1
+                            continue
+                        extracted = _trpsf_v1_stop_evidence_extract_occurrences(
+                            record,
+                            source_file,
+                            source_index=f"byte:{int(line_start)}",
+                            line_number=line_number,
+                            identity_tokens=identity_tokens,
+                            raw_text=text,
+                            byte_offset_start=int(line_start),
+                            byte_offset_end=int(line_end),
+                            scan_strategy="FORWARD_STREAMING",
+                        )
+                        result["occurrences"].extend(extracted.get("occurrences") or [])
+                        result["rejected_events"].extend(extracted.get("rejected_events") or [])
 
-            if result.get("truncated") and tail_budget > 0:
-                try:
-                    with open(path_obj, "rb") as binary_obj:
-                        binary_obj.seek(0, 2)
-                        file_size = binary_obj.tell()
-                        tail_read_budget = max(0, source_scan_budget_bytes - result.get("bytes_scanned", 0))
-                        read_size = min(file_size, tail_budget, tail_scan_bytes, tail_read_budget)
-                        if read_size > 0:
-                            chunk_start = max(0, file_size - read_size)
-                            binary_obj.seek(chunk_start)
-                            chunk = binary_obj.read(read_size)
-                            result["bytes_scanned"] += len(chunk)
-                            _append_byte_range(chunk_start, chunk_start + len(chunk))
-                            tail_lines = chunk.splitlines(keepends=True)
-                            local_offset = 0
-                            if chunk_start > 0 and tail_lines:
-                                local_offset += len(tail_lines[0])
-                                tail_lines = tail_lines[1:]
-                            for raw_tail_line in tail_lines:
-                                line_start = int(chunk_start + local_offset)
-                                local_offset += len(raw_tail_line)
-                                line_end = int(chunk_start + local_offset)
-                                text = raw_tail_line.decode("utf-8", errors="ignore").strip()
-                                if not text or line_start in parsed_offsets:
-                                    continue
-                                parsed_offsets.add(line_start)
-                                if not _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
-                                    if (text.startswith("{") and not text.endswith("}")) or (
-                                        text.startswith("[") and not text.endswith("]")
-                                    ):
-                                        result["malformed_record_count"] += 1
-                                    continue
-                                try:
-                                    record = json.loads(text)
-                                except Exception:
-                                    result["malformed_record_count"] += 1
-                                    continue
-                                if not isinstance(record, dict):
-                                    result["malformed_record_count"] += 1
-                                    continue
-                                extracted = _trpsf_v1_stop_evidence_extract_occurrences(
-                                    record,
-                                    source_file,
-                                    source_index=f"byte:{line_start}",
-                                    line_number=None,
-                                    identity_tokens=identity_tokens,
-                                    raw_text=text,
-                                    byte_offset_start=line_start,
-                                    byte_offset_end=line_end,
-                                )
-                                result["occurrences"].extend(extracted.get("occurrences") or [])
-                                result["rejected_events"].extend(extracted.get("rejected_events") or [])
-                except Exception as exc:
-                    result["source_read_errors"].append(
-                        {
-                            "source_file": source_file,
-                            "error_type": type(exc).__name__,
-                            "message": str(exc),
-                        }
+                result["temporal_conclusive"] = bool(
+                    not result.get("truncated") and not result.get("source_read_errors")
+                )
+            else:
+                result["scan_strategy"] = "TEMPORAL_BINARY_SEEK_WINDOW"
+                result["temporal_seek_used"] = True
+
+                opened_at_value = None
+                if isinstance(identity_tokens, dict):
+                    opened_at_value = identity_tokens.get("opened_at")
+                opened_at_dt = _trpsf_v1_stop_evidence_parse_timestamp(opened_at_value)
+                if opened_at_dt is None:
+                    result["truncated"] = True
+                    result["reason"] = "TEMPORAL_REFERENCE_TIMESTAMP_UNPARSEABLE"
+                    result["temporal_inconclusive_reason"] = "TEMPORAL_REFERENCE_TIMESTAMP_UNPARSEABLE"
+                else:
+                    datetime_mod = __import__("datetime")
+                    window_start_dt = opened_at_dt - datetime_mod.timedelta(seconds=max(0, lookback_seconds))
+                    window_end_dt = opened_at_dt + datetime_mod.timedelta(seconds=max(0, lookahead_seconds))
+                    result["temporal_window_start"] = window_start_dt.isoformat()
+                    result["temporal_window_end"] = window_end_dt.isoformat()
+
+                    reserved_tail_and_probe = max(1024, int(source_scan_budget_bytes // 4))
+                    temporal_window_budget_cap = max(
+                        1,
+                        min(source_scan_budget_bytes, max(1, temporal_window_max_bytes)) - reserved_tail_and_probe,
                     )
+
+                    try:
+                        with open(path_obj, "rb") as binary_obj:
+                            file_size = int(result.get("total_file_bytes") or 0)
+                            if source_scan_budget_bytes <= 4096:
+                                sample_offsets = [
+                                    0,
+                                    max(0, file_size // 2),
+                                ]
+                            elif source_scan_budget_bytes <= 8192:
+                                sample_offsets = [
+                                    0,
+                                    max(0, file_size // 2),
+                                    max(0, file_size - 2),
+                                ]
+                            else:
+                                sample_offsets = [
+                                    0,
+                                    max(0, file_size // 4),
+                                    max(0, file_size // 2),
+                                    max(0, (3 * file_size) // 4),
+                                    max(0, file_size - 2),
+                                ]
+                            sample_offsets = sorted(set(sample_offsets))
+
+                            sample_points = []
+                            for sample_offset in sample_offsets:
+                                probe = _read_probe_record(binary_obj, sample_offset, max_lines=3)
+                                if probe is None:
+                                    continue
+                                if probe.get("timestamp_dt") is not None:
+                                    sample_points.append(
+                                        {
+                                            "offset": int(probe.get("line_start") or 0),
+                                            "timestamp_dt": probe.get("timestamp_dt"),
+                                        }
+                                    )
+
+                            sample_points = sorted(sample_points, key=lambda item: item.get("offset") or 0)
+                            non_decreasing_pairs = 0
+                            comparable_pairs = 0
+                            previous_dt = None
+                            for sample in sample_points:
+                                current_dt = sample.get("timestamp_dt")
+                                if previous_dt is not None:
+                                    cmp_value = _compare_datetimes(previous_dt, current_dt)
+                                    if cmp_value is not None:
+                                        comparable_pairs += 1
+                                        if cmp_value <= 0:
+                                            non_decreasing_pairs += 1
+                                previous_dt = current_dt
+
+                            temporal_order_reliable = bool(
+                                comparable_pairs > 0
+                                and (non_decreasing_pairs * 100) >= (60 * comparable_pairs)
+                            )
+                            result["temporal_order_reliable"] = temporal_order_reliable
+                            if not temporal_order_reliable:
+                                result["truncated"] = True
+                                if not result.get("reason"):
+                                    result["reason"] = "TEMPORAL_ORDER_UNRELIABLE"
+                                if not result.get("temporal_inconclusive_reason"):
+                                    result["temporal_inconclusive_reason"] = "TEMPORAL_ORDER_UNRELIABLE"
+                            else:
+                                low = 0
+                                high = max(0, file_size - 1)
+                                best_probe = None
+                                attempted_offsets = set()
+                                attempt_cap = min(
+                                    max(1, temporal_seek_attempts),
+                                    max(1, source_scan_budget_bytes // 1024),
+                                )
+
+                                while low <= high and result["temporal_seek_attempts"] < attempt_cap:
+                                    middle = int((low + high) // 2)
+                                    if middle in attempted_offsets:
+                                        break
+                                    attempted_offsets.add(middle)
+
+                                    probe = _read_probe_record(binary_obj, middle, max_lines=8)
+                                    result["temporal_seek_attempts"] += 1
+                                    if probe is None:
+                                        break
+
+                                    probe_dt = probe.get("timestamp_dt")
+                                    if probe_dt is None:
+                                        if middle <= low:
+                                            low = min(high + 1, low + 1)
+                                        else:
+                                            low = min(high + 1, middle)
+                                        continue
+
+                                    cmp_open = _compare_datetimes(probe_dt, opened_at_dt)
+                                    if cmp_open is None:
+                                        continue
+                                    if cmp_open <= 0:
+                                        best_probe = probe
+                                        candidate_low = int(probe.get("line_end") or (middle + 1))
+                                        if candidate_low <= low:
+                                            candidate_low = low + 1
+                                        low = min(file_size, candidate_low)
+                                    else:
+                                        candidate_high = int(probe.get("line_start") or middle) - 1
+                                        if candidate_high >= high:
+                                            candidate_high = high - 1
+                                        high = max(0, candidate_high)
+
+                                if best_probe is None and sample_points:
+                                    closest = None
+                                    for sample in sample_points:
+                                        sample_dt = sample.get("timestamp_dt")
+                                        sample_dt_n, opened_at_n = _normalize_datetime_pair(sample_dt, opened_at_dt)
+                                        if sample_dt_n is None or opened_at_n is None:
+                                            continue
+                                        try:
+                                            distance = abs((sample_dt_n - opened_at_n).total_seconds())
+                                        except Exception:
+                                            continue
+                                        if closest is None or distance < closest.get("distance", float("inf")):
+                                            closest = {
+                                                "line_start": int(sample.get("offset") or 0),
+                                                "line_end": int(sample.get("offset") or 0),
+                                                "distance": distance,
+                                            }
+                                    if closest is not None:
+                                        best_probe = closest
+
+                                if best_probe is None:
+                                    result["truncated"] = True
+                                    if not result.get("reason"):
+                                        result["reason"] = "TEMPORAL_SEEK_UNAVAILABLE"
+                                    if not result.get("temporal_inconclusive_reason"):
+                                        result["temporal_inconclusive_reason"] = "TEMPORAL_SEEK_UNAVAILABLE"
+                                else:
+                                    center_offset = int(best_probe.get("line_start") or 0)
+                                    available_window_budget = max(
+                                        0,
+                                        temporal_window_budget_cap - int(result.get("bytes_scanned") or 0),
+                                    )
+                                    if available_window_budget <= 0:
+                                        result["truncated"] = True
+                                        if not result.get("reason"):
+                                            result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                                        if not result.get("temporal_inconclusive_reason"):
+                                            result["temporal_inconclusive_reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                                        window_bytes = 0
+                                    else:
+                                        window_bytes = min(file_size, available_window_budget)
+
+                                    if window_bytes <= 0:
+                                        window_byte_start = None
+                                        window_byte_end = None
+                                    else:
+                                        window_byte_start = max(0, center_offset - (window_bytes // 2))
+                                        window_byte_end = min(file_size, window_byte_start + window_bytes)
+                                        if (window_byte_end - window_byte_start) < window_bytes:
+                                            window_byte_start = max(0, window_byte_end - window_bytes)
+
+                                    result["temporal_window_byte_start"] = (
+                                        None if window_byte_start is None else int(window_byte_start)
+                                    )
+                                    result["temporal_window_byte_end"] = (
+                                        None if window_byte_end is None else int(window_byte_end)
+                                    )
+
+                                    if window_byte_start is None or window_byte_end is None:
+                                        window_byte_start = 0
+                                        window_byte_end = 0
+
+                                    binary_obj.seek(window_byte_start)
+                                    if window_byte_start > 0:
+                                        partial_start = binary_obj.tell()
+                                        discarded = binary_obj.readline()
+                                        partial_end = binary_obj.tell()
+                                        discarded_bytes = int(partial_end - partial_start)
+                                        if result["bytes_scanned"] + discarded_bytes > source_scan_budget_bytes:
+                                            result["truncated"] = True
+                                            if not result.get("reason"):
+                                                result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                                            if not result.get("temporal_inconclusive_reason"):
+                                                result["temporal_inconclusive_reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                                        else:
+                                            result["bytes_scanned"] += discarded_bytes
+                                            _append_byte_range(partial_start, partial_end)
+
+                                    parseable_timestamps_in_window = 0
+                                    reached_eof = False
+                                    covered_window_start = window_byte_start == 0
+                                    covered_window_end = False
+
+                                    while not result.get("truncated"):
+                                        line_start = binary_obj.tell()
+                                        if line_start >= window_byte_end:
+                                            break
+                                        raw_line = binary_obj.readline()
+                                        if not raw_line:
+                                            reached_eof = True
+                                            break
+                                        line_end = binary_obj.tell()
+                                        line_bytes = int(line_end - line_start)
+                                        if result["bytes_scanned"] + line_bytes > source_scan_budget_bytes:
+                                            result["truncated"] = True
+                                            if not result.get("reason"):
+                                                result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                                            if not result.get("temporal_inconclusive_reason"):
+                                                result["temporal_inconclusive_reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+                                            break
+                                        result["bytes_scanned"] += line_bytes
+                                        _append_byte_range(line_start, line_end)
+
+                                        text = raw_line.decode("utf-8", errors="ignore").strip()
+                                        if not text:
+                                            continue
+                                        parsed_offsets.add(int(line_start))
+
+                                        try:
+                                            record = json.loads(text)
+                                        except Exception:
+                                            result["malformed_record_count"] += 1
+                                            continue
+                                        if not isinstance(record, dict):
+                                            result["malformed_record_count"] += 1
+                                            continue
+
+                                        result["temporal_records_examined"] += 1
+                                        timestamp_value = _timestamp_from_record(record)
+                                        timestamp_dt = _trpsf_v1_stop_evidence_parse_timestamp(timestamp_value)
+
+                                        if timestamp_dt is not None:
+                                            parseable_timestamps_in_window += 1
+                                            cmp_start = _compare_datetimes(timestamp_dt, window_start_dt)
+                                            if cmp_start is not None and cmp_start <= 0:
+                                                covered_window_start = True
+                                            cmp_end = _compare_datetimes(timestamp_dt, window_end_dt)
+                                            if cmp_end is not None and cmp_end >= 0:
+                                                covered_window_end = True
+
+                                        if timestamp_dt is not None and covered_window_start:
+                                            cmp_window_end = _compare_datetimes(timestamp_dt, window_end_dt)
+                                            if cmp_window_end is not None and cmp_window_end > 0:
+                                                covered_window_end = True
+                                                break
+
+                                        if not _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
+                                            continue
+
+                                        extracted = _trpsf_v1_stop_evidence_extract_occurrences(
+                                            record,
+                                            source_file,
+                                            source_index=f"byte:{int(line_start)}",
+                                            line_number=None,
+                                            identity_tokens=identity_tokens,
+                                            raw_text=text,
+                                            byte_offset_start=int(line_start),
+                                            byte_offset_end=int(line_end),
+                                            scan_strategy="TEMPORAL_BINARY_SEEK_WINDOW",
+                                        )
+                                        result["occurrences"].extend(extracted.get("occurrences") or [])
+                                        result["rejected_events"].extend(extracted.get("rejected_events") or [])
+
+                                    if reached_eof:
+                                        covered_window_end = True
+
+                                    if parseable_timestamps_in_window <= 0:
+                                        result["truncated"] = True
+                                        if not result.get("reason"):
+                                            result["reason"] = "TEMPORAL_TIMESTAMP_UNPARSEABLE"
+                                        if not result.get("temporal_inconclusive_reason"):
+                                            result["temporal_inconclusive_reason"] = "TEMPORAL_TIMESTAMP_UNPARSEABLE"
+                                    elif not result.get("truncated") and covered_window_start and covered_window_end:
+                                        result["temporal_conclusive"] = True
+                                        if not result.get("reason"):
+                                            result["reason"] = "TEMPORAL_WINDOW_EXAMINED"
+                                    elif not result.get("truncated"):
+                                        result["truncated"] = True
+                                        if not result.get("reason"):
+                                            result["reason"] = "TEMPORAL_WINDOW_INCONCLUSIVE"
+                                        if not result.get("temporal_inconclusive_reason"):
+                                            result["temporal_inconclusive_reason"] = "TEMPORAL_WINDOW_INCONCLUSIVE"
+
+                                    remaining_tail_budget = max(
+                                        0,
+                                        source_scan_budget_bytes - int(result.get("bytes_scanned") or 0),
+                                    )
+                                    if (not result.get("temporal_conclusive")) and remaining_tail_budget > 0:
+                                        tail_size = min(remaining_tail_budget, tail_scan_bytes)
+                                        if tail_size > 0:
+                                            binary_obj.seek(0, 2)
+                                            tail_file_size = binary_obj.tell()
+                                            chunk_start = max(0, int(tail_file_size - tail_size))
+                                            binary_obj.seek(chunk_start)
+                                            chunk = binary_obj.read(tail_size)
+                                            chunk_bytes = len(chunk)
+                                            if chunk_bytes > 0:
+                                                result["bytes_scanned"] += chunk_bytes
+                                                _append_byte_range(chunk_start, chunk_start + chunk_bytes)
+                                                tail_lines = chunk.splitlines(keepends=True)
+                                                local_offset = 0
+                                                if chunk_start > 0 and tail_lines:
+                                                    local_offset += len(tail_lines[0])
+                                                    tail_lines = tail_lines[1:]
+                                                for raw_tail_line in tail_lines:
+                                                    line_start = int(chunk_start + local_offset)
+                                                    local_offset += len(raw_tail_line)
+                                                    line_end = int(chunk_start + local_offset)
+                                                    if line_start in parsed_offsets:
+                                                        continue
+                                                    text = raw_tail_line.decode("utf-8", errors="ignore").strip()
+                                                    if not text:
+                                                        continue
+                                                    parsed_offsets.add(line_start)
+                                                    if not _trpsf_v1_stop_evidence_line_should_parse(text, identity_tokens):
+                                                        if (text.startswith("{") and not text.endswith("}")) or (
+                                                            text.startswith("[") and not text.endswith("]")
+                                                        ):
+                                                            result["malformed_record_count"] += 1
+                                                        continue
+                                                    try:
+                                                        tail_record = json.loads(text)
+                                                    except Exception:
+                                                        result["malformed_record_count"] += 1
+                                                        continue
+                                                    if not isinstance(tail_record, dict):
+                                                        result["malformed_record_count"] += 1
+                                                        continue
+                                                    extracted_tail = _trpsf_v1_stop_evidence_extract_occurrences(
+                                                        tail_record,
+                                                        source_file,
+                                                        source_index=f"byte:{line_start}",
+                                                        line_number=None,
+                                                        identity_tokens=identity_tokens,
+                                                        raw_text=text,
+                                                        byte_offset_start=line_start,
+                                                        byte_offset_end=line_end,
+                                                        scan_strategy="TAIL_FALLBACK",
+                                                    )
+                                                    result["occurrences"].extend(extracted_tail.get("occurrences") or [])
+                                                    result["rejected_events"].extend(extracted_tail.get("rejected_events") or [])
+
+                    except Exception as exc:
+                        result["source_read_errors"].append(
+                            {
+                                "source_file": source_file,
+                                "error_type": type(exc).__name__,
+                                "message": str(exc),
+                            }
+                        )
         else:
             source_size = result.get("total_file_bytes")
             if source_size is not None and source_size > min(json_max_bytes, source_scan_budget_bytes):
@@ -51945,9 +52456,13 @@ def _trpsf_v1_stop_evidence_scan_file(
                     raw_text=None,
                     byte_offset_start=0,
                     byte_offset_end=None,
+                    scan_strategy="JSON_LOAD",
                 )
                 result["occurrences"].extend(extracted.get("occurrences") or [])
                 result["rejected_events"].extend(extracted.get("rejected_events") or [])
+            result["temporal_conclusive"] = bool(
+                not result.get("truncated") and not result.get("source_read_errors")
+            )
     except Exception as exc:
         result["source_read_errors"].append(
             {
@@ -51967,6 +52482,24 @@ def _trpsf_v1_stop_evidence_scan_file(
         result["truncated"] = True
         if not result.get("reason"):
             result["reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+        if not result.get("temporal_inconclusive_reason"):
+            result["temporal_inconclusive_reason"] = "SOURCE_SCAN_BUDGET_EXCEEDED"
+
+    if kind == "jsonl" and result.get("scan_strategy") == "TEMPORAL_BINARY_SEEK_WINDOW":
+        if result.get("temporal_conclusive") and not result.get("source_read_errors"):
+            result["truncated"] = False
+            if result.get("reason") in {
+                "SOURCE_SCAN_BUDGET_EXCEEDED",
+                "TEMPORAL_WINDOW_INCONCLUSIVE",
+                "TEMPORAL_TIMESTAMP_UNPARSEABLE",
+                "TEMPORAL_SEEK_UNAVAILABLE",
+                "TEMPORAL_ORDER_UNRELIABLE",
+            }:
+                result["reason"] = "TEMPORAL_WINDOW_EXAMINED"
+            result["temporal_inconclusive_reason"] = None
+        elif result.get("temporal_inconclusive_reason") and not result.get("reason"):
+            result["reason"] = result.get("temporal_inconclusive_reason")
+
     return result
 
 
@@ -52113,7 +52646,7 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
 
     candidate_paths = _trpsf_v1_stop_evidence_candidate_paths()
     source_scan_priority = [source_file for source_file, _source_path, _kind in candidate_paths]
-    stop_evidence_semantic_version = "STOP_EVIDENCE_V1.2.2"
+    stop_evidence_semantic_version = "STOP_EVIDENCE_V1.3"
 
     env_mod = None
     try:
@@ -52337,6 +52870,12 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
                 "source_scan_priority": list(source_scan_priority),
                 "max_source_scan_bytes": max_source_scan_bytes,
                 "max_total_scan_bytes": max_total_scan_bytes,
+                "lookback_seconds": int(scan_limits.get("lookback_seconds") or (6 * 60 * 60)),
+                "lookahead_seconds": int(scan_limits.get("lookahead_seconds") or (1 * 60 * 60)),
+                "temporal_seek_attempts": int(scan_limits.get("temporal_seek_attempts") or 24),
+                "temporal_window_max_bytes": int(
+                    scan_limits.get("temporal_window_max_bytes") or (16 * 1024 * 1024)
+                ),
             },
         }
 
@@ -52430,6 +52969,12 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         "total_scan_budget_exhausted": False,
         "source_scan_priority": source_scan_priority,
         "source_scan_stats": [],
+        "weak_evidence_total_count": 0,
+        "weak_evidence_outside_window_count": 0,
+        "weak_evidence_samples_truncated": False,
+        "temporal_scan_conclusive": False,
+        "temporal_relevant_source_count": 0,
+        "temporal_inconclusive_source_count": 0,
         "trade": {
             "trade_id": identity_tokens.get("trade_id"),
             "client_order_id": identity_tokens.get("client_order_id"),
@@ -52516,6 +53061,9 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
     }
 
     remaining_total_budget = max_total_scan_bytes
+    temporal_relevant_sources = 0
+    temporal_conclusive_sources = 0
+    temporal_inconclusive_sources = 0
 
     for source_file, source_path, kind in candidate_paths:
         source_path_obj = Path(source_path)
@@ -52531,18 +53079,27 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
                     "scan_truncated": False,
                     "byte_ranges_examined": [],
                     "reason": "SOURCE_NOT_FOUND",
+                    "temporal_seek_used": False,
+                    "temporal_seek_attempts": 0,
+                    "temporal_window_start": None,
+                    "temporal_window_end": None,
+                    "temporal_window_byte_start": None,
+                    "temporal_window_byte_end": None,
+                    "temporal_order_reliable": None,
+                    "temporal_records_examined": 0,
                 }
             )
             continue
 
+        total_file_bytes = None
+        try:
+            total_file_bytes = int(source_path_obj.stat().st_size)
+        except Exception:
+            total_file_bytes = None
+
         if remaining_total_budget <= 0:
             payload["scan_truncated"] = True
             payload["total_scan_budget_exhausted"] = True
-            total_file_bytes = None
-            try:
-                total_file_bytes = int(source_path_obj.stat().st_size)
-            except Exception:
-                total_file_bytes = None
             payload["source_scan_stats"].append(
                 {
                     "source_file": source_file,
@@ -52553,6 +53110,14 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
                     "scan_truncated": True,
                     "byte_ranges_examined": [],
                     "reason": "TOTAL_SCAN_BUDGET_EXHAUSTED",
+                    "temporal_seek_used": False,
+                    "temporal_seek_attempts": 0,
+                    "temporal_window_start": None,
+                    "temporal_window_end": None,
+                    "temporal_window_byte_start": None,
+                    "temporal_window_byte_end": None,
+                    "temporal_order_reliable": None,
+                    "temporal_records_examined": 0,
                 }
             )
             payload["source_read_errors"].append(
@@ -52577,6 +53142,31 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         payload["rejected_events"].extend(scan_result.get("rejected_events") or [])
         payload["malformed_record_count"] += int(scan_result.get("malformed_record_count") or 0)
         payload["source_read_errors"].extend(scan_result.get("source_read_errors") or [])
+
+        source_is_temporal_relevant = bool(
+            kind == "jsonl"
+            and isinstance(total_file_bytes, int)
+            and total_file_bytes > source_scan_budget_bytes
+        )
+        if source_is_temporal_relevant:
+            temporal_relevant_sources += 1
+            if scan_result.get("temporal_conclusive"):
+                temporal_conclusive_sources += 1
+            else:
+                temporal_inconclusive_sources += 1
+                inconclusive_reason = (
+                    scan_result.get("temporal_inconclusive_reason")
+                    or scan_result.get("reason")
+                    or "TEMPORAL_INCONCLUSIVE"
+                )
+                payload["source_read_errors"].append(
+                    {
+                        "source_file": source_file,
+                        "error_type": inconclusive_reason,
+                        "message": "temporal scan was inconclusive for this source",
+                    }
+                )
+
         payload["scan_truncated"] = bool(payload["scan_truncated"] or scan_result.get("truncated"))
         scanned_from_source = int(scan_result.get("bytes_scanned") or 0)
         if scanned_from_source < 0:
@@ -52597,6 +53187,14 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
                 "scan_truncated": bool(scan_result.get("truncated")),
                 "byte_ranges_examined": scan_result.get("byte_ranges_examined") or [],
                 "reason": scan_result.get("reason"),
+                "temporal_seek_used": bool(scan_result.get("temporal_seek_used")),
+                "temporal_seek_attempts": int(scan_result.get("temporal_seek_attempts") or 0),
+                "temporal_window_start": scan_result.get("temporal_window_start"),
+                "temporal_window_end": scan_result.get("temporal_window_end"),
+                "temporal_window_byte_start": scan_result.get("temporal_window_byte_start"),
+                "temporal_window_byte_end": scan_result.get("temporal_window_byte_end"),
+                "temporal_order_reliable": scan_result.get("temporal_order_reliable"),
+                "temporal_records_examined": int(scan_result.get("temporal_records_examined") or 0),
             }
         )
         if isinstance(scan_result.get("limits"), dict):
@@ -52607,10 +53205,54 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
         or payload.get("total_scan_budget_remaining_bytes", 0) <= 0
     )
 
+    temporal_scan_conclusive = bool(
+        temporal_relevant_sources == 0
+        or temporal_conclusive_sources == temporal_relevant_sources
+    )
+    temporal_scan_inconclusive = bool(temporal_inconclusive_sources > 0)
+    payload["temporal_scan_conclusive"] = temporal_scan_conclusive
+    payload["temporal_relevant_source_count"] = temporal_relevant_sources
+    payload["temporal_inconclusive_source_count"] = temporal_inconclusive_sources
+
+    evidence_items = list(payload.get("evidence") or [])
+    filtered_evidence = []
+    weak_total_count = 0
+    weak_outside_window_count = 0
+    weak_outside_samples_kept = 0
+
+    for evidence_item in evidence_items:
+        strength = evidence_item.get("correlation_strength")
+        if strength == "WEAK":
+            weak_total_count += 1
+
+        weak_outside_window = bool(
+            strength == "WEAK"
+            and evidence_item.get("temporal_within_priority_window") is False
+        )
+        if weak_outside_window:
+            weak_outside_window_count += 1
+            if weak_outside_samples_kept < 10:
+                filtered_evidence.append(evidence_item)
+                weak_outside_samples_kept += 1
+            continue
+
+        filtered_evidence.append(evidence_item)
+
+    payload["evidence"] = filtered_evidence
+    payload["weak_evidence_total_count"] = weak_total_count
+    payload["weak_evidence_outside_window_count"] = weak_outside_window_count
+    payload["weak_evidence_samples_truncated"] = bool(
+        weak_outside_window_count > weak_outside_samples_kept
+    )
+
     initial_candidates = [
         item
         for item in (payload.get("evidence") or [])
         if item.get("classification") == "INITIAL_STOP_CANDIDATE"
+        and not (
+            item.get("correlation_strength") == "WEAK"
+            and item.get("temporal_within_priority_window") is False
+        )
     ]
     all_initial_numeric_groups = {}
     for item in initial_candidates:
@@ -52650,7 +53292,16 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
     exit_price = _trpsf_v1_stop_evidence_numeric(trade.get("exit_price"))
     side_value = str(trade.get("side") or "").upper().strip()
 
+    if (
+        temporal_scan_conclusive
+        and temporal_relevant_sources > 0
+        and not payload.get("total_scan_budget_exhausted")
+    ):
+        payload["scan_truncated"] = False
+
     blocking_source_error = bool(payload.get("source_read_errors")) or bool(payload.get("scan_truncated"))
+    if temporal_scan_inconclusive:
+        blocking_source_error = True
 
     factual_candidate = None
     if len(strong_initial_groups) == 1:
@@ -52720,7 +53371,9 @@ def _trpsf_v1_closed_trade_stop_evidence_v1(identity=None, registry_index=None):
                 if denominator > 0:
                     payload["comparison"]["current_stop_hypothesis_gross_r"] = (exit_price - entry) / denominator
 
-    if blocking_source_error and not payload.get("factual_initial_stop_found"):
+    if temporal_scan_inconclusive and not payload.get("factual_initial_stop_found"):
+        payload["status"] = "STOP_EVIDENCE_SOURCE_READ_ERROR"
+    elif blocking_source_error and not payload.get("factual_initial_stop_found"):
         payload["status"] = "STOP_EVIDENCE_SOURCE_READ_ERROR"
     elif len(strong_initial_groups) > 1:
         payload["status"] = "STOP_EVIDENCE_CONFLICTING_INITIAL_STOPS"
@@ -52781,6 +53434,12 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
         f"total_scan_budget_exhausted={payload.get('total_scan_budget_exhausted')}",
         f"source_scan_priority={payload.get('source_scan_priority')}",
         f"source_scan_stats={payload.get('source_scan_stats')}",
+        f"temporal_scan_conclusive={payload.get('temporal_scan_conclusive')}",
+        f"temporal_relevant_source_count={payload.get('temporal_relevant_source_count')}",
+        f"temporal_inconclusive_source_count={payload.get('temporal_inconclusive_source_count')}",
+        f"weak_evidence_total_count={payload.get('weak_evidence_total_count')}",
+        f"weak_evidence_outside_window_count={payload.get('weak_evidence_outside_window_count')}",
+        f"weak_evidence_samples_truncated={payload.get('weak_evidence_samples_truncated')}",
         f"cache_hit={payload.get('cache_hit')}",
         f"cache_age_seconds={payload.get('cache_age_seconds')}",
         f"cache_ttl_seconds={payload.get('cache_ttl_seconds')}",
@@ -52799,6 +53458,7 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
                 f"rejected_line_number={rejection.get('line_number')} "
                 f"rejected_byte_offset_start={rejection.get('byte_offset_start')} "
                 f"rejected_byte_offset_end={rejection.get('byte_offset_end')} "
+                f"rejected_scan_strategy={rejection.get('scan_strategy')} "
                 f"rejection_reason={rejection.get('rejection_reason')} "
                 f"identity_match_fields={rejection.get('identity_match_fields')} "
                 f"identity_mismatch_fields={rejection.get('identity_mismatch_fields')}"
@@ -52814,6 +53474,7 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
                 f"line_number={item.get('line_number')} "
                 f"byte_offset_start={item.get('byte_offset_start')} "
                 f"byte_offset_end={item.get('byte_offset_end')} "
+                f"scan_strategy={item.get('scan_strategy')} "
                 f"event_type={item.get('event_type')} "
                 f"timestamp={item.get('timestamp')} "
                 f"path={item.get('path')} "
@@ -52827,6 +53488,7 @@ def build_trade_registry_closed_identity_stop_evidence_v1_text():
                 f"identity_absent_in_event_fields={item.get('identity_absent_in_event_fields')} "
                 f"event_phase={item.get('event_phase')} "
                 f"temporal_relation={item.get('temporal_relation')} "
+                f"temporal_within_priority_window={item.get('temporal_within_priority_window')} "
                 f"evidence_reason={item.get('evidence_reason')}"
             )
         )
