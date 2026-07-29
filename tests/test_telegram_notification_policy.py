@@ -3,10 +3,13 @@ from __future__ import annotations
 import ast
 import builtins
 import copy
+import os
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from flask import Flask
 
 import telegram_notification_policy as policy
 
@@ -782,6 +785,7 @@ def test_health_route_uses_light_projection_and_is_forbidden_from_heavy_paths():
         "CENTRAL_HEALTH": {
             "started_at": "2026-07-27 12:00:00",
             "started_epoch": 1000.0,
+            "memory_mb": 64.0,
             "watchdog_status": "OK",
             "watchdog_last_status": "UPDATED_OK",
         },
@@ -845,7 +849,7 @@ def test_health_route_uses_light_projection_and_is_forbidden_from_heavy_paths():
         "redis": forbidden("redis"),
         "socket": forbidden("socket"),
         "requests": forbidden("requests"),
-        "current_rss_mb": lambda: 64.0,
+        "current_rss_mb": forbidden("current_rss_mb"),
         "EXECUTION_MODE": "PAPER",
         "ENABLE_REAL_TRADING": "false",
         "CENTRAL_TELEGRAM_BOT_TOKEN": "token",
@@ -878,5 +882,112 @@ def test_health_route_uses_light_projection_and_is_forbidden_from_heavy_paths():
     assert result["trade_registry"]["include_trades"] is False
     assert result["trade_registry"]["health_light"] is True
     assert result["uptime_seconds"] == 30.0
+    assert result["current_rss_mb"] == 64.0
     assert result["telegram_paper_auto_notifications_enabled"] is False
+    assert forbidden_calls == []
+
+
+def test_health_request_context_never_reads_closed_trades_or_calls_heavy_dependencies(
+    monkeypatch,
+):
+    forbidden_calls = []
+    registry_calls = []
+
+    def forbidden(name):
+        return lambda *args, **kwargs: (
+            forbidden_calls.append(name) or pytest.fail(
+                f"forbidden health dependency was called: {name}"
+            )
+        )
+
+    namespace = {
+        "BOT_CONFIGS": {
+            "FALCON": {"enabled_env": "FALCON_ENABLED", "name": "Falcon"},
+        },
+        "LOAD_ERRORS": {},
+        "WATCHDOG_THRESHOLD_MINUTES": 30,
+        "CENTRAL_HEALTH": {
+            "started_at": "2026-07-28 12:00:00",
+            "started_epoch": 1000.0,
+            "memory_mb": 64.0,
+            "watchdog_last_status": "OK",
+        },
+        "time": SimpleNamespace(time=lambda: 1015.0),
+        "light_bot_health": lambda key, cfg: {
+            "name": cfg["name"],
+            "enabled": True,
+            "loaded": True,
+            "health": {},
+            "minutes_since_scanner": 0,
+            "minutes_since_management": 0,
+        },
+        "central_trade_registry_snapshot": lambda **kwargs: registry_calls.append(
+            kwargs
+        )
+        or {"ok": True, "read_only_snapshot": True},
+        "automatic_daily_summaries_health": lambda: {},
+        "central_daily_scheduler_health": lambda: {},
+        "telegram_notification_policy_health": lambda: {
+            "telegram_reports_only_enabled": True,
+            "telegram_paper_auto_notifications_enabled": False,
+        },
+        "automatic_learning_refresh_health": lambda **kwargs: {},
+        "LEARNING_AUTO_REFRESH_SECONDS": 900,
+        "LEARNING_AUTO_REFRESH_MIN_SECONDS": 300,
+        "LEARNING_AUTO_REFRESH_THREAD_STARTED": False,
+        "LEARNING_AUTO_REFRESH_LEGACY_ENABLED": True,
+        "build_disk_forensics_health": lambda _cached: {},
+        "STARTUP_DISK_FORENSICS_RESULT": {},
+        "build_timeline_emergency_recovery_health": lambda _cached: {},
+        "TIMELINE_EMERGENCY_RECOVERY_RESULT": {},
+        "EXECUTION_MODE": "PAPER",
+        "ENABLE_REAL_TRADING": False,
+        "CENTRAL_TELEGRAM_BOT_TOKEN": None,
+        "CENTRAL_TELEGRAM_CHAT_ID": None,
+        "CENTRAL_TELEGRAM_POLLING_ENABLED": False,
+        "CENTRAL_TELEGRAM_ROUTER_STARTED": False,
+        "central_watchdog_status": forbidden("central_watchdog_status"),
+        "bot_health": forbidden("bot_health"),
+        "history_manager": forbidden("history_manager"),
+        "load_events": forbidden("load_events"),
+        "iter_jsonl_tail": forbidden("iter_jsonl_tail"),
+        "load_registry": forbidden("load_registry"),
+        "predator_pnl_paper_audit": forbidden("predator_pnl_paper_audit"),
+        "predator_source_collection": forbidden("predator_source_collection"),
+        "current_rss_mb": forbidden("current_rss_mb"),
+        "redis": forbidden("redis"),
+        "Redis": forbidden("Redis"),
+        "broker": forbidden("broker"),
+        "Broker": forbidden("Broker"),
+        "requests": forbidden("requests"),
+    }
+
+    namespace["build_central_health_light_payload"] = _compile_main_function(
+        "build_central_health_light_payload", namespace
+    )
+    health = _compile_main_function("health", namespace)
+    app = Flask("health-light-request-context")
+    app.add_url_rule("/health", view_func=health)
+
+    def forbidden_open(*args, **kwargs):
+        forbidden_calls.append("open")
+        pytest.fail("GET /health attempted to open a file")
+
+    monkeypatch.setattr(builtins, "open", forbidden_open)
+    monkeypatch.setattr(os, "open", forbidden_open)
+    monkeypatch.setattr(socket, "socket", forbidden("socket"))
+    monkeypatch.setattr(socket, "create_connection", forbidden("socket"))
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden("socket"))
+
+    response = app.test_client().get("/health")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["health_profile"] == "LIGHT"
+    assert payload["heavy_audits_executed"] is False
+    assert payload["history_files_read"] is False
+    assert payload["current_rss_mb"] == 64.0
+    assert payload["telegram_reports_only_enabled"] is True
+    assert payload["telegram_paper_auto_notifications_enabled"] is False
+    assert registry_calls == [{"include_trades": False, "health_light": True}]
     assert forbidden_calls == []

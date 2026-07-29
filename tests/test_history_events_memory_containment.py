@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from flask import Flask
 
 import history_memory_guard as guard
 
@@ -278,6 +279,53 @@ def test_probe_logs_begin_and_end(tmp_path, capsys):
     assert "HISTORY_MEMORY_BEGIN operation=test_probe" in output
     assert "HISTORY_MEMORY_END operation=test_probe" in output
     assert "records=1" in output
+
+
+def test_forensics_log_distinguishes_request_route_from_background_read(tmp_path, capsys):
+    path = tmp_path / "closed_trades.jsonl"
+    _write(path, [{"id": 1}])
+    app = Flask("history-read-forensics")
+
+    @app.route("/forensics/closed-trades")
+    def closed_trades_forensics_route():
+        guard.iter_jsonl_tail(
+            path,
+            10,
+            1024,
+            operation="history_manager:closed_trades.jsonl",
+        )
+        return {"ok": True}
+
+    response = app.test_client().get("/forensics/closed-trades")
+    assert response.status_code == 200
+    guard.iter_jsonl_tail(
+        path,
+        10,
+        1024,
+        operation="history_manager:closed_trades.jsonl",
+    )
+
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("HISTORY_MEMORY_FORENSICS")
+    ]
+    request_line = next(
+        line for line in lines if "route_endpoint=closed_trades_forensics_route" in line
+    )
+    background_line = next(line for line in lines if "route_endpoint=NONE" in line)
+
+    for line in (request_line, background_line):
+        assert "timestamp=" in line
+        assert "thread=" in line
+        assert "caller=" in line
+        assert "stack=" in line
+        assert "operation=history_manager:closed_trades.jsonl" in line
+        assert "records=1" in line
+        assert "partial=False" in line
+        assert "duration_ms=" in line
+    assert "route_path=/forensics/closed-trades" in request_line
+    assert "route_path=NONE" in background_line
 
 
 def test_probe_logs_error(capsys):

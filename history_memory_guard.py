@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -39,6 +40,48 @@ def _safe_log(message):
         pass
 
 
+def _history_read_forensics():
+    """Capture only request attribution metadata for a bounded history read."""
+    details = {
+        "timestamp": round(time.time(), 3),
+        "thread": threading.current_thread().name,
+        "route_endpoint": None,
+        "route_path": None,
+        "caller": None,
+        "stack": [],
+    }
+    try:
+        flask_module = sys.modules.get("flask")
+        has_request_context = getattr(flask_module, "has_request_context", None)
+        request = getattr(flask_module, "request", None)
+        if callable(has_request_context) and has_request_context() and request is not None:
+            details["route_endpoint"] = request.endpoint
+            details["route_path"] = request.path
+    except Exception:
+        pass
+
+    try:
+        frame = sys._getframe(1)
+        while frame is not None and len(details["stack"]) < 6:
+            module_name = str(frame.f_globals.get("__name__") or "UNKNOWN")
+            function_name = str(frame.f_code.co_name or "UNKNOWN")
+            if module_name != __name__:
+                label = f"{module_name}.{function_name}"
+                details["stack"].append(label)
+                if details["caller"] is None:
+                    details["caller"] = label
+            frame = frame.f_back
+    except Exception:
+        pass
+    return details
+
+
+def _forensics_value(value):
+    if value is None or value == "":
+        return "NONE"
+    return str(value).replace(" ", "_")
+
+
 class _HistoryMemoryProbe:
     def __init__(self, operation, path=None):
         self.operation = str(operation or "history_read")
@@ -47,6 +90,7 @@ class _HistoryMemoryProbe:
         self.rss_before = None
         self.records = 0
         self.partial = None
+        self.forensics = _history_read_forensics()
 
     def __enter__(self):
         self.started = time.perf_counter()
@@ -83,6 +127,17 @@ class _HistoryMemoryProbe:
             "HISTORY_MEMORY_END"
             f" operation={self.operation} rss_mb={rss_after} delta_mb={delta}"
             f" records={self.records} partial={self.partial} duration_ms={duration_ms}"
+        )
+        _safe_log(
+            "HISTORY_MEMORY_FORENSICS"
+            f" timestamp={_forensics_value(self.forensics.get('timestamp'))}"
+            f" thread={_forensics_value(self.forensics.get('thread'))}"
+            f" route_endpoint={_forensics_value(self.forensics.get('route_endpoint'))}"
+            f" route_path={_forensics_value(self.forensics.get('route_path'))}"
+            f" caller={_forensics_value(self.forensics.get('caller'))}"
+            f" stack={_forensics_value('>'.join(self.forensics.get('stack') or []))}"
+            f" operation={self.operation} records={self.records}"
+            f" partial={self.partial} duration_ms={duration_ms}"
         )
         return False
 

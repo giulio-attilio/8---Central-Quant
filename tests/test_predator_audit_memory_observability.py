@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,13 @@ def test_current_process_rss_is_available_on_supported_host():
 
 def test_probe_and_stage_emit_structured_memory_contract(monkeypatch, capsys):
     values = iter([100.0, 101.0, 104.0, 103.0])
-    monkeypatch.setattr(observability, "current_rss_mb", lambda: next(values))
+
+    def fake_current_rss_mb():
+        if threading.current_thread() is not threading.main_thread():
+            return None
+        return next(values)
+
+    monkeypatch.setattr(observability, "current_rss_mb", fake_current_rss_mb)
 
     with observability.predator_audit_probe("audit", limit=10):
         with observability.predator_audit_stage("audit", "load_registry", records_in=2) as stage:

@@ -2726,6 +2726,9 @@ def build_central_health_light_payload():
         payload["uptime_seconds"] = None
         payload["uptime_minutes"] = None
         payload["uptime_hours"] = None
+    payload["current_rss_mb"] = central_health_state.get(
+        "current_rss_mb", central_health_state.get("memory_mb")
+    )
     return payload
 
 
@@ -14767,8 +14770,7 @@ def health():
     payload["registry_reloaded"] = False
     payload["write_executed"] = False
     payload["central_started_at"] = payload.get("central_started_at")
-    rss_reader = globals().get("current_rss_mb")
-    payload["current_rss_mb"] = rss_reader() if callable(rss_reader) else None
+    payload["current_rss_mb"] = payload.get("current_rss_mb")
     payload["execution_mode"] = globals().get("EXECUTION_MODE")
     real_trading_value = globals().get("ENABLE_REAL_TRADING")
     payload["real_trading_enabled"] = (
