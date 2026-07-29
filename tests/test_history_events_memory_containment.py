@@ -350,7 +350,7 @@ def test_health_and_root_succeed_when_history_reader_would_raise():
     nodes = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
     namespace = {
         "central_watchdog_status": lambda: {"ok": True},
-        "central_trade_registry_snapshot": lambda include_trades=False: {"ok": True},
+        "central_trade_registry_snapshot": lambda include_trades=False, **_kwargs: {"ok": True},
         "automatic_daily_summaries_health": lambda: {},
         "automatic_learning_refresh_health": lambda **kwargs: {},
         "LEARNING_AUTO_REFRESH_SECONDS": 900,

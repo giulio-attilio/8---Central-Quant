@@ -696,7 +696,7 @@ def test_main_health_uses_cached_projection_without_scan():
     calls = []
     namespace = {
         "central_watchdog_status": lambda: {"ok": True},
-        "central_trade_registry_snapshot": lambda include_trades=False: {},
+        "central_trade_registry_snapshot": lambda include_trades=False, **_kwargs: {},
         "automatic_daily_summaries_health": lambda: {},
         "automatic_learning_refresh_health": lambda **kwargs: {},
         "LEARNING_AUTO_REFRESH_SECONDS": 900,

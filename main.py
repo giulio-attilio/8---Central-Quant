@@ -1550,6 +1550,9 @@ CENTRAL_MONTHLY_REPORT_TIME = os.environ.get("CENTRAL_MONTHLY_REPORT_TIME", "00:
 # Telegram limita mensagens em ~4096 caracteres. Mantemos margem para cabeçalhos.
 TELEGRAM_CHUNK_SIZE = int(os.environ.get("TELEGRAM_CHUNK_SIZE", "2600"))
 TELEGRAM_LONG_COMMAND_NOTICE = env_bool("TELEGRAM_LONG_COMMAND_NOTICE", True)
+TELEGRAM_MANUAL_COMMANDS_ENABLED = env_bool("TELEGRAM_MANUAL_COMMANDS_ENABLED", False)
+TELEGRAM_REPORTS_ONLY_ENABLED = not TELEGRAM_MANUAL_COMMANDS_ENABLED
+TELEGRAM_REPORTS_ONLY_BLOCK_MESSAGE = "Comandos manuais do Telegram estão desativados. Use as rotas HTTP da Central."
 
 # Proteções contra respostas duplicadas no Telegram da Central.
 # DROP_PENDING evita reprocessar comandos antigos depois de deploy/restart.
@@ -2399,6 +2402,14 @@ def light_bot_health(key: str, cfg: dict):
         if value is None or isinstance(value, (bool, int, float, str))
     }
     health["last_warning"] = clean_operational_warning(health.get("last_warning"))
+    for field in (
+        "mode",
+        "execution_mode",
+        "enable_real_trading",
+        "last_positions_count",
+        "disaster_stop_summary",
+    ):
+        health[field] = raw_health.get(field)
     return {
         "name": cfg["name"],
         "enabled": env_bool(cfg["enabled_env"], default=False),
@@ -2407,6 +2418,12 @@ def light_bot_health(key: str, cfg: dict):
         "chat_configured": bool(os.environ.get(cfg["chat_env"])),
         "load_error": LOAD_ERRORS.get(key),
         "health": health,
+        "mode": health.get("mode"),
+        "execution_mode": health.get("execution_mode"),
+        "enable_real_trading": health.get("enable_real_trading"),
+        "last_positions_count": health.get("last_positions_count"),
+        "disaster_stop_summary": health.get("disaster_stop_summary"),
+        "watchdog_status": health.get("watchdog_status"),
         "last_scanner_run": health.get("last_scanner_run"),
         "last_management_run": health.get("last_management_run"),
         "last_error": health.get("last_error"),
@@ -2622,6 +2639,94 @@ def central_watchdog_status():
     }
     memory_profile_step("after_watchdog_status")
     return result
+
+
+def build_central_health_light_payload():
+    central_health_state = globals().get("CENTRAL_HEALTH")
+    if not isinstance(central_health_state, dict):
+        central_health_state = {}
+    bot_health_fn = globals().get("light_bot_health")
+    bot_configurations = globals().get("BOT_CONFIGS")
+    if not isinstance(bot_configurations, dict):
+        bot_configurations = {}
+    load_errors = globals().get("LOAD_ERRORS")
+    if not isinstance(load_errors, dict):
+        load_errors = {}
+
+    if not callable(bot_health_fn):
+        def bot_health_fn(key, cfg):
+            module = globals().get("LOADED_BOTS", {}).get(key)
+            module = module if module is not None else None
+            if isinstance(module, object) and key in load_errors:
+                load_error = load_errors.get(key)
+            elif isinstance(cfg, dict):
+                load_error = None
+            else:
+                load_error = "INVALID_BOT_CONFIG"
+            return {
+                "name": cfg.get("name") if isinstance(cfg, dict) else key,
+                "enabled": False if not isinstance(cfg, dict) else env_bool(cfg.get("enabled_env", ""), default=False),
+                "loaded": module is not None,
+                "load_error": load_error,
+            }
+
+    reasons = []
+    bots = {}
+    for key, cfg in bot_configurations.items():
+        bot_payload = bot_health_fn(key, cfg)
+        bots[key] = bot_payload
+
+        if not bot_payload.get("enabled"):
+            continue
+
+        if not bot_payload.get("loaded"):
+            reasons.append(f"{key}: não carregado ({bot_payload.get('load_error')})")
+            continue
+
+        health = bot_payload.get("health")
+        if isinstance(health, dict):
+            last_error = health.get("last_error")
+            if last_error and not is_benign_bingx_quote_error(last_error):
+                reasons.append(f"{key}: last_error={last_error}")
+
+            ms = bot_payload.get("minutes_since_scanner")
+            mm = bot_payload.get("minutes_since_management")
+            if ms is not None and ms > WATCHDOG_THRESHOLD_MINUTES:
+                reasons.append(f"{key}: scanner parado há {ms} min")
+            if mm is not None and mm > WATCHDOG_THRESHOLD_MINUTES:
+                reasons.append(f"{key}: gestão parada há {mm} min")
+
+    started_epoch = 0.0
+    try:
+        started_epoch = float(central_health_state.get("started_epoch") or 0.0)
+    except (TypeError, ValueError):
+        started_epoch = 0.0
+    payload = {
+        "ok": len(reasons) == 0,
+        "status": "OK" if len(reasons) == 0 else "ALERTA",
+        "central_started_at": central_health_state.get("central_started_at") or central_health_state.get("started_at"),
+        "threshold_minutes": WATCHDOG_THRESHOLD_MINUTES,
+        "reasons": reasons,
+        "bots": bots,
+        "watchdog_status": central_health_state.get("watchdog_last_status", central_health_state.get("watchdog_status", "UNKNOWN")),
+        "watchdog_last_status": central_health_state.get("watchdog_last_status"),
+    }
+    if started_epoch:
+        time_module = globals().get("time")
+        if time_module is not None and callable(getattr(time_module, "time", None)):
+            uptime_seconds = max(0.0, float(time_module.time()) - started_epoch)
+            payload["uptime_seconds"] = round(uptime_seconds, 2)
+            payload["uptime_minutes"] = round(uptime_seconds / 60.0, 2)
+            payload["uptime_hours"] = round(uptime_seconds / 3600.0, 2)
+        else:
+            payload["uptime_seconds"] = None
+            payload["uptime_minutes"] = None
+            payload["uptime_hours"] = None
+    else:
+        payload["uptime_seconds"] = None
+        payload["uptime_minutes"] = None
+        payload["uptime_hours"] = None
+    return payload
 
 
 def send_central_alert(message: str):
@@ -14571,8 +14676,104 @@ def trade_registry_health_route():
 
 @app.route("/health")
 def health():
-    payload = central_watchdog_status()
-    payload["trade_registry"] = central_trade_registry_snapshot(include_trades=False)
+    light_payload_builder = globals().get("build_central_health_light_payload")
+    if callable(light_payload_builder):
+        payload = light_payload_builder()
+    else:
+        central_health_state = globals().get("CENTRAL_HEALTH")
+        if not isinstance(central_health_state, dict):
+            central_health_state = {}
+        bot_health_fn = globals().get("light_bot_health")
+        if not callable(bot_health_fn):
+            bot_health_fn = lambda *_args, **_kwargs: {
+                "name": "unknown",
+                "enabled": False,
+                "loaded": False,
+                "load_error": "light_health_payload_unavailable",
+            }
+        bot_configurations = globals().get("BOT_CONFIGS")
+        if not isinstance(bot_configurations, dict):
+            bot_configurations = {}
+        reasons = []
+        bots = {}
+        for key, cfg in bot_configurations.items():
+            try:
+                bot_payload = bot_health_fn(key, cfg)
+            except Exception as exc:
+                bot_payload = {
+                    "name": cfg.get("name") if isinstance(cfg, dict) else key,
+                    "enabled": False,
+                    "loaded": False,
+                    "load_error": str(exc),
+                }
+            bots[key] = bot_payload
+        started_epoch = 0.0
+        time_module = globals().get("time")
+        uptime_seconds = None
+        try:
+            started_epoch = float(central_health_state.get("started_epoch") or 0.0)
+        except (TypeError, ValueError):
+            started_epoch = 0.0
+        if started_epoch and time_module is not None and callable(
+            getattr(time_module, "time", None)
+        ):
+            uptime_seconds = round(
+                max(0.0, float(time_module.time()) - started_epoch), 2
+            )
+            payload = {
+                "ok": len(reasons) == 0,
+                "status": "OK" if len(reasons) == 0 else "ALERTA",
+                "central_started_at": central_health_state.get("central_started_at")
+                or central_health_state.get("started_at"),
+                "threshold_minutes": globals().get("WATCHDOG_THRESHOLD_MINUTES"),
+                "reasons": reasons,
+                "bots": bots,
+                "watchdog_status": central_health_state.get(
+                    "watchdog_last_status",
+                    central_health_state.get("watchdog_status", "UNKNOWN"),
+                ),
+                "watchdog_last_status": central_health_state.get("watchdog_last_status"),
+                "uptime_seconds": uptime_seconds,
+                "uptime_minutes": round(uptime_seconds / 60.0, 2),
+                "uptime_hours": round(uptime_seconds / 3600.0, 2),
+            }
+        else:
+            payload = {
+                "ok": len(reasons) == 0,
+                "status": "OK" if len(reasons) == 0 else "ALERTA",
+                "central_started_at": central_health_state.get("central_started_at")
+                or central_health_state.get("started_at"),
+                "threshold_minutes": globals().get("WATCHDOG_THRESHOLD_MINUTES"),
+                "reasons": reasons,
+                "bots": bots,
+                "watchdog_status": central_health_state.get(
+                    "watchdog_last_status",
+                    central_health_state.get("watchdog_status", "UNKNOWN"),
+                ),
+                "watchdog_last_status": central_health_state.get("watchdog_last_status"),
+                "uptime_seconds": None,
+                "uptime_minutes": None,
+                "uptime_hours": None,
+            }
+    payload["health_profile"] = "LIGHT"
+    payload["trade_registry"] = central_trade_registry_snapshot(
+        include_trades=False,
+        health_light=True,
+    )
+    payload["heavy_audits_executed"] = False
+    payload["history_files_read"] = False
+    payload["redis_called"] = False
+    payload["broker_called"] = False
+    payload["registry_reloaded"] = False
+    payload["write_executed"] = False
+    payload["central_started_at"] = payload.get("central_started_at")
+    rss_reader = globals().get("current_rss_mb")
+    payload["current_rss_mb"] = rss_reader() if callable(rss_reader) else None
+    payload["execution_mode"] = globals().get("EXECUTION_MODE")
+    real_trading_value = globals().get("ENABLE_REAL_TRADING")
+    payload["real_trading_enabled"] = (
+        bool(real_trading_value) if real_trading_value is not None else None
+    )
     payload.update(automatic_daily_summaries_health())
     daily_scheduler_health_fn = globals().get("central_daily_scheduler_health")
     if callable(daily_scheduler_health_fn):
@@ -14581,6 +14782,22 @@ def health():
             payload.update(daily_scheduler_health)
     if callable(globals().get("telegram_notification_policy_health")):
         payload.update(telegram_notification_policy_health())
+    payload.update(
+        {
+            "telegram_token_configured": bool(
+                globals().get("CENTRAL_TELEGRAM_BOT_TOKEN")
+            ),
+            "telegram_chat_configured": bool(
+                globals().get("CENTRAL_TELEGRAM_CHAT_ID")
+            ),
+            "telegram_polling_enabled": bool(
+                globals().get("CENTRAL_TELEGRAM_POLLING_ENABLED", False)
+            ),
+            "telegram_router_running": bool(
+                globals().get("CENTRAL_TELEGRAM_ROUTER_STARTED", False)
+            ),
+        }
+    )
     payload.update(
         automatic_learning_refresh_health(
             interval_seconds=max(LEARNING_AUTO_REFRESH_SECONDS, LEARNING_AUTO_REFRESH_MIN_SECONDS),
@@ -30884,6 +31101,14 @@ def central_telegram_command_loop():
                     print(f"TELEGRAM CENTRAL: comando duplicado ignorado: chat={chat_id} text={text}")
                     continue
 
+                if not TELEGRAM_MANUAL_COMMANDS_ENABLED:
+                    telegram_send_with_token(
+                        token,
+                        chat_id,
+                        TELEGRAM_REPORTS_ONLY_BLOCK_MESSAGE,
+                    )
+                    continue
+
                 title = _central_command_title(text)
                 try:
                     try:
@@ -31553,7 +31778,7 @@ def central_command_router_loop(key: str, cfg: dict):
 
     while True:
         try:
-            module = get_bot_module(key)
+            module = get_bot_module(key) if TELEGRAM_MANUAL_COMMANDS_ENABLED else None
             updates, warning = telegram_get_updates_for_token(token, offset)
 
             if warning:
@@ -31576,6 +31801,13 @@ def central_command_router_loop(key: str, cfg: dict):
                 if not text.startswith("/"):
                     continue
                 if allowed_chat and chat_id != str(allowed_chat):
+                    continue
+                if not TELEGRAM_MANUAL_COMMANDS_ENABLED:
+                    telegram_send_with_token(
+                        token,
+                        chat_id,
+                        TELEGRAM_REPORTS_ONLY_BLOCK_MESSAGE,
+                    )
                     continue
                 if module is None:
                     telegram_send_with_token(token, chat_id, f"{cfg.get('name', key)} não carregado na Central.")
@@ -53539,7 +53771,48 @@ except Exception:
     pass
 
 
-def central_trade_registry_snapshot(include_trades=True):
+def central_trade_registry_snapshot(include_trades=True, health_light=False):
+    if health_light:
+        storage = _TRPSF_V1_STATE.get("last_status") if isinstance(_TRPSF_V1_STATE, dict) else None
+        storage_state = storage if isinstance(storage, dict) else {}
+        counts = (
+            storage_state.get("current_counts")
+            or storage_state.get("counts_after")
+            or storage_state.get("counts_before")
+            or {}
+        )
+        open_count = counts.get("open_count")
+        closed_count = counts.get("closed_count")
+        active_file = (
+            _TRPSF_V1_STATE.get("active_file")
+            or storage_state.get("registry_file_active")
+            or storage_state.get("active_file")
+        )
+        return {
+            "ok": bool(storage_state.get("ok")),
+            "loaded": bool(storage_state.get("status")),
+            "storage_fix_version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "storage_status": storage_state.get("status"),
+            "storage_last_error": storage_state.get("last_error")
+            or storage_state.get("error"),
+            "storage_file_exists": storage_state.get("active_file_exists"),
+            "persistent_storage_enabled": bool(_TRPSF_V1_STATE.get("patched")),
+            "registry_file_active": str(active_file) if active_file else None,
+            "trade_registry_file": str(active_file) if active_file else None,
+            "data_dir": str(CENTRAL_DATA_DIR) if "CENTRAL_DATA_DIR" in globals() else None,
+            "last_load_ok": storage_state.get("last_load_ok"),
+            "last_write_ok": storage_state.get("last_write_ok"),
+            "open_count": open_count,
+            "closed_count": closed_count,
+            "migrated_from_legacy": storage_state.get("migrated_from_legacy"),
+            "patched_load_registry": storage_state.get("patched_load_registry"),
+            "patched_save_registry": storage_state.get("patched_save_registry"),
+            "write_allowed": bool(storage_state.get("write_allowed")),
+            "temporary_read_only": bool(storage_state.get("temporary_read_only")),
+            "temporary_read_source": storage_state.get("temporary_read_source"),
+            "read_only_snapshot": True,
+        }
+
     original = _TRPSF_V1_ORIGINAL_SNAPSHOT
     if callable(original):
         payload = original(include_trades=include_trades)

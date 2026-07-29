@@ -79,6 +79,45 @@ CRITICAL_EVENT_TYPES = frozenset(
     }
 )
 
+
+def telegram_manual_commands_enabled(environ=None):
+    source = os.environ if environ is None else environ
+    value = source.get("TELEGRAM_MANUAL_COMMANDS_ENABLED")
+    if value is None:
+        return False
+    return str(value).strip().lower() in _TRUE_VALUES
+
+
+def telegram_reports_only_enabled(environ=None):
+    return not telegram_manual_commands_enabled(environ)
+
+
+def telegram_daily_reports_enabled(environ=None):
+    source = os.environ if environ is None else environ
+    value = source.get("CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED")
+    if value is None:
+        return False
+    return str(value).strip().lower() in _TRUE_VALUES
+
+
+def telegram_monthly_reports_enabled(environ=None):
+    source = os.environ if environ is None else environ
+    value = source.get("CENTRAL_MONTHLY_REPORT_ENABLED")
+    if value is None:
+        return True
+    return str(value).strip().lower() in _TRUE_VALUES
+
+
+def telegram_critical_alerts_enabled(environ=None):
+    # Atuação por regra crítica está sempre habilitada por contrato operacional.
+    return True
+
+
+def telegram_live_operational_alerts_enabled(environ=None):
+    # Operações LIVE são governadas pela política LIVE_ONLY; manter compatibilidade
+    # com a validação existente de Telegram Notification.
+    return telegram_live_only_enabled(environ)
+
 _METRICS = {
     "telegram_auto_allowed_live": 0,
     "telegram_auto_allowed_live_operational": 0,
@@ -291,15 +330,25 @@ def send_automatic_telegram(
 
 
 def telegram_notification_policy_health(environ=None):
-    enabled = telegram_live_only_enabled(environ)
+    manual_enabled = telegram_manual_commands_enabled(environ)
+    daily_enabled = telegram_daily_reports_enabled(environ)
+    monthly_enabled = telegram_monthly_reports_enabled(environ)
+    live_only = telegram_live_only_enabled(environ)
     return {
-        "telegram_live_only_enabled": enabled,
-        "telegram_manual_commands_available": True,
-        "telegram_paper_auto_notifications_enabled": not enabled,
-        "telegram_live_auto_notifications_enabled": True,
-        "telegram_critical_notifications_enabled": True,
-        "telegram_central_ceo_daily_enabled": True,
+        "telegram_live_only_enabled": live_only,
+        "telegram_manual_commands_enabled": manual_enabled,
+        "telegram_reports_only_enabled": telegram_reports_only_enabled(environ),
+        "telegram_daily_reports_enabled": daily_enabled,
+        "telegram_monthly_reports_enabled": monthly_enabled,
+        "telegram_critical_alerts_enabled": telegram_critical_alerts_enabled(environ),
+        "telegram_live_operational_alerts_enabled": telegram_live_operational_alerts_enabled(environ),
         **dict(_METRICS),
+        # backward-compatible aliases used by previous HTTP-contract tests
+        "telegram_manual_commands_available": manual_enabled,
+        "telegram_paper_auto_notifications_enabled": not live_only,
+        "telegram_live_auto_notifications_enabled": live_only,
+        "telegram_critical_notifications_enabled": telegram_critical_alerts_enabled(environ),
+        "telegram_central_ceo_daily_enabled": daily_enabled or monthly_enabled,
     }
 
 
@@ -308,6 +357,12 @@ __all__ = [
     "CENTRAL_CEO_DAILY_EVENT_TYPE",
     "LIVE_INFORMATIONAL_EVENT_TYPES",
     "LIVE_OPERATIONAL_EVENT_TYPES",
+    "telegram_manual_commands_enabled",
+    "telegram_reports_only_enabled",
+    "telegram_daily_reports_enabled",
+    "telegram_monthly_reports_enabled",
+    "telegram_critical_alerts_enabled",
+    "telegram_live_operational_alerts_enabled",
     "send_automatic_telegram",
     "should_send_automatic_telegram",
     "telegram_live_only_enabled",

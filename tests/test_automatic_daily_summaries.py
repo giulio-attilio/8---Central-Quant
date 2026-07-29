@@ -359,9 +359,23 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
     }
     namespace = {
         "central_watchdog_status": lambda: {"ok": True},
-        "central_trade_registry_snapshot": lambda include_trades=False: {
+        "central_trade_registry_snapshot": lambda include_trades=False, **_kwargs: {
             "ok": True,
             "include_trades": include_trades,
+        },
+        "telegram_notification_policy_health": lambda: {
+            "telegram_manual_commands_enabled": False,
+            "telegram_reports_only_enabled": True,
+            "telegram_daily_reports_enabled": False,
+            "telegram_monthly_reports_enabled": True,
+            "telegram_critical_alerts_enabled": True,
+            "telegram_live_operational_alerts_enabled": True,
+            "telegram_live_only_enabled": True,
+            "telegram_manual_commands_available": False,
+            "telegram_paper_auto_notifications_enabled": True,
+            "telegram_live_auto_notifications_enabled": True,
+            "telegram_critical_notifications_enabled": True,
+            "telegram_central_ceo_daily_enabled": True,
         },
         "automatic_daily_summaries_health": lambda: expected.copy(),
         "central_daily_scheduler_health": lambda: scheduler.copy(),
@@ -384,7 +398,20 @@ def test_main_health_exposes_lightweight_fields_without_building_reports():
     result = _run_isolated_function(node, namespace)
 
     assert result["ok"] is True
+    assert result["health_profile"] == "LIGHT"
+    assert result["heavy_audits_executed"] is False
+    assert result["history_files_read"] is False
+    assert result["broker_called"] is False
+    assert result["redis_called"] is False
+    assert result["registry_reloaded"] is False
+    assert result["write_executed"] is False
     assert result["trade_registry"]["include_trades"] is False
+    assert result["telegram_manual_commands_enabled"] is False
+    assert result["telegram_reports_only_enabled"] is True
+    assert result["telegram_daily_reports_enabled"] is False
+    assert result["telegram_monthly_reports_enabled"] is True
+    assert result["telegram_critical_alerts_enabled"] is True
+    assert result["telegram_live_operational_alerts_enabled"] is True
     for field, value in expected.items():
         assert result[field] == value
     for field, value in {**learning, **disk, **timeline, **scheduler}.items():
