@@ -1816,8 +1816,32 @@ def seed_policy_effect_decision(commit=True):
     }
 
     if commit:
-        with open(DECISION_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(decision, ensure_ascii=False, sort_keys=True) + "\n")
+        probe = None
+        line = json.dumps(decision, ensure_ascii=False, sort_keys=True) + "\n"
+        try:
+            from decision_log_forensics import decision_log_write_probe
+
+            probe = decision_log_write_probe(
+                DECISION_LOG_FILE,
+                decision,
+                writer="executive_policy_learning.seed_policy_effect_decision",
+                serialized_bytes=len(line.encode("utf-8")),
+            )
+            probe.begin()
+        except Exception:
+            probe = None
+        try:
+            with open(DECISION_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+            if probe is not None:
+                probe.finish(True)
+        except Exception:
+            if probe is not None:
+                try:
+                    probe.finish(False)
+                except Exception:
+                    pass
+            raise
 
     result = {
         "ok": True,

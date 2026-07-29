@@ -193,12 +193,33 @@ def _is_history_events_path(path):
 
 
 def _append_jsonl_unlocked(path: Path, item: dict):
+    probe = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(item, ensure_ascii=False, default=_json_default) + "\n"
+        try:
+            from decision_log_forensics import decision_log_write_probe
+
+            probe = decision_log_write_probe(
+                path,
+                item,
+                writer="history_manager._append_jsonl_unlocked",
+                serialized_bytes=len(line.encode("utf-8")),
+            )
+            probe.begin()
+        except Exception:
+            probe = None
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(item, ensure_ascii=False, default=_json_default) + "\n")
+            f.write(line)
+        if probe is not None:
+            probe.finish(True)
         return True
     except Exception as exc:
+        if probe is not None:
+            try:
+                probe.finish(False)
+            except Exception:
+                pass
         print(f"ERRO HISTORY append_jsonl {path}: {exc}")
         return False
 
