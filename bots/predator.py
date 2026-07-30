@@ -41,6 +41,11 @@ from account_client_order_id import (
 )
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
+from static_operational_runtime import (
+    large_redis_snapshot_allowed,
+    static_operational_runtime_blocked_log,
+    static_operational_runtime_should_log_blocked,
+)
 from predator_daily_summary import (
     append_predator_event,
     build_daily_metrics,
@@ -551,21 +556,40 @@ def carregar_trades():
     return dados if isinstance(dados, list) else []
 
 
-def salvar_trades(dados):
+def salvar_trades(dados, *, automatic=False):
     if not isinstance(dados, list):
         dados = []
+    if automatic and not large_redis_snapshot_allowed():
+        _predator_static_operational_runtime_blocked(
+            "smartpredator_large_redis_snapshot"
+        )
+        return False
     redis_set_json(TRADES_KEY, dados)
+    return True
+
+
+def _predator_static_operational_runtime_blocked(task):
+    try:
+        if static_operational_runtime_should_log_blocked(task):
+            print(static_operational_runtime_blocked_log(task, "smart_predator_runtime"))
+    except Exception:
+        pass
 
 
 def registrar_evento_trade(evento):
     persistent_result = append_predator_event(evento)
     if not persistent_result.get("ok"):
         HEALTH["predator_daily_summary_last_error"] = persistent_result.get("error")
+    if not large_redis_snapshot_allowed():
+        _predator_static_operational_runtime_blocked(
+            "smartpredator_large_redis_snapshot"
+        )
+        return
     trades = carregar_trades()
     trades.append(evento)
     if len(trades) > 3000:
         trades = trades[-3000:]
-    salvar_trades(trades)
+    salvar_trades(trades, automatic=True)
 
 
 # ====================================================

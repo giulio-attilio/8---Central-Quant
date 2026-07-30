@@ -139,6 +139,15 @@ from automatic_learning_policy import (
     automatic_learning_refresh_enabled,
     automatic_learning_refresh_health,
 )
+from static_operational_runtime import (
+    auto_learning_runtime_allowed,
+    heavy_predator_watchdog_audit_allowed,
+    historical_background_tasks_allowed,
+    static_operational_runtime_blocked_log,
+    static_operational_runtime_health,
+    static_operational_runtime_should_log_blocked,
+    static_operational_runtime_startup_summary,
+)
 try:
     from startup_disk_forensics import (
         build_disk_forensics_health,
@@ -2750,6 +2759,30 @@ def send_central_alert(message: str):
             pass
 
 
+def _emit_static_operational_runtime_blocked(task: str, origin: str) -> None:
+    """Emit a bounded operational log without changing runtime authority."""
+    should_log_fn = globals().get("static_operational_runtime_should_log_blocked")
+    try:
+        should_log = bool(should_log_fn(task)) if callable(should_log_fn) else True
+    except Exception:
+        should_log = True
+    if not should_log:
+        return
+    message_fn = globals().get("static_operational_runtime_blocked_log")
+    try:
+        message = (
+            message_fn(task, origin)
+            if callable(message_fn)
+            else (
+                "STATIC_OPERATIONAL_RUNTIME_BLOCKED "
+                f"task={task} origin={origin} reason=STATIC_OPERATIONAL_RUNTIME"
+            )
+        )
+        print(message)
+    except Exception:
+        pass
+
+
 def central_watchdog_loop():
     while True:
         try:
@@ -2762,12 +2795,25 @@ def central_watchdog_loop():
             # Predator PAPER lifecycle hardening is deliberately outside the
             # execution path.  The late-bound callback exists only after the
             # whole module has loaded and is fail-isolated from the watchdog.
-            auto_closed_sync = globals().get("predator_auto_closed_sync_v1_tick")
-            if callable(auto_closed_sync):
-                try:
-                    auto_closed_sync()
-                except Exception as auto_sync_exc:
-                    CENTRAL_HEALTH["predator_auto_closed_sync_last_error"] = str(auto_sync_exc)
+            heavy_audit_policy = globals().get("heavy_predator_watchdog_audit_allowed")
+            try:
+                heavy_audit_allowed = (
+                    bool(heavy_audit_policy()) if callable(heavy_audit_policy) else True
+                )
+            except Exception:
+                heavy_audit_allowed = True
+            if not heavy_audit_allowed:
+                _emit_static_operational_runtime_blocked(
+                    "predator_heavy_watchdog_audit",
+                    "central_watchdog_loop",
+                )
+            else:
+                auto_closed_sync = globals().get("predator_auto_closed_sync_v1_tick")
+                if callable(auto_closed_sync):
+                    try:
+                        auto_closed_sync()
+                    except Exception as auto_sync_exc:
+                        CENTRAL_HEALTH["predator_auto_closed_sync_last_error"] = str(auto_sync_exc)
 
             if not status["ok"]:
                 last = float(CENTRAL_HEALTH.get("last_watchdog_alert_ts", 0) or 0)
@@ -14807,6 +14853,26 @@ def health():
             legacy_enabled=LEARNING_AUTO_REFRESH_LEGACY_ENABLED,
         )
     )
+    static_runtime_health_fn = globals().get("static_operational_runtime_health")
+    if callable(static_runtime_health_fn):
+        try:
+            static_runtime_health = static_runtime_health_fn()
+            if isinstance(static_runtime_health, dict):
+                payload.update(static_runtime_health)
+        except Exception:
+            pass
+    else:
+        payload.update(
+            {
+                "static_operational_runtime_enabled": False,
+                "operational_runtime_profile": "DEFAULT",
+                "historical_background_tasks_enabled": True,
+                "predator_heavy_watchdog_audit_enabled": True,
+                "auto_learning_runtime_enabled": True,
+                "smartpredator_large_redis_snapshot_enabled": True,
+                "manual_heavy_audits_available": True,
+            }
+        )
     if callable(build_disk_forensics_health):
         payload.update(build_disk_forensics_health(STARTUP_DISK_FORENSICS_RESULT))
     else:
@@ -31351,6 +31417,13 @@ def central_daily_report_loop():
     """
     global CENTRAL_MONTHLY_REPORT_SENT_KEY
 
+    if not historical_background_tasks_allowed():
+        _emit_static_operational_runtime_blocked(
+            "central_daily_historical_report",
+            "central_daily_report_loop",
+        )
+        return
+
     automatic_daily_enabled = central_daily_report_automatic_enabled(
         CENTRAL_DAILY_REPORT_MODE,
         CENTRAL_DAILY_REPORT_ENABLED,
@@ -32110,7 +32183,7 @@ def learning_readiness_route():
 LEARNING_AUTO_REFRESH_LEGACY_ENABLED = env_bool("LEARNING_AUTO_REFRESH_ENABLED", True)
 LEARNING_AUTO_REFRESH_ENABLED = automatic_learning_refresh_enabled(
     LEARNING_AUTO_REFRESH_LEGACY_ENABLED
-)
+) and auto_learning_runtime_allowed()
 LEARNING_AUTO_REFRESH_SECONDS = int(os.environ.get("LEARNING_AUTO_REFRESH_SECONDS", "900"))
 LEARNING_AUTO_REFRESH_MIN_SECONDS = 300
 LEARNING_AUTO_REFRESH_LAST = {"ts": None, "ok": None, "error": None, "summary": None, "readiness": None}
@@ -32539,6 +32612,12 @@ def trendpro_daily_summary_v1_run(send: bool = True, force: bool = False) -> dic
 
 
 def trendpro_daily_summary_v1_loop():
+    if not historical_background_tasks_allowed():
+        _emit_static_operational_runtime_blocked(
+            "trendpro_daily_historical_summary",
+            "trendpro_daily_summary_v1_loop",
+        )
+        return
     if not CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED or not TRENDPRO_DAILY_SUMMARY_ENABLED:
         print("TRENDPRO DAILY SUMMARY V1 DESLIGADO POR ENV")
         return
@@ -32612,6 +32691,13 @@ def start_central_runtime_once():
             return
         CENTRAL_RUNTIME_STARTED = True
 
+    startup_summary_fn = globals().get("static_operational_runtime_startup_summary")
+    if callable(startup_summary_fn):
+        try:
+            print(startup_summary_fn())
+        except Exception:
+            pass
+
     memory_snapshot("before_start_bots", store=True, print_log=True)
     start_enabled_bots()
     memory_snapshot("after_start_bots", store=True, print_log=True)
@@ -32647,19 +32733,36 @@ def start_central_runtime_once():
         CENTRAL_DAILY_REPORT_MODE,
         CENTRAL_DAILY_REPORT_ENABLED,
     )
+    historical_background_allowed = historical_background_tasks_allowed()
     if central_daily_automatic_enabled or CENTRAL_MONTHLY_REPORT_ENABLED:
-        if acquire_runtime_file_lock("central_daily_report"):
-            threading.Thread(target=central_daily_report_loop, daemon=True).start()
-            CENTRAL_DAILY_REPORT_THREAD_STARTED = True
+        if historical_background_allowed:
+            if acquire_runtime_file_lock("central_daily_report"):
+                threading.Thread(target=central_daily_report_loop, daemon=True).start()
+                CENTRAL_DAILY_REPORT_THREAD_STARTED = True
+            else:
+                CENTRAL_DAILY_REPORT_LAST_STATUS = "LOCK_NOT_ACQUIRED"
+                print("RELATÓRIO DIÁRIO CENTRAL NÃO INICIADO: outro processo já é líder")
         else:
-            CENTRAL_DAILY_REPORT_LAST_STATUS = "LOCK_NOT_ACQUIRED"
-            print("RELATÓRIO DIÁRIO CENTRAL NÃO INICIADO: outro processo já é líder")
+            CENTRAL_DAILY_REPORT_LAST_STATUS = "STATIC_OPERATIONAL_RUNTIME_BLOCKED"
+            _emit_static_operational_runtime_blocked(
+                "central_daily_historical_report",
+                "start_central_runtime_once",
+            )
 
-    if CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED and TRENDPRO_DAILY_SUMMARY_ENABLED:
+    if (
+        CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
+        and TRENDPRO_DAILY_SUMMARY_ENABLED
+        and historical_background_allowed
+    ):
         if acquire_runtime_file_lock("trendpro_daily_summary_v1"):
             threading.Thread(target=trendpro_daily_summary_v1_loop, daemon=True).start()
         else:
             print("TRENDPRO DAILY SUMMARY V1 NÃO INICIADO: outro processo já é líder")
+    elif CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED and TRENDPRO_DAILY_SUMMARY_ENABLED:
+        _emit_static_operational_runtime_blocked(
+            "trendpro_daily_historical_summary",
+            "start_central_runtime_once",
+        )
 
     start_central_command_routers()
 
@@ -47039,6 +47142,7 @@ def build_predator_pnl_paper_audit_v1_text():
     reg = payload.get("registry_snapshot") or {}
     lines = [
         "🧾 PREDATOR PNL/PAPER AUDIT V1 — CENTRAL QUANT",
+        "Scope: MANUAL_HEAVY_AUDIT",
         f"Data/hora: {payload.get('generated_at')}",
         f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
         f"Versão: {payload.get('version')}",
@@ -47151,7 +47255,10 @@ def bot_health(key: str, cfg: dict):
 @app.route("/predator/pnlaudit", methods=["GET"])
 @app.route("/predator/paperaudit", methods=["GET"])
 def predator_pnl_paper_audit_v1_route():
-    return predator_pnl_paper_audit_v1_status(include_samples=True), 200
+    payload = predator_pnl_paper_audit_v1_status(include_samples=True)
+    payload["runtime_scope"] = "MANUAL_HEAVY_AUDIT"
+    payload["manual_heavy_audit"] = True
+    return payload, 200
 
 
 @app.route("/predator/pnlaudit/text", methods=["GET"])
@@ -47665,6 +47772,7 @@ def build_predator_paper_lifecycle_audit_v1_text():
     p = payload.get("pnl_audit_summary") or {}
     lines = [
         "🧬 PREDATOR PAPER LIFECYCLE AUDIT V1 — CENTRAL QUANT",
+        "Scope: MANUAL_HEAVY_AUDIT",
         f"Data/hora: {payload.get('generated_at')}",
         f"Status: {'✅' if payload.get('ok') else '🛑'} {payload.get('status')}",
         f"Versão: {payload.get('version')}",
@@ -47765,7 +47873,10 @@ def bot_health(key: str, cfg: dict):
 @app.route("/predator/lifecycleaudit", methods=["GET"])
 @app.route("/predator/paperlifecycle", methods=["GET"])
 def predator_paper_lifecycle_audit_v1_route():
-    return predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False), 200
+    payload = predator_paper_lifecycle_audit_v1_status(include_samples=True, use_cache=False)
+    payload["runtime_scope"] = "MANUAL_HEAVY_AUDIT"
+    payload["manual_heavy_audit"] = True
+    return payload, 200
 
 
 @app.route("/predator/lifecycleaudit/text", methods=["GET"])
@@ -65817,6 +65928,25 @@ def predator_auto_closed_sync_v1_status(commit=False, ack=None, automatic=False,
 
 
 def predator_auto_closed_sync_v1_tick(force=False):
+    heavy_audit_policy = globals().get("heavy_predator_watchdog_audit_allowed")
+    try:
+        heavy_audit_allowed = (
+            bool(heavy_audit_policy()) if callable(heavy_audit_policy) else True
+        )
+    except Exception:
+        heavy_audit_allowed = True
+    if not heavy_audit_allowed:
+        emit_blocked = globals().get("_emit_static_operational_runtime_blocked")
+        if callable(emit_blocked):
+            emit_blocked("predator_heavy_watchdog_audit", "predator_auto_closed_sync_v1_tick")
+        return {
+            "ok": True,
+            "status": "STATIC_OPERATIONAL_RUNTIME_BLOCKED",
+            "enabled": PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED,
+            "automatic": True,
+            "blocked": True,
+            "reason": "STATIC_OPERATIONAL_RUNTIME",
+        }
     if not PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED:
         return {"ok": True, "status": "DISABLED", "enabled": False}
     now = time.time()
@@ -65833,6 +65963,7 @@ def build_predator_auto_closed_sync_v1_text(commit=False, ack=None):
     after = payload.get("after_lifecycle_counts") or {}
     lines = [
         "PREDATOR AUTO CLOSED REGISTRY SYNC HARDENING V1",
+        "Scope: MANUAL_HEAVY_AUDIT",
         f"Data/hora: {payload.get('generated_at')}",
         f"Status: {payload.get('status')}",
         f"Enabled: {payload.get('enabled')}",
@@ -65924,7 +66055,15 @@ def predator_auto_closed_sync_v1_route():
     body = request.get_json(silent=True) or {}
     commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
     ack = body.get("ack", request.args.get("ack"))
-    return predator_auto_closed_sync_v1_status(commit=commit, ack=ack, automatic=False, include_samples=True), 200
+    payload = predator_auto_closed_sync_v1_status(
+        commit=commit,
+        ack=ack,
+        automatic=False,
+        include_samples=True,
+    )
+    payload["runtime_scope"] = "MANUAL_HEAVY_AUDIT"
+    payload["manual_heavy_audit"] = True
+    return payload, 200
 
 
 @app.route("/predator/autoclosedsync/text", methods=["GET", "POST"])
