@@ -2544,6 +2544,40 @@ def backfill_closed_trades_from_events(limit=None, force=False):
     except Exception as exc:
         return {"ok": False, "error": str(exc), "file": str(CLOSED_TRADES_FILE)}
 
+def _is_can_open_trade_decision_log_mirror(item):
+    """True somente para o espelho RISK_* da escrita canonica do main.
+
+    O marcador e carregado no ``raw`` pelo normalizador.  Esta verificacao nao
+    usa ``decision_id`` e, portanto, nao afeta eventos futuros legitimos que
+    compartilhem uma identidade de decisao.
+    """
+    if not isinstance(item, dict):
+        return False
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    event_name = str(item.get("event") or "").upper()
+    source_event_name = str(raw.get("event_type") or raw.get("event") or "").upper()
+    # classify_event preserva RISK_ALLOW, mas normaliza RISK_DENY como
+    # TRADE_BLOCKED. O segundo caso ainda e o mesmo espelho, pois o evento
+    # bruto permanece explicitamente RISK_DENY.
+    if event_name not in {"RISK_ALLOW", "RISK_DENY"} and not (
+        event_name == "TRADE_BLOCKED" and source_event_name == "RISK_DENY"
+    ):
+        return False
+
+    metadata = {}
+    metadata.update(raw)
+    metadata.update(details)
+    metadata.update(item)
+    return bool(
+        metadata.get("decision_log_single_writer") is True
+        and metadata.get("canonical_writer") == "main._append_jsonl"
+        and metadata.get("redundant_mirror_suppressed") is True
+        and metadata.get("decision_log_mirror_suppression_scope")
+        == "CAN_OPEN_TRADE_HISTORY_MIRROR_V1"
+    )
+
+
 def log_event(event_type, payload=None, source=None, trade_id=None):
     try:
         item = normalize_payload(event_type, payload, source=source, trade_id=trade_id)
@@ -2560,8 +2594,12 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
             return {"ok": True, "dedup": True, "uid": uid}
         ok = _append_jsonl(HISTORY_EVENTS_FILE, item)
         timeline_written = False
+        decision_log_written = False
+        redundant_mirror_suppressed = False
         if ok and item.get("event") in {"RISK_DECISION", "RISK_ALLOW", "RISK_DENY", "TRADE_BLOCKED"}:
-            _append_jsonl(DECISION_LOG_FILE, item)
+            redundant_mirror_suppressed = _is_can_open_trade_decision_log_mirror(item)
+            if not redundant_mirror_suppressed:
+                decision_log_written = _append_jsonl(DECISION_LOG_FILE, item)
         if ok and item.get("event") not in {"CENTRAL_COMMAND", "BOT_COMMAND"}:
             timeline_written = _append_jsonl(TIMELINE_LOG_FILE, item)
 
@@ -2595,6 +2633,8 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
             "ok": ok,
             "dedup": False,
             "event": item,
+            "decision_log_written": decision_log_written,
+            "redundant_mirror_suppressed": redundant_mirror_suppressed,
             "timeline_written": timeline_written,
             "context": context_result,
             "closed_trade": closed_trade_result,

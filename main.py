@@ -16928,6 +16928,23 @@ def append_decision_log(payload, decision_result):
     trade_id = str(trade_id)
     allowed = bool(result.get("allowed"))
     state = "VERIFY" if allowed and str(result.get("mode") or "").upper() == "VERIFY" else ("DENIED" if not allowed else str(result.get("mode") or "ALLOW").upper())
+    decision_id = result.get("decision_id") or payload.get("decision_id") or None
+
+    # DECISION LOG SINGLE WRITER V1: esta e a escrita canonica da decisao.
+    # O evento RISK_* complementar continua no History/Timeline, mas carrega um
+    # marcador de escopo estreito para que o History Manager nao o espelhe de
+    # volta para o mesmo decision_log.jsonl. Nao e uma deduplicacao por
+    # decision_id: eventos posteriores legitimos continuam independentes.
+    single_writer_telemetry = {
+        "decision_log_single_writer": True,
+        "canonical_writer": "main._append_jsonl",
+        "redundant_mirror_suppressed": True,
+        "decision_log_mirror_suppression_scope": "CAN_OPEN_TRADE_HISTORY_MIRROR_V1",
+    }
+    try:
+        result.update(single_writer_telemetry)
+    except Exception:
+        pass
 
     # V2.1.7 — Top-Level Policy Link Persistence
     # Enriquecimento ocorre antes de montar o item persistido, garantindo que
@@ -16939,6 +16956,7 @@ def append_decision_log(payload, decision_result):
         "ts": data_hora_sp_str(),
         "epoch": time.time(),
         "trade_id": trade_id,
+        "decision_id": decision_id,
         "bot": bot,
         "symbol": symbol,
         "side": side,
@@ -16959,6 +16977,7 @@ def append_decision_log(payload, decision_result):
         "risk_pct": payload.get("risk_pct"),
         "notional_usdt": payload.get("notional_usdt"),
         "exposure": result.get("exposure") or {},
+        **single_writer_telemetry,
     }
     _append_jsonl(CENTRAL_DECISION_LOG_FILE, item)
 
