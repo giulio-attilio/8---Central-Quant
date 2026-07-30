@@ -143,6 +143,7 @@ from static_operational_runtime import (
     auto_learning_runtime_allowed,
     heavy_predator_watchdog_audit_allowed,
     historical_background_tasks_allowed,
+    static_operational_runtime_enabled,
     static_operational_runtime_blocked_log,
     static_operational_runtime_health,
     static_operational_runtime_should_log_blocked,
@@ -17643,6 +17644,33 @@ def _risk_is_reduce_only(payload):
 
 
 
+def _static_risk_analytics_gate_payload():
+    """Describe the complementary historical-ranking state for Risk Manager."""
+    try:
+        static_enabled = bool(static_operational_runtime_enabled())
+    except Exception:
+        static_enabled = False
+
+    if static_enabled:
+        return {
+            "historical_analytics_used": False,
+            "analytics_ranking_status": "STATIC_OPERATIONAL_SKIPPED",
+            "analytics_ranking": {
+                "state": "NEUTRAL",
+                "reason": "STATIC_OPERATIONAL_RUNTIME",
+            },
+        }
+
+    return {
+        "historical_analytics_used": None,
+        "analytics_ranking_status": "HISTORICAL_ANALYTICS_UNRESOLVED",
+        "analytics_ranking": {
+            "state": "NEUTRAL",
+            "reason": "AWAITING_POLICY_SYNC_PATH",
+        },
+    }
+
+
 def _ensure_executive_policy_manager_synced_for_risk(force=False):
     """
     Garante que o Executive Policy Manager tenha políticas ativas antes do
@@ -17663,6 +17691,8 @@ def _ensure_executive_policy_manager_synced_for_risk(force=False):
         "active_codes": [],
         "ingested": 0,
     }
+    analytics_gate = _static_risk_analytics_gate_payload()
+    result.update(analytics_gate)
 
     try:
         if not EXECUTIVE_POLICY_MANAGER_LOADED or executive_policy_manager is None:
@@ -17673,7 +17703,20 @@ def _ensure_executive_policy_manager_synced_for_risk(force=False):
         before_count = int(before.get("active_policy_count") or 0)
         result["before_active_policy_count"] = before_count
 
+        if analytics_gate.get("analytics_ranking_status") == "STATIC_OPERATIONAL_SKIPPED":
+            result["ok"] = True
+            result["reason"] = "STATIC_OPERATIONAL_HISTORICAL_ANALYTICS_SKIPPED"
+            result["after_active_policy_count"] = before_count
+            result["active_codes"] = before.get("active_codes") or []
+            return result
+
         if before_count > 0 and not force:
+            result["historical_analytics_used"] = False
+            result["analytics_ranking_status"] = "HISTORICAL_ANALYTICS_NOT_NEEDED"
+            result["analytics_ranking"] = {
+                "state": "NEUTRAL",
+                "reason": "EXECUTIVE_POLICIES_ALREADY_ACTIVE",
+            }
             result["ok"] = True
             result["reason"] = "policies_already_active"
             result["after_active_policy_count"] = before_count
@@ -17681,11 +17724,16 @@ def _ensure_executive_policy_manager_synced_for_risk(force=False):
             return result
 
         if "_executive_decision_snapshot_for_reports" not in globals():
+            result["historical_analytics_used"] = False
+            result["analytics_ranking_status"] = "HISTORICAL_ANALYTICS_FALLBACK_UNAVAILABLE"
             result["reason"] = "executive_decision_snapshot_unavailable"
             return result
 
         result["attempted"] = True
+        result["historical_analytics_used"] = True
+        result["analytics_ranking_status"] = "HISTORICAL_ANALYTICS_FALLBACK_ATTEMPTED"
         decision_payload = _executive_decision_snapshot_for_reports(compact_source=True)
+        result["analytics_ranking_status"] = "HISTORICAL_ANALYTICS_FALLBACK_CALLED"
 
         # _executive_decision_snapshot_for_reports já chama _sync_executive_policy_manager_from_decision.
         sync_payload = decision_payload.get("executive_policy_manager") if isinstance(decision_payload, dict) else {}
@@ -17701,6 +17749,8 @@ def _ensure_executive_policy_manager_synced_for_risk(force=False):
         return result
 
     except Exception as exc:
+        if result.get("attempted") and result.get("historical_analytics_used"):
+            result["analytics_ranking_status"] = "HISTORICAL_ANALYTICS_FALLBACK_FAILED"
         result["reason"] = str(exc)
         return result
 
@@ -18432,6 +18482,7 @@ def can_open_trade_decision(payload: dict):
         risk_short_pos = short_pos
 
     memory_risk = _risk_memory_block_payload()
+    analytics_gate = _static_risk_analytics_gate_payload()
 
     reasons = []
     warnings = []
@@ -18475,6 +18526,7 @@ def can_open_trade_decision(payload: dict):
             "requested_leverage": leverage,
             "requested_effective_notional_usdt": notional,
             "execution": broker_status_payload(),
+            **analytics_gate,
         }
         try:
             enrich_decision_result_with_policy_links(decision_result, payload)
@@ -18507,6 +18559,30 @@ def can_open_trade_decision(payload: dict):
         "setup": payload.get("setup") or payload.get("signal_type") or payload.get("strategy"),
         "category": payload.get("category") or payload.get("bot_category"),
     }, reasons, warnings)
+    policy_sync = (
+        executive_policy_payload.get("sync")
+        if isinstance(executive_policy_payload, dict)
+        and isinstance(executive_policy_payload.get("sync"), dict)
+        else None
+    )
+    if policy_sync is not None:
+        analytics_gate = {
+            key: policy_sync.get(key)
+            for key in (
+                "historical_analytics_used",
+                "analytics_ranking_status",
+                "analytics_ranking",
+            )
+        }
+    elif analytics_gate.get("historical_analytics_used") is None:
+        analytics_gate = {
+            "historical_analytics_used": False,
+            "analytics_ranking_status": "HISTORICAL_ANALYTICS_NOT_REQUESTED",
+            "analytics_ranking": {
+                "state": "NEUTRAL",
+                "reason": "EXECUTIVE_POLICY_PATH_NOT_USED",
+            },
+        }
 
     # Turtle Risk Guard V1 — trava específica do Turtle definida pela avaliação diária dos bots.
     turtle_risk_guard_payload = _trg_v1_evaluate(
@@ -18641,6 +18717,7 @@ def can_open_trade_decision(payload: dict):
         "requested_leverage": leverage,
         "requested_effective_notional_usdt": notional,
         "execution": broker_status_payload(),
+        **analytics_gate,
     }
     try:
         enrich_decision_result_with_policy_links(decision_result, payload)
