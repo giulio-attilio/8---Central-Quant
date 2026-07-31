@@ -52,6 +52,8 @@ TIMELINE_LOG_FILE = DATA_DIR / "timeline.jsonl"
 HISTORY_EXPORT_FILE = DATA_DIR / "history_export.json"
 HISTORY_SEEN_FILE = DATA_DIR / "history_seen.json"
 CLOSED_TRADES_FILE = DATA_DIR / "closed_trades.jsonl"
+CLOSED_TRADE_KEY_INDEX_FILE = DATA_DIR / "closed_trade_key_index_v1.json"
+_CLOSED_TRADE_KEY_INDEX_LOCK = threading.RLock()
 
 HISTORY_ROTATION_V1_ACK = "HISTORY_ROTATION_V1"
 HISTORY_ROTATION_V1_KEEP_RECENT = 5000
@@ -1955,6 +1957,100 @@ def _load_closed_trade_keys(limit=None):
             keys.add(key)
     return keys
 
+
+def _closed_trade_key_index_size():
+    try:
+        return int(CLOSED_TRADES_FILE.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _closed_trade_key_index_watermark():
+    try:
+        stat = CLOSED_TRADES_FILE.stat()
+        return int(stat.st_size), int(stat.st_mtime_ns)
+    except OSError:
+        return 0, 0
+
+
+def _closed_trade_key_index_checksum(keys):
+    material = "\n".join(sorted(keys)).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _rebuild_closed_trade_key_index_streaming():
+    keys = set()
+    invalid_lines = 0
+    try:
+        with CLOSED_TRADES_FILE.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    invalid_lines += 1
+                    continue
+                key = _closed_trade_key(row)
+                if key:
+                    keys.add(key)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # Fail-open: an unreadable history must not manufacture a dedupe hit.
+        return set(), invalid_lines + 1
+    return keys, invalid_lines
+
+
+def _write_closed_trade_key_index(keys):
+    ordered_keys = sorted(keys)
+    size, mtime_ns = _closed_trade_key_index_watermark()
+    payload = {
+        "version": 1,
+        "closed_trades_size": size,
+        "closed_trades_mtime_ns": mtime_ns,
+        "key_count": len(ordered_keys),
+        "keys_checksum_sha256": _closed_trade_key_index_checksum(ordered_keys),
+        "keys": ordered_keys,
+    }
+    temp = CLOSED_TRADE_KEY_INDEX_FILE.with_suffix(".tmp")
+    try:
+        CLOSED_TRADE_KEY_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        temp.replace(CLOSED_TRADE_KEY_INDEX_FILE)
+        return True
+    except Exception:
+        try:
+            temp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def _closed_trade_key_index_state():
+    """Load minimal persisted identities; rebuild only when absent, invalid or stale."""
+    integrity_error = None
+    try:
+        raw = json.loads(CLOSED_TRADE_KEY_INDEX_FILE.read_text(encoding="utf-8"))
+        keys = raw.get("keys") if isinstance(raw, dict) else None
+        saved_size = raw.get("closed_trades_size") if isinstance(raw, dict) else None
+        saved_mtime_ns = raw.get("closed_trades_mtime_ns") if isinstance(raw, dict) else None
+        if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+            raise ValueError("invalid closed trade key index")
+        if raw.get("version") != 1 or raw.get("key_count") != len(keys):
+            raise ValueError("invalid closed trade key index metadata")
+        if raw.get("keys_checksum_sha256") != _closed_trade_key_index_checksum(keys):
+            raise ValueError("invalid closed trade key index checksum")
+        size, mtime_ns = _closed_trade_key_index_watermark()
+        if int(saved_size) != size or int(saved_mtime_ns) != mtime_ns:
+            raise ValueError("stale closed trade key index watermark")
+        return set(keys), {"closed_trade_key_index_used": True, "closed_trade_key_index_rebuilt": False, "full_history_scan_performed": False, "closed_trade_key_index_valid": True, "closed_trade_key_index_integrity_error": None, "closed_trade_rebuild_invalid_lines": 0}
+    except Exception as exc:
+        integrity_error = type(exc).__name__
+        keys, invalid_lines = _rebuild_closed_trade_key_index_streaming()
+        write_ok = _write_closed_trade_key_index(keys)
+        return keys, {"closed_trade_key_index_used": bool(write_ok), "closed_trade_key_index_rebuilt": True, "full_history_scan_performed": True, "closed_trade_key_index_valid": bool(write_ok), "closed_trade_key_index_integrity_error": integrity_error, "closed_trade_key_index_write_success": bool(write_ok), "closed_trade_rebuild_invalid_lines": invalid_lines}
+
 def normalize_event_type(event_type, payload=None):
     event_type, payload = _coerce_event_args(event_type, payload)
     p = payload if isinstance(payload, dict) else {}
@@ -2264,25 +2360,37 @@ def append_closed_trade(item):
         if not record.get("trade_id") and not record.get("uid"):
             record["trade_id"] = f"CLOSED-{agora_sp().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
         key = _closed_trade_key(record)
-        if key and key in _load_closed_trade_keys():
-            return {
+        with _CLOSED_TRADE_KEY_INDEX_LOCK:
+            keys, telemetry = _closed_trade_key_index_state()
+            if key and key in keys:
+                return {
                 "ok": True,
                 "dedup": True,
+                "duplicate_detected": True,
                 "file": str(CLOSED_TRADES_FILE),
                 "trade_id": record.get("trade_id"),
                 "bot": record.get("bot"),
                 "symbol": record.get("symbol"),
                 "pnl_pct": record.get("pnl_pct"),
+                **telemetry,
             }
-        ok = _append_jsonl(CLOSED_TRADES_FILE, record)
-        return {
+            ok = _append_jsonl(CLOSED_TRADES_FILE, record)
+            if ok and key:
+                keys.add(key)
+                index_ok = _write_closed_trade_key_index(keys)
+                telemetry["closed_trade_key_index_used"] = bool(index_ok)
+                telemetry["closed_trade_key_index_write_success"] = bool(index_ok)
+                telemetry["closed_trade_key_index_valid"] = bool(index_ok)
+            return {
             "ok": ok,
             "dedup": False,
+            "duplicate_detected": False,
             "file": str(CLOSED_TRADES_FILE),
             "trade_id": record.get("trade_id"),
             "bot": record.get("bot"),
             "symbol": record.get("symbol"),
             "pnl_pct": record.get("pnl_pct"),
+            **telemetry,
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "file": str(CLOSED_TRADES_FILE)}

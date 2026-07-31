@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,19 @@ import history_memory_guard as guard
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def _temporary_history_manager_module():
+    original_history_manager = sys.modules.get("history_manager")
+    try:
+        sys.modules.pop("history_manager", None)
+        yield importlib.import_module("history_manager")
+    finally:
+        sys.modules.pop("history_manager", None)
+        if original_history_manager is not None:
+            sys.modules["history_manager"] = original_history_manager
+        assert sys.modules.get("history_manager") is original_history_manager
 
 
 def _write(path: Path, rows, final_newline=True):
@@ -347,26 +361,24 @@ def test_instrumentation_failure_never_blocks_reader(tmp_path, monkeypatch):
 def test_history_manager_uses_bounded_reader_and_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("HISTORY_MAX_READ", "2")
-    sys.modules.pop("history_manager", None)
-    module = importlib.import_module("history_manager")
-    _write(module.HISTORY_EVENTS_FILE, [{"id": number} for number in range(5)])
-    page = module.load_events(include_metadata=True)
-    assert [row["id"] for row in page["records"]] == [3, 4]
-    assert page["partial"] is True
-    assert page["max_records"] == 2
+    with _temporary_history_manager_module() as module:
+        _write(module.HISTORY_EVENTS_FILE, [{"id": number} for number in range(5)])
+        page = module.load_events(include_metadata=True)
+        assert [row["id"] for row in page["records"]] == [3, 4]
+        assert page["partial"] is True
+        assert page["max_records"] == 2
 
 
 def test_query_and_payload_declare_partial_coverage(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("HISTORY_MAX_READ", "2")
-    sys.modules.pop("history_manager", None)
-    module = importlib.import_module("history_manager")
-    _write(module.HISTORY_EVENTS_FILE, [{"event": "SIGNAL_CREATED", "id": number} for number in range(5)])
-    query = module.query_history()
-    payload = module.build_history_payload()
-    assert query["partial"] is True and query["coverage_complete"] is False
-    assert payload["partial"] is True
-    assert payload["totals"]["scope"] == "BOUNDED_TAIL"
+    with _temporary_history_manager_module() as module:
+        _write(module.HISTORY_EVENTS_FILE, [{"event": "SIGNAL_CREATED", "id": number} for number in range(5)])
+        query = module.query_history()
+        payload = module.build_history_payload()
+        assert query["partial"] is True and query["coverage_complete"] is False
+        assert payload["partial"] is True
+        assert payload["totals"]["scope"] == "BOUNDED_TAIL"
 
 
 def test_predator_summary_reader_has_no_integral_read():
