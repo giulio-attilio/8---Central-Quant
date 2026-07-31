@@ -18252,7 +18252,18 @@ def _trg_v1_stats_for(setup=None, side=None, events=None):
 def _trg_v1_evaluate(payload, bot=None, setup=None, side=None, reduce_only=False):
     bot_n = normalize_registry_bot(bot or (payload or {}).get("bot") or "") if "normalize_registry_bot" in globals() else str(bot or "").upper()
     if bot_n != "TURTLE":
-        return {"applies": False, "enabled": TURTLE_RISK_GUARD_ENABLED, "version": TURTLE_RISK_GUARD_VERSION}
+        result = {"applies": False, "enabled": TURTLE_RISK_GUARD_ENABLED, "version": TURTLE_RISK_GUARD_VERSION}
+        try:
+            static_enabled = bool(static_operational_runtime_enabled())
+        except Exception:
+            static_enabled = False
+        if static_enabled:
+            result.update({
+                "historical_data_used": False,
+                "status": "STATIC_OPERATIONAL_SKIPPED",
+                "reason": "STATIC_OPERATIONAL_RUNTIME",
+            })
+        return result
 
     setup_n = _trg_v1_normalize_setup(setup or (payload or {}).get("setup") or (payload or {}).get("signal_type") or (payload or {}).get("strategy"))
     side_n = _trg_v1_normalize_side(side or (payload or {}).get("side") or (payload or {}).get("direction") or (payload or {}).get("signal"))
@@ -18282,6 +18293,36 @@ def _trg_v1_evaluate(payload, bot=None, setup=None, side=None, reduce_only=False
             "reasons": [],
             "warnings": ["TURTLE_RISK_GUARD_ENABLED=false"],
         }
+
+    # STATIC TURTLE RISK GUARD V1: o guard analitico consulta eventos
+    # historicos apenas fora do runtime estatico. A unica trava Turtle que ja
+    # e puramente estatica (Turtle55 SHORT) continua fail-closed, sem leitura.
+    try:
+        static_enabled = bool(static_operational_runtime_enabled())
+    except Exception:
+        static_enabled = False
+    if static_enabled:
+        static_reasons = []
+        static_actions = []
+        if TURTLE_RISK_GUARD_BLOCK_TURTLE55_SHORT and setup_n == "TURTLE55" and side_n == "SHORT":
+            static_reasons.append("Turtle Risk Guard V1: Turtle55 SHORT bloqueado após avaliação diária negativa.")
+            static_actions.append("BLOCK_TURTLE55_SHORT")
+        result = {
+            "applies": bool(static_reasons),
+            "enabled": True,
+            "version": TURTLE_RISK_GUARD_VERSION,
+            "setup": setup_n,
+            "side": side_n,
+            "historical_data_used": False,
+            "status": "STATIC_OPERATIONAL_SKIPPED",
+            "reason": "STATIC_OPERATIONAL_RUNTIME",
+            "actions": static_actions,
+            "reasons": static_reasons,
+            "warnings": [],
+        }
+        if static_reasons:
+            result.update({"allowed": False, "decision": "DENY_STATIC_RULE"})
+        return result
 
     events = _trg_v1_load_history_events()
     setup_side_stats = _trg_v1_stats_for(setup=setup_n, side=side_n, events=events)
