@@ -867,6 +867,10 @@ def register_falcon_trade_registry_open(pos):
                 "reconciliation_required": bool(pos.get("reconciliation_required")),
                 "live_management_reconciliation_pending": pos.get("live_management_reconciliation_pending"),
                 "live_management_block_reason": pos.get("live_management_block_reason"),
+                "unsafe_entry_status": pos.get("unsafe_entry_status"),
+                "initial_stop_failure_incident_id": pos.get(
+                    "initial_stop_failure_incident_id"
+                ),
                 "registry_mode": registry_mode,
                 "execution_sent": bool(live_order.get("sent")),
                 "broker_entry_reference": pos.get("broker_entry_reference"),
@@ -1945,6 +1949,36 @@ def execute_signal_if_allowed(sig, positions=None):
     positions = positions if positions is not None else get_positions()
     mode = FALCON_MODE
     sig["execution_mode"] = mode
+    # A durable P0 incident blocks fresh Falcon LIVE entries before the
+    # Risk-Manager/Broker path.  Lazy lookup preserves historical AST-isolated
+    # tests that compile this legacy consumer without its runtime module.
+    containment_lock_reader = globals().get(
+        "falcon_initial_stop_failure_live_entry_lock_status"
+    )
+    if mode == "LIVE" and callable(containment_lock_reader):
+        containment_lock = containment_lock_reader()
+        if not isinstance(containment_lock, dict) or containment_lock.get("locked"):
+            reason = (
+                containment_lock.get("reason")
+                if isinstance(containment_lock, dict)
+                else "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_UNAVAILABLE"
+            )
+            decision = {
+                "allowed": False,
+                "decision": "DENY",
+                "status": "FALCON_LIVE_ENTRIES_LOCKED_BY_INITIAL_STOP_FAILURE",
+                "reasons": [
+                    reason
+                    or "Existe incidente Falcon LIVE sem stop inicial confirmado; reentrada bloqueada."
+                ],
+                "warnings": [],
+                "initial_stop_failure_containment": containment_lock,
+            }
+            sig["execution_decision"] = decision
+            sig["initial_stop_failure_containment"] = containment_lock
+            HEALTH["last_execution_decision"] = decision
+            HEALTH["falcon_live_entries_locked"] = True
+            return False, decision
     sig["real_notional_usdt"] = FALCON_REAL_NOTIONAL_USDT
     partial_sizing = falcon_resolve_partial_capable_notional(sig) if mode in {"READY", "VERIFY", "LIVE"} else {"allowed": True, "notional_usdt": FALCON_REAL_NOTIONAL_USDT}
     sig["partial_capable_sizing"] = partial_sizing
@@ -2258,6 +2292,96 @@ def execute_signal_if_allowed(sig, positions=None):
             HEALTH["last_execution_decision"] = decision
             HEALTH["last_execution_order"] = order
             return False, decision
+        containment_handler = globals().get(
+            "falcon_handle_initial_stop_failure_containment"
+        )
+        disaster = (
+            order.get("disaster_stop")
+            if isinstance(order.get("disaster_stop"), dict)
+            else {}
+        )
+        initial_stop_failure = bool(
+            order.get("sent") is True
+            and disaster.get("stop_operationally_armed") is not True
+        )
+        containment = None
+        if callable(containment_handler):
+            try:
+                containment = containment_handler(sig, order)
+            except Exception as exc:
+                containment = None
+                containment_error = _falcon_terminal_safe_text(exc)
+            else:
+                containment_error = None
+        else:
+            containment_error = "INITIAL_STOP_FAILURE_CONTAINMENT_HANDLER_MISSING"
+
+        containment_valid_for_failure = bool(
+            isinstance(containment, dict)
+            and containment.get("initial_stop_failure_containment_triggered") is True
+        )
+        if initial_stop_failure and not containment_valid_for_failure:
+            fallback = globals().get(
+                "falcon_initial_stop_failure_containment_internal_error"
+            )
+            if callable(fallback):
+                try:
+                    containment = fallback(
+                        sig,
+                        order,
+                        error=containment_error
+                        or "INITIAL_STOP_FAILURE_CONTAINMENT_INVALID_RESULT",
+                    )
+                except Exception as exc:
+                    # A sent unprotected entry may never be allowed merely
+                    # because its emergency handler failed internally.
+                    containment = {
+                        "initial_stop_failure_containment_triggered": True,
+                        "initial_stop_failure_containment_attempted": True,
+                        "containment_status": (
+                            "INITIAL_STOP_FAILURE_CONTAINMENT_INTERNAL_ERROR"
+                        ),
+                        "containment_reason": _falcon_terminal_safe_text(exc),
+                        "falcon_live_entries_locked": True,
+                        "reconciliation_required": True,
+                    }
+            else:
+                containment = {
+                    "initial_stop_failure_containment_triggered": True,
+                    "initial_stop_failure_containment_attempted": True,
+                    "containment_status": "INITIAL_STOP_FAILURE_CONTAINMENT_INTERNAL_ERROR",
+                    "containment_reason": containment_error,
+                    "falcon_live_entries_locked": True,
+                    "reconciliation_required": True,
+                }
+
+        if isinstance(containment, dict):
+            order["initial_stop_failure_containment"] = containment
+            sig["initial_stop_failure_containment"] = containment
+            if containment.get("initial_stop_failure_containment_triggered"):
+                HEALTH["falcon_live_entries_locked"] = bool(
+                    containment.get("falcon_live_entries_locked")
+                )
+                HEALTH["falcon_initial_stop_failure_containment_status"] = (
+                    containment.get("containment_status")
+                )
+                decision = {
+                    "allowed": False,
+                    "decision": "DENY",
+                    "status": containment.get("containment_status"),
+                    "reasons": [
+                        containment.get("containment_reason")
+                        or "Entrada LIVE enviada sem disaster stop operacionalmente armado."
+                    ],
+                    "warnings": [],
+                    # Execution containment never mutates the preceding Risk
+                    # Manager result; it records the post-send fact instead.
+                    "risk_manager_decision": sig.get("execution_decision"),
+                    "initial_stop_failure_containment": containment,
+                }
+                sig["execution_decision"] = decision
+                HEALTH["last_execution_decision"] = decision
+                return False, decision
         if not order.get("ok"):
             decision = {"allowed": False, "decision": "DENY", "reasons": [f"ordem rejeitada: {order.get('error') or order.get('status')}"], "warnings": []}
             sig["execution_decision"] = decision
@@ -5613,6 +5737,10 @@ FALCON_TERMINAL_STOP_UNRESOLVED_STATES = {
     "SENT_UNCONFIRMED",
     "CONFIRMED",
 }
+FALCON_INITIAL_STOP_FAILURE_CONTAINMENT_VERSION = "2026-08-02-FALCON-INITIAL-STOP-FAILURE-CONTAINMENT-V1"
+FALCON_INITIAL_STOP_FAILURE_LIVE_ENTRIES_LOCK_KEY = (
+    "falcon:initial_stop_failure_containment:v1:live_entries_lock"
+)
 
 
 def _falcon_terminal_safe_text(value, limit=240):
@@ -5764,6 +5892,1700 @@ def falcon_terminal_stop_recovery_save(incident_id, incident_state):
         return {"ok": False, "status": "INCIDENT_PERSISTENCE_ERROR", "error": _falcon_terminal_safe_text(exc)}
 
 
+def falcon_initial_stop_failure_live_entry_lock_status():
+    """Read the durable Falcon LIVE-entry P0 lock without using local cache."""
+    try:
+        with redis_lock:
+            raw = bandwidth_redis_get_authoritative(
+                redis,
+                FALCON_INITIAL_STOP_FAILURE_LIVE_ENTRIES_LOCK_KEY,
+                caller=__name__,
+            )
+        if raw is None:
+            return {
+                "ok": True,
+                "locked": False,
+                "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_CLEAR",
+            }
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(payload, dict):
+            raise ValueError("initial stop failure lock payload is invalid")
+        active = payload.get("active") is True
+        return {
+            "ok": True,
+            "locked": active,
+            "status": (
+                "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCKED"
+                if active
+                else "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_CLEAR"
+            ),
+            "incident_id": _falcon_terminal_safe_text(payload.get("incident_id"), 160),
+            "reason": _falcon_terminal_safe_text(payload.get("reason"), 240),
+        }
+    except Exception as exc:
+        # The inability to read a P0 authority must block new LIVE entries.
+        return {
+            "ok": False,
+            "locked": True,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_READ_ERROR",
+            "reason": _falcon_terminal_safe_text(exc),
+        }
+
+
+def falcon_initial_stop_failure_save_live_entry_lock(
+    incident_id, *, active, reason=None
+):
+    """Persist the P0 entry lock independently from Falcon in-memory state."""
+    if not incident_id:
+        return {
+            "ok": False,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_IDENTITY_REQUIRED",
+        }
+    try:
+        key = FALCON_INITIAL_STOP_FAILURE_LIVE_ENTRIES_LOCK_KEY
+        payload = {
+            "version": FALCON_INITIAL_STOP_FAILURE_CONTAINMENT_VERSION,
+            "incident_id": str(incident_id),
+            "active": True,
+            "reason": _falcon_terminal_safe_text(reason, 240),
+            "updated_at": data_hora_sp_str(),
+        }
+        encoded_payload = json.dumps(payload, ensure_ascii=False)
+
+        if active:
+            # Redis SET NX is the cross-worker authority.  ``redis_lock``
+            # alone is process-local and therefore cannot decide ownership.
+            acquired = bandwidth_redis_set_if_absent(
+                redis, key, encoded_payload, caller=__name__
+            )
+            if acquired not in (None, False):
+                return {
+                    "ok": True,
+                    "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCKED",
+                    "locked": True,
+                }
+            current_raw = bandwidth_redis_get_authoritative(
+                redis, key, caller=__name__
+            )
+            if isinstance(current_raw, bytes):
+                current_raw = current_raw.decode("utf-8")
+            current = (
+                json.loads(current_raw)
+                if isinstance(current_raw, str)
+                else current_raw
+            )
+            if not isinstance(current, dict):
+                raise ValueError("initial stop failure lock payload is invalid")
+            current_incident_id = str(current.get("incident_id") or "")
+            if current.get("active") is True:
+                if current_incident_id == str(incident_id):
+                    return {
+                        "ok": True,
+                        "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_REENTERED",
+                        "locked": True,
+                    }
+                return {
+                    "ok": False,
+                    "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_OWNED_BY_OTHER_INCIDENT",
+                    "locked": True,
+                    "incident_id": _falcon_terminal_safe_text(
+                        current_incident_id, 160
+                    ),
+                }
+            # One release format from older processes stored ``active: false``
+            # instead of deleting the key.  Remove only that exact stale value,
+            # then retry SET NX; any concurrent winner remains authoritative.
+            if not bandwidth_redis_compare_and_delete(
+                redis, key, current_raw, caller=__name__
+            ):
+                return {
+                    "ok": False,
+                    "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_RACE_RECONCILIATION_REQUIRED",
+                    "locked": True,
+                }
+            acquired = bandwidth_redis_set_if_absent(
+                redis, key, encoded_payload, caller=__name__
+            )
+            if acquired not in (None, False):
+                return {
+                    "ok": True,
+                    "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCKED",
+                    "locked": True,
+                }
+            return {
+                "ok": False,
+                "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_RACE_RECONCILIATION_REQUIRED",
+                "locked": True,
+            }
+
+        current_raw = bandwidth_redis_get_authoritative(redis, key, caller=__name__)
+        if current_raw is None:
+            return {
+                "ok": True,
+                "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_CLEARED",
+                "locked": False,
+            }
+        if isinstance(current_raw, bytes):
+            current_raw = current_raw.decode("utf-8")
+        current = json.loads(current_raw) if isinstance(current_raw, str) else current_raw
+        if not isinstance(current, dict):
+            raise ValueError("initial stop failure lock payload is invalid")
+        current_incident_id = str(current.get("incident_id") or "")
+        if current_incident_id != str(incident_id):
+            return {
+                "ok": False,
+                "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_OWNED_BY_OTHER_INCIDENT",
+                "locked": True,
+                "incident_id": _falcon_terminal_safe_text(current_incident_id, 160),
+            }
+        released = bandwidth_redis_compare_and_delete(
+            redis, key, current_raw, caller=__name__
+        )
+        if released is not True:
+            return {
+                "ok": False,
+                "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_RACE_RECONCILIATION_REQUIRED",
+                "locked": True,
+            }
+        return {
+            "ok": True,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_CLEARED",
+            "locked": False,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_PERSISTENCE_ERROR",
+            "locked": True,
+            "error": _falcon_terminal_safe_text(exc),
+        }
+
+
+def falcon_initial_stop_failure_incident_id(pos, order=None):
+    """Make a deterministic incident ID without persisting raw exchange data."""
+    pos = pos if isinstance(pos, dict) else {}
+    order = order if isinstance(order, dict) else {}
+    identity = falcon_position_identity(pos)
+    signal_id = str(
+        pos.get("signal_id") or pos.get("decision_id") or pos.get("id") or ""
+    ).strip()
+    entry_order_id = str(
+        identity.get("order_id") or order.get("order_id") or order.get("id") or ""
+    ).strip()
+    entry_client_order_id = str(
+        identity.get("client_order_id")
+        or order.get("client_order_id")
+        or order.get("client_tag")
+        or ""
+    ).strip()
+    lifecycle_id = str(identity.get("lifecycle_id") or "").strip()
+    trade_id = str(identity.get("trade_id") or "").strip()
+    timestamp = str(
+        order.get("ts")
+        or order.get("timestamp")
+        or pos.get("signal_ts")
+        or pos.get("created_at")
+        or ""
+    ).strip()
+    # Symbol/side by themselves never identify a broker position safely.  A
+    # broker timestamp is accepted only as the last-resort persistence identity
+    # for a sent entry; it never authorizes the managed close below.
+    strong_identity = any(
+        (entry_order_id, entry_client_order_id, signal_id, lifecycle_id, trade_id)
+    )
+    timestamp_fallback = bool(
+        identity.get("symbol") and identity.get("side") and timestamp
+    )
+    if not strong_identity and not timestamp_fallback:
+        return None
+    components = (
+        "FALCON_INITIAL_STOP_FAILURE",
+        entry_order_id,
+        entry_client_order_id,
+        signal_id,
+        lifecycle_id,
+        trade_id,
+        identity.get("symbol"),
+        identity.get("side"),
+        timestamp,
+    )
+    digest = hashlib.sha256(
+        "|".join(str(value or "") for value in components).encode("utf-8")
+    ).hexdigest().upper()
+    return f"FALCON-INITIAL-STOP-{digest[:32]}"
+
+
+def falcon_initial_stop_failure_lifecycle_lock_owner(incident_id):
+    """Return a stable non-secret lifecycle lock owner for one P0 incident."""
+    incident_id = str(incident_id or "").strip()
+    if not incident_id:
+        return None
+    digest = hashlib.sha256(
+        f"FALCON_INITIAL_STOP_FAILURE_LOCK|{incident_id}".encode("utf-8")
+    ).hexdigest().upper()
+    return f"FALCON-INITIAL-STOP-LOCK-{digest[:32]}"
+
+
+def falcon_persist_unsafe_live_entry_registry(sig, order, incident_id):
+    """Write the exact sent-but-unprotected lifecycle before ownership recheck."""
+    sig = sig if isinstance(sig, dict) else {}
+    order = order if isinstance(order, dict) else {}
+    incident_id = str(incident_id or "").strip()
+    entry_order_id = str(order.get("order_id") or order.get("id") or "").strip()
+    entry_client_order_id = str(
+        order.get("client_order_id")
+        or order.get("client_tag")
+        or sig.get("entry_client_order_id")
+        or ""
+    ).strip()
+    lifecycle_id = str(sig.get("lifecycle_id") or "").strip()
+    symbol = _falcon_management_norm_symbol(sig.get("symbol"))
+    side = _falcon_management_norm_side(sig.get("side"))
+    if not all((incident_id, entry_order_id, entry_client_order_id, lifecycle_id, symbol, side)):
+        return {
+            "ok": False,
+            "status": "UNSAFE_ENTRY_REGISTRY_IDENTITY_REQUIRED",
+            "incident_id": incident_id or None,
+        }
+    unsafe_pos = dict(sig)
+    unsafe_pos.update({
+        "live_order": dict(order),
+        "live_order_id": entry_order_id,
+        "bingx_order_id": entry_order_id,
+        "live_client_order_id": entry_client_order_id,
+        "client_order_id": entry_client_order_id,
+        "execution_mode": "LIVE",
+        "registry_mode": "REAL",
+        "initial_qty": safe_float(
+            order.get("filled_amount") or order.get("filled") or order.get("amount"),
+            None,
+        ),
+        "qty": safe_float(
+            order.get("filled_amount") or order.get("filled") or order.get("amount"),
+            None,
+        ),
+        "reconciliation_required": True,
+        "live_management_reconciliation_pending": True,
+        "live_management_block_reason": "UNSAFE_LIVE_ENTRY_UNPROTECTED",
+        "unsafe_entry_status": "UNSAFE_LIVE_ENTRY_UNPROTECTED",
+        "initial_stop_failure_incident_id": incident_id,
+    })
+    try:
+        persisted = register_falcon_trade_registry_open(unsafe_pos)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "UNSAFE_ENTRY_REGISTRY_PERSISTENCE_ERROR",
+            "incident_id": incident_id,
+            "error": _falcon_terminal_safe_text(exc),
+        }
+    if not isinstance(persisted, dict) or persisted.get("ok") is not True:
+        return {
+            "ok": False,
+            "status": "UNSAFE_ENTRY_REGISTRY_PERSISTENCE_REQUIRED",
+            "incident_id": incident_id,
+            "registry": _falcon_terminal_sanitize_projection(persisted),
+        }
+    return {
+        "ok": True,
+        "status": "UNSAFE_LIVE_ENTRY_UNPROTECTED_REGISTERED",
+        "incident_id": incident_id,
+        "trade_id": unsafe_pos.get("trade_registry_id") or persisted.get("trade_id"),
+        "entry_order_id": entry_order_id,
+        "entry_client_order_id": entry_client_order_id,
+        "lifecycle_id": lifecycle_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": unsafe_pos.get("initial_qty"),
+    }
+
+
+def falcon_initial_stop_failure_read_close_reconciliation(identity, state):
+    """Read only the exact close leg before any resumed emergency send."""
+    identity = identity if isinstance(identity, dict) else {}
+    state = state if isinstance(state, dict) else {}
+    symbol = identity.get("symbol")
+    side = identity.get("side")
+    tolerance = FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+    result = {
+        "ok": False,
+        "read_only": True,
+        "position_snapshot": {},
+        "position_flat": False,
+        "residual_position_qty": None,
+        "close_lookup": {},
+        "close_order_active": False,
+        "close_order_terminal": False,
+        "close_order_found": False,
+        "send_outcome_unknown": False,
+    }
+    if (
+        central_broker is not None
+        and hasattr(central_broker, "managed_position_snapshot")
+        and symbol
+        and side
+    ):
+        try:
+            position_snapshot = central_broker.managed_position_snapshot(
+                symbol, side, expected_amount=None
+            )
+        except Exception as exc:
+            position_snapshot = {
+                "ok": False,
+                "status": "INITIAL_STOP_FAILURE_RECONCILIATION_POSITION_ERROR",
+                "error": _falcon_terminal_safe_text(exc),
+                "read_only": True,
+            }
+        result["position_snapshot"] = _falcon_terminal_sanitize_projection(
+            position_snapshot
+        )
+        residual_qty = safe_float(position_snapshot.get("amount"), None)
+        result["residual_position_qty"] = residual_qty
+        result["position_flat"] = bool(
+            position_snapshot.get("ok") is True
+            and position_snapshot.get("read_only") is True
+            and _falcon_management_norm_symbol(position_snapshot.get("symbol"))
+            == symbol
+            and _falcon_management_norm_side(position_snapshot.get("side")) == side
+            and position_snapshot.get("position_closed") is True
+            and residual_qty is not None
+            and residual_qty <= tolerance
+        )
+    reservation = (
+        state.get("client_order_id_reservation")
+        if isinstance(state.get("client_order_id_reservation"), dict)
+        else {}
+    )
+    failsafe = (
+        state.get("failsafe_result")
+        if isinstance(state.get("failsafe_result"), dict)
+        else {}
+    )
+    close_order_id = (
+        state.get("emergency_close_order_id")
+        or failsafe.get("order_id")
+        or failsafe.get("id")
+    )
+    close_client_order_id = (
+        state.get("emergency_close_client_order_id")
+        or reservation.get("client_order_id")
+        or failsafe.get("client_order_id")
+    )
+    close_lookup = {}
+    if (
+        central_broker is not None
+        and close_order_id
+        and hasattr(central_broker, "managed_order_snapshot")
+    ):
+        try:
+            close_lookup = central_broker.managed_order_snapshot(symbol, close_order_id)
+        except Exception as exc:
+            close_lookup = {
+                "ok": False,
+                "status": "INITIAL_STOP_FAILURE_CLOSE_ORDER_LOOKUP_ERROR",
+                "error": _falcon_terminal_safe_text(exc),
+                "read_only": True,
+            }
+    elif central_broker is not None and close_client_order_id:
+        for helper_name in ("reconcile_order_from_bingx", "fetch_order_by_id"):
+            helper = getattr(central_broker, helper_name, None)
+            if not callable(helper):
+                continue
+            try:
+                candidate = helper(symbol, client_order_id=close_client_order_id)
+            except Exception as exc:
+                candidate = {
+                    "ok": False,
+                    "status": "INITIAL_STOP_FAILURE_CLOSE_CLIENT_LOOKUP_ERROR",
+                    "error": _falcon_terminal_safe_text(exc),
+                    "read_only": True,
+                }
+            if isinstance(candidate, dict):
+                close_lookup = candidate.get("order") if isinstance(
+                    candidate.get("order"), dict
+                ) else candidate
+            break
+    result["close_lookup"] = _falcon_terminal_sanitize_projection(close_lookup)
+    close_status = str(
+        close_lookup.get("status") or close_lookup.get("raw_status") or ""
+    ).upper().strip()
+    result["close_order_found"] = bool(
+        close_lookup.get("ok") is True
+        or close_lookup.get("order_id")
+        or close_lookup.get("id")
+    )
+    result["close_order_active"] = bool(
+        result["close_order_found"]
+        and close_status
+        not in {"CLOSED", "FILLED", "EXECUTED", "COMPLETED", "DONE", "FINISHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+    )
+    result["close_order_terminal"] = bool(
+        close_status in {"CLOSED", "FILLED", "EXECUTED", "COMPLETED", "DONE", "FINISHED"}
+        or close_lookup.get("confirmed") is True
+    )
+    result["send_outcome_unknown"] = bool(
+        state.get("emergency_close_sent") is None
+        or state.get("send_outcome_unknown") is True
+        or failsafe.get("send_outcome_unknown") is True
+        or str(state.get("attempt_state") or "").upper()
+        in {"SEND_OUTCOME_UNKNOWN", "SENT_UNCONFIRMED"}
+    )
+    result["ok"] = bool(
+        isinstance(result.get("position_snapshot"), dict)
+        and result["position_snapshot"].get("ok") is True
+    )
+    return result
+
+
+def _falcon_initial_stop_failure_position_mode_evidence(
+    identity, entry_snapshot, position_snapshot
+):
+    """Require factual leg semantics; never infer one-way from ``BOTH``."""
+    identity = identity if isinstance(identity, dict) else {}
+    entry_snapshot = entry_snapshot if isinstance(entry_snapshot, dict) else {}
+    position_snapshot = (
+        position_snapshot if isinstance(position_snapshot, dict) else {}
+    )
+    expected_side = _falcon_management_norm_side(identity.get("side"))
+
+    def observed_side(snapshot):
+        value = (
+            snapshot.get("position_side")
+            or snapshot.get("positionSide")
+            or snapshot.get("posSide")
+        )
+        if value in (None, ""):
+            rows = snapshot.get("positions")
+            rows = rows if isinstance(rows, list) else []
+            if len(rows) == 1 and isinstance(rows[0], dict):
+                value = (
+                    rows[0].get("position_side")
+                    or rows[0].get("positionSide")
+                    or rows[0].get("posSide")
+                    or rows[0].get("side")
+                )
+        return _falcon_management_norm_side(value)
+
+    def raw_mode(snapshot):
+        for field in (
+            "position_mode",
+            "positionMode",
+            "account_position_mode",
+            "accountPositionMode",
+        ):
+            value = snapshot.get(field)
+            if value not in (None, ""):
+                return str(value).upper().strip(), field
+        return "", None
+
+    position_mode, position_mode_source = raw_mode(position_snapshot)
+    entry_mode, entry_mode_source = raw_mode(entry_snapshot)
+
+    def normalize_mode(value):
+        if value in {"HEDGE", "HEDGED", "DUAL", "DUAL_SIDE", "DUALSIDE"}:
+            return "HEDGE"
+        if value in {"ONE_WAY", "ONEWAY", "NET", "SINGLE"}:
+            return "ONE_WAY"
+        return "UNKNOWN"
+
+    normalized_position_mode = normalize_mode(position_mode)
+    normalized_entry_mode = normalize_mode(entry_mode)
+    conflicting_modes = bool(
+        normalized_position_mode != "UNKNOWN"
+        and normalized_entry_mode != "UNKNOWN"
+        and normalized_position_mode != normalized_entry_mode
+    )
+    mode = (
+        "CONFLICTING"
+        if conflicting_modes
+        else (
+            normalized_position_mode
+            if normalized_position_mode != "UNKNOWN"
+            else normalized_entry_mode
+        )
+    )
+    entry_position_side = observed_side(entry_snapshot)
+    observed_position_side = observed_side(position_snapshot)
+    opposite_position_open = position_snapshot.get("opposite_position_open")
+    if opposite_position_open is None:
+        opposite_position_open = position_snapshot.get("opposite_leg_open")
+
+    reasons = []
+    if expected_side not in {"LONG", "SHORT"}:
+        reasons.append("EXPECTED_POSITION_SIDE_REQUIRED")
+    if mode == "CONFLICTING":
+        reasons.append("POSITION_MODE_EVIDENCE_CONFLICT")
+    elif mode == "HEDGE":
+        if entry_position_side != expected_side:
+            reasons.append("ENTRY_POSITION_SIDE_EXACT_REQUIRED_IN_HEDGE")
+        if observed_position_side != expected_side:
+            reasons.append("POSITION_SIDE_EXACT_REQUIRED_IN_HEDGE")
+    elif mode == "ONE_WAY":
+        for label, observed in (
+            ("ENTRY", entry_position_side),
+            ("POSITION", observed_position_side),
+        ):
+            if observed not in {expected_side, "BOTH"}:
+                reasons.append(f"{label}_POSITION_SIDE_INVALID_IN_ONE_WAY")
+            if observed == "BOTH" and opposite_position_open is not False:
+                reasons.append("ONE_WAY_OPPOSITE_LEG_CLEAR_EVIDENCE_REQUIRED")
+    else:
+        # An exact LONG/SHORT value is factual leg evidence even if the account
+        # mode was not returned.  Empty/BOTH never proves a leg by itself.
+        if entry_position_side != expected_side:
+            reasons.append("ENTRY_POSITION_SIDE_EXACT_REQUIRED")
+        if observed_position_side != expected_side:
+            reasons.append("POSITION_SIDE_EXACT_REQUIRED")
+
+    return {
+        "ok": not reasons,
+        "status": (
+            "POSITION_MODE_AND_SIDE_CONFIRMED"
+            if not reasons
+            else "POSITION_MODE_OR_SIDE_UNCONFIRMED"
+        ),
+        "reasons": reasons,
+        "position_mode": mode,
+        "position_mode_source": (
+            position_mode_source or entry_mode_source or "UNAVAILABLE"
+        ),
+        "position_mode_evidence": {
+            "current_raw": position_mode or None,
+            "entry_raw": entry_mode or None,
+            "opposite_position_open": opposite_position_open,
+        },
+        "expected_position_side": expected_side or None,
+        "entry_position_side": entry_position_side or None,
+        "observed_position_side": observed_position_side or None,
+    }
+
+
+def falcon_initial_stop_failure_current_ownership_evidence(
+    pos, identity, entry_snapshot, position_snapshot
+):
+    """Re-read the hardened Registry/Broker ownership facts before a close."""
+    pos = pos if isinstance(pos, dict) else {}
+    identity = identity if isinstance(identity, dict) else {}
+    entry_snapshot = entry_snapshot if isinstance(entry_snapshot, dict) else {}
+    position_snapshot = (
+        position_snapshot if isinstance(position_snapshot, dict) else {}
+    )
+    reasons = []
+    try:
+        registry = _falcon_terminal_registry_evidence(pos)
+    except Exception as exc:
+        registry = {
+            "ok": False,
+            "status": "REGISTRY_CURRENT_OWNERSHIP_READ_ERROR",
+            "error": _falcon_terminal_safe_text(exc),
+            "matches": [],
+            "same_leg_other_records": [],
+        }
+    registry = registry if isinstance(registry, dict) else {}
+    matches = registry.get("matches") if isinstance(registry.get("matches"), list) else []
+    candidate = matches[0] if len(matches) == 1 and isinstance(matches[0], dict) else {}
+    if registry.get("ok") is not True:
+        reasons.append(str(registry.get("status") or "REGISTRY_CURRENT_OWNERSHIP_REQUIRED"))
+    if registry.get("partial") is True:
+        reasons.append("REGISTRY_CURRENT_OWNERSHIP_PARTIAL")
+    if registry.get("lifecycle_match_count") != 1 or not candidate:
+        reasons.append("OPEN_FALCON_LIFECYCLE_MATCH_NOT_UNIQUE")
+    if registry.get("same_leg_other_records"):
+        reasons.append("MANUAL_OR_EXTERNAL_POSITION_AGGREGATION_RISK")
+    if str(_falcon_terminal_registry_field(candidate, "bot") or "").upper().strip() != "FALCON":
+        reasons.append("CURRENT_REGISTRY_BOT_MISMATCH")
+    if str(_falcon_terminal_registry_field(candidate, "execution_mode", "mode") or "").upper().strip() != "LIVE":
+        reasons.append("CURRENT_REGISTRY_EXECUTION_MODE_MISMATCH")
+    if str(_falcon_terminal_registry_field(candidate, "registry_mode") or "").upper().strip() != "REAL":
+        reasons.append("CURRENT_REGISTRY_MODE_MISMATCH")
+
+    expected_pairs = (
+        ("LIFECYCLE_ID", identity.get("lifecycle_id"), _falcon_terminal_registry_field(candidate, "lifecycle_id")),
+        ("ENTRY_ORDER_ID", identity.get("order_id"), _falcon_terminal_registry_field(candidate, "broker_order_id", "live_order_id", "order_id")),
+        ("ENTRY_CLIENT_ORDER_ID", identity.get("client_order_id"), _falcon_terminal_registry_field(candidate, "client_order_id", "live_client_order_id")),
+        ("SYMBOL", identity.get("symbol"), _falcon_terminal_registry_field(candidate, "symbol")),
+        ("SIDE", identity.get("side"), _falcon_terminal_registry_field(candidate, "side")),
+    )
+    if identity.get("trade_id") not in (None, ""):
+        expected_pairs += (
+            ("TRADE_ID", identity.get("trade_id"), _falcon_terminal_registry_field(candidate, "trade_id")),
+        )
+    for label, expected, actual in expected_pairs:
+        expected_text = str(expected or "").upper().strip()
+        actual_text = str(actual or "").upper().strip()
+        if label == "SYMBOL":
+            expected_text = _falcon_management_norm_symbol(expected)
+            actual_text = _falcon_management_norm_symbol(actual)
+        elif label == "SIDE":
+            expected_text = _falcon_management_norm_side(expected)
+            actual_text = _falcon_management_norm_side(actual)
+        if not expected_text or not actual_text or expected_text != actual_text:
+            reasons.append(f"CURRENT_REGISTRY_{label}_MISMATCH")
+
+    manual_position_detected = bool(
+        _falcon_terminal_bool(position_snapshot.get("manual_position_detected"))
+        or _falcon_terminal_bool(position_snapshot.get("external_position_detected"))
+    )
+    position_rows = (
+        position_snapshot.get("positions")
+        if isinstance(position_snapshot.get("positions"), list)
+        else []
+    )
+    manual_position_detected = manual_position_detected or any(
+        _falcon_terminal_bool(row.get("manual_position"))
+        or _falcon_terminal_bool(row.get("external_position"))
+        or str(row.get("ownership") or "").upper().strip() in {"MANUAL", "EXTERNAL"}
+        for row in position_rows
+        if isinstance(row, dict)
+    )
+    if manual_position_detected:
+        reasons.append("MANUAL_OR_EXTERNAL_POSITION_AGGREGATION_RISK")
+
+    current_amount = safe_float(position_snapshot.get("amount"), None)
+    if position_snapshot.get("ok") is not True:
+        reasons.append("BROKER_CURRENT_POSITION_SNAPSHOT_REQUIRED")
+    if position_snapshot.get("read_only") is not True:
+        reasons.append("BROKER_CURRENT_POSITION_READ_ONLY_REQUIRED")
+    if position_snapshot.get("partial") is True:
+        reasons.append("BROKER_CURRENT_POSITION_PARTIAL")
+    if position_snapshot.get("position_closed") is not False:
+        reasons.append("BROKER_CURRENT_POSITION_NOT_OPEN")
+    if _falcon_management_norm_symbol(position_snapshot.get("symbol")) != identity.get("symbol"):
+        reasons.append("BROKER_CURRENT_POSITION_SYMBOL_MISMATCH")
+    if _falcon_management_norm_side(position_snapshot.get("side")) != identity.get("side"):
+        reasons.append("BROKER_CURRENT_POSITION_SIDE_MISMATCH")
+    if position_snapshot.get("ownership_safe") is not True:
+        reasons.append("BROKER_CURRENT_POSITION_OWNERSHIP_UNSAFE")
+    if current_amount is None or current_amount <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE:
+        reasons.append("BROKER_CURRENT_POSITION_AMOUNT_REQUIRED")
+    if position_snapshot.get("matched_count") != 1:
+        reasons.append("BROKER_CURRENT_POSITION_MATCH_COUNT_NOT_UNIQUE")
+
+    mode_evidence = _falcon_initial_stop_failure_position_mode_evidence(
+        identity, entry_snapshot, position_snapshot
+    )
+    reasons.extend(mode_evidence.get("reasons") or [])
+    reasons = list(dict.fromkeys(reasons))
+    return {
+        "ok": not reasons,
+        "status": (
+            "CURRENT_OWNERSHIP_CONFIRMED"
+            if not reasons
+            else "CURRENT_OWNERSHIP_UNCONFIRMED"
+        ),
+        "reasons": reasons,
+        "registry": {
+            "ok": registry.get("ok") is True,
+            "status": registry.get("status"),
+            "lifecycle_match_count": registry.get("lifecycle_match_count"),
+            "same_leg_other_record_count": len(
+                registry.get("same_leg_other_records") or []
+            ),
+        },
+        "entry_identity_linked": not any(
+            item.startswith("CURRENT_REGISTRY_") for item in reasons
+        ),
+        "manual_or_external_detected": manual_position_detected or bool(
+            registry.get("same_leg_other_records")
+        ),
+        "position_mode_evidence": mode_evidence,
+        "expected_position_side": mode_evidence.get("expected_position_side"),
+        "observed_position_side": mode_evidence.get("observed_position_side"),
+    }
+
+
+def falcon_initial_stop_failure_finalize_confirmed(
+    incident_id, state, base, *, residual_qty, post_snapshot, close_projection=None
+):
+    """Persist terminal containment before acknowledging the durable unlock."""
+    state = dict(state or {})
+    base = dict(base or {})
+    projection = close_projection if isinstance(close_projection, dict) else {}
+    state.update({
+        "attempt_state": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_CONFIRMED",
+        "containment_status": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_CONFIRMED",
+        "containment_reason": "CENTRAL_OWNED_POSITION_FACTUALLY_CLOSED",
+        "emergency_close_attempted": bool(
+            state.get("emergency_close_attempted") or projection
+        ),
+        "emergency_close_sent": (
+            projection.get("sent")
+            if projection.get("sent") is not None
+            else state.get("emergency_close_sent")
+        ),
+        "emergency_close_confirmed": True,
+        "residual_position_qty": residual_qty,
+        "position_snapshot_after": _falcon_terminal_sanitize_projection(
+            post_snapshot
+        ),
+        # The terminal record must be saved before any unlock is attempted.
+        "falcon_live_entries_locked": True,
+        "updated_at": data_hora_sp_str(),
+    })
+    terminal_save = falcon_terminal_stop_recovery_save(incident_id, state)
+    if terminal_save.get("ok") is not True:
+        HEALTH["falcon_live_entries_locked"] = True
+        return {
+            **base,
+            "unsafe_entry_persisted": True,
+            "ownership_confirmed": state.get("ownership_confirmed") is True,
+            "emergency_close_attempted": state.get("emergency_close_attempted") is True,
+            "emergency_close_idempotency_key": incident_id,
+            "emergency_close_sent": state.get("emergency_close_sent"),
+            "emergency_close_confirmed": True,
+            "residual_position_qty": residual_qty,
+            "falcon_live_entries_locked": True,
+            "containment_status": "INITIAL_STOP_FAILED_TERMINAL_PERSISTENCE_REQUIRED",
+            "containment_reason": terminal_save.get("error") or terminal_save.get("status"),
+            "persistence": terminal_save,
+        }
+    lock_writer = globals().get("falcon_initial_stop_failure_save_live_entry_lock")
+    lock_reader = globals().get("falcon_initial_stop_failure_live_entry_lock_status")
+    lock_release = (
+        {
+            "ok": False,
+            "locked": True,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_ACTIVATION_UNACKNOWLEDGED",
+        }
+        if state.get("live_entry_lock_persistence_failed") is True
+        else (
+            lock_writer(
+                incident_id, active=False, reason=state.get("containment_reason")
+            )
+            if callable(lock_writer)
+            else {
+                "ok": False,
+                "locked": True,
+                "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_HELPER_MISSING",
+            }
+        )
+    )
+    lock_status = (
+        lock_reader()
+        if callable(lock_reader)
+        else {
+            "ok": False,
+            "locked": True,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_STATUS_HELPER_MISSING",
+        }
+    )
+    unlocked = bool(
+        lock_release.get("ok") is True
+        and lock_release.get("locked") is False
+        and lock_status.get("ok") is True
+        and lock_status.get("locked") is False
+    )
+    state["live_entry_lock_release"] = _falcon_terminal_sanitize_projection(
+        lock_release
+    )
+    state["live_entry_lock_status_after_release"] = (
+        _falcon_terminal_sanitize_projection(lock_status)
+    )
+    state["falcon_live_entries_locked"] = not unlocked
+    acknowledgement_save = falcon_terminal_stop_recovery_save(incident_id, state)
+    HEALTH["falcon_live_entries_locked"] = not unlocked
+    return {
+        **base,
+        "unsafe_entry_persisted": True,
+        "ownership_confirmed": state.get("ownership_confirmed") is True,
+        "emergency_close_attempted": state.get("emergency_close_attempted") is True,
+        "emergency_close_idempotency_key": incident_id,
+        "emergency_close_sent": state.get("emergency_close_sent"),
+        "emergency_close_confirmed": True,
+        "residual_position_qty": residual_qty,
+        "falcon_live_entries_locked": not unlocked,
+        "containment_status": state.get("containment_status"),
+        "containment_reason": state.get("containment_reason"),
+        "persistence": {
+            "terminal": terminal_save,
+            "unlock_acknowledgement": acknowledgement_save,
+        },
+        "live_entry_lock_release": _falcon_terminal_sanitize_projection(
+            lock_release
+        ),
+        "live_entry_lock_status": _falcon_terminal_sanitize_projection(
+            lock_status
+        ),
+    }
+
+
+def falcon_handle_initial_stop_failure_containment(sig, order):
+    """Contain a sent Falcon entry whose initial physical stop is not armed.
+
+    The emergency close itself is the existing hardened managed-close path.  A
+    symbol/side match alone is never enough: the exact entry order, factual
+    fill, exact live leg, pre-entry ownership evidence and account authority
+    must all agree before the close can be attempted.
+    """
+    sig = sig if isinstance(sig, dict) else {}
+    order = order if isinstance(order, dict) else {}
+    disaster = (
+        order.get("disaster_stop")
+        if isinstance(order.get("disaster_stop"), dict)
+        else {}
+    )
+    base = {
+        "version": FALCON_INITIAL_STOP_FAILURE_CONTAINMENT_VERSION,
+        "initial_stop_failure_containment_triggered": False,
+        "unsafe_entry_persisted": False,
+        "ownership_confirmed": False,
+        "emergency_close_attempted": False,
+        "emergency_close_idempotency_key": None,
+        "emergency_close_sent": False,
+        "emergency_close_confirmed": False,
+        "residual_position_qty": None,
+        "falcon_live_entries_locked": False,
+        "containment_status": "INITIAL_STOP_FAILURE_NOT_APPLICABLE",
+        "containment_reason": None,
+    }
+    if order.get("sent") is not True:
+        return {**base, "containment_reason": "ENTRY_NOT_SENT"}
+    if disaster.get("stop_operationally_armed") is True:
+        return {**base, "containment_reason": "INITIAL_STOP_OPERATIONALLY_ARMED"}
+    # ``sent`` is the factual broker outcome.  Contradictory local execution
+    # labels cannot reclassify a sent, unprotected entry as a preview or dry
+    # run, because doing so would leave a real position without containment.
+    execution_state_conflict = bool(
+        order.get("live_send_enabled") is False
+        or order.get("preview_isolation") is True
+    )
+
+    incident_pos = dict(sig)
+    incident_pos.update({
+        "live_order": dict(order),
+        "live_order_id": order.get("order_id") or order.get("id") or sig.get("live_order_id"),
+        "live_client_order_id": order.get("client_order_id") or order.get("client_tag") or sig.get("live_client_order_id"),
+        "execution_mode": "LIVE",
+        "registry_mode": "REAL",
+    })
+    incident_pos["bingx_order_id"] = incident_pos.get("live_order_id")
+    identity = falcon_position_identity(incident_pos)
+    incident_id = falcon_initial_stop_failure_incident_id(incident_pos, order)
+    ownership_evidence_at_entry = sig.get(
+        "falcon_real_position_ownership_limit_v1"
+    )
+    ownership_evidence_at_entry = (
+        ownership_evidence_at_entry
+        if isinstance(ownership_evidence_at_entry, dict)
+        else {}
+    )
+    stop_status = _falcon_terminal_safe_text(
+        disaster.get("status") or order.get("status") or "STOP_UNCONFIRMED", 120
+    )
+    failure_reason = _falcon_terminal_safe_text(
+        disaster.get("reason")
+        or disaster.get("error")
+        or order.get("error")
+        or stop_status,
+        240,
+    )
+    base.update({
+        "initial_stop_failure_containment_triggered": True,
+        "initial_stop_failure_containment_attempted": True,
+        "emergency_close_idempotency_key": incident_id,
+        "falcon_live_entries_locked": True,
+        "containment_status": "UNSAFE_LIVE_ENTRY_UNPROTECTED",
+        "containment_reason": failure_reason or "INITIAL_STOP_NOT_OPERATIONALLY_ARMED",
+        "execution_state_conflict": execution_state_conflict,
+        "execution_state_conflict_status": (
+            "INITIAL_STOP_FAILURE_EXECUTION_STATE_CONFLICT"
+            if execution_state_conflict
+            else None
+        ),
+    })
+    sig.update({
+        "entry_retry_blocked": True,
+        "reconciliation_required": True,
+        "live_management_reconciliation_pending": True,
+        "live_management_block_reason": "UNSAFE_LIVE_ENTRY_UNPROTECTED",
+    })
+    HEALTH["falcon_live_entries_locked"] = True
+    if not incident_id:
+        return {
+            **base,
+            "containment_status": "INITIAL_STOP_FAILED_OWNERSHIP_UNCONFIRMED",
+            "containment_reason": "INCIDENT_IDENTITY_INSUFFICIENT",
+        }
+
+    loaded = falcon_terminal_stop_recovery_load(incident_id)
+    if not loaded.get("ok"):
+        return {
+            **base,
+            "containment_status": "INITIAL_STOP_FAILED_PERSISTENCE_READ_REQUIRED",
+            "containment_reason": loaded.get("error") or "INCIDENT_PERSISTENCE_READ_FAILED",
+        }
+    existing = dict(loaded.get("incident") or {})
+    resuming_existing = bool(existing)
+    restart_reconciliation = {}
+    prior_send_unknown = False
+    if resuming_existing:
+        # Keep the original incident identity and idempotency material.  A
+        # restart is a reconciliation of this state, never a new close flow.
+        state = dict(existing)
+        state.setdefault("incident_id", incident_id)
+        state.setdefault("incident_type", "INITIAL_STOP_FAILURE_CONTAINMENT")
+        state.setdefault("version", FALCON_INITIAL_STOP_FAILURE_CONTAINMENT_VERSION)
+        state.setdefault("emergency_close_sent", False)
+        state.setdefault("emergency_close_confirmed", False)
+        state.setdefault("falcon_live_entries_locked", True)
+        state.setdefault("unsafe_entry_persisted", True)
+        state.setdefault(
+            "ownership_evidence_at_entry",
+            _falcon_terminal_sanitize_projection(ownership_evidence_at_entry),
+        )
+        state["execution_state_conflict"] = execution_state_conflict
+        state["execution_state_conflict_status"] = (
+            "INITIAL_STOP_FAILURE_EXECUTION_STATE_CONFLICT"
+            if execution_state_conflict
+            else None
+        )
+        state["updated_at"] = data_hora_sp_str()
+    else:
+        state = {
+            "version": FALCON_INITIAL_STOP_FAILURE_CONTAINMENT_VERSION,
+            "incident_id": incident_id,
+            "incident_type": "INITIAL_STOP_FAILURE_CONTAINMENT",
+            "attempt_state": "UNSAFE_LIVE_ENTRY_UNPROTECTED",
+            "containment_status": "UNSAFE_LIVE_ENTRY_UNPROTECTED",
+            "containment_reason": failure_reason or "INITIAL_STOP_NOT_OPERATIONALLY_ARMED",
+            "bot": "FALCON",
+            "symbol": identity.get("symbol"),
+            "side": identity.get("side"),
+            "position_side": identity.get("side"),
+            "lifecycle_id": identity.get("lifecycle_id"),
+            "trade_id": identity.get("trade_id"),
+            "entry_order_id": identity.get("order_id"),
+            "entry_client_order_id": identity.get("client_order_id"),
+            "signal_id": _falcon_terminal_safe_text(
+                sig.get("signal_id") or sig.get("decision_id") or sig.get("id"), 160
+            ),
+            "entry_sent": True,
+            "entry_amount": safe_float(order.get("amount"), None),
+            "entry_filled_amount": safe_float(
+                order.get("filled_amount") or order.get("filled"), None
+            ),
+            "stop_order_id": _falcon_terminal_safe_text(disaster.get("order_id"), 120),
+            "stop_client_order_id": _falcon_terminal_safe_text(disaster.get("client_order_id"), 120),
+            "stop_status": stop_status,
+            "stop_operationally_armed": False,
+            "execution_state_conflict": execution_state_conflict,
+            "execution_state_conflict_status": (
+                "INITIAL_STOP_FAILURE_EXECUTION_STATE_CONFLICT"
+                if execution_state_conflict
+                else None
+            ),
+            "unsafe_entry_persisted": True,
+            # Historical decision evidence is audit-only.  A current hardened
+            # Registry/Broker recheck below is the only close authority.
+            "ownership_evidence_at_entry": _falcon_terminal_sanitize_projection(
+                ownership_evidence_at_entry
+            ),
+            "ownership_confirmed": False,
+            "emergency_close_attempted": False,
+            "emergency_close_sent": False,
+            "emergency_close_confirmed": False,
+            "residual_position_qty": None,
+            "falcon_live_entries_locked": True,
+            "reconciliation_required": True,
+            "first_detected_at": data_hora_sp_str(),
+            "updated_at": data_hora_sp_str(),
+        }
+        initial_save = falcon_terminal_stop_recovery_save(incident_id, state)
+        if not initial_save.get("ok"):
+            return {
+                **base,
+                "containment_status": "INITIAL_STOP_FAILED_PERSISTENCE_REQUIRED",
+                "containment_reason": initial_save.get("error") or initial_save.get("status"),
+            }
+    base["unsafe_entry_persisted"] = True
+
+    lock_writer = globals().get("falcon_initial_stop_failure_save_live_entry_lock")
+    entry_lock = (
+        lock_writer(incident_id, active=True, reason=state.get("containment_reason"))
+        if callable(lock_writer)
+        else {
+            "ok": False,
+            "locked": True,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_HELPER_MISSING",
+        }
+    )
+    state["live_entry_lock"] = _falcon_terminal_sanitize_projection(entry_lock)
+    state["live_entry_lock_persistence_failed"] = entry_lock.get("ok") is not True
+    state["falcon_live_entries_locked"] = True
+    if entry_lock.get("ok") is not True:
+        state["live_entry_lock_error"] = _falcon_terminal_safe_text(
+            entry_lock.get("error") or entry_lock.get("status"), 240
+        )
+        alert = globals().get("falcon_terminal_stop_critical_alert")
+        if callable(alert):
+            state["critical_alert"] = alert(incident_pos, state, blocked=True)
+        # The primary incident already exists durably.  An auxiliary lock
+        # write failure blocks new entries locally but must not strand a
+        # factually owned unprotected leg by suppressing its reduce-only close.
+        falcon_terminal_stop_recovery_save(incident_id, state)
+
+    # The normal accepted-signal writer only runs after this function has
+    # already denied the signal.  Persist this exact sent lifecycle before the
+    # current ownership recheck so that the Registry is the operational source
+    # for the close decision, rather than an in-memory test fixture.
+    terminal_recovery_already_confirmed = bool(
+        resuming_existing
+        and str(state.get("containment_status") or "").upper()
+        == "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_CONFIRMED"
+        and state.get("emergency_close_confirmed") is True
+        and isinstance(state.get("position_snapshot_after"), dict)
+        and state["position_snapshot_after"].get("position_closed") is True
+    )
+    if (
+        state.get("unsafe_entry_registry_persisted") is not True
+        and not terminal_recovery_already_confirmed
+    ):
+        unsafe_registry = falcon_persist_unsafe_live_entry_registry(
+            incident_pos, order, incident_id
+        )
+        state["unsafe_entry_registry"] = _falcon_terminal_sanitize_projection(
+            unsafe_registry
+        )
+        if unsafe_registry.get("ok") is not True:
+            state.update({
+                "attempt_state": "UNSAFE_ENTRY_REGISTRY_PERSISTENCE_REQUIRED",
+                "containment_status": "INITIAL_STOP_FAILED_OWNERSHIP_UNCONFIRMED",
+                "containment_reason": "UNSAFE_ENTRY_REGISTRY_PERSISTENCE_REQUIRED",
+                "falcon_live_entries_locked": True,
+                "updated_at": data_hora_sp_str(),
+            })
+            alert = globals().get("falcon_terminal_stop_critical_alert")
+            if callable(alert):
+                state["critical_alert"] = alert(incident_pos, state, blocked=True)
+            falcon_terminal_stop_recovery_save(incident_id, state)
+            return {
+                **base,
+                "containment_status": state["containment_status"],
+                "containment_reason": state["containment_reason"],
+                "registry": state["unsafe_entry_registry"],
+            }
+        state["unsafe_entry_registry_persisted"] = True
+        state["unsafe_entry_registry_trade_id"] = unsafe_registry.get("trade_id")
+        incident_pos["trade_registry_id"] = unsafe_registry.get("trade_id")
+        registry_save = falcon_terminal_stop_recovery_save(incident_id, state)
+        if registry_save.get("ok") is not True:
+            state.update({
+                "attempt_state": "UNSAFE_ENTRY_REGISTRY_STATE_PERSISTENCE_REQUIRED",
+                "containment_status": "INITIAL_STOP_FAILED_PERSISTENCE_REQUIRED",
+                "containment_reason": registry_save.get("error") or registry_save.get("status"),
+                "falcon_live_entries_locked": True,
+            })
+            return {
+                **base,
+                "containment_status": state["containment_status"],
+                "containment_reason": state["containment_reason"],
+                "registry": state["unsafe_entry_registry"],
+            }
+    else:
+        incident_pos["trade_registry_id"] = state.get(
+            "unsafe_entry_registry_trade_id"
+        )
+
+    if resuming_existing:
+        restart_reconciliation = falcon_initial_stop_failure_read_close_reconciliation(
+            identity, state
+        )
+        state["restart_reconciliation"] = _falcon_terminal_sanitize_projection(
+            restart_reconciliation
+        )
+        prior_status = str(state.get("containment_status") or "").upper()
+        terminal_evidence = (
+            state.get("emergency_close_confirmed") is True
+            and isinstance(state.get("position_snapshot_after"), dict)
+            and state["position_snapshot_after"].get("position_closed") is True
+            and safe_float(state.get("residual_position_qty"), None) is not None
+            and safe_float(state.get("residual_position_qty"), None)
+            <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+        )
+        terminal_confirmed = bool(
+            prior_status == "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_CONFIRMED"
+            and state.get("emergency_close_confirmed") is True
+        )
+        if terminal_confirmed and (
+            restart_reconciliation.get("position_flat") is True or terminal_evidence
+        ):
+            base["idempotent"] = True
+            return falcon_initial_stop_failure_finalize_confirmed(
+                incident_id,
+                state,
+                base,
+                residual_qty=(
+                    restart_reconciliation.get("residual_position_qty")
+                    if restart_reconciliation.get("position_flat") is True
+                    else state.get("residual_position_qty")
+                ),
+                post_snapshot=(
+                    restart_reconciliation.get("position_snapshot")
+                    if restart_reconciliation.get("position_flat") is True
+                    else state.get("position_snapshot_after")
+                ),
+                close_projection=state.get("failsafe_result"),
+            )
+        if restart_reconciliation.get("position_flat") is True:
+            return falcon_initial_stop_failure_finalize_confirmed(
+                incident_id,
+                state,
+                base,
+                residual_qty=restart_reconciliation.get("residual_position_qty"),
+                post_snapshot=restart_reconciliation.get("position_snapshot"),
+                close_projection=state.get("failsafe_result"),
+            )
+        prior_send_unknown = bool(
+            restart_reconciliation.get("send_outcome_unknown") is True
+            or restart_reconciliation.get("close_order_active") is True
+            or restart_reconciliation.get("close_order_terminal") is True
+            or state.get("emergency_close_sent") is True
+        )
+
+    entry_snapshot = {}
+    if (
+        central_broker is not None
+        and hasattr(central_broker, "managed_order_snapshot")
+        and identity.get("order_id")
+    ):
+        try:
+            entry_snapshot = central_broker.managed_order_snapshot(
+                identity.get("symbol"), identity.get("order_id")
+            )
+        except Exception as exc:
+            entry_snapshot = {
+                "ok": False,
+                "status": "ENTRY_ORDER_SNAPSHOT_ERROR",
+                "error": _falcon_terminal_safe_text(exc),
+            }
+    entry_filled_qty = safe_float(
+        entry_snapshot.get("filled")
+        if entry_snapshot.get("filled") not in (None, "")
+        else entry_snapshot.get("executed_quantity"),
+        None,
+    )
+    entry_evidence_ok = bool(
+        entry_snapshot.get("ok") is True
+        and entry_snapshot.get("read_only") is True
+        and str(entry_snapshot.get("order_id") or "") == str(identity.get("order_id") or "")
+        and _falcon_management_norm_symbol(entry_snapshot.get("symbol")) == identity.get("symbol")
+        and str(entry_snapshot.get("side") or "").upper()
+        == ("BUY" if identity.get("side") == "LONG" else "SELL")
+        and _falcon_management_norm_side(entry_snapshot.get("position_side"))
+        in {"", identity.get("side"), "BOTH"}
+        and entry_filled_qty is not None
+        and entry_filled_qty > FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+    )
+    state["entry_order_snapshot"] = _falcon_terminal_sanitize_projection(entry_snapshot)
+    state["entry_filled_amount"] = entry_filled_qty
+
+    position_snapshot = {}
+    if entry_evidence_ok and hasattr(central_broker, "managed_position_snapshot"):
+        try:
+            position_snapshot = central_broker.managed_position_snapshot(
+                identity.get("symbol"),
+                identity.get("side"),
+                expected_amount=entry_filled_qty,
+            )
+        except Exception as exc:
+            position_snapshot = {
+                "ok": False,
+                "status": "POSITION_SNAPSHOT_ERROR",
+                "error": _falcon_terminal_safe_text(exc),
+            }
+    broker_qty = safe_float(position_snapshot.get("amount"), None)
+    position_evidence_ok = bool(
+        position_snapshot.get("ok") is True
+        and position_snapshot.get("read_only") is True
+        and position_snapshot.get("partial") is not True
+        and position_snapshot.get("position_closed") is False
+        and broker_qty is not None
+        and broker_qty > FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+    )
+    state["position_snapshot_before"] = _falcon_terminal_sanitize_projection(position_snapshot)
+    state["residual_position_qty"] = broker_qty
+
+    current_ownership = falcon_initial_stop_failure_current_ownership_evidence(
+        incident_pos, identity, entry_snapshot, position_snapshot
+    )
+    state["ownership_evidence_current"] = _falcon_terminal_sanitize_projection(
+        current_ownership
+    )
+    state["ownership_checked_at"] = data_hora_sp_str()
+    state["position_mode_evidence"] = _falcon_terminal_sanitize_projection(
+        current_ownership.get("position_mode_evidence")
+    )
+    state["expected_position_side"] = current_ownership.get(
+        "expected_position_side"
+    )
+    state["observed_position_side"] = current_ownership.get(
+        "observed_position_side"
+    )
+    state["ownership_confirmed"] = bool(
+        entry_evidence_ok
+        and position_evidence_ok
+        and current_ownership["ok"] is True
+    )
+    if not state["ownership_confirmed"]:
+        state.update({
+            "attempt_state": "OWNERSHIP_EVIDENCE_INSUFFICIENT",
+            "containment_status": "INITIAL_STOP_FAILED_OWNERSHIP_UNCONFIRMED",
+            "containment_reason": "CURRENT_OWNERSHIP_EVIDENCE_UNCONFIRMED",
+        })
+        alert = globals().get("falcon_terminal_stop_critical_alert")
+        if callable(alert):
+            state["critical_alert"] = alert(incident_pos, state, blocked=True)
+        falcon_terminal_stop_recovery_save(incident_id, state)
+        return {
+            **base,
+            "ownership_confirmed": False,
+            "residual_position_qty": broker_qty,
+            "containment_status": state["containment_status"],
+            "containment_reason": state["containment_reason"],
+            "ownership_evidence_current": state["ownership_evidence_current"],
+        }
+
+    if prior_send_unknown:
+        state.update({
+            "attempt_state": "BROKER_CALL_PENDING_RECONCILIATION_REQUIRED",
+            "containment_status": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_FAILED",
+            "containment_reason": "PRIOR_EMERGENCY_CLOSE_RECONCILIATION_REQUIRED",
+            "falcon_live_entries_locked": True,
+            "updated_at": data_hora_sp_str(),
+        })
+        alert = globals().get("falcon_terminal_stop_critical_alert")
+        if callable(alert):
+            state["critical_alert"] = alert(incident_pos, state, blocked=True)
+        persistence = falcon_terminal_stop_recovery_save(incident_id, state)
+        HEALTH["falcon_live_entries_locked"] = True
+        return {
+            **base,
+            "ownership_confirmed": True,
+            "emergency_close_attempted": state.get("emergency_close_attempted") is True,
+            "emergency_close_sent": state.get("emergency_close_sent"),
+            "emergency_close_confirmed": False,
+            "residual_position_qty": restart_reconciliation.get("residual_position_qty"),
+            "falcon_live_entries_locked": True,
+            "containment_status": state["containment_status"],
+            "containment_reason": state["containment_reason"],
+            "reconciliation": restart_reconciliation,
+            "persistence": persistence,
+        }
+
+    lifecycle_lock_id = falcon_terminal_stop_lifecycle_lock_id(incident_pos)
+    lifecycle_lock_owner = falcon_initial_stop_failure_lifecycle_lock_owner(
+        incident_id
+    )
+    lifecycle_lock = falcon_terminal_stop_acquire_lifecycle_lock(
+        lifecycle_lock_id, lifecycle_lock_owner
+    )
+    state["lifecycle_lock"] = _falcon_terminal_sanitize_projection(lifecycle_lock)
+    if lifecycle_lock.get("acquired") is not True:
+        lock_reconciliation = falcon_initial_stop_failure_read_close_reconciliation(
+            identity, state
+        )
+        persistence = falcon_terminal_stop_recovery_save(incident_id, state)
+        HEALTH["falcon_live_entries_locked"] = True
+        return {
+            **base,
+            "unsafe_entry_persisted": True,
+            "ownership_confirmed": state.get("ownership_confirmed") is True,
+            "emergency_close_attempted": state.get("emergency_close_attempted") is True,
+            "emergency_close_sent": state.get("emergency_close_sent"),
+            "residual_position_qty": lock_reconciliation.get("residual_position_qty"),
+            "falcon_live_entries_locked": True,
+            "containment_status": (
+                "INITIAL_STOP_FAILED_LIFECYCLE_LOCK_BACKEND_UNAVAILABLE"
+                if lifecycle_lock.get("backend_unavailable") is True
+                else "INITIAL_STOP_FAILED_LIFECYCLE_LOCK_HELD_BY_OTHER_WORKER"
+            ),
+            "containment_reason": lifecycle_lock.get("status"),
+            "reconciliation": lock_reconciliation,
+            "lifecycle_lock": _falcon_terminal_sanitize_projection(lifecycle_lock),
+            "persistence": persistence,
+        }
+
+    persisted_reservation = (
+        state.get("client_order_id_reservation")
+        if isinstance(state.get("client_order_id_reservation"), dict)
+        else {}
+    )
+    prior_attempt_state = str(state.get("attempt_state") or "").upper().strip()
+    if (
+        resuming_existing
+        and prior_attempt_state
+        in {"BROKER_CALL_PENDING", "SEND_OUTCOME_UNKNOWN", "SENT_UNCONFIRMED"}
+        and not persisted_reservation.get("client_order_id")
+    ):
+        state.update({
+            "attempt_state": "BROKER_CALL_PENDING_RECONCILIATION_REQUIRED",
+            "containment_status": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_FAILED",
+            "containment_reason": "PERSISTED_CLOSE_CLIENT_ORDER_ID_REQUIRED",
+            "falcon_live_entries_locked": True,
+            "updated_at": data_hora_sp_str(),
+        })
+        persistence = falcon_terminal_stop_recovery_save(incident_id, state)
+        HEALTH["falcon_live_entries_locked"] = True
+        return {
+            **base,
+            "ownership_confirmed": True,
+            "residual_position_qty": broker_qty,
+            "falcon_live_entries_locked": True,
+            "containment_status": state["containment_status"],
+            "containment_reason": state["containment_reason"],
+            "persistence": persistence,
+        }
+    resume_authority = None
+    if resuming_existing and persisted_reservation.get("client_order_id"):
+        # ``BROKER_CALL_PENDING`` alone cannot prove whether a process died
+        # just before or during the request.  Re-check the account-wide
+        # reservation with the same deterministic identity; only that
+        # authority may prove this exact send was never claimed.
+        resume_authority = falcon_prepare_position_client_order_id(
+            incident_pos, ROLE_EMERGENCY_TERMINAL_STOP_CLOSE, 0, attempt=0
+        )
+        persisted_client_order_id = str(
+            persisted_reservation.get("client_order_id") or ""
+        ).upper()
+        resumed_client_order_id = str(
+            resume_authority.get("client_order_id") or ""
+        ).upper()
+        if (
+            not resumed_client_order_id
+            or resumed_client_order_id != persisted_client_order_id
+            or resume_authority.get("send_allowed") is not True
+        ):
+            state.update({
+                "attempt_state": "BROKER_CALL_PENDING_RECONCILIATION_REQUIRED",
+                "containment_status": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_FAILED",
+                "containment_reason": "ACCOUNT_CLIENT_ORDER_AUTHORITY_RECONCILIATION_REQUIRED",
+                "resume_client_order_authority": _falcon_client_order_authority_projection(
+                    resume_authority
+                ),
+                "falcon_live_entries_locked": True,
+                "updated_at": data_hora_sp_str(),
+            })
+            persistence = falcon_terminal_stop_recovery_save(incident_id, state)
+            HEALTH["falcon_live_entries_locked"] = True
+            return {
+                **base,
+                "ownership_confirmed": True,
+                "residual_position_qty": broker_qty,
+                "falcon_live_entries_locked": True,
+                "containment_status": state["containment_status"],
+                "containment_reason": state["containment_reason"],
+                "client_order_id_reservation": state[
+                    "resume_client_order_authority"
+                ],
+                "persistence": persistence,
+            }
+        close_reservation = resume_authority
+    else:
+        close_reservation = falcon_prepare_position_client_order_id(
+            incident_pos, ROLE_EMERGENCY_TERMINAL_STOP_CLOSE, 0, attempt=0
+        )
+    auth_extra = {
+        "amount": broker_qty,
+        "expected_position_amount": broker_qty,
+        "reason": "INITIAL_STOP_FAILURE_EMERGENCY_CLOSE",
+        "idempotency_key": incident_id,
+        "emergency_operation": "INITIAL_STOP_FAILURE_EMERGENCY_CLOSE",
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "entry_order_id": identity.get("order_id"),
+        "client_order_id": identity.get("client_order_id"),
+    }
+    auth = falcon_issue_management_token(
+        incident_pos, "managed_close_position_market", auth_extra
+    )
+    token = auth.get("token") if isinstance(auth, dict) else None
+    context = auth.get("context") if isinstance(auth, dict) and isinstance(auth.get("context"), dict) else {}
+    tolerance = max(FALCON_MANAGEMENT_AMOUNT_TOLERANCE, abs(broker_qty) * 1e-6)
+    auth_ok = bool(
+        auth.get("ok") is True
+        and token
+        and context.get("operation") == "managed_close_position_market"
+        and _falcon_management_norm_symbol(context.get("symbol")) == identity.get("symbol")
+        and _falcon_management_norm_side(context.get("side")) == identity.get("side")
+        and context.get("reason") == "INITIAL_STOP_FAILURE_EMERGENCY_CLOSE"
+        and context.get("idempotency_key") == incident_id
+        and context.get("emergency_operation") == "INITIAL_STOP_FAILURE_EMERGENCY_CLOSE"
+        and context.get("lifecycle_id") == identity.get("lifecycle_id")
+        and context.get("entry_order_id") == identity.get("order_id")
+        and context.get("client_order_id") == identity.get("client_order_id")
+        and safe_float(context.get("amount"), None) is not None
+        and safe_float(context.get("expected_position_amount"), None) is not None
+        and abs(safe_float(context.get("amount")) - broker_qty) <= tolerance
+        and abs(safe_float(context.get("expected_position_amount")) - broker_qty) <= tolerance
+    )
+    state["client_order_id_reservation"] = _falcon_client_order_authority_projection(close_reservation)
+    state["auth"] = _falcon_terminal_auth_projection(auth, auth_ok)
+    if close_reservation.get("send_allowed") is not True or not auth_ok:
+        state.update({
+            "attempt_state": "EMERGENCY_CLOSE_PRE_SEND_BLOCKED",
+            "containment_status": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_FAILED",
+            "containment_reason": "TOKEN_OR_CLIENT_ORDER_ID_RESERVATION_REQUIRED",
+        })
+        alert = globals().get("falcon_terminal_stop_critical_alert")
+        if callable(alert):
+            state["critical_alert"] = alert(incident_pos, state, blocked=True)
+        falcon_terminal_stop_recovery_save(incident_id, state)
+        return {
+            **base,
+            "ownership_confirmed": True,
+            "residual_position_qty": broker_qty,
+            "containment_status": state["containment_status"],
+            "containment_reason": state["containment_reason"],
+        }
+
+    state.update({
+        "attempt_state": "BROKER_CALL_PENDING",
+        "emergency_close_attempted": True,
+        "emergency_close_client_order_id": close_reservation.get("client_order_id"),
+        "emergency_close_sent": False,
+        "send_outcome_unknown": False,
+        "updated_at": data_hora_sp_str(),
+    })
+    if not falcon_terminal_stop_recovery_save(incident_id, state).get("ok"):
+        return {
+            **base,
+            "ownership_confirmed": True,
+            "residual_position_qty": broker_qty,
+            "containment_status": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_FAILED",
+            "containment_reason": "PRE_SEND_INCIDENT_PERSISTENCE_REQUIRED",
+        }
+    try:
+        close_result = central_broker.managed_close_position_market(
+            symbol=identity.get("symbol"),
+            side=identity.get("side"),
+            amount=broker_qty,
+            expected_position_amount=broker_qty,
+            client_tag=close_reservation.get("client_order_id"),
+            reason="INITIAL_STOP_FAILURE_EMERGENCY_CLOSE",
+            execution_auth_token=token,
+            client_order_id_reservation=close_reservation,
+        )
+    except Exception as exc:
+        close_result = {
+            "ok": False,
+            "status": "INITIAL_STOP_FAILURE_EMERGENCY_CLOSE_EXCEPTION",
+            "sent": None,
+            "confirmed": None,
+            "send_attempted": True,
+            "send_outcome_unknown": True,
+            "error": _falcon_terminal_safe_text(exc),
+        }
+    projected = _falcon_terminal_stop_result_projection(
+        close_result,
+        expected_client_order_id=close_reservation.get("client_order_id"),
+        expected_symbol=identity.get("symbol"),
+        expected_side=identity.get("side"),
+        expected_amount=broker_qty,
+    )
+    post_snapshot = {}
+    if hasattr(central_broker, "managed_position_snapshot"):
+        try:
+            post_snapshot = central_broker.managed_position_snapshot(
+                identity.get("symbol"), identity.get("side"), expected_amount=None
+            )
+        except Exception as exc:
+            post_snapshot = {
+                "ok": False,
+                "status": "POST_CLOSE_POSITION_SNAPSHOT_ERROR",
+                "error": _falcon_terminal_safe_text(exc),
+            }
+    residual_qty = safe_float(post_snapshot.get("amount"), None)
+    close_confirmed = bool(
+        projected.get("confirmed") is True
+        and post_snapshot.get("ok") is True
+        and post_snapshot.get("position_closed") is True
+        and residual_qty is not None
+        and residual_qty <= FALCON_MANAGEMENT_AMOUNT_TOLERANCE
+    )
+    if close_confirmed:
+        state.update({
+            "emergency_close_order_id": projected.get("order_id") or projected.get("id"),
+            "failsafe_result": projected,
+            "send_outcome_unknown": projected.get("send_outcome_unknown") is True,
+        })
+        return falcon_initial_stop_failure_finalize_confirmed(
+            incident_id,
+            state,
+            base,
+            residual_qty=residual_qty,
+            post_snapshot=post_snapshot,
+            close_projection=projected,
+        )
+    state.update({
+        "attempt_state": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_FAILED",
+        "containment_status": "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_FAILED",
+        "containment_reason": "EMERGENCY_CLOSE_NOT_FACTUALLY_CONFIRMED",
+        "emergency_close_attempted": True,
+        "emergency_close_sent": projected.get("sent"),
+        "emergency_close_confirmed": False,
+        "emergency_close_order_id": projected.get("order_id") or projected.get("id"),
+        "residual_position_qty": residual_qty,
+        "failsafe_result": projected,
+        "send_outcome_unknown": projected.get("send_outcome_unknown") is True,
+        "position_snapshot_after": _falcon_terminal_sanitize_projection(post_snapshot),
+        "falcon_live_entries_locked": True,
+        "updated_at": data_hora_sp_str(),
+    })
+    if not close_confirmed:
+        alert = globals().get("falcon_terminal_stop_critical_alert")
+        if callable(alert):
+            state["critical_alert"] = alert(incident_pos, state, blocked=True)
+    final_save = falcon_terminal_stop_recovery_save(incident_id, state)
+    HEALTH["falcon_live_entries_locked"] = True
+    return {
+        **base,
+        "unsafe_entry_persisted": True,
+        "ownership_confirmed": True,
+        "emergency_close_attempted": True,
+        "emergency_close_idempotency_key": incident_id,
+        "emergency_close_sent": projected.get("sent"),
+        "emergency_close_confirmed": close_confirmed,
+        "residual_position_qty": residual_qty,
+        "falcon_live_entries_locked": state["falcon_live_entries_locked"],
+        "containment_status": state["containment_status"],
+        "containment_reason": state["containment_reason"],
+        "persistence": final_save,
+    }
+
+
+def falcon_initial_stop_failure_containment_internal_error(sig, order, *, error=None):
+    """Durably fail closed when the normal P0 containment handler is unusable.
+
+    This is deliberately a record/lock/alert path only.  It has no authority to
+    close a broker position because the normal handler's current Registry and
+    broker ownership proof was not obtained.
+    """
+    sig = sig if isinstance(sig, dict) else {}
+    order = order if isinstance(order, dict) else {}
+    disaster = (
+        order.get("disaster_stop")
+        if isinstance(order.get("disaster_stop"), dict)
+        else {}
+    )
+    base = {
+        "version": FALCON_INITIAL_STOP_FAILURE_CONTAINMENT_VERSION,
+        "initial_stop_failure_containment_triggered": False,
+        "initial_stop_failure_containment_attempted": True,
+        "unsafe_entry_persisted": False,
+        "ownership_confirmed": False,
+        "emergency_close_attempted": False,
+        "emergency_close_sent": False,
+        "emergency_close_confirmed": False,
+        "falcon_live_entries_locked": False,
+        "reconciliation_required": False,
+        "containment_status": "INITIAL_STOP_FAILURE_NOT_APPLICABLE",
+        "containment_reason": None,
+    }
+    if order.get("sent") is not True:
+        return {**base, "containment_reason": "ENTRY_NOT_SENT"}
+    if disaster.get("stop_operationally_armed") is True:
+        return {**base, "containment_reason": "INITIAL_STOP_OPERATIONALLY_ARMED"}
+
+    incident_pos = dict(sig)
+    incident_pos.update({
+        "live_order": dict(order),
+        "live_order_id": (
+            order.get("order_id") or order.get("id") or sig.get("live_order_id")
+        ),
+        "live_client_order_id": (
+            order.get("client_order_id")
+            or order.get("client_tag")
+            or sig.get("entry_client_order_id")
+            or sig.get("live_client_order_id")
+        ),
+        "execution_mode": "LIVE",
+        "registry_mode": "REAL",
+    })
+    incident_pos["bingx_order_id"] = incident_pos.get("live_order_id")
+    identity = falcon_position_identity(incident_pos)
+    incident_id = falcon_initial_stop_failure_incident_id(incident_pos, order)
+    error_text = _falcon_terminal_safe_text(
+        error or "INITIAL_STOP_FAILURE_CONTAINMENT_HANDLER_UNAVAILABLE", 240
+    )
+    base.update({
+        "initial_stop_failure_containment_triggered": True,
+        "unsafe_entry_persisted": True,
+        "falcon_live_entries_locked": True,
+        "reconciliation_required": True,
+        "emergency_close_idempotency_key": incident_id,
+        "containment_status": "INITIAL_STOP_FAILURE_CONTAINMENT_INTERNAL_ERROR",
+        "containment_reason": error_text,
+    })
+    HEALTH["falcon_live_entries_locked"] = True
+    if not incident_id:
+        return {
+            **base,
+            "containment_status": "INITIAL_STOP_FAILED_OWNERSHIP_UNCONFIRMED",
+            "containment_reason": "INCIDENT_IDENTITY_INSUFFICIENT",
+        }
+
+    loaded = falcon_terminal_stop_recovery_load(incident_id)
+    existing = dict(loaded.get("incident") or {}) if loaded.get("ok") else {}
+    state = {
+        **existing,
+        "version": FALCON_INITIAL_STOP_FAILURE_CONTAINMENT_VERSION,
+        "incident_id": incident_id,
+        "incident_type": "INITIAL_STOP_FAILURE_CONTAINMENT_INTERNAL_ERROR",
+        "attempt_state": "INITIAL_STOP_FAILURE_CONTAINMENT_INTERNAL_ERROR",
+        "containment_status": "INITIAL_STOP_FAILURE_CONTAINMENT_INTERNAL_ERROR",
+        "containment_reason": error_text,
+        "bot": "FALCON",
+        "symbol": identity.get("symbol"),
+        "side": identity.get("side"),
+        "lifecycle_id": identity.get("lifecycle_id"),
+        "entry_order_id": identity.get("order_id"),
+        "entry_client_order_id": identity.get("client_order_id"),
+        "entry_sent": True,
+        "stop_operationally_armed": False,
+        "handler_error": error_text,
+        "unsafe_entry_persisted": True,
+        "ownership_confirmed": False,
+        "emergency_close_attempted": False,
+        "emergency_close_sent": False,
+        "emergency_close_confirmed": False,
+        "falcon_live_entries_locked": True,
+        "reconciliation_required": True,
+        "updated_at": data_hora_sp_str(),
+    }
+    lock_writer = globals().get("falcon_initial_stop_failure_save_live_entry_lock")
+    lock_result = (
+        lock_writer(incident_id, active=True, reason=error_text)
+        if callable(lock_writer)
+        else {
+            "ok": False,
+            "locked": True,
+            "status": "INITIAL_STOP_FAILURE_LIVE_ENTRY_LOCK_HELPER_MISSING",
+        }
+    )
+    state["live_entry_lock"] = _falcon_terminal_sanitize_projection(lock_result)
+    state["live_entry_lock_persistence_failed"] = lock_result.get("ok") is not True
+    persistence = falcon_terminal_stop_recovery_save(incident_id, state)
+    alert = globals().get("falcon_terminal_stop_critical_alert")
+    if callable(alert):
+        try:
+            state["critical_alert"] = alert(incident_pos, state, blocked=True)
+            persistence = falcon_terminal_stop_recovery_save(incident_id, state)
+        except Exception as exc:
+            state["critical_alert_error"] = _falcon_terminal_safe_text(exc)
+    if persistence.get("ok") is not True:
+        base["containment_status"] = "INITIAL_STOP_FAILED_PERSISTENCE_REQUIRED"
+        base["containment_reason"] = (
+            persistence.get("error") or persistence.get("status") or error_text
+        )
+    return {
+        **base,
+        "persistence": persistence,
+        "live_entry_lock": _falcon_terminal_sanitize_projection(lock_result),
+        "handler_error": error_text,
+    }
+
+
 def falcon_terminal_stop_lifecycle_lock_id(pos):
     identity = falcon_position_identity(pos if isinstance(pos, dict) else {})
     components = (
@@ -5795,12 +7617,41 @@ def falcon_terminal_stop_acquire_lifecycle_lock(lifecycle_lock_id, owner_nonce):
             else:
                 existing = None
         acquired = bool(result not in (None, False))
+        owner_reentered = bool(
+            not acquired
+            and existing not in (None, b"", "")
+            and str(
+                existing.decode("utf-8") if isinstance(existing, bytes) else existing
+            )
+            == str(owner_nonce)
+        )
+        backend_unavailable = bool(
+            not acquired
+            and not owner_reentered
+            and existing in (None, b"", "")
+        )
         return {
-            "ok": acquired,
-            "acquired": acquired,
-            "status": "LIFECYCLE_LOCK_ACQUIRED" if acquired else "LIFECYCLE_LOCK_ALREADY_EXISTS",
+            "ok": bool(acquired or owner_reentered),
+            "acquired": bool(acquired or owner_reentered),
+            "status": (
+                "LIFECYCLE_LOCK_ACQUIRED"
+                if acquired
+                else (
+                    "LIFECYCLE_LOCK_REENTERED_SAME_OWNER"
+                    if owner_reentered
+                    else (
+                        "LIFECYCLE_LOCK_BACKEND_UNAVAILABLE"
+                        if backend_unavailable
+                        else "LIFECYCLE_LOCK_HELD_BY_OTHER_WORKER"
+                    )
+                )
+            ),
             "lock_key": lock_key,
-            "authoritative_lock_present": bool(existing not in (None, b"", "")) if not acquired else True,
+            "authoritative_lock_present": (
+                bool(existing not in (None, b"", "")) if not acquired else True
+            ),
+            "owner_reentered": owner_reentered,
+            "backend_unavailable": backend_unavailable,
         }
     except Exception as exc:
         return {
