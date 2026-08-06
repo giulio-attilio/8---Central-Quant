@@ -152,6 +152,43 @@ def _function(path: Path, name: str, *, last: bool = True) -> ast.FunctionDef:
     return matches[-1] if last else matches[0]
 
 
+def _unpacked_kwargs_include_reservation(item: dict) -> bool:
+    """Recognize a local kwargs dict that is explicitly expanded at a writer."""
+    unpacked = {
+        keyword.value.id
+        for keyword in item["node"].keywords
+        if keyword.arg is None and isinstance(keyword.value, ast.Name)
+    }
+    if not unpacked:
+        return False
+    path = ROOT / item["path"]
+    function = _function(path, item["function"])
+    for assignment in ast.walk(function):
+        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = (
+            assignment.targets
+            if isinstance(assignment, ast.Assign)
+            else [assignment.target]
+        )
+        if not any(
+            isinstance(target, ast.Name) and target.id in unpacked
+            for target in targets
+        ):
+            continue
+        value = assignment.value
+        if not isinstance(value, ast.Dict):
+            continue
+        keys = {
+            key.value
+            for key in value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        if "client_order_id_reservation" in keys:
+            return True
+    return False
+
+
 def _contains_slice(node: ast.AST) -> bool:
     return any(
         isinstance(child, ast.Subscript) and isinstance(child.slice, ast.Slice)
@@ -366,24 +403,18 @@ def test_all_factual_order_writers_cross_the_common_account_boundary():
     assert len(raw) == 1
     assert raw[0][:2] == ("broker.py", "_create_order_with_reserved_attempt")
 
-    # Every factual writer must pass a rich receipt.  The sole exception is the
-    # Falcon VERIFY preview, whose lexical branch is statically VERIFY-only and
-    # therefore cannot reach create_order under the broker's dry-run contract.
+    # Every factual writer must pass a rich receipt, either as a direct keyword
+    # or inside the explicit local kwargs dict expanded at the writer.
     unreserved = []
     for item in inventory.factual_writer_calls:
-        if "client_order_id_reservation" in item["keywords"]:
+        if (
+            "client_order_id_reservation" in item["keywords"]
+            or _unpacked_kwargs_include_reservation(item)
+        ):
             continue
-        tests = " | ".join(item["if_tests"]).upper()
-        preview_only = (
-            item["path"] == "bots/falcon.py"
-            and item["writer"] == "place_market_order"
-            and item["function"] == "execute_signal_if_allowed"
-            and "VERIFY" in tests
+        unreserved.append(
+            (item["path"], item["function"], item["line"], item["writer"])
         )
-        if not preview_only:
-            unreserved.append(
-                (item["path"], item["function"], item["line"], item["writer"])
-            )
     assert unreserved == []
 
     # Every broker-internal transition to the sole sink carries the receipt too.

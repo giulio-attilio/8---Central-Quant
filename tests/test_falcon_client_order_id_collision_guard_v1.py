@@ -1010,6 +1010,7 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
     ast.fix_missing_locations(module)
     handler_calls = []
     broker_calls = []
+    engine_calls = []
 
     class BrokerProbe:
         def __init__(self):
@@ -1042,6 +1043,29 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
             return result
 
     broker_probe = BrokerProbe()
+
+    def engine_probe(sig, _decision, _notional, ownership_check=None):
+        engine_calls.append((sig, ownership_check))
+        result = {
+            "ok": False,
+            "status": "CLIENT_ORDER_ID_RETURNED_MISSING",
+            "sent": True,
+            "entry_acknowledged": broker_probe.acknowledged_mismatch,
+            "order_id": "ENTRY-UNSAFE-1",
+            "client_order_id": "ENT1-EXPECTED",
+            "returned_client_order_id": (
+                "ENT1-DIFFERENT" if broker_probe.acknowledged_mismatch else None
+            ),
+            "returned_client_order_id_matches": False,
+            "reconciliation_required": True,
+        }
+        if broker_probe.acknowledged_mismatch:
+            result["status"] = "CLIENT_ORDER_ID_RETURNED_MISMATCH"
+            result["disaster_stop"] = {
+                "stop_operationally_armed": True,
+                "order_id": "UNSAFE-STOP-MUST-NOT-BIND",
+            }
+        return result
 
     namespace = {
         "FALCON_MODE": "LIVE",
@@ -1080,6 +1104,7 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
         "falcon_prepare_initial_disaster_stop_client_order_id": (
             lambda **_identity: {"send_allowed": True}
         ),
+        "falcon_execute_live_via_canonical_engine": engine_probe,
         "falcon_handle_unsafe_live_entry_identity": (
             lambda sig, order: handler_calls.append((sig, order))
             or {
@@ -1094,6 +1119,7 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
     exec(compile(module, str(FALCON_SOURCE), "exec"), namespace)
     sig = {
         "id": "SIGNAL-1",
+        "signal_id": "SIGNAL-1",
         "lifecycle_id": "LC-UNSAFE-1",
         "symbol": "SOLUSDT",
         "side": "LONG",
@@ -1106,7 +1132,8 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
     assert allowed is False
     assert decision["status"] == "FALCON_LIVE_ENTRY_IDENTITY_UNSAFE"
     assert decision["reconciliation_required"] is True
-    assert len(broker_calls) == 1
+    assert broker_calls == []
+    assert len(engine_calls) == 1
     assert len(handler_calls) == 1
     assert sig["live_order"]["sent"] is True
     assert sig["live_order_id"] == "ENTRY-UNSAFE-1"
@@ -1131,7 +1158,8 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
 
     assert allowed is False
     assert decision["status"] == "FALCON_LIVE_ENTRY_IDENTITY_UNSAFE"
-    assert len(broker_calls) == 2
+    assert broker_calls == []
+    assert len(engine_calls) == 2
     assert len(handler_calls) == 2
     assert handler_calls[-1][1]["entry_acknowledged"] is True
     assert handler_calls[-1][1]["returned_client_order_id_matches"] is False

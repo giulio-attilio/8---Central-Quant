@@ -2065,6 +2065,7 @@ def create_disaster_stop_order(
                     "client_order_id_unique"
                 ) is True,
                 "client_order_id_reservation_status": client_order_id_reservation_status,
+                "client_order_id_reservation": client_order_id_reservation,
                 "attempt_outcome_persistence": create_result.get(
                     "attempt_outcome_persistence"
                 ),
@@ -2152,6 +2153,7 @@ def create_disaster_stop_order(
             "client_order_id_unique": True,
             "client_order_id_reserved": True,
             "client_order_id_reservation_status": "RESERVED_UNIQUE",
+            "client_order_id_reservation": client_order_id_reservation,
             "reservation_verification": create_result.get("reservation_verification"),
             "returned_client_order_id": create_result.get("returned_client_order_id"),
             "returned_client_order_id_matches": returned_id_matches,
@@ -2238,6 +2240,7 @@ def create_disaster_stop_order(
             "client_order_id": client_order_id,
             "client_order_id_unique": True,
             "client_order_id_reservation_status": client_order_id_reservation_status,
+            "client_order_id_reservation": client_order_id_reservation,
             "reconcile_by_client_order_id": client_order_id,
             **error_details,
         }
@@ -3204,6 +3207,30 @@ def place_market_order(
                     ),
                 }
             else:
+                # Persistable identity projection for the mutable stop call.
+                # If the process dies inside create_order, the outer LIVE
+                # result still carries the exact expected clientOrderID and
+                # reservation; it never fabricates an exchange order ID.
+                disaster_stop_result = {
+                    "ok": False,
+                    "enabled": True,
+                    "created": None,
+                    "sent": None,
+                    "confirmed": None,
+                    "send_attempted": False,
+                    "send_outcome_unknown": True,
+                    "status": "DISASTER_STOP_CALL_PENDING",
+                    "client_order_id": reservation.get("client_order_id"),
+                    "client_order_id_reserved": reservation.get(
+                        "client_order_id_reserved"
+                    ) is True,
+                    "client_order_id_unique": reservation.get(
+                        "client_order_id_unique"
+                    ) is True,
+                    "client_order_id_reservation_status": reservation.get("status"),
+                    "client_order_id_reservation": reservation,
+                    "reconciliation_required": True,
+                }
                 disaster_stop_result = create_disaster_stop_order(
                     symbol=sym,
                     side=side,
@@ -3363,6 +3390,7 @@ def place_market_order(
             "amount": preview.get("amount") if isinstance(preview, dict) else None,
             "price_ref": preview.get("price_ref") if isinstance(preview, dict) else None,
             "preview": preview if isinstance(preview, dict) else None,
+            "disaster_stop": disaster_stop_result,
             "preview_isolation": True,
             "live_send_enabled": True,
             "error": str(exc),

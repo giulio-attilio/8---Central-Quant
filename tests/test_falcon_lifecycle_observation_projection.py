@@ -158,6 +158,19 @@ def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered
             return broker_result
 
     broker = BrokerProbe()
+    engine_calls = []
+
+    def canonical_engine(sig, decision, notional, ownership_check=None):
+        engine_calls.append(
+            {
+                "signal": sig,
+                "decision": decision,
+                "notional": notional,
+                "ownership_check": ownership_check,
+            }
+        )
+        return broker_result
+
     original_consumer = _function(
         "execute_signal_if_allowed",
         {
@@ -185,6 +198,7 @@ def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered
             "falcon_validate_position_ownership_limit_evidence": (
                 lambda _decision, sig=None: {"ok": True, "evidence": {}}
             ),
+            "falcon_execute_live_via_canonical_engine": canonical_engine,
             "falcon_prepare_canonical_client_order_id": lambda _identity: {
                 "ok": True,
                 "send_allowed": True,
@@ -212,6 +226,7 @@ def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered
     )
     signal = {
         "id": "FALCON15:SOLUSDT:LONG",
+        "signal_id": "FALCON15:SOLUSDT:LONG",
         "symbol": "SOLUSDT",
         "side": "LONG",
         "setup": "FALCON15",
@@ -225,8 +240,9 @@ def test_protected_entry_with_ack_persistence_failure_is_consumed_and_registered
     accepted_for_persistence, decision = consume(signal, positions={})
 
     assert accepted_for_persistence is True
-    assert len(broker.place_calls) == 1
-    assert broker.place_calls[0]["client_tag"] == "FALCON-LIVE-FALCON15-ACK-1"
+    assert len(engine_calls) == 1
+    assert engine_calls[0]["notional"] == 10.0
+    assert broker.place_calls == []
     assert decision["decision"] == "LIVE_POSITION_RECOGNIZED_RECONCILIATION_REQUIRED"
     assert decision["management_allowed"] is False
     assert signal["live_order"] is broker_result

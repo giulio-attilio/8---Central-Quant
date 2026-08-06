@@ -1244,11 +1244,7 @@ def test_direct_falcon_consumer_invokes_containment_before_generic_rejection_and
             return {"ok": True, "token": "TEST"}
 
         def place_market_order(self, **_kwargs):
-            return {
-                **_order("CANCELED"),
-                "entry_acknowledged": True,
-                "returned_client_order_id_matches": True,
-            }
+            pytest.fail("Falcon LIVE must not call broker.place_market_order directly")
 
     namespace = {
         "FALCON_MODE": "LIVE",
@@ -1267,6 +1263,13 @@ def test_direct_falcon_consumer_invokes_containment_before_generic_rejection_and
         "falcon_live_positions_count": lambda _positions: 0,
         "central_can_open_trade": lambda _sig, positions=None: risk_decision,
         "falcon_validate_position_ownership_limit_evidence": lambda _decision, sig=None: {"ok": True, "evidence": {"allowed": True}},
+        "falcon_execute_live_via_canonical_engine": lambda _sig, _decision, _notional, ownership_check=None: {
+            **_order("CANCELED"),
+            "entry_acknowledged": True,
+            "returned_client_order_id_matches": True,
+            "falcon_live_execution_path": "ORCHESTRATOR_ENGINE",
+            "ownership_check": ownership_check,
+        },
         "falcon_prepare_canonical_client_order_id": lambda _identity: {"send_allowed": True, "client_order_id": "ENTRY-CID-1"},
         "falcon_prepare_initial_disaster_stop_client_order_id": lambda **_identity: {"send_allowed": True},
         "falcon_handle_unsafe_live_entry_identity": lambda _sig, _order: pytest.fail("identity path is not expected"),
@@ -1540,6 +1543,11 @@ def _original_execute_signal_namespace(*, handler_marker, fallback, broker=None)
             }
 
     broker = broker or EntryBroker()
+
+    def canonical_engine(_sig, _decision, _notional, ownership_check=None):
+        del ownership_check
+        return broker.place_market_order()
+
     namespace = {
         "FALCON_MODE": "LIVE",
         "FALCON_REAL_NOTIONAL_USDT": 10.0,
@@ -1557,6 +1565,7 @@ def _original_execute_signal_namespace(*, handler_marker, fallback, broker=None)
         "falcon_live_positions_count": lambda _positions: 0,
         "central_can_open_trade": lambda _sig, positions=None: risk_decision,
         "falcon_validate_position_ownership_limit_evidence": lambda _decision, sig=None: {"ok": True, "evidence": {"allowed": True}},
+        "falcon_execute_live_via_canonical_engine": canonical_engine,
         "falcon_prepare_canonical_client_order_id": lambda _identity: {"send_allowed": True, "client_order_id": "ENTRY-CID-1"},
         "falcon_prepare_initial_disaster_stop_client_order_id": lambda **_identity: {"send_allowed": True},
         "falcon_handle_unsafe_live_entry_identity": lambda _sig, _order: pytest.fail("identity path is not expected"),
@@ -1789,3 +1798,152 @@ def test_close_requires_current_ownership_ok_and_has_no_permissive_position_side
     position_source = ast.unparse(position_assign.value)
     assert "current_ownership['ok'] is True" in ownership_source
     assert "position_side" not in position_source
+
+
+def test_engine_unknown_default_reader_passes_factual_contract_to_real_containment_once():
+    """Exercise Engine unknown -> physical absence -> real P0 containment locally."""
+    broker = _Broker(
+        close_lookup={
+            "ok": True,
+            "matched_orders": [
+                {
+                    "id": "ENTRY-1",
+                    "clientOrderId": "ENTRY-CID-1",
+                    "symbol": "SOLUSDT",
+                    "side": "BUY",
+                    "filled": 0.5,
+                }
+            ],
+        }
+    )
+    def current_registry(pos):
+        payload = _current_registry_for_test(pos)
+        payload["matches"][0]["trade_id"] = "TR-UNSAFE-ENTRY-1"
+        return payload
+
+    contain, _broker, _containment_store, _timeline, _locks, health = _harness(
+        broker=broker, current_registry=current_registry
+    )
+    engine_state = {
+        "incident_type": "FALCON_ENGINE_SEND_OUTCOME_UNKNOWN",
+        "signal_id": "SIGNAL-INITIAL-STOP-1",
+        "lifecycle_id": "LC-INITIAL-STOP-1",
+        "decision_id": "DECISION-1",
+        "trade_id": "TR-UNSAFE-ENTRY-1",
+        "symbol": "SOLUSDT",
+        "side": "LONG",
+        "client_order_id": "ENTRY-CID-1",
+        "entry_order_id": "ENTRY-1",
+        "entry_filled_amount": 0.5,
+        "canonical_operation_id": "OP-EXACT",
+        "client_order_attempt_id": "ATTEMPT-0",
+        "orchestrator_idempotency_key": "ORCH-EXACT",
+        "execution_intent_idempotency_key": "FALCON-ENGINE-INTENT:EXACT",
+        "disaster_stop": {
+            "order_id": "STOP-1",
+            "client_order_id": "FDS1-STOP-1",
+            "client_order_id_reserved": True,
+            "client_order_id_unique": True,
+            "amount": 0.5,
+        },
+    }
+    saved = []
+    lock = {"locked": True, "release_calls": 0}
+
+    def load_engine(_incident_id):
+        return {"ok": True, "incident": dict(engine_state)}
+
+    def save_engine(_incident_id, value):
+        engine_state.clear()
+        engine_state.update(value)
+        saved.append(dict(value))
+        return {"ok": True}
+
+    def lock_writer(_incident_id, *, active, **_kwargs):
+        lock["locked"] = bool(active)
+        if not active:
+            lock["release_calls"] += 1
+        return {"ok": True, "locked": bool(active), "status": "LOCK"}
+
+    ledger_identity = {
+        "bot": "FALCON",
+        "orchestrator_idempotency_key": "ORCH-EXACT",
+        "execution_intent_idempotency_key": "FALCON-ENGINE-INTENT:EXACT",
+        "client_order_id": "ENTRY-CID-1",
+        "canonical_operation_id": "OP-EXACT",
+        "attempt_id": "ATTEMPT-0",
+        "client_order_attempt_id": "ATTEMPT-0",
+        "signal_id": "SIGNAL-INITIAL-STOP-1",
+        "lifecycle_id": "LC-INITIAL-STOP-1",
+        "symbol": "SOLUSDT",
+        "side": "LONG",
+    }
+
+    def physical_stop_verifier(position, *, force, persist_registry):
+        assert force is True and persist_registry is False
+        assert position["live_order_id"] == "ENTRY-1"
+        assert position["disaster_stop_client_order_id"] == "FDS1-STOP-1"
+        return {
+            "ok": False,
+            "read_only": True,
+            "status": "DISASTER_STOP_NOT_FOUND",
+            "stop_operationally_armed": False,
+            "stop_order_id": "STOP-1",
+            "disaster_stop_client_order_id": "FDS1-STOP-1",
+            "stop_order_active": False,
+            "protected_qty": None,
+            "trigger_price": None,
+            "trigger_type": None,
+            "stop_position_side": "LONG",
+        }
+
+    namespace = _load_falcon_functions(
+        (
+            "_falcon_engine_unknown_normalize_order_lookup",
+            "_falcon_engine_unknown_ledger_identity_validation",
+            "_falcon_engine_unknown_reconciliation_position",
+            "_falcon_engine_unknown_read_only_evidence",
+            "_falcon_engine_unknown_containment_payload",
+            "falcon_reconcile_engine_send_outcome_unknown",
+        ),
+        {
+            "HEALTH": health,
+            "central_broker": broker,
+            "data_hora_sp_str": lambda: "04/08/2026 12:00",
+            "safe_float": _float,
+            "FALCON_MANAGEMENT_AMOUNT_TOLERANCE": 1e-9,
+            "_falcon_terminal_safe_text": lambda value, limit=240: str(value)[:limit],
+            "_falcon_terminal_sanitize_projection": lambda value: copy.deepcopy(value),
+            "falcon_terminal_stop_recovery_load": load_engine,
+            "falcon_terminal_stop_recovery_save": save_engine,
+            "load_execution_broker_state": lambda _key: {
+                "ok": True,
+                "state": {
+                    "state": "ENGINE_BROKER_SEND_OUTCOME_UNKNOWN",
+                    "identity": dict(ledger_identity),
+                },
+            },
+            "falcon_verify_live_disaster_stop": physical_stop_verifier,
+            "falcon_handle_initial_stop_failure_containment": contain,
+            "falcon_initial_stop_failure_save_live_entry_lock": lock_writer,
+            "falcon_initial_stop_failure_live_entry_lock_status": lambda: {
+                "ok": True,
+                "locked": lock["locked"],
+                "status": "LOCK",
+            },
+        },
+    )
+
+    result = namespace["falcon_reconcile_engine_send_outcome_unknown"]("ENGINE-1")
+
+    assert result["status"] == "ENGINE_UNKNOWN_INITIAL_STOP_CONTAINMENT_TRIGGERED"
+    assert result["containment"]["containment_status"] == (
+        "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_CONFIRMED"
+    )
+    assert len(broker.calls) == 1, result["containment"]
+    assert engine_state["initial_stop_containment_incident_id"]
+    assert engine_state["initial_stop_containment_confirmed"] is True
+    assert engine_state["initial_stop_containment_residual_qty"] == 0.0
+    assert engine_state["initial_stop_containment_lock_state"] == "LOCKED"
+    assert lock["release_calls"] == 0
+    assert saved

@@ -759,6 +759,59 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
     assert exchange.create_calls[-1]["type"] == "market"
 
 
+def test_broker_uses_explicit_notional_as_single_sizing_authority(monkeypatch):
+    """Actual broker function must not multiply Falcon's approved notional again."""
+    captured = {}
+    monkeypatch.setattr(
+        broker,
+        "execution_config_for_bot",
+        lambda **kwargs: {
+            "margin_usdt": float(kwargs["margin_usdt"]),
+            "leverage": float(kwargs["leverage"]),
+            "effective_notional_usdt": float(kwargs["margin_usdt"])
+            * float(kwargs["leverage"]),
+        },
+    )
+    monkeypatch.setattr(broker, "is_real_live_send_enabled", lambda: False)
+    monkeypatch.setattr(
+        broker, "_automatic_broker_preview_firewall", lambda **_kwargs: {"blocked": False}
+    )
+    monkeypatch.setattr(broker, "_infer_bot_for_audit", lambda **kwargs: kwargs["bot"])
+    monkeypatch.setattr(broker, "_classify_preview_audit", lambda **_kwargs: "TEST")
+    monkeypatch.setattr(broker, "log_execution_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(broker, "log_execution_audit_event", lambda *_args, **_kwargs: None)
+
+    def preview(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "constraints_ok": True,
+            "symbol": "SOLUSDT",
+            "side": "LONG",
+            "margin_usdt": kwargs["margin_usdt"],
+            "leverage": kwargs["leverage"],
+            "notional_usdt": kwargs["notional_usdt"],
+            "planned_exposure_usdt": kwargs["notional_usdt"],
+            "actual_exposure_usdt": kwargs["notional_usdt"],
+            "client_order_id": kwargs["client_tag"],
+        }
+
+    monkeypatch.setattr(broker, "build_order_preview", preview)
+    result = broker.place_market_order(
+        symbol="SOLUSDT",
+        side="LONG",
+        margin_usdt=20.0,
+        leverage=3,
+        notional_usdt=60.0,
+        client_tag=ENTRY_CLIENT_ORDER_ID,
+        bot="FALCON",
+    )
+
+    assert result["sent"] is False
+    assert captured["notional_usdt"] == 60.0
+    assert captured["notional_usdt"] != 180.0
+
+
 def test_broker_has_exactly_one_raw_create_order_sink():
     tree = ast.parse((ROOT / "broker.py").read_text(encoding="utf-8"))
     parents = {}

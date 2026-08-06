@@ -96,6 +96,8 @@ def test_auto_bridge_strips_legacy_ids_and_passes_strong_identity_to_engine():
         {
             "_AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT": context,
             "AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION": "test",
+            "FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION": "TEST-FALCON-V1",
+            "_arb_v1_norm_bot": lambda value: str(value or "").upper(),
             "_arb_v1_basic_eligibility": lambda payload, risk_result, source=None: {
                 "eligible": True,
                 "payload": dict(payload or {}),

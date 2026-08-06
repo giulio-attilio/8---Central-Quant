@@ -42,6 +42,18 @@ import importlib.util
 import ctypes
 from pathlib import Path
 
+try:
+    from falcon_live_execution_contract import (
+        FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION,
+    )
+except Exception as _falcon_live_execution_contract_exc:
+    FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION = None
+    FALCON_SINGLE_LIVE_EXECUTION_CONTRACT_IMPORT_ERROR = str(
+        _falcon_live_execution_contract_exc
+    )
+else:
+    FALCON_SINGLE_LIVE_EXECUTION_CONTRACT_IMPORT_ERROR = None
+
 
 # ==========================================================
 # CENTRAL DATA DIR + TIMELINE EMERGENCY RECOVERY V1
@@ -38838,6 +38850,61 @@ def auto_real_execution_bridge_v1_process(payload=None, risk_result=None, source
     if _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT is not None:
         _AUTO_REAL_EXECUTION_BRIDGE_V1_CONTEXT.active = True
     try:
+        raw_payload = payload if isinstance(payload, dict) else {}
+        raw_signal_id = str(raw_payload.get("signal_id") or "").strip()
+        raw_lifecycle_id = str(raw_payload.get("lifecycle_id") or "").strip()
+        falcon_can_open_trade = bool(
+            source == "can_open_trade"
+            and _arb_v1_norm_bot(raw_payload.get("bot")) == "FALCON"
+        )
+        explicit_falcon_single_path = bool(
+            falcon_can_open_trade
+            and isinstance(FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION, str)
+            and raw_payload.get("falcon_single_live_execution_path_v1")
+            == FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION
+            and raw_payload.get("suppress_auto_real_bridge") is True
+            and bool(raw_signal_id)
+            and bool(raw_lifecycle_id)
+        )
+        # Falcon never falls back to the generic automatic bridge from
+        # /can_open_trade.  A missing, partial or incompatible contract is a
+        # fail-closed condition before eligibility or Engine invocation.
+        if falcon_can_open_trade and not explicit_falcon_single_path:
+            result = {
+                "ok": False,
+                "module": "auto_real_execution_bridge_v1",
+                "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+                "generated_at": _arb_v1_now(),
+                "source": source,
+                "status": "AUTO_REAL_BRIDGE_FALCON_SINGLE_PATH_CONTRACT_INVALID",
+                "executed": False,
+                "sent": False,
+                "auto_bridge_suppressed": True,
+                "token_value_exposed": False,
+            }
+            _arb_v1_append_event(result)
+            return result
+        if explicit_falcon_single_path:
+            result = {
+                "ok": True,
+                "module": "auto_real_execution_bridge_v1",
+                "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
+                "generated_at": _arb_v1_now(),
+                "source": source,
+                "status": "AUTO_REAL_BRIDGE_SUPPRESSED_FOR_FALCON_SINGLE_LIVE_PATH",
+                "executed": False,
+                "sent": False,
+                "auto_bridge_suppressed": True,
+                "falcon_live_execution_path": "ORCHESTRATOR_ENGINE",
+                "signal_id": raw_signal_id,
+                "lifecycle_id": raw_lifecycle_id,
+                "falcon_single_live_execution_path_version": (
+                    FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION
+                ),
+                "token_value_exposed": False,
+            }
+            _arb_v1_append_event(result)
+            return result
         eligibility = _arb_v1_basic_eligibility(payload, risk_result, source=source)
         payload_norm = eligibility.get("payload") or {}
         config = eligibility.get("config") or _arb_v1_config()
