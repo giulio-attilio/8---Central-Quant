@@ -1,0 +1,200 @@
+CENTRAL QUANT - REGISTRY EXECUTION IDENTITY V2
+V2.1 -> V2.2 FORMAL SPECIFICATION PROMOTION AUDIT
+
+Status: PASS
+Date: 2026-08-09
+Scope: documentation/governance only; no code implementation authorization
+
+AUTHORITATIVE PROMOTION RECORD
+==============================
+
+Previous authoritative baseline:
+registry_execution_identity_v2_final_spec_v2_1.txt
+
+Promoted authoritative specification:
+registry_execution_identity_v2_final_spec_v2_2.txt
+
+Approved source of amendments:
+registry_execution_identity_v2_final_spec_v2_2_PROPOSAL_REVIEW3.txt
+
+Supporting final review:
+registry_execution_identity_v2_spec_resolution_review3.txt
+
+Promotion approval inputs recorded:
+
+- REVIEW3_STATUS=PASS
+- NORMATIVE_CONTRADICTIONS_REMAINING=0
+- PROPOSAL_CAN_BE_PROMOTED_AFTER_FINAL_REVIEW=YES
+
+SOURCE INTEGRITY EVIDENCE
+=========================
+
+SHA256 values at promotion audit:
+
+- registry_execution_identity_v2_final_spec_v2_1.txt
+  82677D21D032F7BD41599CFD3D1DAB39ED73DC2B949FA4D74B3A45CA67DA64CB
+- registry_execution_identity_v2_final_spec_v2_2.txt
+  CBB869A80EF75B3CA5B5CD5B2443D7CDB38D47A96319194E44E1E2EC1D8EBBE2
+- registry_execution_identity_v2_final_spec_v2_2_PROPOSAL_REVIEW3.txt
+  7CF93B13FEE68C0D1EF25A961FECD77BA2A405B9BE061E9CDA50E6A5EEFDE362
+- registry_execution_identity_v2_spec_resolution_review3.txt
+  24125BC21EE92F6AA4415B70F066634C21A35CD473497CCD4BB2F1219AAE3279
+
+Method:
+
+1. The final V2.2 file was created from the complete V2.1 baseline.
+2. A read-only zero-context comparison found exactly seven amendment hunks.
+3. Those hunks map only to header/authority context, section 4.3, section 4.5,
+   section 24, and section 27.
+4. The baseline's V2.2 implementation-phase table row was compared textually
+   with the final row and is identical.
+5. Read-only searches verified the phase/dependency, broker, proposal-marker,
+   V2.LIVE-PILOT, and core identity conditions recorded below.
+
+DIFF-TO-APPROVAL MAP
+====================
+
+| Final V2.2 changed location | Approved purpose | Audit result |
+| --- | --- | --- |
+| Header, authority, revision history, executive authority context | Promote document version from V2.1 to authoritative V2.2; retain V2.1 historical; state no deployment/LIVE/phase authorization. | PASS |
+| 4.3 Factual Falcon signal and decision identity | Add factual signal_id, version/provenance, completed decision_id, replay/new-decision semantics, no observer generation, and exact decision-to-signal correlation. | PASS |
+| 4.5 VERIFY and stage subcontracts | Add two-stage non-operational VERIFY, PRE/POST requirements, no execution/physical IDs, exact V1 position-side precedence, and owner-plan provenance isolation. | PASS |
+| 24.L focused proof obligations | Add signal/decision/correlation, stage, position-side, owner, equivalence, OFF/ON broker, zero-mutation, and zero-influence proofs. | PASS |
+| 27 matrix V2.7A row | Add one authoritative V2.7A prerequisite phase with approved entry, scope, additive metadata, guards, and exit reference. | PASS |
+| 27 V2.8 and V2.9 matrix cells | Replace V2.8 entry/exit high-level gates and V2.9 entry dependency with approved wording. | PASS |
+| 27.1 and 27.2 detail | Preserve the full approved V2.7A provider/equivalence/exit contract and V2.8 causal/mutable broker and factual-parity exit contract. | PASS |
+
+No diff hunk touches V2.1 schema, WAL, journal, recovery, mode, legacy,
+manual/external, PAPER, LIVE, V2.0-V2.7, V2.10, or V2.LIVE-PILOT normative
+content outside the approved V2.7A/V2.8/V2.9 gate amendments above.
+
+REVIEW3 NORMATIVE CHANGE INTEGRATION
+====================================
+
+| Approved Review3 requirement | Final V2.2 normative location | Result |
+| --- | --- | --- |
+| Factual signal_id at birth; retry/restart; legitimate reentry; no unproved legacy alias; version/provenance | 4.3 and 27.1; 24.L.173-174 | PASS |
+| Completed factual decision_id; ALLOW/DENY; replay; new-decision distinction; no observer identity | 4.3 and 27.1; 24.L.175 | PASS |
+| Exact decision-to-signal binding; replay binding; A/B and stale-reentry conflict | 4.3, 4.5 POST_DECISION, 27.1/27.2; 24.L.176-180 | PASS |
+| Exactly PRE_DECISION and POST_DECISION; PRE no decision; POST factual decision; continuity; no execution identity | 4.5; 27.1/27.2; 24.L.179-180 and 188 | PASS |
+| Exact V1 position-side precedence; visible raw contradiction; no BOTH/NET conversion; no broker/market inference | 4.5; 27.1/27.2; 24.L.181 | PASS |
+| Central plan provenance distinct from broker ownership; external evidence never overwritten | 4.5; 27.1/27.2; 24.L.182 | PASS |
+| PREEXISTING_FIELD_VALUE_EQUIVALENCE; additive metadata only; no artificial flag | 27.1; 27.2; 24.L.183 | PASS |
+| V2.7A entry, additive metadata, provider discovery/narrow scope, forbidden scope, and exit | V2.7A matrix row and 27.1 | PASS |
+| V2.8 entry explicitly requires V2.7A exit/dossier | V2.8 matrix row | PASS |
+| V2.8 mutable/causal broker contract, no Registry mutation, no execution influence, factual parity exit | V2.8 matrix row and 27.2; 24.L.184-189 | PASS |
+| V2.9 preserves explicit V2.0-V2.7 + V2.7A + V2.8 dependencies | V2.9 matrix row | PASS |
+
+REQUIRED INTEGRITY ASSERTIONS
+=============================
+
+1. Every Review3 approved normative change appears in final V2.2.
+
+PASS. The preceding integration table maps every Review3 approved category to
+the final standalone normative locations.
+
+2. No unapproved V2.1 normative section changed.
+
+PASS. The read-only baseline/final comparison has only the seven mapped hunks.
+Header/authority and section 1 wording changes are promotion-context edits;
+all normative changes are limited to the approved 4.3, 4.5, 24, and 27 scope.
+UNAPPROVED_NORMATIVE_CHANGES=0.
+
+3. Implementation phase V2.2 READ-ONLY V2 FILE FORMAT remains unchanged.
+
+PASS. The table row beginning "| V2.2 | READ-ONLY V2 FILE FORMAT |" is
+textually identical in V2.1 and final V2.2. The final header also states that
+the document-version promotion does not renumber or replace that phase.
+
+4. execution_id/lifecycle_id core contract remains unchanged.
+
+PASS. The V2.1 P-01 identity invariant, section 4.1 contract, UUIDv4
+generation rule, and physical alias semantics were not within any diff hunk.
+The final specification retains execution_id == lifecycle_id as the physical
+and operational identity contract.
+
+5. LIVE requirements remain unchanged except dependencies explicitly approved.
+
+PASS. The section 4.5 LIVE requirements remain unchanged. V2.7A/V2.8
+observation is VERIFY-only and does not modify LIVE execution intent, identity,
+or broker requirements. No LIVE dependency or authority was added beyond the
+approved future gates.
+
+6. V2.LIVE-PILOT remains separately gated.
+
+PASS. The single section 28 FUTURE V2.LIVE-PILOT GATE remains present outside
+V2.0-V2.10 and was not touched by the comparison hunks.
+
+7. V2.7A exists exactly once.
+
+PASS. Exactly one implementation-gate matrix row begins "| V2.7A |". Detailed
+references elsewhere describe that one prerequisite phase; they do not define
+a second phase.
+
+8. V2.8 entry requires V2.7A exactly and unambiguously.
+
+PASS. The sole V2.8 matrix entry condition begins: "V2.7A exit accepted;
+Falcon flat; Falcon VERIFY; real trading off; explicit operational
+authorization; V2.7A productive signal/decision identity dossier accepted."
+
+9. V2.9 explicitly retains V2.0-V2.7 + V2.7A + V2.8 dependencies.
+
+PASS. The V2.9 matrix entry states: "V2.0-V2.7 accepted; V2.7A exited; V2.8
+exited under the amended authoritative gates; full suite/fault suite; migration
+dry-run; V1 backup; PAPER isolated."
+
+10. No normative phrase restores strict total zero broker-interface calls in
+V2.8.
+
+PASS. The old phrase "zero broker call/no V2 mutation" has zero occurrences in
+the final specification. Section 27.2 instead requires zero mutable broker
+calls, zero shadow-caused broker/exchange calls, and unchanged pre-existing
+read-only calls OFF/ON.
+
+11. No proposal-only / NOT AUTHORITATIVE marker exists in final V2.2.
+
+PASS. Final-document search found zero occurrences of "NOT AUTHORITATIVE" or
+"PROPOSAL ONLY". Historical proposal/review references appear only in the
+revision-history traceability sentence and are explicitly non-normative.
+
+12. Proposal/review historical wording has no normative force.
+
+PASS. The final document contains a concise revision history only. It does not
+embed obsolete Review1/Review2 proposal wording as active requirements.
+
+PROMOTION CONCLUSION
+====================
+
+registry_execution_identity_v2_final_spec_v2_2.txt is a complete standalone
+authoritative V2.2 specification. It supersedes V2.1 for future Registry V2
+specification work while V2.1 remains immutable historical evidence.
+
+The promotion itself authorizes neither implementation nor deployment. V2.7A
+implementation may be separately authorized only under its own V2.7A entry
+gates. V2.8 cannot resume before V2.7A exit, and V2.9 remains gated.
+
+PROMOTION_AUDIT_STATUS=PASS
+FINAL_SPEC_STATUS=AUTHORITATIVE_FINAL_SPECIFICATION
+V2_1_PRESERVED_UNCHANGED=PASS
+REVIEW3_CHANGES_FULLY_INTEGRATED=PASS
+UNAPPROVED_NORMATIVE_CHANGES=0
+V2_7A_PRESENT=PASS
+V2_7A_ENTRY_EXIT_PRESENT=PASS
+SHADOW_STAGE_PRE_POST=PASS
+SIGNAL_ID_CONTRACT=PASS
+DECISION_ID_CONTRACT=PASS
+DECISION_SIGNAL_CORRELATION=PASS
+POSITION_SIDE_V1_PRECEDENCE=PASS
+OWNER_PLAN_PROVENANCE=PASS
+PREEXISTING_FIELD_VALUE_EQUIVALENCE=PASS
+V2_8_ENTRY_REQUIRES_V2_7A=PASS
+V2_8_BROKER_CONTRACT=PASS
+V2_8_EXIT_GATE=PASS
+V2_9_EXPLICIT_DEPENDENCIES=PASS
+IMPLEMENTATION_PHASE_V2_2_UNCHANGED=PASS
+EXECUTION_LIFECYCLE_CORE_CONTRACT_UNCHANGED=PASS
+LIVE_REQUIREMENTS_PRESERVED=PASS
+LIVE_PILOT_SEPARATELY_GATED=PASS
+PROPOSAL_MARKERS_REMOVED_FROM_NORMATIVE_FINAL=PASS
+NORMATIVE_CONTRADICTIONS_REMAINING=0
+V2_7A_IMPLEMENTATION_CAN_BE_SEPARATELY_AUTHORIZED=YES
