@@ -1,0 +1,332 @@
+CENTRAL QUANT — REGISTRY EXECUTION IDENTITY V2
+FINAL SPECIFICATION DOCUMENT V2.3
+PROMOTION AUDIT
+
+STATUS: PASS — DOCUMENTATION / GOVERNANCE ONLY
+DATE: 2026-08-09
+AUTHORITATIVE BASELINE: registry_execution_identity_v2_final_spec_v2_2.txt
+AUTHORITATIVE BASELINE COMMIT: 2963279
+FINAL DOCUMENT: registry_execution_identity_v2_final_spec_v2_3.txt
+
+1. SCOPE AND NON-AUTHORIZATION
+
+This audit evaluates the promotion of the V2.3 final specification document
+from the immutable V2.2 authoritative baseline. It creates no implementation,
+runtime, broker, Registry, test-runtime, staging, commit, push, or deploy
+authority. No source or test file was changed for this promotion.
+
+The final document is a standalone authoritative specification, not a delta.
+V2.2 remains preserved as the immutable historical baseline; V2.3 supersedes
+it only for future Registry V2 specification work. Document version V2.3 does
+not rename or alter implementation phase V2.3 — MIGRATION AUDITOR DRY-RUN.
+
+2. APPROVED SOURCE SET AND PRECEDENCE
+
+The only amendment sources considered were:
+
+1. registry_execution_identity_v2_final_spec_v2_3_PROPOSAL.txt
+   (base V2.3 amendment);
+2. registry_execution_identity_v2_final_spec_v2_3_PROPOSAL_REVIEW2.txt
+   (Review2 corrections, superseding a conflicting base provision);
+3. registry_execution_identity_v2_final_spec_v2_3_PROPOSAL_REVIEW3.txt
+   (final Review3 corrections, superseding conflicting Review2/base text);
+4. registry_execution_identity_v2_7a_decision_identity_spec_resolution.txt;
+5. registry_execution_identity_v2_7a_decision_identity_spec_resolution_review2.txt;
+6. registry_execution_identity_v2_7a_decision_identity_spec_resolution_review3.txt.
+
+The review-resolution documents were used as governance traceability evidence.
+The effective normative precedence is base, then Review2, then Review3.
+
+3. READ-ONLY MECHANICAL COMPARISON
+
+Baseline SHA256:
+CBB869A80EF75B3CA5B5CD5B2443D7CDB38D47A96319194E44E1E2EC1D8EBBE2
+
+Final SHA256:
+38CCA5FD177A9BC79C9BC693C6F62DBDACC0A7EB5206DE4AC5FC2361F0369A88
+
+The baseline was read and copied into the new final-document path; it was not
+edited. A read-only unified-zero-context comparison was performed between the
+baseline and final. Its changed hunks are confined to the following exact
+baseline locations and final sections:
+
+| Mechanical hunk | Final section / purpose | Approved source |
+| --- | --- | --- |
+| @@ -2 +2 | Header V2.2 -> V2.3 | Formal promotion task |
+| @@ -7,3 +7,4; @@ -11,4 +12,9 | Authority/versioning; V2.2 historical baseline; promotion non-authorization; document-version vs implementation-phase distinction | Formal promotion task; base authority clause |
+| @@ -24,2 +30,11 | Revision history V2.3 entry | Base proposal + Review2 + Review3 |
+| @@ -34,0 +50,6 | Executive-summary authority clarification | Formal promotion task |
+| @@ -148,5 +169,5; @@ -181,2 +202,3 | Section 4.3 three factual identities and decision_id exclusion list | Base amendment 1 |
+| @@ -210,0 +233,294 | New Section 4.3A: request ID, one store, same-store claim, ordering, incomplete, V1-equivalence, binding, historical replay, duplicate/concurrency, crash, exposure, store safety | Base amendment 1; Review2 corrections 2–3; Review3 corrections 1–3 |
+| @@ -236 +552,2; @@ -245,0 +563,20 | Section 4.5 VERIFY stage/request/claim/POST requirements | Base amendment 2; Review3 claim ordering |
+| @@ -1293,0 +1631,55 | Section 24 explicit future claim/store/replay/concurrency/I/O/V2.8 proof obligations | Formal promotion test-matrix requirement; Review2/Review3 |
+| @@ -1357,2 +1749,2 | Section 27 V2.7A table cells: files, persistence, focused tests, V2.7A.1/.2 exit | Base amendment 3; Review2 correction 1; Review3 correction 4 |
+| @@ -1368,0 +1761,23; @@ -1374,2 +1789,4; @@ -1400,6 +1817,7 | Section 27.1 exactly two substeps, authorized additive seams, and exact issuer/provider dossier | Base amendment 3; Review2 correction 1 |
+| @@ -1437,0 +1856,55 | New 27.1A activation states and claim-proof gates | Review2 correction 4; Review3 correction 5 |
+| @@ -1442 +1915,9; @@ -1462,0 +1944,3 | Section 27.2 and V2.8 row/exit traceability: no new V2.8 persistence surface and no store/claim management | Base amendment 4; Review2 correction 4; Review3 correction 5 |
+| @@ -1569,0 +2054,19; @@ -1631,0 +2135,27 | Self-consistency and final-architecture decisions for promoted V2.3 identity contract | Formal promotion consolidation; effective V2.3 amendments |
+| Review4 delta from pre-Review4 V2.3 candidate | Section 32 stale V2.0-exclusive/V2.1-start readiness summary replaced with phase-specific readiness and the already-approved V2.7A/V2.8/V2.9/LIVE gates | Final Review4 authorized consistency correction; Section 27 effective V2.3 phase model |
+| Review5 encoding delta from Review4-corrected V2.3 final | Reconstructed inherited V2.2 Unicode text and removed mojibake; no V2.3/Review4 normative hunk changed | Review5 deterministic baseline reconstruction and encoding-integrity validation |
+
+No changed hunk touches the V2.2 Registry schema/WAL/idempotency definitions,
+PAPER/LIVE contract, V2.9, V2.10, V2.LIVE-PILOT, or an implementation phase
+other than the V2.7A/V2.8 governance text explicitly amended above. Review4
+changes only the inherited Section 32 readiness summary to align it with the
+already-approved Section 27 V2.7A progression; it introduces no architecture
+decision or gate change.
+
+Review5 changes only character representation in inherited V2.2 lines. All
+approved V2.3 and Review4 hunk text remains unchanged; Review5 introduces no
+new normative hunk, architecture decision, implementation authority, or
+runtime authority.
+
+4. NORMATIVE-DIFFERENCE TRACEABILITY
+
+4.1 Final-document authority
+
+The header, authority clause, and revision history are required to promote the
+document. They state that V2.3 supersedes V2.2 for future specification work,
+V2.2 remains immutable historical evidence, the implementation phase remains
+V2.3 Migration Auditor Dry-Run, and promotion grants no code/runtime/broker/
+Registry/staging/commit/push/deploy/PAPER/VERIFY/LIVE authority. Source:
+formal promotion task.
+
+4.2 Three factual identities and request identity
+
+Section 4.3/4.3A adds the precise distinction:
+
+- signal_id: one factual productive Falcon signal birth;
+- decision_request_id: one factual decision evaluation request; and
+- decision_id: one factual durably completed ALLOW/DENY result for that exact
+  request.
+
+It maps to base amendment 1 and is constrained by Review2/Review3. It prohibits
+substitution with execution/lifecycle/logical/client/broker/exchange/fill/
+position/broker-derived identity. Request issuance, provenance, explicit retry,
+restart-new-evaluation, digest, signal binding, and non-reuse map to base
+4.3A.2, Review2 4.3A.8C, and Review3 corrections 1–3.
+
+4.3 One narrowly authoritative store and same-store claim
+
+Section 4.3A authorizes exactly one future dedicated provider-owned
+DECISION_IDENTITY_RECORD_STORE. Its authority is only request/result identity
+and exact request/signal correlation. It is not Registry V1/V2, generic
+persistence, execution, risk, broker, financial, position/ownership, or
+execution-intent authority.
+
+The same section maps Review3 correction 1 verbatim in substance: one lineage
+per request ID; durable CLAIMED and COMPLETED only; completed as terminal form
+of same claim/key; approved minimum claim material; no physical/broker/Registry/
+ownership/financial/execution-intent identity; and no second store or V2.7A.3.
+
+4.4 Ordering, failure, incomplete, crash, and concurrency
+
+The final ordering is exactly: create request ID; canonical request/digest with
+exact signal; serialize actual provider/store domain; check state/digest; commit
+claim if absent; only then associate V2.7A identity; run unchanged V1 provider
+semantics; create candidate completed material; durable COMPLETED/validate; then
+expose factual decision_id/POST.
+
+Base durability text, Review2's single-evaluation and historical replay
+correction, and Review3's durable witness correction jointly map:
+
+- identity failure preserves existing V1 current decision behavior only;
+- V2.7A identity/POST fails closed;
+- CLAIMED-without-COMPLETED is IDENTITY_REQUEST_INCOMPLETE, not third state;
+- four crash cases are explicit;
+- same ID/different digest conflicts;
+- same ID/same digest/CLAIMED has no second identity evaluation;
+- same ID/same digest/COMPLETED is historical-only;
+- exactly one lineage and at most one completed record exist;
+- actual topology serialization is mandatory and in-process-only locking is
+  insufficient for multi-process writers; unable proportional serialization
+  stops implementation for architecture review.
+
+4.5 Replay/exposure/exact correlation
+
+Review2 correction 2 maps the final read-only historical IDENTITY_REPLAY
+contract. Historical ALLOW/DENY cannot become current allowed/denied value,
+short-circuit can_open_trade_decision, bypass risk, change Falcon control flow,
+authorize execution, or provide stale approval. A current decision is
+NEW_REEVALUATION with a new request ID.
+
+Review2 correction 3 and Review3 correction 3 map decision_id exposure: a
+candidate can exist internally but is factual/external only after durable
+COMPLETED validation. Exact correlation remains:
+completed_record.signal_id == canonical_decision_request.signal_id ==
+paired_POST_DECISION.signal_id. No symbol/setup/side/logical/legacy/uncorrelated
+fallback is retained.
+
+4.6 V2.7A table, substeps, I/O, and activation
+
+The V2.7A Files allowed cell maps Review2 correction 1: factual Falcon
+signal/plan changes, exact request issuer, exact completed-decision provider,
+one store, pure helpers, focused tests/docs/audit. It grants no generic
+persistence or blanket main.py authority.
+
+The persistence cell maps base amendment 3 and Review2: injected/temporary/
+local test storage for the one store only; no production/default path; zero
+Registry V1/V2 writes, execution persistence, position/ownership persistence,
+or other persistence authority.
+
+The focused-test cell maps Review3 correction 4. It authorizes only store I/O
+defined by V2.7A.2 and explicitly requires zero unauthorized I/O, no added
+broker/exchange call, zero network dependency, zero Registry I/O/write
+attributable to store, zero execution/position/ownership persistence, and
+pure-helper no-I/O where specified.
+
+The two-substep contract maps base amendment 3. Activation States 1–3 map
+Review2 correction 4 plus Review3 correction 5: local test only; local
+acceptance only; future separately authorized VERIFY-only activation with
+claim atomicity/crash/concurrency/non-reuse proof, Falcon VERIFY, real OFF,
+Registry V2 writer OFF, explicit backend/path, data-preserving disable, and no
+PAPER/LIVE execution authority.
+
+4.7 V2.8 traceability
+
+Base amendment 4, Review2 correction 4, and Review3 correction 5 map the final
+V2.8 text: it creates no new persistence surface attributable to V2.8; does not
+create store/claim, write, complete, mutate, recover, repair, compact, select,
+or otherwise manage claim/completed record; only observes additive material
+from separately authorized V2.7A; and remains blocked until both V2.7A
+substeps exit plus separate V2.8 authorization.
+
+4.8 Review4 stale readiness-summary consistency correction
+
+Pre-Review4 final-candidate SHA256:
+3F533732895B37F2A037C40304C2F58302532838190C96BF6BF9345ABA8E85A8
+
+Corrected Review4 final SHA256:
+BA931F25A78E9FA44866D6D0374CE6435D99C48D1AA6B3CAF4F12BA1D7F8C0F6
+
+The inherited Section 32 summary stated that the specification was ready
+“exclusively” to start V2.0 PURE IDENTITY CONTRACT and separately reported no
+architectural blocker for V2.1 implementation start. In a complete standalone
+V2.3 authoritative document, that wording was stale: V2.0 through V2.7 are
+defined historical phases, and the approved V2.3 Section 27 V2.7A row already
+requires factual entry conditions plus separate explicit local implementation
+authorization.
+
+Review4 replaces only that inherited summary. The corrected wording is
+phase-specific under Section 27 and separate authorization; the specification
+itself authorizes no implementation/runtime/PAPER/VERIFY-runtime/LIVE. It says
+V2.7A MAY BE SEPARATELY AUTHORIZED only when factual entry conditions are
+satisfied and explicit local implementation authorization is granted. It does
+not state or imply automatic V2.7A authorization.
+
+The corrected summary keeps V2.8 BLOCKED pending accepted V2.7A.1 and V2.7A.2
+exits plus separate V2.8 authorization; keeps V2.9 dependent on the existing
+accepted phases, full/fault suites, migration dry-run, V1 backup, PAPER
+isolation, and separate authorization; and keeps LIVE under Section 28 plus
+separate V2.LIVE-PILOT authorization.
+
+Read-only pre-Review4-to-corrected-final comparison is limited to one
+normative hunk: the Section 32 readiness summary. This audit's Review4
+traceability supplement is the only other documentation change. This is a
+consistency correction under the already-approved V2.3 phase model, not a new
+architecture decision.
+
+4.9 Review5 UTF-8 / mojibake integrity correction
+
+Pre-Review5 final SHA256:
+BA931F25A78E9FA44866D6D0374CE6435D99C48D1AA6B3CAF4F12BA1D7F8C0F6
+
+Post-Review5 final SHA256:
+38CCA5FD177A9BC79C9BC693C6F62DBDACC0A7EB5206DE4AC5FC2361F0369A88
+
+The pre-Review5 final contained documentary UTF-8-as-Windows-1252 mojibake.
+The deterministic repair classified 420 affected lines, all in inherited V2.2
+regions outside the approved V2.3 and Review4 hunk map. Those regions were
+rebuilt from the exact V2.2 Unicode baseline. The approved V2.3 and Review4
+hunk text was retained unchanged.
+
+The known mojibake-signature scan found 956 occurrences before repair and zero
+after repair. The repaired final decodes as UTF-8, has no BOM, and has zero
+CRLF sequences. The pre-existing terminal blank line was retained so that no
+whitespace normalization beyond encoding integrity was introduced.
+
+No approved normative text changed. V2.2 remains unchanged, the Review4
+readiness contract remains unchanged, and Review5 grants no code, runtime,
+PAPER, VERIFY, LIVE, Registry, broker, staging, commit, push, or deploy
+authority.
+
+
+5. PRESERVATION AUDIT
+
+The following baseline contracts are outside the above hunks and remain
+semantically unchanged:
+
+- execution_id == lifecycle_id; lifecycle_id is an alias, not a second UUID;
+  new IDs remain exec_<uuid.uuid4 lowercase>.
+- logical_trade_id remains non-unique grouping/read compatibility only.
+- Registry EVENT_COMMITTED remains the durable idempotency authority;
+  operation_ledger remains derived/rebuildable cache.
+- Registry WAL remains EVENT_PREPARED -> SNAPSHOT_COMMITTED ->
+  EVENT_COMMITTED with no double apply.
+- Registry schema, canonical execution row, indexes, register/update/close,
+  concurrency, MANUAL_EXTERNAL/read-only non-adoption, legacy view, migration,
+  Registry persistence, invariants, status contract, Falcon execution path,
+  all-bot compatibility, reconciliation, and analytics remain V2.2.
+- Mode precedence remains V2.2. PAPER remains unchanged. LIVE remains unchanged.
+- The existing implementation phase V2.3 Migration Auditor Dry-Run remains
+  unchanged.
+- V2.0–V2.7 historical definitions remain unchanged except explicitly amended
+  V2.7A governance cells/subsections. V2.9 remains first runtime V2 Registry
+  write and isolated PAPER. V2.10 remains unchanged. V2.LIVE-PILOT remains
+  separately gated.
+- V2.0–V2.10 still authorize no LIVE Registry write.
+
+6. REQUIRED PROMOTION PROOFS
+
+1. FINAL V2.3 COMPLETE/STANDALONE: PASS. The final contains the full V2.2
+   baseline with only mapped inline V2.3 amendments.
+2. V2.2 UNCHANGED: PASS. Its source path was not edited; baseline SHA256 is
+   recorded above.
+3. NO UNAPPROVED V2.2 NORMATIVE CHANGE: PASS. Each changed hunk maps to the
+   approved source set in section 3/4.
+4. DOCUMENT VERSION != IMPLEMENTATION PHASE: PASS.
+5. EXECUTION/LIFECYCLE CORE: PASS.
+6. REGISTRY SCHEMA/WAL/IDEMPOTENCY: PASS.
+7. PAPER: PASS.
+8. LIVE: PASS.
+9. V2.9: PASS.
+10. V2.10: PASS.
+11. V2.LIVE-PILOT: PASS.
+12. V2.7A EXACTLY TWO SUBSTEPS: PASS.
+13. EXACTLY ONE STORE IMPLEMENTATION: PASS.
+14. CLAIM IN SAME STORE/NO SECOND AUTHORITY: PASS.
+15. STORE NOT REGISTRY/RISK/EXECUTION/BROKER/OWNERSHIP AUTHORITY: PASS.
+16. HISTORICAL REPLAY CANNOT AUTHORIZE EXECUTION: PASS.
+17. FAILURE PRESERVES V1 DECISION AND FAILS V2.7A IDENTITY CLOSED: PASS.
+18. ACTUAL CONCURRENCY-DOMAIN SERIALIZATION: PASS.
+19. LITERAL CONFLICTING V2.7A FOCUSED “no-I/O” CELL REPLACED: PASS.
+20. V2.8 DOES NOT OWN OR MUTATE STORE: PASS.
+21. FINAL NORMATIVE DOCUMENT HAS AUTHORITATIVE STATUS AND NO “PROPOSAL ONLY”/
+    “NOT AUTHORITATIVE” MARKER: PASS.
+22. NO OBSOLETE CONFLICTING REVIEW1/REVIEW2 RULE SURVIVES AS ACTIVE NORMATIVE
+    CONTENT: PASS. Review2/base conflicts are superseded by Review3 in
+    Sections 4.3A, 27, 27.1A, and 27.2.
+23. REVIEW4 STALE READINESS SUMMARY: PASS. Only the inherited Section 32
+    V2.0-exclusive/V2.1-start wording changed, aligning it with the existing
+    Section 27 V2.7A separate-authorization progression without making V2.7A
+    automatically authorized or changing any architecture/gate.
+24. REVIEW5 UTF-8 / MOJIBAKE INTEGRITY: PASS. The inherited V2.2 Unicode text
+    was reconstructed from the trusted baseline, all approved V2.3/Review4
+    hunks were retained unchanged, and no normative or runtime authority was
+    added.
+
+PROMOTION_STATUS=PASS
+CODE_CHANGED=FALSE
+V2_2_PRESERVED_UNCHANGED=PASS
+COMPLETE_STANDALONE_SPEC=PASS
+UNAPPROVED_NORMATIVE_CHANGES=0
+NORMATIVE_CONTRADICTIONS_REMAINING=0
+V2_7A_IMPLEMENTATION_CAN_BE_SEPARATELY_AUTHORIZED=YES
+REVIEW4_STALE_READINESS_CORRECTED=PASS
+REVIEW5_UTF8_MOJIBAKE_INTEGRITY_CORRECTED=PASS
+PRE_REVIEW5_FINAL_SHA256=BA931F25A78E9FA44866D6D0374CE6435D99C48D1AA6B3CAF4F12BA1D7F8C0F6
+POST_REVIEW5_FINAL_SHA256=38CCA5FD177A9BC79C9BC693C6F62DBDACC0A7EB5206DE4AC5FC2361F0369A88
+STAGING_PERFORMED=FALSE
+COMMIT_PERFORMED=FALSE
+PUSH_PERFORMED=FALSE
+DEPLOY_PERFORMED=FALSE

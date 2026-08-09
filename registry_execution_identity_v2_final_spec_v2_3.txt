@@ -1,0 +1,2291 @@
+CENTRAL QUANT — REGISTRY EXECUTION IDENTITY V2
+FINAL SPECIFICATION DOCUMENT V2.3
+Data: 2026-08-09
+Status: AUTHORITATIVE FINAL SPECIFICATION
+
+Authority:
+This document supersedes registry_execution_identity_v2_final_spec_v2_2.txt
+for future Registry V2 specification work. The V2.2 document, promoted at
+commit 2963279, remains immutable historical authoritative-baseline evidence.
+It is preserved unchanged as historical authority.
+
+Document-version V2.3 does not rename, replace, advance, or alter the
+existing implementation phase V2.3 - MIGRATION AUDITOR DRY-RUN. Every
+implementation phase retains its individual entry/exit gates and requires
+explicit authorization.
+
+This promotion alone authorizes no code, runtime activation, broker call,
+Registry write, staging, commit, push, deploy, PAPER, VERIFY runtime
+activation, or LIVE. V2.8 remains blocked until full V2.7A exit and separate
+explicit V2.8 authorization.
+
+REVISION HISTORY
+
+V2.1: previous authoritative baseline.
+
+V2.2: adds V2.7A; formalizes factual signal/decision identity preparation and
+PRE_DECISION/POST_DECISION observation; clarifies position-side and owner-plan
+provenance; replaces the overbroad strict-total broker wording with the
+approved causal/mutable broker safety contract; updates V2.8 entry/exit; and
+preserves explicit V2.9 dependencies. Historical source-review filenames are
+traceability evidence only and have no normative force.
+
+V2.3: preserves all V2.2 normative architecture not expressly amended. It
+defines separate factual signal_id, decision_request_id, and decision_id;
+authorizes only one narrowly provider-owned Decision Identity Store under
+future V2.7A.2; requires a durable request claim in that same store before
+identity-qualified evaluation; and defines identity-only failure, crash,
+concurrency, historical-projection, testing, activation, and V2.8 boundaries.
+It does not alter Registry V1/V2, broker, risk, sizing, execution, ownership,
+PAPER, LIVE, V2.9, V2.10, or V2.LIVE-PILOT contracts.
+
+1. EXECUTIVE SUMMARY
+
+Registry Execution Identity V2.2 é a referência consolidada e autoritativa
+para o futuro refactor do Trade Registry. Ela sucede V2.1, preserva toda a
+arquitetura V2.1 não explicitamente alterada e incorpora as alterações
+aprovadas de preparação factual de identidade Falcon antes da integração
+shadow V2.8.
+
+The preceding V2.2 overview is retained as historical-baseline context only.
+For future Registry V2 specification work, V2.3 is the authoritative
+consolidation: it preserves that architecture except for the explicit V2.3
+decision-request/claim/store amendments in sections 4.3A, 4.5, 24, 27, 27.1,
+27.1A, and 27.2.
+
+Objetivo: eliminar a colisão estrutural de BOT:SETUP:SYMBOL:SIDE, suportar múltiplas execuções/lifecycles independentes, reentradas e retries idempotentes, preservar ownership por robô, impedir mutação ambígua e manter compatibilidade conservadora com V1.
+
+Decisões finais:
+- execution_id é a chave física e operacional da execução.
+- lifecycle_id é o mesmo valor de execution_id; não existe segundo UUID nem mapping 1:1 separado.
+- Para compatibilidade, ambos os nomes podem aparecer no payload, mas devem ser exatamente iguais. Divergência falha fechada com REGISTRY_EXECUTION_LIFECYCLE_ID_CONFLICT.
+- Novas identidades usam generate_execution_lifecycle_id(), com UUIDv4 do Python standard library e formato exec_<uuid4 minúsculo>. runtime.txt declara Python 3.11.9, cuja biblioteca padrão não oferece uuid.uuid7; UUIDv4 evita dependência adicional e fornece aleatoriedade de sistema suficiente.
+- O Registry V2 journal em estado EVENT_COMMITTED é a única autoridade durável de idempotência. operation_ledger é cache/projeção reconstruível.
+- A mutação é protegida por WAL: EVENT_PREPARED -> SNAPSHOT_COMMITTED -> EVENT_COMMITTED.
+- legacy projection é view derivada read-only, nunca segunda store operacional.
+- V2.0–V2.10 não autorizam write LIVE. O primeiro write V2 runtime ocorre apenas em V2.9, PAPER isolado. LIVE requer projeto separado V2.LIVE-PILOT e autorização específica.
+- V1 permanece archive/read-only após cutover; não existe dual-write independente V1/V2.
+
+Esta especificação não autoriza código, testes de runtime produtivo, alterações de flags, broker, Redis, Render, BingX, Telegram, commit, push ou deploy.
+
+2. CURRENT V1 FAILURE
+
+2.1 Modelo V1 confirmado
+
+trade_registry.py V1 usa trade_id determinístico:
+BOT:SETUP:SYMBOL:SIDE.
+
+open_trades é um dict indexado por essa chave. register_open_trade grava diretamente em open_trades[trade_id]. lifecycle_id, client_order_id e broker_order_id podem estar presentes no payload, mas não fazem parte da chave física. Assim, duas execuções legítimas iguais em bot/setup/symbol/side colidem e a segunda pode sobrescrever a primeira.
+
+Exemplo:
+- FALCON / FALCON15 / SOLUSDT / LONG / lifecycle A
+- FALCON / FALCON15 / SOLUSDT / LONG / lifecycle B
+
+Ambas geram FALCON:FALCON15:SOLUSDT:LONG. V1 não mantém duas rows abertas. update_trade e close_trade genéricos selecionam por trade_id; expected_identity existe em partes de close, mas não é exigido universalmente.
+
+2.2 Outros limites V1
+
+- logical trade_id é usado como selector mutante por Falcon, Turtle, Predator, Donkey, TrendPro, Cobra, Meme e sincronizadores de main.py.
+- Donkey tenta uma lista de setup-derived IDs em update/close, podendo aceitar o primeiro match.
+- main.py possui sincronizadores e alguns writers diretos de snapshot que usam assinatura lógica/fallback manual.
+- V1 mode inference pode deixar PAPER persistido apesar de evidência factual broker.
+- RLock é somente intra-processo; não há protocolo WAL, generation, checksum transacional, operação idempotente autoritativa nem lock interprocesso.
+- closed_trades é lista histórica e parte dos consumers trabalha com aliases legados.
+- Falcon já propaga lifecycle_id e IDs fortes em diversos caminhos, mas V1 ainda persiste fisicamente por chave lógica.
+- Posição MANUAL/EXTERNAL é detectada por Falcon/Main como não gerenciada, mas V1 genericamente não impede chamada malformada que tente registrá-la como Falcon.
+
+2.3 Consequência que V2.1 corrige
+
+V2.1 substitui a identidade física por execution_id, que é o mesmo valor do lifecycle operacional. logical_trade_id é preservado apenas para agrupamento, analytics, compatibilidade e lookup read-only quando unívoco. Nenhuma mutação V2 escolhe row por logical_trade_id, symbol/side, preço médio, timestamp aproximado ou primeira/última ocorrência.
+
+3. FINAL V2 PRINCIPLES
+
+P-01. Uma execução Central possui uma única identidade física e operacional: execution_id == lifecycle_id.
+P-02. logical_trade_id pode agrupar N execuções; nunca é chave física de open trade.
+P-03. Uma ordem/fill factual pertence a no máximo uma execução.
+P-04. Retry idêntico é idempotente; retry com digest material divergente é conflito.
+P-05. Mutation sem execution_id exato, ou com identidade esperada divergente, falha fechada.
+P-06. Nenhuma seleção mutante usa symbol/side, preço médio agregado da corretora, setup alternativo ou heurística temporal.
+P-07. Broker é executor/custodiante e fonte factual de ordem, fill, fee e funding; não define ownership Central.
+P-08. Entry/exit/PnL por robô provêm de fills/ordens da execução correspondente, não de média agregada broker.
+P-09. Estado fechado nunca reabre. Reconciliação financeira posterior acrescenta fato versionado sem trocar lifecycle.
+P-10. TP50 é partial close; runner continua na mesma execution_id.
+P-11. MANUAL_EXTERNAL é observação read-only e não pode ser adotada, fechada, protegida ou usada como fill Central.
+P-12. PAPER, VERIFY e LIVE têm contratos distintos. Evidência broker contraditória gera MODE_CONFLICT, não promoção silenciosa.
+P-13. Journal EVENT_COMMITTED é autoridade de idempotência; snapshot é estado material; operation_ledger é cache.
+P-14. Snapshot/journal inválidos bloqueiam mutations até recovery determinístico.
+P-15. V1 archive e legacy views nunca se tornam source de mutation.
+P-16. Nenhuma fase V2.0–V2.10 habilita write LIVE.
+P-17. O caminho Falcon continua único: Execution Orchestrator/Execution Engine/Broker/Lifecycle existentes; V2 não cria segundo executor.
+
+4. CANONICAL IDENTITY CONTRACT
+
+4.1 Identidade única
+
+execution_id é a identidade canônica de cada execução V2. lifecycle_id é seu alias operacional de compatibilidade e possui exatamente o mesmo valor.
+
+Payload rules:
+- Se só execution_id é fornecido, lifecycle_id é projetado com o mesmo valor.
+- Se só lifecycle_id é fornecido em adapter compatível, ele é aceito como execution_id somente quando a chamada é permitida pelo modo/legado e o valor é preservado.
+- Se ambos são fornecidos e não são exatamente iguais após trim seguro, retornar REGISTRY_EXECUTION_LIFECYCLE_ID_CONFLICT; mutated=false.
+- Nenhum caller pode criar, regenerar, converter ou mapear um segundo ID.
+- A row canônica armazena execution_id; lifecycle_id pode ser serializado como alias durante a janela de compatibilidade, com invariant de igualdade.
+
+4.2 Geração de ID
+
+Função canônica conceitual:
+generate_execution_lifecycle_id()
+
+Formato:
+exec_<uuid4 lowercase>
+
+Exemplo:
+exec_9c8e4f1b-1e2b-4acf-ae12-442a6ca85e7e
+
+Razão do formato:
+- Python runtime declarado em runtime.txt é python-3.11.9.
+- uuid.uuid7 não está disponível na biblioteca padrão dessa versão.
+- uuid.uuid4 usa aleatoriedade do sistema, não exige dependência externa e não depende de símbolo, lado, preço ou timestamp isolado.
+- Ordenação cronológica é fornecida por created_at, journal event_seq e generation, não pelo formato do ID.
+- Consumers devem tratar o valor como opaco.
+
+4.3 Quem gera e quando
+
+Execution Orchestrator é o owner da geração para LIVE. Um shared pure identity helper é usado por adapters PAPER. Bot, broker, Registry reader, reconciliador e projection nunca geram substituto depois do boundary.
+
+Ordem:
+1. signal_id e decision_id autorizam uma nova tentativa.
+2. Orchestrator chama generate_execution_lifecycle_id uma vez.
+3. Execution Intent recebe execution_id/lifecycle_id iguais e intent idempotency key.
+4. Registry V2 grava EVENT_PREPARED/ENTRY_INTENT e retorna sucesso somente após EVENT_COMMITTED; esse é o durable Registry boundary.
+5. Lifecycle/History projection recebe o mesmo ID; se a projeção necessária à segurança falhar, broker submit não inicia.
+6. Só então é criado/reservado client_order_id e ocorre o boundary mutável de broker.
+7. ACK, order IDs, fills, disaster stop, TP50, close e reconciliation usam o mesmo ID.
+
+Factual Falcon signal and decision identity for V2.7A/V2.8
+-----------------------------------------------------------
+
+For Falcon V2.7A/V2.8 observation, signal_id is a factual signal-birth
+identity, decision_request_id is a factual decision-evaluation-request
+identity, and decision_id is a factual completed-decision-result identity.
+None is generated, substituted, repaired, or correlated by the VERIFY observer.
+VERIFY observation does not create operational execution_id or lifecycle_id and
+does not change existing LIVE ordering for execution intent or broker submit.
+
+signal_id MUST:
+
+- be born at factual productive Falcon signal birth;
+- be stable for the same factual signal and retry;
+- be distinct for distinct legitimate signals and reentries;
+- be independent of broker response and physical order/fill/position identity;
+- have defined restart/retry semantics;
+- be versioned and accompanied by signal_identity_version and
+  signal_identity_provenance;
+- not be legacy sig.id unless semantic identity equivalence is proved; and
+- not be logical_trade_id, execution_id, lifecycle_id, client_order_id, or a
+  broker/exchange/fill identity.
+
+The implementation contract must define and test the exact signal_id
+derivation/issuance material before productive use. This specification does
+not prescribe UUID versus deterministic hashing without repository evidence.
+If a persistence-safe restart/retry/reentry contract cannot be established,
+implementation must stop and return to architecture review.
+
+decision_id MUST:
+
+1. identify one factual completed decision result;
+2. be non-empty for a completed POST_DECISION ALLOW or DENY;
+3. be immutable after that decision result is issued;
+4. remain identical when the same factual decision result is transported,
+   replayed, retried, logged, or propagated;
+5. differ for a genuinely new or re-evaluated decision result;
+6. not be signal_id, decision_request_id, execution_id, lifecycle_id,
+   logical_trade_id, client_order_id, broker_order_id, exchange_order_id,
+   fill_id, position identity, or broker-derived identity;
+7. not be generated by the V2.8 observer, a VERIFY fallback, or an unrelated
+   consumer; and
+8. carry versioned factual provenance.
+
+Before a factual completed decision exists, decision_id is absent or None and
+the observation is PRE_DECISION only. A response presented as completed but
+lacking decision_id is decision-identity unavailable, cannot qualify as
+POST_DECISION, and blocks V2.7A exit; it receives no fabricated fallback.
+
+Decision-to-signal correlation:
+
+- A completed POST_DECISION result MUST have factual provenance sufficient to
+  prove it belongs to the exact factual signal_id of its paired PRE_DECISION
+  observation.
+- The result MUST be bound to that exact signal_id. Transport or replay of the
+  same result MUST retain that same binding.
+- A decision issued for signal A MUST NOT qualify as POST_DECISION for signal
+  B. Same symbol, setup, economic side, logical_trade_id, legacy sig.id, or an
+  uncorrelated decision_id is not sufficient correlation.
+- The V2.7A implementation dossier MUST select, document, and test one exact
+  factual correlation mechanism. It may use signal_id returned in the
+  completed decision response, decision_request_id, request digest, or another
+  immutable provider-issued provenance mechanism; this specification does not
+  prescribe a field name without repository evidence.
+- A failed, missing, mismatched, or stale correlation MUST fail paired
+  POST_DECISION qualification and remain a factual correlation conflict. It
+  must not be repaired by symbol/side matching, a legacy alias, or a new ID.
+
+4.3A FACTUAL DECISION REQUEST AND COMPLETED DECISION IDENTITY FOR V2.7A
+
+4.3A.1 Three distinct facts
+
+For V2.7A observation, these facts are separate and no field may substitute
+for another:
+
+1. signal_id identifies one factual productive Falcon signal birth.
+2. decision_request_id identifies one request/evaluation of that signal by the
+   factual Central decision provider.
+3. decision_id identifies one factual durably completed ALLOW or DENY result
+   for that exact decision_request_id.
+
+decision_request_id and decision_id MUST NOT be signal_id, execution_id,
+lifecycle_id, logical_trade_id, client_order_id, broker_order_id,
+exchange_order_id, fill_id, position identity, or broker-derived identity.
+None depends on broker, Registry V1, Registry V2, physical order, fill, or
+position state for issuance.
+
+4.3A.2 decision_request_id contract
+
+decision_request_id is required for a V2.7A identity-qualified decision
+evaluation. The exact factual caller creates it before invoking the factual
+Central provider. It MUST identify exactly one factual evaluation request; be
+opaque, cryptographically random, versioned, and issued once per genuine new
+evaluation; not be a deterministic hash of signal/economic inputs; belong to
+exactly one signal_id; remain byte-identical only for explicit transport/retry
+of that same evaluation; differ for every genuinely new/re-evaluated decision
+even where inputs and ALLOW/DENY coincide; carry versioned provenance; and
+never be inferred, regenerated, repaired, or substituted by the provider,
+observer, broker, Registry, or consumer.
+
+The implementation dossier must define exact opaque format, random source,
+validation, version, issuer seam, and in-process retry retention. It MUST NOT
+derive this ID from legacy sig.id, signal_id, timestamp alone, or market/broker
+facts. Restart without an explicitly preserved request ID is NEW_REEVALUATION,
+not replay: the next invocation receives a new decision_request_id. Matching
+signal_id or request values never prove replay.
+
+The issuer NEVER intentionally reuses a decision_request_id. Retention expiry
+can make historical identity projection unavailable; it never makes an old ID
+eligible for reuse. A cryptographic collision against retained identity
+evidence is a conflict, never overwrite or reuse.
+
+4.3A.3 DECISION_IDENTITY_RECORD_STORE: narrow authority
+
+There is one and only one dedicated provider-owned
+DECISION_IDENTITY_RECORD_STORE implementation that may later be authorized
+under V2.7A.2. It is narrowly authoritative only for decision request/result
+identity and exact request/signal correlation.
+
+It is NOT Registry V1, Registry V2, Registry mutation authority, execution
+authority, risk-policy authority, broker authority, financial truth,
+position/ownership authority, or execution-intent persistence. It cannot
+independently determine whether a trade executes. No generic persistence
+authority, second store, shared persistence framework, or alternate store is
+created.
+
+A completed record is uniquely keyed by decision_request_id. Its minimum
+immutable material is record_schema_version and integrity/version material;
+decision_request_id, request identity version, and issuer provenance; exact
+signal_id; decision_id; literal decision_result ALLOW/DENY and compatible
+allowed boolean; decision identity version/provenance; decision-request digest
+version and canonical digest; decision-to-signal correlation method/version and
+evidence; completed_at; and factual provider/function/version plus applicable
+policy/risk provenance.
+
+The canonical request digest is calculated over a versioned canonical
+representation of all material request facts supplied to the provider,
+including exact signal_id. It excludes decision_id and all execution,
+lifecycle, broker, exchange, fill, Registry, and physical identities. The
+implementation dossier defines the exact canonical representation before use.
+
+The record must not create, contain as authority, or infer execution_id,
+lifecycle_id, client/broker/exchange order IDs, fills, position ownership,
+financial truth, or execution intent. It is not a position record and cannot
+adopt MANUAL_EXTERNAL or EXTERNAL exposure.
+
+4.3A.3A DECISION_REQUEST_CLAIM IN THE SAME STORE
+
+DECISION_IDENTITY_RECORD_STORE contains one request lineage per
+decision_request_id. Before an evaluation may be associated with V2.7A identity
+preparation, that lineage MUST have one valid durable
+DECISION_REQUEST_CLAIM. The claim is not a second store, Registry record,
+execution intent, risk decision, broker record, financial record, or ownership
+record. It is durable evidence only that one exact request ID was claimed for
+one exact factual canonical request.
+
+The only durable lineage states are:
+
+- CLAIMED: a valid durable request claim exists but no valid durable completed
+  decision record exists; and
+- COMPLETED: the same request lineage/key has a valid durable completed
+  decision record.
+
+COMPLETED is the terminal materialized form of the same claim/key. There is no
+third durable state, independent claim authority, additional lifecycle, or
+additional V2.7A substep.
+
+Minimum immutable claim material is claim_schema_version and claim
+integrity/version material; decision_request_id; decision-request identity
+version and issuer provenance; exact signal_id; canonical request digest and
+digest version; claim state; claimed_at; and issuer/provider provenance
+sufficient to identify factual request and provider boundary.
+
+The claim MUST NOT include execution_id, lifecycle_id, client_order_id,
+broker/exchange order IDs, fill IDs, position ownership, financial facts, or
+execution intent. Its sole authority remains one decision request/result
+identity lineage and exact signal/request correlation. Once valid durable
+CLAIMED exists for request X, X is never treated as unseen again.
+
+4.3A.3B Claim ordering and legacy equivalence
+
+For a V2.7A identity-qualified evaluation, the required factual order is:
+
+1. caller creates one new random opaque decision_request_id;
+2. canonical request and digest are formed, including exact signal_id;
+3. store serializes the request over the actual provider/store concurrency
+   domain;
+4. durable state is checked and exact digest consistency verified;
+5. if no state exists, durable DECISION_REQUEST_CLAIM is committed;
+6. only then may provider evaluation be associated with V2.7A identity;
+7. provider executes unchanged current V1 risk semantics;
+8. completed ALLOW/DENY creates candidate decision_id/record material;
+9. completed record is durably committed and validated as COMPLETED; and
+10. only then may decision_id be factual/external POST_DECISION identity.
+
+Identity persistence is never a prerequisite for legacy V1 decision behavior.
+Claim write failure, claim conflict, incomplete claim, completed-record write
+failure, corrupt record, missing replay record, or signal-binding mismatch MUST
+NOT prevent or alter the current can_open_trade_decision evaluation that would
+otherwise occur. It executes with unchanged V1 semantics. The additive V2.7A
+identity state is unavailable/conflicted, decision_id is absent/None, and
+POST_DECISION is blocked. This preservation of V1 behavior is not general
+execution fail-open and never makes a risk-control short circuit.
+
+4.3A.3C Incomplete request
+
+IDENTITY_REQUEST_INCOMPLETE is the one derived identity status for a valid
+durable CLAIMED lineage without valid COMPLETED. It includes a claim left after
+restart or verified absence of an active completion owner. It is not a third
+durable state, lifecycle, or execution status.
+
+It has no factual decision_id, cannot qualify as POST_DECISION, cannot support
+historical replay, cannot contribute to V2.7A exit, and does not alter current
+V1 risk decision behavior. A caller needing a correctly formed current V2.7A
+identity evaluation uses NEW_REEVALUATION and a new decision_request_id.
+
+4.3A.4 Durability and failure boundary
+
+A V2.7A identity-authoritative completed result exists only after the
+provider-owned record is durably COMPLETED and passes validation. A
+pre-existing provider response remains a valid legacy V1 ALLOW/DENY even where
+identity recording fails.
+
+For all identity failures -- claim write failure, claim conflict, incomplete
+claim, completed-record write failure, corrupt record, missing replay record,
+or signal-binding mismatch -- existing V1 decision behavior remains unchanged.
+That is the sole meaning of FAIL OPEN V1. It does not allow execution, broker,
+risk, or safety failure to fail open. V2.7A identity fails closed: no factual
+decision_id, no POST_DECISION qualification, and no V2.7A exit based on that
+request.
+
+Conceptual additive identity statuses include IDENTITY_RECORD_WRITE_FAILED,
+IDENTITY_RECORD_CONFLICT, IDENTITY_RECORD_CORRUPT,
+IDENTITY_RECORD_NOT_FOUND, and IDENTITY_REQUEST_INCOMPLETE. They are not
+Registry statuses and never fabricate decision_id, repair correlation, change
+V1 risk/sizing/PAPER/LIVE, or create execution authority.
+
+4.3A.5 Exact decision-to-signal binding
+
+For a V2.7A completed decision, safe-trimmed, canonically validated values
+MUST satisfy:
+
+completed_record.signal_id
+  == canonical_decision_request.signal_id
+  == paired_POST_DECISION.signal_id
+
+Returned additive metadata preserves exact record/request/signal correlation
+evidence and method/version. Symbol, setup, economic side, logical_trade_id,
+legacy sig.id, timestamps, or uncorrelated decision_id are never substitutes.
+Mismatch, absence, stale reentry, or corrupt evidence is a factual correlation
+conflict and cannot qualify as POST_DECISION.
+
+4.3A.6 READ-ONLY HISTORICAL IDENTITY PROJECTION; NO RISK OR EXECUTION REPLAY
+
+IDENTITY_REPLAY is READ-ONLY HISTORICAL IDENTITY PROJECTION. It exists only
+when the same explicit decision_request_id, same canonical request digest, and
+one valid durable COMPLETED record are present. It may project only historical
+factual metadata: request ID, decision ID, exact signal binding, stored
+completed ALLOW/DENY as evidence, identity/provider provenance, integrity, and
+identity status.
+
+Stored ALLOW/DENY is historical evidence only. IDENTITY_REPLAY MUST NOT become
+the current allowed/denied value; short-circuit can_open_trade_decision or any
+current provider; bypass current risk evaluation; alter Falcon control flow;
+authorize execution or be passed to Execution Orchestrator as current approval;
+provide stale operational approval; or change risk, sizing, PAPER, LIVE,
+broker, Registry, or ownership semantics.
+
+The productive current-decision path continues to evaluate as before V2.7A.
+Store lookup cannot substitute for evaluation otherwise required for a current
+decision. Only additive identity/provenance/status may differ, preserving
+PREEXISTING_FIELD_VALUE_EQUIVALENCE. A caller requiring a CURRENT decision MUST
+use NEW_REEVALUATION, a new request ID, current provider evaluation, and a new
+decision_id only after durable completion. No operational response replay is
+authorized.
+
+4.3A.7 Conflict, duplicate, and single-evaluation owner
+
+For request X:
+
+- same X with different canonical digest is immediate
+  DECISION_REQUEST_ID_CONFLICT; it never joins, replaces, merges, overwrites,
+  or silently selects a lineage;
+- same X/same digest/valid CLAIMED must not create a second V2.7A
+  identity-associated evaluation or second decision candidate;
+- same X/same digest/valid COMPLETED supports historical identity projection
+  only; and
+- exactly one request lineage and at most one authoritative COMPLETED record
+  may exist for X.
+
+While a real active completion owner is known inside a safe serialization
+boundary, a same-X/same-digest participant may wait and re-check committed
+state. After restart it MUST NOT assume an owner remains active. A durable
+CLAIMED record without COMPLETED is incomplete, neither replayable nor new.
+
+This forbids a second V2.7A identity-associated evaluation, not an ordinary
+current V1 provider evaluation. If productive current path is invoked, it
+retains ordinary current risk evaluation and returns no V2.7A completed
+identity for consumed/incomplete ID. A correctly formed new V2.7A current
+evaluation mints a new request ID.
+
+4.3A.8 Actual concurrency-domain serialization
+
+Serialization/single-flight MUST cover the actual concurrency domain of the
+factual provider and selected store. If multiple process, workers, or threads
+can access provider/store, it MUST prevent duplicate completion ownership across
+that shared-writer domain. In-process-only lock is insufficient whenever
+multiple provider processes can access the same store.
+
+This specification does not require storage technology, a thread, a network
+coordinator, generic persistence service, or Registry V2 WAL. If selected store
+cannot provide proportional cross-writer serialization in actual deployment
+topology, implementation MUST STOP for architecture review.
+
+4.3A.8A Claim-aware crash semantics
+
+A. Crash before durable CLAIMED commit
+
+No identity claim exists. V1 is unaffected. If retry finds no factual evidence
+that a claim committed, identity preparation may start as normal first claim
+for the same ID under atomic store rules.
+
+B. Crash after CLAIMED before provider evaluation completes
+
+The ID is durably known as claimed/incomplete. After restart it MUST NOT start
+a new V2.7A identity-associated evaluation under that ID. It is
+IDENTITY_REQUEST_INCOMPLETE, has no factual decision_id and no POST_DECISION.
+A current V2.7A evaluation needs NEW_REEVALUATION and a new ID.
+
+C. Provider result exists but crash before COMPLETED commit
+
+The same B rule applies. Valid CLAIMED proves a consumed/incomplete request,
+not factual completed identity. No candidate or stale ALLOW identity is
+externally factual. New current identity-qualified evaluation needs new ID.
+
+D. Crash after valid durable COMPLETED commit
+
+Exact completed record may be read under the historical projection rule. It
+never substitutes for current risk evaluation or execution approval.
+
+4.3A.8B Exposure and store safety
+
+Candidate decision_id may exist internally as record material but MUST NOT be
+external/factual until same lineage is durably COMPLETED and validation passes.
+On claim/write/incomplete/conflict/corruption/missing-replay/binding failure,
+external decision_id is absent or None, identity unavailable, and
+POST_DECISION blocked.
+
+Before implementation, dossier must prove the single dedicated store provides
+atomic durable claim/complete before identity exposure; unique serialized lookup
+by request ID; same-key/same-digest validated behavior; different-digest
+conflict; restart validation of schema/integrity/request/digest/signal binding;
+explicit corrupt-record handling without silent repair; bounded retention with
+documented horizon and non-reuse/conflict protection; and no broker, exchange,
+network, Registry V1/V2, or runtime-execution dependency.
+
+The store need not and must not copy Registry V2 WAL beyond proportional
+atomicity, integrity, restart, duplicate, and conflict guarantees needed for
+this narrow authority. Existing append-only decision_log telemetry is not this
+store and cannot become it without separate architecture review.
+
+
+4.4 Restart e retry
+
+Antes de broker invocation, a identity é durável no intent/Registry committed. Depois de broker invocation, ela nunca é regenerada. Registry persistence failure reutiliza a mesma identity e idempotency key. ACK perdido reconcilia client_order_id/broker order/fill sob a mesma execution_id. Lifecycle projection faltante é reconstruída do journal committed; não cria outra identity.
+
+Se intent/lifecycle persistence falhar antes do Registry commit, não há broker submit. Se Registry commit falhar, não há sucesso de entry intent e não há broker submit. Se uma falha ocorrer depois de broker invocation, recovery deve consultar a mesma identity/client order e reconciliar antes de qualquer retry.
+
+4.5 PAPER, LIVE, VERIFY e legacy
+
+LIVE:
+- execution_id/lifecycle_id iguais são obrigatórios.
+- são gerados antes de client_order_id e broker submit.
+- signal_id, decision_id, owner_type=CENTRAL, position_side e execution intent idempotency key são obrigatórios.
+
+PAPER:
+- uma posição PAPER Central gerenciada recebe execution_id/lifecycle_id iguais ao nascer.
+- nenhuma broker ID é obrigatória.
+- signal_id/decision_id podem ser null somente para adapter legado, marcado LEGACY_MISSING.
+
+VERIFY:
+- não cria execution Registry aberta, execution_id operacional ou lifecycle_id operacional;
+- pode expor observação de plano read-only e não operacional em exatamente dois
+  shadow stages: PRE_DECISION ou POST_DECISION;
+- PRE_DECISION -> POST_DECISION é enriquecimento observacional do mesmo plano
+  VERIFY, não mutação de lifecycle de execução nem transição de registry_mode;
+- conversão VERIFY -> PAPER/LIVE cria nova identity; não muta modo de um plano VERIFY; e
+- nenhum stage fabrica signal_id, decision_request_id, decision_id,
+  execution_id, lifecycle_id,
+  client_order_id, broker_order_id, exchange_order_id ou fill_id.
+
+Shadow-stage contract:
+
+- shadow_stage é campo não operacional com valores permitidos exatamente
+  PRE_DECISION e POST_DECISION.
+- shadow_stage não é execution_mode, lifecycle_state, registry_mode, estado de
+  lifecycle de execução nem transição de modo de Registry.
+
+V2.7A decision-request additions:
+
+- PRE_DECISION may carry factual decision_request_id only after a real
+  evaluation request is created. Association with V2.7A identity requires the
+  durable CLAIMED boundary in section 4.3A.3B. PRE_DECISION has no decision_id.
+- POST_DECISION requires the same factual signal_id and, where V2.7A decision
+  identity is claimed, the same factual decision_request_id as paired
+  PRE_DECISION plus a valid durable COMPLETED record.
+- POST_DECISION requires non-empty factual decision_id, decision provenance,
+  exact record/request/signal binding, and no identity failure/conflict status.
+- Claim or record write failure, claim conflict, incomplete claim, corruption,
+  missing replay record, or binding mismatch remains identity-unavailable for
+  V2.7A: it cannot be repaired by new ID, legacy fallback, or symbol/side
+  matching.
+- All existing VERIFY prohibitions remain: no operational execution_id or
+  lifecycle_id; no client/broker/exchange/fill identity; no Registry execution;
+  no broker/exchange call attributable to V2.7A/V2.8 identity observation; and
+  no execution authority.
+
+
+Position-side observational precedence for V2.7A/V2.8:
+
+1. If explicit sig.get("positionSide") is non-empty, preserve that value.
+2. Otherwise, if explicit sig.get("position_side") is non-empty, preserve that
+   value.
+3. Otherwise, use sig.get("side"), the existing economic-side fallback exactly
+   as Falcon V1 already does.
+
+This fallback preserves existing Falcon semantics. It is not new V2 identity,
+ownership, broker, market, or position inference. The observer does not use a
+broker/market position to determine position side. The selected value is
+preserved verbatim: it is not silently normalized, validated into another
+side, or converted from BOTH/NET to LONG/SHORT. If positionSide and
+position_side are both explicit, non-empty, and contradictory, positionSide
+remains selected by existing precedence, while the other raw value and the
+fact of contradiction remain visible in observational provenance. Neither raw
+explicit value is overwritten. Position-side fields never establish Central,
+broker-position, or manual/external ownership.
+
+Owner-plan provenance for V2.7A/V2.8:
+
+owner_type=CENTRAL may be asserted only when the actual Falcon signal/plan
+origin factually establishes Central/Falcon plan provenance. That assertion
+means only that the candidate plan originated in the Central/Falcon planning
+path. It does not mean a BingX position is Falcon-owned, a manual/external
+position is adopted, or symbol/side matching proves ownership. Explicit
+MANUAL_EXTERNAL or EXTERNAL evidence is never overwritten by contextual
+CENTRAL plan provenance. If factual Central plan provenance cannot be
+established at the chosen seam, owner_type remains missing or unknown and is
+not fabricated.
+
+PRE_DECISION MUST satisfy all of the following:
+
+- shadow_stage=PRE_DECISION;
+- factual canonical signal_id, setup, symbol, and economic side are present;
+- decision_id is absent or None;
+- position-side selection follows the exact V1 precedence above, including raw
+  explicit-conflict visibility;
+- owner provenance follows the owner-plan rule above;
+- Falcon VERIFY safe gates are factual and real trading remains off;
+- execution_id and lifecycle_id are absent or None;
+- no client, broker, exchange, fill, or other physical/strong identity is
+  fabricated;
+- no Registry execution is created or mutated; and
+- the observer causes no broker or exchange call.
+
+POST_DECISION MUST satisfy all of the following:
+
+- shadow_stage=POST_DECISION;
+- the exact same factual signal_id, material plan facts, selected position-side
+  observation, raw position-side provenance, and owner-plan provenance as its
+  paired PRE_DECISION observation;
+- non-empty factual decision_id and decision provenance;
+- a completed factual ALLOW or DENY decision result;
+- factual decision-to-signal correlation proof for that exact signal_id;
+- every VERIFY non-execution rule in PRE_DECISION;
+- execution_id and lifecycle_id absent or None; and
+- no fabricated physical or strong identity.
+
+If signal/plan facts, selected/raw position-side facts, or justified owner
+provenance materially change, the observations are distinct factual plans. A
+decision result belonging to a distinct or stale reentry is a correlation
+conflict, not a POST_DECISION enrichment.
+
+LEGACY:
+- se um registro legado possui lifecycle_id forte, o mesmo valor torna-se execution_id físico na projection V2, sem regenerar.
+- se somente client/broker IDs fortes existem, o registro permanece V1 archive/read-only até reconciliação; synthetic legacy identity, se usada em audit, é marcada não factual e não é elegível LIVE.
+- um legacy lifecycle value fora do formato exec_<uuid4> é válido como LEGACY_IDENTITY_FORMAT; formato novo não é exigido retroativamente.
+
+5. SCHEMA
+
+5.1 Documento Registry V2
+
+{
+  "schema_version": "REGISTRY_EXECUTION_IDENTITY_V2_1",
+  "registry_version": "2.1.0",
+  "generation": 0,
+  "snapshot_id": "snapshot identifier",
+  "updated_at": "RFC3339 UTC",
+  "integrity": {
+    "snapshot_digest": "sha256",
+    "last_committed_event_seq": 0,
+    "last_committed_event_id": null
+  },
+  "wal": {
+    "materialized_seq": 0,
+    "materialized_event_id": null,
+    "materialized_request_digest": null,
+    "state": "CLEAN"
+  },
+  "open_trades": {
+    "<execution_id>": { "canonical row" }
+  },
+  "closed_trades": {
+    "<execution_id>": { "canonical row" }
+  },
+  "external_observations": {
+    "<external_observation_id>": { "read-only external row" }
+  },
+  "indexes": { "validated projections" },
+  "operation_ledger": {
+    "<operation cache key>": { "derived from committed journal only" }
+  },
+  "migration": {
+    "phase": "V1_READ_ONLY|DUAL_READ|V2_PRIMARY",
+    "source_snapshot_digest": null,
+    "journal_cursor": 0
+  }
+}
+
+Uma execution_id aparece em exatamente uma das coleções open_trades/closed_trades em qualquer snapshot válido. open_trades contém estados não terminais ou não reconciliados; closed_trades contém CLOSED_PROVISIONAL ou CLOSED_RECONCILED.
+
+5.2 Canonical execution row
+
+IDENTITY E OWNERSHIP:
+- execution_id;
+- lifecycle_id, alias igual enquanto compatibilidade existir;
+- logical_trade_id;
+- bot, setup, symbol, side, position_side;
+- owner_type=CENTRAL;
+- execution_mode, registry_mode, source_mode;
+- mode_source, mode_evidence, mode_conflict, mode_verified;
+- signal_id, decision_id;
+- execution_provenance;
+- identity_verification_status;
+- ownership_status;
+- lifecycle_state;
+- schema_row_version, identity_version.
+
+TIMESTAMPS E VERSIONAMENTO:
+- created_at, intent_committed_at, opened_at, updated_at, closed_at;
+- state_version;
+- source_snapshot_ref para legado;
+- factual_observed_at;
+- derivation_version;
+- reconciliation_status.
+
+FACTUAL ENTRY/ORDER/FILL:
+- entry_order.client_order_id, broker_order_id, exchange_order_id, submitted_at, acknowledged_at, status;
+- broker_position_id quando disponível;
+- orders.stop, orders.tp, orders.close, cada um com ID factual, role, client ID, broker ID, status e source;
+- fills append-only: fill_id, order_id, role, price, qty, fee, fee_asset, timestamp, raw_reference;
+- entry_price, entry_qty, filled_qty, remaining_qty;
+- initial_stop, current_stop, disaster_stop_identity, disaster_stop_status;
+- tp50_qty, tp50_filled_qty, runner_qty;
+- exit_price, exit_qty, gross_pnl, fees, funding, net_pnl, pnl_pct, realized_r;
+- close_event_id, close_reason, close_provenance, close_evidence;
+- financial_reconciliation_pending.
+
+DERIVED:
+- risk_per_unit, risk_notional;
+- r_price, r_net;
+- mfe, mae, giveback;
+- tp50_state, breakeven_state, trailing_state;
+- slippage_entry/slippage_exit somente quando existe referência planejada e fill factual;
+- derived_at, derivation_inputs_digest.
+
+CACHE:
+- broker_snapshot_cache;
+- last_mark_price_cache;
+- display_status_cache;
+- index_projection_cache.
+Cache nunca é fonte factual, de identidade ou financeiro.
+
+LEGACY:
+- legacy.trade_id;
+- legacy.registry_collection_key;
+- legacy.source_file, source_record_digest, source_snapshot_digest;
+- legacy.identity_format;
+- legacy.synthetic_audit_id se houver;
+- legacy.compatibility_status.
+Legacy fields não substituem identity factual.
+
+ANALYTICS:
+- analytics_tags;
+- analytics_group_keys;
+- learning_eligible;
+- learning_exclusion_reason;
+- outcome_refs;
+- report_projection_version.
+Analytics não pode alterar FACTUAL ou lifecycle_state.
+
+METADATA:
+- metadata deve ser namespaced.
+- metadata não pode conter aliases conflitantes de execution_id/lifecycle_id, client order, broker order, bot, setup, symbol, side, owner ou modo.
+- alias conflitante resulta em QUARANTINED/IDENTITY_CONFLICT.
+
+5.3 State machine de execução
+
+Estados:
+- ENTRY_INTENT: identity durável criada antes do submit.
+- ENTRY_PENDING_RECONCILIATION: submit/ACK perdido ou identificação entry incompleta.
+- OPEN: entrada identificada e sob gestão permitida.
+- PARTIALLY_CLOSED: remaining_qty factual positivo após parcial.
+- CLOSE_PENDING_RECONCILIATION: close/broker-flat observado, porém evidência financeira/factual incompleta.
+- CLOSED_PROVISIONAL: full close factual, com fee/funding/detalhe pendente.
+- CLOSED_RECONCILED: full close e economia reconciliados.
+- QUARANTINED: conflito/corrupção/ownership/mode/migration; sem automação.
+
+Transições são monotônicas. CLOSED_PROVISIONAL/CLOSED_RECONCILED nunca voltam a OPEN. QUARANTINED só é resolvido por recovery/reconciliation explícita, registrada em journal.
+
+6. INDEXES
+
+6.1 Índices canônicos
+
+| Índice | Tipo | Conteúdo | Regra |
+| --- | --- | --- | --- |
+| by_execution_id | único | execution_id -> row location | chave física canônica |
+| by_lifecycle_id_alias | alias derivado | lifecycle_id igual -> execution_id | não é segundo índice independente |
+| by_client_order_id | único factual | client ID -> execution_id + role | conflito entre execuções bloqueia |
+| by_broker_order_id | único factual | broker/exchange ID -> execution_id + role | conflito entre execuções bloqueia |
+| by_fill_id | único factual | fill ID -> execution_id + role | conflito entre execuções bloqueia |
+| by_close_event_id | único por execution | execution_id + close event -> digest | retry idempotente ou conflito |
+| by_logical_trade_id | não único | logical ID -> ordered set execution_ids | nunca deduplica execução |
+| by_bot | não único | bot -> set execution_ids | analytics/filter |
+| by_symbol | não único | symbol -> set execution_ids | analytics/filter |
+| by_bot_symbol | não único | bot|symbol -> set | analytics/filter |
+| by_bot_symbol_side | não único | bot|symbol|side -> set | analytics/filter |
+| by_owner_type | não único | owner -> set | external separado |
+| by_state | não único | lifecycle_state -> set | gestão/recovery |
+| by_signal_id | não único | signal -> set | provenance |
+| by_decision_id | não único | decision -> set | provenance |
+| external_by_broker_position_id | único awareness | broker position -> external observation | nunca Central ownership |
+
+6.2 Rebuild e corrupção
+
+Índices são projeções persistidas para leitura rápida, mas são reconstruíveis de rows e journal committed. Writer valida índices em toda mutation. No startup:
+1. validar snapshot digest e journal chain;
+2. rebuild em memória;
+3. comparar projeção persistida;
+4. se for possível reconstruir consistentemente, reparar somente após journal/snapshot procedure;
+5. se IDs fortes conflitam, bloquear mutation e marcar REGISTRY_INDEX_CORRUPT/QUARANTINED.
+
+Nenhum índice de symbol, side, bot+symbol ou logical_trade_id é permitido como autor de mutation.
+
+7. REGISTER
+
+7.1 Interface conceitual
+
+register_open_trade_v2(
+  execution_id,
+  lifecycle_id,
+  logical_trade_id,
+  identity,
+  execution,
+  ownership,
+  entry,
+  protection,
+  idempotency_key,
+  expected_identity,
+  provenance
+)
+
+O endpoint aceita documento tipado. Campos canônicos não são recebidos por extra livre.
+
+7.2 Requisitos por modo
+
+| Modo | Cria row V2? | Requisitos |
+| --- | --- | --- |
+| LIVE | sim | execution_id=lifecycle_id, logical id, bot/setup/symbol/side, position_side, CENTRAL, signal_id, decision_id, intent key; client ID antes de submit |
+| PAPER | sim | execution_id=lifecycle_id, logical id, bot/setup/symbol/side, CENTRAL, provenance |
+| VERIFY | não | sem open row; apenas plano fora do Registry execution |
+| MANUAL_EXTERNAL | não em trade row | external_observation somente, read-only |
+
+7.3 Casos
+
+| Caso | Resultado |
+| --- | --- |
+| nova execution | REGISTRY_EXECUTION_CREATED, mutated=true |
+| mesmo execution/lifecycle e mesmo digest | REGISTRY_EXECUTION_ALREADY_EXISTS, idempotent=true |
+| execution/lifecycle iguais ausentes? | REGISTRY_REQUIRED_ID_MISSING |
+| execution e lifecycle divergentes | REGISTRY_EXECUTION_LIFECYCLE_ID_CONFLICT |
+| mesmo execution com client ID divergente | REGISTRY_EXECUTION_IDENTITY_CONFLICT |
+| novo execution com client ID existente | REGISTRY_CLIENT_ORDER_ID_CONFLICT |
+| novo execution com broker ID existente | REGISTRY_BROKER_ORDER_ID_CONFLICT |
+| mesmo logical id com open existente | cria segunda execution distinta |
+| mesmo logical id com close histórico | cria nova execution distinta |
+| same symbol/side | nenhuma deduplicação |
+| manual external same symbol/side | observation separada, sem adoção |
+| VERIFY | REGISTRY_VERIFY_NOT_AN_EXECUTION, mutated=false |
+
+LIVE começa em ENTRY_INTENT ou ENTRY_PENDING_RECONCILIATION. Resposta de sucesso só ocorre após journal EVENT_COMMITTED.
+
+8. UPDATE
+
+8.1 Interface conceitual
+
+update_trade_v2(
+  execution_id,
+  lifecycle_id,
+  patch,
+  expected_identity,
+  idempotency_key,
+  expected_generation,
+  event_id
+)
+
+execution_id é obrigatório. lifecycle_id, se fornecido, deve ser igual. LIVE exige expected_identity com execution/lifecycle e IDs fortes já conhecidos.
+
+8.2 Regras
+
+- mutation por logical_trade_id isolado é proibida.
+- zero match: REGISTRY_EXECUTION_NOT_FOUND.
+- qualquer selector legado com N candidates: REGISTRY_LEGACY_AMBIGUOUS.
+- expected identity divergente: REGISTRY_EXPECTED_IDENTITY_MISMATCH.
+- expected generation stale: REGISTRY_GENERATION_CONFLICT.
+- patch é atomic compare-and-swap.
+- execution/lifecycle, logical id, bot, setup, symbol, side, owner CENTRAL, execution mode, source mode, signal, decision e provenance não mudam.
+- qty só aumenta sob factual entry fill correction/reconciliation autorizado.
+- broker IDs/fills só são anexados se os índices únicos aceitarem.
+- metadata conflitando com canonical fields é recusada/quarantenada.
+- mesma idempotency key/digest retorna resultado committed; mesma key/digest diferente conflita.
+- update de estado só segue transições permitidas.
+
+9. CLOSE
+
+9.1 Interface conceitual
+
+close_trade_v2(
+  execution_id,
+  lifecycle_id,
+  close_event_id,
+  expected_identity,
+  close_evidence,
+  economics,
+  idempotency_key,
+  expected_generation,
+  provenance
+)
+
+LIVE close exige execution_id/lifecycle_id iguais, close_event_id, expected identity e evidência factual aplicável. close_event_id é estável entre retries.
+
+9.2 Regras
+
+- same close_event_id + same digest: REGISTRY_CLOSE_ALREADY_RECORDED.
+- same close_event_id + divergência material: REGISTRY_CLOSE_EVENT_CONFLICT.
+- partial close registra PARTIAL_CLOSE e reduz remaining_qty; não move para closed enquanto remaining_qty factual for positivo.
+- TP50 é partial close, não full close.
+- full close exige remaining_qty zero ou prova broker equivalente.
+- broker-flat sem economia completa cria CLOSE_PENDING_RECONCILIATION.
+- full factual close com economia pendente cria CLOSED_PROVISIONAL.
+- fee/funding tardios entram por RECONCILIATION, sem reopen.
+- manual close de posição CENTRAL, liquidation e ADL usam close_provenance explícita.
+- close de MANUAL_EXTERNAL é proibido.
+- nenhuma close operation usa preço médio agregado broker para identificar/atribuir execução.
+
+10. IDEMPOTENCY AUTHORITY
+
+10.1 Autoridade única
+
+A única autoridade de idempotência V2 é registry_v2_events.jsonl com transition EVENT_COMMITTED válida na cadeia de journal. operation_ledger em registry_v2.json é DERIVED CACHE/PROJECTION, não autoridade.
+
+Se ledger e journal divergem:
+- journal EVENT_COMMITTED vence para saber se a operation ocorreu;
+- Registry entra em diagnostic/rebuild antes de qualquer nova mutation se ledger não puder ser reconstruído consistentemente;
+- snapshot row state é verificado contra event payload/digests;
+- nenhum caller usa ledger sozinho para responder idempotência.
+
+10.2 Chave de operação
+
+operation_key = operation + execution_id + idempotency_key.
+
+Cada operação contém request_digest canônico, event_id único, expected_generation, expected identity e full mutation payload.
+
+| Operação | Idempotency key | Resultado de retry idêntico | Resultado de retry divergente |
+| --- | --- | --- | --- |
+| REGISTER | execution intent key | resultado committed original | REGISTRY_IDEMPOTENCY_KEY_CONFLICT |
+| UPDATE | source event/management key | patch original não reaplicado | REGISTRY_IDEMPOTENCY_KEY_CONFLICT |
+| PARTIAL_CLOSE | close_event_id | parcial original | REGISTRY_CLOSE_EVENT_CONFLICT |
+| FULL_CLOSE | close_event_id | close original | REGISTRY_CLOSE_EVENT_CONFLICT |
+| RECONCILIATION | reconciliation event + evidence digest | reconciliação original | REGISTRY_RECONCILIATION_CONFLICT |
+| QUARANTINE | conflict event ID | estado de quarantine original | REGISTRY_IDEMPOTENCY_KEY_CONFLICT |
+| MODE_CONFLICT | mode evidence event ID | conflito original | REGISTRY_IDEMPOTENCY_KEY_CONFLICT |
+
+10.3 Retenção
+
+Close event IDs, reconciliation evidence IDs e outcomes factuais permanecem nas rows. Journal compaction só é permitida por JOURNAL_CHECKPOINT EVENT_COMMITTED que preserva digest/cursor da autoridade anterior. operation_ledger pode ser descartado/reconstruído sem alterar a resposta idempotente.
+
+11. WAL STATE MACHINE
+
+11.1 Arquivos
+
+- registry_v2.json: snapshot materializado.
+- registry_v2_events.jsonl: WAL/journal append-only, autoridade idempotente quando EVENT_COMMITTED.
+- registry_v2.lock: lock interprocesso.
+- registry_v2_backups/: backups/manifests imutáveis.
+- registry_v2.recovery.json: diagnóstico de recovery bloqueado; não é source de dados.
+
+11.2 Campos obrigatórios de evento
+
+Todo registro WAL relacionado a mutation contém:
+- event_seq;
+- event_id;
+- operation;
+- idempotency_key;
+- request_digest;
+- execution_id;
+- lifecycle_id alias igual quando serializado;
+- expected_generation;
+- target_generation;
+- before_digest;
+- after_digest;
+- state;
+- prepared_at;
+- snapshot_committed_at;
+- committed_at;
+- schema_version;
+- full canonical mutation payload;
+- previous_committed_event_digest;
+- result_digest quando committed.
+
+11.3 Estados e protocolo
+
+EVENT_PREPARED:
+- sob lock exclusivo, validar journal/snapshot/ledger cache.
+- atribuir event_seq monotônico.
+- append PREPARED e fsync journal.
+- nenhum row mudou; nenhum sucesso é retornado.
+
+SNAPSHOT_COMMITTED:
+- construir candidato exclusivamente do PREPARED.
+- validar identity, invariants, indexes, base generation/digest.
+- escrever temp único no mesmo filesystem, flush/fsync, atomic replace e fsync diretório quando suportado.
+- o snapshot publicado contém generation=target_generation, wal.materialized_event_id, wal.materialized_seq, wal.materialized_request_digest e after_digest.
+- esse witness é o próprio marcador SNAPSHOT_COMMITTED; não existe marcador separado depois do replace.
+
+EVENT_COMMITTED:
+- append commit marker no journal e fsync.
+- a partir deste ponto o journal responde idempotência.
+- ledger cache pode ser atualizado em snapshot posterior ou rebuild; sua defasagem não reduz a autoridade do journal.
+
+Writer fica bloqueado enquanto houver PREPARED não terminal ou recovery pendente. Sucesso é devolvido somente após EVENT_COMMITTED fsync.
+
+11.4 Recovery table
+
+| Caso | Estado/autoridade | Replay | Generation esperada | Mutation committed? | Safe retry | Writable? | Manual recovery? |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A. crash antes de EVENT_PREPARED | snapshot G, journal committed N | não | G | não | executar operação nova | sim | não |
+| B. crash depois de EVENT_PREPARED | PREPARED N+1 + snapshot G/N | replay exato do payload se base G/digest coincidir | G+1 após replay | não até commit | REGISTRY_WAL_PREPARED_RECOVERY_REQUIRED; depois resultado idempotente | não até recovery | só se base divergir |
+| C. crash durante temp snapshot | PREPARED N+1, temp incompleto, snapshot G/N | descartar temp não publicado e replay | G+1 após replay | não | igual B | não até recovery | só se temp/snapshot inválido |
+| D. crash após fsync temp antes de replace | PREPARED N+1, temp válido não publicado, snapshot G/N | temp não é autoridade; replay do PREPARED | G+1 após replay | não | igual B | não até recovery | não se base válido |
+| E. crash após replace antes de marcar SNAPSHOT_COMMITTED | estado não é válido pelo protocolo; snapshot publicado deve conter witness | não automático | indeterminada se witness ausente | não | REGISTRY_WAL_SNAPSHOT_RECOVERY_REQUIRED | não | sim; snapshot sem witness é corrupção |
+| F. crash depois de SNAPSHOT_COMMITTED | PREPARED N+1 + snapshot G+1 witness/after digest | não reaplicar; finalizar journal commit | G+1 | ainda não externamente committed | REGISTRY_WAL_EVENT_COMMIT_REQUIRED; depois idempotente | não até finalização | só se digests divergem |
+| G. crash antes de EVENT_COMMITTED fsync | PREPARED N+1 + snapshot G+1; COMMITTED ausente/parcial | validar/truncar tail inválida e append commit | G+1 | não antes de fsync | igual F | não até finalização | só se journal tail não recuperável |
+| H. crash depois de EVENT_COMMITTED | journal committed N+1 + snapshot G+1 | não | G+1 | sim | resultado original idempotente | sim após validação | não |
+| I. journal append/fsync failure | journal tail é autoridade somente se record completo/checksummed | não aplicar sem PREPARED fsync; se snapshot witness já existe, finalizar somente após journal recovery | G ou G+1 conforme witness | não até commit fsync | REGISTRY_JOURNAL_WRITE_FAILED/RECOVERY_REQUIRED | não | se chain não puder validar |
+| J. snapshot fsync failure | PREPARED válido + snapshot anterior G | replay após recuperar storage | G+1 somente após publish válido | não | PREPARED_RECOVERY_REQUIRED | não | se storage não recuperável |
+| K. checksum failure | snapshot/journal com checksum inválido | somente de backup + chain validada | último generation validado | depende de prova | REGISTRY_JOURNAL_CORRUPT ou REGISTRY_JOURNAL_SNAPSHOT_DIVERGENCE | não | sim se não houver cadeia válida |
+| L. duplicated EVENT_PREPARED after restart | PREPARED igual por event_id/key/digest | não criar outro; recuperar o existente | target original | não até commit | PREPARED_RECOVERY_REQUIRED; depois idempotente | não até recovery | divergente exige manual/conflict |
+
+11.5 No double apply
+
+- event_seq e event_id são únicos.
+- snapshot witness impede aplicar PREPARED já materializado.
+- replay só ocorre se snapshot ainda está no base_generation/base_digest esperado.
+- snapshot com witness compatível recebe somente EVENT_COMMITTED, sem reaplicar patch.
+- event payload é determinístico e não consulta mercado durante replay.
+- PREPARED duplicado igual é o mesmo event; divergente é conflito.
+- journal committed/checkpoint é a única resposta para idempotência.
+- qualquer prova incompleta bloqueia writes, em vez de escolher first/latest.
+
+12. CONCURRENCY
+
+V2 é single-writer por Registry document com lock intra-processo e lock interprocesso. Cada writer:
+1. obtém lock com timeout;
+2. valida journal chain/snapshot;
+3. resolve idempotência no journal committed;
+4. executa o WAL protocol;
+5. libera lock somente após EVENT_COMMITTED ou estado recovery bloqueado.
+
+Readers usam snapshot validado/read-only e nunca criam/migram arquivos. Temp files têm nome único por process/thread/random, ficam no mesmo filesystem e não são source de truth.
+
+Concorrência esperada:
+- same execution + same digest: um commit; outro retorna idempotente.
+- same execution + divergent digest: conflict.
+- different execution + same client/broker/fill ID: conflito em índice único.
+- same logical id + execution diferente: ambas criadas normalmente.
+- simultaneous close same event: um commit; outro idempotente ou conflict.
+- lock timeout: REGISTRY_PERSISTENCE_LOCK_TIMEOUT, sem bypass.
+- outro processo nunca pode ignorar PREPARED pendente.
+
+13. MANUAL/EXTERNAL
+
+MANUAL_EXTERNAL é external observation read-only, não execution Central.
+
+external_observations possui:
+- external_observation_id;
+- owner_type=MANUAL_EXTERNAL;
+- broker_position_id e/ou ordem/fill factual quando disponível;
+- symbol, side, position_side, observed_qty, observed_entry;
+- observed_at, source, confidence;
+- matching_result;
+- managed_by_central=false;
+- counts_for_falcon_own_limit=false.
+
+Proibições:
+- não inferir Falcon por symbol+side;
+- não consumir slot Falcon por default;
+- não receber stop Falcon;
+- não ser fechada/alterada pela Central;
+- não fornecer fill para Falcon;
+- não compartilhar execution_id/lifecycle_id Central;
+- não passar por register/update/close execution API;
+- matching de mercado não prova ownership; somente IDs fortes podem produzir relação de evidência e ainda assim não adotam posição.
+
+owner_type UNKNOWN é somente quarantine/diagnóstico; não promove a CENTRAL automaticamente.
+
+14. PAPER/VERIFY/LIVE
+
+14.1 Modos
+
+execution_mode: intenção PAPER, VERIFY ou LIVE.
+registry_mode: classificação factual PAPER, REAL, VERIFY, SYNC_ONLY, UNKNOWN ou CONFLICT.
+source_mode: claim bruto do produtor.
+mode_evidence: fatos e claims versionados.
+mode_verified: boolean factual.
+mode_conflict: boolean.
+
+14.2 Precedência
+
+1. Evidência factual broker confirmada: ACK de ordem, fill, position/order reconciliation.
+2. Configuração explícita LIVE.
+3. Configuração PAPER/VERIFY somente quando não existe evidência broker contraditória.
+4. Nome do bot, token textual ou heurística são observacionais, nunca identidade factual.
+
+PAPER/VERIFY + evidence REAL não vira LIVE silenciosamente:
+- registry_mode=CONFLICT;
+- mode_verified=false;
+- lifecycle_state=QUARANTINED ou ENTRY_PENDING_RECONCILIATION;
+- REGISTRY_MODE_CONFLICT;
+- sem gestão/learning financeiro automático até reconciliation.
+
+LIVE sem ACK/fill não é REAL automaticamente: execution_mode=LIVE, registry_mode=UNKNOWN/VERIFY conforme evidência, estado ENTRY_INTENT/ENTRY_PENDING_RECONCILIATION. Depois de ACK/fill válido, registry_mode=REAL.
+
+14.3 Isolation
+
+VERIFY não cria execution Registry. PAPER cria execution simulada Central. LIVE requer full identity/intent antes de broker. Analytics segmenta PAPER/REAL. Nenhum modo de uma execution é convertido para outro; uma nova execution é criada se o plano mudar de VERIFY para PAPER/LIVE.
+
+15. LEGACY READ-ONLY VIEW
+
+15.1 Definição
+
+legacy_projection é função/view derivada de snapshot V2 committed. Não é segunda store, não é authority e não substitui archive V1.
+
+Forma preferida on-demand:
+- logical_trade_id;
+- execution_ids;
+- status UNIQUE, AMBIGUOUS, NOT_FOUND ou LEGACY_ARCHIVED;
+- row projection somente se UNIQUE e para leitura;
+- source_generation, source_snapshot_id, source_digest, projection_version.
+
+15.2 Cache opcional
+
+Se materializada, a view usa arquivo separado:
+registry_v2_legacy_projection.json.
+
+É cache descartável:
+- contém projection_digest e source snapshot/generation/digest;
+- mismatch com V2 invalida e descarta cache;
+- sobrevive restart somente como cache validável;
+- não é backup, journal, migration source ou mutation source;
+- nunca usa o nome/path do trade_registry.json V1 original.
+
+15.3 Consumers
+
+- Consumers novos operacionais usam V2 directly.
+- Adapters legados usam projection exclusivamente para READ compatibility.
+- V1 logical selector com N rows retorna AMBIGUOUS; não escolhe first/latest.
+- Nenhum register/update/close/reconcile recebe ou lê projection como authority.
+- Após cutover, V1 original é ARCHIVE/READ_ONLY. Não recebe dados de V2 e não é sobrescrito.
+
+16. MIGRATION
+
+16.1 Estratégia
+
+Migração SIDE_BY_SIDE. V1 original permanece preservado; V2 usa snapshot/journal próprios. Não há in-place migration, dual-write independente ou rewrite massivo de closed history.
+
+16.2 Fases lógicas
+
+PHASE 0 — READ-ONLY AUDIT:
+capturar hashes, tamanhos e contagens V1; classificar rows por IDs fortes, ambiguidade, ausência e conflito.
+
+PHASE 1 — DORMANT V2:
+schema/helpers/readers sem writer runtime.
+
+PHASE 2 — DUAL-READ:
+comparar V1/V2 read-only, sem mutar ambos.
+
+PHASE 3 — PROPOSED MIGRATION AUDIT:
+gerar plano de rows inequívocas, legacy archive e quarantine; não publica Registry V2 operacional.
+
+PHASE 4 — V2 PRIMARY PAPER:
+somente V2.9, PAPER isolado e autorizado; V1 permanece read-only.
+
+PHASE 5 — LEGACY READ-ONLY:
+V1 apenas archive/compatibilidade, sem novos writers.
+
+PHASE 6 — FUTURE LIVE PILOT:
+fora V2.0–V2.10, sujeito ao gate da seção 28.
+
+16.3 Identidade legada
+
+- Legacy row com lifecycle_id forte: execution_id recebe exatamente esse valor; lifecycle alias é igual.
+- Legacy row com aliases fortes conflitantes: QUARANTINED; nenhuma projection operacional.
+- Legacy row sem lifecycle mas com client/broker evidence: archive/read-only até reconciliation.
+- Synthetic legacy audit ID somente em relatório/projection auditável, formato legacyaudit_<sha256 de arquivo+collection key+raw digest>; nunca é apresentado como factual broker/lifecycle, nem gerenciável LIVE.
+- closed history não é reescrito; views carregam source reference/digest.
+- symbol/side nunca resolve legacy identity.
+
+17. PERSISTENCE
+
+17.1 Escolha
+
+KEEP_JSON nesta fase, pois o problema P0 é identity correctness, não evidência de necessidade de banco novo. JSON V2 é aceitável somente com WAL, lock interprocesso, checksums, backups, generation e recovery definidos nesta SPEC.
+
+17.2 Requisitos
+
+- directory persistente configurado;
+- temp file único no mesmo filesystem;
+- flush/fsync arquivo e diretório quando suportado;
+- atomic replace;
+- lock interprocesso e local;
+- snapshot_digest SHA-256;
+- generation monotônica;
+- journal event_seq monotônico;
+- backups/manifests antes de publish/migration;
+- read-only loader sem criação/migração;
+- limites de tamanho/retenção;
+- compaction por checkpoint committed;
+- recovery fail-closed.
+
+17.3 Quando replatform considerar
+
+Abrir RFC separado para SQLite/Postgres somente se houver múltiplos writers distribuídos, snapshot exceder SLA de lock/rebuild, transações cruzadas forem necessárias ou houver falha repetida de atomicidade no volume persistente. Não replatform neste refactor.
+
+18. INVARIANTS
+
+INV-001: execution_id é único globalmente no Registry V2.
+INV-002: lifecycle_id, quando presente, é exatamente igual a execution_id.
+INV-003: payload com execution_id/lifecycle_id divergentes não muta state.
+INV-004: cada client_order_id factual pertence a uma única execution_id.
+INV-005: cada broker/exchange order ID factual pertence a uma única execution_id.
+INV-006: cada fill_id factual pertence a uma única execution_id/role.
+INV-007: logical_trade_id pode apontar para N execution_ids.
+INV-008: logical_trade_id nunca é chave física de row.
+INV-009: uma execution aparece em no máximo uma collection open/closed.
+INV-010: CLOSED_PROVISIONAL/CLOSED_RECONCILED não transitam para OPEN/PARTIALLY_CLOSED.
+INV-011: mutation sem execution_id exato falha fechada.
+INV-012: lookup legado com N candidates retorna ambiguidade, não row.
+INV-013: retry mesma operation key/digest retorna resultado committed original.
+INV-014: retry mesma operation key/digest diferente conflita.
+INV-015: somente EVENT_COMMITTED/checkpoint válido é autoridade de idempotência.
+INV-016: operation_ledger é reconstruível de journal committed/row store/generation.
+INV-017: PREPARED sem snapshot witness compatível não é double-applied.
+INV-018: snapshot generation só é válida quando reconciliável com journal/WAL.
+INV-019: snapshot witness igual ao PREPARED é finalizado sem replay de patch.
+INV-020: event_seq/event_id não são reutilizados.
+INV-021: state closed factual não é sobrescrito por close divergente.
+INV-022: partial close com remaining_qty positivo não produz full close.
+INV-023: TP50 não encerra lifecycle.
+INV-024: quantity não aumenta sem factual event autorizado.
+INV-025: fee/funding tardio entra por reconciliation sem reopen.
+INV-026: metadata não pode contradizer identidade canônica.
+INV-027: MANUAL_EXTERNAL nunca vira CENTRAL implicitamente.
+INV-028: external observation não entra no limite Falcon próprio.
+INV-029: symbol/side matching não prova ownership e não pode mutar.
+INV-030: PAPER/VERIFY com evidence REAL contraditória gera CONFLICT.
+INV-031: LIVE sem ACK/fill não é REAL somente pela intenção.
+INV-032: disaster stop ID de uma execution não pertence a outra.
+INV-033: legacy projection nunca é source de mutation.
+INV-034: V1 archive nunca é sobrescrito pelo V2.
+INV-035: synthetic legacy audit identity não é factual/operacional.
+INV-036: readers read-only não criam/migram arquivos.
+INV-037: writer bloqueia com PREPARED/recovery pendente.
+INV-038: backup/checksum inválido não é escolhido silenciosamente.
+INV-039: analytics agrega finance por execution_id e pode group-by logical id.
+INV-040: V2.0–V2.10 nunca habilitam write LIVE.
+
+19. STATUS CONTRACT
+
+19.1 Envelope
+
+Toda resposta V2 inclui:
+- ok;
+- status;
+- mutated;
+- idempotent;
+- reconciliation_required;
+- ambiguous;
+- conflict;
+- execution_id;
+- lifecycle_id alias;
+- logical_trade_id;
+- event_id;
+- idempotency_key;
+- expected_generation;
+- generation_before/generation_after quando aplicável;
+- diagnostics sem dados sensíveis.
+
+19.2 Statuses
+
+| Status | Significado |
+| --- | --- |
+| REGISTRY_EXECUTION_CREATED | execution nova committed |
+| REGISTRY_EXECUTION_ALREADY_EXISTS | retry idêntico committed |
+| REGISTRY_EXECUTION_LIFECYCLE_ID_CONFLICT | dois aliases fornecidos divergem |
+| REGISTRY_EXECUTION_IDENTITY_CONFLICT | ID factual/imutável divergente |
+| REGISTRY_REQUIRED_ID_MISSING | requisito do modo ausente |
+| REGISTRY_CLIENT_ORDER_ID_CONFLICT | client ID em outra execution |
+| REGISTRY_BROKER_ORDER_ID_CONFLICT | broker ID em outra execution |
+| REGISTRY_FILL_ID_CONFLICT | fill ID em outra execution |
+| REGISTRY_EXECUTION_NOT_FOUND | execution inexistente |
+| REGISTRY_LEGACY_AMBIGUOUS | legacy logical lookup não unívoco |
+| REGISTRY_LEGACY_UNIQUE_RESOLVED | somente read compatibility unívoca |
+| REGISTRY_LEGACY_PROJECTION_STALE | cache/view não corresponde ao V2 |
+| REGISTRY_EXPECTED_IDENTITY_MISMATCH | compare-and-swap identity falhou |
+| REGISTRY_GENERATION_CONFLICT | snapshot stale |
+| REGISTRY_IDEMPOTENCY_KEY_CONFLICT | mesma key, digest diferente |
+| REGISTRY_PARTIAL_CLOSE_RECORDED | parcial committed |
+| REGISTRY_CLOSE_ALREADY_RECORDED | close idempotente |
+| REGISTRY_CLOSE_EVENT_CONFLICT | close event divergente |
+| REGISTRY_CLOSE_RECONCILIATION_REQUIRED | close sem economia completa |
+| REGISTRY_CLOSE_RECORDED_PROVISIONAL | full close factual provisório |
+| REGISTRY_CLOSE_RECONCILED | full close/economia reconciliados |
+| REGISTRY_CLOSED_IMMUTABLE | rewrite de closed inválido |
+| REGISTRY_MODE_CONFLICT | modo/evidence contraditórios |
+| REGISTRY_OWNER_CONFLICT | ownership contraditório |
+| REGISTRY_QUARANTINED | row bloqueada para automação |
+| REGISTRY_WAL_PREPARED_RECOVERY_REQUIRED | PREPARED pendente requer recovery |
+| REGISTRY_WAL_SNAPSHOT_RECOVERY_REQUIRED | snapshot witness inválido/ausente |
+| REGISTRY_WAL_EVENT_COMMIT_REQUIRED | snapshot materializado aguarda journal commit |
+| REGISTRY_JOURNAL_CORRUPT | cadeia journal inválida |
+| REGISTRY_JOURNAL_SNAPSHOT_DIVERGENCE | journal/snapshot incompatíveis |
+| REGISTRY_PERSISTENCE_LOCK_TIMEOUT | lock não adquirido |
+| REGISTRY_PERSISTENCE_FAILED | persistence não confirmada |
+| REGISTRY_RECOVERY_REQUIRED | recovery/manual action necessário |
+
+20. FALCON CONTRACT
+
+Falcon V2 usa o único caminho existente:
+Signal -> Decision/Risk -> Execution Orchestrator -> Registry intent -> Broker -> Lifecycle/management -> Reconciliation.
+
+Requisitos Falcon LIVE V2:
+- signal_id;
+- decision_id;
+- execution_id=lifecycle_id;
+- execution intent idempotency key;
+- client_order_id antes de submit;
+- exact symbol, side e position_side;
+- owner_type=CENTRAL;
+- disaster stop plan/identity;
+- expected identity em update/close;
+- broker order ID após ACK;
+- fill IDs quando disponíveis.
+
+Sequência:
+1. Orchestrator cria ID único antes do broker.
+2. Registry commit de ENTRY_INTENT é pré-condição para submit.
+3. client_order_id é reservado sob essa identity.
+4. ACK perdido entra em ENTRY_PENDING_RECONCILIATION e é reconciliado por client/order/fill; não reenvia cegamente.
+5. Disaster stop pertence à mesma identity e deve ser confirmado antes de gestão normal.
+6. TP50, BE/trailing e runner atualizam somente execution exata.
+7. Terminal recovery e real_close_reconciliation localizam execution pelo ID único, depois client/broker/fill; nunca market fields.
+8. Manual/external same leg gera awareness/conflict, não ownership Falcon.
+9. Registry/History/Journal carregam execution_id e lifecycle_id alias igual.
+10. Não há segundo executor, não há média agregada BingX como truth do Falcon.
+
+O fallback atual que constrói lifecycle a partir de client/order depois do ACK é legado V1 e não satisfaz V2. No V2.LIVE-PILOT ele deve estar removido/inacessível no caminho novo, pois V2 ID nasce antes de broker invocation.
+
+21. ALL-BOT COMPATIBILITY
+
+| Bot/componente | V2 contract | Priority |
+| --- | --- | --- |
+| FALCON | full strong identity, unique ID before broker, strict recovery | P0 |
+| TURTLE | PAPER position carrega ID ao nascer; update/close por ID | P1 |
+| PREDATOR | PAPER/LIVE-capable data contract sem logical mutation | P1 |
+| DONKEY | evento/posição carrega ID; remover tentativa de setups alternativos | P1 |
+| TRENDPRO | payload persiste ID em reentry/management | P1 |
+| COBRA | position carrega ID; LONG/SHORT independentes | P1 |
+| MEME | position carrega ID; realized R vs MFE é projeto corretivo separado | P1 |
+| main.py sync | usa API V2/reader; nenhum direct snapshot write | P0 |
+| lifecycle shadow adapter | identity primária é execution/lifecycle ID único | P1 |
+| real_pnl_r_mapper | execution ID primeiro; legacy archive only | P1 |
+| outcome_evaluator | PAPER marker por execution ID | P2 |
+| reports/doctor | mostram execution ID e logical grouping | P2 |
+
+Adapters podem existir em fase controlada, mas não devem alterar semântica V1 quando V2 disabled. Caller sem ID não recebe fallback symbol/side; recebe erro explícito/continua no contrato V1 até migração autorizada.
+
+22. RECONCILIATION
+
+Prioridade de locator:
+1. execution_id/lifecycle_id único;
+2. client_order_id;
+3. broker/exchange order ID;
+4. fill IDs;
+5. legacy read-only único, nunca para mutation LIVE.
+
+Casos:
+- Broker CLOSED, Registry OPEN com ID forte: mesma execution entra em close/provisional/reconciliation.
+- Broker CLOSED sem ID forte: não selecionar row; quarantine/recovery.
+- Registry CLOSED com finance incompleta: manter CLOSED_PROVISIONAL, não reopen/zero.
+- partial fills/partial close: anexar facts e recalcular qty sob mesma identity.
+- funding/fee tardio: RECONCILIATION committed, sem mudar close identity.
+- manual close de posição Central: exige ID forte e close_provenance=MANUAL_RECONCILED.
+- forced close/liquidation/ADL: provenance explícita e flags analytics.
+- broker-flat sem identity: não fechar Registry por symbol/side.
+- preço de entry/exit vem de fills da execução; nenhuma média agregada broker é usada como métrica de robô.
+
+23. ANALYTICS
+
+- Toda métrica financeira é por execution_id.
+- logical_trade_id, bot/setup/symbol/side podem agrupar, nunca deduplicar execução.
+- Rows expõem lifecycle_id alias durante compatibilidade.
+- PAPER e REAL são segmentados; mode conflict, quarantine e legacy ambiguous são excluídos de HIGH_REAL.
+- Mappers preservam source snapshot, data_quality, reconciliation status e derivation version.
+- Dataset financeiro histórico não muda silenciosamente: uma view V2 declara source/dedup/version.
+- learning/adaptive continuam fora de escopo; esta SPEC não ativa pesos, policy learning ou execução baseada em learning.
+- outcome_evaluator permanece PAPER até contrato LIVE reconciliado específico autorizado.
+
+24. TEST MATRIX
+
+Todos os testes futuros são locais, com fake broker, filesystem temporário e rede bloqueada. MUST-PASS P0 significa obrigatório antes de qualquer V2.9 PAPER write.
+
+A. Identity and schema
+001. MUST-PASS P0: generated ID usa UUIDv4 e formato exec_.
+002. ID novo não deriva de symbol/side/preço/time isolado.
+003. execution_id somente é aceito e lifecycle alias é projetado igual.
+004. lifecycle_id somente em adapter compatível torna-se execution ID igual.
+005. MUST-PASS P0: ambos IDs divergentes não mutam.
+006. UUID legado existente é preservado sem regeneração.
+007. payload alias whitespace normaliza sem mudar valor material.
+008. logical trade ID normaliza corretamente.
+009. logical trade ID não é key física.
+010. schema rejeita metadata identity alias conflitante.
+011. owner CENTRAL é obrigatório em execution row.
+012. owner MANUAL_EXTERNAL é proibido em execution row.
+013. position_side valida LONG/SHORT/BOTH/NET.
+014. state inicial LIVE é ENTRY_INTENT.
+015. state inicial PAPER é OPEN.
+
+B. Register
+016. MUST-PASS P0: duas Falcon SOL LONG FALCON15 simultâneas têm IDs distintos.
+017. ambas compartilham logical trade ID e índice contém duas IDs.
+018. same execution/same digest retorna already exists.
+019. same execution/different digest conflita.
+020. new execution/client ID existente conflita.
+021. new execution/broker ID existente conflita.
+022. new execution/fill ID existente conflita.
+023. reentry após close cria nova row.
+024. same symbol/side não deduplica.
+025. opposite side não colide.
+026. bot diferente mesmo leg não colide.
+027. setup diferente mesmo leg não colide.
+028. VERIFY não cria open row.
+029. LIVE sem decision ID falha.
+030. LIVE sem client ID antes de submit falha.
+031. PAPER sem broker ID é aceito.
+032. legacy PAPER sem decision é marcado legacy missing.
+033. external same leg cria observation somente.
+034. register response só ocorre after committed journal.
+035. register rejects stale mode evidence conflict.
+
+C. Update
+036. MUST-PASS P0: update ID A não altera B de mesmo logical ID.
+037. logical-only update é proibido.
+038. legacy unique read lookup não permite LIVE update.
+039. expected identity divergente falha.
+040. stale generation falha.
+041. bot immutable.
+042. setup immutable.
+043. symbol immutable.
+044. side immutable.
+045. execution/lifecycle immutable/equal.
+046. owner immutable.
+047. quantity increase sem factual event falha.
+048. broker order append válido atualiza índice.
+049. broker order duplicate em outra execution falha.
+050. fill append idempotente.
+051. metadata collision leva a quarantine.
+052. repeated management event same key é idempotente.
+053. divergent management event same key conflita.
+054. derived metric não sobrescreve factual.
+055. cache change não altera financial fact.
+
+D. Close
+056. MUST-PASS P0: close A não fecha B de logical ID igual.
+057. partial close reduz remaining qty.
+058. TP50 preserva lifecycle.
+059. runner permanece open.
+060. full close com zero remaining cria provisional.
+061. same close event/digest é idempotente.
+062. same close event/different qty conflita.
+063. close sem strong identity LIVE falha.
+064. broker-flat sem economia cria pending reconciliation.
+065. fee tardia promove provisional/reconciled.
+066. funding tardio promove provisional/reconciled.
+067. closed state não reabre.
+068. manual Central close exige strong IDs.
+069. manual external close API rejeita.
+070. liquidation provenance é preservada.
+071. ADL provenance é preservada.
+072. close economics não usa broker average position.
+
+E. Journal and idempotency
+073. MUST-PASS P0: EVENT_COMMITTED é única resposta idempotente.
+074. operation ledger cache apagado é reconstruído do journal.
+075. ledger divergente não vence journal.
+076. register retry consulta journal committed.
+077. update retry consulta journal committed.
+078. partial close retry consulta journal committed.
+079. full close retry consulta journal committed.
+080. reconciliation retry consulta journal committed.
+081. quarantine retry consulta journal committed.
+082. mode conflict retry consulta journal committed.
+083. compaction checkpoint preserva authority.
+084. same operation key/different digest conflita.
+085. event sequence nunca reutiliza.
+086. event ID nunca reutiliza.
+087. journal result digest valida resposta.
+
+F. WAL crash/recovery
+088. crash before prepared não muda state.
+089. MUST-PASS P0: crash after prepared replays uma vez.
+090. crash during temp snapshot descarta temp/replay.
+091. crash after fsync temp before replace não usa temp como authority.
+092. snapshot published sem witness é recovery manual.
+093. crash after snapshot committed finaliza journal sem reapply.
+094. crash before commit fsync recupera tail/finaliza.
+095. crash after event committed retorna idempotente.
+096. journal append failure before prepared bloqueia submit.
+097. snapshot fsync failure preserva snapshot anterior.
+098. checksum snapshot failure bloqueia write.
+099. checksum journal failure bloqueia write.
+100. duplicate prepared identical não cria segundo event.
+101. duplicate prepared divergent conflita/manual recovery.
+102. journal/snapshot divergence bloqueia.
+103. recovery payload não consulta broker.
+104. recovery base generation mismatch bloqueia.
+105. writer stays blocked with prepared pending.
+
+G. Concurrency and persistence
+106. same execution concurrent register idem.
+107. same client ID concurrent different execution conflicts.
+108. same logical ID concurrent different execution both commit.
+109. concurrent update generation CAS.
+110. concurrent same close event idempotent.
+111. concurrent divergent close conflict.
+112. lock timeout returns failure/no bypass.
+113. reader never sees partial JSON.
+114. unique temp names prevent collision.
+115. backup manifest matches snapshot.
+116. read-only loader creates no file.
+117. index rebuild in memory matches row store.
+118. corrupt index triggers diagnostic/rebuild.
+119. process restart validates lock release.
+120. storage full/fsync failure returns persistence failed.
+
+H. Migration and legacy view
+121. V1 audit is read-only.
+122. legacy strong lifecycle becomes same execution ID.
+123. V1 alias conflict quarantines.
+124. no-lifecycle legacy remains archive/read-only.
+125. synthetic audit ID is never operational.
+126. V1 closed history unchanged byte-for-byte.
+127. V1/V2 parity mismatch is reported.
+128. legacy projection unique exposes row read-only.
+129. legacy projection ambiguous exposes candidates.
+130. projection cache stale is discarded.
+131. projection cannot be input to mutation.
+132. V1 original path is never replaced.
+133. migration rollback preserves V1.
+134. dual-read has no V2 write.
+135. no symbol/side legacy resolution.
+
+I. Manual/external and modes
+136. MUST-PASS P0: manual SOL LONG is not Falcon SOL LONG.
+137. manual leg does not consume Falcon own limit.
+138. external fill not used as Falcon fill.
+139. external broker position ID conflict quarantines observation.
+140. PAPER+broker evidence creates mode conflict.
+141. VERIFY+execution sent creates mode conflict.
+142. LIVE without fill not classified REAL.
+143. LIVE ACK/fill compatible becomes REAL.
+144. source token never overrides broker factual evidence.
+145. mode conflict blocks management/learning high confidence.
+
+J. Falcon and all bots
+146. Falcon intent ID exists before client order.
+147. Falcon lost ACK reconciles before retry.
+148. Falcon disaster stop belongs to same ID.
+149. Falcon stop failure containment is preserved.
+150. Falcon terminal recovery locates ID first.
+151. FALCON_REAL_MAX_POSITIONS=2 test still allows same logical executions without Registry collision.
+152. Turtle PAPER carries ID through close.
+153. Predator carries ID/mode contract.
+154. Donkey no longer tries alternate setup IDs in V2 adapter.
+155. TrendPro reentry gets new ID.
+156. Cobra long/short independent IDs.
+157. Meme carries ID; R/MFE correction remains separate tested project.
+158. main sync cannot direct-write snapshot.
+159. lifecycle adapter exposes alias equal ID.
+160. mapper/outcome markers use execution ID.
+
+K. End-to-end gates
+161. V2.0 pure helper has no I/O.
+162. V2.1 validator does not open production files.
+163. V2.2 reader does not write fixture.
+164. V2.3 migration auditor produces no Registry write.
+165. V2.4 WAL only temp directory.
+166. V2.5 core only injected temp storage.
+167. V2.6 adapters only read compatibility.
+168. V2.7 disabled bot integration preserves V1 behavior.
+169. V2.8 Falcon VERIFY shadow makes no Registry V2 mutation.
+170. V2.9 PAPER writer rejects LIVE execution.
+171. V2.10 parity creates no execution influence.
+172. V2.LIVE-PILOT gate rejects any unmet precondition.
+
+L. V2.7A identity preparation and V2.8 factual shadow gates
+173. canonical signal_id is factual at productive signal birth, versioned, and
+     has restart/retry and legitimate reentry semantics.
+174. legacy sig.id is not used as signal_id without equivalence proof.
+175. decision_id identifies one factual completed ALLOW/DENY decision result,
+     is replay-stable, and differs for a genuinely new/re-evaluated decision.
+176. decision A + signal A is accepted and replay decision A + signal A retains
+     the exact factual binding.
+177. decision A + signal B is a correlation conflict.
+178. a stale decision result from another reentry is a correlation conflict.
+179. PRE_DECISION has factual signal_id and no decision_id; POST_DECISION has a
+     factual completed ALLOW/DENY decision_id and exact correlation proof.
+180. PRE_DECISION -> POST_DECISION preserves same factual signal/plan facts;
+     changed factual plans are distinct observations.
+181. positionSide, position_side, and economic-side fallback use exact Falcon
+     V1 precedence; raw explicit conflicts remain visible and BOTH/NET is not
+     silently converted.
+182. CENTRAL plan provenance never adopts broker, MANUAL_EXTERNAL, or EXTERNAL
+     ownership; explicit external ownership is not overwritten.
+183. PREEXISTING_FIELD_VALUE_EQUIVALENCE preserves every pre-V2.7A field and
+     permits only approved additive identity/provenance metadata.
+184. V2.7A/V2.8 shadow OFF/ON preserve pre-existing read-only broker/exchange
+     calls exactly.
+185. zero mutable broker call is reachable in Falcon VERIFY.
+186. zero broker/exchange call is attributable to the V2.8 observer/shadow.
+187. Registry V1/V2 writes are zero in V2.7A/V2.8.
+188. V2.7A/V2.8 have zero execution influence and VERIFY has no operational
+     execution_id/lifecycle_id or fabricated physical/strong identity.
+189. completed VERIFY ALLOW and DENY paths are covered where both are exposed by
+     the factual provider.
+
+M. V2.3 decision request, claim, store, and V2.8 traceability
+
+190. signal_id, decision_request_id, and decision_id are distinct factual facts;
+     none is execution/lifecycle/logical/client/broker/exchange/fill/position or
+     broker-derived identity.
+191. exact caller issues random opaque versioned decision_request_id before
+     provider invocation; restart without preserved ID is NEW_REEVALUATION.
+192. request ID is bound to exact signal_id, never inferred/repaired, and never
+     intentionally reused despite retention expiry.
+193. canonical request digest includes exact signal_id and excludes decision,
+     execution, lifecycle, broker, exchange, fill, Registry, and physical IDs.
+194. valid durable DECISION_REQUEST_CLAIM exists before evaluation is associated
+     with V2.7A identity; durable states are CLAIMED and COMPLETED only.
+195. claim material is limited to approved version/integrity/request/signal/
+     digest/state/time/issuer-provider provenance and lives in the same store.
+196. claim write failure, conflict, incomplete claim, completed-record write
+     failure, corruption, missing replay, and binding mismatch preserve ordinary
+     V1 decision behavior and fail closed for decision_id/POST_DECISION/V2.7A.
+197. CLAIMED without valid COMPLETED is IDENTITY_REQUEST_INCOMPLETE with no
+     factual decision_id, POST_DECISION, historical replay, or V2.7A exit.
+198. crash before claim has no witness and permits ordinary first claim only
+     where no factual evidence committed.
+199. crash after CLAIMED before completion consumes/incompletes same ID and
+     starts no second V2.7A identity-associated evaluation.
+200. provider result before COMPLETED crash exposes no candidate/stale identity;
+     new current V2.7A evaluation receives a new request ID.
+201. only durable COMPLETED plus validation makes decision_id factual/external;
+     otherwise external decision_id is absent/None.
+202. same request ID/different digest yields DECISION_REQUEST_ID_CONFLICT with
+     no merge, overwrite, or silent source choice.
+203. same ID/same digest/CLAIMED creates no second identity evaluation/candidate;
+     active safe owner may wait/recheck only.
+204. same ID/same digest/COMPLETED supports historical-only identity projection.
+205. exactly one lineage and at most one authoritative COMPLETED record exist
+     per request ID.
+206. serialization covers actual provider/store concurrency topology; prove
+     cross-writer behavior where applicable and in-process-only lock is
+     insufficient for multi-process writers.
+207. historical projection exposes factual record evidence only; it cannot
+     short-circuit current can_open_trade_decision, alter Falcon control flow,
+     authorize execution, or provide current ALLOW/DENY.
+208. authorized-store atomicity, restart, corruption, conflict, claim/complete,
+     retention, and non-reuse use injected/temp/local test storage only.
+209. zero unauthorized I/O; zero broker/exchange call added by identity
+     preparation; zero store network dependency; zero Registry V1/V2 I/O or
+     write attributable to store; zero execution persistence; zero
+     position/ownership persistence; pure helpers remain no-I/O where specified.
+210. future VERIFY activation proves claim atomicity, crash cases, actual
+     concurrency-domain/cross-writer proof where applicable, non-reuse,
+     unchanged V1 behavior, and V2.7A identity fail-closed.
+211. V2.8 creates no store/claim, writes/completes/mutates/recovers/repairs/
+     compacts/selects/manages no claim or record, and only observes separately
+     authorized V2.7A factual additive material.
+
+
+25. FAULT INJECTION
+
+Fault tests use fake filesystem and deterministic crash hooks:
+- before PREPARED;
+- after PREPARED;
+- during write temp;
+- after temp fsync before replace;
+- replace with missing witness;
+- after snapshot witness before journal commit;
+- torn COMMITTED tail;
+- journal append/fsync failure;
+- snapshot fsync failure;
+- directory fsync failure;
+- corrupted snapshot checksum;
+- corrupted journal chain;
+- missing backup;
+- index corruption;
+- duplicate concurrent register;
+- duplicate concurrent close;
+- restart with incomplete migration;
+- V1/V2 disagreement;
+- stale projection cache;
+- persistence lock timeout;
+- simulated disk full;
+- interrupted compaction checkpoint.
+
+Expected recovery follows section 11: no double apply, no silent source choice, no broker action, writes blocked where proof is incomplete.
+
+26. ROLLBACK
+
+Rollback is data-preserving:
+1. freeze new V2 entries/operations;
+2. preserve V2 snapshot, journal, temp, backups and diagnostics;
+3. mark Registry READ_ONLY_RECOVERY_REQUIRED;
+4. do not delete V2 rows, rewrite V1 or fabricate mapping;
+5. V1 may be fallback reader only after V2 primary begins;
+6. return code/feature routing to prior reader only when rows/journal are preserved;
+7. keep Falcon VERIFY and real trading disabled until open execution reconciliation completes;
+8. declare rollback complete only after hashes, journal cursor, execution IDs, client/broker IDs and broker reconciliation agree.
+
+Rollback criteria:
+- journal corruption without valid chain;
+- snapshot/journal divergence;
+- strong identity conflict;
+- repeated persistence failure;
+- unexpected V2 writer invocation;
+- Falcon adapter behavior change while disabled;
+- any risk of duplicate order or loss of disaster stop.
+
+27. IMPLEMENTATION GATES V2.0–V2.10
+
+General: every gate is future-only. Commit/push/deploy answers below mean eligible after separate authorization; this SPEC grants none.
+
+| Version | Purpose | Entry condition | Files allowed | Files forbidden | Runtime behavior change | Persistence change | Feature flags | Focused tests | Full suite required? | Review required? | Commit allowed? | Push allowed? | Deploy allowed? | Exit condition | Rollback |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| V2.0 | PURE IDENTITY CONTRACT | final spec accepted | registry_execution_identity.py, tests/test_registry_execution_identity_v2.py, docs; dormant import in trade_registry.py only if strictly no behavior | bots, main.py, readers/writers, migration, data files, Registry V1, flags, broker/Redis/Render | none | none | none active | UUIDv4, alias equality, pure invariants, proof no I/O | focused only | architecture + safety | yes future | no unless authorized | no | helper pure/dormant, no behavior diff | revert code |
+| V2.1 | PURE SCHEMA + VALIDATOR | V2.0 exit | pure schema/normalization/validator/index builder/tests/docs | bots, main.py, Registry mutation, production reader, migration | none | none | none active | schema, envelopes, invariants, in-memory indexes | focused only | architecture + storage | yes future | no unless authorized | no | no default file I/O | revert code |
+| V2.2 | READ-ONLY V2 FILE FORMAT | V2.1 exit | new read-only V2 reader, fixture/temp tests, diagnostics | writer, snapshot/journal create, V1 touch, bots/main | no production runtime import | read fixture/temp only | none active | checksum, generation, read-only, in-memory rebuild | focused only | storage + security | yes future | no unless authorized | no | reader cannot create/write any Registry | revert reader |
+| V2.3 | MIGRATION AUDITOR DRY-RUN | V2.2 exit; V1 backup plan | audit module, report tests, docs | V2 operational write, V1 write, bots/main mutation | explicit audit only | local audit report only, no Registry files | none active | strong IDs, ambiguous/missing/conflict, synthetic audit candidates | focused only | migration + operations | yes future | no unless authorized | no | dry-run report deterministic/read-only | delete audit artifact only |
+| V2.4 | WAL/JOURNAL TEMP ONLY | V2.3 exit | WAL/storage engine, temp harness, tests | runtime integration, production Registry paths, bots/main, flags | none | temporary test directories only | hard off/no runtime path | all WAL crash cases | yes safe local | storage + safety | yes future | no unless authorized | no | no production file call path | revert engine |
+| V2.5 | REGISTER/UPDATE/CLOSE CORE TEMP ONLY | V2.4 exit | V2 APIs, injected temp backend, tests | routes, bots, main, production writer, migration activation | none | temp test backend only | hard off | register/update/close/idempotency/concurrency | yes safe local | architecture + execution safety | yes future | no unless authorized | no | APIs unreachable in runtime | revert core |
+| V2.6 | LEGACY READ ADAPTERS DORMANT | V2.5 exit | adapters/tests/read compatibility docs | productive caller changes, V1 writer, logical mutation | none | no operational writes | hard off | unique/ambiguous legacy reads, stale projection | yes safe local | compatibility + safety | yes future | no unless authorized | no | logical-only mutation remains blocked | revert adapters |
+| V2.7 | ALL-BOT CONTRACT PREPARATION | V2.6 exit | data contracts, test adapters; bot files only feature-off behavior-preserving changes | broker send, live management change, V1 behavior change, main runtime writer | disabled V2 path has byte/semantic V1 equivalence | no V2 operational write | all V2 flags false | all bot contract tests, Falcon disabled behavior | yes safe local | bot owners + Falcon safety | yes future | no unless authorized | no | proof V2 disabled causes no behavioral change | revert feature-off changes |
+| V2.7A | FALCON SIGNAL/DECISION IDENTITY PREPARATION | V2.7 accepted; authoritative V2.3 accepted; V2.8 Review7 identity/strict-gate dossier recorded; Falcon VERIFY and real trading off; no V2 writer authorization; explicit local implementation authorization | factual Falcon signal/plan identity changes; exact discovered decision-request issuer seam; exact discovered completed-decision provider seam; exactly ONE new dedicated provider-owned Decision Identity Store implementation; pure identity/canonicalization helpers; focused tests/docs/audit | broker behavior/mutation, Registry V1/V2 write, execution/lifecycle ID in VERIFY, risk/sizing/allow-deny/route changes beyond additive fields, flags/routes/threads/other bots; generic persistence; Registry/execution/position/ownership store; environment/deploy; V2.8 files | non-executing identity preparation only; additive identity/provenance only, no execution authority | V2.7A.2 may use injected, temporary, or local test storage for exactly one dedicated Decision Identity Store; no production/default store path; zero Registry V1/V2 write, zero execution persistence, zero position/ownership persistence, and no other persistence authority | no new identity flag; execution gates remain disabled | signal/decision/request-claim/correlation/stage/precedence/ownership/equivalence; authorized-store atomicity/restart/actual-concurrency-domain/crash/corruption/retention/non-reuse; zero unauthorized I/O; zero broker/exchange call added by identity preparation; zero store network dependency; zero Registry V1/V2 I/O or write attributable to store; zero execution persistence and zero position/ownership persistence; pure identity/canonicalization helpers remain no-I/O where specified | focused plus required Falcon safety | architecture + Falcon safety + operations | yes future | no unless authorized | no | V2.7A.1 and V2.7A.2 identity/correlation/stage/equivalence/no-mutation gates accepted | revert additive identity preparation/store |
+| V2.8 | FALCON VERIFY SHADOW INTEGRATION | full V2.7A.1 and V2.7A.2 exit accepted; Falcon flat; Falcon VERIFY; real trading off; explicit operational authorization; V2.7A productive signal/decision identity dossier accepted | Falcon shadow projection/integration tests, lifecycle observer | broker real, V2 mutation LIVE, routes, other live bots, Decision Identity Store/claim/record management | shadow/read-only identity projection only; no execution influence; no operational execution identity in VERIFY | diagnostic artifacts only; no Registry V1/V2 mutation; no new persistence surface attributable to V2.8 | shadow flag false by default, enabled only authorized VERIFY | Falcon intent/ACK/stop/recovery fakes plus approved factual shadow parity | yes safe local | Falcon safety + operations | yes future | no unless authorized | deploy VERIFY-only only with explicit authorization | section 27.2 causal/mutable broker, non-mutation, factual parity, continuity, completed-decision, and V2.8 non-store-management gates accepted | disable shadow/remove projection |
+| V2.9 | FIRST RUNTIME V2 WRITE | V2.0–V2.7 accepted; V2.7A exited; V2.8 exited under the amended authoritative gates; full suite/fault suite; migration dry-run; V1 backup; PAPER isolated | V2 writer, one approved PAPER adapter, V2 observability | Falcon LIVE, broker real, main execution path, V1 destructive mutation, manual adoption | V2 writer only for isolated PAPER | registry_v2.json/journal V2 separated; V1 unchanged/read-only | REGISTRY_V2_PAPER_WRITE_ENABLED=false default; explicit temporary PAPER enable | PAPER e2e, restart, WAL, rollback, projection, selected bot | yes | operations + security + bot owner | yes future | no unless authorized | deploy PAPER/VERIFY only with explicit authorization | repeated restart/retry parity, recovery proven, no LIVE route | disable gate/preserve V2 data |
+| V2.10 | VERIFY/PARITY VALIDATION | V2.9 stable and gate returned false after pilot | mappers/reports/parity diagnostics/docs/deprecation warnings/tests | V1 deletion, V1 archive overwrite, LIVE writer, destructive cleanup | no execution influence; no LIVE V2 write | read-only projections/cache only | no LIVE flag; PAPER flag off except explicitly repeated test | parity, migration, WAL, legacy view, all-bot, Falcon VERIFY | yes | architecture + operations + Falcon safety | yes future | no unless authorized | observational deploy only with authorization; never LIVE | all critical consumers validated, future pilot dossier ready | disable/report rollback |
+
+27.1 V2.7A AUTHORITATIVE CONTRACT
+
+Purpose: non-executing identity preparation only. V2.7A intentionally permits
+a narrow additive productive data-contract change; it is not a feature-off
+identity scheme because factual identity metadata is present in productive
+signal/decision surfaces.
+
+V2.7A has exactly two internal substeps:
+
+V2.7A.1 - SIGNAL IDENTITY PREPARATION
+
+Scope: factual versioned signal_id at productive Falcon signal birth;
+restart/retry/legitimate-reentry contract; exact V1 position-side precedence and
+raw-conflict visibility; Central plan provenance; V1 semantic equivalence; and
+zero broker/Registry/execution influence. It creates no decision_id and cannot
+claim full V2.7A exit or enable V2.8.
+
+V2.7A.2 - DECISION REQUEST / COMPLETED DECISION IDENTITY
+
+Scope: decision_request_id contract, canonical request/digest, one dedicated
+provider-owned Decision Identity Store, DECISION_REQUEST_CLAIM, completed
+decision_id, exact signal correlation, replay/new-evaluation/conflict/failure/
+crash/concurrency semantics, PRE/POST continuity, and V1 equivalence. It adds
+no execution authority, Registry V1/V2 write, broker call/mutation, route
+behavior beyond additive identity metadata, flags, threads, other bots, or
+V2.8 enablement.
+
+DECISION_REQUEST_CLAIM belongs to V2.7A.2. No V2.7A.3 is created.
+
+
+Authorized additive identity/provenance metadata:
+
+- signal_id;
+- signal_identity_version;
+- signal_identity_provenance; and
+- only where needed at the exact factual request-issuer/completed-decision
+  provider seams, decision_request_id, request/canonicalization/claim status,
+  decision identity/provenance, and exact decision-to-signal correlation
+  material.
+
+At productive Falcon signal birth, the contract MUST include factual canonical
+signal_id and its versioned provenance. It MUST preserve the section 4.5 exact
+position-side precedence, keep explicit raw position-side conflict visible,
+apply owner-plan provenance without broker/manual/external adoption, and not
+fabricate execution, lifecycle, client, broker, exchange, or fill identity.
+
+PREEXISTING_FIELD_VALUE_EQUIVALENCE is the V2.7A semantic-equivalence gate;
+it is not byte, object, or literal return-container equality. It requires:
+
+- every pre-V2.7A field remains present with identical value and meaning;
+- no pre-existing field is deleted, renamed, repurposed, or overwritten;
+- existing control flow and allowed/denied decision are identical;
+- risk, sizing, management, broker behavior, Registry behavior, and PAPER/LIVE
+  semantics are identical;
+- only explicitly authorized additive identity/provenance fields may be newly
+  present;
+- consumers that ignore additive fields observe the same V1 behavior; and
+- additive fields carry no execution authority during V2.7A.
+
+No new runtime flag is introduced merely to preserve literal byte equality
+after authorized additive metadata is introduced.
+
+Before any V2.7A implementation changes a decision-producing path, its dossier
+MUST identify the actual authoritative Central completed-decision producer,
+including any wrapper that can issue terminal DENY; the one factual
+decision_request_id issuer before provider invocation; and the factual
+propagation/correlation boundary to paired Falcon POST_DECISION. Only those
+exact discovered seams may be authorized, if necessary, to add request,
+claim, decision, provenance, and factual correlation material. A filename,
+including main.py, is not blanket authorization.
+
+Any allowed provider modification MUST NOT change allowed/denied outcome, risk
+policy, sizing, execution authorization, broker behavior, Registry writes, or
+route semantics except for authorized additive identity/provenance/correlation
+fields. It makes no broker call. If the narrow provider change cannot satisfy
+the decision_id/correlation contract, V2.7A stops and reports the blocker.
+
+V2.7A exit requires all of the following:
+
+- factual canonical signal_id at productive Falcon signal birth; retry,
+  restart, and legitimate reentry semantics; and factual
+  signal_identity_version/signal_identity_provenance;
+- no use of legacy sig.id without equivalence proof;
+- exact V1 position-side precedence at signal/plan, PRE_DECISION, and
+  POST_DECISION; visible explicit conflicts; and no BOTH/NET conversion;
+- factual owner-plan provenance that is not broker ownership and never
+  overwrites explicit manual/external ownership;
+- factual canonical decision_id and exact decision-to-signal correlation for
+  relevant VERIFY ALLOW/DENY; replay retains both ID and binding; another
+  signal or stale reentry is a correlation conflict; and genuine new decisions
+  are distinct;
+- PRE_DECISION, POST_DECISION, and factual stage continuity;
+- no execution_id/lifecycle_id in VERIFY and no fabricated client/broker/
+  exchange/fill identity;
+- PREEXISTING_FIELD_VALUE_EQUIVALENCE;
+- unchanged pre-existing read-only broker/exchange calls, zero mutable broker
+  calls, zero identity/shadow-caused broker calls, and zero Registry V1/V2
+  writes;
+- unchanged PAPER/LIVE execution behavior; focused identity/correlation/
+  observer/integration and required Falcon safety tests; and architecture,
+  Falcon safety, and operations acceptance.
+
+Additional full-exit requirements for V2.7A.2:
+
+Full V2.7A exit requires accepted exits for BOTH V2.7A.1 and V2.7A.2.
+
+- The exact caller issues a random opaque versioned decision_request_id before
+  provider invocation, binds it to exact signal_id, and never infers, repairs,
+  or intentionally reuses it.
+- The one dedicated provider-owned store has durable claim-before-identity
+  association; valid CLAIMED/COMPLETED lineage; exactly one lineage and at most
+  one authoritative completed record; canonical digest conflict; restart,
+  corruption, retention, and non-reuse handling; and actual-domain
+  serialization/cross-writer proof when applicable.
+- Claim/record failure, conflict, incomplete request, corruption, missing
+  replay, or binding mismatch leaves the V1 current decision unchanged but
+  fails closed for V2.7A decision_id/POST_DECISION/exit.
+- decision_id is factual/external only after durable COMPLETED validation.
+  IDENTITY_REPLAY is historical evidence only, cannot short-circuit current
+  risk/execution, and a CURRENT decision uses NEW_REEVALUATION/new request ID.
+- Focused and Falcon safety tests prove authorized store I/O only; zero
+  unauthorized I/O, broker/exchange call added by identity preparation, store
+  network dependency, Registry V1/V2 I/O/write attributable to the store,
+  execution persistence, and position/ownership persistence.
+
+27.1A V2.7A.2 DECISION IDENTITY STORE ACTIVATION STATES
+
+State 1 - LOCAL IMPLEMENTATION / TEST
+
+V2.7A.2 may use injected, temporary, or local test storage only to prove
+atomicity, claim-before-association, restart validation, same-key idempotency,
+different-digest conflict, actual-domain single-evaluation ownership/cross-
+writer behavior where applicable, claim and completion crash behavior,
+corruption handling, bounded retention, and non-reuse. No production/default
+path is activated.
+
+State 2 - ACCEPTED V2.7A CONTRACT
+
+Local code acceptance after all V2.7A.1 and V2.7A.2 exit gates pass does not
+activate production persistence, Render, Falcon runtime storage, V2.8, V2
+Registry writer, PAPER/LIVE execution, broker/network behavior, or any default
+store path.
+
+State 3 - FUTURE VERIFY RUNTIME ACTIVATION
+
+Production/Render activation of the store requires separate explicit operations
+authorization. It is a V2.7A identity persistence surface, not V2.8-created.
+At minimum it requires accepted V2.7A.1/.2; Falcon VERIFY; real trading OFF;
+Registry V2 writer OFF; explicit configured backend/path; passed atomicity,
+restart, corruption, conflict, single-flight, actual-domain/cross-writer where
+applicable, retention/non-reuse, claim atomicity, and crash tests; a data-
+preserving disable/rollback procedure; no broker/network/Registry dependency;
+proof V1 behavior is unchanged on identity failure; V2.7A identity/POST fails
+closed; and operations authorization. No PAPER or LIVE execution authority
+follows.
+
+
+27.2 V2.8 AUTHORITATIVE BROKER, PARITY, AND EXIT CONTRACT
+
+The V2.8 observer/shadow is read-only identity projection only. It has zero
+execution influence, creates no operational execution_id/lifecycle_id in
+VERIFY, and creates no Registry V1/V2 mutation.
+
+V2.8 creates no new persistence surface attributable to V2.8. It does not
+create the Decision Identity Store, create DECISION_REQUEST_CLAIM, write,
+complete, mutate, recover, repair, compact, select, or otherwise manage any
+claim or completed record. It only observes factual additive identity material
+already produced by a separately authorized V2.7A provider path. V2.8 remains
+blocked until both V2.7A substeps exit and separate explicit V2.8 operational
+authorization exists.
+
+Broker contract:
+
+- zero mutable broker call in the entire Falcon VERIFY path;
+- zero broker/exchange call attributable to the V2.8 shadow;
+- pre-existing read-only broker/exchange calls are allowed only when identical
+  with shadow OFF and ON; and
+- the observer itself performs no broker/exchange call.
+
+The only read-only operations allowed under that contract are pre-existing V1
+scanner market-data/OHLCV reads, scanner position reads, partial-capable sizing
+price/market reads, and broker ready_check time/balance reads, each only when
+OFF/ON evidence proves it identical. Any call caused by the shadow fails the
+gate even if it is read-only.
+
+V2.8 exit requires all of the following:
+
+- zero mutable broker call; zero shadow-caused broker/exchange call; zero
+  Registry V1/V2 mutation; zero execution influence; and no operational
+  execution_id/lifecycle_id in VERIFY;
+- full accepted exits for V2.7A.1 and V2.7A.2, plus zero V2.8 creation,
+  write, completion, mutation, recovery, repair, compaction, selection, or
+  management of a Decision Identity Store claim or completed record;
+- PREEXISTING_FIELD_VALUE_EQUIVALENCE for disabled-shadow behavior and
+  identical pre-existing read-only broker/exchange calls OFF/ON;
+- valid PRE_DECISION and POST_DECISION contracts with exact paired factual
+  signal/plan, position-side provenance, and owner-plan provenance continuity;
+- exact factual decision-to-signal correlation, with mismatched/stale decision
+  results rejected as conflicts; and
+- completed ALLOW and DENY decision paths covered as applicable.
+
+28. FUTURE V2.LIVE-PILOT GATE
+
+V2.LIVE-PILOT está explicitamente fora V2.0–V2.10. Ele requer uma nova REGISTRY EXECUTION IDENTITY V2 — LIVE READINESS REVIEW e autorização explícita separada.
+
+Pré-condições:
+- Falcon flat;
+- Falcon VERIFY;
+- real trading disabled antes de qualquer deploy;
+- Registry V1/V2 parity aceita;
+- migration clean;
+- zero ambiguous open records;
+- zero PREPARED WAL;
+- zero recovery/quarantine relevante;
+- checksum/backups válidos;
+- full safe suite aprovada;
+- fault suite aprovada;
+- rollback testado;
+- disaster stop/recovery contract validado com fakes;
+- no external/manual position ownership conflict;
+- first LIVE limitado a uma posição;
+- FALCON_REAL_MAX_POSITIONS não é elevado antes de evidência adicional;
+- decisão humana documentada de go/no-go.
+
+Mesmo após a aprovação, o piloto começa com V2 observation/limited write conforme plano específico. Nenhum merge, deploy ou flag pode ser interpretado como autorização LIVE automática.
+
+29. FILE PLAN
+
+| Arquivo provável | Papel futuro | Risco |
+| --- | --- | --- |
+| registry_execution_identity.py novo | gerador UUIDv4, alias validation, tipos puros | baixo |
+| trade_registry.py | integração V2 futura, somente após gates | crítico |
+| registry_v2_reader.py novo | reader/validator estritamente read-only | médio |
+| registry_v2_wal.py novo | WAL temp-only antes de runtime | alto |
+| registry_v2_migration_audit.py novo | audit dry-run | médio |
+| bots/falcon.py | integração só V2.7/V2.8+ sob gates | crítico |
+| falcon_execution_intent_identity.py | alinhar intent key ao ID único | alto |
+| execution_orchestrator.py | owner de geração/boundary | crítico |
+| main.py | remover sync direct writer apenas em fase futura aprovada | crítico |
+| bots/turtle.py | PAPER data contract | médio |
+| bots/predator.py | data/mode contract | alto |
+| bots/donkey.py | remover fallback alternativo no V2 adapter | alto |
+| bots/trendpro.py | data contract/reentry | médio |
+| bots/cobra.py | data contract | médio |
+| bots/meme.py | data contract; P0-2 continua projeto separado | médio |
+| trade_lifecycle_shadow_runtime_adapter.py | alias único identity projection | médio |
+| trade_lifecycle_manager.py | receive/project identity sem segundo mapping | médio |
+| real_pnl_r_mapper.py | execution ID analytics reader | médio |
+| outcome_evaluator.py | PAPER execution marker | médio |
+| tests novos V2 | unit/WAL/migration/Falcon/all-bot suites | baixo |
+
+Nenhuma dessas alterações é autorizada por esta SPEC.
+
+30. OUT OF SCOPE
+
+- auto learning;
+- adaptive weights activation;
+- policy learning activation;
+- broker redesign;
+- strategy changes;
+- sizing optimization;
+- exchange migration;
+- automatic manual-position adoption;
+- historical mass rewrite;
+- decision log cleanup;
+- Redis optimization;
+- UI redesign;
+- aumentar limite Falcon real;
+- mudar credenciais, secrets, flags atuais, Render ou infraestrutura;
+- calls reais a BingX/Telegram/Render;
+- deploy/commit/push nesta tarefa.
+
+31. SELF_CONSISTENCY_CHECK
+
+Scope da auditoria textual:
+- distinct
+- 1:1
+- operation_ledger
+- dual-write
+- LIVE write
+- legacy projection
+- journal
+- execution_id
+- lifecycle_id
+
+contradictions_found: 0
+contradictions_fixed: 7
+unresolved_contradictions: 0
+
+Resultados:
+1. Não há arquitetura com execution_id distinto de lifecycle_id. Qualquer menção a dois nomes descreve alias com valor igual ou a decisão antiga removida.
+2. Não há mapping 1:1 de dois IDs. Relação de igualdade é invariant, não tabela/index independente.
+3. operation_ledger aparece somente como DERIVED CACHE/PROJECTION; EVENT_COMMITTED journal é autoridade.
+4. dual-write aparece somente como proibido. Não há writer V1+V2 independente.
+5. LIVE write aparece somente como proibido em V2.0–V2.10 ou como requisito futuro de V2.LIVE-PILOT.
+6. legacy projection aparece somente como read-only derived view/cache descartável.
+7. journal é fonte de idempotência committed e WAL; snapshot witness/recovery não cria segunda autoridade.
+8. execution_id/lifecycle_id aparecem como a mesma identity; divergência é status fail-closed.
+9. UUIDv7 não é especificado como gerador ativo; UUIDv4 é a escolha compatível com Python 3.11.9.
+
+V2.3 promotion consistency additions:
+
+10. signal_id, decision_request_id, and decision_id are distinct factual facts;
+    none substitutes for execution/lifecycle/logical/broker/position identity.
+11. DECISION_REQUEST_CLAIM lives in the one same Decision Identity Store;
+    CLAIMED and COMPLETED are the only durable states and incomplete is derived.
+12. Identity failure preserves current V1 decision behavior only and fails
+    V2.7A identity/POST closed; it is never general execution fail-open.
+13. Historical identity projection cannot authorize current risk or execution.
+14. Actual provider/store concurrency serialization is required; in-process-only
+    locking is insufficient for multi-process writers.
+15. V2.7A has V2.7A.1 and V2.7A.2 only; V2.8 does not manage the store/claim
+    and remains blocked.
+16. Document V2.3 is distinct from implementation phase V2.3 Migration Auditor
+    Dry-Run.
+
+V2.3 unresolved normative contradictions: 0
+
+
+32. FINAL ARCHITECTURE DECISIONS
+
+A. Primary physical key:
+execution_id.
+
+B. Lifecycle identity:
+lifecycle_id é alias exatamente igual a execution_id; nenhum segundo UUID.
+
+C. New ID format:
+exec_<uuid.uuid4() em minúsculo>, gerado uma única vez pelo Execution Orchestrator/shared PAPER helper.
+
+D. Durable boundary:
+Registry V2 EVENT_COMMITTED de ENTRY_INTENT, antes de client order/broker submit.
+
+E. Logical legacy key:
+logical_trade_id=BOT:SETUP:SYMBOL:SIDE, não único e somente grouping/read compatibility.
+
+F. Primary storage:
+open_trades e closed_trades mapeiam execution_id -> canonical row.
+
+G. Idempotency authority:
+registry_v2_events.jsonl EVENT_COMMITTED/checkpoint válido.
+
+H. operation_ledger:
+derived cache/projection, rebuildable, nunca authority.
+
+I. WAL:
+EVENT_PREPARED -> SNAPSHOT_COMMITTED -> EVENT_COMMITTED, no double apply.
+
+J. Dual-read:
+YES, quando gate permitir.
+
+K. Dual-write:
+NO. V2 primary com legacy read-only derived view; V1 archive não recebe projection writes.
+
+L. Strong identity LIVE:
+YES.
+
+M. Logical-only mutation:
+FORBID. Legacy logical lookup somente read-only e unívoco.
+
+N. Manual/external adoption:
+NO.
+
+O. Mode conflict:
+MODE_CONFLICT/QUARANTINE, sem conversão silenciosa.
+
+P. Migration:
+SIDE_BY_SIDE, V1 archive/read-only, sem rewrite massivo.
+
+Q. Storage:
+KEEP_JSON com interprocess lock, WAL, checksums, backups e recovery.
+
+R. Event journal:
+V2_REQUIRED e única autoridade de idempotência quando committed.
+
+S. First runtime V2 write:
+V2.9, somente PAPER isolado.
+
+T. First V2 LIVE write:
+fora V2.0–V2.10; somente V2.LIVE-PILOT após review/autorização separada.
+
+U. Factual decision identities:
+signal_id is productive-signal birth; decision_request_id is one factual
+evaluation request; decision_id is one factual durably completed result. None
+is execution/lifecycle/logical/client/broker/exchange/fill/position identity.
+
+V. Decision Identity Store:
+exactly one provider-owned DECISION_IDENTITY_RECORD_STORE may later be
+authorized under V2.7A.2. It has only request/result identity and exact
+signal/request correlation authority; it is not Registry, generic persistence,
+execution, risk, broker, financial, or ownership authority.
+
+W. Durable request identity:
+one same-store lineage has durable CLAIMED then terminal COMPLETED. Claim is
+before V2.7A identity-associated evaluation; candidate decision_id is factual/
+external only after durable completion and validation.
+
+X. Failure/replay boundary:
+identity failure leaves current V1 decision behavior unchanged but V2.7A
+identity/POST fails closed. IDENTITY_REPLAY is historical evidence only and
+never current risk/execution approval.
+
+Y. V2.7A/V2.8:
+V2.7A has exactly two internal substeps. V2.8 cannot create/write/manage the
+Decision Identity Store or claims and remains blocked until full V2.7A exit plus
+separate authorization.
+
+
+SPEC_READY_FOR_IMPLEMENTATION =
+YES - phase-specific only under the implementation gates of Section 27 and
+separate explicit authorization. This specification itself authorizes no
+implementation, runtime activation, PAPER, VERIFY runtime activation, or LIVE.
+
+Current V2.7A readiness:
+V2.7A MAY BE SEPARATELY AUTHORIZED only after its factual entry conditions are
+satisfied and explicit local implementation authorization is granted. It is not
+automatically authorized by this specification or by architectural readiness.
+
+V2.8 readiness:
+BLOCKED until full accepted exits for both V2.7A.1 and V2.7A.2 plus separate
+explicit V2.8 operational authorization.
+
+V2.9 PAPER runtime blockers:
+V2.0–V2.7 accepted, V2.7A exited, V2.8 exited under authoritative gates,
+full/fault suites, migration dry-run, V1 backup, PAPER isolation, and separate
+authorization.
+
+LIVE blockers:
+all requirements of Section 28 plus separate explicit V2.LIVE-PILOT
+authorization.
+
+ARQUIVOS INSPECIONADOS
+
+- AGENTS.md
+- registry_execution_identity_v2_full_spec.txt
+- registry_execution_identity_v2_spec_review2.txt
+- trade_registry.py
+- bots/falcon.py
+- falcon_execution_intent_identity.py
+- trade_lifecycle_manager.py
+- trade_lifecycle_shadow_runtime_adapter.py
+- main.py
+- bots/turtle.py
+- bots/predator.py
+- bots/donkey.py
+- bots/trendpro.py
+- bots/cobra.py
+- bots/meme.py
+- real_pnl_r_mapper.py
+- outcome_evaluator.py
+- paper_lifecycle.py
+- runtime.txt
+
+COMANDOS READ-ONLY USADOS
+
+- Get-Content no pedido anexo e nos documentos V2 anteriores.
+- Get-Content/rg em Registry, callers, lifecycle e identity Falcon.
+- python --version e py --version foram tentados, mas o ambiente recusou iniciar os executáveis por sessão de logon indisponível.
+- Get-Content runtime.txt confirmou python-3.11.9.
+- rg --files, Get-ChildItem, rg e git status --short foram usados apenas para descoberta/verificação local.
+- Nenhum teste runtime, writer produtivo, servidor, broker, HTTP, Redis, BingX, Telegram ou Render foi executado.
+
+TAMANHO DO RELATÓRIO
+
+00000000000000073578
+
+GIT STATUS --SHORT
+
+```text
+?? central_quant_learning_loop_readiness_audit_v1.txt
+?? central_quant_learning_p0_verification_v1.txt
+?? closed_trade_key_index_v1.diff.txt
+?? closed_trade_key_index_v1_review2.diff.txt
+?? closed_trade_key_index_v1_review3.diff.txt
+?? closed_trade_key_index_v1_review4.diff.txt
+?? closed_trade_key_index_v1_review5.diff.txt
+?? closed_trade_key_index_v1_review6.diff.txt
+?? closed_trade_key_index_v1_review7.diff.txt
+?? decision_log_growth_forensics_full_pytest.txt
+?? decision_log_growth_forensics_full_pytest_review2.txt
+?? decision_log_growth_forensics_full_pytest_review3.txt
+?? decision_log_growth_forensics_v1.diff.txt
+?? decision_log_growth_forensics_v1_review2.diff.txt
+?? decision_log_growth_forensics_v1_review3.diff.txt
+?? decision_log_single_writer_v1.diff.txt
+?? decision_log_single_writer_v1_final.diff.txt
+?? decision_log_single_writer_v1_review2.diff.txt
+?? decision_log_single_writer_v1_review3.diff.txt
+?? falcon_first_live_health.json
+?? falcon_initial_stop_failure_containment_v1.diff.txt
+?? falcon_initial_stop_failure_containment_v1_review2.diff.txt
+?? falcon_initial_stop_failure_containment_v1_review3.diff.txt
+?? falcon_initial_stop_failure_containment_v1_review4.diff.txt
+?? falcon_initial_stop_failure_containment_v1_review5.diff.txt
+?? falcon_initial_stop_failure_containment_v1_review6.diff.txt
+?? falcon_initial_stop_failure_containment_v1_review7.diff.txt
+?? falcon_initial_stop_failure_full_suite_review10.txt
+?? falcon_initial_stop_failure_full_suite_review7.txt
+?? falcon_initial_stop_failure_full_suite_review8.txt
+?? falcon_initial_stop_failure_full_suite_review9.txt
+?? falcon_single_live_execution_path_v1.diff.txt
+?? falcon_single_live_execution_path_v1_full_pytest.txt
+?? falcon_single_live_execution_path_v1_review2.diff.txt
+?? falcon_single_live_execution_path_v1_review3.diff.txt
+?? falcon_single_live_execution_path_v1_review4.diff.txt
+?? falcon_single_live_execution_path_v1_review5.diff.txt
+?? falcon_single_live_execution_path_v1_review6.diff.txt
+?? falcon_single_live_execution_path_v1_review7.diff.txt
+?? falcon_single_live_execution_path_v1_review7_1.diff.txt
+?? falcon_single_live_execution_path_v1_review7_2.diff.txt
+?? health_24h.json
+?? health_a7c95e5_10min.json
+?? health_a7c95e5_stable.json
+?? health_closed_trades_full_pytest.txt
+?? health_closed_trades_full_pytest_review3.txt
+?? health_closed_trades_request_forensics_v1.diff.txt
+?? health_closed_trades_request_forensics_v1_review2.diff.txt
+?? pre_live_bots.json
+?? pre_live_health.json
+?? registry_execution_identity_v2_final_spec_v2_1.txt
+?? registry_execution_identity_v2_full_spec.txt
+?? registry_execution_identity_v2_spec_review2.txt
+?? static_operational_runtime_v1.diff.txt
+?? static_operational_runtime_v1_review2.diff.txt
+?? static_operational_runtime_v1_review3.diff.txt
+?? static_risk_gate_v1_final.diff.txt
+?? static_risk_gate_v1_review2.diff.txt
+?? static_risk_gate_v1_review3.diff.txt
+?? static_risk_gate_v1_review4.diff.txt
+?? static_turtle_risk_guard_v1.diff.txt
+?? static_turtle_risk_guard_v1_review2.diff.txt
+?? telegram_reports_only_health_light_v1_review2.diff.txt
+```
+
+CONFIRMAÇÃO
+
+Nenhum arquivo de código foi alterado. Este documento é o único arquivo criado nesta tarefa. Nenhum secret/.env foi acessado. Nenhuma flag foi alterada. Nenhuma chamada externa foi feita. Nenhum git add, commit, push, merge, pull ou deploy foi executado.
+
