@@ -75,6 +75,10 @@ from account_client_order_id import (
     reserve_account_client_order_attempt,
     verify_account_client_order_id_reservation,
 )
+from falcon_signal_identity import (
+    FalconSignalIdentityConstructionError,
+    attach_falcon_signal_identity,
+)
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
@@ -1666,7 +1670,7 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
     current_ts = int(row["ts"])
     ny_date = orb["ny_date"]
 
-    return {
+    signal = {
         "id": position_id(symbol, setup_key, side, ny_date),
         "bot": BOT_NAME,
         "setup": setup_key,
@@ -1711,6 +1715,23 @@ def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
         "candles_to_tp50": None,
         "opened_candle_ts": current_ts,
     }
+    try:
+        return attach_falcon_signal_identity(
+            signal,
+            birth_facts={
+                "closed_candle_ts": current_ts,
+                "closed_candle_high": high,
+                "closed_candle_low": low,
+                "closed_candle_close": close,
+                "orb_range_high": range_high,
+                "orb_range_low": range_low,
+                "orb_range_minutes": setup_cfg["range_minutes"],
+                "orb_range_start_ny": orb["range_start_ny"],
+                "orb_range_end_ny": orb["range_end_ny"],
+            },
+        )
+    except FalconSignalIdentityConstructionError:
+        return signal
 
 
 def signal_message(sig):
