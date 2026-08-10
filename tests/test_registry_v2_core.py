@@ -120,6 +120,101 @@ def test_register_allows_repeated_logical_trade_id_but_not_execution_id(tmp_path
     assert set(_document(storage)["open_trades"]) == {"exec-1", "exec-2"}
 
 
+_CANONICAL_LOW = "exec_00000000-0000-4000-8000-000000000001"
+_CANONICAL_HIGH = "exec_00000000-0000-4000-8000-000000000002"
+
+
+def _register_same_logical_pair(storage, insertion_order):
+    for index, execution_id in enumerate(insertion_order, 1):
+        result = _register(storage, _row(execution_id), f"same-logical-register-{index}")
+        assert result.ok is True
+    return _document(storage)
+
+
+def test_same_logical_ids_persist_in_canonical_order_and_remain_mutable_after_reload(tmp_path):
+    storage = _new_storage(tmp_path)
+    document = _register_same_logical_pair(storage, (_CANONICAL_HIGH, _CANONICAL_LOW))
+
+    expected_members = [_CANONICAL_LOW, _CANONICAL_HIGH]
+    assert document["indexes"]["by_logical_trade_id"]["FALCON:FALCON15:BTCUSDT:LONG"] == expected_members
+    assert document["indexes"]["by_bot"]["FALCON"] == expected_members
+    assert set(document["open_trades"]) == set(expected_members)
+
+    updated = core.update_trade_v2(
+        storage,
+        _CANONICAL_HIGH,
+        _CANONICAL_HIGH,
+        {"canonical_order_note": "updated-exactly"},
+        "same-logical-update-high",
+        _generation(storage),
+    )
+    assert updated.ok is True
+    after_update = _document(storage)
+    assert after_update["open_trades"][_CANONICAL_HIGH]["canonical_order_note"] == "updated-exactly"
+    assert "canonical_order_note" not in after_update["open_trades"][_CANONICAL_LOW]
+
+    closed = core.close_trade_v2(
+        storage,
+        _CANONICAL_LOW,
+        _CANONICAL_LOW,
+        "same-logical-close-low",
+        "same-logical-close-low-request",
+        _generation(storage),
+        factual_economics={"pnl_pct": 1.25},
+    )
+    assert closed.ok is True
+    after_close = _document(storage)
+    assert _CANONICAL_HIGH in after_close["open_trades"]
+    assert _CANONICAL_LOW not in after_close["open_trades"]
+    assert after_close["closed_trades"][_CANONICAL_LOW]["execution_id"] == _CANONICAL_LOW
+    assert after_close["indexes"]["by_logical_trade_id"]["FALCON:FALCON15:BTCUSDT:LONG"] == [
+        _CANONICAL_HIGH,
+        _CANONICAL_LOW,
+    ]
+
+
+def test_reverse_same_logical_insertion_has_identical_canonical_persisted_indexes(tmp_path):
+    first_storage = _new_storage(tmp_path / "first")
+    second_storage = _new_storage(tmp_path / "second")
+    first = _register_same_logical_pair(first_storage, (_CANONICAL_HIGH, _CANONICAL_LOW))
+    second = _register_same_logical_pair(second_storage, (_CANONICAL_LOW, _CANONICAL_HIGH))
+
+    assert first["indexes"] == second["indexes"]
+    assert first["indexes"]["by_logical_trade_id"]["FALCON:FALCON15:BTCUSDT:LONG"] == [
+        _CANONICAL_LOW,
+        _CANONICAL_HIGH,
+    ]
+    assert set(first["open_trades"]) == set(second["open_trades"]) == {
+        _CANONICAL_LOW,
+        _CANONICAL_HIGH,
+    }
+
+
+def test_canonical_indexes_keep_open_rows_before_closed_rows_after_reload(tmp_path):
+    storage = _new_storage(tmp_path)
+    _register_same_logical_pair(storage, (_CANONICAL_HIGH, _CANONICAL_LOW))
+
+    closed = core.close_trade_v2(
+        storage,
+        _CANONICAL_LOW,
+        _CANONICAL_LOW,
+        "open-before-closed-close-low",
+        "open-before-closed-close-low-request",
+        _generation(storage),
+        factual_economics={"pnl_pct": -0.5},
+    )
+
+    assert closed.ok is True
+    document = _document(storage)
+    assert _CANONICAL_HIGH in document["open_trades"]
+    assert _CANONICAL_LOW in document["closed_trades"]
+    assert document["indexes"]["by_logical_trade_id"]["FALCON:FALCON15:BTCUSDT:LONG"] == [
+        _CANONICAL_HIGH,
+        _CANONICAL_LOW,
+    ]
+    assert reader.read_registry_v2(storage.snapshot_path).status == reader.REGISTRY_V2_READ_OK
+
+
 @pytest.mark.parametrize("field", ["client_order_id", "broker_order_id", "exchange_order_id", "fill_id"])
 def test_register_rejects_strong_identity_collision(tmp_path, field):
     storage = _new_storage(tmp_path)

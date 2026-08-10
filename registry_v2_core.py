@@ -808,7 +808,7 @@ def _empty_snapshot() -> dict[str, Any]:
 def _rebuild_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(dict(candidate))
     result.setdefault("operation_ledger", {})
-    rows = list(result["open_trades"].values()) + list(result["closed_trades"].values())
+    rows = _canonical_index_rows(result)
     try:
         rebuilt = schema.build_registry_v2_indexes(rows)
         indexes = reader.project_indexes_for_json(rebuilt)
@@ -834,7 +834,6 @@ def _validate_candidate(candidate: Mapping[str, Any]) -> None:
         raise _CoreError(wal.WAL_INVALID, ("generation",))
     if not isinstance(candidate["open_trades"], Mapping) or not isinstance(candidate["closed_trades"], Mapping):
         raise _CoreError(wal.WAL_INVALID, ("trade_collections_mapping_required",))
-    rows = []
     for collection_name, collection, open_collection in (
         ("open_trades", candidate["open_trades"], True),
         ("closed_trades", candidate["closed_trades"], False),
@@ -850,7 +849,7 @@ def _validate_candidate(candidate: Mapping[str, Any]) -> None:
                 raise _CoreError(wal.WAL_CONFLICT, ("closed_state_in_open_trades",))
             if not open_collection and state not in _CLOSED_STATES:
                 raise _CoreError(wal.WAL_CONFLICT, ("open_state_in_closed_trades",))
-            rows.append(row)
+    rows = _canonical_index_rows(candidate)
     try:
         expected = reader.project_indexes_for_json(schema.build_registry_v2_indexes(rows))
     except (TypeError, ValueError, KeyError) as error:
@@ -859,6 +858,25 @@ def _validate_candidate(candidate: Mapping[str, Any]) -> None:
     if not isinstance(persisted, Mapping) or any(persisted.get(name) != value for name, value in expected.items()):
         raise _CoreError(wal.WAL_CONFLICT, ("persisted_indexes_mismatch",))
     _build_unique_indexes(rows)
+
+
+def _canonical_index_rows(snapshot: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return the persisted index sequence for a canonical V2 snapshot.
+
+    The schema deliberately preserves the sequence it receives for non-unique
+    index members.  Snapshot JSON is canonicalized by key, so the core must
+    provide the same sequence before persistence and after reload: all OPEN
+    rows by execution ID, followed by all CLOSED rows by execution ID.
+    """
+
+    open_trades = snapshot["open_trades"]
+    closed_trades = snapshot["closed_trades"]
+    if not isinstance(open_trades, Mapping) or not isinstance(closed_trades, Mapping):
+        raise TypeError("trade_collections_mapping_required")
+    return [
+        *(open_trades[execution_id] for execution_id in sorted(open_trades)),
+        *(closed_trades[execution_id] for execution_id in sorted(closed_trades)),
+    ]
 
 
 def _build_unique_indexes(rows: list[Mapping[str, Any]]) -> dict[str, dict[str, str]]:
