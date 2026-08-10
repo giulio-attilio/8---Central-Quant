@@ -85,6 +85,54 @@ except Exception:
     # V2.7A.2 identity is additive only; an unavailable local helper must not
     # alter the established Central Risk request or its current V1 outcome.
     ensure_decision_request_identity = None
+
+
+# V2.8 is a local/test-only VERIFY observation seam. It has no module import,
+# environment lookup, runtime setter, or automatic activation.
+class FalconV2VerifyShadowObservationError(Exception):
+    """Expected isolated failure from an explicitly injected V2.8 observer."""
+
+
+FALCON_REGISTRY_V2_VERIFY_SHADOW_ENABLED = False
+FALCON_REGISTRY_V2_VERIFY_SHADOW_OBSERVER = None
+
+
+def _falcon_observe_v2_verify_shadow(
+    *, shadow_stage, sig, decision=None, paired_pre=None
+):
+    """Return an optional non-authoritative VERIFY observation, never a gate."""
+
+    if FALCON_REGISTRY_V2_VERIFY_SHADOW_ENABLED is not True:
+        return None
+    if str(globals().get("FALCON_MODE") or "").upper() != "VERIFY":
+        return None
+    observer = globals().get("FALCON_REGISTRY_V2_VERIFY_SHADOW_OBSERVER")
+    if not callable(observer):
+        return None
+    try:
+        from copy import deepcopy
+
+        facts = {
+            "shadow_stage": shadow_stage,
+            "execution_mode": FALCON_MODE,
+            "signal": sig,
+        }
+        if decision is not None:
+            facts["decision"] = decision
+        if paired_pre is not None:
+            facts["paired_pre"] = paired_pre
+        # The observer receives a factual snapshot only.  Its mutations must
+        # never reach the productive signal, Central response, or PRE result.
+        facts = deepcopy(facts)
+    except Exception:
+        # Snapshot construction is non-authoritative V2.8 observation work.
+        return None
+    try:
+        return observer(facts)
+    except FalconV2VerifyShadowObservationError:
+        return None
+    except Exception:
+        return None
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
@@ -1889,20 +1937,29 @@ def central_can_open_trade(sig, positions=None):
             # Identity failure is not a risk/provider failure.  The exact V1
             # payload and current decision call below remain available.
             pass
+    shadow_observer = globals().get("_falcon_observe_v2_verify_shadow")
+    shadow_pre_observation = (
+        shadow_observer(
+            shadow_stage="PRE_DECISION",
+            sig=sig,
+        )
+        if callable(shadow_observer)
+        else None
+    )
     try:
         r = requests.post(CENTRAL_CAN_OPEN_TRADE_URL, json=payload, timeout=8)
         if r.status_code != 200:
             return {"allowed": False, "decision": "DENY", "reasons": [f"central HTTP {r.status_code}: {r.text[:160]}"]}
         data = r.json()
         if not isinstance(data, dict):
-            return {
+            response_data = {
                 "allowed": False,
                 "decision": "DENY",
                 "status": "FALCON_LIVE_CENTRAL_RISK_INVALID",
                 "reasons": ["Central returned an invalid payload."],
                 "warnings": [],
             }
-        if FALCON_MODE == "LIVE" and not isinstance(data.get("allowed"), bool):
+        elif FALCON_MODE == "LIVE" and not isinstance(data.get("allowed"), bool):
             return {
                 "allowed": False,
                 "decision": "DENY",
@@ -1912,9 +1969,18 @@ def central_can_open_trade(sig, positions=None):
                 "central_risk_required": True,
                 "central_risk_verified": False,
             }
-        return data if isinstance(data, dict) else {"allowed": False, "decision": "DENY", "reasons": ["central retornou payload inválido"]}
+        else:
+            response_data = data
     except Exception as exc:
         return {"allowed": False, "decision": "DENY", "reasons": [f"central indisponível: {exc}"]}
+    if callable(shadow_observer):
+        shadow_observer(
+            shadow_stage="POST_DECISION",
+            sig=sig,
+            decision=response_data,
+            paired_pre=shadow_pre_observation,
+        )
+    return response_data
 
 
 def falcon_live_execution_path_guard(path):

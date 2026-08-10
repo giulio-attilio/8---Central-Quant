@@ -1085,6 +1085,10 @@ def test_source_guards_prove_one_local_store_and_exact_seams_only():
         and isinstance(node.func.value, ast.Call)
         and isinstance(node.func.value.func, ast.Name)
         and node.func.value.func.id == "globals"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ensure_decision_request_identity"
     ]
     issuance_calls = [
         node
