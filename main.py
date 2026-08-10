@@ -54,6 +54,17 @@ except Exception as _falcon_live_execution_contract_exc:
 else:
     FALCON_SINGLE_LIVE_EXECUTION_CONTRACT_IMPORT_ERROR = None
 
+try:
+    from decision_identity_store import (
+        DecisionIdentityRecordStore,
+        evaluate_current_decision_with_identity,
+    )
+except Exception:
+    # The V2.7A.2 store is injected only by local/focused tests.  An identity
+    # helper import failure must preserve the established V1 decision path.
+    DecisionIdentityRecordStore = None
+    evaluate_current_decision_with_identity = None
+
 
 # ==========================================================
 # CENTRAL DATA DIR + TIMELINE EMERGENCY RECOVERY V1
@@ -46070,7 +46081,7 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
     return result
 
 
-def can_open_trade_decision(payload: dict):
+def _can_open_trade_decision_v1_final(payload: dict):
     original = _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_FALCON_LIVE_AUDIT_GUARD_V1
     p = dict(payload or {}) if isinstance(payload, dict) else {}
     bot = _fleag_v1_norm_bot(p.get("bot") or p.get("robot") or p.get("strategy"))
@@ -46120,6 +46131,50 @@ def can_open_trade_decision(payload: dict):
     except Exception:
         pass
     return result
+
+
+# V2.7A.2 is deliberately dormant until a focused/local test injects the one
+# explicit-path store below.  It neither selects a path nor reads environment
+# configuration, so the production/default V1 route remains unchanged.
+DECISION_IDENTITY_RECORD_STORE = None
+_DECISION_IDENTITY_PROVIDER_PROVENANCE_V2_7A_2 = {
+    "provider_file": "main.py",
+    "provider_function": "can_open_trade_decision",
+    "provider_version": "V2.7A.2",
+    "completed_decision_boundary": "FALCON_LIVE_AUDIT_GUARD_V1_FINAL",
+    "terminal_decision_wrappers": (
+        "FALCON_LIVE_AUDIT_GUARD_V1 terminal DENY",
+        "REAL_PILOT_GUARD_V1 terminal DENY",
+        "AUTO_REAL_BRIDGE_V1 delegates to Risk Manager",
+        "Risk Manager base ALLOW/DENY",
+    ),
+}
+
+
+def set_decision_identity_record_store_for_tests(store):
+    """Inject or clear the sole V2.7A.2 local/test identity store."""
+
+    if store is not None and (
+        DecisionIdentityRecordStore is None
+        or not isinstance(store, DecisionIdentityRecordStore)
+    ):
+        raise TypeError("store must be a DecisionIdentityRecordStore or None")
+    global DECISION_IDENTITY_RECORD_STORE
+    DECISION_IDENTITY_RECORD_STORE = store
+
+
+def can_open_trade_decision(payload: dict):
+    """Final V1 provider plus optional, additive V2.7A.2 identity metadata."""
+
+    store = DECISION_IDENTITY_RECORD_STORE
+    if store is None or not callable(evaluate_current_decision_with_identity):
+        return _can_open_trade_decision_v1_final(payload)
+    return evaluate_current_decision_with_identity(
+        payload,
+        _can_open_trade_decision_v1_final,
+        store=store,
+        provider_provenance=_DECISION_IDENTITY_PROVIDER_PROVENANCE_V2_7A_2,
+    )
 
 
 def bot_health(key: str, cfg: dict):

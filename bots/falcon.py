@@ -79,6 +79,12 @@ from falcon_signal_identity import (
     FalconSignalIdentityConstructionError,
     attach_falcon_signal_identity,
 )
+try:
+    from decision_identity_store import ensure_decision_request_identity
+except Exception:
+    # V2.7A.2 identity is additive only; an unavailable local helper must not
+    # alter the established Central Risk request or its current V1 outcome.
+    ensure_decision_request_identity = None
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 
 try:
@@ -1862,6 +1868,27 @@ def central_can_open_trade(sig, positions=None):
         "stop": sig.get("stop"),
         "tp50": sig.get("tp50"),
     }
+    decision_request_identity_helper = globals().get(
+        "ensure_decision_request_identity"
+    )
+    if callable(decision_request_identity_helper):
+        try:
+            issued_request_identity = decision_request_identity_helper(sig)
+            request_identity_transport = {
+                field: issued_request_identity[field]
+                for field in (
+                    "decision_request_id",
+                    "decision_request_identity_version",
+                    "decision_request_identity_provenance",
+                )
+            }
+            payload.update(request_identity_transport)
+            if isinstance(sig, dict):
+                sig.update(request_identity_transport)
+        except Exception:
+            # Identity failure is not a risk/provider failure.  The exact V1
+            # payload and current decision call below remain available.
+            pass
     try:
         r = requests.post(CENTRAL_CAN_OPEN_TRADE_URL, json=payload, timeout=8)
         if r.status_code != 200:
