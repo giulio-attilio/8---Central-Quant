@@ -85,6 +85,11 @@ except Exception as _trade_registry_exc:
     TRADE_REGISTRY_LOADED = False
     TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_exc)
 
+from registry_v2_paper_runtime_adapter import (
+    REGISTRY_V2_PAPER_WRITE_ENABLED,
+    get_registry_v2_paper_runtime_adapter,
+)
+
 app = Flask(__name__)
 
 
@@ -722,7 +727,104 @@ def turtle_registry_id(pos):
         return None
 
 
+def turtle_registry_open_occurrence_key(sig):
+    """Return the factual closed-candle occurrence key used only for V2 retry."""
+
+    if not isinstance(sig, dict):
+        return None
+    setup = sig.get("setup")
+    symbol = sig.get("symbol")
+    side = sig.get("side")
+    signal_ts = sig.get("signal_ts")
+    opened_candle_ts = sig.get("opened_candle_ts")
+    if (
+        not isinstance(setup, str)
+        or not setup.strip()
+        or not isinstance(symbol, str)
+        or not symbol.strip()
+        or side not in {"LONG", "SHORT"}
+        or isinstance(signal_ts, bool)
+        or not isinstance(signal_ts, int)
+        or opened_candle_ts != signal_ts
+    ):
+        return None
+    # This is not an execution ID and never selects an existing execution by
+    # logical trade. It only identifies the one closed candle that produced
+    # this deterministic Turtle signal after a crash before local save.
+    return "turtle-paper-register-occurrence:v1:" + json.dumps(
+        {
+            "setup": setup.strip().upper(),
+            "side": side,
+            "signal_ts": signal_ts,
+            "symbol": symbol.strip().upper(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def turtle_registry_write_committed(result):
+    return (
+        isinstance(result, dict)
+        and result.get("ok") is True
+        and result.get("write_committed") is True
+    )
+
+
+def turtle_registry_is_v2_routed(pos):
+    return isinstance(pos, dict) and pos.get("registry_v2_routed") is True
+
+
+def turtle_registry_result_payload(result):
+    try:
+        payload = result.to_dict()
+    except Exception:
+        return {"ok": False, "status": "REGISTRY_V2_PAPER_RUNTIME_RESULT_INVALID"}
+    return payload if isinstance(payload, dict) else {"ok": False, "status": "REGISTRY_V2_PAPER_RUNTIME_RESULT_INVALID"}
+
+
+def turtle_registry_read_committed_open(sig):
+    """Read one committed V2 source occurrence before any new risk decision."""
+
+    occurrence_key = turtle_registry_open_occurrence_key(sig)
+    if occurrence_key is None:
+        return {
+            "ok": False,
+            "status": "REGISTRY_V2_PAPER_SOURCE_OCCURRENCE_INVALID",
+            "found": False,
+        }
+    result = get_registry_v2_paper_runtime_adapter().read_turtle_paper_committed_register(
+        sig,
+        execution_mode="PAPER",
+        registry_mode="PAPER",
+        idempotency_key=occurrence_key,
+    )
+    return turtle_registry_result_payload(result)
+
+
 def turtle_registry_open(sig):
+    if REGISTRY_V2_PAPER_WRITE_ENABLED:
+        occurrence_key = turtle_registry_open_occurrence_key(sig)
+        if occurrence_key is None:
+            return {
+                "ok": False,
+                "status": "REGISTRY_V2_PAPER_SOURCE_OCCURRENCE_INVALID",
+                "write_attempted": False,
+                "write_committed": False,
+            }
+        result = get_registry_v2_paper_runtime_adapter().register_turtle_paper(
+            sig,
+            execution_mode="PAPER",
+            registry_mode="PAPER",
+            idempotency_key=occurrence_key,
+        )
+        result_payload = turtle_registry_result_payload(result)
+        # A failed V2 attempt must not mark the local card as routed: scanner
+        # code can then fail closed without saving an active local position.
+        if turtle_registry_write_committed(result_payload):
+            sig["registry_v2_routed"] = True
+            sig["registry_v2_result"] = result_payload
+        return result_payload
     if not TRADE_REGISTRY_LOADED or register_open_trade is None:
         return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "TRADE_REGISTRY_NOT_LOADED"}
     try:
@@ -761,6 +863,17 @@ def turtle_registry_open(sig):
 
 
 def turtle_registry_update(pos, event, **updates):
+    if turtle_registry_is_v2_routed(pos):
+        result = get_registry_v2_paper_runtime_adapter().update_turtle_paper(
+            pos,
+            event=event,
+            updates=updates,
+            execution_mode="PAPER",
+            registry_mode="PAPER",
+        )
+        result_payload = turtle_registry_result_payload(result)
+        pos["registry_v2_last_result"] = result_payload
+        return result_payload
     if not TRADE_REGISTRY_LOADED or update_trade is None:
         return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "TRADE_REGISTRY_NOT_LOADED"}
     try:
@@ -791,6 +904,17 @@ def turtle_registry_update(pos, event, **updates):
 
 
 def turtle_registry_close(pos, exit_price, reason, result_pct=None, result_r=None):
+    if turtle_registry_is_v2_routed(pos):
+        result = get_registry_v2_paper_runtime_adapter().close_turtle_paper(
+            pos,
+            exit_price=exit_price,
+            reason=reason,
+            result_pct=result_pct,
+            result_r=result_r,
+            execution_mode="PAPER",
+            registry_mode="PAPER",
+        )
+        return turtle_registry_result_payload(result)
     if not TRADE_REGISTRY_LOADED or close_trade is None:
         return {"ok": False, "error": TRADE_REGISTRY_IMPORT_ERROR or "TRADE_REGISTRY_NOT_LOADED"}
     try:
@@ -822,6 +946,119 @@ def turtle_registry_close(pos, exit_price, reason, result_pct=None, result_r=Non
         )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ==============================================================================
+# RECUPERAÇÃO V2 PAPER
+# ==============================================================================
+
+def turtle_registry_recover_management(pos):
+    """Read exact V2 facts before a routed position can transition locally."""
+
+    if not turtle_registry_is_v2_routed(pos):
+        return {"ok": True, "close": None, "tp50_patch": None, "be_patch": None}
+    adapter = get_registry_v2_paper_runtime_adapter()
+    close = turtle_registry_result_payload(
+        adapter.read_turtle_paper_committed_close(
+            pos,
+            execution_mode="PAPER",
+            registry_mode="PAPER",
+        )
+    )
+    if close.get("ok") is not True:
+        return {"ok": False, "status": close.get("status"), "close": None, "tp50_patch": None, "be_patch": None}
+    if close.get("found") is True:
+        return {
+            "ok": True,
+            "close": close.get("mutation_payload"),
+            "close_result": close,
+            "tp50_patch": None,
+            "be_patch": None,
+        }
+    tp50 = turtle_registry_result_payload(
+        adapter.read_turtle_paper_committed_update(
+            pos,
+            event="TP50",
+            execution_mode="PAPER",
+            registry_mode="PAPER",
+        )
+    )
+    if tp50.get("ok") is not True:
+        return {"ok": False, "status": tp50.get("status"), "close": None, "tp50_patch": None, "be_patch": None}
+    be = turtle_registry_result_payload(
+        adapter.read_turtle_paper_committed_update(
+            pos,
+            event="BE",
+            execution_mode="PAPER",
+            registry_mode="PAPER",
+        )
+    )
+    if be.get("ok") is not True:
+        return {"ok": False, "status": be.get("status"), "close": None, "tp50_patch": None, "be_patch": None}
+    tp50_patch = None
+    be_patch = None
+    if tp50.get("found") is True:
+        payload = tp50.get("mutation_payload")
+        patch = payload.get("patch") if isinstance(payload, dict) else None
+        if not isinstance(patch, dict) or patch.get("last_event") != "TP50":
+            return {"ok": False, "status": "REGISTRY_V2_PAPER_RECOVERY_EVIDENCE_INVALID", "close": None, "tp50_patch": None, "be_patch": None}
+        tp50_patch = patch
+    if be.get("found") is True:
+        payload = be.get("mutation_payload")
+        patch = payload.get("patch") if isinstance(payload, dict) else None
+        if not isinstance(patch, dict) or patch.get("last_event") != "BE" or tp50_patch is None:
+            return {"ok": False, "status": "REGISTRY_V2_PAPER_RECOVERY_EVIDENCE_INVALID", "close": None, "tp50_patch": None, "be_patch": None}
+        be_patch = patch
+    return {"ok": True, "close": None, "tp50_patch": tp50_patch, "be_patch": be_patch}
+
+
+def turtle_registry_apply_management_patch(pos, patch):
+    """Map a committed V2 management patch back to Turtle's local card fields."""
+
+    if not isinstance(pos, dict) or not isinstance(patch, dict):
+        return None
+    restored = dict(pos)
+    field_map = {
+        "status": "status",
+        "stop_price": "stop",
+        "tp50_price": "tp50",
+        "tp50_hit": "tp50_hit",
+        "breakeven": "be_moved",
+        "mfe_pct": "mfe_pct",
+        "mae_pct": "mae_pct",
+        "mfe_r": "mfe_r",
+        "mae_r": "mae_r",
+        "best_price": "best_price",
+        "worst_price": "worst_price",
+        "management_cycles": "management_cycles",
+        "candles_to_tp50": "candles_to_tp50",
+    }
+    for source, target in field_map.items():
+        if source in patch:
+            restored[target] = patch[source]
+    return restored
+
+
+def turtle_registry_committed_close_facts(payload):
+    """Extract only the exact V2 factual close economics for local recovery."""
+
+    close = payload.get("close") if isinstance(payload, dict) else None
+    economics = close.get("factual_economics") if isinstance(close, dict) else None
+    if (
+        not isinstance(economics, dict)
+        or close.get("kind") != "FULL_CLOSE"
+        or economics.get("exit_price") is None
+        or not isinstance(economics.get("close_reason"), str)
+        or economics.get("pnl_pct") is None
+        or economics.get("realized_r") is None
+    ):
+        return None
+    return {
+        "exit_price": economics["exit_price"],
+        "reason": economics["close_reason"],
+        "result_pct": economics["pnl_pct"],
+        "result_r": economics["realized_r"],
+    }
 
 
 # ==============================================================================
@@ -1291,7 +1528,10 @@ def scanner_loop():
             last_candles = get_last_candles_by_symbol()
 
             for symbol in watchlist:
-                if len(positions) >= MAX_OPEN_POSITIONS:
+                # Gate OFF preserves the original early new-entry limit. With
+                # V2 on, an already committed source occurrence must still be
+                # reconstructed before current new-entry gates can reject it.
+                if not REGISTRY_V2_PAPER_WRITE_ENABLED and len(positions) >= MAX_OPEN_POSITIONS:
                     break
 
                 df = safe_fetch_ohlcv(symbol)
@@ -1304,44 +1544,103 @@ def scanner_loop():
                     continue
 
                 funnel_inc("ativos_analisados")
+                symbol_candle_completed = True
 
                 for setup_key, setup_cfg in SETUPS.items():
-                    if len(positions) >= MAX_OPEN_POSITIONS:
+                    if not REGISTRY_V2_PAPER_WRITE_ENABLED and len(positions) >= MAX_OPEN_POSITIONS:
                         break
 
                     sig = analyze_symbol_setup(symbol, setup_key, setup_cfg, closed)
                     if not sig:
                         continue
 
-                    if should_skip_due_to_open_position(positions, symbol, setup_key, sig["side"]):
-                        funnel_inc("reprovados_posicao_ativa")
-                        continue
+                    recovery_result = None
+                    recovered_committed_register = False
+                    if REGISTRY_V2_PAPER_WRITE_ENABLED:
+                        # A source-keyed REGISTER already committed before a
+                        # local-save crash is historical execution fact. Read
+                        # it before any fresh-risk decision, never by logical
+                        # trade, and fail closed if its evidence is unsafe.
+                        recovery_result = turtle_registry_read_committed_open(sig)
+                        if (
+                            not isinstance(recovery_result, dict)
+                            or recovery_result.get("ok") is not True
+                        ):
+                            symbol_candle_completed = False
+                            # An unresolved V2 fact must not permit a second
+                            # setup on this symbol to create a new entry.
+                            break
+                        recovered_committed_register = recovery_result.get("found") is True
+                        if not recovered_committed_register and len(positions) >= MAX_OPEN_POSITIONS:
+                            # Keep probing the remaining setups for committed
+                            # facts, but leave this new occurrence retryable.
+                            symbol_candle_completed = False
+                            continue
 
-                    if time.time() - started < STARTUP_GUARD_SECONDS:
-                        set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
-                        continue
+                    if not recovered_committed_register:
+                        if should_skip_due_to_open_position(positions, symbol, setup_key, sig["side"]):
+                            funnel_inc("reprovados_posicao_ativa")
+                            continue
 
-                    risk_allowed, risk_decision = turtle_risk_guard_allows(sig)
-                    if not risk_allowed:
-                        funnel_inc("reprovados_risk_guard")
-                        set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
-                        record_event(
-                            "TRADE_BLOCKED",
-                            sig,
-                            {
-                                "risk_guard_connector": risk_decision,
-                                "reasons": risk_decision.get("reasons", []),
-                                "warnings": risk_decision.get("warnings", []),
-                                "result": "DENY",
-                            },
-                        )
-                        continue
+                        if time.time() - started < STARTUP_GUARD_SECONDS:
+                            set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
+                            continue
+
+                        risk_allowed, risk_decision = turtle_risk_guard_allows(sig)
+                        if not risk_allowed:
+                            funnel_inc("reprovados_risk_guard")
+                            set_cooldown(symbol, setup_key, sig["side"], sig["signal_ts"])
+                            record_event(
+                                "TRADE_BLOCKED",
+                                sig,
+                                {
+                                    "risk_guard_connector": risk_decision,
+                                    "reasons": risk_decision.get("reasons", []),
+                                    "warnings": risk_decision.get("warnings", []),
+                                    "result": "DENY",
+                                },
+                            )
+                            continue
+
+                        pid = sig["id"]
+                        registry_result = turtle_registry_open(sig)
+                        sig["trade_registry_result"] = registry_result
+                        if REGISTRY_V2_PAPER_WRITE_ENABLED and not turtle_registry_write_committed(registry_result):
+                            # V2 is authoritative while the PAPER gate is on.  A
+                            # rejected, timed-out, conflicted, or blocked write
+                            # leaves the factual source retryable and blocks
+                            # any other new setup entry for this symbol pass.
+                            symbol_candle_completed = False
+                            break
 
                     pid = sig["id"]
-                    registry_result = turtle_registry_open(sig)
-                    sig["trade_registry_result"] = registry_result
+                    if recovered_committed_register:
+                        sig["trade_registry_result"] = recovery_result
+                        if pid in positions:
+                            existing = positions[pid]
+                            execution_id = sig.get("execution_id")
+                            if (
+                                isinstance(existing, dict)
+                                and isinstance(execution_id, str)
+                                and sig.get("lifecycle_id") == execution_id
+                                and existing.get("execution_id") == execution_id
+                                and existing.get("lifecycle_id") == execution_id
+                            ):
+                                # The local card already proves the same exact
+                                # historical execution; do not overwrite or
+                                # duplicate local publication.
+                                continue
+                            symbol_candle_completed = False
+                            break
                     positions[pid] = sig
-                    save_positions(positions)
+                    local_saved = save_positions(positions)
+                    if REGISTRY_V2_PAPER_WRITE_ENABLED and not local_saved:
+                        # The committed V2 occurrence can be recovered on the
+                        # same factual candle after a crash/restart; do not
+                        # publish a local birth that failed to persist.
+                        positions.pop(pid, None)
+                        symbol_candle_completed = False
+                        break
 
                     redis_list_append(SIGNALS_KEY, sig)
                     record_event("SIGNAL", sig, {"entry": sig["entry"], "stop": sig["stop"], "tp50": sig["tp50"]})
@@ -1351,7 +1650,8 @@ def scanner_loop():
                     funnel_inc("sinais_enviados")
                     signals_sent += 1
 
-                last_candles[symbol] = symbol_last_closed_ts
+                if symbol_candle_completed:
+                    last_candles[symbol] = symbol_last_closed_ts
 
             save_last_candles_by_symbol(last_candles)
 
@@ -1419,33 +1719,17 @@ def turtle_exit_signal(pos):
     return False, close
 
 
-def close_position(pid, pos, exit_price, reason):
+def emit_closed_trade(pos, trade):
+    """Publish a close only after the V2 local lifecycle removal is durable."""
+
     entry = safe_float(pos["entry"])
-    initial_stop = safe_float(pos.get("initial_stop", pos["stop"]))
     side = pos["side"]
-
-    result_pct = pnl_pct_for_side(side, entry, exit_price)
-    result_r = r_for_side(side, entry, initial_stop, exit_price)
-
-    giveback_pct = safe_float(pos.get("mfe_pct")) - result_pct
-    giveback_r = safe_float(pos.get("mfe_r")) - result_r
-
-    trade = dict(pos)
-    trade.update(
-        {
-            "status": "CLOSED",
-            "exit_price": exit_price,
-            "exit_reason": reason,
-            "closed_at": data_hora_sp_str(),
-            "result_pct": result_pct,
-            "result_r": result_r,
-            "giveback_pct": giveback_pct,
-            "giveback_r": giveback_r,
-        }
-    )
-
-    registry_close_result = turtle_registry_close(trade, exit_price, reason, result_pct=result_pct, result_r=result_r)
-    trade["trade_registry_close_result"] = registry_close_result
+    exit_price = safe_float(trade["exit_price"])
+    reason = trade["exit_reason"]
+    result_pct = safe_float(trade["result_pct"])
+    result_r = safe_float(trade["result_r"])
+    giveback_pct = safe_float(trade["giveback_pct"])
+    giveback_r = safe_float(trade["giveback_r"])
 
     redis_list_append(TRADES_KEY, trade)
     record_event(reason, trade, {"exit_price": exit_price, "result_pct": result_pct, "result_r": result_r})
@@ -1471,7 +1755,84 @@ def close_position(pid, pos, exit_price, reason):
         bot="TURTLE", event_type="PAPER_TRADE_CLOSED", mode="PAPER"
     )
 
+
+def close_position(pid, pos, exit_price, reason, committed_close=None, committed_close_result=None):
+    entry = safe_float(pos["entry"])
+    initial_stop = safe_float(pos.get("initial_stop", pos["stop"]))
+    side = pos["side"]
+
+    if committed_close is not None:
+        recovered = turtle_registry_committed_close_facts(committed_close)
+        if recovered is None:
+            return None
+        exit_price = safe_float(recovered["exit_price"])
+        reason = recovered["reason"]
+        result_pct = safe_float(recovered["result_pct"])
+        result_r = safe_float(recovered["result_r"])
+    else:
+        result_pct = pnl_pct_for_side(side, entry, exit_price)
+        result_r = r_for_side(side, entry, initial_stop, exit_price)
+
+    giveback_pct = safe_float(pos.get("mfe_pct")) - result_pct
+    giveback_r = safe_float(pos.get("mfe_r")) - result_r
+
+    trade = dict(pos)
+    trade.update(
+        {
+            "status": "CLOSED",
+            "exit_price": exit_price,
+            "exit_reason": reason,
+            "closed_at": (
+                committed_close_result.get("committed_at")
+                if isinstance(committed_close_result, dict) and committed_close_result.get("committed_at")
+                else data_hora_sp_str()
+            ),
+            "result_pct": result_pct,
+            "result_r": result_r,
+            "giveback_pct": giveback_pct,
+            "giveback_r": giveback_r,
+        }
+    )
+
+    if committed_close is not None:
+        registry_close_result = dict(committed_close_result or {
+            "ok": True,
+            "status": "WAL_OK",
+            "write_committed": True,
+            "reconciled": True,
+        })
+        registry_close_result["ok"] = True
+        registry_close_result["write_committed"] = True
+        registry_close_result["reconciled"] = True
+    else:
+        registry_close_result = turtle_registry_close(trade, exit_price, reason, result_pct=result_pct, result_r=result_r)
+    trade["trade_registry_close_result"] = registry_close_result
+
+    if turtle_registry_is_v2_routed(pos):
+        if not turtle_registry_write_committed(registry_close_result):
+            return None
+        return trade
+
+    emit_closed_trade(pos, trade)
     return trade
+
+
+def record_tp50_transition(pos, price):
+    record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"]})
+    record_event("BE", pos, {"new_stop": safe_float(pos["entry"])})
+
+
+def notify_tp50_transition(pos, price):
+    entry = safe_float(pos["entry"])
+    send_automatic_telegram(safe_send_telegram,
+        f"🐢 TP50 {pos.get('setup_label', pos.get('setup'))} - {pos['symbol']}\n\n"
+        f"Direção: {pos['side']}\n"
+        f"Preço atual: {fmt_price(price)}\n"
+        f"Stop movido para BE: {fmt_price(entry)}\n"
+        f"Tempo até TP50: {pos['candles_to_tp50']} ciclos de gestão\n\n"
+        f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}",
+        bot="TURTLE", event_type="TP50_PAPER", mode="PAPER"
+    )
 
 
 def management_loop():
@@ -1480,8 +1841,51 @@ def management_loop():
             positions = get_positions()
             changed = False
             closed_pids = []
+            pending_v2_closes = []
+            pending_v2_tp50 = []
 
-            for pid, pos in list(positions.items()):
+            for pid, stored_pos in list(positions.items()):
+                v2_routed = turtle_registry_is_v2_routed(stored_pos)
+                pos = dict(stored_pos) if v2_routed else stored_pos
+                restored = False
+
+                if v2_routed:
+                    recovery = turtle_registry_recover_management(pos)
+                    if recovery.get("ok") is not True:
+                        continue
+                    if recovery.get("close") is not None:
+                        trade = close_position(
+                            pid,
+                            pos,
+                            None,
+                            None,
+                            committed_close=recovery["close"],
+                            committed_close_result=recovery.get("close_result"),
+                        )
+                        if trade is None:
+                            continue
+                        closed_pids.append(pid)
+                        pending_v2_closes.append((dict(pos), trade))
+                        changed = True
+                        continue
+                    tp50_patch = recovery.get("tp50_patch")
+                    be_patch = recovery.get("be_patch")
+                    if tp50_patch is not None:
+                        pos = turtle_registry_apply_management_patch(pos, tp50_patch)
+                        if pos is None:
+                            continue
+                        restored = True
+                    if be_patch is not None:
+                        pos = turtle_registry_apply_management_patch(pos, be_patch)
+                        if pos is None:
+                            continue
+                        restored = True
+                    if tp50_patch is not None and be_patch is None:
+                        recovered_be = turtle_registry_update(pos, "BE", new_sl=safe_float(pos["entry"]))
+                        if not turtle_registry_write_committed(recovered_be):
+                            continue
+                        pending_v2_tp50.append((dict(pos), safe_float(tp50_patch.get("price", pos["tp50"]))))
+
                 symbol = pos["symbol"]
                 side = pos["side"]
                 entry = safe_float(pos["entry"])
@@ -1493,58 +1897,86 @@ def management_loop():
 
                 price = safe_fetch_price(symbol)
                 if price is None:
+                    if restored:
+                        positions[pid] = pos
+                        changed = True
                     continue
 
                 pos = update_mfe_mae(pos, price)
 
                 stopped = (side == "LONG" and price <= stop) or (side == "SHORT" and price >= stop)
                 if stopped:
-                    close_position(pid, pos, price, "STOP")
+                    trade = close_position(pid, pos, price, "STOP")
+                    if trade is None:
+                        continue
                     closed_pids.append(pid)
+                    if v2_routed:
+                        pending_v2_closes.append((dict(pos), trade))
                     changed = True
                     continue
 
                 if not pos.get("tp50_hit"):
                     tp_hit = (side == "LONG" and price >= tp50) or (side == "SHORT" and price <= tp50)
                     if tp_hit:
-                        pos["tp50_hit"] = True
-                        pos["be_moved"] = True
-                        pos["stop"] = entry
-                        pos["candles_to_tp50"] = int(pos.get("management_cycles", 0))
+                        staged = dict(pos) if v2_routed else pos
+                        staged["tp50_hit"] = True
+                        staged["be_moved"] = True
+                        staged["stop"] = entry
+                        staged["candles_to_tp50"] = int(staged.get("management_cycles", 0))
+
+                        if v2_routed:
+                            tp50_result = turtle_registry_update(
+                                staged,
+                                "TP50",
+                                price=safe_float(price),
+                                candles_to_tp50=staged["candles_to_tp50"],
+                            )
+                            if not turtle_registry_write_committed(tp50_result):
+                                continue
+                            be_result = turtle_registry_update(staged, "BE", new_sl=safe_float(entry))
+                            if not turtle_registry_write_committed(be_result):
+                                continue
+                            pos = staged
+                            pending_v2_tp50.append((dict(pos), safe_float(price)))
+                        else:
+                            pos = staged
+                            record_tp50_transition(pos, price)
+                            turtle_registry_update(pos, "TP50", price=safe_float(price), candles_to_tp50=pos["candles_to_tp50"])
+                            turtle_registry_update(pos, "BE", new_sl=safe_float(entry))
+                            notify_tp50_transition(pos, price)
                         changed = True
-
-                        record_event("TP50", pos, {"price": price, "candles_to_tp50": pos["candles_to_tp50"]})
-                        record_event("BE", pos, {"new_stop": entry})
-                        turtle_registry_update(pos, "TP50", price=safe_float(price), candles_to_tp50=pos["candles_to_tp50"])
-                        turtle_registry_update(pos, "BE", new_sl=safe_float(entry))
-
-                        send_automatic_telegram(safe_send_telegram,
-                            f"🐢 TP50 {pos.get('setup_label', pos.get('setup'))} - {symbol}\n\n"
-                            f"Direção: {side}\n"
-                            f"Preço atual: {fmt_price(price)}\n"
-                            f"Stop movido para BE: {fmt_price(entry)}\n"
-                            f"Tempo até TP50: {pos['candles_to_tp50']} ciclos de gestão\n\n"
-                            f"MFE: {fmt_pct(pos.get('mfe_pct', 0))} | {fmt_r(pos.get('mfe_r', 0))}",
-                            bot="TURTLE", event_type="TP50_PAPER", mode="PAPER"
-                        )
 
                 exit_signal, exit_close = turtle_exit_signal(pos)
                 if exit_signal and exit_close is not None:
-                    close_position(pid, pos, exit_close, f"SAÍDA TURTLE {pos['exit_len']}")
+                    trade = close_position(pid, pos, exit_close, f"SAÍDA TURTLE {pos['exit_len']}")
+                    if trade is None:
+                        continue
                     closed_pids.append(pid)
+                    if v2_routed:
+                        pending_v2_closes.append((dict(pos), trade))
                     changed = True
                     continue
 
                 pos["management_cycles"] = int(pos.get("management_cycles", 0)) + 1
                 positions[pid] = pos
+                if restored:
+                    changed = True
 
             for pid in closed_pids:
                 positions.pop(pid, None)
 
+            local_saved = True
             if changed:
-                save_positions(positions)
+                local_saved = save_positions(positions)
             else:
                 HEALTH["last_positions_count"] = len(positions)
+
+            if local_saved:
+                for pos, price in pending_v2_tp50:
+                    record_tp50_transition(pos, price)
+                    notify_tp50_transition(pos, price)
+                for pos, trade in pending_v2_closes:
+                    emit_closed_trade(pos, trade)
 
             HEALTH["last_management_run"] = data_hora_sp_str()
             HEALTH["last_success"] = data_hora_sp_str()
