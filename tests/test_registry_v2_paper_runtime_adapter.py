@@ -1071,6 +1071,47 @@ def test_read_only_source_occurrence_register_recovers_exact_row_without_new_eve
     assert _events(tmp_path) == committed_before_read
 
 
+def test_gate_off_read_only_source_occurrence_register_recovers_without_v2_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    source_key = (
+        'turtle-paper-register-occurrence:v1:{"setup":"TURTLE20","side":"LONG",'
+        '"signal_ts":1700000000,"symbol":"BTCUSDT"}'
+    )
+    original = _position()
+    assert _register(_adapter(tmp_path), original, idempotency_key=source_key).ok is True
+    snapshot_path, journal_path = _storage_paths(tmp_path)
+    before_snapshot = snapshot_path.read_bytes()
+    before_journal = journal_path.read_bytes()
+    committed_before_read = _events(tmp_path)
+
+    def unexpected_v2_mutation(*_args, **_kwargs):
+        pytest.fail("gate-off committed REGISTER recovery must remain read-only")
+
+    monkeypatch.setattr(paper, "generate_execution_lifecycle_id", unexpected_v2_mutation)
+    monkeypatch.setattr(paper.core, "register_trade_v2", unexpected_v2_mutation)
+    monkeypatch.setattr(paper.core, "update_trade_v2", unexpected_v2_mutation)
+    monkeypatch.setattr(paper.core, "close_trade_v2", unexpected_v2_mutation)
+
+    recovered = _position(entry=111.0, stop=90.0, initial_stop=90.0, tp50=132.0)
+    result = _read_register(
+        _adapter(tmp_path, enabled=False),
+        recovered,
+        idempotency_key=source_key,
+    )
+
+    assert result.ok is True
+    assert result.found is True
+    assert result.execution_id == original["execution_id"]
+    assert recovered["execution_id"] == recovered["lifecycle_id"] == original["execution_id"]
+    assert recovered["registry_v2_routed"] is True
+    assert recovered["registry_v2_register_idempotency_key"] == source_key
+    assert snapshot_path.read_bytes() == before_snapshot
+    assert journal_path.read_bytes() == before_journal
+    assert _events(tmp_path) == committed_before_read
+
+
 def test_read_only_source_occurrence_register_rejects_mismatched_signal_ts(tmp_path):
     source_key = (
         'turtle-paper-register-occurrence:v1:{"setup":"TURTLE20","side":"LONG",'

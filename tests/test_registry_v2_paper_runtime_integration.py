@@ -37,6 +37,7 @@ class _AdapterResult:
 class _FakePaperAdapter:
     def __init__(self, *, enabled=True):
         self.enabled = enabled
+        self.has_explicit_paper_storage = True
         self.calls = []
 
     def register_turtle_paper(self, position, **kwargs):
@@ -192,6 +193,10 @@ class _LifecycleAdapter:
         self._close_status = close_status
         self.register_calls = 0
 
+    @property
+    def has_explicit_paper_storage(self):
+        return self._adapter.has_explicit_paper_storage
+
     @staticmethod
     def _failure(status):
         return _AdapterResult(status, committed=False)
@@ -232,9 +237,9 @@ class _LifecycleAdapter:
         return self._adapter.read_turtle_paper_committed_close(position, **kwargs)
 
 
-def _runtime_registry_namespace(adapter):
+def _runtime_registry_namespace(adapter, *, gate=True):
     calls = []
-    namespace = _namespace(gate=True, fake_adapter=adapter, v1_calls=calls)
+    namespace = _namespace(gate=gate, fake_adapter=adapter, v1_calls=calls)
     _compile_registry_functions(namespace)
     return namespace, calls
 
@@ -355,6 +360,7 @@ def _scanner_namespace(
     should_skip=None,
     startup_guard_seconds=0,
     save_behavior=None,
+    gate=True,
 ):
     state = {} if state is None else state
     state.setdefault("positions", {})
@@ -369,7 +375,7 @@ def _scanner_namespace(
     saves = []
     cooldowns = []
     last_candle_saves = []
-    namespace, v1_calls = _runtime_registry_namespace(adapter)
+    namespace, v1_calls = _runtime_registry_namespace(adapter, gate=gate)
 
     def save_positions(positions):
         saves.append(copy.deepcopy(positions))
@@ -751,6 +757,175 @@ def test_productive_scanner_restart_recovers_committed_register_without_current_
         if event.operation == "REGISTER" and event.state == wal.EVENT_COMMITTED
     ] == committed
     assert observed["v1_calls"] == []
+
+
+def test_productive_scanner_gate_false_restart_recovers_committed_register_without_v1(
+    tmp_path,
+):
+    first_adapter = _LifecycleAdapter(
+        paper.RegistryV2PaperRuntimeAdapter(enabled=True, storage_dir=tmp_path)
+    )
+    signal = _position(id="TURTLE20:BTCUSDT:LONG")
+    first, first_observed = _scanner_namespace(first_adapter, signal, save_ok=False)
+
+    _run_scanner_once(first)
+
+    committed = [
+        event
+        for event in _storage_events(tmp_path)
+        if event.operation == "REGISTER" and event.state == wal.EVENT_COMMITTED
+    ]
+    assert len(committed) == 1
+    execution_id = committed[0].execution_id
+    assert first_observed["state"]["positions"] == {}
+
+    restarted_adapter = _LifecycleAdapter(
+        paper.RegistryV2PaperRuntimeAdapter(enabled=False, storage_dir=tmp_path)
+    )
+    restarted, observed = _scanner_namespace(
+        restarted_adapter,
+        signal,
+        gate=False,
+        state={"positions": {}, "last_candles": {}, "save_ok": True},
+        risk_guard=lambda _sig: (False, {"reasons": ["current_deny"], "warnings": []}),
+    )
+
+    _run_scanner_once(restarted)
+
+    assert restarted_adapter.register_calls == 0
+    assert observed["state"]["risk_calls"] == 0
+    recovered = observed["state"]["positions"][signal["id"]]
+    assert recovered["execution_id"] == recovered["lifecycle_id"] == execution_id
+    assert recovered["registry_v2_routed"] is True
+    assert recovered["registry_v2_register_idempotency_key"].startswith(
+        "turtle-paper-register-occurrence:v1:"
+    )
+    assert observed["v1_calls"] == []
+    assert [
+        event
+        for event in _storage_events(tmp_path)
+        if event.operation == "REGISTER" and event.state == wal.EVENT_COMMITTED
+    ] == committed
+
+
+def test_productive_scanner_gate_false_recovery_save_failure_retries_without_republish(
+    tmp_path,
+):
+    signal = _position(id="TURTLE20:BTCUSDT:LONG")
+
+    # A: an enabled V2 REGISTER commits, but the local card does not persist.
+    first_adapter = _LifecycleAdapter(
+        paper.RegistryV2PaperRuntimeAdapter(enabled=True, storage_dir=tmp_path)
+    )
+    first, first_observed = _scanner_namespace(first_adapter, signal, save_ok=False)
+
+    _run_scanner_once(first)
+
+    committed = [
+        event
+        for event in _storage_events(tmp_path)
+        if event.operation == "REGISTER" and event.state == wal.EVENT_COMMITTED
+    ]
+    assert len(committed) == 1
+    execution_id = committed[0].execution_id
+    assert len(first_observed["saves"]) == 1
+    first_attempt = first_observed["saves"][0][signal["id"]]
+    occurrence_key = first_attempt["registry_v2_register_idempotency_key"]
+    assert first_adapter.register_calls == 1
+    assert first_observed["state"]["risk_calls"] == 1
+    assert first_attempt["execution_id"] == first_attempt["lifecycle_id"] == execution_id
+    assert first_attempt["registry_v2_routed"] is True
+    assert first_observed["state"]["positions"] == {}
+    assert first_observed["signals"] == first_observed["events"] == first_observed["telegram"] == []
+    assert first_observed["cooldowns"] == []
+    assert first_observed["state"]["last_candles"] == {}
+    assert first_observed["last_candle_saves"] == [{}]
+    assert first_observed["v1_calls"] == []
+
+    # B: after restart with the gate off, exact V2 recovery must still fail
+    # closed when the recovered local card cannot be saved.
+    second_adapter = _LifecycleAdapter(
+        paper.RegistryV2PaperRuntimeAdapter(enabled=False, storage_dir=tmp_path)
+    )
+    second, second_observed = _scanner_namespace(
+        second_adapter,
+        signal,
+        gate=False,
+        save_ok=False,
+        state={"positions": {}, "last_candles": {}},
+        risk_guard=lambda _sig: (False, {"reasons": ["current_deny"], "warnings": []}),
+    )
+
+    _run_scanner_once(second)
+
+    assert len(second_observed["saves"]) == 1
+    second_attempt = second_observed["saves"][0][signal["id"]]
+    assert second_adapter.register_calls == 0
+    assert second_observed["state"]["risk_calls"] == 0
+    assert second_attempt["execution_id"] == second_attempt["lifecycle_id"] == execution_id
+    assert second_attempt["registry_v2_routed"] is True
+    assert second_attempt["registry_v2_register_idempotency_key"] == occurrence_key
+    assert second_observed["state"]["positions"] == {}
+    assert second_observed["signals"] == second_observed["events"] == second_observed["telegram"] == []
+    assert second_observed["cooldowns"] == []
+    assert second_observed["state"]["last_candles"] == {}
+    assert second_observed["last_candle_saves"] == [{}]
+    assert second_observed["v1_calls"] == []
+    assert [
+        event
+        for event in _storage_events(tmp_path)
+        if event.operation == "REGISTER" and event.state == wal.EVENT_COMMITTED
+    ] == committed
+
+    # C: a later gate-off retry persists the same recovered V2 card and only
+    # then publishes the normal local success effects.
+    third_adapter = _LifecycleAdapter(
+        paper.RegistryV2PaperRuntimeAdapter(enabled=False, storage_dir=tmp_path)
+    )
+    third, third_observed = _scanner_namespace(
+        third_adapter,
+        signal,
+        gate=False,
+        state={"positions": {}, "last_candles": {}},
+        risk_guard=lambda _sig: (False, {"reasons": ["current_deny"], "warnings": []}),
+    )
+
+    _run_scanner_once(third)
+
+    assert len(third_observed["saves"]) == 1
+    assert third_adapter.register_calls == 0
+    assert third_observed["state"]["risk_calls"] == 0
+    recovered = third_observed["state"]["positions"][signal["id"]]
+    assert recovered["execution_id"] == recovered["lifecycle_id"] == execution_id
+    assert recovered["registry_v2_routed"] is True
+    assert recovered["registry_v2_register_idempotency_key"] == occurrence_key
+    assert third_observed["state"]["last_candles"] == {"BTCUSDT": 1_700_000_000}
+    assert len(third_observed["signals"]) == len(third_observed["events"]) == len(third_observed["telegram"]) == 1
+    assert len(third_observed["cooldowns"]) == 1
+    assert third_observed["v1_calls"] == []
+    assert [
+        event
+        for event in _storage_events(tmp_path)
+        if event.operation == "REGISTER" and event.state == wal.EVENT_COMMITTED
+    ] == committed
+
+
+def test_productive_scanner_gate_false_without_committed_register_preserves_v1_open(
+    tmp_path,
+):
+    adapter = _LifecycleAdapter(
+        paper.RegistryV2PaperRuntimeAdapter(enabled=False, storage_dir=tmp_path)
+    )
+    signal = _position(id="TURTLE20:BTCUSDT:LONG")
+    scanner, observed = _scanner_namespace(adapter, signal, gate=False)
+
+    _run_scanner_once(scanner)
+
+    assert adapter.register_calls == 0
+    assert observed["state"]["risk_calls"] == 1
+    assert [call[0] for call in observed["v1_calls"]] == ["register_open_trade"]
+    opened = observed["state"]["positions"][signal["id"]]
+    assert opened.get("registry_v2_routed") is not True
 
 
 def test_productive_scanner_committed_recovery_bypasses_all_current_new_entry_gates(tmp_path):

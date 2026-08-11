@@ -42,6 +42,8 @@ import importlib.util
 import ctypes
 from pathlib import Path
 
+from registry_execution_identity import is_v2_execution_id
+
 try:
     from falcon_live_execution_contract import (
         FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION,
@@ -14259,6 +14261,113 @@ def _trade_registry_sync_qty(position):
     )
 
 
+_TRADE_REGISTRY_V2_TURTLE_REGISTER_OCCURRENCE_PREFIX = (
+    "turtle-paper-register-occurrence:v1:"
+)
+
+
+def _trade_registry_sync_v2_register_source_key_valid(source_key):
+    """Validate Turtle's canonical source occurrence key without local matching."""
+
+    if not isinstance(source_key, str) or source_key != source_key.strip():
+        return False
+    if not source_key.startswith(
+        _TRADE_REGISTRY_V2_TURTLE_REGISTER_OCCURRENCE_PREFIX
+    ):
+        return False
+
+    payload_text = source_key[
+        len(_TRADE_REGISTRY_V2_TURTLE_REGISTER_OCCURRENCE_PREFIX):
+    ]
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != {
+        "setup",
+        "side",
+        "signal_ts",
+        "symbol",
+    }:
+        return False
+
+    setup = payload.get("setup")
+    symbol = payload.get("symbol")
+    side = payload.get("side")
+    signal_ts = payload.get("signal_ts")
+    if (
+        not isinstance(setup, str)
+        or setup != setup.strip().upper()
+        or not setup
+        or not isinstance(symbol, str)
+        or symbol != symbol.strip().upper()
+        or not symbol
+        or side not in {"LONG", "SHORT"}
+        or isinstance(signal_ts, bool)
+        or not isinstance(signal_ts, int)
+    ):
+        return False
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")) == payload_text
+
+
+def _trade_registry_sync_v2_ownership(position):
+    """Classify only explicit local Registry V2 Turtle provenance."""
+
+    if not isinstance(position, dict):
+        return "LEGACY_V1"
+
+    routed_value = position.get("registry_v2_routed")
+    source_key = position.get("registry_v2_register_idempotency_key")
+    result_payload = position.get("registry_v2_result")
+    v2_claimed = (
+        routed_value is not None
+        or source_key is not None
+        or result_payload is not None
+    )
+    if not v2_claimed:
+        # Generic execution_id/lifecycle_id fields are not V2 ownership
+        # claims.  Other legacy bots may legitimately use those names.
+        return "LEGACY_V1"
+
+    execution_id = position.get("execution_id")
+    lifecycle_id = position.get("lifecycle_id")
+    source_key_valid = _trade_registry_sync_v2_register_source_key_valid(source_key)
+    identity_valid = (
+        isinstance(execution_id, str)
+        and isinstance(lifecycle_id, str)
+        and execution_id == lifecycle_id
+        and is_v2_execution_id(execution_id)
+        and is_v2_execution_id(lifecycle_id)
+    )
+    if routed_value is True and identity_valid and source_key_valid:
+        return "EXACT_V2_OWNED"
+    return "MALFORMED_V2_CLAIM"
+
+
+def _trade_registry_sync_protected_signature(bot_key, position):
+    """Return a legacy signature only to suppress an unsafe V1 missing mark."""
+
+    symbol = _trade_registry_sync_symbol(
+        position.get("symbol") or position.get("ativo") or position.get("pair")
+    )
+    side = _trade_registry_sync_side(position)
+    setup = _trade_registry_sync_setup(bot_key, position)
+    if not symbol or side not in {"LONG", "SHORT"}:
+        return None
+
+    signatures = _trade_registry_signature_from_items(
+        [
+            {
+                "bot": bot_key,
+                "symbol": symbol,
+                "side": side,
+                "setup": setup,
+            }
+        ]
+    )
+    return next(iter(signatures), None)
+
+
 def _trade_registry_existing_trade_ids():
     ids = set()
     if central_trade_registry is None:
@@ -14482,6 +14591,8 @@ def sync_trade_registry_from_open_positions(commit=False):
     skipped = []
     errors = []
     candidates = []
+    protected_v2_signatures = set()
+    missing_mutation_blocked = False
 
     existing_signature = set()
     existing_map = {}
@@ -14497,6 +14608,57 @@ def sync_trade_registry_from_open_positions(commit=False):
     for bot_key, module in LOADED_BOTS.items():
         positions = get_open_positions_from_module(module, key=bot_key)
         for position in positions:
+            ownership_state = _trade_registry_sync_v2_ownership(position)
+            if ownership_state != "LEGACY_V1":
+                if ownership_state == "EXACT_V2_OWNED":
+                    # A legacy signature is never V2 ownership authority. It
+                    # is only a post-classification protection key for an
+                    # already proven exact V2 owner.
+                    protected_signature = _trade_registry_sync_protected_signature(
+                        bot_key,
+                        position,
+                    )
+                    if protected_signature:
+                        protected_v2_signatures.add(protected_signature)
+                    else:
+                        # No legacy key can safely connect this exact V2 owner
+                        # to a potentially contaminated V1 row. Preserve V1
+                        # evidence instead of issuing a missing-record
+                        # mutation.
+                        missing_mutation_blocked = True
+                        errors.append(
+                            {
+                                "bot": bot_key,
+                                "error": (
+                                    "REGISTRY_V2_OWNERSHIP_PROTECTION_SIGNATURE_UNAVAILABLE"
+                                ),
+                            }
+                        )
+                else:
+                    # An explicit but malformed V2 claim must never be
+                    # translated through a legacy key.  Suppress missing
+                    # mutations for this sync run and surface the error below.
+                    missing_mutation_blocked = True
+
+                skipped.append(
+                    {
+                        "bot": bot_key,
+                        "reason": ownership_state,
+                        "execution_id": position.get("execution_id"),
+                        "lifecycle_id": position.get("lifecycle_id"),
+                    }
+                )
+                if ownership_state == "MALFORMED_V2_CLAIM":
+                    errors.append(
+                        {
+                            "bot": bot_key,
+                            "error": "REGISTRY_V2_OWNERSHIP_IDENTITY_INVALID",
+                            "execution_id": position.get("execution_id"),
+                            "lifecycle_id": position.get("lifecycle_id"),
+                        }
+                    )
+                continue
+
             candidate = _trade_registry_sync_candidate(bot_key, position)
             
             if not candidate:
@@ -14567,7 +14729,13 @@ def sync_trade_registry_from_open_positions(commit=False):
                 })
 
     candidate_signature_all = _trade_registry_signature_from_items(candidates)
-    removed_keys = sorted(list(existing_signature - candidate_signature_all))
+    removed_keys = sorted(
+        list(
+            existing_signature
+            - candidate_signature_all
+            - protected_v2_signatures
+        )
+    )
 
     removed = []
     for key in removed_keys:
@@ -14585,7 +14753,14 @@ def sync_trade_registry_from_open_positions(commit=False):
         })
 
     missing_mark_result = None
-    if commit and removed:
+    if commit and missing_mutation_blocked:
+        missing_mark_result = {
+            "ok": False,
+            "error": "REGISTRY_V2_OWNERSHIP_MISSING_MUTATION_BLOCKED",
+            "marked_count": 0,
+            "marked": [],
+        }
+    elif commit and removed:
         missing_mark_result = mark_registry_missing_trades(removed)
 
     return {
@@ -14603,6 +14778,7 @@ def sync_trade_registry_from_open_positions(commit=False):
         "removed_count": len(removed),
         "removed": removed[:200],
         "missing_mark_result": missing_mark_result,
+        "v2_ownership_missing_mutation_blocked": missing_mutation_blocked,
         "after": central_trade_registry_snapshot(include_trades=False) if commit else None,
         "note": "GET faz prévia/dry-run. Para importar, use POST com confirm=true ou confirm=SYNC.",
     }

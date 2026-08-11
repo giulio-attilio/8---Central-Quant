@@ -346,6 +346,12 @@ class RegistryV2PaperRuntimeAdapter:
     def enabled(self) -> bool:
         return self._enabled
 
+    @property
+    def has_explicit_paper_storage(self) -> bool:
+        """Whether a caller supplied a storage location for exact read recovery."""
+
+        return self._storage_dir is not None and bool(str(self._storage_dir).strip())
+
     def register_turtle_paper(
         self,
         position: MutableMapping[str, Any],
@@ -392,7 +398,12 @@ class RegistryV2PaperRuntimeAdapter:
     ) -> RegistryV2PaperRuntimeReadResult:
         """Read one exact source-keyed committed Turtle register without writing."""
 
-        preflight = self._preflight(core.REGISTER, execution_mode, registry_mode)
+        preflight = self._preflight(
+            core.REGISTER,
+            execution_mode,
+            registry_mode,
+            allow_disabled_read=True,
+        )
         if isinstance(preflight, RegistryV2PaperRuntimeResult):
             return self._read_from_write_failure(preflight)
         invalid_position = self._require_mutable_position(position, preflight)
@@ -1278,9 +1289,11 @@ class RegistryV2PaperRuntimeAdapter:
         operation: str,
         execution_mode: Any,
         registry_mode: Any,
+        *,
+        allow_disabled_read: bool = False,
     ) -> _Preflight | RegistryV2PaperRuntimeResult:
         mode = _mode_label(execution_mode, registry_mode)
-        if not self.enabled:
+        if not self.enabled and not allow_disabled_read:
             return RegistryV2PaperRuntimeResult(
                 False,
                 REGISTRY_V2_PAPER_RUNTIME_DISABLED,

@@ -793,7 +793,17 @@ def turtle_registry_read_committed_open(sig):
             "status": "REGISTRY_V2_PAPER_SOURCE_OCCURRENCE_INVALID",
             "found": False,
         }
-    result = get_registry_v2_paper_runtime_adapter().read_turtle_paper_committed_register(
+    adapter = get_registry_v2_paper_runtime_adapter()
+    if not adapter.has_explicit_paper_storage:
+        # No configured V2 evidence location means no durable V2 fact can be
+        # probed here.  Preserve the established gate-off V1 path for a
+        # genuinely new occurrence.
+        return {
+            "ok": True,
+            "status": "REGISTRY_V2_PAPER_RECOVERY_STORAGE_NOT_CONFIGURED",
+            "found": False,
+        }
+    result = adapter.read_turtle_paper_committed_register(
         sig,
         execution_mode="PAPER",
         registry_mode="PAPER",
@@ -1554,28 +1564,31 @@ def scanner_loop():
                     if not sig:
                         continue
 
-                    recovery_result = None
-                    recovered_committed_register = False
-                    if REGISTRY_V2_PAPER_WRITE_ENABLED:
-                        # A source-keyed REGISTER already committed before a
-                        # local-save crash is historical execution fact. Read
-                        # it before any fresh-risk decision, never by logical
-                        # trade, and fail closed if its evidence is unsafe.
-                        recovery_result = turtle_registry_read_committed_open(sig)
-                        if (
-                            not isinstance(recovery_result, dict)
-                            or recovery_result.get("ok") is not True
-                        ):
-                            symbol_candle_completed = False
-                            # An unresolved V2 fact must not permit a second
-                            # setup on this symbol to create a new entry.
-                            break
-                        recovered_committed_register = recovery_result.get("found") is True
-                        if not recovered_committed_register and len(positions) >= MAX_OPEN_POSITIONS:
-                            # Keep probing the remaining setups for committed
-                            # facts, but leave this new occurrence retryable.
-                            symbol_candle_completed = False
-                            continue
+                    # A source-keyed REGISTER already committed before a
+                    # local-save crash is historical execution fact. Read it
+                    # before any fresh-risk decision even after the V2 write
+                    # gate is turned off.  The adapter read is exact and
+                    # read-only; a genuinely new gate-off occurrence still
+                    # continues through the legacy V1 branch below.
+                    recovery_result = turtle_registry_read_committed_open(sig)
+                    if (
+                        not isinstance(recovery_result, dict)
+                        or recovery_result.get("ok") is not True
+                    ):
+                        symbol_candle_completed = False
+                        # An unresolved V2 fact must not permit a second
+                        # setup on this symbol to create a new entry.
+                        break
+                    recovered_committed_register = recovery_result.get("found") is True
+                    if (
+                        REGISTRY_V2_PAPER_WRITE_ENABLED
+                        and not recovered_committed_register
+                        and len(positions) >= MAX_OPEN_POSITIONS
+                    ):
+                        # Keep probing the remaining setups for committed
+                        # facts, but leave this new occurrence retryable.
+                        symbol_candle_completed = False
+                        continue
 
                     if not recovered_committed_register:
                         if should_skip_due_to_open_position(positions, symbol, setup_key, sig["side"]):
@@ -1634,10 +1647,11 @@ def scanner_loop():
                             break
                     positions[pid] = sig
                     local_saved = save_positions(positions)
-                    if REGISTRY_V2_PAPER_WRITE_ENABLED and not local_saved:
+                    if turtle_registry_is_v2_routed(sig) and not local_saved:
                         # The committed V2 occurrence can be recovered on the
-                        # same factual candle after a crash/restart; do not
-                        # publish a local birth that failed to persist.
+                        # same factual candle after a crash/restart, even when
+                        # the write gate has since been disabled; do not publish
+                        # a local birth that failed to persist.
                         positions.pop(pid, None)
                         symbol_candle_completed = False
                         break
