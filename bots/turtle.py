@@ -2161,24 +2161,40 @@ def slim_stats(stats):
     return stats
     
 
+def _trades_today_from_rows(rows, br_date):
+    return [t for t in rows if trade_date_matches(t, br_date)]
+
+
+def _trades_month_from_rows(rows, br_month):
+    return [t for t in rows if trade_month_matches(t, br_month)]
+
+
+def _signals_today_from_rows(rows, br_date):
+    return [s for s in rows if signal_date_matches(s, br_date)]
+
+
+def _signals_month_from_rows(rows, br_month):
+    return [s for s in rows if br_month in str(s.get("created_at", ""))]
+
+
 def trades_today():
     br_date = date_key_br()
-    return [t for t in get_trades() if trade_date_matches(t, br_date)]
+    return _trades_today_from_rows(get_trades(), br_date)
 
 
 def trades_month():
     br_month = month_key_br()
-    return [t for t in get_trades() if trade_month_matches(t, br_month)]
+    return _trades_month_from_rows(get_trades(), br_month)
 
 
 def signals_today():
     br_date = date_key_br()
-    return [s for s in get_signals() if signal_date_matches(s, br_date)]
+    return _signals_today_from_rows(get_signals(), br_date)
 
 
 def signals_month():
     br_month = month_key_br()
-    return [s for s in get_signals() if br_month in str(s.get("created_at", ""))]
+    return _signals_month_from_rows(get_signals(), br_month)
 
 
 def split_by_setup(items):
@@ -2231,11 +2247,14 @@ def get_open_runner():
 def refresh_health_stats():
     summary_cycle_id = next_memory_observation_cycle_id("turtle-summary")
     summary_load_span = start_memory_workload_span()
-    month_trades = trades_month()
-    month_signals = signals_month()
-    today_trades = trades_today()
-    today_signals = signals_today()
-    today_events = [e for e in get_events() if str(e.get("created_at", "")).startswith(date_key_br())]
+    all_trades = get_trades()
+    all_signals = get_signals()
+    all_events = get_events()
+    month_trades = _trades_month_from_rows(all_trades, month_key_br())
+    month_signals = _signals_month_from_rows(all_signals, month_key_br())
+    today_trades = _trades_today_from_rows(all_trades, date_key_br())
+    today_signals = _signals_today_from_rows(all_signals, date_key_br())
+    today_events = [e for e in all_events if str(e.get("created_at", "")).startswith(date_key_br())]
     summary_analytics_span = transition_memory_phase_observation(
         "TURTLE_SUMMARY_LOAD_MEMORY",
         summary_load_span,

@@ -80,11 +80,14 @@ def _namespace(calls: list, *, real_observability: bool = False) -> dict:
             "rss_peak_mb": 100.0,
             "items_processed": 0,
         },
-        "trades_month": loaded("trades_month", month_trades),
-        "signals_month": loaded("signals_month", month_signals),
-        "trades_today": loaded("trades_today", today_trades),
-        "signals_today": loaded("signals_today", today_signals),
+        "get_trades": loaded("get_trades", month_trades + today_trades),
+        "get_signals": loaded("get_signals", month_signals + today_signals),
         "get_events": loaded("get_events", events),
+        "_trades_month_from_rows": lambda _rows, _key: month_trades,
+        "_signals_month_from_rows": lambda _rows, _key: month_signals,
+        "_trades_today_from_rows": lambda _rows, _key: today_trades,
+        "_signals_today_from_rows": lambda _rows, _key: today_signals,
+        "month_key_br": lambda: "08/2026",
         "date_key_br": lambda: "12/08/2026",
         "calc_stats": calc_stats,
         "slim_stats": lambda stats: dict(stats),
@@ -131,7 +134,7 @@ class TurtleSummaryMemoryPhaseObservabilityTests(unittest.TestCase):
 
         self.assertIsNone(refresh())
 
-        for name in ("trades_month", "signals_month", "trades_today", "signals_today", "get_events"):
+        for name in ("get_trades", "get_signals", "get_events"):
             self.assertEqual(calls.count(name), 1)
         load_event = next(item for item in calls if isinstance(item, tuple) and item[0] == "load_observation")
         analytics_event = next(item for item in calls if isinstance(item, tuple) and item[0] == "analytics_observation")
@@ -213,8 +216,10 @@ class TurtleSummaryMemoryPhaseObservabilityTests(unittest.TestCase):
             for node in ast.walk(refresh)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         ]
-        for name in ("trades_month", "signals_month", "trades_today", "signals_today", "get_events"):
+        for name in ("get_trades", "get_signals", "get_events"):
             self.assertEqual(called_names.count(name), 1)
+        for name in ("trades_month", "signals_month", "trades_today", "signals_today"):
+            self.assertEqual(called_names.count(name), 0)
 
         helper_source = (ROOT / "memory_source_observability.py").read_text(encoding="utf-8")
         helper_tree = ast.parse(helper_source)
