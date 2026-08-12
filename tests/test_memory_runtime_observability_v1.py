@@ -152,15 +152,20 @@ class MemoryRuntimeObservabilityV1Tests(unittest.TestCase):
                 return 13
 
         class FakeTime:
-            monotonic_values = iter((100.0, 100.125))
-
-            @classmethod
-            def monotonic(cls):
-                return next(cls.monotonic_values)
-
             @staticmethod
             def sleep(seconds):
                 sleep_calls.append(seconds)
+
+        def coordinate_memory_gc(**kwargs):
+            collected = kwargs["collect_fn"]()
+            kwargs["trim_fn"]()
+            return {
+                "executed": True,
+                "collected": collected,
+                "cleanup_elapsed_ms": 125.0,
+                "qualified": True,
+                "skipped": False,
+            }
 
         namespace = {
             "memory_snapshot": memory_snapshot,
@@ -168,6 +173,10 @@ class MemoryRuntimeObservabilityV1Tests(unittest.TestCase):
             "gc": FakeGc(),
             "time": FakeTime(),
             "malloc_trim_safe": lambda: trim_calls.append(True),
+            "current_rss_mb": lambda: 900.0,
+            "coordinate_memory_gc": coordinate_memory_gc,
+            "emit_memory_gc_skipped": lambda *_args, **_kwargs: False,
+            "emit_memory_source_observation": lambda *_args, **_kwargs: True,
         }
         force_gc_if_needed = _compile_function("force_gc_if_needed", namespace)
 

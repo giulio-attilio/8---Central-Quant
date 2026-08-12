@@ -24,6 +24,9 @@ import traceback
 from datetime import datetime
 from collections import Counter
 
+from memory_gc_coordinator import coordinate_memory_gc, emit_memory_gc_skipped
+from memory_source_observability import emit_memory_source_observation
+
 VERSION = "2026-07-05-MEMORY-PROFILER-V1.4"
 
 DATA_DIR = os.environ.get("CENTRAL_DATA_DIR", "/opt/render/project/src/data")
@@ -311,7 +314,24 @@ def _save_state(snapshot):
         json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
-def _run_gc_if_needed(mem, force=False):
+def _profiler_malloc_trim_safe():
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+        return True
+    except Exception:
+        return False
+
+
+def _profiler_current_rss_mb():
+    try:
+        return (_get_process_memory() or {}).get("rss_mb")
+    except Exception:
+        return None
+
+
+def _run_gc_if_needed(mem, force=False, reason="memory_profiler"):
     rss = (mem or {}).get("rss_mb")
     should_gc = bool(force)
 
@@ -329,19 +349,28 @@ def _run_gc_if_needed(mem, force=False):
         }
 
     try:
-        collected = gc.collect()
-        try:
-            import ctypes
-            libc = ctypes.CDLL("libc.so.6")
-            libc.malloc_trim(0)
-        except Exception:
-            pass
+        coordination = coordinate_memory_gc(
+            reason=f"memory_profiler:{reason}",
+            force=force,
+            threshold_mb=GC_THRESHOLD_MB,
+            rss_before_mb=rss,
+            current_rss_fn=_profiler_current_rss_mb,
+            collect_fn=gc.collect,
+            trim_fn=_profiler_malloc_trim_safe,
+        )
+        emit_memory_gc_skipped(
+            coordination,
+            emit_fn=emit_memory_source_observation,
+        )
 
-        return {
-            "executed": True,
-            "collected": collected,
+        result = {
+            "executed": bool(coordination.get("executed")),
+            "collected": coordination.get("collected"),
             "threshold_mb": GC_THRESHOLD_MB,
         }
+        if coordination.get("skipped"):
+            result["skip_reason"] = coordination.get("skip_reason")
+        return result
     except Exception as e:
         return {
             "executed": False,
@@ -359,7 +388,11 @@ def collect_memory_snapshot(reason="manual", include_gc=False, include_tracemall
 
     with _snapshot_lock:
         mem_before = _get_process_memory()
-        gc_action = _run_gc_if_needed(mem_before, force=force_gc)
+        gc_action = _run_gc_if_needed(
+            mem_before,
+            force=force_gc,
+            reason=reason,
+        )
         mem = _get_process_memory() if gc_action.get("executed") else mem_before
 
         if include_gc:

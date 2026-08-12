@@ -42,6 +42,8 @@ import importlib.util
 import ctypes
 from pathlib import Path
 
+from memory_gc_coordinator import coordinate_memory_gc, emit_memory_gc_skipped
+from memory_source_observability import emit_memory_source_observation
 from registry_execution_identity import is_v2_execution_id
 
 try:
@@ -884,14 +886,28 @@ def _memory_cleanup(reason="request", force=False):
         before_mb = current_rss_mb()
         should_gc = bool(force or (before_mb or 0) >= MEMORY_GC_THRESHOLD_MB)
         collected = None
+        gc_executed = False
         if should_gc:
-            collected = gc.collect()
-            malloc_trim_safe()
+            coordination = coordinate_memory_gc(
+                reason=reason,
+                force=force,
+                threshold_mb=MEMORY_GC_THRESHOLD_MB,
+                rss_before_mb=before_mb,
+                current_rss_fn=current_rss_mb,
+                collect_fn=gc.collect,
+                trim_fn=malloc_trim_safe,
+            )
+            gc_executed = bool(coordination.get("executed"))
+            collected = coordination.get("collected")
+            emit_memory_gc_skipped(
+                coordination,
+                emit_fn=emit_memory_source_observation,
+            )
         after_mb = current_rss_mb()
         return {
             "ok": True,
             "reason": reason,
-            "gc_executed": should_gc,
+            "gc_executed": gc_executed,
             "collected": collected,
             "rss_before_mb": before_mb,
             "rss_after_mb": after_mb,
@@ -2121,23 +2137,30 @@ def force_gc_if_needed(label="gc", force=False):
     should_gc = bool(force or before_mb >= MEMORY_GC_THRESHOLD_MB)
     collected = None
     gc_elapsed_ms = None
+    gc_executed = False
     if should_gc:
-        try:
-            gc_started = time.monotonic()
-        except Exception:
-            gc_started = None
-        collected = gc.collect()
-        malloc_trim_safe()
-        if gc_started is not None:
-            try:
-                gc_elapsed_ms = round((time.monotonic() - gc_started) * 1000.0, 2)
-            except Exception:
-                gc_elapsed_ms = None
-        time.sleep(0.05)
+        coordination = coordinate_memory_gc(
+            reason=label,
+            force=force,
+            threshold_mb=MEMORY_GC_THRESHOLD_MB,
+            rss_before_mb=before_mb,
+            current_rss_fn=current_rss_mb,
+            collect_fn=gc.collect,
+            trim_fn=malloc_trim_safe,
+        )
+        gc_executed = bool(coordination.get("executed"))
+        collected = coordination.get("collected")
+        gc_elapsed_ms = coordination.get("cleanup_elapsed_ms")
+        emit_memory_gc_skipped(
+            coordination,
+            emit_fn=emit_memory_source_observation,
+        )
+        if gc_executed:
+            time.sleep(0.05)
     after = memory_snapshot(
         f"{label}_after_gc",
         extra={
-            "gc_executed": should_gc,
+            "gc_executed": gc_executed,
             "collected": collected,
             "rss_before_mb": before_mb,
             "gc_elapsed_ms": gc_elapsed_ms,
@@ -2153,7 +2176,7 @@ def force_gc_if_needed(label="gc", force=False):
         "rss_after_gc_mb": after_mb,
         "rss_freed_mb": rss_freed_mb,
     })
-    if should_gc:
+    if gc_executed:
         try:
             print(
                 f"MEMORY GC | reason={label} | "
