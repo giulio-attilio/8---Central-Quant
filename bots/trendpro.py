@@ -57,6 +57,11 @@ from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
+from memory_source_observability import (
+    finish_memory_workload_span,
+    observe_memory_workload_items,
+    start_memory_workload_span,
+)
 
 try:
     import trade_registry as central_trade_registry
@@ -5029,6 +5034,7 @@ def scanner():
     )
 
     while True:
+        scanner_memory_span = start_memory_workload_span()
         try:
             HEALTH["last_scanner_run"] = data_hora_sp_str()
             gerenciar_posicoes()
@@ -5069,10 +5075,16 @@ def scanner():
                 HEALTH["last_signals_sent"] = 0
                 HEALTH["last_success"] = data_hora_sp_str()
                 HEALTH["last_error"] = None
+                finish_memory_workload_span(
+                    "SCANNER_CYCLE_MEMORY",
+                    scanner_memory_span,
+                    bot="TRENDPRO",
+                    include_symbols_processed=True,
+                )
                 time.sleep(60)
                 continue
 
-            for symbol in watchlist:
+            for symbol in observe_memory_workload_items(watchlist, scanner_memory_span):
                 try:
                     registrar_funil("ativos_analisados")
                     if startup_signal_guard_active():
@@ -5251,6 +5263,12 @@ def scanner():
             HEALTH["last_error"] = str(e)
             print("ERRO SCANNER:", e)
 
+        finish_memory_workload_span(
+            "SCANNER_CYCLE_MEMORY",
+            scanner_memory_span,
+            bot="TRENDPRO",
+            include_symbols_processed=True,
+        )
         time.sleep(60)
 
 

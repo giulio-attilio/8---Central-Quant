@@ -57,6 +57,11 @@ from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
+from memory_source_observability import (
+    finish_memory_workload_span,
+    observe_memory_workload_items,
+    start_memory_workload_span,
+)
 
 # ====================================================
 # CENTRAL QUANT — TRADE REGISTRY
@@ -4081,6 +4086,7 @@ def scanner():
         print("STARTUP MEME: mensagem de inicialização suprimida por cooldown")
 
     while True:
+        scanner_memory_span = start_memory_workload_span()
         try:
             HEALTH["last_scanner_run"] = data_hora_sp_str()
             gerenciar_posicoes()
@@ -4115,7 +4121,7 @@ def scanner():
             sinais = []
             sinais_enviados = 0
 
-            for symbol in watchlist:
+            for symbol in observe_memory_workload_items(watchlist, scanner_memory_span):
                 try:
                     # Posições ativas: na V2, a gestão fica com TP50/BE/trailing.
                     # POI herdado do Trend PRO fica desligado por padrão para evitar reentradas ruins em memes.
@@ -4277,6 +4283,12 @@ def scanner():
             HEALTH["last_error"] = str(e)
             print("ERRO SCANNER:", e)
 
+        finish_memory_workload_span(
+            "SCANNER_CYCLE_MEMORY",
+            scanner_memory_span,
+            bot="MEME",
+            include_symbols_processed=True,
+        )
         time.sleep(60)
 
 

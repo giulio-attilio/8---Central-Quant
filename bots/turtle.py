@@ -64,6 +64,11 @@ from upstash_redis import Redis
 from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
+from memory_source_observability import (
+    finish_memory_workload_span,
+    observe_memory_workload_items,
+    start_memory_workload_span,
+)
 
 # ==============================================================================
 # TRADE REGISTRY — CENTRAL QUANT
@@ -1530,6 +1535,7 @@ def scanner_loop():
     started = time.time()
 
     while True:
+        scanner_memory_span = start_memory_workload_span()
         signals_sent = 0
 
         try:
@@ -1537,7 +1543,7 @@ def scanner_loop():
             watchlist = load_watchlist()
             last_candles = get_last_candles_by_symbol()
 
-            for symbol in watchlist:
+            for symbol in observe_memory_workload_items(watchlist, scanner_memory_span):
                 # Gate OFF preserves the original early new-entry limit. With
                 # V2 on, an already committed source occurrence must still be
                 # reconstructed before current new-entry gates can reject it.
@@ -1679,6 +1685,12 @@ def scanner_loop():
             HEALTH["last_error"] = f"scanner: {exc}"
             traceback.print_exc()
 
+        finish_memory_workload_span(
+            "SCANNER_CYCLE_MEMORY",
+            scanner_memory_span,
+            bot="TURTLE",
+            include_symbols_processed=True,
+        )
         time.sleep(SCAN_SLEEP_SECONDS)
 
 # ==============================================================================
@@ -2465,12 +2477,18 @@ def maybe_send_monthly_summary():
 
 def summary_loop():
     while True:
+        summary_memory_span = start_memory_workload_span()
         try:
             maybe_send_daily_summary()
             maybe_send_monthly_summary()
             refresh_health_stats()
         except Exception as exc:
             HEALTH["last_warning"] = f"summary: {exc}"
+        finish_memory_workload_span(
+            "SUMMARY_CYCLE_MEMORY",
+            summary_memory_span,
+            bot="TURTLE",
+        )
         time.sleep(30)
 
 # ==============================================================================

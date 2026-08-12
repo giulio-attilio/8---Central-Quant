@@ -1,4 +1,4 @@
-"""Small, fail-open process-memory spans for existing full-file reads.
+"""Small, fail-open process-memory observations for bounded workloads.
 
 This module is intentionally stdlib-only and never imports ``main``. Runtime
 identity is discovered only from modules that are already loaded.
@@ -39,6 +39,98 @@ def memory_source_current_rss_mb() -> float | None:
     except Exception:
         return None
     return None
+
+
+def start_memory_workload_span() -> dict[str, int | float | None]:
+    """Start a scalar-only process RSS span; never retain workload content."""
+
+    try:
+        rss_start_mb = memory_source_current_rss_mb()
+        return {
+            "started_at": time.monotonic(),
+            "rss_start_mb": rss_start_mb,
+            "rss_peak_mb": rss_start_mb,
+            "items_processed": 0,
+        }
+    except Exception:
+        return {
+            "started_at": None,
+            "rss_start_mb": None,
+            "rss_peak_mb": None,
+            "items_processed": 0,
+        }
+
+
+def _observe_memory_workload_boundary(
+    span: dict[str, int | float | None] | None,
+) -> None:
+    """Update only the counter and scalar RSS peak for one completed item."""
+
+    try:
+        if not isinstance(span, dict):
+            return
+        span["items_processed"] = int(span.get("items_processed") or 0) + 1
+        rss_mb = memory_source_current_rss_mb()
+        span["rss_peak_mb"] = _max_scalar(span.get("rss_peak_mb"), rss_mb)
+    except Exception:
+        pass
+
+
+def observe_memory_workload_items(
+    items: Any,
+    span: dict[str, int | float | None] | None,
+) -> Any:
+    """Yield existing items unchanged and sample RSS after each item boundary."""
+
+    for item in items:
+        try:
+            yield item
+        finally:
+            _observe_memory_workload_boundary(span)
+
+
+def finish_memory_workload_span(
+    event_name: str,
+    span: dict[str, int | float | None] | None,
+    *,
+    bot: str,
+    include_symbols_processed: bool = False,
+) -> bool:
+    """Finish and emit a compact workload span without affecting its caller."""
+
+    try:
+        if not isinstance(span, dict):
+            return False
+        rss_end_mb = memory_source_current_rss_mb()
+        rss_peak_mb = _max_scalar(span.get("rss_peak_mb"), rss_end_mb)
+        started_at = span.get("started_at")
+        elapsed_ms = (
+            round((time.monotonic() - float(started_at)) * 1000.0, 2)
+            if isinstance(started_at, (int, float)) and not isinstance(started_at, bool)
+            else None
+        )
+        rss_start_mb = span.get("rss_start_mb")
+        rss_delta_mb = (
+            round(float(rss_end_mb) - float(rss_start_mb), 2)
+            if isinstance(rss_start_mb, (int, float))
+            and not isinstance(rss_start_mb, bool)
+            and isinstance(rss_end_mb, (int, float))
+            and not isinstance(rss_end_mb, bool)
+            else None
+        )
+        fields = {"bot": bot}
+        if include_symbols_processed:
+            fields["symbols_processed"] = int(span.get("items_processed") or 0)
+        fields.update({
+            "elapsed_ms": elapsed_ms,
+            "rss_start_mb": rss_start_mb,
+            "rss_end_mb": rss_end_mb,
+            "rss_delta_mb": rss_delta_mb,
+            "rss_peak_mb": rss_peak_mb,
+        })
+        return emit_memory_source_observation(event_name, **fields)
+    except Exception:
+        return False
 
 
 def _sampled_at() -> str:
@@ -155,6 +247,9 @@ def observe_registry_v2_wal_memory(**fields: Any) -> bool:
 
 __all__ = [
     "emit_memory_source_observation",
+    "finish_memory_workload_span",
     "memory_source_current_rss_mb",
+    "observe_memory_workload_items",
     "observe_registry_v2_wal_memory",
+    "start_memory_workload_span",
 ]
