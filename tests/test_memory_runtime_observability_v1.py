@@ -7,6 +7,7 @@ import threading
 import unittest
 from collections import deque
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -33,10 +34,17 @@ def _compile_function(name, namespace):
 
 class MemoryRuntimeObservabilityV1Tests(unittest.TestCase):
     def _snapshot_namespace(self, include_boot_id=True):
+        class FixedDatetime:
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 12, 9, 1, 23, 456000, tzinfo=tz)
+
         namespace = {
             "os": os,
             "threading": threading,
             "gc": gc,
+            "datetime": FixedDatetime,
+            "TIMEZONE_BR": timezone(timedelta(hours=-3)),
             "current_rss_mb": lambda: 875.35,
             "memory_usage_pct": lambda rss: 42.74,
             "data_hora_sp_str": lambda: "2026-08-12 12:00:00",
@@ -66,9 +74,14 @@ class MemoryRuntimeObservabilityV1Tests(unittest.TestCase):
         self.assertEqual(snapshot["ppid"], os.getppid())
         self.assertEqual(snapshot["thread"], threading.current_thread().name)
         self.assertEqual(snapshot["boot_id"], "boot-test-1234")
+        self.assertEqual(snapshot["sampled_at"], "2026-08-12T09:01:23.456-03:00")
         self.assertEqual(snapshot["seq"], 7)
         rendered = output.getvalue()
-        self.assertIn("MEMORY memory_loop | rss=875.35 MB | usage=42.74%", rendered)
+        self.assertIn(
+            "MEMORY memory_loop | sampled_at=2026-08-12T09:01:23.456-03:00 | "
+            "rss=875.35 MB | usage=42.74%",
+            rendered,
+        )
         self.assertIn(f"pid={os.getpid()} | ppid={os.getppid()}", rendered)
         self.assertIn("thread=MainThread | boot_id=boot-test-1234 | seq=7", rendered)
 
@@ -112,6 +125,86 @@ class MemoryRuntimeObservabilityV1Tests(unittest.TestCase):
         self.assertEqual([sample[1]["seq"] for sample in samples], [1, 2])
         self.assertTrue(all(sample[0] == "memory_loop" for sample in samples))
         self.assertTrue(all(sample[2] is True and sample[3] is True for sample in samples))
+
+    def test_force_gc_logs_elapsed_and_rss_delta_without_changing_gc_decision(self):
+        snapshots = []
+        sleep_calls = []
+        trim_calls = []
+
+        def memory_snapshot(label, extra=None, store=True, print_log=False):
+            rss = 900.0 if label.endswith("_before_gc") else 725.25
+            snapshot = {
+                "label": label,
+                "sampled_at": "2026-08-12T09:02:03.456-03:00",
+                "rss_mb": rss,
+                "pid": 67,
+                "ppid": 1,
+                "thread": "central-memory-monitor",
+                "boot_id": "boot-test-1234",
+            }
+            snapshot.update(dict(extra or {}))
+            snapshots.append(snapshot)
+            return snapshot
+
+        class FakeGc:
+            @staticmethod
+            def collect():
+                return 13
+
+        class FakeTime:
+            monotonic_values = iter((100.0, 100.125))
+
+            @classmethod
+            def monotonic(cls):
+                return next(cls.monotonic_values)
+
+            @staticmethod
+            def sleep(seconds):
+                sleep_calls.append(seconds)
+
+        namespace = {
+            "memory_snapshot": memory_snapshot,
+            "MEMORY_GC_THRESHOLD_MB": 380,
+            "gc": FakeGc(),
+            "time": FakeTime(),
+            "malloc_trim_safe": lambda: trim_calls.append(True),
+        }
+        force_gc_if_needed = _compile_function("force_gc_if_needed", namespace)
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            before, after = force_gc_if_needed("memory_loop")
+
+        self.assertEqual(before["rss_mb"], 900.0)
+        self.assertEqual(after["rss_mb"], 725.25)
+        self.assertEqual(after["gc_elapsed_ms"], 125.0)
+        self.assertEqual(after["rss_before_gc_mb"], 900.0)
+        self.assertEqual(after["rss_after_gc_mb"], 725.25)
+        self.assertEqual(after["rss_freed_mb"], 174.75)
+        self.assertEqual(sleep_calls, [0.05])
+        self.assertEqual(trim_calls, [True])
+        self.assertEqual(len(snapshots), 2)
+        rendered = output.getvalue()
+        self.assertIn("MEMORY GC | reason=memory_loop", rendered)
+        self.assertIn("freed_mb=174.75 | elapsed_ms=125.0", rendered)
+        self.assertIn("pid=67 | ppid=1 | thread=central-memory-monitor", rendered)
+
+    def test_memory_logs_request_immediate_flush(self):
+        for function_name in ("memory_snapshot", "force_gc_if_needed"):
+            function = _function_node(function_name)
+            print_calls = [
+                call
+                for call in ast.walk(function)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "print"
+            ]
+            self.assertTrue(print_calls)
+            for call in print_calls:
+                keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+                flush = keywords.get("flush")
+                self.assertIsInstance(flush, ast.Constant)
+                self.assertIs(flush.value, True)
 
     def test_boot_id_and_memory_monitor_thread_name_are_declared_once(self):
         self.assertEqual(

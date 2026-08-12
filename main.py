@@ -2037,6 +2037,25 @@ def memory_usage_pct(rss_mb=None):
 
 
 def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
+    sampled_at = None
+    try:
+        datetime_cls = globals().get("datetime")
+        timezone_value = globals().get("TIMEZONE_BR")
+        if datetime_cls is not None:
+            sampled_dt = (
+                datetime_cls.now(timezone_value)
+                if timezone_value is not None
+                else datetime_cls.now().astimezone()
+            )
+            sampled_at = sampled_dt.isoformat(timespec="milliseconds")
+    except Exception:
+        sampled_at = None
+    if not sampled_at:
+        try:
+            sampled_at = data_hora_sp_str()
+        except Exception:
+            sampled_at = "unknown"
+
     rss = current_rss_mb()
     try:
         pid = os.getpid()
@@ -2068,6 +2087,7 @@ def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
     if isinstance(extra, dict):
         snap.update(extra)
     snap.update({
+        "sampled_at": sampled_at,
         "pid": pid,
         "ppid": ppid,
         "thread": thread_name,
@@ -2081,6 +2101,7 @@ def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
     if print_log:
         print(
             f"MEMORY {snap.get('label')} | "
+            f"sampled_at={snap.get('sampled_at')} | "
             f"rss={snap.get('rss_mb')} MB | "
             f"usage={snap.get('usage_pct')}% | "
             f"threads={snap.get('threads')} | "
@@ -2088,7 +2109,8 @@ def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
             f"ppid={snap.get('ppid')} | "
             f"thread={snap.get('thread')} | "
             f"boot_id={snap.get('boot_id')}"
-            + (f" | seq={snap.get('seq')}" if snap.get("seq") is not None else "")
+            + (f" | seq={snap.get('seq')}" if snap.get("seq") is not None else ""),
+            flush=True,
         )
     return snap
 
@@ -2098,15 +2120,56 @@ def force_gc_if_needed(label="gc", force=False):
     before_mb = before.get("rss_mb") or 0
     should_gc = bool(force or before_mb >= MEMORY_GC_THRESHOLD_MB)
     collected = None
+    gc_elapsed_ms = None
     if should_gc:
+        try:
+            gc_started = time.monotonic()
+        except Exception:
+            gc_started = None
         collected = gc.collect()
         malloc_trim_safe()
+        if gc_started is not None:
+            try:
+                gc_elapsed_ms = round((time.monotonic() - gc_started) * 1000.0, 2)
+            except Exception:
+                gc_elapsed_ms = None
         time.sleep(0.05)
     after = memory_snapshot(
         f"{label}_after_gc",
-        extra={"gc_executed": should_gc, "collected": collected, "rss_before_mb": before_mb},
+        extra={
+            "gc_executed": should_gc,
+            "collected": collected,
+            "rss_before_mb": before_mb,
+            "gc_elapsed_ms": gc_elapsed_ms,
+        },
         store=True,
     )
+    after_mb = after.get("rss_mb")
+    rss_freed_mb = None
+    if isinstance(before_mb, (int, float)) and isinstance(after_mb, (int, float)):
+        rss_freed_mb = round(float(before_mb) - float(after_mb), 2)
+    after.update({
+        "rss_before_gc_mb": before_mb,
+        "rss_after_gc_mb": after_mb,
+        "rss_freed_mb": rss_freed_mb,
+    })
+    if should_gc:
+        try:
+            print(
+                f"MEMORY GC | reason={label} | "
+                f"sampled_at={after.get('sampled_at')} | "
+                f"rss_before_mb={before_mb} | "
+                f"rss_after_mb={after_mb} | "
+                f"freed_mb={rss_freed_mb} | "
+                f"elapsed_ms={gc_elapsed_ms} | "
+                f"pid={after.get('pid')} | "
+                f"ppid={after.get('ppid')} | "
+                f"thread={after.get('thread')} | "
+                f"boot_id={after.get('boot_id')}",
+                flush=True,
+            )
+        except Exception:
+            pass
     return before, after
 
 
