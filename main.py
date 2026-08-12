@@ -1529,6 +1529,10 @@ MEMORY_HISTORY_MAXLEN = int(os.environ.get("MEMORY_HISTORY_MAXLEN", "40"))
 MEMORY_LOG_INTERVAL_SECONDS = int(os.environ.get("MEMORY_LOG_INTERVAL_SECONDS", "300"))
 MEMORY_PROFILE_BOT_STEPS = os.environ.get("MEMORY_PROFILE_BOT_STEPS", "false").strip().lower() in {"1", "true", "yes", "sim", "on"}
 
+# Identidade somente em memória. Cada importação/inicialização do runtime
+# recebe um UUID novo, permitindo distinguir processos e imports independentes.
+CENTRAL_RUNTIME_BOOT_ID = uuid.uuid4().hex
+
 # ==========================================================
 # MEMORY STABILIZATION V2.4.3 — REPORT DIET / RENDER FREE
 # ==========================================================
@@ -2034,6 +2038,23 @@ def memory_usage_pct(rss_mb=None):
 
 def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
     rss = current_rss_mb()
+    try:
+        pid = os.getpid()
+    except Exception:
+        pid = None
+    try:
+        ppid = os.getppid()
+    except Exception:
+        ppid = None
+    try:
+        thread_name = threading.current_thread().name
+    except Exception:
+        thread_name = "unknown"
+    try:
+        boot_id = globals().get("CENTRAL_RUNTIME_BOOT_ID") or "unknown"
+    except Exception:
+        boot_id = "unknown"
+
     snap = {
         "ts": data_hora_sp_str(),
         "label": str(label),
@@ -2046,6 +2067,12 @@ def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
     }
     if isinstance(extra, dict):
         snap.update(extra)
+    snap.update({
+        "pid": pid,
+        "ppid": ppid,
+        "thread": thread_name,
+        "boot_id": boot_id,
+    })
 
     if store:
         with MEMORY_LOCK:
@@ -2056,7 +2083,12 @@ def memory_snapshot(label="snapshot", extra=None, store=True, print_log=False):
             f"MEMORY {snap.get('label')} | "
             f"rss={snap.get('rss_mb')} MB | "
             f"usage={snap.get('usage_pct')}% | "
-            f"threads={snap.get('threads')}"
+            f"threads={snap.get('threads')} | "
+            f"pid={snap.get('pid')} | "
+            f"ppid={snap.get('ppid')} | "
+            f"thread={snap.get('thread')} | "
+            f"boot_id={snap.get('boot_id')}"
+            + (f" | seq={snap.get('seq')}" if snap.get("seq") is not None else "")
         )
     return snap
 
@@ -2145,9 +2177,17 @@ def memory_profile_step(label):
 
 
 def memory_monitor_loop():
+    monitor_seq = 0
     while True:
         try:
-            snap = memory_snapshot("memory_loop", store=True, print_log=True)
+            next_seq = monitor_seq + 1
+            snap = memory_snapshot(
+                "memory_loop",
+                extra={"seq": next_seq},
+                store=True,
+                print_log=True,
+            )
+            monitor_seq = next_seq
             if (snap.get("rss_mb") or 0) >= MEMORY_GC_THRESHOLD_MB:
                 force_gc_if_needed("memory_loop")
         except Exception as exc:
@@ -33040,7 +33080,11 @@ def start_central_runtime_once():
     force_gc_if_needed("after_start_bots", force=True)
 
     threading.Thread(target=central_watchdog_loop, daemon=True).start()
-    threading.Thread(target=memory_monitor_loop, daemon=True).start()
+    threading.Thread(
+        target=memory_monitor_loop,
+        name="central-memory-monitor",
+        daemon=True,
+    ).start()
 
     try:
         if MEMORY_PROFILER_LOADED and memory_profiler:
