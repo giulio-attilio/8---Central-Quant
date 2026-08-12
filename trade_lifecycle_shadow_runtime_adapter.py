@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import trade_lifecycle_manager as lifecycle_manager
+from memory_source_observability import (
+    emit_memory_source_observation,
+    memory_source_current_rss_mb,
+)
 
 
 VERSION = "1.0.0-SHADOW"
@@ -1112,14 +1116,50 @@ class TradeLifecycleShadowRuntimeAdapter:
                 # Re-read under the process lock so another worker's append is
                 # visible even after this process initialized its local index.
                 if self.events_file.exists():
-                    with self.events_file.open("r", encoding="utf-8") as handle:
-                        for line in handle:
+                    rss_before_mb = memory_source_current_rss_mb()
+                    try:
+                        scan_started = time.monotonic()
+                    except Exception:
+                        scan_started = None
+                    file_bytes = None
+                    lines_scanned = 0
+                    try:
+                        with self.events_file.open("r", encoding="utf-8") as handle:
                             try:
-                                row = json.loads(line)
-                            except (json.JSONDecodeError, UnicodeDecodeError):
-                                continue
-                            if isinstance(row, Mapping) and row.get("event_type") == "SHADOW_VALIDATED" and row.get("event_id"):
-                                known.add(str(row["event_id"]))
+                                file_bytes = os.fstat(handle.fileno()).st_size
+                            except Exception:
+                                file_bytes = None
+                            for line in handle:
+                                lines_scanned += 1
+                                try:
+                                    row = json.loads(line)
+                                except (json.JSONDecodeError, UnicodeDecodeError):
+                                    continue
+                                if isinstance(row, Mapping) and row.get("event_type") == "SHADOW_VALIDATED" and row.get("event_id"):
+                                    known.add(str(row["event_id"]))
+                    finally:
+                        try:
+                            rss_after_mb = memory_source_current_rss_mb()
+                            rss_delta_mb = (
+                                round(float(rss_after_mb) - float(rss_before_mb), 2)
+                                if rss_before_mb is not None and rss_after_mb is not None
+                                else None
+                            )
+                            emit_memory_source_observation(
+                                "SHADOW_JOURNAL_MEMORY",
+                                file_bytes=file_bytes,
+                                lines_scanned=lines_scanned,
+                                rss_before_mb=rss_before_mb,
+                                rss_after_mb=rss_after_mb,
+                                rss_delta_mb=rss_delta_mb,
+                                elapsed_ms=(
+                                    round((time.monotonic() - scan_started) * 1000.0, 2)
+                                    if scan_started is not None
+                                    else None
+                                ),
+                            )
+                        except Exception:
+                            pass
                 if event_id in known:
                     return False
                 self._append(self.events_file, event)

@@ -12,10 +12,16 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from memory_source_observability import (
+    memory_source_current_rss_mb,
+    observe_registry_v2_wal_memory,
+)
 
 
 EVENT_PREPARED = "EVENT_PREPARED"
@@ -236,7 +242,42 @@ def read_journal(storage: RegistryV2WalStorage) -> tuple[WalEvent, ...]:
     path = Path(storage.journal_path)
     if not path.exists():
         return ()
-    return _parse_journal_bytes(path.read_bytes())
+    rss_before_mb = memory_source_current_rss_mb()
+    try:
+        read_started = time.monotonic()
+    except Exception:
+        read_started = None
+    raw = None
+    events = None
+    journal_bytes = None
+    try:
+        raw = path.read_bytes()
+        journal_bytes = len(raw)
+        events = _parse_journal_bytes(raw)
+        return events
+    finally:
+        raw = None
+        try:
+            rss_after_mb = memory_source_current_rss_mb()
+            rss_delta_mb = (
+                round(float(rss_after_mb) - float(rss_before_mb), 2)
+                if rss_before_mb is not None and rss_after_mb is not None
+                else None
+            )
+            observe_registry_v2_wal_memory(
+                journal_bytes=journal_bytes,
+                event_count=len(events) if events is not None else None,
+                rss_before_mb=rss_before_mb,
+                rss_after_mb=rss_after_mb,
+                rss_delta_mb=rss_delta_mb,
+                elapsed_ms=(
+                    round((time.monotonic() - read_started) * 1000.0, 2)
+                    if read_started is not None
+                    else None
+                ),
+            )
+        except Exception:
+            pass
 
 
 def repair_truncated_journal_tail_for_recovery(storage: RegistryV2WalStorage) -> bool:
