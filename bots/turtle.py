@@ -65,9 +65,12 @@ from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandw
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
 from memory_source_observability import (
+    finish_memory_phase_observation,
     finish_memory_workload_span,
+    next_memory_observation_cycle_id,
     observe_memory_workload_items,
     start_memory_workload_span,
+    transition_memory_phase_observation,
 )
 
 # ==============================================================================
@@ -2226,11 +2229,23 @@ def get_open_runner():
 
 
 def refresh_health_stats():
+    summary_cycle_id = next_memory_observation_cycle_id("turtle-summary")
+    summary_load_span = start_memory_workload_span()
     month_trades = trades_month()
     month_signals = signals_month()
     today_trades = trades_today()
     today_signals = signals_today()
     today_events = [e for e in get_events() if str(e.get("created_at", "")).startswith(date_key_br())]
+    summary_analytics_span = transition_memory_phase_observation(
+        "TURTLE_SUMMARY_LOAD_MEMORY",
+        summary_load_span,
+        cycle_id=summary_cycle_id,
+        month_trades_count=len(month_trades),
+        month_signals_count=len(month_signals),
+        today_trades_count=len(today_trades),
+        today_signals_count=len(today_signals),
+        today_events_count=len(today_events),
+    )
 
     stats = slim_stats(calc_stats(month_trades))
     HEALTH["funnel_today"] = funnel_snapshot()
@@ -2294,6 +2309,13 @@ def refresh_health_stats():
     HEALTH["best_setup"] = HEALTH["ranking_month"][0]["name"] if HEALTH["ranking_month"] else None
     HEALTH["worst_setup"] = HEALTH["ranking_month"][-1]["name"] if HEALTH["ranking_month"] else None
     HEALTH["last_summary_run"] = data_hora_sp_str()
+    finish_memory_phase_observation(
+        "TURTLE_SUMMARY_ANALYTICS_MEMORY",
+        summary_analytics_span,
+        cycle_id=summary_cycle_id,
+        setup_count=len(setup_stats),
+        direction_count=len(direction_stats),
+    )
 
 
 def setup_summary_lines(trades):

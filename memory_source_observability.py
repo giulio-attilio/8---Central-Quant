@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from itertools import count
 from typing import Any
 
 
@@ -26,6 +27,7 @@ _REGISTRY_V2_WAL_MEMORY_STATE = {
     "last_rss_before_mb": None,
     "last_rss_after_mb": None,
 }
+_MEMORY_OBSERVATION_CYCLE_COUNTER = count(1)
 
 
 def memory_source_current_rss_mb() -> float | None:
@@ -59,6 +61,115 @@ def start_memory_workload_span() -> dict[str, int | float | None]:
             "rss_peak_mb": None,
             "items_processed": 0,
         }
+
+
+def next_memory_observation_cycle_id(prefix: str) -> str:
+    """Return one compact process-local correlation id without persistence."""
+
+    try:
+        safe_prefix = str(prefix or "memory").strip() or "memory"
+        return f"{safe_prefix}-{os.getpid()}-{next(_MEMORY_OBSERVATION_CYCLE_COUNTER)}"
+    except Exception:
+        return "unknown"
+
+
+def _emit_memory_phase_observation(
+    event_name: str,
+    span: dict[str, int | float | None] | None,
+    *,
+    cycle_id: str,
+    ended_at: int | float | None,
+    rss_end_mb: int | float | None,
+    fields: dict[str, Any],
+) -> bool:
+    try:
+        started_at = span.get("started_at") if isinstance(span, dict) else None
+        rss_start_mb = span.get("rss_start_mb") if isinstance(span, dict) else None
+        elapsed_ms = (
+            round((float(ended_at) - float(started_at)) * 1000.0, 2)
+            if isinstance(started_at, (int, float))
+            and not isinstance(started_at, bool)
+            and isinstance(ended_at, (int, float))
+            and not isinstance(ended_at, bool)
+            else None
+        )
+        rss_delta_mb = (
+            round(float(rss_end_mb) - float(rss_start_mb), 2)
+            if isinstance(rss_start_mb, (int, float))
+            and not isinstance(rss_start_mb, bool)
+            and isinstance(rss_end_mb, (int, float))
+            and not isinstance(rss_end_mb, bool)
+            else None
+        )
+        return emit_memory_source_observation(
+            event_name,
+            cycle_id=cycle_id,
+            elapsed_ms=elapsed_ms,
+            rss_start_mb=rss_start_mb,
+            rss_end_mb=rss_end_mb,
+            rss_delta_mb=rss_delta_mb,
+            **fields,
+        )
+    except Exception:
+        return False
+
+
+def transition_memory_phase_observation(
+    event_name: str,
+    span: dict[str, int | float | None] | None,
+    *,
+    cycle_id: str,
+    **fields: Any,
+) -> dict[str, int | float | None]:
+    """Emit one phase and start the next from the exact same RSS boundary."""
+
+    try:
+        rss_end_mb = memory_source_current_rss_mb()
+        ended_at = time.monotonic()
+    except Exception:
+        rss_end_mb = None
+        ended_at = None
+
+    next_span = {
+        "started_at": ended_at,
+        "rss_start_mb": rss_end_mb,
+        "rss_peak_mb": rss_end_mb,
+        "items_processed": 0,
+    }
+    _emit_memory_phase_observation(
+        event_name,
+        span,
+        cycle_id=cycle_id,
+        ended_at=ended_at,
+        rss_end_mb=rss_end_mb,
+        fields=fields,
+    )
+    return next_span
+
+
+def finish_memory_phase_observation(
+    event_name: str,
+    span: dict[str, int | float | None] | None,
+    *,
+    cycle_id: str,
+    **fields: Any,
+) -> bool:
+    """Finish one scalar-only phase observation; all failures are fail-open."""
+
+    try:
+        rss_end_mb = memory_source_current_rss_mb()
+        ended_at = time.monotonic()
+    except Exception:
+        rss_end_mb = None
+        ended_at = None
+    return _emit_memory_phase_observation(
+        event_name,
+        span,
+        cycle_id=cycle_id,
+        ended_at=ended_at,
+        rss_end_mb=rss_end_mb,
+        fields=fields,
+    )
 
 
 def _observe_memory_workload_boundary(
@@ -247,9 +358,12 @@ def observe_registry_v2_wal_memory(**fields: Any) -> bool:
 
 __all__ = [
     "emit_memory_source_observation",
+    "finish_memory_phase_observation",
     "finish_memory_workload_span",
     "memory_source_current_rss_mb",
+    "next_memory_observation_cycle_id",
     "observe_memory_workload_items",
     "observe_registry_v2_wal_memory",
     "start_memory_workload_span",
+    "transition_memory_phase_observation",
 ]
