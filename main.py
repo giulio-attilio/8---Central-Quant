@@ -40,6 +40,7 @@ import threading
 import requests
 import importlib.util
 import ctypes
+import stat
 from pathlib import Path
 
 from memory_gc_coordinator import coordinate_memory_gc
@@ -38609,6 +38610,7 @@ def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs)
 # - Telegram Notifier V1.x no resultado real
 # ============================================================================
 AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION = "2026-07-06-AUTO-REAL-EXECUTION-BRIDGE-V1"
+AUTO_REAL_EXECUTION_BRIDGE_V1_TAIL_BLOCK_BYTES = 64 * 1024
 
 try:
     _ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1 = can_open_trade_decision
@@ -38859,23 +38861,264 @@ def _arb_v1_append_event(event):
         return False
 
 
+def _arb_v1_tail_lexical_path(path):
+    return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def _arb_v1_tail_stat_value(snapshot, name):
+    try:
+        return getattr(snapshot, name)
+    except Exception:
+        return None
+
+
+def _arb_v1_tail_source_changed(initial_path, initial_open, final_open, final_path):
+    """Detect truncate or replacement while allowing append after snapshot EOF."""
+
+    if final_open is None or final_path is None:
+        return True
+    if not stat.S_ISREG(int(_arb_v1_tail_stat_value(final_open, "st_mode") or 0)):
+        return True
+    if not stat.S_ISREG(int(_arb_v1_tail_stat_value(final_path, "st_mode") or 0)):
+        return True
+    for name in ("st_dev", "st_ino"):
+        values = (
+            _arb_v1_tail_stat_value(initial_path, name),
+            _arb_v1_tail_stat_value(initial_open, name),
+            _arb_v1_tail_stat_value(final_open, name),
+            _arb_v1_tail_stat_value(final_path, name),
+        )
+        if all(value is not None for value in values) and len(set(values)) != 1:
+            return True
+    initial_size = _arb_v1_tail_stat_value(initial_open, "st_size")
+    final_open_size = _arb_v1_tail_stat_value(final_open, "st_size")
+    final_path_size = _arb_v1_tail_stat_value(final_path, "st_size")
+    if initial_size is None or final_open_size is None or final_path_size is None:
+        return True
+    return final_open_size < initial_size or final_path_size < initial_size
+
+
+def _arb_v1_count_events_snapshot(handle, snapshot_size, block_size):
+    """Count legacy non-empty text lines without materializing or parsing JSON."""
+
+    cursor = 0
+    pending = b""
+    total = 0
+    bytes_read = 0
+    handle.seek(0, os.SEEK_SET)
+    while cursor < snapshot_size:
+        if int(os.fstat(handle.fileno()).st_size) < snapshot_size:
+            raise OSError("ARB_V1_TAIL_SOURCE_CHANGED_DURING_READ")
+        read_size = min(block_size, snapshot_size - cursor)
+        chunk = handle.read(read_size)
+        if len(chunk) != read_size:
+            raise OSError("ARB_V1_TAIL_SHORT_READ")
+        cursor += len(chunk)
+        bytes_read += len(chunk)
+        parts = (pending + chunk).split(b"\n")
+        pending = parts.pop()
+        for raw_line in parts:
+            if raw_line.decode("utf-8").strip():
+                total += 1
+    if pending.decode("utf-8").strip():
+        total += 1
+    return total, bytes_read
+
+
+def _arb_v1_read_events_page(
+    path,
+    limit=20,
+    block_size=AUTO_REAL_EXECUTION_BRIDGE_V1_TAIL_BLOCK_BYTES,
+):
+    """Read a coherent reverse tail bounded by the descriptor's initial EOF."""
+
+    configured_path = AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE
+    metadata = {
+        "rows": [],
+        "source_size_bytes": 0,
+        "bytes_read": 0,
+        "records_examined": 0,
+        "records_returned": 0,
+        "tail_limited": False,
+        "incomplete_last_line": False,
+        "total_count": 0,
+        "count_bytes_read": 0,
+    }
+    if configured_path is None:
+        return metadata
+
+    source = Path(path)
+    configured_source = Path(configured_path)
+    if (
+        source != configured_source
+        or _arb_v1_tail_lexical_path(source)
+        != _arb_v1_tail_lexical_path(configured_source)
+    ):
+        raise ValueError("ARB_V1_TAIL_UNEXPECTED_PATH")
+    try:
+        requested_limit = int(limit or 20)
+        block_size = int(block_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ARB V1 tail limits must be integers") from exc
+    if block_size < 1:
+        raise ValueError("ARB V1 tail block_size must be positive")
+
+    # Preserve the old rows[-limit:] behavior for negative values. That edge
+    # case requests all records except the first abs(limit), so it cannot stop
+    # early. Normal callers use a positive recent-event limit.
+    excluded_prefix = abs(requested_limit) if requested_limit < 0 else 0
+    target_records = None if requested_limit < 0 else requested_limit
+
+    try:
+        initial_path = source.lstat()
+    except FileNotFoundError:
+        return metadata
+    if stat.S_ISLNK(initial_path.st_mode):
+        raise ValueError("ARB_V1_TAIL_SYMLINK_REJECTED")
+    if not stat.S_ISREG(initial_path.st_mode):
+        raise ValueError("ARB_V1_TAIL_NOT_REGULAR_FILE")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.fspath(source), flags)
+    try:
+        initial_open = os.fstat(descriptor)
+        if not stat.S_ISREG(initial_open.st_mode):
+            raise ValueError("ARB_V1_TAIL_NOT_REGULAR_FILE")
+        for name in ("st_dev", "st_ino"):
+            path_value = _arb_v1_tail_stat_value(initial_path, name)
+            open_value = _arb_v1_tail_stat_value(initial_open, name)
+            if (
+                path_value is not None
+                and open_value is not None
+                and path_value != open_value
+            ):
+                raise OSError("ARB_V1_TAIL_SOURCE_CHANGED_BEFORE_READ")
+        if int(initial_open.st_size) < int(initial_path.st_size):
+            raise OSError("ARB_V1_TAIL_SOURCE_CHANGED_BEFORE_READ")
+
+        snapshot_size = int(initial_open.st_size)
+        metadata["source_size_bytes"] = snapshot_size
+        handle = os.fdopen(descriptor, "rb", closefd=True)
+        descriptor = None
+        cursor = snapshot_size
+        pending_prefix = b""
+        reversed_rows = []
+        final_fragment_pending = None
+        stopped_before_start = False
+
+        def consume(raw_line):
+            nonlocal final_fragment_pending
+            is_unterminated_final = bool(final_fragment_pending)
+            if final_fragment_pending is not None:
+                final_fragment_pending = False
+            stripped = raw_line.strip()
+            if not stripped:
+                return False
+            metadata["records_examined"] += 1
+            try:
+                decoded = stripped.decode("utf-8")
+            except UnicodeDecodeError:
+                if is_unterminated_final:
+                    metadata["incomplete_last_line"] = True
+                    return False
+                raise
+            try:
+                row = json.loads(decoded)
+            except (json.JSONDecodeError, ValueError):
+                if is_unterminated_final:
+                    metadata["incomplete_last_line"] = True
+                    return False
+                row = {"raw": decoded}
+            reversed_rows.append(row)
+            return target_records is not None and len(reversed_rows) >= target_records
+
+        with handle:
+            while cursor > 0 and (
+                target_records is None or len(reversed_rows) < target_records
+            ):
+                if int(os.fstat(handle.fileno()).st_size) < snapshot_size:
+                    raise OSError("ARB_V1_TAIL_SOURCE_CHANGED_DURING_READ")
+                start = max(0, cursor - block_size)
+                handle.seek(start, os.SEEK_SET)
+                chunk = handle.read(cursor - start)
+                if len(chunk) != cursor - start:
+                    raise OSError("ARB_V1_TAIL_SHORT_READ")
+                metadata["bytes_read"] += len(chunk)
+                if final_fragment_pending is None:
+                    final_fragment_pending = not chunk.endswith(b"\n")
+
+                parts = (chunk + pending_prefix).split(b"\n")
+                pending_prefix = parts[0]
+                reverse_lines = list(reversed(parts[1:]))
+                reached_limit = False
+                for index, raw_line in enumerate(reverse_lines):
+                    if consume(raw_line):
+                        stopped_before_start = bool(
+                            start > 0
+                            or pending_prefix.strip()
+                            or any(line.strip() for line in reverse_lines[index + 1 :])
+                        )
+                        reached_limit = True
+                        break
+                cursor = start
+                if reached_limit:
+                    break
+
+            if cursor == 0 and (
+                target_records is None or len(reversed_rows) < target_records
+            ):
+                consume(pending_prefix)
+
+            total_count, count_bytes_read = _arb_v1_count_events_snapshot(
+                handle,
+                snapshot_size,
+                block_size,
+            )
+            final_open = os.fstat(handle.fileno())
+            try:
+                final_path = source.lstat()
+            except OSError:
+                final_path = None
+            if _arb_v1_tail_source_changed(
+                initial_path,
+                initial_open,
+                final_open,
+                final_path,
+            ):
+                raise OSError("ARB_V1_TAIL_SOURCE_CHANGED_DURING_READ")
+
+        rows = list(reversed(reversed_rows))
+        if excluded_prefix:
+            rows = rows[excluded_prefix:]
+        metadata.update({
+            "rows": rows,
+            "records_returned": len(rows),
+            "tail_limited": bool(stopped_before_start or excluded_prefix),
+            "total_count": total_count,
+            "count_bytes_read": count_bytes_read,
+        })
+        return metadata
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _arb_v1_read_events(limit=20):
-    rows = []
+    requested_limit = int(limit or 20)
     try:
         path = AUTO_REAL_EXECUTION_BRIDGE_V1_EVENTS_FILE
-        if path is not None and path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        rows.append({"raw": line})
+        if path is None:
+            return {"ok": True, "count": 0, "returned_count": 0, "rows": []}
+        page = _arb_v1_read_events_page(path, limit=requested_limit)
+        rows = page["rows"]
     except Exception as exc:
         return {"ok": False, "error": str(exc), "rows": []}
-    return {"ok": True, "count": len(rows), "rows": rows[-int(limit or 20):]}
+    return {
+        "ok": True,
+        "count": page["total_count"],
+        "returned_count": len(rows),
+        "rows": rows,
+    }
 
 
 def _arb_v1_signal_id(payload, result=None):
