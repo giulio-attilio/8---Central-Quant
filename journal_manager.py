@@ -12,6 +12,7 @@
 
 import json
 import os
+import stat
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -29,6 +30,7 @@ JOURNAL_MAX_READ = int(os.environ.get("JOURNAL_MAX_READ", "5000"))
 LIFECYCLE_FILE = DATA_DIR / "trade_lifecycle.jsonl"
 LIFECYCLE_EXPORT_FILE = DATA_DIR / "trade_lifecycle_export.json"
 LIFECYCLE_MAX_READ = int(os.environ.get("LIFECYCLE_MAX_READ", "10000"))
+LIFECYCLE_TAIL_BLOCK_BYTES = 64 * 1024
 JOURNAL_SEEN_MAX = int(os.environ.get("JOURNAL_SEEN_MAX", "10000"))
 
 
@@ -112,6 +114,220 @@ def _read_jsonl_tail(path, limit=None):
             except Exception:
                 rows.append({"raw": line})
         return rows
+    except Exception as exc:
+        print(f"ERRO JOURNAL read_jsonl {path}: {exc}")
+        return []
+
+
+def _lifecycle_tail_lexical_path(path):
+    return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def _lifecycle_tail_stat_value(snapshot, name):
+    try:
+        return getattr(snapshot, name)
+    except Exception:
+        return None
+
+
+def _lifecycle_tail_snapshot_changed(initial_path, initial_open, final_open, final_path):
+    """Detect truncate or replacement while allowing append after snapshot EOF."""
+
+    if final_path is None or final_open is None:
+        return True
+    if not stat.S_ISREG(int(_lifecycle_tail_stat_value(final_open, "st_mode") or 0)):
+        return True
+    if not stat.S_ISREG(int(_lifecycle_tail_stat_value(final_path, "st_mode") or 0)):
+        return True
+    for name in ("st_dev", "st_ino"):
+        initial_path_value = _lifecycle_tail_stat_value(initial_path, name)
+        initial_open_value = _lifecycle_tail_stat_value(initial_open, name)
+        final_open_value = _lifecycle_tail_stat_value(final_open, name)
+        final_path_value = _lifecycle_tail_stat_value(final_path, name)
+        comparable = (
+            initial_path_value,
+            initial_open_value,
+            final_open_value,
+            final_path_value,
+        )
+        if all(value is not None for value in comparable) and len(set(comparable)) != 1:
+            return True
+    initial_size = _lifecycle_tail_stat_value(initial_open, "st_size")
+    final_open_size = _lifecycle_tail_stat_value(final_open, "st_size")
+    final_path_size = _lifecycle_tail_stat_value(final_path, "st_size")
+    if initial_size is None or final_open_size is None or final_path_size is None:
+        return True
+    if final_open_size < initial_size or final_path_size < initial_size:
+        return True
+    return False
+
+
+def _read_lifecycle_jsonl_tail_page(
+    path,
+    limit=None,
+    block_size=LIFECYCLE_TAIL_BLOCK_BYTES,
+):
+    """Read the lifecycle tail backwards without loading the complete journal.
+
+    Complete invalid JSON lines preserve the legacy ``{"raw": line}`` shape.
+    An invalid final fragment without a newline is treated as an interrupted
+    write and is the only physical line ignored.
+
+    The initial descriptor size is the immutable snapshot EOF. Concurrent
+    appends beyond it are intentionally left for the next read. ``partial`` is
+    true only when an earlier byte range was not inspected after reaching the
+    record limit or when an interrupted final fragment was ignored. A source
+    change raises instead of returning page metadata.
+    """
+
+    source = Path(path)
+    configured_source = Path(LIFECYCLE_FILE)
+    expected = _lifecycle_tail_lexical_path(configured_source)
+    if source != configured_source or _lifecycle_tail_lexical_path(source) != expected:
+        raise ValueError("LIFECYCLE_TAIL_UNEXPECTED_PATH")
+    try:
+        requested = int(limit or LIFECYCLE_MAX_READ)
+        block_size = int(block_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("lifecycle tail limits must be integers") from exc
+    if requested < 1:
+        raise ValueError("lifecycle tail limit must be positive")
+    if block_size < 1:
+        raise ValueError("lifecycle tail block_size must be positive")
+
+    metadata = {
+        "records": [],
+        "source_size_bytes": 0,
+        "bytes_read": 0,
+        "records_returned": 0,
+        "records_examined": 0,
+        "partial": False,
+        "incomplete_last_line": False,
+    }
+    try:
+        initial_path = source.lstat()
+    except FileNotFoundError:
+        return metadata
+    if stat.S_ISLNK(initial_path.st_mode):
+        raise ValueError("LIFECYCLE_TAIL_SYMLINK_REJECTED")
+    if not stat.S_ISREG(initial_path.st_mode):
+        raise ValueError("LIFECYCLE_TAIL_NOT_REGULAR_FILE")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.fspath(source), flags)
+    try:
+        initial_open = os.fstat(descriptor)
+        if not stat.S_ISREG(initial_open.st_mode):
+            raise ValueError("LIFECYCLE_TAIL_NOT_REGULAR_FILE")
+        for name in ("st_dev", "st_ino"):
+            path_value = _lifecycle_tail_stat_value(initial_path, name)
+            open_value = _lifecycle_tail_stat_value(initial_open, name)
+            if path_value is not None and open_value is not None and path_value != open_value:
+                raise OSError("LIFECYCLE_TAIL_SOURCE_CHANGED_BEFORE_READ")
+        source_size = int(initial_open.st_size)
+        metadata["source_size_bytes"] = source_size
+
+        handle = os.fdopen(descriptor, "rb", closefd=True)
+        descriptor = None
+        cursor = source_size
+        pending_prefix = b""
+        reversed_records = []
+        final_fragment_pending = None
+        stopped_before_start = False
+
+        def consume(raw_line):
+            nonlocal final_fragment_pending
+            is_unterminated_final = bool(final_fragment_pending)
+            if final_fragment_pending is not None:
+                final_fragment_pending = False
+            stripped = raw_line.strip()
+            if not stripped:
+                return False
+            metadata["records_examined"] += 1
+            try:
+                decoded = stripped.decode("utf-8")
+            except UnicodeDecodeError:
+                if is_unterminated_final:
+                    metadata["incomplete_last_line"] = True
+                    return False
+                raise
+            try:
+                item = json.loads(decoded)
+            except (json.JSONDecodeError, ValueError):
+                if is_unterminated_final:
+                    metadata["incomplete_last_line"] = True
+                    return False
+                item = {"raw": decoded}
+            reversed_records.append(item)
+            return len(reversed_records) >= requested
+
+        with handle:
+            while cursor > 0 and len(reversed_records) < requested:
+                if int(os.fstat(handle.fileno()).st_size) < source_size:
+                    raise OSError("LIFECYCLE_TAIL_SOURCE_CHANGED_DURING_READ")
+                start = max(0, cursor - block_size)
+                handle.seek(start, os.SEEK_SET)
+                chunk = handle.read(cursor - start)
+                if len(chunk) != cursor - start:
+                    raise OSError("LIFECYCLE_TAIL_SHORT_READ")
+                metadata["bytes_read"] += len(chunk)
+                if final_fragment_pending is None:
+                    final_fragment_pending = not chunk.endswith(b"\n")
+
+                combined = chunk + pending_prefix
+                parts = combined.split(b"\n")
+                pending_prefix = parts[0]
+                complete_lines = parts[1:]
+                reversed_lines = list(reversed(complete_lines))
+                reached_limit = False
+                for index, raw_line in enumerate(reversed_lines):
+                    if consume(raw_line):
+                        earlier_in_chunk = any(
+                            candidate.strip()
+                            for candidate in reversed_lines[index + 1:]
+                        )
+                        stopped_before_start = bool(
+                            start > 0 or pending_prefix.strip() or earlier_in_chunk
+                        )
+                        reached_limit = True
+                        break
+                cursor = start
+                if reached_limit:
+                    break
+
+            if cursor == 0 and len(reversed_records) < requested:
+                consume(pending_prefix)
+
+            final_open = os.fstat(handle.fileno())
+            try:
+                final_path = source.lstat()
+            except OSError:
+                final_path = None
+            if _lifecycle_tail_snapshot_changed(
+                initial_path,
+                initial_open,
+                final_open,
+                final_path,
+            ):
+                raise OSError("LIFECYCLE_TAIL_SOURCE_CHANGED_DURING_READ")
+
+        records = list(reversed(reversed_records))
+        metadata.update({
+            "records": records,
+            "records_returned": len(records),
+            "partial": bool(stopped_before_start or metadata["incomplete_last_line"]),
+        })
+        return metadata
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_lifecycle_jsonl_tail(path, limit=None):
+    """Compatibility wrapper preserving the journal reader's fail-open list API."""
+
+    try:
+        return _read_lifecycle_jsonl_tail_page(path, limit=limit)["records"]
     except Exception as exc:
         print(f"ERRO JOURNAL read_jsonl {path}: {exc}")
         return []
@@ -625,7 +841,7 @@ def append_lifecycle_event(event):
 
 
 def load_lifecycle_events(limit=None):
-    rows = _read_jsonl_tail(LIFECYCLE_FILE, limit=limit or LIFECYCLE_MAX_READ)
+    rows = _read_lifecycle_jsonl_tail(LIFECYCLE_FILE, limit=limit)
     # Compatibilidade: trades fechados da V1 também aparecem como ciclo fechado.
     if not rows:
         for trade in load_journal_trades(limit=JOURNAL_MAX_READ):
