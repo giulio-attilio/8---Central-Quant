@@ -222,6 +222,12 @@ POSITIONS_KEY = "turtle_pro:positions"
 SIGNALS_KEY = "turtle_pro:signals"
 TRADES_KEY = "turtle_pro:trades"
 EVENTS_KEY = "turtle_pro:events"
+# Keep the existing event-count contract.  The Upstash REST client embeds this
+# serialized value in a second JSON string, whose escaping can at most double
+# these UTF-8 bytes; 4 MiB therefore stays below the 10 MiB request limit even
+# with the command envelope.
+TURTLE_EVENTS_MAX_COUNT = 5000
+TURTLE_EVENTS_MAX_SERIALIZED_BYTES = 4 * 1024 * 1024
 STATE_KEY = "turtle_pro:state"
 COOLDOWN_KEY = "turtle_pro:cooldowns"
 DAILY_SUMMARY_KEY = "turtle_pro:daily_summary_sent"
@@ -234,6 +240,7 @@ redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 exchange = get_exchange()   
 
 redis_lock = threading.Lock()
+events_redis_lock = threading.Lock()
 
 HEALTH = {
     "started_at": None,
@@ -245,6 +252,12 @@ HEALTH = {
     "last_success": None,
     "last_error": None,
     "last_warning": None,
+    "events_persist_status": "NOT_ATTEMPTED",
+    "events_persist_last_at": None,
+    "events_persist_count": 0,
+    "events_persist_bytes": 0,
+    "events_persist_trimmed_count": 0,
+    "events_persist_last_error": None,
 
     "last_invalid_watchlist_check": None,
     "last_watchdog_alert": None,
@@ -458,7 +471,183 @@ def redis_set_json(key, value):
         return False
 
 
+def _set_turtle_events_persist_health(
+    status,
+    *,
+    count=None,
+    payload_bytes=None,
+    trimmed_count=0,
+    error=None,
+):
+    """Store only scalar diagnostics for the latest bounded events write."""
+
+    HEALTH["events_persist_status"] = str(status)
+    HEALTH["events_persist_last_at"] = data_hora_sp_str()
+    HEALTH["events_persist_count"] = count
+    HEALTH["events_persist_bytes"] = payload_bytes
+    HEALTH["events_persist_trimmed_count"] = int(trimmed_count or 0)
+    HEALTH["events_persist_last_error"] = str(error)[:160] if error else None
+
+
+def _turtle_events_exception_code(exc):
+    """Classify an exception without copying request or event payloads to HEALTH."""
+
+    error_type = type(exc).__name__
+    if "max request size exceeded" in str(exc).lower():
+        return f"{error_type}:MAX_REQUEST_SIZE_EXCEEDED"
+    return error_type
+
+
+def _fail_turtle_events_persist(status, error, *, set_operation=False):
+    error_code = str(error or status)[:160]
+    _set_turtle_events_persist_health(status, error=error_code)
+    previous_warning = HEALTH.get("last_warning")
+    previous_is_unrelated = (
+        isinstance(previous_warning, str)
+        and previous_warning
+        and not previous_warning.startswith(f"redis set {EVENTS_KEY}:")
+        and not previous_warning.startswith("turtle events persist ")
+    )
+    if status == "EVENT_TOO_LARGE" and previous_is_unrelated:
+        return False
+    if set_operation:
+        HEALTH["last_warning"] = f"redis set {EVENTS_KEY}: {error_code}"
+    else:
+        HEALTH["last_warning"] = f"turtle events persist {status}: {error_code}"
+    return False
+
+
+def _decode_turtle_events_value(raw):
+    """Decode the existing events value without treating corruption as empty."""
+
+    if raw is None:
+        return []
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        data = json.loads(raw)
+    else:
+        data = raw
+    if not isinstance(data, list):
+        raise ValueError("turtle events value is not a JSON list")
+    if any(not isinstance(event, dict) for event in data):
+        raise ValueError("turtle events value contains a non-object item")
+    return data
+
+
+def _build_turtle_events_payload(events, max_count, max_bytes):
+    """Build the newest contiguous JSON tail in O(N) item serializations."""
+
+    if max_count < 1:
+        raise ValueError("max_count must be positive")
+    if max_bytes < 2:
+        raise ValueError("max_bytes must fit an empty JSON list")
+
+    candidates = events[-max_count:]
+    count_trimmed = len(events) - len(candidates)
+    selected_reversed = []
+    estimated_bytes = 2  # Opening and closing brackets of the JSON list.
+
+    for event in reversed(candidates):
+        item_serialized = json.dumps(event, ensure_ascii=False)
+        item_bytes = len(item_serialized.encode("utf-8"))
+        separator_bytes = 2 if selected_reversed else 0  # json.dumps uses ", ".
+        if estimated_bytes + separator_bytes + item_bytes > max_bytes:
+            if not selected_reversed:
+                return {
+                    "ok": False,
+                    "status": "EVENT_TOO_LARGE",
+                    "event_bytes": item_bytes + 2,
+                }
+            break
+        selected_reversed.append(event)
+        estimated_bytes += separator_bytes + item_bytes
+
+    selected = list(reversed(selected_reversed))
+    serialized = json.dumps(selected, ensure_ascii=False)
+    payload_bytes = len(serialized.encode("utf-8"))
+    if payload_bytes > max_bytes:
+        raise ValueError("final turtle events payload exceeds local byte budget")
+
+    byte_trimmed = len(candidates) - len(selected)
+    return {
+        "ok": True,
+        "events": selected,
+        "serialized": serialized,
+        "payload_bytes": payload_bytes,
+        "trimmed_count": count_trimmed + byte_trimmed,
+        "trimmed_by_count": count_trimmed,
+        "trimmed_by_bytes": byte_trimmed,
+    }
+
+
+def _append_turtle_event_bounded(item):
+    """Atomically append one event within this process and preserve remote data on failure."""
+
+    with events_redis_lock:
+        try:
+            with redis_lock:
+                raw = bandwidth_redis_get(redis, EVENTS_KEY, caller=__name__)
+        except Exception as exc:
+            return _fail_turtle_events_persist("GET_FAILED", _turtle_events_exception_code(exc))
+
+        try:
+            data = _decode_turtle_events_value(raw)
+        except Exception as exc:
+            return _fail_turtle_events_persist("PARSE_FAILED", _turtle_events_exception_code(exc))
+
+        data.append(item)
+        try:
+            bounded = _build_turtle_events_payload(
+                data,
+                TURTLE_EVENTS_MAX_COUNT,
+                TURTLE_EVENTS_MAX_SERIALIZED_BYTES,
+            )
+        except Exception as exc:
+            return _fail_turtle_events_persist("SERIALIZE_FAILED", _turtle_events_exception_code(exc))
+
+        if not bounded.get("ok"):
+            event_bytes = int(bounded.get("event_bytes") or 0)
+            return _fail_turtle_events_persist(
+                "EVENT_TOO_LARGE",
+                f"event_bytes={event_bytes} budget_bytes={TURTLE_EVENTS_MAX_SERIALIZED_BYTES}",
+            )
+
+        try:
+            with redis_lock:
+                bandwidth_redis_set(
+                    redis,
+                    EVENTS_KEY,
+                    bounded["serialized"],
+                    caller=__name__,
+                )
+        except Exception as exc:
+            return _fail_turtle_events_persist(
+                "SET_FAILED",
+                _turtle_events_exception_code(exc),
+                set_operation=True,
+            )
+
+        status = "OK"
+        if bounded["trimmed_by_bytes"]:
+            status = "TRIMMED_BY_BYTES"
+        elif bounded["trimmed_by_count"]:
+            status = "TRIMMED_BY_COUNT"
+        _set_turtle_events_persist_health(
+            status,
+            count=len(bounded["events"]),
+            payload_bytes=bounded["payload_bytes"],
+            trimmed_count=bounded["trimmed_count"],
+        )
+        warning = HEALTH.get("last_warning")
+        if isinstance(warning, str) and warning.startswith(f"redis set {EVENTS_KEY}:"):
+            HEALTH["last_warning"] = None
+        return True
+
+
 def redis_list_append(key, item, max_len=5000):
+    if key == EVENTS_KEY:
+        return _append_turtle_event_bounded(item)
     data = redis_get_json(key, [])
     if not isinstance(data, list):
         data = []
@@ -2876,7 +3065,8 @@ def reset_paper_route():
     redis_set_json(POSITIONS_KEY, {})
     redis_set_json(SIGNALS_KEY, [])
     redis_set_json(TRADES_KEY, [])
-    redis_set_json(EVENTS_KEY, [])
+    with events_redis_lock:
+        redis_set_json(EVENTS_KEY, [])
     redis_set_json(COOLDOWN_KEY, {})
     redis_set_json(LAST_CANDLES_KEY, {})
     redis_set_json(FUNNEL_KEY, {})
