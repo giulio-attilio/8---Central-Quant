@@ -144,27 +144,3 @@ def coordinate_memory_gc(**kwargs: Any) -> Dict[str, Any]:
     """Use the one coordinator shared by every integrated process caller."""
 
     return _PROCESS_MEMORY_GC_COORDINATOR.coordinate(**kwargs)
-
-
-def emit_memory_gc_skipped(
-    result: Dict[str, Any],
-    *,
-    emit_fn: Callable[..., Any],
-) -> bool:
-    """Emit the compact skipped event through a fail-open scalar logger."""
-
-    try:
-        if not result.get("qualified") or not result.get("skipped"):
-            return False
-        return bool(emit_fn(
-            "MEMORY GC SKIPPED",
-            reason=result.get("reason"),
-            skip_reason=result.get("skip_reason"),
-            rss_before_mb=result.get("rss_before_mb"),
-            rss_recheck_mb=result.get("rss_recheck_mb"),
-            waited_ms=result.get("waited_ms"),
-            entry_generation=result.get("entry_generation"),
-            current_generation=result.get("current_generation"),
-        ))
-    except Exception:
-        return False

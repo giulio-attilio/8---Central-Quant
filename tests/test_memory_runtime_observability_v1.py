@@ -175,8 +175,6 @@ class MemoryRuntimeObservabilityV1Tests(unittest.TestCase):
             "malloc_trim_safe": lambda: trim_calls.append(True),
             "current_rss_mb": lambda: 900.0,
             "coordinate_memory_gc": coordinate_memory_gc,
-            "emit_memory_gc_skipped": lambda *_args, **_kwargs: False,
-            "emit_memory_source_observation": lambda *_args, **_kwargs: True,
         }
         force_gc_if_needed = _compile_function("force_gc_if_needed", namespace)
 

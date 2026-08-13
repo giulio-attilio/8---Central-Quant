@@ -24,8 +24,7 @@ import traceback
 from datetime import datetime
 from collections import Counter
 
-from memory_gc_coordinator import coordinate_memory_gc, emit_memory_gc_skipped
-from memory_source_observability import emit_memory_source_observation
+from memory_gc_coordinator import coordinate_memory_gc
 
 VERSION = "2026-07-05-MEMORY-PROFILER-V1.4"
 
@@ -358,11 +357,6 @@ def _run_gc_if_needed(mem, force=False, reason="memory_profiler"):
             collect_fn=gc.collect,
             trim_fn=_profiler_malloc_trim_safe,
         )
-        emit_memory_gc_skipped(
-            coordination,
-            emit_fn=emit_memory_source_observation,
-        )
-
         result = {
             "executed": bool(coordination.get("executed")),
             "collected": coordination.get("collected"),

@@ -115,13 +115,6 @@ def _runtime_namespace(calls: list[str]) -> dict:
         "get_events": load("get_events", events),
         "month_key_br": lambda: "08/2026",
         "date_key_br": lambda: "12/08/2026",
-        "next_memory_observation_cycle_id": lambda _prefix: "cycle-equivalence",
-        "start_memory_workload_span": lambda: {"started_at": 1.0, "rss_start_mb": 100.0},
-        "transition_memory_phase_observation": lambda *_args, **_kwargs: {
-            "started_at": 2.0,
-            "rss_start_mb": 120.0,
-        },
-        "finish_memory_phase_observation": lambda *_args, **_kwargs: True,
         "calc_stats": _stats,
         "slim_stats": lambda stats: dict(stats),
         "funnel_snapshot": lambda: {"ativos_analisados": 9},
@@ -154,13 +147,23 @@ def _runtime_namespace(calls: list[str]) -> dict:
 def _load_refresh(namespace: dict, *, legacy_loads: bool = False):
     refresh = copy.deepcopy(_function("refresh_health_stats"))
     if legacy_loads:
-        transition_index = next(
+        load_start_index = next(
             index
             for index, statement in enumerate(refresh.body)
             if isinstance(statement, ast.Assign)
-            and isinstance(statement.value, ast.Call)
-            and isinstance(statement.value.func, ast.Name)
-            and statement.value.func.id == "transition_memory_phase_observation"
+            and any(
+                isinstance(target, ast.Name) and target.id == "all_trades"
+                for target in statement.targets
+            )
+        )
+        load_end_index = next(
+            index
+            for index, statement in enumerate(refresh.body)
+            if isinstance(statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "today_events"
+                for target in statement.targets
+            )
         )
         legacy = ast.parse(
             "month_trades = trades_month()\n"
@@ -169,7 +172,7 @@ def _load_refresh(namespace: dict, *, legacy_loads: bool = False):
             "today_signals = signals_today()\n"
             "today_events = [e for e in get_events() if str(e.get('created_at', '')).startswith(date_key_br())]\n"
         ).body
-        refresh.body[2:transition_index] = legacy
+        refresh.body[load_start_index:load_end_index + 1] = legacy
     module = ast.Module(body=[refresh], type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, str(TURTLE_PATH), "exec"), namespace)

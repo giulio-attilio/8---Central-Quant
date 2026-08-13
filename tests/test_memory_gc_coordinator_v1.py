@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import ast
-import io
 import threading
-from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,9 +9,7 @@ import memory_gc_coordinator as coordinator_module
 import memory_profiler_v1 as memory_profiler
 from memory_gc_coordinator import (
     MemoryGCCoordinator,
-    emit_memory_gc_skipped,
 )
-from memory_source_observability import emit_memory_source_observation
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -328,10 +324,11 @@ def test_profiler_preserves_snapshot_action_shape_when_coordination_skips():
         "skip_reason": "gc_completed_while_waiting",
         "collected": None,
     }
-    with (
-        patch.object(memory_profiler, "coordinate_memory_gc", return_value=coordination) as coordinate,
-        patch.object(memory_profiler, "emit_memory_gc_skipped", return_value=True) as emit,
-    ):
+    with patch.object(
+        memory_profiler,
+        "coordinate_memory_gc",
+        return_value=coordination,
+    ) as coordinate:
         result = memory_profiler._run_gc_if_needed(
             {"rss_mb": 950.0},
             force=False,
@@ -345,61 +342,6 @@ def test_profiler_preserves_snapshot_action_shape_when_coordination_skips():
         "skip_reason": "gc_completed_while_waiting",
     }
     assert coordinate.call_args.kwargs["reason"] == "memory_profiler:scheduled"
-    emit.assert_called_once()
-
-
-def test_memory_gc_skipped_log_is_scalar_only_and_has_runtime_identity():
-    coordinator = MemoryGCCoordinator()
-    result = coordinator.coordinate(
-        reason="memory_loop",
-        force=False,
-        threshold_mb=900.0,
-        rss_before_mb=925.0,
-        current_rss_fn=lambda: 800.0,
-        collect_fn=lambda: None,
-        trim_fn=lambda: None,
-    )
-
-    output = io.StringIO()
-    with redirect_stdout(output):
-        emitted = emit_memory_gc_skipped(
-            result,
-            emit_fn=emit_memory_source_observation,
-        )
-
-    rendered = output.getvalue()
-    assert emitted is True
-    assert rendered.startswith("MEMORY GC SKIPPED | sampled_at=")
-    for field in (
-        "reason=memory_loop",
-        "skip_reason=rss_below_threshold_after_lock",
-        "rss_before_mb=925.0",
-        "rss_recheck_mb=800.0",
-        "waited_ms=",
-        "entry_generation=0",
-        "current_generation=0",
-        "pid=",
-        "ppid=",
-        "thread=",
-        "boot_id=",
-    ):
-        assert field in rendered
-    assert "{" not in rendered
-    assert "[" not in rendered
-
-
-def test_skipped_observability_is_fail_open_and_unqualified_callers_are_silent():
-    def failing_emitter(*_args, **_kwargs):
-        raise RuntimeError("logger failed")
-
-    assert emit_memory_gc_skipped(
-        {"qualified": True, "skipped": True},
-        emit_fn=failing_emitter,
-    ) is False
-    assert emit_memory_gc_skipped(
-        {"qualified": False, "skipped": False},
-        emit_fn=failing_emitter,
-    ) is False
 
 
 def test_coordinator_adds_no_cooldown_or_sleep():

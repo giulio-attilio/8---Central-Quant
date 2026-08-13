@@ -42,8 +42,7 @@ import importlib.util
 import ctypes
 from pathlib import Path
 
-from memory_gc_coordinator import coordinate_memory_gc, emit_memory_gc_skipped
-from memory_source_observability import emit_memory_source_observation
+from memory_gc_coordinator import coordinate_memory_gc
 from registry_execution_identity import is_v2_execution_id
 
 try:
@@ -899,10 +898,6 @@ def _memory_cleanup(reason="request", force=False):
             )
             gc_executed = bool(coordination.get("executed"))
             collected = coordination.get("collected")
-            emit_memory_gc_skipped(
-                coordination,
-                emit_fn=emit_memory_source_observation,
-            )
         after_mb = current_rss_mb()
         return {
             "ok": True,
@@ -2151,10 +2146,6 @@ def force_gc_if_needed(label="gc", force=False):
         gc_executed = bool(coordination.get("executed"))
         collected = coordination.get("collected")
         gc_elapsed_ms = coordination.get("cleanup_elapsed_ms")
-        emit_memory_gc_skipped(
-            coordination,
-            emit_fn=emit_memory_source_observation,
-        )
         if gc_executed:
             time.sleep(0.05)
     after = memory_snapshot(
