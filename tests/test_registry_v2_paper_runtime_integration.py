@@ -375,7 +375,6 @@ def _scanner_namespace(
     saves = []
     cooldowns = []
     last_candle_saves = []
-    memory_observability = []
     namespace, v1_calls = _runtime_registry_namespace(adapter, gate=gate)
 
     def save_positions(positions):
@@ -416,26 +415,6 @@ def _scanner_namespace(
             return should_skip(positions, symbol, setup_key, side)
         return should_skip is True
 
-    def start_memory_span():
-        memory_observability.append(("start",))
-        return {"items": 0}
-
-    def observe_memory_items(items, span):
-        for item in items:
-            span["items"] += 1
-            yield item
-
-    def finish_memory_span(log_name, span, **fields):
-        memory_observability.append(
-            (
-                "finish",
-                log_name,
-                span["items"],
-                fields.get("bot"),
-                fields.get("include_symbols_processed"),
-            )
-        )
-
     namespace.update(
         {
             "get_positions": lambda: copy.deepcopy(state["positions"]),
@@ -464,9 +443,6 @@ def _scanner_namespace(
             "traceback": type("Traceback", (), {"print_exc": staticmethod(lambda: None)})(),
             "time": _OneLoopTime(),
             "SCAN_SLEEP_SECONDS": 0,
-            "start_memory_workload_span": start_memory_span,
-            "observe_memory_workload_items": observe_memory_items,
-            "finish_memory_workload_span": finish_memory_span,
         }
     )
     _compile_turtle_functions(namespace, {"scanner_loop"})
@@ -478,7 +454,6 @@ def _scanner_namespace(
         "saves": saves,
         "cooldowns": cooldowns,
         "last_candle_saves": last_candle_saves,
-        "memory_observability": memory_observability,
         "v1_calls": v1_calls,
     }
 
@@ -671,10 +646,6 @@ def test_productive_scanner_new_v2_signal_runs_risk_registers_saves_and_advances
     assert position["execution_id"] == position["lifecycle_id"] == committed[0].execution_id
     assert len(observed["signals"]) == len(observed["events"]) == len(observed["telegram"]) == 1
     assert len(observed["cooldowns"]) == 1
-    assert observed["memory_observability"] == [
-        ("start",),
-        ("finish", "SCANNER_CYCLE_MEMORY", 1, "TURTLE", True),
-    ]
     assert observed["v1_calls"] == []
 
 

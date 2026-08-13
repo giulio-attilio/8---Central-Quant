@@ -133,6 +133,25 @@ def _source_tree():
     return ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
 
 
+def test_read_journal_reads_once_and_returns_the_parsed_result(tmp_path, monkeypatch):
+    storage = _storage(tmp_path)
+    storage.journal_path.write_bytes(b"opaque-journal-bytes")
+    original_read_bytes = Path.read_bytes
+    read_calls = []
+    parsed = ("parsed-event-1", "parsed-event-2")
+
+    def counting_read_bytes(path):
+        if path == storage.journal_path:
+            read_calls.append(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    monkeypatch.setattr(wal, "_parse_journal_bytes", lambda raw: parsed)
+
+    assert wal.read_journal(storage) is parsed
+    assert read_calls == [storage.journal_path]
+
+
 def test_001_canonical_digest_deterministic():
     assert wal.canonical_json({"b": 2, "a": 1}) == '{"a":1,"b":2}'
     assert wal.compute_result_digest({"b": 2, "a": 1}) == wal.compute_result_digest({"a": 1, "b": 2})

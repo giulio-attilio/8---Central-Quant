@@ -41,11 +41,6 @@ from account_client_order_id import (
 )
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
-from memory_source_observability import (
-    finish_memory_workload_span,
-    observe_memory_workload_items,
-    start_memory_workload_span,
-)
 from static_operational_runtime import (
     large_redis_snapshot_allowed,
     static_operational_runtime_blocked_log,
@@ -4405,7 +4400,6 @@ def scanner():
     enviar_startup_message_once()
 
     while True:
-        scanner_memory_span = start_memory_workload_span()
         try:
             watchlist = carregar_watchlist()
             watchlist = validar_watchlist_bingx(watchlist, avisar_telegram=False)
@@ -4421,7 +4415,7 @@ def scanner():
             gerenciar_posicoes()
 
             if SMART_PREDATOR_ENABLED:
-                for symbol in observe_memory_workload_items(watchlist, scanner_memory_span):
+                for symbol in watchlist:
                     try:
                         s = scan_smart_predator_symbol(symbol)
 
@@ -4486,12 +4480,6 @@ def scanner():
             else:
                 HEALTH["last_error"] = erro_txt
 
-        finish_memory_workload_span(
-            "SCANNER_CYCLE_MEMORY",
-            scanner_memory_span,
-            bot="PREDATOR",
-            include_symbols_processed=True,
-        )
         time.sleep(SCANNER_SLEEP_SECONDS)
 
 # ====================================================

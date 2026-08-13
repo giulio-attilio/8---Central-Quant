@@ -19,11 +19,6 @@ from upstash_redis import Redis
 from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
-from memory_source_observability import (
-    finish_memory_workload_span,
-    observe_memory_workload_items,
-    start_memory_workload_span,
-)
 
 try:
     import trade_registry as central_trade_registry
@@ -2361,7 +2356,6 @@ def scanner():
     enviar_startup_cobra_uma_vez()
 
     while True:
-        scanner_memory_span = start_memory_workload_span()
         try:
             HEALTH["last_scanner_run"] = data_hora_sp_str()
             gerenciar_posicoes()
@@ -2371,7 +2365,7 @@ def scanner():
             HEALTH["last_watchlist_count"] = len(watchlist)
             sinais_enviados = 0
 
-            for symbol in observe_memory_workload_items(watchlist, scanner_memory_span):
+            for symbol in watchlist:
                 try:
                     if limite_posicoes_atingido():
                         break
@@ -2434,12 +2428,6 @@ def scanner():
             HEALTH["last_error"] = str(e)
             print("ERRO SCANNER COBRA:", e)
 
-        finish_memory_workload_span(
-            "SCANNER_CYCLE_MEMORY",
-            scanner_memory_span,
-            bot="COBRA",
-            include_symbols_processed=True,
-        )
         time.sleep(SCAN_SLEEP_SECONDS)
 
 # ====================================================

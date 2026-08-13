@@ -51,11 +51,6 @@ from redis_bandwidth import (
     redis_set as bandwidth_redis_set,
     redis_set_if_absent as bandwidth_redis_set_if_absent,
 )
-from memory_source_observability import (
-    finish_memory_workload_span,
-    observe_memory_workload_items,
-    start_memory_workload_span,
-)
 from falcon_client_order_id import (
     FALCON_CLIENT_ORDER_ID_GENERATOR_VERSION,
     ROLE_BREAK_EVEN_STOP,
@@ -4972,17 +4967,10 @@ def scanner_loop():
     started = time.time()
 
     while True:
-        scanner_memory_span = start_memory_workload_span()
         signals_sent = 0
         try:
             if not ENABLE_FALCON:
                 HEALTH["last_warning"] = "ENABLE_FALCON=false"
-                finish_memory_workload_span(
-                    "SCANNER_CYCLE_MEMORY",
-                    scanner_memory_span,
-                    bot="FALCON",
-                    include_symbols_processed=True,
-                )
                 time.sleep(SCAN_SLEEP_SECONDS)
                 continue
 
@@ -4990,7 +4978,7 @@ def scanner_loop():
             watchlist = load_watchlist()
             last_candles = get_last_candles_by_symbol()
 
-            for symbol in observe_memory_workload_items(watchlist, scanner_memory_span):
+            for symbol in watchlist:
                 if len(positions) >= MAX_OPEN_POSITIONS:
                     break
 
@@ -5066,12 +5054,6 @@ def scanner_loop():
             HEALTH["last_error"] = f"scanner: {exc}"
             traceback.print_exc()
 
-        finish_memory_workload_span(
-            "SCANNER_CYCLE_MEMORY",
-            scanner_memory_span,
-            bot="FALCON",
-            include_symbols_processed=True,
-        )
         time.sleep(SCAN_SLEEP_SECONDS)
 
 # ==============================================================================
@@ -5476,18 +5458,12 @@ def maybe_send_monthly_summary():
 
 def summary_loop():
     while True:
-        summary_memory_span = start_memory_workload_span()
         try:
             maybe_send_daily_summary()
             maybe_send_monthly_summary()
             refresh_health_stats()
         except Exception as exc:
             HEALTH["last_warning"] = f"summary: {exc}"
-        finish_memory_workload_span(
-            "SUMMARY_CYCLE_MEMORY",
-            summary_memory_span,
-            bot="FALCON",
-        )
         time.sleep(30)
 
 # ==============================================================================

@@ -77,8 +77,6 @@ def _namespace(calls: list, *, real_observability: bool = False) -> dict:
         "start_memory_workload_span": lambda: calls.append("load_start") or {
             "started_at": 1.0,
             "rss_start_mb": 100.0,
-            "rss_peak_mb": 100.0,
-            "items_processed": 0,
         },
         "get_trades": loaded("get_trades", month_trades + today_trades),
         "get_signals": loaded("get_signals", month_signals + today_signals),
@@ -111,8 +109,6 @@ def _namespace(calls: list, *, real_observability: bool = False) -> dict:
             return {
                 "started_at": 2.0,
                 "rss_start_mb": 150.0,
-                "rss_peak_mb": 150.0,
-                "items_processed": 0,
             }
 
         def finish(event_name, span, **fields):
