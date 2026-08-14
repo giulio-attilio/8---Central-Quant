@@ -59356,11 +59356,29 @@ def trade_timeline_validator_v1_route():
             "production_blocked": False,
         }, 400
 
+    raw_scan_cursor = request.args.get("scan_cursor")
+    if raw_scan_cursor is not None and (
+        not isinstance(raw_scan_cursor, str)
+        or not raw_scan_cursor
+        or len(raw_scan_cursor) > 4096
+    ):
+        return {
+            "ok": False,
+            "trade_id": trade_id,
+            "error": "SCAN_CURSOR_INVALID",
+            "fail_open": True,
+            "production_blocked": False,
+        }, 400
+
     try:
         # Import local: evita acoplamento/ciclo no startup e mantém a consulta manual.
         from trade_timeline_validator import validate_trade_timeline
 
-        report = validate_trade_timeline(trade_id)
+        report = (
+            validate_trade_timeline(trade_id, scan_cursor=raw_scan_cursor)
+            if raw_scan_cursor is not None
+            else validate_trade_timeline(trade_id)
+        )
         if not isinstance(report, dict):
             raise TypeError("trade timeline validator returned a non-dict report")
 
@@ -59393,6 +59411,11 @@ def trade_timeline_validator_v1_route():
             "pass": validation_status == "PASS",
             "fail_open": bool(report.get("fail_open", True)),
             "production_blocked": False,
+            "coverage": report.get("coverage") or {},
+            "conclusive": bool(report.get("conclusive", True)),
+            "evidence_status": report.get("evidence_status") or (
+                "EVIDENCE_FOUND" if report.get("events_found") else "COMPLETE_NO_EVIDENCE"
+            ),
             "generated_at": report.get("generated_at") or datetime.now(timezone.utc).isoformat(),
             "component_status": component_status,
             "events_found": report.get("events_found") or [],
@@ -59419,6 +59442,9 @@ def trade_timeline_validator_v1_route():
             "pass": False,
             "fail_open": True,
             "production_blocked": False,
+            "coverage": {},
+            "conclusive": False,
+            "evidence_status": "COVERAGE_LIMITED",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "component_status": {},
             "events_found": [],
@@ -59509,6 +59535,8 @@ def live_trade_snapshot_v1_route():
             "fail_open",
             "production_blocked",
             "operational_impact",
+            "conclusive",
+            "evidence_status",
             "identity",
             "trade",
             "broker",
@@ -59553,6 +59581,8 @@ def live_trade_snapshot_v1_route():
             "fail_open": True,
             "production_blocked": False,
             "operational_impact": False,
+            "conclusive": False,
+            "evidence_status": "COVERAGE_LIMITED",
             "identity": {},
             "trade": {},
             "broker": {},
@@ -59566,6 +59596,7 @@ def live_trade_snapshot_v1_route():
             "timeline_validation": {},
             "external_exposure": {},
             "component_status": {},
+            "coverage": {},
             "divergences": [],
             "warnings": [],
             "errors": [{"code": "LIVE_TRADE_SNAPSHOT_ROUTE_INTERNAL_ERROR"}],

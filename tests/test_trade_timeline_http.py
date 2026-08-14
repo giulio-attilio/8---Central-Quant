@@ -71,6 +71,9 @@ def _report(result="PASS"):
         "valid": result == "PASS",
         "fail_open": True,
         "production_blocked": False,
+        "coverage": {},
+        "conclusive": True,
+        "evidence_status": "EVIDENCE_FOUND",
         "generated_at": "2026-07-13T12:00:00+00:00",
         "components": {"registry": {"status": "AVAILABLE"}},
         "events_found": [{"event": "SIGNAL_RECEIVED"}],
@@ -117,6 +120,9 @@ def test_valid_trade_id_is_trimmed_and_pass_contract_is_projected(monkeypatch):
         "pass": True,
         "fail_open": True,
         "production_blocked": False,
+        "coverage": {},
+        "conclusive": True,
+        "evidence_status": "EVIDENCE_FOUND",
         "generated_at": "2026-07-13T12:00:00+00:00",
         "component_status": {"registry": "AVAILABLE"},
         "events_found": [{"event": "SIGNAL_RECEIVED"}],
@@ -138,6 +144,34 @@ def test_logical_fail_returns_http_200(monkeypatch):
     assert payload["pass"] is False
     assert payload["missing_events"] == ["BROKER_ACK"]
     assert payload["production_blocked"] is False
+
+
+def test_optional_scan_cursor_is_forwarded_additively(monkeypatch):
+    route, _ = _compile_route({"trade_id": "TR-PAGE", "scan_cursor": "CURSOR-1"})
+    calls = []
+
+    def validate(trade_id, *, scan_cursor=None):
+        calls.append((trade_id, scan_cursor))
+        return _report("FAIL")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "trade_timeline_validator",
+        SimpleNamespace(validate_trade_timeline=validate),
+    )
+
+    payload, status = route()
+
+    assert status == 200
+    assert calls == [("TR-PAGE", "CURSOR-1")]
+    assert {"coverage", "conclusive", "evidence_status"}.issubset(payload)
+
+
+def test_invalid_scan_cursor_is_rejected_before_loading_validator():
+    route, _ = _compile_route({"trade_id": "TR-PAGE", "scan_cursor": ""})
+    payload, status = route()
+    assert status == 400
+    assert payload["error"] == "SCAN_CURSOR_INVALID"
 
 
 def test_unexpected_route_error_is_sanitized_500(monkeypatch):

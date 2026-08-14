@@ -50,7 +50,7 @@ def _install(monkeypatch, result=None, error=None):
 
 
 def _report(status="NOT_FOUND"):
-    return {"ok": True, "snapshot_version": "LIVE_TRADE_SNAPSHOT_V1", "generated_at": "2026-07-14T00:00:00Z", "trade_id": "TR-1", "snapshot_status": status, "trade_status": "UNKNOWN", "fail_open": True, "production_blocked": False, "operational_impact": False, "identity": {}, "trade": {}, "broker": {}, "registry": {}, "lifecycle": {}, "execution": {}, "risk_protection": {}, "management": {}, "shadow": {}, "telegram": {}, "timeline_validation": {}, "external_exposure": {}, "component_status": {}, "divergences": [], "warnings": [], "errors": []}
+    return {"ok": True, "snapshot_version": "LIVE_TRADE_SNAPSHOT_V1", "generated_at": "2026-07-14T00:00:00Z", "trade_id": "TR-1", "snapshot_status": status, "trade_status": "UNKNOWN", "fail_open": True, "production_blocked": False, "operational_impact": False, "conclusive": False, "evidence_status": "NOT_FOUND_IN_SCANNED_REGION", "identity": {}, "trade": {}, "broker": {}, "registry": {}, "lifecycle": {}, "execution": {}, "risk_protection": {}, "management": {}, "shadow": {}, "telegram": {}, "timeline_validation": {}, "external_exposure": {}, "component_status": {}, "divergences": [], "warnings": [], "errors": [], "coverage": {"aggregate": {"coverage_complete": False}}}
 
 
 def test_route_is_get_only():
@@ -69,6 +69,9 @@ def test_trim_and_not_found_return_200(monkeypatch):
     payload, status = route()
     assert status == 200 and payload["snapshot_status"] == "NOT_FOUND"
     assert calls == ["TR-1"]
+    assert payload["conclusive"] is False
+    assert payload["evidence_status"] == "NOT_FOUND_IN_SCANNED_REGION"
+    assert payload["coverage"]["aggregate"]["coverage_complete"] is False
 
 
 def test_open_closed_and_divergent_are_http_200(monkeypatch):

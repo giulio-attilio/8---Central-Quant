@@ -89,6 +89,10 @@ def test_not_found_with_partial_history_preserves_coverage():
     assert result["snapshot_status"] == "NOT_FOUND"
     assert result["component_status"]["history_manager"]["status"] == "PARTIAL"
     assert result["coverage"]["history_manager"]["coverage_limited"] is True
+    assert result["conclusive"] is False
+    assert result["evidence_status"] == "NOT_FOUND_IN_SCANNED_REGION"
+    assert result["timeline_validation"]["conclusive"] is False
+    assert result["timeline_validation"]["coverage"]["sources"]["history_manager"]["partial"] is True
     assert result["identity"]["matched_by"] == []
 
 

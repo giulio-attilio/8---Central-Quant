@@ -242,7 +242,18 @@ def _collect_sources(trade_id: str, sources: Mapping[str, Any]) -> tuple[Dict[st
             status[name] = {
                 "status": source_state,
                 "records": len(matched),
-                **{key: meta[key] for key in ("lines_scanned", "valid_lines", "invalid_lines", "partial", "bytes_scanned", "coverage_limited") if key in meta},
+                **{
+                    key: meta[key]
+                    for key in (
+                        "lines_scanned", "valid_lines", "invalid_lines", "partial",
+                        "bytes_scanned", "coverage_limited", "evidence_found",
+                        "coverage_complete", "conclusive", "records_examined",
+                        "direction", "time_range_scanned", "stop_reason",
+                        "source_size_bytes", "snapshot_eof", "next_scan_cursor",
+                        "evidence_status",
+                    )
+                    if key in meta
+                },
             }
             if meta.get("invalid_lines", 0):
                 warnings.append(_safe_issue(name, "CORRUPT_JSONL_LINES_SKIPPED", count=int(meta["invalid_lines"])))
@@ -611,7 +622,12 @@ def build_live_trade_snapshot(
                     raise OSError(f"{component} source unavailable")
                 validator_sources[name] = failed_source
             else:
-                validator_sources[name] = rows.get(name, [])
+                source_metadata = _metadata(raw_sources.get(name))
+                validator_sources[name] = (
+                    {"records": rows.get(name, []), "_reader_metadata": source_metadata}
+                    if source_metadata
+                    else rows.get(name, [])
+                )
         try:
             timeline_report = validate_trade_timeline(identity, sources=validator_sources, logger=active_logger)
         except Exception as exc:
@@ -741,6 +757,50 @@ def build_live_trade_snapshot(
         else:
             snapshot_status = "HEALTHY"
 
+        relevant_partial = any(
+            detail.get("status") in {"ERROR", "DEGRADED", "PARTIAL"}
+            or detail.get("partial")
+            or detail.get("coverage_limited")
+            or detail.get("coverage_complete") is False
+            for detail in relevant_component_status.values()
+        )
+        snapshot_conclusive = bool(
+            timeline_report.get("conclusive", not relevant_partial)
+            and not relevant_partial
+        )
+        if identified:
+            snapshot_evidence_status = str(timeline_report.get("evidence_status") or "EVIDENCE_FOUND")
+        elif not snapshot_conclusive:
+            snapshot_evidence_status = "NOT_FOUND_IN_SCANNED_REGION"
+        else:
+            snapshot_evidence_status = str(timeline_report.get("evidence_status") or "COMPLETE_NO_EVIDENCE")
+
+        timeline_coverage = copy.deepcopy(timeline_report.get("coverage") or {})
+        if not timeline_coverage:
+            timeline_coverage = {
+                "aggregate": {
+                    "evidence_found": identified,
+                    "coverage_complete": not relevant_partial,
+                    "partial": relevant_partial,
+                    "conclusive": snapshot_conclusive,
+                    "evidence_status": snapshot_evidence_status,
+                },
+                "sources": {
+                    name: {
+                        key: detail.get(key)
+                        for key in (
+                            "evidence_found", "coverage_complete", "partial", "conclusive",
+                            "bytes_scanned", "records_examined", "direction",
+                            "time_range_scanned", "stop_reason", "source_size_bytes",
+                            "snapshot_eof", "next_scan_cursor", "evidence_status",
+                            "coverage_limited",
+                        )
+                        if key in detail
+                    }
+                    for name, detail in relevant_component_status.items()
+                },
+            }
+
         timeline_validation = {
             "validation_status": timeline_report.get("result", "FAIL"),
             "pass": bool(timeline_report.get("valid", False)),
@@ -754,6 +814,9 @@ def build_live_trade_snapshot(
             "latencies": copy.deepcopy(timeline_report.get("latencies") or []),
             "warnings": copy.deepcopy(timeline_report.get("warnings") or []),
             "errors": [{key: item.get(key) for key in ("component", "error_type", "code") if item.get(key)} for item in (timeline_report.get("errors") or []) if isinstance(item, Mapping)],
+            "coverage": timeline_coverage,
+            "conclusive": bool(timeline_report.get("conclusive", not relevant_partial)),
+            "evidence_status": timeline_report.get("evidence_status") or snapshot_evidence_status,
             "fail_open": True,
             "production_blocked": False,
         }
@@ -768,6 +831,8 @@ def build_live_trade_snapshot(
             "fail_open": True,
             "production_blocked": False,
             "operational_impact": False,
+            "conclusive": snapshot_conclusive,
+            "evidence_status": snapshot_evidence_status,
             "identity": {**{key: identities.get(key) for key in ("trade_id", "registry_id", "lifecycle_id", "execution_id", "decision_id", "signal_id", "client_order_id", "broker_order_id")}, "correlation_ids": sorted(set(identities.values())), "matched_by": sorted(matched_by), "identity_confidence": "HIGH" if identified else "NONE"},
             "trade": {
                 "bot": registry.get("bot"), "setup": registry.get("setup"), "symbol": symbol,
@@ -840,7 +905,29 @@ def build_live_trade_snapshot(
             "warnings": warnings,
             "errors": errors,
             "grace_windows_seconds": dict(GRACE_WINDOWS),
-            "coverage": {name: {key: detail.get(key) for key in ("partial", "bytes_scanned", "coverage_limited") if key in detail} for name, detail in component_status.items()},
+            "coverage": {
+                **{
+                    name: {
+                        key: detail.get(key)
+                        for key in (
+                            "evidence_found", "coverage_complete", "partial", "conclusive",
+                            "bytes_scanned", "records_examined", "direction",
+                            "time_range_scanned", "stop_reason", "source_size_bytes",
+                            "snapshot_eof", "next_scan_cursor", "evidence_status",
+                            "coverage_limited",
+                        )
+                        if key in detail
+                    }
+                    for name, detail in component_status.items()
+                },
+                "aggregate": copy.deepcopy((timeline_report.get("coverage") or {}).get("aggregate") or {
+                    "evidence_found": identified,
+                    "coverage_complete": not relevant_partial,
+                    "partial": relevant_partial,
+                    "conclusive": snapshot_conclusive,
+                    "evidence_status": snapshot_evidence_status,
+                }),
+            },
             "duration_ms": round((time.perf_counter() - started) * 1000, 3),
         }
         json.dumps(result, ensure_ascii=False, default=str)
@@ -859,10 +946,11 @@ def build_live_trade_snapshot(
             "ok": False, "snapshot_version": SNAPSHOT_VERSION, "generated_at": _now_iso(),
             "trade_id": public_identity, "snapshot_status": "ERROR",
             "trade_status": "UNKNOWN", "fail_open": True, "production_blocked": False,
-            "operational_impact": False, "identity": {}, "trade": {}, "broker": {},
+            "operational_impact": False, "conclusive": False,
+            "evidence_status": "COVERAGE_LIMITED", "identity": {}, "trade": {}, "broker": {},
             "registry": {}, "lifecycle": {}, "execution": {}, "risk_protection": {},
             "management": {}, "shadow": {}, "telegram": {}, "timeline_validation": {},
-            "external_exposure": {}, "component_status": {}, "divergences": [],
+            "external_exposure": {}, "component_status": {}, "coverage": {}, "divergences": [],
             "warnings": [], "errors": [{"component": "snapshot", "code": "SNAPSHOT_INTERNAL_ERROR", "error_type": type(exc).__name__}],
         }
 

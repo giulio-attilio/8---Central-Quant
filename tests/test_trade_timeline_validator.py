@@ -124,6 +124,33 @@ def test_complete_valid_live_flow_passes_without_side_effects(monkeypatch):
     assert sources == original
 
 
+def test_complete_required_events_with_partial_reader_remain_non_conclusive():
+    sources = valid_sources()
+    sources["timeline"] = {
+        "records": sources["timeline"],
+        "_reader_metadata": {
+            "valid_lines": 2,
+            "records_examined": 2,
+            "partial": True,
+            "coverage_limited": True,
+            "coverage_complete": False,
+            "conclusive": False,
+            "direction": "REVERSE",
+            "stop_reason": "BYTE_BUDGET",
+            "evidence_found": True,
+            "evidence_status": "EVIDENCE_FOUND",
+        },
+    }
+
+    report = validate_trade_timeline(TRADE_ID, sources=sources)
+
+    assert report["result"] == "PASS"
+    assert report["events_missing"] == []
+    assert report["conclusive"] is False
+    assert report["coverage"]["aggregate"]["coverage_complete"] is False
+    assert report["evidence_status"] == "EVIDENCE_FOUND"
+
+
 def test_missing_event_fails_and_names_event():
     sources = valid_sources()
     sources["execution_engine"] = []
@@ -380,7 +407,10 @@ def test_jsonl_reader_limits_bytes_and_valid_lines_with_partial_coverage(tmp_pat
     assert component["records"] == 2
     assert component["partial"] is True
     assert component["coverage_limited"] is True
-    assert component["bytes_scanned"] < len(original)
+    assert component["bytes_scanned"] <= len(original)
+    assert component["records_examined"] == 2
+    assert component["stop_reason"] == "RECORD_BUDGET"
+    assert component["next_scan_cursor"]
 
 
 def test_corrupt_jsonl_read_is_read_only_and_has_no_network_or_broker_import(tmp_path, monkeypatch):

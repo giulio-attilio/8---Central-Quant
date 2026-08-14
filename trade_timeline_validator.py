@@ -7,9 +7,12 @@ arquivos locais lidos sob demanda e fontes alternativas podem ser injetadas.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -17,10 +20,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 
-VERSION = "2026-07-13-TRADE-TIMELINE-VALIDATOR-V1"
+VERSION = "2026-08-14-TRADE-TIMELINE-RECENT-IDENTITY-SCAN-V1"
 LOGGER = logging.getLogger(__name__)
 JSONL_MAX_BYTES = 64 * 1024 * 1024
 JSONL_MAX_VALID_LINES = 100_000
+JSONL_BLOCK_BYTES = 64 * 1024
+JSONL_CURSOR_VERSION = 1
 CORRELATION_PRE_OPEN_SECONDS = 15 * 60
 CORRELATION_POST_CLOSE_SECONDS = 24 * 60 * 60
 ENTRY_REFERENCE_TOLERANCE_RATIO = 0.001
@@ -172,6 +177,16 @@ IDENTITY_GROUPS = {
     "fill_id": "fill",
     "fill_ids": "fill",
 }
+
+STRONG_IDENTITY_GROUPS = {
+    "trade_uuid",
+    "registry",
+    "lifecycle",
+    "client_order",
+    "order",
+    "fill",
+}
+SECONDARY_IDENTITY_GROUPS = {"execution", "decision", "signal", "trade"}
 
 TIMESTAMP_KEYS = (
     "occurred_at",
@@ -376,6 +391,17 @@ def _strict_derived_stop_relation(
     )
 
 
+@dataclass(frozen=True)
+class TargetIdentity:
+    """Immutable view of the identity currently proven for one trade instance."""
+
+    trade_id: str
+    strong: Dict[str, frozenset[str]]
+    secondary: Dict[str, frozenset[str]]
+    registry_anchored: bool
+    ambiguous: bool
+
+
 @dataclass
 class CorrelationContext:
     """Typed, rejection-first correlation state shared by read-only sources."""
@@ -386,6 +412,8 @@ class CorrelationContext:
     profile: Dict[str, Optional[str]] = field(default_factory=lambda: {"bot": None, "setup": None, "symbol": None, "side": None})
     opened_epoch: Optional[float] = None
     closed_epoch: Optional[float] = None
+    registry_anchored: bool = False
+    identity_ambiguous: bool = False
 
     def __post_init__(self) -> None:
         self.trusted.setdefault("trade", set()).add(self.trade_id)
@@ -394,6 +422,27 @@ class CorrelationContext:
 
 def new_correlation_context(trade_id: str) -> CorrelationContext:
     return CorrelationContext(str(trade_id or "").strip())
+
+
+def target_identity_from_context(context: CorrelationContext) -> TargetIdentity:
+    strong_groups = set(STRONG_IDENTITY_GROUPS)
+    if context.registry_anchored:
+        strong_groups.add("trade")
+    return TargetIdentity(
+        trade_id=context.trade_id,
+        strong={
+            group: frozenset(context.trusted.get(group, set()))
+            for group in sorted(strong_groups)
+            if context.trusted.get(group)
+        },
+        secondary={
+            group: frozenset(context.trusted.get(group, set()))
+            for group in sorted(SECONDARY_IDENTITY_GROUPS - strong_groups)
+            if context.trusted.get(group)
+        },
+        registry_anchored=context.registry_anchored,
+        ambiguous=context.identity_ambiguous,
+    )
 
 
 def _grouped_identities(record: Mapping[str, Any]) -> Dict[str, set[str]]:
@@ -457,6 +506,7 @@ def _unrelated_client_order(grouped: Mapping[str, set[str]], context: Correlatio
 
 def _record_matches_context(record: Mapping[str, Any], component: str, context: CorrelationContext) -> bool:
     grouped = _grouped_identities(record)
+    target = target_identity_from_context(context)
     explicit_trade_ids = _identity_pairs(record).get("trade_id", set())
     if explicit_trade_ids and explicit_trade_ids != {context.trade_id}:
         return False
@@ -465,15 +515,20 @@ def _record_matches_context(record: Mapping[str, Any], component: str, context: 
 
     exact_trade = context.trade_id in explicit_trade_ids
     strong_match = False
+    secondary_match = False
     for group, supplied in grouped.items():
-        known = context.trusted.get(group, set())
+        known = set(target.strong.get(group, frozenset()))
+        if not known:
+            known = set(target.secondary.get(group, frozenset()))
         if group == "client_order":
             supplied = {value for value in supplied if not _is_derived_stop_client_id(value)}
         if known & supplied:
-            strong_match = True
-            break
+            if group in target.strong:
+                strong_match = True
+            else:
+                secondary_match = True
     derived_stop_match = _strict_derived_stop_relation(record, component, grouped, context)
-    if not (exact_trade or strong_match or derived_stop_match):
+    if not (exact_trade or strong_match or secondary_match or derived_stop_match):
         return False
     if _has_scoped_identity_conflict(record, context):
         return False
@@ -485,6 +540,27 @@ def _record_matches_context(record: Mapping[str, Any], component: str, context: 
 def _promote_record(record: Mapping[str, Any], component: str, context: CorrelationContext) -> None:
     pairs = _identity_pairs(record)
     grouped = _grouped_identities(record)
+    if component != "registry" and not context.registry_anchored:
+        # A reusable logical trade_id can select records for observation, but it
+        # cannot bootstrap new order/lifecycle identities.  Otherwise an older
+        # instance could poison the context and pull in unrelated history.
+        supplied_trade_ids = pairs.get("trade_id", set())
+        if context.trade_id in supplied_trade_ids or any(
+            context.trusted.get(group, set()) & values
+            for group, values in grouped.items()
+            if group in SECONDARY_IDENTITY_GROUPS
+        ):
+            context.identity_ambiguous = True
+        for key, values in pairs.items():
+            known = context.trusted_typed.get(key, set())
+            if known:
+                context.trusted_typed.setdefault(key, set()).update(known & values)
+        for group, values in grouped.items():
+            known = context.trusted.get(group, set())
+            if known:
+                context.trusted.setdefault(group, set()).update(known & values)
+        return
+
     for key, values in pairs.items():
         context.trusted_typed.setdefault(key, set()).update(values)
     for group, values in grouped.items():
@@ -493,6 +569,7 @@ def _promote_record(record: Mapping[str, Any], component: str, context: Correlat
             safe_values = {value for value in values if not _is_derived_stop_client_id(value)}
         context.trusted.setdefault(group, set()).update(safe_values)
     if component == "registry":
+        context.registry_anchored = True
         profile = _record_profile(record, component)
         for key, value in profile.items():
             if value:
@@ -576,49 +653,444 @@ def _new_reader_metadata() -> Dict[str, Any]:
         "partial": False,
         "bytes_scanned": 0,
         "coverage_limited": False,
+        "evidence_found": False,
+        "coverage_complete": True,
+        "conclusive": True,
+        "records_examined": 0,
+        "direction": "REVERSE",
+        "time_range_scanned": {"oldest": None, "newest": None},
+        "stop_reason": "NOT_SCANNED",
+        "source_size_bytes": 0,
+        "snapshot_eof": 0,
+        "next_scan_cursor": None,
+        "evidence_status": "COMPLETE_NO_EVIDENCE",
     }
 
 
 def _merge_reader_metadata(target: Dict[str, Any], source: Mapping[str, Any]) -> None:
-    for key in ("files_considered", "files_read", "lines_scanned", "valid_lines", "invalid_lines", "bytes_scanned"):
+    for key in (
+        "files_considered", "files_read", "lines_scanned", "valid_lines",
+        "invalid_lines", "bytes_scanned", "records_examined",
+        "source_size_bytes", "snapshot_eof",
+    ):
         target[key] = int(target.get(key, 0) or 0) + int(source.get(key, 0) or 0)
     target["partial"] = bool(target.get("partial") or source.get("partial"))
     target["coverage_limited"] = bool(target.get("coverage_limited") or source.get("coverage_limited"))
+    target["coverage_complete"] = bool(target.get("coverage_complete", True) and source.get("coverage_complete", True))
+    target["conclusive"] = bool(target.get("conclusive", True) and source.get("conclusive", True))
+    target["evidence_found"] = bool(target.get("evidence_found") or source.get("evidence_found"))
+    target["direction"] = source.get("direction") or target.get("direction") or "REVERSE"
+    source_range = source.get("time_range_scanned") if isinstance(source.get("time_range_scanned"), Mapping) else {}
+    target_range = target.get("time_range_scanned") if isinstance(target.get("time_range_scanned"), Mapping) else {}
+    oldest = [value for value in (target_range.get("oldest"), source_range.get("oldest")) if value]
+    newest = [value for value in (target_range.get("newest"), source_range.get("newest")) if value]
+    target["time_range_scanned"] = {
+        "oldest": min(oldest) if oldest else None,
+        "newest": max(newest) if newest else None,
+    }
+    source_reason = str(source.get("stop_reason") or "NOT_SCANNED")
+    if source.get("partial") or target.get("stop_reason") in (None, "NOT_SCANNED"):
+        target["stop_reason"] = source_reason
+    if source.get("next_scan_cursor"):
+        target["next_scan_cursor"] = source["next_scan_cursor"]
 
 
-def _read_path(path: Path, metadata: Optional[Dict[str, Any]] = None) -> Iterable[Mapping[str, Any]]:
+def _path_fingerprint(path: Path) -> str:
+    normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
+    return hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def _encode_scan_cursor(
+    path: Path,
+    file_stat: os.stat_result,
+    snapshot_eof: int,
+    next_end: int,
+    *,
+    oversized_line: bool = False,
+    coverage_tainted: bool = False,
+) -> str:
+    payload = {
+        "v": JSONL_CURSOR_VERSION,
+        "path": _path_fingerprint(path),
+        "dev": int(file_stat.st_dev),
+        "ino": int(file_stat.st_ino),
+        "snapshot_eof": int(snapshot_eof),
+        "next_end": int(next_end),
+        "oversized": bool(oversized_line),
+        "tainted": bool(coverage_tainted or oversized_line),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_scan_cursor(token: str) -> Dict[str, Any]:
+    if not isinstance(token, str) or not token or len(token) > 4096:
+        raise ValueError("invalid scan cursor")
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (ValueError, UnicodeError, json.JSONDecodeError, base64.binascii.Error) as exc:
+        raise ValueError("invalid scan cursor") from exc
+    required = {"v", "path", "dev", "ino", "snapshot_eof", "next_end"}
+    if not isinstance(value, Mapping) or not required.issubset(value) or value.get("v") != JSONL_CURSOR_VERSION:
+        raise ValueError("invalid scan cursor")
+    try:
+        decoded = {
+            "v": int(value["v"]),
+            "path": str(value["path"]),
+            "dev": int(value["dev"]),
+            "ino": int(value["ino"]),
+            "snapshot_eof": int(value["snapshot_eof"]),
+            "next_end": int(value["next_end"]),
+            "oversized": bool(value.get("oversized", False)),
+            "tainted": bool(value.get("tainted", False)),
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid scan cursor") from exc
+    if decoded["snapshot_eof"] < 0 or not 0 <= decoded["next_end"] <= decoded["snapshot_eof"]:
+        raise ValueError("invalid scan cursor")
+    return decoded
+
+
+def _cursor_targets_path(decoded: Optional[Mapping[str, Any]], path: Path) -> bool:
+    return bool(decoded and decoded.get("path") == _path_fingerprint(path))
+
+
+def _mark_source_changed(stats: Dict[str, Any], source_size: int = 0) -> None:
+    stats.update({
+        "partial": True,
+        "coverage_limited": True,
+        "coverage_complete": False,
+        "conclusive": False,
+        "stop_reason": "SOURCE_CHANGED",
+        "source_size_bytes": max(0, int(source_size)),
+        "evidence_status": "SOURCE_CHANGED",
+    })
+
+
+def _update_scanned_time(stats: Dict[str, Any], record: Mapping[str, Any]) -> None:
+    _epoch, normalized = _first_timestamp(record)
+    if not normalized:
+        return
+    time_range = stats["time_range_scanned"]
+    if time_range["oldest"] is None or normalized < time_range["oldest"]:
+        time_range["oldest"] = normalized
+    if time_range["newest"] is None or normalized > time_range["newest"]:
+        time_range["newest"] = normalized
+
+
+def _read_path(
+    path: Path,
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    scan_cursor: Optional[str] = None,
+) -> Iterable[Mapping[str, Any]]:
     stats = metadata if metadata is not None else _new_reader_metadata()
     stats["files_considered"] = int(stats.get("files_considered", 0) or 0) + 1
-    if not path.exists() or not path.is_file():
-        return
     if path.suffix.lower() == ".jsonl":
+        decoded_cursor = _decode_scan_cursor(scan_cursor) if scan_cursor else None
+        try:
+            path_stat = path.lstat()
+        except FileNotFoundError:
+            if decoded_cursor:
+                _mark_source_changed(stats)
+            else:
+                stats["stop_reason"] = "SOURCE_MISSING"
+            return
+        if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+            raise ValueError("JSONL source must be a regular non-symlink file")
+
         with path.open("rb") as handle:
+            descriptor_stat = os.fstat(handle.fileno())
+            if (
+                int(descriptor_stat.st_dev) != int(path_stat.st_dev)
+                or int(descriptor_stat.st_ino) != int(path_stat.st_ino)
+                or not stat.S_ISREG(descriptor_stat.st_mode)
+            ):
+                _mark_source_changed(stats, int(descriptor_stat.st_size))
+                return
             stats["files_read"] = int(stats.get("files_read", 0) or 0) + 1
-            for raw_line in handle:
-                if int(stats.get("bytes_scanned", 0) or 0) + len(raw_line) > JSONL_MAX_BYTES:
-                    stats["partial"] = True
-                    stats["coverage_limited"] = True
-                    break
-                stats["bytes_scanned"] = int(stats.get("bytes_scanned", 0) or 0) + len(raw_line)
-                stats["lines_scanned"] = int(stats.get("lines_scanned", 0) or 0) + 1
-                if not raw_line.strip():
-                    continue
+            source_size = int(descriptor_stat.st_size)
+            stats["source_size_bytes"] = source_size
+
+            if decoded_cursor:
+                if decoded_cursor["path"] != _path_fingerprint(path):
+                    raise ValueError("scan cursor belongs to another source")
+                if (
+                    decoded_cursor["dev"] != int(descriptor_stat.st_dev)
+                    or decoded_cursor["ino"] != int(descriptor_stat.st_ino)
+                    or source_size < decoded_cursor["snapshot_eof"]
+                ):
+                    stats["snapshot_eof"] = decoded_cursor["snapshot_eof"]
+                    _mark_source_changed(stats, source_size)
+                    return
+                snapshot_eof = decoded_cursor["snapshot_eof"]
+                page_end = decoded_cursor["next_end"]
+                if page_end > 0 and not decoded_cursor.get("oversized"):
+                    handle.seek(page_end - 1, os.SEEK_SET)
+                    if handle.read(1) != b"\n":
+                        raise ValueError("scan cursor is not aligned to a physical line")
+            else:
+                snapshot_eof = source_size
+                page_end = snapshot_eof
+            stats["snapshot_eof"] = snapshot_eof
+
+            def source_changed_after_read() -> tuple[bool, os.stat_result]:
+                final_descriptor = os.fstat(handle.fileno())
                 try:
-                    item = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    stats["invalid_lines"] = int(stats.get("invalid_lines", 0) or 0) + 1
+                    final_path = path.lstat()
+                except FileNotFoundError:
+                    final_path = None
+                changed = bool(
+                    final_path is None
+                    or stat.S_ISLNK(final_path.st_mode)
+                    or int(final_path.st_dev) != int(descriptor_stat.st_dev)
+                    or int(final_path.st_ino) != int(descriptor_stat.st_ino)
+                    or int(final_descriptor.st_size) < snapshot_eof
+                )
+                return changed, final_descriptor
+
+            region_start = max(0, page_end - JSONL_MAX_BYTES)
+            offset = page_end
+            scan_chunks: list[bytes] = []
+            bytes_read = 0
+            short_read = False
+            cursor_tainted = bool(decoded_cursor and decoded_cursor.get("tainted"))
+            if decoded_cursor and decoded_cursor.get("oversized"):
+                # This page ends in the middle of a line already proven larger
+                # than MAX_BYTES. Skip backwards without ever parsing a fragment
+                # as an independent JSON document.
+                next_end = None
+                while offset > region_start:
+                    block_start = max(region_start, offset - JSONL_BLOCK_BYTES)
+                    handle.seek(block_start, os.SEEK_SET)
+                    chunk = handle.read(offset - block_start)
+                    bytes_read += len(chunk)
+                    if len(chunk) != offset - block_start:
+                        short_read = True
+                        break
+                    preceding_newline = chunk.rfind(b"\n")
+                    if preceding_newline >= 0:
+                        next_end = block_start + preceding_newline + 1
+                        break
+                    offset = block_start
+                stats["bytes_scanned"] = bytes_read
+                stats.update({
+                    "partial": True,
+                    "coverage_limited": True,
+                    "coverage_complete": False,
+                    "conclusive": False,
+                    "stop_reason": "LINE_EXCEEDS_BYTE_BUDGET",
+                    "evidence_status": "COVERAGE_LIMITED",
+                })
+                if short_read:
+                    _mark_source_changed(stats, int(os.fstat(handle.fileno()).st_size))
+                elif next_end is not None:
+                    stats["next_scan_cursor"] = _encode_scan_cursor(
+                        path,
+                        descriptor_stat,
+                        snapshot_eof,
+                        next_end,
+                        coverage_tainted=True,
+                    )
+                elif region_start > 0:
+                    stats["next_scan_cursor"] = _encode_scan_cursor(
+                        path,
+                        descriptor_stat,
+                        snapshot_eof,
+                        region_start,
+                        oversized_line=True,
+                        coverage_tainted=True,
+                    )
+                changed, final_descriptor = source_changed_after_read()
+                if changed:
+                    _mark_source_changed(stats, int(final_descriptor.st_size))
+                    stats["next_scan_cursor"] = None
+                return
+
+            earliest_examined = page_end
+            loaded_start = page_end
+            record_budget_hit = False
+            boundary_newline_seen = False
+            carry = b""
+            unresolved_parts: list[bytes] = []
+
+            def examine_line(raw_line: bytes, absolute_start: int) -> bool:
+                nonlocal earliest_examined
+                earliest_examined = absolute_start
+                stats["lines_scanned"] += 1
+                if raw_line.strip():
+                    stats["records_examined"] += 1
+                    try:
+                        item = json.loads(raw_line.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        stats["invalid_lines"] += 1
+                    else:
+                        stats["valid_lines"] += 1
+                        if isinstance(item, Mapping):
+                            _update_scanned_time(stats, item)
+                return stats["records_examined"] >= JSONL_MAX_VALID_LINES
+
+            while offset > region_start and not record_budget_hit:
+                block_start = max(region_start, offset - JSONL_BLOCK_BYTES)
+                handle.seek(block_start, os.SEEK_SET)
+                chunk = handle.read(offset - block_start)
+                bytes_read += len(chunk)
+                if len(chunk) != offset - block_start:
+                    short_read = True
+                    break
+                scan_chunks.append(chunk)
+                loaded_start = block_start
+                offset = block_start
+
+                if b"\n" not in chunk:
+                    if carry:
+                        unresolved_parts.append(carry)
+                        carry = b""
+                    unresolved_parts.append(chunk)
                     continue
-                stats["valid_lines"] = int(stats.get("valid_lines", 0) or 0) + 1
+
+                combined = chunk
+                if unresolved_parts:
+                    combined += b"".join(reversed(unresolved_parts))
+                    unresolved_parts = []
+                else:
+                    combined += carry
+                carry = b""
+
+                first_newline = combined.find(b"\n")
+                boundary_newline_seen = True
+                line_end = len(combined) - (1 if combined.endswith(b"\n") else 0)
+                while line_end > first_newline:
+                    previous_newline = combined.rfind(b"\n", first_newline + 1, line_end)
+                    line_start = previous_newline + 1 if previous_newline > first_newline else first_newline + 1
+                    if examine_line(combined[line_start:line_end], block_start + line_start):
+                        record_budget_hit = (block_start + line_start) > 0
+                        break
+                    if previous_newline <= first_newline:
+                        break
+                    line_end = previous_newline
+                carry = combined[:first_newline]
+
+            if short_read:
+                _mark_source_changed(stats, int(os.fstat(handle.fileno()).st_size))
+                return
+
+            if unresolved_parts:
+                carry = b"".join(reversed(unresolved_parts))
+
+            if not record_budget_hit and region_start == 0 and page_end > 0:
+                if examine_line(carry, 0):
+                    record_budget_hit = False  # exactly MAX_RECORDS at file start is complete
+
+            stats["bytes_scanned"] = bytes_read
+            next_end: Optional[int] = None
+            if record_budget_hit:
+                next_end = earliest_examined
+                stats["stop_reason"] = "RECORD_BUDGET"
+            elif region_start > 0:
+                aligned_start = region_start + len(carry) + 1 if boundary_newline_seen else region_start
+                if not boundary_newline_seen or aligned_start >= page_end:
+                    stats.update({
+                        "partial": True,
+                        "coverage_limited": True,
+                        "coverage_complete": False,
+                        "conclusive": False,
+                        "stop_reason": "LINE_EXCEEDS_BYTE_BUDGET",
+                        "evidence_status": "COVERAGE_LIMITED",
+                        "next_scan_cursor": _encode_scan_cursor(
+                            path,
+                            descriptor_stat,
+                            snapshot_eof,
+                            region_start,
+                            oversized_line=True,
+                            coverage_tainted=True,
+                        ),
+                    })
+                    changed, final_descriptor = source_changed_after_read()
+                    if changed:
+                        _mark_source_changed(stats, int(final_descriptor.st_size))
+                        stats["next_scan_cursor"] = None
+                    return
+                next_end = aligned_start
+                earliest_examined = aligned_start
+                stats["stop_reason"] = "BYTE_BUDGET"
+            else:
+                earliest_examined = 0
+                stats["stop_reason"] = "START_OF_SNAPSHOT"
+
+            if next_end is not None and next_end > 0:
+                stats.update({
+                    "partial": True,
+                    "coverage_limited": True,
+                    "coverage_complete": False,
+                    "conclusive": False,
+                    "evidence_status": "COVERAGE_LIMITED",
+                    "next_scan_cursor": _encode_scan_cursor(
+                        path,
+                        descriptor_stat,
+                        snapshot_eof,
+                        next_end,
+                        # A continuation report does not carry records/events
+                        # from newer pages, so it must never become conclusive
+                        # merely because this page reaches byte zero.
+                        coverage_tainted=True,
+                    ),
+                })
+
+            if cursor_tainted:
+                stats.update({
+                    "partial": True,
+                    "coverage_limited": True,
+                    "coverage_complete": False,
+                    "conclusive": False,
+                    "evidence_status": "COVERAGE_LIMITED",
+                })
+                if next_end is None:
+                    stats["stop_reason"] = "PRIOR_PAGE_COVERAGE_LIMITED"
+
+            source_changed, final_descriptor_stat = source_changed_after_read()
+            if source_changed:
+                _mark_source_changed(stats, int(final_descriptor_stat.st_size))
+                stats["next_scan_cursor"] = None
+
+            # Reverse physical selection is deliberately replayed in file order
+            # so correlation and identity promotion retain their old chronology.
+            payload = b"".join(reversed(scan_chunks))
+            replay_offset = max(0, earliest_examined - loaded_start)
+            while replay_offset < len(payload):
+                newline = payload.find(b"\n", replay_offset)
+                if newline < 0:
+                    selected_end = len(payload)
+                    next_offset = len(payload)
+                else:
+                    selected_end = newline
+                    next_offset = newline + 1
+                raw_line = payload[replay_offset:selected_end]
+                try:
+                    item = json.loads(raw_line.decode("utf-8")) if raw_line.strip() else None
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    item = None
                 if isinstance(item, Mapping):
                     yield item
-                if int(stats.get("valid_lines", 0) or 0) >= JSONL_MAX_VALID_LINES:
-                    stats["partial"] = True
-                    stats["coverage_limited"] = True
-                    break
+                replay_offset = next_offset
+        return
+
+    if not path.exists() or not path.is_file():
+        stats["stop_reason"] = "SOURCE_MISSING"
         return
     stats["files_read"] = int(stats.get("files_read", 0) or 0) + 1
-    stats["bytes_scanned"] = path.stat().st_size
-    data = json.loads(path.read_text(encoding="utf-8"))
+    file_size = path.stat().st_size
+    stats.update({
+        "bytes_scanned": file_size,
+        "source_size_bytes": file_size,
+        "snapshot_eof": file_size,
+        "records_examined": 1,
+        "direction": "FULL_DOCUMENT",
+        "stop_reason": "FULL_DOCUMENT",
+    })
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
     stats["valid_lines"] = 1
     if isinstance(data, Mapping):
         yield data
@@ -626,24 +1098,56 @@ def _read_path(path: Path, metadata: Optional[Dict[str, Any]] = None) -> Iterabl
         yield from (item for item in data if isinstance(item, Mapping))
 
 
-def _default_reader(component: str, paths: tuple[Path, ...], context: Optional[CorrelationContext] = None) -> Callable[[str], Dict[str, Any]]:
+def _default_reader(
+    component: str,
+    paths: tuple[Path, ...],
+    context: Optional[CorrelationContext] = None,
+    scan_cursor: Optional[str] = None,
+) -> Callable[[str], Dict[str, Any]]:
     def read(trade_id: str) -> Dict[str, Any]:
         active_context = context if context is not None else new_correlation_context(trade_id)
-        candidates: list[Mapping[str, Any]] = []
+        matched: list[Mapping[str, Any]] = []
         reader_metadata = _new_reader_metadata()
+        decoded_cursor = _decode_scan_cursor(scan_cursor) if scan_cursor else None
         for path in paths:
             path_metadata = _new_reader_metadata()
-            for row in _read_path(path, path_metadata):
-                candidates.append(row)
+            path_cursor = scan_cursor if _cursor_targets_path(decoded_cursor, path) else None
+            for row in _read_path(path, path_metadata, scan_cursor=path_cursor):
+                matched.extend(correlate_source_records(component, (row,), active_context))
+            path_metadata["evidence_found"] = bool(matched)
             _merge_reader_metadata(reader_metadata, path_metadata)
-        matched = correlate_source_records(component, candidates, active_context)
+        ambiguous = bool(active_context.identity_ambiguous and not active_context.registry_anchored)
+        reader_metadata["evidence_found"] = bool(matched)
+        reader_metadata["conclusive"] = bool(reader_metadata["coverage_complete"] and not ambiguous)
+        if ambiguous:
+            reader_metadata["evidence_status"] = "IDENTITY_AMBIGUOUS"
+        elif reader_metadata.get("stop_reason") == "SOURCE_CHANGED":
+            reader_metadata["evidence_status"] = "SOURCE_CHANGED"
+        elif matched:
+            reader_metadata["evidence_status"] = "EVIDENCE_FOUND"
+        elif reader_metadata["coverage_complete"]:
+            reader_metadata["evidence_status"] = "COMPLETE_NO_EVIDENCE"
+        else:
+            reader_metadata["evidence_status"] = "NOT_FOUND_IN_SCANNED_REGION"
         return {"records": matched, "_reader_metadata": reader_metadata}
 
     return read
 
 
-def build_default_sources(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Callable[[str], Dict[str, Any]]]:
+def build_default_sources(
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    scan_cursor: Optional[str] = None,
+) -> Dict[str, Callable[[str], Dict[str, Any]]]:
     """Constroi leitores locais. Nao le arquivos ate a validacao ser solicitada."""
+    configured_paths = default_source_paths(environ)
+    decoded_cursor = _decode_scan_cursor(scan_cursor) if scan_cursor else None
+    if decoded_cursor and not any(
+        path.suffix.lower() == ".jsonl" and _cursor_targets_path(decoded_cursor, path)
+        for paths in configured_paths.values()
+        for path in paths
+    ):
+        raise ValueError("scan cursor belongs to an unconfigured source")
     context = new_correlation_context("")
 
     def reader_for(name: str, paths: tuple[Path, ...]) -> Callable[[str], Dict[str, Any]]:
@@ -656,11 +1160,13 @@ def build_default_sources(environ: Optional[Mapping[str, str]] = None) -> Dict[s
                 context.profile = fresh.profile
                 context.opened_epoch = None
                 context.closed_epoch = None
-            return _default_reader(name, paths, context)(trade_id)
+                context.registry_anchored = False
+                context.identity_ambiguous = False
+            return _default_reader(name, paths, context, scan_cursor=scan_cursor)(trade_id)
 
         return read
 
-    return {name: reader_for(name, paths) for name, paths in default_source_paths(environ).items()}
+    return {name: reader_for(name, paths) for name, paths in configured_paths.items()}
 
 
 def _coerce_records(value: Any) -> list[Mapping[str, Any]]:
@@ -684,15 +1190,33 @@ def _reader_metadata(value: Any) -> Dict[str, Any]:
     if not isinstance(value, Mapping) or not isinstance(value.get("_reader_metadata"), Mapping):
         return {}
     metadata = value["_reader_metadata"]
-    return {
+    partial = bool(metadata.get("partial", False))
+    coverage_limited = bool(metadata.get("coverage_limited", False))
+    coverage_complete = bool(metadata.get("coverage_complete", not (partial or coverage_limited)))
+    projected = {
         "lines_scanned": int(metadata.get("lines_scanned", 0) or 0),
         "valid_lines": int(metadata.get("valid_lines", 0) or 0),
         "invalid_lines": int(metadata.get("invalid_lines", 0) or 0),
-        "partial": bool(metadata.get("partial", False)),
+        "partial": partial,
         "bytes_scanned": int(metadata.get("bytes_scanned", 0) or 0),
-        "coverage_limited": bool(metadata.get("coverage_limited", False)),
+        "coverage_limited": coverage_limited,
         "files_read": int(metadata.get("files_read", 0) or 0),
+        "evidence_found": bool(metadata.get("evidence_found", False)),
+        "coverage_complete": coverage_complete,
+        "conclusive": bool(metadata.get("conclusive", coverage_complete)),
+        "records_examined": int(metadata.get("records_examined", metadata.get("valid_lines", 0)) or 0),
+        "direction": str(metadata.get("direction") or "UNKNOWN"),
+        "time_range_scanned": dict(metadata.get("time_range_scanned") or {"oldest": None, "newest": None}),
+        "stop_reason": str(metadata.get("stop_reason") or "UNKNOWN"),
+        "source_size_bytes": int(metadata.get("source_size_bytes", 0) or 0),
+        "snapshot_eof": int(metadata.get("snapshot_eof", 0) or 0),
+        "evidence_status": str(metadata.get("evidence_status") or (
+            "NOT_FOUND_IN_SCANNED_REGION" if not coverage_complete else "COMPLETE_NO_EVIDENCE"
+        )),
     }
+    if metadata.get("next_scan_cursor"):
+        projected["next_scan_cursor"] = str(metadata["next_scan_cursor"])
+    return projected
 
 
 def _parse_timestamp(value: Any) -> tuple[Optional[float], Optional[str]]:
@@ -1238,8 +1762,17 @@ def _compare(left_name: str, right_name: str, facts: Mapping[str, Mapping[str, A
 class TradeTimelineValidator:
     """Validador read-only. Excecoes de fontes sao convertidas em evidencia."""
 
-    def __init__(self, sources: Optional[Mapping[str, Any]] = None, logger: Optional[logging.Logger] = None):
-        self.sources = dict(sources) if sources is not None else build_default_sources()
+    def __init__(
+        self,
+        sources: Optional[Mapping[str, Any]] = None,
+        logger: Optional[logging.Logger] = None,
+        scan_cursor: Optional[str] = None,
+    ):
+        self.sources = (
+            dict(sources)
+            if sources is not None
+            else build_default_sources(scan_cursor=scan_cursor)
+        )
         self.logger = logger or LOGGER
 
     def validate(self, trade_id: str) -> Dict[str, Any]:
@@ -1251,6 +1784,7 @@ class TradeTimelineValidator:
         errors = []
         warnings = []
         correlation = new_correlation_context(identity)
+        source_coverage: Dict[str, Dict[str, Any]] = {}
 
         if not identity:
             errors.append({"component": "validator", "error_type": "ValueError", "message": "trade_id is required"})
@@ -1260,11 +1794,33 @@ class TradeTimelineValidator:
             if source is None:
                 components[name] = {"status": "UNAVAILABLE", "records": 0}
                 records[name] = []
+                source_coverage[name] = {
+                    "evidence_found": False,
+                    "coverage_complete": False,
+                    "partial": True,
+                    "conclusive": False,
+                    "bytes_scanned": 0,
+                    "records_examined": 0,
+                    "direction": "UNAVAILABLE",
+                    "time_range_scanned": {"oldest": None, "newest": None},
+                    "stop_reason": "SOURCE_UNAVAILABLE",
+                    "source_size_bytes": 0,
+                    "snapshot_eof": 0,
+                    "evidence_status": "COVERAGE_LIMITED",
+                }
                 continue
             try:
                 value = source(identity) if callable(source) else source
                 rows = correlate_source_records(name, _coerce_records(value), correlation)
                 reader_metadata = _reader_metadata(value)
+                if reader_metadata:
+                    reader_metadata["evidence_found"] = bool(
+                        rows or reader_metadata.get("evidence_found", False)
+                    )
+                    if rows and reader_metadata.get("evidence_status") not in {
+                        "SOURCE_CHANGED", "IDENTITY_AMBIGUOUS"
+                    }:
+                        reader_metadata["evidence_status"] = "EVIDENCE_FOUND"
                 records[name] = rows
                 fully_corrupt = bool(
                     reader_metadata.get("files_read", 0) > 0
@@ -1274,6 +1830,25 @@ class TradeTimelineValidator:
                 )
                 status = "AVAILABLE" if rows else ("DEGRADED" if fully_corrupt else "NO_EVIDENCE")
                 components[name] = {"status": status, "records": len(rows), **reader_metadata}
+                source_coverage[name] = {
+                    "evidence_found": bool(reader_metadata.get("evidence_found", bool(rows))),
+                    "coverage_complete": bool(reader_metadata.get("coverage_complete", True)),
+                    "partial": bool(reader_metadata.get("partial", False)),
+                    "conclusive": bool(reader_metadata.get("conclusive", True)),
+                    "bytes_scanned": int(reader_metadata.get("bytes_scanned", 0) or 0),
+                    "records_examined": int(reader_metadata.get("records_examined", len(rows)) or 0),
+                    "direction": reader_metadata.get("direction", "IN_MEMORY"),
+                    "time_range_scanned": dict(reader_metadata.get("time_range_scanned") or {"oldest": None, "newest": None}),
+                    "stop_reason": reader_metadata.get("stop_reason", "IN_MEMORY_COMPLETE"),
+                    "source_size_bytes": int(reader_metadata.get("source_size_bytes", 0) or 0),
+                    "snapshot_eof": int(reader_metadata.get("snapshot_eof", 0) or 0),
+                    "evidence_status": reader_metadata.get(
+                        "evidence_status",
+                        "EVIDENCE_FOUND" if rows else "COMPLETE_NO_EVIDENCE",
+                    ),
+                }
+                if reader_metadata.get("next_scan_cursor"):
+                    source_coverage[name]["next_scan_cursor"] = reader_metadata["next_scan_cursor"]
                 if reader_metadata.get("invalid_lines", 0) > 0:
                     warnings.append({
                         "component": name,
@@ -1294,6 +1869,20 @@ class TradeTimelineValidator:
             except Exception as exc:
                 records[name] = []
                 components[name] = {"status": "ERROR", "records": 0, "error_type": type(exc).__name__, "error": str(exc)[:300]}
+                source_coverage[name] = {
+                    "evidence_found": False,
+                    "coverage_complete": False,
+                    "partial": True,
+                    "conclusive": False,
+                    "bytes_scanned": 0,
+                    "records_examined": 0,
+                    "direction": "ERROR",
+                    "time_range_scanned": {"oldest": None, "newest": None},
+                    "stop_reason": "SOURCE_ERROR",
+                    "source_size_bytes": 0,
+                    "snapshot_eof": 0,
+                    "evidence_status": "COVERAGE_LIMITED",
+                }
                 errors.append({"component": name, "error_type": type(exc).__name__, "message": str(exc)[:300]})
                 _structured_log(self.logger, "warning", "TRADE_TIMELINE_SOURCE_ERROR", trade_id=identity, component=name, error_type=type(exc).__name__)
 
@@ -1314,6 +1903,64 @@ class TradeTimelineValidator:
         validation_errors = bool(errors or missing or duplicates or divergences or not chronology["ordered"] or timeline_absent or not identity)
         result = "FAIL" if validation_errors else "PASS"
 
+        ranges = [
+            detail["time_range_scanned"]
+            for detail in source_coverage.values()
+            if isinstance(detail.get("time_range_scanned"), Mapping)
+        ]
+        oldest = [item.get("oldest") for item in ranges if item.get("oldest")]
+        newest = [item.get("newest") for item in ranges if item.get("newest")]
+        coverage_complete = all(
+            bool(detail.get("coverage_complete", False))
+            for detail in source_coverage.values()
+        )
+        partial = any(bool(detail.get("partial", False)) for detail in source_coverage.values())
+        evidence_found = any(bool(detail.get("evidence_found", False)) for detail in source_coverage.values())
+        identity_ambiguous = bool(correlation.identity_ambiguous and not correlation.registry_anchored)
+        conclusive = bool(coverage_complete and not identity_ambiguous and not errors)
+        reasons = {str(detail.get("stop_reason") or "UNKNOWN") for detail in source_coverage.values()}
+        if "SOURCE_CHANGED" in reasons:
+            stop_reason = "SOURCE_CHANGED"
+        elif partial:
+            stop_reason = "COVERAGE_LIMITED"
+        elif len(reasons) == 1:
+            stop_reason = next(iter(reasons))
+        else:
+            stop_reason = "MULTIPLE_COMPLETE_SOURCES"
+        if identity_ambiguous:
+            evidence_status = "IDENTITY_AMBIGUOUS"
+        elif "SOURCE_CHANGED" in reasons:
+            evidence_status = "SOURCE_CHANGED"
+        elif evidence_found:
+            evidence_status = "EVIDENCE_FOUND"
+        elif coverage_complete:
+            evidence_status = "COMPLETE_NO_EVIDENCE"
+        else:
+            evidence_status = "NOT_FOUND_IN_SCANNED_REGION"
+        aggregate_coverage: Dict[str, Any] = {
+            "evidence_found": evidence_found,
+            "coverage_complete": coverage_complete,
+            "partial": partial,
+            "conclusive": conclusive,
+            "bytes_scanned": sum(int(detail.get("bytes_scanned", 0) or 0) for detail in source_coverage.values()),
+            "records_examined": sum(int(detail.get("records_examined", 0) or 0) for detail in source_coverage.values()),
+            "direction": "REVERSE" if any(detail.get("direction") == "REVERSE" for detail in source_coverage.values()) else "IN_MEMORY",
+            "time_range_scanned": {
+                "oldest": min(oldest) if oldest else None,
+                "newest": max(newest) if newest else None,
+            },
+            "stop_reason": stop_reason,
+            "source_size_bytes": sum(int(detail.get("source_size_bytes", 0) or 0) for detail in source_coverage.values()),
+            "snapshot_eof": sum(int(detail.get("snapshot_eof", 0) or 0) for detail in source_coverage.values()),
+        }
+        next_cursors = {
+            name: detail["next_scan_cursor"]
+            for name, detail in source_coverage.items()
+            if detail.get("next_scan_cursor")
+        }
+        if next_cursors:
+            aggregate_coverage["next_scan_cursors"] = next_cursors
+
         report = {
             "ok": True,
             "module": "trade_timeline_validator",
@@ -1325,6 +1972,9 @@ class TradeTimelineValidator:
             "audit_only": True,
             "fail_open": True,
             "production_blocked": False,
+            "coverage": {"aggregate": aggregate_coverage, "sources": source_coverage},
+            "conclusive": conclusive,
+            "evidence_status": evidence_status,
             "authorities": {
                 "write_access": False,
                 "registry_write_access": False,
@@ -1357,10 +2007,20 @@ class TradeTimelineValidator:
         return report
 
 
-def validate_trade_timeline(trade_id: str, *, sources: Optional[Mapping[str, Any]] = None, logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
+def validate_trade_timeline(
+    trade_id: str,
+    *,
+    sources: Optional[Mapping[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
+    scan_cursor: Optional[str] = None,
+) -> Dict[str, Any]:
     """API publica fail-open para validacao de um trade."""
     try:
-        return TradeTimelineValidator(sources=sources, logger=logger).validate(trade_id)
+        return TradeTimelineValidator(
+            sources=sources,
+            logger=logger,
+            scan_cursor=scan_cursor,
+        ).validate(trade_id)
     except Exception as exc:  # ultima barreira: auditoria nunca afeta a operacao
         active_logger = logger or LOGGER
         _structured_log(active_logger, "exception", "TRADE_TIMELINE_VALIDATION_ERROR", trade_id=str(trade_id or ""), error_type=type(exc).__name__)
@@ -1375,6 +2035,24 @@ def validate_trade_timeline(trade_id: str, *, sources: Optional[Mapping[str, Any
             "audit_only": True,
             "fail_open": True,
             "production_blocked": False,
+            "coverage": {
+                "aggregate": {
+                    "evidence_found": False,
+                    "coverage_complete": False,
+                    "partial": True,
+                    "conclusive": False,
+                    "bytes_scanned": 0,
+                    "records_examined": 0,
+                    "direction": "ERROR",
+                    "time_range_scanned": {"oldest": None, "newest": None},
+                    "stop_reason": "VALIDATOR_ERROR",
+                    "source_size_bytes": 0,
+                    "snapshot_eof": 0,
+                },
+                "sources": {},
+            },
+            "conclusive": False,
+            "evidence_status": "COVERAGE_LIMITED",
             "errors": [{"component": "validator", "error_type": type(exc).__name__, "message": str(exc)[:300]}],
         }
 
@@ -1384,10 +2062,12 @@ __all__ = [
     "EVENT_ORDER",
     "REQUIRED_EVENTS",
     "CorrelationContext",
+    "TargetIdentity",
     "TradeTimelineValidator",
     "build_default_sources",
     "correlate_source_records",
     "default_source_paths",
     "new_correlation_context",
+    "target_identity_from_context",
     "validate_trade_timeline",
 ]
