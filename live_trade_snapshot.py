@@ -11,8 +11,10 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 from trade_timeline_validator import COMPONENTS as TIMELINE_COMPONENTS
 from trade_timeline_validator import (
+    apply_identity_resolution_metadata,
     build_default_sources,
     correlate_source_records,
+    identity_resolution_metadata,
     new_correlation_context,
     validate_trade_timeline,
 )
@@ -38,6 +40,12 @@ IDENTITY_KEYS = {
     "decision_id", "signal_id", "client_order_id", "clientorderid",
     "broker_order_id", "exchange_order_id", "broker_stop_order_id",
     "disaster_stop_order_id", "order_id", "fill_id", "fill_ids",
+}
+IDENTITY_ALIASES = {
+    "registry_record_id": "registry_id",
+    "trade_lifecycle_id": "lifecycle_id",
+    "tradelifecycleid": "lifecycle_id",
+    "position_uuid": "trade_uuid",
 }
 FINAL_EVENTS = {"LIVE_TRADE_CLOSED", "REGISTRY_CLOSE", "LIFECYCLE_FINISHED"}
 ENTRY_CONFIRMED_STATES = {
@@ -93,7 +101,7 @@ def _identity_values(value: Any) -> Dict[str, str]:
     found: Dict[str, str] = {}
     for item in _walk(value):
         for key, raw in item.items():
-            normalized = str(key).lower()
+            normalized = IDENTITY_ALIASES.get(str(key).lower(), str(key).lower())
             if normalized in IDENTITY_KEYS and raw not in (None, ""):
                 found.setdefault(normalized, str(raw).strip())
     return found
@@ -215,8 +223,20 @@ def _safe_issue(component: str, code: str, **extra: Any) -> Dict[str, Any]:
     return {"component": component, "code": code, **allowed}
 
 
-def _collect_sources(trade_id: str, sources: Mapping[str, Any]) -> tuple[Dict[str, list[Mapping[str, Any]]], Dict[str, Any], Dict[str, Any], list, list]:
-    correlation = new_correlation_context(trade_id)
+def _collect_sources(
+    trade_id: str,
+    sources: Mapping[str, Any],
+    *,
+    opened_at: Any = None,
+    opened_epoch: Any = None,
+    instance_id: Any = None,
+) -> tuple[Dict[str, list[Mapping[str, Any]]], Dict[str, Any], Dict[str, Any], list, list, Any]:
+    correlation = new_correlation_context(
+        trade_id,
+        opened_at=opened_at,
+        opened_epoch=opened_epoch,
+        instance_id=instance_id,
+    )
     rows_by_source: Dict[str, list[Mapping[str, Any]]] = {}
     raw_by_source: Dict[str, Any] = {}
     status: Dict[str, Any] = {}
@@ -230,6 +250,7 @@ def _collect_sources(trade_id: str, sources: Mapping[str, Any]) -> tuple[Dict[st
             continue
         try:
             value = source(trade_id) if callable(source) else source
+            apply_identity_resolution_metadata(correlation, value)
             candidates = _records(value)
             if name == "external_exposure":
                 matched = candidates
@@ -255,6 +276,11 @@ def _collect_sources(trade_id: str, sources: Mapping[str, Any]) -> tuple[Dict[st
                     if key in meta
                 },
             }
+            if name == "registry" and correlation.registry_candidate_count:
+                status[name]["identity_ambiguous"] = bool(
+                    correlation.identity_ambiguous and not correlation.registry_anchored
+                )
+                status[name]["candidate_count"] = correlation.registry_candidate_count
             if meta.get("invalid_lines", 0):
                 warnings.append(_safe_issue(name, "CORRUPT_JSONL_LINES_SKIPPED", count=int(meta["invalid_lines"])))
         except Exception as exc:
@@ -262,7 +288,7 @@ def _collect_sources(trade_id: str, sources: Mapping[str, Any]) -> tuple[Dict[st
             raw_by_source[name] = None
             status[name] = {"status": "ERROR", "records": 0, "error_type": type(exc).__name__}
             errors.append(_safe_issue(name, "SOURCE_READ_ERROR"))
-    return rows_by_source, raw_by_source, status, warnings, errors
+    return rows_by_source, raw_by_source, status, warnings, errors, correlation
 
 
 def _direct_first(records: Iterable[Mapping[str, Any]], *keys: str) -> Any:
@@ -606,14 +632,31 @@ def build_live_trade_snapshot(
     sources: Optional[Mapping[str, Any]] = None,
     now_epoch: Optional[float] = None,
     logger: Optional[logging.Logger] = None,
+    opened_at: Any = None,
+    opened_epoch: Any = None,
+    instance_id: Any = None,
 ) -> Dict[str, Any]:
     """Constroi snapshot sem escrita, rede, broker ou autoridade operacional."""
     started = time.perf_counter()
     active_logger = logger or LOGGER
     try:
         identity = _safe_id(trade_id)
-        source_map = dict(sources) if sources is not None else build_default_sources()
-        rows, raw_sources, component_status, warnings, errors = _collect_sources(identity, source_map)
+        source_map = (
+            dict(sources)
+            if sources is not None
+            else build_default_sources(
+                opened_at=opened_at,
+                opened_epoch=opened_epoch,
+                instance_id=instance_id,
+            )
+        )
+        rows, raw_sources, component_status, warnings, errors, correlation = _collect_sources(
+            identity,
+            source_map,
+            opened_at=opened_at,
+            opened_epoch=opened_epoch,
+            instance_id=instance_id,
+        )
 
         validator_sources = {}
         for name in TIMELINE_COMPONENTS:
@@ -623,13 +666,29 @@ def build_live_trade_snapshot(
                 validator_sources[name] = failed_source
             else:
                 source_metadata = _metadata(raw_sources.get(name))
+                source_identity = (
+                    identity_resolution_metadata(correlation)
+                    if name == "registry"
+                    else None
+                )
                 validator_sources[name] = (
-                    {"records": rows.get(name, []), "_reader_metadata": source_metadata}
-                    if source_metadata
+                    {
+                        "records": rows.get(name, []),
+                        **({"_reader_metadata": source_metadata} if source_metadata else {}),
+                        **({"_identity_metadata": source_identity} if source_identity else {}),
+                    }
+                    if source_metadata or source_identity
                     else rows.get(name, [])
                 )
         try:
-            timeline_report = validate_trade_timeline(identity, sources=validator_sources, logger=active_logger)
+            timeline_report = validate_trade_timeline(
+                identity,
+                sources=validator_sources,
+                logger=active_logger,
+                opened_at=opened_at,
+                opened_epoch=opened_epoch,
+                instance_id=instance_id,
+            )
         except Exception as exc:
             timeline_report = {"result": "FAIL", "valid": False, "fail_open": True, "production_blocked": False, "errors": [{"error_type": type(exc).__name__}]}
             errors.append(_safe_issue("timeline_validation", "VALIDATOR_ERROR"))
@@ -741,9 +800,19 @@ def build_live_trade_snapshot(
         }
         source_error = any(detail.get("status") == "ERROR" for detail in relevant_component_status.values())
         degraded = any(detail.get("status") in {"ERROR", "DEGRADED", "PARTIAL"} for detail in relevant_component_status.values())
-        identified = bool(matched_records)
+        timeline_identity = timeline_report.get("identity") or {}
+        identity_ambiguous = bool(
+            correlation.registry_selection_basis == "ambiguous"
+            or (
+                timeline_identity.get("ambiguous")
+                and int(timeline_identity.get("candidate_count", 0) or 0) > 0
+            )
+        )
+        identified = bool(matched_records and not identity_ambiguous)
         incomplete = bool(overdue_missing or pending or (identified and not lifecycle["lifecycle_found"]))
-        if not identified:
+        if identity_ambiguous:
+            snapshot_status = "DEGRADED"
+        elif not identified:
             # Cobertura parcial sem qualquer identidade correlacionada não muda
             # ausência de evidência para degradação. Um erro real de fonte torna
             # a conclusão de ausência não conclusiva, mas ainda permite snapshot.
@@ -767,8 +836,11 @@ def build_live_trade_snapshot(
         snapshot_conclusive = bool(
             timeline_report.get("conclusive", not relevant_partial)
             and not relevant_partial
+            and not identity_ambiguous
         )
-        if identified:
+        if identity_ambiguous:
+            snapshot_evidence_status = "IDENTITY_AMBIGUOUS"
+        elif identified:
             snapshot_evidence_status = str(timeline_report.get("evidence_status") or "EVIDENCE_FOUND")
         elif not snapshot_conclusive:
             snapshot_evidence_status = "NOT_FOUND_IN_SCANNED_REGION"
@@ -833,7 +905,22 @@ def build_live_trade_snapshot(
             "operational_impact": False,
             "conclusive": snapshot_conclusive,
             "evidence_status": snapshot_evidence_status,
-            "identity": {**{key: identities.get(key) for key in ("trade_id", "registry_id", "lifecycle_id", "execution_id", "decision_id", "signal_id", "client_order_id", "broker_order_id")}, "correlation_ids": sorted(set(identities.values())), "matched_by": sorted(matched_by), "identity_confidence": "HIGH" if identified else "NONE"},
+            "identity": {
+                **{
+                    key: identities.get(key)
+                    for key in (
+                        "trade_id", "registry_id", "lifecycle_id", "execution_id",
+                        "decision_id", "signal_id", "client_order_id", "broker_order_id",
+                    )
+                },
+                "correlation_ids": sorted(set(identities.values())),
+                "matched_by": sorted(matched_by),
+                "identity_confidence": "AMBIGUOUS" if identity_ambiguous else ("HIGH" if identified else "NONE"),
+                "selection_basis": correlation.registry_selection_basis,
+                "candidate_count": correlation.registry_candidate_count,
+                "candidates": copy.deepcopy(correlation.registry_candidates),
+                "candidates_truncated": correlation.registry_candidates_truncated,
+            },
             "trade": {
                 "bot": registry.get("bot"), "setup": registry.get("setup"), "symbol": symbol,
                 "side": registry.get("side"), "mode": mode, "status": trade_status,

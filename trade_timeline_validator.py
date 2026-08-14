@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import time
@@ -29,6 +30,7 @@ JSONL_CURSOR_VERSION = 1
 CORRELATION_PRE_OPEN_SECONDS = 15 * 60
 CORRELATION_POST_CLOSE_SECONDS = 24 * 60 * 60
 ENTRY_REFERENCE_TOLERANCE_RATIO = 0.001
+IDENTITY_CANDIDATE_LIMIT = 20
 
 COMPONENTS = (
     "registry",
@@ -129,6 +131,7 @@ EVENT_ALIASES = {
 IDENTITY_KEYS = {
     "trade_id",
     "trade_uuid",
+    "registry_record_id",
     "lifecycle_id",
     "registry_id",
     "execution_id",
@@ -147,6 +150,10 @@ IDENTITY_KEYS = {
 
 IDENTITY_KEY_ALIASES = {
     "clientorderid": "client_order_id",
+    "registry_record_id": "registry_id",
+    "tradelifecycleid": "lifecycle_id",
+    "trade_lifecycle_id": "lifecycle_id",
+    "position_uuid": "trade_uuid",
     # Canonical Falcon stop IDs are persisted under stop-specific field names
     # by the position/Registry projections.  Normalize those names into the
     # client-order identity group so an opaque FDS1 hash is correlated only by
@@ -414,20 +421,62 @@ class CorrelationContext:
     closed_epoch: Optional[float] = None
     registry_anchored: bool = False
     identity_ambiguous: bool = False
+    requested_opened_at: Optional[str] = None
+    requested_opened_epoch: Optional[float] = None
+    requested_instance_id: Optional[str] = None
+    registry_candidate_count: int = 0
+    registry_candidates: list[Dict[str, Any]] = field(default_factory=list)
+    registry_candidates_truncated: bool = False
+    registry_selection_basis: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.trusted.setdefault("trade", set()).add(self.trade_id)
         self.trusted_typed.setdefault("trade_id", set()).add(self.trade_id)
 
 
-def new_correlation_context(trade_id: str) -> CorrelationContext:
-    return CorrelationContext(str(trade_id or "").strip())
+def _normalize_opened_selectors(
+    opened_at: Any = None,
+    opened_epoch: Any = None,
+) -> tuple[Optional[str], Optional[float]]:
+    normalized_at = None
+    if opened_at not in (None, ""):
+        normalized_at = str(opened_at).strip()
+        parsed_at, _ = _parse_timestamp(normalized_at)
+        if parsed_at is None:
+            raise ValueError("invalid opened_at selector")
+    parsed_epoch = None
+    if opened_epoch not in (None, ""):
+        try:
+            parsed_epoch = float(opened_epoch)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid opened_epoch selector") from exc
+        if not math.isfinite(parsed_epoch):
+            raise ValueError("invalid opened_epoch selector")
+    return normalized_at, parsed_epoch
+
+
+def new_correlation_context(
+    trade_id: str,
+    *,
+    opened_at: Any = None,
+    opened_epoch: Any = None,
+    instance_id: Any = None,
+) -> CorrelationContext:
+    normalized_instance = str(instance_id or "").strip() or None
+    normalized_opened_at, normalized_opened_epoch = _normalize_opened_selectors(
+        opened_at,
+        opened_epoch,
+    )
+    return CorrelationContext(
+        str(trade_id or "").strip(),
+        requested_opened_at=normalized_opened_at,
+        requested_opened_epoch=normalized_opened_epoch,
+        requested_instance_id=normalized_instance,
+    )
 
 
 def target_identity_from_context(context: CorrelationContext) -> TargetIdentity:
     strong_groups = set(STRONG_IDENTITY_GROUPS)
-    if context.registry_anchored:
-        strong_groups.add("trade")
     return TargetIdentity(
         trade_id=context.trade_id,
         strong={
@@ -505,6 +554,18 @@ def _unrelated_client_order(grouped: Mapping[str, set[str]], context: Correlatio
 
 
 def _record_matches_context(record: Mapping[str, Any], component: str, context: CorrelationContext) -> bool:
+    if (
+        not context.registry_anchored
+        and (
+            context.requested_opened_at
+            or context.requested_opened_epoch is not None
+            or context.requested_instance_id
+        )
+    ):
+        # A timestamp scopes a Registry occurrence but cannot prove ownership
+        # by itself.  Never fall back to logical-ID-only journal matching when
+        # the requested Registry instance was not resolved.
+        return False
     grouped = _grouped_identities(record)
     target = target_identity_from_context(context)
     explicit_trade_ids = _identity_pairs(record).get("trade_id", set())
@@ -574,8 +635,8 @@ def _promote_record(record: Mapping[str, Any], component: str, context: Correlat
         for key, value in profile.items():
             if value:
                 context.profile[key] = value
-        opened_value = _direct_value(record, "opened_at")
-        closed_value = _direct_value(record, "closed_at")
+        opened_value = _direct_value(record, "opened_epoch", "opened_at")
+        closed_value = _direct_value(record, "closed_epoch", "closed_at")
         opened, _ = _parse_timestamp(opened_value) if opened_value not in (None, "") else (None, None)
         closed, _ = _parse_timestamp(closed_value) if closed_value not in (None, "") else (None, None)
         if opened is not None:
@@ -589,8 +650,12 @@ def _registry_candidates(data: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     opened = data.get("open_trades")
     if isinstance(opened, Mapping):
         candidates.extend(item for item in opened.values() if isinstance(item, Mapping))
+    elif isinstance(opened, list):
+        candidates.extend(item for item in opened if isinstance(item, Mapping))
     closed = data.get("closed_trades")
-    if isinstance(closed, list):
+    if isinstance(closed, Mapping):
+        candidates.extend(item for item in closed.values() if isinstance(item, Mapping))
+    elif isinstance(closed, list):
         candidates.extend(item for item in closed if isinstance(item, Mapping))
     if isinstance(data.get("trade"), Mapping):
         candidates.append(data["trade"])
@@ -605,16 +670,151 @@ def _component_candidates(component: str, record: Mapping[str, Any]) -> list[Map
     return [record]
 
 
-def _registry_rank(record: Mapping[str, Any]) -> tuple[int, float]:
-    status = str(_direct_value(record, "status") or "").upper()
-    epoch = None
-    for key in ("opened_at", "updated_at", "closed_at", "created_at"):
-        value = _direct_value(record, key)
-        if value not in (None, ""):
-            epoch, _ = _parse_timestamp(value)
-        if epoch is not None:
-            break
-    return (1 if status == "OPEN" else 0, epoch or 0.0)
+def _registry_opened_epoch(record: Mapping[str, Any]) -> Optional[float]:
+    value = _direct_value(record, "opened_epoch")
+    if value not in (None, ""):
+        try:
+            epoch = float(value)
+        except (TypeError, ValueError):
+            epoch = None
+        if epoch is not None and math.isfinite(epoch):
+            return epoch
+    value = _direct_value(record, "opened_at")
+    parsed, _ = _parse_timestamp(value) if value not in (None, "") else (None, None)
+    return parsed
+
+
+def _registry_opened_at_matches(record: Mapping[str, Any], requested: str) -> bool:
+    candidate = _direct_value(record, "opened_at")
+    if candidate not in (None, ""):
+        if str(candidate).strip() == str(requested).strip():
+            return True
+        candidate_epoch, _ = _parse_timestamp(candidate)
+        requested_epoch, _ = _parse_timestamp(requested)
+        return bool(
+            candidate_epoch is not None
+            and requested_epoch is not None
+            and abs(candidate_epoch - requested_epoch) <= 1.0
+        )
+    requested_epoch, _ = _parse_timestamp(requested)
+    candidate_epoch = _registry_opened_epoch(record)
+    return bool(
+        candidate_epoch is not None
+        and requested_epoch is not None
+        and abs(candidate_epoch - requested_epoch) <= 1.0
+    )
+
+
+def _registry_instance_values(record: Mapping[str, Any]) -> set[str]:
+    pairs = _identity_pairs(record)
+    values: set[str] = set()
+    for key, supplied in pairs.items():
+        group = IDENTITY_GROUPS.get(key)
+        if group in STRONG_IDENTITY_GROUPS and group != "trade":
+            values.update(supplied)
+    return values
+
+
+def _registry_preferred_instance_id(record: Mapping[str, Any]) -> Optional[str]:
+    pairs = _identity_pairs(record)
+    for key in (
+        "trade_uuid",
+        "registry_id",
+        "lifecycle_id",
+        "client_order_id",
+        "exchange_order_id",
+        "broker_order_id",
+        "order_id",
+        "fill_id",
+    ):
+        values = sorted(pairs.get(key, set()))
+        if values:
+            return values[0]
+    return None
+
+
+def _registry_candidate_summary(record: Mapping[str, Any]) -> Dict[str, Any]:
+    opened_epoch = _registry_opened_epoch(record)
+    closed_value = _direct_value(record, "closed_at")
+    closed_epoch_value = _direct_value(record, "closed_epoch")
+    closed_epoch, _ = _parse_timestamp(
+        closed_epoch_value if closed_epoch_value not in (None, "") else closed_value
+    ) if closed_value not in (None, "") or closed_epoch_value not in (None, "") else (None, None)
+    profile = _record_profile(record, "registry")
+    return {
+        "trade_id": str(_direct_value(record, "trade_id") or "").strip() or None,
+        "instance_id": _registry_preferred_instance_id(record),
+        "opened_at": _direct_value(record, "opened_at"),
+        "opened_epoch": opened_epoch,
+        "closed_at": closed_value,
+        "closed_epoch": closed_epoch,
+        "status": str(_direct_value(record, "status") or "").upper().strip() or None,
+        **profile,
+    }
+
+
+def _reusable_logical_trade_id(trade_id: str, records: Iterable[Mapping[str, Any]]) -> bool:
+    text = str(trade_id or "").upper().strip()
+    prefix = text.split(":", 1)[0]
+    if prefix.startswith("TURTLE"):
+        return True
+    for row in records:
+        bot = str(_direct_value(row, "bot", "bot_name") or "").upper().strip()
+        logical = str(_direct_value(row, "logical_trade_id") or "").upper().strip()
+        reusable = _direct_value(row, "trade_id_reusable", "reusable_trade_id")
+        if bot.startswith("TURTLE") or logical == text or _true(reusable):
+            return True
+    return False
+
+
+def _set_registry_candidates(context: CorrelationContext, records: list[Mapping[str, Any]]) -> None:
+    context.registry_candidate_count = len(records)
+    context.registry_candidates = [
+        _registry_candidate_summary(row)
+        for row in records[:IDENTITY_CANDIDATE_LIMIT]
+    ]
+    context.registry_candidates_truncated = len(records) > IDENTITY_CANDIDATE_LIMIT
+
+
+def _resolve_registry_candidate(
+    records: list[Mapping[str, Any]],
+    context: CorrelationContext,
+) -> Optional[Mapping[str, Any]]:
+    _set_registry_candidates(context, records)
+    selected = records
+    basis_parts = []
+    if context.requested_instance_id:
+        selected = [row for row in selected if context.requested_instance_id in _registry_instance_values(row)]
+        basis_parts.append("instance_id")
+    if context.requested_opened_at:
+        selected = [
+            row for row in selected
+            if _registry_opened_at_matches(row, context.requested_opened_at)
+        ]
+        basis_parts.append("opened_at")
+    if context.requested_opened_epoch is not None:
+        selected = [
+            row for row in selected
+            if (epoch := _registry_opened_epoch(row)) is not None
+            and abs(epoch - context.requested_opened_epoch) <= 1.0
+        ]
+        basis_parts.append("opened_epoch")
+    basis = "+".join(
+        item
+        for item in ("opened_at", "opened_epoch", "instance_id")
+        if item in basis_parts
+    ) or None
+    if len(selected) == 1 and (basis or not _reusable_logical_trade_id(context.trade_id, records)):
+        context.registry_selection_basis = basis or "unique_trade_id"
+        _set_registry_candidates(context, selected)
+        return selected[0]
+    if len(selected) > 1 or (len(selected) == 1 and _reusable_logical_trade_id(context.trade_id, records)):
+        context.identity_ambiguous = True
+        context.registry_selection_basis = "ambiguous"
+        _set_registry_candidates(context, selected)
+    elif basis:
+        context.registry_selection_basis = f"{basis}_not_found"
+    return None
 
 
 def correlate_source_records(
@@ -628,7 +828,9 @@ def correlate_source_records(
         exact = [row for row in candidates if context.trade_id in _identity_pairs(row).get("trade_id", set())]
         if not exact:
             return []
-        selected = max(exact, key=_registry_rank)
+        selected = _resolve_registry_candidate(exact, context)
+        if selected is None:
+            return []
         if _profile_conflicts(selected, component, context):
             return []
         _promote_record(selected, component, context)
@@ -1098,6 +1300,35 @@ def _read_path(
         yield from (item for item in data if isinstance(item, Mapping))
 
 
+def identity_resolution_metadata(context: CorrelationContext) -> Dict[str, Any]:
+    return {
+        "registry_anchored": bool(context.registry_anchored),
+        "ambiguous": bool(context.identity_ambiguous and not context.registry_anchored),
+        "selection_basis": context.registry_selection_basis,
+        "candidate_count": int(context.registry_candidate_count),
+        "candidates": _json_safe(context.registry_candidates),
+        "candidates_truncated": bool(context.registry_candidates_truncated),
+    }
+
+
+def apply_identity_resolution_metadata(context: CorrelationContext, value: Any) -> None:
+    if not isinstance(value, Mapping) or not isinstance(value.get("_identity_metadata"), Mapping):
+        return
+    metadata = value["_identity_metadata"]
+    if metadata.get("ambiguous") and not context.registry_anchored:
+        context.identity_ambiguous = True
+    try:
+        candidate_count = int(metadata.get("candidate_count", 0) or 0)
+    except (TypeError, ValueError):
+        candidate_count = 0
+    candidates = metadata.get("candidates")
+    if candidate_count >= context.registry_candidate_count and isinstance(candidates, list):
+        context.registry_candidate_count = candidate_count
+        context.registry_candidates = [dict(row) for row in candidates if isinstance(row, Mapping)]
+        context.registry_candidates_truncated = bool(metadata.get("candidates_truncated", False))
+        context.registry_selection_basis = str(metadata.get("selection_basis") or "") or None
+
+
 def _default_reader(
     component: str,
     paths: tuple[Path, ...],
@@ -1129,7 +1360,11 @@ def _default_reader(
             reader_metadata["evidence_status"] = "COMPLETE_NO_EVIDENCE"
         else:
             reader_metadata["evidence_status"] = "NOT_FOUND_IN_SCANNED_REGION"
-        return {"records": matched, "_reader_metadata": reader_metadata}
+        return {
+            "records": matched,
+            "_reader_metadata": reader_metadata,
+            "_identity_metadata": identity_resolution_metadata(active_context),
+        }
 
     return read
 
@@ -1138,6 +1373,9 @@ def build_default_sources(
     environ: Optional[Mapping[str, str]] = None,
     *,
     scan_cursor: Optional[str] = None,
+    opened_at: Any = None,
+    opened_epoch: Any = None,
+    instance_id: Any = None,
 ) -> Dict[str, Callable[[str], Dict[str, Any]]]:
     """Constroi leitores locais. Nao le arquivos ate a validacao ser solicitada."""
     configured_paths = default_source_paths(environ)
@@ -1148,12 +1386,22 @@ def build_default_sources(
         for path in paths
     ):
         raise ValueError("scan cursor belongs to an unconfigured source")
-    context = new_correlation_context("")
+    context = new_correlation_context(
+        "",
+        opened_at=opened_at,
+        opened_epoch=opened_epoch,
+        instance_id=instance_id,
+    )
 
     def reader_for(name: str, paths: tuple[Path, ...]) -> Callable[[str], Dict[str, Any]]:
         def read(trade_id: str) -> Dict[str, Any]:
             if context.trade_id != str(trade_id or "").strip():
-                fresh = new_correlation_context(trade_id)
+                fresh = new_correlation_context(
+                    trade_id,
+                    opened_at=opened_at,
+                    opened_epoch=opened_epoch,
+                    instance_id=instance_id,
+                )
                 context.trade_id = fresh.trade_id
                 context.trusted = fresh.trusted
                 context.trusted_typed = fresh.trusted_typed
@@ -1162,6 +1410,13 @@ def build_default_sources(
                 context.closed_epoch = None
                 context.registry_anchored = False
                 context.identity_ambiguous = False
+                context.requested_opened_at = fresh.requested_opened_at
+                context.requested_opened_epoch = fresh.requested_opened_epoch
+                context.requested_instance_id = fresh.requested_instance_id
+                context.registry_candidate_count = 0
+                context.registry_candidates = []
+                context.registry_candidates_truncated = False
+                context.registry_selection_basis = None
             return _default_reader(name, paths, context, scan_cursor=scan_cursor)(trade_id)
 
         return read
@@ -1175,7 +1430,11 @@ def _coerce_records(value: Any) -> list[Mapping[str, Any]]:
     if isinstance(value, Mapping):
         for key in ("records", "items", "events", "lifecycles"):
             if isinstance(value.get(key), list):
-                head = {k: v for k, v in value.items() if k not in {key, "_reader_metadata"}}
+                head = {
+                    k: v
+                    for k, v in value.items()
+                    if k not in {key, "_reader_metadata", "_identity_metadata"}
+                }
                 rows = [item for item in value[key] if isinstance(item, Mapping)]
                 return ([head] if head else []) + rows
         return [value]
@@ -1236,6 +1495,7 @@ def _parse_timestamp(value: Any) -> tuple[Optional[float], Optional[str]]:
     normalized = text.replace("Z", "+00:00")
     for parser in (
         lambda: datetime.fromisoformat(normalized),
+        lambda: datetime.strptime(text, "%d/%m/%Y %H:%M:%S"),
         lambda: datetime.strptime(text, "%d/%m/%Y %H:%M"),
         lambda: datetime.strptime(text, "%Y-%m-%d %H:%M:%S"),
     ):
@@ -1767,11 +2027,22 @@ class TradeTimelineValidator:
         sources: Optional[Mapping[str, Any]] = None,
         logger: Optional[logging.Logger] = None,
         scan_cursor: Optional[str] = None,
+        opened_at: Any = None,
+        opened_epoch: Any = None,
+        instance_id: Any = None,
     ):
+        self.opened_at = opened_at
+        self.opened_epoch = opened_epoch
+        self.instance_id = instance_id
         self.sources = (
             dict(sources)
             if sources is not None
-            else build_default_sources(scan_cursor=scan_cursor)
+            else build_default_sources(
+                scan_cursor=scan_cursor,
+                opened_at=opened_at,
+                opened_epoch=opened_epoch,
+                instance_id=instance_id,
+            )
         )
         self.logger = logger or LOGGER
 
@@ -1783,7 +2054,12 @@ class TradeTimelineValidator:
         records: Dict[str, list[Mapping[str, Any]]] = {}
         errors = []
         warnings = []
-        correlation = new_correlation_context(identity)
+        correlation = new_correlation_context(
+            identity,
+            opened_at=self.opened_at,
+            opened_epoch=self.opened_epoch,
+            instance_id=self.instance_id,
+        )
         source_coverage: Dict[str, Dict[str, Any]] = {}
 
         if not identity:
@@ -1811,6 +2087,7 @@ class TradeTimelineValidator:
                 continue
             try:
                 value = source(identity) if callable(source) else source
+                apply_identity_resolution_metadata(correlation, value)
                 rows = correlate_source_records(name, _coerce_records(value), correlation)
                 reader_metadata = _reader_metadata(value)
                 if reader_metadata:
@@ -1830,6 +2107,11 @@ class TradeTimelineValidator:
                 )
                 status = "AVAILABLE" if rows else ("DEGRADED" if fully_corrupt else "NO_EVIDENCE")
                 components[name] = {"status": status, "records": len(rows), **reader_metadata}
+                if name == "registry" and correlation.registry_candidate_count:
+                    components[name]["identity_ambiguous"] = bool(
+                        correlation.identity_ambiguous and not correlation.registry_anchored
+                    )
+                    components[name]["candidate_count"] = correlation.registry_candidate_count
                 source_coverage[name] = {
                     "evidence_found": bool(reader_metadata.get("evidence_found", bool(rows))),
                     "coverage_complete": bool(reader_metadata.get("coverage_complete", True)),
@@ -1975,6 +2257,14 @@ class TradeTimelineValidator:
             "coverage": {"aggregate": aggregate_coverage, "sources": source_coverage},
             "conclusive": conclusive,
             "evidence_status": evidence_status,
+            "identity": {
+                "registry_anchored": correlation.registry_anchored,
+                "ambiguous": identity_ambiguous,
+                "selection_basis": correlation.registry_selection_basis,
+                "candidate_count": correlation.registry_candidate_count,
+                "candidates": _json_safe(correlation.registry_candidates),
+                "candidates_truncated": correlation.registry_candidates_truncated,
+            },
             "authorities": {
                 "write_access": False,
                 "registry_write_access": False,
@@ -2013,6 +2303,9 @@ def validate_trade_timeline(
     sources: Optional[Mapping[str, Any]] = None,
     logger: Optional[logging.Logger] = None,
     scan_cursor: Optional[str] = None,
+    opened_at: Any = None,
+    opened_epoch: Any = None,
+    instance_id: Any = None,
 ) -> Dict[str, Any]:
     """API publica fail-open para validacao de um trade."""
     try:
@@ -2020,6 +2313,9 @@ def validate_trade_timeline(
             sources=sources,
             logger=logger,
             scan_cursor=scan_cursor,
+            opened_at=opened_at,
+            opened_epoch=opened_epoch,
+            instance_id=instance_id,
         ).validate(trade_id)
     except Exception as exc:  # ultima barreira: auditoria nunca afeta a operacao
         active_logger = logger or LOGGER
@@ -2064,9 +2360,11 @@ __all__ = [
     "CorrelationContext",
     "TargetIdentity",
     "TradeTimelineValidator",
+    "apply_identity_resolution_metadata",
     "build_default_sources",
     "correlate_source_records",
     "default_source_paths",
+    "identity_resolution_metadata",
     "new_correlation_context",
     "target_identity_from_context",
     "validate_trade_timeline",

@@ -167,11 +167,54 @@ def test_optional_scan_cursor_is_forwarded_additively(monkeypatch):
     assert {"coverage", "conclusive", "evidence_status"}.issubset(payload)
 
 
+def test_optional_identity_selectors_are_forwarded_additively(monkeypatch):
+    route, _ = _compile_route({
+        "trade_id": "TURTLE:TURTLE20:FLOKIUSDT:SHORT",
+        "opened_at": "10/08/2026 15:00:41",
+        "opened_epoch": "1786384841",
+        "instance_id": "lifecycle-b",
+    })
+    calls = []
+
+    def validate(trade_id, **kwargs):
+        calls.append((trade_id, kwargs))
+        report = _report("FAIL")
+        report["identity"] = {"selection_basis": "opened_at+instance_id"}
+        return report
+
+    monkeypatch.setitem(
+        sys.modules,
+        "trade_timeline_validator",
+        SimpleNamespace(validate_trade_timeline=validate),
+    )
+
+    payload, status = route()
+
+    assert status == 200
+    assert calls == [(
+        "TURTLE:TURTLE20:FLOKIUSDT:SHORT",
+        {
+            "opened_at": "10/08/2026 15:00:41",
+            "opened_epoch": 1786384841.0,
+            "instance_id": "lifecycle-b",
+        },
+    )]
+    assert payload["identity"]["selection_basis"] == "opened_at+instance_id"
+
+
 def test_invalid_scan_cursor_is_rejected_before_loading_validator():
     route, _ = _compile_route({"trade_id": "TR-PAGE", "scan_cursor": ""})
     payload, status = route()
     assert status == 400
     assert payload["error"] == "SCAN_CURSOR_INVALID"
+
+
+def test_invalid_identity_selector_is_rejected():
+    route, _ = _compile_route({"trade_id": "TR-PAGE", "opened_epoch": "nan"})
+    payload, status = route()
+    assert status == 400
+    assert payload["error"] == "IDENTITY_SELECTOR_INVALID"
+    assert payload["selector"] == "opened_epoch"
 
 
 def test_unexpected_route_error_is_sanitized_500(monkeypatch):

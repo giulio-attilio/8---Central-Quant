@@ -106,6 +106,32 @@ def test_extra_parameters_cannot_select_sources(monkeypatch):
     assert status == 200 and calls == ["TR-1"]
 
 
+def test_identity_selector_is_forwarded_without_changing_default_contract(monkeypatch):
+    route, _ = _route({
+        "trade_id": "TURTLE:TURTLE20:FLOKIUSDT:SHORT",
+        "opened_at": "10/08/2026 15:00:41",
+    })
+    calls = []
+
+    def build(trade_id, **kwargs):
+        calls.append((trade_id, kwargs))
+        return _report("DEGRADED")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "live_trade_snapshot",
+        SimpleNamespace(build_live_trade_snapshot=build),
+    )
+
+    _, status = route()
+
+    assert status == 200
+    assert calls == [(
+        "TURTLE:TURTLE20:FLOKIUSDT:SHORT",
+        {"opened_at": "10/08/2026 15:00:41"},
+    )]
+
+
 def test_route_has_no_mutating_or_automatic_behavior():
     source = ast.unparse(_node())
     forbidden = ("Thread(", ".start(", "schedule", "watchdog", "send_telegram", "place_market_order", "cancel_order", "close_trade(", "update_trade(", "open(", "write_text")

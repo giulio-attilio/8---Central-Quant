@@ -59370,15 +59370,51 @@ def trade_timeline_validator_v1_route():
             "production_blocked": False,
         }, 400
 
+    identity_query = {}
+    for selector_name, max_length in (("opened_at", 128), ("opened_epoch", 64), ("instance_id", 256)):
+        raw_selector = request.args.get(selector_name)
+        if raw_selector is None:
+            continue
+        if (
+            not isinstance(raw_selector, str)
+            or not raw_selector.strip()
+            or len(raw_selector) > max_length
+            or any(ord(char) < 32 or ord(char) == 127 for char in raw_selector)
+        ):
+            return {
+                "ok": False,
+                "trade_id": trade_id,
+                "error": "IDENTITY_SELECTOR_INVALID",
+                "selector": selector_name,
+                "fail_open": True,
+                "production_blocked": False,
+            }, 400
+        normalized_selector = raw_selector.strip()
+        if selector_name == "opened_epoch":
+            try:
+                parsed_epoch = float(normalized_selector)
+            except (TypeError, ValueError):
+                parsed_epoch = None
+            if parsed_epoch is None or parsed_epoch != parsed_epoch or not -1e20 < parsed_epoch < 1e20:
+                return {
+                    "ok": False,
+                    "trade_id": trade_id,
+                    "error": "IDENTITY_SELECTOR_INVALID",
+                    "selector": selector_name,
+                    "fail_open": True,
+                    "production_blocked": False,
+                }, 400
+            identity_query[selector_name] = parsed_epoch
+        else:
+            identity_query[selector_name] = normalized_selector
+
     try:
         # Import local: evita acoplamento/ciclo no startup e mantém a consulta manual.
         from trade_timeline_validator import validate_trade_timeline
 
-        report = (
-            validate_trade_timeline(trade_id, scan_cursor=raw_scan_cursor)
-            if raw_scan_cursor is not None
-            else validate_trade_timeline(trade_id)
-        )
+        if raw_scan_cursor is not None:
+            identity_query["scan_cursor"] = raw_scan_cursor
+        report = validate_trade_timeline(trade_id, **identity_query)
         if not isinstance(report, dict):
             raise TypeError("trade timeline validator returned a non-dict report")
 
@@ -59426,6 +59462,8 @@ def trade_timeline_validator_v1_route():
             "warnings": public_issues(report.get("warnings"), "VALIDATOR_WARNING"),
             "errors": public_issues(report.get("errors"), "VALIDATOR_ERROR"),
         }
+        if isinstance(report.get("identity"), dict):
+            payload["identity"] = report["identity"]
         return payload, 200
     except Exception as exc:
         try:
@@ -59517,11 +59555,51 @@ def live_trade_snapshot_v1_route():
             "operational_impact": False,
         }, 400
 
+    identity_query = {}
+    for selector_name, max_length in (("opened_at", 128), ("opened_epoch", 64), ("instance_id", 256)):
+        raw_selector = request.args.get(selector_name)
+        if raw_selector is None:
+            continue
+        if (
+            not isinstance(raw_selector, str)
+            or not raw_selector.strip()
+            or len(raw_selector) > max_length
+            or any(ord(char) < 32 or ord(char) == 127 for char in raw_selector)
+        ):
+            return {
+                "ok": False,
+                "trade_id": trade_id,
+                "error": "IDENTITY_SELECTOR_INVALID",
+                "selector": selector_name,
+                "fail_open": True,
+                "production_blocked": False,
+                "operational_impact": False,
+            }, 400
+        normalized_selector = raw_selector.strip()
+        if selector_name == "opened_epoch":
+            try:
+                parsed_epoch = float(normalized_selector)
+            except (TypeError, ValueError):
+                parsed_epoch = None
+            if parsed_epoch is None or parsed_epoch != parsed_epoch or not -1e20 < parsed_epoch < 1e20:
+                return {
+                    "ok": False,
+                    "trade_id": trade_id,
+                    "error": "IDENTITY_SELECTOR_INVALID",
+                    "selector": selector_name,
+                    "fail_open": True,
+                    "production_blocked": False,
+                    "operational_impact": False,
+                }, 400
+            identity_query[selector_name] = parsed_epoch
+        else:
+            identity_query[selector_name] = normalized_selector
+
     try:
         # Import local: a interface permanece manual e fora do startup.
         from live_trade_snapshot import build_live_trade_snapshot
 
-        report = build_live_trade_snapshot(trade_id)
+        report = build_live_trade_snapshot(trade_id, **identity_query)
         if not isinstance(report, dict):
             raise TypeError("live trade snapshot returned a non-dict report")
 
