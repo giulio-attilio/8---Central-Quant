@@ -22498,12 +22498,197 @@ def build_executive_report_monthly():
     force_gc_if_needed("executive_report_monthly_v2_end", force=True)
     return text
 
+_DECISION_TIMELINE_TAIL_BLOCK_BYTES = 64 * 1024
+
+
+def _read_physical_tail_lines_v1(
+    path,
+    limit,
+    block_size=_DECISION_TIMELINE_TAIL_BLOCK_BYTES,
+):
+    """Return the legacy physical-line window from a coherent EOF snapshot."""
+
+    metadata = {
+        "lines": [],
+        "source_size_bytes": 0,
+        "bytes_read": 0,
+        "physical_lines_returned": 0,
+        "tail_limited": False,
+        "incomplete_last_line": False,
+    }
+    requested_limit = int(limit)
+    block_size = int(block_size)
+    if block_size < 1:
+        raise ValueError("physical tail block_size must be positive")
+
+    source = Path(path)
+    if ".." in source.parts:
+        raise ValueError("PHYSICAL_TAIL_UNEXPECTED_TRAVERSAL")
+
+    def stat_value(snapshot, name):
+        try:
+            return getattr(snapshot, name)
+        except Exception:
+            return None
+
+    def source_changed(initial_path, initial_open, final_open, final_path):
+        if final_open is None or final_path is None:
+            return True
+        if not stat.S_ISREG(int(stat_value(final_open, "st_mode") or 0)):
+            return True
+        if not stat.S_ISREG(int(stat_value(final_path, "st_mode") or 0)):
+            return True
+        for name in ("st_dev", "st_ino"):
+            values = (
+                stat_value(initial_path, name),
+                stat_value(initial_open, name),
+                stat_value(final_open, name),
+                stat_value(final_path, name),
+            )
+            if all(value is not None for value in values) and len(set(values)) != 1:
+                return True
+        snapshot_size = stat_value(initial_open, "st_size")
+        final_open_size = stat_value(final_open, "st_size")
+        final_path_size = stat_value(final_path, "st_size")
+        if snapshot_size is None or final_open_size is None or final_path_size is None:
+            return True
+        return final_open_size < snapshot_size or final_path_size < snapshot_size
+
+    try:
+        initial_path = source.lstat()
+    except FileNotFoundError:
+        return metadata
+    if stat.S_ISLNK(initial_path.st_mode):
+        raise ValueError("PHYSICAL_TAIL_SYMLINK_REJECTED")
+    if not stat.S_ISREG(initial_path.st_mode):
+        raise ValueError("PHYSICAL_TAIL_NOT_REGULAR_FILE")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.fspath(source), flags)
+    try:
+        initial_open = os.fstat(descriptor)
+        if not stat.S_ISREG(initial_open.st_mode):
+            raise ValueError("PHYSICAL_TAIL_NOT_REGULAR_FILE")
+        for name in ("st_dev", "st_ino"):
+            path_value = stat_value(initial_path, name)
+            open_value = stat_value(initial_open, name)
+            if (
+                path_value is not None
+                and open_value is not None
+                and path_value != open_value
+            ):
+                raise OSError("PHYSICAL_TAIL_SOURCE_CHANGED_BEFORE_READ")
+        if int(initial_open.st_size) < int(initial_path.st_size):
+            raise OSError("PHYSICAL_TAIL_SOURCE_CHANGED_BEFORE_READ")
+
+        snapshot_size = int(initial_open.st_size)
+        metadata["source_size_bytes"] = snapshot_size
+        handle = os.fdopen(descriptor, "rb", closefd=True)
+        descriptor = None
+        raw_lines = []
+        snapshot_ended_with_newline = False
+
+        with handle:
+            if requested_limit > 0:
+                cursor = snapshot_size
+                chunks = []
+                newline_count = 0
+                while cursor > 0:
+                    if int(os.fstat(handle.fileno()).st_size) < snapshot_size:
+                        raise OSError("PHYSICAL_TAIL_SOURCE_CHANGED_DURING_READ")
+                    start = max(0, cursor - block_size)
+                    handle.seek(start, os.SEEK_SET)
+                    chunk = handle.read(cursor - start)
+                    if len(chunk) != cursor - start:
+                        raise OSError("PHYSICAL_TAIL_SHORT_READ")
+                    chunks.append(chunk)
+                    metadata["bytes_read"] += len(chunk)
+                    newline_count += chunk.count(b"\n")
+                    cursor = start
+                    # One extra delimiter proves the first retained line starts
+                    # at a physical boundary when the read stopped above byte 0.
+                    if newline_count >= requested_limit + 1:
+                        break
+
+                payload = b"".join(reversed(chunks))
+                snapshot_ended_with_newline = bool(
+                    chunks and chunks[0].endswith(b"\n")
+                )
+                if cursor > 0:
+                    boundary = payload.find(b"\n")
+                    if boundary < 0:
+                        raise OSError("PHYSICAL_TAIL_BOUNDARY_NOT_FOUND")
+                    payload = payload[boundary + 1 :]
+                if snapshot_size:
+                    raw_lines = payload.split(b"\n")
+                    if payload.endswith(b"\n"):
+                        raw_lines.pop()
+                metadata["tail_limited"] = bool(
+                    cursor > 0 or len(raw_lines) > requested_limit
+                )
+                raw_lines = raw_lines[-requested_limit:]
+            else:
+                # Preserve old lines[-limit:] semantics. limit=0 selects the
+                # complete file; negative values exclude abs(limit) lines from
+                # the front. These compatibility modes necessarily scan EOF.
+                excluded_prefix = abs(requested_limit) if requested_limit < 0 else 0
+                cursor = 0
+                pending = b""
+                physical_index = 0
+                excluded = 0
+                while cursor < snapshot_size:
+                    if int(os.fstat(handle.fileno()).st_size) < snapshot_size:
+                        raise OSError("PHYSICAL_TAIL_SOURCE_CHANGED_DURING_READ")
+                    read_size = min(block_size, snapshot_size - cursor)
+                    chunk = handle.read(read_size)
+                    if len(chunk) != read_size:
+                        raise OSError("PHYSICAL_TAIL_SHORT_READ")
+                    cursor += len(chunk)
+                    metadata["bytes_read"] += len(chunk)
+                    snapshot_ended_with_newline = chunk.endswith(b"\n")
+                    parts = (pending + chunk).split(b"\n")
+                    pending = parts.pop()
+                    for raw_line in parts:
+                        physical_index += 1
+                        if physical_index <= excluded_prefix:
+                            excluded += 1
+                        else:
+                            raw_lines.append(raw_line)
+                if snapshot_size and pending:
+                    physical_index += 1
+                    if physical_index <= excluded_prefix:
+                        excluded += 1
+                    else:
+                        raw_lines.append(pending)
+                metadata["tail_limited"] = bool(excluded)
+
+            final_open = os.fstat(handle.fileno())
+            try:
+                final_path = source.lstat()
+            except OSError:
+                final_path = None
+            if source_changed(initial_path, initial_open, final_open, final_path):
+                raise OSError("PHYSICAL_TAIL_SOURCE_CHANGED_DURING_READ")
+
+        # Text-level metadata: True means the EOF line is unterminated. The
+        # callers still decide independently whether its JSON is complete.
+        metadata["incomplete_last_line"] = bool(
+            snapshot_size and not snapshot_ended_with_newline
+        )
+        metadata["lines"] = [raw_line.decode("utf-8") for raw_line in raw_lines]
+        metadata["physical_lines_returned"] = len(raw_lines)
+        return metadata
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _read_jsonl_tail_v3(path, limit=200):
     try:
         p = Path(path)
         if not p.exists():
             return []
-        lines = p.read_text(encoding="utf-8").splitlines()[-int(limit):]
+        lines = _read_physical_tail_lines_v1(p, int(limit))["lines"]
         out = []
         for line in lines:
             try:
@@ -28459,8 +28644,7 @@ def _awe_extract_outcome_records(limit=600):
         try:
             if not path or not Path(path).exists():
                 continue
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.readlines()[-int(limit):]
+            lines = _read_physical_tail_lines_v1(path, int(limit))["lines"]
             for line in lines:
                 try:
                     item = json.loads(line)
