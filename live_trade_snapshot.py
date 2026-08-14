@@ -6,16 +6,14 @@ import copy
 import json
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 from trade_timeline_validator import COMPONENTS as TIMELINE_COMPONENTS
 from trade_timeline_validator import (
-    apply_identity_resolution_metadata,
-    build_default_sources,
-    correlate_source_records,
-    identity_resolution_metadata,
-    new_correlation_context,
+    EvidenceBundle,
+    collect_evidence_bundle,
     validate_trade_timeline,
 )
 
@@ -225,70 +223,140 @@ def _safe_issue(component: str, code: str, **extra: Any) -> Dict[str, Any]:
 
 def _collect_sources(
     trade_id: str,
-    sources: Mapping[str, Any],
+    sources: Optional[Mapping[str, Any]],
     *,
+    logger: Optional[logging.Logger] = None,
     opened_at: Any = None,
     opened_epoch: Any = None,
     instance_id: Any = None,
-) -> tuple[Dict[str, list[Mapping[str, Any]]], Dict[str, Any], Dict[str, Any], list, list, Any]:
-    correlation = new_correlation_context(
+) -> tuple[Dict[str, list[Mapping[str, Any]]], Dict[str, Any], Dict[str, Any], list, list, Any, EvidenceBundle]:
+    bundle = collect_evidence_bundle(
         trade_id,
+        sources=sources,
+        logger=logger,
         opened_at=opened_at,
         opened_epoch=opened_epoch,
         instance_id=instance_id,
+        component_order=SOURCE_ORDER,
+        passthrough_components=("external_exposure",),
+        record_coercer=_records,
     )
-    rows_by_source: Dict[str, list[Mapping[str, Any]]] = {}
-    raw_by_source: Dict[str, Any] = {}
+    rows_by_source = {
+        name: list(bundle.records.get(name, ()))
+        for name in SOURCE_ORDER
+    }
+    raw_by_source = dict(bundle.raw_sources)
     status: Dict[str, Any] = {}
     warnings, errors = [], []
 
     for name in SOURCE_ORDER:
-        source = sources.get(name)
-        if source is None:
-            rows_by_source[name] = []
+        bundle_status = bundle.component_status.get(name, {})
+        if bundle_status.get("status") == "UNAVAILABLE":
             status[name] = {"status": "UNAVAILABLE", "records": 0}
             continue
-        try:
-            value = source(trade_id) if callable(source) else source
-            apply_identity_resolution_metadata(correlation, value)
-            candidates = _records(value)
-            if name == "external_exposure":
-                matched = candidates
-            else:
-                matched = correlate_source_records(name, candidates, correlation)
-            rows_by_source[name] = matched
-            raw_by_source[name] = value
-            source_state = _source_status(value, matched)
-            meta = _metadata(value)
+        if bundle_status.get("status") == "ERROR":
             status[name] = {
-                "status": source_state,
-                "records": len(matched),
-                **{
-                    key: meta[key]
-                    for key in (
-                        "lines_scanned", "valid_lines", "invalid_lines", "partial",
-                        "bytes_scanned", "coverage_limited", "evidence_found",
-                        "coverage_complete", "conclusive", "records_examined",
-                        "direction", "time_range_scanned", "stop_reason",
-                        "source_size_bytes", "snapshot_eof", "next_scan_cursor",
-                        "evidence_status",
-                    )
-                    if key in meta
-                },
+                "status": "ERROR",
+                "records": 0,
+                "error_type": bundle_status.get("error_type", "Exception"),
             }
-            if name == "registry" and correlation.registry_candidate_count:
-                status[name]["identity_ambiguous"] = bool(
-                    correlation.identity_ambiguous and not correlation.registry_anchored
-                )
-                status[name]["candidate_count"] = correlation.registry_candidate_count
-            if meta.get("invalid_lines", 0):
-                warnings.append(_safe_issue(name, "CORRUPT_JSONL_LINES_SKIPPED", count=int(meta["invalid_lines"])))
-        except Exception as exc:
-            rows_by_source[name] = []
-            raw_by_source[name] = None
-            status[name] = {"status": "ERROR", "records": 0, "error_type": type(exc).__name__}
             errors.append(_safe_issue(name, "SOURCE_READ_ERROR"))
-    return rows_by_source, raw_by_source, status, warnings, errors, correlation
+            continue
+        value = raw_by_source.get(name)
+        matched = rows_by_source[name]
+        source_state = _source_status(value, matched)
+        meta = _metadata(value)
+        status[name] = {
+            "status": source_state,
+            "records": len(matched),
+            **{
+                key: meta[key]
+                for key in (
+                    "lines_scanned", "valid_lines", "invalid_lines", "partial",
+                    "bytes_scanned", "coverage_limited", "evidence_found",
+                    "coverage_complete", "conclusive", "records_examined",
+                    "direction", "time_range_scanned", "stop_reason",
+                    "source_size_bytes", "snapshot_eof", "next_scan_cursor",
+                    "evidence_status",
+                )
+                if key in meta
+            },
+        }
+        if name == "registry" and bundle.correlation.registry_candidate_count:
+            status[name]["identity_ambiguous"] = bool(
+                bundle.correlation.identity_ambiguous
+                and not bundle.correlation.registry_anchored
+            )
+            status[name]["candidate_count"] = bundle.correlation.registry_candidate_count
+        if meta.get("invalid_lines", 0):
+            warnings.append(
+                _safe_issue(
+                    name,
+                    "CORRUPT_JSONL_LINES_SKIPPED",
+                    count=int(meta["invalid_lines"]),
+                )
+            )
+    validator_components = {
+        name: dict(detail)
+        for name, detail in bundle.component_status.items()
+    }
+    validator_coverage = {
+        name: dict(detail)
+        for name, detail in bundle.source_coverage.items()
+    }
+    validator_errors = [
+        dict(item)
+        for item in bundle.errors
+        if item.get("component") not in TIMELINE_COMPONENTS
+    ]
+    for name in TIMELINE_COMPONENTS:
+        source_state = status[name]["status"]
+        if source_state == "UNAVAILABLE":
+            # Legacy Snapshot supplied an empty in-memory source to Validator
+            # for an omitted component, while its own component status remained
+            # UNAVAILABLE. Keep that public two-view contract without rereading.
+            validator_components[name] = {"status": "NO_EVIDENCE", "records": 0}
+            validator_coverage[name] = {
+                "evidence_found": False,
+                "coverage_complete": True,
+                "partial": False,
+                "conclusive": True,
+                "bytes_scanned": 0,
+                "records_examined": 0,
+                "direction": "IN_MEMORY",
+                "time_range_scanned": {"oldest": None, "newest": None},
+                "stop_reason": "IN_MEMORY_COMPLETE",
+                "source_size_bytes": 0,
+                "snapshot_eof": 0,
+                "evidence_status": "COMPLETE_NO_EVIDENCE",
+            }
+        elif source_state == "ERROR":
+            validator_components[name] = {
+                "status": "ERROR",
+                "records": 0,
+                "error_type": "OSError",
+                "error": f"{name} source unavailable",
+            }
+            validator_errors.append({
+                "component": name,
+                "error_type": "OSError",
+                "message": f"{name} source unavailable",
+            })
+    validator_bundle = replace(
+        bundle,
+        component_status=validator_components,
+        source_coverage=validator_coverage,
+        errors=tuple(validator_errors),
+    )
+    return (
+        rows_by_source,
+        raw_by_source,
+        status,
+        warnings,
+        errors,
+        bundle.correlation,
+        validator_bundle,
+    )
 
 
 def _direct_first(records: Iterable[Mapping[str, Any]], *keys: str) -> Any:
@@ -641,53 +709,31 @@ def build_live_trade_snapshot(
     active_logger = logger or LOGGER
     try:
         identity = _safe_id(trade_id)
-        source_map = (
-            dict(sources)
-            if sources is not None
-            else build_default_sources(
-                opened_at=opened_at,
-                opened_epoch=opened_epoch,
-                instance_id=instance_id,
-            )
-        )
-        rows, raw_sources, component_status, warnings, errors, correlation = _collect_sources(
+        (
+            rows,
+            raw_sources,
+            component_status,
+            warnings,
+            errors,
+            correlation,
+            evidence_bundle,
+        ) = _collect_sources(
             identity,
-            source_map,
+            dict(sources) if sources is not None else None,
+            logger=active_logger,
             opened_at=opened_at,
             opened_epoch=opened_epoch,
             instance_id=instance_id,
         )
 
-        validator_sources = {}
-        for name in TIMELINE_COMPONENTS:
-            if component_status.get(name, {}).get("status") == "ERROR":
-                def failed_source(_trade_id: str, component=name):
-                    raise OSError(f"{component} source unavailable")
-                validator_sources[name] = failed_source
-            else:
-                source_metadata = _metadata(raw_sources.get(name))
-                source_identity = (
-                    identity_resolution_metadata(correlation)
-                    if name == "registry"
-                    else None
-                )
-                validator_sources[name] = (
-                    {
-                        "records": rows.get(name, []),
-                        **({"_reader_metadata": source_metadata} if source_metadata else {}),
-                        **({"_identity_metadata": source_identity} if source_identity else {}),
-                    }
-                    if source_metadata or source_identity
-                    else rows.get(name, [])
-                )
         try:
             timeline_report = validate_trade_timeline(
                 identity,
-                sources=validator_sources,
                 logger=active_logger,
                 opened_at=opened_at,
                 opened_epoch=opened_epoch,
                 instance_id=instance_id,
+                evidence_bundle=evidence_bundle,
             )
         except Exception as exc:
             timeline_report = {"result": "FAIL", "valid": False, "fail_open": True, "production_blocked": False, "errors": [{"error_type": type(exc).__name__}]}

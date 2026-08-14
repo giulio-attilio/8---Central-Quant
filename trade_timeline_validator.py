@@ -434,6 +434,25 @@ class CorrelationContext:
         self.trusted_typed.setdefault("trade_id", set()).add(self.trade_id)
 
 
+@dataclass(frozen=True)
+class EvidenceBundle:
+    """Request-local correlated evidence, treated as immutable after build."""
+
+    trade_id: str
+    target_identity: TargetIdentity
+    registry_resolution: Mapping[str, Any]
+    records: Mapping[str, tuple[Mapping[str, Any], ...]]
+    raw_sources: Mapping[str, Any]
+    source_coverage: Mapping[str, Mapping[str, Any]]
+    component_status: Mapping[str, Mapping[str, Any]]
+    events: tuple[Mapping[str, Any], ...]
+    matched_identifiers: Mapping[str, tuple[str, ...]]
+    source_fingerprints: Mapping[str, Mapping[str, int]]
+    warnings: tuple[Mapping[str, Any], ...]
+    errors: tuple[Mapping[str, Any], ...]
+    correlation: CorrelationContext = field(repr=False, compare=False)
+
+
 def _normalize_opened_selectors(
     opened_at: Any = None,
     opened_epoch: Any = None,
@@ -1123,14 +1142,6 @@ def _read_path(
                 stats["lines_scanned"] += 1
                 if raw_line.strip():
                     stats["records_examined"] += 1
-                    try:
-                        item = json.loads(raw_line.decode("utf-8"))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        stats["invalid_lines"] += 1
-                    else:
-                        stats["valid_lines"] += 1
-                        if isinstance(item, Mapping):
-                            _update_scanned_time(stats, item)
                 return stats["records_examined"] >= JSONL_MAX_VALID_LINES
 
             while offset > region_start and not record_budget_hit:
@@ -1258,24 +1269,51 @@ def _read_path(
 
             # Reverse physical selection is deliberately replayed in file order
             # so correlation and identity promotion retain their old chronology.
-            payload = b"".join(reversed(scan_chunks))
+            # Each selected physical line is decoded exactly once here. Chunks
+            # are replayed incrementally to avoid a second page-sized byte copy.
             replay_offset = max(0, earliest_examined - loaded_start)
-            while replay_offset < len(payload):
-                newline = payload.find(b"\n", replay_offset)
-                if newline < 0:
-                    selected_end = len(payload)
-                    next_offset = len(payload)
-                else:
-                    selected_end = newline
-                    next_offset = newline + 1
-                raw_line = payload[replay_offset:selected_end]
+
+            def parse_replay_line(raw_line: bytes) -> Optional[Mapping[str, Any]]:
+                if not raw_line.strip():
+                    return None
                 try:
-                    item = json.loads(raw_line.decode("utf-8")) if raw_line.strip() else None
+                    item = json.loads(raw_line.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
-                    item = None
+                    stats["invalid_lines"] += 1
+                    return None
+                stats["valid_lines"] += 1
                 if isinstance(item, Mapping):
+                    _update_scanned_time(stats, item)
+                    return item
+                return None
+
+            pending_parts: list[bytes] = []
+            first_chunk = True
+            for replay_chunk in reversed(scan_chunks):
+                if first_chunk:
+                    replay_chunk = replay_chunk[replay_offset:]
+                    first_chunk = False
+                chunk_offset = 0
+                while chunk_offset < len(replay_chunk):
+                    newline = replay_chunk.find(b"\n", chunk_offset)
+                    if newline < 0:
+                        pending_parts.append(replay_chunk[chunk_offset:])
+                        break
+                    line_part = replay_chunk[chunk_offset:newline]
+                    raw_line = (
+                        b"".join((*pending_parts, line_part))
+                        if pending_parts
+                        else line_part
+                    )
+                    pending_parts.clear()
+                    item = parse_replay_line(raw_line)
+                    if item is not None:
+                        yield item
+                    chunk_offset = newline + 1
+            if pending_parts:
+                item = parse_replay_line(b"".join(pending_parts))
+                if item is not None:
                     yield item
-                replay_offset = next_offset
         return
 
     if not path.exists() or not path.is_file():
@@ -1364,6 +1402,8 @@ def _default_reader(
             "records": matched,
             "_reader_metadata": reader_metadata,
             "_identity_metadata": identity_resolution_metadata(active_context),
+            "_evidence_correlated": True,
+            "_correlation_context": active_context,
         }
 
     return read
@@ -1376,6 +1416,7 @@ def build_default_sources(
     opened_at: Any = None,
     opened_epoch: Any = None,
     instance_id: Any = None,
+    correlation_context: Optional[CorrelationContext] = None,
 ) -> Dict[str, Callable[[str], Dict[str, Any]]]:
     """Constroi leitores locais. Nao le arquivos ate a validacao ser solicitada."""
     configured_paths = default_source_paths(environ)
@@ -1386,7 +1427,7 @@ def build_default_sources(
         for path in paths
     ):
         raise ValueError("scan cursor belongs to an unconfigured source")
-    context = new_correlation_context(
+    context = correlation_context or new_correlation_context(
         "",
         opened_at=opened_at,
         opened_epoch=opened_epoch,
@@ -1433,7 +1474,13 @@ def _coerce_records(value: Any) -> list[Mapping[str, Any]]:
                 head = {
                     k: v
                     for k, v in value.items()
-                    if k not in {key, "_reader_metadata", "_identity_metadata"}
+                    if k not in {
+                        key,
+                        "_reader_metadata",
+                        "_identity_metadata",
+                        "_evidence_correlated",
+                        "_correlation_context",
+                    }
                 }
                 rows = [item for item in value[key] if isinstance(item, Mapping)]
                 return ([head] if head else []) + rows
@@ -2019,6 +2066,231 @@ def _compare(left_name: str, right_name: str, facts: Mapping[str, Mapping[str, A
     return result
 
 
+def _unavailable_source_coverage() -> Dict[str, Any]:
+    return {
+        "evidence_found": False,
+        "coverage_complete": False,
+        "partial": True,
+        "conclusive": False,
+        "bytes_scanned": 0,
+        "records_examined": 0,
+        "direction": "UNAVAILABLE",
+        "time_range_scanned": {"oldest": None, "newest": None},
+        "stop_reason": "SOURCE_UNAVAILABLE",
+        "source_size_bytes": 0,
+        "snapshot_eof": 0,
+        "evidence_status": "COVERAGE_LIMITED",
+    }
+
+
+def _error_source_coverage() -> Dict[str, Any]:
+    coverage = _unavailable_source_coverage()
+    coverage.update({"direction": "ERROR", "stop_reason": "SOURCE_ERROR"})
+    return coverage
+
+
+def collect_evidence_bundle(
+    trade_id: str,
+    *,
+    sources: Optional[Mapping[str, Any]] = None,
+    logger: Optional[logging.Logger] = None,
+    scan_cursor: Optional[str] = None,
+    opened_at: Any = None,
+    opened_epoch: Any = None,
+    instance_id: Any = None,
+    component_order: Iterable[str] = COMPONENTS,
+    passthrough_components: Iterable[str] = (),
+    record_coercer: Optional[Callable[[Any], list[Mapping[str, Any]]]] = None,
+) -> EvidenceBundle:
+    """Read and correlate source evidence exactly once for one request."""
+
+    identity = str(trade_id or "").strip()
+    active_logger = logger or LOGGER
+    names = tuple(dict.fromkeys(str(name) for name in component_order))
+    passthrough = frozenset(str(name) for name in passthrough_components)
+    coerce_records = record_coercer or _coerce_records
+    correlation = new_correlation_context(
+        identity,
+        opened_at=opened_at,
+        opened_epoch=opened_epoch,
+        instance_id=instance_id,
+    )
+    source_map = (
+        dict(sources)
+        if sources is not None
+        else build_default_sources(
+            scan_cursor=scan_cursor,
+            opened_at=opened_at,
+            opened_epoch=opened_epoch,
+            instance_id=instance_id,
+            correlation_context=correlation,
+        )
+    )
+    records: Dict[str, list[Mapping[str, Any]]] = {}
+    raw_sources: Dict[str, Any] = {}
+    components: Dict[str, Dict[str, Any]] = {}
+    source_coverage: Dict[str, Dict[str, Any]] = {}
+    warnings: list[Dict[str, Any]] = []
+    errors: list[Dict[str, Any]] = []
+
+    for name in names:
+        source = source_map.get(name)
+        if source is None:
+            records[name] = []
+            components[name] = {"status": "UNAVAILABLE", "records": 0}
+            source_coverage[name] = _unavailable_source_coverage()
+            continue
+        try:
+            value = source(identity) if callable(source) else source
+            raw_sources[name] = value
+            source_context = value.get("_correlation_context") if isinstance(value, Mapping) else None
+            already_correlated = bool(
+                isinstance(value, Mapping)
+                and value.get("_evidence_correlated") is True
+                and isinstance(source_context, CorrelationContext)
+            )
+            if already_correlated:
+                # Default readers share this request-local context and already
+                # applied rejection-first identity correlation while streaming.
+                correlation = source_context
+                rows = coerce_records(value)
+            else:
+                apply_identity_resolution_metadata(correlation, value)
+                candidates = coerce_records(value)
+                rows = (
+                    candidates
+                    if name in passthrough
+                    else correlate_source_records(name, candidates, correlation)
+                )
+
+            reader_metadata = _reader_metadata(value)
+            if reader_metadata:
+                reader_metadata["evidence_found"] = bool(
+                    rows or reader_metadata.get("evidence_found", False)
+                )
+                if rows and reader_metadata.get("evidence_status") not in {
+                    "SOURCE_CHANGED",
+                    "IDENTITY_AMBIGUOUS",
+                }:
+                    reader_metadata["evidence_status"] = "EVIDENCE_FOUND"
+            records[name] = rows
+            fully_corrupt = bool(
+                reader_metadata.get("files_read", 0) > 0
+                and reader_metadata.get("lines_scanned", 0) > 0
+                and reader_metadata.get("valid_lines", 0) == 0
+                and reader_metadata.get("invalid_lines", 0) > 0
+            )
+            status = "AVAILABLE" if rows else ("DEGRADED" if fully_corrupt else "NO_EVIDENCE")
+            components[name] = {"status": status, "records": len(rows), **reader_metadata}
+            if name == "registry" and correlation.registry_candidate_count:
+                components[name]["identity_ambiguous"] = bool(
+                    correlation.identity_ambiguous and not correlation.registry_anchored
+                )
+                components[name]["candidate_count"] = correlation.registry_candidate_count
+            source_coverage[name] = {
+                "evidence_found": bool(reader_metadata.get("evidence_found", bool(rows))),
+                "coverage_complete": bool(reader_metadata.get("coverage_complete", True)),
+                "partial": bool(reader_metadata.get("partial", False)),
+                "conclusive": bool(reader_metadata.get("conclusive", True)),
+                "bytes_scanned": int(reader_metadata.get("bytes_scanned", 0) or 0),
+                "records_examined": int(reader_metadata.get("records_examined", len(rows)) or 0),
+                "direction": reader_metadata.get("direction", "IN_MEMORY"),
+                "time_range_scanned": dict(
+                    reader_metadata.get("time_range_scanned")
+                    or {"oldest": None, "newest": None}
+                ),
+                "stop_reason": reader_metadata.get("stop_reason", "IN_MEMORY_COMPLETE"),
+                "source_size_bytes": int(reader_metadata.get("source_size_bytes", 0) or 0),
+                "snapshot_eof": int(reader_metadata.get("snapshot_eof", 0) or 0),
+                "evidence_status": reader_metadata.get(
+                    "evidence_status",
+                    "EVIDENCE_FOUND" if rows else "COMPLETE_NO_EVIDENCE",
+                ),
+            }
+            if reader_metadata.get("next_scan_cursor"):
+                source_coverage[name]["next_scan_cursor"] = reader_metadata["next_scan_cursor"]
+            if reader_metadata.get("invalid_lines", 0) > 0:
+                warnings.append({
+                    "component": name,
+                    "code": "CORRUPT_JSONL_LINES_SKIPPED",
+                    "count": reader_metadata["invalid_lines"],
+                })
+            _structured_log(
+                active_logger,
+                "info",
+                "TRADE_TIMELINE_SOURCE_READ",
+                trade_id=identity,
+                component=name,
+                status=status,
+                records=len(rows),
+                invalid_lines=reader_metadata.get("invalid_lines", 0),
+                partial=reader_metadata.get("partial", False),
+            )
+        except Exception as exc:
+            records[name] = []
+            raw_sources[name] = None
+            components[name] = {
+                "status": "ERROR",
+                "records": 0,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:300],
+            }
+            source_coverage[name] = _error_source_coverage()
+            errors.append({
+                "component": name,
+                "error_type": type(exc).__name__,
+                "message": str(exc)[:300],
+            })
+            _structured_log(
+                active_logger,
+                "warning",
+                "TRADE_TIMELINE_SOURCE_ERROR",
+                trade_id=identity,
+                component=name,
+                error_type=type(exc).__name__,
+            )
+
+    events: list[Dict[str, Any]] = []
+    for component in COMPONENTS:
+        for record in records.get(component, ()):
+            events.extend(_events_from_record(component, record))
+    events = _deduplicate_extracted(events)
+    events.sort(
+        key=lambda item: (
+            item.get("epoch") is None,
+            item.get("epoch") or 0.0,
+            EVENT_ORDER.index(item["event"]) if item["event"] in EVENT_ORDER else 999,
+        )
+    )
+    matched_identifiers = {
+        key: tuple(sorted(values))
+        for key, values in sorted(correlation.trusted_typed.items())
+        if values
+    }
+    source_fingerprints = {
+        name: {
+            "source_size_bytes": int(detail.get("source_size_bytes", 0) or 0),
+            "snapshot_eof": int(detail.get("snapshot_eof", 0) or 0),
+        }
+        for name, detail in source_coverage.items()
+    }
+    return EvidenceBundle(
+        trade_id=identity,
+        target_identity=target_identity_from_context(correlation),
+        registry_resolution=identity_resolution_metadata(correlation),
+        records={name: tuple(rows) for name, rows in records.items()},
+        raw_sources=dict(raw_sources),
+        source_coverage={name: dict(detail) for name, detail in source_coverage.items()},
+        component_status={name: dict(detail) for name, detail in components.items()},
+        events=tuple(events),
+        matched_identifiers=matched_identifiers,
+        source_fingerprints=source_fingerprints,
+        warnings=tuple(warnings),
+        errors=tuple(errors),
+        correlation=correlation,
+    )
+
+
 class TradeTimelineValidator:
     """Validador read-only. Excecoes de fontes sao convertidas em evidencia."""
 
@@ -2034,146 +2306,56 @@ class TradeTimelineValidator:
         self.opened_at = opened_at
         self.opened_epoch = opened_epoch
         self.instance_id = instance_id
-        self.sources = (
-            dict(sources)
-            if sources is not None
-            else build_default_sources(
-                scan_cursor=scan_cursor,
-                opened_at=opened_at,
-                opened_epoch=opened_epoch,
-                instance_id=instance_id,
-            )
-        )
+        self.sources = dict(sources) if sources is not None else None
+        self.scan_cursor = scan_cursor
         self.logger = logger or LOGGER
 
-    def validate(self, trade_id: str) -> Dict[str, Any]:
+    def validate(
+        self,
+        trade_id: str,
+        *,
+        evidence_bundle: Optional[EvidenceBundle] = None,
+    ) -> Dict[str, Any]:
         started = time.perf_counter()
         identity = str(trade_id or "").strip()
         _structured_log(self.logger, "info", "TRADE_TIMELINE_VALIDATION_BEGIN", trade_id=identity)
-        components: Dict[str, Dict[str, Any]] = {}
-        records: Dict[str, list[Mapping[str, Any]]] = {}
-        errors = []
-        warnings = []
-        correlation = new_correlation_context(
+        bundle = evidence_bundle or collect_evidence_bundle(
             identity,
+            sources=self.sources,
+            logger=self.logger,
+            scan_cursor=self.scan_cursor,
             opened_at=self.opened_at,
             opened_epoch=self.opened_epoch,
             instance_id=self.instance_id,
         )
-        source_coverage: Dict[str, Dict[str, Any]] = {}
+        if bundle.trade_id != identity:
+            raise ValueError("evidence bundle belongs to another trade")
+
+        components = {
+            name: dict(bundle.component_status.get(name) or {"status": "UNAVAILABLE", "records": 0})
+            for name in COMPONENTS
+        }
+        records = {name: list(bundle.records.get(name, ())) for name in COMPONENTS}
+        source_coverage = {
+            name: dict(bundle.source_coverage.get(name) or _unavailable_source_coverage())
+            for name in COMPONENTS
+        }
+        errors = [
+            dict(item)
+            for item in bundle.errors
+            if item.get("component") in COMPONENTS
+        ]
+        warnings = [
+            dict(item)
+            for item in bundle.warnings
+            if item.get("component") in COMPONENTS
+        ]
+        correlation = bundle.correlation
 
         if not identity:
             errors.append({"component": "validator", "error_type": "ValueError", "message": "trade_id is required"})
 
-        for name in COMPONENTS:
-            source = self.sources.get(name)
-            if source is None:
-                components[name] = {"status": "UNAVAILABLE", "records": 0}
-                records[name] = []
-                source_coverage[name] = {
-                    "evidence_found": False,
-                    "coverage_complete": False,
-                    "partial": True,
-                    "conclusive": False,
-                    "bytes_scanned": 0,
-                    "records_examined": 0,
-                    "direction": "UNAVAILABLE",
-                    "time_range_scanned": {"oldest": None, "newest": None},
-                    "stop_reason": "SOURCE_UNAVAILABLE",
-                    "source_size_bytes": 0,
-                    "snapshot_eof": 0,
-                    "evidence_status": "COVERAGE_LIMITED",
-                }
-                continue
-            try:
-                value = source(identity) if callable(source) else source
-                apply_identity_resolution_metadata(correlation, value)
-                rows = correlate_source_records(name, _coerce_records(value), correlation)
-                reader_metadata = _reader_metadata(value)
-                if reader_metadata:
-                    reader_metadata["evidence_found"] = bool(
-                        rows or reader_metadata.get("evidence_found", False)
-                    )
-                    if rows and reader_metadata.get("evidence_status") not in {
-                        "SOURCE_CHANGED", "IDENTITY_AMBIGUOUS"
-                    }:
-                        reader_metadata["evidence_status"] = "EVIDENCE_FOUND"
-                records[name] = rows
-                fully_corrupt = bool(
-                    reader_metadata.get("files_read", 0) > 0
-                    and reader_metadata.get("lines_scanned", 0) > 0
-                    and reader_metadata.get("valid_lines", 0) == 0
-                    and reader_metadata.get("invalid_lines", 0) > 0
-                )
-                status = "AVAILABLE" if rows else ("DEGRADED" if fully_corrupt else "NO_EVIDENCE")
-                components[name] = {"status": status, "records": len(rows), **reader_metadata}
-                if name == "registry" and correlation.registry_candidate_count:
-                    components[name]["identity_ambiguous"] = bool(
-                        correlation.identity_ambiguous and not correlation.registry_anchored
-                    )
-                    components[name]["candidate_count"] = correlation.registry_candidate_count
-                source_coverage[name] = {
-                    "evidence_found": bool(reader_metadata.get("evidence_found", bool(rows))),
-                    "coverage_complete": bool(reader_metadata.get("coverage_complete", True)),
-                    "partial": bool(reader_metadata.get("partial", False)),
-                    "conclusive": bool(reader_metadata.get("conclusive", True)),
-                    "bytes_scanned": int(reader_metadata.get("bytes_scanned", 0) or 0),
-                    "records_examined": int(reader_metadata.get("records_examined", len(rows)) or 0),
-                    "direction": reader_metadata.get("direction", "IN_MEMORY"),
-                    "time_range_scanned": dict(reader_metadata.get("time_range_scanned") or {"oldest": None, "newest": None}),
-                    "stop_reason": reader_metadata.get("stop_reason", "IN_MEMORY_COMPLETE"),
-                    "source_size_bytes": int(reader_metadata.get("source_size_bytes", 0) or 0),
-                    "snapshot_eof": int(reader_metadata.get("snapshot_eof", 0) or 0),
-                    "evidence_status": reader_metadata.get(
-                        "evidence_status",
-                        "EVIDENCE_FOUND" if rows else "COMPLETE_NO_EVIDENCE",
-                    ),
-                }
-                if reader_metadata.get("next_scan_cursor"):
-                    source_coverage[name]["next_scan_cursor"] = reader_metadata["next_scan_cursor"]
-                if reader_metadata.get("invalid_lines", 0) > 0:
-                    warnings.append({
-                        "component": name,
-                        "code": "CORRUPT_JSONL_LINES_SKIPPED",
-                        "count": reader_metadata["invalid_lines"],
-                    })
-                _structured_log(
-                    self.logger,
-                    "info",
-                    "TRADE_TIMELINE_SOURCE_READ",
-                    trade_id=identity,
-                    component=name,
-                    status=status,
-                    records=len(rows),
-                    invalid_lines=reader_metadata.get("invalid_lines", 0),
-                    partial=reader_metadata.get("partial", False),
-                )
-            except Exception as exc:
-                records[name] = []
-                components[name] = {"status": "ERROR", "records": 0, "error_type": type(exc).__name__, "error": str(exc)[:300]}
-                source_coverage[name] = {
-                    "evidence_found": False,
-                    "coverage_complete": False,
-                    "partial": True,
-                    "conclusive": False,
-                    "bytes_scanned": 0,
-                    "records_examined": 0,
-                    "direction": "ERROR",
-                    "time_range_scanned": {"oldest": None, "newest": None},
-                    "stop_reason": "SOURCE_ERROR",
-                    "source_size_bytes": 0,
-                    "snapshot_eof": 0,
-                    "evidence_status": "COVERAGE_LIMITED",
-                }
-                errors.append({"component": name, "error_type": type(exc).__name__, "message": str(exc)[:300]})
-                _structured_log(self.logger, "warning", "TRADE_TIMELINE_SOURCE_ERROR", trade_id=identity, component=name, error_type=type(exc).__name__)
-
-        events = []
-        for component, rows in records.items():
-            for record in rows:
-                events.extend(_events_from_record(component, record))
-        events = _deduplicate_extracted(events)
-        events.sort(key=lambda item: (item.get("epoch") is None, item.get("epoch") or 0.0, EVENT_ORDER.index(item["event"]) if item["event"] in EVENT_ORDER else 999))
+        events = [dict(item) for item in bundle.events]
 
         present = {item["event"] for item in events}
         missing = [name for name in REQUIRED_EVENTS if name not in present]
@@ -2306,6 +2488,7 @@ def validate_trade_timeline(
     opened_at: Any = None,
     opened_epoch: Any = None,
     instance_id: Any = None,
+    evidence_bundle: Optional[EvidenceBundle] = None,
 ) -> Dict[str, Any]:
     """API publica fail-open para validacao de um trade."""
     try:
@@ -2316,7 +2499,7 @@ def validate_trade_timeline(
             opened_at=opened_at,
             opened_epoch=opened_epoch,
             instance_id=instance_id,
-        ).validate(trade_id)
+        ).validate(trade_id, evidence_bundle=evidence_bundle)
     except Exception as exc:  # ultima barreira: auditoria nunca afeta a operacao
         active_logger = logger or LOGGER
         _structured_log(active_logger, "exception", "TRADE_TIMELINE_VALIDATION_ERROR", trade_id=str(trade_id or ""), error_type=type(exc).__name__)
@@ -2358,10 +2541,12 @@ __all__ = [
     "EVENT_ORDER",
     "REQUIRED_EVENTS",
     "CorrelationContext",
+    "EvidenceBundle",
     "TargetIdentity",
     "TradeTimelineValidator",
     "apply_identity_resolution_metadata",
     "build_default_sources",
+    "collect_evidence_bundle",
     "correlate_source_records",
     "default_source_paths",
     "identity_resolution_metadata",
