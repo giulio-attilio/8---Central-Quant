@@ -59306,6 +59306,95 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
 
 
 # ============================================================================
+# TRADE EVIDENCE INDEX SHADOW TELEMETRY V1 — READ-ONLY HTTP SURFACE
+# ============================================================================
+@app.route("/tradeevidenceindex/shadow/status", methods=["GET"])
+def trade_evidence_index_shadow_status_v1_route():
+    """Expose only the bounded, process-local shadow telemetry snapshot."""
+    module_name = "trade_evidence_identity_offset_shadow_compare_v1"
+    source_names = ("history_manager", "timeline")
+    source_fields = (
+        "shadow_requests",
+        "shadow_eligible",
+        "shadow_matches",
+        "shadow_mismatches",
+        "shadow_not_comparable",
+        "shadow_index_unavailable",
+        "shadow_last_status",
+        "shadow_last_index_status",
+        "shadow_last_at",
+        "shadow_last_trade_id_masked",
+        "shadow_last_source",
+        "shadow_last_mismatch_category",
+        "shadow_last_legacy_count",
+        "shadow_last_index_count",
+        "shadow_last_index_lookup_ms",
+        "shadow_last_legacy_duration_ms",
+        "shadow_last_duration_ms",
+        "shadow_last_duration_overhead_percent",
+        "shadow_last_legacy_bytes_scanned",
+        "shadow_last_factual_journal_bytes",
+        "shadow_last_tail_journal_bytes",
+        "shadow_last_journal_bytes_read",
+        "shadow_total_index_journal_bytes_read",
+    )
+
+    try:
+        # Import local: a falha desta superfície diagnóstica não afeta o startup.
+        from trade_evidence_identity_offset_shadow_compare_v1 import (
+            get_shadow_telemetry_snapshot,
+        )
+
+        snapshot = get_shadow_telemetry_snapshot()
+        if not isinstance(snapshot, dict):
+            raise TypeError("invalid shadow telemetry snapshot")
+        raw_sources = snapshot.get("sources")
+        if not isinstance(raw_sources, dict):
+            raise TypeError("invalid shadow telemetry sources")
+
+        sources = {}
+        for source_name in source_names:
+            raw_source = raw_sources.get(source_name)
+            if not isinstance(raw_source, dict):
+                raise TypeError("invalid shadow telemetry source")
+            projected = {
+                field: raw_source.get(field)
+                for field in source_fields
+            }
+            masked_trade_id = projected.get("shadow_last_trade_id_masked")
+            if masked_trade_id is not None and (
+                not isinstance(masked_trade_id, str)
+                or len(masked_trade_id) != 12
+                or any(char not in "0123456789abcdef" for char in masked_trade_id.lower())
+            ):
+                projected["shadow_last_trade_id_masked"] = None
+            sources[source_name] = projected
+
+        return {
+            "ok": True,
+            "module": module_name,
+            "version": snapshot.get("version"),
+            "shadow_enabled": bool(snapshot.get("shadow_enabled", False)),
+            "shadow_compare_enabled": bool(snapshot.get("shadow_compare_enabled", False)),
+            "sources": sources,
+        }, 200
+    except Exception as exc:
+        error_type = type(exc).__name__
+        if (
+            not isinstance(error_type, str)
+            or not error_type.isidentifier()
+            or len(error_type) > 80
+        ):
+            error_type = "Exception"
+        return {
+            "ok": False,
+            "module": module_name,
+            "status": "UNAVAILABLE",
+            "error_type": error_type,
+        }, 503
+
+
+# ============================================================================
 # TRADE TIMELINE VALIDATOR V1 — MANUAL READ-ONLY HTTP SURFACE
 # ============================================================================
 @app.route("/trade_timeline", methods=["GET"])
