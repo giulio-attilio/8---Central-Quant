@@ -94,6 +94,10 @@ class PhysicalPagePlan:
     segment_rows_consulted: int
     planner_mode: str
     certified_watermark: int
+    # First byte consumed by the legacy forward replay parser.  This is an
+    # internal planning boundary and is intentionally absent from
+    # ``legacy_physical_metadata()``, whose public projection must not change.
+    replay_start: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -814,6 +818,7 @@ def _not_reproducible(
         segment_rows_consulted=selected.segment_rows_consulted,
         planner_mode=NOT_REPRODUCIBLE,
         certified_watermark=0,
+        replay_start=0,
     )
 
 
@@ -832,6 +837,7 @@ def _coverage_plan(
     cursor_tainted: bool,
     metrics: _Metrics,
     certified_watermark: int,
+    replay_start: int,
     page_oversized: Optional[bool] = None,
     preserve_oversized_stop: bool = False,
 ) -> PhysicalPagePlan:
@@ -899,6 +905,7 @@ def _coverage_plan(
         segment_rows_consulted=metrics.segment_rows_consulted,
         planner_mode=mode,
         certified_watermark=certified_watermark,
+        replay_start=replay_start,
     )
 
 
@@ -1120,6 +1127,7 @@ def plan_physical_page(
                     cursor_tainted=True,
                     metrics=metrics,
                     certified_watermark=certified,
+                    replay_start=selected_page_end,
                     page_oversized=True,
                     preserve_oversized_stop=True,
                 )
@@ -1144,6 +1152,7 @@ def plan_physical_page(
                             cursor_tainted=cursor_tainted,
                             metrics=metrics,
                             certified_watermark=certified,
+                            replay_start=selected_page_end,
                         )
                         assert_final_source_unchanged()
                         return plan
@@ -1231,6 +1240,7 @@ def plan_physical_page(
                     cursor_tainted=cursor_tainted,
                     metrics=metrics,
                     certified_watermark=certified,
+                    replay_start=replay_start,
                 )
 
             assert_final_source_unchanged()

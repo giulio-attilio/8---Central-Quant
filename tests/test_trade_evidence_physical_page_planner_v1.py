@@ -146,6 +146,7 @@ def test_small_mixed_physical_classification_matches_legacy_exactly(
     assert plan.invalid_json == 1
     assert plan.mapping_records == 2
     assert plan.nonmapping_json == 2
+    assert plan.replay_start == plan.page_start
     assert plan.time_range_scanned == {
         "oldest": "2026-08-15T12:00:00+00:00",
         "newest": "bad",
@@ -461,6 +462,7 @@ def test_exact_budget_line_is_oversized_and_small_boundary_cap_refuses(
     )
     assert refused.status == planner_v1.NOT_REPRODUCIBLE
     assert refused.reason == "BOUNDARY_SCAN_LIMIT"
+    assert refused.replay_start == 0
 
 
 def test_oversized_continuation_preserves_stop_and_page_flag_at_offset_zero(
@@ -728,6 +730,8 @@ def test_default_64_mib_window_preserves_cross_block_replay_quirk(
 
     _assert_exact_physical_parity(legacy, plan)
     assert plan.page_start == len(first_line)
+    assert plan.replay_start == validator.JSONL_BLOCK_BYTES + 1
+    assert plan.replay_start < plan.page_start
     assert plan.invalid_lines == 1
     assert plan.bytes_scanned == validator.JSONL_MAX_BYTES
     assert plan.boundary_scan_bytes < planner_v1.DEFAULT_MAX_BOUNDARY_SCAN_BYTES
