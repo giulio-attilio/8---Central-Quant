@@ -8,6 +8,7 @@ arquivos locais lidos sob demanda e fontes alternativas podem ser injetadas.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ CORRELATION_PRE_OPEN_SECONDS = 15 * 60
 CORRELATION_POST_CLOSE_SECONDS = 24 * 60 * 60
 ENTRY_REFERENCE_TOLERANCE_RATIO = 0.001
 IDENTITY_CANDIDATE_LIMIT = 20
+_INDEX_SHADOW_COMPONENTS = frozenset({"history_manager", "timeline"})
 
 COMPONENTS = (
     "registry",
@@ -1005,6 +1007,7 @@ def _read_path(
     metadata: Optional[Dict[str, Any]] = None,
     *,
     scan_cursor: Optional[str] = None,
+    capture_shadow_window: bool = False,
 ) -> Iterable[Mapping[str, Any]]:
     stats = metadata if metadata is not None else _new_reader_metadata()
     stats["files_considered"] = int(stats.get("files_considered", 0) or 0) + 1
@@ -1055,6 +1058,26 @@ def _read_path(
                 snapshot_eof = source_size
                 page_end = snapshot_eof
             stats["snapshot_eof"] = snapshot_eof
+            shadow_window: Optional[Dict[str, Any]] = None
+            if capture_shadow_window:
+                try:
+                    shadow_window = {
+                        "path_fingerprint": _path_fingerprint(path),
+                        "dev": int(descriptor_stat.st_dev),
+                        "ino": int(descriptor_stat.st_ino),
+                        "descriptor_size_at_open": source_size,
+                        "descriptor_mtime_ns_at_open": int(descriptor_stat.st_mtime_ns),
+                        "descriptor_ctime_ns_at_open": int(descriptor_stat.st_ctime_ns),
+                        "snapshot_eof": int(snapshot_eof),
+                        "page_end": int(page_end),
+                        "page_start": None,
+                        "cursor_tainted": bool(decoded_cursor and decoded_cursor.get("tainted")),
+                        "cursor_oversized": bool(decoded_cursor and decoded_cursor.get("oversized")),
+                        "source_changed": False,
+                    }
+                    stats["_shadow_physical_window"] = shadow_window
+                except Exception:
+                    shadow_window = None
 
             def source_changed_after_read() -> tuple[bool, os.stat_result]:
                 final_descriptor = os.fstat(handle.fileno())
@@ -1124,6 +1147,14 @@ def _read_path(
                         coverage_tainted=True,
                     )
                 changed, final_descriptor = source_changed_after_read()
+                if shadow_window is not None:
+                    shadow_window.update({
+                        "descriptor_size_after_read": int(final_descriptor.st_size),
+                        "descriptor_mtime_ns_after_read": int(final_descriptor.st_mtime_ns),
+                        "descriptor_ctime_ns_after_read": int(final_descriptor.st_ctime_ns),
+                        "source_changed": bool(changed),
+                        "oversized": True,
+                    })
                 if changed:
                     _mark_source_changed(stats, int(final_descriptor.st_size))
                     stats["next_scan_cursor"] = None
@@ -1221,6 +1252,14 @@ def _read_path(
                         ),
                     })
                     changed, final_descriptor = source_changed_after_read()
+                    if shadow_window is not None:
+                        shadow_window.update({
+                            "descriptor_size_after_read": int(final_descriptor.st_size),
+                            "descriptor_mtime_ns_after_read": int(final_descriptor.st_mtime_ns),
+                            "descriptor_ctime_ns_after_read": int(final_descriptor.st_ctime_ns),
+                            "source_changed": bool(changed),
+                            "oversized": True,
+                        })
                     if changed:
                         _mark_source_changed(stats, int(final_descriptor.st_size))
                         stats["next_scan_cursor"] = None
@@ -1263,6 +1302,15 @@ def _read_path(
                     stats["stop_reason"] = "PRIOR_PAGE_COVERAGE_LIMITED"
 
             source_changed, final_descriptor_stat = source_changed_after_read()
+            if shadow_window is not None:
+                shadow_window.update({
+                    "page_start": int(earliest_examined),
+                    "descriptor_size_after_read": int(final_descriptor_stat.st_size),
+                    "descriptor_mtime_ns_after_read": int(final_descriptor_stat.st_mtime_ns),
+                    "descriptor_ctime_ns_after_read": int(final_descriptor_stat.st_ctime_ns),
+                    "source_changed": bool(source_changed),
+                    "oversized": False,
+                })
             if source_changed:
                 _mark_source_changed(stats, int(final_descriptor_stat.st_size))
                 stats["next_scan_cursor"] = None
@@ -1375,14 +1423,36 @@ def _default_reader(
 ) -> Callable[[str], Dict[str, Any]]:
     def read(trade_id: str) -> Dict[str, Any]:
         active_context = context if context is not None else new_correlation_context(trade_id)
+        capture_shadow = bool(
+            component in _INDEX_SHADOW_COMPONENTS
+            and str(os.environ.get("TRADE_EVIDENCE_INDEX_SHADOW_ENABLED", "")).strip().lower()
+            in {"1", "true", "yes", "on"}
+            and str(os.environ.get("TRADE_EVIDENCE_INDEX_SHADOW_COMPARE_ENABLED", "")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        context_before = None
+        if capture_shadow:
+            try:
+                context_before = copy.deepcopy(active_context)
+            except Exception:
+                capture_shadow = False
+        shadow_legacy_started = time.perf_counter() if capture_shadow else None
         matched: list[Mapping[str, Any]] = []
         reader_metadata = _new_reader_metadata()
+        physical_windows: list[Mapping[str, Any]] = []
         decoded_cursor = _decode_scan_cursor(scan_cursor) if scan_cursor else None
         for path in paths:
             path_metadata = _new_reader_metadata()
             path_cursor = scan_cursor if _cursor_targets_path(decoded_cursor, path) else None
-            for row in _read_path(path, path_metadata, scan_cursor=path_cursor):
+            for row in _read_path(
+                path,
+                path_metadata,
+                scan_cursor=path_cursor,
+                capture_shadow_window=capture_shadow,
+            ):
                 matched.extend(correlate_source_records(component, (row,), active_context))
+            if isinstance(path_metadata.get("_shadow_physical_window"), Mapping):
+                physical_windows.append(dict(path_metadata["_shadow_physical_window"]))
             path_metadata["evidence_found"] = bool(matched)
             _merge_reader_metadata(reader_metadata, path_metadata)
         ambiguous = bool(active_context.identity_ambiguous and not active_context.registry_anchored)
@@ -1398,13 +1468,28 @@ def _default_reader(
             reader_metadata["evidence_status"] = "COMPLETE_NO_EVIDENCE"
         else:
             reader_metadata["evidence_status"] = "NOT_FOUND_IN_SCANNED_REGION"
-        return {
+        result = {
             "records": matched,
             "_reader_metadata": reader_metadata,
             "_identity_metadata": identity_resolution_metadata(active_context),
             "_evidence_correlated": True,
             "_correlation_context": active_context,
         }
+        if capture_shadow:
+            try:
+                result["_shadow_index_capture"] = {
+                    "component": component,
+                    "context_before": context_before,
+                    "context_after": copy.deepcopy(active_context),
+                    "physical_windows": tuple(physical_windows),
+                    "legacy_duration_ms": round(
+                        (time.perf_counter() - shadow_legacy_started) * 1000.0, 6
+                    ) if shadow_legacy_started is not None else 0.0,
+                    "legacy_bytes_scanned": int(reader_metadata.get("bytes_scanned", 0) or 0),
+                }
+            except Exception:
+                result.pop("_shadow_index_capture", None)
+        return result
 
     return read
 
@@ -1480,6 +1565,7 @@ def _coerce_records(value: Any) -> list[Mapping[str, Any]]:
                         "_identity_metadata",
                         "_evidence_correlated",
                         "_correlation_context",
+                        "_shadow_index_capture",
                     }
                 }
                 rows = [item for item in value[key] if isinstance(item, Mapping)]
@@ -2274,7 +2360,7 @@ def collect_evidence_bundle(
         }
         for name, detail in source_coverage.items()
     }
-    return EvidenceBundle(
+    legacy_bundle = EvidenceBundle(
         trade_id=identity,
         target_identity=target_identity_from_context(correlation),
         registry_resolution=identity_resolution_metadata(correlation),
@@ -2289,6 +2375,30 @@ def collect_evidence_bundle(
         errors=tuple(errors),
         correlation=correlation,
     )
+    shadow_requested = bool(
+        str(os.environ.get("TRADE_EVIDENCE_INDEX_SHADOW_ENABLED", "")).strip().lower()
+        in {"1", "true", "yes", "on"}
+        and str(os.environ.get("TRADE_EVIDENCE_INDEX_SHADOW_COMPARE_ENABLED", "")).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if shadow_requested:
+        try:
+            from trade_evidence_identity_offset_shadow_compare_v1 import observe_evidence_bundle
+
+            observe_evidence_bundle(legacy_bundle, logger=active_logger)
+        except Exception as exc:
+            # Final isolation barrier: shadow diagnostics never alter, replace,
+            # or invalidate the already-complete authoritative legacy bundle.
+            _structured_log(
+                active_logger,
+                "warning",
+                "TRADE_EVIDENCE_INDEX_SHADOW_EXCEPTION_ISOLATED",
+                trade_id_masked=hashlib.sha256(
+                    identity.encode("utf-8", errors="replace")
+                ).hexdigest()[:12],
+                error_type=type(exc).__name__,
+            )
+    return legacy_bundle
 
 
 class TradeTimelineValidator:
