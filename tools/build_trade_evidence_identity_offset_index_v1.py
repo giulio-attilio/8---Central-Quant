@@ -62,6 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--validate", action="store_true")
     mode.add_argument("--deep-validate", action="store_true")
     mode.add_argument("--verify-shadow", action="store_true")
+    parser.add_argument(
+        "--schema-v2",
+        action="store_true",
+        help=(
+            "explicitly build/resume/catch-up/validate the offline C0 physical-certification "
+            "schema; never migrates an existing V1 database"
+        ),
+    )
     parser.add_argument("--staging", type=Path)
     parser.add_argument("--identity", action="append", type=_identity, default=[])
     parser.add_argument("--sample-limit", type=_positive_int, default=100)
@@ -105,7 +113,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     index_module = _load_index_module()
     try:
         if args.build or args.resume:
-            report = index_module.build_index(
+            build_fn = (
+                index_module.build_index_v2
+                if args.schema_v2
+                else index_module.build_index
+            )
+            report = build_fn(
                 args.source,
                 args.index,
                 args.source_id,
@@ -134,6 +147,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise index_module.IndexBuildError(
                     "--catch-up uses the READY index stored config and does not accept build overrides"
                 )
+            metadata = index_module.read_index_certification(args.index)
+            expected_schema = (
+                index_module.SCHEMA_VERSION_V2
+                if args.schema_v2
+                else index_module.SCHEMA_VERSION_V1
+            )
+            if int(metadata.schema_version) != int(expected_schema):
+                required_flag = "with" if args.schema_v2 else "without"
+                raise index_module.IndexBuildError(
+                    "--catch-up schema mismatch: the selected index must be "
+                    f"schema V{expected_schema} when invoked {required_flag} --schema-v2"
+                )
             report = index_module.catch_up_index(
                 args.source,
                 args.index,
@@ -142,18 +167,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = report.to_dict()
             exit_code = 0
         elif args.validate or args.deep_validate:
-            result = index_module.validate_index(
+            validate_fn = (
+                index_module.validate_index_v2
+                if args.schema_v2
+                else index_module.validate_index
+            )
+            result = validate_fn(
                 args.source,
                 args.index,
                 args.source_id,
                 deep=bool(args.deep_validate),
             )
             payload = {"mode": "deep-validate" if args.deep_validate else "validate", **result.to_dict()}
-            exit_code = 0 if result.status in {
-                index_module.INDEX_COMPLETE_FOR_SNAPSHOT,
-                index_module.INDEX_PARTIAL,
-            } else 1
+            accepted = (
+                {
+                    index_module.INDEX_V2_CERTIFIED,
+                    index_module.INDEX_V2_UNCERTIFIED,
+                }
+                if args.schema_v2
+                else {
+                    index_module.INDEX_COMPLETE_FOR_SNAPSHOT,
+                    index_module.INDEX_PARTIAL,
+                }
+            )
+            exit_code = 0 if result.status in accepted else 1
         else:
+            if args.schema_v2:
+                raise index_module.IndexValidationError(
+                    "--verify-shadow remains a Phase B/V1 operation in C0"
+                )
             validation = index_module.validate_index(
                 args.source,
                 args.index,

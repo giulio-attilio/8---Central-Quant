@@ -7,7 +7,6 @@ arquivos locais lidos sob demanda e fontes alternativas podem ser injetadas.
 
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
@@ -21,13 +20,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
+from trade_evidence_physical_window_contract_v1 import (
+    BLOCK_BYTES as PHYSICAL_BLOCK_BYTES,
+    BYTE_BUDGET as PHYSICAL_BYTE_BUDGET,
+    CURSOR_CONTRACT_VERSION as PHYSICAL_CURSOR_CONTRACT_VERSION,
+    RECORD_BUDGET as PHYSICAL_RECORD_BUDGET,
+    TIMESTAMP_KEYS as PHYSICAL_TIMESTAMP_KEYS,
+    cursor_targets_path as _physical_cursor_targets_path,
+    decode_scan_cursor as _physical_decode_scan_cursor,
+    encode_scan_cursor as _physical_encode_scan_cursor,
+    first_timestamp as _physical_first_timestamp,
+    parse_timestamp as _physical_parse_timestamp,
+    path_fingerprint as _physical_path_fingerprint,
+)
+
 
 VERSION = "2026-08-14-TRADE-TIMELINE-RECENT-IDENTITY-SCAN-V1"
 LOGGER = logging.getLogger(__name__)
-JSONL_MAX_BYTES = 64 * 1024 * 1024
-JSONL_MAX_VALID_LINES = 100_000
-JSONL_BLOCK_BYTES = 64 * 1024
-JSONL_CURSOR_VERSION = 1
+JSONL_MAX_BYTES = PHYSICAL_BYTE_BUDGET
+JSONL_MAX_VALID_LINES = PHYSICAL_RECORD_BUDGET
+JSONL_BLOCK_BYTES = PHYSICAL_BLOCK_BYTES
+JSONL_CURSOR_VERSION = PHYSICAL_CURSOR_CONTRACT_VERSION
 CORRELATION_PRE_OPEN_SECONDS = 15 * 60
 CORRELATION_POST_CLOSE_SECONDS = 24 * 60 * 60
 ENTRY_REFERENCE_TOLERANCE_RATIO = 0.001
@@ -197,20 +210,7 @@ STRONG_IDENTITY_GROUPS = {
 }
 SECONDARY_IDENTITY_GROUPS = {"execution", "decision", "signal", "trade"}
 
-TIMESTAMP_KEYS = (
-    "occurred_at",
-    "event_ts",
-    "timestamp",
-    "ts",
-    "created_at",
-    "generated_at",
-    "received_at",
-    "updated_at",
-    "last_update",
-    "opened_at",
-    "closed_at",
-    "epoch",
-)
+TIMESTAMP_KEYS = PHYSICAL_TIMESTAMP_KEYS
 
 
 def _data_dir(environ: Optional[Mapping[str, str]] = None) -> Path:
@@ -919,8 +919,7 @@ def _merge_reader_metadata(target: Dict[str, Any], source: Mapping[str, Any]) ->
 
 
 def _path_fingerprint(path: Path) -> str:
-    normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
-    return hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return _physical_path_fingerprint(path)
 
 
 def _encode_scan_cursor(
@@ -932,51 +931,26 @@ def _encode_scan_cursor(
     oversized_line: bool = False,
     coverage_tainted: bool = False,
 ) -> str:
-    payload = {
-        "v": JSONL_CURSOR_VERSION,
-        "path": _path_fingerprint(path),
-        "dev": int(file_stat.st_dev),
-        "ino": int(file_stat.st_ino),
-        "snapshot_eof": int(snapshot_eof),
-        "next_end": int(next_end),
-        "oversized": bool(oversized_line),
-        "tainted": bool(coverage_tainted or oversized_line),
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return _physical_encode_scan_cursor(
+        path,
+        file_stat,
+        snapshot_eof,
+        next_end,
+        oversized_line=oversized_line,
+        coverage_tainted=coverage_tainted,
+        cursor_version=JSONL_CURSOR_VERSION,
+    )
 
 
 def _decode_scan_cursor(token: str) -> Dict[str, Any]:
-    if not isinstance(token, str) or not token or len(token) > 4096:
-        raise ValueError("invalid scan cursor")
-    try:
-        padded = token + "=" * (-len(token) % 4)
-        value = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
-    except (ValueError, UnicodeError, json.JSONDecodeError, base64.binascii.Error) as exc:
-        raise ValueError("invalid scan cursor") from exc
-    required = {"v", "path", "dev", "ino", "snapshot_eof", "next_end"}
-    if not isinstance(value, Mapping) or not required.issubset(value) or value.get("v") != JSONL_CURSOR_VERSION:
-        raise ValueError("invalid scan cursor")
-    try:
-        decoded = {
-            "v": int(value["v"]),
-            "path": str(value["path"]),
-            "dev": int(value["dev"]),
-            "ino": int(value["ino"]),
-            "snapshot_eof": int(value["snapshot_eof"]),
-            "next_end": int(value["next_end"]),
-            "oversized": bool(value.get("oversized", False)),
-            "tainted": bool(value.get("tainted", False)),
-        }
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid scan cursor") from exc
-    if decoded["snapshot_eof"] < 0 or not 0 <= decoded["next_end"] <= decoded["snapshot_eof"]:
-        raise ValueError("invalid scan cursor")
-    return decoded
+    return _physical_decode_scan_cursor(
+        token,
+        cursor_version=JSONL_CURSOR_VERSION,
+    )
 
 
 def _cursor_targets_path(decoded: Optional[Mapping[str, Any]], path: Path) -> bool:
-    return bool(decoded and decoded.get("path") == _path_fingerprint(path))
+    return _physical_cursor_targets_path(decoded, path)
 
 
 def _mark_source_changed(stats: Dict[str, Any], source_size: int = 0) -> None:
@@ -1612,43 +1586,15 @@ def _reader_metadata(value: Any) -> Dict[str, Any]:
 
 
 def _parse_timestamp(value: Any) -> tuple[Optional[float], Optional[str]]:
-    if value in (None, ""):
-        return None, None
-    if isinstance(value, (int, float)):
-        epoch = float(value)
-        if epoch > 10_000_000_000:
-            epoch /= 1000.0
-        return epoch, datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
-    text = str(value).strip()
-    try:
-        numeric = float(text)
-        return _parse_timestamp(numeric)
-    except ValueError:
-        pass
-    normalized = text.replace("Z", "+00:00")
-    for parser in (
-        lambda: datetime.fromisoformat(normalized),
-        lambda: datetime.strptime(text, "%d/%m/%Y %H:%M:%S"),
-        lambda: datetime.strptime(text, "%d/%m/%Y %H:%M"),
-        lambda: datetime.strptime(text, "%Y-%m-%d %H:%M:%S"),
-    ):
-        try:
-            dt = parser()
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp(), dt.astimezone(timezone.utc).isoformat()
-        except ValueError:
-            continue
-    return None, text
+    return _physical_parse_timestamp(value)
 
 
 def _first_timestamp(record: Mapping[str, Any], preferred: Optional[str] = None) -> tuple[Optional[float], Optional[str]]:
-    keys = ((preferred,) if preferred else ()) + TIMESTAMP_KEYS
-    for item in _walk_dicts(record):
-        for key in keys:
-            if key and item.get(key) not in (None, ""):
-                return _parse_timestamp(item[key])
-    return None, None
+    return _physical_first_timestamp(
+        record,
+        preferred,
+        timestamp_keys=TIMESTAMP_KEYS,
+    )
 
 
 def _raw_event(record: Mapping[str, Any]) -> str:

@@ -9,6 +9,7 @@ sidecars from explicit paths supplied by a caller.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -31,11 +32,39 @@ from trade_evidence_identity_contract import (
     classify_identity,
     extract_typed_identities,
 )
+from trade_evidence_physical_window_contract_v1 import (
+    CURSOR_CONTRACT_VERSION,
+    PHYSICAL_CONTRACT_HASH,
+    PHYSICAL_CONTRACT_VERSION,
+    SUMMARY_CONTRACT_VERSION,
+    classify_physical_line as _physical_classify_line,
+)
 
 
-SCHEMA_VERSION = 1
-INDEX_VERSION = "2026-08-14-TRADE-EVIDENCE-IDENTITY-OFFSET-INDEX-V1"
-BUILDER_VERSION = INDEX_VERSION + "-PHASE-A-SHADOW-BUILD"
+SCHEMA_VERSION_V1 = 1
+SCHEMA_VERSION_V2 = 2
+SCHEMA_VERSION = SCHEMA_VERSION_V1
+
+INDEX_VERSION_V1 = "2026-08-14-TRADE-EVIDENCE-IDENTITY-OFFSET-INDEX-V1"
+INDEX_VERSION_V2 = INDEX_VERSION_V1 + "-PHASE-C0-SCHEMA-V2"
+INDEX_VERSION = INDEX_VERSION_V1
+
+BUILDER_VERSION_V1 = INDEX_VERSION_V1 + "-PHASE-A-SHADOW-BUILD"
+BUILDER_VERSION_V2 = INDEX_VERSION_V2 + "-PHYSICAL-CERTIFICATION-BUILD"
+BUILDER_VERSION = BUILDER_VERSION_V1
+
+CERTIFICATION_UNCERTIFIED = "UNCERTIFIED"
+CERTIFICATION_DEEP_BASELINE = "DEEP_BASELINE"
+CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND = (
+    "DEEP_BASELINE_PLUS_PROVEN_APPEND"
+)
+CERTIFICATION_KINDS = frozenset(
+    {
+        CERTIFICATION_UNCERTIFIED,
+        CERTIFICATION_DEEP_BASELINE,
+        CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+    }
+)
 
 SOURCE_IDS = frozenset({"history_manager", "timeline"})
 SOURCE_STATES = frozenset({"BUILDING", "READY", "REVALIDATING", "STALE", "CORRUPT"})
@@ -46,6 +75,12 @@ INDEX_STALE = "INDEX_STALE"
 INDEX_MISSING = "INDEX_MISSING"
 INDEX_SOURCE_CHANGED = "INDEX_SOURCE_CHANGED"
 INDEX_CORRUPT = "INDEX_CORRUPT"
+
+INDEX_V2_CERTIFIED = "INDEX_V2_CERTIFIED"
+INDEX_V2_UNCERTIFIED = "INDEX_V2_UNCERTIFIED"
+INDEX_V2_CONTRACT_MISMATCH = "INDEX_V2_CONTRACT_MISMATCH"
+INDEX_V2_SOURCE_CHANGED = "INDEX_V2_SOURCE_CHANGED"
+INDEX_V2_CORRUPT = "INDEX_V2_CORRUPT"
 
 DEFAULT_BLOCK_BYTES = 1024 * 1024
 DEFAULT_SEGMENT_TARGET_BYTES = 512 * 1024
@@ -72,6 +107,35 @@ EVENT_TIMESTAMP_KEYS = (
 SQLITE_APPLICATION_ID = 0x43514931  # ASCII "CQI1"
 
 FaultInjector = Optional[Callable[[str, Mapping[str, Any]], None]]
+
+
+@dataclass(frozen=True)
+class _IndexFormat:
+    schema_version: int
+    index_version: str
+    builder_version: str
+    schema_sql: str
+    certified: bool
+
+
+def _index_format(schema_version: int) -> _IndexFormat:
+    if int(schema_version) == SCHEMA_VERSION_V1:
+        return _IndexFormat(
+            schema_version=SCHEMA_VERSION_V1,
+            index_version=INDEX_VERSION_V1,
+            builder_version=BUILDER_VERSION_V1,
+            schema_sql=SCHEMA_SQL_V1,
+            certified=False,
+        )
+    if int(schema_version) == SCHEMA_VERSION_V2:
+        return _IndexFormat(
+            schema_version=SCHEMA_VERSION_V2,
+            index_version=INDEX_VERSION_V2,
+            builder_version=BUILDER_VERSION_V2,
+            schema_sql=SCHEMA_SQL_V2,
+            certified=True,
+        )
+    raise ValueError("unsupported identity offset index schema version")
 
 
 class IndexBuildError(RuntimeError):
@@ -122,7 +186,52 @@ class ValidationResult:
 
     @property
     def complete(self) -> bool:
-        return self.status == INDEX_COMPLETE_FOR_SNAPSHOT
+        return self.status in {
+            INDEX_COMPLETE_FOR_SNAPSHOT,
+            INDEX_V2_CERTIFIED,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CertificationMetadata:
+    schema_version: int
+    index_version: str
+    physical_contract_hash: Optional[str]
+    physical_contract_version: Optional[str]
+    cursor_contract_version: Optional[str]
+    summary_contract_version: Optional[str]
+    safe_watermark: int
+    certified_watermark: int
+    certified_summary_hash: Optional[str]
+    certified_summary_verified: bool
+    certification_kind: str
+    certified_at: Optional[str]
+    certified_source_size: Optional[int]
+    certified_source_mtime_ns: Optional[int]
+    certified_source_ctime_ns: Optional[int]
+
+    @property
+    def certified(self) -> bool:
+        return bool(
+            self.schema_version == SCHEMA_VERSION_V2
+            and self.index_version == INDEX_VERSION_V2
+            and self.physical_contract_hash == PHYSICAL_CONTRACT_HASH
+            and self.physical_contract_version == PHYSICAL_CONTRACT_VERSION
+            and self.cursor_contract_version == str(CURSOR_CONTRACT_VERSION)
+            and self.summary_contract_version == str(SUMMARY_CONTRACT_VERSION)
+            and self.certified_summary_hash is not None
+            and len(self.certified_summary_hash) == HASH_BYTES * 2
+            and self.certified_summary_verified
+            and self.certification_kind
+            in {
+                CERTIFICATION_DEEP_BASELINE,
+                CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+            }
+            and self.certified_watermark <= self.safe_watermark
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -297,6 +406,7 @@ class _PendingSegment:
     last_line_number: int = 0
     last_line_start_offset: int = -1
     physical_lines: int = 0
+    records_examined_lines: int = 0
     blank_lines: int = 0
     valid_json_lines: int = 0
     invalid_json_lines: int = 0
@@ -318,6 +428,7 @@ class _PendingSegment:
         self.last_line_number = line.line_number
         self.last_line_start_offset = line.start_offset
         self.physical_lines += 1
+        self.records_examined_lines += int(line.nonblank)
         self.max_line_bytes = max(self.max_line_bytes, line.byte_length)
         self.has_long_line = bool(self.has_long_line or line.long_line)
         self.has_oversized_barrier = bool(self.has_oversized_barrier or line.oversized)
@@ -354,7 +465,7 @@ class _PendingSegment:
     def byte_length(self) -> int:
         return self.end_offset - self.start_offset
 
-SCHEMA_SQL = """
+SCHEMA_SQL_V1 = """
 CREATE TABLE source_state (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
     schema_version INTEGER NOT NULL,
@@ -494,6 +605,95 @@ CREATE INDEX records_segment_offset_idx ON records(segment_id, start_offset);
 CREATE INDEX postings_record_idx ON postings(record_id, start_offset, identity_id);
 """
 
+SCHEMA_SQL_V2 = SCHEMA_SQL_V1.replace(
+    "    identity_contract_hash TEXT NOT NULL,\n",
+    """    identity_contract_hash TEXT NOT NULL,
+    physical_contract_hash TEXT NOT NULL,
+    physical_contract_version TEXT NOT NULL,
+    cursor_contract_version TEXT NOT NULL,
+    summary_contract_version TEXT NOT NULL,
+""",
+    1,
+).replace(
+    "    safe_watermark INTEGER NOT NULL CHECK (safe_watermark >= 0),\n",
+    """    safe_watermark INTEGER NOT NULL CHECK (safe_watermark >= 0),
+    certified_watermark INTEGER NOT NULL DEFAULT 0
+        CHECK (certified_watermark >= 0 AND certified_watermark <= safe_watermark),
+    certified_anchor BLOB NOT NULL CHECK (length(certified_anchor) = 16),
+    certified_anchor_offset INTEGER NOT NULL CHECK (certified_anchor_offset >= 0),
+    certified_anchor_length INTEGER NOT NULL CHECK (certified_anchor_length >= 0),
+    certified_summary_hash BLOB NOT NULL
+        CHECK (length(certified_summary_hash) = 16),
+    certification_kind TEXT NOT NULL DEFAULT 'UNCERTIFIED'
+        CHECK (certification_kind IN (
+            'UNCERTIFIED', 'DEEP_BASELINE', 'DEEP_BASELINE_PLUS_PROVEN_APPEND'
+        )),
+    certified_at TEXT,
+    certified_source_size INTEGER CHECK (certified_source_size >= 0),
+    certified_source_mtime_ns INTEGER,
+    certified_source_ctime_ns INTEGER,
+""",
+    1,
+).replace(
+    "    physical_lines INTEGER NOT NULL CHECK (physical_lines > 0),\n",
+    """    physical_lines INTEGER NOT NULL CHECK (physical_lines > 0),
+    records_examined_lines INTEGER NOT NULL
+        CHECK (records_examined_lines >= 0 AND records_examined_lines <= physical_lines),
+""",
+    1,
+).replace(
+    "    CHECK (safe_watermark <= observed_eof),\n",
+    """    CHECK (safe_watermark <= observed_eof),
+    CHECK (
+        (certification_kind = 'UNCERTIFIED'
+         AND certified_watermark = 0
+         AND certified_anchor_offset = 0
+         AND certified_anchor_length = 0
+         AND certified_at IS NULL
+         AND certified_source_size IS NULL
+         AND certified_source_mtime_ns IS NULL
+         AND certified_source_ctime_ns IS NULL)
+        OR
+        (certification_kind != 'UNCERTIFIED'
+         AND certified_at IS NOT NULL
+         AND certified_source_size IS NOT NULL
+         AND certified_source_mtime_ns IS NOT NULL
+         AND certified_source_ctime_ns IS NOT NULL
+         AND certified_watermark <= certified_source_size)
+    ),
+""",
+    1,
+)
+
+# Backwards-compatible aliases used by the Phase A/V1 tools and tests.
+SCHEMA_SQL = SCHEMA_SQL_V1
+
+CERTIFIED_SEGMENT_SUMMARY_FIELDS = (
+    "start_offset",
+    "end_offset",
+    "first_line_number",
+    "last_line_number",
+    "last_line_start_offset",
+    "physical_lines",
+    "records_examined_lines",
+    "blank_lines",
+    "valid_json_lines",
+    "invalid_json_lines",
+    "invalid_utf8_lines",
+    "mapping_records",
+    "nonmapping_json_lines",
+    "strong_postings",
+    "secondary_postings",
+    "max_line_bytes",
+    "has_long_line",
+    "has_oversized_barrier",
+    "oversized_barrier_lines",
+    "oldest_timestamp",
+    "newest_timestamp",
+    "segment_hash",
+)
+CERTIFIED_SUMMARY_HASH_DOMAIN = "CENTRAL_QUANT_CERTIFIED_SEGMENT_SUMMARIES_V1"
+
 REQUIRED_TABLES = frozenset({"source_state", "segments", "records", "identities", "postings"})
 
 
@@ -526,6 +726,32 @@ def _source_stat(path: Path) -> os.stat_result:
 
 def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     return int(left.st_dev) == int(right.st_dev) and int(left.st_ino) == int(right.st_ino)
+
+
+def _same_size_timestamp_changed(
+    before: os.stat_result,
+    after: os.stat_result,
+) -> bool:
+    return bool(
+        int(before.st_size) == int(after.st_size)
+        and (
+            int(before.st_mtime_ns) != int(after.st_mtime_ns)
+            or int(before.st_ctime_ns) != int(after.st_ctime_ns)
+        )
+    )
+
+
+def _source_snapshot_metadata_changed(
+    before: os.stat_result,
+    after: os.stat_result,
+) -> bool:
+    """Return whether a source snapshot changed in size or write metadata."""
+
+    return bool(
+        int(before.st_size) != int(after.st_size)
+        or int(before.st_mtime_ns) != int(after.st_mtime_ns)
+        or int(before.st_ctime_ns) != int(after.st_ctime_ns)
+    )
 
 
 def _blake128(value: bytes) -> bytes:
@@ -636,15 +862,18 @@ def _initialize_database(
     source_stat: os.stat_result,
     snapshot_eof: int,
     config: BuildConfig,
+    *,
+    schema_version: int = SCHEMA_VERSION_V1,
 ) -> sqlite3.Connection:
+    index_format = _index_format(schema_version)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = _sqlite_connect(path, readonly=False, busy_timeout_ms=config.busy_timeout_ms)
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute(f"PRAGMA application_id={SQLITE_APPLICATION_ID}")
-        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        connection.executescript(SCHEMA_SQL)
+        connection.execute(f"PRAGMA user_version={index_format.schema_version}")
+        connection.executescript(index_format.schema_sql)
         now = _utc_now()
         empty_anchor = _blake128(b"")
         with source.open("rb") as source_handle:
@@ -657,10 +886,26 @@ def _initialize_database(
             prefix_anchor = _blake128(prefix_value)
             snapshot_tail = _snapshot_tail_anchor(source_handle, snapshot_eof, config.anchor_bytes)
         connection.execute("BEGIN IMMEDIATE")
+        certification_columns = (
+            "physical_contract_hash, physical_contract_version, "
+            "cursor_contract_version, summary_contract_version, "
+            "certified_watermark, certified_anchor, certified_anchor_offset, "
+            "certified_anchor_length, certified_summary_hash, certification_kind, "
+            if index_format.certified
+            else ""
+        )
+        certification_values = (
+            ":physical_contract_hash, :physical_contract_version, "
+            ":cursor_contract_version, :summary_contract_version, "
+            "0, :empty_anchor, 0, 0, :empty_anchor, :uncertified_kind, "
+            if index_format.certified
+            else ""
+        )
         connection.execute(
-            """
+            f"""
             INSERT INTO source_state (
                 singleton_id, schema_version, index_version, identity_contract_hash,
+                {certification_columns}
                 source_id, source_path, normalized_path_hash, dev, inode,
                 generation_uuid, state, safe_watermark, observed_eof,
                 last_complete_line_offset, last_complete_line_number,
@@ -672,6 +917,7 @@ def _initialize_database(
                 batch_lines, max_line_bytes, anchor_bytes, created_at
             ) VALUES (
                 1, :schema_version, :index_version, :contract_hash,
+                {certification_values}
                 :source_id, :source_path, :path_hash, :dev, :inode,
                 :generation_uuid, 'BUILDING', 0, :observed_eof, -1, 0,
                 :initial_snapshot_eof, :build_snapshot_eof,
@@ -684,9 +930,14 @@ def _initialize_database(
             )
             """,
             {
-                "schema_version": SCHEMA_VERSION,
-                "index_version": INDEX_VERSION,
+                "schema_version": index_format.schema_version,
+                "index_version": index_format.index_version,
                 "contract_hash": IDENTITY_CONTRACT_HASH,
+                "physical_contract_hash": PHYSICAL_CONTRACT_HASH,
+                "physical_contract_version": PHYSICAL_CONTRACT_VERSION,
+                "cursor_contract_version": str(CURSOR_CONTRACT_VERSION),
+                "summary_contract_version": str(SUMMARY_CONTRACT_VERSION),
+                "uncertified_kind": CERTIFICATION_UNCERTIFIED,
                 "source_id": source_id,
                 "source_path": _normalized_path(source),
                 "path_hash": normalized_path_hash(source),
@@ -702,7 +953,7 @@ def _initialize_database(
                 "snapshot_tail_anchor": snapshot_tail["snapshot_tail_anchor"],
                 "snapshot_tail_offset": snapshot_tail["snapshot_tail_anchor_offset"],
                 "snapshot_tail_length": snapshot_tail["snapshot_tail_anchor_length"],
-                "builder_version": BUILDER_VERSION,
+                "builder_version": index_format.builder_version,
                 "block_bytes": config.block_bytes,
                 "segment_target_bytes": config.segment_target_bytes,
                 "batch_bytes": config.batch_bytes,
@@ -724,6 +975,160 @@ def _load_source_state(connection: sqlite3.Connection) -> sqlite3.Row:
     if row is None:
         raise IndexValidationError("source_state singleton is missing")
     return row
+
+
+def read_index_certification(index_path: Path | str) -> CertificationMetadata:
+    """Read V1/V2 format metadata without modifying or migrating the index."""
+
+    connection = _sqlite_connect(Path(index_path), readonly=True, must_exist=True)
+    try:
+        state = _load_source_state(connection)
+        schema_version = int(state["schema_version"])
+        if schema_version == SCHEMA_VERSION_V1:
+            return CertificationMetadata(
+                schema_version=schema_version,
+                index_version=str(state["index_version"]),
+                physical_contract_hash=None,
+                physical_contract_version=None,
+                cursor_contract_version=None,
+                summary_contract_version=None,
+                safe_watermark=int(state["safe_watermark"]),
+                certified_watermark=0,
+                certified_summary_hash=None,
+                certified_summary_verified=False,
+                certification_kind=CERTIFICATION_UNCERTIFIED,
+                certified_at=None,
+                certified_source_size=None,
+                certified_source_mtime_ns=None,
+                certified_source_ctime_ns=None,
+            )
+        if schema_version != SCHEMA_VERSION_V2:
+            raise IndexValidationError("unsupported index schema version")
+        return CertificationMetadata(
+            schema_version=schema_version,
+            index_version=str(state["index_version"]),
+            physical_contract_hash=str(state["physical_contract_hash"]),
+            physical_contract_version=str(state["physical_contract_version"]),
+            cursor_contract_version=str(state["cursor_contract_version"]),
+            summary_contract_version=str(state["summary_contract_version"]),
+            safe_watermark=int(state["safe_watermark"]),
+            certified_watermark=int(state["certified_watermark"]),
+            certified_summary_hash=bytes(state["certified_summary_hash"]).hex(),
+            certified_summary_verified=verify_certified_summary_hash(connection),
+            certification_kind=str(state["certification_kind"]),
+            certified_at=(
+                str(state["certified_at"])
+                if state["certified_at"] is not None
+                else None
+            ),
+            certified_source_size=(
+                int(state["certified_source_size"])
+                if state["certified_source_size"] is not None
+                else None
+            ),
+            certified_source_mtime_ns=(
+                int(state["certified_source_mtime_ns"])
+                if state["certified_source_mtime_ns"] is not None
+                else None
+            ),
+            certified_source_ctime_ns=(
+                int(state["certified_source_ctime_ns"])
+                if state["certified_source_ctime_ns"] is not None
+                else None
+            ),
+        )
+    finally:
+        connection.close()
+
+
+def calculate_certified_summary_hash(
+    connection: sqlite3.Connection,
+    certified_watermark: int,
+) -> bytes:
+    """Hash certified V2 segment summaries using bounded streaming SELECTs.
+
+    The helper performs no source read and no SQLite write.  A future planner
+    can call it inside the same pinned read transaction used to load segments.
+    """
+
+    watermark = int(certified_watermark)
+    if watermark < 0:
+        raise IndexValidationError("certified watermark must be non-negative")
+    digest = hashlib.blake2b(digest_size=HASH_BYTES)
+
+    def add_frame(value: Any) -> None:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8", errors="surrogatepass")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    add_frame(
+        {
+            "domain": CERTIFIED_SUMMARY_HASH_DOMAIN,
+            "physical_contract_hash": PHYSICAL_CONTRACT_HASH,
+            "summary_contract_version": str(SUMMARY_CONTRACT_VERSION),
+            "watermark": watermark,
+        }
+    )
+    columns = ", ".join(CERTIFIED_SEGMENT_SUMMARY_FIELDS)
+    expected_start = 0
+    for row in connection.execute(
+        f"SELECT {columns} FROM segments "
+        "WHERE start_offset < ? ORDER BY start_offset",
+        (watermark,),
+    ):
+        values = [row[index] for index in range(len(CERTIFIED_SEGMENT_SUMMARY_FIELDS))]
+        start = int(values[0])
+        end = int(values[1])
+        if start != expected_start or end <= start or end > watermark:
+            raise IndexValidationError(
+                "certified segment summaries are not contiguous through watermark"
+            )
+        values[-1] = bytes(values[-1]).hex()
+        add_frame(values)
+        expected_start = end
+    if expected_start != watermark:
+        raise IndexValidationError(
+            "certified segment summaries do not cover certified watermark"
+        )
+    return digest.digest()
+
+
+def verify_certified_summary_hash(connection: sqlite3.Connection) -> bool:
+    """Verify the stored V2 summary witness without reading the journal."""
+
+    try:
+        state = connection.execute(
+            """
+            SELECT schema_version, certified_summary_hash,
+                   certification_kind, certified_watermark
+            FROM source_state WHERE singleton_id=1
+            """
+        ).fetchone()
+        if state is None or int(state[0]) != SCHEMA_VERSION_V2:
+            return False
+        stored = bytes(state[1])
+        if len(stored) != HASH_BYTES:
+            return False
+        certification_kind = str(state[2])
+        if certification_kind == CERTIFICATION_UNCERTIFIED:
+            return False
+        if certification_kind not in {
+            CERTIFICATION_DEEP_BASELINE,
+            CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+        }:
+            return False
+        calculated = calculate_certified_summary_hash(
+            connection,
+            int(state[3]),
+        )
+        return hmac.compare_digest(stored, calculated)
+    except (IndexValidationError, sqlite3.DatabaseError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _direct_value(record: Mapping[str, Any], *keys: str) -> Any:
@@ -897,39 +1302,66 @@ def _iter_physical_lines(
         )
 
 
-def _classify_line(line: _PhysicalLine) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "barrier": bool(line.oversized),
-        "blank": bool(not line.nonblank and not line.oversized),
-        "valid_json": False,
-        "invalid_json": False,
-        "invalid_utf8": False,
-        "mapping": False,
-        "record": None,
-    }
-    if line.oversized:
-        return result
-    if not line.nonblank:
-        return result
-    if line.raw is None:
-        return result
-    raw_document = line.raw[:-1] if line.terminated else line.raw
-    try:
-        decoded = raw_document.decode("utf-8")
-    except UnicodeDecodeError:
-        result["invalid_utf8"] = True
-        return result
-    try:
-        value = json.loads(decoded)
-    except json.JSONDecodeError:
-        result["invalid_json"] = True
-        return result
-    result["valid_json"] = True
-    if not isinstance(value, Mapping):
-        return result
-    result["mapping"] = True
+def _classify_line(
+    line: _PhysicalLine,
+    *,
+    physical_contract: bool = False,
+) -> dict[str, Any]:
+    if physical_contract:
+        physical = _physical_classify_line(
+            line.raw,
+            newline_terminated=line.terminated,
+            oversized=line.oversized,
+        )
+        result: dict[str, Any] = {
+            "barrier": physical.oversized_barrier,
+            "blank": physical.blank,
+            "valid_json": physical.valid_json,
+            "invalid_json": physical.invalid_json,
+            "invalid_utf8": physical.invalid_utf8,
+            "mapping": physical.mapping,
+            "record": None,
+        }
+        if not physical.mapping:
+            return result
+        value = physical.value
+        if not isinstance(value, Mapping):
+            raise IndexBuildError("physical contract returned a non-Mapping record")
+        event_epoch = physical.event_epoch
+        event_timestamp = physical.event_timestamp
+    else:
+        result = {
+            "barrier": bool(line.oversized),
+            "blank": bool(not line.nonblank and not line.oversized),
+            "valid_json": False,
+            "invalid_json": False,
+            "invalid_utf8": False,
+            "mapping": False,
+            "record": None,
+        }
+        if line.oversized:
+            return result
+        if not line.nonblank:
+            return result
+        if line.raw is None:
+            return result
+        raw_document = line.raw[:-1] if line.terminated else line.raw
+        try:
+            decoded = raw_document.decode("utf-8")
+        except UnicodeDecodeError:
+            result["invalid_utf8"] = True
+            return result
+        try:
+            value = json.loads(decoded)
+        except json.JSONDecodeError:
+            result["invalid_json"] = True
+            return result
+        result["valid_json"] = True
+        if not isinstance(value, Mapping):
+            return result
+        result["mapping"] = True
+        event_epoch, event_timestamp = _first_event_timestamp(value)
     identities = extract_typed_identities(value)
-    event_epoch, event_timestamp = _first_event_timestamp(value)
     result["record"] = _PendingRecord(
         line_number=line.line_number,
         start_offset=line.start_offset,
@@ -992,19 +1424,29 @@ def _commit_segments(
             and str(state["generation_uuid"]) != expected_generation_uuid
         ):
             raise IndexBuildError("index generation changed during batch preparation")
+        records_examined_column = (
+            "records_examined_lines, "
+            if int(state["schema_version"]) == SCHEMA_VERSION_V2
+            else ""
+        )
+        records_examined_placeholder = (
+            "?, " if int(state["schema_version"]) == SCHEMA_VERSION_V2 else ""
+        )
         for segment, segment_hash in zip(segments, segment_hashes):
             cursor = connection.execute(
-                """
+                f"""
                 INSERT INTO segments (
                     start_offset, end_offset, first_line_number, last_line_number,
                     last_line_start_offset,
-                    physical_lines, blank_lines, valid_json_lines, invalid_json_lines,
+                    physical_lines, {records_examined_column}
+                    blank_lines, valid_json_lines, invalid_json_lines,
                     invalid_utf8_lines,
                     mapping_records, nonmapping_json_lines, strong_postings,
                     secondary_postings, max_line_bytes, has_long_line,
                     has_oversized_barrier, oversized_barrier_lines,
                     oldest_timestamp, newest_timestamp, segment_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, {records_examined_placeholder}
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     segment.start_offset,
@@ -1013,6 +1455,7 @@ def _commit_segments(
                     segment.last_line_number,
                     segment.last_line_start_offset,
                     segment.physical_lines,
+                    *((segment.records_examined_lines,) if records_examined_column else ()),
                     segment.blank_lines,
                     segment.valid_json_lines,
                     segment.invalid_json_lines,
@@ -1232,22 +1675,250 @@ def _publish_staging(
     source_id: str,
     *,
     fault_injector: FaultInjector,
+    schema_version: int = SCHEMA_VERSION_V1,
 ) -> None:
     for sidecar in (*_database_sidecars(staging_path), *_database_sidecars(index_path)):
         if sidecar.exists():
             raise IndexBuildError(f"refusing atomic publication while SQLite sidecar exists: {sidecar}")
+    if int(schema_version) == SCHEMA_VERSION_V2 and index_path.exists():
+        raise IndexBuildError("V2 publication refuses to replace an existing index")
     _fsync_file(staging_path)
     _invoke_fault(fault_injector, "before_atomic_replace", staging_path=str(staging_path))
     os.replace(staging_path, index_path)
     _fsync_parent(index_path)
     _invoke_fault(fault_injector, "after_atomic_replace", index_path=str(index_path))
-    _finish_revalidating_final(source, index_path, source_id)
+    _finish_revalidating_final(
+        source,
+        index_path,
+        source_id,
+        schema_version=schema_version,
+    )
+
+
+def _certify_v2_deep_baseline(
+    source: Path,
+    index_path: Path,
+    source_id: str,
+) -> int:
+    """Atomically certify a pinned, deeply revalidated V2 baseline."""
+
+    path_stat = _source_stat(source)
+    with source.open("rb") as handle:
+        descriptor_stat = os.fstat(handle.fileno())
+        if not _same_file(path_stat, descriptor_stat):
+            raise IndexBuildError("V2 certification source changed between lstat and open")
+        connection = _sqlite_connect(index_path, readonly=False, must_exist=True)
+        try:
+            state = _load_source_state(connection)
+            if (
+                int(state["schema_version"]) != SCHEMA_VERSION_V2
+                or str(state["index_version"]) != INDEX_VERSION_V2
+                or str(state["builder_version"]) != BUILDER_VERSION_V2
+                or str(state["identity_contract_hash"]) != IDENTITY_CONTRACT_HASH
+            ):
+                raise IndexBuildError("V2 certification format mismatch")
+            if (
+                str(state["physical_contract_hash"]) != PHYSICAL_CONTRACT_HASH
+                or str(state["physical_contract_version"])
+                != PHYSICAL_CONTRACT_VERSION
+                or str(state["cursor_contract_version"])
+                != str(CURSOR_CONTRACT_VERSION)
+                or str(state["summary_contract_version"])
+                != str(SUMMARY_CONTRACT_VERSION)
+            ):
+                raise IndexBuildError("V2 certification physical contract mismatch")
+            if str(state["source_id"]) != source_id:
+                raise IndexBuildError("V2 certification source id mismatch")
+            if (
+                str(state["source_path"]) != _normalized_path(source)
+                or str(state["normalized_path_hash"])
+                != normalized_path_hash(source)
+            ):
+                raise IndexBuildError("V2 certification source path mismatch")
+            if str(state["state"]) != "REVALIDATING":
+                raise IndexBuildError("only REVALIDATING V2 indexes can be certified")
+            watermark = int(state["safe_watermark"])
+            if watermark != int(state["build_snapshot_eof"]):
+                raise IndexBuildError("partial V2 staging cannot be certified")
+            if (
+                str(int(descriptor_stat.st_dev)) != str(state["dev"])
+                or str(int(descriptor_stat.st_ino)) != str(state["inode"])
+                or int(descriptor_stat.st_size) < watermark
+            ):
+                raise IndexBuildError("V2 certification source identity changed")
+            anchor_bytes = int(state["anchor_bytes"])
+            prefix_length = int(state["prefix_anchor_length"])
+            prefix_anchor = _blake128(
+                _read_exact_range(handle, 0, prefix_length)
+                if prefix_length
+                else b""
+            )
+            watermark_anchor = _watermark_anchor_values(
+                handle,
+                watermark,
+                anchor_bytes,
+            )
+            snapshot_tail = _snapshot_tail_anchor(
+                handle,
+                int(state["build_snapshot_eof"]),
+                anchor_bytes,
+            )
+            if prefix_anchor != bytes(state["prefix_anchor"]):
+                raise IndexBuildError("V2 certification prefix anchor mismatch")
+            if watermark_anchor["watermark_anchor"] != bytes(
+                state["watermark_anchor"]
+            ):
+                raise IndexBuildError("V2 certification watermark anchor mismatch")
+            if snapshot_tail["snapshot_tail_anchor"] != bytes(
+                state["snapshot_tail_anchor"]
+            ):
+                raise IndexBuildError("V2 certification snapshot anchor mismatch")
+            invariant_errors = _basic_invariant_errors(connection)
+            deep_errors = _deep_invariant_errors(connection, handle, state)
+            if invariant_errors or deep_errors:
+                raise IndexBuildError(
+                    "V2 deep baseline certification failed: "
+                    + ",".join((*invariant_errors, *deep_errors))
+                )
+            certified_anchor = _watermark_anchor_values(
+                handle,
+                watermark,
+                anchor_bytes,
+            )
+            final_descriptor = os.fstat(handle.fileno())
+            final_path_stat = _source_stat(source)
+            if not _same_file(descriptor_stat, final_descriptor) or not _same_file(
+                descriptor_stat,
+                final_path_stat,
+            ):
+                raise IndexBuildError("source replaced during V2 certification")
+            if _source_snapshot_metadata_changed(
+                descriptor_stat,
+                final_descriptor,
+            ) or _source_snapshot_metadata_changed(
+                path_stat,
+                final_path_stat,
+            ):
+                raise IndexBuildError("source changed during V2 certification")
+            now = _utc_now()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = _load_source_state(connection)
+                if (
+                    str(current["state"]) != "REVALIDATING"
+                    or str(current["generation_uuid"])
+                    != str(state["generation_uuid"])
+                    or int(current["safe_watermark"]) != watermark
+                    or str(current["certification_kind"])
+                    != CERTIFICATION_UNCERTIFIED
+                ):
+                    raise IndexBuildError(
+                        "V2 source_state changed before baseline certification"
+                    )
+                certified_summary_hash = calculate_certified_summary_hash(
+                    connection,
+                    watermark,
+                )
+                proof_descriptor = os.fstat(handle.fileno())
+                proof_path_stat = _source_stat(source)
+                if (
+                    not _same_file(descriptor_stat, proof_descriptor)
+                    or not _same_file(descriptor_stat, proof_path_stat)
+                    or _source_snapshot_metadata_changed(
+                        descriptor_stat,
+                        proof_descriptor,
+                    )
+                    or _source_snapshot_metadata_changed(
+                        path_stat,
+                        proof_path_stat,
+                    )
+                ):
+                    raise IndexBuildError(
+                        "source changed before V2 baseline certification commit"
+                    )
+                connection.execute(
+                    """
+                    UPDATE source_state SET
+                        certified_watermark=?, certified_anchor=?,
+                        certified_anchor_offset=?, certified_anchor_length=?,
+                        certified_summary_hash=?, certification_kind=?, certified_at=?,
+                        certified_source_size=?, certified_source_mtime_ns=?,
+                        certified_source_ctime_ns=?, state='READY',
+                        published_at=COALESCE(published_at, ?), validated_at=?
+                    WHERE singleton_id=1
+                    """,
+                    (
+                        watermark,
+                        certified_anchor["watermark_anchor"],
+                        certified_anchor["watermark_anchor_offset"],
+                        certified_anchor["watermark_anchor_length"],
+                        certified_summary_hash,
+                        CERTIFICATION_DEEP_BASELINE,
+                        now,
+                        int(proof_descriptor.st_size),
+                        int(proof_descriptor.st_mtime_ns),
+                        int(proof_descriptor.st_ctime_ns),
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            return watermark
+        finally:
+            connection.close()
+
+
+def _revoke_v2_certification(index_path: Path) -> None:
+    """Fail closed when a post-certification validation no longer proves safety."""
+
+    connection = _sqlite_connect(index_path, readonly=False, must_exist=True)
+    try:
+        state = _load_source_state(connection)
+        if int(state["schema_version"]) != SCHEMA_VERSION_V2:
+            return
+        empty_anchor = _blake128(b"")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            current = _load_source_state(connection)
+            if int(current["schema_version"]) != SCHEMA_VERSION_V2:
+                raise IndexBuildError(
+                    "V2 format changed before certification revocation"
+                )
+            connection.execute(
+                """
+                UPDATE source_state SET state='STALE', certified_watermark=0,
+                    certified_anchor=?, certified_anchor_offset=0,
+                    certified_anchor_length=0, certified_summary_hash=?,
+                    certification_kind=?, certified_at=NULL,
+                    certified_source_size=NULL, certified_source_mtime_ns=NULL,
+                    certified_source_ctime_ns=NULL, validated_at=?
+                WHERE singleton_id=1
+                """,
+                (
+                    empty_anchor,
+                    empty_anchor,
+                    CERTIFICATION_UNCERTIFIED,
+                    _utc_now(),
+                ),
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
+    _fsync_file(index_path)
 
 
 def _finish_revalidating_final(
     source: Path,
     index_path: Path,
     source_id: str,
+    *,
+    schema_version: int = SCHEMA_VERSION_V1,
 ) -> None:
     """Finish a DB already present at its final name after a safe crash.
 
@@ -1257,30 +1928,44 @@ def _finish_revalidating_final(
     and ``--resume`` can call this function again.
     """
 
-    result = validate_index(source, index_path, source_id, deep=True)
-    if result.status != INDEX_PARTIAL or result.state != "REVALIDATING":
-        raise IndexBuildError(f"post-publication validation failed: {result.status}: {result.reasons}")
-    connection = _sqlite_connect(index_path, readonly=False)
-    try:
-        state = _load_source_state(connection)
-        if str(state["state"]) != "REVALIDATING":
-            raise IndexBuildError("only a REVALIDATING final index can be finalized")
-        if int(state["safe_watermark"]) != int(state["build_snapshot_eof"]):
-            raise IndexBuildError("partial staging cannot be marked READY")
-        build_snapshot_eof = int(state["build_snapshot_eof"])
-        _mark_state(connection, "READY", published=True)
-    finally:
-        connection.close()
+    v2 = int(schema_version) == SCHEMA_VERSION_V2
+    validate = validate_index_v2 if v2 else validate_index
+    if v2:
+        build_snapshot_eof = _certify_v2_deep_baseline(
+            source,
+            index_path,
+            source_id,
+        )
+    else:
+        result = validate(source, index_path, source_id, deep=True)
+        if result.status != INDEX_PARTIAL or result.state != "REVALIDATING":
+            raise IndexBuildError(
+                f"post-publication validation failed: {result.status}: {result.reasons}"
+            )
+        connection = _sqlite_connect(index_path, readonly=False)
+        try:
+            state = _load_source_state(connection)
+            if str(state["state"]) != "REVALIDATING":
+                raise IndexBuildError("only a REVALIDATING final index can be finalized")
+            if int(state["safe_watermark"]) != int(state["build_snapshot_eof"]):
+                raise IndexBuildError("partial staging cannot be marked READY")
+            build_snapshot_eof = int(state["build_snapshot_eof"])
+            _mark_state(connection, "READY", published=True)
+        finally:
+            connection.close()
     _fsync_file(index_path)
     _fsync_parent(index_path)
-    post_ready = validate_index(
+    post_ready = validate(
         source,
         index_path,
         source_id,
         snapshot_eof=build_snapshot_eof,
         deep=False,
     )
-    if post_ready.status != INDEX_COMPLETE_FOR_SNAPSHOT:
+    expected_complete = INDEX_V2_CERTIFIED if v2 else INDEX_COMPLETE_FOR_SNAPSHOT
+    if post_ready.status != expected_complete:
+        if v2:
+            _revoke_v2_certification(index_path)
         raise IndexBuildError(
             f"READY post-check failed: {post_ready.status}: {post_ready.reasons}"
         )
@@ -1305,6 +1990,7 @@ def _basic_invariant_errors(connection: sqlite3.Connection) -> list[str]:
             errors.append("SOURCE_STATE_CARDINALITY")
             return errors
         state = _load_source_state(connection)
+        schema_version = int(state["schema_version"])
         watermark = int(state["safe_watermark"])
         observed_eof = int(state["observed_eof"])
         initial_snapshot_eof = int(state["initial_snapshot_eof"])
@@ -1314,6 +2000,74 @@ def _basic_invariant_errors(connection: sqlite3.Connection) -> list[str]:
             _stored_config(state).validate()
         except (TypeError, ValueError):
             errors.append("STORED_CONFIG_INVALID")
+        if schema_version == SCHEMA_VERSION_V2:
+            state_columns = set(state.keys())
+            required_v2_columns = {
+                "physical_contract_hash",
+                "physical_contract_version",
+                "cursor_contract_version",
+                "summary_contract_version",
+                "certified_watermark",
+                "certified_anchor",
+                "certified_anchor_offset",
+                "certified_anchor_length",
+                "certified_summary_hash",
+                "certification_kind",
+                "certified_at",
+                "certified_source_size",
+                "certified_source_mtime_ns",
+                "certified_source_ctime_ns",
+            }
+            if not required_v2_columns.issubset(state_columns):
+                errors.append("V2_CERTIFICATION_COLUMNS_MISSING")
+            else:
+                certified_watermark = int(state["certified_watermark"])
+                certification_kind = str(state["certification_kind"])
+                expected_certified_length = min(anchor_bytes, certified_watermark)
+                if not 0 <= certified_watermark <= watermark:
+                    errors.append("CERTIFIED_WATERMARK_RANGE")
+                if certification_kind not in CERTIFICATION_KINDS:
+                    errors.append("CERTIFICATION_KIND_INVALID")
+                if (
+                    len(bytes(state["certified_anchor"])) != HASH_BYTES
+                    or int(state["certified_anchor_length"])
+                    != expected_certified_length
+                    or int(state["certified_anchor_offset"])
+                    != certified_watermark - expected_certified_length
+                ):
+                    errors.append("CERTIFIED_ANCHOR_SHAPE")
+                if len(bytes(state["certified_summary_hash"])) != HASH_BYTES:
+                    errors.append("CERTIFIED_SUMMARY_HASH_SHAPE")
+                elif certification_kind == CERTIFICATION_UNCERTIFIED:
+                    if not hmac.compare_digest(
+                        bytes(state["certified_summary_hash"]),
+                        _blake128(b""),
+                    ):
+                        errors.append("UNCERTIFIED_SUMMARY_HASH_MISMATCH")
+                elif not verify_certified_summary_hash(connection):
+                    errors.append("CERTIFIED_SUMMARY_HASH_MISMATCH")
+                if certification_kind == CERTIFICATION_UNCERTIFIED:
+                    if (
+                        certified_watermark != 0
+                        or state["certified_at"] is not None
+                        or state["certified_source_size"] is not None
+                        or state["certified_source_mtime_ns"] is not None
+                        or state["certified_source_ctime_ns"] is not None
+                    ):
+                        errors.append("UNCERTIFIED_STATE_INCONSISTENT")
+                else:
+                    try:
+                        certified_source_size = int(state["certified_source_size"])
+                        int(state["certified_source_mtime_ns"])
+                        int(state["certified_source_ctime_ns"])
+                    except (TypeError, ValueError):
+                        errors.append("CERTIFIED_SOURCE_METADATA_INVALID")
+                    else:
+                        if (
+                            state["certified_at"] is None
+                            or certified_source_size < certified_watermark
+                        ):
+                            errors.append("CERTIFIED_STATE_INCONSISTENT")
         expected_prefix_length = min(anchor_bytes, initial_snapshot_eof)
         expected_watermark_length = min(anchor_bytes, watermark)
         expected_snapshot_tail_length = min(anchor_bytes, build_snapshot_eof)
@@ -1430,6 +2184,21 @@ def _basic_invariant_errors(connection: sqlite3.Connection) -> list[str]:
             """
         ).fetchone() is not None:
             errors.append("SEGMENT_CLASSIFICATION_COUNTS")
+        if schema_version == SCHEMA_VERSION_V2:
+            segment_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(segments)")
+            }
+            if "records_examined_lines" not in segment_columns:
+                errors.append("V2_RECORDS_EXAMINED_COLUMN_MISSING")
+            elif connection.execute(
+                """
+                SELECT 1 FROM segments
+                WHERE records_examined_lines < 0
+                   OR records_examined_lines > physical_lines
+                LIMIT 1
+                """
+            ).fetchone() is not None:
+                errors.append("SEGMENT_RECORDS_EXAMINED_COUNT")
         if int(segment_summary["mapping_records"] or 0) != record_count:
             errors.append("MAPPING_RECORD_COUNT_MISMATCH")
         expected_postings = int(segment_summary["strong_postings"] or 0) + int(
@@ -1478,6 +2247,8 @@ def _deep_invariant_errors(
     connection: sqlite3.Connection,
     handle: BinaryIO,
     state: sqlite3.Row,
+    *,
+    start_offset: int = 0,
 ) -> list[str]:
     errors: list[str] = []
     quick = connection.execute("PRAGMA quick_check").fetchall()
@@ -1489,7 +2260,11 @@ def _deep_invariant_errors(
         return errors
     block_bytes = int(state["block_bytes"])
     max_line_bytes = int(state["max_line_bytes"])
-    for segment in connection.execute("SELECT * FROM segments ORDER BY start_offset"):
+    v2 = int(state["schema_version"]) == SCHEMA_VERSION_V2
+    for segment in connection.execute(
+        "SELECT * FROM segments WHERE end_offset > ? ORDER BY start_offset",
+        (max(0, int(start_offset)),),
+    ):
         try:
             actual_segment_hash = _hash_range(
                 handle,
@@ -1515,6 +2290,8 @@ def _deep_invariant_errors(
             "secondary_postings": 0,
             "oversized_barrier_lines": 0,
         }
+        if v2:
+            actual_counts["records_examined_lines"] = 0
         actual_max_line_bytes = 0
         actual_has_long_line = False
         actual_has_oversized_barrier = False
@@ -1539,8 +2316,10 @@ def _deep_invariant_errors(
             if not line.terminated:
                 errors.append(f"SEGMENT_NOT_NEWLINE_TERMINATED:{segment['segment_id']}")
                 break
-            classification = _classify_line(line)
+            classification = _classify_line(line, physical_contract=v2)
             actual_counts["physical_lines"] += 1
+            if v2:
+                actual_counts["records_examined_lines"] += int(line.nonblank)
             actual_last_line_start_offset = line.start_offset
             actual_max_line_bytes = max(actual_max_line_bytes, line.byte_length)
             actual_has_long_line = bool(actual_has_long_line or line.long_line)
@@ -1670,26 +2449,33 @@ def _deep_invariant_errors(
     return errors
 
 
-def validate_index(
+def _validate_index_format(
     source_path: Path | str,
     index_path: Path | str,
     source_id: str,
     *,
     snapshot_eof: Optional[int] = None,
     deep: bool = False,
+    index_format: _IndexFormat,
 ) -> ValidationResult:
     """Classify a shadow index without modifying either source or index."""
 
     source = Path(source_path)
     index = Path(index_path)
     expected_source_id = _validate_source_id(source_id)
+    v2 = index_format.schema_version == SCHEMA_VERSION_V2
+    stale_status = INDEX_V2_CONTRACT_MISMATCH if v2 else INDEX_STALE
+    source_changed_status = INDEX_V2_SOURCE_CHANGED if v2 else INDEX_SOURCE_CHANGED
+    corrupt_status = INDEX_V2_CORRUPT if v2 else INDEX_CORRUPT
+    partial_status = INDEX_V2_UNCERTIFIED if v2 else INDEX_PARTIAL
+    complete_status = INDEX_V2_CERTIFIED if v2 else INDEX_COMPLETE_FOR_SNAPSHOT
     if not index.exists():
         return ValidationResult(status=INDEX_MISSING, reasons=("INDEX_FILE_MISSING",), source_id=expected_source_id, deep=deep)
     try:
         connection = _sqlite_connect(index, readonly=True)
     except sqlite3.DatabaseError as exc:
         return ValidationResult(
-            status=INDEX_CORRUPT,
+            status=corrupt_status,
             reasons=(f"SQLITE_OPEN_FAILED:{type(exc).__name__}",),
             source_id=expected_source_id,
             deep=deep,
@@ -1697,7 +2483,7 @@ def validate_index(
     try:
         tables = _table_names(connection)
         if not REQUIRED_TABLES.issubset(tables):
-            return ValidationResult(status=INDEX_CORRUPT, reasons=("REQUIRED_TABLE_MISSING",), source_id=expected_source_id, deep=deep)
+            return ValidationResult(status=corrupt_status, reasons=("REQUIRED_TABLE_MISSING",), source_id=expected_source_id, deep=deep)
         application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
         user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         state = _load_source_state(connection)
@@ -1708,29 +2494,40 @@ def validate_index(
             "generation_uuid": str(state["generation_uuid"]),
             "deep": deep,
         }
-        if application_id != SQLITE_APPLICATION_ID or user_version != SCHEMA_VERSION:
-            return ValidationResult(status=INDEX_STALE, reasons=("SQLITE_VERSION_MISMATCH",), **common)
-        if int(state["schema_version"]) != SCHEMA_VERSION or str(state["index_version"]) != INDEX_VERSION:
-            return ValidationResult(status=INDEX_STALE, reasons=("INDEX_VERSION_MISMATCH",), **common)
-        if str(state["builder_version"]) != BUILDER_VERSION:
-            return ValidationResult(status=INDEX_STALE, reasons=("BUILDER_VERSION_MISMATCH",), **common)
+        if application_id != SQLITE_APPLICATION_ID or user_version != index_format.schema_version:
+            return ValidationResult(status=stale_status, reasons=("SQLITE_VERSION_MISMATCH",), **common)
+        if int(state["schema_version"]) != index_format.schema_version or str(state["index_version"]) != index_format.index_version:
+            return ValidationResult(status=stale_status, reasons=("INDEX_VERSION_MISMATCH",), **common)
+        if str(state["builder_version"]) != index_format.builder_version:
+            return ValidationResult(status=stale_status, reasons=("BUILDER_VERSION_MISMATCH",), **common)
         if str(state["identity_contract_hash"]) != IDENTITY_CONTRACT_HASH:
-            return ValidationResult(status=INDEX_STALE, reasons=("IDENTITY_CONTRACT_MISMATCH",), **common)
+            return ValidationResult(status=stale_status, reasons=("IDENTITY_CONTRACT_MISMATCH",), **common)
+        if v2 and (
+            str(state["physical_contract_hash"]) != PHYSICAL_CONTRACT_HASH
+            or str(state["physical_contract_version"]) != PHYSICAL_CONTRACT_VERSION
+            or str(state["cursor_contract_version"]) != str(CURSOR_CONTRACT_VERSION)
+            or str(state["summary_contract_version"]) != str(SUMMARY_CONTRACT_VERSION)
+        ):
+            return ValidationResult(
+                status=INDEX_V2_CONTRACT_MISMATCH,
+                reasons=("PHYSICAL_CONTRACT_MISMATCH",),
+                **common,
+            )
         if str(state["source_id"]) != expected_source_id:
-            return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("SOURCE_ID_MISMATCH",), **common)
+            return ValidationResult(status=source_changed_status, reasons=("SOURCE_ID_MISMATCH",), **common)
         if (
             str(state["normalized_path_hash"]) != normalized_path_hash(source)
             or str(state["source_path"]) != _normalized_path(source)
         ):
-            return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("SOURCE_PATH_MISMATCH",), **common)
+            return ValidationResult(status=source_changed_status, reasons=("SOURCE_PATH_MISMATCH",), **common)
         if str(state["state"]) == "CORRUPT":
-            return ValidationResult(status=INDEX_CORRUPT, reasons=("STATE_CORRUPT",), **common)
+            return ValidationResult(status=corrupt_status, reasons=("STATE_CORRUPT",), **common)
         if str(state["state"]) == "STALE":
-            return ValidationResult(status=INDEX_STALE, reasons=("STATE_STALE",), **common)
+            return ValidationResult(status=stale_status, reasons=("STATE_STALE",), **common)
         invariant_errors = _basic_invariant_errors(connection)
         if invariant_errors:
             return ValidationResult(
-                status=INDEX_CORRUPT,
+                status=corrupt_status,
                 reasons=tuple(invariant_errors),
                 **common,
             )
@@ -1738,21 +2535,41 @@ def validate_index(
             path_stat = _source_stat(source)
             handle = source.open("rb")
         except (FileNotFoundError, OSError, IndexBuildError) as exc:
-            return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=(f"SOURCE_UNAVAILABLE:{type(exc).__name__}",), **common)
+            return ValidationResult(status=source_changed_status, reasons=(f"SOURCE_UNAVAILABLE:{type(exc).__name__}",), **common)
         with handle:
             descriptor_stat = os.fstat(handle.fileno())
             current_size = int(descriptor_stat.st_size)
             requested_snapshot = current_size if snapshot_eof is None else int(snapshot_eof)
             common.update(source_size=current_size, snapshot_eof=max(0, requested_snapshot))
             if not _same_file(path_stat, descriptor_stat):
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("LSTAT_FSTAT_MISMATCH",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("LSTAT_FSTAT_MISMATCH",), **common)
             if str(int(descriptor_stat.st_dev)) != str(state["dev"]) or str(int(descriptor_stat.st_ino)) != str(state["inode"]):
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("SOURCE_FILE_ID_MISMATCH",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("SOURCE_FILE_ID_MISMATCH",), **common)
             watermark = int(state["safe_watermark"])
             if requested_snapshot < 0 or requested_snapshot > current_size:
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("SNAPSHOT_OUTSIDE_SOURCE",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("SNAPSHOT_OUTSIDE_SOURCE",), **common)
             if current_size < int(state["build_snapshot_eof"]) or current_size < watermark:
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("SOURCE_SHRINK",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("SOURCE_SHRINK",), **common)
+            if (
+                v2
+                and str(state["certification_kind"]) != CERTIFICATION_UNCERTIFIED
+                and current_size < int(state["certified_source_size"])
+            ):
+                return ValidationResult(
+                    status=source_changed_status,
+                    reasons=("SOURCE_SHRANK_BELOW_CERTIFIED_WITNESS",),
+                    **common,
+                )
+            if (
+                v2
+                and str(state["certification_kind"]) != CERTIFICATION_UNCERTIFIED
+                and current_size > int(state["certified_source_size"])
+            ):
+                return ValidationResult(
+                    status=source_changed_status,
+                    reasons=("CERTIFIED_SOURCE_SIZE_MISMATCH",),
+                    **common,
+                )
             try:
                 anchor_bytes = int(state["anchor_bytes"])
                 watermark_anchors = _watermark_anchor_values(
@@ -1772,16 +2589,46 @@ def validate_index(
                     if snapshot_tail_length
                     else _blake128(b"")
                 )
+                certified_anchor = None
+                if v2:
+                    certified_watermark = int(state["certified_watermark"])
+                    certified_anchor_values = _watermark_anchor_values(
+                        handle,
+                        certified_watermark,
+                        anchor_bytes,
+                    )
+                    certified_anchor = certified_anchor_values["watermark_anchor"]
             except (IndexValidationError, OSError):
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("ANCHOR_RANGE_INVALID",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("ANCHOR_RANGE_INVALID",), **common)
             if prefix != bytes(state["prefix_anchor"]):
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("PREFIX_ANCHOR_MISMATCH",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("PREFIX_ANCHOR_MISMATCH",), **common)
             if watermark_anchors["watermark_anchor"] != bytes(state["watermark_anchor"]):
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("WATERMARK_ANCHOR_MISMATCH",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("WATERMARK_ANCHOR_MISMATCH",), **common)
             if snapshot_tail != bytes(state["snapshot_tail_anchor"]):
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("SNAPSHOT_TAIL_ANCHOR_MISMATCH",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("SNAPSHOT_TAIL_ANCHOR_MISMATCH",), **common)
+            if v2 and certified_anchor != bytes(state["certified_anchor"]):
+                return ValidationResult(
+                    status=source_changed_status,
+                    reasons=("CERTIFIED_ANCHOR_MISMATCH",),
+                    **common,
+                )
+            if (
+                v2
+                and str(state["certification_kind"]) != CERTIFICATION_UNCERTIFIED
+                and (
+                    int(descriptor_stat.st_mtime_ns)
+                    != int(state["certified_source_mtime_ns"])
+                    or int(descriptor_stat.st_ctime_ns)
+                    != int(state["certified_source_ctime_ns"])
+                )
+            ):
+                return ValidationResult(
+                    status=source_changed_status,
+                    reasons=("CERTIFIED_SOURCE_TIMESTAMP_MISMATCH",),
+                    **common,
+                )
             if watermark and _read_exact_range(handle, watermark - 1, 1) != b"\n":
-                return ValidationResult(status=INDEX_SOURCE_CHANGED, reasons=("WATERMARK_NOT_NEWLINE_ALIGNED",), **common)
+                return ValidationResult(status=source_changed_status, reasons=("WATERMARK_NOT_NEWLINE_ALIGNED",), **common)
             last_complete_line_offset = int(state["last_complete_line_offset"])
             if (
                 watermark
@@ -1789,7 +2636,7 @@ def validate_index(
                 and _read_exact_range(handle, last_complete_line_offset - 1, 1) != b"\n"
             ):
                 return ValidationResult(
-                    status=INDEX_SOURCE_CHANGED,
+                    status=source_changed_status,
                     reasons=("LAST_COMPLETE_LINE_BOUNDARY_MISMATCH",),
                     **common,
                 )
@@ -1801,7 +2648,7 @@ def validate_index(
                         for reason in deep_errors
                     )
                     return ValidationResult(
-                        status=INDEX_SOURCE_CHANGED if source_mismatch else INDEX_CORRUPT,
+                        status=source_changed_status if source_mismatch else corrupt_status,
                         reasons=tuple(deep_errors),
                         **common,
                     )
@@ -1810,36 +2657,100 @@ def validate_index(
                 final_path_stat = _source_stat(source)
             except (FileNotFoundError, OSError, IndexBuildError) as exc:
                 return ValidationResult(
-                    status=INDEX_SOURCE_CHANGED,
+                    status=source_changed_status,
                     reasons=(f"SOURCE_CHANGED_DURING_VALIDATION:{type(exc).__name__}",),
                     **common,
                 )
             if not _same_file(final_descriptor_stat, final_path_stat):
                 return ValidationResult(
-                    status=INDEX_SOURCE_CHANGED,
+                    status=source_changed_status,
                     reasons=("SOURCE_REPLACED_DURING_VALIDATION",),
                     **common,
                 )
             if int(final_descriptor_stat.st_size) < current_size:
                 return ValidationResult(
-                    status=INDEX_SOURCE_CHANGED,
+                    status=source_changed_status,
                     reasons=("SOURCE_SHRANK_DURING_VALIDATION",),
                     **common,
                 )
+            if v2 and _same_size_timestamp_changed(
+                descriptor_stat,
+                final_descriptor_stat,
+            ):
+                return ValidationResult(
+                    status=source_changed_status,
+                    reasons=("SOURCE_REWRITTEN_DURING_VALIDATION",),
+                    **common,
+                )
             if str(state["state"]) in {"BUILDING", "REVALIDATING"}:
-                return ValidationResult(status=INDEX_PARTIAL, reasons=(f"STATE_{state['state']}",), **common)
+                return ValidationResult(status=partial_status, reasons=(f"STATE_{state['state']}",), **common)
             if watermark < requested_snapshot:
-                return ValidationResult(status=INDEX_PARTIAL, reasons=("WATERMARK_BEHIND_SNAPSHOT",), **common)
-            return ValidationResult(status=INDEX_COMPLETE_FOR_SNAPSHOT, reasons=(), **common)
+                return ValidationResult(status=partial_status, reasons=("WATERMARK_BEHIND_SNAPSHOT",), **common)
+            if v2:
+                certification_kind = str(state["certification_kind"])
+                certified_watermark = int(state["certified_watermark"])
+                if certification_kind == CERTIFICATION_UNCERTIFIED:
+                    return ValidationResult(
+                        status=INDEX_V2_UNCERTIFIED,
+                        reasons=("CERTIFICATION_UNCERTIFIED",),
+                        **common,
+                    )
+                if certified_watermark < requested_snapshot:
+                    return ValidationResult(
+                        status=INDEX_V2_UNCERTIFIED,
+                        reasons=("CERTIFIED_WATERMARK_BEHIND_SNAPSHOT",),
+                        **common,
+                    )
+            return ValidationResult(status=complete_status, reasons=(), **common)
     except (sqlite3.DatabaseError, IndexValidationError, KeyError, TypeError, ValueError) as exc:
         return ValidationResult(
-            status=INDEX_CORRUPT,
+            status=corrupt_status,
             reasons=(f"INDEX_VALIDATION_FAILED:{type(exc).__name__}",),
             source_id=expected_source_id,
             deep=deep,
         )
     finally:
         connection.close()
+
+
+def validate_index(
+    source_path: Path | str,
+    index_path: Path | str,
+    source_id: str,
+    *,
+    snapshot_eof: Optional[int] = None,
+    deep: bool = False,
+) -> ValidationResult:
+    """Validate a Phase A/V1 index without accepting or migrating V2."""
+
+    return _validate_index_format(
+        source_path,
+        index_path,
+        source_id,
+        snapshot_eof=snapshot_eof,
+        deep=deep,
+        index_format=_index_format(SCHEMA_VERSION_V1),
+    )
+
+
+def validate_index_v2(
+    source_path: Path | str,
+    index_path: Path | str,
+    source_id: str,
+    *,
+    snapshot_eof: Optional[int] = None,
+    deep: bool = False,
+) -> ValidationResult:
+    """Validate explicit C0/V2 physical certification without any migration."""
+
+    return _validate_index_format(
+        source_path,
+        index_path,
+        source_id,
+        snapshot_eof=snapshot_eof,
+        deep=deep,
+        index_format=_index_format(SCHEMA_VERSION_V2),
+    )
 
 
 def _stored_config(state: sqlite3.Row) -> BuildConfig:
@@ -1861,6 +2772,8 @@ def _prepare_resume(
     index: Path,
     source_id: str,
     staging_path: Optional[Path],
+    *,
+    schema_version: int = SCHEMA_VERSION_V1,
 ) -> tuple[Path, sqlite3.Connection, sqlite3.Row, BuildConfig]:
     candidate = staging_path
     if candidate is None:
@@ -1895,8 +2808,15 @@ def _prepare_resume(
             )
     if not candidate.exists():
         raise IndexBuildError("staging index does not exist")
-    validation = validate_index(source, candidate, source_id, deep=False)
-    if validation.status not in {INDEX_PARTIAL, INDEX_COMPLETE_FOR_SNAPSHOT}:
+    v2 = int(schema_version) == SCHEMA_VERSION_V2
+    validate = validate_index_v2 if v2 else validate_index
+    validation = validate(source, candidate, source_id, deep=False)
+    accepted = (
+        {INDEX_V2_UNCERTIFIED, INDEX_V2_CERTIFIED}
+        if v2
+        else {INDEX_PARTIAL, INDEX_COMPLETE_FOR_SNAPSHOT}
+    )
+    if validation.status not in accepted:
         raise IndexBuildError(
             f"staging validation failed: {validation.status}: {validation.reasons}"
         )
@@ -2123,7 +3043,7 @@ def _collect_build_report(
         connection.close()
 
 
-def build_index(
+def _build_index_format(
     source_path: Path | str,
     index_path: Path | str,
     source_id: str,
@@ -2134,6 +3054,7 @@ def build_index(
     publish: bool = True,
     fault_injector: FaultInjector = None,
     measure_memory: bool = True,
+    schema_version: int,
 ) -> BuildReport:
     """Build or resume one explicit shadow index with bounded memory.
 
@@ -2144,6 +3065,7 @@ def build_index(
     source = Path(source_path)
     index = Path(index_path)
     identity = _validate_source_id(source_id)
+    index_format = _index_format(schema_version)
     if _normalized_path(source) == _normalized_path(index):
         raise ValueError("source and index paths must differ")
     selected_config = config or BuildConfig()
@@ -2174,6 +3096,7 @@ def build_index(
                     index,
                     identity,
                     Path(staging_path) if staging_path is not None else None,
+                    schema_version=index_format.schema_version,
                 )
                 descriptor_stat = os.fstat(handle.fileno())
                 if (
@@ -2206,6 +3129,7 @@ def build_index(
                     descriptor_stat,
                     snapshot_eof,
                     selected_config,
+                    schema_version=index_format.schema_version,
                 )
                 state = _load_source_state(connection)
 
@@ -2258,7 +3182,10 @@ def build_index(
                     peak_pending_line_bytes,
                     min(line.byte_length, selected_config.max_line_bytes),
                 )
-                classification = _classify_line(line)
+                classification = _classify_line(
+                    line,
+                    physical_contract=index_format.certified,
+                )
                 if not line.terminated:
                     tail_classification = classification if line.raw is not None else None
                     connection.execute("BEGIN IMMEDIATE")
@@ -2341,8 +3268,18 @@ def build_index(
             raise IndexBuildError("builder did not create or open a staging database")
         connection.close()
         connection = None
-        prepublish = validate_index(source, actual_staging, identity, deep=True)
-        if prepublish.status not in {INDEX_PARTIAL, INDEX_COMPLETE_FOR_SNAPSHOT}:
+        validate = (
+            validate_index_v2
+            if index_format.schema_version == SCHEMA_VERSION_V2
+            else validate_index
+        )
+        prepublish = validate(source, actual_staging, identity, deep=True)
+        accepted_prepublish = (
+            {INDEX_V2_UNCERTIFIED, INDEX_V2_CERTIFIED}
+            if index_format.schema_version == SCHEMA_VERSION_V2
+            else {INDEX_PARTIAL, INDEX_COMPLETE_FOR_SNAPSHOT}
+        )
+        if prepublish.status not in accepted_prepublish:
             raise IndexBuildError(
                 f"staging deep validation failed: {prepublish.status}: {prepublish.reasons}"
             )
@@ -2359,7 +3296,12 @@ def build_index(
         database_path = actual_staging
         if publish and can_publish:
             if _normalized_path(actual_staging) == _normalized_path(index):
-                _finish_revalidating_final(source, index, identity)
+                _finish_revalidating_final(
+                    source,
+                    index,
+                    identity,
+                    schema_version=index_format.schema_version,
+                )
             else:
                 _publish_staging(
                     source,
@@ -2367,6 +3309,7 @@ def build_index(
                     actual_staging,
                     identity,
                     fault_injector=fault_injector,
+                    schema_version=index_format.schema_version,
                 )
             published = True
             database_path = index
@@ -2399,6 +3342,70 @@ def build_index(
             connection.close()
         if started_tracemalloc and tracemalloc.is_tracing():
             tracemalloc.stop()
+
+
+def build_index(
+    source_path: Path | str,
+    index_path: Path | str,
+    source_id: str,
+    *,
+    resume: bool = False,
+    staging_path: Path | str | None = None,
+    config: Optional[BuildConfig] = None,
+    publish: bool = True,
+    fault_injector: FaultInjector = None,
+    measure_memory: bool = True,
+) -> BuildReport:
+    """Build the backwards-compatible Phase A/V1 shadow index."""
+
+    return _build_index_format(
+        source_path,
+        index_path,
+        source_id,
+        resume=resume,
+        staging_path=staging_path,
+        config=config,
+        publish=publish,
+        fault_injector=fault_injector,
+        measure_memory=measure_memory,
+        schema_version=SCHEMA_VERSION_V1,
+    )
+
+
+def build_index_v2(
+    source_path: Path | str,
+    index_path: Path | str,
+    source_id: str,
+    *,
+    resume: bool = False,
+    staging_path: Path | str | None = None,
+    config: Optional[BuildConfig] = None,
+    publish: bool = True,
+    fault_injector: FaultInjector = None,
+    measure_memory: bool = True,
+) -> BuildReport:
+    """Build one explicit, offline C0/V2 certified sidecar.
+
+    This opt-in API never discovers, upgrades, or replaces an existing index.
+    """
+
+    if not resume and Path(index_path).exists():
+        raise IndexBuildError(
+            "V2 build refuses to replace an existing index; use a new explicit path"
+        )
+
+    return _build_index_format(
+        source_path,
+        index_path,
+        source_id,
+        resume=resume,
+        staging_path=staging_path,
+        config=config,
+        publish=publish,
+        fault_injector=fault_injector,
+        measure_memory=measure_memory,
+        schema_version=SCHEMA_VERSION_V2,
+    )
 
 
 def _catchup_counts(connection: sqlite3.Connection) -> dict[str, int]:
@@ -2487,17 +3494,27 @@ def _validate_ready_catchup_session(
     application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     state = _load_source_state(connection)
-    if application_id != SQLITE_APPLICATION_ID or user_version != SCHEMA_VERSION:
+    schema_version = int(state["schema_version"])
+    if schema_version not in {SCHEMA_VERSION_V1, SCHEMA_VERSION_V2}:
+        raise IndexBuildError("READY catch-up rejected: INDEX_VERSION_MISMATCH")
+    index_format = _index_format(schema_version)
+    if application_id != SQLITE_APPLICATION_ID or user_version != schema_version:
         raise IndexBuildError("READY catch-up rejected: SQLITE_VERSION_MISMATCH")
     if (
-        int(state["schema_version"]) != SCHEMA_VERSION
-        or str(state["index_version"]) != INDEX_VERSION
+        str(state["index_version"]) != index_format.index_version
     ):
         raise IndexBuildError("READY catch-up rejected: INDEX_VERSION_MISMATCH")
-    if str(state["builder_version"]) != BUILDER_VERSION:
+    if str(state["builder_version"]) != index_format.builder_version:
         raise IndexBuildError("READY catch-up rejected: BUILDER_VERSION_MISMATCH")
     if str(state["identity_contract_hash"]) != IDENTITY_CONTRACT_HASH:
         raise IndexBuildError("READY catch-up rejected: IDENTITY_CONTRACT_MISMATCH")
+    if schema_version == SCHEMA_VERSION_V2 and (
+        str(state["physical_contract_hash"]) != PHYSICAL_CONTRACT_HASH
+        or str(state["physical_contract_version"]) != PHYSICAL_CONTRACT_VERSION
+        or str(state["cursor_contract_version"]) != str(CURSOR_CONTRACT_VERSION)
+        or str(state["summary_contract_version"]) != str(SUMMARY_CONTRACT_VERSION)
+    ):
+        raise IndexBuildError("READY catch-up rejected: PHYSICAL_CONTRACT_MISMATCH")
     if str(state["source_id"]) != source_id:
         raise IndexBuildError("READY catch-up rejected: SOURCE_ID_MISMATCH")
     if (
@@ -2578,6 +3595,11 @@ def _validate_ready_catchup_session(
         raise IndexBuildError("READY catch-up rejected: SOURCE_REPLACED_DURING_PROOF")
     if int(final_descriptor.st_size) < int(descriptor_stat.st_size):
         raise IndexBuildError("READY catch-up rejected: SOURCE_SHRANK_DURING_PROOF")
+    if schema_version == SCHEMA_VERSION_V2 and (
+        _source_snapshot_metadata_changed(descriptor_stat, final_descriptor)
+        or _source_snapshot_metadata_changed(path_stat, final_path_stat)
+    ):
+        raise IndexBuildError("READY catch-up rejected: SOURCE_REWRITTEN_DURING_PROOF")
     return state, config
 
 
@@ -2631,6 +3653,174 @@ def _update_catchup_tail_state(
         safe_watermark=expected_watermark,
         trailing_fragment_bytes=trailing_fragment_bytes,
     )
+
+
+def _extend_v2_certification_after_proven_append(
+    connection: sqlite3.Connection,
+    handle: BinaryIO,
+    source: Path,
+    *,
+    expected_generation_uuid: str,
+    watermark_before: int,
+    watermark_after: int,
+    catchup_snapshot_stat: os.stat_result,
+    catchup_path_stat: os.stat_result,
+    prior_certification_kind: str,
+) -> bool:
+    """Extend certification only from a fully certified prior watermark."""
+
+    if watermark_after <= watermark_before:
+        return False
+    state = _load_source_state(connection)
+    if int(state["schema_version"]) != SCHEMA_VERSION_V2:
+        return False
+    if (
+        prior_certification_kind == CERTIFICATION_UNCERTIFIED
+        or int(state["certified_watermark"]) != watermark_before
+        or int(state["safe_watermark"]) != watermark_after
+    ):
+        return False
+    invariant_errors = _basic_invariant_errors(connection)
+    appended_errors = _deep_invariant_errors(
+        connection,
+        handle,
+        state,
+        start_offset=watermark_before,
+    )
+    if invariant_errors or appended_errors:
+        raise IndexBuildError(
+            "V2 proven-append certification failed: "
+            + ",".join((*invariant_errors, *appended_errors))
+        )
+    certified_anchor = _watermark_anchor_values(
+        handle,
+        watermark_after,
+        int(state["anchor_bytes"]),
+    )
+    proof_stat = os.fstat(handle.fileno())
+    if not _same_file(catchup_snapshot_stat, proof_stat):
+        raise IndexBuildError("source generation changed before V2 certification")
+    proof_path_stat = _source_stat(source)
+    if (
+        not _same_file(catchup_snapshot_stat, proof_path_stat)
+        or _source_snapshot_metadata_changed(catchup_snapshot_stat, proof_stat)
+        or _source_snapshot_metadata_changed(catchup_path_stat, proof_path_stat)
+    ):
+        raise IndexBuildError("source changed before V2 certification")
+    now = _utc_now()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        current = _load_source_state(connection)
+        if (
+            str(current["state"]) != "READY"
+            or str(current["generation_uuid"]) != expected_generation_uuid
+            or int(current["safe_watermark"]) != watermark_after
+            or int(current["certified_watermark"]) != watermark_before
+            or str(current["certification_kind"]) != prior_certification_kind
+        ):
+            raise IndexBuildError(
+                "V2 source_state changed before proven-append certification"
+            )
+        certified_summary_hash = calculate_certified_summary_hash(
+            connection,
+            watermark_after,
+        )
+        commit_descriptor = os.fstat(handle.fileno())
+        commit_path_stat = _source_stat(source)
+        if (
+            not _same_file(catchup_snapshot_stat, commit_descriptor)
+            or not _same_file(catchup_snapshot_stat, commit_path_stat)
+            or _source_snapshot_metadata_changed(
+                catchup_snapshot_stat,
+                commit_descriptor,
+            )
+            or _source_snapshot_metadata_changed(
+                catchup_path_stat,
+                commit_path_stat,
+            )
+        ):
+            raise IndexBuildError(
+                "source changed before V2 proven-append certification commit"
+            )
+        connection.execute(
+            """
+            UPDATE source_state SET
+                certified_watermark=?, certified_anchor=?,
+                certified_anchor_offset=?, certified_anchor_length=?,
+                certified_summary_hash=?, certification_kind=?, certified_at=?,
+                certified_source_size=?, certified_source_mtime_ns=?,
+                certified_source_ctime_ns=?, validated_at=?
+            WHERE singleton_id=1
+            """,
+            (
+                watermark_after,
+                certified_anchor["watermark_anchor"],
+                certified_anchor["watermark_anchor_offset"],
+                certified_anchor["watermark_anchor_length"],
+                certified_summary_hash,
+                CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+                now,
+                int(commit_descriptor.st_size),
+                int(commit_descriptor.st_mtime_ns),
+                int(commit_descriptor.st_ctime_ns),
+                now,
+            ),
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    return True
+
+
+def _refresh_v2_certified_source_witness(
+    connection: sqlite3.Connection,
+    *,
+    expected_generation_uuid: str,
+    expected_safe_watermark: int,
+    expected_certified_watermark: int,
+    expected_certification_kind: str,
+    catchup_snapshot_stat: os.stat_result,
+) -> None:
+    """Record a source snapshot after prefix proof without extending coverage."""
+
+    if expected_certification_kind == CERTIFICATION_UNCERTIFIED:
+        return
+    now = _utc_now()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        state = _load_source_state(connection)
+        if (
+            int(state["schema_version"]) != SCHEMA_VERSION_V2
+            or str(state["state"]) != "READY"
+            or str(state["generation_uuid"]) != expected_generation_uuid
+            or int(state["safe_watermark"]) != expected_safe_watermark
+            or int(state["certified_watermark"])
+            != expected_certified_watermark
+            or str(state["certification_kind"])
+            != expected_certification_kind
+        ):
+            raise IndexBuildError(
+                "V2 source_state changed before source witness refresh"
+            )
+        connection.execute(
+            """
+            UPDATE source_state SET certified_source_size=?,
+                certified_source_mtime_ns=?, certified_source_ctime_ns=?,
+                validated_at=?
+            WHERE singleton_id=1
+            """,
+            (
+                int(catchup_snapshot_stat.st_size),
+                int(catchup_snapshot_stat.st_mtime_ns),
+                int(catchup_snapshot_stat.st_ctime_ns),
+                now,
+            ),
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def catch_up_index(
@@ -2698,6 +3888,17 @@ def catch_up_index(
             generation_uuid = str(state["generation_uuid"])
             state_before = str(state["state"])
             watermark_before = int(state["safe_watermark"])
+            schema_version = int(state["schema_version"])
+            prior_certification_kind = (
+                str(state["certification_kind"])
+                if schema_version == SCHEMA_VERSION_V2
+                else CERTIFICATION_UNCERTIFIED
+            )
+            prior_certified_watermark = (
+                int(state["certified_watermark"])
+                if schema_version == SCHEMA_VERSION_V2
+                else 0
+            )
             if catchup_snapshot_eof < watermark_before:
                 raise IndexBuildError("READY catch-up rejected: SOURCE_SHRINK")
             before_counts = _catchup_counts(connection)
@@ -2722,6 +3923,19 @@ def catch_up_index(
                     raise IndexBuildError("source changed generation during READY catch-up")
                 if int(current_descriptor.st_size) < catchup_snapshot_eof:
                     raise IndexBuildError("source shrank below the catch-up snapshot")
+                if schema_version == SCHEMA_VERSION_V2 and (
+                    _source_snapshot_metadata_changed(
+                        descriptor_stat,
+                        current_descriptor,
+                    )
+                    or _source_snapshot_metadata_changed(
+                        path_stat,
+                        current_path,
+                    )
+                ):
+                    raise IndexBuildError(
+                        "source changed during V2 READY catch-up"
+                    )
                 return current_descriptor
 
             def finalize_segment() -> None:
@@ -2760,7 +3974,10 @@ def catch_up_index(
                 block_bytes=selected_config.block_bytes,
                 max_line_bytes=selected_config.max_line_bytes,
             ):
-                classification = _classify_line(line)
+                classification = _classify_line(
+                    line,
+                    physical_contract=schema_version == SCHEMA_VERSION_V2,
+                )
                 if not line.terminated:
                     terminal_fragment = line
                     terminal_classification = (
@@ -2825,6 +4042,45 @@ def catch_up_index(
                 or int(after_state["build_snapshot_eof"]) != watermark_after
             ):
                 raise IndexBuildError("READY catch-up left inconsistent source_state")
+            certification_extended = False
+            if (
+                schema_version == SCHEMA_VERSION_V2
+                and prior_certification_kind != CERTIFICATION_UNCERTIFIED
+                and prior_certified_watermark == watermark_before
+            ):
+                certification_extended = _extend_v2_certification_after_proven_append(
+                    connection,
+                    handle,
+                    source,
+                    expected_generation_uuid=generation_uuid,
+                    watermark_before=watermark_before,
+                    watermark_after=watermark_after,
+                    catchup_snapshot_stat=descriptor_stat,
+                    catchup_path_stat=path_stat,
+                    prior_certification_kind=prior_certification_kind,
+                )
+                assert_source_generation()
+                after_state = _load_source_state(connection)
+            if (
+                schema_version == SCHEMA_VERSION_V2
+                and prior_certification_kind != CERTIFICATION_UNCERTIFIED
+                and not certification_extended
+            ):
+                witness_stat = assert_source_generation()
+                if _source_snapshot_metadata_changed(descriptor_stat, witness_stat):
+                    raise IndexBuildError(
+                        "source rewritten before V2 source witness refresh"
+                    )
+                _refresh_v2_certified_source_witness(
+                    connection,
+                    expected_generation_uuid=generation_uuid,
+                    expected_safe_watermark=watermark_after,
+                    expected_certified_watermark=prior_certified_watermark,
+                    expected_certification_kind=prior_certification_kind,
+                    catchup_snapshot_stat=descriptor_stat,
+                )
+                assert_source_generation()
+                after_state = _load_source_state(connection)
 
         connection.close()
         connection = None
@@ -2834,13 +4090,27 @@ def catch_up_index(
             safe_watermark=watermark_after,
             catchup_snapshot_eof=catchup_snapshot_eof,
         )
-        final_validation = validate_index(source, index, identity, deep=False)
+        validate = validate_index_v2 if schema_version == SCHEMA_VERSION_V2 else validate_index
+        final_validation = validate(
+            source,
+            index,
+            identity,
+            snapshot_eof=watermark_after if schema_version == SCHEMA_VERSION_V2 else None,
+            deep=False,
+        )
+        accepted_final_statuses = (
+            {INDEX_V2_CERTIFIED, INDEX_V2_UNCERTIFIED}
+            if schema_version == SCHEMA_VERSION_V2
+            else {INDEX_COMPLETE_FOR_SNAPSHOT, INDEX_PARTIAL}
+        )
         if (
             final_validation.status
-            not in {INDEX_COMPLETE_FOR_SNAPSHOT, INDEX_PARTIAL}
+            not in accepted_final_statuses
             or final_validation.state != "READY"
             or final_validation.safe_watermark != watermark_after
         ):
+            if schema_version == SCHEMA_VERSION_V2:
+                _revoke_v2_certification(index)
             raise IndexBuildError(
                 "READY catch-up final validation failed: "
                 f"{final_validation.status}: {final_validation.reasons}"
@@ -3129,6 +4399,7 @@ def verify_shadow(
         watermark = int(state["safe_watermark"])
         block_bytes = int(state["block_bytes"])
         max_line_bytes = int(state["max_line_bytes"])
+        physical_contract = int(state["schema_version"]) == SCHEMA_VERSION_V2
     finally:
         connection.close()
     start = int(start_offset)
@@ -3163,7 +4434,10 @@ def verify_shadow(
         ):
             if not line.terminated:
                 raise IndexValidationError("safe verification scope ended inside a line")
-            classification = _classify_line(line)
+            classification = _classify_line(
+                line,
+                physical_contract=physical_contract,
+            )
             record = classification.get("record")
             if record is None:
                 continue
@@ -3288,8 +4562,17 @@ def verify_shadow(
 
 __all__ = (
     "BUILDER_VERSION",
+    "BUILDER_VERSION_V1",
+    "BUILDER_VERSION_V2",
     "BuildConfig",
     "BuildReport",
+    "CERTIFICATION_DEEP_BASELINE",
+    "CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND",
+    "CERTIFICATION_KINDS",
+    "CERTIFICATION_UNCERTIFIED",
+    "CERTIFIED_SEGMENT_SUMMARY_FIELDS",
+    "CERTIFIED_SUMMARY_HASH_DOMAIN",
+    "CertificationMetadata",
     "CatchUpReport",
     "DEFAULT_ANCHOR_BYTES",
     "DEFAULT_BATCH_BYTES",
@@ -3304,20 +4587,34 @@ __all__ = (
     "INDEX_SOURCE_CHANGED",
     "INDEX_STALE",
     "INDEX_VERSION",
+    "INDEX_VERSION_V1",
+    "INDEX_VERSION_V2",
+    "INDEX_V2_CERTIFIED",
+    "INDEX_V2_CONTRACT_MISMATCH",
+    "INDEX_V2_CORRUPT",
+    "INDEX_V2_SOURCE_CHANGED",
+    "INDEX_V2_UNCERTIFIED",
     "IndexBuildError",
     "IndexedRecordMetadata",
     "IndexValidationError",
     "SCHEMA_VERSION",
+    "SCHEMA_VERSION_V1",
+    "SCHEMA_VERSION_V2",
     "SOURCE_IDS",
     "ShadowVerificationResult",
     "ValidationResult",
     "build_index",
+    "build_index_v2",
+    "calculate_certified_summary_hash",
     "catch_up_index",
     "find_staging_indexes",
     "lookup_offsets",
     "lookup_records",
     "normalized_path_hash",
     "read_and_verify_record",
+    "read_index_certification",
     "validate_index",
+    "validate_index_v2",
+    "verify_certified_summary_hash",
     "verify_shadow",
 )
