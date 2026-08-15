@@ -43,7 +43,10 @@ def _identity(value: str) -> tuple[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Manual Phase A shadow builder/revalidator; no productive reader integration.",
+        description=(
+            "Manual Phase A shadow builder/revalidator and READY append catch-up; "
+            "no productive reader integration."
+        ),
     )
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--index", required=True, type=Path)
@@ -55,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--build", action="store_true")
     mode.add_argument("--resume", action="store_true")
+    mode.add_argument("--catch-up", action="store_true")
     mode.add_argument("--validate", action="store_true")
     mode.add_argument("--deep-validate", action="store_true")
     mode.add_argument("--verify-shadow", action="store_true")
@@ -111,6 +115,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             payload = {"mode": "resume" if args.resume else "build", **report.to_dict()}
             exit_code = 0
+        elif args.catch_up:
+            if args.staging is not None:
+                raise index_module.IndexBuildError(
+                    "--catch-up operates only on the published READY index and does not accept --staging"
+                )
+            if any(
+                value is not None
+                for value in (
+                    args.block_bytes,
+                    args.segment_target_bytes,
+                    args.batch_bytes,
+                    args.batch_lines,
+                    args.max_line_bytes,
+                    args.anchor_bytes,
+                )
+            ):
+                raise index_module.IndexBuildError(
+                    "--catch-up uses the READY index stored config and does not accept build overrides"
+                )
+            report = index_module.catch_up_index(
+                args.source,
+                args.index,
+                args.source_id,
+            )
+            payload = report.to_dict()
+            exit_code = 0
         elif args.validate or args.deep_validate:
             result = index_module.validate_index(
                 args.source,
@@ -165,4 +195,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -2,8 +2,8 @@
 
 Phase A deliberately does not integrate with ``trade_timeline_validator`` or
 any operational read/write path.  Journals remain the sole factual evidence;
-this module only builds and validates derived SQLite sidecars from explicit
-paths supplied by a caller.
+this module only builds, manually catches up, and validates derived SQLite
+sidecars from explicit paths supplied by a caller.
 """
 
 from __future__ import annotations
@@ -191,6 +191,48 @@ class BuildReport:
     max_batch_bytes: int
     max_batch_lines: int
     peak_pending_line_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CatchUpReport:
+    ok: bool
+    mode: str
+    source_id: str
+    source_path: str
+    index_path: str
+    generation_uuid: str
+    state_before: str
+    state_after: str
+    safe_watermark_before: int
+    safe_watermark_after: int
+    catchup_snapshot_eof: int
+    source_size_before: int
+    source_size_after: int
+    processed_append_bytes: int
+    verified_prefix_bytes: int
+    remaining_lag_bytes: int
+    physical_lines_processed: int
+    valid_json: int
+    invalid_json: int
+    invalid_utf8: int
+    mapping_records: int
+    new_postings: int
+    new_strong_postings: int
+    new_secondary_postings: int
+    new_identities: int
+    segments_added: int
+    committed_batches: int
+    duration_seconds: float
+    throughput_mib_per_second: float
+    peak_rss_bytes: Optional[int]
+    peak_tracemalloc_bytes: int
+    trailing_fragment_bytes: int
+    oversized_barriers: int
+    final_validation_status: str
+    final_validation_reasons: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -521,10 +563,23 @@ def _watermark_anchor_values(
     }
 
 
-def _sqlite_connect(path: Path, *, readonly: bool, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS) -> sqlite3.Connection:
+def _sqlite_connect(
+    path: Path,
+    *,
+    readonly: bool,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+    must_exist: bool = False,
+) -> sqlite3.Connection:
     if readonly:
         connection = sqlite3.connect(
             path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=max(0.001, busy_timeout_ms / 1000.0),
+            isolation_level=None,
+        )
+    elif must_exist:
+        connection = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=rw",
             uri=True,
             timeout=max(0.001, busy_timeout_ms / 1000.0),
             isolation_level=None,
@@ -903,6 +958,9 @@ def _commit_segments(
     config: BuildConfig,
     observed_eof: int,
     fault_injector: FaultInjector,
+    expected_state: Optional[str] = None,
+    expected_generation_uuid: Optional[str] = None,
+    advance_build_snapshot: bool = False,
 ) -> None:
     if not segments:
         return
@@ -927,6 +985,13 @@ def _commit_segments(
         expected_start = int(state["safe_watermark"])
         if segments[0].start_offset != expected_start:
             raise IndexBuildError("batch does not begin at the persisted safe watermark")
+        if expected_state is not None and str(state["state"]) != expected_state:
+            raise IndexBuildError("source_state changed during batch preparation")
+        if (
+            expected_generation_uuid is not None
+            and str(state["generation_uuid"]) != expected_generation_uuid
+        ):
+            raise IndexBuildError("index generation changed during batch preparation")
         for segment, segment_hash in zip(segments, segment_hashes):
             cursor = connection.execute(
                 """
@@ -989,6 +1054,12 @@ def _commit_segments(
                     ),
                 )
                 record_id = int(record_cursor.lastrowid)
+                _invoke_fault(
+                    fault_injector,
+                    "after_record_before_postings",
+                    record_id=record_id,
+                    start_offset=record.start_offset,
+                )
                 for identity in record.identities:
                     connection.execute(
                         """
@@ -1026,12 +1097,37 @@ def _commit_segments(
                         """,
                         (int(identity_row["identity_id"]), record.start_offset, record_id),
                     )
+        _invoke_fault(
+            fault_injector,
+            "before_watermark_update",
+            safe_watermark=watermark,
+            segments=len(segments),
+        )
+        snapshot_update = (
+            ", build_snapshot_eof=?, snapshot_tail_anchor=?, "
+            "snapshot_tail_anchor_offset=?, snapshot_tail_anchor_length=?, "
+            "trailing_fragment_bytes=0, trailing_fragment_kind=NULL, validated_at=?"
+            if advance_build_snapshot
+            else ""
+        )
+        snapshot_values: tuple[Any, ...] = (
+            (
+                watermark,
+                anchors["watermark_anchor"],
+                anchors["watermark_anchor_offset"],
+                anchors["watermark_anchor_length"],
+                _utc_now(),
+            )
+            if advance_build_snapshot
+            else ()
+        )
         connection.execute(
-            """
+            f"""
             UPDATE source_state SET
                 safe_watermark=?, observed_eof=?,
                 last_complete_line_offset=?, last_complete_line_number=?,
                 watermark_anchor=?, watermark_anchor_offset=?, watermark_anchor_length=?
+                {snapshot_update}
             WHERE singleton_id=1
             """,
             (
@@ -1042,6 +1138,7 @@ def _commit_segments(
                 anchors["watermark_anchor"],
                 anchors["watermark_anchor_offset"],
                 anchors["watermark_anchor_length"],
+                *snapshot_values,
             ),
         )
         _invoke_fault(
@@ -2304,6 +2401,508 @@ def build_index(
             tracemalloc.stop()
 
 
+def _catchup_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS segments,
+               COALESCE(SUM(physical_lines), 0) AS physical_lines,
+               COALESCE(SUM(valid_json_lines), 0) AS valid_json,
+               COALESCE(SUM(invalid_json_lines), 0) AS invalid_json,
+               COALESCE(SUM(invalid_utf8_lines), 0) AS invalid_utf8,
+               COALESCE(SUM(mapping_records), 0) AS mapping_records,
+               COALESCE(SUM(strong_postings), 0) AS strong_postings,
+               COALESCE(SUM(secondary_postings), 0) AS secondary_postings,
+               COALESCE(SUM(oversized_barrier_lines), 0) AS oversized_barriers
+        FROM segments
+        """
+    ).fetchone()
+    return {
+        "segments": int(row["segments"] or 0),
+        "physical_lines": int(row["physical_lines"] or 0),
+        "valid_json": int(row["valid_json"] or 0),
+        "invalid_json": int(row["invalid_json"] or 0),
+        "invalid_utf8": int(row["invalid_utf8"] or 0),
+        "mapping_records": int(row["mapping_records"] or 0),
+        "strong_postings": int(row["strong_postings"] or 0),
+        "secondary_postings": int(row["secondary_postings"] or 0),
+        "oversized_barriers": int(row["oversized_barriers"] or 0),
+        "identities": int(connection.execute("SELECT COUNT(*) FROM identities").fetchone()[0]),
+        "postings": int(connection.execute("SELECT COUNT(*) FROM postings").fetchone()[0]),
+    }
+
+
+def _catchup_prefix_proof_errors(
+    connection: sqlite3.Connection,
+    handle: BinaryIO,
+    state: sqlite3.Row,
+) -> list[str]:
+    """Hash-prove every immutable committed segment without reparsing JSON."""
+
+    errors: list[str] = []
+    quick = connection.execute("PRAGMA quick_check").fetchall()
+    if len(quick) != 1 or str(quick[0][0]).lower() != "ok":
+        return ["SQLITE_QUICK_CHECK_FAILED"]
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        return ["FOREIGN_KEY_VIOLATION"]
+    expected_start = 0
+    block_bytes = int(state["block_bytes"])
+    for segment in connection.execute(
+        "SELECT segment_id, start_offset, end_offset, segment_hash "
+        "FROM segments ORDER BY start_offset"
+    ):
+        start = int(segment["start_offset"])
+        end = int(segment["end_offset"])
+        if start != expected_start:
+            errors.append(f"SEGMENT_GAP_OR_OVERLAP:{segment['segment_id']}")
+            break
+        try:
+            actual_hash = _hash_range(
+                handle,
+                start,
+                end - start,
+                block_bytes,
+            )
+        except IndexValidationError:
+            errors.append(f"SEGMENT_SHORT_READ:{segment['segment_id']}")
+            break
+        if actual_hash != bytes(segment["segment_hash"]):
+            errors.append(f"SEGMENT_HASH_MISMATCH:{segment['segment_id']}")
+            break
+        expected_start = end
+    if expected_start != int(state["safe_watermark"]):
+        errors.append("SEGMENT_COVERAGE_BEHIND_WATERMARK")
+    return errors
+
+
+def _validate_ready_catchup_session(
+    connection: sqlite3.Connection,
+    handle: BinaryIO,
+    source: Path,
+    source_id: str,
+    path_stat: os.stat_result,
+    descriptor_stat: os.stat_result,
+) -> tuple[sqlite3.Row, BuildConfig]:
+    if not REQUIRED_TABLES.issubset(_table_names(connection)):
+        raise IndexBuildError("READY catch-up rejected: REQUIRED_TABLE_MISSING")
+    application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    state = _load_source_state(connection)
+    if application_id != SQLITE_APPLICATION_ID or user_version != SCHEMA_VERSION:
+        raise IndexBuildError("READY catch-up rejected: SQLITE_VERSION_MISMATCH")
+    if (
+        int(state["schema_version"]) != SCHEMA_VERSION
+        or str(state["index_version"]) != INDEX_VERSION
+    ):
+        raise IndexBuildError("READY catch-up rejected: INDEX_VERSION_MISMATCH")
+    if str(state["builder_version"]) != BUILDER_VERSION:
+        raise IndexBuildError("READY catch-up rejected: BUILDER_VERSION_MISMATCH")
+    if str(state["identity_contract_hash"]) != IDENTITY_CONTRACT_HASH:
+        raise IndexBuildError("READY catch-up rejected: IDENTITY_CONTRACT_MISMATCH")
+    if str(state["source_id"]) != source_id:
+        raise IndexBuildError("READY catch-up rejected: SOURCE_ID_MISMATCH")
+    if (
+        str(state["source_path"]) != _normalized_path(source)
+        or str(state["normalized_path_hash"]) != normalized_path_hash(source)
+    ):
+        raise IndexBuildError("READY catch-up rejected: SOURCE_PATH_MISMATCH")
+    if str(state["state"]) != "READY":
+        raise IndexBuildError("only READY indexes can be caught up")
+    try:
+        generation_uuid = str(uuid.UUID(str(state["generation_uuid"])))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise IndexBuildError("READY catch-up rejected: GENERATION_UUID_INVALID") from exc
+    if generation_uuid != str(state["generation_uuid"]):
+        raise IndexBuildError("READY catch-up rejected: GENERATION_UUID_INVALID")
+    if not _same_file(path_stat, descriptor_stat):
+        raise IndexBuildError("READY catch-up rejected: LSTAT_FSTAT_MISMATCH")
+    if (
+        str(int(descriptor_stat.st_dev)) != str(state["dev"])
+        or str(int(descriptor_stat.st_ino)) != str(state["inode"])
+    ):
+        raise IndexBuildError("READY catch-up rejected: SOURCE_FILE_ID_MISMATCH")
+    watermark = int(state["safe_watermark"])
+    build_snapshot_eof = int(state["build_snapshot_eof"])
+    if watermark != build_snapshot_eof:
+        raise IndexBuildError("READY catch-up rejected: READY_SNAPSHOT_WATERMARK_MISMATCH")
+    if int(descriptor_stat.st_size) < watermark:
+        raise IndexBuildError("READY catch-up rejected: SOURCE_SHRINK")
+    invariant_errors = _basic_invariant_errors(connection)
+    if invariant_errors:
+        raise IndexBuildError(
+            "READY catch-up rejected: " + ",".join(invariant_errors)
+        )
+    config = _stored_config(state)
+    try:
+        prefix_length = int(state["prefix_anchor_length"])
+        prefix_anchor = _blake128(
+            _read_exact_range(handle, 0, prefix_length) if prefix_length else b""
+        )
+        watermark_anchor = _watermark_anchor_values(
+            handle,
+            watermark,
+            config.anchor_bytes,
+        )
+        snapshot_tail = _snapshot_tail_anchor(
+            handle,
+            build_snapshot_eof,
+            config.anchor_bytes,
+        )
+    except (IndexValidationError, OSError, ValueError) as exc:
+        raise IndexBuildError("READY catch-up rejected: ANCHOR_RANGE_INVALID") from exc
+    if prefix_anchor != bytes(state["prefix_anchor"]):
+        raise IndexBuildError("READY catch-up rejected: PREFIX_ANCHOR_MISMATCH")
+    if watermark_anchor["watermark_anchor"] != bytes(state["watermark_anchor"]):
+        raise IndexBuildError("READY catch-up rejected: WATERMARK_ANCHOR_MISMATCH")
+    if (
+        snapshot_tail["snapshot_tail_anchor"] != bytes(state["snapshot_tail_anchor"])
+        or snapshot_tail["snapshot_tail_anchor_offset"]
+        != int(state["snapshot_tail_anchor_offset"])
+        or snapshot_tail["snapshot_tail_anchor_length"]
+        != int(state["snapshot_tail_anchor_length"])
+    ):
+        raise IndexBuildError("READY catch-up rejected: SNAPSHOT_TAIL_ANCHOR_MISMATCH")
+    if watermark and _read_exact_range(handle, watermark - 1, 1) != b"\n":
+        raise IndexBuildError("READY catch-up rejected: WATERMARK_NOT_NEWLINE_ALIGNED")
+    proof_errors = _catchup_prefix_proof_errors(connection, handle, state)
+    if proof_errors:
+        raise IndexBuildError(
+            "READY catch-up rejected: PREFIX_HASH_PROOF_FAILED:"
+            + ",".join(proof_errors)
+        )
+    final_descriptor = os.fstat(handle.fileno())
+    final_path_stat = _source_stat(source)
+    if not _same_file(descriptor_stat, final_descriptor) or not _same_file(
+        descriptor_stat,
+        final_path_stat,
+    ):
+        raise IndexBuildError("READY catch-up rejected: SOURCE_REPLACED_DURING_PROOF")
+    if int(final_descriptor.st_size) < int(descriptor_stat.st_size):
+        raise IndexBuildError("READY catch-up rejected: SOURCE_SHRANK_DURING_PROOF")
+    return state, config
+
+
+def _update_catchup_tail_state(
+    connection: sqlite3.Connection,
+    *,
+    expected_watermark: int,
+    expected_generation_uuid: str,
+    snapshot_eof: int,
+    trailing_fragment_bytes: int,
+    trailing_fragment_kind: Optional[str],
+    fault_injector: FaultInjector,
+) -> None:
+    _invoke_fault(
+        fault_injector,
+        "before_trailing_fragment_update",
+        safe_watermark=expected_watermark,
+        trailing_fragment_bytes=trailing_fragment_bytes,
+    )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        state = _load_source_state(connection)
+        if (
+            str(state["state"]) != "READY"
+            or str(state["generation_uuid"]) != expected_generation_uuid
+            or int(state["safe_watermark"]) != expected_watermark
+        ):
+            raise IndexBuildError("source_state changed before trailing fragment update")
+        if snapshot_eof < int(state["observed_eof"]):
+            raise IndexBuildError("catch-up snapshot is older than persisted observation")
+        connection.execute(
+            """
+            UPDATE source_state SET observed_eof=?, trailing_fragment_bytes=?,
+                trailing_fragment_kind=?, validated_at=?
+            WHERE singleton_id=1
+            """,
+            (
+                snapshot_eof,
+                trailing_fragment_bytes,
+                trailing_fragment_kind,
+                _utc_now(),
+            ),
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+    _invoke_fault(
+        fault_injector,
+        "after_trailing_fragment_commit",
+        safe_watermark=expected_watermark,
+        trailing_fragment_bytes=trailing_fragment_bytes,
+    )
+
+
+def catch_up_index(
+    source_path: Path | str,
+    index_path: Path | str,
+    source_id: str,
+    *,
+    fault_injector: FaultInjector = None,
+    measure_memory: bool = True,
+) -> CatchUpReport:
+    """Advance one published READY index over one fixed append-only snapshot.
+
+    Every immutable committed segment is hash-verified before the first write.
+    Each committed batch appends new contiguous segments and advances all
+    coverage metadata atomically.
+    """
+
+    source = Path(source_path)
+    index = Path(index_path)
+    identity = _validate_source_id(source_id)
+    if _normalized_path(source) == _normalized_path(index):
+        raise ValueError("source and index paths must differ")
+    if not index.exists():
+        raise IndexBuildError("READY catch-up requires an existing index")
+    index_stat = index.lstat()
+    if stat.S_ISLNK(index_stat.st_mode) or not stat.S_ISREG(index_stat.st_mode):
+        raise IndexBuildError("READY catch-up index must be a regular non-symlink file")
+    for sidecar in _database_sidecars(index)[:2]:
+        if sidecar.exists():
+            raise IndexBuildError(
+                f"READY catch-up refuses SQLite WAL sidecar: {sidecar}"
+            )
+
+    started = time.perf_counter()
+    started_tracemalloc = bool(measure_memory and not tracemalloc.is_tracing())
+    if started_tracemalloc:
+        tracemalloc.start()
+    connection: Optional[sqlite3.Connection] = None
+    try:
+        path_stat = _source_stat(source)
+        with source.open("rb") as handle:
+            descriptor_stat = os.fstat(handle.fileno())
+            if not _same_file(path_stat, descriptor_stat):
+                raise IndexBuildError("source changed between lstat and catch-up open")
+            source_size_before = int(descriptor_stat.st_size)
+            catchup_snapshot_eof = source_size_before
+            _invoke_fault(
+                fault_injector,
+                "after_catchup_snapshot",
+                catchup_snapshot_eof=catchup_snapshot_eof,
+            )
+            connection = _sqlite_connect(
+                index,
+                readonly=False,
+                must_exist=True,
+            )
+            state, selected_config = _validate_ready_catchup_session(
+                connection,
+                handle,
+                source,
+                identity,
+                path_stat,
+                descriptor_stat,
+            )
+            generation_uuid = str(state["generation_uuid"])
+            state_before = str(state["state"])
+            watermark_before = int(state["safe_watermark"])
+            if catchup_snapshot_eof < watermark_before:
+                raise IndexBuildError("READY catch-up rejected: SOURCE_SHRINK")
+            before_counts = _catchup_counts(connection)
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("PRAGMA synchronous=FULL")
+
+            committed_batches = 0
+            pending_segments: list[_PendingSegment] = []
+            current_segment: Optional[_PendingSegment] = None
+            batch_bytes_seen = 0
+            batch_lines_seen = 0
+            terminal_fragment: Optional[_PhysicalLine] = None
+            terminal_classification: Optional[Mapping[str, Any]] = None
+
+            def assert_source_generation() -> os.stat_result:
+                current_descriptor = os.fstat(handle.fileno())
+                current_path = _source_stat(source)
+                if not _same_file(descriptor_stat, current_descriptor) or not _same_file(
+                    descriptor_stat,
+                    current_path,
+                ):
+                    raise IndexBuildError("source changed generation during READY catch-up")
+                if int(current_descriptor.st_size) < catchup_snapshot_eof:
+                    raise IndexBuildError("source shrank below the catch-up snapshot")
+                return current_descriptor
+
+            def finalize_segment() -> None:
+                nonlocal current_segment
+                if current_segment is not None and current_segment.physical_lines:
+                    pending_segments.append(current_segment)
+                current_segment = None
+
+            def commit_batch() -> None:
+                nonlocal pending_segments, batch_bytes_seen, batch_lines_seen
+                nonlocal committed_batches
+                if not pending_segments:
+                    return
+                assert_source_generation()
+                _commit_segments(
+                    connection,
+                    handle,
+                    pending_segments,
+                    config=selected_config,
+                    observed_eof=catchup_snapshot_eof,
+                    fault_injector=fault_injector,
+                    expected_state="READY",
+                    expected_generation_uuid=generation_uuid,
+                    advance_build_snapshot=True,
+                )
+                committed_batches += 1
+                pending_segments = []
+                batch_bytes_seen = 0
+                batch_lines_seen = 0
+
+            for line in _iter_physical_lines(
+                handle,
+                start_offset=watermark_before,
+                end_offset=catchup_snapshot_eof,
+                first_line_number=int(state["last_complete_line_number"]) + 1,
+                block_bytes=selected_config.block_bytes,
+                max_line_bytes=selected_config.max_line_bytes,
+            ):
+                classification = _classify_line(line)
+                if not line.terminated:
+                    terminal_fragment = line
+                    terminal_classification = (
+                        classification if line.raw is not None else None
+                    )
+                    break
+                if current_segment is None:
+                    current_segment = _PendingSegment(
+                        start_offset=line.start_offset,
+                        first_line_number=line.line_number,
+                    )
+                current_segment.add_line(line, classification)
+                batch_bytes_seen += line.byte_length
+                batch_lines_seen += 1
+                if (
+                    current_segment.byte_length >= selected_config.segment_target_bytes
+                    or batch_bytes_seen >= selected_config.batch_bytes
+                    or batch_lines_seen >= selected_config.batch_lines
+                ):
+                    finalize_segment()
+                if (
+                    batch_bytes_seen >= selected_config.batch_bytes
+                    or batch_lines_seen >= selected_config.batch_lines
+                ):
+                    finalize_segment()
+                    commit_batch()
+
+            finalize_segment()
+            commit_batch()
+            assert_source_generation()
+            current_state = _load_source_state(connection)
+            watermark_after = int(current_state["safe_watermark"])
+            trailing_fragment_bytes = catchup_snapshot_eof - watermark_after
+            if terminal_fragment is not None:
+                if terminal_fragment.start_offset != watermark_after:
+                    raise IndexBuildError("terminal fragment does not begin at safe watermark")
+                _update_catchup_tail_state(
+                    connection,
+                    expected_watermark=watermark_after,
+                    expected_generation_uuid=generation_uuid,
+                    snapshot_eof=catchup_snapshot_eof,
+                    trailing_fragment_bytes=trailing_fragment_bytes,
+                    trailing_fragment_kind=(
+                        _tail_kind(terminal_fragment, terminal_classification)
+                        if terminal_classification is not None
+                        else "OVERSIZED"
+                    ),
+                    fault_injector=fault_injector,
+                )
+            elif catchup_snapshot_eof > watermark_before and watermark_after != catchup_snapshot_eof:
+                raise IndexBuildError("catch-up ended before its complete-line snapshot boundary")
+
+            final_descriptor = assert_source_generation()
+            source_size_after = int(final_descriptor.st_size)
+            after_state = _load_source_state(connection)
+            after_counts = _catchup_counts(connection)
+            state_after = str(after_state["state"])
+            watermark_after = int(after_state["safe_watermark"])
+            if (
+                state_after != "READY"
+                or str(after_state["generation_uuid"]) != generation_uuid
+                or int(after_state["build_snapshot_eof"]) != watermark_after
+            ):
+                raise IndexBuildError("READY catch-up left inconsistent source_state")
+
+        connection.close()
+        connection = None
+        _invoke_fault(
+            fault_injector,
+            "before_catchup_final_validation",
+            safe_watermark=watermark_after,
+            catchup_snapshot_eof=catchup_snapshot_eof,
+        )
+        final_validation = validate_index(source, index, identity, deep=False)
+        if (
+            final_validation.status
+            not in {INDEX_COMPLETE_FOR_SNAPSHOT, INDEX_PARTIAL}
+            or final_validation.state != "READY"
+            or final_validation.safe_watermark != watermark_after
+        ):
+            raise IndexBuildError(
+                "READY catch-up final validation failed: "
+                f"{final_validation.status}: {final_validation.reasons}"
+            )
+        duration = max(time.perf_counter() - started, 1e-9)
+        processed_append_bytes = watermark_after - watermark_before
+        peak = (
+            tracemalloc.get_traced_memory()[1]
+            if measure_memory and tracemalloc.is_tracing()
+            else 0
+        )
+        delta = {
+            key: after_counts[key] - before_counts[key]
+            for key in before_counts
+        }
+        return CatchUpReport(
+            ok=True,
+            mode="NO_OP" if catchup_snapshot_eof == watermark_before else "CATCH_UP",
+            source_id=identity,
+            source_path=_normalized_path(source),
+            index_path=_normalized_path(index),
+            generation_uuid=generation_uuid,
+            state_before=state_before,
+            state_after=state_after,
+            safe_watermark_before=watermark_before,
+            safe_watermark_after=watermark_after,
+            catchup_snapshot_eof=catchup_snapshot_eof,
+            source_size_before=source_size_before,
+            source_size_after=source_size_after,
+            processed_append_bytes=processed_append_bytes,
+            verified_prefix_bytes=watermark_before,
+            remaining_lag_bytes=max(0, source_size_after - watermark_after),
+            physical_lines_processed=delta["physical_lines"],
+            valid_json=delta["valid_json"],
+            invalid_json=delta["invalid_json"],
+            invalid_utf8=delta["invalid_utf8"],
+            mapping_records=delta["mapping_records"],
+            new_postings=delta["postings"],
+            new_strong_postings=delta["strong_postings"],
+            new_secondary_postings=delta["secondary_postings"],
+            new_identities=delta["identities"],
+            segments_added=delta["segments"],
+            committed_batches=committed_batches,
+            duration_seconds=round(duration, 6),
+            throughput_mib_per_second=round(
+                (processed_append_bytes / (1024 * 1024)) / duration,
+                6,
+            ),
+            peak_rss_bytes=_max_rss_bytes(),
+            peak_tracemalloc_bytes=peak,
+            trailing_fragment_bytes=trailing_fragment_bytes,
+            oversized_barriers=delta["oversized_barriers"],
+            final_validation_status=final_validation.status,
+            final_validation_reasons=final_validation.reasons,
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+        if started_tracemalloc and tracemalloc.is_tracing():
+            tracemalloc.stop()
+
+
 def _identity_for_lookup(identity_type: Any, identity_value: Any) -> tuple[str, str]:
     canonical_type = canonical_identity_key(identity_type)
     value = str(identity_value).strip() if identity_value is not None else ""
@@ -2691,6 +3290,7 @@ __all__ = (
     "BUILDER_VERSION",
     "BuildConfig",
     "BuildReport",
+    "CatchUpReport",
     "DEFAULT_ANCHOR_BYTES",
     "DEFAULT_BATCH_BYTES",
     "DEFAULT_BATCH_LINES",
@@ -2712,6 +3312,7 @@ __all__ = (
     "ShadowVerificationResult",
     "ValidationResult",
     "build_index",
+    "catch_up_index",
     "find_staging_indexes",
     "lookup_offsets",
     "lookup_records",
