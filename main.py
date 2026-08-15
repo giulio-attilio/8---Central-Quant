@@ -33406,6 +33406,19 @@ def start_central_runtime_once():
             "start_central_runtime_once",
         )
 
+    try:
+        from trade_evidence_identity_offset_maintenance_v1 import (
+            start_auto_maintenance,
+        )
+
+        start_auto_maintenance(data_dir=CENTRAL_DATA_DIR)
+    except Exception as exc:
+        # A manutenção do sidecar é estritamente fail-open para a Central.
+        print(
+            "TRADE EVIDENCE INDEX AUTO MAINTENANCE NÃO INICIADA: "
+            + type(exc).__name__
+        )
+
     start_central_command_routers()
 
 
@@ -59385,6 +59398,103 @@ def trade_evidence_index_shadow_status_v1_route():
             or not error_type.isidentifier()
             or len(error_type) > 80
         ):
+            error_type = "Exception"
+        return {
+            "ok": False,
+            "module": module_name,
+            "status": "UNAVAILABLE",
+            "error_type": error_type,
+        }, 503
+
+
+# ============================================================================
+# TRADE EVIDENCE INDEX AUTO MAINTENANCE V1 — READ-ONLY HTTP SURFACE
+# ============================================================================
+@app.route("/tradeevidenceindex/maintenance/status", methods=["GET"])
+def trade_evidence_index_maintenance_status_v1_route():
+    """Expose bounded process-local maintenance state without running a tick."""
+    module_name = "trade_evidence_identity_offset_maintenance_v1"
+    top_fields = (
+        "version",
+        "enabled",
+        "thread_started",
+        "last_check_at",
+        "last_run_at",
+        "last_success_at",
+        "last_error_type",
+        "last_status",
+        "interval_seconds",
+        "min_lag_bytes",
+        "max_lag_bytes",
+        "min_seconds_between_runs",
+        "startup_grace_seconds",
+    )
+    source_fields = (
+        "last_status",
+        "last_check_at",
+        "last_run_at",
+        "last_success_at",
+        "last_error_type",
+        "source_size",
+        "safe_watermark_before",
+        "safe_watermark_after",
+        "lag_before",
+        "lag_after",
+        "lag_above_max",
+        "processed_append_bytes",
+        "duration_seconds",
+        "verified_prefix_bytes",
+        "generation_uuid_masked",
+        "last_validation_status",
+        "run_count",
+        "success_count",
+        "failure_count",
+        "skip_small_lag_count",
+        "lock_busy_count",
+    )
+    try:
+        from trade_evidence_identity_offset_maintenance_v1 import (
+            get_maintenance_telemetry_snapshot,
+        )
+
+        snapshot = get_maintenance_telemetry_snapshot()
+        if not isinstance(snapshot, dict):
+            raise TypeError("invalid maintenance telemetry snapshot")
+        raw_sources = snapshot.get("sources")
+        if not isinstance(raw_sources, dict):
+            raise TypeError("invalid maintenance telemetry sources")
+        maintenance = {
+            field: snapshot.get(field)
+            for field in top_fields
+        }
+        maintenance["sources"] = {}
+        for source_name in ("history_manager", "timeline"):
+            raw_source = raw_sources.get(source_name)
+            if not isinstance(raw_source, dict):
+                raise TypeError("invalid maintenance telemetry source")
+            projected = {
+                field: raw_source.get(field)
+                for field in source_fields
+            }
+            masked_generation = projected.get("generation_uuid_masked")
+            if masked_generation is not None and (
+                not isinstance(masked_generation, str)
+                or len(masked_generation) != 12
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in masked_generation.lower()
+                )
+            ):
+                projected["generation_uuid_masked"] = None
+            maintenance["sources"][source_name] = projected
+        return {
+            "ok": True,
+            "module": module_name,
+            "maintenance": maintenance,
+        }, 200
+    except Exception as exc:
+        error_type = type(exc).__name__
+        if not error_type.isidentifier() or len(error_type) > 80:
             error_type = "Exception"
         return {
             "ok": False,
