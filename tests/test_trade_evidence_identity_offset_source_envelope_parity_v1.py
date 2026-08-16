@@ -15,7 +15,9 @@ import trade_timeline_validator as validator
 from trade_evidence_identity_offset_shadow_compare_v1 import compare_source_semantics
 from trade_evidence_identity_offset_source_envelope_v1 import (
     BUILT,
+    COMPLETENESS_FULL_CERTIFIED,
     INDEX_PLUS_TAIL,
+    NEGATIVE_CERTIFIED,
     NEGATIVE_UNSAFE,
     plan_and_build_indexed_source_envelope,
 )
@@ -575,7 +577,7 @@ def test_terminal_line_without_lf_uses_certified_prefix_plus_tail_with_parity(
 @pytest.mark.parametrize(
     ("record_budget", "negative_status", "coverage_complete"),
     [
-        (DEFAULT_RECORD_BUDGET, NEGATIVE_UNSAFE, True),
+        (DEFAULT_RECORD_BUDGET, NEGATIVE_CERTIFIED, True),
         (1, NEGATIVE_UNSAFE, False),
     ],
 )
@@ -615,6 +617,7 @@ def test_zero_evidence_certified_and_unsafe_have_exact_legacy_envelopes(
     assert result.correlated_rows == ()
     assert plan.coverage_complete is coverage_complete
     assert result.negative_status == negative_status
+    assert result.completeness_status == COMPLETENESS_FULL_CERTIFIED
 
 
 def test_zero_mapping_page_is_negative_certified_and_legacy_exact(
@@ -638,7 +641,8 @@ def test_zero_mapping_page_is_negative_certified_and_legacy_exact(
     assert result.correlated_rows == ()
     assert plan.mapping_records == 0
     assert result.metrics.record_count == 0
-    assert result.negative_status == NEGATIVE_UNSAFE
+    assert result.negative_status == NEGATIVE_CERTIFIED
+    assert result.completeness_status == COMPLETENESS_FULL_CERTIFIED
 
 
 def test_history_then_timeline_parity_and_intermediate_context_promotion(

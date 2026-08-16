@@ -1,9 +1,10 @@
 """Shadow-only persistent offset index for trade evidence JSONL journals.
 
-Phase A deliberately does not integrate with ``trade_timeline_validator`` or
-any operational read/write path.  Journals remain the sole factual evidence;
-this module only builds, manually catches up, and validates derived SQLite
-sidecars from explicit paths supplied by a caller.
+The default API remains Phase A/V1.  Explicit V2 APIs add offline physical and
+serving-completeness certification without integrating with
+``trade_timeline_validator`` or any operational read/write path.  Journals
+remain the sole factual evidence; this module only builds, manually catches up,
+and validates derived SQLite sidecars from explicit paths supplied by a caller.
 """
 
 from __future__ import annotations
@@ -46,11 +47,11 @@ SCHEMA_VERSION_V2 = 2
 SCHEMA_VERSION = SCHEMA_VERSION_V1
 
 INDEX_VERSION_V1 = "2026-08-14-TRADE-EVIDENCE-IDENTITY-OFFSET-INDEX-V1"
-INDEX_VERSION_V2 = INDEX_VERSION_V1 + "-PHASE-C0-SCHEMA-V2"
+INDEX_VERSION_V2 = INDEX_VERSION_V1 + "-PHASE-C2-COMPLETENESS-V2"
 INDEX_VERSION = INDEX_VERSION_V1
 
 BUILDER_VERSION_V1 = INDEX_VERSION_V1 + "-PHASE-A-SHADOW-BUILD"
-BUILDER_VERSION_V2 = INDEX_VERSION_V2 + "-PHYSICAL-CERTIFICATION-BUILD"
+BUILDER_VERSION_V2 = INDEX_VERSION_V2 + "-FULL-CERTIFICATION-BUILD"
 BUILDER_VERSION = BUILDER_VERSION_V1
 
 CERTIFICATION_UNCERTIFIED = "UNCERTIFIED"
@@ -65,6 +66,19 @@ CERTIFICATION_KINDS = frozenset(
         CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
     }
 )
+
+CERTIFICATION_STATE_NONE = "NONE"
+CERTIFICATION_STATE_PHYSICAL = "PHYSICAL"
+CERTIFICATION_STATE_SERVING = "SERVING"
+CERTIFICATION_STATE_FULL = "FULL"
+
+SERVING_COMPLETENESS_CONTRACT_VERSION = "1"
+SERVING_COMPLETENESS_HASH_DOMAIN = (
+    "CENTRAL_QUANT_TRADE_EVIDENCE_SERVING_COMPLETENESS_V1"
+)
+# C2 verification is request-path work.  Keep its streaming batch within the
+# C1 SQLite fetch ceiling instead of silently widening the memory envelope.
+SERVING_COMPLETENESS_FETCH_BATCH = 256
 
 SOURCE_IDS = frozenset({"history_manager", "timeline"})
 SOURCE_STATES = frozenset({"BUILDING", "READY", "REVALIDATING", "STALE", "CORRUPT"})
@@ -212,9 +226,19 @@ class CertificationMetadata:
     certified_source_size: Optional[int]
     certified_source_mtime_ns: Optional[int]
     certified_source_ctime_ns: Optional[int]
+    serving_contract_version: Optional[str] = None
+    serving_certified_watermark: int = 0
+    serving_completeness_hash: Optional[str] = None
+    serving_completeness_verified: bool = False
+    serving_certification_kind: str = CERTIFICATION_UNCERTIFIED
+    serving_certified_at: Optional[str] = None
+    serving_record_count: int = 0
+    serving_identity_count: int = 0
+    serving_posting_count: int = 0
+    lifecycle_state: Optional[str] = None
 
     @property
-    def certified(self) -> bool:
+    def physical_certified(self) -> bool:
         return bool(
             self.schema_version == SCHEMA_VERSION_V2
             and self.index_version == INDEX_VERSION_V2
@@ -233,8 +257,72 @@ class CertificationMetadata:
             and self.certified_watermark <= self.safe_watermark
         )
 
+    @property
+    def serving_certified(self) -> bool:
+        return bool(
+            self.schema_version == SCHEMA_VERSION_V2
+            and self.index_version == INDEX_VERSION_V2
+            and self.serving_contract_version
+            == SERVING_COMPLETENESS_CONTRACT_VERSION
+            and self.serving_completeness_hash is not None
+            and len(self.serving_completeness_hash) == HASH_BYTES * 2
+            and self.serving_completeness_verified
+            and self.serving_certification_kind
+            in {
+                CERTIFICATION_DEEP_BASELINE,
+                CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+            }
+            and self.serving_certified_at is not None
+            and 0 <= self.serving_certified_watermark <= self.safe_watermark
+            and self.serving_record_count >= 0
+            and self.serving_identity_count >= 0
+            and self.serving_posting_count >= 0
+            and self.lifecycle_state == "READY"
+        )
+
+    @property
+    def full_certified(self) -> bool:
+        return bool(
+            self.physical_certified
+            and self.serving_certified
+            and self.certified_watermark == self.serving_certified_watermark
+            and self.certification_kind == self.serving_certification_kind
+        )
+
+    @property
+    def certification_state(self) -> str:
+        if self.full_certified:
+            return CERTIFICATION_STATE_FULL
+        if self.physical_certified:
+            return CERTIFICATION_STATE_PHYSICAL
+        if self.serving_certified:
+            return CERTIFICATION_STATE_SERVING
+        return CERTIFICATION_STATE_NONE
+
+    @property
+    def certified(self) -> bool:
+        """Backwards-compatible alias for the original physical certificate."""
+
+        return self.physical_certified
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ServingCompletenessSeal:
+    contract_version: str
+    watermark: int
+    digest: bytes
+    record_count: int
+    identity_count: int
+    posting_count: int
+    schema_object_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["digest"] = self.digest.hex()
+        return value
 
 
 @dataclass(frozen=True)
@@ -612,6 +700,7 @@ SCHEMA_SQL_V2 = SCHEMA_SQL_V1.replace(
     physical_contract_version TEXT NOT NULL,
     cursor_contract_version TEXT NOT NULL,
     summary_contract_version TEXT NOT NULL,
+    serving_contract_version TEXT NOT NULL,
 """,
     1,
 ).replace(
@@ -632,6 +721,22 @@ SCHEMA_SQL_V2 = SCHEMA_SQL_V1.replace(
     certified_source_size INTEGER CHECK (certified_source_size >= 0),
     certified_source_mtime_ns INTEGER,
     certified_source_ctime_ns INTEGER,
+    serving_certified_watermark INTEGER NOT NULL DEFAULT 0
+        CHECK (serving_certified_watermark >= 0
+               AND serving_certified_watermark <= safe_watermark),
+    serving_completeness_hash BLOB NOT NULL
+        CHECK (length(serving_completeness_hash) = 16),
+    serving_certification_kind TEXT NOT NULL DEFAULT 'UNCERTIFIED'
+        CHECK (serving_certification_kind IN (
+            'UNCERTIFIED', 'DEEP_BASELINE', 'DEEP_BASELINE_PLUS_PROVEN_APPEND'
+        )),
+    serving_certified_at TEXT,
+    serving_record_count INTEGER NOT NULL DEFAULT 0
+        CHECK (serving_record_count >= 0),
+    serving_identity_count INTEGER NOT NULL DEFAULT 0
+        CHECK (serving_identity_count >= 0),
+    serving_posting_count INTEGER NOT NULL DEFAULT 0
+        CHECK (serving_posting_count >= 0),
 """,
     1,
 ).replace(
@@ -660,6 +765,17 @@ SCHEMA_SQL_V2 = SCHEMA_SQL_V1.replace(
          AND certified_source_mtime_ns IS NOT NULL
          AND certified_source_ctime_ns IS NOT NULL
          AND certified_watermark <= certified_source_size)
+    ),
+    CHECK (
+        (serving_certification_kind = 'UNCERTIFIED'
+         AND serving_certified_watermark = 0
+         AND serving_certified_at IS NULL
+         AND serving_record_count = 0
+         AND serving_identity_count = 0
+         AND serving_posting_count = 0)
+        OR
+        (serving_certification_kind != 'UNCERTIFIED'
+         AND serving_certified_at IS NOT NULL)
     ),
 """,
     1,
@@ -693,6 +809,39 @@ CERTIFIED_SEGMENT_SUMMARY_FIELDS = (
     "segment_hash",
 )
 CERTIFIED_SUMMARY_HASH_DOMAIN = "CENTRAL_QUANT_CERTIFIED_SEGMENT_SUMMARIES_V1"
+
+SERVING_SCHEMA_OBJECTS = (
+    ("index", "postings_record_idx"),
+    ("index", "records_segment_offset_idx"),
+    ("table", "identities"),
+    ("table", "postings"),
+    ("table", "records"),
+)
+SERVING_RECORD_FIELDS = (
+    "record_id",
+    "segment_id",
+    "line_number",
+    "start_offset",
+    "byte_length",
+    "terminator_length",
+    "event_type",
+    "event_epoch",
+    "event_timestamp",
+    "writer_version",
+    "record_hash",
+)
+SERVING_IDENTITY_FIELDS = (
+    "identity_id",
+    "identity_type",
+    "identity_value",
+    "identity_group",
+    "identity_class",
+)
+SERVING_POSTING_FIELDS = (
+    "identity_id",
+    "start_offset",
+    "record_id",
+)
 
 REQUIRED_TABLES = frozenset({"source_state", "segments", "records", "identities", "postings"})
 
@@ -889,15 +1038,20 @@ def _initialize_database(
         certification_columns = (
             "physical_contract_hash, physical_contract_version, "
             "cursor_contract_version, summary_contract_version, "
+            "serving_contract_version, "
             "certified_watermark, certified_anchor, certified_anchor_offset, "
             "certified_anchor_length, certified_summary_hash, certification_kind, "
+            "serving_certified_watermark, serving_completeness_hash, "
+            "serving_certification_kind, "
             if index_format.certified
             else ""
         )
         certification_values = (
             ":physical_contract_hash, :physical_contract_version, "
             ":cursor_contract_version, :summary_contract_version, "
+            ":serving_contract_version, "
             "0, :empty_anchor, 0, 0, :empty_anchor, :uncertified_kind, "
+            "0, :empty_anchor, :uncertified_kind, "
             if index_format.certified
             else ""
         )
@@ -937,6 +1091,7 @@ def _initialize_database(
                 "physical_contract_version": PHYSICAL_CONTRACT_VERSION,
                 "cursor_contract_version": str(CURSOR_CONTRACT_VERSION),
                 "summary_contract_version": str(SUMMARY_CONTRACT_VERSION),
+                "serving_contract_version": SERVING_COMPLETENESS_CONTRACT_VERSION,
                 "uncertified_kind": CERTIFICATION_UNCERTIFIED,
                 "source_id": source_id,
                 "source_path": _normalized_path(source),
@@ -1004,6 +1159,17 @@ def read_index_certification(index_path: Path | str) -> CertificationMetadata:
             )
         if schema_version != SCHEMA_VERSION_V2:
             raise IndexValidationError("unsupported index schema version")
+        state_columns = set(state.keys())
+        has_serving_certificate = {
+            "serving_contract_version",
+            "serving_certified_watermark",
+            "serving_completeness_hash",
+            "serving_certification_kind",
+            "serving_certified_at",
+            "serving_record_count",
+            "serving_identity_count",
+            "serving_posting_count",
+        }.issubset(state_columns)
         return CertificationMetadata(
             schema_version=schema_version,
             index_version=str(state["index_version"]),
@@ -1036,6 +1202,53 @@ def read_index_certification(index_path: Path | str) -> CertificationMetadata:
                 if state["certified_source_ctime_ns"] is not None
                 else None
             ),
+            serving_contract_version=(
+                str(state["serving_contract_version"])
+                if has_serving_certificate
+                else None
+            ),
+            serving_certified_watermark=(
+                int(state["serving_certified_watermark"])
+                if has_serving_certificate
+                else 0
+            ),
+            serving_completeness_hash=(
+                bytes(state["serving_completeness_hash"]).hex()
+                if has_serving_certificate
+                else None
+            ),
+            serving_completeness_verified=(
+                verify_serving_completeness_seal(connection)
+                if has_serving_certificate
+                else False
+            ),
+            serving_certification_kind=(
+                str(state["serving_certification_kind"])
+                if has_serving_certificate
+                else CERTIFICATION_UNCERTIFIED
+            ),
+            serving_certified_at=(
+                str(state["serving_certified_at"])
+                if has_serving_certificate
+                and state["serving_certified_at"] is not None
+                else None
+            ),
+            serving_record_count=(
+                int(state["serving_record_count"])
+                if has_serving_certificate
+                else 0
+            ),
+            serving_identity_count=(
+                int(state["serving_identity_count"])
+                if has_serving_certificate
+                else 0
+            ),
+            serving_posting_count=(
+                int(state["serving_posting_count"])
+                if has_serving_certificate
+                else 0
+            ),
+            lifecycle_state=str(state["state"]),
         )
     finally:
         connection.close()
@@ -1128,6 +1341,359 @@ def verify_certified_summary_hash(connection: sqlite3.Connection) -> bool:
         )
         return hmac.compare_digest(stored, calculated)
     except (IndexValidationError, sqlite3.DatabaseError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _serving_sql_value(value: Any) -> list[str]:
+    """Return a typed, deterministic JSON-safe representation of one SQL value."""
+
+    if value is None:
+        return ["NULL", ""]
+    if isinstance(value, bytes):
+        return ["BLOB", value.hex()]
+    if isinstance(value, bool):
+        return ["INTEGER", "1" if value else "0"]
+    if isinstance(value, int):
+        return ["INTEGER", str(value)]
+    if isinstance(value, float):
+        return ["REAL", value.hex()]
+    if isinstance(value, str):
+        return ["TEXT", value]
+    raise IndexValidationError(
+        f"unsupported SQLite value in serving completeness seal: {type(value).__name__}"
+    )
+
+
+def _add_serving_seal_frame(
+    digest: Any,
+    frame_type: str,
+    value: Any,
+) -> None:
+    payload = json.dumps(
+        {"frame": str(frame_type), "value": value},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8", errors="surrogatepass")
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _stream_serving_rows(
+    connection: sqlite3.Connection,
+    digest: Any,
+    frame_type: str,
+    sql: str,
+    parameters: Sequence[Any] = (),
+) -> int:
+    cursor = connection.execute(sql, tuple(parameters))
+    count = 0
+    try:
+        while True:
+            rows = cursor.fetchmany(SERVING_COMPLETENESS_FETCH_BATCH)
+            if not rows:
+                break
+            for row in rows:
+                _add_serving_seal_frame(
+                    digest,
+                    frame_type,
+                    [_serving_sql_value(value) for value in tuple(row)],
+                )
+                count += 1
+    finally:
+        cursor.close()
+    return count
+
+
+def calculate_serving_completeness_seal(
+    connection: sqlite3.Connection,
+    certified_watermark: int,
+) -> ServingCompletenessSeal:
+    """Stream a deterministic V2 seal over every serving-side table row.
+
+    Every record and posting must be covered by ``certified_watermark``.
+    Identities are sealed even when orphaned.  Thus rows outside the certified
+    domain cannot be hidden merely by adding a WHERE-filtered suffix.
+    """
+
+    return _calculate_serving_completeness_seal(
+        connection,
+        certified_watermark,
+        physical_prefix=False,
+    )
+
+
+def _calculate_serving_prefix_completeness_seal(
+    connection: sqlite3.Connection,
+    certified_watermark: int,
+) -> ServingCompletenessSeal:
+    """Reconstruct the exact serving seal that existed at a prior watermark.
+
+    A certified snapshot cannot contain records/postings at or beyond its
+    watermark and cannot contain orphan identities.  Therefore the original
+    full-table seal can be reconstructed after a crash by selecting physical
+    prefix records/postings and the identities referenced by those postings.
+    Unlike transient MAX(id) bounds, this proof survives process restart and
+    rejects any mutation to the previously certified prefix.
+    """
+
+    return _calculate_serving_completeness_seal(
+        connection,
+        certified_watermark,
+        physical_prefix=True,
+    )
+
+
+def _calculate_serving_completeness_seal(
+    connection: sqlite3.Connection,
+    certified_watermark: int,
+    *,
+    physical_prefix: bool = False,
+) -> ServingCompletenessSeal:
+    """Calculate a FULL seal or an internal physical-prefix witness."""
+
+    watermark = int(certified_watermark)
+    if watermark < 0:
+        raise IndexValidationError("serving certified watermark must be non-negative")
+    state = connection.execute(
+        """
+        SELECT schema_version, index_version, builder_version, generation_uuid,
+               identity_contract_hash, physical_contract_hash,
+               physical_contract_version, cursor_contract_version,
+               summary_contract_version, serving_contract_version,
+               source_id, normalized_path_hash, dev, inode, safe_watermark
+        FROM source_state WHERE singleton_id=1
+        """
+    ).fetchone()
+    if state is None:
+        raise IndexValidationError("source_state singleton is missing")
+    if int(state[0]) != SCHEMA_VERSION_V2:
+        raise IndexValidationError("serving completeness seal requires schema V2")
+    if watermark > int(state[14]):
+        raise IndexValidationError("serving watermark exceeds safe watermark")
+
+    digest = hashlib.blake2b(digest_size=HASH_BYTES)
+    _add_serving_seal_frame(
+        digest,
+        "HEADER",
+        {
+            "domain": SERVING_COMPLETENESS_HASH_DOMAIN,
+            "algorithm": f"BLAKE2B-{HASH_BYTES * 8}",
+            "contract_version": SERVING_COMPLETENESS_CONTRACT_VERSION,
+            "schema_version": int(state[0]),
+            "index_version": str(state[1]),
+            "builder_version": str(state[2]),
+            "generation_uuid": str(state[3]),
+            "identity_contract_hash": str(state[4]),
+            "physical_contract_hash": str(state[5]),
+            "physical_contract_version": str(state[6]),
+            "cursor_contract_version": str(state[7]),
+            "summary_contract_version": str(state[8]),
+            "serving_contract_version": str(state[9]),
+            "source_id": str(state[10]),
+            "normalized_path_hash": str(state[11]),
+            "dev": str(state[12]),
+            "inode": str(state[13]),
+            "watermark": watermark,
+        },
+    )
+
+    schema_rows = connection.execute(
+        """
+        SELECT type, name, tbl_name, COALESCE(sql, '')
+        FROM sqlite_master
+        WHERE (type='table' AND name IN ('records', 'identities', 'postings'))
+           OR (type='index' AND name IN (
+               'records_segment_offset_idx', 'postings_record_idx'
+           ))
+        ORDER BY type, name
+        """
+    ).fetchall()
+    actual_schema_objects = tuple((str(row[0]), str(row[1])) for row in schema_rows)
+    if actual_schema_objects != SERVING_SCHEMA_OBJECTS:
+        raise IndexValidationError("serving schema objects do not match the V2 contract")
+    for row in schema_rows:
+        _add_serving_seal_frame(
+            digest,
+            "SCHEMA",
+            [_serving_sql_value(value) for value in tuple(row)],
+        )
+
+    if physical_prefix:
+        record_scope = "start_offset < ?"
+        record_parameters = (watermark,)
+        identity_scope = (
+            "EXISTS (SELECT 1 FROM postings prefix_posting "
+            "WHERE prefix_posting.identity_id=identities.identity_id "
+            "AND prefix_posting.start_offset < ?)"
+        )
+        identity_parameters = (watermark,)
+        posting_scope = "start_offset < ?"
+        posting_parameters = (watermark,)
+    else:
+        record_scope = "1=1"
+        record_parameters: tuple[Any, ...] = ()
+        identity_scope = "1=1"
+        identity_parameters: tuple[Any, ...] = ()
+        posting_scope = "1=1"
+        posting_parameters: tuple[Any, ...] = ()
+
+    bad_record = connection.execute(
+        f"SELECT 1 FROM records WHERE {record_scope} "
+        "AND (start_offset >= ? OR start_offset + byte_length > ?) LIMIT 1",
+        (*record_parameters, watermark, watermark),
+    ).fetchone()
+    if bad_record is not None:
+        raise IndexValidationError(
+            "serving records extend beyond the certified watermark"
+        )
+    bad_posting = connection.execute(
+        f"SELECT 1 FROM postings WHERE {posting_scope} "
+        "AND start_offset >= ? LIMIT 1",
+        (*posting_parameters, watermark),
+    ).fetchone()
+    if bad_posting is not None:
+        raise IndexValidationError(
+            "serving postings extend beyond the certified watermark"
+        )
+
+    record_count = _stream_serving_rows(
+        connection,
+        digest,
+        "RECORD",
+        f"SELECT {', '.join(SERVING_RECORD_FIELDS)} FROM records "
+        f"WHERE {record_scope} ORDER BY record_id",
+        record_parameters,
+    )
+    identity_count = _stream_serving_rows(
+        connection,
+        digest,
+        "IDENTITY",
+        f"SELECT {', '.join(SERVING_IDENTITY_FIELDS)} FROM identities "
+        f"WHERE {identity_scope} ORDER BY identity_id",
+        identity_parameters,
+    )
+    posting_count = _stream_serving_rows(
+        connection,
+        digest,
+        "POSTING",
+        f"SELECT {', '.join(SERVING_POSTING_FIELDS)} FROM postings "
+        f"WHERE {posting_scope} "
+        "ORDER BY start_offset, record_id, identity_id",
+        posting_parameters,
+    )
+    _add_serving_seal_frame(
+        digest,
+        "COUNTS",
+        {
+            "records": record_count,
+            "identities": identity_count,
+            "postings": posting_count,
+            "schema_objects": len(schema_rows),
+        },
+    )
+    return ServingCompletenessSeal(
+        contract_version=SERVING_COMPLETENESS_CONTRACT_VERSION,
+        watermark=watermark,
+        digest=digest.digest(),
+        record_count=record_count,
+        identity_count=identity_count,
+        posting_count=posting_count,
+        schema_object_count=len(schema_rows),
+    )
+
+
+def verify_serving_completeness_seal(connection: sqlite3.Connection) -> bool:
+    """Verify the persisted V2 serving certificate without reading the journal."""
+
+    try:
+        state = connection.execute(
+            """
+            SELECT schema_version, index_version, builder_version,
+                   identity_contract_hash, physical_contract_hash,
+                   physical_contract_version, cursor_contract_version,
+                   summary_contract_version, serving_contract_version,
+                   safe_watermark, certified_watermark,
+                   serving_certified_watermark, serving_completeness_hash,
+                   serving_certification_kind, serving_certified_at,
+                   serving_record_count, serving_identity_count,
+                   serving_posting_count, state
+            FROM source_state WHERE singleton_id=1
+            """
+        ).fetchone()
+        if state is None or int(state[0]) != SCHEMA_VERSION_V2:
+            return False
+        if (
+            str(state[1]) != INDEX_VERSION_V2
+            or str(state[2]) != BUILDER_VERSION_V2
+            or str(state[3]) != IDENTITY_CONTRACT_HASH
+            or str(state[4]) != PHYSICAL_CONTRACT_HASH
+            or str(state[5]) != PHYSICAL_CONTRACT_VERSION
+            or str(state[6]) != str(CURSOR_CONTRACT_VERSION)
+            or str(state[7]) != str(SUMMARY_CONTRACT_VERSION)
+            or str(state[8]) != SERVING_COMPLETENESS_CONTRACT_VERSION
+        ):
+            return False
+        watermark = int(state[11])
+        if (
+            str(state[13]) not in {
+                CERTIFICATION_DEEP_BASELINE,
+                CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+            }
+            or state[14] is None
+            or str(state[18]) != "READY"
+            or not 0 <= watermark <= int(state[9])
+        ):
+            return False
+        stored = bytes(state[12])
+        if len(stored) != HASH_BYTES:
+            return False
+        calculated = calculate_serving_completeness_seal(connection, watermark)
+        return bool(
+            hmac.compare_digest(stored, calculated.digest)
+            and int(state[15]) == calculated.record_count
+            and int(state[16]) == calculated.identity_count
+            and int(state[17]) == calculated.posting_count
+        )
+    except (
+        IndexValidationError,
+        sqlite3.DatabaseError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
+def _verify_serving_prefix_completeness_seal(
+    connection: sqlite3.Connection,
+    certified_watermark: int,
+    expected_digest: bytes,
+    expected_counts: tuple[int, int, int],
+) -> bool:
+    """Verify a persisted serving certificate after later rows were committed."""
+
+    try:
+        calculated = _calculate_serving_prefix_completeness_seal(
+            connection,
+            certified_watermark,
+        )
+        return bool(
+            hmac.compare_digest(bytes(expected_digest), calculated.digest)
+            and tuple(int(value) for value in expected_counts)
+            == (
+                calculated.record_count,
+                calculated.identity_count,
+                calculated.posting_count,
+            )
+        )
+    except (
+        IndexValidationError,
+        sqlite3.DatabaseError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
         return False
 
 
@@ -1725,8 +2291,10 @@ def _certify_v2_deep_baseline(
                 != str(CURSOR_CONTRACT_VERSION)
                 or str(state["summary_contract_version"])
                 != str(SUMMARY_CONTRACT_VERSION)
+                or str(state["serving_contract_version"])
+                != SERVING_COMPLETENESS_CONTRACT_VERSION
             ):
-                raise IndexBuildError("V2 certification physical contract mismatch")
+                raise IndexBuildError("V2 certification contract mismatch")
             if str(state["source_id"]) != source_id:
                 raise IndexBuildError("V2 certification source id mismatch")
             if (
@@ -1774,11 +2342,38 @@ def _certify_v2_deep_baseline(
             ):
                 raise IndexBuildError("V2 certification snapshot anchor mismatch")
             invariant_errors = _basic_invariant_errors(connection)
+            serving_seal_before_deep = calculate_serving_completeness_seal(
+                connection,
+                watermark,
+            )
+            certified_summary_before_deep = calculate_certified_summary_hash(
+                connection,
+                watermark,
+            )
             deep_errors = _deep_invariant_errors(connection, handle, state)
             if invariant_errors or deep_errors:
                 raise IndexBuildError(
                     "V2 deep baseline certification failed: "
                     + ",".join((*invariant_errors, *deep_errors))
+                )
+            serving_seal_after_deep = calculate_serving_completeness_seal(
+                connection,
+                watermark,
+            )
+            if serving_seal_after_deep != serving_seal_before_deep:
+                raise IndexBuildError(
+                    "serving index changed during V2 deep baseline certification"
+                )
+            certified_summary_after_deep = calculate_certified_summary_hash(
+                connection,
+                watermark,
+            )
+            if not hmac.compare_digest(
+                certified_summary_before_deep,
+                certified_summary_after_deep,
+            ):
+                raise IndexBuildError(
+                    "physical summary changed during V2 deep baseline certification"
                 )
             certified_anchor = _watermark_anchor_values(
                 handle,
@@ -1811,14 +2406,31 @@ def _certify_v2_deep_baseline(
                     or int(current["safe_watermark"]) != watermark
                     or str(current["certification_kind"])
                     != CERTIFICATION_UNCERTIFIED
+                    or str(current["serving_certification_kind"])
+                    != CERTIFICATION_UNCERTIFIED
                 ):
                     raise IndexBuildError(
                         "V2 source_state changed before baseline certification"
                     )
-                certified_summary_hash = calculate_certified_summary_hash(
+                certified_summary_at_commit = calculate_certified_summary_hash(
                     connection,
                     watermark,
                 )
+                if not hmac.compare_digest(
+                    certified_summary_after_deep,
+                    certified_summary_at_commit,
+                ):
+                    raise IndexBuildError(
+                        "physical summary changed before V2 baseline certification commit"
+                    )
+                serving_seal_at_commit = calculate_serving_completeness_seal(
+                    connection,
+                    watermark,
+                )
+                if serving_seal_at_commit != serving_seal_after_deep:
+                    raise IndexBuildError(
+                        "serving index changed before V2 baseline certification commit"
+                    )
                 proof_descriptor = os.fstat(handle.fileno())
                 proof_path_stat = _source_stat(source)
                 if (
@@ -1842,6 +2454,11 @@ def _certify_v2_deep_baseline(
                         certified_watermark=?, certified_anchor=?,
                         certified_anchor_offset=?, certified_anchor_length=?,
                         certified_summary_hash=?, certification_kind=?, certified_at=?,
+                        serving_certified_watermark=?,
+                        serving_completeness_hash=?,
+                        serving_certification_kind=?, serving_certified_at=?,
+                        serving_record_count=?, serving_identity_count=?,
+                        serving_posting_count=?,
                         certified_source_size=?, certified_source_mtime_ns=?,
                         certified_source_ctime_ns=?, state='READY',
                         published_at=COALESCE(published_at, ?), validated_at=?
@@ -1852,9 +2469,16 @@ def _certify_v2_deep_baseline(
                         certified_anchor["watermark_anchor"],
                         certified_anchor["watermark_anchor_offset"],
                         certified_anchor["watermark_anchor_length"],
-                        certified_summary_hash,
+                        certified_summary_at_commit,
                         CERTIFICATION_DEEP_BASELINE,
                         now,
+                        watermark,
+                        serving_seal_at_commit.digest,
+                        CERTIFICATION_DEEP_BASELINE,
+                        now,
+                        serving_seal_at_commit.record_count,
+                        serving_seal_at_commit.identity_count,
+                        serving_seal_at_commit.posting_count,
                         int(proof_descriptor.st_size),
                         int(proof_descriptor.st_mtime_ns),
                         int(proof_descriptor.st_ctime_ns),
@@ -1893,12 +2517,19 @@ def _revoke_v2_certification(index_path: Path) -> None:
                     certified_anchor=?, certified_anchor_offset=0,
                     certified_anchor_length=0, certified_summary_hash=?,
                     certification_kind=?, certified_at=NULL,
+                    serving_certified_watermark=0,
+                    serving_completeness_hash=?,
+                    serving_certification_kind=?, serving_certified_at=NULL,
+                    serving_record_count=0, serving_identity_count=0,
+                    serving_posting_count=0,
                     certified_source_size=NULL, certified_source_mtime_ns=NULL,
                     certified_source_ctime_ns=NULL, validated_at=?
                 WHERE singleton_id=1
                 """,
                 (
                     empty_anchor,
+                    empty_anchor,
+                    CERTIFICATION_UNCERTIFIED,
                     empty_anchor,
                     CERTIFICATION_UNCERTIFIED,
                     _utc_now(),
@@ -1980,7 +2611,11 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     }
 
 
-def _basic_invariant_errors(connection: sqlite3.Connection) -> list[str]:
+def _basic_invariant_errors(
+    connection: sqlite3.Connection,
+    *,
+    allow_stale_serving_prefix: bool = False,
+) -> list[str]:
     errors: list[str] = []
     if not REQUIRED_TABLES.issubset(_table_names(connection)):
         return ["REQUIRED_TABLE_MISSING"]
@@ -2007,6 +2642,7 @@ def _basic_invariant_errors(connection: sqlite3.Connection) -> list[str]:
                 "physical_contract_version",
                 "cursor_contract_version",
                 "summary_contract_version",
+                "serving_contract_version",
                 "certified_watermark",
                 "certified_anchor",
                 "certified_anchor_offset",
@@ -2017,6 +2653,13 @@ def _basic_invariant_errors(connection: sqlite3.Connection) -> list[str]:
                 "certified_source_size",
                 "certified_source_mtime_ns",
                 "certified_source_ctime_ns",
+                "serving_certified_watermark",
+                "serving_completeness_hash",
+                "serving_certification_kind",
+                "serving_certified_at",
+                "serving_record_count",
+                "serving_identity_count",
+                "serving_posting_count",
             }
             if not required_v2_columns.issubset(state_columns):
                 errors.append("V2_CERTIFICATION_COLUMNS_MISSING")
@@ -2068,6 +2711,40 @@ def _basic_invariant_errors(connection: sqlite3.Connection) -> list[str]:
                             or certified_source_size < certified_watermark
                         ):
                             errors.append("CERTIFIED_STATE_INCONSISTENT")
+                serving_kind = str(state["serving_certification_kind"])
+                serving_watermark = int(state["serving_certified_watermark"])
+                if (
+                    str(state["serving_contract_version"])
+                    != SERVING_COMPLETENESS_CONTRACT_VERSION
+                ):
+                    errors.append("SERVING_CONTRACT_MISMATCH")
+                if serving_kind not in CERTIFICATION_KINDS:
+                    errors.append("SERVING_CERTIFICATION_KIND_INVALID")
+                if not 0 <= serving_watermark <= watermark:
+                    errors.append("SERVING_CERTIFIED_WATERMARK_RANGE")
+                if len(bytes(state["serving_completeness_hash"])) != HASH_BYTES:
+                    errors.append("SERVING_COMPLETENESS_HASH_SHAPE")
+                if serving_kind == CERTIFICATION_UNCERTIFIED:
+                    if (
+                        serving_watermark != 0
+                        or state["serving_certified_at"] is not None
+                        or int(state["serving_record_count"]) != 0
+                        or int(state["serving_identity_count"]) != 0
+                        or int(state["serving_posting_count"]) != 0
+                        or not hmac.compare_digest(
+                            bytes(state["serving_completeness_hash"]),
+                            _blake128(b""),
+                        )
+                    ):
+                        errors.append("SERVING_UNCERTIFIED_STATE_INCONSISTENT")
+                else:
+                    if state["serving_certified_at"] is None:
+                        errors.append("SERVING_CERTIFIED_STATE_INCONSISTENT")
+                    if (
+                        not allow_stale_serving_prefix
+                        and not verify_serving_completeness_seal(connection)
+                    ):
+                        errors.append("SERVING_COMPLETENESS_SEAL_MISMATCH")
         expected_prefix_length = min(anchor_bytes, initial_snapshot_eof)
         expected_watermark_length = min(anchor_bytes, watermark)
         expected_snapshot_tail_length = min(anchor_bytes, build_snapshot_eof)
@@ -2513,6 +3190,15 @@ def _validate_index_format(
                 reasons=("PHYSICAL_CONTRACT_MISMATCH",),
                 **common,
             )
+        if v2 and (
+            str(state["serving_contract_version"])
+            != SERVING_COMPLETENESS_CONTRACT_VERSION
+        ):
+            return ValidationResult(
+                status=INDEX_V2_CONTRACT_MISMATCH,
+                reasons=("SERVING_COMPLETENESS_CONTRACT_MISMATCH",),
+                **common,
+            )
         if str(state["source_id"]) != expected_source_id:
             return ValidationResult(status=source_changed_status, reasons=("SOURCE_ID_MISMATCH",), **common)
         if (
@@ -2524,8 +3210,33 @@ def _validate_index_format(
             return ValidationResult(status=corrupt_status, reasons=("STATE_CORRUPT",), **common)
         if str(state["state"]) == "STALE":
             return ValidationResult(status=stale_status, reasons=("STATE_STALE",), **common)
-        invariant_errors = _basic_invariant_errors(connection)
-        if invariant_errors:
+        # A failed proven-append certification can legitimately leave the old
+        # serving seal in place while the newly indexed append is already
+        # durable.  In that recovery state the seal is intentionally stale,
+        # but a concurrent source rewrite remains the primary failure.  Defer
+        # only the V2 serving-seal comparison until after the source witness
+        # checks; all structural/index invariants still run here.
+        defer_serving_seal_check = bool(
+            v2
+            and str(state["serving_certification_kind"])
+            != CERTIFICATION_UNCERTIFIED
+        )
+        invariant_errors = _basic_invariant_errors(
+            connection,
+            allow_stale_serving_prefix=v2,
+        )
+        serving_seal_mismatch = bool(
+            defer_serving_seal_check
+            and not verify_serving_completeness_seal(connection)
+        )
+        if serving_seal_mismatch:
+            invariant_errors.append("SERVING_COMPLETENESS_SEAL_MISMATCH")
+        nondeferred_invariant_errors = tuple(
+            reason
+            for reason in invariant_errors
+            if reason != "SERVING_COMPLETENESS_SEAL_MISMATCH"
+        )
+        if nondeferred_invariant_errors:
             return ValidationResult(
                 status=corrupt_status,
                 reasons=tuple(invariant_errors),
@@ -2682,6 +3393,12 @@ def _validate_index_format(
                     reasons=("SOURCE_REWRITTEN_DURING_VALIDATION",),
                     **common,
                 )
+            if serving_seal_mismatch:
+                return ValidationResult(
+                    status=corrupt_status,
+                    reasons=("SERVING_COMPLETENESS_SEAL_MISMATCH",),
+                    **common,
+                )
             if str(state["state"]) in {"BUILDING", "REVALIDATING"}:
                 return ValidationResult(status=partial_status, reasons=(f"STATE_{state['state']}",), **common)
             if watermark < requested_snapshot:
@@ -2699,6 +3416,29 @@ def _validate_index_format(
                     return ValidationResult(
                         status=INDEX_V2_UNCERTIFIED,
                         reasons=("CERTIFIED_WATERMARK_BEHIND_SNAPSHOT",),
+                        **common,
+                    )
+                serving_kind = str(state["serving_certification_kind"])
+                serving_watermark = int(state["serving_certified_watermark"])
+                if serving_kind == CERTIFICATION_UNCERTIFIED:
+                    return ValidationResult(
+                        status=INDEX_V2_UNCERTIFIED,
+                        reasons=("SERVING_CERTIFICATION_UNCERTIFIED",),
+                        **common,
+                    )
+                if serving_watermark < requested_snapshot:
+                    return ValidationResult(
+                        status=INDEX_V2_UNCERTIFIED,
+                        reasons=("SERVING_CERTIFIED_WATERMARK_BEHIND_SNAPSHOT",),
+                        **common,
+                    )
+                if (
+                    certification_kind != serving_kind
+                    or certified_watermark != serving_watermark
+                ):
+                    return ValidationResult(
+                        status=INDEX_V2_UNCERTIFIED,
+                        reasons=("CERTIFICATION_PAIR_MISMATCH",),
                         **common,
                     )
             return ValidationResult(status=complete_status, reasons=(), **common)
@@ -2741,7 +3481,7 @@ def validate_index_v2(
     snapshot_eof: Optional[int] = None,
     deep: bool = False,
 ) -> ValidationResult:
-    """Validate explicit C0/V2 physical certification without any migration."""
+    """Validate an explicit C2/V2 physical+serving certificate pair."""
 
     return _validate_index_format(
         source_path,
@@ -3384,7 +4124,7 @@ def build_index_v2(
     fault_injector: FaultInjector = None,
     measure_memory: bool = True,
 ) -> BuildReport:
-    """Build one explicit, offline C0/V2 certified sidecar.
+    """Build one explicit, offline C2/V2 fully certified sidecar.
 
     This opt-in API never discovers, upgrades, or replaces an existing index.
     """
@@ -3515,6 +4255,13 @@ def _validate_ready_catchup_session(
         or str(state["summary_contract_version"]) != str(SUMMARY_CONTRACT_VERSION)
     ):
         raise IndexBuildError("READY catch-up rejected: PHYSICAL_CONTRACT_MISMATCH")
+    if schema_version == SCHEMA_VERSION_V2 and (
+        str(state["serving_contract_version"])
+        != SERVING_COMPLETENESS_CONTRACT_VERSION
+    ):
+        raise IndexBuildError(
+            "READY catch-up rejected: SERVING_COMPLETENESS_CONTRACT_MISMATCH"
+        )
     if str(state["source_id"]) != source_id:
         raise IndexBuildError("READY catch-up rejected: SOURCE_ID_MISMATCH")
     if (
@@ -3543,11 +4290,46 @@ def _validate_ready_catchup_session(
         raise IndexBuildError("READY catch-up rejected: READY_SNAPSHOT_WATERMARK_MISMATCH")
     if int(descriptor_stat.st_size) < watermark:
         raise IndexBuildError("READY catch-up rejected: SOURCE_SHRINK")
-    invariant_errors = _basic_invariant_errors(connection)
+    recovering_certification_lag = False
+    recovery_certified_watermark = watermark
+    if schema_version == SCHEMA_VERSION_V2:
+        physical_kind = str(state["certification_kind"])
+        serving_kind = str(state["serving_certification_kind"])
+        physical_watermark = int(state["certified_watermark"])
+        serving_watermark = int(state["serving_certified_watermark"])
+        physical_present = physical_kind != CERTIFICATION_UNCERTIFIED
+        serving_present = serving_kind != CERTIFICATION_UNCERTIFIED
+        if (
+            physical_present
+            and serving_present
+            and physical_kind == serving_kind
+            and physical_watermark == serving_watermark
+        ):
+            recovery_certified_watermark = physical_watermark
+            recovering_certification_lag = physical_watermark < watermark
+    invariant_errors = _basic_invariant_errors(
+        connection,
+        allow_stale_serving_prefix=recovering_certification_lag,
+    )
     if invariant_errors:
         raise IndexBuildError(
             "READY catch-up rejected: " + ",".join(invariant_errors)
         )
+    if recovering_certification_lag:
+        prefix_counts = (
+            int(state["serving_record_count"]),
+            int(state["serving_identity_count"]),
+            int(state["serving_posting_count"]),
+        )
+        if not _verify_serving_prefix_completeness_seal(
+            connection,
+            recovery_certified_watermark,
+            bytes(state["serving_completeness_hash"]),
+            prefix_counts,
+        ):
+            raise IndexBuildError(
+                "READY catch-up rejected: SERVING_COMPLETENESS_PREFIX_MISMATCH"
+            )
     config = _stored_config(state)
     try:
         prefix_length = int(state["prefix_anchor_length"])
@@ -3586,6 +4368,18 @@ def _validate_ready_catchup_session(
             "READY catch-up rejected: PREFIX_HASH_PROOF_FAILED:"
             + ",".join(proof_errors)
         )
+    if recovering_certification_lag:
+        recovery_errors = _deep_invariant_errors(
+            connection,
+            handle,
+            state,
+            start_offset=recovery_certified_watermark,
+        )
+        if recovery_errors:
+            raise IndexBuildError(
+                "READY catch-up rejected: RECOVERY_DEEP_PROOF_FAILED:"
+                + ",".join(recovery_errors)
+            )
     final_descriptor = os.fstat(handle.fileno())
     final_path_stat = _source_stat(source)
     if not _same_file(descriptor_stat, final_descriptor) or not _same_file(
@@ -3666,6 +4460,11 @@ def _extend_v2_certification_after_proven_append(
     catchup_snapshot_stat: os.stat_result,
     catchup_path_stat: os.stat_result,
     prior_certification_kind: str,
+    prior_certified_summary_hash: bytes,
+    prior_serving_certification_kind: str,
+    prior_serving_digest: bytes,
+    prior_serving_counts: tuple[int, int, int],
+    fault_injector: FaultInjector,
 ) -> bool:
     """Extend certification only from a fully certified prior watermark."""
 
@@ -3676,11 +4475,83 @@ def _extend_v2_certification_after_proven_append(
         return False
     if (
         prior_certification_kind == CERTIFICATION_UNCERTIFIED
+        or prior_serving_certification_kind == CERTIFICATION_UNCERTIFIED
+        or prior_certification_kind != prior_serving_certification_kind
         or int(state["certified_watermark"]) != watermark_before
+        or str(state["certification_kind"]) != prior_certification_kind
+        or not hmac.compare_digest(
+            bytes(state["certified_summary_hash"]),
+            prior_certified_summary_hash,
+        )
+        or int(state["serving_certified_watermark"]) != watermark_before
+        or str(state["serving_certification_kind"])
+        != prior_serving_certification_kind
+        or not hmac.compare_digest(
+            bytes(state["serving_completeness_hash"]),
+            prior_serving_digest,
+        )
+        or (
+            int(state["serving_record_count"]),
+            int(state["serving_identity_count"]),
+            int(state["serving_posting_count"]),
+        )
+        != prior_serving_counts
         or int(state["safe_watermark"]) != watermark_after
     ):
         return False
-    invariant_errors = _basic_invariant_errors(connection)
+    invariant_errors = _basic_invariant_errors(
+        connection,
+        allow_stale_serving_prefix=True,
+    )
+
+    def prior_serving_seal_matches() -> bool:
+        return _verify_serving_prefix_completeness_seal(
+            connection,
+            watermark_before,
+            prior_serving_digest,
+            prior_serving_counts,
+        )
+
+    def prior_physical_summary_matches() -> bool:
+        current = _load_source_state(connection)
+        if (
+            int(current["certified_watermark"]) != watermark_before
+            or str(current["certification_kind"]) != prior_certification_kind
+            or not hmac.compare_digest(
+                bytes(current["certified_summary_hash"]),
+                prior_certified_summary_hash,
+            )
+        ):
+            return False
+        calculated = calculate_certified_summary_hash(
+            connection,
+            watermark_before,
+        )
+        return hmac.compare_digest(
+            prior_certified_summary_hash,
+            calculated,
+        )
+
+    if not prior_physical_summary_matches():
+        raise IndexBuildError(
+            "V2 proven-append prior physical summary mismatch"
+        )
+    if not prior_serving_seal_matches():
+        raise IndexBuildError(
+            "V2 proven-append prior serving completeness seal mismatch"
+        )
+    serving_seal_before_deep = calculate_serving_completeness_seal(
+        connection,
+        watermark_after,
+    )
+    if not prior_physical_summary_matches():
+        raise IndexBuildError(
+            "V2 prior physical summary changed before append deep validation"
+        )
+    certified_summary_before_deep = calculate_certified_summary_hash(
+        connection,
+        watermark_after,
+    )
     appended_errors = _deep_invariant_errors(
         connection,
         handle,
@@ -3691,6 +4562,33 @@ def _extend_v2_certification_after_proven_append(
         raise IndexBuildError(
             "V2 proven-append certification failed: "
             + ",".join((*invariant_errors, *appended_errors))
+        )
+    serving_seal_after_deep = calculate_serving_completeness_seal(
+        connection,
+        watermark_after,
+    )
+    if serving_seal_after_deep != serving_seal_before_deep:
+        raise IndexBuildError(
+            "serving index changed during V2 proven-append certification"
+        )
+    if not prior_serving_seal_matches():
+        raise IndexBuildError(
+            "V2 serving prefix changed during proven-append certification"
+        )
+    if not prior_physical_summary_matches():
+        raise IndexBuildError(
+            "V2 prior physical summary changed during proven-append certification"
+        )
+    certified_summary_after_deep = calculate_certified_summary_hash(
+        connection,
+        watermark_after,
+    )
+    if not hmac.compare_digest(
+        certified_summary_before_deep,
+        certified_summary_after_deep,
+    ):
+        raise IndexBuildError(
+            "physical summary changed during V2 proven-append certification"
         )
     certified_anchor = _watermark_anchor_values(
         handle,
@@ -3707,6 +4605,13 @@ def _extend_v2_certification_after_proven_append(
         or _source_snapshot_metadata_changed(catchup_path_stat, proof_path_stat)
     ):
         raise IndexBuildError("source changed before V2 certification")
+    _invoke_fault(
+        fault_injector,
+        "after_catchup_post_validation_before_certification",
+        certified_watermark_before=watermark_before,
+        certified_watermark_after=watermark_after,
+        generation_uuid=expected_generation_uuid,
+    )
     now = _utc_now()
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -3717,14 +4622,54 @@ def _extend_v2_certification_after_proven_append(
             or int(current["safe_watermark"]) != watermark_after
             or int(current["certified_watermark"]) != watermark_before
             or str(current["certification_kind"]) != prior_certification_kind
+            or not hmac.compare_digest(
+                bytes(current["certified_summary_hash"]),
+                prior_certified_summary_hash,
+            )
+            or int(current["serving_certified_watermark"]) != watermark_before
+            or str(current["serving_certification_kind"])
+            != prior_serving_certification_kind
+            or not hmac.compare_digest(
+                bytes(current["serving_completeness_hash"]),
+                prior_serving_digest,
+            )
+            or (
+                int(current["serving_record_count"]),
+                int(current["serving_identity_count"]),
+                int(current["serving_posting_count"]),
+            )
+            != prior_serving_counts
         ):
             raise IndexBuildError(
                 "V2 source_state changed before proven-append certification"
             )
-        certified_summary_hash = calculate_certified_summary_hash(
+        if not prior_serving_seal_matches():
+            raise IndexBuildError(
+                "V2 serving prefix changed before proven-append certification commit"
+            )
+        if not prior_physical_summary_matches():
+            raise IndexBuildError(
+                "V2 prior physical summary changed before proven-append certification commit"
+            )
+        certified_summary_at_commit = calculate_certified_summary_hash(
             connection,
             watermark_after,
         )
+        if not hmac.compare_digest(
+            certified_summary_after_deep,
+            certified_summary_at_commit,
+        ):
+            raise IndexBuildError(
+                "physical summary changed before V2 proven-append certification commit"
+            )
+        serving_seal_at_commit = calculate_serving_completeness_seal(
+            connection,
+            watermark_after,
+        )
+        if serving_seal_at_commit != serving_seal_after_deep:
+            raise IndexBuildError(
+                "serving index changed before V2 proven-append certification commit"
+            )
         commit_descriptor = os.fstat(handle.fileno())
         commit_path_stat = _source_stat(source)
         if (
@@ -3748,6 +4693,11 @@ def _extend_v2_certification_after_proven_append(
                 certified_watermark=?, certified_anchor=?,
                 certified_anchor_offset=?, certified_anchor_length=?,
                 certified_summary_hash=?, certification_kind=?, certified_at=?,
+                serving_certified_watermark=?,
+                serving_completeness_hash=?,
+                serving_certification_kind=?, serving_certified_at=?,
+                serving_record_count=?, serving_identity_count=?,
+                serving_posting_count=?,
                 certified_source_size=?, certified_source_mtime_ns=?,
                 certified_source_ctime_ns=?, validated_at=?
             WHERE singleton_id=1
@@ -3757,9 +4707,16 @@ def _extend_v2_certification_after_proven_append(
                 certified_anchor["watermark_anchor"],
                 certified_anchor["watermark_anchor_offset"],
                 certified_anchor["watermark_anchor_length"],
-                certified_summary_hash,
+                certified_summary_at_commit,
                 CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
                 now,
+                watermark_after,
+                serving_seal_at_commit.digest,
+                CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+                now,
+                serving_seal_at_commit.record_count,
+                serving_seal_at_commit.identity_count,
+                serving_seal_at_commit.posting_count,
                 int(commit_descriptor.st_size),
                 int(commit_descriptor.st_mtime_ns),
                 int(commit_descriptor.st_ctime_ns),
@@ -3815,6 +4772,71 @@ def _refresh_v2_certified_source_witness(
                 int(catchup_snapshot_stat.st_mtime_ns),
                 int(catchup_snapshot_stat.st_ctime_ns),
                 now,
+            ),
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def _revoke_stale_v2_serving_certificate_after_append(
+    connection: sqlite3.Connection,
+    *,
+    expected_generation_uuid: str,
+    expected_safe_watermark: int,
+    prior_serving_watermark: int,
+    prior_serving_kind: str,
+    prior_serving_digest: bytes,
+    prior_serving_counts: tuple[int, int, int],
+) -> None:
+    """Remove a prefix-only serving claim after an uncertified append.
+
+    A FULL serving seal covers every table row.  Once rows are appended, an
+    older seal cannot remain advertised as serving-certified unless the
+    proven-append transaction replaces it with a seal at the new watermark.
+    """
+
+    if prior_serving_kind == CERTIFICATION_UNCERTIFIED:
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        state = _load_source_state(connection)
+        if (
+            int(state["schema_version"]) != SCHEMA_VERSION_V2
+            or str(state["state"]) != "READY"
+            or str(state["generation_uuid"]) != expected_generation_uuid
+            or int(state["safe_watermark"]) != expected_safe_watermark
+            or int(state["serving_certified_watermark"])
+            != prior_serving_watermark
+            or str(state["serving_certification_kind"]) != prior_serving_kind
+            or not hmac.compare_digest(
+                bytes(state["serving_completeness_hash"]),
+                prior_serving_digest,
+            )
+            or (
+                int(state["serving_record_count"]),
+                int(state["serving_identity_count"]),
+                int(state["serving_posting_count"]),
+            )
+            != prior_serving_counts
+        ):
+            raise IndexBuildError(
+                "V2 serving certificate changed before stale-prefix revocation"
+            )
+        connection.execute(
+            """
+            UPDATE source_state SET serving_certified_watermark=0,
+                serving_completeness_hash=?,
+                serving_certification_kind=?, serving_certified_at=NULL,
+                serving_record_count=0, serving_identity_count=0,
+                serving_posting_count=0, validated_at=?
+            WHERE singleton_id=1
+            """,
+            (
+                _blake128(b""),
+                CERTIFICATION_UNCERTIFIED,
+                _utc_now(),
             ),
         )
         connection.execute("COMMIT")
@@ -3898,6 +4920,55 @@ def catch_up_index(
                 int(state["certified_watermark"])
                 if schema_version == SCHEMA_VERSION_V2
                 else 0
+            )
+            prior_certified_summary_hash = (
+                bytes(state["certified_summary_hash"])
+                if schema_version == SCHEMA_VERSION_V2
+                else _blake128(b"")
+            )
+            prior_serving_certification_kind = (
+                str(state["serving_certification_kind"])
+                if schema_version == SCHEMA_VERSION_V2
+                else CERTIFICATION_UNCERTIFIED
+            )
+            prior_serving_certified_watermark = (
+                int(state["serving_certified_watermark"])
+                if schema_version == SCHEMA_VERSION_V2
+                else 0
+            )
+            prior_serving_digest = (
+                bytes(state["serving_completeness_hash"])
+                if schema_version == SCHEMA_VERSION_V2
+                else _blake128(b"")
+            )
+            prior_serving_counts = (
+                (
+                    int(state["serving_record_count"]),
+                    int(state["serving_identity_count"]),
+                    int(state["serving_posting_count"]),
+                )
+                if schema_version == SCHEMA_VERSION_V2
+                else (0, 0, 0)
+            )
+            prior_certification_pair_eligible = bool(
+                schema_version == SCHEMA_VERSION_V2
+                and prior_certification_kind != CERTIFICATION_UNCERTIFIED
+                and prior_serving_certification_kind
+                != CERTIFICATION_UNCERTIFIED
+                and prior_certification_kind
+                == prior_serving_certification_kind
+                and prior_certified_watermark
+                == prior_serving_certified_watermark
+                and prior_certified_watermark <= watermark_before
+            )
+            certification_base_watermark = (
+                prior_certified_watermark
+                if prior_certification_pair_eligible
+                else watermark_before
+            )
+            certification_recovery = bool(
+                prior_certification_pair_eligible
+                and certification_base_watermark < watermark_before
             )
             if catchup_snapshot_eof < watermark_before:
                 raise IndexBuildError("READY catch-up rejected: SOURCE_SHRINK")
@@ -4044,22 +5115,51 @@ def catch_up_index(
                 raise IndexBuildError("READY catch-up left inconsistent source_state")
             certification_extended = False
             if (
-                schema_version == SCHEMA_VERSION_V2
-                and prior_certification_kind != CERTIFICATION_UNCERTIFIED
-                and prior_certified_watermark == watermark_before
+                prior_certification_pair_eligible
+                and watermark_after > certification_base_watermark
             ):
                 certification_extended = _extend_v2_certification_after_proven_append(
                     connection,
                     handle,
                     source,
                     expected_generation_uuid=generation_uuid,
-                    watermark_before=watermark_before,
+                    watermark_before=certification_base_watermark,
                     watermark_after=watermark_after,
                     catchup_snapshot_stat=descriptor_stat,
                     catchup_path_stat=path_stat,
                     prior_certification_kind=prior_certification_kind,
+                    prior_certified_summary_hash=prior_certified_summary_hash,
+                    prior_serving_certification_kind=(
+                        prior_serving_certification_kind
+                    ),
+                    prior_serving_digest=prior_serving_digest,
+                    prior_serving_counts=prior_serving_counts,
+                    fault_injector=fault_injector,
                 )
                 assert_source_generation()
+                after_state = _load_source_state(connection)
+                if not certification_extended:
+                    raise IndexBuildError(
+                        "V2 certification proof became ineligible before commit"
+                    )
+            if (
+                schema_version == SCHEMA_VERSION_V2
+                and not certification_extended
+                and watermark_after > watermark_before
+                and prior_serving_certification_kind
+                != CERTIFICATION_UNCERTIFIED
+            ):
+                _revoke_stale_v2_serving_certificate_after_append(
+                    connection,
+                    expected_generation_uuid=generation_uuid,
+                    expected_safe_watermark=watermark_after,
+                    prior_serving_watermark=(
+                        prior_serving_certified_watermark
+                    ),
+                    prior_serving_kind=prior_serving_certification_kind,
+                    prior_serving_digest=prior_serving_digest,
+                    prior_serving_counts=prior_serving_counts,
+                )
                 after_state = _load_source_state(connection)
             if (
                 schema_version == SCHEMA_VERSION_V2
@@ -4128,7 +5228,15 @@ def catch_up_index(
         }
         return CatchUpReport(
             ok=True,
-            mode="NO_OP" if catchup_snapshot_eof == watermark_before else "CATCH_UP",
+            mode=(
+                "CERTIFICATION_RECOVERY"
+                if certification_recovery
+                else (
+                    "NO_OP"
+                    if catchup_snapshot_eof == watermark_before
+                    else "CATCH_UP"
+                )
+            ),
             source_id=identity,
             source_path=_normalized_path(source),
             index_path=_normalized_path(index),
@@ -4569,6 +5677,10 @@ __all__ = (
     "CERTIFICATION_DEEP_BASELINE",
     "CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND",
     "CERTIFICATION_KINDS",
+    "CERTIFICATION_STATE_FULL",
+    "CERTIFICATION_STATE_NONE",
+    "CERTIFICATION_STATE_PHYSICAL",
+    "CERTIFICATION_STATE_SERVING",
     "CERTIFICATION_UNCERTIFIED",
     "CERTIFIED_SEGMENT_SUMMARY_FIELDS",
     "CERTIFIED_SUMMARY_HASH_DOMAIN",
@@ -4600,12 +5712,16 @@ __all__ = (
     "SCHEMA_VERSION",
     "SCHEMA_VERSION_V1",
     "SCHEMA_VERSION_V2",
+    "SERVING_COMPLETENESS_CONTRACT_VERSION",
+    "SERVING_COMPLETENESS_HASH_DOMAIN",
     "SOURCE_IDS",
+    "ServingCompletenessSeal",
     "ShadowVerificationResult",
     "ValidationResult",
     "build_index",
     "build_index_v2",
     "calculate_certified_summary_hash",
+    "calculate_serving_completeness_seal",
     "catch_up_index",
     "find_staging_indexes",
     "lookup_offsets",
@@ -4616,5 +5732,6 @@ __all__ = (
     "validate_index",
     "validate_index_v2",
     "verify_certified_summary_hash",
+    "verify_serving_completeness_seal",
     "verify_shadow",
 )

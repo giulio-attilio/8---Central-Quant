@@ -66,8 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--schema-v2",
         action="store_true",
         help=(
-            "explicitly build/resume/catch-up/validate the offline C0 physical-certification "
-            "schema; never migrates an existing V1 database"
+            "explicitly build/resume/catch-up/validate the offline C2 physical+serving "
+            "certification schema; never migrates an existing V1 database"
         ),
     )
     parser.add_argument("--staging", type=Path)

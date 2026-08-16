@@ -225,22 +225,28 @@ def _collect_sources(
     trade_id: str,
     sources: Optional[Mapping[str, Any]],
     *,
+    evidence_bundle: Optional[EvidenceBundle] = None,
     logger: Optional[logging.Logger] = None,
     opened_at: Any = None,
     opened_epoch: Any = None,
     instance_id: Any = None,
 ) -> tuple[Dict[str, list[Mapping[str, Any]]], Dict[str, Any], Dict[str, Any], list, list, Any, EvidenceBundle]:
-    bundle = collect_evidence_bundle(
-        trade_id,
-        sources=sources,
-        logger=logger,
-        opened_at=opened_at,
-        opened_epoch=opened_epoch,
-        instance_id=instance_id,
-        component_order=SOURCE_ORDER,
-        passthrough_components=("external_exposure",),
-        record_coercer=_records,
-    )
+    if evidence_bundle is not None:
+        if evidence_bundle.trade_id != trade_id:
+            raise ValueError("evidence bundle belongs to another trade")
+        bundle = evidence_bundle
+    else:
+        bundle = collect_evidence_bundle(
+            trade_id,
+            sources=sources,
+            logger=logger,
+            opened_at=opened_at,
+            opened_epoch=opened_epoch,
+            instance_id=instance_id,
+            component_order=SOURCE_ORDER,
+            passthrough_components=("external_exposure",),
+            record_coercer=_records,
+        )
     rows_by_source = {
         name: list(bundle.records.get(name, ()))
         for name in SOURCE_ORDER
@@ -698,6 +704,7 @@ def build_live_trade_snapshot(
     trade_id: str,
     *,
     sources: Optional[Mapping[str, Any]] = None,
+    evidence_bundle: Optional[EvidenceBundle] = None,
     now_epoch: Optional[float] = None,
     logger: Optional[logging.Logger] = None,
     opened_at: Any = None,
@@ -720,6 +727,7 @@ def build_live_trade_snapshot(
         ) = _collect_sources(
             identity,
             dict(sources) if sources is not None else None,
+            evidence_bundle=evidence_bundle,
             logger=active_logger,
             opened_at=opened_at,
             opened_epoch=opened_epoch,

@@ -38,20 +38,27 @@ from trade_evidence_identity_offset_index_v1 import (
     BUILDER_VERSION_V2,
     CERTIFICATION_DEEP_BASELINE,
     CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND,
+    CERTIFICATION_STATE_FULL,
+    CERTIFICATION_STATE_NONE,
+    HASH_BYTES,
     INDEX_VERSION_V2,
     SCHEMA_VERSION_V2,
+    SERVING_COMPLETENESS_CONTRACT_VERSION,
     SQLITE_APPLICATION_ID,
     IndexedRecordMetadata,
     IndexValidationError,
     normalized_path_hash,
     read_and_verify_record,
     verify_certified_summary_hash,
+    verify_serving_completeness_seal,
 )
 from trade_evidence_physical_page_planner_v1 import (
+    DEFAULT_MAX_SEGMENT_ROWS,
     NOT_REPRODUCIBLE,
     REPRODUCIBLE,
     PhysicalPagePlan,
     plan_physical_page,
+    plan_physical_page_pinned,
 )
 from trade_evidence_physical_window_contract_v1 import (
     CURSOR_CONTRACT_VERSION,
@@ -72,9 +79,11 @@ INDEX_ONLY = "INDEX_ONLY"
 INDEX_PLUS_TAIL = "INDEX_PLUS_TAIL"
 NO_INDEX_MODE = "NONE"
 NEGATIVE_UNSAFE = "NEGATIVE_UNSAFE"
+NEGATIVE_CERTIFIED = "NEGATIVE_CERTIFIED"
 NOT_NEGATIVE = "NOT_NEGATIVE"
 COMPLETENESS_UNCERTIFIED = "UNCERTIFIED_COMPLETENESS"
 COMPLETENESS_UNKNOWN = "UNKNOWN"
+COMPLETENESS_FULL_CERTIFIED = "FULL_CERTIFIED"
 
 MAX_CANDIDATE_OFFSETS = 25_000
 MAX_FACTUAL_RECORDS = 10_000
@@ -91,6 +100,16 @@ DEFAULT_BUSY_TIMEOUT_MS = 50
 _CERTIFIED_KINDS = frozenset(
     {CERTIFICATION_DEEP_BASELINE, CERTIFICATION_DEEP_BASELINE_PLUS_PROVEN_APPEND}
 )
+_SERVING_CERTIFICATION_FIELDS = (
+    "serving_contract_version",
+    "serving_certified_watermark",
+    "serving_completeness_hash",
+    "serving_certification_kind",
+    "serving_certified_at",
+    "serving_record_count",
+    "serving_identity_count",
+    "serving_posting_count",
+)
 _GROUP_TYPES = {
     group: tuple(
         sorted(
@@ -101,6 +120,16 @@ _GROUP_TYPES = {
     )
     for group in frozenset(IDENTITY_GROUPS.values())
 }
+_SAFE_PINNED_PLANNER_OPTIONS = frozenset(
+    {
+        "byte_budget",
+        "record_budget",
+        "block_bytes",
+        "max_boundary_scan_bytes",
+        "max_segment_rows",
+        "max_append_proof_bytes",
+    }
+)
 
 FaultInjector = Optional[Callable[[str, Mapping[str, Any]], None]]
 
@@ -157,6 +186,25 @@ def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
 
 def _blake128(value: bytes) -> bytes:
     return hashlib.blake2b(value, digest_size=16).digest()
+
+
+def _certification_witness(state: Any) -> tuple[Any, ...]:
+    """Normalize every physical/serving field that authorizes C2 serving."""
+
+    return (
+        str(state["state"]),
+        str(state["generation_uuid"]),
+        str(state["certification_kind"]),
+        int(state["certified_watermark"]),
+        str(state["serving_contract_version"]),
+        int(state["serving_certified_watermark"]),
+        bytes(state["serving_completeness_hash"]),
+        str(state["serving_certification_kind"]),
+        str(state["serving_certified_at"]),
+        int(state["serving_record_count"]),
+        int(state["serving_identity_count"]),
+        int(state["serving_posting_count"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -230,7 +278,10 @@ class SourceSnapshotMetadata:
 @dataclass(frozen=True)
 class SourceEnvelopeMetrics:
     index_lookup_ms: float = 0.0
+    certification_ms: float = 0.0
+    certification_sqlite_rows: int = 0
     planner_ms: float = 0.0
+    planner_segment_rows: int = 0
     factual_journal_bytes: int = 0
     tail_bytes: int = 0
     boundary_bytes: int = 0
@@ -251,7 +302,10 @@ class SourceEnvelopeMetrics:
 @dataclass
 class _Metrics:
     index_lookup_ms: float = 0.0
+    certification_ms: float = 0.0
+    certification_sqlite_rows: int = 0
     planner_ms: float = 0.0
+    planner_segment_rows: int = 0
     factual_journal_bytes: int = 0
     tail_bytes: int = 0
     boundary_bytes: int = 0
@@ -415,6 +469,8 @@ class PinnedSourceIndexSession:
         self._planner_journal_bytes = 0
         self._planner_bytes_accounted = False
         self._active_cursors = 0
+        self._certification_state = CERTIFICATION_STATE_NONE
+        self._certification_witness_open: Optional[tuple[Any, ...]] = None
 
     def __enter__(self) -> "PinnedSourceIndexSession":
         self.caps.validate()
@@ -588,6 +644,76 @@ class PinnedSourceIndexSession:
             raise _Fallback("CERTIFIED_WATERMARK_INVALID")
         if not verify_certified_summary_hash(self.connection):
             raise _Fallback("CERTIFIED_SUMMARY_HASH_MISMATCH")
+        missing_serving = tuple(
+            field for field in _SERVING_CERTIFICATION_FIELDS if field not in state
+        )
+        if missing_serving:
+            raise _Fallback("SERVING_CERTIFICATION_COLUMNS_MISSING")
+        if (
+            str(state["serving_contract_version"])
+            != SERVING_COMPLETENESS_CONTRACT_VERSION
+        ):
+            raise _Fallback("SERVING_CONTRACT_MISMATCH")
+        try:
+            serving_watermark = int(state["serving_certified_watermark"])
+            serving_hash = bytes(state["serving_completeness_hash"])
+            serving_record_count = int(state["serving_record_count"])
+            serving_identity_count = int(state["serving_identity_count"])
+            serving_posting_count = int(state["serving_posting_count"])
+        except (TypeError, ValueError) as exc:
+            raise _Fallback("SERVING_CERTIFICATION_STATE_INVALID") from exc
+        if serving_watermark != certified:
+            raise _Fallback("SERVING_WATERMARK_MISMATCH")
+        if len(serving_hash) != HASH_BYTES:
+            raise _Fallback("SERVING_COMPLETENESS_HASH_SHAPE")
+        if (
+            str(state["serving_certification_kind"]) not in _CERTIFIED_KINDS
+            or str(state["serving_certification_kind"])
+            != str(state["certification_kind"])
+        ):
+            raise _Fallback("SERVING_CERTIFICATION_KIND_MISMATCH")
+        if not state.get("serving_certified_at"):
+            raise _Fallback("SERVING_CERTIFICATION_TIMESTAMP_MISSING")
+        if min(
+            serving_record_count,
+            serving_identity_count,
+            serving_posting_count,
+        ) < 0:
+            raise _Fallback("SERVING_CERTIFICATION_COUNT_INVALID")
+        # The serving seal deliberately streams every records/identities/
+        # postings row.  Count the exact SQLite rows delivered and isolate its
+        # wall time so an offline/full-shadow caller cannot mistake this O(N)
+        # certification cost for bounded candidate lookup work.  Restoring the
+        # row factory in ``finally`` preserves the session's sqlite.Row API.
+        original_row_factory = self.connection.row_factory
+
+        def counted_row_factory(
+            cursor: sqlite3.Cursor, row: tuple[Any, ...]
+        ) -> Any:
+            self.metrics.certification_sqlite_rows += 1
+            if original_row_factory is None:
+                return row
+            return original_row_factory(cursor, row)
+
+        certification_started = time.perf_counter()
+        self.connection.row_factory = counted_row_factory
+        try:
+            serving_verified = verify_serving_completeness_seal(self.connection)
+        finally:
+            self.connection.row_factory = original_row_factory
+            self.metrics.certification_ms += (
+                time.perf_counter() - certification_started
+            ) * 1000.0
+        if not serving_verified:
+            raise _Fallback("SERVING_COMPLETENESS_SEAL_MISMATCH")
+        self._certification_witness_open = _certification_witness(state)
+        self._certification_state = CERTIFICATION_STATE_FULL
+
+    @property
+    def certification_state(self) -> str:
+        """Certification pinned by this transaction, never inferred by callers."""
+
+        return self._certification_state
 
     def _open_source(self) -> None:
         try:
@@ -677,6 +803,37 @@ class PinnedSourceIndexSession:
             }
         )
 
+    def plan_physical_page(
+        self,
+        *,
+        scan_cursor: Optional[str] = None,
+        **planner_options: Any,
+    ) -> PhysicalPagePlan:
+        """Plan using this session's exact FD, transaction, state and snapshot."""
+
+        if (
+            self.connection is None
+            or self.source_handle is None
+            or self.snapshot is None
+            or self._source_descriptor_open is None
+            or self._source_path_open is None
+        ):
+            raise _Fallback("SESSION_NOT_OPEN")
+        return plan_physical_page_pinned(
+            self.source_path,
+            self.index_path,
+            self.source_id,
+            connection=self.connection,
+            source_handle=self.source_handle,
+            source_state=self.state,
+            source_descriptor=self._source_descriptor_open,
+            source_path_state=self._source_path_open,
+            expected_snapshot_eof=self.snapshot.source_size,
+            expected_generation_uuid=self.snapshot.index_generation_uuid,
+            scan_cursor=scan_cursor,
+            **planner_options,
+        )
+
     def bind_plan(
         self,
         plan: PhysicalPagePlan,
@@ -725,6 +882,15 @@ class PinnedSourceIndexSession:
     @property
     def total_journal_bytes(self) -> int:
         return self._journal_bytes
+
+    @property
+    def pinned_planner_validation_bytes(self) -> int:
+        """C0 validation bytes already read while this session was entered."""
+
+        if self.certification_state != CERTIFICATION_STATE_FULL:
+            raise _Fallback("SESSION_NOT_FULL_CERTIFIED")
+        certified = int(self.state["certified_watermark"])
+        return int(self.state["certified_anchor_length"]) + (1 if certified else 0)
 
     def _reserve_journal(self, length: int) -> None:
         if length < 0 or self._journal_bytes + length > self.caps.max_source_journal_bytes:
@@ -965,14 +1131,20 @@ class PinnedSourceIndexSession:
         ).exists():
             raise _Fallback("INDEX_SIDECAR_APPEARED_DURING_BUILD")
         state = self.connection.execute(
-            "SELECT state, generation_uuid, certification_kind, certified_watermark "
+            "SELECT state, generation_uuid, certification_kind, certified_watermark, "
+            "serving_contract_version, serving_certified_watermark, "
+            "serving_completeness_hash, serving_certification_kind, "
+            "serving_certified_at, serving_record_count, serving_identity_count, "
+            "serving_posting_count "
             "FROM source_state WHERE singleton_id=1"
         ).fetchone()
-        if state is None or (
-            str(state["state"]) != "READY"
-            or str(state["generation_uuid"]) != str(self.state["generation_uuid"])
-            or str(state["certification_kind"]) != str(self.state["certification_kind"])
-            or int(state["certified_watermark"]) != int(self.state["certified_watermark"])
+        try:
+            final_witness = _certification_witness(state) if state is not None else None
+        except (KeyError, TypeError, ValueError):
+            final_witness = None
+        if (
+            self._certification_witness_open is None
+            or final_witness != self._certification_witness_open
         ):
             raise _Fallback("CERTIFICATION_CHANGED_DURING_BUILD")
 
@@ -990,6 +1162,8 @@ class PinnedSourceIndexSession:
                 finally:
                     self.connection.close()
                     self.connection = None
+            self._certification_state = CERTIFICATION_STATE_NONE
+            self._certification_witness_open = None
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
@@ -1365,6 +1539,8 @@ def _build_with_session(
     expected_snapshot: Optional[SourceSnapshotMetadata],
     caps: EnvelopeCaps,
     fault_injector: FaultInjector,
+    trusted_pinned_plan: bool,
+    scan_cursor_supplied: bool,
 ) -> IndexedSourceEnvelope:
     import trade_timeline_validator as validator
 
@@ -1376,6 +1552,19 @@ def _build_with_session(
     certified = int(snapshot.certified_watermark)
     mode = INDEX_ONLY if int(physical_plan.page_end) <= certified else INDEX_PLUS_TAIL
     session.metrics.mode = mode
+    terminal_tail_incomplete = False
+    if (
+        int(physical_plan.page_end) == int(snapshot.snapshot_eof)
+        and int(physical_plan.page_end) > certified
+    ):
+        terminal_tail_incomplete = (
+            session.read_exact(
+                int(physical_plan.page_end) - 1,
+                1,
+                kind="boundary",
+            )
+            != b"\n"
+        )
     if fault_injector is not None:
         fault_injector("after_session_open", snapshot.to_dict())
 
@@ -1456,18 +1645,37 @@ def _build_with_session(
     identity_metadata = validator.identity_resolution_metadata(context)
     physical_metadata = _reader_metadata(physical_plan, context, rows)
     coverage = _source_coverage(physical_metadata, rows)
-    # C0 authenticates physical summaries/segment hashes, not the logical
-    # completeness of records/identities/postings.  Factual reads prove every
-    # returned candidate, but no C1 success may claim that no candidate is
-    # missing until C2 adds an independently verifiable content witness.
-    completeness_status = COMPLETENESS_UNCERTIFIED
+    # A FULL certificate authenticates both the C0 physical summaries and the
+    # complete logical serving tables.  It can authorize a C2 claim only when
+    # the plan itself was produced from this exact pinned transaction/FD.  The
+    # C1 testing entrypoint accepts external plans and therefore remains
+    # explicitly uncertified even when its index carries the same seals.
+    full_certified = bool(
+        trusted_pinned_plan
+        and session.certification_state == CERTIFICATION_STATE_FULL
+    )
+    completeness_status = (
+        COMPLETENESS_FULL_CERTIFIED
+        if full_certified
+        else COMPLETENESS_UNCERTIFIED
+    )
     negative_status = NOT_NEGATIVE
     if not rows:
-        negative_status = NEGATIVE_UNSAFE
+        negative_status = (
+            NEGATIVE_CERTIFIED
+            if full_certified
+            and bool(physical_metadata.get("coverage_complete", False))
+            and bool(physical_metadata.get("conclusive", False))
+            and not terminal_tail_incomplete
+            and not scan_cursor_supplied
+            else NEGATIVE_UNSAFE
+        )
     raw_source_metadata = {
         "snapshot": snapshot.to_dict(),
         "plan": physical_plan.to_dict(),
         "identity_metadata": identity_metadata,
+        "terminal_tail_incomplete": terminal_tail_incomplete,
+        "scan_cursor_supplied": bool(scan_cursor_supplied),
     }
     result = IndexedSourceEnvelope(
         source=source,
@@ -1521,6 +1729,7 @@ def build_indexed_source_envelope(
     started = time.perf_counter()
     metrics = session.metrics if session is not None else _Metrics()
     metrics.planner_ms = max(0.0, float(planner_ms))
+    metrics.planner_segment_rows = int(physical_plan.segment_rows_consulted)
     plan_boundary_bytes = int(physical_plan.boundary_scan_bytes) + int(
         physical_plan.validation_bytes
     )
@@ -1575,6 +1784,8 @@ def build_indexed_source_envelope(
             expected_snapshot=expected_snapshot,
             caps=caps,
             fault_injector=fault_injector,
+            trusted_pinned_plan=False,
+            scan_cursor_supplied=False,
         )
         metrics.duration_ms = (time.perf_counter() - started) * 1000.0
         return replace(result, metrics=metrics.freeze())
@@ -1610,6 +1821,142 @@ def build_indexed_source_envelope(
             active_session.close()
 
 
+def plan_and_build_from_pinned_session(
+    session: PinnedSourceIndexSession,
+    *,
+    target_identity: Any,
+    correlation_context: Any,
+    scan_cursor: Optional[str] = None,
+    fault_injector: FaultInjector = None,
+    **planner_options: Any,
+) -> IndexedSourceEnvelope:
+    """Plan/build on an entered session without taking resource ownership.
+
+    This is the safe composition API for callers that must keep multiple
+    source/index snapshots pinned across a larger shadow/offline transaction.
+    It derives source paths, caps and witnesses from ``session`` and accepts no
+    externally supplied :class:`PhysicalPagePlan`.
+    """
+
+    source = session.source_id
+    metrics = session.metrics
+    caps = session.caps
+    started = time.perf_counter()
+    try:
+        context_before = copy.deepcopy(correlation_context)
+    except Exception:
+        metrics.duration_ms = (time.perf_counter() - started) * 1000.0
+        return _empty_envelope(
+            source, "CONTEXT_CLONE_FAILED", correlation_context, metrics
+        )
+    try:
+        if (
+            session.connection is None
+            or session.source_handle is None
+            or session.snapshot is None
+        ):
+            raise _Fallback("SESSION_NOT_OPEN")
+        caps.validate()
+        options = dict(planner_options)
+        if set(options) - _SAFE_PINNED_PLANNER_OPTIONS:
+            raise _Fallback("PLANNER_OPTION_FORBIDDEN")
+        try:
+            requested_boundary = int(
+                options.get("max_boundary_scan_bytes", caps.max_boundary_bytes)
+            )
+            requested_append_proof = int(
+                options.get("max_append_proof_bytes", 1)
+            )
+            requested_segment_rows = int(
+                options.get("max_segment_rows", DEFAULT_MAX_SEGMENT_ROWS)
+            )
+        except (TypeError, ValueError) as exc:
+            raise _Fallback("PLANNER_CAP_INVALID") from exc
+        if requested_boundary <= 0 or requested_append_proof <= 0:
+            raise _Fallback("PLANNER_CAP_INVALID")
+        if not 0 < requested_segment_rows <= DEFAULT_MAX_SEGMENT_ROWS:
+            raise _Fallback("PLANNER_SEGMENT_ROW_CAP_EXCEEDED")
+        if requested_boundary > caps.max_boundary_bytes:
+            raise _Fallback("PLANNER_BOUNDARY_CAP_EXCEEDED")
+        # A source that grows after this session was pinned is never usable by
+        # this lifecycle.  One byte retains the planner's fail-closed probe.
+        if requested_append_proof > 1:
+            raise _Fallback("PLANNER_APPEND_PROOF_CAP_EXCEEDED")
+        # Eligibility/anchor reads were charged while entering this exact
+        # session.  Remaining validation is at most tail, growth and cursor.
+        validation_allowance = 2 + (1 if scan_cursor is not None else 0)
+        remaining = caps.max_source_journal_bytes - session.total_journal_bytes
+        boundary_remaining = (
+            caps.max_boundary_bytes - metrics.boundary_bytes - validation_allowance
+        )
+        boundary_allowance = min(
+            requested_boundary,
+            remaining - validation_allowance,
+            boundary_remaining,
+        )
+        if boundary_allowance <= 0:
+            raise _Fallback("PLANNER_SOURCE_JOURNAL_BUDGET_EXHAUSTED")
+        options["max_boundary_scan_bytes"] = boundary_allowance
+        options["max_append_proof_bytes"] = requested_append_proof
+        planner_started = time.perf_counter()
+        plan = session.plan_physical_page(
+            scan_cursor=scan_cursor,
+            **options,
+        )
+        metrics.planner_ms = (time.perf_counter() - planner_started) * 1000.0
+        metrics.planner_segment_rows = int(plan.segment_rows_consulted)
+        plan_boundary_bytes = int(plan.boundary_scan_bytes) + int(
+            plan.validation_bytes
+        )
+        pinned_validation_bytes = session.pinned_planner_validation_bytes
+        if (
+            plan.status == REPRODUCIBLE
+            and int(plan.validation_bytes) < pinned_validation_bytes
+        ):
+            raise _Fallback("PLANNER_VALIDATION_ACCOUNTING_MISMATCH")
+        # The plan reports standalone-equivalent logical validation.  Anchor
+        # and watermark-alignment bytes in that number were already physically
+        # read/charged by this exact session during eligibility validation.
+        reused_validation_bytes = min(
+            int(plan.validation_bytes), pinned_validation_bytes
+        )
+        new_planner_bytes = plan_boundary_bytes - reused_validation_bytes
+        if metrics.boundary_bytes + new_planner_bytes > caps.max_boundary_bytes:
+            raise _Fallback("BOUNDARY_BYTE_CAP_EXCEEDED")
+        metrics.boundary_bytes += new_planner_bytes
+        session.account_planner_journal_bytes(new_planner_bytes)
+        expected_snapshot = (
+            session.snapshot_for_plan(plan) if plan.status == REPRODUCIBLE else None
+        )
+        result = _build_with_session(
+            session,
+            source=source,
+            target_identity=target_identity,
+            correlation_context=correlation_context,
+            physical_plan=plan,
+            expected_snapshot=expected_snapshot,
+            caps=caps,
+            fault_injector=fault_injector,
+            trusted_pinned_plan=True,
+            scan_cursor_supplied=scan_cursor is not None,
+        )
+        metrics.duration_ms = (time.perf_counter() - started) * 1000.0
+        return replace(result, metrics=metrics.freeze())
+    except _Fallback as exc:
+        metrics.duration_ms = (time.perf_counter() - started) * 1000.0
+        return _empty_envelope(source, exc.reason, context_before, metrics)
+    except sqlite3.OperationalError as exc:
+        metrics.duration_ms = (time.perf_counter() - started) * 1000.0
+        text = str(exc).lower()
+        reason = "SQLITE_BUSY" if "busy" in text or "locked" in text else "SQLITE_READ_FAILED"
+        return _empty_envelope(source, reason, context_before, metrics)
+    except Exception as exc:
+        metrics.duration_ms = (time.perf_counter() - started) * 1000.0
+        return _empty_envelope(
+            source, f"C1_PLAN_BUILD_FAILED:{type(exc).__name__}", context_before, metrics
+        )
+
+
 def plan_and_build_indexed_source_envelope(
     *,
     source: str,
@@ -1622,7 +1969,7 @@ def plan_and_build_indexed_source_envelope(
     fault_injector: FaultInjector = None,
     **planner_options: Any,
 ) -> IndexedSourceEnvelope:
-    """Strongest C1 offline lifecycle: pin first, plan, build, revalidate."""
+    """Own one pinned session around the safe plan/build composition API."""
 
     metrics = _Metrics()
     started = time.perf_counter()
@@ -1641,74 +1988,24 @@ def plan_and_build_indexed_source_envelope(
             caps=caps,
             metrics=metrics,
         ) as session:
-            options = dict(planner_options)
-            try:
-                requested_boundary = int(
-                    options.get("max_boundary_scan_bytes", caps.max_boundary_bytes)
-                )
-                requested_append_proof = int(
-                    options.get("max_append_proof_bytes", 1)
-                )
-            except (TypeError, ValueError) as exc:
-                raise _Fallback("PLANNER_CAP_INVALID") from exc
-            if requested_boundary <= 0 or requested_append_proof <= 0:
-                raise _Fallback("PLANNER_CAP_INVALID")
-            if requested_boundary > caps.max_boundary_bytes:
-                raise _Fallback("PLANNER_BOUNDARY_CAP_EXCEEDED")
-            # A source that grows after this session was pinned is never usable
-            # by C1.  One byte preserves the planner's fail-closed probe without
-            # allowing its append-proof path to consume the builder's budget.
-            if requested_append_proof > 1:
-                raise _Fallback("PLANNER_APPEND_PROOF_CAP_EXCEEDED")
-            certified = int(session.state["certified_watermark"])
-            validation_allowance = int(session.state["certified_anchor_length"])
-            validation_allowance += 1 if certified else 0
-            validation_allowance += 2  # initial-tail hash plus growth proof
-            validation_allowance += 1 if scan_cursor is not None else 0
-            remaining = caps.max_source_journal_bytes - session.total_journal_bytes
-            boundary_remaining = (
-                caps.max_boundary_bytes
-                - metrics.boundary_bytes
-                - validation_allowance
-            )
-            boundary_allowance = min(
-                requested_boundary,
-                remaining - validation_allowance,
-                boundary_remaining,
-            )
-            if boundary_allowance <= 0:
-                raise _Fallback("PLANNER_SOURCE_JOURNAL_BUDGET_EXHAUSTED")
-            options["max_boundary_scan_bytes"] = boundary_allowance
-            options["max_append_proof_bytes"] = requested_append_proof
-            planner_started = time.perf_counter()
-            plan = plan_physical_page(
-                source_path,
-                index_path,
-                source,
-                scan_cursor=scan_cursor,
-                **options,
-            )
-            metrics.planner_ms = (time.perf_counter() - planner_started) * 1000.0
-            result = build_indexed_source_envelope(
-                source=source,
-                source_path=source_path,
-                index_path=index_path,
+            result = plan_and_build_from_pinned_session(
+                session,
                 target_identity=target_identity,
                 correlation_context=correlation_context,
-                physical_plan=plan,
-                expected_snapshot=session.snapshot_for_plan(plan)
-                if plan.status == REPRODUCIBLE
-                else None,
-                session=session,
-                caps=caps,
-                planner_ms=metrics.planner_ms,
+                scan_cursor=scan_cursor,
                 fault_injector=fault_injector,
+                **planner_options,
             )
             metrics.duration_ms = (time.perf_counter() - started) * 1000.0
             return replace(result, metrics=metrics.freeze())
     except _Fallback as exc:
         metrics.duration_ms = (time.perf_counter() - started) * 1000.0
         return _empty_envelope(source, exc.reason, context_before, metrics)
+    except sqlite3.OperationalError as exc:
+        metrics.duration_ms = (time.perf_counter() - started) * 1000.0
+        text = str(exc).lower()
+        reason = "SQLITE_BUSY" if "busy" in text or "locked" in text else "SQLITE_READ_FAILED"
+        return _empty_envelope(source, reason, context_before, metrics)
     except Exception as exc:
         metrics.duration_ms = (time.perf_counter() - started) * 1000.0
         return _empty_envelope(
@@ -1718,6 +2015,7 @@ def plan_and_build_indexed_source_envelope(
 
 __all__ = (
     "BUILT",
+    "COMPLETENESS_FULL_CERTIFIED",
     "COMPLETENESS_UNCERTIFIED",
     "COMPLETENESS_UNKNOWN",
     "EnvelopeCaps",
@@ -1735,11 +2033,13 @@ __all__ = (
     "MAX_SQLITE_FETCH_BATCH",
     "MAX_TAIL_BYTES",
     "MAX_TAIL_LINES",
+    "NEGATIVE_CERTIFIED",
     "NEGATIVE_UNSAFE",
     "NOT_NEGATIVE",
     "PinnedSourceIndexSession",
     "SourceEnvelopeMetrics",
     "SourceSnapshotMetadata",
     "VERSION",
+    "plan_and_build_from_pinned_session",
     "plan_and_build_indexed_source_envelope",
 )

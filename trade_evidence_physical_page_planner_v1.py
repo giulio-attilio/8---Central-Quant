@@ -18,6 +18,7 @@ import os
 import sqlite3
 import stat
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterable, Mapping, Optional
@@ -294,6 +295,87 @@ def _sqlite_ro(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("BEGIN")
     return connection
+
+
+def _same_stat_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    return bool(
+        int(left.st_dev) == int(right.st_dev)
+        and int(left.st_ino) == int(right.st_ino)
+        and int(left.st_size) == int(right.st_size)
+        and int(left.st_mtime_ns) == int(right.st_mtime_ns)
+        and int(left.st_ctime_ns) == int(right.st_ctime_ns)
+    )
+
+
+def _validate_pinned_planner_resources(
+    connection: sqlite3.Connection,
+    handle: BinaryIO,
+    source: Path,
+    source_id: str,
+    state: Mapping[str, Any],
+    descriptor: os.stat_result,
+    path_state: os.stat_result,
+    expected_snapshot_eof: int,
+    expected_generation_uuid: str,
+    metrics: _Metrics,
+    max_segment_rows: int,
+) -> None:
+    """Bind planning to one already-open source/index transaction.
+
+    Ownership remains with the caller.  This validator intentionally avoids
+    recomputing the V2 seal or reopening either file: the C1 pinned session has
+    already done those eligibility checks and supplies its exact state witness.
+    """
+
+    if handle.closed:
+        raise _PlanningRefused("PINNED_SOURCE_HANDLE_CLOSED")
+    if not connection.in_transaction:
+        raise _PlanningRefused("PINNED_INDEX_TRANSACTION_MISSING")
+    if int(connection.execute("PRAGMA query_only").fetchone()[0]) != 1:
+        raise _PlanningRefused("PINNED_INDEX_NOT_QUERY_ONLY")
+    rows = connection.execute("SELECT * FROM source_state LIMIT 2").fetchall()
+    if len(rows) != 1 or dict(rows[0]) != dict(state):
+        raise _PlanningRefused("PINNED_INDEX_STATE_MISMATCH")
+    if str(state.get("source_id", "")) != str(source_id):
+        raise _PlanningRefused("PINNED_SOURCE_ID_MISMATCH")
+    if str(state.get("generation_uuid", "")) != str(expected_generation_uuid):
+        raise _PlanningRefused("PINNED_GENERATION_MISMATCH")
+    if int(expected_snapshot_eof) != int(descriptor.st_size):
+        raise _PlanningRefused("PINNED_SNAPSHOT_EOF_MISMATCH")
+    if str(state.get("source_path", "")) != _normalized_path(source):
+        raise _PlanningRefused("PINNED_SOURCE_PATH_MISMATCH")
+
+    current_descriptor = os.fstat(handle.fileno())
+    try:
+        current_path = source.lstat()
+    except FileNotFoundError as exc:
+        raise _PlanningRefused("PINNED_SOURCE_REMOVED") from exc
+    if (
+        not stat.S_ISREG(current_descriptor.st_mode)
+        or not stat.S_ISREG(current_path.st_mode)
+        or not _same_stat_snapshot(descriptor, current_descriptor)
+        or not _same_stat_snapshot(path_state, current_path)
+        or int(current_path.st_dev) != int(descriptor.st_dev)
+        or int(current_path.st_ino) != int(descriptor.st_ino)
+    ):
+        raise _PlanningRefused("PINNED_SOURCE_SNAPSHOT_MISMATCH")
+
+    # The owner session already performed the exact anchor/alignment reads and
+    # verified both V2 seals on this transaction.  Preserve the standalone C0
+    # plan's logical accounting without issuing the same journal I/O twice.
+    certified = int(state["certified_watermark"])
+    metrics.validation_bytes += int(state["certified_anchor_length"])
+    if certified:
+        metrics.validation_bytes += 1
+    sealed_rows = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM segments WHERE start_offset < ?",
+            (certified,),
+        ).fetchone()[0]
+    )
+    metrics.segment_rows_consulted += sealed_rows
+    if metrics.segment_rows_consulted > max_segment_rows:
+        raise _PlanningRefused("SEGMENT_ROW_LIMIT")
 
 
 def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -924,6 +1006,13 @@ def plan_physical_page(
     max_segment_rows: int = DEFAULT_MAX_SEGMENT_ROWS,
     max_append_proof_bytes: int = DEFAULT_MAX_APPEND_PROOF_BYTES,
     fault_injector: FaultInjector = None,
+    _pinned_connection: Optional[sqlite3.Connection] = None,
+    _pinned_handle: Optional[BinaryIO] = None,
+    _pinned_state: Optional[Mapping[str, Any]] = None,
+    _pinned_descriptor: Optional[os.stat_result] = None,
+    _pinned_path_state: Optional[os.stat_result] = None,
+    _pinned_snapshot_eof: Optional[int] = None,
+    _pinned_generation_uuid: Optional[str] = None,
 ) -> PhysicalPagePlan:
     """Plan one exact legacy physical page from a certified schema-V2 index.
 
@@ -937,6 +1026,20 @@ def plan_physical_page(
     selected_snapshot = 0
     selected_page_end = 0
     source_size = 0
+    connection: Optional[sqlite3.Connection] = None
+    owns_connection = False
+    pinned_values = (
+        _pinned_connection,
+        _pinned_handle,
+        _pinned_state,
+        _pinned_descriptor,
+        _pinned_path_state,
+        _pinned_snapshot_eof,
+        _pinned_generation_uuid,
+    )
+    pinned = any(value is not None for value in pinned_values)
+    if pinned and any(value is None for value in pinned_values):
+        return _not_reproducible("PINNED_SESSION_ARGUMENT_MISMATCH")
     if (
         byte_budget <= 0
         or record_budget <= 0
@@ -951,18 +1054,51 @@ def plan_physical_page(
     ):
         return _not_reproducible("CURSOR_AND_EXPLICIT_WINDOW")
     try:
-        path_state = source.lstat()
-        if stat.S_ISLNK(path_state.st_mode) or not stat.S_ISREG(path_state.st_mode):
-            raise _PlanningRefused("SOURCE_NOT_REGULAR_FILE")
-        connection = _sqlite_ro(index)
+        if pinned:
+            connection = _pinned_connection
+            path_state = _pinned_path_state
+        else:
+            path_state = source.lstat()
+            if stat.S_ISLNK(path_state.st_mode) or not stat.S_ISREG(path_state.st_mode):
+                raise _PlanningRefused("SOURCE_NOT_REGULAR_FILE")
+            connection = _sqlite_ro(index)
+            owns_connection = True
     except FileNotFoundError:
         return _not_reproducible("SOURCE_OR_INDEX_MISSING")
+    except _PlanningRefused as exc:
+        return _not_reproducible(exc.reason)
     except (OSError, sqlite3.DatabaseError) as exc:
         return _not_reproducible(f"OPEN_FAILED:{type(exc).__name__}")
 
     try:
-        with source.open("rb") as handle:
-            descriptor = os.fstat(handle.fileno())
+        assert connection is not None
+        handle_context = (
+            nullcontext(_pinned_handle) if pinned else source.open("rb")
+        )
+        with handle_context as handle:
+            assert handle is not None
+            if pinned:
+                assert _pinned_state is not None
+                assert _pinned_descriptor is not None
+                assert _pinned_path_state is not None
+                assert _pinned_snapshot_eof is not None
+                assert _pinned_generation_uuid is not None
+                descriptor = _pinned_descriptor
+                _validate_pinned_planner_resources(
+                    connection,
+                    handle,
+                    source,
+                    source_id,
+                    _pinned_state,
+                    descriptor,
+                    _pinned_path_state,
+                    _pinned_snapshot_eof,
+                    _pinned_generation_uuid,
+                    metrics,
+                    max_segment_rows,
+                )
+            else:
+                descriptor = os.fstat(handle.fileno())
             source_size = int(descriptor.st_size)
             if (
                 int(path_state.st_dev) != int(descriptor.st_dev)
@@ -970,15 +1106,20 @@ def plan_physical_page(
                 or not stat.S_ISREG(descriptor.st_mode)
             ):
                 raise _PlanningRefused("LSTAT_FSTAT_MISMATCH")
-            state = _validate_v2_state(
-                connection,
-                handle,
-                source,
-                source_id,
-                descriptor,
-                metrics,
-                max_segment_rows,
+            state = (
+                _pinned_state
+                if pinned
+                else _validate_v2_state(
+                    connection,
+                    handle,
+                    source,
+                    source_id,
+                    descriptor,
+                    metrics,
+                    max_segment_rows,
+                )
             )
+            assert state is not None
             certified = int(state["certified_watermark"])
             decoded = decode_scan_cursor(scan_cursor) if scan_cursor else None
             if decoded is not None:
@@ -1262,11 +1403,65 @@ def plan_physical_page(
             metrics=metrics,
         )
     finally:
-        try:
-            connection.execute("ROLLBACK")
-        except sqlite3.DatabaseError:
-            pass
-        connection.close()
+        if owns_connection and connection is not None:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            connection.close()
+
+
+def plan_physical_page_pinned(
+    source_path: Path | str,
+    index_path: Path | str,
+    source_id: str,
+    *,
+    connection: sqlite3.Connection,
+    source_handle: BinaryIO,
+    source_state: Mapping[str, Any],
+    source_descriptor: os.stat_result,
+    source_path_state: os.stat_result,
+    expected_snapshot_eof: int,
+    expected_generation_uuid: str,
+    scan_cursor: Optional[str] = None,
+    snapshot_eof: Optional[int] = None,
+    page_end: Optional[int] = None,
+    byte_budget: int = BYTE_BUDGET,
+    record_budget: int = RECORD_BUDGET,
+    block_bytes: int = BLOCK_BYTES,
+    max_boundary_scan_bytes: int = DEFAULT_MAX_BOUNDARY_SCAN_BYTES,
+    max_segment_rows: int = DEFAULT_MAX_SEGMENT_ROWS,
+    max_append_proof_bytes: int = DEFAULT_MAX_APPEND_PROOF_BYTES,
+    fault_injector: FaultInjector = None,
+) -> PhysicalPagePlan:
+    """Plan on resources owned by one already-entered pinned C1 session.
+
+    This function never opens or closes the journal/SQLite sidecar and never
+    commits or rolls back the caller's transaction.
+    """
+
+    return plan_physical_page(
+        source_path,
+        index_path,
+        source_id,
+        scan_cursor=scan_cursor,
+        snapshot_eof=snapshot_eof,
+        page_end=page_end,
+        byte_budget=byte_budget,
+        record_budget=record_budget,
+        block_bytes=block_bytes,
+        max_boundary_scan_bytes=max_boundary_scan_bytes,
+        max_segment_rows=max_segment_rows,
+        max_append_proof_bytes=max_append_proof_bytes,
+        fault_injector=fault_injector,
+        _pinned_connection=connection,
+        _pinned_handle=source_handle,
+        _pinned_state=source_state,
+        _pinned_descriptor=source_descriptor,
+        _pinned_path_state=source_path_state,
+        _pinned_snapshot_eof=expected_snapshot_eof,
+        _pinned_generation_uuid=expected_generation_uuid,
+    )
 
 
 __all__ = [
@@ -1278,4 +1473,5 @@ __all__ = [
     "PhysicalPagePlan",
     "REPRODUCIBLE",
     "plan_physical_page",
+    "plan_physical_page_pinned",
 ]

@@ -425,7 +425,10 @@ def test_v2_baseline_rechecks_source_after_summary_seal(
     )
     with pytest.raises(
         index_module.IndexBuildError,
-        match="before V2 baseline certification commit",
+        match=(
+            "deep baseline certification failed"
+            "|before V2 baseline certification commit"
+        ),
     ):
         index_module.build_index_v2(
             source,

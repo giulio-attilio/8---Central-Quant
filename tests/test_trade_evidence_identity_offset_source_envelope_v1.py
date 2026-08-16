@@ -17,11 +17,13 @@ import trade_evidence_identity_offset_source_envelope_v1 as envelope_module
 import trade_timeline_validator as validator
 from trade_evidence_identity_offset_source_envelope_v1 import (
     BUILT,
+    COMPLETENESS_FULL_CERTIFIED,
     COMPLETENESS_UNCERTIFIED,
     COMPLETENESS_UNKNOWN,
     FALLBACK_REQUIRED,
     INDEX_ONLY,
     INDEX_PLUS_TAIL,
+    NEGATIVE_CERTIFIED,
     NEGATIVE_UNSAFE,
     NOT_NEGATIVE,
     EnvelopeCaps,
@@ -30,10 +32,12 @@ from trade_evidence_identity_offset_source_envelope_v1 import (
     plan_and_build_indexed_source_envelope,
 )
 from trade_evidence_physical_page_planner_v1 import (
+    DEFAULT_MAX_SEGMENT_ROWS,
     NOT_REPRODUCIBLE,
     REPRODUCIBLE,
     plan_physical_page,
 )
+from trade_evidence_physical_window_contract_v1 import encode_scan_cursor
 
 
 @pytest.fixture(autouse=True)
@@ -164,10 +168,10 @@ def test_v2_certified_index_only_builds_private_envelope_without_mutating_input(
     context = _context("T-1")
     before = copy.deepcopy(context)
 
-    result = _build(source, index, context)
+    result = _plan_and_build(source, index, context)
 
     assert result.status == BUILT
-    assert result.completeness_status == COMPLETENESS_UNCERTIFIED
+    assert result.completeness_status == COMPLETENESS_FULL_CERTIFIED
     assert result.index_mode == INDEX_ONLY
     assert [row["event_type"] for row in result.correlated_rows] == [
         "POSITION_OPEN",
@@ -333,6 +337,7 @@ def test_external_plan_entrypoint_is_testing_only_and_never_claims_completeness(
         "FIRST",
         "SECOND",
     ]
+    assert lifecycle.completeness_status == COMPLETENESS_FULL_CERTIFIED
 
 
 def test_index_plus_streaming_terminal_tail_preserves_order(tmp_path: Path) -> None:
@@ -360,6 +365,70 @@ def test_index_plus_streaming_terminal_tail_preserves_order(tmp_path: Path) -> N
     ]
     assert result.metrics.tail_bytes == len(terminal)
     assert result.factual_offsets[1] == len(first)
+    assert result.raw_source_metadata["terminal_tail_incomplete"] is True
+
+
+def test_incomplete_terminal_tail_can_never_certify_negative(
+    tmp_path: Path,
+) -> None:
+    source, index = _build_v2(
+        tmp_path,
+        _line(trade_id="FOREIGN", event_type="HEAD"),
+    )
+    fragment = b'{"trade_id":"T-INCOMPLETE'
+    with source.open("ab") as handle:
+        handle.write(fragment)
+    index_module.catch_up_index(source, index, "timeline", measure_memory=False)
+    # This operational hint is not a completeness witness.  The C2 reader
+    # must derive terminal integrity from its pinned journal descriptor.
+    with sqlite3.connect(index) as connection:
+        connection.execute(
+            "UPDATE source_state SET trailing_fragment_bytes=0, "
+            "trailing_fragment_kind='NONE' WHERE singleton_id=1"
+        )
+    context = _context("T-INCOMPLETE")
+
+    result = _plan_and_build(source, index, context)
+
+    assert result.status == BUILT
+    assert result.index_mode == INDEX_PLUS_TAIL
+    assert result.correlated_rows == ()
+    assert result.physical_metadata["invalid_lines"] == 1
+    assert result.completeness_status == COMPLETENESS_FULL_CERTIFIED
+    assert result.negative_status == NEGATIVE_UNSAFE
+    assert result.raw_source_metadata["terminal_tail_incomplete"] is True
+
+
+def test_unsigned_cursor_can_never_certify_negative_even_when_not_tainted(
+    tmp_path: Path,
+) -> None:
+    source, index = _build_v2(
+        tmp_path,
+        _line(trade_id="T-CURSOR-UNSAFE", event_type="OPEN"),
+    )
+    cursor = encode_scan_cursor(
+        source,
+        source.stat(),
+        source.stat().st_size,
+        0,
+        coverage_tainted=False,
+    )
+    context = _context("T-CURSOR-UNSAFE")
+
+    result = plan_and_build_indexed_source_envelope(
+        source="timeline",
+        source_path=source,
+        index_path=index,
+        target_identity=validator.target_identity_from_context(context),
+        correlation_context=context,
+        scan_cursor=cursor,
+    )
+
+    assert result.status == BUILT
+    assert result.correlated_rows == ()
+    assert result.completeness_status == COMPLETENESS_FULL_CERTIFIED
+    assert result.negative_status == NEGATIVE_UNSAFE
+    assert result.raw_source_metadata["scan_cursor_supplied"] is True
 
 
 def test_tail_candidate_identity_and_factual_caps_return_fallback(tmp_path: Path) -> None:
@@ -550,7 +619,9 @@ def test_heap_cursor_and_total_journal_byte_caps_are_enforced(tmp_path: Path) ->
     assert charged_result.fallback_reason == "SOURCE_JOURNAL_BYTE_CAP_EXCEEDED"
 
 
-def test_zero_evidence_certified_and_negative_unsafe_are_conservative(tmp_path: Path) -> None:
+def test_zero_evidence_certification_distinguishes_trusted_and_external_plans(
+    tmp_path: Path,
+) -> None:
     source, index = _build_v2(
         tmp_path,
         b"".join(_line(trade_id="OTHER", event_type="OBS", sequence=i) for i in range(8)),
@@ -570,8 +641,8 @@ def test_zero_evidence_certified_and_negative_unsafe_are_conservative(tmp_path: 
     assert certified.correlated_rows == ()
     assert certified.metrics.record_count == 0
     assert certified.raw_source_metadata["plan"]["mapping_records"] == 0
-    assert certified.negative_status == NEGATIVE_UNSAFE
-    assert certified.completeness_status == COMPLETENESS_UNCERTIFIED
+    assert certified.negative_status == NEGATIVE_CERTIFIED
+    assert certified.completeness_status == COMPLETENESS_FULL_CERTIFIED
 
     tampered_source, tampered_index = _build_v2(
         tmp_path / "missing-posting",
@@ -589,12 +660,9 @@ def test_zero_evidence_certified_and_negative_unsafe_are_conservative(tmp_path: 
         _context("T-MISSING-POSTING"),
         plan=tampered_plan,
     )
-    assert tampered.status == BUILT
-    assert tampered.correlated_rows == ()
-    assert tampered.metrics.record_count == 0
-    assert tampered.raw_source_metadata["plan"]["mapping_records"] == 1
-    assert tampered.negative_status == NEGATIVE_UNSAFE
-    assert tampered.completeness_status == COMPLETENESS_UNCERTIFIED
+    assert tampered.status == FALLBACK_REQUIRED
+    assert tampered.fallback_reason == "SERVING_COMPLETENESS_SEAL_MISMATCH"
+    assert tampered.completeness_status == COMPLETENESS_UNKNOWN
 
     partial_plan = plan_physical_page(
         source,
@@ -617,19 +685,19 @@ def test_zero_evidence_certified_and_negative_unsafe_are_conservative(tmp_path: 
 
 
 @pytest.mark.parametrize(
-    ("tamper", "classification"),
+    "tamper",
     [
-        ("remove_posting", "NEGATIVE_UNSAFE"),
-        ("remove_identity_and_postings", "NEGATIVE_UNSAFE"),
-        ("remove_record_and_postings", "NEGATIVE_UNSAFE"),
-        ("swap_identity_ownership", "DETECTED"),
-        ("move_posting_to_wrong_record", "DETECTED"),
-        ("add_wrong_but_fk_coherent_posting", "DETECTED"),
-        ("change_identity_class", "DETECTED"),
+        "remove_posting",
+        "remove_identity_and_postings",
+        "remove_record_and_postings",
+        "swap_identity_ownership",
+        "move_posting_to_wrong_record",
+        "add_wrong_but_fk_coherent_posting",
+        "change_identity_class",
     ],
 )
-def test_logical_index_tamper_matrix_is_never_certified_complete(
-    tmp_path: Path, tamper: str, classification: str
+def test_logical_index_tamper_matrix_fails_serving_completeness_before_lookup(
+    tmp_path: Path, tamper: str
 ) -> None:
     source, index = _build_v2(
         tmp_path,
@@ -703,25 +771,17 @@ def test_logical_index_tamper_matrix_is_never_certified_complete(
         else:  # pragma: no cover - parametrization is closed above
             raise AssertionError(tamper)
         assert index_module.verify_certified_summary_hash(connection) is True
+        assert index_module.verify_serving_completeness_seal(connection) is False
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
     result = _plan_and_build(source, index, _context("T-TAMPER"))
 
-    if classification == "DETECTED":
-        assert result.status == FALLBACK_REQUIRED
-        assert result.fallback_reason in {
-            "FACTUAL_RECORD_VERIFICATION_FAILED",
-            "FACTUAL_IDENTITY_SET_MISMATCH",
-        }
-        assert result.completeness_status == COMPLETENESS_UNKNOWN
-    else:
-        assert result.status == BUILT
-        assert result.correlated_rows == ()
-        assert result.negative_status == NEGATIVE_UNSAFE
-        assert result.completeness_status == COMPLETENESS_UNCERTIFIED
+    assert result.status == FALLBACK_REQUIRED
+    assert result.fallback_reason == "SERVING_COMPLETENESS_SEAL_MISMATCH"
+    assert result.completeness_status == COMPLETENESS_UNKNOWN
 
 
-def test_positive_partial_result_explicitly_reports_unsealed_index_completeness(
+def test_positive_partial_logical_tamper_fails_serving_completeness_before_lookup(
     tmp_path: Path,
 ) -> None:
     source, index = _build_v2(
@@ -744,15 +804,13 @@ def test_positive_partial_result_explicitly_reports_unsealed_index_completeness(
             (identity_id, missing[0], missing[1]),
         )
         assert index_module.verify_certified_summary_hash(connection) is True
+        assert index_module.verify_serving_completeness_seal(connection) is False
 
     result = _plan_and_build(source, index, _context("T-FIVE"))
 
-    assert result.status == BUILT
-    assert len(result.correlated_rows) == 4
-    assert result.metrics.record_count == 4
-    assert result.raw_source_metadata["plan"]["mapping_records"] == 5
-    assert result.negative_status == NOT_NEGATIVE
-    assert result.completeness_status == COMPLETENESS_UNCERTIFIED
+    assert result.status == FALLBACK_REQUIRED
+    assert result.fallback_reason == "SERVING_COMPLETENESS_SEAL_MISMATCH"
+    assert result.completeness_status == COMPLETENESS_UNKNOWN
 
 
 def test_resealed_coherent_logical_tamper_cannot_create_a_certified_negative(
@@ -781,14 +839,14 @@ def test_resealed_coherent_logical_tamper_cannot_create_a_certified_negative(
             (resealed,),
         )
         assert index_module.verify_certified_summary_hash(connection) is True
+        assert index_module.verify_serving_completeness_seal(connection) is False
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
     result = _plan_and_build(source, index, _context("T-RESEALED"))
 
-    assert result.status == BUILT
-    assert result.correlated_rows == ()
-    assert result.negative_status == NEGATIVE_UNSAFE
-    assert result.completeness_status == COMPLETENESS_UNCERTIFIED
+    assert result.status == FALLBACK_REQUIRED
+    assert result.fallback_reason == "SERVING_COMPLETENESS_SEAL_MISMATCH"
+    assert result.completeness_status == COMPLETENESS_UNKNOWN
 
 
 def test_invalid_utf8_json_nonmapping_and_duplicates_keep_physical_metadata(tmp_path: Path) -> None:
@@ -858,7 +916,7 @@ def test_planner_not_reproducible_and_snapshot_witness_change_fallback(tmp_path:
         plan=plan,
         expected_snapshot=expected,
     )
-    assert changed.fallback_reason == "SOURCE_SNAPSHOT_WITNESS_MISMATCH"
+    assert changed.fallback_reason == "SERVING_COMPLETENESS_SEAL_MISMATCH"
     assert context == before
     assert metrics is None
 
@@ -1185,6 +1243,7 @@ def test_plan_and_build_pins_session_before_planning(tmp_path: Path) -> None:
         correlation_context=context,
     )
     assert result.status == BUILT
+    assert result.completeness_status == COMPLETENESS_FULL_CERTIFIED
     assert result.metrics.planner_ms >= 0
     assert result.metrics.source_journal_bytes == (
         result.metrics.boundary_bytes
@@ -1203,6 +1262,12 @@ def test_plan_and_build_pins_session_before_planning(tmp_path: Path) -> None:
             "PLANNER_BOUNDARY_CAP_EXCEEDED",
         ),
         ({"max_append_proof_bytes": 2}, "PLANNER_APPEND_PROOF_CAP_EXCEEDED"),
+        (
+            {"max_segment_rows": DEFAULT_MAX_SEGMENT_ROWS + 1},
+            "PLANNER_SEGMENT_ROW_CAP_EXCEEDED",
+        ),
+        ({"page_end": 0}, "PLANNER_OPTION_FORBIDDEN"),
+        ({"snapshot_eof": 0}, "PLANNER_OPTION_FORBIDDEN"),
     ],
 )
 def test_plan_and_build_rejects_unbounded_planner_options_before_planning(
