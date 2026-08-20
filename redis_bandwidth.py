@@ -24,7 +24,8 @@ DEFAULT_MAX_CARDINALITY = 512
 DEFAULT_MAX_RUNTIME_KEYS = 256
 DEFAULT_DAILY_FLAG_TTL_SECONDS = 45 * 24 * 60 * 60
 DEFAULT_SAFE_CACHE_SECONDS = 5.0
-HISTORY_HOT_KEY_CACHE_SECONDS = 60.0
+DEFAULT_HISTORY_CACHE_SECONDS = 60.0
+HISTORY_HOT_KEY_CACHE_SECONDS = 300.0
 PAPER_POSITION_CACHE_SECONDS = 15.0
 
 HOT_KEY_POLICIES: Dict[str, Dict[str, Any]] = {
@@ -36,8 +37,9 @@ HOT_KEY_POLICIES: Dict[str, Dict[str, Any]] = {
     "falcon:signals": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
     "donkey:positions": {"policy": "PAPER_POSITION_CACHE_LIVE_FRESH", "cache_seconds": PAPER_POSITION_CACHE_SECONDS},
     "falcon:trades": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
-    "donkey:trades": {"policy": "HISTORY_CACHE", "cache_seconds": HISTORY_HOT_KEY_CACHE_SECONDS},
+    "donkey:trades": {"policy": "HISTORY_CACHE", "cache_seconds": DEFAULT_HISTORY_CACHE_SECONDS},
     "cobra:positions": {"policy": "PAPER_POSITION_CACHE_LIVE_FRESH", "cache_seconds": PAPER_POSITION_CACHE_SECONDS},
+    "trendpro:positions": {"policy": "PAPER_POSITION_CACHE_LIVE_FRESH", "cache_seconds": PAPER_POSITION_CACHE_SECONDS},
 }
 
 _TRUE_VALUES = {"1", "true", "yes", "sim", "on"}
@@ -220,11 +222,65 @@ def _execution_mode_for_caller(caller: Any) -> str:
         value = os.environ.get("FALCON_MODE") or os.environ.get("EXECUTION_MODE")
     elif name.endswith("predator"):
         value = os.environ.get("PREDATOR_MODE") or os.environ.get("SMART_PREDATOR_MODE")
-    elif name.endswith("meme") or name.endswith("turtle"):
+    elif name.endswith(("cobra", "donkey", "meme", "trendpro", "turtle")):
+        # These modules persist simulated strategy positions.  The process-wide
+        # EXECUTION_MODE may be LIVE solely for Falcon and must not disable the
+        # short PAPER cache for their independent position snapshots.
         value = "PAPER"
     else:
         value = os.environ.get("EXECUTION_MODE")
     return str(value or "PAPER").strip().upper()
+
+
+def build_bounded_event_history_payload(
+    events: Any,
+    max_count: int,
+    max_bytes: int,
+) -> Dict[str, Any]:
+    """Build the newest contiguous JSON event tail within count and byte limits."""
+    if not isinstance(events, list):
+        raise ValueError("events must be a list")
+    if max_count < 1:
+        raise ValueError("max_count must be positive")
+    if max_bytes < 2:
+        raise ValueError("max_bytes must fit an empty JSON list")
+
+    candidates = events[-max_count:]
+    count_trimmed = len(events) - len(candidates)
+    selected_reversed = []
+    estimated_bytes = 2
+
+    for event in reversed(candidates):
+        item_serialized = json.dumps(event, ensure_ascii=False)
+        item_bytes = len(item_serialized.encode("utf-8"))
+        separator_bytes = 2 if selected_reversed else 0
+        if estimated_bytes + separator_bytes + item_bytes > max_bytes:
+            if not selected_reversed:
+                return {
+                    "ok": False,
+                    "status": "EVENT_TOO_LARGE",
+                    "event_bytes": item_bytes + 2,
+                }
+            break
+        selected_reversed.append(event)
+        estimated_bytes += separator_bytes + item_bytes
+
+    selected = list(reversed(selected_reversed))
+    serialized = json.dumps(selected, ensure_ascii=False)
+    payload_bytes = len(serialized.encode("utf-8"))
+    if payload_bytes > max_bytes:
+        raise ValueError("final events payload exceeds local byte budget")
+
+    byte_trimmed = len(candidates) - len(selected)
+    return {
+        "ok": True,
+        "events": selected,
+        "serialized": serialized,
+        "payload_bytes": payload_bytes,
+        "trimmed_count": count_trimmed + byte_trimmed,
+        "trimmed_by_count": count_trimmed,
+        "trimmed_by_bytes": byte_trimmed,
+    }
 
 
 def safe_cache_seconds_for_key(
@@ -238,7 +294,10 @@ def safe_cache_seconds_for_key(
         return 0.0
     lowered = sanitize_redis_key(key).lower()
     if lowered.endswith((":events", ":trades", ":signals")) or "execution_firewall_events" in lowered:
-        return HISTORY_HOT_KEY_CACHE_SECONDS
+        policy = HOT_KEY_POLICIES.get(lowered)
+        if policy and policy.get("policy") == "HISTORY_CACHE":
+            return max(0.0, float(policy.get("cache_seconds") or 0.0))
+        return DEFAULT_HISTORY_CACHE_SECONDS
     if lowered.endswith(":positions"):
         mode = str(execution_mode or "UNKNOWN").strip().upper()
         if mode in {"PAPER", "VERIFY", "DRY_RUN", "OBSERVATION_ONLY"}:
@@ -375,7 +434,11 @@ def redis_get(
         if cache_ttl_seconds is None
         else max(0.0, float(cache_ttl_seconds))
     )
-    if no_cache or not bandwidth_diet_enabled():
+    if (
+        no_cache
+        or not bandwidth_diet_enabled()
+        or redis_key_requires_fresh_read(key, execution_mode=inferred_mode)
+    ):
         ttl = 0.0
     now_mono = time.monotonic()
     if ttl > 0:
@@ -490,6 +553,8 @@ def redis_set(
                 if cache_ttl_seconds is None
                 else max(0.0, float(cache_ttl_seconds))
             ) if bandwidth_diet_enabled() else 0.0
+            if redis_key_requires_fresh_read(key, execution_mode=inferred_mode):
+                safe_cache_seconds = 0.0
             if safe_cache_seconds > 0:
                 _cache[cache_key] = {"client": client, "value": value, "stored_at": now_mono}
             else:
@@ -879,12 +944,14 @@ def reset_redis_bandwidth_state(confirm: bool = False) -> Dict[str, Any]:
 __all__ = [
     "VERSION",
     "HOT_KEY_POLICIES",
+    "DEFAULT_HISTORY_CACHE_SECONDS",
     "HISTORY_HOT_KEY_CACHE_SECONDS",
     "PAPER_POSITION_CACHE_SECONDS",
     "instrumentation_enabled",
     "bandwidth_diet_enabled",
     "sanitize_redis_key",
     "classify_redis_key",
+    "build_bounded_event_history_payload",
     "safe_cache_seconds_for_key",
     "redis_key_requires_fresh_read",
     "ttl_seconds_for_key",
