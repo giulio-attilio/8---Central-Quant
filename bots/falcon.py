@@ -45,6 +45,7 @@ from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask
 from upstash_redis import Redis
 from redis_bandwidth import (
+    build_bounded_event_history_payload as bandwidth_build_bounded_event_history_payload,
     redis_compare_and_delete as bandwidth_redis_compare_and_delete,
     redis_get_authoritative as bandwidth_redis_get_authoritative,
     redis_get as bandwidth_redis_get,
@@ -335,6 +336,10 @@ POSITIONS_KEY = "falcon:positions"
 SIGNALS_KEY = "falcon:signals"
 TRADES_KEY = "falcon:trades"
 EVENTS_KEY = "falcon:events"
+# The REST client embeds this serialized value in another JSON command.  Even
+# worst-case escaping of 4 MiB stays below Upstash's 10 MiB request envelope.
+FALCON_EVENTS_MAX_COUNT = 5000
+FALCON_EVENTS_MAX_SERIALIZED_BYTES = 4 * 1024 * 1024
 COOLDOWN_KEY = "falcon:cooldowns"
 DAILY_SUMMARY_KEY = "falcon:daily_summary_sent"
 MONTHLY_SUMMARY_KEY = "falcon:monthly_summary_sent"
@@ -348,6 +353,7 @@ FALCON_CLIENT_ORDER_ID_RESERVATION_PREFIX = ACCOUNT_CLIENT_ORDER_ID_LEDGER_PREFI
 
 redis = Redis(url=UPSTASH_REDIS_REST_URL, token=UPSTASH_REDIS_REST_TOKEN)
 redis_lock = threading.Lock()
+events_redis_lock = threading.Lock()
 position_mutation_lock = threading.RLock()
 manual_close_outcome_projection_lock = threading.RLock()
 management_alert_guard_lock = threading.RLock()
@@ -366,6 +372,12 @@ HEALTH = {
     "last_success": None,
     "last_error": None,
     "last_warning": None,
+    "events_persist_status": "NOT_ATTEMPTED",
+    "events_persist_last_at": None,
+    "events_persist_count": 0,
+    "events_persist_bytes": 0,
+    "events_persist_trimmed_count": 0,
+    "events_persist_last_error": None,
     "last_invalid_watchlist_check": None,
     "last_watchdog_alert": None,
     "last_watchdog_alert_ts": 0,
@@ -599,6 +611,137 @@ def redis_set_json(key, value):
         return False
 
 
+def _set_falcon_events_persist_health(
+    status,
+    *,
+    count=None,
+    payload_bytes=None,
+    trimmed_count=0,
+    error=None,
+):
+    """Store only scalar diagnostics for the latest bounded events write."""
+    HEALTH["events_persist_status"] = str(status)
+    HEALTH["events_persist_last_at"] = data_hora_sp_str()
+    HEALTH["events_persist_count"] = count
+    HEALTH["events_persist_bytes"] = payload_bytes
+    HEALTH["events_persist_trimmed_count"] = int(trimmed_count or 0)
+    HEALTH["events_persist_last_error"] = str(error)[:160] if error else None
+
+
+def _falcon_events_exception_code(exc):
+    """Classify an exception without copying request or event payloads to HEALTH."""
+    error_type = type(exc).__name__
+    if "max request size exceeded" in str(exc).lower():
+        return f"{error_type}:MAX_REQUEST_SIZE_EXCEEDED"
+    return error_type
+
+
+def _fail_falcon_events_persist(status, error, *, set_operation=False):
+    error_code = str(error or status)[:160]
+    _set_falcon_events_persist_health(status, error=error_code)
+    previous_warning = HEALTH.get("last_warning")
+    previous_is_unrelated = (
+        isinstance(previous_warning, str)
+        and previous_warning
+        and not previous_warning.startswith(f"redis set {EVENTS_KEY}:")
+        and not previous_warning.startswith("falcon events persist ")
+    )
+    if status == "EVENT_TOO_LARGE" and previous_is_unrelated:
+        return False
+    if set_operation:
+        HEALTH["last_warning"] = f"redis set {EVENTS_KEY}: {error_code}"
+    else:
+        HEALTH["last_warning"] = f"falcon events persist {status}: {error_code}"
+    return False
+
+
+def _decode_falcon_events_value(raw):
+    """Decode the existing events value without treating corruption as empty."""
+    if raw is None:
+        return []
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        data = json.loads(raw)
+    else:
+        data = raw
+    if not isinstance(data, list):
+        raise ValueError("falcon events value is not a JSON list")
+    if any(not isinstance(event, dict) for event in data):
+        raise ValueError("falcon events value contains a non-object item")
+    return data
+
+
+def _build_falcon_events_payload(events, max_count, max_bytes):
+    return bandwidth_build_bounded_event_history_payload(events, max_count, max_bytes)
+
+
+def _append_falcon_event_bounded(item):
+    """Append one event under the process lock and preserve remote data on failure."""
+    with events_redis_lock:
+        try:
+            with redis_lock:
+                raw = bandwidth_redis_get(redis, EVENTS_KEY, caller=__name__)
+        except Exception as exc:
+            return _fail_falcon_events_persist("GET_FAILED", _falcon_events_exception_code(exc))
+
+        try:
+            data = _decode_falcon_events_value(raw)
+        except Exception as exc:
+            return _fail_falcon_events_persist("PARSE_FAILED", _falcon_events_exception_code(exc))
+
+        data.append(item)
+        try:
+            bounded = _build_falcon_events_payload(
+                data,
+                FALCON_EVENTS_MAX_COUNT,
+                FALCON_EVENTS_MAX_SERIALIZED_BYTES,
+            )
+        except Exception as exc:
+            return _fail_falcon_events_persist(
+                "SERIALIZE_FAILED",
+                _falcon_events_exception_code(exc),
+            )
+
+        if not bounded.get("ok"):
+            event_bytes = int(bounded.get("event_bytes") or 0)
+            return _fail_falcon_events_persist(
+                "EVENT_TOO_LARGE",
+                f"event_bytes={event_bytes} budget_bytes={FALCON_EVENTS_MAX_SERIALIZED_BYTES}",
+            )
+
+        try:
+            with redis_lock:
+                bandwidth_redis_set(
+                    redis,
+                    EVENTS_KEY,
+                    bounded["serialized"],
+                    caller=__name__,
+                )
+        except Exception as exc:
+            return _fail_falcon_events_persist(
+                "SET_FAILED",
+                _falcon_events_exception_code(exc),
+                set_operation=True,
+            )
+
+        status = "OK"
+        if bounded["trimmed_by_bytes"]:
+            status = "TRIMMED_BY_BYTES"
+        elif bounded["trimmed_by_count"]:
+            status = "TRIMMED_BY_COUNT"
+        _set_falcon_events_persist_health(
+            status,
+            count=len(bounded["events"]),
+            payload_bytes=bounded["payload_bytes"],
+            trimmed_count=bounded["trimmed_count"],
+        )
+        warning = HEALTH.get("last_warning")
+        if isinstance(warning, str) and warning.startswith(f"redis set {EVENTS_KEY}:"):
+            HEALTH["last_warning"] = None
+        return True
+
+
 def _falcon_client_order_id_health_update(reservation):
     reservation = reservation if isinstance(reservation, dict) else {}
     role = str(reservation.get("role") or "").upper().strip() or None
@@ -727,6 +870,8 @@ def falcon_prepare_initial_disaster_stop_client_order_id(
 
 
 def redis_list_append(key, item, max_len=5000):
+    if key == EVENTS_KEY:
+        return _append_falcon_event_bounded(item)
     data = redis_get_json(key, [])
     if not isinstance(data, list):
         data = []

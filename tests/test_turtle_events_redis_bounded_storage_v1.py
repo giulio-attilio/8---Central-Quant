@@ -8,6 +8,8 @@ import time
 import unittest
 from pathlib import Path
 
+from redis_bandwidth import build_bounded_event_history_payload
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TURTLE_PATH = ROOT / "bots" / "turtle.py"
@@ -112,6 +114,7 @@ def _runtime(
         "TURTLE_EVENTS_MAX_SERIALIZED_BYTES": max_bytes,
         "HEALTH": health,
         "data_hora_sp_str": lambda: "13/08/2026 12:34",
+        "bandwidth_build_bounded_event_history_payload": build_bounded_event_history_payload,
         "bandwidth_redis_get": fake.get,
         "bandwidth_redis_set": fake.set,
         "redis_get_json": lambda _key, default: list(default) if isinstance(default, list) else default,
