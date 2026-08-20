@@ -52,12 +52,13 @@ def _function_node(source: str, name: str) -> ast.FunctionDef:
     return matches[0]
 
 
-def test_01_falcon_events_hot_key_is_cached_for_sixty_seconds():
+def test_01_falcon_events_hot_key_is_cached_for_three_hundred_seconds():
     client = FakeRedis({"falcon:events": "large-event-history"})
     for _ in range(3):
         assert bandwidth.redis_get(client, "falcon:events", caller="central_bots.falcon") == "large-event-history"
     assert client.get_calls == ["falcon:events"]
-    assert bandwidth.safe_cache_seconds_for_key("falcon:events") == 60.0
+    assert bandwidth.safe_cache_seconds_for_key("falcon:events") == 300.0
+    assert bandwidth.safe_cache_seconds_for_key("cobra:events") == 60.0
 
 
 def test_02_no_cache_remains_available_for_critical_paths():
@@ -97,6 +98,50 @@ def test_05_write_refreshes_safe_cache_with_new_value(monkeypatch):
     assert bandwidth.redis_get(client, "smartpredator:positions", caller="central_bots.predator") == "new"
     assert client.get_calls == ["smartpredator:positions"]
     assert client.set_calls == [("smartpredator:positions", "new")]
+
+
+def test_05b_history_set_is_immediately_visible_without_another_get():
+    client = FakeRedis({"falcon:events": "old"})
+    assert bandwidth.redis_get(client, "falcon:events", caller="central_bots.falcon") == "old"
+    bandwidth.redis_set(client, "falcon:events", "new", caller="central_bots.falcon")
+    assert bandwidth.redis_get(client, "falcon:events", caller="central_bots.falcon") == "new"
+    assert client.get_calls == ["falcon:events"]
+
+
+def test_05c_history_cache_expires_only_after_three_hundred_seconds(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(bandwidth.time, "monotonic", lambda: now[0])
+    client = FakeRedis({"turtle_pro:trades": "v1"})
+    assert bandwidth.redis_get(client, "turtle_pro:trades", caller="central_bots.turtle") == "v1"
+    client.values["turtle_pro:trades"] = "v2"
+    now[0] = 400.0
+    assert bandwidth.redis_get(client, "turtle_pro:trades", caller="central_bots.turtle") == "v1"
+    now[0] = 400.001
+    assert bandwidth.redis_get(client, "turtle_pro:trades", caller="central_bots.turtle") == "v2"
+    assert client.get_calls == ["turtle_pro:trades", "turtle_pro:trades"]
+
+
+@pytest.mark.parametrize(
+    ("key", "caller"),
+    (
+        ("donkey:positions", "central_bots.donkey"),
+        ("cobra:positions", "central_bots.cobra"),
+        ("trendpro:positions", "central_bots.trendpro"),
+    ),
+)
+def test_05d_paper_bot_positions_stay_cached_when_central_mode_is_live(
+    monkeypatch,
+    key,
+    caller,
+):
+    monkeypatch.setenv("EXECUTION_MODE", "LIVE")
+    client = FakeRedis({key: "paper-v1"})
+    assert bandwidth.redis_get(client, key, caller=caller) == "paper-v1"
+    client.values[key] = "remote-v2"
+    assert bandwidth.redis_get(client, key, caller=caller) == "paper-v1"
+    bandwidth.redis_set(client, key, "local-v3", caller=caller)
+    assert bandwidth.redis_get(client, key, caller=caller) == "local-v3"
+    assert client.get_calls == [key]
 
 
 def test_06_turtle_events_trades_and_signals_are_consolidated():
@@ -220,3 +265,22 @@ def test_16_engine_and_orchestrator_are_not_referenced_by_v2_changes():
     assert "execution_orchestrator" not in helper
     assert "execution_engine" not in light
     assert "execution_orchestrator" not in light
+
+
+def test_17_live_falcon_positions_ignore_an_explicit_cache_ttl(monkeypatch):
+    monkeypatch.setenv("FALCON_MODE", "LIVE")
+    client = FakeRedis({"falcon:positions": "v1"})
+    bandwidth.redis_get(
+        client,
+        "falcon:positions",
+        caller="central_bots.falcon",
+        cache_ttl_seconds=300,
+    )
+    client.values["falcon:positions"] = "v2"
+    assert bandwidth.redis_get(
+        client,
+        "falcon:positions",
+        caller="central_bots.falcon",
+        cache_ttl_seconds=300,
+    ) == "v2"
+    assert client.get_calls == ["falcon:positions", "falcon:positions"]
