@@ -61,7 +61,11 @@ from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from flask import Flask, request
 from upstash_redis import Redis
-from redis_bandwidth import redis_get as bandwidth_redis_get, redis_set as bandwidth_redis_set
+from redis_bandwidth import (
+    build_bounded_event_history_payload as bandwidth_build_bounded_event_history_payload,
+    redis_get as bandwidth_redis_get,
+    redis_set as bandwidth_redis_set,
+)
 from automatic_daily_summaries import CENTRAL_AUTO_DAILY_SUMMARIES_ENABLED
 from telegram_notification_policy import send_automatic_telegram
 
@@ -528,49 +532,8 @@ def _decode_turtle_events_value(raw):
 
 
 def _build_turtle_events_payload(events, max_count, max_bytes):
-    """Build the newest contiguous JSON tail in O(N) item serializations."""
-
-    if max_count < 1:
-        raise ValueError("max_count must be positive")
-    if max_bytes < 2:
-        raise ValueError("max_bytes must fit an empty JSON list")
-
-    candidates = events[-max_count:]
-    count_trimmed = len(events) - len(candidates)
-    selected_reversed = []
-    estimated_bytes = 2  # Opening and closing brackets of the JSON list.
-
-    for event in reversed(candidates):
-        item_serialized = json.dumps(event, ensure_ascii=False)
-        item_bytes = len(item_serialized.encode("utf-8"))
-        separator_bytes = 2 if selected_reversed else 0  # json.dumps uses ", ".
-        if estimated_bytes + separator_bytes + item_bytes > max_bytes:
-            if not selected_reversed:
-                return {
-                    "ok": False,
-                    "status": "EVENT_TOO_LARGE",
-                    "event_bytes": item_bytes + 2,
-                }
-            break
-        selected_reversed.append(event)
-        estimated_bytes += separator_bytes + item_bytes
-
-    selected = list(reversed(selected_reversed))
-    serialized = json.dumps(selected, ensure_ascii=False)
-    payload_bytes = len(serialized.encode("utf-8"))
-    if payload_bytes > max_bytes:
-        raise ValueError("final turtle events payload exceeds local byte budget")
-
-    byte_trimmed = len(candidates) - len(selected)
-    return {
-        "ok": True,
-        "events": selected,
-        "serialized": serialized,
-        "payload_bytes": payload_bytes,
-        "trimmed_count": count_trimmed + byte_trimmed,
-        "trimmed_by_count": count_trimmed,
-        "trimmed_by_bytes": byte_trimmed,
-    }
+    """Keep Turtle's public helper while sharing the exact Falcon envelope logic."""
+    return bandwidth_build_bounded_event_history_payload(events, max_count, max_bytes)
 
 
 def _append_turtle_event_bounded(item):
