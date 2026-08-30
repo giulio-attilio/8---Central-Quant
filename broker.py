@@ -48,6 +48,7 @@ import hashlib
 import secrets
 import hmac
 import json
+import math
 import os
 import re
 import time
@@ -1388,6 +1389,7 @@ def market_info(symbol):
         "settle": market.get("settle"),
         "type": market.get("type"),
         "contract": market.get("contract"),
+        "contract_size": market.get("contractSize"),
         "linear": market.get("linear"),
         "precision": precision,
         "limits": limits,
@@ -1468,26 +1470,37 @@ def amount_details(symbol, notional_usdt, margin_usdt=None, leverage=None):
     if price <= 0:
         raise RuntimeError(f"preço inválido para {symbol}: {price}")
 
-    planned_notional = float(notional_usdt)
-    raw_amount = planned_notional / price
-
     ex = exchange()
     market = None
-    amount = raw_amount
+    planned_notional = float(notional_usdt)
+    raw_amount = None
+    amount = None
+    contract_size = 1.0
     precision_error = None
 
     try:
         market = ex.market(sym)
+        if market.get("contract"):
+            contract_size = safe_float(market.get("contractSize"), None)
+            if contract_size is None or contract_size <= 0:
+                raise ValueError("CONTRACT_SIZE_UNAVAILABLE")
+        raw_amount = planned_notional / (price * contract_size)
         amount = float(ex.amount_to_precision(market["symbol"], raw_amount))
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("ORDER_AMOUNT_PRECISION_INVALID")
     except Exception as exc:
-        precision_error = str(exc)
-        amount = round(raw_amount, 6)
+        precision_error = type(exc).__name__
+        amount = None
 
-    actual_notional = amount * price if amount is not None and price is not None else None
-    info = market_info(sym) if market else {"symbol": sym}
+    actual_notional = amount * price * contract_size if amount is not None and price is not None else None
+    try:
+        info = market_info(sym) if market else {"symbol": sym}
+    except Exception:
+        info = {"symbol": sym}
+    info.setdefault("contract_size", contract_size if market and market.get("contract") else 1.0)
 
     return {
-        "ok": True,
+        "ok": precision_error is None and amount is not None,
         "symbol": sym,
         "bingx_symbol": bingx_api_symbol(sym),
         "margin_usdt": margin_usdt,
@@ -1500,9 +1513,52 @@ def amount_details(symbol, notional_usdt, margin_usdt=None, leverage=None):
         "amount_raw": raw_amount,
         "amount": amount,
         "amount_final": amount,
+        "contract_size": contract_size if market and market.get("contract") else 1.0,
         "effective_notional_usdt": money(actual_notional, 8),
         "precision_error": precision_error,
         "market": info,
+    }
+
+
+def _order_constraint_evidence(details, reduce_only=False):
+    details = details if isinstance(details, dict) else {}
+    market = details.get("market") if isinstance(details.get("market"), dict) else {}
+    amount = safe_float(details.get("amount"), None)
+    actual_notional = safe_float(details.get("effective_notional_usdt"), None)
+    min_amount = safe_float(market.get("min_amount"), None)
+    min_cost = safe_float(market.get("min_cost"), None)
+    contract = market.get("contract") is True
+    contract_size = safe_float(details.get("contract_size", market.get("contract_size")), None)
+    reasons = []
+
+    if details.get("ok") is not True or details.get("precision_error"):
+        reasons.append("AMOUNT_PRECISION_UNCONFIRMED")
+    if amount is None or amount <= 0:
+        reasons.append("AMOUNT_INVALID")
+    if min_amount is None or min_amount <= 0:
+        reasons.append("MIN_QTY_UNAVAILABLE")
+    elif amount is not None and amount < min_amount:
+        reasons.append("AMOUNT_BELOW_MIN_QTY")
+    if not reduce_only:
+        if min_cost is None or min_cost <= 0:
+            reasons.append("MIN_NOTIONAL_UNAVAILABLE")
+        elif actual_notional is None or actual_notional < min_cost:
+            reasons.append("NOTIONAL_BELOW_MINIMUM")
+    if contract and (contract_size is None or contract_size <= 0):
+        reasons.append("CONTRACT_SIZE_UNAVAILABLE")
+
+    return {
+        "ok": not reasons,
+        "constraints_ok": not reasons,
+        "constraints_complete": not reasons,
+        "constraint_reasons": reasons,
+        "amount": amount,
+        "actual_notional_usdt": actual_notional,
+        "min_amount": min_amount,
+        "min_cost": min_cost,
+        "contract": contract,
+        "contract_size": contract_size,
+        "reduce_only": bool(reduce_only),
     }
 
 
@@ -1591,6 +1647,7 @@ def build_order_preview(
     price = details["price_ref"]
     market = details.get("market") or {}
     actual_exposure = details.get("effective_notional_usdt")
+    constraints = _order_constraint_evidence(details, reduce_only=reduce_only)
 
     client_order_id = validate_broker_client_order_id(
         client_tag or f"CQ-{int(time.time())}", required=True
@@ -1700,6 +1757,7 @@ def build_order_preview(
         "amount_raw": details.get("amount_raw"),
         "amount": amount,
         "amount_final": amount,
+        "contract_size": details.get("contract_size"),
         "margin_mode": BINGX_MARGIN_MODE,
         "free_balance_usdt": free_balance,
         "estimated_margin_after_open_usdt": money(estimated_margin_after_open, 8),
@@ -1713,6 +1771,10 @@ def build_order_preview(
         "price_precision": market.get("price_precision"),
         "min_amount": market.get("min_amount"),
         "min_cost": market.get("min_cost"),
+        "constraints_ok": constraints.get("constraints_ok"),
+        "constraints_complete": constraints.get("constraints_complete"),
+        "constraint_reasons": constraints.get("constraint_reasons"),
+        "constraint_evidence": constraints,
         "payload": api_payload,
         "query_string": query_string,
         "signature_ok": signature_ok,
@@ -6557,10 +6619,19 @@ def _rpm_validate_auth(token, context):
 
 
 def _rpm_amount_to_precision(ex, symbol, amount):
+    raw_amount = float(amount)
+    if not math.isfinite(raw_amount) or raw_amount <= 0:
+        raise ValueError("MANAGED_AMOUNT_INVALID")
     try:
-        return float(ex.amount_to_precision(symbol, amount))
-    except Exception:
-        return float(amount)
+        precise_amount = float(ex.amount_to_precision(symbol, raw_amount))
+    except Exception as exc:
+        raise ValueError("MANAGED_AMOUNT_PRECISION_UNAVAILABLE") from exc
+    if not math.isfinite(precise_amount) or precise_amount <= 0:
+        raise ValueError("MANAGED_AMOUNT_PRECISION_INVALID")
+    tolerance = max(BROKER_MANAGEMENT_AMOUNT_TOLERANCE, abs(raw_amount) * 1e-12)
+    if precise_amount > raw_amount + tolerance:
+        raise ValueError("MANAGED_AMOUNT_PRECISION_EXCEEDS_POSITION")
+    return precise_amount
 
 
 def _rpm_create_stop_live(
@@ -6822,6 +6893,21 @@ def replace_position_stop_order(
         return {**base, "ok": False, "status": "STOP_REPLACE_AUTH_DENIED", "auth": auth}
 
     ex = exchange()
+    try:
+        precise_amount = _rpm_amount_to_precision(ex, sym, amount)
+    except Exception as exc:
+        return {
+            **base,
+            "ok": False,
+            "status": "STOP_REPLACE_AMOUNT_PRECISION_UNCONFIRMED",
+            "sent": False,
+            "confirmed": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "would_send_order": False,
+            **_managed_exception_details(exc),
+        }
+    base["precise_amount"] = precise_amount
     started = time.perf_counter()
     # BingX lifetime clientOrderID uniqueness makes editOrder unsuitable here:
     # an exchange/CCXT implementation may realize an edit as a cancel/create
@@ -6922,7 +7008,7 @@ def replace_position_stop_order(
             ex,
             sym,
             side_norm,
-            amount,
+            precise_amount,
             new_stop,
             new_tag,
             create_state,
@@ -7093,7 +7179,7 @@ def replace_position_stop_order(
                     ex,
                     sym,
                     side_norm,
-                    amount,
+                    precise_amount,
                     old_stop,
                     rollback_tag,
                     rollback_state,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import math
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -283,7 +284,7 @@ def _load_managed_close(
     )
 
 
-def _load_stop_replacement(*, fake_exchange, snapshots):
+def _load_stop_replacement(*, fake_exchange, snapshots, precision_error=None):
     tree = ast.parse((ROOT / "broker.py").read_text(encoding="utf-8"))
     names = {
         "_managed_sanitize_exception_text",
@@ -345,7 +346,13 @@ def _load_stop_replacement(*, fake_exchange, snapshots):
         "bingx_position_side": lambda side: str(side).upper(),
         "_disaster_stop_hedge_mode_detected": lambda: True,
         "DISASTER_STOP_WORKING_TYPE": "MARK_PRICE",
-        "_rpm_amount_to_precision": lambda _exchange, _symbol, amount: float(amount),
+        "_rpm_amount_to_precision": (
+            lambda _exchange, _symbol, amount: (
+                (_ for _ in ()).throw(precision_error)
+                if precision_error is not None
+                else float(amount)
+            )
+        ),
         "re": re,
         "time": SimpleNamespace(perf_counter=lambda: 1.0),
         "log_execution_event": lambda event: True,
@@ -568,6 +575,80 @@ def test_replacement_blocks_before_create_when_cancel_is_not_factually_terminal(
     assert result["send_attempted"] is False
     assert exchange_probe.create_calls == []
     assert audit_events[-1]["event"] == "BROKER_STOP_REPLACE_CANCEL_UNCONFIRMED"
+
+
+def test_replacement_precision_failure_blocks_before_cancel_or_create():
+    exchange_probe = FakeExchange(response=_replacement_response())
+    cancel_calls = []
+    exchange_probe.cancel_order = lambda *args: cancel_calls.append(args)
+    replace, audit_events = _load_stop_replacement(
+        fake_exchange=exchange_probe,
+        snapshots=[_safe_open_snapshot()],
+        precision_error=RuntimeError("synthetic precision failure"),
+    )
+
+    result = _replace_call(replace)
+
+    assert result["status"] == "STOP_REPLACE_AMOUNT_PRECISION_UNCONFIRMED"
+    assert result["sent"] is False
+    assert result["send_attempted"] is False
+    assert result["would_send_order"] is False
+    assert cancel_calls == []
+    assert exchange_probe.create_calls == []
+    assert audit_events == []
+
+
+def _load_strict_amount_precision():
+    tree = ast.parse((ROOT / "broker.py").read_text(encoding="utf-8"))
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "_rpm_amount_to_precision"
+    )
+    namespace = {
+        "math": math,
+        "BROKER_MANAGEMENT_AMOUNT_TOLERANCE": 1e-10,
+    }
+    exec(
+        compile(ast.Module(body=[copy.deepcopy(node)], type_ignores=[]), "<strict-amount-precision>", "exec"),
+        namespace,
+    )
+    return namespace["_rpm_amount_to_precision"]
+
+
+@pytest.mark.parametrize("amount", [None, 0, -1, float("inf"), float("nan")])
+def test_managed_amount_precision_rejects_invalid_input(amount):
+    precise = _load_strict_amount_precision()
+    exchange_probe = SimpleNamespace(amount_to_precision=lambda _symbol, value: value)
+
+    with pytest.raises((TypeError, ValueError)):
+        precise(exchange_probe, "SOLUSDT", amount)
+
+
+def test_managed_amount_precision_never_falls_back_to_raw_amount():
+    precise = _load_strict_amount_precision()
+    exchange_probe = SimpleNamespace(
+        amount_to_precision=lambda _symbol, _value: (_ for _ in ()).throw(RuntimeError("precision unavailable"))
+    )
+
+    with pytest.raises(ValueError, match="MANAGED_AMOUNT_PRECISION_UNAVAILABLE"):
+        precise(exchange_probe, "SOLUSDT", 0.13)
+
+
+def test_managed_amount_precision_rejects_rounding_above_position():
+    precise = _load_strict_amount_precision()
+    exchange_probe = SimpleNamespace(amount_to_precision=lambda _symbol, _value: "0.14")
+
+    with pytest.raises(ValueError, match="MANAGED_AMOUNT_PRECISION_EXCEEDS_POSITION"):
+        precise(exchange_probe, "SOLUSDT", 0.13)
+
+
+def test_managed_amount_precision_accepts_positive_round_down():
+    precise = _load_strict_amount_precision()
+    exchange_probe = SimpleNamespace(amount_to_precision=lambda _symbol, _value: "0.12")
+
+    assert precise(exchange_probe, "SOLUSDT", 0.13) == 0.12
 
 
 def test_replacement_requires_materially_armed_returned_stop():

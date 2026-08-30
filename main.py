@@ -37744,7 +37744,6 @@ def _rpg_v1_real_execution_enabled():
         "EXECUTION_REAL_ENABLED",
         "ENABLE_REAL_EXECUTION",
         "BINGX_REAL_EXECUTION_ENABLED",
-        "ENABLE_REAL_TRADING",
     ], default=False)
 
 
@@ -37754,7 +37753,6 @@ def _rpg_v1_real_pilot_enabled():
         "REAL_PILOT_ENABLED",
         "EXECUTION_REAL_PILOT_ENABLED",
         "BINGX_REAL_PILOT_ENABLED",
-        "CENTRAL_REAL_PILOT_GUARD_ENABLED",
     ], default=False)
 
 
@@ -37863,12 +37861,6 @@ def _rpg_v1_trade_size(payload, bot):
     if leverage is None:
         leverage = 1
         leverage_source = "default:1"
-    if notional is None:
-        notional = 20.0
-        notional_source = "default:20"
-    if margin is None:
-        margin = notional
-        margin_source = "default:margin_equals_notional"
 
     return {
         "margin_usdt": round(float(margin), 8) if margin is not None else None,
@@ -37890,7 +37882,7 @@ def _rpg_v1_broker_snapshot():
             if callable(ready_fn):
                 ready = ready_fn()
             else:
-                ready = {"ok": True, "status": "READY", "reason": "broker module present; ready_check missing"}
+                ready = {"ok": False, "status": "BROKER_READY_CHECK_MISSING", "reason": "broker module present; ready_check missing"}
         except Exception as exc:
             ready = {"ok": False, "status": "BROKER_READY_CHECK_ERROR", "error": str(exc)}
     return {
@@ -46424,15 +46416,26 @@ def _fleag_v1_divergence_payload():
     adotadas, fechadas ou gerenciadas automaticamente.
     """
     broker_positions, broker_err = ([], None)
-    central_live = []
+    central_live, central_err = ([], None)
     try:
         broker_positions, broker_err = _broker_open_positions() if callable(globals().get("_broker_open_positions")) else ([], "_broker_open_positions missing")
     except Exception as exc:
         broker_positions, broker_err = [], str(exc)
     try:
-        central_live = _central_live_positions_payload() if callable(globals().get("_central_live_positions_payload")) else []
-    except Exception:
+        if callable(globals().get("_central_live_positions_payload")):
+            central_live = _central_live_positions_payload()
+            if not isinstance(central_live, list):
+                central_err = "invalid central live positions payload"
+                central_live = []
+        else:
+            central_err = "_central_live_positions_payload missing"
+    except Exception as exc:
         central_live = []
+        central_err = str(exc)
+
+    if not isinstance(broker_positions, list):
+        broker_positions = []
+        broker_err = broker_err or "invalid broker open positions payload"
 
     broker_map = {}
     for p in broker_positions if isinstance(broker_positions, list) else []:
@@ -46493,8 +46496,9 @@ def _fleag_v1_divergence_payload():
             })
 
     return {
-        "ok": not broker_err,
+        "ok": not broker_err and not central_err,
         "broker_error": broker_err,
+        "central_error": central_err,
         "broker_bingx_open_count": len(broker_map),
         "central_live_count": len(central_map),
         # Compatibilidade: only_bingx continua presente, mas agora é explicitamente manual/externa.
@@ -46531,6 +46535,8 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
         warnings.append(f"Eventos ruins LIVE duplicados entre fontes removidos: {dedup.get('duplicate_bad_events_removed_count')}.")
     if cfg.get("block_on_previous_failure") and bad_events:
         reasons.append(f"Existe LIVE_SENT_BUT_DISASTER_STOP_FAILED não reconhecido: {len(bad_events)} evento(s).")
+    if divergence.get("ok") is not True:
+        reasons.append("Não foi possível confirmar a convergência Central × BingX; auditoria bloqueada por falta de evidência autoritativa.")
     if divergence.get("only_bingx_count"):
         warnings.append(
             f"Posições manuais/externas na BingX: {divergence.get('only_bingx_count')}; "
@@ -55769,6 +55775,22 @@ def _frpp_v1_int(value, default=0):
         return int(default)
 
 
+def _frpp_v1_nonnegative_count(value):
+    """Aceita somente contagens inteiras explícitas; evidência ausente é desconhecida."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw or not raw.isdecimal():
+            return None
+        parsed = int(raw)
+    else:
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _frpp_v1_env_bool(name, default=False):
     return _frpp_v1_bool(os.environ.get(name), default)
 
@@ -56107,14 +56129,17 @@ def _frpp_v1_build_checklist():
         {"ready": broker_ready_payload, "broker_status": _frpp_v1_safe_sanitize(broker_inner)},
     )
 
-    broker_open_count = _frpp_v1_int(divergence.get("broker_bingx_open_count"), -1)
-    central_live_count = _frpp_v1_int(divergence.get("central_live_count"), -1)
-    only_bingx_count = _frpp_v1_int(divergence.get("only_bingx_count"), 0) if divergence.get("only_bingx_count") is not None else 0
-    only_central_count = _frpp_v1_int(divergence.get("only_central_count"), 0) if divergence.get("only_central_count") is not None else 0
-    live_without_stop_count = _frpp_v1_int(divergence.get("live_without_stop_count"), 0) if divergence.get("live_without_stop_count") is not None else 0
+    divergence_ok = divergence.get("ok") is True
+    broker_open_count = _frpp_v1_nonnegative_count(divergence.get("broker_bingx_open_count"))
+    central_live_count = _frpp_v1_nonnegative_count(divergence.get("central_live_count"))
+    only_bingx_count = _frpp_v1_nonnegative_count(divergence.get("only_bingx_count"))
+    only_central_count = _frpp_v1_nonnegative_count(divergence.get("only_central_count"))
+    live_without_stop_count = _frpp_v1_nonnegative_count(divergence.get("live_without_stop_count"))
+    central_live_evidence_ok = divergence_ok and central_live_count is not None
+    ownership_evidence_ok = divergence_ok and only_central_count is not None and live_without_stop_count is not None
     add(
         "BINGX_MANUAL_POSITIONS_INFORMATIONAL",
-        broker_open_count >= 0,
+        divergence_ok and broker_open_count is not None,
         f"BingX possui {broker_open_count} posição(ões); posições sem vínculo Central são manuais/externas e não bloqueiam o Falcon.",
         "Não foi possível confirmar a quantidade de posições na BingX.",
         False,
@@ -56127,23 +56152,29 @@ def _frpp_v1_build_checklist():
     )
     add(
         "SYNC_CENTRAL_LIVE_ZERO",
-        central_live_count == 0,
+        central_live_evidence_ok and central_live_count == 0,
         "Central LIVE positions = 0.",
-        f"Central LIVE positions não está 0: {central_live_count}.",
+        f"Central LIVE positions não está comprovadamente em 0: {central_live_count}.",
         True,
-        {"central_live_count": central_live_count},
+        {
+            "central_live_count": central_live_count,
+            "divergence_source_ok": divergence_ok,
+            "evidence_complete": central_live_evidence_ok,
+        },
     )
     add(
         "SYNC_NO_CENTRAL_OWNERSHIP_DIVERGENCE",
-        only_central_count == 0 and live_without_stop_count == 0,
+        ownership_evidence_ok and only_central_count == 0 and live_without_stop_count == 0,
         "Sem posição Central órfã e sem LIVE da Central sem stop; posições apenas na BingX são tratadas como manuais/externas.",
-        "Há posição Central órfã ou LIVE da Central sem stop.",
+        "Há divergência de ownership ou falta evidência autoritativa para descartá-la.",
         True,
         {
             "manual_external_only_bingx_count": only_bingx_count,
             "only_central_count": only_central_count,
             "live_without_stop_count": live_without_stop_count,
             "manual_external_blocks_falcon": False,
+            "divergence_source_ok": divergence_ok,
+            "evidence_complete": ownership_evidence_ok,
         },
     )
 

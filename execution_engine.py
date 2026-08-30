@@ -1837,21 +1837,71 @@ except Exception:
 
 
 def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry_run: bool = True) -> Dict[str, Any]:  # type: ignore[override]
-    result = _ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711(payload, plan, dry_run=dry_run) if callable(_ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711) else {"ok": False, "allowed": False, "reasons": ["validate_real_pilot_guard original indisponível"]}
-    try:
-        trade = result.get("trade") if isinstance(result, dict) else {}
-        bot = str((trade or {}).get("bot") or "").upper()
-        symbol = (trade or {}).get("symbol")
-        notional = _safe_float((trade or {}).get("notional_usdt"), None)
-        if bot == "FALCON" and EXECUTION_ENGINE_REQUIRE_PARTIAL_CAPABLE_FOR_FALCON and central_broker is not None and hasattr(central_broker, "partial_capability_from_notional"):
-            partial = central_broker.partial_capability_from_notional(symbol, notional, max_notional_usdt=REAL_PILOT_MAX_NOTIONAL_USDT, min_parts=2)
-            result.setdefault("partial_capable_guard", partial)
-            if not partial.get("partial_capable"):
-                result.setdefault("reasons", []).append("Falcon LIVE exige posição >= 2x minQty para TP50 real")
-                result["allowed"] = False
-                result["ok"] = False
-                result["status"] = "REAL_PILOT_BLOCKED_PARTIAL_NOT_CAPABLE"
-        result.setdefault("partial_capable_guard_version", EXECUTION_ENGINE_PARTIAL_CAPABLE_GUARD_VERSION)
-    except Exception as exc:
-        result.setdefault("warnings", []).append(f"partial_capable_guard_error: {exc}")
+    base_result = _ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711(payload, plan, dry_run=dry_run) if callable(_ORIGINAL_VALIDATE_REAL_PILOT_GUARD_20260711) else {"ok": False, "allowed": False, "reasons": ["validate_real_pilot_guard original indisponível"]}
+    result = base_result if isinstance(base_result, dict) else {
+        "ok": False,
+        "allowed": False,
+        "status": "REAL_PILOT_GUARD_INVALID_RESULT",
+        "reasons": ["validate_real_pilot_guard original retornou payload inválido"],
+    }
+    result.setdefault("partial_capable_guard_version", EXECUTION_ENGINE_PARTIAL_CAPABLE_GUARD_VERSION)
+
+    trade = result.get("trade") if isinstance(result.get("trade"), dict) else {}
+    bot = str(trade.get("bot") or "").upper()
+    if bot != "FALCON" or not EXECUTION_ENGINE_REQUIRE_PARTIAL_CAPABLE_FOR_FALCON:
+        return result
+
+    symbol = trade.get("symbol")
+    notional = _safe_float(trade.get("notional_usdt"), None)
+    capability_fn = getattr(central_broker, "partial_capability_from_notional", None) if central_broker is not None else None
+    if not callable(capability_fn):
+        partial = {
+            "ok": False,
+            "partial_capable": False,
+            "status": "PARTIAL_CAPABILITY_CHECK_UNAVAILABLE",
+        }
+    else:
+        try:
+            partial = capability_fn(
+                symbol,
+                notional,
+                max_notional_usdt=REAL_PILOT_MAX_NOTIONAL_USDT,
+                min_parts=2,
+            )
+            if not isinstance(partial, dict):
+                partial = {
+                    "ok": False,
+                    "partial_capable": False,
+                    "status": "PARTIAL_CAPABILITY_INVALID_RESULT",
+                }
+        except Exception as exc:
+            partial = {
+                "ok": False,
+                "partial_capable": False,
+                "status": "PARTIAL_CAPABILITY_CHECK_ERROR",
+                "error_type": type(exc).__name__,
+            }
+
+    result["partial_capable_guard"] = partial
+    if partial.get("partial_capable") is not True:
+        evidence_missing = partial.get("status") in {
+            "PARTIAL_CAPABILITY_CHECK_UNAVAILABLE",
+            "PARTIAL_CAPABILITY_INVALID_RESULT",
+            "PARTIAL_CAPABILITY_CHECK_ERROR",
+        }
+        reason = (
+            "Capacidade de gestão parcial do Falcon não pôde ser confirmada; entrada LIVE bloqueada"
+            if evidence_missing
+            else "Falcon LIVE exige posição >= 2x minQty para TP50 real"
+        )
+        reasons = result.setdefault("reasons", [])
+        if reason not in reasons:
+            reasons.append(reason)
+        result["allowed"] = False
+        result["ok"] = False
+        result["status"] = (
+            "REAL_PILOT_BLOCKED_PARTIAL_CAPABILITY_UNCONFIRMED"
+            if evidence_missing
+            else "REAL_PILOT_BLOCKED_PARTIAL_NOT_CAPABLE"
+        )
     return result
