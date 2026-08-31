@@ -46517,7 +46517,10 @@ def _fleag_v1_divergence_payload():
     }
 
 
-def falcon_live_execution_audit_guard_v1_status(include_recent=True):
+def falcon_live_execution_audit_guard_v1_status(
+    include_recent=True,
+    divergence_snapshot=None,
+):
     cfg = _fleag_v1_config()
     state = _fleag_v1_load_state()
     acked = set(state.get("acked_bad_event_keys") or [])
@@ -46526,7 +46529,18 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
     bad_events = dedup.get("unique_bad_events_unacked") or []
     bad_events_acked = dedup.get("unique_bad_events_acked") or []
     bad_events_unique = dedup.get("unique_bad_events") or []
-    divergence = _fleag_v1_divergence_payload()
+    if divergence_snapshot is None:
+        divergence = _fleag_v1_divergence_payload()
+        divergence_evidence_source = "LIVE_COLLECTION"
+    elif isinstance(divergence_snapshot, dict):
+        divergence = divergence_snapshot
+        divergence_evidence_source = "INJECTED_PREFLIGHT_SNAPSHOT"
+    else:
+        divergence = {
+            "ok": False,
+            "error": "invalid injected divergence snapshot",
+        }
+        divergence_evidence_source = "INVALID_INJECTED_SNAPSHOT"
     reasons = []
     warnings = []
     if not cfg.get("enabled"):
@@ -46575,6 +46589,7 @@ def falcon_live_execution_audit_guard_v1_status(include_recent=True):
         "config": cfg,
         "state": _fleag_v1_public(state),
         "divergence": divergence,
+        "divergence_evidence_source": divergence_evidence_source,
         "manual_position_ownership": {
             "version": MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION,
             "manual_external_count": divergence.get("manual_external_count", divergence.get("only_bingx_count", 0)),
@@ -55723,7 +55738,7 @@ def broker_disaster_stop_payload_preview_v1_text_route():
 # ==========================================================
 # FALCON REAL PILOT PREFLIGHT CHECKLIST V1 — SAFE NO-REARM DIAGNOSTIC
 # ==========================================================
-FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-08-31-FALCON-REAL-PILOT-PREFLIGHT-V1.3-BOUNDED-COLLECTION"
+FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-08-31-FALCON-REAL-PILOT-PREFLIGHT-V1.4-LIGHT-SHARED-EVIDENCE"
 FALCON_REAL_PILOT_PREFLIGHT_TOTAL_DEADLINE_SECONDS = 80.0
 FALCON_REAL_PILOT_PREFLIGHT_COLLECTOR_TIMEOUT_SECONDS = {
     "env": 1.0,
@@ -56015,22 +56030,37 @@ def _frpp_v1_env_snapshot():
 
 def _frpp_v1_get_bots_snapshot():
     out = {}
-    try:
-        for key, cfg in (BOT_CONFIGS if "BOT_CONFIGS" in globals() else {}).items():
-            try:
-                out[str(key).upper()] = bot_health(key, cfg) if callable(globals().get("bot_health")) else {}
-            except Exception as exc:
-                out[str(key).upper()] = {"error": str(exc)}
-    except Exception as exc:
-        out["_error"] = str(exc)
+    configs = globals().get("BOT_CONFIGS")
+    health_fn = globals().get("light_bot_health")
+    if not isinstance(configs, dict):
+        raise RuntimeError("bot configs unavailable for light preflight snapshot")
+    if not callable(health_fn):
+        raise RuntimeError("light bot health unavailable for preflight")
+    failed = []
+    for key, cfg in configs.items():
+        normalized_key = str(key).upper()
+        try:
+            payload = health_fn(key, cfg)
+            if not isinstance(payload, dict):
+                raise TypeError("light bot health returned non-dict payload")
+            out[normalized_key] = payload
+        except Exception as exc:
+            failed.append({"bot": normalized_key, "error_type": type(exc).__name__})
+    if failed:
+        raise RuntimeError("one or more light bot health snapshots failed")
     return out
 
 
-def _frpp_v1_get_falcon_audit():
+def _frpp_v1_get_falcon_audit(divergence_snapshot=None):
     try:
         fn = globals().get("falcon_live_execution_audit_guard_v1_status")
         if callable(fn):
-            return fn(include_recent=False) or {}
+            if divergence_snapshot is None:
+                return fn(include_recent=False) or {}
+            return fn(
+                include_recent=False,
+                divergence_snapshot=divergence_snapshot,
+            ) or {}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "live_audit_status": "ERROR"}
     return {"ok": False, "error": "falcon_live_execution_audit_guard_v1_status unavailable", "live_audit_status": "UNAVAILABLE"}
@@ -56184,42 +56214,40 @@ def _frpp_v1_build_checklist():
     turtle_bot = bots.get("TURTLE") if isinstance(bots.get("TURTLE"), dict) else {}
     turtle_health = turtle_bot.get("health") if isinstance(turtle_bot.get("health"), dict) else {}
 
-    falcon_audit = _frpp_v1_collect(
-        "falcon_audit",
-        _frpp_v1_get_falcon_audit,
-        {"ok": False, "live_audit_status": "EVIDENCE_UNAVAILABLE"},
+    divergence = _frpp_v1_collect(
+        "divergence",
+        _frpp_v1_get_divergence,
+        {"ok": False, "error": "divergence evidence unavailable"},
         collection_started,
         collection_diagnostics,
     )
-    audit_collection_ok = collection_diagnostics.get("falcon_audit", {}).get("ok") is True
-    audit_divergence = falcon_audit.get("divergence")
-    if audit_collection_ok and isinstance(audit_divergence, dict):
-        divergence = audit_divergence
-        collection_diagnostics["divergence"] = {
-            "status": "REUSED_FROM_FALCON_AUDIT",
-            "ok": True,
-            "timeout_seconds": 0.0,
-            "elapsed_ms": 0.0,
-        }
-    elif audit_collection_ok:
-        divergence = _frpp_v1_collect(
-            "divergence",
-            _frpp_v1_get_divergence,
-            {"ok": False, "error": "divergence evidence unavailable"},
+    divergence_collection_ok = collection_diagnostics.get("divergence", {}).get("ok") is True
+    if divergence_collection_ok:
+        falcon_audit = _frpp_v1_collect(
+            "falcon_audit",
+            lambda: _frpp_v1_get_falcon_audit(divergence),
+            {"ok": False, "live_audit_status": "EVIDENCE_UNAVAILABLE"},
             collection_started,
             collection_diagnostics,
         )
+        collection_diagnostics.get("falcon_audit", {}).update(
+            {"divergence_source": "SHARED_PREFLIGHT_SNAPSHOT"}
+        )
     else:
-        divergence = {"ok": False, "error": "falcon audit collection unavailable"}
-        collection_diagnostics["divergence"] = {
+        falcon_audit = {
+            "ok": False,
+            "live_audit_status": "EVIDENCE_UNAVAILABLE",
+        }
+        collection_diagnostics["falcon_audit"] = {
             "status": "SKIPPED_DEPENDENCY_UNAVAILABLE",
             "ok": False,
-            "dependency": "falcon_audit",
+            "dependency": "divergence",
             "timeout_seconds": 0.0,
             "elapsed_ms": 0.0,
         }
 
-    if audit_collection_ok:
+    audit_collection_ok = collection_diagnostics.get("falcon_audit", {}).get("ok") is True
+    if divergence_collection_ok and audit_collection_ok:
         broker = _frpp_v1_collect(
             "broker_ready",
             _frpp_v1_get_broker_ready,

@@ -90,12 +90,14 @@ def _preflight_namespace(divergence):
             },
             "TURTLE": {"health": {"mode": "PAPER"}},
         },
-        "_frpp_v1_get_falcon_audit": lambda: {
+        "_frpp_v1_get_falcon_audit": lambda divergence_snapshot=None: {
             "ok": True,
             "live_audit_status": "OK",
             "bad_execution_events_total_count": 0,
             "bad_execution_events_acked_count": 0,
             "bad_execution_events_unacked_count": 0,
+            "divergence": divergence_snapshot,
+            "divergence_evidence_source": "INJECTED_PREFLIGHT_SNAPSHOT",
         },
         "_frpp_v1_get_broker_ready": lambda: {"ready": {"ok": True}, "broker": {}},
         "_frpp_v1_get_divergence": lambda: divergence,
@@ -146,6 +148,54 @@ def _build_preflight(divergence):
 
 def _check(payload, code):
     return next(item for item in payload["checks"] if item["code"] == code)
+
+
+def test_preflight_bot_snapshot_uses_only_light_health():
+    light_calls = []
+    heavy_calls = []
+
+    def light_health(key, cfg):
+        light_calls.append((key, cfg["name"]))
+        return {
+            "name": cfg["name"],
+            "enabled": True,
+            "loaded": True,
+            "health": {"mode": "VERIFY"},
+            "health_source": "MODULE_MEMORY_LIGHT",
+        }
+
+    namespace = _load_functions(
+        {"_frpp_v1_get_bots_snapshot"},
+        {
+            "BOT_CONFIGS": {
+                "FALCON": {"name": "Falcon"},
+                "TURTLE": {"name": "Turtle"},
+            },
+            "light_bot_health": light_health,
+            "bot_health": lambda *_args: heavy_calls.append(True) or {},
+        },
+    )
+
+    payload = namespace["_frpp_v1_get_bots_snapshot"]()
+
+    assert light_calls == [("FALCON", "Falcon"), ("TURTLE", "Turtle")]
+    assert heavy_calls == []
+    assert payload["FALCON"]["health_source"] == "MODULE_MEMORY_LIGHT"
+    assert payload["TURTLE"]["health_source"] == "MODULE_MEMORY_LIGHT"
+
+
+def test_preflight_bot_snapshot_fails_closed_without_light_health():
+    namespace = _load_functions(
+        {"_frpp_v1_get_bots_snapshot"},
+        {
+            "BOT_CONFIGS": {"FALCON": {"name": "Falcon"}},
+            "light_bot_health": None,
+            "bot_health": lambda *_args: pytest.fail("heavy health must not run"),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="light bot health unavailable"):
+        namespace["_frpp_v1_get_bots_snapshot"]()
 
 
 def _deadline_namespace():
@@ -337,18 +387,95 @@ def test_preflight_timeout_fails_closed_and_still_writes_audit_report():
     assert len(events) == 1
 
 
-def test_preflight_reuses_audit_divergence_without_second_broker_collection():
+def test_preflight_divergence_timeout_skips_audit_and_broker_collectors():
+    namespace = _preflight_namespace(_valid_divergence())
+    base_collect = namespace["_frpp_v1_collect"]
+    audit_calls = []
+    broker_calls = []
+
+    def collect(name, collector, fallback, started_at, diagnostics):
+        if name == "divergence":
+            diagnostics[name] = {
+                "status": "TIMEOUT",
+                "ok": False,
+                "timeout_seconds": 0.01,
+                "elapsed_ms": 10.0,
+            }
+            return dict(fallback or {})
+        return base_collect(name, collector, fallback, started_at, diagnostics)
+
+    namespace["_frpp_v1_collect"] = collect
+    namespace["_frpp_v1_get_falcon_audit"] = (
+        lambda _snapshot=None: audit_calls.append(True) or {}
+    )
+    namespace["_frpp_v1_get_broker_ready"] = (
+        lambda: broker_calls.append(True) or {}
+    )
+
+    payload = _compile_preflight(namespace)
+
+    assert payload["ok"] is False
+    assert payload["sent"] is False
+    assert audit_calls == []
+    assert broker_calls == []
+    collectors = payload["evidence_collection"]["collectors"]
+    assert collectors["divergence"]["status"] == "TIMEOUT"
+    assert collectors["falcon_audit"]["status"] == "SKIPPED_DEPENDENCY_UNAVAILABLE"
+    assert collectors["broker_ready"]["status"] == "SKIPPED_DEPENDENCY_UNAVAILABLE"
+
+
+def test_preflight_audit_timeout_skips_broker_but_keeps_divergence_evidence():
+    divergence = _valid_divergence()
+    namespace = _preflight_namespace(divergence)
+    base_collect = namespace["_frpp_v1_collect"]
+    broker_calls = []
+
+    def collect(name, collector, fallback, started_at, diagnostics):
+        if name == "falcon_audit":
+            diagnostics[name] = {
+                "status": "TIMEOUT",
+                "ok": False,
+                "timeout_seconds": 0.01,
+                "elapsed_ms": 10.0,
+            }
+            return dict(fallback or {})
+        return base_collect(name, collector, fallback, started_at, diagnostics)
+
+    namespace["_frpp_v1_collect"] = collect
+    namespace["_frpp_v1_get_broker_ready"] = (
+        lambda: broker_calls.append(True) or {}
+    )
+
+    payload = _compile_preflight(namespace)
+
+    assert payload["ok"] is False
+    assert payload["snapshots"]["divergence"] == divergence
+    assert broker_calls == []
+    collectors = payload["evidence_collection"]["collectors"]
+    assert collectors["divergence"]["status"] == "OK"
+    assert collectors["falcon_audit"]["status"] == "TIMEOUT"
+    assert collectors["broker_ready"]["status"] == "SKIPPED_DEPENDENCY_UNAVAILABLE"
+
+
+def test_preflight_collects_divergence_once_and_injects_same_snapshot_into_audit():
     divergence = _valid_divergence(broker_bingx_open_count=2, only_bingx_count=2)
     namespace = _preflight_namespace(divergence)
     direct_divergence_calls = []
-    namespace["_frpp_v1_get_falcon_audit"] = lambda: {
-        "ok": True,
-        "live_audit_status": "OK",
-        "bad_execution_events_total_count": 0,
-        "bad_execution_events_acked_count": 0,
-        "bad_execution_events_unacked_count": 0,
-        "divergence": divergence,
-    }
+    audit_snapshots = []
+
+    def audit(divergence_snapshot=None):
+        audit_snapshots.append(divergence_snapshot)
+        return {
+            "ok": True,
+            "live_audit_status": "OK",
+            "bad_execution_events_total_count": 0,
+            "bad_execution_events_acked_count": 0,
+            "bad_execution_events_unacked_count": 0,
+            "divergence": divergence_snapshot,
+            "divergence_evidence_source": "INJECTED_PREFLIGHT_SNAPSHOT",
+        }
+
+    namespace["_frpp_v1_get_falcon_audit"] = audit
 
     def direct_divergence():
         direct_divergence_calls.append(True)
@@ -359,8 +486,11 @@ def test_preflight_reuses_audit_divergence_without_second_broker_collection():
     payload = _compile_preflight(namespace)
 
     assert payload["ok"] is True
-    assert direct_divergence_calls == []
-    assert payload["evidence_collection"]["collectors"]["divergence"]["status"] == "REUSED_FROM_FALCON_AUDIT"
+    assert direct_divergence_calls == [True]
+    assert audit_snapshots == [divergence]
+    assert audit_snapshots[0] is divergence
+    assert payload["evidence_collection"]["collectors"]["divergence"]["status"] == "OK"
+    assert payload["evidence_collection"]["collectors"]["falcon_audit"]["divergence_source"] == "SHARED_PREFLIGHT_SNAPSHOT"
     assert payload["summary"]["broker_bingx_open_count"] == 2
 
 
@@ -498,28 +628,41 @@ class _MissingAuditFile:
         return False
 
 
+def _audit_status_namespace(divergence_fn):
+    return {
+        "json": json,
+        "FALCON_LIVE_AUDIT_LATEST_FILE": _MissingAuditFile(),
+        "FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION": "test-version",
+        "MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION": "test-policy",
+        "_fleag_v1_config": lambda: {
+            "enabled": True,
+            "block_on_previous_failure": True,
+            "block_on_divergence": True,
+        },
+        "_fleag_v1_load_state": lambda: {},
+        "_fleag_v1_read_bad_execution_events": lambda limit=200: [],
+        "_fleag_v1_dedup_bad_events_v1_3": lambda _events, _state: {
+            "unique_bad_events_unacked": [],
+            "unique_bad_events_acked": [],
+            "unique_bad_events": [],
+            "raw_bad_events_total_count": 0,
+            "unique_bad_events_total_count": 0,
+            "duplicate_bad_events_removed_count": 0,
+            "duplicate_bad_event_groups_count": 0,
+            "duplicate_bad_event_samples": [],
+        },
+        "_fleag_v1_divergence_payload": divergence_fn,
+        "_fleag_v1_public": lambda value: value,
+        "_fleag_v1_now": lambda: "2026-08-29T00:00:00Z",
+        "_fleag_v1_read_events": lambda limit=10: [],
+    }
+
+
 def test_live_audit_guard_blocks_when_divergence_evidence_is_unavailable():
     namespace = _load_functions(
         {"falcon_live_execution_audit_guard_v1_status"},
-        {
-            "json": json,
-            "FALCON_LIVE_AUDIT_LATEST_FILE": _MissingAuditFile(),
-            "FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION": "test-version",
-            "MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION": "test-policy",
-            "_fleag_v1_config": lambda: {"enabled": True, "block_on_previous_failure": True, "block_on_divergence": True},
-            "_fleag_v1_load_state": lambda: {},
-            "_fleag_v1_read_bad_execution_events": lambda limit=200: [],
-            "_fleag_v1_dedup_bad_events_v1_3": lambda _events, _state: {
-                "unique_bad_events_unacked": [],
-                "unique_bad_events_acked": [],
-                "unique_bad_events": [],
-                "raw_bad_events_total_count": 0,
-                "unique_bad_events_total_count": 0,
-                "duplicate_bad_events_removed_count": 0,
-                "duplicate_bad_event_groups_count": 0,
-                "duplicate_bad_event_samples": [],
-            },
-            "_fleag_v1_divergence_payload": lambda: {
+        _audit_status_namespace(
+            lambda: {
                 "ok": False,
                 "broker_error": "unavailable",
                 "broker_bingx_open_count": 0,
@@ -527,15 +670,59 @@ def test_live_audit_guard_blocks_when_divergence_evidence_is_unavailable():
                 "only_bingx_count": 0,
                 "only_central_count": 0,
                 "live_without_stop_count": 0,
-            },
-            "_fleag_v1_public": lambda value: value,
-            "_fleag_v1_now": lambda: "2026-08-29T00:00:00Z",
-            "_fleag_v1_read_events": lambda limit=10: [],
-        },
+            }
+        ),
     )
 
     payload = namespace["falcon_live_execution_audit_guard_v1_status"]()
 
     assert payload["ok"] is False
     assert payload["live_audit_status"] == "BLOCKED"
+    assert payload["divergence_evidence_source"] == "LIVE_COLLECTION"
     assert any("evidência autoritativa" in reason for reason in payload["reasons"])
+
+
+def test_live_audit_guard_uses_injected_divergence_without_live_recollection():
+    live_collection_calls = []
+    namespace = _load_functions(
+        {"falcon_live_execution_audit_guard_v1_status"},
+        _audit_status_namespace(
+            lambda: live_collection_calls.append(True) or _valid_divergence()
+        ),
+    )
+    snapshot = _valid_divergence(
+        broker_bingx_open_count=1,
+        only_bingx_count=1,
+        manual_external_count=1,
+    )
+
+    payload = namespace["falcon_live_execution_audit_guard_v1_status"](
+        include_recent=False,
+        divergence_snapshot=snapshot,
+    )
+
+    assert payload["ok"] is True
+    assert payload["divergence"] is snapshot
+    assert payload["divergence_evidence_source"] == "INJECTED_PREFLIGHT_SNAPSHOT"
+    assert payload["manual_position_ownership"]["manual_external_count"] == 1
+    assert live_collection_calls == []
+
+
+def test_live_audit_guard_rejects_invalid_injected_divergence_without_recollection():
+    live_collection_calls = []
+    namespace = _load_functions(
+        {"falcon_live_execution_audit_guard_v1_status"},
+        _audit_status_namespace(
+            lambda: live_collection_calls.append(True) or _valid_divergence()
+        ),
+    )
+
+    payload = namespace["falcon_live_execution_audit_guard_v1_status"](
+        include_recent=False,
+        divergence_snapshot="invalid",
+    )
+
+    assert payload["ok"] is False
+    assert payload["live_audit_status"] == "BLOCKED"
+    assert payload["divergence_evidence_source"] == "INVALID_INJECTED_SNAPSHOT"
+    assert live_collection_calls == []
