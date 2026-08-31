@@ -55723,7 +55723,20 @@ def broker_disaster_stop_payload_preview_v1_text_route():
 # ==========================================================
 # FALCON REAL PILOT PREFLIGHT CHECKLIST V1 — SAFE NO-REARM DIAGNOSTIC
 # ==========================================================
-FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-07-11-FALCON-REAL-PILOT-PREFLIGHT-V1.2-PREDATOR-PAPER-LIFECYCLE-INDEPENDENT"
+FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION = "2026-08-31-FALCON-REAL-PILOT-PREFLIGHT-V1.3-BOUNDED-COLLECTION"
+FALCON_REAL_PILOT_PREFLIGHT_TOTAL_DEADLINE_SECONDS = 80.0
+FALCON_REAL_PILOT_PREFLIGHT_COLLECTOR_TIMEOUT_SECONDS = {
+    "env": 1.0,
+    "bots": 5.0,
+    "falcon_audit": 20.0,
+    "broker_ready": 35.0,
+    "divergence": 20.0,
+    "runtime": 5.0,
+    "trade_registry_storage": 5.0,
+    "disaster_stop_preview": 5.0,
+}
+_FRPP_V1_COLLECTOR_LOCK = threading.Lock()
+_FRPP_V1_COLLECTOR_INFLIGHT = {}
 
 try:
     FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR = Path(CENTRAL_DATA_DIR)
@@ -55732,6 +55745,113 @@ except Exception:
 
 FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_LATEST_FILE = FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR / "falcon_real_pilot_preflight_checklist_v1_latest.json"
 FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE = FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_DATA_DIR / "falcon_real_pilot_preflight_checklist_v1_events.jsonl"
+
+
+def _frpp_v1_run_with_deadline(name, collector, timeout_seconds):
+    """Executa um coletor read-only sem permitir que ele prenda a rota inteira."""
+    started = time.monotonic()
+    try:
+        timeout = max(0.001, float(timeout_seconds))
+    except Exception:
+        timeout = 0.001
+    if not callable(collector):
+        return None, {
+            "status": "INVALID_COLLECTOR",
+            "ok": False,
+            "timeout_seconds": timeout,
+            "elapsed_ms": 0.0,
+        }
+
+    key = str(name or "collector")
+    result = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            result["value"] = collector()
+        except Exception as exc:
+            result["error_type"] = type(exc).__name__
+        finally:
+            done.set()
+            try:
+                with _FRPP_V1_COLLECTOR_LOCK:
+                    current = _FRPP_V1_COLLECTOR_INFLIGHT.get(key)
+                    if current is threading.current_thread():
+                        _FRPP_V1_COLLECTOR_INFLIGHT.pop(key, None)
+            except Exception:
+                pass
+
+    with _FRPP_V1_COLLECTOR_LOCK:
+        previous = _FRPP_V1_COLLECTOR_INFLIGHT.get(key)
+        if previous is not None and previous.is_alive():
+            return None, {
+                "status": "ALREADY_INFLIGHT",
+                "ok": False,
+                "timeout_seconds": timeout,
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+            }
+        worker = threading.Thread(
+            target=run,
+            name=f"falcon-preflight-{key}",
+            daemon=True,
+        )
+        _FRPP_V1_COLLECTOR_INFLIGHT[key] = worker
+        worker.start()
+
+    completed = done.wait(timeout)
+    elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+    if not completed:
+        return None, {
+            "status": "TIMEOUT",
+            "ok": False,
+            "timeout_seconds": timeout,
+            "elapsed_ms": elapsed_ms,
+            "worker_daemon": True,
+        }
+    if result.get("error_type"):
+        return None, {
+            "status": "ERROR",
+            "ok": False,
+            "timeout_seconds": timeout,
+            "elapsed_ms": elapsed_ms,
+            "error_type": result.get("error_type"),
+        }
+    return result.get("value"), {
+        "status": "OK",
+        "ok": True,
+        "timeout_seconds": timeout,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def _frpp_v1_collect(name, collector, fallback, started_at, diagnostics):
+    total_elapsed = max(0.0, time.monotonic() - float(started_at))
+    remaining = max(
+        0.0,
+        FALCON_REAL_PILOT_PREFLIGHT_TOTAL_DEADLINE_SECONDS - total_elapsed,
+    )
+    configured = FALCON_REAL_PILOT_PREFLIGHT_COLLECTOR_TIMEOUT_SECONDS.get(
+        str(name),
+        5.0,
+    )
+    timeout = min(float(configured), remaining)
+    if timeout <= 0:
+        meta = {
+            "status": "TOTAL_DEADLINE_EXHAUSTED",
+            "ok": False,
+            "timeout_seconds": 0.0,
+            "elapsed_ms": 0.0,
+        }
+        diagnostics[str(name)] = meta
+        return dict(fallback or {})
+
+    value, meta = _frpp_v1_run_with_deadline(name, collector, timeout)
+    if meta.get("ok") and not isinstance(value, dict):
+        meta = dict(meta)
+        meta.update({"status": "INVALID_RESULT", "ok": False})
+        value = None
+    diagnostics[str(name)] = meta
+    return value if isinstance(value, dict) else dict(fallback or {})
 
 
 def _frpp_v1_now():
@@ -56035,8 +56155,28 @@ def _frpp_v1_get_disaster_preview_status():
 
 
 def _frpp_v1_build_checklist():
-    env = _frpp_v1_env_snapshot()
-    bots = _frpp_v1_get_bots_snapshot()
+    collection_started = time.monotonic()
+    collection_diagnostics = {}
+    env = _frpp_v1_collect(
+        "env",
+        _frpp_v1_env_snapshot,
+        {
+            "enable_real_trading_bool": True,
+            "broker_dry_run_bool": False,
+            "central_real_execution_enabled_bool": True,
+            "central_real_pilot_enabled_bool": True,
+            "falcon_mode": "UNKNOWN",
+        },
+        collection_started,
+        collection_diagnostics,
+    )
+    bots = _frpp_v1_collect(
+        "bots",
+        _frpp_v1_get_bots_snapshot,
+        {"_error": "preflight bot evidence unavailable"},
+        collection_started,
+        collection_diagnostics,
+    )
     falcon_bot = bots.get("FALCON") if isinstance(bots.get("FALCON"), dict) else {}
     falcon_health = falcon_bot.get("health") if isinstance(falcon_bot.get("health"), dict) else {}
     predator_bot = bots.get("PREDATOR") if isinstance(bots.get("PREDATOR"), dict) else {}
@@ -56044,12 +56184,92 @@ def _frpp_v1_build_checklist():
     turtle_bot = bots.get("TURTLE") if isinstance(bots.get("TURTLE"), dict) else {}
     turtle_health = turtle_bot.get("health") if isinstance(turtle_bot.get("health"), dict) else {}
 
-    falcon_audit = _frpp_v1_get_falcon_audit()
-    broker = _frpp_v1_get_broker_ready()
-    divergence = _frpp_v1_get_divergence()
-    runtime = _frpp_v1_get_runtime()
-    storage = _frpp_v1_get_trade_registry_storage()
-    disaster_preview = _frpp_v1_get_disaster_preview_status()
+    falcon_audit = _frpp_v1_collect(
+        "falcon_audit",
+        _frpp_v1_get_falcon_audit,
+        {"ok": False, "live_audit_status": "EVIDENCE_UNAVAILABLE"},
+        collection_started,
+        collection_diagnostics,
+    )
+    audit_collection_ok = collection_diagnostics.get("falcon_audit", {}).get("ok") is True
+    audit_divergence = falcon_audit.get("divergence")
+    if audit_collection_ok and isinstance(audit_divergence, dict):
+        divergence = audit_divergence
+        collection_diagnostics["divergence"] = {
+            "status": "REUSED_FROM_FALCON_AUDIT",
+            "ok": True,
+            "timeout_seconds": 0.0,
+            "elapsed_ms": 0.0,
+        }
+    elif audit_collection_ok:
+        divergence = _frpp_v1_collect(
+            "divergence",
+            _frpp_v1_get_divergence,
+            {"ok": False, "error": "divergence evidence unavailable"},
+            collection_started,
+            collection_diagnostics,
+        )
+    else:
+        divergence = {"ok": False, "error": "falcon audit collection unavailable"}
+        collection_diagnostics["divergence"] = {
+            "status": "SKIPPED_DEPENDENCY_UNAVAILABLE",
+            "ok": False,
+            "dependency": "falcon_audit",
+            "timeout_seconds": 0.0,
+            "elapsed_ms": 0.0,
+        }
+
+    if audit_collection_ok:
+        broker = _frpp_v1_collect(
+            "broker_ready",
+            _frpp_v1_get_broker_ready,
+            {
+                "ready": {"ok": False, "status": "EVIDENCE_UNAVAILABLE"},
+                "broker": {},
+            },
+            collection_started,
+            collection_diagnostics,
+        )
+    else:
+        broker = {
+            "ready": {"ok": False, "status": "EVIDENCE_UNAVAILABLE"},
+            "broker": {},
+        }
+        collection_diagnostics["broker_ready"] = {
+            "status": "SKIPPED_DEPENDENCY_UNAVAILABLE",
+            "ok": False,
+            "dependency": "falcon_audit",
+            "timeout_seconds": 0.0,
+            "elapsed_ms": 0.0,
+        }
+
+    runtime = _frpp_v1_collect(
+        "runtime",
+        _frpp_v1_get_runtime,
+        {"ok": False, "status": "EVIDENCE_UNAVAILABLE"},
+        collection_started,
+        collection_diagnostics,
+    )
+    storage = _frpp_v1_collect(
+        "trade_registry_storage",
+        _frpp_v1_get_trade_registry_storage,
+        {"ok": False, "status": "EVIDENCE_UNAVAILABLE"},
+        collection_started,
+        collection_diagnostics,
+    )
+    disaster_preview = _frpp_v1_collect(
+        "disaster_stop_preview",
+        _frpp_v1_get_disaster_preview_status,
+        {"ok": False, "long_ok": False, "short_ok": False},
+        collection_started,
+        collection_diagnostics,
+    )
+    collection_elapsed_ms = round((time.monotonic() - collection_started) * 1000, 2)
+    collection_failures = sorted(
+        name
+        for name, meta in collection_diagnostics.items()
+        if not isinstance(meta, dict) or meta.get("ok") is not True
+    )
 
     checks = []
     reasons = []
@@ -56069,6 +56289,19 @@ def _frpp_v1_build_checklist():
         elif not ok:
             warnings.append(item["message"])
         return item
+
+    add(
+        "PREFLIGHT_EVIDENCE_COLLECTION_COMPLETE",
+        not collection_failures,
+        "Todas as evidências do preflight foram coletadas dentro dos deadlines.",
+        "Uma ou mais evidências do preflight ficaram indisponíveis ou excederam o deadline.",
+        True,
+        {
+            "failed_collectors": collection_failures,
+            "elapsed_ms": collection_elapsed_ms,
+            "collectors": collection_diagnostics,
+        },
+    )
 
     enable_real = bool(env.get("enable_real_trading_bool"))
     broker_dry = bool(env.get("broker_dry_run_bool"))
@@ -56340,6 +56573,16 @@ def _frpp_v1_build_checklist():
             "falcon_mode": falcon_mode,
             "runtime_memory_pct": current_mem,
             "runtime_restart_count_24h": restart_count,
+            "evidence_collection_ok": not collection_failures,
+            "evidence_collection_failed": collection_failures,
+            "evidence_collection_elapsed_ms": collection_elapsed_ms,
+        },
+        "evidence_collection": {
+            "ok": not collection_failures,
+            "elapsed_ms": collection_elapsed_ms,
+            "total_deadline_seconds": FALCON_REAL_PILOT_PREFLIGHT_TOTAL_DEADLINE_SECONDS,
+            "failed_collectors": collection_failures,
+            "collectors": collection_diagnostics,
         },
         "checks": checks,
         "blocking_failures": blocking_failed,

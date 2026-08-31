@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -40,11 +42,32 @@ def _valid_divergence(**overrides):
 
 
 def _preflight_namespace(divergence):
+    def collect(name, collector, fallback, _started_at, diagnostics):
+        try:
+            value = collector()
+        except Exception as exc:
+            diagnostics[name] = {
+                "status": "ERROR",
+                "ok": False,
+                "error_type": type(exc).__name__,
+            }
+            return dict(fallback or {})
+        diagnostics[name] = {
+            "status": "OK",
+            "ok": True,
+            "timeout_seconds": 1.0,
+            "elapsed_ms": 0.0,
+        }
+        return value
+
     return {
+        "time": time,
         "FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_VERSION": "test-version",
+        "FALCON_REAL_PILOT_PREFLIGHT_TOTAL_DEADLINE_SECONDS": 10.0,
         "FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_LATEST_FILE": "unused-latest.json",
         "FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE": "unused-events.jsonl",
         "MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION": "test-ownership-policy",
+        "_frpp_v1_collect": collect,
         "_frpp_v1_env_snapshot": lambda: {
             "enable_real_trading_bool": False,
             "broker_dry_run_bool": True,
@@ -103,7 +126,7 @@ def _preflight_namespace(divergence):
     }
 
 
-def _build_preflight(divergence):
+def _compile_preflight(namespace):
     namespace = _load_functions(
         {
             "_frpp_v1_float",
@@ -112,13 +135,233 @@ def _build_preflight(divergence):
             "_frpp_v1_upper",
             "_frpp_v1_build_checklist",
         },
-        _preflight_namespace(divergence),
+        namespace,
     )
     return namespace["_frpp_v1_build_checklist"]()
 
 
+def _build_preflight(divergence):
+    return _compile_preflight(_preflight_namespace(divergence))
+
+
 def _check(payload, code):
     return next(item for item in payload["checks"] if item["code"] == code)
+
+
+def _deadline_namespace():
+    return {
+        "threading": threading,
+        "time": time,
+        "_FRPP_V1_COLLECTOR_LOCK": threading.Lock(),
+        "_FRPP_V1_COLLECTOR_INFLIGHT": {},
+    }
+
+
+def test_preflight_deadline_returns_without_waiting_for_blocked_collector():
+    namespace = _load_functions(
+        {"_frpp_v1_run_with_deadline"},
+        _deadline_namespace(),
+    )
+    run_with_deadline = namespace["_frpp_v1_run_with_deadline"]
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocked_collector():
+        entered.set()
+        release.wait(1.0)
+        finished.set()
+        return {"ok": True}
+
+    started = time.monotonic()
+    value, meta = run_with_deadline("blocked", blocked_collector, 0.02)
+    elapsed = time.monotonic() - started
+
+    assert entered.is_set()
+    assert value is None
+    assert meta["status"] == "TIMEOUT"
+    assert meta["ok"] is False
+    assert meta["worker_daemon"] is True
+    assert elapsed < 0.5
+
+    duplicate_value, duplicate_meta = run_with_deadline(
+        "blocked",
+        lambda: {"ok": True},
+        0.02,
+    )
+    assert duplicate_value is None
+    assert duplicate_meta["status"] == "ALREADY_INFLIGHT"
+
+    release.set()
+    assert finished.wait(1.0)
+
+
+def test_preflight_deadline_converts_collector_exception_to_sanitized_error():
+    namespace = _load_functions(
+        {"_frpp_v1_run_with_deadline"},
+        _deadline_namespace(),
+    )
+
+    def raises_sensitive_message():
+        raise RuntimeError("sensitive-value-must-not-be-returned")
+
+    value, meta = namespace["_frpp_v1_run_with_deadline"](
+        "error",
+        raises_sensitive_message,
+        0.2,
+    )
+
+    assert value is None
+    assert meta["status"] == "ERROR"
+    assert meta["error_type"] == "RuntimeError"
+    assert "sensitive-value" not in json.dumps(meta)
+
+
+def test_preflight_collect_skips_work_after_total_deadline_is_exhausted():
+    namespace = _deadline_namespace()
+    namespace.update(
+        {
+            "FALCON_REAL_PILOT_PREFLIGHT_TOTAL_DEADLINE_SECONDS": 0.01,
+            "FALCON_REAL_PILOT_PREFLIGHT_COLLECTOR_TIMEOUT_SECONDS": {
+                "late": 1.0,
+            },
+        }
+    )
+    namespace = _load_functions(
+        {"_frpp_v1_run_with_deadline", "_frpp_v1_collect"},
+        namespace,
+    )
+    calls = []
+    diagnostics = {}
+
+    value = namespace["_frpp_v1_collect"](
+        "late",
+        lambda: calls.append(True) or {"ok": True},
+        {"ok": False},
+        time.monotonic() - 1.0,
+        diagnostics,
+    )
+
+    assert value == {"ok": False}
+    assert calls == []
+    assert diagnostics["late"]["status"] == "TOTAL_DEADLINE_EXHAUSTED"
+    assert diagnostics["late"]["ok"] is False
+
+
+def test_preflight_build_uses_real_bounded_collector_with_synthetic_sources():
+    namespace = _preflight_namespace(_valid_divergence())
+    namespace.pop("_frpp_v1_collect")
+    namespace.update(_deadline_namespace())
+    namespace.update(
+        {
+            "FALCON_REAL_PILOT_PREFLIGHT_TOTAL_DEADLINE_SECONDS": 2.0,
+            "FALCON_REAL_PILOT_PREFLIGHT_COLLECTOR_TIMEOUT_SECONDS": {
+                "env": 0.2,
+                "bots": 0.2,
+                "falcon_audit": 0.2,
+                "broker_ready": 0.2,
+                "divergence": 0.2,
+                "runtime": 0.2,
+                "trade_registry_storage": 0.2,
+                "disaster_stop_preview": 0.2,
+            },
+        }
+    )
+    namespace = _load_functions(
+        {
+            "_frpp_v1_run_with_deadline",
+            "_frpp_v1_collect",
+            "_frpp_v1_float",
+            "_frpp_v1_int",
+            "_frpp_v1_nonnegative_count",
+            "_frpp_v1_upper",
+            "_frpp_v1_build_checklist",
+        },
+        namespace,
+    )
+
+    payload = namespace["_frpp_v1_build_checklist"]()
+
+    assert payload["ok"] is True
+    assert payload["evidence_collection"]["ok"] is True
+    assert payload["evidence_collection"]["failed_collectors"] == []
+    assert all(
+        meta["ok"] is True
+        for meta in payload["evidence_collection"]["collectors"].values()
+    )
+
+
+def test_preflight_timeout_fails_closed_and_still_writes_audit_report():
+    divergence = _valid_divergence()
+    namespace = _preflight_namespace(divergence)
+    base_collect = namespace["_frpp_v1_collect"]
+    writes = []
+    events = []
+
+    def collect(name, collector, fallback, started_at, diagnostics):
+        if name == "broker_ready":
+            diagnostics[name] = {
+                "status": "TIMEOUT",
+                "ok": False,
+                "timeout_seconds": 0.01,
+                "elapsed_ms": 10.0,
+            }
+            return dict(fallback or {})
+        return base_collect(name, collector, fallback, started_at, diagnostics)
+
+    namespace["_frpp_v1_collect"] = collect
+    namespace["_frpp_v1_write_json_atomic"] = lambda path, payload: (
+        writes.append((path, payload)) or True,
+        None,
+    )
+    namespace["_frpp_v1_append_event"] = lambda payload: (
+        events.append(payload) or True,
+        None,
+    )
+
+    payload = _compile_preflight(namespace)
+
+    assert payload["ok"] is False
+    assert payload["status"] == "PREFLIGHT_REVIEW_REQUIRED"
+    assert payload["manual_rearm_next_step_allowed"] is False
+    assert payload["no_order_sent"] is True
+    assert payload["sent"] is False
+    assert payload["rearm_executed"] is False
+    assert payload["evidence_collection"]["ok"] is False
+    assert payload["evidence_collection"]["failed_collectors"] == ["broker_ready"]
+    assert _check(payload, "PREFLIGHT_EVIDENCE_COLLECTION_COMPLETE")["ok"] is False
+    assert _check(payload, "BROKER_READY_TRUE")["ok"] is False
+    assert payload["diagnostic_write"]["latest_ok"] is True
+    assert payload["diagnostic_write"]["events_ok"] is True
+    assert len(writes) == 1
+    assert len(events) == 1
+
+
+def test_preflight_reuses_audit_divergence_without_second_broker_collection():
+    divergence = _valid_divergence(broker_bingx_open_count=2, only_bingx_count=2)
+    namespace = _preflight_namespace(divergence)
+    direct_divergence_calls = []
+    namespace["_frpp_v1_get_falcon_audit"] = lambda: {
+        "ok": True,
+        "live_audit_status": "OK",
+        "bad_execution_events_total_count": 0,
+        "bad_execution_events_acked_count": 0,
+        "bad_execution_events_unacked_count": 0,
+        "divergence": divergence,
+    }
+
+    def direct_divergence():
+        direct_divergence_calls.append(True)
+        return divergence
+
+    namespace["_frpp_v1_get_divergence"] = direct_divergence
+
+    payload = _compile_preflight(namespace)
+
+    assert payload["ok"] is True
+    assert direct_divergence_calls == []
+    assert payload["evidence_collection"]["collectors"]["divergence"]["status"] == "REUSED_FROM_FALCON_AUDIT"
+    assert payload["summary"]["broker_bingx_open_count"] == 2
 
 
 @pytest.mark.parametrize(
