@@ -3332,6 +3332,12 @@ def place_market_order(
                     "price_ref": preview.get("price_ref") if isinstance(preview, dict) else None,
                     "client_tag": client_tag,
                     "client_order_id": preview.get("client_order_id") if isinstance(preview, dict) else None,
+                    "returned_client_order_id": entry_create_result.get(
+                        "returned_client_order_id"
+                    ),
+                    "returned_client_order_id_matches": entry_create_result.get(
+                        "returned_client_order_id_matches"
+                    ),
                     "attempt_outcome_persistence": entry_create_result.get(
                         "attempt_outcome_persistence"
                     ),
@@ -3391,6 +3397,12 @@ def place_market_order(
             "reduce_only": bool(reduce_only),
             "client_tag": client_tag,
             "client_order_id": preview.get("client_order_id"),
+            "returned_client_order_id": entry_create_result.get(
+                "returned_client_order_id"
+            ),
+            "returned_client_order_id_matches": entry_create_result.get(
+                "returned_client_order_id_matches"
+            ),
             "attempt_outcome_persistence": entry_create_result.get(
                 "attempt_outcome_persistence"
             ),

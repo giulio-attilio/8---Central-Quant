@@ -88,7 +88,7 @@ _FALCON_BROKER_STATE_SCAN_MAX_RECORDS = 2_000
 
 
 def _broker_execution_identity_projection(value: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist only reconciliation identities; never transport credentials."""
+    """Persist bounded reconciliation identities/proofs; never credentials."""
     value = value if isinstance(value, dict) else {}
     reservation = value.get("client_order_id_reservation")
     reservation = reservation if isinstance(reservation, dict) else {}
@@ -101,6 +101,7 @@ def _broker_execution_identity_projection(value: Dict[str, Any]) -> Dict[str, An
         "entry_amount": value.get("entry_amount"),
         "entry_filled_amount": value.get("entry_filled_amount"),
         "entry_acknowledged": value.get("entry_acknowledged"),
+        "returned_client_order_id": value.get("returned_client_order_id"),
         "returned_client_order_id_matches": value.get(
             "returned_client_order_id_matches"
         ),
@@ -135,12 +136,20 @@ def _broker_execution_identity_projection(value: Dict[str, Any]) -> Dict[str, An
             **{
                 key: disaster_stop.get(key)
                 for key in (
+                    "ok", "created", "sent", "confirmed",
+                    "send_attempted", "send_outcome_unknown",
                     "order_id", "client_order_id", "status",
                     "amount", "filled_amount", "stop_price", "working_type",
                     "symbol", "side", "position_side", "reduce_only",
                     "close_position", "client_order_id_reserved",
                     "client_order_id_unique",
+                    "client_order_id_reservation_status",
                     "expected_client_order_id", "expected_disaster_stop_client_order_id",
+                    "returned_client_order_id",
+                    "returned_client_order_id_matches", "stop_created",
+                    "stop_status_active", "stop_status_values",
+                    "stop_materially_valid", "stop_operationally_armed",
+                    "attempt_outcome_persistence_ok", "reconciliation_required",
                 )
                 if disaster_stop.get(key) is not None
             },

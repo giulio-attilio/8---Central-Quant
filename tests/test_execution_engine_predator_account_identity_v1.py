@@ -444,8 +444,19 @@ def test_engine_passes_falcon_notional_and_ownership_once_to_the_only_broker_sen
                 "sent": True,
                 "status": "LIVE_SENT",
                 "client_order_id": kwargs["client_tag"],
+                "returned_client_order_id": kwargs["client_tag"],
+                "returned_client_order_id_matches": True,
+                "entry_acknowledged": True,
                 "order_id": "ENTRY-1",
-                "disaster_stop": {"stop_operationally_armed": True},
+                "disaster_stop": {
+                    "confirmed": True,
+                    "order_id": "STOP-1",
+                    "returned_client_order_id": "FDS1-RETURNED",
+                    "returned_client_order_id_matches": True,
+                    "stop_materially_valid": True,
+                    "stop_operationally_armed": True,
+                    "stop_status_active": True,
+                },
             }
 
     def reserve(identity, *, client_order_id, **kwargs):
@@ -476,6 +487,12 @@ def test_engine_passes_falcon_notional_and_ownership_once_to_the_only_broker_sen
     )
 
     assert result["payload"]["live_result"]["sent"] is True
+    broker_state_identity = result["payload"]["live_result"][
+        "engine_broker_state"
+    ]["identity"]
+    assert broker_state_identity["returned_client_order_id"] == calls[0]["client_tag"]
+    assert broker_state_identity["returned_client_order_id_matches"] is True
+    assert broker_state_identity["disaster_stop"]["stop_operationally_armed"] is True
     assert len(calls) == 1
     assert calls[0]["notional_usdt"] == 10.0
     assert "margin_usdt" not in calls[0]
@@ -484,6 +501,45 @@ def test_engine_passes_falcon_notional_and_ownership_once_to_the_only_broker_sen
     assert basis["authority"] == "REAL_PILOT_GUARD_APPROVED_NOTIONAL_USDT"
     assert basis["approved_notional_usdt"] == basis["payload_notional_usdt"] == 10.0
     assert basis["monetary_tolerance_usdt"] >= 0.01
+
+
+def test_orchestrator_projection_preserves_only_bounded_strict_broker_proofs():
+    projected = canonical_orchestrator._broker_execution_identity_projection(
+        {
+            "client_order_id": "ENT1-EXPECTED",
+            "returned_client_order_id": "ENT1-EXPECTED",
+            "returned_client_order_id_matches": True,
+            "disaster_stop": {
+                "confirmed": True,
+                "order_id": "STOP-1",
+                "returned_client_order_id": "FDS1-EXPECTED",
+                "returned_client_order_id_matches": True,
+                "stop_status_active": True,
+                "stop_status_values": ["OPEN"],
+                "stop_materially_valid": True,
+                "stop_operationally_armed": True,
+                "attempt_outcome_persistence_ok": False,
+                "reconciliation_required": True,
+                "raw": {"apiKey": "must-not-survive"},
+                "stop_material_confirmation": {"unbounded": "must-not-survive"},
+            },
+        }
+    )
+
+    assert projected["returned_client_order_id"] == "ENT1-EXPECTED"
+    assert projected["returned_client_order_id_matches"] is True
+    stop = projected["disaster_stop"]
+    assert stop["confirmed"] is True
+    assert stop["returned_client_order_id"] == "FDS1-EXPECTED"
+    assert stop["returned_client_order_id_matches"] is True
+    assert stop["stop_status_active"] is True
+    assert stop["stop_status_values"] == ["OPEN"]
+    assert stop["stop_materially_valid"] is True
+    assert stop["stop_operationally_armed"] is True
+    assert stop["attempt_outcome_persistence_ok"] is False
+    assert stop["reconciliation_required"] is True
+    assert "raw" not in stop
+    assert "stop_material_confirmation" not in stop
 
 
 def test_engine_preserves_preexisting_broker_kwargs_for_non_falcon_bots():

@@ -691,6 +691,8 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
     assert first["entry_ack_persistence_degraded"] is True
     assert first["attempt_outcome_persistence_ok"] is False
     assert first["reconciliation_required"] is True
+    assert first["returned_client_order_id"] == ENTRY_CLIENT_ORDER_ID
+    assert first["returned_client_order_id_matches"] is True
     assert first["disaster_stop"]["stop_operationally_armed"] is True
     assert first["disaster_stop"]["order_id"] == "STOP-ORDER-1"
     assert [call["type"] for call in exchange.create_calls] == [

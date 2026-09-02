@@ -45,6 +45,9 @@ from pathlib import Path
 
 from memory_gc_coordinator import coordinate_memory_gc
 from registry_execution_identity import is_v2_execution_id
+from trade_evidence_identity_offset_runtime_shadow_post_protection_runtime_proof_finalizer_v3 import (
+    finalize_c3_post_protection_runtime_proof_v3,
+)
 
 try:
     from falcon_live_execution_contract import (
@@ -13296,6 +13299,21 @@ def execution_console_route():
                                         result["payload"].setdefault("post_execution_safety_check_v1", post_execution_safety_check)
                                     if disaster_stop_fallback_v1 is not None:
                                         result["payload"].setdefault("disaster_stop_fallback_v1", disaster_stop_fallback_v1)
+                                if (
+                                    post_execution_safety_check is not None
+                                    and disaster_stop_fallback_v1 is not None
+                                ):
+                                    result.setdefault(
+                                        "c3_post_protection_runtime_proof_v3",
+                                        finalize_c3_post_protection_runtime_proof_v3(
+                                            origin="CONSOLE",
+                                            engine_result=result,
+                                            registry_sync=sync_result,
+                                            safety_check=post_execution_safety_check,
+                                            disaster_stop_fallback=disaster_stop_fallback_v1,
+                                            enabled=False,
+                                        ),
+                                    )
                             if isinstance(disaster_stop_fallback_v1, dict) and disaster_stop_fallback_v1.get("requires_manual_attention"):
                                 message = "ATENÇÃO: ordem real enviada, mas stop de desastre não foi confirmado. Disaster Stop Fallback V1 ativou lock/manual attention. Proteja manualmente na BingX antes de qualquer nova execução."
                             else:
@@ -13843,6 +13861,21 @@ def execution_engine_live_route():
                 engine_result["payload"].setdefault("post_execution_safety_check_v1", post_execution_safety_check)
             if disaster_stop_fallback_v1 is not None:
                 engine_result["payload"].setdefault("disaster_stop_fallback_v1", disaster_stop_fallback_v1)
+        if (
+            post_execution_safety_check is not None
+            and disaster_stop_fallback_v1 is not None
+        ):
+            engine_result.setdefault(
+                "c3_post_protection_runtime_proof_v3",
+                finalize_c3_post_protection_runtime_proof_v3(
+                    origin="EXECUTIONLIVE",
+                    engine_result=engine_result,
+                    registry_sync=sync_result,
+                    safety_check=post_execution_safety_check,
+                    disaster_stop_fallback=disaster_stop_fallback_v1,
+                    enabled=False,
+                ),
+            )
 
     return engine_result, (200 if isinstance(engine_result, dict) and engine_result.get("ok") else 400)
 
