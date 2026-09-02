@@ -1592,6 +1592,11 @@ def run_execution_engine(
                                         "entry_acknowledged": live_result.get(
                                             "entry_acknowledged"
                                         ),
+                                        "returned_client_order_id": (
+                                            live_result.get(
+                                                "returned_client_order_id"
+                                            )
+                                        ),
                                         "returned_client_order_id_matches": (
                                             live_result.get(
                                                 "returned_client_order_id_matches"
