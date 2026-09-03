@@ -54,6 +54,9 @@ def _patch_namespace(tmp_path, bootstrap):
     def patched_save(payload):
         return True
 
+    def live_entry_readiness():
+        return {"ok": False, "status": "TEST_NOT_READY"}
+
     return {
         "Path": Path,
         "central_trade_registry": registry,
@@ -78,6 +81,7 @@ def _patch_namespace(tmp_path, bootstrap):
         "_trpsf_v1_legacy_candidate_paths": lambda: [],
         "_trpsf_v1_patched_load_registry": patched_load,
         "_trpsf_v1_patched_save_registry": patched_save,
+        "_trpsf_v1_falcon_live_entry_storage_readiness": live_entry_readiness,
         "_trpsf_v1_bootstrap_registry": bootstrap,
         "_trpsf_v1_now": lambda: "fixed",
         "_trpsf_v1_atomic_write_json": lambda *args, **kwargs: pytest.fail(
@@ -113,6 +117,10 @@ def test_apply_patch_without_bootstrap_does_not_create_or_write(tmp_path):
     assert (
         namespace["central_trade_registry"].save_registry
         is namespace["_trpsf_v1_patched_save_registry"]
+    )
+    assert (
+        namespace["central_trade_registry"].falcon_live_entry_storage_readiness
+        is namespace["_trpsf_v1_falcon_live_entry_storage_readiness"]
     )
 
 
@@ -301,6 +309,10 @@ def test_patched_loader_falls_back_to_single_legacy_source_without_writes(tmp_pa
         "_trpsf_v1_legacy_candidate_paths": lambda: [legacy],
         "_trpsf_v1_read_json": read_json,
         "_trpsf_v1_atomic_write_json": lambda *args, **kwargs: writes.append((args, kwargs)) or True,
+        "_trpsf_v1_falcon_live_entry_storage_readiness": lambda: {
+            "ok": False,
+            "status": "TEST_NOT_READY",
+        },
         "TRADE_REGISTRY_IMPORT_ERROR": None,
         "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "test-v1",
         "_trpsf_v1_now": lambda: "fixed",

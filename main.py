@@ -50089,6 +50089,47 @@ def _trpsf_v1_now():
         return None
 
 
+def _trpsf_v1_falcon_live_entry_storage_readiness():
+    """Expose a read-only, fail-closed Registry gate to Falcon LIVE."""
+    try:
+        active = _trpsf_v1_active_file()
+        active_text = str(active).replace("\\", "/")
+        checks = {
+            "patch_installed": _TRPSF_V1_STATE.get("patched") is True,
+            "persistent_path": active_text.startswith("/data/"),
+            "active_file_exists": bool(active.exists()),
+            "last_load_ok": _TRPSF_V1_STATE.get("last_load_ok") is True,
+            "last_write_ok": _TRPSF_V1_STATE.get("last_write_ok") is True,
+            "write_allowed": _TRPSF_V1_STATE.get("write_allowed") is True,
+            "temporary_read_only_clear": not bool(
+                _TRPSF_V1_STATE.get("temporary_read_only")
+            ),
+        }
+        ready = all(checks.values())
+        return {
+            "ok": ready,
+            "status": (
+                "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READY"
+                if ready
+                else "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_NOT_READY"
+            ),
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "checks": checks,
+            "read_only": True,
+            "write_executed": False,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_ERROR",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "checks": {},
+            "read_only": True,
+            "write_executed": False,
+            "error_type": type(exc).__name__,
+        }
+
+
 def _trpsf_v1_public(value, max_string=900):
     if isinstance(value, dict):
         return {str(k): _trpsf_v1_public(v, max_string=max_string) for k, v in value.items()}
@@ -50989,6 +51030,11 @@ def _trpsf_v1_apply_patch(run_bootstrap=False, force=False):
             try:
                 setattr(central_trade_registry, "load_registry", _trpsf_v1_patched_load_registry)
                 setattr(central_trade_registry, "save_registry", _trpsf_v1_patched_save_registry)
+                setattr(
+                    central_trade_registry,
+                    "falcon_live_entry_storage_readiness",
+                    _trpsf_v1_falcon_live_entry_storage_readiness,
+                )
             except Exception:
                 try:
                     setattr(
@@ -51009,6 +51055,12 @@ def _trpsf_v1_apply_patch(run_bootstrap=False, force=False):
                 is not _trpsf_v1_patched_load_registry
                 or getattr(central_trade_registry, "save_registry", None)
                 is not _trpsf_v1_patched_save_registry
+                or getattr(
+                    central_trade_registry,
+                    "falcon_live_entry_storage_readiness",
+                    None,
+                )
+                is not _trpsf_v1_falcon_live_entry_storage_readiness
             ):
                 raise RuntimeError("REGISTRY_PATCH_INSTALL_NOT_CONFIRMED")
             _TRPSF_V1_STATE["patched"] = True

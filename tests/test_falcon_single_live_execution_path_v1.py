@@ -112,6 +112,14 @@ def _helpers(**changes):
             derive_falcon_execution_intent_idempotency_key
         ),
         "central_run_execution_engine": None,
+        "central_trade_registry": SimpleNamespace(
+            falcon_live_entry_storage_readiness=lambda: {
+                "ok": True,
+                "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READY",
+                "read_only": True,
+                "write_executed": False,
+            }
+        ),
         "find_falcon_pending_broker_states": lambda limit=32: {
             "ok": True,
             "status": "FALCON_ENGINE_BROKER_LEDGER_CLEAR",
@@ -304,6 +312,55 @@ def test_live_adapter_calls_engine_once_and_propagates_identity_without_direct_b
     assert result["logical_send_count"] == result["broker_send_count"] == 1
     assert result["containment_triggered"] is False
     assert signal["entry_client_order_id"] == "ENT1-FALCON-1"
+
+
+@pytest.mark.parametrize(
+    ("registry", "expected_status"),
+    [
+        (
+            SimpleNamespace(),
+            "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_AUTHORITY_UNAVAILABLE",
+        ),
+        (
+            SimpleNamespace(
+                falcon_live_entry_storage_readiness=lambda: {
+                    "ok": False,
+                    "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_NOT_READY",
+                    "checks": {"last_write_ok": False},
+                }
+            ),
+            "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_NOT_READY",
+        ),
+        (
+            SimpleNamespace(
+                falcon_live_entry_storage_readiness=lambda: (_ for _ in ()).throw(
+                    RuntimeError("startup")
+                )
+            ),
+            "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_ERROR",
+        ),
+    ],
+)
+def test_live_adapter_blocks_before_engine_until_registry_storage_is_ready(
+    registry, expected_status
+):
+    calls = []
+    helpers, _namespace = _helpers(
+        central_trade_registry=registry,
+        central_run_execution_engine=lambda **_kwargs: calls.append(True),
+    )
+
+    result = helpers.falcon_execute_live_via_canonical_engine(
+        _signal(), {"allowed": True, "decision": "ALLOW"}, 10.0
+    )
+
+    assert result["ok"] is False
+    assert result["sent"] is False
+    assert result["send_attempted"] is False
+    assert result["engine_called"] is False
+    assert result["broker_send_count"] == 0
+    assert result["status"] == expected_status
+    assert calls == []
 
 
 def test_live_adapter_runner_missing_is_pre_send_false_and_runner_exception_is_unknown():
