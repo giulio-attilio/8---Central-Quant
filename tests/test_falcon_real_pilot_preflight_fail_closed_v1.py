@@ -114,6 +114,24 @@ def _preflight_namespace(divergence):
             "persistent_storage_enabled": True,
             "last_load_ok": True,
             "last_write_ok": True,
+            "migration_pending": False,
+            "write_allowed": True,
+            "temporary_read_only": False,
+            "live_entry_readiness": {
+                "ok": True,
+                "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READY",
+                "checks": {
+                    "patch_installed": True,
+                    "persistent_path": True,
+                    "active_file_exists": True,
+                    "last_load_ok": True,
+                    "last_write_ok": True,
+                    "write_allowed": True,
+                    "temporary_read_only_clear": True,
+                },
+                "read_only": True,
+                "write_executed": False,
+            },
             "current_counts": {"open_count": 0, "closed_count": 0},
         },
         "_frpp_v1_get_disaster_preview_status": lambda: {
@@ -148,6 +166,152 @@ def _build_preflight(divergence):
 
 def _check(payload, code):
     return next(item for item in payload["checks"] if item["code"] == code)
+
+
+def test_preflight_storage_collector_embeds_exported_live_entry_interlock_result():
+    status_calls = []
+    readiness_calls = []
+    readiness = {
+        "ok": True,
+        "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READY",
+        "checks": {"write_allowed": True},
+        "read_only": True,
+        "write_executed": False,
+    }
+
+    class Registry:
+        @staticmethod
+        def falcon_live_entry_storage_readiness():
+            readiness_calls.append(True)
+            return readiness
+
+    namespace = _load_functions(
+        {"_frpp_v1_get_trade_registry_storage"},
+        {
+            "central_trade_registry": Registry,
+            "trade_registry_persistent_storage_fix_v1_status": (
+                lambda force=False: status_calls.append(force)
+                or {"status": "ACTIVE_PERSISTENT"}
+            ),
+        },
+    )
+
+    result = namespace["_frpp_v1_get_trade_registry_storage"]()
+
+    assert status_calls == [False]
+    assert readiness_calls == [True]
+    assert result["status"] == "ACTIVE_PERSISTENT"
+    assert result["live_entry_readiness"] is readiness
+
+
+@pytest.mark.parametrize(
+    "provider, expected_status",
+    [
+        (None, "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_UNAVAILABLE"),
+        (lambda: None, "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_INVALID"),
+        (
+            lambda: (_ for _ in ()).throw(RuntimeError("sensitive detail")),
+            "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_ERROR",
+        ),
+    ],
+)
+def test_preflight_storage_collector_fails_closed_for_invalid_provider(
+    provider, expected_status
+):
+    class Registry:
+        falcon_live_entry_storage_readiness = staticmethod(provider) if provider else None
+
+    namespace = _load_functions(
+        {"_frpp_v1_get_trade_registry_storage"},
+        {
+            "central_trade_registry": Registry,
+            "trade_registry_persistent_storage_fix_v1_status": (
+                lambda force=False: {
+                    "ok": True,
+                    "status": "ACTIVE_PERSISTENT",
+                }
+            ),
+        },
+    )
+
+    result = namespace["_frpp_v1_get_trade_registry_storage"]()
+    readiness = result["live_entry_readiness"]
+
+    assert readiness["ok"] is False
+    assert readiness["status"] == expected_status
+    assert readiness["read_only"] is True
+    assert readiness["write_executed"] is False
+    assert "sensitive detail" not in json.dumps(result)
+
+
+def test_preflight_registry_check_uses_exact_live_entry_interlock_result():
+    namespace = _preflight_namespace(_valid_divergence())
+    namespace["_frpp_v1_get_trade_registry_storage"] = lambda: {
+        "ok": True,
+        "status": "CLOSED_IDENTITY_MERGE_BLOCKED",
+        "registry_file_active": "/data/trade_registry.json",
+        "persistent_storage_enabled": True,
+        "last_load_ok": True,
+        "last_write_ok": True,
+        "migration_pending": True,
+        "write_allowed": False,
+        "temporary_read_only": False,
+        "live_entry_readiness": {
+            "ok": False,
+            "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_NOT_READY",
+            "checks": {
+                "patch_installed": True,
+                "persistent_path": True,
+                "active_file_exists": True,
+                "last_load_ok": True,
+                "last_write_ok": True,
+                "write_allowed": False,
+                "temporary_read_only_clear": True,
+            },
+            "read_only": True,
+            "write_executed": False,
+        },
+        "current_counts": {"open_count": 20, "closed_count": 1924},
+    }
+
+    payload = _compile_preflight(namespace)
+    check = _check(payload, "TRADE_REGISTRY_PERSISTENT_OK")
+
+    assert payload["ok"] is False
+    assert payload["manual_rearm_next_step_allowed"] is False
+    assert check["ok"] is False
+    assert check["blocking"] is True
+    assert check["details"]["live_entry_readiness_status"] == (
+        "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_NOT_READY"
+    )
+    assert check["details"]["live_entry_readiness_checks"]["write_allowed"] is False
+    assert check["details"]["live_entry_readiness_read_only"] is True
+    assert check["details"]["live_entry_readiness_write_executed"] is False
+
+
+@pytest.mark.parametrize("readiness", [None, {}, {"ok": False}, {"ok": 1}, "ready"])
+def test_preflight_registry_check_fails_closed_without_explicit_true_readiness(
+    readiness,
+):
+    namespace = _preflight_namespace(_valid_divergence())
+    storage = {
+        "status": "ACTIVE_PERSISTENT",
+        "registry_file_active": "/data/trade_registry.json",
+        "persistent_storage_enabled": True,
+        "last_load_ok": True,
+        "last_write_ok": True,
+        "write_allowed": True,
+        "temporary_read_only": False,
+        "current_counts": {"open_count": 0, "closed_count": 0},
+    }
+    if readiness is not None:
+        storage["live_entry_readiness"] = readiness
+    namespace["_frpp_v1_get_trade_registry_storage"] = lambda: storage
+
+    payload = _compile_preflight(namespace)
+
+    assert payload["ok"] is False
+    assert _check(payload, "TRADE_REGISTRY_PERSISTENT_OK")["ok"] is False
 
 
 def test_preflight_bot_snapshot_uses_only_light_health():

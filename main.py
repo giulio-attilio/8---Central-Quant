@@ -56206,11 +56206,62 @@ def _frpp_v1_get_runtime():
 def _frpp_v1_get_trade_registry_storage():
     try:
         fn = globals().get("trade_registry_persistent_storage_fix_v1_status")
-        if callable(fn):
-            return fn(force=False) or {}
+        if not callable(fn):
+            return {
+                "ok": False,
+                "error": "trade_registry_persistent_storage_fix_v1_status unavailable",
+                "status": "UNAVAILABLE",
+            }
+        storage = fn(force=False) or {}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "status": "ERROR"}
-    return {"ok": False, "error": "trade_registry_persistent_storage_fix_v1_status unavailable", "status": "UNAVAILABLE"}
+    if not isinstance(storage, dict):
+        storage = {
+            "ok": False,
+            "status": "INVALID_STORAGE_STATUS",
+        }
+    else:
+        storage = dict(storage)
+
+    readiness_provider = (
+        getattr(
+            central_trade_registry,
+            "falcon_live_entry_storage_readiness",
+            None,
+        )
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(readiness_provider):
+        readiness = {
+            "ok": False,
+            "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_UNAVAILABLE",
+            "checks": {},
+            "read_only": True,
+            "write_executed": False,
+        }
+    else:
+        try:
+            readiness = readiness_provider()
+        except Exception as exc:
+            readiness = {
+                "ok": False,
+                "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_ERROR",
+                "checks": {},
+                "read_only": True,
+                "write_executed": False,
+                "error_type": type(exc).__name__,
+            }
+        if not isinstance(readiness, dict):
+            readiness = {
+                "ok": False,
+                "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_INVALID",
+                "checks": {},
+                "read_only": True,
+                "write_executed": False,
+            }
+    storage["live_entry_readiness"] = readiness
+    return storage
 
 
 def _frpp_v1_get_disaster_preview_status():
@@ -56568,12 +56619,17 @@ def _frpp_v1_build_checklist():
         {"token_configured": falcon_bot.get("token_configured"), "chat_configured": falcon_bot.get("chat_configured")},
     )
 
-    storage_ok = bool(storage.get("persistent_storage_enabled") and storage.get("last_write_ok") and str(storage.get("registry_file_active") or "").startswith("/data/"))
+    storage_readiness = (
+        storage.get("live_entry_readiness")
+        if isinstance(storage.get("live_entry_readiness"), dict)
+        else {}
+    )
+    storage_ok = storage_readiness.get("ok") is True
     add(
         "TRADE_REGISTRY_PERSISTENT_OK",
         storage_ok,
-        "Trade Registry persistente OK em /data.",
-        "Trade Registry persistente não está OK.",
+        "Trade Registry aprovado pelo mesmo interlock da entrada LIVE.",
+        "Trade Registry não foi aprovado pelo interlock da entrada LIVE.",
         True,
         {
             "status": storage.get("status"),
@@ -56581,6 +56637,13 @@ def _frpp_v1_build_checklist():
             "persistent_storage_enabled": storage.get("persistent_storage_enabled"),
             "last_load_ok": storage.get("last_load_ok"),
             "last_write_ok": storage.get("last_write_ok"),
+            "migration_pending": storage.get("migration_pending"),
+            "write_allowed": storage.get("write_allowed"),
+            "temporary_read_only": storage.get("temporary_read_only"),
+            "live_entry_readiness_status": storage_readiness.get("status"),
+            "live_entry_readiness_checks": storage_readiness.get("checks") or {},
+            "live_entry_readiness_read_only": storage_readiness.get("read_only"),
+            "live_entry_readiness_write_executed": storage_readiness.get("write_executed"),
             "open_count": (storage.get("current_counts") or {}).get("open_count"),
             "closed_count": (storage.get("current_counts") or {}).get("closed_count"),
         },
