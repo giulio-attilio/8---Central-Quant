@@ -4087,6 +4087,51 @@ def falcon_execute_live_via_canonical_engine(
             "broker_send_count": 0,
         }
 
+    registry = globals().get("central_trade_registry")
+    registry_readiness_reader = getattr(
+        registry, "falcon_live_entry_storage_readiness", None
+    )
+    if not callable(registry_readiness_reader):
+        registry_readiness = {
+            "ok": False,
+            "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_AUTHORITY_UNAVAILABLE",
+            "read_only": True,
+            "write_executed": False,
+        }
+    else:
+        try:
+            registry_readiness = registry_readiness_reader()
+        except Exception as exc:
+            registry_readiness = {
+                "ok": False,
+                "status": "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READINESS_ERROR",
+                "read_only": True,
+                "write_executed": False,
+                "error_type": type(exc).__name__,
+            }
+    if not isinstance(registry_readiness, dict) or registry_readiness.get("ok") is not True:
+        return {
+            "ok": False,
+            "sent": False,
+            "send_attempted": False,
+            "status": (
+                registry_readiness.get("status")
+                if isinstance(registry_readiness, dict)
+                else "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_NOT_READY"
+            ),
+            "falcon_live_execution_path": "ORCHESTRATOR_ENGINE",
+            "orchestrator_called": False,
+            "engine_called": False,
+            "logical_send_count": 0,
+            "broker_send_count": 0,
+            "reconciliation_required": False,
+            "trade_registry_storage_readiness": (
+                _falcon_terminal_sanitize_projection(registry_readiness)
+                if isinstance(registry_readiness, dict)
+                else {"ok": False, "status": "INVALID_READINESS_RESULT"}
+            ),
+        }
+
     ledger_preflight = _falcon_engine_pending_ledger_preflight()
     if ledger_preflight.get("ok") is not True:
         return {
