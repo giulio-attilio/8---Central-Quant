@@ -68169,6 +68169,92 @@ def falcon_blocked_diagnostic_v1_text_route():
     return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+import trade_registry_closed_identity_conflict_repair_runtime_operation_v1 as c3_closed_repair_operation_v1
+
+
+def _c3_closed_identity_repair_request_v1():
+    if str(getattr(request, "method", "")).upper() != "POST":
+        return {"ok": False, "status": "POST_JSON_REQUIRED", "status_code": 405}
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return {"ok": False, "status": "POST_JSON_REQUIRED", "status_code": 400}
+    sensitive_keys = {
+        str(key or "").lower()
+        for key in body
+        if "token" in str(key or "").lower()
+        or "authorization" in str(key or "").lower()
+        or str(key or "").lower() in {"auth", "api_key", "apikey"}
+    }
+    if sensitive_keys:
+        return {
+            "ok": False,
+            "status": "EXECUTION_AUTH_HEADER_REQUIRED",
+            "status_code": 403,
+        }
+    resolver = globals().get("_ee_auth_resolver_v1_resolve")
+    if not callable(resolver):
+        return {"ok": False, "status": "EXECUTION_AUTH_REQUIRED", "status_code": 403}
+    try:
+        auth = resolver(allow_env_fallback=False)
+    except Exception:
+        auth = {}
+    matched_source = str((auth or {}).get("matched_source") or "")
+    if not ((auth or {}).get("ok") and matched_source.startswith("request.headers.")):
+        return {"ok": False, "status": "EXECUTION_AUTH_REQUIRED", "status_code": 403}
+    operation_name = str(body.get("operation") or "").lower().strip()
+    if operation_name not in {"preview", "apply"}:
+        return {
+            "ok": False,
+            "status": "REPAIR_OPERATION_INVALID",
+            "status_code": 400,
+        }
+    return {
+        "ok": True,
+        "operation": operation_name,
+        "payload": body,
+        "status_code": 200,
+    }
+
+
+@app.route("/traderegistry/closedidentity/repair", methods=["POST"])
+@app.route("/trade_registry/closedidentity/repair", methods=["POST"])
+@app.route("/trades/closedidentity/repair", methods=["POST"])
+def trade_registry_closed_identity_repair_runtime_operation_v1_route():
+    decision = _c3_closed_identity_repair_request_v1()
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    if not decision.get("ok"):
+        return {
+            "ok": False,
+            "status": decision.get("status"),
+            "write_executed": False,
+            "registry_write": False,
+            "no_order_sent": True,
+        }, int(decision.get("status_code") or 400), headers
+    controller = globals().get("C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1")
+    if not isinstance(
+        controller,
+        c3_closed_repair_operation_v1.ClosedIdentityRepairRuntimeOperationV1,
+    ):
+        return {
+            "ok": False,
+            "status": "REPAIR_RUNTIME_OPERATION_UNAVAILABLE",
+            "write_executed": False,
+            "registry_write": False,
+            "no_order_sent": True,
+        }, 503, headers
+    if decision.get("operation") == "preview":
+        result = controller.preview(decision["payload"])
+    else:
+        result = controller.apply(decision["payload"])
+    status = str(result.get("status") or "")
+    status_code = 200 if result.get("ok") else 409
+    if status.endswith("ACK_REQUIRED") or status.endswith("REQUEST_INVALID"):
+        status_code = 400
+    elif "AUTH" in status:
+        status_code = 403
+    return result, status_code, headers
+
+
 def _install_c3_closed_repair_writer_coordination_v1():
     """Install only default-off production-shaped C3 capabilities."""
     coordinator = c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()
@@ -68192,6 +68278,48 @@ def _install_c3_closed_repair_writer_coordination_v1():
         "broker_called": False,
         "no_order_sent": True,
     }
+
+
+def _c3_closed_identity_repair_trading_controls_v1():
+    return {
+        "enable_real_trading": bool(ENABLE_REAL_TRADING),
+        "broker_dry_run": env_bool("BROKER_DRY_RUN", True),
+        "falcon_mode": str(os.getenv("FALCON_MODE", "VERIFY") or "VERIFY")
+        .upper()
+        .strip(),
+        "central_real_execution_enabled": env_bool(
+            "CENTRAL_REAL_EXECUTION_ENABLED", False
+        ),
+        "central_real_pilot_enabled": env_bool(
+            "CENTRAL_REAL_PILOT_ENABLED", False
+        ),
+        "live_trading_enabled": env_bool("LIVE_TRADING_ENABLED", False),
+        "order_submission_authorized": False,
+    }
+
+
+def _build_c3_closed_identity_repair_runtime_operation_v1():
+    loader = (
+        getattr(central_trade_registry, "load_registry_raw_read_only", None)
+        if central_trade_registry is not None
+        else None
+    )
+
+    def unavailable_loader():
+        raise RuntimeError("READ_ONLY_REGISTRY_LOADER_UNAVAILABLE")
+
+    return c3_closed_repair_operation_v1.ClosedIdentityRepairRuntimeOperationV1(
+        registry_loader=loader if callable(loader) else unavailable_loader,
+        conflict_auditor=trade_registry_closed_identity_financial_conflicts_v1,
+        registry_lock=_trpsf_v1_registry_lock,
+        trading_controls=_c3_closed_identity_repair_trading_controls_v1,
+        target_path=_trpsf_v1_active_file(),
+        backup_root=(
+            Path(CENTRAL_DATA_DIR)
+            / "trade_registry_closed_identity_repair_backups_v1"
+        ),
+        config=c3_closed_repair_operation_v1.ClosedIdentityRepairRuntimeConfigV1(),
+    )
 
 
 def _recover_c3_closed_repair_registry_v1():
@@ -68223,6 +68351,9 @@ C3_PERSISTENCE_BOOTSTRAP_V1 = trade_registry_persistent_storage_fix_v1_status(
     no_io=True,
 )
 C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1()
+C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1 = (
+    _build_c3_closed_identity_repair_runtime_operation_v1()
+)
 C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1 = _recover_c3_closed_repair_registry_v1()
 
 if CENTRAL_AUTO_START_RUNTIME:
