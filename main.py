@@ -50048,6 +50048,7 @@ TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE = CENTRAL_DATA_DIR / "trade
 _TRPSF_V1_STATE = {
     "patched": False,
     "migration_done": False,
+    "restart_readiness_attested": False,
     "active_file": None,
     "original_registry_file": None,
     "legacy_files": [],
@@ -50096,6 +50097,11 @@ def _trpsf_v1_falcon_live_entry_storage_readiness():
         active_text = str(active).replace("\\", "/")
         checks = {
             "patch_installed": _TRPSF_V1_STATE.get("patched") is True,
+            "migration_done": _TRPSF_V1_STATE.get("migration_done") is True,
+            "restart_readiness_attested": _TRPSF_V1_STATE.get(
+                "restart_readiness_attested"
+            )
+            is True,
             "persistent_path": active_text.startswith("/data/"),
             "active_file_exists": bool(active.exists()),
             "last_load_ok": _TRPSF_V1_STATE.get("last_load_ok") is True,
@@ -50535,6 +50541,7 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
         # before touching persistence.  Every failure path therefore remains
         # closed even if a stale in-memory state was injected or restored.
         _TRPSF_V1_STATE["migration_done"] = False
+        _TRPSF_V1_STATE["restart_readiness_attested"] = False
         _TRPSF_V1_STATE["last_load_ok"] = False
         _TRPSF_V1_STATE["last_write_ok"] = False
         _TRPSF_V1_STATE["write_allowed"] = False
@@ -50578,6 +50585,7 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
     _TRPSF_V1_STATE["last_load_ok"] = False
     _TRPSF_V1_STATE["last_write_ok"] = False
     _TRPSF_V1_STATE["write_allowed"] = False
+    _TRPSF_V1_STATE["restart_readiness_attested"] = False
     active = _trpsf_v1_active_file()
     legacy_paths = _trpsf_v1_legacy_candidate_paths()
     active_file_exists = active.exists()
@@ -50850,6 +50858,7 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
     _TRPSF_V1_STATE["last_load_ok"] = bootstrap_ready
     _TRPSF_V1_STATE["last_write_ok"] = bootstrap_ready
     _TRPSF_V1_STATE["write_allowed"] = bootstrap_ready
+    _TRPSF_V1_STATE["restart_readiness_attested"] = bootstrap_ready
     if bootstrap_ready:
         _TRPSF_V1_STATE["temporary_read_source"] = None
         _TRPSF_V1_STATE["temporary_read_only"] = False
@@ -51092,6 +51101,7 @@ def _trpsf_v1_apply_patch(run_bootstrap=False, force=False):
             _TRPSF_V1_STATE["temporary_read_source"] = None
             _TRPSF_V1_STATE["temporary_read_only"] = False
             _TRPSF_V1_STATE["write_allowed"] = False
+            _TRPSF_V1_STATE["restart_readiness_attested"] = False
         if run_bootstrap:
             return _trpsf_v1_bootstrap_registry(force=bool(force))
         status = {
@@ -51178,6 +51188,12 @@ def trade_registry_persistent_storage_fix_v1_status(
         status["migration_pending"] = bool(
             _TRPSF_V1_STATE.get("patched")
             and not _TRPSF_V1_STATE.get("migration_done")
+        )
+        status["migration_done"] = bool(
+            _TRPSF_V1_STATE.get("migration_done")
+        )
+        status["restart_readiness_attested"] = bool(
+            _TRPSF_V1_STATE.get("restart_readiness_attested")
         )
         status["temporary_read_source"] = _TRPSF_V1_STATE.get("temporary_read_source")
         status["temporary_read_only"] = bool(

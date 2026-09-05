@@ -43,6 +43,8 @@ def _load_readiness(*, state, active_file):
 def _ready_state(**changes):
     state = {
         "patched": True,
+        "migration_done": True,
+        "restart_readiness_attested": True,
         "last_load_ok": True,
         "last_write_ok": True,
         "write_allowed": True,
@@ -68,6 +70,11 @@ def test_registry_live_entry_readiness_accepts_only_complete_persistent_proof():
 def test_registry_live_entry_readiness_fails_closed_for_each_startup_gap():
     cases = [
         (_ready_state(patched=False), _ActiveFile("/data/trade_registry.json")),
+        (_ready_state(migration_done=False), _ActiveFile("/data/trade_registry.json")),
+        (
+            _ready_state(restart_readiness_attested=False),
+            _ActiveFile("/data/trade_registry.json"),
+        ),
         (_ready_state(), _ActiveFile("/opt/render/project/src/data/trade_registry.json")),
         (_ready_state(), _ActiveFile("/data/trade_registry.json", exists=False)),
         (_ready_state(last_load_ok=None), _ActiveFile("/data/trade_registry.json")),
