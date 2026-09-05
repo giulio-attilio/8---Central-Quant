@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
+from trade_registry_closed_identity_conflict_repair_runtime_seam_v1 import _c3_closed_repair_writer_mutation_v1
 TIMEZONE_BR = timezone(timedelta(hours=-3))
 LOGGER = logging.getLogger(__name__)
 
@@ -263,7 +263,7 @@ def _normalize_registry(data: Any) -> Dict[str, Any]:
 def load_registry() -> Dict[str, Any]:
     _ensure_data_dir()
     path = Path(TRADE_REGISTRY_FILE)
-    with _lock:
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_LOAD_INITIALIZE_OR_MIGRATE"), _lock:
         if not path.exists() and TRADE_REGISTRY_LEGACY_FILE != TRADE_REGISTRY_FILE and Path(TRADE_REGISTRY_LEGACY_FILE).exists():
             legacy = json.loads(
                 Path(TRADE_REGISTRY_LEGACY_FILE).read_text(encoding="utf-8")
@@ -427,7 +427,7 @@ def register_open_trade(
     # Registry mutations are whole-document writes.  Hold the same reentrant
     # lock across load/modify/save so an older writer cannot resurrect a trade
     # that reconciliation has already moved to CLOSED.
-    with _lock:
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_REGISTER_OPEN_TRADE"), _lock:
         registry = load_registry()
         registry["open_trades"][trade_id] = trade
         if save_registry(registry) is False:
@@ -441,7 +441,7 @@ def register_open_trade(
 
 
 def update_trade(trade_id: str, **updates: Any) -> Dict[str, Any]:
-    with _lock:
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_UPDATE_OPEN_TRADE"), _lock:
         registry = load_registry()
         trade = registry["open_trades"].get(trade_id)
         if not trade:
@@ -611,7 +611,7 @@ def update_closed_trade(
     metadata: Optional[Dict[str, Any]] = None,
     **updates: Any,
 ) -> Dict[str, Any]:
-    with _lock:
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_UPDATE_CLOSED_TRADE"), _lock:
         registry = load_registry()
         closed_trades = registry.get("closed_trades", [])
         expected = expected_identity if isinstance(expected_identity, dict) else {}
@@ -2728,7 +2728,7 @@ def backfill_historical_strong_identity(
             "broker_called": False,
             "committed": False,
         }
-    with _lock:
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_HISTORICAL_STRONG_IDENTITY_BACKFILL"), _lock:
         registry = load_registry()
         evaluated = _historical_backfill_evaluate(registry, payload)
         if evaluated.get("status") == "ALREADY_BACKFILLED":
@@ -2871,7 +2871,7 @@ def record_manual_close_outcome(
     if not lifecycle_id:
         return {"ok": False, "error": "MANUAL_CLOSE_OUTCOME_LIFECYCLE_ID_REQUIRED", "trade_id": trade_id}
 
-    with _lock:
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_RECORD_MANUAL_CLOSE_OUTCOME"), _lock:
         registry = load_registry()
         open_trades = registry.get("open_trades", {})
         open_records = list(open_trades.values()) if isinstance(open_trades, dict) else []
@@ -3112,7 +3112,7 @@ def close_trade(
     clear_financial_results: bool = False,
     **extra: Any,
 ) -> Dict[str, Any]:
-    with _lock:
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_CLOSE_TRADE"), _lock:
         registry = load_registry()
         if expected_open_trade_id_count is not None:
             expected_trade_id = str(trade_id or "").strip()
@@ -3302,8 +3302,8 @@ def get_trade_registry_snapshot() -> Dict[str, Any]:
 def reset_trade_registry(confirm: bool = False) -> Dict[str, Any]:
     if not confirm:
         return {"ok": False, "error": "CONFIRM_REQUIRED"}
-    registry = _empty_registry()
-    write_result = save_registry(registry)
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_RESET"):
+        write_result = save_registry(_empty_registry())
     if write_result is False:
         return {"ok": False, "error": "TRADE_REGISTRY_RESET_NOT_PERSISTED"}
     return {"ok": True, "action": "TRADE_REGISTRY_RESET"}
