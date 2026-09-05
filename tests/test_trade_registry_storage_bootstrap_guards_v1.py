@@ -610,7 +610,12 @@ def test_patched_save_registry_uses_active_after_migration(tmp_path):
 def test_bootstrap_without_registry_lock_blocks_before_filesystem_io(tmp_path):
     io_calls = []
     namespace = {
-        "_TRPSF_V1_STATE": {},
+        "_TRPSF_V1_STATE": {
+            "migration_done": True,
+            "last_load_ok": True,
+            "last_write_ok": True,
+            "write_allowed": True,
+        },
         "_trpsf_v1_registry_lock": lambda: None,
         "_trpsf_v1_active_file": lambda: io_calls.append("active_file")
         or (tmp_path / "trade_registry.json"),
@@ -629,6 +634,10 @@ def test_bootstrap_without_registry_lock_blocks_before_filesystem_io(tmp_path):
     assert result["write_performed"] is False
     assert result["closed_history_identity_merge"]["safe_to_commit"] is False
     assert io_calls == []
+    assert namespace["_TRPSF_V1_STATE"]["migration_done"] is False
+    assert namespace["_TRPSF_V1_STATE"]["last_load_ok"] is False
+    assert namespace["_TRPSF_V1_STATE"]["last_write_ok"] is False
+    assert namespace["_TRPSF_V1_STATE"]["write_allowed"] is False
 
 
 def test_bootstrap_without_lock_resolver_blocks_before_filesystem_io(tmp_path):
