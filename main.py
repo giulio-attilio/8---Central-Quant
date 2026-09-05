@@ -56737,7 +56737,19 @@ def _frpp_v1_build_checklist():
     c3_coordination = c3_runtime_seam_v1.c3_closed_repair_writer_coordination_status_v1()
     add(
         "TRADE_REGISTRY_C3_WRITER_COORDINATION_READY",
-        c3_coordination.get("coordination_ready") is True,
+        c3_coordination.get("enabled") is True
+        and c3_coordination.get("coordination_ready") is True
+        and c3_coordination.get("runtime_activation_allowed") is True
+        and c3_coordination.get("registered_writer_count") == 19
+        and c3_coordination.get("all_writers_registered") is True
+        and c3_coordination.get("inflight_mutations") == 0
+        and c3_coordination.get("shared_lock_backend_ready") is True
+        and c3_coordination.get("maintenance_lease_store_ready") is True
+        and c3_coordination.get("registry_interlock_ready") is True
+        and c3_coordination.get("activation_receipt_verified") is True
+        and c3_coordination.get("source_hashes_verified") is True
+        and c3_coordination.get("rollback_ready") is True
+        and c3_coordination.get("kill_switch_ready") is True,
         "Coordenação C3 dos 19 escritores do Trade Registry está pronta.",
         "Coordenação C3 permanece dormente/default-off; Live continua bloqueado.",
         True,

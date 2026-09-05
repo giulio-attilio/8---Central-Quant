@@ -241,6 +241,121 @@ def test_marker_names_in_comments_do_not_satisfy_ast_checks() -> None:
     assert _check(result, "LIVE_PREFLIGHT_REQUIRES_C3_COORDINATION")["ok"] is False
 
 
+def _replace_c3_live_gate_predicate(source: str, replacement: str) -> str:
+    start_marker = '        c3_coordination.get("enabled") is True\n'
+    end_marker = '        and c3_coordination.get("kill_switch_ready") is True,\n'
+    start = source.index(start_marker)
+    end = source.index(end_marker, start) + len(end_marker)
+    return source[:start] + replacement + source[end:]
+
+
+def test_current_live_preflight_requires_exact_c3_vector_semantics(
+    current_harness_result: dict,
+) -> None:
+    check = _check(
+        current_harness_result["preflight_result"],
+        "LIVE_PREFLIGHT_REQUIRES_C3_COORDINATION",
+    )
+    evidence = check["details"]["semantic_evidence"]
+
+    assert check["ok"] is True
+    assert evidence["status_sample_count"] == 1
+    assert evidence["gate_call_count"] == 1
+    assert evidence["all_fields_conjunctive"] is True
+    assert evidence["sampled_at_decision_time"] is True
+    assert evidence["generic_ok_insufficient"] is True
+    assert evidence["observed_fields"] == evidence["required_fields"]
+    assert len(evidence["required_fields"]) == 13
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        '        c3_coordination.get("coordination_ready") is True,\n',
+        '        c3_coordination.get("ok") is True,\n',
+        (
+            '        c3_coordination.get("enabled") is True\n'
+            '        or c3_coordination.get("coordination_ready") is True,\n'
+        ),
+    ],
+)
+def test_weakened_c3_live_gate_semantics_fail_static_preflight(
+    replacement: str,
+) -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = _replace_c3_live_gate_predicate(
+        sources["main.py"], replacement
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(result, "LIVE_PREFLIGHT_REQUIRES_C3_COORDINATION")
+
+    assert check["ok"] is False
+    assert check["details"]["semantic_evidence"]["all_fields_conjunctive"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_missing_one_c3_guard_fails_static_preflight() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        '        and c3_coordination.get("kill_switch_ready") is True,\n',
+        '        and c3_coordination.get("rollback_ready") is True,\n',
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    evidence = _check(
+        result, "LIVE_PREFLIGHT_REQUIRES_C3_COORDINATION"
+    )["details"]["semantic_evidence"]
+
+    assert evidence["all_fields_conjunctive"] is False
+    assert result["static_readiness"] is False
+    assert result["live_allowed"] is False
+
+
+def test_cached_c3_status_fails_static_preflight() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "    c3_coordination = c3_runtime_seam_v1.c3_closed_repair_writer_coordination_status_v1()\n",
+        "    c3_coordination = C3_CLOSED_REPAIR_INSTALLATION_V1\n",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    evidence = _check(
+        result, "LIVE_PREFLIGHT_REQUIRES_C3_COORDINATION"
+    )["details"]["semantic_evidence"]
+
+    assert evidence["status_sample_count"] == 0
+    assert evidence["sampled_at_decision_time"] is False
+    assert result["static_readiness"] is False
+    assert result["live_allowed"] is False
+
+
+def test_conditionally_sampled_c3_status_fails_static_preflight() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "    c3_coordination = c3_runtime_seam_v1.c3_closed_repair_writer_coordination_status_v1()\n",
+        (
+            "    if False:\n"
+            "        c3_coordination = "
+            "c3_runtime_seam_v1.c3_closed_repair_writer_coordination_status_v1()\n"
+        ),
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    evidence = _check(
+        result, "LIVE_PREFLIGHT_REQUIRES_C3_COORDINATION"
+    )["details"]["semantic_evidence"]
+
+    assert evidence["status_sample_count"] == 0
+    assert evidence["sampled_at_decision_time"] is False
+    assert result["static_readiness"] is False
+    assert result["live_allowed"] is False
+
+
 def test_importing_dormant_modules_cannot_create_false_production_readiness() -> None:
     sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
     imports = "\n".join(
