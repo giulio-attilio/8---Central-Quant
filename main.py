@@ -51095,8 +51095,23 @@ def _trpsf_v1_apply_patch(run_bootstrap=False, force=False):
 
 
 def trade_registry_persistent_storage_fix_v1_status(
-    force=False, read_only=False
+    force=False, read_only=False, no_io=False
 ):
+    if no_io:
+        return {
+            "ok": True,
+            "status": "C3_DORMANT_PERSISTENCE_STATUS_NO_IO",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "read_only": True,
+            "no_io": True,
+            "persistent_storage_enabled": False,
+            "patch_installed": False,
+            "registry_file_active": None,
+            "real_registry_accessed": False,
+            "write_required": False,
+            "write_performed": False,
+            "write_executed": False,
+        }
     if read_only:
         status = dict(
             _TRPSF_V1_STATE.get("last_status")
@@ -68152,7 +68167,10 @@ def _recover_c3_closed_repair_registry_v1():
     }
 
 
-C3_PERSISTENCE_BOOTSTRAP_V1 = trade_registry_persistent_storage_fix_v1_status()
+C3_PERSISTENCE_BOOTSTRAP_V1 = trade_registry_persistent_storage_fix_v1_status(
+    read_only=True,
+    no_io=True,
+)
 C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1()
 C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1 = _recover_c3_closed_repair_registry_v1()
 

@@ -112,6 +112,82 @@ def test_current_startup_order_is_reported_without_executing_main(
     assert order["details"]["persistence_bootstrap_line"] < order["details"]["runtime_start_line"]
 
 
+def test_dormant_persistence_startup_is_explicitly_no_io() -> None:
+    tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+    status_functions = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "trade_registry_persistent_storage_fix_v1_status"
+    ]
+    assert len(status_functions) == 1
+    status_function = status_functions[0]
+    argument_names = [argument.arg for argument in status_function.args.args]
+    defaults = dict(
+        zip(
+            argument_names[-len(status_function.args.defaults) :],
+            status_function.args.defaults,
+            strict=True,
+        )
+    )
+    assert isinstance(defaults.get("no_io"), ast.Constant)
+    assert defaults["no_io"].value is False
+    first_statement = status_function.body[0]
+    assert isinstance(first_statement, ast.If)
+    assert isinstance(first_statement.test, ast.Name)
+    assert first_statement.test.id == "no_io"
+    assert isinstance(first_statement.body[0], ast.Return)
+
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "C3_PERSISTENCE_BOOTSTRAP_V1"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    call = assignments[0].value
+    assert isinstance(call, ast.Call)
+    assert isinstance(call.func, ast.Name)
+    assert call.func.id == "trade_registry_persistent_storage_fix_v1_status"
+    assert call.args == []
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    assert set(keywords) == {"read_only", "no_io"}
+    assert all(
+        isinstance(value, ast.Constant) and value.value is True
+        for value in keywords.values()
+    )
+
+    isolated_module = ast.fix_missing_locations(
+        ast.Module(body=[status_function], type_ignores=[])
+    )
+    namespace = {
+        "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "SYNTHETIC_VERSION"
+    }
+    exec(compile(isolated_module, "<c3-dormant-no-io>", "exec"), namespace)
+    result = namespace["trade_registry_persistent_storage_fix_v1_status"](
+        read_only=True,
+        no_io=True,
+    )
+    assert result == {
+        "ok": True,
+        "status": "C3_DORMANT_PERSISTENCE_STATUS_NO_IO",
+        "version": "SYNTHETIC_VERSION",
+        "read_only": True,
+        "no_io": True,
+        "persistent_storage_enabled": False,
+        "patch_installed": False,
+        "registry_file_active": None,
+        "real_registry_accessed": False,
+        "write_required": False,
+        "write_performed": False,
+        "write_executed": False,
+    }
+
+
 def test_source_attestations_expose_only_hash_and_size(
     current_harness_result: dict,
 ) -> None:
