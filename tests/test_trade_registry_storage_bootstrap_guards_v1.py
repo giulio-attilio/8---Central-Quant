@@ -199,7 +199,10 @@ def test_patched_loader_never_bootstraps_and_normalizes_closed_dict_under_lock(
             _lock=lock,
             _normalize_registry=normalize,
         ),
-        "_TRPSF_V1_STATE": {},
+        "_TRPSF_V1_STATE": {
+            "migration_done": False,
+            "restart_readiness_attested": False,
+        },
         "_trpsf_v1_active_file": lambda: tmp_path / "trade_registry.json",
         "_trpsf_v1_read_json": read_json,
         "_trpsf_v1_bootstrap_registry": lambda *args, **kwargs: pytest.fail(
@@ -224,6 +227,11 @@ def test_patched_loader_never_bootstraps_and_normalizes_closed_dict_under_lock(
     assert isinstance(result["closed_trades"], list)
     assert result["closed_trades"][0]["status"] == "CLOSED"
     assert namespace["_TRPSF_V1_STATE"]["last_load_ok"] is True
+    assert namespace["_TRPSF_V1_STATE"]["migration_done"] is False
+    assert (
+        namespace["_TRPSF_V1_STATE"]["restart_readiness_attested"]
+        is False
+    )
 
 
 def test_patched_loader_without_registry_lock_blocks_before_read(tmp_path):
@@ -237,7 +245,10 @@ def test_patched_loader_without_registry_lock_blocks_before_read(tmp_path):
                 registry
             ),
         ),
-        "_TRPSF_V1_STATE": {},
+        "_TRPSF_V1_STATE": {
+            "migration_done": False,
+            "restart_readiness_attested": False,
+        },
         "_trpsf_v1_active_file": lambda: tmp_path / "trade_registry.json",
         "_trpsf_v1_read_json": lambda path: reads.append(path),
     }
@@ -587,7 +598,10 @@ def test_patched_save_registry_uses_active_after_migration(tmp_path):
         "Path": Path,
         "json": json,
         "central_trade_registry": registry,
-        "_TRPSF_V1_STATE": {},
+        "_TRPSF_V1_STATE": {
+            "migration_done": False,
+            "restart_readiness_attested": False,
+        },
         "_trpsf_v1_active_file": lambda: active,
         "_trpsf_v1_atomic_write_json": atomic_write_json,
         "_trpsf_v1_registry_lock": lambda: threading.RLock(),
@@ -605,6 +619,12 @@ def test_patched_save_registry_uses_active_after_migration(tmp_path):
 
     assert result is True
     assert writes == [(active, {"open_trades": {}, "closed_trades": [], "updated_at": "fixed", "storage_fix_version": "test-v1"})]
+    assert namespace["_TRPSF_V1_STATE"]["last_write_ok"] is True
+    assert namespace["_TRPSF_V1_STATE"]["migration_done"] is False
+    assert (
+        namespace["_TRPSF_V1_STATE"]["restart_readiness_attested"]
+        is False
+    )
 
 
 def test_bootstrap_without_registry_lock_blocks_before_filesystem_io(tmp_path):
@@ -612,6 +632,7 @@ def test_bootstrap_without_registry_lock_blocks_before_filesystem_io(tmp_path):
     namespace = {
         "_TRPSF_V1_STATE": {
             "migration_done": True,
+            "restart_readiness_attested": True,
             "last_load_ok": True,
             "last_write_ok": True,
             "write_allowed": True,
@@ -635,6 +656,10 @@ def test_bootstrap_without_registry_lock_blocks_before_filesystem_io(tmp_path):
     assert result["closed_history_identity_merge"]["safe_to_commit"] is False
     assert io_calls == []
     assert namespace["_TRPSF_V1_STATE"]["migration_done"] is False
+    assert (
+        namespace["_TRPSF_V1_STATE"]["restart_readiness_attested"]
+        is False
+    )
     assert namespace["_TRPSF_V1_STATE"]["last_load_ok"] is False
     assert namespace["_TRPSF_V1_STATE"]["last_write_ok"] is False
     assert namespace["_TRPSF_V1_STATE"]["write_allowed"] is False
