@@ -892,7 +892,10 @@ def test_bootstrap_reexecution_is_idempotent_and_confined_to_tmp_path(
             ),
         ),
         "CENTRAL_DATA_DIR": tmp_path,
-        "_TRPSF_V1_STATE": {},
+        "_TRPSF_V1_STATE": {
+            "patched": True,
+            "migration_done": False,
+        },
         "_trpsf_v1_active_file": lambda: active,
         "_trpsf_v1_legacy_candidate_paths": lambda: [active, legacy],
         "_trpsf_v1_read_json": read_json,
@@ -919,6 +922,7 @@ def test_bootstrap_reexecution_is_idempotent_and_confined_to_tmp_path(
             "_trpsf_v1_registry_counts",
             "_trpsf_v1_merge_registries",
             "_trpsf_v1_bootstrap_registry",
+            "_trpsf_v1_falcon_live_entry_storage_readiness",
         ],
         namespace,
     )
@@ -936,6 +940,30 @@ def test_bootstrap_reexecution_is_idempotent_and_confined_to_tmp_path(
     assert len(second_registry["closed_trades"]) == 2
     assert first_registry == second_registry
     assert all(status["write_performed"] is False for status in statuses[1:])
+    assert all(
+        status["restart_readiness_attested"] is True
+        for status in statuses
+    )
+    assert namespace["_TRPSF_V1_STATE"]["migration_done"] is True
+    assert namespace["_TRPSF_V1_STATE"]["last_load_ok"] is True
+    assert namespace["_TRPSF_V1_STATE"]["last_write_ok"] is True
+    assert namespace["_TRPSF_V1_STATE"]["write_allowed"] is True
+
+    class _PersistentActiveFile:
+        def __str__(self):
+            return "/data/trade_registry.json"
+
+        @staticmethod
+        def exists():
+            return True
+
+    namespace["_trpsf_v1_active_file"] = _PersistentActiveFile
+    readiness = namespace[
+        "_trpsf_v1_falcon_live_entry_storage_readiness"
+    ]()
+    assert readiness["ok"] is True
+    assert readiness["status"] == "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_READY"
+    assert readiness["write_executed"] is False
     assert written_paths
     assert all(path.is_relative_to(tmp_path.resolve()) for path in written_paths)
 

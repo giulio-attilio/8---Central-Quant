@@ -154,10 +154,11 @@ def _build_synthetic_main_source() -> str:
         signature="()",
         body=("pass",),
     )
-    for binding in sorted(
+    main_bindings = sorted(
         _writer_bindings_by_component()["main.py"],
         key=lambda item: item["source_anchor_line"],
-    ):
+    )
+    for binding in main_bindings:
         writer = binding["writer"]
         _place_function(
             lines,
@@ -166,24 +167,27 @@ def _build_synthetic_main_source() -> str:
             signature=binding["source_signature"],
             body=(f"{_MARKER}()", "pass"),
         )
+    startup_line = max(
+        int(binding["source_anchor_line"]) for binding in main_bindings
+    ) + 100
     _place_statement(
         lines,
-        line_number=67500,
+        line_number=startup_line,
         statement="trade_registry_persistent_storage_fix_v1_status()",
     )
     _place_statement(
         lines,
-        line_number=67501,
+        line_number=startup_line + 1,
         statement="_install_c3_closed_repair_writer_coordination_v1()",
     )
     _place_statement(
         lines,
-        line_number=67502,
+        line_number=startup_line + 2,
         statement="_recover_c3_closed_repair_registry_v1()",
     )
     _place_statement(
         lines,
-        line_number=67503,
+        line_number=startup_line + 3,
         statement="start_central_runtime_once()",
     )
     return "\n".join(lines) + "\n"

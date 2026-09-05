@@ -50530,6 +50530,14 @@ def _trpsf_v1_merge_registries(registries, active_exists=False):
 @c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP")
 def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
     """Migra para /data/trade_registry.json e mescla CLOSED legados sem apagar OPEN ativo."""
+    if force and not _lock_held:
+        # A forced post-restart bootstrap must revoke any process-local proof
+        # before touching persistence.  Every failure path therefore remains
+        # closed even if a stale in-memory state was injected or restored.
+        _TRPSF_V1_STATE["migration_done"] = False
+        _TRPSF_V1_STATE["last_load_ok"] = False
+        _TRPSF_V1_STATE["last_write_ok"] = False
+        _TRPSF_V1_STATE["write_allowed"] = False
     lock_resolver = globals().get("_trpsf_v1_registry_lock")
     if not _lock_held:
         if not callable(lock_resolver):
@@ -50567,6 +50575,9 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
             )
     if _TRPSF_V1_STATE.get("migration_done") and not force:
         return _TRPSF_V1_STATE.get("last_status") or {}
+    _TRPSF_V1_STATE["last_load_ok"] = False
+    _TRPSF_V1_STATE["last_write_ok"] = False
+    _TRPSF_V1_STATE["write_allowed"] = False
     active = _trpsf_v1_active_file()
     legacy_paths = _trpsf_v1_legacy_candidate_paths()
     active_file_exists = active.exists()
@@ -50826,17 +50837,26 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
             if write_result is not True:
                 raise RuntimeError("REGISTRY_WRITE_NOT_CONFIRMED")
             wrote = True
-        _TRPSF_V1_STATE["last_write_ok"] = True
+        _TRPSF_V1_STATE["last_write_ok"] = bool(merge_safe)
     except Exception as exc:
         error = str(exc)
         write_ok = False
         _TRPSF_V1_STATE["last_write_ok"] = False
         _TRPSF_V1_STATE["last_error"] = error
 
+    bootstrap_ready = bool(
+        merge_safe and write_ok and central_trade_registry is not None
+    )
+    _TRPSF_V1_STATE["last_load_ok"] = bootstrap_ready
+    _TRPSF_V1_STATE["last_write_ok"] = bootstrap_ready
+    _TRPSF_V1_STATE["write_allowed"] = bootstrap_ready
+    if bootstrap_ready:
+        _TRPSF_V1_STATE["temporary_read_source"] = None
+        _TRPSF_V1_STATE["temporary_read_only"] = False
+        _TRPSF_V1_STATE["last_error"] = None
+
     status = {
-        "ok": bool(
-            merge_safe and write_ok and central_trade_registry is not None
-        ),
+        "ok": bootstrap_ready,
         "status": (
             "CLOSED_IDENTITY_MERGE_BLOCKED"
             if not merge_safe
@@ -50854,7 +50874,10 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
         "migrated_from_legacy": bool(migrated),
         "write_required": bool(write_required),
         "write_performed": bool(wrote),
-        "last_write_ok": bool(write_ok),
+        "last_load_ok": bootstrap_ready,
+        "last_write_ok": bootstrap_ready,
+        "write_allowed": bootstrap_ready,
+        "restart_readiness_attested": bootstrap_ready,
         "last_error": error,
         "counts_before": active_counts_before,
         "counts_after": counts_after,
@@ -50889,7 +50912,7 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
         except Exception:
             pass
     _TRPSF_V1_STATE["migration_done"] = bool(
-        merge_safe and write_ok and (not write_required or wrote)
+        bootstrap_ready and (not write_required or wrote)
     )
     _TRPSF_V1_STATE["migrated_from_legacy"] = bool(migrated)
     _TRPSF_V1_STATE["last_status"] = status

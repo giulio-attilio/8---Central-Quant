@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +68,23 @@ def _preflight_namespace(divergence):
         "FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_LATEST_FILE": "unused-latest.json",
         "FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_EVENTS_FILE": "unused-events.jsonl",
         "MANUAL_POSITION_OWNERSHIP_ISOLATION_V1_VERSION": "test-ownership-policy",
+        "c3_runtime_seam_v1": SimpleNamespace(
+            c3_closed_repair_writer_coordination_status_v1=lambda: {
+                "enabled": True,
+                "coordination_ready": True,
+                "runtime_activation_allowed": True,
+                "registered_writer_count": 19,
+                "all_writers_registered": True,
+                "inflight_mutations": 0,
+                "shared_lock_backend_ready": True,
+                "maintenance_lease_store_ready": True,
+                "registry_interlock_ready": True,
+                "activation_receipt_verified": True,
+                "source_hashes_verified": True,
+                "rollback_ready": True,
+                "kill_switch_ready": True,
+            }
+        ),
         "_frpp_v1_collect": collect,
         "_frpp_v1_env_snapshot": lambda: {
             "enable_real_trading_bool": False,
