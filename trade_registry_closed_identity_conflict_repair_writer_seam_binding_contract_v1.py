@@ -64,7 +64,7 @@ _SEAM_DETAILS = (
     (14681, "(removed)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
     (49325, "(commit=False, ack=None, include_samples=True, use_cache=False)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
     (49761, "(commit=False, ack=None, include_samples=True, track_state=True)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (67476, "(commit=False, ack=None, automatic=False, include_samples=True)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
+    (67488, "(commit=False, ack=None, automatic=False, include_samples=True)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
     (50531, "(force=False, _lock_held=False)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
 )
 

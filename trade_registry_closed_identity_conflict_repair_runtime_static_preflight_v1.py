@@ -36,6 +36,21 @@ _PROVIDER_INSTALL_MARKER = "_install_c3_closed_repair_writer_coordination_v1"
 _STARTUP_RECOVERY_MARKER = "_recover_c3_closed_repair_registry_v1"
 _STALE_LEASE_RECOVERY_MARKER = "recover_stale_maintenance_lease_v1"
 _LIVE_PREFLIGHT_CHECK_CODE = "TRADE_REGISTRY_C3_WRITER_COORDINATION_READY"
+_LIVE_PREFLIGHT_REQUIRED_C3_VECTOR = (
+    ("enabled", True),
+    ("coordination_ready", True),
+    ("runtime_activation_allowed", True),
+    ("registered_writer_count", 19),
+    ("all_writers_registered", True),
+    ("inflight_mutations", 0),
+    ("shared_lock_backend_ready", True),
+    ("maintenance_lease_store_ready", True),
+    ("registry_interlock_ready", True),
+    ("activation_receipt_verified", True),
+    ("source_hashes_verified", True),
+    ("rollback_ready", True),
+    ("kill_switch_ready", True),
+)
 _PRODUCTION_STORE_MODULE = (
     "trade_registry_closed_identity_conflict_repair_raw_transaction_store_production_v1"
 )
@@ -262,12 +277,129 @@ def _bot_by_name_imports(tree: ast.AST) -> list[str]:
     return sorted(imported)
 
 
-def _string_literals(node: ast.AST) -> set[str]:
+def _c3_status_sample_names(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[tuple[str, int]]:
+    samples: list[tuple[str, int]] = []
+    for candidate in node.body:
+        if not isinstance(candidate, ast.Assign) or len(candidate.targets) != 1:
+            continue
+        target = candidate.targets[0]
+        value = candidate.value
+        if not isinstance(target, ast.Name) or not isinstance(value, ast.Call):
+            continue
+        if value.args or value.keywords or not isinstance(value.func, ast.Attribute):
+            continue
+        if (
+            isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "c3_runtime_seam_v1"
+            and value.func.attr == "c3_closed_repair_writer_coordination_status_v1"
+        ):
+            samples.append((target.id, candidate.lineno))
+    return samples
+
+
+def _c3_readiness_comparison(
+    node: ast.AST,
+    *,
+    status_name: str,
+) -> tuple[str, Any] | None:
+    if (
+        not isinstance(node, ast.Compare)
+        or len(node.ops) != 1
+        or len(node.comparators) != 1
+        or not isinstance(node.left, ast.Call)
+    ):
+        return None
+    getter = node.left
+    if (
+        getter.keywords
+        or len(getter.args) != 1
+        or not isinstance(getter.func, ast.Attribute)
+        or getter.func.attr != "get"
+        or not isinstance(getter.func.value, ast.Name)
+        or getter.func.value.id != status_name
+        or not isinstance(getter.args[0], ast.Constant)
+        or not isinstance(getter.args[0].value, str)
+        or not isinstance(node.comparators[0], ast.Constant)
+    ):
+        return None
+    field = getter.args[0].value
+    expected = node.comparators[0].value
+    if isinstance(expected, bool):
+        if not isinstance(node.ops[0], ast.Is):
+            return None
+    elif type(expected) is int:
+        if not isinstance(node.ops[0], ast.Eq):
+            return None
+    else:
+        return None
+    return field, expected
+
+
+def _live_preflight_c3_semantics(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[str, Any]:
+    samples = _c3_status_sample_names(node)
+    gate_calls = [
+        statement.value
+        for statement in node.body
+        if isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Name)
+        and statement.value.func.id == "add"
+        and len(statement.value.args) >= 2
+        and isinstance(statement.value.args[0], ast.Constant)
+        and statement.value.args[0].value == _LIVE_PREFLIGHT_CHECK_CODE
+    ]
+    required = dict(_LIVE_PREFLIGHT_REQUIRED_C3_VECTOR)
+    observed: dict[str, Any] = {}
+    all_fields_conjunctive = False
+    sampled_at_decision_time = False
+    if len(samples) == 1 and len(gate_calls) == 1:
+        status_name, sample_line = samples[0]
+        gate = gate_calls[0]
+        status_assignment_count = sum(
+            1
+            for candidate in ast.walk(node)
+            if isinstance(candidate, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == status_name
+                for target in candidate.targets
+            )
+        )
+        predicate = gate.args[1]
+        if isinstance(predicate, ast.BoolOp) and isinstance(predicate.op, ast.And):
+            parsed = [
+                _c3_readiness_comparison(item, status_name=status_name)
+                for item in predicate.values
+            ]
+            if all(item is not None for item in parsed):
+                pairs = [item for item in parsed if item is not None]
+                observed = dict(pairs)
+                all_fields_conjunctive = bool(
+                    len(pairs) == len(required)
+                    and len(observed) == len(pairs)
+                    and observed == required
+                )
+        sampled_at_decision_time = (
+            sample_line < gate.lineno and status_assignment_count == 1
+        )
+    ok = bool(
+        len(samples) == 1
+        and len(gate_calls) == 1
+        and all_fields_conjunctive
+        and sampled_at_decision_time
+    )
     return {
-        candidate.value
-        for candidate in ast.walk(node)
-        if isinstance(candidate, ast.Constant)
-        and isinstance(candidate.value, str)
+        "ok": ok,
+        "required_fields": list(required),
+        "observed_fields": list(observed),
+        "status_sample_count": len(samples),
+        "gate_call_count": len(gate_calls),
+        "all_fields_conjunctive": all_fields_conjunctive,
+        "sampled_at_decision_time": sampled_at_decision_time,
+        "generic_ok_insufficient": True,
     }
 
 
@@ -476,14 +608,28 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
     preflight_nodes = function_maps["main.py"].get(
         "_frpp_v1_build_checklist", []
     )
-    preflight_has_c3 = bool(
-        len(preflight_nodes) == 1
-        and _LIVE_PREFLIGHT_CHECK_CODE in _string_literals(preflight_nodes[0])
+    preflight_c3_semantics = (
+        _live_preflight_c3_semantics(preflight_nodes[0])
+        if len(preflight_nodes) == 1
+        else {
+            "ok": False,
+            "required_fields": [
+                field for field, _ in _LIVE_PREFLIGHT_REQUIRED_C3_VECTOR
+            ],
+            "observed_fields": [],
+            "status_sample_count": 0,
+            "gate_call_count": 0,
+            "all_fields_conjunctive": False,
+            "sampled_at_decision_time": False,
+            "generic_ok_insufficient": True,
+        }
     )
     add(
         "LIVE_PREFLIGHT_REQUIRES_C3_COORDINATION",
-        preflight_has_c3,
+        preflight_c3_semantics["ok"] is True,
         required_check_code=_LIVE_PREFLIGHT_CHECK_CODE,
+        required_vector=dict(_LIVE_PREFLIGHT_REQUIRED_C3_VECTOR),
+        semantic_evidence=preflight_c3_semantics,
     )
 
     coordinator_functions = function_maps[
