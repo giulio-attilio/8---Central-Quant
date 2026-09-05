@@ -1515,7 +1515,7 @@ except Exception as _trade_registry_import_exc:
     TRADE_REGISTRY_IMPORT_ERROR = str(_trade_registry_import_exc)
 else:
     TRADE_REGISTRY_IMPORT_ERROR = None
-
+import trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1 as c3_writer_coordinator_v1, trade_registry_closed_identity_conflict_repair_writer_invocation_adapter_v1 as c3_writer_invocation_v1, trade_registry_closed_identity_conflict_repair_raw_transaction_store_production_v1 as c3_transaction_store_v1, trade_registry_closed_identity_conflict_repair_production_provider_v1 as c3_provider_v1, trade_registry_closed_identity_conflict_repair_runtime_seam_v1 as c3_runtime_seam_v1
 # ==========================================================
 # REAL PNL/R MAPPER V2.4 — IMPORT SEGURO
 # ==========================================================
@@ -4484,7 +4484,7 @@ def _trs_v1_existing_open_match(symbol=None, side=None, bot=None, setup=None, or
         return {"ok": True, "exists": False}
     except Exception as exc:
         return {"ok": False, "exists": False, "error": str(exc)}
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_SYNC_MANUAL_REGISTER_OPEN")
 def _trs_v1_manual_register_open_trade(candidate):
     registry = central_trade_registry.load_registry()
     if not isinstance(registry, dict):
@@ -7245,7 +7245,7 @@ def _rtlm_v1_find_open_trades(symbol=None, side=None, bot=None, setup=None):
         "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
     }
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_LIFECYCLE_UPDATE_OPEN_SNAPSHOT")
 def _rtlm_v1_update_open_trade_snapshot(symbol=None, side=None, bot=None, setup=None, lifecycle=None, commit=False):
     """Atualiza metadata/snapshot do trade aberto. Não fecha trade."""
     if not commit:
@@ -9855,7 +9855,7 @@ def registry_persistence_v1_snapshot(
                 }
     payload["snapshot_save"] = save_result
     return payload
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT")
 def registry_persistence_v1_restore_from_latest_snapshot(
     commit=False, ack=None, _lock_held=False
 ):
@@ -10182,7 +10182,7 @@ def _rp_v12_closed_trade_exists(raw_registry, trade_id):
         }
     return None
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE")
 def registry_persistence_v12_recover_closed_trade_from_params(
     symbol=None,
     side=None,
@@ -11048,7 +11048,7 @@ def trade_close_outcome_v1_build(
         outcome["commit"] = trade_close_outcome_v1_commit(found, selected, outcome)
     return outcome
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_TRADE_CLOSE_OUTCOME_COMMIT")
 def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
     selected_trade = (
         selected_payload.get("trade")
@@ -11602,7 +11602,7 @@ def _rms_v1_append_event(payload):
     except Exception:
         return False
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_REGISTRY_MODE_SEGREGATION_COMMIT")
 def registry_mode_segregation_v1_analyze(commit=False, include_trades=True, source="manual"):
     if central_trade_registry is None or not callable(getattr(central_trade_registry, "load_registry", None)):
         return {
@@ -14677,7 +14677,7 @@ def _trade_registry_signature_map(items):
 
     return out
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_MARK_REGISTRY_MISSING_TRADES")
 def mark_registry_missing_trades(removed):
     if central_trade_registry is None:
         return {"ok": False, "error": "trade_registry unavailable"}
@@ -44389,8 +44389,8 @@ CENTRAL_AUTO_START_RUNTIME = str(
     os.environ.get("CENTRAL_AUTO_START_RUNTIME", "true")
 ).strip().lower() in {"1", "true", "yes", "sim", "on"}
 
-if CENTRAL_AUTO_START_RUNTIME:
-    start_central_runtime_once()
+# O runtime só é iniciado no bootstrap final, após persistência e C3 dormente.
+# A flag existente é preservada sem iniciar threads neste ponto intermediário.
 
 # REAL PILOT GUARD V1 — CENTRAL FINAL WRAPPER 2026-07-08
 # ----------------------------------------------------------------------------
@@ -49319,9 +49319,9 @@ def _pprsf_v1_recalculate_lifecycle_counts_from_registry(registry):
         "missing_registry_closed_count": missing_closed,
     }
 
-
 @request_cached_predator_audit("predator_registry_sync_audit_pipeline")
 @observe_predator_audit("predator_registry_sync_audit_pipeline")
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_PAPER_REGISTRY_SYNC")
 def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_samples=True, use_cache=False):
     audit_name = "predator_registry_sync_audit_pipeline"
     commit = bool(commit)
@@ -49757,7 +49757,7 @@ def _poof_v1_plan_orphans(registry, module_positions):
         })
     return planned, skipped
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_ORPHAN_OPEN_FIX")
 def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_samples=True, track_state=True):
     commit = bool(commit)
     ack_ok = str(ack or "").strip().upper() == "PREDATOR_ORPHAN_OPEN_FIX"
@@ -50527,7 +50527,7 @@ def _trpsf_v1_merge_registries(registries, active_exists=False):
     merged["updated_at"] = _trpsf_v1_now()
     return merged, sorted(set(sources_used))
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP")
 def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
     """Migra para /data/trade_registry.json e mescla CLOSED legados sem apagar OPEN ativo."""
     lock_resolver = globals().get("_trpsf_v1_registry_lock")
@@ -51095,8 +51095,23 @@ def _trpsf_v1_apply_patch(run_bootstrap=False, force=False):
 
 
 def trade_registry_persistent_storage_fix_v1_status(
-    force=False, read_only=False
+    force=False, read_only=False, no_io=False
 ):
+    if no_io:
+        return {
+            "ok": True,
+            "status": "C3_DORMANT_PERSISTENCE_STATUS_NO_IO",
+            "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+            "read_only": True,
+            "no_io": True,
+            "persistent_storage_enabled": False,
+            "patch_installed": False,
+            "registry_file_active": None,
+            "real_registry_accessed": False,
+            "write_required": False,
+            "write_performed": False,
+            "write_executed": False,
+        }
     if read_only:
         status = dict(
             _TRPSF_V1_STATE.get("last_status")
@@ -56719,6 +56734,16 @@ def _frpp_v1_build_checklist():
         {"mode": turtle_mode, "last_positions_count": turtle_health.get("last_positions_count")},
     )
 
+    c3_coordination = c3_runtime_seam_v1.c3_closed_repair_writer_coordination_status_v1()
+    add(
+        "TRADE_REGISTRY_C3_WRITER_COORDINATION_READY",
+        c3_coordination.get("coordination_ready") is True,
+        "Coordenação C3 dos 19 escritores do Trade Registry está pronta.",
+        "Coordenação C3 permanece dormente/default-off; Live continua bloqueado.",
+        True,
+        c3_coordination,
+    )
+
     blocking_failed = [c for c in checks if c.get("blocking") and not c.get("ok")]
     warning_checks = [c for c in checks if (not c.get("blocking")) and not c.get("ok")]
     all_blocking_ok = not blocking_failed
@@ -56801,7 +56826,6 @@ def _frpp_v1_build_checklist():
     }
     return payload
 
-
 def _frpp_v1_text(payload):
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     lines = [
@@ -56861,7 +56885,6 @@ def _frpp_v1_text(payload):
         ]
     return "\n".join(lines)
 
-
 @app.route("/falcon/realpilot/preflight", methods=["GET"])
 @app.route("/falcon/preflight", methods=["GET"])
 @app.route("/realpilot/preflight", methods=["GET"])
@@ -56869,7 +56892,6 @@ def _frpp_v1_text(payload):
 @app.route("/preflight/falcon", methods=["GET"])
 def falcon_real_pilot_preflight_checklist_v1_route():
     return _frpp_v1_build_checklist(), 200
-
 
 @app.route("/falcon/realpilot/preflight/text", methods=["GET"])
 @app.route("/falcon/preflight/text", methods=["GET"])
@@ -56879,7 +56901,6 @@ def falcon_real_pilot_preflight_checklist_v1_route():
 def falcon_real_pilot_preflight_checklist_v1_text_route():
     payload = _frpp_v1_build_checklist()
     return _frpp_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
-
 
 # ============================================================================
 # FALCON LIVE ORDER AUDIT DETAIL V1 + MANUAL POSITION AWARENESS V1
@@ -56907,7 +56928,6 @@ MANUAL_POSITION_AWARENESS_V1_LATEST_FILE = _FLOAD_V1_DATA_DIR / "manual_position
 MANUAL_POSITION_AWARENESS_V1_EVENTS_FILE = _FLOAD_V1_DATA_DIR / "manual_position_awareness_v1_events.jsonl"
 LIVE_STATUS_V12_LATEST_FILE = _FLOAD_V1_DATA_DIR / "live_status_v1_2_latest.json"
 
-
 def _flad_v1_now():
     try:
         if callable(globals().get("data_hora_sp_str")):
@@ -56923,7 +56943,6 @@ def _flad_v1_now():
         return datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y %H:%M")
     except Exception:
         return None
-
 
 def _flad_v1_public(obj, max_string=1200):
     sensitive = {"token", "secret", "apikey", "api_key", "authorization", "signature", "password", "x-bx-apikey"}
@@ -56945,7 +56964,6 @@ def _flad_v1_public(obj, max_string=1200):
     except Exception:
         return None
 
-
 def _flad_v1_write_snapshot(path, payload):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -56954,7 +56972,6 @@ def _flad_v1_write_snapshot(path, payload):
         return True
     except Exception:
         return False
-
 
 def _flad_v1_append_event(path, payload):
     try:
@@ -56966,7 +56983,6 @@ def _flad_v1_append_event(path, payload):
     except Exception:
         return False
 
-
 def _flad_v1_str(value, default=""):
     try:
         if value is None:
@@ -56974,7 +56990,6 @@ def _flad_v1_str(value, default=""):
         return str(value)
     except Exception:
         return default
-
 
 def _flad_v1_upper(value, default=""):
     return _flad_v1_str(value, default=default).upper().strip()
@@ -67457,7 +67472,7 @@ def _pacs_v1_health_overlay():
         "predator_auto_closed_sync_reason": state.get("reason"),
     }
 
-
+@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_AUTO_CLOSED_SYNC")
 def predator_auto_closed_sync_v1_status(commit=False, ack=None, automatic=False, include_samples=True):
     """Project factual Predator PAPER closures into Registry, never execution."""
     commit = bool(commit)
@@ -68101,6 +68116,66 @@ def falcon_blocked_diagnostic_v1_route():
 def falcon_blocked_diagnostic_v1_text_route():
     text = build_falcon_blocked_diagnostic_v1_text(limit=request.args.get("limit", FALCON_BLOCKED_DIAGNOSTIC_V1_DEFAULT_LIMIT))
     return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+def _install_c3_closed_repair_writer_coordination_v1():
+    """Install only default-off production-shaped C3 capabilities."""
+    coordinator = c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()
+    invocation_adapter = c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()
+    transaction_store = c3_transaction_store_v1.build_production_raw_transaction_store_v1()
+    provider = c3_provider_v1.build_production_closed_repair_provider_v1()
+    seam_status = c3_runtime_seam_v1.install_dormant_c3_closed_repair_writer_coordinator_v1(coordinator)
+    return {
+        "ok": True,
+        "status": "C3_RUNTIME_CAPABILITIES_INSTALLED_DORMANT_DEFAULT_OFF",
+        "enabled": False,
+        "coordination_ready": False,
+        "runtime_activation_allowed": False,
+        "coordinator": coordinator.snapshot(),
+        "invocation_adapter": invocation_adapter.snapshot(),
+        "transaction_store": transaction_store.snapshot(),
+        "provider": provider.snapshot(),
+        "seam": seam_status,
+        "real_registry_accessed": False,
+        "network_accessed": False,
+        "broker_called": False,
+        "no_order_sent": True,
+    }
+
+
+def _recover_c3_closed_repair_registry_v1():
+    """Record a clean default-off startup state without reading the Registry."""
+    installed = globals().get("C3_CLOSED_REPAIR_INSTALLATION_V1")
+    if not isinstance(installed, dict) or installed.get("enabled") is not False:
+        return {
+            "ok": False,
+            "status": "C3_DORMANT_STARTUP_RECOVERY_BLOCKED",
+            "reason": "DORMANT_PROVIDER_NOT_INSTALLED",
+            "real_registry_accessed": False,
+            "no_order_sent": True,
+        }
+    return {
+        "ok": True,
+        "status": "C3_DORMANT_STARTUP_RECOVERY_NOT_REQUIRED",
+        "clean": True,
+        "enabled": False,
+        "write_executed": False,
+        "real_registry_accessed": False,
+        "network_accessed": False,
+        "broker_called": False,
+        "no_order_sent": True,
+    }
+
+
+C3_PERSISTENCE_BOOTSTRAP_V1 = trade_registry_persistent_storage_fix_v1_status(
+    read_only=True,
+    no_io=True,
+)
+C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1()
+C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1 = _recover_c3_closed_repair_registry_v1()
+
+if CENTRAL_AUTO_START_RUNTIME:
+    start_central_runtime_once()
 
 
 if __name__ == "__main__":
