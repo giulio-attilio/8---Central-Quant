@@ -16,11 +16,15 @@ def _registry() -> dict:
             {
                 "trade_id": "synthetic-closed",
                 "status": "CLOSED",
-                "close_reason": "MANUAL_CLOSE",
-                "pnl_r": -1.0,
+                "close_reason": "BROKER_RECONCILED_CLOSE",
+                "pnl_r": -1.26907189,
+                "r_multiple": -1.08850668,
                 "metadata": {
-                    "close_reason": "STOP_LOSS",
-                    "pnl_r": -0.5,
+                    "exit_reason": "STOP",
+                    "outcome": {
+                        "close_reason": "BROKER_RECONCILED_CLOSE",
+                        "r_multiple": -1.08850668,
+                    },
                     "keep": {"nested": True},
                 },
             }
@@ -47,15 +51,23 @@ def _audit_for(registry: dict) -> dict:
                             "value": trade["close_reason"],
                         },
                         {
-                            "path": "trade.metadata.close_reason",
-                            "value": trade["metadata"]["close_reason"],
+                            "path": "trade.metadata.exit_reason",
+                            "value": trade["metadata"]["exit_reason"],
+                        },
+                        {
+                            "path": "trade.metadata.outcome.close_reason",
+                            "value": trade["metadata"]["outcome"]["close_reason"],
                         },
                     ],
                     "pnl_r": [
                         {"path": "trade.pnl_r", "value": trade["pnl_r"]},
                         {
-                            "path": "trade.metadata.pnl_r",
-                            "value": trade["metadata"]["pnl_r"],
+                            "path": "trade.r_multiple",
+                            "value": trade["r_multiple"],
+                        },
+                        {
+                            "path": "trade.metadata.outcome.r_multiple",
+                            "value": trade["metadata"]["outcome"]["r_multiple"],
                         },
                     ],
                 },
@@ -78,8 +90,8 @@ def _safe_controls() -> dict:
 
 def _selections() -> dict:
     return {
-        "close_reason": "trade.close_reason",
-        "pnl_r": "trade.metadata.pnl_r",
+        "close_reason": "trade.metadata.exit_reason",
+        "pnl_r": "trade.pnl_r",
     }
 
 
@@ -118,7 +130,11 @@ def _controller(
 
 def _preview(controller):
     return controller.preview(
-        {"ack": operation.PREVIEW_ACK_V1, "selected_sources": _selections()}
+        {
+            "ack": operation.PREVIEW_ACK_V1,
+            "selected_sources": _selections(),
+            "gross_r_source": "trade.r_multiple",
+        }
     )
 
 
@@ -163,10 +179,42 @@ def test_preview_requires_existing_source_choices_and_never_writes(tmp_path) -> 
     assert missing["status"] == "REPAIR_PREVIEW_SELECTION_REQUIRED"
     assert set(missing["selection_options"]) == {"close_reason", "pnl_r"}
 
+    missing_gross = controller.preview(
+        {
+            "ack": operation.PREVIEW_ACK_V1,
+            "selected_sources": _selections(),
+        }
+    )
+    assert missing_gross["status"] == "REPAIR_PREVIEW_GROSS_R_SOURCE_REQUIRED"
+    assert missing_gross["write_executed"] is False
+
     preview = _preview(controller)
     assert preview["ok"] is True
     assert preview["status"] == "REPAIR_PREVIEW_CANDIDATE_VERIFIED"
     assert preview["preservation_verified"] is True
+    assert preview["gross_r_preservation_verified"] is True
+    assert preview["gross_r_preservation"] == {
+        "source_path": "trade.r_multiple",
+        "equivalent_source_paths": [
+            "trade.metadata.outcome.r_multiple",
+            "trade.r_multiple",
+        ],
+        "value": -1.08850668,
+        "value_sha256": operation._stable_sha256(-1.08850668),
+        "target_paths": [
+            "trade.gross_r_multiple",
+            "trade.metadata.outcome.gross_r_multiple",
+        ],
+        "verified": True,
+    }
+    assert preview["changed_paths"] == [
+        "closed_trades[0].close_reason",
+        "closed_trades[0].gross_r_multiple",
+        "closed_trades[0].metadata.outcome.close_reason",
+        "closed_trades[0].metadata.outcome.gross_r_multiple",
+        "closed_trades[0].metadata.outcome.r_multiple",
+        "closed_trades[0].r_multiple",
+    ]
     assert preview["write_executed"] is False
     assert preview["registry_write"] is False
     assert preview["apply_enabled"] is False
@@ -186,10 +234,14 @@ def test_apply_is_atomic_preserves_unrelated_data_and_is_idempotent(tmp_path) ->
     assert applied["write_executed"] is True
     assert applied["registry_write"] is True
     after = json.loads(target.read_text(encoding="utf-8"))
-    assert after["closed_trades"][0]["close_reason"] == "MANUAL_CLOSE"
-    assert after["closed_trades"][0]["metadata"]["close_reason"] == "MANUAL_CLOSE"
-    assert after["closed_trades"][0]["pnl_r"] == -0.5
-    assert after["closed_trades"][0]["metadata"]["pnl_r"] == -0.5
+    repaired = after["closed_trades"][0]
+    assert repaired["close_reason"] == "STOP"
+    assert repaired["metadata"]["outcome"]["close_reason"] == "STOP"
+    assert repaired["pnl_r"] == -1.26907189
+    assert repaired["r_multiple"] == -1.26907189
+    assert repaired["metadata"]["outcome"]["r_multiple"] == -1.26907189
+    assert repaired["gross_r_multiple"] == -1.08850668
+    assert repaired["metadata"]["outcome"]["gross_r_multiple"] == -1.08850668
     assert after["open_trades"] == before["open_trades"]
     assert after["extension"] == before["extension"]
     backups = list((target.parent / "c3_closed_identity_repair_backups").glob("*.json"))
@@ -267,6 +319,56 @@ def test_unknown_or_tampered_preview_is_denied(tmp_path) -> None:
     )
     assert denied["status"] == "REPAIR_APPLY_PREVIEW_REQUIRED"
     assert denied["write_executed"] is False
+    assert target.read_bytes() == before
+
+
+def test_preview_fails_closed_on_conflicting_gross_r_target(tmp_path) -> None:
+    target = tmp_path / "gross-conflict" / "trade_registry.json"
+    registry = _registry()
+    registry["closed_trades"][0]["gross_r_multiple"] = 99.0
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(registry), encoding="utf-8")
+    controller = _controller(target, apply_enabled=False)
+    before = target.read_bytes()
+
+    preview = _preview(controller)
+
+    assert preview["status"] == "REPAIR_PREVIEW_GROSS_R_TARGET_CONFLICT"
+    assert preview["gross_r_target_path"] == "trade.gross_r_multiple"
+    assert preview["write_executed"] is False
+    assert target.read_bytes() == before
+
+
+def test_preview_rejects_reversed_financial_semantics(tmp_path) -> None:
+    target = tmp_path / "reversed-semantics" / "trade_registry.json"
+    controller = _controller(target, apply_enabled=False)
+    before = target.read_bytes()
+
+    technical_reason = controller.preview(
+        {
+            "ack": operation.PREVIEW_ACK_V1,
+            "selected_sources": {
+                "close_reason": "trade.close_reason",
+                "pnl_r": "trade.pnl_r",
+            },
+            "gross_r_source": "trade.r_multiple",
+        }
+    )
+    assert technical_reason["status"] == "REPAIR_PREVIEW_CAUSAL_STOP_SOURCE_REQUIRED"
+
+    gross_as_canonical = controller.preview(
+        {
+            "ack": operation.PREVIEW_ACK_V1,
+            "selected_sources": {
+                "close_reason": "trade.metadata.exit_reason",
+                "pnl_r": "trade.r_multiple",
+            },
+            "gross_r_source": "trade.pnl_r",
+        }
+    )
+    assert gross_as_canonical["status"] == "REPAIR_PREVIEW_CANONICAL_NET_R_SOURCE_REQUIRED"
+    assert technical_reason["write_executed"] is False
+    assert gross_as_canonical["write_executed"] is False
     assert target.read_bytes() == before
 
 

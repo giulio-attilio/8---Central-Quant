@@ -14,6 +14,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import tempfile
 import threading
@@ -26,7 +27,7 @@ from typing import Any
 
 
 TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_RUNTIME_OPERATION_V1_VERSION = (
-    "2026-09-05-TRADE-REGISTRY-CLOSED-IDENTITY-CONFLICT-REPAIR-RUNTIME-OPERATION-V1"
+    "2026-09-05-TRADE-REGISTRY-CLOSED-IDENTITY-CONFLICT-REPAIR-RUNTIME-OPERATION-V1.1-GROSS-R-PRESERVATION"
 )
 PREVIEW_ACK_V1 = "TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_PREVIEW_V1"
 APPLY_ACK_V1 = "TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_APPLY_V1"
@@ -35,6 +36,10 @@ APPLY_SCOPE_ATTESTATION_V1 = (
 )
 
 _EXPECTED_FIELDS = frozenset({"close_reason", "pnl_r"})
+_GROSS_R_TARGET_PATHS = (
+    "trade.gross_r_multiple",
+    "trade.metadata.outcome.gross_r_multiple",
+)
 _MAX_PREVIEW_AGE_SECONDS = 300
 
 
@@ -93,6 +98,31 @@ def _write_path(record: dict[str, Any], path: str, value: Any) -> bool:
         return False
     current[leaf] = copy.deepcopy(value)
     return True
+
+
+def _set_leaf_path(record: dict[str, Any], path: str, value: Any) -> bool:
+    """Set one leaf while refusing to invent or replace parent containers."""
+
+    parts = str(path or "").split(".")
+    if len(parts) < 2 or parts[0] != "trade" or any(not item for item in parts):
+        return False
+    current: Any = record
+    for part in parts[1:-1]:
+        if not isinstance(current, dict) or not isinstance(current.get(part), dict):
+            return False
+        current = current[part]
+    if not isinstance(current, dict):
+        return False
+    current[parts[-1]] = copy.deepcopy(value)
+    return True
+
+
+def _finite_number(value: Any) -> bool:
+    return bool(
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
 
 
 def _closed_record_at(document: Mapping[str, Any], index: int) -> Mapping[str, Any] | None:
@@ -227,7 +257,9 @@ class ClosedIdentityRepairRuntimeOperationV1:
         }
 
     def _build_candidate(
-        self, selected_sources: Mapping[str, Any]
+        self,
+        selected_sources: Mapping[str, Any],
+        gross_r_source: str | None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         result = self._base()
         try:
@@ -266,6 +298,7 @@ class ClosedIdentityRepairRuntimeOperationV1:
         selected_values: dict[str, Any] = {}
         selected_paths: dict[str, str] = {}
         all_update_paths: dict[str, list[str]] = {}
+        actual_by_field: dict[str, dict[str, Any]] = {}
         missing_selections: list[str] = []
         for field_name in sorted(_EXPECTED_FIELDS):
             field_sources = source_map.get(field_name) or []
@@ -286,6 +319,7 @@ class ClosedIdentityRepairRuntimeOperationV1:
                     }
                 )
             requested_path = str(selected_sources.get(field_name) or "")
+            actual_by_field[field_name] = actual_by_path
             options[field_name] = sorted(field_options, key=lambda item: item["path"])
             if requested_path not in actual_by_path:
                 missing_selections.append(field_name)
@@ -303,10 +337,59 @@ class ClosedIdentityRepairRuntimeOperationV1:
             )
             return result, None
 
+        canonical_close_reason = str(selected_values["close_reason"] or "").upper().strip()
+        if (
+            selected_paths["close_reason"].rsplit(".", 1)[-1] != "exit_reason"
+            or canonical_close_reason != "STOP"
+        ):
+            result.update(status="REPAIR_PREVIEW_CAUSAL_STOP_SOURCE_REQUIRED")
+            return result, None
+        canonical_r_path = selected_paths["pnl_r"]
+        canonical_r_value = selected_values["pnl_r"]
+        gross_r_path = str(gross_r_source or "").strip()
+        pnl_r_sources = actual_by_field.get("pnl_r") or {}
+        gross_r_options = [
+            {
+                "path": path,
+                "value": copy.deepcopy(value),
+                "value_sha256": _stable_sha256(value),
+            }
+            for path, value in sorted(pnl_r_sources.items())
+            if path != canonical_r_path and value != canonical_r_value
+        ]
+        if not _finite_number(canonical_r_value):
+            result.update(status="REPAIR_PREVIEW_CANONICAL_NET_R_INVALID")
+            return result, None
+        if canonical_r_path.rsplit(".", 1)[-1] != "pnl_r":
+            result.update(status="REPAIR_PREVIEW_CANONICAL_NET_R_SOURCE_REQUIRED")
+            return result, None
+        if (
+            gross_r_path == canonical_r_path
+            or gross_r_path not in pnl_r_sources
+            or pnl_r_sources.get(gross_r_path) == canonical_r_value
+            or not _finite_number(pnl_r_sources.get(gross_r_path))
+            or gross_r_path.rsplit(".", 1)[-1] != "r_multiple"
+        ):
+            result.update(
+                status="REPAIR_PREVIEW_GROSS_R_SOURCE_REQUIRED",
+                gross_r_source_options=gross_r_options,
+            )
+            return result, None
+        gross_r_value = copy.deepcopy(pnl_r_sources[gross_r_path])
+        gross_r_source_paths = sorted(
+            path
+            for path, value in pnl_r_sources.items()
+            if value == gross_r_value and path != canonical_r_path
+        )
+
         candidate = _document_copy(source)
         mutable_record = _mutable_closed_record_at(candidate, index)
         if mutable_record is None:
             result.update(status="REPAIR_PREVIEW_RECORD_UNAVAILABLE")
+            return result, None
+        record_prefix = _closed_record_document_prefix(candidate, index)
+        if not record_prefix:
+            result.update(status="REPAIR_PREVIEW_RECORD_LOCATOR_INVALID")
             return result, None
         expected_changed: set[str] = set()
         for field_name in sorted(_EXPECTED_FIELDS):
@@ -316,11 +399,23 @@ class ClosedIdentityRepairRuntimeOperationV1:
                     result.update(status="REPAIR_PREVIEW_PATH_UPDATE_FAILED")
                     return result, None
                 if old_value != selected_values[field_name]:
-                    prefix = _closed_record_document_prefix(candidate, index)
-                    if not prefix:
-                        result.update(status="REPAIR_PREVIEW_RECORD_LOCATOR_INVALID")
-                        return result, None
-                    expected_changed.add(f"{prefix}.{path[6:]}")
+                    expected_changed.add(f"{record_prefix}.{path[6:]}")
+        for target_path in _GROSS_R_TARGET_PATHS:
+            exists, current_value = _read_path(mutable_record, target_path)
+            if exists and current_value != gross_r_value:
+                result.update(
+                    status="REPAIR_PREVIEW_GROSS_R_TARGET_CONFLICT",
+                    gross_r_target_path=target_path,
+                )
+                return result, None
+            if not exists:
+                if not _set_leaf_path(mutable_record, target_path, gross_r_value):
+                    result.update(
+                        status="REPAIR_PREVIEW_GROSS_R_TARGET_UNAVAILABLE",
+                        gross_r_target_path=target_path,
+                    )
+                    return result, None
+                expected_changed.add(f"{record_prefix}.{target_path[6:]}")
         actual_changed = _leaf_differences(source, candidate)
         if actual_changed != expected_changed or not actual_changed:
             result.update(status="REPAIR_PREVIEW_PRESERVATION_FAILED")
@@ -339,6 +434,20 @@ class ClosedIdentityRepairRuntimeOperationV1:
                 field_name: [item["value_sha256"] for item in options[field_name]]
                 for field_name in sorted(options)
             },
+            "gross_r_preservation": {
+                "source_path": gross_r_path,
+                "equivalent_source_paths": gross_r_source_paths,
+                "value_sha256": _stable_sha256(gross_r_value),
+                "target_paths": list(_GROSS_R_TARGET_PATHS),
+            },
+        }
+        gross_r_preservation = {
+            "source_path": gross_r_path,
+            "equivalent_source_paths": gross_r_source_paths,
+            "value": gross_r_value,
+            "value_sha256": _stable_sha256(gross_r_value),
+            "target_paths": list(_GROSS_R_TARGET_PATHS),
+            "verified": True,
         }
         material = {
             "source_registry": source,
@@ -347,6 +456,8 @@ class ClosedIdentityRepairRuntimeOperationV1:
             "candidate_registry_sha256": candidate_sha,
             "conflict_binding_sha256": _stable_sha256(conflict_binding),
             "selected_source_paths": selected_paths,
+            "gross_r_source_path": gross_r_path,
+            "gross_r_preservation": gross_r_preservation,
             "changed_paths": sorted(actual_changed),
             "registry_index": index,
         }
@@ -357,6 +468,8 @@ class ClosedIdentityRepairRuntimeOperationV1:
             candidate_registry_sha256=candidate_sha,
             conflict_binding_sha256=material["conflict_binding_sha256"],
             selected_source_paths=selected_paths,
+            gross_r_preservation=gross_r_preservation,
+            gross_r_preservation_verified=True,
             changed_paths=sorted(actual_changed),
             selection_options=options,
             preservation_verified=True,
@@ -377,7 +490,11 @@ class ClosedIdentityRepairRuntimeOperationV1:
         elif not set(selections).issubset(_EXPECTED_FIELDS):
             result.update(status="REPAIR_PREVIEW_SELECTION_FIELDS_INVALID")
             return result
-        result, material = self._build_candidate(selections)
+        gross_r_source = request_payload.get("gross_r_source")
+        if gross_r_source is not None and not isinstance(gross_r_source, str):
+            result.update(status="REPAIR_PREVIEW_GROSS_R_SOURCE_INVALID")
+            return result
+        result, material = self._build_candidate(selections, gross_r_source)
         if material is None:
             return result
         issued_at = int(self._clock())
@@ -388,6 +505,10 @@ class ClosedIdentityRepairRuntimeOperationV1:
             "candidate_registry_sha256": material["candidate_registry_sha256"],
             "conflict_binding_sha256": material["conflict_binding_sha256"],
             "selected_source_paths": material["selected_source_paths"],
+            "gross_r_source_path": material["gross_r_source_path"],
+            "gross_r_preservation_sha256": _stable_sha256(
+                material["gross_r_preservation"]
+            ),
             "changed_paths": material["changed_paths"],
             "issued_at_epoch": issued_at,
             "expires_at_epoch": issued_at + ttl,
@@ -399,6 +520,7 @@ class ClosedIdentityRepairRuntimeOperationV1:
             self._pending[receipt_sha] = {
                 "receipt": copy.deepcopy(receipt),
                 "selected_sources": dict(material["selected_source_paths"]),
+                "gross_r_source": material["gross_r_source_path"],
             }
         result.update(preview_receipt=receipt, apply_enabled=self._config.apply_enabled)
         return result
@@ -459,7 +581,9 @@ class ClosedIdentityRepairRuntimeOperationV1:
             return result
         try:
             with lock:
-                validation, material = self._build_candidate(pending["selected_sources"])
+                validation, material = self._build_candidate(
+                    pending["selected_sources"], pending["gross_r_source"]
+                )
                 if material is None:
                     result["real_registry_accessed"] = bool(
                         validation.get("real_registry_accessed")
