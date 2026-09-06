@@ -59,13 +59,13 @@ _SEAM_DETAILS = (
     (7249, "(symbol=None, side=None, bot=None, setup=None, lifecycle=None, commit=False)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
     (9859, "(commit=False, ack=None, _lock_held=False)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
     (10186, "(symbol=None, side=None, bot=None, setup=None, commit=False, ack=None, entry=None, qty=None, sl=None, tp50=None, exit_price=None, realized_pnl=None, last_mark_price=None, last_unrealized_pnl=None, close_reason=None)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (11052, "(found_payload, selected_payload, outcome)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (11606, "(commit=False, include_trades=True, source='manual')", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (14681, "(removed)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (49325, "(commit=False, ack=None, include_samples=True, use_cache=False)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (49761, "(commit=False, ack=None, include_samples=True, track_state=True)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (67527, "(commit=False, ack=None, automatic=False, include_samples=True)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
-    (50537, "(force=False, _lock_held=False)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
+    (11145, "(found_payload, selected_payload, outcome)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
+    (11715, "(commit=False, include_trades=True, source='manual')", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
+    (14790, "(removed)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
+    (49434, "(commit=False, ack=None, include_samples=True, use_cache=False)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
+    (49870, "(commit=False, ack=None, include_samples=True, track_state=True)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
+    (67728, "(commit=False, ack=None, automatic=False, include_samples=True)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
+    (50646, "(force=False, _lock_held=False)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
 )
 
 _BY_NAME_IMPORT_CONSUMERS = (

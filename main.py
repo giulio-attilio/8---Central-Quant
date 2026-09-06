@@ -10535,7 +10535,9 @@ def registry_persistence_v1_health_route():
 # - Calcular saída, PnL, PnL %, R múltiplo, TP50 e motivo provável.
 # - Salvar outcome em /data e na metadata do trade fechado.
 # - Bloquear nova execução real se houver trade fechado ainda não avaliado.
-TRADE_CLOSE_OUTCOME_V1_VERSION = "2026-07-06-TRADE-CLOSE-OUTCOME-EVALUATOR-V1"
+TRADE_CLOSE_OUTCOME_V1_VERSION = (
+    "2026-09-05-TRADE-CLOSE-OUTCOME-EVALUATOR-V1.1-NET-R-CAUSAL-REASON"
+)
 TRADE_CLOSE_OUTCOME_V1_LATEST_FILE = CENTRAL_DATA_DIR / "trade_close_outcome_v1_latest.json"
 TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "trade_close_outcome_v1_events.jsonl"
 
@@ -10877,13 +10879,15 @@ def _tco_v1_infer_close_reason(trade, explicit_close_reason=None, tp50_hit=False
     if explicit_close_reason:
         return str(explicit_close_reason).upper().strip(), "request"
     meta = _tco_v1_trade_meta(trade)
-    raw = str(trade.get("close_reason") or meta.get("close_reason") or "").upper().strip()
+    raw = str(
+        trade.get("close_reason")
+        or trade.get("exit_reason")
+        or meta.get("close_reason")
+        or meta.get("exit_reason")
+        or ""
+    ).upper().strip()
     if raw in {"MANUAL_CLOSE", "MANUAL", "USER_CLOSE"}:
         return "MANUAL_CLOSE", "registry"
-    if "STOP" in raw:
-        return "STOP_OR_PROTECTIVE_ORDER", "registry"
-    if "TP" in raw or "TAKE" in raw:
-        return "TAKE_PROFIT_OR_TP", "registry"
     if raw == "BROKER_POSITION_NOT_FOUND":
         # O lifecycle sabe que a posição sumiu, mas não sabe se foi manual, stop, TP ou liquidação.
         if tp50_hit:
@@ -10908,6 +10912,7 @@ def trade_close_outcome_v1_build(
     realized_pnl=None,
     fee=None,
     close_reason=None,
+    canonical_pnl_r=None,
     commit=False,
     expected_identity=None,
 ):
@@ -10956,7 +10961,90 @@ def trade_close_outcome_v1_build(
         realized_quality = "ESTIMATED_FROM_EXIT_PRICE" if computed_pnl is not None else "MISSING_REALIZED_PNL"
     fee_f = _tco_v1_float(fee, 0.0) or 0.0
     net_pnl = (realized_pnl_f - fee_f) if realized_pnl_f is not None else None
-    r_multiple, r_calc = _tco_v1_compute_r(entry, exit_price_f, sl, side_n)
+    gross_r_multiple, r_calc = _tco_v1_compute_r(entry, exit_price_f, sl, side_n)
+    risk_abs = _tco_v1_float((r_calc or {}).get("risk_abs"))
+    initial_risk_usdt = (
+        risk_abs * abs(qty)
+        if risk_abs is not None and risk_abs > 0 and qty is not None and abs(qty) > 0
+        else None
+    )
+    net_r_multiple = (
+        net_pnl / initial_risk_usdt
+        if net_pnl is not None and initial_risk_usdt is not None
+        else None
+    )
+    canonical_r_input = (
+        canonical_pnl_r
+        if canonical_pnl_r not in (None, "")
+        else trade.get("pnl_r")
+    )
+    explicit_canonical_r = _tco_v1_float(canonical_r_input)
+    if canonical_r_input not in (None, "") and explicit_canonical_r is None:
+        return {
+            "ok": False,
+            "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+            "status": "CANONICAL_PNL_R_INVALID",
+            "commit": {
+                "attempted": False,
+                "committed": False,
+                "status": "COMMIT_BLOCKED_INVALID_CANONICAL_PNL_R",
+            },
+        }
+    if (
+        explicit_canonical_r is not None
+        and net_r_multiple is not None
+        and abs(explicit_canonical_r - net_r_multiple) > 1e-8
+    ):
+        return {
+            "ok": False,
+            "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+            "status": "CANONICAL_PNL_R_EVIDENCE_CONFLICT",
+            "canonical_pnl_r": round(explicit_canonical_r, 8),
+            "computed_net_r_multiple": round(net_r_multiple, 8),
+            "commit": {
+                "attempted": False,
+                "committed": False,
+                "status": "COMMIT_BLOCKED_CANONICAL_PNL_R_EVIDENCE_CONFLICT",
+            },
+        }
+    if explicit_canonical_r is not None:
+        r_multiple = explicit_canonical_r
+        canonical_r_source = (
+            "explicit_canonical_pnl_r"
+            if canonical_pnl_r not in (None, "")
+            else "registry_canonical_pnl_r"
+        )
+    elif net_r_multiple is not None:
+        r_multiple = net_r_multiple
+        canonical_r_source = "computed_net_pnl_over_initial_risk"
+    else:
+        r_multiple = None
+        canonical_r_source = "net_r_evidence_unavailable"
+    if commit and net_r_multiple is None:
+        return {
+            "ok": False,
+            "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+            "status": "NET_PNL_R_EVIDENCE_UNAVAILABLE",
+            "gross_r_multiple": (
+                round(gross_r_multiple, 8)
+                if gross_r_multiple is not None
+                else None
+            ),
+            "commit": {
+                "attempted": False,
+                "committed": False,
+                "status": "COMMIT_BLOCKED_NET_PNL_R_EVIDENCE_UNAVAILABLE",
+            },
+        }
+    r_calc = dict(r_calc or {})
+    r_calc.update(
+        {
+            "initial_risk_usdt": initial_risk_usdt,
+            "gross_r_multiple": gross_r_multiple,
+            "net_r_multiple": net_r_multiple,
+            "canonical_r_source": canonical_r_source,
+        }
+    )
     tp50_payload = _tco_v1_tp50_result(entry, exit_price_f, tp50, side_n, lifecycle_tp50_hit=meta.get("lifecycle_tp50_hit"))
     close_reason_final, close_reason_source = _tco_v1_infer_close_reason(trade, explicit_close_reason=close_reason, tp50_hit=tp50_payload.get("hit"), r_multiple=r_multiple, pnl_usdt=net_pnl if net_pnl is not None else realized_pnl_f)
     data_quality_notes = []
@@ -11007,7 +11095,10 @@ def trade_close_outcome_v1_build(
         "net_pnl": net_pnl,
         "pnl_pct": round(pnl_pct, 8) if pnl_pct is not None else None,
         "pnl_per_unit": pnl_per_unit,
+        "pnl_r": round(r_multiple, 8) if r_multiple is not None else None,
         "r_multiple": round(r_multiple, 8) if r_multiple is not None else None,
+        "gross_r_multiple": round(gross_r_multiple, 8) if gross_r_multiple is not None else None,
+        "net_r_multiple": round(net_r_multiple, 8) if net_r_multiple is not None else None,
         "r_calculation": r_calc,
         "tp50_result": tp50_payload,
         "close_reason": close_reason_final,
@@ -11033,7 +11124,9 @@ def trade_close_outcome_v1_build(
             "tp50_hit": tp50_payload.get("hit"),
             "pnl_usdt": net_pnl,
             "pnl_pct": round(pnl_pct, 8) if pnl_pct is not None else None,
+            "pnl_r": round(r_multiple, 8) if r_multiple is not None else None,
             "r_multiple": round(r_multiple, 8) if r_multiple is not None else None,
+            "gross_r_multiple": round(gross_r_multiple, 8) if gross_r_multiple is not None else None,
             "close_reason": close_reason_final,
             "data_quality": quality,
         },
@@ -11103,8 +11196,16 @@ def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
             trade["realized_pnl"] = outcome.get("realized_pnl")
             trade["net_pnl"] = outcome.get("net_pnl")
             trade["pnl_pct"] = outcome.get("pnl_pct")
-            trade["r_multiple"] = outcome.get("r_multiple")
+            canonical_r = outcome.get("pnl_r")
+            if canonical_r is None:
+                canonical_r = outcome.get("r_multiple")
+            if canonical_r is not None:
+                trade["pnl_r"] = canonical_r
+                trade["result_r"] = canonical_r
+                trade["r_multiple"] = canonical_r
             trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+            if outcome.get("close_reason") not in (None, ""):
+                trade["close_reason"] = outcome.get("close_reason")
             trade["close_reason_evaluated"] = outcome.get("close_reason")
             trade["last_update"] = now
             closed_obj[key] = trade
@@ -11138,8 +11239,16 @@ def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
             trade["realized_pnl"] = outcome.get("realized_pnl")
             trade["net_pnl"] = outcome.get("net_pnl")
             trade["pnl_pct"] = outcome.get("pnl_pct")
-            trade["r_multiple"] = outcome.get("r_multiple")
+            canonical_r = outcome.get("pnl_r")
+            if canonical_r is None:
+                canonical_r = outcome.get("r_multiple")
+            if canonical_r is not None:
+                trade["pnl_r"] = canonical_r
+                trade["result_r"] = canonical_r
+                trade["r_multiple"] = canonical_r
             trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+            if outcome.get("close_reason") not in (None, ""):
+                trade["close_reason"] = outcome.get("close_reason")
             trade["close_reason_evaluated"] = outcome.get("close_reason")
             trade["last_update"] = now
             closed_obj[idx] = trade
@@ -58325,7 +58434,9 @@ def falcon_disaster_stop_close_position_preview_route():
 # - Todas as consultas à BingX são read-only.
 # - Nenhuma rota deste bloco abre, fecha, cancela ou altera ordens.
 # - Commit só ocorre com evidência broker completa; pela rota manual exige ACK.
-REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-23-REAL-CLOSE-RECONCILIATION-V1.1-REVIEW8-COMPLETE-SELECTED-IDENTITY"
+REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = (
+    "2026-09-05-REAL-CLOSE-RECONCILIATION-V1.2-CAUSAL-REASON-NET-R"
+)
 REAL_CLOSE_RECONCILIATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_latest.json"
 REAL_CLOSE_RECONCILIATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_events.jsonl"
 
@@ -58954,6 +59065,65 @@ def _rcrm_v1_metrics(side, entry, stop, exit_price, qty, net_pnl):
     }
 
 
+def _rcrm_v1_causal_close_reason(trade):
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = _rcrm_v1_meta(trade)
+    trade_outcome = trade.get("outcome") if isinstance(trade.get("outcome"), dict) else {}
+    metadata_outcome = (
+        metadata.get("outcome")
+        if isinstance(metadata.get("outcome"), dict)
+        else {}
+    )
+    technical_markers = {
+        "BROKER_RECONCILED_CLOSE",
+        "BROKER_CLOSE_RECONCILED",
+        "BROKER_CLOSE_RECONCILIATION",
+    }
+    candidates = []
+    for path, source in (
+        ("trade.close_reason", trade.get("close_reason")),
+        ("trade.exit_reason", trade.get("exit_reason")),
+        ("trade.metadata.close_reason", metadata.get("close_reason")),
+        ("trade.metadata.exit_reason", metadata.get("exit_reason")),
+        ("trade.outcome.close_reason", trade_outcome.get("close_reason")),
+        ("trade.outcome.exit_reason", trade_outcome.get("exit_reason")),
+        ("trade.metadata.outcome.close_reason", metadata_outcome.get("close_reason")),
+        ("trade.metadata.outcome.exit_reason", metadata_outcome.get("exit_reason")),
+    ):
+        value = str(source or "").upper().strip()
+        if not value or value in technical_markers:
+            continue
+        candidates.append({"path": path, "value": value})
+    distinct = sorted({item["value"] for item in candidates})
+    if len(distinct) == 1:
+        selected = distinct[0]
+        return {
+            "ok": True,
+            "status": "REAL_CLOSE_CAUSAL_REASON_RESOLVED",
+            "value": selected,
+            "source_paths": [
+                item["path"] for item in candidates if item["value"] == selected
+            ],
+            "technical_markers_ignored": sorted(technical_markers),
+        }
+    if not distinct:
+        return {
+            "ok": False,
+            "status": "REAL_CLOSE_CAUSAL_REASON_UNAVAILABLE",
+            "value": None,
+            "source_paths": [],
+            "technical_markers_ignored": sorted(technical_markers),
+        }
+    return {
+        "ok": False,
+        "status": "REAL_CLOSE_CAUSAL_REASON_CONFLICT",
+        "value": None,
+        "conflicting_values": distinct,
+        "sources": candidates,
+        "technical_markers_ignored": sorted(technical_markers),
+    }
+
+
 def _rcrm_v11_manual_outcome_conflict(trade, broker_exit_price):
     trade = trade if isinstance(trade, dict) else {}
     metadata = _rcrm_v1_meta(trade)
@@ -59219,6 +59389,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
     qty = _rcrm_v1_float(broker_result.get("expected_qty"), values.get("qty"))
     net_pnl = _rcrm_v1_float(broker_result.get("net_pnl"))
     metrics = _rcrm_v1_metrics(side, entry, values.get("stop"), exit_price, qty, net_pnl)
+    causal_close_reason = _rcrm_v1_causal_close_reason(trade)
     financial_dedup_ok = bool(broker_result.get("financial_dedup_ok", True))
     broker_evidence_complete = bool(
         broker_result.get("complete")
@@ -59231,7 +59402,13 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         broker_evidence_complete and broker_identity_validation.get("ok")
     )
     outcome_conflict = _rcrm_v11_manual_outcome_conflict(trade, exit_price)
-    complete = bool(broker_complete and not outcome_conflict.get("conflict"))
+    net_r_ready = metrics.get("r_net") is not None
+    semantic_commit_ready = bool(causal_close_reason.get("ok") and net_r_ready)
+    complete = bool(
+        broker_complete
+        and not outcome_conflict.get("conflict")
+        and (not commit or semantic_commit_ready)
+    )
     legacy_commit_identity_blocked = bool(
         commit
         and complete
@@ -59270,6 +59447,11 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "broker_income_deduped_count": broker_result.get("income_deduped_count"),
             "broker_income_duplicates_removed": broker_result.get("income_duplicates_removed"),
             "broker_financial_dedup_ok": financial_dedup_ok,
+            "real_close_reconciliation_status": "BROKER_RECONCILED_CLOSE",
+            "causal_close_reason": causal_close_reason.get("value"),
+            "causal_close_reason_source_paths": causal_close_reason.get("source_paths") or [],
+            "gross_r_multiple": metrics.get("r_price"),
+            "net_r_multiple": metrics.get("r_net"),
         }
         updater = getattr(central_trade_registry, "update_closed_trade", None)
         if callable(updater):
@@ -59290,10 +59472,12 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
                 funding=broker_result.get("funding"),
                 net_pnl=net_pnl,
                 pnl_pct=metrics.get("pnl_pct"),
-                pnl_r=metrics.get("r_net") if metrics.get("r_net") is not None else metrics.get("r_price"),
-                r_multiple=metrics.get("r_net") if metrics.get("r_net") is not None else metrics.get("r_price"),
+                pnl_r=metrics.get("r_net"),
+                result_r=metrics.get("r_net"),
+                r_multiple=metrics.get("r_net"),
+                gross_r_multiple=metrics.get("r_price"),
                 closed_at=broker_result.get("closed_at") or trade.get("closed_at"),
-                close_reason="BROKER_RECONCILED_CLOSE",
+                close_reason=causal_close_reason.get("value"),
                 metadata=metadata,
             )
         else:
@@ -59310,7 +59494,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
                 exit_price=exit_price,
                 realized_pnl=realized_for_outcome,
                 fee=_rcrm_v1_float(broker_result.get("fee_total"), 0.0) or 0.0,
-                close_reason="BROKER_RECONCILED_CLOSE",
+                close_reason=causal_close_reason.get("value"),
+                canonical_pnl_r=metrics.get("r_net"),
                 commit=True,
             )
             committed = bool((outcome.get("commit") or {}).get("committed")) if isinstance(outcome, dict) else False
@@ -59319,13 +59504,17 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         status = "REAL_CLOSE_BROKER_IDENTITY_DIVERGENCE"
     elif outcome_conflict.get("conflict"):
         status = "REAL_CLOSE_OUTCOME_CONFLICT"
-    elif legacy_commit_identity_blocked:
-        status = "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
     elif broker_result.get("status") in {
         "CLOSING_QTY_EXCEEDS_EXPECTED",
         "FEE_ASSOCIATION_INCONCLUSIVE",
     }:
         status = broker_result.get("status")
+    elif commit and not causal_close_reason.get("ok"):
+        status = causal_close_reason.get("status")
+    elif commit and not net_r_ready:
+        status = "REAL_CLOSE_NET_R_UNAVAILABLE"
+    elif legacy_commit_identity_blocked:
+        status = "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
     else:
         status = "BROKER_CLOSE_RECONCILED_AND_SAVED" if committed else (
             "BROKER_CLOSE_RECONCILED_PREVIEW" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
@@ -59359,6 +59548,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         "diagnostics": lookup_diagnostics,
         "selected_strong_identity": selected_identity,
         "outcome_conflict": outcome_conflict,
+        "causal_close_reason": causal_close_reason,
+        "net_r_ready": net_r_ready,
         "commit_blocked_reason": (
             "REAL_CLOSE_BROKER_IDENTITY_DIVERGENCE"
             if not broker_identity_validation.get("ok")
@@ -59366,15 +59557,23 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
                 outcome_conflict.get("reason")
                 if outcome_conflict.get("conflict")
                 else (
-                    "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
-                    if legacy_commit_identity_blocked
+                    broker_result.get("status")
+                    if broker_result.get("status") in {
+                        "CLOSING_QTY_EXCEEDS_EXPECTED",
+                        "FEE_ASSOCIATION_INCONCLUSIVE",
+                    }
                     else (
-                        broker_result.get("status")
-                        if broker_result.get("status") in {
-                            "CLOSING_QTY_EXCEEDS_EXPECTED",
-                            "FEE_ASSOCIATION_INCONCLUSIVE",
-                        }
-                        else None
+                        causal_close_reason.get("status")
+                        if commit and not causal_close_reason.get("ok")
+                        else (
+                            "REAL_CLOSE_NET_R_UNAVAILABLE"
+                            if commit and not net_r_ready
+                            else (
+                                "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
+                                if legacy_commit_identity_blocked
+                                else None
+                            )
+                        )
                     )
                 )
             )
@@ -59390,6 +59589,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "Fees sem orderId usam simbolo, horario, semantica opening/closing e tradeId quando disponivel; associacao multipla bloqueia o commit.",
             "V1.1 Review 4 resolve closed trade por intersecao de lifecycle/client/order e valida Registry contra o resultado factual do Broker.",
             "V1.1 Review 7 preserva a identidade canonica selecionada ate o Broker e o Registry writer; fallback de execution evidence fica restrito ao lookup legado.",
+            "V1.2 preserva o motivo causal do lifecycle; marcadores de reconciliacao ficam somente em metadata.",
+            "V1.2 usa R liquido como alias estatistico canonico e mantem R bruto em gross_r_multiple.",
             "Outcome manual conflitante nunca é sobrescrito nem duplicado.",
             "Commit é bloqueado se houver colisão financeira ambígua após a deduplicação.",
         ],

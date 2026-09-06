@@ -435,6 +435,7 @@ def _load_main_reconciliation_namespace(
         "_rcrm_v1_norm_side",
         "_rcrm_v1_meta",
         "_rcrm_v1_metrics",
+        "_rcrm_v1_causal_close_reason",
         "_rcrm_v11_manual_outcome_conflict",
         "_rcrm_v11_validate_broker_identity",
         "real_close_reconciliation_v1_run",
@@ -661,6 +662,7 @@ def _strong_identity_records():
         "side": "LONG",
         "status": "CLOSED",
         "qty": 9.0,
+        "close_reason": "STOP",
     }
     verify = dict(
         shared,
@@ -1137,6 +1139,7 @@ def _load_integrated_strong_runner(closed_trades, broker_result):
         "_rcrm_v11_selected_strong_identity",
         "_rcrm_v1_values",
         "_rcrm_v1_metrics",
+        "_rcrm_v1_causal_close_reason",
         "_rcrm_v11_manual_outcome_conflict",
         "_rcrm_v11_validate_broker_identity",
         "real_close_reconciliation_v1_run",
@@ -1674,10 +1677,89 @@ def test_writer_receives_exact_selected_canonical_identity():
         "client_order_id": real["client_order_id"],
         "order_id": real["order_id"],
     }
+    assert registry_updates[0]["close_reason"] == "STOP"
+    assert registry_updates[0]["pnl_r"] == pytest.approx(
+        result["metrics"]["r_net"]
+    )
+    assert registry_updates[0]["result_r"] == pytest.approx(
+        result["metrics"]["r_net"]
+    )
+    assert registry_updates[0]["r_multiple"] == pytest.approx(
+        result["metrics"]["r_net"]
+    )
+    assert registry_updates[0]["gross_r_multiple"] == pytest.approx(
+        result["metrics"]["r_price"]
+    )
+    assert registry_updates[0]["metadata"]["real_close_reconciliation_status"] == (
+        "BROKER_RECONCILED_CLOSE"
+    )
+    assert registry_updates[0]["metadata"]["causal_close_reason"] == "STOP"
     assert len(outcome_calls) == 1
+    assert outcome_calls[0]["close_reason"] == "STOP"
+    assert outcome_calls[0]["canonical_pnl_r"] == pytest.approx(
+        result["metrics"]["r_net"]
+    )
     assert result["selected_strong_identity"]["source"] == (
         "TRADE_REGISTRY_CANONICAL_ALIASES"
     )
+
+
+def test_conflicting_causal_close_reasons_fail_closed_before_registry_writes():
+    _verify, real = _strong_identity_records()
+    real = copy.deepcopy(real)
+    real.pop("outcome", None)
+    real["metadata"] = {"exit_reason": "MANUAL_CLOSE"}
+    namespace, registry_updates, broker_calls, outcome_calls, audit_calls = (
+        _load_integrated_strong_runner([real], _complete_broker_result())
+    )
+
+    result = namespace["real_close_reconciliation_v1_run"](
+        payload=_factual_xrp_request(real),
+        commit=True,
+        source="test",
+    )
+
+    assert len(broker_calls) == 1
+    assert result["status"] == "REAL_CLOSE_CAUSAL_REASON_CONFLICT"
+    assert result["complete"] is False
+    assert result["committed"] is False
+    assert result["commit_blocked_reason"] == (
+        "REAL_CLOSE_CAUSAL_REASON_CONFLICT"
+    )
+    assert result["causal_close_reason"]["conflicting_values"] == [
+        "MANUAL_CLOSE",
+        "STOP",
+    ]
+    assert registry_updates == []
+    assert outcome_calls == []
+    assert audit_calls == ["write", "append"]
+
+
+def test_missing_causal_close_reason_fail_closed_before_registry_writes():
+    _verify, real = _strong_identity_records()
+    real = copy.deepcopy(real)
+    real.pop("outcome", None)
+    real.pop("close_reason", None)
+    namespace, registry_updates, broker_calls, outcome_calls, audit_calls = (
+        _load_integrated_strong_runner([real], _complete_broker_result())
+    )
+
+    result = namespace["real_close_reconciliation_v1_run"](
+        payload=_factual_xrp_request(real),
+        commit=True,
+        source="test",
+    )
+
+    assert len(broker_calls) == 1
+    assert result["status"] == "REAL_CLOSE_CAUSAL_REASON_UNAVAILABLE"
+    assert result["complete"] is False
+    assert result["committed"] is False
+    assert result["commit_blocked_reason"] == (
+        "REAL_CLOSE_CAUSAL_REASON_UNAVAILABLE"
+    )
+    assert registry_updates == []
+    assert outcome_calls == []
+    assert audit_calls == ["write", "append"]
 
 
 def test_broker_client_id_case_difference_remains_match():
