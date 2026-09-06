@@ -14790,50 +14790,50 @@ def _trade_registry_signature_map(items):
 def mark_registry_missing_trades(removed):
     if central_trade_registry is None:
         return {"ok": False, "error": "trade_registry unavailable"}
-
     if not removed:
-        return {"ok": True, "marked_count": 0, "marked": []}
-
+        return {"ok": True, "marked_count": 0, "marked": [], "registry_write": False}
     try:
         registry = central_trade_registry.load_registry()
         open_trades = registry.get("open_trades", {})
-
         if not isinstance(open_trades, dict):
             return {"ok": False, "error": "open_trades is not dict"}
-
-        marked = []
-
+        registry, open_trades = dict(registry), dict(open_trades)
+        marked, already_marked, detected_at = [], [], None
         for item in removed:
+            if not isinstance(item, dict):
+                continue
             trade_id = item.get("trade_id")
             if not trade_id or trade_id not in open_trades:
                 continue
-
             trade = open_trades[trade_id]
+            if not isinstance(trade, dict):
+                return {"ok": False, "error": "open trade is not dict", "registry_write": False}
+            if trade.get("status") == "MISSING_FROM_BOTS" and trade.get("missing_from_bots") is True:
+                already_marked.append(trade_id)
+                continue
+            detected_at = detected_at or data_hora_sp_str()
+            trade = dict(trade)
             trade["status"] = "MISSING_FROM_BOTS"
             trade["missing_from_bots"] = True
-            trade["missing_detected_at"] = data_hora_sp_str()
-            trade["last_update"] = data_hora_sp_str()
-
+            if not trade.get("missing_detected_at"):
+                trade["missing_detected_at"] = detected_at
+            trade["last_update"] = detected_at
             open_trades[trade_id] = trade
             marked.append({
-                "trade_id": trade_id,
-                "bot": trade.get("bot"),
-                "symbol": trade.get("symbol"),
-                "side": trade.get("side"),
+                "trade_id": trade_id, "bot": trade.get("bot"),
+                "symbol": trade.get("symbol"), "side": trade.get("side"),
                 "status": trade.get("status"),
             })
-
+        if not marked:
+            return {"ok": True, "marked_count": 0, "marked": [], "already_marked": already_marked, "registry_write": False}
         registry["open_trades"] = open_trades
         registry_write = central_trade_registry.save_registry(registry)
         if registry_write is False:
-            return {"ok": False, "error": "REGISTRY_SAVE_NOT_CONFIRMED"}
-
+            return {"ok": False, "error": "REGISTRY_SAVE_NOT_CONFIRMED", "registry_write": False}
         return {
-            "ok": True,
-            "marked_count": len(marked),
-            "marked": marked,
+            "ok": True, "marked_count": len(marked),
+            "marked": marked, "already_marked": already_marked, "registry_write": True,
         }
-
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
