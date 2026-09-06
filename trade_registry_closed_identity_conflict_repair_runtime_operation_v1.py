@@ -27,7 +27,7 @@ from typing import Any
 
 
 TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_RUNTIME_OPERATION_V1_VERSION = (
-    "2026-09-05-TRADE-REGISTRY-CLOSED-IDENTITY-CONFLICT-REPAIR-RUNTIME-OPERATION-V1.1-GROSS-R-PRESERVATION"
+    "2026-09-05-TRADE-REGISTRY-CLOSED-IDENTITY-CONFLICT-REPAIR-RUNTIME-OPERATION-V1.3-WRITER-QUIESCENCE"
 )
 PREVIEW_ACK_V1 = "TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_PREVIEW_V1"
 APPLY_ACK_V1 = "TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_APPLY_V1"
@@ -212,6 +212,9 @@ class ClosedIdentityRepairRuntimeOperationV1:
         trading_controls: Callable[[], Mapping[str, Any]],
         target_path: str | os.PathLike[str],
         backup_root: str | os.PathLike[str],
+        writer_coordination_status: Callable[[], Mapping[str, Any]] | None = None,
+        maintenance_lease: Callable[[], AbstractContextManager[Any] | None]
+        | None = None,
         config: ClosedIdentityRepairRuntimeConfigV1 | None = None,
         clock: Callable[[], float] | None = None,
         replacer: Callable[[str, str], None] | None = None,
@@ -221,6 +224,8 @@ class ClosedIdentityRepairRuntimeOperationV1:
         self._conflict_auditor = conflict_auditor
         self._registry_lock = registry_lock
         self._trading_controls = trading_controls
+        self._writer_coordination_status = writer_coordination_status
+        self._maintenance_lease = maintenance_lease
         self._target = Path(target_path).resolve(strict=False)
         self._backup_root = Path(backup_root).resolve(strict=False)
         self._config = config or ClosedIdentityRepairRuntimeConfigV1()
@@ -230,12 +235,27 @@ class ClosedIdentityRepairRuntimeOperationV1:
         self._pending: dict[str, dict[str, Any]] = {}
         self._state_lock = threading.RLock()
 
+    def _apply_contract_enabled(self) -> bool:
+        return bool(
+            self._config.apply_enabled
+            and self._config.apply_scope_attestation == APPLY_SCOPE_ATTESTATION_V1
+        )
+
     def snapshot(self) -> dict[str, Any]:
+        apply_contract_enabled = self._apply_contract_enabled()
         return {
             "version": TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_RUNTIME_OPERATION_V1_VERSION,
-            "default_off": not self._config.apply_enabled,
+            "default_off": not apply_contract_enabled,
             "preview_available": True,
-            "apply_enabled": self._config.apply_enabled,
+            "apply_enabled": apply_contract_enabled,
+            "apply_configured": bool(self._config.apply_enabled),
+            "apply_scope_attested": bool(
+                self._config.apply_scope_attestation == APPLY_SCOPE_ATTESTATION_V1
+            ),
+            "writer_coordination_bound": callable(
+                self._writer_coordination_status
+            ),
+            "maintenance_lease_bound": callable(self._maintenance_lease),
             "pending_preview_count": len(self._pending),
             "real_registry_accessed": False,
             "write_executed": False,
@@ -512,7 +532,7 @@ class ClosedIdentityRepairRuntimeOperationV1:
             "changed_paths": material["changed_paths"],
             "issued_at_epoch": issued_at,
             "expires_at_epoch": issued_at + ttl,
-            "apply_allowed": False,
+            "apply_allowed": self._apply_contract_enabled(),
         }
         receipt["preview_receipt_sha256"] = _stable_sha256(receipt)
         receipt_sha = receipt["preview_receipt_sha256"]
@@ -522,7 +542,10 @@ class ClosedIdentityRepairRuntimeOperationV1:
                 "selected_sources": dict(material["selected_source_paths"]),
                 "gross_r_source": material["gross_r_source_path"],
             }
-        result.update(preview_receipt=receipt, apply_enabled=self._config.apply_enabled)
+        result.update(
+            preview_receipt=receipt,
+            apply_enabled=self._apply_contract_enabled(),
+        )
         return result
 
     def _controls_safe(self) -> bool:
@@ -539,6 +562,45 @@ class ClosedIdentityRepairRuntimeOperationV1:
             and controls.get("central_real_pilot_enabled") is False
             and controls.get("live_trading_enabled") is False
             and controls.get("order_submission_authorized") is False
+        )
+
+    def _writer_coordination_safe(self) -> bool:
+        if not callable(self._writer_coordination_status):
+            return False
+        try:
+            status = self._writer_coordination_status()
+        except Exception:
+            return False
+        return bool(
+            isinstance(status, Mapping)
+            and status.get("enabled") is True
+            and status.get("coordination_ready") is True
+            and status.get("runtime_activation_allowed") is True
+            and status.get("registered_writer_count") == 19
+            and status.get("all_writers_registered") is True
+            and status.get("inflight_mutations") == 0
+            and status.get("shared_lock_backend_ready") is True
+            and status.get("maintenance_lease_store_ready") is True
+            and status.get("registry_interlock_ready") is True
+            and status.get("activation_receipt_verified") is True
+            and status.get("source_hashes_verified") is True
+            and status.get("rollback_ready") is True
+            and status.get("kill_switch_ready") is True
+            and status.get("kill_switch_engaged") is False
+        )
+
+    @staticmethod
+    def _maintenance_permit_safe(permit: Any) -> bool:
+        return bool(
+            permit is not None
+            and getattr(permit, "state", None) == "QUIESCED"
+            and getattr(permit, "registered_writer_count", None) == 19
+            and getattr(permit, "inflight_mutations", None) == 0
+            and getattr(permit, "shared_lock_acquired", None) is True
+            and _valid_sha256(getattr(permit, "maintenance_epoch", None))
+            and _valid_sha256(
+                getattr(permit, "lock_namespace_sha256", None)
+            )
         )
 
     def apply(self, request_payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -569,46 +631,101 @@ class ClosedIdentityRepairRuntimeOperationV1:
             result["registry_write"] = False
             return result
         receipt = pending["receipt"]
+        receipt_payload = dict(receipt)
+        stored_receipt_sha = _valid_sha256(
+            receipt_payload.pop("preview_receipt_sha256", None)
+        )
+        if not (
+            stored_receipt_sha
+            and hmac.compare_digest(stored_receipt_sha, receipt_sha)
+            and hmac.compare_digest(_stable_sha256(receipt_payload), receipt_sha)
+        ):
+            result.update(status="REPAIR_APPLY_RECEIPT_INTEGRITY_FAILED")
+            return result
+        if receipt.get("apply_allowed") is not True:
+            result.update(status="REPAIR_APPLY_RECEIPT_NOT_AUTHORIZED")
+            return result
         if int(self._clock()) > int(receipt["expires_at_epoch"]):
             result.update(status="REPAIR_APPLY_PREVIEW_EXPIRED")
             return result
         if not self._controls_safe():
             result.update(status="REPAIR_APPLY_TRADING_CONTROLS_UNSAFE")
             return result
+        if not self._writer_coordination_safe():
+            result.update(status="REPAIR_APPLY_WRITER_COORDINATION_UNSAFE")
+            return result
+        if not callable(self._maintenance_lease):
+            result.update(status="REPAIR_APPLY_MAINTENANCE_LEASE_UNAVAILABLE")
+            return result
         lock = self._registry_lock()
         if lock is None:
             result.update(status="REPAIR_APPLY_REGISTRY_LOCK_UNAVAILABLE")
             return result
+        transaction: dict[str, Any] | None = None
         try:
-            with lock:
-                validation, material = self._build_candidate(
-                    pending["selected_sources"], pending["gross_r_source"]
-                )
-                if material is None:
-                    result["real_registry_accessed"] = bool(
-                        validation.get("real_registry_accessed")
-                    )
-                    result.update(status="REPAIR_APPLY_REVALIDATION_FAILED")
+            maintenance = self._maintenance_lease()
+            if maintenance is None:
+                result.update(status="REPAIR_APPLY_MAINTENANCE_LEASE_UNAVAILABLE")
+                return result
+            with maintenance as permit:
+                if not self._maintenance_permit_safe(permit):
+                    result.update(status="REPAIR_APPLY_MAINTENANCE_PERMIT_INVALID")
                     return result
-                if not (
-                    hmac.compare_digest(
-                        material["source_registry_sha256"], receipt["source_registry_sha256"]
+                with lock:
+                    validation, material = self._build_candidate(
+                        pending["selected_sources"], pending["gross_r_source"]
                     )
-                    and hmac.compare_digest(
-                        material["candidate_registry_sha256"], receipt["candidate_registry_sha256"]
+                    if material is None:
+                        result["real_registry_accessed"] = bool(
+                            validation.get("real_registry_accessed")
+                        )
+                        result.update(status="REPAIR_APPLY_REVALIDATION_FAILED")
+                        return result
+                    if not (
+                        hmac.compare_digest(
+                            material["source_registry_sha256"],
+                            receipt["source_registry_sha256"],
+                        )
+                        and hmac.compare_digest(
+                            material["candidate_registry_sha256"],
+                            receipt["candidate_registry_sha256"],
+                        )
+                        and hmac.compare_digest(
+                            material["conflict_binding_sha256"],
+                            receipt["conflict_binding_sha256"],
+                        )
+                        and hmac.compare_digest(
+                            _stable_sha256(material["gross_r_preservation"]),
+                            receipt["gross_r_preservation_sha256"],
+                        )
+                        and material["changed_paths"] == receipt["changed_paths"]
+                    ):
+                        result.update(
+                            status="REPAIR_APPLY_COMPARE_AND_SWAP_MISMATCH"
+                        )
+                        result["real_registry_accessed"] = True
+                        return result
+                    transaction = self._apply_file_transaction(
+                        material, receipt_sha
                     )
-                    and hmac.compare_digest(
-                        material["conflict_binding_sha256"], receipt["conflict_binding_sha256"]
-                    )
-                ):
-                    result.update(status="REPAIR_APPLY_COMPARE_AND_SWAP_MISMATCH")
-                    result["real_registry_accessed"] = True
-                    return result
-                transaction = self._apply_file_transaction(material, receipt_sha)
         except Exception as exc:
+            if isinstance(transaction, Mapping) and transaction.get(
+                "write_executed"
+            ) is True:
+                result.update(transaction)
+                result.update(
+                    ok=False,
+                    status=(
+                        "REPAIR_APPLY_COMMITTED_MAINTENANCE_RELEASE_FAILED"
+                    ),
+                    reason=type(exc).__name__,
+                    maintenance_lease_release_confirmed=False,
+                )
+                return result
             result.update(status="REPAIR_APPLY_FAILED_CLOSED", reason=type(exc).__name__)
             return result
         result.update(transaction)
+        result["maintenance_lease_release_confirmed"] = True
         if transaction.get("ok") is True:
             with self._state_lock:
                 if receipt_sha in self._pending:

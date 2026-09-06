@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import threading
 import ast
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import trade_registry_closed_identity_conflict_repair_runtime_operation_v1 as operation
 
@@ -88,6 +90,43 @@ def _safe_controls() -> dict:
     }
 
 
+def _safe_writer_coordination() -> dict:
+    return {
+        "enabled": True,
+        "coordination_ready": True,
+        "runtime_activation_allowed": True,
+        "registered_writer_count": 19,
+        "all_writers_registered": True,
+        "inflight_mutations": 0,
+        "shared_lock_backend_ready": True,
+        "maintenance_lease_store_ready": True,
+        "registry_interlock_ready": True,
+        "activation_receipt_verified": True,
+        "source_hashes_verified": True,
+        "rollback_ready": True,
+        "kill_switch_ready": True,
+        "kill_switch_engaged": False,
+    }
+
+
+@contextmanager
+def _safe_maintenance_lease(events=None):
+    if events is not None:
+        events.append("maintenance_enter")
+    try:
+        yield SimpleNamespace(
+            state="QUIESCED",
+            registered_writer_count=19,
+            inflight_mutations=0,
+            shared_lock_acquired=True,
+            maintenance_epoch="a" * 64,
+            lock_namespace_sha256="b" * 64,
+        )
+    finally:
+        if events is not None:
+            events.append("maintenance_exit")
+
+
 def _selections() -> dict:
     return {
         "close_reason": "trade.metadata.exit_reason",
@@ -117,6 +156,8 @@ def _controller(
         trading_controls=controls or _safe_controls,
         target_path=target,
         backup_root=target.parent / "c3_closed_identity_repair_backups",
+        writer_coordination_status=_safe_writer_coordination,
+        maintenance_lease=_safe_maintenance_lease,
         config=operation.ClosedIdentityRepairRuntimeConfigV1(
             apply_enabled=apply_enabled,
             apply_scope_attestation=(
@@ -227,6 +268,8 @@ def test_apply_is_atomic_preserves_unrelated_data_and_is_idempotent(tmp_path) ->
     controller = _controller(target, apply_enabled=True)
     before = json.loads(target.read_text(encoding="utf-8"))
     preview = _preview(controller)
+    assert preview["apply_enabled"] is True
+    assert preview["preview_receipt"]["apply_allowed"] is True
 
     applied = _apply(controller, preview)
     assert applied["ok"] is True
@@ -286,6 +329,98 @@ def test_apply_rejects_expired_preview_drift_and_unsafe_controls(tmp_path) -> No
     assert denied["write_executed"] is False
 
 
+def test_apply_requires_full_writer_coordination_and_quiescent_lease(tmp_path) -> None:
+    target = tmp_path / "coordination" / "trade_registry.json"
+    controller = _controller(target, apply_enabled=True)
+    preview = _preview(controller)
+    before = target.read_bytes()
+
+    controller._writer_coordination_status = None
+    unavailable = _apply(controller, preview)
+    assert unavailable["status"] == "REPAIR_APPLY_WRITER_COORDINATION_UNSAFE"
+    assert unavailable["write_executed"] is False
+
+    unsafe = _safe_writer_coordination()
+    unsafe["inflight_mutations"] = 1
+    controller._writer_coordination_status = lambda: unsafe
+    inflight = _apply(controller, preview)
+    assert inflight["status"] == "REPAIR_APPLY_WRITER_COORDINATION_UNSAFE"
+    assert inflight["write_executed"] is False
+
+    controller._writer_coordination_status = _safe_writer_coordination
+    controller._maintenance_lease = None
+    missing_lease = _apply(controller, preview)
+    assert missing_lease["status"] == "REPAIR_APPLY_MAINTENANCE_LEASE_UNAVAILABLE"
+    assert missing_lease["write_executed"] is False
+
+    @contextmanager
+    def invalid_lease():
+        yield SimpleNamespace(
+            state="DRAINING",
+            registered_writer_count=19,
+            inflight_mutations=0,
+            shared_lock_acquired=True,
+            maintenance_epoch="a" * 64,
+            lock_namespace_sha256="b" * 64,
+        )
+
+    controller._maintenance_lease = invalid_lease
+    invalid_permit = _apply(controller, preview)
+    assert invalid_permit["status"] == "REPAIR_APPLY_MAINTENANCE_PERMIT_INVALID"
+    assert invalid_permit["write_executed"] is False
+    assert target.read_bytes() == before
+
+
+def test_apply_holds_maintenance_lease_for_the_complete_transaction(tmp_path) -> None:
+    target = tmp_path / "lease-scope" / "trade_registry.json"
+    events = []
+    controller = _controller(target, apply_enabled=True)
+    controller._maintenance_lease = lambda: _safe_maintenance_lease(events)
+    controller._fault_injector = lambda step: events.append(step)
+    preview = _preview(controller)
+
+    applied = _apply(controller, preview)
+
+    assert applied["status"] == "REPAIR_TRANSACTION_COMMITTED"
+    assert events[0] == "maintenance_enter"
+    assert events[-1] == "maintenance_exit"
+    assert events.index("maintenance_enter") < events.index("AFTER_BACKUP")
+    assert events.index("AFTER_REPLACE") < events.index("maintenance_exit")
+
+
+def test_apply_reports_commit_truthfully_when_lease_release_fails(tmp_path) -> None:
+    target = tmp_path / "lease-release-failure" / "trade_registry.json"
+    controller = _controller(target, apply_enabled=True)
+
+    @contextmanager
+    def release_failure_lease():
+        yield SimpleNamespace(
+            state="QUIESCED",
+            registered_writer_count=19,
+            inflight_mutations=0,
+            shared_lock_acquired=True,
+            maintenance_epoch="a" * 64,
+            lock_namespace_sha256="b" * 64,
+        )
+        raise RuntimeError("synthetic lease release failure")
+
+    controller._maintenance_lease = release_failure_lease
+    preview = _preview(controller)
+    applied = _apply(controller, preview)
+
+    assert applied["ok"] is False
+    assert (
+        applied["status"]
+        == "REPAIR_APPLY_COMMITTED_MAINTENANCE_RELEASE_FAILED"
+    )
+    assert applied["write_executed"] is True
+    assert applied["registry_write"] is True
+    assert applied["maintenance_lease_release_confirmed"] is False
+    repaired = json.loads(target.read_text(encoding="utf-8"))["closed_trades"][0]
+    assert repaired["close_reason"] == "STOP"
+    assert repaired["gross_r_multiple"] == -1.08850668
+
+
 def test_failure_after_replace_rolls_back_exact_preimage(tmp_path) -> None:
     target = tmp_path / "rollback" / "trade_registry.json"
     before = json.dumps(_registry()).encode("utf-8")
@@ -320,6 +455,69 @@ def test_unknown_or_tampered_preview_is_denied(tmp_path) -> None:
     assert denied["status"] == "REPAIR_APPLY_PREVIEW_REQUIRED"
     assert denied["write_executed"] is False
     assert target.read_bytes() == before
+
+
+def test_apply_requires_attested_config_and_integral_authorized_receipt(tmp_path) -> None:
+    target = tmp_path / "attestation" / "trade_registry.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(_registry()), encoding="utf-8")
+
+    configured_without_attestation = operation.ClosedIdentityRepairRuntimeOperationV1(
+        registry_loader=lambda: json.loads(target.read_text(encoding="utf-8")),
+        conflict_auditor=lambda: _audit_for(
+            json.loads(target.read_text(encoding="utf-8"))
+        ),
+        registry_lock=lambda: threading.RLock(),
+        trading_controls=_safe_controls,
+        target_path=target,
+        backup_root=target.parent / "c3_closed_identity_repair_backups",
+        config=operation.ClosedIdentityRepairRuntimeConfigV1(apply_enabled=True),
+    )
+    snapshot = configured_without_attestation.snapshot()
+    assert snapshot["apply_configured"] is True
+    assert snapshot["apply_scope_attested"] is False
+    assert snapshot["apply_enabled"] is False
+    assert snapshot["default_off"] is True
+    preview = _preview(configured_without_attestation)
+    assert preview["preview_receipt"]["apply_allowed"] is False
+    denied = _apply(configured_without_attestation, preview)
+    assert denied["status"] == "REPAIR_APPLY_SCOPE_ATTESTATION_REQUIRED"
+    assert denied["write_executed"] is False
+
+    controller = _controller(target, apply_enabled=True)
+    preview = _preview(controller)
+    receipt_sha = preview["preview_receipt"]["preview_receipt_sha256"]
+    controller._pending[receipt_sha]["receipt"]["changed_paths"] = [
+        "closed_trades[0].unexpected"
+    ]
+    tampered = _apply(controller, preview)
+    assert tampered["status"] == "REPAIR_APPLY_RECEIPT_INTEGRITY_FAILED"
+    assert tampered["write_executed"] is False
+    assert json.loads(target.read_text(encoding="utf-8")) == _registry()
+
+
+def test_apply_rejects_receipt_that_was_issued_while_default_off(tmp_path) -> None:
+    target = tmp_path / "unauthorized-receipt" / "trade_registry.json"
+    controller = _controller(target, apply_enabled=True)
+    preview = _preview(controller)
+    receipt_sha = preview["preview_receipt"]["preview_receipt_sha256"]
+    receipt = controller._pending[receipt_sha]["receipt"]
+    receipt["apply_allowed"] = False
+    receipt_without_sha = dict(receipt)
+    receipt_without_sha.pop("preview_receipt_sha256")
+    denied_receipt_sha = operation._stable_sha256(receipt_without_sha)
+    receipt["preview_receipt_sha256"] = denied_receipt_sha
+    controller._pending[denied_receipt_sha] = controller._pending.pop(receipt_sha)
+
+    denied = controller.apply(
+        {
+            "ack": operation.APPLY_ACK_V1,
+            "preview_receipt_sha256": denied_receipt_sha,
+        }
+    )
+    assert denied["status"] == "REPAIR_APPLY_RECEIPT_NOT_AUTHORIZED"
+    assert denied["write_executed"] is False
+    assert json.loads(target.read_text(encoding="utf-8")) == _registry()
 
 
 def test_preview_fails_closed_on_conflicting_gross_r_target(tmp_path) -> None:
@@ -409,3 +607,12 @@ def test_main_wires_authenticated_post_only_route_and_default_off_apply() -> Non
     assert "C3_CLOSED_IDENTITY_REPAIR_APPLY_SCOPE" not in source
     assert "ClosedIdentityRepairRuntimeConfigV1()" in source
     assert "C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1 =" in source
+    builder = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_build_c3_closed_identity_repair_runtime_operation_v1"
+    )
+    builder_source = ast.get_source_segment(source, builder)
+    assert "writer_coordination_status=" not in builder_source
+    assert "maintenance_lease=" not in builder_source
