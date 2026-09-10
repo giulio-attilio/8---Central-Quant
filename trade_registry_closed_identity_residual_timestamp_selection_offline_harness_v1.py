@@ -11,7 +11,7 @@ import trade_registry_closed_identity_residual_timestamp_selection_offline_contr
 
 
 TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_TIMESTAMP_SELECTION_OFFLINE_HARNESS_V1_VERSION = (
-    "2026-09-06-TRADE-REGISTRY-CLOSED-IDENTITY-RESIDUAL-TIMESTAMP-SELECTION-OFFLINE-HARNESS-V1"
+    "2026-09-10-TRADE-REGISTRY-CLOSED-IDENTITY-RESIDUAL-TIMESTAMP-SELECTION-OFFLINE-HARNESS-V1.1-43-RECORDS"
 )
 
 
@@ -92,7 +92,7 @@ def run_residual_timestamp_selection_offline_harness_v1() -> dict[str, Any]:
         "input_quarantine_exact": summary.get("input_quarantined_record_count") == 32,
         "selected_exact": summary.get("selected_record_count") == 32,
         "remaining_quarantine_zero": summary.get("remaining_quarantined_record_count") == 0,
-        "all_records_preserved": len(candidate.get("closed_trades") or []) == 42,
+        "all_records_preserved": len(candidate.get("closed_trades") or []) == 43,
         "unrelated_root_preserved": candidate.get("extension") == prior["candidate_registry"]["extension"],
         "never_applicable": result.get("apply_allowed") is False,
         "no_runtime": result.get("runtime_activation_allowed") is False,

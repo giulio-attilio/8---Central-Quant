@@ -10,7 +10,7 @@ import trade_registry_closed_identity_residual_repair_offline_contract_v1 as con
 
 
 TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_OFFLINE_HARNESS_V1_VERSION = (
-    "2026-09-06-TRADE-REGISTRY-CLOSED-IDENTITY-RESIDUAL-REPAIR-OFFLINE-HARNESS-V1"
+    "2026-09-10-TRADE-REGISTRY-CLOSED-IDENTITY-RESIDUAL-REPAIR-OFFLINE-HARNESS-V1.1-43-RECORDS"
 )
 
 
@@ -170,8 +170,19 @@ def build_synthetic_residual_matrix_v1() -> dict[str, Any]:
                 marker="central_open_positions",
             )
         )
+
+    recurrence_moment = base + dt.timedelta(days=63, minutes=43)
+    rows.append(
+        _record(
+            43,
+            bot="FALCON",
+            source="falcon",
+            opened_at=(recurrence_moment + dt.timedelta(seconds=61)).isoformat(),
+            created_at=recurrence_moment.isoformat(timespec="minutes"),
+        )
+    )
     return {
-        "version": "synthetic-residual-42-v1",
+        "version": "synthetic-residual-43-v1.1",
         "open_trades": {"keep": {"unchanged": True}},
         "closed_trades": rows,
         "extension": {"must_remain_exact": True},
@@ -192,13 +203,13 @@ def run_residual_repair_offline_harness_v1() -> dict[str, Any]:
     }
     checks = {
         "input_unchanged": snapshot == original,
-        "record_count_exact": len(snapshot["closed_trades"]) == 42,
-        "residual_count_exact": summary.get("residual_record_count") == 42,
-        "timestamp_equivalence_exact": summary.get("timestamp_aliases_archived") == 10,
+        "record_count_exact": len(snapshot["closed_trades"]) == 43,
+        "residual_count_exact": summary.get("residual_record_count") == 43,
+        "timestamp_equivalence_exact": summary.get("timestamp_aliases_archived") == 11,
         "status_archive_exact": summary.get("status_aliases_archived") == 31,
         "historical_quarantine_exact": summary.get("quarantined_record_count") == 32,
-        "modified_record_count_exact": summary.get("modified_record_count") == 40,
-        "all_records_preserved": len(candidate.get("closed_trades") or []) == 42,
+        "modified_record_count_exact": summary.get("modified_record_count") == 41,
+        "all_records_preserved": len(candidate.get("closed_trades") or []) == 43,
         "unrelated_root_preserved": candidate.get("extension") == original["extension"],
         "two_unmodified_divergent_falcon_rows": {24, 25}.issubset(quarantined_indexes),
         "never_applicable": result.get("apply_allowed") is False,
@@ -218,8 +229,8 @@ TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_OFFLINE_HARNESS_V1_SHA256 = (
     contract.stable_sha256_v1(
         {
             "version": TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_OFFLINE_HARNESS_V1_VERSION,
-            "matrix": "42_SYNTHETIC_RESIDUAL_RECORDS",
-            "expected_timestamp_equivalences": 10,
+            "matrix": "43_SYNTHETIC_RESIDUAL_RECORDS",
+            "expected_timestamp_equivalences": 11,
             "expected_status_archives": 31,
             "expected_quarantined_records": 32,
         }

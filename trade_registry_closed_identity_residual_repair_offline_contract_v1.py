@@ -21,8 +21,10 @@ from zoneinfo import ZoneInfo
 
 
 TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_OFFLINE_CONTRACT_V1_VERSION = (
-    "2026-09-06-TRADE-REGISTRY-CLOSED-IDENTITY-RESIDUAL-REPAIR-OFFLINE-CONTRACT-V1"
+    "2026-09-10-TRADE-REGISTRY-CLOSED-IDENTITY-RESIDUAL-REPAIR-OFFLINE-CONTRACT-V1.1-BOUNDED-64"
 )
+
+TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_HARD_MAX_RECORDS_V1 = 64
 
 _ARCHIVE_KEY = "c3_residual_identity_evidence_v1"
 _UTC = dt.timezone.utc
@@ -125,7 +127,9 @@ def normalize_residual_timestamp_v1(value: Any) -> str:
 @dataclass(frozen=True)
 class ResidualClosedIdentityRepairCapsV1:
     max_closed_records: int = 10_000
-    max_residual_records: int = 42
+    max_residual_records: int = (
+        TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_HARD_MAX_RECORDS_V1
+    )
     predator_epoch_tolerance_seconds: float = 60.0
     minute_boundary_tolerance_seconds: float = 90.0
 
@@ -299,6 +303,8 @@ def build_residual_closed_identity_repair_plan_v1(
         or isinstance(caps.max_residual_records, bool)
         or not isinstance(caps.max_residual_records, int)
         or caps.max_residual_records <= 0
+        or caps.max_residual_records
+        > TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_HARD_MAX_RECORDS_V1
         or isinstance(caps.predator_epoch_tolerance_seconds, bool)
         or not isinstance(caps.predator_epoch_tolerance_seconds, (int, float))
         or not math.isfinite(float(caps.predator_epoch_tolerance_seconds))
@@ -503,6 +509,9 @@ _CONTRACT_DESCRIPTOR = {
     ],
     "status_rule": "PRESERVE_CLOSED_ARCHIVE_CENTRAL_POSITION_STATUS",
     "unproven_policy": "QUARANTINE",
+    "hard_max_residual_records": (
+        TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_HARD_MAX_RECORDS_V1
+    ),
 }
 TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_OFFLINE_CONTRACT_V1_SHA256 = (
     stable_sha256_v1(_CONTRACT_DESCRIPTOR)
@@ -513,6 +522,7 @@ __all__ = [
     "ResidualClosedIdentityRepairCapsV1",
     "TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_OFFLINE_CONTRACT_V1_SHA256",
     "TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_OFFLINE_CONTRACT_V1_VERSION",
+    "TRADE_REGISTRY_CLOSED_IDENTITY_RESIDUAL_REPAIR_HARD_MAX_RECORDS_V1",
     "build_residual_closed_identity_repair_plan_v1",
     "normalize_residual_timestamp_v1",
     "stable_sha256_v1",

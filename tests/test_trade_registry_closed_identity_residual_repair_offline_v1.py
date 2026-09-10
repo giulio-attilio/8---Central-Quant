@@ -46,12 +46,12 @@ def test_safe_aliases_are_archived_exactly_while_canonical_values_are_preserved(
     candidate = result["candidate_registry"]
 
     assert result["summary"] == {
-        "residual_record_count": 42,
-        "timestamp_aliases_archived": 10,
+        "residual_record_count": 43,
+        "timestamp_aliases_archived": 11,
         "status_aliases_archived": 31,
         "quarantined_conflict_count": 32,
         "quarantined_record_count": 32,
-        "modified_record_count": 40,
+        "modified_record_count": 41,
     }
     for action in result["actions"]:
         index = action["registry_index"]
@@ -155,6 +155,43 @@ def test_digest_mismatch_malformed_shape_and_archive_collision_fail_closed():
         assert blocked["runtime_activation_allowed"] is False
         assert blocked["write_executed"] is False
         assert blocked["broker_called"] is False
+
+
+def test_default_cap_accepts_43_and_hard_cap_rejects_65_residual_records():
+    snapshot = harness.build_synthetic_residual_matrix_v1()
+
+    accepted = _plan(snapshot)
+    assert len(snapshot["closed_trades"]) == 43
+    assert accepted["ok"] is True
+    assert accepted["summary"]["residual_record_count"] == 43
+
+    overflow = copy.deepcopy(snapshot)
+    template = snapshot["closed_trades"][-1]
+    for number in range(44, 66):
+        record = copy.deepcopy(template)
+        record["trade_id"] = f"SYNTHETIC:FALCON:{number:02d}"
+        record["symbol"] = f"SYN{number:02d}USDT"
+        overflow["closed_trades"].append(record)
+
+    blocked = _plan(overflow)
+    assert len(overflow["closed_trades"]) == 65
+    assert blocked["ok"] is False
+    assert blocked["reasons"] == ["RESIDUAL_RECORD_CAP_EXCEEDED"]
+    assert blocked["candidate_registry"] is None
+    assert blocked["apply_allowed"] is False
+    assert blocked["runtime_activation_allowed"] is False
+    assert blocked["write_executed"] is False
+    assert blocked["broker_called"] is False
+
+    invalid_override = contract.build_residual_closed_identity_repair_plan_v1(
+        snapshot,
+        expected_snapshot_sha256=contract.stable_sha256_v1(snapshot),
+        caps=contract.ResidualClosedIdentityRepairCapsV1(
+            max_residual_records=65
+        ),
+    )
+    assert invalid_override["ok"] is False
+    assert invalid_override["reasons"] == ["INVALID_REPAIR_CAPS"]
 
 
 def test_contract_has_no_runtime_network_or_filesystem_integration():

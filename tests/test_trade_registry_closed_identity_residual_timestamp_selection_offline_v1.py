@@ -55,7 +55,7 @@ def test_attested_selection_preserves_both_raw_aliases_and_unrelated_fields():
     after_rows = result["candidate_registry"]["closed_trades"]
 
     assert len(result["actions"]) == 32
-    assert len(after_rows) == len(before_rows) == 42
+    assert len(after_rows) == len(before_rows) == 43
     for action in result["actions"]:
         index = action["registry_index"]
         before = before_rows[index]
