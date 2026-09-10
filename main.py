@@ -68464,6 +68464,7 @@ import trade_registry_closed_identity_conflict_repair_runtime_production_startup
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_contract_v2 as c3_authority_provisioning_receipt_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_authenticated_verifier_contract_v2 as c3_authority_provisioning_receipt_authenticated_verifier_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_physical_binding_contract_v2 as c3_authority_provisioning_physical_binding_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_binding_adapter_contract_v1 as c3_production_startup_port_binding_v1
 
 
 _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = None
@@ -68687,6 +68688,116 @@ C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1 = (
     _build_c3_closed_identity_repair_runtime_operation_v1()
 )
 C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1 = _recover_c3_closed_repair_registry_v1()
+
+
+# C3 production-startup port binding V1 — installed dormant, with no reads.
+# These explicit fail-closed sources prevent the dormant binding from being
+# mistaken for production authority before the controlled activation layer is
+# separately configured and attested.
+def _c3_production_startup_state_source_dormant_v1():
+    raise RuntimeError("C3_PRODUCTION_STARTUP_STATE_SOURCE_DORMANT")
+
+
+def _c3_production_seam_binding_source_dormant_v1():
+    raise RuntimeError("C3_PRODUCTION_SEAM_BINDING_SOURCE_DORMANT")
+
+
+def _c3_production_maintenance_completion_source_dormant_v1():
+    raise RuntimeError("C3_PRODUCTION_MAINTENANCE_COMPLETION_SOURCE_DORMANT")
+
+
+def _c3_production_evidence_verifier_source_dormant_v1(evidence, evidence_sha256):
+    raise RuntimeError("C3_PRODUCTION_EVIDENCE_VERIFIER_SOURCE_DORMANT")
+
+
+def _c3_production_startup_callback_source_dormant_v1(permit):
+    raise RuntimeError("C3_PRODUCTION_STARTUP_CALLBACK_SOURCE_DORMANT")
+
+
+_C3_PRODUCTION_STARTUP_PORTS_V1 = None
+_C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1 = None
+_C3_PRODUCTION_STARTUP_PORT_BINDING_V1 = None
+
+
+def _install_c3_production_startup_port_binding_dormant_v1():
+    """Bind disabled runtime ports without invoking providers or changing startup."""
+
+    global _C3_PRODUCTION_STARTUP_PORTS_V1
+    global _C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1
+    global _C3_PRODUCTION_STARTUP_PORT_BINDING_V1
+    try:
+        surface = c3_runtime_seam_v1.C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1
+        ports = c3_production_startup_port_binding_v1.RuntimeProductionStartupPortsV1(
+            atomic_lock=surface.atomic_lock,
+            trading_controls=_c3_closed_identity_repair_trading_controls_v1,
+            startup_state=_c3_production_startup_state_source_dormant_v1,
+            seam_binding_evidence=_c3_production_seam_binding_source_dormant_v1,
+            maintenance_completion_evidence=_c3_production_maintenance_completion_source_dormant_v1,
+            production_evidence_verifier=_c3_production_evidence_verifier_source_dormant_v1,
+            startup_callback=_c3_production_startup_callback_source_dormant_v1,
+            authority_root_sha256=None,
+            synthetic_only=False,
+            runtime_integrated=True,
+        )
+        ports_identity = c3_production_startup_port_binding_v1.runtime_production_startup_ports_identity_sha256_v1(
+            ports
+        )
+        adapter = c3_production_startup_port_binding_v1.RuntimeProductionStartupPortBindingAdapterContractV1(
+            ports=ports,
+            config=c3_production_startup_port_binding_v1.RuntimeProductionStartupPortBindingAdapterConfigV1(
+                enabled=False,
+                dormant_only=True,
+                scope_attestation=c3_production_startup_port_binding_v1.RUNTIME_PRODUCTION_STARTUP_PORT_BINDING_SCOPE_ATTESTATION_V1,
+                expected_ports_identity_sha256=ports_identity,
+            ),
+        )
+        binding = adapter.bind_dormant()
+        _C3_PRODUCTION_STARTUP_PORTS_V1 = ports
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1 = adapter
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_V1 = binding
+        return {
+            "ok": True,
+            "status": "C3_PRODUCTION_STARTUP_PORT_BINDING_INSTALLED_DORMANT",
+            "default_off": True,
+            "providers_invoked": False,
+            "production_authority_configured": False,
+            "activation_possible": False,
+            "gate_default_off": binding.gate.snapshot().get("default_off") is True,
+            "composition_default_off": binding.composition.snapshot().get("default_off")
+            is True,
+            "runtime_behavior_changed": False,
+            "live_allowed": False,
+            "order_submission_authorized": False,
+            "real_registry_accessed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    except Exception as exc:
+        _C3_PRODUCTION_STARTUP_PORTS_V1 = None
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1 = None
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_V1 = None
+        return {
+            "ok": False,
+            "status": "C3_PRODUCTION_STARTUP_PORT_BINDING_DORMANT_BLOCKED",
+            "reason": type(exc).__name__,
+            "default_off": True,
+            "providers_invoked": False,
+            "production_authority_configured": False,
+            "activation_possible": False,
+            "runtime_behavior_changed": False,
+            "live_allowed": False,
+            "order_submission_authorized": False,
+            "real_registry_accessed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+
+
+C3_PRODUCTION_STARTUP_PORT_BINDING_DORMANT_V1 = (
+    _install_c3_production_startup_port_binding_dormant_v1()
+)
 
 if CENTRAL_AUTO_START_RUNTIME:
     start_central_runtime_once()

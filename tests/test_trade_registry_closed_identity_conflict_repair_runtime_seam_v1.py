@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import threading
 from pathlib import Path
 
@@ -108,6 +109,27 @@ def _activation_evidence(**changes):
         seam.controlled_activation_evidence_sha256_v1(evidence)
     )
     return evidence
+
+
+def _install_controlled_for_offline_test(coordinator, **kwargs):
+    """Exercise post-authorization behavior without leaving a runtime binding."""
+
+    previous_authority = seam._controlled_activation_authority_v1
+    previous_interlock = seam._controlled_activation_interlock_v1
+    authority = object()
+    interlock = object()
+    seam._controlled_activation_authority_v1 = authority
+    seam._controlled_activation_interlock_v1 = interlock
+    try:
+        return seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+            coordinator,
+            activation_authority=authority,
+            activation_interlock=interlock,
+            **kwargs,
+        )
+    finally:
+        seam._controlled_activation_authority_v1 = previous_authority
+        seam._controlled_activation_interlock_v1 = previous_interlock
 
 
 def _successful_startup_recovery(permit: dict) -> dict:
@@ -288,6 +310,22 @@ def test_controlled_installer_is_default_off_and_requires_scope() -> None:
         )
 
 
+def test_controlled_installer_requires_runtime_bound_authority() -> None:
+    with pytest.raises(
+        coordinator_module.WriterRuntimeCoordinationBlocked,
+        match="C3_CONTROLLED_ACTIVATION_AUTHORITY_NOT_INSTALLED",
+    ):
+        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+            _enabled_coordinator(),
+            enabled=True,
+            scope_attestation=(
+                seam.C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1
+            ),
+            activation_evidence=_activation_evidence(),
+            kill_switch=lambda: False,
+        )
+
+
 def test_controlled_installer_rejects_tampered_or_unsafe_evidence() -> None:
     coordinator = _enabled_coordinator()
     tampered = _activation_evidence()
@@ -297,7 +335,7 @@ def test_controlled_installer_rejects_tampered_or_unsafe_evidence() -> None:
         coordinator_module.WriterRuntimeCoordinationBlocked,
         match="C3_CONTROLLED_ACTIVATION_EVIDENCE_HASH_MISMATCH",
     ):
-        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        _install_controlled_for_offline_test(
             coordinator,
             enabled=True,
             scope_attestation=(
@@ -317,7 +355,7 @@ def test_controlled_installer_rejects_tampered_or_unsafe_evidence() -> None:
         coordinator_module.WriterRuntimeCoordinationBlocked,
         match="C3_CONTROLLED_ACTIVATION_EVIDENCE_UNSAFE",
     ):
-        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        _install_controlled_for_offline_test(
             coordinator,
             enabled=True,
             scope_attestation=(
@@ -336,7 +374,7 @@ def test_controlled_installer_requires_all_writers_and_clear_kill_switch() -> No
         coordinator_module.WriterRuntimeCoordinationBlocked,
         match="C3_CONTROLLED_ACTIVATION_COORDINATOR_NOT_QUIESCENT",
     ):
-        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        _install_controlled_for_offline_test(
             missing_writers,
             enabled=True,
             scope_attestation=(
@@ -350,7 +388,7 @@ def test_controlled_installer_requires_all_writers_and_clear_kill_switch() -> No
         coordinator_module.WriterRuntimeCoordinationBlocked,
         match="C3_CONTROLLED_ACTIVATION_KILL_SWITCH_ENGAGED",
     ):
-        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        _install_controlled_for_offline_test(
             _enabled_coordinator(),
             enabled=True,
             scope_attestation=(
@@ -365,7 +403,7 @@ def test_controlled_installer_reports_full_vector_and_kill_switch_fails_closed()
     kill_switch = {"engaged": False}
     coordinator = _enabled_coordinator()
     try:
-        status = seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        status = _install_controlled_for_offline_test(
             coordinator,
             enabled=True,
             scope_attestation=(
@@ -469,7 +507,7 @@ def test_interlock_binding_rejects_different_or_replaced_coordinator() -> None:
 def test_incomplete_startup_recovery_keeps_readiness_closed() -> None:
     coordinator = _enabled_coordinator()
     try:
-        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        _install_controlled_for_offline_test(
             coordinator,
             enabled=True,
             scope_attestation=(
@@ -511,7 +549,7 @@ def test_controlled_reinstall_does_not_inherit_startup_recovery() -> None:
     first = _enabled_coordinator()
     second = _enabled_coordinator()
     try:
-        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        _install_controlled_for_offline_test(
             first,
             enabled=True,
             scope_attestation=(
@@ -529,7 +567,7 @@ def test_controlled_reinstall_does_not_inherit_startup_recovery() -> None:
         ] is True
 
         second_status = (
-            seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+            _install_controlled_for_offline_test(
                 second,
                 enabled=True,
                 scope_attestation=(
@@ -577,7 +615,7 @@ def test_synthetic_startup_recovery_cannot_unlock_runtime() -> None:
         return result
 
     try:
-        seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+        _install_controlled_for_offline_test(
             coordinator,
             enabled=True,
             scope_attestation=(
@@ -605,6 +643,19 @@ def test_synthetic_startup_recovery_cannot_unlock_runtime() -> None:
         seam.install_dormant_c3_closed_repair_writer_coordinator_v1(
             coordinator_module.build_closed_repair_writer_runtime_coordinator_v1()
         )
+
+
+def test_startup_recovery_attestation_commit_is_atomic_with_identity_check() -> None:
+    source = inspect.getsource(
+        seam.C3ClosedRepairRuntimeInterlockBindingV1.run_startup_recovery_v1
+    )
+    atomic_commit = source.rsplit("with _prebootstrap_seam_atomic_lock:", 1)[-1]
+    assert "self._require_current_coordinator()" in atomic_commit
+    assert '_controlled_activation_state["startup_recovery_verified"] = True' in atomic_commit
+    assert "status = self.coordination_status()" in atomic_commit
+    assert atomic_commit.index("self._require_current_coordinator()") < atomic_commit.index(
+        '_controlled_activation_state["startup_recovery_verified"] = True'
+    )
 
 
 def test_controlled_installer_remains_unreferenced_by_runtime_main() -> None:

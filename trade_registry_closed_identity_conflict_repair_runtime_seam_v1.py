@@ -12,8 +12,10 @@ import hmac
 import json
 import math
 import re
+import threading
 from contextlib import ContextDecorator
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1 as coordinator_module
@@ -21,6 +23,12 @@ import trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator
 
 C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1 = (
     "C3_CONTROLLED_RUNTIME_ACTIVATION_EXPLICIT_OFFLINE_REVIEW_V1"
+)
+C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_SCOPE_ATTESTATION_V1 = (
+    "C3_CLOSED_REPAIR_EXPLICIT_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1"
+)
+C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_VERSION_V1 = (
+    "2026-09-10-C3-PREBOOTSTRAP-SEAM-CAS-SURFACE-V1"
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROLLED_ACTIVATION_SOURCE_FILES = frozenset(
@@ -39,6 +47,14 @@ _CONTROLLED_ACTIVATION_SOURCE_FILES = frozenset(
 
 
 _coordinator = coordinator_module.build_closed_repair_writer_runtime_coordinator_v1()
+_prebootstrap_seam_atomic_lock = threading.RLock()
+_prebootstrap_writer_guard: Callable[[str], Mapping[str, Any]] | None = None
+# Deliberately unbound in production.  A future, separately authorized runtime
+# composition must pin both exact objects before the controlled installer can
+# be called.  Keeping these sentinels private and unset makes the current seam
+# fail closed even when a caller can manufacture self-consistent evidence.
+_controlled_activation_authority_v1: Any | None = None
+_controlled_activation_interlock_v1: Any | None = None
 _controlled_activation_state: dict[str, Any] = {
     "activation_receipt_verified": False,
     "source_hashes_verified": False,
@@ -107,6 +123,180 @@ def _kill_switch_clear_v1() -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class C3PrebootstrapSeamCasSurfaceConfigV1:
+    enabled: bool = False
+    scope_attestation: str | None = field(default=None, repr=False)
+    synthetic_only: bool = False
+    runtime_integrated: bool = True
+
+
+class C3PrebootstrapSeamCasSurfaceV1:
+    """Default-off atomic surface for a future pre-runtime CAS adapter."""
+
+    module_name = "trade_registry_closed_identity_conflict_repair_runtime_seam_v1"
+
+    def __init__(
+        self, config: C3PrebootstrapSeamCasSurfaceConfigV1 | None = None
+    ) -> None:
+        self._config = config or C3PrebootstrapSeamCasSurfaceConfigV1()
+
+    def __repr__(self) -> str:
+        return "<C3PrebootstrapSeamCasSurfaceV1 protected>"
+
+    @property
+    def atomic_lock(self):
+        return _prebootstrap_seam_atomic_lock
+
+    def snapshot(self) -> dict[str, Any]:
+        enabled = bool(
+            self._config.enabled is True
+            and self._config.scope_attestation
+            == C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_SCOPE_ATTESTATION_V1
+        )
+        return {
+            "ok": enabled,
+            "status": (
+                "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_READY"
+                if enabled
+                else "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_DORMANT_DEFAULT_OFF"
+            ),
+            "version": C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_VERSION_V1,
+            "enabled": enabled,
+            "default_off": not enabled,
+            "writer_guard_bound": _prebootstrap_writer_guard is not None,
+            "synthetic_only": self._config.synthetic_only,
+            "runtime_integrated": self._config.runtime_integrated,
+            "production_ready": False,
+            "live_allowed": False,
+            "runtime_activation_allowed": False,
+            "real_registry_accessed": False,
+            "write_executed": False,
+            "registry_write": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+
+    def _require_enabled(self) -> None:
+        if self._config.enabled is not True:
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_DEFAULT_OFF"
+            )
+        if (
+            self._config.scope_attestation
+            != C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_SCOPE_ATTESTATION_V1
+        ):
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_SCOPE_REQUIRED"
+            )
+
+    def current_coordinator(self):
+        self._require_enabled()
+        with _prebootstrap_seam_atomic_lock:
+            return _coordinator
+
+    def coordinator_identity_sha256(self, coordinator: Any) -> str:
+        self._require_enabled()
+        if type(coordinator) is not coordinator_module.ClosedRepairWriterRuntimeCoordinatorV1:
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_PREBOOTSTRAP_SEAM_CAS_COORDINATOR_TYPE_INVALID"
+            )
+        identity = (
+            f"{type(coordinator).__module__}:{type(coordinator).__qualname__}:"
+            f"{id(coordinator)}"
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
+        receipt = dict(payload)
+        receipt["receipt_sha256"] = hashlib.sha256(
+            _canonical_json(receipt).encode("utf-8")
+        ).hexdigest()
+        return receipt
+
+    def compare_and_swap_coordinator(
+        self, *, expected_coordinator: Any, replacement_coordinator: Any
+    ) -> dict[str, Any]:
+        self._require_enabled()
+        if type(replacement_coordinator) is not coordinator_module.ClosedRepairWriterRuntimeCoordinatorV1:
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_PREBOOTSTRAP_SEAM_CAS_COORDINATOR_TYPE_INVALID"
+            )
+        global _coordinator
+        with _prebootstrap_seam_atomic_lock:
+            if _coordinator is not expected_coordinator:
+                raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                    "C3_PREBOOTSTRAP_SEAM_CAS_COORDINATOR_IDENTITY_MISMATCH"
+                )
+            _coordinator = replacement_coordinator
+            return self._receipt(
+                {
+                    "ok": True,
+                    "status": "C3_PREBOOTSTRAP_REAL_SEAM_COORDINATOR_CAS_COMMITTED",
+                    "coordinator_identity_sha256": self.coordinator_identity_sha256(
+                        replacement_coordinator
+                    ),
+                    "synthetic_only": self._config.synthetic_only,
+                    "runtime_integrated": self._config.runtime_integrated,
+                    "write_executed": False,
+                    "registry_write": False,
+                }
+            )
+
+    def current_writer_guard(self):
+        self._require_enabled()
+        with _prebootstrap_seam_atomic_lock:
+            return _prebootstrap_writer_guard
+
+    def compare_and_swap_writer_guard(
+        self,
+        *,
+        expected_guard: Any,
+        replacement_guard: Any,
+        atomic_lock: Any,
+    ) -> dict[str, Any]:
+        self._require_enabled()
+        if atomic_lock is not _prebootstrap_seam_atomic_lock:
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_PREBOOTSTRAP_SEAM_CAS_ATOMIC_LOCK_IDENTITY_MISMATCH"
+            )
+        if replacement_guard is not None and not callable(replacement_guard):
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_PREBOOTSTRAP_SEAM_CAS_WRITER_GUARD_INVALID"
+            )
+        global _prebootstrap_writer_guard
+        with _prebootstrap_seam_atomic_lock:
+            if _prebootstrap_writer_guard is not expected_guard:
+                raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                    "C3_PREBOOTSTRAP_SEAM_CAS_WRITER_GUARD_IDENTITY_MISMATCH"
+                )
+            _prebootstrap_writer_guard = replacement_guard
+            return self._receipt(
+                {
+                    "ok": True,
+                    "status": "C3_PREBOOTSTRAP_REAL_SEAM_WRITER_GUARD_CAS_COMMITTED",
+                    "registered_writer_count": len(
+                        coordinator_module.canonical_runtime_writer_inventory_v1()
+                    ),
+                    "all_writers_routed": replacement_guard is not None,
+                    "dynamic_at_invocation": True,
+                    "same_atomic_lock": True,
+                    "synthetic_only": self._config.synthetic_only,
+                    "runtime_integrated": self._config.runtime_integrated,
+                    "write_executed": False,
+                    "registry_write": False,
+                }
+            )
+
+
+def build_dormant_c3_prebootstrap_seam_cas_surface_v1():
+    """Build the runtime-visible surface with all mutation authority disabled."""
+
+    return C3PrebootstrapSeamCasSurfaceV1()
+
+
 def install_dormant_c3_closed_repair_writer_coordinator_v1(
     coordinator: coordinator_module.ClosedRepairWriterRuntimeCoordinatorV1,
 ) -> dict[str, Any]:
@@ -121,9 +311,10 @@ def install_dormant_c3_closed_repair_writer_coordinator_v1(
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
             "C3_RUNTIME_ACTIVATION_FORBIDDEN_BY_DORMANT_SEAM"
         )
-    _coordinator = coordinator
-    _reset_controlled_activation_state_v1()
-    return c3_closed_repair_writer_coordination_status_v1()
+    with _prebootstrap_seam_atomic_lock:
+        _coordinator = coordinator
+        _reset_controlled_activation_state_v1()
+        return c3_closed_repair_writer_coordination_status_v1()
 
 
 def install_controlled_c3_closed_repair_writer_coordinator_v1(
@@ -133,6 +324,8 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     scope_attestation: str | None = None,
     activation_evidence: Mapping[str, Any] | None = None,
     kill_switch: Callable[[], bool] | None = None,
+    activation_authority: Any = None,
+    activation_interlock: Any = None,
 ) -> dict[str, Any]:
     """Install an enabled coordinator only from complete, hash-bound evidence.
 
@@ -151,6 +344,22 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     ):
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
             "C3_CONTROLLED_ACTIVATION_SCOPE_ATTESTATION_REQUIRED"
+        )
+    if _controlled_activation_authority_v1 is None:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_AUTHORITY_NOT_INSTALLED"
+        )
+    if activation_authority is not _controlled_activation_authority_v1:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_AUTHORITY_IDENTITY_MISMATCH"
+        )
+    if _controlled_activation_interlock_v1 is None:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_INTERLOCK_NOT_INSTALLED"
+        )
+    if activation_interlock is not _controlled_activation_interlock_v1:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_INTERLOCK_IDENTITY_MISMATCH"
         )
     if type(coordinator) is not coordinator_module.ClosedRepairWriterRuntimeCoordinatorV1:
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
@@ -277,25 +486,28 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
             "C3_CONTROLLED_ACTIVATION_COORDINATOR_NOT_QUIESCENT"
         )
 
-    previous = _coordinator
-    previous_state = dict(_controlled_activation_state)
-    _coordinator = coordinator
-    _reset_controlled_activation_state_v1()
-    _controlled_activation_state.update(
-        {
-            field: True for field in required_true if field != "activation_requested"
-        }
-    )
-    _controlled_activation_state["kill_switch"] = kill_switch
-    status = c3_closed_repair_writer_coordination_status_v1()
-    if not _c3_closed_repair_base_coordination_safe_v1(status):
-        _coordinator = previous
-        _controlled_activation_state.clear()
-        _controlled_activation_state.update(previous_state)
-        raise coordinator_module.WriterRuntimeCoordinationBlocked(
-            "C3_CONTROLLED_ACTIVATION_POST_INSTALL_ATTESTATION_FAILED"
+    with _prebootstrap_seam_atomic_lock:
+        previous = _coordinator
+        previous_state = dict(_controlled_activation_state)
+        _coordinator = coordinator
+        _reset_controlled_activation_state_v1()
+        _controlled_activation_state.update(
+            {
+                field: True
+                for field in required_true
+                if field != "activation_requested"
+            }
         )
-    return status
+        _controlled_activation_state["kill_switch"] = kill_switch
+        status = c3_closed_repair_writer_coordination_status_v1()
+        if not _c3_closed_repair_base_coordination_safe_v1(status):
+            _coordinator = previous
+            _controlled_activation_state.clear()
+            _controlled_activation_state.update(previous_state)
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_CONTROLLED_ACTIVATION_POST_INSTALL_ATTESTATION_FAILED"
+            )
+        return status
 
 
 def startup_recovery_attestation_sha256_v1(
@@ -447,37 +659,42 @@ class C3ClosedRepairRuntimeInterlockBindingV1:
                     "C3_STARTUP_RECOVERY_ATTESTATION_INVALID"
                 )
 
-        self._require_current_coordinator()
-        _controlled_activation_state["startup_recovery_verified"] = True
-        _controlled_activation_state[
-            "startup_recovery_attestation_sha256"
-        ] = supplied_sha
-        _controlled_activation_state["startup_recovery_summary"] = {
-            "prepared_transactions_before": counts[0],
-            "resolved_transactions_before": counts[1],
-            "prepared_transactions_after": counts[2],
-            "resolved_transactions_after": counts[3],
-            "unresolved_transactions_after": counts[4],
-            "real_registry_accessed": attestation[
-                "real_registry_accessed"
-            ],
-            "write_executed": attestation["write_executed"],
-            "registry_write": attestation["registry_write"],
-            "network_accessed": False,
-            "broker_called": False,
-            "no_order_sent": True,
-        }
-        status = self.coordination_status()
-        if status.get("coordination_ready") is not True:
-            _controlled_activation_state["startup_recovery_verified"] = False
+        with _prebootstrap_seam_atomic_lock:
+            # The current-coordinator check, attestation commit and readiness
+            # projection are one atomic operation.  A replacement coordinator
+            # therefore cannot inherit a recovery completed by another
+            # instance between the check and the state update.
+            self._require_current_coordinator()
+            _controlled_activation_state["startup_recovery_verified"] = True
             _controlled_activation_state[
                 "startup_recovery_attestation_sha256"
-            ] = None
-            _controlled_activation_state["startup_recovery_summary"] = None
-            raise coordinator_module.WriterRuntimeCoordinationBlocked(
-                "C3_STARTUP_RECOVERY_POSTCONDITION_FAILED"
-            )
-        return status
+            ] = supplied_sha
+            _controlled_activation_state["startup_recovery_summary"] = {
+                "prepared_transactions_before": counts[0],
+                "resolved_transactions_before": counts[1],
+                "prepared_transactions_after": counts[2],
+                "resolved_transactions_after": counts[3],
+                "unresolved_transactions_after": counts[4],
+                "real_registry_accessed": attestation[
+                    "real_registry_accessed"
+                ],
+                "write_executed": attestation["write_executed"],
+                "registry_write": attestation["registry_write"],
+                "network_accessed": False,
+                "broker_called": False,
+                "no_order_sent": True,
+            }
+            status = self.coordination_status()
+            if status.get("coordination_ready") is not True:
+                _controlled_activation_state["startup_recovery_verified"] = False
+                _controlled_activation_state[
+                    "startup_recovery_attestation_sha256"
+                ] = None
+                _controlled_activation_state["startup_recovery_summary"] = None
+                raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                    "C3_STARTUP_RECOVERY_POSTCONDITION_FAILED"
+                )
+            return status
 
 
 def bind_c3_closed_repair_runtime_interlocks_v1(
@@ -510,18 +727,39 @@ class _DormantWriterMutationContextV1(ContextDecorator):
         return type(self)(self._writer_id)
 
     def __enter__(self):
-        if _coordinator.enabled and not _kill_switch_clear_v1():
-            raise coordinator_module.WriterRuntimeCoordinationBlocked(
-                "C3_RUNTIME_KILL_SWITCH_ENGAGED"
-            )
-        if _coordinator.enabled and _controlled_activation_state.get(
-            "startup_recovery_verified"
-        ) is not True:
-            raise coordinator_module.WriterRuntimeCoordinationBlocked(
-                "C3_RUNTIME_STARTUP_RECOVERY_REQUIRED"
-            )
-        self._context = _coordinator.mutation(self._writer_id)
-        return self._context.__enter__()
+        with _prebootstrap_seam_atomic_lock:
+            if _prebootstrap_writer_guard is not None:
+                try:
+                    guarded = _prebootstrap_writer_guard(self._writer_id)
+                except Exception as exc:
+                    raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                        getattr(
+                            exc,
+                            "reason",
+                            "C3_PREBOOTSTRAP_SEAM_WRITER_GUARD_BLOCKED",
+                        )
+                    ) from exc
+                if not (
+                    isinstance(guarded, Mapping)
+                    and guarded.get("ok") is True
+                    and guarded.get("writer_id") == self._writer_id
+                    and guarded.get("runtime_activation_allowed") is False
+                ):
+                    raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                        "C3_PREBOOTSTRAP_SEAM_WRITER_GUARD_ATTESTATION_INVALID"
+                    )
+            if _coordinator.enabled and not _kill_switch_clear_v1():
+                raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                    "C3_RUNTIME_KILL_SWITCH_ENGAGED"
+                )
+            if _coordinator.enabled and _controlled_activation_state.get(
+                "startup_recovery_verified"
+            ) is not True:
+                raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                    "C3_RUNTIME_STARTUP_RECOVERY_REQUIRED"
+                )
+            self._context = _coordinator.mutation(self._writer_id)
+            return self._context.__enter__()
 
     def __exit__(self, exc_type, exc, traceback):
         if self._context is None:
@@ -649,11 +887,22 @@ def c3_closed_repair_writer_coordination_status_v1() -> dict[str, Any]:
     }
 
 
+C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1 = (
+    build_dormant_c3_prebootstrap_seam_cas_surface_v1()
+)
+
+
 __all__ = [
+    "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_SCOPE_ATTESTATION_V1",
+    "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_VERSION_V1",
+    "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1",
     "C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1",
+    "C3PrebootstrapSeamCasSurfaceConfigV1",
+    "C3PrebootstrapSeamCasSurfaceV1",
     "C3ClosedRepairRuntimeInterlockBindingV1",
     "_c3_closed_repair_writer_mutation_v1",
     "bind_c3_closed_repair_runtime_interlocks_v1",
+    "build_dormant_c3_prebootstrap_seam_cas_surface_v1",
     "c3_closed_repair_writer_coordination_status_v1",
     "controlled_activation_evidence_sha256_v1",
     "install_controlled_c3_closed_repair_writer_coordinator_v1",

@@ -190,15 +190,27 @@ def run_offline_runtime_startup_recovery_adapter_harness_v1() -> dict[str, Any]:
         coordinator.register_all_declared_writers()
         captured: dict[str, Any] = {}
         try:
-            pending = runtime_seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
-                coordinator,
-                enabled=True,
-                scope_attestation=(
-                    runtime_seam.C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1
-                ),
-                activation_evidence=_activation_evidence(),
-                kill_switch=lambda: False,
-            )
+            previous_authority = runtime_seam._controlled_activation_authority_v1
+            previous_interlock = runtime_seam._controlled_activation_interlock_v1
+            offline_authority = object()
+            offline_interlock = object()
+            runtime_seam._controlled_activation_authority_v1 = offline_authority
+            runtime_seam._controlled_activation_interlock_v1 = offline_interlock
+            try:
+                pending = runtime_seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
+                    coordinator,
+                    enabled=True,
+                    scope_attestation=(
+                        runtime_seam.C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1
+                    ),
+                    activation_evidence=_activation_evidence(),
+                    kill_switch=lambda: False,
+                    activation_authority=offline_authority,
+                    activation_interlock=offline_interlock,
+                )
+            finally:
+                runtime_seam._controlled_activation_authority_v1 = previous_authority
+                runtime_seam._controlled_activation_interlock_v1 = previous_interlock
             def capture(permit):
                 result = adapter(permit)
                 captured.update(result)
