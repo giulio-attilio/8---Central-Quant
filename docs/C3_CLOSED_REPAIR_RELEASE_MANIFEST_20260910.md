@@ -3,23 +3,25 @@
 Data de corte: 2026-09-10
 Branch: `codex/c3-closed-repair-preview-only`
 Base: `15d612971b585d9867e67a65dd68cee305193053`
-Estado: **CANDIDATO LOCAL — DEFAULT-OFF — NÃO APROVADO PARA LIVE**
+Payload commit: `9ca444f53f5060cf149ef1010413f3f6285f01a6`
+Estado: **CANDIDATO REMOTO — DEFAULT-OFF — NÃO APROVADO PARA LIVE**
 
 ## Identidade do payload
 
-- Arquivos do payload: 258
-- Bytes totais: 6910419
-- Linhas totais: 158496
-- SHA-256 do inventário canônico: `99479cc3e244fe4178abcf96944c35971a1e38235c40079295ec452adf147101`
+- Arquivos do payload: 298
+- Bytes totais: 7387270
+- Linhas totais: 170440
+- SHA-256 do inventário canônico: `2798612bd0cbccccdd00e890c21b31fe57095c29c86fbe6ca2209278e951e557`
 - Formato do inventário canônico: uma linha UTF-8 por arquivo, ordenada por caminho, no formato `<sha256> <bytes> <linhas> <caminho>\n`.
 - Este manifesto não integra o digest do payload para evitar autorreferência.
 
 ## Evidência validada
 
-- 258 arquivos analisados sintaticamente.
+- 298 arquivos inventariados e vinculados ao payload commit.
 - 1138 testes aprovados.
 - 56 subtestes aprovados.
-- Um aviso não bloqueante.
+- Regressão adicional pós-endurecimento: 590 testes aprovados.
+- Um aviso não bloqueante de cache local do pytest.
 - Preflight estático aprovado.
 - 19 de 19 writers coordenados; zero divergências de assinatura ou âncora.
 - Controller binding sintético aprovado.
@@ -38,20 +40,19 @@ Estado: **CANDIDATO LOCAL — DEFAULT-OFF — NÃO APROVADO PARA LIVE**
 
 ## Bloqueios atuais para produção
 
-1. O payload e este manifesto ainda não possuem commit isolado.
-2. Nenhum push ou deploy deste candidato foi realizado.
-3. Autoridade raiz autenticada, estado de revogação e referências de recovery não foram provisionados em produção.
-4. Caminhos físicos e garantias de atomic replace/fsync não foram verificados em produção.
-5. O runtime binding permanece deliberadamente não satisfeito.
-6. Startup recovery de produção não foi executado para este candidato.
-7. O preflight controlado de produção não foi executado após o futuro deploy.
-8. Live e envio de ordens permanecem proibidos.
+1. O payload commit foi enviado à branch remota, mas ainda não foi implantado.
+2. Autoridade raiz autenticada, estado de revogação e referências de recovery não foram provisionados em produção.
+3. Caminhos físicos e garantias de atomic replace/fsync não foram verificados em produção.
+4. O runtime binding permanece deliberadamente não satisfeito.
+5. Startup recovery de produção não foi executado para este candidato.
+6. O preflight controlado de produção não foi executado após o futuro deploy.
+7. Live e envio de ordens permanecem proibidos.
 
 ## Ordem controlada do release
 
-1. Confirmar no staging que os 258 arquivos do payload e este manifesto pertencem ao commit isolado.
-2. Criar commit isolado, preservando todos os gates default-off.
-3. Fazer push e deploy com trading real desativado e sem execução de ordens.
+1. Confirmar que os 298 arquivos do inventário correspondem ao payload commit remoto.
+2. Versionar e enviar este manifesto complementar, preservando todos os gates default-off.
+3. Fazer deploy com trading real desativado e sem execução de ordens.
 4. Confirmar o artefato implantado pelo commit e pelos hashes de fonte.
 5. Provisionar autoridade e referências persistentes sob janela de manutenção, sem ativar trading.
 6. Executar bootstrap/recovery idempotente e confirmar zero transações pendentes.
@@ -72,19 +73,44 @@ Estado: **CANDIDATO LOCAL — DEFAULT-OFF — NÃO APROVADO PARA LIVE**
 
 ## 01 — Entrada, gates e readiness
 
-Arquivos: 13 · bytes: 3324742 · linhas: 74999
+Arquivos: 38 · bytes: 3676440 · linhas: 83585
 
 | SHA-256 | Bytes | Linhas | Caminho |
 |---|---:|---:|---|
-| `f9752365930c34237d6e9829e66f3f31337e7fd93e66b50f656eab7d69bf8549` | 3051506 | 68700 | `main.py` |
+| `890ed44428496b6fa3d87cfd92fbea1881d663d1614f4bbffef684ebb04a04e9` | 3056498 | 68811 | `main.py` |
+| `a0ba1e1df229eb82d0b9f642cead1c9ea5410a16fcd3edb62e2d87db123d04bb` | 23192 | 550 | `trade_registry_closed_identity_conflict_repair_prebootstrap_maintenance_bridge_v1.py` |
+| `b994b7da84a240ef8926b9cb99804a53164c1208b7926f48d8231d52f9d09e06` | 14949 | 404 | `trade_registry_closed_identity_conflict_repair_prebootstrap_maintenance_harness_v1.py` |
+| `a94a83e83fd662de9d52a04b45072fd27f714564563dac0581427cce6b0e69d3` | 12259 | 297 | `trade_registry_closed_identity_conflict_repair_prebootstrap_maintenance_only_coordinator_entrypoint_contract_v1.py` |
+| `afde865cbd0d9e9de9b143d3dd7701503fc82c3e9af50f48ae618a4c36b86f04` | 10923 | 264 | `trade_registry_closed_identity_conflict_repair_prebootstrap_maintenance_only_coordinator_entrypoint_harness_v1.py` |
+| `19b2a8cb819ebaf4750f7ff40984656f6cf62f2f3d35855b846f73d1ae8c9d42` | 11322 | 278 | `trade_registry_closed_identity_conflict_repair_prebootstrap_physical_coordinator_port_adapter_contract_v1.py` |
+| `6a0cdb1d1850949cbf41ae388d8e3bfb0fd392ffa6cff2837aec5892aafdd756` | 12182 | 289 | `trade_registry_closed_identity_conflict_repair_prebootstrap_physical_coordinator_port_adapter_harness_v1.py` |
+| `1dcad6fef916d7294bc3dd4a9be707a4512bf70de804184a203efd1bf595cec9` | 15244 | 381 | `trade_registry_closed_identity_conflict_repair_prebootstrap_real_seam_cas_adapter_contract_v1.py` |
+| `5d401d1bb756e977510c272cce2103fd83a7483052c512e47e269aba793bb3fc` | 10851 | 262 | `trade_registry_closed_identity_conflict_repair_prebootstrap_real_seam_cas_adapter_harness_v1.py` |
+| `5d9914617d7dee343d2ddb09d3fdea7913eb9d502cfd76fe26f0a668b141df33` | 16724 | 425 | `trade_registry_closed_identity_conflict_repair_prebootstrap_runtime_maintenance_adapter_contract_v1.py` |
+| `1459aae621dc3639cd513d630dc2df8df95ed488c83ed34285c77af5e89e77a8` | 12502 | 323 | `trade_registry_closed_identity_conflict_repair_prebootstrap_runtime_maintenance_adapter_harness_v1.py` |
+| `4621bcc9d273a2e75b33a5d266431f384cc1195437b7ac847c2036d415ac79c2` | 15180 | 384 | `trade_registry_closed_identity_conflict_repair_prebootstrap_seam_cas_port_contract_v1.py` |
+| `aed235ab3aa811ba2bdecddffbecb1e0b8645bd2e95ef6f2e560291703922bc9` | 8806 | 217 | `trade_registry_closed_identity_conflict_repair_prebootstrap_seam_cas_port_harness_v1.py` |
+| `ea32ed1a428563c3696583ea73a67d8b197f5392f1d5541a8fcbd62961897f21` | 19228 | 449 | `trade_registry_closed_identity_conflict_repair_prebootstrap_startup_only_seam_installation_contract_v1.py` |
+| `317f22f08082d756ddd0cf79733d8721c3957f5aeee623b76778ba383303d384` | 10390 | 268 | `trade_registry_closed_identity_conflict_repair_prebootstrap_startup_only_seam_installation_harness_v1.py` |
 | `d70988283c7359d6f2c3f653331952eb577983f25d4b5978c324b685cd940847` | 10011 | 241 | `trade_registry_closed_identity_conflict_repair_runtime_handoff_raw_transaction_invocation_seam_harness_v1.py` |
 | `a810914c6dd95a69a28bba012996699cb744c1ecd62f9f7207c2c2ebdb0f90f8` | 44039 | 1032 | `trade_registry_closed_identity_conflict_repair_runtime_handoff_raw_transaction_invocation_seam_v1.py` |
 | `6995a7542a268d9c07ac3519c2f7fe99776dd925e4d5a392ecc710a0419c6d99` | 26834 | 611 | `trade_registry_closed_identity_conflict_repair_runtime_installation_preflight_projection_harness_v1.py` |
+| `f1455001c0dc99a82bae9ab8c94f1e406049d58ee26e1a21419bf614cf68afbe` | 15334 | 368 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_composition_contract_v1.py` |
+| `60543110ca3be829957aedda920b590972fcb2b7fc8014d715941be177533e4e` | 14403 | 355 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_composition_harness_v1.py` |
+| `04164d6a02e30a3fc0d28fd64cd7926ac8ee70334ea92b12ea6bb79f7cc41cef` | 14006 | 299 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_controlled_activation_interlock_contract_v1.py` |
+| `eaae0643f241b3c8a95c1492bdc8473a21e22cf54888df689bace266f0d06490` | 7261 | 172 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_controlled_activation_interlock_harness_v1.py` |
+| `3c24bcf8b8a80e9064095f54ad09a86439c8d0a7f6f3518e1cf590911c5d2492` | 15334 | 352 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_binding_adapter_contract_v1.py` |
+| `7d45fee963d16f7dc413df5c0b9eb65d78b8b868b919b75181db32af5d99134f` | 5963 | 161 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_binding_adapter_harness_v1.py` |
+| `0e7420d63911509b85bf8508f4fe983942138d28b23090c41cf44ddb0fb5c48e` | 13599 | 344 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_sources_contract_v1.py` |
+| `792a651dbede84f65f3cf4fa68724489efea87d1962000ebede5f0694f0d9c2c` | 8729 | 215 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_sources_harness_v1.py` |
 | `ed86ec184ebe77fc3110420caaa9649333a1aa5df87828f1eba6f00cc0b05055` | 16761 | 426 | `trade_registry_closed_identity_conflict_repair_runtime_readiness_binding_contract_v1.py` |
 | `b4b79e8913c987d25e358f9248afd67ceb209f241e51a78acef459f74d0f23e2` | 8298 | 194 | `trade_registry_closed_identity_conflict_repair_runtime_readiness_binding_harness_v1.py` |
 | `deb0bb59235f02b6427725ced7e03411f8b140bd55fc5505435fce6f6b07beb3` | 21441 | 517 | `trade_registry_closed_identity_conflict_repair_runtime_readiness_preflight_patch_plan_contract_v1.py` |
 | `8f36da4774d34aacadcc9a440209ca21f68a85798f5560c432eb74d63db842ea` | 10268 | 241 | `trade_registry_closed_identity_conflict_repair_runtime_readiness_preflight_patch_plan_harness_v1.py` |
-| `ec7a3caecf86f68dd5422ccf1aa2471ff28c58e0c0543379b63ca664eb6a6668` | 26334 | 662 | `trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py` |
+| `8c36c5695066ce4f213cf7fe06c0b459b2c7764ac8fd1024bef1dd087cbaf7ce` | 37156 | 911 | `trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py` |
+| `a64eb2f3738cbcc54d2337296a62a059c1b37717f3fe2c32a44cb2cabff21097` | 14881 | 346 | `trade_registry_closed_identity_conflict_repair_runtime_startup_admission_composition_harness_v1.py` |
+| `bda5a2a23f69998cfd3b3f5297d719b7f6fc9f6c5c2111b0ad5f64c7e4a22ad1` | 21705 | 547 | `trade_registry_closed_identity_conflict_repair_runtime_startup_admission_gate_contract_v1.py` |
+| `9851db0a6d308c0805dc2477d2042c4463dcd296d9cf475c5b11f97b35b3f47d` | 10917 | 276 | `trade_registry_closed_identity_conflict_repair_runtime_startup_admission_gate_harness_v1.py` |
 | `47123e749373e23c46fe240d8f2189742bf00c889fe744a2096b31e9655ee18a` | 46651 | 1164 | `trade_registry_closed_identity_conflict_repair_runtime_static_preflight_v1.py` |
 | `566dbf502630a80b94d529c8595028e6b1cd50cd2f81c1547f04de1c00f5cbc6` | 19779 | 405 | `trade_registry_closed_identity_conflict_repair_runtime_writer_source_anchor_contract_v1.py` |
 | `304d7e453037b947d5efb3518bbf148f32093db14f67effa028da6513f55cb90` | 21683 | 382 | `trade_registry_closed_identity_conflict_repair_runtime_writer_transaction_placement_contract_v1.py` |
@@ -191,7 +217,7 @@ Arquivos: 38 · bytes: 888178 · linhas: 18956
 
 ## 05 — Startup recovery e autoridade
 
-Arquivos: 70 · bytes: 1132844 · linhas: 26674
+Arquivos: 70 · bytes: 1133618 · linhas: 26686
 
 | SHA-256 | Bytes | Linhas | Caminho |
 |---|---:|---:|---|
@@ -261,14 +287,14 @@ Arquivos: 70 · bytes: 1132844 · linhas: 26674
 | `537da88eda6dc53d9a469eb6c64c898784101381748087f9d20be21ce7e18135` | 15668 | 363 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_six_port_evidence_builder_composition_offline_v1.py` |
 | `276d76009d8052939cb6f786ab24f78dffd2e41f7cf09337781de4b36f372b75` | 6277 | 142 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_terminal_receipt_normalizer_reference_offline_harness_v1.py` |
 | `b5506629b84bd4f15ec3121fa9523ad33004a6739fb714263c83ef41b2338576` | 11342 | 275 | `trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_terminal_receipt_normalizer_reference_offline_v1.py` |
-| `e7e3d4496a180a0030d93909e5fe69321737cc90a790712aee5502618c274feb` | 12747 | 299 | `trade_registry_closed_identity_conflict_repair_runtime_startup_recovery_adapter_offline_harness_v1.py` |
+| `a84a918636e683624506cd470ff26615ef544e90e4bd5b648585f6c7ee6d39bd` | 13521 | 311 | `trade_registry_closed_identity_conflict_repair_runtime_startup_recovery_adapter_offline_harness_v1.py` |
 | `0535304127885830f9ac7038e25c3aed73dac43ad26f6beeb4c971cd8c36734d` | 22568 | 522 | `trade_registry_closed_identity_conflict_repair_runtime_startup_recovery_adapter_offline_v1.py` |
 | `b13ca999551adada457ed551168e8ab2d6e68157c3d73d54ecde3b1cfe167847` | 20089 | 477 | `trade_registry_closed_identity_conflict_repair_runtime_startup_recovery_production_provider_binding_contract_v1.py` |
 | `3aed0d79962735c0be1e86465be97515e4fc0a6ad2fbc924f1216c6716e7596c` | 6243 | 137 | `trade_registry_closed_identity_conflict_repair_runtime_startup_recovery_production_provider_binding_harness_v1.py` |
 
 ## 06 — Testes
 
-Arquivos: 97 · bytes: 823201 · linhas: 20204
+Arquivos: 112 · bytes: 947580 · linhas: 23550
 
 | SHA-256 | Bytes | Linhas | Caminho |
 |---|---:|---:|---|
@@ -280,6 +306,13 @@ Arquivos: 97 · bytes: 823201 · linhas: 20204
 | `90588fec63a553f8cdfd9c8b33b8eaf072a81ab714e0014bb51f5ed76686ccd7` | 4047 | 94 | `tests/test_trade_registry_closed_identity_conflict_repair_durable_raw_transaction_backend_startup_recovery_v2.py` |
 | `5718f6d63772bdc76fc9f8e495613a70cf3ef28eb80ae9a91c6aea053bb482f5` | 5434 | 127 | `tests/test_trade_registry_closed_identity_conflict_repair_durable_raw_transaction_backend_writer_coordination_compatibility_harness_v2.py` |
 | `968440750be9524cba6eec5145c047359bdaa2101588f6354f63309e5c780fe0` | 10797 | 271 | `tests/test_trade_registry_closed_identity_conflict_repair_durable_raw_transaction_backend_writer_coordination_compatibility_v2.py` |
+| `6057037c18bc3830e3c70302f2e618fb783b82baae1fe7e846dd89cc632be185` | 8908 | 248 | `tests/test_trade_registry_closed_identity_conflict_repair_prebootstrap_maintenance_only_coordinator_entrypoint_v1.py` |
+| `ccc41965d624a21f7c0707ad723ca8f9c1be53206ebedffb2cddd623bb3c3a62` | 11161 | 322 | `tests/test_trade_registry_closed_identity_conflict_repair_prebootstrap_maintenance_v1.py` |
+| `6caec48830250a99dafc5802b28d0e750de26b46314a384bde5cf027927ce2b0` | 7577 | 225 | `tests/test_trade_registry_closed_identity_conflict_repair_prebootstrap_physical_coordinator_port_adapter_v1.py` |
+| `fa0d22b1aff868fee0d8b8c7ee3353bdfaa11a0f324f1d993859724067959fc1` | 7282 | 174 | `tests/test_trade_registry_closed_identity_conflict_repair_prebootstrap_real_seam_cas_adapter_v1.py` |
+| `78993a624cb2e4f9c25ffa018ed587f42568255646800f8d45e1527087ca8514` | 10800 | 295 | `tests/test_trade_registry_closed_identity_conflict_repair_prebootstrap_runtime_maintenance_adapter_v1.py` |
+| `7f99733652692d7ac20ebcfd304f05bad17d28308ad18af6b6a0c2fc1b9f8cf1` | 11396 | 280 | `tests/test_trade_registry_closed_identity_conflict_repair_prebootstrap_seam_cas_port_v1.py` |
+| `9f84669a51c114ca6dddea7bc1f6d8e104dade27058eefed5a8314eace2e3582` | 10352 | 310 | `tests/test_trade_registry_closed_identity_conflict_repair_prebootstrap_startup_only_seam_installation_v1.py` |
 | `2a3dee7785e37553e6625b2f3d9776d954c0b5b3181a63f5d6fb10f46df13db0` | 10204 | 281 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_apply_schema_static_conformance_v1.py` |
 | `39387e694b4376e90ae657c86d88a99a5e997716b7f96dc59ca48efadf0ff097` | 11156 | 319 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_controlled_authorization_v1.py` |
 | `b84321aa0cccfc280749c5d016564be81f85338f30fd2ed2035c7ebb57830eea` | 12011 | 353 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_controlled_repair_package_v1.py` |
@@ -330,6 +363,11 @@ Arquivos: 97 · bytes: 823201 · linhas: 20204
 | `d933e076e6b4f7409ec9b9426a75b19e4c5f6792522b7f09d3d6146f4bc803b9` | 20143 | 400 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_invocation_envelope_v1.py` |
 | `0afdb7302dbe98c4339b514a3dbf4c8120cb9a138773a047a83ee86a7826855f` | 10002 | 228 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_provider_startup_recovery_bridge_offline_v1.py` |
 | `ced689d6b168cf1430b78d80d591c3033ddb67c0ada1eb0fdf2c78f1a7137732` | 16936 | 410 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_provider_store_adapter_binding_v1.py` |
+| `80ca6032bceb5ffd6b84a154de2d82ed998f895ffbe06b6c2abd0e5fd0ece1f9` | 5759 | 153 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_composition_v1.py` |
+| `0f0c6b914a7b358a87e8e6b91a377e7fa87153b0220f4397ed9de1daaa873cf6` | 6366 | 166 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_controlled_activation_interlock_v1.py` |
+| `a1404ad6f60213f289acbfc07d1d7f7916835d2a87ed35bb40013ef957d16773` | 4238 | 114 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_dormant_main_binding_v1.py` |
+| `74cc2f6a5e25cd6f7b1a50ed8f19f71a77232e07d7dec7c8965254b96fec6059` | 5463 | 140 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_binding_adapter_v1.py` |
+| `009bcd504c79ff213e6a81cdb3b7230c69eb88e0466250de8658fce1b9c8d54f` | 6193 | 172 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_sources_v1.py` |
 | `96690b65a51e22b2cd7b9922e4bf55b08bfc33c4487a50dc839ac4de3cc40f75` | 12115 | 302 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_authority_binding_v1.py` |
 | `295cdd2731f963785f36315df1969fa4d17976f853b9f0dd6e52b03b98842123` | 4862 | 119 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_boundary_v2.py` |
 | `a9f369e1301b7155725ecd26348fcd0d55733c5fb461bfaa05a5b06c0af7ea27` | 4667 | 110 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_production_adapters_v2.py` |
@@ -362,7 +400,10 @@ Arquivos: 97 · bytes: 823201 · linhas: 20204
 | `5928d72054aeaab9d866e1cd36cc29b9209ef89f87931621df8b2235d8cc9717` | 10331 | 225 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_terminal_receipt_normalizer_reference_offline_v1.py` |
 | `373c4c179e7921844202f5c44639eae651d0cd1fc4ea2a2467d12f9d111e2fbc` | 10070 | 277 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_readiness_binding_v1.py` |
 | `4396008e8d5db1b5cfaafccc7dd54c877a0095bb6edcb0fed9a339e320e011cb` | 10386 | 268 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_readiness_preflight_patch_plan_v1.py` |
-| `234373ba1300e96ce96e4f9160f2eef5dfa7eae790b707367326275878b1f063` | 22021 | 613 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py` |
+| `d6a440fca0a690ebb3d434d8cdbb3786c8fd8592bd299ffde77070eac770d171` | 10969 | 299 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_seam_prebootstrap_cas_surface_v1.py` |
+| `70c431f0a76f2fee40c2b00a42e3b113ab16295ba0258fb41f3c7f97af8a8ca9` | 23914 | 664 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py` |
+| `ff641b2f1931cd49bfe0c65ec58b46aef526f2695483f877c929a381b639351f` | 5831 | 137 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_startup_admission_composition_v1.py` |
+| `a6e69c7bc4d67678bb724e9ccbc179e7b2ef032ff08b928f7d847718cd3e62cb` | 10191 | 260 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_startup_admission_gate_v1.py` |
 | `2f183a6dd676d964d25d64fa5322a6c895a09f2ebf5eaf1cf31879c40c9b7788` | 9537 | 232 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_startup_recovery_adapter_offline_v1.py` |
 | `e5be52b6d3532471a829b40485d8399a5d0b98dc10dcc91f713cd7b9152beec8` | 8997 | 210 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_startup_recovery_production_provider_binding_v1.py` |
 | `431bc37919868fd40c53b36f94032b8cdb99d76ea26554721409454660ca770f` | 26221 | 652 | `tests/test_trade_registry_closed_identity_conflict_repair_runtime_static_preflight_v1.py` |
