@@ -48,6 +48,9 @@ _controlled_activation_state: dict[str, Any] = {
     "rollback_ready": False,
     "kill_switch_ready": False,
     "kill_switch": None,
+    "startup_recovery_verified": False,
+    "startup_recovery_attestation_sha256": None,
+    "startup_recovery_summary": None,
 }
 
 
@@ -87,6 +90,9 @@ def _reset_controlled_activation_state_v1() -> None:
             "rollback_ready": False,
             "kill_switch_ready": False,
             "kill_switch": None,
+            "startup_recovery_verified": False,
+            "startup_recovery_attestation_sha256": None,
+            "startup_recovery_summary": None,
         }
     )
 
@@ -274,6 +280,7 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     previous = _coordinator
     previous_state = dict(_controlled_activation_state)
     _coordinator = coordinator
+    _reset_controlled_activation_state_v1()
     _controlled_activation_state.update(
         {
             field: True for field in required_true if field != "activation_requested"
@@ -281,7 +288,7 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     )
     _controlled_activation_state["kill_switch"] = kill_switch
     status = c3_closed_repair_writer_coordination_status_v1()
-    if status.get("coordination_ready") is not True:
+    if not _c3_closed_repair_base_coordination_safe_v1(status):
         _coordinator = previous
         _controlled_activation_state.clear()
         _controlled_activation_state.update(previous_state)
@@ -289,6 +296,209 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
             "C3_CONTROLLED_ACTIVATION_POST_INSTALL_ATTESTATION_FAILED"
         )
     return status
+
+
+def startup_recovery_attestation_sha256_v1(
+    attestation: Mapping[str, Any],
+) -> str:
+    """Hash a sanitized recovery result without trusting its supplied digest."""
+
+    if not isinstance(attestation, Mapping):
+        raise TypeError("attestation must be a mapping")
+    payload = {
+        key: value
+        for key, value in attestation.items()
+        if key != "startup_recovery_attestation_sha256"
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _c3_closed_repair_base_coordination_safe_v1(
+    status: Mapping[str, Any],
+) -> bool:
+    return bool(
+        isinstance(status, Mapping)
+        and status.get("enabled") is True
+        and status.get("registered_writer_count") == 19
+        and status.get("all_writers_registered") is True
+        and status.get("inflight_mutations") == 0
+        and status.get("shared_lock_backend_ready") is True
+        and status.get("maintenance_lease_store_ready") is True
+        and status.get("registry_interlock_ready") is True
+        and status.get("activation_receipt_verified") is True
+        and status.get("source_hashes_verified") is True
+        and status.get("rollback_ready") is True
+        and status.get("kill_switch_ready") is True
+        and status.get("kill_switch_engaged") is False
+    )
+
+
+class C3ClosedRepairRuntimeInterlockBindingV1:
+    """Bind status, maintenance and recovery to one exact coordinator object."""
+
+    __slots__ = ("_bound_coordinator", "_bound_startup_recovery")
+
+    def __init__(
+        self,
+        coordinator: coordinator_module.ClosedRepairWriterRuntimeCoordinatorV1,
+        *,
+        startup_recovery: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    ) -> None:
+        if not callable(startup_recovery):
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_STARTUP_RECOVERY_DEPENDENCY_REQUIRED"
+            )
+        self._bound_coordinator = coordinator
+        self._bound_startup_recovery = startup_recovery
+
+    def __repr__(self) -> str:
+        return "<C3ClosedRepairRuntimeInterlockBindingV1 protected>"
+
+    def _require_current_coordinator(self) -> None:
+        if self._bound_coordinator is not _coordinator:
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_RUNTIME_INTERLOCK_BINDING_STALE"
+            )
+
+    def coordination_status(self) -> dict[str, Any]:
+        self._require_current_coordinator()
+        return c3_closed_repair_writer_coordination_status_v1()
+
+    def maintenance_lease(self):
+        self._require_current_coordinator()
+        status = self.coordination_status()
+        if not _c3_closed_repair_base_coordination_safe_v1(status):
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_RUNTIME_INTERLOCKS_NOT_READY"
+            )
+        return self._bound_coordinator.maintenance_lease()
+
+    def run_startup_recovery_v1(self) -> dict[str, Any]:
+        """Recover under the same maintenance lease, then unlock readiness."""
+
+        self._require_current_coordinator()
+        with self.maintenance_lease() as permit:
+            permit_evidence = {
+                "maintenance_epoch": permit.maintenance_epoch,
+                "state": permit.state,
+                "lock_namespace_sha256": permit.lock_namespace_sha256,
+                "registered_writer_count": permit.registered_writer_count,
+                "inflight_mutations": permit.inflight_mutations,
+                "shared_lock_acquired": permit.shared_lock_acquired,
+            }
+            try:
+                recovered = self._bound_startup_recovery(dict(permit_evidence))
+                if not isinstance(recovered, Mapping):
+                    raise TypeError("recovery result must be a mapping")
+                attestation = json.loads(_canonical_json(dict(recovered)))
+                supplied_sha = str(
+                    attestation.get("startup_recovery_attestation_sha256")
+                    or ""
+                ).lower().strip()
+                expected_sha = startup_recovery_attestation_sha256_v1(
+                    attestation
+                )
+            except Exception as exc:
+                raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                    "C3_STARTUP_RECOVERY_FAILED_CLOSED"
+                ) from exc
+            counts = (
+                attestation.get("prepared_transactions_before"),
+                attestation.get("resolved_transactions_before"),
+                attestation.get("prepared_transactions_after"),
+                attestation.get("resolved_transactions_after"),
+                attestation.get("unresolved_transactions_after"),
+            )
+            valid = bool(
+                all(type(value) is int and value >= 0 for value in counts)
+                and counts[2:] == (0, 0, 0)
+                and attestation.get("ok") is True
+                and attestation.get("wal_inspected") is True
+                and attestation.get("transaction_log_inspected") is True
+                and attestation.get("prepared_transactions_inspected") is True
+                and attestation.get("resolved_transactions_inspected") is True
+                and attestation.get("recovery_completed") is True
+                and attestation.get("reconciliation_completed") is True
+                and attestation.get("maintenance_epoch")
+                == permit.maintenance_epoch
+                and attestation.get("lock_namespace_sha256")
+                == permit.lock_namespace_sha256
+                and type(attestation.get("real_registry_accessed")) is bool
+                and attestation.get("filesystem_accessed") is True
+                and type(attestation.get("write_executed")) is bool
+                and type(attestation.get("registry_write")) is bool
+                and (
+                    attestation.get("registry_write") is False
+                    or attestation.get("write_executed") is True
+                )
+                and attestation.get("network_accessed") is False
+                and attestation.get("broker_called") is False
+                and attestation.get("no_order_sent") is True
+                and attestation.get("synthetic_only") is False
+                and attestation.get("temporary_storage_only") is False
+                and attestation.get("production_authority") is True
+                and attestation.get("production_ready") is True
+                and attestation.get("runtime_integrated") is True
+                and _SHA256_RE.fullmatch(supplied_sha)
+                and hmac.compare_digest(supplied_sha, expected_sha)
+            )
+            if not valid:
+                raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                    "C3_STARTUP_RECOVERY_ATTESTATION_INVALID"
+                )
+
+        self._require_current_coordinator()
+        _controlled_activation_state["startup_recovery_verified"] = True
+        _controlled_activation_state[
+            "startup_recovery_attestation_sha256"
+        ] = supplied_sha
+        _controlled_activation_state["startup_recovery_summary"] = {
+            "prepared_transactions_before": counts[0],
+            "resolved_transactions_before": counts[1],
+            "prepared_transactions_after": counts[2],
+            "resolved_transactions_after": counts[3],
+            "unresolved_transactions_after": counts[4],
+            "real_registry_accessed": attestation[
+                "real_registry_accessed"
+            ],
+            "write_executed": attestation["write_executed"],
+            "registry_write": attestation["registry_write"],
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+        status = self.coordination_status()
+        if status.get("coordination_ready") is not True:
+            _controlled_activation_state["startup_recovery_verified"] = False
+            _controlled_activation_state[
+                "startup_recovery_attestation_sha256"
+            ] = None
+            _controlled_activation_state["startup_recovery_summary"] = None
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_STARTUP_RECOVERY_POSTCONDITION_FAILED"
+            )
+        return status
+
+
+def bind_c3_closed_repair_runtime_interlocks_v1(
+    coordinator: coordinator_module.ClosedRepairWriterRuntimeCoordinatorV1,
+    *,
+    startup_recovery: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+) -> C3ClosedRepairRuntimeInterlockBindingV1:
+    """Capture the exact installed coordinator for all runtime interlocks."""
+
+    if (
+        type(coordinator)
+        is not coordinator_module.ClosedRepairWriterRuntimeCoordinatorV1
+        or coordinator is not _coordinator
+    ):
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_RUNTIME_INTERLOCK_COORDINATOR_IDENTITY_MISMATCH"
+        )
+    return C3ClosedRepairRuntimeInterlockBindingV1(
+        coordinator,
+        startup_recovery=startup_recovery,
+    )
 
 
 class _DormantWriterMutationContextV1(ContextDecorator):
@@ -303,6 +513,12 @@ class _DormantWriterMutationContextV1(ContextDecorator):
         if _coordinator.enabled and not _kill_switch_clear_v1():
             raise coordinator_module.WriterRuntimeCoordinationBlocked(
                 "C3_RUNTIME_KILL_SWITCH_ENGAGED"
+            )
+        if _coordinator.enabled and _controlled_activation_state.get(
+            "startup_recovery_verified"
+        ) is not True:
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_RUNTIME_STARTUP_RECOVERY_REQUIRED"
             )
         self._context = _coordinator.mutation(self._writer_id)
         return self._context.__enter__()
@@ -363,8 +579,13 @@ def c3_closed_repair_writer_coordination_status_v1() -> dict[str, Any]:
                 _controlled_activation_state.get("rollback_ready")
             ),
             "kill_switch_ready": kill_switch_ready,
+            "startup_recovery_verified": bool(
+                _controlled_activation_state.get(
+                    "startup_recovery_verified"
+                )
+            ),
         }
-        ready = bool(
+        base_ready = bool(
             fields["registered_writer_count"] == 19
             and fields["all_writers_registered"] is True
             and fields["inflight_mutations"] == 0
@@ -381,18 +602,33 @@ def c3_closed_repair_writer_coordination_status_v1() -> dict[str, Any]:
                 )
             )
         )
+        ready = bool(
+            base_ready and fields["startup_recovery_verified"] is True
+        )
         return {
             "ok": ready,
             "status": (
                 "C3_WRITER_COORDINATION_READY"
                 if ready
-                else "C3_WRITER_COORDINATION_BLOCKED"
+                else (
+                    "C3_WRITER_COORDINATION_STARTUP_RECOVERY_REQUIRED"
+                    if base_ready
+                    else "C3_WRITER_COORDINATION_BLOCKED"
+                )
             ),
             "installed": True,
             **fields,
             "coordination_ready": ready,
             "runtime_activation_allowed": ready,
             "kill_switch_engaged": not kill_switch_ready,
+            "startup_recovery_attestation_sha256": (
+                _controlled_activation_state.get(
+                    "startup_recovery_attestation_sha256"
+                )
+            ),
+            "startup_recovery_summary": _controlled_activation_state.get(
+                "startup_recovery_summary"
+            ),
             "real_registry_accessed": False,
             "network_accessed": False,
             "broker_called": False,
@@ -415,9 +651,12 @@ def c3_closed_repair_writer_coordination_status_v1() -> dict[str, Any]:
 
 __all__ = [
     "C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1",
+    "C3ClosedRepairRuntimeInterlockBindingV1",
     "_c3_closed_repair_writer_mutation_v1",
+    "bind_c3_closed_repair_runtime_interlocks_v1",
     "c3_closed_repair_writer_coordination_status_v1",
     "controlled_activation_evidence_sha256_v1",
     "install_controlled_c3_closed_repair_writer_coordinator_v1",
     "install_dormant_c3_closed_repair_writer_coordinator_v1",
+    "startup_recovery_attestation_sha256_v1",
 ]

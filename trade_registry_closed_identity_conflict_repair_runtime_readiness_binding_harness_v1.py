@@ -145,7 +145,7 @@ def run_synthetic_c3_runtime_readiness_binding_harness_v1(
         and first.get("no_order_sent") is True
         and isinstance(receipt, dict)
         and receipt.get("source_attestation_count") == 4
-        and receipt.get("required_predicate_count") == 13
+        and receipt.get("required_predicate_count") == 14
         and receipt.get("writer_count") == 19
         and receipt.get("runtime_binding_satisfied") is False
         and receipt.get("activation_allowed") is False

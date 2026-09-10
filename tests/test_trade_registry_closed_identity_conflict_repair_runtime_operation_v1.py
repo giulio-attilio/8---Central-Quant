@@ -104,6 +104,7 @@ def _safe_writer_coordination() -> dict:
         "activation_receipt_verified": True,
         "source_hashes_verified": True,
         "rollback_ready": True,
+        "startup_recovery_verified": True,
         "kill_switch_ready": True,
         "kill_switch_engaged": False,
     }
@@ -346,6 +347,13 @@ def test_apply_requires_full_writer_coordination_and_quiescent_lease(tmp_path) -
     inflight = _apply(controller, preview)
     assert inflight["status"] == "REPAIR_APPLY_WRITER_COORDINATION_UNSAFE"
     assert inflight["write_executed"] is False
+
+    unrecovered = _safe_writer_coordination()
+    unrecovered["startup_recovery_verified"] = False
+    controller._writer_coordination_status = lambda: unrecovered
+    recovery_required = _apply(controller, preview)
+    assert recovery_required["status"] == "REPAIR_APPLY_WRITER_COORDINATION_UNSAFE"
+    assert recovery_required["write_executed"] is False
 
     controller._writer_coordination_status = _safe_writer_coordination
     controller._maintenance_lease = None
@@ -614,5 +622,95 @@ def test_main_wires_authenticated_post_only_route_and_default_off_apply() -> Non
         and node.name == "_build_c3_closed_identity_repair_runtime_operation_v1"
     )
     builder_source = ast.get_source_segment(source, builder)
-    assert "writer_coordination_status=" not in builder_source
-    assert "maintenance_lease=" not in builder_source
+    assert (
+        "writer_coordination_status=selected_interlocks.coordination_status"
+        in builder_source
+    )
+    assert (
+        "maintenance_lease=selected_interlocks.maintenance_lease"
+        in builder_source
+    )
+    assert "C3ClosedRepairRuntimeInterlockBindingV1" in builder_source
+
+
+def test_main_startup_recovery_is_deferred_and_fails_closed_until_drained() -> None:
+    source = (Path(__file__).resolve().parents[1] / "main.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    recovery = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_recover_c3_closed_repair_registry_v1"
+    )
+    recovery_source = ast.get_source_segment(source, recovery)
+
+    assert "C3_DORMANT_STARTUP_RECOVERY_NOT_REQUIRED" not in source
+    assert "C3_DORMANT_STARTUP_RECOVERY_DEFERRED_DEFAULT_OFF" in recovery_source
+    assert "run_startup_recovery_v1" in recovery_source
+    assert "run_startup_recovery_v1()" in recovery_source
+    assert '"readiness_allowed": False' in recovery_source
+    assert '"clean": False' in recovery_source
+    assert '"writers_blocked_during_recovery": True' in recovery_source
+    assert '"status": "C3_STARTUP_RECOVERY_COMPLETED"' in recovery_source
+
+    class SyntheticInterlocks:
+        def __init__(self, status: dict, recovered: dict | None = None) -> None:
+            self.status = status
+            self.recovered = recovered
+
+        def coordination_status(self) -> dict:
+            return dict(self.status)
+
+        def run_startup_recovery_v1(self) -> dict:
+            if self.recovered is None:
+                raise RuntimeError("BOUND_STARTUP_RECOVERY_UNAVAILABLE")
+            return dict(self.recovered)
+
+    isolated = ast.fix_missing_locations(
+        ast.Module(body=[recovery], type_ignores=[])
+    )
+    namespace = {
+        "c3_runtime_seam_v1": SimpleNamespace(
+            C3ClosedRepairRuntimeInterlockBindingV1=SyntheticInterlocks
+        )
+    }
+    exec(compile(isolated, "<c3-startup-recovery>", "exec"), namespace)
+    recover = namespace["_recover_c3_closed_repair_registry_v1"]
+
+    dormant = recover(
+        interlocks=SyntheticInterlocks({"enabled": False})
+    )
+    assert dormant["ok"] is True
+    assert dormant["clean"] is False
+    assert dormant["readiness_allowed"] is False
+    assert dormant["real_registry_accessed"] is False
+    assert dormant["write_executed"] is False
+
+    missing_dependency = recover(
+        interlocks=SyntheticInterlocks({"enabled": True})
+    )
+    assert missing_dependency["ok"] is False
+    assert missing_dependency["clean"] is False
+    assert missing_dependency["readiness_allowed"] is False
+
+    completed = recover(
+        interlocks=SyntheticInterlocks(
+            {"enabled": True},
+            {
+                "coordination_ready": True,
+                "startup_recovery_attestation_sha256": "a" * 64,
+                "startup_recovery_summary": {
+                    "real_registry_accessed": True,
+                    "write_executed": True,
+                },
+            },
+        ),
+    )
+    assert completed["ok"] is True
+    assert completed["clean"] is True
+    assert completed["readiness_allowed"] is True
+    assert completed["writers_blocked_during_recovery"] is True
+    assert completed["real_registry_accessed"] is True
+    assert completed["write_executed"] is True

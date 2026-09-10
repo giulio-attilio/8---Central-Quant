@@ -585,6 +585,7 @@ class ClosedIdentityRepairRuntimeOperationV1:
             and status.get("activation_receipt_verified") is True
             and status.get("source_hashes_verified") is True
             and status.get("rollback_ready") is True
+            and status.get("startup_recovery_verified") is True
             and status.get("kill_switch_ready") is True
             and status.get("kill_switch_engaged") is False
         )

@@ -29,6 +29,14 @@ REQUIRED_SOURCE_KEYS_V1 = (
     "trade_registry_closed_identity_conflict_repair_raw_transaction_store_production_v1.py",
     "trade_registry_closed_identity_conflict_repair_writer_invocation_adapter_v1.py",
     "trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_physical_store_reference_v2.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_bridge_v2.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_boundary_v2.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_production_adapters_v2.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_manifest_contract_v2.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_contract_v2.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_authenticated_verifier_contract_v2.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_physical_binding_contract_v2.py",
 )
 
 _WRITER_MUTATION_MARKER = "_c3_closed_repair_writer_mutation_v1"
@@ -49,16 +57,90 @@ _LIVE_PREFLIGHT_REQUIRED_C3_VECTOR = (
     ("activation_receipt_verified", True),
     ("source_hashes_verified", True),
     ("rollback_ready", True),
+    ("startup_recovery_verified", True),
     ("kill_switch_ready", True),
 )
 _PRODUCTION_STORE_MODULE = (
     "trade_registry_closed_identity_conflict_repair_raw_transaction_store_production_v1"
+)
+_RESOLVED_AUTHORITY_PHYSICAL_STORE_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_physical_store_reference_v2"
+)
+_RESOLVED_AUTHORITY_STARTUP_BRIDGE_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_bridge_v2"
+)
+_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BUILDER = (
+    "build_dormant_resolved_authority_startup_recovery_bridge_v2"
+)
+_RESOLVED_AUTHORITY_STARTUP_BRIDGE_GLOBAL = (
+    "C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2"
+)
+_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_boundary_v2"
+)
+_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_BUILDER = (
+    "build_dormant_authenticated_persistent_authority_boundary_v2"
+)
+_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_GLOBAL = (
+    "C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2"
+)
+_AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_production_adapters_v2"
+)
+_AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_BUILDER = (
+    "build_dormant_authenticated_persistent_authority_production_adapters_v2"
+)
+_AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_GLOBAL = (
+    "C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2"
+)
+_AUTHORITY_PROVISIONING_MANIFEST_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_manifest_contract_v2"
+)
+_AUTHORITY_PROVISIONING_MANIFEST_BUILDER = (
+    "build_dormant_authority_provisioning_manifest_contract_v2"
+)
+_AUTHORITY_PROVISIONING_MANIFEST_GLOBAL = (
+    "C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2"
+)
+_AUTHORITY_PROVISIONING_RECEIPT_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_contract_v2"
+)
+_AUTHORITY_PROVISIONING_RECEIPT_BUILDER = (
+    "build_dormant_authority_provisioning_receipt_contract_v2"
+)
+_AUTHORITY_PROVISIONING_RECEIPT_GLOBAL = (
+    "C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_CONTRACT_V2"
+)
+_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_authenticated_verifier_contract_v2"
+)
+_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_BUILDER = (
+    "build_dormant_authenticated_provisioning_receipt_verifier_v2"
+)
+_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_GLOBAL = (
+    "C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_V2"
+)
+_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_MODULE = (
+    "trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_physical_binding_contract_v2"
+)
+_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_BUILDER = (
+    "build_dormant_authority_provisioning_physical_binding_contract_v2"
+)
+_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_GLOBAL = (
+    "C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_CONTRACT_V2"
 )
 _REQUIRED_RUNTIME_MODULES = frozenset(
     {
         "trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1",
         "trade_registry_closed_identity_conflict_repair_writer_invocation_adapter_v1",
         _PRODUCTION_STORE_MODULE,
+        _RESOLVED_AUTHORITY_STARTUP_BRIDGE_MODULE,
+        _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_MODULE,
+        _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_MODULE,
+        _AUTHORITY_PROVISIONING_MANIFEST_MODULE,
+        _AUTHORITY_PROVISIONING_RECEIPT_MODULE,
+        _AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_MODULE,
+        _AUTHORITY_PROVISIONING_PHYSICAL_BINDING_MODULE,
     }
 )
 _PRODUCTION_CAPABILITY_SPECS = {
@@ -85,8 +167,61 @@ _PRODUCTION_CAPABILITY_SPECS = {
         "builder_name": "build_production_raw_transaction_store_v1",
     },
 }
+_RESOLVED_AUTHORITY_CAPABILITY_SPECS = {
+    _RESOLVED_AUTHORITY_PHYSICAL_STORE_MODULE: {
+        "class_name": "ResolvedAuthorityPhysicalStoreReferenceV2",
+        "required_methods": frozenset(
+            {
+                "open_offline",
+                "recover_offline",
+                "read_resolved_records_offline",
+                "snapshot",
+            }
+        ),
+        "builder_name": "build_dormant_resolved_authority_physical_store_reference_v2",
+    },
+    _RESOLVED_AUTHORITY_STARTUP_BRIDGE_MODULE: {
+        "class_name": "ResolvedAuthorityStartupRecoveryBridgeV2",
+        "required_methods": frozenset({"__call__", "snapshot"}),
+        "builder_name": _RESOLVED_AUTHORITY_STARTUP_BRIDGE_BUILDER,
+    },
+    _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_MODULE: {
+        "class_name": "AuthenticatedPersistentAuthorityBoundaryV2",
+        "required_methods": frozenset({"__call__", "snapshot"}),
+        "builder_name": _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_BUILDER,
+    },
+    _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_MODULE: {
+        "class_name": "DormantAuthenticatedPersistentAuthorityProductionAdaptersV2",
+        "required_methods": frozenset({"snapshot"}),
+        "builder_name": _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_BUILDER,
+    },
+    _AUTHORITY_PROVISIONING_MANIFEST_MODULE: {
+        "class_name": "DormantAuthorityProvisioningManifestContractV2",
+        "required_methods": frozenset({"define_offline"}),
+        "builder_name": _AUTHORITY_PROVISIONING_MANIFEST_BUILDER,
+    },
+    _AUTHORITY_PROVISIONING_RECEIPT_MODULE: {
+        "class_name": "DormantAuthorityProvisioningReceiptContractV2",
+        "required_methods": frozenset({"issue_offline"}),
+        "builder_name": _AUTHORITY_PROVISIONING_RECEIPT_BUILDER,
+    },
+    _AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_MODULE: {
+        "class_name": "DormantAuthenticatedProvisioningReceiptVerifierV2",
+        "required_methods": frozenset({"verify_offline"}),
+        "builder_name": _AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_BUILDER,
+    },
+    _AUTHORITY_PROVISIONING_PHYSICAL_BINDING_MODULE: {
+        "class_name": "DormantAuthorityProvisioningPhysicalBindingContractV2",
+        "required_methods": frozenset({"bind_offline"}),
+        "builder_name": _AUTHORITY_PROVISIONING_PHYSICAL_BINDING_BUILDER,
+    },
+}
 _RUNTIME_MODULE_SOURCE_KEYS = {
-    module_name: f"{module_name}.py" for module_name in _REQUIRED_RUNTIME_MODULES
+    module_name: f"{module_name}.py"
+    for module_name in (
+        set(_PRODUCTION_CAPABILITY_SPECS)
+        | set(_RESOLVED_AUTHORITY_CAPABILITY_SPECS)
+    )
 }
 _PRODUCTION_BUILDER_NAMES = frozenset(
     spec["builder_name"] for spec in _PRODUCTION_CAPABILITY_SPECS.values()
@@ -169,9 +304,11 @@ def _production_capability_details(
     function_maps: Mapping[
         str, dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]]
     ],
+    specs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     details: dict[str, dict[str, Any]] = {}
-    for module_name, spec in _PRODUCTION_CAPABILITY_SPECS.items():
+    selected_specs = specs or _PRODUCTION_CAPABILITY_SPECS
+    for module_name, spec in selected_specs.items():
         source_key = _RUNTIME_MODULE_SOURCE_KEYS[module_name]
         tree = trees[source_key]
         class_name = str(spec["class_name"])
@@ -501,6 +638,11 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
     production_capabilities = _production_capability_details(
         trees, function_maps
     )
+    resolved_authority_capabilities = _production_capability_details(
+        trees,
+        function_maps,
+        _RESOLVED_AUTHORITY_CAPABILITY_SPECS,
+    )
     incapable_runtime_modules = sorted(
         module_name
         for module_name, capability in production_capabilities.items()
@@ -516,6 +658,19 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
         not incapable_runtime_modules,
         incapable_modules=incapable_runtime_modules,
         capabilities=production_capabilities,
+    )
+    incapable_resolved_authority_modules = sorted(
+        module_name
+        for module_name, capability in resolved_authority_capabilities.items()
+        if capability["ok"] is not True
+    )
+    add(
+        "C3_RESOLVED_AUTHORITY_PHYSICAL_REFERENCE_CAPABLE",
+        not incapable_resolved_authority_modules,
+        incapable_modules=incapable_resolved_authority_modules,
+        capabilities=resolved_authority_capabilities,
+        temporary_synthetic_reference_only=True,
+        production_ready=False,
     )
     production_store_capable = production_capabilities[
         _PRODUCTION_STORE_MODULE
@@ -536,6 +691,27 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
     )
     provider_line = _first_line(top_calls, _PROVIDER_INSTALL_MARKER)
     recovery_line = _first_line(top_calls, _STARTUP_RECOVERY_MARKER)
+    resolved_bridge_builder_line = _first_line(
+        top_calls, _RESOLVED_AUTHORITY_STARTUP_BRIDGE_BUILDER
+    )
+    authenticated_boundary_builder_line = _first_line(
+        top_calls, _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_BUILDER
+    )
+    authenticated_adapters_builder_line = _first_line(
+        top_calls, _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_BUILDER
+    )
+    provisioning_manifest_builder_line = _first_line(
+        top_calls, _AUTHORITY_PROVISIONING_MANIFEST_BUILDER
+    )
+    provisioning_receipt_builder_line = _first_line(
+        top_calls, _AUTHORITY_PROVISIONING_RECEIPT_BUILDER
+    )
+    authenticated_receipt_verifier_builder_line = _first_line(
+        top_calls, _AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_BUILDER
+    )
+    physical_binding_builder_line = _first_line(
+        top_calls, _AUTHORITY_PROVISIONING_PHYSICAL_BINDING_BUILDER
+    )
     provider_nodes = function_maps["main.py"].get(
         _PROVIDER_INSTALL_MARKER, []
     )
@@ -581,6 +757,313 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
         recovery_line=recovery_line,
         runtime_start_line=runtime_line,
         required_marker=_STARTUP_RECOVERY_MARKER,
+    )
+
+    bridge_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == _RESOLVED_AUTHORITY_STARTUP_BRIDGE_GLOBAL
+            for target in node.targets
+        )
+    ]
+    boundary_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_GLOBAL
+            for target in node.targets
+        )
+    ]
+    adapters_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_GLOBAL
+            for target in node.targets
+        )
+    ]
+    manifest_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == _AUTHORITY_PROVISIONING_MANIFEST_GLOBAL
+            for target in node.targets
+        )
+    ]
+    receipt_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == _AUTHORITY_PROVISIONING_RECEIPT_GLOBAL
+            for target in node.targets
+        )
+    ]
+    authenticated_receipt_verifier_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id
+            == _AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_GLOBAL
+            for target in node.targets
+        )
+    ]
+    physical_binding_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == _AUTHORITY_PROVISIONING_PHYSICAL_BINDING_GLOBAL
+            for target in node.targets
+        )
+    ]
+    recovery_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1"
+            for target in node.targets
+        )
+    ]
+    installation_assignments = [
+        node
+        for node in main_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "C3_CLOSED_REPAIR_INSTALLATION_V1"
+            for target in node.targets
+        )
+    ]
+    bridge_builder_bound = False
+    if len(bridge_assignments) == 1:
+        value = bridge_assignments[0].value
+        bridge_builder_bound = bool(
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == _RESOLVED_AUTHORITY_STARTUP_BRIDGE_BUILDER
+            and not value.args
+            and not value.keywords
+        )
+    recovery_bridge_bound = False
+    adapters_builder_bound = False
+    if len(adapters_assignments) == 1:
+        value = adapters_assignments[0].value
+        adapters_builder_bound = bool(
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_BUILDER
+            and not value.args
+            and not value.keywords
+        )
+    manifest_builder_bound = False
+    if len(manifest_assignments) == 1:
+        value = manifest_assignments[0].value
+        manifest_builder_bound = bool(
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == _AUTHORITY_PROVISIONING_MANIFEST_BUILDER
+            and not value.args
+            and not value.keywords
+        )
+    receipt_builder_bound = False
+    if len(receipt_assignments) == 1:
+        value = receipt_assignments[0].value
+        receipt_builder_bound = bool(
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == _AUTHORITY_PROVISIONING_RECEIPT_BUILDER
+            and not value.args
+            and not value.keywords
+        )
+    authenticated_receipt_verifier_builder_bound = False
+    if len(authenticated_receipt_verifier_assignments) == 1:
+        value = authenticated_receipt_verifier_assignments[0].value
+        authenticated_receipt_verifier_builder_bound = bool(
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr
+            == _AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_BUILDER
+            and not value.args
+            and not value.keywords
+        )
+    physical_binding_builder_bound = False
+    if len(physical_binding_assignments) == 1:
+        value = physical_binding_assignments[0].value
+        physical_binding_builder_bound = bool(
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == _AUTHORITY_PROVISIONING_PHYSICAL_BINDING_BUILDER
+            and not value.args
+            and not value.keywords
+        )
+    boundary_builder_bound = False
+    if len(boundary_assignments) == 1 and adapters_builder_bound:
+        value = boundary_assignments[0].value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr
+            == _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_BUILDER
+            and not value.args
+        ):
+            keywords = {item.arg: item.value for item in value.keywords}
+            adapter_attributes = {
+                "root_state_provider": "root_state_provider",
+                "root_authority_verifier": "root_authority_verifier",
+                "root_revocation_source": "root_revocation_source",
+                "multistore_recovery": "multistore_recovery",
+            }
+            boundary_builder_bound = bool(
+                set(keywords) == set(adapter_attributes) | {"startup_bridge"}
+                and all(
+                    isinstance(keywords[name], ast.Attribute)
+                    and keywords[name].attr == attribute
+                    and isinstance(keywords[name].value, ast.Name)
+                    and keywords[name].value.id
+                    == _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_GLOBAL
+                    for name, attribute in adapter_attributes.items()
+                )
+                and isinstance(keywords["startup_bridge"], ast.Name)
+                and keywords["startup_bridge"].id
+                == _RESOLVED_AUTHORITY_STARTUP_BRIDGE_GLOBAL
+            )
+    provider_recovery_binding_bound = False
+    if len(provider_nodes) == 1:
+        binding_calls = [
+            node
+            for node in ast.walk(provider_nodes[0])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            == "bind_c3_closed_repair_runtime_interlocks_v1"
+        ]
+        if len(binding_calls) == 1:
+            call = binding_calls[0]
+            keywords = {item.arg: item.value for item in call.keywords}
+            provider_recovery_binding_bound = bool(
+                len(call.args) == 1
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == "coordinator"
+                and set(keywords) == {"startup_recovery"}
+                and isinstance(keywords["startup_recovery"], ast.Name)
+                and keywords["startup_recovery"].id == "startup_recovery"
+            )
+    installation_authority_bound = False
+    if len(installation_assignments) == 1 and boundary_builder_bound:
+        value = installation_assignments[0].value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == _PROVIDER_INSTALL_MARKER
+            and not value.args
+        ):
+            keywords = {item.arg: item.value for item in value.keywords}
+            installation_authority_bound = bool(
+                set(keywords) == {"startup_recovery"}
+                and isinstance(keywords["startup_recovery"], ast.Name)
+                and keywords["startup_recovery"].id
+                == _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_GLOBAL
+            )
+    if len(recovery_assignments) == 1 and installation_authority_bound:
+        value = recovery_assignments[0].value
+        if (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == _STARTUP_RECOVERY_MARKER
+            and not value.args
+            and not value.keywords
+        ):
+            recovery_bridge_bound = bool(
+                provider_recovery_binding_bound
+                and installation_authority_bound
+            )
+    add(
+        "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF",
+        _RESOLVED_AUTHORITY_STARTUP_BRIDGE_MODULE in main_imports
+        and _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_MODULE in main_imports
+        and _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_MODULE in main_imports
+        and _AUTHORITY_PROVISIONING_MANIFEST_MODULE in main_imports
+        and _AUTHORITY_PROVISIONING_RECEIPT_MODULE in main_imports
+        and _AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_MODULE
+        in main_imports
+        and _AUTHORITY_PROVISIONING_PHYSICAL_BINDING_MODULE in main_imports
+        and bridge_builder_bound
+        and adapters_builder_bound
+        and manifest_builder_bound
+        and receipt_builder_bound
+        and authenticated_receipt_verifier_builder_bound
+        and physical_binding_builder_bound
+        and boundary_builder_bound
+        and provider_recovery_binding_bound
+        and installation_authority_bound
+        and recovery_bridge_bound
+        and resolved_bridge_builder_line is not None
+        and authenticated_adapters_builder_line is not None
+        and provisioning_manifest_builder_line is not None
+        and provisioning_receipt_builder_line is not None
+        and authenticated_receipt_verifier_builder_line is not None
+        and physical_binding_builder_line is not None
+        and authenticated_boundary_builder_line is not None
+        and provider_line is not None
+        and recovery_line is not None
+        and runtime_line is not None
+        and resolved_bridge_builder_line
+        < authenticated_adapters_builder_line
+        < provisioning_manifest_builder_line
+        < provisioning_receipt_builder_line
+        < authenticated_receipt_verifier_builder_line
+        < physical_binding_builder_line
+        < authenticated_boundary_builder_line
+        < provider_line
+        < recovery_line
+        < runtime_line,
+        module_imported=(
+            _RESOLVED_AUTHORITY_STARTUP_BRIDGE_MODULE in main_imports
+        ),
+        bridge_assignment_count=len(bridge_assignments),
+        adapters_assignment_count=len(adapters_assignments),
+        manifest_assignment_count=len(manifest_assignments),
+        receipt_assignment_count=len(receipt_assignments),
+        authenticated_receipt_verifier_assignment_count=len(
+            authenticated_receipt_verifier_assignments
+        ),
+        physical_binding_assignment_count=len(physical_binding_assignments),
+        boundary_assignment_count=len(boundary_assignments),
+        installation_assignment_count=len(installation_assignments),
+        recovery_assignment_count=len(recovery_assignments),
+        bridge_builder_bound=bridge_builder_bound,
+        production_adapters_builder_bound=adapters_builder_bound,
+        provisioning_manifest_builder_bound=manifest_builder_bound,
+        provisioning_receipt_builder_bound=receipt_builder_bound,
+        authenticated_receipt_verifier_builder_bound=(
+            authenticated_receipt_verifier_builder_bound
+        ),
+        physical_binding_builder_bound=physical_binding_builder_bound,
+        authenticated_boundary_builder_bound=boundary_builder_bound,
+        provider_recovery_binding_bound=provider_recovery_binding_bound,
+        installation_authority_bound=installation_authority_bound,
+        recovery_bridge_bound=recovery_bridge_bound,
+        bridge_builder_line=resolved_bridge_builder_line,
+        authenticated_boundary_builder_line=authenticated_boundary_builder_line,
+        recovery_line=recovery_line,
+        runtime_start_line=runtime_line,
+        default_off_required=True,
     )
 
     bot_imports = {

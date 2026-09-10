@@ -56897,6 +56897,7 @@ def _frpp_v1_build_checklist():
         and c3_coordination.get("activation_receipt_verified") is True
         and c3_coordination.get("source_hashes_verified") is True
         and c3_coordination.get("rollback_ready") is True
+        and c3_coordination.get("startup_recovery_verified") is True
         and c3_coordination.get("kill_switch_ready") is True,
         "Coordenação C3 dos 19 escritores do Trade Registry está pronta.",
         "Coordenação C3 permanece dormente/default-off; Live continua bloqueado.",
@@ -68456,13 +68457,32 @@ def trade_registry_closed_identity_repair_runtime_operation_v1_route():
     return result, status_code, headers
 
 
-def _install_c3_closed_repair_writer_coordination_v1():
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_bridge_v2 as c3_resolved_authority_startup_bridge_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_boundary_v2 as c3_authenticated_persistent_authority_boundary_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_production_adapters_v2 as c3_authenticated_persistent_authority_production_adapters_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_manifest_contract_v2 as c3_authority_provisioning_manifest_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_contract_v2 as c3_authority_provisioning_receipt_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_authenticated_verifier_contract_v2 as c3_authority_provisioning_receipt_authenticated_verifier_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_physical_binding_contract_v2 as c3_authority_provisioning_physical_binding_v2
+
+
+_C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = None
+
+
+def _install_c3_closed_repair_writer_coordination_v1(*, startup_recovery):
     """Install only default-off production-shaped C3 capabilities."""
+    global _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1
     coordinator = c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()
     invocation_adapter = c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()
     transaction_store = c3_transaction_store_v1.build_production_raw_transaction_store_v1()
     provider = c3_provider_v1.build_production_closed_repair_provider_v1()
     seam_status = c3_runtime_seam_v1.install_dormant_c3_closed_repair_writer_coordinator_v1(coordinator)
+    _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = (
+        c3_runtime_seam_v1.bind_c3_closed_repair_runtime_interlocks_v1(
+            coordinator,
+            startup_recovery=startup_recovery,
+        )
+    )
     return {
         "ok": True,
         "status": "C3_RUNTIME_CAPABILITIES_INSTALLED_DORMANT_DEFAULT_OFF",
@@ -68499,7 +68519,7 @@ def _c3_closed_identity_repair_trading_controls_v1():
     }
 
 
-def _build_c3_closed_identity_repair_runtime_operation_v1():
+def _build_c3_closed_identity_repair_runtime_operation_v1(*, interlocks=None):
     loader = (
         getattr(central_trade_registry, "load_registry_raw_read_only", None)
         if central_trade_registry is not None
@@ -68509,11 +68529,24 @@ def _build_c3_closed_identity_repair_runtime_operation_v1():
     def unavailable_loader():
         raise RuntimeError("READ_ONLY_REGISTRY_LOADER_UNAVAILABLE")
 
+    selected_interlocks = (
+        interlocks
+        if interlocks is not None
+        else globals().get("_C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1")
+    )
+    if not isinstance(
+        selected_interlocks,
+        c3_runtime_seam_v1.C3ClosedRepairRuntimeInterlockBindingV1,
+    ):
+        raise RuntimeError("C3_RUNTIME_INTERLOCK_BINDING_REQUIRED")
+
     return c3_closed_repair_operation_v1.ClosedIdentityRepairRuntimeOperationV1(
         registry_loader=loader if callable(loader) else unavailable_loader,
         conflict_auditor=trade_registry_closed_identity_financial_conflicts_v1,
         registry_lock=_trpsf_v1_registry_lock,
         trading_controls=_c3_closed_identity_repair_trading_controls_v1,
+        writer_coordination_status=selected_interlocks.coordination_status,
+        maintenance_lease=selected_interlocks.maintenance_lease,
         target_path=_trpsf_v1_active_file(),
         backup_root=(
             Path(CENTRAL_DATA_DIR)
@@ -68523,35 +68556,133 @@ def _build_c3_closed_identity_repair_runtime_operation_v1():
     )
 
 
-def _recover_c3_closed_repair_registry_v1():
-    """Record a clean default-off startup state without reading the Registry."""
-    installed = globals().get("C3_CLOSED_REPAIR_INSTALLATION_V1")
-    if not isinstance(installed, dict) or installed.get("enabled") is not False:
+def _recover_c3_closed_repair_registry_v1(*, interlocks=None):
+    """Gate readiness on same-coordinator WAL and transaction recovery."""
+    selected_interlocks = (
+        interlocks
+        if interlocks is not None
+        else globals().get("_C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1")
+    )
+    if not isinstance(
+        selected_interlocks,
+        c3_runtime_seam_v1.C3ClosedRepairRuntimeInterlockBindingV1,
+    ):
         return {
             "ok": False,
-            "status": "C3_DORMANT_STARTUP_RECOVERY_BLOCKED",
-            "reason": "DORMANT_PROVIDER_NOT_INSTALLED",
+            "status": "C3_STARTUP_RECOVERY_BLOCKED",
+            "reason": "RUNTIME_INTERLOCK_BINDING_REQUIRED",
+            "clean": False,
+            "readiness_allowed": False,
             "real_registry_accessed": False,
+            "write_executed": False,
+            "network_accessed": False,
+            "broker_called": False,
             "no_order_sent": True,
         }
+    try:
+        coordination = selected_interlocks.coordination_status()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "C3_STARTUP_RECOVERY_BLOCKED",
+            "reason": getattr(exc, "reason", type(exc).__name__),
+            "clean": False,
+            "readiness_allowed": False,
+            "real_registry_accessed": False,
+            "write_executed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    if coordination.get("enabled") is not True:
+        return {
+            "ok": True,
+            "status": "C3_DORMANT_STARTUP_RECOVERY_DEFERRED_DEFAULT_OFF",
+            "clean": False,
+            "enabled": False,
+            "startup_recovery_verified": False,
+            "recovery_required_before_readiness": True,
+            "readiness_allowed": False,
+            "writers_blocked_during_recovery": False,
+            "write_executed": False,
+            "real_registry_accessed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    try:
+        ready = selected_interlocks.run_startup_recovery_v1()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "C3_STARTUP_RECOVERY_BLOCKED",
+            "reason": getattr(exc, "reason", type(exc).__name__),
+            "clean": False,
+            "enabled": True,
+            "startup_recovery_verified": False,
+            "readiness_allowed": False,
+            "real_registry_accessed": False,
+            "write_executed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    summary = ready.get("startup_recovery_summary") or {}
     return {
         "ok": True,
-        "status": "C3_DORMANT_STARTUP_RECOVERY_NOT_REQUIRED",
+        "status": "C3_STARTUP_RECOVERY_COMPLETED",
         "clean": True,
-        "enabled": False,
-        "write_executed": False,
-        "real_registry_accessed": False,
+        "enabled": True,
+        "startup_recovery_verified": True,
+        "readiness_allowed": ready.get("coordination_ready") is True,
+        "writers_blocked_during_recovery": True,
+        "startup_recovery_attestation_sha256": ready.get(
+            "startup_recovery_attestation_sha256"
+        ),
+        "write_executed": bool(summary.get("write_executed")),
+        "real_registry_accessed": bool(
+            summary.get("real_registry_accessed")
+        ),
         "network_accessed": False,
         "broker_called": False,
         "no_order_sent": True,
     }
 
 
+C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = (
+    c3_resolved_authority_startup_bridge_v2.build_dormant_resolved_authority_startup_recovery_bridge_v2()
+)
+C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2 = (
+    c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2 = (
+    c3_authority_provisioning_manifest_v2.build_dormant_authority_provisioning_manifest_contract_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_CONTRACT_V2 = (
+    c3_authority_provisioning_receipt_v2.build_dormant_authority_provisioning_receipt_contract_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_V2 = (
+    c3_authority_provisioning_receipt_authenticated_verifier_v2.build_dormant_authenticated_provisioning_receipt_verifier_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_CONTRACT_V2 = (
+    c3_authority_provisioning_physical_binding_v2.build_dormant_authority_provisioning_physical_binding_contract_v2()
+)
+C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2 = (
+    c3_authenticated_persistent_authority_boundary_v2.build_dormant_authenticated_persistent_authority_boundary_v2(
+        root_state_provider=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_state_provider,
+        root_authority_verifier=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_authority_verifier,
+        root_revocation_source=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_revocation_source,
+        multistore_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.multistore_recovery,
+        startup_bridge=C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2
+    )
+)
 C3_PERSISTENCE_BOOTSTRAP_V1 = trade_registry_persistent_storage_fix_v1_status(
     read_only=True,
     no_io=True,
 )
-C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1()
+C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1(
+    startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2
+)
 C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1 = (
     _build_c3_closed_identity_repair_runtime_operation_v1()
 )

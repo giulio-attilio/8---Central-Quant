@@ -100,7 +100,7 @@ class InMemoryDormantRuntimePatchPlanner:
 def load_runtime_patch_source_preconditions_read_only_v1(
     repository_root: str | Path,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    """Read only the nine explicit source files and expose hashes, never content."""
+    """Read patch sources plus preflight-only dependencies, never exposing content."""
 
     root = Path(repository_root).resolve(strict=True)
     if not root.is_dir():
@@ -139,6 +139,27 @@ def load_runtime_patch_source_preconditions_read_only_v1(
                 ),
             }
         )
+    for relative in static_preflight.REQUIRED_SOURCE_KEYS_V1:
+        if relative in contents:
+            continue
+        candidate = (root / relative).resolve(strict=True)
+        if not candidate.is_relative_to(root) or not candidate.is_file():
+            raise RuntimePatchPlanHarnessBlocked("SOURCE_PATH_OUTSIDE_ROOT")
+        size = candidate.stat().st_size
+        if size <= 0 or size > _MAX_SOURCE_BYTES:
+            raise RuntimePatchPlanHarnessBlocked("SOURCE_SIZE_INVALID")
+        total += size
+        if total > _MAX_TOTAL_BYTES:
+            raise RuntimePatchPlanHarnessBlocked("SOURCE_SET_SIZE_LIMIT_EXCEEDED")
+        try:
+            source = candidate.read_text(encoding="utf-8")
+        except UnicodeError as exc:
+            raise RuntimePatchPlanHarnessBlocked(
+                "SOURCE_UTF8_DECODE_FAILED"
+            ) from exc
+        if "\x00" in source:
+            raise RuntimePatchPlanHarnessBlocked("SOURCE_TEXT_INVALID")
+        contents[relative] = source
     preflight_sources = {
         key: contents[key] for key in static_preflight.REQUIRED_SOURCE_KEYS_V1
     }

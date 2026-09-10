@@ -60,6 +60,7 @@ def test_exact_readiness_vector_contains_all_critical_guards() -> None:
         "activation_receipt_verified": True,
         "source_hashes_verified": True,
         "rollback_ready": True,
+        "startup_recovery_verified": True,
         "kill_switch_ready": True,
     }
 
@@ -71,7 +72,7 @@ def test_receipt_binds_sources_vector_predicates_and_upstream(binding_inputs: di
     receipt = result["binding_receipt"]
 
     assert receipt["source_attestation_count"] == 4
-    assert receipt["required_predicate_count"] == 13
+    assert receipt["required_predicate_count"] == 14
     assert receipt["writer_count"] == 19
     assert len(receipt["upstream_proposal_receipt_sha256"]) == 64
     assert len(receipt["source_attestations_sha256"]) == 64
