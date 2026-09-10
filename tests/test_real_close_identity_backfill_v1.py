@@ -503,6 +503,7 @@ def test_backfilled_real_is_selected_and_manual_outcome_conflict_remains(
         "_rcrm_v11_selected_strong_identity",
         "_rcrm_v1_values",
         "_rcrm_v1_metrics",
+        "_rcrm_v1_causal_close_reason",
         "_rcrm_v11_manual_outcome_conflict",
         "_rcrm_v11_validate_broker_identity",
         "real_close_reconciliation_v1_run",

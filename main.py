@@ -10535,7 +10535,9 @@ def registry_persistence_v1_health_route():
 # - Calcular saída, PnL, PnL %, R múltiplo, TP50 e motivo provável.
 # - Salvar outcome em /data e na metadata do trade fechado.
 # - Bloquear nova execução real se houver trade fechado ainda não avaliado.
-TRADE_CLOSE_OUTCOME_V1_VERSION = "2026-07-06-TRADE-CLOSE-OUTCOME-EVALUATOR-V1"
+TRADE_CLOSE_OUTCOME_V1_VERSION = (
+    "2026-09-05-TRADE-CLOSE-OUTCOME-EVALUATOR-V1.1-NET-R-CAUSAL-REASON"
+)
 TRADE_CLOSE_OUTCOME_V1_LATEST_FILE = CENTRAL_DATA_DIR / "trade_close_outcome_v1_latest.json"
 TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "trade_close_outcome_v1_events.jsonl"
 
@@ -10877,13 +10879,15 @@ def _tco_v1_infer_close_reason(trade, explicit_close_reason=None, tp50_hit=False
     if explicit_close_reason:
         return str(explicit_close_reason).upper().strip(), "request"
     meta = _tco_v1_trade_meta(trade)
-    raw = str(trade.get("close_reason") or meta.get("close_reason") or "").upper().strip()
+    raw = str(
+        trade.get("close_reason")
+        or trade.get("exit_reason")
+        or meta.get("close_reason")
+        or meta.get("exit_reason")
+        or ""
+    ).upper().strip()
     if raw in {"MANUAL_CLOSE", "MANUAL", "USER_CLOSE"}:
         return "MANUAL_CLOSE", "registry"
-    if "STOP" in raw:
-        return "STOP_OR_PROTECTIVE_ORDER", "registry"
-    if "TP" in raw or "TAKE" in raw:
-        return "TAKE_PROFIT_OR_TP", "registry"
     if raw == "BROKER_POSITION_NOT_FOUND":
         # O lifecycle sabe que a posição sumiu, mas não sabe se foi manual, stop, TP ou liquidação.
         if tp50_hit:
@@ -10908,6 +10912,7 @@ def trade_close_outcome_v1_build(
     realized_pnl=None,
     fee=None,
     close_reason=None,
+    canonical_pnl_r=None,
     commit=False,
     expected_identity=None,
 ):
@@ -10956,7 +10961,90 @@ def trade_close_outcome_v1_build(
         realized_quality = "ESTIMATED_FROM_EXIT_PRICE" if computed_pnl is not None else "MISSING_REALIZED_PNL"
     fee_f = _tco_v1_float(fee, 0.0) or 0.0
     net_pnl = (realized_pnl_f - fee_f) if realized_pnl_f is not None else None
-    r_multiple, r_calc = _tco_v1_compute_r(entry, exit_price_f, sl, side_n)
+    gross_r_multiple, r_calc = _tco_v1_compute_r(entry, exit_price_f, sl, side_n)
+    risk_abs = _tco_v1_float((r_calc or {}).get("risk_abs"))
+    initial_risk_usdt = (
+        risk_abs * abs(qty)
+        if risk_abs is not None and risk_abs > 0 and qty is not None and abs(qty) > 0
+        else None
+    )
+    net_r_multiple = (
+        net_pnl / initial_risk_usdt
+        if net_pnl is not None and initial_risk_usdt is not None
+        else None
+    )
+    canonical_r_input = (
+        canonical_pnl_r
+        if canonical_pnl_r not in (None, "")
+        else trade.get("pnl_r")
+    )
+    explicit_canonical_r = _tco_v1_float(canonical_r_input)
+    if canonical_r_input not in (None, "") and explicit_canonical_r is None:
+        return {
+            "ok": False,
+            "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+            "status": "CANONICAL_PNL_R_INVALID",
+            "commit": {
+                "attempted": False,
+                "committed": False,
+                "status": "COMMIT_BLOCKED_INVALID_CANONICAL_PNL_R",
+            },
+        }
+    if (
+        explicit_canonical_r is not None
+        and net_r_multiple is not None
+        and abs(explicit_canonical_r - net_r_multiple) > 1e-8
+    ):
+        return {
+            "ok": False,
+            "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+            "status": "CANONICAL_PNL_R_EVIDENCE_CONFLICT",
+            "canonical_pnl_r": round(explicit_canonical_r, 8),
+            "computed_net_r_multiple": round(net_r_multiple, 8),
+            "commit": {
+                "attempted": False,
+                "committed": False,
+                "status": "COMMIT_BLOCKED_CANONICAL_PNL_R_EVIDENCE_CONFLICT",
+            },
+        }
+    if explicit_canonical_r is not None:
+        r_multiple = explicit_canonical_r
+        canonical_r_source = (
+            "explicit_canonical_pnl_r"
+            if canonical_pnl_r not in (None, "")
+            else "registry_canonical_pnl_r"
+        )
+    elif net_r_multiple is not None:
+        r_multiple = net_r_multiple
+        canonical_r_source = "computed_net_pnl_over_initial_risk"
+    else:
+        r_multiple = None
+        canonical_r_source = "net_r_evidence_unavailable"
+    if commit and net_r_multiple is None:
+        return {
+            "ok": False,
+            "version": TRADE_CLOSE_OUTCOME_V1_VERSION,
+            "status": "NET_PNL_R_EVIDENCE_UNAVAILABLE",
+            "gross_r_multiple": (
+                round(gross_r_multiple, 8)
+                if gross_r_multiple is not None
+                else None
+            ),
+            "commit": {
+                "attempted": False,
+                "committed": False,
+                "status": "COMMIT_BLOCKED_NET_PNL_R_EVIDENCE_UNAVAILABLE",
+            },
+        }
+    r_calc = dict(r_calc or {})
+    r_calc.update(
+        {
+            "initial_risk_usdt": initial_risk_usdt,
+            "gross_r_multiple": gross_r_multiple,
+            "net_r_multiple": net_r_multiple,
+            "canonical_r_source": canonical_r_source,
+        }
+    )
     tp50_payload = _tco_v1_tp50_result(entry, exit_price_f, tp50, side_n, lifecycle_tp50_hit=meta.get("lifecycle_tp50_hit"))
     close_reason_final, close_reason_source = _tco_v1_infer_close_reason(trade, explicit_close_reason=close_reason, tp50_hit=tp50_payload.get("hit"), r_multiple=r_multiple, pnl_usdt=net_pnl if net_pnl is not None else realized_pnl_f)
     data_quality_notes = []
@@ -11007,7 +11095,10 @@ def trade_close_outcome_v1_build(
         "net_pnl": net_pnl,
         "pnl_pct": round(pnl_pct, 8) if pnl_pct is not None else None,
         "pnl_per_unit": pnl_per_unit,
+        "pnl_r": round(r_multiple, 8) if r_multiple is not None else None,
         "r_multiple": round(r_multiple, 8) if r_multiple is not None else None,
+        "gross_r_multiple": round(gross_r_multiple, 8) if gross_r_multiple is not None else None,
+        "net_r_multiple": round(net_r_multiple, 8) if net_r_multiple is not None else None,
         "r_calculation": r_calc,
         "tp50_result": tp50_payload,
         "close_reason": close_reason_final,
@@ -11033,7 +11124,9 @@ def trade_close_outcome_v1_build(
             "tp50_hit": tp50_payload.get("hit"),
             "pnl_usdt": net_pnl,
             "pnl_pct": round(pnl_pct, 8) if pnl_pct is not None else None,
+            "pnl_r": round(r_multiple, 8) if r_multiple is not None else None,
             "r_multiple": round(r_multiple, 8) if r_multiple is not None else None,
+            "gross_r_multiple": round(gross_r_multiple, 8) if gross_r_multiple is not None else None,
             "close_reason": close_reason_final,
             "data_quality": quality,
         },
@@ -11103,8 +11196,16 @@ def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
             trade["realized_pnl"] = outcome.get("realized_pnl")
             trade["net_pnl"] = outcome.get("net_pnl")
             trade["pnl_pct"] = outcome.get("pnl_pct")
-            trade["r_multiple"] = outcome.get("r_multiple")
+            canonical_r = outcome.get("pnl_r")
+            if canonical_r is None:
+                canonical_r = outcome.get("r_multiple")
+            if canonical_r is not None:
+                trade["pnl_r"] = canonical_r
+                trade["result_r"] = canonical_r
+                trade["r_multiple"] = canonical_r
             trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+            if outcome.get("close_reason") not in (None, ""):
+                trade["close_reason"] = outcome.get("close_reason")
             trade["close_reason_evaluated"] = outcome.get("close_reason")
             trade["last_update"] = now
             closed_obj[key] = trade
@@ -11138,8 +11239,16 @@ def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
             trade["realized_pnl"] = outcome.get("realized_pnl")
             trade["net_pnl"] = outcome.get("net_pnl")
             trade["pnl_pct"] = outcome.get("pnl_pct")
-            trade["r_multiple"] = outcome.get("r_multiple")
+            canonical_r = outcome.get("pnl_r")
+            if canonical_r is None:
+                canonical_r = outcome.get("r_multiple")
+            if canonical_r is not None:
+                trade["pnl_r"] = canonical_r
+                trade["result_r"] = canonical_r
+                trade["r_multiple"] = canonical_r
             trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+            if outcome.get("close_reason") not in (None, ""):
+                trade["close_reason"] = outcome.get("close_reason")
             trade["close_reason_evaluated"] = outcome.get("close_reason")
             trade["last_update"] = now
             closed_obj[idx] = trade
@@ -14681,50 +14790,50 @@ def _trade_registry_signature_map(items):
 def mark_registry_missing_trades(removed):
     if central_trade_registry is None:
         return {"ok": False, "error": "trade_registry unavailable"}
-
     if not removed:
-        return {"ok": True, "marked_count": 0, "marked": []}
-
+        return {"ok": True, "marked_count": 0, "marked": [], "registry_write": False}
     try:
         registry = central_trade_registry.load_registry()
         open_trades = registry.get("open_trades", {})
-
         if not isinstance(open_trades, dict):
             return {"ok": False, "error": "open_trades is not dict"}
-
-        marked = []
-
+        registry, open_trades = dict(registry), dict(open_trades)
+        marked, already_marked, detected_at = [], [], None
         for item in removed:
+            if not isinstance(item, dict):
+                continue
             trade_id = item.get("trade_id")
             if not trade_id or trade_id not in open_trades:
                 continue
-
             trade = open_trades[trade_id]
+            if not isinstance(trade, dict):
+                return {"ok": False, "error": "open trade is not dict", "registry_write": False}
+            if trade.get("status") == "MISSING_FROM_BOTS" and trade.get("missing_from_bots") is True:
+                already_marked.append(trade_id)
+                continue
+            detected_at = detected_at or data_hora_sp_str()
+            trade = dict(trade)
             trade["status"] = "MISSING_FROM_BOTS"
             trade["missing_from_bots"] = True
-            trade["missing_detected_at"] = data_hora_sp_str()
-            trade["last_update"] = data_hora_sp_str()
-
+            if not trade.get("missing_detected_at"):
+                trade["missing_detected_at"] = detected_at
+            trade["last_update"] = detected_at
             open_trades[trade_id] = trade
             marked.append({
-                "trade_id": trade_id,
-                "bot": trade.get("bot"),
-                "symbol": trade.get("symbol"),
-                "side": trade.get("side"),
+                "trade_id": trade_id, "bot": trade.get("bot"),
+                "symbol": trade.get("symbol"), "side": trade.get("side"),
                 "status": trade.get("status"),
             })
-
+        if not marked:
+            return {"ok": True, "marked_count": 0, "marked": [], "already_marked": already_marked, "registry_write": False}
         registry["open_trades"] = open_trades
         registry_write = central_trade_registry.save_registry(registry)
         if registry_write is False:
-            return {"ok": False, "error": "REGISTRY_SAVE_NOT_CONFIRMED"}
-
+            return {"ok": False, "error": "REGISTRY_SAVE_NOT_CONFIRMED", "registry_write": False}
         return {
-            "ok": True,
-            "marked_count": len(marked),
-            "marked": marked,
+            "ok": True, "marked_count": len(marked),
+            "marked": marked, "already_marked": already_marked, "registry_write": True,
         }
-
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -56788,6 +56897,7 @@ def _frpp_v1_build_checklist():
         and c3_coordination.get("activation_receipt_verified") is True
         and c3_coordination.get("source_hashes_verified") is True
         and c3_coordination.get("rollback_ready") is True
+        and c3_coordination.get("startup_recovery_verified") is True
         and c3_coordination.get("kill_switch_ready") is True,
         "Coordenação C3 dos 19 escritores do Trade Registry está pronta.",
         "Coordenação C3 permanece dormente/default-off; Live continua bloqueado.",
@@ -58325,7 +58435,9 @@ def falcon_disaster_stop_close_position_preview_route():
 # - Todas as consultas à BingX são read-only.
 # - Nenhuma rota deste bloco abre, fecha, cancela ou altera ordens.
 # - Commit só ocorre com evidência broker completa; pela rota manual exige ACK.
-REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = "2026-07-23-REAL-CLOSE-RECONCILIATION-V1.1-REVIEW8-COMPLETE-SELECTED-IDENTITY"
+REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION = (
+    "2026-09-05-REAL-CLOSE-RECONCILIATION-V1.2-CAUSAL-REASON-NET-R"
+)
 REAL_CLOSE_RECONCILIATION_V1_LATEST_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_latest.json"
 REAL_CLOSE_RECONCILIATION_V1_EVENTS_FILE = CENTRAL_DATA_DIR / "real_close_reconciliation_v1_events.jsonl"
 
@@ -58954,6 +59066,65 @@ def _rcrm_v1_metrics(side, entry, stop, exit_price, qty, net_pnl):
     }
 
 
+def _rcrm_v1_causal_close_reason(trade):
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = _rcrm_v1_meta(trade)
+    trade_outcome = trade.get("outcome") if isinstance(trade.get("outcome"), dict) else {}
+    metadata_outcome = (
+        metadata.get("outcome")
+        if isinstance(metadata.get("outcome"), dict)
+        else {}
+    )
+    technical_markers = {
+        "BROKER_RECONCILED_CLOSE",
+        "BROKER_CLOSE_RECONCILED",
+        "BROKER_CLOSE_RECONCILIATION",
+    }
+    candidates = []
+    for path, source in (
+        ("trade.close_reason", trade.get("close_reason")),
+        ("trade.exit_reason", trade.get("exit_reason")),
+        ("trade.metadata.close_reason", metadata.get("close_reason")),
+        ("trade.metadata.exit_reason", metadata.get("exit_reason")),
+        ("trade.outcome.close_reason", trade_outcome.get("close_reason")),
+        ("trade.outcome.exit_reason", trade_outcome.get("exit_reason")),
+        ("trade.metadata.outcome.close_reason", metadata_outcome.get("close_reason")),
+        ("trade.metadata.outcome.exit_reason", metadata_outcome.get("exit_reason")),
+    ):
+        value = str(source or "").upper().strip()
+        if not value or value in technical_markers:
+            continue
+        candidates.append({"path": path, "value": value})
+    distinct = sorted({item["value"] for item in candidates})
+    if len(distinct) == 1:
+        selected = distinct[0]
+        return {
+            "ok": True,
+            "status": "REAL_CLOSE_CAUSAL_REASON_RESOLVED",
+            "value": selected,
+            "source_paths": [
+                item["path"] for item in candidates if item["value"] == selected
+            ],
+            "technical_markers_ignored": sorted(technical_markers),
+        }
+    if not distinct:
+        return {
+            "ok": False,
+            "status": "REAL_CLOSE_CAUSAL_REASON_UNAVAILABLE",
+            "value": None,
+            "source_paths": [],
+            "technical_markers_ignored": sorted(technical_markers),
+        }
+    return {
+        "ok": False,
+        "status": "REAL_CLOSE_CAUSAL_REASON_CONFLICT",
+        "value": None,
+        "conflicting_values": distinct,
+        "sources": candidates,
+        "technical_markers_ignored": sorted(technical_markers),
+    }
+
+
 def _rcrm_v11_manual_outcome_conflict(trade, broker_exit_price):
     trade = trade if isinstance(trade, dict) else {}
     metadata = _rcrm_v1_meta(trade)
@@ -59219,6 +59390,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
     qty = _rcrm_v1_float(broker_result.get("expected_qty"), values.get("qty"))
     net_pnl = _rcrm_v1_float(broker_result.get("net_pnl"))
     metrics = _rcrm_v1_metrics(side, entry, values.get("stop"), exit_price, qty, net_pnl)
+    causal_close_reason = _rcrm_v1_causal_close_reason(trade)
     financial_dedup_ok = bool(broker_result.get("financial_dedup_ok", True))
     broker_evidence_complete = bool(
         broker_result.get("complete")
@@ -59231,7 +59403,13 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         broker_evidence_complete and broker_identity_validation.get("ok")
     )
     outcome_conflict = _rcrm_v11_manual_outcome_conflict(trade, exit_price)
-    complete = bool(broker_complete and not outcome_conflict.get("conflict"))
+    net_r_ready = metrics.get("r_net") is not None
+    semantic_commit_ready = bool(causal_close_reason.get("ok") and net_r_ready)
+    complete = bool(
+        broker_complete
+        and not outcome_conflict.get("conflict")
+        and (not commit or semantic_commit_ready)
+    )
     legacy_commit_identity_blocked = bool(
         commit
         and complete
@@ -59270,6 +59448,11 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "broker_income_deduped_count": broker_result.get("income_deduped_count"),
             "broker_income_duplicates_removed": broker_result.get("income_duplicates_removed"),
             "broker_financial_dedup_ok": financial_dedup_ok,
+            "real_close_reconciliation_status": "BROKER_RECONCILED_CLOSE",
+            "causal_close_reason": causal_close_reason.get("value"),
+            "causal_close_reason_source_paths": causal_close_reason.get("source_paths") or [],
+            "gross_r_multiple": metrics.get("r_price"),
+            "net_r_multiple": metrics.get("r_net"),
         }
         updater = getattr(central_trade_registry, "update_closed_trade", None)
         if callable(updater):
@@ -59290,10 +59473,12 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
                 funding=broker_result.get("funding"),
                 net_pnl=net_pnl,
                 pnl_pct=metrics.get("pnl_pct"),
-                pnl_r=metrics.get("r_net") if metrics.get("r_net") is not None else metrics.get("r_price"),
-                r_multiple=metrics.get("r_net") if metrics.get("r_net") is not None else metrics.get("r_price"),
+                pnl_r=metrics.get("r_net"),
+                result_r=metrics.get("r_net"),
+                r_multiple=metrics.get("r_net"),
+                gross_r_multiple=metrics.get("r_price"),
                 closed_at=broker_result.get("closed_at") or trade.get("closed_at"),
-                close_reason="BROKER_RECONCILED_CLOSE",
+                close_reason=causal_close_reason.get("value"),
                 metadata=metadata,
             )
         else:
@@ -59310,7 +59495,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
                 exit_price=exit_price,
                 realized_pnl=realized_for_outcome,
                 fee=_rcrm_v1_float(broker_result.get("fee_total"), 0.0) or 0.0,
-                close_reason="BROKER_RECONCILED_CLOSE",
+                close_reason=causal_close_reason.get("value"),
+                canonical_pnl_r=metrics.get("r_net"),
                 commit=True,
             )
             committed = bool((outcome.get("commit") or {}).get("committed")) if isinstance(outcome, dict) else False
@@ -59319,13 +59505,17 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         status = "REAL_CLOSE_BROKER_IDENTITY_DIVERGENCE"
     elif outcome_conflict.get("conflict"):
         status = "REAL_CLOSE_OUTCOME_CONFLICT"
-    elif legacy_commit_identity_blocked:
-        status = "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
     elif broker_result.get("status") in {
         "CLOSING_QTY_EXCEEDS_EXPECTED",
         "FEE_ASSOCIATION_INCONCLUSIVE",
     }:
         status = broker_result.get("status")
+    elif commit and not causal_close_reason.get("ok"):
+        status = causal_close_reason.get("status")
+    elif commit and not net_r_ready:
+        status = "REAL_CLOSE_NET_R_UNAVAILABLE"
+    elif legacy_commit_identity_blocked:
+        status = "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
     else:
         status = "BROKER_CLOSE_RECONCILED_AND_SAVED" if committed else (
             "BROKER_CLOSE_RECONCILED_PREVIEW" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
@@ -59359,6 +59549,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         "diagnostics": lookup_diagnostics,
         "selected_strong_identity": selected_identity,
         "outcome_conflict": outcome_conflict,
+        "causal_close_reason": causal_close_reason,
+        "net_r_ready": net_r_ready,
         "commit_blocked_reason": (
             "REAL_CLOSE_BROKER_IDENTITY_DIVERGENCE"
             if not broker_identity_validation.get("ok")
@@ -59366,15 +59558,23 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
                 outcome_conflict.get("reason")
                 if outcome_conflict.get("conflict")
                 else (
-                    "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
-                    if legacy_commit_identity_blocked
+                    broker_result.get("status")
+                    if broker_result.get("status") in {
+                        "CLOSING_QTY_EXCEEDS_EXPECTED",
+                        "FEE_ASSOCIATION_INCONCLUSIVE",
+                    }
                     else (
-                        broker_result.get("status")
-                        if broker_result.get("status") in {
-                            "CLOSING_QTY_EXCEEDS_EXPECTED",
-                            "FEE_ASSOCIATION_INCONCLUSIVE",
-                        }
-                        else None
+                        causal_close_reason.get("status")
+                        if commit and not causal_close_reason.get("ok")
+                        else (
+                            "REAL_CLOSE_NET_R_UNAVAILABLE"
+                            if commit and not net_r_ready
+                            else (
+                                "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
+                                if legacy_commit_identity_blocked
+                                else None
+                            )
+                        )
                     )
                 )
             )
@@ -59390,6 +59590,8 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
             "Fees sem orderId usam simbolo, horario, semantica opening/closing e tradeId quando disponivel; associacao multipla bloqueia o commit.",
             "V1.1 Review 4 resolve closed trade por intersecao de lifecycle/client/order e valida Registry contra o resultado factual do Broker.",
             "V1.1 Review 7 preserva a identidade canonica selecionada ate o Broker e o Registry writer; fallback de execution evidence fica restrito ao lookup legado.",
+            "V1.2 preserva o motivo causal do lifecycle; marcadores de reconciliacao ficam somente em metadata.",
+            "V1.2 usa R liquido como alias estatistico canonico e mantem R bruto em gross_r_multiple.",
             "Outcome manual conflitante nunca é sobrescrito nem duplicado.",
             "Commit é bloqueado se houver colisão financeira ambígua após a deduplicação.",
         ],
@@ -68169,13 +68371,119 @@ def falcon_blocked_diagnostic_v1_text_route():
     return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
-def _install_c3_closed_repair_writer_coordination_v1():
+import trade_registry_closed_identity_conflict_repair_runtime_operation_v1 as c3_closed_repair_operation_v1
+
+
+def _c3_closed_identity_repair_request_v1():
+    if str(getattr(request, "method", "")).upper() != "POST":
+        return {"ok": False, "status": "POST_JSON_REQUIRED", "status_code": 405}
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return {"ok": False, "status": "POST_JSON_REQUIRED", "status_code": 400}
+    sensitive_keys = {
+        str(key or "").lower()
+        for key in body
+        if "token" in str(key or "").lower()
+        or "authorization" in str(key or "").lower()
+        or str(key or "").lower() in {"auth", "api_key", "apikey"}
+    }
+    if sensitive_keys:
+        return {
+            "ok": False,
+            "status": "EXECUTION_AUTH_HEADER_REQUIRED",
+            "status_code": 403,
+        }
+    resolver = globals().get("_ee_auth_resolver_v1_resolve")
+    if not callable(resolver):
+        return {"ok": False, "status": "EXECUTION_AUTH_REQUIRED", "status_code": 403}
+    try:
+        auth = resolver(allow_env_fallback=False)
+    except Exception:
+        auth = {}
+    matched_source = str((auth or {}).get("matched_source") or "")
+    if not ((auth or {}).get("ok") and matched_source.startswith("request.headers.")):
+        return {"ok": False, "status": "EXECUTION_AUTH_REQUIRED", "status_code": 403}
+    operation_name = str(body.get("operation") or "").lower().strip()
+    if operation_name not in {"preview", "apply"}:
+        return {
+            "ok": False,
+            "status": "REPAIR_OPERATION_INVALID",
+            "status_code": 400,
+        }
+    return {
+        "ok": True,
+        "operation": operation_name,
+        "payload": body,
+        "status_code": 200,
+    }
+
+
+@app.route("/traderegistry/closedidentity/repair", methods=["POST"])
+@app.route("/trade_registry/closedidentity/repair", methods=["POST"])
+@app.route("/trades/closedidentity/repair", methods=["POST"])
+def trade_registry_closed_identity_repair_runtime_operation_v1_route():
+    decision = _c3_closed_identity_repair_request_v1()
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    if not decision.get("ok"):
+        return {
+            "ok": False,
+            "status": decision.get("status"),
+            "write_executed": False,
+            "registry_write": False,
+            "no_order_sent": True,
+        }, int(decision.get("status_code") or 400), headers
+    controller = globals().get("C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1")
+    if not isinstance(
+        controller,
+        c3_closed_repair_operation_v1.ClosedIdentityRepairRuntimeOperationV1,
+    ):
+        return {
+            "ok": False,
+            "status": "REPAIR_RUNTIME_OPERATION_UNAVAILABLE",
+            "write_executed": False,
+            "registry_write": False,
+            "no_order_sent": True,
+        }, 503, headers
+    if decision.get("operation") == "preview":
+        result = controller.preview(decision["payload"])
+    else:
+        result = controller.apply(decision["payload"])
+    status = str(result.get("status") or "")
+    status_code = 200 if result.get("ok") else 409
+    if status.endswith("ACK_REQUIRED") or status.endswith("REQUEST_INVALID"):
+        status_code = 400
+    elif "AUTH" in status:
+        status_code = 403
+    return result, status_code, headers
+
+
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_bridge_v2 as c3_resolved_authority_startup_bridge_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_boundary_v2 as c3_authenticated_persistent_authority_boundary_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_production_adapters_v2 as c3_authenticated_persistent_authority_production_adapters_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_manifest_contract_v2 as c3_authority_provisioning_manifest_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_contract_v2 as c3_authority_provisioning_receipt_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_authenticated_verifier_contract_v2 as c3_authority_provisioning_receipt_authenticated_verifier_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_physical_binding_contract_v2 as c3_authority_provisioning_physical_binding_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_binding_adapter_contract_v1 as c3_production_startup_port_binding_v1
+
+
+_C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = None
+
+
+def _install_c3_closed_repair_writer_coordination_v1(*, startup_recovery):
     """Install only default-off production-shaped C3 capabilities."""
+    global _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1
     coordinator = c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()
     invocation_adapter = c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()
     transaction_store = c3_transaction_store_v1.build_production_raw_transaction_store_v1()
     provider = c3_provider_v1.build_production_closed_repair_provider_v1()
     seam_status = c3_runtime_seam_v1.install_dormant_c3_closed_repair_writer_coordinator_v1(coordinator)
+    _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = (
+        c3_runtime_seam_v1.bind_c3_closed_repair_runtime_interlocks_v1(
+            coordinator,
+            startup_recovery=startup_recovery,
+        )
+    )
     return {
         "ok": True,
         "status": "C3_RUNTIME_CAPABILITIES_INSTALLED_DORMANT_DEFAULT_OFF",
@@ -68194,36 +68502,302 @@ def _install_c3_closed_repair_writer_coordination_v1():
     }
 
 
-def _recover_c3_closed_repair_registry_v1():
-    """Record a clean default-off startup state without reading the Registry."""
-    installed = globals().get("C3_CLOSED_REPAIR_INSTALLATION_V1")
-    if not isinstance(installed, dict) or installed.get("enabled") is not False:
+def _c3_closed_identity_repair_trading_controls_v1():
+    return {
+        "enable_real_trading": bool(ENABLE_REAL_TRADING),
+        "broker_dry_run": env_bool("BROKER_DRY_RUN", True),
+        "falcon_mode": str(os.getenv("FALCON_MODE", "VERIFY") or "VERIFY")
+        .upper()
+        .strip(),
+        "central_real_execution_enabled": env_bool(
+            "CENTRAL_REAL_EXECUTION_ENABLED", False
+        ),
+        "central_real_pilot_enabled": env_bool(
+            "CENTRAL_REAL_PILOT_ENABLED", False
+        ),
+        "live_trading_enabled": env_bool("LIVE_TRADING_ENABLED", False),
+        "order_submission_authorized": False,
+    }
+
+
+def _build_c3_closed_identity_repair_runtime_operation_v1(*, interlocks=None):
+    loader = (
+        getattr(central_trade_registry, "load_registry_raw_read_only", None)
+        if central_trade_registry is not None
+        else None
+    )
+
+    def unavailable_loader():
+        raise RuntimeError("READ_ONLY_REGISTRY_LOADER_UNAVAILABLE")
+
+    selected_interlocks = (
+        interlocks
+        if interlocks is not None
+        else globals().get("_C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1")
+    )
+    if not isinstance(
+        selected_interlocks,
+        c3_runtime_seam_v1.C3ClosedRepairRuntimeInterlockBindingV1,
+    ):
+        raise RuntimeError("C3_RUNTIME_INTERLOCK_BINDING_REQUIRED")
+
+    return c3_closed_repair_operation_v1.ClosedIdentityRepairRuntimeOperationV1(
+        registry_loader=loader if callable(loader) else unavailable_loader,
+        conflict_auditor=trade_registry_closed_identity_financial_conflicts_v1,
+        registry_lock=_trpsf_v1_registry_lock,
+        trading_controls=_c3_closed_identity_repair_trading_controls_v1,
+        writer_coordination_status=selected_interlocks.coordination_status,
+        maintenance_lease=selected_interlocks.maintenance_lease,
+        target_path=_trpsf_v1_active_file(),
+        backup_root=(
+            Path(CENTRAL_DATA_DIR)
+            / "trade_registry_closed_identity_repair_backups_v1"
+        ),
+        config=c3_closed_repair_operation_v1.ClosedIdentityRepairRuntimeConfigV1(),
+    )
+
+
+def _recover_c3_closed_repair_registry_v1(*, interlocks=None):
+    """Gate readiness on same-coordinator WAL and transaction recovery."""
+    selected_interlocks = (
+        interlocks
+        if interlocks is not None
+        else globals().get("_C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1")
+    )
+    if not isinstance(
+        selected_interlocks,
+        c3_runtime_seam_v1.C3ClosedRepairRuntimeInterlockBindingV1,
+    ):
         return {
             "ok": False,
-            "status": "C3_DORMANT_STARTUP_RECOVERY_BLOCKED",
-            "reason": "DORMANT_PROVIDER_NOT_INSTALLED",
+            "status": "C3_STARTUP_RECOVERY_BLOCKED",
+            "reason": "RUNTIME_INTERLOCK_BINDING_REQUIRED",
+            "clean": False,
+            "readiness_allowed": False,
             "real_registry_accessed": False,
+            "write_executed": False,
+            "network_accessed": False,
+            "broker_called": False,
             "no_order_sent": True,
         }
+    try:
+        coordination = selected_interlocks.coordination_status()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "C3_STARTUP_RECOVERY_BLOCKED",
+            "reason": getattr(exc, "reason", type(exc).__name__),
+            "clean": False,
+            "readiness_allowed": False,
+            "real_registry_accessed": False,
+            "write_executed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    if coordination.get("enabled") is not True:
+        return {
+            "ok": True,
+            "status": "C3_DORMANT_STARTUP_RECOVERY_DEFERRED_DEFAULT_OFF",
+            "clean": False,
+            "enabled": False,
+            "startup_recovery_verified": False,
+            "recovery_required_before_readiness": True,
+            "readiness_allowed": False,
+            "writers_blocked_during_recovery": False,
+            "write_executed": False,
+            "real_registry_accessed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    try:
+        ready = selected_interlocks.run_startup_recovery_v1()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "C3_STARTUP_RECOVERY_BLOCKED",
+            "reason": getattr(exc, "reason", type(exc).__name__),
+            "clean": False,
+            "enabled": True,
+            "startup_recovery_verified": False,
+            "readiness_allowed": False,
+            "real_registry_accessed": False,
+            "write_executed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    summary = ready.get("startup_recovery_summary") or {}
     return {
         "ok": True,
-        "status": "C3_DORMANT_STARTUP_RECOVERY_NOT_REQUIRED",
+        "status": "C3_STARTUP_RECOVERY_COMPLETED",
         "clean": True,
-        "enabled": False,
-        "write_executed": False,
-        "real_registry_accessed": False,
+        "enabled": True,
+        "startup_recovery_verified": True,
+        "readiness_allowed": ready.get("coordination_ready") is True,
+        "writers_blocked_during_recovery": True,
+        "startup_recovery_attestation_sha256": ready.get(
+            "startup_recovery_attestation_sha256"
+        ),
+        "write_executed": bool(summary.get("write_executed")),
+        "real_registry_accessed": bool(
+            summary.get("real_registry_accessed")
+        ),
         "network_accessed": False,
         "broker_called": False,
         "no_order_sent": True,
     }
 
 
+C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = (
+    c3_resolved_authority_startup_bridge_v2.build_dormant_resolved_authority_startup_recovery_bridge_v2()
+)
+C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2 = (
+    c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2 = (
+    c3_authority_provisioning_manifest_v2.build_dormant_authority_provisioning_manifest_contract_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_CONTRACT_V2 = (
+    c3_authority_provisioning_receipt_v2.build_dormant_authority_provisioning_receipt_contract_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_V2 = (
+    c3_authority_provisioning_receipt_authenticated_verifier_v2.build_dormant_authenticated_provisioning_receipt_verifier_v2()
+)
+C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_CONTRACT_V2 = (
+    c3_authority_provisioning_physical_binding_v2.build_dormant_authority_provisioning_physical_binding_contract_v2()
+)
+C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2 = (
+    c3_authenticated_persistent_authority_boundary_v2.build_dormant_authenticated_persistent_authority_boundary_v2(
+        root_state_provider=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_state_provider,
+        root_authority_verifier=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_authority_verifier,
+        root_revocation_source=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_revocation_source,
+        multistore_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.multistore_recovery,
+        startup_bridge=C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2
+    )
+)
 C3_PERSISTENCE_BOOTSTRAP_V1 = trade_registry_persistent_storage_fix_v1_status(
     read_only=True,
     no_io=True,
 )
-C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1()
+C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1(
+    startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2
+)
+C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1 = (
+    _build_c3_closed_identity_repair_runtime_operation_v1()
+)
 C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1 = _recover_c3_closed_repair_registry_v1()
+
+
+# C3 production-startup port binding V1 — installed dormant, with no reads.
+# These explicit fail-closed sources prevent the dormant binding from being
+# mistaken for production authority before the controlled activation layer is
+# separately configured and attested.
+def _c3_production_startup_state_source_dormant_v1():
+    raise RuntimeError("C3_PRODUCTION_STARTUP_STATE_SOURCE_DORMANT")
+
+
+def _c3_production_seam_binding_source_dormant_v1():
+    raise RuntimeError("C3_PRODUCTION_SEAM_BINDING_SOURCE_DORMANT")
+
+
+def _c3_production_maintenance_completion_source_dormant_v1():
+    raise RuntimeError("C3_PRODUCTION_MAINTENANCE_COMPLETION_SOURCE_DORMANT")
+
+
+def _c3_production_evidence_verifier_source_dormant_v1(evidence, evidence_sha256):
+    raise RuntimeError("C3_PRODUCTION_EVIDENCE_VERIFIER_SOURCE_DORMANT")
+
+
+def _c3_production_startup_callback_source_dormant_v1(permit):
+    raise RuntimeError("C3_PRODUCTION_STARTUP_CALLBACK_SOURCE_DORMANT")
+
+
+_C3_PRODUCTION_STARTUP_PORTS_V1 = None
+_C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1 = None
+_C3_PRODUCTION_STARTUP_PORT_BINDING_V1 = None
+
+
+def _install_c3_production_startup_port_binding_dormant_v1():
+    """Bind disabled runtime ports without invoking providers or changing startup."""
+
+    global _C3_PRODUCTION_STARTUP_PORTS_V1
+    global _C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1
+    global _C3_PRODUCTION_STARTUP_PORT_BINDING_V1
+    try:
+        surface = c3_runtime_seam_v1.C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1
+        ports = c3_production_startup_port_binding_v1.RuntimeProductionStartupPortsV1(
+            atomic_lock=surface.atomic_lock,
+            trading_controls=_c3_closed_identity_repair_trading_controls_v1,
+            startup_state=_c3_production_startup_state_source_dormant_v1,
+            seam_binding_evidence=_c3_production_seam_binding_source_dormant_v1,
+            maintenance_completion_evidence=_c3_production_maintenance_completion_source_dormant_v1,
+            production_evidence_verifier=_c3_production_evidence_verifier_source_dormant_v1,
+            startup_callback=_c3_production_startup_callback_source_dormant_v1,
+            authority_root_sha256=None,
+            synthetic_only=False,
+            runtime_integrated=True,
+        )
+        ports_identity = c3_production_startup_port_binding_v1.runtime_production_startup_ports_identity_sha256_v1(
+            ports
+        )
+        adapter = c3_production_startup_port_binding_v1.RuntimeProductionStartupPortBindingAdapterContractV1(
+            ports=ports,
+            config=c3_production_startup_port_binding_v1.RuntimeProductionStartupPortBindingAdapterConfigV1(
+                enabled=False,
+                dormant_only=True,
+                scope_attestation=c3_production_startup_port_binding_v1.RUNTIME_PRODUCTION_STARTUP_PORT_BINDING_SCOPE_ATTESTATION_V1,
+                expected_ports_identity_sha256=ports_identity,
+            ),
+        )
+        binding = adapter.bind_dormant()
+        _C3_PRODUCTION_STARTUP_PORTS_V1 = ports
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1 = adapter
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_V1 = binding
+        return {
+            "ok": True,
+            "status": "C3_PRODUCTION_STARTUP_PORT_BINDING_INSTALLED_DORMANT",
+            "default_off": True,
+            "providers_invoked": False,
+            "production_authority_configured": False,
+            "activation_possible": False,
+            "gate_default_off": binding.gate.snapshot().get("default_off") is True,
+            "composition_default_off": binding.composition.snapshot().get("default_off")
+            is True,
+            "runtime_behavior_changed": False,
+            "live_allowed": False,
+            "order_submission_authorized": False,
+            "real_registry_accessed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+    except Exception as exc:
+        _C3_PRODUCTION_STARTUP_PORTS_V1 = None
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_ADAPTER_V1 = None
+        _C3_PRODUCTION_STARTUP_PORT_BINDING_V1 = None
+        return {
+            "ok": False,
+            "status": "C3_PRODUCTION_STARTUP_PORT_BINDING_DORMANT_BLOCKED",
+            "reason": type(exc).__name__,
+            "default_off": True,
+            "providers_invoked": False,
+            "production_authority_configured": False,
+            "activation_possible": False,
+            "runtime_behavior_changed": False,
+            "live_allowed": False,
+            "order_submission_authorized": False,
+            "real_registry_accessed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
+
+
+C3_PRODUCTION_STARTUP_PORT_BINDING_DORMANT_V1 = (
+    _install_c3_production_startup_port_binding_dormant_v1()
+)
 
 if CENTRAL_AUTO_START_RUNTIME:
     start_central_runtime_once()

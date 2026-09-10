@@ -116,7 +116,7 @@ def build_synthetic_c3_readiness_preflight_patch_plan_inputs_v1(
         ],
         "projected_outcome": {
             "required_guard_fields": required_fields,
-            "required_guard_count": 13,
+            "required_guard_count": 14,
             "all_fields_conjunctive": True,
             "decision_time_status_sample_required": True,
             "activation_receipt_sha256_required": True,
@@ -190,8 +190,8 @@ def run_synthetic_c3_readiness_preflight_patch_plan_harness_v1(
         and isinstance(receipt, dict)
         and receipt.get("p1_finding_count") == 2
         and receipt.get("patch_operation_count") == 2
-        and receipt.get("required_guard_count") == 13
-        and receipt.get("acceptance_case_count") == 19
+        and receipt.get("required_guard_count") == 14
+        and receipt.get("acceptance_case_count") == 20
         and receipt.get("apply_allowed") is False
         and receipt.get("activation_allowed") is False
         and receipt.get("production_blockers")

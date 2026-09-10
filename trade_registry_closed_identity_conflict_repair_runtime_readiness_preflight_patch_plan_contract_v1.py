@@ -28,8 +28,8 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _BINDING_CONTRACT_PIN = {
     "role": "readiness_binding_contract",
     "path": "trade_registry_closed_identity_conflict_repair_runtime_readiness_binding_contract_v1.py",
-    "sha256": "90c362d981f8f2c912c714aec4a8378aa7c8bc6f7e3d64bd440c36b01716b33f",
-    "normalized_size_bytes": 16720,
+    "sha256": "f55f6503330f2395f72545c6a5985f0e528671bfbcebe3211fa66be4d8c1410e",
+    "normalized_size_bytes": 16761,
 }
 _REHEARSAL_PHASES = (
     "ATTEST_FIVE_SOURCE_HASHES",
@@ -273,7 +273,7 @@ def _check_upstream(
         and supplied
         and hmac.compare_digest(supplied, expected)
         and receipt.get("source_attestation_count") == 4
-        and receipt.get("required_predicate_count") == 13
+        and receipt.get("required_predicate_count") == 14
         and receipt.get("writer_count") == 19
         and receipt.get("runtime_binding_satisfied") is False
         and receipt.get("production_ready") is False
@@ -322,8 +322,8 @@ def _check_plan(
     checks["acceptance_matrix_exact"] = bool(
         plan.get("acceptance_matrix") == matrix
         and plan.get("acceptance_matrix_sha256") == _stable_sha256(matrix)
-        and len(matrix) == 19
-        and len({item["case_id"] for item in matrix}) == 19
+        and len(matrix) == 20
+        and len({item["case_id"] for item in matrix}) == 20
     )
     safety = plan.get("safety_envelope")
     checks["plan_safety_envelope_exact"] = bool(
@@ -387,7 +387,7 @@ def _check_rehearsal(
     checks["rehearsal_projected_semantics_exact"] = bool(
         isinstance(projected, Mapping)
         and projected.get("required_guard_fields") == required_fields
-        and projected.get("required_guard_count") == 13
+        and projected.get("required_guard_count") == 14
         and projected.get("all_fields_conjunctive") is True
         and projected.get("decision_time_status_sample_required") is True
         and projected.get("activation_receipt_sha256_required") is True
@@ -474,8 +474,8 @@ def evaluate_c3_readiness_preflight_p1_patch_plan_offline_v1(
         "source_file_count": 5,
         "p1_finding_count": 2,
         "patch_operation_count": 2,
-        "required_guard_count": 13,
-        "acceptance_case_count": 19,
+        "required_guard_count": 14,
+        "acceptance_case_count": 20,
         "patch_content_present": False,
         "replacement_text_present": False,
         "source_hashes_must_be_rechecked": True,

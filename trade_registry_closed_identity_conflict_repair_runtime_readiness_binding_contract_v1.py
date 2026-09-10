@@ -34,20 +34,20 @@ _SOURCE_ATTESTATION_PINS = (
     {
         "role": "runtime_seam",
         "path": "trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py",
-        "sha256": "a730aed656c96c8def4393676e76f049730b5853eaaded7340d91725a79da3c7",
-        "normalized_size_bytes": 15709,
+        "sha256": "c5bb7d157d5a77061bd2395ba5fe83dcf7450885c856ff40cdc6664bfa3c5d87",
+        "normalized_size_bytes": 37093,
     },
     {
         "role": "static_preflight",
         "path": "trade_registry_closed_identity_conflict_repair_runtime_static_preflight_v1.py",
-        "sha256": "38b534fa7e91a4f0b11eb6494789027a2fa044df3628bea9e895619aa9bed2ea",
-        "normalized_size_bytes": 24501,
+        "sha256": "e2808fbe9e746ee67fbf528af66fc5e240cd3555e0d17ef8c45f1b778f2e7575",
+        "normalized_size_bytes": 46173,
     },
     {
         "role": "live_preflight_owner",
         "path": "main.py",
-        "sha256": "b2d5c53770b0ba20ef29ac0cc0dbe8c2792b814475bbf29d77bf1e4125c0599f",
-        "normalized_size_bytes": 2962946,
+        "sha256": "6bb4b7881839f15123e0f27b176d01d638070633d792c6ccdae9c4d9aee5bbb3",
+        "normalized_size_bytes": 2988537,
     },
 )
 
@@ -64,6 +64,7 @@ _RUNTIME_READINESS_VECTOR = (
     ("activation_receipt_verified", True),
     ("source_hashes_verified", True),
     ("rollback_ready", True),
+    ("startup_recovery_verified", True),
     ("kill_switch_ready", True),
 )
 
@@ -253,7 +254,7 @@ def _check_readiness_policy(
     vector_sha = _stable_sha256(expected_vector)
     checks["runtime_readiness_vector_exact"] = bool(
         vector == expected_vector
-        and len(expected_vector) == 13
+        and len(expected_vector) == 14
         and spec.get("required_runtime_readiness_vector_sha256") == vector_sha
     )
 

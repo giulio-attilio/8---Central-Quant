@@ -1,6 +1,7 @@
 import ast
 import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -94,6 +95,14 @@ def _compile_sync_functions(namespace):
     assert {node.name for node in nodes} == _SYNC_FUNCTIONS
     module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
+    namespace.setdefault(
+        "c3_runtime_seam_v1",
+        SimpleNamespace(
+            _c3_closed_repair_writer_mutation_v1=(
+                lambda _writer_id: lambda function: function
+            )
+        ),
+    )
     exec(compile(module, "<main-traderegistry-v2-ownership>", "exec"), namespace)
     return namespace
 
@@ -164,6 +173,15 @@ def _sync(registry, bot_positions, *, commit=True, write_gate=False):
     }
     _compile_sync_functions(namespace)
     return namespace["sync_trade_registry_from_open_positions"](commit=commit)
+
+
+def _mark_missing(registry, removed, *, timestamp="2026-09-06T01:00:00-03:00"):
+    namespace = {
+        "central_trade_registry": registry,
+        "data_hora_sp_str": lambda: timestamp,
+    }
+    _compile_sync_functions(namespace)
+    return namespace["mark_registry_missing_trades"](copy.deepcopy(removed))
 
 
 @pytest.mark.parametrize("bot", ("TURTLE", "PREDATOR"))
@@ -289,6 +307,113 @@ def test_ordinary_legacy_absence_still_marks_existing_v1_record_missing():
     assert registry.save_calls
     assert trade["status"] == "MISSING_FROM_BOTS"
     assert trade["missing_from_bots"] is True
+
+
+def test_missing_mark_is_persisted_once_then_becomes_idempotent():
+    position = _position()
+    open_trades = _v1_trade(position)
+    trade_id = next(iter(open_trades))
+    registry = _FakeTradeRegistry(open_trades)
+    removed = [{"trade_id": trade_id}]
+
+    first = _mark_missing(registry, removed)
+    after_first = copy.deepcopy(registry.registry)
+    second = _mark_missing(
+        registry,
+        removed,
+        timestamp="2026-09-06T02:00:00-03:00",
+    )
+
+    assert first["ok"] is True
+    assert first["marked_count"] == 1
+    assert first["registry_write"] is True
+    assert second == {
+        "ok": True,
+        "marked_count": 0,
+        "marked": [],
+        "already_marked": [trade_id],
+        "registry_write": False,
+    }
+    assert len(registry.save_calls) == 1
+    assert registry.registry == after_first
+
+
+def test_existing_equivalent_missing_mark_preserves_timestamps_without_save():
+    position = _position()
+    open_trades = _v1_trade(position)
+    trade_id = next(iter(open_trades))
+    open_trades[trade_id].update(
+        {
+            "status": "MISSING_FROM_BOTS",
+            "missing_from_bots": True,
+            "missing_detected_at": "2026-09-05T20:00:00-03:00",
+            "last_update": "2026-09-05T20:00:01-03:00",
+        }
+    )
+    registry = _FakeTradeRegistry(open_trades)
+    before = copy.deepcopy(registry.registry)
+
+    result = _mark_missing(registry, [{"trade_id": trade_id}])
+
+    assert result["marked_count"] == 0
+    assert result["registry_write"] is False
+    assert registry.save_calls == []
+    assert registry.registry == before
+
+
+def test_mixed_missing_batch_saves_only_the_effective_change():
+    first = _position()
+    second = _position(symbol="ETHUSDT", id="TURTLE20:ETHUSDT:LONG")
+    open_trades = _v1_trade(first)
+    open_trades.update(_v1_trade(second))
+    first_id, second_id = tuple(open_trades)
+    open_trades[first_id].update(
+        {
+            "status": "MISSING_FROM_BOTS",
+            "missing_from_bots": True,
+            "missing_detected_at": "2026-09-05T20:00:00-03:00",
+            "last_update": "2026-09-05T20:00:01-03:00",
+        }
+    )
+    registry = _FakeTradeRegistry(open_trades)
+
+    result = _mark_missing(
+        registry,
+        [{"trade_id": first_id}, {"trade_id": second_id}],
+    )
+
+    assert result["marked_count"] == 1
+    assert result["already_marked"] == [first_id]
+    assert len(registry.save_calls) == 1
+    assert registry.registry["open_trades"][first_id]["last_update"] == (
+        "2026-09-05T20:00:01-03:00"
+    )
+    assert registry.registry["open_trades"][second_id]["last_update"] == (
+        "2026-09-06T01:00:00-03:00"
+    )
+
+
+def test_missing_mark_fails_closed_when_persistence_is_not_confirmed():
+    class _RejectingRegistry(_FakeTradeRegistry):
+        def save_registry(self, registry):
+            self.save_calls.append(copy.deepcopy(registry))
+            return False
+
+    position = _position()
+    open_trades = _v1_trade(position)
+    trade_id = next(iter(open_trades))
+    registry = _RejectingRegistry(open_trades)
+    before = copy.deepcopy(registry.registry)
+
+    result = _mark_missing(registry, [{"trade_id": trade_id}])
+
+    assert result == {
+        "ok": False,
+        "error": "REGISTRY_SAVE_NOT_CONFIRMED",
+        "registry_write": False,
+    }
+    assert len(registry.save_calls) == 1
+    assert registry.registry == before
 
 
 def test_exact_v2_claim_without_a_legacy_signature_blocks_missing_mutation():

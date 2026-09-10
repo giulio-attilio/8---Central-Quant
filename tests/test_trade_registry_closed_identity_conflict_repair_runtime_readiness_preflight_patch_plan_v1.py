@@ -31,12 +31,28 @@ def _reseal_rehearsal(inputs: dict) -> None:
     )
 
 
+def test_binding_contract_pin_matches_audited_current_contract() -> None:
+    pin = next(
+        item
+        for item in contract.canonical_c3_preflight_patch_source_pins_v1()
+        if item["role"] == "readiness_binding_contract"
+    )
+    source_text = (ROOT / pin["path"]).read_text(encoding="utf-8")
+    expected = (
+        "f55f6503330f2395f72545c6a5985f0e528671bfbcebe3211fa66be4d8c1410e",
+        16761,
+    )
+
+    assert (pin["sha256"], pin["normalized_size_bytes"]) == expected
+    assert contract.binding.source_text_sha256_v1(source_text) == expected
+
+
 def test_valid_plan_is_complete_but_non_applicable(patch_inputs: dict) -> None:
     result = contract.evaluate_c3_readiness_preflight_p1_patch_plan_offline_v1(
         **copy.deepcopy(patch_inputs)
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is True, result.get("reasons")
     assert result["patch_plan_contract_verified"] is True
     assert result["upstream_readiness_binding_verified"] is True
     assert result["source_preconditions_verified"] is True
@@ -65,7 +81,7 @@ def test_exact_two_p1_operations_cover_runtime_and_static_preflight() -> None:
         "main.py",
         "trade_registry_closed_identity_conflict_repair_runtime_static_preflight_v1.py",
     }
-    assert all(len(item["required_guard_fields"]) == 13 for item in operations)
+    assert all(len(item["required_guard_fields"]) == 14 for item in operations)
     assert all(item["declarative_only"] is True for item in operations)
     assert all(item["patch_payload_present"] is False for item in operations)
     assert all(item["replacement_text_present"] is False for item in operations)
@@ -76,8 +92,8 @@ def test_acceptance_matrix_covers_each_guard_and_semantic_bypasses() -> None:
     matrix = contract.canonical_c3_preflight_patch_acceptance_matrix_v1()
     case_ids = {item["case_id"] for item in matrix}
 
-    assert len(matrix) == 19
-    assert len(case_ids) == 19
+    assert len(matrix) == 20
+    assert len(case_ids) == 20
     assert "LIVE_GATE_REJECTS_WEAKENED_ENABLED" in case_ids
     assert "LIVE_GATE_REJECTS_WEAKENED_RUNTIME_ACTIVATION_ALLOWED" in case_ids
     assert "LIVE_GATE_REJECTS_WEAKENED_REGISTERED_WRITER_COUNT" in case_ids
@@ -98,8 +114,8 @@ def test_receipt_keeps_both_p1_gaps_and_production_blockers_explicit(
     assert receipt["source_file_count"] == 5
     assert receipt["p1_finding_count"] == 2
     assert receipt["patch_operation_count"] == 2
-    assert receipt["required_guard_count"] == 13
-    assert receipt["acceptance_case_count"] == 19
+    assert receipt["required_guard_count"] == 14
+    assert receipt["acceptance_case_count"] == 20
     assert len(receipt["patch_plan_receipt_sha256"]) == 64
     assert receipt["patch_content_present"] is False
     assert receipt["replacement_text_present"] is False

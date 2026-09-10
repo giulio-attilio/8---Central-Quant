@@ -1138,7 +1138,7 @@ def _closed_trade_legacy_identity_states(
                 aliases_present.append(f"{source_name}.{alias}")
                 if value not in normalized_values:
                     normalized_values.append(value)
-        conflict = len(normalized_values) > 1
+        conflict, normalized_values = _closed_trade_alias_conflict(field, normalized_values, trade, metadata)
         states[field] = {
             "field": field,
             "present": bool(normalized_values),
@@ -1186,11 +1186,11 @@ def _closed_trade_timestamp(value: Any) -> str:
         return parsed.isoformat()
     except Exception:
         pass
+    # BR history exists at minute or second precision. Both are normalized;
+    # malformed timestamps remain untouched and therefore fail closed.
     try:
-        parsed = datetime.strptime(text, "%d/%m/%Y %H:%M:%S").replace(
-            tzinfo=TIMEZONE_BR
-        )
-        return parsed.astimezone(timezone.utc).isoformat()
+        timestamp_state = _closed_trade_br_timestamp_precision_state(text)
+        return str(timestamp_state["normalized"])
     except Exception:
         return text
 
@@ -3307,3 +3307,103 @@ def reset_trade_registry(confirm: bool = False) -> Dict[str, Any]:
     if write_result is False:
         return {"ok": False, "error": "TRADE_REGISTRY_RESET_NOT_PERSISTED"}
     return {"ok": True, "action": "TRADE_REGISTRY_RESET"}
+
+
+def _closed_trade_br_timestamp_precision_state(value: Any) -> Dict[str, Any]:
+    text = _closed_trade_text(value)
+    for date_format, precision in (
+        ("%d/%m/%Y %H:%M:%S", "second"),
+        ("%d/%m/%Y %H:%M", "minute"),
+    ):
+        try:
+            parsed = datetime.strptime(text, date_format).replace(
+                tzinfo=TIMEZONE_BR
+            )
+            normalized = parsed.astimezone(timezone.utc)
+            return {
+                "normalized": normalized.isoformat(),
+                "minute": normalized.replace(
+                    second=0, microsecond=0
+                ).isoformat(),
+                "precision": precision,
+            }
+        except Exception:
+            pass
+    raise ValueError("unsupported BR timestamp")
+
+
+def _closed_trade_timestamp_precision_state(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    """Normalize a timestamp while retaining its declared precision."""
+    text = _closed_trade_text(value)
+    if not text:
+        return None
+    try:
+        return _closed_trade_br_timestamp_precision_state(text)
+    except Exception:
+        pass
+    try:
+        candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(candidate)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc)
+        time_text = candidate.replace(" ", "T", 1).split("T", 1)[-1]
+        for marker in ("+", "-"):
+            marker_index = time_text.find(marker, 5)
+            if marker_index >= 0:
+                time_text = time_text[:marker_index]
+                break
+        precision = "minute" if time_text.count(":") == 1 else "second"
+        return {
+            "normalized": parsed.isoformat(),
+            "minute": parsed.replace(second=0, microsecond=0).isoformat(),
+            "precision": precision,
+        }
+    except Exception:
+        return None
+
+
+def _closed_trade_coalesce_timestamp_aliases(
+    values: Iterable[Any],
+) -> Optional[str]:
+    timestamp_states = [
+        _closed_trade_timestamp_precision_state(value) for value in values
+    ]
+    if not timestamp_states or any(state is None for state in timestamp_states):
+        return None
+    parsed_states = [state for state in timestamp_states if state is not None]
+    if len({state["minute"] for state in parsed_states}) != 1:
+        return None
+    precise_values = {
+        str(state["normalized"])
+        for state in parsed_states
+        if state["precision"] != "minute"
+    }
+    if len(precise_values) > 1:
+        return None
+    if precise_values:
+        return next(iter(precise_values))
+    return str(parsed_states[0]["normalized"])
+
+
+def _closed_trade_alias_conflict(
+    field: str,
+    normalized_values: List[str],
+    trade: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    conflict = len(normalized_values) > 1
+    if not conflict or field not in {"opened_at", "closed_at"}:
+        return conflict, normalized_values
+    aliases = CLOSED_TRADE_LEGACY_IDENTITY_ALIASES[field]
+    raw_values = [
+        source.get(alias)
+        for source in (trade, metadata)
+        for alias in aliases
+        if source.get(alias) not in (None, "")
+    ]
+    coalesced = _closed_trade_coalesce_timestamp_aliases(raw_values)
+    if not coalesced:
+        return True, normalized_values
+    return False, [coalesced]

@@ -265,7 +265,7 @@ def test_current_live_preflight_requires_exact_c3_vector_semantics(
     assert evidence["sampled_at_decision_time"] is True
     assert evidence["generic_ok_insufficient"] is True
     assert evidence["observed_fields"] == evidence["required_fields"]
-    assert len(evidence["required_fields"]) == 13
+    assert len(evidence["required_fields"]) == 14
 
 
 @pytest.mark.parametrize(
@@ -292,6 +292,181 @@ def test_weakened_c3_live_gate_semantics_fail_static_preflight(
 
     assert check["ok"] is False
     assert check["details"]["semantic_evidence"]["all_fields_conjunctive"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_current_sources_bind_resolved_authority_bridge_default_off(
+    current_harness_result: dict,
+) -> None:
+    result = current_harness_result["preflight_result"]
+    capability = _check(
+        result, "C3_RESOLVED_AUTHORITY_PHYSICAL_REFERENCE_CAPABLE"
+    )
+    binding = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert capability["ok"] is True
+    assert capability["details"]["temporary_synthetic_reference_only"] is True
+    assert capability["details"]["production_ready"] is False
+    assert binding["ok"] is True
+    assert binding["details"]["module_imported"] is True
+    assert binding["details"]["bridge_builder_bound"] is True
+    assert binding["details"]["production_adapters_builder_bound"] is True
+    assert binding["details"]["provisioning_manifest_builder_bound"] is True
+    assert binding["details"]["provisioning_receipt_builder_bound"] is True
+    assert (
+        binding["details"]["authenticated_receipt_verifier_builder_bound"]
+        is True
+    )
+    assert binding["details"]["physical_binding_builder_bound"] is True
+    assert binding["details"]["authenticated_boundary_builder_bound"] is True
+    assert binding["details"]["recovery_bridge_bound"] is True
+    assert binding["details"]["default_off_required"] is True
+
+
+def test_missing_resolved_authority_startup_bridge_dependency_fails_closed() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "        startup_bridge=C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2\n",
+        "",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert check["ok"] is False
+    assert check["details"]["recovery_bridge_bound"] is False
+    assert result["static_readiness"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_startup_cannot_bypass_authenticated_persistent_boundary() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "    startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2\n",
+        "    startup_recovery=C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2\n",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert check["ok"] is False
+    assert check["details"]["authenticated_boundary_builder_bound"] is True
+    assert check["details"]["recovery_bridge_bound"] is False
+    assert result["static_readiness"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_boundary_cannot_omit_persistent_revocation_adapter() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "        root_revocation_source=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_revocation_source,\n",
+        "",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert check["ok"] is False
+    assert check["details"]["production_adapters_builder_bound"] is True
+    assert check["details"]["authenticated_boundary_builder_bound"] is False
+    assert result["static_readiness"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_dormant_provisioning_manifest_cannot_be_removed() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "    c3_authority_provisioning_manifest_v2.build_dormant_authority_provisioning_manifest_contract_v2()\n",
+        "    None\n",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert check["ok"] is False
+    assert check["details"]["provisioning_manifest_builder_bound"] is False
+    assert result["static_readiness"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_dormant_provisioning_receipt_cannot_be_removed() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "    c3_authority_provisioning_receipt_v2.build_dormant_authority_provisioning_receipt_contract_v2()\n",
+        "    None\n",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert check["ok"] is False
+    assert check["details"]["provisioning_receipt_builder_bound"] is False
+    assert result["static_readiness"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_dormant_authenticated_receipt_verifier_cannot_be_removed() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "    c3_authority_provisioning_receipt_authenticated_verifier_v2.build_dormant_authenticated_provisioning_receipt_verifier_v2()\n",
+        "    None\n",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert check["ok"] is False
+    assert (
+        check["details"]["authenticated_receipt_verifier_builder_bound"]
+        is False
+    )
+    assert result["static_readiness"] is False
+    assert result["production_ready"] is False
+    assert result["live_allowed"] is False
+
+
+def test_dormant_physical_provisioning_binding_cannot_be_removed() -> None:
+    sources = harness.load_closed_repair_runtime_sources_read_only_v1(ROOT)
+    sources["main.py"] = sources["main.py"].replace(
+        "    c3_authority_provisioning_physical_binding_v2.build_dormant_authority_provisioning_physical_binding_contract_v2()\n",
+        "    None\n",
+        1,
+    )
+
+    result = preflight.evaluate_closed_repair_runtime_static_preflight_v1(sources)
+    check = _check(
+        result, "C3_RESOLVED_AUTHORITY_STARTUP_BRIDGE_BOUND_DEFAULT_OFF"
+    )
+
+    assert check["ok"] is False
+    assert check["details"]["physical_binding_builder_bound"] is False
+    assert result["static_readiness"] is False
     assert result["production_ready"] is False
     assert result["live_allowed"] is False
 

@@ -82,6 +82,7 @@ def _preflight_namespace(divergence):
                 "activation_receipt_verified": True,
                 "source_hashes_verified": True,
                 "rollback_ready": True,
+                "startup_recovery_verified": True,
                 "kill_switch_ready": True,
             }
         ),

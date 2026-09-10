@@ -1899,6 +1899,54 @@ def test_legacy_identity_alias_conflict_is_quarantined_fail_closed(
     assert result["diagnostics"]["strong_alias_conflict_count"] == 0
 
 
+def test_minute_precision_timestamp_alias_matches_exact_same_minute(
+    registry_module,
+):
+    trade = _real_trade(
+        opened_at="05/09/2026 11:00:48",
+        metadata={"created_at": "05/09/2026 11:00"},
+    )
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["has_alias_conflict"] is False
+    assert state["identity_kind"] == "LIFECYCLE_ID"
+    assert state["legacy_identity_states"]["opened_at"] == {
+        "field": "opened_at",
+        "present": True,
+        "value": "2026-09-05T14:00:48+00:00",
+        "normalized_values": ["2026-09-05T14:00:48+00:00"],
+        "aliases_present": ["trade.opened_at", "metadata.created_at"],
+        "conflict": False,
+        "reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata_created_at",
+    [
+        "05/09/2026 11:01",
+        "05/09/2026 11:00:10",
+        "invalid-timestamp",
+    ],
+)
+def test_timestamp_alias_disagreement_remains_fail_closed(
+    registry_module, metadata_created_at
+):
+    trade = _real_trade(
+        opened_at="05/09/2026 11:00:48",
+        metadata={"created_at": metadata_created_at},
+    )
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["identity_kind"] == "CONFLICT_QUARANTINED"
+    assert state["has_alias_conflict"] is True
+    assert [item["field"] for item in state["alias_conflicts"]] == [
+        "opened_at"
+    ]
+
+
 def test_semantic_financial_alias_conflict_is_preserved_fail_closed(
     registry_module,
 ):
