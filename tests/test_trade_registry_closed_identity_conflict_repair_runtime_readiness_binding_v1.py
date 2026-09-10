@@ -24,6 +24,35 @@ def _reseal(inputs: dict) -> None:
     spec["spec_sha256"] = contract.readiness_binding_spec_sha256_v1(spec)
 
 
+def test_source_pins_match_audited_dormant_hardening_payload() -> None:
+    pins = {
+        pin["role"]: pin
+        for pin in contract.canonical_c3_readiness_source_attestation_pins_v1()
+    }
+    expected = {
+        "runtime_seam": (
+            "c5bb7d157d5a77061bd2395ba5fe83dcf7450885c856ff40cdc6664bfa3c5d87",
+            37093,
+        ),
+        "live_preflight_owner": (
+            "6bb4b7881839f15123e0f27b176d01d638070633d792c6ccdae9c4d9aee5bbb3",
+            2988537,
+        ),
+    }
+
+    for role, (sha256, normalized_size_bytes) in expected.items():
+        pin = pins[role]
+        source_text = (ROOT / pin["path"]).read_text(encoding="utf-8")
+        assert (pin["sha256"], pin["normalized_size_bytes"]) == (
+            sha256,
+            normalized_size_bytes,
+        )
+        assert contract.source_text_sha256_v1(source_text) == (
+            sha256,
+            normalized_size_bytes,
+        )
+
+
 def test_valid_binding_policy_still_denies_runtime_and_live(binding_inputs: dict) -> None:
     result = contract.evaluate_c3_runtime_readiness_binding_policy_offline_v1(
         **copy.deepcopy(binding_inputs)

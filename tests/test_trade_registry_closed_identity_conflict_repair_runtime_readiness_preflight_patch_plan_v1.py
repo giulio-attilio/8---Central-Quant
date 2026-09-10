@@ -31,6 +31,22 @@ def _reseal_rehearsal(inputs: dict) -> None:
     )
 
 
+def test_binding_contract_pin_matches_audited_current_contract() -> None:
+    pin = next(
+        item
+        for item in contract.canonical_c3_preflight_patch_source_pins_v1()
+        if item["role"] == "readiness_binding_contract"
+    )
+    source_text = (ROOT / pin["path"]).read_text(encoding="utf-8")
+    expected = (
+        "f55f6503330f2395f72545c6a5985f0e528671bfbcebe3211fa66be4d8c1410e",
+        16761,
+    )
+
+    assert (pin["sha256"], pin["normalized_size_bytes"]) == expected
+    assert contract.binding.source_text_sha256_v1(source_text) == expected
+
+
 def test_valid_plan_is_complete_but_non_applicable(patch_inputs: dict) -> None:
     result = contract.evaluate_c3_readiness_preflight_p1_patch_plan_offline_v1(
         **copy.deepcopy(patch_inputs)
