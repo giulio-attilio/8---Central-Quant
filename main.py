@@ -56375,7 +56375,7 @@ def _frpp_v1_get_trade_registry_storage():
                 "error": "trade_registry_persistent_storage_fix_v1_status unavailable",
                 "status": "UNAVAILABLE",
             }
-        storage = fn(force=False) or {}
+        storage = fn(force=False, read_only=True) or {}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "status": "ERROR"}
     if not isinstance(storage, dict):

@@ -209,7 +209,7 @@ def test_preflight_storage_collector_embeds_exported_live_entry_interlock_result
         {
             "central_trade_registry": Registry,
             "trade_registry_persistent_storage_fix_v1_status": (
-                lambda force=False: status_calls.append(force)
+                lambda force=False, read_only=False: status_calls.append((force, read_only))
                 or {"status": "ACTIVE_PERSISTENT"}
             ),
         },
@@ -217,7 +217,7 @@ def test_preflight_storage_collector_embeds_exported_live_entry_interlock_result
 
     result = namespace["_frpp_v1_get_trade_registry_storage"]()
 
-    assert status_calls == [False]
+    assert status_calls == [(False, True)]
     assert readiness_calls == [True]
     assert result["status"] == "ACTIVE_PERSISTENT"
     assert result["live_entry_readiness"] is readiness
@@ -245,7 +245,7 @@ def test_preflight_storage_collector_fails_closed_for_invalid_provider(
         {
             "central_trade_registry": Registry,
             "trade_registry_persistent_storage_fix_v1_status": (
-                lambda force=False: {
+                lambda force=False, read_only=False: {
                     "ok": True,
                     "status": "ACTIVE_PERSISTENT",
                 }
@@ -261,6 +261,109 @@ def test_preflight_storage_collector_fails_closed_for_invalid_provider(
     assert readiness["read_only"] is True
     assert readiness["write_executed"] is False
     assert "sensitive detail" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("already_ready", [False, True])
+def test_preflight_storage_real_status_is_observational_and_preserves_readiness(
+    already_ready,
+):
+    class SyntheticFile:
+        def __str__(self):
+            return "/data/synthetic-trade-registry.json"
+
+        def exists(self):
+            return True
+
+    active = SyntheticFile()
+    cached_status = {"status": "ACTIVE_PERSISTENT"} if already_ready else None
+    state = {
+        "patched": already_ready,
+        "migration_done": already_ready,
+        "restart_readiness_attested": already_ready,
+        "last_load_ok": already_ready,
+        "last_write_ok": already_ready,
+        "write_allowed": already_ready,
+        "temporary_read_only": False,
+        "temporary_read_source": None,
+        "last_status": cached_status,
+    }
+    before = json.loads(json.dumps(state))
+    reads = []
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("status collection must not install, bootstrap or write")
+
+    registry = SimpleNamespace(
+        TRADE_REGISTRY_FILE=active,
+        DATA_DIR="synthetic-data-dir",
+        load_registry=forbidden,
+        save_registry=forbidden,
+    )
+    namespace = _load_functions(
+        {
+            "_frpp_v1_get_trade_registry_storage",
+            "trade_registry_persistent_storage_fix_v1_status",
+            "_trpsf_v1_falcon_live_entry_storage_readiness",
+        },
+        {
+            "central_trade_registry": registry,
+            "_TRPSF_V1_STATE": state,
+            "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "synthetic-version",
+            "_trpsf_v1_now": lambda: "synthetic-time",
+            "_trpsf_v1_active_file": lambda: active,
+            "_trpsf_v1_read_json": lambda path: reads.append(path) or {},
+            "_trpsf_v1_registry_counts": lambda _value: {"open_count": 0, "closed_count": 0},
+            "_trpsf_v1_apply_patch": forbidden,
+            "_trpsf_v1_bootstrap_registry": forbidden,
+            "_trpsf_v1_atomic_write_json": forbidden,
+            "_trpsf_v1_patched_load_registry": forbidden,
+            "_trpsf_v1_patched_save_registry": forbidden,
+        },
+    )
+    if already_ready:
+        registry.falcon_live_entry_storage_readiness = namespace[
+            "_trpsf_v1_falcon_live_entry_storage_readiness"
+        ]
+    registry_before = vars(registry).copy()
+
+    for _ in range(2):
+        result = namespace["_frpp_v1_get_trade_registry_storage"]()
+        assert result["read_only"] is True
+        assert result["write_executed"] is False
+        assert result["live_entry_readiness"]["ok"] is already_ready
+        assert result["status"] == (
+            "ACTIVE_PERSISTENT" if already_ready else "BOOTSTRAP_STATUS_NOT_AVAILABLE"
+        )
+        preflight = _preflight_namespace(_valid_divergence())
+        preflight["_frpp_v1_get_trade_registry_storage"] = lambda: result
+        assert _check(_compile_preflight(preflight), "TRADE_REGISTRY_PERSISTENT_OK")[
+            "ok"
+        ] is already_ready
+
+    assert reads == [active, active]
+    assert state == before
+    assert state["last_status"] is cached_status
+    assert vars(registry) == registry_before
+
+
+def test_preflight_storage_does_not_retry_legacy_provider_without_read_only():
+    legacy_calls = []
+
+    def legacy_provider(force=False):
+        legacy_calls.append(force)
+        return {"ok": True, "status": "ACTIVE_PERSISTENT"}
+
+    namespace = _load_functions(
+        {"_frpp_v1_get_trade_registry_storage"},
+        {
+            "trade_registry_persistent_storage_fix_v1_status": legacy_provider,
+            "central_trade_registry": None,
+        },
+    )
+    result = namespace["_frpp_v1_get_trade_registry_storage"]()
+    assert result["ok"] is False
+    assert result["status"] == "ERROR"
+    assert legacy_calls == []
 
 
 def test_preflight_registry_check_uses_exact_live_entry_interlock_result():
