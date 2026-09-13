@@ -5,6 +5,7 @@ import copy
 import importlib
 import json
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -64,6 +65,7 @@ def test_03_daily_summary_warns_when_source_incomplete(summary_module):
 
 class _Registry:
     def __init__(self, registry):
+        self._lock = threading.RLock()
         self.registry = registry
         self.saved = 0
 
@@ -120,6 +122,9 @@ def _repair_harness(tmp_path, closed_event=None):
 
     namespace = {
         "request_cached_predator_audit": lambda audit: lambda function: function,
+        "c3_runtime_seam_v1": types.SimpleNamespace(
+            _c3_closed_repair_writer_mutation_v1=lambda _: lambda function: function),
+        "_trpsf_v1_registry_lock": lambda: storage._lock,
         "observe_predator_audit": lambda audit: lambda function: function,
         "predator_audit_stage": lambda *args, **kwargs: _NoopStage(),
         "PREDATOR_AUDIT_REQUEST_SHARED_LIMIT": 2000,

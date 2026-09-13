@@ -21,6 +21,9 @@ _COMPILED_FUNCTIONS = None
 
 def _load_functions(names, namespace):
     global _COMPILED_FUNCTIONS
+    names = set(names) | {"_trpsf_v1_registry_lock"}
+    namespace.setdefault("c3_runtime_seam_v1", SimpleNamespace(
+        _c3_closed_repair_writer_mutation_v1=lambda _: lambda function: function))
     if _COMPILED_FUNCTIONS is None:
         tree = ast.parse(MAIN.read_text(encoding="utf-8"))
         selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
@@ -360,7 +363,13 @@ def test_repeated_automatic_block_does_not_spam_audit_journal(tmp_path):
 def test_implementation_has_no_broker_order_or_execution_engine_dependency():
     source = MAIN.read_text(encoding="utf-8")
     start = source.index("# PREDATOR AUTO CLOSED REGISTRY SYNC HARDENING V1")
-    end = source.index('if __name__ == "__main__":', start)
+    # Scope the whole auto-sync section through its last route, not unrelated
+    # C3 startup/trading-control definitions added below it. Never import main.
+    last_route = next(node for node in ast.parse(source).body
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == "predator_auto_closed_sync_v1_text_route")
+    end = sum(len(line) for line in source.splitlines(keepends=True)[:last_route.end_lineno])
+    assert end > start
     block = source[start:end]
     forbidden = (
         "central_broker", "broker.py", "place_order", "cancel_order", "close_position",

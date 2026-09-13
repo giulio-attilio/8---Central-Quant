@@ -35,8 +35,8 @@ def test_source_pins_match_audited_dormant_hardening_payload() -> None:
             37093,
         ),
         "live_preflight_owner": (
-            "4472fa4da21793b67a2c0e5ee846950d94d52ec6be9c5d794dd08345c229ffb9",
-            2988553,
+            "2c04c752b0fed634bc2344d8a2cba13132ffe4652e1dea01e6575d316b41a52e",
+            2995320,
         ),
     }
 

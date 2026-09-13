@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -223,7 +224,9 @@ def test_commit_aligns_all_statistical_r_aliases_and_preserves_gross_r():
     original = _synthetic_broker_reconciled_trade()
     registry = {"closed_trades": [copy.deepcopy(original)]}
     saved = []
+    registry_lock = threading.RLock()
     namespace = {
+        "_trpsf_v1_registry_lock": lambda: registry_lock,
         "TRADE_CLOSE_OUTCOME_V1_VERSION": "TEST-SEMANTIC-V1",
         "TRADE_CLOSE_OUTCOME_V1_LATEST_FILE": "unused-latest",
         "TRADE_CLOSE_OUTCOME_V1_EVENTS_FILE": "unused-events",

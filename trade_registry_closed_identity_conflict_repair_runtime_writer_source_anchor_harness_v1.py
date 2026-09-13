@@ -37,6 +37,8 @@ def _marker_kind(line: str) -> str:
         return "REGISTRY_SNAPSHOT_READ_CALL"
     if "_trpsf_v1_read_json(" in stripped:
         return "RAW_REGISTRY_READ_CALL"
+    if stripped.startswith("raw = _rp_v12_load_raw_registry_safe("):
+        return "RAW_REGISTRY_READ_CALL"
     if "load_registry(" in stripped or "_load_registry(" in stripped:
         return "REGISTRY_READ_CALL"
     if "path.exists()" in stripped:
@@ -48,6 +50,11 @@ def _marker_kind(line: str) -> str:
         return "WITH_MODULE_RLOCK"
     if stripped.startswith("with registry_lock:"):
         return "WITH_LOCAL_LOCK"
+    if stripped in {
+        "with registry_lock if commit else nullcontext():",
+        "with registry_lock if registry_lock is not None else nullcontext():",
+    }:
+        return "WITH_CONDITIONAL_LOCAL_LOCK"
     if "registry_lock.acquire(" in stripped:
         return "LOCAL_LOCK_ACQUIRE"
     if stripped == "try:":

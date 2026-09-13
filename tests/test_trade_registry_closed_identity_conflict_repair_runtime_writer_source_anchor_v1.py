@@ -74,10 +74,10 @@ def test_fresh_read_and_insertion_seam_markers_are_exact(anchor_inputs: dict) ->
     assert by_id["MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT"]["fresh_marker"] == "REGISTRY_SNAPSHOT_READ_CALL"
     assert by_id["MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP"]["fresh_marker"] == "RAW_REGISTRY_READ_CALL"
     assert by_id["TRADE_REGISTRY_RESET"]["fresh_marker"] is None
-    assert by_id["MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE"]["fresh_marker"] == "TRY_INSERTION_SEAM"
-    assert by_id["MAIN_REGISTRY_MODE_SEGREGATION_COMMIT"]["fresh_marker"] == "LOOP_INSERTION_SEAM"
-    assert by_id["MAIN_PREDATOR_PAPER_REGISTRY_SYNC"]["fresh_marker"] == "TRY_INSERTION_SEAM"
-    assert by_id["MAIN_PREDATOR_ORPHAN_OPEN_FIX"]["fresh_marker"] == "TRY_INSERTION_SEAM"
+    assert by_id["MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE"]["fresh_marker"] == "RAW_REGISTRY_READ_CALL"
+    assert by_id["MAIN_REGISTRY_MODE_SEGREGATION_COMMIT"]["fresh_marker"] == "REGISTRY_READ_CALL"
+    assert by_id["MAIN_PREDATOR_PAPER_REGISTRY_SYNC"]["fresh_marker"] == "REGISTRY_READ_CALL"
+    assert by_id["MAIN_PREDATOR_ORPHAN_OPEN_FIX"]["fresh_marker"] == "REGISTRY_READ_CALL"
 
 
 def test_all_authoritative_writes_still_have_expected_markers(anchor_inputs: dict) -> None:
@@ -104,12 +104,74 @@ def test_all_authoritative_writes_still_have_expected_markers(anchor_inputs: dic
 def test_existing_process_local_lock_markers_are_exact(anchor_inputs: dict) -> None:
     observed = anchor_inputs["source_anchor_evidence"]["observed_anchors"]
     locks = {item["writer_id"]: item["local_lock_marker"] for item in observed if item["local_lock_marker"] is not None}
-    assert len(locks) == 10
+    assert len(locks) == 18
     assert list(locks.values()).count("WITH_MODULE_RLOCK") == 7
+    assert list(locks.values()).count("WITH_LOCAL_LOCK") == 8
+    assert {key for key, value in locks.items() if value == "WITH_CONDITIONAL_LOCAL_LOCK"} == {
+        "MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE",
+        "MAIN_REGISTRY_MODE_SEGREGATION_COMMIT",
+        "MAIN_PREDATOR_PAPER_REGISTRY_SYNC",
+    }
     assert locks["MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT"] == "WITH_LOCAL_LOCK"
-    assert locks["MAIN_PREDATOR_AUTO_CLOSED_SYNC"] == "LOCAL_LOCK_ACQUIRE"
+    assert locks["MAIN_PREDATOR_AUTO_CLOSED_SYNC"] == "WITH_LOCAL_LOCK"
     assert locks["MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP"] == "WITH_LOCAL_LOCK"
     assert "TRADE_REGISTRY_RESET" not in locks
+
+
+def test_main_placements_bind_ast_lock_read_and_write_nodes() -> None:
+    """Independent AST containment check; never import or execute main."""
+    tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8-sig"))
+    placements = [p for p in contract.canonical_runtime_writer_source_anchor_expectations_v1()
+                  if p["component"] == "main.py"]
+    assert len(placements) == 11
+    future_only = {
+        "MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT",
+        "MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP",
+    }
+    protected_count = 0
+    for item in placements:
+        functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                     and n.name == item["function"]]
+        assert len(functions) == 1, item["writer_id"]
+        function = functions[0]
+        assert (function.lineno, function.end_lineno) == (
+            item["function_start_line"], item["function_end_line"])
+        locks = [n for n in ast.walk(function) if isinstance(n, ast.With)
+                 and n.lineno == item["process_local_lock_line"]]
+        assert len(locks) == 1, item["writer_id"]
+        lock = locks[0]
+        assert item["acquire_before_line"] <= lock.lineno
+        assert item["release_after_line"] >= lock.end_lineno
+        # All eleven pins must point to real calls. Only the nine corrected
+        # writers promise containment in the current process-local lock.
+        # Restore/bootstrap retain declarative future coordinator boundaries;
+        # their unchanged code is NOT certified as an atomic local RMW here.
+        scope = function if item["writer_id"] in future_only else lock
+        protected_count += item["writer_id"] not in future_only
+        call_lines = {n.lineno for n in ast.walk(scope) if isinstance(n, ast.Call)}
+        assert item["fresh_read_after_acquire_line"] in call_lines, item["writer_id"]
+        assert set(item["authoritative_write_lines"]) <= call_lines, item["writer_id"]
+        if item["commit_guard_line"] is not None:
+            assert any(isinstance(n, ast.If) and n.lineno == item["commit_guard_line"]
+                       for n in ast.walk(function)), item["writer_id"]
+    assert protected_count == 9
+
+
+@pytest.mark.parametrize("line", [
+    "with registry_lock if commit else nullcontext():",
+    "with registry_lock if registry_lock is not None else nullcontext():",
+])
+def test_exact_conditional_lock_forms_recognized(line: str) -> None:
+    assert harness._marker_kind(line) == "WITH_CONDITIONAL_LOCAL_LOCK"
+
+
+@pytest.mark.parametrize("line", [
+    "with registry_lock if True else nullcontext():",
+    "with registry_lock if unrelated else nullcontext():",
+    "with other_lock:",
+])
+def test_unrecognized_lock_forms_are_not_accepted(line: str) -> None:
+    assert harness._marker_kind(line) == "OTHER"
 
 
 def test_commit_guards_are_observed_without_source_content(anchor_inputs: dict) -> None:
