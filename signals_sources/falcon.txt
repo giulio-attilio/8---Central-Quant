@@ -1,0 +1,202 @@
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+def add_indicators(df):
+    df = df.copy()
+    prev_close = df['close'].shift(1)
+    tr = pd.concat([(df['high'] - df['low']).abs(), (df['high'] - prev_close).abs(), (df['low'] - prev_close).abs()], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(ATR_LEN).mean()
+    df['ema20'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    df['vol_ma20'] = df['volume'].rolling(20).mean()
+    df['volume_rel'] = df['volume'] / df['vol_ma20']
+    up_move = df['high'].diff()
+    down_move = -df['low'].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0), index=df.index)
+    atr_adx = tr.rolling(ADX_LEN).mean()
+    plus_di = 100 * plus_dm.rolling(ADX_LEN).mean() / atr_adx
+    minus_di = 100 * minus_dm.rolling(ADX_LEN).mean() / atr_adx
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    df['adx'] = dx.rolling(ADX_LEN).mean()
+    return df
+
+def closed_candles(df):
+    if df is None or len(df) < 40:
+        return None
+    return df.iloc[:-1].copy()
+
+def position_id(symbol, setup, side, ny_date):
+    return f'{setup}:{symbol}:{side}:{ny_date}'
+
+def risk_pct(entry, stop):
+    entry = safe_float(entry)
+    stop = safe_float(stop)
+    if entry <= 0:
+        return 0.0
+    return abs(entry - stop) / entry * 100.0
+
+def ny_dt_from_row(row):
+    dt_utc = row['dt']
+    if getattr(dt_utc, 'tzinfo', None) is None:
+        dt_utc = dt_utc.tz_localize('UTC')
+    return dt_utc.to_pydatetime().astimezone(TIMEZONE_NY)
+
+def ny_time_bounds(range_minutes):
+    start = dtime(ORB_START_HOUR, ORB_START_MINUTE)
+    start_minutes = ORB_START_HOUR * 60 + ORB_START_MINUTE
+    end_minutes = start_minutes + int(range_minutes)
+    range_end = dtime(end_minutes // 60, end_minutes % 60)
+    trade_end = dtime(ORB_TRADE_END_HOUR, ORB_TRADE_END_MINUTE)
+    return (start, range_end, trade_end)
+
+def get_orb_range(closed, range_minutes):
+    if closed is None or len(closed) < 30:
+        return None
+    start_t, end_t, _ = ny_time_bounds(range_minutes)
+    last_ny = ny_dt_from_row(closed.iloc[-1])
+    target_date = last_ny.date()
+    rows = []
+    for _, row in closed.iterrows():
+        ndt = ny_dt_from_row(row)
+        if ndt.date() == target_date and start_t <= ndt.time() < end_t:
+            rows.append(row)
+    if not rows:
+        return None
+    rdf = pd.DataFrame(rows)
+    return {'ny_date': target_date.isoformat(), 'range_high': safe_float(rdf['high'].max()), 'range_low': safe_float(rdf['low'].min()), 'range_start_ny': start_t.strftime('%H:%M'), 'range_end_ny': end_t.strftime('%H:%M'), 'candles': len(rdf)}
+
+def is_trade_window(row, range_minutes):
+    _, end_t, trade_end = ny_time_bounds(range_minutes)
+    ndt = ny_dt_from_row(row)
+    return end_t <= ndt.time() <= trade_end
+
+def trend_state_for_timeframe(symbol, timeframe):
+    df = safe_fetch_ohlcv(symbol, timeframe=timeframe, limit=120)
+    closed = closed_candles(df)
+    if closed is None or len(closed) < EMA_SLOW + 5:
+        return 0
+    c = add_indicators(closed).iloc[-1]
+    close = safe_float(c['close'])
+    ema20 = safe_float(c['ema20'])
+    ema50 = safe_float(c['ema50'])
+    if close > ema20 > ema50:
+        return 1
+    if close < ema20 < ema50:
+        return -1
+    return 0
+
+def passes_alignment(symbol, side):
+    if ALIGNMENT_MODE == 'off':
+        return True
+    want = 1 if side == 'LONG' else -1
+    h1 = trend_state_for_timeframe(symbol, '1h')
+    if ALIGNMENT_MODE == 'h1':
+        return h1 == want
+    h4 = trend_state_for_timeframe(symbol, '4h')
+    if ALIGNMENT_MODE == 'h1_h4':
+        return h1 == want and h4 == want
+    return True
+
+def quality_from_score(score):
+    score = int(score or 0)
+    if score >= 80:
+        return 'ALTA 🟢'
+    if score >= 65:
+        return 'MÉDIA 🟡'
+    return 'BAIXA 🔴'
+
+def calc_falcon_score(row, close, atr, range_size, breakout_size, volume_rel, adx):
+    score = 0
+    atr_pct = atr / close * 100 if close else 0
+    score += min(20, max(0, int(atr_pct / 1.0 * 20)))
+    score += min(25, max(0, int(safe_float(volume_rel, 1.0) / 2.0 * 25)))
+    breakout_atr = breakout_size / atr if atr > 0 else 0
+    score += min(25, max(0, int(breakout_atr / 0.35 * 25)))
+    range_atr = range_size / atr if atr > 0 else 0
+    if MIN_RANGE_ATR <= range_atr <= 2.0:
+        score += 20
+    elif range_atr <= MAX_RANGE_ATR:
+        score += 10
+    score += min(10, max(0, int(safe_float(adx) / 30 * 10)))
+    score = max(0, min(100, int(score)))
+    return (score, breakout_atr, range_atr)
+
+def analyze_symbol_setup(symbol, setup_key, setup_cfg, closed):
+    if closed is None or len(closed) < 80:
+        return None
+    df = add_indicators(closed)
+    row = df.iloc[-1]
+    if not is_trade_window(row, setup_cfg['range_minutes']):
+        funnel_inc('fora_janela_ny')
+        return None
+    orb = get_orb_range(df, setup_cfg['range_minutes'])
+    if not orb or orb['range_high'] <= 0 or orb['range_low'] <= 0 or (orb['range_high'] <= orb['range_low']):
+        funnel_inc('range_nao_formado')
+        return None
+    close = safe_float(row['close'])
+    high = safe_float(row['high'])
+    low = safe_float(row['low'])
+    atr = safe_float(row['atr'])
+    adx = safe_float(row.get('adx'), 0.0)
+    volume_rel = safe_float(row.get('volume_rel'), 1.0)
+    if close <= 0 or atr <= 0:
+        return None
+    atr_pct = atr / close * 100
+    if atr_pct < MIN_ATR_PCT:
+        funnel_inc('reprovados_atr')
+        return None
+    range_high = orb['range_high']
+    range_low = orb['range_low']
+    range_size = range_high - range_low
+    range_atr = range_size / atr if atr > 0 else 0
+    if range_atr < MIN_RANGE_ATR or range_atr > MAX_RANGE_ATR:
+        funnel_inc('reprovados_range')
+        return None
+    side = None
+    breakout_size = 0.0
+    if close > range_high:
+        side = 'LONG'
+        breakout_size = close - range_high
+        funnel_inc('rompimentos_15_buy' if setup_key == 'FALCON15' else 'rompimentos_30_buy')
+    elif close < range_low:
+        side = 'SHORT'
+        breakout_size = range_low - close
+        funnel_inc('rompimentos_15_sell' if setup_key == 'FALCON15' else 'rompimentos_30_sell')
+    if not side:
+        return None
+    if volume_rel < MIN_VOLUME_REL_TO_SIGNAL:
+        funnel_inc('reprovados_volume')
+        return None
+    if adx < MIN_ADX_TO_SIGNAL:
+        funnel_inc('reprovados_adx')
+        return None
+    if not passes_alignment(symbol, side):
+        funnel_inc('reprovados_alinhamento')
+        return None
+    if side == 'LONG':
+        stop = range_low - atr * STOP_ATR_BUFFER
+        tp50 = close + TP50_R * abs(close - stop)
+    else:
+        stop = range_high + atr * STOP_ATR_BUFFER
+        tp50 = close - TP50_R * abs(stop - close)
+    rp = risk_pct(close, stop)
+    if rp <= 0 or rp > MAX_RISK_PCT:
+        funnel_inc('reprovados_risco')
+        return None
+    score, breakout_atr, range_atr = calc_falcon_score(row, close, atr, range_size, breakout_size, volume_rel, adx)
+    if score < SCORE_MIN_QUALITY_TO_SIGNAL:
+        funnel_inc('reprovados_score')
+        return None
+    current_ts = int(row['ts'])
+    ny_date = orb['ny_date']
+    signal = {'id': position_id(symbol, setup_key, side, ny_date), 'bot': BOT_NAME, 'setup': setup_key, 'setup_label': setup_cfg['label'], 'symbol': symbol, 'side': side, 'direction': 'BUY' if side == 'LONG' else 'SELL', 'entry': close, 'initial_stop': stop, 'stop': stop, 'tp50': tp50, 'atr': atr, 'atr_pct': atr_pct, 'risk_pct': rp, 'score_falcon': score, 'quality': quality_from_score(score), 'volume_rel': volume_rel, 'adx': adx, 'breakout_atr': breakout_atr, 'range_atr': range_atr, 'range_high': range_high, 'range_low': range_low, 'range_minutes': setup_cfg['range_minutes'], 'range_start_ny': orb['range_start_ny'], 'range_end_ny': orb['range_end_ny'], 'ny_date': ny_date, 'timeframe': TIMEFRAME, 'signal_ts': current_ts, 'signal_dt': str(row['dt']), 'created_at': data_hora_sp_str(), 'status': 'OPEN', 'tp50_hit': False, 'be_moved': False, 'trailing_active': False, 'mfe_pct': 0.0, 'mae_pct': 0.0, 'mfe_r': 0.0, 'mae_r': 0.0, 'best_price': close, 'worst_price': close, 'management_cycles': 0, 'candles_to_tp50': None, 'opened_candle_ts': current_ts}
+    try:
+        return attach_falcon_signal_identity(signal, birth_facts={'closed_candle_ts': current_ts, 'closed_candle_high': high, 'closed_candle_low': low, 'closed_candle_close': close, 'orb_range_high': range_high, 'orb_range_low': range_low, 'orb_range_minutes': setup_cfg['range_minutes'], 'orb_range_start_ny': orb['range_start_ny'], 'orb_range_end_ny': orb['range_end_ny']})
+    except FalconSignalIdentityConstructionError:
+        return signal

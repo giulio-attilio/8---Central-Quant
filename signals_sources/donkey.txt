@@ -1,0 +1,275 @@
+def nome_limpo(symbol):
+    return symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
+
+def calcular_supertrend_df(df, period=10, multiplier=3.5):
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    hl2 = (high + low) / 2
+    upperband = hl2 + multiplier * atr
+    lowerband = hl2 - multiplier * atr
+    final_upper = upperband.copy()
+    final_lower = lowerband.copy()
+    direction = pd.Series(index=df.index, dtype='int64')
+    supertrend = pd.Series(index=df.index, dtype='float64')
+    direction.iloc[0] = 1
+    supertrend.iloc[0] = lowerband.iloc[0]
+    for i in range(1, len(df)):
+        final_upper.iloc[i] = upperband.iloc[i] if upperband.iloc[i] < final_upper.iloc[i - 1] or close.iloc[i - 1] > final_upper.iloc[i - 1] else final_upper.iloc[i - 1]
+        final_lower.iloc[i] = lowerband.iloc[i] if lowerband.iloc[i] > final_lower.iloc[i - 1] or close.iloc[i - 1] < final_lower.iloc[i - 1] else final_lower.iloc[i - 1]
+        if direction.iloc[i - 1] == -1:
+            direction.iloc[i] = 1 if close.iloc[i] > final_upper.iloc[i] else -1
+        else:
+            direction.iloc[i] = -1 if close.iloc[i] < final_lower.iloc[i] else 1
+        supertrend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+    return (supertrend, direction)
+
+def calcular_adx(df, period=14):
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series([u if u > d and u > 0 else 0 for u, d in zip(up_move, down_move)], index=df.index)
+    minus_dm = pd.Series([d if d > u and d > 0 else 0 for u, d in zip(up_move, down_move)], index=df.index)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return (adx, plus_di, minus_di)
+
+def marcar_spikes(df):
+    """
+    Marca candles com range/pavio anormal em relação ao ATR.
+    Isso ajuda a evitar que um candle com dado ruim gere stop, ATR ou sinal falso.
+    """
+    df = df.copy()
+    if not ENABLE_SPIKE_FILTER:
+        df['spike_suspeito'] = False
+        return df
+    if 'atr14' not in df.columns:
+        df['atr14'] = calcular_atr(df, ATR_LEN)
+    candle_range = (df['high'].astype(float) - df['low'].astype(float)).abs()
+    candle_body = (df['close'].astype(float) - df['open'].astype(float)).abs()
+    atr = df['atr14'].astype(float)
+    spike_range = candle_range > atr * SPIKE_RANGE_ATR_MULT
+    spike_body = candle_body > atr * SPIKE_BODY_ATR_MULT
+    df['spike_suspeito'] = (spike_range | spike_body).fillna(False)
+    return df
+
+def preparar_df(df):
+    df = df.copy()
+    df['ema9'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema20'] = df['close'].ewm(span=EMA20, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=EMA_MID, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=EMA50, adjust=False).mean()
+    df['ema200'] = df['close'].ewm(span=EMA200, adjust=False).mean()
+    df['atr14'] = calcular_atr(df, ATR_LEN)
+    df = marcar_spikes(df)
+    _, st_dir = calcular_supertrend_df(df, period=SUPERTREND_PERIOD, multiplier=SUPERTREND_FACTOR)
+    df['supertrend_dir'] = st_dir
+    df['vol_avg20'] = df['volume'].rolling(20).mean()
+    df['volume_ok'] = df['volume'] > df['vol_avg20']
+    bb_basis = df['close'].rolling(20).mean()
+    bb_dev = df['close'].rolling(20).std()
+    bb_upper = bb_basis + 2 * bb_dev
+    bb_lower = bb_basis - 2 * bb_dev
+    bb_width = (bb_upper - bb_lower) / bb_basis
+    df['bb_width'] = bb_width
+    df['bb_width_avg'] = bb_width.rolling(100).mean()
+    df['bb_ok'] = bb_width > df['bb_width_avg']
+    adx, plus_di, minus_di = calcular_adx(df, ADX_LEN)
+    df['adx'] = adx
+    df['plus_di'] = plus_di
+    df['minus_di'] = minus_di
+    df['adx_ok'] = adx >= ADX_MIN
+    macd_fast = df['close'].ewm(span=DONKEY_MACD_FAST, adjust=False).mean()
+    macd_slow = df['close'].ewm(span=DONKEY_MACD_SLOW, adjust=False).mean()
+    df['macd'] = macd_fast - macd_slow
+    df['macd_signal'] = df['macd'].ewm(span=DONKEY_MACD_SIGNAL, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+    return df
+
+def detectar_donkey_h4(symbol):
+    """
+    DONKEY H4:
+    BUY: candle H4 fechado acima da EMA20, EMA20 acima da EMA50 e MACD acima de zero.
+    SELL: candle H4 fechado abaixo da EMA20, EMA20 abaixo da EMA50 e MACD abaixo de zero.
+    Não envia novo DONKEY enquanto houver posição aberta no ativo.
+    """
+    if not ENABLE_DONKEY_H4:
+        return None
+    if existe_posicao_ativa(symbol):
+        return None
+    if donkey_em_cooldown_pos_saida(symbol):
+        return None
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=['time', 'open', 'high', 'low', 'close', 'volume']))
+    candle = df_h4.iloc[-2]
+    if bool(candle.get('spike_suspeito', False)):
+        print(f'DONKEY IGNORADO POR CANDLE H4 SUSPEITO: {nome_limpo(symbol)}')
+        return None
+    timestamp = int(candle['time'])
+    close = float(candle['close'])
+    high = float(candle['high'])
+    low = float(candle['low'])
+    ema20 = float(candle['ema20'])
+    ema50 = float(candle['ema50'])
+    macd = float(candle['macd'])
+    signal = None
+    if close > ema20 and ema20 > ema50 and (macd > 0):
+        signal = 'LONG'
+    if close < ema20 and ema20 < ema50 and (macd < 0):
+        signal = 'SHORT'
+    if not signal:
+        return None
+    if donkey_em_cooldown(symbol, signal, timestamp):
+        return None
+    entry = close
+    if signal == 'LONG':
+        sl = low * (1 - DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(entry - sl)
+        tp50 = entry + risk_abs * TP50_R
+    else:
+        sl = high * (1 + DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(sl - entry)
+        tp50 = entry - risk_abs * TP50_R
+    if risk_abs <= 0:
+        return None
+    risk_pct = risk_abs / entry * 100
+    marcar_donkey_cooldown(symbol, signal, timestamp)
+    return {'type': 'DONKEY', 'signal_type': 'DONKEY', 'symbol': symbol, 'symbol_clean': nome_limpo(symbol), 'signal': signal, 'side': signal, 'timestamp': timestamp, 'entry': entry, 'sl': sl, 'tp50': tp50, 'risk_abs': risk_abs, 'risk_pct': risk_pct, 'h4_state': 1 if signal == 'LONG' else -1, 'h1_state': 0, 'adx_h4': float(candle.get('adx', 0)), 'adx_h1': 0.0, 'volume_ok': bool(candle.get('volume_ok', False)), 'bb_ok': bool(candle.get('bb_ok', False)), 'qualidade_pontos': 0, 'qualidade': 'DONKEY H4 🐴', 'signal_score': 0, 'elite_candidate': False, 'donkey_risk_usdt': float(DONKEY_RISK_USDT), 'donkey_ema20': ema20, 'donkey_ema50': ema50, 'donkey_macd': macd}
+
+def detectar_donkey_h4_original(symbol):
+    """
+    DONKEY H4 ORIGINAL:
+    Checklist original, sem regra de pullback.
+
+    BUY:
+    - EMA20 H4 acima da EMA50 H4
+    - Preço H4 acima da EMA20 H4
+    - Preço H4 acima da EMA50 H4
+    - MACD H4 acima de zero
+    - Preço diário acima da EMA20 diária
+
+    SELL:
+    - EMA20 H4 abaixo da EMA50 H4
+    - Preço H4 abaixo da EMA20 H4
+    - Preço H4 abaixo da EMA50 H4
+    - MACD H4 abaixo de zero
+    - Preço diário abaixo da EMA20 diária
+    """
+    if not ENABLE_DONKEY_H4_ORIGINAL:
+        return None
+    if existe_posicao_ativa(symbol):
+        return None
+    if donkey_em_cooldown_pos_saida(symbol):
+        return None
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    ohlcv_d1 = safe_fetch_ohlcv(symbol, timeframe='1d', limit=120)
+    if not ohlcv_h4 or not ohlcv_d1:
+        return None
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=['time', 'open', 'high', 'low', 'close', 'volume']))
+    df_d1 = preparar_df(pd.DataFrame(ohlcv_d1, columns=['time', 'open', 'high', 'low', 'close', 'volume']))
+    candle = df_h4.iloc[-2]
+    candle_d1 = df_d1.iloc[-2]
+    if bool(candle.get('spike_suspeito', False)):
+        print(f'DONKEY ORIGINAL IGNORADO POR CANDLE H4 SUSPEITO: {nome_limpo(symbol)}')
+        return None
+    timestamp = int(candle['time'])
+    close = float(candle['close'])
+    high = float(candle['high'])
+    low = float(candle['low'])
+    ema20 = float(candle['ema20'])
+    ema50 = float(candle['ema50'])
+    macd = float(candle['macd'])
+    close_d1 = float(candle_d1['close'])
+    ema20_d1 = float(candle_d1['ema20'])
+    original_long = ema20 > ema50 and close > ema20 and (close > ema50) and (macd > 0) and (close_d1 > ema20_d1)
+    original_short = ema20 < ema50 and close < ema20 and (close < ema50) and (macd < 0) and (close_d1 < ema20_d1)
+    signal = 'LONG' if original_long else 'SHORT' if original_short else None
+    if not signal:
+        return None
+    if donkey_em_cooldown(symbol, f'ORIGINAL_{signal}', timestamp):
+        return None
+    entry = close
+    if signal == 'LONG':
+        sl = low * (1 - DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(entry - sl)
+        tp50 = entry + risk_abs * TP50_R
+    else:
+        sl = high * (1 + DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(sl - entry)
+        tp50 = entry - risk_abs * TP50_R
+    if risk_abs <= 0:
+        return None
+    risk_pct = risk_abs / entry * 100
+    if USE_MAX_RISK_FILTER and risk_pct > DONKEY_MAX_RISK_PCT:
+        print(f'DONKEY ORIGINAL IGNORADO POR RISCO ALTO: {nome_limpo(symbol)} | {risk_pct:.2f}% > {DONKEY_MAX_RISK_PCT:.2f}%')
+        return None
+    marcar_donkey_cooldown(symbol, f'ORIGINAL_{signal}', timestamp)
+    return {'type': 'DONKEY_ORIGINAL', 'signal_type': 'DONKEY_ORIGINAL', 'symbol': symbol, 'symbol_clean': nome_limpo(symbol), 'signal': signal, 'side': signal, 'timestamp': timestamp, 'entry': entry, 'sl': sl, 'tp50': tp50, 'risk_abs': risk_abs, 'risk_pct': risk_pct, 'h4_state': 1 if signal == 'LONG' else -1, 'h1_state': 0, 'adx_h4': float(candle.get('adx', 0)), 'adx_h1': 0.0, 'volume_ok': bool(candle.get('volume_ok', False)), 'bb_ok': bool(candle.get('bb_ok', False)), 'qualidade_pontos': 0, 'qualidade': 'DONKEY H4 ORIGINAL 🐴', 'signal_score': 0, 'elite_candidate': False, 'donkey_risk_usdt': float(DONKEY_RISK_USDT), 'donkey_ema20': ema20, 'donkey_ema50': ema50, 'donkey_macd': macd, 'donkey_d1_close': close_d1, 'donkey_d1_ema20': ema20_d1}
+
+def detectar_early_donkey_h4(symbol):
+    """
+    EARLY DONKEY H4:
+    - BUY: candle H4 fechado acima da EMA20 e MACD acima de zero, mas EMA20 ainda <= EMA50.
+    - SELL: candle H4 fechado abaixo da EMA20 e MACD abaixo de zero, mas EMA20 ainda >= EMA50.
+    - Serve para estatística da entrada antecipada antes da confirmação EMA20/EMA50.
+    """
+    if not ENABLE_EARLY_DONKEY_H4:
+        return None
+    if existe_posicao_ativa(symbol):
+        return None
+    if donkey_em_cooldown_pos_saida(symbol):
+        return None
+    ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=['time', 'open', 'high', 'low', 'close', 'volume']))
+    candle = df_h4.iloc[-2]
+    if bool(candle.get('spike_suspeito', False)):
+        print(f'EARLY DONKEY IGNORADO POR CANDLE H4 SUSPEITO: {nome_limpo(symbol)}')
+        return None
+    timestamp = int(candle['time'])
+    close = float(candle['close'])
+    high = float(candle['high'])
+    low = float(candle['low'])
+    ema20 = float(candle['ema20'])
+    ema50 = float(candle['ema50'])
+    macd = float(candle['macd'])
+    signal = None
+    if close > ema20 and macd > 0 and (ema20 <= ema50):
+        signal = 'LONG'
+    if close < ema20 and macd < 0 and (ema20 >= ema50):
+        signal = 'SHORT'
+    if not signal:
+        return None
+    if donkey_em_cooldown(symbol, f'EARLY_{signal}', timestamp):
+        return None
+    entry = close
+    if signal == 'LONG':
+        sl = low * (1 - DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(entry - sl)
+        tp50 = entry + risk_abs * TP50_R
+    else:
+        sl = high * (1 + DONKEY_BUFFER_PCT / 100)
+        risk_abs = abs(sl - entry)
+        tp50 = entry - risk_abs * TP50_R
+    if risk_abs <= 0:
+        return None
+    risk_pct = risk_abs / entry * 100
+    marcar_donkey_cooldown(symbol, f'EARLY_{signal}', timestamp)
+    return {'type': 'EARLY_DONKEY', 'signal_type': 'EARLY_DONKEY', 'symbol': symbol, 'symbol_clean': nome_limpo(symbol), 'signal': signal, 'side': signal, 'timestamp': timestamp, 'entry': entry, 'sl': sl, 'tp50': tp50, 'risk_abs': risk_abs, 'risk_pct': risk_pct, 'h4_state': 1 if signal == 'LONG' else -1, 'h1_state': 0, 'adx_h4': float(candle.get('adx', 0)), 'adx_h1': 0.0, 'volume_ok': bool(candle.get('volume_ok', False)), 'bb_ok': bool(candle.get('bb_ok', False)), 'qualidade_pontos': 0, 'qualidade': 'EARLY DONKEY H4 🐴', 'signal_score': 0, 'elite_candidate': False, 'donkey_risk_usdt': float(DONKEY_RISK_USDT), 'donkey_ema20': ema20, 'donkey_ema50': ema50, 'donkey_macd': macd}
+
+def calcular_atr(df, period=14):
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()

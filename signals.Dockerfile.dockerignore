@@ -1,0 +1,16 @@
+**
+!signals.Dockerfile
+!signals.Dockerfile.dockerignore
+!signals-requirements.txt
+!bingx_public_signal_source.py
+!donkey_advisory_offline.py
+!falcon_advisory_offline.py
+!falcon_advisory_preview.py
+!falcon_signal_identity.py
+!signal_only_workflow.py
+!signal_only_service.py
+!telegram_signal_delivery.py
+!signal_only_runner.py
+!signals_sources/
+!signals_sources/falcon.txt
+!signals_sources/donkey.txt
