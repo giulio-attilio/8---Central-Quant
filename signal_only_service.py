@@ -17,7 +17,7 @@ from falcon_advisory_offline import _config, _policy, _require, _timestamp, revi
 from donkey_advisory_offline import validate_config as donkey_config
 from donkey_advisory_offline import reviewed_analysis as donkey_source
 from signal_only_workflow import run_once, DONKEY_VARIANTS
-from bingx_public_signal_source import collect_snapshot
+from bingx_public_signal_source import collect_snapshot, validate_snapshot, PublicDataError, safe_error_code
 from telegram_signal_delivery import _route
 
 
@@ -132,6 +132,65 @@ def evaluate_cycle(config, sources, snapshots, *, now_ms):
     return dict(status="CYCLE_EVALUATED", results=results, delivery_allowed=False, live_allowed=False)
 
 
+def diagnose_public_cycle(config, sources, *, public_data_authorized=False):
+    """One finite measurement, no ledger, credentials, delivery or retries.
+
+    Reports only counts, durations, fixed stages/codes; never market payloads.
+    A completed measurement does not qualify production capacity or delivery.
+    """
+    state = dict(status="BLOCKED", reason="PUBLIC_READ_AUTHORIZATION_REQUIRED",
+                 stage="authorization", completed_symbols=0, evaluations=0,
+                 delivery_allowed=False, live_allowed=False, capacity_approved=False)
+    if public_data_authorized is not True:
+        return state
+    started = time.monotonic()
+    stage = "configuration"
+    try:
+        config = validate_service_config(config)
+        _require(type(sources) is dict and set(sources) == {"FALCON", "DONKEY"}, "SOURCES_REQUIRED")
+        reviewed_analysis(sources["FALCON"])
+        donkey_source(sources["DONKEY"])
+        symbols = list(dict.fromkeys(s for entry in config["bots"].values() for s in entry["symbols"]))
+        state["planned_symbols"] = len(symbols)
+        counts = {}
+        allowed = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
+                   "EXPIRED", "PUBLIC_DELIVERY_NOT_ENABLED"}
+        for symbol in symbols:
+            selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
+            needed = set().union(*(required_frames(bot, entry) for bot, entry in selected.items()))
+            stage = "collection"
+            snapshot = collect_snapshot(symbol, [tf for tf in ("15m", "1h", "4h", "1d") if tf in needed], authorized=True, limit=200)
+            _require(type(snapshot) is dict and snapshot.get("symbol") == symbol and
+                     snapshot.get("synthetic") is False, "SNAPSHOT_IDENTITY_MISMATCH")
+            for bot, entry in selected.items():
+                scoped = scoped_snapshot(snapshot, required_frames(bot, entry))
+                for setup in entry["setups"]:
+                    now = time.time_ns() // 1000000
+                    stage = "freshness_validation"
+                    validate_snapshot(scoped, now_ms=now,
+                                      frame_max_age_ms=entry["policy"]["snapshot_max_age_ms"],
+                                      quote_max_age_ms=entry["policy"]["quote_max_age_ms"])
+                    stage = "analysis"
+                    out = run_once(bot, sources[bot], scoped, entry["analysis"], entry["policy"],
+                                   setup=setup, now_ms=now, public_data_authorized=True,
+                                   network_authorized=False, public_delivery_authorized=False)
+                    state["evaluations"] += 1
+                    reason = out.get("reason")
+                    if type(reason) is not str or reason not in allowed or out.get("status") not in {"BLOCKED", "LOCAL_PUBLIC_PREVIEW"}:
+                        return dict(state, status="FAILED", reason="DIAGNOSTIC_ANALYSIS_STOPPED", stage=stage)
+                    counts[reason] = counts.get(reason, 0) + 1
+            state["completed_symbols"] += 1
+        elapsed = max(0, time.monotonic() - started)
+        return dict(state, status="DIAGNOSTIC_COMPLETE", reason="NO_DELIVERY_ATTEMPTED", stage="complete",
+                    scan_seconds=round(elapsed, 3),
+                    cycle_with_pause_seconds=round(elapsed + config["poll_interval_ms"] / 1000, 3),
+                    reason_counts=counts)
+    except PublicDataError as error:
+        return dict(state, status="FAILED", reason=safe_error_code(error), stage=stage)
+    except Exception:
+        return dict(state, status="FAILED", reason="DIAGNOSTIC_FAILURE_REDACTED", stage=stage)
+
+
 @contextmanager
 def exclusive_service(ledger_path):
     """OS-held local lock, released on exit/crash. Never deletes lock/ledger files.
@@ -210,7 +269,10 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                     selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
                     needed = set().union(*(required_frames(bot, entry) for bot, entry in selected.items()))
                     intervals = [tf for tf in ("15m", "1h", "4h", "1d") if tf in needed]
-                    snapshot = collect_snapshot(symbol, intervals, authorized=True, limit=200)
+                    try:
+                        snapshot = collect_snapshot(symbol, intervals, authorized=True, limit=200)
+                    except PublicDataError as error:
+                        return dict(state, status="FAILED", reason=safe_error_code(error))
                     _require(type(snapshot) is dict and snapshot.get("symbol") == symbol and
                              snapshot.get("synthetic") is False, "SNAPSHOT_IDENTITY_MISMATCH")
                     for bot, entry in selected.items():
@@ -230,7 +292,9 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             elif result.get("reason") not in benign:
                                 # Never return untrusted response/exception contents or credentials.
                                 return dict(state, status="FAILED", reason="EVALUATION_OR_DELIVERY_STOPPED")
-                            if stop_event.wait(1):
+                            # Pace actual Telegram sends; public HTTP is paced in
+                            # collection. Pure evaluations need no delivery delay.
+                            if result["status"] == "CONFIRMED" and stop_event.wait(1):
                                 return dict(state, status="STOPPED", reason="STOP_REQUESTED")
                 state["cycles"] += 1
                 if max_cycles is not None and state["cycles"] >= max_cycles:

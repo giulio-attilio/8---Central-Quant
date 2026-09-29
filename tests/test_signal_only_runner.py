@@ -15,6 +15,30 @@ import signal_only_runner as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_diagnostic_cli_has_no_credential_reads_ledger_or_delivery(self):
+        def locale_only(key, default=None):
+            if key not in {'LANGUAGE', 'LC_ALL', 'LC_MESSAGES', 'LANG', 'COLUMNS', 'LINES'}:
+                raise AssertionError('credential read forbidden')
+            return default
+        with tempfile.TemporaryDirectory() as directory:
+            config, path = self.inputs(directory)
+            argv = ['--diagnose-public', '--config', str(config)]
+            with patch.object(runner.os.environ, 'get', side_effect=locale_only), \
+                 patch.object(fixtures.service, 'collect_snapshot', side_effect=fixtures.service.PublicDataError('PUBLIC_HTTP_FAILED_NO_RETRY')) as collect, \
+                 patch.object(runner, 'execute') as execute, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(runner.main(argv), 1)
+                collect.assert_not_called()
+                self.assertEqual(runner.main(argv + ['--authorize-public-data']), 1)
+            reports = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(reports[0]['reason'], 'PUBLIC_READ_AUTHORIZATION_REQUIRED')
+            self.assertEqual(reports[1]['reason'], 'PUBLIC_HTTP_FAILED_NO_RETRY')
+            self.assertEqual(reports[1]['stage'], 'collection')
+            self.assertIs(reports[1]['delivery_allowed'], False)
+            collect.assert_called_once()
+            execute.assert_not_called()
+            self.assertFalse(path.exists())
+
     def inputs(self, directory):
         config = Path(directory) / 'config.json'
         config.write_text(json.dumps(fixtures.config()), encoding='utf-8')
@@ -82,6 +106,26 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(runner.execute({}, {}, path, authorized=True)['status'], 'FAILED')
                 self.assertEqual(runner.execute({}, {}, path, authorized=True)['status'], 'BLOCKED')
                 self.assertEqual(run.call_count, 1)
+            self.assertEqual(Path(str(path) + '.halted').read_text(), 'MANUAL_REVIEW_REQUIRED\n')
+
+    def test_public_diagnostic_survives_cli_and_latches_without_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, path = self.inputs(directory)
+            runner.provision_ledger(path)
+            argv = ['--run', '--config', str(config), '--ledger', str(path),
+                    '--authorize-service', '--authorize-public-data', '--authorize-telegram']
+            with patch.object(runner.os.environ, 'get', side_effect=lambda key, default=None: fixtures.fixtures.VALUES.get(key, default)), \
+                 patch.object(fixtures.service, 'collect_snapshot', side_effect=fixtures.service.PublicDataError('CANDLE_GAP_OR_DUPLICATE')) as collect, \
+                 patch.object(fixtures.service, 'run_once') as evaluate, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(runner.main(argv), 1)
+                self.assertEqual(runner.main(argv), 1)
+            reports = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(reports[0]['reason'], 'CANDLE_GAP_OR_DUPLICATE')
+            self.assertEqual(reports[1]['reason'], 'LEDGER_OR_MANUAL_REVIEW_REQUIRED')
+            self.assertTrue(all(r['live_allowed'] is False for r in reports))
+            collect.assert_called_once()
+            evaluate.assert_not_called()
             self.assertEqual(Path(str(path) + '.halted').read_text(), 'MANUAL_REVIEW_REQUIRED\n')
 
     def test_error_output_does_not_expose_exception(self):

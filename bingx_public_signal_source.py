@@ -19,6 +19,30 @@ class PublicDataError(ValueError):
     pass
 
 
+PUBLIC_ERROR_CODES = frozenset({
+    "INVALID_NUMBER", "INVALID_TIMESTAMP", "PUBLIC_READ_AUTHORIZATION_REQUIRED",
+    "ENDPOINT_NOT_ALLOWED", "SYMBOL", "INTERVAL", "LIMIT", "QUOTE_INTERVAL",
+    "PUBLIC_HTTP_FAILED_NO_RETRY", "RESPONSE_TOO_LARGE", "PUBLIC_API_REJECTED_NO_RETRY",
+    "PUBLIC_TRANSPORT_OR_JSON_FAILED_NO_RETRY", "CANDLES_REQUIRED",
+    "UNREVIEWED_CANDLE_SCHEMA", "CANDLE_FIELDS", "CANDLE_ALIGNMENT_REVIEW_REQUIRED",
+    "CANDLE_OHLC", "CANDLE_GAP_OR_DUPLICATE", "QUOTE_SYMBOL_OR_SCHEMA", "QUOTE_FIELDS",
+    "EXPLICIT_AGE_POLICY_REQUIRED", "SNAPSHOT_REQUIRED", "PUBLIC_SOURCE_REQUIRED",
+    "FEED_DISCONNECTED", "UNQUALIFIED_INPUT_REQUIRED", "SNAPSHOT_STALE_OR_FUTURE",
+    "FRAMES_REQUIRED", "FRAME_RECEIPTS_REQUIRED", "FRAME_STALE_OR_FUTURE",
+    "CANDLE_ORDER", "FRAME_NOT_CURRENT", "QUOTE_STALE_OR_FUTURE",
+    "INTERVALS", "DUPLICATE_INTERVAL",
+})
+
+
+def safe_error_code(error):
+    """Fixed diagnostic only; never stringify exceptions or return raw responses."""
+    if type(error) is PublicDataError and len(error.args) == 1:
+        code = error.args[0]
+        if type(code) is str and code in PUBLIC_ERROR_CODES:
+            return code
+    return "PUBLIC_DATA_FAILURE_REDACTED"
+
+
 def require(condition, code):
     if not condition:
         raise PublicDataError(code)
@@ -39,7 +63,7 @@ def stamp(value):
     return value
 
 
-def request_public(kind, symbol, *, interval=None, limit=200, authorized=False):
+def _public_path(kind, symbol, *, interval=None, limit=200, authorized=False):
     require(authorized is True, "PUBLIC_READ_AUTHORIZATION_REQUIRED")
     require(type(kind) is str and kind in PATHS, "ENDPOINT_NOT_ALLOWED")
     require(type(symbol) is str and re.fullmatch(r"[A-Z0-9]{2,25}-USDT", symbol) is not None, "SYMBOL")
@@ -50,9 +74,12 @@ def request_public(kind, symbol, *, interval=None, limit=200, authorized=False):
         params.update(interval=interval, limit=limit)
     else:
         require(interval is None, "QUOTE_INTERVAL")
-    connection = http.client.HTTPSConnection("open-api.bingx.com", timeout=15)
+    return PATHS[kind] + "?" + urlencode(params)
+
+
+def _read_public(connection, path):
     try:
-        connection.request("GET", PATHS[kind] + "?" + urlencode(params), headers={"Accept": "application/json"})
+        connection.request("GET", path, headers={"Accept": "application/json"})
         response = connection.getresponse()
         raw = response.read(1048577)
         require(response.status == 200, "PUBLIC_HTTP_FAILED_NO_RETRY")
@@ -64,6 +91,13 @@ def request_public(kind, symbol, *, interval=None, limit=200, authorized=False):
         raise
     except Exception:
         raise PublicDataError("PUBLIC_TRANSPORT_OR_JSON_FAILED_NO_RETRY") from None
+
+
+def request_public(kind, symbol, *, interval=None, limit=200, authorized=False):
+    path = _public_path(kind, symbol, interval=interval, limit=limit, authorized=authorized)
+    connection = http.client.HTTPSConnection("open-api.bingx.com", timeout=15)
+    try:
+        return _read_public(connection, path)
     finally:
         connection.close()
 
@@ -152,13 +186,21 @@ guarantee. A production scheduler sharing IP limits remains separate work.
     require(type(intervals) in (tuple, list) and 1 <= len(intervals) <= 4, "INTERVALS")
     require(all(type(x) is str and x in PERIODS for x in intervals), "INTERVAL")
     require(len(set(intervals)) == len(intervals), "DUPLICATE_INTERVAL")
+    # Validate all requests before constructing a connection. Reuse only within
+    # this finite symbol read; a failed request is never retried.
+    paths = [_public_path("candles", symbol, interval=interval, limit=limit,
+                          authorized=authorized) for interval in intervals]
+    quote_path = _public_path("quote", symbol, authorized=authorized)
     frames, received = {}, {}
-    for interval in intervals:
-        frames[interval] = normalize_candles(request_public("candles", symbol, interval=interval,
-            limit=limit, authorized=True), interval)
-        received[interval] = time.time_ns() // 1000000
-        time.sleep(1)
-    quote = normalize_quote(request_public("quote", symbol, authorized=True), symbol)
+    connection = http.client.HTTPSConnection("open-api.bingx.com", timeout=15)
+    try:
+        for interval, path in zip(intervals, paths):
+            frames[interval] = normalize_candles(_read_public(connection, path), interval)
+            received[interval] = time.time_ns() // 1000000
+            time.sleep(1)
+        quote = normalize_quote(_read_public(connection, quote_path), symbol)
+    finally:
+        connection.close()
     observed = time.time_ns() // 1000000
     # Receipt metadata does not prove that each frame was current at receipt.
     return dict(synthetic=False, connected=True, source="BINGX_PUBLIC_SWAP",

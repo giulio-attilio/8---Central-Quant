@@ -13,7 +13,7 @@ import threading
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from signal_only_service import run_service, validate_service_config
+from signal_only_service import run_service, validate_service_config, diagnose_public_cycle
 from falcon_advisory_offline import reviewed_analysis
 from donkey_advisory_offline import reviewed_analysis as review_donkey
 from telegram_signal_delivery import initialize_ledger, ROUTES
@@ -78,6 +78,7 @@ def main(argv=None):
     mode.add_argument('--check-config', action='store_true')
     mode.add_argument('--initialize-ledger', action='store_true')
     mode.add_argument('--run', action='store_true')
+    mode.add_argument('--diagnose-public', action='store_true')
     parser.add_argument('--config', required=True)
     parser.add_argument('--ledger')
     parser.add_argument('--authorize-service', action='store_true')
@@ -88,6 +89,9 @@ def main(argv=None):
         config, sources = load_inputs(args.config)
         if args.check_config:
             result = dict(status='CONFIG_VALID', live_allowed=False)
+        elif args.diagnose_public:
+            result = diagnose_public_cycle(config, sources,
+                                           public_data_authorized=args.authorize_public_data)
         elif not args.ledger:
             result = dict(status='BLOCKED', reason='LEDGER_PATH_REQUIRED')
         elif args.initialize_ledger:
@@ -99,10 +103,12 @@ def main(argv=None):
     except Exception:
         result = dict(status='BLOCKED', reason='CONFIGURATION_OR_STORAGE_REVIEW_REQUIRED')
     # Never print exceptions, paths, config, credentials or raw transport responses.
-    allowed = {key: result[key] for key in ('status', 'reason', 'cycles', 'evaluations', 'confirmed') if key in result}
+    allowed = {key: result[key] for key in ('status', 'reason', 'cycles', 'evaluations', 'confirmed',
+               'stage', 'completed_symbols', 'planned_symbols', 'scan_seconds',
+               'cycle_with_pause_seconds', 'reason_counts', 'delivery_allowed', 'capacity_approved') if key in result}
     allowed['live_allowed'] = False
     print(json.dumps(allowed), flush=True)
-    return 0 if result.get('status') in ('CONFIG_VALID', 'LEDGER_INITIALIZED', 'STOPPED') else 1
+    return 0 if result.get('status') in ('CONFIG_VALID', 'LEDGER_INITIALIZED', 'STOPPED', 'DIAGNOSTIC_COMPLETE') else 1
 
 
 if __name__ == '__main__':

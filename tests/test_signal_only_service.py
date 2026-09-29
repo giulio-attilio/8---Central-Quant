@@ -20,10 +20,109 @@ def config():
 
 
 class ServiceTests(unittest.TestCase):
+    def test_diagnostic_authorization_and_configuration_precede_collection(self):
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with patch.object(service, "collect_snapshot") as collect:
+            self.assertEqual(service.diagnose_public_cycle(config(), sources)["status"], "BLOCKED")
+            self.assertEqual(service.diagnose_public_cycle({}, sources, public_data_authorized=True)["stage"], "configuration")
+            collect.assert_not_called()
+
+    def test_diagnostic_finite_measurement_never_enables_delivery(self):
+        snapshot, _ = fixtures.PublicPreviewTests().public_fixture("DONKEY")
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with patch.object(service, "collect_snapshot", return_value=snapshot) as collect, \
+             patch.object(service, "validate_snapshot"), \
+             patch.object(service, "run_once", return_value=dict(status="BLOCKED", reason="NO_SIGNAL")) as run, \
+             patch.object(service.time, "monotonic", side_effect=[100, 110]), \
+             patch.object(service.time, "sleep", side_effect=AssertionError("no cycle sleep")):
+            out = service.diagnose_public_cycle(config(), sources, public_data_authorized=True)
+        self.assertEqual(out["status"], "DIAGNOSTIC_COMPLETE")
+        self.assertEqual(out["completed_symbols"], 1)
+        self.assertEqual(out["evaluations"], 5)
+        self.assertEqual(out["reason_counts"], {"NO_SIGNAL": 5})
+        self.assertEqual(out["scan_seconds"], 10)
+        self.assertEqual(out["cycle_with_pause_seconds"], 11)
+        self.assertIs(out["capacity_approved"], False)
+        collect.assert_called_once()
+        for call in run.call_args_list:
+            self.assertIs(call.kwargs["network_authorized"], False)
+            self.assertIs(call.kwargs["public_delivery_authorized"], False)
+            self.assertNotIn("values", call.kwargs)
+            self.assertNotIn("ledger_path", call.kwargs)
+
+    def test_diagnostic_failure_identifies_stage_without_raw_data_or_retry(self):
+        snapshot, _ = fixtures.PublicPreviewTests().public_fixture("DONKEY")
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        for stage in ("collection", "freshness_validation", "analysis"):
+            with self.subTest(stage=stage), patch.object(service, "collect_snapshot", return_value=snapshot) as collect, \
+                 patch.object(service, "validate_snapshot") as validate, \
+                 patch.object(service, "run_once") as run:
+                if stage == "collection":
+                    collect.side_effect = service.PublicDataError("CANDLE_GAP_OR_DUPLICATE")
+                elif stage == "freshness_validation":
+                    validate.side_effect = service.PublicDataError("FRAME_NOT_CURRENT")
+                else:
+                    run.return_value = dict(status="FAILED", reason="PRIVATE_SENTINEL")
+                out = service.diagnose_public_cycle(config(), sources, public_data_authorized=True)
+            self.assertEqual(out["status"], "FAILED")
+            self.assertEqual(out["stage"], stage)
+            self.assertEqual(out["completed_symbols"], 0)
+            self.assertNotIn("PRIVATE_SENTINEL", str(out))
+            collect.assert_called_once()
+            self.assertLessEqual(run.call_count, 1)
+
+    def test_diagnostic_real_freshness_validation_blocks_stale_quote_before_analysis(self):
+        snapshot, now = fixtures.PublicPreviewTests().public_fixture("FALCON")
+        snapshot["quote"]["at_ms"] = now - config()["bots"]["FALCON"]["policy"]["quote_max_age_ms"] - 1
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with patch.object(service, "collect_snapshot", return_value=snapshot) as collect, \
+             patch.object(service.time, "time_ns", return_value=now * 1000000), \
+             patch.object(service, "run_once") as run:
+            out = service.diagnose_public_cycle(config(), sources, public_data_authorized=True)
+        self.assertEqual(out["stage"], "freshness_validation")
+        self.assertEqual(out["reason"], "QUOTE_STALE_OR_FUTURE")
+        self.assertEqual(out["evaluations"], 0)
+        self.assertEqual(out["completed_symbols"], 0)
+        collect.assert_called_once()
+        run.assert_not_called()
+
+    def test_public_failure_reports_only_fixed_code_and_never_evaluates_or_retries(self):
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "delivery.sqlite"
+            fixtures.delivery.initialize_ledger(path)
+            for error, expected in (
+                    (service.PublicDataError("CANDLE_GAP_OR_DUPLICATE"), "CANDLE_GAP_OR_DUPLICATE"),
+                    (service.PublicDataError("PRIVATE_SENTINEL"), "PUBLIC_DATA_FAILURE_REDACTED"),
+                    (RuntimeError("PRIVATE_SENTINEL"), "SERVICE_VALIDATION_OR_IO_FAILED")):
+                with self.subTest(expected=expected), patch.object(service, "collect_snapshot", side_effect=error) as collect, patch.object(service, "run_once") as run:
+                    result = service.run_service(config(), sources, **self.supervisor_args(path))
+                self.assertEqual(result["status"], "FAILED")
+                self.assertEqual(result["reason"], expected)
+                self.assertEqual(result["evaluations"], 0)
+                collect.assert_called_once()
+                run.assert_not_called()
+                self.assertNotIn("PRIVATE_SENTINEL", str(result))
+
+    def test_no_signal_evaluations_do_not_add_delivery_pacing_waits(self):
+        snapshot, now = fixtures.PublicPreviewTests().public_fixture("DONKEY")
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "delivery.sqlite"
+            fixtures.delivery.initialize_ledger(path)
+            args = self.supervisor_args(path)
+            with patch.object(service, "collect_snapshot", return_value=snapshot), \
+                 patch.object(service, "run_once", return_value=dict(status="BLOCKED", reason="NO_SIGNAL")):
+                out = service.run_service(config(), sources, **args)
+            self.assertEqual(out["reason"], "CYCLE_LIMIT_REACHED")
+            self.assertEqual(out["evaluations"], 5)
+            self.assertEqual(args["stop_event"].waits, [])
+
     def supervisor_args(self, path):
         class Stop:
             stopped = False
-            waits = []
+            def __init__(self):
+                self.waits = []
             def is_set(self):
                 return self.stopped
             def wait(self, seconds):
@@ -46,6 +145,7 @@ class ServiceTests(unittest.TestCase):
                 out = service.run_service(config(), sources, **args)
             self.assertEqual(out["reason"], "CYCLE_LIMIT_REACHED", out)
             self.assertEqual((out["cycles"], out["evaluations"], out["confirmed"]), (1, 5, 5))
+            self.assertEqual(args["stop_event"].waits, [1, 1, 1, 1, 1])
             collect.assert_called_once_with("TEST-USDT", ["15m", "4h", "1d"], authorized=True, limit=200)
             self.assertEqual([c.kwargs["setup"] for c in run.call_args_list],
                              ["FALCON15", "FALCON30", "DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"])
