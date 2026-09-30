@@ -15,6 +15,56 @@ import signal_only_runner as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_once_requires_authorization_and_mounted_storage(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(runner, 'diagnose_public_cycle') as collect, \
+             patch.object(runner.os.environ, 'get', side_effect=AssertionError('no env')):
+            self.assertEqual(runner.diagnose_once({}, {}, state_dir=directory)['reason'],
+                             'PUBLIC_READ_AUTHORIZATION_REQUIRED')
+            self.assertEqual(runner.diagnose_once({}, {}, state_dir=directory, authorized=True)['reason'],
+                             'PERSISTENT_MOUNT_REQUIRED')
+            collect.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_once_claim_survives_success_failure_and_restart(self):
+        for outcome in ({'status': 'DIAGNOSTIC_COMPLETE'}, {'status': 'FAILED'}, RuntimeError('private')):
+            with self.subTest(outcome=type(outcome).__name__), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(runner.os.path, 'ismount', return_value=True), \
+                 patch.object(runner.os.environ, 'get', side_effect=AssertionError('no env')), \
+                 patch.object(runner, 'diagnose_public_cycle') as collect:
+                if isinstance(outcome, Exception):
+                    collect.side_effect = outcome
+                    with self.assertRaises(RuntimeError):
+                        runner.diagnose_once({}, {}, authorized=True, state_dir=directory)
+                else:
+                    collect.return_value = outcome
+                    self.assertEqual(runner.diagnose_once({}, {}, authorized=True, state_dir=directory), outcome)
+                self.assertEqual(runner.diagnose_once({}, {}, authorized=True, state_dir=directory)['reason'],
+                                 'DIAGNOSTIC_ALREADY_CLAIMED_NO_RETRY')
+                collect.assert_called_once()
+                self.assertEqual((Path(directory) / 'signals-public-diagnostic.claimed').read_bytes(),
+                                 b'CLAIMED_NO_AUTOMATIC_RETRY\n')
+
+    def test_once_storage_failure_blocks_network_and_keeps_claim(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(runner.os.path, 'ismount', return_value=True), \
+             patch.object(runner.os, 'fsync', side_effect=OSError('private')), \
+             patch.object(runner, 'diagnose_public_cycle') as collect:
+            self.assertEqual(runner.diagnose_once({}, {}, authorized=True, state_dir=directory)['reason'],
+                             'DIAGNOSTIC_STORAGE_REVIEW_REQUIRED')
+            self.assertTrue((Path(directory) / 'signals-public-diagnostic.claimed').exists())
+            collect.assert_not_called()
+
+    def test_once_cli_does_not_read_credentials_or_enable_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, _ = self.inputs(directory)
+            with patch.object(runner, 'diagnose_once', return_value=dict(status='DIAGNOSTIC_COMPLETE')) as once, \
+                 patch.object(runner, 'execute') as execute, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(['--diagnose-public-once', '--config', str(config),
+                                             '--authorize-public-data']), 0)
+            self.assertIs(once.call_args.kwargs['authorized'], True)
+            execute.assert_not_called()
+
     def test_diagnostic_cli_has_no_credential_reads_ledger_or_delivery(self):
         def locale_only(key, default=None):
             if key not in {'LANGUAGE', 'LC_ALL', 'LC_MESSAGES', 'LANG', 'COLUMNS', 'LINES'}:
