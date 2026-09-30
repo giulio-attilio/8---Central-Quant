@@ -86,12 +86,18 @@ class PublicTests(unittest.TestCase):
                 self.validate(snapshot)
 
     def test_intake_candle_boundary_and_order(self):
-        with self.assertRaisesRegex(source.PublicDataError, "FRAME_NOT_CURRENT"):
+        with self.assertRaisesRegex(source.PublicDataError, "FRAME_EXPIRED"):
             self.validate(self.snapshot(), now_ms=2700000, frame_max_age_ms=1000000,
                           quote_max_age_ms=1000000)
         snapshot = self.snapshot()
         snapshot["frames"]["15m"].reverse()
         with self.assertRaisesRegex(source.PublicDataError, "CANDLE_ORDER"):
+            self.validate(snapshot)
+
+    def test_future_frame_is_not_classified_as_expired(self):
+        snapshot = self.snapshot()
+        snapshot['frame_received_at_ms']['15m'] = snapshot['frames']['15m'][-1][0] - 1
+        with self.assertRaisesRegex(source.PublicDataError, 'FRAME_NOT_CURRENT'):
             self.validate(snapshot)
 
     def test_intake_requires_policy_and_unqualified_public_input(self):

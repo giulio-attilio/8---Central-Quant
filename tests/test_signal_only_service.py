@@ -71,6 +71,42 @@ class ServiceTests(unittest.TestCase):
             collect.assert_called_once()
             self.assertLessEqual(run.call_count, 1)
 
+    def test_diagnostic_expired_frame_skips_only_affected_bot_without_retry(self):
+        snapshot, _ = fixtures.PublicPreviewTests().public_fixture("DONKEY")
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with patch.object(service, 'collect_snapshot', return_value=snapshot) as collect, \
+             patch.object(service, 'validate_snapshot', side_effect=[service.PublicDataError('FRAME_EXPIRED'), None, None, None]), \
+             patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='NO_SIGNAL')) as run:
+            out = service.diagnose_public_cycle(config(), sources, public_data_authorized=True)
+        self.assertEqual(out['status'], 'DIAGNOSTIC_COMPLETE')
+        self.assertEqual(out['reason_counts'], {'FRAME_EXPIRED': 1, 'NO_SIGNAL': 3})
+        self.assertEqual(out['evaluations'], 3)
+        self.assertFalse(out['capacity_approved'])
+        collect.assert_called_once()
+        self.assertTrue(all(c.args[0] == 'DONKEY' for c in run.call_args_list))
+
+    def test_supervisor_expired_frame_continues_and_recollects_only_next_cycle(self):
+        snapshot, now = fixtures.PublicPreviewTests().public_fixture('DONKEY')
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'delivery.sqlite'
+            fixtures.delivery.initialize_ledger(path)
+            args = self.supervisor_args(path)
+            args['max_cycles'] = 2
+            with patch.object(service, 'collect_snapshot', return_value=snapshot) as collect, \
+                 patch.object(service.time, 'time_ns', return_value=now * 1000000), \
+                 patch.object(service, 'run_once', side_effect=[dict(status='BLOCKED', reason='FRAME_EXPIRED')] +
+                              [dict(status='BLOCKED', reason='NO_SIGNAL')] * 8) as run:
+                out = service.run_service(config(), sources, **args)
+            self.assertEqual(out['reason'], 'CYCLE_LIMIT_REACHED')
+            self.assertEqual(out['discarded_snapshots'], 1)
+            self.assertEqual(out['confirmed'], 0)
+            self.assertEqual(collect.call_count, 2)
+            self.assertEqual(args['stop_event'].waits, [1.0])
+            self.assertEqual([c.kwargs['setup'] for c in run.call_args_list],
+                             ['FALCON15', 'DONKEY', 'DONKEY_ORIGINAL', 'EARLY_DONKEY',
+                              'FALCON15', 'FALCON30', 'DONKEY', 'DONKEY_ORIGINAL', 'EARLY_DONKEY'])
+
     def test_diagnostic_real_freshness_validation_blocks_stale_quote_before_analysis(self):
         snapshot, now = fixtures.PublicPreviewTests().public_fixture("FALCON")
         snapshot["quote"]["at_ms"] = now - config()["bots"]["FALCON"]["policy"]["quote_max_age_ms"] - 1

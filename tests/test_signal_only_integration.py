@@ -50,6 +50,22 @@ def donkey_fixture(side="LONG"):
 
 
 class PublicPreviewTests(unittest.TestCase):
+    def test_expired_frame_never_reaches_delivery_for_either_bot(self):
+        for bot, source, cfg, setup, module in (
+            ('FALCON', harness.SOURCE, harness.CONFIG, 'FALCON15', harness.offline),
+            ('DONKEY', SOURCE, CONFIG, 'DONKEY', donkey)):
+            snapshot, now = self.public_fixture(bot)
+            with self.subTest(bot=bot), \
+                 patch.object(module, 'validate_snapshot', side_effect=module.PublicDataError('FRAME_EXPIRED')), \
+                 patch.object(workflow, 'dispatch_public_signal') as send:
+                out = workflow.run_once(bot, source, snapshot, cfg, harness.POLICY,
+                    setup=setup, now_ms=now, public_data_authorized=True,
+                    network_authorized=True, public_delivery_authorized=True)
+            self.assertEqual(out['status'], 'BLOCKED')
+            self.assertEqual(out['reason'], 'FRAME_EXPIRED')
+            self.assertIsNone(out['delivery'])
+            send.assert_not_called()
+
     def public_fixture(self, bot):
         # Fabricated records in the public input schema, never fetched market data.
         snap, now = donkey_fixture() if bot == "DONKEY" else harness.fixture()

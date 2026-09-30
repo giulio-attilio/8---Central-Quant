@@ -10,7 +10,7 @@ import json
 
 from falcon_advisory_offline import _require, _number, _timestamp, _identifier, _policy, pd
 from falcon_advisory_preview import preview_signal, preview_public_signal
-from bingx_public_signal_source import validate_snapshot
+from bingx_public_signal_source import validate_snapshot, PublicDataError, safe_error_code
 
 FUNCTIONS = frozenset({"calcular_atr", "calcular_supertrend_df", "calcular_adx",
     "marcar_spikes", "preparar_df", "nome_limpo", "detectar_donkey_h4",
@@ -128,6 +128,8 @@ Public previews never authorize delivery or establish parity with position manag
         if result["status"] in ("OFFLINE_PREVIEW", "PUBLIC_DATA_PREVIEW"):
             result.update(signal=signal, expires_at_ms=expiry, analysis_sha256=SOURCE_DIGEST)
         return result
+    except PublicDataError as exc:
+        return dict(base, reason='FRAME_EXPIRED' if safe_error_code(exc) == 'FRAME_EXPIRED' else 'ANALYSIS_FAILED')
     except Exception as exc:
         # Known validation codes only, never raw exception text/data from analysis.
         from falcon_advisory_offline import OfflineInputError

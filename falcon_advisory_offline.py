@@ -20,7 +20,7 @@ import pandas as pd
 
 from falcon_signal_identity import attach_falcon_signal_identity, FalconSignalIdentityConstructionError
 from falcon_advisory_preview import preview_signal, preview_public_signal
-from bingx_public_signal_source import validate_snapshot
+from bingx_public_signal_source import validate_snapshot, PublicDataError, safe_error_code
 
 
 FUNCTIONS = frozenset({
@@ -251,6 +251,8 @@ class OfflineSignalSession:
                 self.seen.add(candle_key)
                 result.update(signal=preview, counters=counters, analysis_sha256=SOURCE_DIGEST)
             return result
+        except PublicDataError as exc:
+            return dict(out, reason='FRAME_EXPIRED' if safe_error_code(exc) == 'FRAME_EXPIRED' else 'ANALYSIS_FAILED')
         except OfflineInputError as exc:
             return dict(out, reason=str(exc))
         except Exception:

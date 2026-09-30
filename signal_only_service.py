@@ -167,9 +167,16 @@ def diagnose_public_cycle(config, sources, *, public_data_authorized=False):
                 for setup in entry["setups"]:
                     now = time.time_ns() // 1000000
                     stage = "freshness_validation"
-                    validate_snapshot(scoped, now_ms=now,
-                                      frame_max_age_ms=entry["policy"]["snapshot_max_age_ms"],
-                                      quote_max_age_ms=entry["policy"]["quote_max_age_ms"])
+                    try:
+                        validate_snapshot(scoped, now_ms=now,
+                                          frame_max_age_ms=entry["policy"]["snapshot_max_age_ms"],
+                                          quote_max_age_ms=entry["policy"]["quote_max_age_ms"])
+                    except PublicDataError as error:
+                        if safe_error_code(error) != "FRAME_EXPIRED":
+                            raise
+                        counts["FRAME_EXPIRED"] = counts.get("FRAME_EXPIRED", 0) + 1
+                        # Discard this bot's snapshot; no analysis, send or recollection.
+                        break
                     stage = "analysis"
                     out = run_once(bot, sources[bot], scoped, entry["analysis"], entry["policy"],
                                    setup=setup, now_ms=now, public_data_authorized=True,
@@ -287,6 +294,9 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                                 setup=setup, now_ms=now, values=values, ledger_path=str(path),
                                 network_authorized=True, public_data_authorized=True, public_delivery_authorized=True)
                             state["evaluations"] += 1
+                            if result.get("status") == "BLOCKED" and result.get("reason") == "FRAME_EXPIRED":
+                                state["discarded_snapshots"] = state.get("discarded_snapshots", 0) + 1
+                                break
                             if result["status"] == "CONFIRMED":
                                 state["confirmed"] += 1
                             elif result.get("reason") not in benign:

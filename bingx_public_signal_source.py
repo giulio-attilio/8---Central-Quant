@@ -29,7 +29,7 @@ PUBLIC_ERROR_CODES = frozenset({
     "EXPLICIT_AGE_POLICY_REQUIRED", "SNAPSHOT_REQUIRED", "PUBLIC_SOURCE_REQUIRED",
     "FEED_DISCONNECTED", "UNQUALIFIED_INPUT_REQUIRED", "SNAPSHOT_STALE_OR_FUTURE",
     "FRAMES_REQUIRED", "FRAME_RECEIPTS_REQUIRED", "FRAME_STALE_OR_FUTURE",
-    "CANDLE_ORDER", "FRAME_NOT_CURRENT", "QUOTE_STALE_OR_FUTURE",
+    "CANDLE_ORDER", "FRAME_NOT_CURRENT", "FRAME_EXPIRED", "QUOTE_STALE_OR_FUTURE",
     "INTERVALS", "DUPLICATE_INTERVAL",
 })
 
@@ -162,7 +162,8 @@ def validate_snapshot(snapshot, *, now_ms, frame_max_age_ms, quote_max_age_ms):
             for row in rows], interval)
         require([row[0] for row in rows] == [row[0] for row in normalized], "CANDLE_ORDER")
         latest, duration = normalized[-1][0], PERIODS[interval]
-        require(latest <= receipt <= now_ms < latest + duration, "FRAME_NOT_CURRENT")
+        require(latest <= receipt <= now_ms, "FRAME_NOT_CURRENT")
+        require(now_ms < latest + duration, "FRAME_EXPIRED")
         frames[interval], received[interval] = normalized, receipt
     quote = snapshot.get("quote")
     require(type(quote) is dict, "QUOTE_FIELDS")

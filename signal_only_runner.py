@@ -137,7 +137,7 @@ def main(argv=None):
         result = dict(status='BLOCKED', reason='CONFIGURATION_OR_STORAGE_REVIEW_REQUIRED')
     # Never print exceptions, paths, config, credentials or raw transport responses.
     allowed = {key: result[key] for key in ('status', 'reason', 'cycles', 'evaluations', 'confirmed',
-               'stage', 'completed_symbols', 'planned_symbols', 'scan_seconds',
+               'stage', 'completed_symbols', 'planned_symbols', 'scan_seconds', 'discarded_snapshots',
                'cycle_with_pause_seconds', 'reason_counts', 'delivery_allowed', 'capacity_approved') if key in result}
     allowed['live_allowed'] = False
     print(json.dumps(allowed), flush=True)
