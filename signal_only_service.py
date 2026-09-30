@@ -233,7 +233,7 @@ def exclusive_service(ledger_path):
 
 def run_service(config, sources, *, values, ledger_path, stop_event,
                 service_authorized=False, public_data_authorized=False,
-                public_delivery_authorized=False, max_cycles=None):
+                public_delivery_authorized=False, max_cycles=None, donkey_operator_id=None):
     """Explicit blocking supervisor, never spawned/installed automatically.
 
     Fresh per-symbol collection followed immediately by evaluation/delivery.
@@ -269,10 +269,18 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                   "EXPIRED", "PRIOR_ATTEMPT_NO_RETRY", "EXPIRED_BEFORE_HTTP", "DATA_AGED_DURING_ANALYSIS"}
         last_now = None
         with exclusive_service(path):
+            tracker = None
+            if donkey_operator_id is not None:
+                from donkey_signal_tracking import ReferenceTracker
+                tracker = ReferenceTracker(str(path), values, donkey_operator_id, authorized=True)
+                tracker.check_polling()
+                tracker.flush()
             while not stop_event.is_set():
                 for symbol in symbols:
                     if stop_event.is_set():
                         return dict(state, status="STOPPED", reason="STOP_REQUESTED")
+                    if tracker:
+                        tracker.poll(time.time_ns() // 1000000)
                     selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
                     needed = set().union(*(required_frames(bot, entry) for bot, entry in selected.items()))
                     intervals = [tf for tf in ("15m", "1h", "4h", "1d") if tf in needed]
@@ -282,6 +290,14 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                         return dict(state, status="FAILED", reason=safe_error_code(error))
                     _require(type(snapshot) is dict and snapshot.get("symbol") == symbol and
                              snapshot.get("synthetic") is False, "SNAPSHOT_IDENTITY_MISMATCH")
+                    if tracker and symbol in config['bots']['DONKEY']['symbols']:
+                        try:
+                            tracker.observe(scoped_snapshot(snapshot, {'4h'}), time.time_ns() // 1000000,
+                                            config['bots']['DONKEY']['policy'])
+                        except PublicDataError as error:
+                            if safe_error_code(error) != 'FRAME_EXPIRED':
+                                raise
+                        tracker.flush()
                     for bot, entry in selected.items():
                         scoped = scoped_snapshot(snapshot, required_frames(bot, entry))
                         for setup in entry["setups"]:
@@ -292,7 +308,8 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             last_now = now
                             result = run_once(bot, sources[bot], scoped, entry["analysis"], entry["policy"],
                                 setup=setup, now_ms=now, values=values, ledger_path=str(path),
-                                network_authorized=True, public_data_authorized=True, public_delivery_authorized=True)
+                                network_authorized=True, public_data_authorized=True, public_delivery_authorized=True,
+                                donkey_tracking=tracker is not None)
                             state["evaluations"] += 1
                             if result.get("status") == "BLOCKED" and result.get("reason") == "FRAME_EXPIRED":
                                 state["discarded_snapshots"] = state.get("discarded_snapshots", 0) + 1

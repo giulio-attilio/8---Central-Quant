@@ -44,7 +44,7 @@ def provision_ledger(path):
     initialize_ledger(path)
 
 
-def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=False):
+def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=False, donkey_operator_id=None):
     if authorized is not True:
         return dict(status='BLOCKED', reason='EXPLICIT_AUTHORIZATIONS_REQUIRED')
     path = Path(ledger_path).resolve()
@@ -62,9 +62,10 @@ def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=F
                 return checked
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, lambda *_: stop.set())
+        options = {} if donkey_operator_id is None else dict(donkey_operator_id=donkey_operator_id)
         result = run_service(config, sources, values=values, ledger_path=str(path), stop_event=stop,
                              service_authorized=True, public_data_authorized=True,
-                             public_delivery_authorized=True)
+                             public_delivery_authorized=True, **options)
         if result.get('status') not in ('STOPPED',):
             try:
                 with halted.open('x', encoding='utf-8') as handle:
@@ -117,6 +118,7 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--check-config', action='store_true')
     mode.add_argument('--initialize-ledger', action='store_true')
+    mode.add_argument('--initialize-donkey-tracking', action='store_true')
     mode.add_argument('--run', action='store_true')
     mode.add_argument('--diagnose-public', action='store_true')
     mode.add_argument('--diagnose-public-once', action='store_true')
@@ -127,11 +129,17 @@ def main(argv=None):
     parser.add_argument('--authorize-public-data', action='store_true')
     parser.add_argument('--authorize-telegram', action='store_true')
     parser.add_argument('--verify-telegram-once', action='store_true')
+    parser.add_argument('--donkey-operator-id', type=int)
+    parser.add_argument('--authorize-donkey-polling', action='store_true')
     args = parser.parse_args(argv)
     if args.diagnostic_attempt is not None and not args.diagnose_public_once:
         parser.error('--diagnostic-attempt requires --diagnose-public-once')
     if args.verify_telegram_once and not args.run:
         parser.error('--verify-telegram-once requires --run')
+    if args.donkey_operator_id is not None and (not args.run or args.donkey_operator_id <= 0 or not args.authorize_donkey_polling):
+        parser.error('Donkey tracking requires --run, a positive operator id and explicit polling authorization')
+    if args.authorize_donkey_polling and args.donkey_operator_id is None:
+        parser.error('Donkey polling requires an explicit operator id')
     try:
         config, sources = load_inputs(args.config)
         if args.check_config:
@@ -144,13 +152,17 @@ def main(argv=None):
                                            public_data_authorized=args.authorize_public_data)
         elif not args.ledger:
             result = dict(status='BLOCKED', reason='LEDGER_PATH_REQUIRED')
+        elif args.initialize_donkey_tracking:
+            from donkey_signal_tracking import provision
+            provision(args.ledger)
+            result = dict(status='TRACKING_SCHEMA_INITIALIZED', live_allowed=False)
         elif args.initialize_ledger:
             provision_ledger(args.ledger)
             result = dict(status='LEDGER_INITIALIZED', live_allowed=False)
         else:
             result = execute(config, sources, args.ledger, authorized=(args.authorize_service
                              and args.authorize_public_data and args.authorize_telegram),
-                             verify_telegram=args.verify_telegram_once)
+                             verify_telegram=args.verify_telegram_once, donkey_operator_id=args.donkey_operator_id)
     except Exception:
         result = dict(status='BLOCKED', reason='CONFIGURATION_OR_STORAGE_REVIEW_REQUIRED')
     # Never print exceptions, paths, config, credentials or raw transport responses.
@@ -159,7 +171,7 @@ def main(argv=None):
                'cycle_with_pause_seconds', 'reason_counts', 'delivery_allowed', 'capacity_approved') if key in result}
     allowed['live_allowed'] = False
     print(json.dumps(allowed), flush=True)
-    return 0 if result.get('status') in ('CONFIG_VALID', 'LEDGER_INITIALIZED', 'STOPPED', 'DIAGNOSTIC_COMPLETE') else 1
+    return 0 if result.get('status') in ('CONFIG_VALID', 'LEDGER_INITIALIZED', 'TRACKING_SCHEMA_INITIALIZED', 'STOPPED', 'DIAGNOSTIC_COMPLETE') else 1
 
 
 if __name__ == '__main__':

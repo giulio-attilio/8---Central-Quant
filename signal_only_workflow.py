@@ -26,7 +26,7 @@ inspect each result; NO_SIGNAL or rejection is not an alert to deliver.
 
 def run_once(bot, source, snapshot, config, policy, *, setup, now_ms,
              values=None, ledger_path=None, network_authorized=False, public_data_authorized=False,
-             public_delivery_authorized=False):
+             public_delivery_authorized=False, donkey_tracking=False):
     """Explicit caller-owned inputs. No credentials are needed for local preview.
 
 The transport ledger owns attempted-delivery deduplication. The Falcon analysis
@@ -74,7 +74,7 @@ Expiry is derived from candle close and policy, never extended by delivery time.
             delivered = dispatch_public_signal(bot, out["signal"], values=values,
                 ledger_path=ledger_path, now_ms=delivery_now, expires_at_ms=expiry,
                 validity_basis=policy["basis"], data_valid_until_ms=deadline,
-                network_authorized=True, public_delivery_authorized=True)
+                network_authorized=True, public_delivery_authorized=True, donkey_tracking=donkey_tracking)
         else:
             delivered = dispatch_synthetic(bot, out["signal"], values=values,
             ledger_path=ledger_path, now_ms=delivery_now,

@@ -47,22 +47,32 @@ def _route(bot, values):
     return token, chat, route_id
 
 
-def _post(token, chat, text, timeout):
+def _post(token, chat, text, timeout, reply_markup=None):
+    payload = dict(chat_id=chat, text=text, allow_paid_broadcast=False,
+                   link_preview_options={"is_disabled": True})
+    if reply_markup is not None:
+        payload['reply_markup'] = reply_markup
+    return _telegram_api(token, 'sendMessage', payload, timeout)
+
+
+def _telegram_api(token, method, payload, timeout):
     """Exactly one HTTPS POST, fixed host, verified TLS, no redirect/proxy/retry.
 
 Do not enable HTTP debugging or log request URLs: Telegram tokens are in paths.
 The caller catches and discards all transport exception strings.
 """
+    if method not in {'sendMessage', 'getUpdates', 'answerCallbackQuery', 'getWebhookInfo'}:
+        raise DeliveryError('TELEGRAM_METHOD_NOT_ALLOWED')
     connection = http.client.HTTPSConnection("api.telegram.org", timeout=timeout,
                                              context=ssl.create_default_context())
     try:
-        payload = json.dumps(dict(chat_id=chat, text=text, allow_paid_broadcast=False,
-                                  link_preview_options={"is_disabled": True}), ensure_ascii=False).encode("utf-8")
-        connection.request("POST", "/bot" + token + "/sendMessage", body=payload,
+        payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        connection.request("POST", "/bot" + token + "/" + method, body=payload,
                            headers={"Content-Type": "application/json"})
         response = connection.getresponse()
-        raw = response.read(65537)
-        if len(raw) > 65536:
+        limit = 1048576 if method == 'getUpdates' else 65536
+        raw = response.read(limit + 1)
+        if len(raw) > limit:
             return 0, None
         return response.status, json.loads(raw)
     finally:
@@ -137,7 +147,7 @@ prefers a missed message over duplicate delivery; it is not exactly-once deliver
 
 def dispatch_public_signal(bot, signal, *, values, ledger_path, now_ms, expires_at_ms,
                            validity_basis, data_valid_until_ms, network_authorized=False,
-                           public_delivery_authorized=False, timeout_seconds=10):
+                           public_delivery_authorized=False, timeout_seconds=10, donkey_tracking=False):
     """Only for a freshly validated analysis candidate from the trusted workflow.
 
     The caller derives the data deadline from every frame receipt and quote age.
@@ -149,11 +159,11 @@ def dispatch_public_signal(bot, signal, *, values, ledger_path, now_ms, expires_
     return _dispatch(bot, signal, values=values, ledger_path=ledger_path, now_ms=now_ms,
                      expires_at_ms=expires_at_ms, validity_basis=validity_basis,
                      network_authorized=network_authorized, timeout_seconds=timeout_seconds,
-                     public=True, data_valid_until_ms=data_valid_until_ms)
+                     public=True, data_valid_until_ms=data_valid_until_ms, donkey_tracking=donkey_tracking)
 
 
 def _dispatch(bot, signal, *, values, ledger_path, now_ms, expires_at_ms, validity_basis,
-              network_authorized, timeout_seconds, public, data_valid_until_ms):
+              network_authorized, timeout_seconds, public, data_valid_until_ms, donkey_tracking=False):
     result = dict(status="BLOCKED", reason=None, actual_delivery_confirmed=False,
                   live_allowed=False, manual_trade_authorized=False)
     started = time.monotonic()
@@ -181,6 +191,7 @@ def _dispatch(bot, signal, *, values, ledger_path, now_ms, expires_at_ms, validi
     identity = hashlib.sha256((bot + ":" + signal["signal_id"]).encode()).hexdigest()
     candle = hashlib.sha256(json.dumps([bot, signal["setup"], signal["symbol"], signal["timeframe"], signal["candle_closed_at_ms"]]).encode()).hexdigest()
     db = None
+    markup = None
     try:
         # mode=rw forbids accidental creation after state loss. URI is generated
         # from a local path; the caller cannot supply query options or a remote URI.
@@ -198,6 +209,9 @@ def _dispatch(bot, signal, *, values, ledger_path, now_ms, expires_at_ms, validi
             raise DeliveryError("PRIOR_ATTEMPT_NO_RETRY")
         db.execute("INSERT OR REPLACE INTO delivery_clock_v1 VALUES (1, ?)", (now_ms,))
         db.execute("INSERT INTO delivery_v1 VALUES (?, ?, ?, 'UNKNOWN', ?, NULL)", (identity, candle, route, now_ms))
+        if donkey_tracking is True and public and bot == 'DONKEY':
+            from donkey_signal_tracking import offer
+            markup = offer(db, identity, route, signal, expires_at_ms)
         db.commit()
     except Exception as exc:
         if db is not None:
@@ -211,7 +225,8 @@ def _dispatch(bot, signal, *, values, ledger_path, now_ms, expires_at_ms, validi
                 db.execute("UPDATE delivery_v1 SET status='EXPIRED' WHERE identity=?", (identity,))
             db.close()
             return dict(result, reason="EXPIRED_BEFORE_HTTP")
-        http_status, body = _post(token, chat, text, timeout_seconds)
+        http_status, body = (_post(token, chat, text, timeout_seconds, reply_markup=markup)
+                             if markup else _post(token, chat, text, timeout_seconds))
         if type(body) is dict:
             sent = body.get("result")
             if (http_status == 200 and body.get("ok") is True and type(sent) is dict
