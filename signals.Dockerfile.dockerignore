@@ -2,6 +2,7 @@
 !signals.Dockerfile
 !signals.Dockerfile.dockerignore
 !signals-requirements.txt
+!signals-config.validation.json
 !bingx_public_signal_source.py
 !donkey_advisory_offline.py
 !falcon_advisory_offline.py
