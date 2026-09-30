@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from signal_only_service import run_service, validate_service_config, diagnose_public_cycle
 from falcon_advisory_offline import reviewed_analysis
 from donkey_advisory_offline import reviewed_analysis as review_donkey
-from telegram_signal_delivery import initialize_ledger, ROUTES
+from telegram_signal_delivery import initialize_ledger, ROUTES, verify_routes_once
 
 
 def load_inputs(config_path):
@@ -44,7 +44,7 @@ def provision_ledger(path):
     initialize_ledger(path)
 
 
-def execute(config, sources, ledger_path, *, authorized=False):
+def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=False):
     if authorized is not True:
         return dict(status='BLOCKED', reason='EXPLICIT_AUTHORIZATIONS_REQUIRED')
     path = Path(ledger_path).resolve()
@@ -55,6 +55,11 @@ def execute(config, sources, ledger_path, *, authorized=False):
     stop = threading.Event()
     previous = {}
     try:
+        if verify_telegram:
+            checked = verify_routes_once(values=values, ledger_path=str(path), authorized=True)
+            print(json.dumps(checked), flush=True)
+            if checked.get('status') != 'ROUTES_CONFIRMED':
+                return checked
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, lambda *_: stop.set())
         result = run_service(config, sources, values=values, ledger_path=str(path), stop_event=stop,
@@ -121,9 +126,12 @@ def main(argv=None):
     parser.add_argument('--authorize-service', action='store_true')
     parser.add_argument('--authorize-public-data', action='store_true')
     parser.add_argument('--authorize-telegram', action='store_true')
+    parser.add_argument('--verify-telegram-once', action='store_true')
     args = parser.parse_args(argv)
     if args.diagnostic_attempt is not None and not args.diagnose_public_once:
         parser.error('--diagnostic-attempt requires --diagnose-public-once')
+    if args.verify_telegram_once and not args.run:
+        parser.error('--verify-telegram-once requires --run')
     try:
         config, sources = load_inputs(args.config)
         if args.check_config:
@@ -141,7 +149,8 @@ def main(argv=None):
             result = dict(status='LEDGER_INITIALIZED', live_allowed=False)
         else:
             result = execute(config, sources, args.ledger, authorized=(args.authorize_service
-                             and args.authorize_public_data and args.authorize_telegram))
+                             and args.authorize_public_data and args.authorize_telegram),
+                             verify_telegram=args.verify_telegram_once)
     except Exception:
         result = dict(status='BLOCKED', reason='CONFIGURATION_OR_STORAGE_REVIEW_REQUIRED')
     # Never print exceptions, paths, config, credentials or raw transport responses.

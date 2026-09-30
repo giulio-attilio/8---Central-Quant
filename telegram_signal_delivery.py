@@ -76,6 +76,49 @@ def initialize_ledger(path):
             db.execute("CREATE TABLE IF NOT EXISTS delivery_v1 (identity TEXT PRIMARY KEY, candle TEXT UNIQUE NOT NULL, route TEXT NOT NULL, status TEXT NOT NULL, attempted_ms INTEGER NOT NULL, message_id INTEGER)")
             db.execute("CREATE TABLE IF NOT EXISTS delivery_clock_v1 (id INTEGER PRIMARY KEY CHECK(id=1), now_ms INTEGER NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS delivery_pause_v1 (route TEXT PRIMARY KEY, until_ms INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS route_check_v1 (bot TEXT PRIMARY KEY, route TEXT NOT NULL, status TEXT NOT NULL)")
+
+
+def verify_routes_once(*, values, ledger_path, authorized=False):
+    """One durable, non-actionable notice per route; ambiguous sends never retry."""
+    if authorized is not True:
+        return dict(status='BLOCKED', reason='NETWORK_AUTHORIZATION_REQUIRED')
+    from pathlib import Path
+    try:
+        routes = {bot: _route(bot, values) for bot in ROUTES}
+        with closing(sqlite3.connect(Path(ledger_path).resolve().as_uri() + '?mode=rw', uri=True, timeout=5)) as db:
+            db.execute('PRAGMA synchronous=FULL')
+            for bot, (token, chat, route) in routes.items():
+                db.execute('BEGIN IMMEDIATE')
+                previous = db.execute('SELECT route, status FROM route_check_v1 WHERE bot=?', (bot,)).fetchone()
+                if previous:
+                    db.rollback()
+                    if previous != (route, 'CONFIRMED'):
+                        return dict(status='BLOCKED', reason='ROUTE_CHECK_REVIEW_REQUIRED')
+                    continue
+                db.execute("INSERT INTO route_check_v1 VALUES (?, ?, 'UNKNOWN')", (bot, route))
+                db.commit()
+                text = (f'TESTE DE INTEGRAÇÃO — {bot} — NÃO OPERAR\n'
+                        'Destino de sinais informativos verificado. Nenhuma ordem será enviada.\n'
+                        'Este teste não é um sinal de compra ou venda. A ativação depende da verificação dos dois destinos.')
+                status = 'UNKNOWN'
+                try:
+                    code, body = _post(token, chat, text, 10)
+                    sent = body.get('result') if type(body) is dict else None
+                    if (code == 200 and body.get('ok') is True and type(sent) is dict
+                            and type(sent.get('message_id')) is int and sent['message_id'] > 0
+                            and type(sent.get('chat')) is dict and type(sent['chat'].get('id')) is int
+                            and str(sent['chat']['id']) == chat and sent.get('text') == text):
+                        status = 'CONFIRMED'
+                except Exception:
+                    pass
+                with db:
+                    db.execute('UPDATE route_check_v1 SET status=? WHERE bot=?', (status, bot))
+                if status != 'CONFIRMED':
+                    return dict(status='BLOCKED', reason='ROUTE_CHECK_REVIEW_REQUIRED')
+        return dict(status='ROUTES_CONFIRMED', live_allowed=False)
+    except Exception:
+        return dict(status='BLOCKED', reason='ROUTE_CHECK_REVIEW_REQUIRED')
 
 
 def dispatch_synthetic(bot, signal, *, values, ledger_path, now_ms, expires_at_ms,

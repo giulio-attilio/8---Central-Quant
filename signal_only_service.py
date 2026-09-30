@@ -307,6 +307,9 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             if result["status"] == "CONFIRMED" and stop_event.wait(1):
                                 return dict(state, status="STOPPED", reason="STOP_REQUESTED")
                 state["cycles"] += 1
+                print(json.dumps(dict(status='SIGNALS_CYCLE_COMPLETE', cycles=state['cycles'],
+                                      evaluations=state['evaluations'], confirmed=state['confirmed'],
+                                      live_allowed=False)), flush=True)
                 if max_cycles is not None and state["cycles"] >= max_cycles:
                     return dict(state, status="STOPPED", reason="CYCLE_LIMIT_REACHED")
                 # No backlog replay after sleep/resume. Next cycle always recollects.

@@ -49,6 +49,45 @@ def donkey_fixture(side="LONG"):
                 frames=frames, quote=dict(price=frames["4h"][-2][4], at_ms=now)), now
 
 
+class RouteNoticeTests(unittest.TestCase):
+    def test_two_confirmed_routes_never_repeat_after_restart(self):
+        def reply(token, chat, text, timeout):
+            self.assertIn('NÃO OPERAR', text)
+            return 200, dict(ok=True, result=dict(message_id=1, chat=dict(id=int(chat)), text=text))
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'ledger.sqlite')
+            delivery.initialize_ledger(path)
+            with patch.object(delivery, '_post', side_effect=reply) as post:
+                for _ in range(2):
+                    self.assertEqual(delivery.verify_routes_once(values=VALUES, ledger_path=path, authorized=True)['status'], 'ROUTES_CONFIRMED')
+                self.assertEqual(post.call_count, 2)
+
+    def test_unknown_or_rejected_notice_never_retries(self):
+        for response in (TimeoutError('PRIVATE'), (403, dict(ok=False)), (200, dict(ok=True, result={} ))):
+            with tempfile.TemporaryDirectory() as directory:
+                path = str(Path(directory) / 'ledger.sqlite')
+                delivery.initialize_ledger(path)
+                with patch.object(delivery, '_post') as post:
+                    if isinstance(response, Exception):
+                        post.side_effect = response
+                    else:
+                        post.return_value = response
+                    for _ in range(2):
+                        self.assertEqual(delivery.verify_routes_once(values=VALUES, ledger_path=path, authorized=True)['status'], 'BLOCKED')
+                    post.assert_called_once()
+
+    def test_authorization_missing_storage_and_invalid_routes_precede_http(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(delivery, '_post') as post:
+            path = str(Path(directory) / 'absent.sqlite')
+            self.assertEqual(delivery.verify_routes_once(values=VALUES, ledger_path=path)['status'], 'BLOCKED')
+            self.assertEqual(delivery.verify_routes_once(values=VALUES, ledger_path=path, authorized=True)['status'], 'BLOCKED')
+            self.assertFalse(Path(path).exists())
+            delivery.initialize_ledger(path)
+            invalid = dict(VALUES, DONKEY_H4_CHAT_ID='invalid')
+            self.assertEqual(delivery.verify_routes_once(values=invalid, ledger_path=path, authorized=True)['status'], 'BLOCKED')
+            post.assert_not_called()
+
+
 class PublicPreviewTests(unittest.TestCase):
     def test_expired_frame_never_reaches_delivery_for_either_bot(self):
         for bot, source, cfg, setup, module in (

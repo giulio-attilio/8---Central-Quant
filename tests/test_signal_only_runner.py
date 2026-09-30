@@ -15,6 +15,17 @@ import signal_only_runner as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_route_check_failure_prevents_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, path = self.inputs(directory)
+            runner.provision_ledger(path)
+            with patch.object(runner.os.environ, 'get', return_value='FAKE'), \
+                 patch.object(runner, 'verify_routes_once', return_value=dict(status='BLOCKED')) as verify, \
+                 patch.object(runner, 'run_service') as run:
+                self.assertEqual(runner.execute({}, {}, path, authorized=True, verify_telegram=True)['status'], 'BLOCKED')
+            verify.assert_called_once()
+            run.assert_not_called()
+
     def test_named_attempt_preserves_previous_claim_and_blocks_restart(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(runner.os.path, 'ismount', return_value=True), \
