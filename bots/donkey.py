@@ -5464,7 +5464,8 @@ def iniciar_threads_monitoradas():
     # O listener duplicado listen_donkey_commands fica definido no arquivo,
     # mas NÃO é iniciado para evitar erro 409 getUpdates.
     threading.Thread(target=run_thread_guarded, args=("scanner", scanner), daemon=True).start()
-    threading.Thread(target=run_thread_guarded, args=("telegram_commands", listen_commands), daemon=True).start()
+    # Receive-only handoff: scanner, watchdog and outbound alerts stay unchanged.
+    print("DONKEY_TELEGRAM_RECEIVER_DISABLED: signals worker owns callbacks")
     threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
 
 

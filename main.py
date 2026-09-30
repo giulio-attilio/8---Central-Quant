@@ -32308,6 +32308,9 @@ def get_bot_module(name: str):
 
 
 def central_route_enabled_for_bot(key: str) -> bool:
+    # Donkey callbacks belong exclusively to the isolated signals worker.
+    if key.upper() == "DONKEY":
+        return False
     default = COMMAND_ROUTER_DEFAULTS.get(key.upper(), False)
     return env_bool(f"CENTRAL_ROUTE_{key.upper()}_TELEGRAM", default=default)
 
@@ -32677,6 +32680,9 @@ def build_command_reply_for_module(key: str, module, cmd: str):
 
 
 def central_command_router_loop(key: str, cfg: dict):
+    if key.upper() == "DONKEY":
+        print("DONKEY_TELEGRAM_RECEIVER_DISABLED: signals worker owns callbacks")
+        return
     token = os.environ.get(cfg.get("token_env"))
     allowed_chat = os.environ.get(cfg.get("chat_env"))
 
