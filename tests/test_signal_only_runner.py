@@ -15,6 +15,29 @@ import signal_only_runner as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_named_attempt_preserves_previous_claim_and_blocks_restart(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(runner.os.path, 'ismount', return_value=True), \
+             patch.object(runner, 'diagnose_public_cycle', return_value={'status': 'DIAGNOSTIC_COMPLETE'}) as collect:
+            old = Path(directory) / 'signals-public-diagnostic.claimed'
+            old.write_bytes(b'PREVIOUS_ATTEMPT')
+            kwargs = dict(authorized=True, state_dir=directory, attempt='20260930-expiry-v2')
+            self.assertEqual(runner.diagnose_once({}, {}, **kwargs)['status'], 'DIAGNOSTIC_COMPLETE')
+            self.assertEqual(runner.diagnose_once({}, {}, **kwargs)['reason'], 'DIAGNOSTIC_ALREADY_CLAIMED_NO_RETRY')
+            self.assertEqual(old.read_bytes(), b'PREVIOUS_ATTEMPT')
+            collect.assert_called_once()
+
+    def test_invalid_attempts_rejected_before_storage_or_network(self):
+        with patch.object(runner.os.path, 'ismount') as mount, \
+             patch.object(runner, 'diagnose_public_cycle') as collect:
+            for attempt in ('', '../old', 'a/b', 'a\\b', 'A', 'a' * 49, 123):
+                self.assertEqual(runner.diagnose_once({}, {}, authorized=True, attempt=attempt)['reason'],
+                                 'DIAGNOSTIC_ATTEMPT_INVALID')
+            self.assertEqual(runner.diagnose_once({}, {}, attempt='valid')['reason'],
+                             'PUBLIC_READ_AUTHORIZATION_REQUIRED')
+            mount.assert_not_called()
+            collect.assert_not_called()
+
     def test_once_requires_authorization_and_mounted_storage(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(runner, 'diagnose_public_cycle') as collect, \
@@ -61,8 +84,9 @@ class RunnerTests(unittest.TestCase):
             with patch.object(runner, 'diagnose_once', return_value=dict(status='DIAGNOSTIC_COMPLETE')) as once, \
                  patch.object(runner, 'execute') as execute, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(runner.main(['--diagnose-public-once', '--config', str(config),
-                                             '--authorize-public-data']), 0)
+                                             '--authorize-public-data', '--diagnostic-attempt', 'explicit-v2']), 0)
             self.assertIs(once.call_args.kwargs['authorized'], True)
+            self.assertEqual(once.call_args.kwargs['attempt'], 'explicit-v2')
             execute.assert_not_called()
 
     def test_diagnostic_cli_has_no_credential_reads_ledger_or_delivery(self):

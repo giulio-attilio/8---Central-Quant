@@ -6,6 +6,7 @@ configuration checks. Never reads .env, broker credentials or operational module
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import sys
@@ -72,16 +73,20 @@ def execute(config, sources, ledger_path, *, authorized=False):
             signal.signal(sig, handler)
 
 
-def diagnose_once(config, sources, *, authorized=False, state_dir=Path('/var/data')):
+def diagnose_once(config, sources, *, authorized=False, state_dir=Path('/var/data'), attempt=None):
     """Claim on the mounted disk before any public request; never reset or retry."""
     blocked = dict(status='BLOCKED', delivery_allowed=False, live_allowed=False,
                    capacity_approved=False)
     if authorized is not True:
         return dict(blocked, reason='PUBLIC_READ_AUTHORIZATION_REQUIRED')
+    if attempt is not None and (not isinstance(attempt, str) or
+                               re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', attempt) is None):
+        return dict(blocked, reason='DIAGNOSTIC_ATTEMPT_INVALID')
     state_dir = Path(state_dir)
     if state_dir.is_symlink() or not os.path.ismount(state_dir):
         return dict(blocked, reason='PERSISTENT_MOUNT_REQUIRED')
-    marker = state_dir / 'signals-public-diagnostic.claimed'
+    suffix = '' if attempt is None else '-' + attempt
+    marker = state_dir / ('signals-public-diagnostic' + suffix + '.claimed')
     try:
         with marker.open('xb') as handle:
             handle.write(b'CLAIMED_NO_AUTOMATIC_RETRY\n')
@@ -112,16 +117,20 @@ def main(argv=None):
     mode.add_argument('--diagnose-public-once', action='store_true')
     parser.add_argument('--config', required=True)
     parser.add_argument('--ledger')
+    parser.add_argument('--diagnostic-attempt')
     parser.add_argument('--authorize-service', action='store_true')
     parser.add_argument('--authorize-public-data', action='store_true')
     parser.add_argument('--authorize-telegram', action='store_true')
     args = parser.parse_args(argv)
+    if args.diagnostic_attempt is not None and not args.diagnose_public_once:
+        parser.error('--diagnostic-attempt requires --diagnose-public-once')
     try:
         config, sources = load_inputs(args.config)
         if args.check_config:
             result = dict(status='CONFIG_VALID', live_allowed=False)
         elif args.diagnose_public_once:
-            result = diagnose_once(config, sources, authorized=args.authorize_public_data)
+            result = diagnose_once(config, sources, authorized=args.authorize_public_data,
+                                   attempt=args.diagnostic_attempt)
         elif args.diagnose_public:
             result = diagnose_public_cycle(config, sources,
                                            public_data_authorized=args.authorize_public_data)
