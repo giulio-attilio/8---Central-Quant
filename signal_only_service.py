@@ -173,7 +173,7 @@ def diagnose_public_cycle(config, sources, *, public_data_authorized=False):
         state["planned_symbols"] = len(symbols)
         counts = {}
         allowed = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
-                   "EXPIRED", "PUBLIC_DELIVERY_NOT_ENABLED"}
+                   "EXPIRED", "PUBLIC_DELIVERY_NOT_ENABLED", "DONKEY_STOP_DISTANCE_ABOVE_IDEAL"}
         for symbol in symbols:
             selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
             needed = set().union(*(required_frames(bot, entry) for bot, entry in selected.items()))
@@ -287,7 +287,8 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
             db.execute("SELECT route, until_ms FROM delivery_pause_v1 LIMIT 0")
         symbols = list(dict.fromkeys(s for entry in config["bots"].values() for s in entry["symbols"]))
         benign = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
-                  "EXPIRED", "PRIOR_ATTEMPT_NO_RETRY", "EXPIRED_BEFORE_HTTP", "DATA_AGED_DURING_ANALYSIS"}
+                  "EXPIRED", "PRIOR_ATTEMPT_NO_RETRY", "EXPIRED_BEFORE_HTTP", "DATA_AGED_DURING_ANALYSIS",
+                  "DONKEY_STOP_DISTANCE_ABOVE_IDEAL"}
         last_now = None
         stage = 'exclusive_lock'
         with exclusive_service(path):

@@ -60,7 +60,7 @@
         "ADX_LEN": 14,
         "EMA_FAST": 20,
         "EMA_SLOW": 50,
-        "SCORE_MIN_QUALITY_TO_SIGNAL": 55,
+        "SCORE_MIN_QUALITY_TO_SIGNAL": 80,
         "TP50_R": 1,
         "STOP_ATR_BUFFER": 0.1,
         "MIN_ATR_PCT": 0.2,

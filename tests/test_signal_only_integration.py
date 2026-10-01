@@ -49,6 +49,44 @@ def donkey_fixture(side="LONG"):
                 frames=frames, quote=dict(price=frames["4h"][-2][4], at_ms=now)), now
 
 
+class DonkeyIdealFilterTests(unittest.TestCase):
+    def test_all_variants_both_sides_and_exact_boundary(self):
+        snapshot, now = donkey_fixture()
+        for setup in workflow.DONKEY_VARIANTS:
+            for side in ('LONG', 'SHORT'):
+                for distance in (1.49, 1.5, 1.51):
+                    with self.subTest(setup=setup, side=side, distance=distance):
+                        signal = dict(setup=setup, side=side, entry=100,
+                                      stop=100-distance if side == 'LONG' else 100+distance, tp50=110)
+                        original = copy.deepcopy(signal)
+                        with patch.object(workflow, 'analyze_donkey', return_value=dict(status='OFFLINE_PREVIEW', signal=signal)), \
+                             patch.object(workflow, 'dispatch_synthetic') as send:
+                            out = workflow.run_once('DONKEY', '', snapshot, CONFIG, harness.POLICY,
+                                                    setup=setup, now_ms=now)
+                        self.assertEqual(out['reason'], 'DONKEY_STOP_DISTANCE_ABOVE_IDEAL' if distance > 1.5 else 'NETWORK_DISABLED')
+                        self.assertEqual(signal, original)
+                        send.assert_not_called()
+
+    def test_public_filtered_signal_never_reaches_delivery_or_tracking(self):
+        snapshot, now = donkey_fixture()
+        snapshot['synthetic'] = False
+        with patch.object(workflow, 'analyze_donkey', return_value=dict(status='PUBLIC_DATA_PREVIEW',
+                signal=dict(entry=100, stop=98, setup='DONKEY_ORIGINAL'))), \
+             patch.object(workflow, 'dispatch_public_signal') as send:
+            out = workflow.run_once('DONKEY', '', snapshot, CONFIG, harness.POLICY, setup='DONKEY_ORIGINAL',
+                now_ms=now, network_authorized=True, public_data_authorized=True,
+                public_delivery_authorized=True, donkey_tracking=True)
+        self.assertEqual(out['reason'], 'DONKEY_STOP_DISTANCE_ABOVE_IDEAL')
+        send.assert_not_called()
+
+    def test_falcon_is_not_subject_to_donkey_filter(self):
+        snapshot, now = donkey_fixture()
+        with patch.object(workflow, 'OfflineSignalSession') as session:
+            session.return_value.evaluate.return_value = dict(status='OFFLINE_PREVIEW', signal=dict(entry=100, stop=97))
+            out = workflow.run_once('FALCON', '', snapshot, {}, harness.POLICY, setup='FALCON15', now_ms=now)
+        self.assertEqual(out['reason'], 'NETWORK_DISABLED')
+
+
 class RouteNoticeTests(unittest.TestCase):
     def test_two_confirmed_routes_never_repeat_after_restart(self):
         def reply(token, chat, text, timeout):

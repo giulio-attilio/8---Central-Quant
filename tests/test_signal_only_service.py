@@ -20,6 +20,25 @@ def config():
 
 
 class ServiceTests(unittest.TestCase):
+    def test_packaged_falcon_config_requires_high_quality(self):
+        import json
+        packaged = json.loads((Path(__file__).resolve().parents[1] / 'signals-config.validation.json').read_text())
+        validated = service.validate_service_config(packaged)
+        self.assertEqual(validated['bots']['FALCON']['analysis']['SCORE_MIN_QUALITY_TO_SIGNAL'], 80)
+
+    def test_ideal_filter_is_benign_and_does_not_halt_worker(self):
+        snapshot, _ = fixtures.PublicPreviewTests().public_fixture('DONKEY')
+        sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'delivery.sqlite'
+            fixtures.delivery.initialize_ledger(path)
+            with patch.object(service, 'collect_snapshot', return_value=snapshot), \
+                 patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='DONKEY_STOP_DISTANCE_ABOVE_IDEAL')):
+                out = service.run_service(config(), sources, **self.supervisor_args(path))
+        self.assertEqual(out['status'], 'STOPPED')
+        self.assertEqual(out['evaluations'], 5)
+        self.assertEqual(out['confirmed'], 0)
+
     def test_diagnostic_authorization_and_configuration_precede_collection(self):
         sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
         with patch.object(service, "collect_snapshot") as collect:

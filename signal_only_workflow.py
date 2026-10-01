@@ -4,6 +4,7 @@ No loop, scheduler, market client, .env loading or operational bot imports.
 Public data defaults to preview; delivery requires its own explicit authorization.
 """
 import time
+from decimal import Decimal
 from falcon_advisory_offline import OfflineSignalSession, _policy
 from donkey_advisory_offline import analyze as analyze_donkey
 from telegram_signal_delivery import dispatch_synthetic, dispatch_public_signal
@@ -53,6 +54,15 @@ Expiry is derived from candle close and policy, never extended by delivery time.
         else:
             return dict(base, reason="BOT_NOT_ALLOWLISTED")
         base["analysis"] = out
+        if bot == "DONKEY" and out["status"] in ("OFFLINE_PREVIEW", "PUBLIC_DATA_PREVIEW"):
+            # User-approved IDEAL filter for all three variants. Reference distance,
+            # not account risk or win probability. Never move strategy levels.
+            entry = Decimal(str(out["signal"]["entry"]))
+            stop = Decimal(str(out["signal"]["stop"]))
+            if not (entry.is_finite() and stop.is_finite() and entry > 0 and stop > 0):
+                return dict(base, reason="WORKFLOW_INPUT_OR_ANALYSIS_FAILED")
+            if abs(entry - stop) * 100 > entry * Decimal('1.5'):
+                return dict(base, reason="DONKEY_STOP_DISTANCE_ABOVE_IDEAL")
         if public and (public_delivery_authorized is not True or network_authorized is not True
                        or out["status"] != "PUBLIC_DATA_PREVIEW"):
             # Public analysis authority never implies messaging or service authority.
