@@ -105,6 +105,95 @@ class RunnerTests(unittest.TestCase):
             resume.assert_not_called()
             run.assert_not_called()
 
+    def test_second_reviewed_resume_requires_first_receipt_and_preserves_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            halted = Path(str(path) + '.halted')
+            first = runner.reviewed_halt_archive(path, runner.REVIEWED_HALT_ID)
+            second = runner.reviewed_halt_archive(path, runner.SECOND_REVIEWED_HALT_ID)
+            self.assertFalse(runner.resume_reviewed_halt(path, runner.SECOND_REVIEWED_HALT_ID))
+            self.assertTrue(halted.is_file())
+            self.assertFalse(second.exists())
+            self.assertTrue(runner.resume_reviewed_halt(path, runner.REVIEWED_HALT_ID))
+            self.assertEqual(first.read_bytes(), runner.REVIEWED_HALT_BYTES)
+            halted.write_bytes(runner.REVIEWED_HALT_BYTES)
+            before = path.read_bytes()
+            self.assertTrue(runner.resume_reviewed_halt(path, runner.SECOND_REVIEWED_HALT_ID))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(first.read_bytes(), runner.REVIEWED_HALT_BYTES)
+            self.assertEqual(second.read_bytes(), runner.REVIEWED_HALT_BYTES)
+            self.assertFalse(halted.exists())
+            with patch.object(runner.os.environ, 'get', return_value='FAKE'), \
+                 patch.object(runner, 'run_service', return_value=dict(status='STOPPED')) as run:
+                self.assertEqual(runner.execute({}, {}, path, authorized=True)['status'], 'STOPPED')
+            run.assert_called_once()
+
+    def test_old_review_cannot_recover_second_halt_and_second_review_is_single_use(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            halted = Path(str(path) + '.halted')
+            self.assertTrue(runner.resume_reviewed_halt(path, runner.REVIEWED_HALT_ID))
+            halted.write_bytes(runner.REVIEWED_HALT_BYTES)
+            with patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                 patch.object(runner, 'run_service') as run:
+                blocked = runner.execute({}, {}, path, authorized=True, reviewed_halt=runner.REVIEWED_HALT_ID)
+            self.assertEqual(blocked['reason'], 'REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
+            self.assertTrue(halted.is_file())
+            run.assert_not_called()
+            self.assertTrue(runner.resume_reviewed_halt(path, runner.SECOND_REVIEWED_HALT_ID))
+            halted.write_bytes(runner.REVIEWED_HALT_BYTES)
+            with patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                 patch.object(runner, 'run_service') as run:
+                blocked = runner.execute({}, {}, path, authorized=True,
+                                         reviewed_halt=runner.SECOND_REVIEWED_HALT_ID)
+            self.assertEqual(blocked['reason'], 'REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
+            self.assertTrue(halted.is_file())
+            run.assert_not_called()
+
+    def test_second_review_crash_after_receipt_stays_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            halted = Path(str(path) + '.halted')
+            self.assertTrue(runner.resume_reviewed_halt(path, runner.REVIEWED_HALT_ID))
+            halted.write_bytes(runner.REVIEWED_HALT_BYTES)
+            before = path.read_bytes()
+            with patch.object(Path, 'unlink', side_effect=OSError('private')):
+                self.assertFalse(runner.resume_reviewed_halt(path, runner.SECOND_REVIEWED_HALT_ID))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(halted.is_file())
+            self.assertEqual(runner.reviewed_halt_archive(path, runner.SECOND_REVIEWED_HALT_ID).read_bytes(),
+                             runner.REVIEWED_HALT_BYTES)
+            with patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                 patch.object(runner, 'run_service') as run:
+                blocked = runner.execute({}, {}, path, authorized=True,
+                                         reviewed_halt=runner.SECOND_REVIEWED_HALT_ID)
+            self.assertEqual(blocked['reason'], 'REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
+            run.assert_not_called()
+
+    def test_second_review_rejects_changed_first_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            first = runner.reviewed_halt_archive(path, runner.REVIEWED_HALT_ID)
+            first.write_bytes(b'CHANGED\n')
+            self.assertFalse(runner.resume_reviewed_halt(path, runner.SECOND_REVIEWED_HALT_ID))
+            self.assertEqual(first.read_bytes(), b'CHANGED\n')
+            self.assertTrue(Path(str(path) + '.halted').is_file())
+            self.assertFalse(runner.reviewed_halt_archive(path, runner.SECOND_REVIEWED_HALT_ID).exists())
+
+    def test_second_review_id_is_accepted_only_with_run_mode(self):
+        invalid = ['--check-config', '--config', 'unused.json',
+                   '--reviewed-halt', runner.SECOND_REVIEWED_HALT_ID]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            runner.main(invalid)
+        argv = ['--run', '--config', 'unused.json', '--ledger', 'unused.sqlite',
+                '--authorize-service', '--authorize-public-data', '--authorize-telegram',
+                '--reviewed-halt', runner.SECOND_REVIEWED_HALT_ID]
+        with patch.object(runner, 'load_inputs', return_value=({}, {})), \
+             patch.object(runner, 'execute', return_value=dict(status='STOPPED')) as execute, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(argv), 0)
+        self.assertEqual(execute.call_args.kwargs['reviewed_halt'], runner.SECOND_REVIEWED_HALT_ID)
+
     def test_halted_review_is_read_only_and_keeps_unknown_and_active_visible(self):
         import donkey_signal_tracking as tracking
         with tempfile.TemporaryDirectory() as directory:

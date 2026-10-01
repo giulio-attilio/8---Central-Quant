@@ -24,6 +24,15 @@ from telegram_signal_delivery import initialize_ledger, ROUTES, verify_routes_on
 
 
 REVIEWED_HALT_ID = '20260930-205047'
+SECOND_REVIEWED_HALT_ID = '20260930-222218'
+# Incident IDs are derived from the reviewed failure timestamps. The second
+# review is valid only after the first incident's durable receipt is intact.
+REVIEWED_HALT_REVIEWS = {
+    REVIEWED_HALT_ID: (),
+    SECOND_REVIEWED_HALT_ID: (REVIEWED_HALT_ID,),
+}
+REVIEWED_HALT_IDS = tuple(REVIEWED_HALT_REVIEWS)
+REVIEWED_HALT_BYTES = b'MANUAL_REVIEW_REQUIRED\n'
 
 
 def reviewed_halt_archive(path, review=REVIEWED_HALT_ID):
@@ -93,7 +102,8 @@ def resume_reviewed_halt(path, review):
     A later failure cannot reuse this approval even if the command is unchanged.
     A crash after archive creation but before completion fails closed.
     """
-    if review != REVIEWED_HALT_ID:
+    required_reviews = REVIEWED_HALT_REVIEWS.get(review)
+    if required_reviews is None:
         return False
     path = Path(path)
     halted = Path(str(path) + '.halted')
@@ -102,7 +112,11 @@ def resume_reviewed_halt(path, review):
         with exclusive_service(path):
             if path.is_symlink() or halted.is_symlink() or archive.exists() or archive.is_symlink():
                 return False
-            if halted.read_bytes() != b'MANUAL_REVIEW_REQUIRED\n':
+            for required_review in required_reviews:
+                receipt = reviewed_halt_archive(path, required_review)
+                if receipt.is_symlink() or not receipt.is_file() or receipt.read_bytes() != REVIEWED_HALT_BYTES:
+                    return False
+            if halted.read_bytes() != REVIEWED_HALT_BYTES:
                 return False
             audit = inspect_halted_ledger(path)
             if not (audit.get('review_complete') is True and audit.get('clock_ahead') is False
@@ -112,7 +126,7 @@ def resume_reviewed_halt(path, review):
                 return False
             # Exclusive archive is the durable one-use receipt. Never overwrite it.
             with archive.open('xb') as handle:
-                handle.write(b'MANUAL_REVIEW_REQUIRED\n')
+                handle.write(REVIEWED_HALT_BYTES)
                 handle.flush()
                 os.fsync(handle.fileno())
             directory = None
@@ -126,7 +140,7 @@ def resume_reviewed_halt(path, review):
             except OSError:
                 if not halted.exists():
                     with halted.open('xb') as handle:
-                        handle.write(b'MANUAL_REVIEW_REQUIRED\n')
+                        handle.write(REVIEWED_HALT_BYTES)
                         handle.flush()
                         os.fsync(handle.fileno())
                 raise
@@ -145,6 +159,8 @@ def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=F
     path = Path(ledger_path).resolve()
     halted = Path(str(path) + '.halted')
     if halted.exists() and reviewed_halt is not None:
+        if reviewed_halt not in REVIEWED_HALT_REVIEWS:
+            return dict(status='BLOCKED', reason='REVIEWED_RESUME_REFUSED')
         archive = reviewed_halt_archive(path, reviewed_halt)
         if archive.exists() or archive.is_symlink():
             return dict(status='BLOCKED', reason='REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
@@ -235,7 +251,7 @@ def main(argv=None):
     parser.add_argument('--verify-telegram-once', action='store_true')
     parser.add_argument('--donkey-operator-id', type=int)
     parser.add_argument('--authorize-donkey-polling', action='store_true')
-    parser.add_argument('--reviewed-halt', choices=[REVIEWED_HALT_ID])
+    parser.add_argument('--reviewed-halt', choices=REVIEWED_HALT_IDS)
     args = parser.parse_args(argv)
     if args.reviewed_halt is not None and not args.run:
         parser.error('--reviewed-halt requires --run')
