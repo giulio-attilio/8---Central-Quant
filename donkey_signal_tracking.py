@@ -32,12 +32,28 @@ def provision(path):
         db.execute('CREATE TABLE IF NOT EXISTS donkey_reference_control_v1 (id INTEGER PRIMARY KEY CHECK(id=1), route TEXT NOT NULL, operator INTEGER NOT NULL, offset INTEGER NOT NULL, clock INTEGER NOT NULL)')
 
 
+def entry_block_reason(db, route, signal, *, candle_closed_at_ms=None):
+    """Called under BEGIN IMMEDIATE; scope is route + symbol + setup, not side."""
+    rows = db.execute("SELECT signal, state, last_quote FROM donkey_reference_v1 WHERE route=? AND state IN ('ACTIVE','RUNNER','CLOSED')", (route,))
+    for encoded, state, last_quote in rows:
+        previous = json.loads(encoded)
+        if (previous['symbol'], previous['setup']) != (signal['symbol'], signal['setup']):
+            continue
+        if state in ('ACTIVE', 'RUNNER'):
+            return 'DONKEY_REFERENCE_ALREADY_ACTIVE'
+        if candle_closed_at_ms is not None and (last_quote is None or candle_closed_at_ms <= last_quote):
+            return 'DONKEY_WAIT_NEXT_H4_AFTER_EXIT'
+    return None
+
+
 def offer(db, identity, route, signal, expires):
     """Inside the delivery reservation transaction, before sendMessage."""
     if signal.get('setup') not in SETUPS or signal.get('synthetic') is not False:
         raise ValueError('DONKEY_REFERENCE_REQUIRED')
     ref = hashlib.sha256(('donkey-reference:' + identity).encode()).hexdigest()[:32]
     fields = {key: signal[key] for key in ('setup', 'symbol', 'side', 'entry', 'stop', 'tp50')}
+    if 'candle_closed_at_ms' in signal:
+        fields['candle_closed_at_ms'] = signal['candle_closed_at_ms']
     db.execute("INSERT INTO donkey_reference_v1 VALUES (?, ?, ?, ?, ?, 'WAITING', NULL, NULL, NULL, NULL, ?)",
                (ref, identity, route, json.dumps(fields), expires, signal['stop']))
     return {'inline_keyboard': [[{'text': '✅ Entrei na operação', 'callback_data': 'dq:' + ref}]]}
@@ -99,6 +115,9 @@ class ReferenceTracker:
                         elif now >= row['expires']:
                             db.execute("UPDATE donkey_reference_v1 SET state='EXPIRED' WHERE ref=?", (row['ref'],))
                             answer = 'Sinal vencido. Acompanhamento não iniciado.'
+                        elif entry_block_reason(db, self.route, json.loads(row['signal']),
+                                                candle_closed_at_ms=json.loads(row['signal']).get('candle_closed_at_ms')):
+                            answer = 'Acompanhamento ativo ou candle anterior à última saída nesta variante.'
                         else:
                             db.execute("UPDATE donkey_reference_v1 SET state='ACTIVE', active_ms=? WHERE ref=?", (now, row['ref']))
                             answer = 'Acompanhamento de referência ativado. Nenhuma ordem enviada.'

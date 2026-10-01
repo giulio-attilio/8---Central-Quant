@@ -288,7 +288,8 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
         symbols = list(dict.fromkeys(s for entry in config["bots"].values() for s in entry["symbols"]))
         benign = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
                   "EXPIRED", "PRIOR_ATTEMPT_NO_RETRY", "EXPIRED_BEFORE_HTTP", "DATA_AGED_DURING_ANALYSIS",
-                  "DONKEY_STOP_DISTANCE_ABOVE_IDEAL"}
+                  "DONKEY_STOP_DISTANCE_ABOVE_IDEAL", "DONKEY_REFERENCE_ALREADY_ACTIVE",
+                  "DONKEY_WAIT_NEXT_H4_AFTER_EXIT"}
         last_now = None
         stage = 'exclusive_lock'
         with exclusive_service(path):

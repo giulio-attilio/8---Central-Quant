@@ -207,6 +207,11 @@ def _dispatch(bot, signal, *, values, ledger_path, now_ms, expires_at_ms, validi
             raise DeliveryError("RATE_LIMIT_PAUSE")
         if db.execute("SELECT 1 FROM delivery_v1 WHERE identity=? OR candle=?", (identity, candle)).fetchone():
             raise DeliveryError("PRIOR_ATTEMPT_NO_RETRY")
+        if donkey_tracking is True and public and bot == 'DONKEY':
+            from donkey_signal_tracking import entry_block_reason
+            blocked = entry_block_reason(db, route, signal, candle_closed_at_ms=signal['candle_closed_at_ms'])
+            if blocked:
+                raise DeliveryError(blocked)
         db.execute("INSERT OR REPLACE INTO delivery_clock_v1 VALUES (1, ?)", (now_ms,))
         db.execute("INSERT INTO delivery_v1 VALUES (?, ?, ?, 'UNKNOWN', ?, NULL)", (identity, candle, route, now_ms))
         if donkey_tracking is True and public and bot == 'DONKEY':

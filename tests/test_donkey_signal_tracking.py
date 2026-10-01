@@ -15,6 +15,48 @@ import telegram_signal_delivery as delivery
 
 
 class TrackingTests(unittest.TestCase):
+    def test_entry_gate_waiting_active_runner_exit_and_next_candle(self):
+        key = self.offer()
+        sig = dict(symbol='TEST-USDT', setup='DONKEY', side='SHORT')
+        def reason(candle=None, signal=None):
+            with self.db() as db:
+                return tracking.entry_block_reason(db, self.tracker.route, signal or sig, candle_closed_at_ms=candle)
+        self.assertIsNone(reason(self.now))  # No click: future H4 remains eligible.
+        self.tracker.accept(self.click(key), self.now)
+        self.assertEqual(reason(self.now), 'DONKEY_REFERENCE_ALREADY_ACTIVE')
+        self.assertIsNone(reason(signal=dict(sig, setup='EARLY_DONKEY')))
+        self.assertIsNone(reason(signal=dict(sig, symbol='OTHER-USDT')))
+        self.observe(111)
+        self.assertEqual(reason(self.now), 'DONKEY_REFERENCE_ALREADY_ACTIVE')
+        self.observe(100)
+        self.assertEqual(reason(self.now), 'DONKEY_WAIT_NEXT_H4_AFTER_EXIT')
+        self.assertIsNone(reason(self.now + tracking.PERIODS['4h']))
+
+    def test_second_waiting_click_cannot_activate_duplicate_and_survives_restart(self):
+        first = self.offer(identity='first')
+        second = self.offer(identity='second')
+        self.tracker.accept(self.click(first), self.now)
+        restarted = tracking.ReferenceTracker(self.path, fixture.VALUES, 77, authorized=True)
+        restarted.accept(self.click(second, 2), self.now + 1)
+        self.assertEqual(self.state(first)['state'], 'ACTIVE')
+        self.assertEqual(self.state(second)['state'], 'WAITING')
+
+    def test_active_reference_prevents_public_send_and_reservation(self):
+        key = self.offer()
+        self.tracker.accept(self.click(key), self.now)
+        sig = dict(synthetic=False, source='BINGX_PUBLIC_SWAP', setup='DONKEY', symbol='TEST-USDT',
+                   signal_id='new-candle', side='LONG', entry=100., stop=99., tp50=101., timeframe='4h',
+                   candle_closed_at_ms=self.now-1000, generated_at_ms=self.now, invalidated=False)
+        with patch.object(delivery, '_post') as post:
+            out = delivery.dispatch_public_signal('DONKEY', sig, values=fixture.VALUES, ledger_path=self.path,
+                now_ms=self.now, expires_at_ms=self.now+900000, data_valid_until_ms=self.now+15000,
+                validity_basis='Explicit test policy', network_authorized=True,
+                public_delivery_authorized=True, donkey_tracking=True)
+        self.assertEqual(out['reason'], 'DONKEY_REFERENCE_ALREADY_ACTIVE')
+        post.assert_not_called()
+        with self.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM delivery_v1').fetchone()[0], 1)
+
     def test_service_fixed_diagnostics_redact_transport_and_untrusted_errors(self):
         import signal_only_service as service
         cases = [(TimeoutError('secret-url'), 'IO_TIMEOUT'),
@@ -146,7 +188,7 @@ class TrackingTests(unittest.TestCase):
 
     def test_short_tp50_and_original_stop_before_partial(self):
         short = self.offer(side='SHORT')
-        long = self.offer(identity='other')
+        long = self.offer(setup='DONKEY_ORIGINAL', identity='other')
         self.tracker.accept(self.click(short, 1), self.now)
         self.tracker.accept(self.click(long, 2), self.now)
         self.observe(89)
