@@ -76,8 +76,34 @@ class RunnerTests(unittest.TestCase):
             with patch.object(runner.os.environ, 'get', return_value='FAKE'), \
                  patch.object(runner, 'run_service', return_value=dict(status='FAILED')) as run:
                 self.assertEqual(runner.execute({}, {}, path, authorized=True, reviewed_halt='20260930-205047')['status'], 'FAILED')
-                self.assertEqual(runner.execute({}, {}, path, authorized=True, reviewed_halt='20260930-205047')['reason'], 'REVIEWED_RESUME_REFUSED')
+                self.assertEqual(runner.execute({}, {}, path, authorized=True, reviewed_halt='20260930-205047')['reason'],
+                                 'REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
                 run.assert_called_once()
+
+    def test_completed_recovery_normal_restart_needs_no_incident_argument(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            with patch.object(runner.os.environ, 'get', return_value='FAKE'), \
+                 patch.object(runner, 'run_service', return_value=dict(status='STOPPED')) as run:
+                first = runner.execute({}, {}, path, authorized=True, reviewed_halt='20260930-205047')
+                second = runner.execute({}, {}, path, authorized=True)
+            self.assertEqual(first['status'], 'STOPPED')
+            self.assertEqual(second['status'], 'STOPPED')
+            self.assertFalse(Path(str(path) + '.halted').exists())
+            self.assertTrue(runner.reviewed_halt_archive(path).is_file())
+            self.assertEqual(run.call_count, 2)
+
+    def test_consumed_receipt_blocks_before_credentials_or_recovery_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            runner.reviewed_halt_archive(path).write_bytes(b'MANUAL_REVIEW_REQUIRED\n')
+            with patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                 patch.object(runner, 'resume_reviewed_halt') as resume, \
+                 patch.object(runner, 'run_service') as run:
+                result = runner.execute({}, {}, path, authorized=True, reviewed_halt='20260930-205047')
+            self.assertEqual(result['reason'], 'REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
+            resume.assert_not_called()
+            run.assert_not_called()
 
     def test_halted_review_is_read_only_and_keeps_unknown_and_active_visible(self):
         import donkey_signal_tracking as tracking

@@ -23,6 +23,13 @@ from donkey_advisory_offline import reviewed_analysis as review_donkey
 from telegram_signal_delivery import initialize_ledger, ROUTES, verify_routes_once
 
 
+REVIEWED_HALT_ID = '20260930-205047'
+
+
+def reviewed_halt_archive(path, review=REVIEWED_HALT_ID):
+    return Path(str(Path(path).resolve()) + '.halted.reviewed-' + review)
+
+
 def load_inputs(config_path):
     # Explicit nonsecret JSON only. No strategy or freshness defaults.
     path = Path(config_path)
@@ -86,11 +93,11 @@ def resume_reviewed_halt(path, review):
     A later failure cannot reuse this approval even if the command is unchanged.
     A crash after archive creation but before completion fails closed.
     """
-    if review != '20260930-205047':
+    if review != REVIEWED_HALT_ID:
         return False
     path = Path(path)
     halted = Path(str(path) + '.halted')
-    archive = Path(str(path) + '.halted.reviewed-' + review)
+    archive = reviewed_halt_archive(path, review)
     try:
         with exclusive_service(path):
             if path.is_symlink() or halted.is_symlink() or archive.exists() or archive.is_symlink():
@@ -138,6 +145,9 @@ def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=F
     path = Path(ledger_path).resolve()
     halted = Path(str(path) + '.halted')
     if halted.exists() and reviewed_halt is not None:
+        archive = reviewed_halt_archive(path, reviewed_halt)
+        if archive.exists() or archive.is_symlink():
+            return dict(status='BLOCKED', reason='REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
         if not resume_reviewed_halt(path, reviewed_halt):
             return dict(status='BLOCKED', reason='REVIEWED_RESUME_REFUSED')
         print(json.dumps(dict(status='REVIEWED_HALT_ARCHIVED', live_allowed=False)), flush=True)
@@ -225,7 +235,7 @@ def main(argv=None):
     parser.add_argument('--verify-telegram-once', action='store_true')
     parser.add_argument('--donkey-operator-id', type=int)
     parser.add_argument('--authorize-donkey-polling', action='store_true')
-    parser.add_argument('--reviewed-halt', choices=['20260930-205047'])
+    parser.add_argument('--reviewed-halt', choices=[REVIEWED_HALT_ID])
     args = parser.parse_args(argv)
     if args.reviewed_halt is not None and not args.run:
         parser.error('--reviewed-halt requires --run')
