@@ -27,6 +27,15 @@ class RunnerTests(unittest.TestCase):
         Path(str(path) + '.halted').write_bytes(b'MANUAL_REVIEW_REQUIRED\n')
         return path
 
+    def third_reviewed_fixture(self, directory):
+        path = self.reviewed_fixture(directory)
+        halted = Path(str(path) + '.halted')
+        self.assertTrue(runner.resume_reviewed_halt(path, runner.REVIEWED_HALT_ID))
+        halted.write_bytes(runner.REVIEWED_HALT_BYTES)
+        self.assertTrue(runner.resume_reviewed_halt(path, runner.SECOND_REVIEWED_HALT_ID))
+        halted.write_bytes(runner.REVIEWED_HALT_BYTES)
+        return path
+
     def test_reviewed_resume_archives_once_and_never_changes_ledger(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.reviewed_fixture(directory)
@@ -193,6 +202,121 @@ class RunnerTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(argv), 0)
         self.assertEqual(execute.call_args.kwargs['reviewed_halt'], runner.SECOND_REVIEWED_HALT_ID)
+
+    def test_third_review_requires_complete_chain_preserves_ledger_and_starts_without_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.third_reviewed_fixture(directory)
+            halted = Path(str(path) + '.halted')
+            receipts = [runner.reviewed_halt_archive(path, review) for review in (
+                runner.REVIEWED_HALT_ID, runner.SECOND_REVIEWED_HALT_ID,
+                runner.THIRD_REVIEWED_HALT_ID)]
+            before = path.read_bytes()
+            self.assertTrue(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(halted.exists())
+            self.assertTrue(all(receipt.read_bytes() == runner.REVIEWED_HALT_BYTES for receipt in receipts))
+            with patch.object(runner.os.environ, 'get', return_value='FAKE'), \
+                 patch.object(runner, 'run_service', return_value=dict(status='STOPPED')) as run:
+                self.assertEqual(runner.execute({}, {}, path, authorized=True)['status'], 'STOPPED')
+            run.assert_called_once()
+
+    def test_third_review_rejects_missing_or_changed_prior_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            runner.reviewed_halt_archive(path, runner.REVIEWED_HALT_ID).write_bytes(runner.REVIEWED_HALT_BYTES)
+            self.assertFalse(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+            self.assertTrue(Path(str(path) + '.halted').is_file())
+        for changed_review in (runner.REVIEWED_HALT_ID, runner.SECOND_REVIEWED_HALT_ID):
+            with self.subTest(changed_review=changed_review), tempfile.TemporaryDirectory() as directory:
+                path = self.third_reviewed_fixture(directory)
+                changed = runner.reviewed_halt_archive(path, changed_review)
+                changed.write_bytes(b'CHANGED\n')
+                self.assertFalse(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+                self.assertEqual(changed.read_bytes(), b'CHANGED\n')
+                self.assertTrue(Path(str(path) + '.halted').is_file())
+                self.assertFalse(runner.reviewed_halt_archive(path, runner.THIRD_REVIEWED_HALT_ID).exists())
+
+    def test_old_review_ids_cannot_recover_third_halt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.third_reviewed_fixture(directory)
+            halted = Path(str(path) + '.halted')
+            for old_review in (runner.REVIEWED_HALT_ID, runner.SECOND_REVIEWED_HALT_ID):
+                with self.subTest(old_review=old_review), \
+                     patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                     patch.object(runner, 'run_service') as run:
+                    blocked = runner.execute({}, {}, path, authorized=True, reviewed_halt=old_review)
+                self.assertEqual(blocked['reason'], 'REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
+                self.assertTrue(halted.is_file())
+                run.assert_not_called()
+
+    def test_third_review_is_single_use_and_cannot_recover_fourth_halt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.third_reviewed_fixture(directory)
+            halted = Path(str(path) + '.halted')
+            self.assertTrue(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+            halted.write_bytes(runner.REVIEWED_HALT_BYTES)
+            for consumed in runner.REVIEWED_HALT_IDS:
+                with self.subTest(consumed=consumed), \
+                     patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                     patch.object(runner, 'run_service') as run:
+                    blocked = runner.execute({}, {}, path, authorized=True, reviewed_halt=consumed)
+                self.assertEqual(blocked['reason'], 'REVIEWED_HALT_RECEIPT_PRESENT_REVIEW_REQUIRED')
+                run.assert_not_called()
+            self.assertTrue(halted.is_file())
+
+    def test_third_review_crash_after_receipt_stays_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.third_reviewed_fixture(directory)
+            halted = Path(str(path) + '.halted')
+            before = path.read_bytes()
+            with patch.object(Path, 'unlink', side_effect=OSError('private')):
+                self.assertFalse(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(halted.is_file())
+            self.assertEqual(runner.reviewed_halt_archive(path, runner.THIRD_REVIEWED_HALT_ID).read_bytes(),
+                             runner.REVIEWED_HALT_BYTES)
+            self.assertFalse(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+
+    def test_third_review_rejects_ledger_or_schema_review_failure(self):
+        reports = [dict(review_complete=False, reason='LEDGER_INTEGRITY'),
+                   dict(review_complete=False, reason='LEDGER_INSPECTION_FAILED_REDACTED'),
+                   dict(review_complete=True, clock_ahead=False, delivery={'CONFIRMED': 84},
+                        routes={'CONFIRMED': 2}, references={}, notices={})]
+        for report in reports:
+            with self.subTest(reason=report.get('reason')), tempfile.TemporaryDirectory() as directory:
+                path = self.third_reviewed_fixture(directory)
+                before = path.read_bytes()
+                with patch.object(runner, 'inspect_halted_ledger', return_value=report):
+                    self.assertFalse(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+                self.assertEqual(path.read_bytes(), before)
+                self.assertTrue(Path(str(path) + '.halted').is_file())
+                self.assertFalse(runner.reviewed_halt_archive(path, runner.THIRD_REVIEWED_HALT_ID).exists())
+
+    def test_third_review_missing_schema_keeps_latch_and_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.third_reviewed_fixture(directory)
+            with contextlib.closing(runner.sqlite3.connect(path)) as db, db:
+                db.execute('DROP TABLE donkey_reference_events_v1')
+            before = path.read_bytes()
+            self.assertFalse(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertTrue(Path(str(path) + '.halted').is_file())
+            self.assertFalse(runner.reviewed_halt_archive(path, runner.THIRD_REVIEWED_HALT_ID).exists())
+
+    def test_third_review_id_is_accepted_only_with_run_mode(self):
+        invalid = ['--check-config', '--config', 'unused.json',
+                   '--reviewed-halt', runner.THIRD_REVIEWED_HALT_ID]
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            runner.main(invalid)
+        argv = ['--run', '--config', 'unused.json', '--ledger', 'unused.sqlite',
+                '--authorize-service', '--authorize-public-data', '--authorize-telegram',
+                '--reviewed-halt', runner.THIRD_REVIEWED_HALT_ID]
+        with patch.object(runner, 'load_inputs', return_value=({}, {})), \
+             patch.object(runner, 'execute', return_value=dict(status='STOPPED')) as execute, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(runner.main(argv), 0)
+        self.assertEqual(execute.call_args.kwargs['reviewed_halt'], runner.THIRD_REVIEWED_HALT_ID)
+        self.assertIs(json.loads(output.getvalue())['live_allowed'], False)
 
     def test_halted_review_is_read_only_and_keeps_unknown_and_active_visible(self):
         import donkey_signal_tracking as tracking

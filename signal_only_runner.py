@@ -25,11 +25,13 @@ from telegram_signal_delivery import initialize_ledger, ROUTES, verify_routes_on
 
 REVIEWED_HALT_ID = '20260930-205047'
 SECOND_REVIEWED_HALT_ID = '20260930-222218'
-# Incident IDs are derived from the reviewed failure timestamps. The second
-# review is valid only after the first incident's durable receipt is intact.
+THIRD_REVIEWED_HALT_ID = '20261001-110546'
+# Incident IDs are derived from the reviewed failure timestamps. Each later
+# review is valid only when every earlier durable receipt is intact.
 REVIEWED_HALT_REVIEWS = {
     REVIEWED_HALT_ID: (),
     SECOND_REVIEWED_HALT_ID: (REVIEWED_HALT_ID,),
+    THIRD_REVIEWED_HALT_ID: (REVIEWED_HALT_ID, SECOND_REVIEWED_HALT_ID),
 }
 REVIEWED_HALT_IDS = tuple(REVIEWED_HALT_REVIEWS)
 REVIEWED_HALT_BYTES = b'MANUAL_REVIEW_REQUIRED\n'
