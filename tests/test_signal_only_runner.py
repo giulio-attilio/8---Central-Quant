@@ -15,6 +15,70 @@ import signal_only_runner as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def reviewed_fixture(self, directory):
+        import donkey_signal_tracking as tracking
+        path = Path(directory) / 'reviewed.sqlite'
+        runner.provision_ledger(path)
+        tracking.provision(path)
+        with contextlib.closing(runner.sqlite3.connect(path)) as db, db:
+            db.executemany("INSERT INTO delivery_v1 VALUES (?, ?, 'test-route', 'CONFIRMED', 1, 1)",
+                           [(str(i), str(i)) for i in range(85)])
+            db.executemany("INSERT INTO route_check_v1 VALUES (?, 'test-route', 'CONFIRMED')", [('FALCON',), ('DONKEY',)])
+        Path(str(path) + '.halted').write_bytes(b'MANUAL_REVIEW_REQUIRED\n')
+        return path
+
+    def test_reviewed_resume_archives_once_and_never_changes_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            before = path.read_bytes()
+            self.assertTrue(runner.resume_reviewed_halt(path, '20260930-205047'))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(Path(str(path) + '.halted').exists())
+            self.assertEqual(Path(str(path) + '.halted.reviewed-20260930-205047').read_bytes(), b'MANUAL_REVIEW_REQUIRED\n')
+            Path(str(path) + '.halted').write_bytes(b'MANUAL_REVIEW_REQUIRED\n')
+            self.assertFalse(runner.resume_reviewed_halt(path, '20260930-205047'))
+            self.assertTrue(Path(str(path) + '.halted').exists())
+
+    def test_reviewed_resume_rejects_changed_state_or_incident(self):
+        changes = ["UPDATE delivery_v1 SET status='UNKNOWN' WHERE identity='0'",
+                   "DELETE FROM delivery_v1 WHERE identity='0'",
+                   "INSERT INTO donkey_reference_events_v1 VALUES ('test', 'STOP', 'test', 'PENDING')",
+                   "INSERT INTO donkey_reference_v1 VALUES ('test', 'test', 'test', '{}', 1, 'ACTIVE', 1, NULL, NULL, NULL, 1)",
+                   "UPDATE route_check_v1 SET status='UNKNOWN'",
+                   "INSERT INTO delivery_clock_v1 VALUES (1, 4102444800000)"]
+        for sql in changes:
+            with self.subTest(sql=sql), tempfile.TemporaryDirectory() as directory:
+                path = self.reviewed_fixture(directory)
+                with contextlib.closing(runner.sqlite3.connect(path)) as db, db:
+                    db.execute(sql)
+                self.assertFalse(runner.resume_reviewed_halt(path, '20260930-205047'))
+                self.assertTrue(Path(str(path) + '.halted').exists())
+                self.assertFalse(Path(str(path) + '.halted.reviewed-20260930-205047').exists())
+        self.assertFalse(runner.resume_reviewed_halt('unused', '../other'))
+
+    def test_reviewed_resume_disk_failure_keeps_original_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            with patch.object(runner.os, 'fsync', side_effect=OSError('private')):
+                self.assertFalse(runner.resume_reviewed_halt(path, '20260930-205047'))
+            self.assertTrue(Path(str(path) + '.halted').exists())
+            self.assertFalse(runner.resume_reviewed_halt(path, '20260930-205047'))
+
+    def test_resume_requires_authorization_before_any_recovery_or_credentials(self):
+        with patch.object(runner, 'resume_reviewed_halt') as resume, \
+             patch.object(runner.os.environ, 'get', side_effect=AssertionError('no env')):
+            self.assertEqual(runner.execute({}, {}, 'unused', reviewed_halt='20260930-205047')['status'], 'BLOCKED')
+            resume.assert_not_called()
+
+    def test_new_failure_cannot_reuse_reviewed_resume_on_platform_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.reviewed_fixture(directory)
+            with patch.object(runner.os.environ, 'get', return_value='FAKE'), \
+                 patch.object(runner, 'run_service', return_value=dict(status='FAILED')) as run:
+                self.assertEqual(runner.execute({}, {}, path, authorized=True, reviewed_halt='20260930-205047')['status'], 'FAILED')
+                self.assertEqual(runner.execute({}, {}, path, authorized=True, reviewed_halt='20260930-205047')['reason'], 'REVIEWED_RESUME_REFUSED')
+                run.assert_called_once()
+
     def test_halted_review_is_read_only_and_keeps_unknown_and_active_visible(self):
         import donkey_signal_tracking as tracking
         with tempfile.TemporaryDirectory() as directory:

@@ -17,7 +17,7 @@ from contextlib import closing
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-from signal_only_service import run_service, validate_service_config, diagnose_public_cycle
+from signal_only_service import run_service, validate_service_config, diagnose_public_cycle, exclusive_service
 from falcon_advisory_offline import reviewed_analysis
 from donkey_advisory_offline import reviewed_analysis as review_donkey
 from telegram_signal_delivery import initialize_ledger, ROUTES, verify_routes_once
@@ -80,11 +80,67 @@ def inspect_halted_ledger(path):
         return dict(report, reason='LEDGER_INSPECTION_FAILED_REDACTED')
 
 
-def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=False, donkey_operator_id=None):
+def resume_reviewed_halt(path, review):
+    """One human-approved incident only; archive the latch, never edit the DB.
+
+    A later failure cannot reuse this approval even if the command is unchanged.
+    A crash after archive creation but before completion fails closed.
+    """
+    if review != '20260930-205047':
+        return False
+    path = Path(path)
+    halted = Path(str(path) + '.halted')
+    archive = Path(str(path) + '.halted.reviewed-' + review)
+    try:
+        with exclusive_service(path):
+            if path.is_symlink() or halted.is_symlink() or archive.exists() or archive.is_symlink():
+                return False
+            if halted.read_bytes() != b'MANUAL_REVIEW_REQUIRED\n':
+                return False
+            audit = inspect_halted_ledger(path)
+            if not (audit.get('review_complete') is True and audit.get('clock_ahead') is False
+                    and audit.get('delivery') == {'CONFIRMED': 85}
+                    and audit.get('routes') == {'CONFIRMED': 2}
+                    and audit.get('references') == {} and audit.get('notices') == {}):
+                return False
+            # Exclusive archive is the durable one-use receipt. Never overwrite it.
+            with archive.open('xb') as handle:
+                handle.write(b'MANUAL_REVIEW_REQUIRED\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+            directory = None
+            try:
+                if os.name != 'nt':
+                    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    os.fsync(directory)
+                halted.unlink()  # Original bytes are preserved in the fsynced archive.
+                if directory is not None:
+                    os.fsync(directory)
+            except OSError:
+                if not halted.exists():
+                    with halted.open('xb') as handle:
+                        handle.write(b'MANUAL_REVIEW_REQUIRED\n')
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                raise
+            finally:
+                if directory is not None:
+                    os.close(directory)
+        return True
+    except Exception:
+        return False
+
+
+def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=False, donkey_operator_id=None,
+            reviewed_halt=None):
     if authorized is not True:
         return dict(status='BLOCKED', reason='EXPLICIT_AUTHORIZATIONS_REQUIRED')
     path = Path(ledger_path).resolve()
     halted = Path(str(path) + '.halted')
+    if halted.exists() and reviewed_halt is not None:
+        if not resume_reviewed_halt(path, reviewed_halt):
+            return dict(status='BLOCKED', reason='REVIEWED_RESUME_REFUSED')
+        print(json.dumps(dict(status='REVIEWED_HALT_ARCHIVED', live_allowed=False)), flush=True)
     if not path.is_file() or halted.exists():
         if path.is_file() and halted.exists():
             print(json.dumps(inspect_halted_ledger(path)), flush=True)
@@ -169,7 +225,10 @@ def main(argv=None):
     parser.add_argument('--verify-telegram-once', action='store_true')
     parser.add_argument('--donkey-operator-id', type=int)
     parser.add_argument('--authorize-donkey-polling', action='store_true')
+    parser.add_argument('--reviewed-halt', choices=['20260930-205047'])
     args = parser.parse_args(argv)
+    if args.reviewed_halt is not None and not args.run:
+        parser.error('--reviewed-halt requires --run')
     if args.diagnostic_attempt is not None and not args.diagnose_public_once:
         parser.error('--diagnostic-attempt requires --diagnose-public-once')
     if args.verify_telegram_once and not args.run:
@@ -200,7 +259,8 @@ def main(argv=None):
         else:
             result = execute(config, sources, args.ledger, authorized=(args.authorize_service
                              and args.authorize_public_data and args.authorize_telegram),
-                             verify_telegram=args.verify_telegram_once, donkey_operator_id=args.donkey_operator_id)
+                             verify_telegram=args.verify_telegram_once, donkey_operator_id=args.donkey_operator_id,
+                             reviewed_halt=args.reviewed_halt)
     except Exception:
         result = dict(status='BLOCKED', reason='CONFIGURATION_OR_STORAGE_REVIEW_REQUIRED')
     # Never print exceptions, paths, config, credentials or raw transport responses.
