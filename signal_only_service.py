@@ -21,6 +21,25 @@ from bingx_public_signal_source import collect_snapshot, validate_snapshot, Publ
 from telegram_signal_delivery import _route
 
 
+def service_error_code(error):
+    """Only fixed codes/types, never exception text, URLs or payloads."""
+    if type(error) is PublicDataError:
+        return safe_error_code(error)
+    codes = {'DONKEY_POLLING_NOT_AVAILABLE', 'DONKEY_POLL_FAILED_NO_RETRY',
+             'DONKEY_UPDATE_INVALID', 'DONKEY_REFERENCE_CLOCK_REGRESSION',
+             'DONKEY_NOTICE_UNKNOWN_NO_RETRY', 'DONKEY_REFERENCE_H4_REQUIRED',
+             'DONKEY_REFERENCE_IDENTITY_CHANGED', 'CLOCK_REGRESSION', 'LEDGER_INTEGRITY'}
+    if type(error) is ValueError and len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in codes:
+        return error.args[0]
+    if isinstance(error, TimeoutError):
+        return 'IO_TIMEOUT'
+    if isinstance(error, sqlite3.Error):
+        return 'SQLITE_FAILURE'
+    if isinstance(error, OSError):
+        return 'IO_FAILURE'
+    return 'SERVICE_VALIDATION_OR_IO_FAILED'
+
+
 def required_frames(bot, entry):
     if bot == "DONKEY":
         return {"4h", "1d"}
@@ -247,6 +266,7 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                  confirmed=0, live_allowed=False)
     if not (service_authorized is True and public_data_authorized is True and public_delivery_authorized is True):
         return dict(state, reason="SERVICE_AUTHORIZATIONS_REQUIRED")
+    stage = 'configuration'
     try:
         config = validate_service_config(config)
         _require(max_cycles is None or type(max_cycles) is int and max_cycles > 0, "CYCLE_LIMIT")
@@ -259,6 +279,7 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
         values = dict(values)
         sources = dict(sources)
         path = Path(ledger_path).resolve()
+        stage = 'ledger_check'
         with closing(sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5)) as db:
             _require(db.execute("PRAGMA quick_check").fetchone() == ("ok",), "LEDGER_INTEGRITY")
             db.execute("SELECT identity, candle, route, status, attempted_ms, message_id FROM delivery_v1 LIMIT 0")
@@ -268,35 +289,43 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
         benign = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
                   "EXPIRED", "PRIOR_ATTEMPT_NO_RETRY", "EXPIRED_BEFORE_HTTP", "DATA_AGED_DURING_ANALYSIS"}
         last_now = None
+        stage = 'exclusive_lock'
         with exclusive_service(path):
             tracker = None
             if donkey_operator_id is not None:
                 from donkey_signal_tracking import ReferenceTracker
+                stage = 'tracking_initialize'
                 tracker = ReferenceTracker(str(path), values, donkey_operator_id, authorized=True)
+                stage = 'tracking_webhook_check'
                 tracker.check_polling()
+                stage = 'tracking_notice_flush'
                 tracker.flush()
             while not stop_event.is_set():
                 for symbol in symbols:
                     if stop_event.is_set():
                         return dict(state, status="STOPPED", reason="STOP_REQUESTED")
                     if tracker:
+                        stage = 'tracking_poll'
                         tracker.poll(time.time_ns() // 1000000)
                     selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
                     needed = set().union(*(required_frames(bot, entry) for bot, entry in selected.items()))
                     intervals = [tf for tf in ("15m", "1h", "4h", "1d") if tf in needed]
                     try:
+                        stage = 'public_collection'
                         snapshot = collect_snapshot(symbol, intervals, authorized=True, limit=200)
                     except PublicDataError as error:
-                        return dict(state, status="FAILED", reason=safe_error_code(error))
+                        return dict(state, status="FAILED", reason=safe_error_code(error), stage=stage)
                     _require(type(snapshot) is dict and snapshot.get("symbol") == symbol and
                              snapshot.get("synthetic") is False, "SNAPSHOT_IDENTITY_MISMATCH")
                     if tracker and symbol in config['bots']['DONKEY']['symbols']:
                         try:
+                            stage = 'tracking_observe'
                             tracker.observe(scoped_snapshot(snapshot, {'4h'}), time.time_ns() // 1000000,
                                             config['bots']['DONKEY']['policy'])
                         except PublicDataError as error:
                             if safe_error_code(error) != 'FRAME_EXPIRED':
                                 raise
+                        stage = 'tracking_notice_flush'
                         tracker.flush()
                     for bot, entry in selected.items():
                         scoped = scoped_snapshot(snapshot, required_frames(bot, entry))
@@ -304,6 +333,7 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             if stop_event.is_set():
                                 return dict(state, status="STOPPED", reason="STOP_REQUESTED")
                             now = time.time_ns() // 1000000
+                            stage = 'signal_evaluation_or_delivery'
                             _require(last_now is None or now >= last_now, "CLOCK_REGRESSION")
                             last_now = now
                             result = run_once(bot, sources[bot], scoped, entry["analysis"], entry["policy"],
@@ -335,5 +365,5 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
             return dict(state, status="STOPPED", reason="STOP_REQUESTED")
     except KeyboardInterrupt:
         return dict(state, status="STOPPED", reason="INTERRUPTED")
-    except Exception:
-        return dict(state, status="FAILED", reason="SERVICE_VALIDATION_OR_IO_FAILED")
+    except Exception as error:
+        return dict(state, status="FAILED", reason=service_error_code(error), stage=stage)

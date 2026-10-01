@@ -15,6 +15,35 @@ import telegram_signal_delivery as delivery
 
 
 class TrackingTests(unittest.TestCase):
+    def test_service_fixed_diagnostics_redact_transport_and_untrusted_errors(self):
+        import signal_only_service as service
+        cases = [(TimeoutError('secret-url'), 'IO_TIMEOUT'),
+                 (ValueError('secret-url'), 'SERVICE_VALIDATION_OR_IO_FAILED'),
+                 (ValueError('DONKEY_REFERENCE_H4_REQUIRED'), 'DONKEY_REFERENCE_H4_REQUIRED'),
+                 (service.PublicDataError('QUOTE_STALE_OR_FUTURE'), 'QUOTE_STALE_OR_FUTURE')]
+        for error, code in cases:
+            self.assertEqual(service.service_error_code(error), code)
+
+    def test_supervisor_reports_tracking_stage_and_stops_without_evaluation(self):
+        import test_signal_only_service as sf
+        import threading
+        for method, stage in [('check_polling', 'tracking_webhook_check'),
+                              ('poll', 'tracking_poll'), ('observe', 'tracking_observe'),
+                              ('flush', 'tracking_notice_flush')]:
+            with self.subTest(method=method), patch.object(tracking, 'ReferenceTracker') as factory, \
+                 patch.object(sf.service, 'collect_snapshot', return_value=self.snapshot), \
+                 patch.object(sf.service, 'run_once') as evaluate:
+                getattr(factory.return_value, method).side_effect = TimeoutError('private-token')
+                out = sf.service.run_service(sf.config(), dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE),
+                    values=fixture.VALUES, ledger_path=self.path, stop_event=threading.Event(),
+                    service_authorized=True, public_data_authorized=True, public_delivery_authorized=True,
+                    max_cycles=1, donkey_operator_id=77)
+                self.assertEqual(out['status'], 'FAILED')
+                self.assertEqual(out['reason'], 'IO_TIMEOUT')
+                self.assertEqual(out['stage'], stage)
+                self.assertNotIn('private-token', str(out))
+                evaluate.assert_not_called()
+
     @contextmanager
     def db(self):
         with closing(tracking.connect(self.path)) as db, db:

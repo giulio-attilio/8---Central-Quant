@@ -15,6 +15,41 @@ import signal_only_runner as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_halted_review_is_read_only_and_keeps_unknown_and_active_visible(self):
+        import donkey_signal_tracking as tracking
+        with tempfile.TemporaryDirectory() as directory:
+            _, path = self.inputs(directory)
+            runner.provision_ledger(path)
+            tracking.provision(path)
+            with contextlib.closing(runner.sqlite3.connect(path)) as db, db:
+                db.execute("INSERT INTO delivery_v1 VALUES ('private-id', 'private-candle', 'private-route', 'UNKNOWN', 1, NULL)")
+                db.execute("INSERT INTO donkey_reference_v1 VALUES ('private-ref', 'private-id', 'private-route', '{}', 1, 'ACTIVE', 1, NULL, NULL, NULL, 1)")
+            halted = Path(str(path) + '.halted')
+            halted.write_text('MANUAL_REVIEW_REQUIRED\n')
+            before = path.read_bytes()
+            with patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                 patch.object(runner, 'run_service') as run, contextlib.redirect_stdout(io.StringIO()) as output:
+                result = runner.execute({}, {}, path, authorized=True)
+            report = json.loads(output.getvalue())
+            self.assertTrue(report['review_complete'])
+            self.assertEqual(report['delivery'], {'UNKNOWN': 1})
+            self.assertEqual(report['references'], {'ACTIVE': 1})
+            self.assertNotIn('private-', output.getvalue())
+            self.assertEqual(result['status'], 'BLOCKED')
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(halted.read_text(), 'MANUAL_REVIEW_REQUIRED\n')
+            run.assert_not_called()
+
+    def test_halted_review_missing_schema_never_creates_or_repairs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'absent.sqlite'
+            self.assertFalse(runner.inspect_halted_ledger(path)['review_complete'])
+            self.assertFalse(path.exists())
+            runner.provision_ledger(path)
+            before = path.read_bytes()
+            self.assertFalse(runner.inspect_halted_ledger(path)['review_complete'])
+            self.assertEqual(path.read_bytes(), before)
+
     def test_route_check_failure_prevents_service(self):
         with tempfile.TemporaryDirectory() as directory:
             _, path = self.inputs(directory)
@@ -207,7 +242,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(runner.main(argv), 1)
             reports = [json.loads(line) for line in output.getvalue().splitlines()]
             self.assertEqual(reports[0]['reason'], 'CANDLE_GAP_OR_DUPLICATE')
-            self.assertEqual(reports[1]['reason'], 'LEDGER_OR_MANUAL_REVIEW_REQUIRED')
+            self.assertEqual(reports[-1]['reason'], 'LEDGER_OR_MANUAL_REVIEW_REQUIRED')
             self.assertTrue(all(r['live_allowed'] is False for r in reports))
             collect.assert_called_once()
             evaluate.assert_not_called()

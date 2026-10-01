@@ -11,6 +11,9 @@ from pathlib import Path
 import signal
 import sys
 import threading
+import sqlite3
+import time
+from contextlib import closing
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -44,12 +47,47 @@ def provision_ledger(path):
     initialize_ledger(path)
 
 
+def inspect_halted_ledger(path):
+    """Read-only counts, not message contents, identifiers or credentials.
+
+    Never repairs, clears a latch, starts a service or enables delivery.
+    Unknown schema/status or IO failure keeps the review incomplete.
+    """
+    report = dict(status='HALTED_LEDGER_REVIEW', review_complete=False,
+                  delivery_allowed=False, live_allowed=False)
+    try:
+        with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as db:
+            db.execute('BEGIN')
+            if db.execute('PRAGMA quick_check').fetchone() != ('ok',):
+                return dict(report, reason='LEDGER_INTEGRITY')
+            tables = {
+                'delivery': ('delivery_v1', 'status', {'CONFIRMED', 'UNKNOWN', 'REJECTED', 'EXPIRED'}),
+                'routes': ('route_check_v1', 'status', {'CONFIRMED', 'UNKNOWN'}),
+                'references': ('donkey_reference_v1', 'state', {'WAITING', 'ACTIVE', 'RUNNER', 'EXPIRED', 'CLOSED'}),
+                'notices': ('donkey_reference_events_v1', 'status', {'PENDING', 'UNKNOWN', 'CONFIRMED'}),
+            }
+            for name, (table, column, allowed) in tables.items():
+                counts = dict(db.execute(f'SELECT {column}, COUNT(*) FROM {table} GROUP BY {column}'))
+                if not set(counts) <= allowed:
+                    return dict(report, reason='LEDGER_STATE_REVIEW_REQUIRED')
+                report[name] = counts
+            now = time.time_ns() // 1000000
+            clocks = [r[0] for r in db.execute('SELECT now_ms FROM delivery_clock_v1')]
+            clocks += [r[0] for r in db.execute('SELECT clock FROM donkey_reference_control_v1')]
+            report['clock_ahead'] = any(type(c) is not int or c > now for c in clocks)
+        return dict(report, review_complete=True, reason='READ_ONLY_NO_RECOVERY')
+    except Exception:
+        return dict(report, reason='LEDGER_INSPECTION_FAILED_REDACTED')
+
+
 def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=False, donkey_operator_id=None):
     if authorized is not True:
         return dict(status='BLOCKED', reason='EXPLICIT_AUTHORIZATIONS_REQUIRED')
     path = Path(ledger_path).resolve()
     halted = Path(str(path) + '.halted')
     if not path.is_file() or halted.exists():
+        if path.is_file() and halted.exists():
+            print(json.dumps(inspect_halted_ledger(path)), flush=True)
         return dict(status='BLOCKED', reason='LEDGER_OR_MANUAL_REVIEW_REQUIRED')
     values = {key: os.environ.get(key) for pair in ROUTES.values() for key in pair}
     stop = threading.Event()
