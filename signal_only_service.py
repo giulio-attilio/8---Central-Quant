@@ -21,6 +21,9 @@ from bingx_public_signal_source import collect_snapshot, validate_snapshot, Publ
 from telegram_signal_delivery import _route
 
 
+TRACKING_SNAPSHOT_DISCARD_ERRORS = frozenset({'QUOTE_STALE_OR_FUTURE'})
+
+
 def service_error_code(error):
     """Only fixed codes/types, never exception text, URLs or payloads."""
     if type(error) is PublicDataError:
@@ -325,7 +328,17 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             tracker.observe(scoped_snapshot(snapshot, {'4h'}), time.time_ns() // 1000000,
                                             config['bots']['DONKEY']['policy'])
                         except PublicDataError as error:
-                            if safe_error_code(error) != 'FRAME_EXPIRED':
+                            code = safe_error_code(error)
+                            if code in TRACKING_SNAPSHOT_DISCARD_ERRORS:
+                                state['discarded_snapshots'] = state.get('discarded_snapshots', 0) + 1
+                                state['tracking_quote_skips'] = state.get('tracking_quote_skips', 0) + 1
+                                print(json.dumps(dict(status='TRACKING_OBSERVATION_SKIPPED', reason=code,
+                                                      tracking_quote_skips=state['tracking_quote_skips'],
+                                                      live_allowed=False)), flush=True)
+                                # The quote failed validation before the tracker opened
+                                # its transaction. Do not analyze or deliver this snapshot.
+                                continue
+                            if code != 'FRAME_EXPIRED':
                                 raise
                         stage = 'tracking_notice_flush'
                         tracker.flush()

@@ -307,6 +307,24 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(Path(str(path) + '.halted').exists())
         self.assertEqual({sig: signal.getsignal(sig) for sig in previous}, previous)
 
+    def test_tracking_quote_skip_stopped_result_does_not_latch_or_exit_one(self):
+        stopped = dict(status='STOPPED', reason='CYCLE_LIMIT_REACHED',
+                       tracking_quote_skips=1, live_allowed=False)
+        with tempfile.TemporaryDirectory() as directory:
+            config, path = self.inputs(directory)
+            runner.provision_ledger(path)
+            with patch.object(runner.os.environ, 'get', return_value='FAKE'), \
+                 patch.object(runner, 'run_service', return_value=stopped):
+                self.assertEqual(runner.execute({}, {}, path, authorized=True), stopped)
+            self.assertFalse(Path(str(path) + '.halted').exists())
+            argv = ['--run', '--config', str(config), '--ledger', str(path),
+                    '--authorize-service', '--authorize-public-data', '--authorize-telegram']
+            with patch.object(runner, 'load_inputs', return_value=({}, {})), \
+                 patch.object(runner, 'execute', return_value=stopped), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(runner.main(argv), 0)
+            self.assertIs(json.loads(output.getvalue())['live_allowed'], False)
+
     def test_failure_latches_and_platform_restart_cannot_send(self):
         with tempfile.TemporaryDirectory() as directory:
             _, path = self.inputs(directory)
