@@ -13,6 +13,7 @@
 !telegram_signal_delivery.py
 !signal_only_runner.py
 !donkey_signal_tracking.py
+!manual_signal_tracking.py
 !signals_sources/
 !signals_sources/falcon.txt
 !signals_sources/donkey.txt

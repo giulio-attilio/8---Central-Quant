@@ -16,7 +16,7 @@ from contextlib import contextmanager, closing
 from falcon_advisory_offline import _config, _policy, _require, _timestamp, reviewed_analysis
 from donkey_advisory_offline import validate_config as donkey_config
 from donkey_advisory_offline import reviewed_analysis as donkey_source
-from signal_only_workflow import run_once, DONKEY_VARIANTS
+from signal_only_workflow import run_once, dispatch_ready_candidates, DONKEY_VARIANTS
 from bingx_public_signal_source import collect_snapshot, validate_snapshot, PublicDataError, safe_error_code
 from telegram_signal_delivery import _route
 
@@ -31,7 +31,13 @@ def service_error_code(error):
     codes = {'DONKEY_POLLING_NOT_AVAILABLE', 'DONKEY_POLL_FAILED_NO_RETRY',
              'DONKEY_UPDATE_INVALID', 'DONKEY_REFERENCE_CLOCK_REGRESSION',
              'DONKEY_NOTICE_UNKNOWN_NO_RETRY', 'DONKEY_REFERENCE_H4_REQUIRED',
-             'DONKEY_REFERENCE_IDENTITY_CHANGED', 'CLOCK_REGRESSION', 'LEDGER_INTEGRITY'}
+             'DONKEY_REFERENCE_IDENTITY_CHANGED', 'CLOCK_REGRESSION', 'LEDGER_INTEGRITY',
+             'MANUAL_TRACKING_POLLING_NOT_AVAILABLE',
+             'MANUAL_TRACKING_POLL_FAILED_NO_RETRY',
+             'MANUAL_TRACKING_UPDATE_INVALID', 'MANUAL_TRACKING_CLOCK_REGRESSION',
+             'MANUAL_TRACKING_NOTICE_UNKNOWN_NO_RETRY',
+             'MANUAL_TRACKING_IDENTITY_CHANGED', 'MANUAL_TRACKING_PUBLIC_QUOTE_REQUIRED',
+             'MANUAL_TRACKING_ROUTE_CHANGED'}
     if type(error) is ValueError and len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in codes:
         return error.args[0]
     if isinstance(error, TimeoutError):
@@ -293,15 +299,18 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
         benign = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
                   "EXPIRED", "PRIOR_ATTEMPT_NO_RETRY", "EXPIRED_BEFORE_HTTP", "DATA_AGED_DURING_ANALYSIS",
                   "DONKEY_STOP_DISTANCE_ABOVE_IDEAL", "DONKEY_REFERENCE_ALREADY_ACTIVE",
-                  "DONKEY_WAIT_NEXT_H4_AFTER_EXIT"}
+                  "DONKEY_WAIT_NEXT_H4_AFTER_EXIT", "MANUAL_TRADE_SAME_SIDE_ACTIVE"}
         last_now = None
         stage = 'exclusive_lock'
         with exclusive_service(path):
             tracker = None
             if donkey_operator_id is not None:
-                from donkey_signal_tracking import ReferenceTracker, TrackingPollTransientError
+                from manual_signal_tracking import (ManualTradeTracker, TrackingPollTransientError,
+                                                    provision as provision_manual_tracking)
+                stage = 'tracking_schema_provision'
+                provision_manual_tracking(str(path))
                 stage = 'tracking_initialize'
-                tracker = ReferenceTracker(str(path), values, donkey_operator_id, authorized=True)
+                tracker = ManualTradeTracker(str(path), values, donkey_operator_id, authorized=True)
                 stage = 'tracking_webhook_check'
                 tracker.check_polling()
                 stage = 'tracking_notice_flush'
@@ -337,28 +346,28 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                         return dict(state, status="FAILED", reason=safe_error_code(error), stage=stage)
                     _require(type(snapshot) is dict and snapshot.get("symbol") == symbol and
                              snapshot.get("synthetic") is False, "SNAPSHOT_IDENTITY_MISMATCH")
-                    if tracker and symbol in config['bots']['DONKEY']['symbols']:
+                    if tracker:
                         try:
                             stage = 'tracking_observe'
-                            tracker.observe(scoped_snapshot(snapshot, {'4h'}), time.time_ns() // 1000000,
-                                            config['bots']['DONKEY']['policy'])
-                        except PublicDataError as error:
-                            code = safe_error_code(error)
-                            if code in TRACKING_SNAPSHOT_DISCARD_ERRORS:
+                            quote_age = min(entry['policy']['quote_max_age_ms']
+                                            for entry in selected.values())
+                            tracker.observe(snapshot, time.time_ns() // 1000000, quote_age)
+                        except ValueError as error:
+                            if str(error) == 'MANUAL_TRACKING_PUBLIC_QUOTE_REQUIRED':
                                 state['discarded_snapshots'] = state.get('discarded_snapshots', 0) + 1
                                 state['tracking_quote_skips'] = state.get('tracking_quote_skips', 0) + 1
-                                print(json.dumps(dict(status='TRACKING_OBSERVATION_SKIPPED', reason=code,
+                                print(json.dumps(dict(status='TRACKING_OBSERVATION_SKIPPED',
+                                                      reason='QUOTE_STALE_OR_FUTURE',
                                                       tracking_quote_skips=state['tracking_quote_skips'],
                                                       live_allowed=False)), flush=True)
-                                # The quote failed validation before the tracker opened
-                                # its transaction. Do not analyze or deliver this snapshot.
                                 continue
-                            if code != 'FRAME_EXPIRED':
-                                raise
+                            raise
                         stage = 'tracking_notice_flush'
                         tracker.flush()
                     for bot, entry in selected.items():
                         scoped = scoped_snapshot(snapshot, required_frames(bot, entry))
+                        ready = []
+                        frame_expired = False
                         for setup in entry["setups"]:
                             if stop_event.is_set():
                                 return dict(state, status="STOPPED", reason="STOP_REQUESTED")
@@ -369,20 +378,33 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             result = run_once(bot, sources[bot], scoped, entry["analysis"], entry["policy"],
                                 setup=setup, now_ms=now, values=values, ledger_path=str(path),
                                 network_authorized=True, public_data_authorized=True, public_delivery_authorized=True,
-                                donkey_tracking=tracker is not None)
+                                defer_public_delivery=True)
                             state["evaluations"] += 1
                             if result.get("status") == "BLOCKED" and result.get("reason") == "FRAME_EXPIRED":
                                 state["discarded_snapshots"] = state.get("discarded_snapshots", 0) + 1
+                                frame_expired = True
                                 break
-                            if result["status"] == "CONFIRMED":
-                                state["confirmed"] += 1
+                            if result["status"] == "PUBLIC_CANDIDATE_READY":
+                                ready.append(result)
                             elif result.get("reason") not in benign:
                                 # Never return untrusted response/exception contents or credentials.
                                 return dict(state, status="FAILED", reason="EVALUATION_OR_DELIVERY_STOPPED")
-                            # Pace actual Telegram sends; public HTTP is paced in
-                            # collection. Pure evaluations need no delivery delay.
-                            if result["status"] == "CONFIRMED" and stop_event.wait(1):
-                                return dict(state, status="STOPPED", reason="STOP_REQUESTED")
+                        if frame_expired or not ready:
+                            continue
+                        stage = 'signal_delivery'
+                        delivered = dispatch_ready_candidates(
+                            bot, ready, values=values, ledger_path=str(path),
+                            network_authorized=True, public_delivery_authorized=True,
+                            manual_tracking=tracker is not None,
+                        )
+                        physical = delivered.get('deliveries', [])
+                        for item in physical:
+                            if item.get('status') == 'CONFIRMED':
+                                state['confirmed'] += 1
+                                if stop_event.wait(1):
+                                    return dict(state, status="STOPPED", reason="STOP_REQUESTED")
+                            elif item.get('reason') not in benign:
+                                return dict(state, status="FAILED", reason="EVALUATION_OR_DELIVERY_STOPPED")
                 state["cycles"] += 1
                 print(json.dumps(dict(status='SIGNALS_CYCLE_COMPLETE', cycles=state['cycles'],
                                       evaluations=state['evaluations'], confirmed=state['confirmed'],

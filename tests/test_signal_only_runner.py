@@ -15,6 +15,14 @@ import signal_only_runner as runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_run_requires_authorized_manual_tracking_operator(self):
+        argv = ['--run', '--config', 'unused.json', '--ledger', 'unused.sqlite',
+                '--authorize-service', '--authorize-public-data', '--authorize-telegram']
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
+             patch.object(runner, 'load_inputs') as load:
+            runner.main(argv)
+        load.assert_not_called()
+
     def reviewed_fixture(self, directory):
         import donkey_signal_tracking as tracking
         path = Path(directory) / 'reviewed.sqlite'
@@ -196,6 +204,7 @@ class RunnerTests(unittest.TestCase):
             runner.main(invalid)
         argv = ['--run', '--config', 'unused.json', '--ledger', 'unused.sqlite',
                 '--authorize-service', '--authorize-public-data', '--authorize-telegram',
+                '--donkey-operator-id', '77', '--authorize-donkey-polling',
                 '--reviewed-halt', runner.SECOND_REVIEWED_HALT_ID]
         with patch.object(runner, 'load_inputs', return_value=({}, {})), \
              patch.object(runner, 'execute', return_value=dict(status='STOPPED')) as execute, \
@@ -310,6 +319,7 @@ class RunnerTests(unittest.TestCase):
             runner.main(invalid)
         argv = ['--run', '--config', 'unused.json', '--ledger', 'unused.sqlite',
                 '--authorize-service', '--authorize-public-data', '--authorize-telegram',
+                '--donkey-operator-id', '77', '--authorize-donkey-polling',
                 '--reviewed-halt', runner.THIRD_REVIEWED_HALT_ID]
         with patch.object(runner, 'load_inputs', return_value=({}, {})), \
              patch.object(runner, 'execute', return_value=dict(status='STOPPED')) as execute, \
@@ -531,7 +541,8 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(runner.execute({}, {}, path, authorized=True), stopped)
             self.assertFalse(Path(str(path) + '.halted').exists())
             argv = ['--run', '--config', str(config), '--ledger', str(path),
-                    '--authorize-service', '--authorize-public-data', '--authorize-telegram']
+                    '--authorize-service', '--authorize-public-data', '--authorize-telegram',
+                    '--donkey-operator-id', '77', '--authorize-donkey-polling']
             with patch.object(runner, 'load_inputs', return_value=({}, {})), \
                  patch.object(runner, 'execute', return_value=stopped), \
                  contextlib.redirect_stdout(io.StringIO()) as output:
@@ -550,12 +561,15 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(Path(str(path) + '.halted').read_text(), 'MANUAL_REVIEW_REQUIRED\n')
 
     def test_public_diagnostic_survives_cli_and_latches_without_delivery(self):
+        import manual_signal_tracking as manual_tracking
         with tempfile.TemporaryDirectory() as directory:
             config, path = self.inputs(directory)
             runner.provision_ledger(path)
             argv = ['--run', '--config', str(config), '--ledger', str(path),
-                    '--authorize-service', '--authorize-public-data', '--authorize-telegram']
+                    '--authorize-service', '--authorize-public-data', '--authorize-telegram',
+                    '--donkey-operator-id', '77', '--authorize-donkey-polling']
             with patch.object(runner.os.environ, 'get', side_effect=lambda key, default=None: fixtures.fixtures.VALUES.get(key, default)), \
+                 patch.object(manual_tracking, 'ManualTradeTracker'), \
                  patch.object(fixtures.service, 'collect_snapshot', side_effect=fixtures.service.PublicDataError('CANDLE_GAP_OR_DUPLICATE')) as collect, \
                  patch.object(fixtures.service, 'run_once') as evaluate, \
                  contextlib.redirect_stdout(io.StringIO()) as output:

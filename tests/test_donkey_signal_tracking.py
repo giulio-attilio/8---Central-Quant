@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_signal_only_integration as fixture
 import donkey_signal_tracking as tracking
+import manual_signal_tracking as manual_tracking
 import telegram_signal_delivery as delivery
 
 
@@ -74,7 +75,7 @@ class TrackingTests(unittest.TestCase):
         for method, stage in [('check_polling', 'tracking_webhook_check'),
                               ('poll', 'tracking_poll'), ('observe', 'tracking_observe'),
                               ('flush', 'tracking_notice_flush')]:
-            with self.subTest(method=method), patch.object(tracking, 'ReferenceTracker') as factory, \
+            with self.subTest(method=method), patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
                  patch.object(sf.service, 'collect_snapshot', return_value=self.snapshot), \
                  patch.object(sf.service, 'run_once') as evaluate:
                 getattr(factory.return_value, method).side_effect = TimeoutError('private-token')
@@ -100,17 +101,15 @@ class TrackingTests(unittest.TestCase):
         args = sf.ServiceTests().supervisor_args(self.path)
         args.update(max_cycles=2, donkey_operator_id=77)
         sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
-        with patch.object(tracking, 'ReferenceTracker', return_value=self.tracker), \
-             patch.object(self.tracker, 'check_polling'), \
-             patch.object(self.tracker, 'poll'), \
-             patch.object(self.tracker, 'flush') as flush, \
+        with patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
              patch.object(service, 'collect_snapshot', side_effect=[stale, valid]) as collect, \
              patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='NO_SIGNAL')) as evaluate, \
              patch.object(service.time, 'time_ns', return_value=now * 1000000), \
              patch.object(delivery, '_post') as post, redirect_stdout(io.StringIO()) as output:
+            factory.return_value.observe.side_effect = [
+                ValueError('MANUAL_TRACKING_PUBLIC_QUOTE_REQUIRED'), None]
             out = service.run_service(sf.config(), sources, **args)
         report = json.loads(output.getvalue().splitlines()[0])
-        row = self.state(key)
         self.assertEqual(out['status'], 'STOPPED', out)
         self.assertEqual(out['reason'], 'CYCLE_LIMIT_REACHED')
         self.assertEqual(out['discarded_snapshots'], 1)
@@ -119,20 +118,17 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(report['status'], 'TRACKING_OBSERVATION_SKIPPED')
         self.assertEqual(report['reason'], 'QUOTE_STALE_OR_FUTURE')
         self.assertIs(report['live_allowed'], False)
-        self.assertEqual(row['state'], 'ACTIVE')
-        self.assertEqual(row['last_quote'], now)
-        with self.db() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM donkey_reference_events_v1').fetchone()[0], 0)
         self.assertEqual(collect.call_count, 2)
         self.assertEqual(evaluate.call_count, 5)
-        self.assertEqual(flush.call_count, 2)  # Startup plus the valid observation only.
+        self.assertEqual(factory.return_value.flush.call_count, 2)
+        self.assertEqual(factory.return_value.observe.call_count, 2)
         post.assert_not_called()
 
     def test_tracking_storage_failure_remains_fatal(self):
         import signal_only_service as service
         import test_signal_only_service as sf
         sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
-        with patch.object(tracking, 'ReferenceTracker') as factory, \
+        with patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
              patch.object(service, 'collect_snapshot', return_value=self.snapshot), \
              patch.object(service, 'run_once') as evaluate, \
              patch.object(delivery, '_post') as post:
@@ -183,15 +179,12 @@ class TrackingTests(unittest.TestCase):
         args = sf.ServiceTests().supervisor_args(self.path)
         args.update(max_cycles=2, donkey_operator_id=77)
         sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
-        with patch.object(tracking, 'ReferenceTracker', return_value=self.tracker), \
-             patch.object(self.tracker, 'check_polling'), \
-             patch.object(self.tracker, 'flush') as flush, \
-             patch.object(delivery, '_telegram_api',
-                          side_effect=[ConnectionResetError('private'), (200, dict(ok=True, result=[]))]) as api, \
+        with patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
              patch.object(service, 'collect_snapshot', return_value=snap) as collect, \
              patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='NO_SIGNAL')) as evaluate, \
              patch.object(service.time, 'time_ns', return_value=now * 1000000), \
              patch.object(delivery, '_post') as post, redirect_stdout(io.StringIO()) as output:
+            factory.return_value.poll.side_effect = [manual_tracking.TrackingPollTransientError(), None]
             out = service.run_service(sf.config(), sources, **args)
         reports = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(out['status'], 'STOPPED', out)
@@ -201,10 +194,10 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(reports[0]['status'], 'TRACKING_POLL_DEFERRED')
         self.assertEqual(reports[0]['reason'], 'DONKEY_POLL_TRANSIENT')
         self.assertIs(reports[0]['live_allowed'], False)
-        self.assertEqual(api.call_count, 2)
+        self.assertEqual(factory.return_value.poll.call_count, 2)
         self.assertEqual(collect.call_count, 1)
         self.assertEqual(evaluate.call_count, 5)
-        self.assertEqual(flush.call_count, 2)  # Startup and the successful cycle.
+        self.assertEqual(factory.return_value.flush.call_count, 2)
         post.assert_not_called()
 
     def test_poll_cursor_persistence_failure_rolls_back_and_remains_fatal(self):
@@ -245,9 +238,9 @@ class TrackingTests(unittest.TestCase):
         import test_signal_only_service as sf
         sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
         cases = [(tracking.sqlite3.OperationalError('private-storage'), 'SQLITE_FAILURE'),
-                 (ValueError('DONKEY_REFERENCE_CLOCK_REGRESSION'), 'DONKEY_REFERENCE_CLOCK_REGRESSION')]
+                 (ValueError('MANUAL_TRACKING_CLOCK_REGRESSION'), 'MANUAL_TRACKING_CLOCK_REGRESSION')]
         for failure, reason in cases:
-            with self.subTest(reason=reason), patch.object(tracking, 'ReferenceTracker') as factory, \
+            with self.subTest(reason=reason), patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
                  patch.object(service, 'collect_snapshot') as collect, \
                  patch.object(service, 'run_once') as evaluate, patch.object(delivery, '_post') as post:
                 factory.return_value.poll.side_effect = failure
@@ -475,7 +468,7 @@ class TrackingTests(unittest.TestCase):
         config = service_fixture.config()
         sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
         snap, _ = fixture.PublicPreviewTests().public_fixture('DONKEY')
-        with patch.object(tracking, 'ReferenceTracker') as factory, \
+        with patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
              patch.object(service, 'collect_snapshot', return_value=snap) as collect, \
              patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='NO_SIGNAL')) as run:
             out = service.run_service(config, sources, values=fixture.VALUES, ledger_path=self.path,
@@ -487,7 +480,7 @@ class TrackingTests(unittest.TestCase):
         factory.return_value.check_polling.assert_called_once()
         factory.return_value.poll.assert_called_once()
         factory.return_value.observe.assert_called_once()
-        self.assertTrue(all(call.kwargs['donkey_tracking'] for call in run.call_args_list))
+        self.assertTrue(all(call.kwargs['defer_public_delivery'] for call in run.call_args_list))
 
 
 if __name__ == '__main__':

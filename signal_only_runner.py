@@ -265,6 +265,8 @@ def main(argv=None):
         parser.error('Donkey tracking requires --run, a positive operator id and explicit polling authorization')
     if args.authorize_donkey_polling and args.donkey_operator_id is None:
         parser.error('Donkey polling requires an explicit operator id')
+    if args.run and args.donkey_operator_id is None:
+        parser.error('Signal delivery requires manual tracking and an explicit operator id')
     try:
         config, sources = load_inputs(args.config)
         if args.check_config:
@@ -278,8 +280,10 @@ def main(argv=None):
         elif not args.ledger:
             result = dict(status='BLOCKED', reason='LEDGER_PATH_REQUIRED')
         elif args.initialize_donkey_tracking:
-            from donkey_signal_tracking import provision
-            provision(args.ledger)
+            from donkey_signal_tracking import provision as provision_legacy_tracking
+            from manual_signal_tracking import provision as provision_manual_tracking
+            provision_legacy_tracking(args.ledger)
+            provision_manual_tracking(args.ledger)
             result = dict(status='TRACKING_SCHEMA_INITIALIZED', live_allowed=False)
         elif args.initialize_ledger:
             provision_ledger(args.ledger)

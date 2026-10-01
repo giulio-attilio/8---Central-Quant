@@ -187,7 +187,7 @@ class ServiceTests(unittest.TestCase):
                     service_authorized=True, public_data_authorized=True,
                     public_delivery_authorized=True, max_cycles=1)
 
-    def test_supervisor_one_cycle_and_five_separate_evaluations(self):
+    def test_supervisor_one_cycle_batches_ready_candidates_by_bot(self):
         snapshot, now = fixtures.PublicPreviewTests().public_fixture("DONKEY")
         sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)
         with tempfile.TemporaryDirectory() as directory:
@@ -195,15 +195,21 @@ class ServiceTests(unittest.TestCase):
             fixtures.delivery.initialize_ledger(path)
             args = self.supervisor_args(path)
             with patch.object(service, "collect_snapshot", return_value=snapshot) as collect, \
-                 patch.object(service, "run_once", return_value=dict(status="CONFIRMED")) as run, \
+                 patch.object(service, "run_once", return_value=dict(
+                     status="PUBLIC_CANDIDATE_READY", candidate={})) as run, \
+                 patch.object(service, "dispatch_ready_candidates", side_effect=[
+                     dict(deliveries=[dict(status="CONFIRMED")]),
+                     dict(deliveries=[dict(status="CONFIRMED")] * 3),
+                 ]) as dispatch, \
                  patch.object(service.time, "time_ns", return_value=now * 1000000):
                 out = service.run_service(config(), sources, **args)
             self.assertEqual(out["reason"], "CYCLE_LIMIT_REACHED", out)
-            self.assertEqual((out["cycles"], out["evaluations"], out["confirmed"]), (1, 5, 5))
-            self.assertEqual(args["stop_event"].waits, [1, 1, 1, 1, 1])
+            self.assertEqual((out["cycles"], out["evaluations"], out["confirmed"]), (1, 5, 4))
+            self.assertEqual(args["stop_event"].waits, [1, 1, 1, 1])
             collect.assert_called_once_with("TEST-USDT", ["15m", "4h", "1d"], authorized=True, limit=200)
             self.assertEqual([c.kwargs["setup"] for c in run.call_args_list],
                              ["FALCON15", "FALCON30", "DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"])
+            self.assertEqual([len(call.args[1]) for call in dispatch.call_args_list], [2, 3])
 
     def test_supervisor_gates_credentials_and_missing_ledger_before_market(self):
         sources = dict(FALCON=fixtures.harness.SOURCE, DONKEY=fixtures.SOURCE)

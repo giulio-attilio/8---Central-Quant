@@ -7,7 +7,8 @@ import time
 from decimal import Decimal
 from falcon_advisory_offline import OfflineSignalSession, _policy
 from donkey_advisory_offline import analyze as analyze_donkey
-from telegram_signal_delivery import dispatch_synthetic, dispatch_public_signal
+from telegram_signal_delivery import (dispatch_synthetic, dispatch_public_signal,
+                                      dispatch_public_candidates)
 from bingx_public_signal_source import PERIODS
 
 DONKEY_VARIANTS = ("DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY")
@@ -27,7 +28,8 @@ inspect each result; NO_SIGNAL or rejection is not an alert to deliver.
 
 def run_once(bot, source, snapshot, config, policy, *, setup, now_ms,
              values=None, ledger_path=None, network_authorized=False, public_data_authorized=False,
-             public_delivery_authorized=False, donkey_tracking=False):
+             public_delivery_authorized=False, donkey_tracking=False,
+             defer_public_delivery=False):
     """Explicit caller-owned inputs. No credentials are needed for local preview.
 
 The transport ledger owns attempted-delivery deduplication. The Falcon analysis
@@ -63,8 +65,9 @@ Expiry is derived from candle close and policy, never extended by delivery time.
                 return dict(base, reason="WORKFLOW_INPUT_OR_ANALYSIS_FAILED")
             if abs(entry - stop) * 100 > entry * Decimal('1.5'):
                 return dict(base, reason="DONKEY_STOP_DISTANCE_ABOVE_IDEAL")
-        if public and (public_delivery_authorized is not True or network_authorized is not True
-                       or out["status"] != "PUBLIC_DATA_PREVIEW"):
+        if public and defer_public_delivery is not True and (
+                public_delivery_authorized is not True or network_authorized is not True
+                or out["status"] != "PUBLIC_DATA_PREVIEW"):
             # Public analysis authority never implies messaging or service authority.
             return dict(base, status="LOCAL_PUBLIC_PREVIEW" if out["status"] == "PUBLIC_DATA_PREVIEW" else "BLOCKED",
                         reason="PUBLIC_DELIVERY_NOT_ENABLED" if out["status"] == "PUBLIC_DATA_PREVIEW" else out.get("reason") or "NO_SIGNAL")
@@ -81,6 +84,11 @@ Expiry is derived from candle close and policy, never extended by delivery time.
             deadline = min(expiry, snapshot["quote"]["at_ms"] + policy["quote_max_age_ms"],
                            min(snapshot["frame_received_at_ms"].values()) + policy["snapshot_max_age_ms"],
                            min(rows[-1][0] + PERIODS[tf] for tf, rows in snapshot["frames"].items()))
+            if defer_public_delivery is True:
+                return dict(base, status="PUBLIC_CANDIDATE_READY", reason=None,
+                            candidate=dict(signal=out["signal"], now_ms=delivery_now,
+                                           expires_at_ms=expiry, validity_basis=policy["basis"],
+                                           data_valid_until_ms=deadline))
             delivered = dispatch_public_signal(bot, out["signal"], values=values,
                 ledger_path=ledger_path, now_ms=delivery_now, expires_at_ms=expiry,
                 validity_basis=policy["basis"], data_valid_until_ms=deadline,
@@ -93,4 +101,28 @@ Expiry is derived from candle close and policy, never extended by delivery time.
         return dict(base, status=delivered["status"], delivery=delivered, reason=delivered["reason"])
     except Exception:
         # Never propagate potentially credential-bearing exception payloads.
+        analysis = base.get("analysis")
+        if type(analysis) is dict and analysis.get("reason") in {
+                "FRAME_EXPIRED", "NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION",
+                "LEVEL_ALREADY_CROSSED", "EXPIRED"}:
+            return dict(base, reason=analysis["reason"])
         return dict(base, reason="WORKFLOW_INPUT_OR_ANALYSIS_FAILED")
+
+
+def dispatch_ready_candidates(bot, ready, *, values, ledger_path,
+                              network_authorized=False,
+                              public_delivery_authorized=False,
+                              manual_tracking=False):
+    """Deliver candidates already qualified by run_once without re-analysis."""
+    candidates = [item.get("candidate") for item in ready
+                  if item.get("status") == "PUBLIC_CANDIDATE_READY"]
+    if len(candidates) != len(ready) or not candidates:
+        return dict(status="BLOCKED", reason="PUBLIC_CANDIDATES_NOT_READY",
+                    deliveries=[], actual_delivery_confirmed=False,
+                    live_allowed=False, manual_trade_authorized=False)
+    return dispatch_public_candidates(
+        bot, candidates, values=values, ledger_path=ledger_path,
+        network_authorized=network_authorized,
+        public_delivery_authorized=public_delivery_authorized,
+        manual_tracking=manual_tracking,
+    )

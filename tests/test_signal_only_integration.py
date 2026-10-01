@@ -324,8 +324,9 @@ class TelegramTests(unittest.TestCase):
                 again = workflow.run_once(bot, source, snapshot, cfg, harness.POLICY, **kwargs)
                 self.assertEqual(again["reason"], "PRIOR_ATTEMPT_NO_RETRY", again)
             text = self.calls[-1][2]
-            self.assertIn("SINAL INFORMATIVO", text)
-            self.assertIn("Nenhuma ordem enviada", text)
+            self.assertIn("SINAL MANUAL", text)
+            self.assertIn("Modo: SIGNAL-ONLY", text)
+            self.assertIn("Nenhuma ordem foi enviada", text)
             self.assertNotIn("SIMULAÇÃO", text)
             self.assertNotIn("PRÉVIA LOCAL", text)
             self.assertIs(result["live_allowed"], False)
