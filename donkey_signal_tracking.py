@@ -3,9 +3,12 @@
 Explicit schema provisioning and runtime opt-in. No network or IO on import.
 Quotes are sampled, not a tick history: crossings between samples can be missed.
 """
+import errno
 import hashlib
+import http.client
 import json
 import re
+import socket
 import sqlite3
 import time
 from contextlib import closing
@@ -14,6 +17,29 @@ from pathlib import Path
 from bingx_public_signal_source import validate_snapshot, PERIODS
 
 SETUPS = {'DONKEY', 'DONKEY_ORIGINAL', 'EARLY_DONKEY'}
+TRANSIENT_POLL_HTTP_STATUS = frozenset({408, 425, 429})
+TRANSIENT_POLL_ERRNOS = frozenset(value for value in (
+    getattr(errno, name, None) for name in (
+        'ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTDOWN',
+        'EHOSTUNREACH', 'ENETDOWN', 'ENETRESET', 'ENETUNREACH', 'EPIPE', 'ETIMEDOUT'))
+    if value is not None)
+
+
+class TrackingPollTransientError(Exception):
+    """Remote polling failed before any ambiguous local persistence."""
+
+
+def _poll_transport_call(token, method, payload):
+    from telegram_signal_delivery import _telegram_api
+    try:
+        return _telegram_api(token, method, payload, 10)
+    except (json.JSONDecodeError, UnicodeDecodeError, http.client.HTTPException):
+        raise TrackingPollTransientError() from None
+    except OSError as error:
+        if (isinstance(error, (TimeoutError, ConnectionError, socket.gaierror))
+                or error.errno in TRANSIENT_POLL_ERRNOS):
+            raise TrackingPollTransientError() from None
+        raise
 
 
 def connect(path):
@@ -125,20 +151,27 @@ class ReferenceTracker:
         return answer
 
     def poll(self, now):
-        from telegram_signal_delivery import _telegram_api
         started = time.monotonic()
         with closing(connect(self.path)) as db:
             offset = db.execute('SELECT offset FROM donkey_reference_control_v1 WHERE id=1').fetchone()[0]
-        code, body = _telegram_api(self.token, 'getUpdates',
-                                  dict(offset=offset, limit=100, timeout=0, allowed_updates=['callback_query']), 10)
-        if code != 200 or type(body) is not dict or body.get('ok') is not True or type(body.get('result')) is not list:
+        code, body = _poll_transport_call(self.token, 'getUpdates',
+                                          dict(offset=offset, limit=100, timeout=0,
+                                               allowed_updates=['callback_query']))
+        if (type(code) is not int or code == 0 or code in TRANSIENT_POLL_HTTP_STATUS
+                or 500 <= code <= 599):
+            raise TrackingPollTransientError()
+        if code == 200 and (type(body) is not dict or body.get('ok') is not True
+                            or type(body.get('result')) is not list):
+            raise TrackingPollTransientError()
+        if code != 200:
             raise ValueError('DONKEY_POLL_FAILED_NO_RETRY')
         for update in body['result']:
             answer = self.accept(update, now + max(0, int((time.monotonic() - started) * 1000)))
             query = update.get('callback_query')
             if type(query) is dict and type(query.get('id')) is str and len(query['id']) <= 256:
                 # This acknowledgment does not modify tracking, and is never retried.
-                _telegram_api(self.token, 'answerCallbackQuery', dict(callback_query_id=query['id'], text=answer), 10)
+                _poll_transport_call(self.token, 'answerCallbackQuery',
+                                     dict(callback_query_id=query['id'], text=answer))
 
     def observe(self, snapshot, now, policy):
         snap = validate_snapshot(snapshot, now_ms=now, frame_max_age_ms=policy['snapshot_max_age_ms'],

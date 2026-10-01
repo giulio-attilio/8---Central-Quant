@@ -259,7 +259,8 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
     """Explicit blocking supervisor, never spawned/installed automatically.
 
     Fresh per-symbol collection followed immediately by evaluation/delivery.
-    No catch-up queue or automatic retry after a transport/analysis failure.
+    No catch-up queue or immediate retry. Classified transient polling failures
+    are retried only on the next normally paced cycle.
     Ledger must be explicitly provisioned beforehand. Credentials are injected
     in memory; there is no .env/Render/private exchange/account access.
     max_cycles bounds a supervised run; None runs until stop_event or a failure.
@@ -298,7 +299,7 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
         with exclusive_service(path):
             tracker = None
             if donkey_operator_id is not None:
-                from donkey_signal_tracking import ReferenceTracker
+                from donkey_signal_tracking import ReferenceTracker, TrackingPollTransientError
                 stage = 'tracking_initialize'
                 tracker = ReferenceTracker(str(path), values, donkey_operator_id, authorized=True)
                 stage = 'tracking_webhook_check'
@@ -306,12 +307,26 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                 stage = 'tracking_notice_flush'
                 tracker.flush()
             while not stop_event.is_set():
+                tracking_poll_deferred = False
                 for symbol in symbols:
                     if stop_event.is_set():
                         return dict(state, status="STOPPED", reason="STOP_REQUESTED")
                     if tracker:
+                        if tracking_poll_deferred:
+                            continue
                         stage = 'tracking_poll'
-                        tracker.poll(time.time_ns() // 1000000)
+                        try:
+                            tracker.poll(time.time_ns() // 1000000)
+                        except TrackingPollTransientError:
+                            tracking_poll_deferred = True
+                            state['tracking_poll_skips'] = state.get('tracking_poll_skips', 0) + 1
+                            print(json.dumps(dict(status='TRACKING_POLL_DEFERRED',
+                                                  reason='DONKEY_POLL_TRANSIENT',
+                                                  tracking_poll_skips=state['tracking_poll_skips'],
+                                                  live_allowed=False)), flush=True)
+                            # Do not collect, analyze or deliver after a failed poll.
+                            # The next attempt occurs only after the normal cycle pause.
+                            continue
                     selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
                     needed = set().union(*(required_frames(bot, entry) for bot, entry in selected.items()))
                     intervals = [tf for tf in ("15m", "1h", "4h", "1d") if tf in needed]

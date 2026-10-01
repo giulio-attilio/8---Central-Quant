@@ -1,5 +1,6 @@
 """Offline only: install audit/network/import guards before repository imports."""
 import copy
+import http.client
 import json
 import sys
 import tempfile
@@ -110,7 +111,7 @@ class TrackingTests(unittest.TestCase):
             out = service.run_service(sf.config(), sources, **args)
         report = json.loads(output.getvalue().splitlines()[0])
         row = self.state(key)
-        self.assertEqual(out['status'], 'STOPPED')
+        self.assertEqual(out['status'], 'STOPPED', out)
         self.assertEqual(out['reason'], 'CYCLE_LIMIT_REACHED')
         self.assertEqual(out['discarded_snapshots'], 1)
         self.assertEqual(out['tracking_quote_skips'], 1)
@@ -146,6 +147,121 @@ class TrackingTests(unittest.TestCase):
         self.assertIs(out['live_allowed'], False)
         evaluate.assert_not_called()
         post.assert_not_called()
+
+    def test_transient_poll_failures_leave_cursor_unchanged(self):
+        cases = [TimeoutError('private-timeout'), ConnectionResetError('private-reset'),
+                 http.client.BadStatusLine('private-protocol'),
+                 (503, dict(ok=False)), (429, dict(ok=False)), (200, dict(ok=True, result={})),
+                 (0, None)]
+        for failure in cases:
+            with self.subTest(failure=type(failure).__name__):
+                effect = failure if isinstance(failure, BaseException) else None
+                returned = failure if effect is None else None
+                with patch.object(delivery, '_telegram_api', side_effect=effect, return_value=returned):
+                    with self.assertRaises(tracking.TrackingPollTransientError):
+                        self.tracker.poll(self.now)
+                with self.db() as db:
+                    self.assertEqual(db.execute(
+                        'SELECT offset FROM donkey_reference_control_v1 WHERE id=1').fetchone()[0], 0)
+
+    def test_nontransient_poll_http_and_local_io_remain_fatal(self):
+        with patch.object(delivery, '_telegram_api', return_value=(409, dict(ok=False))):
+            with self.assertRaisesRegex(ValueError, '^DONKEY_POLL_FAILED_NO_RETRY$'):
+                self.tracker.poll(self.now)
+        local_error = PermissionError(13, 'private-local-io')
+        with patch.object(delivery, '_telegram_api', side_effect=local_error):
+            with self.assertRaises(PermissionError):
+                self.tracker.poll(self.now)
+        with self.db() as db:
+            self.assertEqual(db.execute(
+                'SELECT offset FROM donkey_reference_control_v1 WHERE id=1').fetchone()[0], 0)
+
+    def test_transient_poll_retries_next_cycle_without_delivery_or_immediate_retry(self):
+        import signal_only_service as service
+        import test_signal_only_service as sf
+        snap, now = fixture.PublicPreviewTests().public_fixture('DONKEY')
+        args = sf.ServiceTests().supervisor_args(self.path)
+        args.update(max_cycles=2, donkey_operator_id=77)
+        sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
+        with patch.object(tracking, 'ReferenceTracker', return_value=self.tracker), \
+             patch.object(self.tracker, 'check_polling'), \
+             patch.object(self.tracker, 'flush') as flush, \
+             patch.object(delivery, '_telegram_api',
+                          side_effect=[ConnectionResetError('private'), (200, dict(ok=True, result=[]))]) as api, \
+             patch.object(service, 'collect_snapshot', return_value=snap) as collect, \
+             patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='NO_SIGNAL')) as evaluate, \
+             patch.object(service.time, 'time_ns', return_value=now * 1000000), \
+             patch.object(delivery, '_post') as post, redirect_stdout(io.StringIO()) as output:
+            out = service.run_service(sf.config(), sources, **args)
+        reports = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(out['status'], 'STOPPED', out)
+        self.assertEqual(out['reason'], 'CYCLE_LIMIT_REACHED')
+        self.assertEqual(out['tracking_poll_skips'], 1)
+        self.assertIs(out['live_allowed'], False)
+        self.assertEqual(reports[0]['status'], 'TRACKING_POLL_DEFERRED')
+        self.assertEqual(reports[0]['reason'], 'DONKEY_POLL_TRANSIENT')
+        self.assertIs(reports[0]['live_allowed'], False)
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(collect.call_count, 1)
+        self.assertEqual(evaluate.call_count, 5)
+        self.assertEqual(flush.call_count, 2)  # Startup and the successful cycle.
+        post.assert_not_called()
+
+    def test_poll_cursor_persistence_failure_rolls_back_and_remains_fatal(self):
+        key = self.offer()
+        with self.db() as db:
+            db.execute("CREATE TRIGGER reject_poll_offset BEFORE UPDATE OF offset "
+                       "ON donkey_reference_control_v1 BEGIN SELECT RAISE(ABORT, 'private'); END")
+        def api(token, method, payload, timeout):
+            self.assertEqual(method, 'getUpdates')
+            return 200, dict(ok=True, result=[self.click(key)])
+        with patch.object(delivery, '_telegram_api', side_effect=api):
+            with self.assertRaises(tracking.sqlite3.Error):
+                self.tracker.poll(self.now)
+        self.assertEqual(self.state(key)['state'], 'WAITING')
+        with self.db() as db:
+            self.assertEqual(db.execute(
+                'SELECT offset FROM donkey_reference_control_v1 WHERE id=1').fetchone()[0], 0)
+
+    def test_ack_transport_failure_keeps_committed_callback_and_no_duplicate(self):
+        key = self.offer()
+        offsets = []
+        def api(token, method, payload, timeout):
+            if method == 'getUpdates':
+                offsets.append(payload['offset'])
+                return 200, dict(ok=True, result=[self.click(key)] if len(offsets) == 1 else [])
+            raise ConnectionResetError('private-ack')
+        with patch.object(delivery, '_telegram_api', side_effect=api):
+            with self.assertRaises(tracking.TrackingPollTransientError):
+                self.tracker.poll(self.now)
+            active_ms = self.state(key)['active_ms']
+            self.tracker.poll(self.now + 1)
+        self.assertEqual(offsets, [0, 2])
+        self.assertEqual(self.state(key)['state'], 'ACTIVE')
+        self.assertEqual(self.state(key)['active_ms'], active_ms)
+
+    def test_poll_sqlite_and_cursor_failures_remain_service_fatal(self):
+        import signal_only_service as service
+        import test_signal_only_service as sf
+        sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
+        cases = [(tracking.sqlite3.OperationalError('private-storage'), 'SQLITE_FAILURE'),
+                 (ValueError('DONKEY_REFERENCE_CLOCK_REGRESSION'), 'DONKEY_REFERENCE_CLOCK_REGRESSION')]
+        for failure, reason in cases:
+            with self.subTest(reason=reason), patch.object(tracking, 'ReferenceTracker') as factory, \
+                 patch.object(service, 'collect_snapshot') as collect, \
+                 patch.object(service, 'run_once') as evaluate, patch.object(delivery, '_post') as post:
+                factory.return_value.poll.side_effect = failure
+                out = service.run_service(sf.config(), sources, values=fixture.VALUES,
+                    ledger_path=self.path, stop_event=sf.ServiceTests().supervisor_args(self.path)['stop_event'],
+                    service_authorized=True, public_data_authorized=True, public_delivery_authorized=True,
+                    max_cycles=1, donkey_operator_id=77)
+            self.assertEqual(out['status'], 'FAILED')
+            self.assertEqual(out['reason'], reason)
+            self.assertEqual(out['stage'], 'tracking_poll')
+            self.assertIs(out['live_allowed'], False)
+            collect.assert_not_called()
+            evaluate.assert_not_called()
+            post.assert_not_called()
 
     @contextmanager
     def db(self):
