@@ -37,7 +37,7 @@ def service_error_code(error):
              'MANUAL_TRACKING_UPDATE_INVALID', 'MANUAL_TRACKING_CLOCK_REGRESSION',
              'MANUAL_TRACKING_NOTICE_UNKNOWN_NO_RETRY',
              'MANUAL_TRACKING_IDENTITY_CHANGED', 'MANUAL_TRACKING_PUBLIC_QUOTE_REQUIRED',
-             'MANUAL_TRACKING_ROUTE_CHANGED'}
+             'MANUAL_TRACKING_ROUTE_CHANGED', 'MANUAL_TRACKING_H4_REQUIRED'}
     if type(error) is ValueError and len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in codes:
         return error.args[0]
     if isinstance(error, TimeoutError):
@@ -317,7 +317,9 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                 tracker.flush()
             while not stop_event.is_set():
                 tracking_poll_deferred = False
-                for symbol in symbols:
+                active_donkey_symbols = tracker.active_donkey_symbols() if tracker else []
+                cycle_symbols = list(dict.fromkeys(symbols + list(active_donkey_symbols)))
+                for symbol in cycle_symbols:
                     if stop_event.is_set():
                         return dict(state, status="STOPPED", reason="STOP_REQUESTED")
                     if tracker:
@@ -338,6 +340,8 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             continue
                     selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
                     needed = set().union(*(required_frames(bot, entry) for bot, entry in selected.items()))
+                    if symbol in active_donkey_symbols:
+                        needed.add("4h")
                     intervals = [tf for tf in ("15m", "1h", "4h", "1d") if tf in needed]
                     try:
                         stage = 'public_collection'
@@ -349,9 +353,16 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                     if tracker:
                         try:
                             stage = 'tracking_observe'
-                            quote_age = min(entry['policy']['quote_max_age_ms']
-                                            for entry in selected.values())
+                            policies = [entry['policy'] for entry in selected.values()]
+                            if symbol in active_donkey_symbols:
+                                policies.append(config['bots']['DONKEY']['policy'])
+                            quote_age = min(policy['quote_max_age_ms'] for policy in policies)
                             tracker.observe(snapshot, time.time_ns() // 1000000, quote_age)
+                            donkey_entry = config['bots']['DONKEY']
+                            tracker.observe_h4(snapshot, time.time_ns() // 1000000,
+                                sources['DONKEY'], donkey_entry['analysis'],
+                                frame_max_age_ms=donkey_entry['policy']['snapshot_max_age_ms'],
+                                quote_max_age_ms=donkey_entry['policy']['quote_max_age_ms'])
                         except ValueError as error:
                             if str(error) == 'MANUAL_TRACKING_PUBLIC_QUOTE_REQUIRED':
                                 state['discarded_snapshots'] = state.get('discarded_snapshots', 0) + 1

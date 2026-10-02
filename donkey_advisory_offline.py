@@ -134,3 +134,24 @@ Public previews never authorize delivery or establish parity with position manag
         # Known validation codes only, never raw exception text/data from analysis.
         from falcon_advisory_offline import OfflineInputError
         return dict(base, reason=str(exc) if isinstance(exc, OfflineInputError) else "ANALYSIS_FAILED")
+
+
+def closed_h4_indicators(source, snapshot, config, *, now_ms, frame_max_age_ms,
+                         quote_max_age_ms, evaluated_through_ms=None):
+    """Reuse reviewed entry indicators and iloc[-2]; no operational bot import."""
+    config = validate_config(config)
+    snapshot = validate_snapshot(snapshot, now_ms=now_ms,
+        frame_max_age_ms=frame_max_age_ms, quote_max_age_ms=quote_max_age_ms)
+    rows = snapshot["frames"].get("4h")
+    _require(type(rows) is list and len(rows) >= 120, "MANUAL_TRACKING_H4_REQUIRED")
+    closed = rows[-2][0] + PERIODS["4h"]
+    if evaluated_through_ms is not None and closed <= evaluated_through_ms:
+        return None
+    ns = dict(config, pd=pd)
+    exec(reviewed_analysis(source), ns)
+    frame = ns["preparar_df"](pd.DataFrame(rows,
+        columns=["time", "open", "high", "low", "close", "volume"]))
+    candle = frame.iloc[-2]
+    values = {key: float(candle[key]) for key in ("close", "ema20", "macd")}
+    _require(all(_number(value) for value in values.values()), "INDICATORS_UNDEFINED")
+    return dict(values, closed_at_ms=int(candle["time"]) + PERIODS["4h"])

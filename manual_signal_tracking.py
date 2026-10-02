@@ -47,6 +47,7 @@ def _provision_in_transaction(db):
             "entry", "stop", "tp50", "expires_ms", "state", "created_ms", "active_ms",
             "tp_ms", "last_quote_ms", "closed_ms", "close_reason",
         ),
+        "manual_trade_h4_v2": ("ref", "closed_at_ms"),
         "manual_trade_candidate_v1": ("ref", "identity", "setup"),
         "manual_trade_event_v1": ("ref", "kind", "route", "text", "status", "created_ms"),
         "manual_trade_control_v1": ("route", "chat", "operator", "offset", "clock", "pending_ref"),
@@ -73,6 +74,9 @@ def _provision_in_transaction(db):
         offset INTEGER NOT NULL, clock INTEGER NOT NULL, pending_ref TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS manual_trade_clock_v1 (
         id INTEGER PRIMARY KEY CHECK(id=1), clock INTEGER NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS manual_trade_h4_v2 (
+        ref TEXT PRIMARY KEY, closed_at_ms INTEGER NOT NULL,
+        FOREIGN KEY(ref) REFERENCES manual_trade_v1(ref))""")
     db.execute("INSERT OR IGNORE INTO manual_trade_clock_v1 VALUES (1, 0)")
     for table, columns in expected.items():
         actual = tuple(row[1] for row in db.execute(f"PRAGMA table_info({table})"))
@@ -89,10 +93,14 @@ def family_for(bot, setup):
 
 
 def active_signal_decision(db, family, symbol, side, *, exclude_ref=None):
-    """Return SAME/OPPOSITE using family+symbol; same side takes precedence."""
+    """Match every persisted participant; same side takes precedence."""
     rows = db.execute(
-        "SELECT ref, side FROM manual_trade_v1 WHERE family=? AND symbol=? AND state='ACTIVE'",
-        (family, symbol),
+        """SELECT t.ref, t.side FROM manual_trade_v1 t
+        WHERE t.symbol=? AND t.state='ACTIVE' AND
+        (t.family=? OR (? != 'FALCON' AND EXISTS (
+            SELECT 1 FROM manual_trade_candidate_v1 c
+            WHERE c.ref=t.ref AND c.setup=?)))""",
+        (symbol, family, family, family),
     ).fetchall()
     sides = [row["side"] for row in rows if row["ref"] != exclude_ref]
     if side in sides:
@@ -109,13 +117,17 @@ def offer(db, bot, identities, signals, route, expires_ms, created_ms):
         raise ValueError("MANUAL_TRADE_OFFER_REQUIRED")
     first = signals[0]
     family = family_for(bot, first["setup"])
-    if any(family_for(bot, signal["setup"]) != family for signal in signals):
+    if bot == "FALCON" and any(family_for(bot, signal["setup"]) != family for signal in signals):
         raise ValueError("MANUAL_TRADE_FAMILY_MISMATCH")
     group_identity = hashlib.sha256(
         ("manual-trade:" + ":".join(sorted(identities))).encode()
     ).hexdigest()
     ref = group_identity[:32]
-    setups = [signal["setup"] for signal in signals]
+    setups = sorted({signal["setup"] for signal in signals},
+                    key=lambda setup: ("FALCON15", "FALCON30", "DONKEY",
+                                       "DONKEY_ORIGINAL", "EARLY_DONKEY").index(setup))
+    for setup in setups:
+        family_for(bot, setup)
     db.execute(
         """INSERT INTO manual_trade_v1
         (ref, group_identity, route, family, setups, symbol, side, entry, stop, tp50,
@@ -142,6 +154,19 @@ def _price(value):
     return format(float(value), ".10g")
 
 
+def _participant_label(row):
+    return row["family"] if row["family"] == "FALCON" else " + ".join(json.loads(row["setups"]))
+
+
+def _stop_label(row):
+    return "Stop atual" if row["family"] == "FALCON" else "Stop de prote\u00e7\u00e3o"
+
+
+def _strategic_rule(side):
+    return ("H4 close < EMA20 OU MACD negativo" if side == "LONG" else
+            "H4 close > EMA20 OU MACD positivo")
+
+
 def _panel(db):
     rows = db.execute(
         "SELECT * FROM manual_trade_v1 WHERE state='ACTIVE' ORDER BY active_ms, ref"
@@ -157,14 +182,16 @@ def _panel(db):
         ).strftime("%d/%m %H:%M")
         lines.extend([
             f"{number}. {color} {row['symbol']}",
-            f"   {row['family']} | {row['side']}",
+            f"   {_participant_label(row)} | {row['side']}",
             f"   Entrada: {_price(row['entry'])}",
-            f"   Stop atual: {_price(row['stop'])}",
+            f"   {_stop_label(row)}: {_price(row['stop'])}",
             f"   TP50: {_price(row['tp50'])}",
             f"   Desde: {since}",
             "   TP50: ✅ atingido" if row["tp_ms"] is not None else "   TP50: ⏳ pendente",
             "",
         ])
+        if row["family"] != "FALCON":
+            lines[-1:-1] = ["   Stop estrat\u00e9gico:", "   " + _strategic_rule(row["side"])]
         keyboard.append([
             {"text": "✏️ ATUALIZAR STOP", "callback_data": "ms:" + row["ref"]},
             {"text": "⚪ ENCERRAR TRADE", "callback_data": "mc:" + row["ref"]},
@@ -284,10 +311,12 @@ class ManualTradeTracker:
                             (ref, item["route"], source_message["message_id"]),
                         ).fetchone()
                         if bound and row["state"] == "WAITING" and now < row["expires_ms"]:
-                            block, _ = active_signal_decision(
-                                db, row["family"], row["symbol"], row["side"], exclude_ref=ref
-                            )
-                            if block == "SAME_SIDE_ACTIVE":
+                            families = (["FALCON"] if row["family"] == "FALCON"
+                                        else json.loads(row["setups"]))
+                            blocks = [active_signal_decision(
+                                db, family, row["symbol"], row["side"], exclude_ref=ref
+                            )[0] for family in families]
+                            if "SAME_SIDE_ACTIVE" in blocks:
                                 answer = "Já existe tracking ativo nessa família, ativo e direção."
                             else:
                                 db.execute(
@@ -410,7 +439,8 @@ class ManualTradeTracker:
                                                     and quote_ms <= row["last_quote_ms"]):
                     continue
                 is_long = row["side"] == "LONG"
-                hit_stop = price <= row["stop"] if is_long else price >= row["stop"]
+                hit_stop = row["family"] == "FALCON" and (
+                    price <= row["stop"] if is_long else price >= row["stop"])
                 hit_tp = price >= row["tp50"] if is_long else price <= row["tp50"]
                 if hit_stop:
                     db.execute(
@@ -418,7 +448,7 @@ class ManualTradeTracker:
                         closed_ms=?, close_reason='STOP' WHERE ref=?""",
                         (quote_ms, now, row["ref"]),
                     )
-                    text = (f"🟡 STOP — {row['symbol']}\n\n{row['family']} | {row['side']}\n"
+                    text = (f"🟡 STOP — {row['symbol']}\n\n{_participant_label(row)} | {row['side']}\n"
                             f"Stop atingido: {_price(row['stop'])}\n\nTrade manual encerrado.\n"
                             "Novos sinais desta estratégia/ativo foram liberados.\n\n"
                             "Nenhuma ordem foi alterada.")
@@ -431,9 +461,9 @@ class ManualTradeTracker:
                         "UPDATE manual_trade_v1 SET tp_ms=?, last_quote_ms=? WHERE ref=?",
                         (now, quote_ms, row["ref"]),
                     )
-                    text = (f"🔵 TP50 — {row['symbol']}\n\n{row['family']} | {row['side']}\n"
+                    text = (f"🔵 TP50 — {row['symbol']}\n\n{_participant_label(row)} | {row['side']}\n"
                             f"TP50 atingido: {_price(row['tp50'])}\n\nTrade continua ATIVO.\n"
-                            f"Stop atual: {_price(row['stop'])}\n\nNenhuma ordem foi alterada.")
+                            f"{_stop_label(row)}: {_price(row['stop'])}\n\nNenhuma ordem foi alterada.")
                     db.execute(
                         "INSERT INTO manual_trade_event_v1 VALUES (?, 'TP50', ?, ?, 'PENDING', ?)",
                         (row["ref"], row["route"], text, now),
@@ -443,6 +473,75 @@ class ManualTradeTracker:
                         "UPDATE manual_trade_v1 SET last_quote_ms=? WHERE ref=?",
                         (quote_ms, row["ref"]),
                     )
+
+    def active_donkey_symbols(self):
+        with closing(connect(self.path)) as db:
+            return [row[0] for row in db.execute(
+                "SELECT DISTINCT symbol FROM manual_trade_v1 "
+                "WHERE state='ACTIVE' AND family!='FALCON' ORDER BY symbol")]
+
+    def observe_h4(self, snapshot, now, source, config, *, frame_max_age_ms,
+                   quote_max_age_ms):
+        """One new closed H4 per active Donkey trade, durable across restarts."""
+        symbol = snapshot.get("symbol") if type(snapshot) is dict else None
+        with closing(connect(self.path)) as db:
+            active = db.execute("""SELECT t.active_ms, h.closed_at_ms
+                FROM manual_trade_v1 t LEFT JOIN manual_trade_h4_v2 h ON h.ref=t.ref
+                WHERE t.symbol=? AND t.state='ACTIVE' AND t.family!='FALCON'""",
+                (symbol,)).fetchall()
+        if not active:
+            return
+        evaluated_through = min(max(row["active_ms"], row["closed_at_ms"] or 0)
+                                for row in active)
+        from donkey_advisory_offline import closed_h4_indicators
+        candle = closed_h4_indicators(source, snapshot, config, now_ms=now,
+            frame_max_age_ms=frame_max_age_ms, quote_max_age_ms=quote_max_age_ms,
+            evaluated_through_ms=evaluated_through)
+        if candle is None:
+            return
+        closed = candle["closed_at_ms"]
+        with closing(connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            old = db.execute("SELECT clock FROM manual_trade_clock_v1 WHERE id=1").fetchone()[0]
+            if type(now) is not int or now < old:
+                raise ValueError("MANUAL_TRACKING_CLOCK_REGRESSION")
+            db.execute("UPDATE manual_trade_clock_v1 SET clock=? WHERE id=1", (now,))
+            rows = db.execute("SELECT * FROM manual_trade_v1 WHERE symbol=? "
+                              "AND state='ACTIVE' AND family!='FALCON'", (symbol,)).fetchall()
+            for row in rows:
+                previous = db.execute("SELECT closed_at_ms FROM manual_trade_h4_v2 WHERE ref=?",
+                                      (row["ref"],)).fetchone()
+                if closed <= row["active_ms"] or (previous and closed <= previous[0]):
+                    continue
+                is_long = row["side"] == "LONG"
+                ema_stop = (candle["close"] < candle["ema20"] if is_long else
+                            candle["close"] > candle["ema20"])
+                macd_stop = candle["macd"] < 0 if is_long else candle["macd"] > 0
+                db.execute("INSERT INTO manual_trade_h4_v2 VALUES (?, ?) "
+                           "ON CONFLICT(ref) DO UPDATE SET closed_at_ms=excluded.closed_at_ms",
+                           (row["ref"], closed))
+                reasons = []
+                if ema_stop:
+                    relation = "abaixo" if is_long else "acima"
+                    reasons.append(f"Fechamento H4 {relation} da EMA20")
+                if macd_stop:
+                    sign = "negativo" if is_long else "positivo"
+                    reasons.append(f"MACD H4 inverteu para {sign}")
+                if not reasons:
+                    continue
+                db.execute("UPDATE manual_trade_v1 SET state='CLOSED', closed_ms=?, "
+                           "close_reason='STOP' WHERE ref=?", (now, row["ref"]))
+                reason_text = ("Motivo:\n" + reasons[0] if len(reasons) == 1 else
+                               "Motivos:\n" + "\n".join("\u2022 " + reason for reason in reasons))
+                text = (f"\U0001f7e1 STOP \u2014 {row['symbol']}\n\n"
+                        f"{_participant_label(row)} | {row['side']}\n\n{reason_text}\n\n"
+                        f"Fechamento: {_price(candle['close'])}\n"
+                        f"EMA20: {_price(candle['ema20'])}\nMACD: {_price(candle['macd'])}\n\n"
+                        "Trade manual encerrado no tracking.\n"
+                        "Novos sinais das variantes participantes foram liberados.\n\n"
+                        "Nenhuma ordem foi alterada.")
+                db.execute("INSERT INTO manual_trade_event_v1 VALUES (?, 'STOP', ?, ?, 'PENDING', ?)",
+                           (row["ref"], row["route"], text, now))
 
     def flush(self):
         from telegram_signal_delivery import _post

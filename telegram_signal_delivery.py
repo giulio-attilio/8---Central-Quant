@@ -177,17 +177,23 @@ def _falcon_consolidates(candidates):
         return False
     if {signal.get("setup") for signal in signals} != {"FALCON15", "FALCON30"}:
         return False
+    return _same_economics(candidates)
+
+
+def _same_economics(candidates):
+    signals = [item["signal"] for item in candidates]
     exact = ("symbol", "side", "timeframe", "candle_closed_at_ms")
-    if any(signals[0].get(key) != signals[1].get(key) for key in exact):
+    if any(signals[0].get(key) != signal.get(key) for signal in signals[1:] for key in exact):
         return False
     try:
-        if any(_canonical_number(signals[0].get(key)) != _canonical_number(signals[1].get(key))
-               for key in ("entry", "stop", "tp50")):
+        if any(_canonical_number(signals[0].get(key)) != _canonical_number(signal.get(key))
+               for signal in signals[1:] for key in ("entry", "stop", "tp50")):
             return False
     except Exception:
         return False
     operational = ("expires_at_ms", "validity_basis", "data_valid_until_ms")
-    return all(candidates[0].get(key) == candidates[1].get(key) for key in operational)
+    return all(candidates[0].get(key) == item.get(key)
+               for item in candidates[1:] for key in operational)
 
 
 def _display_price(value):
@@ -204,9 +210,11 @@ def _manual_message(bot, signals, expires_at_ms, *, opposite_side=None):
     expiry = datetime.fromtimestamp(
         expires_at_ms / 1000, ZoneInfo("America/Sao_Paulo")
     ).strftime("%H:%M")
-    setup_line = (("Confirmação: FALCON15 + FALCON30" if len(signals) == 2 else
-                   f"Confirmação: {first['setup']}") if bot == "FALCON" else
-                  f"Setup: {first['setup']}")
+    setups = sorted({signal["setup"] for signal in signals},
+                    key=lambda setup: ("FALCON15", "FALCON30", "DONKEY",
+                                       "DONKEY_ORIGINAL", "EARLY_DONKEY").index(setup))
+    label = "Confirmação" if bot == "FALCON" or len(setups) > 1 else "Setup"
+    setup_line = label + ": " + " + ".join(setups)
     timeframe = "H4" if first["timeframe"] == "4h" else first["timeframe"]
     lines = [
         f"{color} {family} — {title}", "",
@@ -220,7 +228,7 @@ def _manual_message(bot, signals, expires_at_ms, *, opposite_side=None):
         setup_line,
         f"Timeframe: {timeframe}", "",
         f"Entrada: {_display_price(first['entry'])}",
-        f"Stop: {_display_price(first['stop'])}",
+        f"{'Stop' if bot == 'FALCON' else 'Stop de prote\u00e7\u00e3o'}: {_display_price(first['stop'])}",
         f"TP50: {_display_price(first['tp50'])}", "",
         f"Risco até o Stop: {risk:.2f}%",
         f"RR: 1:{format(rr, '.3g')}", "",
@@ -235,11 +243,10 @@ def dispatch_public_candidates(bot, candidates, *, values, ledger_path,
                                network_authorized=False,
                                public_delivery_authorized=False,
                                manual_tracking=False, timeout_seconds=10):
-    """Dispatch ready public candidates, consolidating only an exact Falcon pair.
+    """Dispatch qualified candidates, consolidating exact economic equivalents.
 
     Every candidate still receives its own durable delivery identity and candle
-    reservation.  Donkey variants and non-identical Falcon candidates are sent
-    independently.
+    reservation. Distinct Donkey economics or tracking decisions stay independent.
     """
     blocked = dict(status="BLOCKED", reason=None, deliveries=[],
                    actual_delivery_confirmed=False, live_allowed=False,
@@ -251,6 +258,28 @@ def dispatch_public_candidates(bot, candidates, *, values, ledger_path,
     groups = [candidates] if bot == "FALCON" and _falcon_consolidates(candidates) else [
         [candidate] for candidate in candidates
     ]
+    if bot == "DONKEY":
+        groups = []
+        try:
+            from manual_signal_tracking import connect, active_signal_decision, family_for
+            with closing(connect(ledger_path)) as db:
+                decisions = []
+                for candidate in candidates:
+                    signal = candidate["signal"]
+                    decision = (active_signal_decision(
+                        db, family_for(bot, signal["setup"]), signal["symbol"], signal["side"]
+                    ) if manual_tracking else (None, None))
+                    for group, previous in zip(groups, decisions):
+                        setups = {item["signal"]["setup"] for item in group}
+                        if (signal["setup"] not in setups and decision == previous
+                                and _same_economics([group[0], candidate])):
+                            group.append(candidate)
+                            break
+                    else:
+                        groups.append([candidate])
+                        decisions.append(decision)
+        except Exception:
+            return dict(blocked, reason="LEDGER_OR_CANDIDATES_UNAVAILABLE")
     deliveries = []
     for group in groups:
         delivered = _dispatch_public_group(
@@ -328,10 +357,12 @@ def _dispatch_public_group(bot, candidates, *, values, ledger_path,
                 raise DeliveryError("PRIOR_ATTEMPT_NO_RETRY")
         if manual_tracking:
             from manual_signal_tracking import active_signal_decision, family_for
-            family = family_for(bot, signals[0]["setup"])
-            decision, opposite_side = active_signal_decision(
-                db, family, signals[0]["symbol"], signals[0]["side"]
-            )
+            decisions = [active_signal_decision(
+                db, family_for(bot, signal["setup"]), signal["symbol"], signal["side"]
+            ) for signal in signals]
+            if any(item != decisions[0] for item in decisions[1:]):
+                raise DeliveryError("MANUAL_TRACKING_GROUP_CHANGED")
+            decision, opposite_side = decisions[0]
             if decision == "SAME_SIDE_ACTIVE":
                 raise DeliveryError("MANUAL_TRADE_SAME_SIDE_ACTIVE")
         text = _manual_message(bot, signals, expires_at_ms, opposite_side=opposite_side)
@@ -398,7 +429,7 @@ def _dispatch_public_group(bot, candidates, *, values, ledger_path,
         db.close()
     return dict(result, status=status, actual_delivery_confirmed=status == "CONFIRMED",
                 reason=None if status == "CONFIRMED" else "NO_AUTOMATIC_RETRY",
-                consolidated=len(signals) == 2, candidate_count=len(signals))
+                consolidated=len(signals) > 1, candidate_count=len(signals))
 
 
 def _dispatch(bot, signal, *, values, ledger_path, now_ms, expires_at_ms, validity_basis,

@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import test_falcon_advisory_offline as guard_harness
 import manual_signal_tracking as tracking
 import signal_only_service as service
 import telegram_signal_delivery as delivery
@@ -134,8 +136,8 @@ class TestMessagesAndConsolidation(Harness):
 
     def test_donkey_message_and_variants_are_independent(self):
         variants = [signal("DONKEY", suffix="d"),
-                    signal("DONKEY_ORIGINAL", suffix="o"),
-                    signal("EARLY_DONKEY", suffix="e")]
+                    signal("DONKEY_ORIGINAL", suffix="o", stop=97.0),
+                    signal("EARLY_DONKEY", suffix="e", stop=96.0)]
         result = self.send("DONKEY", variants)
         assert result["status"] == "CONFIRMED"
         assert len(self.sent) == 3
@@ -307,7 +309,7 @@ class TestSchemaProvisioning(unittest.TestCase):
             ).fetchone()
         assert tables == {"manual_trade_v1", "manual_trade_candidate_v1",
                           "manual_trade_event_v1", "manual_trade_control_v1",
-                          "manual_trade_clock_v1"}
+                          "manual_trade_clock_v1", "manual_trade_h4_v2"}
         assert kept == ("CONFIRMED", 9) and control == (5, 6)
 
     def test_provision_failure_rolls_back_partial_schema(self):
