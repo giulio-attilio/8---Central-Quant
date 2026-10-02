@@ -4578,9 +4578,23 @@ def fetch_realized_income(symbol, since=None, limit=500):
     }
 
 
-def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=None, opened_at=None, opened_epoch=None, qty=None, entry_price=None):
+def reconcile_closed_trade(
+    symbol,
+    side,
+    open_order_id=None,
+    client_order_id=None,
+    opened_at=None,
+    opened_epoch=None,
+    qty=None,
+    entry_price=None,
+    close_order_ids=None,
+):
     """
-    Reconcilia um trade já fechado usando ordem de entrada + fills opostos.
+    Reconcilia um trade já fechado usando identidades exatas de entrada e saída.
+
+    Fills de saída só podem ser atribuídos quando seus order IDs constam em
+    ``close_order_ids``; símbolo, lado, tempo e quantidade são insuficientes
+    para comprovar ownership.
 
     Prioridade de preço de entrada:
     1) média ponderada dos fills reais de abertura;
@@ -4598,10 +4612,37 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
 
     order_payload = fetch_order_by_id(sym, order_id=open_order_id, client_order_id=client_order_id)
     order = order_payload.get("order") if isinstance(order_payload.get("order"), dict) else {}
-    order_ts = _rcr_v1_item_timestamp(order) or start_epoch
+    oid = str(open_order_id or "").strip()
+    cid = str(client_order_id or "").strip()
+    raw_close_order_ids = (
+        list(close_order_ids)
+        if isinstance(close_order_ids, (list, tuple, set))
+        else ([close_order_ids] if close_order_ids not in (None, "") else [])
+    )
+    requested_close_order_ids = sorted(
+        {str(value).strip() for value in raw_close_order_ids if str(value).strip()}
+    )
+    requested_close_order_id_set = set(requested_close_order_ids)
+    order_side = _rcr_v1_side(order)
+    order_position_side = _rcr_v1_position_side(order)
+    order_identity_verified = bool(
+        order
+        and (not order_side or order_side == open_side)
+        and (not order_position_side or order_position_side == position_side)
+        and (
+            (oid and _rcr_v1_order_id(order) == oid)
+            or (
+                cid
+                and _rcr_v1_client_id(order).casefold() == cid.casefold()
+            )
+        )
+    )
+    order_ts = _rcr_v1_item_timestamp(order) if order_identity_verified else None
     registry_entry = safe_float(entry_price, None)
-    order_entry = _rcr_v1_price(order)
-    expected_qty = abs(safe_float(qty, 0.0) or 0.0) or _rcr_v1_amount(order)
+    order_entry = _rcr_v1_price(order) if order_identity_verified else None
+    expected_qty = abs(safe_float(qty, 0.0) or 0.0) or (
+        _rcr_v1_amount(order) if order_identity_verified else 0.0
+    )
 
     all_trades_payload = fetch_order_trades(
         sym,
@@ -4614,24 +4655,137 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
     all_trades.sort(key=lambda item: _rcr_v1_item_timestamp(item) or 0.0)
 
     opening_fills = []
-    closing_candidates = []
-    oid = str(open_order_id or "").strip()
-    cid = str(client_order_id or "").strip()
     for item in all_trades:
         if not _rcr_v1_symbol_matches(item, sym):
+            continue
+        is_open_id = bool(
+            (oid and _rcr_v1_order_id(item) == oid)
+            or (
+                cid
+                and _rcr_v1_client_id(item).casefold() == cid.casefold()
+            )
+        )
+        item_side = _rcr_v1_side(item)
+        item_position_side = _rcr_v1_position_side(item)
+        if (
+            is_open_id
+            and (not item_side or item_side == open_side)
+            and (not item_position_side or item_position_side == position_side)
+        ):
+            opening_fills.append(item)
+
+    opening_identity_verified = bool(order_identity_verified or opening_fills)
+    if not opening_identity_verified:
+        qty_tolerance = max(abs(expected_qty) * 0.001, 1e-12) if expected_qty else 0.0
+        return {
+            "ok": True,
+            "complete": False,
+            "status": "OPENING_IDENTITY_NOT_FOUND",
+            "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
+            "generated_at": agora_sp_str(),
+            "read_only": True,
+            "sent": False,
+            "would_send_order": False,
+            "symbol": sym,
+            "side": position_side,
+            "open_order_id": open_order_id,
+            "client_order_id": client_order_id,
+            "requested_close_order_ids": requested_close_order_ids,
+            "close_order_ids": [],
+            "entry_price": registry_entry,
+            "entry_price_source": "REGISTRY_FALLBACK" if registry_entry is not None else None,
+            "opening_fill_entry_price": None,
+            "order_entry_price": None,
+            "registry_entry_price": registry_entry,
+            "exit_price": None,
+            "expected_qty": expected_qty,
+            "closed_qty": 0.0,
+            "qty_tolerance": qty_tolerance,
+            "qty_exceeds_expected": False,
+            "qty_complete": False,
+            "position_closed": None,
+            "opening_identity_verified": False,
+            "closing_identity_verified": False,
+            "aggregate_position_evaluated": False,
+            "position_ownership_verified": False,
+            "closed_at": None,
+            "closed_at_epoch": None,
+            "realized_pnl_gross": None,
+            "opening_fee": 0.0,
+            "closing_fee": 0.0,
+            "fee_total": 0.0,
+            "opening_fee_source": None,
+            "closing_fee_source": None,
+            "fee_income_tran_ids": [],
+            "fee_association_ok": False,
+            "fee_association_ambiguities": [],
+            "funding": 0.0,
+            "net_pnl": None,
+            "financial_dedup_ok": False,
+            "income_raw_count": None,
+            "income_deduped_count": None,
+            "income_duplicates_removed": None,
+            "income_duplicate_conflicts": [],
+            "opening_fills": [],
+            "closing_fills": [],
+            "income_items": [],
+            "open_positions": [],
+            "aggregate_open_positions": [],
+            "position_fetch_error": None,
+            "issues": [
+                "OPEN_ORDER_OR_FILL_NOT_FOUND",
+                "OPENING_IDENTITY_NOT_FOUND",
+            ],
+            "data_quality": "LOW_OPENING_IDENTITY_NOT_FOUND",
+            "order_lookup": order_payload,
+            "trade_lookup": {
+                "ok": all_trades_payload.get("ok"),
+                "error": all_trades_payload.get("error"),
+                "total_count": len(all_trades),
+            },
+            "income_lookup": {
+                "ok": None,
+                "count": None,
+                "raw_count": None,
+                "deduped_count": None,
+                "duplicates_removed": None,
+                "duplicate_conflicts": [],
+                "dedup_ok": None,
+                "attempts": [],
+                "skipped": "OPENING_IDENTITY_NOT_FOUND",
+            },
+        }
+
+    identity_timestamps = [
+        value
+        for value in (
+            order_ts,
+            *(_rcr_v1_item_timestamp(item) for item in opening_fills),
+        )
+        if value
+    ]
+    identity_ts = min(identity_timestamps) if identity_timestamps else start_epoch
+    closing_candidates = []
+    for item in all_trades:
+        if not _rcr_v1_symbol_matches(item, sym):
+            continue
+        if item in opening_fills:
             continue
         item_side = _rcr_v1_side(item)
         item_position_side = _rcr_v1_position_side(item)
         item_ts = _rcr_v1_item_timestamp(item)
-        is_open_id = bool((oid and _rcr_v1_order_id(item) == oid) or (cid and _rcr_v1_client_id(item) == cid))
-        if is_open_id or (item_side == open_side and order_ts and item_ts and abs(item_ts - order_ts) <= 180):
-            opening_fills.append(item)
+        item_order_id = _rcr_v1_order_id(item)
+        if (
+            not requested_close_order_id_set
+            or not item_order_id
+            or item_order_id not in requested_close_order_id_set
+        ):
             continue
         if item_side != close_side:
             continue
         if item_position_side and item_position_side != position_side:
             continue
-        if order_ts and item_ts and item_ts < order_ts:
+        if identity_ts and item_ts and item_ts < identity_ts:
             continue
         closing_candidates.append(item)
 
@@ -4646,6 +4800,9 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         selected_qty += amount
         if target_qty and selected_qty >= target_qty * 0.999:
             break
+    closing_identity_verified = bool(
+        requested_close_order_id_set and selected_closing
+    )
 
     open_qty = sum(_rcr_v1_amount(item) for item in opening_fills)
     open_cost = sum((_rcr_v1_price(item) or 0.0) * _rcr_v1_amount(item) for item in opening_fills)
@@ -4669,7 +4826,22 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
     if realized_gross is None and entry is not None and exit_price is not None and selected_qty > 0:
         realized_gross = ((entry - exit_price) if position_side == "SHORT" else (exit_price - entry)) * selected_qty
 
-    income_payload = fetch_realized_income(sym, since=order_ts or start_epoch, limit=800)
+    income_payload = (
+        fetch_realized_income(sym, since=identity_ts or start_epoch, limit=800)
+        if closing_identity_verified
+        else {
+            "ok": None,
+            "items": [],
+            "count": 0,
+            "raw_count": 0,
+            "deduped_count": 0,
+            "duplicates_removed": 0,
+            "duplicate_conflicts": [],
+            "dedup_ok": True,
+            "attempts": [],
+            "skipped": "CLOSING_IDENTITY_NOT_FOUND",
+        }
+    )
     funding = 0.0
     ledger_realized = 0.0
     ledger_realized_found = False
@@ -4696,7 +4868,7 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
     fee_association_ambiguities = []
     for item in income_payload.get("items") or []:
         item_ts = _rcr_v1_item_timestamp(item)
-        if order_ts and item_ts and item_ts < order_ts:
+        if identity_ts and item_ts and item_ts < identity_ts:
             continue
         type_text = str(_rcr_v1_first(item, "type", "incomeType", "category", default="") or "").upper()
         amount = safe_float(_rcr_v1_first(item, "amount", "income", "pnl", "profit", "change"), None)
@@ -4767,10 +4939,11 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
 
     positions = []
     position_error = None
-    try:
-        positions = get_positions([sym])
-    except Exception as exc:
-        position_error = str(exc)
+    if closing_identity_verified:
+        try:
+            positions = get_positions([sym])
+        except Exception as exc:
+            position_error = str(exc)
     relevant_open = []
     for pos in positions or []:
         if not isinstance(pos, dict) or not _rcr_v1_symbol_matches(pos, sym):
@@ -4789,29 +4962,48 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         and abs(selected_qty - expected_qty) <= qty_tolerance
         and not qty_exceeds_expected
     )
-    position_closed = len(relevant_open) == 0
+    aggregate_position_present = bool(relevant_open)
+    position_closed = (
+        None
+        if not closing_identity_verified or position_error or aggregate_position_present
+        else True
+    )
+    position_ownership_verified = bool(
+        closing_identity_verified
+        and position_error is None
+        and not aggregate_position_present
+    )
     fee_association_ok = not fee_association_ambiguities
     financial_dedup_ok = bool(
         income_payload.get("dedup_ok", True) and fee_association_ok
     )
-    complete = bool(entry is not None and exit_price is not None and selected_qty > 0 and qty_complete and position_closed and financial_dedup_ok)
+    complete = bool(
+        entry is not None
+        and exit_price is not None
+        and selected_qty > 0
+        and qty_complete
+        and closing_identity_verified
+        and position_closed is True
+        and financial_dedup_ok
+    )
     net_pnl = (realized_gross or 0.0) - fee_total + funding if realized_gross is not None else None
     closed_at_epoch = max([_rcr_v1_item_timestamp(item) or 0.0 for item in selected_closing], default=0.0) or None
     closed_at = datetime.fromtimestamp(closed_at_epoch, TIMEZONE_BR).strftime("%d/%m/%Y %H:%M:%S") if closed_at_epoch else None
 
     issues = []
-    if not order_payload.get("ok") and not opening_fills:
-        issues.append("OPEN_ORDER_OR_FILL_NOT_FOUND")
     if entry is None:
         issues.append("ENTRY_PRICE_MISSING")
     if not selected_closing:
         issues.append("CLOSING_FILL_NOT_FOUND")
+        issues.append("CLOSING_IDENTITY_NOT_FOUND")
     if qty_exceeds_expected:
         issues.append("CLOSING_QTY_EXCEEDS_EXPECTED")
     elif expected_qty and not qty_complete:
         issues.append("CLOSING_QTY_INCOMPLETE")
-    if not position_closed:
-        issues.append("POSITION_STILL_OPEN")
+    if aggregate_position_present:
+        issues.append("AGGREGATE_POSITION_PRESENT_OWNERSHIP_UNKNOWN")
+    elif position_error:
+        issues.append("POSITION_STATUS_UNAVAILABLE")
     if realized_gross is None:
         issues.append("REALIZED_PNL_MISSING")
     if not financial_dedup_ok:
@@ -4830,9 +5022,21 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
                 "CLOSING_QTY_EXCEEDS_EXPECTED"
                 if qty_exceeds_expected
                 else (
-                    "FEE_ASSOCIATION_INCONCLUSIVE"
-                    if not fee_association_ok
-                    else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
+                    "CLOSING_IDENTITY_NOT_FOUND"
+                    if not closing_identity_verified
+                    else (
+                        "FEE_ASSOCIATION_INCONCLUSIVE"
+                        if not fee_association_ok
+                        else (
+                            "AGGREGATE_POSITION_OWNERSHIP_INCONCLUSIVE"
+                            if aggregate_position_present
+                            else (
+                                "POSITION_STATUS_UNAVAILABLE"
+                                if position_error
+                                else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
+                            )
+                        )
+                    )
                 )
             )
         ),
@@ -4845,6 +5049,7 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "side": position_side,
         "open_order_id": open_order_id,
         "client_order_id": client_order_id,
+        "requested_close_order_ids": requested_close_order_ids,
         "close_order_ids": close_order_ids,
         "entry_price": entry,
         "entry_price_source": entry_source,
@@ -4858,6 +5063,10 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "qty_exceeds_expected": qty_exceeds_expected,
         "qty_complete": qty_complete,
         "position_closed": position_closed,
+        "opening_identity_verified": opening_identity_verified,
+        "closing_identity_verified": closing_identity_verified,
+        "aggregate_position_evaluated": closing_identity_verified,
+        "position_ownership_verified": position_ownership_verified,
         "closed_at": closed_at,
         "closed_at_epoch": closed_at_epoch,
         "realized_pnl_gross": realized_gross,
@@ -4888,6 +5097,7 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "closing_fills": selected_closing,
         "income_items": income_payload.get("items") or [],
         "open_positions": relevant_open,
+        "aggregate_open_positions": relevant_open,
         "position_fetch_error": position_error,
         "issues": issues,
         "data_quality": "HIGH_BROKER_RECONCILED_DEDUPED" if complete else "LOW_INCOMPLETE",
@@ -4906,6 +5116,7 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
             "duplicate_conflicts": income_payload.get("duplicate_conflicts") or [],
             "dedup_ok": income_payload.get("dedup_ok"),
             "attempts": income_payload.get("attempts"),
+            "skipped": income_payload.get("skipped"),
         },
     }
 

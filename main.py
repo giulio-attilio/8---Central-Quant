@@ -59089,6 +59089,22 @@ def _rcrm_v1_values(
     normalizer = getattr(
         central_trade_registry, "normalize_strong_identity_value", None
     ) if central_trade_registry is not None else None
+    raw_close_order_ids = _rcrm_v1_first(trade, "broker_close_order_ids")
+    if isinstance(raw_close_order_ids, (list, tuple, set)):
+        raw_close_order_ids = list(raw_close_order_ids)
+    else:
+        raw_close_order_ids = [raw_close_order_ids] if raw_close_order_ids not in (None, "") else []
+    singular_close_order_id = _rcrm_v1_first(
+        trade,
+        "broker_close_order_id",
+        "close_order_id",
+        "exit_order_id",
+    )
+    if singular_close_order_id not in (None, ""):
+        raw_close_order_ids.append(singular_close_order_id)
+    close_order_ids = sorted(
+        {str(value).strip() for value in raw_close_order_ids if str(value).strip()}
+    )
     return {
         "lifecycle_id": selected_identity.get("lifecycle_id"),
         "order_id": (
@@ -59101,6 +59117,7 @@ def _rcrm_v1_values(
             if callable(normalizer)
             else str(client_id or "").strip().upper()
         ) or None,
+        "close_order_ids": close_order_ids,
         "identity_sources": identity_sources,
         "legacy_execution_evidence_used": any(
             source == "LEGACY_EXECUTION_EVIDENCE"
@@ -59453,6 +59470,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         opened_epoch=values.get("opened_epoch"),
         qty=values.get("qty"),
         entry_price=values.get("entry"),
+        close_order_ids=values.get("close_order_ids"),
     )
     broker_identity_validation = _rcrm_v11_validate_broker_identity(
         trade,

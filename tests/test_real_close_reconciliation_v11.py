@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,16 @@ MAIN_TREE = ast.parse(MAIN_FILE.read_text(encoding="utf-8"))
 
 OPEN_ORDER_ID = "2078483751332171776"
 CLOSE_ORDER_ID = "XRP-MANUAL-CLOSE-ORDER"
+
+
+@pytest.fixture(autouse=True)
+def _block_external_network(monkeypatch):
+    def _blocked(*_args, **_kwargs):
+        raise AssertionError("external network is forbidden in reconciliation tests")
+
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", _blocked)
 
 
 def _main_function_nodes(wanted):
@@ -118,7 +129,12 @@ def _income_rows():
     ]
 
 
-def _run_broker_reconciliation(monkeypatch, closing_volume="9", income_rows=None):
+def _run_broker_reconciliation(
+    monkeypatch,
+    closing_volume="9",
+    income_rows=None,
+    close_order_ids=(CLOSE_ORDER_ID,),
+):
     opening, closing = _broker_rows(closing_volume=closing_volume)
     order = {
         "id": OPEN_ORDER_ID,
@@ -161,6 +177,7 @@ def _run_broker_reconciliation(monkeypatch, closing_volume="9", income_rows=None
         opened_epoch=1_784_384_114,
         qty=9,
         entry_price=1.0871,
+        close_order_ids=list(close_order_ids),
     )
 
 
@@ -212,6 +229,20 @@ def test_closing_quantity_above_expected_is_blocked(monkeypatch):
     assert "CLOSING_QTY_EXCEEDS_EXPECTED" in result["issues"]
 
 
+def test_missing_close_identity_never_consumes_opposite_side_fill(monkeypatch):
+    result = _run_broker_reconciliation(monkeypatch, close_order_ids=())
+
+    assert result["complete"] is False
+    assert result["status"] == "CLOSING_IDENTITY_NOT_FOUND"
+    assert result["opening_identity_verified"] is True
+    assert result["closing_identity_verified"] is False
+    assert result["requested_close_order_ids"] == []
+    assert result["close_order_ids"] == []
+    assert result["closed_qty"] == 0
+    assert result["closing_fills"] == []
+    assert "CLOSING_IDENTITY_NOT_FOUND" in result["issues"]
+
+
 def test_fee_without_unique_temporal_or_identity_association_is_inconclusive(
     monkeypatch,
 ):
@@ -244,6 +275,174 @@ def test_fee_without_unique_temporal_or_identity_association_is_inconclusive(
         }
     ]
     assert "AMBIGUOUS_FEE_ASSOCIATION" in result["issues"]
+
+
+def test_missing_open_identity_does_not_consume_unrelated_fills_or_positions(
+    monkeypatch,
+):
+    unrelated_opening, unrelated_closing = _broker_rows(closing_volume="212")
+    unrelated_opening["order"] = "OTHER-OPEN-ORDER"
+    unrelated_opening["info"]["orderId"] = "OTHER-OPEN-ORDER"
+    unrelated_closing["order"] = "OTHER-CLOSE-ORDER"
+    unrelated_closing["info"]["orderId"] = "OTHER-CLOSE-ORDER"
+    monkeypatch.setattr(
+        broker,
+        "fetch_order_by_id",
+        lambda *_args, **_kwargs: {"ok": False, "order": None, "error": "NOT_FOUND"},
+    )
+    monkeypatch.setattr(
+        broker,
+        "fetch_order_trades",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "all_trades": [unrelated_opening, unrelated_closing],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        broker,
+        "fetch_realized_income",
+        lambda *_args, **_kwargs: pytest.fail(
+            "income must not be queried without opening identity"
+        ),
+    )
+    monkeypatch.setattr(
+        broker,
+        "get_positions",
+        lambda *_args, **_kwargs: pytest.fail(
+            "aggregate positions must not be queried without opening identity"
+        ),
+    )
+
+    result = broker.reconcile_closed_trade(
+        symbol="BTCUSDT",
+        side="LONG",
+        open_order_id="MISSING-OPEN-ORDER",
+        client_order_id="MISSING-CLIENT-ORDER",
+        opened_epoch=1_784_384_114,
+        qty=0.0001,
+        entry_price=64_107.9,
+    )
+
+    assert result["status"] == "OPENING_IDENTITY_NOT_FOUND"
+    assert result["complete"] is False
+    assert result["opening_identity_verified"] is False
+    assert result["close_order_ids"] == []
+    assert result["closed_qty"] == 0
+    assert result["closing_fills"] == []
+    assert result["position_closed"] is None
+    assert result["aggregate_position_evaluated"] is False
+    assert result["income_lookup"]["skipped"] == "OPENING_IDENTITY_NOT_FOUND"
+    assert result["issues"] == [
+        "OPEN_ORDER_OR_FILL_NOT_FOUND",
+        "OPENING_IDENTITY_NOT_FOUND",
+    ]
+
+
+def test_exact_opening_fill_recovers_when_order_endpoint_misses(monkeypatch):
+    opening, closing = _broker_rows()
+    monkeypatch.setattr(
+        broker,
+        "fetch_order_by_id",
+        lambda *_args, **_kwargs: {"ok": False, "order": None, "error": "NOT_FOUND"},
+    )
+    monkeypatch.setattr(
+        broker,
+        "fetch_order_trades",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "all_trades": [copy.deepcopy(opening), copy.deepcopy(closing)],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        broker,
+        "fetch_realized_income",
+        lambda *_args, **_kwargs: _deduped_income(_income_rows()),
+    )
+    monkeypatch.setattr(broker, "get_positions", lambda *_args, **_kwargs: [])
+
+    result = broker.reconcile_closed_trade(
+        symbol="XRPUSDT",
+        side="LONG",
+        open_order_id=OPEN_ORDER_ID,
+        client_order_id="FALCON-LIVE-FALCON15-1784384114",
+        opened_epoch=1_784_384_114,
+        qty=9,
+        entry_price=1.0871,
+        close_order_ids=[CLOSE_ORDER_ID],
+    )
+
+    assert result["complete"] is True
+    assert result["status"] == "BROKER_CLOSE_RECONCILED"
+    assert result["opening_identity_verified"] is True
+    assert result["closing_identity_verified"] is True
+    assert result["entry_price_source"] == "BROKER_OPENING_FILLS"
+    assert result["close_order_ids"] == [CLOSE_ORDER_ID]
+
+
+def test_aggregate_position_is_unattributed_and_blocks_only_reconciliation(
+    monkeypatch,
+):
+    opening, closing = _broker_rows()
+    order = {
+        "id": OPEN_ORDER_ID,
+        "timestamp": 1_784_384_114_000,
+        "average": 1.0871,
+        "amount": 9,
+        "info": {"orderId": OPEN_ORDER_ID, "volume": "9"},
+    }
+    monkeypatch.setattr(
+        broker,
+        "fetch_order_by_id",
+        lambda *_args, **_kwargs: {"ok": True, "order": copy.deepcopy(order)},
+    )
+    monkeypatch.setattr(
+        broker,
+        "fetch_order_trades",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "all_trades": [copy.deepcopy(opening), copy.deepcopy(closing)],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        broker,
+        "fetch_realized_income",
+        lambda *_args, **_kwargs: _deduped_income(_income_rows()),
+    )
+    monkeypatch.setattr(
+        broker,
+        "get_positions",
+        lambda *_args, **_kwargs: [
+            {
+                "symbol": "XRP/USDT:USDT",
+                "contracts": 4,
+                "side": "long",
+                "info": {"positionSide": "LONG", "positionAmt": "4"},
+            }
+        ],
+    )
+
+    result = broker.reconcile_closed_trade(
+        symbol="XRPUSDT",
+        side="LONG",
+        open_order_id=OPEN_ORDER_ID,
+        client_order_id="FALCON-LIVE-FALCON15-1784384114",
+        opened_epoch=1_784_384_114,
+        qty=9,
+        entry_price=1.0871,
+        close_order_ids=[CLOSE_ORDER_ID],
+    )
+
+    assert result["complete"] is False
+    assert result["status"] == "AGGREGATE_POSITION_OWNERSHIP_INCONCLUSIVE"
+    assert result["opening_identity_verified"] is True
+    assert result["position_closed"] is None
+    assert result["position_ownership_verified"] is False
+    assert result["aggregate_open_positions"] == result["open_positions"]
+    assert "AGGREGATE_POSITION_PRESENT_OWNERSHIP_UNKNOWN" in result["issues"]
+    assert "POSITION_STILL_OPEN" not in result["issues"]
 
 
 def test_fee_info_text_alone_without_symbol_and_time_is_not_associated():
@@ -1652,6 +1851,32 @@ def test_complete_selected_identity_still_reaches_broker_once():
     assert registry_updates == []
     assert outcome_calls == []
     assert audit_calls == ["write", "append"]
+
+
+def test_registry_close_order_identity_is_forwarded_to_broker_without_mutation():
+    _verify, real = _strong_identity_records()
+    real = copy.deepcopy(real)
+    real["broker_close_order_ids"] = ["CLOSE-PARTIAL-XRP"]
+    real["broker_close_order_id"] = CLOSE_ORDER_ID
+    original_close_ids = copy.deepcopy(real["broker_close_order_ids"])
+    namespace, registry_updates, broker_calls, outcome_calls, _audit_calls = (
+        _load_integrated_strong_runner([real], _complete_broker_result())
+    )
+
+    result = namespace["real_close_reconciliation_v1_run"](
+        payload={"lifecycle_id": real["lifecycle_id"]},
+        commit=False,
+        source="test",
+    )
+
+    assert result["broker_complete"] is True
+    assert broker_calls[0]["close_order_ids"] == [
+        "CLOSE-PARTIAL-XRP",
+        CLOSE_ORDER_ID,
+    ]
+    assert real["broker_close_order_ids"] == original_close_ids
+    assert registry_updates == []
+    assert outcome_calls == []
 
 
 def test_writer_receives_exact_selected_canonical_identity():
