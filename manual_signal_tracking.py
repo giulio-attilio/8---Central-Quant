@@ -33,6 +33,14 @@ MANUAL_TRACKING_COLUMNS = {
     "manual_trade_clock_v1": ("id", "clock"),
 }
 
+# Factual fd62ce6 rollout, from sanitized Render logs supplied by the operator:
+# 2026-10-01 21:46:53 -03:00: previous instance STOPPED / STOP_REQUESTED.
+# 2026-10-01 21:47:09 -03:00: new instance live / ROUTES_CONFIRMED.
+# These are rollout times, not Git commit times. Legacy is strictly before the
+# first bound; both endpoints and the intervening window remain indeterminate.
+H4_LEGACY_LAST_POSSIBLE_MS = 1790902013000
+H4_MODERN_FIRST_LIVE_MS = 1790902029000
+
 
 def connect(path):
     db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
@@ -107,15 +115,16 @@ def inspect_manual_tracking(db, *, now_ms):
         invalid_timestamps=0, invalid_clocks=0, clock_ahead=False,
         ambiguous_notices=0,
     )
-    # Preserve the aggregate's semantics: first failing predicate per cursor,
-    # plus independent duplicate rows and missing Donkey CLOSED/STOP cursors.
-    # These counters sum to invalid_h4; orphan_h4 remains separate.
+    # First failing predicate per cursor, plus independent duplicate rows and
+    # unproven/modern Donkey CLOSED/STOP cursors. Sum excluding the informational
+    # legacy counter equals invalid_h4; orphan_h4 remains separate.
     h4_integrity = out["manual_h4_integrity"] = dict(
         duplicate_ref=0, cursor_for_falcon=0, cursor_for_inactive_trade=0,
         invalid_cursor_timestamp=0, cursor_off_h4_grid=0,
         invalid_activation_timestamp=0, cursor_not_after_activation=0,
         cursor_ahead_observation_clock=0, invalid_closed_timestamp=0,
         cursor_after_close=0, missing_for_donkey_stop=0,
+        legacy_stop_without_h4_cursor=0, indeterminate_stop_without_h4_cursor=0,
     )
 
     def rows(table, columns=None):
@@ -327,8 +336,25 @@ def inspect_manual_tracking(db, *, now_ms):
                        or e["created_ms"] > observation_clock for e in stop_events)):
             integrity["invalid_events"] += 1
         if state == "CLOSED" and t["close_reason"] == "STOP" and t["family"] != "FALCON" and t["ref"] not in h4_by_ref:
-            integrity["invalid_h4"] += 1
-            h4_integrity["missing_for_donkey_stop"] += 1
+            # Date the close, not the offer/activation. A sole STOP event must
+            # agree with closed_ms and route and fit the observation clock.
+            # UNKNOWN notices and every other invariant still fail closed.
+            stop_time_proven = (
+                close_ok and valid_setups and stamp(t["closed_ms"])
+                and len(stop_events) == 1 and stamp(stop_events[0]["created_ms"])
+                and stop_events[0]["created_ms"] == t["closed_ms"]
+                and stop_events[0]["route"] == t["route"]
+                and stop_events[0]["status"] in {"PENDING", "CONFIRMED"}
+                and stop_events[0]["created_ms"] <= observation_clock
+            )
+            if stop_time_proven and t["closed_ms"] < H4_LEGACY_LAST_POSSIBLE_MS:
+                h4_integrity["legacy_stop_without_h4_cursor"] += 1
+            else:
+                integrity["invalid_h4"] += 1
+                subtype = ("missing_for_donkey_stop" if stop_time_proven
+                           and t["closed_ms"] > H4_MODERN_FIRST_LIVE_MS
+                           else "indeterminate_stop_without_h4_cursor")
+                h4_integrity[subtype] += 1
     if integrity["invalid_states"] or integrity["ambiguous_notices"]:
         return out, "MANUAL_TRACKING_STATE_REVIEW_REQUIRED"
     if integrity["clock_ahead"] or integrity["invalid_clocks"] or integrity["invalid_timestamps"]:

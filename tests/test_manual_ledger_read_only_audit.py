@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 import test_donkey_strategic_stop_v2 as h
@@ -310,7 +311,8 @@ class ReadOnlyAudit(h.base.Harness):
     def assert_h4_subtype(self, out, subtype=None, count=1):
         nonzero = {k: v for k, v in out['manual_h4_integrity'].items() if v}
         self.assertEqual(nonzero, {} if subtype is None else {subtype: count}, out)
-        self.assertEqual(sum(out['manual_h4_integrity'].values()),
+        self.assertEqual(sum(v for k, v in out['manual_h4_integrity'].items()
+                             if k != 'legacy_stop_without_h4_cursor'),
                          out['manual_integrity']['invalid_h4'])
 
     def observe_valid_h4(self):
@@ -405,7 +407,7 @@ class ReadOnlyAudit(h.base.Harness):
         out = self.reject('MANUAL_TRACKING_CLOCK_REVIEW_REQUIRED')
         self.assert_h4_subtype(out)
 
-    def test_h4_historical_donkey_price_stop_still_requires_review_without_cursor(self):
+    def test_h4_historical_donkey_price_stop_is_compatible_without_cursor(self):
         ref = self.activate(setups=('DONKEY',))
         # Reconstruct fa2e4af's legitimate price-stop result without loading
         # operational code: that version had no H4 table/writer.
@@ -415,10 +417,140 @@ class ReadOnlyAudit(h.base.Harness):
         with closing(sqlite3.connect(self.path)) as db:
             route = db.execute('SELECT route FROM manual_trade_v1').fetchone()[0]
         self.sql("INSERT INTO manual_trade_event_v1 VALUES (?, 'STOP', ?, 'synthetic historic stop', 'CONFIRMED', ?)", (ref, route, closed))
-        out = self.reject('MANUAL_TRACKING_INTEGRITY_REVIEW_REQUIRED')
-        self.assert_h4_subtype(out, 'missing_for_donkey_stop')
+        out = self.inspect()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out, 'legacy_stop_without_h4_cursor')
         self.assertTrue(all(v == 0 for k, v in out['manual_integrity'].items()
-                            if k not in {'schema_ok', 'invalid_h4'}), out)
+                            if k != 'schema_ok'), out)
+
+    def stop_fixture(self, closed, *, bot='DONKEY', reason='STOP'):
+        ref = self.activate(bot=bot, setups=('DONKEY',) if bot == 'DONKEY' else ('FALCON15',))
+        self.sql("UPDATE manual_trade_v1 SET state='CLOSED', close_reason=?, closed_ms=?, last_quote_ms=?",
+                 (reason, closed, closed))
+        self.sql('UPDATE manual_trade_clock_v1 SET clock=?', (closed,))
+        if reason == 'MANUAL_CLOSE':
+            self.sql('UPDATE manual_trade_control_v1 SET clock=?', (closed,))
+        else:
+            with closing(sqlite3.connect(self.path)) as db:
+                route = db.execute('SELECT route FROM manual_trade_v1').fetchone()[0]
+            self.sql("INSERT INTO manual_trade_event_v1 VALUES (?, 'STOP', ?, 'synthetic stop', 'CONFIRMED', ?)",
+                     (ref, route, closed))
+        return ref
+
+    def inspect_after_rollout(self):
+        # Wall clock for October fixtures; guard/byte checks remain in inspect().
+        with patch(__name__ + '.NOW', manual.H4_MODERN_FIRST_LIVE_MS+86400000):
+            return self.inspect()
+
+    def test_rollout_epoch_ms_explicit_offsets_and_utc(self):
+        low = datetime.fromisoformat('2026-10-01T21:46:53-03:00')
+        high = datetime.fromisoformat('2026-10-01T21:47:09-03:00')
+        self.assertEqual(int(low.timestamp()*1000), manual.H4_LEGACY_LAST_POSSIBLE_MS)
+        self.assertEqual(int(high.timestamp()*1000), manual.H4_MODERN_FIRST_LIVE_MS)
+        self.assertEqual(low.astimezone(timezone.utc).isoformat(), '2026-10-02T00:46:53+00:00')
+        self.assertEqual(high.astimezone(timezone.utc).isoformat(), '2026-10-02T00:47:09+00:00')
+        self.assertEqual(manual.H4_MODERN_FIRST_LIVE_MS-manual.H4_LEGACY_LAST_POSSIBLE_MS, 16000)
+
+    def test_stop_one_ms_before_previous_instance_stop_is_legacy(self):
+        self.stop_fixture(manual.H4_LEGACY_LAST_POSSIBLE_MS-1)
+        out = self.inspect_after_rollout()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out, 'legacy_stop_without_h4_cursor')
+        self.assertEqual(out['manual_h4']['rows'], 0)
+
+    def test_rollout_window_endpoints_and_midpoint_are_indeterminate(self):
+        low, high = manual.H4_LEGACY_LAST_POSSIBLE_MS, manual.H4_MODERN_FIRST_LIVE_MS
+        self.stop_fixture(low)
+        original = Path(self.path).read_bytes()
+        for closed in (low, low+8000, high):
+            with self.subTest(closed=closed):
+                Path(self.path).write_bytes(original)
+                self.sql('UPDATE manual_trade_v1 SET closed_ms=?, last_quote_ms=?', (closed, closed))
+                self.sql('UPDATE manual_trade_event_v1 SET created_ms=?', (closed,))
+                self.sql('UPDATE manual_trade_clock_v1 SET clock=?', (closed,))
+                out = self.inspect_after_rollout()
+                self.assertFalse(out['review_complete'], out)
+                self.assertEqual(out['reason'], 'MANUAL_TRACKING_INTEGRITY_REVIEW_REQUIRED')
+                self.assert_h4_subtype(out, 'indeterminate_stop_without_h4_cursor')
+
+    def test_modern_stop_one_ms_after_live_without_cursor_is_invalid(self):
+        # Offer and activation are old: neither can replace the closing timestamp.
+        self.stop_fixture(manual.H4_MODERN_FIRST_LIVE_MS+1)
+        out = self.inspect_after_rollout()
+        self.assertFalse(out['review_complete'], out)
+        self.assertEqual(out['reason'], 'MANUAL_TRACKING_INTEGRITY_REVIEW_REQUIRED')
+        self.assert_h4_subtype(out, 'missing_for_donkey_stop')
+
+    def test_unproven_close_or_stop_timestamp_is_never_legacy(self):
+        self.stop_fixture(manual.H4_LEGACY_LAST_POSSIBLE_MS-1)
+        original = Path(self.path).read_bytes()
+        cases = (
+            ('UPDATE manual_trade_v1 SET closed_ms=NULL', ()),
+            ('UPDATE manual_trade_v1 SET closed_ms=?', ('bad',)),
+            ('UPDATE manual_trade_v1 SET closed_ms=0', ()),
+            ('DELETE FROM manual_trade_event_v1', ()),
+            ('UPDATE manual_trade_event_v1 SET created_ms=?', ('bad',)),
+            ('UPDATE manual_trade_event_v1 SET created_ms=?', (manual.H4_LEGACY_LAST_POSSIBLE_MS,)),
+            ('UPDATE manual_trade_event_v1 SET route=?', ('different-route',)),
+            ('UPDATE manual_trade_clock_v1 SET clock=?', (manual.H4_LEGACY_LAST_POSSIBLE_MS-2,)),
+            ('UPDATE manual_trade_event_v1 SET status=?', ('UNKNOWN',)),
+        )
+        for statement, params in cases:
+            with self.subTest(statement=statement, params=params):
+                Path(self.path).write_bytes(original)
+                self.sql(statement, params)
+                out = self.inspect_after_rollout()
+                self.assertFalse(out['review_complete'], out)
+                self.assert_h4_subtype(out, 'indeterminate_stop_without_h4_cursor')
+
+    def test_legacy_close_with_other_corruption_remains_blocked(self):
+        self.stop_fixture(manual.H4_LEGACY_LAST_POSSIBLE_MS-1)
+        self.sql('UPDATE manual_trade_v1 SET stop=0')
+        out = self.inspect_after_rollout()
+        self.assertFalse(out['review_complete'], out)
+        self.assertEqual(out['manual_integrity']['invalid_prices'], 1)
+        self.assert_h4_subtype(out, 'legacy_stop_without_h4_cursor')
+
+    def test_legacy_falcon_stop_never_uses_donkey_exception(self):
+        self.stop_fixture(manual.H4_LEGACY_LAST_POSSIBLE_MS-1, bot='FALCON')
+        out = self.inspect_after_rollout()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out)
+
+    def test_legacy_manual_close_never_uses_stop_exception(self):
+        self.stop_fixture(manual.H4_LEGACY_LAST_POSSIBLE_MS-1, reason='MANUAL_CLOSE')
+        out = self.inspect_after_rollout()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out)
+
+    def test_modern_h4_writer_valid_stop_and_lost_cursor_blocked(self):
+        self.activate(setups=('DONKEY',))
+        now = manual.H4_MODERN_FIRST_LIVE_MS+86400000
+        self.tracker.observe_h4(h.snapshot(closed_price=90, now=now), now,
+            h.fixtures.SOURCE, h.fixtures.CONFIG,
+            frame_max_age_ms=10000, quote_max_age_ms=5000)
+        out = self.inspect_after_rollout()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out)
+        self.assertEqual(out['manual_closes'], {'STOP': 1})
+        self.sql('DELETE FROM manual_trade_h4_v2')  # synthetic data loss only
+        out = self.inspect_after_rollout()
+        self.assertFalse(out['review_complete'], out)
+        self.assert_h4_subtype(out, 'missing_for_donkey_stop')
+
+    def test_modern_active_and_cursor_corruption_preserve_modern_invariants(self):
+        self.activate(setups=('DONKEY',))
+        now = manual.H4_MODERN_FIRST_LIVE_MS+86400000
+        self.tracker.observe_h4(h.snapshot(now=now), now, h.fixtures.SOURCE,
+            h.fixtures.CONFIG, frame_max_age_ms=10000, quote_max_age_ms=5000)
+        out = self.inspect_after_rollout()
+        self.assertTrue(out['review_complete'], out)
+        self.assertEqual(out['manual_trades'], {'ACTIVE': 1})
+        self.assert_h4_subtype(out)
+        self.sql('UPDATE manual_trade_h4_v2 SET closed_at_ms=closed_at_ms+1')
+        out = self.inspect_after_rollout()
+        self.assertFalse(out['review_complete'], out)
+        self.assert_h4_subtype(out, 'cursor_off_h4_grid')
 
     def test_h4_first_failure_priority_and_aggregate_counts_unchanged(self):
         self.activate()
