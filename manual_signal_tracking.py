@@ -107,6 +107,16 @@ def inspect_manual_tracking(db, *, now_ms):
         invalid_timestamps=0, invalid_clocks=0, clock_ahead=False,
         ambiguous_notices=0,
     )
+    # Preserve the aggregate's semantics: first failing predicate per cursor,
+    # plus independent duplicate rows and missing Donkey CLOSED/STOP cursors.
+    # These counters sum to invalid_h4; orphan_h4 remains separate.
+    h4_integrity = out["manual_h4_integrity"] = dict(
+        duplicate_ref=0, cursor_for_falcon=0, cursor_for_inactive_trade=0,
+        invalid_cursor_timestamp=0, cursor_off_h4_grid=0,
+        invalid_activation_timestamp=0, cursor_not_after_activation=0,
+        cursor_ahead_observation_clock=0, invalid_closed_timestamp=0,
+        cursor_after_close=0, missing_for_donkey_stop=0,
+    )
 
     def rows(table, columns=None):
         columns = columns or MANUAL_TRACKING_COLUMNS[table]
@@ -173,17 +183,35 @@ def inspect_manual_tracking(db, *, now_ms):
     for h in cursors:
         if h["ref"] in h4_by_ref:
             integrity["invalid_h4"] += 1
+            h4_integrity["duplicate_ref"] += 1
         h4_by_ref[h["ref"]] = h["closed_at_ms"]
         t = by_ref.get(h["ref"])
         if t is None:
             integrity["orphan_h4"] += 1
-        elif (t["family"] == "FALCON" or t["state"] not in {"ACTIVE", "CLOSED"}
-              or not stamp(h["closed_at_ms"]) or h["closed_at_ms"] % 14400000 != 0
-              or type(t["active_ms"]) is not int or h["closed_at_ms"] <= t["active_ms"]
-              or h["closed_at_ms"] > observation_clock
-              or (t["closed_ms"] is not None and
-                  (type(t["closed_ms"]) is not int or h["closed_at_ms"] > t["closed_ms"]))):
-            integrity["invalid_h4"] += 1
+        else:
+            # Keep the original OR's order, including stamp()'s clock flag.
+            subtype = None
+            if t["family"] == "FALCON":
+                subtype = "cursor_for_falcon"
+            elif t["state"] not in {"ACTIVE", "CLOSED"}:
+                subtype = "cursor_for_inactive_trade"
+            elif not stamp(h["closed_at_ms"]):
+                subtype = "invalid_cursor_timestamp"
+            elif h["closed_at_ms"] % 14400000 != 0:
+                subtype = "cursor_off_h4_grid"
+            elif type(t["active_ms"]) is not int:
+                subtype = "invalid_activation_timestamp"
+            elif h["closed_at_ms"] <= t["active_ms"]:
+                subtype = "cursor_not_after_activation"
+            elif h["closed_at_ms"] > observation_clock:
+                subtype = "cursor_ahead_observation_clock"
+            elif t["closed_ms"] is not None and type(t["closed_ms"]) is not int:
+                subtype = "invalid_closed_timestamp"
+            elif t["closed_ms"] is not None and h["closed_at_ms"] > t["closed_ms"]:
+                subtype = "cursor_after_close"
+            if subtype:
+                integrity["invalid_h4"] += 1
+                h4_integrity[subtype] += 1
     for c in controls:
         if not stamp(c["clock"], zero=True):
             integrity["invalid_clocks"] += 1
@@ -300,6 +328,7 @@ def inspect_manual_tracking(db, *, now_ms):
             integrity["invalid_events"] += 1
         if state == "CLOSED" and t["close_reason"] == "STOP" and t["family"] != "FALCON" and t["ref"] not in h4_by_ref:
             integrity["invalid_h4"] += 1
+            h4_integrity["missing_for_donkey_stop"] += 1
     if integrity["invalid_states"] or integrity["ambiguous_notices"]:
         return out, "MANUAL_TRACKING_STATE_REVIEW_REQUIRED"
     if integrity["clock_ahead"] or integrity["invalid_clocks"] or integrity["invalid_timestamps"]:

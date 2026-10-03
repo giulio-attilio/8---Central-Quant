@@ -307,6 +307,149 @@ class ReadOnlyAudit(h.base.Harness):
         self.assertEqual(Path(self.path).read_bytes(), before)
         self.assertTrue(Path(self.path+'.halted').exists())
 
+    def assert_h4_subtype(self, out, subtype=None, count=1):
+        nonzero = {k: v for k, v in out['manual_h4_integrity'].items() if v}
+        self.assertEqual(nonzero, {} if subtype is None else {subtype: count}, out)
+        self.assertEqual(sum(out['manual_h4_integrity'].values()),
+                         out['manual_integrity']['invalid_h4'])
+
+    def observe_valid_h4(self):
+        self.tracker.observe_h4(h.snapshot(), h.LATER, h.fixtures.SOURCE,
+            h.fixtures.CONFIG, frame_max_age_ms=10000, quote_max_age_ms=5000)
+
+    def test_h4_subtypes_zero_for_valid_active_waiting_and_historical_manual_close(self):
+        ref = self.activate()
+        # No missing-for-ACTIVE rule: before the first new H4 there is no cursor.
+        out = self.inspect()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out)
+        self.observe_valid_h4()
+        out = self.inspect()
+        self.assertTrue(out['review_complete'], out)
+        self.assertEqual(out['manual_h4']['active_with_cursor'], 1)
+        self.assert_h4_subtype(out)
+        self.send('DONKEY', [h.signal('EARLY_DONKEY', suffix='waiting')])
+        self.tracker.accept('DONKEY', self.callback('DONKEY', 'mc:'+ref, update=2), h.LATER+1)
+        out = self.inspect()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out)
+        self.sql('DELETE FROM manual_trade_h4_v2')  # synthetic pre-H4 manual close
+        out = self.inspect()
+        self.assertTrue(out['review_complete'], out)
+        self.assert_h4_subtype(out)
+
+    def test_h4_each_timestamp_and_order_subtype_is_distinct(self):
+        self.activate()
+        self.observe_valid_h4()
+        original = Path(self.path).read_bytes()
+        cases = (
+            ('invalid_cursor_timestamp', 'UPDATE manual_trade_h4_v2 SET closed_at_ms=?', (0,)),
+            ('invalid_cursor_timestamp', 'UPDATE manual_trade_h4_v2 SET closed_at_ms=?', ('bad',)),
+            ('invalid_cursor_timestamp', 'UPDATE manual_trade_h4_v2 SET closed_at_ms=?', (NOW+1,)),
+            ('cursor_off_h4_grid', 'UPDATE manual_trade_h4_v2 SET closed_at_ms=?', (h.CLOSED+1,)),
+            ('invalid_activation_timestamp', 'UPDATE manual_trade_v1 SET active_ms=NULL', ()),
+            ('cursor_not_after_activation', 'UPDATE manual_trade_h4_v2 SET closed_at_ms=?', (h.CLOSED-14400000,)),
+            ('cursor_ahead_observation_clock', 'UPDATE manual_trade_clock_v1 SET clock=?', (h.CLOSED-1,)),
+            ('invalid_closed_timestamp', 'UPDATE manual_trade_v1 SET closed_ms=?', ('bad',)),
+            ('cursor_after_close', "UPDATE manual_trade_v1 SET state='CLOSED', close_reason='MANUAL_CLOSE', closed_ms=?", (h.CLOSED-1,)),
+        )
+        for subtype, statement, params in cases:
+            with self.subTest(subtype=subtype, value=params):
+                Path(self.path).write_bytes(original)
+                self.sql(statement, params)
+                if subtype == 'cursor_after_close':
+                    self.sql('UPDATE manual_trade_control_v1 SET clock=?', (h.CLOSED,))
+                out = self.reject()
+                self.assert_h4_subtype(out, subtype)
+                if subtype == 'cursor_ahead_observation_clock':
+                    self.assertFalse(out['clock_ahead'])  # relative order, not wall-clock future
+                    self.assertEqual(out['manual_integrity']['invalid_clocks'], 0)
+                if subtype == 'invalid_cursor_timestamp' and params == (NOW+1,):
+                    self.assertTrue(out['clock_ahead'])
+
+    def test_h4_cursor_for_falcon_subtype(self):
+        ref = self.activate(bot='FALCON', setups=('FALCON15',))
+        self.sql('INSERT INTO manual_trade_h4_v2 VALUES (?,?)', (ref, h.CLOSED))
+        self.sql('UPDATE manual_trade_clock_v1 SET clock=?', (h.LATER,))
+        self.assert_h4_subtype(self.reject(), 'cursor_for_falcon')
+
+    def test_h4_cursor_for_waiting_and_expired_subtype(self):
+        self.send('DONKEY', [h.signal('EARLY_DONKEY')])
+        with closing(sqlite3.connect(self.path)) as db:
+            ref = db.execute('SELECT ref FROM manual_trade_v1').fetchone()[0]
+        self.sql('INSERT INTO manual_trade_h4_v2 VALUES (?,?)', (ref, h.CLOSED))
+        self.assert_h4_subtype(self.reject(), 'cursor_for_inactive_trade')
+        self.sql("UPDATE manual_trade_v1 SET state='EXPIRED', closed_ms=?, close_reason='EXPIRED'", (h.base.NOW+900000,))
+        self.sql('UPDATE manual_trade_control_v1 SET clock=?', (h.base.NOW+900000,))
+        self.assert_h4_subtype(self.reject(), 'cursor_for_inactive_trade')
+
+    def test_h4_duplicate_subtype_in_exact_columns_but_missing_unique_constraint(self):
+        self.activate()
+        self.observe_valid_h4()
+        # Test-only malformed schema. The auditor checks columns, not PK DDL.
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('ALTER TABLE manual_trade_h4_v2 RENAME TO synthetic_h4')
+            db.execute('CREATE TABLE manual_trade_h4_v2 (ref TEXT, closed_at_ms INTEGER)')
+            db.execute('INSERT INTO manual_trade_h4_v2 SELECT * FROM synthetic_h4')
+            db.execute('INSERT INTO manual_trade_h4_v2 SELECT * FROM synthetic_h4')
+            db.execute('DROP TABLE synthetic_h4')
+        self.assert_h4_subtype(self.reject(), 'duplicate_ref')
+
+    def test_h4_orphan_and_global_clocks_stay_separate(self):
+        self.sql("INSERT INTO manual_trade_h4_v2 VALUES ('orphan', ?)", (h.CLOSED,))
+        out = self.reject()
+        self.assertEqual(out['manual_integrity']['orphan_h4'], 1)
+        self.assert_h4_subtype(out)
+        self.sql('DELETE FROM manual_trade_h4_v2')
+        self.sql('UPDATE manual_trade_clock_v1 SET clock=?', (NOW+1,))
+        out = self.reject('MANUAL_TRACKING_CLOCK_REVIEW_REQUIRED')
+        self.assert_h4_subtype(out)
+
+    def test_h4_historical_donkey_price_stop_still_requires_review_without_cursor(self):
+        ref = self.activate(setups=('DONKEY',))
+        # Reconstruct fa2e4af's legitimate price-stop result without loading
+        # operational code: that version had no H4 table/writer.
+        closed = h.base.NOW+10
+        self.sql("UPDATE manual_trade_v1 SET state='CLOSED', close_reason='STOP', closed_ms=?, last_quote_ms=?", (closed, closed))
+        self.sql('UPDATE manual_trade_clock_v1 SET clock=?', (closed,))
+        with closing(sqlite3.connect(self.path)) as db:
+            route = db.execute('SELECT route FROM manual_trade_v1').fetchone()[0]
+        self.sql("INSERT INTO manual_trade_event_v1 VALUES (?, 'STOP', ?, 'synthetic historic stop', 'CONFIRMED', ?)", (ref, route, closed))
+        out = self.reject('MANUAL_TRACKING_INTEGRITY_REVIEW_REQUIRED')
+        self.assert_h4_subtype(out, 'missing_for_donkey_stop')
+        self.assertTrue(all(v == 0 for k, v in out['manual_integrity'].items()
+                            if k not in {'schema_ok', 'invalid_h4'}), out)
+
+    def test_h4_first_failure_priority_and_aggregate_counts_unchanged(self):
+        self.activate()
+        self.observe_valid_h4()
+        self.sql('UPDATE manual_trade_h4_v2 SET closed_at_ms=?', (0,))
+        self.sql('UPDATE manual_trade_v1 SET active_ms=NULL')
+        out = self.reject()
+        self.assert_h4_subtype(out, 'invalid_cursor_timestamp')
+        self.assertFalse(out['clock_ahead'])
+
+    def test_h4_supplied_count_shape_needs_at_least_two_invalid_occurrences(self):
+        # Seven non-orphan cursors cannot all fit in five eligible trades.
+        for index in range(7):
+            self.send('DONKEY', [h.signal('DONKEY', symbol=f'TEST{index}-USDT', suffix=str(index))])
+        with closing(sqlite3.connect(self.path)) as db, db:
+            refs = [r[0] for r in db.execute('SELECT ref FROM manual_trade_v1 ORDER BY symbol')]
+            for index, ref in enumerate(refs):
+                if index < 5:
+                    state = 'ACTIVE' if index < 2 else 'CLOSED'
+                    db.execute('UPDATE manual_trade_v1 SET state=?, active_ms=?, closed_ms=?, close_reason=? WHERE ref=?',
+                        (state, h.base.NOW+1, None if index < 2 else h.LATER,
+                         None if index < 2 else 'MANUAL_CLOSE', ref))
+                db.execute('INSERT INTO manual_trade_h4_v2 VALUES (?,?)', (ref, h.CLOSED))
+            db.execute('UPDATE manual_trade_control_v1 SET clock=?', (h.LATER,))
+            db.execute('UPDATE manual_trade_clock_v1 SET clock=?', (h.LATER,))
+        out = self.reject('MANUAL_TRACKING_INTEGRITY_REVIEW_REQUIRED')
+        self.assertEqual(out['manual_trades'], {'ACTIVE': 2, 'CLOSED': 3, 'WAITING': 2})
+        self.assertEqual(out['manual_h4'], {'rows': 7, 'active_with_cursor': 2})
+        self.assertEqual(out['manual_integrity']['orphan_h4'], 0)
+        self.assert_h4_subtype(out, 'cursor_for_inactive_trade', 2)
+
 
 if __name__ == '__main__':
     unittest.main()
