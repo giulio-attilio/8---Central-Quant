@@ -28,7 +28,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _BINDING_CONTRACT_PIN = {
     "role": "readiness_binding_contract",
     "path": "trade_registry_closed_identity_conflict_repair_runtime_readiness_binding_contract_v1.py",
-    "sha256": "e28a68ede4b33560a0608234fe14e71bf2d99872de4648c4671c75532a0f6841",
+    "sha256": "4b78fafa1b8847086a554ba966906ba15ce6ca295b3d608486abb1b407415ca9",
     "normalized_size_bytes": 16761,
 }
 _REHEARSAL_PHASES = (

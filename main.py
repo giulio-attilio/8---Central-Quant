@@ -68908,6 +68908,7 @@ def _activate_c3_closed_repair_writer_coordination_v1(
     """Explicit pre-runtime entrypoint; never called by normal startup."""
 
     global _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1
+    global C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1
     import trade_registry_closed_identity_conflict_repair_runtime_production_writer_coordination_activation_v1 as activation_v1
 
     result = activation_v1.activate_production_writer_coordination_v1(
@@ -68917,12 +68918,18 @@ def _activate_c3_closed_repair_writer_coordination_v1(
         activation_authority=activation_authority,
         activation_interlock=activation_interlock,
         startup_recovery=startup_recovery,
+        runtime_operation_factory=(
+            _build_c3_closed_identity_repair_runtime_operation_v1
+        ),
         runtime_state=runtime_state,
         clock=clock,
         nonce_source=nonce_source,
         config=config,
     )
-    _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = result.interlocks
+    (
+        _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1,
+        C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1,
+    ) = (result.interlocks, result.runtime_operation)
     return result.snapshot()
 
 

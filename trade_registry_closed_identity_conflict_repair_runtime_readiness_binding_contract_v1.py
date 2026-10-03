@@ -46,8 +46,8 @@ _SOURCE_ATTESTATION_PINS = (
     {
         "role": "live_preflight_owner",
         "path": "main.py",
-        "sha256": "8d2fb71578f4b9dbb2163afd6f53c978930646018dd49fc2599aed8fab5817ae",
-        "normalized_size_bytes": 2997428,
+        "sha256": "20054b25e72d28418697c6854ae0b16b481b1f74a71898a2695dd92a6484df93",
+        "normalized_size_bytes": 2997700,
     },
 )
 

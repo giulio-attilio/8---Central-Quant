@@ -53,6 +53,7 @@ class ProductionWriterCoordinationActivationResultV1:
     interlocks: runtime_seam.C3ClosedRepairRuntimeInterlockBindingV1 = field(
         repr=False
     )
+    runtime_operation: Any = field(repr=False)
     receipt: Mapping[str, Any] = field(repr=False)
 
     def __repr__(self) -> str:
@@ -125,6 +126,7 @@ def activate_production_writer_coordination_v1(
     activation_authority: Any,
     activation_interlock: Any,
     startup_recovery: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    runtime_operation_factory: Callable[..., Any],
     runtime_state: Callable[[], Mapping[str, Any]],
     clock: Callable[[], float],
     nonce_source: Callable[[], str],
@@ -145,7 +147,13 @@ def activate_production_writer_coordination_v1(
         )
     if not all(
         callable(value)
-        for value in (kill_switch, startup_recovery, clock, nonce_source)
+        for value in (
+            kill_switch,
+            startup_recovery,
+            runtime_operation_factory,
+            clock,
+            nonce_source,
+        )
     ):
         raise ProductionWriterCoordinationActivationBlocked(
             "C3_PRODUCTION_WRITER_COORDINATION_DEPENDENCY_REQUIRED"
@@ -211,6 +219,11 @@ def activate_production_writer_coordination_v1(
             raise ProductionWriterCoordinationActivationBlocked(
                 "C3_PRODUCTION_WRITER_COORDINATION_POSTCONDITION_FAILED"
             )
+        runtime_operation = runtime_operation_factory(interlocks=interlocks)
+        if runtime_operation is None:
+            raise ProductionWriterCoordinationActivationBlocked(
+                "C3_PRODUCTION_WRITER_COORDINATION_RUNTIME_BINDING_REQUIRED"
+            )
     except Exception as exc:
         try:
             dormant = (
@@ -265,6 +278,7 @@ def activate_production_writer_coordination_v1(
     }
     return ProductionWriterCoordinationActivationResultV1(
         interlocks=interlocks,
+        runtime_operation=runtime_operation,
         receipt=receipt,
     )
 

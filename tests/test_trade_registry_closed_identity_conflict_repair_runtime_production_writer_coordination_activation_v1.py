@@ -160,6 +160,9 @@ def _inputs(tmp_path: Path) -> dict:
         "activation_authority": object(),
         "activation_interlock": object(),
         "startup_recovery": _startup_recovery,
+        "runtime_operation_factory": (
+            lambda *, interlocks: {"bound_interlocks": interlocks}
+        ),
         "runtime_state": _runtime_stopped,
         "clock": lambda: 100.0,
         "nonce_source": lambda: "offline-test-nonce",
@@ -186,6 +189,9 @@ def test_default_off_does_not_create_storage(tmp_path: Path) -> None:
             activation_authority=object(),
             activation_interlock=object(),
             startup_recovery=_startup_recovery,
+            runtime_operation_factory=(
+                lambda *, interlocks: {"bound_interlocks": interlocks}
+            ),
             runtime_state=_runtime_stopped,
             clock=lambda: 1.0,
             nonce_source=lambda: "nonce",
@@ -224,6 +230,7 @@ def test_complete_activation_coordinates_exact_19_writers(tmp_path: Path) -> Non
     assert receipt["order_submission_authorized"] is False
     assert receipt["network_accessed"] is False
     assert receipt["no_order_sent"] is True
+    assert result.runtime_operation["bound_interlocks"] is result.interlocks
     assert status["coordination_ready"] is True
     assert status["startup_recovery_verified"] is True
 
@@ -242,6 +249,39 @@ def test_invalid_startup_recovery_rolls_back_to_dormant(tmp_path: Path) -> None:
     assert status["enabled"] is False
     assert status["coordination_ready"] is False
     assert status["runtime_activation_allowed"] is False
+
+
+def test_runtime_operation_binding_failure_rolls_back_to_dormant(
+    tmp_path: Path,
+) -> None:
+    values = _inputs(tmp_path)
+
+    def fail_binding(*, interlocks):
+        assert interlocks.coordination_status()["coordination_ready"] is True
+        raise RuntimeError("synthetic binding failure")
+
+    values["runtime_operation_factory"] = fail_binding
+    with pytest.raises(
+        activation.ProductionWriterCoordinationActivationBlocked,
+        match="C3_PRODUCTION_WRITER_COORDINATION_ACTIVATION_FAILED",
+    ):
+        activation.activate_production_writer_coordination_v1(**values)
+
+    status = seam.c3_closed_repair_writer_coordination_status_v1()
+    assert status["enabled"] is False
+    assert status["coordination_ready"] is False
+    assert status["runtime_activation_allowed"] is False
+
+
+def test_runtime_operation_binding_must_not_be_empty(tmp_path: Path) -> None:
+    values = _inputs(tmp_path)
+    values["runtime_operation_factory"] = lambda *, interlocks: None
+    with pytest.raises(
+        activation.ProductionWriterCoordinationActivationBlocked,
+        match="C3_PRODUCTION_WRITER_COORDINATION_RUNTIME_BINDING_REQUIRED",
+    ):
+        activation.activate_production_writer_coordination_v1(**values)
+    assert seam.c3_closed_repair_writer_coordination_status_v1()["enabled"] is False
 
 
 def test_capabilities_are_identity_pinned_and_not_replaceable() -> None:
@@ -294,6 +334,8 @@ def test_main_exposes_entrypoint_but_never_calls_it_at_startup() -> None:
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
     ]
     assert "activate_production_writer_coordination_v1" in ast.unparse(function)
+    assert "C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1" in ast.unparse(function)
+    assert "result.runtime_operation" in ast.unparse(function)
     assert all(
         "_activate_c3_closed_repair_writer_coordination_v1"
         not in ast.unparse(node)
