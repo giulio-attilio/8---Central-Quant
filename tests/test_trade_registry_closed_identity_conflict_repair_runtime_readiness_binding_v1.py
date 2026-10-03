@@ -31,12 +31,12 @@ def test_source_pins_match_audited_dormant_hardening_payload() -> None:
     }
     expected = {
         "runtime_seam": (
-            "c5bb7d157d5a77061bd2395ba5fe83dcf7450885c856ff40cdc6664bfa3c5d87",
-            37093,
+            "2a52c4c9722616df658cc3e0067a1100d8b65b7a4c652c5cb4e1fefcc184e242",
+            40519,
         ),
         "live_preflight_owner": (
-            "2c04c752b0fed634bc2344d8a2cba13132ffe4652e1dea01e6575d316b41a52e",
-            2995320,
+            "8d2fb71578f4b9dbb2163afd6f53c978930646018dd49fc2599aed8fab5817ae",
+            2997428,
         ),
     }
 

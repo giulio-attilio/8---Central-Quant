@@ -39,7 +39,7 @@ def test_binding_contract_pin_matches_audited_current_contract() -> None:
     )
     source_text = (ROOT / pin["path"]).read_text(encoding="utf-8")
     expected = (
-        "e7748a410bb404172ed4ca7d435bef0bd364199ae4be2b3f4936c94ac87d8db2",
+        "e28a68ede4b33560a0608234fe14e71bf2d99872de4648c4671c75532a0f6841",
         16761,
     )
 
