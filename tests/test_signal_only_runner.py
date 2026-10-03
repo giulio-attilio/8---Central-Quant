@@ -266,7 +266,8 @@ class RunnerTests(unittest.TestCase):
             halted = Path(str(path) + '.halted')
             self.assertTrue(runner.resume_reviewed_halt(path, runner.THIRD_REVIEWED_HALT_ID))
             halted.write_bytes(runner.REVIEWED_HALT_BYTES)
-            for consumed in runner.REVIEWED_HALT_IDS:
+            for consumed in (runner.REVIEWED_HALT_ID, runner.SECOND_REVIEWED_HALT_ID,
+                             runner.THIRD_REVIEWED_HALT_ID):
                 with self.subTest(consumed=consumed), \
                      patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
                      patch.object(runner, 'run_service') as run:

@@ -26,12 +26,17 @@ from telegram_signal_delivery import initialize_ledger, ROUTES, verify_routes_on
 REVIEWED_HALT_ID = '20260930-205047'
 SECOND_REVIEWED_HALT_ID = '20260930-222218'
 THIRD_REVIEWED_HALT_ID = '20261001-110546'
+FOURTH_REVIEWED_HALT_ID = '20261002-070002'
 # Incident IDs are derived from the reviewed failure timestamps. Each later
 # review is valid only when every earlier durable receipt is intact.
 REVIEWED_HALT_REVIEWS = {
     REVIEWED_HALT_ID: (),
     SECOND_REVIEWED_HALT_ID: (REVIEWED_HALT_ID,),
     THIRD_REVIEWED_HALT_ID: (REVIEWED_HALT_ID, SECOND_REVIEWED_HALT_ID),
+    # Operator-reviewed FRAME_EXPIRED / tracking_observe incident. The causal
+    # fix is c22950e; the complete production ledger review followed b696651.
+    FOURTH_REVIEWED_HALT_ID: (REVIEWED_HALT_ID, SECOND_REVIEWED_HALT_ID,
+                            THIRD_REVIEWED_HALT_ID),
 }
 REVIEWED_HALT_IDS = tuple(REVIEWED_HALT_REVIEWS)
 REVIEWED_HALT_BYTES = b'MANUAL_REVIEW_REQUIRED\n'
@@ -114,6 +119,69 @@ def inspect_halted_ledger(path):
         return dict(report, reason='LEDGER_INSPECTION_FAILED_REDACTED')
 
 
+def frame_expired_review_is_valid(audit):
+    """Require the current full RO audit, not a transient delivery/trade count.
+
+    Called only for the fourth human-reviewed incident. Historical approvals
+    retain their frozen criteria. Legacy H4 classification is produced by the
+    factual rollout rule in inspect_manual_tracking, never inferred here.
+    """
+    if (type(audit) is not dict or audit.get('status') != 'HALTED_LEDGER_REVIEW'
+            or audit.get('reason') != 'READ_ONLY_NO_RECOVERY'
+            or audit.get('review_complete') is not True or audit.get('clock_ahead') is not False
+            or audit.get('delivery_allowed') is not False or audit.get('live_allowed') is not False):
+        return False
+
+    def counts(value, allowed, *, exact=False):
+        return (type(value) is dict and (set(value) == allowed if exact else set(value) <= allowed)
+                and all(type(n) is int and n >= 0 for n in value.values()))
+
+    manual = audit.get('manual_integrity')
+    zero_keys = set(('orphan_participants orphan_h4 orphan_events orphan_pending_inputs '
+        'invalid_states invalid_participants incompatible_active invalid_h4 invalid_tp50 '
+        'invalid_close invalid_events invalid_controls invalid_trades invalid_prices '
+        'invalid_timestamps invalid_clocks ambiguous_notices').split())
+    if (type(manual) is not dict or set(manual) != zero_keys | {'schema_ok', 'clock_ahead'}
+            or manual['schema_ok'] is not True or manual['clock_ahead'] is not False
+            or any(type(manual[k]) is not int or manual[k] != 0 for k in zero_keys)):
+        return False
+    h4 = audit.get('manual_h4_integrity')
+    h4_zero = set(('duplicate_ref cursor_for_falcon cursor_for_inactive_trade '
+        'invalid_cursor_timestamp cursor_off_h4_grid invalid_activation_timestamp '
+        'cursor_not_after_activation cursor_ahead_observation_clock invalid_closed_timestamp '
+        'cursor_after_close missing_for_donkey_stop indeterminate_stop_without_h4_cursor').split())
+    if (not counts(h4, h4_zero | {'legacy_stop_without_h4_cursor'}, exact=True)
+            or any(h4[k] != 0 for k in h4_zero)):
+        return False
+    buckets = {
+        'delivery': {'CONFIRMED', 'REJECTED', 'EXPIRED'},
+        'routes': {'CONFIRMED'},
+        'references': {'WAITING', 'ACTIVE', 'RUNNER', 'EXPIRED', 'CLOSED'},
+        'notices': {'PENDING', 'CONFIRMED'},
+        'manual_trades': {'WAITING', 'ACTIVE', 'EXPIRED', 'CLOSED'},
+        'manual_notices': {'PENDING', 'CONFIRMED'},
+        'manual_closes': {'STOP', 'MANUAL_CLOSE', 'EXPIRED'},
+    }
+    if (any(not counts(audit.get(k), allowed) for k, allowed in buckets.items())
+            or audit.get('routes') != {'CONFIRMED': len(ROUTES)}):
+        return False
+    summaries = {'manual_participants': {'rows'}, 'manual_h4': {'rows', 'active_with_cursor'},
+        'manual_pending_inputs': {'count'}, 'manual_tp50': {'reached'},
+        'manual_protection': {'positive_stops'}}
+    if any(not counts(audit.get(k), fields, exact=True) for k, fields in summaries.items()):
+        return False
+    trades, closes = audit['manual_trades'], audit['manual_closes']
+    active, closed = trades.get('ACTIVE', 0), trades.get('CLOSED', 0)
+    return (audit['manual_protection']['positive_stops'] == sum(trades.values())
+            and audit['manual_participants']['rows'] >= sum(trades.values())
+            and audit['manual_pending_inputs']['count'] <= active
+            and audit['manual_tp50']['reached'] <= active + closed
+            and audit['manual_h4']['active_with_cursor'] <= min(active, audit['manual_h4']['rows'])
+            and closes.get('STOP', 0) + closes.get('MANUAL_CLOSE', 0) == closed
+            and closes.get('EXPIRED', 0) == trades.get('EXPIRED', 0)
+            and h4['legacy_stop_without_h4_cursor'] <= closes.get('STOP', 0))
+
+
 def resume_reviewed_halt(path, review):
     """One human-approved incident only; archive the latch, never edit the DB.
 
@@ -137,10 +205,14 @@ def resume_reviewed_halt(path, review):
             if halted.read_bytes() != REVIEWED_HALT_BYTES:
                 return False
             audit = inspect_halted_ledger(path)
-            if not (audit.get('review_complete') is True and audit.get('clock_ahead') is False
+            if review == FOURTH_REVIEWED_HALT_ID:
+                approved = frame_expired_review_is_valid(audit)
+            else:
+                approved = (audit.get('review_complete') is True and audit.get('clock_ahead') is False
                     and audit.get('delivery') == {'CONFIRMED': 85}
                     and audit.get('routes') == {'CONFIRMED': 2}
-                    and audit.get('references') == {} and audit.get('notices') == {}):
+                    and audit.get('references') == {} and audit.get('notices') == {})
+            if not approved:
                 return False
             # Exclusive archive is the durable one-use receipt. Never overwrite it.
             with archive.open('xb') as handle:
