@@ -62,10 +62,10 @@ _SEAM_DETAILS = (
     (11164, "(found_payload, selected_payload, outcome)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
     (11740, "(commit=False, include_trades=True, source='manual')", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
     (14821, "(removed)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (49469, "(commit=False, ack=None, include_samples=True, use_cache=False)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (49922, "(commit=False, ack=None, include_samples=True, track_state=True)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
-    (67797, "(commit=False, ack=None, automatic=False, include_samples=True)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
-    (50714, "(force=False, _lock_held=False)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
+    (49475, "(commit=False, ack=None, include_samples=True, use_cache=False)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
+    (49928, "(commit=False, ack=None, include_samples=True, track_state=True)", "MAIN_COMMIT_BRANCH_FULL_RMW_RELOAD", True),
+    (67821, "(commit=False, ack=None, automatic=False, include_samples=True)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
+    (50720, "(force=False, _lock_held=False)", "MAIN_EXISTING_SCOPE_COORDINATOR_UPGRADE", True),
 )
 
 _BY_NAME_IMPORT_CONSUMERS = (
