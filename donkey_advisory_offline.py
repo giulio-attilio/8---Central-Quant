@@ -26,6 +26,51 @@ NUMBERS = {"SUPERTREND_FACTOR", "ADX_MIN", "SPIKE_RANGE_ATR_MULT", "SPIKE_BODY_A
 BOOLS = {"ENABLE_SPIKE_FILTER", "USE_MAX_RISK_FILTER"}
 
 
+def _h4_core_function(nodes):
+    """Project H4 predicates from the hash-pinned detectors, never duplicate them.
+
+    D1, spike/data quality, risk and cooldown remain current-candidate gates.
+    Only Original's daily conjunct is excluded from the transition predicate.
+    This extends the existing AST compilation; the detectors stay untouched.
+    """
+    detectors = {node.name: node for node in nodes}
+    fields = {"close", "ema20", "ema50", "macd"}
+    core = ast.parse('def strategy_core_h4_side(candle, setup):\n    return None').body[0]
+    core.body = [node for node in detectors[SETUPS["DONKEY"]].body
+                 if isinstance(node, ast.Assign) and len(node.targets) == 1
+                 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in fields]
+    _require(len(core.body) == len(fields), "SOURCE_CORE_FIELDS")
+    for setup, name in SETUPS.items():
+        detector = detectors[name]
+        if setup == "DONKEY_ORIGINAL":
+            predicates = [node.value for node in detector.body if isinstance(node, ast.Assign)
+                          and isinstance(node.targets[0], ast.Name)
+                          and node.targets[0].id in {"original_long", "original_short"}]
+            _require(len(predicates) == 2, "SOURCE_CORE_PREDICATES")
+            projected = []
+            for predicate in predicates:
+                _require(isinstance(predicate, ast.BoolOp) and isinstance(predicate.op, ast.And)
+                         and len(predicate.values) == 5, "SOURCE_CORE_PREDICATES")
+                daily_names = {n.id for n in ast.walk(predicate.values[-1]) if isinstance(n, ast.Name)}
+                _require(daily_names == {"close_d1", "ema20_d1"}, "SOURCE_CORE_DAILY_FILTER")
+                projected.append(ast.BoolOp(op=ast.And(), values=predicate.values[:-1]))
+            predicates = projected
+        else:
+            predicates = [node.test for node in detector.body if isinstance(node, ast.If)
+                          and len(node.body) == 1 and isinstance(node.body[0], ast.Assign)
+                          and isinstance(node.body[0].targets[0], ast.Name)
+                          and node.body[0].targets[0].id == "signal"]
+        _require(len(predicates) == 2 and all(
+            {n.id for n in ast.walk(p) if isinstance(n, ast.Name)} <= fields for p in predicates),
+            "SOURCE_CORE_PREDICATES")
+        branch = ast.parse(f'if setup == "{setup}":\n    pass').body[0]
+        branch.body = [ast.If(test=p, body=[ast.Return(value=ast.Constant(value=side))], orelse=[])
+                       for p, side in zip(predicates, ("LONG", "SHORT"))]
+        core.body.append(branch)
+    core.body.append(ast.Return(value=ast.Constant(value=None)))
+    return core
+
+
 def reviewed_analysis(source):
     _require(type(source) is str and len(source) < 2000000, "SOURCE_SIZE")
     nodes = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef) and n.name in FUNCTIONS]
@@ -33,7 +78,8 @@ def reviewed_analysis(source):
     selected = ast.Module(body=nodes, type_ignores=[])
     _require(hashlib.sha256(ast.dump(selected, include_attributes=False).encode()).hexdigest() == SOURCE_DIGEST,
              "SOURCE_CHANGED_REVIEW_REQUIRED")
-    return compile(selected, "<reviewed-donkey-only>", "exec")
+    selected.body.append(_h4_core_function(nodes))
+    return compile(ast.fix_missing_locations(selected), "<reviewed-donkey-only>", "exec")
 
 
 def validate_config(config):
@@ -52,6 +98,8 @@ def analyze(source, snapshot, config, policy, *, setup, now_ms, public_data_auth
 Legacy position/exit cooldown checks are excluded from entry-only analysis;
 entry cooldown writes stay in local memory. No trade registry is touched.
 Public previews never authorize delivery or establish parity with position management.
+Only a directional H4 core false->true on the latest closed candle is a new
+candidate. Operational gates cannot rearm a persistent core; there is no backlog.
 """
     base = dict(status="REJECTED", reason=None, message=None, live_allowed=False,
                 delivery_allowed=False, source_qualified=False, manual_trade_authorized=False)
@@ -107,9 +155,18 @@ Public previews never authorize delivery or establish parity with position manag
         for tf, rows in frames.items():
             enriched = ns["preparar_df"](pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"]))
             _require(all(_number(float(enriched.iloc[-2][k])) for k in ("ema20", "ema50", "macd", "atr14")), "INDICATORS_UNDEFINED")
+            if tf == "4h":
+                previous, current = enriched.iloc[-3], enriched.iloc[-2]
+                _require(all(_number(float(candle[k])) for candle in (previous, current)
+                             for k in ("close", "ema20", "ema50", "macd")), "INDICATORS_UNDEFINED")
+                previous_side = ns["strategy_core_h4_side"](previous, setup)
+                current_side = ns["strategy_core_h4_side"](current, setup)
+        if current_side is None or previous_side == current_side:
+            return dict(base, status="NO_SIGNAL")
         raw = ns[SETUPS[setup]](snapshot["symbol"])
         if raw is None:
             return dict(base, status="NO_SIGNAL")
+        _require(raw["side"] == current_side, "STRATEGY_CORE_MISMATCH")
         price = quote["price"]
         _require(min(raw["sl"], raw["tp50"]) < price < max(raw["sl"], raw["tp50"]), "LEVEL_ALREADY_CROSSED")
         _require(abs(price - raw["entry"]) / raw["entry"] <= policy["max_entry_deviation_fraction"], "ENTRY_DEVIATION")

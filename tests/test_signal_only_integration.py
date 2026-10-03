@@ -35,7 +35,7 @@ VALUES = dict(FALCON_TOKEN="1:" + "A" * 30, FALCON_CHAT_ID="101",
               CENTRAL_TELEGRAM_BOT_TOKEN="3:" + "C" * 30, CENTRAL_TELEGRAM_CHAT_ID="303")
 
 
-def donkey_fixture(side="LONG"):
+def donkey_fixture(side="LONG", *, edge=True):
     now = 1767657600000 + 1000  # Fixture time, not system clock.
     frames = {}
     for tf, duration in donkey.PERIODS.items():
@@ -45,6 +45,12 @@ def donkey_fixture(side="LONG"):
             price = 100 + i * 0.1 if side == "LONG" else 150 - i * 0.1
             rows.append([forming - (199-i)*duration, price, price+0.5, price-0.5, price, 100.])
         frames[tf] = rows
+    if edge:
+        # Fresh H4 edge, rather than the formerly accepted persistent trend.
+        # D1 remains a persistent permission filter; no daily crossing is needed.
+        row = frames["4h"][-3]
+        price = row[4] + (-3 if side == "LONG" else 3)
+        row[1:5] = [price, price+0.5, price-0.5, price]
     return dict(synthetic=True, connected=True, symbol="TESTUSDT", observed_at_ms=now,
                 frames=frames, quote=dict(price=frames["4h"][-2][4], at_ms=now)), now
 
@@ -275,6 +281,8 @@ class DonkeyTests(unittest.TestCase):
             for i, row in enumerate(snap["frames"]["4h"]):
                 if i >= 189:
                     price = 130.5 + (i-189)*0.6
+                    if i == 197:
+                        price -= 4  # Lose H4 qualification before the fresh edge.
                     row[1:5] = [price, price+0.5, price-0.5, price]
                 if side == "SHORT":
                     op, high, low, close = row[1:5]
