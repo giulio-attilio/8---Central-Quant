@@ -75,6 +75,7 @@ def inspect_halted_ledger(path):
                   delivery_allowed=False, live_allowed=False)
     try:
         with closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as db:
+            db.execute('PRAGMA query_only=ON')
             db.execute('BEGIN')
             if db.execute('PRAGMA quick_check').fetchone() != ('ok',):
                 return dict(report, reason='LEDGER_INTEGRITY')
@@ -92,7 +93,22 @@ def inspect_halted_ledger(path):
             now = time.time_ns() // 1000000
             clocks = [r[0] for r in db.execute('SELECT now_ms FROM delivery_clock_v1')]
             clocks += [r[0] for r in db.execute('SELECT clock FROM donkey_reference_control_v1')]
-            report['clock_ahead'] = any(type(c) is not int or c > now for c in clocks)
+            clocks += [r[0] for r in db.execute('SELECT attempted_ms FROM delivery_v1')]
+            clocks += [value for r in db.execute(
+                'SELECT active_ms, tp_ms, last_quote, last_h4 FROM donkey_reference_v1')
+                for value in r if value is not None]
+            report['clock_ahead'] = any(type(c) is not int or c < 0 or c > now for c in clocks)
+            from manual_signal_tracking import inspect_manual_tracking
+            manual, manual_reason = inspect_manual_tracking(db, now_ms=now)
+            report.update(manual)
+            report['clock_ahead'] = (report['clock_ahead'] or
+                manual['manual_integrity'].get('clock_ahead', False))
+            if manual_reason:
+                return dict(report, reason=manual_reason)
+            if report['clock_ahead']:
+                return dict(report, reason='LEDGER_CLOCK_REVIEW_REQUIRED')
+            if any(report[name].get('UNKNOWN', 0) for name in ('delivery', 'routes', 'notices')):
+                return dict(report, reason='LEDGER_STATE_REVIEW_REQUIRED')
         return dict(report, review_complete=True, reason='READ_ONLY_NO_RECOVERY')
     except Exception:
         return dict(report, reason='LEDGER_INSPECTION_FAILED_REDACTED')

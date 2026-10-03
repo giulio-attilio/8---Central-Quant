@@ -25,9 +25,11 @@ class RunnerTests(unittest.TestCase):
 
     def reviewed_fixture(self, directory):
         import donkey_signal_tracking as tracking
+        import manual_signal_tracking as manual_tracking
         path = Path(directory) / 'reviewed.sqlite'
         runner.provision_ledger(path)
         tracking.provision(path)
+        manual_tracking.provision(path)
         with contextlib.closing(runner.sqlite3.connect(path)) as db, db:
             db.executemany("INSERT INTO delivery_v1 VALUES (?, ?, 'test-route', 'CONFIRMED', 1, 1)",
                            [(str(i), str(i)) for i in range(85)])
@@ -344,7 +346,7 @@ class RunnerTests(unittest.TestCase):
                  patch.object(runner, 'run_service') as run, contextlib.redirect_stdout(io.StringIO()) as output:
                 result = runner.execute({}, {}, path, authorized=True)
             report = json.loads(output.getvalue())
-            self.assertTrue(report['review_complete'])
+            self.assertFalse(report['review_complete'])
             self.assertEqual(report['delivery'], {'UNKNOWN': 1})
             self.assertEqual(report['references'], {'ACTIVE': 1})
             self.assertNotIn('private-', output.getvalue())

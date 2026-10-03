@@ -20,6 +20,20 @@ from zoneinfo import ZoneInfo
 from donkey_signal_tracking import TrackingPollTransientError, _poll_transport_call
 
 
+MANUAL_TRACKING_COLUMNS = {
+    "manual_trade_v1": (
+        "ref", "group_identity", "route", "family", "setups", "symbol", "side",
+        "entry", "stop", "tp50", "expires_ms", "state", "created_ms", "active_ms",
+        "tp_ms", "last_quote_ms", "closed_ms", "close_reason",
+    ),
+    "manual_trade_h4_v2": ("ref", "closed_at_ms"),
+    "manual_trade_candidate_v1": ("ref", "identity", "setup"),
+    "manual_trade_event_v1": ("ref", "kind", "route", "text", "status", "created_ms"),
+    "manual_trade_control_v1": ("route", "chat", "operator", "offset", "clock", "pending_ref"),
+    "manual_trade_clock_v1": ("id", "clock"),
+}
+
+
 def connect(path):
     db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
     db.row_factory = sqlite3.Row
@@ -41,18 +55,6 @@ def provision(path):
 
 def _provision_in_transaction(db):
     """Create and verify only additive v1 objects under the caller's transaction."""
-    expected = {
-        "manual_trade_v1": (
-            "ref", "group_identity", "route", "family", "setups", "symbol", "side",
-            "entry", "stop", "tp50", "expires_ms", "state", "created_ms", "active_ms",
-            "tp_ms", "last_quote_ms", "closed_ms", "close_reason",
-        ),
-        "manual_trade_h4_v2": ("ref", "closed_at_ms"),
-        "manual_trade_candidate_v1": ("ref", "identity", "setup"),
-        "manual_trade_event_v1": ("ref", "kind", "route", "text", "status", "created_ms"),
-        "manual_trade_control_v1": ("route", "chat", "operator", "offset", "clock", "pending_ref"),
-        "manual_trade_clock_v1": ("id", "clock"),
-    }
     db.execute("SELECT identity FROM delivery_v1 LIMIT 0")
     db.execute("""CREATE TABLE IF NOT EXISTS manual_trade_v1 (
         ref TEXT PRIMARY KEY, group_identity TEXT UNIQUE NOT NULL,
@@ -78,10 +80,233 @@ def _provision_in_transaction(db):
         ref TEXT PRIMARY KEY, closed_at_ms INTEGER NOT NULL,
         FOREIGN KEY(ref) REFERENCES manual_trade_v1(ref))""")
     db.execute("INSERT OR IGNORE INTO manual_trade_clock_v1 VALUES (1, 0)")
-    for table, columns in expected.items():
+    for table, columns in MANUAL_TRACKING_COLUMNS.items():
         actual = tuple(row[1] for row in db.execute(f"PRAGMA table_info({table})"))
         if actual != columns:
             raise sqlite3.DatabaseError("MANUAL_TRACKING_SCHEMA_MISMATCH")
+
+
+def inspect_manual_tracking(db, *, now_ms):
+    """Read one existing SQLite snapshot; return counts and fixed reasons only.
+
+    The caller owns the read-only connection/transaction and quick_check.
+    Never provisions, repairs, emits notices, reads credentials or changes state.
+    Expiry deadlines may be future; observation/event clocks may not.
+    """
+    out = {"manual_integrity": {"schema_ok": False}}
+    for table, columns in MANUAL_TRACKING_COLUMNS.items():
+        kind = db.execute("SELECT type FROM sqlite_master WHERE name=?", (table,)).fetchone()
+        if (kind is None or kind[0] != "table"
+                or tuple(r[1] for r in db.execute(f"PRAGMA table_info({table})")) != columns):
+            return out, "MANUAL_TRACKING_SCHEMA_REVIEW_REQUIRED"
+    integrity = out["manual_integrity"] = dict(
+        schema_ok=True, orphan_participants=0, orphan_h4=0, orphan_events=0,
+        orphan_pending_inputs=0, invalid_states=0, invalid_participants=0,
+        incompatible_active=0, invalid_h4=0, invalid_tp50=0, invalid_close=0,
+        invalid_events=0, invalid_controls=0, invalid_trades=0, invalid_prices=0,
+        invalid_timestamps=0, invalid_clocks=0, clock_ahead=False,
+        ambiguous_notices=0,
+    )
+
+    def rows(table, columns=None):
+        columns = columns or MANUAL_TRACKING_COLUMNS[table]
+        return [dict(zip(columns, row)) for row in db.execute(
+            f"SELECT {', '.join(columns)} FROM {table}")]
+
+    def stamp(value, *, zero=False):
+        if type(value) is not int or value < (0 if zero else 1):
+            return False
+        if value > now_ms:
+            integrity["clock_ahead"] = True
+            return False
+        return True
+
+    trades = rows("manual_trade_v1")
+    participants = rows("manual_trade_candidate_v1")
+    cursors = rows("manual_trade_h4_v2")
+    # Do not load message bodies or expose route/chat/operator/ref/identity values.
+    events = rows("manual_trade_event_v1", ("ref", "kind", "route", "status", "created_ms"))
+    controls = rows("manual_trade_control_v1")
+    clocks = rows("manual_trade_clock_v1")
+    by_ref = {t["ref"]: t for t in trades}
+    by_route = {c["route"]: c for c in controls}
+    delivery = {r[0]: r[1:] for r in db.execute(
+        "SELECT identity, route, status, attempted_ms, message_id FROM delivery_v1")}
+    states = {"WAITING", "ACTIVE", "EXPIRED", "CLOSED"}
+    statuses = {"PENDING", "UNKNOWN", "CONFIRMED"}
+    out["manual_trades"] = {s: sum(t["state"] == s for t in trades) for s in sorted(states)
+                            if any(t["state"] == s for t in trades)}
+    out["manual_participants"] = dict(rows=len(participants))
+    out["manual_h4"] = dict(rows=len(cursors), active_with_cursor=sum(
+        h["ref"] in by_ref and by_ref[h["ref"]]["state"] == "ACTIVE" for h in cursors))
+    out["manual_pending_inputs"] = dict(count=sum(c["pending_ref"] is not None for c in controls))
+    out["manual_notices"] = {s: sum(e["status"] == s for e in events) for s in sorted(statuses)
+                             if any(e["status"] == s for e in events)}
+    out["manual_tp50"] = dict(reached=sum(t["tp_ms"] is not None for t in trades))
+    out["manual_closes"] = {s: sum(t["close_reason"] == s for t in trades)
+                            for s in ("STOP", "MANUAL_CLOSE", "EXPIRED")
+                            if any(t["close_reason"] == s for t in trades)}
+    out["manual_protection"] = dict(positive_stops=sum(
+        type(t["stop"]) in (int, float) and math.isfinite(t["stop"]) and t["stop"] > 0
+        for t in trades))
+    integrity["invalid_trades"] += len(trades) - len(by_ref)
+    integrity["invalid_controls"] += len(controls) - len(by_route)
+    integrity["invalid_participants"] += len(participants) - len({p["identity"] for p in participants})
+    if len(clocks) != 1 or clocks[0]["id"] != 1 or not stamp(clocks[0]["clock"], zero=True):
+        integrity["invalid_clocks"] += 1
+    observation_clock = clocks[0]["clock"] if len(clocks) == 1 and type(clocks[0]["clock"]) is int else -1
+    part_by_ref, event_by_ref, h4_by_ref = {}, {}, {}
+    for p in participants:
+        part_by_ref.setdefault(p["ref"], []).append(p)
+        if p["ref"] not in by_ref:
+            integrity["orphan_participants"] += 1
+    for e in events:
+        event_by_ref.setdefault(e["ref"], []).append(e)
+        if e["ref"] not in by_ref:
+            integrity["orphan_events"] += 1
+        if e["status"] not in statuses or e["kind"] not in {"TP50", "STOP"}:
+            integrity["invalid_states"] += 1
+        if e["status"] == "UNKNOWN":
+            integrity["ambiguous_notices"] += 1
+        if not stamp(e["created_ms"]):
+            integrity["invalid_timestamps"] += 1
+    for h in cursors:
+        if h["ref"] in h4_by_ref:
+            integrity["invalid_h4"] += 1
+        h4_by_ref[h["ref"]] = h["closed_at_ms"]
+        t = by_ref.get(h["ref"])
+        if t is None:
+            integrity["orphan_h4"] += 1
+        elif (t["family"] == "FALCON" or t["state"] not in {"ACTIVE", "CLOSED"}
+              or not stamp(h["closed_at_ms"]) or h["closed_at_ms"] % 14400000 != 0
+              or type(t["active_ms"]) is not int or h["closed_at_ms"] <= t["active_ms"]
+              or h["closed_at_ms"] > observation_clock
+              or (t["closed_ms"] is not None and
+                  (type(t["closed_ms"]) is not int or h["closed_at_ms"] > t["closed_ms"]))):
+            integrity["invalid_h4"] += 1
+    for c in controls:
+        if not stamp(c["clock"], zero=True):
+            integrity["invalid_clocks"] += 1
+        if (type(c["route"]) is not str or not c["route"] or type(c["chat"]) is not str
+                or re.fullmatch(r"-?[0-9]+", c["chat"]) is None
+                or type(c["operator"]) is not int or c["operator"] <= 0
+                or type(c["offset"]) is not int or c["offset"] < 0):
+            integrity["invalid_controls"] += 1
+        if c["pending_ref"] is not None:
+            t = by_ref.get(c["pending_ref"])
+            if t is None:
+                integrity["orphan_pending_inputs"] += 1
+            elif t["state"] != "ACTIVE" or t["route"] != c["route"]:
+                integrity["invalid_controls"] += 1
+    active_keys = set()
+    for t in trades:
+        state = t["state"]
+        if state not in states:
+            integrity["invalid_states"] += 1
+        if (type(t["ref"]) is not str or re.fullmatch(r"[a-f0-9]{32}", t["ref"]) is None
+                or type(t["group_identity"]) is not str or t["ref"] != t["group_identity"][:32]
+                or type(t["route"]) is not str or not t["route"]
+                or type(t["symbol"]) is not str or re.fullmatch(r"[A-Z0-9]{2,25}-USDT", t["symbol"]) is None
+                or t["side"] not in {"LONG", "SHORT"}):
+            integrity["invalid_trades"] += 1
+        price_ok = all(type(t[k]) in (int, float) and math.isfinite(t[k]) and t[k] > 0
+                       for k in ("entry", "stop", "tp50"))
+        if not price_ok or not (t["tp50"] > t["entry"] if t["side"] == "LONG" else t["tp50"] < t["entry"]):
+            integrity["invalid_prices"] += 1
+        for field in ("created_ms", "active_ms", "tp_ms", "last_quote_ms", "closed_ms"):
+            if (field == "created_ms" or t[field] is not None) and not stamp(t[field]):
+                integrity["invalid_timestamps"] += 1
+        if (type(t["expires_ms"]) is not int or type(t["created_ms"]) is not int
+                or t["expires_ms"] <= t["created_ms"]):
+            integrity["invalid_timestamps"] += 1
+        active = t["active_ms"]
+        if state in {"ACTIVE", "CLOSED"}:
+            if (not stamp(active) or type(t["created_ms"]) is not int or active < t["created_ms"]
+                    or type(t["expires_ms"]) is not int or active >= t["expires_ms"]
+                    or t["route"] not in by_route or type(by_route[t["route"]]["clock"]) is not int
+                    or active > by_route[t["route"]]["clock"]):
+                integrity["invalid_timestamps"] += 1
+        elif any(t[k] is not None for k in ("active_ms", "tp_ms", "last_quote_ms")):
+            integrity["invalid_timestamps"] += 1
+        if t["last_quote_ms"] is not None and (type(active) is not int
+                or type(t["last_quote_ms"]) is not int or t["last_quote_ms"] < active
+                or t["last_quote_ms"] > observation_clock
+                or (t["closed_ms"] is not None and
+                    (type(t["closed_ms"]) is not int or t["last_quote_ms"] > t["closed_ms"]))):
+            integrity["invalid_timestamps"] += 1
+        close_ok = ((state in {"WAITING", "ACTIVE"} and t["closed_ms"] is None and t["close_reason"] is None)
+                    or (state == "EXPIRED" and t["close_reason"] == "EXPIRED"
+                        and stamp(t["closed_ms"]) and type(t["expires_ms"]) is int and t["closed_ms"] >= t["expires_ms"])
+                    or (state == "CLOSED" and t["close_reason"] in {"STOP", "MANUAL_CLOSE"}
+                        and stamp(t["closed_ms"]) and type(active) is int and t["closed_ms"] >= active))
+        if not close_ok:
+            integrity["invalid_close"] += 1
+        if state == "EXPIRED" or (state == "CLOSED" and t["close_reason"] == "MANUAL_CLOSE"):
+            c = by_route.get(t["route"])
+            if (c is None or type(c["clock"]) is not int or type(t["closed_ms"]) is not int
+                    or t["closed_ms"] > c["clock"]):
+                integrity["invalid_timestamps"] += 1
+        try:
+            setups = json.loads(t["setups"])
+            bot = "FALCON" if t["family"] == "FALCON" else "DONKEY"
+            valid_setups = (type(setups) is list and len(setups) > 0
+                            and all(type(s) is str for s in setups) and len(set(setups)) == len(setups)
+                            and all(family_for(bot, s) for s in setups)
+                            and (bot == "FALCON" or t["family"] in setups))
+        except (ValueError, TypeError):
+            setups, valid_setups = [], False
+        if not valid_setups:
+            setups = []
+        parts = part_by_ref.get(t["ref"], [])
+        ids = [p["identity"] for p in parts]
+        if (not valid_setups or len(parts) != len(setups) or {p["setup"] for p in parts} != set(setups)
+                or any(type(i) is not str or re.fullmatch(r"[a-f0-9]{64}", i) is None for i in ids)):
+            integrity["invalid_participants"] += 1
+        else:
+            group = hashlib.sha256(("manual-trade:" + ":".join(sorted(ids))).encode()).hexdigest()
+            if group != t["group_identity"]:
+                integrity["invalid_participants"] += 1
+            for identity in ids:
+                d = delivery.get(identity)
+                if (d is None or d[0] != t["route"] or d[2] != t["created_ms"]
+                        or (d[1] == "CONFIRMED" and (type(d[3]) is not int or d[3] <= 0))
+                        or (state != "WAITING" and d[1] != "CONFIRMED")):
+                    integrity["invalid_participants"] += 1
+            bound = [delivery[i] for i in ids if i in delivery]
+            if len({d[1] for d in bound}) > 1 or len({d[3] for d in bound}) > 1:
+                integrity["invalid_participants"] += 1
+        if state == "ACTIVE" and valid_setups:
+            for family in (["FALCON"] if bot == "FALCON" else setups):
+                key = (family, t["symbol"], t["side"])
+                if key in active_keys:
+                    integrity["incompatible_active"] += 1
+                active_keys.add(key)
+        trade_events = event_by_ref.get(t["ref"], [])
+        tp_events = [e for e in trade_events if e["kind"] == "TP50"]
+        stop_events = [e for e in trade_events if e["kind"] == "STOP"]
+        if t["tp_ms"] is None:
+            tp_ok = not tp_events
+        else:
+            tp_ok = (state in {"ACTIVE", "CLOSED"} and stamp(t["tp_ms"]) and type(active) is int
+                     and active <= t["tp_ms"] <= observation_clock and t["last_quote_ms"] is not None
+                     and (t["closed_ms"] is None or type(t["closed_ms"]) is int and t["tp_ms"] <= t["closed_ms"])
+                     and len(tp_events) == 1 and tp_events[0]["created_ms"] == t["tp_ms"])
+        if not tp_ok:
+            integrity["invalid_tp50"] += 1
+        if (len(stop_events) != int(state == "CLOSED" and t["close_reason"] == "STOP")
+                or any(e["route"] != t["route"] for e in trade_events)
+                or any(e["created_ms"] != t["closed_ms"] or type(e["created_ms"]) is not int
+                       or e["created_ms"] > observation_clock for e in stop_events)):
+            integrity["invalid_events"] += 1
+        if state == "CLOSED" and t["close_reason"] == "STOP" and t["family"] != "FALCON" and t["ref"] not in h4_by_ref:
+            integrity["invalid_h4"] += 1
+    if integrity["invalid_states"] or integrity["ambiguous_notices"]:
+        return out, "MANUAL_TRACKING_STATE_REVIEW_REQUIRED"
+    if integrity["clock_ahead"] or integrity["invalid_clocks"] or integrity["invalid_timestamps"]:
+        return out, "MANUAL_TRACKING_CLOCK_REVIEW_REQUIRED"
+    if any(value for key, value in integrity.items() if key != "schema_ok"):
+        return out, "MANUAL_TRACKING_INTEGRITY_REVIEW_REQUIRED"
+    return out, None
 
 
 def family_for(bot, setup):
