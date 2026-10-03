@@ -77,6 +77,7 @@ class TrackingTests(unittest.TestCase):
                               ('flush', 'tracking_notice_flush')]:
             with self.subTest(method=method), patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
                  patch.object(sf.service, 'collect_snapshot', return_value=self.snapshot), \
+                 patch.object(sf.service.time, 'time_ns', return_value=self.now * 1000000), \
                  patch.object(sf.service, 'run_once') as evaluate:
                 getattr(factory.return_value, method).side_effect = TimeoutError('private-token')
                 out = sf.service.run_service(sf.config(), dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE),
@@ -106,8 +107,7 @@ class TrackingTests(unittest.TestCase):
              patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='NO_SIGNAL')) as evaluate, \
              patch.object(service.time, 'time_ns', return_value=now * 1000000), \
              patch.object(delivery, '_post') as post, redirect_stdout(io.StringIO()) as output:
-            factory.return_value.observe.side_effect = [
-                ValueError('MANUAL_TRACKING_PUBLIC_QUOTE_REQUIRED'), None]
+            factory.return_value.observe.return_value = None
             out = service.run_service(sf.config(), sources, **args)
         report = json.loads(output.getvalue().splitlines()[0])
         self.assertEqual(out['status'], 'STOPPED', out)
@@ -121,7 +121,7 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(collect.call_count, 2)
         self.assertEqual(evaluate.call_count, 5)
         self.assertEqual(factory.return_value.flush.call_count, 2)
-        self.assertEqual(factory.return_value.observe.call_count, 2)
+        self.assertEqual(factory.return_value.observe.call_count, 1)
         post.assert_not_called()
 
     def test_tracking_storage_failure_remains_fatal(self):
@@ -130,6 +130,7 @@ class TrackingTests(unittest.TestCase):
         sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
         with patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
              patch.object(service, 'collect_snapshot', return_value=self.snapshot), \
+             patch.object(service.time, 'time_ns', return_value=self.now * 1000000), \
              patch.object(service, 'run_once') as evaluate, \
              patch.object(delivery, '_post') as post:
             factory.return_value.observe.side_effect = tracking.sqlite3.OperationalError('private-storage')
@@ -467,9 +468,10 @@ class TrackingTests(unittest.TestCase):
         service = service_fixture.service
         config = service_fixture.config()
         sources = dict(FALCON=fixture.harness.SOURCE, DONKEY=fixture.SOURCE)
-        snap, _ = fixture.PublicPreviewTests().public_fixture('DONKEY')
+        snap, now = fixture.PublicPreviewTests().public_fixture('DONKEY')
         with patch.object(manual_tracking, 'ManualTradeTracker') as factory, \
              patch.object(service, 'collect_snapshot', return_value=snap) as collect, \
+             patch.object(service.time, 'time_ns', return_value=now * 1000000), \
              patch.object(service, 'run_once', return_value=dict(status='BLOCKED', reason='NO_SIGNAL')) as run:
             out = service.run_service(config, sources, values=fixture.VALUES, ledger_path=self.path,
                                       stop_event=threading.Event(), service_authorized=True,

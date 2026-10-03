@@ -21,7 +21,7 @@ from bingx_public_signal_source import collect_snapshot, validate_snapshot, Publ
 from telegram_signal_delivery import _route
 
 
-TRACKING_SNAPSHOT_DISCARD_ERRORS = frozenset({'QUOTE_STALE_OR_FUTURE'})
+TRACKING_SNAPSHOT_DISCARD_ERRORS = frozenset({'FRAME_EXPIRED', 'QUOTE_STALE_OR_FUTURE'})
 
 
 def service_error_code(error):
@@ -357,9 +357,35 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
                             if symbol in active_donkey_symbols:
                                 policies.append(config['bots']['DONKEY']['policy'])
                             quote_age = min(policy['quote_max_age_ms'] for policy in policies)
-                            tracker.observe(snapshot, time.time_ns() // 1000000, quote_age)
+                            observation_now = time.time_ns() // 1000000
+                            _require(last_now is None or observation_now >= last_now, "CLOCK_REGRESSION")
+                            last_now = observation_now
+                            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+                                tracking_clock = db.execute(
+                                    "SELECT clock FROM manual_trade_clock_v1 WHERE id=1").fetchone()
+                                if (tracking_clock is None or type(tracking_clock[0]) is not int
+                                        or observation_now < tracking_clock[0]):
+                                    raise ValueError("MANUAL_TRACKING_CLOCK_REGRESSION")
+                            # Only intake expiry is discardable: both observations below
+                            # can commit state, so their errors must remain fail-closed.
+                            try:
+                                validate_snapshot(snapshot, now_ms=observation_now,
+                                    frame_max_age_ms=min(p['snapshot_max_age_ms'] for p in policies),
+                                    quote_max_age_ms=quote_age)
+                            except PublicDataError as error:
+                                reason = safe_error_code(error)
+                                if type(error) is not PublicDataError or reason not in TRACKING_SNAPSHOT_DISCARD_ERRORS:
+                                    raise
+                                state['discarded_snapshots'] = state.get('discarded_snapshots', 0) + 1
+                                if reason == 'QUOTE_STALE_OR_FUTURE':
+                                    state['tracking_quote_skips'] = state.get('tracking_quote_skips', 0) + 1
+                                print(json.dumps(dict(status='TRACKING_OBSERVATION_SKIPPED',
+                                    reason=reason, discarded_snapshots=state['discarded_snapshots'],
+                                    stage=stage, live_allowed=False)), flush=True)
+                                continue
+                            tracker.observe(snapshot, observation_now, quote_age)
                             donkey_entry = config['bots']['DONKEY']
-                            tracker.observe_h4(snapshot, time.time_ns() // 1000000,
+                            tracker.observe_h4(snapshot, observation_now,
                                 sources['DONKEY'], donkey_entry['analysis'],
                                 frame_max_age_ms=donkey_entry['policy']['snapshot_max_age_ms'],
                                 quote_max_age_ms=donkey_entry['policy']['quote_max_age_ms'])
