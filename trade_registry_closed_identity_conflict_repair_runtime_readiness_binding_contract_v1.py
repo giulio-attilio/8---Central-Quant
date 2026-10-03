@@ -34,8 +34,8 @@ _SOURCE_ATTESTATION_PINS = (
     {
         "role": "runtime_seam",
         "path": "trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py",
-        "sha256": "c5bb7d157d5a77061bd2395ba5fe83dcf7450885c856ff40cdc6664bfa3c5d87",
-        "normalized_size_bytes": 37093,
+        "sha256": "2a52c4c9722616df658cc3e0067a1100d8b65b7a4c652c5cb4e1fefcc184e242",
+        "normalized_size_bytes": 40519,
     },
     {
         "role": "static_preflight",
@@ -46,8 +46,8 @@ _SOURCE_ATTESTATION_PINS = (
     {
         "role": "live_preflight_owner",
         "path": "main.py",
-        "sha256": "2c04c752b0fed634bc2344d8a2cba13132ffe4652e1dea01e6575d316b41a52e",
-        "normalized_size_bytes": 2995320,
+        "sha256": "8d2fb71578f4b9dbb2163afd6f53c978930646018dd49fc2599aed8fab5817ae",
+        "normalized_size_bytes": 2997428,
     },
 )
 

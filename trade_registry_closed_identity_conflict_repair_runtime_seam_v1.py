@@ -1,8 +1,9 @@
 """Dormant runtime seam for C3 Trade Registry writer coordination.
 
-This module deliberately installs only the default-off coordinator.  It does
+This module installs only the default-off coordinator at import time.  It does
 not inspect environment variables, touch the Registry, start workers or make
-network calls.  A future activation requires a separate, explicit patch.
+network calls.  The separate activation composition must be invoked explicitly
+before runtime and satisfy every fail-closed guard below.
 """
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ import trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator
 
 C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1 = (
     "C3_CONTROLLED_RUNTIME_ACTIVATION_EXPLICIT_OFFLINE_REVIEW_V1"
+)
+C3_CONTROLLED_RUNTIME_CAPABILITY_BINDING_SCOPE_ATTESTATION_V1 = (
+    "C3_CONTROLLED_RUNTIME_ACTIVATION_CAPABILITY_BINDING_V1"
 )
 C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_SCOPE_ATTESTATION_V1 = (
     "C3_CLOSED_REPAIR_EXPLICIT_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1"
@@ -49,9 +53,9 @@ _CONTROLLED_ACTIVATION_SOURCE_FILES = frozenset(
 _coordinator = coordinator_module.build_closed_repair_writer_runtime_coordinator_v1()
 _prebootstrap_seam_atomic_lock = threading.RLock()
 _prebootstrap_writer_guard: Callable[[str], Mapping[str, Any]] | None = None
-# Deliberately unbound in production.  A future, separately authorized runtime
+# Deliberately unbound at import time.  A separately authorized pre-runtime
 # composition must pin both exact objects before the controlled installer can
-# be called.  Keeping these sentinels private and unset makes the current seam
+# be called.  Keeping these capabilities private and unset makes normal startup
 # fail closed even when a caller can manufacture self-consistent evidence.
 _controlled_activation_authority_v1: Any | None = None
 _controlled_activation_interlock_v1: Any | None = None
@@ -315,6 +319,83 @@ def install_dormant_c3_closed_repair_writer_coordinator_v1(
         _coordinator = coordinator
         _reset_controlled_activation_state_v1()
         return c3_closed_repair_writer_coordination_status_v1()
+
+
+def bind_controlled_c3_runtime_activation_capabilities_v1(
+    *,
+    enabled: bool = False,
+    scope_attestation: str | None = None,
+    activation_authority: Any = None,
+    activation_interlock: Any = None,
+) -> dict[str, Any]:
+    """Pin the two opaque activation capabilities exactly once, before runtime.
+
+    Binding does not enable the coordinator.  The separately guarded installer
+    still requires complete hash-bound evidence, safe trading controls, a clear
+    kill switch and a quiescent 19-writer coordinator.
+    """
+
+    global _controlled_activation_authority_v1
+    global _controlled_activation_interlock_v1
+    if enabled is not True:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_CAPABILITY_BINDING_DEFAULT_OFF"
+        )
+    if (
+        scope_attestation
+        != C3_CONTROLLED_RUNTIME_CAPABILITY_BINDING_SCOPE_ATTESTATION_V1
+    ):
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_CAPABILITY_BINDING_SCOPE_ATTESTATION_REQUIRED"
+        )
+    if (
+        activation_authority is None
+        or activation_interlock is None
+        or activation_authority is activation_interlock
+    ):
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_CAPABILITY_BINDING_DEPENDENCIES_INVALID"
+        )
+    with _prebootstrap_seam_atomic_lock:
+        if _coordinator.enabled:
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_CONTROLLED_CAPABILITY_BINDING_RUNTIME_ALREADY_ENABLED"
+            )
+        if (
+            _controlled_activation_authority_v1 is not None
+            or _controlled_activation_interlock_v1 is not None
+        ):
+            if (
+                _controlled_activation_authority_v1 is activation_authority
+                and _controlled_activation_interlock_v1 is activation_interlock
+            ):
+                return {
+                    "ok": True,
+                    "status": "C3_CONTROLLED_CAPABILITIES_ALREADY_BOUND",
+                    "capabilities_bound": True,
+                    "coordinator_enabled": False,
+                    "runtime_activation_allowed": False,
+                    "real_registry_accessed": False,
+                    "network_accessed": False,
+                    "broker_called": False,
+                    "no_order_sent": True,
+                }
+            raise coordinator_module.WriterRuntimeCoordinationBlocked(
+                "C3_CONTROLLED_CAPABILITY_BINDING_REPLACEMENT_FORBIDDEN"
+            )
+        _controlled_activation_authority_v1 = activation_authority
+        _controlled_activation_interlock_v1 = activation_interlock
+        return {
+            "ok": True,
+            "status": "C3_CONTROLLED_CAPABILITIES_BOUND",
+            "capabilities_bound": True,
+            "coordinator_enabled": False,
+            "runtime_activation_allowed": False,
+            "real_registry_accessed": False,
+            "network_accessed": False,
+            "broker_called": False,
+            "no_order_sent": True,
+        }
 
 
 def install_controlled_c3_closed_repair_writer_coordinator_v1(
@@ -893,6 +974,7 @@ C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1 = (
 
 
 __all__ = [
+    "C3_CONTROLLED_RUNTIME_CAPABILITY_BINDING_SCOPE_ATTESTATION_V1",
     "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_SCOPE_ATTESTATION_V1",
     "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_VERSION_V1",
     "C3_PREBOOTSTRAP_SEAM_CAS_SURFACE_V1",
@@ -901,6 +983,7 @@ __all__ = [
     "C3PrebootstrapSeamCasSurfaceV1",
     "C3ClosedRepairRuntimeInterlockBindingV1",
     "_c3_closed_repair_writer_mutation_v1",
+    "bind_controlled_c3_runtime_activation_capabilities_v1",
     "bind_c3_closed_repair_runtime_interlocks_v1",
     "build_dormant_c3_prebootstrap_seam_cas_surface_v1",
     "c3_closed_repair_writer_coordination_status_v1",
