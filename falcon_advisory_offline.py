@@ -195,13 +195,31 @@ class OfflineSignalSession:
                              public_data_authorized=public_data_authorized)
             public = snapshot["synthetic"] is False
             counters = {}
+            analysis_closed_at = None
+            count_current = True
 
             def count(key, amount=1):
-                counters[key] = counters.get(key, 0) + amount
+                if count_current:
+                    counters[key] = counters.get(key, 0) + amount
 
             def fetch(symbol, timeframe="15m", limit=None):
                 _require(symbol == snapshot["symbol"] and timeframe in frames, "UNAVAILABLE_FRAME")
                 frame = frames[timeframe]
+                if analysis_closed_at is not None:
+                    # The pinned trend function drops exactly one forming row.
+                    # Slice at the historical forming timestamp BEFORE tail(limit),
+                    # so only candles closed at that M15 close enter indicators.
+                    forming_ts = analysis_closed_at // PERIODS[timeframe] * PERIODS[timeframe]
+                    frame = frame.loc[frame["ts"] <= forming_ts]
+                    _require(len(frame) >= max(80, self.config["EMA_SLOW"] + 5,
+                        self.config["ATR_LEN"], 2 * self.config["ADX_LEN"], 20) + 1
+                        and int(frame.iloc[-1]["ts"]) == forming_ts,
+                        "PREVIOUS_CORE_UNAVAILABLE")
+                    trend_closed = ns["closed_candles"](frame.tail(limit) if limit else frame)
+                    trend_row = ns["add_indicators"](trend_closed).iloc[-1]
+                    _require(all(math.isfinite(float(trend_row[k])) for k in
+                        ("atr", "adx", "volume_rel", "ema20", "ema50")),
+                        "PREVIOUS_CORE_UNAVAILABLE")
                 return (frame.tail(limit) if limit is not None else frame).copy(deep=True)
 
             ns = dict(self.config, pd=pd, np=np, dtime=dtime,
@@ -221,6 +239,29 @@ class OfflineSignalSession:
             signal = ns["analyze_symbol_setup"](snapshot["symbol"], setup,
                                                dict(range_minutes=minutes, label=setup), closed)
             if signal is None:
+                return dict(out, status="NO_SIGNAL", counters=counters)
+            # Both variants use M15; their 15/30-minute ORBs stay independent.
+            # Reuse the unchanged, hash-pinned strategy on the preceding prefix.
+            # No quote/delivery/dedup outcome is part of this comparison, and no
+            # qualification state is persisted: a missed edge has no backlog.
+            previous_closed = closed.iloc[:-1].copy()
+            warmup = max(80, self.config["EMA_SLOW"] + 5, self.config["ATR_LEN"],
+                         2 * self.config["ADX_LEN"], 20)
+            _require(len(previous_closed) >= warmup, "PREVIOUS_CORE_UNAVAILABLE")
+            previous_row = ns["add_indicators"](previous_closed).iloc[-1]
+            _require(all(math.isfinite(float(previous_row[k])) for k in
+                ("atr", "adx", "volume_rel", "ema20", "ema50")),
+                "PREVIOUS_CORE_UNAVAILABLE")
+            analysis_closed_at = int(previous_row["ts"]) + PERIODS["15m"]
+            count_current = False  # Keep the existing current-candle funnel intact.
+            if ns["is_trade_window"](previous_row, minutes):
+                previous_orb = ns["get_orb_range"](previous_closed, minutes)
+                _require(previous_orb is not None and previous_orb["candles"] == minutes // 15,
+                         "PREVIOUS_CORE_UNAVAILABLE")
+            previous_signal = ns["analyze_symbol_setup"](snapshot["symbol"], setup,
+                dict(range_minutes=minutes, label=setup), previous_closed)
+            # Each side has its own boolean: a prior LONG does not suppress SHORT.
+            if previous_signal is not None and previous_signal["side"] == signal["side"]:
                 return dict(out, status="NO_SIGNAL", counters=counters)
             _require("signal_id" in signal, "IDENTITY_UNAVAILABLE")
             signal_id = signal["signal_id"]

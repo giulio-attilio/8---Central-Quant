@@ -181,7 +181,7 @@ def diagnose_public_cycle(config, sources, *, public_data_authorized=False):
         symbols = list(dict.fromkeys(s for entry in config["bots"].values() for s in entry["symbols"]))
         state["planned_symbols"] = len(symbols)
         counts = {}
-        allowed = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
+        allowed = {"NO_SIGNAL", "ORB_INCOMPLETE", "PREVIOUS_CORE_UNAVAILABLE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
                    "EXPIRED", "PUBLIC_DELIVERY_NOT_ENABLED", "DONKEY_STOP_DISTANCE_ABOVE_IDEAL"}
         for symbol in symbols:
             selected = {bot: entry for bot, entry in config["bots"].items() if symbol in entry["symbols"]}
@@ -296,7 +296,7 @@ def run_service(config, sources, *, values, ledger_path, stop_event,
             db.execute("SELECT id, now_ms FROM delivery_clock_v1 LIMIT 0")
             db.execute("SELECT route, until_ms FROM delivery_pause_v1 LIMIT 0")
         symbols = list(dict.fromkeys(s for entry in config["bots"].values() for s in entry["symbols"]))
-        benign = {"NO_SIGNAL", "ORB_INCOMPLETE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
+        benign = {"NO_SIGNAL", "ORB_INCOMPLETE", "PREVIOUS_CORE_UNAVAILABLE", "ENTRY_DEVIATION", "LEVEL_ALREADY_CROSSED",
                   "EXPIRED", "PRIOR_ATTEMPT_NO_RETRY", "EXPIRED_BEFORE_HTTP", "DATA_AGED_DURING_ANALYSIS",
                   "DONKEY_STOP_DISTANCE_ABOVE_IDEAL", "DONKEY_REFERENCE_ALREADY_ACTIVE",
                   "DONKEY_WAIT_NEXT_H4_AFTER_EXIT", "MANUAL_TRADE_SAME_SIDE_ACTIVE"}
