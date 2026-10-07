@@ -115,6 +115,33 @@ def inspect_manual_tracking(db, *, now_ms):
         invalid_timestamps=0, invalid_clocks=0, clock_ahead=False,
         ambiguous_notices=0,
     )
+    timestamp_integrity = out["manual_timestamp_integrity"] = dict.fromkeys((
+        "invalid_event_created_ms", "invalid_trade_created_ms",
+        "invalid_trade_active_ms", "invalid_trade_tp_ms",
+        "invalid_trade_last_quote_ms", "invalid_trade_closed_ms",
+        "invalid_trade_expiry_relation", "invalid_trade_activation_relation",
+        "invalid_trade_inactive_timestamps", "invalid_trade_quote_relation",
+        "invalid_trade_close_control_relation",
+    ), 0)
+    timestamp_diagnostics = out["manual_timestamp_diagnostics"] = []
+
+    def invalid_timestamp(category, row, field, reason):
+        # One call per original increment, including overlapping predicates.
+        integrity["invalid_timestamps"] += 1
+        timestamp_integrity[category] += 1
+        table = "manual_trade_event_v1" if category == "invalid_event_created_ms" else "manual_trade_v1"
+        logical_key = str(row["ref"]) + (":" + str(row["kind"]) if table == "manual_trade_event_v1" else "")
+        row_tag = hashlib.sha256((table + ":" + logical_key).encode()).hexdigest()[:12]
+        # Bounded, sanitized samples; counters always cover the full snapshot.
+        if len(timestamp_diagnostics) < 32:
+            timestamp_diagnostics.append(dict(table=table, field=field, reason=reason,
+                                              row_tag=row_tag, category=category))
+
+    def timestamp_reason(value):
+        if type(value) is not int:
+            return "NON_INTEGER"
+        return "NON_POSITIVE" if value < 1 else "AFTER_AUDIT_NOW"
+
     # First failing predicate per cursor, plus independent duplicate rows and
     # unproven/modern Donkey CLOSED/STOP cursors. Sum excluding the informational
     # legacy counter equals invalid_h4; orphan_h4 remains separate.
@@ -188,7 +215,7 @@ def inspect_manual_tracking(db, *, now_ms):
         if e["status"] == "UNKNOWN":
             integrity["ambiguous_notices"] += 1
         if not stamp(e["created_ms"]):
-            integrity["invalid_timestamps"] += 1
+            invalid_timestamp("invalid_event_created_ms", e, "created_ms", timestamp_reason(e["created_ms"]))
     for h in cursors:
         if h["ref"] in h4_by_ref:
             integrity["invalid_h4"] += 1
@@ -252,25 +279,25 @@ def inspect_manual_tracking(db, *, now_ms):
             integrity["invalid_prices"] += 1
         for field in ("created_ms", "active_ms", "tp_ms", "last_quote_ms", "closed_ms"):
             if (field == "created_ms" or t[field] is not None) and not stamp(t[field]):
-                integrity["invalid_timestamps"] += 1
+                invalid_timestamp("invalid_trade_" + field, t, field, timestamp_reason(t[field]))
         if (type(t["expires_ms"]) is not int or type(t["created_ms"]) is not int
                 or t["expires_ms"] <= t["created_ms"]):
-            integrity["invalid_timestamps"] += 1
+            invalid_timestamp("invalid_trade_expiry_relation", t, "expires_ms,created_ms", "EXPIRY_RELATION_FAILED")
         active = t["active_ms"]
         if state in {"ACTIVE", "CLOSED"}:
             if (not stamp(active) or type(t["created_ms"]) is not int or active < t["created_ms"]
                     or type(t["expires_ms"]) is not int or active >= t["expires_ms"]
                     or t["route"] not in by_route or type(by_route[t["route"]]["clock"]) is not int
                     or active > by_route[t["route"]]["clock"]):
-                integrity["invalid_timestamps"] += 1
+                invalid_timestamp("invalid_trade_activation_relation", t, "active_ms,created_ms,expires_ms,route,clock", "ACTIVATION_RELATION_FAILED")
         elif any(t[k] is not None for k in ("active_ms", "tp_ms", "last_quote_ms")):
-            integrity["invalid_timestamps"] += 1
+            invalid_timestamp("invalid_trade_inactive_timestamps", t, "state,active_ms,tp_ms,last_quote_ms", "INACTIVE_TIMESTAMPS_PRESENT")
         if t["last_quote_ms"] is not None and (type(active) is not int
                 or type(t["last_quote_ms"]) is not int or t["last_quote_ms"] < active
                 or t["last_quote_ms"] > observation_clock
                 or (t["closed_ms"] is not None and
                     (type(t["closed_ms"]) is not int or t["last_quote_ms"] > t["closed_ms"]))):
-            integrity["invalid_timestamps"] += 1
+            invalid_timestamp("invalid_trade_quote_relation", t, "last_quote_ms,active_ms,closed_ms,clock", "QUOTE_RELATION_FAILED")
         close_ok = ((state in {"WAITING", "ACTIVE"} and t["closed_ms"] is None and t["close_reason"] is None)
                     or (state == "EXPIRED" and t["close_reason"] == "EXPIRED"
                         and stamp(t["closed_ms"]) and type(t["expires_ms"]) is int and t["closed_ms"] >= t["expires_ms"])
@@ -282,7 +309,7 @@ def inspect_manual_tracking(db, *, now_ms):
             c = by_route.get(t["route"])
             if (c is None or type(c["clock"]) is not int or type(t["closed_ms"]) is not int
                     or t["closed_ms"] > c["clock"]):
-                integrity["invalid_timestamps"] += 1
+                invalid_timestamp("invalid_trade_close_control_relation", t, "closed_ms,route,clock", "CLOSE_CONTROL_RELATION_FAILED")
         try:
             setups = json.loads(t["setups"])
             bot = "FALCON" if t["family"] == "FALCON" else "DONKEY"
