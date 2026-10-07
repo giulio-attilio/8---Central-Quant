@@ -123,6 +123,11 @@ def inspect_manual_tracking(db, *, now_ms):
         "invalid_trade_inactive_timestamps", "invalid_trade_quote_relation",
         "invalid_trade_close_control_relation",
     ), 0)
+    close_control_integrity = out["manual_close_control_integrity"] = dict.fromkeys((
+        "missing_route_control", "non_integer_control_clock",
+        "non_integer_closed_ms", "close_after_control_clock",
+    ), 0)
+    close_control_diagnostics = out["manual_close_control_diagnostics"] = []
     timestamp_diagnostics = out["manual_timestamp_diagnostics"] = []
 
     def invalid_timestamp(category, row, field, reason):
@@ -310,6 +315,34 @@ def inspect_manual_tracking(db, *, now_ms):
             if (c is None or type(c["clock"]) is not int or type(t["closed_ms"]) is not int
                     or t["closed_ms"] > c["clock"]):
                 invalid_timestamp("invalid_trade_close_control_relation", t, "closed_ms,route,clock", "CLOSE_CONTROL_RELATION_FAILED")
+                # First failed term in the original OR, one count per violation.
+                subtype = ("missing_route_control" if c is None else
+                           "non_integer_control_clock" if type(c["clock"]) is not int else
+                           "non_integer_closed_ms" if type(t["closed_ms"]) is not int else
+                           "close_after_control_clock")
+                close_control_integrity[subtype] += 1
+                if len(close_control_diagnostics) < 32:
+                    closed = t["closed_ms"] if type(t["closed_ms"]) is int else None
+                    control_clock = c["clock"] if c is not None and type(c["clock"]) is int else None
+                    close_control_diagnostics.append(dict(
+                        table="manual_trade_v1", field="closed_ms,route,clock",
+                        reason=subtype.upper(), failed_term=subtype,
+                        row_tag=hashlib.sha256(("manual_trade_v1:" + str(t["ref"])).encode()).hexdigest()[:12],
+                        state=state, close_reason=t["close_reason"] if t["close_reason"] in {"STOP", "MANUAL_CLOSE", "EXPIRED"} else "OTHER",
+                        family=t["family"] if t["family"] in {"FALCON", "DONKEY", "DONKEY_ORIGINAL", "EARLY_DONKEY"} else "OTHER",
+                        route_tag=hashlib.sha256(str(t["route"]).encode()).hexdigest()[:12],
+                        control_present=c is not None,
+                        closed_ms_is_integer=type(t["closed_ms"]) is int,
+                        control_clock_is_integer=c is not None and type(c["clock"]) is int,
+                        closed_ms=closed, control_clock_ms=control_clock,
+                        closed_minus_control_ms=closed-control_clock if closed is not None and control_clock is not None else None,
+                        matching_stop_event_count=sum(
+                            e["kind"] == "STOP" and e["route"] == t["route"]
+                            and type(e["created_ms"]) is int and e["created_ms"] == closed
+                            for e in event_by_ref.get(t["ref"], [])),
+                        stop_event_created_ms=[e["created_ms"] if type(e["created_ms"]) is int else None
+                                               for e in event_by_ref.get(t["ref"], []) if e["kind"] == "STOP"],
+                    ))
         try:
             setups = json.loads(t["setups"])
             bot = "FALCON" if t["family"] == "FALCON" else "DONKEY"
