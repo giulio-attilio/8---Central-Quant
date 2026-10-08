@@ -27,6 +27,7 @@ REVIEWED_HALT_ID = '20260930-205047'
 SECOND_REVIEWED_HALT_ID = '20260930-222218'
 THIRD_REVIEWED_HALT_ID = '20261001-110546'
 FOURTH_REVIEWED_HALT_ID = '20261002-070002'
+FIFTH_REVIEWED_HALT_ID = '20261004-210018'
 # Incident IDs are derived from the reviewed failure timestamps. Each later
 # review is valid only when every earlier durable receipt is intact.
 REVIEWED_HALT_REVIEWS = {
@@ -37,6 +38,11 @@ REVIEWED_HALT_REVIEWS = {
     # fix is c22950e; the complete production ledger review followed b696651.
     FOURTH_REVIEWED_HALT_ID: (REVIEWED_HALT_ID, SECOND_REVIEWED_HALT_ID,
                             THIRD_REVIEWED_HALT_ID),
+    # Operator-reviewed PUBLIC_API_REJECTED_NO_RETRY / public_collection halt.
+    # Historical subtype remains indeterminate; 178e80d supplies diagnostics
+    # for recurrence without changing fatal classification or retry semantics.
+    FIFTH_REVIEWED_HALT_ID: (REVIEWED_HALT_ID, SECOND_REVIEWED_HALT_ID,
+                           THIRD_REVIEWED_HALT_ID, FOURTH_REVIEWED_HALT_ID),
 }
 REVIEWED_HALT_IDS = tuple(REVIEWED_HALT_REVIEWS)
 REVIEWED_HALT_BYTES = b'MANUAL_REVIEW_REQUIRED\n'
@@ -122,7 +128,7 @@ def inspect_halted_ledger(path):
 def frame_expired_review_is_valid(audit):
     """Require the current full RO audit, not a transient delivery/trade count.
 
-    Called only for the fourth human-reviewed incident. Historical approvals
+    Used for the fourth and fifth human-reviewed incidents. Historical approvals
     retain their frozen criteria. Legacy H4 classification is produced by the
     factual rollout rule in inspect_manual_tracking, never inferred here.
     """
@@ -205,7 +211,7 @@ def resume_reviewed_halt(path, review):
             if halted.read_bytes() != REVIEWED_HALT_BYTES:
                 return False
             audit = inspect_halted_ledger(path)
-            if review == FOURTH_REVIEWED_HALT_ID:
+            if review in (FOURTH_REVIEWED_HALT_ID, FIFTH_REVIEWED_HALT_ID):
                 approved = frame_expired_review_is_valid(audit)
             else:
                 approved = (audit.get('review_complete') is True and audit.get('clock_ahead') is False
@@ -248,6 +254,9 @@ def execute(config, sources, ledger_path, *, authorized=False, verify_telegram=F
         return dict(status='BLOCKED', reason='EXPLICIT_AUTHORIZATIONS_REQUIRED')
     path = Path(ledger_path).resolve()
     halted = Path(str(path) + '.halted')
+    # This incident approval is recovery-only, never a normal startup token.
+    if reviewed_halt == FIFTH_REVIEWED_HALT_ID and not halted.exists():
+        return dict(status='BLOCKED', reason='REVIEWED_RESUME_REFUSED')
     if halted.exists() and reviewed_halt is not None:
         if reviewed_halt not in REVIEWED_HALT_REVIEWS:
             return dict(status='BLOCKED', reason='REVIEWED_RESUME_REFUSED')
