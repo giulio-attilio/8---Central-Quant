@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import tempfile
 import threading
 from pathlib import Path
 
@@ -37,19 +38,31 @@ class _SyntheticLeaseStore:
 
 
 def _enabled_coordinator(*, register_all: bool = True):
-    coordinator = (
-        coordinator_module.build_closed_repair_writer_runtime_coordinator_v1(
-            config=coordinator_module.WriterRuntimeCoordinatorConfigV1(
-                enabled=True
+    temporary = tempfile.TemporaryDirectory(prefix="c3_seam_activation_")
+    root = Path(temporary.name)
+    coordination_root = root / "coordination"
+    storage = coordinator_module.runtime_storage
+    coordinator = coordinator_module.build_production_closed_repair_writer_runtime_coordinator_v1(
+        config=coordinator_module.ProductionWriterRuntimeCoordinatorBindingConfigV1(
+            enabled=True,
+            scope_attestation=coordinator_module.PRODUCTION_COORDINATOR_EXPLICIT_DEPENDENCY_BINDING_ATTESTATION_V1,
+            storage_root_binding_sha256=coordinator_module.production_coordinator_storage_root_binding_sha256_v1(
+                coordination_root
             ),
-            lock_backend=_SyntheticLockBackend(),
-            lease_store=_SyntheticLeaseStore(),
-            clock=lambda: 1.0,
-            nonce_source=lambda: "synthetic-nonce",
-        )
+        ),
+        lock_backend=storage.CrossPlatformInterprocessFileLockBackendV1(
+            coordination_root, enabled=True
+        ),
+        lease_store=storage.DurableJsonMaintenanceLeaseStoreV1(
+            coordination_root, enabled=True
+        ),
+        registry_path=root / "trade_registry.json",
+        clock=lambda: 1.0,
+        nonce_source=lambda: "synthetic-nonce",
     )
-    if register_all:
-        coordinator.register_all_declared_writers()
+    coordinator._test_temporary_directory = temporary
+    if not register_all:
+        coordinator._registered.pop(next(iter(coordinator._registered)))
     return coordinator
 
 
@@ -63,6 +76,7 @@ def _activation_evidence(**changes):
         "trade_registry_closed_identity_conflict_repair_raw_transaction_store_production_v1.py",
         "trade_registry_closed_identity_conflict_repair_writer_invocation_adapter_v1.py",
         "trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1.py",
+        "trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py",
         "trade_registry_closed_identity_conflict_repair_production_provider_v1.py",
     )
     evidence = {
@@ -71,7 +85,7 @@ def _activation_evidence(**changes):
         "activation_receipt_verified": True,
         "source_hashes_verified": True,
         "source_hashes": {
-            name: hashlib.sha256(name.encode("utf-8")).hexdigest()
+            name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
             for name in source_files
         },
         "shared_lock_backend_ready": True,
@@ -121,6 +135,8 @@ def _install_controlled_for_offline_test(coordinator, **kwargs):
     seam._controlled_activation_authority_v1 = authority
     seam._controlled_activation_interlock_v1 = interlock
     try:
+        if "active_registry_path" not in kwargs:
+            kwargs["active_registry_path"] = getattr(coordinator, "_registry_path_binding", None)
         return seam.install_controlled_c3_closed_repair_writer_coordinator_v1(
             coordinator,
             activation_authority=authority,
@@ -324,6 +340,70 @@ def test_controlled_installer_requires_runtime_bound_authority() -> None:
             activation_evidence=_activation_evidence(),
             kill_switch=lambda: False,
         )
+
+
+@pytest.mark.parametrize("path_case", ["missing", "foreign", "unbound_coordinator"])
+def test_controlled_installer_rejects_registry_binding_before_install(path_case):
+    coordinator = _enabled_coordinator()
+    supplied_path = coordinator._registry_path_binding
+    if path_case == "missing":
+        supplied_path = None
+    elif path_case == "foreign":
+        supplied_path = supplied_path.parent / "elsewhere" / "trade_registry.json"
+    else:
+        del coordinator._registry_path_binding
+    previous = seam._coordinator
+    with pytest.raises(coordinator_module.WriterRuntimeCoordinationBlocked,
+                       match="C3_CONTROLLED_ACTIVATION_REGISTRY_STORAGE_BINDING_INVALID"):
+        _install_controlled_for_offline_test(
+            coordinator,
+            enabled=True,
+            scope_attestation=seam.C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1,
+            activation_evidence=_activation_evidence(),
+            kill_switch=lambda: False,
+            active_registry_path=supplied_path,
+        )
+    assert seam._coordinator is previous
+
+
+def test_controlled_installer_requires_its_own_source_in_activation_evidence():
+    evidence = _activation_evidence()
+    evidence["source_hashes"].pop(
+        "trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py"
+    )
+    evidence["activation_evidence_sha256"] = seam.controlled_activation_evidence_sha256_v1(evidence)
+    previous = seam._coordinator
+    with pytest.raises(coordinator_module.WriterRuntimeCoordinationBlocked,
+                       match="C3_CONTROLLED_ACTIVATION_EVIDENCE_UNSAFE"):
+        _install_controlled_for_offline_test(
+            _enabled_coordinator(),
+            enabled=True,
+            scope_attestation=seam.C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1,
+            activation_evidence=evidence,
+            kill_switch=lambda: False,
+        )
+    assert seam._coordinator is previous
+
+
+def test_controlled_installer_rejects_forged_source_hash_before_install():
+    evidence = _activation_evidence()
+    evidence["source_hashes"]["main.py"] = "0" * 64
+    evidence["activation_evidence_sha256"] = (
+        seam.controlled_activation_evidence_sha256_v1(evidence)
+    )
+    previous = seam._coordinator
+    with pytest.raises(
+        coordinator_module.WriterRuntimeCoordinationBlocked,
+        match="C3_CONTROLLED_ACTIVATION_SOURCE_HASH_MISMATCH",
+    ):
+        _install_controlled_for_offline_test(
+            _enabled_coordinator(),
+            enabled=True,
+            scope_attestation=seam.C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1,
+            activation_evidence=evidence,
+            kill_switch=lambda: False,
+        )
+    assert seam._coordinator is previous
 
 
 def test_controlled_installer_rejects_tampered_or_unsafe_evidence() -> None:

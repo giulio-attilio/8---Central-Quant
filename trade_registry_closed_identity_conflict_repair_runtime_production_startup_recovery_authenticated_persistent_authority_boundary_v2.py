@@ -19,6 +19,8 @@ from typing import Any, Callable
 import trade_registry_closed_identity_conflict_repair_durable_raw_transaction_backend_conformance_contract_v2 as hash_v2
 import trade_registry_closed_identity_conflict_repair_runtime_handoff_v1_backend_v2_protected_reconciliation_durable_authority_contract_v2 as authority_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_evidence_source_ports_contract_v2 as identity_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_physical_aggregate_audit_offline_v2 as aggregate_audit_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_physical_locked_aggregate_collection_offline_v2 as aggregate_collection_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_bridge_v2 as bridge_v2
 import trade_registry_closed_identity_conflict_repair_runtime_seam_v1 as runtime_seam_v1
 
@@ -178,6 +180,10 @@ class AuthenticatedPersistentAuthorityBoundaryConfigV2:
     expected_root_authority_attestation_sha256: str | None = field(
         default=None, repr=False
     )
+    require_locked_physical_aggregate: bool = False
+    expected_locked_physical_aggregate_collector_object_identity_sha256: str | None = field(
+        default=None, repr=False
+    )
 
 
 class AuthenticatedPersistentAuthorityBoundaryV2:
@@ -192,6 +198,7 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
         root_revocation_source: Any = None,
         multistore_recovery: Any = None,
         startup_bridge: Any = None,
+        locked_physical_aggregate_collector: Any = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         self._config = config or AuthenticatedPersistentAuthorityBoundaryConfigV2()
@@ -200,6 +207,7 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
         self._revocation_source = root_revocation_source
         self._multistore_recovery = multistore_recovery
         self._startup_bridge = startup_bridge
+        self._locked_physical_aggregate_collector = locked_physical_aggregate_collector
         self._clock = clock
 
     def __repr__(self) -> str:
@@ -217,6 +225,7 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
             "root_revoked": None,
             "multistore_recovery_verified": False,
             "startup_bridge_verified": False,
+            "locked_physical_aggregate_verified": False,
             "filesystem_accessed": False,
             "real_registry_accessed": False,
             "network_accessed": False,
@@ -240,6 +249,8 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
             != OFFLINE_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_SCOPE_ATTESTATION_V2
         ):
             return "AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_SCOPE_INVALID"
+        if type(config.require_locked_physical_aggregate) is not bool:
+            return "AUTHENTICATED_PERSISTENT_AUTHORITY_AGGREGATE_CONFIG_INVALID"
         pins = (
             config.expected_root_state_provider_object_identity_sha256,
             config.expected_root_verifier_object_identity_sha256,
@@ -270,8 +281,33 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
         )
         if any(_object_identity(value) != expected for value, expected in values):
             return "AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_INSTANCE_MISMATCH"
+        if config.require_locked_physical_aggregate:
+            collector = self._locked_physical_aggregate_collector
+            if not _valid_sha(
+                config.expected_locked_physical_aggregate_collector_object_identity_sha256
+            ):
+                return "AUTHENTICATED_PERSISTENT_AUTHORITY_AGGREGATE_PIN_INVALID"
+            if not (
+                type(collector) is aggregate_collection_v2.PhysicalLockedAggregateCollectionV2
+                and callable(getattr(collector, "collect_offline", None))
+                and callable(getattr(self._multistore_recovery, "maintenance_permit_current_v2", None))
+            ):
+                return "AUTHENTICATED_PERSISTENT_AUTHORITY_AGGREGATE_DEPENDENCY_INVALID"
+            if _object_identity(collector) != (
+                config.expected_locked_physical_aggregate_collector_object_identity_sha256
+            ):
+                return "AUTHENTICATED_PERSISTENT_AUTHORITY_AGGREGATE_INSTANCE_MISMATCH"
         if type(self._startup_bridge) is not bridge_v2.ResolvedAuthorityStartupRecoveryBridgeV2:
             return "AUTHENTICATED_PERSISTENT_AUTHORITY_STARTUP_BRIDGE_INVALID"
+        bridge_binding = getattr(
+            self._multistore_recovery, "coordinated_bridge_bound_v2", None
+        )
+        if callable(bridge_binding):
+            try:
+                if bridge_binding(self._startup_bridge) is not True:
+                    return "AUTHENTICATED_PERSISTENT_AUTHORITY_COORDINATED_BRIDGE_MISMATCH"
+            except Exception:
+                return "AUTHENTICATED_PERSISTENT_AUTHORITY_COORDINATED_BRIDGE_MISMATCH"
         bridge_snapshot = self._startup_bridge.snapshot()
         if not (
             bridge_snapshot.get("temporary_offline_ready") is True
@@ -411,6 +447,60 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
             )
         ):
             return self._failed("AUTHENTICATED_STARTUP_BRIDGE_RECEIPT_INVALID")
+        aggregate_receipt_sha256 = None
+        if config.require_locked_physical_aggregate:
+            if not (
+                recovered.get("physical_evidence_envelope_verified") is True
+                and all(_valid_sha(recovered.get(key)) for key in (
+                    "transaction_physical_evidence_sha256",
+                    "resolved_physical_evidence_sha256",
+                    "transaction_physical_store_instance_sha256",
+                    "transaction_postcondition_audit_sha256",
+                    "resolved_physical_ledger_identity_sha256",
+                ))
+            ):
+                return self._failed("AUTHENTICATED_PHYSICAL_AGGREGATE_SOURCE_UNBOUND")
+            current = self._multistore_recovery.maintenance_permit_current_v2
+            try:
+                if current(dict(maintenance_permit)) is not True:
+                    return self._failed("AUTHENTICATED_PHYSICAL_AGGREGATE_MAINTENANCE_LOST")
+                collected = self._locked_physical_aggregate_collector.collect_offline(
+                    delegated_permit=dict(maintenance_permit),
+                    delegated_permit_validator=current
+                )
+                if current(dict(maintenance_permit)) is not True:
+                    return self._failed("AUTHENTICATED_PHYSICAL_AGGREGATE_MAINTENANCE_LOST")
+            except Exception:
+                return self._failed("AUTHENTICATED_PHYSICAL_AGGREGATE_FAILED_CLOSED")
+            if not isinstance(collected, Mapping):
+                return self._failed("AUTHENTICATED_PHYSICAL_AGGREGATE_RECEIPT_INVALID")
+            collection_receipt = collected.get("collection_receipt")
+            aggregate = collected.get("aggregate_audit")
+            if not (
+                collected.get("ok") is True
+                and aggregate_collection_v2.physical_locked_aggregate_collection_receipt_valid_v2(
+                    collection_receipt
+                )
+                and aggregate_audit_v2.physical_aggregate_recovery_audit_valid_v2(aggregate)
+                and collection_receipt["aggregate_audit_sha256"] == aggregate["aggregate_audit_sha256"]
+                and aggregate["backend_instance_sha256"] == recovered[
+                    "transaction_physical_store_instance_sha256"]
+                and collection_receipt["final_transaction_log_audit_sha256"] == recovered[
+                    "transaction_postcondition_audit_sha256"]
+                and collection_receipt["ledger_object_identity_sha256"] == recovered[
+                    "resolved_physical_ledger_identity_sha256"]
+                and aggregate["total_pending_count"] == 0
+                and collection_receipt["issued_at_epoch"] <= now_epoch
+                < collection_receipt["expires_at_epoch"]
+                and collected.get("no_order_sent") is True
+                and collected.get("real_registry_accessed") is False
+                and collected.get("network_accessed") is False
+                and collected.get("broker_called") is False
+                and collected.get("production_ready") is False
+                and collected.get("live_allowed") is False
+            ):
+                return self._failed("AUTHENTICATED_PHYSICAL_AGGREGATE_RECEIPT_INVALID")
+            aggregate_receipt_sha256 = collection_receipt["receipt_sha256"]
         result = dict(startup)
         result.update(
             {
@@ -424,6 +514,7 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
                 "multistore_recovery_verified": True,
                 "multistore_recovery_receipt_sha256": recovered["receipt_sha256"],
                 "startup_bridge_verified": True,
+                "locked_physical_aggregate_verified": aggregate_receipt_sha256 is not None,
                 "filesystem_accessed": True,
                 "synthetic_only": True,
                 "temporary_storage_only": True,
@@ -434,6 +525,8 @@ class AuthenticatedPersistentAuthorityBoundaryV2:
                 "live_allowed": False,
             }
         )
+        if aggregate_receipt_sha256 is not None:
+            result["locked_physical_aggregate_receipt_sha256"] = aggregate_receipt_sha256
         result["startup_recovery_attestation_sha256"] = (
             runtime_seam_v1.startup_recovery_attestation_sha256_v1(result)
         )

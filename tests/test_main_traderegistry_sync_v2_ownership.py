@@ -1,5 +1,7 @@
 import ast
 import copy
+import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +22,7 @@ _SOURCE_KEY = (
 )
 
 _SYNC_FUNCTIONS = {
+    "_trpsf_v1_registry_lock",
     "_trade_registry_sync_symbol",
     "normalize_registry_symbol",
     "normalize_registry_bot",
@@ -47,6 +50,7 @@ class _BotModule:
 
 class _FakeTradeRegistry:
     def __init__(self, open_trades=None):
+        self._lock = threading.RLock()
         self.registry = {"open_trades": copy.deepcopy(open_trades or {})}
         self.register_calls = []
         self.save_calls = []
@@ -99,7 +103,7 @@ def _compile_sync_functions(namespace):
         "c3_runtime_seam_v1",
         SimpleNamespace(
             _c3_closed_repair_writer_mutation_v1=(
-                lambda _writer_id: lambda function: function
+                lambda _writer_id: nullcontext()
             )
         ),
     )

@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infraestrutura Segura C3 da Central Quant (DynamoDB + KMS + OIDC para o Render)'
+
+Parameters:
+  RenderOidcAudience:
+    Type: String
+    Default: 'render'
+    Description: 'Público (Audience) do token OIDC gerado pelo Render'
+
+Resources:
+  C3RootHeadTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: C3_Root_Head
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: root_identity_sha256
+          AttributeType: S
+      KeySchema:
+        - AttributeName: root_identity_sha256
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  C3HMACKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Chave HMAC para a Autoridade C3 da Central Quant
+      KeySpec: HMAC_256
+      KeyUsage: GENERATE_VERIFY_MAC
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: c3-key-policy
+        Statement:
+          - Sid: Permite ao dono da conta gerenciar a chave
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+
+  C3RenderOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://api.render.com
+      ClientIdList:
+        - !Ref RenderOidcAudience
+      ThumbprintList:
+        - 08745487e891c19e3078c1f2a07e452950ef36f6 # Root CA Padrão AWS
+
+  C3RenderRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CentralQuant_C3_Runtime_Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref C3RenderOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'api.render.com:aud': !Ref RenderOidcAudience
+      Policies:
+        - PolicyName: C3_Minimal_Permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt C3RootHeadTable.Arn
+              - Effect: Allow
+                Action:
+                  - kms:GenerateMac
+                  - kms:VerifyMac
+                Resource: !GetAtt C3HMACKey.Arn
+
+Outputs:
+  DynamoDBTableName:
+    Description: Nome da tabela DynamoDB
+    Value: !Ref C3RootHeadTable
+  KmsKeyArn:
+    Description: ARN da chave KMS criada
+    Value: !GetAtt C3HMACKey.Arn
+  RenderRoleArn:
+    Description: ARN da Role do IAM que a Central Quant (Render) usará
+    Value: !GetAtt C3RenderRuntimeRole.Arn
+

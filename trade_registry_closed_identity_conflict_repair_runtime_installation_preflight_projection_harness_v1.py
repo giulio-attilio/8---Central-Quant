@@ -103,10 +103,10 @@ def _writer_bindings_by_component() -> dict[str, list[dict[str, Any]]]:
 
 def _build_synthetic_main_source() -> str:
     lines = [
-        f"from {_COORDINATOR_MODULE} import build_production_closed_repair_writer_runtime_coordinator_v1",
-        f"from {_INVOCATION_MODULE} import build_production_writer_invocation_adapter_v1",
-        f"from {_STORE_MODULE} import build_production_raw_transaction_store_v1",
-        f"from {_PROVIDER_MODULE} import build_production_closed_repair_provider_v1",
+        f"import {_COORDINATOR_MODULE} as c3_writer_coordinator_v1",
+        f"import {_INVOCATION_MODULE} as c3_writer_invocation_v1",
+        f"import {_STORE_MODULE} as c3_transaction_store_v1",
+        f"import {_PROVIDER_MODULE} as c3_provider_v1",
         f"import {_RESOLVED_AUTHORITY_STARTUP_BRIDGE_MODULE} as c3_resolved_authority_startup_bridge_v2",
         f"import {_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_MODULE} as c3_authenticated_persistent_authority_boundary_v2",
         f"import {_AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_MODULE} as c3_authenticated_persistent_authority_production_adapters_v2",
@@ -133,25 +133,33 @@ def _build_synthetic_main_source() -> str:
         lines,
         line_number=40,
         function="_install_c3_closed_repair_writer_coordination_v1",
-        signature="(*, startup_recovery)",
+        signature="(*, coordinator, startup_recovery)",
         body=(
-            "coordinator = build_production_closed_repair_writer_runtime_coordinator_v1()",
-            "build_production_writer_invocation_adapter_v1()",
-            "build_production_raw_transaction_store_v1()",
-            "build_production_closed_repair_provider_v1()",
+            "if (",
+            "    type(startup_recovery)",
+            "    is not c3_authenticated_persistent_authority_boundary_v2.AuthenticatedPersistentAuthorityBoundaryV2",
+            "    or startup_recovery._config.enabled is not False",
+            "    or type(startup_recovery._multistore_recovery)",
+            "    is not c3_authenticated_persistent_authority_production_adapters_v2.CoordinatedMultistoreStartupRecoveryV2",
+            "    or not startup_recovery._multistore_recovery.dormant_coordinator_bound_v2(coordinator)",
+            "):",
+            '    raise RuntimeError("C3_DORMANT_STARTUP_COORDINATOR_BINDING_REQUIRED")',
+            "c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()",
+            "c3_transaction_store_v1.build_production_raw_transaction_store_v1()",
+            "c3_provider_v1.build_production_closed_repair_provider_v1()",
             "c3_runtime_seam_v1.bind_c3_closed_repair_runtime_interlocks_v1(coordinator, startup_recovery=startup_recovery)",
         ),
     )
     _place_function(
         lines,
-        line_number=50,
+        line_number=60,
         function="_recover_c3_closed_repair_registry_v1",
         signature="()",
         body=("recover_stale_maintenance_lease_v1()",),
     )
     _place_function(
         lines,
-        line_number=60,
+        line_number=80,
         function="_frpp_v1_build_checklist",
         signature="()",
         body=(
@@ -182,7 +190,7 @@ def _build_synthetic_main_source() -> str:
     )
     _place_function(
         lines,
-        line_number=100,
+        line_number=130,
         function="start_central_runtime_once",
         signature="()",
         body=("pass",),
@@ -206,56 +214,61 @@ def _build_synthetic_main_source() -> str:
     _place_statement(
         lines,
         line_number=startup_line,
-        statement="C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = c3_resolved_authority_startup_bridge_v2.build_dormant_resolved_authority_startup_recovery_bridge_v2()",
+        statement="C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1 = c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()",
     )
     _place_statement(
         lines,
         line_number=startup_line + 1,
-        statement="C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2 = c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2()",
+        statement="C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = c3_resolved_authority_startup_bridge_v2.build_dormant_resolved_authority_startup_recovery_bridge_v2()",
     )
     _place_statement(
         lines,
         line_number=startup_line + 2,
-        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2 = c3_authority_provisioning_manifest_v2.build_dormant_authority_provisioning_manifest_contract_v2()",
+        statement="C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2 = c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2(maintenance_coordinator=C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1)",
     )
     _place_statement(
         lines,
         line_number=startup_line + 3,
-        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_CONTRACT_V2 = c3_authority_provisioning_receipt_v2.build_dormant_authority_provisioning_receipt_contract_v2()",
+        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2 = c3_authority_provisioning_manifest_v2.build_dormant_authority_provisioning_manifest_contract_v2()",
     )
     _place_statement(
         lines,
         line_number=startup_line + 4,
-        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_V2 = c3_authority_provisioning_receipt_authenticated_verifier_v2.build_dormant_authenticated_provisioning_receipt_verifier_v2()",
+        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_CONTRACT_V2 = c3_authority_provisioning_receipt_v2.build_dormant_authority_provisioning_receipt_contract_v2()",
     )
     _place_statement(
         lines,
         line_number=startup_line + 5,
-        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_CONTRACT_V2 = c3_authority_provisioning_physical_binding_v2.build_dormant_authority_provisioning_physical_binding_contract_v2()",
+        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_RECEIPT_AUTHENTICATED_VERIFIER_V2 = c3_authority_provisioning_receipt_authenticated_verifier_v2.build_dormant_authenticated_provisioning_receipt_verifier_v2()",
     )
     _place_statement(
         lines,
         line_number=startup_line + 6,
-        statement="C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2 = c3_authenticated_persistent_authority_boundary_v2.build_dormant_authenticated_persistent_authority_boundary_v2(root_state_provider=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_state_provider, root_authority_verifier=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_authority_verifier, root_revocation_source=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_revocation_source, multistore_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.multistore_recovery, startup_bridge=C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2)",
+        statement="C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_PHYSICAL_BINDING_CONTRACT_V2 = c3_authority_provisioning_physical_binding_v2.build_dormant_authority_provisioning_physical_binding_contract_v2()",
     )
     _place_statement(
         lines,
         line_number=startup_line + 7,
-        statement="trade_registry_persistent_storage_fix_v1_status()",
+        statement="C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2 = c3_authenticated_persistent_authority_boundary_v2.build_dormant_authenticated_persistent_authority_boundary_v2(root_state_provider=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_state_provider, root_authority_verifier=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_authority_verifier, root_revocation_source=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.root_revocation_source, multistore_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2.multistore_recovery, startup_bridge=C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2)",
     )
     _place_statement(
         lines,
         line_number=startup_line + 8,
-        statement="C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1(startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2)",
+        statement="trade_registry_persistent_storage_fix_v1_status()",
     )
     _place_statement(
         lines,
         line_number=startup_line + 9,
-        statement="C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1 = _recover_c3_closed_repair_registry_v1()",
+        statement="C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1(coordinator=C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1, startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2)",
     )
     _place_statement(
         lines,
         line_number=startup_line + 10,
+        statement="C3_CLOSED_REPAIR_STARTUP_RECOVERY_V1 = _recover_c3_closed_repair_registry_v1()",
+    )
+    _place_statement(
+        lines,
+        line_number=startup_line + 11,
         statement="start_central_runtime_once()",
     )
     return "\n".join(lines) + "\n"
@@ -410,18 +423,12 @@ def _negative_control_sources(
             needle, "    pass\n", 1
         )
     elif control_id == "C3_RUNTIME_DEPENDENCIES_IMPORTED":
-        needle = (
-            f"from {_COORDINATOR_MODULE} import "
-            "build_production_closed_repair_writer_runtime_coordinator_v1\n"
-        )
+        needle = f"import {_COORDINATOR_MODULE} as c3_writer_coordinator_v1\n"
         mutated["main.py"] = _remove_exact(
             mutated["main.py"], needle, "COORDINATOR_IMPORT_CONTROL_TARGET_MISSING"
         )
     elif control_id == "PRODUCTION_TRANSACTION_STORE_PRESENT":
-        needle = (
-            f"from {_STORE_MODULE} import "
-            "build_production_raw_transaction_store_v1\n"
-        )
+        needle = f"import {_STORE_MODULE} as c3_transaction_store_v1\n"
         mutated["main.py"] = _remove_exact(
             mutated["main.py"], needle, "STORE_IMPORT_CONTROL_TARGET_MISSING"
         )
@@ -434,13 +441,13 @@ def _negative_control_sources(
     elif control_id == "C3_PROVIDER_INSTALLED_BEFORE_RUNTIME_START":
         mutated["main.py"] = _remove_exact(
             mutated["main.py"],
-            "C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1(startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2)\n",
+            "C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1(coordinator=C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1, startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2)\n",
             "PROVIDER_CALL_CONTROL_TARGET_MISSING",
         )
     elif control_id == "C3_PROVIDER_BINDS_PRODUCTION_CAPABILITIES":
         mutated["main.py"] = _remove_exact(
             mutated["main.py"],
-            "    build_production_writer_invocation_adapter_v1()\n",
+            "    c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()\n",
             "PROVIDER_BUILDER_CONTROL_TARGET_MISSING",
         )
     elif control_id == "C3_STARTUP_RECOVERY_BEFORE_RUNTIME_START":

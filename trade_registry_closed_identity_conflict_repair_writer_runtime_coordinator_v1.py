@@ -14,11 +14,13 @@ import json
 import math
 import os
 import re
+import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import trade_registry_closed_identity_conflict_repair_writer_coordination_contract_v1 as coordination
@@ -107,14 +109,48 @@ class WriterRuntimeCoordinationBlocked(RuntimeError):
         self.reason = reason
 
 
+def _synthetic_recovery_storage_scope_valid_v1(
+    lock_backend: Any, lease_store: Any,
+) -> bool:
+    if not (
+        type(lock_backend) is runtime_storage.CrossPlatformInterprocessFileLockBackendV1
+        and type(lease_store) is runtime_storage.DurableJsonMaintenanceLeaseStoreV1
+        and lock_backend.enabled is True
+        and lease_store.enabled is True
+    ):
+        return False
+    try:
+        lock_root = lock_backend.storage_root.resolve(strict=False)
+        temporary_root = Path(tempfile.gettempdir()).resolve(strict=False)
+        return bool(
+            lock_root.name == "outer-writer-locks"
+            and lock_root.parent.parent == temporary_root
+            and lock_root.parent.name.startswith("c3_durable_backend_v2_")
+            and lease_store.storage_root == lock_root
+        )
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class WriterRuntimeCoordinatorConfigV1:
     enabled: bool = False
     lock_timeout_seconds: float = 1.0
+    maintenance_only: bool = False
+    synthetic_recovery_owner_identity: str | None = None
 
     def __post_init__(self) -> None:
         if self.lock_timeout_seconds <= 0:
             raise ValueError("lock_timeout_seconds must be positive")
+        identity = self.synthetic_recovery_owner_identity
+        if identity is not None and (
+            not self.enabled
+            or type(identity) is not str
+            or not identity
+            or identity.strip() != identity
+            or len(identity) > 256
+        ):
+            raise ValueError("synthetic recovery owner identity requires an enabled coordinator")
 
 
 @dataclass(frozen=True)
@@ -123,6 +159,7 @@ class ProductionWriterRuntimeCoordinatorBindingConfigV1:
     scope_attestation: str | None = None
     storage_root_binding_sha256: str | None = None
     lock_timeout_seconds: float = 1.0
+    maintenance_only: bool = False
 
     def __post_init__(self) -> None:
         if self.lock_timeout_seconds <= 0:
@@ -155,6 +192,18 @@ class WriterMaintenancePermitV1:
 class _OwnerFrame:
     owner_token: str
     depth: int
+
+
+@dataclass(frozen=True, repr=False)
+class _MaintenanceFrame:
+    owner: Any
+    config: Any
+    lock_backend: Any
+    lease_store: Any
+    handle: Any
+    permit: WriterMaintenancePermitV1
+    thread_id: int
+    process_id: int
 
 
 class ClosedRepairWriterRuntimeCoordinatorV1:
@@ -206,10 +255,18 @@ class ClosedRepairWriterRuntimeCoordinatorV1:
         self._owner_frame: ContextVar[_OwnerFrame | None] = ContextVar(
             "closed_repair_writer_owner_frame_v1", default=None
         )
+        self._maintenance_frame: ContextVar[_MaintenanceFrame | None] = ContextVar(
+            "closed_repair_maintenance_owner_frame_v1", default=None
+        )
+        self._active_maintenance_frame: _MaintenanceFrame | None = None
 
     @property
     def enabled(self) -> bool:
         return self._config.enabled
+
+    @property
+    def maintenance_only(self) -> bool:
+        return self._config.maintenance_only
 
     @property
     def lock_namespace(self) -> str:
@@ -310,6 +367,8 @@ class ClosedRepairWriterRuntimeCoordinatorV1:
     @contextmanager
     def mutation(self, writer_id: str) -> Iterator[WriterMutationPermitV1]:
         normalized = str(writer_id or "").strip()
+        if self._config.maintenance_only:
+            raise WriterRuntimeCoordinationBlocked("MAINTENANCE_ONLY_WRITERS_FORBIDDEN")
         if not self._config.enabled:
             yield WriterMutationPermitV1(
                 writer_id=normalized,
@@ -392,6 +451,57 @@ class ClosedRepairWriterRuntimeCoordinatorV1:
         except Exception as exc:
             raise WriterRuntimeCoordinationBlocked("LEASE_WRITE_FAILED") from exc
 
+    def maintenance_permit_is_current_v1(
+        self, permit: Mapping[str, Any], *, lock_backend: Any
+    ) -> bool:
+        """Validate the live physical lease in this owner context, never a DTO alone.
+
+        No lease is created, reacquired or repaired here. Disabled coordinators,
+        copied coordinator instances, foreign threads/processes and expired
+        ownership fail before persistence reads.
+        This is local ownership evidence, not authentication of production roots.
+        """
+        try:
+            frame = self._maintenance_frame.get()
+            if not (
+                self.enabled is True and frame is not None
+                and frame is self._active_maintenance_frame and frame.owner is self
+                and frame.config is self._config
+                and frame.thread_id == threading.get_ident()
+                and frame.process_id == os.getpid()
+                and frame.lock_backend is lock_backend is self._lock_backend
+                and frame.lease_store is self._lease_store
+                and type(lock_backend) is runtime_storage.CrossPlatformInterprocessFileLockBackendV1
+                and type(self._lease_store) is runtime_storage.DurableJsonMaintenanceLeaseStoreV1
+                and lock_backend.enabled is True and self._lease_store.enabled is True
+                and lock_backend.storage_root == self._lease_store.storage_root
+                and type(frame.handle) is runtime_storage.InterprocessFileLockHandleV1
+                and frame.handle.released is False
+                and isinstance(permit, Mapping)
+            ):
+                return False
+            expected = asdict(frame.permit)
+            supplied = dict(permit)
+            if (supplied != expected or any(type(supplied[key]) is not type(value)
+                                           for key, value in expected.items())):
+                return False
+            with self._state_lock:
+                if not self.all_writers_registered or self._inflight != 0:
+                    return False
+                lease = self._read_lease()
+                return bool(
+                    lease is not None and lease.get("state") == "QUIESCED"
+                    and lease.get("maintenance_epoch") == frame.permit.maintenance_epoch
+                    and type(lease.get("registered_writer_count")) is int
+                    and lease["registered_writer_count"] == 19
+                    and lease.get("writer_inventory_sha256") == _stable_sha256(self._inventory)
+                    and self._namespace == frame.permit.lock_namespace_sha256
+                    and frame is self._active_maintenance_frame
+                    and frame.handle.released is False
+                )
+        except Exception:
+            return False
+
     @contextmanager
     def maintenance_lease(self) -> Iterator[WriterMaintenancePermitV1]:
         if not self._config.enabled:
@@ -404,18 +514,27 @@ class ClosedRepairWriterRuntimeCoordinatorV1:
             raise WriterRuntimeCoordinationBlocked(
                 "ALL_19_WRITERS_MUST_BE_REGISTERED"
             )
+        synthetic_owner = self._config.synthetic_recovery_owner_identity
+        if synthetic_owner is not None and not _synthetic_recovery_storage_scope_valid_v1(
+            self._lock_backend, self._lease_store,
+        ):
+            raise WriterRuntimeCoordinationBlocked(
+                "SYNTHETIC_STALE_LEASE_RECOVERY_TEMPORARY_STORAGE_REQUIRED"
+            )
         handle = self._acquire_shared_lock()
-        epoch = self._token(
-            "MAINTENANCE_EPOCH_V1",
-            {
-                "nonce": str(self._nonce_source()),
-                "requested_at": float(self._clock()),
-                "registered_writer_count": self.registered_writer_count,
-            },
-        )
         released = False
         lease_started = False
+        frame = None
+        frame_token = None
         try:
+            epoch = self._token(
+                "MAINTENANCE_EPOCH_V1",
+                {
+                    "nonce": str(self._nonce_source()),
+                    "requested_at": float(self._clock()),
+                    "registered_writer_count": self.registered_writer_count,
+                },
+            )
             with self._state_lock:
                 inflight = self._inflight
             if inflight != 0:
@@ -429,11 +548,18 @@ class ClosedRepairWriterRuntimeCoordinatorV1:
                 "writer_inventory_sha256": _stable_sha256(self._inventory),
                 "updated_at": float(self._clock()),
             }
+            if synthetic_owner is not None:
+                common.update({
+                    "recovery_scope_attestation": SYNTHETIC_STALE_LEASE_RECOVERY_ATTESTATION_V1,
+                    "owner_identity_sha256": _stable_sha256(
+                        {"process_identity": synthetic_owner}
+                    ),
+                })
             self._write_lease({**common, "state": "REQUESTED"})
             lease_started = True
             self._write_lease({**common, "state": "DRAINING"})
             self._write_lease({**common, "state": "QUIESCED"})
-            yield WriterMaintenancePermitV1(
+            permit = WriterMaintenancePermitV1(
                 maintenance_epoch=epoch,
                 state="QUIESCED",
                 lock_namespace_sha256=self._namespace,
@@ -441,7 +567,25 @@ class ClosedRepairWriterRuntimeCoordinatorV1:
                 inflight_mutations=0,
                 shared_lock_acquired=True,
             )
+            frame = _MaintenanceFrame(
+                self, self._config, self._lock_backend, self._lease_store,
+                handle, permit, threading.get_ident(), os.getpid(),
+            )
+            frame_token = self._maintenance_frame.set(frame)
+            with self._state_lock:
+                self._active_maintenance_frame = frame
+            yield permit
         finally:
+            # Revoke local admission before release I/O, even if cleanup fails.
+            with self._state_lock:
+                if self._active_maintenance_frame is frame:
+                    self._active_maintenance_frame = None
+            frame_reset_failed = False
+            if frame_token is not None:
+                try:
+                    self._maintenance_frame.reset(frame_token)
+                except Exception:
+                    frame_reset_failed = True
             lease_release_error: Exception | None = None
             try:
                 if lease_started:
@@ -472,10 +616,13 @@ class ClosedRepairWriterRuntimeCoordinatorV1:
                 raise WriterRuntimeCoordinationBlocked(
                     "MAINTENANCE_LEASE_RELEASE_NOT_CONFIRMED"
                 )
+            if frame_reset_failed:
+                raise WriterRuntimeCoordinationBlocked("MAINTENANCE_CONTEXT_RESET_FAILED")
 
     def snapshot(self) -> dict[str, Any]:
         lease = self._read_lease() if self._config.enabled else None
         return {
+            **({"maintenance_only": True} if self.maintenance_only else {}),
             "version": TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_WRITER_RUNTIME_COORDINATOR_V1_VERSION,
             "enabled": self._config.enabled,
             "default_off": not self._config.enabled,
@@ -541,6 +688,9 @@ def recover_stale_maintenance_lease_v1(
         for dependency in (lock_backend, lease_store, clock, owner_liveness)
     ):
         base["reason"] = "STALE_LEASE_RECOVERY_DEPENDENCIES_REQUIRED"
+        return base
+    if not _synthetic_recovery_storage_scope_valid_v1(lock_backend, lease_store):
+        base["reason"] = "STALE_LEASE_RECOVERY_SYNTHETIC_TEMPORARY_STORAGE_REQUIRED"
         return base
     identity = str(current_process_identity or "").strip()
     if not identity or len(identity) > 256:
@@ -802,6 +952,33 @@ def production_coordinator_storage_root_binding_sha256_v1(
     )
 
 
+def _validate_production_registry_storage_binding_v1(
+    registry_path: os.PathLike[str] | str | None,
+    storage_root: Path,
+) -> Path:
+    """Require the Registry file and physical coordination on one resolved disk."""
+
+    try:
+        if registry_path is None or not os.fspath(registry_path):
+            raise ValueError("registry path required")
+        supplied = Path(registry_path)
+        if not supplied.is_absolute():
+            raise ValueError("absolute registry path required")
+        registry = supplied.resolve(strict=False)
+        root = storage_root.resolve(strict=True)
+        if registry.name in ("", ".", "..") or registry.is_dir():
+            raise ValueError("registry file required")
+        if registry.parent not in (root, root.parent):
+            raise ValueError("registry and coordination roots diverge")
+        if os.stat(registry.parent).st_dev != os.stat(root).st_dev:
+            raise ValueError("registry and coordination devices diverge")
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise WriterRuntimeCoordinationBlocked(
+            "PRODUCTION_COORDINATOR_REGISTRY_STORAGE_BINDING_INVALID"
+        ) from exc
+    return registry
+
+
 def build_production_closed_repair_writer_runtime_coordinator_v1(
     *,
     config: ProductionWriterRuntimeCoordinatorBindingConfigV1 | None = None,
@@ -809,6 +986,7 @@ def build_production_closed_repair_writer_runtime_coordinator_v1(
     | None = None,
     lease_store: runtime_storage.DurableJsonMaintenanceLeaseStoreV1
     | None = None,
+    registry_path: os.PathLike[str] | str | None = None,
     clock: Callable[[], float] | None = None,
     nonce_source: Callable[[], str] | None = None,
 ) -> ClosedRepairWriterRuntimeCoordinatorV1:
@@ -816,7 +994,11 @@ def build_production_closed_repair_writer_runtime_coordinator_v1(
 
     binding = config or ProductionWriterRuntimeCoordinatorBindingConfigV1()
     if not binding.enabled:
-        return ClosedRepairWriterRuntimeCoordinatorV1()
+        return ClosedRepairWriterRuntimeCoordinatorV1(
+            config=WriterRuntimeCoordinatorConfigV1(
+                maintenance_only=binding.maintenance_only,
+            )
+        )
     if (
         binding.scope_attestation
         != PRODUCTION_COORDINATOR_EXPLICIT_DEPENDENCY_BINDING_ATTESTATION_V1
@@ -854,6 +1036,9 @@ def build_production_closed_repair_writer_runtime_coordinator_v1(
         raise WriterRuntimeCoordinationBlocked(
             "PRODUCTION_COORDINATOR_STORAGE_ROOT_BINDING_MISMATCH"
         )
+    resolved_registry = _validate_production_registry_storage_binding_v1(
+        registry_path, lock_backend.storage_root
+    )
     if not callable(clock) or not callable(nonce_source):
         raise WriterRuntimeCoordinationBlocked(
             "PRODUCTION_COORDINATOR_CLOCK_AND_NONCE_REQUIRED"
@@ -862,6 +1047,7 @@ def build_production_closed_repair_writer_runtime_coordinator_v1(
         config=WriterRuntimeCoordinatorConfigV1(
             enabled=True,
             lock_timeout_seconds=binding.lock_timeout_seconds,
+            maintenance_only=binding.maintenance_only,
         ),
         lock_backend=lock_backend,
         lease_store=lease_store,
@@ -875,6 +1061,7 @@ def build_production_closed_repair_writer_runtime_coordinator_v1(
         raise WriterRuntimeCoordinationBlocked(
             "PRODUCTION_COORDINATOR_WRITER_REGISTRATION_FAILED"
         )
+    coordinator._registry_path_binding = resolved_registry
     return coordinator
 
 

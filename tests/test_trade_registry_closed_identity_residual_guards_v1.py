@@ -161,6 +161,7 @@ def test_trade_close_outcome_commit_rejects_fresh_identity_conflict_without_writ
     namespace = {
         "json": json,
         "central_trade_registry": central_registry,
+        "_trpsf_v1_registry_lock": lambda: registry_module._lock,
         "TRADE_CLOSE_OUTCOME_V1_VERSION": "test-v1",
         "_tco_v1_load_registry": lambda: {
             "closed_trades": [copy.deepcopy(fresh)]

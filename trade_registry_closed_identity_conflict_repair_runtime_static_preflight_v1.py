@@ -41,6 +41,8 @@ REQUIRED_SOURCE_KEYS_V1 = (
 
 _WRITER_MUTATION_MARKER = "_c3_closed_repair_writer_mutation_v1"
 _PROVIDER_INSTALL_MARKER = "_install_c3_closed_repair_writer_coordination_v1"
+_DORMANT_COORDINATOR_GLOBAL = "C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1"
+_COORDINATOR_BUILDER = "build_production_closed_repair_writer_runtime_coordinator_v1"
 _STARTUP_RECOVERY_MARKER = "_recover_c3_closed_repair_registry_v1"
 _STALE_LEASE_RECOVERY_MARKER = "recover_stale_maintenance_lease_v1"
 _LIVE_PREFLIGHT_CHECK_CODE = "TRADE_REGISTRY_C3_WRITER_COORDINATION_READY"
@@ -404,6 +406,58 @@ def _first_line(calls: list[tuple[str, int]], name: str) -> int | None:
     return min(lines) if lines else None
 
 
+def _dormant_coordinator_startup_binding(tree: ast.Module) -> bool:
+    """Recognize the explicit default-off construction graph, not a marker."""
+    def assignment(name):
+        matches = [n for n in tree.body if isinstance(n, ast.Assign)
+                   and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+                   and n.targets[0].id == name]
+        stores = [n for n in ast.walk(tree) if isinstance(n, ast.Name)
+                  and isinstance(n.ctx, ast.Store) and n.id == name]
+        return matches[0] if len(matches) == len(stores) == 1 else None
+
+    coordinator = assignment(_DORMANT_COORDINATOR_GLOBAL)
+    adapters = assignment(_AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_GLOBAL)
+    installation = assignment("C3_CLOSED_REPAIR_INSTALLATION_V1")
+    functions = _function_nodes(tree).get(_PROVIDER_INSTALL_MARKER, [])
+    if any(n is None for n in (coordinator, adapters, installation)) or len(functions) != 1:
+        return False
+    value, function = coordinator.value, functions[0]
+    if not (isinstance(value, ast.Call) and not value.args and not value.keywords
+            and isinstance(value.func, ast.Attribute) and value.func.attr == _COORDINATOR_BUILDER
+            and isinstance(value.func.value, ast.Name) and value.func.value.id == "c3_writer_coordinator_v1"
+            and coordinator.lineno < adapters.lineno < installation.lineno
+            and any(a.arg == "coordinator" and default is None
+                    for a, default in zip(function.args.kwonlyargs, function.args.kw_defaults))
+            and not any(isinstance(n, ast.Name) and n.id == "coordinator"
+                        and isinstance(n.ctx, ast.Store) for n in ast.walk(function))):
+        return False
+    for node, keyword in ((adapters, "maintenance_coordinator"), (installation, "coordinator")):
+        if not isinstance(node.value, ast.Call):
+            return False
+        values = [k.value for k in node.value.keywords if k.arg == keyword]
+        if not (len(values) == 1 and isinstance(values[0], ast.Name)
+                and values[0].id == _DORMANT_COORDINATOR_GLOBAL):
+            return False
+    # This narrow canonical guard must precede capability creation/installation.
+    expected = ast.parse('''if (
+        type(startup_recovery)
+        is not c3_authenticated_persistent_authority_boundary_v2.AuthenticatedPersistentAuthorityBoundaryV2
+        or startup_recovery._config.enabled is not False
+        or type(startup_recovery._multistore_recovery)
+        is not c3_authenticated_persistent_authority_production_adapters_v2.CoordinatedMultistoreStartupRecoveryV2
+        or not startup_recovery._multistore_recovery.dormant_coordinator_bound_v2(coordinator)
+    ):
+        raise RuntimeError("C3_DORMANT_STARTUP_COORDINATOR_BINDING_REQUIRED")
+''').body[0]
+    statements = [n for n in function.body if not isinstance(n, ast.Global)
+                  and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+                           and isinstance(n.value.value, str))]
+    return bool(statements and ast.dump(statements[0]) == ast.dump(expected)
+                and sum(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                        and n.func.attr == _COORDINATOR_BUILDER for n in ast.walk(tree)) == 1)
+
+
 def _bot_by_name_imports(tree: ast.AST) -> list[str]:
     imported: list[str] = []
     for node in ast.walk(tree):
@@ -720,6 +774,9 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
         if len(provider_nodes) == 1
         else set()
     )
+    dormant_coordinator_bound = _dormant_coordinator_startup_binding(main_tree)
+    if dormant_coordinator_bound:
+        provider_called_builders = provider_called_builders | {_COORDINATOR_BUILDER}
     add(
         "PERSISTENCE_BOOTSTRAP_BEFORE_RUNTIME_START",
         persistence_line is not None
@@ -740,6 +797,7 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
     add(
         "C3_PROVIDER_BINDS_PRODUCTION_CAPABILITIES",
         len(provider_nodes) == 1
+        and dormant_coordinator_bound
         and provider_called_builders == _PRODUCTION_BUILDER_NAMES
         and not incapable_runtime_modules,
         provider_definition_count=len(provider_nodes),
@@ -869,7 +927,11 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
             and isinstance(value.func, ast.Attribute)
             and value.func.attr == _AUTHENTICATED_PERSISTENT_AUTHORITY_ADAPTERS_BUILDER
             and not value.args
-            and not value.keywords
+            and len(value.keywords) == 1
+            and value.keywords[0].arg == "maintenance_coordinator"
+            and isinstance(value.keywords[0].value, ast.Name)
+            and value.keywords[0].value.id == _DORMANT_COORDINATOR_GLOBAL
+            and dormant_coordinator_bound
         )
     manifest_builder_bound = False
     if len(manifest_assignments) == 1:
@@ -975,7 +1037,9 @@ def evaluate_closed_repair_runtime_static_preflight_v1(
         ):
             keywords = {item.arg: item.value for item in value.keywords}
             installation_authority_bound = bool(
-                set(keywords) == {"startup_recovery"}
+                set(keywords) == {"startup_recovery", "coordinator"}
+                and isinstance(keywords["coordinator"], ast.Name)
+                and keywords["coordinator"].id == _DORMANT_COORDINATOR_GLOBAL
                 and isinstance(keywords["startup_recovery"], ast.Name)
                 and keywords["startup_recovery"].id
                 == _AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_GLOBAL

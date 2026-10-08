@@ -11,11 +11,13 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import re
 import threading
 from contextlib import ContextDecorator
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1 as coordinator_module
@@ -41,6 +43,7 @@ _CONTROLLED_ACTIVATION_SOURCE_FILES = frozenset(
         "trade_registry_closed_identity_conflict_repair_raw_transaction_store_production_v1.py",
         "trade_registry_closed_identity_conflict_repair_writer_invocation_adapter_v1.py",
         "trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1.py",
+        "trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py",
         "trade_registry_closed_identity_conflict_repair_production_provider_v1.py",
     }
 )
@@ -93,6 +96,60 @@ def controlled_activation_evidence_sha256_v1(
         if key != "activation_evidence_sha256"
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def verify_controlled_activation_source_hashes_read_only_v1(
+    repository_root: os.PathLike[str] | str,
+    source_hashes: Mapping[str, str],
+) -> dict[str, Any]:
+    """Compare activation claims with bounded source bytes, without activating C3."""
+
+    result: dict[str, Any] = {
+        "ok": False,
+        "status": "C3_CONTROLLED_ACTIVATION_SOURCE_HASHES_BLOCKED",
+        "verified_file_count": 0,
+        "read_only": True,
+        "activation_allowed": False,
+        "runtime_integrated": False,
+        "network_accessed": False,
+        "broker_called": False,
+        "no_order_sent": True,
+    }
+    if (
+        not isinstance(source_hashes, Mapping)
+        or set(source_hashes) != _CONTROLLED_ACTIVATION_SOURCE_FILES
+        or any(
+            not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+            for value in source_hashes.values()
+        )
+    ):
+        return result
+    try:
+        root = Path(repository_root).resolve(strict=True)
+        if not root.is_dir():
+            return result
+        total_size = 0
+        for relative in sorted(_CONTROLLED_ACTIVATION_SOURCE_FILES):
+            candidate = (root / relative).resolve(strict=True)
+            if not candidate.is_relative_to(root) or not candidate.is_file():
+                return result
+            size = candidate.stat().st_size
+            if size <= 0 or size > 8 * 1024 * 1024:
+                return result
+            total_size += size
+            if total_size > 20 * 1024 * 1024:
+                return result
+            actual = candidate.read_bytes()
+            if len(actual) != size or not hmac.compare_digest(
+                hashlib.sha256(actual).hexdigest(), source_hashes[relative]
+            ):
+                return result
+            result["verified_file_count"] += 1
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return result
+    result["ok"] = True
+    result["status"] = "C3_CONTROLLED_ACTIVATION_SOURCE_HASHES_VERIFIED_READ_ONLY"
+    return result
 
 
 def _reset_controlled_activation_state_v1() -> None:
@@ -326,11 +383,13 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     kill_switch: Callable[[], bool] | None = None,
     activation_authority: Any = None,
     activation_interlock: Any = None,
+    active_registry_path: os.PathLike[str] | str | None = None,
 ) -> dict[str, Any]:
     """Install an enabled coordinator only from complete, hash-bound evidence.
 
     This callable is deliberately not wired into ``main.py``.  Its defaults
-    deny activation and it consumes only caller-supplied sanitized evidence.
+    deny activation.  Before any install it checks caller-supplied evidence
+    against the local source files; it never reads the Registry here.
     """
 
     global _coordinator
@@ -368,6 +427,10 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     if coordinator.enabled is not True:
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
             "C3_CONTROLLED_ACTIVATION_ENABLED_COORDINATOR_REQUIRED"
+        )
+    if coordinator.maintenance_only:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_MAINTENANCE_ONLY_RUNTIME_ACTIVATION_FORBIDDEN"
         )
     if not isinstance(activation_evidence, Mapping):
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
@@ -461,6 +524,13 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
             "C3_CONTROLLED_ACTIVATION_EVIDENCE_UNSAFE"
         )
+    source_preflight = verify_controlled_activation_source_hashes_read_only_v1(
+        Path(__file__).resolve().parent, source_hashes
+    )
+    if source_preflight["ok"] is not True:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_SOURCE_HASH_MISMATCH"
+        )
     if not callable(kill_switch):
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
             "C3_CONTROLLED_ACTIVATION_KILL_SWITCH_REQUIRED"
@@ -484,6 +554,35 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     ):
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
             "C3_CONTROLLED_ACTIVATION_COORDINATOR_NOT_QUIESCENT"
+        )
+
+    storage = coordinator_module.runtime_storage
+    lock_backend = coordinator._lock_backend
+    lease_store = coordinator._lease_store
+    if not (
+        type(lock_backend) is storage.CrossPlatformInterprocessFileLockBackendV1
+        and type(lease_store) is storage.DurableJsonMaintenanceLeaseStoreV1
+        and lock_backend.enabled is True
+        and lease_store.enabled is True
+        and lock_backend.storage_root == lease_store.storage_root
+    ):
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_REGISTRY_STORAGE_BINDING_INVALID"
+        )
+    try:
+        resolved_registry = coordinator_module._validate_production_registry_storage_binding_v1(
+            active_registry_path, lock_backend.storage_root
+        )
+    except coordinator_module.WriterRuntimeCoordinationBlocked as exc:
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_REGISTRY_STORAGE_BINDING_INVALID"
+        ) from exc
+    if (
+        not isinstance(getattr(coordinator, "_registry_path_binding", None), Path)
+        or coordinator._registry_path_binding != resolved_registry
+    ):
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_REGISTRY_STORAGE_BINDING_INVALID"
         )
 
     with _prebootstrap_seam_atomic_lock:
@@ -905,6 +1004,7 @@ __all__ = [
     "build_dormant_c3_prebootstrap_seam_cas_surface_v1",
     "c3_closed_repair_writer_coordination_status_v1",
     "controlled_activation_evidence_sha256_v1",
+    "verify_controlled_activation_source_hashes_read_only_v1",
     "install_controlled_c3_closed_repair_writer_coordinator_v1",
     "install_dormant_c3_closed_repair_writer_coordinator_v1",
     "startup_recovery_attestation_sha256_v1",

@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +18,9 @@ MAIN = Path("main.py")
 
 
 def _functions(names, namespace):
+    names = set(names) | {"_trpsf_v1_registry_lock"}
+    namespace.setdefault("c3_runtime_seam_v1", SimpleNamespace(
+        _c3_closed_repair_writer_mutation_v1=lambda _: nullcontext()))
     tree = ast.parse(MAIN.read_text(encoding="utf-8"))
     selected = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     module = ast.Module(body=selected, type_ignores=[])
@@ -26,6 +31,7 @@ def _functions(names, namespace):
 
 class Registry:
     def __init__(self, payload):
+        self._lock = threading.RLock()
         self.payload = payload
         self.saved = 0
 

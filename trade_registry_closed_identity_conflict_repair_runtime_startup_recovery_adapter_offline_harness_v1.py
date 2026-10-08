@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+from pathlib import Path
 from typing import Any
 
 import trade_registry_closed_identity_conflict_repair_durable_raw_transaction_backend_physical_reference_v2 as physical_backend
@@ -28,6 +29,7 @@ _SOURCE_FILES = (
     "trade_registry_closed_identity_conflict_repair_raw_transaction_store_production_v1.py",
     "trade_registry_closed_identity_conflict_repair_writer_invocation_adapter_v1.py",
     "trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1.py",
+    "trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py",
     "trade_registry_closed_identity_conflict_repair_production_provider_v1.py",
 )
 
@@ -73,7 +75,9 @@ def _activation_evidence() -> dict[str, Any]:
         "activation_receipt_verified": True,
         "source_hashes_verified": True,
         "source_hashes": {
-            name: hashlib.sha256(name.encode("utf-8")).hexdigest()
+            name: hashlib.sha256(
+                (Path(__file__).resolve().parent / name).read_bytes()
+            ).hexdigest()
             for name in _SOURCE_FILES
         },
         "shared_lock_backend_ready": True,
@@ -178,16 +182,26 @@ def run_offline_runtime_startup_recovery_adapter_harness_v1() -> dict[str, Any]:
 
         backend.reconcile_attested_transaction_offline = reconcile_with_binding
 
-        coordinator = coordinator_module.build_closed_repair_writer_runtime_coordinator_v1(
-            config=coordinator_module.WriterRuntimeCoordinatorConfigV1(
-                enabled=True
+        coordination_root = Path(root) / "synthetic-coordination"
+        storage = coordinator_module.runtime_storage
+        coordinator = coordinator_module.build_production_closed_repair_writer_runtime_coordinator_v1(
+            config=coordinator_module.ProductionWriterRuntimeCoordinatorBindingConfigV1(
+                enabled=True,
+                scope_attestation=coordinator_module.PRODUCTION_COORDINATOR_EXPLICIT_DEPENDENCY_BINDING_ATTESTATION_V1,
+                storage_root_binding_sha256=coordinator_module.production_coordinator_storage_root_binding_sha256_v1(
+                    coordination_root
+                ),
             ),
-            lock_backend=_LockBackend(),
-            lease_store=_LeaseStore(),
+            lock_backend=storage.CrossPlatformInterprocessFileLockBackendV1(
+                coordination_root, enabled=True
+            ),
+            lease_store=storage.DurableJsonMaintenanceLeaseStoreV1(
+                coordination_root, enabled=True
+            ),
+            registry_path=backend._store.target_path,
             clock=lambda: float(SYNTHETIC_NOW_V1 + 3),
             nonce_source=lambda: "offline-startup-adapter-nonce",
         )
-        coordinator.register_all_declared_writers()
         captured: dict[str, Any] = {}
         try:
             previous_authority = runtime_seam._controlled_activation_authority_v1
@@ -207,6 +221,7 @@ def run_offline_runtime_startup_recovery_adapter_harness_v1() -> dict[str, Any]:
                     kill_switch=lambda: False,
                     activation_authority=offline_authority,
                     activation_interlock=offline_interlock,
+                    active_registry_path=backend._store.target_path,
                 )
             finally:
                 runtime_seam._controlled_activation_authority_v1 = previous_authority

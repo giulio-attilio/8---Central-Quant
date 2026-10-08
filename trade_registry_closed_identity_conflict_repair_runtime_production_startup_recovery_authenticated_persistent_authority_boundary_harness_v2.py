@@ -163,13 +163,14 @@ class TemporarySyntheticMultistoreRecoveryV2:
 
 
 def build_authenticated_persistent_authority_boundary_context_v2(
-    root: str | Path, *, revoked: bool = False
+    root: str | Path, *, revoked: bool = False,
+    root_key_id_sha256: str | None = None,
 ) -> dict[str, Any]:
     root_path = Path(root).resolve(strict=False)
     resolved_root = root_path / "resolved_authority"
     resolved_root.mkdir(parents=True, exist_ok=False)
     values = store_harness_v2.build_resolved_authority_physical_store_reference_context_v2(
-        resolved_root
+        resolved_root, root_key_id_sha256=root_key_id_sha256,
     )
     store = values["reference"]
     attestation = dict(vars(values["ledger"])["_root_authority_attestation"])

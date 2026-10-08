@@ -156,16 +156,18 @@ def runtime_startup_admission_request_sha256_v1(request: Mapping[str, Any]) -> s
 
 
 def production_evidence_verifier_identity_sha256_v1(verifier: Any) -> str:
+    """Process-local instance binding, not authentication; rebuild on each boot."""
     if not callable(verifier):
         raise TypeError("verifier must be callable")
     module = str(getattr(verifier, "__module__", "") or "")
     qualname = str(getattr(verifier, "__qualname__", "") or "")
     owner = getattr(verifier, "__self__", None)
     owner_name = type(owner).__qualname__ if owner is not None else ""
+    identity_target = owner if owner is not None else verifier
     if not module or not qualname:
         raise TypeError("verifier identity is unavailable")
     return hashlib.sha256(
-        f"{module}:{qualname}:{owner_name}".encode("utf-8")
+        f"{module}:{qualname}:{owner_name}:{id(identity_target)}".encode("utf-8")
     ).hexdigest()
 
 
@@ -474,6 +476,17 @@ class RuntimeStartupAdmissionGateContractV1:
             )
         evidence_sha = _stable_sha256(evidence)
         with self._lock:
+            # The optimistic checks above do not serialize concurrent callers.
+            # Admission and consumption must be decided under the same lock.
+            authority_root, _ = self._require_enabled()
+            if self._active_permit is not None:
+                raise RuntimeStartupAdmissionBlocked(
+                    "C3_RUNTIME_STARTUP_ADMISSION_NESTED_FORBIDDEN"
+                )
+            if request_sha in self._consumed:
+                raise RuntimeStartupAdmissionBlocked(
+                    "C3_RUNTIME_STARTUP_ADMISSION_REQUEST_REPLAY_BLOCKED"
+                )
             try:
                 before = self._startup_state()
             except Exception as exc:

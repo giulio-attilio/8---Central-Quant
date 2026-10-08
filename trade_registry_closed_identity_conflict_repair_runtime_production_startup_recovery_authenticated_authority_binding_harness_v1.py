@@ -31,8 +31,9 @@ class SyntheticOfflineRootAuthorityVerifierV1:
     filesystem_access_allowed = False
     network_access_allowed = False
 
-    def __init__(self) -> None:
+    def __init__(self, *, expected_key_id_sha256: str = _SYNTHETIC_KEY_ID_SHA256) -> None:
         self.call_count = 0
+        self._expected_key_id_sha256 = expected_key_id_sha256
 
     def verify_root_authority_signature_v2(
         self,
@@ -42,7 +43,7 @@ class SyntheticOfflineRootAuthorityVerifierV1:
         signature_sha256: str,
     ) -> bool:
         self.call_count += 1
-        if key_id_sha256 != _SYNTHETIC_KEY_ID_SHA256:
+        if key_id_sha256 != self._expected_key_id_sha256:
             return False
         expected = hmac.new(
             _SYNTHETIC_KEY,
@@ -59,12 +60,13 @@ def _root_authority_attestation(
     *,
     root_identity_sha256: str,
     storage_binding_sha256: str,
+    key_id_sha256: str = _SYNTHETIC_KEY_ID_SHA256,
 ) -> dict[str, Any]:
     value = {
         "attestation_version": authority_v2.AUTHENTICATED_ROOT_AUTHORITY_ATTESTATION_VERSION_V2,
         "root_identity_sha256": root_identity_sha256,
         "storage_binding_sha256": storage_binding_sha256,
-        "key_id_sha256": _SYNTHETIC_KEY_ID_SHA256,
+        "key_id_sha256": key_id_sha256,
         "key_epoch": 2,
         "previous_attestation_sha256": _sha("synthetic-previous-root-v1"),
         "issued_at_epoch": 1_000,

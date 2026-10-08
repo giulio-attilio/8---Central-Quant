@@ -2370,6 +2370,7 @@ TRADE_REGISTRY_AUTOSYNC_STATUS = {
 # Evita inicialização duplicada de bots/roteadores no mesmo processo.
 CENTRAL_RUNTIME_STARTED = False
 CENTRAL_RUNTIME_LOCK = threading.Lock()
+C3_MAINTENANCE_STARTUP_BINDING_V1 = None
 
 # Locks de processo para evitar duplicidade quando o Render/Gunicorn inicia
 # mais de um worker/processo. A trava em memória evita duplicidade só dentro
@@ -4484,55 +4485,58 @@ def _trs_v1_existing_open_match(symbol=None, side=None, bot=None, setup=None, or
         return {"ok": True, "exists": False}
     except Exception as exc:
         return {"ok": False, "exists": False, "error": str(exc)}
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_SYNC_MANUAL_REGISTER_OPEN")
 def _trs_v1_manual_register_open_trade(candidate):
-    registry = central_trade_registry.load_registry()
-    if not isinstance(registry, dict):
-        registry = {}
-    open_trades = registry.get("open_trades", {})
-    if not isinstance(open_trades, dict):
-        open_trades = {}
-    try:
-        trade_id = central_trade_registry.make_trade_id(
-            candidate.get("bot"), candidate.get("symbol"), candidate.get("side"), candidate.get("setup")
-        )
-    except Exception:
-        trade_id = candidate.get("trade_id") or f"{candidate.get('bot')}:{candidate.get('symbol')}:{candidate.get('side')}:{candidate.get('setup')}:{int(time.time())}"
-    suffix = 1
-    base_trade_id = str(trade_id)
-    while str(trade_id) in open_trades:
-        suffix += 1
-        trade_id = f"{base_trade_id}:{suffix}"
-    now = data_hora_sp_str() if callable(globals().get("data_hora_sp_str")) else None
-    trade = {
-        "trade_id": str(trade_id),
-        "bot": candidate.get("bot"),
-        "symbol": candidate.get("symbol"),
-        "symbol_clean": candidate.get("symbol"),
-        "side": candidate.get("side"),
-        "setup": candidate.get("setup"),
-        "entry": candidate.get("entry"),
-        "sl": candidate.get("sl"),
-        "tp50": candidate.get("tp50"),
-        "qty": candidate.get("qty"),
-        "status": "OPEN",
-        "source": candidate.get("source") or "trade_registry_sync_v1",
-        "opened_at": now,
-        "last_update": now,
-        "metadata": candidate.get("metadata") or {},
-    }
-    open_trades[str(trade_id)] = trade
-    registry["open_trades"] = open_trades
-    registry["updated_at"] = now
-    registry_write = central_trade_registry.save_registry(registry)
-    if registry_write is False:
-        return {
-            "ok": False,
+    registry_lock = _trpsf_v1_registry_lock()
+    if registry_lock is None:
+        return {"ok": False, "error": "REGISTRY_LOCK_UNAVAILABLE"}
+    with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_SYNC_MANUAL_REGISTER_OPEN"), registry_lock:
+        registry = central_trade_registry.load_registry()
+        if not isinstance(registry, dict):
+            registry = {}
+        open_trades = registry.get("open_trades", {})
+        if not isinstance(open_trades, dict):
+            open_trades = {}
+        try:
+            trade_id = central_trade_registry.make_trade_id(
+                candidate.get("bot"), candidate.get("symbol"), candidate.get("side"), candidate.get("setup")
+            )
+        except Exception:
+            trade_id = candidate.get("trade_id") or f"{candidate.get('bot')}:{candidate.get('symbol')}:{candidate.get('side')}:{candidate.get('setup')}:{int(time.time())}"
+        suffix = 1
+        base_trade_id = str(trade_id)
+        while str(trade_id) in open_trades:
+            suffix += 1
+            trade_id = f"{base_trade_id}:{suffix}"
+        now = data_hora_sp_str() if callable(globals().get("data_hora_sp_str")) else None
+        trade = {
             "trade_id": str(trade_id),
-            "method": "manual_save_registry",
-            "error": "REGISTRY_SAVE_NOT_CONFIRMED",
+            "bot": candidate.get("bot"),
+            "symbol": candidate.get("symbol"),
+            "symbol_clean": candidate.get("symbol"),
+            "side": candidate.get("side"),
+            "setup": candidate.get("setup"),
+            "entry": candidate.get("entry"),
+            "sl": candidate.get("sl"),
+            "tp50": candidate.get("tp50"),
+            "qty": candidate.get("qty"),
+            "status": "OPEN",
+            "source": candidate.get("source") or "trade_registry_sync_v1",
+            "opened_at": now,
+            "last_update": now,
+            "metadata": candidate.get("metadata") or {},
         }
-    return {"ok": True, "trade_id": str(trade_id), "trade": trade, "method": "manual_save_registry"}
+        open_trades[str(trade_id)] = trade
+        registry["open_trades"] = open_trades
+        registry["updated_at"] = now
+        registry_write = central_trade_registry.save_registry(registry)
+        if registry_write is False:
+            return {
+                "ok": False,
+                "trade_id": str(trade_id),
+                "method": "manual_save_registry",
+                "error": "REGISTRY_SAVE_NOT_CONFIRMED",
+            }
+        return {"ok": True, "trade_id": str(trade_id), "trade": trade, "method": "manual_save_registry"}
 
 def trade_registry_sync_v1_register_candidate(candidate, commit=True):
     if central_trade_registry is None:
@@ -7245,53 +7249,58 @@ def _rtlm_v1_find_open_trades(symbol=None, side=None, bot=None, setup=None):
         "trade_registry_file": str(getattr(central_trade_registry, "TRADE_REGISTRY_FILE", "")),
     }
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_LIFECYCLE_UPDATE_OPEN_SNAPSHOT")
 def _rtlm_v1_update_open_trade_snapshot(symbol=None, side=None, bot=None, setup=None, lifecycle=None, commit=False):
     """Atualiza metadata/snapshot do trade aberto. Não fecha trade."""
     if not commit:
         return {"attempted": False, "committed": False, "status": "COMMIT_NOT_REQUESTED"}
-    registry = _rtlm_v1_load_registry()
-    if registry is None:
-        return {"attempted": True, "committed": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR}
-    open_obj, items = _rtlm_v1_registry_open_items(registry)
-    updated = []
-    now = _rtlm_v1_now()
-    for key, trade in items:
-        if not _rtlm_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup):
-            continue
-        meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
-        meta["lifecycle_version"] = REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION
-        meta["lifecycle_last_check_at"] = now
-        meta["lifecycle_status"] = (lifecycle or {}).get("status")
-        meta["lifecycle_stop_confirmed"] = (lifecycle or {}).get("stop_confirmed_by_central")
-        tp50_payload = ((lifecycle or {}).get("tp50") or {})
-        meta["lifecycle_tp50_hit"] = tp50_payload.get("hit")
-        meta["tp50_resolver_version"] = tp50_payload.get("version")
-        meta["tp50_resolved"] = tp50_payload.get("resolved")
-        meta["tp50_source"] = tp50_payload.get("tp50_source")
-        meta["tp50_needs_review"] = tp50_payload.get("needs_tp50_review")
-        meta["tp50_invalid_reason"] = tp50_payload.get("invalid_reason")
-        if tp50_payload.get("resolved") and tp50_payload.get("tp50") is not None:
-            trade["tp50"] = tp50_payload.get("tp50")
-        meta["lifecycle_current_pnl"] = ((lifecycle or {}).get("position") or {}).get("unrealizedPnl")
-        meta["lifecycle_mark_price"] = ((lifecycle or {}).get("position") or {}).get("markPrice")
-        meta["lifecycle_position_found"] = (lifecycle or {}).get("position_found")
-        trade["metadata"] = meta
-        trade["last_update"] = now
-        trade["lifecycle_status"] = (lifecycle or {}).get("status")
-        trade["last_mark_price"] = ((lifecycle or {}).get("position") or {}).get("markPrice")
-        trade["last_unrealized_pnl"] = ((lifecycle or {}).get("position") or {}).get("unrealizedPnl")
-        updated.append(str(key))
-    if not updated:
-        return {"attempted": True, "committed": False, "status": "NO_MATCHING_OPEN_TRADE"}
-    registry["updated_at"] = now
-    try:
-        registry_write = central_trade_registry.save_registry(registry)
-        if registry_write is False:
-            raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
-    except Exception as exc:
-        return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
-    return {"attempted": True, "committed": True, "status": "OPEN_TRADE_SNAPSHOT_UPDATED", "updated_keys": updated}
+    # Acquire C3 before the process-local lock for the fresh Registry RMW.
+    lock_resolver = globals().get("_trpsf_v1_registry_lock")
+    registry_lock = lock_resolver() if callable(lock_resolver) else None
+    if registry_lock is None:
+        return {"attempted": True, "committed": False, "status": "REGISTRY_LOCK_UNAVAILABLE"}
+    with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_LIFECYCLE_UPDATE_OPEN_SNAPSHOT"), registry_lock:
+        registry = _rtlm_v1_load_registry()
+        if registry is None:
+            return {"attempted": True, "committed": False, "status": "TRADE_REGISTRY_UNAVAILABLE", "error": TRADE_REGISTRY_IMPORT_ERROR}
+        open_obj, items = _rtlm_v1_registry_open_items(registry)
+        updated = []
+        now = _rtlm_v1_now()
+        for key, trade in items:
+            if not _rtlm_v1_match_trade(trade, symbol=symbol, side=side, bot=bot, setup=setup):
+                continue
+            meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+            meta["lifecycle_version"] = REAL_TRADE_LIFECYCLE_MONITOR_V1_VERSION
+            meta["lifecycle_last_check_at"] = now
+            meta["lifecycle_status"] = (lifecycle or {}).get("status")
+            meta["lifecycle_stop_confirmed"] = (lifecycle or {}).get("stop_confirmed_by_central")
+            tp50_payload = ((lifecycle or {}).get("tp50") or {})
+            meta["lifecycle_tp50_hit"] = tp50_payload.get("hit")
+            meta["tp50_resolver_version"] = tp50_payload.get("version")
+            meta["tp50_resolved"] = tp50_payload.get("resolved")
+            meta["tp50_source"] = tp50_payload.get("tp50_source")
+            meta["tp50_needs_review"] = tp50_payload.get("needs_tp50_review")
+            meta["tp50_invalid_reason"] = tp50_payload.get("invalid_reason")
+            if tp50_payload.get("resolved") and tp50_payload.get("tp50") is not None:
+                trade["tp50"] = tp50_payload.get("tp50")
+            meta["lifecycle_current_pnl"] = ((lifecycle or {}).get("position") or {}).get("unrealizedPnl")
+            meta["lifecycle_mark_price"] = ((lifecycle or {}).get("position") or {}).get("markPrice")
+            meta["lifecycle_position_found"] = (lifecycle or {}).get("position_found")
+            trade["metadata"] = meta
+            trade["last_update"] = now
+            trade["lifecycle_status"] = (lifecycle or {}).get("status")
+            trade["last_mark_price"] = ((lifecycle or {}).get("position") or {}).get("markPrice")
+            trade["last_unrealized_pnl"] = ((lifecycle or {}).get("position") or {}).get("unrealizedPnl")
+            updated.append(str(key))
+        if not updated:
+            return {"attempted": True, "committed": False, "status": "NO_MATCHING_OPEN_TRADE"}
+        registry["updated_at"] = now
+        try:
+            registry_write = central_trade_registry.save_registry(registry)
+            if registry_write is False:
+                raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+        except Exception as exc:
+            return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
+        return {"attempted": True, "committed": True, "status": "OPEN_TRADE_SNAPSHOT_UPDATED", "updated_keys": updated}
 
 
 def _rtlm_v1_close_open_trade(symbol=None, side=None, bot=None, setup=None, lifecycle=None, commit=False, ack=None):
@@ -9855,7 +9864,6 @@ def registry_persistence_v1_snapshot(
                 }
     payload["snapshot_save"] = save_result
     return payload
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT")
 def registry_persistence_v1_restore_from_latest_snapshot(
     commit=False, ack=None, _lock_held=False
 ):
@@ -9876,12 +9884,32 @@ def registry_persistence_v1_restore_from_latest_snapshot(
                 "status": "RESTORE_BLOCKED_REGISTRY_LOCK_UNAVAILABLE",
                 "committed": False,
             }
-        with registry_lock:
-            return registry_persistence_v1_restore_from_latest_snapshot(
+        with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT"), registry_lock:
+            result = registry_persistence_v1_restore_from_latest_snapshot(
                 commit=True,
                 ack=ack,
                 _lock_held=True,
             )
+        if result.get("status") != "REGISTRY_RESTORED_FROM_SNAPSHOT_WITH_CLOSED_HISTORY":
+            return result
+        try:
+            _rp_v1_append_event({
+                "event": "REGISTRY_PERSISTENCE_RESTORE",
+                "generated_at": _rp_v1_now(),
+                "open_count": result["open_count"],
+                "closed_count": result["closed_count"],
+                "closed_history_merge": result["closed_history_merge"],
+                "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            })
+            return result
+        except Exception as exc:
+            return {
+                "ok": False,
+                "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "status": "RESTORE_AUDIT_PERSISTENCE_ERROR_AFTER_REGISTRY_COMMIT",
+                "committed": True,
+                "error_type": type(exc).__name__,
+            }
     latest = _rp_v1_read_latest_snapshot()
     if not latest.get("ok"):
         return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": latest.get("status"), "latest": latest, "committed": False}
@@ -9991,7 +10019,6 @@ def registry_persistence_v1_restore_from_latest_snapshot(
         if registry_write is False:
             raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
         registry_committed = True
-        _rp_v1_append_event({"event": "REGISTRY_PERSISTENCE_RESTORE", "generated_at": _rp_v1_now(), "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge, "version": REGISTRY_PERSISTENCE_V1_VERSION})
         return {"ok": True, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "REGISTRY_RESTORED_FROM_SNAPSHOT_WITH_CLOSED_HISTORY", "committed": True, "open_count": open_count, "closed_count": closed_count, "closed_history_merge": closed_history_merge}
     except Exception as exc:
         return {
@@ -10182,7 +10209,6 @@ def _rp_v12_closed_trade_exists(raw_registry, trade_id):
         }
     return None
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE")
 def registry_persistence_v12_recover_closed_trade_from_params(
     symbol=None,
     side=None,
@@ -10223,111 +10249,125 @@ def registry_persistence_v12_recover_closed_trade_from_params(
             "trade_id": trade_id,
         }
 
-    raw = _rp_v12_load_raw_registry_safe()
-    if not isinstance(raw, dict):
-        return {
-            "ok": False,
-            "version": REGISTRY_PERSISTENCE_V1_VERSION,
-            "status": "TRADE_REGISTRY_READ_ERROR",
-            "committed": False,
-            "trade_id": trade_id,
-        }
-    existing = _rp_v12_closed_trade_exists(raw, trade_id)
-    if existing:
-        if existing.get("_closed_trade_strong_identity_required"):
+    from contextlib import nullcontext
+    registry_lock = _trpsf_v1_registry_lock() if commit else None
+    if commit and registry_lock is None:
+        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "status": "REGISTRY_LOCK_UNAVAILABLE", "committed": False, "trade_id": trade_id}
+    with (
+        c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE")
+        if commit else nullcontext()
+    ), registry_lock if commit else nullcontext():
+        raw = _rp_v12_load_raw_registry_safe()
+        if not isinstance(raw, dict):
             return {
                 "ok": False,
                 "version": REGISTRY_PERSISTENCE_V1_VERSION,
-                "status": "CLOSED_TRADE_STRONG_IDENTITY_REQUIRED",
+                "status": "TRADE_REGISTRY_READ_ERROR",
                 "committed": False,
                 "trade_id": trade_id,
-                "candidate_count": existing.get("candidate_count"),
-                "reason": "TRADE_ID_IS_NOT_A_CLOSED_EXECUTION_IDENTITY",
             }
-        return {
-            "ok": True,
-            "version": REGISTRY_PERSISTENCE_V1_VERSION,
-            "status": "CLOSED_TRADE_ALREADY_REGISTERED",
-            "committed": False,
+        existing = _rp_v12_closed_trade_exists(raw, trade_id)
+        if existing:
+            if existing.get("_closed_trade_strong_identity_required"):
+                return {
+                    "ok": False,
+                    "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                    "status": "CLOSED_TRADE_STRONG_IDENTITY_REQUIRED",
+                    "committed": False,
+                    "trade_id": trade_id,
+                    "candidate_count": existing.get("candidate_count"),
+                    "reason": "TRADE_ID_IS_NOT_A_CLOSED_EXECUTION_IDENTITY",
+                }
+            return {
+                "ok": True,
+                "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "status": "CLOSED_TRADE_ALREADY_REGISTERED",
+                "committed": False,
+                "trade_id": trade_id,
+                "closed_trade": existing,
+            }
+
+        entry_f = _rp_v1_float(entry)
+        qty_f = _rp_v1_float(qty)
+        sl_f = _rp_v1_float(sl)
+        tp50_f = _rp_v1_float(tp50)
+        exit_f = _rp_v1_float(exit_price)
+        realized_f = _rp_v1_float(realized_pnl)
+        last_mark_f = _rp_v1_float(last_mark_price)
+        last_unrealized_f = _rp_v1_float(last_unrealized_pnl)
+
+        if entry_f is None:
+            return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "ENTRY_REQUIRED", "committed": False, "trade_id": trade_id}
+
+        # Se exit_price não veio, usa o último mark conhecido apenas como referência estimada.
+        exit_reference = exit_f if exit_f is not None else last_mark_f
+        close_reason_s = str(close_reason or "MANUAL_CLOSE").upper().strip()
+
+        closed_trade = {
             "trade_id": trade_id,
-            "closed_trade": existing,
+            "bot": bot_n,
+            "setup": setup_n,
+            "symbol": symbol_n,
+            "side": side_n,
+            "status": "CLOSED",
+            "entry": entry_f,
+            "qty": qty_f,
+            "sl": sl_f,
+            "tp50": tp50_f,
+            "exit_price": exit_f,
+            "exit_price_source": "manual_param" if exit_f is not None else ("last_mark_price_estimate" if last_mark_f is not None else None),
+            "last_mark_price": last_mark_f,
+            "realized_pnl": realized_f,
+            "last_unrealized_pnl": last_unrealized_f,
+            "close_reason": close_reason_s,
+            "closed_at": _rp_v1_now(),
+            "last_update": _rp_v1_now(),
+            "source": "registry_persistence_v1_2_closed_manual_recovery",
+            "metadata": {
+                "recovery_version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "recovered_by": "registry_persistence_v1_2_closed_manual_recovery",
+                "manual_ack": "RESTORE_CLOSED_TRADE_MANUAL",
+                "recovered_at": _rp_v1_now(),
+                "position_found_at_recovery": bool(live_state.get("position_found")),
+                "safety_status_at_recovery": live_state.get("safety_status"),
+                "exit_reference": exit_reference,
+                "exit_reference_source": "exit_price" if exit_f is not None else ("last_mark_price" if last_mark_f is not None else None),
+                "note": "Trade fechado recuperado manualmente após snapshot latest vazio/restore sem CLOSED.",
+            },
         }
 
-    entry_f = _rp_v1_float(entry)
-    qty_f = _rp_v1_float(qty)
-    sl_f = _rp_v1_float(sl)
-    tp50_f = _rp_v1_float(tp50)
-    exit_f = _rp_v1_float(exit_price)
-    realized_f = _rp_v1_float(realized_pnl)
-    last_mark_f = _rp_v1_float(last_mark_price)
-    last_unrealized_f = _rp_v1_float(last_unrealized_pnl)
+        if not commit:
+            return {
+                "ok": True,
+                "version": REGISTRY_PERSISTENCE_V1_VERSION,
+                "status": "DRY_RUN_CLOSED_TRADE_RECOVERY_READY",
+                "committed": False,
+                "trade_id": trade_id,
+                "candidate": closed_trade,
+                "live_state": live_state,
+            }
 
-    if entry_f is None:
-        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "ENTRY_REQUIRED", "committed": False, "trade_id": trade_id}
+        if central_trade_registry is None or not callable(getattr(central_trade_registry, "save_registry", None)):
+            return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "TRADE_REGISTRY_UNAVAILABLE", "committed": False, "trade_id": trade_id}
 
-    # Se exit_price não veio, usa o último mark conhecido apenas como referência estimada.
-    exit_reference = exit_f if exit_f is not None else last_mark_f
-    close_reason_s = str(close_reason or "MANUAL_CLOSE").upper().strip()
+        try:
+            raw.setdefault("open_trades", {})
+            raw.setdefault("closed_trades", [])
+            # Garante que não resta OPEN com a mesma chave.
+            if isinstance(raw.get("open_trades"), dict):
+                raw["open_trades"].pop(trade_id, None)
+            raw["closed_trades"].append(closed_trade)
+            raw["updated_at"] = _rp_v1_now()
+            registry_write = central_trade_registry.save_registry(raw)
+            if registry_write is False:
+                raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+        except Exception as exc:
+            return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "CLOSED_TRADE_RECOVERY_SAVE_ERROR", "committed": False, "trade_id": trade_id, "error": str(exc)}
 
-    closed_trade = {
-        "trade_id": trade_id,
-        "bot": bot_n,
-        "setup": setup_n,
-        "symbol": symbol_n,
-        "side": side_n,
-        "status": "CLOSED",
-        "entry": entry_f,
-        "qty": qty_f,
-        "sl": sl_f,
-        "tp50": tp50_f,
-        "exit_price": exit_f,
-        "exit_price_source": "manual_param" if exit_f is not None else ("last_mark_price_estimate" if last_mark_f is not None else None),
-        "last_mark_price": last_mark_f,
-        "realized_pnl": realized_f,
-        "last_unrealized_pnl": last_unrealized_f,
-        "close_reason": close_reason_s,
-        "closed_at": _rp_v1_now(),
-        "last_update": _rp_v1_now(),
-        "source": "registry_persistence_v1_2_closed_manual_recovery",
-        "metadata": {
-            "recovery_version": REGISTRY_PERSISTENCE_V1_VERSION,
-            "recovered_by": "registry_persistence_v1_2_closed_manual_recovery",
-            "manual_ack": "RESTORE_CLOSED_TRADE_MANUAL",
-            "recovered_at": _rp_v1_now(),
-            "position_found_at_recovery": bool(live_state.get("position_found")),
-            "safety_status_at_recovery": live_state.get("safety_status"),
-            "exit_reference": exit_reference,
-            "exit_reference_source": "exit_price" if exit_f is not None else ("last_mark_price" if last_mark_f is not None else None),
-            "note": "Trade fechado recuperado manualmente após snapshot latest vazio/restore sem CLOSED.",
-        },
-    }
-
-    if not commit:
-        return {
-            "ok": True,
-            "version": REGISTRY_PERSISTENCE_V1_VERSION,
-            "status": "DRY_RUN_CLOSED_TRADE_RECOVERY_READY",
-            "committed": False,
-            "trade_id": trade_id,
-            "candidate": closed_trade,
-            "live_state": live_state,
-        }
-
-    if central_trade_registry is None or not callable(getattr(central_trade_registry, "save_registry", None)):
-        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "TRADE_REGISTRY_UNAVAILABLE", "committed": False, "trade_id": trade_id}
-
+    snapshot_attempted = False
+    snapshot_saved = False
     try:
-        raw.setdefault("open_trades", {})
-        raw.setdefault("closed_trades", [])
-        # Garante que não resta OPEN com a mesma chave.
-        if isinstance(raw.get("open_trades"), dict):
-            raw["open_trades"].pop(trade_id, None)
-        raw["closed_trades"].append(closed_trade)
-        raw["updated_at"] = _rp_v1_now()
-        registry_write = central_trade_registry.save_registry(raw)
-        if registry_write is False:
-            raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
-
         after_registry_state = _rp_v1_registry_snapshot_full()
         latest_payload = {
             "ok": True,
@@ -10345,14 +10385,18 @@ def registry_persistence_v12_recover_closed_trade_from_params(
                 "trade_id": trade_id,
             },
         }
+        snapshot_attempted = True
         _rp_v1_atomic_write_json(REGISTRY_PERSISTENCE_V1_LATEST_FILE, latest_payload)
-        _rp_v1_append_event({
+        snapshot_saved = True
+        event_written = _rp_v1_append_event({
             "event": "REGISTRY_PERSISTENCE_CLOSED_TRADE_RECOVERY",
             "generated_at": _rp_v1_now(),
             "trade_id": trade_id,
             "closed_trade": closed_trade,
             "version": REGISTRY_PERSISTENCE_V1_VERSION,
         })
+        if event_written is False:
+            raise RuntimeError("RECOVERY_EVENT_APPEND_NOT_CONFIRMED")
         return {
             "ok": True,
             "version": REGISTRY_PERSISTENCE_V1_VERSION,
@@ -10364,7 +10408,21 @@ def registry_persistence_v12_recover_closed_trade_from_params(
             "snapshot_save": {"attempted": True, "committed": True, "status": "SNAPSHOT_SAVED", "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE)},
         }
     except Exception as exc:
-        return {"ok": False, "version": REGISTRY_PERSISTENCE_V1_VERSION, "status": "CLOSED_TRADE_RECOVERY_SAVE_ERROR", "committed": False, "trade_id": trade_id, "error": str(exc)}
+        return {
+            "ok": False,
+            "version": REGISTRY_PERSISTENCE_V1_VERSION,
+            "status": "CLOSED_TRADE_RECOVERED_POST_COMMIT_ERROR",
+            "committed": True,
+            "trade_id": trade_id,
+            "snapshot_save": {
+                "attempted": snapshot_attempted,
+                "committed": snapshot_saved,
+                "status": "SNAPSHOT_SAVED" if snapshot_saved else "SNAPSHOT_SAVE_ERROR",
+                "path": str(REGISTRY_PERSISTENCE_V1_LATEST_FILE),
+            },
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
 
 
 @app.route("/registryclosedrecovery", methods=["GET"])
@@ -11141,129 +11199,138 @@ def trade_close_outcome_v1_build(
         outcome["commit"] = trade_close_outcome_v1_commit(found, selected, outcome)
     return outcome
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_TRADE_CLOSE_OUTCOME_COMMIT")
 def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
-    selected_trade = (
-        selected_payload.get("trade")
-        if isinstance(selected_payload.get("trade"), dict)
-        else {}
-    )
-    selected_state = _closed_trade_identity_state_v1(selected_trade)
-    selected_key = str(selected_state.get("canonical_key") or "")
-    registry = _tco_v1_load_registry()
-    if not isinstance(registry, dict):
-        return {
-            "attempted": True,
-            "committed": False,
-            "status": "REGISTRY_NOT_AVAILABLE",
-        }
-    closed_obj, fresh_items = _tco_v1_closed_items(registry)
-    fresh_matches = [
-        {"key": current_key, "trade": trade}
-        for current_key, trade in fresh_items
-        if _closed_trade_records_equivalent_v1(selected_trade, trade)
-    ]
-    if (
-        not selected_key
-        or selected_state.get("has_alias_conflict")
-        or len(fresh_matches) != 1
-    ):
-        return {
-            "attempted": True,
-            "committed": False,
-            "status": "CLOSED_TRADE_IDENTITY_CHANGED_BEFORE_UPDATE",
-            "candidate_count": len(fresh_matches),
-        }
-    key = fresh_matches[0].get("key")
-    if not isinstance(outcome, dict) or not outcome.get("ok"):
-        return {"attempted": True, "committed": False, "status": "INVALID_OUTCOME"}
-    updated = False
-    now = _tco_v1_now()
-    # Atualiza o trade fechado dentro da estrutura original, preservando lista/dict.
-    if isinstance(closed_obj, dict):
-        trade = closed_obj.get(key)
-        if isinstance(trade, dict):
-            meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
-            meta["outcome_evaluated"] = True
-            meta["outcome_evaluated_at"] = now
-            meta["outcome_version"] = TRADE_CLOSE_OUTCOME_V1_VERSION
-            meta["outcome"] = outcome
-            trade["metadata"] = meta
-            trade["outcome_evaluated"] = True
-            trade["outcome_status"] = outcome.get("status")
-            trade["outcome_data_quality"] = outcome.get("data_quality")
-            trade["exit_price"] = outcome.get("exit_price")
-            trade["realized_pnl"] = outcome.get("realized_pnl")
-            trade["net_pnl"] = outcome.get("net_pnl")
-            trade["pnl_pct"] = outcome.get("pnl_pct")
-            canonical_r = outcome.get("pnl_r")
-            if canonical_r is None:
-                canonical_r = outcome.get("r_multiple")
-            if canonical_r is not None:
-                trade["pnl_r"] = canonical_r
-                trade["result_r"] = canonical_r
-                trade["r_multiple"] = canonical_r
-            trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
-            if outcome.get("close_reason") not in (None, ""):
-                trade["close_reason"] = outcome.get("close_reason")
-            trade["close_reason_evaluated"] = outcome.get("close_reason")
-            trade["last_update"] = now
-            closed_obj[key] = trade
-            registry["closed_trades"] = closed_obj
-            updated = True
-    elif isinstance(closed_obj, list):
-        for idx, trade in enumerate(closed_obj):
-            if not isinstance(trade, dict):
-                continue
-            trade_key = (
-                "closed_index|"
-                + str(idx)
-                + "|"
-                + str(
-                    _closed_trade_identity_state_v1(trade).get("canonical_key")
-                    or "identity_unavailable"
+    # The Registry RMW is coordinated; outcome sidecars follow after release.
+    lock_resolver = globals().get("_trpsf_v1_registry_lock")
+    registry_lock = lock_resolver() if callable(lock_resolver) else None
+    if registry_lock is None:
+        return {"attempted": True, "committed": False, "status": "REGISTRY_LOCK_UNAVAILABLE"}
+    with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_TRADE_CLOSE_OUTCOME_COMMIT"), registry_lock:
+        selected_trade = (
+            selected_payload.get("trade")
+            if isinstance(selected_payload.get("trade"), dict)
+            else {}
+        )
+        selected_state = _closed_trade_identity_state_v1(selected_trade)
+        selected_key = str(selected_state.get("canonical_key") or "")
+        registry = _tco_v1_load_registry()
+        if not isinstance(registry, dict):
+            return {
+                "attempted": True,
+                "committed": False,
+                "status": "REGISTRY_NOT_AVAILABLE",
+            }
+        closed_obj, fresh_items = _tco_v1_closed_items(registry)
+        fresh_matches = [
+            {"key": current_key, "trade": trade}
+            for current_key, trade in fresh_items
+            if _closed_trade_records_equivalent_v1(selected_trade, trade)
+        ]
+        if (
+            not selected_key
+            or selected_state.get("has_alias_conflict")
+            or len(fresh_matches) != 1
+        ):
+            return {
+                "attempted": True,
+                "committed": False,
+                "status": "CLOSED_TRADE_IDENTITY_CHANGED_BEFORE_UPDATE",
+                "candidate_count": len(fresh_matches),
+            }
+        key = fresh_matches[0].get("key")
+        if not isinstance(outcome, dict) or not outcome.get("ok"):
+            return {"attempted": True, "committed": False, "status": "INVALID_OUTCOME"}
+        updated = False
+        now = _tco_v1_now()
+        # Atualiza o trade fechado dentro da estrutura original, preservando lista/dict.
+        if isinstance(closed_obj, dict):
+            trade = closed_obj.get(key)
+            if isinstance(trade, dict):
+                meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+                meta["outcome_evaluated"] = True
+                meta["outcome_evaluated_at"] = now
+                meta["outcome_version"] = TRADE_CLOSE_OUTCOME_V1_VERSION
+                meta["outcome"] = outcome
+                trade["metadata"] = meta
+                trade["outcome_evaluated"] = True
+                trade["outcome_status"] = outcome.get("status")
+                trade["outcome_data_quality"] = outcome.get("data_quality")
+                trade["exit_price"] = outcome.get("exit_price")
+                trade["realized_pnl"] = outcome.get("realized_pnl")
+                trade["net_pnl"] = outcome.get("net_pnl")
+                trade["pnl_pct"] = outcome.get("pnl_pct")
+                canonical_r = outcome.get("pnl_r")
+                if canonical_r is None:
+                    canonical_r = outcome.get("r_multiple")
+                if canonical_r is not None:
+                    trade["pnl_r"] = canonical_r
+                    trade["result_r"] = canonical_r
+                    trade["r_multiple"] = canonical_r
+                trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+                if outcome.get("close_reason") not in (None, ""):
+                    trade["close_reason"] = outcome.get("close_reason")
+                trade["close_reason_evaluated"] = outcome.get("close_reason")
+                trade["last_update"] = now
+                closed_obj[key] = trade
+                registry["closed_trades"] = closed_obj
+                updated = True
+        elif isinstance(closed_obj, list):
+            for idx, trade in enumerate(closed_obj):
+                if not isinstance(trade, dict):
+                    continue
+                trade_key = (
+                    "closed_index|"
+                    + str(idx)
+                    + "|"
+                    + str(
+                        _closed_trade_identity_state_v1(trade).get("canonical_key")
+                        or "identity_unavailable"
+                    )
                 )
-            )
-            if str(trade_key) != str(key):
-                continue
-            meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
-            meta["outcome_evaluated"] = True
-            meta["outcome_evaluated_at"] = now
-            meta["outcome_version"] = TRADE_CLOSE_OUTCOME_V1_VERSION
-            meta["outcome"] = outcome
-            trade["metadata"] = meta
-            trade["outcome_evaluated"] = True
-            trade["outcome_status"] = outcome.get("status")
-            trade["outcome_data_quality"] = outcome.get("data_quality")
-            trade["exit_price"] = outcome.get("exit_price")
-            trade["realized_pnl"] = outcome.get("realized_pnl")
-            trade["net_pnl"] = outcome.get("net_pnl")
-            trade["pnl_pct"] = outcome.get("pnl_pct")
-            canonical_r = outcome.get("pnl_r")
-            if canonical_r is None:
-                canonical_r = outcome.get("r_multiple")
-            if canonical_r is not None:
-                trade["pnl_r"] = canonical_r
-                trade["result_r"] = canonical_r
-                trade["r_multiple"] = canonical_r
-            trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
-            if outcome.get("close_reason") not in (None, ""):
-                trade["close_reason"] = outcome.get("close_reason")
-            trade["close_reason_evaluated"] = outcome.get("close_reason")
-            trade["last_update"] = now
-            closed_obj[idx] = trade
-            registry["closed_trades"] = closed_obj
-            updated = True
-            break
-    if not updated:
-        return {"attempted": True, "committed": False, "status": "CLOSED_TRADE_NOT_FOUND_FOR_UPDATE"}
-    registry["updated_at"] = now
+                if str(trade_key) != str(key):
+                    continue
+                meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+                meta["outcome_evaluated"] = True
+                meta["outcome_evaluated_at"] = now
+                meta["outcome_version"] = TRADE_CLOSE_OUTCOME_V1_VERSION
+                meta["outcome"] = outcome
+                trade["metadata"] = meta
+                trade["outcome_evaluated"] = True
+                trade["outcome_status"] = outcome.get("status")
+                trade["outcome_data_quality"] = outcome.get("data_quality")
+                trade["exit_price"] = outcome.get("exit_price")
+                trade["realized_pnl"] = outcome.get("realized_pnl")
+                trade["net_pnl"] = outcome.get("net_pnl")
+                trade["pnl_pct"] = outcome.get("pnl_pct")
+                canonical_r = outcome.get("pnl_r")
+                if canonical_r is None:
+                    canonical_r = outcome.get("r_multiple")
+                if canonical_r is not None:
+                    trade["pnl_r"] = canonical_r
+                    trade["result_r"] = canonical_r
+                    trade["r_multiple"] = canonical_r
+                trade["tp50_hit"] = (outcome.get("tp50_result") or {}).get("hit")
+                if outcome.get("close_reason") not in (None, ""):
+                    trade["close_reason"] = outcome.get("close_reason")
+                trade["close_reason_evaluated"] = outcome.get("close_reason")
+                trade["last_update"] = now
+                closed_obj[idx] = trade
+                registry["closed_trades"] = closed_obj
+                updated = True
+                break
+        if not updated:
+            return {"attempted": True, "committed": False, "status": "CLOSED_TRADE_NOT_FOUND_FOR_UPDATE"}
+        registry["updated_at"] = now
+        try:
+            registry_write = central_trade_registry.save_registry(registry)
+            if registry_write is False:
+                raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+        except Exception as exc:
+            return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
     try:
-        registry_write = central_trade_registry.save_registry(registry)
-        if registry_write is False:
-            raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
         _tco_v1_atomic_write_json(TRADE_CLOSE_OUTCOME_V1_LATEST_FILE, outcome)
-        _tco_v1_append_event(outcome)
+        if _tco_v1_append_event(outcome) is False:
+            raise RuntimeError("OUTCOME_EVENT_APPEND_NOT_CONFIRMED")
         return {
             "attempted": True,
             "committed": True,
@@ -11273,7 +11340,14 @@ def trade_close_outcome_v1_commit(found_payload, selected_payload, outcome):
             "trade_key": key,
         }
     except Exception as exc:
-        return {"attempted": True, "committed": False, "status": "SAVE_ERROR", "error": str(exc)}
+        return {
+            "attempted": True,
+            "committed": True,
+            "status": "OUTCOME_SAVED_WITH_AUDIT_ERROR",
+            "trade_key": key,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
 
 
 def trade_close_outcome_v1_registry_status():
@@ -11711,7 +11785,6 @@ def _rms_v1_append_event(payload):
     except Exception:
         return False
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_REGISTRY_MODE_SEGREGATION_COMMIT")
 def registry_mode_segregation_v1_analyze(commit=False, include_trades=True, source="manual"):
     if central_trade_registry is None or not callable(getattr(central_trade_registry, "load_registry", None)):
         return {
@@ -11722,52 +11795,61 @@ def registry_mode_segregation_v1_analyze(commit=False, include_trades=True, sour
         }
 
     try:
-        registry = central_trade_registry.load_registry()
-        open_items, closed_items = _rms_v1_registry_items(registry)
-        rows_open = [_rms_v1_row(k, t, "OPEN") for k, t in open_items]
-        rows_closed = [_rms_v1_row(k, t, "CLOSED") for k, t in closed_items]
-        all_rows = rows_open + rows_closed
+        from contextlib import nullcontext
+        registry_lock = _trpsf_v1_registry_lock() if commit else None
+        if commit and registry_lock is None:
+            return {"ok": False, "status": "REGISTRY_LOCK_UNAVAILABLE",
+                    "commit": {"attempted": True, "committed": False}}
+        with (
+            c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_REGISTRY_MODE_SEGREGATION_COMMIT")
+            if commit else nullcontext()
+        ), registry_lock if commit else nullcontext():
+            registry = central_trade_registry.load_registry()
+            open_items, closed_items = _rms_v1_registry_items(registry)
+            rows_open = [_rms_v1_row(k, t, "OPEN") for k, t in open_items]
+            rows_closed = [_rms_v1_row(k, t, "CLOSED") for k, t in closed_items]
+            all_rows = rows_open + rows_closed
 
-        def counts(rows):
-            out = {"REAL": 0, "PAPER": 0, "VERIFY": 0, "SYNC_ONLY": 0, "UNKNOWN": 0}
-            for r in rows:
-                m = r.get("registry_mode") or "UNKNOWN"
-                out[m] = out.get(m, 0) + 1
-            return out
+            def counts(rows):
+                out = {"REAL": 0, "PAPER": 0, "VERIFY": 0, "SYNC_ONLY": 0, "UNKNOWN": 0}
+                for r in rows:
+                    m = r.get("registry_mode") or "UNKNOWN"
+                    out[m] = out.get(m, 0) + 1
+                return out
 
-        open_by_mode = counts(rows_open)
-        closed_by_mode = counts(rows_closed)
-        total_by_mode = counts(all_rows)
+            open_by_mode = counts(rows_open)
+            closed_by_mode = counts(rows_closed)
+            total_by_mode = counts(all_rows)
 
-        unknown_open = [r for r in rows_open if r.get("registry_mode") == "UNKNOWN"]
-        real_open = [r for r in rows_open if r.get("registry_mode") == "REAL"]
-        non_real_open = [r for r in rows_open if r.get("registry_mode") in ("PAPER", "VERIFY", "SYNC_ONLY")]
+            unknown_open = [r for r in rows_open if r.get("registry_mode") == "UNKNOWN"]
+            real_open = [r for r in rows_open if r.get("registry_mode") == "REAL"]
+            non_real_open = [r for r in rows_open if r.get("registry_mode") in ("PAPER", "VERIFY", "SYNC_ONLY")]
 
-        commit_result = {"attempted": bool(commit), "committed": False, "status": "COMMIT_NOT_REQUESTED"}
-        if commit:
-            for key, trade in open_items + closed_items:
-                cls = registry_mode_segregation_v1_classify_trade(trade, key=key)
-                meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
-                trade["metadata"] = meta
-                trade["registry_mode"] = cls.get("mode")
-                trade["registry_mode_confidence"] = cls.get("confidence")
-                trade["registry_mode_updated_at"] = _rms_v1_now()
-                meta["registry_mode"] = cls.get("mode")
-                meta["registry_mode_confidence"] = cls.get("confidence")
-                meta["registry_mode_reasons"] = cls.get("reasons")
-                meta["registry_mode_version"] = REGISTRY_MODE_SEGREGATION_V1_VERSION
-            if callable(getattr(central_trade_registry, "save_registry", None)):
-                registry_write = central_trade_registry.save_registry(registry)
-                if registry_write is False:
-                    commit_result = {
-                        "attempted": True,
-                        "committed": False,
-                        "status": "REGISTRY_SAVE_NOT_CONFIRMED",
-                    }
+            commit_result = {"attempted": bool(commit), "committed": False, "status": "COMMIT_NOT_REQUESTED"}
+            if commit:
+                for key, trade in open_items + closed_items:
+                    cls = registry_mode_segregation_v1_classify_trade(trade, key=key)
+                    meta = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+                    trade["metadata"] = meta
+                    trade["registry_mode"] = cls.get("mode")
+                    trade["registry_mode_confidence"] = cls.get("confidence")
+                    trade["registry_mode_updated_at"] = _rms_v1_now()
+                    meta["registry_mode"] = cls.get("mode")
+                    meta["registry_mode_confidence"] = cls.get("confidence")
+                    meta["registry_mode_reasons"] = cls.get("reasons")
+                    meta["registry_mode_version"] = REGISTRY_MODE_SEGREGATION_V1_VERSION
+                if callable(getattr(central_trade_registry, "save_registry", None)):
+                    registry_write = central_trade_registry.save_registry(registry)
+                    if registry_write is False:
+                        commit_result = {
+                            "attempted": True,
+                            "committed": False,
+                            "status": "REGISTRY_SAVE_NOT_CONFIRMED",
+                        }
+                    else:
+                        commit_result = {"attempted": True, "committed": True, "status": "REGISTRY_MODES_SAVED"}
                 else:
-                    commit_result = {"attempted": True, "committed": True, "status": "REGISTRY_MODES_SAVED"}
-            else:
-                commit_result = {"attempted": True, "committed": False, "status": "SAVE_FUNCTION_UNAVAILABLE"}
+                    commit_result = {"attempted": True, "committed": False, "status": "SAVE_FUNCTION_UNAVAILABLE"}
 
         payload = {
             "ok": True,
@@ -14786,54 +14868,57 @@ def _trade_registry_signature_map(items):
 
     return out
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_MARK_REGISTRY_MISSING_TRADES")
 def mark_registry_missing_trades(removed):
     if central_trade_registry is None:
         return {"ok": False, "error": "trade_registry unavailable"}
     if not removed:
         return {"ok": True, "marked_count": 0, "marked": [], "registry_write": False}
     try:
-        registry = central_trade_registry.load_registry()
-        open_trades = registry.get("open_trades", {})
-        if not isinstance(open_trades, dict):
-            return {"ok": False, "error": "open_trades is not dict"}
-        registry, open_trades = dict(registry), dict(open_trades)
-        marked, already_marked, detected_at = [], [], None
-        for item in removed:
-            if not isinstance(item, dict):
-                continue
-            trade_id = item.get("trade_id")
-            if not trade_id or trade_id not in open_trades:
-                continue
-            trade = open_trades[trade_id]
-            if not isinstance(trade, dict):
-                return {"ok": False, "error": "open trade is not dict", "registry_write": False}
-            if trade.get("status") == "MISSING_FROM_BOTS" and trade.get("missing_from_bots") is True:
-                already_marked.append(trade_id)
-                continue
-            detected_at = detected_at or data_hora_sp_str()
-            trade = dict(trade)
-            trade["status"] = "MISSING_FROM_BOTS"
-            trade["missing_from_bots"] = True
-            if not trade.get("missing_detected_at"):
-                trade["missing_detected_at"] = detected_at
-            trade["last_update"] = detected_at
-            open_trades[trade_id] = trade
-            marked.append({
-                "trade_id": trade_id, "bot": trade.get("bot"),
-                "symbol": trade.get("symbol"), "side": trade.get("side"),
-                "status": trade.get("status"),
-            })
-        if not marked:
-            return {"ok": True, "marked_count": 0, "marked": [], "already_marked": already_marked, "registry_write": False}
-        registry["open_trades"] = open_trades
-        registry_write = central_trade_registry.save_registry(registry)
-        if registry_write is False:
-            return {"ok": False, "error": "REGISTRY_SAVE_NOT_CONFIRMED", "registry_write": False}
-        return {
-            "ok": True, "marked_count": len(marked),
-            "marked": marked, "already_marked": already_marked, "registry_write": True,
-        }
+        registry_lock = _trpsf_v1_registry_lock()
+        if registry_lock is None:
+            return {"ok": False, "error": "REGISTRY_LOCK_UNAVAILABLE", "registry_write": False}
+        with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_MARK_REGISTRY_MISSING_TRADES"), registry_lock:
+            registry = central_trade_registry.load_registry()
+            open_trades = registry.get("open_trades", {})
+            if not isinstance(open_trades, dict):
+                return {"ok": False, "error": "open_trades is not dict"}
+            registry, open_trades = dict(registry), dict(open_trades)
+            marked, already_marked, detected_at = [], [], None
+            for item in removed:
+                if not isinstance(item, dict):
+                    continue
+                trade_id = item.get("trade_id")
+                if not trade_id or trade_id not in open_trades:
+                    continue
+                trade = open_trades[trade_id]
+                if not isinstance(trade, dict):
+                    return {"ok": False, "error": "open trade is not dict", "registry_write": False}
+                if trade.get("status") == "MISSING_FROM_BOTS" and trade.get("missing_from_bots") is True:
+                    already_marked.append(trade_id)
+                    continue
+                detected_at = detected_at or data_hora_sp_str()
+                trade = dict(trade)
+                trade["status"] = "MISSING_FROM_BOTS"
+                trade["missing_from_bots"] = True
+                if not trade.get("missing_detected_at"):
+                    trade["missing_detected_at"] = detected_at
+                trade["last_update"] = detected_at
+                open_trades[trade_id] = trade
+                marked.append({
+                    "trade_id": trade_id, "bot": trade.get("bot"),
+                    "symbol": trade.get("symbol"), "side": trade.get("side"),
+                    "status": trade.get("status"),
+                })
+            if not marked:
+                return {"ok": True, "marked_count": 0, "marked": [], "already_marked": already_marked, "registry_write": False}
+            registry["open_trades"] = open_trades
+            registry_write = central_trade_registry.save_registry(registry)
+            if registry_write is False:
+                return {"ok": False, "error": "REGISTRY_SAVE_NOT_CONFIRMED", "registry_write": False}
+            return {
+                "ok": True, "marked_count": len(marked),
+                "marked": marked, "already_marked": already_marked, "registry_write": True,
+            }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -33461,6 +33546,23 @@ def trendpro_daily_summary_v1_text_route():
     return {"text": "\n".join(lines), "payload": status}
 
 
+def _bind_c3_startup_maintenance_v1(composition):
+    """Bind one offline maintenance instance before startup; no execution or I/O."""
+    from trade_registry_c3_maintenance_activation_offline_v1 import OfflineMaintenanceActivationV1
+    from trade_registry_c3_maintenance_authorization_v1 import AuthenticatedMaintenanceAuthorizationV1
+
+    global C3_MAINTENANCE_STARTUP_BINDING_V1
+    with CENTRAL_RUNTIME_LOCK:
+        if CENTRAL_RUNTIME_STARTED or C3_MAINTENANCE_STARTUP_BINDING_V1 is not None:
+            raise RuntimeError("C3_STARTUP_MAINTENANCE_BINDING_UNAVAILABLE")
+        if (
+            type(composition) is not OfflineMaintenanceActivationV1
+            or type(composition._authorize) is not AuthenticatedMaintenanceAuthorizationV1
+        ):
+            raise RuntimeError("C3_STARTUP_MAINTENANCE_BINDING_INVALID")
+        C3_MAINTENANCE_STARTUP_BINDING_V1 = composition
+
+
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED, LEARNING_AUTO_REFRESH_THREAD_STARTED
     global CENTRAL_DAILY_REPORT_THREAD_STARTED, CENTRAL_DAILY_REPORT_LAST_STATUS
@@ -33469,6 +33571,9 @@ def start_central_runtime_once():
         if CENTRAL_RUNTIME_STARTED:
             print("CENTRAL RUNTIME JÁ INICIADO - ignorando nova chamada")
             return
+        if C3_MAINTENANCE_STARTUP_BINDING_V1 is not None:
+            # Offline completion cannot authorize workers or promote readiness.
+            raise RuntimeError("C3_MAINTENANCE_BOUND_RUNTIME_START_FORBIDDEN")
         CENTRAL_RUNTIME_STARTED = True
 
     startup_summary_fn = globals().get("static_operational_runtime_startup_summary")
@@ -42125,10 +42230,17 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
         build_kwargs["commit"] = True
         outcome = trade_close_outcome_v1_build(**build_kwargs)
 
-    committed = bool(isinstance(outcome, dict) and isinstance(outcome.get("commit"), dict) and outcome.get("commit", {}).get("committed"))
-    status = "OUTCOME_AUTO_EVALUATED_AND_SAVED" if committed else ("OUTCOME_EVALUATED_NOT_COMMITTED" if quality_ok else "OUTCOME_INCOMPLETE_NOT_COMMITTED")
+    commit_result = outcome.get("commit") if isinstance(outcome, dict) else None
+    committed = bool(isinstance(commit_result, dict) and commit_result.get("committed"))
+    audit_pending = bool(committed and commit_result.get("status") == "OUTCOME_SAVED_WITH_AUDIT_ERROR")
+    status = (
+        "OUTCOME_AUTO_EVALUATED_AUDIT_PENDING" if audit_pending
+        else "OUTCOME_AUTO_EVALUATED_AND_SAVED" if committed
+        else "OUTCOME_EVALUATED_NOT_COMMITTED" if quality_ok
+        else "OUTCOME_INCOMPLETE_NOT_COMMITTED"
+    )
     cooldown_release = None
-    if committed and config.get("release_cooldown_on_outcome") and callable(globals().get("pilot_cooldown_v1_release")):
+    if committed and not audit_pending and config.get("release_cooldown_on_outcome") and callable(globals().get("pilot_cooldown_v1_release")):
         try:
             cooldown_release = pilot_cooldown_v1_release(reason="OUTCOME_EVALUATED", payload=payload)
         except Exception as exc:
@@ -42138,6 +42250,7 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
     result.update({
         "status": status,
         "committed": committed,
+        "audit_pending": audit_pending,
         "commit_requested": commit_requested,
         "commit_allowed": commit_allowed,
         "quality_ok": quality_ok,
@@ -49430,7 +49543,6 @@ def _pprsf_v1_recalculate_lifecycle_counts_from_registry(registry):
 
 @request_cached_predator_audit("predator_registry_sync_audit_pipeline")
 @observe_predator_audit("predator_registry_sync_audit_pipeline")
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_PAPER_REGISTRY_SYNC")
 def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_samples=True, use_cache=False):
     audit_name = "predator_registry_sync_audit_pipeline"
     commit = bool(commit)
@@ -49478,105 +49590,125 @@ def predator_paper_registry_sync_fix_v1_status(commit=False, ack=None, include_s
     except Exception:
         closed_events = []
 
-    planning_stage = predator_audit_stage(
-        audit_name,
-        "build_sync_indexes_and_repair_plans",
-        records_in=len(module_positions or []) + len(closed_events or []),
-    )
-    planning_stage.__enter__()
-    existing_ids, open_sigs, closed_sigs = _pprsf_v1_existing_ids_and_signatures(registry)
-    open_trades = _pprsf_v1_open_dict(registry)
-    closed_trades = _pprsf_v1_closed_list(registry)
+    from contextlib import nullcontext
+    planned_open, planned_closed = [], []
+    committed, save_error = False, None
+    try:
+        registry_lock = _trpsf_v1_registry_lock() if commit and ack_ok and not errors else None
+        if commit and ack_ok and not errors and registry_lock is None:
+            raise RuntimeError("REGISTRY_LOCK_UNAVAILABLE")
+        with (
+            c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_PAPER_REGISTRY_SYNC")
+            if registry_lock is not None else nullcontext()
+        ), registry_lock if registry_lock is not None else nullcontext():
+            if commit and ack_ok and not errors:
+                registry, fresh_error = _pprsf_v1_load_registry()
+                if not isinstance(registry, dict):
+                    raise RuntimeError(f"REGISTRY_RELOAD_FAILED:{fresh_error}")
+            planning_stage = predator_audit_stage(
+                audit_name,
+                "build_sync_indexes_and_repair_plans",
+                records_in=len(module_positions or []) + len(closed_events or []),
+            )
+            planning_stage.__enter__()
+            existing_ids, open_sigs, closed_sigs = _pprsf_v1_existing_ids_and_signatures(registry)
+            open_trades = _pprsf_v1_open_dict(registry)
+            closed_trades = _pprsf_v1_closed_list(registry)
 
-    planned_open = []
-    for pos in module_positions or []:
-        if not isinstance(pos, dict):
-            continue
-        trade = _pprsf_v1_build_open_trade_from_position(pos)
-        if not trade:
-            open_skipped.append({"reason": "INVALID_OPEN_POSITION", "position": _pprsf_v1_public(pos, max_string=260)})
-            continue
-        tid = str(trade.get("trade_id"))
-        sig = _pprsf_v1_signature_trade(trade)
-        if tid in existing_ids or sig in open_sigs:
-            open_skipped.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "reason": "ALREADY_IN_REGISTRY"})
-            continue
-        planned_open.append(trade)
-        if commit and ack_ok and not errors:
-            try:
-                open_trades[tid] = trade
-                existing_ids.add(tid)
-                open_sigs.add(sig)
-                open_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup")})
-            except Exception as exc:
-                errors.append(f"Falha ao inserir OPEN {tid}: {exc}")
+            planned_open = []
+            for pos in module_positions or []:
+                if not isinstance(pos, dict):
+                    continue
+                trade = _pprsf_v1_build_open_trade_from_position(pos)
+                if not trade:
+                    open_skipped.append({"reason": "INVALID_OPEN_POSITION", "position": _pprsf_v1_public(pos, max_string=260)})
+                    continue
+                tid = str(trade.get("trade_id"))
+                sig = _pprsf_v1_signature_trade(trade)
+                if tid in existing_ids or sig in open_sigs:
+                    open_skipped.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "reason": "ALREADY_IN_REGISTRY"})
+                    continue
+                planned_open.append(trade)
+                if commit and ack_ok and not errors:
+                    try:
+                        open_trades[tid] = trade
+                        existing_ids.add(tid)
+                        open_sigs.add(sig)
+                        open_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup")})
+                    except Exception as exc:
+                        errors.append(f"Falha ao inserir OPEN {tid}: {exc}")
 
-    planned_closed = []
-    for ev in closed_events or []:
-        trade = _pprsf_v1_build_closed_trade_from_event(ev)
-        if not trade:
-            closed_skipped.append({"reason": "INVALID_CLOSED_EVENT", "event": _pprsf_v1_public(ev, max_string=260)})
-            continue
-        tid = str(trade.get("trade_id"))
-        sig = _pprsf_v1_closed_signature(trade)
-        comparison_pool = [
-            existing
-            for existing in list(closed_trades) + list(planned_closed)
-            if isinstance(existing, dict)
-        ]
-        relations = [
-            _closed_trade_record_relation_v1(trade, existing)
-            for existing in comparison_pool
-        ]
-        if "CONFLICT" in relations:
-            closed_skipped.append({
-                "trade_id": tid,
-                "symbol": trade.get("symbol"),
-                "side": trade.get("side"),
-                "reason": "CLOSED_EXECUTION_IDENTITY_CONFLICT",
-            })
-            continue
-        if "EQUIVALENT" in relations:
-            closed_skipped.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "reason": "ALREADY_IN_REGISTRY"})
-            continue
-        planned_closed.append(trade)
-        if commit and ack_ok and not errors:
-            try:
-                closed_trades.append(trade)
-                closed_sigs.add(sig)
-                closed_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup"), "pnl_pct": trade.get("pnl_pct"), "pnl_r": trade.get("pnl_r")})
-            except Exception as exc:
-                errors.append(f"Falha ao inserir CLOSED {tid}: {exc}")
+            planned_closed = []
+            for ev in closed_events or []:
+                trade = _pprsf_v1_build_closed_trade_from_event(ev)
+                if not trade:
+                    closed_skipped.append({"reason": "INVALID_CLOSED_EVENT", "event": _pprsf_v1_public(ev, max_string=260)})
+                    continue
+                tid = str(trade.get("trade_id"))
+                sig = _pprsf_v1_closed_signature(trade)
+                comparison_pool = [
+                    existing
+                    for existing in list(closed_trades) + list(planned_closed)
+                    if isinstance(existing, dict)
+                ]
+                relations = [
+                    _closed_trade_record_relation_v1(trade, existing)
+                    for existing in comparison_pool
+                ]
+                if "CONFLICT" in relations:
+                    closed_skipped.append({
+                        "trade_id": tid,
+                        "symbol": trade.get("symbol"),
+                        "side": trade.get("side"),
+                        "reason": "CLOSED_EXECUTION_IDENTITY_CONFLICT",
+                    })
+                    continue
+                if "EQUIVALENT" in relations:
+                    closed_skipped.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "reason": "ALREADY_IN_REGISTRY"})
+                    continue
+                planned_closed.append(trade)
+                if commit and ack_ok and not errors:
+                    try:
+                        closed_trades.append(trade)
+                        closed_sigs.add(sig)
+                        closed_repaired.append({"trade_id": tid, "symbol": trade.get("symbol"), "side": trade.get("side"), "setup": trade.get("setup"), "pnl_pct": trade.get("pnl_pct"), "pnl_r": trade.get("pnl_r")})
+                    except Exception as exc:
+                        errors.append(f"Falha ao inserir CLOSED {tid}: {exc}")
 
-    planning_stage.finish(
-        {"existing_ids": existing_ids, "open_sigs": open_sigs, "closed_sigs": closed_sigs, "planned_open": planned_open, "planned_closed": planned_closed},
-        records_processed=len(module_positions or []) + len(closed_events or []),
-        objects_produced=len(existing_ids) + len(open_sigs) + len(closed_sigs) + len(planned_open) + len(planned_closed),
-    )
-    planning_stage.__exit__(None, None, None)
+            planning_stage.finish(
+                {"existing_ids": existing_ids, "open_sigs": open_sigs, "closed_sigs": closed_sigs, "planned_open": planned_open, "planned_closed": planned_closed},
+                records_processed=len(module_positions or []) + len(closed_events or []),
+                objects_produced=len(existing_ids) + len(open_sigs) + len(closed_sigs) + len(planned_open) + len(planned_closed),
+            )
+            planning_stage.__exit__(None, None, None)
 
-    committed = False
-    save_error = None
-    if commit and ack_ok and not errors:
-        try:
-            registry["open_trades"] = open_trades
-            registry["closed_trades"] = closed_trades
-            registry["last_update"] = _pprsf_v1_now()
-            registry["last_sync"] = {
-                "source": "predator_paper_registry_sync_fix_v1",
-                "version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
-                "synced_at": _pprsf_v1_now(),
-                "open_repaired_count": len(open_repaired),
-                "closed_repaired_count": len(closed_repaired),
-            }
-            registry_write = central_trade_registry.save_registry(registry)
-            if registry_write is False:
-                raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
-            committed = True
-            actions.append("REGISTRY_SAVED")
-        except Exception as exc:
-            save_error = str(exc)
-            errors.append(f"Falha ao salvar Trade Registry: {exc}")
+            committed = False
+            save_error = None
+            if commit and ack_ok and not errors:
+                try:
+                    registry["open_trades"] = open_trades
+                    registry["closed_trades"] = closed_trades
+                    registry["last_update"] = _pprsf_v1_now()
+                    registry["last_sync"] = {
+                        "source": "predator_paper_registry_sync_fix_v1",
+                        "version": PREDATOR_PAPER_REGISTRY_SYNC_FIX_V1_VERSION,
+                        "synced_at": _pprsf_v1_now(),
+                        "open_repaired_count": len(open_repaired),
+                        "closed_repaired_count": len(closed_repaired),
+                    }
+                    registry_write = central_trade_registry.save_registry(registry)
+                    if registry_write is False:
+                        raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+                    committed = True
+                    actions.append("REGISTRY_SAVED")
+                except Exception as exc:
+                    save_error = str(exc)
+                    errors.append(f"Falha ao salvar Trade Registry: {exc}")
+
+    except Exception as exc:
+        save_error = str(exc)
+        errors.append(f"Falha ao preparar Trade Registry: {exc}")
+        open_repaired, closed_repaired = [], []
 
     after_snapshot = None
     if committed:
@@ -49866,7 +49998,6 @@ def _poof_v1_plan_orphans(registry, module_positions):
         })
     return planned, skipped
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_ORPHAN_OPEN_FIX")
 def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_samples=True, track_state=True):
     commit = bool(commit)
     ack_ok = str(ack or "").strip().upper() == "PREDATOR_ORPHAN_OPEN_FIX"
@@ -49897,105 +50028,121 @@ def predator_registry_orphan_open_fix_v1_status(commit=False, ack=None, include_
     committed = False
     if commit and ack_ok and registry is not None and not errors:
         try:
-            open_trades = _pprsf_v1_open_dict(registry)
-            closed_trades = list(_pprsf_v1_closed_list(registry))
-            for item in planned:
-                source_trade = open_trades.pop(item["registry_key"], None)
-                if not isinstance(source_trade, dict):
-                    skipped.append({"trade_id": item["trade_id"], "reason": "OPEN_DISAPPEARED_BEFORE_COMMIT"})
-                    continue
-                identity_candidate = dict(source_trade)
-                for pnl_field in (
-                    "pnl_pct",
-                    "result_pct",
-                    "pnl_r",
-                    "result_r",
-                    "realized_pnl",
-                    "realized_pnl_usdt",
+            registry_lock = _trpsf_v1_registry_lock()
+            if registry_lock is None:
+                raise RuntimeError("REGISTRY_LOCK_UNAVAILABLE")
+            with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_ORPHAN_OPEN_FIX"), registry_lock:
+                fresh_registry, fresh_error = _pprsf_v1_load_registry()
+                if not isinstance(fresh_registry, dict):
+                    raise RuntimeError(f"REGISTRY_RELOAD_FAILED:{fresh_error}")
+                fresh_planned, fresh_skipped = _poof_v1_plan_orphans(fresh_registry, module_positions)
+                if fresh_planned != planned or any(
+                    _pprsf_v1_open_dict(fresh_registry).get(item["registry_key"])
+                    != _pprsf_v1_open_dict(registry).get(item["registry_key"])
+                    for item in planned
                 ):
-                    identity_candidate.pop(pnl_field, None)
-                identity_candidate["status"] = "CLOSED"
-                relations = [
-                    _closed_trade_record_relation_v1(
-                        identity_candidate, closed_trade
-                    )
-                    for closed_trade in closed_trades
-                ]
-                conflicting_closed_indexes = [
-                    index
-                    for index, relation in enumerate(relations)
-                    if relation == "CONFLICT"
-                ]
-                if conflicting_closed_indexes:
-                    open_trades[item["registry_key"]] = source_trade
-                    skipped.append(
-                        {
-                            "trade_id": item["trade_id"],
-                            "reason": "CLOSED_EXECUTION_IDENTITY_CONFLICT",
-                            "conflict_count": len(
-                                conflicting_closed_indexes
-                            ),
-                        }
-                    )
-                    continue
-                matching_closed_indexes = [
-                    index
-                    for index, relation in enumerate(relations)
-                    if relation == "EQUIVALENT"
-                ]
-                if len(matching_closed_indexes) > 1:
-                    open_trades[item["registry_key"]] = source_trade
-                    skipped.append(
-                        {
-                            "trade_id": item["trade_id"],
-                            "reason": "CLOSED_EXECUTION_IDENTITY_AMBIGUOUS",
-                        }
-                    )
-                    continue
-                metadata = dict(source_trade.get("metadata") or {})
-                metadata.update({
-                    "sync_version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
-                    "synced_at": generated_at,
-                    "source": "predator_orphan_open_fix_v1",
-                    "reason": "REGISTRY_OPEN_WITHOUT_MODULE_POSITION",
-                    "previous_status": "OPEN",
-                    "execution_mode": "PAPER",
-                })
-                if len(matching_closed_indexes) == 1:
-                    index = matching_closed_indexes[0]
-                    existing = dict(closed_trades[index])
-                    existing_metadata = dict(existing.get("metadata") or {})
-                    existing_metadata.update(metadata)
-                    existing["metadata"] = existing_metadata
-                    existing["last_update"] = generated_at
-                    closed_trades[index] = existing
-                    action = "EXISTING_CLOSED_RECONCILED"
-                else:
-                    reconciled = dict(identity_candidate)
-                    reconciled.update({
-                        "status": "CLOSED",
-                        "close_reason": "ORPHAN_REGISTRY_OPEN_RECONCILED",
-                        "closed_at": generated_at,
-                        "last_update": generated_at,
-                        "metadata": metadata,
+                    raise RuntimeError("REGISTRY_CHANGED_DURING_ORPHAN_FIX")
+                registry = fresh_registry
+                planned, skipped = fresh_planned, fresh_skipped
+                open_trades = _pprsf_v1_open_dict(registry)
+                closed_trades = list(_pprsf_v1_closed_list(registry))
+                for item in planned:
+                    source_trade = open_trades.pop(item["registry_key"], None)
+                    if not isinstance(source_trade, dict):
+                        skipped.append({"trade_id": item["trade_id"], "reason": "OPEN_DISAPPEARED_BEFORE_COMMIT"})
+                        continue
+                    identity_candidate = dict(source_trade)
+                    for pnl_field in (
+                        "pnl_pct",
+                        "result_pct",
+                        "pnl_r",
+                        "result_r",
+                        "realized_pnl",
+                        "realized_pnl_usdt",
+                    ):
+                        identity_candidate.pop(pnl_field, None)
+                    identity_candidate["status"] = "CLOSED"
+                    relations = [
+                        _closed_trade_record_relation_v1(
+                            identity_candidate, closed_trade
+                        )
+                        for closed_trade in closed_trades
+                    ]
+                    conflicting_closed_indexes = [
+                        index
+                        for index, relation in enumerate(relations)
+                        if relation == "CONFLICT"
+                    ]
+                    if conflicting_closed_indexes:
+                        open_trades[item["registry_key"]] = source_trade
+                        skipped.append(
+                            {
+                                "trade_id": item["trade_id"],
+                                "reason": "CLOSED_EXECUTION_IDENTITY_CONFLICT",
+                                "conflict_count": len(
+                                    conflicting_closed_indexes
+                                ),
+                            }
+                        )
+                        continue
+                    matching_closed_indexes = [
+                        index
+                        for index, relation in enumerate(relations)
+                        if relation == "EQUIVALENT"
+                    ]
+                    if len(matching_closed_indexes) > 1:
+                        open_trades[item["registry_key"]] = source_trade
+                        skipped.append(
+                            {
+                                "trade_id": item["trade_id"],
+                                "reason": "CLOSED_EXECUTION_IDENTITY_AMBIGUOUS",
+                            }
+                        )
+                        continue
+                    metadata = dict(source_trade.get("metadata") or {})
+                    metadata.update({
+                        "sync_version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
+                        "synced_at": generated_at,
+                        "source": "predator_orphan_open_fix_v1",
+                        "reason": "REGISTRY_OPEN_WITHOUT_MODULE_POSITION",
+                        "previous_status": "OPEN",
+                        "execution_mode": "PAPER",
                     })
-                    closed_trades.append(reconciled)
-                    action = "CLOSED_RECONCILED_ORPHAN"
-                repaired.append({"trade_id": item["trade_id"], "action": action})
-            if repaired:
-                registry["open_trades"] = open_trades
-                registry["closed_trades"] = closed_trades
-                registry["last_update"] = generated_at
-                registry["last_orphan_open_fix"] = {
-                    "version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
-                    "source": "predator_orphan_open_fix_v1",
-                    "synced_at": generated_at,
-                    "repaired_count": len(repaired),
-                }
-                registry_write = central_trade_registry.save_registry(registry)
-                if registry_write is False:
-                    raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
-                committed = True
+                    if len(matching_closed_indexes) == 1:
+                        index = matching_closed_indexes[0]
+                        existing = dict(closed_trades[index])
+                        existing_metadata = dict(existing.get("metadata") or {})
+                        existing_metadata.update(metadata)
+                        existing["metadata"] = existing_metadata
+                        existing["last_update"] = generated_at
+                        closed_trades[index] = existing
+                        action = "EXISTING_CLOSED_RECONCILED"
+                    else:
+                        reconciled = dict(identity_candidate)
+                        reconciled.update({
+                            "status": "CLOSED",
+                            "close_reason": "ORPHAN_REGISTRY_OPEN_RECONCILED",
+                            "closed_at": generated_at,
+                            "last_update": generated_at,
+                            "metadata": metadata,
+                        })
+                        closed_trades.append(reconciled)
+                        action = "CLOSED_RECONCILED_ORPHAN"
+                    repaired.append({"trade_id": item["trade_id"], "action": action})
+                if repaired:
+                    registry["open_trades"] = open_trades
+                    registry["closed_trades"] = closed_trades
+                    registry["last_update"] = generated_at
+                    registry["last_orphan_open_fix"] = {
+                        "version": PREDATOR_ORPHAN_OPEN_FIX_V1_VERSION,
+                        "source": "predator_orphan_open_fix_v1",
+                        "synced_at": generated_at,
+                        "repaired_count": len(repaired),
+                    }
+                    registry_write = central_trade_registry.save_registry(registry)
+                    if registry_write is False:
+                        raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+                    committed = True
         except Exception as exc:
             errors.append(f"Falha ao salvar Trade Registry: {exc}")
 
@@ -50642,7 +50789,6 @@ def _trpsf_v1_merge_registries(registries, active_exists=False):
     merged["updated_at"] = _trpsf_v1_now()
     return merged, sorted(set(sources_used))
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP")
 def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
     """Migra para /data/trade_registry.json e mescla CLOSED legados sem apagar OPEN ativo."""
     if force and not _lock_held:
@@ -50685,7 +50831,7 @@ def _trpsf_v1_bootstrap_registry(force=False, _lock_held=False):
                     "reason": "REGISTRY_LOCK_UNAVAILABLE",
                 },
             }
-        with registry_lock:
+        with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP"), registry_lock:
             return _trpsf_v1_bootstrap_registry(
                 force=force, _lock_held=True
             )
@@ -56375,7 +56521,7 @@ def _frpp_v1_get_trade_registry_storage():
                 "error": "trade_registry_persistent_storage_fix_v1_status unavailable",
                 "status": "UNAVAILABLE",
             }
-        storage = fn(force=False) or {}
+        storage = fn(force=False, read_only=True) or {}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "status": "ERROR"}
     if not isinstance(storage, dict):
@@ -59419,6 +59565,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
     if legacy_commit_identity_blocked:
         complete = False
     committed = False
+    audit_pending = False
     registry_update = None
     outcome = None
     if commit and complete and not legacy_commit_identity_blocked:
@@ -59499,7 +59646,9 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
                 canonical_pnl_r=metrics.get("r_net"),
                 commit=True,
             )
-            committed = bool((outcome.get("commit") or {}).get("committed")) if isinstance(outcome, dict) else False
+            commit_result = outcome.get("commit") if isinstance(outcome, dict) else None
+            committed = bool(isinstance(commit_result, dict) and commit_result.get("committed"))
+            audit_pending = bool(committed and commit_result.get("status") == "OUTCOME_SAVED_WITH_AUDIT_ERROR")
 
     if not broker_identity_validation.get("ok"):
         status = "REAL_CLOSE_BROKER_IDENTITY_DIVERGENCE"
@@ -59517,7 +59666,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
     elif legacy_commit_identity_blocked:
         status = "REAL_CLOSE_LEGACY_IDENTITY_INSUFFICIENT"
     else:
-        status = "BROKER_CLOSE_RECONCILED_AND_SAVED" if committed else (
+        status = "BROKER_CLOSE_RECONCILED_AUDIT_PENDING" if audit_pending else "BROKER_CLOSE_RECONCILED_AND_SAVED" if committed else (
             "BROKER_CLOSE_RECONCILED_PREVIEW" if complete else "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
         )
     result = dict(base)
@@ -59527,6 +59676,7 @@ def real_close_reconciliation_v1_run(payload=None, commit=False, source="route")
         "broker_evidence_complete": broker_evidence_complete,
         "broker_complete": broker_complete,
         "committed": committed,
+        "audit_pending": audit_pending,
         "trade": {
             "trade_id": trade.get("trade_id"),
             "bot": trade.get("bot"),
@@ -60007,14 +60157,20 @@ def real_close_auto_evaluator_v1_run(payload=None, source="route", commit=None, 
                 source="real_close_auto_evaluator:" + str(source),
             )
             if reconciliation.get("committed"):
+                audit_pending = bool(reconciliation.get("audit_pending") or (
+                    isinstance(reconciliation.get("outcome"), dict)
+                    and isinstance(reconciliation["outcome"].get("commit"), dict)
+                    and reconciliation["outcome"]["commit"].get("status") == "OUTCOME_SAVED_WITH_AUDIT_ERROR"
+                ))
                 return {
                     "ok": True,
                     "module": "real_close_auto_evaluator_v1",
                     "version": REAL_CLOSE_AUTO_EVALUATOR_V1_VERSION,
                     "patch_version": REAL_CLOSE_RECONCILIATION_MAIN_V1_VERSION,
                     "generated_at": _rcrm_v1_now(),
-                    "status": "BROKER_OUTCOME_AUTO_RECONCILED_AND_SAVED",
+                    "status": "BROKER_OUTCOME_AUTO_RECONCILED_AUDIT_PENDING" if audit_pending else "BROKER_OUTCOME_AUTO_RECONCILED_AND_SAVED",
                     "committed": True,
+                    "audit_pending": audit_pending,
                     "commit_requested": commit_requested,
                     "broker_reconciliation": reconciliation,
                     "token_value_exposed": False,
@@ -67725,7 +67881,6 @@ def _pacs_v1_health_overlay():
         "predator_auto_closed_sync_reason": state.get("reason"),
     }
 
-@c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_AUTO_CLOSED_SYNC")
 def predator_auto_closed_sync_v1_status(commit=False, ack=None, automatic=False, include_samples=True):
     """Project factual Predator PAPER closures into Registry, never execution."""
     commit = bool(commit)
@@ -67784,61 +67939,61 @@ def predator_auto_closed_sync_v1_status(commit=False, ack=None, automatic=False,
     selected = planned[:max_per_cycle]
     committed = False
     if commit and not blockers and selected:
-        registry_lock = getattr(central_trade_registry, "_lock", None)
-        acquired = False
         try:
-            if registry_lock is not None and callable(getattr(registry_lock, "acquire", None)):
-                registry_lock.acquire()
-                acquired = True
-            fresh_registry, fresh_error = _pprsf_v1_load_registry()
-            if fresh_registry is None:
-                raise RuntimeError(f"REGISTRY_RELOAD_FAILED:{fresh_error}")
-            fresh_plan = _pacs_v1_plan_closed_repairs(fresh_registry, closed_events)
-            selected_keys = [
-                _pprsf_v1_closed_signature(item) for item in selected
-            ]
-            fresh_by_key = {}
-            for item in fresh_plan.get("planned") or []:
-                key = _pprsf_v1_closed_signature(item)
-                if key in fresh_by_key:
-                    raise RuntimeError(
-                        "FRESH_PLAN_CLOSED_IDENTITY_AMBIGUOUS"
-                    )
-                fresh_by_key[key] = item
-            if any(key not in fresh_by_key for key in selected_keys):
-                raise RuntimeError("REGISTRY_CHANGED_DURING_SYNC")
-            working = json.loads(json.dumps(fresh_registry, ensure_ascii=False, default=str))
-            closed_list = _pprsf_v1_closed_list(working)
-            for identity_key in selected_keys:
-                trade = fresh_by_key[identity_key]
-                trade_id = trade.get("trade_id")
-                closed_list.append(trade)
-                repaired.append({
-                    "trade_id": trade_id,
-                    "closed_identity": identity_key,
-                    "closed_at": trade.get("closed_at"),
-                })
-            working["closed_trades"] = closed_list
-            working["last_update"] = generated_at
-            working["last_sync"] = {
-                "source": "predator_auto_closed_sync_v1",
-                "version": PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION,
-                "synced_at": generated_at,
-                "closed_repaired_count": len(repaired),
-                "automatic": automatic,
-            }
-            registry_write = central_trade_registry.save_registry(working)
-            if registry_write is False:
-                raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
-            committed = True
-            after_counts = _pprsf_v1_recalculate_lifecycle_counts_from_registry(working)
+            registry_lock = _trpsf_v1_registry_lock()
+            if registry_lock is None:
+                raise RuntimeError("REGISTRY_LOCK_UNAVAILABLE")
+            with c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1("MAIN_PREDATOR_AUTO_CLOSED_SYNC"), registry_lock:
+                fresh_registry, fresh_error = _pprsf_v1_load_registry()
+                if fresh_registry is None:
+                    raise RuntimeError(f"REGISTRY_RELOAD_FAILED:{fresh_error}")
+                fresh_plan = _pacs_v1_plan_closed_repairs(fresh_registry, closed_events)
+                selected_keys = [
+                    _pprsf_v1_closed_signature(item) for item in selected
+                ]
+                fresh_by_key = {}
+                for item in fresh_plan.get("planned") or []:
+                    key = _pprsf_v1_closed_signature(item)
+                    if key in fresh_by_key:
+                        raise RuntimeError(
+                            "FRESH_PLAN_CLOSED_IDENTITY_AMBIGUOUS"
+                        )
+                    fresh_by_key[key] = item
+                if any(key not in fresh_by_key for key in selected_keys):
+                    raise RuntimeError("REGISTRY_CHANGED_DURING_SYNC")
+                working = json.loads(json.dumps(fresh_registry, ensure_ascii=False, default=str))
+                closed_list = _pprsf_v1_closed_list(working)
+                for identity_key in selected_keys:
+                    trade = fresh_by_key[identity_key]
+                    trade_id = trade.get("trade_id")
+                    closed_list.append(trade)
+                    repaired.append({
+                        "trade_id": trade_id,
+                        "closed_identity": identity_key,
+                        "closed_at": trade.get("closed_at"),
+                    })
+                working["closed_trades"] = closed_list
+                working["last_update"] = generated_at
+                working["last_sync"] = {
+                    "source": "predator_auto_closed_sync_v1",
+                    "version": PREDATOR_AUTO_CLOSED_SYNC_V1_VERSION,
+                    "synced_at": generated_at,
+                    "closed_repaired_count": len(repaired),
+                    "automatic": automatic,
+                }
+                registry_write = central_trade_registry.save_registry(working)
+                if registry_write is False:
+                    raise RuntimeError("REGISTRY_SAVE_NOT_CONFIRMED")
+                committed = True
         except Exception as exc:
             errors.append(str(exc))
             repaired = []
             committed = False
-        finally:
-            if acquired:
-                registry_lock.release()
+        if committed:
+            try:
+                after_counts = _pprsf_v1_recalculate_lifecycle_counts_from_registry(working)
+            except Exception as exc:
+                warnings.append(f"POST_COMMIT_RECOUNT_FAILED:{exc}")
     elif commit and not blockers and not selected:
         after_counts = (before or {}).get("counts")
 
@@ -68465,15 +68620,26 @@ import trade_registry_closed_identity_conflict_repair_runtime_production_startup
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_receipt_authenticated_verifier_contract_v2 as c3_authority_provisioning_receipt_authenticated_verifier_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authority_provisioning_physical_binding_contract_v2 as c3_authority_provisioning_physical_binding_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_port_binding_adapter_contract_v1 as c3_production_startup_port_binding_v1
+import trade_registry_c3_independent_root_head_read_offline_v1 as c3_independent_root_head_read_offline_v1
+import trade_registry_c3_root_head_recovery_composition_offline_v1 as c3_root_head_recovery_composition_offline_v1
 
 
 _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = None
 
 
-def _install_c3_closed_repair_writer_coordination_v1(*, startup_recovery):
+def _install_c3_closed_repair_writer_coordination_v1(*, coordinator, startup_recovery):
     """Install only default-off production-shaped C3 capabilities."""
     global _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1
-    coordinator = c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()
+    # Validate the graph before installing any capability; no provider is called.
+    if (
+        type(startup_recovery)
+        is not c3_authenticated_persistent_authority_boundary_v2.AuthenticatedPersistentAuthorityBoundaryV2
+        or startup_recovery._config.enabled is not False
+        or type(startup_recovery._multistore_recovery)
+        is not c3_authenticated_persistent_authority_production_adapters_v2.CoordinatedMultistoreStartupRecoveryV2
+        or not startup_recovery._multistore_recovery.dormant_coordinator_bound_v2(coordinator)
+    ):
+        raise RuntimeError("C3_DORMANT_STARTUP_COORDINATOR_BINDING_REQUIRED")
     invocation_adapter = c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()
     transaction_store = c3_transaction_store_v1.build_production_raw_transaction_store_v1()
     provider = c3_provider_v1.build_production_closed_repair_provider_v1()
@@ -68596,6 +68762,60 @@ def _recover_c3_closed_repair_registry_v1(*, interlocks=None):
             "no_order_sent": True,
         }
     if coordination.get("enabled") is not True:
+        # This diagnostic is deliberately default-off. It must not consume a
+        # synthetic receipt or call an external head reader during startup.
+        offline_probe = globals().get("C3_CLOSED_REPAIR_ROOT_HEAD_RECOVERY_OFFLINE_V1")
+        if offline_probe is not None:
+            try:
+                dormant_probe_bound = (
+                    type(offline_probe)
+                    is c3_root_head_recovery_composition_offline_v1.OfflineRootHeadRecoveryCompositionV1
+                    and offline_probe._config.enabled is False
+                    and offline_probe._boundary is selected_interlocks._bound_startup_recovery
+                    and type(offline_probe._head_reader)
+                    is c3_independent_root_head_read_offline_v1.IndependentRootHeadReaderV1
+                    and offline_probe._head_reader._config.enabled is False
+                )
+            except Exception:
+                dormant_probe_bound = False
+            if not dormant_probe_bound:
+                return {
+                    "ok": False,
+                    "status": "C3_STARTUP_RECOVERY_BLOCKED",
+                    "reason": "ROOT_HEAD_RECOVERY_DORMANT_BINDING_INVALID",
+                    "clean": False,
+                    "readiness_allowed": False,
+                    "real_registry_accessed": False,
+                    "write_executed": False,
+                    "network_accessed": False,
+                    "broker_called": False,
+                    "no_order_sent": True,
+                }
+            try:
+                probe_result = offline_probe.check(
+                    maintenance_permit={}, root_authority_attestation={}
+                )
+            except Exception:
+                probe_result = None
+            if (
+                type(probe_result) is not dict
+                or probe_result.get("reason") != "ROOT_HEAD_RECOVERY_DEFAULT_OFF"
+                or probe_result.get("head_external_read_attempted") is not False
+                or probe_result.get("admission_allowed") is not False
+                or probe_result.get("live_allowed") is not False
+            ):
+                return {
+                    "ok": False,
+                    "status": "C3_STARTUP_RECOVERY_BLOCKED",
+                    "reason": "ROOT_HEAD_RECOVERY_DORMANT_PROBE_INVALID",
+                    "clean": False,
+                    "readiness_allowed": False,
+                    "real_registry_accessed": False,
+                    "write_executed": False,
+                    "network_accessed": False,
+                    "broker_called": False,
+                    "no_order_sent": True,
+                }
         return {
             "ok": True,
             "status": "C3_DORMANT_STARTUP_RECOVERY_DEFERRED_DEFAULT_OFF",
@@ -68650,11 +68870,16 @@ def _recover_c3_closed_repair_registry_v1(*, interlocks=None):
     }
 
 
+C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1 = (
+    c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()
+)
 C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = (
     c3_resolved_authority_startup_bridge_v2.build_dormant_resolved_authority_startup_recovery_bridge_v2()
 )
 C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2 = (
-    c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2()
+    c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2(
+        maintenance_coordinator=C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1,
+    )
 )
 C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2 = (
     c3_authority_provisioning_manifest_v2.build_dormant_authority_provisioning_manifest_contract_v2()
@@ -68677,11 +68902,21 @@ C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2 = (
         startup_bridge=C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2
     )
 )
+C3_CLOSED_REPAIR_ROOT_HEAD_READER_OFFLINE_V1 = (
+    c3_independent_root_head_read_offline_v1.IndependentRootHeadReaderV1()
+)
+C3_CLOSED_REPAIR_ROOT_HEAD_RECOVERY_OFFLINE_V1 = (
+    c3_root_head_recovery_composition_offline_v1.OfflineRootHeadRecoveryCompositionV1(
+        boundary=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2,
+        head_reader=C3_CLOSED_REPAIR_ROOT_HEAD_READER_OFFLINE_V1,
+    )
+)
 C3_PERSISTENCE_BOOTSTRAP_V1 = trade_registry_persistent_storage_fix_v1_status(
     read_only=True,
     no_io=True,
 )
 C3_CLOSED_REPAIR_INSTALLATION_V1 = _install_c3_closed_repair_writer_coordination_v1(
+    coordinator=C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1,
     startup_recovery=C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_BOUNDARY_V2
 )
 C3_CLOSED_IDENTITY_REPAIR_RUNTIME_OPERATION_V1 = (

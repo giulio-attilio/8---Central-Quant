@@ -605,7 +605,8 @@ def _install_c3_closed_repair_writer_coordination_v1():
     assert _check(result, "C3_RUNTIME_DEPENDENCIES_IMPORTED")["ok"] is True
     assert _check(result, "C3_RUNTIME_DEPENDENCIES_PRODUCTION_CAPABLE")["ok"] is True
     assert _check(result, "PRODUCTION_TRANSACTION_STORE_PRESENT")["ok"] is True
-    assert _check(result, "C3_PROVIDER_BINDS_PRODUCTION_CAPABILITIES")["ok"] is True
+    # Names/shapes alone do not establish the same dormant coordinator graph.
+    assert _check(result, "C3_PROVIDER_BINDS_PRODUCTION_CAPABILITIES")["ok"] is False
     assert result["production_ready"] is False
     assert result["live_allowed"] is False
 

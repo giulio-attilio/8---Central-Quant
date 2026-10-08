@@ -37,7 +37,7 @@ def _marker_kind(line: str) -> str:
         return "REGISTRY_SNAPSHOT_READ_CALL"
     if "_trpsf_v1_read_json(" in stripped:
         return "RAW_REGISTRY_READ_CALL"
-    if "load_registry(" in stripped or "_load_registry(" in stripped:
+    if "load_registry(" in stripped or "_load_registry(" in stripped or "_rp_v12_load_raw_registry_safe(" in stripped:
         return "REGISTRY_READ_CALL"
     if "path.exists()" in stripped:
         return "REGISTRY_STORAGE_STATE_GUARD"
@@ -57,6 +57,58 @@ def _marker_kind(line: str) -> str:
     if stripped.startswith("if "):
         return "IF_GUARD"
     return "OTHER"
+
+
+def _main_c3_lock_scope_verified(node: ast.AST, item: Mapping[str, Any]) -> bool:
+    """Verify lock order and the audited write scope without executing main.py."""
+
+    start = item["acquire_before_line"]
+    matches = [part for part in ast.walk(node) if isinstance(part, ast.With) and part.lineno == start]
+    if len(matches) != 1:
+        return False
+    scope = matches[0]
+    if scope.end_lineno != item["release_after_line"] or len(scope.items) != 2:
+        return False
+    first, second = (entry.context_expr for entry in scope.items)
+    c3_call = first.body if isinstance(first, ast.IfExp) else first
+    local_lock = second.body if isinstance(second, ast.IfExp) else second
+    if not (
+        isinstance(c3_call, ast.Call)
+        and isinstance(c3_call.func, ast.Attribute)
+        and c3_call.func.attr == "_c3_closed_repair_writer_mutation_v1"
+        and len(c3_call.args) == 1
+        and isinstance(c3_call.args[0], ast.Constant)
+        and c3_call.args[0].value == item["writer_id"]
+        and isinstance(local_lock, ast.Name)
+        and local_lock.id == "registry_lock"
+    ):
+        return False
+    fresh = item["fresh_read_after_acquire_line"]
+    writes = item["authoritative_write_lines"]
+    recursive = item["writer_id"] in {
+        "MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT",
+        "MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP",
+    }
+    if not recursive:
+        return bool(start < fresh <= scope.end_lineno and all(start < line <= scope.end_lineno for line in writes))
+    self_calls = [
+        part for part in ast.walk(scope)
+        if isinstance(part, ast.Call)
+        and isinstance(part.func, ast.Name)
+        and part.func.id == item["function"]
+        and any(
+            keyword.arg == "_lock_held"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in part.keywords
+        )
+    ]
+    return bool(
+        len(self_calls) == 1
+        and item["same_owner_token_for_nested_reentry"] is True
+        and scope.end_lineno < fresh < min(writes)
+        and all(scope.end_lineno < line <= node.end_lineno for line in writes)
+    )
 
 
 class InMemoryDormantSourceAnchorRehearsal:
@@ -105,6 +157,8 @@ class InMemoryDormantSourceAnchorRehearsal:
                 raise RuntimeWriterSourceAnchorHarnessBlocked("COMMIT_GUARD_DRIFT_DENIED")
             if observed.get("all_placement_lines_within_function") is not True:
                 raise RuntimeWriterSourceAnchorHarnessBlocked("PLACEMENT_OUTSIDE_FUNCTION_DENIED")
+            if wanted["component"] == "main.py" and observed.get("coordinator_scope_verified") is not True:
+                raise RuntimeWriterSourceAnchorHarnessBlocked("COORDINATOR_SCOPE_DRIFT_DENIED")
         return {
             "writer_count": 19,
             "validated_source_files": ["trade_registry.py", "main.py"],
@@ -165,6 +219,7 @@ def _observe_source_anchors(contents: Mapping[str, str]) -> list[dict[str, Any]]
         fresh_line = _line(lines, item["fresh_read_after_acquire_line"])
         local_lock_line = _line(lines, item["process_local_lock_line"])
         commit_guard_line = _line(lines, item["commit_guard_line"])
+        main_scope_verified = _main_c3_lock_scope_verified(node, item) if component == "main.py" else None
         observed.append(
             {
                 "writer_id": item["writer_id"],
@@ -175,7 +230,10 @@ def _observe_source_anchors(contents: Mapping[str, str]) -> list[dict[str, Any]]
                 "all_placement_lines_within_function": all(start <= number <= end for number in placement_lines),
                 "fresh_marker": _marker_kind(fresh_line) if fresh_line is not None else None,
                 "write_markers": [_marker_kind(_line(lines, number) or "") for number in item["authoritative_write_lines"]],
-                "local_lock_marker": _marker_kind(local_lock_line) if local_lock_line is not None else None,
+                "local_lock_marker": (
+                    "WITH_C3_BEFORE_LOCAL_LOCK" if main_scope_verified else _marker_kind(local_lock_line)
+                ) if local_lock_line is not None else None,
+                "coordinator_scope_verified": main_scope_verified,
                 "commit_guard_marker": _marker_kind(commit_guard_line) if commit_guard_line is not None else None,
                 "source_content_exposed": False,
             }
@@ -195,6 +253,7 @@ def _control_denied(**kwargs: bool) -> bool:
             "fresh_marker": item["expected_fresh_marker"],
             "commit_guard_marker": item["expected_commit_guard_marker"],
             "all_placement_lines_within_function": True,
+            "coordinator_scope_verified": True if item["component"] == "main.py" else None,
         }
         for item in expected
     ]

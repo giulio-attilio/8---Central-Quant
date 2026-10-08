@@ -4,6 +4,7 @@ import ast
 import copy
 import json
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +29,10 @@ def _main_function(name):
 
 
 def _compile(names, namespace):
+    namespace.setdefault(
+        "c3_runtime_seam_v1",
+        SimpleNamespace(_c3_closed_repair_writer_mutation_v1=lambda _: nullcontext()),
+    )
     nodes = []
     for name in names:
         node = copy.deepcopy(_main_function(name))
@@ -663,6 +668,68 @@ def test_bootstrap_without_registry_lock_blocks_before_filesystem_io(tmp_path):
     assert namespace["_TRPSF_V1_STATE"]["last_load_ok"] is False
     assert namespace["_TRPSF_V1_STATE"]["last_write_ok"] is False
     assert namespace["_TRPSF_V1_STATE"]["write_allowed"] is False
+
+
+def test_bootstrap_reentry_acquires_c3_before_local_lock_and_covers_writes(tmp_path):
+    active = tmp_path / "trade_registry.json"
+    active.write_text("{}", encoding="utf-8")
+    backup = tmp_path / "backup.json"
+    latest = tmp_path / "latest.json"
+    events = tmp_path / "events.jsonl"
+    raw = {"open_trades": {}, "closed_trades": []}
+    lock = threading.RLock()
+    calls = []
+    c3_active = [False]
+
+    class BootstrapSeam:
+        def __enter__(self):
+            assert not lock._is_owned(), "C3 acquired after process lock"
+            c3_active[0] = True
+            calls.append("c3-enter")
+
+        def __exit__(self, *_args):
+            c3_active[0] = False
+            calls.append("c3-exit")
+
+    def atomic_write(path, _payload):
+        assert c3_active[0] and lock._is_owned()
+        calls.append(Path(path).name)
+        return True
+
+    namespace = {
+        "c3_runtime_seam_v1": SimpleNamespace(
+            _c3_closed_repair_writer_mutation_v1=lambda _: BootstrapSeam()),
+        "_trpsf_v1_registry_lock": lambda: lock,
+        "_TRPSF_V1_STATE": {},
+        "_trpsf_v1_active_file": lambda: active,
+        "_trpsf_v1_legacy_candidate_paths": lambda: [],
+        "_trpsf_v1_read_json": lambda _: copy.deepcopy(raw),
+        "_trpsf_v1_registry_shape_errors": lambda _: [],
+        "_trpsf_v1_registry_counts": lambda _: {"open_count": 0, "closed_count": 0},
+        "_trpsf_v1_merge_registries": lambda rows, active_exists=False: (
+            {**copy.deepcopy(raw), "closed_history_identity_merge": {"safe_to_commit": True}},
+            [name for name, _ in rows],
+        ),
+        "_trpsf_v1_iter_trades": lambda value, **_: list(value or []),
+        "_trpsf_v1_atomic_write_json": atomic_write,
+        "_trpsf_v1_now": lambda: "synthetic-now",
+        "_trpsf_v1_public": lambda value: value,
+        "central_trade_registry": SimpleNamespace(),
+        "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "synthetic",
+        "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE": backup,
+        "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_LATEST_FILE": latest,
+        "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_EVENTS_FILE": events,
+        "CENTRAL_DATA_DIR": tmp_path,
+        "Path": Path,
+        "json": json,
+    }
+    _compile(["_trpsf_v1_bootstrap_registry"], namespace)
+
+    result = namespace["_trpsf_v1_bootstrap_registry"](force=True)
+
+    assert result["ok"] is True and result["write_performed"] is True
+    assert calls == ["c3-enter", backup.name, active.name, latest.name, "c3-exit"]
+    assert events.exists()
 
 
 def test_bootstrap_without_lock_resolver_blocks_before_filesystem_io(tmp_path):

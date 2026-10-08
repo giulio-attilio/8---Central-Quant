@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import inspect
 from pathlib import Path
 
@@ -9,9 +10,79 @@ import pytest
 
 import trade_registry_closed_identity_conflict_repair_runtime_controlled_activation_contract_v1 as contract
 import trade_registry_closed_identity_conflict_repair_runtime_controlled_activation_harness_v1 as harness
+import trade_registry_closed_identity_conflict_repair_runtime_seam_v1 as seam
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _synthetic_source_hashes(root: Path) -> dict[str, str]:
+    hashes = {}
+    for relative in sorted(seam._CONTROLLED_ACTIVATION_SOURCE_FILES):
+        source = root / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        content = relative.encode("utf-8")
+        source.write_bytes(content)
+        hashes[relative] = hashlib.sha256(content).hexdigest()
+    return hashes
+
+
+def test_activation_source_hash_preflight_is_read_only_and_never_activates(
+    tmp_path: Path,
+) -> None:
+    hashes = _synthetic_source_hashes(tmp_path)
+
+    result = seam.verify_controlled_activation_source_hashes_read_only_v1(
+        tmp_path, hashes
+    )
+
+    assert result["ok"] is True
+    assert result["verified_file_count"] == len(hashes)
+    assert result["activation_allowed"] is False
+    assert result["runtime_integrated"] is False
+    assert result["network_accessed"] is False
+    assert result["broker_called"] is False
+
+
+def test_activation_source_hash_preflight_rejects_drift_and_forged_envelope(
+    tmp_path: Path,
+) -> None:
+    hashes = _synthetic_source_hashes(tmp_path)
+    target = tmp_path / "trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py"
+    target.write_bytes(b"changed")
+    assert seam.verify_controlled_activation_source_hashes_read_only_v1(
+        tmp_path, hashes
+    )["ok"] is False
+    hashes["trade_registry_closed_identity_conflict_repair_runtime_seam_v1.py"] = (
+        hashlib.sha256(b"changed").hexdigest()
+    )
+    hashes["unexpected.py"] = "a" * 64
+    assert seam.verify_controlled_activation_source_hashes_read_only_v1(
+        tmp_path, hashes
+    )["ok"] is False
+    hashes.pop("unexpected.py")
+    hashes.pop("main.py")
+    assert seam.verify_controlled_activation_source_hashes_read_only_v1(
+        tmp_path, hashes
+    )["ok"] is False
+
+
+def test_activation_source_hash_preflight_rejects_path_escape(
+    tmp_path: Path,
+) -> None:
+    hashes = _synthetic_source_hashes(tmp_path)
+    target = tmp_path / "main.py"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.py"
+    outside.write_bytes(target.read_bytes())
+    target.unlink()
+    try:
+        target.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation unavailable on this host")
+
+    assert seam.verify_controlled_activation_source_hashes_read_only_v1(
+        tmp_path, hashes
+    )["ok"] is False
 
 
 @pytest.fixture(scope="module")

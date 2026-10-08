@@ -74,10 +74,10 @@ def test_fresh_read_and_insertion_seam_markers_are_exact(anchor_inputs: dict) ->
     assert by_id["MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT"]["fresh_marker"] == "REGISTRY_SNAPSHOT_READ_CALL"
     assert by_id["MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP"]["fresh_marker"] == "RAW_REGISTRY_READ_CALL"
     assert by_id["TRADE_REGISTRY_RESET"]["fresh_marker"] is None
-    assert by_id["MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE"]["fresh_marker"] == "TRY_INSERTION_SEAM"
-    assert by_id["MAIN_REGISTRY_MODE_SEGREGATION_COMMIT"]["fresh_marker"] == "LOOP_INSERTION_SEAM"
-    assert by_id["MAIN_PREDATOR_PAPER_REGISTRY_SYNC"]["fresh_marker"] == "TRY_INSERTION_SEAM"
-    assert by_id["MAIN_PREDATOR_ORPHAN_OPEN_FIX"]["fresh_marker"] == "TRY_INSERTION_SEAM"
+    assert by_id["MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE"]["fresh_marker"] == "REGISTRY_READ_CALL"
+    assert by_id["MAIN_REGISTRY_MODE_SEGREGATION_COMMIT"]["fresh_marker"] == "REGISTRY_READ_CALL"
+    assert by_id["MAIN_PREDATOR_PAPER_REGISTRY_SYNC"]["fresh_marker"] == "REGISTRY_READ_CALL"
+    assert by_id["MAIN_PREDATOR_ORPHAN_OPEN_FIX"]["fresh_marker"] == "REGISTRY_READ_CALL"
 
 
 def test_all_authoritative_writes_still_have_expected_markers(anchor_inputs: dict) -> None:
@@ -104,11 +104,10 @@ def test_all_authoritative_writes_still_have_expected_markers(anchor_inputs: dic
 def test_existing_process_local_lock_markers_are_exact(anchor_inputs: dict) -> None:
     observed = anchor_inputs["source_anchor_evidence"]["observed_anchors"]
     locks = {item["writer_id"]: item["local_lock_marker"] for item in observed if item["local_lock_marker"] is not None}
-    assert len(locks) == 10
+    assert len(locks) == 18
     assert list(locks.values()).count("WITH_MODULE_RLOCK") == 7
-    assert locks["MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT"] == "WITH_LOCAL_LOCK"
-    assert locks["MAIN_PREDATOR_AUTO_CLOSED_SYNC"] == "LOCAL_LOCK_ACQUIRE"
-    assert locks["MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP"] == "WITH_LOCAL_LOCK"
+    assert list(locks.values()).count("WITH_C3_BEFORE_LOCAL_LOCK") == 11
+    assert all(item["coordinator_scope_verified"] is True for item in observed if item["component"] == "main.py")
     assert "TRADE_REGISTRY_RESET" not in locks
 
 
@@ -173,6 +172,16 @@ def test_resealed_write_marker_drift_fails_closed(anchor_inputs: dict) -> None:
     result = contract.evaluate_closed_repair_runtime_writer_source_anchors_offline_v1(**inputs)
     assert result["ok"] is False
     assert result["apply_allowed"] is False
+    assert "SOURCE_ANCHOR_OBSERVATIONS_INVALID" in result["reasons"]
+
+
+def test_resealed_coordinator_scope_drift_fails_closed(anchor_inputs: dict) -> None:
+    inputs = copy.deepcopy(anchor_inputs)
+    main_anchor = next(item for item in inputs["source_anchor_evidence"]["observed_anchors"] if item["component"] == "main.py")
+    main_anchor["coordinator_scope_verified"] = False
+    _reseal_evidence(inputs)
+    result = contract.evaluate_closed_repair_runtime_writer_source_anchors_offline_v1(**inputs)
+    assert result["ok"] is False
     assert "SOURCE_ANCHOR_OBSERVATIONS_INVALID" in result["reasons"]
 
 

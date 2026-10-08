@@ -98,6 +98,8 @@ class PhysicalMultiStoreObservationLeaseV2:
         self._acquiring = False
         self._active_token: ProtectedPhysicalMultiStoreObservationLeaseTokenV2 | None = None
         self._active_handles: tuple[storage_v1.InterprocessFileLockHandleV1, ...] = ()
+        self._active_delegated_permit: Any = None
+        self._active_delegated_permit_validator: Callable[[Any], bool] | None = None
 
     def _config_reason(self) -> str | None:
         if self._config.enabled is not True:
@@ -183,7 +185,7 @@ class PhysicalMultiStoreObservationLeaseV2:
 
     @contextmanager
     def hold_offline(
-        self, *, expires_at_epoch: int
+        self, *, expires_at_epoch: int, delegated_permit: Any = None, delegated_permit_validator: Callable[[Any], bool] | None = None
     ) -> Iterator[ProtectedPhysicalMultiStoreObservationLeaseTokenV2]:
         reason = self._config_reason()
         if reason is not None:
@@ -216,12 +218,25 @@ class PhysicalMultiStoreObservationLeaseV2:
             self._acquiring = True
         handles: list[storage_v1.InterprocessFileLockHandleV1] = []
         token: ProtectedPhysicalMultiStoreObservationLeaseTokenV2 | None = None
+        delegated_used = False
         try:
             for lock_backend, namespace in self._specs():
                 if type(lock_backend) is not storage_v1.CrossPlatformInterprocessFileLockBackendV1:
                     raise TemporaryPhysicalObservationLeaseBlockedV2(
                         "PHYSICAL_MULTISTORE_OBSERVATION_LOCK_BACKEND_INVALID"
                     )
+                if (
+                    namespace == str(self._config.expected_backend_lock_namespace_sha256)
+                    and delegated_permit is not None
+                    and delegated_permit_validator is not None
+                ):
+                    try:
+                        is_valid = delegated_permit_validator(delegated_permit) is True
+                    except Exception as exc:
+                        raise TemporaryPhysicalObservationLeaseBlockedV2("PHYSICAL_MULTISTORE_OBSERVATION_DELEGATED_PERMIT_FAILED") from exc
+                    if is_valid:
+                        delegated_used = True
+                        continue
                 handle = lock_backend.acquire(
                     namespace, self._config.lock_timeout_seconds
                 )
@@ -270,6 +285,9 @@ class PhysicalMultiStoreObservationLeaseV2:
             with self._state_lock:
                 self._active_token = token
                 self._active_handles = tuple(handles)
+                if delegated_used:
+                    self._active_delegated_permit = delegated_permit
+                    self._active_delegated_permit_validator = delegated_permit_validator
                 self._acquiring = False
             yield token
         finally:
@@ -278,6 +296,8 @@ class PhysicalMultiStoreObservationLeaseV2:
                 if self._active_token is token:
                     self._active_token = None
                     self._active_handles = ()
+                    self._active_delegated_permit = None
+                    self._active_delegated_permit_validator = None
             release_error: Exception | None = None
             for handle in reversed(handles):
                 if not handle.released:
@@ -306,10 +326,22 @@ class PhysicalMultiStoreObservationLeaseV2:
         ):
             return False
         with self._state_lock:
+            delegated_ok = True
+            delegated_count = 0
+            if self._active_delegated_permit is not None and self._active_delegated_permit_validator is not None:
+                delegated_count = 1
+                try:
+                    delegated_ok = self._active_delegated_permit_validator(self._active_delegated_permit) is True
+                except Exception:
+                    delegated_ok = False
+            
+            total_locks = len(self._active_handles) + delegated_count
+            
             return bool(
                 token is self._active_token
-                and len(self._active_handles) == 2
-                and all(not handle.released for handle in self._active_handles)
+                and total_locks == 2
+                and delegated_ok
+                and (len(self._active_handles) == 0 or all(not handle.released for handle in self._active_handles))
                 and token.issued_at_epoch <= now_epoch < token.expires_at_epoch
                 and token.backend_object_identity_sha256
                 == self._config.expected_backend_object_identity_sha256
@@ -391,12 +423,13 @@ class PhysicalMultiStoreObservationLeaseV2:
             return {
                 "active": self._active_token is not None,
                 "held_lock_count": len(self._active_handles),
+                "delegated_lock_count": 1 if self._active_delegated_permit is not None else 0,
                 "all_handles_live": bool(
-                    self._active_handles
+                    len(self._active_handles) > 0
                     and all(
                         not handle.released for handle in self._active_handles
                     )
-                ),
+                ) if len(self._active_handles) > 0 else True,
                 "synthetic_only": True,
                 "temporary_storage_only": True,
                 "production_authority": False,

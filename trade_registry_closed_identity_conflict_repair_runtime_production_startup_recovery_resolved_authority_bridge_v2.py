@@ -8,6 +8,7 @@ PREPARED recovery callback with the exact physical RESOLVED store reference.
 from __future__ import annotations
 
 import hmac
+import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from typing import Any
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_evidence_source_ports_contract_v2 as identity_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_physical_store_reference_v2 as physical_store_v2
 import trade_registry_closed_identity_conflict_repair_runtime_seam_v1 as runtime_seam_v1
+import trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1 as coordinator_v1
+import trade_registry_closed_identity_conflict_repair_writer_runtime_storage_adapters_v1 as lock_storage_v1
 
 
 TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_RUNTIME_PRODUCTION_STARTUP_RECOVERY_RESOLVED_AUTHORITY_BRIDGE_V2_VERSION = (
@@ -104,6 +107,15 @@ class ResolvedAuthorityStartupRecoveryBridgeConfigV2:
     expected_physical_store_object_identity_sha256: str | None = field(
         default=None, repr=False
     )
+    require_coordinated_physical_recovery: bool = False
+    expected_maintenance_coordinator_object_identity_sha256: str | None = field(
+        default=None, repr=False
+    )
+    expected_lock_backend_object_identity_sha256: str | None = field(
+        default=None, repr=False
+    )
+    resolved_lock_namespace_sha256: str | None = field(default=None, repr=False)
+    lock_timeout_seconds: float = 5.0
 
 
 class ResolvedAuthorityStartupRecoveryBridgeV2:
@@ -115,11 +127,15 @@ class ResolvedAuthorityStartupRecoveryBridgeV2:
         | None = None,
         physical_store: Any = None,
         clock: Callable[[], int] | None = None,
+        maintenance_coordinator: Any = None,
+        lock_backend: Any = None,
     ) -> None:
         self._config = config or ResolvedAuthorityStartupRecoveryBridgeConfigV2()
         self._prepared_recovery = prepared_recovery
         self._physical_store = physical_store
         self._clock = clock
+        self._maintenance_coordinator = maintenance_coordinator
+        self._lock_backend = lock_backend
 
     def __repr__(self) -> str:
         return "ResolvedAuthorityStartupRecoveryBridgeV2(<protected>)"
@@ -185,6 +201,31 @@ class ResolvedAuthorityStartupRecoveryBridgeV2:
             == config.expected_physical_store_object_identity_sha256
         ):
             return "RESOLVED_AUTHORITY_STARTUP_RECOVERY_INSTANCE_MISMATCH"
+        if type(config.require_coordinated_physical_recovery) is not bool:
+            return "RESOLVED_AUTHORITY_COORDINATED_RECOVERY_MODE_INVALID"
+        if config.require_coordinated_physical_recovery:
+            if not (
+                all(_valid_sha(item) for item in (
+                    config.expected_maintenance_coordinator_object_identity_sha256,
+                    config.expected_lock_backend_object_identity_sha256,
+                    config.resolved_lock_namespace_sha256,
+                ))
+                and type(self._maintenance_coordinator)
+                is coordinator_v1.ClosedRepairWriterRuntimeCoordinatorV1
+                and type(self._lock_backend)
+                is lock_storage_v1.CrossPlatformInterprocessFileLockBackendV1
+                and self._lock_backend.enabled is True
+                and identity_v2.startup_recovery_evidence_source_object_identity_sha256_v2(
+                    self._maintenance_coordinator
+                ) == config.expected_maintenance_coordinator_object_identity_sha256
+                and identity_v2.startup_recovery_evidence_source_object_identity_sha256_v2(
+                    self._lock_backend
+                ) == config.expected_lock_backend_object_identity_sha256
+                and type(config.lock_timeout_seconds) in (int, float)
+                and math.isfinite(config.lock_timeout_seconds)
+                and config.lock_timeout_seconds > 0
+            ):
+                return "RESOLVED_AUTHORITY_COORDINATED_RECOVERY_BINDING_INVALID"
         physical_snapshot = self._physical_store.snapshot()
         if not (
             physical_snapshot.get("ready_for_temporary_offline_use") is True
@@ -229,6 +270,51 @@ class ResolvedAuthorityStartupRecoveryBridgeV2:
             "live_allowed": False,
         }
 
+    def _read_physical_store_under_current_lease(
+        self, permit: Mapping[str, Any], now_epoch: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if not self._config.require_coordinated_physical_recovery:
+            return (
+                self._physical_store.open_offline(now_epoch=now_epoch),
+                self._physical_store.recover_offline(now_epoch=now_epoch),
+                self._physical_store.read_resolved_records_offline(now_epoch=now_epoch),
+            )
+        backend = self._lock_backend
+        coordinator = self._maintenance_coordinator
+        if not coordinator.maintenance_permit_is_current_v1(permit, lock_backend=backend):
+            raise RuntimeError("RESOLVED_AUTHORITY_MAINTENANCE_NOT_CURRENT")
+        if permit["lock_namespace_sha256"] == self._config.resolved_lock_namespace_sha256:
+            raise RuntimeError("RESOLVED_AUTHORITY_LOCK_NAMESPACE_COLLISION")
+        handle = backend.acquire(
+            self._config.resolved_lock_namespace_sha256,
+            self._config.lock_timeout_seconds,
+        )
+        if type(handle) is not lock_storage_v1.InterprocessFileLockHandleV1 or handle.released:
+            raise RuntimeError("RESOLVED_AUTHORITY_STORE_LOCK_UNAVAILABLE")
+        try:
+            receipts = []
+            for operation in (
+                self._physical_store.open_offline,
+                self._physical_store.recover_offline,
+                self._physical_store.read_resolved_records_offline,
+            ):
+                if not coordinator.maintenance_permit_is_current_v1(permit, lock_backend=backend):
+                    raise RuntimeError("RESOLVED_AUTHORITY_MAINTENANCE_LOST")
+                if handle.released:
+                    raise RuntimeError("RESOLVED_AUTHORITY_STORE_LOCK_LOST")
+                receipts.append(operation(now_epoch=now_epoch))
+                if not coordinator.maintenance_permit_is_current_v1(permit, lock_backend=backend):
+                    raise RuntimeError("RESOLVED_AUTHORITY_MAINTENANCE_LOST")
+                if handle.released:
+                    raise RuntimeError("RESOLVED_AUTHORITY_STORE_LOCK_LOST")
+        finally:
+            handle.release()
+        if not handle.released or not coordinator.maintenance_permit_is_current_v1(
+            permit, lock_backend=backend,
+        ):
+            raise RuntimeError("RESOLVED_AUTHORITY_LOCK_RELEASE_OR_MAINTENANCE_LOST")
+        return tuple(receipts)
+
     def __call__(self, maintenance_permit: Mapping[str, Any]) -> dict[str, Any]:
         reason = self._reason()
         if reason is not None:
@@ -243,17 +329,24 @@ class ResolvedAuthorityStartupRecoveryBridgeV2:
             return self._failed("RESOLVED_AUTHORITY_STARTUP_RECOVERY_CLOCK_FAILED")
         if type(now_epoch) is not int:
             return self._failed("RESOLVED_AUTHORITY_STARTUP_RECOVERY_CLOCK_INVALID")
+        if self._config.require_coordinated_physical_recovery and not (
+            self._maintenance_coordinator.maintenance_permit_is_current_v1(
+                maintenance_permit, lock_backend=self._lock_backend
+            )
+        ):
+            return self._failed("RESOLVED_AUTHORITY_MAINTENANCE_NOT_CURRENT")
         try:
             prepared = self._prepared_recovery(dict(maintenance_permit))
         except Exception:
             return self._failed("PREPARED_STARTUP_RECOVERY_FAILED_CLOSED")
         if not _prepared_attestation_valid(prepared, maintenance_permit):
             return self._failed("PREPARED_STARTUP_RECOVERY_ATTESTATION_INVALID")
-        opened = self._physical_store.open_offline(now_epoch=now_epoch)
-        recovered = self._physical_store.recover_offline(now_epoch=now_epoch)
-        scanned = self._physical_store.read_resolved_records_offline(
-            now_epoch=now_epoch
-        )
+        try:
+            opened, recovered, scanned = self._read_physical_store_under_current_lease(
+                maintenance_permit, now_epoch,
+            )
+        except Exception:
+            return self._failed("RESOLVED_AUTHORITY_PHYSICAL_RECOVERY_FAILED_CLOSED")
         if not (
             opened.get("ok") is True
             and recovered.get("ok") is True

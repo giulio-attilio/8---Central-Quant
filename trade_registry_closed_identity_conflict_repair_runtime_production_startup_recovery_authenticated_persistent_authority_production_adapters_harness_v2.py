@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import tempfile
+from dataclasses import asdict, replace
+from itertools import count
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import trade_registry_closed_identity_conflict_repair_durable_raw_transaction_backend_conformance_contract_v2 as hash_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_authority_binding_harness_v1 as authority_harness_v1
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_boundary_harness_v2 as boundary_harness_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_boundary_v2 as boundary_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_authenticated_persistent_authority_production_adapters_v2 as adapters_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_kms_hmac_verification_adapter_v2 as kms_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_evidence_source_ports_contract_v2 as identity_v2
 import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_physical_store_reference_harness_v2 as store_harness_v2
+import trade_registry_closed_identity_conflict_repair_runtime_production_startup_recovery_resolved_authority_bridge_v2 as bridge_v2
+import trade_registry_closed_identity_conflict_repair_writer_runtime_storage_adapters_v1 as lock_storage_v1
+import trade_registry_closed_identity_conflict_repair_writer_runtime_coordinator_v1 as coordinator_v1
 
 
 TRADE_REGISTRY_CLOSED_IDENTITY_CONFLICT_REPAIR_RUNTIME_PRODUCTION_STARTUP_RECOVERY_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_HARNESS_V2_VERSION = (
@@ -38,14 +46,76 @@ class SyntheticInjectedKeyProviderV2:
         return "SyntheticInjectedKeyProviderV2(<protected>)"
 
 
+class SyntheticRemoteMacVerifierV2:
+    """Test-only remote verdict; never exports a key or opens a connection."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bytes, bytes, str]] = []
+        self.verdict: Any = True
+        self.raise_error = False
+
+    def verify_root_hmac_v2(
+        self, *, key_id_sha256: str, message: bytes, mac: bytes, mac_algorithm: str
+    ) -> Any:
+        self.calls.append((key_id_sha256, message, mac, mac_algorithm))
+        if self.raise_error:
+            raise TimeoutError("synthetic remote verification unavailable")
+        if not (
+            key_id_sha256 == authority_harness_v1._SYNTHETIC_KEY_ID_SHA256
+            and mac_algorithm == "HMAC_SHA_256"
+            and hmac.compare_digest(
+                hmac.new(authority_harness_v1._SYNTHETIC_KEY, message, hashlib.sha256).digest(),
+                mac,
+            )
+        ):
+            return False
+        return self.verdict
+
+
+class SyntheticKmsVerifyMacClientV2:
+    """Offline VerifyMac-shaped client; never discovers credentials or uses AWS."""
+
+    def __init__(self, key_arn: str) -> None:
+        self.key_arn = key_arn
+        self.calls: list[dict[str, Any]] = []
+        self.response_override: Any = None
+        self.raise_error = False
+
+    def verify_mac(self, **request: Any) -> Any:
+        self.calls.append(request)
+        if self.raise_error:
+            raise TimeoutError("synthetic KMS verification unavailable")
+        if self.response_override is not None:
+            return self.response_override
+        valid = bool(
+            request.get("KeyId") == self.key_arn
+            and request.get("MacAlgorithm") == "HMAC_SHA_256"
+            and hmac.compare_digest(
+                hmac.new(
+                    authority_harness_v1._SYNTHETIC_KEY,
+                    request["Message"], hashlib.sha256,
+                ).digest(),
+                request["Mac"],
+            )
+        )
+        return {
+            "KeyId": self.key_arn,
+            "MacAlgorithm": "HMAC_SHA_256",
+            "MacValid": valid,
+        }
+
+
 class TemporaryStoreRecoveryPortV2:
     def __init__(
-        self, path: Path, role: str, storage_binding_sha256: str
+        self, path: Path, role: str, storage_binding_sha256: str,
+        *, lock_backend: Any = None, lock_namespace_sha256: str | None = None,
     ) -> None:
         self._path = path
         self._role = role
         self._storage_binding_sha256 = storage_binding_sha256
         self.call_count = 0
+        self.recovery_lock_backend = lock_backend
+        self.recovery_lock_namespace_sha256 = lock_namespace_sha256
         boundary_harness_v2._atomic_write_json(
             path, {"state": "CLEAN", "transactions_remaining": 0}
         )
@@ -91,11 +161,19 @@ class TemporaryStoreRecoveryPortV2:
 
 
 def build_authenticated_persistent_authority_production_adapters_context_v2(
-    root: str | Path, *, revoked: bool = False
+    root: str | Path, *, revoked: bool = False, remote_hmac: bool = False,
+    lease_directory_fsync: Callable[[Path], None] | None = None,
+    synthetic_kms_key_arn: str | None = None,
 ) -> dict[str, Any]:
+    if synthetic_kms_key_arn is not None and remote_hmac is not True:
+        raise ValueError("SYNTHETIC_KMS_REQUIRES_REMOTE_HMAC_MODE")
+    root_key_id_sha256 = (
+        kms_v2.kms_root_hmac_key_id_sha256_v2(synthetic_kms_key_arn)
+        if synthetic_kms_key_arn is not None else None
+    )
     root_path = Path(root).resolve(strict=False)
     base = boundary_harness_v2.build_authenticated_persistent_authority_boundary_context_v2(
-        root_path
+        root_path, root_key_id_sha256=root_key_id_sha256,
     )
     attestation = dict(base["attestation"])
     root_envelope = {
@@ -140,7 +218,22 @@ def build_authenticated_persistent_authority_production_adapters_context_v2(
     revocation_source = adapters_v2.PersistentRootAuthorityRevocationSourceV2(
         file_config, storage_root=root_path
     )
-    key_provider = SyntheticInjectedKeyProviderV2()
+    kms_client = None
+    if synthetic_kms_key_arn is not None:
+        kms_client = SyntheticKmsVerifyMacClientV2(synthetic_kms_key_arn)
+        key_provider = kms_v2.KmsRootHmacVerificationProviderV2(
+            kms_v2.KmsRootHmacVerificationConfigV2(
+                enabled=True,
+                scope_attestation=adapters_v2.PRODUCTION_AUTHORITY_ADAPTERS_EXPLICIT_DEPENDENCY_SCOPE_V2,
+                key_arn=synthetic_kms_key_arn,
+                expected_client_object_identity_sha256=_object_identity(kms_client),
+            ),
+            client=kms_client,
+        )
+    else:
+        key_provider = (
+            SyntheticRemoteMacVerifierV2() if remote_hmac else SyntheticInjectedKeyProviderV2()
+        )
     verifier = adapters_v2.InjectedRootAuthorityVerifierV2(
         adapters_v2.InjectedRootAuthorityVerifierConfigV2(
             enabled=True,
@@ -148,19 +241,43 @@ def build_authenticated_persistent_authority_production_adapters_context_v2(
             expected_key_provider_object_identity_sha256=_object_identity(
                 key_provider
             ),
+            verification_mode=(
+                adapters_v2.ROOT_HMAC_REMOTE_VERDICT_MODE_V2
+                if remote_hmac else adapters_v2.ROOT_HMAC_LOCAL_KEY_MODE_V2
+            ),
         ),
         key_provider=key_provider,
     )
     storage_binding = attestation["storage_binding_sha256"]
+    lock_backend = lock_storage_v1.CrossPlatformInterprocessFileLockBackendV1(
+        root_path / "synthetic_recovery_locks", enabled=True,
+    )
+    lease_store = lock_storage_v1.DurableJsonMaintenanceLeaseStoreV1(
+        lock_backend.storage_root, enabled=True,
+        directory_fsync=lease_directory_fsync,
+    )
+    nonce_sequence = count()
+    maintenance_coordinator = coordinator_v1.ClosedRepairWriterRuntimeCoordinatorV1(
+        config=coordinator_v1.WriterRuntimeCoordinatorConfigV1(enabled=True, maintenance_only=True),
+        lock_backend=lock_backend, lease_store=lease_store,
+        clock=lambda: float(store_harness_v2.SYNTHETIC_NOW_V2),
+        nonce_source=lambda: f"synthetic-maintenance-{next(nonce_sequence)}",
+    )
+    maintenance_coordinator.register_all_declared_writers()
+    namespaces = tuple(hash_v2.stable_sha256_v2({
+        "synthetic_storage_binding": storage_binding, "store_role": role,
+    }) for role in ("TRANSACTION_STORE", "RESOLVED_AUTHORITY_STORE"))
     transaction_port = TemporaryStoreRecoveryPortV2(
         root_path / "transaction_recovery_state.json",
         "TRANSACTION_STORE",
         storage_binding,
+        lock_backend=lock_backend, lock_namespace_sha256=namespaces[0],
     )
     resolved_port = TemporaryStoreRecoveryPortV2(
         root_path / "resolved_recovery_state.json",
         "RESOLVED_AUTHORITY_STORE",
         storage_binding,
+        lock_backend=lock_backend, lock_namespace_sha256=namespaces[1],
     )
     multistore = adapters_v2.CoordinatedMultistoreStartupRecoveryV2(
         adapters_v2.CoordinatedMultistoreRecoveryConfigV2(
@@ -173,9 +290,32 @@ def build_authenticated_persistent_authority_production_adapters_context_v2(
                 resolved_port
             ),
             expected_storage_binding_sha256=storage_binding,
+            expected_lock_backend_object_identity_sha256=_object_identity(lock_backend),
+            expected_lock_storage_root_binding_sha256=adapters_v2.authority_adapter_storage_root_binding_sha256_v2(lock_backend.storage_root),
+            transaction_lock_namespace_sha256=namespaces[0],
+            resolved_lock_namespace_sha256=namespaces[1],
+            expected_maintenance_coordinator_object_identity_sha256=_object_identity(maintenance_coordinator),
         ),
         transaction_recovery=transaction_port,
         resolved_recovery=resolved_port,
+        lock_backend=lock_backend,
+        maintenance_coordinator=maintenance_coordinator,
+    )
+    original_bridge = base["bridge"]
+    bridge = bridge_v2.ResolvedAuthorityStartupRecoveryBridgeV2(
+        replace(
+            original_bridge._config,
+            require_coordinated_physical_recovery=True,
+            expected_maintenance_coordinator_object_identity_sha256=_object_identity(maintenance_coordinator),
+            expected_lock_backend_object_identity_sha256=_object_identity(lock_backend),
+            resolved_lock_namespace_sha256=namespaces[1],
+            lock_timeout_seconds=0.02,
+        ),
+        prepared_recovery=original_bridge._prepared_recovery,
+        physical_store=original_bridge._physical_store,
+        clock=original_bridge._clock,
+        maintenance_coordinator=maintenance_coordinator,
+        lock_backend=lock_backend,
     )
     boundary = boundary_v2.AuthenticatedPersistentAuthorityBoundaryV2(
         boundary_v2.AuthenticatedPersistentAuthorityBoundaryConfigV2(
@@ -192,7 +332,7 @@ def build_authenticated_persistent_authority_production_adapters_context_v2(
                 multistore
             ),
             expected_startup_bridge_object_identity_sha256=_object_identity(
-                base["bridge"]
+                bridge
             ),
             expected_storage_binding_sha256=storage_binding,
             expected_root_authority_attestation_sha256=attestation[
@@ -203,19 +343,25 @@ def build_authenticated_persistent_authority_production_adapters_context_v2(
         root_authority_verifier=verifier,
         root_revocation_source=revocation_source,
         multistore_recovery=multistore,
-        startup_bridge=base["bridge"],
+        startup_bridge=bridge,
         clock=lambda: store_harness_v2.SYNTHETIC_NOW_V2,
     )
     return {
         **base,
+        "bridge": bridge,
         "boundary": boundary,
         "root_provider": root_provider,
         "revocation": revocation_source,
         "verifier": verifier,
         "key_provider": key_provider,
+        "kms_client": kms_client,
         "multistore": multistore,
         "transaction_port": transaction_port,
         "resolved_port": resolved_port,
+        "lock_backend": lock_backend,
+        "lock_namespaces": namespaces,
+        "maintenance_coordinator": maintenance_coordinator,
+        "lease_store": lease_store,
     }
 
 
@@ -226,19 +372,8 @@ def run_authenticated_persistent_authority_production_adapters_harness_v2() -> d
         values = build_authenticated_persistent_authority_production_adapters_context_v2(
             root_path
         )
-        permit = {
-            "maintenance_epoch": hash_v2.stable_sha256_v2(
-                {"maintenance_epoch": "production-adapters"}
-            ),
-            "state": "QUIESCED",
-            "lock_namespace_sha256": hash_v2.stable_sha256_v2(
-                {"lock_namespace": "production-adapters"}
-            ),
-            "registered_writer_count": 19,
-            "inflight_mutations": 0,
-            "shared_lock_acquired": True,
-        }
-        result = values["boundary"](permit)
+        with values["maintenance_coordinator"].maintenance_lease() as permit:
+            result = values["boundary"](asdict(permit))
         ok = bool(
             result.get("ok") is True
             and result.get("persistent_root_read") is True

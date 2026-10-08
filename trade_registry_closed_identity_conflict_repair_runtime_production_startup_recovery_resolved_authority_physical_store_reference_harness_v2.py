@@ -45,6 +45,7 @@ def build_resolved_authority_physical_store_reference_context_v2(
     root: str | Path,
     *,
     revoked: bool = False,
+    root_key_id_sha256: str | None = None,
 ) -> dict[str, Any]:
     temporary_root = Path(root).resolve(strict=False)
     ledger_storage = _storage(temporary_root)
@@ -66,8 +67,14 @@ def build_resolved_authority_physical_store_reference_context_v2(
     root_attestation = authenticated_harness_v1._root_authority_attestation(
         root_identity_sha256=root_identity_sha256,
         storage_binding_sha256=storage_binding_sha256,
+        key_id_sha256=(
+            authenticated_harness_v1._SYNTHETIC_KEY_ID_SHA256
+            if root_key_id_sha256 is None else root_key_id_sha256
+        ),
     )
-    verifier = authenticated_harness_v1.SyntheticOfflineRootAuthorityVerifierV1()
+    verifier = authenticated_harness_v1.SyntheticOfflineRootAuthorityVerifierV1(
+        expected_key_id_sha256=root_attestation["key_id_sha256"]
+    )
     durable_receipt = authenticated_harness_v1._durable_authority_receipt(
         root_identity_sha256=root_identity_sha256,
         storage_binding_sha256=storage_binding_sha256,

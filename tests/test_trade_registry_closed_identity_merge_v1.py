@@ -6,6 +6,7 @@ import importlib.util
 import itertools
 import json
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -102,6 +103,10 @@ def _main_function(name):
 def _compile_main_functions(names, namespace):
     namespace.setdefault(
         "_trpsf_v1_registry_lock", lambda: threading.RLock()
+    )
+    namespace.setdefault(
+        "c3_runtime_seam_v1",
+        SimpleNamespace(_c3_closed_repair_writer_mutation_v1=lambda _: nullcontext()),
     )
     nodes = []
     for name in names:

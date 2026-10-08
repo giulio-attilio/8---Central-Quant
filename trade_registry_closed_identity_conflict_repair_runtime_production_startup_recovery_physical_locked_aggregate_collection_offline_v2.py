@@ -234,7 +234,7 @@ class PhysicalLockedAggregateCollectionV2:
             return "PHYSICAL_LOCKED_AGGREGATE_COLLECTION_IDENTITY_MISMATCH"
         return None
 
-    def collect_offline(self) -> dict[str, Any]:
+    def collect_offline(self, delegated_permit: Any = None, delegated_permit_validator: Callable[[Any], bool] | None = None) -> dict[str, Any]:
         result = self._failed("")
         reason = self._reason()
         if reason is not None:
@@ -249,7 +249,7 @@ class PhysicalLockedAggregateCollectionV2:
         read_count = 0
         receipt_material: dict[str, Any] | None = None
         try:
-            with self._lease.hold_offline(expires_at_epoch=expires_at) as token:
+            with self._lease.hold_offline(expires_at_epoch=expires_at, delegated_permit=delegated_permit, delegated_permit_validator=delegated_permit_validator) as token:
                 def now() -> int:
                     return int(self._clock())
 
@@ -346,7 +346,7 @@ class PhysicalLockedAggregateCollectionV2:
                         durable_authority_ledger=self._ledger,
                         now_epoch=now(),
                     )
-                    and lease_snapshot["held_lock_count"] == 2
+                    and lease_snapshot["held_lock_count"] + lease_snapshot.get("delegated_lock_count", 0) == 2
                     and lease_snapshot["all_handles_live"] is True
                 ):
                     raise ValueError("LOCKED_AGGREGATE_POSTCONDITIONS_INVALID")

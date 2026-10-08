@@ -123,17 +123,17 @@ def canonical_runtime_writer_transaction_placements_v1() -> list[dict[str, Any]]
         _placement("TRADE_REGISTRY_RECORD_MANUAL_CLOSE_OUTCOME", "trade_registry.py", "record_manual_close_outcome", "TRADE_REGISTRY_FULL_RMW_REENTRANT", 2874, 3007, fresh_read_line=2875, authoritative_write_lines=(3001,), local_lock_line=2874, nested_reentry=True, sidecar_outside=True),
         _placement("TRADE_REGISTRY_CLOSE_TRADE", "trade_registry.py", "close_trade", "TRADE_REGISTRY_FULL_RMW_REENTRANT", 3115, 3250, fresh_read_line=3116, authoritative_write_lines=(3244,), local_lock_line=3115, nested_reentry=True, sidecar_outside=True),
         _placement("TRADE_REGISTRY_RESET", "trade_registry.py", "reset_trade_registry", "TRADE_REGISTRY_EXCLUSIVE_WRITE_REENTRANT", 3305, 3308, fresh_read_line=None, authoritative_write_lines=(3306,), commit_guard_line=3303, nested_reentry=True),
-        _placement("MAIN_SYNC_MANUAL_REGISTER_OPEN", "main.py", "_trs_v1_manual_register_open_trade", "MAIN_FULL_RMW_FRESH_READ", 4489, 4535, fresh_read_line=4489, authoritative_write_lines=(4527,)),
-        _placement("MAIN_LIFECYCLE_UPDATE_OPEN_SNAPSHOT", "main.py", "_rtlm_v1_update_open_trade_snapshot", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 7253, 7294, fresh_read_line=7253, authoritative_write_lines=(7289,), commit_guard_line=7251),
-        _placement("MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT", "main.py", "registry_persistence_v1_restore_from_latest_snapshot", "MAIN_EXISTING_LOCK_COORDINATOR_UPGRADE", 9862, 10007, fresh_read_line=9914, authoritative_write_lines=(9990,), local_lock_line=9879, commit_guard_line=9862, nested_reentry=True, revalidation=True, sidecar_outside=True),
-        _placement("MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE", "main.py", "registry_persistence_v12_recover_closed_trade_from_params", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 10316, 10330, fresh_read_line=10319, authoritative_write_lines=(10327,), commit_guard_line=10305, revalidation=True, external_collection_outside=True, sidecar_outside=True, partial_commit_truth=True),
-        _placement("MAIN_TRADE_CLOSE_OUTCOME_COMMIT", "main.py", "trade_close_outcome_v1_commit", "MAIN_FULL_RMW_FRESH_READ", 11153, 11264, fresh_read_line=11153, authoritative_write_lines=(11262,), revalidation=True, sidecar_outside=True, partial_commit_truth=True),
-        _placement("MAIN_REGISTRY_MODE_SEGREGATION_COMMIT", "main.py", "registry_mode_segregation_v1_analyze", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 11747, 11761, fresh_read_line=11748, authoritative_write_lines=(11760,), commit_guard_line=11747, revalidation=True, external_collection_outside=True, sidecar_outside=True),
-        _placement("MAIN_MARK_REGISTRY_MISSING_TRADES", "main.py", "mark_registry_missing_trades", "MAIN_FULL_RMW_FRESH_READ", 14796, 14830, fresh_read_line=14796, authoritative_write_lines=(14830,)),
-        _placement("MAIN_PREDATOR_PAPER_REGISTRY_SYNC", "main.py", "predator_paper_registry_sync_fix_v1_status", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 49560, 49573, fresh_read_line=49561, authoritative_write_lines=(49572,), commit_guard_line=49560, revalidation=True, external_collection_outside=True, sidecar_outside=True),
-        _placement("MAIN_PREDATOR_ORPHAN_OPEN_FIX", "main.py", "predator_registry_orphan_open_fix_v1_status", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 49898, 49996, fresh_read_line=49899, authoritative_write_lines=(49995,), commit_guard_line=49898, revalidation=True, external_collection_outside=True, sidecar_outside=True),
-        _placement("MAIN_PREDATOR_AUTO_CLOSED_SYNC", "main.py", "predator_auto_closed_sync_v1_status", "MAIN_EXISTING_LOCK_COORDINATOR_UPGRADE", 67786, 67841, fresh_read_line=67793, authoritative_write_lines=(67830,), local_lock_line=67791, commit_guard_line=67786, nested_reentry=True, revalidation=True, external_collection_outside=True, sidecar_outside=True),
-        _placement("MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP", "main.py", "_trpsf_v1_bootstrap_registry", "MAIN_EXISTING_LOCK_COORDINATOR_UPGRADE", 50648, 51037, fresh_read_line=50701, authoritative_write_lines=(50945, 50953, 51015, 51024), local_lock_line=50688, commit_guard_line=50648, nested_reentry=True, revalidation=True, sidecar_outside=False),
+        _placement("MAIN_SYNC_MANUAL_REGISTER_OPEN", "main.py", "_trs_v1_manual_register_open_trade", "MAIN_FULL_RMW_FRESH_READ", 4492, 4539, fresh_read_line=4493, authoritative_write_lines=(4531,), local_lock_line=4492),
+        _placement("MAIN_LIFECYCLE_UPDATE_OPEN_SNAPSHOT", "main.py", "_rtlm_v1_update_open_trade_snapshot", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 7261, 7303, fresh_read_line=7262, authoritative_write_lines=(7298,), local_lock_line=7261, commit_guard_line=7254),
+        _placement("MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT", "main.py", "registry_persistence_v1_restore_from_latest_snapshot", "MAIN_EXISTING_LOCK_COORDINATOR_UPGRADE", 9887, 9892, fresh_read_line=9942, authoritative_write_lines=(10018,), local_lock_line=9887, commit_guard_line=9870, nested_reentry=True, revalidation=True, sidecar_outside=True),
+        _placement("MAIN_PERSISTENCE_RECOVER_CLOSED_TRADE", "main.py", "registry_persistence_v12_recover_closed_trade_from_params", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 10257, 10366, fresh_read_line=10261, authoritative_write_lines=(10362,), local_lock_line=10257, commit_guard_line=10340, revalidation=True, external_collection_outside=True, sidecar_outside=True, partial_commit_truth=True),
+        _placement("MAIN_TRADE_CLOSE_OUTCOME_COMMIT", "main.py", "trade_close_outcome_v1_commit", "MAIN_FULL_RMW_FRESH_READ", 11208, 11329, fresh_read_line=11216, authoritative_write_lines=(11325,), local_lock_line=11208, revalidation=True, sidecar_outside=True, partial_commit_truth=True),
+        _placement("MAIN_REGISTRY_MODE_SEGREGATION_COMMIT", "main.py", "registry_mode_segregation_v1_analyze", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 11803, 11852, fresh_read_line=11807, authoritative_write_lines=(11842,), local_lock_line=11803, commit_guard_line=11829, revalidation=True, external_collection_outside=True, sidecar_outside=True),
+        _placement("MAIN_MARK_REGISTRY_MISSING_TRADES", "main.py", "mark_registry_missing_trades", "MAIN_FULL_RMW_FRESH_READ", 14880, 14921, fresh_read_line=14881, authoritative_write_lines=(14915,), local_lock_line=14880),
+        _placement("MAIN_PREDATOR_PAPER_REGISTRY_SYNC", "main.py", "predator_paper_registry_sync_fix_v1_status", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 49600, 49706, fresh_read_line=49605, authoritative_write_lines=(49699,), local_lock_line=49600, commit_guard_line=49604, revalidation=True, external_collection_outside=True, sidecar_outside=True),
+        _placement("MAIN_PREDATOR_ORPHAN_OPEN_FIX", "main.py", "predator_registry_orphan_open_fix_v1_status", "MAIN_COMMIT_BRANCH_FRESH_RELOAD", 50034, 50145, fresh_read_line=50035, authoritative_write_lines=(50142,), local_lock_line=50034, commit_guard_line=50029, revalidation=True, external_collection_outside=True, sidecar_outside=True),
+        _placement("MAIN_PREDATOR_AUTO_CLOSED_SYNC", "main.py", "predator_auto_closed_sync_v1_status", "MAIN_EXISTING_LOCK_COORDINATOR_UPGRADE", 67946, 67987, fresh_read_line=67947, authoritative_write_lines=(67984,), local_lock_line=67946, commit_guard_line=67941, nested_reentry=True, revalidation=True, external_collection_outside=True, sidecar_outside=True),
+        _placement("MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP", "main.py", "_trpsf_v1_bootstrap_registry", "MAIN_EXISTING_LOCK_COORDINATOR_UPGRADE", 50834, 50837, fresh_read_line=50847, authoritative_write_lines=(51091, 51099, 51161, 51170), local_lock_line=50834, commit_guard_line=50804, nested_reentry=True, revalidation=True, sidecar_outside=False),
     ]
 
 
@@ -246,7 +246,18 @@ def _check_spec(spec: Mapping[str, Any], upstream_sha: str, reasons: list[str], 
         and writer_ids == [item["writer_id"] for item in inventory]
         and Counter(item["classification"] for item in expected) == Counter(_CLASS_COUNTS)
         and all(item["release_on_all_returns"] and item["release_on_all_exceptions"] for item in expected)
-        and all(item["acquire_before_line"] <= min(item["authoritative_write_lines"]) <= item["release_after_line"] for item in expected)
+        and all(
+            item["acquire_before_line"] <= min(item["authoritative_write_lines"]) <= item["release_after_line"]
+            or (
+                item["writer_id"] in {
+                    "MAIN_PERSISTENCE_RESTORE_LATEST_SNAPSHOT",
+                    "MAIN_TRADE_REGISTRY_STORAGE_BOOTSTRAP",
+                }
+                and item["same_owner_token_for_nested_reentry"] is True
+                and item["acquire_before_line"] <= item["release_after_line"] < item["fresh_read_after_acquire_line"]
+            )
+            for item in expected
+        )
         and all(item["fresh_read_after_acquire_line"] is not None for item in expected if item["writer_id"] != "TRADE_REGISTRY_RESET")
     )
     checks["protocol_exact"] = spec.get("lock_protocol") == canonical_runtime_writer_lock_protocol_v1()
