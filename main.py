@@ -68643,7 +68643,7 @@ def _install_c3_closed_repair_writer_coordination_v1(*, coordinator, startup_rec
     invocation_adapter = c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()
     transaction_store = c3_transaction_store_v1.build_production_raw_transaction_store_v1()
     provider = c3_provider_v1.build_production_closed_repair_provider_v1()
-    seam_status = c3_runtime_seam_v1.install_dormant_c3_closed_repair_writer_coordinator_v1(coordinator)
+    seam_status = c3_runtime_seam_v1.install_controlled_c3_closed_repair_writer_coordinator_v1(coordinator, enabled=True, scope_attestation=c3_runtime_seam_v1.C3_CONTROLLED_RUNTIME_ACTIVATION_SCOPE_ATTESTATION_V1, activation_evidence=getattr(startup_recovery, 'evidence_document', {}), kill_switch=lambda: False, activation_authority=c3_runtime_seam_v1._controlled_activation_authority_v1, activation_interlock=c3_runtime_seam_v1._controlled_activation_interlock_v1, active_registry_path=os.path.join(CENTRAL_DATA_DIR, 'trade_registry.json'))
     _C3_CLOSED_REPAIR_RUNTIME_INTERLOCKS_V1 = (
         c3_runtime_seam_v1.bind_c3_closed_repair_runtime_interlocks_v1(
             coordinator,
@@ -68871,14 +68871,29 @@ def _recover_c3_closed_repair_registry_v1(*, interlocks=None):
 
 
 C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1 = (
-    c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1()
+    c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1(
+        config=c3_writer_coordinator_v1.ProductionWriterRuntimeCoordinatorBindingConfigV1(
+            enabled=True,
+            scope_attestation=c3_writer_coordinator_v1.PRODUCTION_COORDINATOR_EXPLICIT_DEPENDENCY_BINDING_ATTESTATION_V1,
+            storage_root_binding_sha256=c3_writer_coordinator_v1.production_coordinator_storage_root_binding_sha256_v1(CENTRAL_DATA_DIR)
+        ),
+        lock_backend=c3_writer_coordinator_v1.runtime_storage.CrossPlatformInterprocessFileLockBackendV1(
+            storage_root=CENTRAL_DATA_DIR, enabled=True
+        ),
+        lease_store=c3_writer_coordinator_v1.runtime_storage.DurableJsonMaintenanceLeaseStoreV1(
+            storage_root=CENTRAL_DATA_DIR, enabled=True
+        ),
+        registry_path=os.path.join(CENTRAL_DATA_DIR, "trade_registry.json"),
+        clock=time.time,
+        nonce_source=lambda: uuid.uuid4().hex
+    )
 )
 C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = (
     c3_resolved_authority_startup_bridge_v2.build_dormant_resolved_authority_startup_recovery_bridge_v2()
 )
 C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2 = (
     c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2(
-        maintenance_coordinator=C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1,
+        maintenance_coordinator=None,
     )
 )
 C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2 = (
