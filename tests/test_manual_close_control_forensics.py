@@ -51,21 +51,17 @@ class CloseControlForensics(fixtures.TimestampIntegrity):
         self.assertEqual(sum(out['manual_close_control_integrity'].values()), 0)
         self.assertEqual(out['manual_close_control_diagnostics'], [])
 
-    def test_existing_writer_cross_route_reproduces_single_failure(self):
+    def test_existing_writer_cross_route_is_valid_without_recovery(self):
         ref = self.activate(bot='FALCON', setups=('FALCON15',))
         now = fixtures.base.h.base.NOW + 100
         update = self.callback('DONKEY', 'mc:' + ref, update=99)
         self.tracker.accept('DONKEY', update, now)
         out = self.inspect()
-        self.assertEqual(out['manual_integrity']['invalid_timestamps'], 1)
+        self.assertEqual(out['manual_integrity']['invalid_timestamps'], 0)
         self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_closed_ms'], 0)
-        self.assertEqual(out['manual_close_control_integrity']['close_after_control_clock'], 1)
-        self.assertFalse(out['review_complete'])
-        d = out['manual_close_control_diagnostics'][0]
-        self.assertIs(d['corrected_invariant_satisfied'], True)
-        self.assertEqual(d['same_operator_covering_control_count'], 1)
-        self.assertEqual(d['minimum_covering_control_clock_ms'], now)
-        self.assertEqual(d['minimum_covering_minus_closed_ms'], 0)
+        self.assertEqual(sum(out['manual_close_control_integrity'].values()), 0)
+        self.assertTrue(out['review_complete'])
+        self.assertEqual(out['manual_close_control_diagnostics'], [])
 
     def test_stop_event_match_and_redaction(self):
         ref = self.activate(bot='FALCON', setups=('FALCON15',))
@@ -79,8 +75,7 @@ class CloseControlForensics(fixtures.TimestampIntegrity):
         self.sql("UPDATE manual_trade_event_v1 SET created_ms=created_ms+1")
         self.assertEqual(self.inspect()['manual_close_control_diagnostics'][0]['matching_stop_event_count'], 0)
 
-    def test_same_operator_watermark_cases_remain_fail_closed(self):
-        import hashlib
+    def test_same_operator_watermark_validation_and_failed_diagnostics(self):
         from contextlib import closing
         import sqlite3
         self.activate(bot='FALCON', setups=('FALCON15',))
@@ -89,6 +84,7 @@ class CloseControlForensics(fixtures.TimestampIntegrity):
             closed, origin_route = db.execute('SELECT closed_ms, route FROM manual_trade_v1').fetchone()
         cases = (
             ('sufficient', [(77, closed)], True, 1, closed, closed),
+            ('strictly_greater', [(77, closed+10)], True, 1, closed+10, closed+10),
             ('insufficient', [(77, closed-1)], False, 0, closed-1, None),
             ('other_operator', [(88, closed+10)], False, 0, closed-100, None),
             ('text_clock', [(77, 'invalid')], False, 0, closed-100, None),
@@ -104,31 +100,28 @@ class CloseControlForensics(fixtures.TimestampIntegrity):
                     self.sql('INSERT INTO manual_trade_control_v1 VALUES (?, ?, ?, 0, ?, NULL)',
                              ('private-route-' + str(i), '909', operator, clock))
                 out = self.inspect()  # Also checks SQLite bytes and no delivery/live.
-                self.assertFalse(out['review_complete'])
+                self.assertIs(out['review_complete'], satisfied)
+                self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_close_control_relation'], int(not satisfied))
+                self.assertEqual(out['manual_close_control_integrity']['close_after_control_clock'], int(not satisfied))
+                self.assertEqual(out['manual_integrity']['invalid_timestamps'], int(not satisfied))
+                self.assertEqual(sum(out['manual_timestamp_integrity'].values()), out['manual_integrity']['invalid_timestamps'])
+                if satisfied:
+                    self.assertEqual(out['reason'], 'READ_ONLY_NO_RECOVERY')
+                    self.assertEqual(out['manual_close_control_diagnostics'], [])
+                    continue
                 self.assertEqual(out['reason'], 'MANUAL_TRACKING_CLOCK_REVIEW_REQUIRED')
-                self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_close_control_relation'], 1)
-                self.assertEqual(out['manual_close_control_integrity']['close_after_control_clock'], 1)
-                self.assertEqual(out['manual_integrity']['invalid_timestamps'], 1)
                 d = out['manual_close_control_diagnostics'][0]
                 self.assertEqual(d['failed_term'], 'close_after_control_clock')
                 self.assertEqual(d['same_operator_control_count'], 1 + sum(op == 77 for op, _ in extra))
                 self.assertEqual(d['same_operator_integer_clock_count'],
                                  1 + sum(op == 77 and type(clock) is int for op, clock in extra))
-                self.assertIs(d['corrected_invariant_satisfied'], satisfied)
+                self.assertIs(d['corrected_invariant_satisfied'], False)
                 self.assertEqual(d['same_operator_covering_control_count'], covering_count)
                 self.assertEqual(d['same_operator_max_control_clock_ms'], maximum)
                 self.assertEqual(d['same_operator_max_minus_closed_ms'], maximum-closed)
-                if minimum is None:
-                    self.assertNotIn('minimum_covering_control_clock_ms', d)
-                    self.assertNotIn('minimum_covering_minus_closed_ms', d)
-                    self.assertNotIn('minimum_covering_route_tag', d)
-                else:
-                    self.assertEqual(d['minimum_covering_control_clock_ms'], minimum)
-                    self.assertEqual(d['minimum_covering_minus_closed_ms'], minimum-closed)
-                    minimum_index = next(i for i, (op, clock) in enumerate(extra)
-                                         if op == 77 and clock == minimum)
-                    self.assertEqual(d['minimum_covering_route_tag'], hashlib.sha256(
-                        ('private-route-' + str(minimum_index)).encode()).hexdigest()[:12])
+                self.assertNotIn('minimum_covering_control_clock_ms', d)
+                self.assertNotIn('minimum_covering_minus_closed_ms', d)
+                self.assertNotIn('minimum_covering_route_tag', d)
                 self.assertFalse({'operator', 'route', 'chat', 'ref'} & set(d))
                 self.assertNotIn('private-route-', str(d))
                 self.assertNotIn(origin_route, str(d))
@@ -153,3 +146,83 @@ class CloseControlForensics(fixtures.TimestampIntegrity):
         out = self.inspect()
         self.assertFalse(out['review_complete'])
         self.assertNotIn('corrected_invariant_satisfied', out['manual_close_control_diagnostics'][0])
+
+    def test_origin_equal_or_greater_and_other_errors_still_block(self):
+        self.activate(bot='FALCON', setups=('FALCON15',))
+        self.sql("UPDATE manual_trade_v1 SET state='CLOSED', close_reason='MANUAL_CLOSE', closed_ms=active_ms")
+        for delta in (0, 10):
+            with self.subTest(delta=delta):
+                self.sql('UPDATE manual_trade_control_v1 SET clock=(SELECT closed_ms FROM manual_trade_v1)+?', (delta,))
+                out = self.inspect()
+                self.assertTrue(out['review_complete'])
+                self.assertEqual(out['manual_integrity']['invalid_timestamps'], 0)
+                self.assertEqual(out['manual_close_control_diagnostics'], [])
+        self.sql('UPDATE manual_trade_v1 SET stop=0')
+        out = self.inspect()
+        self.assertFalse(out['review_complete'])
+        self.assertEqual(out['manual_integrity']['invalid_prices'], 1)
+        self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_close_control_relation'], 0)
+
+    def test_invalid_origin_operator_cannot_use_sufficient_watermark(self):
+        self.activate(bot='FALCON', setups=('FALCON15',))
+        self.sql("UPDATE manual_trade_v1 SET state='CLOSED', close_reason='MANUAL_CLOSE', closed_ms=active_ms")
+        for operator in ('invalid', 0, -1, 77.5):
+            with self.subTest(operator=operator):
+                self.sql('UPDATE manual_trade_control_v1 SET operator=?, clock=(SELECT closed_ms FROM manual_trade_v1)+1', (operator,))
+                out = self.inspect()
+                self.assertFalse(out['review_complete'])
+                self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_close_control_relation'], 1)
+                self.assertEqual(out['manual_close_control_integrity']['invalid_origin_operator'], 1)
+                self.assertEqual(out['manual_close_control_diagnostics'][0]['failed_term'], 'invalid_origin_operator')
+                self.assertEqual(sum(out['manual_timestamp_integrity'].values()), out['manual_integrity']['invalid_timestamps'])
+
+    def test_bad_clock_elsewhere_still_blocks_a_covered_close(self):
+        ref = self.activate(bot='FALCON', setups=('FALCON15',))
+        now = fixtures.base.h.base.NOW + 100
+        self.tracker.accept('DONKEY', self.callback('DONKEY', 'mc:' + ref, update=99), now)
+        self.sql("INSERT INTO manual_trade_control_v1 VALUES ('private-invalid-route', '909', 77, 0, 'invalid', NULL)")
+        out = self.inspect()
+        self.assertFalse(out['review_complete'])
+        self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_close_control_relation'], 0)
+        self.assertEqual(out['manual_integrity']['invalid_timestamps'], 0)
+        self.assertEqual(out['manual_integrity']['invalid_clocks'], 1)
+        self.assertEqual(out['manual_close_control_diagnostics'], [])
+
+    def test_non_integer_origin_clock_does_not_define_manual_watermark(self):
+        from contextlib import closing
+        import sqlite3
+        self.activate(bot='FALCON', setups=('FALCON15',))
+        self.sql("UPDATE manual_trade_v1 SET state='CLOSED', close_reason='MANUAL_CLOSE', closed_ms=active_ms")
+        with closing(sqlite3.connect(self.path)) as db:
+            origin = db.execute('SELECT route FROM manual_trade_v1').fetchone()[0]
+        self.sql('UPDATE manual_trade_control_v1 SET clock=(SELECT closed_ms FROM manual_trade_v1) WHERE route!=?', (origin,))
+        self.sql("UPDATE manual_trade_control_v1 SET clock='invalid' WHERE route=?", (origin,))
+        out = self.inspect()
+        self.assertFalse(out['review_complete'])  # Other clock/activation invariants still fail.
+        self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_close_control_relation'], 0)
+        self.assertEqual(out['manual_integrity']['invalid_clocks'], 1)
+        self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_activation_relation'], 1)
+
+    def test_real_values_synthetic_snapshot_is_valid_and_halt_is_preserved(self):
+        from contextlib import closing
+        from pathlib import Path
+        from unittest.mock import patch
+        import sqlite3
+        self.activate(bot='FALCON', setups=('FALCON15',))
+        origin_clock, closed = 1791136056751, 1791151116911
+        self.sql("UPDATE manual_trade_v1 SET state='CLOSED', close_reason='MANUAL_CLOSE', closed_ms=?", (closed,))
+        with closing(sqlite3.connect(self.path)) as db:
+            origin = db.execute('SELECT route FROM manual_trade_v1').fetchone()[0]
+        self.sql('UPDATE manual_trade_control_v1 SET clock=? WHERE route=?', (origin_clock, origin))
+        self.sql('UPDATE manual_trade_control_v1 SET clock=? WHERE route!=?', (closed, origin))
+        halt = Path(self.path + '.halted')
+        halt.write_bytes(b'MANUAL_REVIEW_REQUIRED\n')
+        with patch.object(fixtures.base, 'NOW', closed+1000):
+            out = self.inspect()
+        self.assertLess(origin_clock, closed)  # Old origin-only rule rejected this snapshot.
+        self.assertTrue(out['review_complete'], out)
+        self.assertEqual(out['manual_timestamp_integrity']['invalid_trade_close_control_relation'], 0)
+        self.assertEqual(out['manual_integrity']['invalid_timestamps'], 0)
+        self.assertEqual(sum(out['manual_close_control_integrity'].values()), 0)
+        self.assertEqual(out['manual_close_control_diagnostics'], [])
+        self.assertEqual(halt.read_bytes(), b'MANUAL_REVIEW_REQUIRED\n')

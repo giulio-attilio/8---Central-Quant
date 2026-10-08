@@ -125,7 +125,7 @@ def inspect_manual_tracking(db, *, now_ms):
     ), 0)
     close_control_integrity = out["manual_close_control_integrity"] = dict.fromkeys((
         "missing_route_control", "non_integer_control_clock",
-        "non_integer_closed_ms", "close_after_control_clock",
+        "non_integer_closed_ms", "close_after_control_clock", "invalid_origin_operator",
     ), 0)
     close_control_diagnostics = out["manual_close_control_diagnostics"] = []
     timestamp_diagnostics = out["manual_timestamp_diagnostics"] = []
@@ -312,11 +312,31 @@ def inspect_manual_tracking(db, *, now_ms):
             integrity["invalid_close"] += 1
         if state == "EXPIRED" or (state == "CLOSED" and t["close_reason"] == "MANUAL_CLOSE"):
             c = by_route.get(t["route"])
-            if (c is None or type(c["clock"]) is not int or type(t["closed_ms"]) is not int
-                    or t["closed_ms"] > c["clock"]):
+            manual_close = state == "CLOSED" and t["close_reason"] == "MANUAL_CLOSE"
+            operator_ok = c is not None and type(c["operator"]) is int and c["operator"] > 0
+            same_operator, integer_controls, covering = [], [], []
+            if manual_close and operator_ok:
+                # A manual-close callback may advance another route of this
+                # operator. Reuse this snapshot selection for diagnostics.
+                same_operator = [control for control in controls
+                                 if type(control["operator"]) is int
+                                 and control["operator"] == c["operator"]]
+                integer_controls = [control for control in same_operator
+                                    if type(control["clock"]) is int]
+                if type(t["closed_ms"]) is int:
+                    covering = [control for control in integer_controls
+                                if control["clock"] >= t["closed_ms"]]
+            # EXPIRED retains the exact origin-route rule.
+            invalid_relation = (c is None or type(c["clock"]) is not int
+                                or type(t["closed_ms"]) is not int or t["closed_ms"] > c["clock"])
+            if manual_close:
+                invalid_relation = (c is None or not operator_ok
+                                    or type(t["closed_ms"]) is not int or not covering)
+            if invalid_relation:
                 invalid_timestamp("invalid_trade_close_control_relation", t, "closed_ms,route,clock", "CLOSE_CONTROL_RELATION_FAILED")
-                # First failed term in the original OR, one count per violation.
+                # One count per violation; retain EXPIRED's failure priority.
                 subtype = ("missing_route_control" if c is None else
+                           "invalid_origin_operator" if manual_close and not operator_ok else
                            "non_integer_control_clock" if type(c["clock"]) is not int else
                            "non_integer_closed_ms" if type(t["closed_ms"]) is not int else
                            "close_after_control_clock")
@@ -343,18 +363,9 @@ def inspect_manual_tracking(db, *, now_ms):
                         stop_event_created_ms=[e["created_ms"] if type(e["created_ms"]) is int else None
                                                for e in event_by_ref.get(t["ref"], []) if e["kind"] == "STOP"],
                     ))
-                    # Observability only: retain the origin-route predicate and
-                    # every failure counter above, including for EXPIRED.
-                    if (state == "CLOSED" and t["close_reason"] == "MANUAL_CLOSE"
-                            and subtype == "close_after_control_clock"
-                            and type(c["operator"]) is int and c["operator"] > 0):
-                        same_operator = [control for control in controls
-                                         if type(control["operator"]) is int
-                                         and control["operator"] == c["operator"]]
-                        integer_controls = [control for control in same_operator
-                                            if type(control["clock"]) is int]
-                        covering = [control for control in integer_controls
-                                    if control["clock"] >= closed]
+                    # Keep sanitized same-operator evidence for failed manual
+                    # relations; valid closes no longer appear as violations.
+                    if manual_close and operator_ok and closed is not None:
                         maximum = max((control["clock"] for control in integer_controls), default=None)
                         diagnostic = close_control_diagnostics[-1]
                         diagnostic.update(
