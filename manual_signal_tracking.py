@@ -343,6 +343,37 @@ def inspect_manual_tracking(db, *, now_ms):
                         stop_event_created_ms=[e["created_ms"] if type(e["created_ms"]) is int else None
                                                for e in event_by_ref.get(t["ref"], []) if e["kind"] == "STOP"],
                     ))
+                    # Observability only: retain the origin-route predicate and
+                    # every failure counter above, including for EXPIRED.
+                    if (state == "CLOSED" and t["close_reason"] == "MANUAL_CLOSE"
+                            and subtype == "close_after_control_clock"
+                            and type(c["operator"]) is int and c["operator"] > 0):
+                        same_operator = [control for control in controls
+                                         if type(control["operator"]) is int
+                                         and control["operator"] == c["operator"]]
+                        integer_controls = [control for control in same_operator
+                                            if type(control["clock"]) is int]
+                        covering = [control for control in integer_controls
+                                    if control["clock"] >= closed]
+                        maximum = max((control["clock"] for control in integer_controls), default=None)
+                        diagnostic = close_control_diagnostics[-1]
+                        diagnostic.update(
+                            same_operator_control_count=len(same_operator),
+                            same_operator_integer_clock_count=len(integer_controls),
+                            same_operator_max_control_clock_ms=maximum,
+                            same_operator_max_minus_closed_ms=maximum-closed if maximum is not None else None,
+                            same_operator_covering_control_count=len(covering),
+                            corrected_invariant_satisfied=bool(covering),
+                        )
+                        if covering:
+                            minimum = min(covering, key=lambda control: (
+                                control["clock"], str(control["route"])))
+                            diagnostic.update(
+                                minimum_covering_control_clock_ms=minimum["clock"],
+                                minimum_covering_minus_closed_ms=minimum["clock"]-closed,
+                                minimum_covering_route_tag=hashlib.sha256(
+                                    str(minimum["route"]).encode()).hexdigest()[:12],
+                            )
         try:
             setups = json.loads(t["setups"])
             bot = "FALCON" if t["family"] == "FALCON" else "DONKEY"
