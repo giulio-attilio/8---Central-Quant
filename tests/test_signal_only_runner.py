@@ -586,6 +586,48 @@ class RunnerTests(unittest.TestCase):
             evaluate.assert_not_called()
             self.assertEqual(Path(str(path) + '.halted').read_text(), 'MANUAL_REVIEW_REQUIRED\n')
 
+    def test_public_api_diagnostic_keeps_fatal_latch_and_sqlite_unchanged(self):
+        from unittest.mock import Mock
+        import bingx_public_signal_source as public
+        import manual_signal_tracking as manual
+        import donkey_signal_tracking as legacy
+        with tempfile.TemporaryDirectory() as directory:
+            _, path = self.inputs(directory)
+            runner.provision_ledger(path)
+            legacy.provision(path)
+            manual.provision(path)
+            before = path.read_bytes()
+            connection = Mock()
+            connection.getresponse.return_value.status = 200
+            connection.getresponse.return_value.read.return_value = b'{"code":19,"msg":"PRIVATE_BODY_FIXTURE"}'
+            sources = dict(FALCON=fixtures.fixtures.harness.SOURCE, DONKEY=fixtures.fixtures.SOURCE)
+            with patch.object(runner.os.environ, 'get', side_effect=lambda key: fixtures.fixtures.VALUES.get(key)), \
+                 patch.object(public.http.client, 'HTTPSConnection', return_value=connection), \
+                 patch.object(fixtures.service, 'run_once') as evaluate, \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                failed = runner.execute(fixtures.config(), sources, path, authorized=True)
+            self.assertEqual((failed['status'], failed['reason'], failed['stage']),
+                             ('FAILED', 'PUBLIC_API_REJECTED_NO_RETRY', 'public_collection'))
+            self.assertFalse(failed['live_allowed'])
+            diagnostic = json.loads(output.getvalue())
+            self.assertEqual(diagnostic['public_endpoint_kind'], 'klines')
+            self.assertEqual(diagnostic['response_shape_reason'], 'NONZERO_API_CODE')
+            self.assertNotIn('PRIVATE_BODY_FIXTURE', output.getvalue())
+            evaluate.assert_not_called()
+            connection.request.assert_called_once()
+            connection.close.assert_called_once()
+            self.assertEqual(path.read_bytes(), before)
+            halted = Path(str(path)+'.halted')
+            latch_before = halted.read_bytes()
+            self.assertEqual(halted.read_text(), runner.REVIEWED_HALT_BYTES.decode())
+            with patch.object(runner.os.environ, 'get', side_effect=AssertionError('no credentials')), \
+                 patch.object(runner, 'run_service', side_effect=AssertionError('no worker')), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                blocked = runner.execute({}, {}, path, authorized=True)
+            self.assertEqual(blocked['reason'], 'LEDGER_OR_MANUAL_REVIEW_REQUIRED')
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(halted.read_bytes(), latch_before)
+
     def test_error_output_does_not_expose_exception(self):
         with patch.object(runner, 'load_inputs', side_effect=ValueError('PRIVATE_TEST_SENTINEL')), \
              contextlib.redirect_stdout(io.StringIO()) as output:

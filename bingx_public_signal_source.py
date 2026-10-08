@@ -4,6 +4,7 @@ Only two fixed GET endpoints. No env, API keys, signing, redirects, retries or
 arbitrary endpoint/host parameters. Collected data is NEVER marked synthetic.
 Receive time is not exchange event time or proof of clock qualification.
 """
+import hashlib
 import http.client
 import json
 import math
@@ -77,7 +78,37 @@ def _public_path(kind, symbol, *, interval=None, limit=200, authorized=False):
     return PATHS[kind] + "?" + urlencode(params)
 
 
-def _read_public(connection, path):
+def _public_rejection_diagnostic(result, *, kind, symbol, interval):
+    """Project only fixed labels, bounded numbers and hashes from a rejection."""
+    if type(result) is not dict:
+        subtype = "INVALID_JSON_SHAPE"
+    elif "code" not in result:
+        subtype = "MISSING_CODE"
+    elif type(result["code"]) is not int:
+        subtype = "NONINTEGER_CODE"
+    else:
+        subtype = "NONZERO_API_CODE"
+    diagnostic = dict(status="PUBLIC_API_REJECTION_DIAGNOSTIC",
+                      reason="PUBLIC_API_REJECTED_NO_RETRY", http_status=200,
+                      response_shape_reason=subtype, live_allowed=False)
+    if type(kind) is str and kind in PATHS:
+        diagnostic["public_endpoint_kind"] = {"candles": "klines", "quote": "price"}[kind]
+    if type(symbol) is str and re.fullmatch(r"[A-Z0-9]{2,25}-USDT", symbol):
+        diagnostic["symbol"] = symbol
+    if kind == "candles" and type(interval) is str and interval in PERIODS:
+        diagnostic["interval"] = interval
+    if type(result) is dict:
+        code = result.get("code")
+        if type(code) is int and -(2**63) <= code < 2**63:
+            diagnostic["public_api_code"] = code
+        message = result.get("msg")
+        if type(message) is str:
+            diagnostic["public_api_message_tag"] = hashlib.sha256(
+                message.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return diagnostic
+
+
+def _read_public(connection, path, *, kind=None, symbol=None, interval=None):
     try:
         connection.request("GET", path, headers={"Accept": "application/json"})
         response = connection.getresponse()
@@ -85,7 +116,14 @@ def _read_public(connection, path):
         require(response.status == 200, "PUBLIC_HTTP_FAILED_NO_RETRY")
         require(len(raw) <= 1048576, "RESPONSE_TOO_LARGE")
         result = json.loads(raw)
-        require(type(result) is dict and type(result.get("code")) is int and result["code"] == 0, "PUBLIC_API_REJECTED_NO_RETRY")
+        if not (type(result) is dict and type(result.get("code")) is int and result["code"] == 0):
+            # A diagnostic failure must not reclassify the original API rejection.
+            try:
+                diagnostic = _public_rejection_diagnostic(result, kind=kind, symbol=symbol, interval=interval)
+                print(json.dumps(diagnostic), flush=True)
+            except Exception:
+                pass
+            raise PublicDataError("PUBLIC_API_REJECTED_NO_RETRY")
         return result.get("data")
     except PublicDataError:
         raise
@@ -97,7 +135,7 @@ def request_public(kind, symbol, *, interval=None, limit=200, authorized=False):
     path = _public_path(kind, symbol, interval=interval, limit=limit, authorized=authorized)
     connection = http.client.HTTPSConnection("open-api.bingx.com", timeout=15)
     try:
-        return _read_public(connection, path)
+        return _read_public(connection, path, kind=kind, symbol=symbol, interval=interval)
     finally:
         connection.close()
 
@@ -196,10 +234,10 @@ guarantee. A production scheduler sharing IP limits remains separate work.
     connection = http.client.HTTPSConnection("open-api.bingx.com", timeout=15)
     try:
         for interval, path in zip(intervals, paths):
-            frames[interval] = normalize_candles(_read_public(connection, path), interval)
+            frames[interval] = normalize_candles(_read_public(connection, path, kind="candles", symbol=symbol, interval=interval), interval)
             received[interval] = time.time_ns() // 1000000
             time.sleep(1)
-        quote = normalize_quote(_read_public(connection, quote_path), symbol)
+        quote = normalize_quote(_read_public(connection, quote_path, kind="quote", symbol=symbol), symbol)
     finally:
         connection.close()
     observed = time.time_ns() // 1000000

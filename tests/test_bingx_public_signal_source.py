@@ -241,5 +241,123 @@ class PublicTests(unittest.TestCase):
             sys.audit("socket.connect", "offline probe")
 
 
+class PublicRejectionObservability(unittest.TestCase):
+    def read(self, payload, *, status=200, kind="candles", symbol="BTC-USDT", interval="15m"):
+        import contextlib
+        import io
+        from unittest.mock import Mock
+        connection = Mock()
+        connection.getresponse.return_value.status = status
+        connection.getresponse.return_value.read.return_value = payload if type(payload) is bytes else json.dumps(payload).encode()
+        output = io.StringIO()
+        result, reason = None, None
+        with contextlib.redirect_stdout(output):
+            try:
+                result = source._read_public(connection, '/unlogged-private-fixture-path',
+                    kind=kind, symbol=symbol, interval=interval)
+            except source.PublicDataError as error:
+                reason = source.safe_error_code(error)
+        return result, reason, output.getvalue(), connection
+
+    def test_rejection_subtypes_and_sanitized_projection(self):
+        cases = (({'code': 19}, 'NONZERO_API_CODE'), ({}, 'MISSING_CODE'),
+                 ({'code': '19'}, 'NONINTEGER_CODE'), ({'code': True}, 'NONINTEGER_CODE'),
+                 ({'code': 0.5}, 'NONINTEGER_CODE'), ([], 'INVALID_JSON_SHAPE'),
+                 (None, 'INVALID_JSON_SHAPE'))
+        for payload, subtype in cases:
+            with self.subTest(payload=payload):
+                if type(payload) is dict:
+                    payload = dict(payload, msg='PRIVATE_MESSAGE_FIXTURE', token='PRIVATE_TOKEN_FIXTURE',
+                                   data={'raw': 'PRIVATE_BODY_FIXTURE'})
+                _, reason, output, connection = self.read(payload)
+                self.assertEqual(reason, 'PUBLIC_API_REJECTED_NO_RETRY')
+                d = json.loads(output)
+                self.assertEqual(d['response_shape_reason'], subtype)
+                self.assertEqual(d['public_endpoint_kind'], 'klines')
+                self.assertEqual(d['symbol'], 'BTC-USDT')
+                self.assertEqual(d['interval'], '15m')
+                self.assertEqual(d['http_status'], 200)
+                self.assertFalse(d['live_allowed'])
+                if type(payload) is dict:
+                    self.assertRegex(d['public_api_message_tag'], r'^[a-f0-9]{12}$')
+                for sentinel in ('PRIVATE_MESSAGE_FIXTURE', 'PRIVATE_TOKEN_FIXTURE', 'PRIVATE_BODY_FIXTURE',
+                                 '/unlogged-private-fixture-path'):
+                    self.assertNotIn(sentinel, output)
+                self.assertLess(len(output), 600)
+                connection.request.assert_called_once()
+
+    def test_success_missing_data_and_other_failures_do_not_emit_rejection(self):
+        for payload, status, expected, reason in (
+            ({'code': 0, 'data': {'value': 1}}, 200, {'value': 1}, None),
+            ({'code': 0}, 200, None, None),
+            (b'{invalid', 200, None, 'PUBLIC_TRANSPORT_OR_JSON_FAILED_NO_RETRY'),
+            ({'code': 19}, 429, None, 'PUBLIC_HTTP_FAILED_NO_RETRY'),
+            ({'code': 19}, 500, None, 'PUBLIC_HTTP_FAILED_NO_RETRY'),
+            ({'code': 19}, 503, None, 'PUBLIC_HTTP_FAILED_NO_RETRY'),
+        ):
+            with self.subTest(payload=payload, status=status):
+                result, actual, output, _ = self.read(payload, status=status)
+                self.assertEqual(result, expected)
+                self.assertEqual(actual, reason)
+                self.assertEqual(output, '')
+
+    def test_context_and_numbers_are_allowlisted_and_bounded(self):
+        _, _, output, _ = self.read({'code': 2**100, 'msg': ['PRIVATE_FIXTURE']},
+            kind='PRIVATE_FIXTURE', symbol='PRIVATE_FIXTURE\nTOKEN', interval='PRIVATE_FIXTURE')
+        d = json.loads(output)
+        self.assertFalse({'public_endpoint_kind', 'symbol', 'interval', 'public_api_code',
+                          'public_api_message_tag'} & set(d))
+        self.assertNotIn('PRIVATE_FIXTURE', output)
+
+    def test_logging_failure_preserves_original_reason(self):
+        with patch('builtins.print', side_effect=OSError('synthetic log failure')):
+            _, reason, _, _ = self.read({'code': 19})
+        self.assertEqual(reason, 'PUBLIC_API_REJECTED_NO_RETRY')
+
+    def test_diagnostic_construction_failure_preserves_original_reason(self):
+        with patch.object(source, '_public_rejection_diagnostic', side_effect=RuntimeError('synthetic failure')):
+            _, reason, output, _ = self.read({'code': 19})
+        self.assertEqual(reason, 'PUBLIC_API_REJECTED_NO_RETRY')
+        self.assertEqual(output, '')
+
+    def test_request_public_passes_both_endpoint_contexts_without_retry(self):
+        import contextlib
+        import io
+        for kind, interval, endpoint in (('candles', '4h', 'klines'), ('quote', None, 'price')):
+            with self.subTest(kind=kind), patch.object(source.http.client, 'HTTPSConnection') as factory:
+                connection = factory.return_value
+                connection.getresponse.return_value.status = 200
+                connection.getresponse.return_value.read.return_value = b'{"code":19,"msg":"fixture"}'
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), self.assertRaisesRegex(source.PublicDataError, '^PUBLIC_API_REJECTED_NO_RETRY$'):
+                    source.request_public(kind, 'BTC-USDT', interval=interval, authorized=True)
+                d = json.loads(output.getvalue())
+                self.assertEqual(d['public_endpoint_kind'], endpoint)
+                self.assertEqual(d['public_api_code'], 19)
+                self.assertEqual(d.get('interval'), interval)
+                connection.request.assert_called_once()
+                connection.close.assert_called_once()
+
+    def test_collector_passes_price_context_after_successful_klines(self):
+        import contextlib
+        import io
+        from unittest.mock import Mock
+        with patch.object(source.http.client, 'HTTPSConnection') as factory, patch.object(source.time, 'sleep'):
+            candle_response, quote_response = Mock(), Mock()
+            candle_response.status = quote_response.status = 200
+            candle_response.read.return_value = json.dumps({'code': 0, 'data': PublicTests().candles()}).encode()
+            quote_response.read.return_value = b'{"code":19}'
+            connection = factory.return_value
+            connection.getresponse.side_effect = [candle_response, quote_response]
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), self.assertRaisesRegex(source.PublicDataError, '^PUBLIC_API_REJECTED_NO_RETRY$'):
+                source.collect_snapshot('BTC-USDT', ['15m'], authorized=True)
+            d = json.loads(output.getvalue())
+            self.assertEqual(d['public_endpoint_kind'], 'price')
+            self.assertNotIn('interval', d)
+            self.assertEqual(connection.request.call_count, 2)
+            connection.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
