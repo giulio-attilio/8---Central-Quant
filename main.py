@@ -29,6 +29,13 @@
 #   exposure, relatório, diagnóstico, selftest e rotas centralizadas.
 
 import os
+
+try:
+    import c3_patch_pnl
+    c3_patch_pnl.run()
+except Exception as e:
+    print("Patch script failed:", e)
+
 import time
 import json
 import re
