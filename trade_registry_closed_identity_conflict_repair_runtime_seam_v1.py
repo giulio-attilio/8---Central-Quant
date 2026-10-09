@@ -56,8 +56,8 @@ _prebootstrap_writer_guard: Callable[[str], Mapping[str, Any]] | None = None
 # composition must pin both exact objects before the controlled installer can
 # be called.  Keeping these sentinels private and unset makes the current seam
 # fail closed even when a caller can manufacture self-consistent evidence.
-_controlled_activation_authority_v1: Any | None = 'PILOT_AUTHORITY'
-_controlled_activation_interlock_v1: Any | None = 'PILOT_INTERLOCK'
+_controlled_activation_authority_v1: Any | None = None
+_controlled_activation_interlock_v1: Any | None = None
 _controlled_activation_state: dict[str, Any] = {
     "activation_receipt_verified": False,
     "source_hashes_verified": False,
@@ -393,9 +393,6 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     """
 
     global _coordinator
-    _coordinator = coordinator
-    _controlled_activation_state["registry_interlock_ready"] = True
-    return {"ok": True, "status": "C3_RUNTIME_CAPABILITIES_INSTALLED_ACTIVE", "enabled": True}
     if enabled is not True:
         raise coordinator_module.WriterRuntimeCoordinationBlocked(
             "C3_CONTROLLED_ACTIVATION_DEFAULT_OFF"
@@ -453,7 +450,9 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
     if len(supplied_sha) != 64 or not hmac.compare_digest(
         supplied_sha, expected_sha
     ):
-        pass
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_EVIDENCE_HASH_MISMATCH"
+        )
 
     required_true = (
         "activation_requested",
@@ -522,7 +521,9 @@ def install_controlled_c3_closed_repair_writer_coordinator_v1(
         and controls.get("order_submission_authorized") is False
     )
     if not evidence_safe:
-        pass
+        raise coordinator_module.WriterRuntimeCoordinationBlocked(
+            "C3_CONTROLLED_ACTIVATION_EVIDENCE_UNSAFE"
+        )
     source_preflight = verify_controlled_activation_source_hashes_read_only_v1(
         Path(__file__).resolve().parent, source_hashes
     )

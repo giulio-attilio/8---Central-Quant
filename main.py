@@ -68639,7 +68639,7 @@ def _install_c3_closed_repair_writer_coordination_v1(*, coordinator, startup_rec
         is not c3_authenticated_persistent_authority_production_adapters_v2.CoordinatedMultistoreStartupRecoveryV2
         or not startup_recovery._multistore_recovery.dormant_coordinator_bound_v2(coordinator)
     ):
-        pass # raise RuntimeError("C3_DORMANT_STARTUP_COORDINATOR_BINDING_REQUIRED")
+        raise RuntimeError("C3_DORMANT_STARTUP_COORDINATOR_BINDING_REQUIRED")
     invocation_adapter = c3_writer_invocation_v1.build_production_writer_invocation_adapter_v1()
     transaction_store = c3_transaction_store_v1.build_production_raw_transaction_store_v1()
     provider = c3_provider_v1.build_production_closed_repair_provider_v1()
