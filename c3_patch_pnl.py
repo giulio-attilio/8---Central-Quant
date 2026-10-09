@@ -1,6 +1,5 @@
 import os
 import json
-import shutil
 
 DATA_DIR = "/data"
 if not os.path.exists(DATA_DIR):
@@ -49,59 +48,28 @@ def patch_file(filepath):
         return
 
     try:
-        # Stream mode for memory efficiency (prevents 2GB OOM)
-        if filepath.endswith('.jsonl'):
-            changed_any = False
-            temp_path = filepath + ".tmp"
-            
-            with open(filepath, 'r', encoding='utf-8') as f_in, open(temp_path, 'w', encoding='utf-8') as f_out:
-                for line in f_in:
-                    if not line.strip():
-                        f_out.write(line)
-                        continue
-                        
-                    if TARGET_TRADE in line:
-                        try:
-                            obj = json.loads(line)
-                            if fix_dict(obj):
-                                changed_any = True
-                            f_out.write(json.dumps(obj) + '\n')
-                        except json.JSONDecodeError:
-                            f_out.write(line)
-                    else:
-                        f_out.write(line)
-                        
-            if changed_any:
-                shutil.move(temp_path, filepath)
-                print(f"Patched streamed JSONL: {filepath}")
-            else:
-                os.remove(temp_path)
-            return
-
-        # Small file mode (registry.json)
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
             
         if TARGET_TRADE not in content:
             return
             
-        try:
-            obj = json.loads(content)
-            if isinstance(obj, dict) and fix_dict(obj):
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(obj, f, indent=4)
-                print(f"Patched JSON: {filepath}")
-            return
-        except json.JSONDecodeError:
-            pass
-            
         lines = content.strip().split('\n')
-        new_lines = []
-        changed_any = False
-        for line in lines:
-            if not line.strip():
-                continue
-            if TARGET_TRADE in line:
+        is_jsonl = False
+        
+        try:
+            first_obj = json.loads(lines[0])
+            if len(lines) > 1 and isinstance(first_obj, dict):
+                is_jsonl = True
+        except:
+            pass
+
+        if is_jsonl:
+            new_lines = []
+            changed_any = False
+            for line in lines:
+                if not line.strip():
+                    continue
                 try:
                     obj = json.loads(line)
                     if fix_dict(obj):
@@ -109,27 +77,34 @@ def patch_file(filepath):
                     new_lines.append(json.dumps(obj))
                 except json.JSONDecodeError:
                     new_lines.append(line)
-            else:
-                new_lines.append(line)
-        
-        if changed_any:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(new_lines) + '\n')
-            print(f"Patched file (small): {filepath}")
+            
+            if changed_any:
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(new_lines) + '\n')
+                print(f"Patched JSONL: {filepath}")
+            return
 
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict):
+                if fix_dict(obj):
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump(obj, f, indent=4)
+                    print(f"Patched JSON: {filepath}")
+        except json.JSONDecodeError:
+            pass
+            
     except Exception as e:
         print(f"Error processing {filepath}: {e}")
 
 def run():
-    print("Starting Central Quant Data Patch (Memory Optimized)...")
+    print("Starting Central Quant Data Patch...")
     if not os.path.exists(DATA_DIR):
         print(f"Data dir {DATA_DIR} not found.")
         return
         
     for root, dirs, files in os.walk(DATA_DIR):
         for file in files:
-            if file.endswith('.tmp'):
-                continue
             patch_file(os.path.join(root, file))
     print("Patch complete.")
 
