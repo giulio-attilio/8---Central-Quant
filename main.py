@@ -68873,7 +68873,7 @@ def _recover_c3_closed_repair_registry_v1(*, interlocks=None):
 C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1 = (
     c3_writer_coordinator_v1.build_production_closed_repair_writer_runtime_coordinator_v1(
         config=c3_writer_coordinator_v1.ProductionWriterRuntimeCoordinatorBindingConfigV1(
-            enabled=True,
+            enabled=False,
             scope_attestation=c3_writer_coordinator_v1.PRODUCTION_COORDINATOR_EXPLICIT_DEPENDENCY_BINDING_ATTESTATION_V1,
             storage_root_binding_sha256=c3_writer_coordinator_v1.production_coordinator_storage_root_binding_sha256_v1(CENTRAL_DATA_DIR)
         ),
@@ -68893,7 +68893,7 @@ C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = (
 )
 C3_CLOSED_REPAIR_AUTHENTICATED_PERSISTENT_AUTHORITY_PRODUCTION_ADAPTERS_V2 = (
     c3_authenticated_persistent_authority_production_adapters_v2.build_dormant_authenticated_persistent_authority_production_adapters_v2(
-        maintenance_coordinator=None,
+        maintenance_coordinator=C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1,
     )
 )
 C3_CLOSED_REPAIR_AUTHORITY_PROVISIONING_MANIFEST_CONTRACT_V2 = (
