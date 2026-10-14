@@ -2665,6 +2665,73 @@ def broker_real_pilot_guard_v1_validate(*, symbol, side, bot=None, notional_usdt
         "token_value_exposed": False,
     }
 
+def _confirm_entry_margin_and_leverage(ex, symbol, leverage, position_side):
+    """Fail closed unless the exchange reads back the requested entry setup."""
+    result = {
+        "ok": False,
+        "margin_set": "NOT_CONFIRMED",
+        "leverage_set": "NOT_CONFIRMED",
+        "margin_mode_confirmed": None,
+        "leverage_confirmed": None,
+        "reason": None,
+    }
+    try:
+        ex.set_margin_mode(BINGX_MARGIN_MODE, symbol)
+        result["margin_set"] = "REQUEST_ACCEPTED"
+    except Exception:
+        # "Already configured" is not proof; a factual readback may still pass.
+        result["margin_set"] = "REQUEST_FAILED"
+    try:
+        ex.set_leverage(leverage, symbol, {"side": position_side or "BOTH"})
+        result["leverage_set"] = "REQUEST_ACCEPTED"
+    except Exception:
+        result["leverage_set"] = "REQUEST_FAILED"
+
+    try:
+        margin_read = ex.fetch_margin_mode(symbol)
+        leverage_read = ex.fetch_leverage(symbol)
+    except Exception:
+        result["reason"] = "ENTRY_SETUP_READBACK_UNAVAILABLE"
+        return result
+
+    margin_read = margin_read if isinstance(margin_read, dict) else {}
+    leverage_read = leverage_read if isinstance(leverage_read, dict) else {}
+    margin_info = margin_read.get("info") if isinstance(margin_read.get("info"), dict) else {}
+    leverage_info = leverage_read.get("info") if isinstance(leverage_read.get("info"), dict) else {}
+    actual_mode = (
+        margin_read.get("marginMode") or margin_read.get("margin_mode")
+        or margin_info.get("marginMode") or margin_info.get("marginType")
+    )
+    actual_mode = str(actual_mode or "").lower().strip()
+    requested_mode = str(BINGX_MARGIN_MODE or "").lower().strip()
+    if actual_mode == "crossed":
+        actual_mode = "cross"
+    if requested_mode == "crossed":
+        requested_mode = "cross"
+    if position_side:
+        leverage_field = "longLeverage" if position_side == "LONG" else "shortLeverage"
+        actual_leverage = leverage_read.get(leverage_field) or leverage_info.get(leverage_field)
+    else:
+        actual_leverage = {
+            "long": leverage_read.get("longLeverage") or leverage_info.get("longLeverage"),
+            "short": leverage_read.get("shortLeverage") or leverage_info.get("shortLeverage"),
+        }
+    try:
+        leverage_matches = (
+            all(float(value) == float(leverage) for value in actual_leverage.values())
+            if isinstance(actual_leverage, dict)
+            else float(actual_leverage) == float(leverage)
+        )
+    except (TypeError, ValueError):
+        leverage_matches = False
+    result["margin_mode_confirmed"] = actual_mode or None
+    result["leverage_confirmed"] = actual_leverage
+    result["ok"] = bool(requested_mode and actual_mode == requested_mode and leverage_matches)
+    if not result["ok"]:
+        result["reason"] = "ENTRY_SETUP_READBACK_MISMATCH"
+    return result
+
+
 def place_market_order(
     symbol,
     side,
@@ -3103,20 +3170,28 @@ def place_market_order(
     entry_order_id = None
     ex = exchange()
     try:
-        margin_set = None
-        leverage_set = None
-        try:
-            margin_set = ex.set_margin_mode(BINGX_MARGIN_MODE, sym)
-        except Exception as exc:
-            margin_set = {"ok": False, "error": str(exc)}
-        try:
-            # BingX Hedge Mode exige side no set_leverage.
-            if position_side:
-                leverage_set = ex.set_leverage(lev, sym, {"side": position_side})
-            else:
-                leverage_set = ex.set_leverage(lev, sym)
-        except Exception as exc:
-            leverage_set = {"ok": False, "error": str(exc)}
+        setup_confirmation = (
+            {"ok": True, "margin_set": "SKIPPED_REDUCE_ONLY", "leverage_set": "SKIPPED_REDUCE_ONLY"}
+            if reduce_only else _confirm_entry_margin_and_leverage(ex, sym, lev, position_side)
+        )
+        margin_set = setup_confirmation.get("margin_set")
+        leverage_set = setup_confirmation.get("leverage_set")
+        if not setup_confirmation.get("ok"):
+            result = {
+                "ok": False,
+                "status": "BROKER_ENTRY_SETUP_UNCONFIRMED",
+                "sent": False,
+                "send_attempted": False,
+                "symbol": sym,
+                "side": order_side,
+                "margin_usdt": margin,
+                "leverage": lev,
+                "notional_usdt": planned_exposure,
+                "setup_confirmation": setup_confirmation,
+            }
+            log_execution_event({"event": "place_market_order", **result})
+            log_execution_audit_event({"event": "BROKER_ENTRY_SETUP_UNCONFIRMED", **result})
+            return result
 
         entry_create_result = _create_order_with_reserved_attempt(
             ex,

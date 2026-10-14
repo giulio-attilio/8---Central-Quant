@@ -18401,15 +18401,32 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
     - CAPITAL_PRESERVATION
     """
     trade_payload = trade_payload or {}
+    falcon_live_entry = (
+        str(trade_payload.get("bot") or "").upper().strip() == "FALCON"
+        and (trade_payload.get("intended_live") is True or str(trade_payload.get("mode") or "").upper().strip() == "LIVE")
+        and str(trade_payload.get("reduce_only") or "").lower() not in {"true", "1", "yes"}
+    )
 
     try:
         if EXECUTIVE_POLICY_MANAGER_LOADED and executive_policy_manager is not None:
             sync_result = _ensure_executive_policy_manager_synced_for_risk(force=False)
+            if falcon_live_entry and (not isinstance(sync_result, dict) or sync_result.get("ok") is not True):
+                reasons.append("FALCON_LIVE_EXECUTIVE_POLICY_SYNC_UNAVAILABLE")
+                return {"ok": False, "allowed": False, "available": False, "source": "executive_policy_manager", "sync": sync_result}
             evaluation = executive_policy_manager.evaluate_trade_against_policies(trade_payload)
+            if falcon_live_entry and (
+                not isinstance(evaluation, dict)
+                or evaluation.get("ok") is not True
+                or not isinstance(evaluation.get("allowed"), bool)
+            ):
+                reasons.append("FALCON_LIVE_EXECUTIVE_POLICY_EVALUATION_UNAVAILABLE")
+                return {"ok": False, "allowed": False, "available": False, "source": "executive_policy_manager"}
             if not isinstance(evaluation, dict):
                 evaluation = {"ok": False, "allowed": True, "warnings": ["Policy Manager retornou payload inválido."]}
 
             if not evaluation.get("allowed", True):
+                if falcon_live_entry and not evaluation.get("reasons"):
+                    reasons.append("FALCON_LIVE_EXECUTIVE_POLICY_DENIED_WITHOUT_REASON")
                 for reason in evaluation.get("reasons") or []:
                     reasons.append(str(reason))
 
@@ -18426,6 +18443,12 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
             # e anexa a policy dominante ao payload usado pelo Risk Manager.
             try:
                 priority_eval = resolve_executive_policy_priority(trade_payload=trade_payload, commit=True)
+                if falcon_live_entry and (
+                    not isinstance(priority_eval, dict)
+                    or priority_eval.get("ok") is not True
+                    or not isinstance(priority_eval.get("allowed"), bool)
+                ):
+                    raise ValueError("Executive Policy Priority indisponível para Falcon LIVE")
                 evaluation["priority"] = priority_eval
                 evaluation["dominant_policy"] = priority_eval.get("dominant_policy")
                 evaluation["dominant_policy_code"] = priority_eval.get("dominant_code")
@@ -18433,6 +18456,8 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
                 if priority_eval.get("allowed") is False:
                     evaluation["allowed"] = False
                     evaluation.setdefault("reasons", [])
+                    if falcon_live_entry and not priority_eval.get("reasons"):
+                        reasons.append("FALCON_LIVE_EXECUTIVE_POLICY_PRIORITY_DENIED_WITHOUT_REASON")
                     for reason in priority_eval.get("reasons") or []:
                         if reason not in evaluation["reasons"]:
                             evaluation["reasons"].append(str(reason))
@@ -18455,6 +18480,9 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
                     warnings.append(str(warning))
             except Exception as priority_exc:
                 warnings.append(f"Erro ao aplicar Executive Policy Priority: {priority_exc}")
+                if falcon_live_entry:
+                    reasons.append("FALCON_LIVE_EXECUTIVE_POLICY_PRIORITY_UNAVAILABLE")
+                    evaluation["allowed"] = False
 
             evaluation["source"] = "executive_policy_manager+priority"
             evaluation["available"] = True
@@ -18472,6 +18500,10 @@ def _apply_executive_policy_to_risk_reasons(trade_payload, reasons, warnings):
 
     except Exception as exc:
         warnings.append(f"Erro ao aplicar Executive Policy Manager: {exc}")
+
+    if falcon_live_entry:
+        reasons.append("FALCON_LIVE_EXECUTIVE_POLICY_MANAGER_UNAVAILABLE")
+        return {"ok": False, "allowed": False, "available": False, "source": "executive_policy_manager"}
 
     # Fallback legado: lê policy atual do Executive Decision Engine.
     policy_payload = _executive_policy_for_can_open_trade()
@@ -19233,18 +19265,18 @@ def can_open_trade_decision(payload: dict):
             if not ready.get("ok"):
                 reasons.append(f"BingX não está READY: {ready.get('status') or ready.get('error')}")
 
-    # Exposição por ativo: usa a Central/PAPER como verdade estatística,
-    # e também confere LIVE quando houver posição real.
+    # No piloto Falcon LIVE, PAPER não representa capital ou ownership real.
+    # Outros modos conservam a política de exposição Central/PAPER existente.
     if symbol:
         same_symbol_paper = [r for r in rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
         same_symbol_live = [r for r in live_rows if normalize_symbol_for_risk(r.get("symbol")) == symbol]
 
-        if len(same_symbol_paper) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
+        if not (intended_live and bot == "FALCON") and len(same_symbol_paper) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
             reasons.append(f"limite por ativo Central/PAPER atingido em {symbol}: {len(same_symbol_paper)}/{GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}")
         if len(same_symbol_live) >= GLOBAL_RISK_MAX_SYMBOL_EXPOSURE:
             reasons.append(f"limite por ativo LIVE atingido em {symbol}: {len(same_symbol_live)}/{GLOBAL_RISK_MAX_SYMBOL_EXPOSURE}")
 
-        same_bot_symbol = [r for r in same_symbol_paper if str(r.get("bot") or "").upper() == bot]
+        same_bot_symbol = [r for r in (same_symbol_live if intended_live and bot == "FALCON" else same_symbol_paper) if str(r.get("bot") or "").upper() == bot]
         if same_bot_symbol:
             reasons.append(f"{bot} já possui exposição em {symbol}")
 
@@ -19255,7 +19287,7 @@ def can_open_trade_decision(payload: dict):
     if side in {"LONG", "BUY"}:
         paper_side_conc = (long_pos + 1) / max(paper_total_after, 1) * 100
         live_side_conc = (live_long_pos + 1) / max(live_total_after, 1) * 100 if live_total_pos else 0
-        if paper_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+        if not (intended_live and bot == "FALCON") and paper_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
             reasons.append(f"concentração LONG Central/PAPER ficaria {paper_side_conc:.1f}%")
         if live_total_pos and live_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
             reasons.append(f"concentração LONG LIVE ficaria {live_side_conc:.1f}%")
@@ -19263,7 +19295,7 @@ def can_open_trade_decision(payload: dict):
     if side in {"SHORT", "SELL"}:
         paper_side_conc = (short_pos + 1) / max(paper_total_after, 1) * 100
         live_side_conc = (live_short_pos + 1) / max(live_total_after, 1) * 100 if live_total_pos else 0
-        if paper_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
+        if not (intended_live and bot == "FALCON") and paper_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
             reasons.append(f"concentração SHORT Central/PAPER ficaria {paper_side_conc:.1f}%")
         if live_total_pos and live_side_conc >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
             reasons.append(f"concentração SHORT LIVE ficaria {live_side_conc:.1f}%")

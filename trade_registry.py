@@ -345,6 +345,24 @@ def make_trade_id(bot: Any, symbol: Any, side: Any, setup: Any = None) -> str:
     return f"{bot_n}:{setup_n}:{_normalize_symbol(symbol)}:{_normalize_side(side)}"
 
 
+def _falcon_open_replay_matches(current: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
+    """A logical V1 key is reusable only for the same factual Falcon entry."""
+    if not isinstance(current, dict):
+        return False
+    current_ids = {field: strong_identity_alias_state(current, field) for field in STRONG_IDENTITY_ALIASES}
+    candidate_ids = {field: strong_identity_alias_state(candidate, field) for field in STRONG_IDENTITY_ALIASES}
+    if not any(state.get("value") for state in candidate_ids.values()):
+        return False
+    for field in STRONG_IDENTITY_ALIASES:
+        old, new = current_ids[field], candidate_ids[field]
+        if old.get("conflict") or new.get("conflict") or old.get("value") != new.get("value"):
+            return False
+    return all(
+        current.get(field) == candidate.get(field)
+        for field in ("bot", "setup", "symbol", "side", "registry_mode", "execution_mode", "entry", "qty")
+    )
+
+
 def _observe_shadow_registry_snapshot(event_type: str, trade: Dict[str, Any]) -> None:
     """Publish a post-persistence copy to Shadow Mode without affecting Registry."""
     try:
@@ -429,6 +447,17 @@ def register_open_trade(
     # that reconciliation has already moved to CLOSED.
     with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_REGISTER_OPEN_TRADE"), _lock:
         registry = load_registry()
+        if bot_n == "FALCON":
+            existing = registry["open_trades"].get(trade_id)
+            if existing is not None:
+                if _falcon_open_replay_matches(existing, trade):
+                    return {"ok": True, "action": "OPEN_ALREADY_REGISTERED", "trade_id": trade_id, "trade": existing}
+                return {"ok": False, "error": "FALCON_OPEN_IDENTITY_COLLISION", "trade_id": trade_id}
+            if trade.get("registry_mode") == "REAL" and not any(
+                strong_identity_alias_state(trade, field).get("value")
+                for field in STRONG_IDENTITY_ALIASES
+            ):
+                return {"ok": False, "error": "FALCON_REAL_OPEN_IDENTITY_REQUIRED", "trade_id": trade_id}
         registry["open_trades"][trade_id] = trade
         if save_registry(registry) is False:
             return {
@@ -440,12 +469,50 @@ def register_open_trade(
     return {"ok": True, "action": "OPEN_REGISTERED", "trade_id": trade_id, "trade": trade}
 
 
-def update_trade(trade_id: str, **updates: Any) -> Dict[str, Any]:
+def update_trade(
+    trade_id: str, *, expected_identity: Optional[Dict[str, Any]] = None, **updates: Any
+) -> Dict[str, Any]:
     with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_UPDATE_OPEN_TRADE"), _lock:
         registry = load_registry()
         trade = registry["open_trades"].get(trade_id)
         if not trade:
             return {"ok": False, "error": "TRADE_NOT_FOUND", "trade_id": trade_id}
+        if trade.get("bot") == "FALCON" and trade.get("registry_mode") == "REAL":
+            # Older factual ACK writers supply the already-stored lifecycle_id
+            # directly in updates. Keep that path, but verify it as an expected
+            # identity before allowing previously absent order IDs to be added.
+            expected = expected_identity if isinstance(expected_identity, dict) else {
+                "lifecycle_id": updates.get("lifecycle_id")
+            }
+            expected_strong = {
+                field: strong_identity_alias_state(expected, field)
+                for field in STRONG_IDENTITY_ALIASES
+            }
+            if not any(state.get("value") for state in expected_strong.values()) or any(
+                state.get("conflict") for state in expected_strong.values()
+            ):
+                return {"ok": False, "error": "FALCON_REAL_UPDATE_IDENTITY_REQUIRED", "trade_id": trade_id}
+            identity_ok, _ = _identity_matches(trade, expected)
+            if not identity_ok:
+                return {"ok": False, "error": "FALCON_REAL_UPDATE_IDENTITY_MISMATCH", "trade_id": trade_id}
+            for field in ("bot", "setup", "symbol", "side", "registry_mode", "execution_mode"):
+                if field in updates and updates[field] not in (None, trade.get(field)):
+                    return {"ok": False, "error": "FALCON_REAL_UPDATE_IDENTITY_CHANGE", "trade_id": trade_id}
+            candidate = copy.deepcopy(trade)
+            for key, value in updates.items():
+                if value is None:
+                    continue
+                if key == "metadata" and isinstance(value, dict):
+                    candidate.setdefault("metadata", {}).update(value)
+                else:
+                    candidate[key] = value
+            for field in STRONG_IDENTITY_ALIASES:
+                old_state = strong_identity_alias_state(trade, field)
+                new_state = strong_identity_alias_state(candidate, field)
+                if old_state.get("conflict") or new_state.get("conflict") or (
+                    old_state.get("value") and old_state.get("value") != new_state.get("value")
+                ):
+                    return {"ok": False, "error": "FALCON_REAL_UPDATE_IDENTITY_CHANGE", "trade_id": trade_id}
         for key, value in updates.items():
             if value is None:
                 continue

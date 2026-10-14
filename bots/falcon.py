@@ -891,7 +891,11 @@ def to_ccxt_symbol(symbol):
 
 
 def load_watchlist():
-    candidates = [WATCHLIST_FILE, "watchlists/falcon.json", "watchlist_falcon.json", "watchlist.json"]
+    live_mode = FALCON_MODE == "LIVE"
+    candidates = [WATCHLIST_FILE] if live_mode else [WATCHLIST_FILE, "watchlists/falcon.json", "watchlist_falcon.json", "watchlist.json"]
+    HEALTH["watchlist_source"] = None
+    HEALTH["watchlist_fallback_used"] = False
+    HEALTH["watchlist_error"] = None
     for path in candidates:
         try:
             if os.path.exists(path):
@@ -899,6 +903,8 @@ def load_watchlist():
                     data = json.load(f)
                 if isinstance(data, dict):
                     data = data.get("symbols", data.get("watchlist", []))
+                if not isinstance(data, list):
+                    raise ValueError("watchlist deve conter uma lista de símbolos")
                 symbols, invalid = [], []
                 for item in data:
                     raw = str(item).upper().strip()
@@ -912,16 +918,31 @@ def load_watchlist():
                     else:
                         symbols.append(s)
                 symbols = sorted(set(symbols))
+                if live_mode and (not symbols or invalid):
+                    raise ValueError("watchlist LIVE vazia ou parcialmente inválida")
                 HEALTH["watchlist_total"] = len(symbols) + len(invalid)
                 HEALTH["watchlist_valid"] = len(symbols)
                 HEALTH["watchlist_invalid"] = invalid
                 HEALTH["last_watchlist_count"] = len(symbols)
                 HEALTH["last_invalid_watchlist_check"] = data_hora_sp_str()
+                HEALTH["watchlist_source"] = path
                 return symbols
         except Exception as exc:
             HEALTH["last_warning"] = f"watchlist {path}: {exc}"
+            HEALTH["watchlist_error"] = str(exc)
+
+    if live_mode:
+        HEALTH["watchlist_total"] = 0
+        HEALTH["watchlist_valid"] = 0
+        HEALTH["watchlist_invalid"] = []
+        HEALTH["last_watchlist_count"] = 0
+        HEALTH["last_invalid_watchlist_check"] = data_hora_sp_str()
+        HEALTH["watchlist_error"] = HEALTH.get("watchlist_error") or f"watchlist LIVE ausente: {WATCHLIST_FILE}"
+        return []
 
     fallback = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"]
+    HEALTH["watchlist_source"] = "legacy_default"
+    HEALTH["watchlist_fallback_used"] = True
     HEALTH["watchlist_total"] = len(fallback)
     HEALTH["watchlist_valid"] = len(fallback)
     HEALTH["watchlist_invalid"] = []
@@ -5775,6 +5796,9 @@ def health_payload():
         "positions_open": len(get_positions()),
         "positions_limit": MAX_OPEN_POSITIONS,
         "watchlist_file": WATCHLIST_FILE,
+        "watchlist_source": HEALTH.get("watchlist_source"),
+        "watchlist_fallback_used": HEALTH.get("watchlist_fallback_used"),
+        "watchlist_error": HEALTH.get("watchlist_error"),
         "watchlist_total": HEALTH.get("watchlist_total"),
         "watchlist_valid": HEALTH.get("watchlist_valid"),
         "watchlist_invalid": HEALTH.get("watchlist_invalid"),
@@ -6786,6 +6810,12 @@ def falcon_update_registry_management(pos, **metadata):
     if not trade_id:
         trade_id = central_trade_registry.make_trade_id("FALCON", normalize_symbol_for_central(pos.get("symbol")), pos.get("side"), pos.get("setup"))
     try:
+        live_order = pos.get("live_order") if isinstance(pos.get("live_order"), dict) else {}
+        expected_identity = {
+            "lifecycle_id": pos.get("lifecycle_id"),
+            "client_order_id": pos.get("live_client_order_id") or live_order.get("client_order_id") or live_order.get("client_tag"),
+            "order_id": pos.get("live_order_id") or pos.get("bingx_order_id") or live_order.get("order_id") or live_order.get("id"),
+        }
         top = {
             # qty permanece a quantidade inicial do trade; runner fica em metadata.
             "qty": safe_float(pos.get("initial_qty"), safe_float(pos.get("qty"), falcon_real_remaining_qty(pos))),
@@ -6823,7 +6853,7 @@ def falcon_update_registry_management(pos, **metadata):
                 **metadata,
             },
         }
-        return central_trade_registry.update_trade(trade_id, **top)
+        return central_trade_registry.update_trade(trade_id, expected_identity=expected_identity, **top)
     except Exception as exc:
         HEALTH["last_real_management_error"] = f"registry management: {exc}"
         return None

@@ -13,6 +13,16 @@ CLIENT_ORDER_ID = "FDS1-0123456789ABCDEF01234567"
 ENTRY_CLIENT_ORDER_ID = "ENT1-0123456789ABCDEF01234567"
 
 
+def test_bingx_ccxt_entry_setup_readback_shape_offline():
+    exchange = broker.ccxt.bingx({"enableRateLimit": False})
+    assert exchange.has["fetchMarginMode"] is True
+    assert exchange.has["fetchLeverage"] is True
+    assert exchange.parse_margin_mode({"marginType": "ISOLATED"})["marginMode"] == "isolated"
+    leverage = exchange.parse_leverage({"longLeverage": 2, "shortLeverage": 3})
+    assert leverage["longLeverage"] == 2
+    assert leverage["shortLeverage"] == 3
+
+
 @pytest.fixture(autouse=True)
 def _recorded_account_attempt_outcomes(monkeypatch):
     recorded = []
@@ -573,6 +583,12 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
         def set_leverage(self, *_args, **_kwargs):
             return {"ok": True}
 
+        def fetch_margin_mode(self, _symbol):
+            return {"marginMode": "isolated"}
+
+        def fetch_leverage(self, _symbol, _params=None):
+            return {"leverage": 1, "longLeverage": 1, "shortLeverage": 1}
+
         def create_order(self, symbol, order_type, side, amount, price, params):
             del price
             self.create_calls.append(
@@ -610,6 +626,7 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
     monkeypatch.setattr(broker, "EXECUTION_MODE", "LIVE")
     monkeypatch.setattr(broker, "ENABLE_REAL_TRADING", True)
     monkeypatch.setattr(broker, "BROKER_DRY_RUN", False)
+    monkeypatch.setattr(broker, "BINGX_MARGIN_MODE", "isolated")
     monkeypatch.setattr(broker, "DISASTER_STOP_ENABLED", True)
     monkeypatch.setattr(broker, "DISASTER_STOP_REQUIRE_FOR_LIVE", True)
     monkeypatch.setattr(
