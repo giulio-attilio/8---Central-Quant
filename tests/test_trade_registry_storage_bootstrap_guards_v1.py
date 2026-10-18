@@ -894,3 +894,247 @@ def test_closed_identity_audit_rejects_malformed_registry_before_merge():
     assert result["read_only"] is True
     assert result["write_executed"] is False
     assert merge_calls == []
+
+
+def _preview_namespace(tmp_path, *, merge_safe=True, open_conflict=False):
+    active = tmp_path / "trade_registry.json"
+    legacy = tmp_path / "legacy_registry.json"
+    active_payload = {
+        "open_trades": {"open-1": {"trade_id": "open-1", "status": "OPEN"}},
+        "closed_trades": [{"trade_id": "closed-active", "status": "CLOSED"}],
+        "storage_fix_version": "test-v1",
+    }
+    legacy_payload = {
+        "open_trades": {},
+        "closed_trades": [{"trade_id": "closed-legacy", "status": "CLOSED"}],
+    }
+    active.write_text(json.dumps(active_payload), encoding="utf-8")
+    legacy.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    lock = _RecordingLock()
+    merge_calls = []
+
+    def merge_registries(sources, active_exists=False):
+        merge_calls.append((copy.deepcopy(sources), active_exists))
+        closed = []
+        for _source, registry in sources:
+            closed.extend(registry.get("closed_trades") or [])
+        diagnostics = {
+            "safe_to_commit": merge_safe,
+            "open_identity_conflict_count": 1 if open_conflict else 0,
+            "source_shape_error_count": 0,
+        }
+        return {
+            "open_trades": active_payload["open_trades"],
+            "closed_trades": closed,
+            "closed_history_identity_merge": diagnostics,
+        }, [source for source, _registry in sources]
+
+    namespace = {
+        "Path": Path,
+        "json": json,
+        "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "test-v1",
+        "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE": tmp_path / "backup.json",
+        "_trpsf_v1_now": lambda: "fixed-time",
+        "_trpsf_v1_registry_lock": lambda: lock,
+        "_trpsf_v1_active_file": lambda: active,
+        "_trpsf_v1_legacy_candidate_paths": lambda: [legacy],
+        "_trpsf_v1_read_json": lambda path: json.loads(Path(path).read_text(encoding="utf-8")),
+        "_trpsf_v1_registry_shape_errors": lambda _registry: [],
+        "_trpsf_v1_registry_counts": lambda registry: {
+            "open_count": len(registry.get("open_trades") or {}),
+            "closed_count": len(registry.get("closed_trades") or []),
+        },
+        "_trpsf_v1_iter_trades": lambda value, preserve_closed_collection_keys=False: (
+            list(value.values()) if isinstance(value, dict) else list(value or [])
+        ),
+        "_trpsf_v1_merge_registries": merge_registries,
+    }
+    _compile(["_trpsf_v1_preview_bootstrap_registry"], namespace)
+    return namespace, active, legacy, active_payload, merge_calls, lock
+
+
+def test_bootstrap_preview_reports_exact_merge_without_writing_or_mutating_state(
+    tmp_path,
+):
+    namespace, active, legacy, active_payload, merge_calls, lock = _preview_namespace(
+        tmp_path
+    )
+    active_before = active.read_bytes()
+    legacy_before = legacy.read_bytes()
+
+    result = namespace["_trpsf_v1_preview_bootstrap_registry"]()
+
+    assert result["status"] == "PREVIEW_SAFE"
+    assert result["safe_to_commit"] is True
+    assert result["write_required"] is True
+    assert result["write_executed"] is False
+    assert result["write_performed"] is False
+    assert result["counts_before"] == {"open_count": 1, "closed_count": 1}
+    assert result["counts_after"] == {"open_count": 1, "closed_count": 2}
+    assert result["closed_history_identity_merge"]["safe_to_commit"] is True
+    assert result["backup_file"] == str(tmp_path / "backup.json")
+    assert merge_calls and merge_calls[0][1] is True
+    assert lock.enters == lock.exits == 1
+    assert active.read_bytes() == active_before
+    assert legacy.read_bytes() == legacy_before
+    assert not (tmp_path / "backup.json").exists()
+    assert active_payload["open_trades"] == {"open-1": {"trade_id": "open-1", "status": "OPEN"}}
+
+
+def test_bootstrap_preview_fails_closed_on_identity_merge_conflict(tmp_path):
+    namespace, active, legacy, _payload, _merge_calls, lock = _preview_namespace(
+        tmp_path, merge_safe=False
+    )
+    active_before = active.read_bytes()
+    legacy_before = legacy.read_bytes()
+
+    result = namespace["_trpsf_v1_preview_bootstrap_registry"]()
+
+    assert result["status"] == "CLOSED_IDENTITY_MERGE_BLOCKED"
+    assert result["safe_to_commit"] is False
+    assert result["write_required"] is False
+    assert result["write_executed"] is False
+    assert lock.enters == lock.exits == 1
+    assert active.read_bytes() == active_before
+    assert legacy.read_bytes() == legacy_before
+
+
+def test_bootstrap_preview_reports_open_identity_conflict_status(tmp_path):
+    namespace, _active, _legacy, _payload, _merge_calls, _lock = _preview_namespace(
+        tmp_path, merge_safe=False, open_conflict=True
+    )
+
+    result = namespace["_trpsf_v1_preview_bootstrap_registry"]()
+
+    assert result["status"] == "OPEN_IDENTITY_MERGE_BLOCKED"
+    assert result["reason"] == "OPEN_IDENTITY_MERGE_BLOCKED"
+    assert result["safe_to_commit"] is False
+    assert result["write_required"] is False
+    assert result["write_executed"] is False
+
+
+def test_bootstrap_preview_fails_closed_when_registry_lock_is_unavailable(tmp_path):
+    namespace, active, legacy, _payload, _merge_calls, _lock = _preview_namespace(
+        tmp_path
+    )
+    namespace["_trpsf_v1_registry_lock"] = lambda: None
+    active_before = active.read_bytes()
+    legacy_before = legacy.read_bytes()
+
+    result = namespace["_trpsf_v1_preview_bootstrap_registry"]()
+
+    assert result["status"] == "REGISTRY_LOCK_UNAVAILABLE"
+    assert result["safe_to_commit"] is False
+    assert result["write_required"] is False
+    assert result["write_executed"] is False
+    assert active.read_bytes() == active_before
+    assert legacy.read_bytes() == legacy_before
+    assert not (tmp_path / "backup.json").exists()
+
+
+def test_bootstrap_preview_fails_closed_on_invalid_active_registry(tmp_path):
+    namespace, active, legacy, _payload, _merge_calls, _lock = _preview_namespace(
+        tmp_path
+    )
+    namespace["_trpsf_v1_registry_shape_errors"] = lambda registry: (
+        ["OPEN_TRADES_INVALID_SHAPE"]
+        if isinstance(registry, dict)
+        and registry.get("open_trades") is not None
+        and not isinstance(registry.get("open_trades"), (dict, list))
+        else []
+    )
+    active.write_text(json.dumps({"open_trades": "not-a-map"}), encoding="utf-8")
+    active_before = active.read_bytes()
+    legacy_before = legacy.read_bytes()
+
+    result = namespace["_trpsf_v1_preview_bootstrap_registry"]()
+
+    assert result["status"] == "ACTIVE_REGISTRY_INVALID_SHAPE"
+    assert result["safe_to_commit"] is False
+    assert result["write_required"] is False
+    assert result["write_executed"] is False
+    assert result["source_shape_errors"] == ["OPEN_TRADES_INVALID_SHAPE"]
+    assert active.read_bytes() == active_before
+    assert legacy.read_bytes() == legacy_before
+    assert not (tmp_path / "backup.json").exists()
+
+
+def test_bootstrap_preview_fails_closed_when_legacy_registry_cannot_be_read(
+    tmp_path,
+):
+    namespace, active, legacy, _payload, _merge_calls, _lock = _preview_namespace(
+        tmp_path
+    )
+    read_json = namespace["_trpsf_v1_read_json"]
+
+    def read_with_legacy_failure(path):
+        if Path(path) == legacy:
+            raise OSError("synthetic read failure")
+        return read_json(path)
+
+    namespace["_trpsf_v1_read_json"] = read_with_legacy_failure
+    active_before = active.read_bytes()
+    legacy_before = legacy.read_bytes()
+
+    result = namespace["_trpsf_v1_preview_bootstrap_registry"]()
+
+    assert result["status"] == "LEGACY_REGISTRY_READ_ERROR"
+    assert result["safe_to_commit"] is False
+    assert result["write_required"] is False
+    assert result["write_executed"] is False
+    assert result["source_read_errors"] == ["LEGACY_REGISTRY_READ_ERROR"]
+    assert active.read_bytes() == active_before
+    assert legacy.read_bytes() == legacy_before
+    assert not (tmp_path / "backup.json").exists()
+
+
+def test_storage_bootstrap_preview_route_is_read_only_and_uncached():
+    calls = []
+    private_trade_id = "private-trade-identity-should-not-leak"
+    namespace = {
+        "_trpsf_v1_preview_bootstrap_registry": lambda: calls.append("preview")
+        or {
+            "ok": False,
+            "status": "CLOSED_IDENTITY_MERGE_BLOCKED",
+            "version": "test-v1",
+            "generated_at": "fixed-time",
+            "safe_to_commit": False,
+            "write_required": False,
+            "write_executed": False,
+            "write_performed": False,
+            "active_file": "/private/data/trade_registry.json",
+            "legacy_files_checked": ["/private/legacy.json"],
+            "sources_used": ["/private/legacy.json"],
+            "counts_before": {"open_count": 1, "closed_count": 2},
+            "counts_after": {"open_count": 1, "closed_count": 2},
+            "closed_history_identity_merge": {
+                "safe_to_commit": False,
+                "open_identity_conflict_count": 1,
+                "open_identity_conflicts": [{"trade_id": private_trade_id}],
+                "financial_conflict_count": 1,
+            },
+        },
+    }
+    _compile(
+        [
+            "_trpsf_v1_public_preview_projection",
+            "trade_registry_persistent_storage_bootstrap_preview_v1_route",
+        ],
+        namespace,
+    )
+
+    payload, status, headers = namespace[
+        "trade_registry_persistent_storage_bootstrap_preview_v1_route"
+    ]()
+
+    assert status == 200
+    assert payload["safe_to_commit"] is False
+    assert payload["status"] == "CLOSED_IDENTITY_MERGE_BLOCKED"
+    assert payload["write_executed"] is False
+    assert payload["counts_before"] == {"open_count": 1, "closed_count": 2}
+    assert payload["conflict_summary"]["open_identity_conflict_count"] == 1
+    assert private_trade_id not in json.dumps(payload)
+    assert "/private/" not in json.dumps(payload)
+    assert "open_identity_conflicts" not in payload["conflict_summary"]
+    assert headers == {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    assert calls == ["preview"]

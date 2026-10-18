@@ -627,7 +627,7 @@ def test_preflight_build_uses_real_bounded_collector_with_synthetic_sources():
     )
 
 
-def test_preflight_timeout_fails_closed_and_still_writes_audit_report():
+def test_preflight_timeout_fails_closed_without_persisting_diagnostics():
     divergence = _valid_divergence()
     namespace = _preflight_namespace(divergence)
     base_collect = namespace["_frpp_v1_collect"]
@@ -667,10 +667,9 @@ def test_preflight_timeout_fails_closed_and_still_writes_audit_report():
     assert payload["evidence_collection"]["failed_collectors"] == ["broker_ready"]
     assert _check(payload, "PREFLIGHT_EVIDENCE_COLLECTION_COMPLETE")["ok"] is False
     assert _check(payload, "BROKER_READY_TRUE")["ok"] is False
-    assert payload["diagnostic_write"]["latest_ok"] is True
-    assert payload["diagnostic_write"]["events_ok"] is True
-    assert len(writes) == 1
-    assert len(events) == 1
+    assert "diagnostic_write" not in payload
+    assert writes == []
+    assert events == []
 
 
 def test_preflight_divergence_timeout_skips_audit_and_broker_collectors():

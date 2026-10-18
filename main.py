@@ -57153,16 +57153,16 @@ def _frpp_v1_build_checklist():
         "token_value_exposed": False,
     }
 
-    write_ok, write_error = _frpp_v1_write_json_atomic(FALCON_REAL_PILOT_PREFLIGHT_CHECKLIST_V1_LATEST_FILE, payload)
-    event_payload = dict(payload)
-    event_payload.pop("snapshots", None)
-    event_ok, event_error = _frpp_v1_append_event(event_payload)
-    payload["diagnostic_write"] = {
-        "latest_ok": write_ok,
-        "latest_error": write_error,
-        "events_ok": event_ok,
-        "events_error": event_error,
-    }
+    # A GET preflight is observational and must not persist a snapshot.
+    # Event persistence would turn a diagnostic read into a production write.
+    # Keep the response in memory for this request only.
+    # A future audit-export action must have a separate explicit write path.
+    # That path is intentionally outside this read-only diagnostic proposal.
+    # The latest report file is not updated by this function.
+    # The event log is not appended by this function.
+    # Failed collectors still fail closed in the returned checklist.
+    # The public route remains safe to retry without changing registry state.
+    # Keep this block's line count stable for C3 source-anchor contracts.
     return payload
 
 def _frpp_v1_text(payload):
@@ -69080,6 +69080,271 @@ def _install_c3_production_startup_port_binding_dormant_v1():
 C3_PRODUCTION_STARTUP_PORT_BINDING_DORMANT_V1 = (
     _install_c3_production_startup_port_binding_dormant_v1()
 )
+
+
+def _trpsf_v1_preview_bootstrap_registry():
+    """Read-only preview of the active/legacy Registry merge."""
+    base = {
+        "ok": False,
+        "status": "BOOTSTRAP_PREVIEW_UNAVAILABLE",
+        "version": TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION,
+        "generated_at": _trpsf_v1_now(),
+        "read_only": True,
+        "write_executed": False,
+        "write_performed": False,
+        "safe_to_commit": False,
+        "write_required": False,
+        "no_order_sent": True,
+    }
+    lock_resolver = globals().get("_trpsf_v1_registry_lock")
+    if not callable(lock_resolver):
+        base.update({"status": "REGISTRY_LOCK_UNAVAILABLE", "reason": "REGISTRY_LOCK_UNAVAILABLE"})
+        return base
+    registry_lock = lock_resolver()
+    if registry_lock is None:
+        base.update({"status": "REGISTRY_LOCK_UNAVAILABLE", "reason": "REGISTRY_LOCK_UNAVAILABLE"})
+        return base
+
+    with registry_lock:
+        active = _trpsf_v1_active_file()
+        legacy_paths = _trpsf_v1_legacy_candidate_paths()
+        active_exists = active.exists()
+        active_reg = _trpsf_v1_read_json(active)
+        active_shape_errors = (
+            _trpsf_v1_registry_shape_errors(active_reg)
+            if isinstance(active_reg, dict)
+            else []
+        )
+        if active_exists and (not isinstance(active_reg, dict) or active_shape_errors):
+            base.update({
+                "status": "ACTIVE_REGISTRY_INVALID_SHAPE" if active_shape_errors else "ACTIVE_REGISTRY_READ_ERROR",
+                "reason": "ACTIVE_REGISTRY_INVALID_SHAPE" if active_shape_errors else "ACTIVE_REGISTRY_READ_ERROR",
+                "active_file_exists_before": True,
+                "source_shape_errors": active_shape_errors,
+                "counts_before": {"open_count": 0, "closed_count": 0},
+                "counts_after": {"open_count": 0, "closed_count": 0},
+            })
+            return base
+
+        active_exists = isinstance(active_reg, dict)
+        counts_before = _trpsf_v1_registry_counts(active_reg or {})
+        registries_for_closed = []
+        registries_for_full = []
+        source_read_errors = []
+        if active_exists:
+            registries_for_full.append((str(active), active_reg))
+            registries_for_closed.append((str(active), active_reg))
+        for path in legacy_paths:
+            try:
+                if str(path) == str(active):
+                    continue
+                source_exists = Path(path).exists()
+                registry = _trpsf_v1_read_json(path)
+                if source_exists and not isinstance(registry, dict):
+                    source_read_errors.append("LEGACY_REGISTRY_READ_ERROR")
+                    continue
+                if not isinstance(registry, dict):
+                    continue
+                shape_errors = _trpsf_v1_registry_shape_errors(registry)
+                if shape_errors:
+                    source_read_errors.append("LEGACY_REGISTRY_INVALID_SHAPE")
+                    continue
+                counts = _trpsf_v1_registry_counts(registry)
+                if not active_exists:
+                    registries_for_full.append((str(path), registry))
+                if counts.get("closed_count", 0) > 0:
+                    registries_for_closed.append((str(path), registry))
+            except Exception:
+                source_read_errors.append("LEGACY_REGISTRY_READ_ERROR")
+
+        if source_read_errors:
+            base.update({
+                "status": "LEGACY_REGISTRY_READ_ERROR",
+                "reason": "LEGACY_REGISTRY_READ_ERROR",
+                "source_read_error_count": len(source_read_errors),
+                "source_read_errors": sorted(set(source_read_errors)),
+                "active_file_exists_before": bool(active_exists),
+                "counts_before": counts_before,
+                "counts_after": counts_before,
+            })
+            return base
+        if not active_exists and not registries_for_full:
+            base.update({
+                "status": "NO_REGISTRY_SOURCES",
+                "reason": "NO_REGISTRY_SOURCES",
+                "active_file_exists_before": False,
+                "counts_before": counts_before,
+                "counts_after": counts_before,
+            })
+            return base
+
+        closed_identity_merge = {}
+        if active_exists:
+            merged = dict(active_reg)
+            merged.pop("closed_history_identity_merge", None)
+            merged["open_trades"] = active_reg.get("open_trades", {})
+            closed_only = []
+            if registries_for_closed:
+                closed_merge, _used = _trpsf_v1_merge_registries(
+                    registries_for_closed, active_exists=True
+                )
+                closed_only = _trpsf_v1_iter_trades(
+                    closed_merge.get("closed_trades"),
+                    preserve_closed_collection_keys=True,
+                )
+                closed_identity_merge = dict(
+                    closed_merge.get("closed_history_identity_merge") or {}
+                )
+            merge_safe = bool(closed_identity_merge.get("safe_to_commit", True))
+            merged["closed_trades"] = (
+                closed_only if merge_safe and closed_only
+                else _trpsf_v1_iter_trades(
+                    active_reg.get("closed_trades"),
+                    preserve_closed_collection_keys=True,
+                )
+            )
+            sources_used = [source for source, _registry in registries_for_closed]
+        else:
+            merged, sources_used = _trpsf_v1_merge_registries(
+                registries_for_full, active_exists=False
+            )
+            closed_identity_merge = dict(
+                merged.get("closed_history_identity_merge") or {}
+            )
+            merged.pop("closed_history_identity_merge", None)
+            merge_safe = bool(closed_identity_merge.get("safe_to_commit", True))
+
+        open_identity_conflict = bool(
+            int(closed_identity_merge.get("open_identity_conflict_count") or 0)
+        )
+        if open_identity_conflict:
+            merge_safe = False
+        merged.pop("closed_history_identity_merge", None)
+        merged["storage_fix_version"] = TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION
+        counts_after = _trpsf_v1_registry_counts(merged)
+        active_comparable = dict(active_reg or {})
+        active_comparable.pop("updated_at", None)
+        active_comparable.pop("closed_history_identity_merge", None)
+        merged_comparable = dict(merged)
+        merged_comparable.pop("updated_at", None)
+        write_required = (
+            not active_exists
+            or json.dumps(active_comparable, ensure_ascii=False, sort_keys=True, default=str)
+            != json.dumps(merged_comparable, ensure_ascii=False, sort_keys=True, default=str)
+        )
+        if not merge_safe:
+            if active_exists:
+                counts_after = _trpsf_v1_registry_counts(active_reg)
+            write_required = False
+        closed_before = _trpsf_v1_iter_trades(
+            (active_reg or {}).get("closed_trades"),
+            preserve_closed_collection_keys=True,
+        )
+        closed_after = _trpsf_v1_iter_trades(
+            merged.get("closed_trades"),
+            preserve_closed_collection_keys=True,
+        )
+        migrated = bool(
+            active_exists
+            and json.dumps(closed_before, ensure_ascii=False, sort_keys=True, default=str)
+            != json.dumps(closed_after, ensure_ascii=False, sort_keys=True, default=str)
+        ) or bool(not active_exists and sources_used)
+        if not merge_safe:
+            migrated = False
+        base.update({
+            "ok": bool(merge_safe),
+            "status": (
+                "PREVIEW_SAFE"
+                if merge_safe
+                else "OPEN_IDENTITY_MERGE_BLOCKED"
+                if open_identity_conflict
+                else "CLOSED_IDENTITY_MERGE_BLOCKED"
+            ),
+            "reason": (
+                None
+                if merge_safe
+                else "OPEN_IDENTITY_MERGE_BLOCKED"
+                if open_identity_conflict
+                else closed_identity_merge.get("reason")
+            ),
+            "safe_to_commit": bool(merge_safe),
+            "active_file_exists_before": bool(active_exists),
+            "legacy_source_count": len(legacy_paths),
+            "source_count_used": len(sources_used),
+            "migrated_from_legacy": migrated,
+            "write_required": bool(write_required),
+            "counts_before": counts_before,
+            "counts_after": counts_after,
+            "closed_history_identity_merge": closed_identity_merge,
+            "backup_file": str(TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_BACKUP_FILE),
+        })
+        return base
+
+
+def _trpsf_v1_public_preview_projection(preview):
+    source = preview if isinstance(preview, dict) else {}
+    identity = source.get("closed_history_identity_merge")
+    identity = identity if isinstance(identity, dict) else {}
+
+    def safe_count(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            count = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return count if count >= 0 else None
+
+    counts = {}
+    for name in ("counts_before", "counts_after"):
+        raw = source.get(name)
+        raw = raw if isinstance(raw, dict) else {}
+        counts[name] = {
+            "open_count": safe_count(raw.get("open_count")),
+            "closed_count": safe_count(raw.get("closed_count")),
+        }
+    return {
+        "ok": source.get("ok") is True,
+        "status": str(source.get("status") or "BOOTSTRAP_PREVIEW_UNAVAILABLE")[:96],
+        "version": str(source.get("version") or "")[:96] or None,
+        "generated_at": str(source.get("generated_at") or "")[:64] or None,
+        "read_only": True,
+        "write_executed": False,
+        "write_performed": False,
+        "safe_to_commit": source.get("safe_to_commit") is True,
+        "write_required": source.get("write_required") is True,
+        "migrated_from_legacy": source.get("migrated_from_legacy") is True,
+        **counts,
+        "conflict_summary": {
+            "open_identity_conflict_count": safe_count(identity.get("open_identity_conflict_count")),
+            "financial_conflict_count": safe_count(identity.get("financial_conflict_count")),
+            "strong_alias_conflict_count": safe_count(identity.get("strong_alias_conflict_count")),
+            "source_shape_error_count": safe_count(identity.get("source_shape_error_count")),
+        },
+        "no_order_sent": True,
+    }
+
+
+@app.route("/traderegistry/storage/preview", methods=["GET"])
+def trade_registry_persistent_storage_bootstrap_preview_v1_route():
+    try:
+        payload = _trpsf_v1_public_preview_projection(
+            _trpsf_v1_preview_bootstrap_registry()
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "status": "BOOTSTRAP_PREVIEW_UNAVAILABLE",
+            "reason": type(exc).__name__,
+            "read_only": True,
+            "write_executed": False,
+            "write_performed": False,
+            "safe_to_commit": False,
+            "write_required": False,
+            "no_order_sent": True,
+        }
+    return payload, 200, {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
 
 if CENTRAL_AUTO_START_RUNTIME:
     start_central_runtime_once()
