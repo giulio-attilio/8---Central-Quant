@@ -3762,7 +3762,6 @@ def atualizar_posicao_com_poi(poi):
     p["timestamp"] = poi["timestamp"]
     p["active_since"] = time.time()
     p["breakeven"] = False
-    p["tp50_hit"] = False
     p["status"] = "ATIVO"
     p["breakeven_activated_at"] = None
     p["trailing_activated_at"] = None
