@@ -69306,6 +69306,7 @@ def _trpsf_v1_public_preview_projection(preview):
     return {
         "ok": source.get("ok") is True,
         "status": str(source.get("status") or "BOOTSTRAP_PREVIEW_UNAVAILABLE")[:96],
+        "reason": str(source.get("reason") or "")[:96] or None,
         "version": str(source.get("version") or "")[:96] or None,
         "generated_at": str(source.get("generated_at") or "")[:64] or None,
         "read_only": True,
@@ -69316,10 +69317,18 @@ def _trpsf_v1_public_preview_projection(preview):
         "migrated_from_legacy": source.get("migrated_from_legacy") is True,
         **counts,
         "conflict_summary": {
+            "input_record_count": safe_count(identity.get("input_record_count")),
+            "invalid_input_record_count": safe_count(identity.get("invalid_input_record_count")),
+            "invalid_closed_record_count": safe_count(identity.get("invalid_closed_record_count")),
+            "ambiguous_identity_bridge_count": safe_count(identity.get("ambiguous_identity_bridge_count")),
+            "identity_alias_conflict_count": safe_count(identity.get("identity_alias_conflict_count")),
+            "specific_alias_conflict_count": safe_count(identity.get("specific_alias_conflict_count")),
+            "legacy_alias_conflict_count": safe_count(identity.get("legacy_alias_conflict_count")),
             "open_identity_conflict_count": safe_count(identity.get("open_identity_conflict_count")),
             "financial_conflict_count": safe_count(identity.get("financial_conflict_count")),
             "strong_alias_conflict_count": safe_count(identity.get("strong_alias_conflict_count")),
             "source_shape_error_count": safe_count(identity.get("source_shape_error_count")),
+            "merge_group_count": safe_count(identity.get("merge_group_count")),
         },
         "no_order_sent": True,
     }

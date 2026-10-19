@@ -1096,6 +1096,7 @@ def test_storage_bootstrap_preview_route_is_read_only_and_uncached():
         or {
             "ok": False,
             "status": "CLOSED_IDENTITY_MERGE_BLOCKED",
+            "reason": "SPECIFIC_IDENTITY_ALIAS_CONFLICT",
             "version": "test-v1",
             "generated_at": "fixed-time",
             "safe_to_commit": False,
@@ -1109,9 +1110,19 @@ def test_storage_bootstrap_preview_route_is_read_only_and_uncached():
             "counts_after": {"open_count": 1, "closed_count": 2},
             "closed_history_identity_merge": {
                 "safe_to_commit": False,
+                "input_record_count": 5,
+                "invalid_input_record_count": 1,
+                "invalid_closed_record_count": 2,
+                "ambiguous_identity_bridge_count": 3,
+                "identity_alias_conflict_count": 4,
+                "specific_alias_conflict_count": 2,
+                "legacy_alias_conflict_count": 1,
+                "merge_group_count": 6,
                 "open_identity_conflict_count": 1,
                 "open_identity_conflicts": [{"trade_id": private_trade_id}],
                 "financial_conflict_count": 1,
+                "invalid_input_records": [{"trade_id": private_trade_id}],
+                "alias_conflicts": [{"trade_id": private_trade_id}],
             },
         },
     }
@@ -1130,11 +1141,27 @@ def test_storage_bootstrap_preview_route_is_read_only_and_uncached():
     assert status == 200
     assert payload["safe_to_commit"] is False
     assert payload["status"] == "CLOSED_IDENTITY_MERGE_BLOCKED"
+    assert payload["reason"] == "SPECIFIC_IDENTITY_ALIAS_CONFLICT"
     assert payload["write_executed"] is False
     assert payload["counts_before"] == {"open_count": 1, "closed_count": 2}
     assert payload["conflict_summary"]["open_identity_conflict_count"] == 1
+    assert payload["conflict_summary"] == {
+        "input_record_count": 5,
+        "invalid_input_record_count": 1,
+        "invalid_closed_record_count": 2,
+        "ambiguous_identity_bridge_count": 3,
+        "identity_alias_conflict_count": 4,
+        "specific_alias_conflict_count": 2,
+        "legacy_alias_conflict_count": 1,
+        "open_identity_conflict_count": 1,
+        "financial_conflict_count": 1,
+        "strong_alias_conflict_count": None,
+        "source_shape_error_count": None,
+        "merge_group_count": 6,
+    }
     assert private_trade_id not in json.dumps(payload)
     assert "/private/" not in json.dumps(payload)
     assert "open_identity_conflicts" not in payload["conflict_summary"]
+    assert "alias_conflicts" not in payload["conflict_summary"]
     assert headers == {"Cache-Control": "no-store", "Pragma": "no-cache"}
     assert calls == ["preview"]
