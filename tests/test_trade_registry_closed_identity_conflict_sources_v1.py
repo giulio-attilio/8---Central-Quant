@@ -282,6 +282,239 @@ def test_closed_identity_financial_conflict_sources_are_reported_by_path(
     assert "field=pnl_r path=trade.metadata.outcome.pnl_r alias=pnl_r value=-1.26907189" in text
 
 
+@pytest.mark.parametrize(
+    "symbol,closed_at,terminal_pnl,intermediate_pnl",
+    [
+        ("XRPUSDT", "18/10/2026 18:56:32", 1.8186639558350086, 0.6213588703478659),
+        ("XRPUSDT", "15/10/2026 11:40:09", 0.3488056533352259, 1.1672240796986726),
+        ("XRPUSDT", "17/10/2026 19:08:45", 0.7541782436651083, 0.5899152137785225),
+        ("DOGEUSDT", "15/10/2026 00:07:23", 3.0020246278044365, 2.2273900362445684),
+    ],
+)
+def test_meme_tp50_metadata_pnl_pct_is_preserved_but_not_a_terminal_conflict(
+    registry_module, symbol, closed_at, terminal_pnl, intermediate_pnl
+):
+    trade = {
+        "trade_id": f"MEME:REENTRY:{symbol}:SHORT",
+        "status": "CLOSED",
+        "bot": "MEME",
+        "setup": "REENTRY",
+        "symbol": symbol,
+        "side": "SHORT",
+        "registry_mode": "PAPER",
+        "closed_at": closed_at,
+        "entry": 1.3176,
+        "exit_price": 1.31300413671166,
+        "pnl_pct": terminal_pnl,
+        "result_pct": terminal_pnl,
+        "metadata": {
+            "updated_by": "meme.py",
+            "event": "TRAILING",
+            # This value is retained from MEME's earlier TP50 update.
+            "pnl_pct": intermediate_pnl,
+        },
+    }
+
+    values = registry_module._closed_trade_financial_source_values(trade)
+    state = registry_module._closed_trade_financial_conflict_state([trade])
+
+    assert len(values["pnl_pct"]) == 1
+    assert next(iter(values["pnl_pct"].values())) == terminal_pnl
+    assert "pnl_pct" not in state["material_financial_conflict_fields"]
+    assert trade["metadata"]["pnl_pct"] == intermediate_pnl
+
+    # Once the source explicitly labels the metadata as a terminal CLOSE,
+    # the same divergent value must remain a blocking financial conflict.
+    trade["metadata"]["event"] = "CLOSE"
+    terminal_metadata_state = registry_module._closed_trade_financial_conflict_state(
+        [trade]
+    )
+    assert "pnl_pct" in terminal_metadata_state["material_financial_conflict_fields"]
+
+    # A separately asserted terminal outcome remains financial evidence; the
+    # event-scoped exception must not mask an authoritative outcome document.
+    trade["metadata"]["outcome"] = {"pnl_pct": 1.1672240796986726}
+    state_with_outcome = registry_module._closed_trade_financial_conflict_state(
+        [trade]
+    )
+    assert "pnl_pct" in state_with_outcome["material_financial_conflict_fields"]
+
+
+@pytest.mark.parametrize(
+    "result_r",
+    [
+        0.08194973995096008,
+        -1.0,
+        3.193488739997675,
+        -1.0,
+        0.1124125122189612,
+        1.676291322314063,
+        1.003094490934477,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        3.3818860620104743,
+        0.2677823037836498,
+    ],
+)
+def test_reverted_falcon_verify_pnl_r_overwrite_is_explicitly_reconciled(
+    registry_module, result_r
+):
+    trade = {
+        "trade_id": "FALCON:FALCON15:BTCUSDT:SHORT",
+        "status": "CLOSED",
+        "bot": "FALCON",
+        "setup": "FALCON15",
+        "symbol": "BTCUSDT",
+        "side": "SHORT",
+        "registry_mode": "VERIFY",
+        "execution_mode": "VERIFY",
+        "entry": 63767.0,
+        "exit_price": 63703.233,
+        "pnl_r": -1.08850668,
+        "result_r": result_r,
+    }
+
+    source_values = registry_module._closed_trade_financial_source_values(trade)
+    state = registry_module._closed_trade_financial_conflict_state([trade])
+    merged = registry_module.merge_closed_trade_records([trade])
+
+    assert list(source_values["pnl_r"].values()) == [result_r]
+    assert "pnl_r" not in state["material_financial_conflict_fields"]
+    assert merged["diagnostics"]["safe_to_commit"] is True
+    assert merged["records"][0]["pnl_r"] == result_r
+    assert trade["pnl_r"] == -1.08850668  # input evidence is never mutated
+    repair = merged["records"][0]["metadata"]["registry_reconciliation_v1"]
+    assert repair["action"] == "REPLACE_REVERTED_FALCON_VERIFY_PNL_R_OVERWRITE"
+    assert repair["source_commits"] == ["eab099e", "8d25540"]
+    assert repair["selected_alias"] == "result_r"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"registry_mode": "REAL", "execution_mode": "LIVE"},
+        {"trade_id": "FALCON:FALCON15:ETHUSDT:SHORT", "symbol": "ETHUSDT"},
+        {"pnl_r": -1.0885},
+        {"result_r": None},
+    ],
+)
+def test_reverted_falcon_verify_pnl_r_overwrite_exception_is_narrow(
+    registry_module, changes
+):
+    trade = {
+        "trade_id": "FALCON:FALCON15:BTCUSDT:SHORT",
+        "status": "CLOSED",
+        "bot": "FALCON",
+        "setup": "FALCON15",
+        "symbol": "BTCUSDT",
+        "side": "SHORT",
+        "registry_mode": "VERIFY",
+        "execution_mode": "VERIFY",
+        "pnl_r": -1.08850668,
+        "result_r": 0.26778230378365,
+    }
+    trade.update(changes)
+    if changes.get("result_r", "sentinel") is None:
+        trade["metadata"] = {"outcome": {"pnl_r": 0.5}}
+
+    state = registry_module._closed_trade_financial_conflict_state([trade])
+
+    assert "pnl_r" in state["material_financial_conflict_fields"]
+
+
+def test_trendpro_near_poi_tp50_reset_is_reconciled_from_event_order(registry_module):
+    trade = {
+        "trade_id": "TRENDPRO:TRENDPRO_REENTRY:NEARUSDT:LONG",
+        "status": "CLOSED",
+        "bot": "TRENDPRO",
+        "setup": "TRENDPRO_REENTRY",
+        "symbol": "NEARUSDT",
+        "side": "LONG",
+        "registry_mode": "PAPER",
+        "entry": 5.221,
+        "exit_price": 5.0925444435592695,
+        "closed_at": "16/10/2026 12:22:28",
+        "tp50_hit": True,
+        "metadata": {"tp50_hit": False},
+    }
+
+    source_values = registry_module._closed_trade_financial_source_values(trade)
+    state = registry_module._closed_trade_financial_conflict_state([trade])
+    merged = registry_module.merge_closed_trade_records([trade])
+
+    assert list(source_values["tp50_hit"].values()) == [True]
+    assert "tp50_hit" not in state["material_financial_conflict_fields"]
+    assert merged["diagnostics"]["safe_to_commit"] is True
+    assert merged["records"][0]["tp50_hit"] is True
+    assert merged["records"][0]["metadata"]["tp50_hit"] is True
+    assert (
+        merged["records"][0]["metadata"]["registry_reconciliation_v1"]["action"]
+        == "PRESERVE_TRENDPRO_TP50_AFTER_REENTRY_POI"
+    )
+    assert trade["metadata"]["tp50_hit"] is False
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"closed_at": "16/10/2026 12:22:29"},
+        {"entry": 5.222},
+        {"registry_mode": "REAL"},
+        {"metadata": {"tp50_hit": False, "outcome": {"tp50_hit": False}}},
+    ],
+)
+def test_trendpro_tp50_reconciliation_is_event_and_identity_scoped(
+    registry_module, changes
+):
+    trade = {
+        "trade_id": "TRENDPRO:TRENDPRO_REENTRY:NEARUSDT:LONG",
+        "status": "CLOSED",
+        "bot": "TRENDPRO",
+        "setup": "TRENDPRO_REENTRY",
+        "symbol": "NEARUSDT",
+        "side": "LONG",
+        "registry_mode": "PAPER",
+        "entry": 5.221,
+        "exit_price": 5.0925444435592695,
+        "closed_at": "16/10/2026 12:22:28",
+        "tp50_hit": True,
+        "metadata": {"tp50_hit": False},
+    }
+    trade.update(changes)
+
+    state = registry_module._closed_trade_financial_conflict_state([trade])
+
+    assert "tp50_hit" in state["material_financial_conflict_fields"]
+
+
+def test_trendpro_tp50_reconciliation_does_not_infer_missing_event_from_false_root(
+    registry_module,
+):
+    trade = {
+        "trade_id": "TRENDPRO:TRENDPRO_REENTRY:NEARUSDT:LONG",
+        "status": "CLOSED",
+        "bot": "TRENDPRO",
+        "setup": "TRENDPRO_REENTRY",
+        "symbol": "NEARUSDT",
+        "side": "LONG",
+        "registry_mode": "PAPER",
+        "entry": 5.221,
+        "exit_price": 5.0925444435592695,
+        "closed_at": "16/10/2026 12:22:28",
+        "tp50_hit": False,
+        "metadata": {"tp50_hit": False},
+    }
+
+    merged = registry_module.merge_closed_trade_records([trade])
+
+    assert merged["records"][0]["tp50_hit"] is False
+    assert "registry_reconciliation_v1" not in merged["records"][0]["metadata"]
+
+
 def test_closed_identity_financial_conflict_r_recalculation_short_with_initial_stop(
     registry_module,
 ):

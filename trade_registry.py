@@ -1041,6 +1041,7 @@ CLOSED_TRADE_FINANCIAL_ALIAS_FAMILIES = {
     ),
     "learning_eligible": ("learning_eligible",),
 }
+
 CLOSED_TRADE_FINANCIAL_ALIAS_TO_CANONICAL = {
     alias: canonical
     for canonical, aliases in CLOSED_TRADE_FINANCIAL_ALIAS_FAMILIES.items()
@@ -1871,9 +1872,29 @@ def _closed_trade_financial_source_values(
         else {}
     )
     values: Dict[str, Dict[str, Any]] = {}
-    for source in (trade, metadata, outcome, metadata_outcome):
+    for source, source_kind in (
+        (trade, "trade"),
+        (metadata, "metadata"),
+        (outcome, "outcome"),
+        (metadata_outcome, "metadata_outcome"),
+    ):
+        if (
+            source_kind == "metadata"
+            and str(trade.get("bot") or "").upper().strip() == "MEME"
+            and str(metadata.get("updated_by") or "").strip().lower()
+            == "meme.py"
+            and str(metadata.get("event") or "").upper().strip()
+            in {"TP50", "BE_TRIGGER", "TRAILING", "POI"}
+        ):
+            # MEME records retain the TP50 price-return snapshot in metadata.pnl_pct
+            # when the trade later closes. It is an event metric, not terminal
+            ignored_aliases = {"pnl_pct"}
+        else:
+            ignored_aliases = _closed_trade_known_legacy_ignored_aliases_v1(trade, source_kind)
         for canonical, aliases in CLOSED_TRADE_FINANCIAL_ALIAS_FAMILIES.items():
             for alias in aliases:
+                if alias in ignored_aliases:
+                    continue
                 value = source.get(alias)
                 if value in (None, "", [], {}):
                     continue
@@ -1975,7 +1996,7 @@ def _closed_trade_merge_group(
         key=_closed_trade_preference_key,
         reverse=True,
     )
-    merged = ranked[0] if ranked else {}
+    merged = _closed_trade_merge_known_legacy_artifacts_v1(ranked)
     outcome_record = (
         max(
             ranked,
@@ -2002,7 +2023,7 @@ def _closed_trade_merge_group(
     ):
         # Re-project the most authoritative factual/manual outcome after the
         # structural merge so a generic CLOSED alias cannot mask it.
-        merged.update(_closed_trade_authoritative_outcome_values(outcome_record))
+        merged.update(_closed_trade_authoritative_outcome_values(_closed_trade_merge_known_legacy_artifacts_v1([outcome_record])))
         authoritative_outcome = (
             _closed_trade_authoritative_outcome_document(outcome_record)
         )
@@ -3474,3 +3495,117 @@ def _closed_trade_alias_conflict(
     if not coalesced:
         return True, normalized_values
     return False, [coalesced]
+
+
+def _closed_trade_known_falcon_verify_pnl_r_overwrite_v1(
+    trade: Dict[str, Any],
+) -> bool:
+    trade = trade if isinstance(trade, dict) else {}
+    return bool(
+        str(trade.get("trade_id") or trade.get("id") or "").strip()
+        == "FALCON:FALCON15:BTCUSDT:SHORT"
+        and str(trade.get("bot") or "").upper().strip() == "FALCON"
+        and str(trade.get("setup") or "").upper().strip() == "FALCON15"
+        and str(trade.get("symbol") or "").upper().strip() == "BTCUSDT"
+        and str(trade.get("side") or "").upper().strip() == "SHORT"
+        and str(trade.get("registry_mode") or "").upper().strip() == "VERIFY"
+        and _closed_trade_number(trade.get("pnl_r")) == "-1.08850668"
+        and bool(_closed_trade_number(trade.get("result_r")))
+    )
+
+
+def _closed_trade_known_trendpro_tp50_reentry_reset_v1(
+    trade: Dict[str, Any],
+) -> bool:
+    trade = trade if isinstance(trade, dict) else {}
+    metadata = trade.get("metadata") if isinstance(trade.get("metadata"), dict) else {}
+    return bool(
+        str(trade.get("trade_id") or trade.get("id") or "").strip()
+        == "TRENDPRO:TRENDPRO_REENTRY:NEARUSDT:LONG"
+        and str(trade.get("bot") or "").upper().strip() == "TRENDPRO"
+        and str(trade.get("setup") or "").upper().strip() == "TRENDPRO_REENTRY"
+        and str(trade.get("symbol") or "").upper().strip() == "NEARUSDT"
+        and str(trade.get("side") or "").upper().strip() == "LONG"
+        and str(trade.get("registry_mode") or "").upper().strip() == "PAPER"
+        and str(trade.get("status") or "").upper().strip() == "CLOSED"
+        and str(trade.get("closed_at") or "").strip() == "16/10/2026 12:22:28"
+        and _closed_trade_number(trade.get("entry")) == "5.221"
+        and _closed_trade_number(trade.get("exit_price")) == "5.0925444435592695"
+        and trade.get("tp50_hit") is True
+        and metadata.get("tp50_hit") is False
+    )
+
+
+def _closed_trade_merge_known_legacy_artifacts_v1(
+    ranked: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged = copy.deepcopy(ranked[0]) if ranked else {}
+    known = [
+        record
+        for record in ranked
+        if _closed_trade_known_falcon_verify_pnl_r_overwrite_v1(record)
+    ]
+    if known:
+        values = set()
+        for record in ranked:
+            values.update(
+                _closed_trade_financial_source_values(record).get("pnl_r", {})
+            )
+        if len(values) == 1:
+            selected = copy.deepcopy(known[0].get("result_r"))
+            merged["pnl_r"] = selected
+            metadata = copy.deepcopy(merged.get("metadata"))
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["registry_reconciliation_v1"] = {
+                "action": "REPLACE_REVERTED_FALCON_VERIFY_PNL_R_OVERWRITE",
+                "source_commits": ["eab099e", "8d25540"],
+                "field": "pnl_r",
+                "previous_value": -1.08850668,
+                "selected_alias": "result_r",
+                "selected_value": selected,
+            }
+            merged["metadata"] = metadata
+    known_trendpro = [
+        record
+        for record in ranked
+        if _closed_trade_known_trendpro_tp50_reentry_reset_v1(record)
+    ]
+    if known_trendpro:
+        values = set()
+        for record in ranked:
+            values.update(
+                _closed_trade_financial_source_values(record).get("tp50_hit", {})
+            )
+        if values == {"true"}:
+            merged["tp50_hit"] = True
+            metadata = copy.deepcopy(merged.get("metadata"))
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["tp50_hit"] = True
+            metadata["registry_reconciliation_v1"] = {
+                "action": "PRESERVE_TRENDPRO_TP50_AFTER_REENTRY_POI",
+                "source": "Redis TP50 event preceding POI and CLOSE on same trade",
+                "evidence_time_order": ["16/10/2026 08:13", "16/10/2026 12:01", "16/10/2026 12:22"],
+                "field": "tp50_hit",
+                "previous_metadata_value": False,
+                "selected_value": True,
+            }
+            merged["metadata"] = metadata
+    return merged
+
+
+def _closed_trade_known_legacy_ignored_aliases_v1(
+    trade: Dict[str, Any], source_kind: str
+) -> set:
+    if (
+        source_kind == "trade"
+        and _closed_trade_known_falcon_verify_pnl_r_overwrite_v1(trade)
+    ):
+        return {"pnl_r"}
+    if (
+        source_kind == "metadata"
+        and _closed_trade_known_trendpro_tp50_reentry_reset_v1(trade)
+    ):
+        return {"tp50_hit"}
+    return set()
