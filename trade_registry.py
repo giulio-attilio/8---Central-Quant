@@ -1068,6 +1068,16 @@ CLOSED_TRADE_LEGACY_IDENTITY_ALIASES = {
     "status": ("status",),
 }
 
+# These metadata aliases are lifecycle/event projections, not authoritative
+# identity fields when the Registry has a top-level value.  In particular,
+# close-event metadata commonly carries the signal's created_at/signal_type or
+# a bot-local status while the top-level Registry fields retain the canonical
+# opened_at/setup/CLOSED state.  Metadata remains a fallback for legacy rows
+# that do not have the canonical top-level field.
+CLOSED_TRADE_METADATA_FALLBACK_IDENTITY_FIELDS = frozenset(
+    {"opened_at", "setup", "status"}
+)
+
 
 def normalize_strong_identity_value(field: str, value: Any) -> str:
     """Normalize one strong identifier without weakening exact identity."""
@@ -1182,6 +1192,36 @@ def _closed_trade_legacy_identity_value(field: str, value: Any) -> str:
     return _closed_trade_text(value)
 
 
+def _closed_trade_legacy_identity_raw_values(
+    field: str,
+    trade: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> List[Any]:
+    aliases = CLOSED_TRADE_LEGACY_IDENTITY_ALIASES[field]
+    if field in CLOSED_TRADE_METADATA_FALLBACK_IDENTITY_FIELDS:
+        top_level = [
+            trade.get(alias)
+            for alias in aliases
+            if trade.get(alias) not in (None, "")
+        ]
+        if any(
+            _closed_trade_legacy_identity_value(field, value)
+            for value in top_level
+        ):
+            return top_level
+        return [
+            metadata.get(alias)
+            for alias in aliases
+            if metadata.get(alias) not in (None, "")
+        ]
+    return [
+        source.get(alias)
+        for source in (trade, metadata)
+        for alias in aliases
+        if source.get(alias) not in (None, "")
+    ]
+
+
 def _closed_trade_legacy_identity_states(
     trade: Dict[str, Any],
 ) -> Dict[str, Dict[str, Any]]:
@@ -1195,17 +1235,25 @@ def _closed_trade_legacy_identity_states(
     for field, aliases in CLOSED_TRADE_LEGACY_IDENTITY_ALIASES.items():
         normalized_values: List[str] = []
         aliases_present: List[str] = []
-        for source_name, source in (("trade", trade), ("metadata", metadata)):
+        sources = (("trade", trade), ("metadata", metadata))
+        for source_name, source in sources:
             for alias in aliases:
                 raw_value = source.get(alias)
                 if raw_value in (None, ""):
                     continue
-                value = _closed_trade_legacy_identity_value(field, raw_value)
-                if not value:
-                    continue
                 aliases_present.append(f"{source_name}.{alias}")
-                if value not in normalized_values:
-                    normalized_values.append(value)
+
+        # `metadata` is a mixed-purpose event payload.  For selected fields,
+        # use it only as a fallback when no usable top-level Registry value
+        # exists; see _closed_trade_legacy_identity_raw_values().
+        for raw_value in _closed_trade_legacy_identity_raw_values(
+            field, trade, metadata
+        ):
+            value = _closed_trade_legacy_identity_value(field, raw_value)
+            if not value:
+                continue
+            if value not in normalized_values:
+                normalized_values.append(value)
         conflict, normalized_values = _closed_trade_alias_conflict(field, normalized_values, trade, metadata)
         states[field] = {
             "field": field,
@@ -3484,13 +3532,9 @@ def _closed_trade_alias_conflict(
     conflict = len(normalized_values) > 1
     if not conflict or field not in {"opened_at", "closed_at"}:
         return conflict, normalized_values
-    aliases = CLOSED_TRADE_LEGACY_IDENTITY_ALIASES[field]
-    raw_values = [
-        source.get(alias)
-        for source in (trade, metadata)
-        for alias in aliases
-        if source.get(alias) not in (None, "")
-    ]
+    raw_values = _closed_trade_legacy_identity_raw_values(
+        field, trade, metadata
+    )
     coalesced = _closed_trade_coalesce_timestamp_aliases(raw_values)
     if not coalesced:
         return True, normalized_values

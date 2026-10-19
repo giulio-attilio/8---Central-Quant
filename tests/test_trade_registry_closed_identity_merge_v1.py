@@ -1935,7 +1935,7 @@ def test_minute_precision_timestamp_alias_matches_exact_same_minute(
         "invalid-timestamp",
     ],
 )
-def test_timestamp_alias_disagreement_remains_fail_closed(
+def test_close_metadata_created_at_does_not_override_canonical_opened_at(
     registry_module, metadata_created_at
 ):
     trade = _real_trade(
@@ -1945,11 +1945,102 @@ def test_timestamp_alias_disagreement_remains_fail_closed(
 
     state = registry_module.closed_trade_identity_state(trade)
 
-    assert state["identity_kind"] == "CONFLICT_QUARANTINED"
-    assert state["has_alias_conflict"] is True
-    assert [item["field"] for item in state["alias_conflicts"]] == [
-        "opened_at"
+    assert state["identity_kind"] == "LIFECYCLE_ID"
+    assert state["has_alias_conflict"] is False
+    assert state["legacy_identity_states"]["opened_at"]["value"] == (
+        "2026-09-05T14:00:48+00:00"
+    )
+    assert state["legacy_identity_states"]["opened_at"]["aliases_present"] == [
+        "trade.opened_at",
+        "metadata.created_at",
     ]
+
+
+def test_metadata_timestamp_aliases_still_conflict_when_canonical_is_missing(
+    registry_module,
+):
+    trade = _real_trade(
+        metadata={
+            "created_at": "05/09/2026 11:00",
+            "entry_timestamp": "05/09/2026 11:05",
+        }
+    )
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["identity_kind"] == "CONFLICT_QUARANTINED"
+    assert [item["field"] for item in state["alias_conflicts"]] == ["opened_at"]
+
+
+def test_conflicting_top_level_open_timestamps_remain_fail_closed(
+    registry_module,
+):
+    trade = _real_trade(
+        opened_at="05/09/2026 11:00:48",
+        open_timestamp="05/09/2026 11:02",
+        metadata={"created_at": "05/09/2026 11:00"},
+    )
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["identity_kind"] == "CONFLICT_QUARANTINED"
+    assert [item["field"] for item in state["alias_conflicts"]] == ["opened_at"]
+
+
+def test_canonical_setup_wins_over_close_event_signal_type(registry_module):
+    trade = _real_trade(
+        setup="TRENDPRO_EARLY",
+        metadata={"signal_type": "EARLY"},
+    )
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["has_alias_conflict"] is False
+    assert state["legacy_identity_states"]["setup"]["value"] == "TRENDPRO_EARLY"
+    assert state["legacy_identity_states"]["setup"]["aliases_present"] == [
+        "trade.setup",
+        "metadata.signal_type",
+    ]
+
+
+def test_conflicting_top_level_setup_aliases_remain_fail_closed(
+    registry_module,
+):
+    trade = _real_trade(
+        setup="FALCON15",
+        signal_type="FALCON_SCALP",
+        metadata={"signal_type": "FALCON15"},
+    )
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["identity_kind"] == "CONFLICT_QUARANTINED"
+    assert [item["field"] for item in state["alias_conflicts"]] == ["setup"]
+
+
+def test_canonical_closed_status_wins_over_mutable_metadata_status(
+    registry_module,
+):
+    trade = _real_trade(metadata={"status": "ATIVO"})
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["has_alias_conflict"] is False
+    assert state["invalid_closed_status"] is False
+    assert state["legacy_identity_states"]["status"]["value"] == "CLOSED"
+
+
+def test_metadata_status_is_fallback_when_canonical_status_is_missing(
+    registry_module,
+):
+    trade = _real_trade(metadata={"status": "OPEN"})
+    trade.pop("status")
+
+    state = registry_module.closed_trade_identity_state(trade)
+
+    assert state["has_alias_conflict"] is False
+    assert state["invalid_closed_status"] is True
+    assert state["legacy_identity_states"]["status"]["value"] == "OPEN"
 
 
 def test_semantic_financial_alias_conflict_is_preserved_fail_closed(
