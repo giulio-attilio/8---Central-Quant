@@ -69355,6 +69355,151 @@ def trade_registry_persistent_storage_bootstrap_preview_v1_route():
     return payload, 200, {"Cache-Control": "no-store", "Pragma": "no-cache"}
 
 
+def trade_registry_closed_identity_alias_conflicts_v1():
+    """Expose sanitized, read-only CLOSED identity alias conflicts for diagnosis."""
+    base = {
+        "ok": False,
+        "status": "CLOSED_IDENTITY_ALIAS_DIAGNOSTIC_UNAVAILABLE",
+        "version": "2026-10-18-CLOSED-IDENTITY-ALIAS-DIAGNOSTIC-V1",
+        "read_only": True,
+        "write_executed": False,
+        "registry_write": False,
+        "broker_called": False,
+        "no_order_sent": True,
+        "conflict_count": 0,
+        "returned_count": 0,
+        "conflicts": [],
+    }
+    loader = (
+        getattr(central_trade_registry, "load_registry_raw_read_only", None)
+        if central_trade_registry is not None
+        else None
+    )
+    if not callable(loader):
+        base["reason"] = "READ_ONLY_REGISTRY_LOADER_UNAVAILABLE"
+        return base
+    try:
+        registry = loader()
+        if not isinstance(registry, dict):
+            base["reason"] = "READ_ONLY_REGISTRY_INVALID"
+            return base
+        shape_errors = _trpsf_v1_registry_shape_errors(registry)
+        if shape_errors:
+            base.update({
+                "status": "CLOSED_IDENTITY_ALIAS_DIAGNOSTIC_INVALID_SHAPE",
+                "reason": "READ_ONLY_REGISTRY_INVALID_SHAPE",
+                "source_shape_error_count": len(shape_errors),
+            })
+            return base
+
+        records = _trpsf_v1_iter_trades(
+            registry.get("closed_trades"),
+            preserve_closed_collection_keys=True,
+        )
+        conflicts = []
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            identity = _closed_trade_identity_state_v1(record)
+            record_conflicts = identity.get("alias_conflicts")
+            if not isinstance(record_conflicts, list) or not record_conflicts:
+                continue
+
+            sanitized_fields = []
+            for conflict in record_conflicts:
+                if not isinstance(conflict, dict):
+                    continue
+                normalized_values = conflict.get("normalized_values")
+                normalized_values = (
+                    normalized_values if isinstance(normalized_values, list) else []
+                )
+                value_hashes = []
+                for value in normalized_values:
+                    encoded = json.dumps(
+                        value, ensure_ascii=False, sort_keys=True, default=str
+                    ).encode("utf-8")
+                    value_hashes.append(hashlib.sha256(encoded).hexdigest()[:12])
+                aliases_present = conflict.get("aliases_present")
+                aliases_present = (
+                    aliases_present if isinstance(aliases_present, list) else []
+                )
+                sanitized_fields.append({
+                    "field": str(conflict.get("field") or "")[:64] or None,
+                    "reason": str(conflict.get("reason") or "")[:64] or None,
+                    "aliases_present": [
+                        str(alias)[:64] for alias in aliases_present[:16]
+                    ],
+                    "normalized_value_count": len(normalized_values),
+                    "normalized_value_hashes": sorted(set(value_hashes))[:16],
+                })
+            if not sanitized_fields:
+                continue
+
+            # Only stable, non-secret context is returned. Trade/order IDs and
+            # raw alias values remain private; hashes allow matching values
+            # without disclosing them.
+            identity_doc = {
+                "registry_index": index,
+                "record_fingerprint": str(identity.get("fingerprint") or ""),
+            }
+            identity_hash = hashlib.sha256(
+                json.dumps(
+                    identity_doc, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            conflicts.append({
+                "registry_index": index,
+                "record_ref": identity_hash,
+                "bot": str(record.get("bot") or "")[:64] or None,
+                "setup": str(record.get("setup") or "")[:64] or None,
+                "symbol": str(record.get("symbol") or "")[:32] or None,
+                "side": str(record.get("side") or "")[:16] or None,
+                "registry_mode": str(record.get("registry_mode") or "")[:24] or None,
+                "closed_at": str(record.get("closed_at") or "")[:64] or None,
+                "fields": sanitized_fields,
+            })
+
+        request_args = globals().get("request")
+        try:
+            limit = int(request_args.args.get("limit", 200)) if request_args else 200
+            offset = int(request_args.args.get("offset", 0)) if request_args else 0
+        except (TypeError, ValueError, AttributeError):
+            limit, offset = 200, 0
+        limit = min(500, max(1, limit))
+        offset = max(0, offset)
+        total = len(conflicts)
+        page = conflicts[offset:offset + limit]
+        base.update({
+            "ok": True,
+            "status": (
+                "CLOSED_IDENTITY_ALIAS_CONFLICTS_FOUND"
+                if total else "CLOSED_IDENTITY_NO_ALIAS_CONFLICTS"
+            ),
+            "generated_at": _trpsf_v1_now(),
+            "closed_record_count": len(records),
+            "conflict_count": total,
+            "returned_count": len(page),
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(page) < total,
+            "conflicts": page,
+        })
+        return base
+    except Exception as exc:
+        base["reason"] = "CLOSED_IDENTITY_ALIAS_DIAGNOSTIC_READ_ERROR"
+        base["error_type"] = type(exc).__name__
+        return base
+
+
+@app.route("/traderegistry/closedidentity/alias-conflicts", methods=["GET"])
+def trade_registry_closed_identity_alias_conflicts_v1_route():
+    return (
+        trade_registry_closed_identity_alias_conflicts_v1(),
+        200,
+        {"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
 if CENTRAL_AUTO_START_RUNTIME:
     start_central_runtime_once()
 

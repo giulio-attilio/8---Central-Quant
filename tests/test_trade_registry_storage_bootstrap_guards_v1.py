@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import threading
 from contextlib import nullcontext
@@ -1165,3 +1166,116 @@ def test_storage_bootstrap_preview_route_is_read_only_and_uncached():
     assert "alias_conflicts" not in payload["conflict_summary"]
     assert headers == {"Cache-Control": "no-store", "Pragma": "no-cache"}
     assert calls == ["preview"]
+
+
+def test_alias_conflict_diagnostic_route_is_read_only_and_redacts_identity_values():
+    private_id = "private-client-order-id-should-not-leak"
+    private_trade_id = "private-trade-id-should-not-leak"
+    record = {
+        "trade_id": private_trade_id,
+        "bot": "Falcon",
+        "setup": "FALCON15",
+        "symbol": "BTCUSDT",
+        "side": "SHORT",
+        "registry_mode": "VERIFY",
+        "closed_at": "2026-10-18T12:00:00Z",
+        "clientOrderId": private_id,
+    }
+    state = {
+        "fingerprint": "f" * 64,
+        "alias_conflicts": [
+            {
+                "field": "client_order_id",
+                "reason": "LEGACY_IDENTITY_ALIAS_CONFLICT",
+                "aliases_present": ["clientOrderId", "client_order_id"],
+                "normalized_values": [private_id, "another-private-id"],
+            }
+        ],
+    }
+    registry = {"closed_trades": [record]}
+    namespace = {
+        "central_trade_registry": SimpleNamespace(
+            load_registry_raw_read_only=lambda: registry
+        ),
+        "_trpsf_v1_registry_shape_errors": lambda _registry: [],
+        "_trpsf_v1_iter_trades": lambda rows, **_kwargs: rows,
+        "_closed_trade_identity_state_v1": lambda _record: state,
+        "_trpsf_v1_now": lambda: "fixed-time",
+        "hashlib": hashlib,
+        "json": json,
+        "request": SimpleNamespace(args={}),
+    }
+    _compile(
+        [
+            "trade_registry_closed_identity_alias_conflicts_v1",
+            "trade_registry_closed_identity_alias_conflicts_v1_route",
+        ],
+        namespace,
+    )
+
+    payload, status, headers = namespace[
+        "trade_registry_closed_identity_alias_conflicts_v1_route"
+    ]()
+    serialized = json.dumps(payload)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["read_only"] is True
+    assert payload["write_executed"] is False
+    assert payload["registry_write"] is False
+    assert payload["broker_called"] is False
+    assert payload["no_order_sent"] is True
+    assert payload["conflict_count"] == 1
+    assert payload["returned_count"] == 1
+    item = payload["conflicts"][0]
+    assert item["registry_index"] == 0
+    assert item["symbol"] == "BTCUSDT"
+    assert item["fields"][0]["field"] == "client_order_id"
+    assert item["fields"][0]["reason"] == "LEGACY_IDENTITY_ALIAS_CONFLICT"
+    assert item["fields"][0]["normalized_value_count"] == 2
+    assert len(item["fields"][0]["normalized_value_hashes"]) == 2
+    assert private_id not in serialized
+    assert private_trade_id not in serialized
+    assert headers == {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
+def test_alias_conflict_diagnostic_route_paginates_without_writes():
+    records = [{"symbol": f"S{i}USDT"} for i in range(3)]
+    states = [
+        {
+            "fingerprint": str(i) * 64,
+            "alias_conflicts": [
+                {
+                    "field": "lifecycle_id",
+                    "reason": "LEGACY_IDENTITY_ALIAS_CONFLICT",
+                    "aliases_present": ["lifecycle_id", "lifecycleId"],
+                    "normalized_values": [f"a{i}", f"b{i}"],
+                }
+            ],
+        }
+        for i in range(3)
+    ]
+    namespace = {
+        "central_trade_registry": SimpleNamespace(
+            load_registry_raw_read_only=lambda: {"closed_trades": records}
+        ),
+        "_trpsf_v1_registry_shape_errors": lambda _registry: [],
+        "_trpsf_v1_iter_trades": lambda rows, **_kwargs: rows,
+        "_closed_trade_identity_state_v1": lambda record: states[
+            int(record["symbol"][1])
+        ],
+        "_trpsf_v1_now": lambda: "fixed-time",
+        "hashlib": hashlib,
+        "json": json,
+        "request": SimpleNamespace(args={"limit": "1", "offset": "1"}),
+    }
+    _compile(["trade_registry_closed_identity_alias_conflicts_v1"], namespace)
+
+    payload = namespace["trade_registry_closed_identity_alias_conflicts_v1"]()
+
+    assert payload["conflict_count"] == 3
+    assert payload["returned_count"] == 1
+    assert payload["offset"] == 1
+    assert payload["limit"] == 1
+    assert payload["truncated"] is True
+    assert payload["conflicts"][0]["registry_index"] == 1
