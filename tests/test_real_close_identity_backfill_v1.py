@@ -350,6 +350,7 @@ def test_route_preview_and_authenticated_commit_security_contract():
 
     class Request:
         def __init__(self):
+            self.method = "GET"
             self.args = {}
             self.form = {}
             self.values = {}
@@ -409,6 +410,15 @@ def test_route_preview_and_authenticated_commit_security_contract():
     assert resolver_calls == []
 
     current_request.args = {**_payload(), "commit": "true", "ack": ACK}
+    get_commit, get_commit_status = namespace[
+        "real_close_identity_backfill_v1_route"
+    ]()
+    assert get_commit_status == 405
+    assert get_commit["status"] == "POST_REQUIRED_FOR_BACKFILL"
+    assert get_commit["write_executed"] is False
+    assert resolver_calls == []
+
+    current_request.method = "POST"
     current_request.headers = {}
     missing, missing_status = namespace[
         "real_close_identity_backfill_v1_route"

@@ -37,6 +37,8 @@ from datetime import datetime, timezone, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 import requests
+from personal_http_auth import central_personal_http_auth
+from runtime_drain_v1 import RUNTIME_DRAIN, guard_live_flow, runtime_drain_blocked_result
 from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 import numpy as np
@@ -247,7 +249,7 @@ ENABLE_FALCON = str(os.environ.get("ENABLE_FALCON", "true")).lower() in {"1", "t
 # READY: valida BingX/API/Risk, mas NÃO envia ordens.
 # VERIFY: monta/valida a ordem completa, mas NÃO envia.
 # LIVE: envia automaticamente se ENABLE_REAL_TRADING=true e a Central aprovar em /can_open_trade.
-FALCON_MODE = os.environ.get("FALCON_MODE", os.environ.get("EXECUTION_MODE", "PAPER")).strip().upper()
+FALCON_MODE = os.environ.get("FALCON_MODE", "PAPER").strip().upper()
 ENABLE_REAL_TRADING = str(os.environ.get("ENABLE_REAL_TRADING", "false")).lower() in {"1", "true", "yes", "sim", "on"}
 FALCON_REAL_NOTIONAL_USDT = float(os.environ.get("FALCON_REAL_NOTIONAL_USDT", os.environ.get("REAL_TRADING_MAX_NOTIONAL_USDT", "5")))
 FALCON_REAL_MAX_POSITIONS = int(os.environ.get("FALCON_REAL_MAX_POSITIONS", "1"))
@@ -416,6 +418,9 @@ HEALTH = {
     "runners_10r": 0,
     "enabled_setups": list(SETUPS.keys()),
     "mode": FALCON_MODE,
+    # LIVE entry admission remains closed until a complete management pass has
+    # read persisted positions and verified every factual LIVE disaster stop.
+    "falcon_live_management_reconciliation_ready": False,
     "alignment_mode": ALIGNMENT_MODE,
     "funnel_today": {},
     "execution_mode": FALCON_MODE,
@@ -585,7 +590,7 @@ def safe_send_telegram(
     return bool(result.get("sent"))
 
 
-def redis_get_json(key, default):
+def redis_get_json(key, default, *, strict=False):
     try:
         with redis_lock:
             raw = bandwidth_redis_get(redis, key, caller=__name__)
@@ -598,6 +603,8 @@ def redis_get_json(key, default):
         return raw
     except Exception as exc:
         HEALTH["last_warning"] = f"redis get {key}: {exc}"
+        if strict:
+            raise RuntimeError(f"redis get {key} failed") from None
         return default
 
 
@@ -1044,8 +1051,10 @@ def r_for_side(side, entry, initial_stop, price):
 
 def get_positions():
     with position_mutation_lock:
-        data = redis_get_json(POSITIONS_KEY, {})
-        return data if isinstance(data, dict) else {}
+        data = redis_get_json(POSITIONS_KEY, {}, strict=True)
+        if not isinstance(data, dict):
+            raise RuntimeError("FALCON_POSITIONS_READ_INVALID")
+        return data
 
 
 def save_positions(positions):
@@ -1154,6 +1163,7 @@ def register_falcon_trade_registry_open(pos):
                 "disaster_stop_client_order_id": pos.get("disaster_stop_client_order_id"),
                 "disaster_stop_client_order_id_reserved": pos.get("disaster_stop_client_order_id_reserved"),
                 "disaster_stop_client_order_id_unique": pos.get("disaster_stop_client_order_id_unique"),
+                "disaster_stop_order_id_readback_verified": pos.get("disaster_stop_order_id_readback_verified"),
                 "disaster_stop_created": pos.get("disaster_stop_created"),
                 "disaster_stop_operationally_armed": pos.get("disaster_stop_operationally_armed"),
                 "client_order_id_reservation_status": pos.get("client_order_id_reservation_status"),
@@ -2113,7 +2123,12 @@ def central_can_open_trade(sig, positions=None):
         else None
     )
     try:
-        r = requests.post(CENTRAL_CAN_OPEN_TRADE_URL, json=payload, timeout=8)
+        r = requests.post(
+            CENTRAL_CAN_OPEN_TRADE_URL,
+            json=payload,
+            timeout=8,
+            auth=central_personal_http_auth(CENTRAL_CAN_OPEN_TRADE_URL),
+        )
         if r.status_code != 200:
             return {"allowed": False, "decision": "DENY", "reasons": [f"central HTTP {r.status_code}: {r.text[:160]}"]}
         data = r.json()
@@ -2829,6 +2844,9 @@ def _falcon_engine_unknown_reconciliation_position(state, entry, position_snapsh
         "disaster_stop_client_order_id_unique": (
             disaster.get("client_order_id_unique") is True
             or stop_reservation.get("client_order_id_unique") is True
+        ),
+        "disaster_stop_order_id_readback_verified": (
+            disaster.get("order_id_readback_verified") is True
         ),
         "broker_stop_amount": disaster.get("amount") or entry_amount,
         "broker_stop_price": disaster.get("stop_price") or state.get("stop_price"),
@@ -4606,6 +4624,21 @@ def execute_signal_if_allowed(sig, positions=None):
     positions = positions if positions is not None else get_positions()
     mode = FALCON_MODE
     sig["execution_mode"] = mode
+    if mode == "LIVE" and HEALTH.get(
+        "falcon_live_management_reconciliation_ready"
+    ) is not True:
+        decision = {
+            "allowed": False,
+            "decision": "DENY",
+            "status": "FALCON_LIVE_MANAGEMENT_RECONCILIATION_NOT_READY",
+            "reasons": [
+                "Falcon LIVE startup/management reconciliation is not ready."
+            ],
+            "warnings": [],
+        }
+        sig["execution_decision"] = decision
+        HEALTH["last_execution_decision"] = decision
+        return False, decision
     # A durable P0 incident blocks fresh Falcon LIVE entries before the
     # Risk-Manager/Broker path.  Lazy lookup preserves historical AST-isolated
     # tests that compile this legacy consumer without its runtime module.
@@ -5174,10 +5207,81 @@ def falcon_persist_accepted_signal(sig, positions):
     return result
 
 
+def _falcon_live_entry_flow_enabled(*_args, **_kwargs):
+    if FALCON_MODE != "LIVE" or not ENABLE_REAL_TRADING:
+        return False
+    checker = getattr(central_broker, "is_real_live_send_enabled", None)
+    if not callable(checker):
+        raise RuntimeError("Falcon live-send mode is unavailable")
+    return checker() is True
+
+
+def _falcon_runtime_drain_denial(args, kwargs):
+    sig = args[0] if args and isinstance(args[0], dict) else kwargs.get("sig")
+    decision = {
+        "allowed": False,
+        "decision": "DENY",
+        "status": "ENTRY_BLOCKED_RUNTIME_DRAIN",
+        "reasons": ["RUNTIME_DRAINING"],
+        "warnings": [],
+        "sent": False,
+        "send_attempted": False,
+        "reconciliation_required": False,
+    }
+    if isinstance(sig, dict):
+        sig["execution_decision"] = decision
+    HEALTH["last_execution_decision"] = decision
+    return False, decision
+
+
+@guard_live_flow(
+    RUNTIME_DRAIN,
+    _falcon_live_entry_flow_enabled,
+    _falcon_runtime_drain_denial,
+)
+def _falcon_process_entry_signal(sig, positions):
+    """Hold the drain lease through engine response and accepted-signal persistence."""
+    allowed, decision = execute_signal_if_allowed(sig, positions=positions)
+    if not allowed:
+        return allowed, decision
+
+    falcon_persist_accepted_signal(sig, positions)
+    redis_list_append(SIGNALS_KEY, sig)
+    record_event(
+        "SIGNAL",
+        sig,
+        {
+            "entry": sig["entry"],
+            "stop": sig["stop"],
+            "tp50": sig["tp50"],
+            "execution_decision": decision,
+        },
+    )
+    msg = signal_message(sig)
+    extra_exec = execution_decision_text(decision)
+    if extra_exec:
+        msg += "\n\n" + extra_exec
+    safe_send_telegram(
+        msg,
+        event_type="SIGNAL_LIVE_AUTHORIZED"
+        if sig.get("execution_mode") == "LIVE"
+        else "SIGNAL_PAPER",
+        mode=sig.get("execution_mode"),
+    )
+    if FALCON_MODE == "VERIFY":
+        safe_send_telegram(
+            verify_message(sig), event_type="VERIFY_PREVIEW", mode="VERIFY"
+        )
+    funnel_inc("sinais_enviados")
+    return allowed, decision
+
+
 def scanner_loop():
     started = time.time()
 
     while True:
+        if RUNTIME_DRAIN.is_draining():
+            return
         signals_sent = 0
         try:
             if not ENABLE_FALCON:
@@ -5223,7 +5327,7 @@ def scanner_loop():
                     if time.time() - started < STARTUP_GUARD_SECONDS:
                         continue
 
-                    execution_allowed, execution_decision = execute_signal_if_allowed(sig, positions=positions)
+                    execution_allowed, execution_decision = _falcon_process_entry_signal(sig, positions)
                     if not execution_allowed:
                         funnel_inc("reprovados_risco")
                         HEALTH["last_warning"] = "execução bloqueada: " + "; ".join([str(x) for x in execution_decision.get("reasons", [])[:3]])
@@ -5239,17 +5343,6 @@ def scanner_loop():
                         )
                         continue
 
-                    falcon_persist_accepted_signal(sig, positions)
-                    redis_list_append(SIGNALS_KEY, sig)
-                    record_event("SIGNAL", sig, {"entry": sig["entry"], "stop": sig["stop"], "tp50": sig["tp50"], "execution_decision": execution_decision})
-                    msg = signal_message(sig)
-                    extra_exec = execution_decision_text(execution_decision)
-                    if extra_exec:
-                        msg += "\n\n" + extra_exec
-                    safe_send_telegram(msg, event_type="SIGNAL_LIVE_AUTHORIZED" if sig.get("execution_mode") == "LIVE" else "SIGNAL_PAPER", mode=sig.get("execution_mode"))
-                    if FALCON_MODE == "VERIFY":
-                        safe_send_telegram(verify_message(sig), event_type="VERIFY_PREVIEW", mode="VERIFY")
-                    funnel_inc("sinais_enviados")
                     signals_sent += 1
 
                 last_candles[symbol] = symbol_last_closed_ts
@@ -5669,6 +5762,8 @@ def maybe_send_monthly_summary():
 
 def summary_loop():
     while True:
+        if RUNTIME_DRAIN.is_draining():
+            return
         try:
             maybe_send_daily_summary()
             maybe_send_monthly_summary()
@@ -5683,6 +5778,8 @@ def summary_loop():
 
 def watchdog_loop():
     while True:
+        if RUNTIME_DRAIN.is_draining():
+            return
         try:
             HEALTH["watchdog_last_check"] = data_hora_sp_str()
             reasons = []
@@ -5926,10 +6023,12 @@ def events_route():
 # ============================================================================
 
 def run_thread_guarded(name, target):
-    while True:
+    while not RUNTIME_DRAIN.is_draining():
         try:
             target()
         except Exception as exc:
+            if name == "management":
+                HEALTH["falcon_live_management_reconciliation_ready"] = False
             HEALTH["last_error"] = f"Thread {name} travou: {exc}"
             traceback.print_exc()
             try:
@@ -6056,6 +6155,9 @@ def falcon_sync_live_order_state(sig, order):
     sig["disaster_stop_client_order_id"] = disaster.get("client_order_id")
     sig["disaster_stop_client_order_id_unique"] = (
         disaster.get("client_order_id_unique") is True
+    )
+    sig["disaster_stop_order_id_readback_verified"] = (
+        disaster.get("order_id_readback_verified") is True
     )
     sig["stop_client_order_id_revision"] = 0
     sig["client_order_id_reservation_status"] = disaster.get(
@@ -6734,6 +6836,11 @@ def falcon_handle_unsafe_live_entry_identity(sig, order):
 # Envolve a função de entrada existente sem reescrever o gate.
 _ORIGINAL_EXECUTE_SIGNAL_IF_ALLOWED_BEFORE_RPM_V1 = execute_signal_if_allowed
 
+@guard_live_flow(
+    RUNTIME_DRAIN,
+    _falcon_live_entry_flow_enabled,
+    _falcon_runtime_drain_denial,
+)
 def execute_signal_if_allowed(sig, positions=None):
     allowed, decision = _ORIGINAL_EXECUTE_SIGNAL_IF_ALLOWED_BEFORE_RPM_V1(sig, positions=positions)
     order = sig.get("live_order") if isinstance(sig, dict) and isinstance(sig.get("live_order"), dict) else {}
@@ -6828,6 +6935,7 @@ def falcon_update_registry_management(pos, **metadata):
                 "disaster_stop_client_order_id": pos.get("disaster_stop_client_order_id"),
                 "disaster_stop_client_order_id_reserved": pos.get("disaster_stop_client_order_id_reserved"),
                 "disaster_stop_client_order_id_unique": pos.get("disaster_stop_client_order_id_unique"),
+                "disaster_stop_order_id_readback_verified": pos.get("disaster_stop_order_id_readback_verified"),
                 "disaster_stop_created": pos.get("disaster_stop_created"),
                 "disaster_stop_operationally_armed": pos.get("disaster_stop_operationally_armed"),
                 "client_order_id_reservation_status": pos.get("client_order_id_reservation_status"),
@@ -7427,6 +7535,10 @@ def _falcon_stop_creation_evidence(pos, identity, expected_stop_order_id):
         "working_type": disaster.get("working_type") or disaster.get("trigger_type") or pos.get("broker_stop_trigger_type"),
         "amount": disaster.get("amount") or pos.get("broker_stop_amount"),
         "hedge_mode_detected": disaster.get("hedge_mode_detected") if disaster.get("hedge_mode_detected") is not None else pos.get("broker_stop_hedge_mode_detected"),
+        "order_id_readback_verified": (
+            disaster.get("order_id_readback_verified") is True
+            or pos.get("disaster_stop_order_id_readback_verified") is True
+        ),
         "source": "CENTRAL_DISASTER_STOP_CREATION_EVIDENCE",
     }
 
@@ -7860,7 +7972,10 @@ def _falcon_update_stop_health(result):
         and result.get("entry_ownership_verified")
         and result.get("client_order_id_reserved") is True
         and result.get("client_order_id_unique") is True
-        and result.get("stop_client_order_id_match") is True
+        and (
+            result.get("stop_client_order_id_match") is True
+            or result.get("stop_identity_verified_via_order_id") is True
+        )
         and result.get("stop_operationally_armed") is True
     )
     HEALTH["falcon_disaster_stop_client_order_id"] = result.get(
@@ -8128,6 +8243,17 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                 and actual_stop_order_id
                 and actual_stop_order_id == str(stop_order_id).strip()
             )
+            stop_identity_verified_via_order_id = bool(
+                not actual_stop_client_id
+                and stop_order_identity_match
+                and creation_stop_evidence.get("eligible") is True
+                and creation_stop_evidence.get("order_id_readback_verified") is True
+                and result.get("client_order_id_reserved") is True
+                and result.get("client_order_id_unique") is True
+            )
+            stop_identity_verified = bool(
+                stop_client_order_id_match or stop_identity_verified_via_order_id
+            )
             flags = _falcon_stop_status_flags(order_status, order_snapshot)
             filled_qty = safe_float((order_snapshot or {}).get("filled"), 0.0)
             fill_expected = safe_float(pos.get("broker_stop_amount"), remaining)
@@ -8156,6 +8282,7 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                 "stop_order_status": order_status,
                 "stop_order_identity_match": stop_order_identity_match,
                 "stop_client_order_id_match": stop_client_order_id_match,
+                "stop_identity_verified_via_order_id": stop_identity_verified_via_order_id,
                 "stop_order_client_id": actual_stop_client_id or None,
                 "stop_order_active": flags["active"],
                 "stop_order_filled": flags["filled"],
@@ -8252,7 +8379,7 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                     and result.get("entry_ownership_verified")
                     and result.get("client_order_id_reserved") is True
                     and result.get("client_order_id_unique") is True
-                    and stop_client_order_id_match
+                    and stop_identity_verified
                 ):
                     result.update({
                         "ok": True,
@@ -8260,7 +8387,7 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
                         "management_allowed": True,
                         "stop_operationally_armed": True,
                     })
-                elif not stop_client_order_id_match:
+                elif not stop_identity_verified:
                     result.update({
                         "status": "DISASTER_STOP_CLIENT_ORDER_ID_MISMATCH",
                         "management_allowed": False,
@@ -8343,6 +8470,10 @@ def falcon_verify_live_disaster_stop(pos, now_epoch=None, force=False, persist_r
         and result.get("stop_order_protective_verified")
         and result.get("entry_ownership_verified")
         and result.get("client_order_id_unique") is True
+        and (
+            result.get("stop_client_order_id_match") is True
+            or result.get("stop_identity_verified_via_order_id") is True
+        )
     )
     pos["stop_anomaly_detected"] = result.get("stop_anomaly_detected")
     pos["stop_anomaly_last_reason"] = result.get("stop_anomaly_reason")
@@ -13143,6 +13274,15 @@ def falcon_handle_live_stop_cross(pid, pos, price, force_fail_safe=False, verifi
 # Gestão substituta: PAPER permanece igual; LIVE usa confirmação broker.
 def management_loop():
     while True:
+        if not RUNTIME_DRAIN.try_enter_management_cycle():
+            return
+        falcon_runtime_mode = str(globals().get("FALCON_MODE") or "PAPER").upper()
+        live_management_reconciliation_ok = falcon_runtime_mode != "LIVE"
+        if falcon_runtime_mode == "LIVE":
+            # Any incomplete/failed pass closes entry admission until a later
+            # full pass verifies the persisted LIVE positions again.
+            HEALTH["falcon_live_management_reconciliation_ready"] = False
+            live_management_reconciliation_ok = True
         try:
             positions = get_positions()
             closed_pids = []
@@ -13158,6 +13298,7 @@ def management_loop():
 
                 live_mode = str(pos.get("execution_mode") or "").upper() == "LIVE" or str(pos.get("registry_mode") or "").upper() == "REAL"
                 if live_mode and not is_real:
+                    live_management_reconciliation_ok = False
                     pos["live_management_block_reason"] = "LIVE_ORDER_IDENTITY_INSUFFICIENT"
                     pos["stop_anomaly_detected"] = True
                     pos["stop_anomaly_last_reason"] = "LIVE_ORDER_IDENTITY_INSUFFICIENT"
@@ -13184,6 +13325,7 @@ def management_loop():
                 if is_real:
                     verification = falcon_verify_live_disaster_stop(pos)
                     if not verification.get("management_allowed"):
+                        live_management_reconciliation_ok = False
                         reason = str(verification.get("status") or "LIVE_MANAGEMENT_PREFLIGHT_BLOCKED")
                         # Terminal protection recovery is deliberately evaluated
                         # before every normal-management ``continue``.  It can
@@ -13240,6 +13382,7 @@ def management_loop():
                 # acima continua ativa, mas nenhuma gestao normal pode operar
                 # ate que a reconciliacao explicita libere o lifecycle.
                 if is_real and pos.get("live_management_reconciliation_pending") is True:
+                    live_management_reconciliation_ok = False
                     pos["live_management_block_reason"] = (
                         "ENTRY_ACK_PERSISTENCE_RECONCILIATION_REQUIRED"
                     )
@@ -13363,12 +13506,22 @@ def management_loop():
             HEALTH["last_success"] = data_hora_sp_str()
             HEALTH["last_error"] = None
             refresh_health_stats()
+            if falcon_runtime_mode == "LIVE":
+                HEALTH["falcon_live_management_reconciliation_ready"] = bool(
+                    live_management_reconciliation_ok
+                )
 
         except Exception as exc:
+            if falcon_runtime_mode == "LIVE":
+                HEALTH["falcon_live_management_reconciliation_ready"] = False
             HEALTH["last_error"] = f"management: {exc}"
             HEALTH["last_real_management_error"] = str(exc)
             traceback.print_exc()
+        finally:
+            RUNTIME_DRAIN.leave_management_cycle()
 
+        if RUNTIME_DRAIN.is_draining():
+            return
         time.sleep(MANAGEMENT_SLEEP_SECONDS)
 
 
@@ -13398,6 +13551,9 @@ def health_payload():
     ]
     for field in safety_fields:
         payload[field] = HEALTH.get(field)
+    payload["falcon_live_management_reconciliation_ready"] = HEALTH.get(
+        "falcon_live_management_reconciliation_ready"
+    )
     payload["real_position_management"] = {
         "version": FALCON_REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
         "enabled": True,

@@ -1,8 +1,12 @@
 import sys
 import tempfile
 import unittest
+import socket
+import os
+import base64
 from pathlib import Path
 from unittest import mock
+from flask.testing import FlaskClient
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -10,6 +14,33 @@ sys.path.insert(0, str(ROOT))
 import event_bus
 import history_manager
 import main as central_main
+
+
+class _AuthenticatedLocalTestClient(FlaskClient):
+    """Supply only synthetic Basic credentials to HTTP route tests."""
+
+    def open(self, *args, **kwargs):
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault(
+            "Authorization",
+            "Basic " + base64.b64encode(b"local-test-operator:not-a-secret").decode("ascii"),
+        )
+        kwargs["headers"] = headers
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CENTRAL_PERSONAL_HTTP_USER": "local-test-operator",
+                "CENTRAL_PERSONAL_HTTP_PASSWORD": "not-a-secret",
+            },
+        ):
+            return super().open(*args, **kwargs)
+
+
+central_main.app.test_client_class = _AuthenticatedLocalTestClient
+
+
+def _network_forbidden(*_args, **_kwargs):
+    raise AssertionError("network access is forbidden in this local test suite")
 
 
 class HistoryEventBusSmokeTest(unittest.TestCase):
@@ -25,6 +56,10 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.central_decision_log = self.root / "central_decision.jsonl"
 
         self.patches = [
+            mock.patch.object(socket, "create_connection", _network_forbidden),
+            mock.patch.object(socket, "getaddrinfo", _network_forbidden),
+            mock.patch.object(socket.socket, "connect", _network_forbidden),
+            mock.patch.object(socket.socket, "connect_ex", _network_forbidden),
             mock.patch.object(history_manager, "DATA_DIR", self.history_dir),
             mock.patch.object(history_manager, "HISTORY_EVENTS_FILE", self.history_dir / "history_events.jsonl"),
             mock.patch.object(history_manager, "DECISION_LOG_FILE", self.history_dir / "decision_log.jsonl"),

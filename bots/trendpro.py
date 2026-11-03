@@ -49,9 +49,11 @@ import json
 import time
 import threading
 import requests
+from personal_http_auth import central_personal_http_auth
 from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
+from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
@@ -502,9 +504,15 @@ def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
             return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso TRENDPRO OHLCV ({attempt+1}/{max_retries}) {symbol} {timeframe}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
+                return []
             time.sleep(2 ** attempt)
         except Exception as e:
             print(f"Aviso TRENDPRO OHLCV genérico ({attempt+1}/{max_retries}) {symbol} {timeframe}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
+                return []
             time.sleep(2 ** attempt)
 
     HEALTH["last_warning"] = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
@@ -3474,22 +3482,24 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
     Em falha ou ausência de URL, o padrão é fail-closed para impedir
     novas entradas fora da arquitetura da Central Quant.
     """
+    fail_closed = TRENDPRO_CENTRAL_RISK_FAIL_CLOSED or EXECUTION_MODE == "LIVE"
     if not TRENDPRO_CENTRAL_RISK_ENABLED:
-        sinal["risk_precheck_allowed"] = True
-        sinal["risk_precheck_decision"] = "ALLOW"
+        live_blocked = EXECUTION_MODE == "LIVE"
+        sinal["risk_precheck_allowed"] = not live_blocked
+        sinal["risk_precheck_decision"] = "DENY" if live_blocked else "ALLOW"
         sinal["risk_precheck_at"] = data_hora_sp_str()
         return {
-            "allowed": True,
-            "decision": "ALLOW",
+            "allowed": not live_blocked,
+            "decision": "DENY" if live_blocked else "ALLOW",
+            "reasons": ["Central Risk Manager desativado; entradas LIVE exigem aprovação central."] if live_blocked else [],
             "warnings": ["TRENDPRO_CENTRAL_RISK_ENABLED=false"],
-            "reasons": [],
             "source": "local_disabled",
         }
 
     url = central_can_open_trade_url()
     if not url:
-        decision = "ALLOW" if not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED else "DENY"
-        allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+        decision = "ALLOW" if not fail_closed else "DENY"
+        allowed = not fail_closed
         sinal["risk_precheck_allowed"] = allowed
         sinal["risk_precheck_decision"] = decision
         sinal["risk_precheck_at"] = data_hora_sp_str()
@@ -3517,14 +3527,19 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=TRENDPRO_CENTRAL_RISK_TIMEOUT)
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=TRENDPRO_CENTRAL_RISK_TIMEOUT,
+            auth=central_personal_http_auth(url),
+        )
         try:
             data = response.json()
         except Exception:
             data = {"raw_response": response.text[:500]}
 
         if response.status_code >= 400:
-            allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+            allowed = not fail_closed
             decision = "ALLOW" if allowed else "DENY"
             sinal["risk_precheck_allowed"] = allowed
             sinal["risk_precheck_decision"] = decision
@@ -3552,7 +3567,7 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
             sinal["risk_precheck_warnings"] = data.get("warnings") or []
             return data
 
-        allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+        allowed = not fail_closed
         decision = "ALLOW" if allowed else "DENY"
         sinal["risk_precheck_allowed"] = allowed
         sinal["risk_precheck_decision"] = decision
@@ -3568,7 +3583,7 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
         }
 
     except Exception as exc:
-        allowed = not TRENDPRO_CENTRAL_RISK_FAIL_CLOSED
+        allowed = not fail_closed
         decision = "ALLOW" if allowed else "DENY"
         sinal["risk_precheck_allowed"] = allowed
         sinal["risk_precheck_decision"] = decision

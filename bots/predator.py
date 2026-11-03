@@ -20,9 +20,12 @@ import re
 import time
 import threading
 import requests
+from personal_http_auth import central_personal_http_auth
+from runtime_drain_v1 import RUNTIME_DRAIN, guard_live_flow, runtime_drain_blocked_result
 import numpy as np
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
+from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
 from redis_bandwidth import (
@@ -1758,10 +1761,22 @@ def central_can_open_trade(sig):
     }
 
     if not PREDATOR_REQUIRE_CENTRAL_RISK:
+        if PREDATOR_MODE == "LIVE":
+            return {
+                "allowed": False,
+                "decision": "DENY",
+                "reasons": ["Central Risk Manager é obrigatório para entradas LIVE."],
+                "payload": payload,
+            }
         return {"allowed": True, "decision": "ALLOW", "reasons": ["PREDATOR_REQUIRE_CENTRAL_RISK=false"], "payload": payload}
 
     try:
-        r = requests.post(f"{CENTRAL_BASE_URL}/can_open_trade", json=payload, timeout=8)
+        r = requests.post(
+            f"{CENTRAL_BASE_URL}/can_open_trade",
+            json=payload,
+            timeout=8,
+            auth=central_personal_http_auth(f"{CENTRAL_BASE_URL}/can_open_trade"),
+        )
         try:
             data = r.json()
         except Exception:
@@ -2461,6 +2476,36 @@ def montar_predator_execution_firewall_status():
     return "\n".join(lines)
 
 
+def _predator_live_entry_flow_enabled(*_args, **_kwargs):
+    return _predator_broker_live_send_state().get("enabled") is True
+
+
+def _predator_runtime_drain_result(args, kwargs):
+    sig = args[0] if args and isinstance(args[0], dict) else kwargs.get("sig")
+    sig = sig if isinstance(sig, dict) else {}
+    risk = {
+        "ok": False,
+        "allowed": False,
+        "decision": "DENY",
+        "reasons": ["RUNTIME_DRAINING"],
+    }
+    broker_result = runtime_drain_blocked_result()
+    broker_result.update({"broker_called": False, "preview_called": False})
+    return {
+        "risk": risk,
+        "ready": {"ok": False, "status": "ENTRY_BLOCKED_RUNTIME_DRAIN"},
+        "broker_result": broker_result,
+        "message": "Nova entrada bloqueada durante encerramento gracioso.",
+        "origin_type": kwargs.get("origin_type") or "BOT_AUTOMATIC",
+        "firewall_blocked": True,
+    }
+
+
+@guard_live_flow(
+    RUNTIME_DRAIN,
+    _predator_live_entry_flow_enabled,
+    _predator_runtime_drain_result,
+)
 def execute_predator_signal_safe(sig, risk_prechecked=None, local_gate_prechecked=None, origin_type="BOT_AUTOMATIC"):
     """Executa a camada READY/VERIFY/LIVE do Smart Predator com firewall de preview automático.
 
@@ -4394,6 +4439,29 @@ def listen_commands():
 # SCANNER LOOP PRINCIPAL
 # ====================================================
 
+def _record_predator_scanner_symbol_error(symbol, error):
+    error_text = str(error)
+    if is_exchange_throttle_error(error):
+        HEALTH["last_warning"] = (
+            f"Rate limit BingX OHLCV {nome_limpo(symbol)}; símbolo ignorado neste ciclo"
+        )
+        return
+    if "109500" in error_text or "quote service unavailable" in error_text:
+        HEALTH["last_warning"] = (
+            f"Erro temporário BingX {nome_limpo(symbol)}: {error_text}"
+        )
+        return
+    HEALTH["last_error"] = f"Erro scanner {nome_limpo(symbol)}: {error_text}"
+
+
+def _record_predator_scanner_cycle_error(error):
+    error_text = str(error)
+    if "109500" in error_text or "quote service unavailable" in error_text:
+        HEALTH["last_warning"] = f"Erro temporário BingX no scanner: {error_text}"
+        return
+    HEALTH["last_error"] = error_text
+
+
 def scanner():
     print(f"SCANNER INICIADO - {BOT_NAME}")
     HEALTH["started_at"] = data_hora_sp_str()
@@ -4447,17 +4515,7 @@ def scanner():
 
                     except Exception as e:
                         print(f"ERRO SCANNER {symbol}:", e)
-
-                        erro_txt = str(e)
-                        if "109500" in erro_txt or "quote service unavailable" in erro_txt:
-                            HEALTH["last_warning"] = (
-                                f"Erro temporário BingX {nome_limpo(symbol)}: {erro_txt}"
-                            )
-                            HEALTH["last_error"] = None
-                        else:
-                            HEALTH["last_error"] = (
-                                f"Erro scanner {nome_limpo(symbol)}: {erro_txt}"
-                            )
+                        _record_predator_scanner_symbol_error(symbol, e)
 
                     time.sleep(0.2)
             else:
@@ -4472,13 +4530,7 @@ def scanner():
 
         except Exception as e:
             print("ERRO LOOP SCANNER:", e)
-
-            erro_txt = str(e)
-            if "109500" in erro_txt or "quote service unavailable" in erro_txt:
-                HEALTH["last_warning"] = f"Erro temporário BingX no scanner: {erro_txt}"
-                HEALTH["last_error"] = None
-            else:
-                HEALTH["last_error"] = erro_txt
+            _record_predator_scanner_cycle_error(e)
 
         time.sleep(SCANNER_SLEEP_SECONDS)
 

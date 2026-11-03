@@ -380,7 +380,7 @@ def _flask_client_for_harness(namespace):
         "/falcon/manualclose/outcome/text",
         endpoint=f"manual-close-{id(namespace)}",
         view_func=namespace["falcon_manual_close_outcome_v1_text_route"],
-        methods=["GET"],
+        methods=["GET", "POST"],
     )
     return app.test_client()
 
@@ -446,6 +446,39 @@ def test_flask_route_without_query_blocks_before_registry_resolution():
     assert "QUERY_PARAMETERS_NOT_RECEIVED" in text
     assert "LIFECYCLE_ID_MISMATCH" not in text
     assert registry.write_calls == []
+
+
+def test_get_commit_is_rejected_but_acknowledged_post_can_record_outcome():
+    old_verify, live_real, params = _xrp_trade_id_collision_fixture()
+    ns, registry, _ = _harness(closed=[old_verify, live_real])
+    client = _flask_client_for_harness(ns)
+
+    get_params = dict(params)
+    get_params.update({
+        "commit": "true",
+        "ack": "FALCON_MANUAL_CLOSE_OUTCOME_V1",
+    })
+    blocked = client.get(
+        "/falcon/manualclose/outcome/text",
+        query_string=get_params,
+    )
+    assert blocked.status_code == 405
+    assert blocked.get_json()["status"] == "POST_REQUIRED_FOR_MANUAL_CLOSE_OUTCOME"
+    assert blocked.get_json()["write_executed"] is False
+    assert registry.write_calls == []
+
+    post_params = dict(params)
+    post_params.update({
+        "commit": True,
+        "ack": "FALCON_MANUAL_CLOSE_OUTCOME_V1",
+    })
+    posted = client.post(
+        "/falcon/manualclose/outcome/text",
+        json=post_params,
+    )
+    assert posted.status_code == 200
+    assert "Status: OUTCOME_RECORDED" in posted.get_data(as_text=True)
+    assert len(registry.write_calls) == 1
 
 
 def test_flask_route_missing_lifecycle_reports_required_query_parameter_first():
@@ -947,7 +980,7 @@ def test_projection_failure_leaves_registry_authoritative_and_pending_visible():
 
 def test_text_route_is_manual_get_and_never_exposes_operational_actions():
     ns, registry, _ = _harness()
-    ns["request"] = SimpleNamespace(args=_params())
+    ns["request"] = SimpleNamespace(method="GET", args=_params())
     text, status, headers = ns["falcon_manual_close_outcome_v1_text_route"]()
 
     assert status == 200

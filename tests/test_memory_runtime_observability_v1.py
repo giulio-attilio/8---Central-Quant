@@ -93,6 +93,88 @@ class MemoryRuntimeObservabilityV1Tests(unittest.TestCase):
 
         self.assertEqual(snapshot["boot_id"], "unknown")
 
+    def test_runtime_stability_snapshot_does_not_mutate_memory_history(self):
+        namespace = self._snapshot_namespace()
+        samples = []
+
+        def memory_snapshot(label, extra=None, store=True, print_log=False):
+            samples.append((label, store, print_log))
+            sample = {"usage_pct": 42.0, "rss_mb": 875.0}
+            if store:
+                namespace["MEMORY_HISTORY"].append(sample)
+            return sample
+
+        namespace.update(
+            {
+                "time": __import__("time"),
+                "CENTRAL_HEALTH": {"started_epoch": 1},
+                "CENTRAL_RUNTIME_STABILITY_V1_VERSION": "test-v1",
+                "CENTRAL_RUNTIME_EVENTS_FILE": Path("runtime-events.jsonl"),
+                "CENTRAL_RUNTIME_STATE_FILE": Path("runtime-state.json"),
+                "_runtime_stability_v1_read_events": lambda limit: [],
+                "memory_snapshot": memory_snapshot,
+            }
+        )
+        runtime_stability_snapshot = _compile_function(
+            "runtime_stability_v1_snapshot", namespace
+        )
+
+        result = runtime_stability_snapshot(hours=24)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            samples,
+            [("runtime_stability_v1_snapshot", False, False)],
+        )
+        self.assertEqual(list(namespace["MEMORY_HISTORY"]), [])
+
+    def test_central_get_does_not_store_its_memory_sample(self):
+        samples = []
+        history = []
+
+        def memory_snapshot(label, extra=None, store=True, print_log=False):
+            samples.append((label, store))
+            if store:
+                history.append(label)
+            return {"rss_mb": 100, "usage_pct": 5}
+
+        namespace = {
+            "memory_profile_step": lambda _label: None,
+            "central_watchdog_status": lambda: {
+                "ok": True,
+                "status": "OK",
+                "central_started_at": "test",
+                "reasons": [],
+            },
+            "central_exposure_snapshot": lambda: {
+                "by_bot": {},
+                "open_runners": {},
+                "best_open_runner": None,
+            },
+            "BOT_CONFIGS": {"FALCON": {}},
+            "bot_health": lambda _key, _config: {
+                "name": "Falcon",
+                "enabled": False,
+                "loaded": False,
+                "health": {},
+            },
+            "memory_snapshot": memory_snapshot,
+            "central_trade_registry_snapshot": lambda include_trades: {
+                "open_count": 0,
+                "include_trades": include_trades,
+            },
+        }
+        node = copy.deepcopy(_function_node("central"))
+        node.decorator_list = []
+        module = ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[]))
+        exec(compile(module, str(MAIN_PATH), "exec"), namespace)
+
+        result = namespace["central"]()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(samples, [("route_central_end", False)])
+        self.assertEqual(history, [])
+
     def test_monitor_sequence_is_local_and_increments_per_successful_sample(self):
         class StopMonitor(BaseException):
             pass

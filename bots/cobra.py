@@ -11,8 +11,10 @@ import json
 import time
 import threading
 import requests
+from personal_http_auth import central_personal_http_auth
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
+from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
@@ -201,12 +203,14 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
     Em falha ou ausência de URL, o padrão é fail-closed para impedir
     novas entradas fora da arquitetura da Central Quant.
     """
+    fail_closed = COBRA_CENTRAL_RISK_FAIL_CLOSED or EXECUTION_MODE == "LIVE"
     if not COBRA_CENTRAL_RISK_ENABLED:
+        live_blocked = EXECUTION_MODE == "LIVE"
         return {
-            "allowed": True,
-            "decision": "ALLOW",
+            "allowed": not live_blocked,
+            "decision": "DENY" if live_blocked else "ALLOW",
+            "reasons": ["Central Risk Manager desativado; entradas LIVE exigem aprovação central."] if live_blocked else [],
             "warnings": ["COBRA_CENTRAL_RISK_ENABLED=false"],
-            "reasons": [],
             "source": "local_disabled",
             "checked_at": data_hora_sp_str(),
         }
@@ -214,8 +218,8 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
     url = central_can_open_trade_url()
     if not url:
         return {
-            "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
-            "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "allowed": not fail_closed,
+            "decision": "ALLOW" if not fail_closed else "DENY",
             "reasons": ["CENTRAL_CAN_OPEN_TRADE_URL/CENTRAL_BASE_URL/RENDER_EXTERNAL_URL não configurado"],
             "warnings": [],
             "source": "missing_url",
@@ -238,7 +242,12 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
     }
 
     try:
-        response = requests.post(url, json=payload, timeout=COBRA_CENTRAL_RISK_TIMEOUT)
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=COBRA_CENTRAL_RISK_TIMEOUT,
+            auth=central_personal_http_auth(url),
+        )
         try:
             data = response.json()
         except Exception:
@@ -246,8 +255,8 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
 
         if response.status_code >= 400:
             return {
-                "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
-                "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+                "allowed": not fail_closed,
+                "decision": "ALLOW" if not fail_closed else "DENY",
                 "reasons": [f"HTTP {response.status_code} ao consultar Central"],
                 "warnings": [str(data)[:300]],
                 "source": "http_error",
@@ -264,8 +273,8 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
             return data
 
         return {
-            "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
-            "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "allowed": not fail_closed,
+            "decision": "ALLOW" if not fail_closed else "DENY",
             "reasons": ["Resposta inválida da Central"],
             "warnings": [str(data)[:300]],
             "source": "invalid_response",
@@ -275,8 +284,8 @@ def consultar_central_risk_manager(sinal, motivo="ENTRY"):
 
     except Exception as exc:
         return {
-            "allowed": not COBRA_CENTRAL_RISK_FAIL_CLOSED,
-            "decision": "ALLOW" if not COBRA_CENTRAL_RISK_FAIL_CLOSED else "DENY",
+            "allowed": not fail_closed,
+            "decision": "ALLOW" if not fail_closed else "DENY",
             "reasons": [f"Erro ao consultar Central: {exc}"],
             "warnings": [],
             "source": "exception",
@@ -361,6 +370,9 @@ def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
             return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso: Erro API OHLCV ({attempt+1}/{max_retries}) para {symbol}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
+                return []
             time.sleep(2 ** attempt) # Backoff exponencial: 1s, 2s, 4s...
     HEALTH["last_warning"] = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
     print(HEALTH["last_warning"])

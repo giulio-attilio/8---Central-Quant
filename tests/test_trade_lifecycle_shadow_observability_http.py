@@ -1,10 +1,12 @@
 import json
 import os
 import socket
+import base64
 from pathlib import Path
 from unittest import mock
 
 import requests
+from flask.testing import FlaskClient
 
 
 def _network_forbidden(*args, **kwargs):
@@ -18,6 +20,29 @@ _request_patch.start()
 _connection_patch.start()
 
 import main as central_main  # noqa: E402
+
+
+class _AuthenticatedLocalTestClient(FlaskClient):
+    """Supply only synthetic Basic credentials to HTTP route tests."""
+
+    def open(self, *args, **kwargs):
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault(
+            "Authorization",
+            "Basic " + base64.b64encode(b"local-test-operator:not-a-secret").decode("ascii"),
+        )
+        kwargs["headers"] = headers
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CENTRAL_PERSONAL_HTTP_USER": "local-test-operator",
+                "CENTRAL_PERSONAL_HTTP_PASSWORD": "not-a-secret",
+            },
+        ):
+            return super().open(*args, **kwargs)
+
+
+central_main.app.test_client_class = _AuthenticatedLocalTestClient
 
 
 AUTHORITIES = (
@@ -41,6 +66,27 @@ def payload(status="OK", **extra):
 def get(client, route):
     response = client.get(route)
     return response, response.get_json()
+
+
+@mock.patch.object(central_main, "build_live_report", return_value="synthetic-only")
+def test_livestatus_auth_gate_runs_before_sensitive_report_builder(provider, monkeypatch):
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "local-operator")
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
+    client = FlaskClient(central_main.app)
+
+    missing_auth = client.get("/livestatus")
+    assert missing_auth.status_code == 401
+    provider.assert_not_called()
+
+    authorization = "Basic " + base64.b64encode(
+        b"local-operator:synthetic-only-password"
+    ).decode("ascii")
+    authenticated = client.get(
+        "/livestatus", headers={"Authorization": authorization}
+    )
+    assert authenticated.status_code == 200
+    assert authenticated.get_json()["text"] == "synthetic-only"
+    provider.assert_called_once_with()
 
 
 @mock.patch.object(central_main._shadow_observability_http, "get_health")
@@ -103,8 +149,12 @@ def test_shadowevents_rejects_invalid_limit_and_unknown_or_dangerous_parameters(
         assert client.get("/shadowevents?limit=nope").status_code == 400
         for key in ("unknown", "path", "file", "filename", "offset", "persist", "repair", "replay", "reconcile", "refresh", "commit"):
             response = client.get("/shadowevents", query_string={key: "x"})
-            assert response.status_code == 400
-            assert response.get_json()["status"] == "INVALID_FILTER"
+            if key in {"persist", "commit"}:
+                assert response.status_code == 405
+                assert response.get_json()["status"] == "GET_MUTATION_REQUIRES_POST"
+            else:
+                assert response.status_code == 400
+                assert response.get_json()["status"] == "INVALID_FILTER"
     provider.assert_not_called()
 
 

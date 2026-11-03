@@ -259,6 +259,9 @@ def _load_managed_close(
         "managed_position_snapshot": managed_position_snapshot,
         "BROKER_MANAGEMENT_AMOUNT_TOLERANCE": 1e-10,
         "_rpm_live_write_enabled": lambda: live,
+        # The extracted raw-send boundary has its own factual-write guard;
+        # mirror the fixture's simulated live mode instead of leaving it undefined.
+        "_broker_factual_writes_enabled": lambda: live,
         "_rpm_validate_auth": lambda token, context: {
             "ok": auth_ok,
             "token": token,
@@ -341,6 +344,7 @@ def _load_stop_replacement(*, fake_exchange, snapshots, precision_error=None):
         "managed_position_snapshot": managed_position_snapshot,
         "fetch_last_price": lambda _symbol: 80.0,
         "_rpm_live_write_enabled": lambda: True,
+        "_broker_factual_writes_enabled": lambda: True,
         "_rpm_validate_auth": lambda *_args, **_kwargs: {"ok": True},
         "exchange": lambda: fake_exchange,
         "bingx_position_side": lambda side: str(side).upper(),
@@ -673,6 +677,40 @@ def test_replacement_requires_materially_armed_returned_stop():
     assert result["rollback_attempted"] is False
     assert len(exchange_probe.create_calls) == 1
     assert audit_events[-1]["event"] == "BROKER_STOP_REPLACE_NOT_ARMED"
+
+
+def test_replacement_stop_omits_unsupported_client_id_and_uses_exchange_order_id():
+    response = _replacement_response()
+    response.pop("clientOrderId")
+    exchange_probe = FakeExchange(response=response)
+    exchange_probe.cancel_order = lambda *_args: {
+        "id": "STOP-OLD",
+        "status": "CANCELED",
+    }
+    replace, audit_events = _load_stop_replacement(
+        fake_exchange=exchange_probe,
+        snapshots=[_safe_open_snapshot(), _safe_open_snapshot()],
+    )
+
+    result = _replace_call(replace)
+
+    assert result["status"] == "STOP_REPLACED_CANCEL_CREATE"
+    assert result["confirmed"] is True
+    assert result["new_order_id"] == "STOP-NEW"
+    assert result["replacement_confirmation"][
+        "exchange_client_order_id_supported"
+    ] is False
+    assert result["replacement_confirmation"][
+        "returned_client_order_id_consistent"
+    ] is True
+    assert result["replacement_confirmation"][
+        "returned_client_order_id_matches"
+    ] is False
+    create_params = exchange_probe.create_calls[0][-1]
+    assert "clientOrderId" not in create_params
+    assert "clientOrderID" not in create_params
+    assert "client_order_id" not in create_params
+    assert audit_events[-1]["event"] == "BROKER_STOP_REPLACED"
 
 
 def test_replacement_post_return_error_never_creates_rollback_order():

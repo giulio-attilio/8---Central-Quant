@@ -296,6 +296,7 @@ def test_preflight_storage_real_status_is_observational_and_preserves_readiness(
     registry = SimpleNamespace(
         TRADE_REGISTRY_FILE=active,
         DATA_DIR="synthetic-data-dir",
+        _lock=threading.RLock(),
         load_registry=forbidden,
         save_registry=forbidden,
     )
@@ -304,6 +305,7 @@ def test_preflight_storage_real_status_is_observational_and_preserves_readiness(
             "_frpp_v1_get_trade_registry_storage",
             "trade_registry_persistent_storage_fix_v1_status",
             "_trpsf_v1_falcon_live_entry_storage_readiness",
+            "_trpsf_v1_registry_lock",
         },
         {
             "central_trade_registry": registry,
@@ -344,6 +346,59 @@ def test_preflight_storage_real_status_is_observational_and_preserves_readiness(
     assert state == before
     assert state["last_status"] is cached_status
     assert vars(registry) == registry_before
+
+
+def test_live_entry_storage_readiness_fails_closed_without_process_lock():
+    class SyntheticFile:
+        def __str__(self):
+            return "/data/synthetic-trade-registry.json"
+
+        def exists(self):
+            return True
+
+    active = SyntheticFile()
+    state = {
+        "patched": True,
+        "migration_done": True,
+        "restart_readiness_attested": True,
+        "last_load_ok": True,
+        "last_write_ok": True,
+        "write_allowed": True,
+        "temporary_read_only": False,
+    }
+    namespace = _load_functions(
+        {"_trpsf_v1_falcon_live_entry_storage_readiness", "_trpsf_v1_registry_lock"},
+        {
+            "central_trade_registry": SimpleNamespace(_lock=None),
+            "_TRPSF_V1_STATE": state,
+            "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "synthetic-version",
+            "_trpsf_v1_active_file": lambda: active,
+        },
+    )
+
+    result = namespace["_trpsf_v1_falcon_live_entry_storage_readiness"]()
+
+    assert result["ok"] is False
+    assert result["checks"]["process_lock_available"] is False
+    assert result["read_only"] is True
+    assert result["write_executed"] is False
+
+
+def test_distributed_c3_status_is_advisory_for_single_process_personal_preflight():
+    namespace = _preflight_namespace(_valid_divergence())
+    namespace["c3_runtime_seam_v1"].c3_closed_repair_writer_coordination_status_v1 = (
+        lambda: {"enabled": False, "coordination_ready": False}
+    )
+
+    payload = _compile_preflight(namespace)
+    check = _check(payload, "TRADE_REGISTRY_C3_WRITER_COORDINATION_READY")
+
+    assert payload["ok"] is True
+    assert check["ok"] is False
+    assert check["blocking"] is False
+    assert payload["summary"]["warning_checks_failed"] == 1
+    assert payload["no_order_sent"] is True
+    assert payload["sent"] is False
 
 
 def test_preflight_storage_does_not_retry_legacy_provider_without_read_only():

@@ -1254,7 +1254,7 @@ def test_direct_falcon_consumer_invokes_containment_before_generic_rejection_and
         "ENABLE_REAL_TRADING": True,
         "BROKER_IMPORT_ERROR": None,
         "ROLE_ENTRY": "ENTRY",
-        "HEALTH": {},
+        "HEALTH": {"falcon_live_management_reconciliation_ready": True},
         "central_broker": Broker(),
         "get_positions": lambda: {},
         "falcon_initial_stop_failure_live_entry_lock_status": lambda: {"ok": True, "locked": False},
@@ -1310,16 +1310,29 @@ def test_scanner_persists_only_allowed_signals_after_the_containment_rejection_b
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "scanner_loop"
     )
-    execute_calls = [
+    process = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_falcon_process_entry_signal"
+    )
+    scanner_process_calls = [
         node
         for node in ast.walk(scanner)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_falcon_process_entry_signal"
+    ]
+    execute_calls = [
+        node
+        for node in ast.walk(process)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "execute_signal_if_allowed"
     ]
     persist_calls = [
         node
-        for node in ast.walk(scanner)
+        for node in ast.walk(process)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "falcon_persist_accepted_signal"
@@ -1329,11 +1342,12 @@ def test_scanner_persists_only_allowed_signals_after_the_containment_rejection_b
         and isinstance(node.test, ast.UnaryOp)
         and isinstance(node.test.op, ast.Not)
         and isinstance(node.test.operand, ast.Name)
-        and node.test.operand.id == "execution_allowed"
-        and any(isinstance(child, ast.Continue) for child in ast.walk(node))
-        for node in ast.walk(scanner)
+        and node.test.operand.id == "allowed"
+        and any(isinstance(child, ast.Return) for child in ast.walk(node))
+        for node in ast.walk(process)
     )
 
+    assert len(scanner_process_calls) == 1
     assert len(execute_calls) == 1
     assert len(persist_calls) == 1
     assert execute_calls[0].lineno < persist_calls[0].lineno
@@ -1556,7 +1570,7 @@ def _original_execute_signal_namespace(*, handler_marker, fallback, broker=None)
         "ENABLE_REAL_TRADING": True,
         "BROKER_IMPORT_ERROR": None,
         "ROLE_ENTRY": "ENTRY",
-        "HEALTH": {},
+        "HEALTH": {"falcon_live_management_reconciliation_ready": True},
         "central_broker": broker,
         "get_positions": lambda: {},
         "falcon_initial_stop_failure_live_entry_lock_status": lambda: {"ok": True, "locked": False},

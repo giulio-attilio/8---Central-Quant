@@ -35,6 +35,7 @@ import re
 import html
 import uuid
 import hashlib
+import hmac
 import gc
 import threading
 import requests
@@ -42,6 +43,7 @@ import importlib.util
 import ctypes
 import stat
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from memory_gc_coordinator import coordinate_memory_gc
 from registry_execution_identity import is_v2_execution_id
@@ -611,6 +613,13 @@ except Exception as e:
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from flask import Flask, request
+from runtime_drain_v1 import (
+    RUNTIME_DRAIN,
+    close_after_drain,
+    guard_live_flow,
+    install_shutdown_signal_handlers,
+    runtime_drain_blocked_result,
+)
 from execution_pipeline_status import build_execution_pipeline_text
 from execution_orchestrator import (
     execution_health,
@@ -692,6 +701,133 @@ except Exception as _memory_profiler_exc:
     MEMORY_PROFILER_ERROR = str(_memory_profiler_exc)
 
 app = Flask(__name__)
+
+
+def _central_personal_http_auth_decision(
+    *,
+    configured_username,
+    configured_password,
+    auth_type=None,
+    presented_username=None,
+    presented_password=None,
+    fetch_site=None,
+    origin=None,
+    referer=None,
+    request_host=None,
+):
+    """Fail closed on public HTTP access; credentials are supplied only by environment."""
+    site = str(fetch_site or "").strip().lower()
+    if site == "cross-site":
+        return {"allowed": False, "status": "CROSS_SITE_REQUEST_BLOCKED", "http_status": 403}
+
+    for candidate_origin in (origin, referer):
+        if not candidate_origin:
+            continue
+        try:
+            parsed_origin = urlsplit(str(candidate_origin))
+            candidate_host = parsed_origin.netloc.strip().lower()
+        except Exception:
+            candidate_host = ""
+            parsed_origin = None
+        if (
+            parsed_origin is None
+            or parsed_origin.scheme.lower() not in {"http", "https"}
+            or not candidate_host
+            or not request_host
+            or candidate_host != str(request_host).strip().lower()
+        ):
+            return {"allowed": False, "status": "CROSS_SITE_REQUEST_BLOCKED", "http_status": 403}
+
+    expected_username = str(configured_username or "")
+    expected_password = str(configured_password or "")
+    if not expected_username or not expected_password:
+        return {"allowed": False, "status": "PRIVATE_HTTP_AUTH_NOT_CONFIGURED", "http_status": 503}
+
+    if str(auth_type or "").strip().lower() != "basic":
+        return {"allowed": False, "status": "PRIVATE_HTTP_AUTH_REQUIRED", "http_status": 401}
+
+    username_matches = hmac.compare_digest(
+        expected_username.encode("utf-8"), str(presented_username or "").encode("utf-8")
+    )
+    password_matches = hmac.compare_digest(
+        expected_password.encode("utf-8"), str(presented_password or "").encode("utf-8")
+    )
+    if not (username_matches and password_matches):
+        return {"allowed": False, "status": "PRIVATE_HTTP_AUTH_REQUIRED", "http_status": 401}
+
+    return {"allowed": True, "status": "AUTHORIZED", "http_status": 200}
+
+
+@app.before_request
+def central_personal_http_auth_before_request():
+    # Apply before every route, including aliases and unknown paths, so a
+    # legacy URL or alternate report cannot bypass this personal-service gate.
+    auth = request.authorization
+    decision = _central_personal_http_auth_decision(
+        configured_username=os.environ.get("CENTRAL_PERSONAL_HTTP_USER"),
+        configured_password=os.environ.get("CENTRAL_PERSONAL_HTTP_PASSWORD"),
+        auth_type=getattr(auth, "type", None),
+        presented_username=getattr(auth, "username", None),
+        presented_password=getattr(auth, "password", None),
+        fetch_site=request.headers.get("Sec-Fetch-Site"),
+        origin=request.headers.get("Origin"),
+        referer=request.headers.get("Referer"),
+        request_host=request.host,
+    )
+    # Render's optional HTTP health probe cannot supply Basic credentials.
+    # Exempt only the body-free liveness route, with no query parameters; keep
+    # cross-site/origin failures above this check and all other routes private.
+    if (
+        request.method == "GET"
+        and request.path == "/healthz"
+        and not request.args
+        and decision.get("status")
+        in {"PRIVATE_HTTP_AUTH_NOT_CONFIGURED", "PRIVATE_HTTP_AUTH_REQUIRED"}
+    ):
+        return None
+    if decision.get("allowed"):
+        return None
+
+    response = app.response_class(
+        response=json.dumps({"ok": False, "status": decision["status"]}),
+        status=decision["http_status"],
+        mimetype="application/json",
+    )
+    if decision["http_status"] == 401:
+        response.headers["WWW-Authenticate"] = 'Basic realm="Central Quant", charset="UTF-8"'
+    return response
+
+
+@app.before_request
+def central_personal_http_mutation_method_before_request():
+    # Authenticated GETs must still be unable to trigger writes, releases,
+    # notifications, or execution intent via query-string flags.
+    from personal_http_auth import central_personal_http_get_mutation_block
+
+    blocked = central_personal_http_get_mutation_block(
+        request.method,
+        request.path,
+        request.args,
+    )
+    if blocked is None:
+        return None
+    return app.response_class(
+        response=json.dumps(blocked),
+        status=405,
+        mimetype="application/json",
+    )
+
+
+@app.route("/healthz", methods=["GET"])
+def render_healthz_v1():
+    """Minimal public liveness for Render; this is not trading readiness."""
+    try:
+        draining = bool(RUNTIME_DRAIN.is_draining())
+    except Exception:
+        return {"ok": False, "status": "HTTP_HEALTH_UNAVAILABLE"}, 503
+    if draining:
+        return {"ok": False, "status": "HTTP_DRAINING"}, 503
+    return {"ok": True, "status": "HTTP_LIVE"}, 200
 
 # ==========================================================
 # TRADE LIFECYCLE SHADOW OBSERVABILITY V1 — HTTP READ-ONLY
@@ -952,8 +1088,8 @@ def memory_stabilizer_after_request(response):
     return response
 
 
-@app.route("/memory/stabilizer", methods=["GET"])
-@app.route("/memorystabilizer", methods=["GET"])
+@app.route("/memory/stabilizer", methods=["GET", "POST"])
+@app.route("/memorystabilizer", methods=["GET", "POST"])
 def memory_stabilizer_route():
     try:
         force = str(request.args.get("gc", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
@@ -1420,6 +1556,41 @@ def _ee_auth_resolver_v1_patch_execution_engine_module():
 
 
 EXECUTION_ENGINE_AUTH_RESOLVER_V1_ENGINE_PATCH = _ee_auth_resolver_v1_patch_execution_engine_module()
+
+
+def _main_live_engine_flow_enabled(payload=None, mode=None, dry_run=True, *args, **kwargs):
+    payload_dict = payload if isinstance(payload, dict) else {}
+    mode_norm = str(
+        mode
+        or payload_dict.get("mode")
+        or payload_dict.get("execution_mode")
+        or ""
+    ).upper().strip()
+    if mode_norm != "LIVE" or _fleag_v1_bool(dry_run, default=True):
+        return False
+    try:
+        if callable(globals().get("_risk_is_reduce_only")) and _risk_is_reduce_only(payload_dict):
+            return False
+        elif _fleag_v1_bool(payload_dict.get("reduce_only"), default=False):
+            return False
+    except Exception:
+        raise RuntimeError("Could not classify live engine flow as entry or reduce-only")
+    checker = getattr(central_broker, "is_real_live_send_enabled", None)
+    if not callable(checker):
+        raise RuntimeError("Central broker live-send state is unavailable")
+    return checker() is True
+
+
+def _main_live_engine_runtime_drain_result(args, kwargs):
+    payload = kwargs.get("payload")
+    if payload is None and args and isinstance(args[0], dict):
+        payload = args[0]
+    payload = dict(payload) if isinstance(payload, dict) else {}
+    blocked = runtime_drain_blocked_result()
+    blocked["mode"] = "LIVE"
+    blocked["dry_run"] = False
+    blocked["payload"] = dict(blocked)
+    return blocked
 
 
 def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
@@ -1942,7 +2113,7 @@ def runtime_stability_v1_snapshot(hours=24):
                     usage_values.append(float(snap.get("usage_pct")))
             except Exception:
                 pass
-        current_memory = memory_snapshot("runtime_stability_v1_snapshot", store=True) if "memory_snapshot" in globals() else {}
+        current_memory = memory_snapshot("runtime_stability_v1_snapshot", store=False) if "memory_snapshot" in globals() else {}
         try:
             usage_values.append(float(current_memory.get("usage_pct")))
         except Exception:
@@ -2386,23 +2557,22 @@ def acquire_runtime_file_lock(lock_name: str):
     Importante: mantemos o file handle aberto em CENTRAL_PROCESS_LOCK_HANDLES.
     Se fechar, o lock é liberado pelo sistema operacional.
     """
+    fh = None
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(lock_name or "runtime"))
     try:
-        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(lock_name or "runtime"))
+        if safe_name in CENTRAL_PROCESS_LOCK_HANDLES:
+            print(f"LOCK ATIVO - {safe_name}: este processo já mantém a liderança")
+            return False
+        if fcntl is None:
+            print(f"ERRO LOCK {safe_name}: flock indisponível; liderança negada")
+            return False
         lock_path = CENTRAL_DATA_DIR / f"{safe_name}.lock"
         lock_path.parent.mkdir(exist_ok=True)
-        fh = open(lock_path, "w", encoding="utf-8")
-
-        if fcntl is not None:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                print(f"LOCK ATIVO - {safe_name}: outro processo já é líder")
-                try:
-                    fh.close()
-                except Exception:
-                    pass
-                return False
-
+        # Do not truncate another process's metadata before flock decides
+        # whether this process acquired the lock. The winner truncates only
+        # after the exclusive lock is held.
+        fh = open(lock_path, "a+", encoding="utf-8")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         fh.seek(0)
         fh.truncate()
         fh.write(json.dumps({
@@ -2416,10 +2586,16 @@ def acquire_runtime_file_lock(lock_name: str):
         CENTRAL_PROCESS_LOCK_HANDLES[safe_name] = fh
         print(f"LOCK OK - {safe_name}: pid={os.getpid()}")
         return True
+    except BlockingIOError:
+        print(f"LOCK ATIVO - {safe_name}: outro processo já é líder")
     except Exception as exc:
-        # Fallback conservador: se não conseguir travar, deixa rodar para não derrubar a Central.
-        print(f"ERRO LOCK {lock_name}: {exc}")
-        return True
+        print(f"ERRO LOCK {safe_name}: {exc}; liderança negada")
+    try:
+        if fh is not None:
+            fh.close()
+    except Exception:
+        pass
+    return False
 
 
 def _set_env_temporarily(mapping):
@@ -3441,8 +3617,8 @@ def executive_policy_route():
 
 
 
-@app.route("/policyautorelease", methods=["GET"])
-@app.route("/executive/policy/auto_release", methods=["GET"])
+@app.route("/policyautorelease", methods=["POST"])
+@app.route("/executive/policy/auto_release", methods=["POST"])
 def policy_auto_release_route():
     """
     Executa uma rodada segura do Executive Policy Auto Release.
@@ -3482,8 +3658,8 @@ def policy_auto_release_health_route():
 
 
 
-@app.route("/policypriority", methods=["GET"])
-@app.route("/executive/policy/priority", methods=["GET"])
+@app.route("/policypriority", methods=["POST"])
+@app.route("/executive/policy/priority", methods=["POST"])
 def policy_priority_route():
     """
     Executa uma rodada do Executive Policy Priority V1.
@@ -3826,7 +4002,7 @@ def real_pnl_r_health_route():
         }, 500
 
 
-@app.route("/realpnlr", methods=["GET"])
+@app.route("/realpnlr", methods=["GET", "POST"])
 def real_pnl_r_dashboard_route():
     """
     Dashboard JSON do Real PnL/R Mapper V2.4.
@@ -3841,7 +4017,14 @@ def real_pnl_r_dashboard_route():
                 "error": REAL_PNL_R_MAPPER_IMPORT_ERROR,
             }, 500
 
-        commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+        if not isinstance(body, dict):
+            body = {}
+        commit_value = body.get("commit", request.args.get("commit", "false")) if request.method == "POST" else request.args.get("commit", "false")
+        commit_requested = str(commit_value or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+        if request.method != "POST" and commit_requested:
+            return {"ok": False, "status": "POST_REQUIRED_FOR_REAL_PNL_SNAPSHOT", "committed": False, "write_executed": False}, 405
+        commit = commit_requested if request.method == "POST" else False
         try:
             limit = _request_limit(default=REAL_PNL_R_DEFAULT_LIMIT, max_value=REAL_PNL_R_MAX_LIMIT)
         except Exception:
@@ -3857,7 +4040,7 @@ def real_pnl_r_dashboard_route():
         }, 500
 
 
-@app.route("/realpnlr/text", methods=["GET"])
+@app.route("/realpnlr/text", methods=["GET", "POST"])
 def real_pnl_r_text_route():
     """
     Relatório textual do Real PnL/R Mapper V2.4.
@@ -3868,7 +4051,14 @@ def real_pnl_r_text_route():
             text = "❌ Real PnL/R Mapper indisponível: " + str(REAL_PNL_R_MAPPER_IMPORT_ERROR)
             return {"ok": False, "text": text}, 500
 
-        commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+        body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+        if not isinstance(body, dict):
+            body = {}
+        commit_value = body.get("commit", request.args.get("commit", "false")) if request.method == "POST" else request.args.get("commit", "false")
+        commit_requested = str(commit_value or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+        if request.method != "POST" and commit_requested:
+            return {"ok": False, "status": "POST_REQUIRED_FOR_REAL_PNL_SNAPSHOT", "committed": False, "write_executed": False}, 405
+        commit = commit_requested if request.method == "POST" else False
         try:
             limit = _request_limit(default=REAL_PNL_R_DEFAULT_LIMIT, max_value=REAL_PNL_R_MAX_LIMIT)
         except Exception:
@@ -4088,10 +4278,17 @@ def adaptive_weights_health_route():
     return adaptive_weights_health()
 
 
-@app.route("/adaptive/build")
-@app.route("/adaptive_weights/build")
+@app.route("/adaptive/build", methods=["GET", "POST"])
+@app.route("/adaptive_weights/build", methods=["GET", "POST"])
 def adaptive_weights_build_route():
-    commit = str(request.args.get("commit", "true")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    if not isinstance(body, dict):
+        body = {}
+    commit_value = body.get("commit", request.args.get("commit", "false")) if request.method == "POST" else request.args.get("commit", "false")
+    commit_requested = str(commit_value or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
+    if request.method != "POST" and commit_requested:
+        return {"ok": False, "status": "POST_REQUIRED_FOR_ADAPTIVE_WEIGHTS_COMMIT", "committed": False, "write_executed": False}, 405
+    commit = commit_requested if request.method == "POST" else False
     return build_adaptive_weights(commit=commit)
 
 
@@ -4120,10 +4317,13 @@ def outcome_evaluator_health_route():
     return outcome_evaluator_health()
 
 
-@app.route("/outcome/evaluate")
-@app.route("/outcome_evaluator/evaluate")
+@app.route("/outcome/evaluate", methods=["POST"])
+@app.route("/outcome_evaluator/evaluate", methods=["POST"])
 def outcome_evaluator_evaluate_route():
-    force = str(request.args.get("force", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    force = str(body.get("force", "false")).strip().lower() in {"1", "true", "yes", "sim", "on"}
     return evaluate_closed_paper_trades(force=force)
 
 
@@ -4156,8 +4356,8 @@ def paper_lifecycle_positions_route():
     return get_paper_lifecycle_positions(status=status)
 
 
-@app.route("/paper_lifecycle/update", methods=["GET", "POST"])
-@app.route("/paper/lifecycle/update", methods=["GET", "POST"])
+@app.route("/paper_lifecycle/update", methods=["POST"])
+@app.route("/paper/lifecycle/update", methods=["POST"])
 def paper_lifecycle_update_route():
     payload = request.get_json(silent=True) or {}
 
@@ -4187,14 +4387,14 @@ def paper_lifecycle_log_route():
     return read_paper_lifecycle_log(limit=limit)
 
 
-@app.route("/paper_lifecycle/test_tp50")
-@app.route("/paper/lifecycle/test_tp50")
+@app.route("/paper_lifecycle/test_tp50", methods=["POST"])
+@app.route("/paper/lifecycle/test_tp50", methods=["POST"])
 def paper_lifecycle_test_tp50_route():
     return paper_lifecycle_test_tp50()
 
 
-@app.route("/paper_lifecycle/test_close")
-@app.route("/paper/lifecycle/test_close")
+@app.route("/paper_lifecycle/test_close", methods=["POST"])
+@app.route("/paper/lifecycle/test_close", methods=["POST"])
 def paper_lifecycle_test_close_route():
     return paper_lifecycle_test_close()
 
@@ -4207,10 +4407,10 @@ def execution_engine_health_route():
     return execution_engine_health()
 
 
-@app.route("/executionenginerun", methods=["GET", "POST"])
-@app.route("/executionrun", methods=["GET", "POST"])
-@app.route("/execution_engine/run", methods=["GET", "POST"])
-@app.route("/execution/engine/run", methods=["GET", "POST"])
+@app.route("/executionenginerun", methods=["POST"])
+@app.route("/executionrun", methods=["POST"])
+@app.route("/execution_engine/run", methods=["POST"])
+@app.route("/execution/engine/run", methods=["POST"])
 def execution_engine_run_route():
     if request.method == "POST":
         payload = request.get_json(silent=True) or {}
@@ -4296,10 +4496,10 @@ def execution_engine_run_route():
     return engine_result
 
 
-@app.route("/executionverify", methods=["GET", "POST"])
-@app.route("/executionengineverify", methods=["GET", "POST"])
-@app.route("/execution/verify", methods=["GET", "POST"])
-@app.route("/execution/engine/verify", methods=["GET", "POST"])
+@app.route("/executionverify", methods=["POST"])
+@app.route("/executionengineverify", methods=["POST"])
+@app.route("/execution/verify", methods=["POST"])
+@app.route("/execution/engine/verify", methods=["POST"])
 def execution_engine_verify_route():
     """
     Verificação completa do fluxo LIVE em dry-run.
@@ -6160,18 +6360,22 @@ def _dsf_v1_attempt_broker_stop_order(
     }
 
 
-def build_disaster_stop_fallback_v1(symbol=None, side=None, bot=None, setup=None, sl=None, commit=False, ack=None, source_result=None, safety_before=None, auto=False):
+def build_disaster_stop_fallback_v1(symbol=None, side=None, bot=None, setup=None, sl=None, commit=None, ack=None, source_result=None, safety_before=None, auto=False):
     symbol_norm = _dsf_v1_norm_symbol(symbol or (request.args.get("symbol") if "request" in globals() else None) or "BTCUSDT")
     side_norm = _dsf_v1_norm_side(side or (request.args.get("side") if "request" in globals() else None) or "SHORT")
     bot = bot or (request.args.get("bot") if "request" in globals() else None) or "FALCON"
     setup = setup or (request.args.get("setup") if "request" in globals() else None) or bot
-    commit = bool(commit)
-    if not commit:
+    if commit is None:
         try:
             commit = str(request.args.get("commit") or "").strip().lower() in {"1", "true", "yes", "sim", "on"}
         except Exception:
             commit = False
-    ack = ack or (request.args.get("ack") if "request" in globals() else None)
+    commit = bool(commit)
+    if ack is None:
+        try:
+            ack = request.args.get("ack")
+        except Exception:
+            ack = None
 
     safety = safety_before if isinstance(safety_before, dict) else None
     if safety is None:
@@ -6312,8 +6516,14 @@ def build_disaster_stop_fallback_v1(symbol=None, side=None, bot=None, setup=None
             "Com lock ativo, proteja manualmente na BingX ou feche/reduza a posição antes de nova execução real.",
         ],
     }
-    _dsf_v1_atomic_write_json(DISASTER_STOP_FALLBACK_V1_LATEST_FILE, payload)
-    _dsf_v1_append_event({"event": "DISASTER_STOP_FALLBACK", **payload})
+    from disaster_stop_fallback_route_v1 import persist_disaster_stop_fallback_result_v1
+    persist_disaster_stop_fallback_result_v1(
+        payload,
+        commit=commit,
+        latest_file=DISASTER_STOP_FALLBACK_V1_LATEST_FILE,
+        atomic_write_json=_dsf_v1_atomic_write_json,
+        append_event=_dsf_v1_append_event,
+    )
     return payload
 
 
@@ -6370,31 +6580,27 @@ def disaster_stop_fallback_v1_health_route():
         "routes": [
             "/disasterstopfallback/health",
             "/disasterstopfallback?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON",
-            "/disasterstopfallback?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&sl=66750.9&commit=true&ack=DISASTER_STOP_FALLBACK",
+            "POST /disasterstopfallback (requires execution-auth header and explicit JSON body commit/ack)",
         ],
         "notes": [
             "Health não envia ordem.",
-            "Fallback com commit=true tenta criar stop reduce-only se houver posição aberta sem stop confirmado.",
+            "GET é somente preview; commit exige POST autenticado e confirmação JSON. Fallback tenta criar stop reduce-only apenas se houver posição aberta sem stop confirmado.",
             "Lock ativo bloqueia nova execução real até proteção manual/automática ficar confirmada.",
         ],
     }
 
 
-@app.route("/disasterstopfallback", methods=["GET"])
-@app.route("/disasterstop", methods=["GET"])
+@app.route("/disasterstopfallback", methods=["GET", "POST"])
+@app.route("/disasterstop", methods=["GET", "POST"])
 def disaster_stop_fallback_v1_route():
-    return build_disaster_stop_fallback_v1(
-        symbol=request.args.get("symbol"),
-        side=request.args.get("side"),
-        bot=request.args.get("bot"),
-        setup=request.args.get("setup"),
-        sl=request.args.get("sl") or request.args.get("stop") or request.args.get("stop_loss"),
-        commit=str(request.args.get("commit") or "").strip().lower() in {"1", "true", "yes", "sim", "on"},
-        ack=request.args.get("ack"),
-        source_result=None,
-        safety_before=None,
-        auto=False,
-    )
+    from disaster_stop_fallback_route_v1 import dispatch_disaster_stop_fallback_route_v1
+    return dispatch_disaster_stop_fallback_route_v1(request, build_disaster_stop_fallback_v1, globals().get("_rtlm_v15_admin_auth"))
+# C3 writer source-anchor line positions below are deliberately unchanged.
+# Keep HTTP dispatch details in disaster_stop_fallback_route_v1.py.
+# This boundary remains GET-preview / authenticated-POST only.
+# These comments do not participate in any runtime control path.
+# Re-audit the C3 writer anchors whenever main.py is edited again.
+# Do not treat matching line anchors as production readiness.
 
 
 
@@ -10457,7 +10663,7 @@ def registry_persistence_v12_closed_recovery_route():
     )
     result["routes"] = [
         "/registryclosedrecovery?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&entry=63572.3&qty=0.0001&sl=66750.9&tp50=60393.7&last_mark_price=63811.3&last_unrealized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true&ack=RESTORE_CLOSED_TRADE_MANUAL",
-        "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+        "POST /tradecloseoutcome (JSON symbol=BTCUSDT, side=SHORT, bot=FALCON, setup=FALCON, commit=true)",
     ]
     result["write_executed"] = False
     return result, 200, headers
@@ -11390,26 +11596,35 @@ def trade_close_outcome_v1_gate_check():
         "evaluated_count": status.get("evaluated_count"),
         "unevaluated_count": unevaluated_count,
         "unevaluated": status.get("unevaluated"),
-        "recommended_route": "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
+        "recommended_route": "POST /tradecloseoutcome (JSON symbol=BTCUSDT, side=SHORT, bot=FALCON, setup=FALCON, commit=true)",
     }
 
 
-@app.route("/tradecloseoutcome", methods=["GET"])
-@app.route("/tradecloseoutcomev1", methods=["GET"])
-@app.route("/trade/close/outcome", methods=["GET"])
+@app.route("/tradecloseoutcome", methods=["GET", "POST"])
+@app.route("/tradecloseoutcomev1", methods=["GET", "POST"])
+@app.route("/trade/close/outcome", methods=["GET", "POST"])
 def trade_close_outcome_v1_route():
-    symbol = request.args.get("symbol") or "BTCUSDT"
-    side = request.args.get("side") or "SHORT"
-    bot = request.args.get("bot") or "FALCON"
-    setup = request.args.get("setup") or bot
-    trade_id = request.args.get("trade_id")
-    exit_price = request.args.get("exit_price") or request.args.get("exit") or request.args.get("close_price")
-    realized_pnl = request.args.get("realized_pnl") or request.args.get("pnl") or request.args.get("pnl_usdt")
-    fee = request.args.get("fee") or request.args.get("fees")
-    close_reason = request.args.get("close_reason") or request.args.get("reason")
-    commit = _tco_v1_bool(request.args.get("commit") or request.args.get("save"), False)
+    params = dict(request.args.items())
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict):
+            params.update(body)
+    symbol = params.get("symbol") or "BTCUSDT"
+    side = params.get("side") or "SHORT"
+    bot = params.get("bot") or "FALCON"
+    setup = params.get("setup") or bot
+    trade_id = params.get("trade_id")
+    exit_price = params.get("exit_price") or params.get("exit") or params.get("close_price")
+    realized_pnl = params.get("realized_pnl") or params.get("pnl") or params.get("pnl_usdt")
+    fee = params.get("fee") or params.get("fees")
+    close_reason = params.get("close_reason") or params.get("reason")
+    commit = (
+        _tco_v1_bool(params.get("commit") or params.get("save"), False)
+        if request.method == "POST"
+        else False
+    )
     expected_identity = {
-        key: request.args.get(key)
+        key: params.get(key)
         for key in (
             "lifecycle_id",
             "trade_lifecycle_id",
@@ -11426,7 +11641,7 @@ def trade_close_outcome_v1_route():
             "registry_mode",
             "execution_mode",
         )
-        if request.args.get(key) not in (None, "")
+        if params.get(key) not in (None, "")
     }
     return trade_close_outcome_v1_build(
         symbol=symbol,
@@ -11475,9 +11690,9 @@ def trade_close_outcome_v1_health_route():
             "O Final Gate bloqueia nova execução real enquanto houver trade fechado sem outcome.",
         ],
         "routes": [
-            "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON",
-            "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true",
-            "/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&exit_price=63811.3&realized_pnl=-0.0239&close_reason=MANUAL_CLOSE&commit=true",
+            "GET /tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON (preview only)",
+            "POST /tradecloseoutcome (JSON symbol=BTCUSDT, side=SHORT, bot=FALCON, setup=FALCON, commit=true)",
+            "POST /tradecloseoutcome (JSON exit_price=63811.3, realized_pnl=-0.0239, close_reason=MANUAL_CLOSE, commit=true)",
             "/tradecloseoutcome/health",
         ],
     }
@@ -11873,9 +12088,11 @@ def registry_mode_segregation_v1_analyze(commit=False, include_trades=True, sour
             "commit": commit_result,
             "routes": [
                 "/registrymodesegregation/health",
-                "/registrymodesegregation?commit=true",
+                "GET /registrymodesegregation (preview)",
+                "POST /registrymodesegregation (JSON commit=true)",
                 "/registrymode/health",
-                "/registrymode?commit=true",
+                "GET /registrymode (preview)",
+                "POST /registrymode (JSON commit=true)",
             ],
         }
         if include_trades:
@@ -11914,7 +12131,7 @@ def registry_mode_segregation_v1_gate_check(current_payload=None):
         "unknown_open_count": unknown_open_count,
         "open_by_mode": summary.get("open_by_mode"),
         "rule": "Final Gate ignora PAPER/VERIFY/SYNC_ONLY e bloqueia UNKNOWN por segurança.",
-        "recommended_route": "/registrymodesegregation?commit=true",
+        "recommended_route": "POST /registrymodesegregation (JSON commit=true)",
     }
 
 
@@ -11970,10 +12187,24 @@ def trade_close_outcome_v1_gate_check():
     }
 
 
-@app.route("/registrymodesegregation", methods=["GET"])
-@app.route("/registrymode", methods=["GET"])
+@app.route("/registrymodesegregation", methods=["GET", "POST"])
+@app.route("/registrymode", methods=["GET", "POST"])
 def registry_mode_segregation_v1_route():
-    commit = str(request.args.get("commit") or "").lower() in ("1", "true", "yes", "sim")
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    if not isinstance(body, dict):
+        body = {}
+    commit_requested = str(
+        body.get("commit", request.args.get("commit") if request.method == "POST" else "") or ""
+    ).lower() in ("1", "true", "yes", "sim")
+    if request.method != "POST" and str(request.args.get("commit") or "").lower() in ("1", "true", "yes", "sim"):
+        return {
+            "ok": False,
+            "status": "POST_REQUIRED_FOR_REGISTRY_MODE_COMMIT",
+            "committed": False,
+            "write_executed": False,
+            "required_method": "POST",
+        }, 405
+    commit = commit_requested if request.method == "POST" else False
     return registry_mode_segregation_v1_analyze(commit=commit, include_trades=True, source="route")
 
 
@@ -11987,7 +12218,7 @@ def registry_mode_segregation_v1_health_route():
         "V1.2 respeita registry_mode explícito e classifica CLOSED Predator como PAPER somente sem qualquer prova broker/REAL.",
         "Final Gate deve ignorar PAPER/VERIFY/SYNC_ONLY para execução real.",
         "UNKNOWN bloqueia por segurança até classificação ou correção do Registry.",
-        "Use commit=true para gravar registry_mode em cada trade.",
+        "GET é somente preview; para gravar registry_mode, use POST JSON com commit=true.",
     ]
     return payload
 
@@ -12851,9 +13082,9 @@ def execution_console_route():
             confirm_ok if is_execute else True,
             {
                 "required_for_execute": True,
-                "required_value": required_phrase,
                 "received_ok": confirm_ok,
                 "mode": action_context,
+                "confirmation_value_exposed": False,
             },
             blocking=True,
         )
@@ -13320,9 +13551,8 @@ def execution_console_route():
                         "status": "CONFIRMATION_REQUIRED",
                         "sent": False,
                         "reason": "Confirmação inválida ou ausente.",
-                        "required_confirmation_value": required_phrase,
-                        "received_confirmation": confirm,
-                        "received_confirmation_raw": str(confirm_raw or ""),
+                        "required_confirmation_field": "execution_confirm",
+                        "confirmation_received": bool(confirm),
                     }
                     status_code = 400
                     message = "Execução real bloqueada: confirmação inválida."
@@ -13774,8 +14004,8 @@ def execution_console_route():
       </div>
       <div>
         <label>Confirmação para execução real</label>
-        <input name="execution_confirm" value="" placeholder="Digite exatamente EXECUTE_REAL_TRADE">
-        <small>O botão vermelho só funciona se este campo for preenchido exatamente com EXECUTE_REAL_TRADE.</small>
+        <input name="execution_confirm" value="" placeholder="Digite a frase configurada">
+        <small>O botão vermelho só funciona se este campo corresponder à frase configurada fora desta página.</small>
       </div>
       <div>
         <label>Posição real existente</label>
@@ -13835,13 +14065,13 @@ def execution_console_route():
     <p><a style="color:#93c5fd" href="/postexecutionsafety?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT" target="_blank">/postexecutionsafety BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/realtradelifecycle/BTCUSDT/SHORT?bot=FALCON&setup=FALCON" target="_blank">/realtradelifecycle BTC SHORT</a></p>
     <p><a style="color:#93c5fd" href="/registrypersistence?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/registrypersistence BTC SHORT persist snapshot</a></p>
-    <p><a style="color:#93c5fd" href="/registrymodesegregation?commit=true" target="_blank">/registrymodesegregation commit classifications</a></p>
+    <p class="info">GET /registrymodesegregation é somente preview. Para gravar classificações, use POST JSON autenticado com commit=true.</p>
     <p><a style="color:#93c5fd" href="/executionfinalgate/health" target="_blank">/executionfinalgate/health final gate route</a></p>
-    <p><a style="color:#93c5fd" href="/tradecloseoutcome?symbol=BTCUSDT&side=SHORT&bot=FALCON&setup=FALCON&commit=true" target="_blank">/tradecloseoutcome BTC SHORT evaluate closed trade</a></p>
+    <p class="info">GET /tradecloseoutcome é somente preview. O commit de reconciliação exige POST JSON autenticado.</p>
     <p><a style="color:#93c5fd" href="/lifecyclemonitor/BTCUSDT/SHORT?bot=FALCON&setup=FALCON&commit=true" target="_blank">/lifecyclemonitor BTC SHORT commit snapshot</a></p>
     <p><a style="color:#93c5fd" href="/positioncheck/BTCUSDT/SHORT" target="_blank">/positioncheck/BTCUSDT/SHORT</a></p>
     <p><a style="color:#93c5fd" href="/executionverify/BTCUSDT/SHORT" target="_blank">/executionverify/BTCUSDT/SHORT</a></p>
-    <p><a style="color:#93c5fd" href="/executionverify?bot=FALCON&setup=FALCON&symbol=BTCUSDT&side=SHORT&entry=108000&sl=109000&tp50=107000" target="_blank">/executionverify BTC SHORT</a></p>
+    <p class="info">Preview dry-run: envie um POST JSON para <code>/executionverify</code>. Esta rota não aceita link GET.</p>
   </div>
 </body>
 </html>
@@ -13883,20 +14113,9 @@ def execution_engine_live_route():
             "sent": False,
             "message": "Esta rota nunca executa ordem real via GET. Use POST com confirmação explícita.",
             "required_confirmation_field": "confirm",
-            "required_confirmation_value": required_phrase,
-            "example_json": {
-                "confirm": required_phrase,
-                "bot": "FALCON",
-                "setup": "FALCON",
-                "symbol": "BTCUSDT",
-                "side": "SHORT",
-                "entry": 108000,
-                "sl": 109000,
-                "tp50": 107000,
-                "risk_pct": 2.0
-            },
             "notes": [
-                "Use /executionverify para preview.",
+                "O valor de confirmação deve ser obtido por canal privado; esta resposta não o revela.",
+                "Para preview dry-run, envie POST JSON para /executionverify.",
                 "Use /executionlive somente para uma execução real deliberada.",
             ],
         }, 405
@@ -13920,11 +14139,10 @@ def execution_engine_live_route():
             "sent": False,
             "reason": "Confirmação explícita ausente ou inválida.",
             "required_confirmation_field": "confirm",
-            "required_confirmation_value": required_phrase,
-            "received_confirmation": confirm,
+            "confirmation_received": bool(confirm),
             "notes": [
                 "Nenhuma chamada a run_execution_engine foi feita.",
-                "Para preview use /executionverify.",
+                "Para preview dry-run, envie POST JSON para /executionverify.",
             ],
         }, 400
 
@@ -15176,31 +15394,35 @@ def trade_registry_autosync_status_route():
 @app.route("/traderegistry/sync", methods=["GET", "POST"])
 @app.route("/trade_registry/sync", methods=["GET", "POST"])
 @app.route("/trades/sync", methods=["GET", "POST"])
-@app.route("/traderegistry/sync/confirm", methods=["GET", "POST"])
-@app.route("/trade_registry/sync/confirm", methods=["GET", "POST"])
-@app.route("/trades/sync/confirm", methods=["GET", "POST"])
+@app.route("/traderegistry/sync/confirm", methods=["POST"])
+@app.route("/trade_registry/sync/confirm", methods=["POST"])
+@app.route("/trades/sync/confirm", methods=["POST"])
 def trade_registry_sync_route():
-    payload = request.get_json(silent=True) or {}
-    confirm_raw = payload.get("confirm", request.args.get("confirm", ""))
+    payload = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    confirm_raw = (
+        payload.get("confirm", request.args.get("confirm", ""))
+        if request.method == "POST"
+        else ""
+    )
 
-    # Permite confirmação simples pelo navegador:
-    # /traderegistry/sync?confirm=1
-    # /traderegistry/sync/confirm
-    path_confirm = str(request.path or "").rstrip("/").endswith("/confirm")
+    # GET is always a preview, even if a caller supplies a query string or
+    # JSON body. Confirmation is accepted only through POST.
+    path_confirm = (
+        request.method == "POST"
+        and str(request.path or "").rstrip("/").endswith("/confirm")
+    )
     confirm = bool(
         path_confirm
         or confirm_raw is True
         or str(confirm_raw).strip().upper() in {"1", "TRUE", "YES", "SIM", "ON", "SYNC", "CONFIRM"}
     )
 
-    # Antes exigia POST para gravar. Agora GET com confirm=1 ou /confirm também grava,
-    # para administração direta pelo navegador, mantendo GET sem confirmação como dry-run.
     commit = bool(confirm)
     result = sync_trade_registry_from_open_positions(commit=commit)
     if commit:
-        result["note"] = "Importação confirmada. GET sem confirm continua fazendo apenas prévia/dry-run."
+        result["note"] = "Importação confirmada por POST. GET continua fazendo apenas prévia/dry-run."
     else:
-        result["note"] = "GET faz prévia/dry-run. Para importar pelo navegador, use /traderegistry/sync?confirm=1 ou /traderegistry/sync/confirm."
+        result["note"] = "GET faz prévia/dry-run. Para importar, envie POST com confirmação explícita."
     return result
 
 
@@ -15589,7 +15811,7 @@ def central():
     enabled = [k for k, v in resumo.items() if v.get("enabled")]
     loaded = [k for k, v in resumo.items() if v.get("loaded")]
     alerts = [k for k, v in resumo.items() if v.get("enabled") and not v.get("ok")]
-    mem = memory_snapshot("route_central_end", store=True)
+    mem = memory_snapshot("route_central_end", store=False)
 
     return {
         "ok": status.get("ok"),
@@ -18038,37 +18260,58 @@ def build_bingx_divergence_status_line():
 
 def bingx_divergence_payload():
     try:
-        txt = build_sync_report()
-
-        only_bingx = []
-        only_central = []
-
-        current_section = None
-
-        for line in txt.splitlines():
-            clean = line.strip()
-
-            if clean.startswith("⚠️ Só na BingX"):
-                current_section = "only_bingx"
-                continue
-
-            if clean.startswith("⚠️ Só na Central"):
-                current_section = "only_central"
-                continue
-
-            if clean.startswith("- "):
-                item = clean.replace("- ", "", 1).strip()
-
-                if current_section == "only_bingx":
-                    only_bingx.append(item)
-                elif current_section == "only_central":
-                    only_central.append(item)
-
+        builder = globals().get("_mpa_v1_build_payload")
+        if not callable(builder):
+            raise RuntimeError("LIVE_POSITION_RECONCILIATION_UNAVAILABLE")
+        awareness = builder(persist=False)
+        if not isinstance(awareness, dict):
+            raise RuntimeError("LIVE_POSITION_RECONCILIATION_INVALID")
+        summary = awareness.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
+        only_bingx = awareness.get("manual_or_external_positions")
+        only_bingx = only_bingx if isinstance(only_bingx, list) else []
+        only_central = awareness.get("central_only_positions")
+        only_central = only_central if isinstance(only_central, list) else []
+        broker_error = summary.get("broker_error")
+        central_error_type = summary.get("central_error_type")
+        manual_count = len(only_bingx)
+        central_only_count = len(only_central)
+        ok = (
+            bool(awareness.get("ok"))
+            and not broker_error
+            and not central_error_type
+            and not manual_count
+            and not central_only_count
+        )
+        if broker_error:
+            status = "BROKER_POSITION_READ_ERROR"
+        elif central_error_type:
+            status = "CENTRAL_POSITION_READ_ERROR"
+        elif manual_count:
+            status = "MANUAL_OR_EXTERNAL_POSITION_PRESENT"
+        elif central_only_count:
+            status = "CENTRAL_ONLY_RECONCILE_REQUIRED"
+        else:
+            status = "OK"
+        txt = (
+            f"Position reconciliation: {status}; "
+            f"broker_open={summary.get('broker_bingx_open_count')}; "
+            f"central_live={summary.get('central_live_count')}; "
+            f"manual_or_external={manual_count}; central_only={central_only_count}; "
+            f"broker_read_error={bool(broker_error)}"
+        )
         return {
-            "ok": len(only_bingx) == 0 and len(only_central) == 0,
-            "status": "OK" if len(only_bingx) == 0 and len(only_central) == 0 else "ALERTA",
+            "ok": ok,
+            "status": status,
+            "broker_error_present": bool(broker_error),
+            "central_error_present": bool(central_error_type),
+            "broker_bingx_open_count": summary.get("broker_bingx_open_count"),
+            "central_live_count": summary.get("central_live_count"),
+            "matched_count": summary.get("matched_count"),
+            "manual_or_external_count": manual_count,
+            "central_only_count": central_only_count,
             "only_bingx_count": len(only_bingx),
-            "only_central_count": len(only_central),
+            "only_central_count": central_only_count,
             "only_bingx": only_bingx,
             "only_central": only_central,
             "text": txt,
@@ -18078,7 +18321,7 @@ def bingx_divergence_payload():
         return {
             "ok": False,
             "status": "ERRO",
-            "error": str(exc),
+            "error_type": type(exc).__name__,
         }
 
 
@@ -18088,13 +18331,26 @@ def bingx_divergence_warning_payload():
     return {
         "active": not bool(payload.get("ok")),
         "status": payload.get("status"),
+        "broker_error_present": payload.get("broker_error_present", False),
+        "central_error_present": payload.get("central_error_present", False),
+        "manual_or_external_count": payload.get("manual_or_external_count", 0),
+        "central_only_count": payload.get("central_only_count", 0),
         "only_bingx_count": payload.get("only_bingx_count", 0),
         "only_central_count": payload.get("only_central_count", 0),
         "only_bingx": payload.get("only_bingx", []),
         "only_central": payload.get("only_central", []),
-        "policy": "LEVEL_2_WARNING_ONLY",
-        "message": "Divergência Central x BingX detectada. Operação permitida, mas requer atenção operacional.",
+        "policy": "LIVE_FAIL_CLOSED",
+        "message": "Estado de posições Central x BingX divergente ou não verificável; novas entradas LIVE bloqueadas.",
     }
+
+
+def _apply_bingx_divergence_gate(mode, intended_live, divergence_warning, reasons, warnings):
+    if not isinstance(divergence_warning, dict) or not divergence_warning.get("active"):
+        return
+    if bool(intended_live) or str(mode or "").upper().strip() == "LIVE":
+        reasons.append("LIVE_BLOCKED_BY_BINGX_POSITION_RECONCILIATION")
+    else:
+        warnings.append(divergence_warning.get("message") or "Central x BingX position state is not verified.")
 
 
 def build_status_report():
@@ -18128,6 +18384,22 @@ def normalize_symbol_for_risk(symbol):
     return s
 
 
+def _sanitize_public_broker_payload(value):
+    """Remove credential fragments from broker payloads returned by public routes."""
+    sensitive_fields = {"api_key_masked", "api_secret_masked", "signature_masked", "x-bx-apikey", "authorization"}
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_public_broker_payload(item)
+            for key, item in value.items()
+            if str(key).strip().lower() not in sensitive_fields
+        }
+    if isinstance(value, list):
+        return [_sanitize_public_broker_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_public_broker_payload(item) for item in value)
+    return value
+
+
 def broker_status_payload():
     """Status seguro do broker. Nunca expõe API key/secret."""
     payload = {
@@ -18141,24 +18413,36 @@ def broker_status_payload():
         "max_margin_usdt": REAL_TRADING_MAX_MARGIN_USDT,
         "max_notional_usdt": REAL_TRADING_MAX_NOTIONAL_USDT,
         "bot_execution_configs": all_real_execution_configs(),
-        "broker_import_error": BROKER_IMPORT_ERROR,
+        # Import exception text can contain paths or transport details; expose
+        # only a stable status code from this public health payload.
+        "broker_import_error": "BROKER_IMPORT_ERROR" if BROKER_IMPORT_ERROR else None,
         "broker_loaded": central_broker is not None,
     }
     if central_broker is not None:
         try:
-            payload["broker"] = central_broker.status_payload(check_ready=False)
+            payload["broker"] = _sanitize_public_broker_payload(
+                central_broker.status_payload(check_ready=False)
+            )
         except Exception as exc:
-            payload["broker"] = {"ok": False, "error": str(exc)}
+            payload["broker"] = {
+                "ok": False,
+                "error": "BROKER_STATUS_ERROR",
+                "error_type": type(exc).__name__,
+            }
     return payload
 
 
 def bingx_ready_payload():
     if central_broker is None:
-        return {"ok": False, "status": "BROKER_IMPORT_ERROR", "error": BROKER_IMPORT_ERROR}
+        return {"ok": False, "status": "BROKER_IMPORT_ERROR"}
     try:
-        return central_broker.ready_check()
+        return _sanitize_public_broker_payload(central_broker.ready_check())
     except Exception as exc:
-        return {"ok": False, "status": "READY_ERROR", "error": str(exc)}
+        return {
+            "ok": False,
+            "status": "READY_ERROR",
+            "error_type": type(exc).__name__,
+        }
 
 
 
@@ -19317,7 +19601,13 @@ def can_open_trade_decision(payload: dict):
 
     divergence_warning = bingx_divergence_warning_payload()
     if divergence_warning.get("active"):
-        warnings.append(divergence_warning.get("message"))
+        _apply_bingx_divergence_gate(
+            mode,
+            intended_live,
+            divergence_warning,
+            reasons,
+            warnings,
+        )
 
     allowed = len(reasons) == 0
     decision_result = {
@@ -19428,37 +19718,54 @@ def _broker_call(name, *args, **kwargs):
         return None, str(exc)
 
 
-def _broker_open_positions():
+def _broker_open_positions(*, strict=False):
     raw, err = _broker_call("get_positions")
     if err:
         return [], err
+    if strict and not isinstance(raw, (list, tuple)):
+        return [], "broker positions response invalid"
     rows = []
     for p in raw or []:
         if not isinstance(p, dict):
+            if strict:
+                return [], "broker positions row invalid"
             continue
-        contracts = p.get("contracts") or p.get("contractSize") or p.get("amount") or p.get("positionAmt")
-        notional = p.get("notional") or p.get("initialMargin") or p.get("margin")
-        symbol = normalize_symbol_for_risk(p.get("symbol") or (p.get("info") or {}).get("symbol"))
-        side = str(p.get("side") or (p.get("info") or {}).get("side") or (p.get("info") or {}).get("positionSide") or "").upper()
+        info = p.get("info") if isinstance(p.get("info"), dict) else {}
+        contracts = next((p.get(key) for key in ("contracts", "contractSize", "amount", "positionAmt") if p.get(key) not in (None, "")), None)
+        if contracts is None:
+            contracts = next((info.get(key) for key in ("positionAmt", "contracts", "amount") if info.get(key) not in (None, "")), None)
+        notional = next((p.get(key) for key in ("notional", "initialMargin", "margin") if p.get(key) not in (None, "")), None)
+        if notional is None:
+            notional = next((info.get(key) for key in ("notional", "positionValue") if info.get(key) not in (None, "")), None)
+        if strict and contracts is None and notional is None:
+            return [], "broker positions quantity missing"
+        symbol = normalize_symbol_for_risk(p.get("symbol") or info.get("symbol"))
+        side = str(p.get("side") or info.get("side") or info.get("positionSide") or "").upper()
         # CCXT costuma retornar contracts=0 para posição zerada.
         try:
             contracts_f = abs(float(contracts or 0))
         except Exception:
+            if strict:
+                return [], "broker positions quantity invalid"
             contracts_f = 0.0
         try:
             notional_f = abs(float(notional or 0))
         except Exception:
+            if strict:
+                return [], "broker positions notional invalid"
             notional_f = 0.0
+        if strict and (contracts_f != contracts_f or notional_f != notional_f):
+            return [], "broker positions quantity invalid"
         if contracts_f <= 0 and notional_f <= 0:
             continue
         rows.append({
             "symbol": symbol,
             "side": side,
-            "position_side": p.get("positionSide") or (p.get("info") or {}).get("positionSide"),
-            "position_mode": p.get("positionMode") or (p.get("info") or {}).get("positionMode"),
+            "position_side": p.get("positionSide") or info.get("positionSide"),
+            "position_mode": p.get("positionMode") or info.get("positionMode"),
             "contracts": contracts,
             "notional": notional,
-            "entry_price": p.get("entryPrice") or p.get("entry_price") or (p.get("info") or {}).get("avgPrice"),
+            "entry_price": p.get("entryPrice") or p.get("entry_price") or info.get("avgPrice"),
             "unrealized_pnl": p.get("unrealizedPnl") or p.get("unrealized_pnl"),
             "leverage": p.get("leverage") or (p.get("info") or {}).get("leverage"),
             "raw_symbol": p.get("symbol"),
@@ -23162,14 +23469,27 @@ def executive_decision_route():
 @app.route("/policyautorelease/report")
 @app.route("/policy_auto_release")
 def policy_auto_release_report_route():
-    return {"text": _executive_policy_auto_release_report_block()}
+    health = get_executive_policy_auto_release_health()
+    return {
+        "text": "\n".join(
+            [
+                "🔓 EXECUTIVE POLICY AUTO RELEASE — STATUS (somente leitura)",
+                f"Status: {'OK' if health.get('ok') else 'INDISPONÍVEL'}",
+                f"Policies ativas: {health.get('active_policy_count', 0)}",
+                f"Última execução: {health.get('last_run_at') or 'ainda não executado'}",
+                f"Últimos códigos liberados: {', '.join(health.get('last_released_codes') or []) or 'nenhum'}",
+                "Esta rota apenas consulta o último estado; não executa liberação.",
+            ]
+        ),
+        "payload": health,
+    }
 
 
 
 @app.route("/policypriority/report")
 @app.route("/policy_priority")
 def policy_priority_report_route():
-    result = resolve_executive_policy_priority(trade_payload=None, commit=True)
+    result = resolve_executive_policy_priority(trade_payload=None, commit=False)
     return {"text": build_executive_policy_priority_report(result), "payload": result}
 
 
@@ -23407,13 +23727,10 @@ def system_debug_route():
     }
 
 
-@app.route("/can_open_trade", methods=["GET", "POST"])
-@app.route("/canopen", methods=["GET", "POST"])
+@app.route("/can_open_trade", methods=["POST"])
+@app.route("/canopen", methods=["POST"])
 def can_open_trade_route():
-    if request.method == "POST":
-        payload = request.get_json(silent=True) or {}
-    else:
-        payload = dict(request.args)
+    payload = request.get_json(silent=True) or {}
     return can_open_trade_decision(payload)
 
 
@@ -23430,13 +23747,15 @@ def risk_route():
     return {"text": build_risk_report()}
 
 
-@app.route("/risk/registry")
-@app.route("/riskregistry")
+@app.route("/risk/registry", methods=["GET", "POST"])
+@app.route("/riskregistry", methods=["GET", "POST"])
 def risk_registry_route():
-    try:
-        autosync_trade_registry(reason="risk_registry")
-    except Exception as exc:
-        print("AVISO SYNC REGISTRY ANTES DO RISK_REGISTRY:", exc)
+    sync_error = None
+    if request.method == "POST":
+        try:
+            autosync_trade_registry(reason="risk_registry")
+        except Exception as exc:
+            sync_error = type(exc).__name__
     exposure = central_exposure_snapshot()
     registry = {
     "loaded": central_trade_registry is not None,
@@ -23462,16 +23781,22 @@ def risk_registry_route():
         },
         "by_bot": exposure.get("by_bot"),
         "registry": registry,
+        "registry_sync": {
+            "attempted": request.method == "POST",
+            "error": sync_error,
+        },
     }
 
 
-@app.route("/risk/registry/check")
-@app.route("/riskregistry/check")
+@app.route("/risk/registry/check", methods=["GET", "POST"])
+@app.route("/riskregistry/check", methods=["GET", "POST"])
 def risk_registry_check_route():
-    try:
-        autosync_trade_registry(reason="risk_registry_check")
-    except Exception as exc:
-        print("AVISO SYNC REGISTRY ANTES DO RISK_REGISTRY_CHECK:", exc)
+    sync_error = None
+    if request.method == "POST":
+        try:
+            autosync_trade_registry(reason="risk_registry_check")
+        except Exception as exc:
+            sync_error = type(exc).__name__
     exposure = central_exposure_snapshot()
     registry = central_trade_registry_snapshot(include_trades=False)
 
@@ -23511,6 +23836,10 @@ def risk_registry_check_route():
             "open_count": registry_total,
             "updated_at": registry.get("updated_at"),
             "file": registry.get("trade_registry_file"),
+        },
+        "registry_sync": {
+            "attempted": request.method == "POST",
+            "error": sync_error,
         },
     }
 
@@ -29231,11 +29560,11 @@ def build_adaptive_weight_engine_v1_text(capital=10000.0, bot=None, symbol=None,
 @app.route("/weights/adaptive/v1", methods=["GET", "POST"])
 @app.route("/awe/v1", methods=["GET", "POST"])
 def adaptive_weight_engine_v1_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     args_payload = _dse_request_payload_from_args(body)
     capital = _awe_safe_float(args_payload.get("capital"), 10000.0)
     persist_raw = body.get("persist", request.args.get("persist", ""))
-    persist = str(persist_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    persist = request.method == "POST" and str(persist_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
     as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
     text, payload = build_adaptive_weight_engine_v1_text(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), persist=persist)
     if as_text:
@@ -29664,11 +29993,10 @@ def build_learning_outcome_v1_text(payload):
 @app.route("/learning/v1", methods=["GET", "POST"])
 @app.route("/learn/v1", methods=["GET", "POST"])
 def learning_engine_v1_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     args_payload = _dse_request_payload_from_args(body)
     capital = _le_safe_float(args_payload.get("capital"), 10000.0)
-    record_raw = body.get("record", request.args.get("record", ""))
-    record = request.method == "POST" or str(record_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save", "record"}
+    record = request.method == "POST"
     as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
     payload = build_learning_engine_v1(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), record=record)
     text = build_learning_engine_v1_text(payload)
@@ -29677,9 +30005,9 @@ def learning_engine_v1_route():
     return {"ok": True, "text": text, "payload": payload}
 
 
-@app.route("/learning/outcome/v1", methods=["GET", "POST"])
-@app.route("/learning/result/v1", methods=["GET", "POST"])
-@app.route("/learn/outcome/v1", methods=["GET", "POST"])
+@app.route("/learning/outcome/v1", methods=["POST"])
+@app.route("/learning/result/v1", methods=["POST"])
+@app.route("/learn/outcome/v1", methods=["POST"])
 def learning_outcome_v1_route():
     body = request.get_json(silent=True) or {}
     learning_id = body.get("learning_id", request.args.get("learning_id"))
@@ -30137,17 +30465,16 @@ def build_outcome_evaluator_v1_text(payload):
 @app.route("/outcome/evaluate/v1", methods=["GET", "POST"])
 @app.route("/learning/evaluate/v1", methods=["GET", "POST"])
 def outcome_evaluator_v1_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     learning_id = body.get("learning_id", request.args.get("learning_id"))
     trade_id = body.get("trade_id", request.args.get("trade_id"))
     outcome = body.get("outcome", request.args.get("outcome"))
     result_r = body.get("result_r", request.args.get("result_r"))
     pnl_pct = body.get("pnl_pct", request.args.get("pnl_pct"))
     note = body.get("note", request.args.get("note"))
-    save_raw = body.get("save", request.args.get("save", "true"))
-    save = request.method == "POST" or str(save_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save", "record"}
+    save = request.method == "POST"
     force_raw = body.get("force", request.args.get("force", ""))
-    force = str(force_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
+    force = request.method == "POST" and str(force_raw).strip().lower() in {"1", "true", "yes", "sim", "on"}
     as_text = str(request.args.get("format", request.args.get("text", ""))).strip().lower() in {"1", "true", "yes", "sim", "on", "text", "txt"}
     payload = build_outcome_evaluator_v1(learning_id=learning_id, trade_id=trade_id, outcome=outcome, result_r=result_r, pnl_pct=pnl_pct, note=note, save=save, force=force)
     text = build_outcome_evaluator_v1_text(payload)
@@ -30657,7 +30984,7 @@ def history_rotation_v1_preview_text_route():
     return _history_rotation_v1_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
-@app.route("/history/rotation/commit/text", methods=["GET"])
+@app.route("/history/rotation/commit/text", methods=["POST"])
 def history_rotation_v1_commit_text_route():
     try:
         import history_manager as super_history_manager
@@ -30766,7 +31093,7 @@ def history_rotation_emergency_v11_preview_text_route():
     return _history_rotation_emergency_v11_text(payload), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
-@app.route("/history/rotation/emergency/commit/text", methods=["GET"])
+@app.route("/history/rotation/emergency/commit/text", methods=["POST"])
 def history_rotation_emergency_v11_commit_text_route():
     live_count, live_known, live_warning = _history_rotation_v11_local_central_live_count()
     try:
@@ -33131,7 +33458,7 @@ def learning_auto_status_route():
     return payload
 
 
-@app.route("/learning/refresh")
+@app.route("/learning/refresh", methods=["POST"])
 def learning_refresh_route():
     try:
         import learning_engine
@@ -33595,9 +33922,57 @@ def _bind_c3_startup_maintenance_v1(composition):
         C3_MAINTENANCE_STARTUP_BINDING_V1 = composition
 
 
+def _central_persistent_registry_startup_admission_v1():
+    """Refuse bot startup when Render's persistent Registry is unavailable."""
+    active_resolver = globals().get("_trpsf_v1_active_file")
+    if not callable(active_resolver):
+        return {"ok": False, "status": "PERSISTENT_REGISTRY_PATH_UNAVAILABLE"}
+    try:
+        active = Path(active_resolver())
+        active_text = str(active).replace("\\", "/")
+    except Exception:
+        return {"ok": False, "status": "PERSISTENT_REGISTRY_PATH_INVALID"}
+    if not active_text.startswith("/data/"):
+        return {"ok": True, "status": "NON_PERSISTENT_PATH_NOT_GATED"}
+
+    if os.name != "nt":
+        try:
+            mount_check = getattr(Path("/data"), "is_mount", None)
+            if not callable(mount_check) or not mount_check():
+                return {"ok": False, "status": "PERSISTENT_DATA_MOUNT_NOT_VERIFIED"}
+        except Exception:
+            return {"ok": False, "status": "PERSISTENT_DATA_MOUNT_NOT_VERIFIED"}
+
+    try:
+        if not active.is_file():
+            return {"ok": False, "status": "PERSISTENT_TRADE_REGISTRY_MISSING"}
+        read_json = globals().get("_trpsf_v1_read_json")
+        shape_errors_fn = globals().get("_trpsf_v1_registry_shape_errors")
+        if not callable(read_json) or not callable(shape_errors_fn):
+            return {"ok": False, "status": "PERSISTENT_REGISTRY_VALIDATOR_UNAVAILABLE"}
+        registry = read_json(active)
+        required_fields = {"version", "open_trades", "closed_trades"}
+        if not isinstance(registry, dict) or not required_fields.issubset(registry):
+            return {"ok": False, "status": "PERSISTENT_TRADE_REGISTRY_INVALID_SHAPE"}
+        if shape_errors_fn(registry):
+            return {"ok": False, "status": "PERSISTENT_TRADE_REGISTRY_INVALID_SHAPE"}
+    except Exception:
+        return {"ok": False, "status": "PERSISTENT_TRADE_REGISTRY_READ_FAILED"}
+    return {"ok": True, "status": "PERSISTENT_TRADE_REGISTRY_READY"}
+
+
 def start_central_runtime_once():
     global CENTRAL_RUNTIME_STARTED, LEARNING_AUTO_REFRESH_THREAD_STARTED
     global CENTRAL_DAILY_REPORT_THREAD_STARTED, CENTRAL_DAILY_REPORT_LAST_STATUS
+
+    admission = _central_persistent_registry_startup_admission_v1()
+    if not isinstance(admission, dict) or admission.get("ok") is not True:
+        reason = (
+            str(admission.get("status") or "PERSISTENT_REGISTRY_STARTUP_BLOCKED")
+            if isinstance(admission, dict)
+            else "PERSISTENT_REGISTRY_STARTUP_BLOCKED"
+        )
+        raise RuntimeError(f"CENTRAL_RUNTIME_STARTUP_BLOCKED:{reason}")
 
     with CENTRAL_RUNTIME_LOCK:
         if CENTRAL_RUNTIME_STARTED:
@@ -33810,26 +34185,17 @@ try:
                 "error": str(e),
             }
     
-    @app.route("/history/trades/rebuild")
+    @app.route("/history/trades/rebuild", methods=["POST"])
     def history_trades_rebuild():
-        try:
-            import history_manager
-            payload = history_manager.rebuild_closed_trades_v4_from_events()
-
-            return {
-                "ok": payload.get("ok"),
-                "text": (
-                    "♻️ HISTORY TRADES REBUILD — CENTRAL QUANT\n"
-                    f"Eventos fechados encontrados: {payload.get('closed_events', 0)}\n"
-                    f"Registros criados: {payload.get('created', 0)}\n"
-                    f"Erros: {payload.get('errors', 0)}\n"
-                    f"Total no arquivo: {payload.get('records', 0)}"
-                ),
-                "payload": payload,
-            }
-
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        # Rebuilding rewrites the entire closed-trade history. Keep the legacy
+        # route inert until a separately reviewed, non-destructive recovery
+        # workflow exists; changing GET to POST alone would not make this safe.
+        return {
+            "ok": False,
+            "status": "DESTRUCTIVE_HISTORY_REBUILD_DISABLED",
+            "write_executed": False,
+            "history_unchanged": True,
+        }, 409
     
     @app.route("/history/raw")
     def super_history_raw_route():
@@ -34302,10 +34668,10 @@ def build_adaptive_weight_engine_v2_text(capital=10000.0, bot=None, symbol=None,
 @app.route("/adaptive-weight/v2", methods=["GET", "POST"])
 @app.route("/weights/adaptive/v2", methods=["GET", "POST"])
 def adaptive_weight_engine_v2_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     args_payload = _dse_request_payload_from_args(body)
     capital = _awe_safe_float(args_payload.get("capital"), 10000.0)
-    persist = str(args_payload.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    persist = request.method == "POST" and str(args_payload.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
     text, payload = build_adaptive_weight_engine_v2_text(capital=capital, bot=args_payload.get("bot"), symbol=args_payload.get("symbol"), side=args_payload.get("side"), entry=args_payload.get("entry"), stop=args_payload.get("stop"), setup=args_payload.get("setup"), leverage=args_payload.get("leverage"), mode=args_payload.get("mode"), intended_live=args_payload.get("intended_live"), persist=persist)
     return {"ok": True, "payload": payload, "text": text}
 
@@ -34891,10 +35257,10 @@ def build_meta_strategy_engine_v1_text(capital=10000.0, market_regime=None, pers
 @app.route("/meta-strategy/v1.1", methods=["GET", "POST"])
 @app.route("/strategy/meta/v1.1", methods=["GET", "POST"])
 def meta_strategy_engine_v11_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     capital = _mse_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
     market_regime = body.get("market_regime") or body.get("regime") or request.args.get("market_regime") or request.args.get("regime")
-    persist = str(body.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    persist = request.method == "POST" and str(body.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
     text, payload = build_meta_strategy_engine_v1_1_text(capital=capital, market_regime=market_regime, persist=persist)
     return {"ok": True, "payload": payload, "text": text}
 
@@ -35255,9 +35621,9 @@ def build_market_regime_detector_v1_text(capital=10000.0, persist=False):
 @app.route("/regime/market/v1", methods=["GET", "POST"])
 @app.route("/market-regime/v1", methods=["GET", "POST"])
 def market_regime_detector_v1_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     capital = _mrd_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
-    persist = str(body.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    persist = request.method == "POST" and str(body.get("persist") or request.args.get("persist", "")).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
     text, payload = build_market_regime_detector_v1_text(capital=capital, persist=persist)
     return {"ok": True, "payload": payload, "text": text}
 
@@ -36196,10 +36562,10 @@ def build_strategy_evolution_engine_v1_text(capital=10000.0, persist=False):
 @app.route("/evolution/strategy/v1", methods=["GET", "POST"])
 @app.route("/strategy-evolution/v1", methods=["GET", "POST"])
 def strategy_evolution_engine_v1_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     capital = _see_safe_float(body.get("capital") or request.args.get("capital"), 10000.0)
     persist_raw = body.get("persist", request.args.get("persist", ""))
-    persist = str(persist_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
+    persist = request.method == "POST" and str(persist_raw).strip().lower() in {"1", "true", "yes", "sim", "on", "save"}
     text, payload = build_strategy_evolution_engine_v1_text(capital=capital, persist=persist)
     return {"ok": True, "payload": payload, "text": text}
 
@@ -36794,7 +37160,7 @@ def build_trade_lifecycle_manager_v1_text(capital=10000.0, bot=None, symbol=None
 @app.route("/lifecycle/trade/v1", methods=["GET", "POST"])
 @app.route("/trade-lifecycle/v1", methods=["GET", "POST"])
 def trade_lifecycle_manager_v1_route():
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
     def arg(name, default=None):
         return body.get(name, request.args.get(name, default))
     capital = _tlm_safe_float(arg("capital"), 10000.0)
@@ -36806,9 +37172,9 @@ def trade_lifecycle_manager_v1_route():
     setup = arg("setup")
     leverage = _tlm_safe_float(arg("leverage"), None)
     trade_id = arg("trade_id")
-    record_decision = str(arg("record_decision", arg("record", ""))).lower() in {"1", "true", "yes", "sim", "on", "save"}
-    evaluate_closed = str(arg("evaluate_closed", arg("evaluate", ""))).lower() in {"1", "true", "yes", "sim", "on"}
-    persist = str(arg("persist", "")).lower() in {"1", "true", "yes", "sim", "on", "save"}
+    record_decision = request.method == "POST" and str(arg("record_decision", arg("record", ""))).lower() in {"1", "true", "yes", "sim", "on", "save"}
+    evaluate_closed = request.method == "POST" and str(arg("evaluate_closed", arg("evaluate", ""))).lower() in {"1", "true", "yes", "sim", "on"}
+    persist = request.method == "POST" and str(arg("persist", "")).lower() in {"1", "true", "yes", "sim", "on", "save"}
     text, payload = build_trade_lifecycle_manager_v1_text(
         capital=capital,
         bot=bot,
@@ -36903,8 +37269,8 @@ def paper_lifecycle_log_alias_route():
         }, 500
 
 
-@app.route("/paperlifecycleupdate", methods=["GET", "POST"])
-@app.route("/paperupdate", methods=["GET", "POST"])
+@app.route("/paperlifecycleupdate", methods=["POST"])
+@app.route("/paperupdate", methods=["POST"])
 def paper_lifecycle_update_alias_route():
     try:
         payload = request.get_json(silent=True) or {}
@@ -36930,8 +37296,8 @@ def paper_lifecycle_update_alias_route():
         }, 500
 
 
-@app.route("/paperlifecycletesttp50")
-@app.route("/papertesttp50")
+@app.route("/paperlifecycletesttp50", methods=["POST"])
+@app.route("/papertesttp50", methods=["POST"])
 def paper_lifecycle_test_tp50_alias_route():
     try:
         return paper_lifecycle_test_tp50()
@@ -36944,8 +37310,8 @@ def paper_lifecycle_test_tp50_alias_route():
         }, 500
 
 
-@app.route("/paperlifecycletestclose")
-@app.route("/papertestclose")
+@app.route("/paperlifecycletestclose", methods=["POST"])
+@app.route("/papertestclose", methods=["POST"])
 def paper_lifecycle_test_close_alias_route():
     try:
         return paper_lifecycle_test_close()
@@ -37012,7 +37378,7 @@ def paper_routes_catalog_route():
             "health": ["/paperlifecyclehealth", "/paperhealth", "/paper_lifecycle/health", "/paper/lifecycle/health"],
             "positions": ["/paperpositions", "/paperlifecyclepositions", "/paperopen", "/paper_lifecycle/positions", "/paper/lifecycle/positions"],
             "log": ["/paperlifecyclelog", "/paperlog", "/paper_lifecycle/log", "/paper/lifecycle/log"],
-            "update": ["/paperlifecycleupdate?symbol=ETHUSDT&price=3580&close=true", "/paperupdate"],
+            "update": ["POST /paperlifecycleupdate (symbol, price, close)", "POST /paperupdate"],
             "tests": ["/paperlifecycletesttp50", "/paperlifecycletestclose"],
             "integrated": ["/paperintegratedpositions", "/paperintegratedhealth", "/paperintegratedlog", "/paper/integrated/positions"],
         },
@@ -37460,7 +37826,7 @@ def execution_dry_run_hard_kill_switch_v1_health_route():
             "/executionfinalgate",
             "/executionfinalgate/health",
             "/pilotcooldown/health",
-            "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
+            "POST /pilotcooldown/release (JSON ack=PILOT_COOLDOWN_RELEASE)",
             "/realcloseautoevaluator/health",
             "/realcloseautoevaluator?commit=true&ack=REAL_CLOSE_AUTO_EVALUATE",
             "/tradecloseoutcome/health",
@@ -38934,12 +39300,28 @@ def real_execution_telegram_notifier_v1_notify(event_type=None, payload=None, re
 
 
 @app.route("/realexecutiontelegram/health", methods=["GET"])
-@app.route("/realexecutiontelegram", methods=["GET"])
+@app.route("/realexecutiontelegram", methods=["GET", "POST"])
 @app.route("/real/executiontelegram/health", methods=["GET"])
 def real_execution_telegram_notifier_v1_health_route():
     config = _retg_v1_config()
-    send_test = _retg_v1_bool(request.args.get("send_test"), default=False)
-    ack = str(request.args.get("ack") or "").strip().upper()
+    if request.method == "POST":
+        payload_in = request.get_json(silent=True) or {}
+        if not isinstance(payload_in, dict):
+            payload_in = {}
+    else:
+        payload_in = {}
+    send_test = _retg_v1_bool(
+        payload_in.get("send_test") if request.method == "POST" else request.args.get("send_test"),
+        default=False,
+    )
+    if request.method == "GET" and send_test:
+        return {
+            "ok": False,
+            "status": "TEST_MESSAGE_REQUIRES_POST",
+            "sent": False,
+            "no_order_sent": True,
+        }, 405
+    ack = str(payload_in.get("ack") or request.args.get("ack") or "").strip().upper()
     test_result = None
     if send_test:
         if ack != "REAL_EXECUTION_TELEGRAM_TEST":
@@ -38993,7 +39375,7 @@ def real_execution_telegram_notifier_v1_health_route():
         "test_result": test_result,
         "routes": [
             "/realexecutiontelegram/health",
-            "/realexecutiontelegram/health?send_test=true&ack=REAL_EXECUTION_TELEGRAM_TEST",
+            "POST /realexecutiontelegram (JSON send_test=true, ack=REAL_EXECUTION_TELEGRAM_TEST)",
             "/executionfinalgate?preflight=true",
             "/executionconsole",
         ],
@@ -40188,8 +40570,8 @@ def auto_real_execution_bridge_v1_log_route():
     return _arb_v1_sanitize_public(payload), 200
 
 
-@app.route("/autorealbridge/test", methods=["GET", "POST"])
-@app.route("/auto/realbridge/test", methods=["GET", "POST"])
+@app.route("/autorealbridge/test", methods=["POST"])
+@app.route("/auto/realbridge/test", methods=["POST"])
 def auto_real_execution_bridge_v1_test_route():
     if request.method == "POST":
         payload = request.get_json(silent=True) or {}
@@ -40211,39 +40593,18 @@ def auto_real_execution_bridge_v1_test_route():
 @app.route("/autorealbridge", methods=["GET", "POST"])
 @app.route("/auto/realbridge", methods=["GET", "POST"])
 def auto_real_execution_bridge_v1_route():
-    if request.method == "POST":
-        payload = request.get_json(silent=True) or {}
-    else:
-        payload = {key: value for key, value in request.args.items()}
-    payload = _arb_v1_normalize_payload(payload, manual_defaults=True)
-    execute = _arb_v1_bool(request.args.get("execute") or payload.get("execute"), default=False)
-    commit = _arb_v1_bool(request.args.get("commit") or payload.get("commit"), default=False)
-    ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
-    dry_run = not (execute and commit and ack in {"AUTO_REAL_EXECUTE", "AUTO_REAL_EXECUTION_BRIDGE"})
-    if execute and not dry_run:
-        result = auto_real_execution_bridge_v1_process(
-            payload=payload,
-            risk_result={"allowed": True, "decision": "ALLOW", "mode": payload.get("mode") or "VERIFY"},
-            source="manual_route_live",
-            execute=True,
-            dry_run=False,
-            force_notify=True,
-        )
-    else:
-        result = auto_real_execution_bridge_v1_process(
-            payload=payload,
-            risk_result={"allowed": True, "decision": "ALLOW", "mode": payload.get("mode") or "VERIFY"},
-            source="manual_route_preview",
-            execute=False,
-            dry_run=True,
-        )
-        if execute and not commit:
-            result.setdefault("manual_live_requirements", {
-                "required_commit": "commit=true",
-                "required_ack": "AUTO_REAL_EXECUTE",
-                "example": "/autorealbridge?execute=true&commit=true&ack=AUTO_REAL_EXECUTE&...",
-            })
-    return _arb_v1_sanitize_public(result), 200
+    from auto_real_execution_bridge_route_v1 import (
+        dispatch_auto_real_execution_bridge_route_v1,
+    )
+
+    return dispatch_auto_real_execution_bridge_route_v1(
+        request,
+        auto_real_execution_bridge_v1_process,
+        _arb_v1_normalize_payload,
+        _arb_v1_bool,
+        _arb_v1_sanitize_public,
+        globals().get("_rtlm_v15_admin_auth"),
+    )
 
 
 # Aliases pedidos no diagnóstico do usuário.
@@ -41012,6 +41373,15 @@ def real_position_watchdog_v1_route():
     notify = _rpw_v1_bool(request.args.get("notify") or payload.get("notify"), False)
     force_notify = _rpw_v1_bool(request.args.get("force_notify") or payload.get("force_notify"), False)
     ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
+    if request.method != "POST" and (notify or force_notify):
+        return {
+            "ok": False,
+            "status": "POST_REQUIRED_FOR_NOTIFICATION",
+            "notification_sent": False,
+            "order_attempted": False,
+            "no_order_sent": True,
+            "version": REAL_POSITION_WATCHDOG_V1_VERSION,
+        }, 405
     if (notify or force_notify) and ack not in {"REAL_POSITION_WATCHDOG_NOTIFY", "REAL_POSITION_WATCHDOG_ALERT"}:
         return {
             "ok": False,
@@ -41507,7 +41877,7 @@ def pilot_cooldown_v1_health_payload():
         "/pilotcooldown/health",
         "/pilotcooldown",
         "/pilotcooldown/log",
-        "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
+        "POST /pilotcooldown/release (JSON ack=PILOT_COOLDOWN_RELEASE)",
         "/realpilotdashboard",
     ]
     return _pcd_v1_sanitize_public(payload)
@@ -41529,14 +41899,13 @@ def pilot_cooldown_v1_route():
     return pilot_cooldown_v1_assess(payload=payload, source="route"), 200
 
 
-@app.route("/pilotcooldown/release", methods=["GET", "POST"])
-@app.route("/pilot/cooldown/release", methods=["GET", "POST"])
+@app.route("/pilotcooldown/release", methods=["POST"])
+@app.route("/pilot/cooldown/release", methods=["POST"])
 def pilot_cooldown_v1_release_route():
-    if request.method == "POST":
-        payload = request.get_json(silent=True) or {}
-    else:
-        payload = {key: value for key, value in request.args.items()}
-    ack = str(request.args.get("ack") or payload.get("ack") or "").strip().upper()
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    ack = str(payload.get("ack") or "").strip().upper()
     if ack != "PILOT_COOLDOWN_RELEASE":
         return {
             "ok": False,
@@ -41546,7 +41915,7 @@ def pilot_cooldown_v1_release_route():
             "version": PILOT_COOLDOWN_V1_VERSION,
             "token_value_exposed": False,
         }, 400
-    reason = str(request.args.get("reason") or payload.get("reason") or "MANUAL_RELEASE").strip() or "MANUAL_RELEASE"
+    reason = str(payload.get("reason") or "MANUAL_RELEASE").strip() or "MANUAL_RELEASE"
     result = pilot_cooldown_v1_release(reason=reason, payload=payload)
     return result, 200
 
@@ -42878,7 +43247,7 @@ def _rpd_v1_build_dashboard(deep=True, source="route"):
             "/realpositionwatchdog",
             "/executionfinalgate/health",
             "/pilotcooldown/health",
-            "/pilotcooldown/release?ack=PILOT_COOLDOWN_RELEASE",
+            "POST /pilotcooldown/release (JSON ack=PILOT_COOLDOWN_RELEASE)",
             "/realcloseautoevaluator/health",
             "/realcloseautoevaluator?commit=true&ack=REAL_CLOSE_AUTO_EVALUATE",
             "/tradecloseoutcome/health",
@@ -43573,11 +43942,15 @@ def _meg_v1_minimal_ceo_daily(reason="MEMORY_PROTECTION_ACTIVE", cleanup=None):
     return "\n".join(lines)
 
 
-@app.route("/memory/emergency", methods=["GET"])
-@app.route("/memoryemergency", methods=["GET"])
+@app.route("/memory/emergency", methods=["GET", "POST"])
+@app.route("/memoryemergency", methods=["GET", "POST"])
 def memory_emergency_guard_v1_route():
     before = _meg_v1_memory_snapshot()
-    cleanup = _meg_v1_cleanup(reason="/memory/emergency", force=True)
+    cleanup = (
+        _meg_v1_cleanup(reason="/memory/emergency", force=True)
+        if request.method == "POST"
+        else {"ok": True, "status": "READ_ONLY_PREVIEW", "cleanup_performed": False}
+    )
     after = _meg_v1_memory_snapshot()
     return {
         "ok": True,
@@ -46903,7 +47276,7 @@ def falcon_live_execution_audit_guard_v1_status(
         "routes": [
             "/falcon/liveaudit",
             "/falcon/liveaudit/text",
-            "/falcon/liveaudit/ack?ack=FALCON_LIVE_AUDIT_ACK&clear_block=true",
+            "POST /falcon/liveaudit/ack",
         ],
         "token_value_exposed": False,
     }
@@ -47074,6 +47447,11 @@ def falcon_live_execution_audit_guard_v1_post_order(payload, result):
     return _fleag_v1_public(post_event)
 
 
+@guard_live_flow(
+    RUNTIME_DRAIN,
+    _main_live_engine_flow_enabled,
+    _main_live_engine_runtime_drain_result,
+)
 def run_execution_engine(payload=None, mode=None, dry_run=True, *args, **kwargs):
     """Falcon Live Execution Audit Guard V1 wrapper final."""
     original_runner = _ORIGINAL_RUN_EXECUTION_ENGINE_FOR_FALCON_LIVE_AUDIT_GUARD_V1
@@ -47211,6 +47589,37 @@ def set_decision_identity_record_store_for_tests(store):
 def can_open_trade_decision(payload: dict):
     """Final V1 provider plus optional, additive V2.7A.2 identity metadata."""
 
+    p = dict(payload or {}) if isinstance(payload, dict) else {}
+    mode_norm = str(p.get("mode") or p.get("execution_mode") or "").upper().strip()
+    intended_live = bool(p.get("intended_live") or mode_norm == "LIVE")
+    try:
+        reduce_only = bool(_risk_is_reduce_only(p)) if callable(globals().get("_risk_is_reduce_only")) else _fleag_v1_bool(p.get("reduce_only"), default=False)
+    except Exception:
+        reduce_only = _fleag_v1_bool(p.get("reduce_only"), default=False)
+    if intended_live and not reduce_only and RUNTIME_DRAIN.is_draining():
+        result = {
+            "ok": True,
+            "allowed": False,
+            "decision": "DENY",
+            "bot": _fleag_v1_norm_bot(p.get("bot") or p.get("robot") or p.get("strategy")),
+            "symbol": _fleag_v1_norm_symbol(p.get("symbol")),
+            "side": _fleag_v1_norm_side(p.get("side")),
+            "mode": mode_norm,
+            "intended_live": True,
+            "reduce_only": False,
+            "reasons": ["RUNTIME_DRAINING"],
+            "warnings": [],
+            "status": "ENTRY_BLOCKED_RUNTIME_DRAIN",
+            "token_value_exposed": False,
+        }
+        try:
+            if callable(globals().get("append_decision_log")):
+                append_decision_log(p, result)
+                result["decision_log_saved"] = True
+        except Exception:
+            result["decision_log_saved"] = False
+        return result
+
     store = DECISION_IDENTITY_RECORD_STORE
     if store is None or not callable(evaluate_current_decision_with_identity):
         return _can_open_trade_decision_v1_final(payload)
@@ -47325,7 +47734,7 @@ def build_falcon_live_audit_guard_v1_text():
         "- Telegram pós-ordem é confirmação obrigatória de LIVE_SENT.",
         "- Se disaster stop falhar, o guard tenta fail-safe close quando habilitado.",
         "- Se status estiver BLOCKED, /can_open_trade nega novas entradas reais do Falcon.",
-        "- Para reconhecer uma falha histórica depois de corrigida, use /falcon/liveaudit/ack?ack=FALCON_LIVE_AUDIT_ACK&clear_block=true.",
+        "- Para reconhecer uma falha histórica depois de corrigida, envie POST JSON para /falcon/liveaudit/ack com ack=FALCON_LIVE_AUDIT_ACK e clear_block=true.",
     ]
     return "\n".join(lines)
 
@@ -47341,16 +47750,23 @@ def falcon_live_audit_guard_v1_text_route():
     return build_falcon_live_audit_guard_v1_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
-@app.route("/falcon/liveaudit/ack", methods=["GET", "POST"])
+@app.route("/falcon/liveaudit/ack", methods=["POST"])
 def falcon_live_audit_guard_v1_ack_route():
-    ack = str(request.args.get("ack") or "").strip().upper()
-    clear_block = _fleag_v1_bool(request.args.get("clear_block"), default=False)
+    payload = request.get_json(silent=True)
+    payload = payload if isinstance(payload, dict) else {}
+    ack = str(payload.get("ack") or "").strip().upper()
+    clear_block = _fleag_v1_bool(payload.get("clear_block"), default=False)
     if ack != "FALCON_LIVE_AUDIT_ACK" or not clear_block:
         return {
             "ok": False,
             "status": "ACK_REQUIRED",
             "required_ack": "FALCON_LIVE_AUDIT_ACK",
             "required_clear_block": "clear_block=true",
+            "required_method": "POST",
+            "required_json": {
+                "ack": "FALCON_LIVE_AUDIT_ACK",
+                "clear_block": True,
+            },
             "warning": "Use apenas depois de corrigir/validar a causa do bloqueio.",
             "version": FALCON_LIVE_EXECUTION_AUDIT_GUARD_V1_VERSION,
         }, 400
@@ -49968,9 +50384,13 @@ def bot_health(key: str, cfg: dict):
 @app.route("/predator/paperregistrysync", methods=["GET", "POST"])
 @app.route("/predator/registryrepair", methods=["GET", "POST"])
 def predator_paper_registry_sync_fix_v1_route():
-    body = request.get_json(silent=True) or {}
-    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
-    ack = body.get("ack", request.args.get("ack"))
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    commit = (
+        _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+        if request.method == "POST"
+        else False
+    )
+    ack = body.get("ack", request.args.get("ack")) if request.method == "POST" else None
     return predator_paper_registry_sync_fix_v1_status(commit=commit, ack=ack, include_samples=True, use_cache=False), 200
 
 
@@ -49978,9 +50398,13 @@ def predator_paper_registry_sync_fix_v1_route():
 @app.route("/predator/paperregistrysync/text", methods=["GET", "POST"])
 @app.route("/predator/registryrepair/text", methods=["GET", "POST"])
 def predator_paper_registry_sync_fix_v1_text_route():
-    body = request.get_json(silent=True) or {}
-    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
-    ack = body.get("ack", request.args.get("ack"))
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    commit = (
+        _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+        if request.method == "POST"
+        else False
+    )
+    ack = body.get("ack", request.args.get("ack")) if request.method == "POST" else None
     return build_predator_paper_registry_sync_fix_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
@@ -50305,17 +50729,25 @@ def bot_health(key: str, cfg: dict):
 
 @app.route("/predator/orphanopenfix", methods=["GET", "POST"])
 def predator_registry_orphan_open_fix_v1_route():
-    body = request.get_json(silent=True) or {}
-    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
-    ack = body.get("ack", request.args.get("ack"))
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    commit = (
+        _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+        if request.method == "POST"
+        else False
+    )
+    ack = body.get("ack", request.args.get("ack")) if request.method == "POST" else None
     return predator_registry_orphan_open_fix_v1_status(commit=commit, ack=ack, include_samples=True), 200
 
 
 @app.route("/predator/orphanopenfix/text", methods=["GET", "POST"])
 def predator_registry_orphan_open_fix_v1_text_route():
-    body = request.get_json(silent=True) or {}
-    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
-    ack = body.get("ack", request.args.get("ack"))
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    commit = (
+        _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+        if request.method == "POST"
+        else False
+    )
+    ack = body.get("ack", request.args.get("ack")) if request.method == "POST" else None
     return build_predator_registry_orphan_open_fix_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
@@ -50395,6 +50827,7 @@ def _trpsf_v1_falcon_live_entry_storage_readiness():
             "last_load_ok": _TRPSF_V1_STATE.get("last_load_ok") is True,
             "last_write_ok": _TRPSF_V1_STATE.get("last_write_ok") is True,
             "write_allowed": _TRPSF_V1_STATE.get("write_allowed") is True,
+            "process_lock_available": _trpsf_v1_registry_lock() is not None,
             "temporary_read_only_clear": not bool(
                 _TRPSF_V1_STATE.get("temporary_read_only")
             ),
@@ -50440,13 +50873,36 @@ def _trpsf_v1_public(value, max_string=900):
     return value
 
 
+def _trpsf_v1_fsync_directory(path):
+    """Durably persist a directory entry update on supported POSIX filesystems."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(Path(path)), flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _trpsf_v1_atomic_write_json(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    os.replace(str(tmp), str(path))
-    return True
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        temp_fd = os.open(str(tmp), flags, 0o600)
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as file_obj:
+            json.dump(payload, file_obj, ensure_ascii=False, indent=2, default=str)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        os.replace(str(tmp), str(path))
+        _trpsf_v1_fsync_directory(path.parent)
+        return True
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def _trpsf_v1_read_json(path):
@@ -57078,8 +57534,8 @@ def _frpp_v1_build_checklist():
         and c3_coordination.get("startup_recovery_verified") is True
         and c3_coordination.get("kill_switch_ready") is True,
         "Coordenação C3 dos 19 escritores do Trade Registry está pronta.",
-        "Coordenação C3 permanece dormente/default-off; Live continua bloqueado.",
-        True,
+        "Coordenação C3 distribuída está indisponível; isso é informativo para a topologia pessoal validada de uma instância com disco persistente e lock local. Reavalie se houver mais processos/instâncias ou outro backend de armazenamento.",
+        False,
         c3_coordination,
     )
 
@@ -57980,17 +58436,19 @@ def _mpa_v1_position_key(p):
     return (_flad_v1_norm_symbol(p.get("symbol") or p.get("market_symbol") or p.get("ativo") or p.get("pair")), _flad_v1_norm_side(p.get("side") or p.get("direction") or p.get("position_side") or p.get("positionSide")))
 
 
-def _mpa_v1_build_payload():
+def _mpa_v1_build_payload(*, persist=True):
     broker_positions, broker_err = ([], None)
     central_live = []
+    central_error_type = None
     try:
-        broker_positions, broker_err = _broker_open_positions() if callable(globals().get("_broker_open_positions")) else ([], "_broker_open_positions missing")
+        broker_positions, broker_err = _broker_open_positions(strict=not persist) if callable(globals().get("_broker_open_positions")) else ([], "_broker_open_positions missing")
     except Exception as exc:
         broker_positions, broker_err = [], str(exc)
     try:
-        central_live = _central_live_positions_payload() if callable(globals().get("_central_live_positions_payload")) else []
-    except Exception:
+        central_live = _central_live_positions_payload(strict=not persist) if callable(globals().get("_central_live_positions_payload")) else []
+    except Exception as exc:
         central_live = []
+        central_error_type = type(exc).__name__
     central_by_key = {}
     for p in central_live or []:
         if not isinstance(p, dict):
@@ -58041,6 +58499,9 @@ def _mpa_v1_build_payload():
     if broker_err:
         status = "BROKER_POSITION_READ_ERROR"
         ok = False
+    elif central_error_type:
+        status = "CENTRAL_POSITION_READ_ERROR"
+        ok = False
     elif manual_or_external:
         status = "MANUAL_OR_EXTERNAL_POSITION_PRESENT"
         ok = True
@@ -58069,6 +58530,7 @@ def _mpa_v1_build_payload():
             "manual_or_external_count": len(manual_or_external),
             "central_only_count": len(central_only),
             "broker_error": broker_err,
+            "central_error_type": central_error_type,
         },
         "manual_or_external_positions": manual_or_external,
         "matched_positions": matched,
@@ -58085,8 +58547,9 @@ def _mpa_v1_build_payload():
         ],
         "token_value_exposed": False,
     }
-    _flad_v1_write_snapshot(MANUAL_POSITION_AWARENESS_V1_LATEST_FILE, payload)
-    _flad_v1_append_event(MANUAL_POSITION_AWARENESS_V1_EVENTS_FILE, {"event": "MANUAL_POSITION_AWARENESS_SNAPSHOT", "status": status, "summary": payload.get("summary"), "generated_at": payload.get("generated_at")})
+    if persist:
+        _flad_v1_write_snapshot(MANUAL_POSITION_AWARENESS_V1_LATEST_FILE, payload)
+        _flad_v1_append_event(MANUAL_POSITION_AWARENESS_V1_EVENTS_FILE, {"event": "MANUAL_POSITION_AWARENESS_SNAPSHOT", "status": status, "summary": payload.get("summary"), "generated_at": payload.get("generated_at")})
     return _flad_v1_public(payload)
 
 
@@ -59797,7 +60260,7 @@ def real_close_reconciliation_v1_health_route():
         "closed_trade_update_available": bool(central_trade_registry is not None and callable(getattr(central_trade_registry, "update_closed_trade", None))),
         "read_only_broker_lookup": True,
         "sent": False,
-        "routes": ["/realclosereconciliation", "/realclosereconciliation?commit=true&ack=REAL_CLOSE_RECONCILE", "/realclosereconciliation/health"],
+        "routes": ["GET /realclosereconciliation (preview)", "POST /realclosereconciliation (JSON commit=true, ack=REAL_CLOSE_RECONCILE)", "/realclosereconciliation/health"],
     }, 200
 
 
@@ -59810,6 +60273,15 @@ def real_close_reconciliation_v1_route():
         payload.setdefault(key, value)
     commit = _rcrm_v1_bool(payload.get("commit") or payload.get("save"), False)
     ack = str(payload.get("ack") or "").upper().strip()
+    if request.method != "POST" and commit:
+        return {
+            "ok": False,
+            "status": "POST_REQUIRED_FOR_RECONCILIATION",
+            "committed": False,
+            "write_executed": False,
+            "no_order_sent": True,
+            "required_method": "POST",
+        }, 405
     if commit and ack != "REAL_CLOSE_RECONCILE":
         return {
             "ok": False,
@@ -59847,9 +60319,16 @@ def real_close_reconciliation_v1_route():
 REAL_CLOSE_IDENTITY_BACKFILL_V1_ACK = "REAL_CLOSE_STRONG_IDENTITY_BACKFILL_V1"
 
 
-@app.route("/realcloseidentitybackfill", methods=["GET"])
+@app.route("/realcloseidentitybackfill", methods=["GET", "POST"])
 def real_close_identity_backfill_v1_route():
     payload = dict(request.args.items())
+    if request.method == "POST":
+        try:
+            body = request.get_json(silent=True)
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            payload.update(body)
     commit_requested = _rcrm_v1_bool(payload.get("commit"), False)
     ack = str(payload.get("ack") or "").strip()
     base = {
@@ -59859,6 +60338,14 @@ def real_close_identity_backfill_v1_route():
         "broker_called": False,
         "committed": False,
     }
+    if request.method != "POST" and commit_requested:
+        return {
+            **base,
+            "ok": False,
+            "status": "POST_REQUIRED_FOR_BACKFILL",
+            "write_executed": False,
+            "required_method": "POST",
+        }, 405
     if central_trade_registry is None:
         return {
             **base,
@@ -61621,11 +62108,12 @@ def _fcor_v1_text(payload):
 
 
 def _fcor_v1_request_commit_ack():
-    body = request.get_json(silent=True) if request.method == "POST" else {}
+    is_post = request.method == "POST"
+    body = request.get_json(silent=True) if is_post else {}
     body = body if isinstance(body, dict) else {}
-    raw_commit = request.args.get("commit", body.get("commit", False))
+    raw_commit = request.args.get("commit", body.get("commit", False)) if is_post else False
     commit_requested = str(raw_commit).strip().lower() in {"1", "true", "yes", "sim", "on"}
-    ack = request.args.get("ack", body.get("ack"))
+    ack = (request.args.get("ack", body.get("ack")) or body.get("ack")) if is_post else None
     return commit_requested, ack
 
 
@@ -62215,9 +62703,23 @@ def _fmcor_v1_text(payload):
     return "\n".join(lines)
 
 
-@app.route("/falcon/manualclose/outcome/text", methods=["GET"])
+@app.route("/falcon/manualclose/outcome/text", methods=["GET", "POST"])
 def falcon_manual_close_outcome_v1_text_route():
-    extracted = _fmcor_v12_extract_query_params(request.args)
+    params = dict(request.args.items())
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict):
+            params.update(body)
+    extracted = _fmcor_v12_extract_query_params(params)
+    if request.method != "POST" and extracted["commit_requested"]:
+        return {
+            "ok": False,
+            "status": "POST_REQUIRED_FOR_MANUAL_CLOSE_OUTCOME",
+            "committed": False,
+            "write_executed": False,
+            "no_order_sent_by_this_route": True,
+            "required_method": "POST",
+        }, 405
     payload = _fmcor_v1_build_payload(
         extracted["params"],
         commit_requested=extracted["commit_requested"],
@@ -68248,9 +68750,13 @@ def bot_health(key: str, cfg: dict):
 
 @app.route("/predator/autoclosedsync", methods=["GET", "POST"])
 def predator_auto_closed_sync_v1_route():
-    body = request.get_json(silent=True) or {}
-    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
-    ack = body.get("ack", request.args.get("ack"))
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    commit = (
+        _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+        if request.method == "POST"
+        else False
+    )
+    ack = body.get("ack", request.args.get("ack")) if request.method == "POST" else None
     payload = predator_auto_closed_sync_v1_status(
         commit=commit,
         ack=ack,
@@ -68264,9 +68770,13 @@ def predator_auto_closed_sync_v1_route():
 
 @app.route("/predator/autoclosedsync/text", methods=["GET", "POST"])
 def predator_auto_closed_sync_v1_text_route():
-    body = request.get_json(silent=True) or {}
-    commit = _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
-    ack = body.get("ack", request.args.get("ack"))
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+    commit = (
+        _pprsf_v1_bool(body.get("commit", request.args.get("commit")), default=False)
+        if request.method == "POST"
+        else False
+    )
+    ack = body.get("ack", request.args.get("ack")) if request.method == "POST" else None
     return build_predator_auto_closed_sync_v1_text(commit=commit, ack=ack), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
@@ -69500,13 +70010,33 @@ def trade_registry_closed_identity_alias_conflicts_v1_route():
     )
 
 
+if __name__ == "__main__":
+    from werkzeug.serving import make_server
+
+    _central_shutdown_server = make_server(
+        "0.0.0.0", int(os.environ.get("PORT", "10000")), app, threaded=True
+    )
+    _central_restore_shutdown_handlers = install_shutdown_signal_handlers(
+        _central_shutdown_server, RUNTIME_DRAIN
+    )
+
+
 if CENTRAL_AUTO_START_RUNTIME:
     start_central_runtime_once()
 
 
 if __name__ == "__main__":
-    porta = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=porta)
+    try:
+        _central_shutdown_server.serve_forever()
+    finally:
+        try:
+            _central_drained = close_after_drain(
+                _central_shutdown_server, RUNTIME_DRAIN, grace_seconds=27.0
+            )
+            if not _central_drained:
+                print("CENTRAL_SHUTDOWN_DRAIN_TIMEOUT: live entry or Falcon management cycle did not finish before grace deadline")
+        finally:
+            _central_restore_shutdown_handlers()
 
 
 # ============================================================================

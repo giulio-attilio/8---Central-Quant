@@ -457,19 +457,31 @@ def test_broker_sends_and_audits_the_exact_reserved_disaster_stop_id_once():
     class ExchangeProbe:
         def __init__(self):
             self.calls = []
+            self.read_calls = []
 
         def create_order(self, *args):
             self.calls.append(args)
             return {
                 "id": "STOP-ORDER-1",
                 "status": "open",
-                "clientOrderId": client_order_id,
                 "symbol": "SOLUSDT",
                 "side": "sell",
                 "positionSide": "LONG",
                 "type": "stop_market",
                 "amount": 0.13,
                 "stopPrice": 75.924,
+            }
+
+        def fetch_order(self, order_id, symbol):
+            self.read_calls.append((order_id, symbol))
+            return {
+                "id": order_id,
+                "status": "open",
+                "symbol": symbol,
+                "side": "sell",
+                "positionSide": "LONG",
+                "type": "stop_market",
+                "amount": 0.13,
             }
 
     exchange_probe = ExchangeProbe()
@@ -483,6 +495,7 @@ def test_broker_sends_and_audits_the_exact_reserved_disaster_stop_id_once():
             "_broker_account_order_context",
             "_broker_returned_client_order_id",
             "_broker_material_disaster_stop_confirmation",
+            "_broker_readback_disaster_stop",
             "_create_order_with_reserved_attempt",
             "create_disaster_stop_order",
         ),
@@ -558,8 +571,12 @@ def test_broker_sends_and_audits_the_exact_reserved_disaster_stop_id_once():
     assert result["attempt_outcome_persistence_ok"] is True
     assert result["attempt_outcome_persistence"]["persistent"] is True
     assert result["reconciliation_required"] is False
+    assert result["returned_client_order_id_matches"] is False
+    assert result["order_id_readback_verified"] is True
+    assert result["order_id_readback"]["status"] == "DISASTER_STOP_READBACK_CONFIRMED"
     assert len(exchange_probe.calls) == 1
-    assert exchange_probe.calls[0][-1]["clientOrderId"] == client_order_id
+    assert "clientOrderId" not in exchange_probe.calls[0][-1]
+    assert exchange_probe.read_calls == [("STOP-ORDER-1", "SOLUSDT")]
     assert audit_events[-1]["client_order_id"] == client_order_id
 
 
@@ -615,6 +632,14 @@ def test_disaster_stop_operational_armed_requires_all_returned_material_evidence
                 "takeProfitPrice": 80.0,
             },
         },
+        "conflicting_non_stop_order_type": {
+            **valid_order,
+            "info": {
+                "planType": "STOP_LOSS",
+                "orderType": "LIMIT",
+                "stopLossPrice": 75.924,
+            },
+        },
         "market_without_stop_evidence": {
             **valid_order,
             "stopPrice": None,
@@ -663,6 +688,129 @@ def test_disaster_stop_operational_armed_requires_all_returned_material_evidence
         result = confirm(order, **expected)
         assert result["materially_valid"] is False, name
         assert result["failed_checks"], name
+
+
+def test_disaster_stop_order_id_readback_is_exact_and_fail_closed():
+    namespace = _load_broker_functions(
+        (
+            "_broker_material_disaster_stop_confirmation",
+            "_broker_readback_disaster_stop",
+        ),
+        {},
+    )
+    readback = namespace["_broker_readback_disaster_stop"]
+    expected = {
+        "expected_close_side": "sell",
+        "expected_position_side": "LONG",
+        "expected_amount": 0.13,
+        "expected_stop_price": 75.924,
+        "entry_price": 76.212,
+    }
+    factual = {
+        "id": "STOP-1",
+        "status": "open",
+        "symbol": "SOLUSDT",
+        "side": "sell",
+        "positionSide": "LONG",
+        "type": "stop_market",
+        "amount": 0.13,
+        "stopPrice": 75.924,
+    }
+
+    class ExchangeProbe:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def fetch_order(self, order_id, symbol):
+            self.calls.append((order_id, symbol))
+            return self.result
+
+    exchange = ExchangeProbe(factual)
+    confirmed = readback(exchange, "SOLUSDT", "STOP-1", **expected)
+    assert confirmed["ok"] is True
+    assert confirmed["order_id"] == "STOP-1"
+    assert confirmed["read_only"] is True
+    assert confirmed["sent"] is False
+    assert exchange.calls == [("STOP-1", "SOLUSDT")]
+
+    # BingX's documented order-query response omits stopPrice. The exact trigger
+    # is already checked against the creation acknowledgement before this
+    # readback; the readback must still confirm the same active order and leg.
+    documented_query_shape = {key: value for key, value in factual.items() if key != "stopPrice"}
+    query_without_trigger = readback(
+        ExchangeProbe(documented_query_shape),
+        "SOLUSDT",
+        "STOP-1",
+        creation_ack_materially_valid=True,
+        **expected,
+    )
+    assert query_without_trigger["ok"] is True
+    assert query_without_trigger["creation_ack_materially_valid"] is True
+    assert query_without_trigger["material_confirmation"]["trigger_attestation_from_creation"] is True
+
+    unanchored_query_without_trigger = readback(
+        ExchangeProbe(documented_query_shape), "SOLUSDT", "STOP-1", **expected
+    )
+    assert unanchored_query_without_trigger["ok"] is False
+
+    conflicting_query_trigger = readback(
+        ExchangeProbe({**documented_query_shape, "stopPrice": 75.0}),
+        "SOLUSDT",
+        "STOP-1",
+        creation_ack_materially_valid=True,
+        **expected,
+    )
+    assert conflicting_query_trigger["ok"] is False
+
+    malformed_query_trigger = readback(
+        ExchangeProbe({**documented_query_shape, "stopPrice": "not-a-price"}),
+        "SOLUSDT",
+        "STOP-1",
+        creation_ack_materially_valid=True,
+        **expected,
+    )
+    assert malformed_query_trigger["ok"] is False
+
+    wrong_id = readback(
+        ExchangeProbe({**factual, "id": "OTHER-ORDER"}),
+        "SOLUSDT",
+        "STOP-1",
+        **expected,
+    )
+    assert wrong_id["ok"] is False
+    assert wrong_id["status"] == "DISASTER_STOP_READBACK_IDENTITY_MISMATCH"
+
+    conflicting_ids = readback(
+        ExchangeProbe({**factual, "info": {"orderId": "OTHER-ORDER"}}),
+        "SOLUSDT",
+        "STOP-1",
+        **expected,
+    )
+    assert conflicting_ids["ok"] is False
+    assert conflicting_ids["status"] == "DISASTER_STOP_READBACK_IDENTITY_MISMATCH"
+
+    wrong_amount = readback(
+        ExchangeProbe({**factual, "amount": 0.12}),
+        "SOLUSDT",
+        "STOP-1",
+        **expected,
+    )
+    assert wrong_amount["ok"] is False
+    assert wrong_amount["status"] == "DISASTER_STOP_READBACK_NOT_CONFIRMED"
+
+    inactive = readback(
+        ExchangeProbe({**factual, "status": "canceled"}),
+        "SOLUSDT",
+        "STOP-1",
+        **expected,
+    )
+    assert inactive["ok"] is False
+    assert inactive["status"] == "DISASTER_STOP_READBACK_NOT_CONFIRMED"
+
+    missing_id = readback(ExchangeProbe(factual), "SOLUSDT", "", **expected)
+    assert missing_id["ok"] is False
+    assert missing_id["status"] == "DISASTER_STOP_READBACK_ORDER_ID_MISSING"
 
 
 def test_conflicting_returned_client_order_ids_never_match_reserved_identity():
@@ -1075,7 +1223,9 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
         "ENABLE_REAL_TRADING": True,
         "BROKER_IMPORT_ERROR": None,
         "ROLE_ENTRY": "ENTRY",
-        "HEALTH": {},
+        # This test isolates identity-mismatch handling after startup checks;
+        # the separate readiness-gate tests cover the not-ready case.
+        "HEALTH": {"falcon_live_management_reconciliation_ready": True},
         "central_broker": broker_probe,
         "get_positions": lambda: {},
         "falcon_resolve_partial_capable_notional": lambda _sig: {
@@ -1167,6 +1317,9 @@ def test_original_falcon_consumer_routes_sent_missing_client_id_to_unsafe_handle
     assert "disaster_stop_client_order_id" not in mismatched_sig
 
     wrapper_node = definitions[-1]
+    # The test isolates wrapper-body behavior; runtime drain decorator behavior
+    # is covered by the dedicated runtime-drain contract tests.
+    wrapper_node.decorator_list = []
     wrapper_module = ast.Module(body=[wrapper_node], type_ignores=[])
     ast.fix_missing_locations(wrapper_module)
     sync_calls = []

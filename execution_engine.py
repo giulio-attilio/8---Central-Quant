@@ -741,6 +741,15 @@ def validate_real_pilot_guard(payload: Dict[str, Any], plan: Dict[str, Any], dry
     }
 
 
+def _execution_engine_public_broker_status(status: Any) -> Any:
+    """Remove partially masked credentials before broker health leaves the process."""
+    if not isinstance(status, dict):
+        return status
+    safe_status = dict(status)
+    safe_status.pop("api_key_masked", None)
+    return safe_status
+
+
 def execution_engine_health() -> Dict[str, Any]:
     orchestrator_payload = None
     if callable(execution_health):
@@ -753,6 +762,7 @@ def execution_engine_health() -> Dict[str, Any]:
     if central_broker is not None and hasattr(central_broker, "status_payload"):
         try:
             broker_status = central_broker.status_payload(check_ready=False)
+            broker_status = _execution_engine_public_broker_status(broker_status)
         except Exception as exc:
             broker_status = {"ok": False, "error": str(exc)}
 

@@ -230,9 +230,9 @@ def test_rotation_has_no_network_or_operational_imports(tmp_path, monkeypatch):
 def test_main_declares_read_only_preview_and_ack_commit_routes():
     source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
     assert '@app.route("/history/rotation/preview/text", methods=["GET"])' in source
-    assert '@app.route("/history/rotation/commit/text", methods=["GET"])' in source
+    assert '@app.route("/history/rotation/commit/text", methods=["POST"])' in source
     assert '@app.route("/history/rotation/emergency/preview/text", methods=["GET"])' in source
-    assert '@app.route("/history/rotation/emergency/commit/text", methods=["GET"])' in source
+    assert '@app.route("/history/rotation/emergency/commit/text", methods=["POST"])' in source
     assert "commit_history_events_rotation" in source
     assert "HISTORY_ROTATION_V1" in history_manager.HISTORY_ROTATION_V1_ACK
 

@@ -56,6 +56,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 
 import requests
+from personal_http_auth import central_personal_http_auth
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
@@ -1555,7 +1556,12 @@ def call_turtle_risk_guard(sig):
 
     payload = build_turtle_risk_guard_payload(sig)
     try:
-        r = requests.post(TURTLE_RISK_GUARD_URL, json=payload, timeout=TURTLE_RISK_GUARD_TIMEOUT_SECONDS)
+        r = requests.post(
+            TURTLE_RISK_GUARD_URL,
+            json=payload,
+            timeout=TURTLE_RISK_GUARD_TIMEOUT_SECONDS,
+            auth=central_personal_http_auth(TURTLE_RISK_GUARD_URL),
+        )
         if r.status_code != 200:
             return {
                 "ok": False,

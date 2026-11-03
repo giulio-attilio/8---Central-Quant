@@ -54,7 +54,7 @@ def _production_sources() -> tuple[Path, ...]:
             name
             for name in child_directories
             if name not in EXCLUDED_PRODUCTION_SOURCE_PARTS
-            and not name.startswith(".pytest_tmp")
+            and not name.startswith(".pytest")
         ]
         current = Path(directory)
         sources.extend(current / name for name in filenames if name.endswith(".py"))

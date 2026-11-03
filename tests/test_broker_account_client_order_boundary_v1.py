@@ -13,6 +13,12 @@ CLIENT_ORDER_ID = "FDS1-0123456789ABCDEF01234567"
 ENTRY_CLIENT_ORDER_ID = "ENT1-0123456789ABCDEF01234567"
 
 
+@pytest.fixture(autouse=True)
+def _allow_synthetic_exchange_write_boundary(monkeypatch):
+    """Exercise post-guard send logic only with this module's fake exchanges."""
+    monkeypatch.setattr(broker, "_broker_factual_writes_enabled", lambda: True)
+
+
 def test_bingx_ccxt_entry_setup_readback_shape_offline():
     exchange = broker.ccxt.bingx({"enableRateLimit": False})
     assert exchange.has["fetchMarginMode"] is True
@@ -575,6 +581,7 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
     class ExchangeProbe:
         def __init__(self):
             self.create_calls = []
+            self.orders = {}
             self.entry_returned_client_order_id_override = None
 
         def set_margin_mode(self, *_args, **_kwargs):
@@ -591,35 +598,43 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
 
         def create_order(self, symbol, order_type, side, amount, price, params):
             del price
+            returned_client_order_id = params.get("clientOrderId")
             self.create_calls.append(
                 {
                     "symbol": symbol,
                     "type": order_type,
                     "side": side,
                     "amount": amount,
-                    "client_order_id": params["clientOrderId"],
+                    "client_order_id": returned_client_order_id,
                 }
             )
             if order_type == "market":
-                return {
+                order = {
                     "id": "ENTRY-ORDER-1",
                     "status": "closed",
                     "clientOrderId": (
                         self.entry_returned_client_order_id_override
-                        or params["clientOrderId"]
+                        or returned_client_order_id
                     ),
                 }
-            return {
+            else:
+                order = {
                 "id": "STOP-ORDER-1",
                 "status": "open",
-                "clientOrderId": params["clientOrderId"],
                 "symbol": symbol,
                 "side": side,
                 "positionSide": params["positionSide"],
                 "type": order_type,
                 "amount": amount,
                 "stopPrice": params["stopPrice"],
-            }
+                }
+                if returned_client_order_id:
+                    order["clientOrderId"] = returned_client_order_id
+            self.orders[order["id"]] = order
+            return order
+
+        def fetch_order(self, order_id, _symbol):
+            return dict(self.orders[str(order_id)])
 
     exchange = ExchangeProbe()
     audit_events = []
@@ -712,13 +727,15 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
     assert first["returned_client_order_id_matches"] is True
     assert first["disaster_stop"]["stop_operationally_armed"] is True
     assert first["disaster_stop"]["order_id"] == "STOP-ORDER-1"
+    assert first["disaster_stop"]["client_order_id_sent_to_exchange"] is False
+    assert first["disaster_stop"]["order_id_readback_verified"] is True
     assert [call["type"] for call in exchange.create_calls] == [
         "market",
         "stop_market",
     ]
     assert [call["client_order_id"] for call in exchange.create_calls] == [
         ENTRY_CLIENT_ORDER_ID,
-        stop_client_order_id,
+        None,
     ]
     assert outcomes == [
         ("ENTRY", "ACKNOWLEDGED"),

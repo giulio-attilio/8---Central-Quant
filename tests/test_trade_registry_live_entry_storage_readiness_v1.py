@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "main.py"
+MAIN_TREE = ast.parse(MAIN.read_text(encoding="utf-8"), filename=str(MAIN))
 
 
 class _ActiveFile:
@@ -21,11 +22,10 @@ class _ActiveFile:
         return self._exists
 
 
-def _load_readiness(*, state, active_file):
-    tree = ast.parse(MAIN.read_text(encoding="utf-8"), filename=str(MAIN))
+def _load_readiness(*, state, active_file, process_lock=True):
     node = next(
         item
-        for item in tree.body
+        for item in MAIN_TREE.body
         if isinstance(item, ast.FunctionDef)
         and item.name == "_trpsf_v1_falcon_live_entry_storage_readiness"
     )
@@ -34,6 +34,7 @@ def _load_readiness(*, state, active_file):
     namespace = {
         "_TRPSF_V1_STATE": state,
         "_trpsf_v1_active_file": lambda: active_file,
+        "_trpsf_v1_registry_lock": lambda: object() if process_lock else None,
         "TRADE_REGISTRY_PERSISTENT_STORAGE_FIX_V1_VERSION": "TEST-V1",
     }
     exec(compile(module, str(MAIN), "exec"), namespace)
@@ -65,6 +66,20 @@ def test_registry_live_entry_readiness_accepts_only_complete_persistent_proof():
     assert readiness["read_only"] is True
     assert readiness["write_executed"] is False
     assert all(readiness["checks"].values())
+    assert readiness["checks"]["process_lock_available"] is True
+
+
+def test_registry_live_entry_readiness_requires_process_lock():
+    readiness = _load_readiness(
+        state=_ready_state(),
+        active_file=_ActiveFile("/data/trade_registry.json"),
+        process_lock=False,
+    )()
+
+    assert readiness["ok"] is False
+    assert readiness["status"] == "TRADE_REGISTRY_LIVE_ENTRY_STORAGE_NOT_READY"
+    assert readiness["checks"]["process_lock_available"] is False
+    assert readiness["write_executed"] is False
 
 
 def test_registry_live_entry_readiness_fails_closed_for_each_startup_gap():

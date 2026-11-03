@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import copy
 from pathlib import Path
+import socket
 from types import SimpleNamespace
+import urllib.request
 
 import pytest
 
@@ -17,6 +19,389 @@ MAIN_TREE = ast.parse(MAIN_FILE.read_text(encoding="utf-8"))
 
 OPEN_ORDER_ID = "2078483751332171776"
 CLOSE_ORDER_ID = "XRP-MANUAL-CLOSE-ORDER"
+
+
+def test_fetch_order_by_client_id_uses_documented_bingx_parameter(monkeypatch):
+    def blocked(*_args, **_kwargs):
+        raise AssertionError("network access is blocked in this contract test")
+
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+    monkeypatch.setattr(urllib.request, "urlopen", blocked)
+
+    requests = []
+    client_order_id = "C3-SYNTHETIC-ATTEMPT-1"
+    order = {
+        "orderId": "SYNTHETIC-ORDER-1",
+        "clientOrderId": client_order_id,
+        "symbol": "BTC-USDT",
+        "type": "STOP_MARKET",
+        "status": "NEW",
+    }
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeOrder(self, params):
+            requests.append(copy.deepcopy(params))
+            return {"code": 0, "data": {"order": copy.deepcopy(order)}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_orders",
+        lambda **_kwargs: {"orders": [], "errors": []},
+    )
+
+    result = broker.fetch_order_by_id("BTCUSDT", client_order_id=client_order_id)
+
+    assert requests == [
+        {"symbol": "BTC-USDT", "clientOrderId": client_order_id}
+    ]
+    assert result["ok"] is True
+    assert result["order"]["clientOrderId"] == client_order_id
+
+
+def test_fetch_order_not_found_error_is_not_complete_absence_proof(monkeypatch):
+    def blocked(*_args, **_kwargs):
+        raise AssertionError("network access is blocked in this contract test")
+
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+    monkeypatch.setattr(urllib.request, "urlopen", blocked)
+
+    client_order_id = "C3-SYNTHETIC-ATTEMPT-2"
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeOrder(self, _params):
+            raise RuntimeError(
+                '{"code":109421,"msg":"The specified order does not exist"}'
+            )
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_orders",
+        lambda **_kwargs: {"orders": [], "errors": []},
+    )
+
+    result = broker.fetch_order_by_id("BTCUSDT", client_order_id=client_order_id)
+
+    assert result["ok"] is False
+    assert result["order"] is None
+    assert "query_complete" not in result
+    assert "reconciliation_status" not in result
+    assert any(
+        attempt.get("ok") is False and "109421" in attempt.get("error", "")
+        for attempt in result["attempts"]
+    )
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        {
+            "orderId": "EXPECTED-ORDER",
+            "clientOrderId": "OTHER-CLIENT-ID",
+            "symbol": "BTC-USDT",
+        },
+        {
+            "orderId": "OTHER-ORDER",
+            "clientOrderId": "EXPECTED-CLIENT-ID",
+            "symbol": "BTC-USDT",
+        },
+    ],
+)
+def test_fetch_order_rejects_conflicting_returned_identity(monkeypatch, order):
+    def blocked(*_args, **_kwargs):
+        raise AssertionError("network access is blocked in this contract test")
+
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", blocked)
+    monkeypatch.setattr(urllib.request, "urlopen", blocked)
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeOrder(self, _params):
+            return {"code": 0, "data": {"order": copy.deepcopy(order)}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_orders",
+        lambda **_kwargs: {"orders": [], "errors": []},
+    )
+
+    result = broker.fetch_order_by_id(
+        "BTCUSDT",
+        order_id="EXPECTED-ORDER",
+        client_order_id="EXPECTED-CLIENT-ID",
+    )
+
+    assert result["ok"] is False
+    assert result["order"] is None
+    assert result["matched_count"] == 0
+
+
+def test_fetch_order_trades_reads_all_documented_cursor_pages(monkeypatch):
+    requests = []
+    fills = [
+        {
+            "orderId": "CLOSE-ORDER",
+            "tradeId": str(index),
+            "symbol": "BTC-USDT",
+            "side": "SELL",
+            "qty": "1",
+            "price": "65000.5",
+            "time": 1_999_999_500_000 + index,
+        }
+        for index in range(1, 4)
+    ]
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeFillHistory(self, params):
+            requests.append(copy.deepcopy(params))
+            if params["pageIndex"] == 1:
+                return {"code": 0, "data": {"fill_orders": copy.deepcopy(fills[:2])}}
+            return {"code": 0, "data": {"fill_orders": copy.deepcopy(fills[2:])}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": True, "trades": [{"tradeId": "UNVERIFIED-FALLBACK"}]},
+    )
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000, limit=2
+    )
+
+    assert requests == [
+        {
+            "symbol": "BTC-USDT",
+            "startTs": 1_999_999_000_000,
+            "endTs": 2_000_000_000_000,
+            "lastFillId": "0",
+            "pageIndex": 1,
+            "pageSize": 2,
+        },
+        {
+            "symbol": "BTC-USDT",
+            "startTs": 1_999_999_000_000,
+            "endTs": 2_000_000_000_000,
+            "lastFillId": "2",
+            "pageIndex": 2,
+            "pageSize": 2,
+        },
+    ]
+    assert result["fill_window_read_ok"] is True
+    assert result["all_trades"] == fills
+    assert result["matched_count"] == 0
+
+
+def test_fetch_order_trades_fallback_does_not_verify_fill_window(monkeypatch):
+    class FakeExchange:
+        def swapV2PrivateGetTradeFillHistory(self, _params):
+            raise RuntimeError("synthetic read failure")
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": True, "trades": [{"tradeId": "FALLBACK-ONLY"}]},
+    )
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000
+    )
+
+    assert result["ok"] is False
+    assert result["fallback_ok"] is True
+    assert result["fill_window_read_ok"] is False
+    assert result["all_trades"] == [{"tradeId": "FALLBACK-ONLY"}]
+    assert result["attempts"][0]["ok"] is False
+
+
+def test_fetch_order_trades_rejects_success_code_with_malformed_data(monkeypatch):
+    class FakeExchange:
+        def swapV2PrivateGetTradeFillHistory(self, _params):
+            return {"code": 0, "data": {"unexpected": "not a fill collection"}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": True, "trades": [{"tradeId": "FALLBACK-ONLY"}]},
+    )
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000
+    )
+
+    assert result["ok"] is False
+    assert result["fill_window_read_ok"] is False
+    assert result["all_trades"] == [{"tradeId": "FALLBACK-ONLY"}]
+    assert result["attempts"][0]["error"] == "INVALID_FILL_HISTORY_PAGE"
+
+
+def test_fetch_order_trades_repeated_full_page_cursor_cannot_claim_complete_window(monkeypatch):
+    fill = {
+        "orderId": "CLOSE-ORDER",
+        "tradeId": "1",
+        "symbol": "BTC-USDT",
+        "side": "SELL",
+        "qty": "1",
+        "price": "65000.5",
+        "time": 1_999_999_500_000,
+    }
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeFillHistory(self, _params):
+            return {"code": 0, "data": {"fill_orders": [copy.deepcopy(fill)]}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": False, "trades": []},
+    )
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000, limit=1
+    )
+
+    assert result["fill_window_read_ok"] is False
+    assert result["ok"] is False
+    assert result["attempts"][-1]["error"] == "FILL_HISTORY_CURSOR_MISSING_OR_REPEATED"
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["tradeId", "orderId", "symbol", "side", "qty", "price", "time"],
+)
+def test_fetch_order_trades_rejects_fill_page_missing_identity_or_measurement_fields(
+    monkeypatch, missing_field
+):
+    fill = {
+        "tradeId": "10",
+        "orderId": "CLOSE-ORDER",
+        "symbol": "BTC-USDT",
+        "side": "SELL",
+        "qty": "1",
+        "price": "65000.5",
+        "time": 1_999_999_500_000,
+    }
+    fill.pop(missing_field)
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeFillHistory(self, _params):
+            # A short page normally signals the end, but a missing tradeId
+            # means neither pagination nor fill identity can be verified.
+            return {"code": 0, "data": {"fill_orders": [copy.deepcopy(fill)]}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": False, "trades": []},
+    )
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000
+    )
+
+    assert result["fill_window_read_ok"] is False
+    assert result["ok"] is False
+    assert result["all_trades"] == []
+    assert result["attempts"][-1]["error"] == "INVALID_FILL_HISTORY_PAGE"
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("qty", float("inf")),
+        ("qty", float("nan")),
+        ("price", float("inf")),
+        ("price", float("nan")),
+        ("time", float("inf")),
+        ("time", float("nan")),
+    ],
+)
+def test_fetch_order_trades_rejects_nonfinite_fill_measurements(
+    monkeypatch, field, invalid_value
+):
+    fill = {
+        "tradeId": "10",
+        "orderId": "CLOSE-ORDER",
+        "symbol": "BTC-USDT",
+        "side": "SELL",
+        "qty": "1",
+        "price": "65000.5",
+        "time": 1_999_999_500_000,
+    }
+    fill[field] = invalid_value
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeFillHistory(self, _params):
+            return {"code": 0, "data": {"fill_orders": [copy.deepcopy(fill)]}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": False, "trades": []},
+    )
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000
+    )
+
+    assert result["fill_window_read_ok"] is False
+    assert result["ok"] is False
+    assert result["all_trades"] == []
+    assert result["attempts"][-1]["error"] == "INVALID_FILL_HISTORY_PAGE"
+
+
+def test_fetch_order_trades_rejects_nonnumeric_fill_cursor(monkeypatch):
+    fill = {
+        "tradeId": "NOT-A-NUMERIC-CURSOR",
+        "orderId": "CLOSE-ORDER",
+        "symbol": "BTC-USDT",
+        "side": "SELL",
+        "qty": "1",
+        "price": "65000.5",
+        "time": 1_999_999_500_000,
+    }
+
+    class FakeExchange:
+        def swapV2PrivateGetTradeFillHistory(self, _params):
+            return {"code": 0, "data": {"fill_orders": [copy.deepcopy(fill)]}}
+
+    monkeypatch.setattr(broker, "exchange", lambda: FakeExchange())
+    monkeypatch.setattr(
+        broker,
+        "fetch_recent_my_trades",
+        lambda **_kwargs: {"ok": False, "trades": []},
+    )
+    monkeypatch.setattr(broker.time, "time", lambda: 2_000_000_000)
+
+    result = broker.fetch_order_trades(
+        "BTCUSDT", order_id="OPEN-ORDER", since=1_999_999_000
+    )
+
+    assert result["fill_window_read_ok"] is False
+    assert result["ok"] is False
+    assert result["all_trades"] == []
+    assert result["attempts"][-1]["error"] == "INVALID_FILL_HISTORY_PAGE"
 
 
 def _main_function_nodes(wanted):
@@ -118,7 +503,15 @@ def _income_rows():
     ]
 
 
-def _run_broker_reconciliation(monkeypatch, closing_volume="9", income_rows=None):
+def _run_broker_reconciliation(
+    monkeypatch,
+    closing_volume="9",
+    income_rows=None,
+    fill_window_read_ok=True,
+    position_read_fails=False,
+    position_rows=None,
+    extra_trades=None,
+):
     opening, closing = _broker_rows(closing_volume=closing_volume)
     order = {
         "id": OPEN_ORDER_ID,
@@ -141,8 +534,13 @@ def _run_broker_reconciliation(monkeypatch, closing_volume="9", income_rows=None
         broker,
         "fetch_order_trades",
         lambda *_args, **_kwargs: {
-            "ok": True,
-            "all_trades": [copy.deepcopy(opening), copy.deepcopy(closing)],
+            "ok": fill_window_read_ok,
+            "fill_window_read_ok": fill_window_read_ok,
+            "all_trades": [
+                copy.deepcopy(opening),
+                copy.deepcopy(closing),
+                *copy.deepcopy(extra_trades or []),
+            ],
             "error": None,
         },
     )
@@ -151,7 +549,17 @@ def _run_broker_reconciliation(monkeypatch, closing_volume="9", income_rows=None
         "fetch_realized_income",
         lambda *_args, **_kwargs: copy.deepcopy(income),
     )
-    monkeypatch.setattr(broker, "get_positions", lambda *_args, **_kwargs: [])
+    if position_read_fails:
+        def fail_positions(*_args, **_kwargs):
+            raise RuntimeError("synthetic position read failure")
+
+        monkeypatch.setattr(broker, "get_positions", fail_positions)
+    else:
+        monkeypatch.setattr(
+            broker,
+            "get_positions",
+            lambda *_args, **_kwargs: copy.deepcopy(position_rows or []),
+        )
 
     return broker.reconcile_closed_trade(
         symbol="XRPUSDT",
@@ -210,6 +618,137 @@ def test_closing_quantity_above_expected_is_blocked(monkeypatch):
     assert result["qty_complete"] is False
     assert result["qty_exceeds_expected"] is True
     assert "CLOSING_QTY_EXCEEDS_EXPECTED" in result["issues"]
+
+
+def test_unverified_fill_window_cannot_complete_reconciliation(monkeypatch):
+    result = _run_broker_reconciliation(monkeypatch, fill_window_read_ok=False)
+
+    assert result["complete"] is False
+    assert result["status"] == "BROKER_CLOSE_RECONCILIATION_INCOMPLETE"
+    assert result["qty_complete"] is True
+    assert "FILL_HISTORY_WINDOW_UNVERIFIED" in result["issues"]
+    assert result["trade_lookup"]["fill_window_read_ok"] is False
+
+
+def test_position_read_failure_cannot_prove_position_closed(monkeypatch):
+    result = _run_broker_reconciliation(monkeypatch, position_read_fails=True)
+
+    assert result["complete"] is False
+    assert result["position_closed"] is False
+    assert result["position_read_ok"] is False
+    assert "POSITION_READ_UNVERIFIED" in result["issues"]
+
+
+@pytest.mark.parametrize(
+    "invalid_amount",
+    [None, "not-a-number", float("nan"), float("inf"), float("-inf")],
+)
+def test_invalid_position_amount_cannot_prove_position_closed(
+    monkeypatch, invalid_amount
+):
+    result = _run_broker_reconciliation(
+        monkeypatch,
+        position_rows=[
+            {
+                "symbol": "XRP-USDT",
+                "positionSide": "LONG",
+                "contracts": invalid_amount,
+            }
+        ],
+    )
+
+    assert result["complete"] is False
+    assert result["position_closed"] is False
+    assert result["position_read_ok"] is False
+    assert "POSITION_READ_UNVERIFIED" in result["issues"]
+
+
+@pytest.mark.parametrize(
+    "position_row",
+    [
+        {"contracts": 0.0, "info": {"positionAmt": "9"}},
+        {"contracts": 9.0, "info": {"positionAmt": "0"}},
+    ],
+)
+def test_conflicting_zero_and_open_position_fields_cannot_confirm_close(
+    monkeypatch, position_row
+):
+    result = _run_broker_reconciliation(
+        monkeypatch,
+        position_rows=[
+            {
+                "symbol": "XRP-USDT",
+                "positionSide": "LONG",
+                **position_row,
+            }
+        ],
+    )
+
+    assert result["complete"] is False
+    assert result["position_closed"] is False
+    assert result["position_read_ok"] is False
+    assert "POSITION_READ_UNVERIFIED" in result["issues"]
+
+
+def test_available_to_close_quantity_does_not_override_total_position(monkeypatch):
+    result = _run_broker_reconciliation(
+        monkeypatch,
+        position_rows=[
+            {
+                "symbol": "XRP-USDT",
+                "positionSide": "LONG",
+                "contracts": 9.0,
+                "info": {"positionAmt": "9", "availableAmt": "0"},
+            }
+        ],
+    )
+
+    assert result["complete"] is False
+    assert result["position_closed"] is False
+    assert result["position_read_ok"] is True
+    assert "POSITION_READ_UNVERIFIED" not in result["issues"]
+
+
+def test_explicit_zero_position_amount_can_confirm_closed_position(monkeypatch):
+    result = _run_broker_reconciliation(
+        monkeypatch,
+        position_rows=[
+            {
+                "symbol": "XRP-USDT",
+                "positionSide": "LONG",
+                "contracts": 0.0,
+            }
+        ],
+    )
+
+    assert result["complete"] is True
+    assert result["position_read_ok"] is True
+    assert result["position_closed"] is True
+    assert "POSITION_READ_UNVERIFIED" not in result["issues"]
+
+
+def test_opening_fill_client_id_does_not_override_conflicting_order_id(monkeypatch):
+    conflicting_fill = {
+        "id": "CONFLICTING-FILL",
+        "order": "DIFFERENT-ORDER",
+        "timestamp": 1_784_384_714_000,
+        "side": "buy",
+        "price": 1.0871,
+        "amount": 9,
+        "info": {
+            "orderId": "DIFFERENT-ORDER",
+            "clientOrderId": "FALCON-LIVE-FALCON15-1784384114",
+            "volume": "9",
+            "positionSide": "LONG",
+        },
+    }
+
+    result = _run_broker_reconciliation(
+        monkeypatch,
+        extra_trades=[conflicting_fill],
+    )
+
+    assert conflicting_fill not in result["opening_fills"]
 
 
 def test_fee_without_unique_temporal_or_identity_association_is_inconclusive(

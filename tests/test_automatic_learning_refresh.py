@@ -229,7 +229,7 @@ def test_manual_learning_and_policy_surfaces_remain_present():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     for marker in (
         '@app.route("/learning")',
-        '@app.route("/learning/refresh")',
+        '@app.route("/learning/refresh", methods=["POST"])',
         '@app.route("/learning/status")',
         '@app.route("/learning/readiness")',
         '@app.route("/policylearning", methods=["GET"])',

@@ -21,6 +21,107 @@ AUTO = "predator_auto_closed_sync_v1_status"
 WRITERS = [MANUAL, RECOVER, MODE, MISSING, PAPER, ORPHAN, AUTO]
 
 
+def _direct_registry_save_calls(path, *, module_level_name=None, receiver_name=None):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_match = (
+            isinstance(func, ast.Name)
+            and func.id == module_level_name
+            if module_level_name is not None
+            else isinstance(func, ast.Attribute)
+            and func.attr == "save_registry"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == receiver_name
+        )
+        if not is_match:
+            continue
+        lock_names = set()
+        function_name = None
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.With, ast.AsyncWith)):
+                for item in parent.items:
+                    lock_names.update(
+                        child.id for child in ast.walk(item.context_expr)
+                        if isinstance(child, ast.Name)
+                    )
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                function_name = getattr(parent, "name", None)
+                break
+            parent = parents.get(parent)
+        calls.append((node.lineno, lock_names, function_name))
+    return calls
+
+
+def _restore_has_lock_reentry_guard(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "registry_persistence_v1_restore_from_latest_snapshot":
+            continue
+        for child in ast.walk(node):
+            if not isinstance(child, ast.If):
+                continue
+            names = {
+                item.id for item in ast.walk(child.test) if isinstance(item, ast.Name)
+            }
+            negates_lock_held = any(
+                isinstance(item, ast.UnaryOp)
+                and isinstance(item.op, ast.Not)
+                and isinstance(item.operand, ast.Name)
+                and item.operand.id == "_lock_held"
+                for item in ast.walk(child.test)
+            )
+            if "commit" not in names or not negates_lock_held:
+                continue
+            return any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == node.name
+                and any(
+                    keyword.arg == "_lock_held"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                    for keyword in call.keywords
+                )
+                for call in ast.walk(ast.Module(body=child.body, type_ignores=[]))
+            )
+    return False
+
+
+def test_every_direct_registry_save_call_is_inside_shared_lock():
+    root = Path(__file__).resolve().parents[1]
+    module_calls = _direct_registry_save_calls(
+        root / "trade_registry.py", module_level_name="save_registry"
+    )
+    app_calls = _direct_registry_save_calls(
+        root / "main.py", receiver_name="central_trade_registry"
+    )
+
+    assert module_calls, "expected direct save_registry calls in trade_registry.py"
+    assert app_calls, "expected central Registry writes in main.py"
+    assert all("_lock" in locks for _, locks, _ in module_calls), [
+        (line, sorted(locks)) for line, locks, _ in module_calls if "_lock" not in locks
+    ]
+    unguarded_app_calls = [
+        (line, sorted(locks), function_name)
+        for line, locks, function_name in app_calls
+        if "registry_lock" not in locks
+        and function_name != "registry_persistence_v1_restore_from_latest_snapshot"
+    ]
+    assert not unguarded_app_calls, unguarded_app_calls
+    if any(
+        function_name == "registry_persistence_v1_restore_from_latest_snapshot"
+        and "registry_lock" not in locks
+        for _, locks, function_name in app_calls
+    ):
+        assert _restore_has_lock_reentry_guard(root / "main.py")
+
+
 class Stage(ContextDecorator):
     def __enter__(self):
         return self

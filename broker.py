@@ -58,6 +58,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 
 import ccxt
+from runtime_drain_v1 import RUNTIME_DRAIN, guard_new_live_entries
 
 from account_client_order_id import (
     ROLE_BREAK_EVEN_STOP,
@@ -300,6 +301,7 @@ def _broker_material_disaster_stop_confirmation(
     expected_amount,
     expected_stop_price,
     entry_price,
+    allow_missing_trigger=False,
 ):
     """Validate factual material returned for a newly-created protective stop.
 
@@ -380,11 +382,12 @@ def _broker_material_disaster_stop_confirmation(
         for value in values("takeProfitPrice", "take_profit_price")
         if number(value) is not None
     ]
+    raw_trigger_values = values(
+        "stopLossPrice", "stop_loss_price", "stopPrice", "triggerPrice"
+    )
     trigger_prices = [
         number(value)
-        for value in values(
-            "stopLossPrice", "stop_loss_price", "stopPrice", "triggerPrice"
-        )
+        for value in raw_trigger_values
         if number(value) is not None
     ]
     factual_amounts = [
@@ -471,19 +474,28 @@ def _broker_material_disaster_stop_confirmation(
             for value in factual_amounts
         )
     )
+    recognized_stop_types = {"STOP", "STOP_MARKET", "STOP_LOSS", "TRIGGER_MARKET"}
+    explicit_stop_types = type_values & recognized_stop_types
+    conflicting_types = type_values - recognized_stop_types - {"MARKET"}
     type_valid = bool(
-        stop_loss_evidence_present and not take_profit_evidence_present
+        stop_loss_evidence_present
+        and explicit_stop_types
+        and not conflicting_types
+        and not take_profit_evidence_present
     )
 
+    trigger_attestation_from_creation = bool(
+        allow_missing_trigger and not raw_trigger_values
+    )
     checks = {
         "symbol_matches": symbol_matches,
         "close_side_matches": close_side_matches,
         "position_side_matches": position_side_matches,
         "close_semantics_valid": close_semantics_valid,
         "type_valid": type_valid,
-        "trigger_present": trigger_present,
-        "trigger_matches_requested": trigger_matches_requested,
-        "trigger_direction_valid": trigger_direction_valid,
+        "trigger_present": trigger_present or trigger_attestation_from_creation,
+        "trigger_matches_requested": trigger_matches_requested or trigger_attestation_from_creation,
+        "trigger_direction_valid": trigger_direction_valid or trigger_attestation_from_creation,
         "quantity_matches": quantity_matches,
     }
     failed_checks = [name for name, valid in checks.items() if not valid]
@@ -504,6 +516,7 @@ def _broker_material_disaster_stop_confirmation(
         "type_values": sorted(type_values),
         "stop_loss_evidence_present": stop_loss_evidence_present,
         "take_profit_evidence_present": take_profit_evidence_present,
+        "trigger_attestation_from_creation": trigger_attestation_from_creation,
     }
 
 
@@ -520,8 +533,22 @@ def _create_order_with_reserved_attempt(
     expected_reservation_roles,
     client_order_id_reservation_verifier=None,
     send_state=None,
+    exchange_client_order_id_supported=True,
 ):
     """The sole raw ``create_order`` boundary for Central-managed orders."""
+
+    # Defense in depth: even if a caller bypasses its public mode guard, this
+    # sole exchange-write boundary must independently fail closed. Check before
+    # consuming the persistent one-shot send authorization.
+    if not _broker_factual_writes_enabled():
+        return {
+            "ok": False,
+            "status": "BROKER_WRITE_MODE_DISABLED",
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "create_returned": False,
+        }
 
     send_state = send_state if isinstance(send_state, dict) else {}
     params = dict(params or {})
@@ -709,8 +736,15 @@ def _create_order_with_reserved_attempt(
     )
     send_state["phase"] = "CREATE_ORDER_CALL"
     try:
+        exchange_params = dict(params)
+        if exchange_client_order_id_supported is False:
+            # Keep the durable internal reservation, but do not send an
+            # unsupported clientOrderId field to this exchange order family.
+            exchange_params.pop("clientOrderId", None)
+            exchange_params.pop("clientOrderID", None)
+            exchange_params.pop("client_order_id", None)
         order = ex.create_order(
-            symbol, order_type, side, amount, price, params
+            symbol, order_type, side, amount, price, exchange_params
         )
     except Exception:
         outcome_persistence = persist_attempt_outcome(
@@ -797,7 +831,20 @@ DEFAULT_REAL_LEVERAGE = int(
 BINGX_TIMEOUT_MS = int(os.environ.get("BINGX_TIMEOUT_MS", "15000"))
 ENABLE_REAL_TRADING = env_bool("ENABLE_REAL_TRADING", False)
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "PAPER").strip().upper()
-BROKER_DRY_RUN = env_bool("BROKER_DRY_RUN", EXECUTION_MODE != "LIVE" or not ENABLE_REAL_TRADING)
+
+
+def _broker_dry_run_enabled(value) -> bool:
+    """Stay in dry-run unless the operator explicitly supplies false."""
+
+    if value is None:
+        return True
+    return str(value).strip().lower() not in {
+        "0", "false", "no", "nao", "não", "off",
+    }
+
+
+# Missing or malformed configuration must not inherit permission to write.
+BROKER_DRY_RUN = _broker_dry_run_enabled(os.environ.get("BROKER_DRY_RUN"))
 
 # Automatic Broker Preview Firewall V1
 # Bloqueia previews automáticos no broker para bots específicos quando o envio real não está habilitado.
@@ -980,7 +1027,8 @@ def safe_float(value, default=None):
     try:
         if value is None:
             return default
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else default
     except Exception:
         return default
 
@@ -1850,7 +1898,8 @@ def _safe_float_broker(value, default=None):
             value = value.replace(",", ".").replace("%", "").strip()
             if not value:
                 return default
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else default
     except Exception:
         return default
 
@@ -1914,6 +1963,114 @@ def _build_disaster_stop_hedge_mode_fix_payload(position_side, reduce_only_reque
         "reduce_only_removed_for_hedge_mode": bool(reduce_only_requested and hedge_mode_detected),
         "disaster_stop_payload_safe": True,
         "token_value_exposed": False,
+    }
+
+
+def _broker_readback_disaster_stop(
+    ex,
+    symbol,
+    order_id,
+    *,
+    expected_close_side,
+    expected_position_side,
+    expected_amount,
+    expected_stop_price,
+    entry_price,
+    creation_ack_materially_valid=False,
+):
+    """Read back one stop by its exact exchange-generated order ID."""
+    requested_id = str(order_id or "").strip()
+    fetch_order = getattr(ex, "fetch_order", None)
+    if not requested_id:
+        status = "DISASTER_STOP_READBACK_ORDER_ID_MISSING"
+    elif not callable(fetch_order):
+        status = "DISASTER_STOP_READBACK_HELPER_MISSING"
+    else:
+        status = None
+    if status:
+        return {
+            "ok": False,
+            "status": status,
+            "order_id": requested_id or None,
+            "read_only": True,
+            "sent": False,
+        }
+    try:
+        factual_order = fetch_order(requested_id, symbol)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "DISASTER_STOP_READBACK_ERROR",
+            "order_id": requested_id,
+            "error_type": type(exc).__name__,
+            "read_only": True,
+            "sent": False,
+        }
+    if not isinstance(factual_order, dict):
+        return {
+            "ok": False,
+            "status": "DISASTER_STOP_READBACK_INVALID_PAYLOAD",
+            "order_id": requested_id,
+            "read_only": True,
+            "sent": False,
+        }
+    info = factual_order.get("info") if isinstance(factual_order.get("info"), dict) else {}
+    actual_ids = {
+        str(value).strip()
+        for value in (
+            factual_order.get("id"),
+            factual_order.get("orderId"),
+            info.get("orderId"),
+            info.get("orderID"),
+            info.get("order_id"),
+        )
+        if value not in (None, "")
+    }
+    actual_id = next(iter(actual_ids), "") if len(actual_ids) == 1 else ""
+    if actual_ids != {requested_id}:
+        return {
+            "ok": False,
+            "status": "DISASTER_STOP_READBACK_IDENTITY_MISMATCH",
+            "order_id": actual_id or None,
+            "requested_order_id": requested_id,
+            "read_only": True,
+            "sent": False,
+        }
+    status_values = {
+        str(value).upper().strip()
+        for value in (
+            factual_order.get("status"),
+            info.get("status"),
+            info.get("orderStatus"),
+            info.get("planStatus"),
+        )
+        if value not in (None, "")
+    }
+    active_statuses = {
+        "OPEN", "NEW", "PENDING", "ACTIVE", "TRIGGER_PENDING", "NOT_TRIGGERED"
+    }
+    status_active = bool(status_values and status_values <= active_statuses)
+    material = _broker_material_disaster_stop_confirmation(
+        factual_order,
+        expected_symbol=symbol,
+        expected_close_side=expected_close_side,
+        expected_position_side=expected_position_side,
+        expected_amount=expected_amount,
+        expected_stop_price=expected_stop_price,
+        entry_price=entry_price,
+        allow_missing_trigger=creation_ack_materially_valid,
+    )
+    ok = bool(status_active and material.get("materially_valid") is True)
+    return {
+        "ok": ok,
+        "status": "DISASTER_STOP_READBACK_CONFIRMED" if ok else "DISASTER_STOP_READBACK_NOT_CONFIRMED",
+        "order_id": actual_id,
+        "status_active": status_active,
+        "status_values": sorted(status_values),
+        "material_confirmation": material,
+        "creation_ack_materially_valid": bool(creation_ack_materially_valid),
+        "read_only": True,
+        "sent": False,
     }
 
 
@@ -2064,7 +2221,8 @@ def create_disaster_stop_order(
         "amount": amount_value,
         "stopPrice": float(stop_price),
         "workingType": DISASTER_STOP_WORKING_TYPE,
-        "clientOrderId": client_order_id,
+        "internal_client_order_id": client_order_id,
+        "client_order_id_sent_to_exchange": False,
         "positionSide": position_side,
         "reduceOnly_in_payload": bool(reduce_only_sent),
         "reduceOnly_value": True if reduce_only_sent else None,
@@ -2094,6 +2252,7 @@ def create_disaster_stop_order(
             expected_reservation_roles={ROLE_INITIAL_DISASTER_STOP},
             client_order_id_reservation_verifier=client_order_id_reservation_verifier,
             send_state=send_state,
+            exchange_client_order_id_supported=False,
         )
         if not create_result.get("ok"):
             create_sent = create_result.get("sent")
@@ -2175,12 +2334,35 @@ def create_disaster_stop_order(
             expected_stop_price=float(stop_price),
             entry_price=entry_value,
         )
+        order_id = str(
+            order.get("id")
+            or order.get("orderId")
+            or order_info.get("orderId")
+            or order_info.get("orderID")
+            or order_info.get("order_id")
+            or ""
+        ).strip()
+        readback = _broker_readback_disaster_stop(
+            ex,
+            sym,
+            order_id,
+            expected_close_side=close_side,
+            expected_position_side=position_side,
+            expected_amount=amount_value,
+            expected_stop_price=float(stop_price),
+            entry_price=entry_value,
+            creation_ack_materially_valid=(
+                material_confirmation.get("materially_valid") is True
+            ),
+        )
         operationally_armed = bool(
             create_result.get("client_order_id_unique") is True
-            and returned_id_matches
+            and order_id
             and status_active
             and order.get("id")
             and material_confirmation.get("materially_valid") is True
+            and readback.get("ok") is True
+            and str(readback.get("order_id") or "").strip() == order_id
         )
         result = {
             "ok": operationally_armed,
@@ -2212,6 +2394,7 @@ def create_disaster_stop_order(
             "disaster_stop_payload_sanitized": payload_sanitized,
             "disaster_stop_hedge_mode_fix": fix_payload,
             "client_order_id": client_order_id,
+            "client_order_id_sent_to_exchange": False,
             "client_order_id_unique": True,
             "client_order_id_reserved": True,
             "client_order_id_reservation_status": "RESERVED_UNIQUE",
@@ -2219,6 +2402,11 @@ def create_disaster_stop_order(
             "reservation_verification": create_result.get("reservation_verification"),
             "returned_client_order_id": create_result.get("returned_client_order_id"),
             "returned_client_order_id_matches": returned_id_matches,
+            "order_id_readback_verified": bool(
+                readback.get("ok") is True
+                and str(readback.get("order_id") or "").strip() == order_id
+            ),
+            "order_id_readback": readback,
             "stop_created": True,
             "stop_status_active": status_active,
             "stop_status_values": sorted(status_values),
@@ -2226,6 +2414,7 @@ def create_disaster_stop_order(
                 "materially_valid"
             ) is True,
             "stop_material_confirmation": material_confirmation,
+            "stop_readback_material_confirmation": readback.get("material_confirmation"),
             "stop_operationally_armed": operationally_armed,
             "attempt_outcome_persistence": create_result.get(
                 "attempt_outcome_persistence"
@@ -2237,7 +2426,7 @@ def create_disaster_stop_order(
                 not operationally_armed
                 or create_result.get("reconciliation_required")
             ),
-            "order_id": order.get("id"),
+            "order_id": order_id or None,
             "raw": order,
         }
         _set_last_disaster_stop_diagnostic(result=result, error=None, payload_sanitized=payload_sanitized)
@@ -2732,6 +2921,7 @@ def _confirm_entry_margin_and_leverage(ex, symbol, leverage, position_side):
     return result
 
 
+@guard_new_live_entries(RUNTIME_DRAIN, is_real_live_send_enabled)
 def place_market_order(
     symbol,
     side,
@@ -3661,7 +3851,8 @@ def _cq_patch_safe_float(value, default=None):
             value = value.replace(",", ".").replace("%", "").strip()
             if not value:
                 return default
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else default
     except Exception:
         return default
 
@@ -4174,7 +4365,7 @@ def _rcr_v1_list_from_response(payload):
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in ("data", "orders", "order", "fills", "trades", "items", "list", "records", "income"):
+    for key in ("data", "orders", "order", "fillOrders", "fill_orders", "fills", "trades", "items", "list", "records", "income"):
         value = payload.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
@@ -4230,6 +4421,32 @@ def _rcr_v1_side(item):
 def _rcr_v1_position_side(item):
     side = str(_rcr_v1_first(item, "positionSide", "position_side", default="") or "").upper().strip()
     return side
+
+
+def _rcr_v1_position_amount(item):
+    """Return a verified position size, rejecting conflicting zero/nonzero fields."""
+    if not isinstance(item, dict):
+        return None
+    info = _rcr_v1_info(item)
+    keys = (
+        "contracts", "positionAmt", "positionAmount", "positionQty",
+        "positionQuantity", "positionSize", "amount", "size",
+    )
+    parsed_values = []
+    for source in (item, info):
+        for key in keys:
+            value = source.get(key)
+            if value in (None, ""):
+                continue
+            parsed = safe_float(value, None)
+            if parsed is None or not math.isfinite(parsed):
+                return None
+            parsed_values.append(abs(parsed))
+    if not parsed_values:
+        return None
+    if any(value == 0 for value in parsed_values) and any(value > 0 for value in parsed_values):
+        return None
+    return parsed_values[0]
 
 
 def _rcr_v1_price(item):
@@ -4458,7 +4675,7 @@ def fetch_order_by_id(symbol, order_id=None, client_order_id=None):
     if oid:
         params["orderId"] = oid
     if cid:
-        params["clientOrderID"] = cid
+        params["clientOrderId"] = cid
     raw_rows, raw_attempts = _rcr_v1_call_raw(
         [
             "swapV2PrivateGetTradeOrder",
@@ -4477,7 +4694,16 @@ def fetch_order_by_id(symbol, order_id=None, client_order_id=None):
     matches.extend(recent.get("orders") or [])
 
     def is_match(item):
-        return bool((oid and _rcr_v1_order_id(item) == oid) or (cid and _rcr_v1_client_id(item) == cid))
+        item_oid = _rcr_v1_order_id(item)
+        item_cid = _rcr_v1_client_id(item)
+        # An exact match on one identifier must not override a contradiction
+        # in another identifier returned by the exchange. Either identifier
+        # may be omitted by a response, but any supplied identity must agree.
+        if oid and item_oid and item_oid != oid:
+            return False
+        if cid and item_cid and item_cid != cid:
+            return False
+        return bool((oid and item_oid == oid) or (cid and item_cid == cid))
 
     matched = [item for item in matches if isinstance(item, dict) and is_match(item)]
     selected = matched[-1] if matched else None
@@ -4496,24 +4722,149 @@ def fetch_order_by_id(symbol, order_id=None, client_order_id=None):
 
 
 def fetch_order_trades(symbol, order_id=None, client_order_id=None, since=None, limit=500):
-    """Consulta fills/trades e filtra por orderId/clientOrderId."""
+    """Consulta todos os fills da janela por cursor; CCXT é apenas diagnóstico."""
     sym = normalize_symbol(symbol)
     since_ms = int(float(since) * 1000) if since and float(since) < 10_000_000_000 else (int(float(since)) if since else None)
     payload = fetch_recent_my_trades(symbol=sym, since=since_ms, limit=limit)
-    rows = list(payload.get("trades") or [])
-    raw_rows, attempts = _rcr_v1_call_raw(
-        [
-            "swapV2PrivateGetTradeAllFillOrders",
-            "swap_v2_private_get_trade_all_fill_orders",
-            "swapV2PrivateGetTradeAllfillorders",
-        ],
-        {
-            "symbol": bingx_api_symbol(sym),
-            "startTime": since_ms,
-            "limit": min(max(int(limit or 500), 1), 1000),
-        },
-    )
-    rows.extend(raw_rows)
+    fallback_rows = list(payload.get("trades") or [])
+    raw_rows = []
+    attempts = []
+    fill_window_read_ok = False
+    end_ms = int(time.time() * 1000)
+    try:
+        page_size = min(1000, max(1, int(limit or 500)))
+    except (TypeError, ValueError, OverflowError):
+        page_size = 500
+    max_pages = 100
+    if since_ms is None or since_ms < 0 or since_ms > end_ms:
+        attempts.append({"method": "fillHistory", "ok": False, "error": "INVALID_OR_MISSING_HISTORY_WINDOW"})
+    else:
+        ex = exchange()
+        method_name = "swapV2PrivateGetTradeFillHistory"
+        method = getattr(ex, method_name, None)
+        if not callable(method):
+            attempts.append({"method": method_name, "ok": False, "error": "FILL_HISTORY_ENDPOINT_UNAVAILABLE"})
+        else:
+            cursor = "0"
+            seen_cursors = {cursor}
+            for page_index in range(1, max_pages + 1):
+                params = {
+                    "symbol": bingx_api_symbol(sym),
+                    "startTs": since_ms,
+                    "endTs": end_ms,
+                    "lastFillId": cursor,
+                    "pageIndex": page_index,
+                    "pageSize": page_size,
+                }
+                try:
+                    response = method(dict(params))
+                    response_code = response.get("code") if isinstance(response, dict) else None
+                    response_data = response.get("data") if isinstance(response, dict) else None
+                    page_rows = (
+                        response_data.get("fill_orders")
+                        if isinstance(response_data, dict)
+                        else None
+                    )
+                    def valid_fill_row(row):
+                        trade_id = str(
+                            _rcr_v1_first(row, "tradeId", "trade_id", default="") or ""
+                        ).strip()
+                        order_id_value = str(
+                            _rcr_v1_first(row, "orderId", "orderID", "order_id", default="") or ""
+                        ).strip()
+                        row_symbol = str(_rcr_v1_first(row, "symbol", default="") or "").strip()
+                        quantity_value = _rcr_v1_first(
+                            row, "qty", "quantity", "filled", "executedQty", "volume", "size"
+                        )
+                        info = _rcr_v1_info(row)
+                        if quantity_value in (None, ""):
+                            quantity_value = next(
+                                (
+                                    info.get(key)
+                                    for key in ("qty", "quantity", "filled", "executedQty", "volume", "size")
+                                    if info.get(key) not in (None, "")
+                                ),
+                                None,
+                            )
+                        quantity = safe_float(quantity_value, None)
+                        price = safe_float(_rcr_v1_first(row, "price", default=None), None)
+                        timestamp = _rcr_v1_item_timestamp(row)
+                        return bool(
+                            trade_id.isdecimal()
+                            and int(trade_id) > 0
+                            and order_id_value
+                            and row_symbol
+                            and _rcr_v1_symbol_matches(row, sym)
+                            and _rcr_v1_side(row) in {"buy", "sell"}
+                            and price is not None
+                            and math.isfinite(price)
+                            and price > 0
+                            and quantity is not None
+                            and math.isfinite(quantity)
+                            and quantity > 0
+                            and timestamp is not None
+                            and math.isfinite(timestamp)
+                            and timestamp > 0
+                        )
+
+                    if (
+                        str(response_code) != "0"
+                        or not isinstance(page_rows, list)
+                        or any(not isinstance(row, dict) for row in page_rows)
+                        or len(page_rows) > page_size
+                        or any(not valid_fill_row(row) for row in page_rows)
+                    ):
+                        attempts.append({
+                            "method": method_name,
+                            "ok": False,
+                            "page_index": page_index,
+                            "error": "INVALID_FILL_HISTORY_PAGE",
+                        })
+                        break
+                    raw_rows.extend(page_rows)
+                    attempts.append({
+                        "method": method_name,
+                        "ok": True,
+                        "page_index": page_index,
+                        "count": len(page_rows),
+                    })
+                    if len(page_rows) < page_size:
+                        fill_window_read_ok = True
+                        break
+                    next_cursor = str(
+                        _rcr_v1_first(page_rows[-1], "tradeId", "trade_id", default="")
+                        or ""
+                    ).strip()
+                    if not next_cursor or next_cursor in seen_cursors:
+                        attempts.append({
+                            "method": method_name,
+                            "ok": False,
+                            "page_index": page_index,
+                            "error": "FILL_HISTORY_CURSOR_MISSING_OR_REPEATED",
+                        })
+                        break
+                    cursor = next_cursor
+                    seen_cursors.add(cursor)
+                except Exception as exc:
+                    attempts.append({
+                        "method": method_name,
+                        "ok": False,
+                        "page_index": page_index,
+                        "error": str(exc)[:500],
+                    })
+                    break
+            else:
+                attempts.append({
+                    "method": method_name,
+                    "ok": False,
+                    "page_index": max_pages,
+                    "error": "FILL_HISTORY_PAGE_LIMIT_REACHED",
+                })
+
+    # CCXT's recent-trades result may be truncated or use a different history
+    # window. Keep it for diagnosis only; never blend it into the verified raw
+    # window that can support a close reconciliation.
+    rows = raw_rows if fill_window_read_ok else fallback_rows
     oid = str(order_id or "").strip()
     cid = str(client_order_id or "").strip()
     matched = [
@@ -4521,17 +4872,35 @@ def fetch_order_trades(symbol, order_id=None, client_order_id=None, since=None, 
         for item in rows
         if isinstance(item, dict)
         and _rcr_v1_symbol_matches(item, sym)
-        and ((oid and _rcr_v1_order_id(item) == oid) or (cid and _rcr_v1_client_id(item) == cid))
+        and (
+            not (oid or cid)
+            or (
+                (not oid or not _rcr_v1_order_id(item) or _rcr_v1_order_id(item) == oid)
+                and (not cid or not _rcr_v1_client_id(item) or _rcr_v1_client_id(item) == cid)
+                and (
+                    (oid and _rcr_v1_order_id(item) == oid)
+                    or (cid and _rcr_v1_client_id(item) == cid)
+                )
+            )
+        )
     ]
     return {
-        "ok": bool(payload.get("ok") or raw_rows),
+        "ok": fill_window_read_ok,
+        "fallback_ok": bool(payload.get("ok")),
+        "fill_window_read_ok": fill_window_read_ok,
+        "fill_window_start_ms": since_ms,
+        "fill_window_end_ms": end_ms,
         "version": REAL_CLOSE_RECONCILIATION_V1_VERSION,
         "symbol": sym,
         "trades": matched,
         "all_trades": rows,
         "matched_count": len(matched),
         "attempts": attempts,
-        "error": payload.get("error"),
+        "error": (
+            None
+            if fill_window_read_ok
+            else (attempts[-1].get("error") if attempts else "FILL_HISTORY_READ_UNVERIFIED")
+        ),
         "read_only": True,
         "sent": False,
     }
@@ -4698,7 +5067,19 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         item_side = _rcr_v1_side(item)
         item_position_side = _rcr_v1_position_side(item)
         item_ts = _rcr_v1_item_timestamp(item)
-        is_open_id = bool((oid and _rcr_v1_order_id(item) == oid) or (cid and _rcr_v1_client_id(item) == cid))
+        item_oid = _rcr_v1_order_id(item)
+        item_cid = _rcr_v1_client_id(item)
+        identity_conflict = bool(
+            (oid and item_oid and item_oid != oid)
+            or (cid and item_cid and item_cid != cid)
+        )
+        is_open_id = bool(
+            not identity_conflict
+            and (
+                (oid and item_oid == oid)
+                or (cid and item_cid == cid)
+            )
+        )
         if is_open_id or (item_side == open_side and order_ts and item_ts and abs(item_ts - order_ts) <= 180):
             opening_fills.append(item)
             continue
@@ -4842,17 +5223,31 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
 
     positions = []
     position_error = None
+    position_read_ok = False
     try:
-        positions = get_positions([sym])
+        positions_result = get_positions([sym])
+        if not isinstance(positions_result, list) or any(
+            not isinstance(item, dict) for item in positions_result
+        ):
+            raise ValueError("INVALID_POSITION_READ_RESPONSE")
+        positions = positions_result
+        position_read_ok = True
     except Exception as exc:
         position_error = str(exc)
     relevant_open = []
     for pos in positions or []:
         if not isinstance(pos, dict) or not _rcr_v1_symbol_matches(pos, sym):
             continue
-        contracts = abs(safe_float(_rcr_v1_first(pos, "contracts", "positionAmt", "amount", "size"), 0.0) or 0.0)
         pside = _rcr_v1_position_side(pos)
-        if contracts > 0 and (not pside or pside == position_side):
+        if pside and pside != position_side:
+            continue
+        contracts = _rcr_v1_position_amount(pos)
+        if contracts is None or not math.isfinite(contracts):
+            position_read_ok = False
+            position_error = "POSITION_AMOUNT_UNVERIFIED"
+            break
+        contracts = abs(contracts)
+        if contracts > 0:
             relevant_open.append(pos)
 
     qty_tolerance = max(abs(expected_qty) * 0.001, 1e-12) if expected_qty else 0.0
@@ -4864,12 +5259,13 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         and abs(selected_qty - expected_qty) <= qty_tolerance
         and not qty_exceeds_expected
     )
-    position_closed = len(relevant_open) == 0
+    position_closed = position_read_ok and len(relevant_open) == 0
     fee_association_ok = not fee_association_ambiguities
     financial_dedup_ok = bool(
         income_payload.get("dedup_ok", True) and fee_association_ok
     )
-    complete = bool(entry is not None and exit_price is not None and selected_qty > 0 and qty_complete and position_closed and financial_dedup_ok)
+    fill_window_read_ok = bool(all_trades_payload.get("fill_window_read_ok"))
+    complete = bool(entry is not None and exit_price is not None and selected_qty > 0 and qty_complete and position_closed and financial_dedup_ok and fill_window_read_ok)
     net_pnl = (realized_gross or 0.0) - fee_total + funding if realized_gross is not None else None
     closed_at_epoch = max([_rcr_v1_item_timestamp(item) or 0.0 for item in selected_closing], default=0.0) or None
     closed_at = datetime.fromtimestamp(closed_at_epoch, TIMEZONE_BR).strftime("%d/%m/%Y %H:%M:%S") if closed_at_epoch else None
@@ -4885,8 +5281,12 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         issues.append("CLOSING_QTY_EXCEEDS_EXPECTED")
     elif expected_qty and not qty_complete:
         issues.append("CLOSING_QTY_INCOMPLETE")
-    if not position_closed:
+    if not position_read_ok:
+        issues.append("POSITION_READ_UNVERIFIED")
+    elif not position_closed:
         issues.append("POSITION_STILL_OPEN")
+    if not fill_window_read_ok:
+        issues.append("FILL_HISTORY_WINDOW_UNVERIFIED")
     if realized_gross is None:
         issues.append("REALIZED_PNL_MISSING")
     if not financial_dedup_ok:
@@ -4933,6 +5333,7 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "qty_exceeds_expected": qty_exceeds_expected,
         "qty_complete": qty_complete,
         "position_closed": position_closed,
+        "position_read_ok": position_read_ok,
         "closed_at": closed_at,
         "closed_at_epoch": closed_at_epoch,
         "realized_pnl_gross": realized_gross,
@@ -4969,7 +5370,12 @@ def reconcile_closed_trade(symbol, side, open_order_id=None, client_order_id=Non
         "order_lookup": order_payload,
         "trade_lookup": {
             "ok": all_trades_payload.get("ok"),
+            "fallback_ok": all_trades_payload.get("fallback_ok"),
+            "fill_window_read_ok": fill_window_read_ok,
+            "fill_window_start_ms": all_trades_payload.get("fill_window_start_ms"),
+            "fill_window_end_ms": all_trades_payload.get("fill_window_end_ms"),
             "error": all_trades_payload.get("error"),
+            "attempts": all_trades_payload.get("attempts") or [],
             "total_count": len(all_trades),
         },
         "income_lookup": {
@@ -5016,18 +5422,7 @@ def _rpm_symbol_key(value):
 
 
 def _rpm_position_amount(item):
-    info = item.get("info") if isinstance(item, dict) and isinstance(item.get("info"), dict) else {}
-    candidates = [
-        item.get("contracts") if isinstance(item, dict) else None,
-        item.get("amount") if isinstance(item, dict) else None,
-        info.get("positionAmt"), info.get("positionAmount"), info.get("positionQty"),
-        info.get("positionQuantity"), info.get("positionSize"), info.get("availableAmt"),
-    ]
-    for value in candidates:
-        parsed = _cq_patch_safe_float(value, None)
-        if parsed is not None:
-            return abs(parsed)
-    return 0.0
+    return _rcr_v1_position_amount(item)
 
 
 def _rpm_position_side(item):
@@ -5061,6 +5456,8 @@ def managed_position_snapshot(symbol, side, expected_amount=None):
             if item_side and item_side != wanted_side:
                 continue
             amount = _rpm_position_amount(item)
+            if amount is None or not math.isfinite(amount):
+                raise ValueError("POSITION_AMOUNT_INVALID")
             if amount <= BROKER_MANAGEMENT_AMOUNT_TOLERANCE:
                 continue
             total += amount
@@ -6771,6 +7168,7 @@ def _rpm_create_stop_live(
         },
         client_order_id_reservation_verifier=client_order_id_reservation_verifier,
         send_state=send_state,
+        exchange_client_order_id_supported=False,
     )
 
 
@@ -6782,6 +7180,7 @@ def _rpm_stop_create_confirmation(
     amount,
     stop_price,
     current_price,
+    exchange_client_order_id_supported=False,
 ):
     """Confirm a replacement/rollback stop from factual returned material."""
 
@@ -6807,10 +7206,21 @@ def _rpm_stop_create_confirmation(
         expected_stop_price=stop_price,
         entry_price=current_price,
     )
+    returned_client_order_id = create_result.get("returned_client_order_id")
+    returned_client_order_id_matches = (
+        create_result.get("returned_client_order_id_matches") is True
+    )
+    returned_client_order_id_consistent = bool(
+        returned_client_order_id_matches
+        or (
+            not exchange_client_order_id_supported
+            and returned_client_order_id in (None, "")
+        )
+    )
     armed = bool(
         create_result.get("ok") is True
         and create_result.get("client_order_id_unique") is True
-        and create_result.get("returned_client_order_id_matches") is True
+        and returned_client_order_id_consistent
         and order.get("id")
         and status_values
         and status_values <= active_statuses
@@ -6821,10 +7231,12 @@ def _rpm_stop_create_confirmation(
         "order_id": order.get("id"),
         "status_values": sorted(status_values),
         "status_active": bool(status_values and status_values <= active_statuses),
-        "returned_client_order_id": create_result.get("returned_client_order_id"),
-        "returned_client_order_id_matches": create_result.get(
-            "returned_client_order_id_matches"
-        ) is True,
+        "returned_client_order_id": returned_client_order_id,
+        "returned_client_order_id_matches": returned_client_order_id_matches,
+        "exchange_client_order_id_supported": bool(
+            exchange_client_order_id_supported
+        ),
+        "returned_client_order_id_consistent": returned_client_order_id_consistent,
         "material_confirmation": material,
     }
 

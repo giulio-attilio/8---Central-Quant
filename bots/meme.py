@@ -49,9 +49,11 @@ import json
 import time
 import threading
 import requests
+from personal_http_auth import central_personal_http_auth
 from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
+from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
 from upstash_redis import Redis
@@ -606,6 +608,7 @@ def consultar_central_risk_manager(s):
             f"{CENTRAL_BASE_URL}/can_open_trade",
             json=payload,
             timeout=CENTRAL_RISK_TIMEOUT_SECONDS,
+            auth=central_personal_http_auth(f"{CENTRAL_BASE_URL}/can_open_trade"),
         )
 
         try:
@@ -788,9 +791,15 @@ def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
             return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso MEME OHLCV ({attempt+1}/{max_retries}) {symbol} {timeframe}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
+                return []
             time.sleep(2 ** attempt)
         except Exception as e:
             print(f"Aviso MEME OHLCV genérico ({attempt+1}/{max_retries}) {symbol} {timeframe}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
+                return []
             time.sleep(2 ** attempt)
     HEALTH["last_warning"] = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
     print(HEALTH["last_warning"])

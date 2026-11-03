@@ -3,5 +3,5 @@ gunicorn
 requests
 pandas
 numpy
-ccxt
+ccxt==4.5.88
 upstash-redis

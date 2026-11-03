@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from runtime_drain_v1 import RuntimeDrainState
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FALCON_SOURCE = ROOT / "bots" / "falcon.py"
@@ -226,6 +228,99 @@ def test_stop_active_is_factually_verified_without_mutating_broker():
     assert health["falcon_disaster_stop_semantic_predicates"]["type_valid"] is True
     assert [call[0] for call in broker.read_calls] == ["position", "order", "order"]
     assert broker.mutation_calls == []
+
+
+def test_stop_without_exchange_client_id_uses_verified_creation_order_id_only():
+    stop = _order_snapshot("OPEN")
+    stop["client_order_id"] = None
+    position = _position(disaster_stop_order_id_readback_verified=True)
+    broker = _ReadOnlyBroker(_position_snapshot(), stop)
+
+    result = _verifier(broker)(
+        position, now_epoch=1000.0, force=True, persist_registry=False
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "DISASTER_STOP_ACTIVE_VERIFIED"
+    assert result["stop_client_order_id_match"] is False
+    assert result["stop_identity_verified_via_order_id"] is True
+    assert position["disaster_stop_active_verified"] is True
+    assert result["management_allowed"] is True
+    assert broker.mutation_calls == []
+
+
+def test_stop_without_client_id_or_creation_readback_remains_fail_closed():
+    stop = _order_snapshot("OPEN")
+    stop["client_order_id"] = None
+    position = _position(disaster_stop_order_id_readback_verified=False)
+    broker = _ReadOnlyBroker(_position_snapshot(), stop)
+
+    result = _verifier(broker)(
+        position, now_epoch=1000.0, force=True, persist_registry=False
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "DISASTER_STOP_CLIENT_ORDER_ID_MISMATCH"
+    assert result["management_allowed"] is False
+    assert broker.mutation_calls == []
+
+
+def test_stop_creation_readback_attestation_is_projected_into_registry_metadata():
+    captured = {}
+
+    class RegistryProbe:
+        def register_open_trade(self, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "trade_id": "TRADE-1"}
+
+    tree = ast.parse(FALCON_SOURCE.read_text(encoding="utf-8"))
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "register_falcon_trade_registry_open"
+    ]
+    assert len(definitions) >= 2
+    base_writer = definitions[0]
+    namespace = {
+        "central_trade_registry": RegistryProbe(),
+        "TRADE_REGISTRY_IMPORT_ERROR": None,
+        "HEALTH": {},
+        "normalize_symbol_for_central": lambda value: value,
+        "data_hora_sp_str": lambda: "2026-10-31 12:00:00",
+        "FALCON_MODE": "PAPER",
+        "TIMEFRAME": "15m",
+    }
+    module = ast.Module(body=[base_writer], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(FALCON_SOURCE), "exec"), namespace)
+
+    result = namespace["register_falcon_trade_registry_open"]({
+        "id": "FALCON-1",
+        "symbol": "XRPUSDT",
+        "side": "LONG",
+        "entry": 2.0,
+        "stop": 1.8,
+        "tp50": 2.2,
+        "setup": "TEST",
+        "initial_qty": 2.0,
+        "execution_mode": "LIVE",
+        "registry_mode": "REAL",
+        "lifecycle_id": "LIFECYCLE-1",
+        "broker_stop_order_id": "STOP-1",
+        "disaster_stop_order_id_readback_verified": True,
+        "live_order": {
+            "sent": True,
+            "order_id": "ENTRY-1",
+            "client_order_id": "ENTRY-CID-1",
+            "disaster_stop": {
+                "order_id": "STOP-1",
+                "order_id_readback_verified": True,
+            },
+        },
+    })
+
+    assert result["ok"] is True
+    assert captured["metadata"]["disaster_stop_order_id_readback_verified"] is True
 
 
 def test_xrp_like_market_stop_plan_is_verified_and_diagnostics_are_propagated():
@@ -1288,6 +1383,7 @@ class _TwoCycleClock:
 
 
 def test_management_loop_central_only_preflight_skips_all_normal_management_and_mutations():
+    drain_state = RuntimeDrainState()
     broker = _ReadOnlyBroker(
         _position_snapshot(amount=0.0, closed=True, matched_count=0),
         _order_snapshot("CANCELED", filled=0.0),
@@ -1295,6 +1391,11 @@ def test_management_loop_central_only_preflight_skips_all_normal_management_and_
     positions = {"PID-1": _position()}
     saved: list[dict] = []
     forbidden_calls: list[str] = []
+
+    def save_then_begin_drain(value):
+        saved.append(dict(value))
+        drain_state.begin_draining()
+        return True
 
     def forbidden(name):
         def fail(*_args, **_kwargs):
@@ -1320,11 +1421,12 @@ def test_management_loop_central_only_preflight_skips_all_normal_management_and_
         {
             "safe_float": _safe_float,
             "time": _SingleCycleClock,
+            "RUNTIME_DRAIN": drain_state,
             "data_hora_sp_str": lambda: "15/07/2026 10:00:00",
             "central_broker": broker,
             "HEALTH": {},
             "get_positions": lambda: positions,
-            "save_positions": lambda value: saved.append(dict(value)) or True,
+            "save_positions": save_then_begin_drain,
             "falcon_is_live_real_position": lambda _pos: True,
             "falcon_real_remaining_qty": lambda pos: _safe_float(pos.get("remaining_qty")),
             "falcon_update_registry_management": lambda *_args, **_kwargs: {"ok": True},
@@ -1354,11 +1456,12 @@ def test_management_loop_central_only_preflight_skips_all_normal_management_and_
         },
     )
 
-    with pytest.raises(_StopLoop):
-        namespace["management_loop"]()
+    namespace["management_loop"]()
 
     assert forbidden_calls == []
     assert len(saved) == 1
+    assert drain_state.is_draining()
+    assert drain_state.active_management_cycles() == 0
     assert positions["PID-1"]["central_only_reconcile_required"] is True
     assert positions["PID-1"]["live_management_block_reason"] == "CENTRAL_ONLY_RECONCILE_REQUIRED"
     assert [call[0] for call in broker.read_calls] == ["position", "order", "order"]
@@ -1413,6 +1516,7 @@ def test_two_management_cycles_emit_one_central_only_alert_and_never_tp50_spam()
         {
             "safe_float": _safe_float,
             "time": _TwoCycleClock,
+            "RUNTIME_DRAIN": RuntimeDrainState(),
             "data_hora_sp_str": lambda: "15/07/2026 10:00:00",
             "central_broker": broker,
             "HEALTH": {},

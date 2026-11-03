@@ -2516,6 +2516,12 @@ def test_management_loop_calls_terminal_guard_before_continue_and_skips_all_norm
         return probe
 
     globals_dict = {
+        "FALCON_MODE": "LIVE",
+        "RUNTIME_DRAIN": SimpleNamespace(
+            try_enter_management_cycle=lambda: True,
+            leave_management_cycle=lambda: None,
+            is_draining=lambda: False,
+        ),
         "get_positions": lambda: {pos["id"]: pos},
         "safe_float": _safe_float,
         "falcon_is_live_real_position": lambda _pos: True,
@@ -2588,6 +2594,7 @@ def test_management_loop_calls_terminal_guard_before_continue_and_skips_all_norm
     assert saved_pos.get("tp50_hit") is not True
     assert saved_pos.get("be_moved") is not True
     assert saved_pos.get("trailing_active") is not True
+    assert health["falcon_live_management_reconciliation_ready"] is False
 
 
 def test_management_loop_reconciliation_pending_verifies_stop_and_blocks_normal_management():
@@ -2610,6 +2617,12 @@ def test_management_loop_reconciliation_pending_verifies_stop_and_blocks_normal_
         return call
 
     globals_dict = {
+        "FALCON_MODE": "LIVE",
+        "RUNTIME_DRAIN": SimpleNamespace(
+            try_enter_management_cycle=lambda: True,
+            leave_management_cycle=lambda: None,
+            is_draining=lambda: False,
+        ),
         "get_positions": lambda: {pos["id"]: pos},
         "safe_float": _safe_float,
         "falcon_is_live_real_position": lambda _pos: True,
@@ -2667,6 +2680,72 @@ def test_management_loop_reconciliation_pending_verifies_stop_and_blocks_normal_
     assert saved_pos.get("tp50_hit") is not True
     assert saved_pos.get("be_moved") is not True
     assert saved_pos.get("trailing_active") is not True
+    assert health["falcon_live_management_reconciliation_ready"] is False
+
+
+def test_management_loop_opens_live_entry_gate_after_clean_saved_cycle():
+    class StopLoop(Exception):
+        pass
+
+    health = {}
+    saved = []
+    drain = SimpleNamespace(
+        try_enter_management_cycle=lambda: True,
+        leave_management_cycle=lambda: None,
+        is_draining=lambda: False,
+    )
+    globals_dict = {
+        "FALCON_MODE": "LIVE",
+        "RUNTIME_DRAIN": drain,
+        "get_positions": lambda: {},
+        "falcon_refresh_management_safety_health": lambda _positions: None,
+        "save_positions": lambda positions: saved.append(dict(positions)),
+        "refresh_health_stats": lambda: None,
+        "data_hora_sp_str": lambda: "02/11/2026 12:00",
+        "HEALTH": health,
+        "time": SimpleNamespace(
+            sleep=lambda _seconds: (_ for _ in ()).throw(StopLoop())
+        ),
+        "traceback": SimpleNamespace(print_exc=lambda: None),
+        "MANAGEMENT_SLEEP_SECONDS": 20,
+    }
+    namespace = _load_final_functions(("management_loop",), globals_dict)
+
+    with pytest.raises(StopLoop):
+        namespace["management_loop"]()
+
+    assert saved == [{}]
+    assert health["falcon_live_management_reconciliation_ready"] is True
+
+
+def test_management_thread_supervisor_closes_live_gate_before_restart_delay():
+    state = {"draining": False}
+    health = {"falcon_live_management_reconciliation_ready": True}
+
+    def begin_draining():
+        state["draining"] = True
+
+    def fail_once():
+        raise RuntimeError("synthetic manager crash")
+
+    namespace = _load_final_functions(
+        ("run_thread_guarded",),
+        {
+            "RUNTIME_DRAIN": SimpleNamespace(
+                is_draining=lambda: state["draining"],
+            ),
+            "HEALTH": health,
+            "traceback": SimpleNamespace(print_exc=lambda: None),
+            "safe_send_telegram": lambda *_args, **_kwargs: None,
+            "time": SimpleNamespace(sleep=lambda _seconds: begin_draining()),
+        },
+    )
+
+    namespace["run_thread_guarded"]("management", fail_once)
+
+    assert state["draining"] is True
+    assert health["falcon_live_management_reconciliation_ready"] is False
+    assert "synthetic manager crash" in health["last_error"]
 
 
 def test_test_harness_has_no_runtime_falcon_import_or_real_execution_dependency():

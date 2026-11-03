@@ -594,8 +594,19 @@ def test_shadow_validated_is_idempotent_across_retry_and_restart(tmp_path):
 def test_shadow_validation_append_is_idempotent_across_processes(tmp_path):
     script = """
 import json
+import socket
 import sys
 from pathlib import Path
+
+def _deny_network(*args, **kwargs):
+    raise RuntimeError("network access forbidden in cross-process persistence test")
+
+socket.socket = _deny_network
+socket.create_connection = _deny_network
+socket.getaddrinfo = _deny_network
+socket.gethostbyname = _deny_network
+
+sys.path.insert(0, str(Path.cwd()))
 from trade_lifecycle_shadow_runtime_adapter import TradeLifecycleShadowRuntimeAdapter
 
 adapter = TradeLifecycleShadowRuntimeAdapter(enabled=True, data_dir=Path(sys.argv[1]))

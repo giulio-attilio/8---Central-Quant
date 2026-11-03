@@ -155,6 +155,15 @@ def _base_trade(**updates) -> dict:
     return trade
 
 
+def _atomic_json_write_for_registry_semantics_test(path, payload):
+    """Keep reconciliation semantics tests independent of platform fsync support."""
+    Path(path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return True
+
+
 class FakeRegistry:
     def __init__(self, trade: dict, *, fail_close: bool = False, operation_log: list[str] | None = None):
         self.payload = {
@@ -342,7 +351,7 @@ def _build(harness, *, commit=False, ack=None):
     return harness.ns["_fcor_v1_build_payload"](commit_requested=commit, ack=ack)
 
 
-def test_request_parser_accepts_preview_by_default_and_exact_query_or_post_ack(tmp_path):
+def test_request_parser_ignores_get_commit_intent_and_accepts_post_commit(tmp_path):
     harness = _harness(tmp_path)
     parser = harness.ns["_fcor_v1_request_commit_ack"]
 
@@ -351,6 +360,13 @@ def test_request_parser_accepts_preview_by_default_and_exact_query_or_post_ack(t
 
     harness.ns["request"] = SimpleNamespace(
         method="GET",
+        args={"commit": "true", "ack": ACK},
+        get_json=lambda silent=True: None,
+    )
+    assert parser() == (False, None)
+
+    harness.ns["request"] = SimpleNamespace(
+        method="POST",
         args={"commit": "true", "ack": ACK},
         get_json=lambda silent=True: None,
     )
@@ -1011,9 +1027,12 @@ def test_route_does_not_modify_real_trading_configuration_or_ack_the_live_audit(
 
 
 def test_trade_registry_compare_and_close_blocks_replaced_lifecycle_and_clears_unknown_financials(tmp_path, monkeypatch):
+    import main as central_main
     import trade_registry
 
-    registry_file = tmp_path / "registry.json"
+    registry_file = tmp_path / "trade_registry.json"
+    monkeypatch.setattr(central_main, "CENTRAL_DATA_DIR", tmp_path)
+    monkeypatch.setattr(central_main, "_trpsf_v1_atomic_write_json", _atomic_json_write_for_registry_semantics_test)
     monkeypatch.setattr(trade_registry, "TRADE_REGISTRY_FILE", str(registry_file))
     monkeypatch.setattr(trade_registry, "TRADE_REGISTRY_LEGACY_FILE", str(tmp_path / "missing-legacy.json"))
     monkeypatch.setattr(trade_registry, "_observe_shadow_registry_snapshot", lambda *_args, **_kwargs: None)
@@ -1031,7 +1050,10 @@ def test_trade_registry_compare_and_close_blocks_replaced_lifecycle_and_clears_u
         close_order_id="PARTIAL-CLOSE",
         close_qty=2.0,
     )
-    trade_registry.save_registry({"open_trades": {"TR-XRP": open_trade}, "closed_trades": []})
+    registry_file.write_text(
+        json.dumps({"open_trades": {"TR-XRP": open_trade}, "closed_trades": []}),
+        encoding="utf-8",
+    )
 
     blocked = trade_registry.close_trade(
         "TR-XRP",
@@ -1068,9 +1090,12 @@ def test_trade_registry_compare_and_close_blocks_replaced_lifecycle_and_clears_u
 
 
 def test_trade_registry_default_close_behavior_remains_compatible_for_other_bots(tmp_path, monkeypatch):
+    import main as central_main
     import trade_registry
 
-    registry_file = tmp_path / "registry-default.json"
+    registry_file = tmp_path / "trade_registry.json"
+    monkeypatch.setattr(central_main, "CENTRAL_DATA_DIR", tmp_path)
+    monkeypatch.setattr(central_main, "_trpsf_v1_atomic_write_json", _atomic_json_write_for_registry_semantics_test)
     monkeypatch.setattr(trade_registry, "TRADE_REGISTRY_FILE", str(registry_file))
     monkeypatch.setattr(trade_registry, "TRADE_REGISTRY_LEGACY_FILE", str(tmp_path / "missing-legacy.json"))
     monkeypatch.setattr(trade_registry, "_observe_shadow_registry_snapshot", lambda *_args, **_kwargs: None)
@@ -1081,7 +1106,10 @@ def test_trade_registry_default_close_behavior_remains_compatible_for_other_bots
         execution_mode="PAPER",
         result_pct=9.0,
     )
-    trade_registry.save_registry({"open_trades": {"TR-PREDATOR": paper_trade}, "closed_trades": []})
+    registry_file.write_text(
+        json.dumps({"open_trades": {"TR-PREDATOR": paper_trade}, "closed_trades": []}),
+        encoding="utf-8",
+    )
 
     result = trade_registry.close_trade(
         "TR-PREDATOR",
@@ -1099,13 +1127,19 @@ def test_trade_registry_default_close_behavior_remains_compatible_for_other_bots
 
 
 def test_trade_registry_compare_and_close_never_overwrites_a_concurrent_factual_close(tmp_path, monkeypatch):
+    import main as central_main
     import trade_registry
 
-    registry_file = tmp_path / "registry-concurrent-close.json"
+    registry_file = tmp_path / "trade_registry.json"
+    monkeypatch.setattr(central_main, "CENTRAL_DATA_DIR", tmp_path)
+    monkeypatch.setattr(central_main, "_trpsf_v1_atomic_write_json", _atomic_json_write_for_registry_semantics_test)
     monkeypatch.setattr(trade_registry, "TRADE_REGISTRY_FILE", str(registry_file))
     monkeypatch.setattr(trade_registry, "TRADE_REGISTRY_LEGACY_FILE", str(tmp_path / "missing-legacy.json"))
     monkeypatch.setattr(trade_registry, "_observe_shadow_registry_snapshot", lambda *_args, **_kwargs: None)
-    trade_registry.save_registry({"open_trades": {"TR-XRP": _base_trade()}, "closed_trades": []})
+    registry_file.write_text(
+        json.dumps({"open_trades": {"TR-XRP": _base_trade()}, "closed_trades": []}),
+        encoding="utf-8",
+    )
 
     factual = trade_registry.close_trade(
         "TR-XRP",

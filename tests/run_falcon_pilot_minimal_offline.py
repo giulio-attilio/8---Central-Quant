@@ -1,8 +1,8 @@
 """Run the existing Falcon safety regressions without external access.
 
 Usage: python3 -I tests/run_falcon_pilot_minimal_offline.py
-This process does not import main.py or start a service. Pytest is loaded only
-after network, subprocess and secret-file access have been denied.
+Some tests import main.py, so runtime auto-start is disabled before collection.
+Pytest is loaded only after network, subprocess and .env-file access are denied.
 """
 
 import builtins
@@ -14,6 +14,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 
@@ -25,18 +26,68 @@ def forbidden(*args, **kwargs):
     raise OfflineBoundaryViolation("offline boundary violated")
 
 
-def guarded_socket(*args, **kwargs):
-    # urllib3 probes IPv6 support while importing ccxt. Report unavailable
-    # without creating a socket; every other socket attempt still fails hard.
-    caller = inspect.currentframe().f_back
-    if (
-        caller.f_code.co_name == "_has_ipv6"
-        and Path(caller.f_code.co_filename).as_posix().endswith("urllib3/util/connection.py")
-        and args == (socket.AF_INET6,)
-        and not kwargs
-    ):
-        raise OSError("IPv6 capability probe disabled in offline tests")
-    forbidden()
+_ORIGINAL_SOCKET = socket.socket
+_LOOPBACK_SERVER_ONLY = sys.argv[1:] in (
+    [],
+    ["--drain-only"],
+    ["--drain-regression"],
+    ["--extra"],
+)
+
+
+class GuardedSocket(_ORIGINAL_SOCKET):
+    def __init__(self, *args, **kwargs):
+        # urllib3 probes IPv6 support while importing ccxt. Report unavailable
+        # without creating a socket in either offline mode.
+        caller = inspect.currentframe().f_back
+        if (
+            caller.f_code.co_name == "_has_ipv6"
+            and Path(caller.f_code.co_filename).as_posix().endswith("urllib3/util/connection.py")
+            and args == (socket.AF_INET6,)
+            and not kwargs
+        ):
+            raise OSError("IPv6 capability probe disabled in offline tests")
+        if _LOOPBACK_SERVER_ONLY:
+            family = args[0] if args else kwargs.get("family", socket.AF_INET)
+            socktype = args[1] if len(args) > 1 else kwargs.get("type", socket.SOCK_STREAM)
+            if family == socket.AF_INET and socktype == socket.SOCK_STREAM:
+                super().__init__(*args, **kwargs)
+                return
+            forbidden()
+        forbidden()
+
+    def bind(self, address):
+        if (
+            _LOOPBACK_SERVER_ONLY
+            and isinstance(address, tuple)
+            and address
+            and address[0] == "127.0.0.1"
+        ):
+            return super().bind(address)
+        forbidden()
+
+    def listen(self, *args, **kwargs):
+        if _LOOPBACK_SERVER_ONLY:
+            return super().listen(*args, **kwargs)
+        forbidden()
+
+    def connect(self, *args, **kwargs):
+        forbidden()
+
+    def connect_ex(self, *args, **kwargs):
+        forbidden()
+
+    def accept(self):
+        forbidden()
+
+    def send(self, *args, **kwargs):
+        forbidden()
+
+    def sendall(self, *args, **kwargs):
+        forbidden()
+
+    def sendto(self, *args, **kwargs):
+        forbidden()
 
 
 def guarded_open(original):
@@ -47,19 +98,35 @@ def guarded_open(original):
     return opener
 
 
-socket.socket = guarded_socket
+socket.socket = GuardedSocket
 socket.create_connection = forbidden
 socket.getaddrinfo = forbidden
 socket.gethostbyname = forbidden
 http.client.HTTPConnection.connect = forbidden
 http.client.HTTPSConnection.connect = forbidden
 urllib.request.urlopen = forbidden
-subprocess.Popen = forbidden
+_ORIGINAL_POPEN = subprocess.Popen
+
+
+class GuardedPopen(_ORIGINAL_POPEN):
+    def __init__(self, *args, **kwargs):
+        forbidden()
+
+
+subprocess.Popen = GuardedPopen
 subprocess.run = forbidden
 os.system = forbidden
 builtins.open = guarded_open(builtins.open)
 io.open = guarded_open(io.open)
 os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+os.environ["CENTRAL_AUTO_START_RUNTIME"] = "false"
+_ISOLATED_DATA_DIR = tempfile.TemporaryDirectory(prefix="central-quant-offline-data-")
+os.environ["CENTRAL_DATA_DIR"] = _ISOLATED_DATA_DIR.name
+os.environ["DATA_DIR"] = _ISOLATED_DATA_DIR.name
+os.environ["TRADE_REGISTRY_FILE"] = str(
+    Path(_ISOLATED_DATA_DIR.name) / "trade_registry.json"
+)
+os.environ["TRADE_LIFECYCLE_SHADOW_DATA_DIR"] = _ISOLATED_DATA_DIR.name
 
 import pytest  # noqa: E402 - only after guards
 
@@ -67,6 +134,8 @@ import pytest  # noqa: E402 - only after guards
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 CASES = (
+    "test_runtime_drain_v1.py",
+    "test_main_runtime_drain_contract_v1.py",
     "test_falcon_single_live_execution_path_v1.py",
     "test_falcon_management_safety_v1.py",
     "test_falcon_real_position_ownership_limit_v1.py",
@@ -74,17 +143,132 @@ CASES = (
     "test_main_real_pilot_guard_fail_closed_v1.py",
     "test_account_client_order_id_v1.py",
     "test_account_client_order_writer_contract_v1.py",
+    "test_runtime_file_lock_fail_closed_v1.py",
+    "test_live_central_risk_gate_fail_closed_v1.py",
 )
 EXTRA_CASES = (
+    "test_runtime_drain_v1.py",
     "test_trade_lifecycle_shadow_runtime_adapter.py",
     "test_registry_remaining_writers_atomic_rmw_v1.py",
+    "test_trade_registry_atomic_durable_write_v1.py",
+    "test_trade_registry_reset_serialization_v1.py",
     "test_falcon_central_only_reconciliation.py",
+    "test_falcon_initial_stop_failure_containment_v1.py",
+    "test_falcon_terminal_disaster_stop_emergency_recovery_v1.py",
+    "test_falcon_manual_close_outcome_reconciliation_v1.py",
+    "test_real_close_reconciliation_v11.py",
+    "test_startup_disk_forensics.py",
     "test_broker_order_constraints_fail_closed_v1.py",
     "test_broker_account_client_order_boundary_v1.py",
+    "test_broker_managed_close_timeout_semantics_v1.py",
+    "test_bingx_ccxt_stop_readback_contract_v1.py",
+    "test_personal_http_auth_gate_v1.py",
+    "test_auto_real_execution_bridge_route_auth_v1.py",
+    "test_disaster_stop_fallback_route_auth_v1.py",
+    "test_execution_engine_public_health_redaction_v1.py",
+    "test_live_central_risk_gate_fail_closed_v1.py",
+    "test_falcon_positions_read_fail_closed_v1.py",
+    "test_live_position_reconciliation_risk_gate_v1.py",
+    "test_trading_mode_defaults_fail_closed_v1.py",
 )
 
 
 if __name__ == "__main__":
-    cases = EXTRA_CASES if sys.argv[1:] == ["--extra"] else CASES
-    filters = ["-k", "not test_shadow_validation_append_is_idempotent_across_processes"] if cases is EXTRA_CASES else []
-    raise SystemExit(pytest.main(["-q", "-p", "no:cacheprovider", *filters, *(str(ROOT / "tests" / name) for name in cases)]))
+    if sys.argv[1:] == ["--extra"]:
+        cases = EXTRA_CASES
+    elif sys.argv[1:] == ["--drain-only"]:
+        cases = ("test_runtime_drain_v1.py", "test_main_runtime_drain_contract_v1.py")
+    elif sys.argv[1:] == ["--drain-regression"]:
+        cases = (
+            "test_runtime_drain_v1.py",
+            "test_main_runtime_drain_contract_v1.py",
+            "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_falcon_management_safety_v1.py",
+        )
+    elif sys.argv[1:] in (["--registry-lock-audit"], ["--registry-writers"]):
+        cases = ("test_registry_remaining_writers_atomic_rmw_v1.py",)
+    elif sys.argv[1:] == ["--personal-http-auth"]:
+        cases = (
+            "test_personal_http_auth_gate_v1.py",
+            "test_falcon_central_only_reconciliation.py",
+            "test_falcon_manual_close_outcome_reconciliation_v1.py",
+        )
+    elif sys.argv[1:] == ["--persistence-locks"]:
+        cases = (
+            "test_trade_registry_atomic_durable_write_v1.py",
+            "test_trade_registry_reset_serialization_v1.py",
+            "test_runtime_file_lock_fail_closed_v1.py",
+            "test_main_runtime_drain_contract_v1.py",
+        )
+    elif sys.argv[1:] == ["--personal-execution-safety"]:
+        cases = (
+            "test_falcon_real_pilot_preflight_fail_closed_v1.py",
+            "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_falcon_management_safety_v1.py",
+            "test_account_client_order_writer_contract_v1.py",
+            "test_bingx_ccxt_stop_readback_contract_v1.py",
+            "test_real_close_reconciliation_v11.py",
+            "test_broker_finite_numeric_inputs_v1.py",
+            "test_falcon_positions_read_fail_closed_v1.py",
+            "test_live_central_risk_gate_fail_closed_v1.py",
+            "test_live_position_reconciliation_risk_gate_v1.py",
+            "test_disaster_stop_fallback_route_auth_v1.py",
+            "test_auto_real_execution_bridge_route_auth_v1.py",
+        )
+    elif sys.argv[1:] == ["--personal-safety-no-ccxt"]:
+        # Run the available personal-execution regressions when the offline
+        # Python environment has no cached ccxt package. The two excluded
+        # modules are not silently represented as tested by this selection.
+        cases = (
+            "test_falcon_real_pilot_preflight_fail_closed_v1.py",
+            "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_falcon_management_safety_v1.py",
+            "test_account_client_order_writer_contract_v1.py",
+            "test_falcon_positions_read_fail_closed_v1.py",
+            "test_live_central_risk_gate_fail_closed_v1.py",
+            "test_live_position_reconciliation_risk_gate_v1.py",
+            "test_disaster_stop_fallback_route_auth_v1.py",
+            "test_auto_real_execution_bridge_route_auth_v1.py",
+            "test_trading_mode_defaults_fail_closed_v1.py",
+        )
+    elif sys.argv[1:] == ["--stop-readback"]:
+        cases = ("test_falcon_client_order_id_collision_guard_v1.py",)
+    elif sys.argv[1:] == ["--finite-numeric"]:
+        cases = ("test_broker_finite_numeric_inputs_v1.py",)
+    elif sys.argv[1:] == ["--close-reconciliation"]:
+        cases = ("test_real_close_reconciliation_v11.py",)
+    else:
+        cases = CASES
+    if sys.argv[1:] == ["--registry-lock-audit"]:
+        filters = ["-k", "test_every_direct_registry_save_call_is_inside_shared_lock"]
+    elif sys.argv[1:] == ["--registry-writers"]:
+        filters = []
+    elif sys.argv[1:] == ["--personal-http-auth"]:
+        filters = []
+    elif sys.argv[1:] == ["--persistence-locks"]:
+        filters = []
+    elif sys.argv[1:] == ["--personal-execution-safety"]:
+        filters = []
+    elif sys.argv[1:] == ["--personal-safety-no-ccxt"]:
+        filters = []
+    elif sys.argv[1:] == ["--stop-readback"]:
+        filters = []
+    elif sys.argv[1:] == ["--finite-numeric"]:
+        filters = []
+    elif sys.argv[1:] == ["--close-reconciliation"]:
+        filters = []
+    else:
+        filters = ["-k", "not test_shadow_validation_append_is_idempotent_across_processes"] if cases is EXTRA_CASES else []
+    raise SystemExit(
+        pytest.main(
+            [
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "-p",
+                "no:debugging",
+                *filters,
+                *(str(ROOT / "tests" / name) for name in cases),
+            ]
+        )
+    )

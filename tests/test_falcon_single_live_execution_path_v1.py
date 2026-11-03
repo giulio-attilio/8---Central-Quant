@@ -685,7 +685,7 @@ def test_live_consumer_treats_unknown_engine_outcome_as_reconciliation_only():
         "FALCON_REAL_NOTIONAL_USDT": 10.0,
         "FALCON_REAL_MAX_POSITIONS": 1,
         "FALCON_REQUIRE_REAL_TP50_CAPABLE": False,
-        "HEALTH": {},
+        "HEALTH": {"falcon_live_management_reconciliation_ready": True},
         "central_broker": object(),
         "BROKER_IMPORT_ERROR": None,
         "safe_float": lambda value, default=None: float(value)
@@ -733,6 +733,83 @@ def test_live_consumer_treats_unknown_engine_outcome_as_reconciliation_only():
     assert calls["unknown"] == 1
 
 
+def test_live_position_reconciliation_denial_never_reaches_execution_engine():
+    engine_calls = []
+
+    def engine(**_kwargs):
+        engine_calls.append(True)
+        pytest.fail("a denied Central reconciliation decision must block Engine")
+
+    namespace = {
+        "FALCON_MODE": "LIVE",
+        "ENABLE_REAL_TRADING": True,
+        "FALCON_REAL_NOTIONAL_USDT": 10.0,
+        "FALCON_REAL_MAX_POSITIONS": 1,
+        "FALCON_REQUIRE_REAL_TP50_CAPABLE": False,
+        "HEALTH": {"falcon_live_management_reconciliation_ready": True},
+        "central_broker": object(),
+        "BROKER_IMPORT_ERROR": None,
+        "safe_float": lambda value, default=None: float(value)
+        if value is not None
+        else default,
+        "falcon_resolve_partial_capable_notional": lambda _sig: {
+            "allowed": True,
+            "notional_usdt": 10.0,
+        },
+        "falcon_live_positions_count": lambda _positions: 0,
+        "central_can_open_trade": lambda _sig, positions=None: {
+            "allowed": False,
+            "decision": "DENY",
+            "status": "LIVE_BLOCKED_BY_BINGX_POSITION_RECONCILIATION",
+            "reasons": ["LIVE_BLOCKED_BY_BINGX_POSITION_RECONCILIATION"],
+        },
+        "falcon_validate_position_ownership_limit_evidence": lambda *_args, **_kwargs: {
+            "ok": True,
+            "evidence": {},
+        },
+        "falcon_execute_live_via_canonical_engine": engine,
+    }
+    execute = _load_first_function(FALCON, "execute_signal_if_allowed", namespace)
+    signal = _signal()
+
+    allowed, decision = execute(signal, positions={})
+
+    assert allowed is False
+    assert decision["decision"] == "DENY"
+    assert decision["status"] == "LIVE_BLOCKED_BY_BINGX_POSITION_RECONCILIATION"
+    assert signal["execution_decision"] is decision
+    assert engine_calls == []
+
+
+def test_live_consumer_blocks_before_central_or_engine_until_startup_reconciliation():
+    calls = []
+    namespace = {
+        "FALCON_MODE": "LIVE",
+        "FALCON_REAL_NOTIONAL_USDT": 10.0,
+        "FALCON_REAL_MAX_POSITIONS": 1,
+        "FALCON_REQUIRE_REAL_TP50_CAPABLE": False,
+        "HEALTH": {"falcon_live_management_reconciliation_ready": False},
+        "falcon_resolve_partial_capable_notional": lambda _sig: pytest.fail(
+            "startup gate must run before sizing and Central risk"
+        ),
+        "central_can_open_trade": lambda *_args, **_kwargs: calls.append(
+            "central"
+        ),
+        "falcon_execute_live_via_canonical_engine": lambda *_args, **_kwargs: calls.append(
+            "engine"
+        ),
+    }
+    execute = _load_first_function(FALCON, "execute_signal_if_allowed", namespace)
+    signal = _signal()
+
+    allowed, decision = execute(signal, positions={})
+
+    assert allowed is False
+    assert decision["status"] == "FALCON_LIVE_MANAGEMENT_RECONCILIATION_NOT_READY"
+    assert calls == []
+    assert signal["execution_decision"] is decision
+
+
 def test_live_consumer_post_engine_exception_becomes_unknown_without_retry_or_close():
     calls = {"adapter": 0, "unknown": 0}
 
@@ -766,7 +843,7 @@ def test_live_consumer_post_engine_exception_becomes_unknown_without_retry_or_cl
         "FALCON_REAL_NOTIONAL_USDT": 10.0,
         "FALCON_REAL_MAX_POSITIONS": 1,
         "FALCON_REQUIRE_REAL_TP50_CAPABLE": False,
-        "HEALTH": {},
+        "HEALTH": {"falcon_live_management_reconciliation_ready": True},
         "central_broker": object(),
         "BROKER_IMPORT_ERROR": None,
         "safe_float": lambda value, default=None: float(value) if value is not None else default,
@@ -1666,8 +1743,12 @@ def test_live_risk_payload_uses_exact_single_path_version_and_literal_signal_id(
 
     class Requests:
         @staticmethod
-        def post(_url, json=None, timeout=None):
-            captured.append({"payload": dict(json or {}), "timeout": timeout})
+        def post(_url, json=None, timeout=None, auth=None):
+            captured.append({
+                "payload": dict(json or {}),
+                "timeout": timeout,
+                "auth": auth,
+            })
             return Response()
 
     helpers, _namespace = _load_latest(
@@ -1679,6 +1760,10 @@ def test_live_risk_payload_uses_exact_single_path_version_and_literal_signal_id(
             "FALCON_REAL_NOTIONAL_USDT": 10.0,
             "FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION": "TEST-FALCON-V1",
             "CENTRAL_CAN_OPEN_TRADE_URL": "http://test.invalid/can_open_trade",
+            "central_personal_http_auth": lambda _url: (
+                "synthetic-test-user",
+                "synthetic-test-password",
+            ),
             "requests": Requests(),
             "normalize_symbol_for_central": lambda value: value,
             "safe_float": lambda value, default=None: float(value)
@@ -1691,6 +1776,10 @@ def test_live_risk_payload_uses_exact_single_path_version_and_literal_signal_id(
     )
 
     assert result["allowed"] is True
+    assert captured[0]["auth"] == (
+        "synthetic-test-user",
+        "synthetic-test-password",
+    )
     assert captured[0]["payload"]["signal_id"] is None
     assert captured[0]["payload"]["lifecycle_id"] == "FALCON-LIFECYCLE-1"
     assert captured[0]["payload"]["falcon_single_live_execution_path_v1"] == (

@@ -77,6 +77,28 @@ def _ensure_data_dir() -> None:
     Path(TRADE_REGISTRY_FILE).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _is_persistent_registry_path(path: Any) -> bool:
+    normalized = str(path or "").replace("\\", "/").rstrip("/")
+    return normalized == "/data" or normalized.startswith("/data/")
+
+
+def _fsync_registry_parent(path: Path) -> None:
+    """Persist the directory entry after replacing the Registry on POSIX.
+
+    Windows does not expose the same portable directory-fsync contract. Local
+    Windows runs therefore validate file syncing only; they are not evidence
+    for Linux persistent-disk durability.
+    """
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(path.parent), flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _empty_registry() -> Dict[str, Any]:
     return {
         "ok": True,
@@ -261,9 +283,12 @@ def _normalize_registry(data: Any) -> Dict[str, Any]:
 
 
 def load_registry() -> Dict[str, Any]:
-    _ensure_data_dir()
     path = Path(TRADE_REGISTRY_FILE)
     with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_LOAD_INITIALIZE_OR_MIGRATE"), _lock:
+        if not path.exists() and _is_persistent_registry_path(path):
+            raise FileNotFoundError(
+                "PERSISTENT_TRADE_REGISTRY_MISSING_FAIL_CLOSED"
+            )
         if not path.exists() and TRADE_REGISTRY_LEGACY_FILE != TRADE_REGISTRY_FILE and Path(TRADE_REGISTRY_LEGACY_FILE).exists():
             legacy = json.loads(
                 Path(TRADE_REGISTRY_LEGACY_FILE).read_text(encoding="utf-8")
@@ -333,9 +358,19 @@ def save_registry(registry: Dict[str, Any]) -> bool:
     registry["updated_at"] = _now()
     tmp = str(TRADE_REGISTRY_FILE) + ".tmp"
     with _lock:
-        with open(tmp, "w", encoding="utf-8") as file_obj:
-            json.dump(registry, file_obj, ensure_ascii=False, indent=2, default=str)
-        os.replace(tmp, TRADE_REGISTRY_FILE)
+        try:
+            with open(tmp, "w", encoding="utf-8") as file_obj:
+                json.dump(registry, file_obj, ensure_ascii=False, indent=2, default=str)
+                file_obj.flush()
+                os.fsync(file_obj.fileno())
+            os.replace(tmp, TRADE_REGISTRY_FILE)
+            _fsync_registry_parent(Path(TRADE_REGISTRY_FILE))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
     return True
 
 
@@ -3438,7 +3473,7 @@ def get_trade_registry_snapshot() -> Dict[str, Any]:
 def reset_trade_registry(confirm: bool = False) -> Dict[str, Any]:
     if not confirm:
         return {"ok": False, "error": "CONFIRM_REQUIRED"}
-    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_RESET"):
+    with _c3_closed_repair_writer_mutation_v1("TRADE_REGISTRY_RESET"), _lock:
         write_result = save_registry(_empty_registry())
     if write_result is False:
         return {"ok": False, "error": "TRADE_REGISTRY_RESET_NOT_PERSISTED"}
