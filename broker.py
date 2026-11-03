@@ -1922,16 +1922,100 @@ def validate_disaster_stop_price(side: str, entry_price, stop_price):
 
 
 def _apply_disaster_stop_buffer(side: str, stop_price: float) -> float:
-    stop = float(stop_price)
-    pct = float(DISASTER_STOP_PRICE_BUFFER_PCT or 0)
-    if pct <= 0:
+    stop = _safe_float_broker(stop_price)
+    pct = _safe_float_broker(DISASTER_STOP_PRICE_BUFFER_PCT)
+    if stop is None or stop <= 0:
+        raise ValueError("DISASTER_STOP_INVALID_INPUT")
+    if pct is None or pct < 0:
+        raise ValueError("DISASTER_STOP_BUFFER_CONFIG_INVALID")
+    if pct == 0:
         return stop
     s = str(side or "").upper().strip()
     if s in {"LONG", "BUY"}:
-        return stop * (1 - pct / 100.0)
-    if s in {"SHORT", "SELL"}:
-        return stop * (1 + pct / 100.0)
-    return stop
+        buffered = stop * (1 - pct / 100.0)
+    elif s in {"SHORT", "SELL"}:
+        buffered = stop * (1 + pct / 100.0)
+    else:
+        buffered = stop
+    buffered = _safe_float_broker(buffered)
+    if buffered is None or buffered <= 0:
+        raise ValueError("DISASTER_STOP_BUFFERED_PRICE_INVALID")
+    return buffered
+
+
+def _prepare_buffered_disaster_stop(side: str, entry_price, stop_price):
+    """Validate both the configured buffer and final trigger before any order send."""
+    base_validation = validate_disaster_stop_price(side, entry_price, stop_price)
+    if not base_validation.get("ok"):
+        return {
+            "ok": False,
+            "status": "DISASTER_STOP_INVALID",
+            "reason": base_validation.get("reason"),
+            "validation": base_validation,
+            "stop_price": None,
+        }
+
+    try:
+        buffered_price = _apply_disaster_stop_buffer(side, base_validation["stop"])
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "ok": False,
+            "status": "DISASTER_STOP_BUFFER_INVALID",
+            "reason": "disaster stop buffer configuration or result is invalid",
+            "validation": base_validation,
+            "stop_price": None,
+        }
+
+    buffered_validation = validate_disaster_stop_price(
+        side, base_validation.get("entry"), buffered_price
+    )
+    if not buffered_validation.get("ok"):
+        return {
+            "ok": False,
+            "status": "DISASTER_STOP_BUFFER_INVALID",
+            "reason": buffered_validation.get("reason"),
+            "validation": base_validation,
+            "buffered_validation": buffered_validation,
+            "stop_price": None,
+        }
+
+    return {
+        "ok": True,
+        "status": "DISASTER_STOP_BUFFERED_PRICE_VALID",
+        "reason": None,
+        "validation": base_validation,
+        "buffered_validation": buffered_validation,
+        "stop_price": buffered_price,
+    }
+
+
+def _live_disaster_stop_preflight(side: str, entry_price, stop_price):
+    """Fail closed before entry if a required stop is disabled or configured invalidly."""
+    if DISASTER_STOP_REQUIRE_FOR_LIVE and not DISASTER_STOP_ENABLED:
+        return {
+            "ok": False,
+            "status": "DISASTER_STOP_REQUIRED_BUT_DISABLED",
+            "reason": "disaster stop is required for live entries but is disabled",
+            "stop_price": None,
+        }
+
+    if not DISASTER_STOP_ENABLED:
+        return {
+            "ok": True,
+            "status": "DISASTER_STOP_NOT_REQUIRED_AND_DISABLED",
+            "reason": None,
+            "stop_price": None,
+        }
+
+    if not DISASTER_STOP_REQUIRE_FOR_LIVE and stop_price in (None, ""):
+        return {
+            "ok": True,
+            "status": "DISASTER_STOP_OPTIONAL_NOT_CONFIGURED",
+            "reason": None,
+            "stop_price": None,
+        }
+
+    return _prepare_buffered_disaster_stop(side, entry_price, stop_price)
 
 
 def _disaster_stop_hedge_mode_detected() -> bool:
@@ -2125,12 +2209,20 @@ def create_disaster_stop_order(
         sym = normalize_symbol(symbol)
         normalized = normalize_side(side)
         position_side = bingx_position_side(side)
-        amount_value = float(amount)
-        stop_loss_value = float(stop_loss_price)
+        amount_value = _safe_float_broker(amount)
+        stop_loss_value = _safe_float_broker(stop_loss_price)
+        entry_supplied = entry_price not in (None, "")
         entry_value = (
-            float(entry_price) if entry_price not in (None, "") else None
+            _safe_float_broker(entry_price) if entry_supplied else None
         )
-        if not sym or amount_value <= 0 or stop_loss_value <= 0:
+        if (
+            not sym
+            or amount_value is None
+            or amount_value <= 0
+            or stop_loss_value is None
+            or stop_loss_value <= 0
+            or (entry_supplied and (entry_value is None or entry_value <= 0))
+        ):
             raise ValueError("DISASTER_STOP_INVALID_INPUT")
     except Exception as exc:
         error_details = _managed_exception_details(exc)
@@ -2182,21 +2274,28 @@ def create_disaster_stop_order(
             result=result, error=result["reason"], payload_sanitized=None
         )
         return result
-    validation = validate_disaster_stop_price(side, entry_value, stop_loss_value)
-    if not validation.get("ok"):
+    stop_preparation = _prepare_buffered_disaster_stop(
+        side, entry_value, stop_loss_value
+    )
+    if not stop_preparation.get("ok"):
         result = {
             "ok": False,
             "enabled": True,
             "created": False,
-            "status": "DISASTER_STOP_INVALID",
-            "reason": validation.get("reason"),
-            "validation": validation,
+            "sent": False,
+            "send_attempted": False,
+            "send_outcome_unknown": False,
+            "confirmed": False,
+            "status": stop_preparation.get("status"),
+            "reason": stop_preparation.get("reason"),
+            "validation": stop_preparation.get("validation"),
+            "buffered_validation": stop_preparation.get("buffered_validation"),
             "disaster_stop_hedge_mode_fix": _build_disaster_stop_hedge_mode_fix_payload(position_side),
         }
-        _set_last_disaster_stop_diagnostic(result=result, error=validation.get("reason"), payload_sanitized=None)
+        _set_last_disaster_stop_diagnostic(result=result, error=result["reason"], payload_sanitized=None)
         return result
 
-    stop_price = _apply_disaster_stop_buffer(side, stop_loss_value)
+    stop_price = stop_preparation["stop_price"]
     close_side = "sell" if normalized == "buy" else "buy"
     client_order_id = exact_client_order_id
 
@@ -3296,29 +3395,32 @@ def place_market_order(
         log_execution_audit_event({"event": "BROKER_EXECUTION_AUTH_DENIED", **result})
         return result
 
-    if DISASTER_STOP_ENABLED and DISASTER_STOP_REQUIRE_FOR_LIVE:
-        stop_validation = validate_disaster_stop_price(side, preview.get("price_ref") if isinstance(preview, dict) else None, stop_loss_price)
-        if not stop_validation.get("ok"):
-            result = {
-                "ok": False,
-                "status": "DISASTER_STOP_REQUIRED_BLOCKED",
-                "sent": False,
-                "symbol": sym,
-                "side": order_side,
-                "position_side": bingx_position_side(side),
-                "margin_usdt": margin,
-                "leverage": lev,
-                "notional_usdt": planned_exposure,
-                "preview": preview,
-                "preview_isolation": True,
-                "live_send_enabled": live_send_enabled,
-                "stop_validation": stop_validation,
-                "error": stop_validation.get("reason"),
-                "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-            }
-            log_execution_event({"event": "place_market_order", **result})
-            log_execution_audit_event({"event": "BROKER_DISASTER_STOP_REQUIRED_BLOCKED", **result})
-            return result
+    stop_validation = _live_disaster_stop_preflight(
+        side,
+        preview.get("price_ref") if isinstance(preview, dict) else None,
+        stop_loss_price,
+    )
+    if not stop_validation.get("ok"):
+        result = {
+            "ok": False,
+            "status": "DISASTER_STOP_REQUIRED_BLOCKED",
+            "sent": False,
+            "symbol": sym,
+            "side": order_side,
+            "position_side": bingx_position_side(side),
+            "margin_usdt": margin,
+            "leverage": lev,
+            "notional_usdt": planned_exposure,
+            "preview": preview,
+            "preview_isolation": True,
+            "live_send_enabled": live_send_enabled,
+            "stop_validation": stop_validation,
+            "error": stop_validation.get("reason"),
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        log_execution_event({"event": "place_market_order", **result})
+        log_execution_audit_event({"event": "BROKER_DISASTER_STOP_REQUIRED_BLOCKED", **result})
+        return result
 
     ready = ready_check(cache_seconds=0)
     if not ready.get("ok"):
@@ -4292,8 +4394,14 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
     sym = normalize_symbol(symbol)
     normalized = normalize_side(side)
     position_side = bingx_position_side(side)
-    validation = validate_disaster_stop_price(side, entry_price, stop_loss_price)
-    stop_price = _apply_disaster_stop_buffer(side, float(stop_loss_price)) if validation.get("ok") else stop_loss_price
+    stop_preparation = _prepare_buffered_disaster_stop(
+        side, entry_price, stop_loss_price
+    )
+    validation = stop_preparation.get("validation") or {
+        "ok": False,
+        "reason": stop_preparation.get("reason"),
+    }
+    stop_price = stop_preparation.get("stop_price")
     close_side = "sell" if normalized == "buy" else "buy"
     client_order_id = validate_broker_client_order_id(
         client_tag or f"CQ-CPDS-{int(time.time())}", required=True
@@ -4302,7 +4410,7 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
         "symbol": bingx_api_symbol(sym),
         "side": close_side.upper(),
         "type": "STOP_MARKET",
-        "stopPrice": float(stop_price) if _cq_patch_safe_float(stop_price) else stop_price,
+        "stopPrice": float(stop_price) if _cq_patch_safe_float(stop_price) else None,
         "workingType": DISASTER_STOP_WORKING_TYPE,
         "closePosition": True,
         "clientOrderId": client_order_id,
@@ -4310,7 +4418,7 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
     if position_side:
         payload["positionSide"] = position_side
     return {
-        "ok": bool(validation.get("ok")),
+        "ok": bool(stop_preparation.get("ok")),
         "version": DISASTER_STOP_CLOSE_POSITION_PREVIEW_VERSION,
         "mode": "PREVIEW_ONLY_NO_ORDER_SENT",
         "symbol": sym,
@@ -4319,6 +4427,7 @@ def build_disaster_stop_close_position_preview(symbol, side, stop_loss_price, cl
         "stop_price": stop_price,
         "client_order_id": client_order_id,
         "validation": validation,
+        "stop_preparation_status": stop_preparation.get("status"),
         "payload_preview": payload,
         "notes": [
             "Este preview não confirma que a BingX aceitará closePosition via CCXT/API.",
