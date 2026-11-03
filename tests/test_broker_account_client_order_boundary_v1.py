@@ -672,9 +672,6 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
         "validate_execution_auth_token",
         lambda *_args, **_kwargs: {"ok": True},
     )
-    monkeypatch.setattr(
-        broker, "validate_disaster_stop_price", lambda *_args, **_kwargs: {"ok": True}
-    )
     monkeypatch.setattr(broker, "ready_check", lambda **_kwargs: {"ok": True})
     monkeypatch.setattr(broker, "exchange", lambda: exchange)
     monkeypatch.setattr(
