@@ -257,3 +257,8 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   com query não amplia a exceção de autenticação no deploy ativo. Nenhuma rota
   de trading foi chamada; não é uma validação completa de todas as rotas nem
   prova de configuração dos controles de execução.
+- Reexecução da suíte dedicada `--personal-http-auth` no código local após a
+  correção e documentação: **235 passed in 87,66s**. O runner bloqueou rede,
+  subprocessos e leitura de `.env`, permitiu apenas os sockets locais Flask e
+  redirecionou persistência para temporário. O resultado não substitui o GET
+  read-only no serviço ativo e não prova todas as configurações de produção.
