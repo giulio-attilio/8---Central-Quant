@@ -400,3 +400,26 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   referência de rastreamento local. Não houve push nem deploy. A autenticação
   ainda não está integrada no Render. Os testes não demonstram configuração,
   disponibilidade ou comportamento no processo ativo, nem prontidão de trading.
+
+## Regressão PAPER ampliada e publicação pendente — 2026-11-04
+
+- Revalidei o branch antes desta atualização: `codex/personal-readiness-release-20261104`,
+  HEAD `8941e5f9b612d270ac514aa671e49293d842cd9c`, worktree limpa, 17 commits
+  à frente da referência local.
+- A suíte `python.exe -I tests/run_falcon_pilot_minimal_offline.py
+  --personal-execution-safety` terminou com **402 passed em 875,54 s**, usando o
+  ambiente local com CCXT 4.5.88. O runner bloqueou rede/DNS, subprocessos e
+  leitura de `.env`, desativou o auto-start dos robôs e redirecionou persistência
+  para temporário. É evidência local PAPER/simulada, não prova de corretora,
+  runtime Render ou operação LIVE.
+- O push fast-forward foi tentado para `codex/personal-readiness-release-20261104`,
+  mas falhou antes da autenticação porque o SSH empacotado no sandbox não
+  iniciou (`NtCreateDirectoryObject ... 0xC0000022`). Não usei credenciais
+  salvas nem forcei outro método. A leitura do GitHub confirmou que a branch
+  remota permanece em `cc8b674e6d3597ccdfac96a15559773c42b99598`; nenhum objeto
+  ou ref remoto foi alterado.
+- A branch candidata e `main` não contêm `.github/workflows`; o repositório é
+  público, a branch não é protegida e o Render continua com auto-deploy
+  desligado. A publicação não deve iniciar build/deploy pago; nenhum deploy foi
+  iniciado. A publicação manual ainda é necessária para disponibilizar estes
+  commits.
