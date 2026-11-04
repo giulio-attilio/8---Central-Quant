@@ -499,3 +499,30 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   `codex/personal-readiness-20261103`, deploy `598c4d4505c3aec6d4de9a6b762cc1576f604374`
   (`live`), auto-deploy desligado; nenhuma configuração foi alterada. A
   correção local ainda não foi publicada nem integrada ao serviço em execução.
+
+## Retificação após publicação e integração de históricos — 2026-11-04
+
+- A branch `codex/personal-readiness-release-20261104` foi publicada no
+  repositório Central Quant. O GitHub confirmou a ponta
+  `22538425bf0c0db4b6a175a595b728ea3c3d1b21`; o push foi fast-forward e não
+  acionou deploy. A autoria registrada pelo commit é `giulioap822-hash`; isso
+  identifica o metadado de autoria do commit, não necessariamente a identidade
+  que autenticou o push.
+- A comparação somente de leitura com a branch seguida pelo Render mostrou
+  divergência: 24 commits à frente e um merge de segurança à frente na branch
+  `codex/personal-readiness-20261103`. Para preservar ambos os históricos,
+  incorporei essa ponta localmente, sem conflitos, no merge
+  `42ebbd3c4d22e94ba6d5b77c636c2eb4a7e6fa56` (pais: `22538425` e `20ed76bd`).
+- Após o merge, o runner oficial offline
+  `python -I tests/run_falcon_pilot_minimal_offline.py` terminou com **337
+  passed em 804,60 s**, código de saída 0. A seleção
+  `python -I tests/run_falcon_pilot_minimal_offline.py --c3-dormant-startup`
+  terminou com **24 passed e 3 subtests passed em 519,36 s**, código de saída
+  0. `git diff --check` passou e o worktree ficou limpo após os testes.
+- Esses testes usam simuladores, rede/DNS bloqueados e persistência temporária;
+  não validam durabilidade física do disco Render, chamadas reais à corretora,
+  credenciais de produção nem integração em execução. O C3 distribuído continua
+  dormente.
+- A branch de release ainda precisa publicar o merge local. O Render permanece
+  apontado para `codex/personal-readiness-20261103`, com auto-deploy desligado;
+  nenhum deploy ou alteração de AWS/Render/produção foi feito.
