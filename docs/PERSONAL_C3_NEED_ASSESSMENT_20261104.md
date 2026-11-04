@@ -223,6 +223,14 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   implantada. A consequência conservadora é intencional: sem prova de origem,
   a conciliação não libera novas entradas LIVE, mesmo que símbolo, lado e
   quantidade coincidam.
+- Reexecução em 2026-11-04 de `--personal-execution-safety`: **402 passed em
+  845,40 s**, Python Windows 3.14.5, wheel local `ccxt==4.5.88` instalado
+  somente em pasta temporária com `pip --no-index --no-deps`; SHA-256 do wheel:
+  `3e37d626cf3245c547b76751a26a9119df9da28f1f80fbdb751586bfebf5f791`. O runner
+  bloqueou rede externa, subprocessos e leitura de `.env`, usando persistência
+  temporária. A coleta sem o wheel não passou porque `ccxt` estava ausente; a
+  tentativa no WSL também parou antes dos testes por falta de Flask/pip. Não
+  houve download nem alteração de dependências compartilhadas.
 
 ## Regressão expandida e estado de publicação — 2026-11-04
 
