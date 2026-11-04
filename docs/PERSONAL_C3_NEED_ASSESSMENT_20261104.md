@@ -541,3 +541,16 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   temporários simulados. O resultado valida comportamento local do código; não
   prova as credenciais configuradas, o deploy ou a autenticação do serviço em
   execução no Render.
+
+## Revalidação da segurança de execução pessoal — 2026-11-04
+
+- No HEAD `27e3a952c2b33d7f31b82929124b6e02d3d1ff77`, a seleção
+  `python -I tests/run_falcon_pilot_minimal_offline.py --personal-execution-safety`
+  terminou com **402 passed em 1.942,66 s**, código de saída 0.
+- O runner isolado usa a instalação offline de dependências, bloqueia rede/DNS
+  e subprocessos conforme o harness e direciona persistência para dados
+  temporários. Isso é evidência reproduzível do comportamento local coberto;
+  não comprova disco físico no Render, integração externa nem prontidão LIVE.
+- AWS, Render e produção não foram alterados; nenhum deploy foi iniciado. O
+  resultado deve ser revalidado no release implantado antes de qualquer
+  conclusão sobre o serviço em execução.
