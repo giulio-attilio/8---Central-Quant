@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import threading
 import time as real_time
 from pathlib import Path
@@ -42,7 +43,7 @@ def _load_broker_function(name: str, globals_dict: dict):
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
     assert {node.name for node in definitions} == set(names), name
-    namespace = dict(globals_dict)
+    namespace = {"math": math, **globals_dict}
     exec(compile(ast.Module(body=sorted(definitions, key=lambda node: node.lineno), type_ignores=[]), str(BROKER_SOURCE), "exec"), namespace)
     return namespace[name]
 

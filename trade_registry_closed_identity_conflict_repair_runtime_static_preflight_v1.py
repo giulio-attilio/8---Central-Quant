@@ -423,7 +423,7 @@ def _dormant_coordinator_startup_binding(tree: ast.Module) -> bool:
     if any(n is None for n in (coordinator, adapters, installation)) or len(functions) != 1:
         return False
     value, function = coordinator.value, functions[0]
-    if not (isinstance(value, ast.Call) and not value.args and not value.keywords
+    if not (isinstance(value, ast.Call) and not value.args
             and isinstance(value.func, ast.Attribute) and value.func.attr == _COORDINATOR_BUILDER
             and isinstance(value.func.value, ast.Name) and value.func.value.id == "c3_writer_coordinator_v1"
             and coordinator.lineno < adapters.lineno < installation.lineno
@@ -431,6 +431,32 @@ def _dormant_coordinator_startup_binding(tree: ast.Module) -> bool:
                     for a, default in zip(function.args.kwonlyargs, function.args.kw_defaults))
             and not any(isinstance(n, ast.Name) and n.id == "coordinator"
                         and isinstance(n.ctx, ast.Store) for n in ast.walk(function))):
+        return False
+    # Dormant startup must not construct storage backends or resolve a disk
+    # path merely to pass dependencies that the disabled builder discards.
+    if len(value.keywords) != 1 or value.keywords[0].arg != "config":
+        return False
+    binding = value.keywords[0].value
+    if not (
+        isinstance(binding, ast.Call)
+        and isinstance(binding.func, ast.Attribute)
+        and binding.func.attr == "ProductionWriterRuntimeCoordinatorBindingConfigV1"
+        and isinstance(binding.func.value, ast.Name)
+        and binding.func.value.id == "c3_writer_coordinator_v1"
+        and {item.arg for item in binding.keywords}
+        == {"enabled", "scope_attestation"}
+    ):
+        return False
+    binding_values = {item.arg: item.value for item in binding.keywords}
+    if not (
+        isinstance(binding_values["enabled"], ast.Constant)
+        and binding_values["enabled"].value is False
+        and isinstance(binding_values["scope_attestation"], ast.Attribute)
+        and binding_values["scope_attestation"].attr
+        == "PRODUCTION_COORDINATOR_EXPLICIT_DEPENDENCY_BINDING_ATTESTATION_V1"
+        and isinstance(binding_values["scope_attestation"].value, ast.Name)
+        and binding_values["scope_attestation"].value.id == "c3_writer_coordinator_v1"
+    ):
         return False
     for node, keyword in ((adapters, "maintenance_coordinator"), (installation, "coordinator")):
         if not isinstance(node.value, ast.Call):

@@ -22,6 +22,7 @@ _SOURCE_KEY = (
 )
 
 _SYNC_FUNCTIONS = {
+    "get_open_positions_from_module",
     "_trpsf_v1_registry_lock",
     "_trade_registry_sync_symbol",
     "normalize_registry_symbol",
@@ -40,12 +41,19 @@ _SYNC_FUNCTIONS = {
     "_trade_registry_signature_map",
     "mark_registry_missing_trades",
     "sync_trade_registry_from_open_positions",
+    "autosync_trade_registry",
 }
 
 
 class _BotModule:
-    def __init__(self, positions):
+    def __init__(self, positions, loader_error=None):
         self.positions = copy.deepcopy(positions)
+        self.loader_error = loader_error
+
+    def carregar_posicoes(self):
+        if self.loader_error is not None:
+            raise self.loader_error
+        return copy.deepcopy(self.positions)
 
 
 class _FakeTradeRegistry:
@@ -170,10 +178,8 @@ def _sync(registry, bot_positions, *, commit=True, write_gate=False):
         "data_hora_sp_str": lambda: "2026-08-11T12:00:00-03:00",
         "_position_runner_r": lambda _position: None,
         "_position_runner_pct": lambda _position: None,
-        "get_open_positions_from_module": (
-            lambda module, key=None: copy.deepcopy(module.positions)
-        ),
         "central_trade_registry_snapshot": lambda include_trades=False: {},
+        "memory_profile_step": lambda _label: None,
     }
     _compile_sync_functions(namespace)
     return namespace["sync_trade_registry_from_open_positions"](commit=commit)
@@ -304,13 +310,310 @@ def test_ordinary_legacy_absence_still_marks_existing_v1_record_missing():
     position = _position()
     registry = _FakeTradeRegistry(_v1_trade(position))
 
-    result = _sync(registry, {})
+    # A confirmed empty position source is different from having no bot
+    # position source loaded at all.
+    result = _sync(registry, {"TURTLE": []})
 
     trade = next(iter(registry.registry["open_trades"].values()))
     assert result["ok"] is True
     assert registry.save_calls
     assert trade["status"] == "MISSING_FROM_BOTS"
     assert trade["missing_from_bots"] is True
+
+
+def test_any_position_loader_failure_aborts_sync_before_registry_mutations():
+    existing_position = _position()
+    registry = _FakeTradeRegistry(_v1_trade(existing_position))
+    new_position = _position(symbol="ETHUSDT", id="TURTLE20:ETHUSDT:LONG")
+    namespace = {
+        "central_trade_registry": registry,
+        "TRADE_REGISTRY_IMPORT_ERROR": None,
+        "LOADED_BOTS": {
+            "TURTLE": _BotModule([new_position]),
+            "PREDATOR": _BotModule([], loader_error=OSError("disk temporarily unavailable")),
+        },
+        "REGISTRY_V2_PAPER_WRITE_ENABLED": False,
+        "_TRADE_REGISTRY_V2_TURTLE_REGISTER_OCCURRENCE_PREFIX": (
+            "turtle-paper-register-occurrence:v1:"
+        ),
+        "is_v2_execution_id": is_v2_execution_id,
+        "json": __import__("json"),
+        "data_hora_sp_str": lambda: "2026-11-04T12:00:00-03:00",
+        "_position_runner_r": lambda _position: None,
+        "_position_runner_pct": lambda _position: None,
+        "central_trade_registry_snapshot": lambda include_trades=False: {},
+        "memory_profile_step": lambda _label: None,
+    }
+    _compile_sync_functions(namespace)
+
+    result = namespace["sync_trade_registry_from_open_positions"](commit=True)
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        {"bot": "PREDATOR", "error": "POSITION_LOADER_FAILED:OSError"}
+    ]
+    assert result["missing_mark_result"]["error"] == (
+        "REGISTRY_POSITION_READ_FAILED_NO_MUTATION"
+    )
+    assert result["removed_count"] == 0
+    assert registry.register_calls == []
+    assert registry.save_calls == []
+    assert registry.registry["open_trades"] == _v1_trade(existing_position)
+
+
+def test_enabled_bot_missing_from_loaded_set_aborts_sync_before_registry_mutations():
+    existing_position = _position()
+    registry = _FakeTradeRegistry(_v1_trade(existing_position))
+    namespace = {
+        "central_trade_registry": registry,
+        "TRADE_REGISTRY_IMPORT_ERROR": None,
+        "LOADED_BOTS": {"TURTLE": _BotModule([])},
+        "BOT_CONFIGS": {
+            "TURTLE": {"enabled_env": "ENABLE_TURTLE"},
+            "PREDATOR": {"enabled_env": "ENABLE_PREDATOR"},
+        },
+        "env_bool": lambda name, default=False: name == "ENABLE_PREDATOR",
+        "REGISTRY_V2_PAPER_WRITE_ENABLED": False,
+        "_TRADE_REGISTRY_V2_TURTLE_REGISTER_OCCURRENCE_PREFIX": (
+            "turtle-paper-register-occurrence:v1:"
+        ),
+        "is_v2_execution_id": is_v2_execution_id,
+        "json": __import__("json"),
+        "data_hora_sp_str": lambda: "2026-11-04T12:00:00-03:00",
+        "_position_runner_r": lambda _position: None,
+        "_position_runner_pct": lambda _position: None,
+        "central_trade_registry_snapshot": lambda include_trades=False: {},
+        "memory_profile_step": lambda _label: None,
+    }
+    _compile_sync_functions(namespace)
+
+    result = namespace["sync_trade_registry_from_open_positions"](commit=True)
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        {"bot": "PREDATOR", "error": "BOT_POSITION_SOURCE_UNAVAILABLE"}
+    ]
+    assert result["missing_mark_result"]["error"] == (
+        "REGISTRY_BOT_SET_INCOMPLETE_NO_MUTATION"
+    )
+    assert result["missing_mutation_blocked"] is True
+    assert registry.register_calls == []
+    assert registry.save_calls == []
+    assert registry.registry["open_trades"] == _v1_trade(existing_position)
+
+
+def test_existing_registry_owner_not_loaded_aborts_sync_before_mutations():
+    existing_position = _position()
+    registry = _FakeTradeRegistry(_v1_trade(existing_position, bot="PREDATOR"))
+    namespace = {
+        "central_trade_registry": registry,
+        "TRADE_REGISTRY_IMPORT_ERROR": None,
+        "LOADED_BOTS": {"TURTLE": _BotModule([])},
+        "BOT_CONFIGS": {"TURTLE": {"enabled_env": "ENABLE_TURTLE"}},
+        "env_bool": lambda _name, default=False: default,
+        "REGISTRY_V2_PAPER_WRITE_ENABLED": False,
+        "_TRADE_REGISTRY_V2_TURTLE_REGISTER_OCCURRENCE_PREFIX": (
+            "turtle-paper-register-occurrence:v1:"
+        ),
+        "is_v2_execution_id": is_v2_execution_id,
+        "json": __import__("json"),
+        "data_hora_sp_str": lambda: "2026-11-04T12:00:00-03:00",
+        "_position_runner_r": lambda _position: None,
+        "_position_runner_pct": lambda _position: None,
+        "central_trade_registry_snapshot": lambda include_trades=False: {},
+        "memory_profile_step": lambda _label: None,
+    }
+    _compile_sync_functions(namespace)
+
+    result = namespace["sync_trade_registry_from_open_positions"](commit=True)
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        {"bot": "PREDATOR", "error": "BOT_POSITION_SOURCE_UNAVAILABLE"}
+    ]
+    assert result["missing_mutation_blocked"] is True
+    assert registry.register_calls == []
+    assert registry.save_calls == []
+    assert registry.registry["open_trades"] == _v1_trade(
+        existing_position, bot="PREDATOR"
+    )
+
+
+def test_registry_read_failure_aborts_sync_before_registry_mutations():
+    class _UnreadableRegistry(_FakeTradeRegistry):
+        def load_registry(self):
+            raise OSError("temporary disk read failure")
+
+    position = _position()
+    registry = _UnreadableRegistry()
+
+    result = _sync(registry, {"TURTLE": [position]}, commit=True)
+
+    assert result["ok"] is False
+    assert result["errors"] == [{"error": "REGISTRY_READ_FAILED:OSError"}]
+    assert result["missing_mark_result"]["error"] == (
+        "REGISTRY_READ_FAILED_NO_MUTATION"
+    )
+    assert result["missing_mutation_blocked"] is True
+    assert registry.register_calls == []
+    assert registry.save_calls == []
+    assert registry.registry["open_trades"] == {}
+
+
+def test_malformed_registry_open_trades_aborts_sync_before_registry_mutations():
+    position = _position()
+    registry = _FakeTradeRegistry()
+    registry.registry["open_trades"] = None
+
+    result = _sync(registry, {"TURTLE": [position]}, commit=True)
+
+    assert result["ok"] is False
+    assert result["errors"] == [{"error": "REGISTRY_READ_FAILED:TypeError"}]
+    assert result["missing_mark_result"]["error"] == (
+        "REGISTRY_READ_FAILED_NO_MUTATION"
+    )
+    assert registry.register_calls == []
+    assert registry.save_calls == []
+    assert registry.registry["open_trades"] is None
+
+
+def test_failed_missing_mark_persistence_makes_sync_unsuccessful():
+    class _RejectingRegistry(_FakeTradeRegistry):
+        def save_registry(self, registry):
+            self.save_calls.append(copy.deepcopy(registry))
+            return False
+
+    position = _position()
+    registry = _RejectingRegistry(_v1_trade(position))
+
+    result = _sync(registry, {"TURTLE": []}, commit=True)
+
+    assert result["ok"] is False
+    assert result["missing_mark_result"] == {
+        "ok": False,
+        "error": "REGISTRY_SAVE_NOT_CONFIRMED",
+        "registry_write": False,
+    }
+
+
+def test_registry_registration_failure_does_not_return_exception_details():
+    class _RaisingRegistry(_FakeTradeRegistry):
+        def register_open_trade(self, **kwargs):
+            raise RuntimeError("sensitive diagnostic fixture")
+
+    registry = _RaisingRegistry()
+    result = _sync(registry, {"TURTLE": [_position()]}, commit=True)
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        {
+            "trade_id": "TURTLE:TURTLE20:BTCUSDT:LONG",
+            "bot": "TURTLE",
+            "symbol": "BTCUSDT",
+            "error": "REGISTRY_REGISTER_FAILED",
+        }
+    ]
+    assert "sensitive diagnostic fixture" not in repr(result)
+
+
+def test_strict_position_loader_rejects_malformed_rows():
+    namespace = {
+        "memory_profile_step": lambda _label: None,
+    }
+    _compile_sync_functions(namespace)
+
+    with pytest.raises(TypeError, match="LOCAL_POSITION_LOADER_ITEM_INVALID_TYPE"):
+        namespace["get_open_positions_from_module"](
+            SimpleNamespace(carregar_posicoes=lambda: {"trade-1": None}),
+            key="TURTLE",
+            raise_on_error=True,
+        )
+
+
+def test_invalid_position_fields_block_missing_mutation_for_existing_registry_trade():
+    invalid_position = _position(entry=None)
+    registry = _FakeTradeRegistry(_v1_trade(invalid_position))
+
+    result = _sync(registry, {"TURTLE": [invalid_position]}, commit=True)
+
+    trade = next(iter(registry.registry["open_trades"].values()))
+    assert result["ok"] is False
+    assert result["missing_mutation_blocked"] is True
+    assert result["v2_ownership_missing_mutation_blocked"] is False
+    assert result["missing_mark_result"]["error"] == (
+        "REGISTRY_POSITION_DATA_MISSING_MUTATION_BLOCKED"
+    )
+    assert result["errors"] == [
+        {"bot": "TURTLE", "error": "REGISTRY_POSITION_FIELDS_INVALID"}
+    ]
+    assert trade["status"] == "OPEN"
+    assert "missing_from_bots" not in trade
+    assert registry.save_calls == []
+
+
+def test_autosync_status_surfaces_unsuccessful_sync_without_error_details():
+    namespace = {
+        "TRADE_REGISTRY_AUTOSYNC_STATUS": {},
+        "data_hora_sp_str": lambda: "2026-11-04T12:00:00-03:00",
+        "sync_trade_registry_from_open_positions": lambda *, commit: {
+            "ok": False,
+            "commit": commit,
+            "errors_count": 1,
+            "errors": [{"bot": "PREDATOR", "error": "POSITION_LOADER_FAILED:OSError"}],
+            "candidates_count": 0,
+            "imported_count": 0,
+            "skipped_count": 0,
+            "removed_count": 0,
+            "removed": [],
+            "missing_mark_result": {"ok": False},
+            "after": None,
+        },
+    }
+    _compile_sync_functions(namespace)
+    namespace["sync_trade_registry_from_open_positions"] = lambda *, commit: {
+        "ok": False,
+        "commit": commit,
+        "errors_count": 1,
+        "errors": [{"bot": "PREDATOR", "error": "POSITION_LOADER_FAILED:OSError"}],
+        "candidates_count": 0,
+        "imported_count": 0,
+        "skipped_count": 0,
+        "removed_count": 0,
+        "removed": [],
+        "missing_mark_result": {"ok": False},
+        "after": None,
+    }
+
+    namespace["autosync_trade_registry"]("can_open_trade")
+
+    assert namespace["TRADE_REGISTRY_AUTOSYNC_STATUS"]["last_ok"] is False
+    assert namespace["TRADE_REGISTRY_AUTOSYNC_STATUS"]["last_error"] == (
+        "TRADE_REGISTRY_AUTOSYNC_FAILED"
+    )
+
+
+def test_autosync_status_sanitizes_unexpected_exception_details():
+    namespace = {
+        "TRADE_REGISTRY_AUTOSYNC_STATUS": {},
+        "data_hora_sp_str": lambda: "2026-11-04T12:00:00-03:00",
+        "sync_trade_registry_from_open_positions": lambda *, commit: (
+            _ for _ in ()
+        ).throw(RuntimeError("sensitive diagnostic fixture")),
+    }
+    _compile_sync_functions(namespace)
+    namespace["sync_trade_registry_from_open_positions"] = lambda *, commit: (
+        _ for _ in ()
+    ).throw(RuntimeError("sensitive diagnostic fixture"))
+
+    with pytest.raises(RuntimeError, match="sensitive diagnostic fixture"):
+        namespace["autosync_trade_registry"]("can_open_trade")
+
+    assert namespace["TRADE_REGISTRY_AUTOSYNC_STATUS"]["last_error"] == (
+        "TRADE_REGISTRY_AUTOSYNC_FAILED"
+    )
+    assert "sensitive diagnostic fixture" not in repr(
+        namespace["TRADE_REGISTRY_AUTOSYNC_STATUS"]
+    )
 
 
 def test_missing_mark_is_persisted_once_then_becomes_idempotent():

@@ -46,6 +46,10 @@ def define(tree, name, namespace):
 
 def namespace():
     return {
+        "CENTRAL_DATA_DIR": "/tmp/central-quant-dormant-startup-test",
+        "os": __import__("os"),
+        "time": __import__("time"),
+        "uuid": __import__("uuid"),
         "c3_writer_coordinator_v1": coordinator_v1,
         "c3_authenticated_persistent_authority_production_adapters_v2": adapters_v2,
         "c3_authenticated_persistent_authority_boundary_v2": boundary_v2,

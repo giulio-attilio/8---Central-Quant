@@ -161,6 +161,8 @@ EXTRA_CASES = (
     "test_broker_order_constraints_fail_closed_v1.py",
     "test_broker_account_client_order_boundary_v1.py",
     "test_broker_managed_close_timeout_semantics_v1.py",
+    "test_broker_managed_entry_cancel_v1.py",
+    "test_broker_entry_fill_stop_sizing_v1.py",
     "test_bingx_ccxt_stop_readback_contract_v1.py",
     "test_personal_http_auth_gate_v1.py",
     "test_auto_real_execution_bridge_route_auth_v1.py",
@@ -187,6 +189,18 @@ if __name__ == "__main__":
         )
     elif sys.argv[1:] in (["--registry-lock-audit"], ["--registry-writers"]):
         cases = ("test_registry_remaining_writers_atomic_rmw_v1.py",)
+    elif sys.argv[1:] == ["--registry-sync"]:
+        cases = ("test_main_traderegistry_sync_v2_ownership.py",)
+    elif sys.argv[1:] == ["--can-open-risk"]:
+        cases = (
+            "test_history_eventbus_smoke.py",
+            "test_falcon_single_live_execution_path_v1.py",
+        )
+    elif sys.argv[1:] == ["--c3-dormant-startup"]:
+        cases = (
+            "test_c3_dormant_startup_same_coordinator_v2.py",
+            "test_c3_dormant_root_head_startup_integration_v1.py",
+        )
     elif sys.argv[1:] == ["--personal-http-auth"]:
         cases = (
             "test_personal_http_auth_gate_v1.py",
@@ -204,6 +218,8 @@ if __name__ == "__main__":
         cases = (
             "test_falcon_real_pilot_preflight_fail_closed_v1.py",
             "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_broker_managed_entry_cancel_v1.py",
+            "test_broker_entry_fill_stop_sizing_v1.py",
             "test_falcon_management_safety_v1.py",
             "test_account_client_order_writer_contract_v1.py",
             "test_bingx_ccxt_stop_readback_contract_v1.py",
@@ -237,11 +253,37 @@ if __name__ == "__main__":
         cases = ("test_broker_finite_numeric_inputs_v1.py",)
     elif sys.argv[1:] == ["--close-reconciliation"]:
         cases = ("test_real_close_reconciliation_v11.py",)
+    elif sys.argv[1:] == ["--initial-stop-containment"]:
+        cases = (
+            "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_broker_managed_entry_cancel_v1.py",
+        )
+    elif sys.argv[1:] == ["--initial-stop-cancel"]:
+        cases = (
+            "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_broker_entry_fill_stop_sizing_v1.py",
+        )
+    elif sys.argv[1:] == ["--entry-fill-stop"]:
+        cases = (
+            "test_broker_account_client_order_boundary_v1.py",
+            "test_broker_entry_fill_stop_sizing_v1.py",
+        )
     else:
         cases = CASES
     if sys.argv[1:] == ["--registry-lock-audit"]:
         filters = ["-k", "test_every_direct_registry_save_call_is_inside_shared_lock"]
     elif sys.argv[1:] == ["--registry-writers"]:
+        filters = []
+    elif sys.argv[1:] == ["--registry-sync"]:
+        filters = []
+    elif sys.argv[1:] == ["--can-open-risk"]:
+        filters = [
+            "-k",
+            "reduce_only_claim or registry_sync_fails or does_not_block_paper or "
+            "auto_bridge_blocks_every_invalid_falcon_can_open_contract or "
+            "can_open_trade_wrapper_attaches_only_validated_falcon_bridge_suppression",
+        ]
+    elif sys.argv[1:] == ["--c3-dormant-startup"]:
         filters = []
     elif sys.argv[1:] == ["--personal-http-auth"]:
         filters = []
@@ -257,16 +299,24 @@ if __name__ == "__main__":
         filters = []
     elif sys.argv[1:] == ["--close-reconciliation"]:
         filters = []
+    elif sys.argv[1:] == ["--initial-stop-containment"]:
+        filters = []
+    elif sys.argv[1:] == ["--initial-stop-cancel"]:
+        filters = []
+    elif sys.argv[1:] == ["--entry-fill-stop"]:
+        filters = []
     else:
         filters = ["-k", "not test_shadow_validation_append_is_idempotent_across_processes"] if cases is EXTRA_CASES else []
+    pytest_args = ["-q", "-p", "no:cacheprovider"]
+    # The unittest-based C3 startup integration tests use pytest's trace-option
+    # lookup in pytest's unittest adapter, so keep the built-in debugging
+    # plugin registered for this focused mode (the option remains false).
+    if sys.argv[1:] not in (["--c3-dormant-startup"], ["--can-open-risk"]):
+        pytest_args.extend(["-p", "no:debugging"])
     raise SystemExit(
         pytest.main(
             [
-                "-q",
-                "-p",
-                "no:cacheprovider",
-                "-p",
-                "no:debugging",
+                *pytest_args,
                 *filters,
                 *(str(ROOT / "tests" / name) for name in cases),
             ]

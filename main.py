@@ -2792,6 +2792,8 @@ def get_open_positions_from_module(module, key=None, raise_on_error=False):
 
         for p in iterable:
             if not isinstance(p, dict):
+                if raise_on_error:
+                    raise TypeError("LOCAL_POSITION_LOADER_ITEM_INVALID_TYPE")
                 continue
             status = str(p.get("status", "OPEN")).upper()
             if status in {"ENCERRADO", "CLOSED", "FECHADO"}:
@@ -15149,27 +15151,174 @@ def sync_trade_registry_from_open_positions(commit=False):
             "commit": bool(commit),
         }
 
-    existing_ids = _trade_registry_existing_trade_ids()
     imported = []
     skipped = []
     errors = []
     candidates = []
     protected_v2_signatures = set()
     missing_mutation_blocked = False
+    missing_mutation_block_reason = None
+    v2_ownership_missing_mutation_blocked = False
+    position_snapshots = []
 
     existing_signature = set()
     existing_map = {}
     try:
         registry = central_trade_registry.load_registry()
+        if not isinstance(registry, dict):
+            raise TypeError("registry root is not an object")
         existing_open = registry.get("open_trades", {})
+        if not isinstance(existing_open, (dict, list)):
+            raise TypeError("open_trades is not a collection")
         existing_signature = _trade_registry_signature_from_items(existing_open)
         existing_map = _trade_registry_signature_map(existing_open)
-    except Exception:
-        existing_signature = set()
-        existing_map = {}
+        existing_values = (
+            existing_open.values()
+            if isinstance(existing_open, dict)
+            else existing_open
+        )
+        existing_ids = set()
+        for item in existing_values:
+            if isinstance(item, dict) and item.get("trade_id"):
+                existing_ids.add(str(item.get("trade_id")))
+            elif isinstance(item, str):
+                existing_ids.add(item)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "commit": bool(commit),
+            "updated_at": data_hora_sp_str(),
+            "loaded_bots": list(LOADED_BOTS.keys()),
+            "candidates_count": 0,
+            "imported_count": 0,
+            "skipped_count": 0,
+            "errors_count": 1,
+            "imported": [],
+            "skipped": [],
+            "errors": [{
+                "error": f"REGISTRY_READ_FAILED:{type(exc).__name__}",
+            }],
+            "removed_count": 0,
+            "removed": [],
+            "missing_mark_result": {
+                "ok": False,
+                "error": "REGISTRY_READ_FAILED_NO_MUTATION",
+                "marked_count": 0,
+                "marked": [],
+            },
+            "missing_mutation_blocked": True,
+            "v2_ownership_missing_mutation_blocked": False,
+            "after": None,
+            "note": "Registry sync aborted before writes because the Registry read failed.",
+        }
 
+    # A partial bot set is not an authoritative position snapshot. In
+    # particular, a configured bot can fail to import at startup, or an
+    # existing Registry owner can be disabled/unloaded. Neither condition is
+    # evidence that the owner's open trades disappeared.
+    loaded_bot_keys = {
+        normalize_registry_bot(key)
+        for key in (LOADED_BOTS.keys() if isinstance(LOADED_BOTS, dict) else [])
+    }
+    unavailable_bots = set()
+    bot_configurations = globals().get("BOT_CONFIGS")
+    enabled_check = globals().get("env_bool")
+    if isinstance(bot_configurations, dict) and callable(enabled_check):
+        for bot_key, config in bot_configurations.items():
+            if not isinstance(config, dict):
+                unavailable_bots.add(normalize_registry_bot(bot_key))
+                continue
+            enabled_env = config.get("enabled_env")
+            if enabled_env and enabled_check(enabled_env, default=False):
+                normalized_key = normalize_registry_bot(bot_key)
+                if normalized_key not in loaded_bot_keys:
+                    unavailable_bots.add(normalized_key)
+
+    for item in existing_values:
+        if not isinstance(item, dict):
+            continue
+        owner = normalize_registry_bot(item.get("bot") or "UNKNOWN")
+        if owner not in loaded_bot_keys:
+            unavailable_bots.add(owner)
+
+    if unavailable_bots:
+        unavailable_sorted = sorted(unavailable_bots)
+        unavailable_errors = [
+            {"bot": bot_key, "error": "BOT_POSITION_SOURCE_UNAVAILABLE"}
+            for bot_key in unavailable_sorted
+        ]
+        return {
+            "ok": False,
+            "commit": bool(commit),
+            "updated_at": data_hora_sp_str(),
+            "loaded_bots": list(LOADED_BOTS.keys()) if isinstance(LOADED_BOTS, dict) else [],
+            "candidates_count": 0,
+            "imported_count": 0,
+            "skipped_count": 0,
+            "errors_count": len(unavailable_errors),
+            "imported": [],
+            "skipped": [],
+            "errors": unavailable_errors,
+            "removed_count": 0,
+            "removed": [],
+            "missing_mark_result": {
+                "ok": False,
+                "error": "REGISTRY_BOT_SET_INCOMPLETE_NO_MUTATION",
+                "marked_count": 0,
+                "marked": [],
+            },
+            "missing_mutation_blocked": True,
+            "v2_ownership_missing_mutation_blocked": False,
+            "after": None,
+            "note": "Registry sync aborted before writes because the configured or existing owner bot set is incomplete.",
+        }
+
+    # Read every bot's position source successfully before performing any
+    # Registry writes. A failed read must not be confused with an empty
+    # position set, because that could mark valid open trades as missing.
+    position_load_errors = []
     for bot_key, module in LOADED_BOTS.items():
-        positions = get_open_positions_from_module(module, key=bot_key)
+        try:
+            positions = get_open_positions_from_module(
+                module,
+                key=bot_key,
+                raise_on_error=True,
+            )
+            position_snapshots.append((bot_key, positions))
+        except Exception as exc:
+            position_load_errors.append({
+                "bot": bot_key,
+                "error": f"POSITION_LOADER_FAILED:{type(exc).__name__}",
+            })
+
+    if position_load_errors:
+        return {
+            "ok": False,
+            "commit": bool(commit),
+            "updated_at": data_hora_sp_str(),
+            "loaded_bots": list(LOADED_BOTS.keys()),
+            "candidates_count": 0,
+            "imported_count": 0,
+            "skipped_count": 0,
+            "errors_count": len(position_load_errors),
+            "imported": [],
+            "skipped": [],
+            "errors": position_load_errors,
+            "removed_count": 0,
+            "removed": [],
+            "missing_mark_result": {
+                "ok": False,
+                "error": "REGISTRY_POSITION_READ_FAILED_NO_MUTATION",
+                "marked_count": 0,
+                "marked": [],
+            },
+            "missing_mutation_blocked": True,
+            "v2_ownership_missing_mutation_blocked": False,
+            "after": None,
+            "note": "Registry sync aborted before writes because a bot position read failed.",
+        }
+
+    for bot_key, positions in position_snapshots:
         for position in positions:
             ownership_state = _trade_registry_sync_v2_ownership(position)
             if ownership_state != "LEGACY_V1":
@@ -15189,6 +15338,10 @@ def sync_trade_registry_from_open_positions(commit=False):
                         # evidence instead of issuing a missing-record
                         # mutation.
                         missing_mutation_blocked = True
+                        missing_mutation_block_reason = (
+                            "REGISTRY_V2_OWNERSHIP_MISSING_MUTATION_BLOCKED"
+                        )
+                        v2_ownership_missing_mutation_blocked = True
                         errors.append(
                             {
                                 "bot": bot_key,
@@ -15202,6 +15355,10 @@ def sync_trade_registry_from_open_positions(commit=False):
                     # translated through a legacy key.  Suppress missing
                     # mutations for this sync run and surface the error below.
                     missing_mutation_blocked = True
+                    missing_mutation_block_reason = (
+                        "REGISTRY_V2_OWNERSHIP_MISSING_MUTATION_BLOCKED"
+                    )
+                    v2_ownership_missing_mutation_blocked = True
 
                 skipped.append(
                     {
@@ -15225,6 +15382,18 @@ def sync_trade_registry_from_open_positions(commit=False):
             candidate = _trade_registry_sync_candidate(bot_key, position)
             
             if not candidate:
+                # An unclassifiable live position is not evidence that its
+                # Registry row is stale. Suppress missing-row mutations for
+                # this run while still allowing valid candidates to sync.
+                missing_mutation_blocked = True
+                if missing_mutation_block_reason is None:
+                    missing_mutation_block_reason = (
+                        "REGISTRY_POSITION_DATA_MISSING_MUTATION_BLOCKED"
+                    )
+                errors.append({
+                    "bot": bot_key,
+                    "error": "REGISTRY_POSITION_FIELDS_INVALID",
+                })
                 skipped.append({
                     "bot": bot_key,
                     "reason": "INVALID_POSITION_FIELDS",
@@ -15281,14 +15450,14 @@ def sync_trade_registry_from_open_positions(commit=False):
                         "trade_id": trade_id,
                         "bot": candidate.get("bot"),
                         "symbol": candidate.get("symbol"),
-                        "error": result if isinstance(result, dict) else str(result),
+                        "error": "REGISTRY_REGISTER_FAILED",
                     })
-            except Exception as exc:
+            except Exception:
                 errors.append({
                     "trade_id": trade_id,
                     "bot": candidate.get("bot"),
                     "symbol": candidate.get("symbol"),
-                    "error": str(exc),
+                    "error": "REGISTRY_REGISTER_FAILED",
                 })
 
     candidate_signature_all = _trade_registry_signature_from_items(candidates)
@@ -15319,15 +15488,20 @@ def sync_trade_registry_from_open_positions(commit=False):
     if commit and missing_mutation_blocked:
         missing_mark_result = {
             "ok": False,
-            "error": "REGISTRY_V2_OWNERSHIP_MISSING_MUTATION_BLOCKED",
+            "error": missing_mutation_block_reason,
             "marked_count": 0,
             "marked": [],
         }
     elif commit and removed:
         missing_mark_result = mark_registry_missing_trades(removed)
 
+    missing_mark_failed = bool(
+        commit
+        and isinstance(missing_mark_result, dict)
+        and missing_mark_result.get("ok") is False
+    )
     return {
-        "ok": len(errors) == 0,
+        "ok": len(errors) == 0 and not missing_mark_failed,
         "commit": bool(commit),
         "updated_at": data_hora_sp_str(),
         "loaded_bots": list(LOADED_BOTS.keys()),
@@ -15341,7 +15515,10 @@ def sync_trade_registry_from_open_positions(commit=False):
         "removed_count": len(removed),
         "removed": removed[:200],
         "missing_mark_result": missing_mark_result,
-        "v2_ownership_missing_mutation_blocked": missing_mutation_blocked,
+        "missing_mutation_blocked": missing_mutation_blocked,
+        "v2_ownership_missing_mutation_blocked": (
+            v2_ownership_missing_mutation_blocked
+        ),
         "after": central_trade_registry_snapshot(include_trades=False) if commit else None,
         "note": "GET faz prévia/dry-run. Para importar, use POST com confirm=true ou confirm=SYNC.",
     }
@@ -15355,7 +15532,9 @@ def autosync_trade_registry(reason="manual"):
         TRADE_REGISTRY_AUTOSYNC_STATUS = {
             "last_run": data_hora_sp_str(),
             "last_ok": bool(result.get("ok")),
-            "last_error": None,
+            "last_error": (
+                None if result.get("ok") else "TRADE_REGISTRY_AUTOSYNC_FAILED"
+            ),
             "reason": reason,
             "last_result": {
             "candidates_count": result.get("candidates_count"),
@@ -15370,11 +15549,11 @@ def autosync_trade_registry(reason="manual"):
         }
         return result
 
-    except Exception as exc:
+    except Exception:
         TRADE_REGISTRY_AUTOSYNC_STATUS = {
             "last_run": data_hora_sp_str(),
             "last_ok": False,
-            "last_error": str(exc),
+            "last_error": "TRADE_REGISTRY_AUTOSYNC_FAILED",
             "reason": reason,
             "last_result": None,
         }
@@ -19320,15 +19499,68 @@ def can_open_trade_decision(payload: dict):
     - Concentração direcional >= GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT:
       DENY novas entradas no lado dominante.
     - Ativo com GLOBAL_RISK_MAX_SYMBOL_EXPOSURE ou mais exposições: DENY.
-    - reduceOnly/fechamento continua permitido quando GLOBAL_RISK_ALLOW_REDUCE_ONLY=true.
+    - Alegações reduceOnly são recusadas neste gate de novas entradas; fechamentos
+      devem usar um fluxo que valide a posição e a quantidade contra a fonte confiável.
     """
     payload = payload or {}
 
-    # Mantém o Trade Registry sincronizado antes da decisão de risco
+    # This endpoint authorizes new entries. A caller-provided reduce-only flag
+    # is not proof that an open position exists or that an order can only
+    # reduce it, so it must not bypass the entry risk gates here. Verified
+    # position-management/close flows use their dedicated paths.
+    if _risk_is_reduce_only(payload):
+        reduce_only_result = {
+            "ok": True,
+            "allowed": False,
+            "decision": "DENY",
+            "status": "REDUCE_ONLY_NOT_VALID_FOR_CAN_OPEN_TRADE",
+            "bot": normalize_registry_bot(
+                payload.get("bot")
+                or payload.get("robot")
+                or payload.get("strategy")
+                or ""
+            ),
+            "symbol": normalize_registry_symbol(
+                payload.get("symbol")
+                or payload.get("symbol_clean")
+                or payload.get("pair")
+                or payload.get("ativo")
+                or ""
+            ),
+            "side": str(
+                payload.get("side")
+                or payload.get("direction")
+                or payload.get("signal")
+                or ""
+            ).upper().strip(),
+            "reduce_only": True,
+            "reasons": [
+                "reduce_only não comprova uma posição; use o fluxo de fechamento validado, não o gate de novas entradas"
+            ],
+            "warnings": [],
+            "token_value_exposed": False,
+        }
+        try:
+            append_decision_log(payload, reduce_only_result)
+            reduce_only_result["decision_log_saved"] = True
+        except Exception:
+            reduce_only_result["decision_log_saved"] = False
+        return reduce_only_result
+
+    # A decisão não pode aprovar uma nova entrada se não foi possível
+    # confirmar a sincronização/leitura das posições locais.
+    registry_sync_ok = False
     try:
-        autosync_trade_registry(reason="can_open_trade")
+        registry_sync_result = autosync_trade_registry(reason="can_open_trade")
+        registry_sync_ok = (
+            isinstance(registry_sync_result, dict)
+            and registry_sync_result.get("ok") is True
+        )
     except Exception as exc:
-        print("AVISO SYNC REGISTRY ANTES DO CAN_OPEN_TRADE:", exc)
+        print(
+            "AVISO SYNC REGISTRY ANTES DO CAN_OPEN_TRADE:",
+            type(exc).__name__,
+        )
 
     bot = normalize_registry_bot(
         payload.get("bot")
@@ -19406,6 +19638,8 @@ def can_open_trade_decision(payload: dict):
 
     reasons = []
     warnings = []
+    if not reduce_only and not registry_sync_ok:
+        reasons.append("sincronização do Registry indisponível; novas entradas bloqueadas")
     executive_policy_payload = None
     turtle_risk_guard_payload = {"applies": False, "enabled": TURTLE_RISK_GUARD_ENABLED, "version": TURTLE_RISK_GUARD_VERSION}
 
@@ -19626,6 +19860,7 @@ def can_open_trade_decision(payload: dict):
         "bingx_divergence": divergence_warning,
         "memory": memory_risk,
         "exposure": {
+            "registry_sync_ok": registry_sync_ok,
             "total": risk_total_pos,
             "long": risk_long_pos,
             "short": risk_short_pos,
@@ -69417,17 +69652,7 @@ C3_CLOSED_REPAIR_WRITER_COORDINATOR_DORMANT_V1 = (
         config=c3_writer_coordinator_v1.ProductionWriterRuntimeCoordinatorBindingConfigV1(
             enabled=False,
             scope_attestation=c3_writer_coordinator_v1.PRODUCTION_COORDINATOR_EXPLICIT_DEPENDENCY_BINDING_ATTESTATION_V1,
-            storage_root_binding_sha256=c3_writer_coordinator_v1.production_coordinator_storage_root_binding_sha256_v1(CENTRAL_DATA_DIR)
-        ),
-        lock_backend=c3_writer_coordinator_v1.runtime_storage.CrossPlatformInterprocessFileLockBackendV1(
-            storage_root=CENTRAL_DATA_DIR, enabled=True
-        ),
-        lease_store=c3_writer_coordinator_v1.runtime_storage.DurableJsonMaintenanceLeaseStoreV1(
-            storage_root=CENTRAL_DATA_DIR, enabled=True
-        ),
-        registry_path=os.path.join(CENTRAL_DATA_DIR, "trade_registry.json"),
-        clock=time.time,
-        nonce_source=lambda: uuid.uuid4().hex
+        )
     )
 )
 C3_CLOSED_REPAIR_RESOLVED_AUTHORITY_STARTUP_BRIDGE_V2 = (
