@@ -294,3 +294,22 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   momento da captura, sem upgrade ou compra de minutos; não garante custo zero
   se o saldo mudar ou o build exceder a franquia. O serviço web existente segue
   no plano Standard. Não houve deploy nem alteração de configuração.
+- Revalidação Render somente de leitura em 2026-11-04: o alvo segue
+  `srv-d8rtuv9o3t8c73ehav5g`, ligado à branch `codex/personal-readiness-20261103`,
+  com auto-deploy desligado, uma instância e disco persistente `/data` de 2 GB.
+  `healthCheckPath` está vazio; Render está usando a checagem TCP padrão, embora
+  `GET /healthz` responda 200 no release ativo. Antes de um futuro deploy, é
+  recomendável configurar `/healthz` como health check HTTP no serviço e
+  confirmar que a rota permanece rápida e sem efeitos colaterais. Isso mede
+  apenas liveness/readiness do processo, não prontidão de trading. O disco
+  persistente implica interrupção durante a substituição da instância; não
+  iniciar o deploy sem janela segura e confirmação de que não há operação em
+  andamento. A integração Render disponível não expõe atualização desse campo.
+- Estado de publicação na mesma revalidação: HEAD local
+  `db009554f2ce4efaa92d7c39c833286bca23c9fc` está 11 commits à frente da branch
+  remota, que continua em `cc8b674e6d3597ccdfac96a15559773c42b99598`. O push
+  por HTTPS não conseguiu conectar ao GitHub mesmo após a concessão de rede ao
+  ambiente; nenhum objeto/ref remoto foi alterado. Depois da publicação, o
+  release pretendido deve ser escolhido por SHA em `Manual Deploy > Deploy a
+  specific commit`, não `Deploy latest commit`, porque o serviço aponta para
+  outra branch. Nenhum deploy foi iniciado.
