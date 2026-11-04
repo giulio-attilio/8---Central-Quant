@@ -423,3 +423,30 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   desligado. A publicação não deve iniciar build/deploy pago; nenhum deploy foi
   iniciado. A publicação manual ainda é necessária para disponibilizar estes
   commits.
+
+## Revalidação após a publicação manual pendente — 2026-11-04
+
+- Revalidação local: branch `codex/personal-readiness-release-20261104`, HEAD
+  `7c4f7a63d99fce8f530eaaecaeab68299e6408ff`, worktree limpa, 18 commits à
+  frente da referência remota local. `git diff --check` passou.
+- Consulta somente de leitura ao GitHub confirmou que a branch remota existe,
+  mas ainda aponta para `cc8b674e6d3597ccdfac96a15559773c42b99598`; portanto o
+  HEAD local não foi publicado. Não houve escrita no GitHub nesta rodada.
+- Consulta somente de leitura ao Render confirmou o serviço
+  `central-robos-bingx` no workspace esperado, branch configurada
+  `codex/personal-readiness-20261103`, auto-deploy desligado e instância única
+  com disco persistente `/data` de 2 GB. O deploy mais recente continua
+  `598c4d4505c3aec6d4de9a6b762cc1576f604374` (`live`). Nenhuma configuração ou
+  deploy foi alterado.
+- Capturas de Billing mostram 0/1.000 minutos de pipeline incluídos consumidos,
+  14,05/25 GB de banda, pipeline Starter a US$ 5/1.000 minutos com 1.000
+  incluídos e limite mensal de US$ 5. A franquia indicada não comprova que o
+  próximo build/deploy custará zero; deploy permanece não autorizado até custo
+  zero comprovável.
+- Regressão ampliada executada do ambiente offline compartilhado, sem instalar
+  dependências:
+  `python.exe -I tests/run_falcon_pilot_minimal_offline.py --extra` — **924
+  passed, 1 skipped, 1 deselected em 1.370,09 s**. O runner bloqueou rede/DNS,
+  subprocessos e acesso a `.env`, desativou auto-start e redirecionou os dados
+  para persistência temporária. É evidência local simulada; não valida
+  integração com corretora, processo Render ou prontidão LIVE.
