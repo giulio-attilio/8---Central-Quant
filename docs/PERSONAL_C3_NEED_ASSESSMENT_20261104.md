@@ -317,3 +317,23 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   release pretendido deve ser escolhido por SHA em `Manual Deploy > Deploy a
   specific commit`, não `Deploy latest commit`, porque o serviço aponta para
   outra branch. Nenhum deploy foi iniciado.
+
+## Revalidação adicional local e estado atual — 2026-11-04
+
+- Revalidei branch, HEAD e status antes de qualquer edição: branch
+  `codex/personal-readiness-release-20261104`, HEAD
+  `2f3f7e79e75dd9e9794259a54cca906b9a2645db`, sem alterações locais; 13 commits
+  à frente da referência remota observada.
+- O `--personal-http-auth` foi reexecutado com o Python isolado já existente,
+  overlay local do wheel CCXT 4.5.88 e o runner de isolamento do repositório:
+  **235 passed em 148,92 s**. O runner bloqueou rede, subprocessos e leitura de
+  `.env`, permitiu apenas os sockets locais necessários ao Flask e redirecionou
+  persistência para temporário. Nenhuma dependência foi instalada ou alterada.
+- A tentativa de checagem Linux atual não iniciou: `wsl -d Ubuntu` retornou
+  `Wsl/E_ACCESSDENIED` antes de executar comandos. Portanto, esta rodada não
+  acrescenta evidência Linux/WSL.
+- GitHub somente leitura ainda mostra a branch remota em
+  `cc8b674e6d3597ccdfac96a15559773c42b99598`; Render somente leitura ainda
+  mostra o serviço na branch `codex/personal-readiness-20261103` e deploy ativo
+  `598c4d4505c3aec6d4de9a6b762cc1576f604374`. Não houve push, deploy ou escrita
+  em AWS/Render/produção.
