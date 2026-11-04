@@ -425,6 +425,20 @@ def _request(
     )
 
 
+def _runtime_auth_pair():
+    from personal_http_auth import central_personal_http_auth_expected_passwords
+
+    username, passwords = central_personal_http_auth_expected_passwords()
+    assert passwords
+    return username, passwords[0]
+
+
+def _runtime_basic_header():
+    username, password = _runtime_auth_pair()
+    encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return "Basic " + encoded
+
+
 @pytest.fixture(autouse=True)
 def block_network(monkeypatch):
     def blocked(*_args, **_kwargs):
@@ -503,9 +517,49 @@ def test_auth_decision_rejects_cross_site_and_malformed_origins():
     assert same_origin["allowed"] is True
 
 
-def test_request_hook_returns_503_until_env_credentials_are_configured(monkeypatch):
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_USER", raising=False)
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_PASSWORD", raising=False)
+def test_runtime_http_passwords_rotate_without_persisting(monkeypatch):
+    import personal_http_auth
+
+    monkeypatch.setattr(personal_http_auth, "_RUNTIME_AUTH_KEY", b"k" * 32)
+    username, first_bucket = personal_http_auth.central_personal_http_auth_expected_passwords(
+        now=119.0
+    )
+    next_username, second_bucket = personal_http_auth.central_personal_http_auth_expected_passwords(
+        now=120.0
+    )
+
+    assert username == next_username == "cq-runtime"
+    assert len(first_bucket[0]) == len(second_bucket[0]) == 64
+    assert first_bucket[0] != second_bucket[0]
+    assert "CENTRAL_PERSONAL_HTTP_PASSWORD" not in personal_http_auth.__dict__
+
+
+def test_http_gate_accepts_boundary_grace_then_rejects_expired_password(monkeypatch):
+    import personal_http_auth
+
+    clock = [119.0]
+    monkeypatch.setattr(personal_http_auth.time, "time", lambda: clock[0])
+    app = _load_real_flask_auth_app()
+    client = app.test_client()
+    old_bucket_header = _runtime_basic_header()
+
+    clock[0] = 120.0
+    boundary = client.get("/livestatus", headers={"Authorization": old_bucket_header})
+    clock[0] = 240.0
+    expired = client.get("/livestatus", headers={"Authorization": old_bucket_header})
+
+    assert boundary.status_code == 200
+    assert expired.status_code == 401
+
+
+def test_request_hook_returns_503_if_runtime_auth_initialization_fails(monkeypatch):
+    import personal_http_auth
+
+    monkeypatch.setattr(
+        personal_http_auth,
+        "central_personal_http_auth_expected_passwords",
+        lambda: (None, ()),
+    )
     namespace, app = _load_auth_gate()
     namespace["request"] = _request()
 
@@ -517,10 +571,9 @@ def test_request_hook_returns_503_until_env_credentials_are_configured(monkeypat
 
 
 def test_request_hook_challenges_missing_or_invalid_credentials(monkeypatch):
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "operator")
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-pass")
+    username, _password = _runtime_auth_pair()
     namespace, app = _load_auth_gate()
-    namespace["request"] = _request(username="operator", password="wrong")
+    namespace["request"] = _request(username=username, password="wrong")
 
     response = app.before_request_function()
 
@@ -530,12 +583,11 @@ def test_request_hook_challenges_missing_or_invalid_credentials(monkeypatch):
 
 
 def test_request_hook_allows_matching_same_origin_credentials(monkeypatch):
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "operator")
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-pass")
+    username, password = _runtime_auth_pair()
     namespace, app = _load_auth_gate()
     namespace["request"] = _request(
-        username="operator",
-        password="synthetic-pass",
+        username=username,
+        password=password,
         fetch_site="same-origin",
         origin="https://central.example.test",
     )
@@ -544,12 +596,11 @@ def test_request_hook_allows_matching_same_origin_credentials(monkeypatch):
 
 
 def test_request_hook_blocks_cross_site_even_with_valid_basic_credentials(monkeypatch):
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "operator")
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-pass")
+    username, password = _runtime_auth_pair()
     namespace, app = _load_auth_gate()
     namespace["request"] = _request(
-        username="operator",
-        password="synthetic-pass",
+        username=username,
+        password=password,
         fetch_site="cross-site",
     )
 
@@ -561,8 +612,13 @@ def test_request_hook_blocks_cross_site_even_with_valid_basic_credentials(monkey
 
 @pytest.mark.parametrize("endpoint", ["can_open_trade_route", "health", "execution_route", None])
 def test_request_hook_fails_closed_for_every_endpoint_when_credentials_are_missing(monkeypatch, endpoint):
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_USER", raising=False)
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_PASSWORD", raising=False)
+    import personal_http_auth
+
+    monkeypatch.setattr(
+        personal_http_auth,
+        "central_personal_http_auth_expected_passwords",
+        lambda: (None, ()),
+    )
     namespace, app = _load_auth_gate()
     namespace["request"] = _request(endpoint=endpoint)
 
@@ -613,9 +669,7 @@ def test_authenticated_get_cannot_commit_registry_query_mutation(monkeypatch):
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     blocked = client.get("/registrymode?commit=true", headers={"Authorization": valid})
     preview = client.get("/registrymode?commit=false", headers={"Authorization": valid})
@@ -639,9 +693,7 @@ def test_authenticated_get_cannot_confirm_registry_sync_or_disaster_stop(monkeyp
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     paths = (
         "/traderegistry/sync?confirm=1",
@@ -665,9 +717,7 @@ def test_authenticated_get_blocks_discovered_registry_and_action_intents(monkeyp
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     paths = (
         "/registryclosedrecovery?commit=true&ack=RESTORE_CLOSED_TRADE_MANUAL",
@@ -701,9 +751,7 @@ def test_authenticated_get_keeps_centralonly_preview_but_blocks_commit_intent(mo
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     preview = client.get(
         "/falcon/centralonly/reconcile?commit=false",
@@ -1071,9 +1119,7 @@ def test_authenticated_get_cannot_invoke_path_encoded_mutation(monkeypatch):
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     blocked = client.get(
         "/history/rotation/commit/text?ack=ROTATE_HISTORY",
@@ -1094,9 +1140,7 @@ def test_authenticated_get_cannot_trigger_learning_refresh(monkeypatch):
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     blocked = client.get("/learning/refresh", headers={"Authorization": valid})
     posted = client.post("/learning/refresh", headers={"Authorization": valid})
@@ -1113,9 +1157,7 @@ def test_authenticated_memory_gc_route_requires_post(monkeypatch, path):
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     blocked = client.get(path, headers={"Authorization": valid})
     posted = client.post(path, headers={"Authorization": valid})
@@ -1168,9 +1210,7 @@ def test_authenticated_get_blocks_legacy_mutation_routes_by_default(monkeypatch,
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     response = client.get(path, headers={"Authorization": valid})
 
@@ -1872,9 +1912,7 @@ def test_authenticated_get_allows_only_explicit_read_only_route_modes(monkeypatc
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     response = client.get(path, headers={"Authorization": valid})
 
@@ -2028,9 +2066,7 @@ def test_authenticated_get_blocks_additional_action_intent_fields(monkeypatch, q
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     response = client.get(f"/registrymode?{query}", headers={"Authorization": valid})
 
@@ -2083,9 +2119,7 @@ def test_real_flask_dispatch_authenticates_sensitive_and_unknown_paths(monkeypat
     monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     app = _load_real_flask_auth_app()
     client = app.test_client()
-    valid = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
-    ).decode("ascii")
+    valid = _runtime_basic_header()
 
     missing = client.get("/livestatus")
     wrong = client.get(
@@ -2105,7 +2139,7 @@ def test_real_flask_dispatch_authenticates_sensitive_and_unknown_paths(monkeypat
     assert allowed.get_json() == {"ok": True, "data": "synthetic-only"}
     assert unknown.status_code == 401
     assert cross_site.status_code == 403
-    assert b"synthetic-only-password" not in allowed.data
+    assert b"cq-runtime" not in allowed.data
 
 
 def test_render_healthz_is_minimal_public_liveness_only(monkeypatch):
@@ -2131,14 +2165,19 @@ def test_render_healthz_is_minimal_public_liveness_only(monkeypatch):
     assert b"trading" not in live.data.lower()
     assert b"secret" not in live.data.lower()
 
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_USER")
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_PASSWORD")
+    import personal_http_auth
+
+    monkeypatch.setattr(
+        personal_http_auth,
+        "central_personal_http_auth_expected_passwords",
+        lambda: (None, ()),
+    )
     unconfigured = _load_real_flask_auth_app().test_client().get("/healthz")
     assert unconfigured.status_code == 200
     assert unconfigured.get_json() == {"ok": True, "status": "HTTP_LIVE"}
 
 
-def test_internal_bot_risk_requests_use_the_same_environment_auth():
+def test_internal_bot_risk_requests_use_the_same_runtime_auth():
     expected_files = {
         "cobra.py",
         "donkey.py",
@@ -2175,46 +2214,47 @@ def test_internal_bot_risk_requests_use_the_same_environment_auth():
     assert authenticated_calls == {name: 1 for name in expected_files}
 
 
-def test_bot_auth_helper_returns_none_unconfigured_and_tuple_when_configured(monkeypatch):
+def test_runtime_auth_source_does_not_depend_on_persistent_http_secrets():
+    source = SOURCE.read_text(encoding="utf-8")
+    helper_source = (ROOT / "personal_http_auth.py").read_text(encoding="utf-8")
+
+    assert "CENTRAL_PERSONAL_HTTP_USER" not in source
+    assert "CENTRAL_PERSONAL_HTTP_PASSWORD" not in source
+    assert "CENTRAL_PERSONAL_HTTP_USER" not in helper_source
+    assert "CENTRAL_PERSONAL_HTTP_PASSWORD" not in helper_source
+
+
+def test_bot_auth_helper_returns_short_lived_tuple_only_for_own_origin(monkeypatch):
     from personal_http_auth import central_personal_http_auth
 
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_USER", raising=False)
-    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_PASSWORD", raising=False)
     monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://central.example.test")
     monkeypatch.setenv("PORT", "10000")
-    assert central_personal_http_auth("https://central.example.test/can_open_trade") is None
-
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "local-test-operator")
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
-    assert central_personal_http_auth("https://central.example.test/can_open_trade") == (
-        "local-test-operator",
-        "synthetic-only-password",
-    )
+    credentials = central_personal_http_auth("https://central.example.test/can_open_trade")
+    assert credentials is not None
+    assert credentials[0] == "cq-runtime"
+    assert len(credentials[1]) == 64
+    assert central_personal_http_auth("https://attacker.example/can_open_trade") is None
 
 
 def test_bot_auth_helper_never_sends_credentials_to_untrusted_or_plain_http_hosts(monkeypatch):
     from personal_http_auth import central_personal_http_auth
 
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "local-test-operator")
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://central.example.test")
     monkeypatch.setenv("PORT", "10000")
 
     assert central_personal_http_auth("https://attacker.example/can_open_trade") is None
     assert central_personal_http_auth("http://central.example.test/can_open_trade") is None
     assert central_personal_http_auth("http://localhost:9999/can_open_trade") is None
-    assert central_personal_http_auth("http://127.0.0.1:10000/can_open_trade") == (
-        "local-test-operator",
-        "synthetic-only-password",
-    )
+    credentials = central_personal_http_auth("http://127.0.0.1:10000/can_open_trade")
+    assert credentials is not None
+    assert credentials[0] == "cq-runtime"
+    assert len(credentials[1]) == 64
 
 
 @pytest.mark.parametrize("port", ["invalid", "", "-1"])
 def test_bot_auth_helper_fails_closed_for_invalid_local_port(monkeypatch, port):
     from personal_http_auth import central_personal_http_auth
 
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "local-test-operator")
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
     monkeypatch.delenv("RENDER_EXTERNAL_URL", raising=False)
     monkeypatch.setenv("PORT", port)
 

@@ -1,7 +1,34 @@
 """Runtime-only helper for authenticated Central Quant HTTP calls."""
 
+import hashlib
+import hmac
 import os
+import secrets
+import time
 from urllib.parse import urlsplit
+
+
+_RUNTIME_AUTH_USERNAME = "cq-runtime"
+_RUNTIME_AUTH_KEY = secrets.token_bytes(32)
+_RUNTIME_AUTH_BUCKET_SECONDS = 120
+
+
+def central_personal_http_auth_expected_passwords(*, now=None):
+    """Return short-lived process-local Basic credentials for this runtime.
+
+    The signing key is generated in memory at import and is never persisted.
+    A password is valid for the current or immediately previous two-minute
+    bucket to tolerate a request that crosses a bucket boundary.
+    """
+    current_time = time.time() if now is None else float(now)
+    current_bucket = int(current_time // _RUNTIME_AUTH_BUCKET_SECONDS)
+    passwords = []
+    for bucket in (current_bucket, current_bucket - 1):
+        message = f"central-personal-http-auth-v1:{bucket}".encode("ascii")
+        passwords.append(
+            hmac.new(_RUNTIME_AUTH_KEY, message, hashlib.sha256).hexdigest()
+        )
+    return _RUNTIME_AUTH_USERNAME, tuple(passwords)
 
 
 def central_personal_http_get_mutation_block(method, path, args):
@@ -249,8 +276,7 @@ def central_personal_http_auth(target_url):
     if not (is_loopback_target or is_render_origin):
         return None
 
-    username = os.environ.get("CENTRAL_PERSONAL_HTTP_USER")
-    password = os.environ.get("CENTRAL_PERSONAL_HTTP_PASSWORD")
-    if not username or not password:
+    username, passwords = central_personal_http_auth_expected_passwords()
+    if not username or not passwords:
         return None
-    return username, password
+    return username, passwords[0]

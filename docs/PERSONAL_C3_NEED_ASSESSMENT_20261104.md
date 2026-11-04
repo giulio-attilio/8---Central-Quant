@@ -346,3 +346,55 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   sincronização explícita do Registry e foi revisada sem executar a rota.
   Essa análise de ancestralidade e diff não substitui validação do runtime,
   configuração ou dados de produção.
+
+## Autenticação pessoal sem segredo estático — 2026-11-04
+
+- Antes de editar, revalidei branch `codex/personal-readiness-release-20261104`,
+  HEAD `1f79896ed7221eb9d94ad2b53928f6760d5d4281` e worktree limpa. As únicas
+  mudanças desta rodada são a autenticação local, os testes correspondentes e
+  este registro; nenhuma alteração existente foi descartada.
+- A autenticação candidata deixou de depender de
+  `CENTRAL_PERSONAL_HTTP_USER`/`CENTRAL_PERSONAL_HTTP_PASSWORD`. O módulo gera
+  uma chave aleatória apenas em memória no início do processo; deriva senhas
+  Basic rotativas de dois minutos, aceita a janela anterior só para tolerar uma
+  requisição que cruza a virada e nunca persiste ou imprime os valores. Os sete
+  clientes internos continuam limitados ao hostname HTTPS exato do Render ou
+  ao loopback/porta configurados. A validação global de rotas, rejeição
+  cross-site e bloqueio de mutação via GET continuam em vigor.
+- Limite residual: Basic ainda pode ser repetido por quem obtiver a senha
+  durante sua curta janela de validade; TLS, escopo de host e ausência de
+  exposição/log são necessários. O desenho presume o processo único atualmente
+  descrito pela configuração Render (1 instância, `python main.py`); não prova
+  comportamento após restart/execução real em produção. Rotas privadas não
+  ficam utilizáveis diretamente pelo navegador sem uma sessão de operador; a
+  rota pública `/healthz` permanece apenas liveness. Não foi criada uma sessão
+  de navegador nem um serviço adicional.
+- Validação isolada da autenticação: `python.exe -I
+  tests/run_falcon_pilot_minimal_offline.py --personal-http-auth` — **238
+  passed em 112,02 s** na execução final após remover a função redundante. O
+  runner bloqueou rede/DNS, subprocessos e leitura de `.env`, permitiu apenas
+  os sockets locais do Flask e usou diretório temporário para dados. Cobriu
+  rotação/expiração, aceitação na virada, rejeição após expirar, hosts não
+  confiáveis, gate real Flask e os sete chamadores.
+- Regressões adjacentes: `python.exe -m unittest discover -s tests -p
+  test_history_eventbus_smoke.py -v` — **13/13 passed**, com bloqueio de rede
+  instalado por cada teste e persistência temporária; `python.exe -m pytest -q
+  tests/test_trade_lifecycle_shadow_observability_http.py` — **25 passed em
+  2,49 s**, com os patches de rede próprios desse módulo e `CENTRAL_AUTO_START_RUNTIME=false`.
+  `py_compile` dos arquivos tocados e `git diff --check` também passaram.
+- Uma tentativa de incluir a suíte `unittest` no runner pytest foi descartada:
+  o pytest isolado falhou antes de executar aqueles testes por não ter a opção
+  `trace` (plugin de depuração desativado). Os mesmos 13 testes foram então
+  executados diretamente por `unittest` e passaram. Essa falha do harness não é
+  contada como teste do produto.
+- As capturas de Billing de 2026-11-04 mostram 0/1.000 minutos de pipeline
+  consumidos, Starter, US$ 5/1.000 min com 1.000 min incluídos, limite mensal de
+  US$ 5 e banda 14,05/25 GB. Isso não garante custo zero de um deploy específico.
+  Esta ressalva substitui qualquer inferência anterior de que a franquia, por si
+  só, comprovaria custo zero para o próximo deploy.
+  O serviço Render segue com auto-deploy desligado, 1 instância e start command
+  `python main.py`; nenhum ambiente foi alterado e nenhum deploy foi iniciado.
+- Estado final desta rodada: ainda sem commit/push/deploy. A autenticação está
+  validada localmente, mas não integrada no Render. Os testes não demonstram
+  configuração, disponibilidade ou comportamento no processo ativo, nem
+  prontidão de trading.

@@ -33,6 +33,12 @@ class _AuthenticatedLocalTestClient(FlaskClient):
                 "CENTRAL_PERSONAL_HTTP_PASSWORD": "not-a-secret",
             },
         ):
+            from personal_http_auth import central_personal_http_auth_expected_passwords
+
+            username, passwords = central_personal_http_auth_expected_passwords()
+            headers["Authorization"] = "Basic " + base64.b64encode(
+                f"{username}:{passwords[0]}".encode("utf-8")
+            ).decode("ascii")
             return super().open(*args, **kwargs)
 
 

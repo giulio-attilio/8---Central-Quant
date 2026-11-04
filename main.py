@@ -707,6 +707,7 @@ def _central_personal_http_auth_decision(
     *,
     configured_username,
     configured_password,
+    configured_passwords=None,
     auth_type=None,
     presented_username=None,
     presented_password=None,
@@ -739,8 +740,12 @@ def _central_personal_http_auth_decision(
             return {"allowed": False, "status": "CROSS_SITE_REQUEST_BLOCKED", "http_status": 403}
 
     expected_username = str(configured_username or "")
-    expected_password = str(configured_password or "")
-    if not expected_username or not expected_password:
+    expected_passwords = tuple(
+        str(value or "")
+        for value in (configured_passwords or (configured_password,))
+        if str(value or "")
+    )
+    if not expected_username or not expected_passwords:
         return {"allowed": False, "status": "PRIVATE_HTTP_AUTH_NOT_CONFIGURED", "http_status": 503}
 
     if str(auth_type or "").strip().lower() != "basic":
@@ -749,8 +754,10 @@ def _central_personal_http_auth_decision(
     username_matches = hmac.compare_digest(
         expected_username.encode("utf-8"), str(presented_username or "").encode("utf-8")
     )
-    password_matches = hmac.compare_digest(
-        expected_password.encode("utf-8"), str(presented_password or "").encode("utf-8")
+    presented_password_bytes = str(presented_password or "").encode("utf-8")
+    password_matches = any(
+        hmac.compare_digest(expected.encode("utf-8"), presented_password_bytes)
+        for expected in expected_passwords
     )
     if not (username_matches and password_matches):
         return {"allowed": False, "status": "PRIVATE_HTTP_AUTH_REQUIRED", "http_status": 401}
@@ -763,9 +770,18 @@ def central_personal_http_auth_before_request():
     # Apply before every route, including aliases and unknown paths, so a
     # legacy URL or alternate report cannot bypass this personal-service gate.
     auth = request.authorization
+    try:
+        from personal_http_auth import central_personal_http_auth_expected_passwords
+
+        configured_username, configured_passwords = (
+            central_personal_http_auth_expected_passwords()
+        )
+    except Exception:
+        configured_username, configured_passwords = None, ()
     decision = _central_personal_http_auth_decision(
-        configured_username=os.environ.get("CENTRAL_PERSONAL_HTTP_USER"),
-        configured_password=os.environ.get("CENTRAL_PERSONAL_HTTP_PASSWORD"),
+        configured_username=configured_username,
+        configured_password=None,
+        configured_passwords=configured_passwords,
         auth_type=getattr(auth, "type", None),
         presented_username=getattr(auth, "username", None),
         presented_password=getattr(auth, "password", None),

@@ -39,6 +39,12 @@ class _AuthenticatedLocalTestClient(FlaskClient):
                 "CENTRAL_PERSONAL_HTTP_PASSWORD": "not-a-secret",
             },
         ):
+            from personal_http_auth import central_personal_http_auth_expected_passwords
+
+            username, passwords = central_personal_http_auth_expected_passwords()
+            headers["Authorization"] = "Basic " + base64.b64encode(
+                f"{username}:{passwords[0]}".encode("utf-8")
+            ).decode("ascii")
             return super().open(*args, **kwargs)
 
 
@@ -70,16 +76,17 @@ def get(client, route):
 
 @mock.patch.object(central_main, "build_live_report", return_value="synthetic-only")
 def test_livestatus_auth_gate_runs_before_sensitive_report_builder(provider, monkeypatch):
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "local-operator")
-    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
+    from personal_http_auth import central_personal_http_auth_expected_passwords
+
     client = FlaskClient(central_main.app)
 
     missing_auth = client.get("/livestatus")
     assert missing_auth.status_code == 401
     provider.assert_not_called()
 
+    username, passwords = central_personal_http_auth_expected_passwords()
     authorization = "Basic " + base64.b64encode(
-        b"local-operator:synthetic-only-password"
+        f"{username}:{passwords[0]}".encode("utf-8")
     ).decode("ascii")
     authenticated = client.get(
         "/livestatus", headers={"Authorization": authorization}
