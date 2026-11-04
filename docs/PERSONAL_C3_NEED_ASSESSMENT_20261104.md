@@ -523,6 +523,9 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   não validam durabilidade física do disco Render, chamadas reais à corretora,
   credenciais de produção nem integração em execução. O C3 distribuído continua
   dormente.
-- A branch de release ainda precisa publicar o merge local. O Render permanece
+- A branch `codex/personal-readiness-release-20261104` foi publicada até o
+  commit `9774aef5267b6057bc29e31de41236a790aa696e`; GitHub confirmou esse SHA
+  e a worktree local ficou sincronizada com `origin`. O Render permanece
   apontado para `codex/personal-readiness-20261103`, com auto-deploy desligado;
-  nenhum deploy ou alteração de AWS/Render/produção foi feito.
+  a publicação da branch não iniciou deploy e nenhuma configuração de
+  AWS/Render/produção foi alterada.
