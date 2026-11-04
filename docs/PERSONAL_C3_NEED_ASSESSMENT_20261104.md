@@ -394,7 +394,9 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   só, comprovaria custo zero para o próximo deploy.
   O serviço Render segue com auto-deploy desligado, 1 instância e start command
   `python main.py`; nenhum ambiente foi alterado e nenhum deploy foi iniciado.
-- Estado final desta rodada: ainda sem commit/push/deploy. A autenticação está
-  validada localmente, mas não integrada no Render. Os testes não demonstram
-  configuração, disponibilidade ou comportamento no processo ativo, nem
-  prontidão de trading.
+- O código validado foi salvo no commit local `5317daa`
+  (`fix(auth): rotate personal runtime HTTP credentials`); o HEAD da worktree
+  ficou `5317daa744e9240e385fc0768377c79992ddcc64`, 16 commits à frente da
+  referência de rastreamento local. Não houve push nem deploy. A autenticação
+  ainda não está integrada no Render. Os testes não demonstram configuração,
+  disponibilidade ou comportamento no processo ativo, nem prontidão de trading.
