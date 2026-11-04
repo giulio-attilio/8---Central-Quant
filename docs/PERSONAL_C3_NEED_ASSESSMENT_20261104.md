@@ -524,8 +524,20 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   credenciais de produção nem integração em execução. O C3 distribuído continua
   dormente.
 - A branch `codex/personal-readiness-release-20261104` foi publicada até o
-  commit `9774aef5267b6057bc29e31de41236a790aa696e`; GitHub confirmou esse SHA
+  commit `d23d8e91eb83971a87cb21271422fc11886d8727`; GitHub confirmou esse SHA
   e a worktree local ficou sincronizada com `origin`. O Render permanece
   apontado para `codex/personal-readiness-20261103`, com auto-deploy desligado;
   a publicação da branch não iniciou deploy e nenhuma configuração de
   AWS/Render/produção foi alterada.
+
+## Revalidação HTTP pessoal após publicar o merge — 2026-11-04
+
+- No HEAD `d23d8e91eb83971a87cb21271422fc11886d8727`, o runner isolado
+  `python -I tests/run_falcon_pilot_minimal_offline.py --personal-http-auth`
+  terminou com **239 passed em 120,70 s**, código de saída 0. A seleção cobre
+  autenticação HTTP pessoal, aliases/métodos seguros e regressões de
+  reconciliação/fechamento relacionadas.
+- O runner mantém rede/DNS e subprocessos bloqueados, não lê `.env` e usa dados
+  temporários simulados. O resultado valida comportamento local do código; não
+  prova as credenciais configuradas, o deploy ou a autenticação do serviço em
+  execução no Render.
