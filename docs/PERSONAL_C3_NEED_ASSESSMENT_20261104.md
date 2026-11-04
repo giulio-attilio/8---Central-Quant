@@ -268,3 +268,8 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   Isso confirma os contratos locais de não ativação no startup cobertos por
   esses testes; não demonstra que C3 distribuído seja necessário nem valida
   integração AWS/Render. Nenhuma escrita externa ocorreu.
+- Com permissão de rede deste turno, um GET sem credenciais para a rota pública
+  de leitura `/livestatus` respondeu **401**. O cliente descartou o corpo e
+  imprimiu apenas o status. Isso é evidência read-only de que uma rota real de
+  relatório está protegida no deploy ativo; não foi chamada nenhuma rota de
+  ordem.
