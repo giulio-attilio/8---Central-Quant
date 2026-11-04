@@ -466,3 +466,36 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   rede/DNS, subprocessos e `.env`, desativa auto-start e redireciona os dados
   para diretório temporário. A evidência reforça manter C3 fora do caminho
   crítico até que simultaneidade ou requisito de uso pessoal seja demonstrado.
+
+## Atualização de autenticação, billing e limites de laboratório — 2026-11-04
+
+- Antes da edição local: branch `codex/personal-readiness-release-20261104`,
+  HEAD `d7ecc6c6f46e85a9d7ac85ee9a12f2b7513b37ab`, worktree limpa, 20 commits
+  à frente da referência local. O GitHub ainda não lista a branch candidata.
+- A captura enviada pelo usuário mostra os nomes de variáveis de usuário/senha
+  já configuradas no Render, com valores mascarados. Não consultei nem copiei os
+  valores. O helper local agora usa essas variáveis em memória quando ambas
+  existem; sem configuração, conserva apenas a credencial aleatória efêmera
+  para chamadas internas. `/healthz` continua sendo somente uma resposta
+  pública mínima de liveness, sem detalhes de trading; as demais rotas seguem
+  autenticadas.
+- A seleção offline `--personal-http-auth`, após essa alteração, terminou com
+  **239 passed em 99,23 s**. `git diff --check` passou. O runner bloqueia rede,
+  subprocessos e leitura de `.env`, desativa auto-start e redireciona dados para
+  persistência temporária. Isso valida apenas o comportamento local/simulado.
+- As capturas de Billing de 2026-11-04 mostram 0/1.000 minutos de pipeline
+  incluídos usados, 14,05/25 GB de banda, Starter a US$ 5/1.000 minutos com
+  1.000 incluídos e limite mensal de US$ 5. Isso não comprova custo incremental
+  zero para um deploy; não alterei billing nem iniciei deploy.
+- Reexecução experimental dos quatro módulos de lock físico/hierárquico com o
+  runner offline: **19 passed, 3 failed, 1 skipped e 31 errors**. As falhas de
+  preparação mostram `PermissionError` do sandbox Windows ao abrir diretório
+  para `fsync`, convertido corretamente em `DIRECTORY_FSYNC_FAILED`; portanto
+  esses testes não provam durabilidade física nesta máquina. Não alterei o
+  fail-closed nem tratei isso como aprovação do C3. Como a avaliação anterior
+  não demonstrou necessidade do C3 distribuído para a topologia pessoal, ele
+  permanece dormente e fora do caminho crítico.
+- Estado externo confirmado por leitura: Render permanece em
+  `codex/personal-readiness-20261103`, deploy `598c4d4505c3aec6d4de9a6b762cc1576f604374`
+  (`live`), auto-deploy desligado; nenhuma configuração foi alterada. A
+  correção local ainda não foi publicada nem integrada ao serviço em execução.

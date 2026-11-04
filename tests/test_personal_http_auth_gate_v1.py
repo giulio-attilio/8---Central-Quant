@@ -441,6 +441,9 @@ def _runtime_basic_header():
 
 @pytest.fixture(autouse=True)
 def block_network(monkeypatch):
+    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_USER", raising=False)
+    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_PASSWORD", raising=False)
+
     def blocked(*_args, **_kwargs):
         raise AssertionError("network access is forbidden in these tests")
 
@@ -520,6 +523,8 @@ def test_auth_decision_rejects_cross_site_and_malformed_origins():
 def test_runtime_http_passwords_rotate_without_persisting(monkeypatch):
     import personal_http_auth
 
+    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_USER", raising=False)
+    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_PASSWORD", raising=False)
     monkeypatch.setattr(personal_http_auth, "_RUNTIME_AUTH_KEY", b"k" * 32)
     username, first_bucket = personal_http_auth.central_personal_http_auth_expected_passwords(
         now=119.0
@@ -537,6 +542,8 @@ def test_runtime_http_passwords_rotate_without_persisting(monkeypatch):
 def test_http_gate_accepts_boundary_grace_then_rejects_expired_password(monkeypatch):
     import personal_http_auth
 
+    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_USER", raising=False)
+    monkeypatch.delenv("CENTRAL_PERSONAL_HTTP_PASSWORD", raising=False)
     clock = [119.0]
     monkeypatch.setattr(personal_http_auth.time, "time", lambda: clock[0])
     app = _load_real_flask_auth_app()
@@ -2214,14 +2221,41 @@ def test_internal_bot_risk_requests_use_the_same_runtime_auth():
     assert authenticated_calls == {name: 1 for name in expected_files}
 
 
-def test_runtime_auth_source_does_not_depend_on_persistent_http_secrets():
+def test_configured_http_credentials_are_used_without_disclosing_values(monkeypatch):
+    import personal_http_auth
+
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "synthetic-operator")
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
+
+    username, passwords = personal_http_auth.central_personal_http_auth_expected_passwords()
+
+    assert username == "synthetic-operator"
+    assert passwords == ("synthetic-only-password",)
+
+    app = _load_real_flask_auth_app()
+    client = app.test_client()
+    unauthorized = client.get("/livestatus")
+    encoded = base64.b64encode(
+        b"synthetic-operator:synthetic-only-password"
+    ).decode("ascii")
+    authorized = client.get(
+        "/livestatus", headers={"Authorization": "Basic " + encoded}
+    )
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert b"synthetic-operator" not in authorized.data
+    assert b"synthetic-only-password" not in authorized.data
+
+
+def test_runtime_auth_source_uses_only_configured_or_process_local_credentials():
     source = SOURCE.read_text(encoding="utf-8")
     helper_source = (ROOT / "personal_http_auth.py").read_text(encoding="utf-8")
 
     assert "CENTRAL_PERSONAL_HTTP_USER" not in source
     assert "CENTRAL_PERSONAL_HTTP_PASSWORD" not in source
-    assert "CENTRAL_PERSONAL_HTTP_USER" not in helper_source
-    assert "CENTRAL_PERSONAL_HTTP_PASSWORD" not in helper_source
+    assert 'os.environ.get("CENTRAL_PERSONAL_HTTP_USER")' in helper_source
+    assert 'os.environ.get("CENTRAL_PERSONAL_HTTP_PASSWORD")' in helper_source
+    assert "print(configured_password)" not in helper_source
 
 
 def test_bot_auth_helper_returns_short_lived_tuple_only_for_own_origin(monkeypatch):

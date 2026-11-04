@@ -14,12 +14,18 @@ _RUNTIME_AUTH_BUCKET_SECONDS = 120
 
 
 def central_personal_http_auth_expected_passwords(*, now=None):
-    """Return short-lived process-local Basic credentials for this runtime.
+    """Return configured Basic credentials or a process-local fallback.
 
-    The signing key is generated in memory at import and is never persisted.
-    A password is valid for the current or immediately previous two-minute
-    bucket to tolerate a request that crosses a bucket boundary.
+    When the Render service has the personal HTTP username/password configured,
+    use them without persisting or exposing their values here. The runtime-only
+    fallback keeps same-process internal calls working if no external
+    credentials are configured; it is not a production login credential.
     """
+    configured_username = os.environ.get("CENTRAL_PERSONAL_HTTP_USER")
+    configured_password = os.environ.get("CENTRAL_PERSONAL_HTTP_PASSWORD")
+    if configured_username and configured_password:
+        return configured_username, (configured_password,)
+
     current_time = time.time() if now is None else float(now)
     current_bucket = int(current_time // _RUNTIME_AUTH_BUCKET_SECONDS)
     passwords = []
