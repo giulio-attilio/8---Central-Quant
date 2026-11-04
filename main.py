@@ -58702,20 +58702,30 @@ def _mpa_v1_build_payload(*, persist=True):
     for key, bps in broker_by_key.items():
         cps = central_by_key.get(key) or []
         for bp in bps:
+            # BingX position snapshots expose the contract and direction, not
+            # the originating Central lifecycle/order identity. A matching
+            # symbol+side is therefore only a candidate; it cannot prove that
+            # the exchange's (possibly aggregated) exposure belongs entirely
+            # to Central rather than including manual/external quantity.
+            # Keep the position unattached and let the LIVE divergence gate
+            # fail closed until a trusted ownership signal is available.
             row = {
-                "classification": "CENTRAL_LIVE_MATCHED" if cps else "MANUAL_OR_EXTERNAL_POSITION",
+                "classification": "POSITION_OWNERSHIP_UNVERIFIED" if cps else "MANUAL_OR_EXTERNAL_POSITION",
                 "symbol": key[0],
                 "side": key[1],
                 "source": "BINGX",
                 "broker_position": _flad_v1_public(bp),
-                "central_matches": _flad_v1_public(cps),
-                "action": "MONITOR_AS_CENTRAL_TRADE" if cps else "DO_NOT_ATTACH_TO_BOT_AUTOMATICALLY",
+                "central_candidates": _flad_v1_public(cps),
+                "action": "DO_NOT_ATTACH_TO_BOT_AUTOMATICALLY",
                 "notes": [
-                    "Posição existe na BingX e corresponde a LIVE da Central." if cps else "Posição existe na BingX sem LIVE correspondente na Central; tratar como manual/externa até prova contrária."
+                    "Símbolo e lado coincidem com LIVE da Central, mas não provam a origem nem excluem exposição manual agregada; tratar como não verificada e bloquear novas entradas LIVE." if cps else "Posição existe na BingX sem LIVE candidato na Central; tratar como manual/externa até prova contrária."
                 ],
             }
             rows.append(row)
-            (matched if cps else manual_or_external).append(row)
+            # This list feeds the fail-closed LIVE gate. It intentionally also
+            # contains same-leg candidates whose exchange ownership is not
+            # independently established.
+            manual_or_external.append(row)
     for key, cps in central_by_key.items():
         if key in broker_by_key:
             continue

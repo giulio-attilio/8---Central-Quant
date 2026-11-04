@@ -197,3 +197,29 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
 - Manter `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true` e
   `FALCON_MODE=PAPER`. Nada nesta avaliação permite ativar LIVE ou enviar
   ordens reais.
+
+## Revalidação local da conciliação de propriedade — 2026-11-04
+
+- Revalidado antes da edição: branch `codex/personal-readiness-release-20261104`,
+  HEAD `f33dae8404dbbd07287717b670148c9bd870ed8d`; a worktree estava limpa.
+- Encontrado risco no `_mpa_v1_build_payload`: uma posição da corretora era
+  classificada como `CENTRAL_LIVE_MATCHED` somente porque símbolo e lado
+  coincidiam com alguma posição LIVE da Central. A resposta normalizada de
+  posições do broker contém contrato/lado e quantidade, mas não inclui
+  identidade de lifecycle/ordem que prove a origem; além disso, a exposição
+  pode estar agregada. Igualdade de quantidade também não prova propriedade.
+- Alteração local: posições do broker com candidato da Central agora são
+  `POSITION_OWNERSHIP_UNVERIFIED`; nenhuma posição é anexada automaticamente.
+  Elas permanecem no conjunto de divergências consumido pelo gate LIVE, de
+  modo que novas entradas ficam bloqueadas até existir sinal de propriedade
+  confiável. O relatório preserva o candidato da Central para investigação.
+- Regressões adicionadas para coincidência exata de símbolo/lado/quantidade e
+  para quantidade agregada diferente. Resultado no runner offline
+  `--personal-execution-safety`: **402 passed in 601.78s**. O runner bloqueou
+  rede externa, subprocessos e leitura de `.env`, usando persistência temporária.
+  `git diff --check` passou. Esta evidência é local/sintética, não valida a
+  resposta da conta nem a integração de produção.
+- A alteração está apenas na worktree e não foi commitada, enviada ou implantada.
+  A consequência conservadora é intencional: sem prova de origem, a conciliação
+  não libera novas entradas LIVE, mesmo que símbolo, lado e quantidade
+  coincidam.

@@ -48,6 +48,63 @@ def _awareness_payload(*, broker_error=None, central_error_type=None, manual=Non
     }
 
 
+def _build_mpa_payload(*, broker, central):
+    namespace = {
+        "_broker_open_positions": lambda **_kwargs: (broker, None),
+        "_central_live_positions_payload": lambda **_kwargs: central,
+        "_flad_v1_norm_symbol": lambda value: str(value or "").replace("/", "").upper(),
+        "_flad_v1_norm_side": lambda value: str(value or "").upper(),
+        "_flad_v1_public": lambda value, **_kwargs: value,
+        "_flad_v1_now": lambda: "synthetic-now",
+        "MANUAL_POSITION_AWARENESS_V1_VERSION": "test-v1",
+        "MANUAL_POSITION_AWARENESS_V1_LATEST_FILE": "unused-latest.json",
+        "MANUAL_POSITION_AWARENESS_V1_EVENTS_FILE": "unused-events.jsonl",
+    }
+    _load_functions({"_mpa_v1_position_key", "_mpa_v1_build_payload"}, namespace)
+    return namespace["_mpa_v1_build_payload"](persist=False)
+
+
+def test_same_symbol_side_and_exact_quantity_do_not_prove_position_ownership():
+    payload = _build_mpa_payload(
+        broker=[{"symbol": "BTCUSDT", "side": "LONG", "contracts": 1.0}],
+        central=[
+            {
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "quantity": 1.0,
+                "trade_id": "CENTRAL-TRADE-1",
+                "order_id": "CENTRAL-ORDER-1",
+            }
+        ],
+    )
+
+    assert payload["status"] == "MANUAL_OR_EXTERNAL_POSITION_PRESENT"
+    assert payload["summary"]["matched_count"] == 0
+    assert payload["summary"]["manual_or_external_count"] == 1
+    row = payload["manual_or_external_positions"][0]
+    assert row["classification"] == "POSITION_OWNERSHIP_UNVERIFIED"
+    assert row["action"] == "DO_NOT_ATTACH_TO_BOT_AUTOMATICALLY"
+    assert row["central_candidates"][0]["trade_id"] == "CENTRAL-TRADE-1"
+
+
+def test_same_symbol_side_with_aggregated_quantity_stays_unverified_and_blocks_live():
+    payload = _build_mpa_payload(
+        broker=[{"symbol": "BTCUSDT", "side": "LONG", "contracts": 2.0}],
+        central=[{"symbol": "BTCUSDT", "side": "LONG", "quantity": 1.0}],
+    )
+    namespace = {
+        "_mpa_v1_build_payload": lambda **_kwargs: payload,
+        "_mpa_v1_text": lambda _payload: "ok",
+    }
+    _load_functions({"bingx_divergence_payload", "bingx_divergence_warning_payload"}, namespace)
+
+    warning = namespace["bingx_divergence_warning_payload"]()
+
+    assert warning["active"] is True
+    assert warning["status"] == "MANUAL_OR_EXTERNAL_POSITION_PRESENT"
+    assert warning["manual_or_external_count"] == 1
+
+
 def test_divergence_audit_uses_in_memory_awareness_without_persisting():
     calls = []
 
