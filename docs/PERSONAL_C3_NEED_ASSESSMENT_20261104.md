@@ -554,3 +554,29 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
 - AWS, Render e produção não foram alterados; nenhum deploy foi iniciado. O
   resultado deve ser revalidado no release implantado antes de qualquer
   conclusão sobre o serviço em execução.
+
+## Verificação Linux de escrita durável e locks sintéticos — 2026-11-04
+
+- O ambiente WSL2 disponível foi usado com Python 3.14.4 e pytest 9.0.2; não
+  foram instaladas dependências nem acessadas redes externas. Os dados de
+  teste ficaram em diretórios temporários do filesystem Linux do WSL.
+- `python3 -m pytest -q tests/test_trade_registry_atomic_durable_write_v1.py`:
+  **10 passed em 25,10 s**, incluindo escrita atômica e `fsync` de arquivo e
+  diretório real no filesystem Linux temporário.
+- As quatro suítes C3 foram executadas em grupos isolados para evitar
+  interferência de um bloqueio global de subprocessos definido por módulo:
+  `test_c3_hierarchical_lock_probe_offline_v1.py`: **10 passed em 31,90 s**;
+  `test_c3_multistore_lock_proof_v2.py`,
+  `test_c3_physical_integration_offline_conflict.py` e
+  `test_c3_physical_lock_graph_offline_v1.py`: **44 passed em 21,91 s**.
+- A execução cruzada revelou que faltava o helper sintético
+  `tests/helpers/c3_hierarchical_lock_child.py` nesta branch; ele foi restaurado
+  sem alterar runtime ou dados. O helper aceita somente um diretório temporário
+  específico e papéis sintéticos permitidos. C3 permanece dormente; estes
+  testes não provam necessidade do C3 distribuído nem durabilidade física do
+  disco Render.
+- `unshare --net` não é permitido pela configuração atual do WSL. A suíte de
+  hierarquia bloqueia sockets/DNS e subprocessos não listados no próprio teste;
+  os demais módulos não fazem chamadas de rede. O primeiro agrupamento de
+  módulos apresentou interferência pelo bloqueio global de subprocessos e não
+  foi considerado aprovação; as execuções isoladas acima passaram.
