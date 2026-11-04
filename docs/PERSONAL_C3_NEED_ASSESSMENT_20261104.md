@@ -135,6 +135,13 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   mesmo runner offline e terminou com 93 aprovados, incluindo aquele teste.
   Isso é consistente com uma falha transitória de acesso, mas a execução ampla
   ainda deve ser registrada literalmente como 918/1/1/1, não totalmente verde.
+- Repetição da seleção completa `--extra` no HEAD
+  `ee0a53cb985e9e48a0547f01bb63084b6f47a2f5` terminou em 2026-11-04 com 919
+  aprovados, 1 ignorado e 1 desmarcado em
+  1.157,70 s. A falha transitória de leitura de `bots/falcon.py` não se repetiu.
+  A execução usou `ccxt==4.5.88`, bloqueou rede externa, subprocessos e leitura
+  de `.env`, permitiu somente os sockets locais exigidos pelos testes e usou
+  diretório temporário de dados.
 - Reexecução focada em 2026-11-04 do runner offline `--personal-http-auth`
   terminou com 235 aprovados em 81,49 s. O runner bloqueou rede externa,
   subprocessos e leitura de `.env`; permitiu somente os sockets locais exigidos
