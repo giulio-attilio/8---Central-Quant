@@ -262,6 +262,12 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   subprocessos e leitura de `.env`, permitiu apenas os sockets locais Flask e
   redirecionou persistência para temporário. O resultado não substitui o GET
   read-only no serviço ativo e não prova todas as configurações de produção.
+- Reexecução adicional em 2026-11-04 do mesmo comando, com Python Windows
+  3.14.5: **235 passed in 99,91s**. O runner manteve rede, subprocessos e
+  leitura de `.env` bloqueados, permitindo apenas sockets locais Flask e
+  persistência temporária. Uma tentativa no Python do WSL (3.14.4) não chegou
+  aos testes porque Flask não está instalado; não foi usado `pip` nem rede e
+  nenhuma dependência foi alterada.
 - A seleção específica de startup dormente C3, ausente de `--extra`, foi
   executada separadamente: `--c3-dormant-startup` terminou com **24 passed e
   3 subtests passed em 389,32s**. O runner isolado bloqueou rede e subprocessos.
