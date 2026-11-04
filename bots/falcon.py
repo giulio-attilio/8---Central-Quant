@@ -9592,6 +9592,7 @@ def falcon_initial_stop_failure_finalize_confirmed(
             else state.get("emergency_close_sent")
         ),
         "emergency_close_confirmed": True,
+        "reconciliation_required": False,
         "residual_position_qty": residual_qty,
         "position_snapshot_after": _falcon_terminal_sanitize_projection(
             post_snapshot
@@ -9611,6 +9612,7 @@ def falcon_initial_stop_failure_finalize_confirmed(
             "emergency_close_idempotency_key": incident_id,
             "emergency_close_sent": state.get("emergency_close_sent"),
             "emergency_close_confirmed": True,
+            "reconciliation_required": True,
             "residual_position_qty": residual_qty,
             "falcon_live_entries_locked": True,
             "containment_status": "INITIAL_STOP_FAILED_TERMINAL_PERSISTENCE_REQUIRED",
@@ -9670,6 +9672,7 @@ def falcon_initial_stop_failure_finalize_confirmed(
         "emergency_close_idempotency_key": incident_id,
         "emergency_close_sent": state.get("emergency_close_sent"),
         "emergency_close_confirmed": True,
+        "reconciliation_required": False,
         "residual_position_qty": residual_qty,
         "falcon_live_entries_locked": not unlocked,
         "containment_status": state.get("containment_status"),
@@ -10072,13 +10075,26 @@ def falcon_handle_initial_stop_failure_containment(sig, order):
                 post_snapshot=restart_reconciliation.get("position_snapshot"),
                 close_projection=state.get("failsafe_result"),
             )
-        prior_send_unknown = bool(
-            restart_reconciliation.get("send_outcome_unknown") is True
-            or restart_reconciliation.get("close_order_active") is True
-            or restart_reconciliation.get("close_order_terminal") is True
-            or restart_reconciliation.get("close_lookup_available") is not True
-            or restart_reconciliation.get("close_identity_conflict") is True
+        prior_close_call_possible = bool(
+            state.get("emergency_close_attempted") is True
+            or state.get("emergency_close_call_started") is True
             or state.get("emergency_close_sent") is True
+            or str(state.get("attempt_state") or "").upper().strip()
+            in {"BROKER_CALL_PENDING", "SEND_OUTCOME_UNKNOWN", "SENT_UNCONFIRMED"}
+        )
+        # No deterministic close lookup exists before the first close identity
+        # is reserved. After a restart from entry-cancel reconciliation, absence
+        # of that lookup is not evidence that a close was sent. Gate on lookup
+        # failures only when durable state says a close call may have begun.
+        prior_send_unknown = bool(
+            prior_close_call_possible
+            and (
+                restart_reconciliation.get("send_outcome_unknown") is True
+                or restart_reconciliation.get("close_order_active") is True
+                or restart_reconciliation.get("close_order_terminal") is True
+                or restart_reconciliation.get("close_lookup_available") is not True
+                or restart_reconciliation.get("close_identity_conflict") is True
+            )
         )
 
     entry_snapshot = {}
@@ -10097,6 +10113,253 @@ def falcon_handle_initial_stop_failure_containment(sig, order):
                 "status": "ENTRY_ORDER_SNAPSHOT_ERROR",
                 "error": _falcon_terminal_safe_text(exc),
             }
+    entry_filled_qty = safe_float(
+        entry_snapshot.get("filled")
+        if entry_snapshot.get("filled") not in (None, "")
+        else entry_snapshot.get("executed_quantity"),
+        None,
+    )
+    entry_status = str(entry_snapshot.get("status") or "").upper().strip()
+    entry_raw_status = str(entry_snapshot.get("raw_status") or "").upper().strip()
+    terminal_entry_statuses = {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+    entry_order_terminal = bool(
+        entry_status in terminal_entry_statuses
+        and (not entry_raw_status or entry_raw_status in terminal_entry_statuses)
+    )
+    state["entry_order_terminal"] = entry_order_terminal
+    state["entry_order_status"] = entry_status or None
+    state["entry_order_raw_status"] = entry_raw_status or None
+    if not entry_order_terminal:
+        entry_cancel = {}
+        cancel_entry = getattr(central_broker, "cancel_managed_entry_order", None)
+        if callable(cancel_entry):
+            cancel_reason = "INITIAL_STOP_FAILURE_ENTRY_CANCEL"
+            expected_entry_order_id = str(identity.get("order_id") or "")
+            expected_entry_client_order_id = str(identity.get("client_order_id") or "")
+            expected_entry_side = "BUY" if identity.get("side") == "LONG" else "SELL"
+            expected_entry_position_side = str(identity.get("side") or "").upper()
+            lifecycle_lock_id = falcon_terminal_stop_lifecycle_lock_id(incident_pos)
+            lifecycle_lock_owner = falcon_initial_stop_failure_lifecycle_lock_owner(
+                incident_id
+            )
+            lifecycle_lock = falcon_terminal_stop_acquire_lifecycle_lock(
+                lifecycle_lock_id, lifecycle_lock_owner
+            )
+            state["lifecycle_lock"] = _falcon_terminal_sanitize_projection(
+                lifecycle_lock
+            )
+            if lifecycle_lock.get("acquired") is True:
+                cancel_identity_ok = bool(
+                    expected_entry_order_id
+                    and expected_entry_client_order_id
+                    and expected_entry_side in {"BUY", "SELL"}
+                    and expected_entry_position_side in {"LONG", "SHORT"}
+                )
+                state.update({
+                    "attempt_state": "ENTRY_CANCEL_CALL_PENDING",
+                    "containment_status": "INITIAL_STOP_FAILED_ENTRY_CANCEL_PENDING",
+                    "containment_reason": "ENTRY_ORDER_MAY_STILL_FILL",
+                    "entry_cancel_identity": {
+                        "order_id": expected_entry_order_id or None,
+                        "client_order_id": expected_entry_client_order_id or None,
+                        "symbol": identity.get("symbol"),
+                        "side": expected_entry_side,
+                        "position_side": expected_entry_position_side,
+                        "reason": cancel_reason,
+                    },
+                    "falcon_live_entries_locked": True,
+                    "reconciliation_required": True,
+                    "updated_at": data_hora_sp_str(),
+                })
+                pending_save = falcon_terminal_stop_recovery_save(incident_id, state)
+                if pending_save.get("ok") is True and cancel_identity_ok:
+                    auth_extra = {
+                        "symbol": identity.get("symbol"),
+                        "order_id": expected_entry_order_id,
+                        "client_order_id": expected_entry_client_order_id,
+                        "side": expected_entry_side,
+                        "position_side": expected_entry_position_side,
+                        "reason": cancel_reason,
+                    }
+                    cancel_auth = falcon_issue_management_token(
+                        incident_pos, "cancel_managed_entry_order", auth_extra
+                    )
+                    cancel_token = (
+                        cancel_auth.get("token")
+                        if isinstance(cancel_auth, dict)
+                        else None
+                    )
+                    cancel_context = (
+                        cancel_auth.get("context")
+                        if isinstance(cancel_auth, dict)
+                        and isinstance(cancel_auth.get("context"), dict)
+                        else {}
+                    )
+                    cancel_auth_ok = bool(
+                        isinstance(cancel_auth, dict)
+                        and cancel_auth.get("ok") is True
+                        and cancel_token
+                        and cancel_context.get("operation") == "cancel_managed_entry_order"
+                        and _falcon_management_norm_symbol(cancel_context.get("symbol"))
+                        == identity.get("symbol")
+                        and str(cancel_context.get("order_id") or "")
+                        == expected_entry_order_id
+                        and str(cancel_context.get("client_order_id") or "")
+                        == expected_entry_client_order_id
+                        and str(cancel_context.get("side") or "").upper()
+                        == expected_entry_side
+                        and str(cancel_context.get("position_side") or "").upper()
+                        == expected_entry_position_side
+                        and cancel_context.get("reason") == cancel_reason
+                    )
+                    state["entry_cancel_auth"] = _falcon_terminal_auth_projection(
+                        cancel_auth, cancel_auth_ok
+                    )
+                    if cancel_auth_ok:
+                        try:
+                            entry_cancel = cancel_entry(
+                                symbol=identity.get("symbol"),
+                                order_id=expected_entry_order_id,
+                                client_order_id=expected_entry_client_order_id,
+                                side=expected_entry_side,
+                                position_side=expected_entry_position_side,
+                                execution_auth_token=cancel_token,
+                                reason=cancel_reason,
+                            )
+                        except Exception as exc:
+                            entry_cancel = {
+                                "ok": False,
+                                "status": "ENTRY_CANCEL_CALL_EXCEPTION",
+                                "send_outcome_unknown": True,
+                                "error": _falcon_terminal_safe_text(exc),
+                            }
+                    else:
+                        entry_cancel = {
+                            "ok": False,
+                            "status": "ENTRY_CANCEL_AUTH_DENIED",
+                            "send_outcome_unknown": False,
+                        }
+                elif not cancel_identity_ok:
+                    entry_cancel = {
+                        "ok": False,
+                        "status": "ENTRY_CANCEL_EXACT_IDENTITY_REQUIRED",
+                        "send_outcome_unknown": False,
+                    }
+                else:
+                    entry_cancel = {
+                        "ok": False,
+                        "status": "ENTRY_CANCEL_PENDING_PERSISTENCE_REQUIRED",
+                        "send_outcome_unknown": False,
+                    }
+                state["entry_cancel_result"] = _falcon_terminal_sanitize_projection(
+                    entry_cancel
+                )
+                state["updated_at"] = data_hora_sp_str()
+                falcon_terminal_stop_recovery_save(incident_id, state)
+                if entry_cancel.get("terminal") is True:
+                    try:
+                        refreshed_entry = central_broker.managed_order_snapshot(
+                            identity.get("symbol"), expected_entry_order_id
+                        )
+                    except Exception as exc:
+                        refreshed_entry = {
+                            "ok": False,
+                            "status": "ENTRY_CANCEL_READBACK_ERROR",
+                            "error": _falcon_terminal_safe_text(exc),
+                        }
+                    refreshed_status = str(
+                        refreshed_entry.get("status") or ""
+                    ).upper().strip()
+                    refreshed_raw_status = str(
+                        refreshed_entry.get("raw_status") or ""
+                    ).upper().strip()
+                    entry_order_terminal = bool(
+                        refreshed_entry.get("ok") is True
+                        and refreshed_entry.get("read_only") is True
+                        and str(refreshed_entry.get("order_id") or "")
+                        == expected_entry_order_id
+                        and str(refreshed_entry.get("client_order_id") or "")
+                        == expected_entry_client_order_id
+                        and _falcon_management_norm_symbol(
+                            refreshed_entry.get("symbol")
+                        )
+                        == identity.get("symbol")
+                        and str(refreshed_entry.get("side") or "").upper()
+                        == expected_entry_side
+                        and _falcon_management_norm_side(
+                            refreshed_entry.get("position_side")
+                        ) in {"", identity.get("side"), "BOTH"}
+                        and refreshed_status
+                        in {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+                        and (
+                            not refreshed_raw_status
+                            or refreshed_raw_status
+                            in {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+                        )
+                    )
+                    if entry_order_terminal:
+                        entry_snapshot = refreshed_entry
+                        entry_status = refreshed_status
+                        entry_raw_status = refreshed_raw_status
+                        state["entry_order_snapshot"] = (
+                            _falcon_terminal_sanitize_projection(refreshed_entry)
+                        )
+                        state["entry_order_terminal"] = True
+                        state["entry_order_status"] = refreshed_status
+                        state["entry_order_raw_status"] = refreshed_raw_status or None
+                    else:
+                        state["entry_cancel_readback"] = (
+                            _falcon_terminal_sanitize_projection(refreshed_entry)
+                        )
+                        entry_cancel["status"] = (
+                            "ENTRY_CANCEL_READBACK_RECONCILIATION_REQUIRED"
+                        )
+                        entry_cancel["terminal"] = False
+                        entry_cancel["send_outcome_unknown"] = True
+                state["entry_cancel_result"] = _falcon_terminal_sanitize_projection(
+                    entry_cancel
+                )
+                state["updated_at"] = data_hora_sp_str()
+                falcon_terminal_stop_recovery_save(incident_id, state)
+
+        # Never close the observed position until the exact entry is terminal;
+        # cancellation can race a fill, so the exact order must be read back.
+        # Missing cancellation support, ambiguous outcomes, and failed readback
+        # retain the durable entry lock for later reconciliation.
+    if not entry_order_terminal:
+        pending_entry_cancel_status = (
+            entry_cancel.get("status")
+            if isinstance(entry_cancel, dict)
+            else None
+        ) or "ENTRY_ORDER_MAY_STILL_FILL"
+        state.update({
+            "attempt_state": "ENTRY_ORDER_NOT_TERMINAL",
+            "containment_status": "INITIAL_STOP_FAILED_ENTRY_ORDER_RECONCILIATION_REQUIRED",
+            "containment_reason": pending_entry_cancel_status,
+            "ownership_confirmed": False,
+            "falcon_live_entries_locked": True,
+            "reconciliation_required": True,
+            "updated_at": data_hora_sp_str(),
+        })
+        alert = globals().get("falcon_terminal_stop_critical_alert")
+        if callable(alert):
+            state["critical_alert"] = alert(incident_pos, state, blocked=True)
+        persistence = falcon_terminal_stop_recovery_save(incident_id, state)
+        HEALTH["falcon_live_entries_locked"] = True
+        return {
+            **base,
+            "ownership_confirmed": False,
+            "residual_position_qty": None,
+            "falcon_live_entries_locked": True,
+            "containment_status": state["containment_status"],
+            "containment_reason": state["containment_reason"],
+            "entry_cancel_status": pending_entry_cancel_status,
+            "entry_order_status": entry_status or None,
+            "entry_order_raw_status": entry_raw_status or None,
+            "reconciliation_required": True,
+            "persistence": persistence,
+        }
+
     entry_filled_qty = safe_float(
         entry_snapshot.get("filled")
         if entry_snapshot.get("filled") not in (None, "")

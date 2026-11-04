@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 import pytest
+import broker
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,3 +200,151 @@ def test_live_entry_preflight_validates_buffer_before_entry_send():
     assert prepare_lines
     assert entry_send_lines
     assert min(prepare_lines) < min(entry_send_lines)
+
+
+def test_live_entry_blocks_invalid_stop_buffer_before_exchange_initialization(monkeypatch):
+    monkeypatch.setattr(broker, "EXECUTION_MODE", "LIVE")
+    monkeypatch.setattr(broker, "ENABLE_REAL_TRADING", True)
+    monkeypatch.setattr(broker, "BROKER_DRY_RUN", False)
+    monkeypatch.setattr(broker, "DISASTER_STOP_ENABLED", True)
+    monkeypatch.setattr(broker, "DISASTER_STOP_REQUIRE_FOR_LIVE", True)
+    monkeypatch.setattr(broker, "DISASTER_STOP_PRICE_BUFFER_PCT", float("nan"))
+    monkeypatch.setattr(broker, "is_real_live_send_enabled", lambda: True)
+    monkeypatch.setattr(
+        broker,
+        "execution_config_for_bot",
+        lambda **_kwargs: {
+            "margin_usdt": 10.0,
+            "leverage": 1.0,
+            "effective_notional_usdt": 10.0,
+        },
+    )
+    monkeypatch.setattr(broker, "_infer_bot_for_audit", lambda **_kwargs: "FALCON")
+    monkeypatch.setattr(
+        broker, "_automatic_broker_preview_firewall", lambda **_kwargs: {"blocked": False}
+    )
+    monkeypatch.setattr(
+        broker,
+        "build_order_preview",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "constraints_ok": True,
+            "client_order_id": "TEST-ENTRY-1",
+            "amount": 0.1,
+            "price_ref": 100.0,
+            "notional_usdt": 10.0,
+            "planned_exposure_usdt": 10.0,
+            "actual_exposure_usdt": 10.0,
+        },
+    )
+    monkeypatch.setattr(
+        broker, "validate_broker_client_order_id", lambda value, **_kwargs: value
+    )
+    monkeypatch.setattr(
+        broker,
+        "_broker_account_reservation_verification",
+        lambda *_args, **_kwargs: {"ok": True},
+    )
+    monkeypatch.setattr(
+        broker, "broker_real_pilot_guard_v1_validate", lambda **_kwargs: {"allowed": True}
+    )
+    monkeypatch.setattr(
+        broker, "validate_execution_auth_token", lambda *_args, **_kwargs: {"ok": True}
+    )
+    monkeypatch.setattr(broker, "log_execution_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(broker, "log_execution_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        broker,
+        "ready_check",
+        lambda **_kwargs: pytest.fail("stop validation must run before ready/exchange setup"),
+    )
+    monkeypatch.setattr(
+        broker,
+        "exchange",
+        lambda: pytest.fail("invalid stop configuration must block before exchange initialization"),
+    )
+
+    result = broker.place_market_order(
+        symbol="BTCUSDT",
+        side="LONG",
+        margin_usdt=10.0,
+        leverage=1.0,
+        client_tag="TEST-ENTRY-1",
+        bot="FALCON",
+        execution_auth_token="TEST-ONLY",
+        stop_loss_price=90.0,
+        falcon_position_ownership_limit={"known": True},
+    )
+
+    assert result["ok"] is False
+    assert result["sent"] is False
+    assert result["status"] == "DISASTER_STOP_REQUIRED_BLOCKED"
+    assert result["stop_validation"]["status"] == "DISASTER_STOP_BUFFER_INVALID"
+
+
+def test_paper_entry_stays_preview_only_without_live_preflight_or_exchange(monkeypatch):
+    monkeypatch.setattr(broker, "EXECUTION_MODE", "PAPER")
+    monkeypatch.setattr(broker, "ENABLE_REAL_TRADING", False)
+    monkeypatch.setattr(broker, "BROKER_DRY_RUN", True)
+    monkeypatch.setattr(broker, "DISASTER_STOP_ENABLED", True)
+    monkeypatch.setattr(broker, "DISASTER_STOP_REQUIRE_FOR_LIVE", True)
+    monkeypatch.setattr(broker, "DISASTER_STOP_PRICE_BUFFER_PCT", float("nan"))
+    monkeypatch.setattr(broker, "is_real_live_send_enabled", lambda: False)
+    monkeypatch.setattr(
+        broker,
+        "execution_config_for_bot",
+        lambda **_kwargs: {
+            "margin_usdt": 10.0,
+            "leverage": 1.0,
+            "effective_notional_usdt": 10.0,
+        },
+    )
+    monkeypatch.setattr(broker, "_infer_bot_for_audit", lambda **_kwargs: "FALCON")
+    monkeypatch.setattr(
+        broker, "_automatic_broker_preview_firewall", lambda **_kwargs: {"blocked": False}
+    )
+    monkeypatch.setattr(
+        broker,
+        "build_order_preview",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "constraints_ok": True,
+            "client_order_id": "TEST-PAPER-ENTRY-1",
+            "amount": 0.1,
+            "price_ref": 100.0,
+            "notional_usdt": 10.0,
+            "planned_exposure_usdt": 10.0,
+            "actual_exposure_usdt": 10.0,
+        },
+    )
+    monkeypatch.setattr(broker, "log_execution_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(broker, "log_execution_audit_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        broker,
+        "_live_disaster_stop_preflight",
+        lambda *_args, **_kwargs: pytest.fail("PAPER must return before LIVE stop preflight"),
+    )
+    monkeypatch.setattr(
+        broker,
+        "validate_execution_auth_token",
+        lambda *_args, **_kwargs: pytest.fail("PAPER must not consume a live execution token"),
+    )
+    monkeypatch.setattr(
+        broker,
+        "exchange",
+        lambda: pytest.fail("PAPER must not initialize an exchange client"),
+    )
+
+    result = broker.place_market_order(
+        symbol="BTCUSDT",
+        side="LONG",
+        margin_usdt=10.0,
+        leverage=1.0,
+        client_tag="TEST-PAPER-ENTRY-1",
+        bot="FALCON",
+        stop_loss_price=90.0,
+    )
+
+    assert result["sent"] is False
+    assert result["status"] == "DRY_RUN"
+    assert result["live_send_enabled"] is False

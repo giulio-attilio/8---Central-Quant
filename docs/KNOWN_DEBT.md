@@ -2,7 +2,7 @@
 
 Status: DRAFT
 Versão: 0.1
-Última revisão: 2026-07-11
+Última revisão: 2026-11-04 (TD-005 a TD-007 revalidados contra o checkout)
 Responsável: CTO
 Implementação: Codex
 Aprovado: Não
@@ -79,47 +79,47 @@ Este registro cobre somente condições verificadas no repositório por inspeç�
 - **Sprint provável:** Sprint 2
 - **Classificação:** PLANEJADA
 
-### TD-005 — Ausência de Network Kill Switch na suíte
+### TD-005 — Isolamento de rede não universal na suíte
 
 - **ID:** TD-005
-- **Título:** Ausência de Network Kill Switch na suíte
+- **Título:** Isolamento de rede não universal na suíte
 - **Categoria:** Testes
-- **Situação atual:** Não existe `conftest.py`, fixture global ou outro mecanismo de teste que bloqueie sockets, HTTP, CCXT, Telegram e Redis externo. O único teste importa `main.py` diretamente.
-- **Motivo pelo qual existe:** A suíte atual foi criada para smoke tests de histórico e Event Bus, sem infraestrutura global de isolamento de rede.
-- **Impacto:** Não há garantia automatizada de que um teste falhará imediatamente ao tentar acessar serviço externo.
-- **Risco:** Chamadas externas involuntárias durante testes locais, especialmente devido aos efeitos colaterais de importação.
+- **Situação atual:** Não há bloqueio global aplicado a todo `pytest`. Existe o runner selado `tests/run_falcon_pilot_minimal_offline.py`, que, antes de importar os módulos selecionados, bloqueia sockets externos, DNS, HTTP, subprocessos e leitura de `.env`, e redireciona persistência para diretório temporário. Ele protege as suítes selecionadas para execução pessoal, mas não qualquer comando de teste do repositório.
+- **Motivo pelo qual existe:** O isolamento foi implementado no runner offline das regressões críticas, não como política universal de toda a suíte.
+- **Impacto:** As execuções feitas por esse runner têm fronteiras reproduzíveis; testes executados fora dele não herdam automaticamente a mesma garantia.
+- **Risco:** Um comando pytest arbitrário pode tentar acessar serviços ou arquivos externos se um teste/import tiver esse comportamento.
 - **Prioridade:** CRÍTICA
-- **Condição para resolução:** Bloqueio global fail-closed validado por testes próprios e instalado antes da importação de módulos da aplicação.
+- **Condição para resolução:** Expandir uma fronteira fail-closed para todos os comandos de teste suportados, com testes próprios; enquanto isso, usar exclusivamente o runner selado nas suítes de segurança que importam o runtime.
 - **Sprint provável:** Sprint 2
-- **Classificação:** PLANEJADA
+- **Classificação:** PARCIALMENTE RESOLVIDA; RUNNER SELADO LIMITADO ÀS SUÍTES SELECIONADAS
 
-### TD-006 — Ausência de Fake Exchange
+### TD-006 — Ausência de simulador CCXT/BingX integrado reutilizável
 
 - **ID:** TD-006
-- **Título:** Ausência de Fake Exchange
+- **Título:** Ausência de simulador CCXT/BingX integrado reutilizável
 - **Categoria:** Testes
-- **Situação atual:** Não há fake local da interface CCXT/BingX para ordens, posições, fills, stops, precision, limits, hedge mode e one-way mode.
-- **Motivo pelo qual existe:** Os testes existentes não exercitam broker nem execução real simulada.
-- **Impacto:** Os caminhos LIVE não podem ser testados de forma determinística e sem rede com estados controlados da exchange.
-- **Risco:** Comportamentos de timeout, aceite parcial, stop rejeitado e reconciliação permanecem sem validação automatizada.
+- **Situação atual:** Há vários doubles locais por módulo (`FakeExchange`, `ExchangeProbe`, `ReadOnlyExchange` e semelhantes) cobrindo create/fetch/cancel, timeouts, fills, constraints, stops e closes. Não existe um simulador CCXT/BingX reutilizável único que modele ciclo de vida coerente entre ordem, fill, posição e stop em todos esses testes.
+- **Motivo pelo qual existe:** Os contratos foram testados por cenários específicos e controlados, não por um estado de exchange sintético compartilhado.
+- **Impacto:** Regressões por incompatibilidade entre os doubles de módulos distintos ou por sequência completa de estados podem escapar aos testes isolados.
+- **Risco:** Uma sequência combinada de timeout, fill parcial, cancelamento e leitura posterior pode se comportar diferentemente da soma dos testes unitários.
 - **Prioridade:** CRÍTICA
-- **Condição para resolução:** Fake Exchange determinístico cobrindo o subconjunto de operações usado pelo broker e validado pela suíte local sem rede.
+- **Condição para resolução:** Simulador determinístico e reutilizável que cubra apenas a superfície CCXT usada no caminho pessoal; provar que ele acrescenta cobertura de sequência além dos doubles já existentes antes de ampliar o harness.
 - **Sprint provável:** Sprint 2
-- **Classificação:** PLANEJADA
+- **Classificação:** PARCIALMENTE COBERTA POR DOUBLES; SIMULADOR INTEGRADO AUSENTE
 
-### TD-007 — Ausência de suíte de integração para execução LIVE
+### TD-007 — Limite de integração real da execução LIVE
 
 - **ID:** TD-007
-- **Título:** Ausência de suíte de integração para execução LIVE
+- **Título:** Limite de integração real da execução LIVE
 - **Categoria:** Testes
-- **Situação atual:** Existe somente `tests/test_history_eventbus_smoke.py`. Não há testes dedicados ao broker, Falcon LIVE, disaster stop, idempotência, ownership, TP50 real, stop replacement ou reconciliação.
-- **Motivo pelo qual existe:** A cobertura atual está concentrada em histórico, Event Bus, métricas e comportamento PAPER.
-- **Impacto:** Garantias operacionais definidas no `AGENTS.md` não possuem verificação automatizada correspondente.
-- **Risco:** Regressões em caminhos que enviam, protegem ou gerenciam posições reais podem não ser detectadas antes da operação.
+- **Situação atual:** O checkout possui suítes offline dedicadas ao broker/Falcon, entrada e fill, proteção inicial e replacement do stop, cancelamento, idempotência/identidade, ownership, fechamento e reconciliação. O runner `--extra` seleciona 25 módulos relevantes e, no HEAD local atual, passou 916 testes, com 1 skip e 1 caso deliberadamente deselected; `--stop-readback` passou 12. Isso é evidência sintética local, não integração real da corretora.
+- **Motivo pelo qual existe:** O caminho real ainda é protegido por PAPER/DRY_RUN e a meta proíbe ordens reais; portanto, testes de rede com conta real não são uma opção de validação.
+- **Impacto:** A maioria dos contratos de segurança pode ser regressada offline, mas a semântica real de execução/fills/stops da BingX e a integração de produção não foram provadas por essas suítes.
+- **Risco:** Diferenças do exchange, configuração da conta, latência e estado de produção podem invalidar hipóteses dos doubles mesmo com os testes locais verdes.
 - **Prioridade:** CRÍTICA
-- **Condição para resolução:** Suíte sem rede cobrindo os cenários LIVE mínimos definidos no `AGENTS.md`, incluindo falhas, timeout, recovery, ownership e gestão parcial.
+- **Condição para resolução:** A cobertura offline dos principais contratos está presente; completar as lacunas de sequência relevantes com simulador reutilizável se isso demonstrar cobertura adicional. Integração LIVE real não é autorizada por esta meta e deve permanecer um limite explicitamente não verificado.
 - **Sprint provável:** Sprint 2
-- **Classificação:** PLANEJADA
+- **Classificação:** COBERTURA OFFLINE PRESENTE; INTEGRAÇÃO REAL NÃO VALIDADA/PROIBIDA PELA META
 
 ### TD-008 — Ownership parcialmente conciliado por símbolo e lado
 
@@ -149,19 +149,19 @@ Este registro cobre somente condições verificadas no repositório por inspeç�
 - **Sprint provável:** Sprint 3
 - **Classificação:** PLANEJADA
 
-### TD-010 — Confirmação inicial do disaster stop não é demonstrada por leitura posterior
+### TD-010 — Confirmação inicial do disaster stop no release implantado
 
 - **ID:** TD-010
-- **Título:** Confirmação inicial do disaster stop não é demonstrada por leitura posterior
+- **Título:** Confirmação inicial do disaster stop no release implantado
 - **Categoria:** Broker
-- **Situação atual:** Após a ordem market, o broker cria o disaster stop e considera o resultado da criação para decidir sucesso ou `LIVE_SENT_BUT_DISASTER_STOP_FAILED`. O fluxo inicial não demonstra uma consulta posterior obrigatória que confirme ordem aberta, status e quantidade protegida antes de concluir sucesso.
-- **Motivo pelo qual existe:** O fluxo atual usa a resposta imediata de criação do stop como evidência principal e delega verificações adicionais a auditorias, lifecycle e watchdogs posteriores.
-- **Impacto:** O estado protegido pode ser declarado antes de uma confirmação independente do stop na corretora.
-- **Risco:** Posição real aberta com stop ausente, rejeitado posteriormente ou com quantidade divergente.
+- **Situação atual:** O código do release implantado `598c4d4` já consulta o stop por ID exato após a criação e valida identidade, status ativo, lado/posição, quantidade e evidência material do trigger antes de marcar `stop_operationally_armed`. Se a consulta estiver ausente, conflitante ou inválida, o stop não é considerado armado e a entrada retorna como falha crítica para reconciliação. O contrato também passou em 12 testes offline no checkout atual.
+- **Motivo pelo qual existe:** A resposta de criação isolada não basta para comprovar proteção operacional; a leitura posterior independente foi adicionada para fechar essa lacuna.
+- **Impacto:** O código implantado contém a garantia de read-back, mas não há evidência de uma operação real na BingX que demonstre o comportamento do exchange nem de uma posição de produção protegida.
+- **Risco:** Falhas específicas do exchange, configuração de conta ou comportamento do runtime podem divergir dos testes sintéticos; não inferir prontidão LIVE.
 - **Prioridade:** CRÍTICA
-- **Condição para resolução:** Confirmação obrigatória do stop por consulta ao broker, validando ID, status, lado e quantidade; estados pendente e recovery cobertos por testes sem rede.
+- **Condição para resolução:** A implementação está presente no release `598c4d4` e os contratos exatos/fail-closed passam offline. A evidência de comportamento da corretora e de posição real protegida permanece ausente; essa validação não deve ser feita por esta meta, que proíbe ordens reais.
 - **Sprint provável:** Sprint 2
-- **Classificação:** PLANEJADA
+- **Classificação:** IMPLEMENTADA NO RELEASE; COMPORTAMENTO EXTERNO NÃO COMPROVADO
 
 ### TD-011 — Dependências sem versões fixadas
 
@@ -201,12 +201,12 @@ Este registro cobre somente condições verificadas no repositório por inspeç�
 | TD-002 | Wrappers e redefinições sucessivas do Execution Engine | ACEITA |
 | TD-003 | Redefinições duplicadas em módulos operacionais | ACEITA |
 | TD-004 | Efeitos colaterais durante importação | PLANEJADA |
-| TD-005 | Ausência de Network Kill Switch na suíte | PLANEJADA |
-| TD-006 | Ausência de Fake Exchange | PLANEJADA |
-| TD-007 | Ausência de suíte de integração para execução LIVE | PLANEJADA |
+| TD-005 | Isolamento de rede não universal | PARCIALMENTE RESOLVIDA; RUNNER SELADO PARA SUÍTES CRÍTICAS |
+| TD-006 | Ausência de simulador CCXT/BingX integrado reutilizável | PARCIALMENTE COBERTA POR DOUBLES |
+| TD-007 | Limite de integração real da execução LIVE | TESTES OFFLINE PRESENTES; INTEGRAÇÃO REAL NÃO VALIDADA/PROIBIDA |
 | TD-008 | Ownership parcialmente conciliado por símbolo e lado | PLANEJADA |
 | TD-009 | Lifecycle operacional distribuído e parcialmente implícito | PLANEJADA |
-| TD-010 | Confirmação inicial do disaster stop não é demonstrada por leitura posterior | PLANEJADA |
+| TD-010 | Confirmação inicial do disaster stop no release implantado | IMPLEMENTADA NO CÓDIGO; EXCHANGE NÃO VALIDADO |
 | TD-011 | Dependências sem versões fixadas | PLANEJADA |
 | TD-012 | Documentação técnica oficial ainda não preenchida | EM TRATAMENTO |
 

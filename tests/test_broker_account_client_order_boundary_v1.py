@@ -492,8 +492,9 @@ def test_unknown_send_with_unpersisted_outcome_keeps_material_unknown_state(
     assert len(exchange.calls) == 1
 
 
+@pytest.mark.parametrize("sparse_entry_ack", [False, True])
 def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
-    monkeypatch,
+    monkeypatch, sparse_entry_ack,
 ):
     stop_client_order_id = CLIENT_ORDER_ID
 
@@ -582,6 +583,7 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
         def __init__(self):
             self.create_calls = []
             self.orders = {}
+            self.fetch_order_calls = []
             self.entry_returned_client_order_id_override = None
 
         def set_margin_mode(self, *_args, **_kwargs):
@@ -612,6 +614,11 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
                 order = {
                     "id": "ENTRY-ORDER-1",
                     "status": "closed",
+                    "symbol": symbol,
+                    "side": side,
+                    "amount": amount,
+                    "filled": amount,
+                    "average": 76.25,
                     "clientOrderId": (
                         self.entry_returned_client_order_id_override
                         or returned_client_order_id
@@ -631,9 +638,22 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
                 if returned_client_order_id:
                     order["clientOrderId"] = returned_client_order_id
             self.orders[order["id"]] = order
+            if order_type == "market" and sparse_entry_ack:
+                return {
+                    "id": order["id"],
+                    "status": "open",
+                    "symbol": symbol,
+                    "side": side,
+                    "amount": amount,
+                    "clientOrderId": (
+                        self.entry_returned_client_order_id_override
+                        or returned_client_order_id
+                    ),
+                }
             return order
 
         def fetch_order(self, order_id, _symbol):
+            self.fetch_order_calls.append(str(order_id))
             return dict(self.orders[str(order_id)])
 
     exchange = ExchangeProbe()
@@ -726,6 +746,14 @@ def test_entry_ack_persistence_failure_still_arms_stop_and_never_resends_entry(
     assert first["disaster_stop"]["order_id"] == "STOP-ORDER-1"
     assert first["disaster_stop"]["client_order_id_sent_to_exchange"] is False
     assert first["disaster_stop"]["order_id_readback_verified"] is True
+    assert first["disaster_stop"]["entry_fill_evidence"]["source"] == (
+        "READ_ONLY_ORDER_SNAPSHOT" if sparse_entry_ack else "CREATE_ORDER_RESPONSE"
+    )
+    assert exchange.fetch_order_calls == (
+        ["ENTRY-ORDER-1", "STOP-ORDER-1"]
+        if sparse_entry_ack
+        else ["STOP-ORDER-1"]
+    )
     assert [call["type"] for call in exchange.create_calls] == [
         "market",
         "stop_market",

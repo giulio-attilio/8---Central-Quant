@@ -217,6 +217,7 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
              mock.patch.object(central_main, "GLOBAL_RISK_MAX_SIDE_CONCENTRATION_PCT", 100), \
              mock.patch.object(central_main, "GLOBAL_RISK_MAX_SYMBOL_EXPOSURE", 3), \
              mock.patch.object(central_main, "GLOBAL_RISK_ALLOW_REDUCE_ONLY", False), \
+             mock.patch.object(central_main, "autosync_trade_registry", return_value={"ok": True}), \
              mock.patch.object(central_main, "ENABLE_REAL_TRADING", True), \
              mock.patch.object(central_main, "REAL_TRADING_ALLOWED_BOTS", {"FALCON"}), \
              mock.patch.object(central_main, "_all_open_positions_payload", return_value=[{"bot": "FALCON", "symbol": "BTCUSDT", "side": "LONG"}] * 101), \
@@ -230,6 +231,54 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.assertTrue(result["allowed"])
         self.assertIn("exposição PAPER alta", " ".join(result["warnings"]))
         self.assertNotIn("bloqueio PAPER ativo", " ".join(result["reasons"]))
+
+    def test_can_open_trade_denies_new_entry_when_registry_sync_fails(self):
+        with mock.patch.object(central_main, "autosync_trade_registry", return_value={"ok": False}), \
+             mock.patch.object(central_main, "_all_open_positions_payload", return_value=[]), \
+             mock.patch.object(central_main, "_central_live_positions_payload", return_value=[]), \
+             mock.patch.object(central_main, "central_exposure_snapshot", return_value={"total_positions_open": 0, "long_positions_open": 0, "short_positions_open": 0}), \
+             mock.patch.object(central_main, "_risk_memory_block_payload", return_value={"blocked": False, "usage_pct": 0}), \
+             mock.patch.object(central_main, "append_decision_log", return_value=None), \
+             mock.patch.object(central_main, "broker_status_payload", return_value={"ok": True}), \
+             mock.patch.object(central_main, "ENABLE_REAL_TRADING", False), \
+             mock.patch.object(central_main, "EXECUTION_MODE", "PAPER"):
+            result = central_main.can_open_trade_decision(
+                {"bot": "TURTLE", "symbol": "ETHUSDT", "side": "LONG", "mode": "PAPER"}
+            )
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["decision"], "DENY")
+        self.assertIn(
+            "sincronização do Registry indisponível; novas entradas bloqueadas",
+            result["reasons"],
+        )
+        self.assertFalse(result["exposure"]["registry_sync_ok"])
+
+    def test_can_open_trade_does_not_trust_caller_reduce_only_claim(self):
+        with mock.patch.object(central_main, "GLOBAL_RISK_ALLOW_REDUCE_ONLY", True), \
+             mock.patch.object(central_main, "append_decision_log", return_value=None), \
+             mock.patch.object(central_main, "auto_real_execution_bridge_v1_process", return_value={
+                 "ok": False,
+                 "status": "NOT_ELIGIBLE_FOR_AUTO_REAL_EXECUTION",
+                 "executed": False,
+                 "sent": False,
+             }), \
+             mock.patch.object(central_main, "DECISION_IDENTITY_RECORD_STORE", None):
+            result = central_main.can_open_trade_decision({
+                "bot": "FALCON",
+                "symbol": "BTCUSDT",
+                "side": "LONG",
+                "mode": "LIVE",
+                "intended_live": True,
+                "reduce_only": True,
+            })
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["decision"], "DENY")
+        self.assertEqual(
+            result["status"], "REDUCE_ONLY_NOT_VALID_FOR_CAN_OPEN_TRADE"
+        )
+        self.assertTrue(result["reduce_only"])
 
     def test_blocked_and_nested_payloads_are_normalized(self):
         history_manager.log_event(

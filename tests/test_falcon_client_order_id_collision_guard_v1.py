@@ -4,6 +4,7 @@ import ast
 import copy
 import hashlib
 import json
+import math
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -488,6 +489,8 @@ def test_broker_sends_and_audits_the_exact_reserved_disaster_stop_id_once():
     audit_events = []
     namespace = _load_broker_functions(
         (
+            "_safe_float_broker",
+            "_prepare_buffered_disaster_stop",
             "_managed_sanitize_exception_text",
             "_managed_exception_details",
             "validate_broker_client_order_id",
@@ -500,6 +503,8 @@ def test_broker_sends_and_audits_the_exact_reserved_disaster_stop_id_once():
             "create_disaster_stop_order",
         ),
         {
+            "math": math,
+            "re": re,
             "BROKER_CLIENT_ORDER_ID_MAX_LENGTH": 32,
             "_BROKER_CLIENT_ORDER_ID_PATTERN": re.compile(r"^[A-Z0-9_-]+$"),
             "normalize_account_client_order_id": lambda value: str(value).strip().upper(),
@@ -522,7 +527,10 @@ def test_broker_sends_and_audits_the_exact_reserved_disaster_stop_id_once():
             "normalize_symbol": lambda value: value,
             "normalize_side": lambda value: "buy" if str(value).upper() == "LONG" else "sell",
             "bingx_position_side": lambda value: str(value).upper(),
-            "validate_disaster_stop_price": lambda *_args: {"ok": True},
+            "validate_disaster_stop_price": lambda _side, _entry, stop: {
+                "ok": True,
+                "stop": float(stop),
+            },
             "_apply_disaster_stop_buffer": lambda _side, value: value,
             "_build_disaster_stop_hedge_mode_fix_payload": lambda *_args, **_kwargs: {
                 "reduce_only_sent": False,

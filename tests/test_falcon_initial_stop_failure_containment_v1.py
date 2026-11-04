@@ -81,6 +81,8 @@ class _Broker:
         position_mode=None,
         opposite_position_open=None,
         manual_position=False,
+        entry_status="CLOSED",
+        entry_raw_status=None,
     ):
         self.residual = residual
         self.pre_close_amount = pre_close_amount
@@ -93,6 +95,8 @@ class _Broker:
         self.position_mode = position_mode
         self.opposite_position_open = opposite_position_open
         self.manual_position = manual_position
+        self.entry_status = entry_status
+        self.entry_raw_status = entry_raw_status
         self.calls = []
         self.position_calls = []
 
@@ -101,10 +105,13 @@ class _Broker:
             "ok": True,
             "read_only": True,
             "order_id": order_id,
+            "client_order_id": "ENTRY-CID-1",
             "symbol": symbol,
             "side": self.entry_side,
             "position_side": self.entry_position_side,
             "filled": 0.5,
+            "status": self.entry_status,
+            "raw_status": self.entry_raw_status,
         }
 
     def managed_position_snapshot(self, symbol, side, expected_amount=None):
@@ -293,6 +300,7 @@ def _harness(
     save_outcomes=None,
     lock_helper_present=True,
     lifecycle_lock_ok=True,
+    entry_lock_state=None,
     resume_send_allowed=True,
     current_registry=None,
     unsafe_registry_open=None,
@@ -302,7 +310,7 @@ def _harness(
     timeline = []
     entry_locks = []
     health = {}
-    lock_state = {
+    lock_state = entry_lock_state if isinstance(entry_lock_state, dict) else {
         "locked": bool(other_incident_owns_lock),
         "incident_id": "FALCON-INITIAL-STOP-OTHER" if other_incident_owns_lock else None,
     }
@@ -609,6 +617,214 @@ def test_unarmed_partial_stop_response_without_an_order_id_is_contained():
     assert result["emergency_close_confirmed"] is True
     assert len(broker.calls) == 1
     assert next(iter(store.values()))["stop_status"] == "STOP_ORDER_ID_MISSING"
+
+
+@pytest.mark.parametrize(
+    ("status", "raw_status"),
+    [
+        ("OPEN", "PARTIALLY_FILLED"),
+        ("OPEN", "NEW"),
+        ("UNKNOWN", None),
+        (None, None),
+    ],
+)
+def test_active_or_unverified_entry_is_not_emergency_closed_while_it_can_still_fill(
+    status, raw_status
+):
+    broker = _Broker(
+        pre_close_amount=0.5,
+        entry_status=status,
+        entry_raw_status=raw_status,
+    )
+    contain, _broker, store, _timeline, locks, health = _harness(broker=broker)
+
+    result = contain(_signal(), _order())
+    state = next(iter(store.values()))
+
+    assert result["containment_status"] == (
+        "INITIAL_STOP_FAILED_ENTRY_ORDER_RECONCILIATION_REQUIRED"
+    )
+    assert result["containment_reason"] == "ENTRY_ORDER_MAY_STILL_FILL"
+    assert result["reconciliation_required"] is True
+    assert result["falcon_live_entries_locked"] is True
+    assert state["attempt_state"] == "ENTRY_ORDER_NOT_TERMINAL"
+    assert state["entry_order_terminal"] is False
+    assert broker.calls == []
+    assert locks == [(result["emergency_close_idempotency_key"], True, "CANCELED")]
+    assert health["falcon_live_entries_locked"] is True
+
+
+def test_active_entry_is_cancelled_and_read_back_terminal_before_exact_position_close():
+    broker = _Broker(
+        pre_close_amount=0.5,
+        entry_status="OPEN",
+        entry_raw_status="PARTIALLY_FILLED",
+    )
+    contain, _broker, store, timeline, _locks, _health = _harness(broker=broker)
+    cancel_calls = []
+
+    def cancel_entry(**kwargs):
+        cancel_calls.append(dict(kwargs))
+        timeline.append(("entry_cancel", kwargs["order_id"]))
+        broker.entry_status = "CANCELED"
+        broker.entry_raw_status = "CANCELED"
+        return {
+            "ok": True,
+            "status": "ENTRY_ORDER_CANCELLED_AND_TERMINAL",
+            "terminal": True,
+            "sent": True,
+            "filled": 0.5,
+            "average": 100.0,
+        }
+
+    broker.cancel_managed_entry_order = cancel_entry
+    result = contain(_signal(), _order())
+    state = next(iter(store.values()))
+
+    assert len(cancel_calls) == 1, (state.get("entry_cancel_auth"), state.get("entry_cancel_result"), state.get("lifecycle_lock"))
+    assert result["containment_status"] == "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_CONFIRMED", result
+    assert len(cancel_calls) == 1
+    assert cancel_calls[0]["order_id"] == "ENTRY-1"
+    assert cancel_calls[0]["client_order_id"] == "ENTRY-CID-1"
+    assert cancel_calls[0]["side"] == "BUY"
+    assert cancel_calls[0]["position_side"] == "LONG"
+    assert cancel_calls[0]["reason"] == "INITIAL_STOP_FAILURE_ENTRY_CANCEL"
+    assert timeline.index(("persist", "ENTRY_CANCEL_CALL_PENDING")) < timeline.index(
+        ("entry_cancel", "ENTRY-1")
+    )
+    assert len(broker.calls) == 1
+    assert broker.calls[0]["amount"] == 0.5
+    assert state["entry_order_terminal"] is True
+    assert state["entry_order_status"] == "CANCELED"
+    assert state["emergency_close_confirmed"] is True
+
+
+def test_ambiguous_entry_cancel_keeps_lock_and_never_closes_position():
+    broker = _Broker(
+        pre_close_amount=0.5,
+        entry_status="OPEN",
+        entry_raw_status="PARTIALLY_FILLED",
+    )
+    contain, _broker, store, _timeline, locks, health = _harness(broker=broker)
+    broker.cancel_managed_entry_order = lambda **_kwargs: {
+        "ok": False,
+        "status": "ENTRY_CANCEL_OUTCOME_UNKNOWN",
+        "terminal": False,
+        "send_attempted": True,
+        "send_outcome_unknown": True,
+    }
+
+    result = contain(_signal(), _order())
+    state = next(iter(store.values()))
+
+    assert result["containment_status"] == (
+        "INITIAL_STOP_FAILED_ENTRY_ORDER_RECONCILIATION_REQUIRED"
+    )
+    assert result["entry_cancel_status"] == "ENTRY_CANCEL_OUTCOME_UNKNOWN"
+    assert result["reconciliation_required"] is True
+    assert result["falcon_live_entries_locked"] is True
+    assert state["entry_order_terminal"] is False
+    assert broker.calls == []
+    assert locks[-1][1] is True
+    assert health["falcon_live_entries_locked"] is True
+
+
+def test_cancel_ack_with_nonterminal_raw_readback_never_closes_position():
+    broker = _Broker(
+        pre_close_amount=0.5,
+        entry_status="OPEN",
+        entry_raw_status="PARTIALLY_FILLED",
+    )
+    contain, _broker, store, _timeline, locks, health = _harness(broker=broker)
+
+    def cancel_entry(**_kwargs):
+        broker.entry_status = "CANCELED"
+        # Contradictory exchange raw status means cancellation is not factual.
+        broker.entry_raw_status = "PARTIALLY_FILLED"
+        return {
+            "ok": True,
+            "status": "ENTRY_ORDER_CANCELLED_AND_TERMINAL",
+            "terminal": True,
+            "sent": True,
+        }
+
+    broker.cancel_managed_entry_order = cancel_entry
+
+    result = contain(_signal(), _order())
+    state = next(iter(store.values()))
+
+    assert result["containment_status"] == (
+        "INITIAL_STOP_FAILED_ENTRY_ORDER_RECONCILIATION_REQUIRED"
+    )
+    assert result["entry_cancel_status"] == (
+        "ENTRY_CANCEL_READBACK_RECONCILIATION_REQUIRED"
+    )
+    assert result["reconciliation_required"] is True
+    assert state["entry_order_terminal"] is False
+    assert state["entry_order_raw_status"] == "PARTIALLY_FILLED"
+    assert broker.calls == []
+    assert locks[-1][1] is True
+    assert health["falcon_live_entries_locked"] is True
+
+
+def test_restart_reconciles_persisted_ambiguous_entry_cancel_before_close():
+    broker = _Broker(
+        pre_close_amount=0.5,
+        entry_status="OPEN",
+        entry_raw_status="PARTIALLY_FILLED",
+    )
+    store = {}
+    entry_lock_state = {}
+    first_handler, _broker, _store, _timeline, _locks, first_health = _harness(
+        broker=broker,
+        store=store,
+        entry_lock_state=entry_lock_state,
+    )
+    cancel_calls = []
+
+    def ambiguous_cancel(**kwargs):
+        cancel_calls.append(dict(kwargs))
+        return {
+            "ok": False,
+            "status": "ENTRY_CANCEL_OUTCOME_UNKNOWN",
+            "terminal": False,
+            "send_attempted": True,
+            "send_outcome_unknown": True,
+        }
+
+    broker.cancel_managed_entry_order = ambiguous_cancel
+    first = first_handler(_signal(), _order())
+    persisted = next(iter(store.values()))
+
+    assert first["entry_cancel_status"] == "ENTRY_CANCEL_OUTCOME_UNKNOWN"
+    assert persisted["entry_cancel_result"]["send_outcome_unknown"] is True
+    assert entry_lock_state["locked"] is True
+    assert first_health["falcon_live_entries_locked"] is True
+    assert broker.calls == []
+
+    # Simulate process restart: a fresh handler reuses only durable incident and
+    # entry-lock state; the new authoritative broker read now says terminal.
+    broker.entry_status = "CANCELED"
+    broker.entry_raw_status = "CANCELED"
+    restarted_handler, _broker, _store, _timeline, _locks, restarted_health = _harness(
+        broker=broker,
+        store=store,
+        entry_lock_state=entry_lock_state,
+    )
+    resumed = restarted_handler(_signal(), _order())
+
+    assert resumed["containment_status"] == (
+        "INITIAL_STOP_FAILED_EMERGENCY_CLOSE_CONFIRMED"
+    )
+    resumed_state = store[next(iter(store))]
+    assert resumed_state["entry_order_status"] == "CANCELED"
+    assert resumed_state["emergency_close_confirmed"] is True
+    assert resumed_state["reconciliation_required"] is False
+    assert resumed["reconciliation_required"] is False
+    assert len(cancel_calls) == 1
+    assert len(broker.calls) == 1
+    assert entry_lock_state["locked"] is False
+    assert restarted_health["falcon_live_entries_locked"] is False
 
 
 @pytest.mark.parametrize("stop_status", ["CANCELED", "NOT_FOUND", "REJECTED", "STOP_ORDER_ID_MISSING", "TIMEOUT"])

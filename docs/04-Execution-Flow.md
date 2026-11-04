@@ -635,7 +635,7 @@ Todo retry preserva identidade persistente, registra número da tentativa, motiv
 | Matching parcial por símbolo/lado | Risco operacional em tratamento | Usar somente para awareness; ownership por IDs/fills | TD-008 |
 | Persistência distribuída | Migração planejada | Registry como fonte primária e adapters explícitos | TD-001, TD-009 |
 | Gestão entre bot, Broker e `main.py` | Compatibilidade transitória | Management por lifecycle através de Execution | TD-001, TD-003, TD-009 |
-| Stop considerado pela resposta inicial | Risco operacional em tratamento | Consulta posterior obrigatória | TD-010 |
+| Confirmação inicial do disaster stop | Implementada no release `598c4d4`; comportamento real do exchange não comprovado | Consulta posterior read-only por ID exato, identidade/status ativo/lado/quantidade/trigger; divergências permanecem fail-closed | TD-010 |
 
 Nenhuma dessas condições é o fluxo oficial. Migração deve ser incremental, coberta por testes sem rede, plano, impacto e rollback; não se recomenda refatoração ampla imediata.
 

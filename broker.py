@@ -520,6 +520,154 @@ def _broker_material_disaster_stop_confirmation(
     }
 
 
+def validate_entry_fill_for_disaster_stop(
+    order,
+    *,
+    expected_order_id,
+    expected_client_order_id,
+    expected_symbol,
+    expected_side,
+    expected_amount,
+):
+    """Require exact, internally consistent full-fill evidence before sizing a stop."""
+    payload = order if isinstance(order, dict) else {}
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+
+    def observed(*keys):
+        values = []
+        for source in (payload, info):
+            for key in keys:
+                value = source.get(key)
+                if value not in (None, ""):
+                    values.append(value)
+        return values
+
+    def number(value):
+        try:
+            if value in (None, "") or isinstance(value, bool):
+                return None
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) else None
+        except (TypeError, ValueError):
+            return None
+
+    def canonical_symbol(value):
+        return (
+            str(value or "").upper().strip().replace(":USDT", "")
+            .replace("/", "").replace("-", "")
+        )
+
+    order_ids = {
+        str(value).strip()
+        for value in observed("id", "orderId", "order_id")
+    }
+    client_ids = {
+        str(value).strip()
+        for value in observed("clientOrderId", "client_order_id", "clientId")
+    }
+    symbols = {
+        canonical_symbol(value)
+        for value in observed("symbol", "contract", "instrument")
+        if canonical_symbol(value)
+    }
+    sides = {
+        str(value).lower().strip()
+        for value in observed("side", "orderSide")
+        if str(value).strip()
+    }
+    statuses = {
+        str(payload.get("status")).lower().strip()
+    } if payload.get("status") not in (None, "") else set()
+    raw_statuses = {
+        str(value).upper().strip()
+        for value in observed("orderStatus", "order_status", "raw_status")
+        if str(value).strip()
+    }
+    if info.get("status") not in (None, ""):
+        raw_statuses.add(str(info["status"]).upper().strip())
+
+    requested_amount = number(expected_amount)
+
+    def numeric_observations(*keys):
+        values = []
+        malformed = False
+        for value in observed(*keys):
+            parsed = number(value)
+            if parsed is None:
+                malformed = True
+            else:
+                values.append(parsed)
+        return values, not malformed
+
+    amounts, amounts_well_formed = numeric_observations(
+        "amount", "origQty", "quantity", "qty", "orderQty"
+    )
+    fills, fills_well_formed = numeric_observations(
+        "filled", "executedQty", "filledQty", "executed_quantity", "cumExecQty", "z"
+    )
+    averages, averages_well_formed = numeric_observations(
+        "average", "avgPrice", "ap"
+    )
+    normalized_alias_status = payload.get("numeric_aliases_well_formed")
+    if isinstance(normalized_alias_status, dict):
+        amounts_well_formed = (
+            amounts_well_formed
+            and normalized_alias_status.get("amount") is True
+        )
+        fills_well_formed = (
+            fills_well_formed
+            and normalized_alias_status.get("filled") is True
+        )
+        averages_well_formed = (
+            averages_well_formed
+            and normalized_alias_status.get("average") is True
+        )
+
+    def all_match(values, expected):
+        return bool(
+            expected is not None
+            and expected > 0
+            and values
+            and all(
+                abs(value - expected) <= max(1e-12, abs(expected) * 1e-8)
+                for value in values
+            )
+        )
+
+    checks = {
+        "exact_order_id": order_ids == {str(expected_order_id).strip()},
+        "exact_client_order_id": client_ids == {str(expected_client_order_id).strip()},
+        "exact_symbol": symbols == {canonical_symbol(expected_symbol)},
+        "exact_side": sides == {str(expected_side or "").lower().strip()},
+        "terminal_status": statuses == {"closed"}
+        and (not raw_statuses or raw_statuses <= {"FILLED", "CLOSED", "FULLY_FILLED", "ALL_FILLED", "FINISHED"}),
+        "requested_amount_consistent": (
+            amounts_well_formed and all_match(amounts, requested_amount)
+        ),
+        "full_fill_confirmed": (
+            fills_well_formed and all_match(fills, requested_amount)
+        ),
+        "average_price_confirmed": bool(
+            averages_well_formed
+            and averages
+            and all(value > 0 for value in averages)
+            and all(
+                abs(value - averages[0]) <= max(1e-12, abs(averages[0]) * 1e-8)
+                for value in averages
+            )
+        ),
+    }
+    ok = all(checks.values())
+    return {
+        "ok": ok,
+        "status": "ENTRY_FILL_CONFIRMED" if ok else "ENTRY_FILL_EVIDENCE_UNVERIFIED",
+        **checks,
+        "failed_checks": [name for name, valid in checks.items() if not valid],
+        "filled": fills[0] if fills else None,
+        "average": averages[0] if averages else None,
+    }
+
+
 def _create_order_with_reserved_attempt(
     ex,
     symbol,
@@ -3576,7 +3724,76 @@ def place_market_order(
         disaster_stop_result = None
         if DISASTER_STOP_ENABLED:
             reservation = None
-            if callable(disaster_stop_client_order_id_factory):
+            entry_fill_source = "CREATE_ORDER_RESPONSE"
+            entry_fill_evidence = validate_entry_fill_for_disaster_stop(
+                order,
+                expected_order_id=entry_order_id,
+                expected_client_order_id=exact_entry_client_order_id,
+                expected_symbol=sym,
+                expected_side=order_side,
+                expected_amount=amount,
+            )
+            entry_fill_readback = None
+            if entry_fill_evidence.get("ok") is not True and entry_order_id:
+                try:
+                    # An acknowledged order may omit final fill facts. Read the
+                    # exact order once through the already authenticated client
+                    # before deciding that safe stop sizing is impossible.
+                    # This is read-only; missing/conflicting facts still follow
+                    # the existing fail-closed containment path.
+                    readback_raw = ex.fetch_order(str(entry_order_id), sym)
+                    entry_fill_readback = {
+                        **_normalize_managed_order_payload(
+                            readback_raw,
+                            requested_symbol=sym,
+                            requested_order_id=entry_order_id,
+                        ),
+                        "ok": True,
+                        "read_only": True,
+                        "sent": False,
+                    }
+                    readback_evidence = validate_entry_fill_for_disaster_stop(
+                        entry_fill_readback,
+                        expected_order_id=entry_order_id,
+                        expected_client_order_id=exact_entry_client_order_id,
+                        expected_symbol=sym,
+                        expected_side=order_side,
+                        expected_amount=amount,
+                    )
+                    if readback_evidence.get("ok") is True:
+                        entry_fill_evidence = readback_evidence
+                        entry_fill_source = "READ_ONLY_ORDER_SNAPSHOT"
+                    else:
+                        entry_fill_evidence = {
+                            **readback_evidence,
+                            "initial_ack_failed_checks": entry_fill_evidence.get(
+                                "failed_checks", []
+                            ),
+                        }
+                except Exception as exc:
+                    entry_fill_readback = {
+                        "ok": False,
+                        "read_only": True,
+                        "sent": False,
+                        **_managed_exception_details(exc),
+                    }
+                    entry_fill_evidence = {
+                        **entry_fill_evidence,
+                        "readback_status": "ENTRY_FILL_READBACK_FAILED",
+                    }
+            entry_fill_evidence["source"] = entry_fill_source
+            if entry_fill_evidence.get("ok") is not True:
+                reservation = {
+                    "ok": False,
+                    "send_allowed": False,
+                    "client_order_id_unique": False,
+                    "status": "ENTRY_FILL_EVIDENCE_UNVERIFIED",
+                    "entry_fill_evidence": entry_fill_evidence,
+                    "entry_fill_readback": _managed_sanitize_snapshot_value(
+                        entry_fill_readback
+                    ) if isinstance(entry_fill_readback, dict) else None,
+                }
+            elif callable(disaster_stop_client_order_id_factory):
                 try:
                     reservation = disaster_stop_client_order_id_factory(
                         entry_order_id=(order or {}).get("id"),
@@ -3634,6 +3851,10 @@ def place_market_order(
                     "collision_detected": bool(
                         (reservation or {}).get("collision_detected")
                     ),
+                    "entry_fill_evidence": entry_fill_evidence,
+                    "entry_fill_readback": _managed_sanitize_snapshot_value(
+                        entry_fill_readback
+                    ) if isinstance(entry_fill_readback, dict) else None,
                 }
             else:
                 # Persistable identity projection for the mutable stop call.
@@ -3659,20 +3880,31 @@ def place_market_order(
                     "client_order_id_reservation_status": reservation.get("status"),
                     "client_order_id_reservation": reservation,
                     "reconciliation_required": True,
+                    "entry_fill_evidence": entry_fill_evidence,
+                    "entry_fill_readback": _managed_sanitize_snapshot_value(
+                        entry_fill_readback
+                    ) if isinstance(entry_fill_readback, dict) else None,
                 }
                 disaster_stop_result = create_disaster_stop_order(
                     symbol=sym,
                     side=side,
-                    amount=amount,
+                    amount=entry_fill_evidence["filled"],
                     stop_loss_price=stop_loss_price,
                     client_tag=client_tag,
-                    entry_price=preview.get("price_ref") if isinstance(preview, dict) else None,
+                    entry_price=entry_fill_evidence["average"],
                     client_order_id=reservation.get("client_order_id"),
                     client_order_id_unique=True,
                     client_order_id_reservation_status=reservation.get("status"),
                     client_order_id_reservation=reservation,
                     client_order_id_reservation_verifier=client_order_id_reservation_verifier,
                 )
+                if isinstance(disaster_stop_result, dict):
+                    disaster_stop_result["entry_fill_evidence"] = entry_fill_evidence
+                    disaster_stop_result["entry_fill_readback"] = (
+                        _managed_sanitize_snapshot_value(entry_fill_readback)
+                        if isinstance(entry_fill_readback, dict)
+                        else None
+                    )
             if DISASTER_STOP_REQUIRE_FOR_LIVE and not (
                 isinstance(disaster_stop_result, dict)
                 and disaster_stop_result.get("stop_operationally_armed") is True
@@ -5700,6 +5932,21 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
                     selected = value
         return selected
 
+    def numeric_aliases_well_formed(keys):
+        for source in (payload, info):
+            for key in keys:
+                value = source.get(key)
+                if value in (None, ""):
+                    continue
+                if isinstance(value, bool):
+                    return False
+                try:
+                    if not math.isfinite(float(value)):
+                        return False
+                except (TypeError, ValueError, OverflowError):
+                    return False
+        return True
+
     def safe_diagnostic_text(value, limit=240):
         if value in (None, ""):
             return None
@@ -5915,6 +6162,20 @@ def _normalize_managed_order_payload(order, requested_symbol=None, requested_ord
             payload.get("avgPrice"),
             info.get("avgPrice"),
         ), None),
+        # Keep only sanitized validity flags so a readback projection cannot
+        # hide malformed numeric aliases from the entry-fill validator.
+        "numeric_aliases_well_formed": {
+            "amount": numeric_aliases_well_formed((
+                "amount", "quantity", "origQty", "qty", "orderQty",
+            )),
+            "filled": numeric_aliases_well_formed((
+                "filled", "executedQty", "filledQty", "executed_quantity",
+                "cumExecQty", "z",
+            )),
+            "average": numeric_aliases_well_formed((
+                "average", "avgPrice", "ap",
+            )),
+        },
         "timestamp": first_present(
             payload.get("datetime"),
             payload.get("timestamp"),
@@ -8219,6 +8480,164 @@ def cancel_managed_stop_order(symbol, order_id, execution_auth_token=None, reaso
             **_managed_exception_details(exc),
         }
 
+
+def cancel_managed_entry_order(
+    symbol,
+    order_id,
+    client_order_id,
+    side,
+    position_side=None,
+    execution_auth_token=None,
+    reason="INITIAL_STOP_FAILURE_ENTRY_CANCEL",
+):
+    """Cancel only the exact owned entry order and verify its terminal readback.
+
+    The caller must persist a cancel-pending phase before invoking this helper.
+    A valid token is not sufficient by itself: its complete scope must match
+    the exact order identity supplied here.
+    """
+    sym = normalize_symbol(symbol)
+    exact_order_id = str(order_id or "").strip()
+    exact_client_order_id = str(client_order_id or "").strip()
+    expected_side = str(side or "").upper().strip()
+    expected_position_side = str(position_side or "").upper().strip()
+    base = {
+        "ok": False,
+        "version": REAL_POSITION_MANAGEMENT_HARDENING_VERSION,
+        "symbol": sym,
+        "order_id": exact_order_id or None,
+        "client_order_id": exact_client_order_id or None,
+        "side": expected_side or None,
+        "position_side": expected_position_side or None,
+        "reason": reason,
+        "sent": False,
+        "send_attempted": False,
+        "send_outcome_unknown": False,
+        "terminal": False,
+        "read_only": False,
+    }
+    if not all((sym, exact_order_id, exact_client_order_id, expected_side, reason)):
+        return {**base, "status": "ENTRY_CANCEL_EXACT_IDENTITY_REQUIRED"}
+    if expected_side not in {"BUY", "SELL"}:
+        return {**base, "status": "ENTRY_CANCEL_SIDE_INVALID"}
+    if not _rpm_live_write_enabled():
+        return {**base, "ok": True, "status": "ENTRY_CANCEL_DRY_RUN", "would_send_order": True}
+
+    expected_context = {
+        "operation": "cancel_managed_entry_order",
+        "symbol": sym,
+        "order_id": exact_order_id,
+        "client_order_id": exact_client_order_id,
+        "side": expected_side,
+        "position_side": expected_position_side,
+        "reason": reason,
+    }
+    auth = _rpm_validate_auth(execution_auth_token, expected_context)
+    stored_context = auth.get("context") if isinstance(auth, dict) else None
+    if not (
+        isinstance(auth, dict)
+        and auth.get("ok") is True
+        and isinstance(stored_context, dict)
+        and all(stored_context.get(key) == value for key, value in expected_context.items())
+    ):
+        return {
+            **base,
+            "status": "ENTRY_CANCEL_AUTH_DENIED",
+            "auth_status": (auth or {}).get("status") if isinstance(auth, dict) else None,
+        }
+
+    def read_exact_order(ex):
+        raw = ex.fetch_order(exact_order_id, sym)
+        projected = _normalize_managed_order_payload(
+            raw, requested_symbol=sym, requested_order_id=exact_order_id
+        )
+        actual_id = str(projected.get("order_id") or "")
+        actual_symbol = normalize_symbol(projected.get("symbol"))
+        actual_client_id = str(projected.get("client_order_id") or "")
+        actual_side = str(projected.get("side") or "").upper().strip()
+        actual_position_side = str(projected.get("position_side") or "").upper().strip()
+        identity_ok = bool(
+            actual_id == exact_order_id
+            and actual_symbol == sym
+            and actual_client_id == exact_client_order_id
+            and actual_side == expected_side
+            and (
+                not actual_position_side
+                or not expected_position_side
+                or actual_position_side == expected_position_side
+            )
+        )
+        return projected, identity_ok
+
+    try:
+        ex = exchange()
+        before, before_identity_ok = read_exact_order(ex)
+        if not before_identity_ok:
+            return {**base, "status": "ENTRY_CANCEL_ORDER_IDENTITY_MISMATCH"}
+        terminal_statuses = {"CLOSED", "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+        active_statuses = {"OPEN", "NEW", "PENDING", "ACTIVE", "PARTIALLY_FILLED"}
+        before_status = str(before.get("status") or "").upper().strip()
+        before_raw_status = str(before.get("raw_status") or "").upper().strip()
+        if (
+            before_status in terminal_statuses
+            and (not before_raw_status or before_raw_status in terminal_statuses)
+        ):
+            return {
+                **base,
+                "ok": True,
+                "status": "ENTRY_ORDER_ALREADY_TERMINAL",
+                "terminal": True,
+                "order_status": before_status,
+                "raw_status": before_raw_status or None,
+                "filled": before.get("filled"),
+                "average": before.get("average"),
+                "remaining": before.get("remaining"),
+                "read_only": True,
+            }
+        if not (
+            before_status in active_statuses
+            and (not before_raw_status or before_raw_status in active_statuses)
+        ):
+            return {**base, "status": "ENTRY_CANCEL_ORDER_STATUS_UNVERIFIED"}
+
+        base["send_attempted"] = True
+        ex.cancel_order(exact_order_id, sym)
+        base["sent"] = True
+        after, after_identity_ok = read_exact_order(ex)
+        after_status = str(after.get("status") or "").upper().strip()
+        after_raw_status = str(after.get("raw_status") or "").upper().strip()
+        terminal = bool(
+            after_identity_ok
+            and after_status in terminal_statuses
+            and (not after_raw_status or after_raw_status in terminal_statuses)
+        )
+        return {
+            **base,
+            "ok": terminal,
+            "status": "ENTRY_ORDER_CANCELLED_AND_TERMINAL" if terminal else (
+                "ENTRY_CANCEL_READBACK_IDENTITY_MISMATCH"
+                if not after_identity_ok
+                else "ENTRY_CANCEL_READBACK_NOT_TERMINAL"
+            ),
+            "terminal": terminal,
+            "send_outcome_unknown": not terminal,
+            "order_status": after_status or None,
+            "raw_status": after_raw_status or None,
+            "filled": after.get("filled"),
+            "average": after.get("average"),
+            "remaining": after.get("remaining"),
+            "read_only": True,
+        }
+    except Exception as exc:
+        # Once cancel_order was entered, an exception is an unknown outcome;
+        # the durable caller must reconcile the same order ID before retrying.
+        base["send_outcome_unknown"] = base["send_attempted"] is True
+        return {
+            **base,
+            "status": "ENTRY_CANCEL_OUTCOME_UNKNOWN" if base["send_attempted"] else "ENTRY_CANCEL_READ_FAILED",
+            **_managed_exception_details(exc),
+        }
+
 # Expõe o hardening no health existente do broker sem alterar rotas.
 _ORIGINAL_STATUS_PAYLOAD_BEFORE_RPM_V1 = status_payload
 
@@ -8231,6 +8650,7 @@ def status_payload(check_ready: bool = False):
         "managed_close_position_market": True,
         "replace_position_stop_order": True,
         "cancel_managed_stop_order": True,
+        "cancel_managed_entry_order": True,
         "amount_tolerance": BROKER_MANAGEMENT_AMOUNT_TOLERANCE,
         "confirm_retries": BROKER_MANAGEMENT_CONFIRM_RETRIES,
         "confirm_delay_seconds": BROKER_MANAGEMENT_CONFIRM_DELAY_SECONDS,
@@ -8259,6 +8679,7 @@ def real_position_management_health():
             "managed_close_position_market",
             "replace_position_stop_order",
             "cancel_managed_stop_order",
+            "cancel_managed_entry_order",
         ],
         "sent": False,
         "read_only": True,
