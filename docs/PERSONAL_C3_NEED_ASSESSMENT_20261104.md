@@ -450,3 +450,19 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   subprocessos e acesso a `.env`, desativou auto-start e redirecionou os dados
   para persistência temporária. É evidência local simulada; não valida
   integração com corretora, processo Render ou prontidão LIVE.
+
+## C3 dormente e inventário de writers — nova regressão local
+
+- Antes de editar, revalidei branch `codex/personal-readiness-release-20261104`,
+  HEAD `776d15d`, worktree limpa. `git diff --check` passou.
+- `python.exe -I tests/run_falcon_pilot_minimal_offline.py --registry-writers`
+  terminou com **60 passed em 82,05 s**, cobrindo o contrato de gravações
+  remanescentes do Registry.
+- `python.exe -I tests/run_falcon_pilot_minimal_offline.py --c3-dormant-startup`
+  terminou com **24 passed e 3 subtests passed em 523,38 s**. Confirma o
+  comportamento local das composições de startup C3 em estado dormente; não
+  demonstra necessidade de coordenação distribuída nem valida produção.
+- Ambos usaram o ambiente Python offline compartilhado; o runner bloqueia
+  rede/DNS, subprocessos e `.env`, desativa auto-start e redireciona os dados
+  para diretório temporário. A evidência reforça manter C3 fora do caminho
+  crítico até que simultaneidade ou requisito de uso pessoal seja demonstrado.
