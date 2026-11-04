@@ -112,7 +112,7 @@ Este registro cobre somente condições verificadas no repositório por inspeç�
 - **ID:** TD-007
 - **Título:** Limite de integração real da execução LIVE
 - **Categoria:** Testes
-- **Situação atual:** O checkout possui suítes offline dedicadas ao broker/Falcon, entrada e fill, proteção inicial e replacement do stop, cancelamento, idempotência/identidade, ownership, fechamento e reconciliação. O runner `--extra` seleciona 25 módulos relevantes e, no HEAD local atual, passou 916 testes, com 1 skip e 1 caso deliberadamente deselected; `--stop-readback` passou 12. Isso é evidência sintética local, não integração real da corretora.
+- **Situação atual:** O checkout possui suítes offline dedicadas ao broker/Falcon, entrada e fill, proteção inicial e replacement do stop, cancelamento, idempotência/identidade, ownership, fechamento e reconciliação. A reexecução do runner `--extra` em 2026-11-04 passou 919 testes, com 1 skip e 1 caso deliberadamente deselected; `--personal-execution-safety` passou 400 e `--personal-http-auth` passou 235. `--stop-readback` passou 12. Isso é evidência sintética local, não integração real da corretora.
 - **Motivo pelo qual existe:** O caminho real ainda é protegido por PAPER/DRY_RUN e a meta proíbe ordens reais; portanto, testes de rede com conta real não são uma opção de validação.
 - **Impacto:** A maioria dos contratos de segurança pode ser regressada offline, mas a semântica real de execução/fills/stops da BingX e a integração de produção não foram provadas por essas suítes.
 - **Risco:** Diferenças do exchange, configuração da conta, latência e estado de produção podem invalidar hipóteses dos doubles mesmo com os testes locais verdes.
