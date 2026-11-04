@@ -279,3 +279,10 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   imprimiu apenas o status. Isso é evidência read-only de que uma rota real de
   relatório está protegida no deploy ativo; não foi chamada nenhuma rota de
   ordem.
+- Capturas do usuário em 2026-11-04, às 16:41–16:42 BRT, mostram uso de
+  pipeline **0/1.000 min**, Starter selecionado com 1.000 minutos incluídos,
+  limite de gasto de **US$ 5/mês**, e tráfego de saída 14,05/25 GB. Isso sustenta
+  custo incremental zero para um build que permaneça na franquia disponível no
+  momento da captura, sem upgrade ou compra de minutos; não garante custo zero
+  se o saldo mudar ou o build exceder a franquia. O serviço web existente segue
+  no plano Standard. Não houve deploy nem alteração de configuração.
