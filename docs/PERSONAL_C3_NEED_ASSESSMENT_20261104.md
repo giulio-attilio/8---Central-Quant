@@ -231,6 +231,10 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   temporária. A coleta sem o wheel não passou porque `ccxt` estava ausente; a
   tentativa no WSL também parou antes dos testes por falta de Flask/pip. Não
   houve download nem alteração de dependências compartilhadas.
+- Reexecução dedicada `--stop-readback` em 2026-11-04, com o mesmo wheel local
+  temporário: **12 passed em 37,31 s**. A seleção isolada manteve a rede e os
+  subprocessos bloqueados; nenhum acesso externo ou alteração persistente fora
+  do temporário ocorreu.
 
 ## Regressão expandida e estado de publicação — 2026-11-04
 
