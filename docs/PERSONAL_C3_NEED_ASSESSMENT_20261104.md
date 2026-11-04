@@ -262,3 +262,9 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   subprocessos e leitura de `.env`, permitiu apenas os sockets locais Flask e
   redirecionou persistência para temporário. O resultado não substitui o GET
   read-only no serviço ativo e não prova todas as configurações de produção.
+- A seleção específica de startup dormente C3, ausente de `--extra`, foi
+  executada separadamente: `--c3-dormant-startup` terminou com **24 passed e
+  3 subtests passed em 389,32s**. O runner isolado bloqueou rede e subprocessos.
+  Isso confirma os contratos locais de não ativação no startup cobertos por
+  esses testes; não demonstra que C3 distribuído seja necessário nem valida
+  integração AWS/Render. Nenhuma escrita externa ocorreu.
