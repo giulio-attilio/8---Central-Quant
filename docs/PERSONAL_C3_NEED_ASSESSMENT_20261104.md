@@ -219,7 +219,35 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   rede externa, subprocessos e leitura de `.env`, usando persistência temporária.
   `git diff --check` passou. Esta evidência é local/sintética, não valida a
   resposta da conta nem a integração de produção.
-- A alteração está apenas na worktree e não foi commitada, enviada ou implantada.
-  A consequência conservadora é intencional: sem prova de origem, a conciliação
-  não libera novas entradas LIVE, mesmo que símbolo, lado e quantidade
-  coincidam.
+- A alteração foi commitada localmente em `4b5c1c0`, mas não foi enviada nem
+  implantada. A consequência conservadora é intencional: sem prova de origem,
+  a conciliação não libera novas entradas LIVE, mesmo que símbolo, lado e
+  quantidade coincidam.
+
+## Regressão expandida e estado de publicação — 2026-11-04
+
+- Após o commit local `4b5c1c0`, a suíte offline expandida
+  `tests/run_falcon_pilot_minimal_offline.py --extra` terminou com **921 passed,
+  1 skipped e 1 deselected em 979,22 s**. O runner bloqueou rede externa,
+  subprocessos e leitura de `.env`, e usou persistência temporária. O caso
+  marcado `deselected` não é contado como aprovado.
+- Estado Render relido em 2026-11-04: serviço `central-robos-bingx`, ID
+  `srv-d8rtuv9o3t8c73ehav5g`, segue a branch
+  `codex/personal-readiness-20261103`, `autoDeploy=no`, plano Standard, uma
+  instância e disco persistente `/data` de 2 GB. O deploy ativo permanece
+  `dep-dbl0g5rncjis73fhe8dg`, commit `598c4d4505c3aec6d4de9a6b762cc1576f604374`.
+  Nenhum deploy ou alteração no serviço ocorreu.
+- GitHub, somente leitura, confirmou a branch candidata
+  `codex/personal-readiness-release-20261104` no SHA
+  `cc8b674e6d3597ccdfac96a15559773c42b99598`; esse SHA é ancestral direto do
+  HEAD local `4b5c1c0`. Há três commits locais posteriores. Não existe diretório
+  `.github/workflows` nessa branch. O push fast-forward foi tentado, mas o SSH
+  empacotado no sandbox falhou ao iniciar (`NtCreateDirectoryObject ...
+  0xC0000022`) antes de autenticar. Não foi usado force push, chave alternativa,
+  nem ocorreu escrita remota. Publicação permanece pendente de um caminho de
+  autenticação GitHub que funcione nesse ambiente ou ação manual do usuário.
+- A ferramenta Render disponível não expõe billing. A captura compartilhada
+  mostra o uso no momento da captura, mas não confirma o saldo/custo incremental
+  atual de um build/deploy. Mesmo após publicar na branch candidata, o serviço
+  Render não implanta automaticamente; eventual deploy continua condicionado
+  à confirmação de custo zero e verificação de rollback.
