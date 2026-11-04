@@ -375,7 +375,7 @@ def _load_order_normalizer():
         if isinstance(item, ast.FunctionDef)
         and item.name == "_normalize_managed_order_payload"
     )
-    namespace = {"_cq_patch_safe_float": _safe_float}
+    namespace = {"_cq_patch_safe_float": _safe_float, "math": math}
     exec(
         compile(ast.Module(body=[copy.deepcopy(node)], type_ignores=[]), "<managed-order-normalizer>", "exec"),
         namespace,
@@ -406,6 +406,7 @@ def _load_historical_order_snapshot(fetch_result=None, *, fetch_error=None):
         "normalize_symbol": lambda value: str(value),
         "fetch_order_by_id": fetch_order_by_id,
         "REAL_POSITION_MANAGEMENT_HARDENING_VERSION": "TEST-V1",
+        "math": math,
         "re": re,
     }
     module = ast.Module(body=nodes, type_ignores=[])
@@ -455,6 +456,7 @@ def _load_open_orders_snapshot(*, orders=None, fetch_error=None):
         "normalize_symbol": normalize_symbol,
         "exchange": lambda: ReadOnlyExchange(),
         "REAL_POSITION_MANAGEMENT_HARDENING_VERSION": "TEST-V1",
+        "math": math,
         "re": re,
     }
     module = ast.Module(body=nodes, type_ignores=[])
