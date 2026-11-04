@@ -251,3 +251,9 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   atual de um build/deploy. Mesmo após publicar na branch candidata, o serviço
   Render não implanta automaticamente; eventual deploy continua condicionado
   à confirmação de custo zero e verificação de rollback.
+- Verificação de produção estritamente read-only em 2026-11-04, sem enviar
+  credenciais: `GET /healthz` respondeu **200** e `GET /healthz?detail=true`
+  respondeu **401**. Isso confirma o health check público exato e que a variante
+  com query não amplia a exceção de autenticação no deploy ativo. Nenhuma rota
+  de trading foi chamada; não é uma validação completa de todas as rotas nem
+  prova de configuração dos controles de execução.
