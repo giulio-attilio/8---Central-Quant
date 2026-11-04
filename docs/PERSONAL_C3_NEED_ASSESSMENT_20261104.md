@@ -24,19 +24,22 @@ que os writers estão corretos em produção nem uma aprovação para trading LI
   (`live`), com auto-deploy desligado. A exposição de rede é pública; o gate
   HTTP global do próprio release autentica as rotas da aplicação, exceto o
   `/healthz` mínimo de liveness. Não foram consultados valores de variáveis.
-- Revalidação somente de leitura às 17:47–17:49 UTC de 2026-11-04: Render
+- Revalidação somente de leitura às 18:18–18:20 UTC de 2026-11-04: Render
   continua apontando `srv-d8rtuv9o3t8c73ehav5g` para
   `codex/personal-readiness-20261103`, com auto-deploy desligado. O deploy mais
   recente continua `dep-dbl0g5rncjis73fhe8dg`, commit
   `598c4d4505c3aec6d4de9a6b762cc1576f604374`, estado `live`. No GitHub, a
-  comparação da branch candidata `codex/personal-readiness-release-20261104`
-  com o HEAD local `29b505b8da9b64e92ca82f9c5c9cd1b261cb5c3b` retornou
-  `identical` (0 commits à frente/atrás). Isso confirma que o commit candidato
-  já está publicado na branch candidata, mas o Render ainda não consome essa
-  branch. A integração GitHub não permitiu confirmar as regras de proteção da
-  branch candidata (endpoint de proteção rejeitado pelo conector); isso não
-  prova que a branch seja desprotegida. Não foi feito push/merge por essa via.
-  Nenhuma variável de ambiente foi lida nem alterada.
+  branch acompanhada pelo Render avançou para `20ed76bdaab8f2efe9a18fa72dc6207875d8f6c1`,
+  merge "Merge personal execution and Registry safety". A comparação dessa
+  branch com a candidata `codex/personal-readiness-release-20261104`
+  (`50eb62e6781b3c872caa83851988b6b0abbc39c8`) mostra a candidata 2 commits à
+  frente e 1 atrás do merge base `29b505b`; os únicos arquivos diferentes são
+  este relatório e um ajuste no harness de teste. Portanto, os arquivos de
+  aplicação da correção de segurança já estão integrados à branch que o Render
+  acompanha, mas ainda não estão no deploy ativo. A branch candidata está sem
+  proteção, o endpoint de rulesets do repositório retornou lista vazia, e o
+  fast-forward para `50eb62e` foi publicado e confirmado. Nenhuma variável de
+  ambiente foi lida ou alterada.
 - Em `trade_registry.py`, `_lock` é um `threading.RLock`. A função
   `_trpsf_v1_registry_lock()` em `main.py` retorna esse mesmo lock. Os caminhos
   de escrita do Registry revisados usam esse lock local. Os locks `flock` de
@@ -157,17 +160,16 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   e leitura de `.env`, com diretório temporário de dados.
 - Testes locais não provam comportamento do release em Render, durabilidade do
   `/data`, integração de permissões nem prontidão de produção.
-- O release validado ainda não é o release implantado. Deploy permanece
+- O código de segurança validado está integrado na branch seguida pelo Render
+  (`20ed76b`), mas o release ativo continua em `598c4d4`. Deploy permanece
   condicionado à confirmação de custo incremental zero e a um plano para a
   interrupção possível do serviço com disco persistente.
-- Plano para eventual promoção (nenhuma escrita executada): alvo único
-  `srv-d8rtuv9o3t8c73ehav5g` (`central-robos-bingx`), branch Render
-  `codex/personal-readiness-20261103`, atualmente em `598c4d4`. A candidata
-  `29b505b` está publicada em `codex/personal-readiness-release-20261104`; para
-  promovê-la seria necessário alterar a branch do serviço ou integrar a
-  candidata à branch atualmente ligada e fazer deploy manual, pois auto-deploy
-  está desligado. Antes disso verificar alvo/release, controles PAPER/DRY_RUN,
-  configuração de rollback para `dep-dbl0g5rncjis73fhe8dg` e custo. O serviço
+- Plano para eventual promoção (nenhuma escrita de produção executada): alvo
+  único `srv-d8rtuv9o3t8c73ehav5g` (`central-robos-bingx`), mantendo a branch
+  Render `codex/personal-readiness-20261103`. O deploy manual usaria o HEAD
+  integrado `20ed76b`; auto-deploy está desligado. Antes disso verificar
+  novamente branch/commit, controles PAPER/DRY_RUN, configuração de rollback
+  para `dep-dbl0g5rncjis73fhe8dg` e custo incremental zero. O serviço
   usa plano Standard,
   uma instância e disco `/data` de 2 GB; segundo a documentação do Render, esse
   disco faz o deploy parar a instância atual antes de iniciar a nova, causando
