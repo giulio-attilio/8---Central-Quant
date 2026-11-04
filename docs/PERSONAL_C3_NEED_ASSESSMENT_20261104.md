@@ -337,3 +337,12 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   mostra o serviço na branch `codex/personal-readiness-20261103` e deploy ativo
   `598c4d4505c3aec6d4de9a6b762cc1576f604374`. Não houve push, deploy ou escrita
   em AWS/Render/produção.
+- Auditoria do grafo local confirmou que o HEAD candidato descende do deploy
+  ativo `598c4d4` e do ancestral `0ddc28a` da branch acompanhada pelo Render;
+  portanto não é uma base de código alheia ao release atual. O delta candidato
+  contém 20 arquivos (2.957 inserções, 145 remoções), incluindo autenticação e
+  gates de segurança cobertos pelos testes locais. A implementação
+  `trade_registry.py` não foi alterada; a mudança de `main.py` endurece a
+  sincronização explícita do Registry e foi revisada sem executar a rota.
+  Essa análise de ancestralidade e diff não substitui validação do runtime,
+  configuração ou dados de produção.
