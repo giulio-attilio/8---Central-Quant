@@ -158,6 +158,19 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   de escrita por cliente, leitura de stop, fechamento, validação numérica,
   posição, risco e rotas de autorização. O runner bloqueou rede, subprocessos
   e leitura de `.env`, com diretório temporário de dados.
+- Revalidação posterior, no mesmo código-fonte (HEAD `cc8b674` só acrescentou
+  documentação depois do commit de testes `ee0a53c`): `--personal-http-auth`
+  terminou com 235 aprovados em 95,14 s e `--personal-execution-safety` com
+  400 aprovados em 599,73 s. O runner manteve rede externa, subprocessos e
+  leitura de `.env` bloqueados, usando dados temporários. `git diff --check`
+  permaneceu limpo.
+- Consulta GitHub somente-leitura ao commit `20ed76b` não encontrou status de
+  CI publicados. Isso não foi contado como aprovação de CI.
+- Reconsulta Render somente-leitura confirmou novamente auto-deploy desligado,
+  branch `codex/personal-readiness-20261103` e deploy `598c4d4` em `live`.
+  A sessão do navegador não pôde ser ativada pela ferramenta e o conector não
+  oferece leitura de billing; portanto franquia/custo incremental continuam
+  sem confirmação e nenhum deploy foi disparado.
 - Testes locais não provam comportamento do release em Render, durabilidade do
   `/data`, integração de permissões nem prontidão de produção.
 - O código de segurança validado está integrado na branch seguida pelo Render
