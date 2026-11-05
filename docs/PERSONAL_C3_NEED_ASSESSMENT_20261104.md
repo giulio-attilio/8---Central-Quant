@@ -743,3 +743,19 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   Render. Portanto, não é evidência de resposta HTTP nem confirma ou refuta a
   configuração de autenticação em produção. Nenhuma chamada com credenciais,
   escrita externa, deploy, mudança de ambiente ou ordem foi feita.
+
+## Revalidação local C3 dormente e persistência — 2026-11-04 (23:19 BRT)
+
+- No mesmo runner offline, `--c3-dormant-startup` terminou com **24 passed e
+  3 subtests passed em 540,42 s**. Isso cobre os cenários de startup dormente
+  selecionados, não prova a necessidade nem a integração de C3 distribuído.
+- `--persistence-locks` terminou com **30 passed em 250,64 s**. O runner
+  bloqueou sockets/rede/DNS, subprocessos e leitura de `.env`, desativou o
+  startup operacional e usou diretório temporário de dados.
+- Junto às reexecuções acima, os resultados atuais desta rodada são: HTTP auth
+  **239 passed**, segurança de execução **402 passed**, startup C3 dormente
+  **24 passed + 3 subtests**, persistência/locks **30 passed**. São testes
+  locais/sintéticos e não substituem validação Render/BingX de produção.
+- A conclusão de necessidade permanece: com uma instância/processo observados
+  e sem evidência de writer externo concorrente, C3 distribuído fica fora do
+  caminho crítico e dormente. Não houve ativação C3, deploy ou operação real.
