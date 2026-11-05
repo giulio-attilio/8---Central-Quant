@@ -614,3 +614,10 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   ausência de Flask, tanto com Python isolado quanto normal. Nenhuma dependência
   foi instalada. Os resultados anteriores da suíte de segurança permanecem
   evidência histórica, mas não foram reproduzidos nesta sessão.
+- Complemento sintético sem Flask: a função de decisão foi extraída da AST
+  local de `main.py` e exercitada com a biblioteca padrão em WSL, sem rede,
+  segredos ou arquivos de estado. **5/5 casos passaram**: configuração ausente
+  falha fechada (503), senha errada (401), credenciais sintéticas válidas,
+  requisição cross-site (403) mesmo com credencial válida e origem malformada
+  (403). Isso testa somente a função de decisão; não substitui o teste de
+  integração Flask nem a validação do serviço Render ativo.
