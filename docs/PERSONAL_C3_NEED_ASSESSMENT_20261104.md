@@ -608,3 +608,9 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   limite mensal de pipeline de US$ 5 e banda em 14,05/25 GB. Isso confirma a
   franquia exibida no momento da captura, mas não prova que um deploy específico
   custará zero nem elimina possível cobrança; não houve mudança no Billing.
+- Revalidação local desta sessão: `python -I -m pytest -q
+  tests/test_personal_http_auth_gate_v1.py` não pôde iniciar no Windows porque o
+  `python.exe` disponível é um alias inacessível; no WSL, a coleta falhou por
+  ausência de Flask, tanto com Python isolado quanto normal. Nenhuma dependência
+  foi instalada. Os resultados anteriores da suíte de segurança permanecem
+  evidência histórica, mas não foram reproduzidos nesta sessão.
