@@ -721,3 +721,25 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   manual no serviço acima. Ele pode consumir minutos pagos se exceder a
   franquia; portanto continua suspenso até decisão financeira do usuário. O
   trabalho local e as validações offline não dependem dessa decisão.
+
+## Reexecução offline desta rodada — 2026-11-04 (23:04 BRT)
+
+- Antes de registrar os resultados, confirmei novamente branch
+  `codex/personal-readiness-release-20261104`, HEAD
+  `dda55746f45616adf1a78de8e4337ef8706e9a59` e estado limpo, exceto a branch
+  local um commit à frente do upstream. O commit `dda5574` contém somente este
+  relatório; nenhum arquivo de aplicação foi alterado.
+- No Python offline existente com `ccxt==4.5.88`, reexecutei
+  `tests/run_falcon_pilot_minimal_offline.py --personal-http-auth`: **239
+  passed em 117,27 s**, exit code 0.
+- Na mesma configuração, `tests/run_falcon_pilot_minimal_offline.py
+  --personal-execution-safety`: **402 passed em 849,66 s**, exit code 0.
+- O runner bloqueou sockets/rede/DNS, subprocessos e leitura de `.env`, definiu
+  os diretórios operacionais de dados para temporário e desativou o startup do
+  runtime. Essas execuções validam o código local; não exercitam a conta
+  BingX nem o serviço Render.
+- Uma tentativa GET sem credenciais a `/healthz` e `/` não chegou ao serviço:
+  o resolver deste ambiente retornou `No such host is known` para o domínio
+  Render. Portanto, não é evidência de resposta HTTP nem confirma ou refuta a
+  configuração de autenticação em produção. Nenhuma chamada com credenciais,
+  escrita externa, deploy, mudança de ambiente ou ordem foi feita.
