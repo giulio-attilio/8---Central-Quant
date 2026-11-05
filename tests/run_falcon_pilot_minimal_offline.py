@@ -231,6 +231,21 @@ if __name__ == "__main__":
             "test_disaster_stop_fallback_route_auth_v1.py",
             "test_auto_real_execution_bridge_route_auth_v1.py",
         )
+    elif sys.argv[1:] == ["--personal-lifecycle-completeness"]:
+        cases = (
+            "test_broker_entry_fill_stop_sizing_v1.py",
+            "test_broker_managed_entry_cancel_v1.py",
+            "test_broker_managed_close_timeout_semantics_v1.py",
+            "test_falcon_initial_stop_failure_containment_v1.py",
+            "test_falcon_disaster_stop_failure_forensics_v1.py",
+            "test_falcon_terminal_disaster_stop_emergency_recovery_v1.py",
+            "test_falcon_positions_read_fail_closed_v1.py",
+            "test_falcon_central_only_reconciliation.py",
+            "test_falcon_manual_close_outcome_reconciliation_v1.py",
+            "test_real_close_reconciliation_v11.py",
+            "test_real_trade_lifecycle_missing_from_bots_close_v1.py",
+            "test_live_position_reconciliation_risk_gate_v1.py",
+        )
     elif sys.argv[1:] == ["--personal-safety-no-ccxt"]:
         # Run the available personal-execution regressions when the offline
         # Python environment has no cached ccxt package. The two excluded
@@ -290,6 +305,8 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--persistence-locks"]:
         filters = []
     elif sys.argv[1:] == ["--personal-execution-safety"]:
+        filters = []
+    elif sys.argv[1:] == ["--personal-lifecycle-completeness"]:
         filters = []
     elif sys.argv[1:] == ["--personal-safety-no-ccxt"]:
         filters = []
