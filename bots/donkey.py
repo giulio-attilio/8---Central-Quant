@@ -1869,6 +1869,12 @@ def origem_msg_trade(p):
 # ====================================================
 
 def calcular_supertrend_df(df, period=10, multiplier=3.5):
+    if df.empty:
+        return (
+            pd.Series(index=df.index, dtype="float64"),
+            pd.Series(index=df.index, dtype="int64"),
+        )
+
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)
@@ -2255,6 +2261,10 @@ def analisar_sinal_h1(symbol):
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 2 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para análise H1 {nome_limpo(symbol)}"
+        return None, pd.DataFrame(), pd.DataFrame()
+
     df_h1 = pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"])
     df_h4 = pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"])
 
@@ -2375,6 +2385,10 @@ def detectar_early_a(symbol):
 
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 3 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para EARLY H1 {nome_limpo(symbol)}"
+        return None
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -2517,6 +2531,10 @@ def detectar_poi(symbol, posicao):
 
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 2 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para POI {nome_limpo(symbol)}"
+        return None
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -2677,6 +2695,10 @@ def detectar_reentry(symbol, posicao_fechada):
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 2 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para REENTRY {nome_limpo(symbol)}"
+        return None
+
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
 
@@ -2824,6 +2846,9 @@ def detectar_donkey_h4(symbol):
         return None
 
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    if not ohlcv_h4 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para DONKEY H4 {nome_limpo(symbol)}"
+        return None
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df_h4.iloc[-2]
 
@@ -2927,7 +2952,7 @@ def detectar_donkey_h4_original(symbol):
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
     ohlcv_d1 = safe_fetch_ohlcv(symbol, timeframe="1d", limit=120)
 
-    if not ohlcv_h4 or not ohlcv_d1:
+    if not ohlcv_h4 or not ohlcv_d1 or len(ohlcv_h4) < 2 or len(ohlcv_d1) < 2:
         return None
 
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -3046,6 +3071,9 @@ def detectar_early_donkey_h4(symbol):
         return None
 
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    if not ohlcv_h4 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para EARLY DONKEY H4 {nome_limpo(symbol)}"
+        return None
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df_h4.iloc[-2]
 
@@ -3243,6 +3271,9 @@ def detectar_poi_donkey_h4(symbol, posicao):
         return None
 
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=DONKEY_TIMEFRAME, limit=200)
+    if not ohlcv_h4 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para POI DONKEY H4 {nome_limpo(symbol)}"
+        return None
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df_h4.iloc[-2]
 

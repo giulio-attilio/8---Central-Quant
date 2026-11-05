@@ -1700,6 +1700,12 @@ def origem_msg_trade(p):
 # ====================================================
 
 def calcular_supertrend_df(df, period=10, multiplier=3.5):
+    if df.empty:
+        return (
+            pd.Series(index=df.index, dtype="float64"),
+            pd.Series(index=df.index, dtype="int64"),
+        )
+
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)
@@ -2373,6 +2379,10 @@ def detectar_poi(symbol, posicao):
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
 
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 2 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para POI {nome_limpo(symbol)}"
+        return None
+
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
 
@@ -2531,6 +2541,10 @@ def detectar_reentry(symbol, posicao_fechada):
 
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
+
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 2 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para REENTRY {nome_limpo(symbol)}"
+        return None
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
     df_h4 = preparar_df(pd.DataFrame(ohlcv_h4, columns=["time", "open", "high", "low", "close", "volume"]))
