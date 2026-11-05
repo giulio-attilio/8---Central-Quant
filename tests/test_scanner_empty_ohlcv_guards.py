@@ -155,3 +155,30 @@ def test_empty_ohlcv_survives_full_indicator_preparation(relative_path: str):
 
     assert prepared.empty
     assert len(prepared.columns) > len(frame.columns)
+
+
+@pytest.mark.parametrize("row_count", [0, 1])
+def test_donkey_chandelier_fails_closed_before_indexing_insufficient_ohlcv(row_count: int):
+    source = (ROOT / "bots/donkey.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="bots/donkey.py")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "calcular_chandelier"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    ohlcv = [[1, 2, 3, 1, 2, 10] for _ in range(row_count)]
+    health = {}
+    namespace = {
+        "safe_fetch_ohlcv": lambda *_args, **_kwargs: ohlcv,
+        "TIMEFRAME_H1": "1h",
+        "HEALTH": health,
+        "nome_limpo": lambda symbol: symbol,
+    }
+    exec(compile(module, "bots/donkey.py", "exec"), namespace)
+
+    with pytest.raises(ValueError, match="OHLCV_INSUFFICIENT_FOR_DONKEY_CHANDELIER"):
+        namespace["calcular_chandelier"]("TEST/USDT", "LONG")
+    assert "OHLCV insuficiente" in health["last_warning"]

@@ -4180,6 +4180,10 @@ def atualizar_posicao_com_poi(poi):
 
 def calcular_chandelier(symbol, side):
     ohlcv = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
+    if not ohlcv or len(ohlcv) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para stop móvel DONKEY {nome_limpo(symbol)}"
+        raise ValueError("OHLCV_INSUFFICIENT_FOR_DONKEY_CHANDELIER")
+
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     df["atr14"] = calcular_atr(df, ATR_LEN)
     df = marcar_spikes(df)
