@@ -580,3 +580,26 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   os demais módulos não fazem chamadas de rede. O primeiro agrupamento de
   módulos apresentou interferência pelo bloqueio global de subprocessos e não
   foi considerado aprovação; as execuções isoladas acima passaram.
+
+## Cobertura dos controles pessoais e estado de release — 2026-11-04
+
+- A seleção `--personal-execution-safety` do runner inclui preflight fail-closed,
+  contenção após falha do stop inicial, cancelamento/leitura de volta da entrada,
+  dimensionamento do stop por fill, leitura de posições, gates de risco, leitura
+  do stop na corretora, fechamento/reconciliação e autenticação das rotas de
+  execução. O resultado continua sendo simulado/local; não prova uma ordem ou
+  fill real da conta.
+- O commit `6d09b4f39baeb291864d0efb27b8acd53ba04064` está publicado em
+  `codex/personal-readiness-release-20261104` e a branch ligada ao serviço foi
+  avançada por fast-forward até o mesmo SHA. A comparação GitHub confirmou
+  igualdade das pontas, sem force-push.
+- Leitura Render posterior à atualização: o serviço ainda está configurado para
+  `codex/personal-readiness-20261103`, auto-deploy desligado, uma instância
+  Standard e o mesmo disco de 2 GB. O deploy live continua em
+  `598c4d4505c3aec6d4de9a6b762cc1576f604374`; nenhum deploy foi iniciado.
+- A ferramenta Render recusou o trigger manual: franquia de build disponível
+  não comprova exatamente custo zero futuro, exigindo decisão financeira antes
+  do deploy. O workspace mostrava 0/1.000 minutos incluídos e spend limit de
+  US$ 5/mês. Não alterei limite, plano, variáveis ou controles de trading. O
+  próximo passo externo depende somente de decisão do usuário sobre eventual
+  custo de pipeline.
