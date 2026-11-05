@@ -759,3 +759,18 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
 - A conclusão de necessidade permanece: com uma instância/processo observados
   e sem evidência de writer externo concorrente, C3 distribuído fica fora do
   caminho crítico e dormente. Não houve ativação C3, deploy ou operação real.
+
+## Verificação agregada de logs Render — 2026-11-04 (23:21 BRT)
+
+- Consulta somente de leitura no workspace/serviço confirmados, limitada aos
+  valores agregados de `statusCode` em logs `request` desde
+  `2026-11-04T00:00:00Z`, retornou `200` e `401` para o serviço. A consulta
+  filtrada para `/healthz` retornou somente `200`.
+- A consulta filtrada para status `401` e rota exata `/` não encontrou entradas
+  no período. Portanto os logs confirmam liveness HTTP, mas não demonstram que
+  a rota principal respondeu com desafio de autenticação. A busca direta via
+  este ambiente segue limitada por DNS; é necessária observação sem credenciais
+  por navegador ou um registro equivalente para fechar esse gate.
+- Foram consultados somente códigos agregados; não foram lidos corpos,
+  headers, variáveis de ambiente ou secrets. Nenhuma alteração externa foi
+  feita.
