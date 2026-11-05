@@ -603,3 +603,8 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   US$ 5/mês. Não alterei limite, plano, variáveis ou controles de trading. O
   próximo passo externo depende somente de decisão do usuário sobre eventual
   custo de pipeline.
+- Nova captura de Billing recebida em 2026-11-04: 0/1.000 minutos incluídos,
+  tarifa Starter de US$ 5 por 1.000 minutos (com os primeiros 1.000 incluídos),
+  limite mensal de pipeline de US$ 5 e banda em 14,05/25 GB. Isso confirma a
+  franquia exibida no momento da captura, mas não prova que um deploy específico
+  custará zero nem elimina possível cobrança; não houve mudança no Billing.
