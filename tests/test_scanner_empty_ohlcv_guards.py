@@ -182,3 +182,36 @@ def test_donkey_chandelier_fails_closed_before_indexing_insufficient_ohlcv(row_c
     with pytest.raises(ValueError, match="OHLCV_INSUFFICIENT_FOR_DONKEY_CHANDELIER"):
         namespace["calcular_chandelier"]("TEST/USDT", "LONG")
     assert "OHLCV insuficiente" in health["last_warning"]
+
+
+@pytest.mark.parametrize(
+    ("side", "expected"),
+    [("LONG", 172.0), ("SHORT", 126.0)],
+)
+def test_donkey_chandelier_keeps_valid_ohlcv_calculation(side: str, expected: float):
+    source = (ROOT / "bots/donkey.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="bots/donkey.py")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "calcular_chandelier"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    ohlcv = [
+        [i, 100.0 + i, 100.0 + i, 80.0 + i, 90.0 + i, 10.0]
+        for i in range(80)
+    ]
+    namespace = {
+        "safe_fetch_ohlcv": lambda *_args, **_kwargs: ohlcv,
+        "TIMEFRAME_H1": "1h",
+        "ATR_LEN": 14,
+        "TRAIL_ATR_MULT": 3.0,
+        "pd": pd,
+        "calcular_atr": lambda frame, _period: pd.Series(2.0, index=frame.index),
+        "marcar_spikes": lambda frame: frame,
+    }
+    exec(compile(module, "bots/donkey.py", "exec"), namespace)
+
+    assert namespace["calcular_chandelier"]("TEST/USDT", side) == expected
