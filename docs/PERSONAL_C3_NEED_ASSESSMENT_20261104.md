@@ -621,3 +621,8 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   requisição cross-site (403) mesmo com credencial válida e origem malformada
   (403). Isso testa somente a função de decisão; não substitui o teste de
   integração Flask nem a validação do serviço Render ativo.
+- Reexecução no WSL da seleção `--c3-dormant-startup` do runner offline:
+  **24 passed, 3 subtests passed em 62,96 s**. O runner bloqueia chamadas de
+  rede e subprocessos externos e usa diretório temporário; confirma os
+  contratos locais de startup C3 dormente, não a necessidade do C3 distribuído
+  nem a integração/durabilidade do Render.
