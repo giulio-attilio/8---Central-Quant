@@ -728,6 +728,12 @@ def calcular_rsi(series, period=14):
     return (100 - (100 / (1 + rs))).fillna(50)
 
 def calcular_supertrend_df(df, period=10, multiplier=3.0):
+    if df.empty:
+        return (
+            pd.Series(index=df.index, dtype="float64"),
+            pd.Series(index=df.index, dtype="int64"),
+        )
+
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)
@@ -939,7 +945,8 @@ def detectar_cobra(symbol):
     ohlcv_h1 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=300)
     ohlcv_h4 = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H4, limit=300)
     
-    if not ohlcv_h1 or not ohlcv_h4:
+    if not ohlcv_h1 or not ohlcv_h4 or len(ohlcv_h1) < 3 or len(ohlcv_h4) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para análise COBRA {nome_limpo(symbol)}"
         return None
 
     df_h1 = preparar_df(pd.DataFrame(ohlcv_h1, columns=["time", "open", "high", "low", "close", "volume"]))
@@ -1383,8 +1390,9 @@ def atualizar_mfe_mae(p, preco_atual):
 def calcular_chandelier_stop(symbol, side):
     # USO DA FUNÇÃO SEGURA
     ohlcv = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=120)
-    if not ohlcv:
-        return None # Retorna None se falhar
+    if not ohlcv or len(ohlcv) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para stop móvel COBRA {nome_limpo(symbol)}"
+        return None
 
     df = preparar_df(pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"]))
     candle = df.iloc[-2]

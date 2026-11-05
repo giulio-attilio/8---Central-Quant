@@ -27,6 +27,7 @@ SCANNERS = [
     ("bots/donkey.py", "detectar_donkey_h4_original"),
     ("bots/donkey.py", "detectar_early_donkey_h4"),
     ("bots/donkey.py", "detectar_poi_donkey_h4"),
+    ("bots/cobra.py", "detectar_cobra"),
 ]
 
 
@@ -88,7 +89,21 @@ def test_scanner_returns_before_dataframe_for_empty_or_single_candle(
     )
 
 
-@pytest.mark.parametrize("relative_path", ["bots/trendpro.py", "bots/meme.py", "bots/donkey.py"])
+def test_cobra_detector_rejects_two_h1_candles_before_dataframe():
+    guards = _data_guards_before_dataframe("bots/cobra.py", "detectar_cobra")
+    local_values = {"ohlcv_h1": [[1, 2, 3, 4, 5, 6]] * 2, "ohlcv_h4": [[1, 2, 3, 4, 5, 6]] * 2}
+
+    assert any(
+        eval(
+            compile(ast.Expression(guard), "bots/cobra.py", "eval"),
+            {"__builtins__": {"len": len}},
+            local_values,
+        )
+        for guard in guards
+    )
+
+
+@pytest.mark.parametrize("relative_path", ["bots/trendpro.py", "bots/meme.py", "bots/donkey.py", "bots/cobra.py"])
 def test_supertrend_handles_empty_dataframe_without_iloc_growth(relative_path: str):
     tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
     function = next(
@@ -215,3 +230,29 @@ def test_donkey_chandelier_keeps_valid_ohlcv_calculation(side: str, expected: fl
     exec(compile(module, "bots/donkey.py", "exec"), namespace)
 
     assert namespace["calcular_chandelier"]("TEST/USDT", side) == expected
+
+
+@pytest.mark.parametrize("row_count", [0, 1])
+def test_cobra_chandelier_skips_insufficient_ohlcv(row_count: int):
+    source = (ROOT / "bots/cobra.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="bots/cobra.py")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "calcular_chandelier_stop"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    ohlcv = [[1, 2, 3, 1, 2, 10] for _ in range(row_count)]
+    health = {}
+    namespace = {
+        "safe_fetch_ohlcv": lambda *_args, **_kwargs: ohlcv,
+        "TIMEFRAME_H1": "1h",
+        "HEALTH": health,
+        "nome_limpo": lambda symbol: symbol,
+    }
+    exec(compile(module, "bots/cobra.py", "exec"), namespace)
+
+    assert namespace["calcular_chandelier_stop"]("TEST/USDT", "LONG") is None
+    assert "OHLCV insuficiente" in health["last_warning"]
