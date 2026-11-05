@@ -3832,6 +3832,10 @@ def atualizar_posicao_com_poi(poi):
 
 def calcular_chandelier(symbol, side):
     ohlcv = safe_fetch_ohlcv(symbol, timeframe=TIMEFRAME_H1, limit=80)
+    if not ohlcv or len(ohlcv) < 2:
+        HEALTH["last_warning"] = f"OHLCV insuficiente para stop móvel Trend PRO {nome_limpo(symbol)}"
+        return None
+
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     df["atr14"] = calcular_atr(df, ATR_LEN)
     df = marcar_spikes(df)
@@ -3852,6 +3856,15 @@ def calcular_chandelier(symbol, side):
 
     lowest_low = float(ultimos["low"].min())
     return lowest_low + atr * TRAIL_ATR_MULT
+
+
+def compor_stop_be_trailing(side, stop_atual, stop_be, stop_trailing):
+    candidatos = [float(stop_atual), float(stop_be)]
+    if stop_trailing is not None:
+        candidatos.append(float(stop_trailing))
+    if side == "LONG":
+        return max(candidatos)
+    return min(candidatos)
 
 
 def stop_em_carencia(p):
@@ -4160,7 +4173,9 @@ def gerenciar_posicoes():
                     if preco_atual >= be_trigger_price:
                         novo_stop_be = entry * (1 + BE_OFFSET_PCT / 100)
                         novo_stop_trail = calcular_chandelier(symbol, side)
-                        novo_stop = max(float(p["sl"]), novo_stop_be, novo_stop_trail)
+                        novo_stop = compor_stop_be_trailing(
+                            side, p["sl"], novo_stop_be, novo_stop_trail
+                        )
 
                         p["sl"] = novo_stop
                         p["breakeven"] = True
@@ -4213,7 +4228,9 @@ def gerenciar_posicoes():
                     if preco_atual <= be_trigger_price:
                         novo_stop_be = entry * (1 - BE_OFFSET_PCT / 100)
                         novo_stop_trail = calcular_chandelier(symbol, side)
-                        novo_stop = min(float(p["sl"]), novo_stop_be, novo_stop_trail)
+                        novo_stop = compor_stop_be_trailing(
+                            side, p["sl"], novo_stop_be, novo_stop_trail
+                        )
 
                         p["sl"] = novo_stop
                         p["breakeven"] = True
@@ -4243,6 +4260,8 @@ def gerenciar_posicoes():
             # Trailing somente após ativar BE em 1,5R.
             if p.get("tp50_hit") and p.get("breakeven"):
                 novo_stop = calcular_chandelier(symbol, side)
+                if novo_stop is None:
+                    continue
 
                 if side == "LONG" and novo_stop > float(p["sl"]):
                     if p.get("last_trailing_message_stop") == novo_stop:

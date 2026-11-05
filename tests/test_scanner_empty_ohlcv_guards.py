@@ -103,6 +103,42 @@ def test_cobra_detector_rejects_two_h1_candles_before_dataframe():
     )
 
 
+@pytest.mark.parametrize(
+    ("h1_count", "h4_count"),
+    [(0, 300), (1, 300), (2, 300), (300, 0), (300, 1)],
+)
+def test_cobra_detector_returns_without_preparing_insufficient_ohlcv(
+    h1_count: int, h4_count: int
+):
+    source = (ROOT / "bots/cobra.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="bots/cobra.py")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "detectar_cobra"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    h1 = [[1, 2, 3, 4, 5, 6] for _ in range(h1_count)]
+    h4 = [[1, 2, 3, 4, 5, 6] for _ in range(h4_count)]
+    health = {}
+    namespace = {
+        "existe_posicao_ativa": lambda _symbol: False,
+        "safe_fetch_ohlcv": lambda _symbol, timeframe, **_kwargs: (
+            h1 if timeframe == "1h" else h4
+        ),
+        "TIMEFRAME_H1": "1h",
+        "TIMEFRAME_H4": "4h",
+        "HEALTH": health,
+        "nome_limpo": lambda symbol: symbol,
+    }
+    exec(compile(module, "bots/cobra.py", "exec"), namespace)
+
+    assert namespace["detectar_cobra"]("TEST/USDT") is None
+    assert "OHLCV insuficiente" in health["last_warning"]
+
+
 @pytest.mark.parametrize("relative_path", ["bots/trendpro.py", "bots/meme.py", "bots/donkey.py", "bots/cobra.py"])
 def test_supertrend_handles_empty_dataframe_without_iloc_growth(relative_path: str):
     tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
@@ -256,3 +292,65 @@ def test_cobra_chandelier_skips_insufficient_ohlcv(row_count: int):
 
     assert namespace["calcular_chandelier_stop"]("TEST/USDT", "LONG") is None
     assert "OHLCV insuficiente" in health["last_warning"]
+
+
+@pytest.mark.parametrize("row_count", [0, 1])
+def test_trendpro_chandelier_skips_insufficient_ohlcv(row_count: int):
+    source = (ROOT / "bots/trendpro.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="bots/trendpro.py")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "calcular_chandelier"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    ohlcv = [[1, 2, 3, 1, 2, 10] for _ in range(row_count)]
+    health = {}
+    namespace = {
+        "safe_fetch_ohlcv": lambda *_args, **_kwargs: ohlcv,
+        "TIMEFRAME_H1": "1h",
+        "HEALTH": health,
+        "nome_limpo": lambda symbol: symbol,
+    }
+    exec(compile(module, "bots/trendpro.py", "exec"), namespace)
+
+    assert namespace["calcular_chandelier"]("TEST/USDT", "LONG") is None
+    assert "OHLCV insuficiente" in health["last_warning"]
+
+
+@pytest.mark.parametrize(
+    ("side", "stop_atual", "stop_be", "stop_trailing", "expected"),
+    [
+        ("LONG", 95.0, 101.0, None, 101.0),
+        ("SHORT", 105.0, 99.0, None, 99.0),
+        ("LONG", 95.0, 101.0, 103.0, 103.0),
+        ("SHORT", 105.0, 99.0, 97.0, 97.0),
+        ("LONG", 95.0, 101.0, 98.0, 101.0),
+        ("SHORT", 105.0, 99.0, 102.0, 99.0),
+    ],
+)
+def test_trendpro_be_stop_remains_monotonic_without_trailing_data(
+    side: str,
+    stop_atual: float,
+    stop_be: float,
+    stop_trailing: float | None,
+    expected: float,
+):
+    source = (ROOT / "bots/trendpro.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="bots/trendpro.py")
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "compor_stop_be_trailing"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {}
+    exec(compile(module, "bots/trendpro.py", "exec"), namespace)
+
+    assert namespace["compor_stop_be_trailing"](
+        side, stop_atual, stop_be, stop_trailing
+    ) == expected
