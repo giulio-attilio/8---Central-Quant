@@ -626,3 +626,98 @@ migrar/bootstrap o Registry e não reescrever dados históricos em massa.
   rede e subprocessos externos e usa diretório temporário; confirma os
   contratos locais de startup C3 dormente, não a necessidade do C3 distribuído
   nem a integração/durabilidade do Render.
+
+## Revalidação de autenticação pessoal — 2026-11-04
+
+- Antes do registro: branch `codex/personal-readiness-release-20261104`, HEAD
+  `e8117946e49c70b59774e4a63eff4bbeb30e9165`, worktree limpa e sincronizada.
+- Reexecutei `--personal-http-auth` contra esta worktree usando o Python
+  virtual offline já existente no checkout principal; nenhuma dependência foi
+  instalada. O primeiro intento terminou com **236 passed e 3 failed** porque
+  a importação de `ccxt` tentou executar `git` para obter metadados do pacote,
+  chamada corretamente bloqueada pela barreira de subprocessos do runner.
+- Repeti sem relaxar as barreiras: pré-carreguei somente em memória o metadado
+  neutro de versão do módulo Versioneer de toolz/CCXT e executei o runner em
+  modo isolado. Resultado: **239 passed em 263,05 s**, código de saída 0. A
+  seleção inclui o gate HTTP pessoal e regressões adjacentes de reconciliação e
+  fechamento; a execução bloqueou rede/DNS, subprocessos externos e leitura de
+  `.env`, permitindo apenas os sockets locais exigidos pelos testes Flask e
+  usando diretórios temporários. A repetição não alterou o pacote nem arquivos
+  do projeto; não é evidência de integração ou comportamento do serviço Render.
+- As capturas de Billing enviadas em 2026-11-04 exibem 0/1.000 minutos de
+  pipeline incluídos usados, 1.000 minutos incluídos, limite mensal de US$ 5 e
+  14,05/25 GB de banda. Isso não comprova custo incremental zero para um
+  deploy específico. Não alterei billing, serviço, variáveis ou trading e não
+  iniciei deploy.
+
+## Revalidação de controles de execução e release — 2026-11-04
+
+- Antes da análise: branch `codex/personal-readiness-release-20261104`, HEAD
+  `e8117946e49c70b59774e4a63eff4bbeb30e9165`; o único arquivo local modificado
+  era este relatório. Nenhum código de runtime foi editado nesta rodada.
+- Reexecutei a seleção offline `--personal-execution-safety` contra o código
+  atual. O primeiro intento usou o Python do checkout principal, que contém
+  `ccxt==4.5.62`, e terminou com **400 passed, 2 failed em 1.930,84 s**; os
+  dois testes falharam somente na assertion que exige `ccxt==4.5.88`. Encontrei
+  depois o ambiente offline existente
+  `C:\Users\giuli\Documents\Codex\2026-10-17\feito\.offline-envs\cq-ccxt-4.5.88\Scripts\python.exe`,
+  confirmei a versão instalada e repeti a seleção sem instalar ou baixar
+  dependências: **402 passed em 1.359,40 s**, código de saída 0. O resultado
+  verde é da repetição com a dependência exigida; o resultado inicial fica
+  registrado para explicar a incompatibilidade do primeiro interpretador.
+- A versão neutra Versioneer foi pré-carregada somente em memória para impedir
+  que a importação do CCXT tentasse iniciar `git`; o runner continuou bloqueando
+  rede/DNS, subprocessos externos e leitura de `.env`, com dados em temporário.
+  Essa solução trata apenas o metadado Versioneer de toolz e não mascara
+  `ccxt.__version__` (confirmado como 4.5.88 no ambiente repetido).
+- Releitura Render: serviço `srv-d8rtuv9o3t8c73ehav5g` segue a branch
+  `codex/personal-readiness-20261103` (`autoDeploy=no`); o deploy `dep-dbl0g5rncjis73fhe8dg`
+  continua em `live` no commit `598c4d4505c3aec6d4de9a6b762cc1576f604374`.
+  A leitura GitHub confirmou que a branch configurada está em
+  `6d09b4f39baeb291864d0efb27b8acd53ba04064`. Comparação local: esta worktree
+  está 5 commits à frente e 0 atrás dessa branch; o único arquivo diferente é
+  este relatório, logo o código de aplicação local coincide com o da branch
+  configurada, não com o commit de deploy ativo.
+- Inspecionei somente o código-fonte versionado do commit implantado
+  `598c4d4`: ele já contém um `before_request` com autenticação Basic global e
+  a exceção pública limitada ao `GET /healthz` sem query. Isso comprova a
+  presença do gate no código desse commit, mas não comprova que as variáveis de
+  autenticação em produção estejam presentes/corretas; não li valores de
+  variáveis nem secrets. A branch configurada contém o código validado mais
+  recente, mas continua sem deploy.
+- O GitHub Desktop exigiu desbloqueio do Windows por PIN, e o Git no terminal
+  não conseguiu criar o `index.lock` da worktree. Não forcei permissão nem
+  contornei o bloqueio. Este relatório permanece como a única alteração local
+  não commitada; o próximo passo de publicação depende de desbloqueio manual.
+- Nenhuma configuração do Render/AWS/produção foi alterada, nenhum deploy ou
+  ordem foi iniciado e os controles PAPER/DRY_RUN permaneceram intocados.
+
+## Rechecagem de publicação e produção — 2026-11-04 (22:38 BRT)
+
+- Revalidei o checkout antes de continuar: branch
+  `codex/personal-readiness-release-20261104`, HEAD
+  `e8117946e49c70b59774e4a63eff4bbeb30e9165`, sincronizado com seu upstream; a
+  única alteração local é este relatório. `git diff --check` não apontou erro
+  de whitespace (apenas o aviso normal de conversão LF/CRLF do Windows).
+- O conector Render, em consulta somente de leitura ao workspace confirmado e
+  serviço `srv-d8rtuv9o3t8c73ehav5g`, confirmou novamente a branch
+  `codex/personal-readiness-20261103`, `autoDeploy=no`, uma instância Standard,
+  disco `/data` de 2 GB e região Oregon. O deploy mais recente continua
+  `dep-dbl0g5rncjis73fhe8dg`, estado `live`, commit
+  `598c4d4505c3aec6d4de9a6b762cc1576f604374`; não houve deploy novo.
+- Comparação somente de leitura no GitHub confirmou que o HEAD remoto da branch
+  candidata `e8117946e49c70b59774e4a63eff4bbeb30e9165` está cinco commits à
+  frente e nenhum atrás da ponta `6d09b4f39baeb291864d0efb27b8acd53ba04064`
+  usada pela branch configurada no Render. A única diferença de arquivo é
+  este relatório. Assim, o código validado permanece publicado na branch que o
+  serviço acompanha, mas o release ativo ainda é anterior e não contém essas
+  correções.
+- As capturas atuais de Billing continuam mostrando 0/1.000 minutos incluídos,
+  banda 14,05/25 GB e limite de gasto do pipeline de US$ 5/mês; a configuração
+  Starter exibe US$ 5/1.000 minutos e 1.000 minutos incluídos. Isso não permite
+  provar custo incremental zero de um deploy específico. Não alterei cobrança,
+  serviço, variáveis, AWS ou controles de trading, nem iniciei deploy.
+- O único próximo passo externo que promoveria o código ao release é um deploy
+  manual no serviço acima. Ele pode consumir minutos pagos se exceder a
+  franquia; portanto continua suspenso até decisão financeira do usuário. O
+  trabalho local e as validações offline não dependem dessa decisão.
