@@ -21,7 +21,12 @@ import time
 import threading
 import requests
 from personal_http_auth import central_personal_http_auth
-from runtime_drain_v1 import RUNTIME_DRAIN, guard_live_flow, runtime_drain_blocked_result
+from runtime_drain_v1 import (
+    RUNTIME_DRAIN,
+    guard_live_flow,
+    guard_management_cycle,
+    runtime_drain_blocked_result,
+)
 import numpy as np
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
@@ -3067,6 +3072,7 @@ def encerrar_posicao(symbol, p, preco_saida, motivo):
         safe_send_telegram(close_message)
 
 
+@guard_management_cycle(RUNTIME_DRAIN)
 def gerenciar_posicoes():
     posicoes = carregar_posicoes()
     alterou = False

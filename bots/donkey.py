@@ -54,6 +54,7 @@ from personal_http_auth import central_personal_http_auth
 from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
+from runtime_drain_v1 import RUNTIME_DRAIN, guard_management_cycle
 from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
@@ -3473,6 +3474,7 @@ def enviar_saida_ema20_donkey(p, exit_price, resultado_total):
 
 
 
+@guard_management_cycle(RUNTIME_DRAIN)
 def gerenciar_donkey_position(symbol, p, preco_atual):
     """
     Gestão Donkey H4 - modelo parcial 50% + EMA20.
@@ -4283,6 +4285,7 @@ def atualizar_monitor_be():
         salvar_monitor_be(monitores)
 
 
+@guard_management_cycle(RUNTIME_DRAIN)
 def gerenciar_posicoes():
     posicoes = carregar_posicoes()
     alterou = False

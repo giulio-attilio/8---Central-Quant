@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import threading
 import time
+from pathlib import Path
 
 from runtime_drain_v1 import (
     RuntimeDrainState,
+    guard_management_cycle,
     close_after_drain,
     guard_live_flow,
     guard_new_live_entries,
@@ -36,6 +39,139 @@ def test_management_cycle_is_admitted_before_drain_and_shutdown_waits_for_it():
     state.leave_management_cycle()
     assert state.wait_for_shutdown_work(0)
     assert state.active_management_cycles() == 0
+
+
+def test_management_decorator_tracks_active_work_and_denies_after_drain():
+    state = RuntimeDrainState()
+
+    @guard_management_cycle(state)
+    def manage(value):
+        assert state.active_management_cycles() == 1
+        return value
+
+    assert manage("done") == "done"
+    assert state.active_management_cycles() == 0
+    state.begin_draining()
+    assert manage("must-not-run") is None
+    assert state.active_management_cycles() == 0
+
+
+def test_admitted_management_can_finish_nested_work_after_drain_begins():
+    state = RuntimeDrainState()
+
+    @guard_management_cycle(state)
+    def nested_management():
+        assert state.is_draining()
+        assert state.active_management_cycles() == 1
+        return "nested-finished"
+
+    @guard_management_cycle(state)
+    def outer_management():
+        state.begin_draining()
+        return nested_management()
+
+    assert outer_management() == "nested-finished"
+    assert state.active_management_cycles() == 0
+    assert nested_management() is None
+
+
+def test_turtle_management_loop_tracks_cycle_and_exits_after_drain():
+    source_path = Path(__file__).resolve().parents[1] / "bots" / "turtle.py"
+    module = ast.parse(source_path.read_text(encoding="utf-8"))
+    functions = [
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "management_loop"
+    ]
+    function = functions[-1]
+    loop = next(node for node in function.body if isinstance(node, ast.While))
+
+    def calls(node, method):
+        return [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == method
+        ]
+
+    admission_if = loop.body[0]
+    assert isinstance(admission_if, ast.If)
+    assert calls(admission_if, "try_enter_management_cycle")
+
+    guarded_try = next(node for node in loop.body if isinstance(node, ast.Try))
+    assert calls(guarded_try, "leave_management_cycle")
+    assert calls(guarded_try.finalbody[0], "leave_management_cycle")
+
+    drain_if = next(
+        node
+        for node in loop.body[loop.body.index(guarded_try) + 1 :]
+        if isinstance(node, ast.If)
+    )
+    assert calls(drain_if, "is_draining")
+    assert any(isinstance(node, ast.Return) for node in drain_if.body)
+
+
+def test_falcon_management_loop_tracks_cycle_and_exits_after_drain():
+    source_path = Path(__file__).resolve().parents[1] / "bots" / "falcon.py"
+    module = ast.parse(source_path.read_text(encoding="utf-8"))
+    functions = [
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "management_loop"
+    ]
+    function = functions[-1]
+    loop = next(node for node in function.body if isinstance(node, ast.While))
+
+    def calls(node, method):
+        return [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == method
+        ]
+
+    admission_if = loop.body[0]
+    assert isinstance(admission_if, ast.If)
+    assert calls(admission_if, "try_enter_management_cycle")
+
+    guarded_try = next(node for node in loop.body if isinstance(node, ast.Try))
+    assert calls(guarded_try.finalbody[0], "leave_management_cycle")
+
+    drain_if = next(
+        node
+        for node in loop.body[loop.body.index(guarded_try) + 1 :]
+        if isinstance(node, ast.If)
+    )
+    assert calls(drain_if, "is_draining")
+    assert any(isinstance(node, ast.Return) for node in drain_if.body)
+
+
+def test_position_managers_use_the_shared_shutdown_drain():
+    expected = {
+        "cobra.py": {"gerenciar_posicoes"},
+        "donkey.py": {"gerenciar_donkey_position", "gerenciar_posicoes"},
+        "meme.py": {"atualizar_monitor_be", "gerenciar_posicoes"},
+        "predator.py": {"gerenciar_posicoes"},
+        "trendpro.py": {"atualizar_monitor_be", "gerenciar_posicoes"},
+    }
+    bots_dir = Path(__file__).resolve().parents[1] / "bots"
+    for filename, function_names in expected.items():
+        module = ast.parse((bots_dir / filename).read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        for name in function_names:
+            function = functions[name]
+            assert any(
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Name)
+                and decorator.func.id == "guard_management_cycle"
+                for decorator in function.decorator_list
+            ), f"{filename}:{name} is not tracked by runtime drain"
 
 
 def test_shutdown_waits_for_entry_and_management_work_together():

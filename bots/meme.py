@@ -53,6 +53,7 @@ from personal_http_auth import central_personal_http_auth
 from telegram_notification_policy import send_automatic_telegram
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
+from runtime_drain_v1 import RUNTIME_DRAIN, guard_management_cycle
 from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
@@ -3234,6 +3235,7 @@ def adicionar_monitor_be(p, entry, exit_price):
     salvar_monitor_be(monitores)
 
 
+@guard_management_cycle(RUNTIME_DRAIN)
 def atualizar_monitor_be():
     monitores = carregar_monitor_be()
 
@@ -3299,6 +3301,7 @@ def atualizar_mfe_mae_posicao(p, preco_atual):
         print("ERRO MFE/MAE MEME:", e)
     return p
 
+@guard_management_cycle(RUNTIME_DRAIN)
 def gerenciar_posicoes():
     posicoes = carregar_posicoes()
     alterou = False

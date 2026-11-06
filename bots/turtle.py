@@ -94,6 +94,7 @@ from registry_v2_paper_runtime_adapter import (
     REGISTRY_V2_PAPER_WRITE_ENABLED,
     get_registry_v2_paper_runtime_adapter,
 )
+from runtime_drain_v1 import RUNTIME_DRAIN
 
 app = Flask(__name__)
 
@@ -2009,6 +2010,8 @@ def notify_tp50_transition(pos, price):
 
 def management_loop():
     while True:
+        if not RUNTIME_DRAIN.try_enter_management_cycle():
+            return
         try:
             positions = get_positions()
             changed = False
@@ -2158,7 +2161,11 @@ def management_loop():
         except Exception as exc:
             HEALTH["last_error"] = f"management: {exc}"
             traceback.print_exc()
+        finally:
+            RUNTIME_DRAIN.leave_management_cycle()
 
+        if RUNTIME_DRAIN.is_draining():
+            return
         time.sleep(MANAGEMENT_SLEEP_SECONDS)
 
 # ==============================================================================

@@ -14,6 +14,7 @@ import requests
 from personal_http_auth import central_personal_http_auth
 import pandas as pd
 from exchange_manager import get_exchange, load_markets_once
+from runtime_drain_v1 import RUNTIME_DRAIN, guard_management_cycle
 from exchange_throttle_policy_v1 import is_exchange_throttle_error
 from ccxt.base.errors import NetworkError, RateLimitExceeded, ExchangeError
 from datetime import datetime, timezone, timedelta
@@ -1457,6 +1458,7 @@ def fechar_posicao(symbol, p, price, reason):
 
     enviar_fechamento(p, price, reason, pnl)
 
+@guard_management_cycle(RUNTIME_DRAIN)
 def gerenciar_posicoes():
     HEALTH["last_management_run"] = data_hora_sp_str()
     posicoes = carregar_posicoes()

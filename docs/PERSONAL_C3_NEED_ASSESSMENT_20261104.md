@@ -3184,3 +3184,594 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   scanners deste processo: a quota é por IP e pode haver outros consumidores,
   além de limites agregados/cooldowns. É necessária observação após release do
   candidato para avaliar o efeito, sem prometer eliminação total do erro.
+- Nova auditoria estática do checkout encontrou `fetch_ohlcv` nos sete bots
+  (`cobra`, `donkey`, `falcon`, `meme`, `predator`, `trendpro`, `turtle`); todos
+  importam `get_exchange` de `exchange_manager` e inicializam `exchange` por
+  essa fábrica. O único outro construtor `ccxt.bingx` encontrado está em
+  `broker.py`, sem chamada `fetch_ohlcv` no código examinado. A suíte também
+  contém uma verificação AST para os sete bots. Isso sustenta que o guard
+  envolve todos os caminhos OHLCV atualmente encontrados neste checkout, mas
+  não prova ausência de outro processo ou consumidor externo no mesmo IP.
+
+## Verificação read-only de configuração e liveness no Render — 2026-11-05
+
+- `get_service` confirmou serviço `central-robos-bingx`, branch conectada
+  `codex/personal-readiness-20261103`, auto-deploy desligado, uma instância,
+  plano Standard, disco persistente de 2 GB em `/data`, allowlist pública
+  `0.0.0.0/0` e nenhum `healthCheckPath` configurado no Render. Não consultei
+  variáveis de ambiente.
+- O deployment `dep-dbmf7futlv9c7387dqp0` segue `live` no commit `7939678`.
+  Logs de aplicação mostram `GET /healthz` respondendo 200 em intervalos de
+  aproximadamente cinco minutos; o mais recente consultado foi
+  `2026-11-06T01:45:07Z` (22:45 BRT em 5/nov). Isso comprova apenas liveness
+  HTTP: na mesma instância os erros de OHLCV `100410` continuaram após o deploy.
+- A consulta HTTP direta pela ferramenta web não ficou acessível; usei o status
+  do deployment e os logs read-only do Render, sem alterar serviço ou chamar
+  rotas autenticadas.
+
+## Confirmação do deploy 7939678 e monitoramento posterior — 2026-11-05 22:49 -03
+
+- A captura enviada e a consulta read-only ao deployment confirmam o commit
+  `793967849cd6139aa35820164759a5bd5dd82c6b` (`7939678`) como `live`; o
+  deployment terminou às `2026-11-05T21:24:20Z`. Isso confirma publicação,
+  não prontidão de trading.
+- A busca read-only mais recente por `100410` retornou ocorrências até
+  `2026-11-06T01:49:17Z` (22:49 BRT em 5/nov), inclusive em chamadas de
+  scanners e OHLCV. A paginação ainda indica mais resultados. O sintoma de
+  limitação continua no release ativo; isso não identifica por si só todos os
+  consumidores do IP nem prova a causa exata.
+- O release `7939678` antecede e não contém o candidato local
+  `341bf05` (limitador/cache OHLCV). Portanto, esses registros não são uma
+  avaliação pós-deploy do candidato.
+- Auditoria dos callsites confirmou que Turtle e Falcon chamam
+  `analyze_symbol_setup` com `closed`, imediatamente derivado de
+  `closed_candles(df)`; os leitores de última linha nessas funções recebem,
+  portanto, apenas candles fechados no caminho examinado.
+- Estado local revalidado antes deste registro: branch
+  `codex/personal-readiness-release-20261104`, HEAD `5afe35c`, três commits
+  locais à frente da branch remota e apenas este relatório modificado. O
+  candidato continua sem push/deploy; nenhuma configuração AWS/Render ou
+  controle de trading foi alterado.
+- A leitura da API GitHub confirmou que a ponta remota continua em `7939678`
+  e que a branch não está protegida. A atualização da ref pelo conector falhou
+  porque os objetos dos commits locais ainda não existem no remoto; `git push`
+  falhou ao iniciar o SSH local com `NtCreateDirectoryObject: 0xC0000022`.
+  Nenhuma escrita no GitHub ocorreu. Não tentei contornar o bloqueio usando
+  gravações diretas de arquivos pela API.
+
+## Reauditoria local da autenticação HTTP — 2026-11-05 23:01 -03
+
+- O Render continua configurado com `python main.py`, uma instância e auto-
+  deploy desligado. A branch do serviço é diferente da branch candidata; a
+  publicação da candidata não dispara deploy automático. Não consultei valores
+  nem nomes de variáveis de ambiente nesta verificação.
+- A mesma `main.py` e `personal_http_auth.py` estão no commit ativo `7939678` e
+  no HEAD local. Um `before_request` global protege rotas conhecidas, aliases e
+  caminhos desconhecidos com Basic Auth; só `GET /healthz` sem query é
+  exceção, retornando estado mínimo de liveness. O teste global também rejeita
+  origem cross-site e um segundo gate bloqueia intenções de mutação por GET.
+- Executei os testes locais
+  `tests/test_personal_http_auth_gate_v1.py`,
+  `tests/test_auto_real_execution_bridge_route_auth_v1.py` e
+  `tests/test_disaster_stop_fallback_route_auth_v1.py` com plugin autoload
+  desativado e raiz do repo em `PYTHONPATH`: **185 passed em 256,28 s**. Uma
+  coleta inicial falhou porque faltava `PYTHONPATH`; a execução configurada
+  passou. Não foram feitas chamadas à produção nem leituras de secrets.
+- Captura e logs do Render mostram requisição anônima ao caminho raiz recusada
+  com `401`, compatível com autenticação ativa; `/healthz` respondeu `200`.
+  Isso e os testes não verificam uma sessão autenticada real. Não há mudança de
+  código de autenticação necessária demonstrada nesta etapa.
+- A tentativa de `git push` no terminal falhou antes da autenticação com
+  `NtCreateDirectoryObject: 0xC0000022`, e o conector GitHub não tinha os
+  objetos locais para avançar a ref. Em seguida, publiquei pelo GitHub Desktop
+  os três commits já validados na branch `codex/personal-readiness-release-20261104`.
+  A API GitHub confirmou a ponta remota em `5afe35c`; o status local agora não
+  mostra commits à frente. O relatório modificado permaneceu fora do push e
+  continua preservado como alteração local. Nenhum deploy foi disparado.
+
+## Continuação: confirmação do deploy e regressão offline do candidato — 2026-11-06
+
+- Revalidei o checkout antes de testar: branch
+  `codex/personal-readiness-release-20261104`, HEAD local e remoto
+  `5afe35c3b694236aece8f3d1a0df1794026c009d`; a única alteração local era este
+  relatório. O deploy Render `dep-dbmf7futlv9c7387dqp0` segue `live` no SHA
+  `793967849cd6139aa35820164759a5bd5dd82c6b` (`7939678`), confirmação também
+  visível na captura do usuário. Esse SHA não inclui o candidato `341bf05`.
+- Reexecutei as suítes de limitador/cache OHLCV, adiamento de M15 do Predator e
+  guards para OHLCV vazia: **88 passed em 15,60 s**. A execução bloqueou
+  conexões e resolução DNS, subprocessos, `urllib` e leitura de arquivos `.env`,
+  desativou o auto-start e usou persistência temporária. Uma primeira coleta
+  foi interrompida porque o bloqueio de subprocessos interceptou uma consulta
+  local de versão do Windows; o harness foi ajustado para resolver essa
+  informação antes do bloqueio e então a suíte passou. Não houve acesso a
+  serviços externos nem trading.
+- O branch remoto já contém o candidato, mas o Render está conectado a outro
+  branch e tem auto-deploy desligado. Portanto, publicar no GitHub não atualiza
+  este serviço. Não iniciei novo deploy: não consegui confirmar a franquia de
+  build atual por API, e a tentativa de leitura da tela Billing no navegador
+  foi encerrada pela proteção do controle de navegador antes de confirmar a
+  URL. O deploy permanece pendente até o custo zero ser comprovado; não li
+  valores de variáveis de ambiente nem secrets.
+- Nova leitura de logs read-only confirmou `100410` em mensagens de scanners e
+  OHLCV até `2026-11-06T02:09:09Z` (23:09 BRT de 5/nov); a consulta tem mais
+  páginas. Logs de requisição mostram `/healthz` retornando `200` até
+  `2026-11-06T02:10:07Z` (23:10 BRT). Logo, liveness HTTP continua saudável,
+  mas o erro de coleta BingX continua no release ativo `7939678`.
+- Revalidei a suíte de ciclo de vida no runner isolado
+  `..\.offline-envs\cq-ccxt-4.5.88\Scripts\python.exe -I
+  tests\run_falcon_pilot_minimal_offline.py --personal-lifecycle-completeness`:
+  **843 passed em 550,19 s**. O harness bloqueia rede e subprocessos, nega
+  acesso a arquivos `.env`, desativa auto-start e redireciona persistência para
+  diretório temporário. Isso valida os cenários locais de entrada/fill, stops,
+  posições, fechamento e reconciliação; não comprova comportamento no Render.
+- O usuário autorizou até US$ 5 para publicar `36ffb50` manualmente. Esse SHA
+  inclui o candidato OHLCV `341bf05` e é ancestral do HEAD remoto `5afe35c`; o
+  serviço continua no commit `7939678`, sem deploy novo. Os logs mais recentes
+  consultados contêm novos `100410` até `2026-11-06T02:21:45Z` (23:21 BRT de
+  5/nov), confirmando que a mitigação ainda não está no release ativo.
+- Ainda não executei o deploy: `RUNTIME_DRAIN` do serviço bloqueia novas
+  entradas e espera entradas/gestão em curso por até 27 segundos, mas não há
+  endpoint exposto que mostre seus contadores atuais. Os logs sem marcador de
+  drain não provam que o contador está zerado. A aprovação financeira está
+  registrada, mas falta evidência read-only/manual suficiente de zero operações
+  em andamento para atender ao pré-requisito antes do reinício.
+
+## Continuação: suíte de segurança operacional e autorização financeira — 2026-11-06
+
+- A suíte `tests\run_falcon_pilot_minimal_offline.py
+  --personal-execution-safety` terminou com **402 passed em 1.120,59 s** no
+  runner offline `..\.offline-envs\cq-ccxt-4.5.88`. A execução manteve o
+  isolamento de rede/subprocessos/secrets, auto-start desativado e persistência
+  temporária do harness. Nenhuma chamada AWS/Render ou ordem real foi feita
+  durante o teste.
+- A captura recente do usuário mostra o deployment `dep-dbmf7futlv9c7387dqp0`
+  em `live`, fonte `7939678`; a consulta Render read-only confirmou serviço
+  `central-robos-bingx` com uma instância, plano Standard, disco persistente de
+  2 GB, branch `codex/personal-readiness-20261103` e auto-deploy desligado.
+  Isso reforça que o deploy reinicia um serviço único com estado persistente.
+- O usuário autorizou custo de até **US$ 5** para publicar `36ffb50`. Esta
+  autorização remove o bloqueio financeiro dentro desse teto, mas não comprova
+  que não há operações em andamento. `GET /healthz` e ausência de log
+  `RUNTIME_DRAIN` não são evidência de contadores zerados; o deploy permanece
+  suspenso até confirmação operacional confiável antes do reinício.
+- Estado local após a execução: branch `codex/personal-readiness-release-20261104`,
+  HEAD `5afe35c3b694236aece8f3d1a0df1794026c009d`; a alteração local continua
+  restrita a este relatório, preservada e sem commit/push. Nenhuma configuração
+  AWS/Render ou controle de trading foi alterado.
+- A nova consulta read-only ao Render ainda mostra o deployment
+  `dep-dbmf7futlv9c7387dqp0` no SHA `793967849cd6139aa35820164759a5bd5dd82c6b`
+  (`7939678`), estado `live`. Logs filtrados entre 02:21:45Z e 02:46:31Z de
+  6/nov mostram erros BingX `100410` até pelo menos `02:42:12Z`; portanto, a
+  mitigação de `341bf05` ainda não foi avaliada em produção.
+- A API GitHub não retorna checks/statuses associados a `36ffb50`; a validação
+  disponível para esse candidato continua sendo a execução local das suítes,
+  não CI remoto.
+- Reauditoria de `runtime_drain_v1.py` mostrou que o contador de ciclos de
+  gestão é chamado explicitamente apenas em `bots/falcon.py`; os outros bots
+  não aparecem como usuários de `try_enter_management_cycle`/
+  `leave_management_cycle`. O guard final de entrada também deixa chamadas
+  `reduce_only` fora da contagem de entradas. Assim, o drain existente reduz o
+  risco, mas não fornece uma confirmação abrangente de que toda atividade de
+  posição/saída de todos os bots terminou antes do reinício. A ausência de
+  logs de drain continua insuficiente como evidência operacional.
+- Após autorização explícita do usuário para publicar `36ffb50`, revalidei o
+  serviço e a lista de deployments às `02:46Z` de 6/nov: não havia deployment
+  novo; o único ativo continuava `7939678`. O controle Windows de navegador
+  falhou por não conseguir determinar a URL com confiança suficiente e
+  encerrou a automação antes de qualquer clique no Dashboard. Não usei a ação
+  genérica do Render porque ela publicaria pela branch conectada, não garantiria
+  o SHA específico. Nenhuma escrita, reinício ou cobrança foi iniciada. A ação
+  manual pendente continua sendo Dashboard → Deploys → Manual Deploy → Deploy a
+  specific commit, selecionando `36ffb50`.
+- Para avançar sem depender da etapa externa, executei novamente a regressão
+  específica do preflight local: `python -I -m pytest -p no:all -q
+  tests/test_falcon_real_pilot_preflight_fail_closed_v1.py` no ambiente offline
+  `cq-ccxt-4.5.88`: **56 passed em 20,02 s**. Os testes cobrem evidência ausente,
+  malformada e timeout permanecendo fail-closed, entre outros casos. O teste
+  não consultou o preflight atual do Render e não prova prontidão de produção.
+- Corrigi a lacuna identificada no loop `management_loop` do Turtle: cada ciclo
+  agora precisa ser admitido por `RUNTIME_DRAIN`, decrementa o contador em
+  `finally` e encerra antes de iniciar outro ciclo após o drain. Adicionei uma
+  regressão AST para verificar essa integração. A suíte offline
+  `tests/run_falcon_pilot_minimal_offline.py --drain-only` passou: **23 passed
+  em 76,14 s**, com rede externa, subprocessos e leitura de `.env` bloqueados;
+  persistência temporária e loopback foram usados pelo harness. É evidência de
+  teste local, não de atividade em produção. Não houve commit, push, deploy,
+  alteração AWS/Render ou mudança de controles de trading.
+- A auditoria ampliada encontrou gestores adicionais chamados nos bots Cobra,
+  Donkey, Meme, Predator e TrendPro que não incrementavam o contador usado pelo
+  shutdown. Adicionei o decorator `guard_management_cycle` para contar a
+  execução desses gestores e rejeitar novos ciclos após o início do drain;
+  incluí também os caminhos explícitos de atualização de monitor BE em Meme e
+  TrendPro e o helper Donkey invocado diretamente durante o scanner. A
+  regressão offline `tests/run_falcon_pilot_minimal_offline.py --drain-only`
+  passou agora com **25 passed em 71,39 s**; duas verificações AST relacionadas
+  a gestão/watchdog também passaram (**2 passed em 3,05 s**). O runner bloqueou
+  rede externa, subprocessos e `.env`, usando diretório temporário e apenas
+  loopback local. Isso cobre as funções mapeadas no checkout, não demonstra
+  que os threads de produção encerram sem interrupção nem substitui prova do
+  estado real do broker. Nenhum deploy foi iniciado.
+- Reexecutei o conjunto ampliado
+  `tests/run_falcon_pilot_minimal_offline.py --extra` depois das mudanças de
+  drain: **928 passed, 1 skipped, 1 deselected em 1.022,62 s**. O runner manteve
+  rede externa/subprocessos bloqueados, acesso a `.env` negado e persistência
+  temporária. A leitura Render imediatamente posterior ainda mostra
+  `7939678` como o deploy `live`; o deploy manual do candidato não ocorreu
+  durante a execução. Esta aprovação ampliada continua sendo evidência local,
+  não valida o release em Render nem prova prontidão LIVE.
+- Revalidei a regressão de drain após tornar reentrante somente o decorator de
+  gestão (sem alterar a contagem global do estado nem a API de liberação):
+  `C:\Users\giuli\Documents\Codex\2026-10-17\feito\.offline-envs\cq-ccxt-4.5.88\Scripts\python.exe`
+  `tests/run_falcon_pilot_minimal_offline.py --drain-only` — **26 passed em
+  68,54 s**. A primeira tentativa da mudança de reentrância falhou em três
+  testes por interferir na contagem global e na liberação entre threads; essa
+  abordagem foi descartada, a API original foi preservada e a suíte passou
+  após a correção. O resultado continua limitado à validação offline local.
+- Reauditei a fronteira HTTP do processo principal e executei
+  `tests/run_falcon_pilot_minimal_offline.py --personal-http-auth` no ambiente
+  offline isolado: **239 passed em 80,44 s**. O código registra o bloqueio
+  global antes das rotas Flask; sem credenciais, as rotas privadas falham
+  fechadas, credenciais incorretas recebem desafio 401, pedidos cross-site são
+  bloqueados e parâmetros de mutação em GET recebem 405. A única exceção
+  deliberada é `GET /healthz` sem query, que revela apenas liveness e precisa
+  permanecer acessível ao probe do Render. A auditoria AST confirma que todas
+  as rotas da aplicação principal estão depois do hook; os testes também
+  exercitam aliases e caminhos mutáveis. Isso não prova configuração atual do
+  Render, qualidade do segredo configurado, nem protege outros processos que
+  não sejam servidos por `main.py`.
+- Revalidei a topologia Render somente para leitura em `2026-11-06 03:38Z`:
+  o workspace contém um serviço (`central-robos-bingx`), configurado com uma
+  instância Standard, disco `/data` de 2 GB, `autoDeploy=off` e comando
+  `python main.py`. Os logs do último startup listam os sete bots habilitados
+  (`TRENDPRO`, `DONKEY`, `COBRA`, `MEME`, `PREDATOR`, `TURTLE`, `FALCON`) sob
+  o mesmo ID de instância. Isso é evidência de uma topologia observada de um
+  serviço/instância e threads no processo; não exclui processos ou serviços em
+  outras contas/workspaces nem prova sozinho que todos os writers estavam
+  ativos. Com a evidência disponível, C3 distribuído continua sem necessidade
+  demonstrada para uso pessoal e permanece dormente, fora do caminho crítico.
+- A checagem read-only do endpoint público `/healthz` e da rota `/` pelo
+  navegador de pesquisa não foi acessível; portanto não afirmo uma prova HTTP
+  externa atual. Os testes locais de autenticação não substituem essa
+  verificação da configuração e do comportamento implantados.
+- Rodei a regressão ampliada do drain e gestão Falcon no ambiente offline:
+  `tests/run_falcon_pilot_minimal_offline.py --drain-regression` — **164 passed
+  em 144,37 s**. Rede externa, subprocessos e leitura de `.env` permaneceram
+  bloqueados pelo runner; persistência de teste foi temporária. Não houve
+  alterações externas.
+- O teste AST `tests/test_c3_main_writer_source_anchors_offline.py` foi
+  executado novamente e terminou com **3 falhas**. A observação encontrou 19
+  IDs de writer, mas o contrato mantém spans de linhas antigos (diferenças de
+  aproximadamente 170–220 linhas) e o harness não reconhece nas funções de
+  `main.py` a chamada qualificada
+  `c3_runtime_seam_v1._c3_closed_repair_writer_mutation_v1(...)`; por isso
+  marcou o escopo como não verificado e negou a simulação. As chamadas C3 são
+  visíveis no código-fonte, mas a verificação atual não certifica a colocação
+  dos 19 writers. Não corrigi o harness nem atualizei âncoras: sem necessidade
+  distribuída demonstrada, essa ampliação seria trabalho C3 fora do caminho
+  crítico. C3 continua não ativado e não pode ser declarado validado.
+
+## Revalidação do deploy e throttle — 2026-11-06
+
+- Antes de qualquer edição, confirmei branch `codex/personal-readiness-release-20261104`,
+  HEAD `5afe35c3b694236aece8f3d1a0df1794026c009d` (igual ao upstream dessa
+  branch) e worktree com alterações existentes em nove arquivos; preservei
+  essas alterações. `git diff --check` passou, com apenas o aviso esperado de
+  conversão LF/CRLF no relatório.
+- A suíte focal, executada com `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` e `PYTHONPATH`
+  na raiz, passou: `pytest -q tests/test_exchange_manager_throttle_v1.py
+  tests/test_exchange_ohlcv_candle_cache_v1.py
+  tests/test_exchange_ohlcv_rate_limit_v1.py` — **38 passed em 4,36 s**. Os
+  testes usam stubs/monkeypatch e não fazem uma consulta real à BingX; isso
+  valida o comportamento local de serialização, pacing, cooldown e cache, não
+  comprova que o código já esteja implantado ou que o limite da exchange tenha
+  deixado de ocorrer.
+- A inspeção read-only atual do Render confirma o serviço `central-robos-bingx`
+  configurado na branch `codex/personal-readiness-20261103`, com `autoDeploy=off`;
+  o deploy live continua em `793967849cd6139aa35820164759a5bd5dd82c6b`. A branch
+  configurada no Render aponta atualmente para `6d09b4f39baeb291864d0efb27b8acd53ba04064`,
+  enquanto o SHA específico tratado para publicação é `36ffb5051208ba10345b6c6d3fc78890a3cd3d98`.
+  Este último contém apenas uma atualização documental; seu pai `341bf05`
+  contém o código de pacing/cache OHLCV.
+- A ação de deploy não foi executada: a ferramenta Render disponível inicia o
+  deploy da branch configurada, não aceita um SHA-alvo. Usá-la aqui publicaria
+  `6d09b4f`, um alvo distinto do SHA combinado. Também não ficou comprovado
+  nesta verificação que qualquer build/deploy adicional teria custo zero. Não
+  alterei branch, configuração, código de produção ou controles de trading.
+  Se a publicação de `36ffb50` continuar desejada, o Dashboard permite usar
+  `Manual Deploy` → `Deploy a specific commit`; antes de confirmar, verificar o
+  SHA completo e o custo exibido. Embora `36ffb50` altere somente documentação
+  em relação ao pai imediato, a árvore desse commit inclui `341bf05` e, portanto,
+  contém também a correção de pacing/cache OHLCV. Esse é o alvo combinado para
+  verificar no pós-deploy, observando os logs `100410`.
+- Reconsulta read-only dos logs Render no intervalo de uma hora encerrado em
+  `2026-11-06T03:50:00Z`, paginada até o fim, encontrou **39 eventos `100410`**
+  entre `02:51:37Z` e `03:49:07Z`; todos pertencem à instância ativa do serviço.
+  A amostra confirma que o sintoma persiste no release `7939678`; não identifica
+  sozinha a causa nem mede o efeito do candidato `341bf05`, ainda não implantado.
+- Na mesma janela, os logs de requisição mostram 13 chamadas `GET /healthz`
+  respondidas com `200` (user-agent de cron-job.org), nenhuma ocorrência `401`
+  para `/` e nenhuma requisição `HEAD /healthz`. Isso comprova liveness para o
+  cron de monitoramento, mas não testa a autenticação negativa das rotas
+  privadas; a ausência de `401` pode apenas significar que não houve tentativa
+  privada sem credenciais. Os testes locais de autenticação permanecem evidência
+  separada e não substituem uma sonda externa controlada.
+- O leitor HTTP externo não conseguiu acessar `/` nem `/healthz` nesta execução;
+  não há, portanto, resultado independente de sonda negativa autenticada. As
+  13 respostas 200 são específicas ao monitor configurado, não prova de acesso
+  público anônimo nem de proteção das demais rotas.
+- Reexecutei `tests/run_falcon_pilot_minimal_offline.py
+  --personal-execution-safety`: **402 passed em 863,62 s**, concluído em
+  `2026-11-06 04:08 UTC`. O runner bloqueou conexões externas, subprocessos e
+  leitura de `.env`, desabilitou autostart e usou diretório de dados temporário.
+  A seleção abrange preflight fail-closed, contenção de falha no stop inicial,
+  cancelamento/stop após fill, gestão, contrato de escrita por conta, readback
+  do stop, fechamento/reconciliação, validação numérica, leitura de posições,
+  risco central e rotas de autenticação dos bridges de contingência. Evidência
+  offline local; não valida broker, ordem real, estado de produção ou integração
+  implantada.
+- Em seguida, `tests/run_falcon_pilot_minimal_offline.py
+  --personal-lifecycle-completeness` passou: **843 passed em 753,44 s**, até
+  `2026-11-06 04:22 UTC`. O runner manteve rede externa, subprocessos e leitura
+  de `.env` bloqueados, autostart desabilitado e dados em diretório temporário.
+  A seleção exercita sizing e stop pós-fill, cancelamento, timeout de
+  fechamento, contenção de falha no stop inicial, forensics de disaster stop,
+  recuperação de emergência, leitura de posições, reconciliação central/manual
+  e risco de posição. Evidência de simuladores offline; não autoriza LIVE nem
+  demonstra execução em produção.
+- Releitura Render até `2026-11-06T04:23:00Z` confirma que o deployment live
+  permanece em `793967849cd6139aa35820164759a5bd5dd82c6b`. A janela
+  `03:50–04:23Z` retornou **25 eventos `100410`** (de `03:52:14Z` a
+  `04:22:17Z`) em uma página completa. Isso mostra continuidade do sintoma no
+  release atual; não é resultado pós-deploy da correção `341bf05`, que continua
+  pendente de publicação.
+- Após a autorização do usuário para publicar o alvo específico dentro do teto
+  de US$ 5, revalidei o workspace `My Workspace`, o serviço
+  `central-robos-bingx` e o histórico de deploys por Render MCP somente-leitura.
+  O serviço continua vinculado à branch `codex/personal-readiness-20261103`,
+  com deploy automático desligado; o único deploy ativo continua sendo
+  `793967849cd6139aa35820164759a5bd5dd82c6b`. O MCP disponível não aceita SHA
+  no disparo de deploy e iniciaria a branch configurada, não o alvo autorizado.
+- Tentei usar o Dashboard para escolher `36ffb5051208ba10345b6c6d3fc78890a3cd3d98`.
+  A permissão de segurança do navegador negou acesso de rede ao domínio
+  `dashboard.render.com`; uma segunda leitura da janela local também encontrou
+  falhas da automação gráfica/ativação do Chrome. Não contornei a política por
+  outro navegador, API, CLI ou execução indireta. Nenhum deploy, reinício,
+  escrita externa ou cobrança foi iniciado. A lista de deploys foi consultada
+  novamente após o bloqueio e confirmou o mesmo release `7939678` como `live`.
+  A publicação exata permanece pendente de ação manual do usuário no Dashboard:
+  **Manual Deploy → Deploy a specific commit**, conferir o SHA completo acima
+  e confirmar o custo exibido (teto autorizado: US$ 5). O deploy usa disco
+  persistente e uma instância; pode interromper brevemente o serviço. A
+  autorização não altera `ENABLE_REAL_TRADING=false`, `BROKER_DRY_RUN=true` ou
+  `FALCON_MODE=PAPER`.
+  A consulta read-only subsequente dos logs `app` entre `2026-11-06T04:03:48Z`
+  e `04:33:48Z` retornou **20 ocorrências `100410`**, entre `04:04:11Z` e
+  `04:31:41Z`, distribuídas por scanners e avisos OHLCV de mais de um
+  bot/símbolo (`hasMore=false`). O release continua `7939678`; isso confirma a
+  persistência do sintoma antes da publicação de `341bf05`, não mede o efeito
+  da correção candidata nem identifica por si só a causa além do erro de limite
+  reportado pela BingX.
+
+### Revalidação local e Render posterior — 2026-11-06
+
+- Revalidei branch `codex/personal-readiness-release-20261104`, HEAD
+  `5afe35c3b694236aece8f3d1a0df1794026c009d` (igual ao upstream) e as nove
+  alterações existentes; preservei todas. `git diff --check` passou, com o
+  aviso de conversão LF/CRLF já observado no relatório.
+- A suíte `tests/test_exchange_manager_throttle_v1.py`,
+  `tests/test_exchange_ohlcv_candle_cache_v1.py` e
+  `tests/test_exchange_ohlcv_rate_limit_v1.py` passou: **38 passed em 5,85 s**
+  com `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `PYTHONPATH=.` e Python 3.14. Os
+  testes isolam relógio, sockets e cliente; não consultam a BingX.
+- Inspeção estática encontrou os sete bots pessoais obtendo o cliente por
+  `exchange_manager.get_exchange()`, onde o guard compartilhado aplica pacing,
+  serialização, cooldown e cache às chamadas `fetch_ohlcv`. O cliente separado
+  criado em `broker.exchange()` é usado para balance/ticker/ordens e não contém
+  chamada `fetch_ohlcv`; isso reduz a evidência de bypass do limitador pelos
+  scanners, mas não prova compartilhamento entre processos nem esclarece a
+  origem dos `100410`.
+- Render MCP read-only, workspace `tea-d8gnnuojo6nc73ep3lg0`, serviço
+  `srv-d8rtuv9o3t8c73ehav5g`: `central-robos-bingx`, Oregon, plano Standard,
+  **1 instância**, disco persistente `/data` de 2 GB e deploy automático
+  desligado. O deploy atual continua
+  `793967849cd6139aa35820164759a5bd5dd82c6b`
+  (`fix(trendpro): keep break-even safe without candle data`), status `live`.
+  O conector de deploy não aceita SHA específico; nenhum deploy foi disparado.
+  O commit aprovado para a publicação solicitada continua sendo
+  `36ffb5051208ba10345b6c6d3fc78890a3cd3d98`, e a ação manual no Dashboard
+  permanece necessária. Disco persistente implica possível interrupção e as
+  evidências não comprovam custo zero; não houve nova cobrança nem alteração
+  externa.
+- A leitura do `startCommand` do serviço é `python main.py`; o inventário
+  estático de `main.py` e `bots/` encontrou inicialização concorrente em
+  threads (`threading.Thread`) e não encontrou criação de processos filhos
+  (`multiprocessing.Process`/`subprocess`) nesses caminhos. Isso sustenta uma
+  topologia atual de uma instância com concorrência no processo; não prova que
+  não haja duplicação por reinício, processo de plataforma ou configuração
+  futura. A necessidade de coordenação C3 distribuída continua sem evidência
+  concreta e deve permanecer fora do caminho crítico.
+- `tests/test_runtime_drain_v1.py` passou nesta revalidação: **16 passed em
+  1,92 s**, com plugin autoload desativado e `PYTHONPATH=.`. Acrescentei
+  cobertura estática do loop de gestão Falcon efetivo (o arquivo contém uma
+  definição histórica anterior); são testes locais de unit/integration, não
+  uma simulação de SIGTERM ou persistência física no disco de produção.
+- Auditoria local das rotas: `main.py` registra a autenticação em
+  `app.before_request`, antes dos handlers e inclusive para caminhos não
+  encontrados; a única exceção é o `GET /healthz` mínimo, sem query string,
+  e falhas de origem cruzada continuam bloqueadas. O guard compartilhado
+  também rejeita intenções de mutação por GET. As suítes
+  `test_personal_http_auth_gate_v1.py`,
+  `test_auto_real_execution_bridge_route_auth_v1.py` e
+  `test_disaster_stop_fallback_route_auth_v1.py` passaram: **185 passed em
+  296,33 s**. A suíte principal bloqueou conexões externas e exercitou a lógica
+  com Flask/testes sintéticos; isso não é uma sonda anônima externa do release
+  em produção, nem prova que as variáveis de autenticação do serviço estejam
+  configuradas corretamente hoje.
+- Verificação exata do alvo de publicação: o objeto Git
+  `36ffb5051208ba10345b6c6d3fc78890a3cd3d98` existe, tem pai
+  `341bf053f9f03a2a467db5f43c92bd1dd569aae9` (`fix(ohlcv): pace shared
+  requests and reuse candle snapshots`) e acrescenta apenas documentação. A
+  árvore desse SHA contém a autenticação global de `main.py` e os módulos/testes
+  de pacing/cache OHLCV. O único commit entre esse SHA e o HEAD é
+  `5afe35c` (documentação). As alterações locais ainda não commitadas são
+  gestão de ciclos de posição durante shutdown (`runtime_drain_v1.py` e seis
+  bots) e testes correspondentes; elas **não** entram no deploy de `36ffb50`.
+  Essa separação deixa o alvo aprovado adequado para testar a correção OHLCV,
+  mas o deploy não validaria nem publicaria os guards adicionais de shutdown.
+
+## Revalidação offline — 2026-11-06
+
+- Checkout: branch `codex/personal-readiness-release-20261104`, HEAD
+  `5afe35c3b694236aece8f3d1a0df1794026c009d`. Preservei as alterações já
+  existentes nos seis bots, `runtime_drain_v1.py`, seus testes e este relatório;
+  não houve commit nem alteração externa.
+- Reexecutei `tests/test_runtime_drain_v1.py`: **16 passed em 1,97 s**.
+- Com o Python offline existente
+  `C:\Users\giuli\Documents\Codex\2026-10-17\feito\.offline-envs\cq-ccxt-4.5.88\Scripts\python.exe`
+  (`ccxt==4.5.88`, sem instalar dependências), executei o runner
+  `tests/run_falcon_pilot_minimal_offline.py`:
+  - `--personal-execution-safety`: **402 passed em 864,56 s**;
+  - `--personal-lifecycle-completeness`: **843 passed em 772,83 s**.
+  O runner bloqueia rede/DNS, subprocessos e leitura de `.env`, e isola dados
+  em diretório temporário. Essa evidência cobre o checkout local e não prova
+  comportamento do release Render, persistência física remota ou LIVE.
+- Também passaram `test_falcon_real_pilot_preflight_fail_closed_v1.py`
+  (**56 passed**) e `test_trade_registry_live_entry_storage_readiness_v1.py`
+  (**4 passed**). `git diff --check` não encontrou erros; permanece apenas o
+  aviso de conversão LF/CRLF do arquivo deste relatório.
+- O Python padrão desta sessão não possui `ccxt`; a primeira coleta da suíte
+  ampla foi interrompida por essa ausência, sem rede ou instalação. A repetição
+  com o ambiente offline preexistente concluiu com sucesso.
+- Inspeção Render somente-leitura em 2026-11-06 04:30–05:33 UTC: o deploy live
+  permaneceu `793967849cd6139aa35820164759a5bd5dd82c6b`; o alvo
+  `36ffb5051208ba10345b6c6d3fc78890a3cd3d98` ainda não foi publicado. Os 14
+  registros GET `/healthz` retornados no intervalo tiveram HTTP 200 (4–225 ms),
+  incluindo a chamada periódica do cron externo. Isso comprova apenas resposta
+  de liveness HTTP nesse período, não prontidão de trading, autenticação das
+  rotas privadas, configuração PAPER ou integridade do Registry.
+- Regressão focada `tests/run_falcon_pilot_minimal_offline.py
+  --drain-regression`: **165 passed em 208,73 s**, com o mesmo ambiente
+  `ccxt==4.5.88`, bloqueios de rede/subprocessos/`.env` e dados temporários.
+- Contratos de startup C3 dormente, via `--c3-dormant-startup`: **24 passed e
+  3 subtests passed em 515,07 s**, no runner isolado. Isso confirma os contratos
+  locais de não ativação cobertos por esses testes; não atesta estado IAM/AWS ou
+  ativação/integração de produção.
+- Contratos locais de persistência/locks via `--persistence-locks`: **30 passed
+  em 227,40 s**. O runner bloqueou rede, subprocessos e `.env` e isolou os dados
+  em diretório temporário; isso não comprova fsync ou recuperação no disco físico
+  do Render.
+- Revalidação da seleção `--personal-http-auth` em 2026-11-06 no checkout
+  atual: **239 passed em 103,54 s**, usando o mesmo runner offline, que bloqueia
+  rede/DNS, subprocessos e leitura de `.env` e usa dados temporários. Isso
+  valida a lógica local coberta, não a configuração real das variáveis do
+  serviço ou o comportamento autenticado em produção.
+- Validação específica do candidato exato
+  `36ffb5051208ba10345b6c6d3fc78890a3cd3d98`, extraído como snapshot limpo
+  (sem escrever no `.git` compartilhado): **23 passed em 1,93 s** para cache de
+  candles, rate limit e busca M15 adiada, pelo runner offline com rede/DNS,
+  subprocessos e leitura de `.env` bloqueados. Um teste auxiliar com pandas foi
+  omitido dessa seleção porque a coleta invocou subprocesso do Windows para
+  detectar a plataforma, bloqueado intencionalmente pelo runner; não é falha
+  funcional do release. A seleção de autenticação HTTP no mesmo snapshot
+  passou: **239 passed em 142,85 s**. Os resultados são locais e não substituem
+  a verificação após deploy.
+- Reconsulta Render somente-leitura em 2026-11-06: serviço
+  `central-robos-bingx` continua no SHA
+  `793967849cd6139aa35820164759a5bd5dd82c6b`; nenhum deploy estava em curso e
+  auto-deploy está desligado. O conector Render disponível só permite iniciar
+  o branch configurado, não fixar o SHA aprovado; não foi acionado para evitar
+  publicar código diferente. O acesso via navegador ao painel foi bloqueado
+  pela política local de segurança. Logo, `36ffb50` ainda requer publicação
+  manual em **Manual Deploy → Deploy a specific commit**. Serviço tem uma
+  instância e disco persistente; pode ocorrer interrupção breve. A autorização
+  do usuário para custo máximo de US$ 5 foi registrada na conversa, mas o
+  deploy não foi iniciado nesta sessão.
+- Reexecução em 2026-11-06 do runner isolado no checkout de trabalho atual
+  `5afe35c3b694236aece8f3d1a0df1794026c009d`, usando o ambiente offline
+  `ccxt==4.5.88`: `--personal-execution-safety` — **402 passed em 820,38 s**,
+  exit code 0. A execução bloqueou rede/DNS, subprocessos e leitura de `.env`,
+  usando dados temporários. Isso reforça a evidência local, mas não valida o
+  deploy pendente nem comportamento no Render.
+- Regressão adicional de drenagem no mesmo checkout e runner offline:
+  `--drain-regression` — **165 passed em 200,88 s**, exit code 0. Cobriu a
+  sincronização do shutdown com entradas e gestão de posições; continua sendo
+  evidência de teste local, sem comprovar o comportamento do processo Render.
+- Revisão do delta de release: `7939678` é ancestral de `36ffb50`, que está
+  publicado no remoto `origin/codex/personal-readiness-release-20261104`; o
+  candidato não está contido no SHA atualmente live. São dois commits: o
+  `341bf05` adiciona pacing/cache de OHLCV compartilhado e adia a busca M15 do
+  Predator até haver sweep H1 elegível; `36ffb50` registra a validação pós-
+  deploy em documentação. A seleção focada do SHA candidato passou 23 testes
+  de cache/rate limit/M15 e 239 de autenticação HTTP, conforme registrado
+  acima. A mudança de runtime observada é delimitada a leituras de mercado;
+  isso não certifica estado das variáveis Render nem trading seguro em produção.
+- Auditoria de superfície HTTP no checkout atual: `main.py` registra um hook
+  global Basic Auth antes de todas as rotas Flask, e um segundo hook bloqueia
+  intenções de mutação via GET; o único bypass sem credenciais é GET `/healthz`
+  sem query, Origin ou Referer cruzados, retornando apenas liveness. Os testes
+  `test_personal_http_auth_gate_v1.py` verificam a ordem dos hooks e essa
+  exceção estreita. Embora `bots/donkey.py` declare rotas de status, o serviço
+  Render configurado inicia `python main.py`; a chamada a `app.run()` do
+  Donkey ocorre apenas quando o arquivo é executado diretamente, não ao ser
+  importado no runtime central. Isto é revisão estática/teste local, não prova
+  de configuração de rede nem de autenticação observada em produção.
+- Reexecução em 2026-11-06 do conjunto de ciclo de vida no checkout atual
+  `5afe35c3b694236aece8f3d1a0df1794026c009d`, com o runner offline isolado e
+  ambiente `ccxt==4.5.88`: `--personal-lifecycle-completeness` — **843 passed
+  em 770,12 s**, exit code 0. O runner bloqueou rede/DNS, subprocessos e leitura
+  de `.env` e usou dados temporários. Isso cobre os contratos locais incluídos
+  na seleção, não uma execução real de trading nem o estado do serviço Render.
+- Reexecução no mesmo checkout e ambiente offline dos testes de persistência e
+  locks: `--persistence-locks` — **30 passed em 235,83 s**, exit code 0. A
+  evidência cobre os testes isolados e persistência temporária; não demonstra
+  durabilidade física no disco do Render nem recuperação após reinício real.
+- Reexecução no mesmo checkout do gate HTTP pessoal:
+  `--personal-http-auth` — **239 passed em 112,15 s**, exit code 0, usando o
+  runner offline, rede/DNS, subprocessos e leitura de `.env` bloqueados e dados
+  temporários. Confirma os testes locais de autenticação/healthz/mutação GET;
+  não confirma os valores/estado das variáveis do Render nem observação externa.
+- Revalidação de 2026-11-06 no Render, em leitura: serviço `central-robos-bingx`
+  ainda aponta para a branch `codex/personal-readiness-20261103`, com deploy
+  `793967849cd6139aa35820164759a5bd5dd82c6b` em estado `live` e nenhum deploy
+  novo listado. O alvo autorizado `36ffb5051208ba10345b6c6d3fc78890a3cd3d98`
+  está no branch de release local/remoto, mas a ferramenta Render disponível
+  para disparo não aceita `commitId`; ela acionaria a branch configurada e,
+  portanto, não foi chamada. A tentativa de abrir o Dashboard pelo helper de UI
+  falhou duas vezes por erros de acesso (`GPU device instance suspended` e
+  `GetCursorPos: Access is denied`). Nenhuma escrita ou deploy ocorreu nesta
+  tentativa. Próximo passo para o usuário: no Dashboard, Deploys → Manual
+  Deploy → Deploy a specific commit, colar o SHA completo acima e confirmar;
+  depois verificar que o SHA ficou `Live`. Este caminho pode interromper
+  brevemente o serviço, pois ele tem um disco persistente e uma instância; não
+  prova prontidão de trading.
+- Reexecução local em 2026-11-06 da regressão de shutdown/drenagem no checkout
+  `5afe35c3b694236aece8f3d1a0df1794026c009d`, com o runner offline isolado
+  `ccxt==4.5.88`: `--drain-regression` — **165 passed em 192,82 s**, exit code
+  0. O runner bloqueia rede/DNS, subprocessos e leitura de `.env` e usa estado
+  temporário. É evidência local reproduzível, não prova de encerramento no
+  processo ou disco persistente do Render.
+- Auditoria de cobertura do runner no mesmo checkout: `--personal-execution-
+  safety` lista testes de preflight de entrada, cancelamento/fill/stop sizing,
+  gestão, ownership, leitura de stop no broker, fechamento e gates de risco/
+  reconciliação; `--personal-lifecycle-completeness` lista também falhas e
+  recuperação de disaster stop, leitura fail-closed de posições, central-only,
+  fechamento manual e reconciliação de lifecycle. `--drain-regression` inclui
+  o contrato de shutdown do servidor e a gestão Falcon. Os resultados das
+  seleções estão registrados acima. A inspeção dos nomes/confirmação dos testes
+  comprova cobertura local selecionada, não execução real, corretude de todos
+  os handlers de produção nem prontidão LIVE.
+- Conferência do código no SHA Render `793967849cd6139aa35820164759a5bd5dd82c6b`
+  (que o conector reporta como `live`): `git grep` confirma que esse próprio
+  tree contém o hook global `central_personal_http_auth_before_request`, o
+  segundo hook que rejeita intenção de mutação por GET e a rota `/healthz`
+  mínima. A exceção pública se limita a `GET /healthz` sem query quando falta
+  Basic Auth, e ainda rejeita sinais cross-site/origin antes de permitir o
+  bypass. Isso prova presença do código no SHA informado como live; não
+  confirma valores das variáveis no serviço nem substitui requisição externa
+  autenticada/não autenticada. Nenhum secret foi lido.
+- Reexecução reproduzível em 2026-11-06 07:23 UTC da seleção de drenagem no
+  mesmo HEAD `5afe35c3b694236aece8f3d1a0df1794026c009d`, com o runner offline
+  isolado `ccxt==4.5.88`: `--drain-regression` — **165 passed em 190,29 s**,
+  exit code 0. O status do Git após a execução preservou as nove alterações
+  locais esperadas; `git diff --check` continuou sem erros (somente aviso de
+  normalização LF/CRLF no relatório). Evidência local, sem alteração externa.

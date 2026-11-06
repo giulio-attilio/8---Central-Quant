@@ -21,6 +21,7 @@ class RuntimeDrainState:
         self._draining = False
         self._active_entries = 0
         self._active_management_cycles = 0
+        self._management_local = threading.local()
 
     def try_enter_live_entry(self) -> bool:
         with self._condition:
@@ -96,6 +97,33 @@ class RuntimeDrainState:
 
 
 RUNTIME_DRAIN = RuntimeDrainState()
+
+
+def guard_management_cycle(state):
+    """Count a position-management call so shutdown waits for it to finish."""
+
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            depth = getattr(state._management_local, "depth", 0)
+            if depth:
+                state._management_local.depth = depth + 1
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    state._management_local.depth = depth
+            if not state.try_enter_management_cycle():
+                return None
+            state._management_local.depth = 1
+            try:
+                return function(*args, **kwargs)
+            finally:
+                state._management_local.depth = 0
+                state.leave_management_cycle()
+
+        return wrapped
+
+    return decorate
 
 
 def guard_new_live_entries(state, live_send_enabled):
