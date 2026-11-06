@@ -3136,3 +3136,37 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   `100410` desde 01:05 UTC retornou ao menos dez ocorrências, com paginação
   (`hasMore=true`) e a mais recente às 01:24:05 UTC. Portanto o throttling segue
   ativo no release atual; essa amostra não mede o total nem prova a causa.
+
+## Revalidação após deploy do release anterior — 2026-11-05
+
+- A tela do Render e a consulta read-only do deployment confirmam que
+  `793967849cd6139aa35820164759a5bd5dd82c6b` está `live`. A página registra
+  deploy manual concluído; isso confirma o estado do serviço, não prontidão de
+  trading.
+- Nova consulta somente de leitura dos logs `app`, filtrada por `100410` desde
+  `2026-11-05T21:24:00Z`, foi paginada até o fim: **164 registros em 2 páginas**,
+  de `21:26:20Z` até `2026-11-06T01:36:35Z` (22:36 BRT em 5/nov). As mensagens
+  incluem scanners e endpoints OHLCV; logo, o release `7939678` ainda apresenta
+  falhas de consulta após o deploy. Isso confirma a persistência do sintoma,
+  não a causa específica do código BingX `100410`.
+- A branch local segue em `codex/personal-readiness-release-20261104`, com
+  HEAD `341bf053f9f03a2a467db5f43c92bd1dd569aae9`, um commit à frente de
+  `origin/codex/personal-readiness-release-20261104`. A worktree estava limpa
+  antes desta atualização de evidências. O candidato de throttle/cache não foi
+  enviado nem implantado; o release ativo não contém essa correção.
+- No Windows, repeti as cinco suítes com
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, `PYTHONPATH` apontando para a raiz e as
+  fixtures que substituem conexões de rede por falhas: **106 passed em 19,27 s**.
+  O comando está reproduzido no histórico deste trabalho. A primeira execução
+  do runner falhou na coleta por não ter a raiz em `PYTHONPATH`; a execução
+  corrigida passou. A tentativa de repetir em WSL não iniciou por
+  `Wsl/E_ACCESSDENIED`; a aprovação não dependia dessa repetição, pois a suíte
+  offline passou no Windows.
+- `git diff --check HEAD^ HEAD` passou. Não há diretório `.github` versionado
+  nesse checkout; portanto, não encontrei workflow de CI do próprio repositório
+  que fosse disparado por push. Isso não prova custo zero do build/deploy no
+  Render nem de serviços externos.
+- Próxima barreira externa: não enviar nem implantar `341bf05` até confirmar
+  custo zero atual. O deploy anterior `7939678` foi autorizado separadamente;
+  essa autorização não cobre automaticamente uma nova publicação. Continuar
+  validações locais não depende dessa decisão financeira.
