@@ -2,19 +2,40 @@ from __future__ import annotations
 
 import ast
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
+try:
+    import ccxt  # noqa: F401
+except ModuleNotFoundError:
+    # Keep the guard tests runnable in an approved offline environment without
+    # ccxt; all exchange behavior below is already supplied by FakeExchange.
+    ccxt_stub = ModuleType("ccxt")
+    ccxt_stub.ExchangeError = type("ExchangeError", (Exception,), {})
+    ccxt_stub.RateLimitExceeded = type("RateLimitExceeded", (Exception,), {})
+
+    class _StubBingx:
+        def __init__(self, _config):
+            self.options = {}
+            self.fetch_ohlcv = lambda *_args, **_kwargs: []
+
+    ccxt_stub.bingx = _StubBingx
+    sys.modules["ccxt"] = ccxt_stub
+
 import exchange_manager
+from exchange_ohlcv_candle_cache_v1 import clear_ohlcv_candle_cache_for_tests
 from exchange_throttle_policy_v1 import (
     exchange_throttle_cooldown_remaining,
     reset_exchange_throttle_cooldown_for_tests,
     start_exchange_throttle_cooldown,
 )
+from exchange_ohlcv_rate_limit_v1 import reset_exchange_ohlcv_rate_limit_for_tests
 
 
 BOT_MODULES = (
@@ -40,8 +61,12 @@ def isolate_state_and_block_network(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", blocked)
     monkeypatch.setattr(exchange_manager, "_exchange", None)
     reset_exchange_throttle_cooldown_for_tests()
+    reset_exchange_ohlcv_rate_limit_for_tests()
+    clear_ohlcv_candle_cache_for_tests()
     yield
     reset_exchange_throttle_cooldown_for_tests()
+    reset_exchange_ohlcv_rate_limit_for_tests()
+    clear_ohlcv_candle_cache_for_tests()
     monkeypatch.setattr(exchange_manager, "_exchange", None)
 
 
@@ -105,6 +130,142 @@ def test_shared_client_starts_cooldown_and_rejects_next_scanner_read(monkeypatch
         shared.fetch_ohlcv("ETH/USDT", timeframe="1h", limit=100)
 
     assert len(calls) == 1
+
+
+def test_shared_client_reuses_matching_candle_snapshot_across_bots(monkeypatch):
+    calls = []
+
+    class FakeExchange:
+        def __init__(self):
+            self.options = {}
+
+        def fetch_ohlcv(self, symbol, **kwargs):
+            calls.append((symbol, kwargs))
+            window = exchange_manager.current_ohlcv_window_start_ms(kwargs["timeframe"])
+            return [
+                [window - 3_600_000, 1, 2, 0, 1, 10],
+                [window, 2, 3, 1, 2, 11],
+            ]
+
+    client = FakeExchange()
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", lambda _config: client)
+    shared = exchange_manager.get_exchange()
+
+    first = shared.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=2)
+    second = shared.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=1)
+
+    assert first[-1][4] == 2
+    assert second == [first[-1]]
+    assert len(calls) == 1
+    second[-1][4] = 999
+    assert shared.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=1)[-1][4] == 2
+
+
+def test_shared_throttle_cooldown_serves_valid_cache_but_rejects_cache_miss(monkeypatch):
+    calls = []
+
+    class FakeExchange:
+        def __init__(self):
+            self.options = {}
+
+        def fetch_ohlcv(self, _symbol, **kwargs):
+            calls.append(kwargs)
+            window = exchange_manager.current_ohlcv_window_start_ms(kwargs["timeframe"])
+            return [[window - 3_600_000, 1, 2, 0, 1, 10], [window, 2, 3, 1, 2, 11]]
+
+    client = FakeExchange()
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", lambda _config: client)
+    shared = exchange_manager.get_exchange()
+    shared.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=2)
+    start_exchange_throttle_cooldown(60)
+
+    cached = shared.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=2)
+    assert len(cached) == 2
+    assert len(calls) == 1
+
+    with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+        shared.fetch_ohlcv("ETH/USDT:USDT", timeframe="1h", limit=2)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [
+        (("BTC/USDT", None), {"timeframe": "1h", "limit": 2}),
+        (("BTC/USDT",), {"timeframe": "1h", "limit": 2, "since": 123}),
+        (("BTC/USDT",), {"timeframe": "1h", "limit": 2, "params": {"price": "mark"}}),
+    ],
+)
+def test_non_scanner_fetch_shapes_bypass_candle_cache(args, kwargs):
+    assert exchange_manager._cache_request_parts(args, kwargs) is None
+
+
+def test_six_scanner_consumers_share_43_symbols_across_h1_h4_snapshots(monkeypatch):
+    calls = []
+    paced_slots = []
+    elapsed = {"seconds": 0.0}
+
+    class FakeExchange:
+        def __init__(self):
+            self.options = {}
+
+        def fetch_ohlcv(self, symbol, **kwargs):
+            calls.append((symbol, kwargs["timeframe"], kwargs["limit"]))
+            timeframe = kwargs["timeframe"]
+            window = exchange_manager.current_ohlcv_window_start_ms(timeframe)
+            interval_ms = 3_600_000 if timeframe == "1h" else 14_400_000
+            return [
+                [window - (299 - index) * interval_ms, index, index + 1, index - 1, index, 10]
+                for index in range(299)
+            ] + [[window, 299, 300, 298, 299, 11]]
+
+    def fake_rate_slot():
+        if paced_slots:
+            elapsed["seconds"] += 1.05
+        paced_slots.append(elapsed["seconds"])
+        return 1.05 if len(paced_slots) > 1 else 0.0
+
+    client = FakeExchange()
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", lambda _config: client)
+    monkeypatch.setattr(exchange_manager, "wait_for_exchange_ohlcv_slot", fake_rate_slot)
+    shared = exchange_manager.get_exchange()
+
+    symbols = [f"COIN{index}/USDT:USDT" for index in range(43)]
+    limits_by_scanner = (300, 200, 120, 80, 80, 120)
+    for symbol in symbols:
+        for timeframe in ("1h", "4h"):
+            for limit in limits_by_scanner:
+                rows = shared.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+                assert len(rows) == limit
+
+    assert len(calls) == 43 * 2
+    assert len(paced_slots) == 43 * 2
+    assert elapsed["seconds"] == pytest.approx((43 * 2 - 1) * 1.05)
+
+
+def test_shared_client_waits_for_rate_slot_before_exchange_call(monkeypatch):
+    events = []
+
+    class FakeExchange:
+        def __init__(self):
+            self.options = {}
+
+        def fetch_ohlcv(self, _symbol, **_kwargs):
+            events.append("request")
+            return [[1, 2, 3, 4, 5, 6]]
+
+    client = FakeExchange()
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", lambda _config: client)
+    monkeypatch.setattr(
+        exchange_manager,
+        "wait_for_exchange_ohlcv_slot",
+        lambda: events.append("paced"),
+    )
+
+    exchange_manager.get_exchange().fetch_ohlcv("BTC/USDT", timeframe="1h", limit=100)
+
+    assert events == ["paced", "request"]
 
 
 def test_concurrent_scanners_serialize_request_and_share_throttle_cooldown(monkeypatch):
@@ -186,7 +347,7 @@ def test_shared_cooldown_expires_and_restores_exchange_reads(monkeypatch):
     assert len(calls) == 3
 
 
-def test_guard_installs_on_real_ccxt_client_without_network():
+def test_guard_installs_on_ccxt_compatible_client_without_network():
     client = exchange_manager.ccxt.bingx({"enableRateLimit": True})
     start_exchange_throttle_cooldown(60)
 

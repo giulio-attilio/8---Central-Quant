@@ -8,6 +8,12 @@ from exchange_throttle_policy_v1 import (
     record_exchange_throttle_cooldown,
     reset_exchange_throttle_backoff,
 )
+from exchange_ohlcv_candle_cache_v1 import (
+    current_ohlcv_window_start_ms,
+    get_cached_ohlcv_snapshot,
+    store_ohlcv_snapshot,
+)
+from exchange_ohlcv_rate_limit_v1 import wait_for_exchange_ohlcv_slot
 
 _exchange = None
 _markets_loaded = False
@@ -49,6 +55,28 @@ def _install_shared_ohlcv_throttle_guard(ex):
         # and request so only one in-flight scanner call can pass before a
         # throttling response opens the process-wide cooldown.
         with _shared_ohlcv_request_lock:
+            cache_request = _cache_request_parts(args, kwargs)
+            window_start_ms = None
+            if cache_request is not None:
+                symbol, timeframe, limit = cache_request
+                window_start_ms = current_ohlcv_window_start_ms(timeframe)
+                cached = get_cached_ohlcv_snapshot(symbol, timeframe, limit)
+                if cached is not None:
+                    return cached
+            # A validated current-window snapshot may satisfy consumers that
+            # use closed candles even while the exchange circuit is open. Do
+            # not let cached reads bypass the cooldown with a network request:
+            # misses remain fail-closed below.
+            remaining = exchange_throttle_cooldown_remaining()
+            if remaining > 0:
+                raise ccxt.RateLimitExceeded(
+                    f"Central shared OHLCV throttle cooldown active ({remaining:.1f}s)"
+                )
+            # The current BingX swap-kline endpoint reference annotates a
+            # 1 request/second IP limit. The effective gateway policy and the
+            # cause of a 100410 response are not independently verified. Pace
+            # this endpoint across scanners sharing this process, conservatively.
+            wait_for_exchange_ohlcv_slot()
             remaining = exchange_throttle_cooldown_remaining()
             if remaining > 0:
                 raise ccxt.RateLimitExceeded(
@@ -60,12 +88,34 @@ def _install_shared_ohlcv_throttle_guard(ex):
                 if is_exchange_throttle_error(exc):
                     record_exchange_throttle_cooldown()
                 raise
+            if cache_request is not None and window_start_ms is not None:
+                symbol, timeframe, _limit = cache_request
+                store_ohlcv_snapshot(
+                    symbol,
+                    timeframe,
+                    result,
+                    requested_window_start_ms=window_start_ms,
+                )
             reset_exchange_throttle_backoff()
             return result
 
     guarded_fetch_ohlcv._central_throttle_guard_v1 = True
     ex.fetch_ohlcv = guarded_fetch_ohlcv
     return True
+
+
+def _cache_request_parts(args, kwargs):
+    """Restrict reuse to the call shape used by scanners (no since/params)."""
+    if len(args) != 1 or not set(kwargs).issubset({"timeframe", "limit"}):
+        return None
+    symbol = args[0]
+    timeframe = kwargs.get("timeframe", "1m")
+    limit = kwargs.get("limit")
+    if not isinstance(symbol, str) or not isinstance(timeframe, str):
+        return None
+    if not isinstance(limit, int) or limit <= 0:
+        return None
+    return symbol, timeframe, limit
 
 
 def load_markets_once(force=False):

@@ -1504,9 +1504,8 @@ def scan_smart_predator_symbol(symbol):
 
     df_h1 = fetch_df(symbol, TIMEFRAME_H1, limit=100)
     df_h4 = fetch_df(symbol, TIMEFRAME_H4, limit=100)
-    df_m15 = fetch_df(symbol, TIMEFRAME_M15, limit=100)
 
-    if len(df_h1) < 50 or len(df_h4) < 50 or len(df_m15) < 50:
+    if len(df_h1) < 50 or len(df_h4) < 50:
         return None
 
     candle_h1 = df_h1.iloc[-2]
@@ -1521,6 +1520,16 @@ def scan_smart_predator_symbol(symbol):
 
     bullish_sweep = detect_bullish_sweep(df_h1, SWING_LOOKBACK)
     bearish_sweep = detect_bearish_sweep(df_h1, SWING_LOOKBACK)
+    bullish_eligible = bool(bullish_sweep) and not em_cooldown(symbol, "LONG")
+    bearish_eligible = bool(bearish_sweep) and not em_cooldown(symbol, "SHORT")
+
+    # M15 is only consumed to confirm a valid H1 sweep. Avoid spending a
+    # scarce public kline request on symbols that cannot produce a candidate.
+    df_m15 = None
+    if bullish_eligible or bearish_eligible:
+        df_m15 = fetch_df(symbol, TIMEFRAME_M15, limit=100)
+        if len(df_m15) < 50:
+            return None
 
     if bullish_sweep:
         inc_funnel_stat("bullish_sweeps")
@@ -1536,7 +1545,7 @@ def scan_smart_predator_symbol(symbol):
     )
 
     # LONG
-    if bullish_sweep and not em_cooldown(symbol, "LONG"):
+    if bullish_eligible:
         bullish_choch = detect_bullish_choch_m15_after_sweep(df_m15, bullish_sweep)
         ob = find_bullish_order_block(df_h1, OB_LOOKBACK)
 
@@ -1620,7 +1629,7 @@ def scan_smart_predator_symbol(symbol):
                     }
 
     # SHORT
-    if bearish_sweep and not em_cooldown(symbol, "SHORT"):
+    if bearish_eligible:
         bearish_choch = detect_bearish_choch_m15_after_sweep(df_m15, bearish_sweep)
         ob = find_bearish_order_block(df_h1, OB_LOOKBACK)
 
