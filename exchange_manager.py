@@ -13,7 +13,10 @@ from exchange_ohlcv_candle_cache_v1 import (
     get_cached_ohlcv_snapshot,
     store_ohlcv_snapshot,
 )
-from exchange_ohlcv_rate_limit_v1 import wait_for_exchange_ohlcv_slot
+from exchange_ohlcv_rate_limit_v1 import (
+    wait_for_exchange_ohlcv_slot,
+    wait_for_exchange_ticker_slot,
+)
 
 _exchange = None
 _markets_loaded = False
@@ -36,8 +39,7 @@ def get_exchange():
         if _exchange is None:
             ex = ccxt.bingx({"enableRateLimit": True})
             ex.options["defaultType"] = DEFAULT_TYPE
-            _install_shared_ohlcv_throttle_guard(ex)
-            _install_shared_ticker_throttle_guard(ex)
+            install_shared_market_data_throttle_guards(ex)
             _exchange = ex
 
         return _exchange
@@ -123,6 +125,12 @@ def _install_shared_ticker_throttle_guard(ex):
                 raise ccxt.RateLimitExceeded(
                     f"Central shared market-data throttle cooldown active ({remaining:.1f}s)"
                 )
+            wait_for_exchange_ticker_slot()
+            remaining = exchange_throttle_cooldown_remaining()
+            if remaining > 0:
+                raise ccxt.RateLimitExceeded(
+                    f"Central shared market-data throttle cooldown active ({remaining:.1f}s)"
+                )
             try:
                 result = original_fetch_ticker(*args, **kwargs)
             except Exception as exc:
@@ -135,6 +143,19 @@ def _install_shared_ticker_throttle_guard(ex):
     guarded_fetch_ticker._central_throttle_guard_v1 = True
     ex.fetch_ticker = guarded_fetch_ticker
     return True
+
+
+def install_shared_market_data_throttle_guards(ex):
+    """Apply process-wide OHLCV/ticker cooldowns to any BingX client.
+
+    The broker owns a separate authenticated CCXT client. Applying the same
+    guards to that client keeps its public market-data reads in the same
+    process-wide throttle domain without wrapping order/account methods.
+    """
+    return {
+        "ohlcv": _install_shared_ohlcv_throttle_guard(ex),
+        "ticker": _install_shared_ticker_throttle_guard(ex),
+    }
 
 
 def _cache_request_parts(args, kwargs):

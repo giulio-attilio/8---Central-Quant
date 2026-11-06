@@ -1362,6 +1362,12 @@ def exchange():
         "options": {"defaultType": BINGX_DEFAULT_TYPE},
     })
     ex.options["defaultType"] = BINGX_DEFAULT_TYPE
+    # The authenticated broker client is distinct from the public shared
+    # client. Keep its ticker/candle reads inside the same process-wide
+    # throttle/cooldown, while leaving account and order methods untouched.
+    from exchange_manager import install_shared_market_data_throttle_guards
+
+    install_shared_market_data_throttle_guards(ex)
     _exchange = ex
     return _exchange
 

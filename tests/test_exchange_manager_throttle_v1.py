@@ -463,3 +463,74 @@ def test_guard_installs_on_ccxt_compatible_client_without_network():
     assert exchange_manager._install_shared_ohlcv_throttle_guard(client) is True
     with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
         client.fetch_ohlcv("BTC/USDT", timeframe="1h", limit=100)
+
+
+def test_independent_clients_share_market_data_throttle_cooldown(monkeypatch):
+    calls = []
+    ticker_pacing_calls = []
+    monkeypatch.setattr(
+        exchange_manager,
+        "wait_for_exchange_ticker_slot",
+        lambda: ticker_pacing_calls.append("waited") or 0.0,
+    )
+
+    class FakeExchange:
+        def __init__(self, *, fail_ticker=False):
+            self.options = {}
+            self.fail_ticker = fail_ticker
+
+        def fetch_ohlcv(self, symbol, **_kwargs):
+            calls.append(("ohlcv", symbol))
+            return [[1, 2, 3, 4, 5, 6]]
+
+        def fetch_ticker(self, symbol):
+            calls.append(("ticker", symbol))
+            if self.fail_ticker:
+                raise exchange_manager.ccxt.ExchangeError(
+                    'bingx {"code":100410,"msg":"try again later"}'
+                )
+            return {"symbol": symbol}
+
+    public_client = FakeExchange()
+    authenticated_broker_client = FakeExchange(fail_ticker=True)
+    assert exchange_manager.install_shared_market_data_throttle_guards(
+        public_client
+    ) == {"ohlcv": True, "ticker": True}
+    assert exchange_manager.install_shared_market_data_throttle_guards(
+        authenticated_broker_client
+    ) == {"ohlcv": True, "ticker": True}
+
+    with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
+        authenticated_broker_client.fetch_ticker("BTC/USDT:USDT")
+    with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+        public_client.fetch_ohlcv("ETH/USDT:USDT", timeframe="1h", limit=1)
+
+    assert calls == [("ticker", "BTC/USDT:USDT")]
+    assert ticker_pacing_calls == ["waited"]
+
+
+def test_broker_authenticated_client_installs_shared_guards():
+    tree = ast.parse((BOT_DIR.parent / "broker.py").read_text(encoding="utf-8"))
+    exchange_function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "exchange"
+    )
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "exchange_manager"
+        and any(
+            alias.name == "install_shared_market_data_throttle_guards"
+            for alias in node.names
+        )
+        for node in ast.walk(exchange_function)
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "install_shared_market_data_throttle_guards"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "ex"
+        for node in ast.walk(exchange_function)
+    )

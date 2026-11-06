@@ -12,6 +12,7 @@ from exchange_ohlcv_rate_limit_v1 import (
     MIN_OHLCV_REQUEST_INTERVAL_SECONDS,
     reset_exchange_ohlcv_rate_limit_for_tests,
     wait_for_exchange_ohlcv_slot,
+    wait_for_exchange_ticker_slot,
 )
 
 
@@ -75,6 +76,24 @@ def test_concurrent_callers_are_paced_under_one_shared_lock():
     )
 
 
+def test_ticker_requests_have_an_independent_documented_endpoint_budget(
+    isolate_clock_and_block_network,
+):
+    clock = isolate_clock_and_block_network
+    assert wait_for_exchange_ticker_slot() == 0.0
+    clock["now"] += 0.2
+
+    waited = wait_for_exchange_ticker_slot()
+
+    assert waited == pytest.approx(MIN_OHLCV_REQUEST_INTERVAL_SECONDS - 0.2)
+    assert clock["sleeps"] == [pytest.approx(MIN_OHLCV_REQUEST_INTERVAL_SECONDS - 0.2)]
+
+
+def test_ticker_slot_is_independent_from_ohlcv_slot(isolate_clock_and_block_network):
+    assert wait_for_exchange_ohlcv_slot() == 0.0
+    assert wait_for_exchange_ticker_slot() == 0.0
+
+
 def test_shared_exchange_guard_paces_before_each_network_call():
     tree = ast.parse((ROOT / "exchange_manager.py").read_text(encoding="utf-8"))
     installer = next(
@@ -96,6 +115,29 @@ def test_shared_exchange_guard_paces_before_each_network_call():
 
     assert "wait_for_exchange_ohlcv_slot" in calls
     assert calls.index("wait_for_exchange_ohlcv_slot") < calls.index("original_fetch_ohlcv")
+
+
+def test_shared_ticker_guard_paces_before_each_network_call():
+    tree = ast.parse((ROOT / "exchange_manager.py").read_text(encoding="utf-8"))
+    installer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_install_shared_ticker_throttle_guard"
+    )
+    guard = next(
+        node
+        for node in ast.walk(installer)
+        if isinstance(node, ast.FunctionDef) and node.name == "guarded_fetch_ticker"
+    )
+    calls = [
+        node.func.id
+        for node in ast.walk(guard)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+
+    assert "wait_for_exchange_ticker_slot" in calls
+    assert calls.index("wait_for_exchange_ticker_slot") < calls.index("original_fetch_ticker")
 
 
 @pytest.mark.parametrize(
