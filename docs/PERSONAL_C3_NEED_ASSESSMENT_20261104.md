@@ -3786,3 +3786,13 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   da drenagem de managers. Essa correção ainda não está no Render; publicação
   depende do push manual bloqueado pelo SSH e do deploy específico, sujeito à
   confirmação de custo aplicável. Nenhum secret ou valor de variável foi lido.
+- Correção da sequência de publicação em 2026-11-06: após a tentativa SSH
+  bloqueada, um push Git normal, sem force, foi concluído com sucesso. O GitHub
+  confirmou `codex/personal-readiness-release-20261104` em
+  `220d44b80ee9a09380c910fda83761dbd51776d6` (`protected=false`), contendo os
+  commits locais `c4e339e` e `220d44b`. O Render foi reconsultado em seguida e
+  continuava em `793967849cd6139aa35820164759a5bd5dd82c6b`; o push não iniciou
+  deploy, conforme esperado com auto-deploy desligado. Resta somente deploy
+  manual de SHA específico e confirmação do custo aplicável; o acesso ao
+  Dashboard via navegador segue negado pela política salva. A autorização de
+  até US$ 5 dada para `36ffb50` não é presumida para o novo SHA.
