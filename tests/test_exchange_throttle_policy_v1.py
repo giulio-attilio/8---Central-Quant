@@ -143,6 +143,18 @@ def test_all_scanner_ohlcv_wrappers_stop_retrying_explicit_throttle(relative_pat
     assert "Rate limit OHLCV" in namespace["HEALTH"]["last_warning"]
 
 
+def test_donkey_generic_100410_is_warning_without_retry():
+    # The production Render exception entered Donkey's generic handler rather
+    # than its typed CCXT handler; retain coverage for that exact branch.
+    error = RuntimeError('bingx {"code":100410,"msg":"try again later"}')
+    safe_fetch, calls, namespace = _load_safe_fetch("bots/donkey.py", [error])
+
+    assert safe_fetch("BCH/USDT:USDT", "4h", 300, max_retries=3) == []
+    assert calls["fetch"] == 1
+    assert calls["sleep"] == []
+    assert "Rate limit OHLCV BCH/USDT:USDT 4h" in namespace["HEALTH"]["last_warning"]
+
+
 @pytest.mark.parametrize("relative_path", ["bots/falcon.py", "bots/turtle.py"])
 def test_single_attempt_scanners_keep_throttle_as_warning(relative_path):
     safe_fetch, calls, namespace = _load_single_attempt_safe_fetch(

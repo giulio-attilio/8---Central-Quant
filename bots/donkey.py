@@ -536,6 +536,10 @@ def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
             time.sleep(2 ** attempt)
         except Exception as e:
             ultimo_erro = e
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
+                print(f"AVISO API OHLCV ({attempt + 1}/{max_retries}) {symbol} {timeframe}: {e}")
+                return []
             print(f"ERRO API OHLCV {symbol} {timeframe}: {e}")
             time.sleep(2 ** attempt)
 
