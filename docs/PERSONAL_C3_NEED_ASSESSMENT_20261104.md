@@ -3775,3 +3775,14 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   exit code 0. O status do Git após a execução preservou as nove alterações
   locais esperadas; `git diff --check` continuou sem erros (somente aviso de
   normalização LF/CRLF no relatório). Evidência local, sem alteração externa.
+- Revalidação somente de leitura em 2026-11-06 07:02–07:32 UTC: Render ainda
+  reporta `793967849cd6139aa35820164759a5bd5dd82c6b` como `live`. Na janela,
+  os logs do serviço retornaram 19 mensagens BingX `100410`; portanto, o erro
+  de OHLCV continua presente no código em produção. Também houve bloqueio
+  `STATIC_OPERATIONAL_RUNTIME_BLOCKED` para a auditoria do watchdog Predator
+  e para o snapshot Redis; isso confirma que a reconciliação automática de
+  fechamentos continua sem executar nesse perfil. O HEAD local `c4e339e`
+  descende de `7939678` e inclui a correção de pacing/cache de `341bf05`, além
+  da drenagem de managers. Essa correção ainda não está no Render; publicação
+  depende do push manual bloqueado pelo SSH e do deploy específico, sujeito à
+  confirmação de custo aplicável. Nenhum secret ou valor de variável foi lido.
