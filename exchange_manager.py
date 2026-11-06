@@ -37,6 +37,7 @@ def get_exchange():
             ex = ccxt.bingx({"enableRateLimit": True})
             ex.options["defaultType"] = DEFAULT_TYPE
             _install_shared_ohlcv_throttle_guard(ex)
+            _install_shared_ticker_throttle_guard(ex)
             _exchange = ex
 
         return _exchange
@@ -101,6 +102,38 @@ def _install_shared_ohlcv_throttle_guard(ex):
 
     guarded_fetch_ohlcv._central_throttle_guard_v1 = True
     ex.fetch_ohlcv = guarded_fetch_ohlcv
+    return True
+
+
+def _install_shared_ticker_throttle_guard(ex):
+    """Share throttling failures across bots that read public tickers."""
+    original_fetch_ticker = getattr(ex, "fetch_ticker", None)
+    if not callable(original_fetch_ticker) or getattr(
+        original_fetch_ticker, "_central_throttle_guard_v1", False
+    ):
+        return False
+
+    def guarded_fetch_ticker(*args, **kwargs):
+        # Ticker callers retry independently in several bots. Serialize them
+        # with scanner reads and open the same process-wide cooldown on an
+        # explicit exchange throttle, so one bot cannot amplify another's 429.
+        with _shared_ohlcv_request_lock:
+            remaining = exchange_throttle_cooldown_remaining()
+            if remaining > 0:
+                raise ccxt.RateLimitExceeded(
+                    f"Central shared market-data throttle cooldown active ({remaining:.1f}s)"
+                )
+            try:
+                result = original_fetch_ticker(*args, **kwargs)
+            except Exception as exc:
+                if is_exchange_throttle_error(exc):
+                    record_exchange_throttle_cooldown()
+                raise
+            reset_exchange_throttle_backoff()
+            return result
+
+    guarded_fetch_ticker._central_throttle_guard_v1 = True
+    ex.fetch_ticker = guarded_fetch_ticker
     return True
 
 

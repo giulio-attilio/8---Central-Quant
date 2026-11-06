@@ -132,6 +132,115 @@ def test_shared_client_starts_cooldown_and_rejects_next_scanner_read(monkeypatch
     assert len(calls) == 1
 
 
+def test_ticker_throttle_opens_shared_cooldown_for_tickers_and_scanners(monkeypatch):
+    calls = []
+
+    class FakeExchange:
+        def __init__(self):
+            self.options = {}
+
+        def fetch_ticker(self, symbol):
+            calls.append(("ticker", symbol))
+            raise exchange_manager.ccxt.ExchangeError(
+                'bingx {"code":100410,"msg":"system busy"}'
+            )
+
+        def fetch_ohlcv(self, symbol, **kwargs):
+            calls.append(("ohlcv", symbol, kwargs))
+            return []
+
+    client = FakeExchange()
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", lambda _config: client)
+    shared = exchange_manager.get_exchange()
+
+    with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
+        shared.fetch_ticker("ALGO/USDT:USDT")
+    with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+        shared.fetch_ticker("BTC/USDT:USDT")
+    with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+        shared.fetch_ohlcv("ETH/USDT:USDT", timeframe="1m", limit=10)
+
+    assert calls == [("ticker", "ALGO/USDT:USDT")]
+
+
+def test_concurrent_ticker_callers_cannot_bypass_new_throttle_cooldown(monkeypatch):
+    calls = []
+    first_request_started = threading.Event()
+    release_first_request = threading.Event()
+
+    class FakeExchange:
+        def __init__(self):
+            self.options = {}
+
+        def fetch_ticker(self, symbol):
+            calls.append(symbol)
+            first_request_started.set()
+            assert release_first_request.wait(timeout=2)
+            raise exchange_manager.ccxt.ExchangeError(
+                'bingx {"code":100410,"msg":"system busy"}'
+            )
+
+        def fetch_ohlcv(self, *_args, **_kwargs):
+            return []
+
+    client = FakeExchange()
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", lambda _config: client)
+    shared = exchange_manager.get_exchange()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(shared.fetch_ticker, "ALGO/USDT:USDT")
+        assert first_request_started.wait(timeout=2)
+        second = pool.submit(shared.fetch_ticker, "BTC/USDT:USDT")
+        release_first_request.set()
+        with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
+            first.result(timeout=2)
+        with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+            second.result(timeout=2)
+
+    assert calls == ["ALGO/USDT:USDT"]
+
+
+def test_ticker_guard_is_installed_and_keeps_successful_results(monkeypatch):
+    class FakeExchange:
+        def __init__(self):
+            self.options = {}
+
+        def fetch_ticker(self, symbol, params=None):
+            return {"symbol": symbol, "last": 1.25, "params": params}
+
+        def fetch_ohlcv(self, *_args, **_kwargs):
+            return []
+
+    client = FakeExchange()
+    monkeypatch.setattr(exchange_manager.ccxt, "bingx", lambda _config: client)
+    shared = exchange_manager.get_exchange()
+
+    assert getattr(shared.fetch_ticker, "_central_throttle_guard_v1", False)
+    assert shared.fetch_ticker("BTC/USDT:USDT", {"price": "mark"}) == {
+        "symbol": "BTC/USDT:USDT",
+        "last": 1.25,
+        "params": {"price": "mark"},
+    }
+
+
+@pytest.mark.parametrize("module_name", BOT_MODULES)
+def test_all_bot_ticker_reads_use_the_shared_exchange_client(module_name):
+    tree = ast.parse((BOT_DIR / module_name).read_text(encoding="utf-8"))
+    ticker_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fetch_ticker"
+    ]
+
+    assert ticker_calls, f"{module_name} no longer has an auditable ticker call path"
+    assert all(
+        isinstance(call.func.value, ast.Name) and call.func.value.id == "exchange"
+        for call in ticker_calls
+    ), f"{module_name} bypasses the shared exchange client's ticker guard"
+
+
 def test_shared_client_reuses_matching_candle_snapshot_across_bots(monkeypatch):
     calls = []
 
