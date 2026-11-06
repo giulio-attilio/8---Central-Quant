@@ -3170,3 +3170,17 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   custo zero atual. O deploy anterior `7939678` foi autorizado separadamente;
   essa autorização não cobre automaticamente uma nova publicação. Continuar
   validações locais não depende dessa decisão financeira.
+
+## Conferência da hipótese do limite de OHLCV — 2026-11-05
+
+- A referência BingX publicada para `GET /openApi/swap/v3/quote/klines`
+  informa `1/s per IP`; a referência de erros define `100410` como limite de
+  frequência excedido e orienta reduzir a frequência e aguardar cooldown:
+  https://github.com/BingX-API/api-ai-skills/blob/main/skills/swap-market/api-reference.md
+  e
+  https://github.com/BingX-API/api-ai-skills/blob/main/skills/references/error-codes.md
+- Isso torna a cadência de 1,05 s do candidato coerente com o limite publicado.
+  Ainda não prova que a causa de todas as 164 respostas seja apenas a taxa dos
+  scanners deste processo: a quota é por IP e pode haver outros consumidores,
+  além de limites agregados/cooldowns. É necessária observação após release do
+  candidato para avaliar o efeito, sem prometer eliminação total do erro.
