@@ -8072,3 +8072,25 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   novo build do candidato não foi comprovado.
 - Nenhum código foi editado, nenhum commit/push/deploy foi feito e controles de
   trading permaneceram inalterados.
+
+## Otimização local e revalidação pós-commit — 2026-11-07
+
+- A autorização recebida para `4bd218f` foi conferida somente por leitura:
+  o Render já o mostra como deploy `live` (`dep-dbn58sjl550s73fgt9og`), então
+  não iniciei um deploy duplicado.
+- Preservei e consolidei as alterações locais revisadas em `86e122b`
+  (`perf(registry): optimize personal PAPER reconciliation`). A otimização
+  reduz a formação de componentes de identidade de até 2.000 eventos de
+  comparações pareadas para agrupamento por chave/token com union-find; não
+  altera o limite de reparos por ciclo nem os bloqueios PAPER/fail-closed.
+- Após o commit, no ambiente Python offline existente, com o runner que bloqueia
+  rede, subprocessos externos e leitura de `.env`, `--predator-auto-closed-sync`
+  passou **17 testes em 22,17 s** e `--drain-only` passou **27 testes em 8,51 s**.
+  Um pytest direto separado passou **47 testes** dos módulos de runtime estático
+  e reconciliação. O probe isolado gravou e releu o sentinel em processos
+  distintos, com rede negada, em arquivo temporário de 770 bytes; a limpeza
+  passou. `main.py` passou análise AST e `git diff --check` não encontrou erros.
+- A worktree está limpa em `86e122b`, um commit à frente do upstream.
+  Não fiz push nem deploy: custo zero para uma nova publicação não foi
+  comprovado. O commit local não atualiza o serviço Render e não prova prontidão
+  de produção. Nenhuma configuração na AWS/Render ou controle PAPER foi alterado.
