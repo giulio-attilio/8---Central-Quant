@@ -8155,3 +8155,17 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
 - Não publiquei o novo SHA no Render: o custo do build não está confirmado como
   zero e a autorização financeira anterior era específica a `4bd218f`, que já
   está ativo. A ativação LIVE e ordens reais continuam proibidas.
+
+## Reconsulta dos erros de mercado e bloqueios operacionais — 2026-11-07
+
+- Nos logs do serviço, entre `09:05Z` e `10:29Z`, foram encontrados dois erros
+  BingX `100410` em scanners (09:34:44Z e 10:04:45Z) e dois marcadores de
+  contenção estática (watchdog pesado às 09:29:44Z e snapshot grande às
+  10:09:45Z). A captura é filtrada e não representa todos os eventos.
+- Os 93 testes locais do throttle passaram, mas o código correspondente ainda
+  não está no SHA ativo `4bd218f`; os erros recentes confirmam que a correção
+  não foi validada em produção. Não alterei runtime nem removi os bloqueios.
+- O deploy candidato de código validado é `dcfd16b` (o HEAD `946fb1d` acrescenta
+  somente documentação). Render está com auto-deploy desligado, mas a execução
+  do build no plano atual não tem custo zero confirmado; é necessária decisão
+  financeira antes dessa publicação. Rollback conhecido permanece `4bd218f`.
