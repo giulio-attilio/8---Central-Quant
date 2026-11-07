@@ -749,10 +749,10 @@ def test_independent_clients_share_market_data_throttle_cooldown(monkeypatch):
     authenticated_broker_client = FakeExchange(fail_ticker=True)
     assert exchange_manager.install_shared_market_data_throttle_guards(
         public_client
-    ) == {"markets": False, "ohlcv": True, "ticker": True}
+    ) == {"markets": False, "ohlcv": True, "ticker": True, "time": False}
     assert exchange_manager.install_shared_market_data_throttle_guards(
         authenticated_broker_client
-    ) == {"markets": False, "ohlcv": True, "ticker": True}
+    ) == {"markets": False, "ohlcv": True, "ticker": True, "time": False}
 
     with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
         authenticated_broker_client.fetch_ticker("BTC/USDT:USDT")
@@ -783,16 +783,56 @@ def test_broker_market_metadata_throttle_blocks_public_client_load_markets():
     broker_client = FakeExchange(fail=True)
     assert exchange_manager.install_shared_market_data_throttle_guards(
         public_client
-    ) == {"markets": True, "ohlcv": False, "ticker": False}
+    ) == {"markets": True, "ohlcv": False, "ticker": False, "time": False}
     assert exchange_manager.install_shared_market_data_throttle_guards(
         broker_client
-    ) == {"markets": True, "ohlcv": False, "ticker": False}
+    ) == {"markets": True, "ohlcv": False, "ticker": False, "time": False}
 
     with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
         broker_client.load_markets()
     with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
         public_client.load_markets(reload=True)
     assert calls == [(True, {})]
+
+
+def test_broker_public_time_throttle_blocks_market_reads_only():
+    calls = []
+
+    class FakeExchange:
+        def __init__(self, *, fail=False):
+            self.fail = fail
+
+        def fetch_time(self):
+            calls.append(("time", self.fail))
+            if self.fail:
+                raise exchange_manager.ccxt.ExchangeError(
+                    'bingx {"code":100410,"msg":"try again later"}'
+                )
+            return 123456789
+
+        def fetch_ticker(self, _symbol):
+            calls.append(("ticker", self.fail))
+            return {"last": 1.0}
+
+        def fetch_balance(self):
+            calls.append(("balance", self.fail))
+            return {"USDT": {"free": 100.0}}
+
+    public_client = FakeExchange()
+    broker_client = FakeExchange(fail=True)
+    assert exchange_manager.install_shared_market_data_throttle_guards(
+        public_client
+    ) == {"markets": False, "ohlcv": False, "ticker": True, "time": True}
+    assert exchange_manager.install_shared_market_data_throttle_guards(
+        broker_client
+    ) == {"markets": False, "ohlcv": False, "ticker": True, "time": True}
+
+    with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
+        broker_client.fetch_time()
+    with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+        public_client.fetch_ticker("BTC/USDT:USDT")
+    assert broker_client.fetch_balance() == {"USDT": {"free": 100.0}}
+    assert calls == [("time", True), ("balance", True)]
 
 
 def test_load_markets_throttle_opens_shared_cooldown_and_suppresses_repeat(monkeypatch):

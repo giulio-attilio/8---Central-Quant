@@ -177,18 +177,52 @@ def _install_shared_load_markets_throttle_guard(ex):
     return True
 
 
+def _install_shared_fetch_time_throttle_guard(ex):
+    """Share public server-time throttles without touching private endpoints."""
+    original_fetch_time = getattr(ex, "fetch_time", None)
+    if not callable(original_fetch_time) or getattr(
+        original_fetch_time, "_central_throttle_guard_v1", False
+    ):
+        return False
+
+    def guarded_fetch_time(*args, **kwargs):
+        # The broker's readiness probe uses the same public BingX API surface.
+        # A throttle there must suppress scanner retries, but this wrapper is
+        # deliberately limited to fetch_time and does not touch account/order
+        # methods on the authenticated client.
+        with _shared_ohlcv_request_lock:
+            remaining = exchange_throttle_cooldown_remaining()
+            if remaining > 0:
+                raise ccxt.RateLimitExceeded(
+                    f"Central shared market-data throttle cooldown active ({remaining:.1f}s)"
+                )
+            try:
+                result = original_fetch_time(*args, **kwargs)
+            except Exception as exc:
+                if is_exchange_throttle_error(exc):
+                    record_exchange_throttle_cooldown()
+                raise
+            reset_exchange_throttle_backoff()
+            return result
+
+    guarded_fetch_time._central_throttle_guard_v1 = True
+    ex.fetch_time = guarded_fetch_time
+    return True
+
+
 def install_shared_market_data_throttle_guards(ex):
-    """Apply process-wide market-data cooldowns to any BingX client.
+    """Apply process-wide public-read cooldowns to any BingX client.
 
     The broker owns a separate authenticated CCXT client. Applying the same
-    guards to that client keeps its public OHLCV, ticker, and market-metadata
-    reads in the same process-wide throttle domain without wrapping
-    order/account methods.
+    guards to that client keeps its public OHLCV, ticker, market-metadata, and
+    server-time reads in the same process-wide throttle domain without
+    wrapping order/account methods.
     """
     return {
         "markets": _install_shared_load_markets_throttle_guard(ex),
         "ohlcv": _install_shared_ohlcv_throttle_guard(ex),
         "ticker": _install_shared_ticker_throttle_guard(ex),
+        "time": _install_shared_fetch_time_throttle_guard(ex),
     }
 
 
