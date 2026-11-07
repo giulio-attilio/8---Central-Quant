@@ -749,10 +749,10 @@ def test_independent_clients_share_market_data_throttle_cooldown(monkeypatch):
     authenticated_broker_client = FakeExchange(fail_ticker=True)
     assert exchange_manager.install_shared_market_data_throttle_guards(
         public_client
-    ) == {"ohlcv": True, "ticker": True}
+    ) == {"markets": False, "ohlcv": True, "ticker": True}
     assert exchange_manager.install_shared_market_data_throttle_guards(
         authenticated_broker_client
-    ) == {"ohlcv": True, "ticker": True}
+    ) == {"markets": False, "ohlcv": True, "ticker": True}
 
     with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
         authenticated_broker_client.fetch_ticker("BTC/USDT:USDT")
@@ -761,6 +761,65 @@ def test_independent_clients_share_market_data_throttle_cooldown(monkeypatch):
 
     assert calls == [("ticker", "BTC/USDT:USDT")]
     assert ticker_pacing_calls == ["waited"]
+
+
+def test_broker_market_metadata_throttle_blocks_public_client_load_markets():
+    calls = []
+
+    class FakeExchange:
+        def __init__(self, *, fail=False):
+            self.options = {}
+            self.fail = fail
+
+        def load_markets(self, **kwargs):
+            calls.append((self.fail, kwargs))
+            if self.fail:
+                raise exchange_manager.ccxt.ExchangeError(
+                    'bingx {"code":100410,"msg":"try again later"}'
+                )
+            return {"BTC/USDT": {"symbol": "BTC/USDT"}}
+
+    public_client = FakeExchange()
+    broker_client = FakeExchange(fail=True)
+    assert exchange_manager.install_shared_market_data_throttle_guards(
+        public_client
+    ) == {"markets": True, "ohlcv": False, "ticker": False}
+    assert exchange_manager.install_shared_market_data_throttle_guards(
+        broker_client
+    ) == {"markets": True, "ohlcv": False, "ticker": False}
+
+    with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
+        broker_client.load_markets()
+    with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+        public_client.load_markets(reload=True)
+    assert calls == [(True, {})]
+
+
+def test_load_markets_throttle_opens_shared_cooldown_and_suppresses_repeat(monkeypatch):
+    calls = []
+
+    class FakeExchange:
+        markets = None
+
+        def load_markets(self, *, reload):
+            calls.append(reload)
+            raise exchange_manager.ccxt.ExchangeError(
+                'bingx {"code":100410,"msg":"try again later"}'
+            )
+
+    monkeypatch.setattr(exchange_manager, "_exchange", FakeExchange())
+    monkeypatch.setattr(exchange_manager, "_markets_loaded", False)
+    exchange_manager.install_shared_market_data_throttle_guards(
+        exchange_manager._exchange
+    )
+
+    with pytest.raises(exchange_manager.ccxt.ExchangeError, match="100410"):
+        exchange_manager.load_markets_once()
+
+    assert exchange_throttle_cooldown_remaining() >= 59.0
+    with pytest.raises(exchange_manager.ccxt.RateLimitExceeded, match="cooldown"):
+        exchange_manager.load_markets_once(force=True)
+    assert calls == [True]
 
 
 def test_broker_authenticated_client_installs_shared_guards():

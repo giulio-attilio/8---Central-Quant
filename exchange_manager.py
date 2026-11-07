@@ -145,14 +145,48 @@ def _install_shared_ticker_throttle_guard(ex):
     return True
 
 
+def _install_shared_load_markets_throttle_guard(ex):
+    """Share market-metadata throttles across public and broker clients."""
+    original_load_markets = getattr(ex, "load_markets", None)
+    if not callable(original_load_markets) or getattr(
+        original_load_markets, "_central_throttle_guard_v1", False
+    ):
+        return False
+
+    def guarded_load_markets(*args, **kwargs):
+        # Market metadata is read by both the public scanner client and the
+        # separate broker client. Serialize it with other market-data reads so
+        # a throttle from either client opens one shared process cooldown.
+        with _shared_ohlcv_request_lock:
+            remaining = exchange_throttle_cooldown_remaining()
+            if remaining > 0:
+                raise ccxt.RateLimitExceeded(
+                    f"Central shared market-data throttle cooldown active ({remaining:.1f}s)"
+                )
+            try:
+                result = original_load_markets(*args, **kwargs)
+            except Exception as exc:
+                if is_exchange_throttle_error(exc):
+                    record_exchange_throttle_cooldown()
+                raise
+            reset_exchange_throttle_backoff()
+            return result
+
+    guarded_load_markets._central_throttle_guard_v1 = True
+    ex.load_markets = guarded_load_markets
+    return True
+
+
 def install_shared_market_data_throttle_guards(ex):
-    """Apply process-wide OHLCV/ticker cooldowns to any BingX client.
+    """Apply process-wide market-data cooldowns to any BingX client.
 
     The broker owns a separate authenticated CCXT client. Applying the same
-    guards to that client keeps its public market-data reads in the same
-    process-wide throttle domain without wrapping order/account methods.
+    guards to that client keeps its public OHLCV, ticker, and market-metadata
+    reads in the same process-wide throttle domain without wrapping
+    order/account methods.
     """
     return {
+        "markets": _install_shared_load_markets_throttle_guard(ex),
         "ohlcv": _install_shared_ohlcv_throttle_guard(ex),
         "ticker": _install_shared_ticker_throttle_guard(ex),
     }
@@ -191,6 +225,12 @@ def load_markets_once(force=False):
         )
 
         if should_reload:
+            remaining = exchange_throttle_cooldown_remaining()
+            if remaining > 0:
+                raise ccxt.RateLimitExceeded(
+                    f"Central shared market-data throttle cooldown active ({remaining:.1f}s)"
+                )
+            install_shared_market_data_throttle_guards(ex)
             ex.load_markets(reload=True)
             _markets_loaded = True
             _last_markets_load_ts = now
