@@ -1009,7 +1009,16 @@ def preparar_df(df):
 
 
 def fetch_df(symbol, timeframe, limit=100):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception as exc:
+        if is_exchange_throttle_error(exc):
+            HEALTH["last_warning"] = (
+                f"Rate limit BingX OHLCV {nome_limpo(symbol)} {timeframe}; "
+                "Predator ignorou o símbolo neste ciclo"
+            )
+            return None
+        raise
     df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
     return preparar_df(df)
 
@@ -1508,9 +1517,11 @@ def scan_smart_predator_symbol(symbol):
         return None
 
     df_h1 = fetch_df(symbol, TIMEFRAME_H1, limit=100)
-    df_h4 = fetch_df(symbol, TIMEFRAME_H4, limit=100)
+    if df_h1 is None or len(df_h1) < 50:
+        return None
 
-    if len(df_h1) < 50 or len(df_h4) < 50:
+    df_h4 = fetch_df(symbol, TIMEFRAME_H4, limit=100)
+    if df_h4 is None or len(df_h4) < 50:
         return None
 
     candle_h1 = df_h1.iloc[-2]
@@ -1533,7 +1544,7 @@ def scan_smart_predator_symbol(symbol):
     df_m15 = None
     if bullish_eligible or bearish_eligible:
         df_m15 = fetch_df(symbol, TIMEFRAME_M15, limit=100)
-        if len(df_m15) < 50:
+        if df_m15 is None or len(df_m15) < 50:
             return None
 
     if bullish_sweep:
@@ -2986,6 +2997,8 @@ def obter_preco_atual(symbol):
 def calcular_trailing_stop(symbol, side):
     try:
         df = fetch_df(symbol, TIMEFRAME_H1, limit=50)
+        if df is None or len(df) < 10:
+            return None
         candle = df.iloc[-2]
         atr = float(candle["atr14"])
         ultimos = df.iloc[-10:-1]

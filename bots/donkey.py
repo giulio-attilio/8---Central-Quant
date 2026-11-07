@@ -566,10 +566,16 @@ def safe_fetch_ticker(symbol, max_retries=3):
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             ultimo_erro = e
             print(f"AVISO API TICKER ({attempt + 1}/{max_retries}) {symbol}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit ticker {symbol}; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
         except Exception as e:
             ultimo_erro = e
             print(f"ERRO API TICKER {symbol}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit ticker {symbol}; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
 
     aviso = f"Falha ticker {symbol} após {max_retries} tentativas"
@@ -587,9 +593,15 @@ def safe_load_markets(max_retries=3):
             return load_markets_once()
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"AVISO API LOAD_MARKETS ({attempt + 1}/{max_retries}): {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = "Rate limit BingX load_markets; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
         except Exception as e:
             print(f"ERRO API LOAD_MARKETS: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = "Rate limit BingX load_markets; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
 
     HEALTH["last_error"] = "Falha crítica ao carregar markets da BingX"
