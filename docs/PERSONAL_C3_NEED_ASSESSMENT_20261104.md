@@ -8137,3 +8137,21 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   PAPER e que o gate final bloqueia envio. Os logs do Loki não permitiram essa
   confirmação nesta consulta. Nenhum valor secreto foi lido. Nenhuma alteração
   externa foi feita.
+
+## Publicação da branch de prontidão pessoal — 2026-11-07
+
+- O commit `afb4fa68c7bea696d64472341c2d744c42e62a77` e seus três commits
+  validados anteriores foram enviados em avanço rápido para a branch GitHub
+  `codex/personal-readiness-release-20261104`; a API GitHub confirmou o ref
+  remoto exatamente nesse SHA. O histórico foi preservado.
+- O push não disparou deploy: `autoDeploy=no` continua configurado no serviço
+  Render e a worktree não contém workflows em `.github/workflows`. O deploy
+  ativo segue sendo `4bd218f`; não alterei AWS, Render, configuração nem trading.
+- A verificação adicional confirmou que `POST /can_open_trade` está atrás do
+  Basic Auth global no código ativo, mas seu wrapper solicita o bridge com
+  `execute=True, dry_run=False`. Gates internos ainda decidem elegibilidade e
+  execução; os logs 200 não identificam o chamador nem confirmam que o gate
+  bloqueou envio. Isso permanece um bloqueio de evidência, não prova de ordem.
+- Não publiquei o novo SHA no Render: o custo do build não está confirmado como
+  zero e a autorização financeira anterior era específica a `4bd218f`, que já
+  está ativo. A ativação LIVE e ordens reais continuam proibidas.
