@@ -172,6 +172,22 @@ class _OneLoopTime:
         raise _StopLoop()
 
 
+class _TestRuntimeDrain:
+    """Management-loop drain stub for isolated runtime behavior tests."""
+
+    @staticmethod
+    def try_enter_management_cycle():
+        return True
+
+    @staticmethod
+    def leave_management_cycle():
+        return None
+
+    @staticmethod
+    def is_draining():
+        return False
+
+
 class _ClosedCandle:
     class _ILoc:
         def __getitem__(self, _item):
@@ -291,6 +307,7 @@ def _management_namespace(adapter, state, *, price):
             "data_hora_sp_str": lambda: "2026-08-10T12:00:00-03:00",
             "traceback": type("Traceback", (), {"print_exc": staticmethod(lambda: None)})(),
             "time": _OneLoopTime(),
+            "RUNTIME_DRAIN": _TestRuntimeDrain(),
             "MANAGEMENT_SLEEP_SECONDS": 0,
         }
     )

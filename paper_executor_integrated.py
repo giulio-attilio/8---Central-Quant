@@ -15,6 +15,7 @@
 
 import os
 import json
+import threading
 import time
 import hashlib
 from pathlib import Path
@@ -33,6 +34,7 @@ PAPER_SEEN_FILE = DATA_DIR / "paper_integrated_seen.json"
 
 PAPER_EXECUTION_ENABLED = os.getenv("CENTRAL_PAPER_EXECUTION_ENABLED", "false").lower() == "true"
 REAL_EXECUTION_ENABLED = os.getenv("CENTRAL_REAL_EXECUTION_ENABLED", "false").lower() == "true"
+_PAPER_EXECUTION_LOCK = threading.RLock()
 
 
 def _now_br() -> str:
@@ -48,11 +50,30 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def _read_state_json(path: Path, default: Any) -> Any:
+    """Read execution state strictly so corruption cannot masquerade as empty state."""
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: Any) -> bool:
+    """Atomically replace one PAPER state file; report failures to the caller."""
+    temp_path = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+        return True
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
 
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
@@ -130,6 +151,8 @@ def validate_paper_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     payload = plan.get("payload") if isinstance(plan.get("payload"), dict) else {}
 
     idempotency_key = plan.get("idempotency_key")
+    if isinstance(idempotency_key, str):
+        idempotency_key = idempotency_key.strip()
     symbol = _clean_symbol(payload.get("symbol"))
     side = _normalize_side(payload.get("side"))
     bot = payload.get("bot")
@@ -141,8 +164,8 @@ def validate_paper_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     requested_qty = _safe_float(plan.get("requested_qty"), 0.0)
     capital_allocated = _safe_float(plan.get("capital_allocated"))
 
-    if not idempotency_key:
-        errors.append("idempotency_key ausente")
+    if not isinstance(idempotency_key, str) or not idempotency_key:
+        errors.append("idempotency_key ausente ou inválida")
     if not symbol:
         errors.append("symbol ausente")
     if side not in {"LONG", "SHORT"}:
@@ -226,28 +249,7 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
         _append_jsonl(PAPER_LOG_FILE, {"event": "PAPER_INVALID_PLAN", "payload": result})
         return {"ok": False, "payload": result}
 
-    seen = _read_json(PAPER_SEEN_FILE, {})
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
-
     idem = normalized["idempotency_key"]
-
-    if idem in seen:
-        result = {
-            "ok": False,
-            "status": "PAPER_DUPLICATE_BLOCKED",
-            "reason": "idempotency_key já executada em PAPER",
-            "version": VERSION,
-            "generated_at": _now_br(),
-            "idempotency_key": idem,
-            "previous_seen_at": seen[idem].get("seen_at"),
-            "errors": ["execução paper duplicada"],
-            "warnings": validation["warnings"],
-            "exchange_executor_called": False,
-            "paper_executor_called": True,
-        }
-        _append_jsonl(PAPER_LOG_FILE, {"event": "PAPER_DUPLICATE_BLOCKED", "payload": result})
-        return {"ok": False, "payload": result}
-
     trade_id = _build_trade_id(plan)
 
     position = {
@@ -289,46 +291,127 @@ def execute_paper_from_engine(engine_payload: Dict[str, Any]) -> Dict[str, Any]:
         ],
     }
 
-    positions.append(position)
-    _write_json(PAPER_POSITIONS_FILE, positions)
+    with _PAPER_EXECUTION_LOCK:
+        try:
+            seen = _read_state_json(PAPER_SEEN_FILE, {})
+            positions = _read_state_json(PAPER_POSITIONS_FILE, [])
+        except Exception:
+            seen, positions = None, None
+        if not isinstance(seen, dict) or not isinstance(positions, list):
+            result = {
+                "ok": False,
+                "status": "PAPER_STATE_INVALID",
+                "reason": "estado PAPER inválido; execução bloqueada para evitar duplicidade",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "idempotency_key": idem,
+                "errors": ["estado PAPER não é JSON object/list válido"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
+            return {"ok": False, "payload": result}
 
-    seen[idem] = {
-        "seen_at": _now_br(),
-        "trade_id": trade_id,
-        "symbol": normalized["symbol"],
-        "side": normalized["side"],
-        "bot": normalized["bot"],
-        "setup": normalized["setup"],
-    }
-    _write_json(PAPER_SEEN_FILE, seen)
+        existing_position = next(
+            (
+                item for item in positions
+                if isinstance(item, dict) and str(item.get("idempotency_key") or "") == str(idem)
+            ),
+            None,
+        )
+        seen_entry = seen.get(idem)
+        if idem in seen or existing_position is not None:
+            # The position ledger is also an idempotency source of truth: this
+            # covers a crash after positions were committed but before the seen cache.
+            if not isinstance(seen_entry, dict):
+                seen_entry = {}
+            if existing_position is not None and idem not in seen:
+                seen[idem] = {
+                    "seen_at": existing_position.get("opened_at") or _now_br(),
+                    "trade_id": existing_position.get("trade_id"),
+                    "symbol": existing_position.get("symbol"),
+                    "side": existing_position.get("side"),
+                    "recovered_from_position_ledger": True,
+                }
+                _write_json(PAPER_SEEN_FILE, seen)
+            result = {
+                "ok": False,
+                "status": "PAPER_DUPLICATE_BLOCKED",
+                "reason": "idempotency_key já executada em PAPER",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "idempotency_key": idem,
+                "previous_seen_at": seen_entry.get("seen_at"),
+                "trade_id": (existing_position or {}).get("trade_id") or seen_entry.get("trade_id"),
+                "errors": ["execução paper duplicada"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
+            try:
+                _append_jsonl(PAPER_LOG_FILE, {"event": "PAPER_DUPLICATE_BLOCKED", "payload": result})
+            except Exception:
+                pass
+            return {"ok": False, "payload": result}
 
-    result = {
-        "ok": True,
-        "status": "PAPER_OPENED",
-        "version": VERSION,
-        "generated_at": _now_br(),
-        "trade_id": trade_id,
-        "idempotency_key": idem,
-        "position": position,
-        "errors": [],
-        "warnings": validation["warnings"],
-        "exchange_executor_called": False,
-        "paper_executor_called": True,
-        "real_execution_enabled": REAL_EXECUTION_ENABLED,
-        "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
-    }
+        positions.append(position)
+        if not _write_json(PAPER_POSITIONS_FILE, positions):
+            result = {
+                "ok": False,
+                "status": "PAPER_STATE_PERSISTENCE_FAILED",
+                "reason": "posição PAPER não foi persistida; execução bloqueada",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "idempotency_key": idem,
+                "errors": ["falha ao persistir paper_integrated_positions.json"],
+                "warnings": validation["warnings"],
+                "exchange_executor_called": False,
+                "paper_executor_called": True,
+            }
+            return {"ok": False, "payload": result}
 
-    _append_jsonl(PAPER_LOG_FILE, {
-        "event": "PAPER_TRADE_OPENED",
-        "version": VERSION,
-        "generated_at": _now_br(),
-        "epoch": time.time(),
-        "trade_id": trade_id,
-        "idempotency_key": idem,
-        "result": result,
-    })
+        seen[idem] = {
+            "seen_at": _now_br(),
+            "trade_id": trade_id,
+            "symbol": normalized["symbol"],
+            "side": normalized["side"],
+            "bot": normalized["bot"],
+            "setup": normalized["setup"],
+        }
+        seen_persisted = _write_json(PAPER_SEEN_FILE, seen)
 
-    return {"ok": True, "payload": result}
+        result = {
+            "ok": True,
+            "status": "PAPER_OPENED",
+            "version": VERSION,
+            "generated_at": _now_br(),
+            "trade_id": trade_id,
+            "idempotency_key": idem,
+            "position": position,
+            "errors": [],
+            "warnings": validation["warnings"] + ([] if seen_persisted else [
+                "marcador de idempotência pendente; retry será bloqueado pelo ledger de posições"
+            ]),
+            "exchange_executor_called": False,
+            "paper_executor_called": True,
+            "real_execution_enabled": REAL_EXECUTION_ENABLED,
+            "paper_execution_enabled": PAPER_EXECUTION_ENABLED,
+        }
+
+        try:
+            _append_jsonl(PAPER_LOG_FILE, {
+                "event": "PAPER_TRADE_OPENED",
+                "version": VERSION,
+                "generated_at": _now_br(),
+                "epoch": time.time(),
+                "trade_id": trade_id,
+                "idempotency_key": idem,
+                "result": result,
+            })
+        except Exception:
+            result["warnings"].append("posição PAPER persistida, mas o log de auditoria falhou")
+
+        return {"ok": True, "payload": result}
 
 
 def paper_integrated_health() -> Dict[str, Any]:
