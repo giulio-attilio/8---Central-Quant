@@ -1647,6 +1647,48 @@ def _dedup_seen(uid):
         return False
 
 
+def _append_history_event_once(item):
+    """Append the canonical event before reserving its UID in either cache."""
+    uid = str((item or {}).get("uid") or "")
+    if not uid or not HISTORY_DEDUP_ENABLED:
+        return _append_jsonl(HISTORY_EVENTS_FILE, item), False
+    try:
+        with _PROCESS_SEEN_UIDS_LOCK:
+            if uid in _PROCESS_SEEN_UIDS:
+                _PROCESS_SEEN_UIDS.move_to_end(uid)
+                return True, True
+
+            seen = _read_json(HISTORY_SEEN_FILE, {})
+            if not isinstance(seen, dict):
+                seen = {}
+            if uid in seen:
+                _PROCESS_SEEN_UIDS[uid] = seen.get(uid) or time.time()
+                while len(_PROCESS_SEEN_UIDS) > HISTORY_DEDUP_MAX_KEYS:
+                    _PROCESS_SEEN_UIDS.popitem(last=False)
+                return True, True
+
+            if not _append_jsonl(HISTORY_EVENTS_FILE, item):
+                return False, False
+
+            seen_at = time.time()
+            _PROCESS_SEEN_UIDS[uid] = seen_at
+            while len(_PROCESS_SEEN_UIDS) > HISTORY_DEDUP_MAX_KEYS:
+                _PROCESS_SEEN_UIDS.popitem(last=False)
+            seen[uid] = seen_at
+            if len(seen) > HISTORY_DEDUP_MAX_KEYS:
+                items = sorted(seen.items(), key=lambda entry: entry[1])[-HISTORY_DEDUP_MAX_KEYS:]
+                seen = dict(items)
+            try:
+                _write_json(HISTORY_SEEN_FILE, seen)
+            except Exception:
+                # The event was appended; keep its in-process marker and accept
+                # a possible duplicate after restart rather than report loss.
+                pass
+            return True, False
+    except Exception:
+        return False, False
+
+
 
 def _looks_like_dict_string(value):
     if not isinstance(value, str):
@@ -2697,10 +2739,9 @@ def log_event(event_type, payload=None, source=None, trade_id=None):
                 context_result = {"ok": True, "version": getattr(context_manager, "CONTEXT_VERSION", None)}
         except Exception as context_exc:
             context_result = {"ok": False, "error": str(context_exc)}
-        uid = item.get("uid")
-        if uid and _dedup_seen(uid):
-            return {"ok": True, "dedup": True, "uid": uid}
-        ok = _append_jsonl(HISTORY_EVENTS_FILE, item)
+        ok, dedup = _append_history_event_once(item)
+        if dedup:
+            return {"ok": True, "dedup": True, "uid": item.get("uid")}
         timeline_written = False
         decision_log_written = False
         redundant_mirror_suppressed = False

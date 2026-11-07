@@ -4,6 +4,9 @@ import unittest
 import socket
 import os
 import base64
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 from flask.testing import FlaskClient
@@ -98,11 +101,140 @@ class HistoryEventBusSmokeTest(unittest.TestCase):
         self.assertTrue(status["ok"])
         self.assertEqual(status["events_file"], str(self.history_dir / "history_events.jsonl"))
 
+    def test_failed_primary_append_does_not_poison_same_process_retry(self):
+        item = {"uid": "retry-after-primary-append-failure-v1", "event": "TEST_EVENT"}
+        original_append = history_manager._append_jsonl
+        attempts = 0
+
+        def fail_once(path, event):
+            nonlocal attempts
+            if Path(path) == history_manager.HISTORY_EVENTS_FILE:
+                attempts += 1
+                if attempts == 1:
+                    return False
+            return original_append(path, event)
+
+        with mock.patch.object(history_manager, "normalize_payload", return_value=item), mock.patch.object(
+            history_manager, "_append_jsonl", side_effect=fail_once
+        ):
+            first = history_manager.log_event("TEST_EVENT")
+            second = history_manager.log_event("TEST_EVENT")
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertFalse(second["dedup"])
+        self.assertEqual(len(history_manager.load_events()), 1)
+
+    def test_concurrent_same_uid_writes_primary_event_once(self):
+        item = {"uid": "concurrent-primary-event-v1", "event": "TEST_EVENT"}
+        original_append = history_manager._append_jsonl
+        barrier = threading.Barrier(8)
+        lock = threading.Lock()
+        primary_appends = 0
+
+        def observed_append(path, event):
+            nonlocal primary_appends
+            if Path(path) == history_manager.HISTORY_EVENTS_FILE:
+                with lock:
+                    primary_appends += 1
+                time.sleep(0.01)
+            return original_append(path, event)
+
+        def emit(_index):
+            barrier.wait(timeout=3)
+            return history_manager.log_event("TEST_EVENT")
+
+        with mock.patch.object(history_manager, "normalize_payload", return_value=item), mock.patch.object(
+            history_manager, "_append_jsonl", side_effect=observed_append
+        ):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(emit, range(8)))
+
+        self.assertEqual(primary_appends, 1)
+        self.assertEqual(sum(result["dedup"] is False for result in results), 1)
+        self.assertEqual(sum(result["dedup"] is True for result in results), 7)
+        self.assertEqual(len(history_manager.load_events()), 1)
+
     def test_emit_from_http_logs_event(self):
         result = event_bus.emit_from_http({"event": "TEST_EVENT", "symbol": "ETHUSDT", "bot": "unit-test"})
         self.assertTrue(result["ok"])
         self.assertTrue(result["event_bus_logged"])
         self.assertIn("uid", result)
+
+    def test_event_bus_append_failure_does_not_poison_same_process_retry(self):
+        payload = {"event_id": "eventbus-append-retry-v1", "event": "TEST_EVENT"}
+        original_append = event_bus._append_jsonl
+        attempts = 0
+
+        def fail_once(path, item):
+            nonlocal attempts
+            if Path(path) == event_bus.EVENT_BUS_LOG_FILE:
+                attempts += 1
+                if attempts == 1:
+                    return False
+            return original_append(path, item)
+
+        with mock.patch.object(event_bus, "_append_jsonl", side_effect=fail_once):
+            first = event_bus.emit_from_http(payload)
+            second = event_bus.emit_from_http(payload)
+
+        self.assertFalse(first["ok"])
+        self.assertFalse(first["event_bus_logged"])
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["history_logged"])
+        rows = (self.event_dir / "event_bus.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(rows), 1)
+
+    def test_history_failure_keeps_event_retryable_without_advancing_seen_marker(self):
+        payload = {"event_id": "eventbus-history-retry-v1", "event": "TEST_EVENT"}
+        with mock.patch.object(
+            event_bus.history_manager,
+            "log_event",
+            side_effect=[{"ok": False, "error": "temporary write failure"}, {"ok": True}],
+        ) as log_event:
+            first = event_bus.emit_from_http(payload)
+            second = event_bus.emit_from_http(payload)
+            third = event_bus.emit_from_http(payload)
+
+        self.assertFalse(first["ok"])
+        self.assertFalse(first["history_logged"])
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["history_logged"])
+        self.assertTrue(third["dedup"])
+        self.assertEqual(log_event.call_count, 2)
+        rows = (self.event_dir / "event_bus.jsonl").read_text(encoding="utf-8").splitlines()
+        # The retry policy prefers a recoverable duplicate telemetry row over a lost history event.
+        self.assertEqual(len(rows), 2)
+
+    def test_concurrent_same_event_id_is_forwarded_once(self):
+        payload = {"event_id": "eventbus-concurrent-v1", "event": "TEST_EVENT"}
+        barrier = threading.Barrier(8)
+        original_append = event_bus._append_jsonl
+        lock = threading.Lock()
+        event_appends = 0
+
+        def observed_append(path, item):
+            nonlocal event_appends
+            if Path(path) == event_bus.EVENT_BUS_LOG_FILE:
+                with lock:
+                    event_appends += 1
+                time.sleep(0.01)
+            return original_append(path, item)
+
+        def emit(_index):
+            barrier.wait(timeout=3)
+            return event_bus.emit_from_http(payload)
+
+        with mock.patch.object(event_bus, "_append_jsonl", side_effect=observed_append), mock.patch.object(
+            event_bus.history_manager, "log_event", return_value={"ok": True}
+        ) as log_event:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(emit, range(8)))
+
+        self.assertEqual(event_appends, 1)
+        self.assertEqual(log_event.call_count, 1)
+        self.assertEqual(sum(result.get("dedup") is not True for result in results), 1)
+        self.assertEqual(sum(result.get("dedup") is True for result in results), 7)
 
     def test_load_events_filters_and_aggregation(self):
         history_manager.log_event("SIGNAL", {"symbol": "BTCUSDT", "side": "buy", "setup": "breakout", "trade_id": "A1"}, source="falcon", trade_id="A1")

@@ -6,6 +6,9 @@ import json
 import os
 import stat
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -89,6 +92,145 @@ def test_default_returns_exactly_last_ten_thousand_in_chronological_order(journa
     assert [row["uid"] for row in actual[-2:]] == ["event-10023", "event-10024"]
     assert [row["epoch"] for row in actual] == sorted(row["epoch"] for row in actual)
     assert journal.load_lifecycle_events(limit=10_025) == rows
+
+
+def test_dedup_seen_read_modify_write_is_serialized_across_threads(journal, monkeypatch):
+    worker_count = 12
+    start = threading.Barrier(worker_count)
+    active_lock = threading.Lock()
+    active_reads = 0
+    max_active_reads = 0
+    original_read_json = journal._read_json
+
+    def observed_read_json(path, default):
+        nonlocal active_reads, max_active_reads
+        if path == journal.JOURNAL_SEEN_FILE:
+            with active_lock:
+                active_reads += 1
+                max_active_reads = max(max_active_reads, active_reads)
+            try:
+                time.sleep(0.01)
+                return original_read_json(path, default)
+            finally:
+                with active_lock:
+                    active_reads -= 1
+        return original_read_json(path, default)
+
+    monkeypatch.setattr(journal, "_read_json", observed_read_json)
+
+    def record(index):
+        start.wait(timeout=3)
+        return journal._dedup_seen(f"thread-event-{index}")
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        results = list(pool.map(record, range(worker_count)))
+
+    assert results == [False] * worker_count
+    assert max_active_reads == 1
+    assert len(json.loads(journal.JOURNAL_SEEN_FILE.read_text(encoding="utf-8"))) == worker_count
+
+
+def test_failed_lifecycle_append_does_not_poison_dedup_cache(journal, monkeypatch):
+    event = _event(77)
+    original_append = journal._append_jsonl
+    attempts = 0
+
+    def fail_once(path, item):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        return original_append(path, item)
+
+    monkeypatch.setattr(journal, "_append_jsonl", fail_once)
+
+    first = journal.append_lifecycle_event(event)
+    second = journal.append_lifecycle_event(event)
+
+    assert first["ok"] is False
+    assert second["ok"] is True
+    assert second["dedup"] is False
+    assert [row["uid"] for row in journal.load_lifecycle_events()] == [
+        journal.normalize_lifecycle_event(event)["uid"]
+    ]
+
+
+def test_concurrent_lifecycle_duplicate_appends_only_once(journal, monkeypatch):
+    worker_count = 12
+    start = threading.Barrier(worker_count)
+    original_append = journal._append_jsonl
+    append_calls = 0
+    calls_lock = threading.Lock()
+
+    def observed_append(path, item):
+        nonlocal append_calls
+        with calls_lock:
+            append_calls += 1
+        time.sleep(0.01)
+        return original_append(path, item)
+
+    monkeypatch.setattr(journal, "_append_jsonl", observed_append)
+
+    def record(_index):
+        start.wait(timeout=3)
+        return journal.append_lifecycle_event(_event(88))
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        results = list(pool.map(record, range(worker_count)))
+
+    assert sum(result["dedup"] is False for result in results) == 1
+    assert sum(result["dedup"] is True for result in results) == worker_count - 1
+    assert append_calls == 1
+    assert [row["uid"] for row in journal.load_lifecycle_events()] == [
+        journal.normalize_lifecycle_event(_event(88))["uid"]
+    ]
+
+
+def test_failed_trade_journal_append_can_be_retried(journal, monkeypatch):
+    trade = {
+        "uid": "closed-trade-91",
+        "event": "TRADE_CLOSED",
+        "trade_id": "trade-91",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "pnl_pct": 1.5,
+    }
+    original_append = journal._append_jsonl
+    attempts = 0
+
+    def fail_once(path, item):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        return original_append(path, item)
+
+    monkeypatch.setattr(journal, "_append_jsonl", fail_once)
+
+    first = journal.append_journal_trade(trade)
+    second = journal.append_journal_trade(trade)
+
+    assert first["ok"] is False
+    assert second["ok"] is True
+    assert second["dedup"] is False
+    assert [row["journal_id"] for row in journal.load_journal_trades()] == ["closed-trade-91"]
+
+
+def test_seen_cache_failure_does_not_misreport_successful_lifecycle_append(journal, monkeypatch):
+    event = _event(92)
+
+    def fail_cache_write(*_args, **_kwargs):
+        raise OSError("simulated cache write failure")
+
+    monkeypatch.setattr(journal, "_write_json", fail_cache_write)
+
+    result = journal.append_lifecycle_event(event)
+
+    assert result["ok"] is True
+    assert result["dedup"] is False
+    assert [row["uid"] for row in journal.load_lifecycle_events()] == [
+        journal.normalize_lifecycle_event(event)["uid"]
+    ]
 
 
 def test_limit_contract_none_zero_one_negative_and_above_default(journal):

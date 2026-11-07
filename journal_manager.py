@@ -13,6 +13,7 @@
 import json
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -32,6 +33,7 @@ LIFECYCLE_EXPORT_FILE = DATA_DIR / "trade_lifecycle_export.json"
 LIFECYCLE_MAX_READ = int(os.environ.get("LIFECYCLE_MAX_READ", "10000"))
 LIFECYCLE_TAIL_BLOCK_BYTES = 64 * 1024
 JOURNAL_SEEN_MAX = int(os.environ.get("JOURNAL_SEEN_MAX", "10000"))
+_JOURNAL_SEEN_LOCK = threading.RLock()
 
 
 def ensure_journal_files():
@@ -439,18 +441,53 @@ def _journal_uid(event):
 
 def _dedup_seen(uid):
     try:
-        seen = _read_json(JOURNAL_SEEN_FILE, {})
-        if not isinstance(seen, dict):
-            seen = {}
-        if uid in seen:
-            return True
-        seen[uid] = time.time()
-        if len(seen) > JOURNAL_SEEN_MAX:
-            seen = dict(sorted(seen.items(), key=lambda x: x[1])[-JOURNAL_SEEN_MAX:])
-        _write_json(JOURNAL_SEEN_FILE, seen)
-        return False
+        # This read-modify-write must be atomic across the service's bot threads.
+        with _JOURNAL_SEEN_LOCK:
+            seen = _read_json(JOURNAL_SEEN_FILE, {})
+            if not isinstance(seen, dict):
+                seen = {}
+            if uid in seen:
+                return True
+            seen[uid] = time.time()
+            if len(seen) > JOURNAL_SEEN_MAX:
+                seen = dict(sorted(seen.items(), key=lambda x: x[1])[-JOURNAL_SEEN_MAX:])
+            _write_json(JOURNAL_SEEN_FILE, seen)
+            return False
     except Exception:
         return False
+
+
+def _append_deduplicated_jsonl(path, item, uid):
+    """Append once per UID without reserving the UID before the JSONL append."""
+    try:
+        with _JOURNAL_SEEN_LOCK:
+            if uid:
+                seen = _read_json(JOURNAL_SEEN_FILE, {})
+                if isinstance(seen, dict) and uid in seen:
+                    return {"ok": True, "dedup": True, "uid": uid}
+
+            ok = _append_jsonl(path, item)
+            if not ok:
+                return {"ok": False, "dedup": False, "uid": uid}
+
+            # Prefer a possible duplicate after a cache-write failure/crash over
+            # losing an event whose append failed after its UID was reserved.
+            if uid:
+                seen = _read_json(JOURNAL_SEEN_FILE, {})
+                if not isinstance(seen, dict):
+                    seen = {}
+                seen[uid] = time.time()
+                if len(seen) > JOURNAL_SEEN_MAX:
+                    seen = dict(sorted(seen.items(), key=lambda entry: entry[1])[-JOURNAL_SEEN_MAX:])
+                try:
+                    _write_json(JOURNAL_SEEN_FILE, seen)
+                except Exception:
+                    # The event is already appended; report that fact and allow
+                    # a later duplicate rather than signaling a lost write.
+                    pass
+            return {"ok": True, "dedup": False, "uid": uid}
+    except Exception:
+        return {"ok": False, "dedup": False, "uid": uid}
 
 
 def _result_label(pnl_pct, result_value=None):
@@ -547,10 +584,8 @@ def append_journal_trade(event):
     if not trade:
         return {"ok": False, "error": "evento não é TRADE_CLOSED válido"}
     uid = trade.get("journal_id")
-    if uid and _dedup_seen(uid):
-        return {"ok": True, "dedup": True, "journal_id": uid}
-    ok = _append_jsonl(JOURNAL_FILE, trade)
-    return {"ok": ok, "dedup": False, "journal_id": uid, "trade": trade}
+    result = _append_deduplicated_jsonl(JOURNAL_FILE, trade, uid)
+    return {**result, "journal_id": uid, "trade": trade}
 
 
 def load_journal_trades(limit=None):
@@ -834,10 +869,8 @@ def append_lifecycle_event(event):
     if not item:
         return {"ok": False, "skipped": True, "error": "evento não é lifecycle válido"}
     uid = item.get("uid")
-    if uid and _dedup_seen(uid):
-        return {"ok": True, "dedup": True, "uid": uid}
-    ok = _append_jsonl(LIFECYCLE_FILE, item)
-    return {"ok": ok, "dedup": False, "event": item}
+    result = _append_deduplicated_jsonl(LIFECYCLE_FILE, item, uid)
+    return {**result, "event": item}
 
 
 def load_lifecycle_events(limit=None):

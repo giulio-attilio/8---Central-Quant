@@ -10,6 +10,7 @@
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -27,7 +28,9 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 EVENT_BUS_LOG_FILE = DATA_DIR / "event_bus.jsonl"
 EVENT_BUS_SEEN_FILE = DATA_DIR / "event_bus_seen.json"
-EVENT_BUS_SEEN_MAX = int(os.environ.get("EVENT_BUS_SEEN_MAX", "5000"))
+EVENT_BUS_SEEN_MAX = max(1, int(os.environ.get("EVENT_BUS_SEEN_MAX", "5000")))
+_EVENT_BUS_LOCK = threading.RLock()
+_PROCESS_EVENT_BUS_SEEN = set()
 
 
 def data_hora_sp_str():
@@ -86,19 +89,41 @@ def _uid(payload):
 
 def _seen(uid):
     try:
+        key = str(uid)
+        with _EVENT_BUS_LOCK:
+            if key in _PROCESS_EVENT_BUS_SEEN:
+                return True
+            data = _read_json(EVENT_BUS_SEEN_FILE, {})
+            if not isinstance(data, dict):
+                data = {}
+            if key in data:
+                _PROCESS_EVENT_BUS_SEEN.add(key)
+                return True
+            return False
+    except Exception:
+        return False
+
+
+def _mark_seen(uid):
+    """Persist deduplication only after the event and its history write succeed."""
+    key = str(uid)
+    with _EVENT_BUS_LOCK:
+        _PROCESS_EVENT_BUS_SEEN.add(key)
+        while len(_PROCESS_EVENT_BUS_SEEN) > EVENT_BUS_SEEN_MAX:
+            _PROCESS_EVENT_BUS_SEEN.pop()
         data = _read_json(EVENT_BUS_SEEN_FILE, {})
         if not isinstance(data, dict):
             data = {}
-        if uid in data:
-            return True
-        data[uid] = time.time()
+        data[key] = time.time()
         if len(data) > EVENT_BUS_SEEN_MAX:
-            items = sorted(data.items(), key=lambda x: x[1])[-EVENT_BUS_SEEN_MAX:]
+            items = sorted(data.items(), key=lambda entry: entry[1])[-EVENT_BUS_SEEN_MAX:]
             data = dict(items)
-        _write_json(EVENT_BUS_SEEN_FILE, data)
-        return False
-    except Exception:
-        return False
+        try:
+            _write_json(EVENT_BUS_SEEN_FILE, data)
+        except Exception:
+            # A completed event remains marked in-process; after restart a
+            # duplicate is preferable to losing a retryable event.
+            pass
 
 
 def emit_from_http(payload):
@@ -106,37 +131,41 @@ def emit_from_http(payload):
         return {"ok": False, "error": "payload precisa ser JSON object"}
 
     uid = _uid(payload)
-    if _seen(uid):
-        return {"ok": True, "dedup": True, "uid": uid, "event_bus_logged": True, "history_logged": False}
+    with _EVENT_BUS_LOCK:
+        if _seen(uid):
+            return {"ok": True, "dedup": True, "uid": uid, "event_bus_logged": True, "history_logged": True}
 
-    item = dict(payload)
-    item.setdefault("received_at", data_hora_sp_str())
-    item.setdefault("epoch", time.time())
-    item["uid"] = uid
-    event_bus_logged = _append_jsonl(EVENT_BUS_LOG_FILE, item)
-    if not event_bus_logged:
-        return {"ok": False, "uid": uid, "error": "falha ao gravar event_bus.jsonl", "event_bus_logged": False}
+        item = dict(payload)
+        item.setdefault("received_at", data_hora_sp_str())
+        item.setdefault("epoch", time.time())
+        item["uid"] = uid
+        event_bus_logged = _append_jsonl(EVENT_BUS_LOG_FILE, item)
+        if not event_bus_logged:
+            return {"ok": False, "uid": uid, "error": "falha ao gravar event_bus.jsonl", "event_bus_logged": False}
 
-    if history_manager is None:
+        if history_manager is None:
+            return {
+                "ok": True,
+                "uid": uid,
+                "event_bus_logged": True,
+                "history_logged": False,
+                "error": HISTORY_MANAGER_ERROR or "history_manager indisponível",
+            }
+
+        event_type = item.get("event") or item.get("event_type") or item.get("type") or "EVENT"
+        source = item.get("source") or item.get("bot") or "event_bus"
+        trade_id = item.get("trade_id") or item.get("position_id")
+        try:
+            result = history_manager.log_event(event_type, item, source=source, trade_id=trade_id)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        history_logged = bool(result.get("ok", False))
+        if history_logged:
+            _mark_seen(uid)
         return {
-            "ok": True,
+            "ok": bool(result.get("ok", True)),
             "uid": uid,
             "event_bus_logged": True,
-            "history_logged": False,
-            "error": HISTORY_MANAGER_ERROR or "history_manager indisponível",
+            "history_logged": history_logged,
+            "history": result,
         }
-
-    event_type = item.get("event") or item.get("event_type") or item.get("type") or "EVENT"
-    source = item.get("source") or item.get("bot") or "event_bus"
-    trade_id = item.get("trade_id") or item.get("position_id")
-    try:
-        result = history_manager.log_event(event_type, item, source=source, trade_id=trade_id)
-    except Exception as exc:
-        result = {"ok": False, "error": str(exc)}
-    return {
-        "ok": bool(result.get("ok", True)),
-        "uid": uid,
-        "event_bus_logged": True,
-        "history_logged": bool(result.get("ok", False)),
-        "history": result,
-    }
