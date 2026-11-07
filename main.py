@@ -2671,10 +2671,16 @@ def start_enabled_bots():
             continue
         try:
             memory_profile_step(f"before_load_bot_{key}")
+            print(
+                f"BOT STARTUP LOAD BEGIN: {key} module={cfg['module']}"
+            )
             LOADED_BOTS[key] = load_bot(key, cfg)
+            print(f"BOT STARTUP IMPORT COMPLETE: {key}")
             try:
+                print(f"BOT STARTUP HISTORY WRAP BEGIN: {key}")
                 import history_manager as super_history_manager
                 super_history_manager.wrap_bot_module(LOADED_BOTS[key], key)
+                print(f"BOT STARTUP HISTORY WRAP COMPLETE: {key}")
             except Exception as _history_wrap_exc:
                 print(f"AVISO HISTORY WRAP BOT {key}: {_history_wrap_exc}")
             print(f"BOT CARREGADO: {key} - {cfg['name']}")
@@ -70323,6 +70329,14 @@ if __name__ == "__main__":
     _central_restore_shutdown_handlers = install_shutdown_signal_handlers(
         _central_shutdown_server, RUNTIME_DRAIN
     )
+    # Keep the HTTP liveness endpoint responsive while bot modules are loaded.
+    # Some imports/startup work can take several minutes on the persistent disk.
+    _central_http_server_thread = threading.Thread(
+        target=_central_shutdown_server.serve_forever,
+        name="central-http-server",
+        daemon=True,
+    )
+    _central_http_server_thread.start()
 
 
 if CENTRAL_AUTO_START_RUNTIME:
@@ -70331,7 +70345,7 @@ if CENTRAL_AUTO_START_RUNTIME:
 
 if __name__ == "__main__":
     try:
-        _central_shutdown_server.serve_forever()
+        _central_http_server_thread.join()
     finally:
         try:
             _central_drained = close_after_drain(

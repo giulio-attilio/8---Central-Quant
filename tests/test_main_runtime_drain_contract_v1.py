@@ -233,15 +233,37 @@ def test_loaded_central_admission_provider_returns_deny_during_drain():
     assert result["reasons"] == ["RUNTIME_DRAINING"]
 
 
-def test_shutdown_handlers_precede_runtime_start_and_allow_bounded_drain():
+def test_http_server_starts_before_runtime_boot_and_shutdown_remains_bounded():
     source = _source(ROOT / "main.py")
     install = source.index("install_shutdown_signal_handlers(")
+    serve_target = source.index("target=_central_shutdown_server.serve_forever")
+    serve_start = source.index("_central_http_server_thread.start()")
     startup = source.index("if CENTRAL_AUTO_START_RUNTIME:")
-    serve = source.index("_central_shutdown_server.serve_forever()")
-    assert install < startup < serve
-    assert "threaded=True" in source[install - 180 : startup]
-    assert "grace_seconds=27.0" in source[serve:]
-    assert "server.shutdown" not in source[serve:]
+    join = source.index("_central_http_server_thread.join()")
+    assert install < serve_target < serve_start < startup < join
+    assert "threaded=True" in source[install - 180 : serve_target]
+    assert "daemon=True" in source[serve_target:serve_start]
+    assert "grace_seconds=27.0" in source[join:]
+    assert "server.shutdown" not in source[join:]
+
+
+def test_bot_startup_logs_bracket_import_and_history_wrap_without_environment_values():
+    source = _source(ROOT / "main.py")
+    start = source.index("def start_enabled_bots():")
+    end = source.index("\ndef bot_health(", start)
+    block = source[start:end]
+    markers = (
+        "BOT STARTUP LOAD BEGIN",
+        "load_bot(key, cfg)",
+        "BOT STARTUP IMPORT COMPLETE",
+        "BOT STARTUP HISTORY WRAP BEGIN",
+        "wrap_bot_module(LOADED_BOTS[key], key)",
+        "BOT STARTUP HISTORY WRAP COMPLETE",
+    )
+    positions = [block.index(marker) for marker in markers]
+    assert positions == sorted(positions)
+    assert "TOKEN" not in block
+    assert "CHAT_ID" not in block
 
 
 def test_drain_is_process_local_and_never_changes_trading_mode_controls():

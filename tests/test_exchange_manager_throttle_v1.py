@@ -18,6 +18,10 @@ except ModuleNotFoundError:
     # ccxt; all exchange behavior below is already supplied by FakeExchange.
     ccxt_stub = ModuleType("ccxt")
     ccxt_stub.ExchangeError = type("ExchangeError", (Exception,), {})
+    ccxt_stub.NetworkError = type("NetworkError", (ccxt_stub.ExchangeError,), {})
+    ccxt_stub.OperationFailed = type(
+        "OperationFailed", (ccxt_stub.ExchangeError,), {}
+    )
     ccxt_stub.RateLimitExceeded = type("RateLimitExceeded", (Exception,), {})
 
     class _StubBingx:
