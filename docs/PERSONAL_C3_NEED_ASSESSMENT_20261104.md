@@ -8100,3 +8100,40 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
 - Após os commits locais `86e122b` e `56149f4`, o runner offline bloqueado
   executou `--market-data-throttle`: **93 testes passaram em 7,93 s**, exit code
   zero. Nenhuma chamada de rede externa foi permitida.
+
+## Suíte offline de execução pessoal — 2026-11-07
+
+- No HEAD `dcfd16bc32ce77828522c75439d686c17f27ea6c`, o runner
+  `tests/run_falcon_pilot_minimal_offline.py --personal-execution-safety`
+  terminou com **402 testes aprovados em 201,73 s**. O runner bloqueia sockets,
+  DNS, HTTP externo, subprocessos e leitura de arquivos `.env`; não houve acesso
+  a serviços externos nem envio de ordens.
+- Essa suíte valida contratos sintéticos de execução pessoal, não a integração
+  com a BingX nem qualquer posição LIVE. A branch continua local, três commits à
+  frente do upstream; push e deploy aguardam confirmação financeira e
+  confirmação atual de que não há operações em andamento.
+
+## Revalidação da autenticação e do release ativo — 2026-11-07
+
+- A suíte offline `--personal-http-auth` passou novamente: **239 testes em
+  21,38 s**, exit code zero. A inspeção local confirma que o `before_request`
+  global de Basic Auth é executado antes das rotas, inclusive `/can_open_trade`;
+  somente `GET /healthz` sem query tem exceção pública de liveness.
+- Consulta somente de leitura ao Render confirmou o serviço `central-robos-bingx`
+  no plano Standard, uma instância, disco persistente de 2 GB, auto-deploy
+  desativado e `4bd218f` como deploy `live`. Não foi iniciado novo deploy.
+- Os logs de requisição retornaram algumas chamadas `POST /can_open_trade` com
+  status 200 no intervalo consultado. Os logs disponíveis não incluem os
+  cabeçalhos de autenticação; portanto não identificam o chamador. Uma consulta
+  complementar ao Loki falhou com 503 e permanece inconclusiva. Não interpreto
+  isso como prova de acesso anônimo nem como prova da identidade do chamador.
+- O código presente tanto no HEAD local validado quanto no deploy ativo
+  `4bd218f` confirma que a rota passa por Basic Auth global. Também mostra que o
+  wrapper chama o bridge com `execute=True, dry_run=False`; a execução depende
+  dos gates internos e da configuração runtime. Portanto, o status HTTP 200 não
+  prova que houve execução ou ordem, mas a rota merece auditoria específica.
+- Ainda é necessário identificar o consumidor das chamadas e confirmar, por
+  evidência sem secrets, que os controles runtime de trading permanecem em
+  PAPER e que o gate final bloqueia envio. Os logs do Loki não permitiram essa
+  confirmação nesta consulta. Nenhum valor secreto foi lido. Nenhuma alteração
+  externa foi feita.
