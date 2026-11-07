@@ -8094,3 +8094,9 @@ Conclusão: a Central ainda **não está pronta para LIVE**. O bloqueio imediato
   Não fiz push nem deploy: custo zero para uma nova publicação não foi
   comprovado. O commit local não atualiza o serviço Render e não prova prontidão
   de produção. Nenhuma configuração na AWS/Render ou controle PAPER foi alterado.
+
+## Revalidação do throttle no HEAD local — 2026-11-07
+
+- Após os commits locais `86e122b` e `56149f4`, o runner offline bloqueado
+  executou `--market-data-throttle`: **93 testes passaram em 7,93 s**, exit code
+  zero. Nenhuma chamada de rede externa foi permitida.
