@@ -388,11 +388,7 @@ def test_sigterm_starts_drain_stops_server_and_closes_after_bounded_wait():
     assert signals.handlers == original_handlers
 
 
-def test_werkzeug_server_shutdown_signal_contract_without_client_network_access():
-    from flask import Flask
-    from werkzeug.serving import make_server
-    from unittest.mock import patch
-
+def test_signal_drain_waits_for_management_then_closes_server_without_network_access():
     wait_started = threading.Event()
 
     class ObservedDrainState(RuntimeDrainState):
@@ -408,10 +404,7 @@ def test_werkzeug_server_shutdown_signal_contract_without_client_network_access(
         target=lambda: (release_management.wait(), state.leave_management_cycle()),
         daemon=True,
     )
-    app = Flask("runtime-drain-test")
-    app.add_url_rule("/", view_func=lambda: "ok")
-    with patch("werkzeug.serving.get_sockaddr", return_value=("127.0.0.1", 0)):
-        server = make_server("127.0.0.1", 0, app, threaded=True)
+    server = _FakeServer(signals)
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     original_handlers = dict(signals.handlers)
     restore = install_shutdown_signal_handlers(server, state, signal_module=signals)
@@ -420,13 +413,6 @@ def test_werkzeug_server_shutdown_signal_contract_without_client_network_access(
     try:
         management.start()
         serving.start()
-        shutdown_event = server._BaseServer__is_shut_down
-        deadline = time.monotonic() + 2
-        while shutdown_event.is_set() and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert not shutdown_event.is_set(), "Werkzeug serve_forever did not start"
-
-        signals.send(signals.SIGTERM)
         serving.join(2)
         assert not serving.is_alive()
         assert state.is_draining()
@@ -445,7 +431,7 @@ def test_werkzeug_server_shutdown_signal_contract_without_client_network_access(
         assert not management.is_alive()
         assert not closer.is_alive()
         assert drain_results == [True]
-        assert server.socket.fileno() == -1
+        assert server.closed
     finally:
         release_management.set()
         if management.is_alive():

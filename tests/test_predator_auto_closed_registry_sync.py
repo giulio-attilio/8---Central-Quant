@@ -316,6 +316,23 @@ def test_repairs_are_limited_per_cycle(tmp_path):
     assert len(registry["closed_trades"]) == 2
 
 
+def test_maximum_audit_batch_groups_unique_identities_and_keeps_cycle_cap(tmp_path):
+    events = [
+        _event(f"PREDATOR-{index}", exit_price=101 + index / 10000)
+        for index in range(2000)
+    ]
+    ns, registry, _ = _harness(tmp_path, events=events, max_per_cycle=3)
+    result = ns["predator_auto_closed_sync_v1_status"](
+        commit=True,
+        automatic=True,
+    )
+    assert result["status"] == "REPAIRED_PARTIAL"
+    assert result["planned_count"] == 2000
+    assert result["repaired_count"] == 3
+    assert result["pending_count"] == 1997
+    assert len(registry["closed_trades"]) == 3
+
+
 def test_health_and_lifecycle_reflect_successful_repair(tmp_path):
     ns, _, _ = _harness(tmp_path)
     result = ns["predator_auto_closed_sync_v1_status"](commit=True, automatic=True)

@@ -121,17 +121,17 @@ Este registro cobre somente condições verificadas no repositório por inspeç�
 - **Sprint provável:** Sprint 2
 - **Classificação:** COBERTURA OFFLINE PRESENTE; INTEGRAÇÃO REAL NÃO VALIDADA/PROIBIDA PELA META
 
-### TD-008 — Ownership parcialmente conciliado por símbolo e lado
+### TD-008 — Ownership de posições agregadas não comprovado
 
 - **ID:** TD-008
-- **Título:** Ownership parcialmente conciliado por símbolo e lado
+- **Título:** Ownership de posições agregadas não comprovado
 - **Categoria:** Ownership
-- **Situação atual:** O Manual Position Awareness constrói chaves de posição com símbolo e lado e usa essas chaves para classificar correspondências Central × BingX como `CENTRAL_LIVE_MATCHED` ou `MANUAL_OR_EXTERNAL_POSITION`.
+- **Situação atual:** O Manual Position Awareness usa símbolo e lado apenas para localizar candidatos. Mesmo quando há correspondência Central × BingX — inclusive com quantidade igual — a posição é classificada como `POSITION_OWNERSHIP_UNVERIFIED`, não é anexada automaticamente e entra no gate de divergência que bloqueia novas entradas LIVE. Sem candidato Central, a posição é tratada como manual/externa. A saída `CENTRAL_LIVE_MATCHED` não é produzida pelo construtor atual; a confirmação por lifecycle no gerenciamento do Falcon é uma verificação separada.
 - **Motivo pelo qual existe:** A visão agregada de posições da corretora é conciliada com a visão Central por uma chave comum disponível nos dois conjuntos.
-- **Impacto:** A correspondência indica coexistência no mesmo símbolo/lado, mas não demonstra a origem de cada quantidade.
-- **Risco:** Uma posição manual ou de outro lifecycle pode ser considerada casada com uma posição Central sem prova suficiente de ownership.
+- **Impacto:** A política atual é conservadora e impede anexar exposição agregada sem prova de origem, mas também impede novas entradas LIVE enquanto houver qualquer exposição aberta da corretora, inclusive exposição legítima já gerenciada pela Central.
+- **Risco:** Relaxar o bloqueio com base apenas em símbolo, lado ou quantidade pode atribuir incorretamente exposição manual/externa à Central; manter o bloqueio significa indisponibilidade de novas entradas LIVE até uma fonte confiável de ownership/reconciliação existir.
 - **Prioridade:** CRÍTICA
-- **Condição para resolução:** Classificação e gestão exigirem evidência por trade UUID, lifecycle UUID, client order ID, exchange order ID ou fills; símbolo/lado permanecer apenas como indício de exposição.
+- **Condição para resolução:** Manter o bloqueio fail-closed até existir evidência de ownership verificável por lifecycle/order/fill que a BingX realmente exponha; só então adicionar matching granular e testes de posições agregadas, parciais e divergentes. Não relaxar o gate usando símbolo/lado ou quantidade isolados.
 - **Sprint provável:** Sprint 3
 - **Classificação:** PLANEJADA
 
@@ -204,7 +204,7 @@ Este registro cobre somente condições verificadas no repositório por inspeç�
 | TD-005 | Isolamento de rede não universal | PARCIALMENTE RESOLVIDA; RUNNER SELADO PARA SUÍTES CRÍTICAS |
 | TD-006 | Ausência de simulador CCXT/BingX integrado reutilizável | PARCIALMENTE COBERTA POR DOUBLES |
 | TD-007 | Limite de integração real da execução LIVE | TESTES OFFLINE PRESENTES; INTEGRAÇÃO REAL NÃO VALIDADA/PROIBIDA |
-| TD-008 | Ownership parcialmente conciliado por símbolo e lado | PLANEJADA |
+| TD-008 | Ownership de posições agregadas não comprovado | BLOQUEIO FAIL-CLOSED; MATCHING GRANULAR DEPENDE DE EVIDÊNCIA DA EXCHANGE |
 | TD-009 | Lifecycle operacional distribuído e parcialmente implícito | PLANEJADA |
 | TD-010 | Confirmação inicial do disaster stop no release implantado | IMPLEMENTADA NO CÓDIGO; EXCHANGE NÃO VALIDADO |
 | TD-011 | Dependências sem versões fixadas | PLANEJADA |

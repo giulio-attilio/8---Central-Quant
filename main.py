@@ -68372,34 +68372,66 @@ def _pacs_v1_plan_closed_repairs(registry, closed_events):
             continue
         candidate_items.append((trade, event))
 
-    adjacency = [set([index]) for index in range(len(candidate_items))]
-    for left_index in range(len(candidate_items)):
-        for right_index in range(left_index + 1, len(candidate_items)):
-            relation = _closed_trade_record_relation_v1(
-                candidate_items[left_index][0],
-                candidate_items[right_index][0],
+    # `_closed_trade_record_relation_v1` joins a pair only when its canonical
+    # keys match or its typed merge-token sets overlap. Index those same edges
+    # directly instead of comparing every pair (up to ~2M comparisons at the
+    # 2,000-event audit cap). Union-find preserves the connected components,
+    # including transitive identity bridges that the merge step must quarantine.
+    component_parent = list(range(len(candidate_items)))
+    component_rank = [0] * len(candidate_items)
+
+    def _candidate_component_root(index):
+        root = index
+        while component_parent[root] != root:
+            root = component_parent[root]
+        while component_parent[index] != index:
+            parent = component_parent[index]
+            component_parent[index] = root
+            index = parent
+        return root
+
+    def _union_candidate_components(left_index, right_index):
+        left_root = _candidate_component_root(left_index)
+        right_root = _candidate_component_root(right_index)
+        if left_root == right_root:
+            return
+        if component_rank[left_root] < component_rank[right_root]:
+            left_root, right_root = right_root, left_root
+        component_parent[right_root] = left_root
+        if component_rank[left_root] == component_rank[right_root]:
+            component_rank[left_root] += 1
+
+    identity_bucket_members = {}
+    for index, (trade, _event) in enumerate(candidate_items):
+        identity = _closed_trade_identity_state_v1(trade)
+        identity = identity if isinstance(identity, dict) else {}
+        bucket_keys = set()
+        canonical_key = str(identity.get("canonical_key") or "")
+        if canonical_key:
+            bucket_keys.add("canonical|" + canonical_key)
+        merge_tokens = identity.get("merge_tokens")
+        if isinstance(merge_tokens, (list, tuple, set, frozenset)):
+            bucket_keys.update(
+                "merge|" + str(token)
+                for token in merge_tokens
+                if str(token or "")
             )
-            if relation != "DISTINCT":
-                adjacency[left_index].add(right_index)
-                adjacency[right_index].add(left_index)
-    candidate_components = []
-    seen_candidate_indexes = set()
-    for start_index in range(len(candidate_items)):
-        if start_index in seen_candidate_indexes:
-            continue
-        pending_indexes = [start_index]
-        component_indexes = []
-        seen_candidate_indexes.add(start_index)
-        while pending_indexes:
-            current_index = pending_indexes.pop()
-            component_indexes.append(current_index)
-            for linked_index in sorted(adjacency[current_index]):
-                if linked_index not in seen_candidate_indexes:
-                    seen_candidate_indexes.add(linked_index)
-                    pending_indexes.append(linked_index)
-        candidate_components.append(
-            [candidate_items[index] for index in sorted(component_indexes)]
+        for bucket_key in bucket_keys:
+            members = identity_bucket_members.setdefault(bucket_key, [])
+            if members:
+                _union_candidate_components(members[0], index)
+            members.append(index)
+
+    candidate_component_indexes = {}
+    for index in range(len(candidate_items)):
+        root = _candidate_component_root(index)
+        candidate_component_indexes.setdefault(root, []).append(index)
+    candidate_components = [
+        [candidate_items[index] for index in indexes]
+        for indexes in sorted(
+            candidate_component_indexes.values(), key=lambda values: values[0]
         )
+    ]
 
     planned = []
     ambiguous = []
