@@ -1,6 +1,7 @@
 import ast
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from runtime_drain_v1 import RuntimeDrainState
@@ -289,6 +290,55 @@ def test_enabled_import_failure_blocks_worker_launch():
     assert namespace["_central_missing_enabled_bot_modules"]() == ["TRENDPRO"]
     namespace["LOADED_BOTS"]["TRENDPRO"] = object()
     assert namespace["_central_missing_enabled_bot_modules"]() == []
+
+
+def test_worker_start_failure_aborts_before_starting_later_bots_and_redacts_error():
+    tree = ast.parse(_source(ROOT / "main.py"))
+    start_enabled_bots = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "start_enabled_bots"
+    )
+    started = []
+
+    def fail_first_worker():
+        started.append("FIRST")
+        raise RuntimeError("simulated sensitive detail")
+
+    def start_second_worker():
+        started.append("SECOND")
+
+    modules = {
+        "FIRST": SimpleNamespace(start_central_bot_threads=fail_first_worker),
+        "SECOND": SimpleNamespace(start_central_bot_threads=start_second_worker),
+    }
+    namespace = {
+        "BOT_CONFIGS": {
+            key: {"enabled_env": f"ENABLE_{key}", "module": key, "name": key}
+            for key in modules
+        },
+        "LOADED_BOTS": {},
+        "BOT_THREADS_STARTED": set(),
+        "LOAD_ERRORS": {},
+        "env_bool": lambda key, default=False: True,
+        "memory_profile_step": lambda *_args, **_kwargs: None,
+        "load_bot": lambda key, _cfg: modules[key],
+        "current_rss_mb": lambda: 0,
+        "MEMORY_GC_THRESHOLD_MB": 10_000,
+        "force_gc_if_needed": lambda *_args, **_kwargs: None,
+        "_central_missing_enabled_bot_modules": lambda: [],
+    }
+    exec(
+        compile(ast.Module(body=[start_enabled_bots], type_ignores=[]), "main.py", "exec"),
+        namespace,
+    )
+
+    with pytest.raises(RuntimeError, match="CENTRAL_BOT_WORKER_STARTUP_FAILED:FIRST") as error:
+        namespace["start_enabled_bots"]()
+
+    assert started == ["FIRST"]
+    assert "simulated sensitive detail" not in str(error.value)
+    assert namespace["LOAD_ERRORS"]["FIRST"] == "WORKER_START_FAILED:RuntimeError"
+    assert "FIRST" not in namespace["LOADED_BOTS"]
 
 
 def test_persistent_registry_startup_admission_requires_mount_file_and_schema():

@@ -2760,10 +2760,14 @@ def start_enabled_bots():
             BOT_THREADS_STARTED.add(key)
             print(f"BOT STARTUP WORKERS COMPLETE: {key}", flush=True)
         except Exception as exc:
-            LOAD_ERRORS[key] = str(exc)
+            LOAD_ERRORS[key] = f"WORKER_START_FAILED:{type(exc).__name__}"
             LOADED_BOTS.pop(key, None)
-            print(f"ERRO AO INICIAR WORKERS {key}: {exc}")
+            print(f"ERRO AO INICIAR WORKERS {key}: {type(exc).__name__}")
             memory_profile_step(f"worker_start_error_{key}")
+            # A starter may have launched some daemon threads before failing.
+            # Abort process startup so those partial workers cannot keep running
+            # beside an HTTP server that remains permanently not-ready.
+            raise RuntimeError(f"CENTRAL_BOT_WORKER_STARTUP_FAILED:{key}") from None
 
 
 def bot_health(key: str, cfg: dict):
