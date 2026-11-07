@@ -51,6 +51,7 @@ import json
 import math
 import os
 import re
+import shutil
 import time
 import threading
 from pathlib import Path
@@ -1012,6 +1013,7 @@ BROKER_AUTO_PREVIEW_FIREWALL_STATUS = os.environ.get("BROKER_AUTO_PREVIEW_FIREWA
 BROKER_REAL_PILOT_GUARD_ENABLED = env_bool("BROKER_REAL_PILOT_GUARD_ENABLED", env_bool("CENTRAL_REAL_PILOT_GUARD_ENABLED", True))
 BROKER_REAL_PILOT_FAIL_CLOSED = env_bool("BROKER_REAL_PILOT_FAIL_CLOSED", True)
 BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS = env_bool("BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS", True)
+BROKER_REAL_PILOT_MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
 BROKER_REAL_PILOT_ALLOWED_BOTS = {
     x.strip().upper()
     for x in os.environ.get(
@@ -2922,6 +2924,25 @@ def _broker_rpg_v1_open_positions_count():
     return {"ok": True, "count": len(open_items), "open_items": open_items[:10], "positions_checked": True}
 
 
+def _broker_rpg_v1_persistent_disk_space():
+    """Read free space for the persistent data volume; never writes to it."""
+    try:
+        usage = shutil.disk_usage(CENTRAL_DATA_DIR)
+        return {
+            "ok": True,
+            "path": str(CENTRAL_DATA_DIR),
+            "total_bytes": int(usage.total),
+            "used_bytes": int(usage.used),
+            "free_bytes": int(usage.free),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "path": str(CENTRAL_DATA_DIR),
+            "error_type": type(exc).__name__,
+        }
+
+
 FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION = "2026-07-16-FALCON-REAL-POSITION-OWNERSHIP-LIMIT-V1"
 FALCON_OWNERSHIP_EVIDENCE_MAX_AGE_SECONDS = 30.0
 
@@ -3060,6 +3081,20 @@ def broker_real_pilot_guard_v1_validate(*, symbol, side, bot=None, notional_usdt
     symbol_allowed = "*" in BROKER_REAL_PILOT_ALLOWED_SYMBOLS or symbol_key in BROKER_REAL_PILOT_ALLOWED_SYMBOLS
     add("SYMBOL_ALLOWED", symbol_allowed, f"Símbolo {symbol_key} não está liberado no broker", {"allowed_symbols": sorted(BROKER_REAL_PILOT_ALLOWED_SYMBOLS)})
     add("NOTIONAL_LIMIT", effective_notional is not None and float(effective_notional) <= BROKER_REAL_PILOT_MAX_NOTIONAL_USDT, f"Notional {effective_notional} USDT acima do limite {BROKER_REAL_PILOT_MAX_NOTIONAL_USDT} USDT", {"notional_usdt": effective_notional, "max_notional_usdt": BROKER_REAL_PILOT_MAX_NOTIONAL_USDT})
+    disk_space = _broker_rpg_v1_persistent_disk_space()
+    disk_ok = bool(
+        disk_space.get("ok") is True
+        and int(disk_space.get("free_bytes") or 0) >= BROKER_REAL_PILOT_MIN_FREE_DISK_BYTES
+    )
+    add(
+        "PERSISTENT_DISK_FREE_SPACE",
+        disk_ok,
+        "Espaço livre insuficiente ou não confirmado no disco persistente para uma nova entrada LIVE",
+        {
+            **disk_space,
+            "minimum_free_bytes": BROKER_REAL_PILOT_MIN_FREE_DISK_BYTES,
+        },
+    )
     pos_count = _broker_rpg_v1_open_positions_count()
     ownership_validation = None
     if bot_key == "FALCON":
