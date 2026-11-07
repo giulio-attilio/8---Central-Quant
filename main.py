@@ -837,11 +837,9 @@ def central_personal_http_mutation_method_before_request():
 @app.before_request
 def central_personal_http_runtime_readiness_before_request():
     # The listener can now start before bot imports finish. Keep every
-    # operational route fail-closed until the full runtime boot reaches its
-    # final readiness point; only the body-free public liveness probe remains
-    # available during that interval.
-    if request.method == "GET" and request.path == "/healthz" and not request.args:
-        return None
+    # route, including the public cron probe, fail-closed until the full
+    # runtime boot reaches its final readiness point. Otherwise a healthy
+    # HTTP listener could mask a stuck bot import as a healthy Central.
     try:
         with CENTRAL_RUNTIME_LOCK:
             runtime_ready = CENTRAL_RUNTIME_READY is True
@@ -858,7 +856,7 @@ def central_personal_http_runtime_readiness_before_request():
 
 @app.route("/healthz", methods=["GET"])
 def render_healthz_v1():
-    """Minimal public liveness for Render; this is not trading readiness."""
+    """Minimal public runtime-ready probe; this is not trading readiness."""
     try:
         draining = bool(RUNTIME_DRAIN.is_draining())
     except Exception:

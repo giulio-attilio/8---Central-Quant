@@ -2206,7 +2206,7 @@ def test_runtime_routes_fail_closed_until_boot_completes(monkeypatch):
     unauthorized = client.get("/livestatus")
     blocked = client.get("/livestatus", headers={"Authorization": valid})
     blocked_post = client.post("/registrymode", headers={"Authorization": valid})
-    liveness = client.get("/healthz")
+    not_ready_probe = client.get("/healthz")
 
     assert unauthorized.status_code == 401
     assert blocked.status_code == 503
@@ -2214,12 +2214,18 @@ def test_runtime_routes_fail_closed_until_boot_completes(monkeypatch):
     assert blocked_post.status_code == 503
     assert blocked_post.get_json() == {"ok": False, "status": "CENTRAL_RUNTIME_NOT_READY"}
     assert app.test_mutations == []
-    assert liveness.status_code == 200
-    assert liveness.get_json() == {"ok": True, "status": "HTTP_LIVE"}
+    assert not_ready_probe.status_code == 503
+    assert not_ready_probe.get_json() == {
+        "ok": False,
+        "status": "CENTRAL_RUNTIME_NOT_READY",
+    }
 
     app._central_runtime_namespace["CENTRAL_RUNTIME_READY"] = True
     ready = client.get("/livestatus", headers={"Authorization": valid})
+    ready_probe = client.get("/healthz")
     assert ready.status_code == 200
+    assert ready_probe.status_code == 200
+    assert ready_probe.get_json() == {"ok": True, "status": "HTTP_LIVE"}
 
 
 def test_internal_bot_risk_requests_use_the_same_runtime_auth():
