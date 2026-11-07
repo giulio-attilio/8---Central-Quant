@@ -341,6 +341,97 @@ def test_worker_start_failure_aborts_before_starting_later_bots_and_redacts_erro
     assert "FIRST" not in namespace["LOADED_BOTS"]
 
 
+def test_missing_later_worker_hook_aborts_and_does_not_start_following_bots():
+    tree = ast.parse(_source(ROOT / "main.py"))
+    start_enabled_bots = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "start_enabled_bots"
+    )
+    started = []
+    modules = {
+        "FIRST": SimpleNamespace(
+            start_central_bot_threads=lambda: started.append("FIRST")
+        ),
+        "SECOND": SimpleNamespace(),
+        "THIRD": SimpleNamespace(
+            start_central_bot_threads=lambda: started.append("THIRD")
+        ),
+    }
+    namespace = {
+        "BOT_CONFIGS": {
+            key: {"enabled_env": f"ENABLE_{key}", "module": key, "name": key}
+            for key in modules
+        },
+        "LOADED_BOTS": {},
+        "BOT_THREADS_STARTED": set(),
+        "LOAD_ERRORS": {},
+        "env_bool": lambda key, default=False: True,
+        "memory_profile_step": lambda *_args, **_kwargs: None,
+        "load_bot": lambda key, _cfg: modules[key],
+        "current_rss_mb": lambda: 0,
+        "MEMORY_GC_THRESHOLD_MB": 10_000,
+        "force_gc_if_needed": lambda *_args, **_kwargs: None,
+        "_central_missing_enabled_bot_modules": lambda: [],
+    }
+    exec(
+        compile(
+            ast.Module(body=[start_enabled_bots], type_ignores=[]),
+            "main.py",
+            "exec",
+        ),
+        namespace,
+    )
+
+    with pytest.raises(RuntimeError, match="CENTRAL_BOT_START_HOOK_MISSING:SECOND"):
+        namespace["start_enabled_bots"]()
+
+    assert started == ["FIRST"]
+    assert namespace["LOAD_ERRORS"]["SECOND"] == "BOT_START_HOOK_MISSING"
+    assert "SECOND" not in namespace["LOADED_BOTS"]
+
+
+def test_incomplete_enabled_import_set_aborts_before_any_worker_starts():
+    tree = ast.parse(_source(ROOT / "main.py"))
+    start_enabled_bots = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "start_enabled_bots"
+    )
+    started = []
+    modules = {
+        key: SimpleNamespace(start_central_bot_threads=lambda key=key: started.append(key))
+        for key in ("FIRST", "SECOND")
+    }
+    namespace = {
+        "BOT_CONFIGS": {
+            key: {"enabled_env": f"ENABLE_{key}", "module": key, "name": key}
+            for key in modules
+        },
+        "LOADED_BOTS": {},
+        "BOT_THREADS_STARTED": set(),
+        "LOAD_ERRORS": {},
+        "env_bool": lambda key, default=False: True,
+        "memory_profile_step": lambda *_args, **_kwargs: None,
+        "load_bot": lambda key, _cfg: modules[key],
+        "current_rss_mb": lambda: 0,
+        "MEMORY_GC_THRESHOLD_MB": 10_000,
+        "force_gc_if_needed": lambda *_args, **_kwargs: None,
+        "_central_missing_enabled_bot_modules": lambda: ["SECOND"],
+    }
+    exec(
+        compile(
+            ast.Module(body=[start_enabled_bots], type_ignores=[]),
+            "main.py",
+            "exec",
+        ),
+        namespace,
+    )
+
+    with pytest.raises(RuntimeError, match="CENTRAL_BOT_IMPORT_STARTUP_INCOMPLETE:SECOND"):
+        namespace["start_enabled_bots"]()
+
+    assert started == []
+
+
 def test_persistent_registry_startup_admission_requires_mount_file_and_schema():
     tree = ast.parse(_source(ROOT / "main.py"))
     gate = next(

@@ -2740,7 +2740,10 @@ def start_enabled_bots():
             + ",".join(missing_enabled_modules),
             flush=True,
         )
-        return
+        raise RuntimeError(
+            "CENTRAL_BOT_IMPORT_STARTUP_INCOMPLETE:"
+            + ",".join(missing_enabled_modules)
+        )
     print("BOT STARTUP PHASE: enter_worker_launch", flush=True)
     for key, cfg in BOT_CONFIGS.items():
         if not env_bool(cfg["enabled_env"], default=False):
@@ -2753,7 +2756,7 @@ def start_enabled_bots():
             LOAD_ERRORS[key] = "BOT_START_HOOK_MISSING"
             LOADED_BOTS.pop(key, None)
             print(f"BOT STARTUP WORKERS BLOCKED: {key} missing start hook", flush=True)
-            continue
+            raise RuntimeError(f"CENTRAL_BOT_START_HOOK_MISSING:{key}")
         try:
             print(f"BOT STARTUP WORKERS BEGIN: {key}", flush=True)
             starter()
