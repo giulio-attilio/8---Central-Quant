@@ -83,7 +83,7 @@ def test_invalid_values_fail_safe_to_current_runtime(monkeypatch, value):
     assert policy.static_operational_runtime_enabled() is False
 
 
-def test_environment_evaluation_error_fails_safe_to_current_runtime(monkeypatch):
+def test_environment_evaluation_error_fails_closed_to_static_runtime(monkeypatch):
     policy = _fresh_policy(monkeypatch)
 
     class BrokenEnvironment:
@@ -93,7 +93,7 @@ def test_environment_evaluation_error_fails_safe_to_current_runtime(monkeypatch)
     assert policy._environment_enabled(
         "CENTRAL_STATIC_OPERATIONAL_RUNTIME_ENABLED",
         environment=BrokenEnvironment(),
-    ) is False
+    ) is True
 
 
 def test_blocked_logs_are_rate_limited_per_task(monkeypatch):
@@ -112,7 +112,9 @@ def test_blocked_logs_are_rate_limited_per_task(monkeypatch):
 def _run_watchdog_once(heavy_allowed: bool):
     calls = {"tick": 0, "blocked": []}
     namespace = {
-        "heavy_predator_watchdog_audit_allowed": lambda: heavy_allowed,
+        "heavy_predator_watchdog_audit_allowed": (
+            heavy_allowed if callable(heavy_allowed) else lambda: heavy_allowed
+        ),
         "_emit_static_operational_runtime_blocked": lambda task, origin: calls[
             "blocked"
         ].append((task, origin)),
@@ -156,10 +158,45 @@ def test_watchdog_does_not_enter_predator_historical_audit_when_static_mode_is_o
     }
 
 
+def test_watchdog_blocks_predator_historical_audit_when_policy_raises():
+    def broken_policy():
+        raise RuntimeError("policy unavailable")
+
+    calls = _run_watchdog_once(heavy_allowed=broken_policy)
+    assert calls == {
+        "tick": 0,
+        "blocked": [("predator_heavy_watchdog_audit", "central_watchdog_loop")],
+    }
+
+
 def test_auto_closed_tick_has_its_own_static_guard_before_any_audit_reader():
     blocked = []
     namespace = {
         "heavy_predator_watchdog_audit_allowed": lambda: False,
+        "_emit_static_operational_runtime_blocked": lambda task, origin: blocked.append(
+            (task, origin)
+        ),
+        "PREDATOR_AUTO_CLOSED_SYNC_V1_ENABLED": True,
+        "predator_auto_closed_sync_v1_status": lambda **_kwargs: pytest.fail(
+            "historical audit was entered"
+        ),
+    }
+    _load_functions("main.py", {"predator_auto_closed_sync_v1_tick"}, namespace)
+    result = namespace["predator_auto_closed_sync_v1_tick"]()
+    assert result["status"] == "STATIC_OPERATIONAL_RUNTIME_BLOCKED"
+    assert blocked == [
+        ("predator_heavy_watchdog_audit", "predator_auto_closed_sync_v1_tick")
+    ]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [None, lambda: (_ for _ in ()).throw(RuntimeError("policy unavailable"))],
+)
+def test_auto_closed_tick_blocks_when_policy_is_missing_or_raises(policy):
+    blocked = []
+    namespace = {
+        "heavy_predator_watchdog_audit_allowed": policy,
         "_emit_static_operational_runtime_blocked": lambda task, origin: blocked.append(
             (task, origin)
         ),

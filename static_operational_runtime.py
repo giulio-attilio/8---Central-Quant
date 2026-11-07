@@ -22,7 +22,9 @@ def _environment_enabled(name: str, environment=None) -> bool:
         value = source.get(name, "false")
         return str(value).strip().lower() in _TRUE_VALUES
     except Exception:
-        return False
+        # If the mode cannot be determined, suspend historical background
+        # work rather than silently treating the runtime as unrestricted.
+        return True
 
 
 def static_operational_runtime_enabled() -> bool:

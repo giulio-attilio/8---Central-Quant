@@ -210,6 +210,8 @@ if __name__ == "__main__":
         )
     elif sys.argv[1:] == ["--static-runtime"]:
         cases = ("test_static_operational_runtime_v1.py",)
+    elif sys.argv[1:] == ["--predator-auto-closed-sync"]:
+        cases = ("test_predator_auto_closed_registry_sync.py",)
     elif sys.argv[1:] == ["--trading-mode-defaults"]:
         cases = ("test_trading_mode_defaults_fail_closed_v1.py",)
     elif sys.argv[1:] == ["--personal-http-auth"]:
@@ -314,6 +316,8 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--market-data-throttle"]:
         filters = []
     elif sys.argv[1:] == ["--static-runtime"]:
+        filters = []
+    elif sys.argv[1:] == ["--predator-auto-closed-sync"]:
         filters = []
     elif sys.argv[1:] == ["--trading-mode-defaults"]:
         filters = []

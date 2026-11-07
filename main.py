@@ -3140,10 +3140,10 @@ def central_watchdog_loop():
             heavy_audit_policy = globals().get("heavy_predator_watchdog_audit_allowed")
             try:
                 heavy_audit_allowed = (
-                    bool(heavy_audit_policy()) if callable(heavy_audit_policy) else True
+                    bool(heavy_audit_policy()) if callable(heavy_audit_policy) else False
                 )
             except Exception:
-                heavy_audit_allowed = True
+                heavy_audit_allowed = False
             if not heavy_audit_allowed:
                 _emit_static_operational_runtime_blocked(
                     "predator_heavy_watchdog_audit",
@@ -68890,10 +68890,10 @@ def predator_auto_closed_sync_v1_tick(force=False):
     heavy_audit_policy = globals().get("heavy_predator_watchdog_audit_allowed")
     try:
         heavy_audit_allowed = (
-            bool(heavy_audit_policy()) if callable(heavy_audit_policy) else True
+            bool(heavy_audit_policy()) if callable(heavy_audit_policy) else False
         )
     except Exception:
-        heavy_audit_allowed = True
+        heavy_audit_allowed = False
     if not heavy_audit_allowed:
         emit_blocked = globals().get("_emit_static_operational_runtime_blocked")
         if callable(emit_blocked):
