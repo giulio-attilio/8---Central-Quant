@@ -834,6 +834,28 @@ def central_personal_http_mutation_method_before_request():
     )
 
 
+@app.before_request
+def central_personal_http_runtime_readiness_before_request():
+    # The listener can now start before bot imports finish. Keep every
+    # operational route fail-closed until the full runtime boot reaches its
+    # final readiness point; only the body-free public liveness probe remains
+    # available during that interval.
+    if request.method == "GET" and request.path == "/healthz" and not request.args:
+        return None
+    try:
+        with CENTRAL_RUNTIME_LOCK:
+            runtime_ready = CENTRAL_RUNTIME_READY is True
+    except Exception:
+        runtime_ready = False
+    if runtime_ready:
+        return None
+    return app.response_class(
+        response=json.dumps({"ok": False, "status": "CENTRAL_RUNTIME_NOT_READY"}),
+        status=503,
+        mimetype="application/json",
+    )
+
+
 @app.route("/healthz", methods=["GET"])
 def render_healthz_v1():
     """Minimal public liveness for Render; this is not trading readiness."""
@@ -2556,6 +2578,7 @@ TRADE_REGISTRY_AUTOSYNC_STATUS = {
 
 # Evita inicialização duplicada de bots/roteadores no mesmo processo.
 CENTRAL_RUNTIME_STARTED = False
+CENTRAL_RUNTIME_READY = False
 CENTRAL_RUNTIME_LOCK = threading.Lock()
 C3_MAINTENANCE_STARTUP_BINDING_V1 = None
 
@@ -34219,7 +34242,7 @@ def _central_persistent_registry_startup_admission_v1():
 
 
 def start_central_runtime_once():
-    global CENTRAL_RUNTIME_STARTED, LEARNING_AUTO_REFRESH_THREAD_STARTED
+    global CENTRAL_RUNTIME_STARTED, CENTRAL_RUNTIME_READY, LEARNING_AUTO_REFRESH_THREAD_STARTED
     global CENTRAL_DAILY_REPORT_THREAD_STARTED, CENTRAL_DAILY_REPORT_LAST_STATUS
 
     admission = _central_persistent_registry_startup_admission_v1()
@@ -34331,6 +34354,8 @@ def start_central_runtime_once():
         )
 
     start_central_command_routers()
+    with CENTRAL_RUNTIME_LOCK:
+        CENTRAL_RUNTIME_READY = True
 
 
 # ==========================================================

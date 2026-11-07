@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -237,7 +238,7 @@ def _load_auth_gate():
     return namespace, app
 
 
-def _load_real_flask_auth_app(*, draining=False):
+def _load_real_flask_auth_app(*, draining=False, runtime_ready=True):
     """Register the exact source hook on Flask's real request dispatcher."""
     if "personal_http_auth" not in sys.modules:
         auth_helper = ROOT / "personal_http_auth.py"
@@ -249,6 +250,7 @@ def _load_real_flask_auth_app(*, draining=False):
         "_central_personal_http_auth_decision",
         "central_personal_http_auth_before_request",
         "central_personal_http_mutation_method_before_request",
+        "central_personal_http_runtime_readiness_before_request",
         "render_healthz_v1",
     }
     nodes = [
@@ -266,6 +268,8 @@ def _load_real_flask_auth_app(*, draining=False):
         "app": app,
         "request": flask_request,
         "RUNTIME_DRAIN": SimpleNamespace(is_draining=lambda: draining),
+        "CENTRAL_RUNTIME_LOCK": threading.RLock(),
+        "CENTRAL_RUNTIME_READY": runtime_ready,
     }
     module = ast.Module(body=nodes, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
@@ -387,6 +391,7 @@ def _load_real_flask_auth_app(*, draining=False):
             methods=["GET", "POST"],
         )
     app.test_mutations = mutations
+    app._central_runtime_namespace = namespace
     return app
 
 
@@ -659,9 +664,16 @@ def test_global_auth_hook_precedes_routes_with_only_narrow_healthz_exemption():
         if isinstance(node, ast.FunctionDef)
         and node.name == "central_personal_http_mutation_method_before_request"
     )
+    readiness_hook_index = next(
+        index
+        for index, node in enumerate(_TREE.body)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "central_personal_http_runtime_readiness_before_request"
+    )
     assert routes
     assert all(index > hook_index for index, _node in routes)
     assert all(index > mutation_hook_index for index, _node in routes)
+    assert all(index > readiness_hook_index for index, _node in routes)
     hook = _TREE.body[hook_index]
     hook_source = ast.unparse(hook)
     assert "request.method ==" in hook_source and "GET" in hook_source
@@ -2182,6 +2194,28 @@ def test_render_healthz_is_minimal_public_liveness_only(monkeypatch):
     unconfigured = _load_real_flask_auth_app().test_client().get("/healthz")
     assert unconfigured.status_code == 200
     assert unconfigured.get_json() == {"ok": True, "status": "HTTP_LIVE"}
+
+
+def test_runtime_routes_fail_closed_until_boot_completes(monkeypatch):
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_USER", "local-operator")
+    monkeypatch.setenv("CENTRAL_PERSONAL_HTTP_PASSWORD", "synthetic-only-password")
+    app = _load_real_flask_auth_app(runtime_ready=False)
+    client = app.test_client()
+    valid = _runtime_basic_header()
+
+    unauthorized = client.get("/livestatus")
+    blocked = client.get("/livestatus", headers={"Authorization": valid})
+    liveness = client.get("/healthz")
+
+    assert unauthorized.status_code == 401
+    assert blocked.status_code == 503
+    assert blocked.get_json() == {"ok": False, "status": "CENTRAL_RUNTIME_NOT_READY"}
+    assert liveness.status_code == 200
+    assert liveness.get_json() == {"ok": True, "status": "HTTP_LIVE"}
+
+    app._central_runtime_namespace["CENTRAL_RUNTIME_READY"] = True
+    ready = client.get("/livestatus", headers={"Authorization": valid})
+    assert ready.status_code == 200
 
 
 def test_internal_bot_risk_requests_use_the_same_runtime_auth():

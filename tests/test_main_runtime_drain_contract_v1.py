@@ -131,6 +131,40 @@ def test_runtime_startup_rejects_failed_persistent_registry_admission_before_bot
     assert namespace["CENTRAL_RUNTIME_STARTED"] is False
 
 
+def test_runtime_readiness_is_published_only_after_bot_and_router_startup():
+    tree = ast.parse(_source(ROOT / "main.py"))
+    start = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "start_central_runtime_once"
+    )
+    ready_assignments = [
+        node for node in ast.walk(start)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "CENTRAL_RUNTIME_READY"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Constant)
+        and node.value.value is True
+    ]
+    assert len(ready_assignments) == 1
+    ready_line = ready_assignments[0].lineno
+    bot_start_lines = [
+        node.lineno for node in ast.walk(start)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "start_enabled_bots"
+    ]
+    router_start_lines = [
+        node.lineno for node in ast.walk(start)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "start_central_command_routers"
+    ]
+    assert bot_start_lines and router_start_lines
+    assert ready_line > max(bot_start_lines + router_start_lines)
+
+
 def test_persistent_registry_startup_admission_requires_mount_file_and_schema():
     tree = ast.parse(_source(ROOT / "main.py"))
     gate = next(
