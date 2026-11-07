@@ -201,6 +201,17 @@ if __name__ == "__main__":
             "test_c3_dormant_startup_same_coordinator_v2.py",
             "test_c3_dormant_root_head_startup_integration_v1.py",
         )
+    elif sys.argv[1:] == ["--market-data-throttle"]:
+        cases = (
+            "test_exchange_manager_throttle_v1.py",
+            "test_exchange_ohlcv_rate_limit_v1.py",
+            "test_exchange_throttle_policy_v1.py",
+            "test_predator_deferred_m15_fetch_v1.py",
+        )
+    elif sys.argv[1:] == ["--static-runtime"]:
+        cases = ("test_static_operational_runtime_v1.py",)
+    elif sys.argv[1:] == ["--trading-mode-defaults"]:
+        cases = ("test_trading_mode_defaults_fail_closed_v1.py",)
     elif sys.argv[1:] == ["--personal-http-auth"]:
         cases = (
             "test_personal_http_auth_gate_v1.py",
@@ -299,6 +310,12 @@ if __name__ == "__main__":
             "can_open_trade_wrapper_attaches_only_validated_falcon_bridge_suppression",
         ]
     elif sys.argv[1:] == ["--c3-dormant-startup"]:
+        filters = []
+    elif sys.argv[1:] == ["--market-data-throttle"]:
+        filters = []
+    elif sys.argv[1:] == ["--static-runtime"]:
+        filters = []
+    elif sys.argv[1:] == ["--trading-mode-defaults"]:
         filters = []
     elif sys.argv[1:] == ["--personal-http-auth"]:
         filters = []

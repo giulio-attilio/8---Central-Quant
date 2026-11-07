@@ -32,6 +32,7 @@ import exchange_manager
 from exchange_ohlcv_candle_cache_v1 import clear_ohlcv_candle_cache_for_tests
 from exchange_throttle_policy_v1 import (
     exchange_throttle_cooldown_remaining,
+    is_exchange_throttle_error,
     reset_exchange_throttle_cooldown_for_tests,
     start_exchange_throttle_cooldown,
 )
@@ -105,6 +106,259 @@ def test_all_bot_ohlcv_reads_use_the_shared_exchange_client(module_name):
         isinstance(call.func.value, ast.Name) and call.func.value.id == "exchange"
         for call in ohlcv_calls
     ), f"{module_name} bypasses the shared exchange client's OHLCV wrapper"
+
+
+@pytest.mark.parametrize(
+    ("module_name", "error_type_name", "message"),
+    [
+        ("cobra.py", "RateLimitExceeded", "cooldown"),
+        ("cobra.py", "OperationFailed", 'bingx {"code":100410,"msg":"try again later"}'),
+        ("meme.py", "RateLimitExceeded", "cooldown"),
+        ("meme.py", "OperationFailed", 'bingx {"code":100410,"msg":"try again later"}'),
+        ("meme.py", "Exception", 'bingx {"code":100410,"msg":"try again later"}'),
+        ("donkey.py", "RateLimitExceeded", "cooldown"),
+        ("donkey.py", "OperationFailed", 'bingx {"code":100410,"msg":"try again later"}'),
+        ("donkey.py", "Exception", 'bingx {"code":100410,"msg":"try again later"}'),
+        ("trendpro.py", "RateLimitExceeded", "cooldown"),
+        ("trendpro.py", "OperationFailed", 'bingx {"code":100410,"msg":"try again later"}'),
+        ("trendpro.py", "Exception", 'bingx {"code":100410,"msg":"try again later"}'),
+    ],
+)
+def test_bot_ticker_throttle_fails_fast_without_retry_or_sleep(
+    module_name, error_type_name, message
+):
+    exception_type = {
+        "RateLimitExceeded": exchange_manager.ccxt.RateLimitExceeded,
+        "OperationFailed": exchange_manager.ccxt.OperationFailed,
+        "Exception": Exception,
+    }[error_type_name]
+
+    class FakeExchange:
+        calls = 0
+
+        def fetch_ticker(self, _symbol):
+            self.calls += 1
+            raise exception_type(message)
+
+    tree = ast.parse((BOT_DIR / module_name).read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "safe_fetch_ticker"
+    )
+    def fail_on_sleep(*_args):
+        pytest.fail("throttle retry slept")
+
+    namespace = {
+        "exchange": FakeExchange(),
+        "HEALTH": {},
+        "NetworkError": exchange_manager.ccxt.NetworkError,
+        "RateLimitExceeded": exchange_manager.ccxt.RateLimitExceeded,
+        "ExchangeError": exchange_manager.ccxt.ExchangeError,
+        "is_exchange_throttle_error": is_exchange_throttle_error,
+        "time": type("NoSleep", (), {"sleep": staticmethod(fail_on_sleep)}),
+    }
+    isolated = ast.Module(body=[function], type_ignores=[])
+    exec(
+        compile(
+            ast.fix_missing_locations(isolated),
+            f"{module_name}:safe_fetch_ticker",
+            "exec",
+        ),
+        namespace,
+    )
+
+    result = namespace["safe_fetch_ticker"]("BTC/USDT:USDT", max_retries=3)
+
+    assert result is None
+    assert namespace["exchange"].calls == 1
+    assert namespace["HEALTH"]["last_warning"] == (
+        "Rate limit ticker BTC/USDT:USDT; novas tentativas suspensas"
+    )
+
+
+@pytest.mark.parametrize("module_name", ["cobra.py", "donkey.py", "meme.py", "trendpro.py"])
+def test_bot_load_markets_operation_failed_100410_fails_fast(module_name):
+    calls = []
+
+    def load_markets_once():
+        calls.append("load")
+        raise exchange_manager.ccxt.OperationFailed(
+            'bingx {"code":100410,"msg":"try again later"}'
+        )
+
+    tree = ast.parse((BOT_DIR / module_name).read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "safe_load_markets"
+    )
+
+    def fail_on_sleep(*_args):
+        pytest.fail("throttled load_markets retried")
+
+    namespace = {
+        "load_markets_once": load_markets_once,
+        "HEALTH": {},
+        "NetworkError": exchange_manager.ccxt.NetworkError,
+        "RateLimitExceeded": exchange_manager.ccxt.RateLimitExceeded,
+        "ExchangeError": exchange_manager.ccxt.ExchangeError,
+        "is_exchange_throttle_error": is_exchange_throttle_error,
+        "time": type("NoSleep", (), {"sleep": staticmethod(fail_on_sleep)}),
+    }
+    isolated = ast.Module(body=[function], type_ignores=[])
+    exec(
+        compile(
+            ast.fix_missing_locations(isolated),
+            f"{module_name}:safe_load_markets",
+            "exec",
+        ),
+        namespace,
+    )
+
+    result = namespace["safe_load_markets"](max_retries=3)
+
+    assert result is None
+    assert calls == ["load"]
+    assert namespace["HEALTH"]["last_warning"] == (
+        "Rate limit BingX load_markets; novas tentativas suspensas"
+    )
+
+
+def test_cobra_ohlcv_operation_failed_100410_fails_fast():
+    class FakeExchange:
+        calls = 0
+
+        def fetch_ohlcv(self, _symbol, *, timeframe, limit):
+            self.calls += 1
+            raise exchange_manager.ccxt.OperationFailed(
+                'bingx {"code":100410,"msg":"try again later"}'
+            )
+
+    tree = ast.parse((BOT_DIR / "cobra.py").read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "safe_fetch_ohlcv"
+    )
+
+    def fail_on_sleep(*_args):
+        pytest.fail("throttled OHLCV retried")
+
+    namespace = {
+        "exchange": FakeExchange(),
+        "HEALTH": {},
+        "NetworkError": exchange_manager.ccxt.NetworkError,
+        "RateLimitExceeded": exchange_manager.ccxt.RateLimitExceeded,
+        "ExchangeError": exchange_manager.ccxt.ExchangeError,
+        "is_exchange_throttle_error": is_exchange_throttle_error,
+        "time": type("NoSleep", (), {"sleep": staticmethod(fail_on_sleep)}),
+    }
+    isolated = ast.Module(body=[function], type_ignores=[])
+    exec(
+        compile(
+            ast.fix_missing_locations(isolated),
+            "cobra.py:safe_fetch_ohlcv",
+            "exec",
+        ),
+        namespace,
+    )
+
+    result = namespace["safe_fetch_ohlcv"](
+        "BTC/USDT:USDT", timeframe="1m", limit=100, max_retries=3
+    )
+
+    assert result == []
+    assert namespace["exchange"].calls == 1
+    assert "Rate limit OHLCV BTC/USDT:USDT 1m" in namespace["HEALTH"]["last_warning"]
+
+
+@pytest.mark.parametrize(
+    "throttle_error",
+    [
+        exchange_manager.ccxt.RateLimitExceeded(
+            "Central shared OHLCV throttle cooldown active (10s)"
+        ),
+        RuntimeError('bingx {"code":100410,"msg":"try again later"}'),
+    ],
+)
+def test_predator_fetch_df_converts_shared_throttle_to_skipped_symbol(throttle_error):
+    class FakeExchange:
+        calls = 0
+
+        def fetch_ohlcv(self, _symbol, *, timeframe, limit):
+            self.calls += 1
+            raise throttle_error
+
+    tree = ast.parse((BOT_DIR / "predator.py").read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "fetch_df"
+    )
+    namespace = {
+        "exchange": FakeExchange(),
+        "HEALTH": {},
+        "is_exchange_throttle_error": is_exchange_throttle_error,
+        "nome_limpo": lambda symbol: symbol,
+    }
+    isolated = ast.Module(body=[function], type_ignores=[])
+    exec(
+        compile(
+            ast.fix_missing_locations(isolated),
+            "predator.py:fetch_df",
+            "exec",
+        ),
+        namespace,
+    )
+
+    result = namespace["fetch_df"]("APT/USDT:USDT", "1h", limit=100)
+
+    assert result is None
+    assert namespace["exchange"].calls == 1
+    assert namespace["HEALTH"]["last_warning"] == (
+        "Rate limit BingX OHLCV APT/USDT:USDT 1h; "
+        "Predator ignorou o símbolo neste ciclo"
+    )
+
+
+def test_predator_scanner_stops_after_throttled_h1_without_more_reads():
+    tree = ast.parse((BOT_DIR / "predator.py").read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "scan_smart_predator_symbol"
+    )
+    calls = []
+
+    def throttled_fetch(symbol, timeframe, *, limit):
+        calls.append((symbol, timeframe, limit))
+        return None
+
+    namespace = {
+        "inc_funnel_stat": lambda *_args: None,
+        "SMART_PREDATOR_ENABLED": True,
+        "existe_posicao_ativa": lambda _symbol: False,
+        "limite_posicoes_atingido": lambda: False,
+        "fetch_df": throttled_fetch,
+        "TIMEFRAME_H1": "1h",
+        "TIMEFRAME_H4": "4h",
+    }
+    isolated = ast.Module(body=[function], type_ignores=[])
+    exec(
+        compile(
+            ast.fix_missing_locations(isolated),
+            "predator.py:scan_smart_predator_symbol",
+            "exec",
+        ),
+        namespace,
+    )
+
+    result = namespace["scan_smart_predator_symbol"]("APT/USDT:USDT")
+
+    assert result is None
+    assert calls == [("APT/USDT:USDT", "1h", 100)]
 
 
 def test_shared_client_starts_cooldown_and_rejects_next_scanner_read(monkeypatch):

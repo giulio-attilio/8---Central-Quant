@@ -815,9 +815,15 @@ def safe_fetch_ticker(symbol, max_retries=3):
             return exchange.fetch_ticker(symbol)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso MEME Ticker ({attempt+1}/{max_retries}) {symbol}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit ticker {symbol}; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
         except Exception as e:
             print(f"Aviso MEME Ticker genérico ({attempt+1}/{max_retries}) {symbol}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit ticker {symbol}; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
     HEALTH["last_warning"] = f"Falha Ticker {symbol} após {max_retries} tentativas"
     print(HEALTH["last_warning"])
@@ -829,9 +835,15 @@ def safe_load_markets(max_retries=3):
             return load_markets_once()
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso MEME load_markets ({attempt+1}/{max_retries}): {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = "Rate limit BingX load_markets; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
         except Exception as e:
             print(f"Aviso MEME load_markets genérico ({attempt+1}/{max_retries}): {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = "Rate limit BingX load_markets; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
     HEALTH["last_warning"] = "Falha ao carregar markets da exchange após tentativas"
     print(HEALTH["last_warning"])

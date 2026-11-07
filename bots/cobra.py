@@ -375,6 +375,11 @@ def safe_fetch_ohlcv(symbol, timeframe, limit, max_retries=3):
                 HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
                 return []
             time.sleep(2 ** attempt) # Backoff exponencial: 1s, 2s, 4s...
+        except Exception as e:
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit OHLCV {symbol} {timeframe}; novas tentativas suspensas"
+                return []
+            raise
     HEALTH["last_warning"] = f"Falha OHLCV {symbol} {timeframe} após {max_retries} tentativas"
     print(HEALTH["last_warning"])
     return []
@@ -385,7 +390,15 @@ def safe_fetch_ticker(symbol, max_retries=3):
             return exchange.fetch_ticker(symbol)
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso: Erro API Ticker ({attempt+1}/{max_retries}) para {symbol}: {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit ticker {symbol}; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
+        except Exception as e:
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = f"Rate limit ticker {symbol}; novas tentativas suspensas"
+                return None
+            raise
     HEALTH["last_warning"] = f"Falha Ticker {symbol} após {max_retries} tentativas"
     print(HEALTH["last_warning"])
     return None
@@ -396,7 +409,15 @@ def safe_load_markets(max_retries=3):
             return load_markets_once()
         except (RateLimitExceeded, NetworkError, ExchangeError) as e:
             print(f"Aviso: Erro API Load Markets ({attempt+1}/{max_retries}): {e}")
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = "Rate limit BingX load_markets; novas tentativas suspensas"
+                return None
             time.sleep(2 ** attempt)
+        except Exception as e:
+            if is_exchange_throttle_error(e):
+                HEALTH["last_warning"] = "Rate limit BingX load_markets; novas tentativas suspensas"
+                return None
+            raise
     HEALTH["last_warning"] = "Falha ao carregar markets da exchange após retries"
     print(HEALTH["last_warning"])
     return None
