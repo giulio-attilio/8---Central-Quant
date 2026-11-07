@@ -144,8 +144,6 @@ def test_runtime_readiness_is_published_only_after_bot_and_router_startup():
             isinstance(target, ast.Name) and target.id == "CENTRAL_RUNTIME_READY"
             for target in node.targets
         )
-        and isinstance(node.value, ast.Constant)
-        and node.value.value is True
     ]
     assert len(ready_assignments) == 1
     ready_line = ready_assignments[0].lineno
@@ -163,6 +161,40 @@ def test_runtime_readiness_is_published_only_after_bot_and_router_startup():
     ]
     assert bot_start_lines and router_start_lines
     assert ready_line > max(bot_start_lines + router_start_lines)
+
+
+def test_runtime_readiness_requires_every_enabled_bot_to_be_loaded():
+    tree = ast.parse(_source(ROOT / "main.py"))
+    start = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "start_central_runtime_once"
+    )
+    ready_assignment = next(
+        node for node in ast.walk(start)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "CENTRAL_RUNTIME_READY"
+            for target in node.targets
+        )
+    )
+    ready_expression = compile(ast.Expression(ready_assignment.value), "main.py", "eval")
+    enabled = {"ENABLE_TRENDPRO": True, "ENABLE_DONKEY": False}
+    namespace = {
+        "env_bool": lambda key, default=False: enabled.get(key, default),
+        "BOT_CONFIGS": {
+            "TRENDPRO": {"enabled_env": "ENABLE_TRENDPRO"},
+            "DONKEY": {"enabled_env": "ENABLE_DONKEY"},
+        },
+        "LOADED_BOTS": {},
+    }
+
+    assert eval(ready_expression, namespace) is False
+    namespace["LOADED_BOTS"]["TRENDPRO"] = object()
+    assert eval(ready_expression, namespace) is True
+
+    enabled["ENABLE_TRENDPRO"] = False
+    namespace["LOADED_BOTS"].clear()
+    assert eval(ready_expression, namespace) is True
 
 
 def test_persistent_registry_startup_admission_requires_mount_file_and_schema():

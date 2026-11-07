@@ -34353,7 +34353,7 @@ def start_central_runtime_once():
 
     start_central_command_routers()
     with CENTRAL_RUNTIME_LOCK:
-        CENTRAL_RUNTIME_READY = True
+        CENTRAL_RUNTIME_READY = all(not env_bool(cfg["enabled_env"], default=False) or key in LOADED_BOTS for key, cfg in BOT_CONFIGS.items())
 
 
 # ==========================================================
