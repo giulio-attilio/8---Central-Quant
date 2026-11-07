@@ -2205,11 +2205,15 @@ def test_runtime_routes_fail_closed_until_boot_completes(monkeypatch):
 
     unauthorized = client.get("/livestatus")
     blocked = client.get("/livestatus", headers={"Authorization": valid})
+    blocked_post = client.post("/registrymode", headers={"Authorization": valid})
     liveness = client.get("/healthz")
 
     assert unauthorized.status_code == 401
     assert blocked.status_code == 503
     assert blocked.get_json() == {"ok": False, "status": "CENTRAL_RUNTIME_NOT_READY"}
+    assert blocked_post.status_code == 503
+    assert blocked_post.get_json() == {"ok": False, "status": "CENTRAL_RUNTIME_NOT_READY"}
+    assert app.test_mutations == []
     assert liveness.status_code == 200
     assert liveness.get_json() == {"ok": True, "status": "HTTP_LIVE"}
 
