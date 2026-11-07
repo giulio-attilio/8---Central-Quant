@@ -40897,12 +40897,33 @@ def can_open_trade_decision(payload: dict):
             "version": AUTO_REAL_EXECUTION_BRIDGE_V1_VERSION,
         }
     try:
+        # /can_open_trade is also used by external schedulers. Never let a
+        # caller-provided LIVE/VERIFY payload arm the automatic bridge while
+        # the process is configured for PAPER/dry-run. Require every runtime
+        # trading control to be explicitly armed; missing or unreadable values
+        # remain safe by default.
+        try:
+            broker_dry_run, _broker_dry_run_source = _arb_v1_env_bool(
+                ["BROKER_DRY_RUN"], default=True
+            )
+        except Exception:
+            broker_dry_run = True
+        live_controls_armed = bool(
+            globals().get("ENABLE_REAL_TRADING") is True
+            and broker_dry_run is False
+            and str(globals().get("EXECUTION_MODE") or "PAPER").upper().strip() == "LIVE"
+        )
+        if _arb_v1_norm_bot((payload or {}).get("bot")) == "FALCON":
+            live_controls_armed = bool(
+                live_controls_armed
+                and str(os.environ.get("FALCON_MODE", "PAPER")).upper().strip() == "LIVE"
+            )
         bridge_result = auto_real_execution_bridge_v1_process(
             payload=payload,
             risk_result=decision_result if isinstance(decision_result, dict) else {},
             source="can_open_trade",
-            execute=True,
-            dry_run=False,
+            execute=live_controls_armed,
+            dry_run=not live_controls_armed,
         )
         if isinstance(decision_result, dict):
             decision_result.setdefault("auto_real_execution_bridge_v1", _arb_v1_sanitize_public(bridge_result))

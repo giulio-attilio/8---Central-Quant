@@ -1882,6 +1882,10 @@ def test_can_open_trade_wrapper_attaches_only_validated_falcon_bridge_suppressio
         "FALCON_SINGLE_LIVE_EXECUTION_PATH_VERSION": "TEST-FALCON-V1",
         "_ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1": original_decision,
         "_arb_v1_norm_bot": lambda value: str(value or "").upper(),
+        "_arb_v1_env_bool": lambda _names, default=False: (default, None),
+        "ENABLE_REAL_TRADING": False,
+        "EXECUTION_MODE": "PAPER",
+        "os": SimpleNamespace(environ={"FALCON_MODE": "PAPER"}),
         "_arb_v1_signal_id": lambda payload, _risk: payload.get("signal_id"),
         "_arb_v1_now": lambda: "2026-08-03T12:00:00Z",
         "_arb_v1_append_event": lambda event: events.append(dict(event)) or True,
@@ -1942,7 +1946,6 @@ def test_can_open_trade_wrapper_attaches_only_validated_falcon_bridge_suppressio
     assert missing_contract["auto_real_execution_bridge_v1"]["status"] == (
         "AUTO_REAL_BRIDGE_FALCON_SINGLE_PATH_CONTRACT_INVALID"
     )
-
     other_bot = bridge(
         payload={
             "bot": "PREDATOR",
@@ -1962,6 +1965,44 @@ def test_can_open_trade_wrapper_attaches_only_validated_falcon_bridge_suppressio
         for event in events
     )
 
+
+@pytest.mark.parametrize(
+    ("real_enabled", "broker_dry_run", "execution_mode", "falcon_mode", "expected_execute"),
+    [
+        (False, True, "PAPER", "PAPER", False),
+        (True, True, "LIVE", "LIVE", False),
+        (True, False, "PAPER", "LIVE", False),
+        (True, False, "LIVE", "PAPER", False),
+        (True, False, "LIVE", "LIVE", True),
+    ],
+)
+def test_can_open_trade_bridge_requires_all_runtime_live_controls(
+    real_enabled, broker_dry_run, execution_mode, falcon_mode, expected_execute
+):
+    calls = []
+    namespace = {
+        "_ORIGINAL_CAN_OPEN_TRADE_DECISION_FOR_AUTO_REAL_BRIDGE_V1": lambda _payload: {
+            "ok": True,
+            "allowed": True,
+            "decision": "ALLOW",
+        },
+        "_arb_v1_norm_bot": lambda value: str(value or "").upper(),
+        "_arb_v1_env_bool": lambda _names, default=False: (broker_dry_run, "TEST"),
+        "ENABLE_REAL_TRADING": real_enabled,
+        "EXECUTION_MODE": execution_mode,
+        "os": SimpleNamespace(environ={"FALCON_MODE": falcon_mode}),
+        "auto_real_execution_bridge_v1_process": lambda **kwargs: calls.append(kwargs)
+        or {"status": "TEST_ONLY", "executed": False, "sent": False},
+        "_arb_v1_sanitize_public": lambda value: dict(value),
+    }
+    can_open = _load_auto_bridge_can_open_wrapper(namespace)
+
+    result = can_open({"bot": "FALCON", "mode": "LIVE"})
+
+    assert len(calls) == 1
+    assert calls[0]["execute"] is expected_execute
+    assert calls[0]["dry_run"] is (not expected_execute)
+    assert result["auto_real_execution_bridge_v1"]["status"] == "TEST_ONLY"
 
 def test_auto_bridge_blocks_every_invalid_falcon_can_open_contract():
     namespace = {

@@ -309,7 +309,8 @@ if __name__ == "__main__":
             "-k",
             "reduce_only_claim or registry_sync_fails or does_not_block_paper or "
             "auto_bridge_blocks_every_invalid_falcon_can_open_contract or "
-            "can_open_trade_wrapper_attaches_only_validated_falcon_bridge_suppression",
+            "can_open_trade_wrapper_attaches_only_validated_falcon_bridge_suppression or "
+            "can_open_trade_bridge_requires_all_runtime_live_controls",
         ]
     elif sys.argv[1:] == ["--c3-dormant-startup"]:
         filters = []
