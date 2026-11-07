@@ -3042,7 +3042,12 @@ def startup():
    # threading.Thread(target=command_loop, daemon=True).start()
 
 
-startup()
+def start_central_bot_threads():
+    startup()
+
+
+if os.environ.get("CENTRAL_DEFER_BOT_STARTUP") != "1":
+    start_central_bot_threads()
 
 if __name__ == "__main__":
     porta = int(os.environ.get("PORT", "10000"))

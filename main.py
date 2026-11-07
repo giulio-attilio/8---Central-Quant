@@ -2552,6 +2552,7 @@ BOT_CONFIGS = {
 
 LOADED_BOTS = {}
 LOAD_ERRORS = {}
+BOT_THREADS_STARTED = set()
 CENTRAL_HEALTH = {
     "started_at": data_hora_sp_str(),
     "started_epoch": time.time(),
@@ -2665,6 +2666,9 @@ def load_bot(key: str, cfg: dict):
         "TELEGRAM_BOT_TOKEN": token,
         "TELEGRAM_CHAT_ID": chat_id,
         "BOT_NAME": cfg["name"],
+        # Bot modules must be imported without starting workers. The central
+        # startup coordinator launches them only after all enabled imports pass.
+        "CENTRAL_DEFER_BOT_STARTUP": "1",
     }
 
     for extra in cfg.get("extra_token_envs", []):
@@ -2679,21 +2683,36 @@ def load_bot(key: str, cfg: dict):
         spec = importlib.util.spec_from_file_location(module_name, cfg["file"])
         module = importlib.util.module_from_spec(spec)
         assert spec and spec.loader
+        print(f"BOT STARTUP IMPORT EXEC_BEGIN: {key} module={module_name}", flush=True)
         spec.loader.exec_module(module)
+        print(f"BOT STARTUP IMPORT EXEC_COMPLETE: {key} module={module_name}", flush=True)
         return module
     finally:
         _restore_env(old_env)
         memory_profile_step(f"after_import_{key}")
 
 
+def _central_missing_enabled_bot_modules():
+    return [
+        key
+        for key, cfg in BOT_CONFIGS.items()
+        if env_bool(cfg["enabled_env"], default=False) and key not in LOADED_BOTS
+    ]
+
+
 def start_enabled_bots():
+    print("BOT STARTUP PHASE: enter_config_loop", flush=True)
     for key, cfg in BOT_CONFIGS.items():
-        if not env_bool(cfg["enabled_env"], default=False):
+        print(f"BOT STARTUP CONFIG CHECK BEGIN: {key}", flush=True)
+        enabled = env_bool(cfg["enabled_env"], default=False)
+        print(f"BOT STARTUP CONFIG CHECK END: {key} enabled={bool(enabled)}", flush=True)
+        if not enabled:
             continue
         try:
             memory_profile_step(f"before_load_bot_{key}")
             print(
-                f"BOT STARTUP LOAD BEGIN: {key} module={cfg['module']}"
+                f"BOT STARTUP LOAD BEGIN: {key} module={cfg['module']}",
+                flush=True,
             )
             LOADED_BOTS[key] = load_bot(key, cfg)
             print(f"BOT STARTUP IMPORT COMPLETE: {key}")
@@ -2712,6 +2731,39 @@ def start_enabled_bots():
             LOAD_ERRORS[key] = str(exc)
             print(f"ERRO AO CARREGAR {key}: {exc}")
             memory_profile_step(f"load_error_{key}")
+
+    # Import the full enabled set before any bot worker can perform work.
+    missing_enabled_modules = _central_missing_enabled_bot_modules()
+    if missing_enabled_modules:
+        print(
+            "BOT STARTUP WORKERS BLOCKED: enabled module imports incomplete: "
+            + ",".join(missing_enabled_modules),
+            flush=True,
+        )
+        return
+    print("BOT STARTUP PHASE: enter_worker_launch", flush=True)
+    for key, cfg in BOT_CONFIGS.items():
+        if not env_bool(cfg["enabled_env"], default=False):
+            continue
+        module = LOADED_BOTS.get(key)
+        if module is None:
+            continue
+        starter = getattr(module, "start_central_bot_threads", None)
+        if not callable(starter):
+            LOAD_ERRORS[key] = "BOT_START_HOOK_MISSING"
+            LOADED_BOTS.pop(key, None)
+            print(f"BOT STARTUP WORKERS BLOCKED: {key} missing start hook", flush=True)
+            continue
+        try:
+            print(f"BOT STARTUP WORKERS BEGIN: {key}", flush=True)
+            starter()
+            BOT_THREADS_STARTED.add(key)
+            print(f"BOT STARTUP WORKERS COMPLETE: {key}", flush=True)
+        except Exception as exc:
+            LOAD_ERRORS[key] = str(exc)
+            LOADED_BOTS.pop(key, None)
+            print(f"ERRO AO INICIAR WORKERS {key}: {exc}")
+            memory_profile_step(f"worker_start_error_{key}")
 
 
 def bot_health(key: str, cfg: dict):
@@ -34251,6 +34303,7 @@ def start_central_runtime_once():
             else "PERSISTENT_REGISTRY_STARTUP_BLOCKED"
         )
         raise RuntimeError(f"CENTRAL_RUNTIME_STARTUP_BLOCKED:{reason}")
+    print("CENTRAL RUNTIME PHASE: registry_admission_passed", flush=True)
 
     with CENTRAL_RUNTIME_LOCK:
         if CENTRAL_RUNTIME_STARTED:
@@ -34260,6 +34313,7 @@ def start_central_runtime_once():
             # Offline completion cannot authorize workers or promote readiness.
             raise RuntimeError("C3_MAINTENANCE_BOUND_RUNTIME_START_FORBIDDEN")
         CENTRAL_RUNTIME_STARTED = True
+    print("CENTRAL RUNTIME PHASE: runtime_lock_acquired", flush=True)
 
     startup_summary_fn = globals().get("static_operational_runtime_startup_summary")
     if callable(startup_summary_fn):
@@ -34268,8 +34322,12 @@ def start_central_runtime_once():
         except Exception:
             pass
 
+    print("CENTRAL RUNTIME PHASE: before_startup_memory_snapshot", flush=True)
     memory_snapshot("before_start_bots", store=True, print_log=True)
+    print("CENTRAL RUNTIME PHASE: after_startup_memory_snapshot", flush=True)
+    print("CENTRAL RUNTIME PHASE: before_enabled_bot_loading", flush=True)
     start_enabled_bots()
+    print("CENTRAL RUNTIME PHASE: after_enabled_bot_loading", flush=True)
     memory_snapshot("after_start_bots", store=True, print_log=True)
     force_gc_if_needed("after_start_bots", force=True)
 
@@ -34353,7 +34411,11 @@ def start_central_runtime_once():
 
     start_central_command_routers()
     with CENTRAL_RUNTIME_LOCK:
-        CENTRAL_RUNTIME_READY = all(not env_bool(cfg["enabled_env"], default=False) or key in LOADED_BOTS for key, cfg in BOT_CONFIGS.items())
+        CENTRAL_RUNTIME_READY = all(
+            not env_bool(cfg["enabled_env"], default=False)
+            or (key in LOADED_BOTS and key in BOT_THREADS_STARTED)
+            for key, cfg in BOT_CONFIGS.items()
+        )
 
 
 # ==========================================================

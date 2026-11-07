@@ -5534,7 +5534,12 @@ def iniciar_threads_monitoradas():
     threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
 
 
-iniciar_threads_monitoradas()
+def start_central_bot_threads():
+    iniciar_threads_monitoradas()
+
+
+if os.environ.get("CENTRAL_DEFER_BOT_STARTUP") != "1":
+    start_central_bot_threads()
 
 
 if __name__ == "__main__":

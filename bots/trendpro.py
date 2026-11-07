@@ -5438,9 +5438,14 @@ def run_thread_guarded(nome, target):
             time.sleep(10)
 
 
-threading.Thread(target=run_thread_guarded, args=("scanner", scanner), daemon=True).start()
-threading.Thread(target=run_thread_guarded, args=("telegram_commands", listen_commands), daemon=True).start()
-threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
+def start_central_bot_threads():
+    threading.Thread(target=run_thread_guarded, args=("scanner", scanner), daemon=True).start()
+    threading.Thread(target=run_thread_guarded, args=("telegram_commands", listen_commands), daemon=True).start()
+    threading.Thread(target=run_thread_guarded, args=("watchdog", watchdog_loop), daemon=True).start()
+
+
+if os.environ.get("CENTRAL_DEFER_BOT_STARTUP") != "1":
+    start_central_bot_threads()
 
 
 if __name__ == "__main__":

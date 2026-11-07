@@ -163,7 +163,7 @@ def test_runtime_readiness_is_published_only_after_bot_and_router_startup():
     assert ready_line > max(bot_start_lines + router_start_lines)
 
 
-def test_runtime_readiness_requires_every_enabled_bot_to_be_loaded():
+def test_runtime_readiness_requires_every_enabled_bot_to_be_loaded_and_started():
     tree = ast.parse(_source(ROOT / "main.py"))
     start = next(
         node for node in tree.body
@@ -186,15 +186,109 @@ def test_runtime_readiness_requires_every_enabled_bot_to_be_loaded():
             "DONKEY": {"enabled_env": "ENABLE_DONKEY"},
         },
         "LOADED_BOTS": {},
+        "BOT_THREADS_STARTED": set(),
     }
 
     assert eval(ready_expression, namespace) is False
     namespace["LOADED_BOTS"]["TRENDPRO"] = object()
+    assert eval(ready_expression, namespace) is False
+    namespace["BOT_THREADS_STARTED"].add("TRENDPRO")
     assert eval(ready_expression, namespace) is True
 
     enabled["ENABLE_TRENDPRO"] = False
     namespace["LOADED_BOTS"].clear()
+    namespace["BOT_THREADS_STARTED"].clear()
     assert eval(ready_expression, namespace) is True
+
+
+def test_bot_import_defers_worker_start_until_explicit_central_hook():
+    bot_files = (
+        "trendpro.py",
+        "donkey.py",
+        "cobra.py",
+        "meme.py",
+        "predator.py",
+        "turtle.py",
+        "falcon.py",
+    )
+    for filename in bot_files:
+        tree = ast.parse(_source(ROOT / "bots" / filename))
+        assert any(
+            isinstance(node, ast.FunctionDef)
+            and node.name == "start_central_bot_threads"
+            for node in tree.body
+        ), filename
+        guarded_start = any(
+            isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Constant)
+                and child.value == "CENTRAL_DEFER_BOT_STARTUP"
+                for child in ast.walk(node.test)
+            )
+            and any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "start_central_bot_threads"
+                for stmt in node.body
+                for child in ast.walk(stmt)
+            )
+            for node in tree.body
+        )
+        assert guarded_start, filename
+
+
+def test_main_imports_all_enabled_bots_before_invoking_any_worker_hook():
+    tree = ast.parse(_source(ROOT / "main.py"))
+    start = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "start_enabled_bots"
+    )
+    load_lines = [
+        node.lineno
+        for node in ast.walk(start)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "load_bot"
+    ]
+    worker_lines = [
+        node.lineno
+        for node in ast.walk(start)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "starter"
+    ]
+    missing_gate_lines = [
+        node.lineno
+        for node in ast.walk(start)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_central_missing_enabled_bot_modules"
+    ]
+    assert load_lines and worker_lines and missing_gate_lines
+    assert max(load_lines) < min(worker_lines)
+    assert max(load_lines) < min(missing_gate_lines) < min(worker_lines)
+
+
+def test_enabled_import_failure_blocks_worker_launch():
+    tree = ast.parse(_source(ROOT / "main.py"))
+    helper = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_central_missing_enabled_bot_modules"
+    )
+    enabled = {"ENABLE_TRENDPRO": True, "ENABLE_DONKEY": False}
+    namespace = {
+        "BOT_CONFIGS": {
+            "TRENDPRO": {"enabled_env": "ENABLE_TRENDPRO"},
+            "DONKEY": {"enabled_env": "ENABLE_DONKEY"},
+        },
+        "LOADED_BOTS": {},
+        "env_bool": lambda key, default=False: enabled.get(key, default),
+    }
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "main.py", "exec"), namespace)
+    assert namespace["_central_missing_enabled_bot_modules"]() == ["TRENDPRO"]
+    namespace["LOADED_BOTS"]["TRENDPRO"] = object()
+    assert namespace["_central_missing_enabled_bot_modules"]() == []
 
 
 def test_persistent_registry_startup_admission_requires_mount_file_and_schema():

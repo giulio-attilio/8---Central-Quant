@@ -2633,7 +2633,12 @@ def funil_route():
 def eventos_route():
     return {"ok": True, "bot": "Cobra Attack", "events": carregar_trades()[-50:]}
 
-iniciar_threads_monitoradas()
+def start_central_bot_threads():
+    iniciar_threads_monitoradas()
+
+
+if os.environ.get("CENTRAL_DEFER_BOT_STARTUP") != "1":
+    start_central_bot_threads()
 
 if __name__ == "__main__":
     try:

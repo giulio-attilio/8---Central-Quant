@@ -13855,7 +13855,12 @@ def health_payload():
     return payload
 
 
-start_threads()
+def start_central_bot_threads():
+    start_threads()
+
+
+if os.environ.get("CENTRAL_DEFER_BOT_STARTUP") != "1":
+    start_central_bot_threads()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
