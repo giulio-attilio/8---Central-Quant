@@ -873,6 +873,104 @@ def test_broker_uses_explicit_notional_as_single_sizing_authority(monkeypatch):
     assert captured["notional_usdt"] != 180.0
 
 
+def test_broker_blocks_paper_preview_before_builder_when_persistence_is_low(monkeypatch):
+    monkeypatch.setattr(
+        broker,
+        "execution_config_for_bot",
+        lambda **kwargs: {
+            "margin_usdt": float(kwargs["margin_usdt"]),
+            "leverage": float(kwargs["leverage"]),
+            "effective_notional_usdt": float(kwargs["margin_usdt"])
+            * float(kwargs["leverage"]),
+        },
+    )
+    monkeypatch.setattr(broker, "is_real_live_send_enabled", lambda: False)
+    monkeypatch.setattr(broker, "_infer_bot_for_audit", lambda **kwargs: kwargs["bot"])
+    monkeypatch.setattr(
+        broker,
+        "broker_paper_persistence_guard_v1_validate",
+        lambda: {
+            "allowed": False,
+            "status": "PAPER_PERSISTENCE_BLOCKED",
+            "free_bytes": 63 * 1024 * 1024,
+        },
+    )
+    monkeypatch.setattr(
+        broker,
+        "build_order_preview",
+        lambda *_args, **_kwargs: pytest.fail("preview must not be built"),
+    )
+
+    result = broker.place_market_order(
+        symbol="SOLUSDT",
+        side="LONG",
+        margin_usdt=20.0,
+        leverage=3,
+        notional_usdt=60.0,
+        client_tag=ENTRY_CLIENT_ORDER_ID,
+        bot="FALCON",
+    )
+
+    assert result["ok"] is False
+    assert result["sent"] is False
+    assert result["order_attempted"] is False
+    assert result["no_order_sent"] is True
+    assert result["status"] == "PAPER_PERSISTENCE_BLOCKED"
+
+
+@pytest.mark.parametrize("failed_log", ["execution", "audit"])
+def test_broker_blocks_paper_result_when_either_audit_append_fails(monkeypatch, failed_log):
+    monkeypatch.setattr(
+        broker,
+        "execution_config_for_bot",
+        lambda **kwargs: {
+            "margin_usdt": float(kwargs["margin_usdt"]),
+            "leverage": float(kwargs["leverage"]),
+            "effective_notional_usdt": float(kwargs["margin_usdt"])
+            * float(kwargs["leverage"]),
+        },
+    )
+    monkeypatch.setattr(broker, "is_real_live_send_enabled", lambda: False)
+    monkeypatch.setattr(
+        broker,
+        "broker_paper_persistence_guard_v1_validate",
+        lambda: {"allowed": True, "status": "PAPER_PERSISTENCE_READY", "free_bytes": 1_000_000_000},
+    )
+    monkeypatch.setattr(
+        broker, "_automatic_broker_preview_firewall", lambda **_kwargs: {"blocked": False}
+    )
+    monkeypatch.setattr(broker, "_infer_bot_for_audit", lambda **kwargs: kwargs["bot"])
+    monkeypatch.setattr(broker, "_classify_preview_audit", lambda **_kwargs: "TEST")
+    monkeypatch.setattr(broker, "build_order_preview", lambda *_args, **kwargs: {
+        "ok": True,
+        "constraints_ok": True,
+        "symbol": "SOLUSDT",
+        "side": "LONG",
+        "margin_usdt": kwargs["margin_usdt"],
+        "leverage": kwargs["leverage"],
+        "notional_usdt": kwargs["notional_usdt"],
+        "client_order_id": kwargs["client_tag"],
+    })
+    monkeypatch.setattr(broker, "log_execution_event", lambda *_args, **_kwargs: failed_log != "execution")
+    monkeypatch.setattr(broker, "log_execution_audit_event", lambda *_args, **_kwargs: failed_log != "audit")
+
+    result = broker.place_market_order(
+        symbol="SOLUSDT",
+        side="LONG",
+        margin_usdt=20.0,
+        leverage=3,
+        notional_usdt=60.0,
+        client_tag=ENTRY_CLIENT_ORDER_ID,
+        bot="FALCON",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "PAPER_PERSISTENCE_BLOCKED"
+    assert result["sent"] is False
+    assert result["order_attempted"] is False
+    assert result["persistence_guard"]["allowed"] is False
+
+
 def test_broker_has_exactly_one_raw_create_order_sink():
     tree = ast.parse((ROOT / "broker.py").read_text(encoding="utf-8"))
     parents = {}

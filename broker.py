@@ -1014,6 +1014,7 @@ BROKER_REAL_PILOT_GUARD_ENABLED = env_bool("BROKER_REAL_PILOT_GUARD_ENABLED", en
 BROKER_REAL_PILOT_FAIL_CLOSED = env_bool("BROKER_REAL_PILOT_FAIL_CLOSED", True)
 BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS = env_bool("BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS", True)
 BROKER_REAL_PILOT_MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
+BROKER_PAPER_MIN_FREE_DISK_BYTES = 256 * 1024 * 1024
 BROKER_REAL_PILOT_ALLOWED_BOTS = {
     x.strip().upper()
     for x in os.environ.get(
@@ -2943,6 +2944,30 @@ def _broker_rpg_v1_persistent_disk_space():
         }
 
 
+def broker_paper_persistence_guard_v1_validate():
+    """Fail closed before a PAPER preview when its persistent audit volume is unhealthy."""
+    disk_space = _broker_rpg_v1_persistent_disk_space()
+    free_bytes = None
+    try:
+        if disk_space.get("ok") is True:
+            free_bytes = int(disk_space.get("free_bytes"))
+    except (TypeError, ValueError):
+        free_bytes = None
+    allowed = (
+        free_bytes is not None
+        and free_bytes >= BROKER_PAPER_MIN_FREE_DISK_BYTES
+    )
+    return {
+        "ok": allowed,
+        "allowed": allowed,
+        "status": "PAPER_PERSISTENCE_READY" if allowed else "PAPER_PERSISTENCE_BLOCKED",
+        "free_bytes": free_bytes,
+        "minimum_free_bytes": BROKER_PAPER_MIN_FREE_DISK_BYTES,
+        "disk_measurement_ok": disk_space.get("ok") is True,
+        "error_type": disk_space.get("error_type") if disk_space.get("ok") is not True else None,
+    }
+
+
 FALCON_REAL_POSITION_OWNERSHIP_LIMIT_V1_VERSION = "2026-07-16-FALCON-REAL-POSITION-OWNERSHIP-LIMIT-V1"
 FALCON_OWNERSHIP_EVIDENCE_MAX_AGE_SECONDS = 30.0
 
@@ -3266,6 +3291,32 @@ def place_market_order(
     live_send_enabled = is_real_live_send_enabled()
     audit_bot = _infer_bot_for_audit(bot=bot, client_tag=client_tag)
 
+    # PAPER/VERIFY previews still write execution and audit records to /data.
+    # Do not label a preview as successful if durable logging is already below
+    # the safety margin (or cannot be measured). This guard never blocks the
+    # reduce-only LIVE close path because it applies only while real sending is off.
+    if not live_send_enabled:
+        paper_persistence = broker_paper_persistence_guard_v1_validate()
+        if paper_persistence.get("allowed") is not True:
+            print(
+                "PAPER_PREVIEW_BLOCKED_PERSISTENT_DISK "
+                f"status={paper_persistence.get('status')} "
+                f"free_bytes={paper_persistence.get('free_bytes')}"
+            )
+            return {
+                "ok": False,
+                "status": "PAPER_PERSISTENCE_BLOCKED",
+                "sent": False,
+                "order_attempted": False,
+                "no_order_sent": True,
+                "symbol": sym,
+                "side": order_side,
+                "bot": audit_bot,
+                "reason": "Persistent audit storage is below the required margin or cannot be measured.",
+                "persistence_guard": paper_persistence,
+                "live_send_enabled": False,
+            }
+
     preview_firewall = _automatic_broker_preview_firewall(
         sym=sym,
         side=order_side,
@@ -3406,7 +3457,7 @@ def place_market_order(
             "preview_isolation": True,
             "live_send_enabled": False,
         })
-        log_execution_event({
+        execution_log_ok = log_execution_event({
             "event": "place_market_order",
             "mode": EXECUTION_MODE,
             "status": result.get("status"),
@@ -3435,7 +3486,7 @@ def place_market_order(
             "estimated_max_loss_usdt": result.get("estimated_max_loss_usdt"),
             "preview_isolation": True,
         })
-        log_execution_audit_event({
+        audit_log_ok = log_execution_audit_event({
             "event": "BROKER_PREVIEW_ISOLATED",
             "status": result.get("status"),
             "sent": False,
@@ -3460,6 +3511,21 @@ def place_market_order(
             "preview_isolation": True,
             "live_send_enabled": False,
         })
+        if execution_log_ok is not True or audit_log_ok is not True:
+            result.update({
+                "ok": False,
+                "status": "PAPER_PERSISTENCE_BLOCKED",
+                "sent": False,
+                "order_attempted": False,
+                "no_order_sent": True,
+                "reason": "PAPER preview audit records could not be persisted.",
+                "persistence_guard": {
+                    "allowed": False,
+                    "status": "PAPER_PERSISTENCE_BLOCKED",
+                    "execution_log_ok": execution_log_ok is True,
+                    "audit_log_ok": audit_log_ok is True,
+                },
+            })
         return result
 
     # A partir daqui é LIVE real autorizado pelas envs, mas ainda precisa passar pelo Real Pilot Guard do broker.

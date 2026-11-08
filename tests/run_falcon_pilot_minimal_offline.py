@@ -208,6 +208,12 @@ if __name__ == "__main__":
             "test_exchange_throttle_policy_v1.py",
             "test_predator_deferred_m15_fetch_v1.py",
         )
+    elif sys.argv[1:] == ["--broker-paper-disk-guard"]:
+        cases = (
+            "test_broker_real_pilot_disk_space_guard_v1.py",
+            "test_broker_order_constraints_fail_closed_v1.py",
+            "test_broker_account_client_order_boundary_v1.py",
+        )
     elif sys.argv[1:] == ["--static-runtime"]:
         cases = ("test_static_operational_runtime_v1.py",)
     elif sys.argv[1:] == ["--predator-auto-closed-sync"]:
@@ -315,6 +321,8 @@ if __name__ == "__main__":
     elif sys.argv[1:] == ["--c3-dormant-startup"]:
         filters = []
     elif sys.argv[1:] == ["--market-data-throttle"]:
+        filters = []
+    elif sys.argv[1:] == ["--broker-paper-disk-guard"]:
         filters = []
     elif sys.argv[1:] == ["--static-runtime"]:
         filters = []

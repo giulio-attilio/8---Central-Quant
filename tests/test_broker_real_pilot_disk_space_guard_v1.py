@@ -15,6 +15,7 @@ def guard_namespace():
     tree = ast.parse(BROKER_SOURCE.read_text(encoding="utf-8"))
     names = {
         "_broker_rpg_v1_persistent_disk_space",
+        "broker_paper_persistence_guard_v1_validate",
         "broker_real_pilot_guard_v1_validate",
     }
     functions = [
@@ -28,6 +29,7 @@ def guard_namespace():
         "Path": Path,
         "CENTRAL_DATA_DIR": Path("/isolated-data"),
         "BROKER_REAL_PILOT_MIN_FREE_DISK_BYTES": 256 * 1024 * 1024,
+        "BROKER_PAPER_MIN_FREE_DISK_BYTES": 256 * 1024 * 1024,
         "BROKER_REAL_PILOT_GUARD_ENABLED": True,
         "BROKER_REAL_PILOT_FAIL_CLOSED": True,
         "BROKER_REAL_PILOT_ALLOW_REDUCE_ONLY_ALWAYS": True,
@@ -114,16 +116,62 @@ def test_reduce_only_close_remains_available_when_disk_is_low(guard_namespace):
     assert result["checks"] == []
 
 
-def test_paper_guard_does_not_apply_disk_entry_interlock(guard_namespace):
-    guard_namespace["_broker_rpg_v1_persistent_disk_space"] = lambda: (_ for _ in ()).throw(AssertionError("must not inspect disk in PAPER"))
+def test_paper_persistence_guard_blocks_below_safety_margin(guard_namespace):
+    guard_namespace["_broker_rpg_v1_persistent_disk_space"] = lambda: {
+        "ok": True, "path": "/isolated-data", "total_bytes": 2_000_000_000,
+        "used_bytes": 1_950_000_000, "free_bytes": 50_000_000,
+    }
 
-    result = guard_namespace["broker_real_pilot_guard_v1_validate"](
-        symbol="BTCUSDT", side="BUY", bot="DONKEY", notional_usdt=10.0,
-        live_send_enabled=False,
-    )
+    result = guard_namespace["broker_paper_persistence_guard_v1_validate"]()
+
+    assert result["allowed"] is False
+    assert result["status"] == "PAPER_PERSISTENCE_BLOCKED"
+    assert result["free_bytes"] == 50_000_000
+
+
+def test_paper_persistence_guard_fails_closed_when_disk_is_unknown(guard_namespace):
+    guard_namespace["_broker_rpg_v1_persistent_disk_space"] = lambda: {
+        "ok": False, "path": "/isolated-data", "error_type": "OSError",
+    }
+
+    result = guard_namespace["broker_paper_persistence_guard_v1_validate"]()
+
+    assert result["allowed"] is False
+    assert result["status"] == "PAPER_PERSISTENCE_BLOCKED"
+    assert result["disk_measurement_ok"] is False
+    assert "sensitive" not in str(result).lower()
+
+
+def test_paper_persistence_guard_allows_margin_and_probe_is_read_only(guard_namespace, tmp_path):
+    guard_namespace["CENTRAL_DATA_DIR"] = tmp_path
+    result = guard_namespace["broker_paper_persistence_guard_v1_validate"]()
 
     assert result["allowed"] is True
-    assert result["applies"] is False
+    assert result["status"] == "PAPER_PERSISTENCE_READY"
+    assert result["free_bytes"] >= result["minimum_free_bytes"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_paper_persistence_guard_is_before_preview_in_broker_path():
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    place = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "place_market_order"
+    )
+    guard_call_line = next(
+        node.lineno for node in ast.walk(place)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "broker_paper_persistence_guard_v1_validate"
+    )
+    preview_line = next(
+        node.lineno for node in ast.walk(place)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_order_preview"
+    )
+    assert guard_call_line < preview_line
 
 
 def test_disk_probe_reads_usage_without_writing(guard_namespace, tmp_path):
