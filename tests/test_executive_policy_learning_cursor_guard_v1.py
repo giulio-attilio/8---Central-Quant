@@ -81,3 +81,38 @@ def test_cursor_at_or_before_current_eof_continues_normally(tmp_path, monkeypatc
     assert result["ok"] is True
     assert "error" not in result
     assert result["new_offset"] == timeline.stat().st_size
+
+
+def test_restored_original_timeline_recovers_without_cursor_reset(tmp_path, monkeypatch):
+    timeline = tmp_path / "timeline.jsonl"
+    first = b'{"code":"POLICY_A","event":1}\n'
+    second = b'{"code":"POLICY_A","event":2}\n'
+    third = b'{"code":"POLICY_A","event":3}\n'
+    original = first + second + third
+    saved_offset = len(first + second)
+    timeline.write_bytes(first)
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"timeline_offset": saved_offset, "events_processed": 0}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
+    monkeypatch.setattr(learning, "STATE_FILE", state_path)
+    monkeypatch.setattr(learning, "STATS_FILE", tmp_path / "stats.json")
+    monkeypatch.setattr(learning, "LOG_FILE", tmp_path / "learning.jsonl")
+
+    blocked = learning.run_executive_policy_learning(commit=True)
+    assert blocked["error"] == "TIMELINE_CURSOR_PAST_EOF"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["timeline_offset"] == saved_offset
+
+    timeline.write_bytes(original)
+    recovered = learning.run_executive_policy_learning(commit=True)
+
+    assert recovered["ok"] is True
+    assert recovered["events_processed"] == 1
+    assert recovered["old_offset"] == saved_offset
+    assert recovered["new_offset"] == len(original)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["timeline_offset"] == len(original)
+    assert state["last_error"] is None
+    assert learning.get_executive_policy_learning_health()["ok"] is True
