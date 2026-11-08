@@ -188,3 +188,43 @@ def test_malformed_saved_timeline_identity_fails_closed(tmp_path, monkeypatch):
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["timeline_offset"] == 1
     assert state["last_error"] == "TIMELINE_SOURCE_IDENTITY_INVALID"
+
+
+def test_replaced_timeline_during_read_fails_closed(tmp_path, monkeypatch):
+    timeline = tmp_path / "timeline.jsonl"
+    original = b'{"code":"POLICY_A","event":1}\n'
+    timeline.write_bytes(original)
+    state_path = tmp_path / "state.json"
+    stats_path = tmp_path / "stats.json"
+    log_path = tmp_path / "learning.jsonl"
+    monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
+    monkeypatch.setattr(learning, "STATE_FILE", state_path)
+    monkeypatch.setattr(learning, "STATS_FILE", stats_path)
+    monkeypatch.setattr(learning, "LOG_FILE", log_path)
+
+    first = learning.run_executive_policy_learning(commit=True)
+    assert first["ok"] is True
+    old_offset = first["new_offset"]
+    old_stats = stats_path.read_bytes()
+    original_iter = learning._iter_new_timeline_events
+    replacement = tmp_path / "timeline.replacement"
+
+    def replace_after_read(offset, max_events):
+        result = original_iter(offset, max_events)
+        replacement.write_bytes(
+            original + b'{"code":"POLICY_B","event":2}\n'
+        )
+        os.replace(replacement, timeline)
+        return result
+
+    monkeypatch.setattr(learning, "_iter_new_timeline_events", replace_after_read)
+    result = learning.run_executive_policy_learning(commit=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "TIMELINE_SOURCE_CHANGED_DURING_READ"
+    assert result["old_offset"] == result["new_offset"] == old_offset
+    assert result["events_processed"] == 0
+    assert stats_path.read_bytes() == old_stats
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["timeline_offset"] == old_offset
+    assert state["last_error"] == "TIMELINE_SOURCE_CHANGED_DURING_READ"
