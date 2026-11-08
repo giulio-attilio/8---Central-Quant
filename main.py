@@ -97,6 +97,10 @@ def _resolve_central_data_dir():
 
 
 CENTRAL_DATA_DIR = _resolve_central_data_dir()
+# Keep modules that resolve storage from the environment on the same persistent
+# volume selected by the runtime. In particular, PAPER storage and its disk
+# guard must not silently fall back to the ephemeral source directory.
+os.environ["CENTRAL_DATA_DIR"] = str(CENTRAL_DATA_DIR)
 
 # Deve permanecer antes dos imports operacionais, do Startup Disk Forensics,
 # do mkdir do data dir e de qualquer writer configurado pela Central. O módulo

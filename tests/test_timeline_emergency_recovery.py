@@ -552,7 +552,11 @@ def test_startup_integration_order_is_strictly_early():
     data_mkdir = source.index("CENTRAL_DATA_DIR.mkdir(")
     history_import = source.index("import history_manager as _canonical_timeline_history_manager")
     runtime_append = source.index("runtime_stability_v1_record_startup()")
-    assert source.index("CENTRAL_DATA_DIR = _resolve_central_data_dir()") < recovery_call
+    data_dir_resolved = source.index("CENTRAL_DATA_DIR = _resolve_central_data_dir()")
+    data_dir_exported = source.index('os.environ["CENTRAL_DATA_DIR"] = str(CENTRAL_DATA_DIR)')
+    paper_executor_import = source.index("from paper_executor_integrated import")
+    assert data_dir_resolved < data_dir_exported < recovery_call
+    assert data_dir_exported < paper_executor_import
     assert recovery_call < disk_scan < data_mkdir < history_import < runtime_append
     assert recovery_call < source.index("from automatic_daily_summaries import")
     assert recovery_call < source.index("import event_bus as central_event_bus")
