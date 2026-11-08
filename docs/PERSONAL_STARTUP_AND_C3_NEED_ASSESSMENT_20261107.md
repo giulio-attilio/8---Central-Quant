@@ -378,3 +378,9 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 - Verifiquei inventário local de Python e cache: Python 3.11 não tem `pytest` nem `ccxt`; Python 3.14 tem `pytest`, mas não `ccxt`; o cache pip local está vazio. Não instalei nem baixei pacote. Os três módulos dependentes de `ccxt` continuam pendentes de wheel offline aprovado.
 - Tentei acessar somente a página Disk no navegador integrado, mas uma política salva do navegador bloqueou a navegação a `dashboard.render.com`. Não tentei contornar essa restrição por outro navegador ou mecanismo. Assim, a última leitura de espaço continua sendo 62,07 MB às 19:46 UTC; falta o usuário enviar a captura atual de Render → serviço → Disk.
 - Continuam sem alteração a AWS, o Render, dados de produção e os controles de trading. A etapa de deploy permanece suspensa até verificar espaço atual suficiente e repetir o preflight do SHA exato.
+
+### Cobertura lifecycle com dependência sintética fail-closed — 2026-11-08 00:03 UTC
+
+- Rodei a seleção `--personal-lifecycle-completeness` no runner offline com um módulo `ccxt` em memória, sintético e sem cliente exchange; sua factory `bingx` lança erro imediatamente se chamada. O runner continuou bloqueando sockets, DNS, conexões externas, subprocessos e leitura de `.env`, e manteve dados/persistência em diretório temporário.
+- Resultado: **843 passed em 773,11 s** nos 12 módulos de ciclo de vida (entrada/fill/stop, cancelamento, fechamento/reconciliação, posição e disaster stop). Isso amplia a cobertura funcional simulada que não coletava sem pacote `ccxt`, mas não valida o pacote real, compatibilidade com BingX, nem integração da exchange.
+- O `ccxt` real continua ausente do ambiente/cache; nenhum pacote foi baixado/instalado. WSL continua sem permissão e a validação física POSIX segue pendente. Nenhuma alteração de produção foi feita.
