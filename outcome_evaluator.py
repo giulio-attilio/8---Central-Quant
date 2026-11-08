@@ -76,6 +76,8 @@ def _write_json(path: Path, payload: Any) -> bool:
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def _outcome_event_id(outcome: Dict[str, Any]) -> str:

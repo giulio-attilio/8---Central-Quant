@@ -72,6 +72,18 @@ def _write_positions(module, positions):
     )
 
 
+def test_outcome_event_append_flushes_and_fsyncs(evaluator, monkeypatch):
+    fsync_calls = []
+    monkeypatch.setattr(evaluator.os, "fsync", lambda fd: fsync_calls.append(fd))
+    event = {"event": "PAPER_OUTCOME_EVALUATED", "event_id": "event-test"}
+
+    evaluator._append_jsonl(evaluator.OUTCOME_LOG_FILE, event)
+
+    stored = json.loads(evaluator.OUTCOME_LOG_FILE.read_text(encoding="utf-8"))
+    assert stored == event
+    assert len(fsync_calls) == 1
+
+
 def test_same_trade_id_distinct_lifecycles_are_evaluated_independently(
     evaluator,
 ):
@@ -195,6 +207,45 @@ def test_outcome_log_failure_is_reported_and_retry_finishes_once(
     assert partial["stage"] == "outcome_log"
     assert not evaluator.OUTCOME_STATS_FILE.exists()
 
+    retry = evaluator.evaluate_closed_paper_trades()
+
+    assert retry["ok"] is True
+    assert retry["evaluated_count"] == 1
+    assert retry["stats"]["global"]["trades"] == 1
+    events = [
+        json.loads(line)
+        for line in evaluator.OUTCOME_LOG_FILE.read_text("utf-8").splitlines()
+    ]
+    assert len(events) == 1
+
+
+def test_outcome_log_fsync_failure_is_reported_and_retry_finishes_once(
+    evaluator, monkeypatch
+):
+    _write_positions(evaluator, [_closed(lifecycle_id="LC-FSYNC-RETRY")])
+    original_write = evaluator._write_json
+    original_fsync = evaluator.os.fsync
+
+    def fail_log_fsync_after_positions(path, payload):
+        result = original_write(path, payload)
+        if path == evaluator.PAPER_POSITIONS_FILE:
+            monkeypatch.setattr(
+                evaluator.os,
+                "fsync",
+                lambda _fd: (_ for _ in ()).throw(OSError("simulated fsync failure")),
+            )
+        return result
+
+    monkeypatch.setattr(evaluator, "_write_json", fail_log_fsync_after_positions)
+    partial = evaluator.evaluate_closed_paper_trades()
+
+    assert partial["ok"] is False
+    assert partial["status"] == "OUTCOME_PERSISTENCE_PARTIAL"
+    assert partial["stage"] == "outcome_log"
+    assert not evaluator.OUTCOME_STATS_FILE.exists()
+
+    monkeypatch.setattr(evaluator.os, "fsync", original_fsync)
+    monkeypatch.setattr(evaluator, "_write_json", original_write)
     retry = evaluator.evaluate_closed_paper_trades()
 
     assert retry["ok"] is True
