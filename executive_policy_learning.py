@@ -393,6 +393,47 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
     offset = _safe_int(state.get("timeline_offset"), 0)
     max_events = int(max_events or MAX_EVENTS_PER_RUN)
 
+    try:
+        timeline_size = TIMELINE_FILE.stat().st_size
+    except FileNotFoundError:
+        timeline_size = None
+    if offset < 0 or (offset > 0 and (timeline_size is None or offset > timeline_size)):
+        error = "TIMELINE_CURSOR_INVALID" if offset < 0 else "TIMELINE_CURSOR_PAST_EOF"
+        state["last_run_at"] = _now()
+        state["last_error"] = error
+        state["last_batch"] = {
+            "events_read": 0,
+            "events_processed": 0,
+            "reached_eof": False,
+            "old_offset": offset,
+            "new_offset": offset,
+            "source_size_bytes": timeline_size,
+            "error": error,
+        }
+        result = {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "version": VERSION,
+            "generated_at": _now(),
+            "commit": commit,
+            "timeline_file": str(TIMELINE_FILE),
+            "state_file": str(STATE_FILE),
+            "stats_file": str(STATS_FILE),
+            "events_read": 0,
+            "events_processed": 0,
+            "old_offset": offset,
+            "new_offset": offset,
+            "reached_eof": False,
+            "source_size_bytes": timeline_size,
+            "error": error,
+            "duration_ms": round((time.time() - started) * 1000, 2),
+            "summary": stats.get("summary") or {},
+        }
+        if commit:
+            _save_state(state)
+        _append_log(result)
+        return result
+
     events, new_offset, reached_eof = _iter_new_timeline_events(offset, max_events)
 
     processed = 0
@@ -466,13 +507,15 @@ def get_executive_policy_learning_health():
     summary = stats.get("summary") or {}
 
     status = "OK"
-    if not TIMELINE_FILE.exists():
+    if state.get("last_error") in {"TIMELINE_CURSOR_INVALID", "TIMELINE_CURSOR_PAST_EOF"}:
+        status = "SOURCE_CHANGED"
+    elif not TIMELINE_FILE.exists():
         status = "NO_TIMELINE"
     elif _safe_int(summary.get("policy_count")) == 0:
         status = "WAITING_DATA"
 
     return {
-        "ok": True,
+        "ok": status not in {"SOURCE_CHANGED"},
         "module": "executive_policy_learning",
         "loaded": True,
         "version": VERSION,
