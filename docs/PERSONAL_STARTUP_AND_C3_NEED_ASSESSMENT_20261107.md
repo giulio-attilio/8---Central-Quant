@@ -382,5 +382,30 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 ### Cobertura lifecycle com dependência sintética fail-closed — 2026-11-08 00:03 UTC
 
 - Rodei a seleção `--personal-lifecycle-completeness` no runner offline com um módulo `ccxt` em memória, sintético e sem cliente exchange; sua factory `bingx` lança erro imediatamente se chamada. O runner continuou bloqueando sockets, DNS, conexões externas, subprocessos e leitura de `.env`, e manteve dados/persistência em diretório temporário.
-- Resultado: **843 passed em 773,11 s** nos 12 módulos de ciclo de vida (entrada/fill/stop, cancelamento, fechamento/reconciliação, posição e disaster stop). Isso amplia a cobertura funcional simulada que não coletava sem pacote `ccxt`, mas não valida o pacote real, compatibilidade com BingX, nem integração da exchange.
-- O `ccxt` real continua ausente do ambiente/cache; nenhum pacote foi baixado/instalado. WSL continua sem permissão e a validação física POSIX segue pendente. Nenhuma alteração de produção foi feita.
+- Resultado: **843 passed em 773,11 s** nos 12 módulos de ciclo de vida (entrada/fill/stop, cancelamento, fechamento/reconciliação, posição e disaster stop). Essa execução usou stub sintético; não validou a compatibilidade com o pacote nem com a exchange reais.
+- Correção registrada em 2026-11-08: embora `ccxt` não esteja no Python global, a venv offline `..\\.offline-envs\\cq-ccxt-4.5.88` e o wheelhouse local existem. Uma nova execução com `ccxt` real está registrada abaixo. WSL ainda retorna `Wsl/E_ACCESSDENIED`, portanto a validação física POSIX permanece pendente.
+
+### Continuação local: escritores do Registry, autenticação HTTP e estado Render — 2026-11-08 00:18 UTC
+
+- Antes dos testes: branch `codex/personal-readiness-release-20261104`, HEAD `d7f73fa738dbc1a569eef0762f115d85f3893a9d`, árvore limpa e sincronizada com `origin`.
+- O runner `tests/run_falcon_pilot_minimal_offline.py --can-open-risk` passou **10 testes** em 183,93 s. O runner bloqueia sockets/DNS/HTTP de saída, subprocessos e leitura de `.env`, usa persistência temporária e recebeu somente um módulo `ccxt` sintético cuja factory não permite criar cliente.
+- A seleção `--personal-http-auth` passou **240 testes** em 101,79 s, com as mesmas barreiras offline e o stub de `ccxt` sem cliente real.
+- A auditoria `--registry-lock-audit` passou **1 teste**, com 59 casos não selecionados; a seleção completa `--registry-writers` passou **60 testes** em 78,15 s. Isso dá evidência de cobertura estática/contratual dos escritores do Registry e do lock compartilhado, mas não prova exclusão entre processos nem `fsync`/lock físico no volume Render.
+- Testes isolados adicionais passaram: `tests/test_broker_real_pilot_disk_space_guard_v1.py` (**7 passed**) e os módulos `tests/test_paper_executor_integrated_idempotency_v1.py` + `tests/test_history_eventbus_smoke.py` (**23 passed**), com conectividade de sockets bloqueada e persistência de fixtures temporária.
+- Render somente leitura às 00:18 UTC: uma instância, disco persistente `/data` de 2 GB, `autoDeploy=no`; SHA ativo permanece `31f31c9d071398c0fd35b1167f0460020f9ce2fd`. Não há amostra `free_mb` posterior a **62,07 MB às 19:46:04 UTC de 2026-11-07**. O Dashboard continua necessário para uma captura atual do uso do disco; nenhuma limpeza, redimensionamento ou deploy foi feito.
+- A configuração observada de uma instância e os testes locais não demonstram por si sós a necessidade de coordenação distribuída C3, nem eliminam a necessidade de confirmar writers/processos ativos e semântica física do volume. C3 permanece sem ativação; validação POSIX física segue pendente por `Wsl/E_ACCESSDENIED`.
+- Uma tentativa de rodar pytest com `subprocess.Popen` substituído por uma função falhou antes da coleta por interferir na inicialização do próprio pytest; a tentativa válida foi refeita pelo runner offline mantido no repositório e terminou com os resultados acima. Nenhum arquivo do serviço ou dado de produção foi alterado.
+
+### Regressão de lifecycle com ccxt real instalada offline — 2026-11-08 00:31 UTC
+
+- Confirmei a venv existente `C:\\Users\\giuli\\Documents\\Codex\\2026-10-17\\feito\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe`, que importa `ccxt 4.5.88` em Python 3.14.5 com `-I`. O wheelhouse local contém as dependências para Windows/CPython 3.14; não instalei nem baixei nada nesta rodada.
+- Executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --personal-lifecycle-completeness` a partir da raiz da worktree. Resultado: **843 passed em 757,42 s (12 min 37 s)** usando a biblioteca `ccxt` real instalada localmente, sem instanciar credenciais nem chamar BingX.
+- O runner bloqueia rede/DNS/HTTP, subprocessos e leitura de `.env`, e usa persistência temporária. A execução melhora a evidência de compatibilidade de import/API e dos testes de ciclo de vida; não prova conectividade ou comportamento real da corretora.
+- O SHA no Render continua `31f31c9`; não houve ação externa nem mudança nos controles de trading. A tentativa de commit local da anotação anterior falhou porque o Git não conseguiu criar o `index.lock` no diretório de metadados da worktree (`Permission denied`). O documento permanece como alteração local não commitada; não tentei contornar permissões.
+
+### Regressão de segurança de execução com ccxt real — 2026-11-08 00:48 UTC
+
+- No mesmo HEAD local `d7f73fa738dbc1a569eef0762f115d85f3893a9d`, executei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --personal-execution-safety`: **402 passed em 840,40 s (14 min)**.
+- A execução usou o `ccxt 4.5.88` local real, não criou cliente nem carregou credenciais, bloqueou rede/subprocessos/leitura de `.env` e direcionou persistência aos fixtures temporários do runner. Cobriu preflight fail-closed, entrada/fill/cancelamento, leitura de stop/posição, disaster stop, fechamento e reconciliação; não substitui teste de integração com corretora.
+- Nova consulta Render às 00:48 UTC não encontrou amostra `free_mb` posterior a **62,07 MB às 19:46:04 UTC de 2026-11-07**. Configuração read-only permanece uma instância com `/data` de 2 GB e `autoDeploy=no`; o SHA live permanece `31f31c9d071398c0fd35b1167f0460020f9ce2fd`.
+- Não houve deploy, limpeza/redimensionamento de disco, alteração de secrets, AWS, Render, produção ou controles PAPER/DRY_RUN/LIVE. A leitura atual do Disk no Dashboard segue pendente.
