@@ -964,3 +964,4 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 
 - No HEAD `5f0e51d0bbcb431fe53073a9e9a40f5bfc945b62`, executei novamente `--personal-execution-safety`: **402 passed em 642,84 s**, exit code 0. Essa seleção cobre contratos locais de preflight fail-closed, entrada/fill, posição/stop, disaster stop, fechamento/reconciliação e segurança adjacente, com harness offline e fixtures temporárias.
 - Isso não prova integração com a exchange, ordem real, posição real, configuração efetiva no Render, nem semântica física do filesystem. O teste não mudou controles de trading.
+- No mesmo HEAD, `--trading-mode-defaults` passou: **9 passed em 25,58 s**. Isso verifica defaults locais fail-closed; não foi lido nem alterado qualquer valor no Render.
