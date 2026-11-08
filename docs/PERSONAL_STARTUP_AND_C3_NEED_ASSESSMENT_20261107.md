@@ -959,3 +959,8 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 
 - No HEAD local `2f6dbd44dbf8d3828d78efc5572f5b2732258ea3`, executei `--personal-lifecycle-completeness` novamente após o commit de `fsync` do JSONL: **843 passed em 974,19 s**. A execução terminou com exit code 0 no runner offline, usando fixtures temporárias e restrições de rede do harness.
 - Esse resultado valida a regressão local selecionada, não comportamento físico do disco Render, configuração de produção, integração com exchange ou prontidão para LIVE. O filesystem pós-resize continua aguardando `df -h /data` executado no Shell da instância.
+
+### Controles pessoais de execução — revalidação no HEAD local — 2026-11-08
+
+- No HEAD `5f0e51d0bbcb431fe53073a9e9a40f5bfc945b62`, executei novamente `--personal-execution-safety`: **402 passed em 642,84 s**, exit code 0. Essa seleção cobre contratos locais de preflight fail-closed, entrada/fill, posição/stop, disaster stop, fechamento/reconciliação e segurança adjacente, com harness offline e fixtures temporárias.
+- Isso não prova integração com a exchange, ordem real, posição real, configuração efetiva no Render, nem semântica física do filesystem. O teste não mudou controles de trading.
