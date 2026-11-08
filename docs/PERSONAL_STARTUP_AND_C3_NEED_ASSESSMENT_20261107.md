@@ -409,3 +409,10 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 - A execução usou o `ccxt 4.5.88` local real, não criou cliente nem carregou credenciais, bloqueou rede/subprocessos/leitura de `.env` e direcionou persistência aos fixtures temporários do runner. Cobriu preflight fail-closed, entrada/fill/cancelamento, leitura de stop/posição, disaster stop, fechamento e reconciliação; não substitui teste de integração com corretora.
 - Nova consulta Render às 00:48 UTC não encontrou amostra `free_mb` posterior a **62,07 MB às 19:46:04 UTC de 2026-11-07**. Configuração read-only permanece uma instância com `/data` de 2 GB e `autoDeploy=no`; o SHA live permanece `31f31c9d071398c0fd35b1167f0460020f9ce2fd`.
 - Não houve deploy, limpeza/redimensionamento de disco, alteração de secrets, AWS, Render, produção ou controles PAPER/DRY_RUN/LIVE. A leitura atual do Disk no Dashboard segue pendente.
+
+### Startup C3 dormente com ccxt real — 2026-11-08 00:59 UTC
+
+- No HEAD local `57fe123852fb3f74277a7db762a384a4e168d037`, rodei `..\\.offline-envs\\cq-ccxt-4.5.88\\Scripts\\python.exe -I tests/run_falcon_pilot_minimal_offline.py --c3-dormant-startup`: **24 passed e 3 subtests passed em 529,52 s (8 min 49 s)**.
+- A seleção verifica somente o comportamento local de startup C3 dormente/fail-closed; usa barreiras de rede e dados isolados do runner. Não invocou signer real, AWS ou Render, nem ativou C3.
+- Isso complementa a auditoria de 60 testes dos writers/locks, mas não demonstra se o lock compartilhado fornece exclusão física no `/data` do Render. A decisão sobre C3 distribuído permanece baseada em requisitos e evidência de produção somente leitura, sem ativação.
+- O único bloqueio externo de deploy permanece a leitura atual do espaço persistente; última medição conhecida: 62,07 MB às 19:46:04 UTC de 2026-11-07.
