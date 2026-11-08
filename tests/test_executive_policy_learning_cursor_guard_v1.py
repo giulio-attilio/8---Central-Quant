@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 
@@ -116,3 +117,74 @@ def test_restored_original_timeline_recovers_without_cursor_reset(tmp_path, monk
     assert state["timeline_offset"] == len(original)
     assert state["last_error"] is None
     assert learning.get_executive_policy_learning_health()["ok"] is True
+
+
+def test_replaced_timeline_with_larger_file_fails_closed(tmp_path, monkeypatch):
+    timeline = tmp_path / "timeline.jsonl"
+    original = b'{"code":"POLICY_A","event":1}\n'
+    timeline.write_bytes(original)
+    state_path = tmp_path / "state.json"
+    stats_path = tmp_path / "stats.json"
+    log_path = tmp_path / "learning.jsonl"
+    monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
+    monkeypatch.setattr(learning, "STATE_FILE", state_path)
+    monkeypatch.setattr(learning, "STATS_FILE", stats_path)
+    monkeypatch.setattr(learning, "LOG_FILE", log_path)
+
+    first = learning.run_executive_policy_learning(commit=True)
+    assert first["ok"] is True
+    old_offset = first["new_offset"]
+    old_stats = stats_path.read_bytes()
+
+    replacement = tmp_path / "timeline.replacement"
+    replacement.write_bytes(
+        original + b'{"code":"POLICY_B","event":2}\n'
+    )
+    os.replace(replacement, timeline)
+
+    blocked = learning.run_executive_policy_learning(commit=True)
+
+    assert blocked["ok"] is False
+    assert blocked["error"] == "TIMELINE_SOURCE_CHANGED"
+    assert blocked["old_offset"] == old_offset
+    assert blocked["new_offset"] == old_offset
+    assert blocked["events_processed"] == 0
+    assert stats_path.read_bytes() == old_stats
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["timeline_offset"] == old_offset
+    assert state["last_error"] == "TIMELINE_SOURCE_CHANGED"
+    assert learning.get_executive_policy_learning_health()["status"] == "SOURCE_CHANGED"
+
+
+def test_malformed_saved_timeline_identity_fails_closed(tmp_path, monkeypatch):
+    timeline = tmp_path / "timeline.jsonl"
+    timeline.write_bytes(b'{"code":"POLICY_A"}\n')
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "timeline_offset": 1,
+                "events_processed": 4,
+                "timeline_file_identity": {"device": "not-an-int", "inode": 9},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stats_path = tmp_path / "stats.json"
+    stats_path.write_text(json.dumps({"policies": {}, "summary": {}}), encoding="utf-8")
+    stats_before = stats_path.read_bytes()
+    monkeypatch.setattr(learning, "TIMELINE_FILE", timeline)
+    monkeypatch.setattr(learning, "STATE_FILE", state_path)
+    monkeypatch.setattr(learning, "STATS_FILE", stats_path)
+    monkeypatch.setattr(learning, "LOG_FILE", tmp_path / "learning.jsonl")
+
+    result = learning.run_executive_policy_learning(commit=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "TIMELINE_SOURCE_IDENTITY_INVALID"
+    assert result["old_offset"] == result["new_offset"] == 1
+    assert result["events_processed"] == 0
+    assert stats_path.read_bytes() == stats_before
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["timeline_offset"] == 1
+    assert state["last_error"] == "TIMELINE_SOURCE_IDENTITY_INVALID"

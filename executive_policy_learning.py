@@ -96,6 +96,18 @@ def _append_log(event):
         pass
 
 
+def _timeline_file_identity_from_stat(file_stat):
+    """Return stable local file identity when the platform exposes an inode."""
+    try:
+        device = int(file_stat.st_dev)
+        inode = int(file_stat.st_ino)
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
+    if inode <= 0:
+        return None
+    return {"device": device, "inode": inode}
+
+
 def _load_state():
     state = _read_json(STATE_FILE, {})
     if not isinstance(state, dict):
@@ -394,11 +406,43 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
     max_events = int(max_events or MAX_EVENTS_PER_RUN)
 
     try:
-        timeline_size = TIMELINE_FILE.stat().st_size
+        timeline_stat = TIMELINE_FILE.stat()
+        timeline_size = int(timeline_stat.st_size)
+        timeline_identity = _timeline_file_identity_from_stat(timeline_stat)
     except FileNotFoundError:
         timeline_size = None
-    if offset < 0 or (offset > 0 and (timeline_size is None or offset > timeline_size)):
-        error = "TIMELINE_CURSOR_INVALID" if offset < 0 else "TIMELINE_CURSOR_PAST_EOF"
+        timeline_identity = None
+
+    error = None
+    if offset < 0:
+        error = "TIMELINE_CURSOR_INVALID"
+    elif offset > 0 and (timeline_size is None or offset > timeline_size):
+        error = "TIMELINE_CURSOR_PAST_EOF"
+    else:
+        saved_identity = state.get("timeline_file_identity")
+        if offset > 0 and saved_identity is not None:
+            if not isinstance(saved_identity, dict) or not {
+                "device", "inode"
+            }.issubset(saved_identity):
+                error = "TIMELINE_SOURCE_IDENTITY_INVALID"
+            elif timeline_identity is None:
+                error = "TIMELINE_SOURCE_IDENTITY_UNAVAILABLE"
+            else:
+                try:
+                    saved_device = int(saved_identity["device"])
+                    saved_inode = int(saved_identity["inode"])
+                except (TypeError, ValueError, OverflowError):
+                    error = "TIMELINE_SOURCE_IDENTITY_INVALID"
+                else:
+                    if saved_device <= 0 or saved_inode <= 0:
+                        error = "TIMELINE_SOURCE_IDENTITY_INVALID"
+                    elif (
+                        saved_device != timeline_identity["device"]
+                        or saved_inode != timeline_identity["inode"]
+                    ):
+                        error = "TIMELINE_SOURCE_CHANGED"
+
+    if error:
         state["last_run_at"] = _now()
         state["last_error"] = error
         state["last_batch"] = {
@@ -436,6 +480,48 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
 
     events, new_offset, reached_eof = _iter_new_timeline_events(offset, max_events)
 
+    try:
+        final_stat = TIMELINE_FILE.stat()
+        final_identity = _timeline_file_identity_from_stat(final_stat)
+    except FileNotFoundError:
+        final_identity = None
+    if timeline_identity != final_identity:
+        error = "TIMELINE_SOURCE_CHANGED_DURING_READ"
+        state["last_run_at"] = _now()
+        state["last_error"] = error
+        state["last_batch"] = {
+            "events_read": 0,
+            "events_processed": 0,
+            "reached_eof": False,
+            "old_offset": offset,
+            "new_offset": offset,
+            "source_size_bytes": timeline_size,
+            "error": error,
+        }
+        result = {
+            "ok": False,
+            "module": "executive_policy_learning",
+            "version": VERSION,
+            "generated_at": _now(),
+            "commit": commit,
+            "timeline_file": str(TIMELINE_FILE),
+            "state_file": str(STATE_FILE),
+            "stats_file": str(STATS_FILE),
+            "events_read": 0,
+            "events_processed": 0,
+            "old_offset": offset,
+            "new_offset": offset,
+            "reached_eof": False,
+            "source_size_bytes": timeline_size,
+            "error": error,
+            "duration_ms": round((time.time() - started) * 1000, 2),
+            "summary": stats.get("summary") or {},
+        }
+        if commit:
+            _save_state(state)
+        _append_log(result)
+        return result
+
     processed = 0
     skipped_without_code = 0
 
@@ -456,6 +542,8 @@ def run_executive_policy_learning(context=None, commit=True, max_events=None):
         processed += 1
 
     state["timeline_offset"] = new_offset
+    if timeline_identity is not None:
+        state["timeline_file_identity"] = timeline_identity
     state["last_run_at"] = _now()
     state["last_error"] = None
     state["events_processed"] = _safe_int(state.get("events_processed")) + processed
@@ -507,7 +595,14 @@ def get_executive_policy_learning_health():
     summary = stats.get("summary") or {}
 
     status = "OK"
-    if state.get("last_error") in {"TIMELINE_CURSOR_INVALID", "TIMELINE_CURSOR_PAST_EOF"}:
+    if state.get("last_error") in {
+        "TIMELINE_CURSOR_INVALID",
+        "TIMELINE_CURSOR_PAST_EOF",
+        "TIMELINE_SOURCE_IDENTITY_INVALID",
+        "TIMELINE_SOURCE_IDENTITY_UNAVAILABLE",
+        "TIMELINE_SOURCE_CHANGED",
+        "TIMELINE_SOURCE_CHANGED_DURING_READ",
+    }:
         status = "SOURCE_CHANGED"
     elif not TIMELINE_FILE.exists():
         status = "NO_TIMELINE"
