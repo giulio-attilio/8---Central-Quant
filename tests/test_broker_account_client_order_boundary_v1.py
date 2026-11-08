@@ -835,6 +835,15 @@ def test_broker_uses_explicit_notional_as_single_sizing_authority(monkeypatch):
     )
     monkeypatch.setattr(broker, "is_real_live_send_enabled", lambda: False)
     monkeypatch.setattr(
+        broker,
+        "broker_paper_persistence_guard_v1_validate",
+        lambda: {
+            "allowed": True,
+            "status": "PAPER_PERSISTENCE_READY",
+            "free_bytes": 512 * 1024 * 1024,
+        },
+    )
+    monkeypatch.setattr(
         broker, "_automatic_broker_preview_firewall", lambda **_kwargs: {"blocked": False}
     )
     monkeypatch.setattr(broker, "_infer_bot_for_audit", lambda **kwargs: kwargs["bot"])
