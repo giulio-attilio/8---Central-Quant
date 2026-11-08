@@ -954,3 +954,8 @@ Para a topologia observada de uma instância e um operador, a alternativa propor
 - As alterações locais de persistência do outcome evaluator, seus dois testes e as anotações correspondentes foram salvas no commit `4970901fd52de0fc976acc021fe322dc42077703` (`fix(paper): fsync outcome event log`). A branch está dois commits à frente de `origin/codex/personal-readiness-release-20261104`; nada foi enviado ao GitHub ou ao Render.
 - Após o commit, `--paper-integrated-disk-guard` passou novamente: **31 passed em 2,53 s**. `--personal-http-auth` passou nesta retomada: **240 passed em 131,58 s**. Os testes são offline e usam dados/credenciais sintéticos; não comprovam filesystem físico Linux nem configuração efetiva dos secrets no Render.
 - A verificação pós-resize pelo comando `df -h /data` continua pendente. O commit é local e não implica publicação nem prontidão para trading.
+
+### Regressão de lifecycle após persistência fsync — 2026-11-08
+
+- No HEAD local `2f6dbd44dbf8d3828d78efc5572f5b2732258ea3`, executei `--personal-lifecycle-completeness` novamente após o commit de `fsync` do JSONL: **843 passed em 974,19 s**. A execução terminou com exit code 0 no runner offline, usando fixtures temporárias e restrições de rede do harness.
+- Esse resultado valida a regressão local selecionada, não comportamento físico do disco Render, configuração de produção, integração com exchange ou prontidão para LIVE. O filesystem pós-resize continua aguardando `df -h /data` executado no Shell da instância.
