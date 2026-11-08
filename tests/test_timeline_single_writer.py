@@ -350,6 +350,95 @@ def test_paper_lifecycle_emits_one_timeline_row(history, tmp_path, monkeypatch):
     assert len(_rows(history.TIMELINE_LOG_FILE)) == 1
 
 
+def _paper_lifecycle_module(tmp_path, monkeypatch):
+    monkeypatch.setenv("CENTRAL_DATA_DIR", str(tmp_path / "paper"))
+    sys.modules.pop("paper_lifecycle", None)
+    paper = importlib.import_module("paper_lifecycle")
+    paper.PAPER_POSITIONS_FILE = tmp_path / "paper_integrated_positions.json"
+    paper.PAPER_LIFECYCLE_LOG_FILE = tmp_path / "paper_lifecycle_log.jsonl"
+    return paper
+
+
+def _open_paper_position():
+    return [{
+        "trade_id": "TR-PAPER-DISK",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "status": "OPEN",
+        "entry": 100.0,
+        "sl_initial": 90.0,
+        "sl_current": 90.0,
+        "tp50": 200.0,
+        "qty": 1.0,
+    }]
+
+
+def test_paper_lifecycle_replace_failure_keeps_state_and_emits_no_events(tmp_path, monkeypatch):
+    paper = _paper_lifecycle_module(tmp_path, monkeypatch)
+    original = json.dumps(_open_paper_position(), separators=(",", ":"))
+    paper.PAPER_POSITIONS_FILE.write_text(original, encoding="utf-8")
+    emitted = []
+    monkeypatch.setattr(paper, "_emit_history_event", lambda event: emitted.append(event))
+    monkeypatch.setattr(paper.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+
+    result = paper.update_paper_position_price(trade_id="TR-PAPER-DISK", price=101, close=True)
+
+    assert result["ok"] is False
+    assert result["status"] == "PAPER_LIFECYCLE_PERSISTENCE_FAILED"
+    assert json.loads(paper.PAPER_POSITIONS_FILE.read_text(encoding="utf-8")) == _open_paper_position()
+    assert not paper.PAPER_LIFECYCLE_LOG_FILE.exists()
+    assert emitted == []
+
+
+def test_paper_lifecycle_corrupt_state_fails_closed_without_overwrite(tmp_path, monkeypatch):
+    paper = _paper_lifecycle_module(tmp_path, monkeypatch)
+    original = "{truncated"
+    paper.PAPER_POSITIONS_FILE.write_text(original, encoding="utf-8")
+    emitted = []
+    monkeypatch.setattr(paper, "_emit_history_event", lambda event: emitted.append(event))
+
+    result = paper.update_paper_position_price(trade_id="TR-PAPER-DISK", price=101, close=True)
+
+    assert result["ok"] is False
+    assert result["status"] == "PAPER_LIFECYCLE_PERSISTENCE_FAILED"
+    assert result["error"].startswith("PAPER_POSITIONS_READ_FAILED:")
+    assert paper.PAPER_POSITIONS_FILE.read_text(encoding="utf-8") == original
+    assert not paper.PAPER_LIFECYCLE_LOG_FILE.exists()
+    assert emitted == []
+
+
+def test_paper_lifecycle_persists_close_before_emitting_events(tmp_path, monkeypatch):
+    paper = _paper_lifecycle_module(tmp_path, monkeypatch)
+    paper.PAPER_POSITIONS_FILE.write_text(json.dumps(_open_paper_position()), encoding="utf-8")
+    observed = []
+
+    def observe_after_persist(event):
+        state = json.loads(paper.PAPER_POSITIONS_FILE.read_text(encoding="utf-8"))
+        observed.append((event["event"], state[0]["status"]))
+        return {"ok": True}
+
+    monkeypatch.setattr(paper, "_emit_history_event", observe_after_persist)
+    result = paper.update_paper_position_price(trade_id="TR-PAPER-DISK", price=101, close=True)
+
+    assert result["ok"] is True
+    assert json.loads(paper.PAPER_POSITIONS_FILE.read_text(encoding="utf-8"))[0]["status"] == "CLOSED"
+    assert observed and all(status == "CLOSED" for _, status in observed)
+
+
+def test_paper_lifecycle_reports_event_log_failure_after_state_commit(tmp_path, monkeypatch):
+    paper = _paper_lifecycle_module(tmp_path, monkeypatch)
+    paper.PAPER_POSITIONS_FILE.write_text(json.dumps(_open_paper_position()), encoding="utf-8")
+    monkeypatch.setattr(paper, "_append_jsonl", lambda *args: False)
+    monkeypatch.setattr(paper, "_emit_history_event", lambda event: {"ok": True})
+
+    result = paper.update_paper_position_price(trade_id="TR-PAPER-DISK", price=101, close=True)
+
+    assert result["ok"] is True
+    assert result["status"] == "PAPER_LIFECYCLE_UPDATED_WITH_EVENT_ERRORS"
+    assert result["event_log_errors"] == result["events_count"]
+    assert json.loads(paper.PAPER_POSITIONS_FILE.read_text(encoding="utf-8"))[0]["status"] == "CLOSED"
+
+
 def test_main_append_timeline_is_bridge_only():
     source = (ROOT / "main.py").read_text(encoding="utf-8")
     tree = ast.parse(source)

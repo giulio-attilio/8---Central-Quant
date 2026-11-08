@@ -216,6 +216,12 @@ if __name__ == "__main__":
         )
     elif sys.argv[1:] == ["--paper-integrated-disk-guard"]:
         cases = ("test_paper_executor_integrated_idempotency_v1.py",)
+    elif sys.argv[1:] == ["--paper-lifecycle-disk-failures"]:
+        cases = ("test_timeline_single_writer.py",)
+        filters = ["-k", "paper_lifecycle"]
+    elif sys.argv[1:] == ["--paper-lifecycle-integration"]:
+        cases = ("test_trade_lifecycle_shadow_runtime_adapter.py",)
+        filters = ["-k", "not test_shadow_validation_append_is_idempotent_across_processes"]
     elif sys.argv[1:] == ["--static-runtime"]:
         cases = ("test_static_operational_runtime_v1.py",)
     elif sys.argv[1:] == ["--predator-auto-closed-sync"]:
@@ -328,6 +334,10 @@ if __name__ == "__main__":
         filters = []
     elif sys.argv[1:] == ["--paper-integrated-disk-guard"]:
         filters = []
+    elif sys.argv[1:] == ["--paper-lifecycle-disk-failures"]:
+        filters = ["-k", "paper_lifecycle"]
+    elif sys.argv[1:] == ["--paper-lifecycle-integration"]:
+        filters = ["-k", "not test_shadow_validation_append_is_idempotent_across_processes"]
     elif sys.argv[1:] == ["--static-runtime"]:
         filters = []
     elif sys.argv[1:] == ["--predator-auto-closed-sync"]:

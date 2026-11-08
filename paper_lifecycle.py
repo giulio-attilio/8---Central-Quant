@@ -18,6 +18,8 @@
 import os
 import json
 import time
+import tempfile
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -36,6 +38,7 @@ PAPER_LIFECYCLE_ENABLED = os.getenv("CENTRAL_PAPER_LIFECYCLE_ENABLED", "true").l
 PAPER_LIFECYCLE_HISTORY_ENABLED = os.getenv("CENTRAL_PAPER_LIFECYCLE_HISTORY_ENABLED", "true").lower() in {
     "1", "true", "yes", "sim", "on"
 }
+_PAPER_LIFECYCLE_LOCK = threading.RLock()
 
 
 def _now_br() -> str:
@@ -51,18 +54,55 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def _read_positions_for_update() -> tuple[Optional[list], Optional[str]]:
+    """Read the canonical PAPER positions file without masking corruption."""
+    if not PAPER_POSITIONS_FILE.exists():
+        return [], None
+    try:
+        payload = json.loads(PAPER_POSITIONS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"PAPER_POSITIONS_READ_FAILED:{type(exc).__name__}"
+    if not isinstance(payload, list):
+        return None, "PAPER_POSITIONS_INVALID_SCHEMA"
+    return payload, None
 
 
-def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+def _write_json(path: Path, payload: Any) -> bool:
+    """Atomically replace JSON, retaining the old file if preparation fails."""
+    temp_path = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), delete=False
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temp_path), str(path))
+        temp_path = None
+        return True
+    except Exception:
+        return False
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except Exception:
+        return False
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -399,7 +439,34 @@ def update_paper_position_price(
             "version": VERSION,
         }
 
-    positions = _read_json(PAPER_POSITIONS_FILE, [])
+    # Serialize the local read/modify/write path. Render is currently a single
+    # service instance; this lock does not claim cross-process coordination.
+    with _PAPER_LIFECYCLE_LOCK:
+        return _update_paper_position_price_locked(
+            trade_id=trade_id,
+            symbol=symbol,
+            price=price,
+            close=close,
+            close_reason=close_reason,
+        )
+
+
+def _update_paper_position_price_locked(
+    trade_id: Optional[str],
+    symbol: Optional[str],
+    price: float,
+    close: bool,
+    close_reason: Optional[str],
+) -> Dict[str, Any]:
+    positions, read_error = _read_positions_for_update()
+    if read_error:
+        return {
+            "ok": False,
+            "status": "PAPER_LIFECYCLE_PERSISTENCE_FAILED",
+            "error": read_error,
+            "generated_at": _now_br(),
+            "version": VERSION,
+        }
     updated = []
     events = []
     history_results = []
@@ -465,33 +532,47 @@ def update_paper_position_price(
                 price=price,
                 close_reason=close_reason,
             )
-            _append_jsonl(PAPER_LIFECYCLE_LOG_FILE, event)
-            history_result = _emit_history_event(event)
-            if history_result is not None:
-                event["history_result"] = history_result
-                history_results.append({
-                    "event": event.get("event"),
-                    "paper_event": event.get("paper_event"),
-                    "trade_id": event.get("trade_id"),
-                    "ok": history_result.get("ok") if isinstance(history_result, dict) else None,
-                    "dedup": history_result.get("dedup") if isinstance(history_result, dict) else None,
-                    "error": history_result.get("error") if isinstance(history_result, dict) else None,
-                })
             events.append(event)
 
         updated.append(pos.get("trade_id"))
 
-    _write_json(PAPER_POSITIONS_FILE, positions)
+    if updated and not _write_json(PAPER_POSITIONS_FILE, positions):
+        return {
+            "ok": False,
+            "status": "PAPER_LIFECYCLE_PERSISTENCE_FAILED",
+            "error": "PAPER_POSITIONS_ATOMIC_WRITE_FAILED",
+            "generated_at": _now_br(),
+            "version": VERSION,
+            "updated_count": 0,
+            "events_count": 0,
+        }
+
+    event_log_errors = 0
+    for event in events:
+        if not _append_jsonl(PAPER_LIFECYCLE_LOG_FILE, event):
+            event_log_errors += 1
+        history_result = _emit_history_event(event)
+        if history_result is not None:
+            event["history_result"] = history_result
+            history_results.append({
+                "event": event.get("event"),
+                "paper_event": event.get("paper_event"),
+                "trade_id": event.get("trade_id"),
+                "ok": history_result.get("ok") if isinstance(history_result, dict) else None,
+                "dedup": history_result.get("dedup") if isinstance(history_result, dict) else None,
+                "error": history_result.get("error") if isinstance(history_result, dict) else None,
+            })
 
     return {
         "ok": True,
-        "status": "PAPER_LIFECYCLE_UPDATED",
+        "status": "PAPER_LIFECYCLE_UPDATED_WITH_EVENT_ERRORS" if event_log_errors else "PAPER_LIFECYCLE_UPDATED",
         "version": VERSION,
         "generated_at": _now_br(),
         "updated_count": len(updated),
         "updated_trade_ids": updated,
         "events_count": len(events),
         "history_events_count": len(history_results),
+        "event_log_errors": event_log_errors,
         "history_results": history_results,
         "events": events,
     }
